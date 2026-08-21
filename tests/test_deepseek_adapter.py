@@ -18,7 +18,6 @@ sys.path.insert(0, str(ENGINE / "api"))
 
 import deepseek_runtime  # noqa: E402
 import route_bindings  # noqa: E402
-from conversation_adapters import deepseek as deepseek_adapter  # noqa: E402
 from conversation_broker import BrokerRun, ConversationBroker  # noqa: E402
 from conversation_adapters import ADAPTER_TYPES, adapter_for  # noqa: E402
 from conversation_adapters.base import (  # noqa: E402
@@ -27,10 +26,7 @@ from conversation_adapters.base import (  # noqa: E402
     NativeTurn,
     checked_version_compatibility,
 )
-from conversation_adapters.deepseek import (  # noqa: E402
-    FAILURE_CATEGORIES,
-    DeepSeekAdapter,
-)
+from conversation_adapters.deepseek import DeepSeekAdapter  # noqa: E402
 
 CREATED_ADAPTERS: list[DeepSeekAdapter] = []
 
@@ -303,7 +299,6 @@ def provider_notification(
     provider: str = "ollama-cloud",
     model: str = "deepseek-v4-pro:0813",
     default_omitted: bool = True,
-    shell_tool: bool = True,
     purpose: str = "conversation",
 ) -> dict[str, Any]:
     return {
@@ -316,7 +311,6 @@ def provider_notification(
                 "model": model,
                 "reasoningEffort": None,
                 "reservedDefaultOmitted": default_omitted,
-                "shellToolDeclared": shell_tool,
                 "purpose": purpose,
             },
         },
@@ -338,7 +332,7 @@ def test_manifest_registry_probe_and_surface_contract_are_live() -> None:
     manifest = json.loads((ENGINE / "adapters" / "deepseek" / "adapter.json").read_text())
     assert [
         name for name, enabled in manifest["surfaces"].items() if enabled
-    ] == ["browser", "sprint"]
+    ] == ["browser"]
 
     next_release = checked_version_compatibility(
         harness="deepseek",
@@ -346,63 +340,6 @@ def test_manifest_registry_probe_and_surface_contract_are_live() -> None:
         version="0.1.0rc8",
     )
     assert next_release.compatibility == "newer-unverified"
-
-
-def test_exact_restart_rehearsal_is_the_only_ollama_loopback_route(
-    tmp_path: Path,
-) -> None:
-    worktree = tmp_path / "worktree"
-    worktree.mkdir()
-    current = context(worktree, provider="ollama-cloud")
-    binding = json.loads(json.dumps(current.route_binding))
-    metadata = binding["adapter_metadata"]
-    metadata["endpoint_identity"] = deepseek_adapter.EXACT_RESTART_REHEARSAL_ENDPOINT
-    metadata["discovery_evidence_digest"] = (
-        deepseek_adapter.EXACT_RESTART_REHEARSAL_DISCOVERY
-    )
-    metadata["wire_evidence_digest"] = deepseek_adapter.EXACT_RESTART_REHEARSAL_WIRE
-    route_bindings.validate_v2_binding(binding)
-    rehearsal = ConversationContext(
-        worktree=current.worktree,
-        provider=current.provider,
-        model=current.model,
-        effort=current.effort,
-        permission_mode=current.permission_mode,
-        env=current.env,
-        route_binding=binding,
-        binding_digest=route_bindings.digest_json(binding),
-        conversation_id=current.conversation_id,
-        boot_content=current.boot_content,
-    )
-
-    provider, model, _options, _credential, endpoint = DeepSeekAdapter._route(
-        rehearsal
-    )
-    assert provider == "ollama-cloud"
-    assert model == "deepseek-v4-pro:0813"
-    assert endpoint == deepseek_adapter.EXACT_RESTART_REHEARSAL_ENDPOINT
-
-    for field, value in (
-        ("endpoint_identity", "http://127.0.0.1:18992/v1"),
-        ("discovery_evidence_digest", "0" * 64),
-        ("wire_evidence_digest", "0" * 64),
-    ):
-        rejected = json.loads(json.dumps(binding))
-        rejected["adapter_metadata"][field] = value
-        invalid = ConversationContext(
-            worktree=rehearsal.worktree,
-            provider=rehearsal.provider,
-            model=rehearsal.model,
-            effort=rehearsal.effort,
-            permission_mode=rehearsal.permission_mode,
-            env=rehearsal.env,
-            route_binding=rejected,
-            binding_digest=route_bindings.digest_json(rejected),
-            conversation_id=rehearsal.conversation_id,
-            boot_content=rehearsal.boot_content,
-        )
-        with pytest.raises(AdapterError, match="endpoint changed"):
-            DeepSeekAdapter._route(invalid)
 
 
 def test_start_binds_exact_route_boot_and_isolated_process_identity(tmp_path: Path) -> None:
@@ -733,11 +670,6 @@ def test_approval_event_fails_only_the_owned_run_and_releases_no_other_transport
             "HARNESS_NATIVE_RUN_PI_AI_ERROR",
         ),
         (
-            "invalid credential token=must-not-survive",
-            "opaque provider detail",
-            "HARNESS_NATIVE_RUN_FAILED",
-        ),
-        (
             "PLAUSIBLE_BUT_UNKNOWN",
             "opaque provider detail",
             "HARNESS_NATIVE_RUN_FAILED",
@@ -776,87 +708,57 @@ def test_turn_failure_projects_only_a_strict_native_error_code(
 
         assert [event.type for event in events] == ["session.started", "run.failed"]
         assert events[-1].payload["error"] == expected_code
-        assert "must-not-survive" not in events[-1].payload["error"]
-        evidence = json.loads(events[-1].payload["detail"])
-        assert evidence["category"] in FAILURE_CATEGORIES
-        assert evidence["provider_request_observed"] is False
         assert native_message not in events[-1].payload["detail"]
     finally:
         adapter.close()
 
 
-@pytest.mark.parametrize(
-    ("native_code", "native_message", "status", "category", "phase"),
-    [
-        (
-            "PI_AI_ERROR", "tools are not supported by this model", 400,
-            "model-tools-unsupported", "provider-response",
-        ),
-        (
-            "INVALID_REQUEST", "tool schema rejected", 400,
-            "tool-schema-rejected", "provider-response",
-        ),
-        (
-            "MALFORMED_RESPONSE", "malformed tool call", None,
-            "tool-call-malformed", "tool-call-decode",
-        ),
-        ("AUTH", "opaque", 401, "authentication", "provider-response"),
-        ("RATE_LIMIT", "opaque", 429, "quota-or-rate-limit", "provider-response"),
-        ("SERVER", "opaque", 503, "provider-unavailable", "provider-response"),
-    ],
-)
-def test_provider_failure_retains_only_fixed_action_evidence(
+def test_provider_failure_retains_exact_route_and_default_omission_only(
     tmp_path: Path,
-    native_code: str,
-    native_message: str,
-    status: int | None,
-    category: str,
-    phase: str,
 ) -> None:
     worktree = tmp_path / "worktree"
     worktree.mkdir()
     factory = Factory()
     adapter = make_adapter(tmp_path / "state", factory)
     try:
-        turn = adapter.start(
-            context(worktree, provider="ollama-cloud"),
-            "Do it",
-        )
-        error = {"code": native_code, "message": native_message}
-        if status is not None:
-            error["status"] = status
+        turn = adapter.start(context(worktree, provider="ollama-cloud"), "Do it")
         factory.instances[0].items = [
             provider_notification(turn.session_ref),
             native_notification(
                 turn.session_ref,
                 "turn/end",
                 5,
-                {"turn": 1, "reason": {"kind": "error", "error": error}},
+                {
+                    "turn": 1,
+                    "reason": {
+                        "kind": "error",
+                        "error": {
+                            "code": "AUTH",
+                            "status": 401,
+                            "message": "credential must-not-survive",
+                        },
+                    },
+                },
             ),
         ]
 
         events = list(adapter.stream(turn))
-
         evidence = json.loads(events[-1].payload["detail"])
-        assert set(evidence) == {
-            "schema_version", "source", "phase", "category", "upstream_code",
-            "http_status", "provider_request_observed", "provider_exact",
-            "model_exact", "reserved_default_omitted", "shell_tool_declared",
-            "purpose",
-        }
+
         assert evidence == {
-            **evidence,
+            "schema_version": 1,
             "source": "provider",
-            "phase": phase,
-            "category": category,
+            "phase": "provider-response",
+            "category": "authentication",
+            "upstream_code": "AUTH",
+            "http_status": 401,
             "provider_request_observed": True,
             "provider_exact": True,
             "model_exact": True,
             "reserved_default_omitted": True,
-            "shell_tool_declared": True,
             "purpose": "conversation",
         }
-        assert native_message not in events[-1].payload["detail"]
+        assert "must-not-survive" not in events[-1].payload["detail"]
     finally:
         adapter.close()
 
@@ -1011,7 +913,6 @@ def test_broker_captures_prompt_failure_identity_before_terminal(tmp_path: Path)
     terminal_call = store.finish_run.call_args
     assert terminal_call.args[:2] == (7, "failed")
     assert terminal_call.kwargs["error_code"] == "HARNESS_TIMEOUT"
-    assert terminal_call.kwargs["error_detail"] == "native prompt response timed out"
 
 
 def test_uncancelled_prompt_failure_reconciles_exactly_after_close(tmp_path: Path) -> None:

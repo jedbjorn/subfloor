@@ -10,8 +10,7 @@ The command is intentionally conservative:
 * every credential, capacity, dirty-state, active-Sprint, and remote collision
   check completes before a disposable install or remote ref is created;
 * the candidate is resolved to one commit and that exact commit is installed;
-* real browser conversations drive either the standard Codex/Kimi route or an
-  explicit provider-neutral DeepSeek Sprint route;
+* real browser conversations drive a Codex Planner/Developer and Kimi Reviewer;
 * stage and whole-run deadlines fail closed;
 * the durable receipt is allow-listed and recursively redacted; and
 * cleanup runs after every partial failure, is fatal when incomplete, and can be
@@ -31,10 +30,8 @@ import hashlib
 import json
 import os
 import re
-import shlex
 import shutil
 import socket
-import stat
 import subprocess
 import sys
 import tempfile
@@ -51,7 +48,6 @@ REMOTE_PREFIX = "subfloor-canary"
 ENGINE_REMOTE = "super-coder"
 MIN_GITHUB_REMAINING = 100
 MIN_FREE_BYTES = 2 * 1024 * 1024 * 1024
-EXPLICIT_TEMP_ROOT = Path("/home")
 FORK_PREPARATION_PATHS = {
     ".github/workflows/subfloor-visual-qa.yml",
     ".gitignore",
@@ -63,33 +59,9 @@ FORK_PREPARATION_PATHS = {
 TERMINAL_LIFECYCLES = {"completed", "aborted"}
 FAILURE_LIFECYCLES = {"paused", "aborted"}
 PICKUP_INJECTION_PAUSE_REASON = "wake_pickup_evidence_invalid"
-STANDARD_PROFILE = "standard"
-DEEPSEEK_SPRINT_PROFILE = "deepseek-sprint"
-PROFILES = {STANDARD_PROFILE, DEEPSEEK_SPRINT_PROFILE}
-DEEPSEEK_PROVIDER = "ollama-cloud"
-DEEPSEEK_CANDIDATE_PREFERENCES = (
-    "ollama-cloud/glm-5.2:cloud",
-    "ollama-cloud/minimax-m3:cloud",
-)
-DEEPSEEK_CANDIDATE_REJECTIONS = frozenset(
-    {"ollama-cloud/deepseek-v4-flash:0731"}
-)
-DEEPSEEK_CANDIDATE_LIMIT = 4
-DEEPSEEK_CANDIDATE_OUTPUT_BYTES = 16 * 1024
-RESTART_REHEARSAL_MODEL = "ollama-cloud/sc-loopback-restart:fixture"
-PROVIDER_CREDENTIAL_ENV = {
-    "ANTHROPIC_API_KEY",
-    "DEEPSEEK_API_KEY",
-    "KIMI_API_KEY",
-    "MISTRAL_API_KEY",
-    "OLLAMA_API_KEY",
-    "OPENAI_API_KEY",
-}
 HEX_SHA = re.compile(r"^[0-9a-f]{40}$")
 RUN_ID_RE = re.compile(r"^[a-z0-9][a-z0-9-]{5,47}$")
 REPO_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
-CONVERSATION_ID_RE = re.compile(r"^cv_[0-9a-f]{32}$")
-DEEPSEEK_SESSION_ID_RE = re.compile(r"^deepseek-[0-9a-f]{32}$")
 SECRET_PATTERNS = (
     re.compile(r"(?i)(authorization\s*:\s*bearer\s+)[^\s,;]+"),
     re.compile(r"(?i)((?:api[_-]?key|token|secret|password)\s*[=:]\s*)[^\s,;]+"),
@@ -116,254 +88,6 @@ SENSITIVE_KEYS = {
     "token",
     "transcript",
 }
-QAQC_EVIDENCE_KEYS = frozenset(
-    {"boot", "terminal", "record_qaqc", "action_receipt", "postcondition"}
-)
-QAQC_BOOT_KEYS = frozenset(
-    {"role", "skill", "shell_tool", "candidate", "predeclaration"}
-)
-QAQC_COMMAND_KEYS = frozenset(
-    {"observed", "invocation_count", "exit_class", "receipt", "identity"}
-)
-QAQC_ACTION_RECEIPT_KEYS = frozenset({"count", "identity"})
-QAQC_ACTION_RECEIPT_IDENTITIES = frozenset(
-    {
-        "matched",
-        "absent",
-        "duplicate",
-        "sprint_mismatch",
-        "participant_mismatch",
-        "shell_mismatch",
-        "role_mismatch",
-        "generation_mismatch",
-        "conversation_mismatch",
-        "session_mismatch",
-        "run_mismatch",
-        "candidate_mismatch",
-        "spec_mismatch",
-        "phase_mismatch",
-        "approval_mismatch",
-        "row_mismatch",
-        "malformed",
-    }
-)
-QAQC_TERMINAL_CLASSES = frozenset(
-    {"succeeded", "failed", "cancelled", "unknown", "missing", "ambiguous"}
-)
-QAQC_EXIT_CLASSES = frozenset(
-    {"success", "failure", "missing_completion", "not_invoked", "ambiguous"}
-)
-QAQC_POSTCONDITIONS = frozenset(
-    {"approved", "absent", "reviewer_mismatch", "revision_mismatch", "verdict_mismatch", "ambiguous"}
-)
-PARTICIPANT_FAILURE_KEYS = frozenset(
-    {
-        "schema_version",
-        "source",
-        "phase",
-        "category",
-        "upstream_code",
-        "http_status",
-        "provider_request_observed",
-        "provider_exact",
-        "model_exact",
-        "reserved_default_omitted",
-        "shell_tool_declared",
-        "purpose",
-    }
-)
-PARTICIPANT_FAILURE_SOURCES = frozenset(
-    {"provider", "carrier", "protocol", "tool-dispatch", "engine"}
-)
-PARTICIPANT_FAILURE_PHASES = frozenset(
-    {
-        "initialize",
-        "request-serialize",
-        "provider-request",
-        "provider-response",
-        "tool-call-decode",
-        "tool-dispatch",
-        "terminal",
-    }
-)
-PARTICIPANT_FAILURE_CATEGORIES = frozenset(
-    {
-        "model-tools-unsupported",
-        "tool-schema-rejected",
-        "tool-call-malformed",
-        "authentication",
-        "quota-or-rate-limit",
-        "provider-unavailable",
-        "protocol-contract",
-        "carrier-contract",
-        "unknown",
-    }
-)
-PARTICIPANT_FAILURE_PURPOSES = frozenset(
-    {"conversation", "compaction", "session-title", "unknown"}
-)
-PARTICIPANT_UPSTREAM_CODES = frozenset(
-    {
-        "ABORTED",
-        "AUTH",
-        "CONTEXT_WINDOW_EXCEEDED",
-        "EMPTY_RESPONSE",
-        "INVALID_CREDENTIAL",
-        "INVALID_REQUEST",
-        "MALFORMED_RESPONSE",
-        "MISSING_CREDENTIAL",
-        "PI_AI_ERROR",
-        "QUOTA",
-        "RATE_LIMIT",
-        "SERVER",
-        "STREAM_CLOSED",
-        "TIMEOUT",
-        "TRANSPORT",
-        "UNSUPPORTED_CONTENT",
-    }
-)
-PARTICIPANT_HTTP_CODE = re.compile(r"^HTTP_[1-5][0-9]{2}$")
-ROUTE_ADMISSION_KEYS = (
-    "contract_version",
-    "requested_provider",
-    "requested_model",
-    "admitted",
-    "error_code",
-    "category",
-    "required_surface",
-    "required_capability",
-    "freshness",
-    "authentication",
-    "tool_capability",
-    "exit_class",
-)
-ROUTE_ADMISSION_CATEGORIES = frozenset(
-    {
-        "harness-unavailable",
-        "runtime-unavailable",
-        "credential-or-authentication",
-        "catalogue-unavailable",
-        "catalogue-stale",
-        "exact-model-absent",
-        "exact-model-unavailable",
-        "tool-capability-unsupported",
-        "tool-capability-unproven",
-        "route-evidence-invalid",
-        "provider-option-drift",
-        "unknown",
-    }
-)
-ROUTE_ADMISSION_ERROR_CODES = {
-    category: "ROUTE_ADMISSION_" + category.replace("-", "_").upper()
-    for category in ROUTE_ADMISSION_CATEGORIES
-}
-ROUTE_ADMISSION_FRESHNESS = frozenset({"fresh", "stale", "missing", "unknown"})
-ROUTE_ADMISSION_AUTHENTICATION = frozenset(
-    {"verified", "failed", "unproven", "unknown"}
-)
-ROUTE_ADMISSION_TOOL_CAPABILITY = frozenset(
-    {"supported", "unsupported", "unproven", "unknown"}
-)
-ROUTE_ADMISSION_EXIT_CLASSES = frozenset(
-    {"success", "route-rejected", "malformed-response", "identity-mismatch", "command-failed"}
-)
-RESTART_REHEARSAL_PORT = 18991
-RESTART_REHEARSAL_HELPER = (
-    ".super-coder/scripts/deepseek_exact_restart_rehearsal.py"
-)
-RESTART_CATEGORIES = frozenset(
-    {
-        "command-contract",
-        "api-or-auth-target",
-        "session-reference-missing",
-        "session-reference-mismatch",
-        "persisted-root-missing",
-        "persisted-root-mismatch",
-        "boot-or-runtime-drift",
-        "route-drift",
-        "old-process-still-live",
-        "process-collision",
-        "broker-state-or-lease",
-        "native-resume-rejected",
-        "restart-timeout",
-        "unknown",
-    }
-)
-RESTART_PROBE_KEYS = frozenset(
-    {
-        "ok",
-        "candidate_sha",
-        "conversation_id",
-        "native_session_id",
-        "provider",
-        "model",
-        "runtime_version",
-        "source_commit",
-        "patch_sha256",
-        "composition_sha256",
-        "binding_digest",
-        "boot_sha256",
-        "persisted_root_id",
-        "persisted_root_device",
-        "persisted_root_inode",
-        "persisted_root_present",
-        "persisted_root_private",
-        "run_id",
-        "run_state",
-        "process_pid",
-        "process_start_ticks",
-        "process_live",
-        "lease_clear",
-        "inspect_session_exact",
-        "inspect_presence",
-        "inspect_state",
-        "reconcile_outcome",
-        "reconcile_proven",
-    }
-)
-RESTART_RESULT_KEYS = frozenset(
-    {
-        "schema_version",
-        "category",
-        "command_exit_class",
-        "command_exit_status",
-        "candidate_sha",
-        "conversation_id",
-        "native_session_id",
-        "provider",
-        "model",
-        "runtime_version",
-        "source_commit",
-        "patch_sha256",
-        "composition_sha256",
-        "binding_digest",
-        "boot_sha256",
-        "persisted_root_id",
-        "persisted_root_device",
-        "persisted_root_inode",
-        "persisted_root_private",
-        "old_process_pid",
-        "old_process_start_ticks",
-        "old_process_live",
-        "resumed_process_pid",
-        "resumed_process_start_ticks",
-        "resumed_process_distinct",
-        "same_candidate",
-        "same_runtime",
-        "same_boot",
-        "same_route",
-        "same_conversation",
-        "same_native_session",
-        "same_persisted_root",
-        "inspect_session_exact",
-        "inspect_presence",
-        "inspect_state",
-        "reconcile_outcome",
-        "reconcile_proven",
-        "broker_state",
-        "lease_clear",
-    }
-)
 
 
 class CanaryError(RuntimeError):
@@ -392,9 +116,6 @@ class CanaryConfig:
     receipt_path: Path
     temp_parent: Path
     run_id: str
-    temp_parent_explicit: bool = False
-    profile: str = STANDARD_PROFILE
-    credential_file: Path | None = None
     stage_timeout_s: float = 900.0
     whole_timeout_s: float = 3600.0
     poll_interval_s: float = 2.0
@@ -458,7 +179,7 @@ class Backend(Protocol):
 
     def launch(
         self, config: CanaryConfig, facts: Preflight, ledger: ResourceLedger
-    ) -> dict[str, Any]: ...
+    ) -> dict[str, str]: ...
 
     def orchestrate(
         self,
@@ -578,8 +299,6 @@ class Receipt:
             "started_at": utc_now(),
             "finished_at": None,
             "engine_ref_requested": config.engine_ref,
-            "profile": config.profile,
-            "temp_parent_explicit": config.temp_parent_explicit,
             "dos_app_repo": str(config.dos_app_repo.resolve()),
             "candidate_sha": None,
             "base_sha": None,
@@ -741,631 +460,11 @@ def _json_output(result: CommandResult, *, label: str) -> Any:
         ) from exc
 
 
-def _route_admission_fallback(
-    expected_model: str, exit_class: str
-) -> dict[str, Any]:
-    provider, model = expected_model.split("/", 1)
-    return {
-        "contract_version": 1,
-        "requested_provider": provider,
-        "requested_model": model,
-        "admitted": False,
-        "error_code": ROUTE_ADMISSION_ERROR_CODES["unknown"],
-        "category": "unknown",
-        "required_surface": "sprint",
-        "required_capability": "reviewer-shell-tool-execution",
-        "freshness": "unknown",
-        "authentication": "unknown",
-        "tool_capability": "unknown",
-        "exit_class": exit_class,
-    }
-
-
-def _validated_route_admission(
-    result: CommandResult, expected_model: str
-) -> dict[str, Any]:
-    """Consume only the fixed admission contract; never project raw output."""
-    try:
-        payload = json.loads(result.stdout or "null")
-    except json.JSONDecodeError:
-        payload = None
-    if not isinstance(payload, dict) or tuple(payload) != ROUTE_ADMISSION_KEYS:
-        raise CanaryError(
-            "CANARY_ROUTE_ADMISSION_INVALID",
-            "exact-route admission returned a malformed bounded contract",
-            details={
-                "route_admission": _route_admission_fallback(
-                    expected_model, "malformed-response"
-                )
-            },
-        )
-
-    provider, model = expected_model.split("/", 1)
-    identity_matches = (
-        payload.get("requested_provider") == provider
-        and payload.get("requested_model") == model
-        and payload.get("required_surface") == "sprint"
-        and payload.get("required_capability")
-        == "reviewer-shell-tool-execution"
-    )
-    if not identity_matches:
-        raise CanaryError(
-            "CANARY_ROUTE_ADMISSION_INVALID",
-            "exact-route admission identity did not match the canary",
-            details={
-                "route_admission": _route_admission_fallback(
-                    expected_model, "identity-mismatch"
-                )
-            },
-        )
-
-    admitted = payload.get("admitted")
-    category = payload.get("category")
-    error_code = payload.get("error_code")
-    bounded = (
-        payload.get("contract_version") == 1
-        and type(admitted) is bool
-        and payload.get("freshness") in ROUTE_ADMISSION_FRESHNESS
-        and payload.get("authentication") in ROUTE_ADMISSION_AUTHENTICATION
-        and payload.get("tool_capability") in ROUTE_ADMISSION_TOOL_CAPABILITY
-        and payload.get("exit_class") in ROUTE_ADMISSION_EXIT_CLASSES
-    )
-    if admitted:
-        bounded = bounded and (
-            result.returncode == 0
-            and category is None
-            and error_code is None
-            and payload.get("freshness") == "fresh"
-            and payload.get("authentication") == "verified"
-            and payload.get("tool_capability") == "supported"
-            and payload.get("exit_class") == "success"
-        )
-    else:
-        bounded = bounded and (
-            result.returncode == 2
-            and category in ROUTE_ADMISSION_CATEGORIES
-            and error_code == ROUTE_ADMISSION_ERROR_CODES.get(category)
-            and payload.get("exit_class") == "route-rejected"
-        )
-    if not bounded:
-        exit_class = "command-failed" if result.returncode not in {0, 2} else "malformed-response"
-        raise CanaryError(
-            "CANARY_ROUTE_ADMISSION_INVALID",
-            "exact-route admission violated its bounded contract",
-            details={
-                "route_admission": _route_admission_fallback(
-                    expected_model, exit_class
-                )
-            },
-        )
-    return {key: payload[key] for key in ROUTE_ADMISSION_KEYS}
-
-
-def _validated_deepseek_candidates(result: CommandResult) -> list[str]:
-    """Accept only bounded, exact, authenticated Ollama route projections."""
-    if result.returncode != 0 or len(result.stdout.encode()) > DEEPSEEK_CANDIDATE_OUTPUT_BYTES:
-        raise CanaryError(
-            "CANARY_ROUTE_CANDIDATES_INVALID",
-            "bounded DeepSeek candidate projection failed",
-        )
-    lines = [line for line in result.stdout.splitlines() if line]
-    if len(lines) > 32:
-        raise CanaryError(
-            "CANARY_ROUTE_CANDIDATES_INVALID",
-            "DeepSeek candidate projection exceeded its row limit",
-        )
-    candidates: list[str] = []
-    for line in lines:
-        fields = line.split("\t")
-        if len(fields) not in {3, 4} or not fields[0].startswith("deepseek/"):
-            raise CanaryError(
-                "CANARY_ROUTE_CANDIDATES_INVALID",
-                "DeepSeek candidate projection was malformed",
-            )
-        selector = fields[0].removeprefix("deepseek/")
-        if not selector.startswith(f"{DEEPSEEK_PROVIDER}/"):
-            continue
-        if fields[1] != "available" or fields[2] != "ollama-cloud-provider-api":
-            continue
-        provider, model = selector.split("/", 1)
-        if (
-            provider != DEEPSEEK_PROVIDER
-            or not model
-            or model != model.strip()
-            or len(model) > 256
-            or any(char.isspace() or ord(char) < 32 for char in model)
-        ):
-            raise CanaryError(
-                "CANARY_ROUTE_CANDIDATES_INVALID",
-                "DeepSeek candidate identity was not exact and bounded",
-            )
-        if selector in DEEPSEEK_CANDIDATE_REJECTIONS:
-            continue
-        candidates.append(selector)
-    if len(candidates) != len(set(candidates)) or not candidates:
-        raise CanaryError(
-            "CANARY_ROUTE_CANDIDATES_INVALID",
-            "DeepSeek candidate projection was empty or duplicated",
-        )
-    if len(candidates) > DEEPSEEK_CANDIDATE_LIMIT:
-        raise CanaryError(
-            "CANARY_ROUTE_CANDIDATES_INVALID",
-            "DeepSeek candidate projection exceeded its proof budget",
-        )
-    preference = {
-        selector: index
-        for index, selector in enumerate(DEEPSEEK_CANDIDATE_PREFERENCES)
-    }
-    return sorted(
-        candidates,
-        key=lambda selector: (
-            preference.get(selector, len(preference)),
-            selector,
-        ),
-    )
-
-
-def _restart_command_category(result: CommandResult) -> str | None:
-    """Classify restart failures ephemerally without retaining command output."""
-    if result.returncode == 0:
-        return None
-    detail = f"{result.stdout}\n{result.stderr}".lower()
-    if any(token in detail for token in ("restart aborted", "unknown argument", "usage:")):
-        return "command-contract"
-    if any(
-        token in detail
-        for token in ("unauthorized", "forbidden", "authentication", "api target")
-    ):
-        return "api-or-auth-target"
-    if any(token in detail for token in ("broker", "lease", "engine unhealthy")):
-        return "broker-state-or-lease"
-    return "unknown"
-
-
-def _validated_restart_probe(
-    result: CommandResult, expected_model: str
-) -> dict[str, Any]:
-    try:
-        payload = json.loads(result.stdout or "null")
-    except json.JSONDecodeError:
-        payload = None
-    valid = (
-        result.returncode == 0
-        and isinstance(payload, dict)
-        and set(payload) == RESTART_PROBE_KEYS
-        and payload.get("ok") is True
-        and isinstance(payload.get("candidate_sha"), str)
-        and HEX_SHA.fullmatch(payload["candidate_sha"]) is not None
-        and isinstance(payload.get("conversation_id"), str)
-        and CONVERSATION_ID_RE.fullmatch(payload["conversation_id"]) is not None
-        and payload.get("provider") == DEEPSEEK_PROVIDER
-        and payload.get("model") == expected_model
-        and isinstance(payload.get("runtime_version"), str)
-        and bool(payload["runtime_version"])
-        and isinstance(payload.get("source_commit"), str)
-        and HEX_SHA.fullmatch(payload["source_commit"]) is not None
-        and all(
-            isinstance(payload.get(key), str)
-            and re.fullmatch(r"[0-9a-f]{64}", payload[key]) is not None
-            for key in (
-                "patch_sha256",
-                "composition_sha256",
-                "binding_digest",
-                "boot_sha256",
-            )
-        )
-        and isinstance(payload.get("persisted_root_id"), str)
-        and re.fullmatch(r"[0-9a-f]{32}", payload["persisted_root_id"]) is not None
-        and all(
-            payload.get(key) is None
-            or (
-                isinstance(payload.get(key), int)
-                and not isinstance(payload.get(key), bool)
-                and payload[key] > 0
-            )
-            for key in ("persisted_root_device", "persisted_root_inode")
-        )
-        and all(
-            type(payload.get(key)) is bool
-            for key in (
-                "persisted_root_present",
-                "persisted_root_private",
-                "process_live",
-                "lease_clear",
-            )
-        )
-        and all(
-            payload.get(key) is None or type(payload.get(key)) is bool
-            for key in ("inspect_session_exact", "inspect_presence", "reconcile_proven")
-        )
-        and all(
-            isinstance(payload.get(key), int)
-            and not isinstance(payload.get(key), bool)
-            and payload[key] > 0
-            for key in ("run_id", "process_pid", "process_start_ticks")
-        )
-        and isinstance(payload.get("native_session_id"), str)
-        and DEEPSEEK_SESSION_ID_RE.fullmatch(payload["native_session_id"]) is not None
-        and payload.get("run_state") in {"succeeded", "failed", "cancelled"}
-        and all(
-            payload.get(key) is None
-            or (
-                isinstance(payload.get(key), str)
-                and 1 <= len(payload[key]) <= 64
-                and re.fullmatch(r"[a-z0-9._-]+", payload[key]) is not None
-            )
-            for key in ("inspect_state", "reconcile_outcome")
-        )
-    )
-    if not valid:
-        raise CanaryError(
-            "CANARY_RESTART_RECOVERY_FAILED",
-            "exact-session probe violated its bounded contract",
-            details={"restart": {"schema_version": 1, "category": "unknown"}},
-        )
-    return {key: payload[key] for key in RESTART_PROBE_KEYS}
-
-
-def _restart_result(
-    before: Mapping[str, Any],
-    after: Mapping[str, Any],
-    *,
-    command_exit_class: str,
-    command_exit_status: int,
-    expected_model: str,
-    category: str | None = None,
-) -> dict[str, Any]:
-    same_runtime = all(
-        before.get(key) == after.get(key)
-        for key in ("runtime_version", "source_commit", "patch_sha256", "composition_sha256")
-    )
-    same_route = all(
-        before.get(key) == after.get(key)
-        for key in ("provider", "model", "binding_digest")
-    )
-    distinct_process = (
-        isinstance(before.get("process_pid"), int)
-        and isinstance(before.get("process_start_ticks"), int)
-        and isinstance(after.get("process_pid"), int)
-        and isinstance(after.get("process_start_ticks"), int)
-        and (before["process_pid"], before["process_start_ticks"])
-        != (after["process_pid"], after["process_start_ticks"])
-    )
-    checks = {
-        "same_candidate": before.get("candidate_sha") == after.get("candidate_sha"),
-        "same_runtime": same_runtime,
-        "same_boot": before.get("boot_sha256") == after.get("boot_sha256"),
-        "same_route": same_route,
-        "same_conversation": before.get("conversation_id") == after.get("conversation_id"),
-        "same_native_session": before.get("native_session_id") == after.get("native_session_id"),
-        "same_persisted_root": all(
-            before.get(key) == after.get(key)
-            for key in (
-                "persisted_root_id",
-                "persisted_root_device",
-                "persisted_root_inode",
-            )
-        ),
-    }
-    if category is None:
-        if not before.get("native_session_id") or not after.get("native_session_id"):
-            category = "session-reference-missing"
-        elif not checks["same_native_session"]:
-            category = "session-reference-mismatch"
-        elif not before.get("persisted_root_present") or not after.get("persisted_root_present"):
-            category = "persisted-root-missing"
-        elif not checks["same_persisted_root"]:
-            category = "persisted-root-mismatch"
-        elif not checks["same_candidate"] or not same_runtime or not checks["same_boot"]:
-            category = "boot-or-runtime-drift"
-        elif not same_route or not checks["same_conversation"]:
-            category = "route-drift"
-        elif before.get("process_live") is True:
-            category = "old-process-still-live"
-        elif not distinct_process:
-            category = "process-collision"
-        elif after.get("run_state") != "succeeded" or after.get("lease_clear") is not True:
-            category = "broker-state-or-lease"
-        elif (
-            after.get("inspect_session_exact") is not True
-            or after.get("inspect_presence") is not True
-            or after.get("reconcile_proven") is not True
-        ):
-            category = "native-resume-rejected"
-    result = {
-        "schema_version": 1,
-        "category": category,
-        "command_exit_class": command_exit_class,
-        "command_exit_status": command_exit_status,
-        "candidate_sha": after.get("candidate_sha") or before.get("candidate_sha"),
-        "conversation_id": after.get("conversation_id") or before.get("conversation_id"),
-        "native_session_id": after.get("native_session_id") or before.get("native_session_id"),
-        "provider": after.get("provider") or before.get("provider"),
-        "model": after.get("model") or before.get("model"),
-        "runtime_version": after.get("runtime_version") or before.get("runtime_version"),
-        "source_commit": after.get("source_commit") or before.get("source_commit"),
-        "patch_sha256": after.get("patch_sha256") or before.get("patch_sha256"),
-        "composition_sha256": after.get("composition_sha256") or before.get("composition_sha256"),
-        "binding_digest": after.get("binding_digest") or before.get("binding_digest"),
-        "boot_sha256": after.get("boot_sha256") or before.get("boot_sha256"),
-        "persisted_root_id": after.get("persisted_root_id") or before.get("persisted_root_id"),
-        "persisted_root_device": after.get("persisted_root_device"),
-        "persisted_root_inode": after.get("persisted_root_inode"),
-        "persisted_root_private": after.get("persisted_root_private") is True,
-        "old_process_pid": before.get("process_pid"),
-        "old_process_start_ticks": before.get("process_start_ticks"),
-        "old_process_live": before.get("process_live") is True,
-        "resumed_process_pid": after.get("process_pid"),
-        "resumed_process_start_ticks": after.get("process_start_ticks"),
-        "resumed_process_distinct": distinct_process,
-        **checks,
-        "inspect_session_exact": after.get("inspect_session_exact"),
-        "inspect_presence": after.get("inspect_presence"),
-        "inspect_state": after.get("inspect_state"),
-        "reconcile_outcome": after.get("reconcile_outcome"),
-        "reconcile_proven": after.get("reconcile_proven"),
-        "broker_state": after.get("run_state"),
-        "lease_clear": after.get("lease_clear"),
-    }
-    return _validated_restart_result(result, expected_model)
-
-
-def _validated_restart_result(
-    payload: Mapping[str, Any], expected_model: str
-) -> dict[str, Any]:
-    category = payload.get("category")
-    native_session_id = payload.get("native_session_id")
-    valid = (
-        set(payload) == RESTART_RESULT_KEYS
-        and payload.get("schema_version") == 1
-        and (category is None or category in RESTART_CATEGORIES)
-        and payload.get("command_exit_class") in {"success", "failure", "timeout"}
-        and isinstance(payload.get("command_exit_status"), int)
-        and not isinstance(payload.get("command_exit_status"), bool)
-        and isinstance(payload.get("candidate_sha"), str)
-        and HEX_SHA.fullmatch(payload["candidate_sha"]) is not None
-        and isinstance(payload.get("conversation_id"), str)
-        and CONVERSATION_ID_RE.fullmatch(payload["conversation_id"]) is not None
-        and (
-            (
-                isinstance(native_session_id, str)
-                and DEEPSEEK_SESSION_ID_RE.fullmatch(native_session_id) is not None
-            )
-            or (native_session_id is None and category == "session-reference-missing")
-        )
-        and payload.get("provider") == DEEPSEEK_PROVIDER
-        and payload.get("model") == expected_model
-        and isinstance(payload.get("runtime_version"), str)
-        and 1 <= len(payload["runtime_version"]) <= 64
-        and isinstance(payload.get("source_commit"), str)
-        and HEX_SHA.fullmatch(payload["source_commit"]) is not None
-        and all(
-            isinstance(payload.get(key), str)
-            and re.fullmatch(r"[0-9a-f]{64}", payload[key]) is not None
-            for key in (
-                "patch_sha256",
-                "composition_sha256",
-                "binding_digest",
-                "boot_sha256",
-            )
-        )
-        and isinstance(payload.get("persisted_root_id"), str)
-        and re.fullmatch(r"[0-9a-f]{32}", payload["persisted_root_id"]) is not None
-        and all(
-            (
-                isinstance(payload.get(key), int)
-                and not isinstance(payload.get(key), bool)
-                and payload[key] > 0
-            )
-            or (payload.get(key) is None and category == "persisted-root-missing")
-            for key in ("persisted_root_device", "persisted_root_inode")
-        )
-        and all(
-            payload.get(key) is None
-            or (
-                isinstance(payload.get(key), int)
-                and not isinstance(payload.get(key), bool)
-                and payload[key] > 0
-            )
-            for key in (
-                "old_process_pid",
-                "old_process_start_ticks",
-                "resumed_process_pid",
-                "resumed_process_start_ticks",
-            )
-        )
-        and payload.get("broker_state") in {"succeeded", "failed", "cancelled"}
-        and all(
-            payload.get(key) is None
-            or (
-                isinstance(payload.get(key), str)
-                and 1 <= len(payload[key]) <= 64
-                and re.fullmatch(r"[a-z0-9._-]+", payload[key]) is not None
-            )
-            for key in ("inspect_state", "reconcile_outcome")
-        )
-        and all(
-            payload.get(key) is None or type(payload.get(key)) is bool
-            for key in ("inspect_session_exact", "inspect_presence", "reconcile_proven")
-        )
-        and all(type(payload.get(key)) is bool for key in (
-            "persisted_root_private", "old_process_live", "resumed_process_distinct",
-            "same_candidate", "same_runtime", "same_boot", "same_route",
-            "same_conversation", "same_native_session", "same_persisted_root",
-        ))
-    )
-    if not valid:
-        raise CanaryError(
-            "CANARY_RESTART_RECOVERY_FAILED",
-            "restart evidence violated its bounded contract",
-            details={"restart": {"schema_version": 1, "category": "unknown"}},
-        )
-    return {key: payload[key] for key in RESTART_RESULT_KEYS}
-
-
-def _restart_passed(payload: Mapping[str, Any]) -> bool:
-    return (
-        payload.get("category") is None
-        and payload.get("command_exit_class") == "success"
-        and payload.get("command_exit_status") == 0
-        and all(
-            payload.get(key) is True
-            for key in (
-                "persisted_root_private",
-                "resumed_process_distinct",
-                "same_candidate",
-                "same_runtime",
-                "same_boot",
-                "same_route",
-                "same_conversation",
-                "same_native_session",
-                "same_persisted_root",
-                "inspect_session_exact",
-                "inspect_presence",
-                "reconcile_proven",
-                "lease_clear",
-            )
-        )
-        and payload.get("old_process_live") is False
-        and payload.get("broker_state") == "succeeded"
-    )
-
-
 def _nonempty_file(path: Path) -> bool:
     try:
         return path.is_file() and path.stat().st_size > 2
     except OSError:
         return False
-
-
-def _absolute_lexical(path: Path) -> Path:
-    return Path(os.path.abspath(os.fspath(path)))
-
-
-def _strictly_beneath(path: Path, parent: Path) -> bool:
-    return path != parent and path.is_relative_to(parent)
-
-
-def _paths_overlap(first: Path, second: Path) -> bool:
-    return (
-        first == second
-        or first.is_relative_to(second)
-        or second.is_relative_to(first)
-    )
-
-
-def _validate_no_symlink_components(path: Path) -> None:
-    current = Path(path.anchor)
-    for part in path.parts[1:]:
-        current /= part
-        try:
-            metadata = current.lstat()
-        except OSError as exc:
-            raise CanaryError(
-                "CANARY_INPUT_INVALID",
-                "explicit disposable parent is absent or unreadable",
-            ) from exc
-        if stat.S_ISLNK(metadata.st_mode):
-            raise CanaryError(
-                "CANARY_INPUT_INVALID",
-                "explicit disposable parent traverses a symlink",
-            )
-
-
-def _validated_explicit_parent(config: CanaryConfig) -> Path:
-    raw_parent = config.temp_parent
-    if not raw_parent.is_absolute() or ".." in raw_parent.parts:
-        raise CanaryError(
-            "CANARY_INPUT_INVALID",
-            "explicit disposable parent must be an absolute path without traversal",
-        )
-    parent = _absolute_lexical(raw_parent)
-    _validate_no_symlink_components(parent)
-    try:
-        metadata = parent.lstat()
-        root = EXPLICIT_TEMP_ROOT.resolve(strict=True)
-        root_metadata = root.stat()
-    except OSError as exc:
-        raise CanaryError(
-            "CANARY_INPUT_INVALID",
-            "explicit disposable parent or required filesystem root is unavailable",
-        ) from exc
-    mode = stat.S_IMODE(metadata.st_mode)
-    if (
-        not stat.S_ISDIR(metadata.st_mode)
-        or metadata.st_uid != os.getuid()
-        or mode != 0o700
-        or parent.resolve(strict=True) != parent
-        or not _strictly_beneath(parent, root)
-        or metadata.st_dev != root_metadata.st_dev
-    ):
-        raise CanaryError(
-            "CANARY_INPUT_INVALID",
-            "explicit disposable parent failed path, ownership, mode, or filesystem checks",
-        )
-    return parent
-
-
-def _validated_explicit_workspace(
-    config: CanaryConfig,
-    *,
-    protected_paths: Sequence[Path] = (),
-) -> tuple[Path, Path]:
-    parent = _validated_explicit_parent(config)
-    workspace = parent / f"{WORKSPACE_PREFIX}{config.run_id}"
-    if workspace.parent != parent or not _strictly_beneath(workspace, parent):
-        raise CanaryError(
-            "CANARY_INPUT_INVALID",
-            "disposable workspace is not an exact child of its parent",
-        )
-    if workspace.exists() or workspace.is_symlink():
-        raise CanaryError("CANARY_COLLISION", "disposable workspace already exists")
-
-    configured_protected = [
-        config.source_repo,
-        config.dos_app_repo,
-        config.receipt_path,
-        config.source_repo / ".sc-state",
-        config.source_repo / ".super-coder",
-        config.dos_app_repo / ".sc-state",
-        config.dos_app_repo / ".super-coder",
-    ]
-    if config.credential_file is not None:
-        configured_protected.extend(
-            [config.credential_file, config.credential_file.parent]
-        )
-    for protected in (*configured_protected, *protected_paths):
-        candidate = _absolute_lexical(protected)
-        if _paths_overlap(workspace, candidate):
-            raise CanaryError(
-                "CANARY_INPUT_INVALID",
-                "disposable workspace overlaps a protected path",
-            )
-
-    for sibling in parent.iterdir():
-        if sibling.name.startswith(WORKSPACE_PREFIX) and _paths_overlap(
-            workspace, _absolute_lexical(sibling)
-        ):
-            raise CanaryError(
-                "CANARY_COLLISION", "disposable workspace overlaps another run"
-            )
-    return parent, workspace
-
-
-def _require_disposable_capacity(parent: Path) -> int:
-    try:
-        free_bytes = shutil.disk_usage(parent).free
-    except OSError as exc:
-        raise CanaryError(
-            "CANARY_CAPACITY_FAILED", "cannot inspect free disk"
-        ) from exc
-    if free_bytes < MIN_FREE_BYTES:
-        raise CanaryError(
-            "CANARY_CAPACITY_FAILED",
-            "insufficient disk capacity",
-            details={"free_bytes": free_bytes, "required_bytes": MIN_FREE_BYTES},
-        )
-    return free_bytes
 
 
 class HostBackend:
@@ -1381,77 +480,6 @@ class HostBackend:
         self.runner = CommandRunner(deadline)
         self.sleep = sleep
         self._port_sockets: list[socket.socket] = []
-        self._provider_key: str | None = None
-        self._deepseek_model: str | None = None
-        self._deepseek_admission: dict[str, Any] | None = None
-        self._deepseek_candidates: list[tuple[str, dict[str, Any]]] = []
-
-    def _candidate_deepseek_routes(self) -> list[tuple[str, dict[str, Any]]]:
-        if not self._deepseek_candidates:
-            raise CanaryError(
-                "CANARY_ROUTE_NOT_ADMITTED",
-                "no bounded exact DeepSeek Sprint candidate passed route admission",
-            )
-        return list(self._deepseek_candidates)
-
-    @staticmethod
-    def _validate_credential_file(path: Path | None) -> Path:
-        if path is None:
-            raise CanaryError(
-                "CANARY_CREDENTIAL_INVALID",
-                "deepseek-sprint profile requires an authorized credential file",
-            )
-        candidate = path.resolve(strict=False)
-        try:
-            metadata = path.lstat()
-        except OSError as exc:
-            raise CanaryError(
-                "CANARY_CREDENTIAL_INVALID",
-                "authorized credential file is absent or unreadable",
-            ) from exc
-        if (
-            path.is_symlink()
-            or not stat.S_ISREG(metadata.st_mode)
-            or metadata.st_uid != os.getuid()
-            or stat.S_IMODE(metadata.st_mode) != 0o600
-            or not 16 <= metadata.st_size <= 4096
-            or candidate != path.absolute()
-        ):
-            raise CanaryError(
-                "CANARY_CREDENTIAL_INVALID",
-                "authorized credential file failed ownership, mode, size, or path checks",
-            )
-        return path
-
-    def _read_provider_key(self, path: Path | None) -> str:
-        source = self._validate_credential_file(path)
-        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
-        try:
-            descriptor = os.open(source, flags)
-            with os.fdopen(descriptor, "r", encoding="utf-8") as stream:
-                value = stream.read(4097).strip()
-        except (OSError, UnicodeError) as exc:
-            raise CanaryError(
-                "CANARY_CREDENTIAL_INVALID",
-                "authorized credential could not be read safely",
-            ) from exc
-        if not 16 <= len(value) <= 4096 or any(char.isspace() for char in value):
-            raise CanaryError(
-                "CANARY_CREDENTIAL_INVALID",
-                "authorized credential has an unsafe structure",
-            )
-        return value
-
-    def _runtime_env(self, facts: Preflight) -> dict[str, str]:
-        env = {
-            name: value
-            for name, value in os.environ.items()
-            if name not in PROVIDER_CREDENTIAL_ENV
-        }
-        env["SC_NET"] = facts.network
-        if self._provider_key is not None:
-            env["OLLAMA_API_KEY"] = self._provider_key
-        return env
 
     def _run(
         self,
@@ -1521,27 +549,21 @@ class HostBackend:
         self._port_sockets.clear()
 
     def preflight(self, config: CanaryConfig) -> Preflight:
-        if config.profile not in PROFILES:
-            raise CanaryError("CANARY_INPUT_INVALID", "canary profile is invalid")
         if not RUN_ID_RE.fullmatch(config.run_id):
             raise CanaryError("CANARY_INPUT_INVALID", "run_id is invalid")
         source = config.source_repo.resolve()
         target = config.dos_app_repo.resolve()
         receipt = config.receipt_path.resolve()
-        if config.temp_parent_explicit:
-            temp_parent, workspace = _validated_explicit_workspace(config)
-        else:
-            temp_parent = config.temp_parent.resolve()
-            workspace = temp_parent / f"{WORKSPACE_PREFIX}{config.run_id}"
-            if workspace.exists():
-                raise CanaryError(
-                    "CANARY_COLLISION", f"workspace already exists: {workspace}"
-                )
+        temp_parent = config.temp_parent.resolve()
+        workspace = temp_parent / f"{WORKSPACE_PREFIX}{config.run_id}"
+        if workspace.exists():
+            raise CanaryError(
+                "CANARY_COLLISION", f"workspace already exists: {workspace}"
+            )
         if workspace == receipt or workspace in receipt.parents:
             raise CanaryError(
                 "CANARY_INPUT_INVALID", "receipt must live outside disposable state"
             )
-        free_bytes = _require_disposable_capacity(temp_parent)
         for executable in ("git", "gh", "docker", "python3"):
             if shutil.which(executable) is None:
                 raise CanaryError(
@@ -1564,22 +586,6 @@ class HostBackend:
             )
         if not target.is_dir():
             raise CanaryError("CANARY_PREFLIGHT_FAILED", "dos_app_repo is missing")
-        if config.temp_parent_explicit:
-            worktrees: list[Path] = []
-            for repository_path in (source, target):
-                listing = self._git(
-                    repository_path,
-                    "worktree",
-                    "list",
-                    "--porcelain",
-                    label="protected Git worktree inventory",
-                )
-                worktrees.extend(
-                    Path(line.removeprefix("worktree "))
-                    for line in listing.stdout.splitlines()
-                    if line.startswith("worktree ")
-                )
-            _validated_explicit_workspace(config, protected_paths=worktrees)
         candidate = self._git(
             source,
             "rev-parse",
@@ -1657,38 +663,29 @@ class HostBackend:
                 details={"remaining": remaining, "required": MIN_GITHUB_REMAINING},
             )
         self._run(["docker", "info"], label="Docker capacity preflight")
-        image = self._run(
-            [
-                "docker",
-                "image",
-                "inspect",
-                "--format",
-                '{{ index .Config.Labels "sc.engine_ref" }}',
-                "super-coder-sandbox",
-            ],
+        self._run(
+            ["docker", "image", "inspect", "super-coder-sandbox"],
             label="sandbox image preflight",
-        ).stdout.strip()
-        if image != candidate:
-            raise CanaryError(
-                "CANARY_EXACT_REF_MISMATCH",
-                "sandbox image label does not match the candidate",
-                details={"expected": candidate, "actual": image or None},
-            )
+        )
         codex_auth = Path.home() / ".codex" / "auth.json"
         kimi_auth = Path.home() / ".kimi-code" / "credentials" / "kimi-code.json"
-        if not _nonempty_file(codex_auth) or (
-            config.profile == STANDARD_PROFILE and not _nonempty_file(kimi_auth)
-        ):
+        if not _nonempty_file(codex_auth) or not _nonempty_file(kimi_auth):
             raise CanaryError(
                 "CANARY_PREFLIGHT_FAILED",
-                (
-                    "Codex host credentials must be present"
-                    if config.profile == DEEPSEEK_SPRINT_PROFILE
-                    else "Codex and Kimi host credentials must both be present"
-                ),
+                "Codex and Kimi host credentials must both be present",
             )
-        if config.profile == DEEPSEEK_SPRINT_PROFILE:
-            self._validate_credential_file(config.credential_file)
+        try:
+            free_bytes = shutil.disk_usage(temp_parent).free
+        except OSError as exc:
+            raise CanaryError(
+                "CANARY_CAPACITY_FAILED", "cannot inspect free disk"
+            ) from exc
+        if free_bytes < MIN_FREE_BYTES:
+            raise CanaryError(
+                "CANARY_CAPACITY_FAILED",
+                "insufficient disk capacity",
+                details={"free_bytes": free_bytes, "required_bytes": MIN_FREE_BYTES},
+            )
 
         base_branch = f"{REMOTE_PREFIX}/{config.run_id}/base"
         head_branch = f"{REMOTE_PREFIX}/{config.run_id}/head"
@@ -1933,165 +930,25 @@ class HostBackend:
 
     def launch(
         self, config: CanaryConfig, facts: Preflight, ledger: ResourceLedger
-    ) -> dict[str, Any]:
+    ) -> dict[str, str]:
         self._release_ports()
-
-        def start_runtime(env: Mapping[str, str], *, label: str) -> None:
-            self._run(
-                [str(facts.workspace / "sc"), "launch", "--no-build"],
-                cwd=facts.workspace,
-                env=env,
-                label=label,
-            )
-            api = JsonHttp(f"http://127.0.0.1:{facts.api_port}", self.deadline)
-            while True:
-                try:
-                    health = api.request("GET", "/api/health")
-                    if health:
-                        return
-                except CanaryError:
-                    pass
-                self.deadline.remaining()
-                self.sleep(min(config.poll_interval_s, self.deadline.remaining()))
-
-        nonsecret_env = self._runtime_env(facts)
-        start_runtime(nonsecret_env, label="launch non-secret route probe")
+        env = {**os.environ, "SC_NET": facts.network}
         self._run(
-            ["docker", "exec", facts.container, "./sc", "models", "refresh"],
-            label="refresh exact-image model routes",
-        )
-        codex_resolution = _json_output(
-            self._run(
-                [
-                    "docker",
-                    "exec",
-                    facts.container,
-                    "./sc",
-                    "models",
-                    "resolve",
-                    "codex",
-                    "gpt-5.6-terra",
-                    "--json",
-                ],
-                label="resolve exact-image codex route",
-            ),
-            label="resolve exact-image codex route",
-        )
-        if (
-            not isinstance(codex_resolution, dict)
-            or codex_resolution.get("ok") is not True
-        ):
-            raise CanaryError(
-                "CANARY_ROUTE_NOT_CANONICAL",
-                "exact-image codex route did not resolve",
-                details={"harness": "codex", "selector": "gpt-5.6-terra"},
-            )
-        self._run(
-            [str(facts.workspace / "sc"), "down"],
+            [str(facts.workspace / "sc"), "launch", "--no-build"],
             cwd=facts.workspace,
-            env=nonsecret_env,
-            label="stop non-secret route probe",
+            env=env,
+            label="launch isolated runtime",
         )
-        stopped = self._run(
-            ["docker", "container", "inspect", facts.container],
-            check=False,
-            label="verify non-secret route probe stopped",
-        )
-        if stopped.returncode == 0:
-            raise CanaryError(
-                "CANARY_CLEANUP_FAILED",
-                "non-secret route probe container remained after stop",
-            )
-
-        if config.profile == DEEPSEEK_SPRINT_PROFILE:
-            self._provider_key = "sc-loopback-restart-rehearsal-only"
-            rehearsal_env = self._runtime_env(facts)
+        api = JsonHttp(f"http://127.0.0.1:{facts.api_port}", self.deadline)
+        while True:
             try:
-                start_runtime(
-                    rehearsal_env,
-                    label="launch credential-free exact-session rehearsal",
-                )
-                restart_rehearsal = self._credential_free_restart_rehearsal(
-                    JsonHttp(f"http://127.0.0.1:{facts.api_port}", self.deadline),
-                    config,
-                    facts,
-                    rehearsal_env,
-                )
-                self._run(
-                    [str(facts.workspace / "sc"), "down"],
-                    cwd=facts.workspace,
-                    env=rehearsal_env,
-                    label="stop credential-free exact-session rehearsal",
-                )
-                stopped = self._run(
-                    ["docker", "container", "inspect", facts.container],
-                    check=False,
-                    label="verify exact-session rehearsal stopped",
-                )
-                if stopped.returncode == 0:
-                    raise CanaryError(
-                        "CANARY_CLEANUP_FAILED",
-                        "exact-session rehearsal container remained after stop",
-                    )
-            finally:
-                self._provider_key = None
-            self._provider_key = self._read_provider_key(config.credential_file)
-        else:
-            restart_rehearsal = None
-        env = self._runtime_env(facts)
-        start_runtime(env, label="launch isolated runtime")
-        if config.profile == DEEPSEEK_SPRINT_PROFILE:
-            self._run(
-                ["docker", "exec", facts.container, "./sc", "models", "refresh"],
-                check=False,
-                label="refresh admitted deepseek route",
-            )
-            candidates = _validated_deepseek_candidates(
-                self._run(
-                    [
-                        "docker",
-                        "exec",
-                        facts.container,
-                        "./sc",
-                        "models",
-                        "list",
-                        "deepseek",
-                    ],
-                    check=False,
-                    label="list bounded deepseek candidates",
-                )
-            )
-            admitted_candidates: list[tuple[str, dict[str, Any]]] = []
-            for candidate in candidates:
-                admission = _validated_route_admission(
-                    self._run(
-                        [
-                            "docker",
-                            "exec",
-                            facts.container,
-                            "./sc",
-                            "models",
-                            "resolve",
-                            "deepseek",
-                            candidate,
-                            "--sprint-admission-json",
-                        ],
-                        check=False,
-                        label="resolve bounded deepseek candidate",
-                    ),
-                    candidate,
-                )
-                if admission["admitted"]:
-                    admitted_candidates.append((candidate, admission))
-            if not admitted_candidates:
-                raise CanaryError(
-                    "CANARY_ROUTE_NOT_ADMITTED",
-                    "no bounded exact DeepSeek Sprint candidate was admitted",
-                )
-            self._deepseek_candidates = admitted_candidates
-            route_admission = None
-        else:
-            route_admission = None
+                health = api.request("GET", "/api/health")
+                if health:
+                    break
+            except CanaryError:
+                pass
+            self.deadline.remaining()
+            self.sleep(min(config.poll_interval_s, self.deadline.remaining()))
         status = self._run(
             [str(facts.workspace / "sc"), "harness-status"],
             cwd=facts.workspace,
@@ -2100,286 +957,21 @@ class HostBackend:
         ).stdout
         versions: dict[str, str] = {}
         for line in status.splitlines():
-            match = re.match(
-                r"\s*(claude|codex|deepseek|kimi|opencode)\s+(.+?)\s*$", line
-            )
+            match = re.match(r"\s*(claude|codex|kimi|opencode)\s+(.+?)\s*$", line)
             if match:
                 versions[match.group(1)] = redact_text(match.group(2))[:160]
-        required = (
-            {"codex", "deepseek"}
-            if config.profile == DEEPSEEK_SPRINT_PROFILE
-            else {"codex", "kimi"}
-        )
-        if not required.issubset(versions):
+        if "codex" not in versions or "kimi" not in versions:
             raise CanaryError(
                 "CANARY_RUNTIME_PROVENANCE_MISSING",
-                "launched runtime did not report every profile harness version",
+                "launched runtime did not report Codex and Kimi versions",
             )
-        return {
-            "versions": versions,
-            "route_admission": route_admission,
-            "restart_rehearsal": restart_rehearsal,
-        }
-
-    def _restart_helper(
-        self,
-        facts: Preflight,
-        *args: str,
-        label: str,
-    ) -> CommandResult:
-        return self._run(
-            [
-                "docker",
-                "exec",
-                facts.container,
-                "python3",
-                RESTART_REHEARSAL_HELPER,
-                *args,
-            ],
-            check=False,
-            label=label,
-        )
-
-    def _start_restart_provider(self, facts: Preflight) -> None:
-        launched = self._run(
-            [
-                "docker",
-                "exec",
-                "--detach",
-                facts.container,
-                "python3",
-                RESTART_REHEARSAL_HELPER,
-                "provider",
-                "--port",
-                str(RESTART_REHEARSAL_PORT),
-            ],
-            check=False,
-            label="start credential-free loopback provider",
-        )
-        if launched.returncode != 0:
-            raise CanaryError(
-                "CANARY_RESTART_RECOVERY_FAILED",
-                "credential-free loopback provider did not start",
-                details={"restart": {"schema_version": 1, "category": "unknown"}},
-            )
-        for _attempt in range(30):
-            probe = self._restart_helper(
-                facts,
-                "provider-probe",
-                "--port",
-                str(RESTART_REHEARSAL_PORT),
-                label="probe credential-free loopback provider",
-            )
-            try:
-                payload = json.loads(probe.stdout or "null")
-            except json.JSONDecodeError:
-                payload = None
-            if probe.returncode == 0 and payload == {"ok": True}:
-                return
-            self.deadline.remaining()
-            self.sleep(min(0.1, self.deadline.remaining()))
-        raise CanaryError(
-            "CANARY_RESTART_RECOVERY_FAILED",
-            "credential-free loopback provider did not become ready",
-            details={"restart": {"schema_version": 1, "category": "unknown"}},
-        )
-
-    def _restart_probe(
-        self,
-        facts: Preflight,
-        conversation_id: str,
-        *,
-        native: bool,
-        expected_model: str,
-    ) -> dict[str, Any]:
-        args = ["probe", "--conversation", conversation_id]
-        if native:
-            args.append("--native")
-        return _validated_restart_probe(
-            self._restart_helper(facts, *args, label="read bounded restart evidence"),
-            expected_model,
-        )
-
-    def _wait_health(self, api: JsonHttp, config: CanaryConfig) -> None:
-        while True:
-            try:
-                if api.request("GET", "/api/health"):
-                    return
-            except CanaryError:
-                pass
-            try:
-                self.deadline.remaining()
-            except CanaryError as exc:
-                raise CanaryError(
-                    "CANARY_RESTART_RECOVERY_FAILED",
-                    "restarted runtime did not become healthy before its deadline",
-                    details={
-                        "restart": {
-                            "schema_version": 1,
-                            "category": "restart-timeout",
-                        }
-                    },
-                ) from exc
-            self.sleep(min(config.poll_interval_s, self.deadline.remaining()))
-
-    def _run_exact_restart(
-        self,
-        facts: Preflight,
-        env: Mapping[str, str],
-    ) -> None:
-        try:
-            result = self._run(
-                [str(facts.workspace / "sc"), "restart", "--yes", "--no-build"],
-                cwd=facts.workspace,
-                env=env,
-                check=False,
-                label="restart exact DeepSeek canary runtime",
-            )
-        except CanaryError as exc:
-            if exc.code != "CANARY_COMMAND_TIMEOUT":
-                raise
-            raise CanaryError(
-                "CANARY_RESTART_RECOVERY_FAILED",
-                "exact-session restart exceeded its deadline",
-                details={"restart": {"schema_version": 1, "category": "restart-timeout"}},
-            ) from exc
-        category = _restart_command_category(result)
-        if category is not None:
-            raise CanaryError(
-                "CANARY_RESTART_RECOVERY_FAILED",
-                "exact-session restart command was rejected",
-                details={"restart": {"schema_version": 1, "category": category}},
-            )
-
-    def _credential_free_restart_rehearsal(
-        self,
-        api: JsonHttp,
-        config: CanaryConfig,
-        facts: Preflight,
-        env: Mapping[str, str],
-    ) -> dict[str, Any]:
-        self._start_restart_provider(facts)
-        prepared = self._restart_helper(
-            facts,
-            "prepare",
-            "--shortname",
-            "REV1",
-            "--endpoint",
-            f"http://127.0.0.1:{RESTART_REHEARSAL_PORT}/v1",
-            label="prepare credential-free exact-session rehearsal",
-        )
-        try:
-            payload = json.loads(prepared.stdout or "null")
-        except json.JSONDecodeError:
-            payload = None
-        conversation_id = payload.get("conversation_id") if isinstance(payload, dict) else None
-        if (
-            prepared.returncode != 0
-            or not isinstance(payload, dict)
-            or set(payload)
-            != {"ok", "candidate_sha", "conversation_id", "provider", "model", "binding_digest"}
-            or payload.get("ok") is not True
-            or payload.get("candidate_sha") != facts.candidate_sha
-            or payload.get("provider") != DEEPSEEK_PROVIDER
-            or payload.get("model") != RESTART_REHEARSAL_MODEL
-            or not isinstance(conversation_id, str)
-            or CONVERSATION_ID_RE.fullmatch(conversation_id) is None
-        ):
-            raise CanaryError(
-                "CANARY_RESTART_RECOVERY_FAILED",
-                "credential-free restart fixture violated its bounded contract",
-                details={"restart": {"schema_version": 1, "category": "unknown"}},
-            )
-        try:
-            self._message(
-                api,
-                conversation_id,
-                "Reply with only restart-rehearsal-before.",
-                f"{config.run_id}:restart-rehearsal:before",
-            )
-            self._wait_idle(api, conversation_id, config, facts)
-            before = self._restart_probe(
-                facts,
-                conversation_id,
-                native=False,
-                expected_model=RESTART_REHEARSAL_MODEL,
-            )
-            self._run_exact_restart(facts, env)
-            self._wait_health(api, config)
-            self._start_restart_provider(facts)
-            self._message(
-                api,
-                conversation_id,
-                "Resume this exact native session; reply with only restart-rehearsal-after.",
-                f"{config.run_id}:restart-rehearsal:after",
-            )
-            self._wait_idle(api, conversation_id, config, facts)
-            after = self._restart_probe(
-                facts,
-                conversation_id,
-                native=True,
-                expected_model=RESTART_REHEARSAL_MODEL,
-            )
-            result = _restart_result(
-                before,
-                after,
-                command_exit_class="success",
-                command_exit_status=0,
-                expected_model=RESTART_REHEARSAL_MODEL,
-            )
-            if not _restart_passed(result):
-                raise CanaryError(
-                    "CANARY_RESTART_RECOVERY_FAILED",
-                    "credential-free exact-session rehearsal did not preserve identity",
-                    details={"restart": result},
-                )
-            return result
-        finally:
-            cleaned = self._restart_helper(
-                facts,
-                "cleanup",
-                "--conversation",
-                conversation_id,
-                label="clean credential-free exact-session rehearsal",
-            )
-            try:
-                cleanup_payload = json.loads(cleaned.stdout or "null")
-            except json.JSONDecodeError:
-                cleanup_payload = None
-            if cleaned.returncode != 0 or cleanup_payload != {
-                "conversation_retired": True,
-                "ok": True,
-                "root_removed": True,
-            }:
-                category = (
-                    cleanup_payload.get("category")
-                    if isinstance(cleanup_payload, dict)
-                    and set(cleanup_payload) == {"ok", "category"}
-                    and cleanup_payload.get("ok") is False
-                    else None
-                )
-                if category in RESTART_CATEGORIES:
-                    raise CanaryError(
-                        "CANARY_RESTART_RECOVERY_FAILED",
-                        "credential-free exact-session rehearsal cleanup was rejected",
-                        details={
-                            "restart": {
-                                "schema_version": 1,
-                                "category": category,
-                            }
-                        },
-                    )
-                raise CanaryError(
-                    "CANARY_CLEANUP_FAILED",
-                    "credential-free exact-session rehearsal cleanup was incomplete",
-                )
+        return versions
 
     def _wait_idle(
         self,
         api: JsonHttp,
         conversation_id: str,
         config: CanaryConfig,
-        facts: Preflight,
     ) -> dict[str, Any]:
         while True:
             conversation = api.request("GET", f"/api/conversations/{conversation_id}")
@@ -2401,94 +993,10 @@ class HostBackend:
                     details={
                         "conversation_id": conversation_id,
                         "state": conversation.get("state"),
-                        "failure": self._conversation_failure_evidence(
-                            facts, conversation_id
-                        ),
                     },
                 )
             self.deadline.remaining()
             self.sleep(min(config.poll_interval_s, self.deadline.remaining()))
-
-    def _conversation_failure_evidence(
-        self, facts: Preflight, conversation_id: str
-    ) -> dict[str, Any]:
-        if not CONVERSATION_ID_RE.fullmatch(conversation_id):
-            return {"diagnostic": "invalid_conversation_id"}
-        query = (
-            "SELECT state,error_code,error_detail FROM conversation_runs "
-            f"WHERE conversation_id='{conversation_id}' "
-            "ORDER BY run_id DESC LIMIT 1;"
-        )
-        result = self._run(
-            ["docker", "exec", facts.container, "./sc", "sql", "-json", query],
-            check=False,
-            label="read bounded participant failure",
-        )
-        if result.returncode != 0:
-            return {"diagnostic": "unavailable"}
-        try:
-            rows = json.loads(result.stdout or "[]")
-        except json.JSONDecodeError:
-            return {"diagnostic": "invalid"}
-        if not isinstance(rows, list) or len(rows) != 1 or not isinstance(rows[0], dict):
-            return {"diagnostic": "absent"}
-        row = rows[0]
-        error_code = str(row.get("error_code") or "")
-        try:
-            evidence = json.loads(str(row.get("error_detail") or ""))
-        except json.JSONDecodeError:
-            return {
-                "run_state": row.get("state"),
-                "error_code": error_code or None,
-                "diagnostic": "structured_evidence_invalid",
-            }
-        valid = (
-            isinstance(evidence, dict)
-            and set(evidence) == PARTICIPANT_FAILURE_KEYS
-            and evidence.get("schema_version") == 1
-            and evidence.get("source") in PARTICIPANT_FAILURE_SOURCES
-            and evidence.get("phase") in PARTICIPANT_FAILURE_PHASES
-            and evidence.get("category") in PARTICIPANT_FAILURE_CATEGORIES
-            and evidence.get("purpose") in PARTICIPANT_FAILURE_PURPOSES
-            and (
-                evidence.get("upstream_code") is None
-                or evidence.get("upstream_code") in PARTICIPANT_UPSTREAM_CODES
-                or (
-                    isinstance(evidence.get("upstream_code"), str)
-                    and PARTICIPANT_HTTP_CODE.fullmatch(
-                        evidence["upstream_code"]
-                    )
-                    is not None
-                )
-            )
-            and (
-                evidence.get("http_status") is None
-                or isinstance(evidence.get("http_status"), int)
-                and not isinstance(evidence.get("http_status"), bool)
-                and 100 <= evidence["http_status"] <= 599
-            )
-            and all(
-                isinstance(evidence.get(key), bool)
-                for key in (
-                    "provider_request_observed",
-                    "provider_exact",
-                    "model_exact",
-                    "reserved_default_omitted",
-                    "shell_tool_declared",
-                )
-            )
-        )
-        if not valid:
-            return {
-                "run_state": row.get("state"),
-                "error_code": error_code or None,
-                "diagnostic": "structured_evidence_mismatch",
-            }
-        return {
-            "run_state": row.get("state"),
-            "error_code": error_code or None,
-            **evidence,
-        }
 
     @staticmethod
     def _shells(payload: dict[str, Any]) -> dict[str, int]:
@@ -2531,614 +1039,18 @@ class HostBackend:
             raise CanaryError("CANARY_QAQC_FAILED", "reviewer did not record approval")
         return int(rows[0]["approval_id"])
 
-    @staticmethod
-    def _qaqc_invocation(arguments: Any, document_id: int) -> bool:
-        if isinstance(arguments, str):
-            try:
-                decoded = json.loads(arguments)
-            except json.JSONDecodeError:
-                decoded = {"cmd": arguments}
-        elif isinstance(arguments, dict):
-            decoded = arguments
-        else:
-            return False
-        command = decoded.get("cmd") or decoded.get("command")
-        if not isinstance(command, str):
-            return False
-        try:
-            argv = shlex.split(command)
-        except ValueError:
-            return False
-        return argv in (
-            [
-                "./sc",
-                "sprint",
-                "record-qaqc",
-                "--document",
-                str(document_id),
-                "--verdict",
-                "pass",
-            ],
-            [
-                "sc",
-                "sprint",
-                "record-qaqc",
-                "--document",
-                str(document_id),
-                "--verdict",
-                "pass",
-            ],
-        )
-
-    @staticmethod
-    def _qaqc_receipt_values(value: Any) -> list[dict[str, Any]]:
-        receipts: list[dict[str, Any]] = []
-
-        def visit(item: Any, depth: int = 0) -> None:
-            if depth > 8:
-                return
-            if isinstance(item, dict):
-                if {
-                    "approval_id",
-                    "revision_sha256",
-                    "verdict",
-                    "created",
-                }.issubset(item):
-                    receipts.append(item)
-                for child in item.values():
-                    visit(child, depth + 1)
-                return
-            if isinstance(item, list):
-                for child in item[:128]:
-                    visit(child, depth + 1)
-                return
-            if not isinstance(item, str) or len(item.encode()) > 65536:
-                return
-            try:
-                decoded = json.loads(item)
-            except json.JSONDecodeError:
-                return
-            if decoded != item:
-                visit(decoded, depth + 1)
-
-        visit(value)
-        return receipts
-
-    @staticmethod
-    def _validate_qaqc_evidence(evidence: dict[str, Any]) -> dict[str, Any]:
-        if set(evidence) != QAQC_EVIDENCE_KEYS:
-            raise CanaryError(
-                "CANARY_QAQC_EVIDENCE_INVALID",
-                "QA/QC evidence escaped its fixed top-level allowlist",
-            )
-        boot = evidence.get("boot")
-        command = evidence.get("record_qaqc")
-        action_receipt = evidence.get("action_receipt")
-        if not isinstance(boot, dict) or set(boot) != QAQC_BOOT_KEYS:
-            raise CanaryError(
-                "CANARY_QAQC_EVIDENCE_INVALID",
-                "QA/QC boot evidence escaped its fixed allowlist",
-            )
-        if not isinstance(command, dict) or set(command) != QAQC_COMMAND_KEYS:
-            raise CanaryError(
-                "CANARY_QAQC_EVIDENCE_INVALID",
-                "QA/QC command evidence escaped its fixed allowlist",
-            )
-        if (
-            not isinstance(action_receipt, dict)
-            or set(action_receipt) != QAQC_ACTION_RECEIPT_KEYS
-        ):
-            raise CanaryError(
-                "CANARY_QAQC_EVIDENCE_INVALID",
-                "QA/QC action receipt evidence escaped its fixed allowlist",
-            )
-        if evidence.get("terminal") not in QAQC_TERMINAL_CLASSES:
-            raise CanaryError(
-                "CANARY_QAQC_EVIDENCE_INVALID",
-                "QA/QC terminal evidence is not a bounded category",
-            )
-        if command.get("exit_class") not in QAQC_EXIT_CLASSES:
-            raise CanaryError(
-                "CANARY_QAQC_EVIDENCE_INVALID",
-                "QA/QC command exit evidence is not a bounded category",
-            )
-        if evidence.get("postcondition") not in QAQC_POSTCONDITIONS:
-            raise CanaryError(
-                "CANARY_QAQC_EVIDENCE_INVALID",
-                "QA/QC postcondition evidence is not a bounded category",
-            )
-        if any(value not in {"resolved", "missing", "mismatch"} for value in boot.values()):
-            raise CanaryError(
-                "CANARY_QAQC_EVIDENCE_INVALID",
-                "QA/QC boot evidence is not a bounded category",
-            )
-        if not isinstance(command.get("observed"), bool):
-            raise CanaryError(
-                "CANARY_QAQC_EVIDENCE_INVALID",
-                "QA/QC observation evidence is not boolean",
-            )
-        count = command.get("invocation_count")
-        if not isinstance(count, int) or isinstance(count, bool) or not 0 <= count <= 64:
-            raise CanaryError(
-                "CANARY_QAQC_EVIDENCE_INVALID",
-                "QA/QC invocation count is outside its bound",
-            )
-        if not isinstance(command.get("receipt"), bool):
-            raise CanaryError(
-                "CANARY_QAQC_EVIDENCE_INVALID",
-                "QA/QC receipt evidence is not boolean",
-            )
-        if command.get("identity") not in {"matched", "mismatch", "absent"}:
-            raise CanaryError(
-                "CANARY_QAQC_EVIDENCE_INVALID",
-                "QA/QC receipt identity is not a bounded category",
-            )
-        receipt_count = action_receipt.get("count")
-        if (
-            not isinstance(receipt_count, int)
-            or isinstance(receipt_count, bool)
-            or not 0 <= receipt_count <= 64
-        ):
-            raise CanaryError(
-                "CANARY_QAQC_EVIDENCE_INVALID",
-                "QA/QC action receipt count is outside its bound",
-            )
-        if action_receipt.get("identity") not in QAQC_ACTION_RECEIPT_IDENTITIES:
-            raise CanaryError(
-                "CANARY_QAQC_EVIDENCE_INVALID",
-                "QA/QC action receipt identity is not a bounded category",
-            )
-        return evidence
-
-    @staticmethod
-    def _qaqc_evidence_passed(evidence: Mapping[str, Any]) -> bool:
-        boot = evidence.get("boot")
-        action_receipt = evidence.get("action_receipt")
-        return (
-            isinstance(boot, dict)
-            and set(boot) == QAQC_BOOT_KEYS
-            and all(value == "resolved" for value in boot.values())
-            and evidence.get("terminal") == "succeeded"
-            and isinstance(action_receipt, dict)
-            and action_receipt.get("count") == 1
-            and action_receipt.get("identity") == "matched"
-            and evidence.get("postcondition") == "approved"
-        )
-
-    def _qaqc_action_evidence(
-        self,
-        api: JsonHttp,
-        facts: Preflight,
-        reviewer_id: str,
-        *,
-        sprint_id: int | None,
-        reviewer_shell_id: int,
-        document_id: int,
-    ) -> tuple[int | None, dict[str, Any]]:
-        if not CONVERSATION_ID_RE.fullmatch(reviewer_id):
-            raise CanaryError(
-                "CANARY_QAQC_EVIDENCE_INVALID",
-                "Reviewer conversation identity is invalid",
-            )
-        conversation_query = (
-            "SELECT c.harness,c.state,c.shell_id,c.worktree,s.flavor,s.shortname,"
-            "boot.content_sha256,boot.content_bytes,"
-            "instr(boot.content,'sprint_rev')>0 has_sprint_rev,"
-            "(SELECT r.state FROM conversation_runs r "
-            " WHERE r.conversation_id=c.conversation_id "
-            " ORDER BY r.run_id DESC LIMIT 1) terminal_state,"
-            "(SELECT r.run_id FROM conversation_runs r "
-            " WHERE r.conversation_id=c.conversation_id "
-            " ORDER BY r.run_id DESC LIMIT 1) terminal_run_id,"
-            "(SELECT archive.session_id FROM conversation_runs r "
-            " JOIN shell_memory_archives archive ON archive.archive_id=r.archive_id "
-            " WHERE r.conversation_id=c.conversation_id "
-            " ORDER BY r.run_id DESC LIMIT 1) terminal_session_id "
-            "FROM conversations c JOIN shells s ON s.shell_id=c.shell_id "
-            "LEFT JOIN conversation_boot_snapshots boot "
-            "ON boot.conversation_id=c.conversation_id "
-            f"WHERE c.conversation_id='{reviewer_id}';"
-        )
-        conversation_rows = _json_output(
-            self._run(
-                [
-                    "docker",
-                    "exec",
-                    facts.container,
-                    "./sc",
-                    "sql",
-                    "-json",
-                    conversation_query,
-                ],
-                label="read bounded QA/QC boot evidence",
-            ),
-            label="read bounded QA/QC boot evidence",
-        )
-        row = conversation_rows[0] if len(conversation_rows) == 1 else None
-        if not isinstance(row, dict):
-            row = {}
-
-        terminal = str(row.get("terminal_state") or "missing")
-        if len(conversation_rows) != 1:
-            terminal = "ambiguous"
-        elif terminal not in QAQC_TERMINAL_CLASSES:
-            terminal = "unknown"
-
-        skill_source = facts.workspace / ".super-coder" / "assets" / "skills" / "sprint_rev" / "SKILL.md"
-        composition = facts.workspace / ".super-coder" / "assets" / "deepseek" / "cordis-ollama-cloud.yml"
-        engine_ref = facts.workspace / ".sc-state" / "engine.ref"
-        try:
-            skill_body = skill_source.read_text()
-        except (OSError, UnicodeError):
-            skill_body = ""
-        try:
-            composition_body = composition.read_text()
-        except (OSError, UnicodeError):
-            composition_body = ""
-        try:
-            installed_ref = engine_ref.read_text().strip()
-        except (OSError, UnicodeError):
-            installed_ref = ""
-        worktree = row.get("worktree")
-        candidate_worktree = False
-        if isinstance(worktree, str):
-            try:
-                Path(worktree).resolve().relative_to(facts.workspace.resolve())
-            except (OSError, ValueError):
-                pass
-            else:
-                candidate_worktree = True
-        boot = {
-            "role": (
-                "resolved"
-                if row.get("shell_id") == reviewer_shell_id
-                and row.get("flavor") == "reviewer"
-                and str(row.get("shortname") or "").upper() == "REV1"
-                else "mismatch"
-            ),
-            "skill": (
-                "resolved"
-                if bool(row.get("has_sprint_rev"))
-                and isinstance(row.get("content_sha256"), str)
-                and len(str(row["content_sha256"])) == 64
-                else "missing"
-            ),
-            "shell_tool": (
-                "resolved"
-                if row.get("harness") == "deepseek"
-                and "- id: bash" in composition_body
-                and "@deepseek-ai/dsh-bash-local" in composition_body
-                else "missing"
-            ),
-            "candidate": (
-                "resolved"
-                if installed_ref == facts.candidate_sha
-                and candidate_worktree
-                else "mismatch"
-            ),
-            "predeclaration": (
-                "resolved"
-                if "pre-declaration QAQC" in skill_body
-                and "sc sprint record-qaqc" in skill_body
-                else "missing"
-            ),
-        }
-
-        event_query = (
-            "SELECT event_type,payload FROM conversation_events "
-            f"WHERE conversation_id='{reviewer_id}' "
-            "AND event_type IN ('tool.started','tool.completed') "
-            "AND run_id=(SELECT run_id FROM conversation_runs "
-            f"WHERE conversation_id='{reviewer_id}' "
-            "ORDER BY run_id DESC LIMIT 1) "
-            "ORDER BY sequence;"
-        )
-        event_rows = _json_output(
-            self._run(
-                [
-                    "docker",
-                    "exec",
-                    facts.container,
-                    "./sc",
-                    "sql",
-                    "-json",
-                    event_query,
-                ],
-                label="inspect bounded QA/QC action events",
-            ),
-            label="inspect bounded QA/QC action events",
-        )
-        tool_started: list[tuple[str, dict[str, Any]]] = []
-        completed: dict[str, list[dict[str, Any]]] = {}
-        for event in event_rows if isinstance(event_rows, list) else []:
-            if not isinstance(event, dict):
-                continue
-            try:
-                payload = json.loads(str(event.get("payload") or "{}"))
-            except json.JSONDecodeError:
-                continue
-            if not isinstance(payload, dict):
-                continue
-            tool_ref = payload.get("tool_ref")
-            if not isinstance(tool_ref, str) or not tool_ref:
-                continue
-            if event.get("event_type") == "tool.started":
-                tool_started.append((tool_ref, payload))
-            elif event.get("event_type") == "tool.completed":
-                completed.setdefault(tool_ref, []).append(payload)
-
-        approval_query = (
-            "SELECT a.approval_id,a.document_id,a.revision_sha256,"
-            "a.reviewer_shell_id,a.verdict,d.body FROM documents d "
-            "LEFT JOIN sprint_spec_approvals a ON a.document_id=d.document_id "
-            f"WHERE d.document_id={document_id} ORDER BY a.approval_id;"
-        )
-        approval_rows = _json_output(
-            self._run(
-                [
-                    "docker",
-                    "exec",
-                    facts.container,
-                    "./sc",
-                    "sql",
-                    "-json",
-                    approval_query,
-                ],
-                label="read bounded QA/QC durable postcondition",
-            ),
-            label="read bounded QA/QC durable postcondition",
-        )
-        document_rows = [row for row in approval_rows if isinstance(row, dict)]
-        document_body = document_rows[0].get("body") if document_rows else None
-        revision = (
-            hashlib.sha256(document_body.encode()).hexdigest()
-            if isinstance(document_body, str)
-            else None
-        )
-        approvals = [row for row in document_rows if isinstance(row.get("approval_id"), int)]
-        exact = [
-            row
-            for row in approvals
-            if row.get("reviewer_shell_id") == reviewer_shell_id
-            and row.get("revision_sha256") == revision
-            and row.get("verdict") == "pass"
-        ]
-        if len(exact) == 1:
-            postcondition = "approved"
-            approval_id = int(exact[0]["approval_id"])
-        elif len(exact) > 1:
-            postcondition = "ambiguous"
-            approval_id = None
-        elif any(row.get("reviewer_shell_id") != reviewer_shell_id for row in approvals):
-            postcondition = "reviewer_mismatch"
-            approval_id = None
-        elif any(row.get("revision_sha256") != revision for row in approvals):
-            postcondition = "revision_mismatch"
-            approval_id = None
-        elif any(row.get("verdict") != "pass" for row in approvals):
-            postcondition = "verdict_mismatch"
-            approval_id = None
-        else:
-            postcondition = "absent"
-            approval_id = None
-
-        receipt_count = 0
-        action_identity = "absent"
-        if sprint_id is not None:
-            binding_query = (
-                "SELECT sprint.conversation_generation,participant.participant_id "
-                "FROM sprints sprint JOIN sprint_participants participant "
-                "ON participant.sprint_id=sprint.sprint_id "
-                f"WHERE sprint.sprint_id={sprint_id} "
-                f"AND participant.shell_id={reviewer_shell_id} "
-                "AND participant.role='reviewer';"
-            )
-            binding_rows = _json_output(
-                self._run(
-                    [
-                        "docker",
-                        "exec",
-                        facts.container,
-                        "./sc",
-                        "sql",
-                        "-json",
-                        binding_query,
-                    ],
-                    label="read bounded QA/QC participant binding",
-                ),
-                label="read bounded QA/QC participant binding",
-            )
-            binding = binding_rows[0] if len(binding_rows) == 1 else {}
-            events_page = api.request(
-                "GET", f"/api/sprints/{sprint_id}/events?limit=100"
-            )
-            receipt_events = [
-                item
-                for item in events_page.get("items") or []
-                if isinstance(item, dict)
-                and item.get("type") == "qaqc.action_recorded"
-            ]
-            receipt_count = min(len(receipt_events), 64)
-            if not receipt_events:
-                action_identity = "absent"
-            elif len(receipt_events) != 1:
-                action_identity = "duplicate"
-            else:
-                event = receipt_events[0]
-                details = event.get("details")
-                actor = event.get("actor")
-                required_receipt_keys = {
-                    "action_kind",
-                    "sprint_id",
-                    "participant_id",
-                    "reviewer_shell_id",
-                    "role",
-                    "assignment_generation",
-                    "conversation_id",
-                    "session_id",
-                    "run_id",
-                    "candidate_sha",
-                    "document_id",
-                    "revision_sha256",
-                    "review_phase",
-                    "approval_id",
-                    "approval_created",
-                }
-                if (
-                    not isinstance(details, dict)
-                    or set(details) != required_receipt_keys
-                    or not isinstance(actor, dict)
-                    or details.get("action_kind") != "record-qaqc"
-                ):
-                    action_identity = "malformed"
-                elif details.get("sprint_id") != sprint_id:
-                    action_identity = "sprint_mismatch"
-                elif details.get("participant_id") != binding.get("participant_id"):
-                    action_identity = "participant_mismatch"
-                elif (
-                    details.get("reviewer_shell_id") != reviewer_shell_id
-                    or actor.get("shell_id") != reviewer_shell_id
-                    or actor.get("kind") != "participant"
-                ):
-                    action_identity = "shell_mismatch"
-                elif details.get("role") != "reviewer":
-                    action_identity = "role_mismatch"
-                elif details.get("assignment_generation") != binding.get(
-                    "conversation_generation"
-                ):
-                    action_identity = "generation_mismatch"
-                elif details.get("conversation_id") != reviewer_id:
-                    action_identity = "conversation_mismatch"
-                elif details.get("session_id") != row.get("terminal_session_id"):
-                    action_identity = "session_mismatch"
-                elif details.get("run_id") != row.get("terminal_run_id"):
-                    action_identity = "run_mismatch"
-                elif details.get("candidate_sha") != facts.candidate_sha:
-                    action_identity = "candidate_mismatch"
-                elif (
-                    details.get("document_id") != document_id
-                    or details.get("revision_sha256") != revision
-                ):
-                    action_identity = "spec_mismatch"
-                elif details.get("review_phase") != "pre-arm-qaqc":
-                    action_identity = "phase_mismatch"
-                elif approval_id is None or details.get("approval_id") != approval_id:
-                    action_identity = "approval_mismatch"
-                elif details.get("approval_created") is not True:
-                    action_identity = "row_mismatch"
-                else:
-                    action_identity = "matched"
-
-        receipt_matches_by_ref: dict[str, list[dict[str, Any]]] = {}
-        for tool_ref, _payload in tool_started:
-            receipts = [
-                receipt
-                for completion in completed.get(tool_ref, [])
-                for receipt in self._qaqc_receipt_values(completion)
-                if approval_id is not None
-                and receipt.get("approval_id") == approval_id
-                and receipt.get("revision_sha256") == revision
-                and receipt.get("verdict") == "pass"
-                and isinstance(receipt.get("created"), bool)
-            ]
-            if receipts:
-                receipt_matches_by_ref[tool_ref] = receipts
-        started = [
-            (tool_ref, payload)
-            for tool_ref, payload in tool_started
-            if self._qaqc_invocation(payload.get("arguments"), document_id)
-            or tool_ref in receipt_matches_by_ref
-        ]
-        completions = [
-            item
-            for tool_ref, _payload in started
-            for item in completed.get(tool_ref, [])
-        ]
-        statuses = {str(item.get("status") or "") for item in completions}
-        if not started:
-            exit_class = "not_invoked"
-        elif any(len(completed.get(tool_ref, [])) != 1 for tool_ref, _payload in started):
-            exit_class = "missing_completion" if not completions else "ambiguous"
-        elif statuses == {"completed"}:
-            exit_class = "success"
-        elif statuses == {"failed"}:
-            exit_class = "failure"
-        else:
-            exit_class = "ambiguous"
-
-        returned_receipts = [
-            receipt
-            for completion in completions
-            for receipt in self._qaqc_receipt_values(completion)
-        ]
-        matched_receipts = [
-            receipt
-            for tool_ref, _payload in started
-            for receipt in receipt_matches_by_ref.get(tool_ref, [])
-        ]
-        identity = (
-            "matched"
-            if len(matched_receipts) == 1
-            else "mismatch" if returned_receipts else "absent"
-        )
-        if sprint_id is None:
-            receipt_count = min(len(matched_receipts), 64)
-            action_identity = (
-                "matched"
-                if len(matched_receipts) == 1 and approval_id is not None
-                else "duplicate" if len(matched_receipts) > 1
-                else "absent"
-            )
-        evidence = {
-            "boot": boot,
-            "terminal": terminal,
-            "record_qaqc": {
-                "observed": bool(started),
-                "invocation_count": min(len(started), 64),
-                "exit_class": exit_class,
-                "receipt": bool(returned_receipts),
-                "identity": identity,
-            },
-            "action_receipt": {
-                "count": receipt_count,
-                "identity": action_identity,
-            },
-            "postcondition": postcondition,
-        }
-        return approval_id, self._validate_qaqc_evidence(evidence)
-
-    @staticmethod
-    def _qaqc_reviewer_prompt(document_id: int) -> str:
-        return (
-            "Load sprint_rev and use its explicit pre-declaration QA/QC path; "
-            "there is no Sprint id or Sprint inbox yet. "
-            f"Review spec document #{document_id} as the canary QA/QC Reviewer. "
-            "Confirm it is limited to a deterministic file, an ephemeral-base PR, real "
-            "Sprint lifecycle actions, and no change to main. If sound, run exactly "
-            f"./sc sprint record-qaqc --document {document_id} --verdict pass. "
-            "Verify that command confirms the durable approval, retry the exact command "
-            "if the write is failed or ambiguous, and stop only after confirmation."
-        )
-
     def _create_conversation(
         self,
         api: JsonHttp,
         *,
         shell_id: int,
         harness: str,
-        model: str | None = None,
-        effort: str | None = None,
         key: str,
     ) -> dict[str, Any]:
-        body: dict[str, Any] = {"shell_id": shell_id, "harness": harness}
-        if model is not None:
-            body["model"] = model
-        if effort is not None:
-            body["effort"] = effort
         conversation = api.request(
             "POST",
             "/api/conversations",
-            body=body,
+            body={"shell_id": shell_id, "harness": harness},
             key=key,
         )
         projected_route = conversation.get("route") or {}
@@ -3153,223 +1065,6 @@ class HostBackend:
                 details={"harness": harness},
             )
         return conversation
-
-    def _conversation_evidence(
-        self,
-        facts: Preflight,
-        conversation_id: str,
-    ) -> dict[str, Any]:
-        if not CONVERSATION_ID_RE.fullmatch(conversation_id):
-            raise CanaryError(
-                "CANARY_CONVERSATION_INVALID", "conversation identity is invalid"
-            )
-        query = (
-            "SELECT c.conversation_id,c.harness,c.state,c.harness_session_ref,"
-            "boot.content_sha256 boot_sha256,boot.content_bytes,"
-            "instr(boot.content,'sprint_dev')>0 has_sprint_dev,"
-            "instr(boot.content,'sprint_rev')>0 has_sprint_rev,"
-            "SUM(CASE WHEN event.event_type='tool.started' THEN 1 ELSE 0 END) "
-            "tool_started,"
-            "SUM(CASE WHEN event.event_type='tool.completed' THEN 1 ELSE 0 END) "
-            "tool_completed,"
-            "SUM(CASE WHEN event.event_type IN "
-            "('run.completed','run.failed','run.interrupted') THEN 1 ELSE 0 END) "
-            "terminal_events FROM conversations c "
-            "LEFT JOIN conversation_boot_snapshots boot "
-            "ON boot.conversation_id=c.conversation_id "
-            "LEFT JOIN conversation_events event "
-            "ON event.conversation_id=c.conversation_id "
-            f"WHERE c.conversation_id='{conversation_id}' GROUP BY c.conversation_id;"
-        )
-        rows = _json_output(
-            self._run(
-                ["docker", "exec", facts.container, "./sc", "sql", "-json", query],
-                label="read bounded conversation evidence",
-            ),
-            label="read bounded conversation evidence",
-        )
-        if len(rows) != 1 or not isinstance(rows[0], dict):
-            raise CanaryError(
-                "CANARY_CONVERSATION_INVALID",
-                "conversation evidence is missing or ambiguous",
-            )
-        row = rows[0]
-        session_ref = row.get("harness_session_ref")
-        return {
-            "conversation_id": conversation_id,
-            "harness": row.get("harness"),
-            "state": row.get("state"),
-            "session_sha256": (
-                hashlib.sha256(session_ref.encode()).hexdigest()
-                if isinstance(session_ref, str) and session_ref
-                else None
-            ),
-            "boot_sha256": row.get("boot_sha256"),
-            "boot_bytes": row.get("content_bytes"),
-            "has_sprint_dev": bool(row.get("has_sprint_dev")),
-            "has_sprint_rev": bool(row.get("has_sprint_rev")),
-            "tool_started": int(row.get("tool_started") or 0),
-            "tool_completed": int(row.get("tool_completed") or 0),
-            "terminal_events": int(row.get("terminal_events") or 0),
-        }
-
-    def _restart_exact_session(
-        self,
-        api: JsonHttp,
-        config: CanaryConfig,
-        facts: Preflight,
-        conversation_id: str,
-        expected_model: str,
-    ) -> dict[str, Any]:
-        before = self._restart_probe(
-            facts,
-            conversation_id,
-            native=False,
-            expected_model=expected_model,
-        )
-        if before["native_session_id"] is None:
-            result = _restart_result(
-                before,
-                before,
-                command_exit_class="failure",
-                command_exit_status=1,
-                expected_model=expected_model,
-                category="session-reference-missing",
-            )
-            raise CanaryError(
-                "CANARY_RESTART_RECOVERY_FAILED",
-                "DeepSeek session evidence is absent before restart",
-                details={"restart": result},
-            )
-        self._run_exact_restart(facts, self._runtime_env(facts))
-        self._wait_health(api, config)
-        try:
-            self._message(
-                api,
-                conversation_id,
-                (
-                    "Resume this exact conversation after the engine restart. Use Bash "
-                    "once to run `pwd`, then reply with only exact-session-recovered. "
-                    "Pass when the tool completes and this turn becomes idle; do not "
-                    "change files."
-                ),
-                f"{config.run_id}:deepseek:restart-resume",
-            )
-            self._wait_idle(api, conversation_id, config, facts)
-            after = self._restart_probe(
-                facts,
-                conversation_id,
-                native=True,
-                expected_model=expected_model,
-            )
-        except CanaryError as exc:
-            if exc.code == "CANARY_RESTART_RECOVERY_FAILED":
-                raise
-            result = _restart_result(
-                before,
-                before,
-                command_exit_class="success",
-                command_exit_status=0,
-                expected_model=expected_model,
-                category="native-resume-rejected",
-            )
-            raise CanaryError(
-                "CANARY_RESTART_RECOVERY_FAILED",
-                "native exact-session resume did not complete",
-                details={"restart": result},
-            ) from exc
-        result = _restart_result(
-            before,
-            after,
-            command_exit_class="success",
-            command_exit_status=0,
-            expected_model=expected_model,
-        )
-        if not _restart_passed(result):
-            raise CanaryError(
-                "CANARY_RESTART_RECOVERY_FAILED",
-                "restart did not preserve the exact native session",
-                details={"restart": result},
-            )
-        return result
-
-    def _deepseek_participant_evidence(
-        self,
-        facts: Preflight,
-        sprint_id: int,
-        board: Mapping[str, Any],
-        expected_model: str,
-    ) -> dict[str, Any]:
-        evidence: dict[str, Any] = {}
-        for role, skill_key in (("developer", "has_sprint_dev"), ("reviewer", "has_sprint_rev")):
-            participant = next(
-                (
-                    row
-                    for row in board.get("participants") or []
-                    if row.get("role") == role
-                ),
-                None,
-            )
-            if (
-                not isinstance(participant, dict)
-                or participant.get("harness") != "deepseek"
-                or participant.get("model") != expected_model
-                or participant.get("effort") != "default"
-                or not isinstance(participant.get("current_conversation_id"), str)
-            ):
-                raise CanaryError(
-                    "CANARY_PARTICIPANT_EVIDENCE_FAILED",
-                    f"{role} is not bound to the admitted DeepSeek route",
-                )
-            conversation = self._conversation_evidence(
-                facts, str(participant["current_conversation_id"])
-            )
-            if (
-                not conversation[skill_key]
-                or not isinstance(conversation["boot_sha256"], str)
-                or len(conversation["boot_sha256"]) != 64
-                or conversation["tool_completed"] < 1
-            ):
-                raise CanaryError(
-                    "CANARY_PARTICIPANT_EVIDENCE_FAILED",
-                    f"{role} lacks role skill, boot, or completed-tool evidence",
-                )
-            evidence[role] = {
-                "conversation_id": conversation["conversation_id"],
-                "route": {
-                    "harness": participant.get("harness"),
-                    "provider": "ollama-cloud",
-                    "model": participant.get("model"),
-                    "effort": participant.get("effort"),
-                },
-                "boot_sha256": conversation["boot_sha256"],
-                "boot_bytes": conversation["boot_bytes"],
-                "role_skill_loaded": True,
-                "tool_started": conversation["tool_started"],
-                "tool_completed": conversation["tool_completed"],
-            }
-        query = (
-            "SELECT COUNT(*) handoffs FROM wake_message message "
-            "JOIN sprint_participants sender "
-            "ON sender.participant_id=message.from_participant_id "
-            f"WHERE message.sprint_id={sprint_id} AND message.intent='handoff' "
-            "AND sender.role='developer';"
-        )
-        rows = _json_output(
-            self._run(
-                ["docker", "exec", facts.container, "./sc", "sql", "-json", query],
-                label="read bounded Sprint handoff evidence",
-            ),
-            label="read bounded Sprint handoff evidence",
-        )
-        handoffs = int(rows[0].get("handoffs") or 0) if len(rows) == 1 else 0
-        if handoffs != 1:
-            raise CanaryError(
-                "CANARY_PARTICIPANT_EVIDENCE_FAILED",
-                "DeepSeek Developer did not produce exactly one durable handoff",
-            )
-        evidence["developer_handoffs"] = handoffs
-        return evidence
 
     def _message(
         self,
@@ -3795,117 +1490,6 @@ raise TimeoutError("controller did not close the Force-new barrier")
                 details={"conversation_id": probe.reviewer_id},
             )
 
-    def _start_isolation_peer(
-        self,
-        api: JsonHttp,
-        config: CanaryConfig,
-        facts: Preflight,
-        conversation_id: str,
-    ) -> dict[str, Any]:
-        before = self._conversation_evidence(facts, conversation_id)
-        if before["harness"] != "deepseek" or before["session_sha256"] is None:
-            raise CanaryError(
-                "CANARY_ISOLATION_FAILED",
-                "DeepSeek peer has no exact session identity",
-            )
-        self._message(
-            api,
-            conversation_id,
-            (
-                "Run one Bash tool with exactly `python3 -c 'import time; "
-                "time.sleep(600)'`. Keep that tool call active until interrupted. "
-                "Do not run another tool, change files, or finish early. Pass when the "
-                "controller interrupts this turn."
-            ),
-            f"{config.run_id}:deepseek:isolation-peer",
-        )
-        while True:
-            evidence = self._conversation_evidence(facts, conversation_id)
-            if (
-                evidence["state"] == "running"
-                and evidence["tool_started"] > before["tool_started"]
-            ):
-                return evidence
-            if evidence["state"] in {"error", "closed"}:
-                raise CanaryError(
-                    "CANARY_ISOLATION_FAILED",
-                    "DeepSeek peer terminalized before its isolation barrier",
-                )
-            self.deadline.remaining()
-            self.sleep(min(0.1, self.deadline.remaining()))
-
-    def _assert_isolation_peer(
-        self,
-        facts: Preflight,
-        conversation_id: str,
-        baseline: Mapping[str, Any],
-        *,
-        boundary: str,
-    ) -> dict[str, Any]:
-        observed = self._conversation_evidence(facts, conversation_id)
-        if (
-            observed["state"] != "running"
-            or observed["session_sha256"] != baseline["session_sha256"]
-            or observed["boot_sha256"] != baseline["boot_sha256"]
-            or observed["terminal_events"] != baseline["terminal_events"]
-        ):
-            raise CanaryError(
-                "CANARY_ISOLATION_FAILED",
-                f"DeepSeek peer changed across {boundary}",
-            )
-        return observed
-
-    def _stop_isolation_peer(
-        self,
-        api: JsonHttp,
-        config: CanaryConfig,
-        facts: Preflight,
-        conversation_id: str,
-        baseline: Mapping[str, Any],
-    ) -> dict[str, Any]:
-        interrupted = api.request(
-            "POST",
-            f"/api/conversations/{conversation_id}/interruptions",
-            body={},
-            key=f"{config.run_id}:deepseek:isolation-peer-stop",
-        )
-        if not isinstance(interrupted.get("run_id"), int):
-            raise CanaryError(
-                "CANARY_ISOLATION_FAILED",
-                "DeepSeek peer stop returned no run identity",
-            )
-        while True:
-            observed = self._conversation_evidence(facts, conversation_id)
-            if observed["state"] == "idle":
-                break
-            if observed["state"] in {"error", "closed"}:
-                raise CanaryError(
-                    "CANARY_ISOLATION_FAILED",
-                    "DeepSeek peer did not return to idle after scoped stop",
-                )
-            self.deadline.remaining()
-            self.sleep(min(0.1, self.deadline.remaining()))
-        if (
-            observed["session_sha256"] != baseline["session_sha256"]
-            or observed["boot_sha256"] != baseline["boot_sha256"]
-            or observed["terminal_events"] != baseline["terminal_events"] + 1
-        ):
-            raise CanaryError(
-                "CANARY_ISOLATION_FAILED",
-                "DeepSeek peer stop changed identity or terminalized more than one run",
-            )
-        return {
-            "conversation_id": conversation_id,
-            "session_sha256": observed["session_sha256"],
-            "boot_sha256": observed["boot_sha256"],
-            "concurrent_running": True,
-            "reviewer_close_scoped": True,
-            "reviewer_pickup_interrupt_scoped": True,
-            "peer_stop_scoped": True,
-            "terminal_events_before": baseline["terminal_events"],
-            "terminal_events_after": observed["terminal_events"],
-        }
-
     def _exercise_review_delivery_gates(
         self,
         api: JsonHttp,
@@ -3915,7 +1499,6 @@ raise TimeoutError("controller did not close the Force-new barrier")
         sprint_id: int,
         probe: ForceNewProbe,
         stage: Callable[[str], None],
-        require_deepseek_isolation: bool = False,
     ) -> tuple[dict[str, Any], list[str]]:
         observed_columns: list[str] = []
         stage("force_new_pre_delivery")
@@ -3991,40 +1574,7 @@ raise TimeoutError("controller did not close the Force-new barrier")
                 details={"message_id": message_id},
             )
 
-        isolation_peer_id: str | None = None
-        isolation_baseline: dict[str, Any] | None = None
-        if require_deepseek_isolation:
-            stage("deepseek_ab_isolation")
-            developer = next(
-                (
-                    row
-                    for row in board.get("participants") or []
-                    if row.get("role") == "developer"
-                ),
-                None,
-            )
-            if (
-                not isinstance(developer, dict)
-                or developer.get("harness") != "deepseek"
-                or not isinstance(developer.get("current_conversation_id"), str)
-            ):
-                raise CanaryError(
-                    "CANARY_ISOLATION_FAILED",
-                    "DeepSeek Developer participant conversation is missing",
-                )
-            isolation_peer_id = str(developer["current_conversation_id"])
-            isolation_baseline = self._start_isolation_peer(
-                api, config, facts, isolation_peer_id
-            )
-
         self._close_force_new_barrier(api, probe)
-        if isolation_peer_id is not None and isolation_baseline is not None:
-            self._assert_isolation_peer(
-                facts,
-                isolation_peer_id,
-                isolation_baseline,
-                boundary="Reviewer barrier close",
-            )
 
         stage("force_new_delivery")
         delivery_id: str | None = None
@@ -4100,13 +1650,6 @@ raise TimeoutError("controller did not close the Force-new barrier")
                     body={},
                     key=f"{config.run_id}:reviewer:pickup-interrupt",
                 )
-                if isolation_peer_id is not None and isolation_baseline is not None:
-                    self._assert_isolation_peer(
-                        facts,
-                        isolation_peer_id,
-                        isolation_baseline,
-                        boundary="Reviewer pickup interruption",
-                    )
                 break
             if state in {"idle", "error", "closed"}:
                 raise CanaryError(
@@ -4276,19 +1819,9 @@ raise TimeoutError("controller did not close the Force-new barrier")
                 "fresh_chat": delivery_id != probe.reviewer_id,
             }
         )
-        isolation = None
-        if isolation_peer_id is not None and isolation_baseline is not None:
-            isolation = self._stop_isolation_peer(
-                api,
-                config,
-                facts,
-                isolation_peer_id,
-                isolation_baseline,
-            )
         return (
             {
                 "force_new": force_new,
-                "deepseek_ab_isolation": isolation,
                 "pickup_recovery": {
                     "induced": True,
                     "interrupted_run_id": run_id,
@@ -4329,14 +1862,6 @@ raise TimeoutError("controller did not close the Force-new barrier")
         spec_title = f"Canary contract {config.run_id}"
         deterministic_path = f"canary/{config.run_id}.txt"
         deterministic_content = f"subfloor sprint canary {facts.candidate_sha}"
-        deepseek_profile = config.profile == DEEPSEEK_SPRINT_PROFILE
-        candidate_routes = (
-            self._candidate_deepseek_routes() if deepseek_profile else []
-        )
-        qualification_titles = [
-            f"Reviewer route qualification {config.run_id} {index}"
-            for index, _route in enumerate(candidate_routes, start=1)
-        ]
 
         stage("planner_prepare")
         planner = self._create_conversation(
@@ -4358,25 +1883,14 @@ raise TimeoutError("controller did not close the Force-new barrier")
                 "You are the Planner for an unattended source-maintainer canary. "
                 f"Create one in_progress roadmap feature titled exactly {feature_title!r}, "
                 f"one unfrozen spec titled exactly {spec_title!r}, and one pending task. "
-                + (
-                    "Also create one unfrozen, task-free QA/QC qualification spec for "
-                    "each exact title in this JSON array; keep every qualification body "
-                    "limited to the same deterministic-file and ephemeral-PR safety "
-                    f"contract: {json.dumps(qualification_titles, separators=(',', ':'))}. "
-                    if deepseek_profile
-                    else ""
-                )
-                +
                 "The spec must require DEV1 to create exactly one deterministic file and a "
-                "real GitHub PR against the named ephemeral base, with REV1 reviewing through "
-                f"{'DeepSeek Harness' if deepseek_profile else 'Kimi'}. "
-                "Do not declare or arm a Sprint yet. For this preparation turn, use only "
-                "sc mem public commands, confirm every durable write, and stop after the "
-                "feature, spec, and task exist."
+                "real GitHub PR against the named ephemeral base, with REV1 reviewing via Kimi. "
+                "Do not declare or arm a Sprint yet. Use only sc mem public commands, confirm "
+                "every durable write, and stop after the feature, spec, and task exist."
             ),
             f"{config.run_id}:planner:prepare",
         )
-        self._wait_idle(api, planner_id, config, facts)
+        self._wait_idle(api, planner_id, config)
         feature = self._feature(api.request("GET", "/api/roadmap"), feature_title)
         if feature is None:
             raise CanaryError(
@@ -4397,98 +1911,42 @@ raise TimeoutError("controller did not close the Force-new barrier")
         document_id = int(documents[0]["document_id"])
         task_id = int(tasks[0]["task_id"])
 
-        qualification_documents: dict[str, int] = {}
-        if deepseek_profile:
-            feature_documents = list(feature.get("documents") or [])
-            for title in qualification_titles:
-                matches = [
-                    item
-                    for item in feature_documents
-                    if item.get("kind") == "spec" and item.get("title") == title
-                ]
-                if len(matches) != 1:
-                    raise CanaryError(
-                        "CANARY_PLAN_FAILED",
-                        "Planner did not create every isolated route qualification spec",
-                    )
-                qualification_documents[title] = int(matches[0]["document_id"])
+        stage("kimi_qaqc")
+        reviewer = self._create_conversation(
+            api,
+            shell_id=shells["REV1"],
+            harness="kimi",
+            key=f"{config.run_id}:reviewer:create",
+        )
+        reviewer_id = str(reviewer["conversation_id"])
+        reviewer_projection = reviewer.get("route") or {}
+        reviewer_route = {
+            key: reviewer_projection.get(key)
+            for key in ("harness", "provider", "model", "effort")
+        }
+        self._message(
+            api,
+            reviewer_id,
+            (
+                f"Review spec document #{document_id} as the canary QA/QC Reviewer. "
+                "Confirm it is limited to a deterministic file, an ephemeral-base PR, real "
+                "Sprint lifecycle actions, and no change to main. If sound, run "
+                f"sc sprint record-qaqc --document {document_id} --verdict pass. "
+                "Confirm the durable approval and stop."
+            ),
+            f"{config.run_id}:reviewer:qaqc",
+        )
+        self._wait_idle(api, reviewer_id, config)
+        approval_id = self._approval(facts, document_id)
 
-        reviewer_harness = "deepseek" if deepseek_profile else "kimi"
-        developer_harness = "deepseek" if deepseek_profile else "codex"
-        deepseek_model = ""
-        selected_qualification: dict[str, Any] | None = None
-        reviewer: dict[str, Any] | None = None
-        reviewer_id = ""
-        reviewer_route: dict[str, Any] = {}
-        if deepseek_profile:
-            stage("deepseek_candidate_qualification")
-            for index, (candidate, admission) in enumerate(
-                candidate_routes, start=1
-            ):
-                candidate_reviewer = self._create_conversation(
-                    api,
-                    shell_id=shells["REV1"],
-                    harness="deepseek",
-                    model=candidate,
-                    effort="default",
-                    key=f"{config.run_id}:reviewer:qualify:{index}:create",
-                )
-                candidate_id = str(candidate_reviewer["conversation_id"])
-                candidate_projection = candidate_reviewer.get("route") or {}
-                candidate_route = {
-                    key: candidate_projection.get(key)
-                    for key in ("harness", "provider", "model", "effort")
-                }
-                qualification_id = qualification_documents[
-                    qualification_titles[index - 1]
-                ]
-                candidate_evidence: dict[str, Any] | None = None
-                try:
-                    self._message(
-                        api,
-                        candidate_id,
-                        self._qaqc_reviewer_prompt(qualification_id),
-                        f"{config.run_id}:reviewer:qualify:{index}:qaqc",
-                    )
-                    self._wait_idle(api, candidate_id, config, facts)
-                    approval_id, candidate_evidence = self._qaqc_action_evidence(
-                        api,
-                        facts,
-                        candidate_id,
-                        sprint_id=None,
-                        reviewer_shell_id=shells["REV1"],
-                        document_id=qualification_id,
-                    )
-                except CanaryError as exc:
-                    if exc.code != "CANARY_PARTICIPANT_FAILED":
-                        raise
-                    approval_id = None
-                if (
-                    approval_id is not None
-                    and candidate_evidence is not None
-                    and self._qaqc_evidence_passed(candidate_evidence)
-                ):
-                    self._deepseek_model = candidate
-                    self._deepseek_admission = admission
-                    deepseek_model = candidate
-                    selected_qualification = candidate_evidence
-                    reviewer = candidate_reviewer
-                    reviewer_id = candidate_id
-                    reviewer_route = candidate_route
-                    break
-                latest = api.request("GET", f"/api/conversations/{candidate_id}")
-                if latest.get("state") != "closed":
-                    api.request(
-                        "PATCH",
-                        f"/api/conversations/{candidate_id}",
-                        body={"version": latest["version"], "state": "closed"},
-                    )
-            if not deepseek_model:
-                raise CanaryError(
-                    "CANARY_ROUTE_NOT_ADMITTED",
-                    "no bounded exact model passed the live Reviewer tool proof",
-                )
+        stage("force_new_barrier")
+        force_new_probe = self._start_force_new_barrier(
+            api,
+            config,
+            reviewer_id=reviewer_id,
+        )
 
+        stage("declare_and_arm")
         participants = [
             {
                 "shell_id": shells["PLN1"],
@@ -4500,42 +1958,38 @@ raise TimeoutError("controller did not close the Force-new barrier")
             {
                 "shell_id": shells["DEV1"],
                 "role": "developer",
-                "harness": developer_harness,
-                "model": deepseek_model if deepseek_profile else None,
-                "effort": "default" if deepseek_profile else None,
+                "harness": "codex",
+                "model": planner_route["model"],
+                "effort": planner_route["effort"],
             },
             {
                 "shell_id": shells["REV1"],
                 "role": "reviewer",
-                "harness": reviewer_harness,
-                "model": deepseek_model if deepseek_profile else None,
-                "effort": "default" if deepseek_profile else None,
+                "harness": "kimi",
+                "model": reviewer_route["model"],
+                "effort": reviewer_route["effort"],
             },
         ]
-        stage("declare_prepared")
         self._message(
             api,
             planner_id,
             (
-                "The preparation-turn restriction has ended. Load `sprint_prep`, then "
-                "execute the declaration and planning writes now; do not merely propose "
-                "commands or wait for approval. "
-                f"Declare one merge-granted prepared Sprint for feature #{feature_id} "
-                f"using spec document #{document_id} directly, with no QA/QC approval id, "
-                "and the participant JSON below. Plan exactly one code unit assigning "
-                f"task #{task_id} to DEV1 with REV1. Expected output: create "
-                f"{deterministic_path!r} containing exactly {deterministic_content!r} plus "
-                f"a newline; use head branch {facts.head_branch!r}, created from "
-                f"origin/{facts.base_branch}; open the PR in {facts.repository!r} against "
-                f"base {facts.base_branch!r}; never target main. Do not arm or dispatch the "
-                "Sprint. Pass only when each command confirms its durable write and exactly "
-                "one Sprint for this feature is prepared with exactly one planned unit. "
-                "Participants JSON: "
+                f"QA/QC approval #{approval_id} now covers document #{document_id}. "
+                "Declare one merge-granted Sprint using the participant JSON below, plan one "
+                f"code unit assigning task #{task_id} to DEV1 with REV1, then arm and dispatch. "
+                f"Expected output: create {deterministic_path!r} containing exactly "
+                f"{deterministic_content!r} plus a newline; use head branch "
+                f"{facts.head_branch!r}, created from origin/{facts.base_branch}; "
+                f"open the PR in {facts.repository!r} against base "
+                f"{facts.base_branch!r}; never target main. The lane must register the PR, "
+                "reach green, request real Force-new Kimi review, authorize and merge only "
+                "through Sprint gates, and report the merge to you. After dispatch, handle "
+                "your own informational Sprint inbox items and stop. Participants JSON: "
                 + json.dumps(participants, separators=(",", ":"))
             ),
-            f"{config.run_id}:planner:declare-prepared",
+            f"{config.run_id}:planner:arm",
         )
-        self._wait_idle(api, planner_id, config, facts)
+        self._wait_idle(api, planner_id, config)
         sprint_list = api.request("GET", "/api/sprints?limit=100")
         matches = [
             row
@@ -4548,97 +2002,6 @@ raise TimeoutError("controller did not close the Force-new barrier")
                 "CANARY_DECLARATION_FAILED", "Planner did not declare one Sprint"
             )
         sprint_id = int(matches[0]["sprint_id"])
-        prepared_board = api.request("GET", f"/api/sprints/{sprint_id}")
-        if (prepared_board.get("sprint") or {}).get("lifecycle") != "prepared":
-            raise CanaryError(
-                "CANARY_DECLARATION_FAILED", "canary Sprint is not prepared"
-            )
-
-        stage("deepseek_qaqc" if deepseek_profile else "kimi_qaqc")
-        if not deepseek_profile:
-            reviewer = self._create_conversation(
-                api,
-                shell_id=shells["REV1"],
-                harness=reviewer_harness,
-                key=f"{config.run_id}:reviewer:create",
-            )
-            reviewer_id = str(reviewer["conversation_id"])
-            reviewer_projection = reviewer.get("route") or {}
-            reviewer_route = {
-                key: reviewer_projection.get(key)
-                for key in ("harness", "provider", "model", "effort")
-            }
-        if reviewer is None or not reviewer_id:
-            raise CanaryError(
-                "CANARY_ROUTE_NOT_ADMITTED",
-                "no qualified Reviewer conversation was retained",
-            )
-        self._message(
-            api,
-            reviewer_id,
-            self._qaqc_reviewer_prompt(document_id),
-            f"{config.run_id}:reviewer:qaqc",
-        )
-        self._wait_idle(api, reviewer_id, config, facts)
-        if deepseek_profile:
-            approval_id, qaqc_evidence = self._qaqc_action_evidence(
-                api,
-                facts,
-                reviewer_id,
-                sprint_id=sprint_id,
-                reviewer_shell_id=shells["REV1"],
-                document_id=document_id,
-            )
-            if approval_id is None or not self._qaqc_evidence_passed(qaqc_evidence):
-                raise CanaryError(
-                    "CANARY_QAQC_FAILED",
-                    "reviewer did not record exact approval",
-                    details={"qaqc_action": qaqc_evidence},
-                )
-        else:
-            approval_id = self._approval(facts, document_id)
-            qaqc_evidence = None
-
-        restart_recovery = None
-        if deepseek_profile:
-            if (
-                reviewer_route["model"] != deepseek_model
-                or reviewer_route["provider"] != DEEPSEEK_PROVIDER
-                or reviewer_route["effort"] != "default"
-            ):
-                raise CanaryError(
-                    "CANARY_ROUTE_NOT_CANONICAL",
-                    "DeepSeek Reviewer did not bind the admitted Ollama route",
-                    details={"route": reviewer_route},
-                )
-            stage("deepseek_exact_session_restart")
-            restart_recovery = self._restart_exact_session(
-                api, config, facts, reviewer_id, deepseek_model
-            )
-
-        stage("force_new_barrier")
-        force_new_probe = self._start_force_new_barrier(
-            api,
-            config,
-            reviewer_id=reviewer_id,
-        )
-
-        stage("declare_and_arm")
-        self._message(
-            api,
-            planner_id,
-            (
-                f"QA/QC approval #{approval_id} and its engine action receipt now correlate "
-                f"to prepared Sprint #{sprint_id} and document #{document_id}. Arm and "
-                "dispatch that existing Sprint without declaring or planning another one. "
-                "The lane must register the PR, "
-                f"reach green, request real Force-new {reviewer_harness} review, authorize and merge only "
-                "through Sprint gates, and report the merge to you. After dispatch, handle "
-                "your own informational Sprint inbox items and stop."
-            ),
-            f"{config.run_id}:planner:arm",
-        )
-        self._wait_idle(api, planner_id, config, facts)
         board = api.request("GET", f"/api/sprints/{sprint_id}")
         if (board.get("sprint") or {}).get("lifecycle") != "armed":
             raise CanaryError("CANARY_ARM_FAILED", "canary Sprint is not armed")
@@ -4655,7 +2018,6 @@ raise TimeoutError("controller did not close the Force-new barrier")
             facts,
             sprint_id=sprint_id,
             probe=force_new_probe,
-            require_deepseek_isolation=deepseek_profile,
             stage=stage,
         )
 
@@ -4832,16 +2194,6 @@ raise TimeoutError("controller did not close the Force-new barrier")
             raise CanaryError(
                 "CANARY_REENTRY_FAILED", "Planner Re-enter first run did not complete"
             )
-        participant_evidence = (
-            self._deepseek_participant_evidence(
-                facts,
-                sprint_id,
-                final_board,
-                deepseek_model,
-            )
-            if deepseek_profile
-            else None
-        )
         events = api.request("GET", f"/api/sprints/{sprint_id}/events?limit=100")
         return {
             "sprint": {
@@ -4856,22 +2208,8 @@ raise TimeoutError("controller did not close the Force-new barrier")
                 "evidence": self._bounded_board(final_board),
                 "events": sanitize(events.get("items") or []),
                 **gate_evidence,
-                "exact_session_restart": restart_recovery,
-                "participant_evidence": participant_evidence,
-                "qaqc_action": qaqc_evidence,
             },
             "routes": {
-                **(
-                    {
-                        "admission": self._deepseek_admission,
-                        "qualification": {
-                            "model": deepseek_model,
-                            "qaqc_action": selected_qualification,
-                        },
-                    }
-                    if deepseek_profile
-                    else {}
-                ),
                 "planner_initial": planner_route,
                 "planner_reentry": reentry_route,
                 "reviewer_qaqc": reviewer_route,
@@ -5026,39 +2364,24 @@ raise TimeoutError("controller did not close the Force-new barrier")
                 if not ok:
                     failures.append("remove_network")
         if ledger.workspace:
-            if config.temp_parent_explicit:
-                parent = _validated_explicit_parent(config)
-                workspace = _absolute_lexical(Path(ledger.workspace))
-                expected_workspace = parent / f"{WORKSPACE_PREFIX}{config.run_id}"
-                workspace_identity_ok = (
-                    workspace == expected_workspace
-                    and workspace.parent == parent
-                    and _strictly_beneath(workspace, parent)
-                    and not workspace.is_symlink()
-                )
-            else:
-                workspace = Path(ledger.workspace).resolve()
-                expected_workspace = (
-                    config.temp_parent.resolve()
-                    / f"{WORKSPACE_PREFIX}{config.run_id}"
-                )
-                workspace_identity_ok = workspace == expected_workspace
+            workspace = Path(ledger.workspace).resolve()
+            expected_workspace = (
+                config.temp_parent.resolve() / f"{WORKSPACE_PREFIX}{config.run_id}"
+            )
             marker = workspace / ".git" / "subfloor-canary-marker.json"
-            if workspace.exists() or workspace.is_symlink():
+            if workspace.exists():
                 marker_ok = False
-                if workspace_identity_ok:
-                    try:
-                        marker_data = json.loads(marker.read_text())
-                        marker_ok = (
-                            marker_data.get("run_id") == config.run_id
-                            and isinstance(ledger.candidate_sha, str)
-                            and HEX_SHA.fullmatch(ledger.candidate_sha) is not None
-                            and marker_data.get("candidate_sha")
-                            == ledger.candidate_sha
-                        )
-                    except (OSError, json.JSONDecodeError):
-                        marker_ok = False
-                if not workspace_identity_ok or not marker_ok:
+                try:
+                    marker_data = json.loads(marker.read_text())
+                    marker_ok = (
+                        marker_data.get("run_id") == config.run_id
+                        and isinstance(ledger.candidate_sha, str)
+                        and HEX_SHA.fullmatch(ledger.candidate_sha) is not None
+                        and marker_data.get("candidate_sha") == ledger.candidate_sha
+                    )
+                except (OSError, json.JSONDecodeError):
+                    marker_ok = False
+                if workspace != expected_workspace or not marker_ok:
                     failures.append("remove_workspace_unsafe")
                     record("remove_workspace", ok=False)
                 else:
@@ -5071,7 +2394,6 @@ raise TimeoutError("controller did not close the Force-new barrier")
                         record("remove_workspace")
             else:
                 record("remove_workspace_absent")
-        self._provider_key = None
         if failures:
             raise CanaryError(
                 "CANARY_CLEANUP_FAILED",
@@ -5155,24 +2477,13 @@ class CanaryController:
             )
             self.receipt.write()
 
-            self._stage("route_admission")
-            launch_result = self.backend.launch(
-                self.config, self.facts, self.ledger
-            )
-            versions = launch_result["versions"]
-            route_admission = launch_result.get("route_admission")
-            restart_rehearsal = launch_result.get("restart_rehearsal")
-            if route_admission is not None:
-                self.receipt.data["routes"]["admission"] = route_admission
-
             self._stage("launch")
+            versions = self.backend.launch(self.config, self.facts, self.ledger)
             self.receipt.data["runtime"] = {
                 "namespace": self.facts.network,
                 "container": self.facts.container,
                 "harness_versions": versions,
             }
-            if restart_rehearsal is not None:
-                self.receipt.data["runtime"]["restart_rehearsal"] = restart_rehearsal
             self.receipt.event("runtime.launched", harnesses=sorted(versions))
             self.receipt.write()
 
@@ -5183,10 +2494,7 @@ class CanaryController:
                 self._stage,
                 self._checkpoint,
             )
-            self.receipt.data["routes"] = {
-                **self.receipt.data["routes"],
-                **outcome["routes"],
-            }
+            self.receipt.data["routes"] = outcome["routes"]
             self.receipt.data["sprint"] = outcome["sprint"]
             self.receipt.data["pull_request"] = outcome["pull_request"]
             self.receipt.event("sprint.completed", **outcome["sprint"])
@@ -5235,9 +2543,7 @@ class CanaryController:
         if final_failure is None:
             self.receipt.data["status"] = "passed"
             self.receipt.data["next_action"] = (
-                "Candidate DeepSeek Sprint receipt is green; bind it to exact-head review."
-                if self.config.profile == DEEPSEEK_SPRINT_PROFILE
-                else "Candidate receipt is green; task #353 may update the real dos-app install."
+                "Candidate receipt is green; task #353 may update the real dos-app install."
             )
             self.receipt.data["failure"] = None
         else:
@@ -5289,12 +2595,6 @@ def default_run_id() -> str:
 def build_config(args: argparse.Namespace) -> CanaryConfig:
     source = Path(args.source_repo).resolve()
     run_id = args.run_id or default_run_id()
-    temp_parent_explicit = args.temp_parent is not None
-    temp_parent = (
-        Path(args.temp_parent)
-        if temp_parent_explicit
-        else Path(tempfile.gettempdir()).resolve()
-    )
     receipt = (
         Path(args.receipt).resolve()
         if args.receipt
@@ -5307,15 +2607,8 @@ def build_config(args: argparse.Namespace) -> CanaryConfig:
         dos_app_ref=args.dos_app_ref,
         repository=args.repository,
         receipt_path=receipt,
-        temp_parent=temp_parent,
+        temp_parent=Path(args.temp_parent).resolve(),
         run_id=run_id,
-        temp_parent_explicit=temp_parent_explicit,
-        profile=args.profile,
-        credential_file=(
-            Path(args.credential_file).absolute()
-            if args.credential_file is not None
-            else None
-        ),
         stage_timeout_s=args.stage_timeout,
         whole_timeout_s=args.whole_timeout,
         poll_interval_s=args.poll_interval,
@@ -5328,7 +2621,7 @@ def _cleanup_from_receipt(path: Path) -> int:
     resources = data.get("resources") or {}
     workspace_value = resources.get("workspace")
     if workspace_value:
-        workspace = _absolute_lexical(Path(str(workspace_value)))
+        workspace = Path(str(workspace_value)).resolve()
         temp_parent = workspace.parent
     else:
         temp_parent = Path(tempfile.gettempdir()).resolve()
@@ -5348,8 +2641,6 @@ def _cleanup_from_receipt(path: Path) -> int:
         receipt_path=path.resolve(),
         temp_parent=temp_parent,
         run_id=run_id,
-        temp_parent_explicit=bool(data.get("temp_parent_explicit", False)),
-        profile=str(data.get("profile") or STANDARD_PROFILE),
         stage_timeout_s=300,
         whole_timeout_s=600,
     )
@@ -5393,10 +2684,8 @@ def parser() -> argparse.ArgumentParser:
         "--repository", help="GitHub owner/name; derived from origin when omitted"
     )
     run.add_argument("--receipt", help="durable JSON path outside disposable state")
-    run.add_argument("--temp-parent")
+    run.add_argument("--temp-parent", default=tempfile.gettempdir())
     run.add_argument("--run-id")
-    run.add_argument("--profile", choices=sorted(PROFILES), default=STANDARD_PROFILE)
-    run.add_argument("--credential-file")
     run.add_argument("--stage-timeout", type=float, default=900.0)
     run.add_argument("--whole-timeout", type=float, default=3600.0)
     run.add_argument("--poll-interval", type=float, default=2.0)

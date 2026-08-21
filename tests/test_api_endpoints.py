@@ -759,7 +759,7 @@ class FlavorDefaultsTest(unittest.TestCase):
             "terminal": False,
             "one_shot": False,
             "browser": True,
-            "sprint": True,
+            "sprint": False,
         })
 
     def test_historical_unknown_harness_stays_projected_without_launch_access(self) -> None:

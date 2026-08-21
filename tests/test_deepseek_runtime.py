@@ -47,8 +47,6 @@ def native_request_metadata(model: str, efforts) -> dict:
                 "provider": "deepseek-official",
                 "model": model,
                 "reasoning_effort": None if effort == "default" else effort,
-                "reserved_default_omitted": effort == "default",
-                "shell_tool_declared": purpose == "conversation",
                 "purpose": purpose,
             }
             for purpose in deepseek_runtime.PROVIDER_WIRE_PURPOSES
@@ -60,12 +58,8 @@ def native_request_metadata(model: str, efforts) -> dict:
 def emit_provider_requests(argv, kwargs) -> dict:
     options_by_effort = json.loads(argv[-1])
     for options in options_by_effort.values():
-        for purpose in deepseek_runtime.PROVIDER_WIRE_PURPOSES:
+        for _purpose in deepseek_runtime.PROVIDER_WIRE_PURPOSES:
             body = {"model": argv[-2], "messages": [], "stream": True}
-            if purpose == "conversation":
-                body["tools"] = [
-                    deepseek_runtime.provider_wire_shell_tool("deepseek-official")
-                ]
             if options["thinking"] != "omit":
                 body["thinking"] = {"type": options["thinking"]}
             if options["reasoningEffort"] != "omit":
@@ -239,38 +233,6 @@ def test_provider_compositions_activate_only_the_selected_adapter() -> None:
         assert excluded not in names
 
 
-def test_provider_registry_bounds_exact_candidate_preferences() -> None:
-    registry = deepseek_runtime.load_provider_adapter_registry()
-    providers = registry["providers"]
-    assert providers["deepseek-official"]["candidate_preferences"] == []
-    assert providers["ollama-cloud"]["candidate_preferences"] == [
-        "glm-5.2:cloud",
-        "minimax-m3:cloud",
-    ]
-    assert providers["ollama-cloud"]["model_selectors"] == []
-    assert providers["ollama-cloud"]["wire_proof_budget"] == 4
-
-    for preferences, selectors in (
-        (["duplicate", "duplicate"], []),
-        (["candidate"], ["fixed"]),
-        ([f"candidate-{index}" for index in range(5)], []),
-    ):
-        mutated = json.loads(
-            (ROOT / ".super-coder/assets/deepseek/provider-adapters.json").read_text()
-        )
-        mutated["providers"]["ollama-cloud"]["candidate_preferences"] = preferences
-        mutated["providers"]["ollama-cloud"]["model_selectors"] = selectors
-        with tempfile.TemporaryDirectory() as raw:
-            path = Path(raw) / "provider-adapters.json"
-            path.write_text(json.dumps(mutated))
-            try:
-                deepseek_runtime.load_provider_adapter_registry(path)
-            except deepseek_runtime.DeepSeekRuntimeError as exc:
-                assert exc.code == "HARNESS_PROVIDER_ADAPTER_INVALID"
-            else:
-                raise AssertionError("invalid candidate preferences were accepted")
-
-
 def test_composition_enables_native_skills_only_from_the_rendered_grant_root() -> None:
     manifest = deepseek_runtime.load_runtime_manifest()
     composition = ROOT / ".super-coder" / manifest["composition"]["path"]
@@ -319,17 +281,6 @@ def test_ollama_composition_drift_fails_only_when_that_route_is_selected() -> No
             assert ollama["sha256"] in exc.detail
         else:
             raise AssertionError("changed Ollama composition was accepted")
-
-
-def test_provider_wire_tool_matches_each_final_serializer_contract() -> None:
-    official = deepseek_runtime.provider_wire_shell_tool("deepseek-official")
-    ollama = deepseek_runtime.provider_wire_shell_tool("ollama-cloud")
-
-    assert "strict" not in official["function"]
-    assert ollama["function"]["strict"] is False
-    assert {
-        key: value for key, value in ollama["function"].items() if key != "strict"
-    } == official["function"]
 
 
 def test_missing_carrier_is_a_deepseek_only_unavailable_status() -> None:
@@ -512,8 +463,6 @@ def test_provider_wire_evidence_captures_default_omission_and_named_mapping() ->
         "provider": "deepseek-official",
         "model": "deepseek-v4-pro",
         "reasoning_effort": None,
-        "reserved_default_omitted": True,
-        "shell_tool_declared": True,
         "purpose": "conversation",
     }
     assert set(evidence["proofs"]["default"]["purpose_proofs"]) == set(
@@ -523,11 +472,6 @@ def test_provider_wire_evidence_captures_default_omission_and_named_mapping() ->
         purpose_proof = evidence["proofs"]["default"]["purpose_proofs"][purpose]
         assert purpose_proof["wire_options"] == {}
         assert purpose_proof["native_request"]["purpose"] == purpose
-        assert purpose_proof["shell_tool"] == (
-            [deepseek_runtime.provider_wire_shell_tool("deepseek-official")]
-            if purpose == "conversation"
-            else None
-        )
     for effort in ("low", "high", "max"):
         assert evidence["proofs"][effort]["wire_options"] == {
             "thinking": {"type": "enabled"},
@@ -538,8 +482,6 @@ def test_provider_wire_evidence_captures_default_omission_and_named_mapping() ->
             "provider": "deepseek-official",
             "model": "deepseek-v4-pro",
             "reasoning_effort": effort,
-            "reserved_default_omitted": False,
-            "shell_tool_declared": True,
             "purpose": "conversation",
         }
     assert len(evidence["proofs"]["default"]["digest"]) == 64
@@ -846,42 +788,6 @@ def test_unsupported_container_architecture_degrades_without_partial_carrier() -
         assert projected.error == "HARNESS_RUNTIME_INCOMPATIBLE"
         assert "architecture: s390x" in projected.detail
         runner.assert_not_called()
-
-
-def test_supported_container_carrier_is_root_owned_read_only_runtime_input() -> None:
-    with tempfile.TemporaryDirectory() as raw:
-        root = Path(raw)
-        target = root / "deepseek-runtime"
-        bootstrap = executable(root / "python3.14")
-
-        def runner(argv, **_kwargs):
-            if argv[-1] == deepseek_runtime._PYTHON_VERSION_PROBE:
-                return completed(stdout="[3, 14, 7]\n")
-            if argv[1:3] == ["-m", "venv"]:
-                executable(Path(argv[3]) / "bin" / "python")
-                return completed()
-            if len(argv) > 1 and Path(argv[1]).name == "build_deepseek_carrier.py":
-                write_artifact_evidence(Path(argv[argv.index("--output-dir") + 1]))
-                return completed()
-            if argv[1:4] == ["-m", "pip", "install"]:
-                return completed()
-            if argv[-1] == deepseek_runtime._CARRIER_PROBE:
-                return completed(stdout=carrier_evidence(Path(argv[0])))
-            raise AssertionError(f"unexpected command: {argv}")
-
-        status = deepseek_runtime.prepare_container_carrier(
-            target,
-            architecture="x86_64",
-            bootstrap_python=bootstrap,
-            runner=runner,
-        )
-
-        assert status.available is True
-        assert stat.S_IMODE(target.stat().st_mode) == 0o555
-        assert stat.S_IMODE((target / "install-evidence.json").stat().st_mode) == 0o444
-        for path in target.rglob("*"):
-            if not path.is_symlink():
-                assert stat.S_IMODE(path.stat().st_mode) & 0o222 == 0
 
 
 def test_unsupported_container_cli_exits_successfully_for_global_image_build() -> None:

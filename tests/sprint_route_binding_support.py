@@ -25,7 +25,6 @@ def _runtime(harness: str) -> tuple[dict, dict]:
         {
             "claude": "2.1.223",
             "codex": "0.146.0",
-            "deepseek": "0.1.0rc7",
             "kimi": "0.33.0",
             "opencode": "1.18.9",
             "vibe": "2.22.0",
@@ -72,11 +71,7 @@ def candidate(_con, participant) -> sprint_domain.ParticipantBindingCandidate:
             "control_state": "controlled",
             "harness": harness,
             "requested_model": model,
-            "provider_model": (
-                model.split("/", 1)[1]
-                if harness == "deepseek" and "/" in model
-                else model
-            ),
+            "provider_model": model,
             "requested_effort": selected,
             "effective_effort": selected,
             "native_variant_id": (
@@ -88,30 +83,7 @@ def candidate(_con, participant) -> sprint_domain.ParticipantBindingCandidate:
             "catalogue_generation": "1" * 32,
             "evidence_digest": None if model_default else "2" * 64,
             "selector_binding": {"kind": "test", "selector": model},
-            "adapter_metadata": (
-                {
-                    "provider_route": "ollama-cloud",
-                    "provider_adapter_id": (
-                        "dsh-llm-pi-ai@0.1.0-rc.7/ollama-cloud"
-                    ),
-                    "provider_adapter_digest": "4" * 64,
-                    "provider_registry_sha256": "5" * 64,
-                    "credential_kind": "ollama-api-key",
-                    "endpoint_identity": "https://ollama.com/v1",
-                    "discovery_evidence_digest": "6" * 64,
-                    "transport_contract": "deepseek-provider-options-v1",
-                    "wire_evidence_digest": "7" * 64,
-                    "runtime_version": "0.1.0rc7",
-                    "source_commit": "8" * 40,
-                    "patch_sha256": "9" * 64,
-                    "composition_sha256": "a" * 64,
-                    "provider_options": {
-                        "omit": ["thinking", "reasoning_effort"],
-                        "set": {},
-                    },
-                }
-                if harness == "deepseek" else {}
-            ),
+            "adapter_metadata": {},
         }
         route_bindings.validate_v2_binding(binding)
         digest = route_bindings.digest_json(binding)
@@ -119,7 +91,6 @@ def candidate(_con, participant) -> sprint_domain.ParticipantBindingCandidate:
         harness_version = {
             "claude": "2.1.223",
             "codex": "0.146.0",
-            "deepseek": "0.1.0rc7",
             "kimi": "0.33.0",
             "opencode": "1.18.9",
         }[harness]

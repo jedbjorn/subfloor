@@ -12,7 +12,6 @@ import json
 import os
 import re
 import shutil
-import stat
 import subprocess
 import sys
 import tempfile
@@ -53,23 +52,7 @@ SECRET_TEXT = (
 LIFECYCLE_METHODS = frozenset(
     {"session/start", "session/cancel", "session/inspect", "session/reconcile", "shutdown"}
 )
-PROVIDER_WIRE_CONTRACT = "deepseek-provider-options-wire-v4"
-PROVIDER_WIRE_SHELL_TOOL = {
-    "type": "function",
-    "function": {
-        "name": "bash",
-        "description": "Execute one bounded shell command.",
-        "parameters": {
-            "type": "object",
-            "additionalProperties": False,
-            "required": ["command", "description"],
-            "properties": {
-                "command": {"type": "string"},
-                "description": {"type": "string"},
-            },
-        },
-    },
-}
+PROVIDER_WIRE_CONTRACT = "deepseek-provider-options-wire-v3"
 
 
 _PROVIDER_WIRE_PROBE = r"""
@@ -124,10 +107,6 @@ for index, (effort, options) in enumerate(options_by_effort.items()):
                         "provider": payload.get("provider"),
                         "model": payload.get("model"),
                         "reasoning_effort": payload.get("reasoningEffort"),
-                        "reserved_default_omitted": payload.get(
-                            "reservedDefaultOmitted"
-                        ),
-                        "shell_tool_declared": payload.get("shellToolDeclared"),
                         "purpose": payload.get("purpose"),
                     })
 
@@ -231,7 +210,7 @@ def load_provider_adapter_registry(
                 "credential_kind", "credential_source_env", "credential_child_env",
                 "endpoint_default", "endpoint_env", "discovery_path",
                 "discovery_shape", "selector_prefix", "max_models", "model_selectors",
-                "candidate_preferences", "wire_proof_budget",
+                "wire_proof_budget",
                 "named_efforts", "wire_mode",
             }
             if not required.issubset(entry):
@@ -265,15 +244,6 @@ def load_provider_adapter_registry(
                 raise ValueError(f"provider adapter {provider} has invalid endpoint_env")
             if not isinstance(entry["selector_prefix"], bool):
                 raise ValueError(f"provider adapter {provider} has invalid selector_prefix")
-            if provider == "ollama-cloud":
-                if entry.get("capability_shape") != "ollama-show-model-v1":
-                    raise ValueError("ollama-cloud capability shape is not reviewed")
-                _credential_free_url(
-                    entry.get("capability_url"),
-                    field="ollama-cloud.capability_url",
-                )
-                if entry.get("required_capabilities") != ["tools"]:
-                    raise ValueError("ollama-cloud must prove exact tool capability")
             if (
                 not isinstance(entry["max_models"], int)
                 or isinstance(entry["max_models"], bool)
@@ -292,28 +262,12 @@ def load_provider_adapter_registry(
                 )
             ):
                 raise ValueError(f"provider adapter {provider} has invalid model_selectors")
-            preferences = entry["candidate_preferences"]
-            if (
-                not isinstance(preferences, list)
-                or len(preferences) != len(set(preferences))
-                or any(
-                    not isinstance(item, str)
-                    or not item
-                    or item != item.strip()
-                    for item in preferences
-                )
-                or (selectors and preferences)
-            ):
-                raise ValueError(
-                    f"provider adapter {provider} has invalid candidate_preferences"
-                )
             proof_budget = entry["wire_proof_budget"]
             if (
                 not isinstance(proof_budget, int)
                 or isinstance(proof_budget, bool)
                 or not 1 <= proof_budget <= entry["max_models"]
                 or len(selectors) > proof_budget
-                or len(preferences) > proof_budget
             ):
                 raise ValueError(f"provider adapter {provider} has invalid wire_proof_budget")
             efforts = entry["named_efforts"]
@@ -353,14 +307,6 @@ def provider_adapter(provider: str) -> dict[str, object]:
             f'provider route "{provider}" is not in the reviewed allowlist',
         )
     return selected
-
-
-def provider_wire_shell_tool(provider: str) -> dict[str, object]:
-    """Return the exact final tool declaration for one governed serializer."""
-    tool = json.loads(json.dumps(PROVIDER_WIRE_SHELL_TOOL))
-    if provider_adapter(provider)["wire_mode"] == "pi-ai-provider-default":
-        tool["function"]["strict"] = False
-    return tool
 
 
 def provider_composition(provider: str) -> dict[str, str]:
@@ -1184,16 +1130,6 @@ def prepare_container_carrier(
         runner=runner,
         manifest=manifest,
     )
-    if status.available:
-        for path in (target_root, *target_root.rglob("*")):
-            if path.is_symlink():
-                continue
-            mode = path.stat().st_mode
-            if path.is_dir():
-                path.chmod(0o555)
-            elif stat.S_ISREG(mode):
-                path.chmod(0o555 if mode & 0o111 else 0o444)
-        status = probe_carrier(target_python, runner=runner, manifest=manifest)
     if status.available and marker.exists():
         marker.unlink()
     return status
@@ -1600,17 +1536,6 @@ def provider_wire_evidence(
                             f"outbound reasoning fields do not match effort "
                             f"{effort} purpose {purpose}",
                         )
-                    expected_tools = (
-                        [provider_wire_shell_tool(provider)]
-                        if purpose == "conversation"
-                        else None
-                    )
-                    if payload.get("tools") != expected_tools:
-                        raise DeepSeekRuntimeError(
-                            "HARNESS_PROVIDER_WIRE_MISMATCH",
-                            f"outbound shell tool declaration does not match "
-                            f"purpose {purpose}",
-                        )
                     native_request = native_by_purpose[purpose]
                     expected_native = {
                         "event_type": "provider.request",
@@ -1619,8 +1544,6 @@ def provider_wire_evidence(
                         "reasoning_effort": (
                             None if effort == "default" else effort
                         ),
-                        "reserved_default_omitted": effort == "default",
-                        "shell_tool_declared": purpose == "conversation",
                         "purpose": purpose,
                     }
                     if native_request != expected_native:
@@ -1631,7 +1554,6 @@ def provider_wire_evidence(
                         )
                     purpose_proofs[purpose] = {
                         "wire_options": observed_options,
-                        "shell_tool": expected_tools,
                         "native_request": native_request,
                     }
                 conversation = purpose_proofs["conversation"]

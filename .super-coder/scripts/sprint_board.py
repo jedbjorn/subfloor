@@ -47,25 +47,6 @@ _MAX_HEALTH_MESSAGE_REPLIES = 100
 # Payloads are internal evidence.  Only fields with an explicit browser use
 # are projected; an unknown event remains visible with an empty detail object.
 _EVENT_FIELDS = {
-    "qaqc.action_recorded": frozenset(
-        {
-            "action_kind",
-            "sprint_id",
-            "participant_id",
-            "reviewer_shell_id",
-            "role",
-            "assignment_generation",
-            "conversation_id",
-            "session_id",
-            "run_id",
-            "candidate_sha",
-            "document_id",
-            "revision_sha256",
-            "review_phase",
-            "approval_id",
-            "approval_created",
-        }
-    ),
     "sprint.declared": frozenset(
         {
             "feature_id",

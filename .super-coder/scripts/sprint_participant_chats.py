@@ -126,17 +126,6 @@ def _browser_adapter(harness: str) -> dict:
     return adapter
 
 
-def require_sprint_harness(harness: str) -> dict:
-    """Require a browser adapter whose manifest explicitly admits Sprints."""
-    adapter = _browser_adapter(harness)
-    surfaces = adapter.get("surfaces")
-    if not isinstance(surfaces, dict) or surfaces.get("sprint") is not True:
-        raise SprintConversationError(
-            f"harness '{harness}' has no Sprint conversation surface"
-        )
-    return adapter
-
-
 def _linked_to_participant(con, participant_id: int, conversation_id: str) -> bool:
     return (
         con.execute(
@@ -267,7 +256,7 @@ def _prepare_participant_route(
     model: str | None,
     effort: str | None,
 ) -> PreparedParticipantRoute:
-    adapter = require_sprint_harness(harness)
+    adapter = _browser_adapter(harness)
     try:
         resolved = run_mod.resolve_headless_route(
             harness=harness,
@@ -488,7 +477,7 @@ def prepare_wake_conversation(
     control_state = None
     if row["active_route_binding_id"] is None:
         harness = str(row["harness"])
-        adapter = require_sprint_harness(harness)
+        adapter = _browser_adapter(harness)
         try:
             resolved = run_mod.resolve_headless_route(
                 harness=harness,
@@ -520,7 +509,7 @@ def prepare_wake_conversation(
                 "active Sprint route binding digest does not match its content"
             )
         harness = binding["harness"]
-        require_sprint_harness(harness)
+        _browser_adapter(harness)
         provider = run_mod.session_provider(harness, binding["requested_model"])
         model = binding["requested_model"]
         effort = binding["effective_effort"]

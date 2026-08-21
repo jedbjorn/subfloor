@@ -18,7 +18,6 @@
       "selector_prefix": false,
       "max_models": 8,
       "model_selectors": [],
-      "candidate_preferences": [],
       "wire_proof_budget": 8,
       "named_efforts": ["low", "high", "max"],
       "wire_mode": "deepseek-request-patch"
@@ -42,13 +41,9 @@
       "endpoint_env": null,
       "discovery_path": "/models",
       "discovery_shape": "openai-model-list-v1",
-      "capability_url": "https://ollama.com/api/show",
-      "capability_shape": "ollama-show-model-v1",
-      "required_capabilities": ["tools"],
       "selector_prefix": true,
       "max_models": 64,
       "model_selectors": [],
-      "candidate_preferences": ["glm-5.2:cloud", "minimax-m3:cloud"],
       "wire_proof_budget": 4,
       "named_efforts": [],
       "wire_mode": "pi-ai-provider-default"

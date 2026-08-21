@@ -109,12 +109,6 @@ DEEPSEEK_PROVIDER_REGISTRY_INVALID = "DeepSeek provider registry is unavailable"
 DEEPSEEK_PROVIDER_OPTIONS_UNVERIFIED = (
     "DeepSeek provider-option mapper has no outbound wire proof"
 )
-DEEPSEEK_PROVIDER_TOOLS_UNVERIFIED = (
-    "authenticated DeepSeek model has no governed tool-capability proof"
-)
-DEEPSEEK_PROVIDER_TOOLS_UNSUPPORTED = (
-    "authenticated DeepSeek model explicitly lacks required tool capability"
-)
 DEEPSEEK_DISCOVERY_LIMIT_ERROR = (
     "authenticated DeepSeek model response exceeds safety limits"
 )
@@ -136,9 +130,6 @@ class _ModelCatalogueLimitError(ValueError):
 class _DeepSeekDiscoveryEvidenceError(ValueError):
     pass
 
-
-class _DeepSeekToolCapabilityError(ValueError):
-    pass
 
 # The ids the engine ships in flavor_defaults — surfaced only when every live
 # source fails AND no cache exists, so the datalist is never empty.
@@ -162,23 +153,6 @@ def _http_json(url: str, headers: dict | None = None) -> dict:
             "model catalogue response exceeds safety limits"
         )
     return json.loads(body.decode())
-
-
-def _http_json_post(url: str, payload: dict, headers: dict | None = None) -> dict:
-    hdrs = {
-        "User-Agent": "super-coder-model-catalog/1.0",
-        "Content-Type": "application/json",
-        **(headers or {}),
-    }
-    body = json.dumps(payload, separators=(",", ":")).encode()
-    req = urllib.request.Request(url, data=body, headers=hdrs, method="POST")
-    with urllib.request.urlopen(req, timeout=TIMEOUT) as response:
-        response_body = response.read(MAX_HTTP_JSON_BYTES + 1)
-    if len(response_body) > MAX_HTTP_JSON_BYTES:
-        raise _ModelCatalogueLimitError(
-            "model capability response exceeds safety limits"
-        )
-    return json.loads(response_body.decode())
 
 
 def _entry(mid: str, release_date: str = "", name: str = "",
@@ -291,36 +265,6 @@ def _deepseek_provider_endpoint(provider: str, adapter: dict, env) -> tuple[str,
     return identity, identity + adapter["discovery_path"]
 
 
-def _deepseek_tool_capability(
-    provider: str,
-    model: str,
-    adapter: dict,
-    key: str,
-    *,
-    post=_http_json_post,
-) -> dict[str, object]:
-    required = adapter.get("required_capabilities")
-    if not required:
-        return {"required": False, "tools": True}
-    if provider != "ollama-cloud" or required != ["tools"]:
-        raise _DeepSeekToolCapabilityError(DEEPSEEK_PROVIDER_TOOLS_UNVERIFIED)
-    payload = post(
-        adapter["capability_url"],
-        {"model": model},
-        {"Authorization": f"Bearer {key}"},
-    )
-    capabilities = payload.get("capabilities") if isinstance(payload, dict) else None
-    if (
-        not isinstance(capabilities, list)
-        or len(capabilities) > 32
-        or any(not isinstance(item, str) for item in capabilities)
-    ):
-        raise _DeepSeekToolCapabilityError(DEEPSEEK_PROVIDER_TOOLS_UNVERIFIED)
-    if "tools" not in capabilities:
-        raise _DeepSeekToolCapabilityError(DEEPSEEK_PROVIDER_TOOLS_UNSUPPORTED)
-    return {"required": True, "tools": True}
-
-
 def _deepseek_carrier_options(provider: str = "deepseek-official") -> dict[str, dict[str, str]]:
     _manifest, providers, _registry_digest = _deepseek_provider_registry()
     adapter = providers.get(provider)
@@ -397,21 +341,13 @@ def _deepseek_provider_metadata(
             "reasoning_effort": (
                 None if effort == route_bindings.DEFAULT_EFFORT else effort
             ),
-            "reserved_default_omitted": effort == route_bindings.DEFAULT_EFFORT,
-            "shell_tool_declared": True,
             "purpose": "conversation",
         }
         expected_purpose_proofs = {
             purpose: {
                 "wire_options": expected_wire,
-                "shell_tool": (
-                    [deepseek_runtime.provider_wire_shell_tool(provider)]
-                    if purpose == "conversation"
-                    else None
-                ),
                 "native_request": {
                     **expected_native,
-                    "shell_tool_declared": purpose == "conversation",
                     "purpose": purpose,
                 },
             }
@@ -496,7 +432,6 @@ def _from_deepseek_provider(
     wire_probe=None,
     *,
     selector=None,
-    capability_probe=None,
 ) -> list[dict]:
     """Read exact models through one reviewed provider-specific credential."""
     _manifest, providers, registry_digest = _deepseek_provider_registry()
@@ -518,8 +453,6 @@ def _from_deepseek_provider(
         import deepseek_runtime  # noqa: PLC0415
 
         wire_probe = deepseek_runtime.provider_wire_evidence
-    if capability_probe is None:
-        capability_probe = _deepseek_tool_capability
     entries = []
     seen = set()
     exact_rows = []
@@ -548,8 +481,6 @@ def _from_deepseek_provider(
         "provider_registry_sha256": registry_digest,
     })
     configured = adapter["model_selectors"]
-    preferences = adapter["candidate_preferences"]
-    dynamic_candidates = False
     if selector is not None:
         exact_rows = [
             (row, model)
@@ -567,49 +498,12 @@ def _from_deepseek_provider(
         exact_rows = [
             (row, model) for row, model in exact_rows if model in configured_set
         ]
-    elif preferences:
-        by_model = {model: row for row, model in exact_rows}
-        preferred = [
-            (by_model[model], model) for model in preferences if model in by_model
-        ]
-        preferred_ids = {model for _row, model in preferred}
-        remaining = sorted(
-            (
-                (row, model)
-                for row, model in exact_rows
-                if model not in preferred_ids
-            ),
-            key=lambda item: item[1],
-        )
-        exact_rows = (preferred + remaining)[: adapter["wire_proof_budget"]]
-        dynamic_candidates = True
+    else:
+        exact_rows = exact_rows[: adapter["wire_proof_budget"]]
     if len(exact_rows) > adapter["wire_proof_budget"]:
         raise _DeepSeekWireProofError(DEEPSEEK_PROVIDER_OPTIONS_UNVERIFIED)
-    capability_failures = []
     for row, model in exact_rows:
         route_selector = f"{provider}/{model}" if adapter["selector_prefix"] else model
-        try:
-            capability_evidence = capability_probe(provider, model, adapter, key)
-            expected_capability = {
-                "required": bool(adapter.get("required_capabilities")),
-                "tools": True,
-            }
-            if capability_evidence != expected_capability:
-                raise _DeepSeekToolCapabilityError(
-                    DEEPSEEK_PROVIDER_TOOLS_UNVERIFIED
-                )
-        except _DeepSeekToolCapabilityError as exc:
-            if not dynamic_candidates:
-                raise
-            capability_failures.append(str(exc))
-            continue
-        except Exception as exc:
-            if not dynamic_candidates:
-                raise _DeepSeekToolCapabilityError(
-                    DEEPSEEK_PROVIDER_TOOLS_UNVERIFIED
-                ) from exc
-            capability_failures.append(DEEPSEEK_PROVIDER_TOOLS_UNVERIFIED)
-            continue
         try:
             proof = wire_probe(
                 provider, model, _deepseek_carrier_options(provider), env=env
@@ -644,20 +538,8 @@ def _from_deepseek_provider(
                 "runtime_source_commit": source_commit,
                 "provider_wire_contract": metadata["wire_contract"],
                 "provider_wire_digests": metadata["wire_evidence_by_effort"],
-                **(
-                    {"tool_capability_verified": True}
-                    if capability_evidence["required"]
-                    else {}
-                ),
             },
-            adapter_metadata={
-                **metadata,
-                **(
-                    {"tool_capability_verified": True}
-                    if capability_evidence["required"]
-                    else {}
-                ),
-            },
+            adapter_metadata=metadata,
         ))
     if exact_rows and not entries:
         selectors = {
@@ -666,16 +548,6 @@ def _from_deepseek_provider(
         }
         if selector is not None and selector not in selectors:
             raise ValueError("DeepSeek authenticated endpoint omitted exact model")
-        if capability_failures:
-            failure = (
-                DEEPSEEK_PROVIDER_TOOLS_UNSUPPORTED
-                if all(
-                    item == DEEPSEEK_PROVIDER_TOOLS_UNSUPPORTED
-                    for item in capability_failures
-                )
-                else DEEPSEEK_PROVIDER_TOOLS_UNVERIFIED
-            )
-            raise _DeepSeekToolCapabilityError(failure)
         raise _DeepSeekWireProofError(DEEPSEEK_PROVIDER_OPTIONS_UNVERIFIED)
     if not entries:
         raise ValueError("DeepSeek authenticated endpoint returned no exact models")
@@ -791,7 +663,6 @@ def build(
     env=os.environ,
     run=subprocess.run,
     deepseek_wire_probe=None,
-    deepseek_capability_probe=None,
 ) -> dict:
     """One live sweep across all sources. Raises only if EVERY source fails —
     partial results (e.g. models.dev down but a keyed API up) still count."""
@@ -830,7 +701,6 @@ def build(
                 fetch,
                 env,
                 wire_probe=deepseek_wire_probe,
-                capability_probe=deepseek_capability_probe,
             )
         except _ModelCatalogueLimitError:
             provider_errors.append((source, DEEPSEEK_DISCOVERY_LIMIT_ERROR))
@@ -840,15 +710,6 @@ def build(
             continue
         except _DeepSeekExactModelAbsentError:
             provider_errors.append((source, DEEPSEEK_EXACT_MODEL_ABSENT))
-            continue
-        except _DeepSeekToolCapabilityError as exc:
-            stable_error = str(exc)
-            if stable_error not in {
-                DEEPSEEK_PROVIDER_TOOLS_UNSUPPORTED,
-                DEEPSEEK_PROVIDER_TOOLS_UNVERIFIED,
-            }:
-                stable_error = DEEPSEEK_PROVIDER_TOOLS_UNVERIFIED
-            provider_errors.append((source, stable_error))
             continue
         except _DeepSeekWireProofError:
             provider_errors.append((source, DEEPSEEK_PROVIDER_OPTIONS_UNVERIFIED))
@@ -1702,7 +1563,6 @@ def controlled_route_evidence(
     harness_probe=None,
     deepseek_fetch=None,
     deepseek_wire_probe=None,
-    deepseek_capability_probe=None,
 ) -> dict:
     """Probe one controlled route and bind its source to this runtime seat."""
     env = os.environ if env is None else env
@@ -1765,7 +1625,6 @@ def controlled_route_evidence(
                 env,
                 wire_probe=deepseek_wire_probe,
                 selector=selector,
-                capability_probe=deepseek_capability_probe,
             )
         else:
             entries = []

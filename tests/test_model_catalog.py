@@ -95,8 +95,6 @@ def deepseek_wire_proof(provider, model, options_by_effort, env=None):
             "provider": provider,
             "model": model,
             "reasoning_effort": None if effort == "default" else effort,
-            "reserved_default_omitted": effort == "default",
-            "shell_tool_declared": True,
             "purpose": "conversation",
         }
         evidence = {
@@ -110,16 +108,7 @@ def deepseek_wire_proof(provider, model, options_by_effort, env=None):
             "purpose_proofs": {
                 purpose: {
                     "wire_options": wire,
-                    "shell_tool": (
-                        [deepseek_runtime.provider_wire_shell_tool(provider)]
-                        if purpose == "conversation"
-                        else None
-                    ),
-                    "native_request": {
-                        **native_request,
-                        "shell_tool_declared": purpose == "conversation",
-                        "purpose": purpose,
-                    },
+                    "native_request": {**native_request, "purpose": purpose},
                 }
                 for purpose in deepseek_runtime.PROVIDER_WIRE_PURPOSES
             },
@@ -140,14 +129,6 @@ def deepseek_wire_proof(provider, model, options_by_effort, env=None):
         "provider": provider,
         "model": model,
         "proofs": proofs,
-    }
-
-
-def deepseek_tool_capability(provider, model, adapter, key):
-    del provider, model, key
-    return {
-        "required": bool(adapter.get("required_capabilities")),
-        "tools": True,
     }
 
 
@@ -588,8 +569,8 @@ class BuildTest(NoCLI):
                 return MODELS_DEV
             if url == "https://ollama.com/v1/models":
                 return {"data": [
-                    {"id": "minimax-m3:cloud"},
-                    {"id": "glm-5.2:cloud"},
+                    {"id": "deepseek-v4-pro:0813"},
+                    {"id": "deepseek-v4-pro:0813-cloud"},
                 ]}
             raise AssertionError(url)
 
@@ -598,18 +579,15 @@ class BuildTest(NoCLI):
             env={"OLLAMA_API_KEY": "ollama-secret"},
             run=None,
             deepseek_wire_probe=deepseek_wire_proof,
-            deepseek_capability_probe=deepseek_tool_capability,
         )
 
         route = got["harnesses"]["deepseek"]["models"][0]
-        self.assertEqual(route["id"], "ollama-cloud/glm-5.2:cloud")
+        self.assertEqual(route["id"], "ollama-cloud/deepseek-v4-pro:0813")
         self.assertEqual(route["provider"], "ollama-cloud")
-        self.assertEqual(route["provider_model"], "glm-5.2:cloud")
+        self.assertEqual(route["provider_model"], "deepseek-v4-pro:0813")
         self.assertEqual(route["supported_efforts"], [])
         self.assertIsNone(route["default_effort"])
         self.assertEqual(route["adapter_metadata"]["credential_kind"], "ollama-api-key")
-        self.assertIs(route["selector_binding"]["tool_capability_verified"], True)
-        self.assertIs(route["adapter_metadata"]["tool_capability_verified"], True)
         self.assertEqual(
             route["adapter_metadata"]["provider_options_by_effort"],
             {"default": {"omit": ["thinking", "reasoning_effort"], "set": {}}},
@@ -620,169 +598,34 @@ class BuildTest(NoCLI):
         ))
         self.assertIn(mc.OLLAMA_CLOUD_SOURCE, got["sources"])
         self.assertNotIn(mc.DEEPSEEK_SOURCE, got["sources"])
-        self.assertEqual(
+        self.assertIn(
+            "ollama-cloud/deepseek-v4-pro:0813-cloud",
             ids(got["harnesses"]["deepseek"]),
-            ["ollama-cloud/glm-5.2:cloud", "ollama-cloud/minimax-m3:cloud"],
         )
         serialized = json.dumps(got)
         self.assertNotIn("ollama-secret", serialized)
         self.assertNotIn("OLLAMA_API_KEY", serialized)
 
-    def test_ollama_tool_capability_uses_exact_non_generative_model_metadata(self):
-        adapter = deepseek_runtime.provider_adapter("ollama-cloud")
-        calls = []
-
-        def post(url, payload, headers=None):
-            calls.append((url, payload, headers))
-            return {"capabilities": ["completion", "tools", "thinking"]}
-
-        evidence = mc._deepseek_tool_capability(
-            "ollama-cloud",
-            "deepseek-v4-pro:0813",
-            adapter,
-            "ollama-secret",
-            post=post,
-        )
-
-        self.assertEqual(evidence, {"required": True, "tools": True})
-        self.assertEqual(calls, [(
-            "https://ollama.com/api/show",
-            {"model": "deepseek-v4-pro:0813"},
-            {"Authorization": "Bearer ollama-secret"},
-        )])
-        self.assertNotIn("ollama-secret", json.dumps(evidence))
-
-    def test_ollama_dynamic_candidates_skip_only_the_failed_exact_route(self):
-        capability_calls = []
-        wire_calls = []
-
-        def capability(provider, model, _adapter, _key):
-            capability_calls.append((provider, model))
-            if model == "glm-5.2:cloud":
-                raise mc._DeepSeekToolCapabilityError(
-                    mc.DEEPSEEK_PROVIDER_TOOLS_UNSUPPORTED
-                )
-            return {"required": True, "tools": True}
-
-        def prove(provider, model, options_by_effort, env=None):
-            wire_calls.append((provider, model))
-            return deepseek_wire_proof(provider, model, options_by_effort, env)
-
-        routes = mc._from_deepseek_provider(
-            "ollama-cloud",
-            lambda _url, _headers=None: {
-                "data": [
-                    {"id": "unrelated:cloud"},
-                    {"id": "minimax-m3:cloud"},
-                    {"id": "glm-5.2:cloud"},
-                ]
-            },
-            {"OLLAMA_API_KEY": "ollama-secret"},
-            wire_probe=prove,
-            capability_probe=capability,
-        )
-
-        self.assertEqual(
-            capability_calls,
-            [
-                ("ollama-cloud", "glm-5.2:cloud"),
-                ("ollama-cloud", "minimax-m3:cloud"),
-                ("ollama-cloud", "unrelated:cloud"),
-            ],
-        )
-        self.assertEqual(
-            wire_calls,
-            [
-                ("ollama-cloud", "minimax-m3:cloud"),
-                ("ollama-cloud", "unrelated:cloud"),
-            ],
-        )
-        self.assertEqual(
-            [route["id"] for route in routes],
-            ["ollama-cloud/minimax-m3:cloud", "ollama-cloud/unrelated:cloud"],
-        )
-
-    def test_ollama_tool_capability_distinguishes_explicit_unsupported(self):
-        adapter = deepseek_runtime.provider_adapter("ollama-cloud")
-        with self.assertRaises(mc._DeepSeekToolCapabilityError) as raised:
-            mc._deepseek_tool_capability(
-                "ollama-cloud",
-                "deepseek-v4-pro:0813",
-                adapter,
-                "ollama-secret",
-                post=lambda *_args: {"capabilities": ["completion"]},
-            )
-
-        self.assertEqual(
-            mc.DEEPSEEK_PROVIDER_TOOLS_UNSUPPORTED, str(raised.exception)
-        )
-
-    def test_ollama_route_fails_closed_when_exact_model_tools_are_unproven(self):
-        wire_probe = mock.Mock(
-            side_effect=AssertionError("capability failure must precede wire proof")
-        )
+    def test_ollama_authenticated_exact_model_is_not_fixed_to_one_selector(self):
+        probe = mock.Mock(side_effect=deepseek_wire_proof)
 
         got = mc.build(
             fetch=lambda url, _headers=None: (
                 MODELS_DEV
                 if url == mc.MODELS_DEV_URL
-                else {"data": [{"id": "deepseek-v4-pro:0813"}]}
+                else {"data": [{"id": "deepseek-v4-pro:0813-cloud"}]}
             ),
             env={"OLLAMA_API_KEY": "ollama-secret"},
             run=None,
-            deepseek_wire_probe=wire_probe,
-            deepseek_capability_probe=lambda *_args: {
-                "required": True,
-                "tools": False,
-            },
-        )
-
-        self.assertEqual(got["harnesses"]["deepseek"]["models"], [])
-        self.assertEqual(
-            got["harnesses"]["deepseek"]["error"],
-            mc.DEEPSEEK_PROVIDER_TOOLS_UNVERIFIED,
-        )
-        wire_probe.assert_not_called()
-
-    def test_requested_exact_ollama_route_cannot_substitute_nearby_tag(self):
-        probe = mock.Mock(
-            side_effect=AssertionError("missing exact inference id must not probe")
-        )
-
-        with self.assertRaisesRegex(
-            mc._DeepSeekExactModelAbsentError,
-            mc.DEEPSEEK_EXACT_MODEL_ABSENT,
-        ):
-            mc._from_deepseek_provider(
-                "ollama-cloud",
-                lambda _url, _headers=None: {
-                    "data": [{"id": "glm-5.2:cloud-latest"}]
-                },
-                {"OLLAMA_API_KEY": "ollama-secret"},
-                wire_probe=probe,
-                selector="ollama-cloud/glm-5.2:cloud",
-            )
-        probe.assert_not_called()
-
-    def test_authenticated_provider_rejection_has_one_redacted_auth_category(self):
-        def fetch(url, headers=None):
-            if url == mc.MODELS_DEV_URL:
-                return MODELS_DEV
-            raise mc.urllib.error.HTTPError(url, 401, "raw detail", {}, None)
-
-        got = mc.build(
-            fetch=fetch,
-            env={"OLLAMA_API_KEY": "ollama-secret"},
-            run=None,
+            deepseek_wire_probe=probe,
         )
 
         self.assertEqual(
-            mc.DEEPSEEK_AUTHENTICATION_ERROR,
-            got["harnesses"]["deepseek"]["error"],
+            ids(got["harnesses"]["deepseek"]),
+            ["ollama-cloud/deepseek-v4-pro:0813-cloud"],
         )
-        serialized = json.dumps(got)
-        self.assertNotIn("raw detail", serialized)
-        self.assertNotIn("ollama-secret", serialized)
+        self.assertIn(mc.OLLAMA_CLOUD_SOURCE, got["sources"])
+        probe.assert_called_once()
 
     def test_one_provider_failure_does_not_suppress_the_other_provider(self):
         def fetch(url, headers=None):
@@ -802,7 +645,6 @@ class BuildTest(NoCLI):
             },
             run=None,
             deepseek_wire_probe=deepseek_wire_proof,
-            deepseek_capability_probe=deepseek_tool_capability,
         )
 
         self.assertEqual(
@@ -900,7 +742,7 @@ class BuildTest(NoCLI):
             [f"deepseek-exact-{index}" for index in range(8)],
         )
 
-    def test_ollama_max_catalogue_proves_only_bounded_exact_candidates(self):
+    def test_ollama_max_catalogue_proves_only_bounded_exact_selectors(self):
         proof_calls = []
         configured = "deepseek-v4-pro:0813"
         rows = [{"id": configured}] + [
@@ -922,15 +764,17 @@ class BuildTest(NoCLI):
             env={"OLLAMA_API_KEY": "ollama-secret"},
             run=None,
             deepseek_wire_probe=unavailable_probe,
-            deepseek_capability_probe=deepseek_tool_capability,
         )
 
-        self.assertEqual(proof_calls, [
-            ("ollama-cloud", configured),
-            ("ollama-cloud", "other-model-0"),
-            ("ollama-cloud", "other-model-1"),
-            ("ollama-cloud", "other-model-10"),
-        ])
+        self.assertEqual(
+            proof_calls,
+            [
+                ("ollama-cloud", configured),
+                ("ollama-cloud", "other-model-0"),
+                ("ollama-cloud", "other-model-1"),
+                ("ollama-cloud", "other-model-2"),
+            ],
+        )
         self.assertEqual(got["harnesses"]["deepseek"]["models"], [])
         self.assertEqual(
             got["harnesses"]["deepseek"]["error"],
@@ -1446,29 +1290,6 @@ class RoutePersistenceTest(unittest.TestCase):
             "SELECT selector, availability, headless_supported, "
             "high_effort_supported, stale FROM model_routes").fetchone()
         self.assertEqual(tuple(row), ("kimi-code/k3", "available", 1, 1, 0))
-
-    def test_latest_generation_retains_bounded_harness_failure_without_route(self):
-        payload = {
-            "fetched_at": "2026-08-21T00:00:00+00:00",
-            "stale": False,
-            "partial": True,
-            "errors": ["redacted provider failure"],
-            "harnesses": {
-                "deepseek": {
-                    "models": [],
-                    "error": mc.DEEPSEEK_AUTHENTICATION_ERROR,
-                }
-            },
-            **self.verification("deepseek", "0.1.0rc7"),
-        }
-
-        mc.persist_routes(self.con, payload)
-
-        self.assertEqual(
-            mc.DEEPSEEK_AUTHENTICATION_ERROR,
-            mc.latest_harness_error(self.con, "deepseek"),
-        )
-        self.assertIsNone(mc.latest_harness_error(self.con, "codex"))
 
     def test_authenticated_deepseek_ids_stay_unbindable_before_wire_proof(self):
         def fetch(url, _headers=None):
@@ -2486,209 +2307,6 @@ class RouteCliConnectionTest(unittest.TestCase):
         ):
             self.assertEqual(routes_cli.main(["refresh"]), 0)
         opened.assert_called_once_with()
-
-
-class SprintAdmissionProjectionTest(unittest.TestCase):
-    SELECTOR = "ollama-cloud/deepseek-v4-pro:0813"
-
-    @classmethod
-    def route(cls, **updates) -> dict:
-        value = {
-            "harness": "deepseek",
-            "selector": cls.SELECTOR,
-            "availability": "available",
-            "stale": 0,
-            "last_error": None,
-            "selector_binding": json.dumps({
-                "tool_capability_verified": True,
-            }),
-        }
-        value.update(updates)
-        return value
-
-    @classmethod
-    def resolved(cls, **binding_updates) -> dict:
-        binding = {
-            "harness": "deepseek",
-            "requested_model": cls.SELECTOR,
-            "provider_model": "deepseek-v4-pro:0813",
-            "selector_binding": {"tool_capability_verified": True},
-            "adapter_metadata": {"provider_route": "ollama-cloud"},
-        }
-        binding.update(binding_updates)
-        return {"ok": True, "binding": binding}
-
-    def test_admitted_result_has_only_the_bounded_exact_contract(self):
-        result = routes_cli.sprint_admission_result(
-            self.resolved(), self.route(), "deepseek", self.SELECTOR
-        )
-
-        self.assertEqual(tuple(result), routes_cli.SPRINT_ADMISSION_KEYS)
-        self.assertEqual(result, {
-            "contract_version": 1,
-            "requested_provider": "ollama-cloud",
-            "requested_model": "deepseek-v4-pro:0813",
-            "admitted": True,
-            "error_code": None,
-            "category": None,
-            "required_surface": "sprint",
-            "required_capability": "reviewer-shell-tool-execution",
-            "freshness": "fresh",
-            "authentication": "verified",
-            "tool_capability": "supported",
-            "exit_class": "success",
-        })
-
-    def test_every_rejection_category_maps_to_one_stable_bounded_code(self):
-        cases = {
-            "harness-unavailable": ({"code": "harness_unavailable"}, self.route()),
-            "runtime-unavailable": ({"code": "runtime_unavailable"}, self.route()),
-            "credential-or-authentication": (
-                {"code": "credential_or_authentication"}, self.route()
-            ),
-            "catalogue-unavailable": (
-                {"code": "catalogue_unavailable"}, self.route()
-            ),
-            "catalogue-stale": (
-                {"code": "thinking_evidence_stale"}, self.route(stale=1)
-            ),
-            "exact-model-absent": ({"code": "exact_model_absent"}, None),
-            "exact-model-unavailable": (
-                {"code": "exact_model_unavailable"},
-                self.route(availability="unavailable"),
-            ),
-            "tool-capability-unsupported": (
-                {"code": "tool_capability_unsupported"}, self.route()
-            ),
-            "tool-capability-unproven": (
-                {"code": "tool_capability_unproven"}, self.route()
-            ),
-            "route-evidence-invalid": (
-                {"code": "route_evidence_invalid"}, self.route()
-            ),
-            "provider-option-drift": (
-                {"code": "provider_option_drift"}, self.route()
-            ),
-            "unknown": ({"code": "unexpected_internal_code"}, self.route()),
-        }
-        for category, (failure, route) in cases.items():
-            with self.subTest(category=category):
-                result = routes_cli.sprint_admission_result(
-                    {"ok": False, **failure}, route, "deepseek", self.SELECTOR
-                )
-                self.assertEqual(tuple(result), routes_cli.SPRINT_ADMISSION_KEYS)
-                self.assertFalse(result["admitted"])
-                self.assertEqual(category, result["category"])
-                self.assertEqual(
-                    routes_cli.SPRINT_ADMISSION_ERROR_CODES[category],
-                    result["error_code"],
-                )
-                self.assertEqual("route-rejected", result["exit_class"])
-
-    def test_tool_unsupported_and_unproven_use_authenticated_metadata(self):
-        unsupported = routes_cli.sprint_admission_result(
-            {"ok": False, "code": "thinking_evidence_stale"},
-            self.route(
-                stale=1,
-                last_error=mc.DEEPSEEK_PROVIDER_TOOLS_UNSUPPORTED,
-            ),
-            "deepseek",
-            self.SELECTOR,
-        )
-        unproven = routes_cli.sprint_admission_result(
-            {"ok": False, "code": "thinking_evidence_stale"},
-            self.route(
-                stale=1,
-                last_error=mc.DEEPSEEK_PROVIDER_TOOLS_UNVERIFIED,
-            ),
-            "deepseek",
-            self.SELECTOR,
-        )
-
-        self.assertEqual("tool-capability-unsupported", unsupported["category"])
-        self.assertEqual("unsupported", unsupported["tool_capability"])
-        self.assertEqual("verified", unsupported["authentication"])
-        self.assertEqual("tool-capability-unproven", unproven["category"])
-        self.assertEqual("unproven", unproven["tool_capability"])
-        self.assertEqual("unproven", unproven["authentication"])
-
-    def test_success_with_exact_identity_or_tool_drift_fails_closed(self):
-        mismatched = routes_cli.sprint_admission_result(
-            self.resolved(provider_model="nearby-model"),
-            self.route(),
-            "deepseek",
-            self.SELECTOR,
-        )
-        unproven = routes_cli.sprint_admission_result(
-            self.resolved(),
-            self.route(selector_binding=json.dumps({})),
-            "deepseek",
-            self.SELECTOR,
-        )
-
-        self.assertFalse(mismatched["admitted"])
-        self.assertEqual("route-evidence-invalid", mismatched["category"])
-        self.assertFalse(unproven["admitted"])
-        self.assertEqual("tool-capability-unproven", unproven["category"])
-
-    def test_missing_route_uses_authenticated_harness_failure_category(self):
-        authentication = routes_cli.sprint_admission_result(
-            {"ok": False, "code": "model_not_found"},
-            None,
-            "deepseek",
-            self.SELECTOR,
-            mc.DEEPSEEK_AUTHENTICATION_ERROR,
-        )
-        absent = routes_cli.sprint_admission_result(
-            {"ok": False, "code": "model_not_found"},
-            None,
-            "deepseek",
-            self.SELECTOR,
-            mc.DEEPSEEK_EXACT_MODEL_ABSENT,
-        )
-
-        self.assertEqual("credential-or-authentication", authentication["category"])
-        self.assertEqual("failed", authentication["authentication"])
-        self.assertEqual("exact-model-absent", absent["category"])
-        self.assertEqual("verified", absent["authentication"])
-
-    def test_sprint_admission_cli_emits_no_raw_resolution_diagnostics(self):
-        projection = {"routes": [self.route(
-            stale=1,
-            last_error=mc.DEEPSEEK_PROVIDER_TOOLS_UNSUPPORTED,
-        )]}
-        output = io.StringIO()
-        with (
-            mock.patch.object(routes_cli.mem, "SC_API_TOKEN", "shell-token"),
-            mock.patch.object(routes_cli.mem, "SC_API_BASE", "http://engine"),
-            mock.patch.object(routes_cli.mem, "_api", return_value=projection),
-            mock.patch.object(
-                routes_cli.model_catalog,
-                "controlled_route_evidence",
-                return_value=controlled_bundle(
-                    "deepseek",
-                    self.SELECTOR,
-                    runtime_status(harness="deepseek"),
-                    None,
-                ),
-            ),
-            contextlib.redirect_stdout(output),
-        ):
-            exit_code = routes_cli.main([
-                "resolve",
-                "deepseek",
-                self.SELECTOR,
-                "--sprint-admission-json",
-            ])
-        payload = json.loads(output.getvalue())
-
-        self.assertEqual(2, exit_code)
-        self.assertEqual(tuple(payload), routes_cli.SPRINT_ADMISSION_KEYS)
-        self.assertEqual("tool-capability-unsupported", payload["category"])
-        serialized = output.getvalue()
-        self.assertNotIn('"error":', serialized.lower())
-        self.assertNotIn('"details":', serialized.lower())
-        self.assertNotIn(mc.DEEPSEEK_PROVIDER_TOOLS_UNSUPPORTED, serialized)
 
 
 class CatalogCacheTest(NoCLI):

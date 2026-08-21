@@ -5,7 +5,7 @@
     "terminal": false,
     "one_shot": false,
     "browser": true,
-    "sprint": true
+    "sprint": false
   },
   "boot_artifact": "AGENTS.md",
   "emit": [],
