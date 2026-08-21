@@ -33,7 +33,7 @@
     "source_date_epoch": 1786963622,
     "artifact_evidence": "deepseek-carrier-artifacts.json",
     "canary_path": "scripts/deepseek_skill_resume_canary.py",
-    "canary_sha256": "ffc7efd08c6ea4735b135a6eeedc7fd4959d722313d909a5e476c9a4baf08f0c",
+    "canary_sha256": "1d0b3640d9579f42e9d0afa386e1f97c8360c6a372ea138534a343c292ddfba1",
     "canary_contract": "deepseek-production-skill-resume-v1"
   },
   "sdk": {
