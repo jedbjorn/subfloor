@@ -496,6 +496,200 @@ class DosAppSprintCanaryTest(unittest.TestCase):
         self.assertIsNone(payload["resources"]["workspace"])
         self.assertEqual("PREFLIGHT_TEST", payload["failure"]["primary"]["code"])
 
+    def explicit_parent(self) -> tuple[Path, canary.CanaryConfig]:
+        home_root = self.root / "home"
+        parent = home_root / "canary-anchor"
+        parent.mkdir(parents=True, mode=0o700)
+        parent.chmod(0o700)
+        return home_root, dataclasses.replace(
+            self.config,
+            temp_parent=parent,
+            temp_parent_explicit=True,
+        )
+
+    def test_explicit_temp_parent_resolves_one_exact_owned_child(self) -> None:
+        home_root, config = self.explicit_parent()
+        high_capacity = canary.MIN_FREE_BYTES + 1
+
+        with (
+            mock.patch.object(canary, "EXPLICIT_TEMP_ROOT", home_root),
+            mock.patch.object(
+                canary.shutil,
+                "disk_usage",
+                return_value=mock.Mock(free=high_capacity),
+            ),
+        ):
+            parent, workspace = canary._validated_explicit_workspace(config)
+            available = canary._require_disposable_capacity(parent)
+
+        self.assertEqual(config.temp_parent, parent)
+        self.assertEqual(high_capacity, available)
+        self.assertEqual(parent, workspace.parent)
+        self.assertEqual(
+            f"{canary.WORKSPACE_PREFIX}{config.run_id}", workspace.name
+        )
+        self.assertFalse(workspace.exists())
+
+    def test_explicit_temp_parent_rejects_low_capacity_before_commands(self) -> None:
+        home_root, config = self.explicit_parent()
+        backend = canary.HostBackend(canary.Deadline(100, 50))
+        backend._run = mock.Mock(side_effect=AssertionError("command ran"))
+        backend._git = mock.Mock(side_effect=AssertionError("git ran"))
+
+        with (
+            mock.patch.object(canary, "EXPLICIT_TEMP_ROOT", home_root),
+            mock.patch.object(
+                canary.shutil,
+                "disk_usage",
+                return_value=mock.Mock(free=canary.MIN_FREE_BYTES - 1),
+            ),
+            self.assertRaises(canary.CanaryError) as raised,
+        ):
+            backend.preflight(config)
+
+        self.assertEqual("CANARY_CAPACITY_FAILED", raised.exception.code)
+        backend._run.assert_not_called()
+        backend._git.assert_not_called()
+
+    def test_explicit_temp_parent_rejects_relative_traversal_and_symlinks(self) -> None:
+        home_root, config = self.explicit_parent()
+        real_parent = home_root / "real-anchor"
+        real_parent.mkdir(mode=0o700)
+        linked_parent = home_root / "linked-anchor"
+        linked_parent.symlink_to(real_parent, target_is_directory=True)
+        cases = {
+            "relative": Path("relative-anchor"),
+            "traversal": config.temp_parent / "..",
+            "symlink": linked_parent,
+        }
+
+        with mock.patch.object(canary, "EXPLICIT_TEMP_ROOT", home_root):
+            for label, parent in cases.items():
+                with self.subTest(label=label), self.assertRaises(
+                    canary.CanaryError
+                ) as raised:
+                    canary._validated_explicit_workspace(
+                        dataclasses.replace(config, temp_parent=parent)
+                    )
+                self.assertEqual("CANARY_INPUT_INVALID", raised.exception.code)
+
+    def test_explicit_temp_parent_rejects_unsafe_owner_and_mode(self) -> None:
+        home_root, config = self.explicit_parent()
+        with (
+            mock.patch.object(canary, "EXPLICIT_TEMP_ROOT", home_root),
+            mock.patch.object(canary.os, "getuid", return_value=os.getuid() + 1),
+            self.assertRaises(canary.CanaryError) as wrong_owner,
+        ):
+            canary._validated_explicit_workspace(config)
+        self.assertEqual("CANARY_INPUT_INVALID", wrong_owner.exception.code)
+
+        config.temp_parent.chmod(0o750)
+        with (
+            mock.patch.object(canary, "EXPLICIT_TEMP_ROOT", home_root),
+            self.assertRaises(canary.CanaryError) as unsafe_mode,
+        ):
+            canary._validated_explicit_workspace(config)
+        self.assertEqual("CANARY_INPUT_INVALID", unsafe_mode.exception.code)
+
+    def test_explicit_temp_parent_rejects_protected_path_overlap(self) -> None:
+        home_root, config = self.explicit_parent()
+        workspace = config.temp_parent / (
+            f"{canary.WORKSPACE_PREFIX}{config.run_id}"
+        )
+        cases = {
+            "source": dataclasses.replace(config, source_repo=workspace / "source"),
+            "foreign": dataclasses.replace(
+                config, dos_app_repo=workspace / "dos-app"
+            ),
+            "receipt": dataclasses.replace(
+                config, receipt_path=workspace / "receipt.json"
+            ),
+            "credential": dataclasses.replace(
+                config, credential_file=workspace / "secret.key"
+            ),
+        }
+
+        with mock.patch.object(canary, "EXPLICIT_TEMP_ROOT", home_root):
+            for label, candidate in cases.items():
+                with self.subTest(label=label), self.assertRaises(
+                    canary.CanaryError
+                ) as raised:
+                    canary._validated_explicit_workspace(candidate)
+                self.assertEqual("CANARY_INPUT_INVALID", raised.exception.code)
+
+            with self.assertRaises(canary.CanaryError) as worktree_overlap:
+                canary._validated_explicit_workspace(
+                    config, protected_paths=[workspace / "nested-worktree"]
+                )
+        self.assertEqual("CANARY_INPUT_INVALID", worktree_overlap.exception.code)
+
+    def test_explicit_temp_parent_rejects_exact_child_collision(self) -> None:
+        home_root, config = self.explicit_parent()
+        workspace = config.temp_parent / (
+            f"{canary.WORKSPACE_PREFIX}{config.run_id}"
+        )
+        workspace.mkdir()
+
+        with (
+            mock.patch.object(canary, "EXPLICIT_TEMP_ROOT", home_root),
+            self.assertRaises(canary.CanaryError) as raised,
+        ):
+            canary._validated_explicit_workspace(config)
+
+        self.assertEqual("CANARY_COLLISION", raised.exception.code)
+
+    def test_explicit_temp_cleanup_removes_only_identity_checked_child(self) -> None:
+        home_root, config = self.explicit_parent()
+        workspace = config.temp_parent / (
+            f"{canary.WORKSPACE_PREFIX}{config.run_id}"
+        )
+        marker = workspace / ".git" / "subfloor-canary-marker.json"
+        marker.parent.mkdir(parents=True)
+        marker.write_text(
+            json.dumps({"run_id": config.run_id, "candidate_sha": SHA}) + "\n"
+        )
+        sibling = config.temp_parent / "keep-sibling"
+        sibling.mkdir()
+        ledger = canary.ResourceLedger(workspace=str(workspace), candidate_sha=SHA)
+        backend = canary.HostBackend(canary.Deadline(100, 50))
+
+        with mock.patch.object(canary, "EXPLICIT_TEMP_ROOT", home_root):
+            first = backend.cleanup(config, None, ledger)
+            second = backend.cleanup(config, None, ledger)
+
+        self.assertFalse(workspace.exists())
+        self.assertTrue(config.temp_parent.is_dir())
+        self.assertTrue(sibling.is_dir())
+        self.assertIn(
+            {"action": "remove_workspace", "ok": True, "returncode": 0}, first
+        )
+        self.assertIn(
+            {"action": "remove_workspace_absent", "ok": True, "returncode": 0},
+            second,
+        )
+
+    def test_temp_parent_cli_preserves_default_and_marks_explicit_selection(
+        self,
+    ) -> None:
+        arguments = [
+            "run",
+            "--engine-ref",
+            SHA,
+            "--dos-app-repo",
+            str(self.root / "dos-app"),
+        ]
+        default_config = canary.build_config(canary.parser().parse_args(arguments))
+        explicit_config = canary.build_config(
+            canary.parser().parse_args(
+                [*arguments, "--temp-parent", str(self.root / "explicit")]
+            )
+        )
+
+        self.assertFalse(default_config.temp_parent_explicit)
+        self.assertEqual(Path(tempfile.gettempdir()).resolve(), default_config.temp_parent)
+        self.assertTrue(explicit_config.temp_parent_explicit)
+        self.assertEqual(self.root / "explicit", explicit_config.temp_parent)
+
     def test_success_records_exact_ref_routes_stages_and_cleanup(self) -> None:
         backend = FakeBackend(self.facts)
         controller, _ = self.controller(backend)

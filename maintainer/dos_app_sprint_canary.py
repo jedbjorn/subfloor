@@ -51,6 +51,7 @@ REMOTE_PREFIX = "subfloor-canary"
 ENGINE_REMOTE = "super-coder"
 MIN_GITHUB_REMAINING = 100
 MIN_FREE_BYTES = 2 * 1024 * 1024 * 1024
+EXPLICIT_TEMP_ROOT = Path("/home")
 FORK_PREPARATION_PATHS = {
     ".github/workflows/subfloor-visual-qa.yml",
     ".gitignore",
@@ -217,6 +218,7 @@ class CanaryConfig:
     receipt_path: Path
     temp_parent: Path
     run_id: str
+    temp_parent_explicit: bool = False
     profile: str = STANDARD_PROFILE
     credential_file: Path | None = None
     stage_timeout_s: float = 900.0
@@ -403,6 +405,7 @@ class Receipt:
             "finished_at": None,
             "engine_ref_requested": config.engine_ref,
             "profile": config.profile,
+            "temp_parent_explicit": config.temp_parent_explicit,
             "dos_app_repo": str(config.dos_app_repo.resolve()),
             "candidate_sha": None,
             "base_sha": None,
@@ -571,6 +574,136 @@ def _nonempty_file(path: Path) -> bool:
         return False
 
 
+def _absolute_lexical(path: Path) -> Path:
+    return Path(os.path.abspath(os.fspath(path)))
+
+
+def _strictly_beneath(path: Path, parent: Path) -> bool:
+    return path != parent and path.is_relative_to(parent)
+
+
+def _paths_overlap(first: Path, second: Path) -> bool:
+    return (
+        first == second
+        or first.is_relative_to(second)
+        or second.is_relative_to(first)
+    )
+
+
+def _validate_no_symlink_components(path: Path) -> None:
+    current = Path(path.anchor)
+    for part in path.parts[1:]:
+        current /= part
+        try:
+            metadata = current.lstat()
+        except OSError as exc:
+            raise CanaryError(
+                "CANARY_INPUT_INVALID",
+                "explicit disposable parent is absent or unreadable",
+            ) from exc
+        if stat.S_ISLNK(metadata.st_mode):
+            raise CanaryError(
+                "CANARY_INPUT_INVALID",
+                "explicit disposable parent traverses a symlink",
+            )
+
+
+def _validated_explicit_parent(config: CanaryConfig) -> Path:
+    raw_parent = config.temp_parent
+    if not raw_parent.is_absolute() or ".." in raw_parent.parts:
+        raise CanaryError(
+            "CANARY_INPUT_INVALID",
+            "explicit disposable parent must be an absolute path without traversal",
+        )
+    parent = _absolute_lexical(raw_parent)
+    _validate_no_symlink_components(parent)
+    try:
+        metadata = parent.lstat()
+        root = EXPLICIT_TEMP_ROOT.resolve(strict=True)
+        root_metadata = root.stat()
+    except OSError as exc:
+        raise CanaryError(
+            "CANARY_INPUT_INVALID",
+            "explicit disposable parent or required filesystem root is unavailable",
+        ) from exc
+    mode = stat.S_IMODE(metadata.st_mode)
+    if (
+        not stat.S_ISDIR(metadata.st_mode)
+        or metadata.st_uid != os.getuid()
+        or mode != 0o700
+        or parent.resolve(strict=True) != parent
+        or not _strictly_beneath(parent, root)
+        or metadata.st_dev != root_metadata.st_dev
+    ):
+        raise CanaryError(
+            "CANARY_INPUT_INVALID",
+            "explicit disposable parent failed path, ownership, mode, or filesystem checks",
+        )
+    return parent
+
+
+def _validated_explicit_workspace(
+    config: CanaryConfig,
+    *,
+    protected_paths: Sequence[Path] = (),
+) -> tuple[Path, Path]:
+    parent = _validated_explicit_parent(config)
+    workspace = parent / f"{WORKSPACE_PREFIX}{config.run_id}"
+    if workspace.parent != parent or not _strictly_beneath(workspace, parent):
+        raise CanaryError(
+            "CANARY_INPUT_INVALID",
+            "disposable workspace is not an exact child of its parent",
+        )
+    if workspace.exists() or workspace.is_symlink():
+        raise CanaryError("CANARY_COLLISION", "disposable workspace already exists")
+
+    configured_protected = [
+        config.source_repo,
+        config.dos_app_repo,
+        config.receipt_path,
+        config.source_repo / ".sc-state",
+        config.source_repo / ".super-coder",
+        config.dos_app_repo / ".sc-state",
+        config.dos_app_repo / ".super-coder",
+    ]
+    if config.credential_file is not None:
+        configured_protected.extend(
+            [config.credential_file, config.credential_file.parent]
+        )
+    for protected in (*configured_protected, *protected_paths):
+        candidate = _absolute_lexical(protected)
+        if _paths_overlap(workspace, candidate):
+            raise CanaryError(
+                "CANARY_INPUT_INVALID",
+                "disposable workspace overlaps a protected path",
+            )
+
+    for sibling in parent.iterdir():
+        if sibling.name.startswith(WORKSPACE_PREFIX) and _paths_overlap(
+            workspace, _absolute_lexical(sibling)
+        ):
+            raise CanaryError(
+                "CANARY_COLLISION", "disposable workspace overlaps another run"
+            )
+    return parent, workspace
+
+
+def _require_disposable_capacity(parent: Path) -> int:
+    try:
+        free_bytes = shutil.disk_usage(parent).free
+    except OSError as exc:
+        raise CanaryError(
+            "CANARY_CAPACITY_FAILED", "cannot inspect free disk"
+        ) from exc
+    if free_bytes < MIN_FREE_BYTES:
+        raise CanaryError(
+            "CANARY_CAPACITY_FAILED",
+            "insufficient disk capacity",
+            details={"free_bytes": free_bytes, "required_bytes": MIN_FREE_BYTES},
+        )
+    return free_bytes
+
+
 class HostBackend:
     """Live host/Docker/GitHub implementation."""
 
@@ -720,16 +853,20 @@ class HostBackend:
         source = config.source_repo.resolve()
         target = config.dos_app_repo.resolve()
         receipt = config.receipt_path.resolve()
-        temp_parent = config.temp_parent.resolve()
-        workspace = temp_parent / f"{WORKSPACE_PREFIX}{config.run_id}"
-        if workspace.exists():
-            raise CanaryError(
-                "CANARY_COLLISION", f"workspace already exists: {workspace}"
-            )
+        if config.temp_parent_explicit:
+            temp_parent, workspace = _validated_explicit_workspace(config)
+        else:
+            temp_parent = config.temp_parent.resolve()
+            workspace = temp_parent / f"{WORKSPACE_PREFIX}{config.run_id}"
+            if workspace.exists():
+                raise CanaryError(
+                    "CANARY_COLLISION", f"workspace already exists: {workspace}"
+                )
         if workspace == receipt or workspace in receipt.parents:
             raise CanaryError(
                 "CANARY_INPUT_INVALID", "receipt must live outside disposable state"
             )
+        free_bytes = _require_disposable_capacity(temp_parent)
         for executable in ("git", "gh", "docker", "python3"):
             if shutil.which(executable) is None:
                 raise CanaryError(
@@ -752,6 +889,22 @@ class HostBackend:
             )
         if not target.is_dir():
             raise CanaryError("CANARY_PREFLIGHT_FAILED", "dos_app_repo is missing")
+        if config.temp_parent_explicit:
+            worktrees: list[Path] = []
+            for repository_path in (source, target):
+                listing = self._git(
+                    repository_path,
+                    "worktree",
+                    "list",
+                    "--porcelain",
+                    label="protected Git worktree inventory",
+                )
+                worktrees.extend(
+                    Path(line.removeprefix("worktree "))
+                    for line in listing.stdout.splitlines()
+                    if line.startswith("worktree ")
+                )
+            _validated_explicit_workspace(config, protected_paths=worktrees)
         candidate = self._git(
             source,
             "rev-parse",
@@ -861,18 +1014,6 @@ class HostBackend:
             )
         if config.profile == DEEPSEEK_SPRINT_PROFILE:
             self._validate_credential_file(config.credential_file)
-        try:
-            free_bytes = shutil.disk_usage(temp_parent).free
-        except OSError as exc:
-            raise CanaryError(
-                "CANARY_CAPACITY_FAILED", "cannot inspect free disk"
-            ) from exc
-        if free_bytes < MIN_FREE_BYTES:
-            raise CanaryError(
-                "CANARY_CAPACITY_FAILED",
-                "insufficient disk capacity",
-                details={"free_bytes": free_bytes, "required_bytes": MIN_FREE_BYTES},
-            )
 
         base_branch = f"{REMOTE_PREFIX}/{config.run_id}/base"
         head_branch = f"{REMOTE_PREFIX}/{config.run_id}/head"
@@ -3572,24 +3713,39 @@ raise TimeoutError("controller did not close the Force-new barrier")
                 if not ok:
                     failures.append("remove_network")
         if ledger.workspace:
-            workspace = Path(ledger.workspace).resolve()
-            expected_workspace = (
-                config.temp_parent.resolve() / f"{WORKSPACE_PREFIX}{config.run_id}"
-            )
+            if config.temp_parent_explicit:
+                parent = _validated_explicit_parent(config)
+                workspace = _absolute_lexical(Path(ledger.workspace))
+                expected_workspace = parent / f"{WORKSPACE_PREFIX}{config.run_id}"
+                workspace_identity_ok = (
+                    workspace == expected_workspace
+                    and workspace.parent == parent
+                    and _strictly_beneath(workspace, parent)
+                    and not workspace.is_symlink()
+                )
+            else:
+                workspace = Path(ledger.workspace).resolve()
+                expected_workspace = (
+                    config.temp_parent.resolve()
+                    / f"{WORKSPACE_PREFIX}{config.run_id}"
+                )
+                workspace_identity_ok = workspace == expected_workspace
             marker = workspace / ".git" / "subfloor-canary-marker.json"
-            if workspace.exists():
+            if workspace.exists() or workspace.is_symlink():
                 marker_ok = False
-                try:
-                    marker_data = json.loads(marker.read_text())
-                    marker_ok = (
-                        marker_data.get("run_id") == config.run_id
-                        and isinstance(ledger.candidate_sha, str)
-                        and HEX_SHA.fullmatch(ledger.candidate_sha) is not None
-                        and marker_data.get("candidate_sha") == ledger.candidate_sha
-                    )
-                except (OSError, json.JSONDecodeError):
-                    marker_ok = False
-                if workspace != expected_workspace or not marker_ok:
+                if workspace_identity_ok:
+                    try:
+                        marker_data = json.loads(marker.read_text())
+                        marker_ok = (
+                            marker_data.get("run_id") == config.run_id
+                            and isinstance(ledger.candidate_sha, str)
+                            and HEX_SHA.fullmatch(ledger.candidate_sha) is not None
+                            and marker_data.get("candidate_sha")
+                            == ledger.candidate_sha
+                        )
+                    except (OSError, json.JSONDecodeError):
+                        marker_ok = False
+                if not workspace_identity_ok or not marker_ok:
                     failures.append("remove_workspace_unsafe")
                     record("remove_workspace", ok=False)
                 else:
@@ -3806,6 +3962,12 @@ def default_run_id() -> str:
 def build_config(args: argparse.Namespace) -> CanaryConfig:
     source = Path(args.source_repo).resolve()
     run_id = args.run_id or default_run_id()
+    temp_parent_explicit = args.temp_parent is not None
+    temp_parent = (
+        Path(args.temp_parent)
+        if temp_parent_explicit
+        else Path(tempfile.gettempdir()).resolve()
+    )
     receipt = (
         Path(args.receipt).resolve()
         if args.receipt
@@ -3818,8 +3980,9 @@ def build_config(args: argparse.Namespace) -> CanaryConfig:
         dos_app_ref=args.dos_app_ref,
         repository=args.repository,
         receipt_path=receipt,
-        temp_parent=Path(args.temp_parent).resolve(),
+        temp_parent=temp_parent,
         run_id=run_id,
+        temp_parent_explicit=temp_parent_explicit,
         profile=args.profile,
         credential_file=(
             Path(args.credential_file).absolute()
@@ -3838,7 +4001,7 @@ def _cleanup_from_receipt(path: Path) -> int:
     resources = data.get("resources") or {}
     workspace_value = resources.get("workspace")
     if workspace_value:
-        workspace = Path(str(workspace_value)).resolve()
+        workspace = _absolute_lexical(Path(str(workspace_value)))
         temp_parent = workspace.parent
     else:
         temp_parent = Path(tempfile.gettempdir()).resolve()
@@ -3858,6 +4021,7 @@ def _cleanup_from_receipt(path: Path) -> int:
         receipt_path=path.resolve(),
         temp_parent=temp_parent,
         run_id=run_id,
+        temp_parent_explicit=bool(data.get("temp_parent_explicit", False)),
         profile=str(data.get("profile") or STANDARD_PROFILE),
         stage_timeout_s=300,
         whole_timeout_s=600,
@@ -3902,7 +4066,7 @@ def parser() -> argparse.ArgumentParser:
         "--repository", help="GitHub owner/name; derived from origin when omitted"
     )
     run.add_argument("--receipt", help="durable JSON path outside disposable state")
-    run.add_argument("--temp-parent", default=tempfile.gettempdir())
+    run.add_argument("--temp-parent")
     run.add_argument("--run-id")
     run.add_argument("--profile", choices=sorted(PROFILES), default=STANDARD_PROFILE)
     run.add_argument("--credential-file")
