@@ -2748,40 +2748,19 @@ let chatRenderGeneration = 0;
 let chatPendingSend = null;
 let chatModeController = null;
 let chatReviewCleanup = null;
-let chatConfiguration = null;
 let chatConfigurationPromise = null;
-let chatHarnessDefaults = null;
-let chatHarnessDefaultsPromise = null;
-
-function chatLoadHarnessDefaults() {
-  if (chatHarnessDefaults) return Promise.resolve(chatHarnessDefaults);
-  if (chatHarnessDefaultsPromise) return chatHarnessDefaultsPromise;
-  const request = api("/flavor-defaults").then((defaults) => {
-    chatHarnessDefaults = defaults;
-    return defaults;
-  });
-  chatHarnessDefaultsPromise = request;
-  request.catch(() => {
-    if (chatHarnessDefaultsPromise === request)
-      chatHarnessDefaultsPromise = null;
-  });
-  return request;
-}
 
 function chatLoadConfiguration() {
-  if (chatConfiguration) return Promise.resolve(chatConfiguration);
   if (chatConfigurationPromise) return chatConfigurationPromise;
   const request = Promise.all([
-    chatLoadHarnessDefaults(),
+    api("/flavor-defaults"),
     api("/models"),
-  ]).then(([defaults, catalog]) => {
-    chatConfiguration = { defaults, catalog };
-    return chatConfiguration;
-  });
+  ]).then(([defaults, catalog]) => ({ defaults, catalog }));
   chatConfigurationPromise = request;
-  request.catch(() => {
+  const clear = () => {
     if (chatConfigurationPromise === request) chatConfigurationPromise = null;
-  });
+  };
+  request.then(clear, clear);
   return request;
 }
 
@@ -3953,6 +3932,7 @@ async function chatRenderNew(host, shell, defaults, catalog) {
   );
   form.onsubmit = async (event) => {
     event.preventDefault();
+    if (submit.disabled) return;
     submit.disabled = true;
     submit.textContent = "Starting…";
     const body = {

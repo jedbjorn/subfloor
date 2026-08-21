@@ -993,7 +993,7 @@ def test_history_metadata_and_all_shell_accents_poll_without_repainting_interfac
 def test_interface_arrival_defers_configuration_and_phases_history_requests():
     interface = APP[APP.index("async function renderInterface"):
                     APP.index("// ── Tabs + boot")]
-    loader = APP[APP.index("function chatLoadHarnessDefaults"):
+    loader = APP[APP.index("function chatLoadConfiguration"):
                      APP.index("function chatStopStream")]
     open_chat = interface[interface.index("const loadTranscript = async"):
                           interface.index("await loadTranscript()")]
@@ -1002,9 +1002,11 @@ def test_interface_arrival_defers_configuration_and_phases_history_requests():
     assert 'api("/flavor-defaults").catch(() => null)' in open_chat
     assert 'api("/flavor-defaults")' in loader
     assert 'api("/models")' in loader
-    assert "if (chatConfiguration) return Promise.resolve(chatConfiguration)" in loader
     assert "if (chatConfigurationPromise) return chatConfigurationPromise" in loader
     assert "chatConfigurationPromise = null" in loader
+    assert "request.then(clear, clear)" in loader
+    assert "let chatConfiguration =" not in APP
+    assert "let chatHarnessDefaults" not in APP
     assert 'chatApi("/conversations?open=true&limit=100")' in interface
     assert "starred=false&limit=20" in interface
     assert "starred=true&limit=100" in interface
