@@ -59,6 +59,7 @@ MAINTAINED_OBSERVED_VERSIONS = {
     "opencode": "1.18.9",
     "vibe": "vibe 2.22.0",
     "kimi": "0.33.0",
+    "deepseek": "0.1.0rc7",
 }
 
 
@@ -191,6 +192,8 @@ class ConversationContext:
     env: Mapping[str, str] = field(default_factory=dict)
     route_binding: Mapping[str, Any] | None = None
     binding_digest: str | None = None
+    conversation_id: str | None = None
+    boot_content: str | None = None
 
     def checked_worktree(self) -> Path:
         if self.permission_mode not in PERMISSION_MODES:
@@ -749,14 +752,21 @@ def command_version(argv: list[str]) -> str:
     return output[0].strip()
 
 
-def version_tuple(version: str) -> tuple[int, int, int]:
-    match = re.fullmatch(r"(\d+)\.(\d+)\.(\d+)", version)
+def version_tuple(version: str) -> tuple[int, int, int, int, int]:
+    match = re.fullmatch(r"(\d+)\.(\d+)\.(\d+)(?:rc(\d+))?", version)
     if not match:
         raise AdapterError(
             "HARNESS_PROTOCOL_ERROR",
             f"invalid harness version: {version}",
         )
-    return tuple(int(part) for part in match.groups())
+    major, minor, patch, release_candidate = match.groups()
+    return (
+        int(major),
+        int(minor),
+        int(patch),
+        0 if release_candidate is not None else 1,
+        int(release_candidate or 0),
+    )
 
 
 def ensure_nonempty_message(message: str) -> str:

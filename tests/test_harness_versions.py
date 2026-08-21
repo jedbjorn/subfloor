@@ -19,6 +19,7 @@ sys.path.insert(0, str(ROOT / ".super-coder" / "api"))
 
 import harness_versions  # noqa: E402
 import model_catalog  # noqa: E402
+import deepseek_runtime  # noqa: E402
 
 
 STATUS = {
@@ -128,6 +129,39 @@ def test_spec_current_harness_versions_all_report_tested() -> None:
         "vibe": ("verified", None),
         "kimi": ("verified", None),
     }
+
+
+def test_deepseek_version_comes_from_the_isolated_carrier_probe() -> None:
+    status = deepseek_runtime.RuntimeStatus(
+        available=True,
+        enabled=True,
+        error=None,
+        detail=None,
+        carrier_python="/carrier/bin/python",
+        python_version="3.12.1",
+        sdk_version="0.1.0rc7",
+        runtime_version="0.1.0rc7",
+        composition_sha256="a" * 64,
+    )
+    with mock.patch.object(
+        deepseek_runtime, "runtime_status", return_value=status
+    ) as probe:
+        result = harness_versions.compatibility_status(("deepseek",))
+
+    assert result == {
+        "deepseek": {
+            "harness": "deepseek",
+            **harness_versions.runtime_scope(),
+            "version": "0.1.0rc7",
+            "observed_version": "0.1.0rc7",
+            "compatibility": "verified",
+            "minimum_version": "0.1.0rc7",
+            "maximum_version_exclusive": "0.1.0rc8",
+            "verified_version": "0.1.0rc7",
+            "error": None,
+        }
+    }
+    probe.assert_called_once_with()
 
 
 def test_current_core_prerelease_is_best_effort_not_tested() -> None:

@@ -129,6 +129,22 @@ def write_artifact_evidence(directory: Path) -> None:
                     "uv": manifest["build"]["uv_version"],
                     "source_date_epoch": manifest["build"]["source_date_epoch"],
                 },
+                "canary": {
+                    "schema_version": 1,
+                    "contract": "deepseek-production-skill-resume-v1",
+                    "source_commit": manifest["source"]["commit"],
+                    "composition_sha256": manifest["composition"]["sha256"],
+                    "initial_catalog": ["changed", "current", "revoked"],
+                    "resumed_catalog": ["changed", "current", "new"],
+                    "changed_body_refreshed": True,
+                    "new_grant_loadable": True,
+                    "revoked_grant_absent": True,
+                    "boot_digest_preserved": True,
+                    "native_session_preserved": True,
+                    "fresh_carrier_process": True,
+                    "initial_terminal": "run.completed",
+                    "resumed_terminal": "run.completed",
+                },
                 "artifacts": records,
             }
         )
@@ -142,6 +158,8 @@ def test_runtime_manifest_pins_source_patch_recipe_and_supported_platforms() -> 
     assert manifest["carrier"] == {
         "protocol": "super-coder-deepseek-lifecycle-v1",
         "acquisition": "verified-source-build",
+        "worker_path": "scripts/deepseek_carrier_worker.py",
+        "worker_sha256": "da6b9803a2429ce926b97cff162f9aa387daa7570778c8dc53b97c7bfe685b89",
     }
     assert manifest["source"]["commit"] == "bb4ca698d63714e753f5621b07400e6ebb0b5d97"
     assert manifest["source"]["archive_sha256"] == "d5a78fb623d1c14846812e8e18042134a1127ab86dea259f79c2c8358e8481bc"
@@ -178,13 +196,26 @@ def test_composition_is_exact_and_contains_only_the_reviewed_plugin_allowlist() 
     )
 
 
+def test_composition_enables_native_skills_only_from_the_rendered_grant_root() -> None:
+    manifest = deepseek_runtime.load_runtime_manifest()
+    composition = ROOT / ".super-coder" / manifest["composition"]["path"]
+    body = composition.read_text()
+
+    assert "skills:\n      enabled: true" in body
+    assert "includeDefaultRoots: false" in body
+    assert "- !!js process.env.DSH_SKILL_ROOT" in body
+    assert "watch: false" in body
+    assert "DSH_AGENTS_HOME" not in body
+    assert "DSH_BUNDLED_SKILL_DIR" not in body
+
+
 def test_composition_digest_drift_fails_closed() -> None:
     with mock.patch.object(deepseek_runtime, "_sha256", return_value="0" * 64):
         try:
             deepseek_runtime.load_runtime_manifest()
         except deepseek_runtime.DeepSeekRuntimeError as exc:
             assert exc.code == "HARNESS_COMPOSITION_DRIFT"
-            assert "9f29580d44ff78363f32585e926f384038de1f7f51dafde473375d69e73e69de" in exc.detail
+            assert "8c1e4a0988c2a00c457ba7d2b0fbf80dc02d5b0fd29a8e8f92567f09ef70f3c1" in exc.detail
         else:
             raise AssertionError("composition drift was accepted")
 
@@ -249,7 +280,7 @@ def test_exact_isolated_pair_reports_available_and_mismatch_does_not() -> None:
             "python_version": "3.14.7",
             "sdk_version": "0.1.0rc7",
             "runtime_version": "0.1.0rc7",
-            "composition_sha256": "9f29580d44ff78363f32585e926f384038de1f7f51dafde473375d69e73e69de",
+            "composition_sha256": "8c1e4a0988c2a00c457ba7d2b0fbf80dc02d5b0fd29a8e8f92567f09ef70f3c1",
         }
         assert bad.available is False
         assert bad.error == "HARNESS_RUNTIME_VERSION_MISMATCH"
@@ -284,6 +315,26 @@ def test_built_artifact_digest_drift_fails_before_install() -> None:
             assert exc.code == "HARNESS_RUNTIME_ARTIFACT_DRIFT"
         else:
             raise AssertionError("changed built artifact was accepted")
+
+
+def test_built_artifact_without_production_skill_canary_is_rejected() -> None:
+    with tempfile.TemporaryDirectory() as raw:
+        directory = Path(raw)
+        write_artifact_evidence(directory)
+        evidence_path = directory / "deepseek-carrier-artifacts.json"
+        evidence = json.loads(evidence_path.read_text())
+        del evidence["canary"]
+        evidence_path.write_text(json.dumps(evidence))
+
+        try:
+            deepseek_runtime._load_built_artifacts(
+                directory, manifest=deepseek_runtime.load_runtime_manifest()
+            )
+        except deepseek_runtime.DeepSeekRuntimeError as exc:
+            assert exc.code == "HARNESS_RUNTIME_ARTIFACT_DRIFT"
+            assert "canary" in exc.detail
+        else:
+            raise AssertionError("artifact without production skill canary was accepted")
 
 
 def test_provider_request_patch_is_callable_exact_and_fail_closed() -> None:
@@ -750,6 +801,7 @@ def test_launch_environment_replaces_personal_state_and_redacts_credentials() ->
                 "PATH": "/usr/bin",
                 "DSH_HOME": "/home/operator/.dsh",
                 "DSH_SESSION_ROOT": "/tmp/shared",
+                "DSH_SKILL_ROOT": "/home/operator/.agents/skills",
                 "DSH_PROFILE": "mutable-personal-profile",
                 "DEEPSEEK_API_KEY": "old-secret",
             },
@@ -760,6 +812,7 @@ def test_launch_environment_replaces_personal_state_and_redacts_credentials() ->
         assert child["DSH_HOME"] == str(layout.home)
         assert child["DSH_SESSION_ROOT"] == str(layout.session_root)
         assert child["DSH_CWD"] == str(worktree)
+        assert child["DSH_SKILL_ROOT"] == str(worktree / ".agents" / "skills")
         assert child["DSH_SYSTEM_PROMPT"] == "immutable boot bytes"
         assert child["DEEPSEEK_API_KEY"] == "sk-private-credential"
         assert child["DEEPSEEK_BASE_URL"] == "https://api.deepseek.example/v1"

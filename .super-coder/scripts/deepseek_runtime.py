@@ -139,6 +139,8 @@ class ConversationLayout:
     session_root: Path
     diagnostics: Path
     process_identity: Path
+    adapter_identity: Path
+    adapter_lock: Path
 
 
 def _sha256(path: Path) -> str:
@@ -183,12 +185,18 @@ def load_runtime_manifest(path: Path = MANIFEST_PATH) -> dict[str, object]:
             raise ValueError("unexpected lifecycle carrier protocol")
         if carrier["acquisition"] != "verified-source-build":
             raise ValueError("carrier acquisition must remain verified-source-build")
+        if carrier["worker_path"] != "scripts/deepseek_carrier_worker.py":
+            raise ValueError("unexpected carrier worker path")
         if source["commit"] != "bb4ca698d63714e753f5621b07400e6ebb0b5d97":
             raise ValueError("unexpected DeepSeek source commit")
         if patch["protocol"] != carrier["protocol"]:
             raise ValueError("patch and carrier protocol identities differ")
         if runtime["platforms"] != ["macos-arm64", "linux-arm64", "linux-x64"]:
             raise ValueError("runtime platform contract drifted")
+        if build["canary_path"] != "scripts/deepseek_skill_resume_canary.py":
+            raise ValueError("unexpected production skill canary path")
+        if build["canary_contract"] != "deepseek-production-skill-resume-v1":
+            raise ValueError("unexpected production skill canary contract")
         if not isinstance(composition, dict):
             raise ValueError("composition evidence must be an object")
         if composition["path"] != "assets/deepseek/cordis.yml":
@@ -198,6 +206,22 @@ def load_runtime_manifest(path: Path = MANIFEST_PATH) -> dict[str, object]:
             (patch, "assets/deepseek/deepseek-harness-bb4ca698-lifecycle.patch", "HARNESS_RUNTIME_ARTIFACT_DRIFT"),
             (source, "assets/deepseek/LICENSE.deepseek-harness", "HARNESS_RUNTIME_ARTIFACT_DRIFT"),
             (build, "scripts/build_deepseek_carrier.py", "HARNESS_RUNTIME_ARTIFACT_DRIFT"),
+            (
+                {
+                    "path": carrier["worker_path"],
+                    "sha256": carrier["worker_sha256"],
+                },
+                "scripts/deepseek_carrier_worker.py",
+                "HARNESS_RUNTIME_ARTIFACT_DRIFT",
+            ),
+            (
+                {
+                    "path": build["canary_path"],
+                    "sha256": build["canary_sha256"],
+                },
+                "scripts/deepseek_skill_resume_canary.py",
+                "HARNESS_RUNTIME_ARTIFACT_DRIFT",
+            ),
         ):
             path_key = "license_path" if evidence is source else "path"
             digest_key = "license_sha256" if evidence is source else "sha256"
@@ -671,6 +695,24 @@ def _load_built_artifacts(
             "source_date_epoch": build["source_date_epoch"],
         }:
             raise ValueError("artifact build tool evidence drifted")
+        expected_canary = {
+            "schema_version": 1,
+            "contract": build["canary_contract"],
+            "source_commit": source["commit"],
+            "composition_sha256": manifest["composition"]["sha256"],
+            "initial_catalog": ["changed", "current", "revoked"],
+            "resumed_catalog": ["changed", "current", "new"],
+            "changed_body_refreshed": True,
+            "new_grant_loadable": True,
+            "revoked_grant_absent": True,
+            "boot_digest_preserved": True,
+            "native_session_preserved": True,
+            "fresh_carrier_process": True,
+            "initial_terminal": "run.completed",
+            "resumed_terminal": "run.completed",
+        }
+        if evidence["canary"] != expected_canary:
+            raise ValueError("artifact production skill-resume canary drifted")
         records = evidence["artifacts"]
         if not isinstance(records, list) or len(records) != 2:
             raise ValueError("artifact evidence must contain exactly two wheels")
@@ -919,6 +961,8 @@ def conversation_layout(
         session_root=root / "sessions",
         diagnostics=root / "diagnostics",
         process_identity=root / "process.json",
+        adapter_identity=root / "adapter.json",
+        adapter_lock=root / "adapter.lock",
     )
 
 
@@ -966,6 +1010,7 @@ def launch_environment(
             "DSH_SESSION_ROOT": str(layout.session_root),
             "DSH_CORDIS_CONFIG": str(ENGINE / "assets" / "deepseek" / "cordis.yml"),
             "DSH_CWD": str(worktree.resolve()),
+            "DSH_SKILL_ROOT": str(worktree.resolve() / ".agents" / "skills"),
             "DSH_SYSTEM_PROMPT": system_prompt,
             "DEEPSEEK_API_KEY": api_key,
             "PYTHONNOUSERSITE": "1",

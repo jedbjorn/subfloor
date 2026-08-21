@@ -125,6 +125,7 @@ def project(
     *,
     env: Mapping[str, str] | None = None,
     executable: Callable[[str], str | None] = shutil.which,
+    deepseek_probe: Callable[..., object] | None = None,
 ) -> dict[str, dict[str, object]]:
     """Project shipped and historical harnesses without rejecting old names."""
     env = os.environ if env is None else env
@@ -167,7 +168,26 @@ def project(
             }
             continue
 
-        installed = executable(_runtime_command(harness, manifest)) is not None
+        runtime_reason = None
+        if harness == "deepseek":
+            if deepseek_probe is None:
+                import deepseek_runtime
+
+                deepseek_probe = deepseek_runtime.runtime_status
+            probe_env = dict(env)
+            probe_env.pop("SC_DISABLED_HARNESSES", None)
+            try:
+                runtime_status = deepseek_probe(env=probe_env)
+                carrier = getattr(runtime_status, "carrier_python", None)
+                installed = bool(getattr(runtime_status, "available", False)) or (
+                    isinstance(carrier, str) and Path(carrier).is_file()
+                )
+                runtime_reason = getattr(runtime_status, "error", None)
+            except Exception as exc:
+                installed = False
+                runtime_reason = getattr(exc, "code", "HARNESS_MANIFEST_INVALID")
+        else:
+            installed = executable(_runtime_command(harness, manifest)) is not None
         enabled = harness not in disabled
         compatibility = _compatibility_state(manifest)
         healthy = (
@@ -179,7 +199,7 @@ def project(
         if not enabled:
             reason = "HARNESS_DISABLED"
         elif not installed:
-            reason = "HARNESS_UNAVAILABLE"
+            reason = runtime_reason or "HARNESS_UNAVAILABLE"
         elif compatibility != "declared":
             reason = "HARNESS_COMPATIBILITY_UNPROVEN"
         elif not any(surfaces.values()):

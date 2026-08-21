@@ -218,6 +218,8 @@ class ConversationLaunchPreparer:
                 env=plan.env,
                 route_binding=binding,
                 binding_digest=binding_digest,
+                conversation_id=broker_run.conversation_id,
+                boot_content=getattr(plan, "boot_content", None),
             ),
             int(plan.archive_id),
         )
