@@ -6,7 +6,9 @@ import io
 import importlib.util
 import json
 import os
+import shutil
 import stat
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -869,6 +871,51 @@ def test_dockerfile_delegates_container_acquisition_to_tested_optional_helper() 
         '"$(uname -m)"'
     ) in folded
     assert "RUN python -m venv /opt/super-coder/deepseek-runtime" not in folded
+
+
+def test_dockerfile_stages_a_runnable_deepseek_container_entrypoint() -> None:
+    dockerfile = (ROOT / ".super-coder" / "Dockerfile").read_text()
+    container_root = Path("/opt/super-coder/deepseek-bootstrap")
+
+    with tempfile.TemporaryDirectory() as raw:
+        staging_root = Path(raw) / "deepseek-bootstrap"
+        for line in dockerfile.splitlines():
+            fields = line.split()
+            if (
+                len(fields) != 3
+                or fields[0] != "COPY"
+                or not fields[2].startswith(f"{container_root}/")
+            ):
+                continue
+            source = ROOT / fields[1]
+            destination = staging_root / Path(fields[2]).relative_to(container_root)
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            if source.is_dir():
+                shutil.copytree(source, destination)
+            else:
+                shutil.copy2(source, destination)
+
+        target = Path(raw) / "deepseek-runtime"
+        completed = subprocess.run(
+            [
+                sys.executable,
+                str(staging_root / "scripts" / "deepseek_runtime.py"),
+                "--install-container-carrier",
+                str(target),
+                "s390x",
+                "--json",
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+        assert completed.returncode == 0, completed.stderr
+        assert completed.stderr == ""
+        payload = json.loads(completed.stdout)
+        assert payload["available"] is False
+        assert payload["error"] == "HARNESS_RUNTIME_INCOMPATIBLE"
+        assert target.with_suffix(".unavailable.json").is_file()
 
 
 def test_conversations_receive_distinct_private_roots_and_process_evidence() -> None:
