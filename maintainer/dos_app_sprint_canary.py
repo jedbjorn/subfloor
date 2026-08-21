@@ -10,7 +10,8 @@ The command is intentionally conservative:
 * every credential, capacity, dirty-state, active-Sprint, and remote collision
   check completes before a disposable install or remote ref is created;
 * the candidate is resolved to one commit and that exact commit is installed;
-* real browser conversations drive a Codex Planner/Developer and Kimi Reviewer;
+* real browser conversations drive either the standard Codex/Kimi route or an
+  explicit provider-neutral DeepSeek Sprint route;
 * stage and whole-run deadlines fail closed;
 * the durable receipt is allow-listed and recursively redacted; and
 * cleanup runs after every partial failure, is fatal when incomplete, and can be
@@ -32,6 +33,7 @@ import os
 import re
 import shutil
 import socket
+import stat
 import subprocess
 import sys
 import tempfile
@@ -59,9 +61,22 @@ FORK_PREPARATION_PATHS = {
 TERMINAL_LIFECYCLES = {"completed", "aborted"}
 FAILURE_LIFECYCLES = {"paused", "aborted"}
 PICKUP_INJECTION_PAUSE_REASON = "wake_pickup_evidence_invalid"
+STANDARD_PROFILE = "standard"
+DEEPSEEK_SPRINT_PROFILE = "deepseek-sprint"
+PROFILES = {STANDARD_PROFILE, DEEPSEEK_SPRINT_PROFILE}
+DEEPSEEK_MODEL = "ollama-cloud/deepseek-v4-pro:0813"
+PROVIDER_CREDENTIAL_ENV = {
+    "ANTHROPIC_API_KEY",
+    "DEEPSEEK_API_KEY",
+    "KIMI_API_KEY",
+    "MISTRAL_API_KEY",
+    "OLLAMA_API_KEY",
+    "OPENAI_API_KEY",
+}
 HEX_SHA = re.compile(r"^[0-9a-f]{40}$")
 RUN_ID_RE = re.compile(r"^[a-z0-9][a-z0-9-]{5,47}$")
 REPO_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
+CONVERSATION_ID_RE = re.compile(r"^cv_[0-9a-f]{32}$")
 SECRET_PATTERNS = (
     re.compile(r"(?i)(authorization\s*:\s*bearer\s+)[^\s,;]+"),
     re.compile(r"(?i)((?:api[_-]?key|token|secret|password)\s*[=:]\s*)[^\s,;]+"),
@@ -116,6 +131,8 @@ class CanaryConfig:
     receipt_path: Path
     temp_parent: Path
     run_id: str
+    profile: str = STANDARD_PROFILE
+    credential_file: Path | None = None
     stage_timeout_s: float = 900.0
     whole_timeout_s: float = 3600.0
     poll_interval_s: float = 2.0
@@ -299,6 +316,7 @@ class Receipt:
             "started_at": utc_now(),
             "finished_at": None,
             "engine_ref_requested": config.engine_ref,
+            "profile": config.profile,
             "dos_app_repo": str(config.dos_app_repo.resolve()),
             "candidate_sha": None,
             "base_sha": None,
@@ -480,6 +498,66 @@ class HostBackend:
         self.runner = CommandRunner(deadline)
         self.sleep = sleep
         self._port_sockets: list[socket.socket] = []
+        self._provider_key: str | None = None
+
+    @staticmethod
+    def _validate_credential_file(path: Path | None) -> Path:
+        if path is None:
+            raise CanaryError(
+                "CANARY_CREDENTIAL_INVALID",
+                "deepseek-sprint profile requires an authorized credential file",
+            )
+        candidate = path.resolve(strict=False)
+        try:
+            metadata = path.lstat()
+        except OSError as exc:
+            raise CanaryError(
+                "CANARY_CREDENTIAL_INVALID",
+                "authorized credential file is absent or unreadable",
+            ) from exc
+        if (
+            path.is_symlink()
+            or not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != os.getuid()
+            or stat.S_IMODE(metadata.st_mode) != 0o600
+            or not 16 <= metadata.st_size <= 4096
+            or candidate != path.absolute()
+        ):
+            raise CanaryError(
+                "CANARY_CREDENTIAL_INVALID",
+                "authorized credential file failed ownership, mode, size, or path checks",
+            )
+        return path
+
+    def _read_provider_key(self, path: Path | None) -> str:
+        source = self._validate_credential_file(path)
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+        try:
+            descriptor = os.open(source, flags)
+            with os.fdopen(descriptor, "r", encoding="utf-8") as stream:
+                value = stream.read(4097).strip()
+        except (OSError, UnicodeError) as exc:
+            raise CanaryError(
+                "CANARY_CREDENTIAL_INVALID",
+                "authorized credential could not be read safely",
+            ) from exc
+        if not 16 <= len(value) <= 4096 or any(char.isspace() for char in value):
+            raise CanaryError(
+                "CANARY_CREDENTIAL_INVALID",
+                "authorized credential has an unsafe structure",
+            )
+        return value
+
+    def _runtime_env(self, facts: Preflight) -> dict[str, str]:
+        env = {
+            name: value
+            for name, value in os.environ.items()
+            if name not in PROVIDER_CREDENTIAL_ENV
+        }
+        env["SC_NET"] = facts.network
+        if self._provider_key is not None:
+            env["OLLAMA_API_KEY"] = self._provider_key
+        return env
 
     def _run(
         self,
@@ -549,6 +627,8 @@ class HostBackend:
         self._port_sockets.clear()
 
     def preflight(self, config: CanaryConfig) -> Preflight:
+        if config.profile not in PROFILES:
+            raise CanaryError("CANARY_INPUT_INVALID", "canary profile is invalid")
         if not RUN_ID_RE.fullmatch(config.run_id):
             raise CanaryError("CANARY_INPUT_INVALID", "run_id is invalid")
         source = config.source_repo.resolve()
@@ -669,11 +749,19 @@ class HostBackend:
         )
         codex_auth = Path.home() / ".codex" / "auth.json"
         kimi_auth = Path.home() / ".kimi-code" / "credentials" / "kimi-code.json"
-        if not _nonempty_file(codex_auth) or not _nonempty_file(kimi_auth):
+        if not _nonempty_file(codex_auth) or (
+            config.profile == STANDARD_PROFILE and not _nonempty_file(kimi_auth)
+        ):
             raise CanaryError(
                 "CANARY_PREFLIGHT_FAILED",
-                "Codex and Kimi host credentials must both be present",
+                (
+                    "Codex host credentials must be present"
+                    if config.profile == DEEPSEEK_SPRINT_PROFILE
+                    else "Codex and Kimi host credentials must both be present"
+                ),
             )
+        if config.profile == DEEPSEEK_SPRINT_PROFILE:
+            self._validate_credential_file(config.credential_file)
         try:
             free_bytes = shutil.disk_usage(temp_parent).free
         except OSError as exc:
@@ -932,7 +1020,9 @@ class HostBackend:
         self, config: CanaryConfig, facts: Preflight, ledger: ResourceLedger
     ) -> dict[str, str]:
         self._release_ports()
-        env = {**os.environ, "SC_NET": facts.network}
+        if config.profile == DEEPSEEK_SPRINT_PROFILE:
+            self._provider_key = self._read_provider_key(config.credential_file)
+        env = self._runtime_env(facts)
         self._run(
             [str(facts.workspace / "sc"), "launch", "--no-build"],
             cwd=facts.workspace,
@@ -957,13 +1047,20 @@ class HostBackend:
         ).stdout
         versions: dict[str, str] = {}
         for line in status.splitlines():
-            match = re.match(r"\s*(claude|codex|kimi|opencode)\s+(.+?)\s*$", line)
+            match = re.match(
+                r"\s*(claude|codex|deepseek|kimi|opencode)\s+(.+?)\s*$", line
+            )
             if match:
                 versions[match.group(1)] = redact_text(match.group(2))[:160]
-        if "codex" not in versions or "kimi" not in versions:
+        required = (
+            {"codex", "deepseek"}
+            if config.profile == DEEPSEEK_SPRINT_PROFILE
+            else {"codex", "kimi"}
+        )
+        if not required.issubset(versions):
             raise CanaryError(
                 "CANARY_RUNTIME_PROVENANCE_MISSING",
-                "launched runtime did not report Codex and Kimi versions",
+                "launched runtime did not report every profile harness version",
             )
         return versions
 
@@ -1065,6 +1162,199 @@ class HostBackend:
                 details={"harness": harness},
             )
         return conversation
+
+    def _conversation_evidence(
+        self,
+        facts: Preflight,
+        conversation_id: str,
+    ) -> dict[str, Any]:
+        if not CONVERSATION_ID_RE.fullmatch(conversation_id):
+            raise CanaryError(
+                "CANARY_CONVERSATION_INVALID", "conversation identity is invalid"
+            )
+        query = (
+            "SELECT c.conversation_id,c.harness,c.state,c.harness_session_ref,"
+            "boot.content_sha256 boot_sha256,boot.content_bytes,"
+            "instr(boot.content,'sprint_dev')>0 has_sprint_dev,"
+            "instr(boot.content,'sprint_rev')>0 has_sprint_rev,"
+            "SUM(CASE WHEN event.event_type='tool.started' THEN 1 ELSE 0 END) "
+            "tool_started,"
+            "SUM(CASE WHEN event.event_type='tool.completed' THEN 1 ELSE 0 END) "
+            "tool_completed,"
+            "SUM(CASE WHEN event.event_type IN "
+            "('run.completed','run.failed','run.interrupted') THEN 1 ELSE 0 END) "
+            "terminal_events FROM conversations c "
+            "LEFT JOIN conversation_boot_snapshots boot "
+            "ON boot.conversation_id=c.conversation_id "
+            "LEFT JOIN conversation_events event "
+            "ON event.conversation_id=c.conversation_id "
+            f"WHERE c.conversation_id='{conversation_id}' GROUP BY c.conversation_id;"
+        )
+        rows = _json_output(
+            self._run(
+                ["docker", "exec", facts.container, "./sc", "sql", "-json", query],
+                label="read bounded conversation evidence",
+            ),
+            label="read bounded conversation evidence",
+        )
+        if len(rows) != 1 or not isinstance(rows[0], dict):
+            raise CanaryError(
+                "CANARY_CONVERSATION_INVALID",
+                "conversation evidence is missing or ambiguous",
+            )
+        row = rows[0]
+        session_ref = row.get("harness_session_ref")
+        return {
+            "conversation_id": conversation_id,
+            "harness": row.get("harness"),
+            "state": row.get("state"),
+            "session_sha256": (
+                hashlib.sha256(session_ref.encode()).hexdigest()
+                if isinstance(session_ref, str) and session_ref
+                else None
+            ),
+            "boot_sha256": row.get("boot_sha256"),
+            "boot_bytes": row.get("content_bytes"),
+            "has_sprint_dev": bool(row.get("has_sprint_dev")),
+            "has_sprint_rev": bool(row.get("has_sprint_rev")),
+            "tool_started": int(row.get("tool_started") or 0),
+            "tool_completed": int(row.get("tool_completed") or 0),
+            "terminal_events": int(row.get("terminal_events") or 0),
+        }
+
+    def _restart_exact_session(
+        self,
+        api: JsonHttp,
+        config: CanaryConfig,
+        facts: Preflight,
+        conversation_id: str,
+    ) -> dict[str, Any]:
+        before = self._conversation_evidence(facts, conversation_id)
+        if before["harness"] != "deepseek" or before["session_sha256"] is None:
+            raise CanaryError(
+                "CANARY_RESTART_RECOVERY_FAILED",
+                "DeepSeek session evidence is absent before restart",
+            )
+        self._run(
+            [str(facts.workspace / "sc"), "restart", "--no-build"],
+            cwd=facts.workspace,
+            env=self._runtime_env(facts),
+            label="restart exact DeepSeek canary runtime",
+        )
+        while True:
+            try:
+                if api.request("GET", "/api/health"):
+                    break
+            except CanaryError:
+                pass
+            self.deadline.remaining()
+            self.sleep(min(config.poll_interval_s, self.deadline.remaining()))
+        self._message(
+            api,
+            conversation_id,
+            (
+                "Resume this exact conversation after the engine restart. Use Bash once "
+                "to run `pwd`, then reply with only `exact-session-recovered`. Pass when "
+                "the tool completes and this turn becomes idle; do not change files."
+            ),
+            f"{config.run_id}:deepseek:restart-resume",
+        )
+        self._wait_idle(api, conversation_id, config)
+        after = self._conversation_evidence(facts, conversation_id)
+        if (
+            after["session_sha256"] != before["session_sha256"]
+            or after["boot_sha256"] != before["boot_sha256"]
+            or after["tool_completed"] <= before["tool_completed"]
+        ):
+            raise CanaryError(
+                "CANARY_RESTART_RECOVERY_FAILED",
+                "restart did not preserve exact session/boot identity with a completed tool",
+            )
+        return {
+            "conversation_id": conversation_id,
+            "session_sha256": after["session_sha256"],
+            "boot_sha256": after["boot_sha256"],
+            "tool_completed_before": before["tool_completed"],
+            "tool_completed_after": after["tool_completed"],
+            "exact_session_preserved": True,
+        }
+
+    def _deepseek_participant_evidence(
+        self,
+        facts: Preflight,
+        sprint_id: int,
+        board: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        evidence: dict[str, Any] = {}
+        for role, skill_key in (("developer", "has_sprint_dev"), ("reviewer", "has_sprint_rev")):
+            participant = next(
+                (
+                    row
+                    for row in board.get("participants") or []
+                    if row.get("role") == role
+                ),
+                None,
+            )
+            if (
+                not isinstance(participant, dict)
+                or participant.get("harness") != "deepseek"
+                or participant.get("model") != DEEPSEEK_MODEL
+                or participant.get("effort") != "default"
+                or not isinstance(participant.get("current_conversation_id"), str)
+            ):
+                raise CanaryError(
+                    "CANARY_PARTICIPANT_EVIDENCE_FAILED",
+                    f"{role} is not bound to the admitted DeepSeek route",
+                )
+            conversation = self._conversation_evidence(
+                facts, str(participant["current_conversation_id"])
+            )
+            if (
+                not conversation[skill_key]
+                or not isinstance(conversation["boot_sha256"], str)
+                or len(conversation["boot_sha256"]) != 64
+                or conversation["tool_completed"] < 1
+            ):
+                raise CanaryError(
+                    "CANARY_PARTICIPANT_EVIDENCE_FAILED",
+                    f"{role} lacks role skill, boot, or completed-tool evidence",
+                )
+            evidence[role] = {
+                "conversation_id": conversation["conversation_id"],
+                "route": {
+                    "harness": participant.get("harness"),
+                    "provider": "ollama-cloud",
+                    "model": participant.get("model"),
+                    "effort": participant.get("effort"),
+                },
+                "boot_sha256": conversation["boot_sha256"],
+                "boot_bytes": conversation["boot_bytes"],
+                "role_skill_loaded": True,
+                "tool_started": conversation["tool_started"],
+                "tool_completed": conversation["tool_completed"],
+            }
+        query = (
+            "SELECT COUNT(*) handoffs FROM wake_message message "
+            "JOIN sprint_participants sender "
+            "ON sender.participant_id=message.from_participant_id "
+            f"WHERE message.sprint_id={sprint_id} AND message.intent='handoff' "
+            "AND sender.role='developer';"
+        )
+        rows = _json_output(
+            self._run(
+                ["docker", "exec", facts.container, "./sc", "sql", "-json", query],
+                label="read bounded Sprint handoff evidence",
+            ),
+            label="read bounded Sprint handoff evidence",
+        )
+        handoffs = int(rows[0].get("handoffs") or 0) if len(rows) == 1 else 0
+        if handoffs != 1:
+            raise CanaryError(
+                "CANARY_PARTICIPANT_EVIDENCE_FAILED",
+                "DeepSeek Developer did not produce exactly one durable handoff",
+            )
+        evidence["developer_handoffs"] = handoffs
+        return evidence
 
     def _message(
         self,
@@ -1490,6 +1780,117 @@ raise TimeoutError("controller did not close the Force-new barrier")
                 details={"conversation_id": probe.reviewer_id},
             )
 
+    def _start_isolation_peer(
+        self,
+        api: JsonHttp,
+        config: CanaryConfig,
+        facts: Preflight,
+        conversation_id: str,
+    ) -> dict[str, Any]:
+        before = self._conversation_evidence(facts, conversation_id)
+        if before["harness"] != "deepseek" or before["session_sha256"] is None:
+            raise CanaryError(
+                "CANARY_ISOLATION_FAILED",
+                "DeepSeek peer has no exact session identity",
+            )
+        self._message(
+            api,
+            conversation_id,
+            (
+                "Run one Bash tool with exactly `python3 -c 'import time; "
+                "time.sleep(600)'`. Keep that tool call active until interrupted. "
+                "Do not run another tool, change files, or finish early. Pass when the "
+                "controller interrupts this turn."
+            ),
+            f"{config.run_id}:deepseek:isolation-peer",
+        )
+        while True:
+            evidence = self._conversation_evidence(facts, conversation_id)
+            if (
+                evidence["state"] == "running"
+                and evidence["tool_started"] > before["tool_started"]
+            ):
+                return evidence
+            if evidence["state"] in {"error", "closed"}:
+                raise CanaryError(
+                    "CANARY_ISOLATION_FAILED",
+                    "DeepSeek peer terminalized before its isolation barrier",
+                )
+            self.deadline.remaining()
+            self.sleep(min(0.1, self.deadline.remaining()))
+
+    def _assert_isolation_peer(
+        self,
+        facts: Preflight,
+        conversation_id: str,
+        baseline: Mapping[str, Any],
+        *,
+        boundary: str,
+    ) -> dict[str, Any]:
+        observed = self._conversation_evidence(facts, conversation_id)
+        if (
+            observed["state"] != "running"
+            or observed["session_sha256"] != baseline["session_sha256"]
+            or observed["boot_sha256"] != baseline["boot_sha256"]
+            or observed["terminal_events"] != baseline["terminal_events"]
+        ):
+            raise CanaryError(
+                "CANARY_ISOLATION_FAILED",
+                f"DeepSeek peer changed across {boundary}",
+            )
+        return observed
+
+    def _stop_isolation_peer(
+        self,
+        api: JsonHttp,
+        config: CanaryConfig,
+        facts: Preflight,
+        conversation_id: str,
+        baseline: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        interrupted = api.request(
+            "POST",
+            f"/api/conversations/{conversation_id}/interruptions",
+            body={},
+            key=f"{config.run_id}:deepseek:isolation-peer-stop",
+        )
+        if not isinstance(interrupted.get("run_id"), int):
+            raise CanaryError(
+                "CANARY_ISOLATION_FAILED",
+                "DeepSeek peer stop returned no run identity",
+            )
+        while True:
+            observed = self._conversation_evidence(facts, conversation_id)
+            if observed["state"] == "idle":
+                break
+            if observed["state"] in {"error", "closed"}:
+                raise CanaryError(
+                    "CANARY_ISOLATION_FAILED",
+                    "DeepSeek peer did not return to idle after scoped stop",
+                )
+            self.deadline.remaining()
+            self.sleep(min(0.1, self.deadline.remaining()))
+        if (
+            observed["session_sha256"] != baseline["session_sha256"]
+            or observed["boot_sha256"] != baseline["boot_sha256"]
+            or observed["terminal_events"] != baseline["terminal_events"] + 1
+        ):
+            raise CanaryError(
+                "CANARY_ISOLATION_FAILED",
+                "DeepSeek peer stop changed identity or terminalized more than one run",
+            )
+        return {
+            "conversation_id": conversation_id,
+            "session_sha256": observed["session_sha256"],
+            "boot_sha256": observed["boot_sha256"],
+            "concurrent_running": True,
+            "reviewer_close_scoped": True,
+            "reviewer_pickup_interrupt_scoped": True,
+            "peer_stop_scoped": True,
+            "terminal_events_before": baseline["terminal_events"],
+            "terminal_events_after": observed["terminal_events"],
+        }
+
     def _exercise_review_delivery_gates(
         self,
         api: JsonHttp,
@@ -1499,6 +1900,7 @@ raise TimeoutError("controller did not close the Force-new barrier")
         sprint_id: int,
         probe: ForceNewProbe,
         stage: Callable[[str], None],
+        require_deepseek_isolation: bool = False,
     ) -> tuple[dict[str, Any], list[str]]:
         observed_columns: list[str] = []
         stage("force_new_pre_delivery")
@@ -1574,7 +1976,40 @@ raise TimeoutError("controller did not close the Force-new barrier")
                 details={"message_id": message_id},
             )
 
+        isolation_peer_id: str | None = None
+        isolation_baseline: dict[str, Any] | None = None
+        if require_deepseek_isolation:
+            stage("deepseek_ab_isolation")
+            developer = next(
+                (
+                    row
+                    for row in board.get("participants") or []
+                    if row.get("role") == "developer"
+                ),
+                None,
+            )
+            if (
+                not isinstance(developer, dict)
+                or developer.get("harness") != "deepseek"
+                or not isinstance(developer.get("current_conversation_id"), str)
+            ):
+                raise CanaryError(
+                    "CANARY_ISOLATION_FAILED",
+                    "DeepSeek Developer participant conversation is missing",
+                )
+            isolation_peer_id = str(developer["current_conversation_id"])
+            isolation_baseline = self._start_isolation_peer(
+                api, config, facts, isolation_peer_id
+            )
+
         self._close_force_new_barrier(api, probe)
+        if isolation_peer_id is not None and isolation_baseline is not None:
+            self._assert_isolation_peer(
+                facts,
+                isolation_peer_id,
+                isolation_baseline,
+                boundary="Reviewer barrier close",
+            )
 
         stage("force_new_delivery")
         delivery_id: str | None = None
@@ -1650,6 +2085,13 @@ raise TimeoutError("controller did not close the Force-new barrier")
                     body={},
                     key=f"{config.run_id}:reviewer:pickup-interrupt",
                 )
+                if isolation_peer_id is not None and isolation_baseline is not None:
+                    self._assert_isolation_peer(
+                        facts,
+                        isolation_peer_id,
+                        isolation_baseline,
+                        boundary="Reviewer pickup interruption",
+                    )
                 break
             if state in {"idle", "error", "closed"}:
                 raise CanaryError(
@@ -1819,9 +2261,19 @@ raise TimeoutError("controller did not close the Force-new barrier")
                 "fresh_chat": delivery_id != probe.reviewer_id,
             }
         )
+        isolation = None
+        if isolation_peer_id is not None and isolation_baseline is not None:
+            isolation = self._stop_isolation_peer(
+                api,
+                config,
+                facts,
+                isolation_peer_id,
+                isolation_baseline,
+            )
         return (
             {
                 "force_new": force_new,
+                "deepseek_ab_isolation": isolation,
                 "pickup_recovery": {
                     "induced": True,
                     "interrupted_run_id": run_id,
@@ -1862,6 +2314,7 @@ raise TimeoutError("controller did not close the Force-new barrier")
         spec_title = f"Canary contract {config.run_id}"
         deterministic_path = f"canary/{config.run_id}.txt"
         deterministic_content = f"subfloor sprint canary {facts.candidate_sha}"
+        deepseek_profile = config.profile == DEEPSEEK_SPRINT_PROFILE
 
         stage("planner_prepare")
         planner = self._create_conversation(
@@ -1884,7 +2337,8 @@ raise TimeoutError("controller did not close the Force-new barrier")
                 f"Create one in_progress roadmap feature titled exactly {feature_title!r}, "
                 f"one unfrozen spec titled exactly {spec_title!r}, and one pending task. "
                 "The spec must require DEV1 to create exactly one deterministic file and a "
-                "real GitHub PR against the named ephemeral base, with REV1 reviewing via Kimi. "
+                "real GitHub PR against the named ephemeral base, with REV1 reviewing through "
+                f"{'DeepSeek Harness' if deepseek_profile else 'Kimi'}. "
                 "Do not declare or arm a Sprint yet. Use only sc mem public commands, confirm "
                 "every durable write, and stop after the feature, spec, and task exist."
             ),
@@ -1911,11 +2365,12 @@ raise TimeoutError("controller did not close the Force-new barrier")
         document_id = int(documents[0]["document_id"])
         task_id = int(tasks[0]["task_id"])
 
-        stage("kimi_qaqc")
+        stage("deepseek_qaqc" if deepseek_profile else "kimi_qaqc")
+        reviewer_harness = "deepseek" if deepseek_profile else "kimi"
         reviewer = self._create_conversation(
             api,
             shell_id=shells["REV1"],
-            harness="kimi",
+            harness=reviewer_harness,
             key=f"{config.run_id}:reviewer:create",
         )
         reviewer_id = str(reviewer["conversation_id"])
@@ -1939,6 +2394,23 @@ raise TimeoutError("controller did not close the Force-new barrier")
         self._wait_idle(api, reviewer_id, config)
         approval_id = self._approval(facts, document_id)
 
+        restart_recovery = None
+        if deepseek_profile:
+            if (
+                reviewer_route["model"] != DEEPSEEK_MODEL
+                or reviewer_route["provider"] != "ollama-cloud"
+                or reviewer_route["effort"] != "default"
+            ):
+                raise CanaryError(
+                    "CANARY_ROUTE_NOT_CANONICAL",
+                    "DeepSeek Reviewer did not bind the admitted Ollama route",
+                    details={"route": reviewer_route},
+                )
+            stage("deepseek_exact_session_restart")
+            restart_recovery = self._restart_exact_session(
+                api, config, facts, reviewer_id
+            )
+
         stage("force_new_barrier")
         force_new_probe = self._start_force_new_barrier(
             api,
@@ -1947,6 +2419,8 @@ raise TimeoutError("controller did not close the Force-new barrier")
         )
 
         stage("declare_and_arm")
+        developer_harness = "deepseek" if deepseek_profile else "codex"
+        developer_route = reviewer_route if deepseek_profile else planner_route
         participants = [
             {
                 "shell_id": shells["PLN1"],
@@ -1958,14 +2432,14 @@ raise TimeoutError("controller did not close the Force-new barrier")
             {
                 "shell_id": shells["DEV1"],
                 "role": "developer",
-                "harness": "codex",
-                "model": planner_route["model"],
-                "effort": planner_route["effort"],
+                "harness": developer_harness,
+                "model": developer_route["model"],
+                "effort": developer_route["effort"],
             },
             {
                 "shell_id": shells["REV1"],
                 "role": "reviewer",
-                "harness": "kimi",
+                "harness": reviewer_harness,
                 "model": reviewer_route["model"],
                 "effort": reviewer_route["effort"],
             },
@@ -1982,7 +2456,7 @@ raise TimeoutError("controller did not close the Force-new barrier")
                 f"{facts.head_branch!r}, created from origin/{facts.base_branch}; "
                 f"open the PR in {facts.repository!r} against base "
                 f"{facts.base_branch!r}; never target main. The lane must register the PR, "
-                "reach green, request real Force-new Kimi review, authorize and merge only "
+                f"reach green, request real Force-new {reviewer_harness} review, authorize and merge only "
                 "through Sprint gates, and report the merge to you. After dispatch, handle "
                 "your own informational Sprint inbox items and stop. Participants JSON: "
                 + json.dumps(participants, separators=(",", ":"))
@@ -2018,6 +2492,7 @@ raise TimeoutError("controller did not close the Force-new barrier")
             facts,
             sprint_id=sprint_id,
             probe=force_new_probe,
+            require_deepseek_isolation=deepseek_profile,
             stage=stage,
         )
 
@@ -2194,6 +2669,11 @@ raise TimeoutError("controller did not close the Force-new barrier")
             raise CanaryError(
                 "CANARY_REENTRY_FAILED", "Planner Re-enter first run did not complete"
             )
+        participant_evidence = (
+            self._deepseek_participant_evidence(facts, sprint_id, final_board)
+            if deepseek_profile
+            else None
+        )
         events = api.request("GET", f"/api/sprints/{sprint_id}/events?limit=100")
         return {
             "sprint": {
@@ -2208,6 +2688,8 @@ raise TimeoutError("controller did not close the Force-new barrier")
                 "evidence": self._bounded_board(final_board),
                 "events": sanitize(events.get("items") or []),
                 **gate_evidence,
+                "exact_session_restart": restart_recovery,
+                "participant_evidence": participant_evidence,
             },
             "routes": {
                 "planner_initial": planner_route,
@@ -2394,6 +2876,7 @@ raise TimeoutError("controller did not close the Force-new barrier")
                         record("remove_workspace")
             else:
                 record("remove_workspace_absent")
+        self._provider_key = None
         if failures:
             raise CanaryError(
                 "CANARY_CLEANUP_FAILED",
@@ -2543,7 +3026,9 @@ class CanaryController:
         if final_failure is None:
             self.receipt.data["status"] = "passed"
             self.receipt.data["next_action"] = (
-                "Candidate receipt is green; task #353 may update the real dos-app install."
+                "Candidate DeepSeek Sprint receipt is green; bind it to exact-head review."
+                if self.config.profile == DEEPSEEK_SPRINT_PROFILE
+                else "Candidate receipt is green; task #353 may update the real dos-app install."
             )
             self.receipt.data["failure"] = None
         else:
@@ -2609,6 +3094,12 @@ def build_config(args: argparse.Namespace) -> CanaryConfig:
         receipt_path=receipt,
         temp_parent=Path(args.temp_parent).resolve(),
         run_id=run_id,
+        profile=args.profile,
+        credential_file=(
+            Path(args.credential_file).absolute()
+            if args.credential_file is not None
+            else None
+        ),
         stage_timeout_s=args.stage_timeout,
         whole_timeout_s=args.whole_timeout,
         poll_interval_s=args.poll_interval,
@@ -2641,6 +3132,7 @@ def _cleanup_from_receipt(path: Path) -> int:
         receipt_path=path.resolve(),
         temp_parent=temp_parent,
         run_id=run_id,
+        profile=str(data.get("profile") or STANDARD_PROFILE),
         stage_timeout_s=300,
         whole_timeout_s=600,
     )
@@ -2686,6 +3178,8 @@ def parser() -> argparse.ArgumentParser:
     run.add_argument("--receipt", help="durable JSON path outside disposable state")
     run.add_argument("--temp-parent", default=tempfile.gettempdir())
     run.add_argument("--run-id")
+    run.add_argument("--profile", choices=sorted(PROFILES), default=STANDARD_PROFILE)
+    run.add_argument("--credential-file")
     run.add_argument("--stage-timeout", type=float, default=900.0)
     run.add_argument("--whole-timeout", type=float, default=3600.0)
     run.add_argument("--poll-interval", type=float, default=2.0)

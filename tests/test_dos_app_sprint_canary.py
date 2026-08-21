@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+import dataclasses
 import json
 import os
 import shutil
@@ -1267,6 +1268,108 @@ class DosAppSprintCanaryTest(unittest.TestCase):
             backend.cleanup(self.config, self.facts, ledger)
 
         self.assertIn("inspect_pr_identity", raised.exception.details["failed_actions"])
+
+    def test_deepseek_credential_is_scoped_without_mutating_or_persisting_source(
+        self,
+    ) -> None:
+        credential = self.root / "authorized-provider.key"
+        credential.write_text("provider-canary-secret-value\n")
+        credential.chmod(0o600)
+        before = credential.read_bytes()
+        backend = canary.HostBackend(canary.Deadline(100, 50))
+
+        backend._provider_key = backend._read_provider_key(credential)
+        env = backend._runtime_env(self.facts)
+        config = dataclasses.replace(
+            self.config,
+            profile=canary.DEEPSEEK_SPRINT_PROFILE,
+            credential_file=credential,
+        )
+        receipt = canary.Receipt(self.receipt_path, config).data
+
+        self.assertEqual(before, credential.read_bytes())
+        self.assertEqual(0o600, credential.stat().st_mode & 0o777)
+        self.assertEqual("provider-canary-secret-value", env["OLLAMA_API_KEY"])
+        self.assertTrue(canary.PROVIDER_CREDENTIAL_ENV.isdisjoint(
+            set(env) - {"OLLAMA_API_KEY"}
+        ))
+        encoded = json.dumps(receipt, sort_keys=True)
+        self.assertNotIn(str(credential), encoded)
+        self.assertNotIn("provider-canary-secret-value", encoded)
+        self.assertNotIn("OLLAMA_API_KEY", encoded)
+        self.assertTrue(credential.is_file())
+
+    def test_deepseek_credential_rejects_unsafe_mode_without_mutation(self) -> None:
+        credential = self.root / "unsafe-provider.key"
+        credential.write_text("provider-canary-secret-value\n")
+        credential.chmod(0o640)
+        before = credential.read_bytes()
+        backend = canary.HostBackend(canary.Deadline(100, 50))
+
+        with self.assertRaisesRegex(canary.CanaryError, "failed ownership, mode"):
+            backend._read_provider_key(credential)
+
+        self.assertEqual(before, credential.read_bytes())
+        self.assertEqual(0o640, credential.stat().st_mode & 0o777)
+        self.assertTrue(credential.is_file())
+
+    def test_deepseek_participant_evidence_requires_skills_tools_and_handoff(
+        self,
+    ) -> None:
+        backend = canary.HostBackend(canary.Deadline(100, 50))
+        board = {
+            "participants": [
+                {
+                    "role": "developer",
+                    "harness": "deepseek",
+                    "model": canary.DEEPSEEK_MODEL,
+                    "effort": "default",
+                    "current_conversation_id": "cv_" + "1" * 32,
+                },
+                {
+                    "role": "reviewer",
+                    "harness": "deepseek",
+                    "model": canary.DEEPSEEK_MODEL,
+                    "effort": "default",
+                    "current_conversation_id": "cv_" + "2" * 32,
+                },
+            ]
+        }
+
+        def conversation(_facts, conversation_id):
+            developer = conversation_id.endswith("1" * 32)
+            return {
+                "conversation_id": conversation_id,
+                "boot_sha256": "b" * 64,
+                "boot_bytes": 2048,
+                "has_sprint_dev": developer,
+                "has_sprint_rev": not developer,
+                "tool_started": 3,
+                "tool_completed": 3,
+            }
+
+        backend._conversation_evidence = mock.Mock(side_effect=conversation)
+        backend._run = mock.Mock(
+            return_value=canary.CommandResult('[{"handoffs":1}]', "", 0)
+        )
+
+        evidence = backend._deepseek_participant_evidence(self.facts, 9, board)
+
+        self.assertEqual(1, evidence["developer_handoffs"])
+        self.assertTrue(evidence["developer"]["role_skill_loaded"])
+        self.assertTrue(evidence["reviewer"]["role_skill_loaded"])
+        self.assertEqual(3, evidence["developer"]["tool_completed"])
+        self.assertEqual(
+            canary.DEEPSEEK_MODEL, evidence["reviewer"]["route"]["model"]
+        )
+
+        missing_tools = conversation(self.facts, "cv_" + "1" * 32)
+        missing_tools["tool_completed"] = 0
+        backend._conversation_evidence = mock.Mock(
+            side_effect=[missing_tools, conversation(self.facts, "cv_" + "2" * 32)]
+        )
+        with self.assertRaisesRegex(canary.CanaryError, "completed-tool evidence"):
+            backend._deepseek_participant_evidence(self.facts, 9, board)
 
     def test_maintainer_command_is_not_distributed_or_added_as_sc_verb(self) -> None:
         root = Path(__file__).resolve().parents[1]
