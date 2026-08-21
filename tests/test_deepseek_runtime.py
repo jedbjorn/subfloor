@@ -865,6 +865,11 @@ def test_launch_environment_replaces_personal_state_and_redacts_credentials() ->
                 "DSH_SKILL_ROOT": "/home/operator/.agents/skills",
                 "DSH_PROFILE": "mutable-personal-profile",
                 "DEEPSEEK_API_KEY": "old-secret",
+                "ANTHROPIC_API_KEY": "ambient-anthropic-secret",
+                "KIMI_API_KEY": "ambient-kimi-secret",
+                "MISTRAL_API_KEY": "ambient-mistral-secret",
+                "OLLAMA_API_KEY": "ambient-ollama-secret",
+                "OPENAI_API_KEY": "ambient-openai-secret",
             },
         )
         redacted = deepseek_runtime.redacted_environment(child)
@@ -881,6 +886,26 @@ def test_launch_environment_replaces_personal_state_and_redacts_credentials() ->
         assert "DSH_PROFILE" not in child
         assert "/home/operator/.dsh" not in child.values()
         assert "old-secret" not in child.values()
+        assert {
+            name
+            for name in child
+            if name in {
+                "ANTHROPIC_API_KEY",
+                "DEEPSEEK_API_KEY",
+                "KIMI_API_KEY",
+                "MISTRAL_API_KEY",
+                "OLLAMA_API_KEY",
+                "OPENAI_API_KEY",
+            }
+        } == {"DEEPSEEK_API_KEY"}
+        for leaked in (
+            "ambient-anthropic-secret",
+            "ambient-kimi-secret",
+            "ambient-mistral-secret",
+            "ambient-ollama-secret",
+            "ambient-openai-secret",
+        ):
+            assert leaked not in child.values()
         assert redacted["DEEPSEEK_API_KEY"] == "[REDACTED]"
         assert "sk-private-credential" not in json.dumps(redacted)
 
@@ -900,9 +925,13 @@ def test_ollama_launch_projects_only_its_fixed_provider_credential() -> None:
             api_key="ollama-private-credential",
             base_env={
                 "PATH": "/usr/bin",
+                "ANTHROPIC_API_KEY": "ambient-anthropic-secret",
                 "DEEPSEEK_API_KEY": "ambient-deepseek-secret",
                 "DEEPSEEK_BASE_URL": "https://attacker.example/v1",
+                "KIMI_API_KEY": "ambient-kimi-secret",
+                "MISTRAL_API_KEY": "ambient-mistral-secret",
                 "OLLAMA_API_KEY": "old-ollama-secret",
+                "OPENAI_API_KEY": "ambient-openai-secret",
                 "SC_DEEPSEEK_PROVIDER": "deepseek-official",
             },
         )
@@ -915,8 +944,27 @@ def test_ollama_launch_projects_only_its_fixed_provider_credential() -> None:
         assert "DEEPSEEK_API_KEY" not in child
         assert "DEEPSEEK_BASE_URL" not in child
         assert "SC_DEEPSEEK_PROVIDER" not in child
-        assert "ambient-deepseek-secret" not in child.values()
-        assert "old-ollama-secret" not in child.values()
+        assert {
+            name
+            for name in child
+            if name in {
+                "ANTHROPIC_API_KEY",
+                "DEEPSEEK_API_KEY",
+                "KIMI_API_KEY",
+                "MISTRAL_API_KEY",
+                "OLLAMA_API_KEY",
+                "OPENAI_API_KEY",
+            }
+        } == {"OLLAMA_API_KEY"}
+        for leaked in (
+            "ambient-anthropic-secret",
+            "ambient-deepseek-secret",
+            "ambient-kimi-secret",
+            "ambient-mistral-secret",
+            "ambient-openai-secret",
+            "old-ollama-secret",
+        ):
+            assert leaked not in child.values()
 
 
 def test_disable_is_non_destructive_and_short_circuits_runtime_probe() -> None:

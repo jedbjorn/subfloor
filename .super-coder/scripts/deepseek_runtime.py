@@ -35,6 +35,14 @@ PROVIDER_WIRE_PROBE_TIMEOUT = 30
 INSTALL_TIMEOUT = 3600
 MAX_DIAGNOSTIC_CHARS = 4096
 SENSITIVE_ENV = re.compile(r"(?:KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL)", re.I)
+PROVIDER_CREDENTIAL_ENV = frozenset({
+    "ANTHROPIC_API_KEY",
+    "DEEPSEEK_API_KEY",
+    "KIMI_API_KEY",
+    "MISTRAL_API_KEY",
+    "OLLAMA_API_KEY",
+    "OPENAI_API_KEY",
+})
 SECRET_TEXT = (
     re.compile(r"(?i)((?:DEEPSEEK|OLLAMA)_API_KEY\s*[=:]\s*)[^\s,;]+"),
     re.compile(r"(?i)(Authorization\s*:\s*Bearer\s+)[^\s,;]+"),
@@ -1198,7 +1206,7 @@ def launch_environment(
     )
     providers = registry["providers"]
     assert isinstance(providers, dict)
-    provider_variables = {
+    provider_variables = PROVIDER_CREDENTIAL_ENV | {
         str(entry[field])
         for entry in providers.values()
         if isinstance(entry, dict)

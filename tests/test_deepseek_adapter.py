@@ -62,7 +62,7 @@ def deepseek_binding(
     provider_model = (
         "deepseek-v4-pro"
         if provider_route == "deepseek-official"
-        else "deepseek-v4-pro:0813"
+        else "deepseek-v4-pro:0813-cloud"
     )
     selector = (
         provider_model
@@ -325,7 +325,15 @@ def test_start_binds_exact_route_boot_and_isolated_process_identity(tmp_path: Pa
     adapter = make_adapter(tmp_path / "state", factory)
     current = context(
         worktree,
-        env={"DSH_HOME": "/attacker/home", "CURRENT_GRANT": "filesystem"},
+        env={
+            "DSH_HOME": "/attacker/home",
+            "CURRENT_GRANT": "filesystem",
+            "ANTHROPIC_API_KEY": "ambient-anthropic-secret",
+            "KIMI_API_KEY": "ambient-kimi-secret",
+            "MISTRAL_API_KEY": "ambient-mistral-secret",
+            "OLLAMA_API_KEY": "ambient-ollama-secret",
+            "OPENAI_API_KEY": "ambient-openai-secret",
+        },
     )
 
     turn = adapter.start(current, "Do the work")
@@ -347,6 +355,26 @@ def test_start_binds_exact_route_boot_and_isolated_process_identity(tmp_path: Pa
     assert transport.env["DSH_CWD"] == str(worktree)
     assert transport.env["DSH_HOME"] == str(layout.home)
     assert transport.env["CURRENT_GRANT"] == "filesystem"
+    assert {
+        name
+        for name in transport.env
+        if name in {
+            "ANTHROPIC_API_KEY",
+            "DEEPSEEK_API_KEY",
+            "KIMI_API_KEY",
+            "MISTRAL_API_KEY",
+            "OLLAMA_API_KEY",
+            "OPENAI_API_KEY",
+        }
+    } == {"DEEPSEEK_API_KEY"}
+    for leaked in (
+        "ambient-anthropic-secret",
+        "ambient-kimi-secret",
+        "ambient-mistral-secret",
+        "ambient-ollama-secret",
+        "ambient-openai-secret",
+    ):
+        assert leaked not in transport.env.values()
     assert json.loads(transport.env["SC_DEEPSEEK_PROVIDER_OPTIONS"]) == {
         "thinking": "omit",
         "reasoningEffort": "omit",
@@ -380,18 +408,43 @@ def test_ollama_start_uses_raw_provider_model_and_only_ollama_credential(tmp_pat
         context(
             worktree,
             provider="ollama-cloud",
-            env={"DEEPSEEK_API_KEY": "ambient-deepseek-secret"},
+            env={
+                "ANTHROPIC_API_KEY": "ambient-anthropic-secret",
+                "DEEPSEEK_API_KEY": "ambient-deepseek-secret",
+                "KIMI_API_KEY": "ambient-kimi-secret",
+                "MISTRAL_API_KEY": "ambient-mistral-secret",
+                "OPENAI_API_KEY": "ambient-openai-secret",
+            },
         ),
         "Do the work",
     )
     transport = factory.instances[0]
 
     assert transport.env["SC_DEEPSEEK_PROVIDER"] == "ollama-cloud"
-    assert transport.env["SC_DEEPSEEK_MODEL"] == "deepseek-v4-pro:0813"
+    assert transport.env["SC_DEEPSEEK_MODEL"] == "deepseek-v4-pro:0813-cloud"
     assert transport.env["OLLAMA_API_KEY"] == "ollama-test-secret-value"
     assert "DEEPSEEK_API_KEY" not in transport.env
     assert "DEEPSEEK_BASE_URL" not in transport.env
-    assert "ambient-deepseek-secret" not in transport.env.values()
+    assert {
+        name
+        for name in transport.env
+        if name in {
+            "ANTHROPIC_API_KEY",
+            "DEEPSEEK_API_KEY",
+            "KIMI_API_KEY",
+            "MISTRAL_API_KEY",
+            "OLLAMA_API_KEY",
+            "OPENAI_API_KEY",
+        }
+    } == {"OLLAMA_API_KEY"}
+    for leaked in (
+        "ambient-anthropic-secret",
+        "ambient-deepseek-secret",
+        "ambient-kimi-secret",
+        "ambient-mistral-secret",
+        "ambient-openai-secret",
+    ):
+        assert leaked not in transport.env.values()
 
 
 @pytest.mark.parametrize(

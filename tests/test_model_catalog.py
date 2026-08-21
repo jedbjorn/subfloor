@@ -560,7 +560,7 @@ class BuildTest(NoCLI):
             if url == mc.MODELS_DEV_URL:
                 return MODELS_DEV
             if url == "https://ollama.com/v1/models":
-                return {"data": [{"id": "deepseek-v4-pro:0813"}]}
+                return {"data": [{"id": "deepseek-v4-pro:0813-cloud"}]}
             raise AssertionError(url)
 
         got = mc.build(
@@ -571,9 +571,9 @@ class BuildTest(NoCLI):
         )
 
         route = got["harnesses"]["deepseek"]["models"][0]
-        self.assertEqual(route["id"], "ollama-cloud/deepseek-v4-pro:0813")
+        self.assertEqual(route["id"], "ollama-cloud/deepseek-v4-pro:0813-cloud")
         self.assertEqual(route["provider"], "ollama-cloud")
-        self.assertEqual(route["provider_model"], "deepseek-v4-pro:0813")
+        self.assertEqual(route["provider_model"], "deepseek-v4-pro:0813-cloud")
         self.assertEqual(route["supported_efforts"], [])
         self.assertIsNone(route["default_effort"])
         self.assertEqual(route["adapter_metadata"]["credential_kind"], "ollama-api-key")
@@ -598,7 +598,7 @@ class BuildTest(NoCLI):
             if url == "https://api.deepseek.com/models":
                 raise OSError("deepseek unavailable")
             if url == "https://ollama.com/v1/models":
-                return {"data": [{"id": "deepseek-v4-pro:0813"}]}
+                return {"data": [{"id": "deepseek-v4-pro:0813-cloud"}]}
             raise AssertionError(url)
 
         got = mc.build(
@@ -613,7 +613,7 @@ class BuildTest(NoCLI):
 
         self.assertEqual(
             ids(got["harnesses"]["deepseek"]),
-            ["ollama-cloud/deepseek-v4-pro:0813"],
+            ["ollama-cloud/deepseek-v4-pro:0813-cloud"],
         )
         self.assertIn(mc.OLLAMA_CLOUD_SOURCE, got["sources"])
         self.assertNotIn(mc.DEEPSEEK_SOURCE, got["sources"])
@@ -708,7 +708,7 @@ class BuildTest(NoCLI):
 
     def test_ollama_max_catalogue_proves_only_configured_exact_selectors(self):
         proof_calls = []
-        configured = "deepseek-v4-pro:0813"
+        configured = "deepseek-v4-pro:0813-cloud"
         rows = [{"id": configured}] + [
             {"id": f"other-model-{index}"} for index in range(63)
         ]
@@ -738,7 +738,7 @@ class BuildTest(NoCLI):
         )
 
     def test_authenticated_provider_rejects_entire_malformed_generation_before_probe(self):
-        configured = "deepseek-v4-pro:0813"
+        configured = "deepseek-v4-pro:0813-cloud"
         invalid_rows = (
             [{"id": configured}, {"id": configured}],
             [{"id": configured}, {"id": ""}],
@@ -769,8 +769,8 @@ class BuildTest(NoCLI):
                 return MODELS_DEV
             return {
                 "data": [
-                    {"id": "deepseek-v4-pro:0813"},
-                    {"id": "deepseek-v4-pro:0813"},
+                    {"id": "deepseek-v4-pro:0813-cloud"},
+                    {"id": "deepseek-v4-pro:0813-cloud"},
                 ]
             }
 
