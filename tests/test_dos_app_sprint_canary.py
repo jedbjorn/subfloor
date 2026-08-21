@@ -2294,6 +2294,27 @@ class DosAppSprintCanaryTest(unittest.TestCase):
         self.assertNotIn("dos-app-sprint-canary)", dispatcher)
         self.assertTrue((root / "maintainer" / "dos_app_sprint_canary.py").is_file())
 
+    def test_planner_declaration_prompt_ends_the_mem_only_turn(self) -> None:
+        source = Path(canary.__file__).read_text()
+
+        self.assertIn(
+            "For this preparation turn, use only "
+            '"\n                "sc mem public commands',
+            source,
+        )
+        self.assertIn(
+            '"The preparation-turn restriction has ended. Load `sprint_prep`, then "',
+            source,
+        )
+        self.assertIn(
+            '"execute the declaration and planning writes now; do not merely propose "',
+            source,
+        )
+        self.assertIn(
+            '"one Sprint for this feature is prepared with exactly one planned unit. "',
+            source,
+        )
+
 
 class DeepSeekExactRestartHelperTest(unittest.TestCase):
     def test_prepare_uses_installed_state_and_exact_controlled_route(self) -> None:

@@ -4340,8 +4340,9 @@ raise TimeoutError("controller did not close the Force-new barrier")
                 "The spec must require DEV1 to create exactly one deterministic file and a "
                 "real GitHub PR against the named ephemeral base, with REV1 reviewing through "
                 f"{'DeepSeek Harness' if deepseek_profile else 'Kimi'}. "
-                "Do not declare or arm a Sprint yet. Use only sc mem public commands, confirm "
-                "every durable write, and stop after the feature, spec, and task exist."
+                "Do not declare or arm a Sprint yet. For this preparation turn, use only "
+                "sc mem public commands, confirm every durable write, and stop after the "
+                "feature, spec, and task exist."
             ),
             f"{config.run_id}:planner:prepare",
         )
@@ -4396,6 +4397,9 @@ raise TimeoutError("controller did not close the Force-new barrier")
             api,
             planner_id,
             (
+                "The preparation-turn restriction has ended. Load `sprint_prep`, then "
+                "execute the declaration and planning writes now; do not merely propose "
+                "commands or wait for approval. "
                 f"Declare one merge-granted prepared Sprint for feature #{feature_id} "
                 f"using spec document #{document_id} directly, with no QA/QC approval id, "
                 "and the participant JSON below. Plan exactly one code unit assigning "
@@ -4404,7 +4408,8 @@ raise TimeoutError("controller did not close the Force-new barrier")
                 f"a newline; use head branch {facts.head_branch!r}, created from "
                 f"origin/{facts.base_branch}; open the PR in {facts.repository!r} against "
                 f"base {facts.base_branch!r}; never target main. Do not arm or dispatch the "
-                "Sprint. Confirm every durable write and stop with the Sprint prepared. "
+                "Sprint. Pass only when each command confirms its durable write and exactly "
+                "one Sprint for this feature is prepared with exactly one planned unit. "
                 "Participants JSON: "
                 + json.dumps(participants, separators=(",", ":"))
             ),
