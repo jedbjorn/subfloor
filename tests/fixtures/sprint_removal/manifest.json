@@ -316,6 +316,7 @@
     "tests/test_conversation_schema.py",
     "tests/test_conversation_ui.py",
     "tests/test_deepseek_adapter.py",
+    "tests/test_docker_build_context.py",
     "tests/test_flavor_skill_packs.py",
     "tests/test_harness_epoch.py",
     "tests/test_live_model.py",
