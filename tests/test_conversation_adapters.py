@@ -2232,6 +2232,40 @@ class ConversationAdapterTest(unittest.TestCase):
             process.pid,
         )
 
+    def test_codex_initialize_timeout_cleans_up_process_group(self) -> None:
+        process = mock.Mock()
+        process.pid = 4321
+        process.stdin = io.StringIO()
+        process.stdout = io.StringIO()
+        process.stderr = io.StringIO()
+        process.poll.return_value = None
+        timeout = AdapterError(
+            "HARNESS_TIMEOUT",
+            "Codex request timed out: initialize",
+            retryable=True,
+        )
+        with (
+            mock.patch(
+                "conversation_adapters.codex.subprocess.Popen",
+                return_value=process,
+            ),
+            mock.patch.object(
+                JsonLineRpcProcess,
+                "request",
+                side_effect=timeout,
+            ),
+            mock.patch(
+                "conversation_adapters.codex.cleanup_owned_process"
+            ) as cleanup,
+        ):
+            with self.assertRaisesRegex(
+                AdapterError,
+                "Codex request timed out: initialize",
+            ):
+                JsonLineRpcProcess(cwd=self.root, env={})
+
+        cleanup.assert_called_once_with(process, 5.0)
+
     def test_shared_runner_reaps_group_after_leader_exit(self) -> None:
         process = mock.Mock()
         process.pid = 4321
