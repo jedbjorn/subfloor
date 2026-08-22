@@ -757,8 +757,8 @@ class FlavorDefaultsTest(unittest.TestCase):
         self.assertNotIn("deepseek", got["harnesses"])
         self.assertEqual(got["harness_status"]["deepseek"]["surfaces"], {
             "terminal": False,
-            "one_shot": False,
-            "browser": False,
+            "one_shot": True,
+            "browser": True,
             "sprint": False,
         })
 

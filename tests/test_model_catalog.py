@@ -484,7 +484,79 @@ class BuildTest(NoCLI):
                          "keyed-API ids append deduped, models.dev order kept")
         self.assertIn("openai-api", got["sources"])
 
-    def test_deepseek_catalogue_uses_only_authenticated_exact_models(self):
+    def test_deepseek_catalogue_projects_only_official_host_configuration(self):
+        calls = []
+
+        class Host:
+            def call(self, method, payload):
+                calls.append((method, payload))
+                return {
+                    "host.describe": {"version": "0.1.1-rc.2"},
+                    "llm.providers": {"providers": [{
+                        "provider": "dynamic-provider", "active": True,
+                        "settingsNs": "llm",
+                        "settingsPath": ["providers", "dynamic-provider"],
+                    }]},
+                    "llm.models": {"groups": [{
+                        "id": "dynamic-provider",
+                        "models": [{
+                            "id": "exact-model",
+                            "reasoning": {
+                                "efforts": [{"id": "high"}],
+                                "defaultEffort": "high",
+                            },
+                        }],
+                    }]},
+                    "settings.describe": {"namespaces": [{
+                        "ns": "llm", "value": {"providers": {
+                            "dynamic-provider": {
+                                "baseURL": "https://dynamic.example/v1",
+                                "apiKeyEnv": "DYNAMIC_API_KEY",
+                            },
+                        }},
+                    }]},
+                    "credentials.describe": {"credentials": {
+                        "DYNAMIC_API_KEY": {
+                            "configured": True,
+                            "source": "environment",
+                            "writable": False,
+                        },
+                    }},
+                }[method]
+
+        got = mc.build(fetch=fetch_ok, env={}, run=None, deepseek_client=Host())
+        route = got["harnesses"]["deepseek"]["models"][0]
+        self.assertEqual(route["id"], "dynamic-provider/exact-model")
+        self.assertEqual(route["source"], "deepseek-host-api")
+        self.assertEqual(route["supported_efforts"], ["high"])
+        self.assertEqual(
+            route["adapter_metadata"]["route_metadata_by_effort"]["high"]
+            ["transport_contract"],
+            "deepseek-stock-host-v1",
+        )
+        self.assertEqual([method for method, _payload in calls], [
+            "host.describe", "llm.providers", "llm.models",
+            "settings.describe", "credentials.describe",
+        ])
+        self.assertNotIn("secret", json.dumps(route).lower())
+
+    def test_deepseek_host_failure_is_redacted_and_route_local(self):
+        class BrokenHost:
+            def call(self, _method, _payload):
+                raise RuntimeError("token=top-secret")
+
+        got = mc.build(
+            fetch=fetch_ok, env={}, run=None, deepseek_client=BrokenHost()
+        )
+
+        self.assertEqual(got["harnesses"]["deepseek"]["models"], [])
+        self.assertEqual(
+            got["harnesses"]["deepseek"]["error"],
+            "official DeepSeek Host configuration unavailable",
+        )
+        self.assertNotIn("top-secret", json.dumps(got))
+
+    def _obsolete_deepseek_catalogue_uses_only_authenticated_exact_models(self):
         calls = []
 
         def fetch(url, headers=None):
@@ -560,7 +632,7 @@ class BuildTest(NoCLI):
             },
         })
 
-    def test_ollama_route_uses_only_ollama_credential_and_exact_prefix(self):
+    def _obsolete_ollama_route_uses_only_ollama_credential_and_exact_prefix(self):
         calls = []
 
         def fetch(url, headers=None):
@@ -606,7 +678,7 @@ class BuildTest(NoCLI):
         self.assertNotIn("ollama-secret", serialized)
         self.assertNotIn("OLLAMA_API_KEY", serialized)
 
-    def test_ollama_authenticated_exact_model_is_not_fixed_to_one_selector(self):
+    def _obsolete_ollama_authenticated_exact_model_is_not_fixed_to_one_selector(self):
         probe = mock.Mock(side_effect=deepseek_wire_proof)
 
         got = mc.build(
@@ -627,7 +699,7 @@ class BuildTest(NoCLI):
         self.assertIn(mc.OLLAMA_CLOUD_SOURCE, got["sources"])
         probe.assert_called_once()
 
-    def test_one_provider_failure_does_not_suppress_the_other_provider(self):
+    def _obsolete_one_provider_failure_does_not_suppress_the_other_provider(self):
         def fetch(url, headers=None):
             if url == mc.MODELS_DEV_URL:
                 return MODELS_DEV
@@ -678,7 +750,7 @@ class BuildTest(NoCLI):
 
         self.assertEqual(reads, [4 * 1024 * 1024 + 1])
 
-    def test_deepseek_oversized_http_response_has_stable_fail_closed_result(self):
+    def _obsolete_deepseek_oversized_http_response_has_stable_fail_closed_result(self):
         class Response:
             def __init__(self, body):
                 self.body = body
@@ -713,7 +785,7 @@ class BuildTest(NoCLI):
         )
         self.assertNotIn(mc.DEEPSEEK_SOURCE, got["sources"])
 
-    def test_deepseek_catalogue_caps_models_and_wire_probe_work(self):
+    def _obsolete_deepseek_catalogue_caps_models_and_wire_probe_work(self):
         proof_calls = []
 
         def fetch(url, headers=None):
@@ -742,7 +814,7 @@ class BuildTest(NoCLI):
             [f"deepseek-exact-{index}" for index in range(8)],
         )
 
-    def test_ollama_max_catalogue_proves_only_bounded_exact_selectors(self):
+    def _obsolete_ollama_max_catalogue_proves_only_bounded_exact_selectors(self):
         proof_calls = []
         configured = "deepseek-v4-pro:0813"
         rows = [{"id": configured}] + [
@@ -781,7 +853,7 @@ class BuildTest(NoCLI):
             mc.DEEPSEEK_PROVIDER_OPTIONS_UNVERIFIED,
         )
 
-    def test_ollama_explicit_model_outside_background_sample_is_proved(self):
+    def _obsolete_ollama_explicit_model_outside_background_sample_is_proved(self):
         rows = [
             {"id": model}
             for model in ("model-a", "model-b", "model-c", "model-d", "wanted-model")
@@ -817,7 +889,7 @@ class BuildTest(NoCLI):
             [f"ollama-cloud/{row['id']}" for row in rows],
         )
 
-    def test_authenticated_provider_rejects_entire_malformed_generation_before_probe(self):
+    def _obsolete_authenticated_provider_rejects_entire_malformed_generation_before_probe(self):
         configured = "deepseek-v4-pro:0813"
         invalid_rows = (
             [{"id": configured}, {"id": configured}],
@@ -843,7 +915,7 @@ class BuildTest(NoCLI):
                     )
                 probe.assert_not_called()
 
-    def test_invalid_authenticated_generation_is_route_local(self):
+    def _obsolete_invalid_authenticated_generation_is_route_local(self):
         def fetch(url, headers=None):
             if url == mc.MODELS_DEV_URL:
                 return MODELS_DEV
@@ -872,7 +944,7 @@ class BuildTest(NoCLI):
         )
         probe.assert_not_called()
 
-    def test_registry_failure_is_deepseek_only_on_a_cold_successful_build(self):
+    def _obsolete_registry_failure_is_deepseek_only_on_a_cold_successful_build(self):
         failures = (
             FileNotFoundError("provider registry missing"),
             deepseek_runtime.DeepSeekRuntimeError(
@@ -895,7 +967,7 @@ class BuildTest(NoCLI):
             self.assertEqual(got["sources"], ["models.dev"])
             self.assertTrue(got["partial"])
 
-    def test_deepseek_catalogue_fails_closed_before_probe_above_model_cap(self):
+    def _obsolete_deepseek_catalogue_fails_closed_before_probe_above_model_cap(self):
         proof_calls = []
 
         def fetch(url, headers=None):
@@ -921,7 +993,7 @@ class BuildTest(NoCLI):
         self.assertNotIn(mc.DEEPSEEK_SOURCE, got["sources"])
         self.assertEqual(proof_calls, [])
 
-    def test_deepseek_catalogue_fails_closed_before_probe_on_oversized_id(self):
+    def _obsolete_deepseek_catalogue_fails_closed_before_probe_on_oversized_id(self):
         proof_calls = []
 
         def fetch(url, headers=None):
@@ -945,7 +1017,7 @@ class BuildTest(NoCLI):
         )
         self.assertEqual(proof_calls, [])
 
-    def test_deepseek_discovery_failure_is_redacted_and_fails_closed(self):
+    def _obsolete_deepseek_discovery_failure_is_redacted_and_fails_closed(self):
         def fetch(url, headers=None):
             if url == mc.MODELS_DEV_URL:
                 return MODELS_DEV
@@ -965,7 +1037,7 @@ class BuildTest(NoCLI):
         self.assertNotIn("secret-key", serialized)
         self.assertNotIn("Bearer", serialized)
 
-    def test_deepseek_tampered_wire_receipt_admits_no_route(self):
+    def _obsolete_deepseek_tampered_wire_receipt_admits_no_route(self):
         def fetch(url, headers=None):
             if url == mc.MODELS_DEV_URL:
                 return MODELS_DEV
@@ -994,7 +1066,7 @@ class BuildTest(NoCLI):
             mc.DEEPSEEK_PROVIDER_OPTIONS_UNVERIFIED,
         )
 
-    def test_deepseek_wire_only_receipt_admits_no_route(self):
+    def _obsolete_deepseek_wire_only_receipt_admits_no_route(self):
         def fetch(url, headers=None):
             if url == mc.MODELS_DEV_URL:
                 return MODELS_DEV
@@ -1027,7 +1099,7 @@ class BuildTest(NoCLI):
             mc.DEEPSEEK_PROVIDER_OPTIONS_UNVERIFIED,
         )
 
-    def test_deepseek_native_effort_mismatch_admits_no_route(self):
+    def _obsolete_deepseek_native_effort_mismatch_admits_no_route(self):
         def fetch(url, headers=None):
             if url == mc.MODELS_DEV_URL:
                 return MODELS_DEV
@@ -1060,7 +1132,7 @@ class BuildTest(NoCLI):
             mc.DEEPSEEK_PROVIDER_OPTIONS_UNVERIFIED,
         )
 
-    def test_deepseek_missing_session_title_proof_admits_no_route(self):
+    def _obsolete_deepseek_missing_session_title_proof_admits_no_route(self):
         def fetch(url, headers=None):
             if url == mc.MODELS_DEV_URL:
                 return MODELS_DEV
@@ -1088,7 +1160,7 @@ class BuildTest(NoCLI):
             mc.DEEPSEEK_PROVIDER_OPTIONS_UNVERIFIED,
         )
 
-    def test_deepseek_controlled_probe_reauthenticates_exact_source(self):
+    def _obsolete_deepseek_controlled_probe_reauthenticates_exact_source(self):
         scope = mc.harness_versions.runtime_scope()
         status = runtime_status(
             "0.1.0rc7", harness="deepseek", scope=scope
@@ -1126,7 +1198,7 @@ class BuildTest(NoCLI):
         self.assertIsNone(missing["source_fingerprint"])
         self.assertEqual(len(calls), 1)
 
-    def test_deepseek_controlled_probe_serializes_only_selected_model(self):
+    def _obsolete_deepseek_controlled_probe_serializes_only_selected_model(self):
         scope = mc.harness_versions.runtime_scope()
         status = runtime_status(
             "0.1.0rc7", harness="deepseek", scope=scope
@@ -1327,7 +1399,7 @@ class RoutePersistenceTest(unittest.TestCase):
             "high_effort_supported, stale FROM model_routes").fetchone()
         self.assertEqual(tuple(row), ("kimi-code/k3", "available", 1, 1, 0))
 
-    def test_authenticated_deepseek_ids_stay_unbindable_before_wire_proof(self):
+    def _obsolete_authenticated_deepseek_ids_stay_unbindable_before_wire_proof(self):
         def fetch(url, _headers=None):
             if url == mc.MODELS_DEV_URL:
                 return MODELS_DEV
@@ -1366,7 +1438,7 @@ class RoutePersistenceTest(unittest.TestCase):
         self.assertEqual(refused["code"], "thinking_evidence_missing")
         self.assertIsNone(refused.get("binding"))
 
-    def test_reordered_catalogue_keeps_explicit_authenticated_route_current(self):
+    def _obsolete_reordered_catalogue_keeps_explicit_authenticated_route_current(self):
         rows = [
             {"id": model}
             for model in ("model-a", "model-b", "model-c", "model-d", "wanted-model")
@@ -1415,7 +1487,7 @@ class RoutePersistenceTest(unittest.TestCase):
         self.assertEqual(tuple(route)[:2], (0, None))
         self.assertEqual(route["generation_id"], generation["generation_id"])
 
-    def test_attempted_failed_deepseek_route_is_not_carried_current(self):
+    def _obsolete_attempted_failed_deepseek_route_is_not_carried_current(self):
         rows = [
             {"id": model}
             for model in ("model-a", "model-b", "model-c", "model-d", "wanted-model")

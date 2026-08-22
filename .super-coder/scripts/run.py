@@ -190,7 +190,7 @@ def validate_headless_request(adapter: dict, model: "str | None",
                               effort: "str | None") -> None:
     hcfg = adapter.get("headless") or {}
     harness = adapter.get("harness", "?")
-    if not hcfg.get("launch"):
+    if not hcfg.get("launch") and not hcfg.get("engine_script"):
         raise ValueError(f"harness '{harness}' has no headless adapter")
     if model and not hcfg.get("model_flag"):
         raise ValueError(
@@ -212,13 +212,13 @@ def headless_command(
     positional. None when the harness declares no headless block (e.g. vibe,
     which takes no model from the launch seam — see the spec's non-goals)."""
     hcfg = adapter.get("headless")
-    if not hcfg or not hcfg.get("launch"):
-        if (
-            conversation_owned
-            and (adapter.get("surfaces") or {}).get("browser") is True
-            and (adapter.get("conversation") or {}).get("driver")
-        ):
-            return []
+    if (
+        conversation_owned
+        and (adapter.get("surfaces") or {}).get("browser") is True
+        and (adapter.get("conversation") or {}).get("driver")
+    ):
+        return []
+    if not hcfg or not (hcfg.get("launch") or hcfg.get("engine_script")):
         return None
     if transport is not None:
         if transport.harness != adapter.get("harness"):
@@ -226,7 +226,20 @@ def headless_command(
         model = transport.model
         effort = transport.effort
     validate_headless_request(adapter, model, None if transport else effort)
-    cmd = list(hcfg["launch"])
+    engine_script = hcfg.get("engine_script")
+    if engine_script:
+        if (
+            not isinstance(engine_script, str)
+            or Path(engine_script).name != engine_script
+            or not engine_script.endswith(".py")
+        ):
+            raise ValueError("headless engine_script must be one Python basename")
+        script_path = ENGINE / "scripts" / engine_script
+        if not script_path.is_file():
+            raise ValueError(f"headless engine script is missing: {engine_script}")
+        cmd = [sys.executable, str(script_path)]
+    else:
+        cmd = list(hcfg["launch"])
     managed_mcp = managed_mcp_injection(adapter)
     if managed_mcp:
         cmd += list(managed_mcp.get("launch_args") or [])

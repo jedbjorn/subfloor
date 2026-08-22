@@ -597,7 +597,7 @@ class ConversationApiCase(unittest.TestCase):
 
 
 class ConversationResourceTest(ConversationApiCase):
-    def test_deepseek_new_chat_stays_unavailable_without_writing(self) -> None:
+    def test_deepseek_new_chat_requires_exact_official_host_route(self) -> None:
         status, _, error = self.request(
             "POST",
             "/api/conversations",
@@ -607,9 +607,13 @@ class ConversationResourceTest(ConversationApiCase):
 
         self.assertEqual(status, 422, error)
         self.assertEqual(error["error"], {
-            "code": "HARNESS_CONVERSATION_UNSUPPORTED",
-            "message": "harness 'deepseek' has no browser conversation adapter",
-            "details": {},
+            "code": "thinking_evidence_missing",
+            "message": "DeepSeek requires an exact route from official Host configuration",
+            "details": {
+                "harness": "deepseek",
+                "model": None,
+                "remediation": "sc models refresh",
+            },
         })
         with closing(self.connect()) as con:
             count = con.execute(

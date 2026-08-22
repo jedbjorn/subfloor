@@ -43,8 +43,7 @@ CONTROLLED_EVIDENCE = {
     "claude": {"claude-portable-manifest"},
     "codex": {"codex-model-cache"},
     "deepseek": {
-        "deepseek-authenticated-models",
-        "deepseek-provider-authenticated-models-v2",
+        "deepseek-host-config-v1",
     },
     "kimi": {"kimi-alias-config"},
     "opencode": {"opencode-connected-variant"},
@@ -54,16 +53,13 @@ SUPPORTED_HARNESSES = frozenset((*CONTROLLED_EVIDENCE, "vibe"))
 TRANSPORTS = {
     "claude": "claude-effort-argument",
     "codex": "codex-reasoning-config",
-    "deepseek": "deepseek-provider-options-v1",
+    "deepseek": "deepseek-stock-host-v1",
     "kimi": "kimi-effort-environment",
     "opencode": "opencode-route-agent",
 }
 
-DEEPSEEK_PROVIDER_ROUTE = "deepseek-official"
-DEEPSEEK_PROVIDER_ROUTES = frozenset({DEEPSEEK_PROVIDER_ROUTE, "ollama-cloud"})
 DEEPSEEK_TRANSPORT_CONTRACT = TRANSPORTS["deepseek"]
-DEEPSEEK_OVERRIDE_FIELDS = ("thinking", "reasoning_effort")
-DEEPSEEK_EFFORTS = frozenset({"default", "low", "high", "max"})
+DEEPSEEK_CREDENTIAL_REF = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,255}$")
 
 # Reserved canonical effort: bind the exact model with no effort transport and
 # let the harness or alias's own default govern thinking.  Admitted for every
@@ -280,36 +276,21 @@ def _binding_error(reason: str) -> RouteResolutionError:
 
 
 def _validate_deepseek_metadata(binding: dict) -> None:
-    """Pin the evidence-selected provider request expectation in the binding."""
+    """Pin one exact route projected by the stock loopback Host API."""
     metadata = binding["adapter_metadata"]
     if set(metadata) != {
-        "provider_route", "provider_adapter_id", "provider_adapter_digest",
-        "provider_registry_sha256", "credential_kind", "endpoint_identity",
-        "discovery_evidence_digest", "transport_contract", "provider_options",
-        "wire_evidence_digest", "runtime_version", "source_commit",
-        "patch_sha256", "composition_sha256",
+        "provider_route", "endpoint_identity", "credential_ref",
+        "credential_status", "configuration_digest", "transport_contract",
+        "reasoning_effort", "runtime_version", "source_commit",
     }:
-        raise _binding_error("DeepSeek metadata must contain the fixed provider evidence")
+        raise _binding_error("DeepSeek metadata must contain the fixed Host evidence")
     provider = metadata["provider_route"]
-    if provider not in DEEPSEEK_PROVIDER_ROUTES:
-        raise _binding_error("DeepSeek provider route is not reviewed")
+    if not _exact_nonblank(provider):
+        raise _binding_error("DeepSeek provider route is missing")
     if metadata["transport_contract"] != DEEPSEEK_TRANSPORT_CONTRACT:
         raise _binding_error("DeepSeek transport contract is not canonical")
-    expected_credential = {
-        "deepseek-official": "deepseek-api-key",
-        "ollama-cloud": "ollama-api-key",
-    }[provider]
-    if metadata["credential_kind"] != expected_credential:
-        raise _binding_error("DeepSeek credential kind does not match its provider")
-    for field in (
-        "provider_adapter_digest", "provider_registry_sha256",
-        "discovery_evidence_digest", "wire_evidence_digest", "patch_sha256",
-        "composition_sha256",
-    ):
-        if not _lower_hex(metadata[field], LOWER_HEX_64):
-            raise _binding_error(f"DeepSeek {field} must be a SHA-256 digest")
-    if not _exact_nonblank(metadata["provider_adapter_id"]):
-        raise _binding_error("DeepSeek provider adapter identity is missing")
+    if not _lower_hex(metadata["configuration_digest"], LOWER_HEX_64):
+        raise _binding_error("DeepSeek configuration digest must be a SHA-256 digest")
     if not _exact_nonblank(metadata["runtime_version"]):
         raise _binding_error("DeepSeek runtime version is missing")
     if (
@@ -318,55 +299,53 @@ def _validate_deepseek_metadata(binding: dict) -> None:
     ):
         raise _binding_error("DeepSeek source commit is invalid")
     endpoint = metadata["endpoint_identity"]
-    parsed_endpoint = urlsplit(endpoint) if _exact_nonblank(endpoint) else None
-    if (
-        parsed_endpoint is None
-        or parsed_endpoint.scheme not in {"https", "http"}
-        or parsed_endpoint.hostname is None
-        or parsed_endpoint.username is not None
-        or parsed_endpoint.password is not None
-        or parsed_endpoint.query
-        or parsed_endpoint.fragment
-    ):
-        raise _binding_error("DeepSeek endpoint identity must be credential-free HTTP(S)")
+    if endpoint == f"dsh-provider:{provider}":
+        pass
+    else:
+        parsed_endpoint = urlsplit(endpoint) if _exact_nonblank(endpoint) else None
+        if (
+            parsed_endpoint is None
+            or parsed_endpoint.scheme not in {"https", "http"}
+            or parsed_endpoint.hostname is None
+            or parsed_endpoint.username is not None
+            or parsed_endpoint.password is not None
+            or parsed_endpoint.query
+            or parsed_endpoint.fragment
+        ):
+            raise _binding_error(
+                "DeepSeek endpoint identity must be credential-free HTTP(S)"
+            )
     requested_model = binding["requested_model"]
     provider_model = binding["provider_model"]
-    expected_selector = (
-        provider_model
-        if provider == DEEPSEEK_PROVIDER_ROUTE
-        else f"{provider}/{provider_model}"
-    )
-    if requested_model != expected_selector:
+    if requested_model != f"{provider}/{provider_model}":
         raise _binding_error("DeepSeek selector does not match its provider/model route")
-    options = metadata["provider_options"]
-    if not isinstance(options, dict) or set(options) != {"omit", "set"}:
-        raise _binding_error("DeepSeek provider options must contain omit and set")
-    omitted = options["omit"]
-    selected = options["set"]
-    if not isinstance(omitted, list) or not isinstance(selected, dict):
-        raise _binding_error("DeepSeek provider option values have invalid types")
-
-    effort = binding["requested_effort"]
-    if effort not in DEEPSEEK_EFFORTS:
-        raise _binding_error("DeepSeek effort is outside the carrier contract")
-    if effort == DEFAULT_EFFORT:
-        if omitted != list(DEEPSEEK_OVERRIDE_FIELDS) or selected != {}:
-            raise _binding_error(
-                "DeepSeek model default must omit every reasoning override"
+    credential_ref = metadata["credential_ref"]
+    credential_status = metadata["credential_status"]
+    if credential_ref is None:
+        if credential_status is not None:
+            raise _binding_error("DeepSeek uncredentialed route carries credential status")
+    else:
+        if (
+            not isinstance(credential_ref, str)
+            or DEEPSEEK_CREDENTIAL_REF.fullmatch(credential_ref) is None
+        ):
+            raise _binding_error("DeepSeek credential reference is invalid")
+        if (
+            not isinstance(credential_status, dict)
+            or not set(credential_status).issubset({"configured", "source", "writable"})
+            or set(credential_status) < {"configured", "writable"}
+            or credential_status.get("configured") is not True
+            or not isinstance(credential_status.get("writable"), bool)
+            or (
+                "source" in credential_status
+                and not isinstance(credential_status["source"], str)
             )
-        return
-    if provider == DEEPSEEK_PROVIDER_ROUTE:
-        if omitted != [] or set(selected) != set(DEEPSEEK_OVERRIDE_FIELDS):
-            raise _binding_error("DeepSeek-official named effort must set the exact override pair")
-        if selected["thinking"] != {"type": "enabled"}:
-            raise _binding_error("DeepSeek-official named effort must enable thinking")
-    elif omitted != ["thinking"] or set(selected) != {"reasoning_effort"}:
-        raise _binding_error("Ollama named effort must set only reasoning_effort")
-    wire_effort = selected["reasoning_effort"]
-    if wire_effort != effort:
-        raise _binding_error(
-            "DeepSeek wire effort must equal the immutable requested effort"
-        )
+        ):
+            raise _binding_error("DeepSeek credential status is not value-free and configured")
+    effort = binding["requested_effort"]
+    expected_effort = None if effort == DEFAULT_EFFORT else effort
+    if metadata["reasoning_effort"] != expected_effort:
+        raise _binding_error("DeepSeek Host effort must equal the immutable request")
 
 
 def validate_v2_binding(binding: dict) -> None:
@@ -693,7 +672,7 @@ def _uncontrolled_binding(harness: str, model: str | None, effort: str | None) -
     if harness == "deepseek":
         raise RouteResolutionError(
             "thinking_evidence_missing",
-            "DeepSeek requires an authenticated exact model route",
+            "DeepSeek requires an exact route from official Host configuration",
             {"harness": harness, "model": model,
              "remediation": "sc models refresh"},
         )

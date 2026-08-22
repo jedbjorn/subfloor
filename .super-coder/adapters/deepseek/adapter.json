@@ -3,8 +3,8 @@
   "runtime": { "command": "dsh" },
   "surfaces": {
     "terminal": false,
-    "one_shot": false,
-    "browser": false,
+    "one_shot": true,
+    "browser": true,
     "sprint": false
   },
   "official_runtime": {
@@ -36,6 +36,11 @@
   "emit": [],
   "skill_dirs": [".agents/skills"],
   "env": {},
+  "headless": {
+    "engine_script": "deepseek_one_shot.py",
+    "model_flag": "--selector",
+    "effort": { "flag": "--effort" }
+  },
   "mcp": {
     "streamable_http": {
       "supported": false,
@@ -43,25 +48,22 @@
     }
   },
   "conversation": {
-    "selected": false,
-    "legacy": true,
-    "unavailable_reason": "HARNESS_OFFICIAL_HOST_ADAPTER_PENDING",
     "contract_version": 1,
-    "minimum_cli_version": "0.1.0rc7",
-    "maximum_cli_version_exclusive": "0.1.0rc8",
-    "verified_cli_version": "0.1.0rc7",
-    "driver": "deepseek-isolated-sdk-carrier",
-    "session_ref": { "source": "session/start", "field": "sessionId" },
-    "start": { "method": "session/start" },
-    "resume": { "method": "session/start", "session_field": "sessionId" },
-    "stream": { "transport": "isolated-jsonl-rpc-notifications" },
-    "interrupt": { "method": "session/cancel" },
-    "inspect": { "method": "session/inspect" },
-    "reconcile": { "method": "session/reconcile" },
-    "permission_policy": "fixed-unattended-composition",
+    "minimum_cli_version": "0.1.1-rc.2",
+    "maximum_cli_version_exclusive": "0.1.1-rc.3",
+    "verified_cli_version": "0.1.1-rc.2",
+    "driver": "deepseek-stock-host-api",
+    "session_ref": { "source": "session.create", "field": "sessionId" },
+    "start": { "method": "session.create" },
+    "resume": { "method": "session.create", "session_field": "sessionId" },
+    "stream": { "transport": "websocket", "path": "/api/events.mux" },
+    "interrupt": { "method": "session.cancel" },
+    "inspect": { "method": "session.history" },
+    "reconcile": { "method": "session.history" },
+    "permission_policy": "official-agent-preset",
     "execution_permissions": {
       "requirement": "worktree-command-access",
-      "unrestricted_mechanism": "fixed-local-bash-and-filesystem",
+      "unrestricted_mechanism": "official-agent-preset",
       "sandbox_flag_required": false
     },
     "normalized_events": [

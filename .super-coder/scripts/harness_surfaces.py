@@ -68,8 +68,10 @@ def _proven_surfaces(
     one_shot = (
         declared["one_shot"]
         and isinstance(headless, dict)
-        and isinstance(headless.get("launch"), list)
-        and bool(headless["launch"])
+        and (
+            (isinstance(headless.get("launch"), list) and bool(headless["launch"]))
+            or isinstance(headless.get("engine_script"), str)
+        )
     )
     browser = declared["browser"] and _browser_contract_proven(harness)
     return {
