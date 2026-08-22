@@ -23,6 +23,11 @@ from conversation_adapters.deepseek import DeepSeekAdapter  # noqa: E402
 def configuration(*, credential: Mapping[str, Any] | None = None) -> dict:
     return {
         "host.describe": {"version": "0.1.1-rc.2"},
+        "agentPreset.list": {
+            "presets": [{"id": "standard", "trust": "system", "isDefault": True}],
+            "authorable": True,
+            "hasDocument": False,
+        },
         "llm.providers": {"providers": [{
             "provider": "acme-dynamic", "active": True,
             "settingsNs": "llm", "settingsPath": ["providers", "acme-dynamic"],
@@ -69,6 +74,8 @@ class FakeHost:
         self.config = copy.deepcopy(config or configuration())
         self.frames = list(frames)
         self.history = list(history or [])
+        self.existing_session = history is not None
+        self.permission_default = "workspace-write"
         self.calls: list[tuple[str, dict]] = []
         self.streams: list[FakeStream] = []
 
@@ -79,8 +86,36 @@ class FakeHost:
             if method == "credentials.describe":
                 assert request == {"refs": ["ACME_API_KEY"]}
             return copy.deepcopy(self.config[method])
+        if method == "settings.update":
+            self.permission_default = request["patch"]["defaultPreset"]
+            return {
+                "ns": request["ns"],
+                "schema": {},
+                "value": {"defaultPreset": self.permission_default},
+                "applies": "live",
+                "secrets": [],
+                "revision": 1,
+            }
         if method == "session.create":
-            return {"sessionId": request["sessionId"]}
+            if not self.existing_session:
+                self.history = [
+                    {"seq": 0, "type": "permission/preset", "data": {
+                        "preset": self.permission_default,
+                    }},
+                    {"seq": 1, "type": "sandbox/mode", "data": {
+                        "mode": self.permission_default,
+                    }},
+                    {"seq": 2, "type": "approval/policy", "data": {
+                        "policy": "never"
+                        if self.permission_default == "danger-full-access"
+                        else "ask",
+                    }},
+                ]
+                self.existing_session = True
+            return {
+                "sessionId": request["sessionId"],
+                "agentPreset": request.get("agentPreset"),
+            }
         if method == "session.history":
             return {"events": [{"event": copy.deepcopy(row)} for row in self.history]}
         if method == "session.selectModel":
@@ -215,6 +250,69 @@ def test_injected_host_port_derives_the_only_endpoint() -> None:
     }) == "http://127.0.0.1:6500"
 
 
+def test_stock_evidence_records_unattended_permission_contract() -> None:
+    evidence = json.loads(
+        (ENGINE / "assets/deepseek/stock-host-seam.json").read_text()
+    )
+    assert evidence["managed_session"]["unattended_permission_preset"] == {
+        "settings_write": {
+            "method": "settings.update",
+            "transport": "loopback HTTP POST /api/settings.update",
+            "payload": {
+                "ns": "permission",
+                "patch": {"defaultPreset": "danger-full-access"},
+            },
+        },
+        "create_hook_event": {
+            "type": "permission/preset",
+            "data": {"preset": "danger-full-access"},
+        },
+        "verification": {
+            "method": "session.history",
+            "transport": "loopback HTTP POST /api/session.history",
+        },
+        "resume_default_write": False,
+        "pinned_sources": [
+            {
+                "path": "packages/host/apiproxy/src/api/rpc-map.ts",
+                "lines": "22-33,63-67",
+                "proves": (
+                    "settings.update and session.history are registered HTTP "
+                    "unary methods"
+                ),
+            },
+            {
+                "path": "packages/host/apiproxy/src/api/settings.ts",
+                "lines": "71-77",
+                "proves": "settings.update accepts ns plus a merge patch",
+            },
+            {
+                "path": "packages/host/apiproxy/src/api-proxy.ts",
+                "lines": "1792-1838,3077",
+                "proves": (
+                    "the settings write commits before its redacted descriptor "
+                    "response"
+                ),
+            },
+            {
+                "path": (
+                    "packages/interaction/permission-presets/src/index.ts"
+                ),
+                "lines": "66-68,208-220,388-400",
+                "proves": (
+                    "permission.defaultPreset is validated and pinned as session "
+                    "creation events"
+                ),
+            },
+            {
+                "path": "packages/host/apiproxy/src/api/sessions.ts",
+                "lines": "247-265",
+                "proves": "session.history returns raw session events",
+            },
+        ],
+    }
+
+
 def test_unary_client_uses_exact_official_envelope(monkeypatch) -> None:
     captured = {}
 
@@ -275,16 +373,31 @@ def test_stale_route_fails_before_session_mutation(tmp_path: Path) -> None:
     assert "session.create" not in [method for method, _ in live.calls]
 
 
+def test_probe_requires_shipped_managed_agent_preset() -> None:
+    healthy = FakeHost()
+    result = DeepSeekAdapter(client_factory=lambda: healthy).probe()
+    assert result.version == "0.1.1-rc.2"
+    assert [method for method, _ in healthy.calls] == [
+        "host.describe", "agentPreset.list",
+    ]
+
+    broken = configuration()
+    broken["agentPreset.list"]["presets"][0]["broken"] = "missing plugin"
+    with pytest.raises(AdapterError) as refused:
+        DeepSeekAdapter(client_factory=lambda: FakeHost(config=broken)).probe()
+    assert refused.value.code == "HARNESS_AGENT_PRESET_UNAVAILABLE"
+
+
 def test_browser_start_stream_and_exact_call_order(tmp_path: Path) -> None:
     seed = FakeHost()
     ctx = context(tmp_path, seed)
     session = DeepSeekAdapter._new_session_ref(ctx)
     live = FakeHost(frames=[
-        frame(session, {"seq": 0, "type": "turn/start", "data": {}}),
-        frame(session, {"seq": 1, "type": "assistant/chunk", "data": {
+        frame(session, {"seq": 3, "type": "turn/start", "data": {}}),
+        frame(session, {"seq": 4, "type": "assistant/chunk", "data": {
             "chunk": {"type": "text-delta", "text": "hello"},
         }}),
-        frame(session, {"seq": 2, "type": "turn/end", "data": {
+        frame(session, {"seq": 5, "type": "turn/end", "data": {
             "reason": {"kind": "completed"},
         }}),
     ])
@@ -294,8 +407,17 @@ def test_browser_start_stream_and_exact_call_order(tmp_path: Path) -> None:
         "session.started", "run.started", "assistant.delta", "run.completed",
     ]
     assert events[2].payload["text"] == "hello"
-    assert live.calls[-4:] == [
-        ("session.create", {"sessionId": session, "cwd": str(tmp_path)}),
+    assert live.calls[-6:] == [
+        ("settings.update", {
+            "ns": "permission",
+            "patch": {"defaultPreset": "danger-full-access"},
+        }),
+        ("session.create", {
+            "sessionId": session,
+            "cwd": str(tmp_path),
+            "agentPreset": "standard",
+        }),
+        ("session.history", {"sessionId": session, "maxMessages": 200}),
         ("session.history", {"sessionId": session, "maxMessages": 200}),
         ("session.selectModel", {
             "sessionId": session, "provider": "acme-dynamic", "model": "model-7",
@@ -313,13 +435,80 @@ def test_cold_resume_reuses_session_and_prior_history(tmp_path: Path) -> None:
     seed = FakeHost()
     ctx = context(tmp_path, seed)
     session = DeepSeekAdapter._new_session_ref(ctx)
-    live = FakeHost(history=[{
-        "seq": 0, "type": "turn/end", "data": {"reason": {"kind": "completed"}},
-    }])
+    live = FakeHost(history=[
+        {"seq": 0, "type": "permission/preset", "data": {
+            "preset": "danger-full-access",
+        }},
+        {"seq": 1, "type": "sandbox/mode", "data": {
+            "mode": "danger-full-access",
+        }},
+        {"seq": 2, "type": "approval/policy", "data": {"policy": "never"}},
+        {"seq": 3, "type": "turn/end", "data": {
+            "reason": {"kind": "completed"},
+        }},
+    ])
     turn = DeepSeekAdapter(client_factory=lambda: live).resume(session, ctx, "continue")
     assert turn.session_ref == session
-    assert ("session.create", {"sessionId": session, "cwd": str(tmp_path)}) in live.calls
-    assert ("session.history", {"sessionId": session, "maxMessages": 200}) in live.calls
+    assert ("session.create", {
+        "sessionId": session,
+        "cwd": str(tmp_path),
+        "agentPreset": "standard",
+    }) in live.calls
+    assert "settings.update" not in [method for method, _payload in live.calls]
+    assert [payload for method, payload in live.calls if method == "session.history"] == [
+        {"sessionId": session, "maxMessages": 200},
+    ]
+
+
+def test_unattended_permission_history_mismatch_stops_before_prompt(
+    tmp_path: Path,
+) -> None:
+    class MismatchedHost(FakeHost):
+        def call(self, method, payload):
+            result = super().call(method, payload)
+            if method == "session.history":
+                return {"events": [entry for entry in result["events"]
+                                   if entry["event"]["type"] != "permission/preset"]}
+            return result
+
+    seed = FakeHost()
+    ctx = context(tmp_path, seed)
+    live = MismatchedHost()
+
+    with pytest.raises(AdapterError) as refused:
+        DeepSeekAdapter(client_factory=lambda: live).start(ctx, "work")
+
+    assert refused.value.code == "HARNESS_PERMISSION_POLICY_UNAVAILABLE"
+    assert "session.prompt" not in [method for method, _payload in live.calls]
+
+
+def test_unattended_permission_settings_refusal_stops_before_session_create(
+    tmp_path: Path,
+) -> None:
+    class RefusingHost(FakeHost):
+        def call(self, method, payload):
+            if method == "settings.update":
+                self.calls.append((method, dict(payload)))
+                raise deepseek_host.HostRpcError(
+                    "HARNESS_HOST_RPC_SETTINGS_REJECTED",
+                    "permission default rejected",
+                )
+            return super().call(method, payload)
+
+    seed = FakeHost()
+    ctx = context(tmp_path, seed)
+    live = RefusingHost()
+
+    with pytest.raises(AdapterError) as refused:
+        DeepSeekAdapter(client_factory=lambda: live).start(ctx, "work")
+
+    assert refused.value.code == "HARNESS_PERMISSION_POLICY_UNAVAILABLE"
+    assert live.calls[-1] == ("settings.update", {
+        "ns": "permission",
+        "patch": {"defaultPreset": "danger-full-access"},
+    })
+    assert "session.create" not in [method for method, _payload in live.calls]
+    assert "session.prompt" not in [method for method, _payload in live.calls]
 
 
 def test_stream_loss_never_invents_success(tmp_path: Path) -> None:
@@ -338,8 +527,12 @@ def test_stream_loss_cancels_proven_running_turn_before_failure(
     class RunningHost(FakeHost):
         def call(self, method, payload):
             result = super().call(method, payload)
-            if method == "session.prompt":
-                self.history = [{"seq": 0, "type": "turn/start", "data": {}}]
+            if method == "session.prompt" and payload.get("content") == [{
+                "type": "text", "text": "work",
+            }]:
+                self.history.append({
+                    "seq": len(self.history), "type": "turn/start", "data": {},
+                })
             return result
 
     seed = FakeHost()
@@ -365,8 +558,12 @@ def test_stream_loss_without_acknowledged_cancel_emits_no_false_terminal(
     class RunningHost(FakeHost):
         def call(self, method, payload):
             result = super().call(method, payload)
-            if method == "session.prompt":
-                self.history = [{"seq": 0, "type": "turn/start", "data": {}}]
+            if method == "session.prompt" and payload.get("content") == [{
+                "type": "text", "text": "work",
+            }]:
+                self.history.append({
+                    "seq": len(self.history), "type": "turn/start", "data": {},
+                })
             if method == "session.cancel":
                 return {"accepted": False}
             return result
