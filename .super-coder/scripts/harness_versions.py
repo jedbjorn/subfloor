@@ -114,7 +114,11 @@ def compatibility_status(
         try:
             if name in ADAPTER_TYPES:
                 manifest = load_manifest(name)
-                compatibility = manifest.get("conversation") or {}
+                compatibility = (
+                    manifest.get("runtime_compatibility")
+                    or manifest.get("conversation")
+                    or {}
+                )
             else:
                 adapter = json.loads(
                     (ADAPTERS / name / "adapter.json").read_text()

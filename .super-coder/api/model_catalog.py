@@ -631,11 +631,11 @@ def _observed_version(status: dict) -> str | None:
 def _support_state(status: dict) -> str | None:
     if status.get("error") or not _observed_version(status):
         return None
-    return "tested" if (
-        status.get("version")
-        and status.get("version") == status.get("verified_version")
-        and status.get("compatibility") == "verified"
-    ) else "best-effort"
+    return (
+        "tested"
+        if status.get("compatibility") == "verified"
+        else "best-effort"
+    )
 
 
 def _compatible_route_status(harness: str, entry: dict,
