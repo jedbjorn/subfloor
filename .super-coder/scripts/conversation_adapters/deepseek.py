@@ -182,10 +182,14 @@ class DeepSeekAdapter(ConversationAdapter):
             )
         try:
             permission = client.call(
-                "command.execute",
+                "session.prompt",
                 {
                     "sessionId": session_ref,
-                    "line": f"/permission {permission_preset}",
+                    "mode": "queue",
+                    "content": [{
+                        "type": "text",
+                        "text": f"/permission {permission_preset}",
+                    }],
                 },
             )
         except deepseek_host.DeepSeekHostError as exc:
@@ -193,12 +197,12 @@ class DeepSeekAdapter(ConversationAdapter):
                 "HARNESS_PERMISSION_POLICY_UNAVAILABLE",
                 exc.detail,
             ) from exc
-        result = permission.get("result") if isinstance(permission, Mapping) else None
+        command = permission.get("command") if isinstance(permission, Mapping) else None
         if (
             not isinstance(permission, Mapping)
-            or permission.get("matched") is not True
-            or not isinstance(result, Mapping)
-            or result.get("kind") != "success"
+            or permission.get("accepted") is not True
+            or not isinstance(command, Mapping)
+            or command.get("kind") != "success"
         ):
             raise AdapterError(
                 "HARNESS_PERMISSION_POLICY_UNAVAILABLE",

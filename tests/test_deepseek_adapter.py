@@ -89,12 +89,6 @@ class FakeHost:
                 "sessionId": request["sessionId"],
                 "agentPreset": request.get("agentPreset"),
             }
-        if method == "command.execute":
-            return {
-                "matched": True,
-                "commandId": "cmd-test-1",
-                "result": {"kind": "success"},
-            }
         if method == "session.history":
             return {"events": [{"event": copy.deepcopy(row)} for row in self.history]}
         if method == "session.selectModel":
@@ -104,6 +98,10 @@ class FakeHost:
                 if key in request
             }}
         if method == "session.prompt":
+            if request.get("content") == [{
+                "type": "text", "text": "/permission danger-full-access",
+            }]:
+                return {"accepted": True, "command": {"kind": "success"}}
             return {"accepted": True}
         if method == "session.cancel":
             return {"accepted": True}
@@ -229,6 +227,21 @@ def test_injected_host_port_derives_the_only_endpoint() -> None:
     }) == "http://127.0.0.1:6500"
 
 
+def test_stock_evidence_records_unattended_permission_contract() -> None:
+    evidence = json.loads(
+        (ENGINE / "assets/deepseek/stock-host-seam.json").read_text()
+    )
+    assert evidence["managed_session"]["unattended_permission_preset"] == {
+        "method": "session.prompt",
+        "transport": "loopback HTTP POST /api/session.prompt",
+        "content": [{
+            "type": "text", "text": "/permission danger-full-access",
+        }],
+        "success_contract": {"accepted": True, "command_kind": "success"},
+        "opens_turn": False,
+    }
+
+
 def test_unary_client_uses_exact_official_envelope(monkeypatch) -> None:
     captured = {}
 
@@ -329,9 +342,12 @@ def test_browser_start_stream_and_exact_call_order(tmp_path: Path) -> None:
             "cwd": str(tmp_path),
             "agentPreset": "standard",
         }),
-        ("command.execute", {
+        ("session.prompt", {
             "sessionId": session,
-            "line": "/permission danger-full-access",
+            "mode": "queue",
+            "content": [{
+                "type": "text", "text": "/permission danger-full-access",
+            }],
         }),
         ("session.history", {"sessionId": session, "maxMessages": 200}),
         ("session.selectModel", {
@@ -360,9 +376,12 @@ def test_cold_resume_reuses_session_and_prior_history(tmp_path: Path) -> None:
         "cwd": str(tmp_path),
         "agentPreset": "standard",
     }) in live.calls
-    assert ("command.execute", {
+    assert ("session.prompt", {
         "sessionId": session,
-        "line": "/permission danger-full-access",
+        "mode": "queue",
+        "content": [{
+            "type": "text", "text": "/permission danger-full-access",
+        }],
     }) in live.calls
     assert ("session.history", {"sessionId": session, "maxMessages": 200}) in live.calls
 
@@ -371,19 +390,65 @@ def test_unattended_permission_refusal_stops_before_prompt(tmp_path: Path) -> No
     class RefusingHost(FakeHost):
         def call(self, method, payload):
             result = super().call(method, payload)
-            if method == "command.execute":
-                return {"matched": False}
+            if method == "session.prompt" and payload.get("content") == [{
+                "type": "text", "text": "/permission danger-full-access",
+            }]:
+                return {"accepted": True, "command": {"kind": "error"}}
             return result
 
     seed = FakeHost()
     ctx = context(tmp_path, seed)
+    session = DeepSeekAdapter._new_session_ref(ctx)
     live = RefusingHost()
 
     with pytest.raises(AdapterError) as refused:
         DeepSeekAdapter(client_factory=lambda: live).start(ctx, "work")
 
     assert refused.value.code == "HARNESS_PERMISSION_POLICY_UNAVAILABLE"
-    assert "session.prompt" not in [method for method, _ in live.calls]
+    prompts = [payload for method, payload in live.calls if method == "session.prompt"]
+    assert prompts == [{
+        "sessionId": session,
+        "mode": "queue",
+        "content": [{
+            "type": "text", "text": "/permission danger-full-access",
+        }],
+    }]
+
+
+@pytest.mark.parametrize("rpc_code", [
+    "HARNESS_HOST_RPC_UNKNOWN_COMMAND",
+    "HARNESS_HOST_RPC_COMMAND_ERROR",
+])
+def test_unattended_permission_rpc_refusal_stops_before_user_prompt(
+    tmp_path: Path,
+    rpc_code: str,
+) -> None:
+    class RefusingHost(FakeHost):
+        def call(self, method, payload):
+            if method == "session.prompt" and payload.get("content") == [{
+                "type": "text", "text": "/permission danger-full-access",
+            }]:
+                self.calls.append((method, dict(payload)))
+                raise deepseek_host.HostRpcError(rpc_code, "permission rejected")
+            return super().call(method, payload)
+
+    seed = FakeHost()
+    ctx = context(tmp_path, seed)
+    session = DeepSeekAdapter._new_session_ref(ctx)
+    live = RefusingHost()
+
+    with pytest.raises(AdapterError) as refused:
+        DeepSeekAdapter(client_factory=lambda: live).start(ctx, "work")
+
+    assert refused.value.code == "HARNESS_PERMISSION_POLICY_UNAVAILABLE"
+    prompts = [payload for method, payload in live.calls if method == "session.prompt"]
+    assert prompts == [{
+        "sessionId": session,
+        "mode": "queue",
+        "content": [{
+            "type": "text", "text": "/permission danger-full-access",
+        }],
+    }]
 
 
 def test_stream_loss_never_invents_success(tmp_path: Path) -> None:
@@ -402,7 +467,9 @@ def test_stream_loss_cancels_proven_running_turn_before_failure(
     class RunningHost(FakeHost):
         def call(self, method, payload):
             result = super().call(method, payload)
-            if method == "session.prompt":
+            if method == "session.prompt" and payload.get("content") == [{
+                "type": "text", "text": "work",
+            }]:
                 self.history = [{"seq": 0, "type": "turn/start", "data": {}}]
             return result
 
@@ -429,7 +496,9 @@ def test_stream_loss_without_acknowledged_cancel_emits_no_false_terminal(
     class RunningHost(FakeHost):
         def call(self, method, payload):
             result = super().call(method, payload)
-            if method == "session.prompt":
+            if method == "session.prompt" and payload.get("content") == [{
+                "type": "text", "text": "work",
+            }]:
                 self.history = [{"seq": 0, "type": "turn/start", "data": {}}]
             if method == "session.cancel":
                 return {"accepted": False}

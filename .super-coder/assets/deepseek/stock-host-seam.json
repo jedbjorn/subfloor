@@ -44,6 +44,13 @@
     "caller_stable_session_id_accepted": true,
     "native_session_id_preserved": true,
     "exact_route_selected": true,
+    "unattended_permission_preset": {
+      "method": "session.prompt",
+      "transport": "loopback HTTP POST /api/session.prompt",
+      "content": [{"type": "text", "text": "/permission danger-full-access"}],
+      "success_contract": {"accepted": true, "command_kind": "success"},
+      "opens_turn": false
+    },
     "ordered_event_sequences": {
       "first_completed_turn": [0, 27],
       "cancelled_turn": [28, 34],
