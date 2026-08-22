@@ -3542,7 +3542,7 @@ class SprintParticipantStore:
                 raise SprintInvariantError(
                     "participant route changed during preflight; retry reroute"
                 )
-            expectation_facts = self._require_idle_projection(
+            expectation_facts, closed_chat_id = self._require_idle_projection(
                 current, lifecycle, planner_shell_id=planner_shell_id
             )
             if lifecycle == "paused":
@@ -3648,6 +3648,8 @@ class SprintParticipantStore:
                         ),
                     ),
                 )
+        if closed_chat_id is not None:
+            conversation_events.notify(closed_chat_id)
         return ParticipantRerouteReceipt(
             changed=True,
             binding_status=(
@@ -3699,7 +3701,7 @@ class SprintParticipantStore:
         lifecycle: str,
         *,
         planner_shell_id: int,
-    ) -> list[dict]:
+    ) -> tuple[list[dict], str | None]:
         """Guard the route change and relax it for own-route expectations.
 
         A paused Sprint no longer refuses reroute solely because the
@@ -3708,10 +3710,12 @@ class SprintParticipantStore:
         reroute transaction retires it and queues a fresh one on the
         replacement route (delivered at resume).  Expectations owned by
         another seat — a released ``ready``/``in_review`` lane for a
-        Developer — still block, as do live wakes, runs, and chats.
+        Developer — still block, as do live wakes, runs, and unrelated chats.
+        An idle chat linked to this participant is closed as durable history
+        before the replacement route is recorded.
         """
         if lifecycle == "prepared":
-            return []
+            return [], None
         sprint_id = int(participant["sprint_id"])
         shell_id = int(participant["shell_id"])
         if participant["role"] == "developer":
@@ -3767,16 +3771,59 @@ class SprintParticipantStore:
             )
         chat = active_chat_registry.get(self.con, shell_id)
         if chat is not None:
-            raise SprintInvariantError(
-                f"participant route still owns active chat {chat.chat_id}; "
-                "close and unregister it before reroute"
+            linked = self.con.execute(
+                "SELECT 1 FROM sprint_participant_conversations "
+                "WHERE sprint_participant_id=? AND conversation_id=?",
+                (participant["participant_id"], chat.chat_id),
+            ).fetchone()
+            if linked is None:
+                raise SprintInvariantError(
+                    f"participant route has unrelated active chat {chat.chat_id}; "
+                    "wait for its natural boundary before reroute"
+                )
+            if chat.state != "idle":
+                raise SprintInvariantError(
+                    f"participant route still owns active chat {chat.chat_id} "
+                    f"({chat.state}); finish the chat before reroute"
+                )
+            try:
+                closed = active_chat_registry.close_for_wake(
+                    self.con,
+                    shell_id,
+                    expected_chat_id=chat.chat_id,
+                )
+            except active_chat_registry.ActiveChatBusy as exc:
+                raise SprintInvariantError(
+                    f"participant route still owns active chat {chat.chat_id}; "
+                    "finish the chat before reroute"
+                ) from exc
+            if closed is None or closed.chat_id != chat.chat_id:
+                raise SprintInvariantError(
+                    "participant active chat changed during reroute; retry reroute"
+                )
+            sprint_participant_chats._append_event(
+                self.con,
+                closed.chat_id,
+                "conversation.closed",
+                {
+                    "reason": "paused participant reroute",
+                    "state": "closed",
+                    "sprint_id": sprint_id,
+                    "participant_id": int(participant["participant_id"]),
+                },
             )
+            closed_chat_id = closed.chat_id
+        else:
+            closed_chat_id = None
         if not rows:
-            return []
-        return self._retire_own_route_expectations(
-            participant,
-            rows,
-            planner_shell_id=planner_shell_id,
+            return [], closed_chat_id
+        return (
+            self._retire_own_route_expectations(
+                participant,
+                rows,
+                planner_shell_id=planner_shell_id,
+            ),
+            closed_chat_id,
         )
 
     def _retire_own_route_expectations(

@@ -18,6 +18,7 @@ MIGRATIONS = ENGINE / "migrations"
 
 sys.path.insert(0, str(ENGINE / "scripts"))
 sys.path.insert(0, str(ENGINE / "api"))
+import active_chat_registry
 import db_driver
 import server
 import sprint_domain
@@ -462,6 +463,190 @@ class DispatchGateTest(SprintWorkDispatchCase):
         )
         self.assertEqual(1, before[1][0])
         self.assertEqual(before[1], after[1])
+
+    def test_paused_reroute_closes_idle_linked_chat_before_fresh_delivery(self):
+        unit_id = self.create_unit(developer=1)
+        self.lifecycle.arm(
+            self.sprint_id, 3, conformance_reviewer_shell_id=2
+        )
+        self.deliver_pending_wakes()
+        original_message_id = self.assignment_message(unit_id)
+        self.assertEqual(
+            "accepted", self.messages.mark_read(original_message_id, 1)
+        )
+        original_chat_id = self.conversation_for(1)
+        participant_id = int(
+            self.con.execute(
+                "SELECT participant_id FROM sprint_participants "
+                "WHERE sprint_id=? AND shell_id=1",
+                (self.sprint_id,),
+            ).fetchone()[0]
+        )
+        self.assertEqual(
+            ("idle", "sprint", participant_id),
+            tuple(
+                self.con.execute(
+                    "SELECT conversation.state,conversation.conversation_scope,"
+                    "link.sprint_participant_id "
+                    "FROM conversations conversation "
+                    "JOIN sprint_participant_conversations link "
+                    "ON link.conversation_id=conversation.conversation_id "
+                    "WHERE conversation.conversation_id=?",
+                    (original_chat_id,),
+                ).fetchone()
+            ),
+        )
+        self.lifecycle.pause(
+            self.sprint_id,
+            sprint_domain.LifecycleActor("planner", 3),
+            reason="replace the idle Developer route",
+        )
+
+        notifications: list[tuple[str, bool]] = []
+        with mock.patch.object(
+            sprint_domain.conversation_events,
+            "notify",
+            side_effect=lambda chat_id: notifications.append(
+                (chat_id, self.con.in_transaction)
+            ),
+        ):
+            receipt = sprint_domain.SprintParticipantStore(
+                self.con, probe_harness=lambda _harness: None
+            ).reroute(
+                self.sprint_id,
+                3,
+                participant_shell_id=1,
+                harness="codex",
+                model="replacement-model",
+                effort="medium",
+                route="codex/replacement-model",
+            )
+
+        self.assertEqual((True, "bound", 2), (
+            receipt.changed,
+            receipt.binding_status,
+            receipt.route_revision,
+        ))
+        self.assertEqual(
+            ("closed", 0),
+            (
+                self.con.execute(
+                    "SELECT state FROM conversations WHERE conversation_id=?",
+                    (original_chat_id,),
+                ).fetchone()[0],
+                self.con.execute(
+                    "SELECT COUNT(*) FROM active_shell_chats WHERE shell_id=1"
+                ).fetchone()[0],
+            ),
+        )
+        closed_event = self.con.execute(
+            "SELECT payload FROM conversation_events WHERE conversation_id=? "
+            "AND event_type='conversation.closed'",
+            (original_chat_id,),
+        ).fetchone()
+        self.assertEqual(
+            {
+                "reason": "paused participant reroute",
+                "state": "closed",
+                "sprint_id": self.sprint_id,
+                "participant_id": participant_id,
+            },
+            json.loads(closed_event[0]),
+        )
+        self.assertEqual([(original_chat_id, False)], notifications)
+
+        replacement = self.con.execute(
+            "SELECT message_id,declared_type,delivered_at,to_participant_id "
+            "FROM wake_message WHERE sprint_id=? AND work_unit_id=? "
+            "AND message_kind='work_assignment' ORDER BY message_id DESC LIMIT 1",
+            (self.sprint_id, unit_id),
+        ).fetchone()
+        self.assertEqual(
+            ("force-new", None, participant_id),
+            tuple(replacement[field] for field in (
+                "declared_type", "delivered_at", "to_participant_id"
+            )),
+        )
+        self.assertNotEqual(
+            original_message_id, int(replacement["message_id"])
+        )
+        self.assertEqual(
+            ("replacement-model", "medium", 2),
+            tuple(
+                self.con.execute(
+                    "SELECT participant.model,participant.effort,"
+                    "binding.route_revision FROM sprint_participants participant "
+                    "JOIN sprint_participant_route_bindings binding "
+                    "ON binding.binding_id=participant.active_route_binding_id "
+                    "WHERE participant.participant_id=?",
+                    (participant_id,),
+                ).fetchone()
+            ),
+        )
+
+    def test_paused_reroute_refuses_unlinked_idle_active_chat(self):
+        self.create_unit(developer=1)
+        self.lifecycle.arm(
+            self.sprint_id, 3, conformance_reviewer_shell_id=2
+        )
+        self.lifecycle.pause(
+            self.sprint_id,
+            sprint_domain.LifecycleActor("planner", 3),
+            reason="verify chat ownership before reroute",
+        )
+        chat_id = "cv_unrelated_reroute"
+        self.con.execute(
+            "INSERT INTO conversations "
+            "(conversation_id,shell_id,owner_user_id,harness,worktree,title,"
+            "creation_idempotency_key,creation_request_hash) "
+            "VALUES (?,4,1,'codex','/tmp/dev2','Unrelated chat',?,?)",
+            (chat_id, "unrelated-reroute-chat", "unrelated-reroute-hash"),
+        )
+        active_chat_registry.register(self.con, 4, chat_id)
+        before = tuple(
+            self.con.execute(
+                "SELECT harness,model,effort,route FROM sprint_participants "
+                "WHERE sprint_id=? AND shell_id=4",
+                (self.sprint_id,),
+            ).fetchone()
+        )
+        self.con.commit()
+
+        with self.assertRaisesRegex(
+            sprint_domain.SprintInvariantError, "unrelated active chat"
+        ):
+            sprint_domain.SprintParticipantStore(
+                self.con, probe_harness=lambda _harness: None
+            ).reroute(
+                self.sprint_id,
+                3,
+                participant_shell_id=4,
+                harness="codex",
+                model="replacement-model",
+                effort="medium",
+                route="codex/replacement-model",
+            )
+
+        self.assertEqual(
+            (before, ("idle", chat_id)),
+            (
+                tuple(
+                    self.con.execute(
+                        "SELECT harness,model,effort,route FROM sprint_participants "
+                        "WHERE sprint_id=? AND shell_id=4",
+                        (self.sprint_id,),
+                    ).fetchone()
+                ),
+                tuple(
+                    self.con.execute(
+                        "SELECT conversation.state,active.chat_id "
+                        "FROM active_shell_chats active JOIN conversations conversation "
+                        "ON conversation.conversation_id=active.chat_id "
+                        "WHERE active.shell_id=4"
+                    ).fetchone()
+                ),
+            ),
+        )
 
     def test_arm_default_preflight_uses_the_conversation_adapter_probe(self) -> None:
         self.create_unit(developer=1)
