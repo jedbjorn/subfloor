@@ -2,9 +2,9 @@
 """Own the fork-scoped official DeepSeek Web/Host service.
 
 The stock service stays on container/host loopback. Docker publishes a tiny
-engine-owned TCP relay on the container interface to a deterministic host
-loopback port; this avoids weakening dsh's own bind-host safety gate. State
-records PID start ticks before either child can be trusted across invocations.
+engine-owned TCP relay to a deterministic host-loopback port; the relay rejects
+every peer except container loopback and the host gateway before connecting to
+dsh. State records PID start ticks before either child is trusted across calls.
 """
 from __future__ import annotations
 
@@ -16,6 +16,7 @@ import os
 import shutil
 import signal
 import socket
+import struct
 import subprocess
 import sys
 import time
@@ -37,6 +38,7 @@ LOCK = ENGINE / "run" / "deepseek-web.lock"
 START_TIMEOUT_SECONDS = 30.0
 STOP_TIMEOUT_SECONDS = 5.0
 HTTP_TIMEOUT_SECONDS = 2.0
+RELAY_POLICY = "host-gateway-only-v1"
 
 
 class DeepSeekWebError(RuntimeError):
@@ -171,7 +173,8 @@ def _service_port(config: Mapping[str, Any], env: Mapping[str, str]) -> int:
     except ValueError as exc:
         raise DeepSeekWebError(
             "HARNESS_ENDPOINT_UNAVAILABLE",
-            "SC_DEEPSEEK_HOST_PORT is missing or invalid",
+            "SC_DEEPSEEK_HOST_PORT is missing or invalid; "
+            "run ./sc launch --no-build from the host",
         ) from exc
     if injected != configured:
         raise DeepSeekWebError(
@@ -179,6 +182,36 @@ def _service_port(config: Mapping[str, Any], env: Mapping[str, str]) -> int:
             "SC_DEEPSEEK_HOST_PORT disagrees with this fork's persisted Host port",
         )
     return injected
+
+
+def _default_gateway(route_path: Path = Path("/proc/net/route")) -> str | None:
+    """Return the active namespace's IPv4 default gateway."""
+    try:
+        rows = route_path.read_text().splitlines()[1:]
+    except OSError:
+        return None
+    for row in rows:
+        fields = row.split()
+        if len(fields) < 4 or fields[1] != "00000000":
+            continue
+        try:
+            flags = int(fields[3], 16)
+            gateway = socket.inet_ntoa(struct.pack("<L", int(fields[2], 16)))
+        except (OSError, ValueError, struct.error):
+            continue
+        if flags & 0x3 == 0x3:
+            return gateway
+    return None
+
+
+def _relay_allowed_peers() -> tuple[str, ...]:
+    gateway = _default_gateway()
+    if gateway is None:
+        raise DeepSeekWebError(
+            "HARNESS_SERVICE_START_FAILED",
+            "could not identify the sandbox host gateway for the loopback relay",
+        )
+    return ("127.0.0.1", gateway)
 
 
 def _worktree(path: Path) -> Path:
@@ -306,7 +339,12 @@ def stop() -> dict[str, Any]:
 
 
 def _existing_healthy(
-    state: Mapping[str, Any], service_port: int, relay_port: int, *, sandbox: bool
+    state: Mapping[str, Any],
+    service_port: int,
+    relay_port: int,
+    *,
+    sandbox: bool,
+    allowed_peers: tuple[str, ...],
 ) -> bool:
     if state.get("service_port") != service_port:
         return False
@@ -318,6 +356,8 @@ def _existing_healthy(
         return True
     return (
         state.get("relay_port") == relay_port
+        and state.get("relay_policy") == RELAY_POLICY
+        and state.get("relay_allowed_peers") == list(allowed_peers)
         and _verified_process(
             state.get("relay_pid"), state.get("relay_start_ticks"), "relay"
         )
@@ -338,8 +378,13 @@ def ensure(worktree: Path, *, env: Mapping[str, str] | None = None) -> dict[str,
         url = f"http://127.0.0.1:{service_port}"
         state = _read_state()
         sandbox = bool(env.get("SC_SANDBOX"))
+        allowed_peers = _relay_allowed_peers() if sandbox else ()
         reused = _existing_healthy(
-            state, service_port, relay_port, sandbox=sandbox
+            state,
+            service_port,
+            relay_port,
+            sandbox=sandbox,
+            allowed_peers=allowed_peers,
         )
         if not reused:
             _stop_unlocked()
@@ -368,6 +413,8 @@ def ensure(worktree: Path, *, env: Mapping[str, str] | None = None) -> dict[str,
                 "web_start_ticks": web_ticks,
                 "service_port": service_port,
                 "relay_port": relay_port if sandbox else None,
+                "relay_policy": RELAY_POLICY if sandbox else None,
+                "relay_allowed_peers": list(allowed_peers),
                 "url": url,
             }
             _write_state(state)
@@ -383,6 +430,11 @@ def ensure(worktree: Path, *, env: Mapping[str, str] | None = None) -> dict[str,
                         sys.executable,
                         str(Path(__file__).resolve()),
                         "relay",
+                        *[
+                            item
+                            for peer in allowed_peers
+                            for item in ("--allowed-peer", peer)
+                        ],
                         "--listen-port",
                         str(relay_port),
                         "--target-port",
@@ -421,21 +473,39 @@ def status() -> dict[str, Any]:
     relay = relay_port is None or _verified_process(
         state.get("relay_pid"), state.get("relay_start_ticks"), "relay"
     )
+    relay_safe = relay_port is None or (
+        state.get("relay_policy") == RELAY_POLICY
+        and isinstance(state.get("relay_allowed_peers"), list)
+        and bool(state["relay_allowed_peers"])
+    )
     ready = (
         web
         and isinstance(service_port, int)
         and _http_ready(service_port)
         and relay
+        and relay_safe
         and (relay_port is None or _tcp_ready("127.0.0.1", relay_port))
     )
-    return {"ready": ready, "web_process": web, "relay_process": relay, **state}
+    return {
+        "ready": ready,
+        "web_process": web,
+        "relay_process": relay,
+        "relay_safe": relay_safe,
+        **state,
+    }
 
 
 async def _relay_connection(
     reader: asyncio.StreamReader,
     writer: asyncio.StreamWriter,
     target_port: int,
+    allowed_peers: frozenset[str],
 ) -> None:
+    peer = writer.get_extra_info("peername")
+    if not isinstance(peer, tuple) or not peer or peer[0] not in allowed_peers:
+        writer.close()
+        await writer.wait_closed()
+        return
     try:
         upstream_reader, upstream_writer = await asyncio.open_connection(
             "127.0.0.1", target_port
@@ -467,9 +537,13 @@ async def _relay_connection(
     await writer.wait_closed()
 
 
-async def _relay(listen_port: int, target_port: int) -> None:
+async def _relay(
+    listen_port: int, target_port: int, allowed_peers: frozenset[str]
+) -> None:
     server = await asyncio.start_server(
-        lambda reader, writer: _relay_connection(reader, writer, target_port),
+        lambda reader, writer: _relay_connection(
+            reader, writer, target_port, allowed_peers
+        ),
         "0.0.0.0",
         listen_port,
     )
@@ -485,6 +559,7 @@ def main(argv: list[str]) -> int:
     subparsers.add_parser("status")
     subparsers.add_parser("stop")
     relay_parser = subparsers.add_parser("relay")
+    relay_parser.add_argument("--allowed-peer", action="append", required=True)
     relay_parser.add_argument("--listen-port", type=int, required=True)
     relay_parser.add_argument("--target-port", type=int, required=True)
     args = parser.parse_args(argv)
@@ -496,7 +571,13 @@ def main(argv: list[str]) -> int:
         elif args.command == "stop":
             result = stop()
         else:
-            asyncio.run(_relay(args.listen_port, args.target_port))
+            asyncio.run(
+                _relay(
+                    args.listen_port,
+                    args.target_port,
+                    frozenset(args.allowed_peer),
+                )
+            )
             return 0
     except DeepSeekWebError as exc:
         print(f"{exc.code}: {exc.detail}", file=sys.stderr)

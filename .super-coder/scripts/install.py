@@ -521,40 +521,6 @@ def ensure_harnesses() -> dict[str, str]:
     return status
 
 
-def deepseek_runtime_status(*, install: bool) -> dict[str, object]:
-    """Project the optional isolated carrier without gating core installation."""
-    try:
-        import deepseek_runtime
-
-        status = (
-            deepseek_runtime.ensure_carrier()
-            if install
-            else deepseek_runtime.runtime_status()
-        )
-        observed = status.sdk_version or "—"
-        if status.available:
-            print(
-                f"  ✓ {'deepseek':9} SDK/runtime {observed} in isolated "
-                f"Python {status.python_version} carrier"
-            )
-        else:
-            print(
-                f"  ⚠ {'deepseek':9} unavailable · {status.error}: "
-                f"{status.detail}"
-            )
-        return status.as_dict()
-    except Exception as exc:
-        # DeepSeek is an optional browser/Sprint capability. A broken or absent
-        # carrier must not narrow the engine's Python floor or abort core setup.
-        print(f"  ⚠ {'deepseek':9} unavailable · HARNESS_RUNTIME_INVALID: {exc}")
-        return {
-            "available": False,
-            "enabled": True,
-            "error": "HARNESS_RUNTIME_INVALID",
-            "detail": str(exc),
-        }
-
-
 # ── Docker preflight (the default run mode is a sandbox container) ────────────
 # Advisory only: real docker setup needs root + a re-login, so install GUIDES with
 # the right commands for the state it finds, never mutates. Mirrors the git/curl

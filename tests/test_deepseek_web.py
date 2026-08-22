@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import asyncio
 import importlib
 import json
 import sys
 import tempfile
+from contextlib import suppress
 from pathlib import Path
 from unittest import mock
 
@@ -53,6 +55,11 @@ def test_ensure_starts_exact_stock_web_relay_registers_and_reuses() -> None:
             mock.patch.object(deepseek_web, "_tcp_ready", return_value=True),
             mock.patch.object(
                 deepseek_web,
+                "_relay_allowed_peers",
+                return_value=("127.0.0.1", "172.18.0.1"),
+            ),
+            mock.patch.object(
+                deepseek_web,
                 "_post_workspace",
                 return_value={"workspace_id": "ws-4", "workspace_created": True},
             ) as register,
@@ -85,6 +92,12 @@ def test_ensure_starts_exact_stock_web_relay_registers_and_reuses() -> None:
             "18942",
             "--target-port",
             "8942",
+        ]
+        assert spawned[1][0][3:7] == [
+            "--allowed-peer",
+            "127.0.0.1",
+            "--allowed-peer",
+            "172.18.0.1",
         ]
         assert register.call_count == 2
         state = json.loads((root / "state.json").read_text())
@@ -120,14 +133,119 @@ def test_disabled_deepseek_stops_owned_service_without_launching() -> None:
 def test_sandbox_service_fails_closed_without_exact_injected_host_port() -> None:
     config = {"deepseek_host_port": 8942}
 
+    with pytest.raises(deepseek_web.DeepSeekWebError) as missing:
+        deepseek_web._service_port(config, {"SC_SANDBOX": "1"})
+    assert missing.value.code == "HARNESS_ENDPOINT_UNAVAILABLE"
+    assert "./sc launch --no-build" in missing.value.detail
+
     for env in (
-        {"SC_SANDBOX": "1"},
         {"SC_SANDBOX": "1", "SC_DEEPSEEK_HOST_PORT": "invalid"},
         {"SC_SANDBOX": "1", "SC_DEEPSEEK_HOST_PORT": "8943"},
     ):
         with pytest.raises(deepseek_web.DeepSeekWebError) as unavailable:
             deepseek_web._service_port(config, env)
         assert unavailable.value.code == "HARNESS_ENDPOINT_UNAVAILABLE"
+
+
+def test_default_gateway_is_derived_from_the_namespace_route_table() -> None:
+    with tempfile.TemporaryDirectory() as raw:
+        route = Path(raw) / "route"
+        route.write_text(
+            "Iface Destination Gateway Flags RefCnt Use Metric Mask MTU Window IRTT\n"
+            "eth0 00000000 010011AC 0003 0 0 0 00000000 0 0 0\n"
+        )
+
+        assert deepseek_web._default_gateway(route) == "172.17.0.1"
+
+
+def test_relay_rejects_sibling_source_before_opening_stock_host() -> None:
+    async def scenario() -> None:
+        upstream_connections: list[tuple[str, int]] = []
+
+        async def echo(
+            reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+        ) -> None:
+            upstream_connections.append(writer.get_extra_info("peername"))
+            payload = await reader.readexactly(4)
+            writer.write(payload)
+            await writer.drain()
+            writer.close()
+            await writer.wait_closed()
+
+        upstream = await asyncio.start_server(echo, "127.0.0.1", 0)
+        target_port = upstream.sockets[0].getsockname()[1]
+        allowed = frozenset({"127.0.0.1"})
+        relay = await asyncio.start_server(
+            lambda reader, writer: deepseek_web._relay_connection(
+                reader, writer, target_port, allowed
+            ),
+            "127.0.0.1",
+            0,
+        )
+        relay_port = relay.sockets[0].getsockname()[1]
+
+        async def exchange(source: str) -> bytes:
+            reader, writer = await asyncio.open_connection(
+                "127.0.0.1", relay_port, local_addr=(source, 0)
+            )
+            try:
+                writer.write(b"ping")
+                await writer.drain()
+                try:
+                    return await asyncio.wait_for(reader.read(4), timeout=1)
+                except ConnectionResetError:
+                    return b""
+            finally:
+                writer.close()
+                with suppress(ConnectionResetError):
+                    await writer.wait_closed()
+
+        try:
+            assert await exchange("127.0.0.1") == b"ping"
+            assert len(upstream_connections) == 1
+            assert await exchange("127.0.0.2") == b""
+            assert len(upstream_connections) == 1
+        finally:
+            relay.close()
+            upstream.close()
+            await relay.wait_closed()
+            await upstream.wait_closed()
+
+    asyncio.run(scenario())
+
+
+def test_status_rejects_a_live_relay_without_the_host_gateway_policy() -> None:
+    with tempfile.TemporaryDirectory() as raw:
+        root = Path(raw)
+        state = {
+            "web_pid": 101,
+            "web_start_ticks": 201,
+            "service_port": 8942,
+            "relay_pid": 102,
+            "relay_start_ticks": 202,
+            "relay_port": 18942,
+        }
+        (root / "state.json").write_text(json.dumps(state))
+        with (
+            mock.patch.dict(deepseek_web.os.environ, service_env(root), clear=False),
+            mock.patch.object(deepseek_web, "_verified_process", return_value=True),
+            mock.patch.object(deepseek_web, "_http_ready", return_value=True),
+            mock.patch.object(deepseek_web, "_tcp_ready", return_value=True),
+        ):
+            unsafe = deepseek_web.status()
+            state.update(
+                {
+                    "relay_policy": deepseek_web.RELAY_POLICY,
+                    "relay_allowed_peers": ["127.0.0.1", "172.18.0.1"],
+                }
+            )
+            (root / "state.json").write_text(json.dumps(state))
+            safe = deepseek_web.status()
+
+    assert unsafe["ready"] is False
+    assert unsafe["relay_safe"] is False
+    assert safe["ready"] is True
+    assert safe["relay_safe"] is True
 
 
 def test_workspace_registration_uses_stock_rpc_envelope_and_verifies_path() -> None:
@@ -203,4 +321,4 @@ def test_worktree_registration_refuses_paths_outside_the_fork() -> None:
         pytest.raises(deepseek_web.DeepSeekWebError) as invalid,
     ):
         deepseek_web._worktree(Path(other_raw))
-        assert invalid.value.code == "HARNESS_WORKTREE_INVALID"
+    assert invalid.value.code == "HARNESS_WORKTREE_INVALID"

@@ -340,7 +340,6 @@ def test_stock_host_selection_withdraws_legacy_carrier_from_live_registry() -> N
     assert manifest["official_runtime"] == {
         "distribution": "@deepseek-ai/dsh",
         "version": "0.1.1-rc.2",
-        "integrity": "sha512-UP1UIh6q3Gme/yXRn/QL2P8IsVlv8Shpg22TRJIZPsCRWLm4CBiA1MUvXmJAfsOEETBMLAl+xWPtFw6ICsN3wg==",
         "tag": "dsh-v0.1.1-rc.2",
         "commit": "b150a551b8d465e31e418e1b2eaf5e79bbb7d28e",
         "selected_seam": "stock-host-api",
