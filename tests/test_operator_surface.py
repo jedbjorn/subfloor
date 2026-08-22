@@ -140,7 +140,7 @@ class EnterPreAttachPrintTest(unittest.TestCase):
         self._stub(
             "deepseek-python",
             "#!/bin/sh\ncase \"$*\" in\n"
-            "  *ports.py*deepseekport*) echo 8942; exit 0 ;;\n"
+            "  *ports.py*deepseekhostport*) echo 8942; exit 0 ;;\n"
             "  *sandbox_devkit.py*) exit 0 ;;\n"
             "esac\n"
             f"exec {sys.executable} \"$@\"\n",
@@ -201,6 +201,7 @@ class EnterPreAttachPrintTest(unittest.TestCase):
         source = (ROOT / ".super-coder" / "scripts" / "dispatch.sh").read_text()
         self.assertIn('-p "127.0.0.1:$dsp:$dsrp"', source)
         self.assertIn('dsrp="$(deepseekrelayport)"', source)
+        self.assertIn('-e SC_DEEPSEEK_HOST_PORT="$dsp"', source)
 
     def test_an_underivable_url_never_costs_the_operator_their_shell(self):
         """`sc` runs under `set -e`, so an unguarded print is a new way for

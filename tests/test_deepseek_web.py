@@ -21,6 +21,7 @@ deepseek_web = importlib.import_module("deepseek_web")
 def service_env(root: Path) -> dict[str, str]:
     return {
         "SC_SANDBOX": "1",
+        "SC_DEEPSEEK_HOST_PORT": "8942",
         "SC_DEEPSEEK_WEB_STATE": str(root / "state.json"),
         "SC_DEEPSEEK_WEB_LOG": str(root / "service.log"),
         "SC_DEEPSEEK_WEB_LOCK": str(root / "service.lock"),
@@ -44,7 +45,7 @@ def test_ensure_starts_exact_stock_web_relay_registers_and_reuses() -> None:
             mock.patch.object(
                 deepseek_web.ports,
                 "resolve",
-                return_value={"deepseek_port": 8942},
+                return_value={"deepseek_host_port": 8942},
             ),
             mock.patch.object(deepseek_web.shutil, "which", return_value="/bin/dsh"),
             mock.patch.object(deepseek_web, "_spawn", side_effect=spawn),
@@ -114,6 +115,19 @@ def test_disabled_deepseek_stops_owned_service_without_launching() -> None:
 
         assert unavailable.value.code == "HARNESS_DISABLED"
         stopped.assert_called_once_with()
+
+
+def test_sandbox_service_fails_closed_without_exact_injected_host_port() -> None:
+    config = {"deepseek_host_port": 8942}
+
+    for env in (
+        {"SC_SANDBOX": "1"},
+        {"SC_SANDBOX": "1", "SC_DEEPSEEK_HOST_PORT": "invalid"},
+        {"SC_SANDBOX": "1", "SC_DEEPSEEK_HOST_PORT": "8943"},
+    ):
+        with pytest.raises(deepseek_web.DeepSeekWebError) as unavailable:
+            deepseek_web._service_port(config, env)
+        assert unavailable.value.code == "HARNESS_ENDPOINT_UNAVAILABLE"
 
 
 def test_workspace_registration_uses_stock_rpc_envelope_and_verifies_path() -> None:

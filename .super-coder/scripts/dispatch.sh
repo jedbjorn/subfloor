@@ -163,7 +163,7 @@ sc_refuse_linked() {
 
 port() { "$PY" "$S/ports.py" port; }
 devport() { "$PY" "$S/ports.py" devport; }
-deepseekport() { "$PY" "$S/ports.py" deepseekport; }
+deepseekhostport() { "$PY" "$S/ports.py" deepseekhostport; }
 deepseekrelayport() { "$PY" "$S/ports.py" deepseekrelayport; }
 
 sc_open_browser() {
@@ -1214,7 +1214,7 @@ case "$cmd" in
     "$PY" "$S/ports.py" ensure >/dev/null
     p="$(port)"
     dp="$(devport)"
-    dsp="$(deepseekport)"
+    dsp="$(deepseekhostport)"
     dsrp="$(deepseekrelayport)"
     dnet
     github_auth_rootless=""
@@ -1295,7 +1295,7 @@ case "$cmd" in
         --network "$SC_NET" \
         SC_GITHUB_AUTH_ARGS \
         -e HOME="$HOME" -e SC_BIND=0.0.0.0 -e SC_PYTHON=python3 -e PYTHONUNBUFFERED=1 \
-        -e SC_SANDBOX=1 -e SC_DEV_PORT="$dp" \
+        -e SC_SANDBOX=1 -e SC_DEV_PORT="$dp" -e SC_DEEPSEEK_HOST_PORT="$dsp" \
         $mistral_env $ollama_env $disabled_harnesses_env $pg_env \
         -e GIT_AUTHOR_NAME="$git_name" -e GIT_AUTHOR_EMAIL="$git_email" \
         -e GIT_COMMITTER_NAME="$git_name" -e GIT_COMMITTER_EMAIL="$git_email" \
@@ -1367,7 +1367,7 @@ case "$cmd" in
       shift
       docker exec -it -e "SC_DISABLED_HARNESSES=${SC_DISABLED_HARNESSES:-}" \
         "$CNAME" ./sc boot "$@" --harness deepseek --local-web
-      sc_deepseek_url="http://127.0.0.1:$(deepseekport)"
+      sc_deepseek_url="http://127.0.0.1:$(deepseekhostport)"
       echo "  DeepSeek Web  $sc_deepseek_url"
       sc_open_browser "$sc_deepseek_url" || true
       exit 0

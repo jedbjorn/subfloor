@@ -27,7 +27,7 @@
     "kind": "local_web",
     "launch": ["dsh", "web"],
     "host": "127.0.0.1",
-    "port_source": "instance.deepseek_port",
+    "port_source": "SC_DEEPSEEK_HOST_PORT",
     "readiness_path": "/",
     "workspace_method": "workspace.create",
     "browser_open_owner": "host-dispatcher",

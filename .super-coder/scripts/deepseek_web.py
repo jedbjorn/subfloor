@@ -161,6 +161,26 @@ def _disabled(env: Mapping[str, str]) -> bool:
     }
 
 
+def _service_port(config: Mapping[str, Any], env: Mapping[str, str]) -> int:
+    configured = int(config["deepseek_host_port"])
+    if not env.get("SC_SANDBOX"):
+        return configured
+    raw = env.get("SC_DEEPSEEK_HOST_PORT")
+    try:
+        injected = int(raw or "")
+    except ValueError as exc:
+        raise DeepSeekWebError(
+            "HARNESS_ENDPOINT_UNAVAILABLE",
+            "SC_DEEPSEEK_HOST_PORT is missing or invalid",
+        ) from exc
+    if injected != configured:
+        raise DeepSeekWebError(
+            "HARNESS_ENDPOINT_UNAVAILABLE",
+            "SC_DEEPSEEK_HOST_PORT disagrees with this fork's persisted Host port",
+        )
+    return injected
+
+
 def _worktree(path: Path) -> Path:
     try:
         resolved = path.resolve(strict=True)
@@ -313,7 +333,7 @@ def ensure(worktree: Path, *, env: Mapping[str, str] | None = None) -> dict[str,
             raise DeepSeekWebError("HARNESS_DISABLED", "DeepSeek is disabled")
         selected = _worktree(worktree)
         config = ports.resolve(persist=True)
-        service_port = int(config["deepseek_port"])
+        service_port = _service_port(config, env)
         relay_port = service_port + ports.DEEPSEEK_RELAY_OFFSET
         url = f"http://127.0.0.1:{service_port}"
         state = _read_state()
