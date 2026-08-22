@@ -143,6 +143,14 @@ class HarnessSurfaceProjectionTest(unittest.TestCase):
             ):
                 run.require_harness_surface(adapter, surface)
 
+    def test_local_web_entry_requires_an_explicit_interactive_contract(self) -> None:
+        run.require_local_web_surface({
+            "harness": "deepseek",
+            "interactive": {"kind": "local_web"},
+        })
+        with self.assertRaisesRegex(ValueError, "does not support local Web entry"):
+            run.require_local_web_surface({"harness": "codex"})
+
 
 if __name__ == "__main__":
     unittest.main()

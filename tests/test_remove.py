@@ -346,6 +346,33 @@ class TargetValidationTest(unittest.TestCase):
 
 
 class RuntimeQuiescenceTest(unittest.TestCase):
+    def test_deepseek_web_is_stopped_before_the_repo_runtime(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            repo = Path(raw)
+            scripts = repo / ".super-coder" / "scripts"
+            scripts.mkdir(parents=True)
+            manager = scripts / "deepseek_web.py"
+            manager.write_text("# managed service\n")
+            results = [
+                subprocess.CompletedProcess(["deepseek_web.py", "stop"], 0, "{}\n", ""),
+                subprocess.CompletedProcess(["sc", "down"], 0, "stopped\n", ""),
+                subprocess.CompletedProcess(["ports.py", "port"], 0, "8837\n", ""),
+            ]
+            with (
+                mock.patch.object(remove_mod, "stop_running_jobs"),
+                mock.patch.object(remove_mod, "_run", side_effect=results) as run,
+                mock.patch.object(remove_mod.shutil, "which", return_value=None),
+                mock.patch.object(
+                    remove_mod.socket,
+                    "create_connection",
+                    side_effect=ConnectionRefusedError,
+                ),
+            ):
+                remove_mod.quiesce_runtime(repo)
+
+        self.assertEqual(run.call_args_list[0].args[-1], "stop")
+        self.assertEqual(run.call_args_list[1].args, (str(repo / "sc"), "down"))
+
     def test_foreground_listener_blocks_removal_after_down(self) -> None:
         repo = Path("/tmp/remove-runtime-fixture")
         results = [

@@ -850,68 +850,25 @@ def test_container_platform_map_matches_every_published_linux_wheel_family() -> 
     }
 
 
-def test_dockerfile_delegates_container_acquisition_to_tested_optional_helper() -> None:
+def test_dockerfile_installs_the_exact_official_deepseek_distribution() -> None:
     dockerfile = (ROOT / ".super-coder" / "Dockerfile").read_text()
     folded = dockerfile.replace("\\\n", " ")
 
     assert (
-        "COPY .super-coder/scripts/deepseek_runtime.py "
-        "/opt/super-coder/deepseek-bootstrap/scripts/deepseek_runtime.py"
-    ) in dockerfile
-    assert (
-        "COPY .super-coder/scripts/build_deepseek_carrier.py "
-        "/opt/super-coder/deepseek-bootstrap/scripts/build_deepseek_carrier.py"
-    ) in dockerfile
-    assert (
-        "--install-container-carrier /opt/super-coder/deepseek-runtime "
-        '"$(uname -m)"'
+        'npm install --global --prefix "$HOME/.local" '
+        '"@deepseek-ai/dsh@0.1.1-rc.2"'
     ) in folded
-    assert "RUN python -m venv /opt/super-coder/deepseek-runtime" not in folded
+    assert '"$HOME/.local/bin/dsh" --version' in folded
+    assert "--install-container-carrier" not in folded
+    assert "SC_DEEPSEEK_CARRIER_PYTHON" not in folded
 
 
-def test_dockerfile_stages_a_runnable_deepseek_container_entrypoint() -> None:
+def test_dockerfile_does_not_stage_the_retired_carrier_bootstrap() -> None:
     dockerfile = (ROOT / ".super-coder" / "Dockerfile").read_text()
-    container_root = Path("/opt/super-coder/deepseek-bootstrap")
 
-    with tempfile.TemporaryDirectory() as raw:
-        staging_root = Path(raw) / "deepseek-bootstrap"
-        for line in dockerfile.splitlines():
-            fields = line.split()
-            if (
-                len(fields) != 3
-                or fields[0] != "COPY"
-                or not fields[2].startswith(f"{container_root}/")
-            ):
-                continue
-            source = ROOT / fields[1]
-            destination = staging_root / Path(fields[2]).relative_to(container_root)
-            destination.parent.mkdir(parents=True, exist_ok=True)
-            if source.is_dir():
-                shutil.copytree(source, destination)
-            else:
-                shutil.copy2(source, destination)
-
-        target = Path(raw) / "deepseek-runtime"
-        completed = subprocess.run(
-            [
-                sys.executable,
-                str(staging_root / "scripts" / "deepseek_runtime.py"),
-                "--install-container-carrier",
-                str(target),
-                "s390x",
-                "--json",
-            ],
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-
-        assert completed.returncode == 0, completed.stderr
-        assert completed.stderr == ""
-        payload = json.loads(completed.stdout)
-        assert payload["available"] is False
-        assert payload["error"] == "HARNESS_RUNTIME_INCOMPATIBLE"
-        assert target.with_suffix(".unavailable.json").is_file()
+    assert "/opt/super-coder/deepseek-bootstrap" not in dockerfile
+    assert "build_deepseek_carrier.py" not in dockerfile
+    assert "deepseek_carrier_worker.py" not in dockerfile
 
 
 def test_conversations_receive_distinct_private_roots_and_process_evidence() -> None:

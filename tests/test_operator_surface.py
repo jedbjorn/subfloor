@@ -123,6 +123,12 @@ class EnterPreAttachPrintTest(unittest.TestCase):
             "[ -n \"$SC_DOCKER_LOG\" ] && printf '%s\\n' \"$*\" > \"$SC_DOCKER_LOG\"\n"
             "exit 0\n",
         )
+        self._stub(
+            "xdg-open",
+            "#!/bin/sh\n"
+            "[ -n \"$SC_BROWSER_LOG\" ] && printf '%s\\n' \"$*\" > \"$SC_BROWSER_LOG\"\n"
+            "exit 0\n",
+        )
         # A python that runs everything except ports.py — the one seam whose
         # failure must not decide whether the operator gets a shell.
         self._stub("no-ports-python",
@@ -131,6 +137,14 @@ class EnterPreAttachPrintTest(unittest.TestCase):
                    "  *sandbox_devkit.py*) exit 0 ;;\n"
                    "esac\n"
                    f"exec {sys.executable} \"$@\"\n")
+        self._stub(
+            "deepseek-python",
+            "#!/bin/sh\ncase \"$*\" in\n"
+            "  *ports.py*deepseekport*) echo 8942; exit 0 ;;\n"
+            "  *sandbox_devkit.py*) exit 0 ;;\n"
+            "esac\n"
+            f"exec {sys.executable} \"$@\"\n",
+        )
 
     def _stub(self, name: str, body: str) -> Path:
         path = self.bin / name
@@ -159,6 +173,34 @@ class EnterPreAttachPrintTest(unittest.TestCase):
                 self.assertEqual(out.returncode, 0, out.stderr)
                 self.assertIn(target, log.read_text())
                 self.assertNotIn("interface", log.read_text().lower())
+
+    def test_enter_deepseek_owns_host_browser_and_printed_url_fallback(self):
+        log = self.bin / "docker.log"
+        browser_log = self.bin / "browser.log"
+        out = sc(
+            "enter",
+            "deepseek",
+            "DEV4",
+            env=self._env(
+                SC_DOCKER_LOG=str(log),
+                SC_BROWSER_LOG=str(browser_log),
+                SC_PYTHON=str(self.bin / "deepseek-python"),
+            ),
+        )
+
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertIn(
+            "./sc boot DEV4 --harness deepseek --local-web",
+            log.read_text(),
+        )
+        expected = "http://127.0.0.1:8942"
+        self.assertIn(expected, out.stdout)
+        self.assertEqual(browser_log.read_text().strip(), expected)
+
+    def test_launch_publishes_deepseek_relay_to_host_loopback_only(self):
+        source = (ROOT / ".super-coder" / "scripts" / "dispatch.sh").read_text()
+        self.assertIn('-p "127.0.0.1:$dsp:$dsrp"', source)
+        self.assertIn('dsrp="$(deepseekrelayport)"', source)
 
     def test_an_underivable_url_never_costs_the_operator_their_shell(self):
         """`sc` runs under `set -e`, so an unguarded print is a new way for

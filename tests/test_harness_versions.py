@@ -19,7 +19,6 @@ sys.path.insert(0, str(ROOT / ".super-coder" / "api"))
 
 import harness_versions  # noqa: E402
 import model_catalog  # noqa: E402
-import deepseek_runtime  # noqa: E402
 
 
 STATUS = {
@@ -131,20 +130,9 @@ def test_spec_current_harness_versions_all_report_tested() -> None:
     }
 
 
-def test_deepseek_version_comes_from_the_isolated_carrier_probe() -> None:
-    status = deepseek_runtime.RuntimeStatus(
-        available=True,
-        enabled=True,
-        error=None,
-        detail=None,
-        carrier_python="/carrier/bin/python",
-        python_version="3.12.1",
-        sdk_version="0.1.0rc7",
-        runtime_version="0.1.0rc7",
-        composition_sha256="a" * 64,
-    )
+def test_deepseek_version_comes_from_the_official_dsh_probe() -> None:
     with mock.patch.object(
-        deepseek_runtime, "runtime_status", return_value=status
+        harness_versions, "probe", return_value="0.1.1-rc.2"
     ) as probe:
         result = harness_versions.compatibility_status(("deepseek",))
 
@@ -152,16 +140,40 @@ def test_deepseek_version_comes_from_the_isolated_carrier_probe() -> None:
         "deepseek": {
             "harness": "deepseek",
             **harness_versions.runtime_scope(),
-            "version": "0.1.0rc7",
-            "observed_version": "0.1.0rc7",
+            "version": "0.1.1-rc.2",
+            "observed_version": "0.1.1-rc.2",
             "compatibility": "verified",
-            "minimum_version": "0.1.0rc7",
-            "maximum_version_exclusive": "0.1.0rc8",
-            "verified_version": "0.1.0rc7",
+            "minimum_version": "0.1.1",
+            "maximum_version_exclusive": "0.1.2",
+            "verified_version": "0.1.1",
             "error": None,
         }
     }
-    probe.assert_called_once_with()
+    probe.assert_called_once_with("deepseek")
+
+
+def test_deepseek_probe_resolves_the_dsh_executable() -> None:
+    with (
+        mock.patch.object(
+            harness_versions.shutil, "which", return_value="/bin/dsh"
+        ) as which,
+        mock.patch.object(
+            harness_versions.subprocess,
+            "run",
+            return_value=SimpleNamespace(
+                returncode=0, stdout="0.1.1-rc.2\n", stderr=""
+            ),
+        ) as run,
+    ):
+        assert harness_versions.probe("deepseek") == "0.1.1-rc.2"
+
+    which.assert_called_once_with("dsh")
+    run.assert_called_once_with(
+        ["dsh", "--version"],
+        capture_output=True,
+        text=True,
+        timeout=harness_versions.TIMEOUT,
+    )
 
 
 def test_current_core_prerelease_is_best_effort_not_tested() -> None:

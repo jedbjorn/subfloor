@@ -184,6 +184,64 @@ class HarnessEpochDockerfile(unittest.TestCase):
             "durable Codex state stays mounted; isolate its executable",
         )
 
+    def test_deepseek_uses_the_selected_stock_distribution_and_profile_mount(self):
+        folded = self.folded()
+        dispatch = (ROOT / ".super-coder" / "scripts" / "dispatch.sh").read_text()
+
+        self.assertIn(
+            'npm install --global --prefix "$HOME/.local" '
+            '"@deepseek-ai/dsh@0.1.1-rc.2"',
+            folded,
+        )
+        self.assertNotIn("--install-container-carrier", folded)
+        self.assertIn('-v "$HOME/.dsh:$HOME/.dsh"', dispatch)
+
+
+class OfficialDeepSeekInstall(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        sys.path.insert(0, str(ENGINE / "scripts"))
+        import install as install_mod  # noqa: PLC0415
+
+        cls.install = install_mod
+
+    def test_logical_harness_maps_to_official_dsh_binary_and_exact_pin(self):
+        self.assertEqual(self.install.HARNESS_COMMAND["deepseek"], "dsh")
+        self.assertEqual(
+            self.install.HARNESS_BIN["deepseek"],
+            Path.home() / ".local" / "bin" / "dsh",
+        )
+        self.assertEqual(
+            self.install.HARNESS_INSTALL["deepseek"],
+            'npm install --global --prefix "$HOME/.local" '
+            '"@deepseek-ai/dsh@0.1.1-rc.2"',
+        )
+
+    def test_missing_npm_blocks_only_deepseek_install(self):
+        def available(command: str):
+            return None if command in {"npm", "dsh"} else f"/bin/{command}"
+
+        with (
+            mock.patch.object(self.install.shutil, "which", side_effect=available),
+            mock.patch.dict(
+                self.install.HARNESS_BIN,
+                {"deepseek": Path("/definitely/missing/dsh")},
+            ),
+        ):
+            status = self.install.ensure_harnesses()
+
+        self.assertEqual(status["deepseek"], "no-npm")
+        self.assertEqual(
+            {name: state for name, state in status.items() if name != "deepseek"},
+            {
+                "claude": "present",
+                "opencode": "present",
+                "codex": "present",
+                "vibe": "present",
+                "kimi": "present",
+            },
+        )
+
 
 class ScFixture:
     """A throwaway fork tree with a fake docker, enough to drive `sc`'s harness

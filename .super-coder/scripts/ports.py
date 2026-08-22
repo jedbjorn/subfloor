@@ -6,12 +6,13 @@ and several forks may run at once. So the port can't be hardcoded. Each fork
 derives a stable per-repo offset from its absolute path (sha1 % 100) and lands
 in a distinctive band well clear of the neighbors:
 
-    port = 8800 + offset     (away from superCC 8000 / dos-arch 8001, and the
-                              common host-app ports 3000 / 5173 / 8080)
+    port = 8800 + offset          (Subfloor API + review UI)
+    deepseek_port = 8900 + offset (official DeepSeek Web/Host)
 
 The substrate's own server (JSON API + static review UI) runs on `port`. A
-second `dev_port` is derived the same way for a *project* dev server (vite/etc)
-the shell starts inside the sandbox — `./sc launch` publishes both, and the
+second `dev_port` is derived in the 8800 band for a *project* dev server
+(vite/etc), while `deepseek_port` lives in its own 8900 band. `./sc launch`
+publishes all three on host loopback, and the
 shell binds its dev server to 0.0.0.0:dev_port so the host browser can reach it.
 Both are persisted to `.super-coder/instance.json` (gitignored — per-instance,
 local, like the `.db`) so they stay stable across restarts and can be
@@ -23,7 +24,8 @@ Usage:
     python3 .super-coder/scripts/ports.py show     # print resolved ports (JSON)
     python3 .super-coder/scripts/ports.py ensure    # resolve + persist instance.json
     python3 .super-coder/scripts/ports.py port      # bare serve port
-    python3 .super-coder/scripts/ports.py devport    # bare dev-server port
+    python3 .super-coder/scripts/ports.py devport   # bare dev-server port
+    python3 .super-coder/scripts/ports.py deepseekport
 """
 from __future__ import annotations
 
@@ -38,7 +40,9 @@ REPO_ROOT = ENGINE.parent
 CONFIG = ENGINE / "instance.json"
 
 PORT_BASE = 8800
+DEEPSEEK_PORT_BASE = 8900
 SPAN = 100  # offsets 0..99 → port 8800-8899
+DEEPSEEK_RELAY_OFFSET = 10_000
 
 
 def _offset(seed: str) -> int:
@@ -55,14 +59,16 @@ def _free(port: int) -> bool:
             return False
 
 
-def _resolve_offset(base: int, avoid: set[int]) -> int:
+def _resolve_offset(
+    base: int, avoid: set[int], *, port_base: int = PORT_BASE
+) -> int:
     """Walk forward from a base offset to the first free port not in `avoid`."""
     for i in range(SPAN):
-        port = PORT_BASE + (base + i) % SPAN
+        port = port_base + (base + i) % SPAN
         if port not in avoid and _free(port):
             return port
     raise RuntimeError(
-        f"no free super-coder port in {PORT_BASE}-{PORT_BASE + SPAN - 1}"
+        f"no free super-coder port in {port_base}-{port_base + SPAN - 1}"
     )
 
 
@@ -95,7 +101,7 @@ def _sibling_ports() -> set[int]:
             sibling = json.loads(candidate.read_text())
         except (OSError, json.JSONDecodeError):
             continue
-        for key in ("port", "dev_port"):
+        for key in ("port", "dev_port", "deepseek_port"):
             value = sibling.get(key)
             if isinstance(value, int):
                 occupied.add(value)
@@ -107,8 +113,19 @@ def _derive(avoid: set[int] | None = None) -> dict:
     occupied port so it lands free, and dev_port is kept distinct from port."""
     occupied = set(avoid or ())
     port = _resolve_offset(_offset(str(REPO_ROOT)), avoid=occupied)
-    return {"repo": REPO_ROOT.name, "port": port,
-            "dev_port": _dev_offset(port, occupied), "harness": "claude"}
+    dev_port = _dev_offset(port, occupied)
+    deepseek_port = _resolve_offset(
+        _offset(str(REPO_ROOT) + ":deepseek"),
+        occupied | {port, dev_port},
+        port_base=DEEPSEEK_PORT_BASE,
+    )
+    return {
+        "repo": REPO_ROOT.name,
+        "port": port,
+        "dev_port": dev_port,
+        "deepseek_port": deepseek_port,
+        "harness": "claude",
+    }
 
 
 def resolve(persist: bool = False) -> dict:
@@ -146,6 +163,13 @@ def resolve(persist: bool = False) -> dict:
         # Instance predates dev_port — backfill without disturbing the serve port
         # (respects hand-edits to `port`); persisted below if requested.
         cfg["dev_port"] = _dev_offset(cfg["port"], occupied)
+    deepseek_port = cfg.get("deepseek_port")
+    if not isinstance(deepseek_port, int) or deepseek_port in occupied:
+        cfg["deepseek_port"] = _resolve_offset(
+            _offset(str(REPO_ROOT) + ":deepseek"),
+            occupied | {cfg["port"], cfg["dev_port"]},
+            port_base=DEEPSEEK_PORT_BASE,
+        )
     if persist:
         CONFIG.write_text(json.dumps(cfg, indent=2) + "\n")
     return cfg
@@ -167,10 +191,17 @@ def main(argv: list[str]) -> int:
         print(resolve(persist=False)["port"])
     elif mode == "devport":       # bare dev-server port, for shell/sc use
         print(resolve(persist=False)["dev_port"])
+    elif mode == "deepseekport":
+        print(resolve(persist=False)["deepseek_port"])
+    elif mode == "deepseekrelayport":
+        print(resolve(persist=False)["deepseek_port"] + DEEPSEEK_RELAY_OFFSET)
     elif mode == "name":          # pm2 process name — unique per fork
         print("sc-" + resolve(persist=False).get("repo", "fork"))
     else:
-        sys.exit("usage: ports.py [show|ensure|port|devport|name]")
+        sys.exit(
+            "usage: ports.py "
+            "[show|ensure|port|devport|deepseekport|deepseekrelayport|name]"
+        )
     return 0
 
 
