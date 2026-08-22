@@ -1464,7 +1464,13 @@ case "$cmd" in
       *) echo "sc build: unknown argument '$1' (usage: ./sc build [--harnesses])" >&2; exit 2 ;;
     esac
     dbuild ;;
-  logs)         exec docker logs -f "$CNAME" ;;
+  logs)
+    if sc_help_form "$@"; then
+      echo "usage: ./sc logs"
+      echo "  Tail the managed server logs until interrupted."
+      exit 0
+    fi
+    exec docker logs -f "$CNAME" ;;
   verify)
     sc_refuse_linked verify "$DB"
     # Destructive by design: rebuild.py REPLACES the DB below. Say which DB and

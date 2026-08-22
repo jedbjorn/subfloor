@@ -229,6 +229,32 @@ class EnterPreAttachPrintTest(unittest.TestCase):
 class HelpChartTest(unittest.TestCase):
     """A live verb absent from the chart is a verb its operator cannot find."""
 
+    def test_logs_help_does_not_select_the_docker_runtime(self):
+        with tempfile.TemporaryDirectory() as directory:
+            bin_dir = Path(directory)
+            marker = bin_dir / "docker-ran"
+            docker = bin_dir / "docker"
+            docker.write_text(
+                "#!/bin/sh\n"
+                f"touch {marker}\n"
+                "exit 99\n"
+            )
+            docker.chmod(docker.stat().st_mode | stat.S_IEXEC)
+
+            out = sc(
+                "logs",
+                "--help",
+                env={"PATH": f"{bin_dir}:{os.environ['PATH']}"},
+            )
+
+            self.assertEqual(out.returncode, 0, out.stderr)
+            self.assertEqual(
+                out.stdout,
+                "usage: ./sc logs\n"
+                "  Tail the managed server logs until interrupted.\n",
+            )
+            self.assertFalse(marker.exists())
+
     def test_update_help_matches_ff_only_runtime_contract(self):
         help_text = sc("help").stdout
         update_block = help_text.split("./sc update", 1)[1].split(
