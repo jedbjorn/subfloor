@@ -18,7 +18,7 @@ from .base import (
 )
 from .claude import ClaudeAdapter
 from .codex import CodexAdapter, JsonLineRpcProcess, RpcTransport
-from .deepseek import DeepSeekAdapter, DeepSeekCarrierProcess, DeepSeekTransport
+from .deepseek import DeepSeekAdapter, DeepSeekHostClient, DeepSeekTransport
 from .kimi import KimiAdapter
 from .opencode import OpenCodeAdapter
 
@@ -28,6 +28,7 @@ ADAPTER_TYPES = {
     "claude": ClaudeAdapter,
     "codex": CodexAdapter,
     "kimi": KimiAdapter,
+    "deepseek": DeepSeekAdapter,
 }
 
 
@@ -51,7 +52,7 @@ __all__ = [
     "ConversationAdapter",
     "ConversationContext",
     "DeepSeekAdapter",
-    "DeepSeekCarrierProcess",
+    "DeepSeekHostClient",
     "DeepSeekTransport",
     "InterruptResult",
     "JsonLineRpcProcess",

@@ -103,39 +103,32 @@ def unsupported_deepseek_binding() -> dict:
         "contract_version": 2,
         "control_state": "controlled",
         "harness": "deepseek",
-        "requested_model": "deepseek-v4-pro",
+        "requested_model": "deepseek-official/deepseek-v4-pro",
         "provider_model": "deepseek-v4-pro",
         "requested_effort": "medium",
         "effective_effort": "medium",
         "native_variant_id": None,
-        "transport": "deepseek-provider-options-v1",
+        "transport": "deepseek-stock-host-v1",
         "catalogue_generation": "a" * 32,
         "evidence_digest": "b" * 64,
         "selector_binding": {
-            "kind": "authenticated-provider-model",
-            "selector": "deepseek-v4-pro",
+            "kind": "official-host-configured-model",
+            "selector": "deepseek-official/deepseek-v4-pro",
         },
         "adapter_metadata": {
             "provider_route": "deepseek-official",
-            "provider_adapter_id": "deepseek-native-v1",
-            "provider_adapter_digest": "1" * 64,
-            "provider_registry_sha256": "2" * 64,
-            "credential_kind": "deepseek-api-key",
             "endpoint_identity": "https://api.deepseek.com",
-            "discovery_evidence_digest": "3" * 64,
-            "transport_contract": "deepseek-provider-options-v1",
-            "wire_evidence_digest": "c" * 64,
-            "runtime_version": "0.1.0rc7",
-            "source_commit": "b" * 40,
-            "patch_sha256": "4" * 64,
-            "composition_sha256": "5" * 64,
-            "provider_options": {
-                "omit": [],
-                "set": {
-                    "thinking": {"type": "enabled"},
-                    "reasoning_effort": "medium",
-                },
+            "credential_ref": "DEEPSEEK_API_KEY",
+            "credential_status": {
+                "configured": True,
+                "source": "environment",
+                "writable": False,
             },
+            "configuration_digest": "3" * 64,
+            "transport_contract": "deepseek-stock-host-v1",
+            "reasoning_effort": "high",
+            "runtime_version": "0.1.1-rc.2",
+            "source_commit": "b" * 40,
         },
     }
 
@@ -169,13 +162,13 @@ def test_bound_headless_route_uses_exact_controlled_native_variant() -> None:
     assert route.effort == binding["native_variant_id"] == "high"
 
 
-def test_bound_headless_route_rejects_unsupported_deepseek_effort() -> None:
+def test_bound_headless_route_rejects_mismatched_deepseek_host_effort() -> None:
     binding = unsupported_deepseek_binding()
 
     with pytest.raises(route_bindings.RouteResolutionError) as refused:
         run_mod.resolve_bound_headless_route(
             harness="deepseek",
-            model="deepseek-v4-pro",
+            model="deepseek-official/deepseek-v4-pro",
             effort="medium",
             binding=binding,
             binding_digest=route_bindings.digest_json(binding),
@@ -183,21 +176,25 @@ def test_bound_headless_route_rejects_unsupported_deepseek_effort() -> None:
 
     assert refused.value.code == "thinking_evidence_missing"
     assert refused.value.details == {
-        "reason": "DeepSeek effort is outside the carrier contract"
+        "reason": "DeepSeek Host effort must equal the immutable request"
     }
 
 
-def test_pending_deepseek_host_adapter_does_not_enable_cli_headless() -> None:
+def test_deepseek_public_one_shot_and_managed_browser_use_distinct_entrypoints() -> None:
     adapter = run_mod.load_adapter("deepseek")
 
-    assert run_mod.headless_command(adapter, "prompt") is None
-    assert run_mod.headless_command(
-        adapter, "prompt", conversation_owned=True
-    ) is None
-    assert adapter["surfaces"]["one_shot"] is False
+    command = run_mod.headless_command(
+        adapter, "prompt", model="acme/model", effort="high"
+    )
+    assert command[-5:] == [
+        "--selector", "acme/model", "--effort", "high", "prompt"
+    ]
+    assert command[1].endswith("deepseek_one_shot.py")
+    assert run_mod.headless_command(adapter, "prompt", conversation_owned=True) == []
+    assert adapter["surfaces"]["one_shot"] is True
 
 
-def test_pending_deepseek_host_adapter_refuses_browser_launch_before_cli_probe(
+def test_deepseek_managed_browser_launch_does_not_probe_cli(
     launch_case, monkeypatch
 ) -> None:
     db_path, worktree = launch_case
@@ -228,7 +225,7 @@ def test_pending_deepseek_host_adapter_refuses_browser_launch_before_cli_probe(
     )
     monkeypatch.setattr(run_mod, "cleanup_before_launch", lambda *_a, **_k: None)
     monkeypatch.setattr(run_mod, "open_session", lambda *_a, **_k: ("0001", 42))
-    monkeypatch.setattr(run_mod.ports_mod, "resolve", lambda: {})
+    monkeypatch.setattr(run_mod.ports_mod, "resolve", lambda **_kwargs: {})
     monkeypatch.setattr(run_mod, "shell_work_dir", lambda *_: worktree)
     monkeypatch.setattr(run_mod, "ensure_worktree", lambda *_: None)
     monkeypatch.setattr(run_mod, "sync_worktree", lambda *_: None)
@@ -247,23 +244,20 @@ def test_pending_deepseek_host_adapter_refuses_browser_launch_before_cli_probe(
     monkeypatch.setattr(run_mod, "apply_sandbox", lambda *_: None)
     monkeypatch.setattr(run_mod, "_cli_version", reject_cli_probe)
 
-    with pytest.raises(
-        run_mod.LaunchError,
-        match="harness 'deepseek' has no headless adapter",
-    ):
-        run_mod.prepare_launch(
-            shell_id=1,
-            harness="deepseek",
-            model="ollama-cloud/deepseek-v4-pro:0813",
-            effort="high",
-            headless_prompt="Do the work",
-            conversation_owned=True,
-            current_leased_run_id=7,
-            boot=BootDirective(
-                conversation_id="cv_" + "a" * 32,
-                phase="start",
-            ),
-        )
+    prepared = run_mod.prepare_launch(
+        shell_id=1,
+        harness="deepseek",
+        model="ollama-cloud/deepseek-v4-pro:0813",
+        effort="high",
+        headless_prompt="Do the work",
+        conversation_owned=True,
+        current_leased_run_id=7,
+        boot=BootDirective(
+            conversation_id="cv_" + "a" * 32,
+            phase="start",
+        ),
+    )
+    assert prepared.argv == []
 
 
 @pytest.fixture

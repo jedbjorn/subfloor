@@ -50,15 +50,15 @@ class HarnessSurfaceProjectionTest(unittest.TestCase):
             "shipped": True,
             "installed": True,
             "enabled": True,
-            "healthy": False,
+            "healthy": True,
             "compatibility": "declared",
             "surfaces": {
                 "terminal": False,
-                "one_shot": False,
-                "browser": False,
+                "one_shot": True,
+                "browser": True,
                 "sprint": False,
             },
-            "unavailable_reason": "HARNESS_SURFACE_UNPROVEN",
+            "unavailable_reason": None,
         })
         self.assertIn("dsh", commands)
         self.assertNotIn("deepseek-harness", commands)

@@ -10,8 +10,8 @@ of this is load-bearing — a source that fails just thins the suggestions:
      newest-first sorting.
   2. Provider list-models APIs — only when the matching env key is present.
      Harness logins are OAuth, not API keys, so these are usually absent.
-  3. DeepSeek's authenticated list-models API — exact ids only, paired with
-     the pinned runtime's documented provider-option contract.
+  3. DeepSeek's stock loopback Host API — configured providers/models plus
+     value-free credential readiness, bound to the pinned official runtime.
   4. OpenCode's loopback `/provider` projection — only providers OpenCode
      reports as connected, with exactly the models each connected provider
      exposes. This live overlay is refreshed on every served catalog.
@@ -38,8 +38,6 @@ import re
 import shutil
 import sqlite3
 import subprocess
-import urllib.error
-import urllib.parse
 import urllib.request
 import uuid
 from contextlib import contextmanager
@@ -49,6 +47,7 @@ from pathlib import Path
 import harness_versions
 import route_bindings
 import toml_compat
+import deepseek_host
 from conversation_adapters.opencode import (
     connected_models as opencode_connected_models,
 )
@@ -97,37 +96,10 @@ PROVIDER_APIS = {
              lambda k: {"Authorization": f"Bearer {k}"}),
 }
 
-DEEPSEEK_SOURCE = "deepseek-provider-api"
-OLLAMA_CLOUD_SOURCE = "ollama-cloud-provider-api"
-DEEPSEEK_DISCOVERY_ERROR = "authenticated DeepSeek model discovery failed"
-DEEPSEEK_AUTHENTICATION_ERROR = "authenticated DeepSeek credential was rejected"
-DEEPSEEK_EXACT_MODEL_ABSENT = "authenticated DeepSeek exact model is absent"
-DEEPSEEK_DISCOVERY_EVIDENCE_INVALID = (
-    "authenticated DeepSeek model evidence is malformed or duplicated"
-)
-DEEPSEEK_PROVIDER_REGISTRY_INVALID = "DeepSeek provider registry is unavailable"
-DEEPSEEK_PROVIDER_OPTIONS_UNVERIFIED = (
-    "DeepSeek provider-option mapper has no outbound wire proof"
-)
-DEEPSEEK_DISCOVERY_LIMIT_ERROR = (
-    "authenticated DeepSeek model response exceeds safety limits"
-)
-DEEPSEEK_MODEL_ID_MAX_CHARS = 256
-
-
-class _DeepSeekWireProofError(RuntimeError):
-    pass
-
-
-class _DeepSeekExactModelAbsentError(RuntimeError):
-    pass
+DEEPSEEK_SOURCE = "deepseek-host-api"
 
 
 class _ModelCatalogueLimitError(ValueError):
-    pass
-
-
-class _DeepSeekDiscoveryEvidenceError(ValueError):
     pass
 
 
@@ -235,352 +207,55 @@ def _from_provider_apis(fetch, env) -> dict[str, list[dict]]:
     return out
 
 
-def _deepseek_provider_registry() -> tuple[dict, dict, str]:
-    import deepseek_runtime  # noqa: PLC0415
-
-    manifest = deepseek_runtime.load_runtime_manifest()
-    registry_evidence = manifest["provider_adapters"]
-    registry = deepseek_runtime.load_provider_adapter_registry(
-        expected_sha256=registry_evidence["sha256"]
-    )
-    return manifest, registry["providers"], registry_evidence["sha256"]
-
-
-def _deepseek_provider_endpoint(provider: str, adapter: dict, env) -> tuple[str, str]:
-    base = adapter["endpoint_default"]
-    endpoint_env = adapter.get("endpoint_env")
-    if endpoint_env and env.get(endpoint_env):
-        base = env[endpoint_env]
-    parsed = urllib.parse.urlsplit(base)
-    if (
-        parsed.scheme not in {"http", "https"}
-        or not parsed.netloc
-        or parsed.username is not None
-        or parsed.password is not None
-        or parsed.query
-        or parsed.fragment
-    ):
-        raise ValueError(f"{provider} base URL must be credential-free HTTP(S)")
-    identity = base.rstrip("/")
-    return identity, identity + adapter["discovery_path"]
-
-
-def _deepseek_carrier_options(provider: str = "deepseek-official") -> dict[str, dict[str, str]]:
-    _manifest, providers, _registry_digest = _deepseek_provider_registry()
-    adapter = providers.get(provider)
-    if not isinstance(adapter, dict):
-        raise ValueError("DeepSeek provider route is not reviewed")
-    named = adapter["named_efforts"]
-    thinking = "enabled" if adapter["wire_mode"] == "deepseek-request-patch" else "omit"
-    return {
-        route_bindings.DEFAULT_EFFORT: {
-            "thinking": "omit", "reasoningEffort": "omit",
-        },
-        **{
-            effort: {"thinking": thinking, "reasoningEffort": effort}
-            for effort in named
-        },
-    }
-
-
-def _deepseek_provider_metadata(
-    provider: str,
-    model: str,
-    endpoint_identity: str,
-    discovery_evidence_digest: str,
-    proof: dict,
-) -> dict:
-    import deepseek_runtime  # noqa: PLC0415
-
-    manifest, providers, registry_digest = _deepseek_provider_registry()
-    adapter = providers[provider]
-    expected_runtime = (manifest.get("runtime") or {}).get("version")
-    expected_source = (manifest.get("source") or {}).get("commit")
-    expected_patch = (manifest.get("patch") or {}).get("sha256")
-    expected_composition = adapter.get("composition_sha256")
-    adapter_digest = route_bindings.digest_json(adapter)
-    if (
-        not isinstance(proof, dict)
-        or proof.get("contract") != deepseek_runtime.PROVIDER_WIRE_CONTRACT
-        or proof.get("provider") != provider
-        or proof.get("model") != model
-        or not isinstance(proof.get("proofs"), dict)
-    ):
-        raise _DeepSeekWireProofError(DEEPSEEK_PROVIDER_OPTIONS_UNVERIFIED)
-    carrier_options = _deepseek_carrier_options(provider)
-    wire_proofs = proof["proofs"]
-    mappings = {}
-    digests = {}
-    for effort, expected_options in carrier_options.items():
-        if effort == route_bindings.DEFAULT_EFFORT:
-            mapping = {
-                "omit": list(route_bindings.DEEPSEEK_OVERRIDE_FIELDS), "set": {},
-            }
-            expected_wire = {}
-        elif adapter["wire_mode"] == "deepseek-request-patch":
-            mapping = {
-                "omit": [],
-                "set": {
-                    "thinking": {"type": "enabled"},
-                    "reasoning_effort": effort,
-                },
-            }
-            expected_wire = dict(mapping["set"])
-        else:
-            mapping = {
-                "omit": ["thinking"],
-                "set": {"reasoning_effort": effort},
-            }
-            expected_wire = dict(mapping["set"])
-        mappings[effort] = mapping
-        item = wire_proofs.get(effort)
-        expected_native = {
-            "event_type": "provider.request",
-            "provider": provider,
-            "model": model,
-            "reasoning_effort": (
-                None if effort == route_bindings.DEFAULT_EFFORT else effort
-            ),
-            "purpose": "conversation",
-        }
-        expected_purpose_proofs = {
-            purpose: {
-                "wire_options": expected_wire,
-                "native_request": {
-                    **expected_native,
-                    "purpose": purpose,
-                },
-            }
-            for purpose in deepseek_runtime.PROVIDER_WIRE_PURPOSES
-        }
-        digest_payload = {
-            key: item.get(key) if isinstance(item, dict) else None
-            for key in (
-                "contract", "provider", "model", "effort", "provider_options",
-                "wire_options", "native_request", "purpose_proofs",
-                "runtime_version", "source_commit",
-                "patch_sha256", "composition_sha256", "provider_registry_sha256",
-                "provider_adapter_id", "provider_adapter_digest",
-            )
-        }
-        if (
-            not isinstance(item, dict)
-            or item.get("contract") != deepseek_runtime.PROVIDER_WIRE_CONTRACT
-            or item.get("provider") != provider
-            or item.get("model") != model
-            or item.get("effort") != effort
-            or item.get("provider_options") != expected_options
-            or item.get("wire_options") != expected_wire
-            or item.get("native_request") != expected_native
-            or item.get("purpose_proofs") != expected_purpose_proofs
-            or item.get("runtime_version") != expected_runtime
-            or item.get("source_commit") != expected_source
-            or item.get("patch_sha256") != expected_patch
-            or item.get("composition_sha256") != expected_composition
-            or item.get("provider_registry_sha256") != registry_digest
-            or item.get("provider_adapter_id") != adapter["adapter_id"]
-            or item.get("provider_adapter_digest") != adapter_digest
-            or not isinstance(item.get("digest"), str)
-            or re.fullmatch(r"[0-9a-f]{64}", item["digest"]) is None
-            or item["digest"] != route_bindings.digest_json(digest_payload)
-        ):
-            raise _DeepSeekWireProofError(DEEPSEEK_PROVIDER_OPTIONS_UNVERIFIED)
-        digests[effort] = item["digest"]
-    return {
-        "provider_route": provider,
-        "provider_adapter_id": adapter["adapter_id"],
-        "provider_adapter_digest": adapter_digest,
-        "provider_registry_sha256": registry_digest,
-        "credential_kind": adapter["credential_kind"],
-        "endpoint_identity": endpoint_identity,
-        "discovery_evidence_digest": discovery_evidence_digest,
-        "transport_contract": route_bindings.DEEPSEEK_TRANSPORT_CONTRACT,
-        "provider_options_by_effort": mappings,
-        "wire_contract": deepseek_runtime.PROVIDER_WIRE_CONTRACT,
-        "wire_evidence_by_effort": digests,
-        "runtime_version": expected_runtime,
-        "source_commit": expected_source,
-        "patch_sha256": expected_patch,
-        "composition_sha256": expected_composition,
-    }
-
-
-def _deepseek_manifest_identity() -> tuple[str, str]:
-    import deepseek_runtime  # noqa: PLC0415
-
-    manifest = deepseek_runtime.load_runtime_manifest()
-    sdk = manifest.get("sdk") or {}
-    runtime = manifest.get("runtime") or {}
-    if sdk.get("version") != runtime.get("version"):
-        raise ValueError("DeepSeek SDK/runtime versions are not aligned")
-    version = sdk.get("version")
-    if not isinstance(version, str) or not version.strip():
-        raise ValueError("DeepSeek runtime has no exact version")
-    commit = (manifest.get("source") or {}).get("commit")
-    if (
-        not isinstance(commit, str)
-        or not re.fullmatch(r"[0-9a-f]{40}", commit)
-    ):
-        raise ValueError("DeepSeek runtime has no exact upstream commit")
-    return version, commit
-
-
-def _from_deepseek_provider(
-    provider: str,
-    fetch,
-    env,
-    wire_probe=None,
+def _from_deepseek_host(
+    client=None,
     *,
-    selector=None,
-    discovery_out=None,
+    selector: str | None = None,
+    discovery_out: dict | None = None,
 ) -> list[dict]:
-    """Read exact models through one reviewed provider-specific credential."""
-    _manifest, providers, registry_digest = _deepseek_provider_registry()
-    adapter = providers.get(provider)
-    if not isinstance(adapter, dict):
-        raise ValueError("DeepSeek provider route is not reviewed")
-    key = env.get(adapter["credential_source_env"])
-    if not isinstance(key, str) or not key.strip():
-        return []
-    endpoint_identity, url = _deepseek_provider_endpoint(provider, adapter, env)
-    payload = fetch(url, {"Authorization": f"Bearer {key}"})
-    rows = payload.get("data") if isinstance(payload, dict) else None
-    if not isinstance(rows, list):
-        raise ValueError("DeepSeek model response has no data list")
-    if len(rows) > adapter["max_models"]:
-        raise _ModelCatalogueLimitError(DEEPSEEK_DISCOVERY_LIMIT_ERROR)
-    version, source_commit = _deepseek_manifest_identity()
-    if wire_probe is None:
-        import deepseek_runtime  # noqa: PLC0415
-
-        wire_probe = deepseek_runtime.provider_wire_evidence
+    """Project exact configured routes through the stock official Host API."""
+    client = deepseek_host.DeepSeekHostClient() if client is None else client
+    routes = deepseek_host.configured_routes(client, selector=selector)
     entries = []
-    seen = set()
-    exact_rows = []
-    for row in rows:
-        if not isinstance(row, dict):
-            raise _DeepSeekDiscoveryEvidenceError(
-                DEEPSEEK_DISCOVERY_EVIDENCE_INVALID
-            )
-        model = row.get("id")
-        if not isinstance(model, str) or not model or model != model.strip():
-            raise _DeepSeekDiscoveryEvidenceError(
-                DEEPSEEK_DISCOVERY_EVIDENCE_INVALID
-            )
-        if model in seen:
-            raise _DeepSeekDiscoveryEvidenceError(
-                DEEPSEEK_DISCOVERY_EVIDENCE_INVALID
-            )
-        if len(model) > DEEPSEEK_MODEL_ID_MAX_CHARS:
-            raise _ModelCatalogueLimitError(DEEPSEEK_DISCOVERY_LIMIT_ERROR)
-        seen.add(model)
-        exact_rows.append((row, model))
-    discovery_evidence_digest = route_bindings.digest_json({
-        "provider": provider,
-        "endpoint_identity": endpoint_identity,
-        "models": sorted(model for _row, model in exact_rows),
-        "provider_registry_sha256": registry_digest,
-    })
+    selectors = [route.selector for route in routes]
     if discovery_out is not None:
         discovery_out.update({
-            "provider": provider,
-            "selectors": [
-                f"{provider}/{model}" if adapter["selector_prefix"] else model
-                for _row, model in exact_rows
-            ],
-            "discovery_evidence_digest": discovery_evidence_digest,
-            "attempted_selectors": [],
-            "proved_selectors": [],
+            "provider": "deepseek-host",
+            "selectors": selectors,
+            "attempted_selectors": selectors,
+            "proved_selectors": selectors,
         })
-    configured = adapter["model_selectors"]
-    if selector is not None:
-        exact_rows = [
-            (row, model)
-            for row, model in exact_rows
-            if (
-                f"{provider}/{model}" if adapter["selector_prefix"] else model
-            ) == selector
-        ]
-        if not exact_rows:
-            raise _DeepSeekExactModelAbsentError(DEEPSEEK_EXACT_MODEL_ABSENT)
-    elif configured:
-        configured_set = set(configured)
-        if not configured_set.issubset(seen):
-            raise _DeepSeekExactModelAbsentError(DEEPSEEK_EXACT_MODEL_ABSENT)
-        exact_rows = [
-            (row, model) for row, model in exact_rows if model in configured_set
-        ]
-    else:
-        if len(exact_rows) > adapter["wire_proof_budget"]:
-            exact_rows = sorted(exact_rows, key=lambda item: item[1])[
-                : adapter["wire_proof_budget"]
-            ]
-    if len(exact_rows) > adapter["wire_proof_budget"]:
-        raise _DeepSeekWireProofError(DEEPSEEK_PROVIDER_OPTIONS_UNVERIFIED)
-    if discovery_out is not None:
-        discovery_out["attempted_selectors"] = [
-            f"{provider}/{model}" if adapter["selector_prefix"] else model
-            for _row, model in exact_rows
-        ]
-    for row, model in exact_rows:
-        route_selector = f"{provider}/{model}" if adapter["selector_prefix"] else model
-        try:
-            proof = wire_probe(
-                provider, model, _deepseek_carrier_options(provider), env=env
-            )
-            metadata = _deepseek_provider_metadata(
-                provider, model, endpoint_identity, discovery_evidence_digest, proof
-            )
-        except Exception:  # noqa: BLE001 (proof diagnostics stay local/redacted)
-            continue
-        entries.append(_entry(
-            route_selector,
-            name=(row.get("name") if isinstance(row, dict) else None) or model,
-            source=(DEEPSEEK_SOURCE if provider == "deepseek-official" else OLLAMA_CLOUD_SOURCE),
-            availability="available",
-            provider=provider,
-            provider_model=model,
-            supported_efforts=list(adapter["named_efforts"]),
-            default_effort=("high" if "high" in adapter["named_efforts"] else None),
-            cli_version=version,
-            selector_binding={
-                "kind": "authenticated-provider-model",
-                "selector": route_selector,
-                "provider_model": model,
-                "provider_route": provider,
-                "provider_adapter_id": adapter["adapter_id"],
-                "provider_adapter_digest": metadata["provider_adapter_digest"],
-                "provider_registry_sha256": registry_digest,
-                "credential_kind": adapter["credential_kind"],
-                "endpoint_identity": endpoint_identity,
-                "discovery_evidence_digest": discovery_evidence_digest,
-                "models_url": url,
-                "runtime_source_commit": source_commit,
-                "provider_wire_contract": metadata["wire_contract"],
-                "provider_wire_digests": metadata["wire_evidence_by_effort"],
-            },
-            adapter_metadata=metadata,
-        ))
-        if discovery_out is not None:
-            discovery_out["proved_selectors"].append(route_selector)
-    if exact_rows and not entries:
-        selectors = {
-            f"{provider}/{item}" if adapter["selector_prefix"] else item
-            for _row, item in exact_rows
+    for route in routes:
+        efforts = list(route.reasoning_efforts)
+        metadata_by_effort = {
+            effort: route.binding_metadata(effort)
+            for effort in [route_bindings.DEFAULT_EFFORT, *efforts]
         }
-        if selector is not None and selector not in selectors:
-            raise ValueError("DeepSeek authenticated endpoint omitted exact model")
-        raise _DeepSeekWireProofError(DEEPSEEK_PROVIDER_OPTIONS_UNVERIFIED)
-    if not entries:
-        raise ValueError("DeepSeek authenticated endpoint returned no exact models")
+        entries.append(_entry(
+            route.selector,
+            name=route.name,
+            source=DEEPSEEK_SOURCE,
+            availability="available",
+            provider=route.provider,
+            provider_model=route.model,
+            supported_efforts=efforts,
+            default_effort=route.default_effort,
+            cli_version=route.runtime_version,
+            selector_binding={
+                "kind": "official-host-configured-model",
+                "selector": route.selector,
+                "provider_model": route.model,
+                "provider_route": route.provider,
+                "endpoint_identity": route.endpoint_identity,
+                "credential_ref": route.credential_ref,
+                "configuration_digest": route.configuration_digest,
+                "runtime_source_commit": route.source_commit,
+            },
+            adapter_metadata={
+                "route_metadata_by_effort": metadata_by_effort,
+            },
+        ))
     return entries
-
-
-def _from_deepseek_api(fetch, env, wire_probe=None, *, selector=None) -> list[dict]:
-    """Compatibility wrapper for the retained DeepSeek-official route."""
-    return _from_deepseek_provider(
-        "deepseek-official", fetch, env, wire_probe=wire_probe, selector=selector
-    )
 
 
 def _cli_version(binary: str, run) -> str | None:
@@ -684,8 +359,7 @@ def build(
     fetch=_http_json,
     env=os.environ,
     run=subprocess.run,
-    deepseek_wire_probe=None,
-    deepseek_selector=None,
+    deepseek_client=None,
 ) -> dict:
     """One live sweep across all sources. Raises only if EVERY source fails —
     partial results (e.g. models.dev down but a keyed API up) still count."""
@@ -702,80 +376,17 @@ def build(
         harnesses[harness] = _merge(harnesses.get(harness, []), extra)
         sources.append(f"{HARNESS_PROVIDER[harness]}-api")
     deepseek = []
-    authenticated_deepseek_routes = []
-    attempted_providers = []
-    provider_errors = []
     try:
-        _manifest, deepseek_providers, _registry_digest = _deepseek_provider_registry()
-    except Exception:  # noqa: BLE001 (DeepSeek failure remains route-local)
-        deepseek_providers = {}
-        harnesses.setdefault("deepseek", [])
-        harness_errors["deepseek"] = DEEPSEEK_PROVIDER_REGISTRY_INVALID
-        errors.append(
-            f"deepseek-provider-registry: {DEEPSEEK_PROVIDER_REGISTRY_INVALID}"
+        deepseek = _from_deepseek_host(
+            deepseek_client,
         )
-    for provider, adapter in deepseek_providers.items():
-        if not env.get(adapter["credential_source_env"]):
-            continue
-        attempted_providers.append(provider)
-        source = DEEPSEEK_SOURCE if provider == "deepseek-official" else OLLAMA_CLOUD_SOURCE
-        selected_for_provider = (
-            deepseek_selector
-            if (
-                (
-                    provider == "ollama-cloud"
-                    and str(deepseek_selector).startswith("ollama-cloud/")
-                )
-                or (
-                    provider == "deepseek-official"
-                    and deepseek_selector is not None
-                    and not str(deepseek_selector).startswith("ollama-cloud/")
-                )
-            )
-            else None
-        )
-        discovery = {}
-        try:
-            observed = _from_deepseek_provider(
-                provider,
-                fetch,
-                env,
-                wire_probe=deepseek_wire_probe,
-                selector=selected_for_provider,
-                discovery_out=discovery,
-            )
-        except _ModelCatalogueLimitError:
-            provider_errors.append((source, DEEPSEEK_DISCOVERY_LIMIT_ERROR))
-            continue
-        except _DeepSeekDiscoveryEvidenceError:
-            provider_errors.append((source, DEEPSEEK_DISCOVERY_EVIDENCE_INVALID))
-            continue
-        except _DeepSeekExactModelAbsentError:
-            provider_errors.append((source, DEEPSEEK_EXACT_MODEL_ABSENT))
-            continue
-        except _DeepSeekWireProofError:
-            provider_errors.append((source, DEEPSEEK_PROVIDER_OPTIONS_UNVERIFIED))
-            continue
-        except urllib.error.HTTPError as exc:
-            stable_error = (
-                DEEPSEEK_AUTHENTICATION_ERROR
-                if exc.code in {401, 403}
-                else DEEPSEEK_DISCOVERY_ERROR
-            )
-            provider_errors.append((source, stable_error))
-            continue
-        except Exception:  # noqa: BLE001 (secret-bearing discovery is redacted)
-            provider_errors.append((source, DEEPSEEK_DISCOVERY_ERROR))
-            continue
-        deepseek = _merge(deepseek, observed)
-        authenticated_deepseek_routes.append(discovery)
-        if observed:
-            sources.append(source)
-    if attempted_providers:
         harnesses["deepseek"] = deepseek
-        errors.extend(f"{source}: {error}" for source, error in provider_errors)
-        if provider_errors and not deepseek:
-            harness_errors["deepseek"] = provider_errors[-1][1]
+        if deepseek:
+            sources.append(DEEPSEEK_SOURCE)
+    except Exception:  # noqa: BLE001 (official Host errors stay redacted)
+        harnesses.setdefault("deepseek", [])
+        harness_errors["deepseek"] = "official DeepSeek Host configuration unavailable"
+        errors.append("deepseek-host-api: official DeepSeek Host configuration unavailable")
     local = {
         "claude": _from_claude_cli(run),
         "codex": _from_codex_cache(env, run),
@@ -798,10 +409,6 @@ def build(
                               **({"error": harness_errors[h]}
                                  if h in harness_errors else {})}
                           for h, entries in harnesses.items()}}
-    if "deepseek" in result["harnesses"]:
-        result["harnesses"]["deepseek"][
-            "authenticated_routes"
-        ] = authenticated_deepseek_routes
     return result
 
 
@@ -929,30 +536,40 @@ def _headless_supported(harness: str) -> bool:
         cfg = json.loads((ADAPTERS / harness / "adapter.json").read_text())
     except Exception:  # noqa: BLE001
         return False
-    return bool((cfg.get("headless") or {}).get("launch"))
+    headless = cfg.get("headless") or {}
+    return bool(headless.get("launch") or headless.get("engine_script"))
 
 
 def harness_runtime_status(harness: str) -> dict:
     """Return exact version-bounded runtime evidence for one shipped harness."""
     if harness == "deepseek":
         try:
-            import deepseek_runtime  # noqa: PLC0415
-
-            status = deepseek_runtime.runtime_status()
-            manifest = deepseek_runtime.load_runtime_manifest()
-            verified = str((manifest.get("sdk") or {}).get("version") or "") or None
+            described = deepseek_host.DeepSeekHostClient().call("host.describe", {})
+            if not isinstance(described, dict):
+                raise ValueError("invalid Host descriptor")
+            manifest = json.loads(
+                (ADAPTERS / "deepseek" / "adapter.json").read_text()
+            )
+            verified = str(
+                (manifest.get("official_runtime") or {}).get("version") or ""
+            ) or None
             scope = harness_versions.runtime_scope()
-            version = status.sdk_version or status.runtime_version
+            version = described.get("version")
+            compatible = version == verified
             return {
                 "harness": harness,
                 **scope,
                 "version": version,
                 "observed_version": version,
-                "compatibility": "verified" if status.available else None,
-                "minimum_version": None,
-                "maximum_version_exclusive": None,
+                "compatibility": "verified" if compatible else None,
+                "minimum_version": verified,
+                "maximum_version_exclusive": (
+                    (manifest.get("conversation") or {}).get(
+                        "maximum_cli_version_exclusive"
+                    )
+                ),
                 "verified_version": verified,
-                "error": status.error,
+                "error": None if compatible else "HARNESS_VERSION_UNSUPPORTED",
             }
         except Exception:  # noqa: BLE001
             return {
@@ -987,8 +604,7 @@ def _evidence_kind(harness: str, source: str) -> str | None:
     return {
         ("claude", "claude-cli"): "claude-portable-manifest",
         ("codex", "codex-cache"): "codex-model-cache",
-        ("deepseek", DEEPSEEK_SOURCE): "deepseek-provider-authenticated-models-v2",
-        ("deepseek", OLLAMA_CLOUD_SOURCE): "deepseek-provider-authenticated-models-v2",
+        ("deepseek", DEEPSEEK_SOURCE): "deepseek-host-config-v1",
         ("kimi", "kimi-config"): "kimi-alias-config",
         ("opencode", "opencode-provider-api"): "opencode-connected-variant",
     }.get((harness, source))
@@ -1015,11 +631,11 @@ def _observed_version(status: dict) -> str | None:
 def _support_state(status: dict) -> str | None:
     if status.get("error") or not _observed_version(status):
         return None
-    return "tested" if (
-        status.get("version")
-        and status.get("version") == status.get("verified_version")
-        and status.get("compatibility") == "verified"
-    ) else "best-effort"
+    return (
+        "tested"
+        if status.get("compatibility") == "verified"
+        else "best-effort"
+    )
 
 
 def _compatible_route_status(harness: str, entry: dict,
@@ -1079,29 +695,10 @@ def _entry_evidence(harness: str, entry: dict,
     def binding_adapter_metadata(effort: str) -> dict:
         if harness == "deepseek":
             mappings = catalogue_adapter_metadata.get(
-                "provider_options_by_effort"
+                "route_metadata_by_effort"
             ) or {}
-            wire_digests = catalogue_adapter_metadata.get(
-                "wire_evidence_by_effort"
-            ) or {}
-            return {
-                "provider_route": catalogue_adapter_metadata.get("provider_route"),
-                "provider_adapter_id": catalogue_adapter_metadata.get("provider_adapter_id"),
-                "provider_adapter_digest": catalogue_adapter_metadata.get("provider_adapter_digest"),
-                "provider_registry_sha256": catalogue_adapter_metadata.get("provider_registry_sha256"),
-                "credential_kind": catalogue_adapter_metadata.get("credential_kind"),
-                "endpoint_identity": catalogue_adapter_metadata.get("endpoint_identity"),
-                "discovery_evidence_digest": catalogue_adapter_metadata.get("discovery_evidence_digest"),
-                "transport_contract": catalogue_adapter_metadata.get(
-                    "transport_contract"
-                ),
-                "provider_options": mappings.get(effort),
-                "wire_evidence_digest": wire_digests.get(effort),
-                "runtime_version": catalogue_adapter_metadata.get("runtime_version"),
-                "source_commit": catalogue_adapter_metadata.get("source_commit"),
-                "patch_sha256": catalogue_adapter_metadata.get("patch_sha256"),
-                "composition_sha256": catalogue_adapter_metadata.get("composition_sha256"),
-            }
+            value = mappings.get(effort)
+            return dict(value) if isinstance(value, dict) else {}
         if harness != "opencode" or not variants_by_effort:
             return catalogue_adapter_metadata
         return {
@@ -1249,48 +846,6 @@ def persist_routes(con, payload: dict, *, publication_locked: bool = False) -> N
     verification = payload.get("verification") or {}
     harness_statuses = verification.get("harnesses") or {}
     source_fingerprints: dict[str, str] = {}
-    carried_deepseek_routes: dict[str, str] = {}
-    deepseek_block = (payload.get("harnesses") or {}).get("deepseek") or {}
-    authenticated_routes = {
-        item.get("provider"): item
-        for item in deepseek_block.get("authenticated_routes") or []
-        if isinstance(item, dict)
-    }
-    attempted_deepseek_routes = {
-        selector
-        for item in authenticated_routes.values()
-        for selector in (item.get("attempted_selectors") or [])
-    }
-    proved_deepseek_routes = {
-        selector
-        for item in authenticated_routes.values()
-        for selector in (item.get("proved_selectors") or [])
-    }
-    failed_deepseek_routes = attempted_deepseek_routes - proved_deepseek_routes
-    if authenticated_routes and not failed:
-        for row in con.execute(
-            "SELECT selector,provider,selector_binding,source_fingerprint "
-            "FROM model_routes WHERE harness='deepseek' AND stale=0"
-        ).fetchall():
-            route = dict(row)
-            authenticated = authenticated_routes.get(route["provider"])
-            try:
-                binding = json.loads(route["selector_binding"])
-            except (TypeError, json.JSONDecodeError):
-                continue
-            if (
-                isinstance(authenticated, dict)
-                and route["selector"] in (authenticated.get("selectors") or [])
-                and route["selector"] not in attempted_deepseek_routes
-                and binding.get("discovery_evidence_digest")
-                == authenticated.get("discovery_evidence_digest")
-            ):
-                carried_deepseek_routes[route["selector"]] = route[
-                    "source_fingerprint"
-                ]
-                source_fingerprints[
-                    f"deepseek/{route['selector']}"
-                ] = route["source_fingerprint"]
     evidence_by_route: dict[tuple[str, str], dict] = {}
     rejected_routes: dict[tuple[str, str], str] = {}
     for harness, block in (payload.get("harnesses") or {}).items():
@@ -1430,20 +985,6 @@ def persist_routes(con, payload: dict, *, publication_locked: bool = False) -> N
                             route_bindings.canonical_json(evidence["adapter_metadata"]),
                         ),
                     )
-                if harness == "deepseek":
-                    for selector in carried_deepseek_routes:
-                        con.execute(
-                            "UPDATE model_routes SET stale=0,last_error=NULL,"
-                            "last_seen_at=?,generation_id=? "
-                            "WHERE harness='deepseek' AND selector=?",
-                            (completed_at, generation_id, selector),
-                        )
-                    for selector in failed_deepseek_routes:
-                        con.execute(
-                            "UPDATE model_routes SET stale=1,last_error=? "
-                            "WHERE harness='deepseek' AND selector=?",
-                            (DEEPSEEK_PROVIDER_OPTIONS_UNVERIFIED, selector),
-                        )
     payload["catalogue_generation"] = generation_id
     payload["generation_state"] = state
     payload["generation_published"] = publish_projection
@@ -1665,8 +1206,7 @@ def controlled_route_evidence(
     run=None,
     opencode_provider=None,
     harness_probe=None,
-    deepseek_fetch=None,
-    deepseek_wire_probe=None,
+    deepseek_client=None,
 ) -> dict:
     """Probe one controlled route and bind its source to this runtime seat."""
     env = os.environ if env is None else env
@@ -1679,7 +1219,6 @@ def controlled_route_evidence(
         harness_versions.compatibility_status
         if harness_probe is None else harness_probe
     )
-    deepseek_fetch = _http_json if deepseek_fetch is None else deepseek_fetch
     harness = (harness or "").strip().lower()
     scope = harness_versions.runtime_scope()
     entries: list[dict]
@@ -1718,16 +1257,8 @@ def controlled_route_evidence(
                     for model in opencode_provider()
                 ]
         elif harness == "deepseek":
-            provider = (
-                "ollama-cloud"
-                if selector.startswith("ollama-cloud/")
-                else "deepseek-official"
-            )
-            entries = _from_deepseek_provider(
-                provider,
-                deepseek_fetch,
-                env,
-                wire_probe=deepseek_wire_probe,
+            entries = _from_deepseek_host(
+                deepseek_client,
                 selector=selector,
             )
         else:
@@ -1772,9 +1303,9 @@ def ensure_deepseek_route(
     run=subprocess.run,
     opencode_provider=opencode_connected_models,
     harness_probe=harness_versions.compatibility_status,
-    deepseek_wire_probe=None,
+    deepseek_client=None,
 ) -> dict | None:
-    """Publish one explicitly selected authenticated route outside the sample."""
+    """Publish one exact route from the official Host configuration."""
     row = con.execute(
         "SELECT * FROM model_routes WHERE harness='deepseek' AND selector=?",
         (selector,),
@@ -1790,8 +1321,7 @@ def ensure_deepseek_route(
             con=con,
             opencode_provider=opencode_provider,
             harness_probe=harness_probe,
-            deepseek_wire_probe=deepseek_wire_probe,
-            deepseek_selector=selector,
+            deepseek_client=deepseek_client,
         )
     except Exception:  # noqa: BLE001 (provider diagnostics remain redacted)
         return None
@@ -1806,7 +1336,7 @@ def catalog(refresh: bool = False, fetch=_http_json, env=os.environ,
             run=subprocess.run, con=None,
             opencode_provider=opencode_connected_models,
             harness_probe=harness_versions.compatibility_status,
-            deepseek_wire_probe=None, deepseek_selector=None) -> dict:
+            deepseek_client=None) -> dict:
     """The cached-with-fallbacks entry point the API serves.
 
     fresh cache → serve it; miss/stale/refresh → live sweep, cache the result;
@@ -1833,8 +1363,7 @@ def catalog(refresh: bool = False, fetch=_http_json, env=os.environ,
     refresh_started_at = datetime.now(timezone.utc).isoformat()
     try:
         fresh = build(
-            fetch, env, run, deepseek_wire_probe=deepseek_wire_probe,
-            deepseek_selector=deepseek_selector,
+            fetch, env, run, deepseek_client=deepseek_client,
         )
     except Exception as e:  # noqa: BLE001
         refresh_completed_at = datetime.now(timezone.utc).isoformat()

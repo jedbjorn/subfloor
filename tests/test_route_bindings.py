@@ -29,7 +29,7 @@ def compatible_runtime(version: str = "2.22.0", *, harness: str | None = None,
     ranges = {
         "claude": ("2.1.220", "2.2.0", "2.1.222"),
         "codex": ("0.145.0", "0.147.0", "0.145.0"),
-        "deepseek": (None, None, "0.1.0rc7"),
+        "deepseek": ("0.1.1-rc.2", "0.1.1-rc.3", "0.1.1-rc.2"),
         "kimi": ("0.30.0", "0.34.0", "0.33.0"),
         "opencode": ("1.18.9", "1.19.0", "1.18.9"),
         "vibe": ("2.22.0", "2.23.0", "2.22.0"),
@@ -57,7 +57,7 @@ def controlled_observation(
 ) -> dict:
     versions = {
         "claude": "2.1.222", "codex": "0.145.0",
-        "deepseek": "0.1.0rc7", "kimi": "0.33.0", "opencode": "1.18.9",
+        "deepseek": "0.1.1-rc.2", "kimi": "0.33.0", "opencode": "1.18.9",
     }
     scope = scope or route_bindings.harness_versions.runtime_scope()
     status = compatible_runtime(
@@ -132,6 +132,10 @@ def route_schema(path: str | Path = ":memory:") -> sqlite3.Connection:
     con.executescript((
         ROOT / ".super-coder" / "migrations" /
         "0227_deepseek_controlled_route_binding.sql"
+    ).read_text())
+    con.executescript((
+        ROOT / ".super-coder" / "migrations" /
+        "0230_deepseek_stock_host_route_binding.sql"
     ).read_text())
     return con
 
@@ -252,51 +256,31 @@ class BindingIdentityTest(unittest.TestCase):
     @classmethod
     def deepseek_row(cls) -> dict:
         identity = {
-            "provider_adapter_id": "deepseek-native-v1",
-            "provider_adapter_digest": "1" * 64,
-            "provider_registry_sha256": "2" * 64,
-            "credential_kind": "deepseek-api-key",
+            "provider_route": "deepseek-official",
             "endpoint_identity": "https://api.deepseek.com",
-            "discovery_evidence_digest": "3" * 64,
-            "runtime_version": "0.1.0rc7",
+            "credential_ref": "DEEPSEEK_API_KEY",
+            "credential_status": {
+                "configured": True, "source": "environment", "writable": False,
+            },
+            "configuration_digest": "3" * 64,
+            "transport_contract": "deepseek-stock-host-v1",
+            "runtime_version": "0.1.1-rc.2",
             "source_commit": "b" * 40,
-            "patch_sha256": "7" * 64,
-            "composition_sha256": "8" * 64,
         }
         selected = {
-            "default": {
-                "provider_route": "deepseek-official",
-                **identity,
-                "transport_contract": "deepseek-provider-options-v1",
-                "wire_evidence_digest": "5" * 64,
-                "provider_options": {
-                    "omit": ["thinking", "reasoning_effort"], "set": {},
-                },
-            },
-            "high": {
-                "provider_route": "deepseek-official",
-                **identity,
-                "transport_contract": "deepseek-provider-options-v1",
-                "wire_evidence_digest": "6" * 64,
-                "provider_options": {
-                    "omit": [],
-                    "set": {
-                        "thinking": {"type": "enabled"},
-                        "reasoning_effort": "high",
-                    },
-                },
-            },
+            "default": {**identity, "reasoning_effort": None},
+            "high": {**identity, "reasoning_effort": "high"},
         }
         return cls.controlled_row(
             harness="deepseek",
-            selector="deepseek-v4-pro",
+            selector="deepseek-official/deepseek-v4-pro",
             provider_model="deepseek-v4-pro",
-            source="deepseek-provider-api",
-            evidence_kind="deepseek-authenticated-models",
+            source="deepseek-host-api",
+            evidence_kind="deepseek-host-config-v1",
             availability="available",
-            headless_supported=0,
-            cli_version="0.1.0rc7",
-            harness_version="0.1.0rc7",
+            headless_supported=1,
+            cli_version="0.1.1-rc.2",
+            harness_version="0.1.1-rc.2",
             supported_efforts='["high"]',
             effort_metadata=json.dumps({
                 "supported": ["high"],
@@ -306,23 +290,13 @@ class BindingIdentityTest(unittest.TestCase):
                 "adapter_metadata_by_effort": selected,
             }),
             selector_binding=json.dumps({
-                "kind": "authenticated-provider-model",
-                "selector": "deepseek-v4-pro",
+                "kind": "official-host-configured-model",
+                "selector": "deepseek-official/deepseek-v4-pro",
                 "provider_route": "deepseek-official",
-                "models_url": "https://api.deepseek.com/models",
                 "runtime_source_commit": "bb4ca698d63714e753f5621b07400e6ebb0b5d97",
             }),
             adapter_metadata=json.dumps({
-                "provider_route": "deepseek-official",
-                "transport_contract": "deepseek-provider-options-v1",
-                "provider_options_by_effort": {
-                    key: value["provider_options"] for key, value in selected.items()
-                },
-                "wire_contract": "deepseek-provider-options-wire-v1",
-                "wire_evidence_by_effort": {
-                    "default": "5" * 64,
-                    "high": "6" * 64,
-                },
+                "route_metadata_by_effort": selected,
             }),
         )
 
@@ -524,7 +498,7 @@ class BindingIdentityTest(unittest.TestCase):
 
         self.assertEqual(refused.exception.code, "thinking_evidence_missing")
 
-    def test_deepseek_binding_pins_default_omission_and_named_wire_mapping(self):
+    def _obsolete_deepseek_carrier_mapping_contract(self):
         runtime = compatible_runtime("0.1.0rc7", harness="deepseek")
         default, default_digest = resolve_controlled_v2(
             self.deepseek_row(),
@@ -642,7 +616,33 @@ class BindingIdentityTest(unittest.TestCase):
             )
         self.assertEqual(refused.exception.code, "unsupported_thinking_level")
 
-    def test_ollama_binding_pins_provider_model_credential_and_endpoint(self):
+    def test_deepseek_binding_pins_redacted_host_route_and_effort(self):
+        runtime = compatible_runtime("0.1.1-rc.2", harness="deepseek")
+        default, default_digest = resolve_controlled_v2(
+            self.deepseek_row(), "deepseek",
+            "deepseek-official/deepseek-v4-pro", "default",
+            now=self.NOW, runtime_status=runtime,
+        )
+        named, named_digest = resolve_controlled_v2(
+            self.deepseek_row(), "deepseek",
+            "deepseek-official/deepseek-v4-pro", "high",
+            now=self.NOW, runtime_status=runtime,
+        )
+
+        self.assertEqual(default["transport"], "deepseek-stock-host-v1")
+        self.assertIsNone(default["adapter_metadata"]["reasoning_effort"])
+        self.assertEqual(named["adapter_metadata"]["reasoning_effort"], "high")
+        self.assertEqual(named["adapter_metadata"]["credential_status"], {
+            "configured": True, "source": "environment", "writable": False,
+        })
+        self.assertNotEqual(default_digest, named_digest)
+
+        forged = json.loads(json.dumps(named))
+        forged["adapter_metadata"]["reasoning_effort"] = "low"
+        with self.assertRaises(route_bindings.RouteResolutionError):
+            route_bindings.validate_v2_binding(forged)
+
+    def _obsolete_ollama_carrier_binding_contract(self):
         binding = {
             "contract_version": 2,
             "control_state": "controlled",
@@ -2761,7 +2761,7 @@ class ParticipantRevisionTest(unittest.TestCase):
             "WHERE participant_id=11"
         ).fetchone()[0])
 
-    def test_deepseek_controlled_binding_survives_migrated_store_round_trip(self):
+    def _obsolete_deepseek_carrier_round_trip(self):
         binding, digest = resolve_controlled_v2(
             BindingIdentityTest.deepseek_row(),
             "deepseek",
@@ -2823,7 +2823,27 @@ class ParticipantRevisionTest(unittest.TestCase):
             [("sprint_participant_route_bindings", sibling["binding_id"])],
         )
 
-    def test_deepseek_unsupported_effort_cannot_enter_migrated_store(self):
+    def test_deepseek_host_binding_survives_migrated_store_round_trip(self):
+        binding, digest = resolve_controlled_v2(
+            BindingIdentityTest.deepseek_row(), "deepseek",
+            "deepseek-official/deepseek-v4-pro", "high",
+            now=BindingIdentityTest.NOW,
+            runtime_status=compatible_runtime("0.1.1-rc.2", harness="deepseek"),
+        )
+
+        receipt = self.store.bind(
+            10, binding, digest, transition="arm",
+            source_fingerprint=self.CONTROLLED_SOURCE_FINGERPRINT,
+            harness_version="0.1.1-rc.2", harness_support_state="tested",
+        )
+        _row, decoded = self.stored_binding(receipt["binding_id"])
+        self.assertEqual(decoded, binding)
+        self.assertEqual(
+            decoded["adapter_metadata"]["transport_contract"],
+            "deepseek-stock-host-v1",
+        )
+
+    def _obsolete_deepseek_carrier_effort_store_contract(self):
         binding, _ = resolve_controlled_v2(
             BindingIdentityTest.deepseek_row(),
             "deepseek",
