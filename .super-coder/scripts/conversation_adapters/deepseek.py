@@ -126,9 +126,91 @@ class DeepSeekAdapter(ConversationAdapter):
         except deepseek_host.DeepSeekHostError as exc:
             raise _adapter_error(exc) from exc
 
+    def _managed_session(self) -> tuple[str, str]:
+        configured = self.manifest.get("conversation", {}).get("managed_session")
+        if not isinstance(configured, Mapping):
+            raise AdapterError(
+                "HARNESS_MANIFEST_INVALID",
+                "DeepSeek managed-session policy is missing",
+            )
+        agent_preset = configured.get("agent_preset")
+        permission_preset = configured.get("permission_preset")
+        if not isinstance(agent_preset, str) or not agent_preset:
+            raise AdapterError(
+                "HARNESS_MANIFEST_INVALID",
+                "DeepSeek managed agent preset is missing",
+            )
+        if not isinstance(permission_preset, str) or not permission_preset:
+            raise AdapterError(
+                "HARNESS_MANIFEST_INVALID",
+                "DeepSeek managed permission preset is missing",
+            )
+        return agent_preset, permission_preset
+
+    def _prepare_managed_session(
+        self,
+        client: deepseek_host.HostTransport,
+        session_ref: str,
+        context: ConversationContext,
+        *,
+        resume: bool = False,
+    ) -> Mapping[str, Any]:
+        agent_preset, permission_preset = self._managed_session()
+        try:
+            created = client.call(
+                "session.create",
+                {
+                    "sessionId": session_ref,
+                    "cwd": str(context.checked_worktree()),
+                    "agentPreset": agent_preset,
+                },
+            )
+        except deepseek_host.HostRpcError as exc:
+            if resume:
+                raise AdapterError("HARNESS_SESSION_LOST", exc.detail) from exc
+            raise _adapter_error(exc) from exc
+        except deepseek_host.DeepSeekHostError as exc:
+            raise _adapter_error(exc) from exc
+        if (
+            not isinstance(created, Mapping)
+            or created.get("sessionId") != session_ref
+            or created.get("agentPreset") != agent_preset
+        ):
+            raise AdapterError(
+                "HARNESS_SESSION_MISMATCH",
+                "DeepSeek Host did not preserve the managed session preset",
+            )
+        try:
+            permission = client.call(
+                "command.execute",
+                {
+                    "sessionId": session_ref,
+                    "line": f"/permission {permission_preset}",
+                },
+            )
+        except deepseek_host.DeepSeekHostError as exc:
+            raise AdapterError(
+                "HARNESS_PERMISSION_POLICY_UNAVAILABLE",
+                exc.detail,
+            ) from exc
+        result = permission.get("result") if isinstance(permission, Mapping) else None
+        if (
+            not isinstance(permission, Mapping)
+            or permission.get("matched") is not True
+            or not isinstance(result, Mapping)
+            or result.get("kind") != "success"
+        ):
+            raise AdapterError(
+                "HARNESS_PERMISSION_POLICY_UNAVAILABLE",
+                "DeepSeek Host did not apply the unattended permission preset",
+            )
+        return created
+
     def probe(self) -> ProbeResult:
         try:
-            described = self._client().call("host.describe", {})
+            client = self._client()
+            described = client.call("host.describe", {})
+            roster = client.call("agentPreset.list", {})
         except deepseek_host.DeepSeekHostError as exc:
             raise _adapter_error(exc) from exc
         version = described.get("version") if isinstance(described, Mapping) else None
@@ -137,6 +219,24 @@ class DeepSeekAdapter(ConversationAdapter):
             raise AdapterError(
                 "HARNESS_VERSION_UNSUPPORTED",
                 "DeepSeek Host version does not match the pinned official runtime",
+            )
+        agent_preset, _permission_preset = self._managed_session()
+        presets = roster.get("presets") if isinstance(roster, Mapping) else None
+        selected = next(
+            (
+                row for row in presets
+                if isinstance(row, Mapping) and row.get("id") == agent_preset
+            ),
+            None,
+        ) if isinstance(presets, list) else None
+        if (
+            selected is None
+            or selected.get("trust") != "system"
+            or selected.get("broken") is not None
+        ):
+            raise AdapterError(
+                "HARNESS_AGENT_PRESET_UNAVAILABLE",
+                "DeepSeek shipped managed agent preset is unavailable",
             )
         return ProbeResult(
             harness=self.harness,
@@ -332,21 +432,7 @@ class DeepSeekAdapter(ConversationAdapter):
         client = self._client()
         route = self._route(client, context)
         session_ref = self._new_session_ref(context)
-        try:
-            created = client.call(
-                "session.create",
-                {
-                    "sessionId": session_ref,
-                    "cwd": str(context.checked_worktree()),
-                },
-            )
-        except deepseek_host.DeepSeekHostError as exc:
-            raise _adapter_error(exc) from exc
-        if not isinstance(created, Mapping) or created.get("sessionId") != session_ref:
-            raise AdapterError(
-                "HARNESS_SESSION_MISMATCH",
-                "DeepSeek Host did not preserve the caller-stable session identity",
-            )
+        self._prepare_managed_session(client, session_ref, context)
         return self._turn(
             client, session_ref, context, message, resumed=False, route=route
         )
@@ -361,23 +447,9 @@ class DeepSeekAdapter(ConversationAdapter):
         message = ensure_nonempty_message(message)
         client = self._client()
         route = self._route(client, context)
-        try:
-            created = client.call(
-                "session.create",
-                {
-                    "sessionId": session_ref,
-                    "cwd": str(context.checked_worktree()),
-                },
-            )
-        except deepseek_host.HostRpcError as exc:
-            raise AdapterError("HARNESS_SESSION_LOST", exc.detail) from exc
-        except deepseek_host.DeepSeekHostError as exc:
-            raise _adapter_error(exc) from exc
-        if not isinstance(created, Mapping) or created.get("sessionId") != session_ref:
-            raise AdapterError(
-                "HARNESS_SESSION_MISMATCH",
-                "DeepSeek Host did not cold-resume the exact native session",
-            )
+        self._prepare_managed_session(
+            client, session_ref, context, resume=True
+        )
         return self._turn(
             client, session_ref, context, message, resumed=True, route=route
         )

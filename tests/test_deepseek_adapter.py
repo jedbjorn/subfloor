@@ -23,6 +23,11 @@ from conversation_adapters.deepseek import DeepSeekAdapter  # noqa: E402
 def configuration(*, credential: Mapping[str, Any] | None = None) -> dict:
     return {
         "host.describe": {"version": "0.1.1-rc.2"},
+        "agentPreset.list": {
+            "presets": [{"id": "standard", "trust": "system", "isDefault": True}],
+            "authorable": True,
+            "hasDocument": False,
+        },
         "llm.providers": {"providers": [{
             "provider": "acme-dynamic", "active": True,
             "settingsNs": "llm", "settingsPath": ["providers", "acme-dynamic"],
@@ -80,7 +85,16 @@ class FakeHost:
                 assert request == {"refs": ["ACME_API_KEY"]}
             return copy.deepcopy(self.config[method])
         if method == "session.create":
-            return {"sessionId": request["sessionId"]}
+            return {
+                "sessionId": request["sessionId"],
+                "agentPreset": request.get("agentPreset"),
+            }
+        if method == "command.execute":
+            return {
+                "matched": True,
+                "commandId": "cmd-test-1",
+                "result": {"kind": "success"},
+            }
         if method == "session.history":
             return {"events": [{"event": copy.deepcopy(row)} for row in self.history]}
         if method == "session.selectModel":
@@ -275,6 +289,21 @@ def test_stale_route_fails_before_session_mutation(tmp_path: Path) -> None:
     assert "session.create" not in [method for method, _ in live.calls]
 
 
+def test_probe_requires_shipped_managed_agent_preset() -> None:
+    healthy = FakeHost()
+    result = DeepSeekAdapter(client_factory=lambda: healthy).probe()
+    assert result.version == "0.1.1-rc.2"
+    assert [method for method, _ in healthy.calls] == [
+        "host.describe", "agentPreset.list",
+    ]
+
+    broken = configuration()
+    broken["agentPreset.list"]["presets"][0]["broken"] = "missing plugin"
+    with pytest.raises(AdapterError) as refused:
+        DeepSeekAdapter(client_factory=lambda: FakeHost(config=broken)).probe()
+    assert refused.value.code == "HARNESS_AGENT_PRESET_UNAVAILABLE"
+
+
 def test_browser_start_stream_and_exact_call_order(tmp_path: Path) -> None:
     seed = FakeHost()
     ctx = context(tmp_path, seed)
@@ -294,8 +323,16 @@ def test_browser_start_stream_and_exact_call_order(tmp_path: Path) -> None:
         "session.started", "run.started", "assistant.delta", "run.completed",
     ]
     assert events[2].payload["text"] == "hello"
-    assert live.calls[-4:] == [
-        ("session.create", {"sessionId": session, "cwd": str(tmp_path)}),
+    assert live.calls[-5:] == [
+        ("session.create", {
+            "sessionId": session,
+            "cwd": str(tmp_path),
+            "agentPreset": "standard",
+        }),
+        ("command.execute", {
+            "sessionId": session,
+            "line": "/permission danger-full-access",
+        }),
         ("session.history", {"sessionId": session, "maxMessages": 200}),
         ("session.selectModel", {
             "sessionId": session, "provider": "acme-dynamic", "model": "model-7",
@@ -318,8 +355,35 @@ def test_cold_resume_reuses_session_and_prior_history(tmp_path: Path) -> None:
     }])
     turn = DeepSeekAdapter(client_factory=lambda: live).resume(session, ctx, "continue")
     assert turn.session_ref == session
-    assert ("session.create", {"sessionId": session, "cwd": str(tmp_path)}) in live.calls
+    assert ("session.create", {
+        "sessionId": session,
+        "cwd": str(tmp_path),
+        "agentPreset": "standard",
+    }) in live.calls
+    assert ("command.execute", {
+        "sessionId": session,
+        "line": "/permission danger-full-access",
+    }) in live.calls
     assert ("session.history", {"sessionId": session, "maxMessages": 200}) in live.calls
+
+
+def test_unattended_permission_refusal_stops_before_prompt(tmp_path: Path) -> None:
+    class RefusingHost(FakeHost):
+        def call(self, method, payload):
+            result = super().call(method, payload)
+            if method == "command.execute":
+                return {"matched": False}
+            return result
+
+    seed = FakeHost()
+    ctx = context(tmp_path, seed)
+    live = RefusingHost()
+
+    with pytest.raises(AdapterError) as refused:
+        DeepSeekAdapter(client_factory=lambda: live).start(ctx, "work")
+
+    assert refused.value.code == "HARNESS_PERMISSION_POLICY_UNAVAILABLE"
+    assert "session.prompt" not in [method for method, _ in live.calls]
 
 
 def test_stream_loss_never_invents_success(tmp_path: Path) -> None:
