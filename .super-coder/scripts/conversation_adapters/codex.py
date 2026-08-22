@@ -86,18 +86,22 @@ class JsonLineRpcProcess:
             daemon=True,
         )
         self._reader.start()
-        self.request(
-            "initialize",
-            {
-                "clientInfo": {
-                    "name": "super-coder",
-                    "title": "super-coder conversation broker",
-                    "version": "1",
+        try:
+            self.request(
+                "initialize",
+                {
+                    "clientInfo": {
+                        "name": "super-coder",
+                        "title": "super-coder conversation broker",
+                        "version": "1",
+                    },
+                    "capabilities": {"experimentalApi": False},
                 },
-                "capabilities": {"experimentalApi": False},
-            },
-        )
-        self.notify("initialized", {})
+            )
+            self.notify("initialized", {})
+        except BaseException:
+            self.close()
+            raise
 
     def _drain_stderr(self) -> None:
         stderr = self.process.stderr
