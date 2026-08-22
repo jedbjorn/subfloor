@@ -25,6 +25,7 @@ def _runtime(harness: str) -> tuple[dict, dict]:
         {
             "claude": "2.1.223",
             "codex": "0.146.0",
+            "deepseek": "0.1.1-rc.2",
             "kimi": "0.33.0",
             "opencode": "1.18.9",
             "vibe": "2.22.0",
@@ -66,12 +67,38 @@ def candidate(_con, participant) -> sprint_domain.ParticipantBindingCandidate:
     else:
         selected = "high" if effort is None else str(effort).strip().lower()
         model_default = selected == route_bindings.DEFAULT_EFFORT
+        provider_model = model
+        adapter_metadata = {}
+        selector_binding = {"kind": "test", "selector": model}
+        if harness == "deepseek":
+            provider, separator, provider_model = str(model).partition("/")
+            if not separator:
+                raise AssertionError("DeepSeek test routes require provider/model")
+            adapter_metadata = {
+                "provider_route": provider,
+                "endpoint_identity": f"https://{provider}.example.test/v1",
+                "credential_ref": "TEST_DEEPSEEK_API_KEY",
+                "credential_status": {
+                    "configured": True,
+                    "source": "environment",
+                    "writable": False,
+                },
+                "configuration_digest": "4" * 64,
+                "transport_contract": route_bindings.TRANSPORTS[harness],
+                "reasoning_effort": None if model_default else selected,
+                "runtime_version": "0.1.1-rc.2",
+                "source_commit": "5" * 40,
+            }
+            selector_binding = {
+                "kind": "official-host-configured-model",
+                "selector": model,
+            }
         binding = {
             "contract_version": 2,
             "control_state": "controlled",
             "harness": harness,
             "requested_model": model,
-            "provider_model": model,
+            "provider_model": provider_model,
             "requested_effort": selected,
             "effective_effort": selected,
             "native_variant_id": (
@@ -82,8 +109,8 @@ def candidate(_con, participant) -> sprint_domain.ParticipantBindingCandidate:
             "transport": route_bindings.TRANSPORTS[harness],
             "catalogue_generation": "1" * 32,
             "evidence_digest": None if model_default else "2" * 64,
-            "selector_binding": {"kind": "test", "selector": model},
-            "adapter_metadata": {},
+            "selector_binding": selector_binding,
+            "adapter_metadata": adapter_metadata,
         }
         route_bindings.validate_v2_binding(binding)
         digest = route_bindings.digest_json(binding)
@@ -91,6 +118,7 @@ def candidate(_con, participant) -> sprint_domain.ParticipantBindingCandidate:
         harness_version = {
             "claude": "2.1.223",
             "codex": "0.146.0",
+            "deepseek": "0.1.1-rc.2",
             "kimi": "0.33.0",
             "opencode": "1.18.9",
         }[harness]
