@@ -57,6 +57,7 @@ import artifact_policy  # noqa: E402
 import callable_floor  # noqa: E402
 import conversation_boot  # noqa: E402
 import db_driver  # noqa: E402
+import deepseek_web  # noqa: E402  — official dsh Web/Host lifecycle
 import git_freshness  # noqa: E402
 import git_prune  # noqa: E402  — boot-time prune of provably-merged local branches
 import global_pointer  # noqa: E402
@@ -262,6 +263,14 @@ def require_harness_surface(adapter: dict, surface: str) -> None:
         harness = adapter.get("harness", "unknown")
         label = surface.replace("_", "-")
         raise ValueError(f"harness '{harness}' does not support {label}")
+
+
+def require_local_web_surface(adapter: dict) -> None:
+    """Require the explicit engine-managed local-Web adapter contract."""
+    interactive = adapter.get("interactive")
+    if not isinstance(interactive, dict) or interactive.get("kind") != "local_web":
+        harness = adapter.get("harness", "unknown")
+        raise ValueError(f"harness '{harness}' does not support local Web entry")
 
 
 def linked_vm_configured() -> bool:
@@ -1592,6 +1601,7 @@ def main() -> None:
     args = raw_args
     first = "--first" in args
     headless = "--headless" in args
+    local_web = "--local-web" in args
     # --harness <name> / --harness=<name> forces the harness and skips the
     # picker; its value must not be mistaken for the shell shortname positional.
     # Headless adds -p/--prompt and -m/--model (value-taking, same rule).
@@ -1603,7 +1613,7 @@ def main() -> None:
     i = 0
     while i < len(args):
         a = args[i]
-        if a in ("--first", "--headless", "--host-admin"):
+        if a in ("--first", "--headless", "--host-admin", "--local-web"):
             i += 1
             continue
         if a == "--harness":
@@ -1636,6 +1646,8 @@ def main() -> None:
             positional.append(a)
         i += 1
     requested = positional[0] if positional else None
+    if local_web and (headless or host_admin):
+        sys.exit("session launch: --local-web cannot be combined with --headless or --host-admin")
     if host_admin and (headless or len(positional) > 1):
         sys.exit("usage: ./sc admin [admin-shortname] [--harness <h>]")
     if headless and not requested:
@@ -1756,7 +1768,10 @@ def main() -> None:
     flavor_effort = (fdef.get("efforts") or {}).get(harness) if fdef else None
     adapter = load_adapter(harness)
     try:
-        require_harness_surface(adapter, "one_shot" if headless else "terminal")
+        if local_web:
+            require_local_web_surface(adapter)
+        else:
+            require_harness_surface(adapter, "one_shot" if headless else "terminal")
     except ValueError as exc:
         con.close()
         prefix = "sc run" if headless else "session launch"
@@ -2034,6 +2049,16 @@ def main() -> None:
 
     if os.environ.get("RENDER_ONLY"):
         print("→ RENDER_ONLY set — not exec'ing the harness.")
+        return
+
+    if local_web:
+        try:
+            service = deepseek_web.ensure(work_dir)
+        except deepseek_web.DeepSeekWebError as exc:
+            sys.exit(f"session launch: {exc.code}: {exc.detail}")
+        action = "reused" if service["reused"] else "started"
+        print(f"→ DeepSeek Web: {action} for {work_dir}")
+        print(f"→ DeepSeek Web URL: {service['url']}")
         return
 
     # --name labels the session in the harness prompt box, resume picker, and

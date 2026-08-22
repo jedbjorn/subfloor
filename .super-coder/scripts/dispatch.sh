@@ -163,6 +163,26 @@ sc_refuse_linked() {
 
 port() { "$PY" "$S/ports.py" port; }
 devport() { "$PY" "$S/ports.py" devport; }
+deepseekhostport() { "$PY" "$S/ports.py" deepseekhostport; }
+deepseekrelayport() { "$PY" "$S/ports.py" deepseekrelayport; }
+
+sc_open_browser() {
+  sc_browser_url="$1"
+  if command -v xdg-open >/dev/null 2>&1; then
+    if xdg-open "$sc_browser_url" >/dev/null 2>&1; then
+      echo "→ opened DeepSeek Web in the host browser"
+      return 0
+    fi
+  fi
+  if command -v open >/dev/null 2>&1; then
+    if open "$sc_browser_url" >/dev/null 2>&1; then
+      echo "→ opened DeepSeek Web in the host browser"
+      return 0
+    fi
+  fi
+  echo "→ no host browser opener found; use the printed DeepSeek Web URL"
+  return 1
+}
 
 # The two localhost URLs an operator needs, derived from this fork's ports —
 # never a fixed 8800, because every fork lands on its own offset (ports.py).
@@ -226,7 +246,7 @@ dcheck() {
 # breaks claude — so seed it with empty json. Real creds come from a one-time
 # host login (`./sc doctor` guides it); this just keeps the mounts valid.
 dcreds() {
-  mkdir -p "$HOME/.claude" "$HOME/.config/opencode" "$HOME/.local/share/opencode" "$HOME/.codex" "$HOME/.vibe" "$HOME/.kimi-code" 2>/dev/null || true
+  mkdir -p "$HOME/.claude" "$HOME/.config/opencode" "$HOME/.local/share/opencode" "$HOME/.codex" "$HOME/.vibe" "$HOME/.kimi-code" "$HOME/.dsh" 2>/dev/null || true
   [ -e "$HOME/.claude.json" ] || echo '{}' > "$HOME/.claude.json"
 }
 
@@ -1194,6 +1214,8 @@ case "$cmd" in
     "$PY" "$S/ports.py" ensure >/dev/null
     p="$(port)"
     dp="$(devport)"
+    dsp="$(deepseekhostport)"
+    dsrp="$(deepseekrelayport)"
     dnet
     github_auth_rootless=""
     drootless && github_auth_rootless="--rootless"
@@ -1206,6 +1228,8 @@ case "$cmd" in
     # value stays in Docker's inherited environment and never enters argv.
     ollama_env=""
     [ -n "${OLLAMA_API_KEY:-}" ] && ollama_env="-e OLLAMA_API_KEY"
+    disabled_harnesses_env=""
+    [ -n "${SC_DISABLED_HARNESSES:-}" ] && disabled_harnesses_env="-e SC_DISABLED_HARNESSES"
     # Forward DATABASE_URL into the sandbox when a pg sidecar is configured, so
     # the fork's APP can connect to it. Default tracks the sidecar's container
     # name + baked sc/sc/sc creds (one source of truth); SC_DATABASE_URL overrides
@@ -1271,8 +1295,8 @@ case "$cmd" in
         --network "$SC_NET" \
         SC_GITHUB_AUTH_ARGS \
         -e HOME="$HOME" -e SC_BIND=0.0.0.0 -e SC_PYTHON=python3 -e PYTHONUNBUFFERED=1 \
-        -e SC_SANDBOX=1 -e SC_DEV_PORT="$dp" \
-        $mistral_env $ollama_env $pg_env \
+        -e SC_SANDBOX=1 -e SC_DEV_PORT="$dp" -e SC_DEEPSEEK_HOST_PORT="$dsp" \
+        $mistral_env $ollama_env $disabled_harnesses_env $pg_env \
         -e GIT_AUTHOR_NAME="$git_name" -e GIT_AUTHOR_EMAIL="$git_email" \
         -e GIT_COMMITTER_NAME="$git_name" -e GIT_COMMITTER_EMAIL="$git_email" \
         -w "$here" \
@@ -1285,8 +1309,10 @@ case "$cmd" in
         -v "$HOME/.codex:$HOME/.codex" \
         -v "$HOME/.vibe:$HOME/.vibe" \
         -v "$HOME/.kimi-code:$HOME/.kimi-code" \
+        -v "$HOME/.dsh:$HOME/.dsh" \
         -p "127.0.0.1:$p:$p" \
         -p "127.0.0.1:$dp:$dp" \
+        -p "127.0.0.1:$dsp:$dsrp" \
         SC_DEVKIT_MOUNTS \
         "$IMG" ./sc serve --port "$p" || provision_rc=$?
     if [ "$provision_rc" -ne 0 ]; then
@@ -1337,6 +1363,15 @@ case "$cmd" in
       exit 1
     }
     sc_urls || true
+    if [ "${1:-}" = "deepseek" ]; then
+      shift
+      docker exec -it -e "SC_DISABLED_HARNESSES=${SC_DISABLED_HARNESSES:-}" \
+        "$CNAME" ./sc boot "$@" --harness deepseek --local-web
+      sc_deepseek_url="http://127.0.0.1:$(deepseekhostport)"
+      echo "  DeepSeek Web  $sc_deepseek_url"
+      sc_open_browser "$sc_deepseek_url" || true
+      exit 0
+    fi
     exec docker exec -it "$CNAME" ./sc boot "$@" ;;
   enter-*)
     if [ "${1:-}" = "--devkit-repair" ]; then
@@ -1559,6 +1594,8 @@ super-coder — forkable shell substrate
   ./sc admin               boot the sole active Admin directly on the host (no Docker or API required)
   ./sc enter               boot an interactive shell only when declared provisioning is ready
                              --devkit-repair enters state repair without claiming readiness
+  ./sc enter deepseek      select a shell, register its worktree with official dsh Web/Host,
+                             open the host browser, and always print the loopback URL
   ./sc enter-<shortname>   enter that shell directly when ready (skip the shell picker)
                              harness: --harness <name> or HARNESS=<name> forces it; else when
                              >1 harness is on PATH you're prompted (per-launch, not persisted)

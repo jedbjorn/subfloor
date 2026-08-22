@@ -103,22 +103,6 @@ RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
  && apt-get install -y --no-install-recommends nodejs \
  && rm -rf /var/lib/apt/lists/*
 
-# DeepSeek Harness has a Python 3.10+ floor. Its lifecycle carrier is built from
-# one digest-pinned upstream archive plus the reviewed narrow patch, then kept in
-# a dedicated venv. The recipe itself pins the build Node and pnpm versions; the
-# image's Node is only the bootstrap for that isolated tool invocation. Unsupported
-# architectures still receive the tested marker instead of a partial carrier.
-ENV SC_DEEPSEEK_CARRIER_PYTHON=/opt/super-coder/deepseek-runtime/bin/python
-COPY .super-coder/scripts/deepseek_runtime.py /opt/super-coder/deepseek-bootstrap/scripts/deepseek_runtime.py
-COPY .super-coder/scripts/build_deepseek_carrier.py /opt/super-coder/deepseek-bootstrap/scripts/build_deepseek_carrier.py
-COPY .super-coder/scripts/deepseek_carrier_worker.py /opt/super-coder/deepseek-bootstrap/scripts/deepseek_carrier_worker.py
-COPY .super-coder/scripts/deepseek_inference_canary.py /opt/super-coder/deepseek-bootstrap/scripts/deepseek_inference_canary.py
-COPY .super-coder/scripts/cli_entry.py /opt/super-coder/deepseek-bootstrap/scripts/cli_entry.py
-COPY .super-coder/assets/deepseek /opt/super-coder/deepseek-bootstrap/assets/deepseek
-RUN python /opt/super-coder/deepseek-bootstrap/scripts/deepseek_runtime.py \
-      --install-container-carrier /opt/super-coder/deepseek-runtime "$(uname -m)" \
-      --json
-
 # Playwright E2E browser — baked at the IMAGE level on purpose, unlike the per-fork
 # app deps (those land in the fork's .venv / node_modules via `./sc deps`). It stays
 # baked because: (1) Chromium needs a pile of OS libraries (`--with-deps` shells out
@@ -219,7 +203,9 @@ ENV HOME=/home/${SC_USER}
 # run.py's ensure_harness_path() agree (it derives the same dirs from Path.home).
 ENV PATH=/home/${SC_USER}/.local/bin:/home/${SC_USER}/.opencode/bin:${PATH}
 
-# Harness CLIs — official native installers, no npm (mirrors install.py).
+# Harness CLIs — official distributions (mirrors install.py). DeepSeek is the
+# exact stock release selected by the Feature 60 Host-seam gate; it deliberately
+# does not ride the latest-resolving native-installer policy of the other CLIs.
 # Codex drops a launcher in ~/.local/bin whose standalone target is under
 # ~/.codex/packages. Runtime mounts the host's whole ~/.codex so auth, sessions,
 # goals, plugins, and other durable state survive; without relocation that mount
@@ -244,7 +230,9 @@ RUN echo "harness epoch: ${SC_HARNESS_EPOCH}" \
  && install -m 0755 "$codex_code_mode_host" "$HOME/.local/libexec/codex-code-mode-host" \
  && ln -sfn "$HOME/.local/libexec/codex" "$HOME/.local/bin/codex" \
  && "$HOME/.local/bin/codex" --version \
- && curl -LsSf https://mistral.ai/vibe/install.sh | bash
+ && curl -LsSf https://mistral.ai/vibe/install.sh | bash \
+ && npm install --global --prefix "$HOME/.local" "@deepseek-ai/dsh@0.1.1-rc.2" \
+ && "$HOME/.local/bin/dsh" --version
 
 # Stamp the epoch the harness layers were built with, so an image can be asked
 # what it is rather than guessed at: `./sc harness-status` reads this label and

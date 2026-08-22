@@ -13,7 +13,24 @@
     "tag": "dsh-v0.1.1-rc.2",
     "commit": "b150a551b8d465e31e418e1b2eaf5e79bbb7d28e",
     "selected_seam": "stock-host-api",
-    "feasibility_evidence": "assets/deepseek/stock-host-seam.json"
+    "feasibility_evidence": "assets/deepseek/stock-host-seam.json",
+    "profile_home": "$DSH_HOME or ~/.dsh"
+  },
+  "runtime_compatibility": {
+    "minimum_cli_version": "0.1.1",
+    "maximum_cli_version_exclusive": "0.1.2",
+    "verified_cli_version": "0.1.1",
+    "verified_observed_version": "0.1.1-rc.2"
+  },
+  "interactive": {
+    "kind": "local_web",
+    "launch": ["dsh", "web"],
+    "host": "127.0.0.1",
+    "port_source": "SC_DEEPSEEK_HOST_PORT",
+    "readiness_path": "/",
+    "workspace_method": "workspace.create",
+    "browser_open_owner": "host-dispatcher",
+    "url_fallback": true
   },
   "boot_artifact": "AGENTS.md",
   "emit": [],
@@ -22,7 +39,7 @@
   "mcp": {
     "streamable_http": {
       "supported": false,
-      "reason": "the fixed DeepSeek Cordis composition has no arbitrary MCP injection surface"
+      "reason": "the selected stock DeepSeek Web profile exposes no managed arbitrary MCP injection surface"
     }
   },
   "conversation": {

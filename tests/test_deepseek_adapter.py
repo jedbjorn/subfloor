@@ -344,6 +344,7 @@ def test_stock_host_selection_withdraws_legacy_carrier_from_live_registry() -> N
         "commit": "b150a551b8d465e31e418e1b2eaf5e79bbb7d28e",
         "selected_seam": "stock-host-api",
         "feasibility_evidence": "assets/deepseek/stock-host-seam.json",
+        "profile_home": "$DSH_HOME or ~/.dsh",
     }
     evidence = json.loads(
         (ENGINE / manifest["official_runtime"]["feasibility_evidence"]).read_text()
