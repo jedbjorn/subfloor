@@ -758,7 +758,7 @@ class FlavorDefaultsTest(unittest.TestCase):
         self.assertEqual(got["harness_status"]["deepseek"]["surfaces"], {
             "terminal": False,
             "one_shot": False,
-            "browser": True,
+            "browser": False,
             "sprint": False,
         })
 
@@ -1268,7 +1268,7 @@ class AuthenticatedCliCatalogueRouteTest(unittest.TestCase):
         self.assertNotIn("runtime_status", unavailable)
 
     def test_route_projection_carries_latest_bounded_harness_failure(self) -> None:
-        completed = "2026-08-21T00:02:00+00:00"
+        completed = (datetime.now(timezone.utc) + timedelta(minutes=1)).isoformat()
         con = self.connect()
         con.execute(
             "INSERT INTO model_catalog_generations (generation_id,"

@@ -187,17 +187,17 @@ def test_bound_headless_route_rejects_unsupported_deepseek_effort() -> None:
     }
 
 
-def test_native_deepseek_conversation_does_not_enable_cli_headless() -> None:
+def test_pending_deepseek_host_adapter_does_not_enable_cli_headless() -> None:
     adapter = run_mod.load_adapter("deepseek")
 
     assert run_mod.headless_command(adapter, "prompt") is None
     assert run_mod.headless_command(
         adapter, "prompt", conversation_owned=True
-    ) == []
+    ) is None
     assert adapter["surfaces"]["one_shot"] is False
 
 
-def test_native_deepseek_launch_plan_does_not_probe_an_empty_cli(
+def test_pending_deepseek_host_adapter_refuses_browser_launch_before_cli_probe(
     launch_case, monkeypatch
 ) -> None:
     db_path, worktree = launch_case
@@ -247,25 +247,23 @@ def test_native_deepseek_launch_plan_does_not_probe_an_empty_cli(
     monkeypatch.setattr(run_mod, "apply_sandbox", lambda *_: None)
     monkeypatch.setattr(run_mod, "_cli_version", reject_cli_probe)
 
-    plan = run_mod.prepare_launch(
-        shell_id=1,
-        harness="deepseek",
-        model="ollama-cloud/deepseek-v4-pro:0813",
-        effort="high",
-        headless_prompt="Do the work",
-        conversation_owned=True,
-        current_leased_run_id=7,
-        boot=BootDirective(
-            conversation_id="cv_" + "a" * 32,
-            phase="start",
-        ),
-    )
-
-    assert plan.argv == []
-    assert plan.cli_version is None
-    assert plan.harness == "deepseek"
-    assert plan.model == "ollama-cloud/deepseek-v4-pro:0813"
-    assert plan.effort == "high"
+    with pytest.raises(
+        run_mod.LaunchError,
+        match="harness 'deepseek' has no headless adapter",
+    ):
+        run_mod.prepare_launch(
+            shell_id=1,
+            harness="deepseek",
+            model="ollama-cloud/deepseek-v4-pro:0813",
+            effort="high",
+            headless_prompt="Do the work",
+            conversation_owned=True,
+            current_leased_run_id=7,
+            boot=BootDirective(
+                conversation_id="cv_" + "a" * 32,
+                phase="start",
+            ),
+        )
 
 
 @pytest.fixture

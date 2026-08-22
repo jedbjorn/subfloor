@@ -5,7 +5,6 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
-from types import SimpleNamespace
 from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -17,9 +16,14 @@ import run
 
 class HarnessSurfaceProjectionTest(unittest.TestCase):
     def test_existing_surface_roster_and_deepseek_gates_are_explicit(self) -> None:
+        commands = []
+
+        def executable(command: str) -> str:
+            commands.append(command)
+            return f"/bin/{command}"
+
         projection = harness_surfaces.project(
-            executable=lambda command: command,
-            deepseek_probe=lambda **_: SimpleNamespace(available=True, error=None),
+            executable=executable,
         )
 
         self.assertEqual(
@@ -46,33 +50,31 @@ class HarnessSurfaceProjectionTest(unittest.TestCase):
             "shipped": True,
             "installed": True,
             "enabled": True,
-            "healthy": True,
+            "healthy": False,
             "compatibility": "declared",
             "surfaces": {
                 "terminal": False,
                 "one_shot": False,
-                "browser": True,
+                "browser": False,
                 "sprint": False,
             },
-            "unavailable_reason": None,
+            "unavailable_reason": "HARNESS_SURFACE_UNPROVEN",
         })
+        self.assertIn("dsh", commands)
+        self.assertNotIn("deepseek-harness", commands)
 
     def test_missing_runtime_and_disablement_have_stable_distinct_reasons(self) -> None:
         missing = harness_surfaces.project(
             executable=lambda command: None,
-            deepseek_probe=lambda **_: SimpleNamespace(
-                available=False, error="HARNESS_RUNTIME_MISSING"
-            ),
         )
         disabled = harness_surfaces.project(
             env={"SC_DISABLED_HARNESSES": " codex, DEEPSEEK "},
             executable=lambda command: command,
-            deepseek_probe=lambda **_: SimpleNamespace(available=True, error=None),
         )
 
         self.assertFalse(missing["deepseek"]["installed"])
         self.assertEqual(
-            missing["deepseek"]["unavailable_reason"], "HARNESS_RUNTIME_MISSING"
+            missing["deepseek"]["unavailable_reason"], "HARNESS_UNAVAILABLE"
         )
         self.assertFalse(disabled["codex"]["enabled"])
         self.assertFalse(disabled["codex"]["healthy"])
