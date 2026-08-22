@@ -171,6 +171,26 @@ def test_unconfigured_credential_excludes_route() -> None:
     assert refused.value.code == "HARNESS_ROUTE_UNAVAILABLE"
 
 
+def test_active_provider_without_settings_profile_has_stable_failure() -> None:
+    config = configuration()
+    config["llm.providers"]["providers"] = [{
+        "provider": "odd", "active": True,
+    }]
+    config["llm.models"]["groups"] = [{
+        "id": "odd", "models": [{"id": "model-1"}],
+    }]
+    fake = FakeHost(config=config)
+
+    with pytest.raises(deepseek_host.DeepSeekHostError) as refused:
+        deepseek_host.configured_routes(fake)
+
+    assert refused.value.code == "HARNESS_HOST_RESPONSE_INVALID"
+    assert str(refused.value) == (
+        "HARNESS_HOST_RESPONSE_INVALID: provider odd has no usable settings profile"
+    )
+    assert "credentials.describe" not in [method for method, _ in fake.calls]
+
+
 @pytest.mark.parametrize("value", [
     "http://localhost:1234", "https://127.0.0.1:1234", "http://127.0.0.1",
     "http://user:pass@127.0.0.1:1234", "http://127.0.0.1:1234/api",
@@ -310,6 +330,65 @@ def test_stream_loss_never_invents_success(tmp_path: Path) -> None:
     events = list(adapter.stream(adapter.start(ctx, "work")))
     assert events[-1].type == "run.failed"
     assert events[-1].payload["error"] == "HARNESS_RECONCILIATION_UNKNOWN"
+
+
+def test_stream_loss_cancels_proven_running_turn_before_failure(
+    tmp_path: Path,
+) -> None:
+    class RunningHost(FakeHost):
+        def call(self, method, payload):
+            result = super().call(method, payload)
+            if method == "session.prompt":
+                self.history = [{"seq": 0, "type": "turn/start", "data": {}}]
+            return result
+
+    seed = FakeHost()
+    ctx = context(tmp_path, seed)
+    live = RunningHost()
+    adapter = DeepSeekAdapter(client_factory=lambda: live)
+    turn = adapter.start(ctx, "work")
+
+    events = list(adapter.stream(turn))
+
+    assert [event.type for event in events] == ["session.started", "run.failed"]
+    assert events[-1].payload["status"] == "failed"
+    assert events[-1].payload["error"] == "HARNESS_HOST_STREAM_LOST"
+    assert [
+        payload for method, payload in live.calls if method == "session.cancel"
+    ] == [{"sessionId": turn.session_ref}]
+    assert live.streams[0].closed is True
+
+
+def test_stream_loss_without_acknowledged_cancel_emits_no_false_terminal(
+    tmp_path: Path,
+) -> None:
+    class RunningHost(FakeHost):
+        def call(self, method, payload):
+            result = super().call(method, payload)
+            if method == "session.prompt":
+                self.history = [{"seq": 0, "type": "turn/start", "data": {}}]
+            if method == "session.cancel":
+                return {"accepted": False}
+            return result
+
+    seed = FakeHost()
+    ctx = context(tmp_path, seed)
+    live = RunningHost()
+    adapter = DeepSeekAdapter(client_factory=lambda: live)
+    turn = adapter.start(ctx, "work")
+    produced = []
+
+    with pytest.raises(AdapterError) as refused:
+        for event in adapter.stream(turn):
+            produced.append(event)
+
+    assert refused.value.code == "HARNESS_HOST_STREAM_LOST"
+    assert [event.type for event in produced] == ["session.started"]
+    assert turn.metadata.get("terminal") is None
+    assert [
+        payload for method, payload in live.calls if method == "session.cancel"
+    ] == [{"sessionId": turn.session_ref}]
+    assert live.streams[0].closed is True
 
 
 def test_approval_cancels_only_owning_session(tmp_path: Path) -> None:

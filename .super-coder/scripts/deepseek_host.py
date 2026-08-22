@@ -477,7 +477,13 @@ def configured_routes(
             raise DeepSeekHostError(
                 "HARNESS_HOST_RESPONSE_INVALID", f"provider {provider} model list is invalid"
             )
-        _profile, endpoint, credential_ref = profiles[provider]
+        profile = profiles.get(provider)
+        if profile is None:
+            raise DeepSeekHostError(
+                "HARNESS_HOST_RESPONSE_INVALID",
+                f"provider {provider} has no usable settings profile",
+            )
+        _profile, endpoint, credential_ref = profile
         status = None
         if credential_ref is not None:
             status = _credential_status(credential_map.get(credential_ref))

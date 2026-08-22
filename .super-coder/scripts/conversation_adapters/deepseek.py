@@ -553,6 +553,7 @@ class DeepSeekAdapter(ConversationAdapter):
             },
             "session.create",
         )
+        stream_error = "HARNESS_HOST_STREAM_LOST"
         try:
             for envelope in stream:
                 payload = (
@@ -594,13 +595,37 @@ class DeepSeekAdapter(ConversationAdapter):
                     return
                 elif frame_type == "stream/error":
                     break
-        except deepseek_host.DeepSeekHostError:
-            pass
+        except deepseek_host.DeepSeekHostError as exc:
+            stream_error = exc.code
         finally:
             stream.close()
         if turn.metadata.get("terminal"):
             return
         result = self.reconcile(turn, turn.metadata["context"])
+        if result.outcome == "running":
+            cancelled = self.interrupt(turn)
+            if not cancelled.acknowledged:
+                raise AdapterError(
+                    "HARNESS_HOST_STREAM_LOST",
+                    "DeepSeek Host stream ended while the native turn remained "
+                    "running, and cancellation was not acknowledged",
+                )
+            terminal = self._terminal(
+                turn,
+                "run.failed",
+                {
+                    "status": "failed",
+                    "error": stream_error,
+                    "detail": (
+                        "DeepSeek Host stream ended while the native turn remained "
+                        "running; session cancellation was acknowledged"
+                    ),
+                },
+                "session.history",
+            )
+            if terminal is not None:
+                yield terminal
+            return
         terminal_type = {
             "cancelled": "run.interrupted",
             "failed": "run.failed",
