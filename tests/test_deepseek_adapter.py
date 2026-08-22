@@ -317,12 +317,14 @@ def provider_notification(
     }
 
 
-def test_manifest_registry_probe_and_surface_contract_are_live() -> None:
+def test_stock_host_selection_withdraws_legacy_carrier_from_live_registry() -> None:
     adapter = DeepSeekAdapter(runtime_probe=lambda **_: runtime_status())
     probe = adapter.probe()
 
-    assert ADAPTER_TYPES["deepseek"] is DeepSeekAdapter
-    assert isinstance(adapter_for("deepseek", runtime_probe=lambda **_: runtime_status()), DeepSeekAdapter)
+    assert "deepseek" not in ADAPTER_TYPES
+    with pytest.raises(AdapterError) as unavailable:
+        adapter_for("deepseek", runtime_probe=lambda **_: runtime_status())
+    assert unavailable.value.code == "HARNESS_CONVERSATION_UNSUPPORTED"
     assert probe.version == probe.verified_version == "0.1.0rc7"
     assert probe.compatibility == "verified"
     assert probe.capabilities.exact_session_resume is True
@@ -332,7 +334,35 @@ def test_manifest_registry_probe_and_surface_contract_are_live() -> None:
     manifest = json.loads((ENGINE / "adapters" / "deepseek" / "adapter.json").read_text())
     assert [
         name for name, enabled in manifest["surfaces"].items() if enabled
-    ] == ["browser"]
+    ] == []
+    assert manifest["conversation"]["selected"] is False
+    assert manifest["conversation"]["legacy"] is True
+    assert manifest["official_runtime"] == {
+        "distribution": "@deepseek-ai/dsh",
+        "version": "0.1.1-rc.2",
+        "tag": "dsh-v0.1.1-rc.2",
+        "commit": "b150a551b8d465e31e418e1b2eaf5e79bbb7d28e",
+        "selected_seam": "stock-host-api",
+        "feasibility_evidence": "assets/deepseek/stock-host-seam.json",
+    }
+    evidence = json.loads(
+        (ENGINE / manifest["official_runtime"]["feasibility_evidence"]).read_text()
+    )
+    assert evidence["selection"] == "stock-host-api"
+    assert evidence["result"] == "passed"
+    assert evidence["configuration_projection"]["credential_descriptor"] == {
+        "configured": True,
+        "source": "file",
+        "writable": True,
+        "value_returned": False,
+    }
+    assert evidence["configuration_projection"]["secret_returned"] is False
+    assert evidence["surface_posture"] == {
+        "terminal": False,
+        "one_shot": False,
+        "browser": False,
+        "sprint": False,
+    }
 
     next_release = checked_version_compatibility(
         harness="deepseek",

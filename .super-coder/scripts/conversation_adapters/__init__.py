@@ -28,7 +28,6 @@ ADAPTER_TYPES = {
     "claude": ClaudeAdapter,
     "codex": CodexAdapter,
     "kimi": KimiAdapter,
-    "deepseek": DeepSeekAdapter,
 }
 
 

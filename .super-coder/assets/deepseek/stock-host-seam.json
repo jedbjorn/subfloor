@@ -1,0 +1,109 @@
+{
+  "schema_version": 1,
+  "recorded_at": "2026-08-22",
+  "spec_document_id": 167,
+  "spec_task_id": 595,
+  "sprint_id": 22,
+  "work_unit_id": 89,
+  "release": {
+    "distribution": "@deepseek-ai/dsh",
+    "version": "0.1.1-rc.2",
+    "tag": "dsh-v0.1.1-rc.2",
+    "commit": "b150a551b8d465e31e418e1b2eaf5e79bbb7d28e",
+    "integrity": "sha512-UP1UIh6q3Gme/yXRn/QL2P8IsVlv8Shpg22TRJIZPsCRWLm4CBiA1MUvXmJAfsOEETBMLAl+xWPtFw6ICsN3wg==",
+    "node": "24.18.1",
+    "package_manager": "pnpm@11.7.0"
+  },
+  "selection": "stock-host-api",
+  "result": "passed",
+  "caller_network_locus": "host process beside the loopback-only Subfloor API server",
+  "transport": {
+    "unary": "loopback HTTP POST /api/<method>",
+    "events": "loopback WebSocket /api/events.mux"
+  },
+  "configuration_projection": {
+    "methods": [
+      "host.describe",
+      "llm.providers",
+      "llm.models",
+      "settings.describe",
+      "credentials.describe"
+    ],
+    "provider": "ollama-cloud",
+    "model": "deepseek-v4-pro:0813",
+    "endpoint_identity": "https://ollama.com/v1",
+    "credential_descriptor": {
+      "configured": true,
+      "source": "file",
+      "writable": true,
+      "value_returned": false
+    },
+    "secret_returned": false
+  },
+  "managed_session": {
+    "caller_stable_session_id_accepted": true,
+    "native_session_id_preserved": true,
+    "exact_route_selected": true,
+    "ordered_event_sequences": {
+      "first_completed_turn": [0, 27],
+      "cancelled_turn": [28, 34],
+      "post_restart_continuation": [35, 89]
+    },
+    "history_inspection": true,
+    "session_scoped_cancellation": {
+      "accepted": true,
+      "terminal_reason": "aborted:user",
+      "host_remained_ready": true
+    },
+    "cold_resume": {
+      "host_process_restarted": true,
+      "same_native_session": true,
+      "same_provider_model": true,
+      "prior_history_restored": true,
+      "ordinary_continuation": true
+    },
+    "reconciliation": true
+  },
+  "one_shot": {
+    "entry": "dsh --profile headless",
+    "ordinary_response": true,
+    "exit_status": 0
+  },
+  "stock_web": {
+    "entry": "dsh web --host 127.0.0.1 --port 0 --no-open",
+    "readiness": true,
+    "bounded_shutdown": true
+  },
+  "fallback_sdk_evaluated": false,
+  "fallback_sdk_reason": "The primary stock Host API passed every lifecycle gate.",
+  "upstream_issue": null,
+  "reconciliation": {
+    "preserve": [
+      "generic harness surface projection and disablement",
+      "generic conversation records, normalized events, transcript, history, and analytics",
+      "generic exact route binding and redacted provider metadata",
+      "generic Sprint participant-chat, wake, interruption, recovery, and handoff machinery"
+    ],
+    "retire_or_replace_in_followup": [
+      "patched Python carrier and carrier worker",
+      "carrier lifecycle patch and fixed Cordis compositions",
+      "fixed DeepSeek and Ollama provider registry",
+      "carrier-backed Browser adapter",
+      "browser-only surface posture"
+    ]
+  },
+  "surface_posture": {
+    "terminal": false,
+    "one_shot": false,
+    "browser": false,
+    "sprint": false
+  },
+  "followup_tasks": {
+    "596": "install and update the official distribution",
+    "597": "add native Web sc enter",
+    "598": "project official configuration through loopback",
+    "599": "implement one-shot and Browser on the selected Host seam",
+    "600": "enable Sprint after the Browser gate",
+    "601": "run bounded promotion"
+  }
+}
