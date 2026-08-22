@@ -74,6 +74,8 @@ class FakeHost:
         self.config = copy.deepcopy(config or configuration())
         self.frames = list(frames)
         self.history = list(history or [])
+        self.existing_session = history is not None
+        self.permission_default = "workspace-write"
         self.calls: list[tuple[str, dict]] = []
         self.streams: list[FakeStream] = []
 
@@ -84,7 +86,32 @@ class FakeHost:
             if method == "credentials.describe":
                 assert request == {"refs": ["ACME_API_KEY"]}
             return copy.deepcopy(self.config[method])
+        if method == "settings.update":
+            self.permission_default = request["patch"]["defaultPreset"]
+            return {
+                "ns": request["ns"],
+                "schema": {},
+                "value": {"defaultPreset": self.permission_default},
+                "applies": "live",
+                "secrets": [],
+                "revision": 1,
+            }
         if method == "session.create":
+            if not self.existing_session:
+                self.history = [
+                    {"seq": 0, "type": "permission/preset", "data": {
+                        "preset": self.permission_default,
+                    }},
+                    {"seq": 1, "type": "sandbox/mode", "data": {
+                        "mode": self.permission_default,
+                    }},
+                    {"seq": 2, "type": "approval/policy", "data": {
+                        "policy": "never"
+                        if self.permission_default == "danger-full-access"
+                        else "ask",
+                    }},
+                ]
+                self.existing_session = True
             return {
                 "sessionId": request["sessionId"],
                 "agentPreset": request.get("agentPreset"),
@@ -98,10 +125,6 @@ class FakeHost:
                 if key in request
             }}
         if method == "session.prompt":
-            if request.get("content") == [{
-                "type": "text", "text": "/permission danger-full-access",
-            }]:
-                return {"accepted": True, "command": {"kind": "success"}}
             return {"accepted": True}
         if method == "session.cancel":
             return {"accepted": True}
@@ -232,13 +255,61 @@ def test_stock_evidence_records_unattended_permission_contract() -> None:
         (ENGINE / "assets/deepseek/stock-host-seam.json").read_text()
     )
     assert evidence["managed_session"]["unattended_permission_preset"] == {
-        "method": "session.prompt",
-        "transport": "loopback HTTP POST /api/session.prompt",
-        "content": [{
-            "type": "text", "text": "/permission danger-full-access",
-        }],
-        "success_contract": {"accepted": True, "command_kind": "success"},
-        "opens_turn": False,
+        "settings_write": {
+            "method": "settings.update",
+            "transport": "loopback HTTP POST /api/settings.update",
+            "payload": {
+                "ns": "permission",
+                "patch": {"defaultPreset": "danger-full-access"},
+            },
+        },
+        "create_hook_event": {
+            "type": "permission/preset",
+            "data": {"preset": "danger-full-access"},
+        },
+        "verification": {
+            "method": "session.history",
+            "transport": "loopback HTTP POST /api/session.history",
+        },
+        "resume_default_write": False,
+        "pinned_sources": [
+            {
+                "path": "packages/host/apiproxy/src/api/rpc-map.ts",
+                "lines": "22-33,63-67",
+                "proves": (
+                    "settings.update and session.history are registered HTTP "
+                    "unary methods"
+                ),
+            },
+            {
+                "path": "packages/host/apiproxy/src/api/settings.ts",
+                "lines": "71-77",
+                "proves": "settings.update accepts ns plus a merge patch",
+            },
+            {
+                "path": "packages/host/apiproxy/src/api-proxy.ts",
+                "lines": "1792-1838,3077",
+                "proves": (
+                    "the settings write commits before its redacted descriptor "
+                    "response"
+                ),
+            },
+            {
+                "path": (
+                    "packages/interaction/permission-presets/src/index.ts"
+                ),
+                "lines": "66-68,208-220,388-400",
+                "proves": (
+                    "permission.defaultPreset is validated and pinned as session "
+                    "creation events"
+                ),
+            },
+            {
+                "path": "packages/host/apiproxy/src/api/sessions.ts",
+                "lines": "247-265",
+                "proves": "session.history returns raw session events",
+            },
+        ],
     }
 
 
@@ -322,11 +393,11 @@ def test_browser_start_stream_and_exact_call_order(tmp_path: Path) -> None:
     ctx = context(tmp_path, seed)
     session = DeepSeekAdapter._new_session_ref(ctx)
     live = FakeHost(frames=[
-        frame(session, {"seq": 0, "type": "turn/start", "data": {}}),
-        frame(session, {"seq": 1, "type": "assistant/chunk", "data": {
+        frame(session, {"seq": 3, "type": "turn/start", "data": {}}),
+        frame(session, {"seq": 4, "type": "assistant/chunk", "data": {
             "chunk": {"type": "text-delta", "text": "hello"},
         }}),
-        frame(session, {"seq": 2, "type": "turn/end", "data": {
+        frame(session, {"seq": 5, "type": "turn/end", "data": {
             "reason": {"kind": "completed"},
         }}),
     ])
@@ -336,19 +407,17 @@ def test_browser_start_stream_and_exact_call_order(tmp_path: Path) -> None:
         "session.started", "run.started", "assistant.delta", "run.completed",
     ]
     assert events[2].payload["text"] == "hello"
-    assert live.calls[-5:] == [
+    assert live.calls[-6:] == [
+        ("settings.update", {
+            "ns": "permission",
+            "patch": {"defaultPreset": "danger-full-access"},
+        }),
         ("session.create", {
             "sessionId": session,
             "cwd": str(tmp_path),
             "agentPreset": "standard",
         }),
-        ("session.prompt", {
-            "sessionId": session,
-            "mode": "queue",
-            "content": [{
-                "type": "text", "text": "/permission danger-full-access",
-            }],
-        }),
+        ("session.history", {"sessionId": session, "maxMessages": 200}),
         ("session.history", {"sessionId": session, "maxMessages": 200}),
         ("session.selectModel", {
             "sessionId": session, "provider": "acme-dynamic", "model": "model-7",
@@ -366,9 +435,18 @@ def test_cold_resume_reuses_session_and_prior_history(tmp_path: Path) -> None:
     seed = FakeHost()
     ctx = context(tmp_path, seed)
     session = DeepSeekAdapter._new_session_ref(ctx)
-    live = FakeHost(history=[{
-        "seq": 0, "type": "turn/end", "data": {"reason": {"kind": "completed"}},
-    }])
+    live = FakeHost(history=[
+        {"seq": 0, "type": "permission/preset", "data": {
+            "preset": "danger-full-access",
+        }},
+        {"seq": 1, "type": "sandbox/mode", "data": {
+            "mode": "danger-full-access",
+        }},
+        {"seq": 2, "type": "approval/policy", "data": {"policy": "never"}},
+        {"seq": 3, "type": "turn/end", "data": {
+            "reason": {"kind": "completed"},
+        }},
+    ])
     turn = DeepSeekAdapter(client_factory=lambda: live).resume(session, ctx, "continue")
     assert turn.session_ref == session
     assert ("session.create", {
@@ -376,79 +454,61 @@ def test_cold_resume_reuses_session_and_prior_history(tmp_path: Path) -> None:
         "cwd": str(tmp_path),
         "agentPreset": "standard",
     }) in live.calls
-    assert ("session.prompt", {
-        "sessionId": session,
-        "mode": "queue",
-        "content": [{
-            "type": "text", "text": "/permission danger-full-access",
-        }],
-    }) in live.calls
-    assert ("session.history", {"sessionId": session, "maxMessages": 200}) in live.calls
+    assert "settings.update" not in [method for method, _payload in live.calls]
+    assert [payload for method, payload in live.calls if method == "session.history"] == [
+        {"sessionId": session, "maxMessages": 200},
+    ]
 
 
-def test_unattended_permission_refusal_stops_before_prompt(tmp_path: Path) -> None:
-    class RefusingHost(FakeHost):
+def test_unattended_permission_history_mismatch_stops_before_prompt(
+    tmp_path: Path,
+) -> None:
+    class MismatchedHost(FakeHost):
         def call(self, method, payload):
             result = super().call(method, payload)
-            if method == "session.prompt" and payload.get("content") == [{
-                "type": "text", "text": "/permission danger-full-access",
-            }]:
-                return {"accepted": True, "command": {"kind": "error"}}
+            if method == "session.history":
+                return {"events": [entry for entry in result["events"]
+                                   if entry["event"]["type"] != "permission/preset"]}
             return result
 
     seed = FakeHost()
     ctx = context(tmp_path, seed)
-    session = DeepSeekAdapter._new_session_ref(ctx)
-    live = RefusingHost()
+    live = MismatchedHost()
 
     with pytest.raises(AdapterError) as refused:
         DeepSeekAdapter(client_factory=lambda: live).start(ctx, "work")
 
     assert refused.value.code == "HARNESS_PERMISSION_POLICY_UNAVAILABLE"
-    prompts = [payload for method, payload in live.calls if method == "session.prompt"]
-    assert prompts == [{
-        "sessionId": session,
-        "mode": "queue",
-        "content": [{
-            "type": "text", "text": "/permission danger-full-access",
-        }],
-    }]
+    assert "session.prompt" not in [method for method, _payload in live.calls]
 
 
-@pytest.mark.parametrize("rpc_code", [
-    "HARNESS_HOST_RPC_UNKNOWN_COMMAND",
-    "HARNESS_HOST_RPC_COMMAND_ERROR",
-])
-def test_unattended_permission_rpc_refusal_stops_before_user_prompt(
+def test_unattended_permission_settings_refusal_stops_before_session_create(
     tmp_path: Path,
-    rpc_code: str,
 ) -> None:
     class RefusingHost(FakeHost):
         def call(self, method, payload):
-            if method == "session.prompt" and payload.get("content") == [{
-                "type": "text", "text": "/permission danger-full-access",
-            }]:
+            if method == "settings.update":
                 self.calls.append((method, dict(payload)))
-                raise deepseek_host.HostRpcError(rpc_code, "permission rejected")
+                raise deepseek_host.HostRpcError(
+                    "HARNESS_HOST_RPC_SETTINGS_REJECTED",
+                    "permission default rejected",
+                )
             return super().call(method, payload)
 
     seed = FakeHost()
     ctx = context(tmp_path, seed)
-    session = DeepSeekAdapter._new_session_ref(ctx)
     live = RefusingHost()
 
     with pytest.raises(AdapterError) as refused:
         DeepSeekAdapter(client_factory=lambda: live).start(ctx, "work")
 
     assert refused.value.code == "HARNESS_PERMISSION_POLICY_UNAVAILABLE"
-    prompts = [payload for method, payload in live.calls if method == "session.prompt"]
-    assert prompts == [{
-        "sessionId": session,
-        "mode": "queue",
-        "content": [{
-            "type": "text", "text": "/permission danger-full-access",
-        }],
-    }]
+    assert live.calls[-1] == ("settings.update", {
+        "ns": "permission",
+        "patch": {"defaultPreset": "danger-full-access"},
+    })
+    assert "session.create" not in [method for method, _payload in live.calls]
+    assert "session.prompt" not in [method for method, _payload in live.calls]
 
 
 def test_stream_loss_never_invents_success(tmp_path: Path) -> None:
@@ -470,7 +530,9 @@ def test_stream_loss_cancels_proven_running_turn_before_failure(
             if method == "session.prompt" and payload.get("content") == [{
                 "type": "text", "text": "work",
             }]:
-                self.history = [{"seq": 0, "type": "turn/start", "data": {}}]
+                self.history.append({
+                    "seq": len(self.history), "type": "turn/start", "data": {},
+                })
             return result
 
     seed = FakeHost()
@@ -499,7 +561,9 @@ def test_stream_loss_without_acknowledged_cancel_emits_no_false_terminal(
             if method == "session.prompt" and payload.get("content") == [{
                 "type": "text", "text": "work",
             }]:
-                self.history = [{"seq": 0, "type": "turn/start", "data": {}}]
+                self.history.append({
+                    "seq": len(self.history), "type": "turn/start", "data": {},
+                })
             if method == "session.cancel":
                 return {"accepted": False}
             return result

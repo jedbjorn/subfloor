@@ -156,6 +156,20 @@ class DeepSeekAdapter(ConversationAdapter):
         resume: bool = False,
     ) -> Mapping[str, Any]:
         agent_preset, permission_preset = self._managed_session()
+        if not resume:
+            try:
+                client.call(
+                    "settings.update",
+                    {
+                        "ns": "permission",
+                        "patch": {"defaultPreset": permission_preset},
+                    },
+                )
+            except deepseek_host.DeepSeekHostError as exc:
+                raise AdapterError(
+                    "HARNESS_PERMISSION_POLICY_UNAVAILABLE",
+                    exc.detail,
+                ) from exc
         try:
             created = client.call(
                 "session.create",
@@ -180,34 +194,23 @@ class DeepSeekAdapter(ConversationAdapter):
                 "HARNESS_SESSION_MISMATCH",
                 "DeepSeek Host did not preserve the managed session preset",
             )
-        try:
-            permission = client.call(
-                "session.prompt",
-                {
-                    "sessionId": session_ref,
-                    "mode": "queue",
-                    "content": [{
-                        "type": "text",
-                        "text": f"/permission {permission_preset}",
-                    }],
-                },
-            )
-        except deepseek_host.DeepSeekHostError as exc:
-            raise AdapterError(
-                "HARNESS_PERMISSION_POLICY_UNAVAILABLE",
-                exc.detail,
-            ) from exc
-        command = permission.get("command") if isinstance(permission, Mapping) else None
-        if (
-            not isinstance(permission, Mapping)
-            or permission.get("accepted") is not True
-            or not isinstance(command, Mapping)
-            or command.get("kind") != "success"
-        ):
-            raise AdapterError(
-                "HARNESS_PERMISSION_POLICY_UNAVAILABLE",
-                "DeepSeek Host did not apply the unattended permission preset",
-            )
+        if not resume:
+            try:
+                history = self._history(client, session_ref)
+            except deepseek_host.DeepSeekHostError as exc:
+                raise AdapterError(
+                    "HARNESS_PERMISSION_POLICY_UNAVAILABLE",
+                    exc.detail,
+                ) from exc
+            if not any(
+                event.get("type") == "permission/preset"
+                and event.get("data") == {"preset": permission_preset}
+                for event in history
+            ):
+                raise AdapterError(
+                    "HARNESS_PERMISSION_POLICY_UNAVAILABLE",
+                    "DeepSeek Host did not pin the unattended permission preset",
+                )
         return created
 
     def probe(self) -> ProbeResult:

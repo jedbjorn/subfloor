@@ -45,11 +45,50 @@
     "native_session_id_preserved": true,
     "exact_route_selected": true,
     "unattended_permission_preset": {
-      "method": "session.prompt",
-      "transport": "loopback HTTP POST /api/session.prompt",
-      "content": [{"type": "text", "text": "/permission danger-full-access"}],
-      "success_contract": {"accepted": true, "command_kind": "success"},
-      "opens_turn": false
+      "settings_write": {
+        "method": "settings.update",
+        "transport": "loopback HTTP POST /api/settings.update",
+        "payload": {
+          "ns": "permission",
+          "patch": {"defaultPreset": "danger-full-access"}
+        }
+      },
+      "create_hook_event": {
+        "type": "permission/preset",
+        "data": {"preset": "danger-full-access"}
+      },
+      "verification": {
+        "method": "session.history",
+        "transport": "loopback HTTP POST /api/session.history"
+      },
+      "resume_default_write": false,
+      "pinned_sources": [
+        {
+          "path": "packages/host/apiproxy/src/api/rpc-map.ts",
+          "lines": "22-33,63-67",
+          "proves": "settings.update and session.history are registered HTTP unary methods"
+        },
+        {
+          "path": "packages/host/apiproxy/src/api/settings.ts",
+          "lines": "71-77",
+          "proves": "settings.update accepts ns plus a merge patch"
+        },
+        {
+          "path": "packages/host/apiproxy/src/api-proxy.ts",
+          "lines": "1792-1838,3077",
+          "proves": "the settings write commits before its redacted descriptor response"
+        },
+        {
+          "path": "packages/interaction/permission-presets/src/index.ts",
+          "lines": "66-68,208-220,388-400",
+          "proves": "permission.defaultPreset is validated and pinned as session creation events"
+        },
+        {
+          "path": "packages/host/apiproxy/src/api/sessions.ts",
+          "lines": "247-265",
+          "proves": "session.history returns raw session events"
+        }
+      ]
     },
     "ordered_event_sequences": {
       "first_completed_turn": [0, 27],
