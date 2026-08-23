@@ -573,6 +573,7 @@ def ensure(
             allowed_peers=allowed_peers,
             credential_shell=credential_shell,
         )
+        generation = None
         if not reused:
             _stop_unlocked()
             executable = shutil.which("dsh")
@@ -653,11 +654,13 @@ def ensure(
                         "DeepSeek loopback publication relay did not become ready",
                     )
                 url = f"http://127.0.0.1:{relay_port}/?sc_generation={generation}"
-                state["url"] = url
         elif credential_shell is not None:
             # Repair a missing/stale artifact (for example after shell-key
             # rotation) without restarting an otherwise healthy same-shell Host.
             _write_shell_credential(env)
+        if sandbox:
+            generation = generation or _read_generation(_generation_path())
+            url = f"http://127.0.0.1:{relay_port}/?sc_generation={generation}"
         registration = _post_workspace(service_port, selected)
         state.update(
             {
@@ -667,7 +670,7 @@ def ensure(
             }
         )
         _write_state(state)
-        return {"url": url, "reused": reused, **registration, **state}
+        return {**state, **registration, "url": url, "reused": reused}
 
 
 def status() -> dict[str, Any]:

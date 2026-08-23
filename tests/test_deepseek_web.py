@@ -111,6 +111,7 @@ def test_ensure_starts_exact_stock_web_relay_registers_and_reuses() -> None:
         state = json.loads((root / "state.json").read_text())
         assert state["last_worktree"] == str(worktree)
         assert state["last_workspace_id"] == "ws-4"
+        assert "sc_generation=" not in state["url"]
 
 
 def test_shell_identity_reaches_stock_host_only_through_owner_only_artifact() -> None:
