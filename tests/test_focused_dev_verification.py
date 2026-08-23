@@ -11,7 +11,10 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 ENGINE = ROOT / ".super-coder"
 ASSETS = ENGINE / "assets" / "skills"
-MIGRATION = ENGINE / "migrations" / "0225_focused_dev_verification.sql"
+MIGRATIONS = (
+    ENGINE / "migrations" / "0225_focused_dev_verification.sql",
+    ENGINE / "migrations" / "0231_suppress_aborted_sprint_pr_wakes.sql",
+)
 sys.path.insert(0, str(ENGINE / "scripts"))
 
 import seed_skills  # noqa: E402
@@ -105,7 +108,7 @@ class FocusedDeveloperVerificationMigrationTest(unittest.TestCase):
         original_planner = self.con.execute(
             "SELECT system_prompt FROM shells WHERE shell_id=3"
         ).fetchone()[0]
-        migration = MIGRATION.read_text()
+        migration = "\n".join(path.read_text() for path in MIGRATIONS)
 
         self.con.executescript(migration)
         first_prompts = dict(

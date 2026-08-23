@@ -1390,6 +1390,9 @@ class SprintPRWatcher:
                 ),
             )
 
+        if registered["lifecycle"] == "aborted":
+            return resolved_review_message_ids
+
         instructions = {
             "red": "Your PR went red; fix it.",
             "green": "Your PR is green; judge readiness and pass the baton to review.",

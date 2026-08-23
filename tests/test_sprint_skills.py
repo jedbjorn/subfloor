@@ -1663,7 +1663,11 @@ class SprintSkillTest(unittest.TestCase):
         developer = bodies["sprint_dev"]
         reviewer = bodies["sprint_rev"]
         planner = bodies["sprint_pln"]
+        normalized_developer = " ".join(developer.split())
         self.assertIn("outside an armed Sprint", developer)
+        self.assertIn("attached to an aborted Sprint", normalized_developer)
+        self.assertIn("observation without a wake", normalized_developer)
+        self.assertIn("reconciliation restores wakes", normalized_developer)
         self.assertIn("Reviewer decides", developer)
         self.assertIn("recalling unreleased work", " ".join(reviewer.split()))
         self.assertIn("Compile the bounded evidence packet first", reviewer)
