@@ -648,7 +648,14 @@ def _read_activity(*, required: bool) -> dict[str, Any]:
             or boundary < 0
         ):
             raise _activity_error("DeepSeek Web activity requests are invalid")
-        checked[request_id] = {"session_id": session_id, "boundary": boundary}
+        status = record.get("status")
+        if status not in {"pending", "accepted"}:
+            raise _activity_error("DeepSeek Web activity requests are invalid")
+        checked[request_id] = {
+            "session_id": session_id,
+            "boundary": boundary,
+            "status": status,
+        }
     return {"admission": value["admission"], "requests": checked}
 
 
@@ -673,6 +680,7 @@ def _write_activity(value: Mapping[str, Any]) -> None:
 def _initialize_activity() -> None:
     with _gateway_lock():
         _write_activity({"admission": "open", "requests": {}})
+        _write_reservation(None)
 
 
 def _history_boundary(service_port: int, session_id: str) -> int:
@@ -739,6 +747,7 @@ def _drain_gateway_work(state: Mapping[str, Any], activity: Mapping[str, Any]) -
         request_id: record
         for request_id, record in requests.items()
         if not isinstance(record, Mapping)
+        or record.get("status") != "accepted"
         or not _history_is_terminal(
             service_port,
             str(record.get("session_id")),
@@ -754,9 +763,7 @@ def _drain_gateway_work(state: Mapping[str, Any], activity: Mapping[str, Any]) -
     return not pending
 
 
-def _record_browser_prompt(
-    service_port: int, session_id: str, request_id: str
-) -> None:
+def _record_browser_prompt(service_port: int, session_id: str) -> str:
     with _gateway_lock():
         activity = _read_activity(required=True)
         if activity["admission"] != "open":
@@ -766,11 +773,31 @@ def _record_browser_prompt(
                 "HARNESS_WEB_SESSION_BUSY",
                 "a managed DeepSeek turn owns this native session",
             )
-        boundary = _history_boundary(service_port, session_id)
+        if any(record["session_id"] == session_id for record in activity["requests"].values()):
+            raise DeepSeekWebError(
+                "HARNESS_WEB_SESSION_BUSY",
+                "native Web already owns an accepted or pending prompt for this session",
+            )
+        request_id = uuid.uuid4().hex
         activity["requests"][request_id] = {
             "session_id": session_id,
-            "boundary": boundary,
+            "boundary": _history_boundary(service_port, session_id),
+            "status": "pending",
         }
+        _write_activity(activity)
+        return request_id
+
+
+def _settle_browser_prompt(request_id: str, *, accepted: bool) -> None:
+    with _gateway_lock():
+        activity = _read_activity(required=True)
+        record = activity["requests"].get(request_id)
+        if record is None:
+            raise _activity_error("DeepSeek Web prompt evidence disappeared")
+        if accepted:
+            record["status"] = "accepted"
+        else:
+            del activity["requests"][request_id]
         _write_activity(activity)
 
 
@@ -789,7 +816,7 @@ def reserve_managed_session(session_id: str) -> None:
         active = {
             request_id: record
             for request_id, record in activity["requests"].items()
-            if not _history_is_terminal(
+            if record.get("status") != "accepted" or not _history_is_terminal(
                 service_port, record["session_id"], record["boundary"]
             )
         }
@@ -800,46 +827,47 @@ def reserve_managed_session(session_id: str) -> None:
             )
         activity["requests"] = active
         _write_activity(activity)
-        path = _reservation_path()
-        temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
-        descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-        try:
-            with os.fdopen(descriptor, "w") as handle:
-                os.fchmod(handle.fileno(), 0o600)
-                json.dump({"session_id": session_id}, handle)
-                handle.write("\n")
-            os.replace(temporary, path)
-        except OSError:
-            try:
-                temporary.unlink()
-            except FileNotFoundError:
-                pass
-            raise
+        _write_reservation(session_id)
 
 
 def release_managed_session(session_id: str) -> None:
     with _gateway_lock():
+        if _reserved_session() == session_id:
+            _write_reservation(None)
+
+
+def _write_reservation(session_id: str | None) -> None:
+    path = _reservation_path()
+    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        with os.fdopen(descriptor, "w") as handle:
+            os.fchmod(handle.fileno(), 0o600)
+            json.dump({"session_id": session_id}, handle)
+            handle.write("\n")
+        os.replace(temporary, path)
+    except OSError:
         try:
-            value = json.loads(_reservation_path().read_text())
-        except (OSError, json.JSONDecodeError):
-            return
-        if isinstance(value, Mapping) and value.get("session_id") == session_id:
-            try:
-                _reservation_path().unlink()
-            except FileNotFoundError:
-                pass
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+        raise
 
 
 def _reserved_session() -> str | None:
     try:
         path = _reservation_path()
         if path.is_symlink() or path.stat().st_mode & 0o777 != 0o600:
-            return None
+            raise OSError("unsafe managed-session reservation")
         value = json.loads(path.read_text())
-    except (OSError, json.JSONDecodeError):
-        return None
+    except (OSError, json.JSONDecodeError) as exc:
+        raise _activity_error("DeepSeek Web managed-session reservation is unavailable") from exc
     session_id = value.get("session_id") if isinstance(value, Mapping) else None
-    return session_id if isinstance(session_id, str) else None
+    if session_id is None:
+        return None
+    if re.fullmatch(r"sc-[0-9a-f]{32}", session_id) is None:
+        raise _activity_error("DeepSeek Web managed-session reservation is invalid")
+    return session_id
 
 
 def _write_generation() -> str:
@@ -944,6 +972,8 @@ def _existing_healthy(
     credential_shell: str | None,
     credential_shell_id: int | None,
 ) -> bool:
+    if state.get("schema_version") != 3:
+        return False
     if state.get("service_port") != service_port:
         return False
     if not _verified_process(state.get("web_pid"), state.get("web_start_ticks"), "web"):
@@ -1051,7 +1081,7 @@ def ensure(
                 env=web_env,
             )
             state = {
-                "schema_version": 2,
+                "schema_version": 3,
                 "web_pid": web_pid,
                 "web_start_ticks": web_ticks,
                 "service_port": service_port,
@@ -1204,6 +1234,7 @@ async def _relay_connection(
         for item in cookie.split(";") if "=" in item
     }
     query_generation = None
+    clean_target = None
     if len(request_line) == 3:
         parsed_target = urllib.parse.urlsplit(request_line[1])
         query = urllib.parse.parse_qs(parsed_target.query)
@@ -1211,6 +1242,7 @@ async def _relay_connection(
         if query_generation is not None:
             clean_query = [(key, value) for key, values in query.items() for value in values if key != "sc_generation"]
             request_line[1] = urllib.parse.urlunsplit(("", "", parsed_target.path or "/", urllib.parse.urlencode(clean_query), ""))
+            clean_target = request_line[1]
             lines[0] = " ".join(request_line)
             request = ("\r\n".join(lines)).encode("iso-8859-1")
     if generation is not None and (
@@ -1222,6 +1254,21 @@ async def _relay_connection(
             b"HTTP/1.1 409 Conflict\r\nContent-Type: application/json\r\n"
             + f"Content-Length: {len(body)}\r\nConnection: close\r\n\r\n".encode()
             + body
+        )
+        await writer.drain()
+        writer.close()
+        await writer.wait_closed()
+        return
+    if query_generation is not None:
+        # Consume the one-shot capability before the upstream app sees a
+        # request.  The browser retains only this clean URL in history and its
+        # subsequent Referer cannot disclose the generation to DSH.
+        assert clean_target is not None
+        writer.write(
+            b"HTTP/1.1 302 Found\r\n"
+            + f"Location: {clean_target}\r\n".encode("iso-8859-1")
+            + f"Set-Cookie: {GENERATION_COOKIE}={generation}; HttpOnly; SameSite=Strict; Path=/\r\n".encode("iso-8859-1")
+            + b"Cache-Control: no-store\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
         )
         await writer.drain()
         writer.close()
@@ -1270,8 +1317,20 @@ async def _relay_connection(
             await writer.wait_closed()
             return
         if target.startswith("/api/session.cancel"):
-            with _gateway_lock():
-                reserved = _reserved_session()
+            try:
+                with _gateway_lock():
+                    reserved = _reserved_session()
+            except DeepSeekWebError as exc:
+                body = json.dumps({"error": exc.code}, separators=(",", ":")).encode()
+                writer.write(
+                    b"HTTP/1.1 409 Conflict\r\nContent-Type: application/json\r\n"
+                    + f"Content-Length: {len(body)}\r\nConnection: close\r\n\r\n".encode()
+                    + body
+                )
+                await writer.drain()
+                writer.close()
+                await writer.wait_closed()
+                return
         else:
             reserved = None
         if session_id == reserved:
@@ -1285,14 +1344,10 @@ async def _relay_connection(
             writer.close()
             await writer.wait_closed()
             return
+        prompt_record_id = None
         if target.startswith("/api/session.prompt"):
-            request_id = payload.get("rpcId") if isinstance(payload, Mapping) else None
             try:
-                _record_browser_prompt(
-                    target_port,
-                    session_id,
-                    request_id if isinstance(request_id, str) and request_id else uuid.uuid4().hex,
-                )
+                prompt_record_id = _record_browser_prompt(target_port, session_id)
             except DeepSeekWebError as exc:
                 body = json.dumps({"error": exc.code}, separators=(",", ":")).encode()
                 writer.write(
@@ -1305,26 +1360,43 @@ async def _relay_connection(
                 await writer.wait_closed()
                 return
         request += body
+    headers = [
+        line for line in lines[1:]
+        if line
+        and not (line.lower().startswith("referer:") and "sc_generation=" in line.lower())
+    ]
     if not websocket:
         headers = [
-            line for line in lines[1:]
-            if line and not line.lower().startswith("connection:")
+            line for line in headers if not line.lower().startswith("connection:")
         ]
         request = "\r\n".join(
             [lines[0], *headers, "Connection: close", "", ""]
         ).encode("iso-8859-1")
         if target.startswith(("/api/session.prompt", "/api/session.cancel")):
             request += body
+    else:
+        request = "\r\n".join([lines[0], *headers, "", ""]).encode("iso-8859-1")
     try:
         upstream_reader, upstream_writer = await asyncio.open_connection(
             "127.0.0.1", target_port
         )
     except OSError:
+        if "prompt_record_id" in locals() and prompt_record_id is not None:
+            _settle_browser_prompt(prompt_record_id, accepted=False)
         writer.close()
         await writer.wait_closed()
         return
-    upstream_writer.write(request)
-    await upstream_writer.drain()
+    try:
+        upstream_writer.write(request)
+        await upstream_writer.drain()
+    except OSError:
+        # The TCP peer accepted a connection; whether it consumed the prompt is
+        # unknowable, so preserve the pending record and fail handoff closed.
+        upstream_writer.close()
+        writer.close()
+        await upstream_writer.wait_closed()
+        await writer.wait_closed()
+        return
 
     try:
         response = await asyncio.wait_for(upstream_reader.readuntil(b"\r\n\r\n"), timeout=HTTP_TIMEOUT_SECONDS)
@@ -1334,10 +1406,38 @@ async def _relay_connection(
         await upstream_writer.wait_closed()
         await writer.wait_closed()
         return
-    response_lines = response.decode("iso-8859-1").split("\r\n")
-    if generation is not None:
-        response_lines.insert(-2, f"Set-Cookie: {GENERATION_COOKIE}={generation}; HttpOnly; SameSite=Strict; Path=/")
-    writer.write("\r\n".join(response_lines).encode("iso-8859-1"))
+    if "prompt_record_id" in locals() and prompt_record_id is not None:
+        response_lines = response.decode("iso-8859-1").split("\r\n")
+        raw_length = next(
+            (line.split(":", 1)[1].strip() for line in response_lines if line.lower().startswith("content-length:")),
+            None,
+        )
+        try:
+            response_body = await asyncio.wait_for(
+                upstream_reader.readexactly(int(raw_length or "-1")), timeout=HTTP_TIMEOUT_SECONDS
+            )
+            result = json.loads(response_body).get("result")
+            accepted = (
+                isinstance(result, Mapping)
+                and result.get("ok") is True
+                and isinstance(result.get("value"), Mapping)
+                and result["value"].get("accepted") is True
+            )
+        except (ValueError, asyncio.IncompleteReadError, TimeoutError, json.JSONDecodeError):
+            upstream_writer.close()
+            writer.close()
+            await upstream_writer.wait_closed()
+            await writer.wait_closed()
+            return
+        _settle_browser_prompt(prompt_record_id, accepted=accepted)
+        writer.write(response + response_body)
+        await writer.drain()
+        upstream_writer.close()
+        writer.close()
+        await upstream_writer.wait_closed()
+        await writer.wait_closed()
+        return
+    writer.write(response)
     await writer.drain()
 
     async def copy(source: asyncio.StreamReader, destination: asyncio.StreamWriter) -> None:

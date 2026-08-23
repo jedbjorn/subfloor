@@ -393,6 +393,101 @@ class HarnessSurfaceProjectionTest(unittest.TestCase):
         self.assertEqual(captured["SC_API_BASE"], "http://127.0.0.1:8837")
         self.assertNotIn("sc_generation=", transcript.getvalue())
 
+    def test_public_deepseek_run_overwrites_absent_or_stale_shell_id_at_exec(self) -> None:
+        class Con:
+            def execute(self, *_args):
+                return self
+
+            def fetchone(self):
+                return {
+                    "shell_id": 5,
+                    "display_name": "Code-01",
+                    "shortname": "DEV3",
+                    "api_key": "canonical-token",
+                    "flavor": "dev",
+                }
+
+            def close(self) -> None:
+                return None
+
+        class Spinner:
+            label = ""
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return None
+
+        with tempfile.TemporaryDirectory() as raw:
+            worktree = Path(raw) / "worktree"
+            worktree.mkdir()
+            chosen = {"shell_id": 5, "shortname": "DEV3", "flavor": "dev"}
+            adapter = {
+                "harness": "deepseek",
+                "surfaces": {"one_shot": True},
+                "headless": {"engine_script": "deepseek_one_shot.py"},
+            }
+            captured = {}
+            fake_analytics = types.SimpleNamespace(
+                sweep=lambda **_kwargs: {"inserted": 0, "updated": 0}
+            )
+            with mock.patch.dict(
+                run.os.environ, {"SC_SHELL_ID": "999", "SC_NO_AUTOPRUNE": "1"}, clear=True
+            ), ExitStack() as stack:
+                for patcher in (
+                    mock.patch.object(run.sys, "argv", ["run.py", "DEV3", "--headless", "--harness", "deepseek", "--prompt", "hello"]),
+                    mock.patch.object(run.sys.stdin, "isatty", return_value=False),
+                    mock.patch.object(run.callable_floor, "require_callable_floor"),
+                    mock.patch.object(run.install, "is_source_repo", return_value=True),
+                    mock.patch.object(run.subprocess, "run", return_value=mock.Mock(returncode=0)),
+                    mock.patch.object(run.global_pointer, "write_global_pointers"),
+                    mock.patch.object(run, "open_db", return_value=Con()),
+                    mock.patch.object(run.seed_skills, "sync_engine_skills", return_value=[]),
+                    mock.patch.object(run, "authenticate", return_value={"user_id": 1}),
+                    mock.patch.object(run, "flavor_defaults", return_value={"dev": {"default_harness": "deepseek", "models": {"deepseek": None}}}),
+                    mock.patch.object(run, "list_shells", return_value=[chosen]),
+                    mock.patch.object(run, "pick_shell", return_value=chosen),
+                    mock.patch.object(run.shell_liveness, "compute", return_value={"supported": False, "indeterminate": 0}),
+                    mock.patch.object(run, "ensure_harness_path"),
+                    mock.patch.object(run, "load_adapter", return_value=adapter),
+                    mock.patch.object(run, "resolve_headless_route", return_value=run.ResolvedHeadlessRoute("deepseek", None, None, None)),
+                    mock.patch.object(run, "headless_command", return_value=["deepseek-one-shot", "hello"]),
+                    mock.patch.object(run, "cleanup_before_launch"),
+                    mock.patch.object(run.style, "spinner", return_value=Spinner()),
+                    mock.patch.object(run, "open_session", return_value=(17, 18)),
+                    mock.patch.object(run.ports_mod, "resolve", return_value={"port": 8837}),
+                    mock.patch.object(run, "shell_work_dir", return_value=worktree),
+                    mock.patch.object(run, "ensure_worktree"),
+                    mock.patch.object(run, "sync_worktree", return_value="current"),
+                    mock.patch.object(run, "link_worktree_map", return_value=None),
+                    mock.patch.object(run, "main_checkout_note", return_value="current"),
+                    mock.patch.object(run, "declared_work_repo_note", return_value="current"),
+                    mock.patch.object(run, "compose_boot", return_value="boot"),
+                    mock.patch.object(run, "render_harness_skills", return_value={"written": [], "deleted": [], "skipped": [], "dirs": []}),
+                    mock.patch.object(run, "atomic_write"),
+                    mock.patch.object(run, "emit_adapter", return_value=[]),
+                    mock.patch.object(run, "resolve_opencode_plugins"),
+                    mock.patch.object(run, "apply_merge_json", return_value=[]),
+                    mock.patch.object(run, "apply_managed_mcp", return_value=[]),
+                    mock.patch.object(run, "apply_sandbox", return_value=[]),
+                    mock.patch.object(run, "record_launch"),
+                    mock.patch.object(run.os, "execvpe", side_effect=lambda _cmd, _argv, env: captured.update(env)),
+                    mock.patch.dict(sys.modules, {"analytics": fake_analytics}),
+                ):
+                    stack.enter_context(patcher)
+                run.main()
+                stale_identity_env = dict(captured)
+                captured.clear()
+                run.os.environ.pop("SC_SHELL_ID")
+                run.main()
+
+        assert captured["SC_SHELL_ID"] == "5"
+        assert captured["SC_SHELL_SHORTNAME"] == "DEV3"
+        assert captured["SC_API_TOKEN"] == "canonical-token"
+        assert captured["SC_API_BASE"] == "http://127.0.0.1:8837"
+        assert stale_identity_env["SC_SHELL_ID"] == "5"
+
     def test_explicit_unsupported_terminal_and_one_shot_requests_fail_early(self) -> None:
         adapter = {
             "harness": "deepseek",

@@ -8,6 +8,7 @@ import socket
 import subprocess
 import sys
 import time
+import urllib.error
 import urllib.request
 from pathlib import Path
 
@@ -58,8 +59,10 @@ def test_pinned_stock_dsh_workspace_session_archive_contract(
 
     port = _free_port()
     dsh_home = tmp_path / "dsh-home"
-    workspace = tmp_path / "workspace"
+    workspace = tmp_path / "workspace-a"
+    other_workspace = tmp_path / "workspace-b"
     workspace.mkdir()
+    other_workspace.mkdir()
     environment = {
         **os.environ,
         "DSH_HOME": str(dsh_home),
@@ -79,21 +82,36 @@ def test_pinned_stock_dsh_workspace_session_archive_contract(
         client = deepseek_host.DeepSeekHostClient(timeout=2)
         created = client.call("workspace.create", {"path": str(workspace)})
         workspace_id = created["workspace"]["workspaceId"]
+        second = client.call("workspace.create", {"path": str(other_workspace)})
+        second_workspace_id = second["workspace"]["workspaceId"]
+        assert second["workspace"]["path"] == str(other_workspace)
+        assert second_workspace_id != workspace_id
         session_id = "sc-stock-contract"
-        assert client.call(
+        first_session = client.call(
             "session.create",
             {
                 "workspaceId": workspace_id,
                 "sessionId": session_id,
                 "agentPreset": "standard",
             },
-        )["sessionId"] == session_id
+        )
+        retry_session = client.call(
+            "session.create",
+            {
+                "workspaceId": workspace_id,
+                "sessionId": session_id,
+                "agentPreset": "standard",
+            },
+        )
+        assert first_session == {"sessionId": session_id, "agentPreset": "standard"}
+        assert retry_session == first_session
 
         listed = client.call("workspace.list", {})
         row = next(item for item in listed["items"] if item["workspaceId"] == workspace_id)
         assert row["path"] == str(workspace)
         assert row["sessionIds"] == [session_id]
         session_rows = client.call("session.list", {"workspaceId": workspace_id})
+        assert len(session_rows["items"]) == 1
         assert session_rows["items"][0]["sessionId"] == session_id
         assert session_rows["items"][0]["cwd"] == str(workspace)
 
@@ -107,6 +125,29 @@ def test_pinned_stock_dsh_workspace_session_archive_contract(
         # Stock DSH preserves the workspace membership row while publishing the
         # archive set separately; callers must check both facts before reuse.
         assert row_after_archive["sessionIds"] == [session_id]
+        archived_rows = client.call("session.list", {"workspaceId": workspace_id})
+        assert archived_rows["items"] == session_rows["items"]
+
+        with pytest.raises(deepseek_host.HostRpcError) as conflict:
+            client.call(
+                "session.create",
+                {
+                    "workspaceId": second_workspace_id,
+                    "sessionId": session_id,
+                    "agentPreset": "standard",
+                },
+            )
+        assert conflict.value.code == "HARNESS_HOST_RPC_SESSION_CONFLICT"
+
+        unknown = urllib.request.Request(
+            f"http://127.0.0.1:{port}/api/workspace.unarchiveSession",
+            data=b"{}",
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with pytest.raises(urllib.error.HTTPError) as absent:
+            urllib.request.urlopen(unknown, timeout=2)
+        assert absent.value.code == 404
     finally:
         process.terminate()
         try:

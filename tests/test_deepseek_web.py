@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import importlib
 import json
+import socket
 import sys
 import tempfile
 from contextlib import suppress
@@ -322,7 +323,11 @@ def test_unproven_browser_work_refuses_handoff_before_gateway_termination() -> N
             deepseek_web._write_activity({
                 "admission": "open",
                 "requests": {
-                    "browser-rpc": {"session_id": session_id, "boundary": 0},
+                    "browser-rpc": {
+                        "session_id": session_id,
+                        "boundary": 0,
+                        "status": "accepted",
+                    },
                 },
             })
             with pytest.raises(deepseek_web.DeepSeekWebError) as refused:
@@ -332,7 +337,13 @@ def test_unproven_browser_work_refuses_handoff_before_gateway_termination() -> N
         assert refused.value.code == "HARNESS_WEB_GATEWAY_BUSY"
         assert calls == []
         assert credential.read_text() == "credential"
-        assert active == {"browser-rpc": {"session_id": session_id, "boundary": 0}}
+        assert active == {
+            "browser-rpc": {
+                "session_id": session_id,
+                "boundary": 0,
+                "status": "accepted",
+            }
+        }
 
 
 def test_disabled_deepseek_stops_owned_service_without_launching() -> None:
@@ -520,11 +531,10 @@ def test_relay_rejects_sibling_source_before_opening_stock_host() -> None:
 
 def test_gateway_rejects_stale_generation_before_stock_host_forwarding() -> None:
     async def scenario() -> None:
-        upstream_connections: list[tuple[str, int]] = []
+        upstream_requests: list[bytes] = []
 
         async def upstream_handler(reader, writer) -> None:
-            upstream_connections.append(writer.get_extra_info("peername"))
-            await reader.readuntil(b"\r\n\r\n")
+            upstream_requests.append(await reader.readuntil(b"\r\n\r\n"))
             writer.write(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
             await writer.drain()
             writer.close()
@@ -540,10 +550,10 @@ def test_gateway_rejects_stale_generation_before_stock_host_forwarding() -> None
         )
         gateway_port = gateway.sockets[0].getsockname()[1]
 
-        async def request(target: str) -> bytes:
+        async def request(target: str, headers: bytes = b"") -> bytes:
             reader, writer = await asyncio.open_connection("127.0.0.1", gateway_port)
             try:
-                writer.write(f"GET {target} HTTP/1.1\r\nHost: test\r\n\r\n".encode())
+                writer.write(f"GET {target} HTTP/1.1\r\nHost: test\r\n".encode() + headers + b"\r\n")
                 await writer.drain()
                 return await asyncio.wait_for(reader.read(512), timeout=1)
             finally:
@@ -552,13 +562,33 @@ def test_gateway_rejects_stale_generation_before_stock_host_forwarding() -> None
 
         try:
             admitted = await request("/?sc_generation=" + "a" * 64)
-            assert b"HTTP/1.1 200 OK" in admitted
+            assert b"HTTP/1.1 302 Found" in admitted
+            assert b"Location: /\r\n" in admitted
             assert b"Set-Cookie: sc_deepseek_generation=" + b"a" * 64 in admitted
-            assert len(upstream_connections) == 1
+            assert upstream_requests == []
+
+            clean = await request(
+                "/",
+                b"Cookie: sc_deepseek_generation=" + b"a" * 64 + b"\r\n"
+                + b"Referer: http://127.0.0.1/?sc_generation=" + b"a" * 64 + b"\r\n",
+            )
+            assert b"HTTP/1.1 200 OK" in clean
+            assert len(upstream_requests) == 1
+            assert b"sc_generation=" not in upstream_requests[0]
+
+            websocket = await request(
+                "/api/events.mux",
+                b"Cookie: sc_deepseek_generation=" + b"a" * 64 + b"\r\n"
+                + b"Upgrade: websocket\r\nConnection: Upgrade\r\n"
+                + b"Referer: http://127.0.0.1/?sc_generation=" + b"a" * 64 + b"\r\n",
+            )
+            assert b"HTTP/1.1 200 OK" in websocket
+            assert len(upstream_requests) == 2
+            assert b"sc_generation=" not in upstream_requests[1]
 
             stale = await request("/")
             assert stale == b'HTTP/1.1 409 Conflict\r\nContent-Type: application/json\r\nContent-Length: 40\r\nConnection: close\r\n\r\n{"error":"HARNESS_WEB_GENERATION_STALE"}'
-            assert len(upstream_connections) == 1
+            assert len(upstream_requests) == 2
         finally:
             gateway.close()
             upstream.close()
@@ -596,8 +626,9 @@ def test_gateway_refuses_prompt_to_the_reserved_managed_session() -> None:
             reader, writer = await asyncio.open_connection("127.0.0.1", gateway_port)
             try:
                 writer.write(
-                    b"POST /api/session.prompt?sc_generation=" + b"a" * 64
-                    + b" HTTP/1.1\r\nHost: test\r\nContent-Type: application/json\r\n"
+                    b"POST /api/session.prompt HTTP/1.1\r\nHost: test\r\n"
+                    + b"Cookie: sc_deepseek_generation=" + b"a" * 64
+                    + b"\r\nContent-Type: application/json\r\n"
                     + f"Content-Length: {len(payload)}\r\n\r\n".encode()
                     + payload
                 )
@@ -619,6 +650,203 @@ def test_gateway_refuses_prompt_to_the_reserved_managed_session() -> None:
         with mock.patch.dict(
             deepseek_web.os.environ, service_env(Path(raw)), clear=False
         ):
+            asyncio.run(scenario(Path(raw)))
+
+
+def test_gateway_refuses_missing_or_unsafe_managed_reservation_before_forwarding() -> None:
+    async def scenario(root: Path) -> None:
+        upstream_connections: list[object] = []
+
+        async def upstream_handler(_reader, writer) -> None:
+            upstream_connections.append(writer.get_extra_info("peername"))
+            writer.close()
+            await writer.wait_closed()
+
+        upstream = await asyncio.start_server(upstream_handler, "127.0.0.1", 0)
+        target_port = upstream.sockets[0].getsockname()[1]
+        (root / "state.json").write_text(json.dumps({"service_port": target_port}))
+        deepseek_web._initialize_activity()
+        deepseek_web._reservation_path().unlink()
+        gateway = await asyncio.start_server(
+            lambda reader, writer: deepseek_web._relay_connection(
+                reader, writer, target_port, frozenset({"127.0.0.1"}), "a" * 64
+            ),
+            "127.0.0.1", 0,
+        )
+        gateway_port = gateway.sockets[0].getsockname()[1]
+        session_id = "sc-" + "9" * 32
+        payload = json.dumps({"payload": {"sessionId": session_id}}).encode()
+
+        async def request(method: str) -> bytes:
+            reader, writer = await asyncio.open_connection("127.0.0.1", gateway_port)
+            try:
+                writer.write(
+                    f"POST /api/session.{method} HTTP/1.1\r\nHost: test\r\n".encode()
+                    + b"Cookie: sc_deepseek_generation=" + b"a" * 64
+                    + b"\r\nContent-Type: application/json\r\n"
+                    + f"Content-Length: {len(payload)}\r\n\r\n".encode() + payload
+                )
+                await writer.drain()
+                return await asyncio.wait_for(reader.read(), timeout=1)
+            finally:
+                writer.close()
+                await writer.wait_closed()
+
+        try:
+            assert (await request("prompt")).endswith(b'{"error":"HARNESS_WEB_GATEWAY_BUSY"}')
+            assert (await request("cancel")).endswith(b'{"error":"HARNESS_WEB_GATEWAY_BUSY"}')
+            assert upstream_connections == []
+        finally:
+            gateway.close()
+            upstream.close()
+            await gateway.wait_closed()
+            await upstream.wait_closed()
+
+    with tempfile.TemporaryDirectory() as raw:
+        with mock.patch.dict(deepseek_web.os.environ, service_env(Path(raw)), clear=False):
+            asyncio.run(scenario(Path(raw)))
+
+
+def test_browser_prompt_uses_engine_id_and_serializes_one_session() -> None:
+    with tempfile.TemporaryDirectory() as raw:
+        root = Path(raw)
+        env = service_env(root)
+        with mock.patch.dict(deepseek_web.os.environ, env, clear=False):
+            (root / "state.json").write_text(json.dumps({"service_port": 8942}))
+            deepseek_web._initialize_activity()
+            session_id = "sc-" + "8" * 32
+            with mock.patch.object(deepseek_web, "_history_boundary", return_value=11):
+                request_id = deepseek_web._record_browser_prompt(8942, session_id)
+                assert request_id != "client-rpc-id"
+                assert len(request_id) == 32
+                with pytest.raises(deepseek_web.DeepSeekWebError) as refused:
+                    deepseek_web._record_browser_prompt(8942, session_id)
+                assert refused.value.code == "HARNESS_WEB_SESSION_BUSY"
+                assert deepseek_web._read_activity(required=True)["requests"] == {
+                    request_id: {
+                        "session_id": session_id,
+                        "boundary": 11,
+                        "status": "pending",
+                    }
+                }
+                deepseek_web._settle_browser_prompt(request_id, accepted=False)
+            assert deepseek_web._read_activity(required=True)["requests"] == {}
+
+
+def test_gateway_clears_pending_prompt_when_upstream_connection_is_refused() -> None:
+    async def scenario(root: Path) -> None:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+            listener.bind(("127.0.0.1", 0))
+            target_port = int(listener.getsockname()[1])
+        (root / "state.json").write_text(json.dumps({"service_port": target_port}))
+        deepseek_web._initialize_activity()
+        gateway = await asyncio.start_server(
+            lambda reader, writer: deepseek_web._relay_connection(
+                reader, writer, target_port, frozenset({"127.0.0.1"}), "a" * 64
+            ),
+            "127.0.0.1", 0,
+        )
+        gateway_port = gateway.sockets[0].getsockname()[1]
+        payload = json.dumps({"payload": {"sessionId": "sc-" + "6" * 32}}).encode()
+        try:
+            with mock.patch.object(deepseek_web, "_history_boundary", return_value=0):
+                reader, writer = await asyncio.open_connection("127.0.0.1", gateway_port)
+                writer.write(
+                    b"POST /api/session.prompt HTTP/1.1\r\nHost: test\r\n"
+                    + b"Cookie: sc_deepseek_generation=" + b"a" * 64
+                    + b"\r\nContent-Type: application/json\r\n"
+                    + f"Content-Length: {len(payload)}\r\n\r\n".encode() + payload
+                )
+                await writer.drain()
+                assert await asyncio.wait_for(reader.read(), timeout=1) == b""
+                writer.close()
+                await writer.wait_closed()
+            assert deepseek_web._read_activity(required=True)["requests"] == {}
+        finally:
+            gateway.close()
+            await gateway.wait_closed()
+
+    with tempfile.TemporaryDirectory() as raw:
+        with mock.patch.dict(deepseek_web.os.environ, service_env(Path(raw)), clear=False):
+            asyncio.run(scenario(Path(raw)))
+
+
+def test_gateway_clears_rejected_prompt_and_serializes_concurrent_same_session() -> None:
+    async def scenario(root: Path) -> None:
+        arrivals: list[str] = []
+        release = asyncio.Event()
+
+        async def upstream_handler(reader, writer) -> None:
+            header = await reader.readuntil(b"\r\n\r\n")
+            length = int(next(
+                line.split(b":", 1)[1].strip()
+                for line in header.split(b"\r\n")
+                if line.lower().startswith(b"content-length:")
+            ))
+            payload = json.loads(await reader.readexactly(length))
+            arrivals.append(payload["rpcId"])
+            await release.wait()
+            body = json.dumps({
+                "type": "server-response",
+                "rpcId": payload["rpcId"],
+                "result": {"ok": True, "value": {"accepted": False}},
+            }).encode()
+            writer.write(
+                b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+                + f"Content-Length: {len(body)}\r\n\r\n".encode() + body
+            )
+            await writer.drain()
+            writer.close()
+            await writer.wait_closed()
+
+        upstream = await asyncio.start_server(upstream_handler, "127.0.0.1", 0)
+        target_port = upstream.sockets[0].getsockname()[1]
+        (root / "state.json").write_text(json.dumps({"service_port": target_port}))
+        deepseek_web._initialize_activity()
+        gateway = await asyncio.start_server(
+            lambda reader, writer: deepseek_web._relay_connection(
+                reader, writer, target_port, frozenset({"127.0.0.1"}), "a" * 64
+            ),
+            "127.0.0.1", 0,
+        )
+        gateway_port = gateway.sockets[0].getsockname()[1]
+        session_id = "sc-" + "7" * 32
+
+        async def prompt(rpc_id: str) -> bytes:
+            body = json.dumps({"rpcId": rpc_id, "payload": {"sessionId": session_id}}).encode()
+            reader, writer = await asyncio.open_connection("127.0.0.1", gateway_port)
+            try:
+                writer.write(
+                    b"POST /api/session.prompt HTTP/1.1\r\nHost: test\r\n"
+                    + b"Cookie: sc_deepseek_generation=" + b"a" * 64
+                    + b"\r\nContent-Type: application/json\r\n"
+                    + f"Content-Length: {len(body)}\r\n\r\n".encode() + body
+                )
+                await writer.drain()
+                return await asyncio.wait_for(reader.read(), timeout=1)
+            finally:
+                writer.close()
+                await writer.wait_closed()
+
+        try:
+            with mock.patch.object(deepseek_web, "_history_boundary", return_value=5):
+                first = asyncio.create_task(prompt("same-client-rpc"))
+                while not arrivals:
+                    await asyncio.sleep(0)
+                second = await prompt("same-client-rpc")
+                assert second.endswith(b'{"error":"HARNESS_WEB_SESSION_BUSY"}')
+                assert arrivals == ["same-client-rpc"]
+                release.set()
+                assert b"HTTP/1.1 200 OK" in await first
+            assert deepseek_web._read_activity(required=True)["requests"] == {}
+        finally:
+            gateway.close()
+            upstream.close()
+            await gateway.wait_closed()
+            await upstream.wait_closed()
+
+    with tempfile.TemporaryDirectory() as raw:
+        with mock.patch.dict(deepseek_web.os.environ, service_env(Path(raw)), clear=False):
             asyncio.run(scenario(Path(raw)))
 
 
@@ -658,10 +886,8 @@ def test_gateway_closes_mutable_http_connection_after_one_guarded_request() -> N
             response = await asyncio.wait_for(reader.read(), timeout=1)
             writer.close()
             await writer.wait_closed()
-            assert b"HTTP/1.1 200 OK" in response
-            assert len(upstream_requests) == 1
-            assert b"session.prompt" not in upstream_requests[0]
-            assert b"Connection: close" in upstream_requests[0]
+            assert b"HTTP/1.1 302 Found" in response
+            assert upstream_requests == []
             assert deepseek_web._read_activity(required=True)["requests"] == {}
         finally:
             gateway.close()
@@ -701,8 +927,9 @@ def test_closed_gateway_admission_refuses_new_prompt_before_host_forwarding() ->
         try:
             reader, writer = await asyncio.open_connection("127.0.0.1", gateway_port)
             writer.write(
-                b"POST /api/session.prompt?sc_generation=" + b"a" * 64
-                + b" HTTP/1.1\r\nHost: test\r\nContent-Type: application/json\r\n"
+                b"POST /api/session.prompt HTTP/1.1\r\nHost: test\r\n"
+                + b"Cookie: sc_deepseek_generation=" + b"a" * 64
+                + b"\r\nContent-Type: application/json\r\n"
                 + f"Content-Length: {len(payload)}\r\n\r\n".encode() + payload
             )
             await writer.drain()
@@ -758,6 +985,7 @@ def test_malformed_activity_refuses_handoff_without_terminating_host() -> None:
 
 def test_existing_service_requires_both_shell_id_and_shortname() -> None:
     state = {
+        "schema_version": 3,
         "service_port": 8942,
         "relay_port": 18942,
         "relay_policy": deepseek_web.RELAY_POLICY,

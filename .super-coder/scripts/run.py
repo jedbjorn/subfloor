@@ -2148,6 +2148,9 @@ def main() -> None:
     # branch-guard.sh reads it to exempt the admin shell (which works on main
     # by mandate); like SC_PROTECTED_BRANCHES it's a guardrail, not a boundary.
     env["SC_SHELL_FLAVOR"] = chosen["flavor"] or ""
+    # The final exec environment is the authority boundary for every public
+    # harness surface.  Never consume an inherited/deleted shell identity.
+    env["SC_SHELL_ID"] = str(chosen["shell_id"])
     env["SC_SHELL_SHORTNAME"] = chosen["shortname"]
     env["SC_API_TOKEN"] = full["api_key"] or ""
     env["SC_API_BASE"] = f"http://127.0.0.1:{api_port}" if api_port else ""
