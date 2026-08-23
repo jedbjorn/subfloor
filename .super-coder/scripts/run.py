@@ -286,6 +286,20 @@ def require_local_web_surface(adapter: dict) -> None:
         raise ValueError(f"harness '{harness}' does not support local Web entry")
 
 
+def interactive_launch(adapter: dict) -> dict | None:
+    """Return the adapter's supported interactive launch contract."""
+    surfaces = adapter.get("surfaces") or {}
+    if surfaces.get("terminal") is True:
+        return {
+            "kind": "terminal",
+            "launch": adapter.get("launch") or [adapter.get("harness", "unknown")],
+        }
+    interactive = adapter.get("interactive")
+    if isinstance(interactive, dict) and interactive.get("kind") == "local_web":
+        return interactive
+    return None
+
+
 def linked_vm_configured() -> bool:
     """Match ``sc_vm_broker_configured``: a truthy persisted vm block."""
     return bool(ports_mod.resolve(persist=False).get("vm"))
@@ -680,10 +694,11 @@ def ensure_harness_path() -> None:
 
 
 def detect_harnesses() -> list[str]:
-    """Harnesses installable RIGHT NOW: an adapter dir with adapter.json whose
-    launch command is also on PATH (after ensure_harness_path() has folded in
-    the installer bin dirs). Adapter-dir order. Drives the launch-time picker —
-    we only offer a harness the host can actually exec."""
+    """Interactive harnesses installable right now, in adapter-dir order.
+
+    Terminal adapters use their ordinary launch command. Browser-backed
+    adapters use the command from their explicit interactive contract.
+    """
     if not ADAPTERS.exists():
         return []
     found = []
@@ -695,13 +710,26 @@ def detect_harnesses() -> list[str]:
             adapter = json.loads(cfg.read_text())
         except (json.JSONDecodeError, OSError):
             continue
-        surfaces = adapter.get("surfaces") or {}
-        if surfaces.get("terminal") is not True:
+        interactive = interactive_launch(adapter)
+        if interactive is None:
             continue
-        cmd = (adapter.get("launch") or [d.name])[0]
+        cmd = (interactive.get("launch") or [d.name])[0]
         if shutil.which(cmd):
             found.append(adapter.get("harness", d.name))
     return found
+
+
+def signal_browser_handoff(handoff_id: str | None) -> None:
+    """Tell the host dispatcher that a picker-selected local Web app is ready."""
+    if not handoff_id or not handoff_id.isascii() or not handoff_id.isdigit():
+        return
+    path = REPO_ROOT / ".sc-state" / "local" / "run" / f"browser-handoff-{handoff_id}"
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("deepseek\n")
+    except OSError:
+        # The ready URL is already printed; browser opening remains best-effort.
+        return
 
 
 def pick_harness(detected: list[str], default: str, first: bool) -> str | None:
@@ -1783,6 +1811,9 @@ def main() -> None:
     flavor_model = fdef["models"].get(harness) if fdef else None
     flavor_effort = (fdef.get("efforts") or {}).get(harness) if fdef else None
     adapter = load_adapter(harness)
+    launch_contract = interactive_launch(adapter)
+    if not local_web and not headless and not host_admin and launch_contract:
+        local_web = launch_contract["kind"] == "local_web"
     try:
         if local_web:
             require_local_web_surface(adapter)
@@ -2083,6 +2114,7 @@ def main() -> None:
         action = "reused" if service["reused"] else "started"
         print(f"→ DeepSeek Web: {action} for {work_dir}")
         print(f"→ DeepSeek Web URL: {service['url']}")
+        signal_browser_handoff(os.environ.get("SC_BROWSER_HANDOFF_ID"))
         return
 
     # --name labels the session in the harness prompt box, resume picker, and

@@ -107,16 +107,22 @@ class HarnessSurfaceProjectionTest(unittest.TestCase):
             "retired-harness", harness_surfaces.known_terminal_harnesses()
         )
 
-    def test_terminal_detection_excludes_shipped_non_terminal_harness(self) -> None:
+    def test_interactive_detection_includes_terminal_and_local_web_harnesses(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             adapters = Path(tmp)
             terminal = adapters / "terminal" / "adapter.json"
+            local_web = adapters / "local-web" / "adapter.json"
             browser_only = adapters / "browser-only" / "adapter.json"
             terminal.parent.mkdir()
+            local_web.parent.mkdir()
             browser_only.parent.mkdir()
             terminal.write_text(
                 '{"harness":"terminal","launch":["terminal"],'
                 '"surfaces":{"terminal":true}}'
+            )
+            local_web.write_text(
+                '{"harness":"local-web","surfaces":{"terminal":false},'
+                '"interactive":{"kind":"local_web","launch":["web-cli","web"]}}'
             )
             browser_only.write_text(
                 '{"harness":"browser-only","runtime":{"command":"browser"},'
@@ -127,8 +133,76 @@ class HarnessSurfaceProjectionTest(unittest.TestCase):
             ):
                 detected = run.detect_harnesses()
 
-        self.assertEqual(detected, ["terminal"])
+        self.assertEqual(detected, ["local-web", "terminal"])
         self.assertNotIn("browser-only", detected)
+
+    def test_picker_selected_local_web_signals_the_host_dispatcher(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(
+            run, "REPO_ROOT", Path(tmp)
+        ):
+            run.signal_browser_handoff("31415")
+            marker = (
+                Path(tmp)
+                / ".sc-state"
+                / "local"
+                / "run"
+                / "browser-handoff-31415"
+            )
+            self.assertEqual(marker.read_text(), "deepseek\n")
+
+            run.signal_browser_handoff("../../outside")
+            self.assertFalse((Path(tmp) / "outside").exists())
+
+    def test_selected_local_web_uses_web_validation_in_the_boot_path(self) -> None:
+        class StopAfterSelection(RuntimeError):
+            pass
+
+        con = mock.Mock()
+        chosen = {"shell_id": 5, "shortname": "DEV3", "flavor": "dev"}
+        adapter = {
+            "harness": "deepseek",
+            "surfaces": {"terminal": False},
+            "interactive": {"kind": "local_web", "launch": ["dsh", "web"]},
+        }
+        local_web_gate = mock.Mock(wraps=run.require_local_web_surface)
+        terminal_gate = mock.Mock(wraps=run.require_harness_surface)
+
+        with mock.patch.dict(run.os.environ, {"RENDER_ONLY": "1"}, clear=True), \
+                mock.patch.object(
+                    run.sys,
+                    "argv",
+                    ["run.py", "DEV3", "--harness", "deepseek"],
+                ), \
+                mock.patch.object(run.sys.stdin, "isatty", return_value=False), \
+                mock.patch.object(run, "open_db", return_value=con), \
+                mock.patch.object(run, "authenticate", return_value={"user_id": 1}), \
+                mock.patch.object(
+                    run,
+                    "flavor_defaults",
+                    return_value={
+                        "dev": {
+                            "default_harness": "claude",
+                            "models": {"deepseek": None},
+                        }
+                    },
+                ), \
+                mock.patch.object(run, "list_shells", return_value=[chosen]), \
+                mock.patch.object(run, "pick_shell", return_value=chosen), \
+                mock.patch.object(run, "browser_conversation_active", return_value=False), \
+                mock.patch.object(run, "confirm_live", return_value=True), \
+                mock.patch.object(run, "ensure_harness_path"), \
+                mock.patch.object(run, "load_adapter", return_value=adapter), \
+                mock.patch.object(run, "require_local_web_surface", local_web_gate), \
+                mock.patch.object(run, "require_harness_surface", terminal_gate), \
+                mock.patch.object(run, "cleanup_before_launch"), \
+                mock.patch.object(
+                    run, "open_session", side_effect=StopAfterSelection
+                ), \
+                self.assertRaises(StopAfterSelection):
+            run.main()
+
+        local_web_gate.assert_called_once_with(adapter)
+        terminal_gate.assert_not_called()
 
     def test_explicit_unsupported_terminal_and_one_shot_requests_fail_early(self) -> None:
         adapter = {

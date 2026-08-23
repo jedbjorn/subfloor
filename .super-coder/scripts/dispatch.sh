@@ -184,6 +184,27 @@ sc_open_browser() {
   return 1
 }
 
+sc_enter_with_browser_handoff() {
+  sc_handoff_id="$$"
+  sc_handoff_path="$ROOT/.sc-state/local/run/browser-handoff-$sc_handoff_id"
+  rm -f "$sc_handoff_path"
+  if docker exec -it -e "SC_BROWSER_HANDOFF_ID=$sc_handoff_id" \
+      "$CNAME" ./sc boot "$@"; then
+    sc_enter_rc=0
+  else
+    sc_enter_rc=$?
+  fi
+  if [ "$sc_enter_rc" -eq 0 ] && [ -f "$sc_handoff_path" ]; then
+    rm -f "$sc_handoff_path"
+    sc_deepseek_url="http://127.0.0.1:$(deepseekhostport)"
+    echo "  DeepSeek Web  $sc_deepseek_url"
+    sc_open_browser "$sc_deepseek_url" || true
+  else
+    rm -f "$sc_handoff_path"
+  fi
+  return "$sc_enter_rc"
+}
+
 # The two localhost URLs an operator needs, derived from this fork's ports —
 # never a fixed 8800, because every fork lands on its own offset (ports.py).
 # One printer, three callers (`url`, `enter`, `enter-<shortname>`): entry
@@ -1372,7 +1393,7 @@ case "$cmd" in
       sc_open_browser "$sc_deepseek_url" || true
       exit 0
     fi
-    exec docker exec -it "$CNAME" ./sc boot "$@" ;;
+    sc_enter_with_browser_handoff "$@" ;;
   enter-*)
     if [ "${1:-}" = "--devkit-repair" ]; then
       echo "sc ${cmd}: repair posture is available only as ./sc enter --devkit-repair" >&2
@@ -1385,7 +1406,7 @@ case "$cmd" in
       exit 1
     }
     sc_urls || true
-    exec docker exec -it "$CNAME" ./sc boot "${cmd#enter-}" "$@" ;;
+    sc_enter_with_browser_handoff "${cmd#enter-}" "$@" ;;
   down)         docker rm -f "$CNAME" >/dev/null 2>&1 && echo "→ sandbox stopped" || echo "→ not running"
                 sc_vm_broker_down
                 sc_ts_broker_down
