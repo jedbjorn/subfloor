@@ -92,6 +92,8 @@ def test_default_models_saves_model_and_effort_atomically():
     assert 'row.effort_state = "selection-required"' in DEFAULT_MODELS
     assert 'ariaLabel: `Thinking level for ${flavor} ${h}`' in DEFAULT_MODELS
     assert "m.harness_support_state" in DEFAULT_MODELS
+    assert "new Set(fd.default_harnesses || fd.harnesses || [])" in DEFAULT_MODELS
+    assert "star.disabled = !defaultHarnesses.has(h)" in DEFAULT_MODELS
 
 
 def test_skills_is_nested_under_shells_instead_of_global_navigation():

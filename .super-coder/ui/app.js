@@ -690,6 +690,7 @@ async function renderDefaultModels(root, s, catalogOverride = null) {
   // emphasis — the shell header above is inert on this tab), one card per
   // flavor with docs-style separation between cards.
   const flavors = Object.keys(fd.flavors).sort();
+  const defaultHarnesses = new Set(fd.default_harnesses || fd.harnesses || []);
   for (const flavor of flavors) {
     const byHarness = Object.fromEntries((fd.flavors[flavor] || []).map((r) => [r.harness, r]));
     const panel = el("div", { className: "vpanel dm-card" });
@@ -699,6 +700,10 @@ async function renderDefaultModels(root, s, catalogOverride = null) {
       const star = el("input", { type: "radio", name: "dm-star-" + flavor,
                                  title: "star = default harness at launch" });
       star.checked = row.is_default;
+      star.disabled = !defaultHarnesses.has(h);
+      if (star.disabled) {
+        star.title = "model configuration only — no interactive launch surface";
+      }
       star.onchange = async () => {
         try {
           await api("/flavor-defaults", "POST", { flavor, harness: h, is_default: true });

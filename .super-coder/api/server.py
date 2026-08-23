@@ -477,8 +477,13 @@ def get_model_routes(con, *, harness: str | None = None,
 
 
 def known_harnesses() -> list[str]:
-    """Harnesses eligible for flavor-level launch and model defaults."""
+    """Harnesses visible in the flavor-level model-defaults matrix."""
     return harness_surfaces.known_runnable_harnesses()
+
+
+def known_default_harnesses() -> list[str]:
+    """Harnesses eligible for the flavor-level interactive launch star."""
+    return harness_surfaces.known_interactive_harnesses()
 
 
 def _historical_harnesses(con) -> set[str]:
@@ -512,11 +517,13 @@ def _historical_harnesses(con) -> set[str]:
 
 
 def get_flavor_defaults(con) -> dict:
-    """The launch-defaults matrix for the Default Models sub-tab: per flavor,
-    a model per harness + one starred default harness (flavor_defaults rows —
-    the exact table run.py's picker resolves at launch). Template flavors with
-    no rows yet are included empty so the GUI matrix is complete; missing
-    cells are created on first write (see set_flavor_default)."""
+    """The model matrix and interactive launch defaults for each flavor.
+
+    Every model-capable harness is visible, while only harnesses with a proven
+    terminal or local-Web launch contract may receive the star consumed by
+    run.py. Template flavors with no rows yet are included empty; missing cells
+    are created on first write (see set_flavor_default).
+    """
     flavors: dict[str, list] = {}
     route_rows = {
         (r["harness"], r["selector"]): r
@@ -577,6 +584,7 @@ def get_flavor_defaults(con) -> dict:
     return {
         "flavors": flavors,
         "harnesses": known_harnesses(),
+        "default_harnesses": known_default_harnesses(),
         "harness_status": harness_surfaces.project(_historical_harnesses(con)),
     }
 
@@ -664,6 +672,12 @@ def set_flavor_default(con, body) -> tuple[bool, dict | None]:
     if harness not in known_harnesses():
         return False, _flavor_default_error(
             "validation_error", f"unknown harness '{harness}'")
+    if body.get("is_default") and harness not in known_default_harnesses():
+        return False, _flavor_default_error(
+            "validation_error",
+            f"harness '{harness}' has no interactive launch surface and "
+            "cannot be the flavor default",
+        )
     known_flavors = {t.get("flavor") for t in shell_factory.flavors()} | {
         r[0] for r in con.execute("SELECT DISTINCT flavor FROM flavor_defaults")}
     if flavor not in known_flavors:

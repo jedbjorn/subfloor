@@ -1,6 +1,7 @@
 """Authoritative harness surface/status projection contracts."""
 from __future__ import annotations
 
+import json
 import sys
 import tempfile
 import unittest
@@ -32,6 +33,10 @@ class HarnessSurfaceProjectionTest(unittest.TestCase):
         )
         self.assertEqual(
             harness_surfaces.known_runnable_harnesses(),
+            ["claude", "codex", "deepseek", "kimi", "opencode", "vibe"],
+        )
+        self.assertEqual(
+            harness_surfaces.known_interactive_harnesses(),
             ["claude", "codex", "deepseek", "kimi", "opencode", "vibe"],
         )
         for harness in ("claude", "codex", "kimi", "opencode"):
@@ -113,6 +118,61 @@ class HarnessSurfaceProjectionTest(unittest.TestCase):
         self.assertNotIn(
             "retired-harness", harness_surfaces.known_runnable_harnesses()
         )
+
+    def test_model_visibility_is_separate_from_launch_default_eligibility(self) -> None:
+        manifests = {
+            "one-shot-only": {
+                "harness": "one-shot-only",
+                "surfaces": {
+                    "terminal": False,
+                    "one_shot": True,
+                    "browser": False,
+                    "sprint": False,
+                },
+                "headless": {"launch": ["one-shot"]},
+            },
+            "browser-only": {
+                "harness": "browser-only",
+                "surfaces": {
+                    "terminal": False,
+                    "one_shot": False,
+                    "browser": True,
+                    "sprint": False,
+                },
+            },
+            "local-web-only": {
+                "harness": "local-web-only",
+                "surfaces": {
+                    "terminal": False,
+                    "one_shot": False,
+                    "browser": False,
+                    "sprint": False,
+                },
+                "interactive": {
+                    "kind": "local_web",
+                    "launch": ["local-web"],
+                },
+            },
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            adapters = Path(tmp)
+            for harness, manifest in manifests.items():
+                path = adapters / harness / "adapter.json"
+                path.parent.mkdir()
+                path.write_text(json.dumps(manifest))
+            with mock.patch.object(harness_surfaces, "ADAPTERS", adapters), \
+                    mock.patch.object(
+                        harness_surfaces,
+                        "_browser_contract_proven",
+                        side_effect=lambda harness: harness == "browser-only",
+                    ):
+                visible = harness_surfaces.known_runnable_harnesses()
+                defaults = harness_surfaces.known_interactive_harnesses()
+
+        self.assertEqual(
+            visible, ["browser-only", "local-web-only", "one-shot-only"]
+        )
+        self.assertEqual(defaults, ["local-web-only"])
 
     def test_interactive_detection_includes_terminal_and_local_web_harnesses(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
