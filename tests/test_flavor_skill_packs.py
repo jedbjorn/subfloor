@@ -45,7 +45,7 @@ RATIFIED_OPT_INS = {
         "docs",
         "flags",
         "git",
-        "harness_promotion",
+        "harness_readiness",
         "redline_review",
         "spec",
         "sprint_dev",
@@ -266,7 +266,7 @@ class HardCutoverMigrationTest(unittest.TestCase):
         }
         for flavor, expected in RATIFIED_OPT_INS.items():
             expected_at_0188 = expected - (
-                {"harness_promotion"} if flavor == "dev" else set()
+                {"harness_readiness"} if flavor == "dev" else set()
             )
             actual = {
                 row[0]
@@ -280,12 +280,12 @@ class HardCutoverMigrationTest(unittest.TestCase):
             self.assertEqual(actual - common, expected_at_0188, flavor)
         self.assertEqual(resolved_names(con, bespoke), bespoke_names)
 
-    def test_0232_seeds_harness_promotion_and_grants_dev_idempotently(self) -> None:
-        migration = "0232_seed_harness_promotion_skill.sql"
+    def test_0232_seeds_harness_readiness_and_grants_dev_idempotently(self) -> None:
+        migration = "0232_seed_harness_readiness_skill.sql"
         con = build_db(before=migration)
         skill = con.execute(
             "INSERT INTO skills (name,description,category,common,content,is_deleted) "
-            "VALUES ('harness_promotion','stale','wrong',1,'stale body',1)"
+            "VALUES ('harness_readiness','stale','wrong',1,'stale body',1)"
         ).lastrowid
         bespoke = add_shell(con, "custom", None)
         con.execute(
@@ -302,11 +302,11 @@ class HardCutoverMigrationTest(unittest.TestCase):
         con.executescript(sql)
 
         expected = seed_skills.parse_skill(
-            ENGINE / "assets" / "skills" / "harness_promotion" / "SKILL.md"
+            ENGINE / "assets" / "skills" / "harness_readiness" / "SKILL.md"
         )
         actual = con.execute(
             "SELECT description,category,command,common,content,is_deleted "
-            "FROM skills WHERE name='harness_promotion'"
+            "FROM skills WHERE name='harness_readiness'"
         ).fetchone()
         self.assertEqual(
             tuple(actual),
@@ -324,13 +324,13 @@ class HardCutoverMigrationTest(unittest.TestCase):
                 tuple(row)
                 for row in con.execute(
                     "SELECT fs.flavor FROM flavor_skills fs JOIN skills s "
-                    "USING(skill_id) WHERE s.name='harness_promotion' "
+                    "USING(skill_id) WHERE s.name='harness_readiness' "
                     "ORDER BY fs.flavor"
                 )
             ],
             [("dev",), ("planner",)],
         )
-        self.assertEqual(resolved_names(con, bespoke), {"harness_promotion"})
+        self.assertEqual(resolved_names(con, bespoke), {"harness_readiness"})
 
     def test_non_admin_skill_packs_use_the_canonical_sc_command(self) -> None:
         con = build_db()
