@@ -338,6 +338,56 @@ def test_relay_rejects_sibling_source_before_opening_stock_host() -> None:
     asyncio.run(scenario())
 
 
+def test_gateway_rejects_stale_generation_before_stock_host_forwarding() -> None:
+    async def scenario() -> None:
+        upstream_connections: list[tuple[str, int]] = []
+
+        async def upstream_handler(reader, writer) -> None:
+            upstream_connections.append(writer.get_extra_info("peername"))
+            await reader.readuntil(b"\r\n\r\n")
+            writer.write(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+            await writer.drain()
+            writer.close()
+            await writer.wait_closed()
+
+        upstream = await asyncio.start_server(upstream_handler, "127.0.0.1", 0)
+        target_port = upstream.sockets[0].getsockname()[1]
+        gateway = await asyncio.start_server(
+            lambda reader, writer: deepseek_web._relay_connection(
+                reader, writer, target_port, frozenset({"127.0.0.1"}), "a" * 64
+            ),
+            "127.0.0.1", 0,
+        )
+        gateway_port = gateway.sockets[0].getsockname()[1]
+
+        async def request(target: str) -> bytes:
+            reader, writer = await asyncio.open_connection("127.0.0.1", gateway_port)
+            try:
+                writer.write(f"GET {target} HTTP/1.1\r\nHost: test\r\n\r\n".encode())
+                await writer.drain()
+                return await asyncio.wait_for(reader.read(512), timeout=1)
+            finally:
+                writer.close()
+                await writer.wait_closed()
+
+        try:
+            admitted = await request("/?sc_generation=" + "a" * 64)
+            assert b"HTTP/1.1 200 OK" in admitted
+            assert b"Set-Cookie: sc_deepseek_generation=" + b"a" * 64 in admitted
+            assert len(upstream_connections) == 1
+
+            stale = await request("/")
+            assert stale == b'HTTP/1.1 409 Conflict\r\nContent-Type: application/json\r\nContent-Length: 40\r\nConnection: close\r\n\r\n{"error":"HARNESS_WEB_GENERATION_STALE"}'
+            assert len(upstream_connections) == 1
+        finally:
+            gateway.close()
+            upstream.close()
+            await gateway.wait_closed()
+            await upstream.wait_closed()
+
+    asyncio.run(scenario())
+
+
 def test_status_rejects_a_live_relay_without_the_host_gateway_policy() -> None:
     with tempfile.TemporaryDirectory() as raw:
         root = Path(raw)
