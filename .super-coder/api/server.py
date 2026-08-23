@@ -477,8 +477,8 @@ def get_model_routes(con, *, harness: str | None = None,
 
 
 def known_harnesses() -> list[str]:
-    """Compatibility string roster for terminal/default-model callers."""
-    return harness_surfaces.known_terminal_harnesses()
+    """Harnesses eligible for flavor-level launch and model defaults."""
+    return harness_surfaces.known_runnable_harnesses()
 
 
 def _historical_harnesses(con) -> set[str]:

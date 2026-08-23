@@ -30,6 +30,10 @@ class HarnessSurfaceProjectionTest(unittest.TestCase):
             harness_surfaces.known_terminal_harnesses(),
             ["claude", "codex", "kimi", "opencode", "vibe"],
         )
+        self.assertEqual(
+            harness_surfaces.known_runnable_harnesses(),
+            ["claude", "codex", "deepseek", "kimi", "opencode", "vibe"],
+        )
         for harness in ("claude", "codex", "kimi", "opencode"):
             with self.subTest(harness=harness):
                 self.assertEqual(projection[harness]["surfaces"], {
@@ -105,6 +109,9 @@ class HarnessSurfaceProjectionTest(unittest.TestCase):
         })
         self.assertNotIn(
             "retired-harness", harness_surfaces.known_terminal_harnesses()
+        )
+        self.assertNotIn(
+            "retired-harness", harness_surfaces.known_runnable_harnesses()
         )
 
     def test_interactive_detection_includes_terminal_and_local_web_harnesses(self) -> None:

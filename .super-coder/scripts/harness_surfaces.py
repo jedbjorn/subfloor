@@ -122,6 +122,20 @@ def known_terminal_harnesses() -> list[str]:
     return sorted(found)
 
 
+def known_runnable_harnesses() -> list[str]:
+    """Return shipped harnesses with at least one proven execution surface."""
+    found = []
+    for harness, path in _manifest_paths().items():
+        try:
+            manifest = json.loads(path.read_text())
+            declared = _declared_surfaces(manifest)
+            if any(_proven_surfaces(harness, manifest, declared).values()):
+                found.append(harness)
+        except (OSError, json.JSONDecodeError, ValueError):
+            continue
+    return sorted(found)
+
+
 def project(
     historical_harnesses: Iterable[str] = (),
     *,
