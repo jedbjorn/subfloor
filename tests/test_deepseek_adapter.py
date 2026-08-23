@@ -1,11 +1,13 @@
 """Stock DeepSeek Host projection, one-shot, and Browser lifecycle contracts."""
 from __future__ import annotations
 
+import asyncio
 import copy
 import json
 import sys
 from pathlib import Path
 from typing import Any, Mapping
+from unittest import mock
 
 import pytest
 
@@ -20,6 +22,9 @@ import harness_versions  # noqa: E402
 import route_bindings  # noqa: E402
 from conversation_adapters.base import AdapterError, ConversationContext  # noqa: E402
 from conversation_adapters.deepseek import DeepSeekAdapter  # noqa: E402
+
+REAL_RESERVE_MANAGED_SESSION = deepseek_web.reserve_managed_session
+REAL_RELEASE_MANAGED_SESSION = deepseek_web.release_managed_session
 
 
 def configuration(*, credential: Mapping[str, Any] | None = None) -> dict:
@@ -529,6 +534,184 @@ def test_browser_start_stream_and_exact_call_order(tmp_path: Path) -> None:
         for method, payload in live.calls
     )
     assert live.streams[0].closed
+
+
+def test_start_reserves_the_deterministic_session_before_host_publication(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    seed = FakeHost()
+    ctx = context(tmp_path, seed)
+    session = DeepSeekAdapter._new_session_ref(ctx)
+    reservations: list[str] = []
+    releases: list[str] = []
+
+    class BarrierHost(FakeHost):
+        def call(self, method, payload):
+            if method == "session.create":
+                # This is the first point at which the stock Host can publish
+                # the chat to native Web.  Reservation must already exist.
+                assert reservations == [session]
+            return super().call(method, payload)
+
+    monkeypatch.setattr(
+        deepseek_web, "reserve_managed_session", lambda value: reservations.append(value)
+    )
+    monkeypatch.setattr(
+        deepseek_web, "release_managed_session", lambda value: releases.append(value)
+    )
+    adapter = DeepSeekAdapter(client_factory=BarrierHost)
+    turn = adapter.start(ctx, "work")
+    assert turn.session_ref == session
+    assert reservations == [session]
+    adapter.close()
+    assert releases == [session]
+
+
+def test_start_reservation_blocks_native_prompt_after_session_publication(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Pause stock publication and prove only a distinct native chat proceeds."""
+    seed = FakeHost()
+    ctx = context(tmp_path, seed)
+    session = DeepSeekAdapter._new_session_ref(ctx)
+    runtime = tmp_path / "runtime"
+    runtime.mkdir()
+    (runtime / "state.json").write_text(json.dumps({"service_port": 8942}))
+    environment = {
+        "SC_DEEPSEEK_WEB_STATE": str(runtime / "state.json"),
+        "SC_DEEPSEEK_WEB_LOCK": str(runtime / "service.lock"),
+    }
+    browser_results: list[str] = []
+
+    class PublicationBarrierHost(FakeHost):
+        def call(self, method, payload):
+            result = super().call(method, payload)
+            if method == "session.create":
+                # ``super`` has made the native chat observable.  Native Web
+                # must still be rejected before a Host prompt can be sent.
+                with pytest.raises(deepseek_web.DeepSeekWebError) as refused:
+                    deepseek_web._record_browser_prompt(8942, session)
+                browser_results.append(refused.value.code)
+            return result
+
+    async def distinct_browser_prompt() -> list[dict[str, object]]:
+        forwarded: list[dict[str, object]] = []
+
+        async def upstream_handler(reader, writer) -> None:
+            header = await reader.readuntil(b"\r\n\r\n")
+            length = int(next(
+                line.split(b":", 1)[1].strip()
+                for line in header.split(b"\r\n")
+                if line.lower().startswith(b"content-length:")
+            ))
+            payload = json.loads(await reader.readexactly(length))
+            forwarded.append(payload)
+            body = json.dumps({
+                "type": "server-response",
+                "rpcId": payload["rpcId"],
+                "result": {"ok": True, "value": {"accepted": True}},
+            }).encode()
+            writer.write(
+                b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+                + f"Content-Length: {len(body)}\r\n\r\n".encode() + body
+            )
+            await writer.drain()
+            writer.close()
+            await writer.wait_closed()
+
+        upstream = await asyncio.start_server(upstream_handler, "127.0.0.1", 0)
+        target_port = upstream.sockets[0].getsockname()[1]
+        gateway = await asyncio.start_server(
+            lambda reader, writer: deepseek_web._relay_connection(
+                reader, writer, target_port, frozenset({"127.0.0.1"}), "a" * 64
+            ),
+            "127.0.0.1", 0,
+        )
+        gateway_port = gateway.sockets[0].getsockname()[1]
+        native_session = "session-550e8400-e29b-41d4-a716-446655440000"
+        body = json.dumps({"rpcId": "native-distinct", "payload": {"sessionId": native_session}}).encode()
+        try:
+            with mock.patch.object(deepseek_web, "_history_boundary", return_value=0):
+                reader, writer = await asyncio.open_connection("127.0.0.1", gateway_port)
+                try:
+                    writer.write(
+                        b"POST /api/session.prompt HTTP/1.1\r\nHost: test\r\n"
+                        + b"Cookie: sc_deepseek_generation=" + b"a" * 64
+                        + b"\r\nContent-Type: application/json\r\n"
+                        + f"Content-Length: {len(body)}\r\n\r\n".encode() + body
+                    )
+                    await writer.drain()
+                    response = await asyncio.wait_for(reader.read(), timeout=1)
+                finally:
+                    writer.close()
+                    await writer.wait_closed()
+            assert b'"accepted": true' in response
+        finally:
+            gateway.close()
+            upstream.close()
+            await gateway.wait_closed()
+            await upstream.wait_closed()
+        return forwarded
+
+    with mock.patch.dict(deepseek_web.os.environ, environment, clear=False):
+        deepseek_web._initialize_activity()
+        monkeypatch.setattr(
+            deepseek_web, "reserve_managed_session", REAL_RESERVE_MANAGED_SESSION
+        )
+        monkeypatch.setattr(
+            deepseek_web, "release_managed_session", REAL_RELEASE_MANAGED_SESSION
+        )
+        live = PublicationBarrierHost()
+        adapter = DeepSeekAdapter(client_factory=lambda: live)
+        turn = adapter.start(ctx, "work")
+        forwarded = asyncio.run(distinct_browser_prompt())
+        adapter.close()
+
+    assert turn.session_ref == session
+    assert browser_results == ["HARNESS_WEB_SESSION_BUSY"]
+    assert forwarded == [{
+        "rpcId": "native-distinct",
+        "payload": {
+            "sessionId": "session-550e8400-e29b-41d4-a716-446655440000",
+        },
+    }]
+    assert [payload for method, payload in live.calls if method == "session.prompt"] == [{
+        "sessionId": session,
+        "mode": "queue",
+        "content": [{"type": "text", "text": "work"}],
+    }]
+
+
+def test_start_releases_early_reservation_when_publication_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    seed = FakeHost()
+    ctx = context(tmp_path, seed)
+    session = DeepSeekAdapter._new_session_ref(ctx)
+    reservations: list[str] = []
+    releases: list[str] = []
+
+    class RefusingHost(FakeHost):
+        def call(self, method, payload):
+            if method == "session.create":
+                self.calls.append((method, dict(payload)))
+                raise deepseek_host.HostRpcError(
+                    "HARNESS_HOST_RPC_SESSION_REJECTED", "publication refused"
+                )
+            return super().call(method, payload)
+
+    monkeypatch.setattr(
+        deepseek_web, "reserve_managed_session", lambda value: reservations.append(value)
+    )
+    monkeypatch.setattr(
+        deepseek_web, "release_managed_session", lambda value: releases.append(value)
+    )
+    with pytest.raises(AdapterError) as refused:
+        DeepSeekAdapter(client_factory=RefusingHost).start(ctx, "work")
+
+    assert refused.value.code == "HARNESS_HOST_RPC_SESSION_REJECTED"
+    assert reservations == [session]
+    assert releases == [session]
 
 
 def test_cold_resume_reuses_session_and_prior_history(tmp_path: Path) -> None:

@@ -10,6 +10,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
+import uuid
 from pathlib import Path
 
 import pytest
@@ -148,6 +149,30 @@ def test_pinned_stock_dsh_workspace_session_archive_contract(
         with pytest.raises(urllib.error.HTTPError) as absent:
             urllib.request.urlopen(unknown, timeout=2)
         assert absent.value.code == 404
+
+        # The unmodified native Web client allocates this separate opaque
+        # namespace when the browser opens a chat without a caller-supplied
+        # ID.  Gateway activity must accept it without weakening the strict
+        # managed-session reservation format.
+        native = client.call(
+            "session.create",
+            {"workspaceId": second_workspace_id, "agentPreset": "standard"},
+        )
+        native_id = native["sessionId"]
+        assert native["agentPreset"] == "standard"
+        assert native_id.startswith("session-")
+        assert uuid.UUID(native_id.removeprefix("session-")).version == 4
+        native_rows = client.call("session.list", {"workspaceId": second_workspace_id})
+        native_matches = [
+            row for row in native_rows["items"] if row["sessionId"] == native_id
+        ]
+        assert len(native_matches) == 1
+        native_row = native_matches[0]
+        assert native_row["sessionId"] == native_id
+        assert native_row["cwd"] == str(other_workspace)
+        assert native_row["running"] is False
+        assert native_row["blank"] is True
+        assert native_row["sessionId"] != session_id
     finally:
         process.terminate()
         try:

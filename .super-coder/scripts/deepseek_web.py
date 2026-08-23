@@ -617,6 +617,24 @@ def _activity_error(detail: str) -> DeepSeekWebError:
     return DeepSeekWebError("HARNESS_WEB_GATEWAY_BUSY", detail)
 
 
+def _browser_session_id(value: object) -> str | None:
+    """Accept only a bounded opaque stock-Web session reference.
+
+    Native DSH creates browser chats as ``session-<UUID>`` while managed
+    Subfloor conversations use ``sc-<hex>``.  Activity is an observation of
+    stock browser work, not a managed-session identity artifact, so it must
+    preserve either safe upstream form.  The reservation artifact remains
+    intentionally stricter below.
+    """
+    if (
+        isinstance(value, str)
+        and 1 <= len(value) <= 128
+        and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]*", value)
+    ):
+        return value
+    return None
+
+
 def _read_activity(*, required: bool) -> dict[str, Any]:
     path = _activity_path()
     try:
@@ -641,8 +659,7 @@ def _read_activity(*, required: bool) -> dict[str, Any]:
         session_id = record.get("session_id")
         boundary = record.get("boundary")
         if (
-            not isinstance(session_id, str)
-            or re.fullmatch(r"sc-[0-9a-f]{32}", session_id) is None
+            _browser_session_id(session_id) is None
             or not isinstance(boundary, int)
             or isinstance(boundary, bool)
             or boundary < 0
@@ -763,7 +780,23 @@ def _drain_gateway_work(state: Mapping[str, Any], activity: Mapping[str, Any]) -
     return not pending
 
 
+def _active_browser_requests(
+    service_port: int, requests: Mapping[str, Mapping[str, Any]]
+) -> dict[str, Mapping[str, Any]]:
+    """Retain only browser work whose matching terminal proof is absent."""
+    return {
+        request_id: record
+        for request_id, record in requests.items()
+        if record.get("status") != "accepted"
+        or not _history_is_terminal(
+            service_port, str(record["session_id"]), int(record["boundary"])
+        )
+    }
+
+
 def _record_browser_prompt(service_port: int, session_id: str) -> str:
+    if _browser_session_id(session_id) is None:
+        raise _activity_error("DeepSeek Web browser session identity is invalid")
     with _gateway_lock():
         activity = _read_activity(required=True)
         if activity["admission"] != "open":
@@ -773,6 +806,9 @@ def _record_browser_prompt(service_port: int, session_id: str) -> str:
                 "HARNESS_WEB_SESSION_BUSY",
                 "a managed DeepSeek turn owns this native session",
             )
+        activity["requests"] = _active_browser_requests(
+            service_port, activity["requests"]
+        )
         if any(record["session_id"] == session_id for record in activity["requests"].values()):
             raise DeepSeekWebError(
                 "HARNESS_WEB_SESSION_BUSY",
@@ -813,13 +849,7 @@ def reserve_managed_session(session_id: str) -> None:
         service_port = state.get("service_port")
         if not isinstance(service_port, int):
             raise _activity_error("DeepSeek Web service state is unavailable")
-        active = {
-            request_id: record
-            for request_id, record in activity["requests"].items()
-            if record.get("status") != "accepted" or not _history_is_terminal(
-                service_port, record["session_id"], record["boundary"]
-            )
-        }
+        active = _active_browser_requests(service_port, activity["requests"])
         if any(record["session_id"] == session_id for record in active.values()):
             raise DeepSeekWebError(
                 "HARNESS_WEB_SESSION_BUSY",

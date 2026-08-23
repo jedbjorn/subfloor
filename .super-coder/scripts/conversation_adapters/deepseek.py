@@ -678,8 +678,8 @@ class DeepSeekAdapter(ConversationAdapter):
             client = self._managed_client(context)
             route = self._route(client, context)
             session_ref = self._new_session_ref(context)
-            self._prepare_managed_session(client, session_ref, context)
             self._reserve(session_ref)
+            self._prepare_managed_session(client, session_ref, context)
             return self._turn(
                 client, session_ref, context, message, resumed=False, route=route
             )
