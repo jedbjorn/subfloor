@@ -394,6 +394,10 @@ class HarnessSurfaceProjectionTest(unittest.TestCase):
         self.assertNotIn("sc_generation=", transcript.getvalue())
 
     def test_public_deepseek_run_overwrites_absent_or_stale_shell_id_at_exec(self) -> None:
+        # run.main() enters the selected worktree.  Restore the test runner's
+        # directory after TemporaryDirectory removes that synthetic worktree.
+        self.addCleanup(run.os.chdir, Path.cwd())
+
         class Con:
             def execute(self, *_args):
                 return self
