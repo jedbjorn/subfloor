@@ -132,9 +132,9 @@ class DeepSeekAdapter(ConversationAdapter):
     def _managed_client(
         self, context: ConversationContext
     ) -> deepseek_host.HostTransport:
-        # Unit/probe contexts have no shell authority.  Actual Browser and
-        # Sprint preparation always carries all three facts; require the Host
-        # lease before it can inspect a route or mutate a native session.
+        # Unit/probe contexts have no shell authority. Managed preparation
+        # carries all three facts; require the Host lease before it can inspect
+        # a route or mutate a native session.
         env = context.env
         wiring = (env.get("SC_API_TOKEN"), env.get("SC_API_BASE"), env.get("SC_SHELL_SHORTNAME"))
         if any(wiring):
