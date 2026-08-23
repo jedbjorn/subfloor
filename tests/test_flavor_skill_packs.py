@@ -45,6 +45,7 @@ RATIFIED_OPT_INS = {
         "docs",
         "flags",
         "git",
+        "harness_promotion",
         "redline_review",
         "spec",
         "sprint_dev",
@@ -264,6 +265,9 @@ class HardCutoverMigrationTest(unittest.TestCase):
             )
         }
         for flavor, expected in RATIFIED_OPT_INS.items():
+            expected_at_0188 = expected - (
+                {"harness_promotion"} if flavor == "dev" else set()
+            )
             actual = {
                 row[0]
                 for row in con.execute(
@@ -273,8 +277,60 @@ class HardCutoverMigrationTest(unittest.TestCase):
                     (flavor,),
                 )
             }
-            self.assertEqual(actual - common, expected, flavor)
+            self.assertEqual(actual - common, expected_at_0188, flavor)
         self.assertEqual(resolved_names(con, bespoke), bespoke_names)
+
+    def test_0232_seeds_harness_promotion_and_grants_dev_idempotently(self) -> None:
+        migration = "0232_seed_harness_promotion_skill.sql"
+        con = build_db(before=migration)
+        skill = con.execute(
+            "INSERT INTO skills (name,description,category,common,content,is_deleted) "
+            "VALUES ('harness_promotion','stale','wrong',1,'stale body',1)"
+        ).lastrowid
+        bespoke = add_shell(con, "custom", None)
+        con.execute(
+            "INSERT INTO shell_skills (shell_id,skill_id) VALUES (?,?)",
+            (bespoke, skill),
+        )
+        con.execute(
+            "INSERT INTO flavor_skills (flavor,skill_id) VALUES ('planner',?)",
+            (skill,),
+        )
+
+        sql = (MIGRATIONS / migration).read_text()
+        con.executescript(sql)
+        con.executescript(sql)
+
+        expected = seed_skills.parse_skill(
+            ENGINE / "assets" / "skills" / "harness_promotion" / "SKILL.md"
+        )
+        actual = con.execute(
+            "SELECT description,category,command,common,content,is_deleted "
+            "FROM skills WHERE name='harness_promotion'"
+        ).fetchone()
+        self.assertEqual(
+            tuple(actual),
+            (
+                expected["description"],
+                expected["category"],
+                expected["command"],
+                expected["common"],
+                expected["content"],
+                0,
+            ),
+        )
+        self.assertEqual(
+            [
+                tuple(row)
+                for row in con.execute(
+                    "SELECT fs.flavor FROM flavor_skills fs JOIN skills s "
+                    "USING(skill_id) WHERE s.name='harness_promotion' "
+                    "ORDER BY fs.flavor"
+                )
+            ],
+            [("dev",), ("planner",)],
+        )
+        self.assertEqual(resolved_names(con, bespoke), {"harness_promotion"})
 
     def test_non_admin_skill_packs_use_the_canonical_sc_command(self) -> None:
         con = build_db()
