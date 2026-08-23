@@ -1291,7 +1291,7 @@ class RecoveryAndFailureTest(SprintPRWatcherCase):
         self.assertTrue(self.watcher.poll_once())
         self.assertEqual(["red", "green"], self._states())
 
-    def test_terminal_sprint_does_not_gate_an_active_subscription(self):
+    def test_completed_sprint_does_not_gate_an_active_subscription(self):
         self.register()
         self.con.execute(
             "UPDATE sprint_work_units SET disposition='completed',"
@@ -1311,6 +1311,57 @@ class RecoveryAndFailureTest(SprintPRWatcherCase):
         self.assertTrue(self.watcher.poll_once())
         self.assertEqual(calls + 1, len(self.reader.get_calls))
         self.assertEqual(0, self.reader.list_calls)
+
+    def test_aborted_sprint_observes_pr_without_waking_its_former_developer(self):
+        self.register()
+        self.con.execute(
+            "INSERT INTO shells "
+            "(shell_id,display_name,shortname,flavor,system_prompt,user_id) "
+            "VALUES (4,'FnB','FNB','admin','prompt',1)"
+        )
+        self.con.commit()
+        sprint_domain.SprintLifecycleStore(self.con).abort(
+            self.sprint_id,
+            sprint_domain.LifecycleActor("fnb", 4),
+            reason="the implementation was abandoned",
+            terminal_outcome="cancelled",
+        )
+        wake_count = self.con.execute(
+            "SELECT COUNT(*) FROM wake_message "
+            "WHERE idempotency_key LIKE 'pr-transition:%'"
+        ).fetchone()[0]
+        self.reader.current = pull_request(
+            state="CLOSED", checks=None, checks_failed=False
+        )
+
+        self.assertTrue(self.watcher.poll_once())
+
+        self.assertEqual(["red", "closed"], self._states())
+        self.assertEqual(
+            ["red", "closed"],
+            [
+                str(row[0])
+                for row in self.con.execute(
+                    "SELECT normalized_state FROM pr_subscription_transitions "
+                    "ORDER BY transition_id"
+                )
+            ],
+        )
+        self.assertEqual(
+            wake_count,
+            self.con.execute(
+                "SELECT COUNT(*) FROM wake_message "
+                "WHERE idempotency_key LIKE 'pr-transition:%'"
+            ).fetchone()[0],
+        )
+        self.assertEqual(
+            0,
+            self.con.execute(
+                "SELECT COUNT(*) FROM wake_message "
+                "WHERE idempotency_key LIKE 'pr-transition:%' "
+                "AND body LIKE '%event=closed%'"
+            ).fetchone()[0],
+        )
 
     def test_failure_is_durable_backs_off_and_never_invents_state(self):
         self.reader.current = GitHubReadError("rate limit reached")

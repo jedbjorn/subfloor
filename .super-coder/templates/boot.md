@@ -147,9 +147,10 @@ can close the Planner chat during an armed Sprint to set coordinate mode (idle
 Planner Re-enters become fresh ticket chats); FnB pause/resume returns to
 supervise, while automatic pauses preserve the dial. Developer-owned PR
 subscriptions emit self-describing red/green/closed Re-enter wakes even outside
-an armed Sprint; Planner and Reviewer receive no PR-event wakes. Arming
-validates all recorded role harness/model/effort selections before publishing
-work; defaults satisfy the gate.
+an armed Sprint, except while the registration remains attached to an aborted
+Sprint; Planner and Reviewer receive no PR-event wakes. Arming validates all
+recorded role harness/model/effort selections before publishing work;
+defaults satisfy the gate.
 
 ---
 
