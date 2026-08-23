@@ -81,7 +81,7 @@ def test_ensure_starts_exact_stock_web_relay_registers_and_reuses() -> None:
 
         assert first["reused"] is False
         assert second["reused"] is True
-        assert first["url"] == "http://127.0.0.1:8942"
+        assert first["url"].startswith("http://127.0.0.1:18942/?sc_generation=")
         assert spawned[0][:2] == (
             [
                 "/bin/dsh",
@@ -94,12 +94,13 @@ def test_ensure_starts_exact_stock_web_relay_registers_and_reuses() -> None:
             ],
             worktree,
         )
-        assert spawned[1][0][-4:] == [
+        assert spawned[1][0][7:11] == [
             "--listen-port",
             "18942",
             "--target-port",
             "8942",
         ]
+        assert spawned[1][0][-2:] == ["--generation-file", str(root / "deepseek-web-generation.json")]
         assert spawned[1][0][3:7] == [
             "--allowed-peer",
             "127.0.0.1",
@@ -288,8 +289,8 @@ def test_relay_rejects_sibling_source_before_opening_stock_host() -> None:
             reader: asyncio.StreamReader, writer: asyncio.StreamWriter
         ) -> None:
             upstream_connections.append(writer.get_extra_info("peername"))
-            payload = await reader.readexactly(4)
-            writer.write(payload)
+            await reader.readuntil(b"\r\n\r\n")
+            writer.write(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\npong")
             await writer.drain()
             writer.close()
             await writer.wait_closed()
@@ -311,10 +312,10 @@ def test_relay_rejects_sibling_source_before_opening_stock_host() -> None:
                 "127.0.0.1", relay_port, local_addr=(source, 0)
             )
             try:
-                writer.write(b"ping")
+                writer.write(b"GET / HTTP/1.1\r\nHost: test\r\n\r\n")
                 await writer.drain()
                 try:
-                    return await asyncio.wait_for(reader.read(4), timeout=1)
+                    return await asyncio.wait_for(reader.read(512), timeout=1)
                 except ConnectionResetError:
                     return b""
             finally:
@@ -323,7 +324,7 @@ def test_relay_rejects_sibling_source_before_opening_stock_host() -> None:
                     await writer.wait_closed()
 
         try:
-            assert await exchange("127.0.0.1") == b"ping"
+            assert b"HTTP/1.1 200 OK" in await exchange("127.0.0.1")
             assert len(upstream_connections) == 1
             assert await exchange("127.0.0.2") == b""
             assert len(upstream_connections) == 1

@@ -13,6 +13,7 @@ import asyncio
 import fcntl
 import json
 import os
+import re
 import shutil
 import signal
 import socket
@@ -40,6 +41,7 @@ START_TIMEOUT_SECONDS = 30.0
 STOP_TIMEOUT_SECONDS = 5.0
 HTTP_TIMEOUT_SECONDS = 2.0
 RELAY_POLICY = "host-gateway-only-v1"
+GENERATION_COOKIE = "sc_deepseek_generation"
 
 
 class DeepSeekWebError(RuntimeError):
@@ -415,11 +417,59 @@ def _stop_unlocked() -> dict[str, Any]:
         _credential_path().unlink()
     except FileNotFoundError:
         pass
+    try:
+        _generation_path().unlink()
+    except FileNotFoundError:
+        pass
     return {"stopped": web_stopped or relay_stopped, "web": web_stopped, "relay": relay_stopped}
 
 
 def _credential_path() -> Path:
     return _state_path().with_name("deepseek-shell-api.json")
+
+
+def _generation_path() -> Path:
+    return _state_path().with_name("deepseek-web-generation.json")
+
+
+def _write_generation() -> str:
+    """Mint the relay-only capability without serializing it into service state."""
+    token = uuid.uuid4().hex + uuid.uuid4().hex
+    path = _generation_path()
+    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(descriptor, "w") as handle:
+            os.fchmod(handle.fileno(), 0o600)
+            json.dump({"generation": token}, handle)
+            handle.write("\n")
+        os.replace(temporary, path)
+    except OSError:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+        raise
+    return token
+
+
+def _read_generation(path: Path) -> str:
+    try:
+        if path.is_symlink() or path.stat().st_mode & 0o777 != 0o600:
+            raise OSError("unsafe generation artifact")
+        value = json.loads(path.read_text())
+        token = value.get("generation") if isinstance(value, Mapping) else None
+    except (OSError, json.JSONDecodeError) as exc:
+        raise DeepSeekWebError(
+            "HARNESS_WEB_GENERATION_STALE",
+            "DeepSeek Web generation is unavailable",
+        ) from exc
+    if not isinstance(token, str) or re.fullmatch(r"[0-9a-f]{64}", token) is None:
+        raise DeepSeekWebError(
+            "HARNESS_WEB_GENERATION_STALE",
+            "DeepSeek Web generation is invalid",
+        )
+    return token
 
 
 def _write_shell_credential(env: Mapping[str, str]) -> tuple[Path, str] | None:
@@ -571,6 +621,7 @@ def ensure(
                     f"official dsh Web did not become ready; inspect {_log_path()}",
                 )
             if sandbox:
+                generation = _write_generation()
                 relay_pid, relay_ticks = _spawn(
                     [
                         sys.executable,
@@ -585,6 +636,8 @@ def ensure(
                         str(relay_port),
                         "--target-port",
                         str(service_port),
+                        "--generation-file",
+                        str(_generation_path()),
                     ],
                     cwd=REPO_ROOT,
                     log=_log_path(),
@@ -599,6 +652,8 @@ def ensure(
                         "HARNESS_SERVICE_UNAVAILABLE",
                         "DeepSeek loopback publication relay did not become ready",
                     )
+                url = f"http://127.0.0.1:{relay_port}/?sc_generation={generation}"
+                state["url"] = url
         elif credential_shell is not None:
             # Repair a missing/stale artifact (for example after shell-key
             # rotation) without restarting an otherwise healthy same-shell Host.
@@ -650,9 +705,47 @@ async def _relay_connection(
     writer: asyncio.StreamWriter,
     target_port: int,
     allowed_peers: frozenset[str],
+    generation: str | None = None,
 ) -> None:
     peer = writer.get_extra_info("peername")
     if not isinstance(peer, tuple) or not peer or peer[0] not in allowed_peers:
+        writer.close()
+        await writer.wait_closed()
+        return
+    try:
+        request = await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), timeout=HTTP_TIMEOUT_SECONDS)
+    except (asyncio.IncompleteReadError, TimeoutError, asyncio.LimitOverrunError):
+        writer.close()
+        await writer.wait_closed()
+        return
+    lines = request.decode("iso-8859-1").split("\r\n")
+    request_line = lines[0].split(" ", 2) if lines else []
+    cookie = next((line[7:].strip() for line in lines[1:] if line.lower().startswith("cookie:")), "")
+    parsed_cookie = {
+        item.split("=", 1)[0].strip(): item.split("=", 1)[1].strip()
+        for item in cookie.split(";") if "=" in item
+    }
+    query_generation = None
+    if len(request_line) == 3:
+        parsed_target = urllib.parse.urlsplit(request_line[1])
+        query = urllib.parse.parse_qs(parsed_target.query)
+        query_generation = (query.get("sc_generation") or [None])[0]
+        if query_generation is not None:
+            clean_query = [(key, value) for key, values in query.items() for value in values if key != "sc_generation"]
+            request_line[1] = urllib.parse.urlunsplit(("", "", parsed_target.path or "/", urllib.parse.urlencode(clean_query), ""))
+            lines[0] = " ".join(request_line)
+            request = ("\r\n".join(lines)).encode("iso-8859-1")
+    if generation is not None and (
+        parsed_cookie.get(GENERATION_COOKIE) != generation
+        and query_generation != generation
+    ):
+        body = b'{"error":"HARNESS_WEB_GENERATION_STALE"}'
+        writer.write(
+            b"HTTP/1.1 409 Conflict\r\nContent-Type: application/json\r\n"
+            + f"Content-Length: {len(body)}\r\nConnection: close\r\n\r\n".encode()
+            + body
+        )
+        await writer.drain()
         writer.close()
         await writer.wait_closed()
         return
@@ -664,6 +757,22 @@ async def _relay_connection(
         writer.close()
         await writer.wait_closed()
         return
+    upstream_writer.write(request)
+    await upstream_writer.drain()
+
+    try:
+        response = await asyncio.wait_for(upstream_reader.readuntil(b"\r\n\r\n"), timeout=HTTP_TIMEOUT_SECONDS)
+    except (asyncio.IncompleteReadError, TimeoutError, asyncio.LimitOverrunError):
+        upstream_writer.close()
+        writer.close()
+        await upstream_writer.wait_closed()
+        await writer.wait_closed()
+        return
+    response_lines = response.decode("iso-8859-1").split("\r\n")
+    if generation is not None:
+        response_lines.insert(-2, f"Set-Cookie: {GENERATION_COOKIE}={generation}; HttpOnly; SameSite=Strict; Path=/")
+    writer.write("\r\n".join(response_lines).encode("iso-8859-1"))
+    await writer.drain()
 
     async def copy(source: asyncio.StreamReader, destination: asyncio.StreamWriter) -> None:
         try:
@@ -688,11 +797,12 @@ async def _relay_connection(
 
 
 async def _relay(
-    listen_port: int, target_port: int, allowed_peers: frozenset[str]
+    listen_port: int, target_port: int, allowed_peers: frozenset[str], generation_file: Path
 ) -> None:
+    generation = _read_generation(generation_file)
     server = await asyncio.start_server(
         lambda reader, writer: _relay_connection(
-            reader, writer, target_port, allowed_peers
+            reader, writer, target_port, allowed_peers, generation
         ),
         "0.0.0.0",
         listen_port,
@@ -712,6 +822,7 @@ def main(argv: list[str]) -> int:
     relay_parser.add_argument("--allowed-peer", action="append", required=True)
     relay_parser.add_argument("--listen-port", type=int, required=True)
     relay_parser.add_argument("--target-port", type=int, required=True)
+    relay_parser.add_argument("--generation-file", type=Path, required=True)
     args = parser.parse_args(argv)
     try:
         if args.command == "ensure":
@@ -726,6 +837,7 @@ def main(argv: list[str]) -> int:
                     args.listen_port,
                     args.target_port,
                     frozenset(args.allowed_peer),
+                    args.generation_file,
                 )
             )
             return 0
