@@ -106,7 +106,8 @@ def _render_documents(con, written, skipped, root: Path) -> None:
     """specs (kind='spec') → specs_sc/, docs (kind='doc') → docs_sc/.
 
     The document's own `render_path` is authoritative when set; otherwise we
-    derive a stable path from kind + title.
+    derive a stable path from kind + title. Files without a current source row
+    are removed so both managed directories remain exact DB projections.
     """
     rows = con.execute(
         "SELECT d.feature_id, d.kind, d.seq, d.title, d.body, d.render_path, "
@@ -114,10 +115,13 @@ def _render_documents(con, written, skipped, root: Path) -> None:
         "LEFT JOIN roadmap r ON r.feature_id = d.feature_id "
         "ORDER BY d.feature_id, d.kind, d.seq"
     ).fetchall()
+    expected: set[Path] = set()
     for r in rows:
         if not r["body"]:
             continue
         rel = document_rel_path(r)
+        target = _document_target(root, rel, r["kind"])
+        expected.add(target)
         # Per-document metadata into the rendered frontmatter — where the
         # feature sits in the plan + whether this spec is frozen.
         extra = [
@@ -125,9 +129,16 @@ def _render_documents(con, written, skipped, root: Path) -> None:
             f"roadmap_status: {r['roadmap_status'] or ''}",
             f"frozen: {'true' if r['frozen'] else 'false'}",
         ]
-        _write_if_changed(_document_target(root, rel, r["kind"]),
-                          with_banner(r["body"], extra),
-                          written, skipped)
+        _write_if_changed(target, with_banner(r["body"], extra), written, skipped)
+
+    for dirname in ("specs_sc", "docs_sc"):
+        managed_root = root / dirname
+        if not managed_root.exists():
+            continue
+        for path in sorted(managed_root.rglob("*")):
+            if path.is_file() and path not in expected:
+                path.unlink()
+                written.append(path)
 
 
 # Board order: delivered first, then the committed funnel backward, with
