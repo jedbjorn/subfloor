@@ -590,6 +590,44 @@ def test_resume_archived_session_refuses_without_replacement(tmp_path: Path) -> 
     assert not any(method == "session.prompt" for method, _ in live.calls)
 
 
+def test_recovery_refuses_detached_session_before_history_or_prompt(tmp_path: Path) -> None:
+    seed = FakeHost()
+    ctx = context(tmp_path, seed)
+    session = DeepSeekAdapter._new_session_ref(ctx)
+    live = FakeHost(history=[{
+        "seq": 3, "type": "turn/end", "data": {"reason": {"kind": "completed"}},
+    }])
+    live.seed_session(session, str(tmp_path))
+    live.workspaces["ws-1"]["sessionIds"] = []
+
+    with pytest.raises(AdapterError) as refused:
+        DeepSeekAdapter(client_factory=lambda: live).inspect(session, ctx)
+
+    assert refused.value.code == "HARNESS_SESSION_LOST"
+    assert [method for method, _ in live.calls] == ["workspace.list"]
+    assert "session.history" not in [method for method, _ in live.calls]
+    assert "session.prompt" not in [method for method, _ in live.calls]
+
+
+def test_recovery_refuses_archived_session_before_history_or_prompt(tmp_path: Path) -> None:
+    seed = FakeHost()
+    ctx = context(tmp_path, seed)
+    session = DeepSeekAdapter._new_session_ref(ctx)
+    live = FakeHost(history=[{
+        "seq": 3, "type": "turn/end", "data": {"reason": {"kind": "completed"}},
+    }])
+    live.seed_session(session, str(tmp_path))
+    live.workspaces["ws-1"]["archivedSessionIds"].append(session)
+
+    with pytest.raises(AdapterError) as refused:
+        DeepSeekAdapter(client_factory=lambda: live).inspect(session, ctx)
+
+    assert refused.value.code == "HARNESS_SESSION_ARCHIVED"
+    assert [method for method, _ in live.calls] == ["workspace.list"]
+    assert "session.history" not in [method for method, _ in live.calls]
+    assert "session.prompt" not in [method for method, _ in live.calls]
+
+
 def test_partial_workspace_attach_retries_the_same_exact_session(tmp_path: Path) -> None:
     class PartialAttachHost(FakeHost):
         def __init__(self) -> None:
@@ -836,3 +874,38 @@ def test_one_shot_without_canonical_identity_refuses_before_host_access(
 
     assert refused.value.code == "HARNESS_SHELL_IDENTITY_UNAVAILABLE"
     assert fake.calls == []
+
+
+def test_one_shot_uncertain_prompt_fences_future_handoff_before_lease_release(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class UncertainHost(FakeHost):
+        def call(self, method, payload):
+            if method == "session.prompt":
+                self.calls.append((method, dict(payload)))
+                raise deepseek_host.DeepSeekHostError(
+                    "HARNESS_HOST_UNAVAILABLE", "prompt acknowledgement lost"
+                )
+            if method == "session.cancel":
+                self.calls.append((method, dict(payload)))
+                return {"accepted": False}
+            return super().call(method, payload)
+
+    fake = UncertainHost()
+    fenced: list[str] = []
+    monkeypatch.setattr(deepseek_host, "DeepSeekHostClient", lambda: fake)
+    monkeypatch.setattr(
+        deepseek_web,
+        "mark_unproven_execution",
+        lambda _env, session: fenced.append(session),
+    )
+
+    with pytest.raises(deepseek_host.DeepSeekHostError) as refused:
+        deepseek_one_shot._run("acme-dynamic/model-7", "high", "prompt", worktree=tmp_path)
+
+    assert refused.value.code == "HARNESS_ONE_SHOT_BUSY"
+    prompts = [payload for method, payload in fake.calls if method == "session.prompt"]
+    cancels = [payload for method, payload in fake.calls if method == "session.cancel"]
+    assert len(prompts) == 1
+    assert cancels == [{"sessionId": prompts[0]["sessionId"]}]
+    assert fenced == [prompts[0]["sessionId"]]

@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+import time
 import uuid
 from pathlib import Path
 from typing import Mapping
@@ -19,6 +20,58 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--effort", default="default")
     parser.add_argument("prompt")
     return parser
+
+
+def _terminal_proven(client: deepseek_host.HostTransport, session_ref: str) -> bool:
+    try:
+        value = client.call("session.history", {"sessionId": session_ref, "maxMessages": 200})
+    except deepseek_host.DeepSeekHostError:
+        return False
+    events = value.get("events") if isinstance(value, Mapping) else None
+    if not isinstance(events, list):
+        return False
+    starts = [
+        event.get("event", {}).get("seq")
+        for event in events
+        if isinstance(event, Mapping)
+        and isinstance(event.get("event"), Mapping)
+        and event["event"].get("type") == "turn/start"
+        and isinstance(event["event"].get("seq"), int)
+    ]
+    if not starts:
+        return False
+    boundary = max(starts)
+    return any(
+        isinstance(event, Mapping)
+        and isinstance(event.get("event"), Mapping)
+        and event["event"].get("type") == "turn/end"
+        and isinstance(event["event"].get("seq"), int)
+        and event["event"]["seq"] >= boundary
+        for event in events
+    )
+
+
+def _finalize_unknown(client: deepseek_host.HostTransport, session_ref: str) -> None:
+    try:
+        cancelled = client.call("session.cancel", {"sessionId": session_ref})
+    except deepseek_host.DeepSeekHostError:
+        cancelled = None
+    if not isinstance(cancelled, Mapping) or cancelled.get("accepted") is not True:
+        deepseek_web.mark_unproven_execution(os.environ, session_ref)
+        raise deepseek_host.DeepSeekHostError(
+            "HARNESS_ONE_SHOT_BUSY",
+            "one-shot cancellation lacks terminal proof; Host credential remains fenced",
+        )
+    for attempt in range(3):
+        if _terminal_proven(client, session_ref):
+            return
+        if attempt < 2:
+            time.sleep(0.05)
+    deepseek_web.mark_unproven_execution(os.environ, session_ref)
+    raise deepseek_host.DeepSeekHostError(
+        "HARNESS_ONE_SHOT_BUSY",
+        "one-shot cancellation lacks terminal proof; Host credential remains fenced",
+    )
 
 
 def _run(selector: str, effort: str, prompt: str, *, worktree: Path) -> int:
@@ -60,7 +113,10 @@ def _run(selector: str, effort: str, prompt: str, *, worktree: Path) -> int:
         )
     stream = client.open_events()
     wrote = False
+    prompt_attempted = False
+    terminal = False
     try:
+        prompt_attempted = True
         accepted = client.call(
             "session.prompt",
             {
@@ -102,6 +158,7 @@ def _run(selector: str, effort: str, prompt: str, *, worktree: Path) -> int:
                     sys.stdout.flush()
                     wrote = True
             if event.get("type") == "turn/end" and isinstance(data, Mapping):
+                terminal = True
                 reason = data.get("reason")
                 kind = reason.get("kind") if isinstance(reason, Mapping) else None
                 if wrote:
@@ -112,11 +169,16 @@ def _run(selector: str, effort: str, prompt: str, *, worktree: Path) -> int:
                     "HARNESS_NATIVE_RUN_FAILED",
                     f"DeepSeek one-shot ended without an ordinary response: {kind or 'unknown'}",
                 )
+    except BaseException:
+        if prompt_attempted and not terminal:
+            _finalize_unknown(client, session_ref)
+        raise
     finally:
         stream.close()
+    _finalize_unknown(client, session_ref)
     raise deepseek_host.DeepSeekHostError(
         "HARNESS_RECONCILIATION_UNKNOWN",
-        "DeepSeek one-shot event stream ended without terminal evidence",
+        "DeepSeek one-shot stream ended after cancellation terminalization",
     )
 
 

@@ -182,6 +182,23 @@ class DeepSeekAdapter(ConversationAdapter):
                 "HARNESS_WORKSPACE_BINDING_FAILED",
                 "DeepSeek recovery cannot find the canonical managed workspace",
             )
+        active = workspace.get("sessionIds") if isinstance(workspace, Mapping) else None
+        archived = value.get("archivedSessionIds") if isinstance(value, Mapping) else None
+        if not isinstance(active, list) or session_ref not in active:
+            raise AdapterError(
+                "HARNESS_SESSION_LOST",
+                "DeepSeek recovery session is not actively accounted under its workspace",
+            )
+        if not isinstance(archived, list):
+            raise AdapterError(
+                "HARNESS_PROTOCOL_ERROR",
+                "DeepSeek Host returned invalid workspace archive state",
+            )
+        if session_ref in archived:
+            raise AdapterError(
+                "HARNESS_SESSION_ARCHIVED",
+                "DeepSeek recovery session is archived in its workspace",
+            )
         self._require_resume_target(client, session_ref, worktree, workspace_id)
 
     def _managed_session(self) -> tuple[str, str]:
@@ -620,11 +637,6 @@ class DeepSeekAdapter(ConversationAdapter):
             else None
         )
         self._select(client, session_ref, route, effort or "default")
-        try:
-            deepseek_web.reserve_managed_session(session_ref)
-            self._reserved_session = session_ref
-        except deepseek_web.DeepSeekWebError as exc:
-            raise AdapterError(exc.code, exc.detail) from exc
         stream = client.open_events()
         try:
             accepted = client.call(
@@ -667,12 +679,20 @@ class DeepSeekAdapter(ConversationAdapter):
             route = self._route(client, context)
             session_ref = self._new_session_ref(context)
             self._prepare_managed_session(client, session_ref, context)
+            self._reserve(session_ref)
             return self._turn(
                 client, session_ref, context, message, resumed=False, route=route
             )
         except Exception:
             self.close()
             raise
+
+    def _reserve(self, session_ref: str) -> None:
+        try:
+            deepseek_web.reserve_managed_session(session_ref)
+            self._reserved_session = session_ref
+        except deepseek_web.DeepSeekWebError as exc:
+            raise AdapterError(exc.code, exc.detail) from exc
 
     def resume(
         self,
@@ -684,6 +704,7 @@ class DeepSeekAdapter(ConversationAdapter):
         message = ensure_nonempty_message(message)
         try:
             client = self._managed_client(context)
+            self._reserve(session_ref)
             route = self._route(client, context)
             self._prepare_managed_session(
                 client, session_ref, context, resume=True

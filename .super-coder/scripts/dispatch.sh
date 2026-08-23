@@ -180,17 +180,39 @@ sc_open_browser() {
       return 0
     fi
   fi
-  echo "→ no host browser opener found; use the printed DeepSeek Web URL"
+  echo "→ no host browser opener found; DeepSeek Web handoff was not opened"
   return 1
 }
 
-sc_deepseek_browser_url() {
-  # The container gateway owns the generation. Read it after setup finishes;
-  # it remains a one-shot browser capability, never launcher state or argv.
+sc_deepseek_browser_handoff() {
+  # Read the relay generation only into a 0600 handoff file. The opener gets
+  # a nonce-only loopback URL; the helper consumes the capability before its
+  # redirect reaches the upstream DSH UI.
   sc_deepseek_generation="$(docker exec -i "$CNAME" python3 .super-coder/scripts/deepseek_web.py generation)" || return 1
   [ "${#sc_deepseek_generation}" -eq 64 ] || return 1
   [ -z "$(printf '%s' "$sc_deepseek_generation" | tr -d '0-9a-f')" ] || return 1
-  printf 'http://127.0.0.1:%s/?sc_generation=%s\n' "$(deepseekhostport)" "$sc_deepseek_generation"
+  sc_handoff_dir="$ROOT/.sc-state/local/run"
+  sc_capability_path="$sc_handoff_dir/deepseek-browser-capability-$$"
+  sc_ready_path="$sc_handoff_dir/deepseek-browser-ready-$$"
+  umask 077
+  mkdir -p "$sc_handoff_dir" || return 1
+  rm -f "$sc_capability_path" "$sc_ready_path"
+  printf 'http://127.0.0.1:%s/?sc_generation=%s\n' "$(deepseekhostport)" "$sc_deepseek_generation" > "$sc_capability_path" || return 1
+  "$PY" "$(dirname "$0")/browser_handoff.py" --capability-file "$sc_capability_path" --ready-file "$sc_ready_path" >/dev/null 2>&1 &
+  sc_handoff_pid=$!
+  sc_handoff_wait=0
+  while [ "$sc_handoff_wait" -lt 50 ] && [ ! -s "$sc_ready_path" ]; do
+    sleep 0.02
+    sc_handoff_wait=$((sc_handoff_wait + 1))
+  done
+  if [ ! -s "$sc_ready_path" ]; then
+    kill "$sc_handoff_pid" 2>/dev/null || true
+    rm -f "$sc_capability_path" "$sc_ready_path"
+    return 1
+  fi
+  sc_handoff_url="$(cat "$sc_ready_path")"
+  rm -f "$sc_ready_path"
+  printf '%s\n' "$sc_handoff_url"
 }
 
 sc_enter_with_browser_handoff() {
@@ -205,8 +227,8 @@ sc_enter_with_browser_handoff() {
   fi
   if [ "$sc_enter_rc" -eq 0 ] && [ -f "$sc_handoff_path" ]; then
     rm -f "$sc_handoff_path"
-    sc_deepseek_url="$(sc_deepseek_browser_url)" || return "$sc_enter_rc"
-    echo "  DeepSeek Web  $sc_deepseek_url"
+    sc_deepseek_url="$(sc_deepseek_browser_handoff)" || return "$sc_enter_rc"
+    echo "  DeepSeek Web browser handoff ready"
     sc_open_browser "$sc_deepseek_url" || true
   else
     rm -f "$sc_handoff_path"
@@ -1397,11 +1419,11 @@ case "$cmd" in
       shift
       docker exec -it -e "SC_DISABLED_HARNESSES=${SC_DISABLED_HARNESSES:-}" \
         "$CNAME" ./sc boot "$@" --harness deepseek --local-web || exit $?
-      sc_deepseek_url="$(sc_deepseek_browser_url)" || {
+      sc_deepseek_url="$(sc_deepseek_browser_handoff)" || {
         echo "✗ DeepSeek Web gateway did not provide a current browser generation" >&2
         exit 1
       }
-      echo "  DeepSeek Web  $sc_deepseek_url"
+      echo "  DeepSeek Web browser handoff ready"
       sc_open_browser "$sc_deepseek_url" || true
       exit 0
     fi

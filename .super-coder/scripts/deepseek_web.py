@@ -86,6 +86,104 @@ def _identity_lock_path() -> Path:
     return _state_path().with_name("deepseek-shell-identity.lock")
 
 
+def _unproven_path() -> Path:
+    return _state_path().with_name("deepseek-shell-identity-unproven.json")
+
+
+def _read_unproven() -> dict[str, Any] | None:
+    path = _unproven_path()
+    try:
+        if path.is_symlink() or path.stat().st_mode & 0o777 != 0o600:
+            raise OSError("unsafe unproven-work artifact")
+        value = json.loads(path.read_text())
+    except FileNotFoundError:
+        return None
+    except (OSError, json.JSONDecodeError) as exc:
+        raise DeepSeekWebError(
+            "HARNESS_SHELL_IDENTITY_BUSY",
+            "DeepSeek has unreadable unproven work; credential rotation is refused",
+        ) from exc
+    if not isinstance(value, Mapping):
+        raise DeepSeekWebError(
+            "HARNESS_SHELL_IDENTITY_BUSY",
+            "DeepSeek has invalid unproven work; credential rotation is refused",
+        )
+    session_id = value.get("session_id")
+    shell_id = value.get("shell_id")
+    shortname = value.get("shortname")
+    if (
+        not isinstance(session_id, str)
+        or re.fullmatch(r"sc-[0-9a-f]{32}", session_id) is None
+        or not isinstance(shell_id, int)
+        or shell_id <= 0
+        or not isinstance(shortname, str)
+        or not shortname
+    ):
+        raise DeepSeekWebError(
+            "HARNESS_SHELL_IDENTITY_BUSY",
+            "DeepSeek has invalid unproven work; credential rotation is refused",
+        )
+    return {"session_id": session_id, "shell_id": shell_id, "shortname": shortname}
+
+
+def mark_unproven_execution(env: Mapping[str, str], session_id: str) -> None:
+    shell_id = env.get("SC_SHELL_ID", "")
+    shortname = env.get("SC_SHELL_SHORTNAME", "")
+    if not shell_id.isdecimal() or int(shell_id) <= 0 or not shortname:
+        raise DeepSeekWebError(
+            "HARNESS_SHELL_IDENTITY_UNAVAILABLE",
+            "cannot preserve unproven DeepSeek work without canonical shell identity",
+        )
+    path = _unproven_path()
+    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        with os.fdopen(descriptor, "w") as handle:
+            os.fchmod(handle.fileno(), 0o600)
+            json.dump(
+                {
+                    "session_id": session_id,
+                    "shell_id": int(shell_id),
+                    "shortname": shortname,
+                },
+                handle,
+            )
+        os.replace(temporary, path)
+    except OSError:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+        raise
+
+
+def _clear_terminal_unproven(env: Mapping[str, str]) -> None:
+    marker = _read_unproven()
+    if marker is None:
+        return
+    if (
+        env.get("SC_SHELL_ID") != str(marker["shell_id"])
+        or env.get("SC_SHELL_SHORTNAME") != marker["shortname"]
+    ):
+        raise DeepSeekWebError(
+            "HARNESS_SHELL_IDENTITY_BUSY",
+            "another shell owns DeepSeek work without terminal proof",
+        )
+    state = _read_state()
+    service_port = state.get("service_port")
+    if not isinstance(service_port, int) or not _history_is_terminal(
+        service_port, marker["session_id"], 0
+    ):
+        raise DeepSeekWebError(
+            "HARNESS_SHELL_IDENTITY_BUSY",
+            "DeepSeek work has no terminal proof; credential rotation is refused",
+        )
+    try:
+        _unproven_path().unlink()
+    except FileNotFoundError:
+        pass
+
+
 def acquire_shell_identity(*, env: Mapping[str, str]) -> ShellIdentityLease:
     """Acquire the full-lifetime Host identity lease or refuse before mutation."""
     path = _identity_lock_path()
@@ -100,6 +198,12 @@ def acquire_shell_identity(*, env: Mapping[str, str]) -> ShellIdentityLease:
             "HARNESS_SHELL_IDENTITY_BUSY",
             "another DeepSeek execution owns the shared Host credential",
         ) from exc
+    try:
+        _clear_terminal_unproven(env)
+    except Exception:
+        fcntl.flock(handle, fcntl.LOCK_UN)
+        handle.close()
+        raise
     return ShellIdentityLease(handle)
 
 
@@ -435,7 +539,8 @@ def _terminate_verified(state: Mapping[str, Any], prefix: str) -> bool:
 
 def _stop_unlocked() -> dict[str, Any]:
     state = _read_state()
-    if not _drain_gateway_work(state):
+    activity = _close_gateway_admission(state)
+    if not _drain_gateway_work(state, activity):
         raise DeepSeekWebError(
             "HARNESS_WEB_GATEWAY_BUSY",
             "DeepSeek Web has accepted browser work without terminal proof",
@@ -494,29 +599,67 @@ def _activity_path() -> Path:
     return _state_path().with_name("deepseek-web-activity.json")
 
 
-def _activity_sessions() -> set[str]:
+def _gateway_lock_path() -> Path:
+    return _state_path().with_name("deepseek-web-gateway.lock")
+
+
+@contextmanager
+def _gateway_lock():
+    path = _gateway_lock_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a+") as handle:
+        os.chmod(path, 0o600)
+        fcntl.flock(handle, fcntl.LOCK_EX)
+        yield
+
+
+def _activity_error(detail: str) -> DeepSeekWebError:
+    return DeepSeekWebError("HARNESS_WEB_GATEWAY_BUSY", detail)
+
+
+def _read_activity(*, required: bool) -> dict[str, Any]:
+    path = _activity_path()
     try:
-        path = _activity_path()
         if path.is_symlink() or path.stat().st_mode & 0o777 != 0o600:
-            return set()
+            raise OSError("unsafe activity artifact")
         value = json.loads(path.read_text())
-    except (OSError, json.JSONDecodeError):
-        return set()
-    raw = value.get("session_ids") if isinstance(value, Mapping) else None
-    return {
-        session_id for session_id in raw or []
-        if isinstance(session_id, str) and re.fullmatch(r"sc-[0-9a-f]{32}", session_id)
-    }
+    except FileNotFoundError:
+        if not required:
+            return {"admission": "open", "requests": {}}
+        raise _activity_error("DeepSeek Web activity evidence is unavailable") from None
+    except (OSError, json.JSONDecodeError) as exc:
+        raise _activity_error("DeepSeek Web activity evidence is unreadable") from exc
+    if not isinstance(value, Mapping) or value.get("admission") not in {"open", "closed"}:
+        raise _activity_error("DeepSeek Web activity evidence is invalid")
+    requests = value.get("requests")
+    if not isinstance(requests, Mapping):
+        raise _activity_error("DeepSeek Web activity requests are invalid")
+    checked: dict[str, dict[str, Any]] = {}
+    for request_id, record in requests.items():
+        if not isinstance(request_id, str) or not isinstance(record, Mapping):
+            raise _activity_error("DeepSeek Web activity requests are invalid")
+        session_id = record.get("session_id")
+        boundary = record.get("boundary")
+        if (
+            not isinstance(session_id, str)
+            or re.fullmatch(r"sc-[0-9a-f]{32}", session_id) is None
+            or not isinstance(boundary, int)
+            or isinstance(boundary, bool)
+            or boundary < 0
+        ):
+            raise _activity_error("DeepSeek Web activity requests are invalid")
+        checked[request_id] = {"session_id": session_id, "boundary": boundary}
+    return {"admission": value["admission"], "requests": checked}
 
 
-def _write_activity(session_ids: set[str]) -> None:
+def _write_activity(value: Mapping[str, Any]) -> None:
     path = _activity_path()
     temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
     try:
         descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         with os.fdopen(descriptor, "w") as handle:
             os.fchmod(handle.fileno(), 0o600)
-            json.dump({"session_ids": sorted(session_ids)}, handle)
+            json.dump(dict(value), handle, sort_keys=True)
             handle.write("\n")
         os.replace(temporary, path)
     except OSError:
@@ -527,7 +670,31 @@ def _write_activity(session_ids: set[str]) -> None:
         raise
 
 
-def _history_is_terminal(service_port: int, session_id: str) -> bool:
+def _initialize_activity() -> None:
+    with _gateway_lock():
+        _write_activity({"admission": "open", "requests": {}})
+
+
+def _history_boundary(service_port: int, session_id: str) -> int:
+    try:
+        result = _host_rpc(service_port, "session.history", {"sessionId": session_id})
+    except DeepSeekWebError:
+        raise
+    events = result.get("events") if isinstance(result, Mapping) else None
+    if not isinstance(events, list):
+        raise _activity_error("DeepSeek Web could not read browser session history")
+    sequence = [
+        event.get("event", {}).get("seq")
+        for event in events
+        if isinstance(event, Mapping)
+        and isinstance(event.get("event"), Mapping)
+        and isinstance(event["event"].get("seq"), int)
+        and not isinstance(event["event"].get("seq"), bool)
+    ]
+    return max(sequence, default=-1) + 1
+
+
+def _history_is_terminal(service_port: int, session_id: str, boundary: int) -> bool:
     try:
         result = _host_rpc(service_port, "session.history", {"sessionId": session_id})
     except DeepSeekWebError:
@@ -537,26 +704,74 @@ def _history_is_terminal(service_port: int, session_id: str) -> bool:
         return False
     for envelope in reversed(events):
         event = envelope.get("event") if isinstance(envelope, Mapping) else None
-        if not isinstance(event, Mapping) or event.get("type") != "turn/end":
+        if (
+            not isinstance(event, Mapping)
+            or event.get("type") != "turn/end"
+            or not isinstance(event.get("seq"), int)
+            or event["seq"] < boundary
+        ):
             continue
         reason = event.get("data")
         return isinstance(reason, Mapping) and isinstance(reason.get("reason"), Mapping)
     return False
 
 
-def _drain_gateway_work(state: Mapping[str, Any]) -> bool:
-    sessions = _activity_sessions()
-    if not sessions:
+def _close_gateway_admission(state: Mapping[str, Any]) -> dict[str, Any]:
+    if not state:
+        return {"admission": "closed", "requests": {}}
+    with _gateway_lock():
+        activity = _read_activity(required=True)
+        activity["admission"] = "closed"
+        _write_activity(activity)
+        return activity
+
+
+def _drain_gateway_work(state: Mapping[str, Any], activity: Mapping[str, Any]) -> bool:
+    requests = activity.get("requests")
+    if not isinstance(requests, Mapping):
+        return False
+    if not requests:
         return True
     service_port = state.get("service_port")
     if not isinstance(service_port, int):
         return False
     pending = {
-        session_id for session_id in sessions
-        if not _history_is_terminal(service_port, session_id)
+        request_id: record
+        for request_id, record in requests.items()
+        if not isinstance(record, Mapping)
+        or not _history_is_terminal(
+            service_port,
+            str(record.get("session_id")),
+            int(record.get("boundary", -1)),
+        )
     }
-    _write_activity(pending)
+    with _gateway_lock():
+        current = _read_activity(required=True)
+        if current.get("admission") != "closed":
+            return False
+        current["requests"] = pending
+        _write_activity(current)
     return not pending
+
+
+def _record_browser_prompt(
+    service_port: int, session_id: str, request_id: str
+) -> None:
+    with _gateway_lock():
+        activity = _read_activity(required=True)
+        if activity["admission"] != "open":
+            raise _activity_error("DeepSeek Web is closing browser admission")
+        if session_id == _reserved_session():
+            raise DeepSeekWebError(
+                "HARNESS_WEB_SESSION_BUSY",
+                "a managed DeepSeek turn owns this native session",
+            )
+        boundary = _history_boundary(service_port, session_id)
+        activity["requests"][request_id] = {
+            "session_id": session_id,
+            "boundary": boundary,
+        }
+        _write_activity(activity)
 
 
 def reserve_managed_session(session_id: str) -> None:
@@ -565,33 +780,54 @@ def reserve_managed_session(session_id: str) -> None:
         raise DeepSeekWebError(
             "HARNESS_SESSION_INVALID", "managed DeepSeek session identity is invalid"
         )
-    path = _reservation_path()
-    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
-    descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    try:
-        with os.fdopen(descriptor, "w") as handle:
-            os.fchmod(handle.fileno(), 0o600)
-            json.dump({"session_id": session_id}, handle)
-            handle.write("\n")
-        os.replace(temporary, path)
-    except OSError:
+    with _gateway_lock():
+        activity = _read_activity(required=True)
+        state = _read_state()
+        service_port = state.get("service_port")
+        if not isinstance(service_port, int):
+            raise _activity_error("DeepSeek Web service state is unavailable")
+        active = {
+            request_id: record
+            for request_id, record in activity["requests"].items()
+            if not _history_is_terminal(
+                service_port, record["session_id"], record["boundary"]
+            )
+        }
+        if any(record["session_id"] == session_id for record in active.values()):
+            raise DeepSeekWebError(
+                "HARNESS_WEB_SESSION_BUSY",
+                "native Web has accepted browser work for this managed session",
+            )
+        activity["requests"] = active
+        _write_activity(activity)
+        path = _reservation_path()
+        temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+        descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         try:
-            temporary.unlink()
-        except FileNotFoundError:
-            pass
-        raise
+            with os.fdopen(descriptor, "w") as handle:
+                os.fchmod(handle.fileno(), 0o600)
+                json.dump({"session_id": session_id}, handle)
+                handle.write("\n")
+            os.replace(temporary, path)
+        except OSError:
+            try:
+                temporary.unlink()
+            except FileNotFoundError:
+                pass
+            raise
 
 
 def release_managed_session(session_id: str) -> None:
-    try:
-        value = json.loads(_reservation_path().read_text())
-    except (OSError, json.JSONDecodeError):
-        return
-    if isinstance(value, Mapping) and value.get("session_id") == session_id:
+    with _gateway_lock():
         try:
-            _reservation_path().unlink()
-        except FileNotFoundError:
-            pass
+            value = json.loads(_reservation_path().read_text())
+        except (OSError, json.JSONDecodeError):
+            return
+        if isinstance(value, Mapping) and value.get("session_id") == session_id:
+            try:
+                _reservation_path().unlink()
+            except FileNotFoundError:
+                pass
 
 
 def _reserved_session() -> str | None:
@@ -646,11 +882,12 @@ def _read_generation(path: Path) -> str:
     return token
 
 
-def _write_shell_credential(env: Mapping[str, str]) -> tuple[Path, str] | None:
+def _write_shell_credential(env: Mapping[str, str]) -> tuple[Path, str, int] | None:
     token = env.get("SC_API_TOKEN", "")
     api_base = env.get("SC_API_BASE", "")
+    shell_id = env.get("SC_SHELL_ID", "")
     shortname = env.get("SC_SHELL_SHORTNAME", "")
-    present = tuple(bool(value) for value in (token, api_base, shortname))
+    present = tuple(bool(value) for value in (token, api_base, shell_id, shortname))
     if not any(present):
         return None
     if not all(present):
@@ -665,7 +902,15 @@ def _write_shell_credential(env: Mapping[str, str]) -> tuple[Path, str] | None:
         descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         with os.fdopen(descriptor, "w") as handle:
             os.fchmod(handle.fileno(), 0o600)
-            json.dump({"shortname": shortname, "api_base": api_base, "token": token}, handle)
+            json.dump(
+                {
+                    "shell_id": int(shell_id),
+                    "shortname": shortname,
+                    "api_base": api_base,
+                    "token": token,
+                },
+                handle,
+            )
             handle.write("\n")
         os.replace(temporary, path)
     except OSError:
@@ -674,7 +919,7 @@ def _write_shell_credential(env: Mapping[str, str]) -> tuple[Path, str] | None:
         except FileNotFoundError:
             pass
         raise
-    return path, shortname
+    return path, shortname, int(shell_id)
 
 
 def stop(*, env: Mapping[str, str] | None = None) -> dict[str, Any]:
@@ -697,6 +942,7 @@ def _existing_healthy(
     listen_host: str,
     allowed_peers: tuple[str, ...],
     credential_shell: str | None,
+    credential_shell_id: int | None,
 ) -> bool:
     if state.get("service_port") != service_port:
         return False
@@ -704,7 +950,10 @@ def _existing_healthy(
         return False
     if not _http_ready(service_port):
         return False
-    if state.get("credential_shell") != credential_shell:
+    if (
+        state.get("credential_shell") != credential_shell
+        or state.get("credential_shell_id") != credential_shell_id
+    ):
         return False
     return (
         state.get("relay_port") == relay_port
@@ -761,6 +1010,7 @@ def ensure(
         state = _read_state()
         listen_host, allowed_peers = _relay_configuration(sandbox=sandbox)
         credential_shell = env.get("SC_SHELL_SHORTNAME") or None
+        credential_shell_id = int(env["SC_SHELL_ID"])
         reused = _existing_healthy(
             state,
             service_port,
@@ -768,6 +1018,7 @@ def ensure(
             listen_host=listen_host,
             allowed_peers=allowed_peers,
             credential_shell=credential_shell,
+            credential_shell_id=credential_shell_id,
         )
         generation = None
         if not reused:
@@ -781,7 +1032,7 @@ def ensure(
             credential = _write_shell_credential(env)
             web_env = dict(env)
             if credential is not None:
-                credential_file, credential_shell = credential
+                credential_file, credential_shell, credential_shell_id = credential
                 web_env.pop("SC_API_TOKEN", None)
                 web_env.pop("SC_API_BASE", None)
                 web_env["SC_MEM_CREDENTIAL_FILE"] = str(credential_file)
@@ -800,7 +1051,7 @@ def ensure(
                 env=web_env,
             )
             state = {
-                "schema_version": 1,
+                "schema_version": 2,
                 "web_pid": web_pid,
                 "web_start_ticks": web_ticks,
                 "service_port": service_port,
@@ -810,6 +1061,7 @@ def ensure(
                 "relay_allowed_peers": list(allowed_peers),
                 "url": f"http://127.0.0.1:{public_port}",
                 "credential_shell": credential_shell,
+                "credential_shell_id": credential_shell_id,
             }
             _write_state(state)
             if not _wait_ready(lambda: _http_ready(service_port)):
@@ -845,6 +1097,7 @@ def ensure(
                 {"relay_pid": relay_pid, "relay_start_ticks": relay_ticks}
             )
             _write_state(state)
+            _initialize_activity()
             if not _wait_ready(lambda: _tcp_ready("127.0.0.1", relay_port)):
                 _stop_unlocked()
                 raise DeepSeekWebError(
@@ -923,12 +1176,20 @@ async def _relay_connection(
     target_port: int,
     allowed_peers: frozenset[str],
     generation: str | None = None,
+    generation_file: Path | None = None,
 ) -> None:
     peer = writer.get_extra_info("peername")
     if not isinstance(peer, tuple) or not peer or peer[0] not in allowed_peers:
         writer.close()
         await writer.wait_closed()
         return
+    if generation_file is not None:
+        try:
+            generation = _read_generation(generation_file)
+        except DeepSeekWebError:
+            writer.close()
+            await writer.wait_closed()
+            return
     try:
         request = await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), timeout=HTTP_TIMEOUT_SECONDS)
     except (asyncio.IncompleteReadError, TimeoutError, asyncio.LimitOverrunError):
@@ -967,6 +1228,15 @@ async def _relay_connection(
         await writer.wait_closed()
         return
     target = request_line[1] if len(request_line) == 3 else ""
+    websocket = any(
+        line.lower() == "upgrade: websocket" for line in lines[1:]
+    )
+    if websocket and target.split("?", 1)[0] not in {
+        "/api/events.mux", "/api/events.host"
+    }:
+        writer.close()
+        await writer.wait_closed()
+        return
     if target.startswith(("/api/session.prompt", "/api/session.cancel")):
         content_length = next(
             (
@@ -992,10 +1262,19 @@ async def _relay_connection(
             await writer.wait_closed()
             return
         rpc_payload = payload.get("payload") if isinstance(payload, Mapping) else None
-        if (
-            isinstance(rpc_payload, Mapping)
-            and rpc_payload.get("sessionId") == _reserved_session()
-        ):
+        session_id = (
+            rpc_payload.get("sessionId") if isinstance(rpc_payload, Mapping) else None
+        )
+        if not isinstance(session_id, str):
+            writer.close()
+            await writer.wait_closed()
+            return
+        if target.startswith("/api/session.cancel"):
+            with _gateway_lock():
+                reserved = _reserved_session()
+        else:
+            reserved = None
+        if session_id == reserved:
             body = b'{"error":"HARNESS_WEB_SESSION_BUSY"}'
             writer.write(
                 b"HTTP/1.1 409 Conflict\r\nContent-Type: application/json\r\n"
@@ -1006,13 +1285,36 @@ async def _relay_connection(
             writer.close()
             await writer.wait_closed()
             return
-        if (
-            target.startswith("/api/session.prompt")
-            and isinstance(rpc_payload, Mapping)
-            and isinstance(rpc_payload.get("sessionId"), str)
-        ):
-            _write_activity(_activity_sessions() | {rpc_payload["sessionId"]})
+        if target.startswith("/api/session.prompt"):
+            request_id = payload.get("rpcId") if isinstance(payload, Mapping) else None
+            try:
+                _record_browser_prompt(
+                    target_port,
+                    session_id,
+                    request_id if isinstance(request_id, str) and request_id else uuid.uuid4().hex,
+                )
+            except DeepSeekWebError as exc:
+                body = json.dumps({"error": exc.code}, separators=(",", ":")).encode()
+                writer.write(
+                    b"HTTP/1.1 409 Conflict\r\nContent-Type: application/json\r\n"
+                    + f"Content-Length: {len(body)}\r\nConnection: close\r\n\r\n".encode()
+                    + body
+                )
+                await writer.drain()
+                writer.close()
+                await writer.wait_closed()
+                return
         request += body
+    if not websocket:
+        headers = [
+            line for line in lines[1:]
+            if line and not line.lower().startswith("connection:")
+        ]
+        request = "\r\n".join(
+            [lines[0], *headers, "Connection: close", "", ""]
+        ).encode("iso-8859-1")
+        if target.startswith(("/api/session.prompt", "/api/session.cancel")):
+            request += body
     try:
         upstream_reader, upstream_writer = await asyncio.open_connection(
             "127.0.0.1", target_port
@@ -1051,11 +1353,15 @@ async def _relay_connection(
         finally:
             destination.close()
 
-    tasks = [
-        asyncio.create_task(copy(reader, upstream_writer)),
-        asyncio.create_task(copy(upstream_reader, writer)),
-    ]
-    await asyncio.gather(*tasks, return_exceptions=True)
+    if websocket:
+        tasks = [
+            asyncio.create_task(copy(reader, upstream_writer)),
+            asyncio.create_task(copy(upstream_reader, writer)),
+        ]
+        await asyncio.gather(*tasks, return_exceptions=True)
+    else:
+        await copy(upstream_reader, writer)
+        upstream_writer.close()
     await upstream_writer.wait_closed()
     await writer.wait_closed()
 
@@ -1070,7 +1376,12 @@ async def _relay(
     generation = _read_generation(generation_file)
     server = await asyncio.start_server(
         lambda reader, writer: _relay_connection(
-            reader, writer, target_port, allowed_peers, generation
+            reader,
+            writer,
+            target_port,
+            allowed_peers,
+            generation,
+            generation_file,
         ),
         listen_host,
         listen_port,

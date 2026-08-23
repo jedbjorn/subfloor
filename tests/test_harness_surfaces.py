@@ -2,9 +2,12 @@
 from __future__ import annotations
 
 import json
+import io
 import sys
 import tempfile
+import types
 import unittest
+from contextlib import ExitStack
 from pathlib import Path
 from unittest import mock
 
@@ -270,6 +273,125 @@ class HarnessSurfaceProjectionTest(unittest.TestCase):
 
         local_web_gate.assert_called_once_with(adapter)
         terminal_gate.assert_not_called()
+
+    def test_local_web_boot_passes_selected_shell_id_not_inherited_identity(self) -> None:
+        class Con:
+            def execute(self, *_args):
+                return self
+
+            def fetchone(self):
+                return {
+                    "shell_id": 5,
+                    "display_name": "Code-01",
+                    "shortname": "DEV3",
+                    "api_key": "canonical-token",
+                }
+
+            def close(self) -> None:
+                return None
+
+        class Spinner:
+            label = ""
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return None
+
+        with tempfile.TemporaryDirectory() as raw:
+            worktree = Path(raw) / "worktree"
+            worktree.mkdir()
+            chosen = {"shell_id": 5, "shortname": "DEV3", "flavor": "dev"}
+            adapter = {
+                "harness": "deepseek",
+                "surfaces": {"terminal": False},
+                "interactive": {"kind": "local_web", "launch": ["dsh", "web"]},
+            }
+            captured = {}
+            transcript = io.StringIO()
+            fake_analytics = types.SimpleNamespace(
+                sweep=lambda **_kwargs: {"inserted": 0, "updated": 0}
+            )
+            patchers = (
+                mock.patch.object(run.sys, "argv", ["run.py", "DEV3", "--harness", "deepseek", "--local-web"]),
+                mock.patch.object(run.sys.stdin, "isatty", return_value=False),
+                mock.patch.object(run.callable_floor, "require_callable_floor"),
+                mock.patch.object(run.install, "is_source_repo", return_value=True),
+                mock.patch.object(run.subprocess, "run", return_value=mock.Mock(returncode=0)),
+                mock.patch.object(run.global_pointer, "write_global_pointers"),
+                mock.patch.multiple(
+                    run,
+                    open_db=mock.DEFAULT,
+                    authenticate=mock.DEFAULT,
+                    flavor_defaults=mock.DEFAULT,
+                    list_shells=mock.DEFAULT,
+                    pick_shell=mock.DEFAULT,
+                    browser_conversation_active=mock.DEFAULT,
+                    confirm_live=mock.DEFAULT,
+                    ensure_harness_path=mock.DEFAULT,
+                    load_adapter=mock.DEFAULT,
+                    cleanup_before_launch=mock.DEFAULT,
+                    open_session=mock.DEFAULT,
+                    shell_work_dir=mock.DEFAULT,
+                    ensure_worktree=mock.DEFAULT,
+                    sync_worktree=mock.DEFAULT,
+                    link_worktree_map=mock.DEFAULT,
+                    main_checkout_note=mock.DEFAULT,
+                    declared_work_repo_note=mock.DEFAULT,
+                    compose_boot=mock.DEFAULT,
+                    render_harness_skills=mock.DEFAULT,
+                    atomic_write=mock.DEFAULT,
+                    emit_adapter=mock.DEFAULT,
+                    resolve_opencode_plugins=mock.DEFAULT,
+                    apply_merge_json=mock.DEFAULT,
+                    apply_managed_mcp=mock.DEFAULT,
+                    apply_sandbox=mock.DEFAULT,
+                    review_gui_panel=mock.DEFAULT,
+                ),
+                mock.patch.object(run.seed_skills, "sync_engine_skills", return_value=[]),
+                mock.patch.object(run.ports_mod, "resolve", return_value={"port": 8837}),
+                mock.patch.object(run.style, "spinner", return_value=Spinner()),
+                mock.patch.object(run.sys, "stdout", transcript),
+                mock.patch.dict(sys.modules, {"analytics": fake_analytics}),
+                mock.patch.object(
+                    run.deepseek_web,
+                    "ensure",
+                    side_effect=lambda _worktree, *, env: captured.update(env) or {"reused": False, "url": "http://127.0.0.1:8942"},
+                ),
+            )
+            with mock.patch.dict(
+                run.os.environ, {"SC_SHELL_ID": "999", "SC_NO_AUTOPRUNE": "1"}, clear=True
+            ), ExitStack() as stack:
+                applied = [stack.enter_context(patcher) for patcher in patchers]
+                run.open_db.return_value = Con()
+                run.authenticate.return_value = {"user_id": 1}
+                run.flavor_defaults.return_value = {"dev": {"default_harness": "deepseek", "models": {"deepseek": None}}}
+                run.list_shells.return_value = [chosen]
+                run.pick_shell.return_value = chosen
+                run.browser_conversation_active.return_value = False
+                run.confirm_live.return_value = True
+                run.load_adapter.return_value = adapter
+                run.open_session.return_value = (17, 18)
+                run.shell_work_dir.return_value = worktree
+                run.sync_worktree.return_value = "current"
+                run.link_worktree_map.return_value = None
+                run.main_checkout_note.return_value = "current"
+                run.declared_work_repo_note.return_value = "current"
+                run.compose_boot.return_value = "boot"
+                run.render_harness_skills.return_value = {"written": [], "deleted": [], "skipped": [], "dirs": []}
+                run.emit_adapter.return_value = []
+                run.apply_merge_json.return_value = []
+                run.apply_managed_mcp.return_value = []
+                run.apply_sandbox.return_value = []
+                run.review_gui_panel.return_value = "gui"
+                run.main()
+
+        self.assertEqual(captured["SC_SHELL_ID"], "5")
+        self.assertEqual(captured["SC_SHELL_SHORTNAME"], "DEV3")
+        self.assertEqual(captured["SC_API_TOKEN"], "canonical-token")
+        self.assertEqual(captured["SC_API_BASE"], "http://127.0.0.1:8837")
+        self.assertNotIn("sc_generation=", transcript.getvalue())
 
     def test_explicit_unsupported_terminal_and_one_shot_requests_fail_early(self) -> None:
         adapter = {

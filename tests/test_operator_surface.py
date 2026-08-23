@@ -181,7 +181,7 @@ class EnterPreAttachPrintTest(unittest.TestCase):
                 self.assertIn(target, log.read_text())
                 self.assertNotIn("interface", log.read_text().lower())
 
-    def test_enter_deepseek_owns_host_browser_and_printed_url_fallback(self):
+    def test_enter_deepseek_hands_capability_to_browser_without_argv_exposure(self):
         log = self.bin / "docker.log"
         browser_log = self.bin / "browser.log"
         out = sc(
@@ -200,9 +200,11 @@ class EnterPreAttachPrintTest(unittest.TestCase):
             "./sc boot DEV4 --harness deepseek --local-web",
             log.read_text(),
         )
-        expected = "http://127.0.0.1:8942/?sc_generation=" + "0" * 64
-        self.assertIn(expected, out.stdout)
-        self.assertEqual(browser_log.read_text().strip(), expected)
+        opened = browser_log.read_text().strip()
+        self.assertIn("DeepSeek Web browser handoff ready", out.stdout)
+        self.assertNotIn("sc_generation=", out.stdout)
+        self.assertRegex(opened, r"^http://127\.0\.0\.1:\d+/handoff/")
+        self.assertNotIn("sc_generation=", opened)
 
     def test_picker_selected_deepseek_hands_browser_opening_to_the_host(self):
         log = self.bin / "docker.log"
@@ -219,9 +221,11 @@ class EnterPreAttachPrintTest(unittest.TestCase):
 
         self.assertEqual(out.returncode, 0, out.stderr)
         self.assertIn("SC_BROWSER_HANDOFF_ID=", log.read_text())
-        expected = "http://127.0.0.1:8942/?sc_generation=" + "0" * 64
-        self.assertIn(expected, out.stdout)
-        self.assertEqual(browser_log.read_text().strip(), expected)
+        opened = browser_log.read_text().strip()
+        self.assertIn("DeepSeek Web browser handoff ready", out.stdout)
+        self.assertNotIn("sc_generation=", out.stdout)
+        self.assertRegex(opened, r"^http://127\.0\.0\.1:\d+/handoff/")
+        self.assertNotIn("sc_generation=", opened)
 
     def test_terminal_selection_without_handoff_does_not_open_a_browser(self):
         browser_log = self.bin / "browser.log"
