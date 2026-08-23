@@ -70,6 +70,59 @@ class ConversationLaunchPreparer:
             )
         return str(row["shortname"]), row["flavor"]
 
+    def recovery(self, broker_run) -> ConversationContext:
+        """Rebuild only canonical identity for crash recovery, with no launch effects."""
+        con = db_driver.connect(self.db_path)
+        try:
+            row = con.execute(
+                "SELECT shell_id,shortname,flavor,api_key FROM shells "
+                "WHERE shell_id=? AND COALESCE(is_deleted,0)=0",
+                (broker_run.shell_id,),
+            ).fetchone()
+        finally:
+            con.close()
+        if row is None or not row["api_key"]:
+            raise ConversationLaunchError(
+                "HARNESS_SHELL_IDENTITY_UNAVAILABLE",
+                "recovery shell no longer has canonical API identity",
+            )
+        worktree = run_mod.shell_work_dir(str(row["shortname"]), row["flavor"])
+        if worktree.resolve() != broker_run.worktree.resolve():
+            raise ConversationLaunchError(
+                "HARNESS_WORKTREE_MISMATCH",
+                "recovery shell no longer resolves to the conversation worktree",
+            )
+        api_port = run_mod.ports_mod.resolve().get("port")
+        if not isinstance(api_port, int):
+            raise ConversationLaunchError(
+                "HARNESS_SHELL_IDENTITY_UNAVAILABLE",
+                "recovery could not resolve the shell API endpoint",
+            )
+        env = {
+            **run_mod.os.environ,
+            "SC_API_TOKEN": str(row["api_key"]),
+            "SC_API_BASE": f"http://127.0.0.1:{api_port}",
+            "SC_SHELL_ID": str(row["shell_id"]),
+            "SC_SHELL_SHORTNAME": str(row["shortname"]),
+            "SC_SHELL_WORKTREE": str(worktree),
+            "SC_ENGINE_DIR": str(run_mod.ENGINE),
+            "SC_HARNESS": broker_run.harness,
+            "SC_ROOT": str(run_mod.REPO_ROOT),
+        }
+        env["PATH"] = run_mod._shell_path(worktree, env.get("PATH", ""))
+        return ConversationContext(
+            worktree=worktree.resolve(),
+            provider=broker_run.provider,
+            model=broker_run.model,
+            effort=broker_run.effort,
+            permission_mode="unrestricted",
+            title=broker_run.title,
+            env=env,
+            route_binding=broker_run.route_binding,
+            binding_digest=broker_run.binding_digest,
+            conversation_id=broker_run.conversation_id,
+        )
+
     def __call__(self, broker_run) -> tuple[ConversationContext, int]:
         shortname, flavor = self._shell(broker_run.shell_id)
         binding = None

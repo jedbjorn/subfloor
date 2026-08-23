@@ -128,21 +128,25 @@ def run(selector: str, effort: str, prompt: str) -> int:
             "HARNESS_WORKTREE_MISSING", "one-shot worktree is unavailable"
         )
     env = os.environ
-    wiring = (env.get("SC_API_TOKEN"), env.get("SC_API_BASE"), env.get("SC_SHELL_SHORTNAME"))
+    wiring = (
+        env.get("SC_API_TOKEN"),
+        env.get("SC_API_BASE"),
+        env.get("SC_SHELL_ID"),
+        env.get("SC_SHELL_SHORTNAME"),
+    )
+    if not all(wiring):
+        raise deepseek_host.DeepSeekHostError(
+            "HARNESS_SHELL_IDENTITY_UNAVAILABLE",
+            "DeepSeek one-shot requires canonical shell identity",
+        )
     lease = None
-    if any(wiring):
-        if not all(wiring):
-            raise deepseek_host.DeepSeekHostError(
-                "HARNESS_SHELL_IDENTITY_UNAVAILABLE",
-                "DeepSeek one-shot requires complete shell API wiring",
-            )
-        try:
-            lease = deepseek_web.acquire_shell_identity(env=env)
-            deepseek_web.ensure(worktree, env=env, identity_lease=lease)
-        except deepseek_web.DeepSeekWebError as exc:
-            if lease is not None:
-                lease.close()
-            raise deepseek_host.DeepSeekHostError(exc.code, exc.detail) from exc
+    try:
+        lease = deepseek_web.acquire_shell_identity(env=env)
+        deepseek_web.ensure(worktree, env=env, identity_lease=lease)
+    except deepseek_web.DeepSeekWebError as exc:
+        if lease is not None:
+            lease.close()
+        raise deepseek_host.DeepSeekHostError(exc.code, exc.detail) from exc
     try:
         return _run(selector, effort, prompt, worktree=worktree)
     finally:

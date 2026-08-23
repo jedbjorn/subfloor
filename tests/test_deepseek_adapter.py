@@ -15,6 +15,7 @@ sys.path[:0] = [str(ENGINE / "scripts"), str(ENGINE / "api")]
 
 import deepseek_host  # noqa: E402
 import deepseek_one_shot  # noqa: E402
+import deepseek_web  # noqa: E402
 import harness_versions  # noqa: E402
 import route_bindings  # noqa: E402
 from conversation_adapters.base import AdapterError, ConversationContext  # noqa: E402
@@ -63,6 +64,19 @@ def stock_cli_version(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         harness_versions, "probe", lambda harness: "0.1.1-rc.2"
     )
+
+
+@pytest.fixture(autouse=True)
+def canonical_identity(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep unit Hosts isolated while every managed path has canonical identity."""
+    class Lease:
+        def close(self) -> None:
+            return None
+
+    monkeypatch.setattr(deepseek_web, "acquire_shell_identity", lambda **_kwargs: Lease())
+    monkeypatch.setattr(deepseek_web, "ensure", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(deepseek_web, "reserve_managed_session", lambda _session: None)
+    monkeypatch.setattr(deepseek_web, "release_managed_session", lambda _session: None)
 
 
 class FakeStream:
@@ -226,6 +240,12 @@ def context(tmp_path: Path, fake: FakeHost, effort: str = "high") -> Conversatio
         effort=effort, route_binding=binding,
         binding_digest=route_bindings.digest_json(binding),
         conversation_id="cv_" + "1" * 32,
+        env={
+            "SC_API_TOKEN": "test-shell-token",
+            "SC_API_BASE": "http://127.0.0.1:8837",
+            "SC_SHELL_ID": "4",
+            "SC_SHELL_SHORTNAME": "DEV4",
+        },
     )
 
 
@@ -763,8 +783,10 @@ def test_one_shot_uses_same_exact_route(tmp_path: Path, capsys, monkeypatch) -> 
         return result
 
     fake.call = call  # type: ignore[method-assign]
-    for name in ("SC_API_TOKEN", "SC_API_BASE", "SC_SHELL_SHORTNAME"):
-        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("SC_API_TOKEN", "test-shell-token")
+    monkeypatch.setenv("SC_API_BASE", "http://127.0.0.1:8837")
+    monkeypatch.setenv("SC_SHELL_ID", "4")
+    monkeypatch.setenv("SC_SHELL_SHORTNAME", "DEV4")
     monkeypatch.setenv("SC_SHELL_WORKTREE", str(tmp_path))
     monkeypatch.setattr(deepseek_host, "DeepSeekHostClient", lambda: fake)
     assert deepseek_one_shot.run("acme-dynamic/model-7", "high", "prompt") == 0
@@ -786,8 +808,10 @@ def test_one_shot_rejects_wrong_native_selection_before_prompt(
             return result
 
     fake = WrongSelectionHost()
-    for name in ("SC_API_TOKEN", "SC_API_BASE", "SC_SHELL_SHORTNAME"):
-        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("SC_API_TOKEN", "test-shell-token")
+    monkeypatch.setenv("SC_API_BASE", "http://127.0.0.1:8837")
+    monkeypatch.setenv("SC_SHELL_ID", "4")
+    monkeypatch.setenv("SC_SHELL_SHORTNAME", "DEV4")
     monkeypatch.setenv("SC_SHELL_WORKTREE", str(tmp_path))
     monkeypatch.setattr(deepseek_host, "DeepSeekHostClient", lambda: fake)
 
@@ -796,3 +820,19 @@ def test_one_shot_rejects_wrong_native_selection_before_prompt(
 
     assert refused.value.code == "HARNESS_ROUTE_MISMATCH"
     assert "session.prompt" not in [method for method, _payload in fake.calls]
+
+
+def test_one_shot_without_canonical_identity_refuses_before_host_access(
+    tmp_path: Path, monkeypatch
+) -> None:
+    fake = FakeHost()
+    for name in ("SC_API_TOKEN", "SC_API_BASE", "SC_SHELL_ID", "SC_SHELL_SHORTNAME"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("SC_SHELL_WORKTREE", str(tmp_path))
+    monkeypatch.setattr(deepseek_host, "DeepSeekHostClient", lambda: fake)
+
+    with pytest.raises(deepseek_host.DeepSeekHostError) as refused:
+        deepseek_one_shot.run("acme-dynamic/model-7", "high", "prompt")
+
+    assert refused.value.code == "HARNESS_SHELL_IDENTITY_UNAVAILABLE"
+    assert fake.calls == []

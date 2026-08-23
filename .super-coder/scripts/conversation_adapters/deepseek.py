@@ -122,6 +122,7 @@ class DeepSeekAdapter(ConversationAdapter):
         super().__init__(manifest or load_manifest(self.harness))
         self.client_factory = client_factory
         self._shell_lease: deepseek_web.ShellIdentityLease | None = None
+        self._reserved_session: str | None = None
 
     def _client(self) -> deepseek_host.HostTransport:
         try:
@@ -130,28 +131,58 @@ class DeepSeekAdapter(ConversationAdapter):
             raise _adapter_error(exc) from exc
 
     def _managed_client(
-        self, context: ConversationContext
+        self, context: ConversationContext, *, recovery: bool = False
     ) -> deepseek_host.HostTransport:
-        # Unit/probe contexts have no shell authority. Managed preparation
-        # carries all three facts; require the Host lease before it can inspect
-        # a route or mutate a native session.
+        # Every production managed turn is canonically prepared. A missing
+        # immutable shell identity is a refusal, never a test/probe fallback.
         env = context.env
-        wiring = (env.get("SC_API_TOKEN"), env.get("SC_API_BASE"), env.get("SC_SHELL_SHORTNAME"))
-        if any(wiring):
-            if not all(wiring):
-                raise AdapterError(
-                    "HARNESS_SHELL_IDENTITY_UNAVAILABLE",
-                    "DeepSeek conversation preparation omitted shell API wiring",
-                )
-            try:
-                self._shell_lease = deepseek_web.acquire_shell_identity(env=env)
-                deepseek_web.ensure(
-                    context.checked_worktree(), env=env, identity_lease=self._shell_lease
-                )
-            except deepseek_web.DeepSeekWebError as exc:
-                self.close()
-                raise AdapterError(exc.code, exc.detail) from exc
+        wiring = (
+            env.get("SC_API_TOKEN"),
+            env.get("SC_API_BASE"),
+            env.get("SC_SHELL_ID"),
+            env.get("SC_SHELL_SHORTNAME"),
+        )
+        if not all(wiring):
+            raise AdapterError(
+                "HARNESS_SHELL_IDENTITY_UNAVAILABLE",
+                "DeepSeek conversation preparation omitted canonical shell identity",
+            )
+        try:
+            self._shell_lease = deepseek_web.acquire_shell_identity(env=env)
+            deepseek_web.ensure(
+                context.checked_worktree(),
+                env=env,
+                identity_lease=self._shell_lease,
+                register_workspace=not recovery,
+            )
+        except deepseek_web.DeepSeekWebError as exc:
+            self.close()
+            raise AdapterError(exc.code, exc.detail) from exc
         return self._client()
+
+    def _require_recovery_target(
+        self,
+        client: deepseek_host.HostTransport,
+        session_ref: str,
+        context: ConversationContext,
+    ) -> None:
+        """Prove the old exact session before recovery reads its history."""
+        worktree = str(context.checked_worktree())
+        try:
+            value = client.call("workspace.list", {})
+            rows = self._workspace_rows(value)
+        except deepseek_host.DeepSeekHostError as exc:
+            raise _adapter_error(exc) from exc
+        workspace = next((row for row in rows if row.get("path") == worktree), None)
+        workspace_id = (
+            workspace.get("workspaceId") if isinstance(workspace, Mapping) else None
+        )
+        if not isinstance(workspace_id, str) or not workspace_id:
+            raise AdapterError(
+                "HARNESS_WORKSPACE_BINDING_FAILED",
+                "DeepSeek recovery cannot find the canonical managed workspace",
+            )
+        self._require_resume_target(client, session_ref, worktree, workspace_id)
 
     def _managed_session(self) -> tuple[str, str]:
         configured = self.manifest.get("conversation", {}).get("managed_session")
@@ -589,6 +620,11 @@ class DeepSeekAdapter(ConversationAdapter):
             else None
         )
         self._select(client, session_ref, route, effort or "default")
+        try:
+            deepseek_web.reserve_managed_session(session_ref)
+            self._reserved_session = session_ref
+        except deepseek_web.DeepSeekWebError as exc:
+            raise AdapterError(exc.code, exc.detail) from exc
         stream = client.open_events()
         try:
             accepted = client.call(
@@ -973,8 +1009,9 @@ class DeepSeekAdapter(ConversationAdapter):
         self, session_ref: str, context: ConversationContext
     ) -> SessionInspection:
         session_ref = self._session_ref(session_ref)
-        client = self._client()
+        client = self._managed_client(context, recovery=True)
         try:
+            self._require_recovery_target(client, session_ref, context)
             listed = client.call("session.list", {})
             items = listed.get("items") if isinstance(listed, Mapping) else None
             if not isinstance(items, list):
@@ -1021,8 +1058,11 @@ class DeepSeekAdapter(ConversationAdapter):
     def reconcile(
         self, turn: NativeTurn, context: ConversationContext
     ) -> ReconcileResult:
-        client = turn.metadata.get("client") or self._client()
+        client = turn.metadata.get("client")
+        if client is None:
+            client = self._managed_client(context, recovery=True)
         try:
+            self._require_recovery_target(client, turn.session_ref, context)
             events = self._history(client, turn.session_ref)
         except deepseek_host.DeepSeekHostError as exc:
             raise _adapter_error(exc) from exc
@@ -1043,6 +1083,9 @@ class DeepSeekAdapter(ConversationAdapter):
         )
 
     def close(self) -> None:
+        if self._reserved_session is not None:
+            deepseek_web.release_managed_session(self._reserved_session)
+            self._reserved_session = None
         if self._shell_lease is not None:
             self._shell_lease.close()
             self._shell_lease = None

@@ -27,6 +27,10 @@ def service_env(root: Path) -> dict[str, str]:
         "SC_DEEPSEEK_WEB_STATE": str(root / "state.json"),
         "SC_DEEPSEEK_WEB_LOG": str(root / "service.log"),
         "SC_DEEPSEEK_WEB_LOCK": str(root / "service.lock"),
+        "SC_API_TOKEN": "test-shell-token",
+        "SC_API_BASE": "http://127.0.0.1:8837",
+        "SC_SHELL_ID": "4",
+        "SC_SHELL_SHORTNAME": "DEV4",
     }
 
 
@@ -226,14 +230,14 @@ def test_non_sandbox_entry_still_uses_the_generation_gateway() -> None:
         ):
             result = deepseek_web.ensure(worktree, env=env)
 
-        assert result["url"].startswith("http://127.0.0.1:18942/?sc_generation=")
+        assert result["url"].startswith("http://127.0.0.1:8942/?sc_generation=")
         assert spawned[1][3:9] == [
             "--listen-host",
             "127.0.0.1",
             "--allowed-peer",
             "127.0.0.1",
             "--listen-port",
-            "18942",
+            "8942",
         ]
         state = json.loads((root / "state.json").read_text())
         assert state["relay_listen_host"] == "127.0.0.1"
@@ -291,6 +295,38 @@ def test_gateway_quiescence_failure_preserves_old_host_credential() -> None:
         assert credential.read_text() == "credential"
 
 
+def test_unproven_browser_work_refuses_handoff_before_gateway_termination() -> None:
+    with tempfile.TemporaryDirectory() as raw:
+        root = Path(raw)
+        env = service_env(root)
+        (root / "state.json").write_text(
+            json.dumps({"relay_pid": 12, "web_pid": 13, "service_port": 8942})
+        )
+        credential = root / "deepseek-shell-api.json"
+        credential.write_text("credential")
+        session_id = "sc-" + "2" * 32
+        calls: list[str] = []
+
+        with (
+            mock.patch.dict(deepseek_web.os.environ, env, clear=False),
+            mock.patch.object(deepseek_web, "_host_rpc", return_value={"events": []}),
+            mock.patch.object(
+                deepseek_web,
+                "_terminate_verified",
+                side_effect=lambda _state, prefix: calls.append(prefix) or True,
+            ),
+        ):
+            deepseek_web._write_activity({session_id})
+            with pytest.raises(deepseek_web.DeepSeekWebError) as refused:
+                deepseek_web._stop_unlocked()
+            active = deepseek_web._activity_sessions()
+
+        assert refused.value.code == "HARNESS_WEB_GATEWAY_BUSY"
+        assert calls == []
+        assert credential.read_text() == "credential"
+        assert active == {session_id}
+
+
 def test_disabled_deepseek_stops_owned_service_without_launching() -> None:
     with tempfile.TemporaryDirectory() as raw:
         root = Path(raw)
@@ -298,8 +334,9 @@ def test_disabled_deepseek_stops_owned_service_without_launching() -> None:
         worktree.mkdir()
         with (
             mock.patch.dict(deepseek_web.os.environ, service_env(root), clear=False),
-            mock.patch.object(deepseek_web, "REPO_ROOT", root),
-            mock.patch.object(deepseek_web, "_stop_unlocked") as stopped,
+                mock.patch.object(deepseek_web, "REPO_ROOT", root),
+                mock.patch.object(deepseek_web, "_stop_unlocked") as stopped,
+                mock.patch.object(deepseek_web, "_verify_shell_identity"),
             mock.patch.object(
                 deepseek_web.shutil,
                 "which",
@@ -336,6 +373,7 @@ def test_shell_identity_verifies_whoami_before_host_handoff() -> None:
     env = {
         "SC_API_TOKEN": "test-token",
         "SC_API_BASE": "http://127.0.0.1:8837",
+        "SC_SHELL_ID": "4",
         "SC_SHELL_SHORTNAME": "DEV4",
     }
     with mock.patch.object(deepseek_web.urllib.request, "urlopen", side_effect=urlopen):
@@ -345,6 +383,32 @@ def test_shell_identity_verifies_whoami_before_host_handoff() -> None:
     assert request.full_url == "http://127.0.0.1:8837/_sc/mem/whoami"
     assert request.get_header("Authorization") == "Bearer test-token"
     assert timeout == deepseek_web.HTTP_TIMEOUT_SECONDS
+
+
+def test_shell_identity_rejects_same_shortname_with_a_different_shell_id() -> None:
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def read(self) -> bytes:
+            return b'{"shell_id":9,"shortname":"DEV4"}'
+
+    env = {
+        "SC_API_TOKEN": "test-token",
+        "SC_API_BASE": "http://127.0.0.1:8837",
+        "SC_SHELL_ID": "4",
+        "SC_SHELL_SHORTNAME": "DEV4",
+    }
+    with (
+        mock.patch.object(deepseek_web.urllib.request, "urlopen", return_value=Response()),
+        pytest.raises(deepseek_web.DeepSeekWebError) as refused,
+    ):
+        deepseek_web._verify_shell_identity(env)
+
+    assert refused.value.code == "HARNESS_SHELL_IDENTITY_MISMATCH"
 
 
 def test_shell_identity_lease_refuses_an_overlapping_owner() -> None:
@@ -494,6 +558,58 @@ def test_gateway_rejects_stale_generation_before_stock_host_forwarding() -> None
             await upstream.wait_closed()
 
     asyncio.run(scenario())
+
+
+def test_gateway_refuses_prompt_to_the_reserved_managed_session() -> None:
+    async def scenario() -> None:
+        upstream_connections: list[tuple[str, int]] = []
+
+        async def upstream_handler(_reader, writer) -> None:
+            upstream_connections.append(writer.get_extra_info("peername"))
+            writer.close()
+            await writer.wait_closed()
+
+        upstream = await asyncio.start_server(upstream_handler, "127.0.0.1", 0)
+        target_port = upstream.sockets[0].getsockname()[1]
+        gateway = await asyncio.start_server(
+            lambda reader, writer: deepseek_web._relay_connection(
+                reader, writer, target_port, frozenset({"127.0.0.1"}), "a" * 64
+            ),
+            "127.0.0.1",
+            0,
+        )
+        gateway_port = gateway.sockets[0].getsockname()[1]
+        session_id = "sc-" + "1" * 32
+        payload = json.dumps({"payload": {"sessionId": session_id}}).encode()
+        try:
+            deepseek_web.reserve_managed_session(session_id)
+            reader, writer = await asyncio.open_connection("127.0.0.1", gateway_port)
+            try:
+                writer.write(
+                    b"POST /api/session.prompt?sc_generation=" + b"a" * 64
+                    + b" HTTP/1.1\r\nHost: test\r\nContent-Type: application/json\r\n"
+                    + f"Content-Length: {len(payload)}\r\n\r\n".encode()
+                    + payload
+                )
+                await writer.drain()
+                response = await asyncio.wait_for(reader.read(512), timeout=1)
+            finally:
+                writer.close()
+                await writer.wait_closed()
+            assert response == b'HTTP/1.1 409 Conflict\r\nContent-Type: application/json\r\nContent-Length: 36\r\nConnection: close\r\n\r\n{"error":"HARNESS_WEB_SESSION_BUSY"}'
+            assert upstream_connections == []
+        finally:
+            deepseek_web.release_managed_session(session_id)
+            gateway.close()
+            upstream.close()
+            await gateway.wait_closed()
+            await upstream.wait_closed()
+
+    with tempfile.TemporaryDirectory() as raw:
+        with mock.patch.dict(
+            deepseek_web.os.environ, service_env(Path(raw)), clear=False
+        ):
+            asyncio.run(scenario())
 
 
 def test_status_rejects_a_live_relay_without_the_host_gateway_policy() -> None:

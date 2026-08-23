@@ -1567,6 +1567,7 @@ def prepare_launch(*, shell_id: int, harness: "str | None" = None,
     env["SC_SHELL_FLAVOR"] = chosen["flavor"] or ""
     env["SC_API_TOKEN"] = full["api_key"] or ""
     env["SC_API_BASE"] = f"http://127.0.0.1:{api_port}" if api_port else ""
+    env["SC_SHELL_ID"] = str(chosen["shell_id"])
     env["SC_SHELL_SHORTNAME"] = chosen["shortname"]
     env["SC_ENGINE_DIR"] = str(ENGINE)
     env["SC_HARNESS"] = harness
