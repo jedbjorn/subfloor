@@ -15,6 +15,7 @@ sys.path[:0] = [str(ENGINE / "scripts"), str(ENGINE / "api")]
 
 import deepseek_host  # noqa: E402
 import deepseek_one_shot  # noqa: E402
+import harness_versions  # noqa: E402
 import route_bindings  # noqa: E402
 from conversation_adapters.base import AdapterError, ConversationContext  # noqa: E402
 from conversation_adapters.deepseek import DeepSeekAdapter  # noqa: E402
@@ -22,7 +23,7 @@ from conversation_adapters.deepseek import DeepSeekAdapter  # noqa: E402
 
 def configuration(*, credential: Mapping[str, Any] | None = None) -> dict:
     return {
-        "host.describe": {"version": "0.1.1-rc.2"},
+        "host.describe": {"version": "0.0.1"},
         "agentPreset.list": {
             "presets": [{"id": "standard", "trust": "system", "isDefault": True}],
             "authorable": True,
@@ -55,6 +56,13 @@ def configuration(*, credential: Mapping[str, Any] | None = None) -> dict:
             }
         )}},
     }
+
+
+@pytest.fixture(autouse=True)
+def stock_cli_version(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        harness_versions, "probe", lambda harness: "0.1.1-rc.2"
+    )
 
 
 class FakeStream:
@@ -185,6 +193,18 @@ def test_configuration_is_dynamic_redacted_and_official_only() -> None:
         "credentials.describe",
     ]
     assert "secret" not in repr(route).lower()
+
+
+def test_configuration_rejects_missing_host_api_version() -> None:
+    config = configuration()
+    config["host.describe"] = {}
+    fake = FakeHost(config=config)
+
+    with pytest.raises(deepseek_host.DeepSeekHostError) as refused:
+        deepseek_host.configured_routes(fake)
+
+    assert refused.value.code == "HARNESS_HOST_RESPONSE_INVALID"
+    assert "llm.providers" not in [method for method, _ in fake.calls]
 
 
 def test_secret_bearing_credential_descriptor_is_rejected() -> None:
@@ -373,7 +393,9 @@ def test_stale_route_fails_before_session_mutation(tmp_path: Path) -> None:
     assert "session.create" not in [method for method, _ in live.calls]
 
 
-def test_probe_requires_shipped_managed_agent_preset() -> None:
+def test_probe_uses_cli_version_and_requires_shipped_managed_agent_preset(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     healthy = FakeHost()
     result = DeepSeekAdapter(client_factory=lambda: healthy).probe()
     assert result.version == "0.1.1-rc.2"
@@ -381,6 +403,16 @@ def test_probe_requires_shipped_managed_agent_preset() -> None:
         "host.describe", "agentPreset.list",
     ]
 
+    monkeypatch.setattr(harness_versions, "probe", lambda harness: "0.1.0")
+    incompatible = FakeHost()
+    with pytest.raises(AdapterError) as refused:
+        DeepSeekAdapter(client_factory=lambda: incompatible).probe()
+    assert refused.value.code == "HARNESS_VERSION_UNSUPPORTED"
+    assert incompatible.calls == [("host.describe", {})]
+
+    monkeypatch.setattr(
+        harness_versions, "probe", lambda harness: "0.1.1-rc.2"
+    )
     broken = configuration()
     broken["agentPreset.list"]["presets"][0]["broken"] = "missing plugin"
     with pytest.raises(AdapterError) as refused:
