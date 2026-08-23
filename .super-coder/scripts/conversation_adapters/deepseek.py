@@ -9,6 +9,7 @@ import uuid
 from typing import Any, Callable, Iterator, Mapping
 
 import deepseek_host
+import deepseek_web
 import harness_versions
 import route_transport
 
@@ -120,12 +121,37 @@ class DeepSeekAdapter(ConversationAdapter):
     ) -> None:
         super().__init__(manifest or load_manifest(self.harness))
         self.client_factory = client_factory
+        self._shell_lease: deepseek_web.ShellIdentityLease | None = None
 
     def _client(self) -> deepseek_host.HostTransport:
         try:
             return self.client_factory()
         except deepseek_host.DeepSeekHostError as exc:
             raise _adapter_error(exc) from exc
+
+    def _managed_client(
+        self, context: ConversationContext
+    ) -> deepseek_host.HostTransport:
+        # Unit/probe contexts have no shell authority.  Actual Browser and
+        # Sprint preparation always carries all three facts; require the Host
+        # lease before it can inspect a route or mutate a native session.
+        env = context.env
+        wiring = (env.get("SC_API_TOKEN"), env.get("SC_API_BASE"), env.get("SC_SHELL_SHORTNAME"))
+        if any(wiring):
+            if not all(wiring):
+                raise AdapterError(
+                    "HARNESS_SHELL_IDENTITY_UNAVAILABLE",
+                    "DeepSeek conversation preparation omitted shell API wiring",
+                )
+            try:
+                self._shell_lease = deepseek_web.acquire_shell_identity(env=env)
+                deepseek_web.ensure(
+                    context.checked_worktree(), env=env, identity_lease=self._shell_lease
+                )
+            except deepseek_web.DeepSeekWebError as exc:
+                self.close()
+                raise AdapterError(exc.code, exc.detail) from exc
+        return self._client()
 
     def _managed_session(self) -> tuple[str, str]:
         configured = self.manifest.get("conversation", {}).get("managed_session")
@@ -157,6 +183,7 @@ class DeepSeekAdapter(ConversationAdapter):
         resume: bool = False,
     ) -> Mapping[str, Any]:
         agent_preset, permission_preset = self._managed_session()
+        worktree = str(context.checked_worktree())
         if not resume:
             try:
                 client.call(
@@ -171,19 +198,31 @@ class DeepSeekAdapter(ConversationAdapter):
                     "HARNESS_PERMISSION_POLICY_UNAVAILABLE",
                     exc.detail,
                 ) from exc
+        workspace_id = self._workspace_id(client, worktree)
+        if resume:
+            self._require_resume_target(client, session_ref, worktree, workspace_id)
+        payload = {
+            "workspaceId": workspace_id,
+            "sessionId": session_ref,
+            "agentPreset": agent_preset,
+        }
         try:
-            created = client.call(
-                "session.create",
-                {
-                    "sessionId": session_ref,
-                    "cwd": str(context.checked_worktree()),
-                    "agentPreset": agent_preset,
-                },
-            )
+            created = client.call("session.create", payload)
         except deepseek_host.HostRpcError as exc:
-            if resume:
+            # The stock Host can publish the exact session before reporting an
+            # attach failure.  Retrying the same identity repairs that narrow
+            # partial success; a new ID would silently replace history.
+            if exc.code == "HARNESS_HOST_RPC_WORKSPACE_ATTACH_FAILED":
+                try:
+                    created = client.call("session.create", payload)
+                except deepseek_host.DeepSeekHostError as retry_exc:
+                    raise AdapterError(
+                        "HARNESS_SESSION_WORKSPACE_MISMATCH", retry_exc.detail
+                    ) from retry_exc
+            elif resume:
                 raise AdapterError("HARNESS_SESSION_LOST", exc.detail) from exc
-            raise _adapter_error(exc) from exc
+            else:
+                raise _adapter_error(exc) from exc
         except deepseek_host.DeepSeekHostError as exc:
             raise _adapter_error(exc) from exc
         if (
@@ -195,6 +234,9 @@ class DeepSeekAdapter(ConversationAdapter):
                 "HARNESS_SESSION_MISMATCH",
                 "DeepSeek Host did not preserve the managed session preset",
             )
+        self._confirm_workspace_session(
+            client, session_ref, worktree, workspace_id
+        )
         if not resume:
             try:
                 history = self._history(client, session_ref)
@@ -213,6 +255,137 @@ class DeepSeekAdapter(ConversationAdapter):
                     "DeepSeek Host did not pin the unattended permission preset",
                 )
         return created
+
+    @staticmethod
+    def _workspace_id(
+        client: deepseek_host.HostTransport, worktree: str
+    ) -> str:
+        try:
+            value = client.call("workspace.create", {"path": worktree})
+        except deepseek_host.DeepSeekHostError as exc:
+            raise _adapter_error(exc) from exc
+        workspace = value.get("workspace") if isinstance(value, Mapping) else None
+        workspace_id = (
+            workspace.get("workspaceId") if isinstance(workspace, Mapping) else None
+        )
+        returned_path = workspace.get("path") if isinstance(workspace, Mapping) else None
+        if (
+            not isinstance(workspace_id, str)
+            or not workspace_id
+            or not isinstance(returned_path, str)
+            or returned_path != worktree
+        ):
+            raise AdapterError(
+                "HARNESS_WORKSPACE_BINDING_FAILED",
+                "DeepSeek Host did not resolve the canonical managed workspace",
+            )
+        return workspace_id
+
+    @staticmethod
+    def _workspace_rows(value: Any) -> list[Mapping[str, Any]]:
+        rows = value.get("items") if isinstance(value, Mapping) else None
+        if not isinstance(rows, list):
+            raise AdapterError(
+                "HARNESS_PROTOCOL_ERROR", "DeepSeek Host returned invalid workspace list"
+            )
+        return [row for row in rows if isinstance(row, Mapping)]
+
+    @staticmethod
+    def _session_rows(value: Any) -> list[Mapping[str, Any]]:
+        rows = value.get("items") if isinstance(value, Mapping) else None
+        if not isinstance(rows, list):
+            raise AdapterError(
+                "HARNESS_PROTOCOL_ERROR", "DeepSeek Host returned invalid session list"
+            )
+        return [row for row in rows if isinstance(row, Mapping)]
+
+    def _workspace_snapshot(
+        self,
+        client: deepseek_host.HostTransport,
+        workspace_id: str,
+    ) -> tuple[Mapping[str, Any], list[Any]]:
+        try:
+            value = client.call("workspace.list", {})
+            rows = self._workspace_rows(value)
+        except deepseek_host.DeepSeekHostError as exc:
+            raise _adapter_error(exc) from exc
+        archived = value.get("archivedSessionIds") if isinstance(value, Mapping) else None
+        if not isinstance(archived, list):
+            raise AdapterError(
+                "HARNESS_PROTOCOL_ERROR",
+                "DeepSeek Host returned invalid workspace archive state",
+            )
+        row = next((item for item in rows if item.get("workspaceId") == workspace_id), None)
+        if row is None:
+            raise AdapterError(
+                "HARNESS_WORKSPACE_BINDING_FAILED",
+                "DeepSeek Host did not list the resolved managed workspace",
+            )
+        return row, archived
+
+    def _require_resume_target(
+        self,
+        client: deepseek_host.HostTransport,
+        session_ref: str,
+        worktree: str,
+        workspace_id: str,
+    ) -> None:
+        try:
+            rows = self._session_rows(client.call("session.list", {}))
+        except deepseek_host.DeepSeekHostError as exc:
+            raise _adapter_error(exc) from exc
+        row = next((item for item in rows if item.get("sessionId") == session_ref), None)
+        if row is None:
+            raise AdapterError(
+                "HARNESS_SESSION_LOST",
+                "DeepSeek managed session is absent; refusing to create a replacement",
+            )
+        if row.get("cwd") != worktree:
+            raise AdapterError(
+                "HARNESS_SESSION_WORKSPACE_MISMATCH",
+                "DeepSeek managed session belongs to another worktree",
+            )
+        _workspace, archived = self._workspace_snapshot(client, workspace_id)
+        if session_ref in archived:
+            raise AdapterError(
+                "HARNESS_SESSION_ARCHIVED",
+                "DeepSeek managed session is archived and cannot be resumed",
+            )
+
+    def _confirm_workspace_session(
+        self,
+        client: deepseek_host.HostTransport,
+        session_ref: str,
+        worktree: str,
+        workspace_id: str,
+    ) -> None:
+        workspace, archived = self._workspace_snapshot(client, workspace_id)
+        if workspace.get("path") != worktree:
+            raise AdapterError(
+                "HARNESS_WORKSPACE_BINDING_FAILED",
+                "DeepSeek Host workspace path changed during managed setup",
+            )
+        sessions = workspace.get("sessionIds")
+        if not isinstance(sessions, list) or session_ref not in sessions:
+            raise AdapterError(
+                "HARNESS_SESSION_WORKSPACE_MISMATCH",
+                "DeepSeek managed session is not accounted under its workspace",
+            )
+        if session_ref in archived:
+            raise AdapterError(
+                "HARNESS_SESSION_ARCHIVED",
+                "DeepSeek managed session is archived and cannot be prompted",
+            )
+        try:
+            rows = self._session_rows(client.call("session.list", {}))
+        except deepseek_host.DeepSeekHostError as exc:
+            raise _adapter_error(exc) from exc
+        row = next((item for item in rows if item.get("sessionId") == session_ref), None)
+        if row is None or row.get("cwd") != worktree:
+            raise AdapterError(
+                "HARNESS_SESSION_WORKSPACE_MISMATCH",
+                "DeepSeek Host session list disagrees with the managed workspace",
+            )
 
     def probe(self) -> ProbeResult:
         try:
@@ -453,13 +626,17 @@ class DeepSeekAdapter(ConversationAdapter):
 
     def start(self, context: ConversationContext, message: str) -> NativeTurn:
         message = ensure_nonempty_message(message)
-        client = self._client()
-        route = self._route(client, context)
-        session_ref = self._new_session_ref(context)
-        self._prepare_managed_session(client, session_ref, context)
-        return self._turn(
-            client, session_ref, context, message, resumed=False, route=route
-        )
+        try:
+            client = self._managed_client(context)
+            route = self._route(client, context)
+            session_ref = self._new_session_ref(context)
+            self._prepare_managed_session(client, session_ref, context)
+            return self._turn(
+                client, session_ref, context, message, resumed=False, route=route
+            )
+        except Exception:
+            self.close()
+            raise
 
     def resume(
         self,
@@ -469,14 +646,18 @@ class DeepSeekAdapter(ConversationAdapter):
     ) -> NativeTurn:
         session_ref = self._session_ref(session_ref)
         message = ensure_nonempty_message(message)
-        client = self._client()
-        route = self._route(client, context)
-        self._prepare_managed_session(
-            client, session_ref, context, resume=True
-        )
-        return self._turn(
-            client, session_ref, context, message, resumed=True, route=route
-        )
+        try:
+            client = self._managed_client(context)
+            route = self._route(client, context)
+            self._prepare_managed_session(
+                client, session_ref, context, resume=True
+            )
+            return self._turn(
+                client, session_ref, context, message, resumed=True, route=route
+            )
+        except Exception:
+            self.close()
+            raise
 
     @staticmethod
     def _usage(raw: Mapping[str, Any]) -> dict[str, int | float]:
@@ -862,4 +1043,6 @@ class DeepSeekAdapter(ConversationAdapter):
         )
 
     def close(self) -> None:
-        return None
+        if self._shell_lease is not None:
+            self._shell_lease.close()
+            self._shell_lease = None

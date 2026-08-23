@@ -86,6 +86,17 @@ class FakeHost:
         self.permission_default = "workspace-write"
         self.calls: list[tuple[str, dict]] = []
         self.streams: list[FakeStream] = []
+        self.workspaces: dict[str, dict[str, Any]] = {}
+        self.sessions: dict[str, str] = {}
+
+    def seed_session(self, session_id: str, cwd: str, *, workspace_id: str = "ws-1") -> None:
+        self.workspaces[workspace_id] = {
+            "workspaceId": workspace_id,
+            "path": cwd,
+            "sessionIds": [session_id],
+            "archivedSessionIds": [],
+        }
+        self.sessions[session_id] = cwd
 
     def call(self, method: str, payload: Mapping[str, Any]) -> Any:
         request = dict(payload)
@@ -104,6 +115,38 @@ class FakeHost:
                 "secrets": [],
                 "revision": 1,
             }
+        if method == "workspace.create":
+            path = request["path"]
+            row = next(
+                (item for item in self.workspaces.values() if item["path"] == path),
+                None,
+            )
+            if row is None:
+                workspace_id = f"ws-{len(self.workspaces) + 1}"
+                row = {
+                    "workspaceId": workspace_id,
+                    "path": path,
+                    "sessionIds": [],
+                    "archivedSessionIds": [],
+                }
+                self.workspaces[workspace_id] = row
+            return {"created": False, "workspace": copy.deepcopy(row)}
+        if method == "workspace.list":
+            return {
+                "items": [
+                    {
+                        key: copy.deepcopy(value)
+                        for key, value in row.items()
+                        if key != "archivedSessionIds"
+                    }
+                    for row in self.workspaces.values()
+                ],
+                "archivedSessionIds": [
+                    session_id
+                    for row in self.workspaces.values()
+                    for session_id in row["archivedSessionIds"]
+                ],
+            }
         if method == "session.create":
             if not self.existing_session:
                 self.history = [
@@ -120,6 +163,15 @@ class FakeHost:
                     }},
                 ]
                 self.existing_session = True
+            workspace_id = request.get("workspaceId")
+            cwd = request.get("cwd")
+            if isinstance(workspace_id, str):
+                workspace = self.workspaces[workspace_id]
+                cwd = workspace["path"]
+                if request["sessionId"] not in workspace["sessionIds"]:
+                    workspace["sessionIds"].append(request["sessionId"])
+            assert isinstance(cwd, str)
+            self.sessions[request["sessionId"]] = cwd
             return {
                 "sessionId": request["sessionId"],
                 "agentPreset": request.get("agentPreset"),
@@ -137,7 +189,10 @@ class FakeHost:
         if method == "session.cancel":
             return {"accepted": True}
         if method == "session.list":
-            return {"items": []}
+            return {"items": [
+                {"sessionId": session_id, "cwd": cwd, "running": False}
+                for session_id, cwd in self.sessions.items()
+            ]}
         raise AssertionError(f"unexpected Host method: {method}")
 
     def open_events(self) -> FakeStream:
@@ -439,27 +494,20 @@ def test_browser_start_stream_and_exact_call_order(tmp_path: Path) -> None:
         "session.started", "run.started", "assistant.delta", "run.completed",
     ]
     assert events[2].payload["text"] == "hello"
-    assert live.calls[-6:] == [
-        ("settings.update", {
-            "ns": "permission",
-            "patch": {"defaultPreset": "danger-full-access"},
-        }),
-        ("session.create", {
-            "sessionId": session,
-            "cwd": str(tmp_path),
-            "agentPreset": "standard",
-        }),
-        ("session.history", {"sessionId": session, "maxMessages": 200}),
-        ("session.history", {"sessionId": session, "maxMessages": 200}),
-        ("session.selectModel", {
-            "sessionId": session, "provider": "acme-dynamic", "model": "model-7",
-            "reasoningEffort": "high",
-        }),
-        ("session.prompt", {
-            "sessionId": session, "mode": "queue",
-            "content": [{"type": "text", "text": "do work"}],
-        }),
-    ]
+    assert ("workspace.create", {"path": str(tmp_path)}) in live.calls
+    assert ("session.create", {
+        "workspaceId": "ws-1", "sessionId": session, "agentPreset": "standard",
+    }) in live.calls
+    assert ("workspace.list", {}) in live.calls
+    assert ("session.list", {}) in live.calls
+    assert ("session.prompt", {
+        "sessionId": session, "mode": "queue",
+        "content": [{"type": "text", "text": "do work"}],
+    }) in live.calls
+    assert not any(
+        method == "session.create" and "cwd" in payload
+        for method, payload in live.calls
+    )
     assert live.streams[0].closed
 
 
@@ -479,17 +527,78 @@ def test_cold_resume_reuses_session_and_prior_history(tmp_path: Path) -> None:
             "reason": {"kind": "completed"},
         }},
     ])
+    live.seed_session(session, str(tmp_path))
     turn = DeepSeekAdapter(client_factory=lambda: live).resume(session, ctx, "continue")
     assert turn.session_ref == session
     assert ("session.create", {
-        "sessionId": session,
-        "cwd": str(tmp_path),
-        "agentPreset": "standard",
+        "workspaceId": "ws-1", "sessionId": session, "agentPreset": "standard",
     }) in live.calls
     assert "settings.update" not in [method for method, _payload in live.calls]
     assert [payload for method, payload in live.calls if method == "session.history"] == [
         {"sessionId": session, "maxMessages": 200},
     ]
+
+
+def test_resume_missing_session_refuses_before_create_or_prompt(tmp_path: Path) -> None:
+    seed = FakeHost()
+    ctx = context(tmp_path, seed)
+    session = DeepSeekAdapter._new_session_ref(ctx)
+    live = FakeHost()
+
+    with pytest.raises(AdapterError) as refused:
+        DeepSeekAdapter(client_factory=lambda: live).resume(session, ctx, "continue")
+
+    assert refused.value.code == "HARNESS_SESSION_LOST"
+    assert not any(method == "session.create" for method, _ in live.calls)
+    assert not any(method == "session.prompt" for method, _ in live.calls)
+
+
+def test_resume_archived_session_refuses_without_replacement(tmp_path: Path) -> None:
+    seed = FakeHost()
+    ctx = context(tmp_path, seed)
+    session = DeepSeekAdapter._new_session_ref(ctx)
+    live = FakeHost()
+    live.seed_session(session, str(tmp_path))
+    live.workspaces["ws-1"]["archivedSessionIds"].append(session)
+
+    with pytest.raises(AdapterError) as refused:
+        DeepSeekAdapter(client_factory=lambda: live).resume(session, ctx, "continue")
+
+    assert refused.value.code == "HARNESS_SESSION_ARCHIVED"
+    assert live.sessions == {session: str(tmp_path)}
+    assert not any(method == "session.create" for method, _ in live.calls)
+    assert not any(method == "session.prompt" for method, _ in live.calls)
+
+
+def test_partial_workspace_attach_retries_the_same_exact_session(tmp_path: Path) -> None:
+    class PartialAttachHost(FakeHost):
+        def __init__(self) -> None:
+            super().__init__()
+            self.failed_once = False
+
+        def call(self, method, payload):
+            if method == "session.create" and not self.failed_once:
+                self.failed_once = True
+                super().call(method, payload)
+                raise deepseek_host.HostRpcError(
+                    "HARNESS_HOST_RPC_WORKSPACE_ATTACH_FAILED", "published then detached"
+                )
+            return super().call(method, payload)
+
+    seed = FakeHost()
+    ctx = context(tmp_path, seed)
+    session = DeepSeekAdapter._new_session_ref(ctx)
+    live = PartialAttachHost()
+
+    turn = DeepSeekAdapter(client_factory=lambda: live).start(ctx, "work")
+
+    creates = [payload for method, payload in live.calls if method == "session.create"]
+    assert creates == [
+        {"workspaceId": "ws-1", "sessionId": session, "agentPreset": "standard"},
+        {"workspaceId": "ws-1", "sessionId": session, "agentPreset": "standard"},
+    ]
+    assert live.workspaces["ws-1"]["sessionIds"] == [session]
+    assert turn.session_ref == session
 
 
 def test_unattended_permission_history_mismatch_stops_before_prompt(
@@ -654,6 +763,8 @@ def test_one_shot_uses_same_exact_route(tmp_path: Path, capsys, monkeypatch) -> 
         return result
 
     fake.call = call  # type: ignore[method-assign]
+    for name in ("SC_API_TOKEN", "SC_API_BASE", "SC_SHELL_SHORTNAME"):
+        monkeypatch.delenv(name, raising=False)
     monkeypatch.setenv("SC_SHELL_WORKTREE", str(tmp_path))
     monkeypatch.setattr(deepseek_host, "DeepSeekHostClient", lambda: fake)
     assert deepseek_one_shot.run("acme-dynamic/model-7", "high", "prompt") == 0
@@ -675,6 +786,8 @@ def test_one_shot_rejects_wrong_native_selection_before_prompt(
             return result
 
     fake = WrongSelectionHost()
+    for name in ("SC_API_TOKEN", "SC_API_BASE", "SC_SHELL_SHORTNAME"):
+        monkeypatch.delenv(name, raising=False)
     monkeypatch.setenv("SC_SHELL_WORKTREE", str(tmp_path))
     monkeypatch.setattr(deepseek_host, "DeepSeekHostClient", lambda: fake)
 

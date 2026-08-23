@@ -21,6 +21,7 @@ import subprocess
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 import uuid
 from collections.abc import Mapping
@@ -50,6 +51,20 @@ class DeepSeekWebError(RuntimeError):
         super().__init__(f"{code}: {detail}")
 
 
+class ShellIdentityLease:
+    """Exclusive process-credential ownership for one DeepSeek execution."""
+
+    def __init__(self, handle) -> None:
+        self._handle = handle
+
+    def close(self) -> None:
+        if self._handle is None:
+            return
+        fcntl.flock(self._handle, fcntl.LOCK_UN)
+        self._handle.close()
+        self._handle = None
+
+
 def _state_path() -> Path:
     override = os.environ.get("SC_DEEPSEEK_WEB_STATE")
     return Path(override) if override else STATE
@@ -63,6 +78,65 @@ def _log_path() -> Path:
 def _lock_path() -> Path:
     override = os.environ.get("SC_DEEPSEEK_WEB_LOCK")
     return Path(override) if override else LOCK
+
+
+def _identity_lock_path() -> Path:
+    return _state_path().with_name("deepseek-shell-identity.lock")
+
+
+def acquire_shell_identity(*, env: Mapping[str, str]) -> ShellIdentityLease:
+    """Acquire the full-lifetime Host identity lease or refuse before mutation."""
+    path = _identity_lock_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    handle = path.open("a+")
+    os.chmod(path, 0o600)
+    try:
+        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError as exc:
+        handle.close()
+        raise DeepSeekWebError(
+            "HARNESS_SHELL_IDENTITY_BUSY",
+            "another DeepSeek execution owns the shared Host credential",
+        ) from exc
+    return ShellIdentityLease(handle)
+
+
+def _verify_shell_identity(env: Mapping[str, str]) -> None:
+    token = env.get("SC_API_TOKEN", "")
+    api_base = env.get("SC_API_BASE", "")
+    shortname = env.get("SC_SHELL_SHORTNAME", "")
+    present = tuple(bool(value) for value in (token, api_base, shortname))
+    if not any(present):
+        return
+    if not all(present):
+        raise DeepSeekWebError(
+            "HARNESS_SHELL_IDENTITY_UNAVAILABLE",
+            "DeepSeek requires complete Subfloor shell API wiring",
+        )
+    parsed = urllib.parse.urlsplit(api_base)
+    if parsed.scheme != "http" or parsed.hostname not in {"127.0.0.1", "localhost"}:
+        raise DeepSeekWebError(
+            "HARNESS_SHELL_IDENTITY_UNAVAILABLE",
+            "DeepSeek shell API must use a loopback endpoint",
+        )
+    request = urllib.request.Request(
+        api_base.rstrip("/") + "/_sc/mem/whoami",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=HTTP_TIMEOUT_SECONDS) as response:
+            payload = json.loads(response.read())
+    except (OSError, urllib.error.URLError, json.JSONDecodeError) as exc:
+        raise DeepSeekWebError(
+            "HARNESS_SHELL_IDENTITY_UNAVAILABLE",
+            "DeepSeek shell API identity could not be authenticated",
+        ) from exc
+    resolved = payload.get("shortname") if isinstance(payload, Mapping) else None
+    if resolved != shortname:
+        raise DeepSeekWebError(
+            "HARNESS_SHELL_IDENTITY_MISMATCH",
+            "DeepSeek shell API identity disagrees with the prepared shell",
+        )
 
 
 @contextmanager
@@ -414,8 +488,20 @@ def _existing_healthy(
     )
 
 
-def ensure(worktree: Path, *, env: Mapping[str, str] | None = None) -> dict[str, Any]:
+def ensure(
+    worktree: Path,
+    *,
+    env: Mapping[str, str] | None = None,
+    identity_lease: ShellIdentityLease | None = None,
+) -> dict[str, Any]:
     env = os.environ if env is None else env
+    if identity_lease is None:
+        lease = acquire_shell_identity(env=env)
+        try:
+            return ensure(worktree, env=env, identity_lease=lease)
+        finally:
+            lease.close()
+    _verify_shell_identity(env)
     with _service_lock():
         if _disabled(env):
             _stop_unlocked()

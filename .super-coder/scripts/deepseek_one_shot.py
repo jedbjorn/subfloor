@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Mapping
 
 import deepseek_host
+import deepseek_web
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -20,15 +21,10 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
-def run(selector: str, effort: str, prompt: str) -> int:
+def _run(selector: str, effort: str, prompt: str, *, worktree: Path) -> int:
     if not prompt.strip():
         raise deepseek_host.DeepSeekHostError(
             "HARNESS_MESSAGE_INVALID", "one-shot prompt must contain text"
-        )
-    worktree = Path(os.environ.get("SC_SHELL_WORKTREE", os.getcwd())).resolve()
-    if not worktree.is_dir():
-        raise deepseek_host.DeepSeekHostError(
-            "HARNESS_WORKTREE_MISSING", "one-shot worktree is unavailable"
         )
     client = deepseek_host.DeepSeekHostClient()
     route = deepseek_host.route_for(client, selector)
@@ -122,6 +118,36 @@ def run(selector: str, effort: str, prompt: str) -> int:
         "HARNESS_RECONCILIATION_UNKNOWN",
         "DeepSeek one-shot event stream ended without terminal evidence",
     )
+
+
+def run(selector: str, effort: str, prompt: str) -> int:
+    """Run under the shared Host identity lease through terminal cleanup."""
+    worktree = Path(os.environ.get("SC_SHELL_WORKTREE", os.getcwd())).resolve()
+    if not worktree.is_dir():
+        raise deepseek_host.DeepSeekHostError(
+            "HARNESS_WORKTREE_MISSING", "one-shot worktree is unavailable"
+        )
+    env = os.environ
+    wiring = (env.get("SC_API_TOKEN"), env.get("SC_API_BASE"), env.get("SC_SHELL_SHORTNAME"))
+    lease = None
+    if any(wiring):
+        if not all(wiring):
+            raise deepseek_host.DeepSeekHostError(
+                "HARNESS_SHELL_IDENTITY_UNAVAILABLE",
+                "DeepSeek one-shot requires complete shell API wiring",
+            )
+        try:
+            lease = deepseek_web.acquire_shell_identity(env=env)
+            deepseek_web.ensure(worktree, env=env, identity_lease=lease)
+        except deepseek_web.DeepSeekWebError as exc:
+            if lease is not None:
+                lease.close()
+            raise deepseek_host.DeepSeekHostError(exc.code, exc.detail) from exc
+    try:
+        return _run(selector, effort, prompt, worktree=worktree)
+    finally:
+        if lease is not None:
+            lease.close()
 
 
 def main(argv: list[str] | None = None) -> int:

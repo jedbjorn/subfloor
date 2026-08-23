@@ -69,12 +69,13 @@ def test_ensure_starts_exact_stock_web_relay_registers_and_reuses() -> None:
                 "_post_workspace",
                 return_value={"workspace_id": "ws-4", "workspace_created": True},
             ) as register,
-            mock.patch.object(
-                deepseek_web,
-                "_verified_process",
-                side_effect=lambda pid, *_args, **_kwargs: isinstance(pid, int),
-            ),
-        ):
+                mock.patch.object(
+                    deepseek_web,
+                    "_verified_process",
+                    side_effect=lambda pid, *_args, **_kwargs: isinstance(pid, int),
+                ),
+                mock.patch.object(deepseek_web, "_verify_shell_identity"),
+            ):
             first = deepseek_web.ensure(worktree, env=service_env(root))
             second = deepseek_web.ensure(worktree, env=service_env(root))
 
@@ -161,6 +162,7 @@ def test_shell_identity_reaches_stock_host_only_through_owner_only_artifact() ->
                 "_verified_process",
                 side_effect=lambda pid, *_args, **_kwargs: isinstance(pid, int),
             ),
+            mock.patch.object(deepseek_web, "_verify_shell_identity"),
         ):
             result = deepseek_web.ensure(worktree, env=env)
 
@@ -202,6 +204,52 @@ def test_disabled_deepseek_stops_owned_service_without_launching() -> None:
 
         assert unavailable.value.code == "HARNESS_DISABLED"
         stopped.assert_called_once_with()
+
+
+def test_shell_identity_verifies_whoami_before_host_handoff() -> None:
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def read(self) -> bytes:
+            return b'{"shell_id":4,"shortname":"DEV4"}'
+
+    captured = []
+
+    def urlopen(request, *, timeout):
+        captured.append((request, timeout))
+        return Response()
+
+    env = {
+        "SC_API_TOKEN": "test-token",
+        "SC_API_BASE": "http://127.0.0.1:8837",
+        "SC_SHELL_SHORTNAME": "DEV4",
+    }
+    with mock.patch.object(deepseek_web.urllib.request, "urlopen", side_effect=urlopen):
+        deepseek_web._verify_shell_identity(env)
+
+    request, timeout = captured[0]
+    assert request.full_url == "http://127.0.0.1:8837/_sc/mem/whoami"
+    assert request.get_header("Authorization") == "Bearer test-token"
+    assert timeout == deepseek_web.HTTP_TIMEOUT_SECONDS
+
+
+def test_shell_identity_lease_refuses_an_overlapping_owner() -> None:
+    with tempfile.TemporaryDirectory() as raw:
+        env = {**service_env(Path(raw))}
+        first = deepseek_web.acquire_shell_identity(env=env)
+        try:
+            with pytest.raises(deepseek_web.DeepSeekWebError) as refused:
+                deepseek_web.acquire_shell_identity(env=env)
+            assert refused.value.code == "HARNESS_SHELL_IDENTITY_BUSY"
+        finally:
+            first.close()
+
+        second = deepseek_web.acquire_shell_identity(env=env)
+        second.close()
 
 
 def test_sandbox_service_fails_closed_without_exact_injected_host_port() -> None:
