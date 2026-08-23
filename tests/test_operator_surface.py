@@ -121,6 +121,12 @@ class EnterPreAttachPrintTest(unittest.TestCase):
             "docker",
             "#!/bin/sh\n"
             "[ -n \"$SC_DOCKER_LOG\" ] && printf '%s\\n' \"$*\" > \"$SC_DOCKER_LOG\"\n"
+            "if [ -n \"$SC_DOCKER_HANDOFF\" ]; then\n"
+            "  id=$(printf '%s\\n' \"$*\" | sed -n 's/.*SC_BROWSER_HANDOFF_ID=\\([0-9][0-9]*\\).*/\\1/p')\n"
+            "  root=$(cd \"$(git rev-parse --git-common-dir)/..\" && pwd)\n"
+            "  mkdir -p \"$root/.sc-state/local/run\"\n"
+            "  printf 'deepseek\\n' > \"$root/.sc-state/local/run/browser-handoff-$id\"\n"
+            "fi\n"
             "exit 0\n",
         )
         self._stub(
@@ -196,6 +202,36 @@ class EnterPreAttachPrintTest(unittest.TestCase):
         expected = "http://127.0.0.1:8942"
         self.assertIn(expected, out.stdout)
         self.assertEqual(browser_log.read_text().strip(), expected)
+
+    def test_picker_selected_deepseek_hands_browser_opening_to_the_host(self):
+        log = self.bin / "docker.log"
+        browser_log = self.bin / "browser.log"
+        out = sc(
+            "enter",
+            env=self._env(
+                SC_DOCKER_LOG=str(log),
+                SC_DOCKER_HANDOFF="1",
+                SC_BROWSER_LOG=str(browser_log),
+                SC_PYTHON=str(self.bin / "deepseek-python"),
+            ),
+        )
+
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertIn("SC_BROWSER_HANDOFF_ID=", log.read_text())
+        expected = "http://127.0.0.1:8942"
+        self.assertIn(expected, out.stdout)
+        self.assertEqual(browser_log.read_text().strip(), expected)
+
+    def test_terminal_selection_without_handoff_does_not_open_a_browser(self):
+        browser_log = self.bin / "browser.log"
+        out = sc(
+            "enter",
+            env=self._env(SC_BROWSER_LOG=str(browser_log)),
+        )
+
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertFalse(browser_log.exists())
+        self.assertNotIn("DeepSeek Web", out.stdout)
 
     def test_launch_publishes_deepseek_relay_to_host_loopback_only(self):
         source = (ROOT / ".super-coder" / "scripts" / "dispatch.sh").read_text()
