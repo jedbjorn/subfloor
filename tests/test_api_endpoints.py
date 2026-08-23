@@ -751,10 +751,14 @@ class FlavorDefaultsTest(unittest.TestCase):
         self.assertIn("planner", got["flavors"])
         self.assertIn("admin", got["flavors"], "template flavors appear even unseeded")
         self.assertEqual(
-            got["harnesses"], ["claude", "codex", "kimi", "opencode", "vibe"]
+            got["harnesses"],
+            ["claude", "codex", "deepseek", "kimi", "opencode", "vibe"],
+        )
+        self.assertEqual(
+            got["default_harnesses"],
+            ["claude", "codex", "deepseek", "kimi", "opencode", "vibe"],
         )
         self.assertIn("deepseek", got["harness_status"])
-        self.assertNotIn("deepseek", got["harnesses"])
         self.assertEqual(got["harness_status"]["deepseek"]["surfaces"], {
             "terminal": False,
             "one_shot": True,
@@ -952,6 +956,62 @@ class FlavorDefaultsTest(unittest.TestCase):
         row = self._row("planner", "vibe")
         self.assertEqual(row["model"], "devstral-latest")
         self.assertEqual(row["is_default"], 1)
+
+    def test_deepseek_harness_default_is_settable(self) -> None:
+        self.assertIsNone(self._row("planner", "deepseek"))
+
+        ok, err = server.set_flavor_default(
+            self.con,
+            {"flavor": "planner", "harness": "deepseek", "model": None,
+             "is_default": True},
+        )
+
+        self.assertTrue(ok, err)
+        row = self._row("planner", "deepseek")
+        self.assertEqual((row["model"], row["effort"], row["is_default"]),
+                         (None, None, 1))
+
+    def test_noninteractive_harness_is_configurable_but_not_starrable(self) -> None:
+        with mock.patch.object(
+            server, "known_harnesses", return_value=["one-shot-only"]
+        ), mock.patch.object(server, "known_default_harnesses", return_value=[]):
+            ok, err = server.set_flavor_default(
+                self.con,
+                {"flavor": "planner", "harness": "one-shot-only", "model": None},
+            )
+            self.assertTrue(ok, err)
+            row = self._row("planner", "one-shot-only")
+            self.assertEqual((row["model"], row["effort"], row["is_default"]),
+                             (None, None, 0))
+
+            ok, err = server.set_flavor_default(
+                self.con,
+                {"flavor": "planner", "harness": "one-shot-only",
+                 "is_default": True},
+            )
+
+        self.assertFalse(ok)
+        self.assertEqual(err, {
+            "code": "validation_error",
+            "message": "harness 'one-shot-only' has no interactive launch "
+                       "surface and cannot be the flavor default",
+            "details": {},
+        })
+        self.assertEqual(self._row("planner", "one-shot-only")["is_default"], 0)
+
+    def test_unknown_harness_remains_unsettable(self) -> None:
+        ok, err = server.set_flavor_default(
+            self.con,
+            {"flavor": "planner", "harness": "removed-harness", "model": None},
+        )
+
+        self.assertFalse(ok)
+        self.assertEqual(err, {
+            "code": "validation_error",
+            "message": "unknown harness 'removed-harness'",
+            "details": {},
+        })
+        self.assertIsNone(self._row("planner", "removed-harness"))
 
     def test_empty_model_clears_to_null(self) -> None:
         self._route("claude", "opus")

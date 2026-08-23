@@ -82,6 +82,15 @@ def _proven_surfaces(
     }
 
 
+def _local_web_launch_proven(manifest: Mapping[str, object]) -> bool:
+    """Return whether the adapter has an engine-managed local-Web entry."""
+    interactive = manifest.get("interactive")
+    return (
+        isinstance(interactive, dict)
+        and interactive.get("kind") == "local_web"
+    )
+
+
 def _runtime_command(harness: str, manifest: Mapping[str, object]) -> str:
     runtime = manifest.get("runtime")
     if isinstance(runtime, dict) and isinstance(runtime.get("command"), str):
@@ -116,6 +125,38 @@ def known_terminal_harnesses() -> list[str]:
             manifest = json.loads(path.read_text())
             declared = _declared_surfaces(manifest)
             if _proven_surfaces(harness, manifest, declared)["terminal"]:
+                found.append(harness)
+        except (OSError, json.JSONDecodeError, ValueError):
+            continue
+    return sorted(found)
+
+
+def known_runnable_harnesses() -> list[str]:
+    """Return shipped harnesses visible in the model-defaults matrix."""
+    found = []
+    for harness, path in _manifest_paths().items():
+        try:
+            manifest = json.loads(path.read_text())
+            declared = _declared_surfaces(manifest)
+            if (
+                any(_proven_surfaces(harness, manifest, declared).values())
+                or _local_web_launch_proven(manifest)
+            ):
+                found.append(harness)
+        except (OSError, json.JSONDecodeError, ValueError):
+            continue
+    return sorted(found)
+
+
+def known_interactive_harnesses() -> list[str]:
+    """Return shipped harnesses eligible for the flavor launch-default star."""
+    found = []
+    for harness, path in _manifest_paths().items():
+        try:
+            manifest = json.loads(path.read_text())
+            declared = _declared_surfaces(manifest)
+            terminal = _proven_surfaces(harness, manifest, declared)["terminal"]
+            if terminal or _local_web_launch_proven(manifest):
                 found.append(harness)
         except (OSError, json.JSONDecodeError, ValueError):
             continue
