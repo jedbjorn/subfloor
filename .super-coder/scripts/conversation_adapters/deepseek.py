@@ -9,6 +9,7 @@ import uuid
 from typing import Any, Callable, Iterator, Mapping
 
 import deepseek_host
+import harness_versions
 import route_transport
 
 from .base import (
@@ -217,16 +218,32 @@ class DeepSeekAdapter(ConversationAdapter):
         try:
             client = self._client()
             described = client.call("host.describe", {})
-            roster = client.call("agentPreset.list", {})
         except deepseek_host.DeepSeekHostError as exc:
             raise _adapter_error(exc) from exc
-        version = described.get("version") if isinstance(described, Mapping) else None
+        host_version = (
+            described.get("version") if isinstance(described, Mapping) else None
+        )
+        if not isinstance(host_version, str) or not host_version:
+            raise AdapterError(
+                "HARNESS_PROTOCOL_ERROR",
+                "DeepSeek Host descriptor version is invalid",
+            )
         conversation = self.manifest["conversation"]
+        version = harness_versions.probe(self.harness)
+        if version is None:
+            raise AdapterError(
+                "HARNESS_UNAVAILABLE",
+                "DeepSeek CLI version is unavailable",
+            )
         if version != conversation["verified_cli_version"]:
             raise AdapterError(
                 "HARNESS_VERSION_UNSUPPORTED",
-                "DeepSeek Host version does not match the pinned official runtime",
+                "DeepSeek CLI version does not match the pinned official runtime",
             )
+        try:
+            roster = client.call("agentPreset.list", {})
+        except deepseek_host.DeepSeekHostError as exc:
+            raise _adapter_error(exc) from exc
         agent_preset, _permission_preset = self._managed_session()
         presets = roster.get("presets") if isinstance(roster, Mapping) else None
         selected = next(

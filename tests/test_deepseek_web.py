@@ -35,10 +35,16 @@ def test_ensure_starts_exact_stock_web_relay_registers_and_reuses() -> None:
         root = Path(raw)
         worktree = root / ".sc-worktrees" / "dev4"
         worktree.mkdir(parents=True)
-        spawned: list[tuple[list[str], Path]] = []
+        spawned: list[tuple[list[str], Path, dict[str, str] | None]] = []
 
-        def spawn(argv: list[str], *, cwd: Path, log: Path) -> tuple[int, int]:
-            spawned.append((argv, cwd))
+        def spawn(
+            argv: list[str],
+            *,
+            cwd: Path,
+            log: Path,
+            env: dict[str, str] | None = None,
+        ) -> tuple[int, int]:
+            spawned.append((argv, cwd, env))
             return (101 + len(spawned), 201 + len(spawned))
 
         with (
@@ -75,7 +81,7 @@ def test_ensure_starts_exact_stock_web_relay_registers_and_reuses() -> None:
         assert first["reused"] is False
         assert second["reused"] is True
         assert first["url"] == "http://127.0.0.1:8942"
-        assert spawned[0] == (
+        assert spawned[0][:2] == (
             [
                 "/bin/dsh",
                 "web",
@@ -103,6 +109,74 @@ def test_ensure_starts_exact_stock_web_relay_registers_and_reuses() -> None:
         state = json.loads((root / "state.json").read_text())
         assert state["last_worktree"] == str(worktree)
         assert state["last_workspace_id"] == "ws-4"
+
+
+def test_shell_identity_reaches_stock_host_only_through_owner_only_artifact() -> None:
+    with tempfile.TemporaryDirectory() as raw:
+        root = Path(raw)
+        worktree = root / ".sc-worktrees" / "dev4"
+        worktree.mkdir(parents=True)
+        env = {
+            **service_env(root),
+            "SC_API_TOKEN": "shell-token-never-in-host-env",
+            "SC_API_BASE": "http://127.0.0.1:8837",
+            "SC_SHELL_SHORTNAME": "DEV4",
+        }
+        spawned: list[dict[str, str] | None] = []
+
+        def spawn(
+            argv: list[str],
+            *,
+            cwd: Path,
+            log: Path,
+            env: dict[str, str] | None = None,
+        ) -> tuple[int, int]:
+            spawned.append(env)
+            return (101 + len(spawned), 201 + len(spawned))
+
+        with (
+            mock.patch.dict(deepseek_web.os.environ, env, clear=False),
+            mock.patch.object(deepseek_web, "REPO_ROOT", root),
+            mock.patch.object(
+                deepseek_web.ports,
+                "resolve",
+                return_value={"deepseek_host_port": 8942},
+            ),
+            mock.patch.object(deepseek_web.shutil, "which", return_value="/bin/dsh"),
+            mock.patch.object(deepseek_web, "_spawn", side_effect=spawn),
+            mock.patch.object(deepseek_web, "_http_ready", return_value=True),
+            mock.patch.object(deepseek_web, "_tcp_ready", return_value=True),
+            mock.patch.object(
+                deepseek_web,
+                "_relay_allowed_peers",
+                return_value=("127.0.0.1", "172.18.0.1"),
+            ),
+            mock.patch.object(
+                deepseek_web,
+                "_post_workspace",
+                return_value={"workspace_id": "ws-4", "workspace_created": True},
+            ),
+            mock.patch.object(
+                deepseek_web,
+                "_verified_process",
+                side_effect=lambda pid, *_args, **_kwargs: isinstance(pid, int),
+            ),
+        ):
+            result = deepseek_web.ensure(worktree, env=env)
+
+        assert result["credential_shell"] == "DEV4"
+        artifact = root / "deepseek-shell-api.json"
+        assert artifact.stat().st_mode & 0o777 == 0o600
+        assert json.loads(artifact.read_text()) == {
+            "shortname": "DEV4",
+            "api_base": "http://127.0.0.1:8837",
+            "token": "shell-token-never-in-host-env",
+        }
+        assert spawned[0] is not None
+        assert "SC_API_TOKEN" not in spawned[0]
+        assert "SC_API_BASE" not in spawned[0]
+        assert spawned[0]["SC_MEM_CREDENTIAL_FILE"] == str(artifact)
+        assert spawned[1] is None
 
 
 def test_disabled_deepseek_stops_owned_service_without_launching() -> None:

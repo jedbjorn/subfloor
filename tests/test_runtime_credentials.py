@@ -279,6 +279,17 @@ class DiscoveryTest(unittest.TestCase):
         self.assertIn("Peer", out)                     # env identity, not TC's
         self.assertIsNone(mem._DISCOVERED_FROM)
 
+    def test_explicit_owner_only_credential_file_wires_managed_shell(self):
+        artifact = self.write_artifact("PEER", PEER_TOKEN)
+        with mock.patch.dict(
+            os.environ, {"SC_MEM_CREDENTIAL_FILE": str(artifact)}
+        ):
+            rc, out = self.run_which()
+        self.assertEqual(rc, 0)
+        self.assertIn("Peer", out)
+        self.assertEqual(mem._DISCOVERED_FROM, artifact)
+        self.assertEqual(mem.SC_API_TOKEN, PEER_TOKEN)
+
     def test_ambiguous_admin_identity_refuses(self):
         self.write_artifact("TC", TOKEN)
         self.write_artifact("PEER", PEER_TOKEN)

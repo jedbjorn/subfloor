@@ -18,6 +18,12 @@ act as another shell (identity isn't a spoofable argument; it's the secret
 token). The one place a *recipient* is named is `message send <to>` — that
 addresses someone else's inbox; the sender is always the token.
 
+The stock DeepSeek Host strips credential-shaped environment variables from
+model tool subprocesses. Its native Web launcher therefore passes only the path
+to an owner-only runtime artifact in `SC_MEM_CREDENTIAL_FILE`; this client
+validates and reads that file locally. The bearer itself never enters the Host
+RPC, prompt, session history, or subprocess environment.
+
 Host Admin discovery (spec doc #30 req 11): a host Admin seat booted outside
 run.py has neither var. When BOTH are absent, `sc mem` may adopt the unique
 owner-only runtime credential the supervised API provisions per Admin shell
@@ -230,6 +236,10 @@ def _require_api() -> None:
     loud — do NOT silently write the DB behind the API's back (the bug that let a
     shell think a write was API-backed when it wasn't)."""
     if SC_API_TOKEN and SC_API_BASE:
+        return
+    credential_file = os.environ.get("SC_MEM_CREDENTIAL_FILE", "")
+    if not SC_API_TOKEN and not SC_API_BASE and credential_file:
+        _load_runtime_credential(Path(credential_file))
         return
     if not SC_API_TOKEN and not SC_API_BASE and _discover_runtime_credential():
         return

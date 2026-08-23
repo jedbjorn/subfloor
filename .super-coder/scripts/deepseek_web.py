@@ -285,7 +285,13 @@ def _post_workspace(port: int, worktree: Path) -> dict[str, Any]:
     }
 
 
-def _spawn(argv: list[str], *, cwd: Path, log: Path) -> tuple[int, int]:
+def _spawn(
+    argv: list[str],
+    *,
+    cwd: Path,
+    log: Path,
+    env: Mapping[str, str] | None = None,
+) -> tuple[int, int]:
     log.parent.mkdir(parents=True, exist_ok=True)
     with log.open("ab") as output:
         process = subprocess.Popen(
@@ -295,6 +301,7 @@ def _spawn(argv: list[str], *, cwd: Path, log: Path) -> tuple[int, int]:
             stdout=output,
             stderr=subprocess.STDOUT,
             start_new_session=True,
+            env=None if env is None else dict(env),
         )
     ticks = process_start_ticks(process.pid)
     if ticks is None:
@@ -330,7 +337,46 @@ def _stop_unlocked() -> dict[str, Any]:
         _state_path().unlink()
     except FileNotFoundError:
         pass
+    try:
+        _credential_path().unlink()
+    except FileNotFoundError:
+        pass
     return {"stopped": web_stopped or relay_stopped, "web": web_stopped, "relay": relay_stopped}
+
+
+def _credential_path() -> Path:
+    return _state_path().with_name("deepseek-shell-api.json")
+
+
+def _write_shell_credential(env: Mapping[str, str]) -> tuple[Path, str] | None:
+    token = env.get("SC_API_TOKEN", "")
+    api_base = env.get("SC_API_BASE", "")
+    shortname = env.get("SC_SHELL_SHORTNAME", "")
+    present = tuple(bool(value) for value in (token, api_base, shortname))
+    if not any(present):
+        return None
+    if not all(present):
+        raise DeepSeekWebError(
+            "HARNESS_SHELL_IDENTITY_UNAVAILABLE",
+            "DeepSeek Web requires complete Subfloor shell API wiring",
+        )
+    path = _credential_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(descriptor, "w") as handle:
+            os.fchmod(handle.fileno(), 0o600)
+            json.dump({"shortname": shortname, "api_base": api_base, "token": token}, handle)
+            handle.write("\n")
+        os.replace(temporary, path)
+    except OSError:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+        raise
+    return path, shortname
 
 
 def stop() -> dict[str, Any]:
@@ -345,12 +391,15 @@ def _existing_healthy(
     *,
     sandbox: bool,
     allowed_peers: tuple[str, ...],
+    credential_shell: str | None,
 ) -> bool:
     if state.get("service_port") != service_port:
         return False
     if not _verified_process(state.get("web_pid"), state.get("web_start_ticks"), "web"):
         return False
     if not _http_ready(service_port):
+        return False
+    if state.get("credential_shell") != credential_shell:
         return False
     if not sandbox:
         return True
@@ -379,12 +428,14 @@ def ensure(worktree: Path, *, env: Mapping[str, str] | None = None) -> dict[str,
         state = _read_state()
         sandbox = bool(env.get("SC_SANDBOX"))
         allowed_peers = _relay_allowed_peers() if sandbox else ()
+        credential_shell = env.get("SC_SHELL_SHORTNAME") or None
         reused = _existing_healthy(
             state,
             service_port,
             relay_port,
             sandbox=sandbox,
             allowed_peers=allowed_peers,
+            credential_shell=credential_shell,
         )
         if not reused:
             _stop_unlocked()
@@ -394,6 +445,13 @@ def ensure(worktree: Path, *, env: Mapping[str, str] | None = None) -> dict[str,
                     "HARNESS_UNAVAILABLE",
                     "official dsh is not installed; run ./sc ensure-harness",
                 )
+            credential = _write_shell_credential(env)
+            web_env = dict(env)
+            if credential is not None:
+                credential_file, credential_shell = credential
+                web_env.pop("SC_API_TOKEN", None)
+                web_env.pop("SC_API_BASE", None)
+                web_env["SC_MEM_CREDENTIAL_FILE"] = str(credential_file)
             web_pid, web_ticks = _spawn(
                 [
                     executable,
@@ -406,6 +464,7 @@ def ensure(worktree: Path, *, env: Mapping[str, str] | None = None) -> dict[str,
                 ],
                 cwd=selected,
                 log=_log_path(),
+                env=web_env,
             )
             state = {
                 "schema_version": 1,
@@ -416,6 +475,7 @@ def ensure(worktree: Path, *, env: Mapping[str, str] | None = None) -> dict[str,
                 "relay_policy": RELAY_POLICY if sandbox else None,
                 "relay_allowed_peers": list(allowed_peers),
                 "url": url,
+                "credential_shell": credential_shell,
             }
             _write_state(state)
             if not _wait_ready(lambda: _http_ready(service_port)):
@@ -453,6 +513,10 @@ def ensure(worktree: Path, *, env: Mapping[str, str] | None = None) -> dict[str,
                         "HARNESS_SERVICE_UNAVAILABLE",
                         "DeepSeek loopback publication relay did not become ready",
                     )
+        elif credential_shell is not None:
+            # Repair a missing/stale artifact (for example after shell-key
+            # rotation) without restarting an otherwise healthy same-shell Host.
+            _write_shell_credential(env)
         registration = _post_workspace(service_port, selected)
         state.update(
             {

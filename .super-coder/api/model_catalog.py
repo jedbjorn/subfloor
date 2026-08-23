@@ -542,47 +542,6 @@ def _headless_supported(harness: str) -> bool:
 
 def harness_runtime_status(harness: str) -> dict:
     """Return exact version-bounded runtime evidence for one shipped harness."""
-    if harness == "deepseek":
-        try:
-            described = deepseek_host.DeepSeekHostClient().call("host.describe", {})
-            if not isinstance(described, dict):
-                raise ValueError("invalid Host descriptor")
-            manifest = json.loads(
-                (ADAPTERS / "deepseek" / "adapter.json").read_text()
-            )
-            verified = str(
-                (manifest.get("official_runtime") or {}).get("version") or ""
-            ) or None
-            scope = harness_versions.runtime_scope()
-            version = described.get("version")
-            compatible = version == verified
-            return {
-                "harness": harness,
-                **scope,
-                "version": version,
-                "observed_version": version,
-                "compatibility": "verified" if compatible else None,
-                "minimum_version": verified,
-                "maximum_version_exclusive": (
-                    (manifest.get("conversation") or {}).get(
-                        "maximum_cli_version_exclusive"
-                    )
-                ),
-                "verified_version": verified,
-                "error": None if compatible else "HARNESS_VERSION_UNSUPPORTED",
-            }
-        except Exception:  # noqa: BLE001
-            return {
-                "harness": harness,
-                **harness_versions.runtime_scope(),
-                "version": None,
-                "observed_version": None,
-                "compatibility": None,
-                "minimum_version": None,
-                "maximum_version_exclusive": None,
-                "verified_version": None,
-                "error": "HARNESS_PROBE_FAILED",
-            }
     try:
         return dict(
             harness_versions.compatibility_status((harness,)).get(harness) or {}

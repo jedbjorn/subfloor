@@ -450,6 +450,27 @@ class BuildTest(NoCLI):
         self.assertEqual(got, expected)
         probe.assert_called_once_with(("vibe",))
 
+    def test_deepseek_runtime_status_uses_cli_probe_not_host_api_version(self):
+        expected = {
+            "harness": "deepseek",
+            **mc.harness_versions.runtime_scope(),
+            "version": "0.1.1-rc.2",
+            "observed_version": "0.1.1-rc.2",
+            "compatibility": "verified",
+            "minimum_version": "0.1.1",
+            "maximum_version_exclusive": "0.1.2",
+            "verified_version": "0.1.1",
+            "error": None,
+        }
+        with mock.patch.object(
+            mc.harness_versions, "compatibility_status",
+            return_value={"deepseek": expected},
+        ) as probe:
+            got = mc.harness_runtime_status("deepseek")
+
+        self.assertEqual(got, expected)
+        probe.assert_called_once_with(("deepseek",))
+
     def test_harness_mapping_and_prefixing(self):
         got = mc.build(fetch=fetch_ok, env={}, run=None)
         self.assertEqual(got["v"], mc.PAYLOAD_VERSION)
@@ -491,7 +512,7 @@ class BuildTest(NoCLI):
             def call(self, method, payload):
                 calls.append((method, payload))
                 return {
-                    "host.describe": {"version": "0.1.1-rc.2"},
+                    "host.describe": {"version": "0.0.1"},
                     "llm.providers": {"providers": [{
                         "provider": "dynamic-provider", "active": True,
                         "settingsNs": "llm",

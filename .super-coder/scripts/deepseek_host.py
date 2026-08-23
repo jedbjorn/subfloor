@@ -385,19 +385,27 @@ def configured_routes(
 ) -> list[ConfiguredRoute]:
     """Project configured routes only from public, redacted Host RPC methods."""
     described = client.call("host.describe", {})
+    if not isinstance(described, Mapping):
+        raise DeepSeekHostError(
+            "HARNESS_HOST_RESPONSE_INVALID", "configuration projection is malformed"
+        )
+    host_version = described.get("version")
+    if not isinstance(host_version, str) or not host_version:
+        raise DeepSeekHostError(
+            "HARNESS_HOST_RESPONSE_INVALID",
+            "DeepSeek Host descriptor version is invalid",
+        )
     providers_value = client.call("llm.providers", {})
     models_value = client.call("llm.models", {})
     settings_value = client.call("settings.describe", {})
-    if not all(isinstance(item, Mapping) for item in (described, providers_value, models_value, settings_value)):
+    if not all(
+        isinstance(item, Mapping)
+        for item in (providers_value, models_value, settings_value)
+    ):
         raise DeepSeekHostError(
             "HARNESS_HOST_RESPONSE_INVALID", "configuration projection is malformed"
         )
     runtime_version, source_commit = _manifest_identity()
-    if described.get("version") != runtime_version:
-        raise DeepSeekHostError(
-            "HARNESS_VERSION_UNSUPPORTED",
-            "DeepSeek Host version does not match the pinned official runtime",
-        )
     provider_rows = providers_value.get("providers")
     model_groups = models_value.get("groups")
     namespaces = settings_value.get("namespaces")
