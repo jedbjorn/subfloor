@@ -352,7 +352,10 @@ def render_harness_skills(con: sqlite3.Connection, shell_id: int,
     """Render exact shell grants into every skill directory consumed by the
     selected harness. Adapters default to the Claude-compatible path and may
     add a native path where compatibility discovery is incomplete."""
-    skill_dirs = adapter.get("skill_dirs") or [".claude/skills"]
+    skill_dirs = list(dict.fromkeys([
+        ".claude/skills",
+        *(adapter.get("skill_dirs") or []),
+    ]))
     try:
         summary = skill_projection.reconcile_shell(
             con, shell_id, work_dir, ensure_dirs=skill_dirs
@@ -2065,8 +2068,16 @@ def main() -> None:
         return
 
     if local_web:
+        web_env = {
+            **os.environ,
+            **{k: str(v) for k, v in adapter.get("env", {}).items()},
+            **sandbox_env,
+            "SC_SHELL_SHORTNAME": chosen["shortname"],
+            "SC_API_TOKEN": full["api_key"] or "",
+            "SC_API_BASE": f"http://127.0.0.1:{api_port}" if api_port else "",
+        }
         try:
-            service = deepseek_web.ensure(work_dir)
+            service = deepseek_web.ensure(work_dir, env=web_env)
         except deepseek_web.DeepSeekWebError as exc:
             sys.exit(f"session launch: {exc.code}: {exc.detail}")
         action = "reused" if service["reused"] else "started"
@@ -2100,6 +2111,7 @@ def main() -> None:
     # branch-guard.sh reads it to exempt the admin shell (which works on main
     # by mandate); like SC_PROTECTED_BRANCHES it's a guardrail, not a boundary.
     env["SC_SHELL_FLAVOR"] = chosen["flavor"] or ""
+    env["SC_SHELL_SHORTNAME"] = chosen["shortname"]
     env["SC_API_TOKEN"] = full["api_key"] or ""
     env["SC_API_BASE"] = f"http://127.0.0.1:{api_port}" if api_port else ""
     # Optional fast-path for the branch-guard hooks: the absolute engine path, so

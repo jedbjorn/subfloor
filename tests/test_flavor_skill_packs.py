@@ -628,6 +628,32 @@ class RenderAndSnapshotTest(unittest.TestCase):
                     (root / skill_root / "skills" / "query_authoring_pg").exists()
                 )
 
+    def test_native_only_adapter_also_renders_boot_advertised_skill_mirror(self) -> None:
+        self.con.execute(
+            "INSERT INTO shell_skills (shell_id, skill_id) VALUES (?, ?)",
+            (self.custom, self.kid),
+        )
+        adapter = json.loads(
+            (ENGINE / "adapters" / "deepseek" / "adapter.json").read_text()
+        )
+        self.assertEqual(adapter["skill_dirs"], [".agents/skills"])
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            summary = run.render_harness_skills(
+                self.con, self.custom, root, adapter
+            )
+
+            self.assertEqual(
+                summary["dirs"], [".claude/skills", ".agents/skills"]
+            )
+            for skill_root in (".claude", ".agents"):
+                rendered = (
+                    root / skill_root / "skills" / "query_authoring_pg" / "SKILL.md"
+                )
+                self.assertTrue(rendered.exists())
+                self.assertIn("name: query_authoring_pg", rendered.read_text())
+
     def test_snapshot_serializes_pack_grants_by_skill_name(self) -> None:
         self.con.execute(
             "INSERT INTO shell_skills (shell_id, skill_id) VALUES (?, ?)",
