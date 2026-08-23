@@ -184,6 +184,15 @@ sc_open_browser() {
   return 1
 }
 
+sc_deepseek_browser_url() {
+  # The container gateway owns the generation. Read it after setup finishes;
+  # it remains a one-shot browser capability, never launcher state or argv.
+  sc_deepseek_generation="$(docker exec -i "$CNAME" python3 .super-coder/scripts/deepseek_web.py generation)" || return 1
+  [ "${#sc_deepseek_generation}" -eq 64 ] || return 1
+  [ -z "$(printf '%s' "$sc_deepseek_generation" | tr -d '0-9a-f')" ] || return 1
+  printf 'http://127.0.0.1:%s/?sc_generation=%s\n' "$(deepseekhostport)" "$sc_deepseek_generation"
+}
+
 sc_enter_with_browser_handoff() {
   sc_handoff_id="$$"
   sc_handoff_path="$ROOT/.sc-state/local/run/browser-handoff-$sc_handoff_id"
@@ -196,7 +205,7 @@ sc_enter_with_browser_handoff() {
   fi
   if [ "$sc_enter_rc" -eq 0 ] && [ -f "$sc_handoff_path" ]; then
     rm -f "$sc_handoff_path"
-    sc_deepseek_url="http://127.0.0.1:$(deepseekhostport)"
+    sc_deepseek_url="$(sc_deepseek_browser_url)" || return "$sc_enter_rc"
     echo "  DeepSeek Web  $sc_deepseek_url"
     sc_open_browser "$sc_deepseek_url" || true
   else
@@ -1387,8 +1396,11 @@ case "$cmd" in
     if [ "${1:-}" = "deepseek" ]; then
       shift
       docker exec -it -e "SC_DISABLED_HARNESSES=${SC_DISABLED_HARNESSES:-}" \
-        "$CNAME" ./sc boot "$@" --harness deepseek --local-web
-      sc_deepseek_url="http://127.0.0.1:$(deepseekhostport)"
+        "$CNAME" ./sc boot "$@" --harness deepseek --local-web || exit $?
+      sc_deepseek_url="$(sc_deepseek_browser_url)" || {
+        echo "✗ DeepSeek Web gateway did not provide a current browser generation" >&2
+        exit 1
+      }
       echo "  DeepSeek Web  $sc_deepseek_url"
       sc_open_browser "$sc_deepseek_url" || true
       exit 0

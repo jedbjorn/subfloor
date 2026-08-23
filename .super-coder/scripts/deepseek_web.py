@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """Own the fork-scoped official DeepSeek Web/Host service.
 
-The stock service stays on container/host loopback. Docker publishes a tiny
-engine-owned TCP relay to a deterministic host-loopback port; the relay rejects
-every peer except container loopback and the host gateway before connecting to
-dsh. State records PID start ticks before either child is trusted across calls.
+The stock service stays on container/host loopback. An engine-owned
+HTTP/WebSocket gateway publishes its deterministic host-loopback entry,
+generation-checking each browser connection before it reaches dsh. State
+records PID start ticks before either child is trusted across calls.
 """
 from __future__ import annotations
 
@@ -393,22 +393,42 @@ def _terminate_verified(state: Mapping[str, Any], prefix: str) -> bool:
     ticks = state.get(f"{prefix}_start_ticks")
     identity = "web" if prefix == "web" else "relay"
     if not _verified_process(pid, ticks, identity):
-        return False
-    os.kill(pid, signal.SIGTERM)
+        return True
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return True
     deadline = time.monotonic() + STOP_TIMEOUT_SECONDS
     while time.monotonic() < deadline:
         if not _verified_process(pid, ticks, identity):
             return True
         time.sleep(0.05)
-    if _verified_process(pid, ticks, identity):
+    if not _verified_process(pid, ticks, identity):
+        return True
+    try:
         os.kill(pid, signal.SIGKILL)
-    return True
+    except ProcessLookupError:
+        return True
+    return not _verified_process(pid, ticks, identity)
 
 
 def _stop_unlocked() -> dict[str, Any]:
     state = _read_state()
+    # The gateway owns browser admission. It must be gone before the upstream
+    # Host or its owner-only credential can be replaced. SIGTERM cancels every
+    # accepted relay task; an unproven cancellation blocks rotation.
     relay_stopped = _terminate_verified(state, "relay")
+    if not relay_stopped:
+        raise DeepSeekWebError(
+            "HARNESS_WEB_GATEWAY_BUSY",
+            "DeepSeek Web gateway could not quiesce accepted browser work",
+        )
     web_stopped = _terminate_verified(state, "web")
+    if not web_stopped:
+        raise DeepSeekWebError(
+            "HARNESS_SERVICE_STOP_FAILED",
+            "official dsh Web could not stop after gateway quiescence",
+        )
     try:
         _state_path().unlink()
     except FileNotFoundError:
@@ -421,7 +441,7 @@ def _stop_unlocked() -> dict[str, Any]:
         _generation_path().unlink()
     except FileNotFoundError:
         pass
-    return {"stopped": web_stopped or relay_stopped, "web": web_stopped, "relay": relay_stopped}
+    return {"stopped": bool(state), "web": web_stopped, "relay": relay_stopped}
 
 
 def _credential_path() -> Path:
@@ -513,7 +533,7 @@ def _existing_healthy(
     service_port: int,
     relay_port: int,
     *,
-    sandbox: bool,
+    listen_host: str,
     allowed_peers: tuple[str, ...],
     credential_shell: str | None,
 ) -> bool:
@@ -525,17 +545,23 @@ def _existing_healthy(
         return False
     if state.get("credential_shell") != credential_shell:
         return False
-    if not sandbox:
-        return True
     return (
         state.get("relay_port") == relay_port
         and state.get("relay_policy") == RELAY_POLICY
+        and state.get("relay_listen_host") == listen_host
         and state.get("relay_allowed_peers") == list(allowed_peers)
         and _verified_process(
             state.get("relay_pid"), state.get("relay_start_ticks"), "relay"
         )
         and _tcp_ready("127.0.0.1", relay_port)
     )
+
+
+def _relay_configuration(*, sandbox: bool) -> tuple[str, tuple[str, ...]]:
+    """Keep the engine gateway at the browser-facing boundary in every mode."""
+    if sandbox:
+        return "0.0.0.0", _relay_allowed_peers()
+    return "127.0.0.1", ("127.0.0.1",)
 
 
 def ensure(
@@ -560,16 +586,15 @@ def ensure(
         config = ports.resolve(persist=True)
         service_port = _service_port(config, env)
         relay_port = service_port + ports.DEEPSEEK_RELAY_OFFSET
-        url = f"http://127.0.0.1:{service_port}"
         state = _read_state()
         sandbox = bool(env.get("SC_SANDBOX"))
-        allowed_peers = _relay_allowed_peers() if sandbox else ()
+        listen_host, allowed_peers = _relay_configuration(sandbox=sandbox)
         credential_shell = env.get("SC_SHELL_SHORTNAME") or None
         reused = _existing_healthy(
             state,
             service_port,
             relay_port,
-            sandbox=sandbox,
+            listen_host=listen_host,
             allowed_peers=allowed_peers,
             credential_shell=credential_shell,
         )
@@ -608,10 +633,11 @@ def ensure(
                 "web_pid": web_pid,
                 "web_start_ticks": web_ticks,
                 "service_port": service_port,
-                "relay_port": relay_port if sandbox else None,
-                "relay_policy": RELAY_POLICY if sandbox else None,
+                "relay_port": relay_port,
+                "relay_policy": RELAY_POLICY,
+                "relay_listen_host": listen_host,
                 "relay_allowed_peers": list(allowed_peers),
-                "url": url,
+                "url": f"http://127.0.0.1:{relay_port}",
                 "credential_shell": credential_shell,
             }
             _write_state(state)
@@ -621,46 +647,45 @@ def ensure(
                     "HARNESS_SERVICE_UNAVAILABLE",
                     f"official dsh Web did not become ready; inspect {_log_path()}",
                 )
-            if sandbox:
-                generation = _write_generation()
-                relay_pid, relay_ticks = _spawn(
-                    [
-                        sys.executable,
-                        str(Path(__file__).resolve()),
-                        "relay",
-                        *[
-                            item
-                            for peer in allowed_peers
-                            for item in ("--allowed-peer", peer)
-                        ],
-                        "--listen-port",
-                        str(relay_port),
-                        "--target-port",
-                        str(service_port),
-                        "--generation-file",
-                        str(_generation_path()),
+            generation = _write_generation()
+            relay_pid, relay_ticks = _spawn(
+                [
+                    sys.executable,
+                    str(Path(__file__).resolve()),
+                    "relay",
+                    "--listen-host",
+                    listen_host,
+                    *[
+                        item
+                        for peer in allowed_peers
+                        for item in ("--allowed-peer", peer)
                     ],
-                    cwd=REPO_ROOT,
-                    log=_log_path(),
+                    "--listen-port",
+                    str(relay_port),
+                    "--target-port",
+                    str(service_port),
+                    "--generation-file",
+                    str(_generation_path()),
+                ],
+                cwd=REPO_ROOT,
+                log=_log_path(),
+            )
+            state.update(
+                {"relay_pid": relay_pid, "relay_start_ticks": relay_ticks}
+            )
+            _write_state(state)
+            if not _wait_ready(lambda: _tcp_ready("127.0.0.1", relay_port)):
+                _stop_unlocked()
+                raise DeepSeekWebError(
+                    "HARNESS_SERVICE_UNAVAILABLE",
+                    "DeepSeek loopback publication relay did not become ready",
                 )
-                state.update(
-                    {"relay_pid": relay_pid, "relay_start_ticks": relay_ticks}
-                )
-                _write_state(state)
-                if not _wait_ready(lambda: _tcp_ready("127.0.0.1", relay_port)):
-                    _stop_unlocked()
-                    raise DeepSeekWebError(
-                        "HARNESS_SERVICE_UNAVAILABLE",
-                        "DeepSeek loopback publication relay did not become ready",
-                    )
-                url = f"http://127.0.0.1:{relay_port}/?sc_generation={generation}"
         elif credential_shell is not None:
             # Repair a missing/stale artifact (for example after shell-key
             # rotation) without restarting an otherwise healthy same-shell Host.
             _write_shell_credential(env)
-        if sandbox:
-            generation = generation or _read_generation(_generation_path())
-            url = f"http://127.0.0.1:{relay_port}/?sc_generation={generation}"
+        generation = generation or _read_generation(_generation_path())
+        url = f"http://127.0.0.1:{relay_port}/?sc_generation={generation}"
         registration = _post_workspace(service_port, selected)
         state.update(
             {
@@ -671,6 +696,22 @@ def ensure(
         )
         _write_state(state)
         return {**state, **registration, "url": url, "reused": reused}
+
+
+def browser_generation() -> str:
+    """Return the one-shot generation capability after proving gateway health."""
+    state = _read_state()
+    relay_port = state.get("relay_port")
+    if (
+        not isinstance(relay_port, int)
+        or not _verified_process(state.get("relay_pid"), state.get("relay_start_ticks"), "relay")
+        or not _tcp_ready("127.0.0.1", relay_port)
+    ):
+        raise DeepSeekWebError(
+            "HARNESS_SERVICE_UNAVAILABLE",
+            "DeepSeek Web gateway is not ready for browser handoff",
+        )
+    return _read_generation(_generation_path())
 
 
 def status() -> dict[str, Any]:
@@ -800,14 +841,18 @@ async def _relay_connection(
 
 
 async def _relay(
-    listen_port: int, target_port: int, allowed_peers: frozenset[str], generation_file: Path
+    listen_host: str,
+    listen_port: int,
+    target_port: int,
+    allowed_peers: frozenset[str],
+    generation_file: Path,
 ) -> None:
     generation = _read_generation(generation_file)
     server = await asyncio.start_server(
         lambda reader, writer: _relay_connection(
             reader, writer, target_port, allowed_peers, generation
         ),
-        "0.0.0.0",
+        listen_host,
         listen_port,
     )
     async with server:
@@ -821,8 +866,10 @@ def main(argv: list[str]) -> int:
     ensure_parser.add_argument("--worktree", required=True)
     subparsers.add_parser("status")
     subparsers.add_parser("stop")
+    subparsers.add_parser("generation")
     relay_parser = subparsers.add_parser("relay")
     relay_parser.add_argument("--allowed-peer", action="append", required=True)
+    relay_parser.add_argument("--listen-host", required=True)
     relay_parser.add_argument("--listen-port", type=int, required=True)
     relay_parser.add_argument("--target-port", type=int, required=True)
     relay_parser.add_argument("--generation-file", type=Path, required=True)
@@ -834,9 +881,13 @@ def main(argv: list[str]) -> int:
             result = status()
         elif args.command == "stop":
             result = stop()
+        elif args.command == "generation":
+            print(browser_generation())
+            return 0
         else:
             asyncio.run(
                 _relay(
+                    args.listen_host,
                     args.listen_port,
                     args.target_port,
                     frozenset(args.allowed_peer),

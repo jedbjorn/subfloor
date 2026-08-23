@@ -120,7 +120,8 @@ class EnterPreAttachPrintTest(unittest.TestCase):
         self._stub(
             "docker",
             "#!/bin/sh\n"
-            "[ -n \"$SC_DOCKER_LOG\" ] && printf '%s\\n' \"$*\" > \"$SC_DOCKER_LOG\"\n"
+            "[ -n \"$SC_DOCKER_LOG\" ] && printf '%s\\n' \"$*\" >> \"$SC_DOCKER_LOG\"\n"
+            "case \"$*\" in *deepseek_web.py*generation*) printf '%064d\\n' 0; exit 0 ;; esac\n"
             "if [ -n \"$SC_DOCKER_HANDOFF\" ]; then\n"
             "  id=$(printf '%s\\n' \"$*\" | sed -n 's/.*SC_BROWSER_HANDOFF_ID=\\([0-9][0-9]*\\).*/\\1/p')\n"
             "  root=$(cd \"$(git rev-parse --git-common-dir)/..\" && pwd)\n"
@@ -199,7 +200,7 @@ class EnterPreAttachPrintTest(unittest.TestCase):
             "./sc boot DEV4 --harness deepseek --local-web",
             log.read_text(),
         )
-        expected = "http://127.0.0.1:8942"
+        expected = "http://127.0.0.1:8942/?sc_generation=" + "0" * 64
         self.assertIn(expected, out.stdout)
         self.assertEqual(browser_log.read_text().strip(), expected)
 
@@ -218,7 +219,7 @@ class EnterPreAttachPrintTest(unittest.TestCase):
 
         self.assertEqual(out.returncode, 0, out.stderr)
         self.assertIn("SC_BROWSER_HANDOFF_ID=", log.read_text())
-        expected = "http://127.0.0.1:8942"
+        expected = "http://127.0.0.1:8942/?sc_generation=" + "0" * 64
         self.assertIn(expected, out.stdout)
         self.assertEqual(browser_log.read_text().strip(), expected)
 

@@ -94,14 +94,18 @@ def test_ensure_starts_exact_stock_web_relay_registers_and_reuses() -> None:
             ],
             worktree,
         )
-        assert spawned[1][0][7:11] == [
+        assert spawned[1][0][3:5] == [
+            "--listen-host",
+            "0.0.0.0",
+        ]
+        assert spawned[1][0][9:13] == [
             "--listen-port",
             "18942",
             "--target-port",
             "8942",
         ]
         assert spawned[1][0][-2:] == ["--generation-file", str(root / "deepseek-web-generation.json")]
-        assert spawned[1][0][3:7] == [
+        assert spawned[1][0][5:9] == [
             "--allowed-peer",
             "127.0.0.1",
             "--allowed-peer",
@@ -181,6 +185,110 @@ def test_shell_identity_reaches_stock_host_only_through_owner_only_artifact() ->
         assert "SC_API_BASE" not in spawned[0]
         assert spawned[0]["SC_MEM_CREDENTIAL_FILE"] == str(artifact)
         assert spawned[1] is None
+
+
+def test_non_sandbox_entry_still_uses_the_generation_gateway() -> None:
+    with tempfile.TemporaryDirectory() as raw:
+        root = Path(raw)
+        worktree = root / "worktree"
+        worktree.mkdir()
+        env = service_env(root)
+        env.pop("SC_SANDBOX")
+        spawned: list[list[str]] = []
+
+        def spawn(argv, **_kwargs):
+            spawned.append(argv)
+            return (101 + len(spawned), 201 + len(spawned))
+
+        with (
+            mock.patch.dict(deepseek_web.os.environ, env, clear=False),
+            mock.patch.object(deepseek_web, "REPO_ROOT", root),
+            mock.patch.object(
+                deepseek_web.ports,
+                "resolve",
+                return_value={"deepseek_host_port": 8942},
+            ),
+            mock.patch.object(deepseek_web.shutil, "which", return_value="/bin/dsh"),
+            mock.patch.object(deepseek_web, "_spawn", side_effect=spawn),
+            mock.patch.object(deepseek_web, "_http_ready", return_value=True),
+            mock.patch.object(deepseek_web, "_tcp_ready", return_value=True),
+            mock.patch.object(
+                deepseek_web,
+                "_post_workspace",
+                return_value={"workspace_id": "ws-4", "workspace_created": True},
+            ),
+            mock.patch.object(
+                deepseek_web,
+                "_verified_process",
+                side_effect=lambda pid, *_args, **_kwargs: isinstance(pid, int),
+            ),
+            mock.patch.object(deepseek_web, "_verify_shell_identity"),
+        ):
+            result = deepseek_web.ensure(worktree, env=env)
+
+        assert result["url"].startswith("http://127.0.0.1:18942/?sc_generation=")
+        assert spawned[1][3:9] == [
+            "--listen-host",
+            "127.0.0.1",
+            "--allowed-peer",
+            "127.0.0.1",
+            "--listen-port",
+            "18942",
+        ]
+        state = json.loads((root / "state.json").read_text())
+        assert state["relay_listen_host"] == "127.0.0.1"
+        assert state["relay_allowed_peers"] == ["127.0.0.1"]
+
+
+def test_gateway_quiesces_before_host_and_credential_rotation() -> None:
+    with tempfile.TemporaryDirectory() as raw:
+        root = Path(raw)
+        env = service_env(root)
+        (root / "state.json").write_text(json.dumps({"relay_pid": 12, "web_pid": 13}))
+        (root / "deepseek-shell-api.json").write_text("credential")
+        (root / "deepseek-web-generation.json").write_text("generation")
+        calls: list[str] = []
+
+        def terminate(_state, prefix):
+            calls.append(prefix)
+            return True
+
+        with (
+            mock.patch.dict(deepseek_web.os.environ, env, clear=False),
+            mock.patch.object(deepseek_web, "_terminate_verified", side_effect=terminate),
+        ):
+            result = deepseek_web._stop_unlocked()
+
+        assert result == {"stopped": True, "web": True, "relay": True}
+        assert calls == ["relay", "web"]
+        assert not (root / "state.json").exists()
+        assert not (root / "deepseek-shell-api.json").exists()
+        assert not (root / "deepseek-web-generation.json").exists()
+
+
+def test_gateway_quiescence_failure_preserves_old_host_credential() -> None:
+    with tempfile.TemporaryDirectory() as raw:
+        root = Path(raw)
+        env = service_env(root)
+        (root / "state.json").write_text(json.dumps({"relay_pid": 12, "web_pid": 13}))
+        credential = root / "deepseek-shell-api.json"
+        credential.write_text("credential")
+        calls: list[str] = []
+
+        def terminate(_state, prefix):
+            calls.append(prefix)
+            return prefix != "relay"
+
+        with (
+            mock.patch.dict(deepseek_web.os.environ, env, clear=False),
+            mock.patch.object(deepseek_web, "_terminate_verified", side_effect=terminate),
+            pytest.raises(deepseek_web.DeepSeekWebError) as refused,
+        ):
+            deepseek_web._stop_unlocked()
+
+        assert refused.value.code == "HARNESS_WEB_GATEWAY_BUSY"
+        assert calls == ["relay"]
+        assert credential.read_text() == "credential"
 
 
 def test_disabled_deepseek_stops_owned_service_without_launching() -> None:
