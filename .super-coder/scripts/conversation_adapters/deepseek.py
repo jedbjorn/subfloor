@@ -227,7 +227,7 @@ class DeepSeekAdapter(ConversationAdapter):
         context: ConversationContext,
         *,
         resume: bool = False,
-    ) -> Mapping[str, Any]:
+    ) -> str:
         agent_preset, permission_preset = self._managed_session()
         worktree = str(context.checked_worktree())
         if not resume:
@@ -300,7 +300,7 @@ class DeepSeekAdapter(ConversationAdapter):
                     "HARNESS_PERMISSION_POLICY_UNAVAILABLE",
                     "DeepSeek Host did not pin the unattended permission preset",
                 )
-        return created
+        return workspace_id
 
     @staticmethod
     def _workspace_id(
@@ -625,6 +625,7 @@ class DeepSeekAdapter(ConversationAdapter):
         *,
         resumed: bool,
         route: deepseek_host.ConfiguredRoute | None = None,
+        workspace_id: str,
     ) -> NativeTurn:
         route = route or self._route(client, context)
         boundary = self._boundary(client, session_ref)
@@ -637,6 +638,15 @@ class DeepSeekAdapter(ConversationAdapter):
         self._select(client, session_ref, route, effort or "default")
         stream = client.open_events()
         try:
+            # Native Web shares the Host and may change workspace/archive state.
+            # Recheck the two authoritative baselines at the final admission
+            # boundary after route/session lifecycle work and stream setup.
+            self._confirm_workspace_session(
+                client,
+                session_ref,
+                str(context.checked_worktree()),
+                workspace_id,
+            )
             accepted = client.call(
                 "session.prompt",
                 {
@@ -677,9 +687,17 @@ class DeepSeekAdapter(ConversationAdapter):
             route = self._route(client, context)
             session_ref = self._new_session_ref(context)
             self._reserve(session_ref)
-            self._prepare_managed_session(client, session_ref, context)
+            workspace_id = self._prepare_managed_session(
+                client, session_ref, context
+            )
             return self._turn(
-                client, session_ref, context, message, resumed=False, route=route
+                client,
+                session_ref,
+                context,
+                message,
+                resumed=False,
+                route=route,
+                workspace_id=workspace_id,
             )
         except Exception:
             self.close()
@@ -704,11 +722,17 @@ class DeepSeekAdapter(ConversationAdapter):
             client = self._managed_client(context)
             self._reserve(session_ref)
             route = self._route(client, context)
-            self._prepare_managed_session(
+            workspace_id = self._prepare_managed_session(
                 client, session_ref, context, resume=True
             )
             return self._turn(
-                client, session_ref, context, message, resumed=True, route=route
+                client,
+                session_ref,
+                context,
+                message,
+                resumed=True,
+                route=route,
+                workspace_id=workspace_id,
             )
         except Exception:
             self.close()
@@ -1080,6 +1104,10 @@ class DeepSeekAdapter(ConversationAdapter):
         client = turn.metadata.get("client")
         if client is None:
             client = self._managed_client(context, recovery=True)
+            # Recovery begins from a durable NativeTurn with no live transport.
+            # Retain the newly authenticated client so every later reconcile and
+            # pending interrupt reuse this adapter's one full-lifetime lease.
+            turn.metadata["client"] = client
         try:
             self._require_recovery_target(client, turn.session_ref, context)
             events = self._history(client, turn.session_ref)

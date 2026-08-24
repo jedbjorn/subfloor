@@ -42,6 +42,17 @@ STOP_TIMEOUT_SECONDS = 5.0
 HTTP_TIMEOUT_SECONDS = 2.0
 RELAY_POLICY = "host-gateway-only-v1"
 GENERATION_COOKIE = "sc_deepseek_generation"
+SESSION_MUTATION_PATHS = frozenset({
+    "/api/session.create",
+    "/api/session.selectModel",
+    "/api/session.rename",
+    "/api/session.fork",
+    "/api/session.prompt",
+    "/api/session.updateQueue",
+    "/api/session.cancel",
+    "/api/workspace.archiveSession",
+})
+WORKSPACE_DELETE_PATH = "/api/workspace.delete"
 
 
 class DeepSeekWebError(RuntimeError):
@@ -807,6 +818,31 @@ def _active_browser_requests(
     }
 
 
+def _workspace_contains_session(
+    service_port: int, workspace_id: object, session_id: str
+) -> bool:
+    if not isinstance(workspace_id, str) or not workspace_id:
+        raise _activity_error("DeepSeek Web workspace identity is invalid")
+    value = _host_rpc(service_port, "workspace.list", {})
+    rows = value.get("items") if isinstance(value, Mapping) else None
+    if not isinstance(rows, list):
+        raise _activity_error("DeepSeek Web could not confirm workspace membership")
+    workspace = next(
+        (
+            row
+            for row in rows
+            if isinstance(row, Mapping) and row.get("workspaceId") == workspace_id
+        ),
+        None,
+    )
+    if workspace is None:
+        return False
+    session_ids = workspace.get("sessionIds")
+    if not isinstance(session_ids, list):
+        raise _activity_error("DeepSeek Web workspace membership is invalid")
+    return session_id in session_ids
+
+
 def _record_browser_prompt(service_port: int, session_id: str) -> str:
     if _browser_session_id(session_id) is None:
         raise _activity_error("DeepSeek Web browser session identity is invalid")
@@ -1335,7 +1371,13 @@ async def _relay_connection(
         writer.close()
         await writer.wait_closed()
         return
-    if target.startswith(("/api/session.prompt", "/api/session.cancel")):
+    target_path = target.split("?", 1)[0]
+    guarded_mutation = (
+        target_path in SESSION_MUTATION_PATHS
+        or target_path == WORKSPACE_DELETE_PATH
+    )
+    prompt_record_id = None
+    if guarded_mutation:
         content_length = next(
             (
                 line.split(":", 1)[1].strip()
@@ -1363,28 +1405,42 @@ async def _relay_connection(
         session_id = (
             rpc_payload.get("sessionId") if isinstance(rpc_payload, Mapping) else None
         )
-        if not isinstance(session_id, str):
+        if (
+            target_path != "/api/session.create"
+            and target_path != WORKSPACE_DELETE_PATH
+            and not isinstance(session_id, str)
+        ):
             writer.close()
             await writer.wait_closed()
             return
-        if target.startswith("/api/session.cancel"):
-            try:
-                with _gateway_lock():
-                    reserved = _reserved_session()
-            except DeepSeekWebError as exc:
-                body = json.dumps({"error": exc.code}, separators=(",", ":")).encode()
-                writer.write(
-                    b"HTTP/1.1 409 Conflict\r\nContent-Type: application/json\r\n"
-                    + f"Content-Length: {len(body)}\r\nConnection: close\r\n\r\n".encode()
-                    + body
+        try:
+            with _gateway_lock():
+                reserved = _reserved_session()
+            targets_reserved = session_id == reserved
+            if (
+                not targets_reserved
+                and reserved is not None
+                and target_path == WORKSPACE_DELETE_PATH
+            ):
+                targets_reserved = _workspace_contains_session(
+                    target_port,
+                    rpc_payload.get("workspaceId")
+                    if isinstance(rpc_payload, Mapping)
+                    else None,
+                    reserved,
                 )
-                await writer.drain()
-                writer.close()
-                await writer.wait_closed()
-                return
-        else:
-            reserved = None
-        if session_id == reserved:
+        except DeepSeekWebError as exc:
+            body = json.dumps({"error": exc.code}, separators=(",", ":")).encode()
+            writer.write(
+                b"HTTP/1.1 409 Conflict\r\nContent-Type: application/json\r\n"
+                + f"Content-Length: {len(body)}\r\nConnection: close\r\n\r\n".encode()
+                + body
+            )
+            await writer.drain()
+            writer.close()
+            await writer.wait_closed()
+            return
+        if targets_reserved:
             body = b'{"error":"HARNESS_WEB_SESSION_BUSY"}'
             writer.write(
                 b"HTTP/1.1 409 Conflict\r\nContent-Type: application/json\r\n"
@@ -1395,8 +1451,7 @@ async def _relay_connection(
             writer.close()
             await writer.wait_closed()
             return
-        prompt_record_id = None
-        if target.startswith("/api/session.prompt"):
+        if target_path == "/api/session.prompt":
             try:
                 prompt_record_id = _record_browser_prompt(target_port, session_id)
             except DeepSeekWebError as exc:
@@ -1423,7 +1478,7 @@ async def _relay_connection(
         request = "\r\n".join(
             [lines[0], *headers, "Connection: close", "", ""]
         ).encode("iso-8859-1")
-        if target.startswith(("/api/session.prompt", "/api/session.cancel")):
+        if guarded_mutation:
             request += body
     else:
         request = "\r\n".join([lines[0], *headers, "", ""]).encode("iso-8859-1")

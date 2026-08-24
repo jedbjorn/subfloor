@@ -20,8 +20,12 @@ import deepseek_one_shot  # noqa: E402
 import deepseek_web  # noqa: E402
 import harness_versions  # noqa: E402
 import route_bindings  # noqa: E402
-from conversation_adapters.base import AdapterError, ConversationContext  # noqa: E402
-from conversation_adapters.deepseek import DeepSeekAdapter  # noqa: E402
+from conversation_adapters.base import (  # noqa: E402
+    AdapterError,
+    ConversationContext,
+    NativeTurn,
+)
+from conversation_adapters.deepseek import DeepSeekAdapter, _run_ref  # noqa: E402
 
 REAL_RESERVE_MANAGED_SESSION = deepseek_web.reserve_managed_session
 REAL_RELEASE_MANAGED_SESSION = deepseek_web.release_managed_session
@@ -773,6 +777,31 @@ def test_resume_archived_session_refuses_without_replacement(tmp_path: Path) -> 
     assert not any(method == "session.prompt" for method, _ in live.calls)
 
 
+def test_managed_prompt_rechecks_archive_state_at_final_admission(
+    tmp_path: Path,
+) -> None:
+    class ArchiveAtStreamHost(FakeHost):
+        def open_events(self) -> FakeStream:
+            session_id = next(iter(self.sessions))
+            self.workspaces["ws-1"]["archivedSessionIds"].append(session_id)
+            return super().open_events()
+
+    seed = FakeHost()
+    ctx = context(tmp_path, seed)
+    live = ArchiveAtStreamHost()
+    adapter = DeepSeekAdapter(client_factory=lambda: live)
+    try:
+        with pytest.raises(AdapterError) as refused:
+            adapter.start(ctx, "work")
+
+        assert refused.value.code == "HARNESS_SESSION_ARCHIVED"
+        assert len(live.streams) == 1
+        assert live.streams[0].closed is True
+        assert "session.prompt" not in [method for method, _ in live.calls]
+    finally:
+        adapter.close()
+
+
 def test_recovery_refuses_detached_session_before_history_or_prompt(tmp_path: Path) -> None:
     seed = FakeHost()
     ctx = context(tmp_path, seed)
@@ -839,6 +868,56 @@ def test_recovery_refuses_archived_session_before_history_or_prompt(tmp_path: Pa
     ]
     assert "session.history" not in [method for method, _ in live.calls]
     assert "session.prompt" not in [method for method, _ in live.calls]
+
+
+def test_running_recovery_reuses_one_client_and_delivers_interrupt(
+    tmp_path: Path,
+) -> None:
+    seed = FakeHost()
+    ctx = context(tmp_path, seed)
+    session = DeepSeekAdapter._new_session_ref(ctx)
+    live = FakeHost(history=[{
+        "seq": 3, "type": "turn/start", "data": {},
+    }])
+    live.seed_session(session, str(tmp_path))
+    clients: list[FakeHost] = []
+
+    def client_factory() -> FakeHost:
+        clients.append(live)
+        return live
+
+    adapter = DeepSeekAdapter(client_factory=client_factory)
+    turn = NativeTurn(
+        "deepseek",
+        session,
+        _run_ref(3),
+        tmp_path,
+        metadata={"recovered": True},
+    )
+    try:
+        first = adapter.reconcile(turn, ctx)
+        second = adapter.reconcile(turn, ctx)
+        interrupted = adapter.interrupt(turn)
+        live.history.append({
+            "seq": 4,
+            "type": "turn/end",
+            "data": {"reason": {"kind": "cancelled"}},
+        })
+        terminal = adapter.reconcile(turn, ctx)
+
+        assert first.outcome == "running"
+        assert second.outcome == "running"
+        assert clients == [live]
+        assert turn.metadata["client"] is live
+        assert interrupted.acknowledged is True
+        assert interrupted.detail is None
+        assert terminal.outcome == "cancelled"
+        assert terminal.proven is True
+        assert [
+            payload for method, payload in live.calls if method == "session.cancel"
+        ] == [{"sessionId": session}]
+    finally:
+        adapter.close()
 
 
 def test_partial_workspace_attach_retries_the_same_exact_session(tmp_path: Path) -> None:
