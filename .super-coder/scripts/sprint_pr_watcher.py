@@ -1404,6 +1404,10 @@ class SprintPRWatcher:
                 ),
             }
             if lifecycle == "paused":
+                instructions["red"] = (
+                    "Your paused Sprint PR went red; fix the failing checks now; "
+                    "do not wait for the Sprint to resume."
+                )
                 instructions["green"] = (
                     "Your paused Sprint PR is green; judge readiness and wait "
                     "for the Sprint to resume."

@@ -1270,6 +1270,7 @@ class RecoveryAndFailureTest(SprintPRWatcherCase):
         self.assertEqual(before, after)
 
     def test_paused_change_is_observed_immediately_and_deduplicated(self):
+        self.reader.current = pull_request(checks="SUCCESS", checks_failed=False)
         self.register()
         lifecycle = sprint_domain.SprintLifecycleStore(self.con)
         lifecycle.transition(
@@ -1278,9 +1279,25 @@ class RecoveryAndFailureTest(SprintPRWatcherCase):
             sprint_domain.LifecycleActor("participant", 1),
             reason="test",
         )
+        self.reader.current = pull_request()
+        self.assertTrue(self.watcher.poll_once())
+        self.assertEqual(["green", "red"], self._states())
+        paused_red_message = self.con.execute(
+            "SELECT body FROM wake_message "
+            "WHERE idempotency_key LIKE 'pr-transition:%' "
+            "ORDER BY message_id DESC LIMIT 1"
+        ).fetchone()
+        self.assertEqual(
+            "GitHub PR event: repository=acme/repo, number=42, head_sha="
+            + "a" * 40
+            + ", event=red. Your paused Sprint PR went red; fix the failing "
+            "checks now; do not wait for the Sprint to resume.",
+            paused_red_message["body"],
+        )
+
         self.reader.current = pull_request(checks="SUCCESS", checks_failed=False)
         self.assertTrue(self.watcher.poll_once())
-        self.assertEqual(["red", "green"], self._states())
+        self.assertEqual(["green", "red", "green"], self._states())
         paused_message = self.con.execute(
             "SELECT body FROM wake_message "
             "WHERE idempotency_key LIKE 'pr-transition:%' "
@@ -1301,9 +1318,9 @@ class RecoveryAndFailureTest(SprintPRWatcherCase):
             sprint_domain.LifecycleActor("planner", 3),
         )
         self.assertTrue(self.watcher.poll_once())
-        self.assertEqual(["red", "green"], self._states())
+        self.assertEqual(["green", "red", "green"], self._states())
         self.assertTrue(self.watcher.poll_once())
-        self.assertEqual(["red", "green"], self._states())
+        self.assertEqual(["green", "red", "green"], self._states())
 
     def test_completed_sprint_does_not_gate_an_active_subscription(self):
         self.register()

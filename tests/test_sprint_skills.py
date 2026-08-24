@@ -1669,10 +1669,11 @@ class SprintSkillTest(unittest.TestCase):
         )
         self.assertIn("armed -> fix red + judge/pass green", normalized_developer)
         self.assertIn(
-            "paused -> wait for resume before fix/review", normalized_developer
+            "paused -> fix red now + judge green, review after resume",
+            normalized_developer,
         )
         self.assertIn(
-            "no active Sprint -> fix red only if needed", normalized_developer
+            "no active Sprint -> fix red if needed", normalized_developer
         )
         self.assertIn("no action on green", normalized_developer)
         self.assertIn("Reviewer decides", developer)
