@@ -60,6 +60,10 @@ jobs:
         run: pip install pytest
       - name: Install exact OpenCode compatibility binary
         run: npm install --global opencode-ai@1.18.9
+      - name: Install exact DeepSeek Host contract binary
+        run: |-
+          npm install --global @deepseek-ai/dsh@0.1.1-rc.2
+          test "$(dsh --version)" = "0.1.1-rc.2"
       - name: Run the suite
         run: ./sc test tests/ -q
         env:

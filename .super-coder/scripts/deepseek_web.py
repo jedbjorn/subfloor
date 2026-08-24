@@ -1450,11 +1450,45 @@ async def _relay_connection(
             (line.split(":", 1)[1].strip() for line in response_lines if line.lower().startswith("content-length:")),
             None,
         )
+        chunked = any(
+            line.lower().startswith("transfer-encoding:")
+            and "chunked" in line.lower()
+            for line in response_lines
+        )
         try:
-            response_body = await asyncio.wait_for(
-                upstream_reader.readexactly(int(raw_length or "-1")), timeout=HTTP_TIMEOUT_SECONDS
-            )
-            result = json.loads(response_body).get("result")
+            if chunked:
+                wire_chunks: list[bytes] = []
+                decoded_chunks: list[bytes] = []
+                while True:
+                    size_line = await asyncio.wait_for(
+                        upstream_reader.readuntil(b"\r\n"), timeout=HTTP_TIMEOUT_SECONDS
+                    )
+                    wire_chunks.append(size_line)
+                    size = int(size_line[:-2].split(b";", 1)[0], 16)
+                    if size == 0:
+                        while True:
+                            trailer = await asyncio.wait_for(
+                                upstream_reader.readuntil(b"\r\n"), timeout=HTTP_TIMEOUT_SECONDS
+                            )
+                            wire_chunks.append(trailer)
+                            if trailer == b"\r\n":
+                                break
+                        break
+                    chunk = await asyncio.wait_for(
+                        upstream_reader.readexactly(size + 2), timeout=HTTP_TIMEOUT_SECONDS
+                    )
+                    if chunk[-2:] != b"\r\n":
+                        raise ValueError("malformed chunked response")
+                    wire_chunks.append(chunk)
+                    decoded_chunks.append(chunk[:-2])
+                response_body = b"".join(wire_chunks)
+                decoded_body = b"".join(decoded_chunks)
+            else:
+                response_body = await asyncio.wait_for(
+                    upstream_reader.readexactly(int(raw_length or "-1")), timeout=HTTP_TIMEOUT_SECONDS
+                )
+                decoded_body = response_body
+            result = json.loads(decoded_body).get("result")
             accepted = (
                 isinstance(result, Mapping)
                 and result.get("ok") is True

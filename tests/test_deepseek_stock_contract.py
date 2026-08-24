@@ -54,7 +54,7 @@ def test_pinned_stock_dsh_workspace_session_archive_contract(
     """Exercise the unmodified 0.1.1-rc.2 Host, not a fake transport."""
     dsh = shutil.which("dsh")
     if dsh is None:
-        pytest.skip("pinned dsh is unavailable in this test environment")
+        pytest.fail("pinned dsh 0.1.1-rc.2 is required for the stock contract")
     version = subprocess.check_output([dsh, "--version"], text=True).strip()
     assert version == "0.1.1-rc.2"
 

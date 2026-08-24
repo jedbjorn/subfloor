@@ -20,7 +20,7 @@ import threading
 import urllib.error
 import urllib.request
 import uuid
-from http.server import ThreadingHTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
@@ -45,6 +45,62 @@ from conversation_adapters.deepseek import DeepSeekAdapter  # noqa: E402
 
 ALICE_TOKEN = "deepseek-cross-surface-alice-token"
 BOB_TOKEN = "deepseek-cross-surface-bob-token"
+PROVIDER_TOKEN = "deepseek-cross-surface-provider-token"
+
+
+class _ControlledProvider:
+    """A local OpenAI-compatible SSE endpoint used by stock DSH unchanged."""
+
+    def __init__(self) -> None:
+        self.requests: list[dict[str, Any]] = []
+        self.entered = threading.Event()
+        self.release = threading.Event()
+        self.hold = False
+        fixture = self
+
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, _format: str, *_args: object) -> None:
+                return
+
+            def do_POST(self) -> None:
+                length = int(self.headers.get("Content-Length", "0"))
+                payload = json.loads(self.rfile.read(length))
+                fixture.requests.append(payload)
+                fixture.entered.set()
+                if fixture.hold and not fixture.release.wait(timeout=15):
+                    self.send_error(504, "controlled provider timed out")
+                    return
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.end_headers()
+                for chunk in (
+                    {"id": "gate", "object": "chat.completion.chunk", "created": 1,
+                     "model": "fixture", "choices": [{"index": 0,
+                     "delta": {"role": "assistant", "content": "gate"},
+                     "finish_reason": None}]},
+                    {"id": "gate", "object": "chat.completion.chunk", "created": 1,
+                     "model": "fixture", "choices": [{"index": 0, "delta": {},
+                     "finish_reason": "stop"}]},
+                ):
+                    self.wfile.write(b"data: " + json.dumps(chunk).encode() + b"\n\n")
+                self.wfile.write(b"data: [DONE]\n\n")
+                self.wfile.flush()
+
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+
+    @property
+    def url(self) -> str:
+        return f"http://127.0.0.1:{self.server.server_address[1]}/v1"
+
+    def start(self) -> None:
+        self.thread.start()
+
+    def close(self) -> None:
+        self.release.set()
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=5)
 
 
 def _build_db(path: Path) -> int:
@@ -183,7 +239,7 @@ def test_stock_two_shell_cross_surface_refusals_are_side_effect_free(
     """Exercise real identity, lease, Host/gateway and command boundaries."""
     dsh = shutil.which("dsh")
     if dsh is None:
-        pytest.skip("pinned dsh is unavailable in this test environment")
+        pytest.fail("pinned dsh 0.1.1-rc.2 is required for this production gate")
     assert subprocess.check_output([dsh, "--version"], text=True).strip() == "0.1.1-rc.2"
 
     database = tmp_path / "shell.db"
@@ -194,6 +250,8 @@ def test_stock_two_shell_cross_surface_refusals_are_side_effect_free(
     httpd = ThreadingHTTPServer(("127.0.0.1", 0), server.Handler)
     thread = threading.Thread(target=httpd.serve_forever, daemon=True)
     thread.start()
+    provider = _ControlledProvider()
+    provider.start()
     base = f"http://127.0.0.1:{httpd.server_address[1]}"
     mem.SC_API_BASE, mem.SC_API_TOKEN = base, ALICE_TOKEN
 
@@ -235,8 +293,14 @@ def test_stock_two_shell_cross_surface_refusals_are_side_effect_free(
         upstream_port = public_port + deepseek_web.ports.DEEPSEEK_RELAY_OFFSET
         alice = _identity(base, ALICE_TOKEN, 41, "ALICE", upstream_port)
         bob = _identity(base, BOB_TOKEN, 42, "BOB", upstream_port)
-        alice["DSH_HOME"] = str(root / "dsh-home")
-        bob["DSH_HOME"] = str(root / "dsh-home")
+        provider_environment = {
+            "DSH_HOME": str(root / "dsh-home"),
+            "DEEPSEEK_BASE_URL": provider.url,
+            "DEEPSEEK_API_KEY": PROVIDER_TOKEN,
+            "DSH_TELEMETRY_MODE": "DISABLED",
+        }
+        alice.update(provider_environment)
+        bob.update(provider_environment)
 
         # Same identity reuse, an overlapping different identity refusal, then
         # a real handoff and restart.  Each whoami call hits the temporary API.
@@ -290,6 +354,79 @@ def test_stock_two_shell_cross_surface_refusals_are_side_effect_free(
             deepseek_web.release_managed_session(managed_id)
         assert _host_rpc(upstream_port, "session.history", {"sessionId": managed_id}) == history_before
         assert _protected_snapshot(database) == baseline
+
+        # Stock DSH must actually execute a native-Web prompt against the
+        # controlled provider.  A distinct native session coexists with the
+        # reservation above and produces a real Host history boundary.
+        assert deepseek_web._read_activity(required=True) == {
+            "admission": "open", "requests": {}
+        }
+        native_id = f"session-{uuid.uuid4()}"
+        native_created = _host_rpc(upstream_port, "session.create", {
+            "sessionId": native_id, "cwd": str(bob_worktree),
+        })
+        assert native_created["sessionId"] == native_id
+        selected = _host_rpc(upstream_port, "session.selectModel", {
+            "sessionId": native_id,
+            "provider": "deepseek-official",
+            "model": "deepseek-v4-flash",
+            "reasoningEffort": "high",
+        })
+        assert selected["selected"] == {
+            "provider": "deepseek-official", "model": "deepseek-v4-flash",
+            "reasoningEffort": "high",
+        }
+        status, accepted = _gateway_prompt(public_port, native_id, cookie=cookie)
+        assert status == 200, accepted
+        assert accepted["result"]["ok"] is True
+        deadline = threading.Event()
+        for _ in range(100):
+            if provider.requests:
+                break
+            deadline.wait(0.05)
+        # Stock DSH makes one agent completion and one generated-title request;
+        # both are bounded, local, and prove the prompt reached its unmodified
+        # provider integration rather than a relay mock.
+        assert len(provider.requests) == 2
+        assert any("gate prompt" in json.dumps(request) for request in provider.requests)
+        native_history = _host_rpc(upstream_port, "session.history", {"sessionId": native_id})
+        assert any(
+            event.get("event", {}).get("type") == "turn/end"
+            for event in native_history["events"]
+        )
+
+        # A real public one-shot remains the owner through a live provider
+        # stream.  Arrival from the other canonical shell is refused until the
+        # stock Host has produced its terminal event, rather than merely while
+        # route/session setup is running.
+        for key, value in bob.items():
+            monkeypatch.setenv(key, value)
+        monkeypatch.setenv("SC_SHELL_WORKTREE", str(bob_worktree))
+        provider.requests.clear()
+        provider.entered.clear()
+        provider.release.clear()
+        provider.hold = True
+        one_shot_result: dict[str, Any] = {}
+
+        def run_one_shot() -> None:
+            try:
+                one_shot_result["status"] = deepseek_one_shot.run(
+                    "deepseek-official/deepseek-v4-flash", "high", "held one-shot"
+                )
+            except BaseException as exc:  # asserted below in the parent thread
+                one_shot_result["error"] = exc
+
+        one_shot = threading.Thread(target=run_one_shot, daemon=True)
+        one_shot.start()
+        assert provider.entered.wait(timeout=10), one_shot_result
+        with pytest.raises(deepseek_web.DeepSeekWebError, match="IDENTITY_BUSY"):
+            deepseek_web.ensure(alice_worktree, env=alice)
+        provider.release.set()
+        one_shot.join(timeout=15)
+        provider.hold = False
+        assert not one_shot.is_alive()
+        assert one_shot_result == {"status": 0}
+        assert any("held one-shot" in json.dumps(request) for request in provider.requests)
 
         # Recovery and public one-shot each use their production entry point.
         # A wrong authenticated durable identity fails before Host mutation.
@@ -367,12 +504,16 @@ def test_stock_two_shell_cross_surface_refusals_are_side_effect_free(
         }
         assert json.loads((root / "deepseek-shell-api.json").read_text())["token"] == BOB_TOKEN
         assert json.loads((root / "deepseek-web-generation.json").read_text())["generation"] == reopened_generation
+        # The controlled provider key necessarily belongs to stock DSH's live
+        # process environment.  The engine-owned shell credentials below must
+        # never cross into either stock process or any durable surface.
+        secrets = (ALICE_TOKEN, BOB_TOKEN)
+        capabilities = (old_generation, generation, reopened_generation)
         for pid_key in ("web_pid", "relay_pid"):
             command = "\0".join(deepseek_web._process_cmdline(state[pid_key]))
-            assert BOB_TOKEN not in command and reopened_generation not in command
+            assert not any(value in command for value in (*secrets, *capabilities))
             environment = Path(f"/proc/{state[pid_key]}/environ").read_bytes()
-            assert BOB_TOKEN.encode() not in environment
-            assert reopened_generation.encode() not in environment
+            assert not any(value.encode() in environment for value in (*secrets, *capabilities))
         for path in root.rglob("*"):
             if not path.is_file() or path in owner_only or path == database:
                 continue
@@ -380,11 +521,24 @@ def test_stock_two_shell_cross_surface_refusals_are_side_effect_free(
                 payload = path.read_bytes()
             except OSError:
                 continue
-            assert BOB_TOKEN.encode() not in payload, path
-            assert reopened_generation.encode() not in payload, path
+            assert not any(value.encode() in payload for value in (*secrets, *capabilities)), path
+        # The only durable token rows are their canonical shell records.  The
+        # complete SQL image covers documents, metadata/events, transcripts,
+        # receipts, snapshots, and every other table without treating the
+        # legitimate authenticated API-key rows as a leak.
+        con = sqlite3.connect(database)
+        try:
+            shell_keys = con.execute(
+                "SELECT shell_id,api_key FROM shells ORDER BY shell_id"
+            ).fetchall()
+            dump = "\n".join(con.iterdump())
+        finally:
+            con.close()
+        assert shell_keys == [(41, ALICE_TOKEN), (42, BOB_TOKEN)]
+        assert PROVIDER_TOKEN not in dump
+        assert not any(value in dump for value in capabilities)
         output = capsys.readouterr()
-        assert BOB_TOKEN not in output.out + output.err
-        assert reopened_generation not in output.out + output.err
+        assert not any(value in output.out + output.err for value in (*secrets, *capabilities))
     finally:
         # Stop whichever stock service is alive before the temporary API and
         # artifacts disappear; cleanup is deliberately independent of pass/fail.
@@ -395,5 +549,6 @@ def test_stock_two_shell_cross_surface_refusals_are_side_effect_free(
             pass
         httpd.shutdown()
         httpd.server_close()
+        provider.close()
         server.DB_PATH = original_db
         mem.SC_API_BASE, mem.SC_API_TOKEN = original_base, original_token
