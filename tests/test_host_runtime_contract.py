@@ -549,6 +549,7 @@ class Python314SourceContractTest(unittest.TestCase):
             {
                 ".github/workflows/render-check.yml": ["3.14"],
                 ".github/workflows/tests.yml": ["3.14", "3.14", "3.14", "3.14"],
+                ".github/workflows/trusted-main.yml": ["3.14"],
                 ".super-coder/templates/fork/subfloor-visual-qa.yml": ["3.14"],
             },
         )
