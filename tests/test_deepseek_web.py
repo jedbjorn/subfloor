@@ -1167,6 +1167,147 @@ def test_managed_reservation_waits_for_admitted_mutation_forwarding() -> None:
             asyncio.run(scenario(Path(raw)))
 
 
+def test_managed_reservation_waits_when_client_disconnects_on_response_header() -> None:
+    async def scenario(root: Path) -> None:
+        forwarded: list[dict[str, object]] = []
+        downstream_closed = asyncio.Event()
+        release_host_completion = asyncio.Event()
+        host_completed = asyncio.Event()
+
+        async def upstream_handler(reader, writer) -> None:
+            try:
+                header = await reader.readuntil(b"\r\n\r\n")
+                length = int(next(
+                    line.split(b":", 1)[1].strip()
+                    for line in header.split(b"\r\n")
+                    if line.lower().startswith(b"content-length:")
+                ))
+                forwarded.append(json.loads(await reader.readexactly(length)))
+                body = json.dumps({
+                    "result": {
+                        "ok": True,
+                        "value": {"selected": {"provider": "native", "model": "disconnect"}},
+                    }
+                }).encode()
+                writer.write(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+                    + f"Content-Length: {len(body)}\r\n\r\n".encode()
+                )
+                await writer.drain()
+                await release_host_completion.wait()
+                writer.write(body)
+                await writer.drain()
+            except ConnectionError:
+                pass
+            finally:
+                writer.close()
+                await writer.wait_closed()
+                host_completed.set()
+
+        class DisconnectOnResponseHeader:
+            def __init__(self, writer) -> None:
+                self._writer = writer
+                self._response_started = False
+
+            def get_extra_info(self, name):
+                return self._writer.get_extra_info(name)
+
+            def write(self, data: bytes) -> None:
+                if data.startswith(b"HTTP/1.1 200 OK"):
+                    self._response_started = True
+                self._writer.write(data)
+
+            async def drain(self) -> None:
+                if self._response_started:
+                    raise ConnectionResetError("native client disconnected")
+                await self._writer.drain()
+
+            def close(self) -> None:
+                downstream_closed.set()
+                self._writer.close()
+
+            async def wait_closed(self) -> None:
+                await self._writer.wait_closed()
+
+        upstream = await asyncio.start_server(upstream_handler, "127.0.0.1", 0)
+        target_port = upstream.sockets[0].getsockname()[1]
+
+        async def relay(reader, writer) -> None:
+            try:
+                await deepseek_web._relay_connection(
+                    reader,
+                    DisconnectOnResponseHeader(writer),
+                    target_port,
+                    frozenset({"127.0.0.1"}),
+                    "a" * 64,
+                )
+            except ConnectionResetError:
+                pass
+
+        gateway = await asyncio.start_server(relay, "127.0.0.1", 0)
+        gateway_port = gateway.sockets[0].getsockname()[1]
+        (root / "state.json").write_text(json.dumps({"service_port": target_port}))
+        deepseek_web._initialize_activity()
+        session_id = "sc-" + "5" * 32
+        envelope = {
+            "rpcId": "disconnect-race",
+            "payload": {
+                "sessionId": session_id,
+                "provider": "native",
+                "model": "disconnect",
+            },
+        }
+        payload = json.dumps(envelope).encode()
+
+        reader, writer = await asyncio.open_connection("127.0.0.1", gateway_port)
+        try:
+            writer.write(
+                b"POST /api/session.selectModel HTTP/1.1\r\nHost: test\r\n"
+                + b"Cookie: sc_deepseek_generation=" + b"a" * 64
+                + b"\r\nContent-Type: application/json\r\n"
+                + f"Content-Length: {len(payload)}\r\n\r\n".encode()
+                + payload
+            )
+            await writer.drain()
+            await asyncio.wait_for(downstream_closed.wait(), timeout=1)
+
+            probe = deepseek_web._gateway_lock_path().open("a+")
+            try:
+                with pytest.raises(BlockingIOError):
+                    fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            finally:
+                probe.close()
+
+            reservation = asyncio.create_task(
+                asyncio.to_thread(deepseek_web.reserve_managed_session, session_id)
+            )
+            await asyncio.sleep(0)
+            assert reservation.done() is False
+            assert deepseek_web._reserved_session() is None
+            assert host_completed.is_set() is False
+
+            release_host_completion.set()
+            await asyncio.wait_for(host_completed.wait(), timeout=1)
+            await asyncio.wait_for(reservation, timeout=1)
+            assert forwarded == [envelope]
+            assert deepseek_web._reserved_session() == session_id
+        finally:
+            release_host_completion.set()
+            writer.close()
+            await writer.wait_closed()
+            deepseek_web.release_managed_session(session_id)
+            gateway.close()
+            upstream.close()
+            await gateway.wait_closed()
+            await upstream.wait_closed()
+
+    with tempfile.TemporaryDirectory() as raw:
+        with mock.patch.dict(
+            deepseek_web.os.environ, service_env(Path(raw)), clear=False
+        ):
+            asyncio.run(scenario(Path(raw)))
+
+
 def test_gateway_refuses_missing_or_unsafe_managed_reservation_before_forwarding() -> None:
     async def scenario(root: Path) -> None:
         upstream_connections: list[object] = []

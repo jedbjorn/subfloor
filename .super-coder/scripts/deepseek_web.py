@@ -1659,9 +1659,27 @@ async def _relay_connection(
         await upstream_writer.wait_closed()
         await writer.wait_closed()
         return
+    async def drain_upstream_response() -> None:
+        try:
+            while await upstream_reader.read(64 * 1024):
+                pass
+        except ConnectionError:
+            pass
+
     try:
         writer.write(response)
         await writer.drain()
+    except ConnectionError:
+        writer.close()
+        try:
+            if forward_lock is not None:
+                await drain_upstream_response()
+        finally:
+            release_forward_lock()
+        upstream_writer.close()
+        await upstream_writer.wait_closed()
+        await writer.wait_closed()
+        return
     except BaseException:
         release_forward_lock()
         upstream_writer.close()
