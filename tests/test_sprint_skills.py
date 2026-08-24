@@ -1664,10 +1664,12 @@ class SprintSkillTest(unittest.TestCase):
         reviewer = bodies["sprint_rev"]
         planner = bodies["sprint_pln"]
         normalized_developer = " ".join(developer.split())
-        self.assertIn("outside an armed Sprint", developer)
-        self.assertIn("attached to an aborted Sprint", normalized_developer)
-        self.assertIn("observation without a wake", normalized_developer)
-        self.assertIn("reconciliation restores wakes", normalized_developer)
+        self.assertIn(
+            "Red/green/closed Re-enter wakes continue", normalized_developer
+        )
+        self.assertIn("in an armed/paused Sprint", normalized_developer)
+        self.assertIn("outside an active Sprint", normalized_developer)
+        self.assertIn("take no action on green", normalized_developer)
         self.assertIn("Reviewer decides", developer)
         self.assertIn("recalling unreleased work", " ".join(reviewer.split()))
         self.assertIn("Compile the bounded evidence packet first", reviewer)
@@ -1679,6 +1681,8 @@ class SprintSkillTest(unittest.TestCase):
         self.assertIn("verified live turn", boot)
         self.assertIn("coordinate mode", boot)
         self.assertIn("reaper", boot)
+        self.assertIn("including after a Sprint ends", boot)
+        self.assertIn("armed/paused Sprint from no active Sprint", boot)
         self.assertIn("defaults satisfy the gate", boot)
 
     def test_force_new_and_blind_review_contracts_are_folded_into_roles(self):

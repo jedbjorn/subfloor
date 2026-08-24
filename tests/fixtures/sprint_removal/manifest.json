@@ -134,7 +134,8 @@
     ".super-coder/migrations/0227_deepseek_controlled_route_binding.sql",
     ".super-coder/migrations/0228_reseed_python_test_tooling.sql",
     ".super-coder/migrations/0229_reseed_messaging_wake_guidance.sql",
-    ".super-coder/migrations/0231_suppress_aborted_sprint_pr_wakes.sql"
+    ".super-coder/migrations/0231_suppress_aborted_sprint_pr_wakes.sql",
+    ".super-coder/migrations/0233_reseed_sprint_aware_pr_notifications.sql"
   ],
   "baseline_migration_ledger": {
     "count": 142,
