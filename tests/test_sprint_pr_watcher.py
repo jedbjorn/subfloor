@@ -424,8 +424,8 @@ class RegistrationTest(SprintPRWatcherCase):
                     "re-enter",
                     "GitHub PR event: repository=acme/repo, number=42, head_sha="
                     + "a" * 40
-                    + ", event=closed. Your PR was closed without merge; judge it "
-                    "and inform the Planner if this is a real problem.",
+                    + ", event=closed. Your active Sprint PR was closed without "
+                    "merge; tell the Planner if this blocks the Sprint.",
                 ),
                 (
                     1,
@@ -434,8 +434,8 @@ class RegistrationTest(SprintPRWatcherCase):
                     "re-enter",
                     "GitHub PR event: repository=acme/repo, number=42, head_sha="
                     + reopened_head
-                    + ", event=green. Your PR is green; judge readiness and pass "
-                    "the baton to review.",
+                    + ", event=green. Your active Sprint PR is green; judge "
+                    "readiness and pass the baton to review when ready.",
                 ),
             ],
             [
@@ -1058,7 +1058,8 @@ class TransitionRoutingTest(SprintPRWatcherCase):
             {
                 "GitHub PR event: repository=acme/repo, number=42, head_sha="
                 + "a" * 40
-                + ", event=red. Your PR went red; fix it."
+                + ", event=red. Your active Sprint PR went red; fix the failing "
+                "checks."
             },
             {str(row["body"]) for row in routed},
         )
@@ -1269,6 +1270,7 @@ class RecoveryAndFailureTest(SprintPRWatcherCase):
         self.assertEqual(before, after)
 
     def test_paused_change_is_observed_immediately_and_deduplicated(self):
+        self.reader.current = pull_request(checks="SUCCESS", checks_failed=False)
         self.register()
         lifecycle = sprint_domain.SprintLifecycleStore(self.con)
         lifecycle.transition(
@@ -1277,9 +1279,38 @@ class RecoveryAndFailureTest(SprintPRWatcherCase):
             sprint_domain.LifecycleActor("participant", 1),
             reason="test",
         )
+        self.reader.current = pull_request()
+        self.assertTrue(self.watcher.poll_once())
+        self.assertEqual(["green", "red"], self._states())
+        paused_red_message = self.con.execute(
+            "SELECT body FROM wake_message "
+            "WHERE idempotency_key LIKE 'pr-transition:%' "
+            "ORDER BY message_id DESC LIMIT 1"
+        ).fetchone()
+        self.assertEqual(
+            "GitHub PR event: repository=acme/repo, number=42, head_sha="
+            + "a" * 40
+            + ", event=red. Your paused Sprint PR went red; fix the failing "
+            "checks now; do not wait for the Sprint to resume.",
+            paused_red_message["body"],
+        )
+
         self.reader.current = pull_request(checks="SUCCESS", checks_failed=False)
         self.assertTrue(self.watcher.poll_once())
-        self.assertEqual(["red", "green"], self._states())
+        self.assertEqual(["green", "red", "green"], self._states())
+        paused_message = self.con.execute(
+            "SELECT body FROM wake_message "
+            "WHERE idempotency_key LIKE 'pr-transition:%' "
+            "ORDER BY message_id DESC LIMIT 1"
+        ).fetchone()
+        self.assertEqual(
+            "GitHub PR event: repository=acme/repo, number=42, head_sha="
+            + "a" * 40
+            + ", event=green. Your paused Sprint PR is green; judge readiness "
+            "and wait for the Sprint to resume.",
+            paused_message["body"],
+        )
+        self.assertNotIn("pass the baton", paused_message["body"])
 
         lifecycle.transition(
             self.sprint_id,
@@ -1287,9 +1318,9 @@ class RecoveryAndFailureTest(SprintPRWatcherCase):
             sprint_domain.LifecycleActor("planner", 3),
         )
         self.assertTrue(self.watcher.poll_once())
-        self.assertEqual(["red", "green"], self._states())
+        self.assertEqual(["green", "red", "green"], self._states())
         self.assertTrue(self.watcher.poll_once())
-        self.assertEqual(["red", "green"], self._states())
+        self.assertEqual(["green", "red", "green"], self._states())
 
     def test_completed_sprint_does_not_gate_an_active_subscription(self):
         self.register()
@@ -1307,12 +1338,25 @@ class RecoveryAndFailureTest(SprintPRWatcherCase):
             terminal_outcome="delivered",
         )
         calls = len(self.reader.get_calls)
+        self.reader.current = pull_request(checks="SUCCESS", checks_failed=False)
 
         self.assertTrue(self.watcher.poll_once())
         self.assertEqual(calls + 1, len(self.reader.get_calls))
         self.assertEqual(0, self.reader.list_calls)
+        message = self.con.execute(
+            "SELECT body FROM wake_message "
+            "WHERE idempotency_key LIKE 'pr-transition:%' "
+            "ORDER BY message_id DESC LIMIT 1"
+        ).fetchone()
+        self.assertEqual(
+            "GitHub PR event: repository=acme/repo, number=42, head_sha="
+            + "a" * 40
+            + ", event=green. Your PR is green outside an active Sprint; "
+            "no action is needed.",
+            message["body"],
+        )
 
-    def test_aborted_sprint_observes_pr_without_waking_its_former_developer(self):
+    def test_aborted_sprint_uses_non_sprint_notification_policy(self):
         self.register()
         self.con.execute(
             "INSERT INTO shells "
@@ -1348,19 +1392,23 @@ class RecoveryAndFailureTest(SprintPRWatcherCase):
             ],
         )
         self.assertEqual(
-            wake_count,
+            wake_count + 1,
             self.con.execute(
                 "SELECT COUNT(*) FROM wake_message "
                 "WHERE idempotency_key LIKE 'pr-transition:%'"
             ).fetchone()[0],
         )
+        message = self.con.execute(
+            "SELECT body FROM wake_message "
+            "WHERE idempotency_key LIKE 'pr-transition:%' "
+            "ORDER BY message_id DESC LIMIT 1"
+        ).fetchone()
         self.assertEqual(
-            0,
-            self.con.execute(
-                "SELECT COUNT(*) FROM wake_message "
-                "WHERE idempotency_key LIKE 'pr-transition:%' "
-                "AND body LIKE '%event=closed%'"
-            ).fetchone()[0],
+            "GitHub PR event: repository=acme/repo, number=42, head_sha="
+            + "a" * 40
+            + ", event=closed. Your PR was closed without merge outside an "
+            "active Sprint; no action is needed unless the closure was unexpected.",
+            message["body"],
         )
 
     def test_failure_is_durable_backs_off_and_never_invents_state(self):
@@ -1709,8 +1757,13 @@ class EngineWideSubscriptionTest(SprintPRWatcherCase):
             (1, None, None, "re-enter"),
             tuple(message)[:4],
         )
-        self.assertIn("repository=acme/repo, number=42", message["body"])
-        self.assertIn("head_sha=" + "a" * 40 + ", event=red", message["body"])
+        self.assertEqual(
+            "GitHub PR event: repository=acme/repo, number=42, head_sha="
+            + "a" * 40
+            + ", event=red. Your PR went red outside an active Sprint; fix it if "
+            "it still needs attention, otherwise no action is needed.",
+            message["body"],
+        )
 
     def test_no_subscriptions_performs_zero_github_calls(self):
         self.assertFalse(self.watcher.poll_once())

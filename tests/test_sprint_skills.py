@@ -1664,21 +1664,35 @@ class SprintSkillTest(unittest.TestCase):
         reviewer = bodies["sprint_rev"]
         planner = bodies["sprint_pln"]
         normalized_developer = " ".join(developer.split())
-        self.assertIn("outside an armed Sprint", developer)
-        self.assertIn("attached to an aborted Sprint", normalized_developer)
-        self.assertIn("observation without a wake", normalized_developer)
-        self.assertIn("reconciliation restores wakes", normalized_developer)
+        self.assertIn(
+            "Red/green/closed Re-enter wakes continue", normalized_developer
+        )
+        self.assertIn("armed -> fix red + judge/pass green", normalized_developer)
+        self.assertIn(
+            "paused -> fix red now + judge green, review after resume",
+            normalized_developer,
+        )
+        self.assertIn(
+            "no active Sprint -> fix red if needed", normalized_developer
+        )
+        self.assertIn("no action on green", normalized_developer)
         self.assertIn("Reviewer decides", developer)
         self.assertIn("recalling unreleased work", " ".join(reviewer.split()))
         self.assertIn("Compile the bounded evidence packet first", reviewer)
         self.assertIn("Developer-owned subscriptions", planner)
 
         boot = (ENGINE / "templates" / "boot.md").read_text()
+        normalized_boot = " ".join(boot.split())
         self.assertIn("## ACTIVE CHAT DELIVERY", boot)
         self.assertIn("Every `wake_message` creates durable delivery intent", boot)
         self.assertIn("verified live turn", boot)
         self.assertIn("coordinate mode", boot)
         self.assertIn("reaper", boot)
+        self.assertIn("including after a Sprint ends", boot)
+        self.assertIn(
+            "an armed Sprint, a paused Sprint, and no active Sprint",
+            normalized_boot,
+        )
         self.assertIn("defaults satisfy the gate", boot)
 
     def test_force_new_and_blind_review_contracts_are_folded_into_roles(self):

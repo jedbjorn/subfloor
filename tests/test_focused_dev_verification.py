@@ -14,6 +14,7 @@ ASSETS = ENGINE / "assets" / "skills"
 MIGRATIONS = (
     ENGINE / "migrations" / "0225_focused_dev_verification.sql",
     ENGINE / "migrations" / "0231_suppress_aborted_sprint_pr_wakes.sql",
+    ENGINE / "migrations" / "0233_reseed_sprint_aware_pr_notifications.sql",
 )
 sys.path.insert(0, str(ENGINE / "scripts"))
 

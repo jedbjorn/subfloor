@@ -1390,17 +1390,42 @@ class SprintPRWatcher:
                 ),
             )
 
-        if registered["lifecycle"] == "aborted":
-            return resolved_review_message_ids
-
-        instructions = {
-            "red": "Your PR went red; fix it.",
-            "green": "Your PR is green; judge readiness and pass the baton to review.",
-            "closed": (
-                "Your PR was closed without merge; judge it and inform the Planner "
-                "if this is a real problem."
-            ),
-        }
+        lifecycle = registered["lifecycle"]
+        if lifecycle in {"armed", "paused"}:
+            instructions = {
+                "red": "Your active Sprint PR went red; fix the failing checks.",
+                "green": (
+                    "Your active Sprint PR is green; judge readiness and pass "
+                    "the baton to review when ready."
+                ),
+                "closed": (
+                    "Your active Sprint PR was closed without merge; tell the "
+                    "Planner if this blocks the Sprint."
+                ),
+            }
+            if lifecycle == "paused":
+                instructions["red"] = (
+                    "Your paused Sprint PR went red; fix the failing checks now; "
+                    "do not wait for the Sprint to resume."
+                )
+                instructions["green"] = (
+                    "Your paused Sprint PR is green; judge readiness and wait "
+                    "for the Sprint to resume."
+                )
+        else:
+            instructions = {
+                "red": (
+                    "Your PR went red outside an active Sprint; fix it if it still "
+                    "needs attention, otherwise no action is needed."
+                ),
+                "green": (
+                    "Your PR is green outside an active Sprint; no action is needed."
+                ),
+                "closed": (
+                    "Your PR was closed without merge outside an active Sprint; "
+                    "no action is needed unless the closure was unexpected."
+                ),
+            }
         if state in instructions:
             head = pull_request.head_sha or "unknown"
             owner_shell_id = int(registered["owner_shell_id"])
