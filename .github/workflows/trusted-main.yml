@@ -1,0 +1,115 @@
+name: trusted-main
+
+# Self-hosted execution is isolated from pull_request by design. A fork PR can
+# rewrite its own workflow files, so no workflow with that trigger may name the
+# persistent Dev runner.
+on:
+  push:
+    branches:
+      - main
+      - chore/dev-runner-routing # canary only; removed before review
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: trusted-main-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    name: Trusted main validation
+    runs-on: [self-hosted, Linux, X64, subfloor]
+    timeout-minutes: 45
+    env:
+      SC_CI_CONTAINER: sc-${{ github.event.repository.name }}
+      SC_CI_SIDECAR: sc-pg-${{ github.event.repository.name }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.14'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Install exact test dependencies
+        run: |
+          pip install pytest -r requirements.txt
+          npm install --global opencode-ai@1.18.9
+          npm install --global @deepseek-ai/dsh@0.1.1-rc.2
+          test "$(dsh --version)" = "0.1.1-rc.2"
+      - name: Run Python 3.14 host contract
+        run: >-
+          python -m unittest -v
+          tests.test_host_runtime_contract
+          tests.test_deepseek_runtime
+          tests.test_install_fresh_fork
+          tests.test_install_phases
+          tests.test_model_catalog
+          tests.test_gitignore_sync
+          tests.test_remove
+          tests.test_sc_wrapper
+          tests.test_git_freshness
+          tests.test_worktree_sync
+          tests.test_branch_guard
+      - name: Run full engine suite
+        run: ./sc test tests/ -q
+        env:
+          SC_REQUIRE_OPENCODE_CANARY: '1'
+      - name: Rebuild, render, and prove headless boot
+        run: ./sc verify
+      - name: Prove public render freshness
+        run: |
+          python3 tests/test_skills_freshness.py
+          ./sc render-check
+      - name: Build and launch the default sandbox
+        run: ./sc launch
+      - name: Reach the sandbox health endpoint within 90 seconds
+        run: |
+          python3 - <<'PY'
+          import json
+          import subprocess
+          import time
+
+          deadline = time.monotonic() + 90
+          while time.monotonic() < deadline:
+              result = subprocess.run(
+                  ["./sc", "health"], capture_output=True, text=True, timeout=5, check=False
+              )
+              if result.returncode == 0:
+                  try:
+                      if json.loads(result.stdout).get("ok") is True:
+                          print(result.stdout.strip())
+                          raise SystemExit(0)
+                  except json.JSONDecodeError:
+                      pass
+              time.sleep(2)
+          raise SystemExit("sandbox did not become healthy within 90 seconds")
+          PY
+      - name: Prove the running engine uses Python 3.14
+        run: |
+          docker exec -i "$SC_CI_CONTAINER" python3 - <<'PY'
+          import platform
+          import sys
+
+          print(platform.python_version())
+          if sys.version_info[:2] != (3, 14):
+              raise SystemExit(f"running engine uses unsupported Python {platform.python_version()}")
+          PY
+      - name: Stop the managed sandbox
+        if: always()
+        run: ./sc down
+      - name: Assert no managed container residue
+        if: always()
+        run: |
+          residue=0
+          for container in "$SC_CI_CONTAINER" "$SC_CI_SIDECAR"; do
+            if docker container inspect "$container" >/dev/null 2>&1; then
+              echo "managed container remains after ./sc down: $container" >&2
+              residue=1
+            fi
+          done
+          test "$residue" -eq 0
