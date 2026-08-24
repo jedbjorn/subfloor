@@ -7,9 +7,9 @@ common: false
 
 # spec — analyze and execute a spec
 
-Load before implementing any feature/spec/roadmap item. A governing spec is
-missing -> use `docs` to author it first. Analyze before code; unresolved
-ambiguity goes to FnB, while hard blockers get flags. `<self>` = your shell id.
+Load before any feature/spec/roadmap build. Missing spec -> author via `docs`.
+Analyze before code; ask FnB on ambiguity, flag hard blockers. `<self>` = your
+shell id.
 
 ## 1. Select the spec
 
@@ -22,10 +22,9 @@ sc mem get documents --doc <doc_id>
 sc mem get tasks --doc <doc_id>
 ```
 
-The feature list includes `kind`, `seq`, `frozen`, and `task_count`. Resume the
-one unfrozen spec with tasks. An unfrozen zero-task spec is backlog; engaging it
-creates the plan below. Multiple plausible open specs -> ask FnB. Existing
-tasks -> skip planning and track the first unfinished one.
+The list includes `kind`, `seq`, `frozen`, and `task_count`. Resume the unfrozen
+spec with tasks; zero tasks = backlog and needs the plan below. Multiple
+plausible specs -> ask FnB. Existing tasks -> track the first unfinished one.
 
 ## 2. Analyze before planning
 
@@ -47,9 +46,8 @@ sc mem flag open "[Spec] <blocked fact> | Blocker for: <feature>" \
 
 ## 3. Engage and plan
 
-Building this session moves `brainstorm|long_term|near_term` to `in_progress`;
-planning ahead moves it to `next`. Matching/later stages are no-ops. Reading
-for reference moves nothing, and unspec'd small fixes have no stage ceremony.
+Building now moves `brainstorm|long_term|near_term` to `in_progress`; planning
+ahead -> `next`; matching/later stages and reference reads do not move.
 
 ```text
 sc mem roadmap status <feature_id> in_progress
@@ -99,11 +97,14 @@ sc mem task cancel <task_id> --notes "moved to F<id> as task #<n>"
 sc mem state "[<feature>] — last: <last_done>. next: <next_up>."
 ```
 
-The final Verification task follows the boot `TESTING POSTURE`; require focused
-local proof + green configured CI, every In Scope done-condition, and the
-Anticipated User Activity contract. Unexpected reach, weakened hardening, or
-crossed tenancy fails. A large spec may stop after a verified task slice; leave
-later tasks pending and state the next one.
+Final Verification follows the boot `TESTING POSTURE`. Complete code; run every
+available focused proof; use observed registered-PR checks only for an
+unavailable local gate: pending -> wait, red -> fix, green -> review. No checks
+or untrustworthy watcher after one bounded read -> block; an optional browser
+skip is non-failing. Require every In Scope done-condition + Anticipated User
+Activity contract; unexpected reach, weakened hardening, or crossed tenancy
+fails. A large spec may stop after a verified task slice; leave later tasks
+pending and state the next one.
 
 ## 5. Ship and hand docs to Planner
 

@@ -1,4 +1,5 @@
 """Focused local Developer verification and CI-owned full-suite posture."""
+
 from __future__ import annotations
 
 import json
@@ -7,7 +8,6 @@ import sys
 import unittest
 from pathlib import Path
 
-
 ROOT = Path(__file__).resolve().parents[1]
 ENGINE = ROOT / ".super-coder"
 ASSETS = ENGINE / "assets" / "skills"
@@ -15,19 +15,15 @@ MIGRATIONS = (
     ENGINE / "migrations" / "0225_focused_dev_verification.sql",
     ENGINE / "migrations" / "0231_suppress_aborted_sprint_pr_wakes.sql",
     ENGINE / "migrations" / "0233_reseed_sprint_aware_pr_notifications.sql",
+    ENGINE / "migrations" / "0234_reseed_ci_fallback_authority.sql",
 )
 sys.path.insert(0, str(ENGINE / "scripts"))
 
-import seed_skills  # noqa: E402
-
+import seed_skills
 
 POLICY_HEADING = "## TESTING POSTURE"
-FULL_SUITE_BOUNDARY = (
-    "do not run the repository-wide suite locally merely to duplicate"
-)
-SHARED_HOST_BOUNDARY = (
-    "Never start a competing repository-wide suite on a shared host."
-)
+FULL_SUITE_BOUNDARY = "do not run the repository-wide suite locally merely to duplicate"
+SHARED_HOST_BOUNDARY = "Never start a competing repository-wide suite on a shared host."
 
 
 class FocusedDeveloperVerificationSourceTest(unittest.TestCase):
@@ -38,34 +34,83 @@ class FocusedDeveloperVerificationSourceTest(unittest.TestCase):
         focus = template["focus"]
 
         self.assertEqual(focus.count(POLICY_HEADING), 1)
-        self.assertIn("smallest affected test targets", focus)
+        self.assertIn("every available smallest affected test target", focus)
+        self.assertIn("Complete the implementation before using CI fallback", focus)
+        self.assertIn(
+            "Required checks pending -> wait; red -> diagnose, fix, and push; "
+            "green -> review readiness",
+            focus,
+        )
+        self.assertIn("incomplete code is a failure", focus)
+        self.assertIn("no trustworthy seat remains", focus)
+        self.assertIn("browser-capability skip is informational and non-failing", focus)
         self.assertIn(FULL_SUITE_BOUNDARY, focus)
-        self.assertIn("required CI checks are green", focus)
         self.assertIn(SHARED_HOST_BOUNDARY, focus)
 
-    def test_later_loaded_developer_skills_keep_the_same_boundary(self):
+    def test_role_guidance_keeps_ci_fallback_and_authority_boundaries(self):
         bodies = {
             name: (ASSETS / name / "SKILL.md").read_text()
-            for name in ("agents", "spec", "sprint_dev")
+            for name in ("agents", "spec", "sprint_dev", "sprint_pln")
         }
+        bodies["dev_kit"] = (
+            ENGINE / "assets" / "seed" / "skills" / "dev_kit" / "SKILL.md"
+        ).read_text()
 
-        for name, body in bodies.items():
+        for name in ("agents", "spec", "sprint_dev"):
             with self.subTest(skill=name):
-                normalized = " ".join(body.split())
+                normalized = " ".join(bodies[name].split())
                 self.assertIn("boot `TESTING POSTURE`", normalized)
 
-        normalized = {
-            name: " ".join(body.split()) for name, body in bodies.items()
-        }
-        self.assertIn("focused local proof", normalized["spec"])
-        self.assertIn("green configured CI", normalized["spec"])
-        self.assertNotIn("runs focused/full gates", normalized["spec"])
-        self.assertIn("never use bare `sc test`", normalized["agents"])
-        self.assertIn("smallest affected gate", normalized["sprint_dev"])
+        normalized = {name: " ".join(body.split()) for name, body in bodies.items()}
+        self.assertIn("open/register the PR", normalized["agents"])
+        self.assertIn("pending", normalized["agents"])
+        self.assertIn("fix red", normalized["agents"])
+        self.assertIn("green as proof", normalized["agents"])
         self.assertIn(
-            "configured CI green = full-suite proof", normalized["sprint_dev"]
+            "No trustworthy local or registered-PR seat -> block", normalized["agents"]
         )
-        self.assertIn("red -> diagnose/fix/push/rerun", normalized["sprint_dev"])
+
+        self.assertIn("available focused proof", normalized["spec"])
+        self.assertIn("observed registered-PR checks", normalized["spec"])
+        self.assertIn("pending -> wait", normalized["spec"])
+        self.assertIn("red -> fix", normalized["spec"])
+        self.assertIn("green -> review", normalized["spec"])
+        self.assertIn("optional browser skip is non-failing", normalized["spec"])
+        self.assertNotIn("runs focused/full gates", normalized["spec"])
+
+        self.assertIn("never use bare `sc test`", normalized["agents"])
+        self.assertIn(
+            "Register complete code even when a local gate is unavailable",
+            normalized["sprint_dev"],
+        )
+        for state in (
+            "pending ->",
+            "red ->",
+            "green ->",
+            "none or untrustworthy watcher",
+        ):
+            self.assertIn(state, normalized["sprint_dev"])
+        self.assertIn("incomplete code = failure", normalized["sprint_dev"])
+        self.assertIn("Optional browser skip = non-failing", normalized["sprint_dev"])
+
+        self.assertIn("## Verification-seat fallback", bodies["dev_kit"])
+        self.assertIn("Pending -> wait for the native fact", normalized["dev_kit"])
+        self.assertIn("Red -> diagnose, fix, and push", normalized["dev_kit"])
+        self.assertIn(
+            "Green -> the proof is complete and review may start", normalized["dev_kit"]
+        )
+        self.assertIn("a Planner NEVER runs `sc deps`", normalized["dev_kit"])
+
+        self.assertIn("pending wait", normalized["sprint_pln"])
+        self.assertIn("red fix", normalized["sprint_pln"])
+        self.assertIn("green review", normalized["sprint_pln"])
+        self.assertIn(
+            "Planner NEVER mutates packages/toolchains", normalized["sprint_pln"]
+        )
+        self.assertIn(
+            "No checks/untrustworthy watcher after one read -> blocker",
+            normalized["sprint_pln"],
+        )
 
 
 class FocusedDeveloperVerificationMigrationTest(unittest.TestCase):
@@ -98,6 +143,8 @@ class FocusedDeveloperVerificationMigrationTest(unittest.TestCase):
                 ('agents', 'drift', 'drift', 'drift', 1, 'drift', 1),
                 ('spec', 'drift', 'drift', 'drift', 1, 'drift', 1),
                 ('sprint_dev', 'drift', 'drift', 'drift', 1, 'drift', 1),
+                ('sprint_pln', 'drift', 'drift', 'drift', 1, 'drift', 1),
+                ('dev_kit', 'drift', 'drift', 'drift', 1, 'drift', 1),
                 ('fork_local', 'local', 'fork', NULL, 0, 'preserve me', 0);
             """
         )
@@ -134,9 +181,22 @@ class FocusedDeveloperVerificationMigrationTest(unittest.TestCase):
         )
         self.assertEqual(first_prompts[2].count(POLICY_HEADING), 1)
         self.assertEqual(first_prompts[3], original_planner)
+        source_focus = json.loads(
+            (ENGINE / "templates" / "shells" / "dev.json").read_text()
+        )["focus"]
+        source_policy = self._testing_posture(source_focus)
+        self.assertEqual(self._testing_posture(first_prompts[1]), source_policy)
+        self.assertEqual(self._testing_posture(first_prompts[2]), source_policy)
 
-        for name in ("agents", "spec", "sprint_dev"):
-            expected = seed_skills.parse_skill(ASSETS / name / "SKILL.md")
+        paths = {
+            name: ASSETS / name / "SKILL.md"
+            for name in ("agents", "spec", "sprint_dev", "sprint_pln")
+        }
+        paths["dev_kit"] = (
+            ENGINE / "assets" / "seed" / "skills" / "dev_kit" / "SKILL.md"
+        )
+        for name, path in paths.items():
+            expected = seed_skills.parse_skill(path)
             self.assertEqual(
                 first_skills[name],
                 (
@@ -162,10 +222,16 @@ class FocusedDeveloperVerificationMigrationTest(unittest.TestCase):
             row[0]: row[1:]
             for row in self.con.execute(
                 "SELECT name,description,category,command,common,content,is_deleted "
-                "FROM skills WHERE name IN ('agents','spec','sprint_dev') "
+                "FROM skills WHERE name IN "
+                "('agents','spec','sprint_dev','sprint_pln','dev_kit') "
                 "ORDER BY name"
             ).fetchall()
         }
+
+    @staticmethod
+    def _testing_posture(text: str) -> str:
+        policy = text.split(POLICY_HEADING, 1)[1].lstrip("\n")
+        return policy.split("\n\n## CODE CRAFT", 1)[0].rstrip()
 
 
 if __name__ == "__main__":

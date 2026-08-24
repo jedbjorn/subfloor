@@ -7,15 +7,12 @@ common: false
 
 # sprint_pln — govern the armed Sprint
 
-Use as originating Planner after `sprint_prep` arms a Sprint. System records
-facts; Reviewer owns review/conformance judgment + reports; Planner owns plan
-structure and executes control transitions. FnB retains board-level override
-under decision #46.
+Use after `sprint_prep` arms Sprint. System records; Reviewer judges/reports;
+Planner structures/controls; FnB board override = decision #46.
 
 Use the simplest path supported by current durable state. Treat authority,
-lifecycle preconditions, durable writes, and typed handoffs as hard boundaries.
-Repeat a read only when later activity could have changed it or the next command
-requires live revalidation.
+lifecycle, writes, and handoffs as hard boundaries. Repeat a read only when
+later activity could have changed it or a command requires revalidation.
 
 ## Route the entry
 
@@ -37,8 +34,8 @@ rotation, recovery, and coordinate mode. Stop after a successful typed handoff.
 
 ## Durable running loop
 
-Read only lifecycle, unit, dependency, route, PR, expectation, and anomaly
-facts required by the trigger. Browser presence is not progress.
+Read only trigger-required lifecycle, unit, dependency, route, PR, expectation,
+and anomaly facts. Browser presence is not progress.
 
 ```text
 sc sprint inbox --sprint <id>
@@ -66,8 +63,11 @@ cleanup authority. An unproved postcondition stops.
 
 - Keep dependencies as hard sequence; restructure current projection under
   Planner authority, record why, and never rewrite completed history.
-- Developers own PR green/review/correction/merge. Reviewers own verdicts and
-  conformance. Do not proxy routine handoffs or judgments.
+- Developers own local/PR proof, review/fix/merge. Complete code + unavailable
+  local gate -> registered CI: pending wait, red fix, green review; browser skip
+  is non-failing. With fallback, Planner NEVER mutates packages/toolchains or
+  runs repair. No checks/untrustworthy watcher after one read -> blocker.
+  Reviewers own verdicts/conformance; do not proxy handoffs/judgments.
 - Record Reviewer decision id + exact action + receipt; never rewrite rationale
   as Planner judgment.
 - Mid-Sprint spec edits require owning Planner/FnB + durable Reviewer decision.

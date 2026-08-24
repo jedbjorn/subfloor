@@ -60,11 +60,15 @@ procedure solo; at most spawn one adversarial skeptic against your own diff
    reaching for isolation — it has real costs. Reviewer/checker agents are
    read-only; no isolation needed.
 4. **Agent claims are inputs, not results.** Follow the boot `TESTING POSTURE`:
-   re-run smallest affected targets, lint, and the spec's done-condition
-   yourself; never use bare `sc test` merely to duplicate configured CI.
-   "Agent says tests pass" is not verification. Pull diffs yourself
-   (`git -C <worktree> diff`); NEVER adjudicate pasted diffs/output — pastes
-   are lossy.
+   re-run the available smallest affected targets, lint, and the spec's
+   done-condition yourself; never use bare `sc test` merely to duplicate
+   configured CI. If a local gate cannot execute, record the exact seat
+   evidence and use the boot fallback only after the merged implementation is
+   complete: open/register the PR, wait while required checks are pending, fix
+   red, and treat green as proof for the unavailable gate. No trustworthy
+   local or registered-PR seat -> block. "Agent says tests pass" is never
+   verification. Pull diffs yourself (`git -C <worktree> diff`); NEVER
+   adjudicate pasted diffs/output — pastes are lossy.
 
 ---
 
@@ -83,7 +87,8 @@ first fork runs — super-coder #303, #304):
   interpreters typically mount only into the primary worktree — an isolated
   agent often cannot run the app's suite at all. Say so in the prompt so it
   doesn't burn a turn rediscovering it; treat its tree as an authoring
-  surface — verification is yours, in your tree.
+  surface. Verification remains yours through the primary tree or the boot
+  registered-PR fallback; never install a toolchain into the agent tree.
 
 ---
 

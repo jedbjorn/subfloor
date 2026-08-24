@@ -7,11 +7,10 @@ common: false
 
 # sprint_dev — own one editing lane
 
-Use for an actionable work-unit assignment in an armed Sprint. Use the simplest
-path supported by current durable state. Treat ownership, lifecycle
-preconditions, durable writes, and typed handoffs as hard boundaries; use
-judgment inside them. Repeat a read only when later activity could have changed
-it or the next command requires live revalidation.
+Use for an actionable armed-Sprint assignment. Use the simplest path supported
+by current durable state. Treat ownership, lifecycle, writes, and handoffs as
+hard boundaries. Repeat a read only when later activity could have changed it
+or a command requires live revalidation.
 
 ## Route the entry
 
@@ -29,19 +28,15 @@ sc sprint accept --sprint <id> --message <message-id>
 sc sprint decline --sprint <id> --message <message-id> --reason <reason>
 ```
 
-Accepting marks assignment ownership and starts work. Decline with a concrete
-reason when unable to accept. After handling an informational message, run
-`accept`; it marks the message read and does not change Sprint or work-unit
-state.
+Accepting starts ownership; decline concretely. After an informational message,
+`accept` marks the message read and does not change Sprint or work-unit state.
 
-An unusable success receipt from idempotent bookkeeping does not stall the
-Sprint. Retry the exact command once, then use its normal read surface once to
-prove the exact postcondition. For informational `accept`, prior inbox presence
-+ absence of that exact message id proves the read landed. Continue under that
-proof + name the receipt defect in the next normal handoff. NEVER use this
-recovery to infer assignment ownership, review outcome, merge authorization,
-lifecycle/work-unit transition, governing revision, PR head/green state, or
-cleanup authority. An unproved postcondition stops.
+For an unusable bookkeeping receipt, retry the exact command once, then use its
+normal read surface once to prove the postcondition. For informational `accept`,
+prior inbox presence + absence of that exact message id proves the read landed;
+name the defect next handoff. NEVER infer assignment ownership, review outcome,
+merge authorization, lifecycle/work-unit transition, governing revision, PR
+head/green state, or cleanup authority. An unproved postcondition stops.
 
 Assignments and review requests use Force-new delivery; verdicts and PR-event
 wakes use Re-enter. Delivery waits for a natural boundary; the runtime owns
@@ -49,12 +44,10 @@ bundling, rotation, and recovery. Stop after a successful typed handoff.
 
 ## Bound the lane
 
-Read the assignment, expected output, bound spec revision, dependencies,
-Reviewer, repository/worktree, merge grant, and prior judgments. Own at most one
-active work unit; never start a second editing lane or edit another shell's
-worktree. Resolve ambiguity with the shippable in-scope reading + recorded
-rationale. Ask the Planner before changing the unit boundary, shared interface,
-deliverable cut, priority, or scope.
+Read assignment, output, bound revision, dependencies, roles, worktree, grant,
+and judgments. Own one active unit; never start another lane or edit another
+shell's worktree. Resolve ambiguity to shippable in-scope work + rationale. Ask
+Planner before changing boundary, interface, deliverable, priority, or scope.
 
 Put one question, blocker, decision, answer, or useful context item in a short
 body file. Unit questions/blockers require a reply:
@@ -86,32 +79,32 @@ cross-unit authority. Confirm the durable reply, then `accept` the incoming
 message. At a decision boundary, stop until the required answer arrives;
 unread recovery re-wakes, so send no duplicate reminder.
 
-A stable key identifies recipient + exact body + intent + reply linkage +
-scope. Reuse it only for the same failed/ambiguous write; when any of those
-fields changes, use a new key. Keep bodies near 6,000 characters and below the
-8,000-character hard limit; run `wc -m < <path>`. A handoff completes only when
-the command exits successfully and confirms its durable message/state + wake.
-If a command is rejected or transport fails, correct and retry safely. If the
-relay itself fails, give FnB the attempted command, evidence, impact, and
-recommendation; invent no alternate protocol.
+Stable key = recipient + exact body + intent + reply + scope. Reuse it only for
+the same failed/ambiguous write; when any of those fields changes, use a new
+key. Keep bodies near 6,000 characters and below
+8,000; run `wc -m < <path>`. Handoff completes only when the command exits
+successfully and confirms durable state + wake. If a command is rejected or
+transport fails, correct/retry. If relay itself fails, give FnB command +
+evidence + impact + recommendation; invent no alternate protocol.
 
 A Developer does not pause the Sprint. Report blocker or integrity evidence to
 the Planner, continue safe independent work, and stop at the unsafe boundary.
 The Reviewer decides continue/replan/pause; the Planner executes the decision.
 
-Store scratch proof, diffs, evidence packets, review notes, and report drafts in
-gitignored `shared/sprints/sprint-<n>/`. Never commit or PR them. Durable
-judgments belong in `record-review`, reports in `sprint_reports`, and decisions
-in the relay.
+Scratch proof/diffs/reports -> gitignored `shared/sprints/sprint-<n>/`; never
+commit/PR them. Durable judgment -> `record-review`; reports -> `sprint_reports`;
+decisions -> relay.
 
 ## Build and verify
 
 Sync + branch; implement the smallest complete change. Per boot `TESTING
-POSTURE`, run the smallest affected gate + failures; configured CI green =
-full-suite proof, red -> diagnose/fix/push/rerun. Keep external calls outside
-DB transactions; preserve durable identities and append-only evidence. Record
-CI failures, infrastructure anomalies, retries, review friction, and
-departures for closeout.
+POSTURE`, finish code + run every available smallest affected gate. If the
+selected interpreter, runner, or declared dependency cannot execute one,
+record exact seat evidence; the registered PR supplies only that proof. Test
+assertion/source collection red or incomplete code = failure. Optional browser
+skip = non-failing. Keep external calls outside DB transactions; preserve
+durable identities and append-only evidence. Record failures, anomalies,
+retries, review friction, and departures for closeout.
 
 Immediately before `complete-unit`, `register-pr`, or `request-review`, re-run
 `sc sprint inbox --sprint <id>` once and act on new messages. After the typed
@@ -138,11 +131,14 @@ sc sprint register-pr --sprint <id> --repository <owner/name> \
   --pr <number> --work-unit <id>
 ```
 
-After `register-pr` succeeds, retain ownership. Red/green/closed Re-enter wakes
-continue after the Sprint ends. Follow context: armed -> fix red + judge/pass
-green; paused -> fix red now + judge green, review after resume;
-no active Sprint -> fix red if needed + no action on green. Planner/Reviewer get
-none.
+Register complete code even when a local gate is unavailable; registration
+obtains evidence, not review. After `register-pr` succeeds, retain ownership;
+Red/green/closed Re-enter wakes continue. Required checks: pending -> native
+wake; red -> fix/push; green -> judge/request review; none or untrustworthy
+watcher after one bounded read -> report + block. Follow context: armed -> fix
+red + judge/pass green; paused -> fix red now + judge green, review after
+resume; no active Sprint -> fix red if needed + no action on green.
+Planner/Reviewer get none.
 
 If the same registered PR was externally closed, then reopened, rebased, and
 pushed, replay the exact `register-pr` command. Require `created: false`, which
@@ -167,7 +163,7 @@ Do not repeat this read as a polling loop.
 
 Complete each round in order:
 
-1. Finish readiness judgment + local verification.
+1. Finish readiness judgment + available local proof; require observed green.
 2. Perform the once-only inbox check; handle and `accept` new messages.
 3. Use `submit` first or `resubmit` after changes requested. The engine injects
    the PR URL, registered id, exact green head, and work-unit id into the

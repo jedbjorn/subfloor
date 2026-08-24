@@ -46,6 +46,9 @@ class PythonToolingSkillReseedTest(unittest.TestCase):
         con = sqlite3.connect(":memory:")
         self.addCleanup(con.close)
         con.executescript(
+            "CREATE TABLE shells ("
+            "shell_id INTEGER PRIMARY KEY, flavor TEXT, "
+            "system_prompt TEXT NOT NULL);"
             "CREATE TABLE skills ("
             "skill_id INTEGER PRIMARY KEY, name TEXT UNIQUE, description TEXT, "
             "category TEXT, command TEXT, common INTEGER, content TEXT, "
@@ -54,7 +57,7 @@ class PythonToolingSkillReseedTest(unittest.TestCase):
             "(1,'dev_kit','stale','stale','stale',1,'stale',1);"
         )
         migration = (
-            ENGINE / "migrations" / "0228_reseed_python_test_tooling.sql"
+            ENGINE / "migrations" / "0234_reseed_ci_fallback_authority.sql"
         ).read_text()
 
         con.executescript(migration)
@@ -62,11 +65,11 @@ class PythonToolingSkillReseedTest(unittest.TestCase):
 
         actual = con.execute(
             "SELECT name,description,category,command,common,content,is_deleted "
-            "FROM skills ORDER BY skill_id"
-        ).fetchall()
+            "FROM skills WHERE name='dev_kit'"
+        ).fetchone()
         self.assertEqual(
             actual,
-            [(
+            (
                 expected["name"],
                 expected["description"],
                 expected["category"],
@@ -74,9 +77,9 @@ class PythonToolingSkillReseedTest(unittest.TestCase):
                 expected["common"],
                 expected["content"],
                 0,
-            )],
+            ),
         )
-        self.assertIn("pinned `uv` + `pytest`", actual[0][5])
+        self.assertIn("pinned `uv` + `pytest`", actual[5])
 
 
 if __name__ == "__main__":

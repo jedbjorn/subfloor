@@ -87,6 +87,27 @@ live declaration or restart the sandbox. Inspect `.sc-state/local/dev-kit/` and
 the System-managed Flags record. Pass remediation back to the FnB as a reviewed
 tracked change; only the FnB authorizes downstream materialization and cutover.
 
+## Verification-seat fallback
+
+A local gate is unavailable only when the selected interpreter, runner, or
+declared dependency cannot execute it. A test assertion, source-caused
+collection error, red CI result, or incomplete implementation is a failure,
+not unavailable infrastructure.
+
+After implementation is complete, a Developer records the selected seat,
+executable, and failure; runs every available affected check; opens/registers
+the PR; and uses its observed required checks for the unavailable proof.
+Pending -> wait for the native fact. Red -> diagnose, fix, and push. Green ->
+the proof is complete and review may start. No configured checks or an
+untrustworthy watcher after one bounded read -> no trustworthy seat; block the
+lane. An optional browser-capability skip is informational and non-failing.
+
+When this registered-PR fallback exists, a Planner NEVER runs `sc deps`,
+installs packages/runtimes, edits `.venv` or the dev-kit declaration, or starts
+a repair/restart to manufacture a local seat. Keep ownership with the
+Developer through the CI route. Only the FnB may authorize a separate tracked
+toolchain or environment change.
+
 ## Engine-baseline tools
 
 The standard sandbox image includes `rg`, the `sqlite3` CLI, `curl`, Node 22,

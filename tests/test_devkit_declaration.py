@@ -31,7 +31,7 @@ DEVKIT_RESEED = (
     ROOT
     / ".super-coder"
     / "migrations"
-    / "0228_reseed_python_test_tooling.sql"
+    / "0234_reseed_ci_fallback_authority.sql"
 )
 
 
@@ -1016,6 +1016,9 @@ class DevKitReseedConformanceTest(unittest.TestCase):
         expected = seed_skills.parse_skill(DEVKIT_SKILL)
         with sqlite3.connect(":memory:") as con:
             con.executescript(
+                "CREATE TABLE shells ("
+                "shell_id INTEGER PRIMARY KEY, flavor TEXT, "
+                "system_prompt TEXT NOT NULL);"
                 "CREATE TABLE skills ("
                 "skill_id INTEGER PRIMARY KEY, name TEXT UNIQUE, description TEXT, "
                 "category TEXT, command TEXT, common INTEGER, content TEXT, "
