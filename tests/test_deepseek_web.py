@@ -740,7 +740,7 @@ def test_gateway_rejects_stale_generation_before_stock_host_forwarding() -> None
         "host_create",
         "host_prompt",
         "memory_write",
-        "sprint_action",
+        "workflow_action",
         "message_send",
         "wake_enqueue",
     ),
