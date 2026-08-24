@@ -1131,6 +1131,13 @@ def ensure(
                     f"official dsh Web did not become ready; inspect {_log_path()}",
                 )
             generation = _write_generation()
+            # The relay never calls the engine API.  Give it no shell
+            # credential: inheriting the launcher environment would expose the
+            # API token through the relay's process environment even though the
+            # stock Host correctly receives only the owner-only artifact.
+            relay_env = dict(os.environ)
+            relay_env.pop("SC_API_TOKEN", None)
+            relay_env.pop("SC_API_BASE", None)
             relay_pid, relay_ticks = _spawn(
                 [
                     sys.executable,
@@ -1152,6 +1159,7 @@ def ensure(
                 ],
                 cwd=REPO_ROOT,
                 log=_log_path(),
+                env=relay_env,
             )
             state.update(
                 {"relay_pid": relay_pid, "relay_start_ticks": relay_ticks}

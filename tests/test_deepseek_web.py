@@ -190,7 +190,9 @@ def test_shell_identity_reaches_stock_host_only_through_owner_only_artifact() ->
         assert "SC_API_TOKEN" not in spawned[0]
         assert "SC_API_BASE" not in spawned[0]
         assert spawned[0]["SC_MEM_CREDENTIAL_FILE"] == str(artifact)
-        assert spawned[1] is None
+        assert spawned[1] is not None
+        assert "SC_API_TOKEN" not in spawned[1]
+        assert "SC_API_BASE" not in spawned[1]
 
 
 def test_two_shell_handoff_rotates_only_after_empty_gateway_quiescence() -> None:
