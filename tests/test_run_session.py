@@ -2,15 +2,19 @@
 """Regression tests for atomic, contention-safe launcher session opening."""
 from __future__ import annotations
 
+import io
+import json
 import os
 import sqlite3
+import subprocess
 import sys
 import tempfile
 import threading
 import unittest
-from contextlib import contextmanager
-from types import SimpleNamespace
+import venv
+from contextlib import contextmanager, nullcontext, redirect_stderr
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 SCRIPTS = Path(__file__).resolve().parents[1] / ".super-coder" / "scripts"
@@ -109,29 +113,187 @@ class ShellPathTest(unittest.TestCase):
         self.root_patch.start()
         self.addCleanup(self.root_patch.stop)
 
-    def test_existing_project_environment_precedes_inherited_tools(self) -> None:
+    def _python(self, *, executable: bool = True) -> Path:
         project_bin = self.worktree / ".venv" / "bin"
         project_bin.mkdir(parents=True)
+        python = project_bin / "python"
+        python.write_text("probe fixture")
+        python.chmod(0o755 if executable else 0o644)
+        return python
 
-        path = run._shell_path(self.worktree, "/usr/local/bin:/usr/bin")
+    def _completed_probe(
+        self,
+        *,
+        version: tuple[int, int] = (3, 14),
+        prefix: Path | None = None,
+        base_prefix: Path | None = None,
+        returncode: int = 0,
+    ) -> subprocess.CompletedProcess:
+        prefix = prefix or self.worktree / ".venv"
+        base_prefix = base_prefix or self.root / "baseline-python"
+        return subprocess.CompletedProcess(
+            args=[],
+            returncode=returncode,
+            stdout=json.dumps({
+                "version": list(version),
+                "prefix": str(prefix),
+                "base_prefix": str(base_prefix),
+            }),
+            stderr="",
+        )
+
+    def _path_and_warning(self, completed=None) -> tuple[str, str]:
+        stderr = io.StringIO()
+        patcher = (
+            mock.patch.object(run.subprocess, "run", return_value=completed)
+            if completed is not None
+            else nullcontext()
+        )
+        with patcher, redirect_stderr(stderr):
+            path = run._shell_path(self.worktree, "/usr/local/bin:/usr/bin")
+        return path, stderr.getvalue()
+
+    def test_python_314_virtualenv_precedes_inherited_tools(self) -> None:
+        python = self._python()
+        completed = self._completed_probe()
+
+        with mock.patch.object(
+            run.subprocess, "run", return_value=completed
+        ) as probe:
+            path = run._shell_path(
+                self.worktree, "/usr/local/bin:/usr/bin"
+            )
 
         self.assertEqual(
             path,
-            f"{self.root}:{project_bin}:/usr/local/bin:/usr/bin",
+            f"{self.root}:{python.parent}:/usr/local/bin:/usr/bin",
+        )
+        probe.assert_called_once_with(
+            [
+                str(python),
+                "-I",
+                "-S",
+                "-c",
+                run.VENV_PROBE_SCRIPT,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=3,
+            check=False,
         )
 
-    def test_absent_or_non_directory_environment_is_not_injected(self) -> None:
+    def test_real_python_314_virtualenv_is_admitted(self) -> None:
+        project_venv = self.worktree / ".venv"
+        venv.EnvBuilder(with_pip=False).create(project_venv)
+
+        path, warning = self._path_and_warning()
+
         self.assertEqual(
-            run._shell_path(self.worktree, "/usr/bin"),
-            f"{self.root}:/usr/bin",
+            path,
+            f"{self.root}:{project_venv / 'bin'}:/usr/local/bin:/usr/bin",
         )
+        self.assertEqual(warning, "")
+
+    def test_absent_environment_is_omitted_without_warning(self) -> None:
+        path, warning = self._path_and_warning()
+        self.assertEqual(path, f"{self.root}:/usr/local/bin:/usr/bin")
+        self.assertEqual(warning, "")
+
+    def test_non_directory_bin_is_omitted_with_remedy(self) -> None:
         project_bin = self.worktree / ".venv" / "bin"
         project_bin.parent.mkdir(parents=True)
         project_bin.write_text("not a directory")
-        self.assertEqual(
-            run._shell_path(self.worktree, "/usr/bin"),
-            f"{self.root}:/usr/bin",
+        path, warning = self._path_and_warning()
+        self.assertEqual(path, f"{self.root}:/usr/local/bin:/usr/bin")
+        self.assertIn(str(self.worktree), warning)
+        self.assertIn(".venv/bin is not a directory", warning)
+        self.assertIn("run `sc deps`", warning)
+
+    def test_missing_interpreter_is_omitted_with_remedy(self) -> None:
+        (self.worktree / ".venv" / "bin").mkdir(parents=True)
+        path, warning = self._path_and_warning()
+        self.assertEqual(path, f"{self.root}:/usr/local/bin:/usr/bin")
+        self.assertIn("missing .venv/bin/python", warning)
+        self.assertIn("run `sc deps`", warning)
+
+    def test_dangling_interpreter_is_omitted_with_remedy(self) -> None:
+        project_bin = self.worktree / ".venv" / "bin"
+        project_bin.mkdir(parents=True)
+        (project_bin / "python").symlink_to(self.root / "missing-python")
+        path, warning = self._path_and_warning()
+        self.assertEqual(path, f"{self.root}:/usr/local/bin:/usr/bin")
+        self.assertIn("dangling .venv/bin/python symlink", warning)
+        self.assertTrue((project_bin / "python").is_symlink())
+
+    def test_non_executable_interpreter_is_omitted_with_remedy(self) -> None:
+        python = self._python(executable=False)
+        path, warning = self._path_and_warning()
+        self.assertEqual(path, f"{self.root}:/usr/local/bin:/usr/bin")
+        self.assertIn("not an executable regular file", warning)
+        self.assertEqual(python.stat().st_mode & 0o777, 0o644)
+
+    def test_timed_out_probe_is_omitted_with_remedy(self) -> None:
+        self._python()
+        stderr = io.StringIO()
+        with mock.patch.object(
+            run.subprocess,
+            "run",
+            side_effect=subprocess.TimeoutExpired("python", 3),
+        ), redirect_stderr(stderr):
+            path = run._shell_path(self.worktree, "/usr/bin")
+        self.assertEqual(path, f"{self.root}:/usr/bin")
+        self.assertIn("Python probe timed out after 3 seconds", stderr.getvalue())
+
+    def test_foreign_prefix_is_omitted_with_remedy(self) -> None:
+        self._python()
+        foreign = self.root / "other-worktree" / ".venv"
+        path, warning = self._path_and_warning(
+            self._completed_probe(prefix=foreign)
         )
+        self.assertEqual(path, f"{self.root}:/usr/local/bin:/usr/bin")
+        self.assertIn(f"Python reported foreign prefix {foreign}", warning)
+
+    def test_python_313_environment_is_omitted_with_remedy(self) -> None:
+        self._python()
+        path, warning = self._path_and_warning(
+            self._completed_probe(version=(3, 13))
+        )
+        self.assertEqual(path, f"{self.root}:/usr/local/bin:/usr/bin")
+        self.assertIn("Python 3.14 is required; found 3.13", warning)
+
+    def test_python_315_environment_is_omitted_with_remedy(self) -> None:
+        self._python()
+        path, warning = self._path_and_warning(
+            self._completed_probe(version=(3, 15))
+        )
+        self.assertEqual(path, f"{self.root}:/usr/local/bin:/usr/bin")
+        self.assertIn("Python 3.14 is required; found 3.15", warning)
+
+    def test_nonzero_probe_is_omitted_with_remedy(self) -> None:
+        self._python()
+        path, warning = self._path_and_warning(
+            self._completed_probe(returncode=9)
+        )
+        self.assertEqual(path, f"{self.root}:/usr/local/bin:/usr/bin")
+        self.assertIn("Python probe exited 9", warning)
+
+    def test_invalid_probe_report_is_omitted_with_remedy(self) -> None:
+        self._python()
+        completed = subprocess.CompletedProcess(
+            args=[], returncode=0, stdout="not-json", stderr=""
+        )
+        path, warning = self._path_and_warning(completed)
+        self.assertEqual(path, f"{self.root}:/usr/local/bin:/usr/bin")
+        self.assertIn("Python probe returned an invalid report", warning)
+
+    def test_non_virtual_prefix_is_omitted_with_remedy(self) -> None:
+        self._python()
+        prefix = self.worktree / ".venv"
+        path, warning = self._path_and_warning(
+            self._completed_probe(prefix=prefix, base_prefix=prefix)
+        )
+        self.assertEqual(path, f"{self.root}:/usr/local/bin:/usr/bin")
+        self.assertIn("Python reported no virtual environment", warning)
 
     def test_interactive_and_prepared_launches_share_the_path_builder(self) -> None:
         source = (SCRIPTS / "run.py").read_text()

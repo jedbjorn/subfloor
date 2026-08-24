@@ -5,6 +5,7 @@ from __future__ import annotations
 import sqlite3
 import sys
 import tempfile
+import venv
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -198,6 +199,8 @@ def test_deepseek_managed_browser_launch_does_not_probe_cli(
     launch_case, monkeypatch
 ) -> None:
     db_path, worktree = launch_case
+    project_venv = worktree / ".venv"
+    venv.EnvBuilder(with_pip=False).create(project_venv)
 
     def connect():
         con = sqlite3.connect(db_path)
@@ -258,6 +261,10 @@ def test_deepseek_managed_browser_launch_does_not_probe_cli(
         ),
     )
     assert prepared.argv == []
+    assert prepared.env["PATH"].split(run_mod.os.pathsep)[:2] == [
+        str(run_mod.REPO_ROOT),
+        str(project_venv / "bin"),
+    ]
 
 
 @pytest.fixture
