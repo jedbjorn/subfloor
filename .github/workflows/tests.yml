@@ -83,3 +83,145 @@ jobs:
           python-version: '3.14'
       - name: Rebuild + render + headless boot
         run: ./sc verify
+
+  docker-sandbox-lifecycle:
+    name: Docker sandbox lifecycle
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      SC_CI_CONTAINER: sc-${{ github.event.repository.name }}
+      SC_CI_SIDECAR: sc-pg-${{ github.event.repository.name }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # A launch may forward explicitly configured host GitHub auth. Keep
+          # the job token out of git config so the disposable sandbox receives
+          # no repository credential.
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.14'
+      - name: Bootstrap the fresh checkout
+        run: ./sc verify
+      - name: Build and launch the default sandbox
+        run: ./sc launch
+      - name: Reach the sandbox health endpoint within 90 seconds
+        run: |-
+          python3 - <<'PY'
+          import json
+          import subprocess
+          import time
+          import urllib.request
+
+          deadline = time.monotonic() + 90
+          last_evidence = "no health response"
+          while (remaining := deadline - time.monotonic()) > 0:
+              try:
+                  result = subprocess.run(
+                      ["./sc", "health"],
+                      capture_output=True,
+                      text=True,
+                      timeout=min(5, remaining),
+                      check=False,
+                  )
+                  last_evidence = (
+                      f"exit={result.returncode} stdout={result.stdout!r} "
+                      f"stderr={result.stderr!r}"
+                  )
+                  payload = json.loads(result.stdout) if result.returncode == 0 else {}
+                  if payload.get("ok") is True:
+                      remaining = deadline - time.monotonic()
+                      if remaining <= 0:
+                          continue
+                      port_result = subprocess.run(
+                          ["./sc", "ports", "port"],
+                          capture_output=True,
+                          text=True,
+                          timeout=min(5, remaining),
+                          check=True,
+                      )
+                      remaining = deadline - time.monotonic()
+                      if remaining <= 0:
+                          continue
+                      port = json.loads(port_result.stdout)["port"]
+                      url = f"http://127.0.0.1:{port}/api/health"
+                      with urllib.request.urlopen(
+                          url,
+                          timeout=min(5, remaining),
+                      ) as response:
+                          direct_payload = json.load(response)
+                          if response.status == 200 and direct_payload.get("ok") is True:
+                              print(json.dumps(direct_payload, sort_keys=True))
+                              raise SystemExit(0)
+              except (json.JSONDecodeError, OSError, subprocess.SubprocessError) as exc:
+                  last_evidence = repr(exc)
+              time.sleep(min(2, max(0, deadline - time.monotonic())))
+
+          raise SystemExit(f"sandbox health did not become ready within 90 seconds: {last_evidence}")
+          PY
+      - name: Prove the running engine uses Python 3.14
+        run: |-
+          docker exec -i "$SC_CI_CONTAINER" python3 - <<'PY'
+          import json
+          import os
+          import platform
+          import sys
+          from pathlib import Path
+
+          servers = []
+          for process in Path("/proc").iterdir():
+              if not process.name.isdecimal():
+                  continue
+              try:
+                  command = (process / "cmdline").read_bytes()
+              except OSError:
+                  continue
+              if b".super-coder/api/server.py" in command:
+                  servers.append(process)
+
+          if len(servers) != 1:
+              raise SystemExit(f"expected one running engine server, found {len(servers)}")
+          server_executable = Path(os.readlink(servers[0] / "exe")).resolve()
+          selected_executable = Path(sys.executable).resolve()
+          evidence = {
+              "python": platform.python_version(),
+              "running_engine_executable": str(server_executable),
+              "selected_executable": str(selected_executable),
+          }
+          print(json.dumps(evidence, sort_keys=True))
+          if server_executable != selected_executable:
+              raise SystemExit("running engine and selected Python executables differ")
+          if sys.version_info[:2] != (3, 14):
+              raise SystemExit(f"running engine uses unsupported Python {platform.python_version()}")
+          PY
+      - name: Capture Docker failure evidence
+        if: failure()
+        run: |-
+          set +e
+          docker ps -a --no-trunc
+          docker inspect "$SC_CI_CONTAINER"
+          docker logs "$SC_CI_CONTAINER"
+          docker exec "$SC_CI_CONTAINER" python3 -VV
+          python3 -VV
+          epoch="$(python3 .super-coder/scripts/install.py --harness-epoch 2>/dev/null)"
+          selected_image="$(python3 .super-coder/scripts/sandbox_devkit.py image-name \
+            "$GITHUB_WORKSPACE" "$GITHUB_WORKSPACE/.super-coder" "$epoch" \
+            "$(id -un)" "$(id -u)" "$(id -g)" 2>/dev/null)"
+          echo "selected image: ${selected_image:-unresolved}"
+          test -z "$selected_image" || docker image inspect "$selected_image"
+          docker image ls --all --no-trunc
+      - name: Stop the managed sandbox
+        if: always()
+        run: ./sc down
+      - name: Assert no managed container residue
+        if: always()
+        run: |-
+          residue=0
+          for container in "$SC_CI_CONTAINER" "$SC_CI_SIDECAR"; do
+            if docker container inspect "$container" >/dev/null 2>&1; then
+              echo "managed container remains after ./sc down: $container" >&2
+              docker inspect "$container"
+              residue=1
+            fi
+          done
+          test "$residue" -eq 0
