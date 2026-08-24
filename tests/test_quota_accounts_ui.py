@@ -388,6 +388,30 @@ def test_a_real_zero_percent_still_draws_a_measured_zero():
     assert r["pct"] == ["0%"] and r["width"] == "0%"
 
 
+def test_kimi_matches_provider_remaining_quota_without_fake_absolute_counts():
+    """Kimi's official usage UI reports quota remaining, while its endpoint
+    commonly normalizes limit/used onto a 100-point scale. The card must match
+    that direction and must not present 28/100 as an absolute request budget.
+
+    The fill and label are both asserted so the display cannot say 72% left
+    while drawing the inverse 28% bar. The source used_percent stays intact for
+    the provider-blind warning threshold, pinned by the red class at 96% used.
+    """
+    r = run_js("""
+      const r0 = root(); anDrawQuota(r0, PAYLOAD);
+      const card = byClass(r0, "an-acct")[0];
+      out({ pct: texts(byClass(card, "an-win-pct")),
+            width: byClass(card, "an-meter-fill")[0].style.width,
+            tone: cls(byClass(card, "an-win-pct")[0]),
+            body: card.textContent });
+    """, payload([provider("moonshot", windows=[
+        window(pct=96.0, used=96, limit_value=100)])]))
+    assert r["pct"] == ["4% left"]
+    assert r["width"] == "4%"
+    assert "red" in r["tone"], "warning colour still follows 96% used"
+    assert "96 / 100" not in r["body"]
+
+
 # ── one card per provider, never hidden ──────────────────────────────────────
 
 def test_every_provider_renders_a_card_including_the_unconfigured_ones():
@@ -562,7 +586,7 @@ def test_each_card_links_out_to_its_own_providers_usage_page():
     """, payload(all_three()))
     assert r["hrefs"] == ["https://claude.ai/settings/usage",
                           "https://chatgpt.com/codex/settings/usage",
-                          "https://www.kimi.com/code/console"]
+                          "https://www.kimi.ai/membership/subscription?tab=quota"]
 
 
 def test_refresh_forces_a_probe_and_redraws_from_its_response():
