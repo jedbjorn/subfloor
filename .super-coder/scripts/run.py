@@ -78,6 +78,17 @@ PROC_SELF_STAT = Path("/proc/self/stat")   # H-25: our own start ticks, pre-exec
 
 DEFAULT_HEADLESS_PROMPT = "Check your inbox and act on your unread messages."
 SESSION_OPEN_RETRY_DELAYS_S = (0.1, 0.3)
+VENV_PROBE_TIMEOUT_S = 3
+VENV_PROBE_SCRIPT = (
+    "import json, sys; "
+    "print(json.dumps({'version': list(sys.version_info[:2]), "
+    "'prefix': sys.prefix, 'base_prefix': sys.base_prefix}))"
+)
+
+
+class VenvEligibility(NamedTuple):
+    bin_dir: Path | None
+    failure: str | None
 
 
 def _headless_effort_args(hcfg: dict, effort: "str | None",
@@ -1259,12 +1270,105 @@ def _cli_version(binary: str) -> "str | None":
     return lines[0].strip() if lines else None
 
 
+def _probe_worktree_venv(work_dir: Path) -> VenvEligibility:
+    """Read-only proof that the assigned worktree owns a viable Python 3.14 venv."""
+    venv = work_dir / ".venv"
+    project_bin = venv / "bin"
+    if not project_bin.exists() and not project_bin.is_symlink():
+        return VenvEligibility(None, None)
+    if not project_bin.is_dir():
+        return VenvEligibility(None, ".venv/bin is not a directory")
+
+    python = project_bin / "python"
+    try:
+        executable = python.resolve(strict=True)
+    except FileNotFoundError:
+        condition = (
+            "dangling .venv/bin/python symlink"
+            if python.is_symlink()
+            else "missing .venv/bin/python"
+        )
+        return VenvEligibility(None, condition)
+    except (OSError, RuntimeError) as exc:
+        return VenvEligibility(
+            None, f"unresolvable .venv/bin/python ({exc})"
+        )
+
+    if not executable.is_file() or not os.access(executable, os.X_OK):
+        return VenvEligibility(
+            None, ".venv/bin/python is not an executable regular file"
+        )
+
+    try:
+        completed = subprocess.run(
+            [str(python), "-I", "-S", "-c", VENV_PROBE_SCRIPT],
+            capture_output=True,
+            text=True,
+            timeout=VENV_PROBE_TIMEOUT_S,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        return VenvEligibility(
+            None, f"Python probe timed out after {VENV_PROBE_TIMEOUT_S} seconds"
+        )
+    except OSError as exc:
+        return VenvEligibility(None, f"Python probe could not execute ({exc})")
+
+    if completed.returncode != 0:
+        return VenvEligibility(
+            None, f"Python probe exited {completed.returncode}"
+        )
+    try:
+        report = json.loads(completed.stdout)
+        version = report["version"]
+        prefix = report["prefix"]
+        base_prefix = report["base_prefix"]
+        if (
+            not isinstance(version, list)
+            or len(version) != 2
+            or not all(isinstance(part, int) for part in version)
+            or not isinstance(prefix, str)
+            or not isinstance(base_prefix, str)
+        ):
+            raise ValueError
+    except (json.JSONDecodeError, KeyError, TypeError, ValueError):
+        return VenvEligibility(None, "Python probe returned an invalid report")
+
+    if version != [3, 14]:
+        return VenvEligibility(
+            None, f"Python 3.14 is required; found {version[0]}.{version[1]}"
+        )
+
+    try:
+        selected_prefix = venv.resolve()
+        reported_prefix = Path(prefix).resolve()
+    except (OSError, RuntimeError):
+        return VenvEligibility(
+            None, f"Python reported foreign prefix {prefix}"
+        )
+    if reported_prefix != selected_prefix:
+        return VenvEligibility(
+            None, f"Python reported foreign prefix {prefix}"
+        )
+    if base_prefix == prefix:
+        return VenvEligibility(None, "Python reported no virtual environment")
+
+    return VenvEligibility(project_bin, None)
+
+
 def _shell_path(work_dir: Path, inherited: str) -> str:
-    """Put this shell's existing project environment ahead of baseline tools."""
+    """Put a proven project environment ahead of baseline tools."""
     entries = [str(REPO_ROOT)]
-    project_bin = work_dir / ".venv" / "bin"
-    if project_bin.is_dir():
-        entries.append(str(project_bin))
+    eligibility = _probe_worktree_venv(work_dir)
+    if eligibility.bin_dir is not None:
+        entries.append(str(eligibility.bin_dir))
+    elif eligibility.failure is not None:
+        print(
+            f"WARNING: {work_dir}: ignoring unusable .venv: "
+            f"{eligibility.failure}; run `sc deps` from this worktree to "
+            "rebuild its fork-owned environment.",
+            file=sys.stderr,
+        )
     if inherited:
         entries.append(inherited)
     return os.pathsep.join(entries)
