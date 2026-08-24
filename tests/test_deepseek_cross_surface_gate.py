@@ -332,7 +332,13 @@ def test_stock_two_shell_cross_surface_refusals_are_side_effect_free(
         # Same identity reuse, an overlapping different identity refusal, then
         # a real handoff and restart.  Each whoami call hits the temporary API.
         alice_lease = deepseek_web.acquire_shell_identity(env=alice)
-        first = deepseek_web.ensure(alice_worktree, env=alice, identity_lease=alice_lease)
+        try:
+            first = deepseek_web.ensure(
+                alice_worktree, env=alice, identity_lease=alice_lease
+            )
+        except deepseek_web.DeepSeekWebError as exc:
+            log = (root / "web.log").read_text(errors="replace")[-4_000:]
+            pytest.fail(f"stock dsh startup failed: {exc}\n{log}")
         reused = deepseek_web.ensure(alice_worktree, env=alice, identity_lease=alice_lease)
         assert reused["reused"] is True
         old_generation = first["url"].split("sc_generation=", 1)[1]
