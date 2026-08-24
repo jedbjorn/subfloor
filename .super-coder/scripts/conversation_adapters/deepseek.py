@@ -31,6 +31,7 @@ from .base import (
 SESSION_REF = re.compile(r"^sc-[0-9a-f]{32}$")
 RUN_REF_PREFIX = "deepseek-host-run-v1:"
 MAX_UNKNOWN_EVENTS = 24
+MANAGED_IDENTITY_WAIT_SECONDS = 5400.0
 SENSITIVE_KEY = re.compile(
     r"(?:key|token|secret|password|credential|authorization)", re.I
 )
@@ -148,7 +149,10 @@ class DeepSeekAdapter(ConversationAdapter):
                 "DeepSeek conversation preparation omitted canonical shell identity",
             )
         try:
-            self._shell_lease = deepseek_web.acquire_shell_identity(env=env)
+            self._shell_lease = deepseek_web.acquire_shell_identity(
+                env=env,
+                wait_seconds=MANAGED_IDENTITY_WAIT_SECONDS,
+            )
             deepseek_web.ensure(
                 context.checked_worktree(),
                 env=env,
