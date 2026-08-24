@@ -106,6 +106,54 @@ class _ControlledProvider:
         self.thread.join(timeout=5)
 
 
+class _PhaseBlockingHost:
+    """Observe one real Host boundary and pause before it proceeds.
+
+    This delegates every RPC and event to the stock process.  It is a wire
+    barrier for the public one-shot's lifetime, not a substitute Host.
+    """
+
+    def __init__(self, phase: str) -> None:
+        self.phase = phase
+        self.delegate = deepseek_host.DeepSeekHostClient()
+        self.entered = threading.Event()
+        self.release = threading.Event()
+        self._blocked = False
+
+    def _pause(self) -> None:
+        if self._blocked:
+            return
+        self._blocked = True
+        self.entered.set()
+        assert self.release.wait(timeout=10), self.phase
+
+    def call(self, method: str, payload: dict[str, Any]) -> Any:
+        if method == self.phase:
+            self._pause()
+        return self.delegate.call(method, payload)
+
+    def open_events(self):
+        stream = self.delegate.open_events()
+        if self.phase != "turn/end":
+            return stream
+
+        fixture = self
+
+        class PausedStream:
+            def __iter__(self):
+                for envelope in stream:
+                    payload = envelope.get("payload")
+                    event = payload.get("event") if isinstance(payload, dict) else None
+                    if isinstance(event, dict) and event.get("type") == "turn/end":
+                        fixture._pause()
+                    yield envelope
+
+            def close(self) -> None:
+                stream.close()
+
+        return PausedStream()
+
+
 def _build_db(path: Path) -> int:
     con = sqlite3.connect(path)
     try:
@@ -663,6 +711,39 @@ def test_stock_two_shell_cross_surface_refusals_are_side_effect_free(
         assert not one_shot.is_alive()
         assert one_shot_result == {"status": 0}
         assert any("held one-shot" in json.dumps(request) for request in provider.requests)
+
+        # Hold the real public entry at route resolution, exact-session
+        # creation, prompt admission, and terminal delivery.  The observing
+        # transport delegates to the stock Host; each pause is therefore a
+        # production lifetime boundary, not a fabricated one-shot result.
+        for phase in ("host.describe", "session.create", "session.prompt", "turn/end"):
+            provider.requests.clear()
+            blocker = _PhaseBlockingHost(phase)
+            phase_result: dict[str, Any] = {}
+            with monkeypatch.context() as phase_patch:
+                phase_patch.setattr(
+                    deepseek_host, "DeepSeekHostClient", lambda: blocker
+                )
+
+                def run_phase() -> None:
+                    try:
+                        phase_result["status"] = deepseek_one_shot.run(
+                            "deepseek-official/deepseek-v4-flash", "high",
+                            f"one-shot {phase}",
+                        )
+                    except BaseException as exc:
+                        phase_result["error"] = exc
+
+                phase_thread = threading.Thread(target=run_phase, daemon=True)
+                phase_thread.start()
+                assert blocker.entered.wait(timeout=10), phase
+                with pytest.raises(deepseek_web.DeepSeekWebError, match="IDENTITY_BUSY"):
+                    deepseek_web.ensure(alice_worktree, env=alice)
+                blocker.release.set()
+                phase_thread.join(timeout=15)
+            assert not phase_thread.is_alive(), phase
+            assert phase_result == {"status": 0}, phase_result
+            assert any(f"one-shot {phase}" in json.dumps(request) for request in provider.requests)
 
         # Recovery and public one-shot each use their production entry point.
         # A wrong authenticated durable identity fails before Host mutation.
