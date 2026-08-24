@@ -41,6 +41,7 @@ class DockerLifecycleWorkflowTest(unittest.TestCase):
         self.assertLess(bootstrap, launch)
         self.assertNotIn("./sc launch --no-build", self.job)
         self.assertIn('["./sc", "health"]', self.job)
+        self.assertIn('json.loads(port_result.stdout)["port"]', self.job)
         self.assertIn("time.monotonic() + 90", self.job)
         self.assertIn('response.status == 200 and direct_payload.get("ok") is True', self.job)
 

@@ -143,7 +143,8 @@ jobs:
                       remaining = deadline - time.monotonic()
                       if remaining <= 0:
                           continue
-                      url = f"http://127.0.0.1:{port_result.stdout.strip()}/api/health"
+                      port = json.loads(port_result.stdout)["port"]
+                      url = f"http://127.0.0.1:{port}/api/health"
                       with urllib.request.urlopen(
                           url,
                           timeout=min(5, remaining),
