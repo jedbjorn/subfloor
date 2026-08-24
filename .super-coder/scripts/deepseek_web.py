@@ -50,6 +50,8 @@ SESSION_MUTATION_FIELDS = {
     "/api/session.prompt": ("sessionId",),
     "/api/session.updateQueue": ("sessionId",),
     "/api/session.cancel": ("sessionId",),
+    "/api/subagent.prompt": ("parentSessionId",),
+    "/api/subagent.interrupt": ("parentSessionId",),
     "/api/workspace.insertSessionBefore": ("sessionId", "beforeSessionId"),
     "/api/workspace.archiveSession": ("sessionId",),
 }
@@ -1446,7 +1448,13 @@ async def _relay_connection(
         if (
             target_path != "/api/session.create"
             and target_path != WORKSPACE_DELETE_PATH
-            and not isinstance(session_id, str)
+            and (
+                not isinstance(rpc_payload, Mapping)
+                or not any(
+                    isinstance(rpc_payload.get(field), str)
+                    for field in SESSION_MUTATION_FIELDS.get(target_path, ())
+                )
+            )
         ):
             writer.close()
             await writer.wait_closed()
@@ -1570,11 +1578,15 @@ async def _relay_connection(
         upstream_writer.close()
         writer.close()
         raise
-    release_forward_lock()
+    if target_path == "/api/session.prompt":
+        # Prompt ownership moves to the terminal activity ledger after Host
+        # admission so concurrent same-session requests can fail immediately.
+        release_forward_lock()
 
     try:
         response = await asyncio.wait_for(upstream_reader.readuntil(b"\r\n\r\n"), timeout=HTTP_TIMEOUT_SECONDS)
     except (asyncio.IncompleteReadError, TimeoutError, asyncio.LimitOverrunError):
+        release_forward_lock()
         upstream_writer.close()
         writer.close()
         await upstream_writer.wait_closed()
@@ -1632,12 +1644,14 @@ async def _relay_connection(
                 and result["value"].get("accepted") is True
             )
         except (ValueError, asyncio.IncompleteReadError, TimeoutError, json.JSONDecodeError):
+            release_forward_lock()
             upstream_writer.close()
             writer.close()
             await upstream_writer.wait_closed()
             await writer.wait_closed()
             return
         _settle_browser_prompt(prompt_record_id, accepted=accepted)
+        release_forward_lock()
         writer.write(response + response_body)
         await writer.drain()
         upstream_writer.close()
@@ -1645,17 +1659,37 @@ async def _relay_connection(
         await upstream_writer.wait_closed()
         await writer.wait_closed()
         return
-    writer.write(response)
-    await writer.drain()
+    try:
+        writer.write(response)
+        await writer.drain()
+    except BaseException:
+        release_forward_lock()
+        upstream_writer.close()
+        writer.close()
+        raise
 
-    async def copy(source: asyncio.StreamReader, destination: asyncio.StreamWriter) -> None:
+    async def copy(
+        source: asyncio.StreamReader,
+        destination: asyncio.StreamWriter,
+        *,
+        drain_source: bool = False,
+    ) -> None:
+        destination_open = True
         try:
             while True:
                 chunk = await source.read(64 * 1024)
                 if not chunk:
                     break
-                destination.write(chunk)
-                await destination.drain()
+                if not destination_open:
+                    continue
+                try:
+                    destination.write(chunk)
+                    await destination.drain()
+                except ConnectionError:
+                    destination.close()
+                    if not drain_source:
+                        break
+                    destination_open = False
         except (ConnectionError, asyncio.CancelledError):
             pass
         finally:
@@ -1668,7 +1702,12 @@ async def _relay_connection(
         ]
         await asyncio.gather(*tasks, return_exceptions=True)
     else:
-        await copy(upstream_reader, writer)
+        await copy(
+            upstream_reader,
+            writer,
+            drain_source=forward_lock is not None,
+        )
+        release_forward_lock()
         upstream_writer.close()
     await upstream_writer.wait_closed()
     await writer.wait_closed()

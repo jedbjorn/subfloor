@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import fcntl
 import importlib
 import json
 import socket
@@ -806,6 +807,8 @@ def test_gateway_refuses_mutations_to_the_reserved_managed_session() -> None:
         "/api/session.prompt": ("sessionId",),
         "/api/session.updateQueue": ("sessionId",),
         "/api/session.cancel": ("sessionId",),
+        "/api/subagent.prompt": ("parentSessionId",),
+        "/api/subagent.interrupt": ("parentSessionId",),
         "/api/workspace.insertSessionBefore": ("sessionId", "beforeSessionId"),
         "/api/workspace.archiveSession": ("sessionId",),
     }
@@ -839,6 +842,13 @@ def test_gateway_refuses_mutations_to_the_reserved_managed_session() -> None:
             ("/api/session.prompt", {"sessionId": session_id}),
             ("/api/session.updateQueue", {"sessionId": session_id}),
             ("/api/session.cancel", {"sessionId": session_id}),
+            ("/api/subagent.prompt", {
+                "parentSessionId": session_id, "childSessionId": "session-child",
+                "content": [{"type": "text", "text": "continue"}],
+            }),
+            ("/api/subagent.interrupt", {
+                "parentSessionId": session_id, "childSessionId": "session-child",
+            }),
             ("/api/workspace.insertSessionBefore", {
                 "workspaceId": "ws-managed", "sessionId": session_id,
             }),
@@ -1043,9 +1053,8 @@ def test_gateway_forwards_mutation_for_a_distinct_native_session() -> None:
 def test_managed_reservation_waits_for_admitted_mutation_forwarding() -> None:
     async def scenario(root: Path) -> None:
         forwarded: list[dict[str, object]] = []
-        forward_entered = asyncio.Event()
-        release_forward = asyncio.Event()
-        original_open_connection = asyncio.open_connection
+        mutation_received = asyncio.Event()
+        release_response = asyncio.Event()
 
         async def upstream_handler(reader, writer) -> None:
             header = await reader.readuntil(b"\r\n\r\n")
@@ -1055,6 +1064,8 @@ def test_managed_reservation_waits_for_admitted_mutation_forwarding() -> None:
                 if line.lower().startswith(b"content-length:")
             ))
             forwarded.append(json.loads(await reader.readexactly(length)))
+            mutation_received.set()
+            await release_response.wait()
             body = json.dumps({
                 "result": {
                     "ok": True,
@@ -1072,12 +1083,6 @@ def test_managed_reservation_waits_for_admitted_mutation_forwarding() -> None:
 
         upstream = await asyncio.start_server(upstream_handler, "127.0.0.1", 0)
         target_port = upstream.sockets[0].getsockname()[1]
-
-        async def gated_open_connection(host, port, *args, **kwargs):
-            if port == target_port:
-                forward_entered.set()
-                await release_forward.wait()
-            return await original_open_connection(host, port, *args, **kwargs)
 
         gateway = await asyncio.start_server(
             lambda reader, writer: deepseek_web._relay_connection(
@@ -1100,7 +1105,7 @@ def test_managed_reservation_waits_for_admitted_mutation_forwarding() -> None:
         payload = json.dumps(envelope).encode()
 
         async def request() -> bytes:
-            reader, writer = await original_open_connection(
+            reader, writer = await asyncio.open_connection(
                 "127.0.0.1", gateway_port
             )
             try:
@@ -1117,28 +1122,26 @@ def test_managed_reservation_waits_for_admitted_mutation_forwarding() -> None:
                 writer.close()
                 await writer.wait_closed()
 
-        reservation_started = asyncio.Event()
-        loop = asyncio.get_running_loop()
-
-        def reserve() -> None:
-            loop.call_soon_threadsafe(reservation_started.set)
-            deepseek_web.reserve_managed_session(session_id)
-
         try:
-            with mock.patch.object(
-                deepseek_web.asyncio,
-                "open_connection",
-                side_effect=gated_open_connection,
-            ):
-                first_request = asyncio.create_task(request())
-                await asyncio.wait_for(forward_entered.wait(), timeout=1)
-                reservation = asyncio.create_task(asyncio.to_thread(reserve))
-                await asyncio.wait_for(reservation_started.wait(), timeout=1)
-                assert reservation.done() is False
-                assert deepseek_web._reserved_session() is None
-                release_forward.set()
-                first_response = await first_request
-                await asyncio.wait_for(reservation, timeout=1)
+            first_request = asyncio.create_task(request())
+            await asyncio.wait_for(mutation_received.wait(), timeout=1)
+
+            probe = deepseek_web._gateway_lock_path().open("a+")
+            try:
+                with pytest.raises(BlockingIOError):
+                    fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            finally:
+                probe.close()
+
+            reservation = asyncio.create_task(
+                asyncio.to_thread(deepseek_web.reserve_managed_session, session_id)
+            )
+            await asyncio.sleep(0)
+            assert reservation.done() is False
+            assert deepseek_web._reserved_session() is None
+            release_response.set()
+            first_response = await first_request
+            await asyncio.wait_for(reservation, timeout=1)
 
             assert b"HTTP/1.1 200 OK" in first_response
             assert forwarded == [envelope]
@@ -1150,7 +1153,7 @@ def test_managed_reservation_waits_for_admitted_mutation_forwarding() -> None:
             )
             assert forwarded == [envelope]
         finally:
-            release_forward.set()
+            release_response.set()
             deepseek_web.release_managed_session(session_id)
             gateway.close()
             upstream.close()
