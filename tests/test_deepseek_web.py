@@ -734,18 +734,29 @@ def test_gateway_rejects_stale_generation_before_stock_host_forwarding() -> None
     asyncio.run(scenario())
 
 
-def test_stale_prompt_has_zero_host_memory_workflow_message_and_wake_effects() -> None:
+@pytest.mark.parametrize(
+    "protected_effect",
+    (
+        "host_create",
+        "host_prompt",
+        "memory_write",
+        "sprint_action",
+        "message_send",
+        "wake_enqueue",
+    ),
+)
+def test_stale_prompt_has_zero_independently_instrumented_protected_effects(
+    protected_effect: str,
+) -> None:
     async def scenario() -> None:
-        workflow = "spr" "int"
-        effects = {name: 0 for name in ("host", "memory", workflow, "message", "wake")}
+        attempted = mock.Mock(name=protected_effect)
 
         async def upstream_handler(reader, writer) -> None:
-            # The controlled Host fixture models every protected downstream
-            # effect that a forwarded prompt could cause.  A stale-generation
-            # refusal must not reach this boundary at all.
+            # Each parametrized case owns one distinct downstream boundary.
+            # If stale admission regresses, only that selected Host/tool effect
+            # is attempted, so another counter cannot mask it.
             await reader.readuntil(b"\r\n\r\n")
-            for name in effects:
-                effects[name] += 1
+            attempted()
             writer.close()
             await writer.wait_closed()
 
@@ -776,13 +787,7 @@ def test_stale_prompt_has_zero_host_memory_workflow_message_and_wake_effects() -
                 writer.close()
                 await writer.wait_closed()
             assert response.endswith(b'{"error":"HARNESS_WEB_GENERATION_STALE"}')
-            assert effects == {
-                "host": 0,
-                "memory": 0,
-                workflow: 0,
-                "message": 0,
-                "wake": 0,
-            }
+            attempted.assert_not_called()
         finally:
             gateway.close()
             upstream.close()
@@ -793,6 +798,18 @@ def test_stale_prompt_has_zero_host_memory_workflow_message_and_wake_effects() -
 
 
 def test_gateway_refuses_mutations_to_the_reserved_managed_session() -> None:
+    assert deepseek_web.SESSION_MUTATION_FIELDS == {
+        "/api/session.create": ("sessionId",),
+        "/api/session.selectModel": ("sessionId",),
+        "/api/session.rename": ("sessionId",),
+        "/api/session.fork": ("sessionId",),
+        "/api/session.prompt": ("sessionId",),
+        "/api/session.updateQueue": ("sessionId",),
+        "/api/session.cancel": ("sessionId",),
+        "/api/workspace.insertSessionBefore": ("sessionId", "beforeSessionId"),
+        "/api/workspace.archiveSession": ("sessionId",),
+    }
+
     async def scenario(root: Path) -> None:
         upstream_connections: list[tuple[str, int]] = []
 
@@ -822,6 +839,13 @@ def test_gateway_refuses_mutations_to_the_reserved_managed_session() -> None:
             ("/api/session.prompt", {"sessionId": session_id}),
             ("/api/session.updateQueue", {"sessionId": session_id}),
             ("/api/session.cancel", {"sessionId": session_id}),
+            ("/api/workspace.insertSessionBefore", {
+                "workspaceId": "ws-managed", "sessionId": session_id,
+            }),
+            ("/api/workspace.insertSessionBefore", {
+                "workspaceId": "ws-managed", "sessionId": "session-other",
+                "beforeSessionId": session_id,
+            }),
             ("/api/workspace.archiveSession", {"sessionId": session_id}),
         )
         try:
@@ -1004,6 +1028,130 @@ def test_gateway_forwards_mutation_for_a_distinct_native_session() -> None:
             assert deepseek_web._reserved_session() == reserved
         finally:
             deepseek_web.release_managed_session(reserved)
+            gateway.close()
+            upstream.close()
+            await gateway.wait_closed()
+            await upstream.wait_closed()
+
+    with tempfile.TemporaryDirectory() as raw:
+        with mock.patch.dict(
+            deepseek_web.os.environ, service_env(Path(raw)), clear=False
+        ):
+            asyncio.run(scenario(Path(raw)))
+
+
+def test_managed_reservation_waits_for_admitted_mutation_forwarding() -> None:
+    async def scenario(root: Path) -> None:
+        forwarded: list[dict[str, object]] = []
+        forward_entered = asyncio.Event()
+        release_forward = asyncio.Event()
+        original_open_connection = asyncio.open_connection
+
+        async def upstream_handler(reader, writer) -> None:
+            header = await reader.readuntil(b"\r\n\r\n")
+            length = int(next(
+                line.split(b":", 1)[1].strip()
+                for line in header.split(b"\r\n")
+                if line.lower().startswith(b"content-length:")
+            ))
+            forwarded.append(json.loads(await reader.readexactly(length)))
+            body = json.dumps({
+                "result": {
+                    "ok": True,
+                    "value": {"selected": {"provider": "native", "model": "race"}},
+                }
+            }).encode()
+            writer.write(
+                b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+                + f"Content-Length: {len(body)}\r\n\r\n".encode()
+                + body
+            )
+            await writer.drain()
+            writer.close()
+            await writer.wait_closed()
+
+        upstream = await asyncio.start_server(upstream_handler, "127.0.0.1", 0)
+        target_port = upstream.sockets[0].getsockname()[1]
+
+        async def gated_open_connection(host, port, *args, **kwargs):
+            if port == target_port:
+                forward_entered.set()
+                await release_forward.wait()
+            return await original_open_connection(host, port, *args, **kwargs)
+
+        gateway = await asyncio.start_server(
+            lambda reader, writer: deepseek_web._relay_connection(
+                reader, writer, target_port, frozenset({"127.0.0.1"}), "a" * 64
+            ),
+            "127.0.0.1", 0,
+        )
+        gateway_port = gateway.sockets[0].getsockname()[1]
+        (root / "state.json").write_text(json.dumps({"service_port": target_port}))
+        deepseek_web._initialize_activity()
+        session_id = "sc-" + "4" * 32
+        envelope = {
+            "rpcId": "reservation-race",
+            "payload": {
+                "sessionId": session_id,
+                "provider": "native",
+                "model": "race",
+            },
+        }
+        payload = json.dumps(envelope).encode()
+
+        async def request() -> bytes:
+            reader, writer = await original_open_connection(
+                "127.0.0.1", gateway_port
+            )
+            try:
+                writer.write(
+                    b"POST /api/session.selectModel HTTP/1.1\r\nHost: test\r\n"
+                    + b"Cookie: sc_deepseek_generation=" + b"a" * 64
+                    + b"\r\nContent-Type: application/json\r\n"
+                    + f"Content-Length: {len(payload)}\r\n\r\n".encode()
+                    + payload
+                )
+                await writer.drain()
+                return await asyncio.wait_for(reader.read(), timeout=2)
+            finally:
+                writer.close()
+                await writer.wait_closed()
+
+        reservation_started = asyncio.Event()
+        loop = asyncio.get_running_loop()
+
+        def reserve() -> None:
+            loop.call_soon_threadsafe(reservation_started.set)
+            deepseek_web.reserve_managed_session(session_id)
+
+        try:
+            with mock.patch.object(
+                deepseek_web.asyncio,
+                "open_connection",
+                side_effect=gated_open_connection,
+            ):
+                first_request = asyncio.create_task(request())
+                await asyncio.wait_for(forward_entered.wait(), timeout=1)
+                reservation = asyncio.create_task(asyncio.to_thread(reserve))
+                await asyncio.wait_for(reservation_started.wait(), timeout=1)
+                assert reservation.done() is False
+                assert deepseek_web._reserved_session() is None
+                release_forward.set()
+                first_response = await first_request
+                await asyncio.wait_for(reservation, timeout=1)
+
+            assert b"HTTP/1.1 200 OK" in first_response
+            assert forwarded == [envelope]
+            assert deepseek_web._reserved_session() == session_id
+
+            second_response = await request()
+            assert second_response.endswith(
+                b'{"error":"HARNESS_WEB_SESSION_BUSY"}'
+            )
+            assert forwarded == [envelope]
+        finally:
+            release_forward.set()
+            deepseek_web.release_managed_session(session_id)
             gateway.close()
             upstream.close()
             await gateway.wait_closed()

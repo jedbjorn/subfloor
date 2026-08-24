@@ -119,6 +119,7 @@ class _PhaseBlockingHost:
         self.entered = threading.Event()
         self.release = threading.Event()
         self._blocked = False
+        self.calls: list[tuple[str, dict[str, Any]]] = []
 
     def _pause(self) -> None:
         if self._blocked:
@@ -128,13 +129,14 @@ class _PhaseBlockingHost:
         assert self.release.wait(timeout=10), self.phase
 
     def call(self, method: str, payload: dict[str, Any]) -> Any:
+        self.calls.append((method, payload))
         if method == self.phase:
             self._pause()
         return self.delegate.call(method, payload)
 
     def open_events(self):
         stream = self.delegate.open_events()
-        if self.phase != "turn/end":
+        if self.phase not in {"turn/end", "stream.close"}:
             return stream
 
         fixture = self
@@ -150,8 +152,49 @@ class _PhaseBlockingHost:
 
             def close(self) -> None:
                 stream.close()
+                if fixture.phase == "stream.close":
+                    fixture._pause()
 
         return PausedStream()
+
+
+class _CancellationBlockingHost(_PhaseBlockingHost):
+    """Lose the provider stream, then pause inside real cancellation proof."""
+
+    def __init__(self, phase: str) -> None:
+        super().__init__(phase)
+        self.cancelled = False
+
+    def call(self, method: str, payload: dict[str, Any]) -> Any:
+        self.calls.append((method, payload))
+        value = self.delegate.call(method, payload)
+        if method == "session.cancel":
+            self.cancelled = True
+            if self.phase == method:
+                self._pause()
+        elif method == "session.history" and self.cancelled and self.phase == method:
+            self._pause()
+        return value
+
+    def open_events(self):
+        stream = self.delegate.open_events()
+
+        class InterruptedStream:
+            def __iter__(self):
+                for envelope in stream:
+                    payload = envelope.get("payload")
+                    event = payload.get("event") if isinstance(payload, dict) else None
+                    if isinstance(event, dict) and event.get("type") == "turn/start":
+                        raise deepseek_host.DeepSeekHostError(
+                            "HARNESS_PROVIDER_STREAM_FAILED",
+                            "controlled stream loss after prompt admission",
+                        )
+                    yield envelope
+
+            def close(self) -> None:
+                stream.close()
+
+        return InterruptedStream()
 
 
 def _build_db(path: Path) -> int:
@@ -713,10 +756,14 @@ def test_stock_two_shell_cross_surface_refusals_are_side_effect_free(
         assert any("held one-shot" in json.dumps(request) for request in provider.requests)
 
         # Hold the real public entry at route resolution, exact-session
-        # creation, prompt admission, and terminal delivery.  The observing
+        # creation, prompt admission, terminal delivery, and after terminal
+        # delivery while the provider stream is closing.  The observing
         # transport delegates to the stock Host; each pause is therefore a
         # production lifetime boundary, not a fabricated one-shot result.
-        for phase in ("host.describe", "session.create", "session.prompt", "turn/end"):
+        for phase in (
+            "host.describe", "session.create", "session.prompt", "turn/end",
+            "stream.close",
+        ):
             provider.requests.clear()
             blocker = _PhaseBlockingHost(phase)
             phase_result: dict[str, Any] = {}
@@ -744,6 +791,57 @@ def test_stock_two_shell_cross_surface_refusals_are_side_effect_free(
             assert not phase_thread.is_alive(), phase
             assert phase_result == {"status": 0}, phase_result
             assert any(f"one-shot {phase}" in json.dumps(request) for request in provider.requests)
+
+        # Force a provider stream loss after the prompt reached stock DSH.
+        # The one-shot must retain Bob's lease while cancellation is accepted
+        # and while history supplies terminal proof; Alice can acquire it only
+        # after the failed one-shot has finished its final close.
+        for phase in ("session.cancel", "session.history"):
+            provider.requests.clear()
+            blocker = _CancellationBlockingHost(phase)
+            phase_result = {}
+            with monkeypatch.context() as phase_patch:
+                phase_patch.setattr(
+                    deepseek_host, "DeepSeekHostClient", lambda: blocker
+                )
+
+                def run_cancel_phase() -> None:
+                    try:
+                        phase_result["status"] = deepseek_one_shot.run(
+                            "deepseek-official/deepseek-v4-flash", "high",
+                            f"one-shot {phase}",
+                        )
+                    except BaseException as exc:
+                        phase_result["error"] = exc
+
+                phase_thread = threading.Thread(
+                    target=run_cancel_phase, daemon=True
+                )
+                phase_thread.start()
+                assert blocker.entered.wait(timeout=10), phase
+                with pytest.raises(
+                    deepseek_web.DeepSeekWebError, match="IDENTITY_BUSY"
+                ):
+                    deepseek_web.ensure(alice_worktree, env=alice)
+                blocker.release.set()
+                phase_thread.join(timeout=15)
+            assert not phase_thread.is_alive(), phase
+            assert blocker.cancelled is True
+            assert set(phase_result) == {"error"}
+            error = phase_result["error"]
+            assert isinstance(error, deepseek_host.DeepSeekHostError)
+            assert error.code == "HARNESS_PROVIDER_STREAM_FAILED"
+            prompts = [
+                payload for method, payload in blocker.calls
+                if method == "session.prompt"
+            ]
+            assert len(prompts) == 1
+            assert prompts[0]["content"] == [{
+                "type": "text", "text": f"one-shot {phase}",
+            }]
+            assert prompts[0]["sessionId"].startswith("sc-")
+            released = deepseek_web.acquire_shell_identity(env=alice)
+            released.close()
 
         # Recovery and public one-shot each use their production entry point.
         # A wrong authenticated durable identity fails before Host mutation.

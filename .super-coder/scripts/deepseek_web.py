@@ -42,16 +42,18 @@ STOP_TIMEOUT_SECONDS = 5.0
 HTTP_TIMEOUT_SECONDS = 2.0
 RELAY_POLICY = "host-gateway-only-v1"
 GENERATION_COOKIE = "sc_deepseek_generation"
-SESSION_MUTATION_PATHS = frozenset({
-    "/api/session.create",
-    "/api/session.selectModel",
-    "/api/session.rename",
-    "/api/session.fork",
-    "/api/session.prompt",
-    "/api/session.updateQueue",
-    "/api/session.cancel",
-    "/api/workspace.archiveSession",
-})
+SESSION_MUTATION_FIELDS = {
+    "/api/session.create": ("sessionId",),
+    "/api/session.selectModel": ("sessionId",),
+    "/api/session.rename": ("sessionId",),
+    "/api/session.fork": ("sessionId",),
+    "/api/session.prompt": ("sessionId",),
+    "/api/session.updateQueue": ("sessionId",),
+    "/api/session.cancel": ("sessionId",),
+    "/api/workspace.insertSessionBefore": ("sessionId", "beforeSessionId"),
+    "/api/workspace.archiveSession": ("sessionId",),
+}
+SESSION_MUTATION_PATHS = frozenset(SESSION_MUTATION_FIELDS)
 WORKSPACE_DELETE_PATH = "/api/workspace.delete"
 
 
@@ -637,6 +639,29 @@ def _gateway_lock():
         yield
 
 
+async def _acquire_gateway_forward_lock():
+    """Acquire the cross-process gate without blocking the relay event loop."""
+    path = _gateway_lock_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    handle = path.open("a+")
+    try:
+        os.chmod(path, 0o600)
+        while True:
+            try:
+                fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return handle
+            except BlockingIOError:
+                await asyncio.sleep(0.01)
+    except BaseException:
+        handle.close()
+        raise
+
+
+def _release_gateway_forward_lock(handle) -> None:
+    fcntl.flock(handle, fcntl.LOCK_UN)
+    handle.close()
+
+
 def _activity_error(detail: str) -> DeepSeekWebError:
     return DeepSeekWebError("HARNESS_WEB_GATEWAY_BUSY", detail)
 
@@ -843,34 +868,38 @@ def _workspace_contains_session(
     return session_id in session_ids
 
 
-def _record_browser_prompt(service_port: int, session_id: str) -> str:
+def _record_browser_prompt_locked(service_port: int, session_id: str) -> str:
     if _browser_session_id(session_id) is None:
         raise _activity_error("DeepSeek Web browser session identity is invalid")
-    with _gateway_lock():
-        activity = _read_activity(required=True)
-        if activity["admission"] != "open":
-            raise _activity_error("DeepSeek Web is closing browser admission")
-        if session_id == _reserved_session():
-            raise DeepSeekWebError(
-                "HARNESS_WEB_SESSION_BUSY",
-                "a managed DeepSeek turn owns this native session",
-            )
-        activity["requests"] = _active_browser_requests(
-            service_port, activity["requests"]
+    activity = _read_activity(required=True)
+    if activity["admission"] != "open":
+        raise _activity_error("DeepSeek Web is closing browser admission")
+    if session_id == _reserved_session():
+        raise DeepSeekWebError(
+            "HARNESS_WEB_SESSION_BUSY",
+            "a managed DeepSeek turn owns this native session",
         )
-        if any(record["session_id"] == session_id for record in activity["requests"].values()):
-            raise DeepSeekWebError(
-                "HARNESS_WEB_SESSION_BUSY",
-                "native Web already owns an accepted or pending prompt for this session",
-            )
-        request_id = uuid.uuid4().hex
-        activity["requests"][request_id] = {
-            "session_id": session_id,
-            "boundary": _history_boundary(service_port, session_id),
-            "status": "pending",
-        }
-        _write_activity(activity)
-        return request_id
+    activity["requests"] = _active_browser_requests(
+        service_port, activity["requests"]
+    )
+    if any(record["session_id"] == session_id for record in activity["requests"].values()):
+        raise DeepSeekWebError(
+            "HARNESS_WEB_SESSION_BUSY",
+            "native Web already owns an accepted or pending prompt for this session",
+        )
+    request_id = uuid.uuid4().hex
+    activity["requests"][request_id] = {
+        "session_id": session_id,
+        "boundary": _history_boundary(service_port, session_id),
+        "status": "pending",
+    }
+    _write_activity(activity)
+    return request_id
+
+
+def _record_browser_prompt(service_port: int, session_id: str) -> str:
+    with _gateway_lock():
+        return _record_browser_prompt_locked(service_port, session_id)
 
 
 def _settle_browser_prompt(request_id: str, *, accepted: bool) -> None:
@@ -1295,6 +1324,15 @@ async def _relay_connection(
     generation: str | None = None,
     generation_file: Path | None = None,
 ) -> None:
+    forward_lock = None
+
+    def release_forward_lock() -> None:
+        nonlocal forward_lock
+        if forward_lock is None:
+            return
+        _release_gateway_forward_lock(forward_lock)
+        forward_lock = None
+
     peer = writer.get_extra_info("peername")
     if not isinstance(peer, tuple) or not peer or peer[0] not in allowed_peers:
         writer.close()
@@ -1414,9 +1452,16 @@ async def _relay_connection(
             await writer.wait_closed()
             return
         try:
-            with _gateway_lock():
-                reserved = _reserved_session()
-            targets_reserved = session_id == reserved
+            forward_lock = await _acquire_gateway_forward_lock()
+            reserved = _reserved_session()
+            targets_reserved = (
+                reserved is not None
+                and isinstance(rpc_payload, Mapping)
+                and any(
+                    rpc_payload.get(field) == reserved
+                    for field in SESSION_MUTATION_FIELDS.get(target_path, ())
+                )
+            )
             if (
                 not targets_reserved
                 and reserved is not None
@@ -1430,6 +1475,7 @@ async def _relay_connection(
                     reserved,
                 )
         except DeepSeekWebError as exc:
+            release_forward_lock()
             body = json.dumps({"error": exc.code}, separators=(",", ":")).encode()
             writer.write(
                 b"HTTP/1.1 409 Conflict\r\nContent-Type: application/json\r\n"
@@ -1440,7 +1486,11 @@ async def _relay_connection(
             writer.close()
             await writer.wait_closed()
             return
+        except BaseException:
+            release_forward_lock()
+            raise
         if targets_reserved:
+            release_forward_lock()
             body = b'{"error":"HARNESS_WEB_SESSION_BUSY"}'
             writer.write(
                 b"HTTP/1.1 409 Conflict\r\nContent-Type: application/json\r\n"
@@ -1453,8 +1503,11 @@ async def _relay_connection(
             return
         if target_path == "/api/session.prompt":
             try:
-                prompt_record_id = _record_browser_prompt(target_port, session_id)
+                prompt_record_id = _record_browser_prompt_locked(
+                    target_port, session_id
+                )
             except DeepSeekWebError as exc:
+                release_forward_lock()
                 body = json.dumps({"error": exc.code}, separators=(",", ":")).encode()
                 writer.write(
                     b"HTTP/1.1 409 Conflict\r\nContent-Type: application/json\r\n"
@@ -1465,6 +1518,9 @@ async def _relay_connection(
                 writer.close()
                 await writer.wait_closed()
                 return
+            except BaseException:
+                release_forward_lock()
+                raise
         request += body
     headers = [
         line for line in lines[1:]
@@ -1487,15 +1543,21 @@ async def _relay_connection(
             "127.0.0.1", target_port
         )
     except OSError:
+        release_forward_lock()
         if "prompt_record_id" in locals() and prompt_record_id is not None:
             _settle_browser_prompt(prompt_record_id, accepted=False)
         writer.close()
         await writer.wait_closed()
         return
+    except BaseException:
+        release_forward_lock()
+        writer.close()
+        raise
     try:
         upstream_writer.write(request)
         await upstream_writer.drain()
     except OSError:
+        release_forward_lock()
         # The TCP peer accepted a connection; whether it consumed the prompt is
         # unknowable, so preserve the pending record and fail handoff closed.
         upstream_writer.close()
@@ -1503,6 +1565,12 @@ async def _relay_connection(
         await upstream_writer.wait_closed()
         await writer.wait_closed()
         return
+    except BaseException:
+        release_forward_lock()
+        upstream_writer.close()
+        writer.close()
+        raise
+    release_forward_lock()
 
     try:
         response = await asyncio.wait_for(upstream_reader.readuntil(b"\r\n\r\n"), timeout=HTTP_TIMEOUT_SECONDS)

@@ -173,6 +173,28 @@ def test_pinned_stock_dsh_workspace_session_archive_contract(
         assert native_row["running"] is False
         assert native_row["blank"] is True
         assert native_row["sessionId"] != session_id
+
+        second_native = client.call(
+            "session.create",
+            {"workspaceId": second_workspace_id, "agentPreset": "standard"},
+        )
+        second_native_id = second_native["sessionId"]
+        before_reorder = next(
+            row for row in client.call("workspace.list", {})["items"]
+            if row["workspaceId"] == second_workspace_id
+        )
+        assert before_reorder["sessionIds"] == [second_native_id, native_id]
+        reordered = client.call(
+            "workspace.insertSessionBefore",
+            {
+                "workspaceId": second_workspace_id,
+                "sessionId": native_id,
+                "beforeSessionId": second_native_id,
+            },
+        )
+        assert reordered["workspace"]["workspaceId"] == second_workspace_id
+        assert reordered["workspace"]["sessionIds"] == [native_id, second_native_id]
+        assert session_id not in reordered["workspace"]["sessionIds"]
     finally:
         process.terminate()
         try:

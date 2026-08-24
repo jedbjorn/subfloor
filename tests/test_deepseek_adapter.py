@@ -777,6 +777,90 @@ def test_resume_archived_session_refuses_without_replacement(tmp_path: Path) -> 
     assert not any(method == "session.prompt" for method, _ in live.calls)
 
 
+@pytest.mark.parametrize(
+    "protected_effect",
+    (
+        "host_create",
+        "host_prompt",
+        "memory_write",
+        "sprint_action",
+        "message_send",
+        "wake_enqueue",
+    ),
+)
+@pytest.mark.parametrize(
+    ("refusal", "expected_code"),
+    (
+        ("missing", "HARNESS_SESSION_LOST"),
+        ("archived", "HARNESS_SESSION_ARCHIVED"),
+        ("workspace_mismatch", "HARNESS_SESSION_WORKSPACE_MISMATCH"),
+        ("shell_identity", "HARNESS_SHELL_IDENTITY_MISMATCH"),
+    ),
+)
+def test_refusal_matrix_has_zero_independent_protected_effects(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    refusal: str,
+    expected_code: str,
+    protected_effect: str,
+) -> None:
+    attempted = mock.Mock(name=protected_effect)
+
+    class ProbedHost(FakeHost):
+        def call(self, method, payload):
+            if method == "session.create" and protected_effect == "host_create":
+                attempted(dict(payload))
+            if method == "session.prompt":
+                if protected_effect == "host_prompt":
+                    attempted(dict(payload))
+                elif protected_effect not in {"host_create", "host_prompt"}:
+                    # These are independent fake post-prompt authority effects,
+                    # one per parametrized case.  A shared forwarding sentinel
+                    # could conceal a path-specific mutation; this selected
+                    # probe is attempted only if this refusal wrongly prompts.
+                    attempted(dict(payload))
+            return super().call(method, payload)
+
+    seed = FakeHost()
+    ctx = context(tmp_path, seed)
+    session = DeepSeekAdapter._new_session_ref(ctx)
+    live = ProbedHost()
+    operation = "resume"
+    if refusal == "archived":
+        live.seed_session(session, str(tmp_path))
+        live.workspaces["ws-1"]["archivedSessionIds"].append(session)
+    elif refusal == "workspace_mismatch":
+        live.seed_session(session, str(tmp_path))
+        live.workspaces["ws-1"]["sessionIds"] = []
+        live.existing_session = True
+        operation = "inspect"
+    elif refusal == "shell_identity":
+        operation = "start"
+
+        def refuse_identity(**_kwargs):
+            raise deepseek_web.DeepSeekWebError(
+                "HARNESS_SHELL_IDENTITY_MISMATCH",
+                "controlled shell mismatch",
+            )
+
+        monkeypatch.setattr(deepseek_web, "acquire_shell_identity", refuse_identity)
+
+    adapter = DeepSeekAdapter(client_factory=lambda: live)
+    try:
+        with pytest.raises(AdapterError) as refused:
+            if operation == "start":
+                adapter.start(ctx, "must not act")
+            elif operation == "inspect":
+                adapter.inspect(session, ctx)
+            else:
+                adapter.resume(session, ctx, "must not act")
+        assert refused.value.code == expected_code
+        attempted.assert_not_called()
+        assert [call for call in live.calls if call[0] == "session.prompt"] == []
+    finally:
+        adapter.close()
+
+
 def test_managed_prompt_rechecks_archive_state_at_final_admission(
     tmp_path: Path,
 ) -> None:
