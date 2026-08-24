@@ -1289,10 +1289,11 @@ class RecoveryAndFailureTest(SprintPRWatcherCase):
         self.assertEqual(
             "GitHub PR event: repository=acme/repo, number=42, head_sha="
             + "a" * 40
-            + ", event=green. Your active Sprint PR is green; judge readiness "
-            "and pass the baton to review when ready.",
+            + ", event=green. Your paused Sprint PR is green; judge readiness "
+            "and wait for the Sprint to resume.",
             paused_message["body"],
         )
+        self.assertNotIn("pass the baton", paused_message["body"])
 
         lifecycle.transition(
             self.sprint_id,

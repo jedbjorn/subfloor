@@ -148,9 +148,10 @@ Planner Re-enters become fresh ticket chats); FnB pause/resume returns to
 supervise, while automatic pauses preserve the dial. Developer-owned PR
 subscriptions emit self-describing red/green/closed Re-enter wakes throughout
 ownership, including after a Sprint ends. Wake text distinguishes an
-armed/paused Sprint from no active Sprint; Planner and Reviewer receive no
-PR-event wakes. Arming validates all recorded role harness/model/effort
-selections before publishing work; defaults satisfy the gate.
+armed Sprint, a paused Sprint, and no active Sprint; Planner and Reviewer
+receive no PR-event wakes. Arming validates all recorded role
+harness/model/effort selections before publishing work;
+defaults satisfy the gate.
 
 ---
 

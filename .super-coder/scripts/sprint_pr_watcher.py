@@ -1390,8 +1390,8 @@ class SprintPRWatcher:
                 ),
             )
 
-        active_sprint = registered["lifecycle"] in {"armed", "paused"}
-        if active_sprint:
+        lifecycle = registered["lifecycle"]
+        if lifecycle in {"armed", "paused"}:
             instructions = {
                 "red": "Your active Sprint PR went red; fix the failing checks.",
                 "green": (
@@ -1403,6 +1403,11 @@ class SprintPRWatcher:
                     "Planner if this blocks the Sprint."
                 ),
             }
+            if lifecycle == "paused":
+                instructions["green"] = (
+                    "Your paused Sprint PR is green; judge readiness and wait "
+                    "for the Sprint to resume."
+                )
         else:
             instructions = {
                 "red": (

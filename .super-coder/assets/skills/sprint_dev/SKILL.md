@@ -139,9 +139,9 @@ sc sprint register-pr --sprint <id> --repository <owner/name> \
 ```
 
 After `register-pr` succeeds, retain ownership. Red/green/closed Re-enter wakes
-continue after the Sprint ends. Follow their context: in an armed/paused
-Sprint, fix red + pass green to review; outside an active Sprint, fix red only
-if needed + take no action on green. Planner/Reviewer get none.
+continue after the Sprint ends. Follow context: armed -> fix red + judge/pass
+green; paused -> wait for resume before fix/review; no active Sprint -> fix red
+only if needed + no action on green. Planner/Reviewer get none.
 
 If the same registered PR was externally closed, then reopened, rebased, and
 pushed, replay the exact `register-pr` command. Require `created: false`, which
