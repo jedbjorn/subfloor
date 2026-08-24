@@ -325,6 +325,10 @@ def test_stock_two_shell_cross_surface_refusals_are_side_effect_free(
             "DEEPSEEK_BASE_URL": provider.url,
             "DEEPSEEK_API_KEY": PROVIDER_TOKEN,
             "DSH_TELEMETRY_MODE": "DISABLED",
+            # Launch preparation preserves the shell PATH.  Stock dsh is a
+            # /usr/bin/env node script on CI, so the controlled identity must
+            # retain that non-secret runtime dependency as well.
+            "PATH": os.environ["PATH"],
         }
         alice.update(provider_environment)
         bob.update(provider_environment)
