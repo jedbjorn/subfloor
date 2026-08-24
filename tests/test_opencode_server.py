@@ -60,6 +60,11 @@ class OpenCodeServerTest(unittest.TestCase):
         opencode._SERVER_ENDPOINT = opencode.SERVER_ENDPOINT
         opencode._SERVER_PASSWORD = None
         opencode._SERVER_LOG_HANDLE = None
+        self.probe_patch = mock.patch.object(
+            opencode.harness_versions, "probe", return_value=None
+        )
+        self.probe_patch.start()
+        self.addCleanup(self.probe_patch.stop)
         self.addCleanup(opencode.stop_server)
 
     def test_healthy_existing_server_is_reused_without_spawning(self):
@@ -135,6 +140,81 @@ class OpenCodeServerTest(unittest.TestCase):
         spawn.assert_not_called()
         reap.assert_not_called()
         self.assertTrue(self.state_path.exists())
+
+    def test_version_mismatched_managed_orphan_is_rotated_before_adoption(self):
+        self.state_path.write_text(json.dumps({
+            "pid": 4322,
+            "password": "stale-secret",
+            "port": 43212,
+        }))
+        process = FakeProcess(pid=9999)
+        with mock.patch.dict(os.environ, {}, clear=False), \
+                mock.patch.object(
+                    opencode,
+                    "_server_healthy",
+                    side_effect=lambda endpoint, password: (
+                        (endpoint, password)
+                        in {
+                            ("http://127.0.0.1:43212", "stale-secret"),
+                            ("http://127.0.0.1:43213", "fresh-secret"),
+                        }
+                    ),
+                ), mock.patch.object(
+                    opencode, "_server_version", return_value="1.18.18"
+                ), mock.patch.object(
+                    opencode.harness_versions, "probe", return_value="1.18.22"
+                ), mock.patch.object(
+                    opencode, "_pid_is_opencode_serve", return_value=True
+                ), mock.patch.object(
+                    opencode, "_reap_orphan_server"
+                ) as reap, mock.patch.object(
+                    opencode.shutil, "which", return_value="/bin/opencode"
+                ), mock.patch.object(
+                    opencode.secrets, "token_urlsafe", return_value="fresh-secret"
+                ), mock.patch.object(
+                    opencode, "_available_loopback_port", return_value=43213
+                ), mock.patch.object(
+                    opencode.subprocess, "Popen", return_value=process
+                ):
+            os.environ.pop("OPENCODE_SERVER_PASSWORD", None)
+            endpoint, password = opencode.ensure_server(timeout=1)
+
+        self.assertEqual(endpoint, "http://127.0.0.1:43213")
+        self.assertEqual(password, "fresh-secret")
+        reap.assert_called_once_with(4322)
+        self.assertEqual(
+            json.loads(self.state_path.read_text()),
+            {"pid": 9999, "password": "fresh-secret", "port": 43213},
+        )
+
+    def test_version_mismatch_never_reaps_unverified_recorded_process(self):
+        self.state_path.write_text(json.dumps({
+            "pid": 4322,
+            "password": "recorded-secret",
+            "port": 43212,
+        }))
+        with mock.patch.object(
+            opencode,
+            "_server_healthy",
+            side_effect=lambda endpoint, password: (
+                (endpoint, password)
+                == ("http://127.0.0.1:43212", "recorded-secret")
+            ),
+        ), mock.patch.object(
+            opencode, "_server_version", return_value="1.18.18"
+        ), mock.patch.object(
+            opencode.harness_versions, "probe", return_value="1.18.22"
+        ), mock.patch.object(
+            opencode, "_pid_is_opencode_serve", return_value=False
+        ), mock.patch.object(
+            opencode, "_reap_orphan_server"
+        ) as reap, mock.patch.object(opencode.subprocess, "Popen") as spawn:
+            endpoint, password = opencode.ensure_server()
+
+        self.assertEqual(endpoint, "http://127.0.0.1:43212")
+        self.assertEqual(password, "recorded-secret")
+        reap.assert_not_called()
+        spawn.assert_not_called()
 
     def test_unreachable_orphan_is_reaped_then_respawned(self):
         self.state_path.write_text(
@@ -236,6 +316,7 @@ class OpenCodeServerTest(unittest.TestCase):
                                 "reasoningEffort": "high",
                                 "reasoningSummary": "detailed",
                             },
+                            "max": {"reasoningEffort": "max"},
                         },
                     }
                 },
@@ -244,10 +325,10 @@ class OpenCodeServerTest(unittest.TestCase):
 
         self.assertEqual(len(got), 1)
         model = got[0]
-        self.assertEqual(model["supported_efforts"], ["low", "high"])
+        self.assertEqual(model["supported_efforts"], ["low", "high", "max"])
         self.assertEqual(model["default_effort"], "high")
         self.assertEqual(model["native_variant_ids"], {
-            "low": "low", "high": "high",
+            "low": "low", "high": "high", "max": "max",
         })
         self.assertEqual(
             model["adapter_metadata"]["variant_options_by_effort"],
@@ -257,6 +338,7 @@ class OpenCodeServerTest(unittest.TestCase):
                     "reasoningEffort": "high",
                     "reasoningSummary": "detailed",
                 },
+                "max": {"reasoningEffort": "max"},
             },
         )
         self.assertEqual(model["cli_version"], "1.18.9")
