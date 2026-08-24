@@ -26,7 +26,13 @@ RESEEDED_SKILLS = set(SKILLS) | {"db_map"}
 AUTHORITY_SPLIT_SKILLS = {"sprint_pln", "sprint_rev"}
 V21_ROLE_SKILLS = set(SKILLS)
 HANDOFF_ROLE_SKILLS = {"sprint_dev", "sprint_rev", "sprint_pln"}
-FOCUSED_DEV_VERIFICATION_SKILLS = {"agents", "spec", "sprint_dev"}
+FOCUSED_DEV_VERIFICATION_SKILLS = {
+    "agents",
+    "dev_kit",
+    "spec",
+    "sprint_dev",
+    "sprint_pln",
+}
 CLOSEOUT_ROLE_SKILLS = {"sprint_close", "sprint_dev", "sprint_pln", "sprint_rev"}
 FORCE_NEW_ROLE_SKILLS = {"sprint_dev", "sprint_pln", "sprint_rev"}
 POLISHED_SPRINT_SKILLS = set(SKILLS) - {"sprint_prep"}
@@ -195,6 +201,8 @@ class SprintSkillTest(unittest.TestCase):
 
             for name in sorted(CONFORMANCE_OWNER_SKILLS):
                 with self.subTest(name=name):
+                    if name in FOCUSED_DEV_VERIFICATION_SKILLS:
+                        continue  # Migration 0234 supersedes this historical body.
                     parsed = seed_skills.parse_skill(ASSETS / name / "SKILL.md")
                     rows = con.execute(
                         "SELECT description,category,command,common,content,is_deleted "
@@ -890,6 +898,8 @@ class SprintSkillTest(unittest.TestCase):
             )
             for name in sorted(CLEANUP_RECOVERY_SKILLS):
                 with self.subTest(name=name):
+                    if name in FOCUSED_DEV_VERIFICATION_SKILLS:
+                        continue  # Migration 0234 supersedes this historical body.
                     parsed = seed_skills.parse_skill(ASSETS / name / "SKILL.md")
                     rows = con.execute(
                         "SELECT description,category,command,common,content,is_deleted "
