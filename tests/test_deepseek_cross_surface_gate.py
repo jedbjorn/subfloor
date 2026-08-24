@@ -13,6 +13,7 @@ import io
 import json
 import os
 import shutil
+import socket
 import sqlite3
 import subprocess
 import sys
@@ -233,6 +234,26 @@ def _identity(base: str, token: str, shell_id: int, shortname: str, host_port: i
     }
 
 
+def _free_gateway_port() -> int:
+    """Reserve a test-local public port whose private DSH offset is free too."""
+    for port in range(12_000, 50_000):
+        candidates = (port, port + 1, port + 2, port + deepseek_web.ports.DEEPSEEK_RELAY_OFFSET)
+        sockets: list[socket.socket] = []
+        try:
+            for candidate in candidates:
+                listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                listener.bind(("127.0.0.1", candidate))
+                sockets.append(listener)
+            return port
+        except OSError:
+            continue
+        finally:
+            for listener in sockets:
+                listener.close()
+    raise AssertionError("no free DeepSeek Web public/private port pair")
+
+
 def test_stock_two_shell_cross_surface_refusals_are_side_effect_free(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -288,8 +309,14 @@ def test_stock_two_shell_cross_surface_refusals_are_side_effect_free(
         monkeypatch.setenv("SC_DEEPSEEK_WEB_LOG", str(root / "web.log"))
         monkeypatch.setenv("DSH_HOME", str(root / "dsh-home"))
         monkeypatch.delenv("SC_SANDBOX", raising=False)
+        public_port = _free_gateway_port()
+        (root / "instance.json").write_text(json.dumps({
+            "port": public_port + 1,
+            "dev_port": public_port + 2,
+            "deepseek_host_port": public_port,
+        }))
         config = deepseek_web.ports.resolve(persist=True)
-        public_port = int(config["deepseek_host_port"])
+        assert config["deepseek_host_port"] == public_port
         upstream_port = public_port + deepseek_web.ports.DEEPSEEK_RELAY_OFFSET
         alice = _identity(base, ALICE_TOKEN, 41, "ALICE", upstream_port)
         bob = _identity(base, BOB_TOKEN, 42, "BOB", upstream_port)
