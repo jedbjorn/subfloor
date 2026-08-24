@@ -38,10 +38,12 @@ import deepseek_host  # noqa: E402
 import deepseek_one_shot  # noqa: E402
 import deepseek_web  # noqa: E402
 import mem  # noqa: E402
+import route_bindings  # noqa: E402
 import server  # noqa: E402
 import sprint_cli  # noqa: E402
 from conversation_adapters.base import AdapterError, ConversationContext  # noqa: E402
 from conversation_adapters.deepseek import DeepSeekAdapter  # noqa: E402
+from conversation_broker import BrokerRun, ConversationBroker  # noqa: E402
 
 
 ALICE_TOKEN = "deepseek-cross-surface-alice-token"
@@ -162,6 +164,40 @@ def _protected_snapshot(path: Path) -> dict[str, list[dict[str, Any]]]:
     }
 
 
+def _assert_database_secrets_absent(
+    database: Path, *, secrets: tuple[str, ...], capabilities: tuple[str, ...]
+) -> None:
+    """Sweep every persisted cell, exempting only canonical shell API keys."""
+    con = sqlite3.connect(database)
+    try:
+        tables = [
+            row[0]
+            for row in con.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' "
+                "AND name NOT LIKE 'sqlite_%' ORDER BY name"
+            )
+        ]
+        for table in tables:
+            columns = [row[1] for row in con.execute(f'PRAGMA table_info("{table}")')]
+            assert columns, table
+            quoted = ", ".join(f'"{column}"' for column in columns)
+            for row in con.execute(f'SELECT {quoted} FROM "{table}"'):
+                for column, value in zip(columns, row):
+                    if table == "shells" and column == "api_key":
+                        continue
+                    payload = (
+                        value if isinstance(value, bytes) else str(value).encode()
+                    )
+                    assert not any(secret.encode() in payload for secret in secrets), (
+                        table, column
+                    )
+                    assert not any(capability.encode() in payload for capability in capabilities), (
+                        table, column
+                    )
+    finally:
+        con.close()
+
+
 def _host_rpc(port: int, method: str, payload: dict[str, Any]) -> dict[str, Any]:
     body = json.dumps({
         "type": "client-request", "rpcId": uuid.uuid4().hex,
@@ -232,6 +268,42 @@ def _identity(base: str, token: str, shell_id: int, shortname: str, host_port: i
         "SC_SHELL_SHORTNAME": shortname,
         "SC_DEEPSEEK_HOST_PORT": str(host_port),
     }
+
+
+def _managed_context(
+    worktree: Path, env: dict[str, str], *, conversation_id: str
+) -> ConversationContext:
+    """Build the immutable production route binding from the live stock Host."""
+    client = deepseek_host.DeepSeekHostClient()
+    route = deepseek_host.route_for(client, "deepseek-official/deepseek-v4-flash")
+    binding = {
+        "contract_version": 2,
+        "control_state": "controlled",
+        "harness": "deepseek",
+        "requested_model": route.selector,
+        "provider_model": route.model,
+        "requested_effort": "high",
+        "effective_effort": "high",
+        "native_variant_id": None,
+        "transport": deepseek_host.TRANSPORT_CONTRACT,
+        "catalogue_generation": "c" * 32,
+        "evidence_digest": "d" * 64,
+        "selector_binding": {
+            "kind": "official-host-configured-model", "selector": route.selector,
+        },
+        "adapter_metadata": route.binding_metadata("high"),
+    }
+    route_bindings.validate_v2_binding(binding)
+    return ConversationContext(
+        worktree=worktree,
+        provider=route.provider,
+        model=route.selector,
+        effort="high",
+        route_binding=binding,
+        binding_digest=route_bindings.digest_json(binding),
+        conversation_id=conversation_id,
+        env=env,
+    )
 
 
 def _free_gateway_port() -> int:
@@ -392,6 +464,111 @@ def test_stock_two_shell_cross_surface_refusals_are_side_effect_free(
         assert _host_rpc(upstream_port, "session.history", {"sessionId": managed_id}) == history_before
         assert _protected_snapshot(database) == baseline
 
+        # A managed Browser/Sprint-shaped turn uses the real adapter and stock
+        # Host, not a manually-created managed-looking chat.  Its immutable
+        # binding, workspace membership, deterministic session ID, prompt,
+        # stream terminal, and lease release all cross production boundaries.
+        provider.requests.clear()
+        for key, value in bob.items():
+            monkeypatch.setenv(key, value)
+        managed_adapter = DeepSeekAdapter()
+        managed_context = _managed_context(
+            bob_worktree, bob, conversation_id="cross-surface-managed-turn"
+        )
+        try:
+            managed_turn = managed_adapter.start(managed_context, "managed gate prompt")
+            managed_events = list(managed_adapter.stream(managed_turn))
+        finally:
+            managed_adapter.close()
+        assert managed_events[-1].type == "run.completed"
+        assert managed_turn.session_ref == DeepSeekAdapter._new_session_ref(managed_context)
+        assert any("managed gate prompt" in json.dumps(request) for request in provider.requests)
+        managed_workspace = next(
+            row for row in _host_rpc(upstream_port, "workspace.list", {})["items"]
+            if row["path"] == str(bob_worktree)
+        )
+        assert managed_turn.session_ref in managed_workspace["sessionIds"]
+
+        # Recovery starts from the broker's persisted running shape after a
+        # real Host process loss.  Its production recovery context rebuilds
+        # Bob's authenticated identity; the broker's actual reconciliation
+        # loop may read history only after the adapter repeats every binding.
+        pre_restart = json.loads((root / "web-state.json").read_text())["web_pid"]
+        deepseek_web.stop(env=bob)
+
+        class RecoveryPreparer:
+            def recovery(self, _run: BrokerRun) -> ConversationContext:
+                return managed_context
+
+        recovery_conversation = "cv_" + uuid.uuid4().hex
+        con = sqlite3.connect(database)
+        try:
+            con.execute(
+                "INSERT INTO conversations (conversation_id,shell_id,owner_user_id,"
+                "harness,provider,model,effort,worktree,harness_session_ref,state,"
+                "creation_idempotency_key,creation_request_hash) "
+                "VALUES (?,?,?,?,?,?,?,?,?,'running',?,?)",
+                (
+                    recovery_conversation, 42, 1, "deepseek",
+                    managed_context.provider, managed_context.model,
+                    managed_context.effort, str(bob_worktree),
+                    managed_turn.session_ref, "cross-surface-recovery",
+                    "cross-surface-recovery-hash",
+                ),
+            )
+            recovery_message = int(con.execute(
+                "INSERT INTO conversation_messages (conversation_id,sender_kind,"
+                "sender_ref,message_kind,body,idempotency_key,request_hash,state) "
+                "VALUES (?,'user','42','prompt','recovery never prompts',?,?, 'running')",
+                (recovery_conversation, "cross-surface-recovery-message",
+                 "cross-surface-recovery-message-hash"),
+            ).lastrowid)
+            recovery_run_id = int(con.execute(
+                "INSERT INTO conversation_runs (conversation_id,shell_id,"
+                "trigger_message_id,harness_session_before,harness_session_after,"
+                "runner_ref,state,lease_owner,lease_expires_at,started_at) "
+                "VALUES (?,?,?,?,?,?, 'running','lost-broker','1970-01-01 00:00:00',"
+                "'1970-01-01 00:00:00')",
+                (
+                    recovery_conversation, 42, recovery_message,
+                    managed_turn.session_ref, managed_turn.session_ref,
+                    managed_turn.run_ref,
+                ),
+            ).lastrowid)
+            con.commit()
+        finally:
+            con.close()
+        broker = ConversationBroker(
+            database,
+            adapter_factory=lambda _harness: DeepSeekAdapter(),
+            launch_preparer=RecoveryPreparer(),  # type: ignore[arg-type]
+            recovery_seconds=0.01,
+        )
+        assert broker._recover(startup=True) == 1
+        assert broker.wait_idle(timeout=10)
+        con = sqlite3.connect(database)
+        try:
+            recovered = con.execute(
+                "SELECT state,error_code FROM conversation_runs WHERE run_id=?",
+                (recovery_run_id,),
+            ).fetchone()
+            recovery_events = con.execute(
+                "SELECT event_type FROM conversation_events WHERE run_id=? ORDER BY sequence",
+                (recovery_run_id,),
+            ).fetchall()
+        finally:
+            con.close()
+        assert recovered == ("succeeded", None)
+        assert recovery_events == [("run.completed",)]
+        post_restart = json.loads((root / "web-state.json").read_text())["web_pid"]
+        assert post_restart != pre_restart
+        assert _host_rpc(upstream_port, "session.history", {
+            "sessionId": managed_turn.session_ref,
+        })["events"]
+        recovered_service = deepseek_web.ensure(bob_worktree, env=bob)
+        generation = recovered_service["url"].split("sc_generation=", 1)[1]
+        cookie = _gateway_cookie(public_port, generation)
+
         # Stock DSH must actually execute a native-Web prompt against the
         # controlled provider.  A distinct native session coexists with the
         # reservation above and produces a real Host history boundary.
@@ -413,12 +590,27 @@ def test_stock_two_shell_cross_surface_refusals_are_side_effect_free(
             "provider": "deepseek-official", "model": "deepseek-v4-flash",
             "reasoningEffort": "high",
         }
+        provider.requests.clear()
+        provider.entered.clear()
+        provider.release.clear()
+        provider.hold = True
         status, accepted = _gateway_prompt(public_port, native_id, cookie=cookie)
         assert status == 200, accepted
         assert accepted["result"]["ok"] is True
+        assert provider.entered.wait(timeout=10)
+        # Closing admission while this accepted stock request is live cannot
+        # rotate Bob's credential to Alice.  The old generation stays current
+        # until terminal proof exists, so the retry is a busy refusal rather
+        # than a destructive cross-shell handoff.
+        with pytest.raises(deepseek_web.DeepSeekWebError, match="(GATEWAY_BUSY|IDENTITY_BUSY)"):
+            deepseek_web.ensure(alice_worktree, env=alice)
+        assert _gateway_prompt(public_port, native_id, cookie=cookie)[0] == 409
+        provider.release.set()
+        provider.hold = False
         deadline = threading.Event()
         for _ in range(100):
-            if provider.requests:
+            history = _host_rpc(upstream_port, "session.history", {"sessionId": native_id})
+            if any(event.get("event", {}).get("type") == "turn/end" for event in history["events"]):
                 break
             deadline.wait(0.05)
         # Stock DSH makes one agent completion and one generated-title request;
@@ -431,6 +623,13 @@ def test_stock_two_shell_cross_surface_refusals_are_side_effect_free(
             event.get("event", {}).get("type") == "turn/end"
             for event in native_history["events"]
         )
+        handed_after_web = deepseek_web.ensure(alice_worktree, env=alice)
+        assert handed_after_web["credential_shell"] == "ALICE"
+        status, stale_cookie = _gateway_prompt(public_port, native_id, cookie=cookie)
+        assert status == 409 and stale_cookie == {"error": "HARNESS_WEB_GENERATION_STALE"}
+        returned = deepseek_web.ensure(bob_worktree, env=bob)
+        generation = returned["url"].split("sc_generation=", 1)[1]
+        cookie = _gateway_cookie(public_port, generation)
 
         # A real public one-shot remains the owner through a live provider
         # stream.  Arrival from the other canonical shell is refused until the
@@ -521,7 +720,7 @@ def test_stock_two_shell_cross_surface_refusals_are_side_effect_free(
         })
         mismatched = DeepSeekAdapter()
         try:
-            with pytest.raises(AdapterError, match="SESSION_LOST"):
+            with pytest.raises(AdapterError, match="SESSION_WORKSPACE_MISMATCH"):
                 mismatched.inspect(
                     foreign_id, ConversationContext(worktree=bob_worktree, env=bob)
                 )
@@ -559,21 +758,23 @@ def test_stock_two_shell_cross_surface_refusals_are_side_effect_free(
             except OSError:
                 continue
             assert not any(value.encode() in payload for value in (*secrets, *capabilities)), path
-        # The only durable token rows are their canonical shell records.  The
-        # complete SQL image covers documents, metadata/events, transcripts,
-        # receipts, snapshots, and every other table without treating the
-        # legitimate authenticated API-key rows as a leak.
+        # The only durable token cells are their canonical shell records.  This
+        # is a table-aware sweep, not an SQL dump shortcut: every other cell in
+        # documents, metadata/events, transcripts, receipts, snapshots, and
+        # future persisted tables is examined independently.
         con = sqlite3.connect(database)
         try:
             shell_keys = con.execute(
                 "SELECT shell_id,api_key FROM shells ORDER BY shell_id"
             ).fetchall()
-            dump = "\n".join(con.iterdump())
         finally:
             con.close()
         assert shell_keys == [(41, ALICE_TOKEN), (42, BOB_TOKEN)]
-        assert PROVIDER_TOKEN not in dump
-        assert not any(value in dump for value in capabilities)
+        _assert_database_secrets_absent(
+            database,
+            secrets=(ALICE_TOKEN, BOB_TOKEN, PROVIDER_TOKEN),
+            capabilities=capabilities,
+        )
         output = capsys.readouterr()
         assert not any(value in output.out + output.err for value in (*secrets, *capabilities))
     finally:

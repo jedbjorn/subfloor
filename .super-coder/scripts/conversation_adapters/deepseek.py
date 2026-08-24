@@ -182,24 +182,22 @@ class DeepSeekAdapter(ConversationAdapter):
                 "HARNESS_WORKSPACE_BINDING_FAILED",
                 "DeepSeek recovery cannot find the canonical managed workspace",
             )
-        active = workspace.get("sessionIds") if isinstance(workspace, Mapping) else None
         archived = value.get("archivedSessionIds") if isinstance(value, Mapping) else None
-        if not isinstance(active, list) or session_ref not in active:
-            raise AdapterError(
-                "HARNESS_SESSION_LOST",
-                "DeepSeek recovery session is not actively accounted under its workspace",
-            )
         if not isinstance(archived, list):
             raise AdapterError(
                 "HARNESS_PROTOCOL_ERROR",
                 "DeepSeek Host returned invalid workspace archive state",
             )
-        if session_ref in archived:
-            raise AdapterError(
-                "HARNESS_SESSION_ARCHIVED",
-                "DeepSeek recovery session is archived in its workspace",
-            )
+        # Resolve the exact global row before classifying missing workspace
+        # membership.  A foreign workspace is identity corruption, not a lost
+        # history, and recovery must surface that distinction before history.
         self._require_resume_target(client, session_ref, worktree, workspace_id)
+        active = workspace.get("sessionIds") if isinstance(workspace, Mapping) else None
+        if not isinstance(active, list) or session_ref not in active:
+            raise AdapterError(
+                "HARNESS_SESSION_WORKSPACE_MISMATCH",
+                "DeepSeek recovery session is not actively accounted under its workspace",
+            )
 
     def _managed_session(self) -> tuple[str, str]:
         configured = self.manifest.get("conversation", {}).get("managed_session")

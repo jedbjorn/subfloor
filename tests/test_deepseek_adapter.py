@@ -786,8 +786,36 @@ def test_recovery_refuses_detached_session_before_history_or_prompt(tmp_path: Pa
     with pytest.raises(AdapterError) as refused:
         DeepSeekAdapter(client_factory=lambda: live).inspect(session, ctx)
 
-    assert refused.value.code == "HARNESS_SESSION_LOST"
-    assert [method for method, _ in live.calls] == ["workspace.list"]
+    assert refused.value.code == "HARNESS_SESSION_WORKSPACE_MISMATCH"
+    assert [method for method, _ in live.calls] == [
+        "workspace.list", "session.list", "workspace.list",
+    ]
+    assert "session.history" not in [method for method, _ in live.calls]
+    assert "session.prompt" not in [method for method, _ in live.calls]
+
+
+def test_recovery_classifies_foreign_workspace_as_mismatch_before_history(
+    tmp_path: Path,
+) -> None:
+    seed = FakeHost()
+    ctx = context(tmp_path, seed)
+    session = DeepSeekAdapter._new_session_ref(ctx)
+    foreign = tmp_path.parent / "foreign"
+    foreign.mkdir()
+    live = FakeHost(history=[{
+        "seq": 3, "type": "turn/end", "data": {"reason": {"kind": "completed"}},
+    }])
+    live.seed_session(session, str(foreign), workspace_id="ws-foreign")
+    live.workspaces["ws-1"] = {
+        "workspaceId": "ws-1", "path": str(tmp_path), "sessionIds": [],
+        "archivedSessionIds": [],
+    }
+
+    with pytest.raises(AdapterError) as refused:
+        DeepSeekAdapter(client_factory=lambda: live).inspect(session, ctx)
+
+    assert refused.value.code == "HARNESS_SESSION_WORKSPACE_MISMATCH"
+    assert [method for method, _ in live.calls] == ["workspace.list", "session.list"]
     assert "session.history" not in [method for method, _ in live.calls]
     assert "session.prompt" not in [method for method, _ in live.calls]
 
@@ -806,7 +834,9 @@ def test_recovery_refuses_archived_session_before_history_or_prompt(tmp_path: Pa
         DeepSeekAdapter(client_factory=lambda: live).inspect(session, ctx)
 
     assert refused.value.code == "HARNESS_SESSION_ARCHIVED"
-    assert [method for method, _ in live.calls] == ["workspace.list"]
+    assert [method for method, _ in live.calls] == [
+        "workspace.list", "session.list", "workspace.list",
+    ]
     assert "session.history" not in [method for method, _ in live.calls]
     assert "session.prompt" not in [method for method, _ in live.calls]
 
