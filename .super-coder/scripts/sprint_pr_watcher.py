@@ -1395,8 +1395,8 @@ class SprintPRWatcher:
             instructions = {
                 "red": "Your active Sprint PR went red; fix the failing checks.",
                 "green": (
-                    "Your active Sprint PR is green; pass the baton to review "
-                    "when ready."
+                    "Your active Sprint PR is green; judge readiness and pass "
+                    "the baton to review when ready."
                 ),
                 "closed": (
                     "Your active Sprint PR was closed without merge; tell the "

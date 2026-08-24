@@ -434,8 +434,8 @@ class RegistrationTest(SprintPRWatcherCase):
                     "re-enter",
                     "GitHub PR event: repository=acme/repo, number=42, head_sha="
                     + reopened_head
-                    + ", event=green. Your active Sprint PR is green; pass the "
-                    "baton to review when ready.",
+                    + ", event=green. Your active Sprint PR is green; judge "
+                    "readiness and pass the baton to review when ready.",
                 ),
             ],
             [
@@ -1289,8 +1289,8 @@ class RecoveryAndFailureTest(SprintPRWatcherCase):
         self.assertEqual(
             "GitHub PR event: repository=acme/repo, number=42, head_sha="
             + "a" * 40
-            + ", event=green. Your active Sprint PR is green; pass the baton "
-            "to review when ready.",
+            + ", event=green. Your active Sprint PR is green; judge readiness "
+            "and pass the baton to review when ready.",
             paused_message["body"],
         )
 
