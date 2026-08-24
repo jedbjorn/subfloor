@@ -1,11 +1,11 @@
 {
   "schema_version": 3,
-  "python_minimum": "3.10",
+  "python_minimum": "3.14",
   "carrier": {
     "protocol": "super-coder-deepseek-lifecycle-v1",
     "acquisition": "verified-source-build",
     "worker_path": "scripts/deepseek_carrier_worker.py",
-    "worker_sha256": "c75ad8ff34dd659a5d2d1c4727f619c599a0c18924269be82a1b5ca605d39c34"
+    "worker_sha256": "09a78cb3c6d33eb4df9856d9c7f77378887b748a30aa87abba90dc0cbb441c5f"
   },
   "source": {
     "repository": "https://github.com/deepseek-ai/deepseek-harness",

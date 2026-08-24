@@ -1,4 +1,4 @@
-# managed-by: subfloor — visual-qa shim v3
+# managed-by: subfloor — visual-qa shim v4
 # Edits are overwritten by `make update`. Delete the managed-by line to take
 # ownership; subfloor will then leave this file alone.
 name: Subfloor Visual QA
@@ -22,7 +22,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: "3.14"
       - uses: actions/setup-node@v4
         with:
           node-version: "22"

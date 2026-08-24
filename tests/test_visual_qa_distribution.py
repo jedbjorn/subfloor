@@ -25,11 +25,15 @@ class VisualQaTemplateTest(unittest.TestCase):
     def test_workflow_is_the_fixed_managed_shim(self):
         text = (TEMPLATES / "subfloor-visual-qa.yml").read_text()
 
-        self.assertTrue(text.startswith("# managed-by: subfloor — visual-qa shim v3\n"))
+        self.assertTrue(
+            text.startswith("# managed-by: subfloor — visual-qa shim v4\n")
+        )
         self.assertIn("pull_request:\n", text)
         self.assertIn("workflow_dispatch:\n", text)
         self.assertIn("contents: read\n", text)
         self.assertIn("pull-requests: write\n", text)
+        self.assertEqual(text.count('python-version: "3.14"'), 1)
+        self.assertNotIn('python-version: "3.12"', text)
         self.assertIn("group: subfloor-visual-qa-${{ github.ref }}", text)
         self.assertIn("test -s .sc-state/engine.ref", text)
         self.assertIn('checkout "$engine_ref" -- .super-coder', text)
@@ -224,7 +228,7 @@ class VisualQaUpdateTest(unittest.TestCase):
 
     def test_older_managed_workflow_is_refreshed_but_example_is_preserved(self):
         self.workflow.parent.mkdir(parents=True)
-        self.workflow.write_text("# managed-by: subfloor — visual-qa shim v2\nold\n")
+        self.workflow.write_text("# managed-by: subfloor — visual-qa shim v3\nold\n")
         self.example.parent.mkdir(parents=True)
         self.example.write_text("fork note\n")
 
@@ -252,14 +256,14 @@ class VisualQaUpdateTest(unittest.TestCase):
 
     def test_same_or_newer_managed_version_is_not_rewritten(self):
         self.workflow.parent.mkdir(parents=True)
-        self.workflow.write_text("# managed-by: subfloor — visual-qa shim v3\nfuture\n")
+        self.workflow.write_text("# managed-by: subfloor — visual-qa shim v4\nfuture\n")
         self.example.parent.mkdir(parents=True)
         self.example.write_text("existing\n")
 
         self.assertEqual(self.reconcile(), ("current", []))
         self.assertEqual(
             self.workflow.read_text(),
-            "# managed-by: subfloor — visual-qa shim v3\nfuture\n",
+            "# managed-by: subfloor — visual-qa shim v4\nfuture\n",
         )
         self.assertEqual(self.example.read_text(), "existing\n")
 

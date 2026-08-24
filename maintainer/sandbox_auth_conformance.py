@@ -554,7 +554,7 @@ class HostBackend:
         context.mkdir()
         (context / "github_known_hosts").write_bytes(trust_bytes)
         trust_digest = hashlib.sha256(trust_bytes).hexdigest()
-        dockerfile = f"""FROM python:3.12-slim
+        dockerfile = f"""FROM python:3.14-slim
 RUN apt-get update && apt-get install -y --no-install-recommends git gh openssh-client ca-certificates && rm -rf /var/lib/apt/lists/*
 COPY github_known_hosts /etc/ssh/ssh_known_hosts
 RUN install -d -m 0755 /etc/ssh/ssh_config.d && chmod 0644 /etc/ssh/ssh_known_hosts && printf '%s\\n' 'Host github.com' '    StrictHostKeyChecking yes' '    GlobalKnownHostsFile /etc/ssh/ssh_known_hosts' '    UserKnownHostsFile /dev/null' > /etc/ssh/ssh_config.d/99-super-coder-github.conf

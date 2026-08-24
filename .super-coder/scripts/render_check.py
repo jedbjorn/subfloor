@@ -185,15 +185,17 @@ def main() -> int:
             diagnostics = ""
             if LIVE_DB.is_file():
                 try:
-                    with closing(  # noqa: SIM117 -- Python 3.9 has no parenthesized with
-                        sqlite3.connect(f"file:{LIVE_DB}?mode=ro", uri=True)
-                    ) as live:
-                        with closing(sqlite3.connect(db)) as source:
-                            live.row_factory = sqlite3.Row
-                            source.row_factory = sqlite3.Row
-                            diagnostics = _document_source_diagnostics(
-                                source, live, drifted
-                            )
+                    with (
+                        closing(
+                            sqlite3.connect(f"file:{LIVE_DB}?mode=ro", uri=True)
+                        ) as live,
+                        closing(sqlite3.connect(db)) as source,
+                    ):
+                        live.row_factory = sqlite3.Row
+                        source.row_factory = sqlite3.Row
+                        diagnostics = _document_source_diagnostics(
+                            source, live, drifted
+                        )
                 except sqlite3.Error as exc:
                     diagnostics = f"  source-row diagnostics unavailable: {exc}"
             sys.stderr.write(

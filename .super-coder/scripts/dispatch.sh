@@ -72,7 +72,7 @@ sc_platform_unsupported() {
 }
 
 sc_python_recovery() {
-  echo '  recovery: install Python 3.9+ with sqlite3, then:' >&2
+  echo '  recovery: install Python 3.14.x with sqlite3, then:' >&2
   echo '            export SC_PYTHON=/absolute/path/to/python3' >&2
 }
 
@@ -95,8 +95,8 @@ import sys
 
 executable = os.path.realpath(sys.executable)
 version = platform.python_version()
-if sys.version_info < (3, 9):
-    print("Python 3.9+ required; {} reports {}".format(executable, version))
+if sys.version_info[:2] != (3, 14):
+    print("Python 3.14.x required; {} reports {}".format(executable, version))
     raise SystemExit(2)
 try:
     import sqlite3

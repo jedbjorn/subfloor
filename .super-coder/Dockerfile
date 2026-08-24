@@ -22,7 +22,7 @@
 #
 # The container runs as your uid (compose `user:`) with HOME=/home/<user> equal
 # to the host, so paths match host==container and Path.home() finds everything.
-ARG SC_PARENT_IMAGE=python:3.12-slim
+ARG SC_PARENT_IMAGE=python:3.14-slim
 FROM ${SC_PARENT_IMAGE}
 
 ARG SC_USER=j3d1

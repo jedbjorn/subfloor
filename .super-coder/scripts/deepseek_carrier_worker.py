@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Isolated DeepSeek SDK worker controlled by the Python 3.9 engine.
+"""Isolated DeepSeek SDK worker controlled by the Python 3.14 engine.
 
 The worker runs only under the pinned carrier interpreter. Its stdout is a
 small JSON-line protocol owned by super-coder; the official SDK owns the

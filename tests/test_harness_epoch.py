@@ -375,7 +375,7 @@ class ScFixture:
               image)
                 case " $* " in
                   *" --format "*) printf '%s\\n' "$SC_TEST_LABEL" ;;
-                  *" python:3.12-slim "*)
+                  *" python:3.14-slim "*)
                     printf '[{"Id":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","Config":{"Labels":{}}}]\\n' ;;
                   *) cat "$SC_TEST_IMAGE_STATE" ;;
                 esac
