@@ -55,11 +55,16 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
-      # pytest is the runner; test imports remain stdlib or engine-local.
-      - name: Install pytest
-        run: pip install pytest
+      # The test runner and the engine's pinned runtime dependencies.  The
+      # DeepSeek stock gate exercises the production WebSocket event stream.
+      - name: Install Python test and runtime dependencies
+        run: pip install pytest -r requirements.txt
       - name: Install exact OpenCode compatibility binary
         run: npm install --global opencode-ai@1.18.9
+      - name: Install exact DeepSeek Host contract binary
+        run: |-
+          npm install --global @deepseek-ai/dsh@0.1.1-rc.2
+          test "$(dsh --version)" = "0.1.1-rc.2"
       - name: Run the suite
         run: ./sc test tests/ -q
         env:

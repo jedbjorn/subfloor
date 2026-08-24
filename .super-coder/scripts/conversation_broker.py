@@ -1701,7 +1701,14 @@ class ConversationBroker(threading.Thread):
                 metadata={"recovered": True},
             )
             self._deliver_interrupt(active)
-            self._reconcile_loop(active, run.context())
+            recovery = getattr(self.launch_preparer, "recovery", None)
+            if run.harness == "deepseek" and not callable(recovery):
+                raise BrokerError(
+                    "HARNESS_SHELL_IDENTITY_UNAVAILABLE",
+                    "DeepSeek recovery requires canonical launch preparation",
+                )
+            context = recovery(run) if callable(recovery) else run.context()
+            self._reconcile_loop(active, context)
         except Exception as exc:
             # Store failures are loud in service stderr, but try to close the
             # durable run if its state still permits a conservative terminal.

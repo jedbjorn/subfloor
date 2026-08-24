@@ -1567,6 +1567,8 @@ def prepare_launch(*, shell_id: int, harness: "str | None" = None,
     env["SC_SHELL_FLAVOR"] = chosen["flavor"] or ""
     env["SC_API_TOKEN"] = full["api_key"] or ""
     env["SC_API_BASE"] = f"http://127.0.0.1:{api_port}" if api_port else ""
+    env["SC_SHELL_ID"] = str(chosen["shell_id"])
+    env["SC_SHELL_SHORTNAME"] = chosen["shortname"]
     env["SC_ENGINE_DIR"] = str(ENGINE)
     env["SC_HARNESS"] = harness
     env["SC_SHELL_WORKTREE"] = str(work_dir)
@@ -2103,6 +2105,7 @@ def main() -> None:
             **os.environ,
             **{k: str(v) for k, v in adapter.get("env", {}).items()},
             **sandbox_env,
+            "SC_SHELL_ID": str(chosen["shell_id"]),
             "SC_SHELL_SHORTNAME": chosen["shortname"],
             "SC_API_TOKEN": full["api_key"] or "",
             "SC_API_BASE": f"http://127.0.0.1:{api_port}" if api_port else "",
@@ -2113,7 +2116,9 @@ def main() -> None:
             sys.exit(f"session launch: {exc.code}: {exc.detail}")
         action = "reused" if service["reused"] else "started"
         print(f"→ DeepSeek Web: {action} for {work_dir}")
-        print(f"→ DeepSeek Web URL: {service['url']}")
+        # The host dispatcher consumes the generation capability through its
+        # owner-only handoff; never print it into the boot transcript.
+        print("→ DeepSeek Web browser handoff is ready")
         signal_browser_handoff(os.environ.get("SC_BROWSER_HANDOFF_ID"))
         return
 
@@ -2143,6 +2148,9 @@ def main() -> None:
     # branch-guard.sh reads it to exempt the admin shell (which works on main
     # by mandate); like SC_PROTECTED_BRANCHES it's a guardrail, not a boundary.
     env["SC_SHELL_FLAVOR"] = chosen["flavor"] or ""
+    # The final exec environment is the authority boundary for every public
+    # harness surface.  Never consume an inherited/deleted shell identity.
+    env["SC_SHELL_ID"] = str(chosen["shell_id"])
     env["SC_SHELL_SHORTNAME"] = chosen["shortname"]
     env["SC_API_TOKEN"] = full["api_key"] or ""
     env["SC_API_BASE"] = f"http://127.0.0.1:{api_port}" if api_port else ""

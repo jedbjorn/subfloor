@@ -319,6 +319,7 @@
     "tests/test_conversation_launch.py",
     "tests/test_conversation_schema.py",
     "tests/test_conversation_ui.py",
+    "tests/test_deepseek_cross_surface_gate.py",
     "tests/test_flavor_skill_packs.py",
     "tests/test_harness_epoch.py",
     "tests/test_live_model.py",

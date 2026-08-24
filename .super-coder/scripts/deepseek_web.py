@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """Own the fork-scoped official DeepSeek Web/Host service.
 
-The stock service stays on container/host loopback. Docker publishes a tiny
-engine-owned TCP relay to a deterministic host-loopback port; the relay rejects
-every peer except container loopback and the host gateway before connecting to
-dsh. State records PID start ticks before either child is trusted across calls.
+The stock service stays on container/host loopback. An engine-owned
+HTTP/WebSocket gateway publishes its deterministic host-loopback entry,
+generation-checking each browser connection before it reaches dsh. State
+records PID start ticks before either child is trusted across calls.
 """
 from __future__ import annotations
 
@@ -13,6 +13,7 @@ import asyncio
 import fcntl
 import json
 import os
+import re
 import shutil
 import signal
 import socket
@@ -21,6 +22,7 @@ import subprocess
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 import uuid
 from collections.abc import Mapping
@@ -39,6 +41,22 @@ START_TIMEOUT_SECONDS = 30.0
 STOP_TIMEOUT_SECONDS = 5.0
 HTTP_TIMEOUT_SECONDS = 2.0
 RELAY_POLICY = "host-gateway-only-v1"
+GENERATION_COOKIE = "sc_deepseek_generation"
+SESSION_MUTATION_FIELDS = {
+    "/api/session.create": ("sessionId",),
+    "/api/session.selectModel": ("sessionId",),
+    "/api/session.rename": ("sessionId",),
+    "/api/session.fork": ("sessionId",),
+    "/api/session.prompt": ("sessionId",),
+    "/api/session.updateQueue": ("sessionId",),
+    "/api/session.cancel": ("sessionId",),
+    "/api/subagent.prompt": ("parentSessionId",),
+    "/api/subagent.interrupt": ("parentSessionId",),
+    "/api/workspace.insertSessionBefore": ("sessionId", "beforeSessionId"),
+    "/api/workspace.archiveSession": ("sessionId",),
+}
+SESSION_MUTATION_PATHS = frozenset(SESSION_MUTATION_FIELDS)
+WORKSPACE_DELETE_PATH = "/api/workspace.delete"
 
 
 class DeepSeekWebError(RuntimeError):
@@ -48,6 +66,20 @@ class DeepSeekWebError(RuntimeError):
         self.code = code
         self.detail = detail
         super().__init__(f"{code}: {detail}")
+
+
+class ShellIdentityLease:
+    """Exclusive process-credential ownership for one DeepSeek execution."""
+
+    def __init__(self, handle) -> None:
+        self._handle = handle
+
+    def close(self) -> None:
+        if self._handle is None:
+            return
+        fcntl.flock(self._handle, fcntl.LOCK_UN)
+        self._handle.close()
+        self._handle = None
 
 
 def _state_path() -> Path:
@@ -63,6 +95,181 @@ def _log_path() -> Path:
 def _lock_path() -> Path:
     override = os.environ.get("SC_DEEPSEEK_WEB_LOCK")
     return Path(override) if override else LOCK
+
+
+def _identity_lock_path() -> Path:
+    return _state_path().with_name("deepseek-shell-identity.lock")
+
+
+def _unproven_path() -> Path:
+    return _state_path().with_name("deepseek-shell-identity-unproven.json")
+
+
+def _read_unproven() -> dict[str, Any] | None:
+    path = _unproven_path()
+    try:
+        if path.is_symlink() or path.stat().st_mode & 0o777 != 0o600:
+            raise OSError("unsafe unproven-work artifact")
+        value = json.loads(path.read_text())
+    except FileNotFoundError:
+        return None
+    except (OSError, json.JSONDecodeError) as exc:
+        raise DeepSeekWebError(
+            "HARNESS_SHELL_IDENTITY_BUSY",
+            "DeepSeek has unreadable unproven work; credential rotation is refused",
+        ) from exc
+    if not isinstance(value, Mapping):
+        raise DeepSeekWebError(
+            "HARNESS_SHELL_IDENTITY_BUSY",
+            "DeepSeek has invalid unproven work; credential rotation is refused",
+        )
+    session_id = value.get("session_id")
+    shell_id = value.get("shell_id")
+    shortname = value.get("shortname")
+    if (
+        not isinstance(session_id, str)
+        or re.fullmatch(r"sc-[0-9a-f]{32}", session_id) is None
+        or not isinstance(shell_id, int)
+        or shell_id <= 0
+        or not isinstance(shortname, str)
+        or not shortname
+    ):
+        raise DeepSeekWebError(
+            "HARNESS_SHELL_IDENTITY_BUSY",
+            "DeepSeek has invalid unproven work; credential rotation is refused",
+        )
+    return {"session_id": session_id, "shell_id": shell_id, "shortname": shortname}
+
+
+def mark_unproven_execution(env: Mapping[str, str], session_id: str) -> None:
+    shell_id = env.get("SC_SHELL_ID", "")
+    shortname = env.get("SC_SHELL_SHORTNAME", "")
+    if not shell_id.isdecimal() or int(shell_id) <= 0 or not shortname:
+        raise DeepSeekWebError(
+            "HARNESS_SHELL_IDENTITY_UNAVAILABLE",
+            "cannot preserve unproven DeepSeek work without canonical shell identity",
+        )
+    path = _unproven_path()
+    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        with os.fdopen(descriptor, "w") as handle:
+            os.fchmod(handle.fileno(), 0o600)
+            json.dump(
+                {
+                    "session_id": session_id,
+                    "shell_id": int(shell_id),
+                    "shortname": shortname,
+                },
+                handle,
+            )
+        os.replace(temporary, path)
+    except OSError:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+        raise
+
+
+def _clear_terminal_unproven(env: Mapping[str, str]) -> None:
+    marker = _read_unproven()
+    if marker is None:
+        return
+    if (
+        env.get("SC_SHELL_ID") != str(marker["shell_id"])
+        or env.get("SC_SHELL_SHORTNAME") != marker["shortname"]
+    ):
+        raise DeepSeekWebError(
+            "HARNESS_SHELL_IDENTITY_BUSY",
+            "another shell owns DeepSeek work without terminal proof",
+        )
+    state = _read_state()
+    service_port = state.get("service_port")
+    if not isinstance(service_port, int) or not _history_is_terminal(
+        service_port, marker["session_id"], 0
+    ):
+        raise DeepSeekWebError(
+            "HARNESS_SHELL_IDENTITY_BUSY",
+            "DeepSeek work has no terminal proof; credential rotation is refused",
+        )
+    try:
+        _unproven_path().unlink()
+    except FileNotFoundError:
+        pass
+
+
+def acquire_shell_identity(*, env: Mapping[str, str]) -> ShellIdentityLease:
+    """Acquire the full-lifetime Host identity lease or refuse before mutation."""
+    path = _identity_lock_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    handle = path.open("a+")
+    os.chmod(path, 0o600)
+    try:
+        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError as exc:
+        handle.close()
+        raise DeepSeekWebError(
+            "HARNESS_SHELL_IDENTITY_BUSY",
+            "another DeepSeek execution owns the shared Host credential",
+        ) from exc
+    try:
+        _clear_terminal_unproven(env)
+    except Exception:
+        fcntl.flock(handle, fcntl.LOCK_UN)
+        handle.close()
+        raise
+    return ShellIdentityLease(handle)
+
+
+def _verify_shell_identity(env: Mapping[str, str]) -> None:
+    token = env.get("SC_API_TOKEN", "")
+    api_base = env.get("SC_API_BASE", "")
+    shell_id = env.get("SC_SHELL_ID", "")
+    shortname = env.get("SC_SHELL_SHORTNAME", "")
+    present = tuple(bool(value) for value in (token, api_base, shell_id, shortname))
+    if not all(present):
+        raise DeepSeekWebError(
+            "HARNESS_SHELL_IDENTITY_UNAVAILABLE",
+            "DeepSeek requires complete canonical shell API wiring",
+        )
+    try:
+        expected_shell_id = int(shell_id)
+    except ValueError as exc:
+        raise DeepSeekWebError(
+            "HARNESS_SHELL_IDENTITY_UNAVAILABLE",
+            "DeepSeek shell identity has an invalid shell ID",
+        ) from exc
+    if expected_shell_id <= 0 or str(expected_shell_id) != shell_id:
+        raise DeepSeekWebError(
+            "HARNESS_SHELL_IDENTITY_UNAVAILABLE",
+            "DeepSeek shell identity has an invalid shell ID",
+        )
+    parsed = urllib.parse.urlsplit(api_base)
+    if parsed.scheme != "http" or parsed.hostname not in {"127.0.0.1", "localhost"}:
+        raise DeepSeekWebError(
+            "HARNESS_SHELL_IDENTITY_UNAVAILABLE",
+            "DeepSeek shell API must use a loopback endpoint",
+        )
+    request = urllib.request.Request(
+        api_base.rstrip("/") + "/_sc/mem/whoami",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=HTTP_TIMEOUT_SECONDS) as response:
+            payload = json.loads(response.read())
+    except (OSError, urllib.error.URLError, json.JSONDecodeError) as exc:
+        raise DeepSeekWebError(
+            "HARNESS_SHELL_IDENTITY_UNAVAILABLE",
+            "DeepSeek shell API identity could not be authenticated",
+        ) from exc
+    resolved_id = payload.get("shell_id") if isinstance(payload, Mapping) else None
+    resolved_name = payload.get("shortname") if isinstance(payload, Mapping) else None
+    if resolved_id != expected_shell_id or resolved_name != shortname:
+        raise DeepSeekWebError(
+            "HARNESS_SHELL_IDENTITY_MISMATCH",
+            "DeepSeek shell API identity disagrees with the prepared shell",
+        )
 
 
 @contextmanager
@@ -236,15 +443,30 @@ def _worktree(path: Path) -> Path:
 
 
 def _post_workspace(port: int, worktree: Path) -> dict[str, Any]:
+    value = _host_rpc(port, "workspace.create", {"path": str(worktree)})
+    workspace = value.get("workspace") if isinstance(value, dict) else None
+    returned_path = workspace.get("path") if isinstance(workspace, dict) else None
+    if returned_path is None or Path(returned_path).resolve() != worktree:
+        raise DeepSeekWebError(
+            "HARNESS_WORKTREE_MISMATCH",
+            "workspace.create did not return the selected worktree",
+        )
+    return {
+        "workspace_id": workspace.get("workspaceId"),
+        "workspace_created": bool(value.get("created")),
+    }
+
+
+def _host_rpc(port: int, method: str, rpc_payload: Mapping[str, Any]) -> Mapping[str, Any]:
     rpc_id = str(uuid.uuid4())
     body = {
         "type": "client-request",
         "rpcId": rpc_id,
-        "method": "workspace.create",
-        "payload": {"path": str(worktree)},
+        "method": method,
+        "payload": dict(rpc_payload),
     }
     request = urllib.request.Request(
-        f"http://127.0.0.1:{port}/api/workspace.create",
+        f"http://127.0.0.1:{port}/api/{method}",
         data=json.dumps(body).encode(),
         headers={
             "Content-Type": "application/json",
@@ -257,32 +479,26 @@ def _post_workspace(port: int, worktree: Path) -> dict[str, Any]:
             payload = json.loads(response.read())
     except (OSError, urllib.error.URLError, json.JSONDecodeError) as exc:
         raise DeepSeekWebError(
-            "HARNESS_WORKSPACE_REGISTRATION_FAILED",
-            f"official Host rejected the selected worktree: {exc}",
+            "HARNESS_WEB_GATEWAY_BUSY",
+            f"official Host did not prove browser work terminal: {exc}",
         ) from exc
     if payload.get("rpcId") != rpc_id:
         raise DeepSeekWebError(
-            "HARNESS_PROTOCOL_ERROR", "workspace.create returned a mismatched rpcId"
+            "HARNESS_PROTOCOL_ERROR", f"{method} returned a mismatched rpcId"
         )
     result = payload.get("result")
     if not isinstance(result, dict) or result.get("ok") is not True:
         error = result.get("error") if isinstance(result, dict) else None
         raise DeepSeekWebError(
-            "HARNESS_WORKSPACE_REGISTRATION_FAILED",
-            f"workspace.create failed: {error or 'invalid response'}",
+            "HARNESS_WEB_GATEWAY_BUSY",
+            f"{method} did not prove browser work terminal: {error or 'invalid response'}",
         )
     value = result.get("value")
-    workspace = value.get("workspace") if isinstance(value, dict) else None
-    returned_path = workspace.get("path") if isinstance(workspace, dict) else None
-    if returned_path is None or Path(returned_path).resolve() != worktree:
+    if not isinstance(value, Mapping):
         raise DeepSeekWebError(
-            "HARNESS_WORKTREE_MISMATCH",
-            "workspace.create did not return the selected worktree",
+            "HARNESS_PROTOCOL_ERROR", f"{method} returned no value"
         )
-    return {
-        "workspace_id": workspace.get("workspaceId"),
-        "workspace_created": bool(value.get("created")),
-    }
+    return value
 
 
 def _spawn(
@@ -317,22 +533,61 @@ def _terminate_verified(state: Mapping[str, Any], prefix: str) -> bool:
     ticks = state.get(f"{prefix}_start_ticks")
     identity = "web" if prefix == "web" else "relay"
     if not _verified_process(pid, ticks, identity):
-        return False
-    os.kill(pid, signal.SIGTERM)
+        return True
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return True
     deadline = time.monotonic() + STOP_TIMEOUT_SECONDS
     while time.monotonic() < deadline:
         if not _verified_process(pid, ticks, identity):
             return True
         time.sleep(0.05)
-    if _verified_process(pid, ticks, identity):
+    if not _verified_process(pid, ticks, identity):
+        return True
+    try:
         os.kill(pid, signal.SIGKILL)
-    return True
+    except ProcessLookupError:
+        return True
+    return not _verified_process(pid, ticks, identity)
 
 
 def _stop_unlocked() -> dict[str, Any]:
     state = _read_state()
+    # A crashed service can leave its state record behind without ever having
+    # initialized gateway activity.  When neither recorded process survives
+    # its start-ticks proof, there is no credentialed execution to drain; clear
+    # that dead record so the next owner can start.  A partially live service
+    # remains fail-closed below because it might still own accepted work.
+    if state and not _activity_path().exists() and not any(
+        _verified_process(
+            state.get(f"{prefix}_pid"), state.get(f"{prefix}_start_ticks"),
+            "web" if prefix == "web" else "relay",
+        )
+        for prefix in ("web", "relay")
+    ):
+        state = {}
+    activity = _close_gateway_admission(state)
+    if not _drain_gateway_work(state, activity):
+        raise DeepSeekWebError(
+            "HARNESS_WEB_GATEWAY_BUSY",
+            "DeepSeek Web has accepted browser work without terminal proof",
+        )
+    # The gateway owns browser admission. It must be gone before the upstream
+    # Host or its owner-only credential can be replaced. SIGTERM cancels every
+    # accepted relay task; an unproven cancellation blocks rotation.
     relay_stopped = _terminate_verified(state, "relay")
+    if not relay_stopped:
+        raise DeepSeekWebError(
+            "HARNESS_WEB_GATEWAY_BUSY",
+            "DeepSeek Web gateway could not quiesce accepted browser work",
+        )
     web_stopped = _terminate_verified(state, "web")
+    if not web_stopped:
+        raise DeepSeekWebError(
+            "HARNESS_SERVICE_STOP_FAILED",
+            "official dsh Web could not stop after gateway quiescence",
+        )
     try:
         _state_path().unlink()
     except FileNotFoundError:
@@ -341,18 +596,436 @@ def _stop_unlocked() -> dict[str, Any]:
         _credential_path().unlink()
     except FileNotFoundError:
         pass
-    return {"stopped": web_stopped or relay_stopped, "web": web_stopped, "relay": relay_stopped}
+    try:
+        _generation_path().unlink()
+    except FileNotFoundError:
+        pass
+    try:
+        _reservation_path().unlink()
+    except FileNotFoundError:
+        pass
+    try:
+        _activity_path().unlink()
+    except FileNotFoundError:
+        pass
+    return {"stopped": bool(state), "web": web_stopped, "relay": relay_stopped}
 
 
 def _credential_path() -> Path:
     return _state_path().with_name("deepseek-shell-api.json")
 
 
-def _write_shell_credential(env: Mapping[str, str]) -> tuple[Path, str] | None:
+def _generation_path() -> Path:
+    return _state_path().with_name("deepseek-web-generation.json")
+
+
+def _reservation_path() -> Path:
+    return _state_path().with_name("deepseek-managed-session.json")
+
+
+def _activity_path() -> Path:
+    return _state_path().with_name("deepseek-web-activity.json")
+
+
+def _gateway_lock_path() -> Path:
+    return _state_path().with_name("deepseek-web-gateway.lock")
+
+
+@contextmanager
+def _gateway_lock():
+    path = _gateway_lock_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a+") as handle:
+        os.chmod(path, 0o600)
+        fcntl.flock(handle, fcntl.LOCK_EX)
+        yield
+
+
+async def _acquire_gateway_forward_lock():
+    """Acquire the cross-process gate without blocking the relay event loop."""
+    path = _gateway_lock_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    handle = path.open("a+")
+    try:
+        os.chmod(path, 0o600)
+        while True:
+            try:
+                fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return handle
+            except BlockingIOError:
+                await asyncio.sleep(0.01)
+    except BaseException:
+        handle.close()
+        raise
+
+
+def _release_gateway_forward_lock(handle) -> None:
+    fcntl.flock(handle, fcntl.LOCK_UN)
+    handle.close()
+
+
+def _activity_error(detail: str) -> DeepSeekWebError:
+    return DeepSeekWebError("HARNESS_WEB_GATEWAY_BUSY", detail)
+
+
+def _browser_session_id(value: object) -> str | None:
+    """Accept only a bounded opaque stock-Web session reference.
+
+    Native DSH creates browser chats as ``session-<UUID>`` while managed
+    Subfloor conversations use ``sc-<hex>``.  Activity is an observation of
+    stock browser work, not a managed-session identity artifact, so it must
+    preserve either safe upstream form.  The reservation artifact remains
+    intentionally stricter below.
+    """
+    if (
+        isinstance(value, str)
+        and 1 <= len(value) <= 128
+        and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]*", value)
+    ):
+        return value
+    return None
+
+
+def _read_activity(*, required: bool) -> dict[str, Any]:
+    path = _activity_path()
+    try:
+        if path.is_symlink() or path.stat().st_mode & 0o777 != 0o600:
+            raise OSError("unsafe activity artifact")
+        value = json.loads(path.read_text())
+    except FileNotFoundError:
+        if not required:
+            return {"admission": "open", "requests": {}}
+        raise _activity_error("DeepSeek Web activity evidence is unavailable") from None
+    except (OSError, json.JSONDecodeError) as exc:
+        raise _activity_error("DeepSeek Web activity evidence is unreadable") from exc
+    if not isinstance(value, Mapping) or value.get("admission") not in {"open", "closed"}:
+        raise _activity_error("DeepSeek Web activity evidence is invalid")
+    requests = value.get("requests")
+    if not isinstance(requests, Mapping):
+        raise _activity_error("DeepSeek Web activity requests are invalid")
+    checked: dict[str, dict[str, Any]] = {}
+    for request_id, record in requests.items():
+        if not isinstance(request_id, str) or not isinstance(record, Mapping):
+            raise _activity_error("DeepSeek Web activity requests are invalid")
+        session_id = record.get("session_id")
+        boundary = record.get("boundary")
+        if (
+            _browser_session_id(session_id) is None
+            or not isinstance(boundary, int)
+            or isinstance(boundary, bool)
+            or boundary < 0
+        ):
+            raise _activity_error("DeepSeek Web activity requests are invalid")
+        status = record.get("status")
+        if status not in {"pending", "accepted"}:
+            raise _activity_error("DeepSeek Web activity requests are invalid")
+        checked[request_id] = {
+            "session_id": session_id,
+            "boundary": boundary,
+            "status": status,
+        }
+    return {"admission": value["admission"], "requests": checked}
+
+
+def _write_activity(value: Mapping[str, Any]) -> None:
+    path = _activity_path()
+    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(descriptor, "w") as handle:
+            os.fchmod(handle.fileno(), 0o600)
+            json.dump(dict(value), handle, sort_keys=True)
+            handle.write("\n")
+        os.replace(temporary, path)
+    except OSError:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+        raise
+
+
+def _initialize_activity() -> None:
+    with _gateway_lock():
+        _write_activity({"admission": "open", "requests": {}})
+        _write_reservation(None)
+
+
+def _history_boundary(service_port: int, session_id: str) -> int:
+    try:
+        result = _host_rpc(service_port, "session.history", {"sessionId": session_id})
+    except DeepSeekWebError:
+        raise
+    events = result.get("events") if isinstance(result, Mapping) else None
+    if not isinstance(events, list):
+        raise _activity_error("DeepSeek Web could not read browser session history")
+    sequence = [
+        event.get("event", {}).get("seq")
+        for event in events
+        if isinstance(event, Mapping)
+        and isinstance(event.get("event"), Mapping)
+        and isinstance(event["event"].get("seq"), int)
+        and not isinstance(event["event"].get("seq"), bool)
+    ]
+    return max(sequence, default=-1) + 1
+
+
+def _history_is_terminal(service_port: int, session_id: str, boundary: int) -> bool:
+    try:
+        result = _host_rpc(service_port, "session.history", {"sessionId": session_id})
+    except DeepSeekWebError:
+        return False
+    events = result.get("events") if isinstance(result, Mapping) else None
+    if not isinstance(events, list):
+        return False
+    for envelope in reversed(events):
+        event = envelope.get("event") if isinstance(envelope, Mapping) else None
+        if (
+            not isinstance(event, Mapping)
+            or event.get("type") != "turn/end"
+            or not isinstance(event.get("seq"), int)
+            or event["seq"] < boundary
+        ):
+            continue
+        reason = event.get("data")
+        return isinstance(reason, Mapping) and isinstance(reason.get("reason"), Mapping)
+    return False
+
+
+def _close_gateway_admission(state: Mapping[str, Any]) -> dict[str, Any]:
+    if not state:
+        return {"admission": "closed", "requests": {}}
+    with _gateway_lock():
+        activity = _read_activity(required=True)
+        activity["admission"] = "closed"
+        _write_activity(activity)
+        return activity
+
+
+def _drain_gateway_work(state: Mapping[str, Any], activity: Mapping[str, Any]) -> bool:
+    requests = activity.get("requests")
+    if not isinstance(requests, Mapping):
+        return False
+    if not requests:
+        return True
+    service_port = state.get("service_port")
+    if not isinstance(service_port, int):
+        return False
+    pending = {
+        request_id: record
+        for request_id, record in requests.items()
+        if not isinstance(record, Mapping)
+        or record.get("status") != "accepted"
+        or not _history_is_terminal(
+            service_port,
+            str(record.get("session_id")),
+            int(record.get("boundary", -1)),
+        )
+    }
+    with _gateway_lock():
+        current = _read_activity(required=True)
+        if current.get("admission") != "closed":
+            return False
+        current["requests"] = pending
+        _write_activity(current)
+    return not pending
+
+
+def _active_browser_requests(
+    service_port: int, requests: Mapping[str, Mapping[str, Any]]
+) -> dict[str, Mapping[str, Any]]:
+    """Retain only browser work whose matching terminal proof is absent."""
+    return {
+        request_id: record
+        for request_id, record in requests.items()
+        if record.get("status") != "accepted"
+        or not _history_is_terminal(
+            service_port, str(record["session_id"]), int(record["boundary"])
+        )
+    }
+
+
+def _workspace_contains_session(
+    service_port: int, workspace_id: object, session_id: str
+) -> bool:
+    if not isinstance(workspace_id, str) or not workspace_id:
+        raise _activity_error("DeepSeek Web workspace identity is invalid")
+    value = _host_rpc(service_port, "workspace.list", {})
+    rows = value.get("items") if isinstance(value, Mapping) else None
+    if not isinstance(rows, list):
+        raise _activity_error("DeepSeek Web could not confirm workspace membership")
+    workspace = next(
+        (
+            row
+            for row in rows
+            if isinstance(row, Mapping) and row.get("workspaceId") == workspace_id
+        ),
+        None,
+    )
+    if workspace is None:
+        return False
+    session_ids = workspace.get("sessionIds")
+    if not isinstance(session_ids, list):
+        raise _activity_error("DeepSeek Web workspace membership is invalid")
+    return session_id in session_ids
+
+
+def _record_browser_prompt_locked(service_port: int, session_id: str) -> str:
+    if _browser_session_id(session_id) is None:
+        raise _activity_error("DeepSeek Web browser session identity is invalid")
+    activity = _read_activity(required=True)
+    if activity["admission"] != "open":
+        raise _activity_error("DeepSeek Web is closing browser admission")
+    if session_id == _reserved_session():
+        raise DeepSeekWebError(
+            "HARNESS_WEB_SESSION_BUSY",
+            "a managed DeepSeek turn owns this native session",
+        )
+    activity["requests"] = _active_browser_requests(
+        service_port, activity["requests"]
+    )
+    if any(record["session_id"] == session_id for record in activity["requests"].values()):
+        raise DeepSeekWebError(
+            "HARNESS_WEB_SESSION_BUSY",
+            "native Web already owns an accepted or pending prompt for this session",
+        )
+    request_id = uuid.uuid4().hex
+    activity["requests"][request_id] = {
+        "session_id": session_id,
+        "boundary": _history_boundary(service_port, session_id),
+        "status": "pending",
+    }
+    _write_activity(activity)
+    return request_id
+
+
+def _record_browser_prompt(service_port: int, session_id: str) -> str:
+    with _gateway_lock():
+        return _record_browser_prompt_locked(service_port, session_id)
+
+
+def _settle_browser_prompt(request_id: str, *, accepted: bool) -> None:
+    with _gateway_lock():
+        activity = _read_activity(required=True)
+        record = activity["requests"].get(request_id)
+        if record is None:
+            raise _activity_error("DeepSeek Web prompt evidence disappeared")
+        if accepted:
+            record["status"] = "accepted"
+        else:
+            del activity["requests"][request_id]
+        _write_activity(activity)
+
+
+def reserve_managed_session(session_id: str) -> None:
+    """Publish the sole managed prompt owner for the native-Web gateway."""
+    if re.fullmatch(r"sc-[0-9a-f]{32}", session_id) is None:
+        raise DeepSeekWebError(
+            "HARNESS_SESSION_INVALID", "managed DeepSeek session identity is invalid"
+        )
+    with _gateway_lock():
+        activity = _read_activity(required=True)
+        state = _read_state()
+        service_port = state.get("service_port")
+        if not isinstance(service_port, int):
+            raise _activity_error("DeepSeek Web service state is unavailable")
+        active = _active_browser_requests(service_port, activity["requests"])
+        if any(record["session_id"] == session_id for record in active.values()):
+            raise DeepSeekWebError(
+                "HARNESS_WEB_SESSION_BUSY",
+                "native Web has accepted browser work for this managed session",
+            )
+        activity["requests"] = active
+        _write_activity(activity)
+        _write_reservation(session_id)
+
+
+def release_managed_session(session_id: str) -> None:
+    with _gateway_lock():
+        if _reserved_session() == session_id:
+            _write_reservation(None)
+
+
+def _write_reservation(session_id: str | None) -> None:
+    path = _reservation_path()
+    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        with os.fdopen(descriptor, "w") as handle:
+            os.fchmod(handle.fileno(), 0o600)
+            json.dump({"session_id": session_id}, handle)
+            handle.write("\n")
+        os.replace(temporary, path)
+    except OSError:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+        raise
+
+
+def _reserved_session() -> str | None:
+    try:
+        path = _reservation_path()
+        if path.is_symlink() or path.stat().st_mode & 0o777 != 0o600:
+            raise OSError("unsafe managed-session reservation")
+        value = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        raise _activity_error("DeepSeek Web managed-session reservation is unavailable") from exc
+    session_id = value.get("session_id") if isinstance(value, Mapping) else None
+    if session_id is None:
+        return None
+    if re.fullmatch(r"sc-[0-9a-f]{32}", session_id) is None:
+        raise _activity_error("DeepSeek Web managed-session reservation is invalid")
+    return session_id
+
+
+def _write_generation() -> str:
+    """Mint the relay-only capability without serializing it into service state."""
+    token = uuid.uuid4().hex + uuid.uuid4().hex
+    path = _generation_path()
+    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(descriptor, "w") as handle:
+            os.fchmod(handle.fileno(), 0o600)
+            json.dump({"generation": token}, handle)
+            handle.write("\n")
+        os.replace(temporary, path)
+    except OSError:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+        raise
+    return token
+
+
+def _read_generation(path: Path) -> str:
+    try:
+        if path.is_symlink() or path.stat().st_mode & 0o777 != 0o600:
+            raise OSError("unsafe generation artifact")
+        value = json.loads(path.read_text())
+        token = value.get("generation") if isinstance(value, Mapping) else None
+    except (OSError, json.JSONDecodeError) as exc:
+        raise DeepSeekWebError(
+            "HARNESS_WEB_GENERATION_STALE",
+            "DeepSeek Web generation is unavailable",
+        ) from exc
+    if not isinstance(token, str) or re.fullmatch(r"[0-9a-f]{64}", token) is None:
+        raise DeepSeekWebError(
+            "HARNESS_WEB_GENERATION_STALE",
+            "DeepSeek Web generation is invalid",
+        )
+    return token
+
+
+def _write_shell_credential(env: Mapping[str, str]) -> tuple[Path, str, int] | None:
     token = env.get("SC_API_TOKEN", "")
     api_base = env.get("SC_API_BASE", "")
+    shell_id = env.get("SC_SHELL_ID", "")
     shortname = env.get("SC_SHELL_SHORTNAME", "")
-    present = tuple(bool(value) for value in (token, api_base, shortname))
+    present = tuple(bool(value) for value in (token, api_base, shell_id, shortname))
     if not any(present):
         return None
     if not all(present):
@@ -367,7 +1040,15 @@ def _write_shell_credential(env: Mapping[str, str]) -> tuple[Path, str] | None:
         descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         with os.fdopen(descriptor, "w") as handle:
             os.fchmod(handle.fileno(), 0o600)
-            json.dump({"shortname": shortname, "api_base": api_base, "token": token}, handle)
+            json.dump(
+                {
+                    "shell_id": int(shell_id),
+                    "shortname": shortname,
+                    "api_base": api_base,
+                    "token": token,
+                },
+                handle,
+            )
             handle.write("\n")
         os.replace(temporary, path)
     except OSError:
@@ -376,12 +1057,19 @@ def _write_shell_credential(env: Mapping[str, str]) -> tuple[Path, str] | None:
         except FileNotFoundError:
             pass
         raise
-    return path, shortname
+    return path, shortname, int(shell_id)
 
 
-def stop() -> dict[str, Any]:
-    with _service_lock():
-        return _stop_unlocked()
+def stop(*, env: Mapping[str, str] | None = None) -> dict[str, Any]:
+    """Stop only while holding the same identity lease as every acting path."""
+    env = os.environ if env is None else env
+    lease = acquire_shell_identity(env=env)
+    try:
+        _verify_shell_identity(env)
+        with _service_lock():
+            return _stop_unlocked()
+    finally:
+        lease.close()
 
 
 def _existing_healthy(
@@ -389,23 +1077,28 @@ def _existing_healthy(
     service_port: int,
     relay_port: int,
     *,
-    sandbox: bool,
+    listen_host: str,
     allowed_peers: tuple[str, ...],
     credential_shell: str | None,
+    credential_shell_id: int | None,
 ) -> bool:
+    if state.get("schema_version") != 3:
+        return False
     if state.get("service_port") != service_port:
         return False
     if not _verified_process(state.get("web_pid"), state.get("web_start_ticks"), "web"):
         return False
     if not _http_ready(service_port):
         return False
-    if state.get("credential_shell") != credential_shell:
+    if (
+        state.get("credential_shell") != credential_shell
+        or state.get("credential_shell_id") != credential_shell_id
+    ):
         return False
-    if not sandbox:
-        return True
     return (
         state.get("relay_port") == relay_port
         and state.get("relay_policy") == RELAY_POLICY
+        and state.get("relay_listen_host") == listen_host
         and state.get("relay_allowed_peers") == list(allowed_peers)
         and _verified_process(
             state.get("relay_pid"), state.get("relay_start_ticks"), "relay"
@@ -414,29 +1107,60 @@ def _existing_healthy(
     )
 
 
-def ensure(worktree: Path, *, env: Mapping[str, str] | None = None) -> dict[str, Any]:
+def _relay_configuration(*, sandbox: bool) -> tuple[str, tuple[str, ...]]:
+    """Keep the engine gateway at the browser-facing boundary in every mode."""
+    if sandbox:
+        return "0.0.0.0", _relay_allowed_peers()
+    return "127.0.0.1", ("127.0.0.1",)
+
+
+def ensure(
+    worktree: Path,
+    *,
+    env: Mapping[str, str] | None = None,
+    identity_lease: ShellIdentityLease | None = None,
+    register_workspace: bool = True,
+) -> dict[str, Any]:
     env = os.environ if env is None else env
+    if identity_lease is None:
+        lease = acquire_shell_identity(env=env)
+        try:
+            return ensure(
+                worktree,
+                env=env,
+                identity_lease=lease,
+                register_workspace=register_workspace,
+            )
+        finally:
+            lease.close()
+    _verify_shell_identity(env)
     with _service_lock():
         if _disabled(env):
             _stop_unlocked()
             raise DeepSeekWebError("HARNESS_DISABLED", "DeepSeek is disabled")
         selected = _worktree(worktree)
         config = ports.resolve(persist=True)
-        service_port = _service_port(config, env)
-        relay_port = service_port + ports.DEEPSEEK_RELAY_OFFSET
-        url = f"http://127.0.0.1:{service_port}"
-        state = _read_state()
+        public_port = _service_port(config, env)
+        # Docker maps the fixed host entry to the sandbox gateway port. On a
+        # bare host the gateway itself owns that fixed entry and stock dsh
+        # moves to the private offset instead. The browser URL never changes.
         sandbox = bool(env.get("SC_SANDBOX"))
-        allowed_peers = _relay_allowed_peers() if sandbox else ()
+        service_port = public_port if sandbox else public_port + ports.DEEPSEEK_RELAY_OFFSET
+        relay_port = service_port + ports.DEEPSEEK_RELAY_OFFSET if sandbox else public_port
+        state = _read_state()
+        listen_host, allowed_peers = _relay_configuration(sandbox=sandbox)
         credential_shell = env.get("SC_SHELL_SHORTNAME") or None
+        credential_shell_id = int(env["SC_SHELL_ID"])
         reused = _existing_healthy(
             state,
             service_port,
             relay_port,
-            sandbox=sandbox,
+            listen_host=listen_host,
             allowed_peers=allowed_peers,
             credential_shell=credential_shell,
+            credential_shell_id=credential_shell_id,
         )
+        generation = None
         if not reused:
             _stop_unlocked()
             executable = shutil.which("dsh")
@@ -448,7 +1172,7 @@ def ensure(worktree: Path, *, env: Mapping[str, str] | None = None) -> dict[str,
             credential = _write_shell_credential(env)
             web_env = dict(env)
             if credential is not None:
-                credential_file, credential_shell = credential
+                credential_file, credential_shell, credential_shell_id = credential
                 web_env.pop("SC_API_TOKEN", None)
                 web_env.pop("SC_API_BASE", None)
                 web_env["SC_MEM_CREDENTIAL_FILE"] = str(credential_file)
@@ -467,15 +1191,17 @@ def ensure(worktree: Path, *, env: Mapping[str, str] | None = None) -> dict[str,
                 env=web_env,
             )
             state = {
-                "schema_version": 1,
+                "schema_version": 3,
                 "web_pid": web_pid,
                 "web_start_ticks": web_ticks,
                 "service_port": service_port,
-                "relay_port": relay_port if sandbox else None,
-                "relay_policy": RELAY_POLICY if sandbox else None,
+                "relay_port": relay_port,
+                "relay_policy": RELAY_POLICY,
+                "relay_listen_host": listen_host,
                 "relay_allowed_peers": list(allowed_peers),
-                "url": url,
+                "url": f"http://127.0.0.1:{public_port}",
                 "credential_shell": credential_shell,
+                "credential_shell_id": credential_shell_id,
             }
             _write_state(state)
             if not _wait_ready(lambda: _http_ready(service_port)):
@@ -484,39 +1210,56 @@ def ensure(worktree: Path, *, env: Mapping[str, str] | None = None) -> dict[str,
                     "HARNESS_SERVICE_UNAVAILABLE",
                     f"official dsh Web did not become ready; inspect {_log_path()}",
                 )
-            if sandbox:
-                relay_pid, relay_ticks = _spawn(
-                    [
-                        sys.executable,
-                        str(Path(__file__).resolve()),
-                        "relay",
-                        *[
-                            item
-                            for peer in allowed_peers
-                            for item in ("--allowed-peer", peer)
-                        ],
-                        "--listen-port",
-                        str(relay_port),
-                        "--target-port",
-                        str(service_port),
+            generation = _write_generation()
+            # The relay never calls the engine API.  Give it no shell
+            # credential: inheriting the launcher environment would expose the
+            # API token through the relay's process environment even though the
+            # stock Host correctly receives only the owner-only artifact.
+            relay_env = dict(os.environ)
+            relay_env.pop("SC_API_TOKEN", None)
+            relay_env.pop("SC_API_BASE", None)
+            relay_pid, relay_ticks = _spawn(
+                [
+                    sys.executable,
+                    str(Path(__file__).resolve()),
+                    "relay",
+                    "--listen-host",
+                    listen_host,
+                    *[
+                        item
+                        for peer in allowed_peers
+                        for item in ("--allowed-peer", peer)
                     ],
-                    cwd=REPO_ROOT,
-                    log=_log_path(),
+                    "--listen-port",
+                    str(relay_port),
+                    "--target-port",
+                    str(service_port),
+                    "--generation-file",
+                    str(_generation_path()),
+                ],
+                cwd=REPO_ROOT,
+                log=_log_path(),
+                env=relay_env,
+            )
+            state.update(
+                {"relay_pid": relay_pid, "relay_start_ticks": relay_ticks}
+            )
+            _write_state(state)
+            _initialize_activity()
+            if not _wait_ready(lambda: _tcp_ready("127.0.0.1", relay_port)):
+                _stop_unlocked()
+                raise DeepSeekWebError(
+                    "HARNESS_SERVICE_UNAVAILABLE",
+                    "DeepSeek loopback publication relay did not become ready",
                 )
-                state.update(
-                    {"relay_pid": relay_pid, "relay_start_ticks": relay_ticks}
-                )
-                _write_state(state)
-                if not _wait_ready(lambda: _tcp_ready("127.0.0.1", relay_port)):
-                    _stop_unlocked()
-                    raise DeepSeekWebError(
-                        "HARNESS_SERVICE_UNAVAILABLE",
-                        "DeepSeek loopback publication relay did not become ready",
-                    )
         elif credential_shell is not None:
             # Repair a missing/stale artifact (for example after shell-key
             # rotation) without restarting an otherwise healthy same-shell Host.
             _write_shell_credential(env)
+        generation = generation or _read_generation(_generation_path())
+        url = f"http://127.0.0.1:{relay_port}/?sc_generation={generation}"
+        if not register_workspace:
+            return {**state, "url": url, "reused": reused}
         registration = _post_workspace(service_port, selected)
         state.update(
             {
@@ -526,7 +1269,23 @@ def ensure(worktree: Path, *, env: Mapping[str, str] | None = None) -> dict[str,
             }
         )
         _write_state(state)
-        return {"url": url, "reused": reused, **registration, **state}
+        return {**state, **registration, "url": url, "reused": reused}
+
+
+def browser_generation() -> str:
+    """Return the one-shot generation capability after proving gateway health."""
+    state = _read_state()
+    relay_port = state.get("relay_port")
+    if (
+        not isinstance(relay_port, int)
+        or not _verified_process(state.get("relay_pid"), state.get("relay_start_ticks"), "relay")
+        or not _tcp_ready("127.0.0.1", relay_port)
+    ):
+        raise DeepSeekWebError(
+            "HARNESS_SERVICE_UNAVAILABLE",
+            "DeepSeek Web gateway is not ready for browser handoff",
+        )
+    return _read_generation(_generation_path())
 
 
 def status() -> dict[str, Any]:
@@ -564,51 +1323,432 @@ async def _relay_connection(
     writer: asyncio.StreamWriter,
     target_port: int,
     allowed_peers: frozenset[str],
+    generation: str | None = None,
+    generation_file: Path | None = None,
 ) -> None:
+    forward_lock = None
+
+    def release_forward_lock() -> None:
+        nonlocal forward_lock
+        if forward_lock is None:
+            return
+        _release_gateway_forward_lock(forward_lock)
+        forward_lock = None
+
     peer = writer.get_extra_info("peername")
     if not isinstance(peer, tuple) or not peer or peer[0] not in allowed_peers:
         writer.close()
         await writer.wait_closed()
         return
+    if generation_file is not None:
+        try:
+            generation = _read_generation(generation_file)
+        except DeepSeekWebError:
+            writer.close()
+            await writer.wait_closed()
+            return
+    try:
+        request = await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), timeout=HTTP_TIMEOUT_SECONDS)
+    except (asyncio.IncompleteReadError, TimeoutError, asyncio.LimitOverrunError):
+        writer.close()
+        await writer.wait_closed()
+        return
+    lines = request.decode("iso-8859-1").split("\r\n")
+    request_line = lines[0].split(" ", 2) if lines else []
+    cookie = next((line[7:].strip() for line in lines[1:] if line.lower().startswith("cookie:")), "")
+    parsed_cookie = {
+        item.split("=", 1)[0].strip(): item.split("=", 1)[1].strip()
+        for item in cookie.split(";") if "=" in item
+    }
+    query_generation = None
+    clean_target = None
+    if len(request_line) == 3:
+        parsed_target = urllib.parse.urlsplit(request_line[1])
+        query = urllib.parse.parse_qs(parsed_target.query)
+        query_generation = (query.get("sc_generation") or [None])[0]
+        if query_generation is not None:
+            clean_query = [(key, value) for key, values in query.items() for value in values if key != "sc_generation"]
+            request_line[1] = urllib.parse.urlunsplit(("", "", parsed_target.path or "/", urllib.parse.urlencode(clean_query), ""))
+            clean_target = request_line[1]
+            lines[0] = " ".join(request_line)
+            request = ("\r\n".join(lines)).encode("iso-8859-1")
+    if generation is not None and (
+        parsed_cookie.get(GENERATION_COOKIE) != generation
+        and query_generation != generation
+    ):
+        body = b'{"error":"HARNESS_WEB_GENERATION_STALE"}'
+        writer.write(
+            b"HTTP/1.1 409 Conflict\r\nContent-Type: application/json\r\n"
+            + f"Content-Length: {len(body)}\r\nConnection: close\r\n\r\n".encode()
+            + body
+        )
+        await writer.drain()
+        writer.close()
+        await writer.wait_closed()
+        return
+    if query_generation is not None:
+        # Consume the one-shot capability before the upstream app sees a
+        # request.  The browser retains only this clean URL in history and its
+        # subsequent Referer cannot disclose the generation to DSH.
+        assert clean_target is not None
+        writer.write(
+            b"HTTP/1.1 302 Found\r\n"
+            + f"Location: {clean_target}\r\n".encode("iso-8859-1")
+            + f"Set-Cookie: {GENERATION_COOKIE}={generation}; HttpOnly; SameSite=Strict; Path=/\r\n".encode("iso-8859-1")
+            + b"Cache-Control: no-store\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        )
+        await writer.drain()
+        writer.close()
+        await writer.wait_closed()
+        return
+    target = request_line[1] if len(request_line) == 3 else ""
+    websocket = any(
+        line.lower() == "upgrade: websocket" for line in lines[1:]
+    )
+    if websocket and target.split("?", 1)[0] not in {
+        "/api/events.mux", "/api/events.host"
+    }:
+        writer.close()
+        await writer.wait_closed()
+        return
+    target_path = target.split("?", 1)[0]
+    guarded_mutation = (
+        target_path in SESSION_MUTATION_PATHS
+        or target_path == WORKSPACE_DELETE_PATH
+    )
+    prompt_record_id = None
+    if guarded_mutation:
+        content_length = next(
+            (
+                line.split(":", 1)[1].strip()
+                for line in lines[1:]
+                if line.lower().startswith("content-length:")
+            ),
+            "0",
+        )
+        try:
+            length = int(content_length)
+            body = await asyncio.wait_for(
+                reader.readexactly(length), timeout=HTTP_TIMEOUT_SECONDS
+            )
+            payload = json.loads(body)
+        except (
+            ValueError,
+            asyncio.IncompleteReadError,
+            TimeoutError,
+            json.JSONDecodeError,
+        ):
+            writer.close()
+            await writer.wait_closed()
+            return
+        rpc_payload = payload.get("payload") if isinstance(payload, Mapping) else None
+        session_id = (
+            rpc_payload.get("sessionId") if isinstance(rpc_payload, Mapping) else None
+        )
+        if (
+            target_path != "/api/session.create"
+            and target_path != WORKSPACE_DELETE_PATH
+            and (
+                not isinstance(rpc_payload, Mapping)
+                or not any(
+                    isinstance(rpc_payload.get(field), str)
+                    for field in SESSION_MUTATION_FIELDS.get(target_path, ())
+                )
+            )
+        ):
+            writer.close()
+            await writer.wait_closed()
+            return
+        try:
+            forward_lock = await _acquire_gateway_forward_lock()
+            reserved = _reserved_session()
+            targets_reserved = (
+                reserved is not None
+                and isinstance(rpc_payload, Mapping)
+                and any(
+                    rpc_payload.get(field) == reserved
+                    for field in SESSION_MUTATION_FIELDS.get(target_path, ())
+                )
+            )
+            if (
+                not targets_reserved
+                and reserved is not None
+                and target_path == WORKSPACE_DELETE_PATH
+            ):
+                targets_reserved = _workspace_contains_session(
+                    target_port,
+                    rpc_payload.get("workspaceId")
+                    if isinstance(rpc_payload, Mapping)
+                    else None,
+                    reserved,
+                )
+        except DeepSeekWebError as exc:
+            release_forward_lock()
+            body = json.dumps({"error": exc.code}, separators=(",", ":")).encode()
+            writer.write(
+                b"HTTP/1.1 409 Conflict\r\nContent-Type: application/json\r\n"
+                + f"Content-Length: {len(body)}\r\nConnection: close\r\n\r\n".encode()
+                + body
+            )
+            await writer.drain()
+            writer.close()
+            await writer.wait_closed()
+            return
+        except BaseException:
+            release_forward_lock()
+            raise
+        if targets_reserved:
+            release_forward_lock()
+            body = b'{"error":"HARNESS_WEB_SESSION_BUSY"}'
+            writer.write(
+                b"HTTP/1.1 409 Conflict\r\nContent-Type: application/json\r\n"
+                + f"Content-Length: {len(body)}\r\nConnection: close\r\n\r\n".encode()
+                + body
+            )
+            await writer.drain()
+            writer.close()
+            await writer.wait_closed()
+            return
+        if target_path == "/api/session.prompt":
+            try:
+                prompt_record_id = _record_browser_prompt_locked(
+                    target_port, session_id
+                )
+            except DeepSeekWebError as exc:
+                release_forward_lock()
+                body = json.dumps({"error": exc.code}, separators=(",", ":")).encode()
+                writer.write(
+                    b"HTTP/1.1 409 Conflict\r\nContent-Type: application/json\r\n"
+                    + f"Content-Length: {len(body)}\r\nConnection: close\r\n\r\n".encode()
+                    + body
+                )
+                await writer.drain()
+                writer.close()
+                await writer.wait_closed()
+                return
+            except BaseException:
+                release_forward_lock()
+                raise
+        request += body
+    headers = [
+        line for line in lines[1:]
+        if line
+        and not (line.lower().startswith("referer:") and "sc_generation=" in line.lower())
+    ]
+    if not websocket:
+        headers = [
+            line for line in headers if not line.lower().startswith("connection:")
+        ]
+        request = "\r\n".join(
+            [lines[0], *headers, "Connection: close", "", ""]
+        ).encode("iso-8859-1")
+        if guarded_mutation:
+            request += body
+    else:
+        request = "\r\n".join([lines[0], *headers, "", ""]).encode("iso-8859-1")
     try:
         upstream_reader, upstream_writer = await asyncio.open_connection(
             "127.0.0.1", target_port
         )
     except OSError:
+        release_forward_lock()
+        if "prompt_record_id" in locals() and prompt_record_id is not None:
+            _settle_browser_prompt(prompt_record_id, accepted=False)
         writer.close()
         await writer.wait_closed()
         return
+    except BaseException:
+        release_forward_lock()
+        writer.close()
+        raise
+    try:
+        upstream_writer.write(request)
+        await upstream_writer.drain()
+    except OSError:
+        release_forward_lock()
+        # The TCP peer accepted a connection; whether it consumed the prompt is
+        # unknowable, so preserve the pending record and fail handoff closed.
+        upstream_writer.close()
+        writer.close()
+        await upstream_writer.wait_closed()
+        await writer.wait_closed()
+        return
+    except BaseException:
+        release_forward_lock()
+        upstream_writer.close()
+        writer.close()
+        raise
+    if target_path == "/api/session.prompt":
+        # Prompt ownership moves to the terminal activity ledger after Host
+        # admission so concurrent same-session requests can fail immediately.
+        release_forward_lock()
 
-    async def copy(source: asyncio.StreamReader, destination: asyncio.StreamWriter) -> None:
+    try:
+        response = await asyncio.wait_for(upstream_reader.readuntil(b"\r\n\r\n"), timeout=HTTP_TIMEOUT_SECONDS)
+    except (asyncio.IncompleteReadError, TimeoutError, asyncio.LimitOverrunError):
+        release_forward_lock()
+        upstream_writer.close()
+        writer.close()
+        await upstream_writer.wait_closed()
+        await writer.wait_closed()
+        return
+    if "prompt_record_id" in locals() and prompt_record_id is not None:
+        response_lines = response.decode("iso-8859-1").split("\r\n")
+        raw_length = next(
+            (line.split(":", 1)[1].strip() for line in response_lines if line.lower().startswith("content-length:")),
+            None,
+        )
+        chunked = any(
+            line.lower().startswith("transfer-encoding:")
+            and "chunked" in line.lower()
+            for line in response_lines
+        )
+        try:
+            if chunked:
+                wire_chunks: list[bytes] = []
+                decoded_chunks: list[bytes] = []
+                while True:
+                    size_line = await asyncio.wait_for(
+                        upstream_reader.readuntil(b"\r\n"), timeout=HTTP_TIMEOUT_SECONDS
+                    )
+                    wire_chunks.append(size_line)
+                    size = int(size_line[:-2].split(b";", 1)[0], 16)
+                    if size == 0:
+                        while True:
+                            trailer = await asyncio.wait_for(
+                                upstream_reader.readuntil(b"\r\n"), timeout=HTTP_TIMEOUT_SECONDS
+                            )
+                            wire_chunks.append(trailer)
+                            if trailer == b"\r\n":
+                                break
+                        break
+                    chunk = await asyncio.wait_for(
+                        upstream_reader.readexactly(size + 2), timeout=HTTP_TIMEOUT_SECONDS
+                    )
+                    if chunk[-2:] != b"\r\n":
+                        raise ValueError("malformed chunked response")
+                    wire_chunks.append(chunk)
+                    decoded_chunks.append(chunk[:-2])
+                response_body = b"".join(wire_chunks)
+                decoded_body = b"".join(decoded_chunks)
+            else:
+                response_body = await asyncio.wait_for(
+                    upstream_reader.readexactly(int(raw_length or "-1")), timeout=HTTP_TIMEOUT_SECONDS
+                )
+                decoded_body = response_body
+            result = json.loads(decoded_body).get("result")
+            accepted = (
+                isinstance(result, Mapping)
+                and result.get("ok") is True
+                and isinstance(result.get("value"), Mapping)
+                and result["value"].get("accepted") is True
+            )
+        except (ValueError, asyncio.IncompleteReadError, TimeoutError, json.JSONDecodeError):
+            release_forward_lock()
+            upstream_writer.close()
+            writer.close()
+            await upstream_writer.wait_closed()
+            await writer.wait_closed()
+            return
+        _settle_browser_prompt(prompt_record_id, accepted=accepted)
+        release_forward_lock()
+        writer.write(response + response_body)
+        await writer.drain()
+        upstream_writer.close()
+        writer.close()
+        await upstream_writer.wait_closed()
+        await writer.wait_closed()
+        return
+    async def drain_upstream_response() -> None:
+        try:
+            while await upstream_reader.read(64 * 1024):
+                pass
+        except ConnectionError:
+            pass
+
+    try:
+        writer.write(response)
+        await writer.drain()
+    except ConnectionError:
+        writer.close()
+        try:
+            if forward_lock is not None:
+                await drain_upstream_response()
+        finally:
+            release_forward_lock()
+        upstream_writer.close()
+        await upstream_writer.wait_closed()
+        await writer.wait_closed()
+        return
+    except BaseException:
+        release_forward_lock()
+        upstream_writer.close()
+        writer.close()
+        raise
+
+    async def copy(
+        source: asyncio.StreamReader,
+        destination: asyncio.StreamWriter,
+        *,
+        drain_source: bool = False,
+    ) -> None:
+        destination_open = True
         try:
             while True:
                 chunk = await source.read(64 * 1024)
                 if not chunk:
                     break
-                destination.write(chunk)
-                await destination.drain()
+                if not destination_open:
+                    continue
+                try:
+                    destination.write(chunk)
+                    await destination.drain()
+                except ConnectionError:
+                    destination.close()
+                    if not drain_source:
+                        break
+                    destination_open = False
         except (ConnectionError, asyncio.CancelledError):
             pass
         finally:
             destination.close()
 
-    tasks = [
-        asyncio.create_task(copy(reader, upstream_writer)),
-        asyncio.create_task(copy(upstream_reader, writer)),
-    ]
-    await asyncio.gather(*tasks, return_exceptions=True)
+    if websocket:
+        tasks = [
+            asyncio.create_task(copy(reader, upstream_writer)),
+            asyncio.create_task(copy(upstream_reader, writer)),
+        ]
+        await asyncio.gather(*tasks, return_exceptions=True)
+    else:
+        await copy(
+            upstream_reader,
+            writer,
+            drain_source=forward_lock is not None,
+        )
+        release_forward_lock()
+        upstream_writer.close()
     await upstream_writer.wait_closed()
     await writer.wait_closed()
 
 
 async def _relay(
-    listen_port: int, target_port: int, allowed_peers: frozenset[str]
+    listen_host: str,
+    listen_port: int,
+    target_port: int,
+    allowed_peers: frozenset[str],
+    generation_file: Path,
 ) -> None:
+    generation = _read_generation(generation_file)
     server = await asyncio.start_server(
         lambda reader, writer: _relay_connection(
-            reader, writer, target_port, allowed_peers
+            reader,
+            writer,
+            target_port,
+            allowed_peers,
+            generation,
+            generation_file,
         ),
-        "0.0.0.0",
+        listen_host,
         listen_port,
     )
     async with server:
@@ -622,10 +1762,13 @@ def main(argv: list[str]) -> int:
     ensure_parser.add_argument("--worktree", required=True)
     subparsers.add_parser("status")
     subparsers.add_parser("stop")
+    subparsers.add_parser("generation")
     relay_parser = subparsers.add_parser("relay")
     relay_parser.add_argument("--allowed-peer", action="append", required=True)
+    relay_parser.add_argument("--listen-host", required=True)
     relay_parser.add_argument("--listen-port", type=int, required=True)
     relay_parser.add_argument("--target-port", type=int, required=True)
+    relay_parser.add_argument("--generation-file", type=Path, required=True)
     args = parser.parse_args(argv)
     try:
         if args.command == "ensure":
@@ -634,12 +1777,17 @@ def main(argv: list[str]) -> int:
             result = status()
         elif args.command == "stop":
             result = stop()
+        elif args.command == "generation":
+            print(browser_generation())
+            return 0
         else:
             asyncio.run(
                 _relay(
+                    args.listen_host,
                     args.listen_port,
                     args.target_port,
                     frozenset(args.allowed_peer),
+                    args.generation_file,
                 )
             )
             return 0
