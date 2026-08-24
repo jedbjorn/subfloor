@@ -361,6 +361,22 @@ def test_gateway_quiesces_before_host_and_credential_rotation() -> None:
         assert not (root / "deepseek-web-generation.json").exists()
 
 
+def test_dead_state_without_activity_is_replaced_before_new_owner_starts() -> None:
+    with tempfile.TemporaryDirectory() as raw:
+        root = Path(raw)
+        env = service_env(root)
+        state = root / "state.json"
+        state.write_text(json.dumps({"relay_pid": 12, "web_pid": 13}))
+        with (
+            mock.patch.dict(deepseek_web.os.environ, env, clear=False),
+            mock.patch.object(deepseek_web, "_verified_process", return_value=False),
+        ):
+            result = deepseek_web._stop_unlocked()
+
+        assert result == {"stopped": False, "web": True, "relay": True}
+        assert not state.exists()
+
+
 def test_gateway_quiescence_failure_preserves_old_host_credential() -> None:
     with tempfile.TemporaryDirectory() as raw:
         root = Path(raw)

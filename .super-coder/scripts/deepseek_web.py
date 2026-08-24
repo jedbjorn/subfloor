@@ -539,6 +539,19 @@ def _terminate_verified(state: Mapping[str, Any], prefix: str) -> bool:
 
 def _stop_unlocked() -> dict[str, Any]:
     state = _read_state()
+    # A crashed service can leave its state record behind without ever having
+    # initialized gateway activity.  When neither recorded process survives
+    # its start-ticks proof, there is no credentialed execution to drain; clear
+    # that dead record so the next owner can start.  A partially live service
+    # remains fail-closed below because it might still own accepted work.
+    if state and not _activity_path().exists() and not any(
+        _verified_process(
+            state.get(f"{prefix}_pid"), state.get(f"{prefix}_start_ticks"),
+            "web" if prefix == "web" else "relay",
+        )
+        for prefix in ("web", "relay")
+    ):
+        state = {}
     activity = _close_gateway_admission(state)
     if not _drain_gateway_work(state, activity):
         raise DeepSeekWebError(
