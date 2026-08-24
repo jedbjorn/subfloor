@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Optional standard-library TOML parsing across the Python 3.9+ host floor."""
+"""Optional standard-library TOML parsing for advisory enrichment."""
 from __future__ import annotations
 
 try:
     import tomllib as _tomllib
-except ImportError:  # Python 3.9/3.10: TOML enrichment is advisory.
+except ImportError:  # A stripped runtime may omit the advisory parser.
     _tomllib = None
 
 

@@ -148,10 +148,10 @@ def report_host_runtime(*, report: bool = True) -> None:
     """Validate and report the exact interpreter before installer mutation."""
     version = platform.python_version()
     executable = str(Path(sys.executable).resolve())
-    if sys.version_info < (3, 9):
+    if sys.version_info[:2] != (3, 14):
         raise SystemExit(
-            f"install: Python 3.9+ required; selected {executable} reports {version}.\n"
-            "  recovery: install Python 3.9+ with sqlite3, then set "
+            f"install: Python 3.14.x required; selected {executable} reports {version}.\n"
+            "  recovery: install Python 3.14.x with sqlite3, then set "
             "SC_PYTHON=/absolute/path/to/python3"
         )
     try:
@@ -159,7 +159,7 @@ def report_host_runtime(*, report: bool = True) -> None:
     except ImportError:
         raise SystemExit(
             f"install: selected Python {executable} ({version}) cannot import sqlite3.\n"
-            "  recovery: install Python 3.9+ with sqlite3, then set "
+            "  recovery: install Python 3.14.x with sqlite3, then set "
             "SC_PYTHON=/absolute/path/to/python3"
         )
     if report:

@@ -27,7 +27,7 @@ import build_deepseek_carrier  # noqa: E402
 
 
 def load_tests(_loader, _standard_tests, _pattern):
-    """Run the same contract under the stdlib-only Python 3.9 CI lane."""
+    """Run the same contract under the stdlib-only Python 3.14 CI lane."""
     suite = unittest.TestSuite()
     for name, function in sorted(globals().items()):
         if name.startswith("test_") and callable(function):
@@ -157,12 +157,12 @@ def write_artifact_evidence(directory: Path) -> None:
 def test_runtime_manifest_pins_source_patch_recipe_and_supported_platforms() -> None:
     manifest = deepseek_runtime.load_runtime_manifest()
 
-    assert manifest["python_minimum"] == "3.10"
+    assert manifest["python_minimum"] == "3.14"
     assert manifest["carrier"] == {
         "protocol": "super-coder-deepseek-lifecycle-v1",
         "acquisition": "verified-source-build",
         "worker_path": "scripts/deepseek_carrier_worker.py",
-        "worker_sha256": "c75ad8ff34dd659a5d2d1c4727f619c599a0c18924269be82a1b5ca605d39c34",
+        "worker_sha256": "09a78cb3c6d33eb4df9856d9c7f77378887b748a30aa87abba90dc0cbb441c5f",
     }
     assert manifest["source"]["commit"] == "bb4ca698d63714e753f5621b07400e6ebb0b5d97"
     assert manifest["source"]["archive_sha256"] == "d5a78fb623d1c14846812e8e18042134a1127ab86dea259f79c2c8358e8481bc"
@@ -295,23 +295,27 @@ def test_missing_carrier_is_a_deepseek_only_unavailable_status() -> None:
         runner.assert_not_called()
 
 
-def test_python39_carrier_projects_incompatible_without_importing_the_sdk() -> None:
-    with tempfile.TemporaryDirectory() as raw:
-        python = executable(Path(raw) / "venv" / "bin" / "python")
-        runner = mock.Mock(
-            return_value=completed(
-                stdout=carrier_evidence(python, version=(3, 9, 19))
+def test_other_minor_carriers_project_incompatible_without_importing_the_sdk() -> None:
+    for version in ((3, 13, 9), (3, 15, 0)):
+        with tempfile.TemporaryDirectory() as raw:
+            python = executable(Path(raw) / "venv" / "bin" / "python")
+            runner = mock.Mock(
+                return_value=completed(
+                    stdout=carrier_evidence(python, version=version)
+                )
             )
-        )
 
-        status = deepseek_runtime.probe_carrier(python, runner=runner)
+            status = deepseek_runtime.probe_carrier(python, runner=runner)
 
-        assert status.available is False
-        assert status.error == "HARNESS_RUNTIME_INCOMPATIBLE"
-        assert status.python_version == "3.9.19"
-        assert status.sdk_version == "0.1.0rc7"
-        assert status.runtime_version == "0.1.0rc7"
-        assert runner.call_args.args[0][1:3] == ["-I", "-c"]
+            assert status.available is False
+            assert status.error == "HARNESS_RUNTIME_INCOMPATIBLE"
+            assert status.python_version == ".".join(map(str, version))
+            assert status.detail == (
+                f"carrier Python {status.python_version} is not Python 3.14.x"
+            )
+            assert status.sdk_version == "0.1.0rc7"
+            assert status.runtime_version == "0.1.0rc7"
+            assert runner.call_args.args[0][1:3] == ["-I", "-c"]
 
 
 def test_exact_isolated_pair_reports_available_and_mismatch_does_not() -> None:
@@ -732,23 +736,26 @@ def test_bare_metal_install_uses_a_separate_venv_and_writes_version_evidence() -
         ) == 0o600
 
 
-def test_absent_compatible_bootstrap_does_not_create_a_partial_carrier() -> None:
-    with tempfile.TemporaryDirectory() as raw:
-        root = Path(raw)
-        engine = root / "engine"
-        bootstrap = executable(root / "python3.9")
-        runner = mock.Mock(return_value=completed(stdout="[3, 9, 19]\n"))
+def test_other_minor_bootstraps_do_not_create_partial_carriers() -> None:
+    for version in ((3, 13, 9), (3, 15, 0)):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            engine = root / "engine"
+            bootstrap = executable(root / "python")
+            runner = mock.Mock(
+                return_value=completed(stdout=json.dumps(version) + "\n")
+            )
 
-        status = deepseek_runtime.ensure_carrier(
-            env={"SC_DEEPSEEK_BOOTSTRAP_PYTHON": str(bootstrap)},
-            engine=engine,
-            runner=runner,
-        )
+            status = deepseek_runtime.ensure_carrier(
+                env={"SC_DEEPSEEK_BOOTSTRAP_PYTHON": str(bootstrap)},
+                engine=engine,
+                runner=runner,
+            )
 
-        assert status.available is False
-        assert status.error == "HARNESS_RUNTIME_INCOMPATIBLE"
-        assert not engine.exists()
-        assert runner.call_count == 1
+            assert status.available is False
+            assert status.error == "HARNESS_RUNTIME_INCOMPATIBLE"
+            assert not engine.exists()
+            assert runner.call_count == 1
 
 
 def test_unsupported_container_architecture_degrades_without_partial_carrier() -> None:
@@ -809,12 +816,12 @@ def test_unsupported_container_cli_exits_successfully_for_global_image_build() -
         assert target.with_suffix(".unavailable.json").is_file()
 
 
-def test_python39_container_degrades_on_supported_architecture_without_install() -> None:
+def test_non_314_container_degrades_on_supported_architecture_without_install() -> None:
     with tempfile.TemporaryDirectory() as raw:
         root = Path(raw)
         target = root / "deepseek-runtime"
-        bootstrap = executable(root / "python3.9")
-        runner = mock.Mock(return_value=completed(stdout="[3, 9, 19]\n"))
+        bootstrap = executable(root / "python3.15")
+        runner = mock.Mock(return_value=completed(stdout="[3, 15, 0]\n"))
 
         status = deepseek_runtime.prepare_container_carrier(
             target,
@@ -825,7 +832,7 @@ def test_python39_container_degrades_on_supported_architecture_without_install()
 
         assert status.available is False
         assert status.error == "HARNESS_RUNTIME_INCOMPATIBLE"
-        assert "no Python 3.10+ carrier interpreter" in status.detail
+        assert "no Python 3.14.x carrier interpreter" in status.detail
         assert not target.exists()
         assert target.with_suffix(".unavailable.json").is_file()
         assert runner.call_count == 1

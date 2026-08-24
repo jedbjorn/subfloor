@@ -171,7 +171,7 @@ class SupervisionFixture:
               [ "$SC_TEST_IMAGE" = present ] || exit 1
               case " $* " in
                 *" --format "*) echo 0 ;;
-                *" python:3.12-slim "*)
+                *" python:3.14-slim "*)
                   printf '[{"Id":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","Config":{"Labels":{}}}]\\n' ;;
                 *) cat "$state_dir/image.json" ;;
               esac
@@ -398,7 +398,7 @@ class RestrictedLaunchTests(unittest.TestCase):
         ]
         self.assertEqual(len(image_inspects), 4)
         self.assertEqual(
-            sum("python:3.12-slim" in line for line in image_inspects), 1
+            sum("python:3.14-slim" in line for line in image_inspects), 1
         )
         self.assertTrue(any("super-coder-base:" in line for line in image_inspects))
         sandbox_run = next(

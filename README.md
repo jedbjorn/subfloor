@@ -114,7 +114,7 @@ harness already ships, nothing patched, nothing forked: [*Architecture*](docs/RE
 ## Install quickstart
 
 > [!class4]
-> **The bar: Linux, Python 3.9+ with `sqlite3`, a reachable docker daemon, and one signed-in harness CLI on PATH.** Set `SC_PYTHON=/absolute/path/to/python3` to select a specific interpreter. Ubuntu LTS, stable Fedora, and Arch-compatible Linux (including CachyOS) are tested examples, not an exclusive list. On macOS or Windows, create a Linux VM and run this flow inside the guest. Full Linux prerequisites, the guest-filesystem recommendation, docker modes, and the no-docker escape hatch: [*Install*](docs/README.md#install).
+> **The bar: Linux, Python 3.14.x with `sqlite3`, a reachable docker daemon, and one signed-in harness CLI on PATH.** Set `SC_PYTHON=/absolute/path/to/python3` to select a specific interpreter. Ubuntu LTS, stable Fedora, and Arch-compatible Linux (including CachyOS) are tested examples, not an exclusive list. On macOS or Windows, create a Linux VM and run this flow inside the guest. Full Linux prerequisites, the guest-filesystem recommendation, docker modes, and the no-docker escape hatch: [*Install*](docs/README.md#install).
 
 Drop subfloor into an existing git repo and boot a shell:
 

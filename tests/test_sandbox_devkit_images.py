@@ -48,7 +48,7 @@ class FakeDocker:
         self.commands: list[tuple[str, ...]] = []
         self.inputs: list[str | bytes | None] = []
         self.images: dict[str, dict] = {
-            "python:3.12-slim": {
+            "python:3.14-slim": {
                 "Id": "sha256:" + "a" * 64,
                 "Created": "2026-08-01T00:00:00Z",
                 "Config": {"Labels": {}},
@@ -436,7 +436,7 @@ class SandboxImagePlanTest(unittest.TestCase):
             "SC_GITHUB_HOST_TRUST_SHA256=" + hashlib.sha256(trust).hexdigest(),
             base,
         )
-        self.assertIn("SC_PARENT_IMAGE=python:3.12-slim", base)
+        self.assertIn("SC_PARENT_IMAGE=python:3.14-slim", base)
         self.assertNotIn("SC_PARENT_IMAGE=sha256:" + "a" * 64, base)
         self.assertIn("sc.parent_id=sha256:" + "a" * 64, base)
         self.assertIn(f"SC_BASE_IMAGE={plan.base_tag}", extension)

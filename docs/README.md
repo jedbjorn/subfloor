@@ -96,12 +96,12 @@ one signed-in coding harness.
 | Need | Linux host |
 |---|---|
 | **Container engine** | Install Docker with your distribution's package tooling. For example, Arch uses `sudo pacman -S docker`; rootless setup is `dockerd-rootless-setuptool.sh install && systemctl --user enable --now docker`. |
-| **Base tools** | Install Git, curl, Python, and SQLite with your distribution's package tooling. Python 3.9+ with `sqlite3` is required. |
+| **Base tools** | Install Git, curl, Python, and SQLite with your distribution's package tooling. Python 3.14.x with `sqlite3` is required. |
 | **Harness CLI** | `./sc install` installs `claude` · `opencode` · `codex` · `vibe` · `kimi` through their native installers. Repair a harness with its documented Linux installer if needed. |
 | **Harness account** | Have a plan for Claude Code, OpenCode, Codex, Vibe, or Kimi Code; sign in once in Linux. |
 
 > [!class4]
-> **The bar: Linux, Python 3.9+ with `sqlite3`, a reachable docker daemon, and a harness CLI on PATH.** `./sc doctor` reports the selected absolute interpreter, version, SQLite result, docker mode (rootless / rootful), and the exact next command. `SC_PYTHON`, when non-empty, selects the exact interpreter. No docker at all? The `./sc serve` + `./sc boot` escape hatch runs the shell on the Linux host.
+> **The bar: Linux, Python 3.14.x with `sqlite3`, a reachable docker daemon, and a harness CLI on PATH.** `./sc doctor` reports the selected absolute interpreter, version, SQLite result, docker mode (rootless / rootful), and the exact next command. `SC_PYTHON`, when non-empty, selects the exact interpreter. No docker at all? The `./sc serve` + `./sc boot` escape hatch runs the shell on the Linux host.
 
 On macOS or Windows, create a Linux VM, install these prerequisites in the
 guest, and keep the checkout on guest-owned storage when practical. Host-shared
@@ -155,7 +155,7 @@ inherits the **system** (schema + the skill catalogue + the render chain), never
 subfloor's own memory or roadmap.
 
 > [!class4]
-> **Requirements: Python 3.9+ with `sqlite3`, plus `docker`.** The default run mode is a sandbox container, so the harness's "allow everything" is safe — the kernel is the boundary, and the container sees only this repo + your harness creds. The image bakes the rest: `python3`, `sqlite3`, `git`, `curl`, and the harness CLIs. No docker? The `./sc serve` + `./sc boot` primitives run on the host with the selected Python 3.9+ interpreter, `sqlite3`, and a harness on `PATH`. Set `SC_PYTHON` to select that interpreter explicitly.
+> **Requirements: Python 3.14.x with `sqlite3`, plus `docker`.** The default run mode is a sandbox container, so the harness's "allow everything" is safe — the kernel is the boundary, and the container sees only this repo + your harness creds. The image bakes the rest: `python3`, `sqlite3`, `git`, `curl`, and the harness CLIs. No docker? The `./sc serve` + `./sc boot` primitives run on the host with the selected Python 3.14.x interpreter, `sqlite3`, and a harness on `PATH`. Set `SC_PYTHON` to select that interpreter explicitly.
 
 **Docker mode — rootless is the default.** `./sc doctor` checks your docker.
 Both modes work (the launcher's `duser()` adapts), and **rootless is the chosen

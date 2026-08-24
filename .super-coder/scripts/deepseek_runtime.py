@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Pinned, isolated carrier and per-conversation state for DeepSeek Harness.
 
-The super-coder engine remains importable on Python 3.9. DeepSeek's official
-SDK/runtime pair runs only through a separate Python 3.10+ virtual environment;
-this module never imports the SDK into the engine process.
+The Python 3.14 engine controls DeepSeek's official SDK/runtime pair through a
+separate virtual environment; this module never imports the SDK into the engine
+process.
 """
 from __future__ import annotations
 
@@ -29,7 +29,7 @@ ASSET_ROOT = ENGINE / "assets" / "deepseek"
 MANIFEST_PATH = ASSET_ROOT / "runtime.json"
 PROVIDER_ADAPTERS_PATH = ASSET_ROOT / "provider-adapters.json"
 RUN_ROOT = ENGINE / "run" / "deepseek"
-MINIMUM_PYTHON = (3, 10)
+SUPPORTED_PYTHON = (3, 14)
 PROBE_TIMEOUT = 10
 PROVIDER_WIRE_PROBE_TIMEOUT = 30
 PROVIDER_WIRE_PURPOSES = ("conversation", "compaction", "session-title")
@@ -342,8 +342,8 @@ def load_runtime_manifest(path: Path = MANIFEST_PATH) -> dict[str, object]:
     try:
         if raw["schema_version"] != 3:
             raise ValueError("unsupported schema_version")
-        if raw["python_minimum"] != "3.10":
-            raise ValueError("python_minimum must preserve the 3.10 carrier floor")
+        if raw["python_minimum"] != "3.14":
+            raise ValueError("python_minimum must match the Python 3.14 engine")
         sdk = raw["sdk"]
         runtime = raw["runtime"]
         carrier = raw["carrier"]
@@ -613,11 +613,11 @@ def probe_carrier(
             python=python,
             manifest=manifest,
         )
-    if version_tuple < MINIMUM_PYTHON:
+    if version_tuple != SUPPORTED_PYTHON:
         return _status(
             available=False,
             error="HARNESS_RUNTIME_INCOMPATIBLE",
-            detail=f"carrier Python {python_version} is older than 3.10",
+            detail=f"carrier Python {python_version} is not Python 3.14.x",
             python=python,
             python_version=python_version,
             sdk_version=sdk_version,
@@ -723,14 +723,14 @@ def discover_bootstrap_python(
     candidates: Sequence[str] | None = None,
     runner=subprocess.run,
 ) -> tuple[Path | None, str | None]:
-    """Find a Python 3.10+ interpreter without changing the engine floor."""
+    """Find the selected Python 3.14 interpreter for carrier creation."""
     env = os.environ if env is None else env
     explicit = env.get("SC_DEEPSEEK_BOOTSTRAP_PYTHON", "").strip()
     names = (
         [explicit]
         if explicit
         else list(candidates or ())
-        or [sys.executable, "python3.14", "python3.13", "python3.12", "python3.11", "python3.10"]
+        or [sys.executable, "python3.14"]
     )
     seen: set[str] = set()
     observed: list[str] = []
@@ -757,9 +757,9 @@ def discover_bootstrap_python(
             version = None
         if version:
             observed.append(f"{python}={'.'.join(str(item) for item in version)}")
-        if pair >= MINIMUM_PYTHON:
+        if pair == SUPPORTED_PYTHON:
             return python, "; ".join(observed)
-    detail = "; ".join(observed) or "no Python 3.10+ candidate found"
+    detail = "; ".join(observed) or "no Python 3.14.x candidate found"
     return None, detail
 
 
@@ -1110,7 +1110,7 @@ def prepare_container_carrier(
         runner=runner,
     )
     if bootstrap is None:
-        detail = f"container has no Python 3.10+ carrier interpreter: {observed}"
+        detail = f"container has no Python 3.14.x carrier interpreter: {observed}"
         _write_container_incompatibility(
             marker,
             architecture=architecture,

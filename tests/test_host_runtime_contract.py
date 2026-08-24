@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import re
 import shlex
 import shutil
 import stat
@@ -21,6 +22,7 @@ sys.path.insert(0, str(ENGINE / "scripts"))
 
 import map_repo  # noqa: E402
 import model_catalog  # noqa: E402
+import sandbox_devkit  # noqa: E402
 import toml_compat  # noqa: E402
 
 
@@ -146,6 +148,25 @@ class DispatcherRuntimeProbeTest(unittest.TestCase):
             f"  exit {rc}\n"
             "fi\n"
             f"exec {sys.executable} \"$@\"\n"
+        )
+        path.chmod(path.stat().st_mode | stat.S_IXUSR)
+        return path
+
+    def versioned_python(self, name: str, version: tuple[int, int, int]) -> Path:
+        path = self.root / name
+        version_text = ".".join(str(part) for part in version)
+        prelude = (
+            "import platform,sys; "
+            f"sys.version_info={version!r}; "
+            f"platform.python_version=lambda: {version_text!r}; "
+            "exec(sys.argv[1])"
+        )
+        path.write_text(
+            "#!/bin/sh\n"
+            "if [ \"$1\" = -c ]; then\n"
+            f"  exec {shlex.quote(sys.executable)} -c {shlex.quote(prelude)} \"$2\"\n"
+            "fi\n"
+            f"exec {shlex.quote(sys.executable)} \"$@\"\n"
         )
         path.chmod(path.stat().st_mode | stat.S_IXUSR)
         return path
@@ -405,23 +426,31 @@ class DispatcherRuntimeProbeTest(unittest.TestCase):
         self.assertIn("export SC_PYTHON=", completed.stderr)
         self.assertFalse((self.root / ".super-coder/scripts/install-ran").exists())
 
-    def test_incompatible_interpreter_stops_before_target(self) -> None:
-        selected = self.wrapper(
-            "python-old",
-            "Python 3.9+ required; /opt/python3.8 reports 3.8.20",
-            rc=2,
-        )
-        completed = self.invoke(str(selected))
-        self.assertEqual(completed.returncode, 1)
-        self.assertIn(str(selected), completed.stderr)
-        self.assertIn("Python 3.9+ required", completed.stderr)
-        self.assertFalse((self.root / ".super-coder/scripts/install-ran").exists())
+    def test_other_python_minors_stop_before_target(self) -> None:
+        for version in ((3, 13, 9), (3, 15, 0)):
+            with self.subTest(version=version):
+                selected = self.versioned_python(
+                    "python" + "".join(str(part) for part in version[:2]), version
+                )
+                completed = self.invoke(str(selected))
+                self.assertEqual(completed.returncode, 1)
+                self.assertIn("Python 3.14.x required", completed.stderr)
+                self.assertIn(
+                    "reports " + ".".join(map(str, version)), completed.stderr
+                )
+                self.assertIn(
+                    "recovery: install Python 3.14.x with sqlite3",
+                    completed.stderr,
+                )
+                self.assertFalse(
+                    (self.root / ".super-coder/scripts/install-ran").exists()
+                )
 
     def test_valid_override_executes_the_reported_exact_interpreter(self) -> None:
-        selected = self.root / "python39"
+        selected = self.root / "python314"
         selected = self.wrapper(
             selected.name,
-            f"{selected}|3.9.18|3.35.5",
+            f"{selected}|3.14.7|3.53.4",
         )
         completed = self.invoke(str(selected))
         self.assertEqual(completed.returncode, 0, completed.stderr)
@@ -498,6 +527,40 @@ class OptionalTomlTest(unittest.TestCase):
                 self.assertEqual(map_repo.deps_pyproject(pyproject), [])
                 self.assertEqual(map_repo.deps_cargo(cargo), [])
 
+
+class Python314SourceContractTest(unittest.TestCase):
+    def test_every_maintained_setup_python_selector_is_exact(self) -> None:
+        workflow_roots = (
+            ROOT / ".github" / "workflows",
+            ENGINE / "templates" / "fork",
+        )
+        selectors: dict[str, list[str]] = {}
+        for workflow_root in workflow_roots:
+            for path in workflow_root.glob("*.yml"):
+                matches = re.findall(
+                    r"python-version:\s*['\"]?([^'\"\s]+)",
+                    path.read_text(),
+                )
+                if matches:
+                    selectors[str(path.relative_to(ROOT))] = matches
+
+        self.assertEqual(
+            selectors,
+            {
+                ".github/workflows/render-check.yml": ["3.14"],
+                ".github/workflows/tests.yml": ["3.14", "3.14", "3.14"],
+                ".super-coder/templates/fork/subfloor-visual-qa.yml": ["3.14"],
+            },
+        )
+
+    def test_host_contract_name_and_runtime_defaults_are_stable(self) -> None:
+        workflow = (ROOT / ".github" / "workflows" / "tests.yml").read_text()
+        dockerfile = (ENGINE / "Dockerfile").read_text()
+
+        self.assertIn("name: Python 3.14 Linux host contract", workflow)
+        self.assertNotIn("Python 3.9 Linux host contract", workflow)
+        self.assertIn("ARG SC_PARENT_IMAGE=python:3.14-slim", dockerfile)
+        self.assertEqual(sandbox_devkit.DEFAULT_PARENT_IMAGE, "python:3.14-slim")
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

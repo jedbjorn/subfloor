@@ -185,7 +185,7 @@ class OperatorDocumentationTest(unittest.TestCase):
         for path in self.DOC_PATHS:
             with self.subTest(path=path.relative_to(ROOT)):
                 body = path.read_text()
-                self.assertIn("Python 3.9+", body)
+                self.assertIn("Python 3.14.x", body)
                 self.assertIn("SC_PYTHON", body)
 
     def test_launched_shell_boot_keeps_branch_only_guidance(self):

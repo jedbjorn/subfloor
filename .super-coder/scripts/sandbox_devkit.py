@@ -30,7 +30,7 @@ import runtime_flags
 from devkit import AptPackage, Declaration, DevkitConfigError, load_declaration
 
 IMAGE_PREFIX = "super-coder"
-DEFAULT_PARENT_IMAGE = "python:3.12-slim"
+DEFAULT_PARENT_IMAGE = "python:3.14-slim"
 PACKAGE_CONTRACT_VERSION = 1
 READINESS_CONTRACT_VERSION = 2
 CONTEXT_CONTRACT_VERSION = 1

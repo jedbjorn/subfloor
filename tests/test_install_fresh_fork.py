@@ -203,6 +203,11 @@ class FreshForkInstallTest(unittest.TestCase):
                 re.compile(r"^\d{4}-\d{2}-\d{2}$"),
             )
             self.assertIn("Installed ✓", result.stdout)
+            self.assertEqual(sys.version_info[:2], (3, 14))
+            self.assertIn(
+                f"python    {Path(sys.executable).resolve()} · 3.14.",
+                result.stdout,
+            )
             wrapper = home / ".local/bin/sc"
             registry = home / ".local/state/super-coder/installs.json"
             wrapper_text = wrapper.read_text()
@@ -215,42 +220,51 @@ class FreshForkInstallTest(unittest.TestCase):
             )
             self.assertIn("subfloor managed PATH", (home / ".profile").read_text())
 
-    def test_direct_installer_rejects_old_python_before_repository_mutation(self) -> None:
-        with tempfile.TemporaryDirectory() as raw:
-            repo, home = self.prepare_repo(raw)
-            before = subprocess.run(
-                ["git", "status", "--porcelain=v1"],
-                cwd=repo,
-                capture_output=True,
-                text=True,
-                check=True,
-            ).stdout
-            release = home / "os-release"
-            release.write_text("ID=ubuntu\nVERSION_ID=26.04\n")
-            result = self.run_direct_host(
-                repo,
-                home,
-                "Linux",
-                release,
-                {"NO_COLOR": "1"},
-                args=["--skip-harness-install"],
-                python_version=(3, 8, 20),
-            )
+    def test_direct_installer_rejects_other_python_minors_before_mutation(self) -> None:
+        for version in ((3, 13, 9), (3, 15, 0)):
+            with (
+                self.subTest(version=version),
+                tempfile.TemporaryDirectory() as raw,
+            ):
+                repo, home = self.prepare_repo(raw)
+                before = subprocess.run(
+                    ["git", "status", "--porcelain=v1"],
+                    cwd=repo,
+                    capture_output=True,
+                    text=True,
+                    check=True,
+                ).stdout
+                release = home / "os-release"
+                release.write_text("ID=ubuntu\nVERSION_ID=26.04\n")
+                result = self.run_direct_host(
+                    repo,
+                    home,
+                    "Linux",
+                    release,
+                    {"NO_COLOR": "1"},
+                    args=["--skip-harness-install"],
+                    python_version=version,
+                )
 
-            self.assertNotEqual(result.returncode, 0)
-            self.assertIn("Python 3.9+ required", result.stderr)
-            self.assertIn("reports 3.8.20", result.stderr)
-            self.assertFalse((repo / ".gitignore").exists())
-            self.assertFalse((repo / ".sc-state").exists())
-            self.assertFalse((repo / ".super-coder" / "instance.json").exists())
-            after = subprocess.run(
-                ["git", "status", "--porcelain=v1"],
-                cwd=repo,
-                capture_output=True,
-                text=True,
-                check=True,
-            ).stdout
-            self.assertEqual(after, before)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("Python 3.14.x required", result.stderr)
+                self.assertIn(
+                    "reports " + ".".join(map(str, version)), result.stderr
+                )
+                self.assertIn(
+                    "recovery: install Python 3.14.x with sqlite3", result.stderr
+                )
+                self.assertFalse((repo / ".gitignore").exists())
+                self.assertFalse((repo / ".sc-state").exists())
+                self.assertFalse((repo / ".super-coder" / "instance.json").exists())
+                after = subprocess.run(
+                    ["git", "status", "--porcelain=v1"],
+                    cwd=repo,
+                    capture_output=True,
+                    text=True,
+                    check=True,
+                ).stdout
+                self.assertEqual(after, before)
 
     def test_direct_installer_platform_gate_is_kernel_only(self) -> None:
         fixtures = {

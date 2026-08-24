@@ -20,14 +20,14 @@ permissions:
   contents: read
 
 jobs:
-  python39-contract:
-    name: Python 3.9 Linux host contract
+  python314-contract:
+    name: Python 3.14 Linux host contract
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: '3.9'
+          python-version: '3.14'
       # These acceptance modules are stdlib-only. Keeping this lane free of a
       # package install proves the clean host contract instead of the dev kit.
       - name: Run host and temporary-repository acceptance
@@ -51,7 +51,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: '3.x'
+          python-version: '3.14'
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
@@ -80,6 +80,6 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: '3.x'
+          python-version: '3.14'
       - name: Rebuild + render + headless boot
         run: ./sc verify

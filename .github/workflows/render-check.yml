@@ -17,7 +17,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: '3.x'
+          python-version: '3.14'
       - name: Rebuild the DB from public system text
         run: ./sc rebuild
       - name: Prove public skill migrations match engine assets
