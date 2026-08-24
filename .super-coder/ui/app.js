@@ -2485,11 +2485,11 @@ const AN_PROVIDER_LABEL = { anthropic: "Claude", openai: "Codex", moonshot: "Kim
 // stops at "how much is left" — the FnB's ruling that retired account identity
 // rests on the provider's own page being one click away, so the link is part of
 // the design and not a convenience. Each URL is taken from the harness CLI's own
-// binary rather than guessed; Kimi links to its Code usage console.
+// binary rather than guessed; Kimi links straight to its membership quota tab.
 const AN_PROVIDER_USAGE_URL = {
   anthropic: "https://claude.ai/settings/usage",
   openai: "https://chatgpt.com/codex/settings/usage",
-  moonshot: "https://www.kimi.com/code/console",
+  moonshot: "https://www.kimi.ai/membership/subscription?tab=quota",
 };
 // Display order for a card's windows. Unrecognized kinds sort last rather than
 // being dropped — the probe stores a window it could not map under its raw
@@ -2536,23 +2536,33 @@ function anAge(iso) {
   return ms <= 0 ? "just now" : anDuration(ms) + " ago";
 }
 
-function anWindowRow(w) {
+function anWindowRow(w, provider) {
   const pct = w.used_percent;
+  // Kimi's own usage surface presents quota remaining. Its endpoint commonly
+  // normalizes limit/used to a 100-point scale, so rendering `28 / 100` looks
+  // like an absolute request allowance and inverts the 72%-left figure the
+  // operator sees on Kimi. Keep used_percent as the threshold source, but make
+  // Kimi's presentation match the provider: remaining bar + explicit label,
+  // and no count-like rendering of percentage-normalized values.
+  const isKimi = provider === "moonshot";
+  const displayPct = isKimi && pct != null
+    ? Math.max(0, Math.min(100, 100 - pct)) : pct;
+  const pctText = isKimi && pct != null ? anPct(displayPct) + " left" : anPct(pct);
   const row = el("div", { className: "an-win" });
   row.append(el("div", { className: "an-win-head" },
     el("span", { className: "an-win-name" }, anWindowName(w)),
-    el("span", { className: "an-win-pct" + anQuotaClass(pct) }, anPct(pct))));
+    el("span", { className: "an-win-pct" + anQuotaClass(pct) }, pctText)));
   const meter = el("div", { className: "an-meter" });
   if (pct != null) {
     // Clamped: a provider reporting over 100 fills the track, it does not
     // overflow it. NULL draws no fill at all — an empty track is honest.
     const fill = el("div", { className: "an-meter-fill" + anQuotaClass(pct) });
-    fill.style.width = Math.max(0, Math.min(100, pct)) + "%";
+    fill.style.width = Math.max(0, Math.min(100, displayPct)) + "%";
     meter.append(fill);
   }
   row.append(meter);
   const meta = [];
-  if (w.used != null || w.limit_value != null)
+  if (!isKimi && (w.used != null || w.limit_value != null))
     meta.push(["used", (w.used == null ? "—" : fmt(w.used))
       + " / " + (w.limit_value == null ? "—" : fmt(w.limit_value))]);
   meta.push(["resets", anCountdown(w.resets_at)]);
@@ -2617,7 +2627,7 @@ function anProviderCard(prov) {
   if (!wins.length)
     card.append(el("div", { className: "muted" },
       prov.status === "ok" ? "no windows reported" : "no reading yet"));
-  for (const w of wins) card.append(anWindowRow(w));
+  for (const w of wins) card.append(anWindowRow(w, prov.provider));
 
   const foot = el("div", { className: "an-acct-foot" });
   // THE AGE IS NEVER OMITTED AND NEVER SOFTENED. It is the whole of the

@@ -96,17 +96,18 @@ MUTATIONS = [
         "M5 the meter is unclamped — a provider reporting over 100 overflows "
         "the track instead of filling it",
         "threshold_driven",
-        "    fill.style.width = Math.max(0, Math.min(100, pct)) + \"%\";",
-        "    fill.style.width = pct + \"%\";",
+        "    fill.style.width = Math.max(0, Math.min(100, displayPct)) + \"%\";",
+        "    fill.style.width = displayPct + \"%\";",
     ),
     (
         "M6 COLOUR IS TAKEN FROM THE PROVIDER'S STATUS instead of used_percent "
         "— openai's limit_reached painted red at 22%. Every consistent fixture "
         "stays green under this; only the contradictory card reddens",
         "provider_status_never_decides_colour",
-        "  for (const w of wins) card.append(anWindowRow(w));",
+        "  for (const w of wins) card.append(anWindowRow(w, prov.provider));",
         "  for (const w of wins) card.append(anWindowRow("
-        "status === \"error\" ? { ...w, used_percent: 100 } : w));",
+        "status === \"error\" ? { ...w, used_percent: 100 } : w, "
+        "prov.provider));",
     ),
     (
         "M7 the accounts array drives provider state — the status list is "
