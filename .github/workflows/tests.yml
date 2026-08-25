@@ -18,16 +18,6 @@ permissions:
   contents: read
 
 jobs:
-  windows-dsh-provenance:
-    name: Windows DSH native provenance contract
-    runs-on: windows-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: Exercise native fact mapping and bounded Windows pipe framing
-        shell: pwsh
-        run: >-
-          ./tests/fixtures/test_deepseek_dsh_windows_native_adapter.ps1
-
   python314-contract:
     name: Python 3.14 Linux host contract
     runs-on: ubuntu-24.04

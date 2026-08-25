@@ -19,22 +19,6 @@ CONTRACT_PATH = ROOT / ".super-coder/assets/deepseek/dsh-shell-authority-contrac
 NODE_PROBE = ROOT / "tests/fixtures/deepseek_dsh_shell_env_probe.mjs"
 INVENTORY_PROBE = ROOT / ".super-coder/scripts/dsh_preparation_inventory.py"
 PROVENANCE_PROBE = ROOT / ".super-coder/scripts/dsh_execution_provenance.py"
-WINDOWS_PROBE = ROOT / "tests/fixtures/deepseek_dsh_job_object_probe.ps1"
-WINDOWS_DESCRIPTOR_PROBE = (
-    ROOT / "tests/fixtures/deepseek_dsh_windows_descriptor_probe.mjs"
-)
-WINDOWS_DESCRIPTOR_VECTORS = (
-    ROOT / "tests/fixtures/deepseek_dsh_windows_descriptor_vectors.json"
-)
-WINDOWS_PROVENANCE_POLICY = (
-    ROOT / "tests/fixtures/deepseek_dsh_windows_provenance_policy.json"
-)
-WINDOWS_NATIVE_ADAPTER = (
-    ROOT / "tests/fixtures/deepseek_dsh_windows_native_adapter.ps1"
-)
-WINDOWS_BEHAVIOR_PROBE = (
-    ROOT / "tests/fixtures/test_deepseek_dsh_windows_native_adapter.ps1"
-)
 EFFECT_DRIVER = ROOT / "tests/fixtures/deepseek_dsh_effect_driver.py"
 SOURCE_ROOTS = (ROOT / ".super-coder/scripts", ROOT / ".super-coder/api")
 REQUIRED_SEALS = (
@@ -181,24 +165,6 @@ def sha256(path):
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def callsite_parts(key):
-    path, line, column, call = key.rsplit(":", 3)
-    return path, int(line), int(column), call
-
-
-def expand_effect_ranges(ranges):
-    identifiers = []
-    for value in ranges:
-        if ".." not in value:
-            identifiers.append(value)
-            continue
-        first, last = value.split("..", 1)
-        start = int(first.removeprefix("effect-"))
-        end = int(last.removeprefix("effect-"))
-        identifiers.extend(f"effect-{number:04d}" for number in range(start, end + 1))
-    return identifiers
-
-
 @contextmanager
 def linux_domain_fixture(kind):
     with tempfile.TemporaryDirectory() as raw:
@@ -325,6 +291,20 @@ class DeepSeekDshPreparationContractTests(unittest.TestCase):
             (ROOT / ".super-coder/adapters/deepseek/adapter.json").read_text()
         )
         release = self.contract["dsh_release"]
+        self.assertEqual(
+            self.contract["governing_revision"],
+            {
+                "document_id": 174,
+                "current_sha256": "84056c2fc7206b83f2d3beb71150545326d5e33f557cb5f2329f55321eab0bdf",
+                "sprint_bound_sha256": "a305eba5c73988d202e3f3f9d392d623645b3f799dfe4ab4945687026ae5a969",
+                "scope_decision_id": 255,
+                "drift_disposition": "retain the immutable v3 Sprint binding as evidence; current Doc 174 v4 and Decision 255 govern this corrected head",
+                "task_id": 648,
+                "sprint_id": 24,
+                "work_unit_id": 95,
+                "implementation_base": "83a1bcaaac513e24446c78bab6b41c8932610fba",
+            },
+        )
         self.assertEqual(adapter["official_runtime"]["version"], release["version"])
         self.assertEqual(adapter["official_runtime"]["tag"], release["tag"])
         self.assertEqual(adapter["official_runtime"]["commit"], release["commit"])
@@ -455,39 +435,10 @@ class DeepSeekDshPreparationContractTests(unittest.TestCase):
                 "contract": "sc-dsh-linux-cgroup-v2-v1",
             },
         )
-        self.assertEqual(
-            provenance["windows_contributor"]["sha256"],
-            sha256(WINDOWS_PROBE),
-        )
-        self.assertEqual(
-            provenance["windows_contributor"]["contract"],
-            "sc-dsh-windows-job-object-v2",
-        )
-        descriptor = provenance["windows_contributor"]["descriptor"]
-        self.assertEqual(descriptor["vector_sha256"], sha256(WINDOWS_DESCRIPTOR_VECTORS))
-        self.assertEqual(
-            descriptor["executable_probe_sha256"],
-            sha256(WINDOWS_DESCRIPTOR_PROBE),
-        )
-        self.assertEqual(
-            descriptor["native_adapter_sha256"], sha256(WINDOWS_NATIVE_ADAPTER)
-        )
-        self.assertEqual(
-            descriptor["windows_behavior_probe_sha256"],
-            sha256(WINDOWS_BEHAVIOR_PROBE),
-        )
-        self.assertEqual(
-            descriptor["schema"],
-            [
-                "binding_generation",
-                "contract",
-                "domain_id",
-                "expires_unix_ms",
-                "issued_unix_ms",
-                "job_handle",
-                "process_id",
-            ],
-        )
+        self.assertNotIn("windows", provenance)
+        self.assertNotIn("windows_contributor", provenance)
+        self.assertIn("Arch and Ubuntu Linux only", provenance["platform_boundary"])
+        self.assertIn("pwsh", provenance["executor_rule"])
         self.assertEqual(
             provenance["bootstrap_order"][3],
             "under managed membership refuse SC_DISPATCH, SC_CALLER_ROOT, "
@@ -633,9 +584,10 @@ class DeepSeekDshPreparationContractTests(unittest.TestCase):
                 )
                 self.assertEqual(outcome, expected, f"{surface}:{subcommand}")
 
-    def test_complete_source_sc_signal_and_effect_inventory_is_exact(self):
+    def test_exhaustive_sc_signal_and_bounded_effect_inventory_is_exact(self):
         observed = generated_inventory()
         for name in (
+            "bounded_audit_scope",
             "source_sha256_inventory",
             "direct_sc_signal_inventory",
             "ambient_sc_policy",
@@ -645,14 +597,8 @@ class DeepSeekDshPreparationContractTests(unittest.TestCase):
             "direct_effect_signal_inventory",
             "risky_call_inventory",
             "risky_call_classification",
-            "risky_callsite_inventory",
-            "effect_callsite_inventory",
-            "effect_callsite_id_inventory",
             "route_entrypoint_inventory",
-            "route_source_reachability",
-            "direct_consumer_policy",
-            "route_effect_binding_inventory",
-            "effect_callsite_policy_rule",
+            "bounded_direct_consumer_inventory",
             "effect_detector_vocabulary",
         ):
             self.assertEqual(observed[name], self.contract[name], name)
@@ -680,19 +626,41 @@ class DeepSeekDshPreparationContractTests(unittest.TestCase):
             ".super-coder/scripts/mem.py",
             self.contract["direct_sc_signal_inventory"]["SC_MEM_AS"],
         )
+        scope = self.contract["bounded_audit_scope"]
+        expected_scope = {
+            "sc",
+            ".super-coder/scripts/dispatch.sh",
+            ".super-coder/scripts/job.py",
+            ".super-coder/scripts/map_finalize.py",
+            ".super-coder/scripts/mem.py",
+            ".super-coder/scripts/models.py",
+            ".super-coder/scripts/pr_cli.py",
+            ".super-coder/scripts/skill.py",
+        }
+        self.assertEqual(set(scope["paths"]), expected_scope)
+        self.assertEqual(set(self.contract["source_sha256_inventory"]), expected_scope)
+        self.assertIn("no route-to-callsite", scope["rule"])
+        self.assertIn("whole-program", scope["rule"])
+        for excluded in (
+            "risky_callsite_inventory",
+            "effect_callsite_inventory",
+            "effect_callsite_id_inventory",
+            "route_source_reachability",
+            "direct_consumer_policy",
+            "route_effect_binding_inventory",
+            "effect_callsite_policy_rule",
+        ):
+            self.assertNotIn(excluded, self.contract)
         effects = self.contract["direct_effect_signal_inventory"]
         self.assertIn(
-            ".super-coder/scripts/map_setup.py",
-            effects["filesystem_write"],
+            ".super-coder/scripts/map_finalize.py",
+            effects["direct_db_write"],
         )
-        self.assertIn("os.chmod", self.contract["effect_call_vocabulary"]["filesystem_write"])
+        self.assertIn("os.open", self.contract["effect_call_vocabulary"]["filesystem_write"])
         for path in (
+            ".super-coder/scripts/map_finalize.py",
             ".super-coder/scripts/models.py",
             ".super-coder/scripts/skill.py",
-            ".super-coder/api/conversation_routes.py",
-            ".super-coder/api/review_routes.py",
-            ".super-coder/api/server.py",
-            ".super-coder/scripts/sprint_runtime.py",
         ):
             self.assertTrue(
                 any(
@@ -706,7 +674,6 @@ class DeepSeekDshPreparationContractTests(unittest.TestCase):
         self.assertIn("db_connection.execute.read", db_vocabulary["direct_db_read"])
         self.assertIn("db_connection.execute.write", db_vocabulary["direct_db_write"])
         self.assertIn("db_connection.commit", db_vocabulary["direct_db_write"])
-        self.assertIn("db_connection.rollback", db_vocabulary["direct_db_write"])
         detector = self.contract["effect_detector_vocabulary"]
         self.assertTrue({"chmod", "mkdir", "rename"} <= set(detector["filesystem_write_methods"]))
         self.assertTrue(
@@ -716,105 +683,50 @@ class DeepSeekDshPreparationContractTests(unittest.TestCase):
         risky = self.contract["risky_call_inventory"]
         classifications = self.contract["risky_call_classification"]
         self.assertEqual(set(risky), set(classifications))
-        self.assertEqual(classifications["asyncio.open_connection"], "api_effect")
-        self.assertEqual(classifications["asyncio.start_server"], "api_effect")
-        self.assertEqual(classifications["http.client.HTTPConnection"], "api_effect")
+        self.assertEqual(classifications["db_driver.connect"], "direct_db")
+        self.assertEqual(classifications["os.environ.get"], "credential_discovery")
         self.assertEqual(classifications["os.kill"], "process_effect")
         self.assertEqual(classifications["os.killpg"], "process_effect")
-        self.assertEqual(classifications["os.write"], "filesystem_write")
-        self.assertEqual(classifications["os.fsync"], "filesystem_write")
-        self.assertEqual(classifications["shutil.copytree"], "filesystem_write")
-        callsites = self.contract["risky_callsite_inventory"]
-        self.assertEqual(
-            {(callsite_parts(key)[3], callsite_parts(key)[0]) for key in callsites},
-            {
-                (call, path)
-                for call, paths in risky.items()
-                for path in paths
-            },
-        )
-        self.assertEqual(
-            len(callsites),
-            len({callsite_parts(key) for key in callsites}),
-        )
-        for key, value in callsites.items():
-            classification, outcome = value.split("|", 1)
-            call = callsite_parts(key)[3]
-            self.assertEqual(classification, classifications[call])
-            expected_policy = (
-                "identity_neutral_read_only"
-                if classification == "identity_neutral_read_only"
-                else "dsh_shell_authorized"
+        self.assertEqual(classifications["os.open"], "filesystem_write")
+        self.assertEqual(classifications["os.read"], "filesystem_read")
+        self.assertEqual(classifications["subprocess.run"], "process_effect")
+        consumers = self.contract["bounded_direct_consumer_inventory"]
+        self.assertEqual(set(consumers), set(scope["paths"]))
+        for path, row in consumers.items():
+            self.assertEqual(row["sha256"], sha256(ROOT / path))
+            self.assertEqual(
+                set(row["sc_signals"]),
+                {
+                    name
+                    for name, paths in self.contract["direct_sc_signal_inventory"].items()
+                    if path in paths
+                },
             )
-            self.assertEqual(outcome, expected_policy)
-        effect_callsites = self.contract["effect_callsite_inventory"]
-        self.assertFalse(
-            any(
-                callsite_parts(key)[3] in {"lowered.replace", "value.replace"}
-                for key in effect_callsites
+            self.assertEqual(
+                set(row["effect_classes"]),
+                {
+                    name
+                    for name, paths in effects.items()
+                    if path in paths
+                },
             )
-        )
-        self.assertEqual(
-            {callsite_parts(key)[3] for key in effect_callsites},
-            {
-                call
-                for calls in self.contract["effect_call_vocabulary"].values()
-                for call in calls
-            },
-        )
-        self.assertEqual(
-            len(effect_callsites),
-            len({callsite_parts(key) for key in effect_callsites}),
-        )
-        for effect_classes in effect_callsites.values():
-            self.assertNotEqual(effect_classes, "")
 
-        identifiers = self.contract["effect_callsite_id_inventory"]
-        self.assertEqual(set(identifiers.values()), set(effect_callsites))
-        self.assertEqual(len(identifiers), len(set(identifiers.values())))
-        bindings = self.contract["route_effect_binding_inventory"]
-        bound_identifiers = {
-            identifier
-            for binding in bindings.values()
-            for identifier in expand_effect_ranges(binding["effect_callsite_ranges"])
-        }
-        self.assertEqual(bound_identifiers, set(identifiers))
-        for route, binding in bindings.items():
-            self.assertTrue(
-                set(expand_effect_ranges(binding["effect_callsite_ranges"]))
-                <= set(identifiers)
-            )
-            if binding["route_outcome"] == "dsh_shell_authorized":
-                self.assertEqual(
-                    binding["post_guard_reachability"],
-                    "guard_required_before_effect",
-                    route,
-                )
-            else:
-                self.assertIn(
-                    binding["route_outcome"],
-                    {"refused", "identity_neutral_read_only"},
-                )
-                self.assertEqual(
-                    binding["post_guard_reachability"],
-                    "zero_after_route_refusal",
-                    route,
-                )
-        callsite_to_id = {callsite: identifier for identifier, callsite in identifiers.items()}
-        expected_refused = {
-            "install": ".super-coder/scripts/install.py:278:13:sqlite3.connect",
-            "update": ".super-coder/scripts/update.py:1088:10:db_driver.connect",
-            "remove": ".super-coder/scripts/remove.py:482:8:shutil.rmtree",
-        }
-        for route, callsite in expected_refused.items():
-            self.assertEqual(bindings[route]["route_outcome"], "refused")
-            self.assertIn(
-                callsite_to_id[callsite],
-                expand_effect_ranges(bindings[route]["effect_callsite_ranges"]),
-            )
-        self.assertEqual(bindings["sprint"]["route_outcome"], "dsh_shell_authorized")
-        self.assertNotEqual(bindings["sprint"]["effect_callsite_ranges"], [])
-        self.assertEqual(bindings["job:_supervise"]["route_outcome"], "refused")
+    def test_native_windows_assets_and_ci_are_excluded(self):
+        excluded = (
+            "tests/fixtures/deepseek_dsh_job_object_probe.ps1",
+            "tests/fixtures/deepseek_dsh_windows_descriptor_probe.mjs",
+            "tests/fixtures/deepseek_dsh_windows_descriptor_vectors.json",
+            "tests/fixtures/deepseek_dsh_windows_native_adapter.ps1",
+            "tests/fixtures/deepseek_dsh_windows_provenance_policy.json",
+            "tests/fixtures/test_deepseek_dsh_windows_native_adapter.ps1",
+        )
+        self.assertEqual(
+            [relative for relative in excluded if (ROOT / relative).exists()],
+            [],
+        )
+        workflow = (ROOT / ".github/workflows/tests.yml").read_text()
+        self.assertNotIn("windows-latest", workflow)
+        self.assertNotIn("Windows DSH native provenance contract", workflow)
 
     def test_inventory_detector_reacts_to_new_authority_and_effect_forms(self):
         with tempfile.TemporaryDirectory() as raw:
@@ -824,7 +736,7 @@ class DeepSeekDshPreparationContractTests(unittest.TestCase):
             scripts.mkdir(parents=True)
             api.mkdir(parents=True)
             (root / "sc").write_text("#!/bin/sh\nexec sh dispatcher\n")
-            sample = scripts / "sample.py"
+            sample = scripts / "mem.py"
             sample.write_text(
                 "import asyncio\n"
                 "import http.client\n"
@@ -862,7 +774,7 @@ class DeepSeekDshPreparationContractTests(unittest.TestCase):
             first = generated_inventory(root)
             self.assertEqual(
                 first["direct_sc_signal_inventory"]["SC_NEW_AUTHORITY"],
-                [".super-coder/scripts/sample.py"],
+                [".super-coder/scripts/mem.py"],
             )
             expected = {
                 "asyncio.open_connection": "api_effect",
@@ -885,27 +797,12 @@ class DeepSeekDshPreparationContractTests(unittest.TestCase):
             self.assertIn("db_connection.execute.write", db_calls["direct_db_write"])
             self.assertIn("db_connection.commit", db_calls["direct_db_write"])
             self.assertIn("db_connection.rollback", db_calls["direct_db_write"])
+            self.assertNotIn("effect_callsite_inventory", first)
+            self.assertNotIn("route_source_reachability", first)
+            self.assertNotIn("route_effect_binding_inventory", first)
             self.assertEqual(
-                sum(
-                    callsite_parts(key)[3] == "db_driver.connect"
-                    for key in first["effect_callsite_inventory"]
-                ),
-                3,
-            )
-            self.assertEqual(
-                sum(
-                    callsite_parts(key)[3] == "db_connection.execute.read"
-                    for key in first["effect_callsite_inventory"]
-                ),
-                3,
-            )
-            self.assertFalse(
-                any(
-                    callsite_parts(key)[3] in {
-                        "text.replace", "items.remove", "stream.open"
-                    }
-                    for key in first["effect_callsite_inventory"]
-                )
+                set(first["bounded_direct_consumer_inventory"]),
+                {".super-coder/scripts/mem.py", "sc"},
             )
             sample.write_text(
                 "import socket\n"
@@ -930,69 +827,6 @@ class DeepSeekDshPreparationContractTests(unittest.TestCase):
                 completed = run_provenance_probe(fixture)
                 self.assertEqual(completed.returncode, 77, completed.stderr)
                 self.assertEqual(json.loads(completed.stdout)["provenance"], "unknown")
-
-    def test_effect_routes_inherit_refusal_and_authorization_from_dispatch(self):
-        with tempfile.TemporaryDirectory() as raw:
-            root = Path(raw)
-            scripts = root / ".super-coder/scripts"
-            api = root / ".super-coder/api"
-            scripts.mkdir(parents=True)
-            api.mkdir(parents=True)
-            (root / "sc").write_text("#!/bin/sh\n")
-            (scripts / "dispatch.sh").write_text(
-                '#!/bin/sh\ncase "$cmd" in\n'
-                '  install) exec "$PY" "$S/sample.py" ;;\n'
-                '  *) exit 1 ;;\n'
-                "esac\n"
-            )
-            (scripts / "sample.py").write_text(
-                "import os\n"
-                "os.unlink('protected')\n"
-            )
-            policy = {
-                "public_command_policy": {
-                    "identity_neutral_read_only": [],
-                    "dsh_shell_authorized": [],
-                    "refused": ["install"],
-                    "selector_policies": {},
-                },
-                "literal_subcommand_policy": {},
-                "custom_subcommand_policy": {},
-            }
-            policy_path = root / "policy.json"
-            policy_path.write_text(json.dumps(policy))
-            refused = generated_inventory(root, policy_path)
-            binding = refused["route_effect_binding_inventory"]["install"]
-            self.assertEqual(binding["route_outcome"], "refused")
-            self.assertEqual(
-                binding["post_guard_reachability"],
-                "zero_after_route_refusal",
-            )
-            identifiers = expand_effect_ranges(binding["effect_callsite_ranges"])
-            self.assertEqual(len(identifiers), 1)
-            identifier = identifiers[0]
-            callsite = refused["effect_callsite_id_inventory"][identifier]
-            self.assertEqual(
-                callsite,
-                ".super-coder/scripts/sample.py:2:0:os.unlink",
-            )
-
-            policy["public_command_policy"]["refused"] = []
-            policy["public_command_policy"]["dsh_shell_authorized"] = ["install"]
-            policy_path.write_text(json.dumps(policy))
-            authorized = generated_inventory(root, policy_path)
-            authorized_binding = authorized["route_effect_binding_inventory"]["install"]
-            self.assertEqual(
-                authorized_binding["route_outcome"], "dsh_shell_authorized"
-            )
-            self.assertEqual(
-                authorized_binding["post_guard_reachability"],
-                "guard_required_before_effect",
-            )
-            self.assertEqual(
-                expand_effect_ranges(authorized_binding["effect_callsite_ranges"]),
-                [identifier],
-            )
 
     def test_managed_and_spoofed_selectors_refuse_before_external_effects(self):
         aliases = {
@@ -1144,150 +978,6 @@ class DeepSeekDshPreparationContractTests(unittest.TestCase):
                     seam["source_sha256"],
                 )
 
-    def test_windows_job_object_contributor_is_exact_and_non_breakaway(self):
-        source = WINDOWS_PROBE.read_text()
-        self.assertEqual(
-            sha256(WINDOWS_PROBE),
-            self.contract["execution_provenance"]["windows_contributor"]["sha256"],
-        )
-        for marker in (
-            "IsProcessInJob",
-            "QueryInformationJobObject",
-            "JOB_OBJECT_LIMIT_BREAKAWAY_OK",
-            "JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK",
-            "NtQueryObject",
-            "FILE_TYPE_PIPE",
-            "FORBIDDEN_WRITE_ACCESS",
-            "ImportSubjectPublicKeyInfo",
-            "VerifyData",
-            'foreach ($rule in $Policy.rules)',
-            '$rule.stage -eq "native"',
-            '$rule.stage -eq "descriptor"',
-        ):
-            self.assertIn(marker, source)
-
-        completed = subprocess.run(
-            [
-                "node",
-                str(WINDOWS_DESCRIPTOR_PROBE),
-                str(WINDOWS_DESCRIPTOR_VECTORS),
-                str(WINDOWS_PROVENANCE_POLICY),
-                str(WINDOWS_PROBE),
-                str(WINDOWS_NATIVE_ADAPTER),
-            ],
-            cwd=ROOT,
-            text=True,
-            capture_output=True,
-            timeout=10,
-            check=False,
-        )
-        self.assertEqual(completed.returncode, 0, completed.stderr)
-        receipt = json.loads(completed.stdout)
-        self.assertEqual(receipt["accepted"], ["valid"])
-        self.assertEqual(
-            receipt["refused"],
-            [
-                "arbitrary-file",
-                "mutable-pipe",
-                "unreadable",
-                "wrong-job",
-                "wrong-process",
-                "stale",
-                "extra-field",
-                "zero-generation",
-                "breakaway",
-                "not-job-member",
-                "membership-api-failed",
-                "bad-signature",
-                "malformed",
-            ],
-        )
-        self.assertEqual(receipt["powershellSha256"], sha256(WINDOWS_PROBE))
-        self.assertEqual(
-            receipt["vectorsSha256"],
-            sha256(WINDOWS_DESCRIPTOR_VECTORS),
-        )
-        self.assertEqual(receipt["policySha256"], sha256(WINDOWS_PROVENANCE_POLICY))
-        self.assertEqual(
-            receipt["nativeAdapterSha256"], sha256(WINDOWS_NATIVE_ADAPTER)
-        )
-        descriptor = self.contract["execution_provenance"]["windows_contributor"]["descriptor"]
-        self.assertEqual(descriptor["shared_policy_sha256"], sha256(WINDOWS_PROVENANCE_POLICY))
-        self.assertEqual(descriptor["executable_probe_sha256"], sha256(WINDOWS_DESCRIPTOR_PROBE))
-
-    def test_windows_contributor_sensitive_mutations_fail_shared_policy_proof(self):
-        source = WINDOWS_PROBE.read_text()
-        mutations = {
-            "signature": (
-                "signature_valid = $signatureValid",
-                "signature_valid = $true",
-            ),
-            "policy-loop": (
-                "-not (Test-PolicyRule $rule $state)",
-                "$false",
-            ),
-        }
-        with tempfile.TemporaryDirectory() as raw:
-            for name, (old, new) in mutations.items():
-                self.assertIn(old, source)
-                mutated = Path(raw) / f"{name}.ps1"
-                mutated.write_text(source.replace(old, new, 1))
-                completed = subprocess.run(
-                    [
-                        "node",
-                        str(WINDOWS_DESCRIPTOR_PROBE),
-                        str(WINDOWS_DESCRIPTOR_VECTORS),
-                        str(WINDOWS_PROVENANCE_POLICY),
-                        str(mutated),
-                        str(WINDOWS_NATIVE_ADAPTER),
-                    ],
-                    cwd=ROOT,
-                    text=True,
-                    capture_output=True,
-                    timeout=10,
-                    check=False,
-                )
-                self.assertNotEqual(completed.returncode, 0, name)
-
-    def test_refreshing_windows_policy_hash_cannot_bless_weakened_rules(self):
-        policy = json.loads(WINDOWS_PROVENANCE_POLICY.read_text())
-        source = WINDOWS_PROBE.read_text()
-        old_hash = sha256(WINDOWS_PROVENANCE_POLICY)
-        with tempfile.TemporaryDirectory() as raw:
-            root = Path(raw)
-            for rule_id in (
-                "job-member",
-                "immutable-handle",
-                "valid-signature",
-                "exact-schema",
-                "not-expired",
-            ):
-                mutated_policy = dict(policy)
-                mutated_policy["rules"] = [
-                    rule for rule in policy["rules"] if rule["id"] != rule_id
-                ]
-                policy_path = root / f"{rule_id}.json"
-                policy_path.write_text(f"{json.dumps(mutated_policy, indent=2)}\n")
-                new_hash = sha256(policy_path)
-                probe_path = root / f"{rule_id}.ps1"
-                probe_path.write_text(source.replace(old_hash, new_hash, 1))
-                completed = subprocess.run(
-                    [
-                        "node",
-                        str(WINDOWS_DESCRIPTOR_PROBE),
-                        str(WINDOWS_DESCRIPTOR_VECTORS),
-                        str(policy_path),
-                        str(probe_path),
-                        str(WINDOWS_NATIVE_ADAPTER),
-                    ],
-                    cwd=ROOT,
-                    text=True,
-                    capture_output=True,
-                    timeout=10,
-                    check=False,
-                )
-                self.assertNotEqual(completed.returncode, 0, rule_id)
-
     def test_real_pinned_dsh_components_reproduce_clean_room_fixture(self):
         dsh = shutil.which("dsh")
         self.assertIsNotNone(dsh, "pinned dsh is required for the executable fixture")
@@ -1309,24 +999,9 @@ class DeepSeekDshPreparationContractTests(unittest.TestCase):
             set(receipt["runtimeHashes"]),
             {seam["name"] for seam in self.contract["supported_seams"]},
         )
-        self.assertEqual(receipt["powershellParity"]["accepted"], ["valid"])
         self.assertEqual(
-            set(receipt["powershellParity"]["refused"]),
-            {
-                "arbitrary-file",
-                "mutable-pipe",
-                "unreadable",
-                "wrong-job",
-                "wrong-process",
-                "stale",
-                "extra-field",
-                "zero-generation",
-                "breakaway",
-                "not-job-member",
-                "membership-api-failed",
-                "bad-signature",
-                "malformed",
-            },
+            receipt["powershellToolExecutionSeam"],
+            "supported-linux-only",
         )
 
 

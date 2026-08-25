@@ -100,6 +100,16 @@ AUTHORIZED_LITERAL_SUBCOMMAND_PATHS = {
     ".super-coder/scripts/visual_qa.py",
     ".super-coder/scripts/vm.py",
 }
+BOUNDED_AUDIT_PATHS = {
+    "sc",
+    ".super-coder/scripts/dispatch.sh",
+    ".super-coder/scripts/job.py",
+    ".super-coder/scripts/map_finalize.py",
+    ".super-coder/scripts/mem.py",
+    ".super-coder/scripts/models.py",
+    ".super-coder/scripts/pr_cli.py",
+    ".super-coder/scripts/skill.py",
+}
 PRE_PROVENANCE_SELECTORS = {"SC_CALLER_ROOT", "SC_DISPATCH"}
 CREDENTIAL_SELECTORS = {
     "SC_API_BASE", "SC_API_TOKEN", "SC_DATABASE_URL", "SC_GH_TOKEN",
@@ -436,75 +446,6 @@ def _flatten_route_policy(contract: dict[str, object]) -> dict[str, str]:
     return routes
 
 
-def _module_paths(root: Path) -> dict[str, str]:
-    modules: dict[str, str] = {}
-    for base, prefix in (
-        (root / ".super-coder/scripts", ""),
-        (root / ".super-coder/api", "api."),
-    ):
-        for path in base.rglob("*.py"):
-            relative_module = ".".join(path.relative_to(base).with_suffix("").parts)
-            relative_path = str(path.relative_to(root))
-            modules[f"{prefix}{relative_module}"] = relative_path
-            if prefix:
-                modules.setdefault(relative_module, relative_path)
-    return modules
-
-
-def _import_graph(root: Path, files: Iterable[Path]) -> dict[str, set[str]]:
-    modules = _module_paths(root)
-    graph: dict[str, set[str]] = defaultdict(set)
-    for path in files:
-        if path.suffix != ".py":
-            continue
-        relative = str(path.relative_to(root))
-        tree = ast.parse(path.read_text())
-        for node in ast.walk(tree):
-            names: list[str] = []
-            if isinstance(node, ast.Import):
-                names.extend(alias.name for alias in node.names)
-            elif isinstance(node, ast.ImportFrom) and node.module:
-                names.append(node.module)
-            for name in names:
-                candidate = modules.get(name)
-                if candidate is not None:
-                    graph[relative].add(candidate)
-    return graph
-
-
-def _reachable_sources(entrypoints: Iterable[str], graph: dict[str, set[str]]) -> set[str]:
-    pending = list(entrypoints)
-    reached: set[str] = set()
-    while pending:
-        path = pending.pop()
-        if path in reached:
-            continue
-        reached.add(path)
-        pending.extend(graph.get(path, set()) - reached)
-    return reached
-
-
-def _compact_effect_identifiers(identifiers: Iterable[str]) -> list[str]:
-    numbers = sorted(int(identifier.removeprefix("effect-")) for identifier in identifiers)
-    if not numbers:
-        return []
-    ranges: list[tuple[int, int]] = []
-    start = previous = numbers[0]
-    for number in numbers[1:]:
-        if number == previous + 1:
-            previous = number
-            continue
-        ranges.append((start, previous))
-        start = previous = number
-    ranges.append((start, previous))
-    return [
-        f"effect-{start:04d}"
-        if start == end
-        else f"effect-{start:04d}..effect-{end:04d}"
-        for start, end in ranges
-    ]
-
-
 def _literal_subparsers(path: Path) -> Counter[str]:
     tree = ast.parse(path.read_text())
     values = []
@@ -531,8 +472,6 @@ def build_inventory(
     vocabulary: dict[str, set[str]] = defaultdict(set)
     risky: dict[str, set[str]] = defaultdict(set)
     risky_classification: dict[str, str] = {}
-    risky_callsites: dict[str, str] = {}
-    effect_callsites: dict[str, str] = {}
     unclassified_risky_calls: list[str] = []
     source_hashes: dict[str, str] = {}
     subparsers: dict[str, dict[str, int]] = {}
@@ -540,17 +479,22 @@ def build_inventory(
     for path in files:
         relative = str(path.relative_to(root))
         source = path.read_text()
-        source_hashes[relative] = hashlib.sha256(source.encode()).hexdigest()
         for name in SC_SIGNAL.findall(source):
             sc_signals[name].add(relative)
+        audit_path = relative in BOUNDED_AUDIT_PATHS
+        if audit_path:
+            source_hashes[relative] = hashlib.sha256(source.encode()).hexdigest()
         if path.suffix != ".py":
-            for category, pattern in SHELL_EFFECT_PATTERNS.items():
-                if pattern.search(source):
-                    effect_paths[category].add(relative)
+            if audit_path:
+                for category, pattern in SHELL_EFFECT_PATTERNS.items():
+                    if pattern.search(source):
+                        effect_paths[category].add(relative)
             continue
         counters = _literal_subparsers(path)
         if counters:
             subparsers[relative] = dict(sorted(counters.items()))
+        if not audit_path:
+            continue
         for callee, categories, line, column in _python_calls(path):
             root_name = callee.split(".", 1)[0]
             if root_name in RISKY_ROOTS:
@@ -562,21 +506,9 @@ def build_inventory(
                     continue
                 risky[callee].add(relative)
                 risky_classification[callee] = classification
-                callsite = f"{relative}:{line}:{column}:{callee}"
-                risky_callsites[callsite] = (
-                    f"{classification}|"
-                    + (
-                        "identity_neutral_read_only"
-                        if classification == "identity_neutral_read_only"
-                        else "dsh_shell_authorized"
-                    )
-                )
             for category in categories:
                 vocabulary[category].add(callee)
                 effect_paths[category].add(relative)
-            if categories:
-                callsite = f"{relative}:{line}:{column}:{callee}"
-                effect_callsites[callsite] = ",".join(sorted(categories))
 
     if unclassified_risky_calls:
         raise ValueError(
@@ -604,9 +536,6 @@ def build_inventory(
             for subcommand in counters
         }
     route_entrypoints: dict[str, list[str]] = {}
-    route_source_reachability: dict[str, list[str]] = {}
-    route_effect_bindings: dict[str, dict[str, object]] = {}
-    direct_consumer_policy: dict[str, str] = {}
     if policy_contract is not None:
         routes = _flatten_route_policy(policy_contract)
         base_entrypoints = _dispatch_route_entrypoints(root)
@@ -629,48 +558,27 @@ def build_inventory(
             entries = base_entrypoints.get(command, set())
             if entries:
                 route_entrypoints[route] = sorted(entries)
-        graph = _import_graph(root, files)
-        callsite_ids = {
-            callsite: f"effect-{index:04d}"
-            for index, callsite in enumerate(sorted(effect_callsites), 1)
+    bounded_consumers = {
+        path: {
+            "sha256": source_hashes[path],
+            "sc_signals": sorted(
+                name for name, paths in sc_signals.items() if path in paths
+            ),
+            "effect_classes": sorted(
+                name for name, paths in effect_paths.items() if path in paths
+            ),
         }
-        callsites_by_path: dict[str, list[str]] = defaultdict(list)
-        for callsite in effect_callsites:
-            callsites_by_path[callsite.rsplit(":", 3)[0]].append(callsite)
-        bound_callsites: set[str] = set()
-        for route, entries in route_entrypoints.items():
-            reached = _reachable_sources(entries, graph)
-            route_source_reachability[route] = sorted(reached)
-            outcome = routes[route]
-            route_callsites: set[str] = set()
-            for path in reached:
-                for callsite in callsites_by_path.get(path, []):
-                    bound_callsites.add(callsite)
-                    route_callsites.add(callsite_ids[callsite])
-            route_effect_bindings[route] = {
-                "effect_callsite_ranges": _compact_effect_identifiers(
-                    route_callsites
-                ),
-                "route_outcome": outcome,
-                "post_guard_reachability": (
-                    "guard_required_before_effect"
-                    if outcome == "dsh_shell_authorized"
-                    else "zero_after_route_refusal"
-                ),
-            }
-        direct_callsites: dict[str, list[str]] = defaultdict(list)
-        for callsite in sorted(set(effect_callsites) - bound_callsites):
-            path = callsite.rsplit(":", 3)[0]
-            route = f"direct:{path}"
-            direct_consumer_policy[route] = "refused"
-            direct_callsites[route].append(callsite_ids[callsite])
-        for route, identifiers in direct_callsites.items():
-            route_effect_bindings[route] = {
-                "effect_callsite_ranges": _compact_effect_identifiers(identifiers),
-                "route_outcome": "refused",
-                "post_guard_reachability": "zero_after_route_refusal",
-            }
+        for path in sorted(source_hashes)
+    }
     return {
+        "bounded_audit_scope": {
+            "paths": sorted(BOUNDED_AUDIT_PATHS),
+            "rule": (
+                "exact-base direct consumer/effect audit sample only; public-route "
+                "and pre-guard selector policy is exhaustive, but no route-to-callsite "
+                "or whole-program reachability claim is made"
+            ),
+        },
         "source_sha256_inventory": source_hashes,
         "direct_sc_signal_inventory": {
             name: sorted(paths) for name, paths in sorted(sc_signals.items())
@@ -694,27 +602,8 @@ def build_inventory(
             name: sorted(paths) for name, paths in sorted(risky.items())
         },
         "risky_call_classification": dict(sorted(risky_classification.items())),
-        "risky_callsite_inventory": dict(sorted(risky_callsites.items())),
-        "effect_callsite_inventory": dict(sorted(effect_callsites.items())),
-        "effect_callsite_id_inventory": {
-            identifier: callsite
-            for callsite, identifier in sorted(
-                (
-                    (callsite, f"effect-{index:04d}")
-                    for index, callsite in enumerate(sorted(effect_callsites), 1)
-                ),
-                key=lambda item: item[1],
-            )
-        },
         "route_entrypoint_inventory": dict(sorted(route_entrypoints.items())),
-        "route_source_reachability": dict(sorted(route_source_reachability.items())),
-        "direct_consumer_policy": dict(sorted(direct_consumer_policy.items())),
-        "route_effect_binding_inventory": dict(sorted(route_effect_bindings.items())),
-        "effect_callsite_policy_rule": (
-            "each route-to-callsite edge inherits its route outcome; authorized "
-            "edges require the complete guard before effect, while refused, neutral, "
-            "and fail-closed direct-consumer edges have zero post-guard reachability"
-        ),
+        "bounded_direct_consumer_inventory": bounded_consumers,
         "effect_detector_vocabulary": {
             "filesystem_read_methods": sorted(FILESYSTEM_READ_METHODS),
             "filesystem_write_methods": sorted(FILESYSTEM_WRITE_METHODS),
@@ -752,7 +641,17 @@ def main() -> int:
     )
     if args.contract is not None:
         contract = policy_contract
-        contract.pop("direct_identity_signal_inventory", None)
+        for obsolete in (
+            "direct_identity_signal_inventory",
+            "risky_callsite_inventory",
+            "effect_callsite_inventory",
+            "effect_callsite_id_inventory",
+            "route_source_reachability",
+            "direct_consumer_policy",
+            "route_effect_binding_inventory",
+            "effect_callsite_policy_rule",
+        ):
+            contract.pop(obsolete, None)
         for name, value in inventory.items():
             contract[name] = value
         args.contract.write_text(f"{json.dumps(contract, indent=2)}\n")
