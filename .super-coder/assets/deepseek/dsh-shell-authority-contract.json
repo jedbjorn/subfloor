@@ -123,7 +123,7 @@
     "linux": "engine wrapper creates a sealed descriptor, places the suspended child in an engine-created non-delegated cgroup-v2 domain, and releases it; resolver requires exact /proc/self/cgroup membership, descriptor seals/path/generation/expiry equality, cgroup type domain, and empty subtree delegation",
     "linux_contributor": {
       "path": ".super-coder/scripts/dsh_execution_provenance.py",
-      "sha256": "c9a19bf2819f481d8483c4b20bc86cb77381e77068e51c7382ce3570acf9a96d",
+      "sha256": "bbd11e5ba102d5779add1884eb8ad43b34f1771c2650242f7f280915f874dfb2",
       "contract": "sc-dsh-linux-cgroup-v2-v1"
     },
     "windows": "engine wrapper creates a Job Object, omits breakaway limits, assigns the suspended child, supplies only the job and sealed-descriptor handles through PROC_THREAD_ATTRIBUTE_HANDLE_LIST, then resumes it; contributor queries actual process membership and limits",
@@ -781,8 +781,8 @@
     ".super-coder/scripts/devkit.py": "78f50fd298e38052970dbffbc0d4704b723880d015236d62d3860a2e79fe0b53",
     ".super-coder/scripts/dispatch.sh": "b05b649715f8d3bda783d12f17467511a4d91faca512459431b3183bc12d7551",
     ".super-coder/scripts/docker_cache.py": "edf24867863af2eb827aad75370768d797d7472bd38f2438072076b5fbc614b7",
-    ".super-coder/scripts/dsh_execution_provenance.py": "c9a19bf2819f481d8483c4b20bc86cb77381e77068e51c7382ce3570acf9a96d",
-    ".super-coder/scripts/dsh_preparation_inventory.py": "12ba5b9f869553d2170d5c6e765ae83ea01e8617c6f03f3f68ed3bece4adaee4",
+    ".super-coder/scripts/dsh_execution_provenance.py": "bbd11e5ba102d5779add1884eb8ad43b34f1771c2650242f7f280915f874dfb2",
+    ".super-coder/scripts/dsh_preparation_inventory.py": "8a8921a94bb1b56e9bf1777b50bbe69601bf2cb217ed2bade03a0621d98ba7a3",
     ".super-coder/scripts/eject.py": "05c5ffd08e4409ca6d4bf222e914ec8b893cc94442a849242615d47a130cf123",
     ".super-coder/scripts/engine_manifest.py": "2612855563a6e17573c587c84396b5d188244ec27776bf375590e1e6bb654cc4",
     ".super-coder/scripts/engine_paths.py": "358f5ef77ec1859775edf1a69f3fc4d047364fa41e6c3d1920ffd3567418ecdf",
