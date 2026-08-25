@@ -67,6 +67,7 @@
     "tests/test_sprint_skills.py",
     "tests/test_harness_surfaces.py",
     "tests/test_deepseek_adapter.py",
+    "tests/test_deepseek_candidate_authority.py",
     "tests/test_focused_dev_verification.py",
     "tests/test_sprint_snapshot_rebuild.py",
     "tests/test_route_bindings.py",
