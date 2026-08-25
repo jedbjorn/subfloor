@@ -140,7 +140,7 @@
     },
     "production_linux_contributor": {
       "path": ".super-coder/scripts/deepseek_execution_domain.py",
-      "sha256": "2e456b90356062e61092e64f966a702fc2c8d000605c41e3313cb033067063ac",
+      "sha256": "17d2c812a7d17fd8c482d4709d36c8935242b47a82d416e339a0645f48a0052c",
       "contract": "sc-dsh-linux-cgroup-v2-v3",
       "descriptor_fd": 198,
       "entry": "Wrap only a complete registry-current ToolExecution identity. Refuse partial, stale, copied, wrong-domain, dead-issuer, self-created, and self-entered evidence before user code.",
