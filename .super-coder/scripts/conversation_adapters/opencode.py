@@ -21,6 +21,7 @@ from collections.abc import Iterator, Mapping
 from pathlib import Path
 from typing import Any
 
+import harness_versions
 import opencode_config
 import route_transport
 
@@ -178,6 +179,20 @@ def _server_healthy(endpoint: str, password: str | None) -> bool:
     )
 
 
+def _server_version(endpoint: str, password: str | None) -> str | None:
+    """Read the exact version of one healthy managed execution seat."""
+    try:
+        health = UrlHttpTransport(
+            endpoint,
+            password=password,
+            timeout=1.0,
+        ).request("GET", "/global/health")
+    except AdapterError:
+        return None
+    version = health.get("version") if isinstance(health, dict) else None
+    return version if isinstance(version, str) and version else None
+
+
 def ensure_server(*, timeout: float = 10.0) -> tuple[str, str | None]:
     """Return the endpoint and credential for a healthy ``opencode serve``.
 
@@ -207,6 +222,39 @@ def ensure_server(*, timeout: float = 10.0) -> tuple[str, str | None]:
                 candidates.append(candidate)
         for endpoint, password in candidates:
             if _server_healthy(endpoint, password):
+                first_orphan_adoption = bool(
+                    state
+                    and state_pid is not None
+                    and endpoint == state_endpoint
+                    and password == state["password"]
+                    and _SERVER_PROCESS is None
+                    and (_SERVER_ENDPOINT, _SERVER_PASSWORD)
+                    != (state_endpoint, state["password"])
+                )
+                installed_version = (
+                    harness_versions.probe("opencode")
+                    if first_orphan_adoption
+                    else None
+                )
+                server_version = (
+                    _server_version(endpoint, password)
+                    if installed_version is not None
+                    else None
+                )
+                if (
+                    installed_version is not None
+                    and server_version is not None
+                    and installed_version != server_version
+                    and _pid_is_opencode_serve(state_pid)
+                ):
+                    # A healthy orphan is still the wrong managed-conversation
+                    # execution seat after the CLI is upgraded. Rotate it only
+                    # at first adoption, before this process can hand the
+                    # endpoint to an active conversation.
+                    _clear_server_state()
+                    _reap_orphan_server(state_pid)
+                    state_pid = None
+                    break
                 _SERVER_ENDPOINT = endpoint
                 _SERVER_PASSWORD = password
                 return endpoint, password

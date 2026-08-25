@@ -1297,13 +1297,14 @@ class BuildTest(NoCLI):
     def test_opencode_live_overlay_preserves_admitted_variant_evidence(self):
         connected = mc.opencode_connected_models({
             "_sc_cli_version": "1.18.9",
-            "connected": ["openai"],
+            "connected": ["ollama-cloud"],
             "all": [{
-                "id": "openai",
-                "npm": "@ai-sdk/openai",
-                "models": {"gpt-connected": {
+                "id": "ollama-cloud",
+                "npm": "@ai-sdk/openai-compatible",
+                "models": {"deepseek-v4-pro": {
                     "variants": {
                         "high": {"reasoningEffort": "high"},
+                        "max": {"reasoningEffort": "max"},
                     }
                 }},
             }],
@@ -1315,12 +1316,18 @@ class BuildTest(NoCLI):
             )
 
         model = got["harnesses"]["opencode"]["models"][0]
-        self.assertEqual(model["supported_efforts"], ["high"])
+        self.assertEqual(model["id"], "ollama-cloud/deepseek-v4-pro")
+        self.assertEqual(model["supported_efforts"], ["high", "max"])
         self.assertEqual(model["default_effort"], "high")
-        self.assertEqual(model["native_variant_ids"], {"high": "high"})
+        self.assertEqual(
+            model["native_variant_ids"], {"high": "high", "max": "max"}
+        )
         self.assertEqual(
             model["adapter_metadata"]["variant_options_by_effort"],
-            {"high": {"reasoningEffort": "high"}},
+            {
+                "high": {"reasoningEffort": "high"},
+                "max": {"reasoningEffort": "max"},
+            },
         )
 
     def test_all_sources_down_raises(self):
