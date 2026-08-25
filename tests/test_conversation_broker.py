@@ -1027,6 +1027,8 @@ class StoreContractTest(ConversationBrokerCase):
         run = store.claim_next("broker")
         self.assertIsNotNone(run)
         self.assertEqual(run.message_id, message_id)
+        self.assertEqual(run.lifecycle_epoch, 2)
+        self.assertEqual(run.context().lifecycle_epoch, 2)
         store.mark_starting(run.run_id, "broker")
         store.mark_native_started(
             run.run_id,

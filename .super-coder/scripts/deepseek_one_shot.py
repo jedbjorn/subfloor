@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 import sys
 import time
 import uuid
+from collections.abc import Mapping
 from pathlib import Path
-from typing import Mapping
 
 import deepseek_host
 import deepseek_web
@@ -74,11 +75,19 @@ def _finalize_unknown(client: deepseek_host.HostTransport, session_ref: str) -> 
     )
 
 
-def _run(selector: str, effort: str, prompt: str, *, worktree: Path) -> int:
+def _run(
+    selector: str,
+    effort: str,
+    prompt: str,
+    *,
+    worktree: Path,
+    session_ref: str | None = None,
+) -> int:
     if not prompt.strip():
         raise deepseek_host.DeepSeekHostError(
             "HARNESS_MESSAGE_INVALID", "one-shot prompt must contain text"
         )
+    session_ref = session_ref or f"sc-{uuid.uuid4().hex}"
     client = deepseek_host.DeepSeekHostClient()
     route = deepseek_host.route_for(client, selector)
     if effort != "default" and effort not in route.reasoning_efforts:
@@ -86,7 +95,6 @@ def _run(selector: str, effort: str, prompt: str, *, worktree: Path) -> int:
             "HARNESS_ROUTE_INVALID",
             f"reasoning effort is unavailable for the exact route: {effort}",
         )
-    session_ref = f"sc-{uuid.uuid4().hex}"
     created = client.call(
         "session.create", {"sessionId": session_ref, "cwd": str(worktree)}
     )
@@ -202,15 +210,69 @@ def run(selector: str, effort: str, prompt: str) -> int:
             "DeepSeek one-shot requires canonical shell identity",
         )
     lease = None
+    if env.get("SC_DSH_PROOF_CAPABILITY_FILE"):
+        session_ref = env.get("SC_DSH_PROOF_ROOT_SESSION_ID", "")
+        if re.fullmatch(r"sc-[0-9a-f]{32}", session_ref) is None:
+            raise deepseek_host.DeepSeekHostError(
+                "HARNESS_PROOF_ROOT_REFUSED",
+                "candidate one-shot requires one enumerated exact root session",
+            )
+    else:
+        session_ref = f"sc-{uuid.uuid4().hex}"
     try:
         lease = deepseek_web.acquire_shell_identity(env=env)
         deepseek_web.ensure(worktree, env=env, identity_lease=lease)
+        deepseek_web.bind_session_identity(
+            env=env,
+            root_session_id=session_ref,
+            conversation_id=f"one-shot:{session_ref}",
+            lifecycle_epoch=1,
+            worktree=worktree,
+        )
+        proof_authority = deepseek_web.admit_candidate_execution(
+            env=env,
+            root_session_id=session_ref,
+            conversation_id=f"one-shot:{session_ref}",
+            lifecycle_epoch=1,
+        )
+        if proof_authority is not None:
+            lease.close()
+            lease = None
     except deepseek_web.DeepSeekWebError as exc:
         if lease is not None:
             lease.close()
         raise deepseek_host.DeepSeekHostError(exc.code, exc.detail) from exc
     try:
-        return _run(selector, effort, prompt, worktree=worktree)
+        result = _run(
+            selector,
+            effort,
+            prompt,
+            worktree=worktree,
+            session_ref=session_ref,
+        )
+    except BaseException as exc:
+        busy = (
+            isinstance(exc, deepseek_host.DeepSeekHostError)
+            and exc.code == "HARNESS_ONE_SHOT_BUSY"
+        )
+        if not busy:
+            try:
+                deepseek_web.retire_session_identity(
+                    env=env, root_session_id=session_ref, quiesced=True
+                )
+            except deepseek_web.DeepSeekWebError as retire_exc:
+                raise deepseek_host.DeepSeekHostError(
+                    retire_exc.code, retire_exc.detail
+                ) from retire_exc
+        raise
+    else:
+        try:
+            deepseek_web.retire_session_identity(
+                env=env, root_session_id=session_ref, quiesced=True
+            )
+        except deepseek_web.DeepSeekWebError as exc:
+            raise deepseek_host.DeepSeekHostError(exc.code, exc.detail) from exc
+        return result
     finally:
         if lease is not None:
             lease.close()

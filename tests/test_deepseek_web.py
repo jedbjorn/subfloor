@@ -136,7 +136,7 @@ def test_ensure_starts_exact_stock_web_relay_registers_and_reuses() -> None:
         assert "sc_generation=" not in state["url"]
 
 
-def test_shell_identity_reaches_stock_host_only_through_owner_only_artifact() -> None:
+def test_stock_host_is_identity_neutral_and_receives_only_plugin_contract() -> None:
     with tempfile.TemporaryDirectory() as raw:
         root = Path(raw)
         worktree = root / ".sc-worktrees" / "dev4"
@@ -202,25 +202,24 @@ def test_shell_identity_reaches_stock_host_only_through_owner_only_artifact() ->
         ):
             result = deepseek_web.ensure(worktree, env=env)
 
-        assert result["credential_shell"] == "DEV4"
+        assert result["host_identity"] == "neutral"
         artifact = root / "deepseek-shell-api.json"
-        assert artifact.stat().st_mode & 0o777 == 0o600
-        assert json.loads(artifact.read_text()) == {
-            "shell_id": 4,
-            "shortname": "DEV4",
-            "api_base": "http://127.0.0.1:8837",
-            "token": "shell-token-never-in-host-env",
-        }
+        assert artifact.exists() is False
         assert spawned[0] is not None
         assert "SC_API_TOKEN" not in spawned[0]
         assert "SC_API_BASE" not in spawned[0]
-        assert spawned[0]["SC_MEM_CREDENTIAL_FILE"] == str(artifact)
+        assert "SC_MEM_CREDENTIAL_FILE" not in spawned[0]
+        assert "SC_SHELL_ID" not in spawned[0]
+        assert "SC_SHELL_SHORTNAME" not in spawned[0]
+        assert not any(name.startswith("DSH_SC_") for name in spawned[0])
+        assert spawned[0]["SC_DSH_PROFILE_ID"]
+        assert spawned[0]["DSH_HOME"]
         assert spawned[1] is not None
         assert "SC_API_TOKEN" not in spawned[1]
         assert "SC_API_BASE" not in spawned[1]
 
 
-def test_two_shell_handoff_rotates_only_after_empty_gateway_quiescence() -> None:
+def test_two_shells_reuse_one_identity_neutral_host_under_default_lease() -> None:
     with tempfile.TemporaryDirectory() as raw:
         root = Path(raw)
         first_worktree = root / "pln1"
@@ -299,23 +298,20 @@ def test_two_shell_handoff_rotates_only_after_empty_gateway_quiescence() -> None
             second = deepseek_web.ensure(second_worktree, env=pln2)
 
         state = json.loads((root / "state.json").read_text())
-        credential = json.loads((root / "deepseek-shell-api.json").read_text())
         assert verified == [("4", "DEV4"), ("5", "DEV5")]
-        assert terminated == ["relay", "web", "relay", "web"]
-        assert first["credential_shell"] == "DEV4"
-        assert second["credential_shell"] == "DEV5"
-        assert state["credential_shell_id"] == 5
-        assert credential == {
-            "shell_id": 5,
-            "shortname": "DEV5",
-            "api_base": "http://127.0.0.1:8837",
-            "token": "pln2-token",
-        }
-        assert old_generation not in (root / "state.json").read_text()
+        assert terminated == ["relay", "web"]
+        assert first["host_identity"] == "neutral"
+        assert second["host_identity"] == "neutral"
+        assert second["reused"] is True
+        assert state["host_identity"] == "neutral"
+        assert second["url"].split("sc_generation=", 1)[1] == old_generation
+        assert not (root / "deepseek-shell-api.json").exists()
         assert "pln1-token" not in (root / "state.json").read_text()
-        assert spawned[2][1] is not None
-        assert spawned[2][1]["SC_SHELL_ID"] == "5"
-        assert "SC_API_TOKEN" not in spawned[2][1]
+        assert "pln2-token" not in (root / "state.json").read_text()
+        assert len(spawned) == 2
+        assert spawned[0][1] is not None
+        assert "SC_SHELL_ID" not in spawned[0][1]
+        assert "SC_API_TOKEN" not in spawned[0][1]
 
 
 def test_non_sandbox_entry_still_uses_the_generation_gateway() -> None:
@@ -1821,7 +1817,7 @@ def test_malformed_activity_refuses_handoff_without_terminating_host() -> None:
     terminated.assert_not_called()
 
 
-def test_existing_service_requires_both_shell_id_and_shortname() -> None:
+def test_existing_service_requires_exact_neutral_host_contract() -> None:
     identity = mock.Mock()
     identity.layout.fork_id = "fork-id"
     identity.layout.profile_id = "sc-fork-id"
@@ -1830,14 +1826,13 @@ def test_existing_service_requires_both_shell_id_and_shortname() -> None:
         "plugin_contract_generation": "plugin-contract-test"
     }
     state = {
-        "schema_version": 4,
+        "schema_version": 5,
         "service_port": 8942,
         "relay_port": 18942,
         "relay_policy": deepseek_web.RELAY_POLICY,
         "relay_listen_host": "0.0.0.0",
         "relay_allowed_peers": ["127.0.0.1"],
-        "credential_shell": "DEV4",
-        "credential_shell_id": 4,
+        "host_identity": "neutral",
         "web_pid": 11,
         "web_start_ticks": 12,
         "relay_pid": 13,
@@ -1855,13 +1850,13 @@ def test_existing_service_requires_both_shell_id_and_shortname() -> None:
     ):
         assert deepseek_web._existing_healthy(
             state, 8942, 18942, listen_host="0.0.0.0",
-            allowed_peers=("127.0.0.1",), credential_shell="DEV4", credential_shell_id=4,
+            allowed_peers=("127.0.0.1",),
             identity_registry=identity,
         ) is True
+        changed = {**state, "schema_version": 4}
         assert deepseek_web._existing_healthy(
-            state, 8942, 18942, listen_host="0.0.0.0",
-            allowed_peers=("127.0.0.1",), credential_shell="DEV4", credential_shell_id=5,
-            identity_registry=identity,
+            changed, 8942, 18942, listen_host="0.0.0.0",
+            allowed_peers=("127.0.0.1",), identity_registry=identity,
         ) is False
 
 
@@ -1897,7 +1892,7 @@ def test_status_rejects_a_live_relay_without_the_host_gateway_policy() -> None:
     with tempfile.TemporaryDirectory() as raw:
         root = Path(raw)
         state = {
-            "schema_version": 4,
+            "schema_version": 5,
             "web_pid": 101,
             "web_start_ticks": 201,
             "service_port": 8942,

@@ -774,6 +774,9 @@
       ".super-coder/scripts/dsh_preparation_inventory.py",
       "sc"
     ],
+    "SC_DSH_": [
+      ".super-coder/scripts/deepseek_web.py"
+    ],
     "SC_DSH_FORK_ID": [
       ".super-coder/scripts/deepseek_identity_registry.py"
     ],
@@ -783,6 +786,16 @@
     ],
     "SC_DSH_PROFILE_ID": [
       ".super-coder/scripts/deepseek_identity_registry.py"
+    ],
+    "SC_DSH_PROOF_": [
+      ".super-coder/scripts/deepseek_web.py"
+    ],
+    "SC_DSH_PROOF_CAPABILITY_FILE": [
+      ".super-coder/scripts/deepseek_one_shot.py",
+      ".super-coder/scripts/deepseek_web.py"
+    ],
+    "SC_DSH_PROOF_ROOT_SESSION_ID": [
+      ".super-coder/scripts/deepseek_one_shot.py"
     ],
     "SC_ENGINE_DIR": [
       ".super-coder/scripts/branch-guard.sh",
@@ -954,6 +967,7 @@
       ".super-coder/scripts/branch-guard.sh",
       ".super-coder/scripts/conversation_launch.py",
       ".super-coder/scripts/deepseek_one_shot.py",
+      ".super-coder/scripts/deepseek_web.py",
       ".super-coder/scripts/dsh_preparation_inventory.py",
       ".super-coder/scripts/map_extractor_install.py",
       ".super-coder/scripts/map_finalize.py",
@@ -1381,9 +1395,13 @@
       "SC_DEVKIT_SEAT",
       "SC_DEV_PORT",
       "SC_DISABLED_HARNESSES",
+      "SC_DSH_",
       "SC_DSH_FORK_ID",
       "SC_DSH_HOST_BOOT_GENERATION",
       "SC_DSH_PROFILE_ID",
+      "SC_DSH_PROOF_",
+      "SC_DSH_PROOF_CAPABILITY_FILE",
+      "SC_DSH_PROOF_ROOT_SESSION_ID",
       "SC_GITHUB_AUTH_ARGS",
       "SC_GITHUB_HOST_TRUST_B64",
       "SC_GITHUB_HOST_TRUST_SHA256",

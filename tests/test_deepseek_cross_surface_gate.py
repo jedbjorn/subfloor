@@ -514,9 +514,11 @@ def test_stock_two_shell_cross_surface_refusals_are_side_effect_free(
         alice_lease.close()
         handed = deepseek_web.ensure(bob_worktree, env=bob)
         generation = handed["url"].split("sc_generation=", 1)[1]
-        assert handed["credential_shell"] == "BOB"
-        assert handed["credential_shell_id"] == 42
-        assert generation != old_generation
+        assert handed["host_identity"] == "neutral"
+        assert handed["reused"] is True
+        assert generation == old_generation
+        stale_generation = "0" * 64
+        assert stale_generation != generation
 
         # The shell handoff did create exactly the selected Host workspace;
         # stale Web work below must not add a prompt to this real stock Host.
@@ -536,7 +538,7 @@ def test_stock_two_shell_cross_surface_refusals_are_side_effect_free(
         # A stale tab is rejected by the real generation boundary before the
         # upstream Host can observe a prompt.
         status, stale = _gateway_prompt(
-            public_port, managed_id, query_generation=old_generation
+            public_port, managed_id, query_generation=stale_generation
         )
         assert status == 409 and stale == {"error": "HARNESS_WEB_GENERATION_STALE"}
         assert _host_rpc(upstream_port, "session.history", {"sessionId": managed_id}) == history_before
@@ -689,12 +691,13 @@ def test_stock_two_shell_cross_surface_refusals_are_side_effect_free(
         assert status == 200, accepted
         assert accepted["result"]["ok"] is True
         assert provider.entered.wait(timeout=10)
-        # Closing admission while this accepted stock request is live cannot
-        # rotate Bob's credential to Alice.  The old generation stays current
-        # until terminal proof exists, so the retry is a busy refusal rather
-        # than a destructive cross-shell handoff.
-        with pytest.raises(deepseek_web.DeepSeekWebError, match="(GATEWAY_BUSY|IDENTITY_BUSY)"):
-            deepseek_web.ensure(alice_worktree, env=alice)
+        # The Host is identity-neutral, so a different shell may reuse it while
+        # distinct native-Web work is live without rotating authority or the
+        # gateway generation. The active-session mutation ledger still refuses
+        # a second prompt owner for the same native session.
+        concurrent_reuse = deepseek_web.ensure(alice_worktree, env=alice)
+        assert concurrent_reuse["reused"] is True
+        assert concurrent_reuse["url"].split("sc_generation=", 1)[1] == generation
         assert _gateway_prompt(public_port, native_id, cookie=cookie)[0] == 409
         provider.release.set()
         provider.hold = False
@@ -715,9 +718,9 @@ def test_stock_two_shell_cross_surface_refusals_are_side_effect_free(
             for event in native_history["events"]
         )
         handed_after_web = deepseek_web.ensure(alice_worktree, env=alice)
-        assert handed_after_web["credential_shell"] == "ALICE"
-        status, stale_cookie = _gateway_prompt(public_port, native_id, cookie=cookie)
-        assert status == 409 and stale_cookie == {"error": "HARNESS_WEB_GENERATION_STALE"}
+        assert handed_after_web["host_identity"] == "neutral"
+        assert handed_after_web["reused"] is True
+        assert handed_after_web["url"].split("sc_generation=", 1)[1] == generation
         returned = deepseek_web.ensure(bob_worktree, env=bob)
         generation = returned["url"].split("sc_generation=", 1)[1]
         cookie = _gateway_cookie(public_port, generation)
@@ -940,16 +943,16 @@ def test_stock_two_shell_cross_surface_refusals_are_side_effect_free(
         reopened_generation = reopened["url"].split("sc_generation=", 1)[1]
         assert reopened_generation != generation
         state = json.loads((root / "web-state.json").read_text())
-        owner_only = {
-            root / "deepseek-shell-api.json", root / "deepseek-web-generation.json",
-        }
-        assert json.loads((root / "deepseek-shell-api.json").read_text())["token"] == BOB_TOKEN
+        owner_only = {root / "deepseek-web-generation.json"}
+        assert not (root / "deepseek-shell-api.json").exists()
         assert json.loads((root / "deepseek-web-generation.json").read_text())["generation"] == reopened_generation
         # The controlled provider key necessarily belongs to stock DSH's live
         # process environment.  The engine-owned shell credentials below must
         # never cross into either stock process or any durable surface.
         secrets = (ALICE_TOKEN, BOB_TOKEN)
-        capabilities = (old_generation, generation, reopened_generation)
+        capabilities = (
+            stale_generation, old_generation, generation, reopened_generation,
+        )
         for pid_key in ("web_pid", "relay_pid"):
             command = "\0".join(deepseek_web._process_cmdline(state[pid_key]))
             assert not any(value in command for value in (*secrets, *capabilities))

@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import fcntl
 import hashlib
+import hmac
 import json
 import os
 import re
@@ -1003,6 +1004,16 @@ class DeepSeekIdentityRegistry:
             record["retired_artifacts"] = [*record.get("retired_artifacts", []), old]
             if recovery:
                 record["recovered_at"] = _utc_now()
+                for lineage in snapshot["lineage"].values():
+                    if (
+                        isinstance(lineage, dict)
+                        and lineage.get("root_session_id") == root_session_id
+                        and lineage.get("lifecycle_epoch")
+                        == record["lifecycle_epoch"]
+                        and lineage.get("record_generation")
+                        == expected_record_generation
+                    ):
+                        lineage["record_generation"] = next_generation
             return self._commit(
                 snapshot,
                 root_session_id=root_session_id,
@@ -1170,6 +1181,62 @@ class DeepSeekIdentityRegistry:
                 "child lineage no longer names the current root",
             )
         return record
+
+    def binding_current(
+        self,
+        *,
+        root_session_id: str,
+        conversation_id: str,
+        lifecycle_epoch: int,
+        shell_id: int,
+        shell_shortname: str,
+        shell_worktree: Path,
+        api_base: str,
+        token: str,
+        plugin_contract_generation: str,
+    ) -> bool:
+        """Prove one active root and credential are the exact admission identity."""
+        try:
+            record = self.resolve_record(root_session_id)
+            credential = _read_owner_json(
+                Path(record["credential_file"]),
+                missing_code="HARNESS_BINDING_CREDENTIAL_UNAVAILABLE",
+            )
+            worktree = shell_worktree.resolve(strict=True)
+            normalized_api = _validate_loopback_api(api_base)
+        except (DeepSeekIdentityError, KeyError, OSError, TypeError):
+            return False
+        expected_record = {
+            "root_session_id": root_session_id,
+            "conversation_id": conversation_id,
+            "lifecycle_epoch": lifecycle_epoch,
+            "shell_id": shell_id,
+            "shell_shortname": shell_shortname,
+            "shell_worktree": str(worktree),
+            "api_base": normalized_api,
+            "plugin_contract_generation": plugin_contract_generation,
+            "state": "active",
+        }
+        if any(record.get(key) != value for key, value in expected_record.items()):
+            return False
+        expected_credential = {
+            "contract": CREDENTIAL_CONTRACT,
+            "api_base": normalized_api,
+            "shell_id": shell_id,
+            "shell_shortname": shell_shortname,
+            "root_session_id": root_session_id,
+            "conversation_id": conversation_id,
+            "lifecycle_epoch": lifecycle_epoch,
+            "binding_generation": record.get("record_generation"),
+            "plugin_contract_generation": plugin_contract_generation,
+        }
+        if any(
+            credential.get(key) != value
+            for key, value in expected_credential.items()
+        ):
+            return False
+        raw_token = credential.get("token")
+        return isinstance(raw_token, str) and hmac.compare_digest(raw_token, token)
 
     def recover_artifacts(self) -> dict[str, int]:
         """Idempotently remove only artifacts absent from the committed snapshot."""

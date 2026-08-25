@@ -124,6 +124,7 @@ class DeepSeekAdapter(ConversationAdapter):
         self.client_factory = client_factory
         self._shell_lease: deepseek_web.ShellIdentityLease | None = None
         self._reserved_session: str | None = None
+        self._proof_authority: Mapping[str, Any] | None = None
 
     def _client(self) -> deepseek_host.HostTransport:
         try:
@@ -132,7 +133,12 @@ class DeepSeekAdapter(ConversationAdapter):
             raise _adapter_error(exc) from exc
 
     def _managed_client(
-        self, context: ConversationContext, *, recovery: bool = False
+        self,
+        context: ConversationContext,
+        root_session_id: str,
+        *,
+        recovery: bool = False,
+        bind_identity: bool = True,
     ) -> deepseek_host.HostTransport:
         # Every production managed turn is canonically prepared. A missing
         # immutable shell identity is a refusal, never a test/probe fallback.
@@ -159,10 +165,33 @@ class DeepSeekAdapter(ConversationAdapter):
                 identity_lease=self._shell_lease,
                 register_workspace=not recovery,
             )
+            if bind_identity:
+                self._bind_execution_identity(context, root_session_id)
         except deepseek_web.DeepSeekWebError as exc:
             self.close()
             raise AdapterError(exc.code, exc.detail) from exc
         return self._client()
+
+    def _bind_execution_identity(
+        self, context: ConversationContext, root_session_id: str
+    ) -> None:
+        env = context.env
+        deepseek_web.bind_session_identity(
+            env=env,
+            root_session_id=root_session_id,
+            conversation_id=self._conversation_id(context),
+            lifecycle_epoch=context.lifecycle_epoch,
+            worktree=context.checked_worktree(),
+        )
+        self._proof_authority = deepseek_web.admit_candidate_execution(
+            env=env,
+            root_session_id=root_session_id,
+            conversation_id=self._conversation_id(context),
+            lifecycle_epoch=context.lifecycle_epoch,
+        )
+        if self._proof_authority is not None and self._shell_lease is not None:
+            self._shell_lease.close()
+            self._shell_lease = None
 
     def _require_recovery_target(
         self,
@@ -680,6 +709,7 @@ class DeepSeekAdapter(ConversationAdapter):
                 "route": route,
                 "client": client,
                 "stream": stream,
+                "proof_authority": self._proof_authority,
             },
             opaque=stream,
         )
@@ -687,9 +717,9 @@ class DeepSeekAdapter(ConversationAdapter):
     def start(self, context: ConversationContext, message: str) -> NativeTurn:
         message = ensure_nonempty_message(message)
         try:
-            client = self._managed_client(context)
-            route = self._route(client, context)
             session_ref = self._new_session_ref(context)
+            client = self._managed_client(context, session_ref)
+            route = self._route(client, context)
             self._reserve(session_ref)
             workspace_id = self._prepare_managed_session(
                 client, session_ref, context
@@ -723,12 +753,15 @@ class DeepSeekAdapter(ConversationAdapter):
         session_ref = self._session_ref(session_ref)
         message = ensure_nonempty_message(message)
         try:
-            client = self._managed_client(context)
+            client = self._managed_client(
+                context, session_ref, bind_identity=False
+            )
             self._reserve(session_ref)
             route = self._route(client, context)
             workspace_id = self._prepare_managed_session(
                 client, session_ref, context, resume=True
             )
+            self._bind_execution_identity(context, session_ref)
             return self._turn(
                 client,
                 session_ref,
@@ -1056,9 +1089,12 @@ class DeepSeekAdapter(ConversationAdapter):
         self, session_ref: str, context: ConversationContext
     ) -> SessionInspection:
         session_ref = self._session_ref(session_ref)
-        client = self._managed_client(context, recovery=True)
+        client = self._managed_client(
+            context, session_ref, recovery=True, bind_identity=False
+        )
         try:
             self._require_recovery_target(client, session_ref, context)
+            self._bind_execution_identity(context, session_ref)
             listed = client.call("session.list", {})
             items = listed.get("items") if isinstance(listed, Mapping) else None
             if not isinstance(items, list):
@@ -1107,13 +1143,16 @@ class DeepSeekAdapter(ConversationAdapter):
     ) -> ReconcileResult:
         client = turn.metadata.get("client")
         if client is None:
-            client = self._managed_client(context, recovery=True)
+            client = self._managed_client(
+                context, turn.session_ref, recovery=True, bind_identity=False
+            )
             # Recovery begins from a durable NativeTurn with no live transport.
             # Retain the newly authenticated client so every later reconcile and
             # pending interrupt reuse this adapter's one full-lifetime lease.
             turn.metadata["client"] = client
         try:
             self._require_recovery_target(client, turn.session_ref, context)
+            self._bind_execution_identity(context, turn.session_ref)
             events = self._history(client, turn.session_ref)
         except deepseek_host.DeepSeekHostError as exc:
             raise _adapter_error(exc) from exc
@@ -1140,3 +1179,4 @@ class DeepSeekAdapter(ConversationAdapter):
         if self._shell_lease is not None:
             self._shell_lease.close()
             self._shell_lease = None
+        self._proof_authority = None

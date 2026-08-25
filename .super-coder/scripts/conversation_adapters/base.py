@@ -193,6 +193,7 @@ class ConversationContext:
     route_binding: Mapping[str, Any] | None = None
     binding_digest: str | None = None
     conversation_id: str | None = None
+    lifecycle_epoch: int = 1
     boot_content: str | None = None
 
     def checked_worktree(self) -> Path:

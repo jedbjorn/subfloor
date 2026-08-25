@@ -121,6 +121,7 @@ class ConversationLaunchPreparer:
             route_binding=broker_run.route_binding,
             binding_digest=broker_run.binding_digest,
             conversation_id=broker_run.conversation_id,
+            lifecycle_epoch=broker_run.lifecycle_epoch,
         )
 
     def __call__(self, broker_run) -> tuple[ConversationContext, int]:
@@ -273,6 +274,7 @@ class ConversationLaunchPreparer:
                 route_binding=binding,
                 binding_digest=binding_digest,
                 conversation_id=broker_run.conversation_id,
+                lifecycle_epoch=broker_run.lifecycle_epoch,
                 boot_content=getattr(plan, "boot_content", None),
             ),
             int(plan.archive_id),

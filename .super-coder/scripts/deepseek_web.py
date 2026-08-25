@@ -30,7 +30,9 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
+import harness_versions
 import ports
+from deepseek_candidate_authority import DeepSeekCandidateAuthority
 from deepseek_identity_registry import (
     DeepSeekIdentityError,
     DeepSeekIdentityRegistry,
@@ -84,6 +86,44 @@ class ShellIdentityLease:
         fcntl.flock(self._handle, fcntl.LOCK_UN)
         self._handle.close()
         self._handle = None
+
+
+def _exact_engine_ref() -> str:
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(ENGINE), "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        dirty = subprocess.run(
+            [
+                "git", "-C", str(ENGINE), "status", "--porcelain",
+                "--untracked-files=all",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise DeepSeekWebError(
+            "HARNESS_PROOF_REF_UNAVAILABLE",
+            "cannot resolve the exact engine ref for proof admission",
+        ) from exc
+    value = result.stdout.strip()
+    if re.fullmatch(r"[0-9a-f]{40}", value) is None:
+        raise DeepSeekWebError(
+            "HARNESS_PROOF_REF_UNAVAILABLE",
+            "engine ref is not one exact commit",
+        )
+    if dirty.stdout.strip():
+        raise DeepSeekWebError(
+            "HARNESS_PROOF_REF_DIRTY",
+            "proof admission requires the exact clean engine ref",
+        )
+    return value
 
 
 def _state_path() -> Path:
@@ -629,7 +669,7 @@ def _stop_unlocked() -> dict[str, Any]:
     except FileNotFoundError:
         pass
     try:
-        _credential_path().unlink()
+        _legacy_credential_path().unlink()
     except FileNotFoundError:
         pass
     try:
@@ -647,7 +687,8 @@ def _stop_unlocked() -> dict[str, Any]:
     return {"stopped": bool(state), "web": web_stopped, "relay": relay_stopped}
 
 
-def _credential_path() -> Path:
+def _legacy_credential_path() -> Path:
+    """Locate the pre-neutral-Host artifact so stop removes upgrade residue."""
     return _state_path().with_name("deepseek-shell-api.json")
 
 
@@ -788,10 +829,7 @@ def _initialize_activity() -> None:
 
 
 def _history_boundary(service_port: int, session_id: str) -> int:
-    try:
-        result = _host_rpc(service_port, "session.history", {"sessionId": session_id})
-    except DeepSeekWebError:
-        raise
+    result = _host_rpc(service_port, "session.history", {"sessionId": session_id})
     events = result.get("events") if isinstance(result, Mapping) else None
     if not isinstance(events, list):
         raise _activity_error("DeepSeek Web could not read browser session history")
@@ -1056,46 +1094,6 @@ def _read_generation(path: Path) -> str:
     return token
 
 
-def _write_shell_credential(env: Mapping[str, str]) -> tuple[Path, str, int] | None:
-    token = env.get("SC_API_TOKEN", "")
-    api_base = env.get("SC_API_BASE", "")
-    shell_id = env.get("SC_SHELL_ID", "")
-    shortname = env.get("SC_SHELL_SHORTNAME", "")
-    present = tuple(bool(value) for value in (token, api_base, shell_id, shortname))
-    if not any(present):
-        return None
-    if not all(present):
-        raise DeepSeekWebError(
-            "HARNESS_SHELL_IDENTITY_UNAVAILABLE",
-            "DeepSeek Web requires complete Subfloor shell API wiring",
-        )
-    path = _credential_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
-    try:
-        descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-        with os.fdopen(descriptor, "w") as handle:
-            os.fchmod(handle.fileno(), 0o600)
-            json.dump(
-                {
-                    "shell_id": int(shell_id),
-                    "shortname": shortname,
-                    "api_base": api_base,
-                    "token": token,
-                },
-                handle,
-            )
-            handle.write("\n")
-        os.replace(temporary, path)
-    except OSError:
-        try:
-            temporary.unlink()
-        except FileNotFoundError:
-            pass
-        raise
-    return path, shortname, int(shell_id)
-
-
 def _identity_registry(env: Mapping[str, str]) -> DeepSeekIdentityRegistry:
     override = env.get("SC_DEEPSEEK_IDENTITY_ROOT")
     if override:
@@ -1105,6 +1103,393 @@ def _identity_registry(env: Mapping[str, str]) -> DeepSeekIdentityRegistry:
     else:
         runtime_root = ENGINE / "run" / "deepseek-identity"
     return DeepSeekIdentityRegistry(repo_root=REPO_ROOT, runtime_root=runtime_root)
+
+
+def _candidate_authority(
+    registry: DeepSeekIdentityRegistry,
+) -> DeepSeekCandidateAuthority:
+    return DeepSeekCandidateAuthority(registry.layout.root / "proof-authority")
+
+
+def _current_dsh_version() -> str:
+    version = harness_versions.probe("deepseek")
+    if not isinstance(version, str) or not version:
+        raise DeepSeekWebError(
+            "HARNESS_PROOF_VERSION_UNAVAILABLE",
+            "cannot resolve the live DeepSeek version for proof admission",
+        )
+    return version
+
+
+def mint_candidate_capability(
+    *,
+    env: Mapping[str, str],
+    mode: str,
+    disposable_baseline: str,
+    proof_run_id: str,
+    roots: Mapping[str, Mapping[str, Any]],
+    ttl_seconds: int,
+) -> dict[str, Any]:
+    """Server-side mint from live exact-ref, Host, and clean-seat evidence."""
+    registry = _identity_registry(env)
+    try:
+        snapshot = registry.read_snapshot()
+        health = registry.read_live_health()
+        grant = _candidate_authority(registry).mint(
+            mode=mode,
+            exact_ref=_exact_engine_ref(),
+            pinned_dsh_version=_current_dsh_version(),
+            disposable_baseline=disposable_baseline,
+            proof_run_id=proof_run_id,
+            roots=roots,
+            plugin_contract_generation=health["plugin_contract_generation"],
+            ttl_seconds=ttl_seconds,
+            live_registry_roots=sorted(snapshot["records"]),
+        )
+        return {
+            "mode": grant.mode,
+            "generation": grant.generation,
+            "artifact": str(grant.artifact),
+            "proof_run_id": grant.proof_run_id,
+            "exact_ref": grant.exact_ref,
+            "plugin_contract_generation": grant.plugin_contract_generation,
+        }
+    except DeepSeekIdentityError as exc:
+        raise DeepSeekWebError(exc.code, exc.detail) from exc
+
+
+def bind_session_identity(
+    *,
+    env: Mapping[str, str],
+    root_session_id: str,
+    conversation_id: str,
+    lifecycle_epoch: int,
+    worktree: Path,
+) -> dict[str, Any]:
+    """Bind one exact managed/one-shot root before model-facing admission."""
+    _verify_shell_identity(env)
+    if lifecycle_epoch <= 0:
+        raise DeepSeekWebError(
+            "HARNESS_LIFECYCLE_INVALID",
+            "DeepSeek lifecycle epoch must be positive",
+        )
+    try:
+        shell_id = int(env["SC_SHELL_ID"])
+        shell_shortname = env["SC_SHELL_SHORTNAME"]
+        api_base = env["SC_API_BASE"]
+        token = env["SC_API_TOKEN"]
+        selected = worktree.resolve(strict=True)
+    except (KeyError, ValueError, OSError) as exc:
+        raise DeepSeekWebError(
+            "HARNESS_SHELL_IDENTITY_UNAVAILABLE",
+            "DeepSeek session binding lacks canonical shell identity",
+        ) from exc
+    registry = _identity_registry(env)
+    try:
+        health = registry.read_live_health()
+        contract_generation = health["plugin_contract_generation"]
+        snapshot = registry.read_snapshot()
+        record = snapshot["records"].get(root_session_id)
+        if record is None:
+            registry.create_binding(
+                expected_snapshot_generation=snapshot["snapshot_generation"],
+                root_session_id=root_session_id,
+                conversation_id=conversation_id,
+                lifecycle_epoch=lifecycle_epoch,
+                shell_id=shell_id,
+                shell_shortname=shell_shortname,
+                shell_worktree=selected,
+                api_base=api_base,
+                token=token,
+                plugin_contract_generation=contract_generation,
+            )
+        else:
+            if not isinstance(record, dict):
+                raise DeepSeekIdentityError(
+                    "HARNESS_REGISTRY_INVALID", "binding record is malformed"
+                )
+            same_owner = (
+                record.get("root_session_id") == root_session_id
+                and record.get("conversation_id") == conversation_id
+                and record.get("shell_id") == shell_id
+                and record.get("shell_shortname") == shell_shortname
+                and record.get("shell_worktree") == str(selected)
+            )
+            previous_epoch = record.get("lifecycle_epoch")
+            if not same_owner:
+                raise DeepSeekIdentityError(
+                    "HARNESS_BINDING_REUSE_REFUSED",
+                    "DSH root session belongs to another exact identity",
+                )
+            if not isinstance(previous_epoch, int) or lifecycle_epoch < previous_epoch:
+                raise DeepSeekIdentityError(
+                    "HARNESS_LIFECYCLE_STALE",
+                    "DeepSeek lifecycle epoch is stale",
+                )
+            if lifecycle_epoch > previous_epoch:
+                if record.get("state") == "active":
+                    closing = registry.begin_close(
+                        expected_snapshot_generation=snapshot["snapshot_generation"],
+                        root_session_id=root_session_id,
+                        expected_record_generation=record["record_generation"],
+                    )
+                    registry.retire_binding(
+                        expected_snapshot_generation=closing.snapshot_generation,
+                        root_session_id=root_session_id,
+                        expected_record_generation=closing.record_generation,
+                        quiesced=True,
+                    )
+                elif record.get("state") == "closing":
+                    registry.retire_binding(
+                        expected_snapshot_generation=snapshot["snapshot_generation"],
+                        root_session_id=root_session_id,
+                        expected_record_generation=record["record_generation"],
+                        quiesced=True,
+                    )
+                elif record.get("state") == "terminal":
+                    pass
+                else:
+                    raise DeepSeekIdentityError(
+                        "HARNESS_BINDING_REOPEN_REFUSED",
+                        "DeepSeek binding cannot advance from its durable state",
+                    )
+                reopened_snapshot = registry.read_snapshot()
+                terminal_record = reopened_snapshot["records"][root_session_id]
+                registry.reopen_binding(
+                    expected_snapshot_generation=reopened_snapshot[
+                        "snapshot_generation"
+                    ],
+                    root_session_id=root_session_id,
+                    expected_record_generation=terminal_record["record_generation"],
+                    conversation_id=conversation_id,
+                    lifecycle_epoch=lifecycle_epoch,
+                    shell_id=shell_id,
+                    shell_shortname=shell_shortname,
+                    shell_worktree=selected,
+                    api_base=api_base,
+                    token=token,
+                    plugin_contract_generation=contract_generation,
+                )
+            elif record.get("state") != "active":
+                raise DeepSeekIdentityError(
+                    "HARNESS_BINDING_NOT_LIVE",
+                    "DeepSeek root is not active in this lifecycle epoch",
+                )
+            elif not registry.binding_current(
+                root_session_id=root_session_id,
+                conversation_id=conversation_id,
+                lifecycle_epoch=lifecycle_epoch,
+                shell_id=shell_id,
+                shell_shortname=shell_shortname,
+                shell_worktree=selected,
+                api_base=api_base,
+                token=token,
+                plugin_contract_generation=contract_generation,
+            ):
+                registry.rotate_binding(
+                    expected_snapshot_generation=snapshot["snapshot_generation"],
+                    root_session_id=root_session_id,
+                    expected_record_generation=record["record_generation"],
+                    token=token,
+                    plugin_contract_generation=contract_generation,
+                    recovery=(
+                        record.get("plugin_contract_generation")
+                        != contract_generation
+                    ),
+                )
+        current = registry.resolve_record(root_session_id)
+        if not registry.binding_current(
+            root_session_id=root_session_id,
+            conversation_id=conversation_id,
+            lifecycle_epoch=lifecycle_epoch,
+            shell_id=shell_id,
+            shell_shortname=shell_shortname,
+            shell_worktree=selected,
+            api_base=api_base,
+            token=token,
+            plugin_contract_generation=contract_generation,
+        ):
+            raise DeepSeekIdentityError(
+                "HARNESS_BINDING_MISMATCH",
+                "DeepSeek binding changed before admission",
+            )
+        return {
+            "root_session_id": root_session_id,
+            "conversation_id": conversation_id,
+            "lifecycle_epoch": lifecycle_epoch,
+            "record_generation": current["record_generation"],
+            "plugin_contract_generation": contract_generation,
+        }
+    except DeepSeekIdentityError as exc:
+        raise DeepSeekWebError(exc.code, exc.detail) from exc
+
+
+def retire_session_identity(
+    *, env: Mapping[str, str], root_session_id: str, quiesced: bool
+) -> dict[str, Any]:
+    """Retire a disposable root only after its terminal/quiescence barrier."""
+    registry = _identity_registry(env)
+    try:
+        snapshot = registry.read_snapshot()
+        record = snapshot["records"].get(root_session_id)
+        if not isinstance(record, dict):
+            raise DeepSeekIdentityError(
+                "HARNESS_BINDING_NOT_LIVE", "DeepSeek root binding is missing"
+            )
+        if record.get("state") == "active":
+            closing = registry.begin_close(
+                expected_snapshot_generation=snapshot["snapshot_generation"],
+                root_session_id=root_session_id,
+                expected_record_generation=record["record_generation"],
+            )
+            closing_snapshot_generation = closing.snapshot_generation
+            closing_record_generation = closing.record_generation
+        elif record.get("state") == "closing":
+            closing_snapshot_generation = snapshot["snapshot_generation"]
+            closing_record_generation = record["record_generation"]
+        else:
+            raise DeepSeekIdentityError(
+                "HARNESS_BINDING_NOT_LIVE",
+                "DeepSeek root is not eligible for terminal retirement",
+            )
+        receipt = registry.retire_binding(
+            expected_snapshot_generation=closing_snapshot_generation,
+            root_session_id=root_session_id,
+            expected_record_generation=closing_record_generation,
+            quiesced=quiesced,
+        )
+        return {
+            "root_session_id": root_session_id,
+            "state": receipt.state,
+            "lifecycle_epoch": receipt.lifecycle_epoch,
+            "record_generation": receipt.record_generation,
+        }
+    except DeepSeekIdentityError as exc:
+        raise DeepSeekWebError(exc.code, exc.detail) from exc
+
+
+def admit_candidate_execution(
+    *,
+    env: Mapping[str, str],
+    root_session_id: str,
+    conversation_id: str,
+    lifecycle_epoch: int,
+) -> dict[str, Any] | None:
+    """Admit one server-minted proof root; ordinary callers return ``None``."""
+    raw_artifact = env.get("SC_DSH_PROOF_CAPABILITY_FILE")
+    if raw_artifact is None:
+        return None
+    artifact = Path(raw_artifact)
+    if not artifact.is_absolute() or len(artifact.parents) < 2:
+        raise DeepSeekWebError(
+            "HARNESS_PROOF_CAPABILITY_UNSAFE",
+            "proof capability path must be absolute",
+        )
+    registry = _identity_registry(env)
+    authority = _candidate_authority(registry)
+    try:
+        contract = authority.describe(artifact=artifact)
+        exact_ref = _exact_engine_ref()
+        pinned_version = _current_dsh_version()
+        health = registry.read_live_health()
+        record = registry.resolve_record(root_session_id)
+        snapshot = registry.read_snapshot()
+        lineage = sorted(
+            session_id
+            for session_id, item in snapshot["lineage"].items()
+            if isinstance(item, Mapping)
+            and item.get("root_session_id") == root_session_id
+            and item.get("lifecycle_epoch") == lifecycle_epoch
+            and item.get("record_generation") == record.get("record_generation")
+        )
+        return authority.admit(
+            artifact=artifact,
+            mode=contract["mode"],
+            exact_ref=exact_ref,
+            pinned_dsh_version=pinned_version,
+            root_session_id=root_session_id,
+            conversation_id=conversation_id,
+            lifecycle_epoch=lifecycle_epoch,
+            verified_lineage=lineage,
+            plugin_contract_generation=health["plugin_contract_generation"],
+        )
+    except DeepSeekIdentityError as exc:
+        raise DeepSeekWebError(exc.code, exc.detail) from exc
+
+
+def ratchet_candidate_after_host_restart(
+    *, env: Mapping[str, str], artifact: Path, ttl_seconds: int
+) -> dict[str, Any]:
+    """Advance proof authority only after every exact binding recovered."""
+    if not artifact.is_absolute() or len(artifact.parents) < 2:
+        raise DeepSeekWebError(
+            "HARNESS_PROOF_CAPABILITY_UNSAFE",
+            "proof capability path must be absolute",
+        )
+    registry = _identity_registry(env)
+    authority = _candidate_authority(registry)
+    try:
+        expected = authority.recovery_contract(artifact=artifact)
+        if (
+            expected["exact_ref"] != _exact_engine_ref()
+            or expected["pinned_dsh_version"]
+            != harness_versions.probe("deepseek")
+        ):
+            raise DeepSeekIdentityError(
+                "HARNESS_PROOF_CAPABILITY_MISMATCH",
+                "proof restart no longer runs the exact candidate runtime",
+            )
+        health = registry.read_live_health()
+        new_contract = health["plugin_contract_generation"]
+        snapshot = registry.read_snapshot()
+        actual_roots: dict[str, dict[str, Any]] = {}
+        for root_session_id, expected_root in expected["roots"].items():
+            record = snapshot["records"].get(root_session_id)
+            if (
+                not isinstance(record, Mapping)
+                or record.get("state") != "active"
+                or record.get("conversation_id")
+                != expected_root["conversation_id"]
+                or record.get("lifecycle_epoch")
+                != expected_root["lifecycle_epoch"]
+                or record.get("plugin_contract_generation") != new_contract
+            ):
+                raise DeepSeekIdentityError(
+                    "HARNESS_PROOF_RESTART_BINDING_MISMATCH",
+                    "proof restart did not recover every exact root binding",
+                )
+            lineage = sorted(
+                session_id
+                for session_id, item in snapshot["lineage"].items()
+                if isinstance(item, Mapping)
+                and item.get("root_session_id") == root_session_id
+                and item.get("lifecycle_epoch") == record["lifecycle_epoch"]
+                and item.get("record_generation") == record["record_generation"]
+            )
+            actual_roots[root_session_id] = {
+                "conversation_id": record["conversation_id"],
+                "lifecycle_epoch": record["lifecycle_epoch"],
+                "verified_lineage": lineage,
+            }
+        grant = authority.ratchet_after_host_restart(
+            artifact=artifact,
+            old_plugin_contract_generation=expected[
+                "plugin_contract_generation"
+            ],
+            new_plugin_contract_generation=new_contract,
+            roots=actual_roots,
+            ttl_seconds=ttl_seconds,
+        )
+        return {
+            "mode": grant.mode,
+            "generation": grant.generation,
+            "artifact": str(grant.artifact),
+            "proof_run_id": grant.proof_run_id,
+            "exact_ref": grant.exact_ref,
+            "plugin_contract_generation": grant.plugin_contract_generation,
+        }
+    except DeepSeekIdentityError as exc:
+        raise DeepSeekWebError(exc.code, exc.detail) from exc
 
 
 def stop(*, env: Mapping[str, str] | None = None) -> dict[str, Any]:
@@ -1126,22 +1511,15 @@ def _existing_healthy(
     *,
     listen_host: str,
     allowed_peers: tuple[str, ...],
-    credential_shell: str | None,
-    credential_shell_id: int | None,
     identity_registry: DeepSeekIdentityRegistry,
 ) -> bool:
-    if state.get("schema_version") != 4:
+    if state.get("schema_version") != 5:
         return False
     if state.get("service_port") != service_port:
         return False
     if not _verified_process(state.get("web_pid"), state.get("web_start_ticks"), "web"):
         return False
     if not _http_ready(service_port):
-        return False
-    if (
-        state.get("credential_shell") != credential_shell
-        or state.get("credential_shell_id") != credential_shell_id
-    ):
         return False
     if (
         state.get("fork_id") != identity_registry.layout.fork_id
@@ -1215,16 +1593,12 @@ def ensure(
         state = _read_state()
         identity_registry = _identity_registry(env)
         listen_host, allowed_peers = _relay_configuration(sandbox=sandbox)
-        credential_shell = env.get("SC_SHELL_SHORTNAME") or None
-        credential_shell_id = int(env["SC_SHELL_ID"])
         reused = _existing_healthy(
             state,
             service_port,
             relay_port,
             listen_host=listen_host,
             allowed_peers=allowed_peers,
-            credential_shell=credential_shell,
-            credential_shell_id=credential_shell_id,
             identity_registry=identity_registry,
         )
         generation = None
@@ -1236,15 +1610,16 @@ def ensure(
                     "HARNESS_UNAVAILABLE",
                     "official dsh is not installed; run ./sc ensure-harness",
                 )
-            credential = _write_shell_credential(env)
             web_env = dict(env)
             identity_env = identity_registry.host_environment()
+            for name in tuple(web_env):
+                if name in {
+                    "SC_API_TOKEN", "SC_API_BASE", "SC_MEM_CREDENTIAL_FILE",
+                    "SC_SHELL_ID", "SC_SHELL_SHORTNAME", "SC_SHELL_WORKTREE",
+                    "DSH_SHELL",
+                } or name.startswith(("DSH_SC_", "SC_DSH_")):
+                    web_env.pop(name, None)
             web_env.update(identity_env)
-            if credential is not None:
-                credential_file, credential_shell, credential_shell_id = credential
-                web_env.pop("SC_API_TOKEN", None)
-                web_env.pop("SC_API_BASE", None)
-                web_env["SC_MEM_CREDENTIAL_FILE"] = str(credential_file)
             web_pid, web_ticks = _spawn(
                 [
                     executable,
@@ -1261,7 +1636,7 @@ def ensure(
                 env=web_env,
             )
             state = {
-                "schema_version": 4,
+                "schema_version": 5,
                 "web_pid": web_pid,
                 "web_start_ticks": web_ticks,
                 "service_port": service_port,
@@ -1270,8 +1645,7 @@ def ensure(
                 "relay_listen_host": listen_host,
                 "relay_allowed_peers": list(allowed_peers),
                 "url": f"http://127.0.0.1:{public_port}",
-                "credential_shell": credential_shell,
-                "credential_shell_id": credential_shell_id,
+                "host_identity": "neutral",
                 "fork_id": identity_registry.layout.fork_id,
                 "profile_id": identity_registry.layout.profile_id,
                 "registry_path": str(identity_registry.layout.registry.resolve()),
@@ -1313,8 +1687,13 @@ def ensure(
             # API token through the relay's process environment even though the
             # stock Host correctly receives only the owner-only artifact.
             relay_env = dict(os.environ)
-            relay_env.pop("SC_API_TOKEN", None)
-            relay_env.pop("SC_API_BASE", None)
+            for name in tuple(relay_env):
+                if name in {
+                    "SC_API_TOKEN", "SC_API_BASE", "SC_MEM_CREDENTIAL_FILE",
+                    "SC_SHELL_ID", "SC_SHELL_SHORTNAME", "SC_SHELL_WORKTREE",
+                    "DSH_SHELL",
+                } or name.startswith(("DSH_SC_", "SC_DSH_PROOF_")):
+                    relay_env.pop(name, None)
             relay_pid, relay_ticks = _spawn(
                 [
                     sys.executable,
@@ -1349,10 +1728,6 @@ def ensure(
                     "HARNESS_SERVICE_UNAVAILABLE",
                     "DeepSeek loopback publication relay did not become ready",
                 )
-        elif credential_shell is not None:
-            # Repair a missing/stale artifact (for example after shell-key
-            # rotation) without restarting an otherwise healthy same-shell Host.
-            _write_shell_credential(env)
         generation = generation or _read_generation(_generation_path())
         url = f"http://127.0.0.1:{relay_port}/?sc_generation={generation}"
         if not register_workspace:
@@ -1401,7 +1776,7 @@ def status() -> dict[str, Any]:
     plugin_health = "unavailable"
     plugin_contract_generation = None
     plugin_current = False
-    if state.get("schema_version") == 4:
+    if state.get("schema_version") == 5:
         try:
             identity = _identity_registry(os.environ)
             health = identity.read_live_health(

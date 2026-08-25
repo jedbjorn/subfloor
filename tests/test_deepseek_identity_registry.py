@@ -35,6 +35,7 @@ from deepseek_identity_registry import (
     plugin_contract_generation,
     process_start_ticks,
 )
+import deepseek_web
 
 
 def owner_json(path: Path, value: object) -> None:
@@ -1373,6 +1374,12 @@ def test_host_restart_blocks_old_contract_until_conditional_recovery() -> None:
                 shortname="SHELL_RESTART",
                 token="secret-one",
             )
+            registry.register_lineage(
+                expected_snapshot_generation=1,
+                root_session_id="restart-session",
+                child_session_id="restart-child",
+                expected_record_generation=1,
+            )
             assert (
                 first.collect("restart-session")["aliases"][
                     "DSH_SC_PLUGIN_HEALTH_GENERATION"
@@ -1386,7 +1393,7 @@ def test_host_restart_blocks_old_contract_until_conditional_recovery() -> None:
             assert generation_two != generation_one
             assert second.collect("restart-session") == {"aliases": {}}
             recovered = registry.rotate_binding(
-                expected_snapshot_generation=1,
+                expected_snapshot_generation=2,
                 root_session_id="restart-session",
                 expected_record_generation=1,
                 token="secret-two",
@@ -1394,12 +1401,15 @@ def test_host_restart_blocks_old_contract_until_conditional_recovery() -> None:
                 recovery=True,
             )
             assert (recovered.snapshot_generation, recovered.record_generation) == (
-                2,
+                3,
                 2,
             )
             aliases = second.collect("restart-session")["aliases"]
             assert aliases["DSH_SC_PLUGIN_HEALTH_GENERATION"] == generation_two
             assert aliases["DSH_SC_BINDING_GENERATION"] == "2"
+            child_aliases = second.collect("restart-child")["aliases"]
+            assert child_aliases["DSH_SC_BINDING_GENERATION"] == "2"
+            assert child_aliases["DSH_SC_SHELL_SHORTNAME"] == "SHELL_RESTART"
             snapshot = registry.read_snapshot()
             assert snapshot["records"]["restart-session"]["recovered_at"] is not None
             assert "secret-one" not in registry.layout.registry.read_text()
@@ -1680,3 +1690,136 @@ def test_artifact_permissions_and_alias_schema_are_exact() -> None:
             assert credential_payload["binding_generation"] == 1
             assert credential_payload["shell_id"] == 808
             assert "permission-secret" not in registry.layout.registry.read_text()
+
+
+def test_runtime_binding_tracks_exact_lifecycle_key_rotation_and_retirement(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with tempfile.TemporaryDirectory() as raw:
+        registry, worktree = registry_fixture(Path(raw))
+        monkeypatch.setattr(deepseek_web, "_identity_registry", lambda _env: registry)
+        monkeypatch.setattr(deepseek_web, "_verify_shell_identity", lambda _env: None)
+        with PluginProbe(registry) as plugin:
+            env = {
+                "SC_API_TOKEN": "lifecycle-token-one",
+                "SC_API_BASE": "http://127.0.0.1:8837",
+                "SC_SHELL_ID": "909",
+                "SC_SHELL_SHORTNAME": "LIFECYCLE",
+            }
+            first = deepseek_web.bind_session_identity(
+                env=env,
+                root_session_id="lifecycle-root",
+                conversation_id="lifecycle-conversation",
+                lifecycle_epoch=1,
+                worktree=worktree,
+            )
+            assert first["record_generation"] == 1
+            assert plugin.collect("lifecycle-root")["aliases"][
+                "DSH_SC_BINDING_GENERATION"
+            ] == "1"
+
+            unchanged = deepseek_web.bind_session_identity(
+                env=env,
+                root_session_id="lifecycle-root",
+                conversation_id="lifecycle-conversation",
+                lifecycle_epoch=1,
+                worktree=worktree,
+            )
+            assert unchanged == first
+            assert registry.read_snapshot()["snapshot_generation"] == 1
+
+            rotated_env = {**env, "SC_API_TOKEN": "lifecycle-token-two"}
+            rotated = deepseek_web.bind_session_identity(
+                env=rotated_env,
+                root_session_id="lifecycle-root",
+                conversation_id="lifecycle-conversation",
+                lifecycle_epoch=1,
+                worktree=worktree,
+            )
+            assert rotated["record_generation"] == 2
+            rotated_credential = json.loads(
+                Path(registry.resolve_record("lifecycle-root")["credential_file"])
+                .read_text()
+            )
+            assert rotated_credential["token"] == "lifecycle-token-two"
+            assert "lifecycle-token-one" not in registry.layout.registry.read_text()
+
+            advanced = deepseek_web.bind_session_identity(
+                env=rotated_env,
+                root_session_id="lifecycle-root",
+                conversation_id="lifecycle-conversation",
+                lifecycle_epoch=2,
+                worktree=worktree,
+            )
+            assert advanced["lifecycle_epoch"] == 2
+            record = registry.resolve_record("lifecycle-root")
+            assert record["state"] == "active"
+            assert record["lifecycle_epoch"] == 2
+            assert len(record["tombstone_history"]) == 1
+            assert record["tombstone_history"][0]["lifecycle_epoch"] == 1
+
+            terminal = deepseek_web.retire_session_identity(
+                env=rotated_env,
+                root_session_id="lifecycle-root",
+                quiesced=True,
+            )
+            assert terminal["state"] == "terminal"
+            snapshot = registry.read_snapshot()
+            assert snapshot["records"]["lifecycle-root"]["state"] == "terminal"
+            assert snapshot["records"]["lifecycle-root"]["credential_file"] is None
+            assert list(registry.layout.credentials.glob("binding-*.json")) == []
+            assert plugin.collect("lifecycle-root") == {"aliases": {}}
+
+
+def test_runtime_binding_rejects_foreign_or_stale_lifecycle_without_effect(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with tempfile.TemporaryDirectory() as raw:
+        registry, worktree = registry_fixture(Path(raw))
+        synthetic_health(registry)
+        monkeypatch.setattr(deepseek_web, "_identity_registry", lambda _env: registry)
+        monkeypatch.setattr(deepseek_web, "_verify_shell_identity", lambda _env: None)
+        env = {
+            "SC_API_TOKEN": "owner-token",
+            "SC_API_BASE": "http://127.0.0.1:8837",
+            "SC_SHELL_ID": "910",
+            "SC_SHELL_SHORTNAME": "OWNER",
+        }
+        deepseek_web.bind_session_identity(
+            env=env,
+            root_session_id="owned-root",
+            conversation_id="owned-conversation",
+            lifecycle_epoch=2,
+            worktree=worktree,
+        )
+        before = registry.read_snapshot()
+        artifacts = sorted(registry.layout.credentials.glob("binding-*.json"))
+        foreign = {
+            **env,
+            "SC_API_TOKEN": "foreign-token",
+            "SC_SHELL_ID": "911",
+            "SC_SHELL_SHORTNAME": "FOREIGN",
+        }
+        with pytest.raises(deepseek_web.DeepSeekWebError) as refused_owner:
+            deepseek_web.bind_session_identity(
+                env=foreign,
+                root_session_id="owned-root",
+                conversation_id="owned-conversation",
+                lifecycle_epoch=2,
+                worktree=worktree,
+            )
+        assert refused_owner.value.code == "HARNESS_BINDING_REUSE_REFUSED"
+        with pytest.raises(deepseek_web.DeepSeekWebError) as refused_epoch:
+            deepseek_web.bind_session_identity(
+                env=env,
+                root_session_id="owned-root",
+                conversation_id="owned-conversation",
+                lifecycle_epoch=1,
+                worktree=worktree,
+            )
+        assert refused_epoch.value.code == "HARNESS_LIFECYCLE_STALE"
+        assert registry.read_snapshot() == before
+        assert sorted(registry.layout.credentials.glob("binding-*.json")) == artifacts
+        credential = json.loads(Path(before["records"]["owned-root"]["credential_file"]).read_text())
+        assert credential["token"] == "owner-token"
+        assert "foreign-token" not in json.dumps(before)
