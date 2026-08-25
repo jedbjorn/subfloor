@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import fcntl
 import hashlib
+import hmac
 import json
 import os
 import re
@@ -19,7 +20,7 @@ import stat
 import sys
 import tempfile
 import uuid
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -550,6 +551,35 @@ class DeepSeekIdentityRegistry:
     def read_snapshot(self) -> dict[str, Any]:
         return self._read_snapshot_unlocked()
 
+    @contextmanager
+    def candidate_mint_guard(
+        self, *, expected_plugin_contract_generation: str
+    ) -> Iterator[dict[str, Any]]:
+        """Linearize a clean-seat proof mint with every registry writer."""
+        with self._mutation_lock():
+            health = self.read_live_health()
+            if (
+                health["plugin_contract_generation"]
+                != expected_plugin_contract_generation
+            ):
+                raise DeepSeekIdentityError(
+                    "HARNESS_PLUGIN_HEALTH_MISMATCH",
+                    "plugin health changed before proof capability mint",
+                )
+            snapshot = self._read_snapshot_unlocked()
+            live_roots = sorted(
+                root_session_id
+                for root_session_id, record in snapshot["records"].items()
+                if isinstance(record, Mapping)
+                and record.get("state") in LIVE_STATES
+            )
+            if live_roots:
+                raise DeepSeekIdentityError(
+                    "HARNESS_PROOF_SEAT_NOT_CLEAN",
+                    "initial proof capability requires an empty live session set",
+                )
+            yield snapshot
+
     def read_live_health(
         self, *, expected_host_boot_generation: str | None = None
     ) -> dict[str, Any]:
@@ -1003,6 +1033,16 @@ class DeepSeekIdentityRegistry:
             record["retired_artifacts"] = [*record.get("retired_artifacts", []), old]
             if recovery:
                 record["recovered_at"] = _utc_now()
+                for lineage in snapshot["lineage"].values():
+                    if (
+                        isinstance(lineage, dict)
+                        and lineage.get("root_session_id") == root_session_id
+                        and lineage.get("lifecycle_epoch")
+                        == record["lifecycle_epoch"]
+                        and lineage.get("record_generation")
+                        == expected_record_generation
+                    ):
+                        lineage["record_generation"] = next_generation
             return self._commit(
                 snapshot,
                 root_session_id=root_session_id,
@@ -1040,6 +1080,82 @@ class DeepSeekIdentityRegistry:
                 operation="closing",
                 crash_at=crash_at,
             )
+
+    def begin_close_roots(
+        self,
+        *,
+        roots: Mapping[str, Mapping[str, Any]],
+        require_live_root: bool = False,
+        fence_mismatch: bool = False,
+        crash_at: str | None = None,
+    ) -> dict[str, TransactionReceipt]:
+        """Fence every present exact proof root in one registry commit.
+
+        ``fence_mismatch`` is reserved for fail-closed proof teardown. Root
+        identifiers are globally non-reusable, so a lifecycle mismatch under
+        an enumerated ID is corruption to close, not foreign work to preserve.
+        """
+        with self._mutation_lock():
+            snapshot = self._read_snapshot_unlocked()
+            present: dict[str, dict[str, Any]] = {}
+            for root_session_id, expected in sorted(roots.items()):
+                _validate_session(root_session_id, field="root_session_id")
+                record = snapshot["records"].get(root_session_id)
+                if record is None:
+                    continue
+                if (
+                    not isinstance(record, dict)
+                    or record.get("state") not in {"active", "closing", "terminal"}
+                    or (
+                        not fence_mismatch
+                        and (
+                            record.get("conversation_id")
+                            != expected.get("conversation_id")
+                            or record.get("lifecycle_epoch")
+                            != expected.get("lifecycle_epoch")
+                        )
+                    )
+                ):
+                    raise DeepSeekIdentityError(
+                        "HARNESS_PROOF_BINDING_MISMATCH",
+                        "proof teardown found a mismatched root lifecycle",
+                )
+                present[root_session_id] = record
+            if require_live_root and not any(
+                record["state"] in {"active", "closing"}
+                for record in present.values()
+            ):
+                return {}
+            changed = False
+            for record in present.values():
+                if record["state"] == "active":
+                    record["record_generation"] += 1
+                    record["state"] = "closing"
+                    changed = True
+            if changed:
+                _crash("after_closing_update", crash_at)
+                snapshot["snapshot_generation"] += 1
+                _crash("before_registry_replace", crash_at)
+                _atomic_owner_write(
+                    self.layout.registry, _canonical_json(snapshot) + b"\n"
+                )
+                _crash("after_registry_replace", crash_at)
+            generation = snapshot["snapshot_generation"]
+            return {
+                root_session_id: TransactionReceipt(
+                    operation=(
+                        "terminal"
+                        if record["state"] == "terminal"
+                        else "closing"
+                    ),
+                    root_session_id=root_session_id,
+                    snapshot_generation=generation,
+                    record_generation=record["record_generation"],
+                    lifecycle_epoch=record["lifecycle_epoch"],
+                    state=record["state"],
+                )
+                for root_session_id, record in present.items()
+            }
 
     def retire_binding(
         self,
@@ -1170,6 +1286,62 @@ class DeepSeekIdentityRegistry:
                 "child lineage no longer names the current root",
             )
         return record
+
+    def binding_current(
+        self,
+        *,
+        root_session_id: str,
+        conversation_id: str,
+        lifecycle_epoch: int,
+        shell_id: int,
+        shell_shortname: str,
+        shell_worktree: Path,
+        api_base: str,
+        token: str,
+        plugin_contract_generation: str,
+    ) -> bool:
+        """Prove one active root and credential are the exact admission identity."""
+        try:
+            record = self.resolve_record(root_session_id)
+            credential = _read_owner_json(
+                Path(record["credential_file"]),
+                missing_code="HARNESS_BINDING_CREDENTIAL_UNAVAILABLE",
+            )
+            worktree = shell_worktree.resolve(strict=True)
+            normalized_api = _validate_loopback_api(api_base)
+        except (DeepSeekIdentityError, KeyError, OSError, TypeError):
+            return False
+        expected_record = {
+            "root_session_id": root_session_id,
+            "conversation_id": conversation_id,
+            "lifecycle_epoch": lifecycle_epoch,
+            "shell_id": shell_id,
+            "shell_shortname": shell_shortname,
+            "shell_worktree": str(worktree),
+            "api_base": normalized_api,
+            "plugin_contract_generation": plugin_contract_generation,
+            "state": "active",
+        }
+        if any(record.get(key) != value for key, value in expected_record.items()):
+            return False
+        expected_credential = {
+            "contract": CREDENTIAL_CONTRACT,
+            "api_base": normalized_api,
+            "shell_id": shell_id,
+            "shell_shortname": shell_shortname,
+            "root_session_id": root_session_id,
+            "conversation_id": conversation_id,
+            "lifecycle_epoch": lifecycle_epoch,
+            "binding_generation": record.get("record_generation"),
+            "plugin_contract_generation": plugin_contract_generation,
+        }
+        if any(
+            credential.get(key) != value
+            for key, value in expected_credential.items()
+        ):
+            return False
+        raw_token = credential.get("token")
+        return isinstance(raw_token, str) and hmac.compare_digest(raw_token, token)
 
     def recover_artifacts(self) -> dict[str, int]:
         """Idempotently remove only artifacts absent from the committed snapshot."""

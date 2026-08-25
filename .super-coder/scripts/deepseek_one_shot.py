@@ -1,17 +1,28 @@
-#!/usr/bin/env python3
 """Public one-shot execution through the stock DeepSeek Host API."""
 from __future__ import annotations
 
 import argparse
 import os
+import re
 import sys
 import time
 import uuid
+from collections.abc import Mapping
 from pathlib import Path
-from typing import Mapping
 
 import deepseek_host
 import deepseek_web
+
+
+READINESS_MAX_ATTEMPTS = 3
+READINESS_WINDOW_SECONDS = 5.0
+READINESS_RETRY_DELAY_SECONDS = 0.05
+TRANSIENT_READINESS_CODES = frozenset({
+    "HARNESS_HOST_UNAVAILABLE",
+    "HARNESS_PLUGIN_HEALTH_UNAVAILABLE",
+    "HARNESS_REGISTRY_UNAVAILABLE",
+    "HARNESS_REGISTRY_STALE_WRITER",
+})
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -74,11 +85,19 @@ def _finalize_unknown(client: deepseek_host.HostTransport, session_ref: str) -> 
     )
 
 
-def _run(selector: str, effort: str, prompt: str, *, worktree: Path) -> int:
+def _run(
+    selector: str,
+    effort: str,
+    prompt: str,
+    *,
+    worktree: Path,
+    session_ref: str | None = None,
+) -> int:
     if not prompt.strip():
         raise deepseek_host.DeepSeekHostError(
             "HARNESS_MESSAGE_INVALID", "one-shot prompt must contain text"
         )
+    session_ref = session_ref or f"sc-{uuid.uuid4().hex}"
     client = deepseek_host.DeepSeekHostClient()
     route = deepseek_host.route_for(client, selector)
     if effort != "default" and effort not in route.reasoning_efforts:
@@ -86,7 +105,6 @@ def _run(selector: str, effort: str, prompt: str, *, worktree: Path) -> int:
             "HARNESS_ROUTE_INVALID",
             f"reasoning effort is unavailable for the exact route: {effort}",
         )
-    session_ref = f"sc-{uuid.uuid4().hex}"
     created = client.call(
         "session.create", {"sessionId": session_ref, "cwd": str(worktree)}
     )
@@ -203,14 +221,93 @@ def run(selector: str, effort: str, prompt: str) -> int:
         )
     lease = None
     try:
-        lease = deepseek_web.acquire_shell_identity(env=env)
-        deepseek_web.ensure(worktree, env=env, identity_lease=lease)
+        proof_root = deepseek_web.proof_root_from_environment(
+            env=env, surface="one-shot"
+        )
     except deepseek_web.DeepSeekWebError as exc:
-        if lease is not None:
-            lease.close()
         raise deepseek_host.DeepSeekHostError(exc.code, exc.detail) from exc
+    if proof_root is None:
+        session_ref = f"sc-{uuid.uuid4().hex}"
+    else:
+        session_ref = proof_root
+    started = time.monotonic()
+    last_error: deepseek_web.DeepSeekWebError | None = None
+    for attempt in range(READINESS_MAX_ATTEMPTS):
+        try:
+            lease = deepseek_web.acquire_shell_identity(env=env)
+            deepseek_web.ensure(worktree, env=env, identity_lease=lease)
+            proof_authority = deepseek_web.preflight_candidate_execution(
+                env=env,
+                root_session_id=session_ref,
+                conversation_id=f"one-shot:{session_ref}",
+                lifecycle_epoch=1,
+                worktree=worktree,
+            )
+            deepseek_web.bind_session_identity(
+                env=env,
+                root_session_id=session_ref,
+                conversation_id=f"one-shot:{session_ref}",
+                lifecycle_epoch=1,
+                worktree=worktree,
+                candidate_preflight=proof_authority,
+            )
+            if proof_authority is not None:
+                lease.close()
+                lease = None
+            break
+        except deepseek_web.DeepSeekWebError as exc:
+            last_error = exc
+            if lease is not None:
+                lease.close()
+                lease = None
+            remaining = READINESS_WINDOW_SECONDS - (time.monotonic() - started)
+            if (
+                exc.code not in TRANSIENT_READINESS_CODES
+                or attempt + 1 >= READINESS_MAX_ATTEMPTS
+                or remaining <= 0
+            ):
+                raise deepseek_host.DeepSeekHostError(exc.code, exc.detail) from exc
+            time.sleep(min(READINESS_RETRY_DELAY_SECONDS, remaining))
+    else:  # pragma: no cover - the final attempt always raises or breaks
+        assert last_error is not None
+        raise deepseek_host.DeepSeekHostError(
+            last_error.code, last_error.detail
+        ) from last_error
     try:
-        return _run(selector, effort, prompt, worktree=worktree)
+        result = _run(
+            selector,
+            effort,
+            prompt,
+            worktree=worktree,
+            session_ref=session_ref,
+        )
+    except BaseException as exc:
+        busy = (
+            isinstance(exc, deepseek_host.DeepSeekHostError)
+            and exc.code == "HARNESS_ONE_SHOT_BUSY"
+        )
+        try:
+            deepseek_web.retire_session_identity(
+                env=env, root_session_id=session_ref, quiesced=not busy
+            )
+        except deepseek_web.DeepSeekWebError as retire_exc:
+            if busy:
+                raise deepseek_host.DeepSeekHostError(
+                    "HARNESS_ONE_SHOT_BUSY",
+                    f"{exc.detail}; exact binding close failed: {retire_exc.code}",
+                ) from exc
+            raise deepseek_host.DeepSeekHostError(
+                retire_exc.code, retire_exc.detail
+            ) from retire_exc
+        raise
+    else:
+        try:
+            deepseek_web.retire_session_identity(
+                env=env, root_session_id=session_ref, quiesced=True
+            )
+        except deepseek_web.DeepSeekWebError as exc:
+            raise deepseek_host.DeepSeekHostError(exc.code, exc.detail) from exc
+        return result
     finally:
         if lease is not None:
             lease.close()

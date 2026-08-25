@@ -15,17 +15,15 @@ import time
 from pathlib import Path
 from typing import Any
 
-
 CONTRACT = "sc-dsh-linux-cgroup-v2-v3"
 REGISTRY_CONTRACT = "sc-dsh-identity-registry-v1"
 HOST_IDENTITY_CONTRACT = "sc-dsh-host-identity-v1"
 DESCRIPTOR_FD = 198
-REQUIRED_SEALS = (
-    fcntl.F_SEAL_SEAL
-    | fcntl.F_SEAL_SHRINK
-    | fcntl.F_SEAL_GROW
-    | fcntl.F_SEAL_WRITE
-)
+# Linux UAPI values from <linux/fcntl.h>.  Some supported Python builds omit
+# these names even though their kernels implement memfd sealing.
+F_ADD_SEALS = getattr(fcntl, "F_ADD_SEALS", 1033)
+F_GET_SEALS = getattr(fcntl, "F_GET_SEALS", 1034)
+REQUIRED_SEALS = 0x0001 | 0x0002 | 0x0004 | 0x0008
 ALIASES = (
     "DSH_SC_SHELL_ID",
     "DSH_SC_SHELL_SHORTNAME",
@@ -187,10 +185,7 @@ def _host_identity(
 ) -> dict[str, Any]:
     identity = _owner_json(host_identity_path, "Host identity")
     host_pid = os.getppid()
-    try:
-        _parent, host_ticks = _process_identity(host_pid)
-    except ExecutionDomainError:
-        raise
+    _parent, host_ticks = _process_identity(host_pid)
     if (
         identity.get("contract") != HOST_IDENTITY_CONTRACT
         or identity.get("fork_id") != fork_id
@@ -241,8 +236,8 @@ def _seal_descriptor(fd: int, value: dict[str, Any]) -> None:
     os.ftruncate(fd, 0)
     os.pwrite(fd, payload, 0)
     os.fsync(fd)
-    fcntl.fcntl(fd, fcntl.F_ADD_SEALS, REQUIRED_SEALS)
-    if fcntl.fcntl(fd, fcntl.F_GET_SEALS) & REQUIRED_SEALS != REQUIRED_SEALS:
+    fcntl.fcntl(fd, F_ADD_SEALS, REQUIRED_SEALS)
+    if fcntl.fcntl(fd, F_GET_SEALS) & REQUIRED_SEALS != REQUIRED_SEALS:
         raise ExecutionDomainError("execution descriptor did not seal")
 
 
@@ -286,7 +281,7 @@ def _child_exec(
         if os.read(gate, 1) != b"1":
             raise ExecutionDomainError("execution issuer did not release the child")
         if (
-            fcntl.fcntl(descriptor_fd, fcntl.F_GET_SEALS) & REQUIRED_SEALS
+            fcntl.fcntl(descriptor_fd, F_GET_SEALS) & REQUIRED_SEALS
             != REQUIRED_SEALS
         ):
             raise ExecutionDomainError("execution descriptor is not sealed")

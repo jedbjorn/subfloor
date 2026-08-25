@@ -324,6 +324,7 @@ def test_preparer_returns_canonical_environment_and_archive(launch_case):
     assert archive_id == 42
     assert context.worktree == worktree
     assert context.env["SC_API_TOKEN"] == "shell-token"
+    assert context.env["SC_CONVERSATION_SURFACE"] == "browser"
     assert context.conversation_id == "cv_" + "a" * 32
     assert context.boot_content == "immutable boot bytes"
     assert context.permission_mode == "unrestricted"

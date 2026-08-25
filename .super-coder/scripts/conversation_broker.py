@@ -96,6 +96,7 @@ class BrokerRun:
     route_contract_version: int = 1
     route_binding: Mapping[str, Any] | None = None
     binding_digest: str | None = None
+    lifecycle_epoch: int = 1
 
     def context(self) -> ConversationContext:
         # Browser conversations run with worktree command access.
@@ -111,6 +112,7 @@ class BrokerRun:
             route_binding=self.route_binding,
             binding_digest=self.binding_digest,
             conversation_id=self.conversation_id,
+            lifecycle_epoch=self.lifecycle_epoch,
         )
 
 
@@ -374,6 +376,7 @@ class BrokerStore:
             route_contract_version=contract_version,
             route_binding=binding,
             binding_digest=binding_digest,
+            lifecycle_epoch=int(row["lifecycle_epoch"]),
         )
 
     @staticmethod
@@ -384,6 +387,9 @@ class BrokerStore:
             "r.state AS run_state,c.harness,c.provider,c.model,c.effort,"
             "c.route_contract_version,c.route_binding,"
             "c.worktree,c.title,m.body,"
+            "1+(SELECT COUNT(*) FROM conversation_events reopened "
+            " WHERE reopened.conversation_id=r.conversation_id "
+            " AND reopened.event_type='conversation.reopened') AS lifecycle_epoch,"
             "EXISTS(SELECT 1 FROM conversation_events ie "
             " WHERE ie.run_id=r.run_id "
             " AND ie.event_type='run.interrupt.requested') "
@@ -408,7 +414,10 @@ class BrokerStore:
                     "SELECT o.outbox_id,o.conversation_id,o.message_id,o.attempts,"
                     "c.shell_id,c.harness,c.provider,c.model,c.effort,"
                     "c.route_contract_version,c.route_binding,c.worktree,"
-                    "c.title,c.harness_session_ref,m.body,m.state AS message_state "
+                    "c.title,c.harness_session_ref,m.body,m.state AS message_state,"
+                    "1+(SELECT COUNT(*) FROM conversation_events reopened "
+                    " WHERE reopened.conversation_id=c.conversation_id "
+                    " AND reopened.event_type='conversation.reopened') AS lifecycle_epoch "
                     "FROM conversation_outbox o "
                     "JOIN conversations c "
                     " ON c.conversation_id=o.conversation_id "
@@ -516,6 +525,7 @@ class BrokerStore:
                     route_contract_version=contract_version,
                     route_binding=binding,
                     binding_digest=binding_digest,
+                    lifecycle_epoch=int(row["lifecycle_epoch"]),
                 )
         except db_driver.IntegrityError as exc:
             # A second broker can race the eligibility read. BEGIN IMMEDIATE

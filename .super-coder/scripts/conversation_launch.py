@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 import db_driver
+import deepseek_promotion_runner
 import route_transport
 import run as run_mod
 import shell_liveness
@@ -70,6 +71,18 @@ class ConversationLaunchPreparer:
             )
         return str(row["shortname"]), row["flavor"]
 
+    def _conversation_surface(self, conversation_id: str) -> str:
+        con = db_driver.connect(self.db_path)
+        try:
+            row = con.execute(
+                "SELECT EXISTS(SELECT 1 FROM sprint_participant_conversations "
+                "WHERE conversation_id=?) AS is_sprint",
+                (conversation_id,),
+            ).fetchone()
+        finally:
+            con.close()
+        return "sprint" if row is not None and row["is_sprint"] else "browser"
+
     def recovery(self, broker_run) -> ConversationContext:
         """Rebuild only canonical identity for crash recovery, with no launch effects."""
         con = db_driver.connect(self.db_path)
@@ -108,8 +121,16 @@ class ConversationLaunchPreparer:
             "SC_ENGINE_DIR": str(run_mod.ENGINE),
             "SC_HARNESS": broker_run.harness,
             "SC_ROOT": str(run_mod.REPO_ROOT),
+            "SC_CONVERSATION_SURFACE": self._conversation_surface(
+                broker_run.conversation_id
+            ),
         }
         env["PATH"] = run_mod._shell_path(worktree, env.get("PATH", ""))
+        env = deepseek_promotion_runner.inject_conversation_context(
+            env=env,
+            conversation_id=broker_run.conversation_id,
+            lifecycle_epoch=broker_run.lifecycle_epoch,
+        )
         return ConversationContext(
             worktree=worktree.resolve(),
             provider=broker_run.provider,
@@ -121,6 +142,7 @@ class ConversationLaunchPreparer:
             route_binding=broker_run.route_binding,
             binding_digest=broker_run.binding_digest,
             conversation_id=broker_run.conversation_id,
+            lifecycle_epoch=broker_run.lifecycle_epoch,
         )
 
     def __call__(self, broker_run) -> tuple[ConversationContext, int]:
@@ -261,6 +283,10 @@ class ConversationLaunchPreparer:
                 "immutable harness, model, or effort",
             )
 
+        prepared_env = dict(plan.env)
+        prepared_env["SC_CONVERSATION_SURFACE"] = self._conversation_surface(
+            broker_run.conversation_id
+        )
         return (
             ConversationContext(
                 worktree=actual,
@@ -269,10 +295,15 @@ class ConversationLaunchPreparer:
                 effort=plan.effort,
                 permission_mode="unrestricted",
                 title=broker_run.title,
-                env=plan.env,
+                env=deepseek_promotion_runner.inject_conversation_context(
+                    env=prepared_env,
+                    conversation_id=broker_run.conversation_id,
+                    lifecycle_epoch=broker_run.lifecycle_epoch,
+                ),
                 route_binding=binding,
                 binding_digest=binding_digest,
                 conversation_id=broker_run.conversation_id,
+                lifecycle_epoch=broker_run.lifecycle_epoch,
                 boot_content=getattr(plan, "boot_content", None),
             ),
             int(plan.archive_id),

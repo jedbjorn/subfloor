@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import json
 import re
+import time
 import uuid
 from typing import Any, Callable, Iterator, Mapping
 
@@ -32,6 +33,15 @@ SESSION_REF = re.compile(r"^sc-[0-9a-f]{32}$")
 RUN_REF_PREFIX = "deepseek-host-run-v1:"
 MAX_UNKNOWN_EVENTS = 24
 MANAGED_IDENTITY_WAIT_SECONDS = 5400.0
+READINESS_MAX_ATTEMPTS = 3
+READINESS_WINDOW_SECONDS = 5.0
+READINESS_RETRY_DELAY_SECONDS = 0.05
+TRANSIENT_READINESS_CODES = frozenset({
+    "HARNESS_HOST_UNAVAILABLE",
+    "HARNESS_PLUGIN_HEALTH_UNAVAILABLE",
+    "HARNESS_REGISTRY_UNAVAILABLE",
+    "HARNESS_REGISTRY_STALE_WRITER",
+})
 SENSITIVE_KEY = re.compile(
     r"(?:key|token|secret|password|credential|authorization)", re.I
 )
@@ -124,6 +134,11 @@ class DeepSeekAdapter(ConversationAdapter):
         self.client_factory = client_factory
         self._shell_lease: deepseek_web.ShellIdentityLease | None = None
         self._reserved_session: str | None = None
+        self._proof_authority: Mapping[str, Any] | None = None
+        self._proof_context: ConversationContext | None = None
+        self._proof_session_id: str | None = None
+        self._proof_quiesced = True
+        self._identity_degradation: Mapping[str, Any] | None = None
 
     def _client(self) -> deepseek_host.HostTransport:
         try:
@@ -132,7 +147,12 @@ class DeepSeekAdapter(ConversationAdapter):
             raise _adapter_error(exc) from exc
 
     def _managed_client(
-        self, context: ConversationContext, *, recovery: bool = False
+        self,
+        context: ConversationContext,
+        root_session_id: str,
+        *,
+        recovery: bool = False,
+        bind_identity: bool = True,
     ) -> deepseek_host.HostTransport:
         # Every production managed turn is canonically prepared. A missing
         # immutable shell identity is a refusal, never a test/probe fallback.
@@ -148,21 +168,182 @@ class DeepSeekAdapter(ConversationAdapter):
                 "HARNESS_SHELL_IDENTITY_UNAVAILABLE",
                 "DeepSeek conversation preparation omitted canonical shell identity",
             )
+        host_ready = False
+        started = time.monotonic()
+        last_error: deepseek_web.DeepSeekWebError | None = None
+        for attempt in range(READINESS_MAX_ATTEMPTS):
+            try:
+                self._shell_lease = deepseek_web.acquire_shell_identity(
+                    env=env,
+                    wait_seconds=MANAGED_IDENTITY_WAIT_SECONDS,
+                )
+                deepseek_web.ensure(
+                    context.checked_worktree(),
+                    env=env,
+                    identity_lease=self._shell_lease,
+                    register_workspace=not recovery,
+                )
+                host_ready = True
+                if bind_identity:
+                    self._bind_execution_identity(context, root_session_id)
+                return self._client()
+            except deepseek_web.DeepSeekWebError as exc:
+                last_error = exc
+                self._release_shell_lease()
+                if not self._retry_readiness(exc, attempt, started):
+                    break
+        assert last_error is not None
+        if (
+            bind_identity
+            and host_ready
+            and self._browser_chat_only_allowed(context)
+            and last_error.code in TRANSIENT_READINESS_CODES
+        ):
+            self._enter_browser_chat_only(context, root_session_id, last_error)
+            return self._client()
+        raise AdapterError(last_error.code, last_error.detail) from last_error
+
+    @staticmethod
+    def _retry_readiness(
+        exc: deepseek_web.DeepSeekWebError, attempt: int, started: float
+    ) -> bool:
+        if exc.code not in TRANSIENT_READINESS_CODES:
+            return False
+        if attempt + 1 >= READINESS_MAX_ATTEMPTS:
+            return False
+        remaining = READINESS_WINDOW_SECONDS - (time.monotonic() - started)
+        if remaining <= 0:
+            return False
+        time.sleep(min(READINESS_RETRY_DELAY_SECONDS, remaining))
+        return True
+
+    def _release_shell_lease(self) -> None:
+        if self._shell_lease is not None:
+            self._shell_lease.close()
+            self._shell_lease = None
+
+    @staticmethod
+    def _browser_chat_only_allowed(context: ConversationContext) -> bool:
+        return (
+            context.env.get("SC_CONVERSATION_SURFACE", "browser") == "browser"
+            and "SC_DSH_PROOF_CONTEXT_FILE" not in context.env
+        )
+
+    def _enter_browser_chat_only(
+        self,
+        context: ConversationContext,
+        root_session_id: str,
+        failure: deepseek_web.DeepSeekWebError,
+    ) -> None:
         try:
-            self._shell_lease = deepseek_web.acquire_shell_identity(
-                env=env,
-                wait_seconds=MANAGED_IDENTITY_WAIT_SECONDS,
-            )
-            deepseek_web.ensure(
-                context.checked_worktree(),
-                env=env,
-                identity_lease=self._shell_lease,
-                register_workspace=not recovery,
+            receipt = deepseek_web.retire_session_identity(
+                env=context.env,
+                root_session_id=root_session_id,
+                quiesced=True,
             )
         except deepseek_web.DeepSeekWebError as exc:
-            self.close()
+            if exc.code != "HARNESS_BINDING_NOT_LIVE":
+                raise AdapterError(exc.code, exc.detail) from exc
+        else:
+            state = receipt.get("state") if isinstance(receipt, Mapping) else None
+            if state not in {None, "terminal"}:
+                raise AdapterError(
+                    "HARNESS_BINDING_QUIESCENCE_UNKNOWN",
+                    "Browser chat-only degradation could not retire protected authority",
+                )
+        self._identity_degradation = {
+            "mode": "chat-only",
+            "reason": failure.code,
+            "protected_effects": False,
+        }
+
+    def _bind_with_readiness(
+        self, context: ConversationContext, root_session_id: str
+    ) -> None:
+        started = time.monotonic()
+        last_error: deepseek_web.DeepSeekWebError | None = None
+        for attempt in range(READINESS_MAX_ATTEMPTS):
+            try:
+                self._bind_execution_identity(context, root_session_id)
+                return
+            except deepseek_web.DeepSeekWebError as exc:
+                last_error = exc
+                if not self._retry_readiness(exc, attempt, started):
+                    break
+        assert last_error is not None
+        if (
+            self._browser_chat_only_allowed(context)
+            and last_error.code in TRANSIENT_READINESS_CODES
+        ):
+            self._enter_browser_chat_only(context, root_session_id, last_error)
+            return
+        raise AdapterError(last_error.code, last_error.detail) from last_error
+
+    def _bind_execution_identity(
+        self, context: ConversationContext, root_session_id: str
+    ) -> None:
+        env = context.env
+        proof_authority = deepseek_web.preflight_candidate_execution(
+            env=env,
+            root_session_id=root_session_id,
+            conversation_id=self._conversation_id(context),
+            lifecycle_epoch=context.lifecycle_epoch,
+            worktree=context.checked_worktree(),
+        )
+        deepseek_web.bind_session_identity(
+            env=env,
+            root_session_id=root_session_id,
+            conversation_id=self._conversation_id(context),
+            lifecycle_epoch=context.lifecycle_epoch,
+            worktree=context.checked_worktree(),
+            candidate_preflight=proof_authority,
+        )
+        same_proof_root = (
+            proof_authority is not None
+            and self._proof_context is not None
+            and self._proof_session_id == root_session_id
+        )
+        self._proof_authority = proof_authority
+        if self._proof_authority is not None:
+            self._proof_context = context
+            self._proof_session_id = root_session_id
+            if not same_proof_root:
+                self._proof_quiesced = (
+                    proof_authority.get("binding_record_generation") is None
+                )
+        if self._proof_authority is not None and self._shell_lease is not None:
+            self._shell_lease.close()
+            self._shell_lease = None
+
+    def _revalidate_proof_authority(
+        self, context: ConversationContext, root_session_id: str
+    ) -> None:
+        if self._proof_authority is None:
+            return
+        try:
+            admitted = deepseek_web.admit_candidate_execution(
+                env=context.env,
+                root_session_id=root_session_id,
+                conversation_id=self._conversation_id(context),
+                lifecycle_epoch=context.lifecycle_epoch,
+            )
+        except deepseek_web.DeepSeekWebError as exc:
             raise AdapterError(exc.code, exc.detail) from exc
-        return self._client()
+        expected = {
+            key: self._proof_authority.get(key)
+            for key in (
+                "mode",
+                "generation",
+                "proof_run_id",
+                "root_session_id",
+                "plugin_contract_generation",
+            )
+        }
+        if admitted != expected:
+            raise AdapterError(
+                "HARNESS_PROOF_CAPABILITY_STALE",
+                "proof capability changed before the managed effect",
+            )
 
     def _require_recovery_target(
         self,
@@ -651,6 +832,9 @@ class DeepSeekAdapter(ConversationAdapter):
                 str(context.checked_worktree()),
                 workspace_id,
             )
+            if self._proof_authority is not None:
+                self._proof_quiesced = False
+                self._revalidate_proof_authority(context, session_ref)
             accepted = client.call(
                 "session.prompt",
                 {
@@ -663,6 +847,8 @@ class DeepSeekAdapter(ConversationAdapter):
             stream.close()
             raise
         if not isinstance(accepted, Mapping) or accepted.get("accepted") is not True:
+            if self._proof_authority is not None:
+                self._proof_quiesced = True
             stream.close()
             raise AdapterError(
                 "HARNESS_PROTOCOL_ERROR", "DeepSeek Host did not accept the prompt"
@@ -680,6 +866,8 @@ class DeepSeekAdapter(ConversationAdapter):
                 "route": route,
                 "client": client,
                 "stream": stream,
+                "proof_authority": self._proof_authority,
+                "identity_degradation": self._identity_degradation,
             },
             opaque=stream,
         )
@@ -687,9 +875,9 @@ class DeepSeekAdapter(ConversationAdapter):
     def start(self, context: ConversationContext, message: str) -> NativeTurn:
         message = ensure_nonempty_message(message)
         try:
-            client = self._managed_client(context)
-            route = self._route(client, context)
             session_ref = self._new_session_ref(context)
+            client = self._managed_client(context, session_ref)
+            route = self._route(client, context)
             self._reserve(session_ref)
             workspace_id = self._prepare_managed_session(
                 client, session_ref, context
@@ -723,12 +911,15 @@ class DeepSeekAdapter(ConversationAdapter):
         session_ref = self._session_ref(session_ref)
         message = ensure_nonempty_message(message)
         try:
-            client = self._managed_client(context)
+            client = self._managed_client(
+                context, session_ref, bind_identity=False
+            )
             self._reserve(session_ref)
             route = self._route(client, context)
             workspace_id = self._prepare_managed_session(
                 client, session_ref, context, resume=True
             )
+            self._bind_with_readiness(context, session_ref)
             return self._turn(
                 client,
                 session_ref,
@@ -860,6 +1051,8 @@ class DeepSeekAdapter(ConversationAdapter):
                 native_type,
             )]
         if native_type == "turn/end":
+            if self._proof_authority is not None:
+                self._proof_quiesced = True
             reason = data.get("reason")
             kind = reason.get("kind") if isinstance(reason, Mapping) else None
             if kind == "completed":
@@ -1012,6 +1205,15 @@ class DeepSeekAdapter(ConversationAdapter):
         client = turn.metadata.get("client")
         if client is None:
             return InterruptResult(False, "DeepSeek Host client is unavailable")
+        context = turn.metadata.get("context")
+        if self._proof_authority is not None:
+            if not isinstance(context, ConversationContext):
+                raise AdapterError(
+                    "HARNESS_IDENTITY_MISSING",
+                    "candidate cancellation lacks its exact conversation context",
+                )
+            self._revalidate_proof_authority(context, turn.session_ref)
+            self._proof_quiesced = False
         try:
             result = client.call("session.cancel", {"sessionId": turn.session_ref})
         except deepseek_host.DeepSeekHostError as exc:
@@ -1056,9 +1258,12 @@ class DeepSeekAdapter(ConversationAdapter):
         self, session_ref: str, context: ConversationContext
     ) -> SessionInspection:
         session_ref = self._session_ref(session_ref)
-        client = self._managed_client(context, recovery=True)
+        client = self._managed_client(
+            context, session_ref, recovery=True, bind_identity=False
+        )
         try:
             self._require_recovery_target(client, session_ref, context)
+            self._bind_with_readiness(context, session_ref)
             listed = client.call("session.list", {})
             items = listed.get("items") if isinstance(listed, Mapping) else None
             if not isinstance(items, list):
@@ -1107,18 +1312,23 @@ class DeepSeekAdapter(ConversationAdapter):
     ) -> ReconcileResult:
         client = turn.metadata.get("client")
         if client is None:
-            client = self._managed_client(context, recovery=True)
+            client = self._managed_client(
+                context, turn.session_ref, recovery=True, bind_identity=False
+            )
             # Recovery begins from a durable NativeTurn with no live transport.
             # Retain the newly authenticated client so every later reconcile and
             # pending interrupt reuse this adapter's one full-lifetime lease.
             turn.metadata["client"] = client
         try:
             self._require_recovery_target(client, turn.session_ref, context)
+            self._bind_with_readiness(context, turn.session_ref)
             events = self._history(client, turn.session_ref)
         except deepseek_host.DeepSeekHostError as exc:
             raise _adapter_error(exc) from exc
         boundary = _run_boundary(turn.run_ref)
         outcome, proven, interrupt = self._history_outcome(events, boundary)
+        if self._proof_authority is not None:
+            self._proof_quiesced = proven and outcome not in {"running", "unknown"}
         return ReconcileResult(
             outcome,
             proven,
@@ -1134,9 +1344,28 @@ class DeepSeekAdapter(ConversationAdapter):
         )
 
     def close(self) -> None:
+        close_error: AdapterError | None = None
+        if (
+            self._proof_authority is not None
+            and self._proof_context is not None
+            and self._proof_session_id is not None
+        ):
+            try:
+                deepseek_web.retire_session_identity(
+                    env=self._proof_context.env,
+                    root_session_id=self._proof_session_id,
+                    quiesced=self._proof_quiesced,
+                )
+            except deepseek_web.DeepSeekWebError as exc:
+                close_error = AdapterError(exc.code, exc.detail)
         if self._reserved_session is not None:
             deepseek_web.release_managed_session(self._reserved_session)
             self._reserved_session = None
-        if self._shell_lease is not None:
-            self._shell_lease.close()
-            self._shell_lease = None
+        self._release_shell_lease()
+        self._proof_authority = None
+        self._proof_context = None
+        self._proof_session_id = None
+        self._proof_quiesced = True
+        self._identity_degradation = None
+        if close_error is not None:
+            raise close_error

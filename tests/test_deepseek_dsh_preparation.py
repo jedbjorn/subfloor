@@ -445,13 +445,14 @@ class DeepSeekDshPreparationContractTests(unittest.TestCase):
             self.contract["governing_revision"],
             {
                 "document_id": 174,
-                "current_sha256": "84056c2fc7206b83f2d3beb71150545326d5e33f557cb5f2329f55321eab0bdf",
+                "current_sha256": "06bb2bc31856575b88983d522fd881ad8e9b68c75714a804ff6cdb5bbd98aeb8",
                 "sprint_bound_sha256": "84056c2fc7206b83f2d3beb71150545326d5e33f557cb5f2329f55321eab0bdf",
-                "scope_decision_id": 255,
-                "drift_disposition": "retain Sprint 24 WU95 Doc 174 v3 only as replaced-binding drift evidence; Sprint 25 WU101 Doc 174 v4 and Decision 255 govern this corrected head",
-                "task_id": 649,
+                "scope_decision_id": 261,
+                "reviewer_disposition_message_id": 1385,
+                "drift_disposition": "retain Sprint 25 WU104 Doc 174 v4 as the immutable Sprint binding; Doc 174 v5, Decision 261, and Reviewer disposition message 1385 are active reliability narrowing authority and do not edit that binding",
+                "task_id": 651,
                 "sprint_id": 25,
-                "work_unit_id": 107,
+                "work_unit_id": 104,
                 "preparation_work_unit": {
                     "task_id": 648,
                     "work_unit_id": 101,
@@ -461,7 +462,7 @@ class DeepSeekDshPreparationContractTests(unittest.TestCase):
                     "work_unit_id": 95,
                     "sprint_bound_sha256": "a305eba5c73988d202e3f3f9d392d623645b3f799dfe4ab4945687026ae5a969",
                 },
-                "implementation_base": "3dc47cd",
+                "implementation_base": "21a05f3eae09b70c4c42bae69a6d04e89bb1d8f7",
             },
         )
         self.assertEqual(adapter["official_runtime"]["version"], release["version"])

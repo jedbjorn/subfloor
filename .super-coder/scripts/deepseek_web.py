@@ -11,12 +11,15 @@ from __future__ import annotations
 import argparse
 import asyncio
 import fcntl
+import hashlib
 import json
 import os
 import re
 import shutil
 import signal
 import socket
+import sqlite3
+import stat
 import struct
 import subprocess
 import sys
@@ -30,13 +33,16 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
+import harness_versions
 import ports
+from deepseek_candidate_authority import DeepSeekCandidateAuthority
 from deepseek_identity_registry import (
     DeepSeekIdentityError,
     DeepSeekIdentityRegistry,
 )
 
 ENGINE = Path(__file__).resolve().parents[1]
+ENGINE_DB = ENGINE / "shell_db.db"
 REPO_ROOT = ENGINE.parent.resolve()
 STATE = ENGINE / "run" / "deepseek-web.json"
 LOG = ENGINE / "logs" / "deepseek-web.log"
@@ -46,6 +52,17 @@ STOP_TIMEOUT_SECONDS = 5.0
 HTTP_TIMEOUT_SECONDS = 2.0
 RELAY_POLICY = "host-gateway-only-v1"
 GENERATION_COOKIE = "sc_deepseek_generation"
+CANDIDATE_FENCE_CODES = frozenset({
+    "HARNESS_PROOF_BINDING_MISMATCH",
+    "HARNESS_PROOF_CAPABILITY_EXPIRED",
+    "HARNESS_PROOF_CAPABILITY_MISMATCH",
+    "HARNESS_PROOF_CAPABILITY_REVOKED",
+    "HARNESS_PROOF_CAPABILITY_STALE",
+    "HARNESS_PROOF_RESTART_BINDING_MISMATCH",
+    "HARNESS_PROOF_ROOT_REFUSED",
+})
+PROMOTION_RUNNER_CONTRACT = "sc-dsh-promotion-runner-v1"
+PROOF_CONTEXT_CONTRACT = "sc-dsh-proof-context-v1"
 SESSION_MUTATION_FIELDS = {
     "/api/session.create": ("sessionId",),
     "/api/session.selectModel": ("sessionId",),
@@ -86,6 +103,44 @@ class ShellIdentityLease:
         self._handle = None
 
 
+def _exact_engine_ref() -> str:
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(ENGINE), "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        dirty = subprocess.run(
+            [
+                "git", "-C", str(ENGINE), "status", "--porcelain",
+                "--untracked-files=all",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise DeepSeekWebError(
+            "HARNESS_PROOF_REF_UNAVAILABLE",
+            "cannot resolve the exact engine ref for proof admission",
+        ) from exc
+    value = result.stdout.strip()
+    if re.fullmatch(r"[0-9a-f]{40}", value) is None:
+        raise DeepSeekWebError(
+            "HARNESS_PROOF_REF_UNAVAILABLE",
+            "engine ref is not one exact commit",
+        )
+    if dirty.stdout.strip():
+        raise DeepSeekWebError(
+            "HARNESS_PROOF_REF_DIRTY",
+            "proof admission requires the exact clean engine ref",
+        )
+    return value
+
+
 def _state_path() -> Path:
     override = os.environ.get("SC_DEEPSEEK_WEB_STATE")
     return Path(override) if override else STATE
@@ -112,9 +167,22 @@ def _unproven_path() -> Path:
 def _read_unproven() -> dict[str, Any] | None:
     path = _unproven_path()
     try:
-        if path.is_symlink() or path.stat().st_mode & 0o777 != 0o600:
+        metadata = path.lstat()
+        if path.is_symlink() or metadata.st_mode & 0o777 != 0o600:
             raise OSError("unsafe unproven-work artifact")
-        value = json.loads(path.read_text())
+        with path.open("rb") as handle:
+            before = os.fstat(handle.fileno())
+            if (metadata.st_dev, metadata.st_ino) != (before.st_dev, before.st_ino):
+                raise OSError("proof artifact changed before reading")
+            value = json.load(handle)
+            after = os.fstat(handle.fileno())
+        if (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns) != (
+            after.st_dev,
+            after.st_ino,
+            after.st_size,
+            after.st_mtime_ns,
+        ):
+            raise OSError("proof artifact changed while reading")
     except FileNotFoundError:
         return None
     except (OSError, json.JSONDecodeError) as exc:
@@ -629,7 +697,7 @@ def _stop_unlocked() -> dict[str, Any]:
     except FileNotFoundError:
         pass
     try:
-        _credential_path().unlink()
+        _legacy_credential_path().unlink()
     except FileNotFoundError:
         pass
     try:
@@ -647,7 +715,8 @@ def _stop_unlocked() -> dict[str, Any]:
     return {"stopped": bool(state), "web": web_stopped, "relay": relay_stopped}
 
 
-def _credential_path() -> Path:
+def _legacy_credential_path() -> Path:
+    """Locate the pre-neutral-Host artifact so stop removes upgrade residue."""
     return _state_path().with_name("deepseek-shell-api.json")
 
 
@@ -788,10 +857,7 @@ def _initialize_activity() -> None:
 
 
 def _history_boundary(service_port: int, session_id: str) -> int:
-    try:
-        result = _host_rpc(service_port, "session.history", {"sessionId": session_id})
-    except DeepSeekWebError:
-        raise
+    result = _host_rpc(service_port, "session.history", {"sessionId": session_id})
     events = result.get("events") if isinstance(result, Mapping) else None
     if not isinstance(events, list):
         raise _activity_error("DeepSeek Web could not read browser session history")
@@ -1056,46 +1122,6 @@ def _read_generation(path: Path) -> str:
     return token
 
 
-def _write_shell_credential(env: Mapping[str, str]) -> tuple[Path, str, int] | None:
-    token = env.get("SC_API_TOKEN", "")
-    api_base = env.get("SC_API_BASE", "")
-    shell_id = env.get("SC_SHELL_ID", "")
-    shortname = env.get("SC_SHELL_SHORTNAME", "")
-    present = tuple(bool(value) for value in (token, api_base, shell_id, shortname))
-    if not any(present):
-        return None
-    if not all(present):
-        raise DeepSeekWebError(
-            "HARNESS_SHELL_IDENTITY_UNAVAILABLE",
-            "DeepSeek Web requires complete Subfloor shell API wiring",
-        )
-    path = _credential_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
-    try:
-        descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-        with os.fdopen(descriptor, "w") as handle:
-            os.fchmod(handle.fileno(), 0o600)
-            json.dump(
-                {
-                    "shell_id": int(shell_id),
-                    "shortname": shortname,
-                    "api_base": api_base,
-                    "token": token,
-                },
-                handle,
-            )
-            handle.write("\n")
-        os.replace(temporary, path)
-    except OSError:
-        try:
-            temporary.unlink()
-        except FileNotFoundError:
-            pass
-        raise
-    return path, shortname, int(shell_id)
-
-
 def _identity_registry(env: Mapping[str, str]) -> DeepSeekIdentityRegistry:
     override = env.get("SC_DEEPSEEK_IDENTITY_ROOT")
     if override:
@@ -1105,6 +1131,1096 @@ def _identity_registry(env: Mapping[str, str]) -> DeepSeekIdentityRegistry:
     else:
         runtime_root = ENGINE / "run" / "deepseek-identity"
     return DeepSeekIdentityRegistry(repo_root=REPO_ROOT, runtime_root=runtime_root)
+
+
+def _candidate_authority(
+    registry: DeepSeekIdentityRegistry,
+) -> DeepSeekCandidateAuthority:
+    return DeepSeekCandidateAuthority(registry.layout.root / "proof-authority")
+
+
+def _current_dsh_version() -> str:
+    version = harness_versions.probe("deepseek")
+    if not isinstance(version, str) or not version:
+        raise DeepSeekWebError(
+            "HARNESS_PROOF_VERSION_UNAVAILABLE",
+            "cannot resolve the live DeepSeek version for proof admission",
+        )
+    return version
+
+
+def _owner_proof_json(path: Path, *, code: str) -> dict[str, Any]:
+    try:
+        metadata = path.lstat()
+        if (
+            path.is_symlink()
+            or not stat.S_ISREG(metadata.st_mode)
+            or stat.S_IMODE(metadata.st_mode) != 0o600
+            or metadata.st_uid != os.getuid()
+        ):
+            raise OSError("unsafe owner-only proof artifact")
+        descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        with os.fdopen(descriptor, "r") as handle:
+            before = os.fstat(handle.fileno())
+            if (
+                before.st_dev != metadata.st_dev
+                or before.st_ino != metadata.st_ino
+                or before.st_uid != metadata.st_uid
+                or stat.S_IMODE(before.st_mode) != 0o600
+            ):
+                raise OSError("owner-only proof artifact changed before open")
+            value = json.load(handle)
+            after = os.fstat(handle.fileno())
+            if (
+                after.st_dev != before.st_dev
+                or after.st_ino != before.st_ino
+                or after.st_size != before.st_size
+                or after.st_mtime_ns != before.st_mtime_ns
+            ):
+                raise OSError("owner-only proof artifact changed during read")
+    except (FileNotFoundError, OSError, json.JSONDecodeError) as exc:
+        raise DeepSeekIdentityError(
+            code, "owner-only proof artifact is unavailable"
+        ) from exc
+    if not isinstance(value, dict):
+        raise DeepSeekIdentityError(code, "owner-only proof artifact is malformed")
+    return value
+
+
+def _canonical_proof_digest(value: object) -> str:
+    payload = json.dumps(
+        value, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+    ).encode()
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _canonical_promotion_roots(
+    *, conversation_ids: tuple[str, ...]
+) -> dict[str, dict[str, Any]]:
+    """Derive the disposable Browser/Sprint roots from the fixed engine DB."""
+    if (
+        len(conversation_ids) != 2
+        or len(set(conversation_ids)) != 2
+        or any(not isinstance(value, str) or not value for value in conversation_ids)
+    ):
+        raise DeepSeekWebError(
+            "HARNESS_PROOF_RUNNER_INVALID",
+            "promotion requires two distinct canonical conversation identities",
+        )
+    try:
+        metadata = ENGINE_DB.lstat()
+        canonical_db = ENGINE_DB.resolve(strict=True)
+        if (
+            ENGINE_DB.is_symlink()
+            or not stat.S_ISREG(metadata.st_mode)
+            or canonical_db != ENGINE_DB.absolute()
+        ):
+            raise OSError("canonical engine DB path is unsafe")
+        connection = sqlite3.connect(
+            f"{canonical_db.as_uri()}?mode=ro", uri=True, timeout=5.0
+        )
+        connection.row_factory = sqlite3.Row
+        try:
+            roots: dict[str, dict[str, Any]] = {}
+            for conversation_id in conversation_ids:
+                row = connection.execute(
+                    "SELECT c.conversation_id,c.harness,c.state,"
+                    "c.conversation_scope,"
+                    "1+(SELECT COUNT(*) FROM conversation_events reopened "
+                    "WHERE reopened.conversation_id=c.conversation_id "
+                    "AND reopened.event_type='conversation.reopened') "
+                    "AS lifecycle_epoch,"
+                    "EXISTS(SELECT 1 FROM sprint_participant_conversations link "
+                    "WHERE link.conversation_id=c.conversation_id) AS is_sprint "
+                    "FROM conversations c WHERE c.conversation_id=?",
+                    (conversation_id,),
+                ).fetchone()
+                if (
+                    row is None
+                    or row["harness"] != "deepseek"
+                    or row["state"] not in {"idle", "queued", "running", "waiting"}
+                ):
+                    raise DeepSeekWebError(
+                        "HARNESS_PROOF_ROOT_REFUSED",
+                        "promotion roots must be live canonical DeepSeek conversations",
+                    )
+                surface = "sprint" if row["is_sprint"] else "browser"
+                expected_scope = "sprint" if surface == "sprint" else "normal"
+                if row["conversation_scope"] != expected_scope:
+                    raise DeepSeekWebError(
+                        "HARNESS_PROOF_ROOT_REFUSED",
+                        "promotion conversation scope disagrees with canonical topology",
+                    )
+                root_session_id = (
+                    f"sc-{uuid.uuid5(uuid.NAMESPACE_URL, conversation_id).hex}"
+                )
+                roots[root_session_id] = {
+                    "conversation_id": conversation_id,
+                    "lifecycle_epoch": int(row["lifecycle_epoch"]),
+                    "verified_lineage": [],
+                    "surface": surface,
+                }
+        finally:
+            connection.close()
+    except DeepSeekWebError:
+        raise
+    except (OSError, sqlite3.Error) as exc:
+        raise DeepSeekWebError(
+            "HARNESS_PROOF_ROOT_SOURCE_UNAVAILABLE",
+            "canonical engine conversation state is unavailable",
+        ) from exc
+    if {root["surface"] for root in roots.values()} != {"browser", "sprint"}:
+        raise DeepSeekWebError(
+            "HARNESS_PROOF_ROOT_REFUSED",
+            "promotion requires one canonical Browser and one Sprint conversation",
+        )
+    return roots
+
+
+def _validate_promotion_runner(
+    *,
+    registry: DeepSeekIdentityRegistry,
+    runner_authorization: Mapping[str, str] | None,
+    mode: str,
+    proof_run_id: str,
+    roots: Mapping[str, Mapping[str, Any]] | None,
+) -> str:
+    expected_path = registry.layout.root / "proof-authority" / "runner.json"
+    raw_path = (
+        runner_authorization.get("state_path")
+        if isinstance(runner_authorization, Mapping)
+        else None
+    )
+    token = (
+        runner_authorization.get("token")
+        if isinstance(runner_authorization, Mapping)
+        else None
+    )
+    if not isinstance(raw_path, str) or not isinstance(token, str) or not token:
+        raise DeepSeekIdentityError(
+            "HARNESS_PROOF_RUNNER_REQUIRED",
+            "proof capability mint requires dedicated runner authorization",
+        )
+    presented_path = Path(raw_path)
+    try:
+        path = presented_path.resolve(strict=True)
+    except OSError as exc:
+        raise DeepSeekIdentityError(
+            "HARNESS_PROOF_RUNNER_REQUIRED",
+            "dedicated runner authorization is unavailable",
+        ) from exc
+    if (
+        not presented_path.is_absolute()
+        or presented_path.is_symlink()
+        or presented_path != path
+        or path != expected_path.resolve()
+    ):
+        raise DeepSeekIdentityError(
+            "HARNESS_PROOF_RUNNER_REQUIRED",
+            "proof capability mint rejected foreign runner authority",
+        )
+    state = _owner_proof_json(path, code="HARNESS_PROOF_RUNNER_REQUIRED")
+    expected_roots = (
+        {
+            root_session_id: dict(root)
+            for root_session_id, root in roots.items()
+        }
+        if roots is not None
+        else None
+    )
+    exact_ref = _exact_engine_ref()
+    if (
+        state.get("contract") != PROMOTION_RUNNER_CONTRACT
+        or state.get("state") != "authorizing"
+        or state.get("runner_pid") != os.getpid()
+        or state.get("runner_start_ticks") != process_start_ticks(os.getpid())
+        or state.get("runner_token_sha256")
+        != hashlib.sha256(token.encode()).hexdigest()
+        or state.get("mode") != mode
+        or state.get("proof_run_id") != proof_run_id
+        or state.get("exact_ref") != exact_ref
+        or (
+            expected_roots is not None
+            and state.get("roots_sha256")
+            != _canonical_proof_digest(expected_roots)
+        )
+    ):
+        raise DeepSeekIdentityError(
+            "HARNESS_PROOF_RUNNER_REQUIRED",
+            "dedicated runner identity or engine-derived proof facts changed",
+        )
+    acceptance = state.get("acceptance")
+    if (mode == "candidate" and acceptance is not None) or (
+        mode == "promoted"
+        and not isinstance(acceptance, Mapping)
+    ):
+        raise DeepSeekIdentityError(
+            "HARNESS_PROOF_ACCEPTANCE_REQUIRED",
+            "proof mode is not authorized by the candidate acceptance transition",
+        )
+    return exact_ref
+
+
+def _candidate_artifact(
+    *,
+    env: Mapping[str, str],
+    root_session_id: str | None = None,
+    conversation_id: str | None = None,
+    lifecycle_epoch: int | None = None,
+    surface: str | None = None,
+) -> Path | None:
+    raw_context = env.get("SC_DSH_PROOF_CONTEXT_FILE")
+    if raw_context is None:
+        if env.get("SC_DSH_PROOF_CAPABILITY_FILE") is not None:
+            raise DeepSeekWebError(
+                "HARNESS_PROOF_RUNNER_REQUIRED",
+                "ambient proof capability selection is refused",
+            )
+        return None
+    registry = _identity_registry(env)
+    authority_root = registry.layout.root / "proof-authority"
+    contexts_root = authority_root / "contexts"
+    presented_context = Path(raw_context)
+    try:
+        context_path = presented_context.resolve(strict=True)
+        if (
+            not presented_context.is_absolute()
+            or presented_context.is_symlink()
+            or presented_context != context_path
+        ):
+            raise OSError("aliased proof context")
+        if context_path.parent != contexts_root.resolve():
+            raise OSError("foreign proof context")
+        context = _owner_proof_json(
+            context_path, code="HARNESS_PROOF_RUNNER_REQUIRED"
+        )
+        runner = _owner_proof_json(
+            authority_root / "runner.json",
+            code="HARNESS_PROOF_RUNNER_REQUIRED",
+        )
+    except (OSError, DeepSeekIdentityError) as exc:
+        code = getattr(exc, "code", "HARNESS_PROOF_RUNNER_REQUIRED")
+        detail = getattr(exc, "detail", "dedicated proof context is unavailable")
+        raise DeepSeekWebError(code, detail) from exc
+    expected_context_path = runner.get("contexts", {}).get(
+        context.get("root_session_id")
+    )
+    if (
+        context.get("contract") != PROOF_CONTEXT_CONTRACT
+        or runner.get("contract") != PROMOTION_RUNNER_CONTRACT
+        or runner.get("state") != "active"
+        or context.get("runner_id") != runner.get("runner_id")
+        or context.get("proof_run_id") != runner.get("proof_run_id")
+        or context.get("mode") != runner.get("mode")
+        or expected_context_path != str(context_path)
+        or (surface is not None and context.get("surface") != surface)
+    ):
+        raise DeepSeekWebError(
+            "HARNESS_PROOF_RUNNER_REQUIRED",
+            "proof context is stale or does not match this exact execution",
+        )
+    if (
+        context.get("generation") != runner.get("generation")
+        or context.get("artifact") != runner.get("artifact")
+    ):
+        raise DeepSeekWebError(
+            "HARNESS_PROOF_CAPABILITY_STALE",
+            "proof context presents a stale capability generation",
+        )
+    if (
+        (root_session_id is not None and context.get("root_session_id") != root_session_id)
+        or (conversation_id is not None and context.get("conversation_id") != conversation_id)
+        or (lifecycle_epoch is not None and context.get("lifecycle_epoch") != lifecycle_epoch)
+    ):
+        raise DeepSeekWebError(
+            "HARNESS_PROOF_ROOT_REFUSED",
+            "proof context does not enumerate this exact root lifecycle",
+        )
+    artifact = context.get("artifact")
+    if not isinstance(artifact, str):
+        raise DeepSeekWebError(
+            "HARNESS_PROOF_RUNNER_REQUIRED", "proof context lacks an artifact"
+        )
+    return Path(artifact)
+
+
+def proof_root_from_environment(
+    *, env: Mapping[str, str], surface: str
+) -> str | None:
+    """Resolve the runner-installed exact root for a non-conversation surface."""
+    artifact = _candidate_artifact(env=env, surface=surface)
+    if artifact is None:
+        return None
+    context = _owner_proof_json(
+        Path(env["SC_DSH_PROOF_CONTEXT_FILE"]),
+        code="HARNESS_PROOF_RUNNER_REQUIRED",
+    )
+    root_session_id = context.get("root_session_id")
+    if not isinstance(root_session_id, str):
+        raise DeepSeekWebError(
+            "HARNESS_PROOF_ROOT_REFUSED", "proof context lacks an exact root"
+        )
+    return root_session_id
+
+
+def _binding_inputs(
+    env: Mapping[str, str], worktree: Path
+) -> tuple[int, str, str, str, Path]:
+    _verify_shell_identity(env)
+    try:
+        return (
+            int(env["SC_SHELL_ID"]),
+            env["SC_SHELL_SHORTNAME"],
+            env["SC_API_BASE"],
+            env["SC_API_TOKEN"],
+            worktree.resolve(strict=True),
+        )
+    except (KeyError, ValueError, OSError) as exc:
+        raise DeepSeekWebError(
+            "HARNESS_SHELL_IDENTITY_UNAVAILABLE",
+            "DeepSeek session binding lacks canonical shell identity",
+        ) from exc
+
+
+def mint_candidate_capability(
+    *,
+    env: Mapping[str, str],
+    mode: str,
+    disposable_baseline: str,
+    proof_run_id: str,
+    conversation_ids: tuple[str, ...],
+    ttl_seconds: int,
+    runner_authorization: Mapping[str, str] | None = None,
+) -> dict[str, Any]:
+    """Server-side mint from live exact-ref, Host, and clean-seat evidence."""
+    registry = _identity_registry(env)
+    try:
+        exact_ref = _validate_promotion_runner(
+            registry=registry,
+            runner_authorization=runner_authorization,
+            mode=mode,
+            proof_run_id=proof_run_id,
+            roots=None,
+        )
+        managed_roots = _canonical_promotion_roots(
+            conversation_ids=conversation_ids
+        )
+        managed_authority_roots = {
+            root_session_id: {
+                key: value for key, value in root.items() if key != "surface"
+            }
+            for root_session_id, root in managed_roots.items()
+        }
+        verified_ref = _validate_promotion_runner(
+            registry=registry,
+            runner_authorization=runner_authorization,
+            mode=mode,
+            proof_run_id=proof_run_id,
+            roots=managed_authority_roots,
+        )
+        if verified_ref != exact_ref:
+            raise DeepSeekIdentityError(
+                "HARNESS_PROOF_RUNNER_REQUIRED",
+                "dedicated runner exact ref changed during root derivation",
+            )
+        snapshot = registry.read_snapshot()
+        health = registry.read_live_health()
+        observed_live_roots = sorted(
+            root_session_id
+            for root_session_id, record in snapshot["records"].items()
+            if isinstance(record, Mapping)
+            and record.get("state") in {"active", "closing"}
+        )
+        if observed_live_roots:
+            raise DeepSeekIdentityError(
+                "HARNESS_PROOF_SEAT_NOT_CLEAN",
+                "initial proof capability requires an empty live session set",
+            )
+        with registry.candidate_mint_guard(
+            expected_plugin_contract_generation=health[
+                "plugin_contract_generation"
+            ]
+        ) as locked_snapshot:
+            one_shot_root = f"sc-{uuid.uuid4().hex}"
+            roots = {
+                **managed_roots,
+                one_shot_root: {
+                    "conversation_id": f"one-shot:{one_shot_root}",
+                    "lifecycle_epoch": 1,
+                    "verified_lineage": [],
+                    "surface": "one-shot",
+                },
+            }
+            authority_roots = {
+                root_session_id: {
+                    key: value for key, value in root.items() if key != "surface"
+                }
+                for root_session_id, root in roots.items()
+            }
+            grant = _candidate_authority(registry).mint(
+                mode=mode,
+                exact_ref=exact_ref,
+                pinned_dsh_version=_current_dsh_version(),
+                disposable_baseline=disposable_baseline,
+                proof_run_id=proof_run_id,
+                roots=authority_roots,
+                plugin_contract_generation=health[
+                    "plugin_contract_generation"
+                ],
+                ttl_seconds=ttl_seconds,
+                live_registry_roots=sorted(
+                    root_session_id
+                    for root_session_id, record in locked_snapshot["records"].items()
+                    if isinstance(record, Mapping)
+                    and record.get("state") in {"active", "closing"}
+                ),
+            )
+        return {
+            "mode": grant.mode,
+            "generation": grant.generation,
+            "artifact": str(grant.artifact),
+            "proof_run_id": grant.proof_run_id,
+            "exact_ref": grant.exact_ref,
+            "plugin_contract_generation": grant.plugin_contract_generation,
+            "roots": roots,
+        }
+    except DeepSeekIdentityError as exc:
+        raise DeepSeekWebError(exc.code, exc.detail) from exc
+
+
+def _candidate_root_terminal(root_session_id: str) -> bool:
+    state = _read_state()
+    service_port = state.get("service_port")
+    if not isinstance(service_port, int):
+        return False
+    try:
+        _host_rpc(service_port, "session.cancel", {"sessionId": root_session_id})
+    except DeepSeekWebError:
+        pass
+    for attempt in range(3):
+        if _history_is_terminal(service_port, root_session_id, 0):
+            return True
+        if attempt < 2:
+            time.sleep(0.05)
+    return False
+
+
+def _fence_candidate_capability(
+    *,
+    env: Mapping[str, str],
+    artifact: Path,
+    strict_revoke: bool,
+    require_live_root: bool,
+    failure_code: str | None = None,
+) -> dict[str, Any] | None:
+    registry = _identity_registry(env)
+    authority = _candidate_authority(registry)
+    contract = authority.refusal_contract(artifact=artifact)
+    roots = contract["roots"]
+    fenced = registry.begin_close_roots(
+        roots=roots,
+        require_live_root=require_live_root,
+        fence_mismatch=True,
+    )
+    if require_live_root and not fenced:
+        return None
+    revoked = (
+        authority.revoke(artifact=artifact)
+        if strict_revoke
+        else authority.revoke_for_refusal(
+            artifact=artifact, reason_code=failure_code
+        )
+    )
+    outcomes: dict[str, dict[str, Any]] = {}
+    for root_session_id, receipt in fenced.items():
+        if receipt.state == "terminal":
+            outcomes[root_session_id] = {
+                "state": "terminal",
+                "record_generation": receipt.record_generation,
+            }
+            continue
+        try:
+            terminal = _candidate_root_terminal(root_session_id)
+            outcomes[root_session_id] = retire_session_identity(
+                env=env,
+                root_session_id=root_session_id,
+                quiesced=terminal,
+            )
+        except DeepSeekWebError as exc:
+            outcomes[root_session_id] = {
+                "state": "closing",
+                "record_generation": receipt.record_generation,
+                "teardown_error": exc.code,
+            }
+    if (
+        not strict_revoke
+        and failure_code is not None
+        and isinstance(revoked.get("failure"), dict)
+    ):
+        authority.record_refusal_outcomes(artifact=artifact, roots=outcomes)
+        revoked["failure"]["roots"] = outcomes
+    return {**revoked, "roots": outcomes}
+
+
+def _fence_failed_candidate(
+    *,
+    env: Mapping[str, str],
+    artifact: Path,
+    failure_code: str | None = None,
+    require_live_root: bool = True,
+) -> dict[str, Any] | None:
+    return _fence_candidate_capability(
+        env=env,
+        artifact=artifact,
+        strict_revoke=False,
+        require_live_root=require_live_root,
+        failure_code=failure_code,
+    )
+
+
+def revoke_candidate_capability(
+    *, env: Mapping[str, str], artifact: Path
+) -> dict[str, Any]:
+    """Revoke current proof authority and close every enumerated live root."""
+    if not artifact.is_absolute() or len(artifact.parents) < 2:
+        raise DeepSeekWebError(
+            "HARNESS_PROOF_CAPABILITY_UNSAFE",
+            "proof capability path must be absolute",
+        )
+    try:
+        result = _fence_candidate_capability(
+            env=env,
+            artifact=artifact,
+            strict_revoke=True,
+            require_live_root=False,
+        )
+        if result is None:
+            raise DeepSeekIdentityError(
+                "HARNESS_PROOF_CAPABILITY_INVALID",
+                "proof capability revocation produced no receipt",
+            )
+        return result
+    except DeepSeekIdentityError as exc:
+        raise DeepSeekWebError(exc.code, exc.detail) from exc
+
+
+def bind_session_identity(
+    *,
+    env: Mapping[str, str],
+    root_session_id: str,
+    conversation_id: str,
+    lifecycle_epoch: int,
+    worktree: Path,
+    candidate_preflight: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Bind one exact managed/one-shot root before model-facing admission."""
+    if lifecycle_epoch <= 0:
+        raise DeepSeekWebError(
+            "HARNESS_LIFECYCLE_INVALID",
+            "DeepSeek lifecycle epoch must be positive",
+        )
+    shell_id, shell_shortname, api_base, token, selected = _binding_inputs(
+        env, worktree
+    )
+    registry = _identity_registry(env)
+    try:
+        health = registry.read_live_health()
+        contract_generation = health["plugin_contract_generation"]
+        snapshot = registry.read_snapshot()
+        record = snapshot["records"].get(root_session_id)
+        if candidate_preflight is not None:
+            expected = {
+                "root_session_id": root_session_id,
+                "plugin_contract_generation": contract_generation,
+                "binding_snapshot_generation": snapshot[
+                    "snapshot_generation"
+                ],
+                "binding_record_generation": (
+                    record.get("record_generation")
+                    if isinstance(record, Mapping)
+                    else None
+                ),
+            }
+            if any(
+                candidate_preflight.get(key) != value
+                for key, value in expected.items()
+            ):
+                raise DeepSeekIdentityError(
+                    "HARNESS_PROOF_CAPABILITY_STALE",
+                    "proof preflight no longer matches the binding snapshot",
+                )
+            if record is not None:
+                if not isinstance(record, Mapping) or record.get("state") != "active":
+                    raise DeepSeekIdentityError(
+                        "HARNESS_PROOF_BINDING_MISMATCH",
+                        "proof preflight cannot mutate a non-current binding",
+                    )
+                if not registry.binding_current(
+                    root_session_id=root_session_id,
+                    conversation_id=conversation_id,
+                    lifecycle_epoch=lifecycle_epoch,
+                    shell_id=shell_id,
+                    shell_shortname=shell_shortname,
+                    shell_worktree=selected,
+                    api_base=api_base,
+                    token=token,
+                    plugin_contract_generation=contract_generation,
+                ):
+                    raise DeepSeekIdentityError(
+                        "HARNESS_PROOF_BINDING_MISMATCH",
+                        "proof preflight cannot rotate a stale binding",
+                    )
+        if record is None:
+            registry.create_binding(
+                expected_snapshot_generation=snapshot["snapshot_generation"],
+                root_session_id=root_session_id,
+                conversation_id=conversation_id,
+                lifecycle_epoch=lifecycle_epoch,
+                shell_id=shell_id,
+                shell_shortname=shell_shortname,
+                shell_worktree=selected,
+                api_base=api_base,
+                token=token,
+                plugin_contract_generation=contract_generation,
+            )
+        elif candidate_preflight is not None:
+            pass
+        else:
+            if not isinstance(record, dict):
+                raise DeepSeekIdentityError(
+                    "HARNESS_REGISTRY_INVALID", "binding record is malformed"
+                )
+            same_owner = (
+                record.get("root_session_id") == root_session_id
+                and record.get("conversation_id") == conversation_id
+                and record.get("shell_id") == shell_id
+                and record.get("shell_shortname") == shell_shortname
+                and record.get("shell_worktree") == str(selected)
+            )
+            previous_epoch = record.get("lifecycle_epoch")
+            if not same_owner:
+                raise DeepSeekIdentityError(
+                    "HARNESS_BINDING_REUSE_REFUSED",
+                    "DSH root session belongs to another exact identity",
+                )
+            if not isinstance(previous_epoch, int) or lifecycle_epoch < previous_epoch:
+                raise DeepSeekIdentityError(
+                    "HARNESS_LIFECYCLE_STALE",
+                    "DeepSeek lifecycle epoch is stale",
+                )
+            if lifecycle_epoch > previous_epoch:
+                if record.get("state") == "active":
+                    closing = registry.begin_close(
+                        expected_snapshot_generation=snapshot["snapshot_generation"],
+                        root_session_id=root_session_id,
+                        expected_record_generation=record["record_generation"],
+                    )
+                    registry.retire_binding(
+                        expected_snapshot_generation=closing.snapshot_generation,
+                        root_session_id=root_session_id,
+                        expected_record_generation=closing.record_generation,
+                        quiesced=True,
+                    )
+                elif record.get("state") == "closing":
+                    registry.retire_binding(
+                        expected_snapshot_generation=snapshot["snapshot_generation"],
+                        root_session_id=root_session_id,
+                        expected_record_generation=record["record_generation"],
+                        quiesced=True,
+                    )
+                elif record.get("state") == "terminal":
+                    pass
+                else:
+                    raise DeepSeekIdentityError(
+                        "HARNESS_BINDING_REOPEN_REFUSED",
+                        "DeepSeek binding cannot advance from its durable state",
+                    )
+                reopened_snapshot = registry.read_snapshot()
+                terminal_record = reopened_snapshot["records"][root_session_id]
+                registry.reopen_binding(
+                    expected_snapshot_generation=reopened_snapshot[
+                        "snapshot_generation"
+                    ],
+                    root_session_id=root_session_id,
+                    expected_record_generation=terminal_record["record_generation"],
+                    conversation_id=conversation_id,
+                    lifecycle_epoch=lifecycle_epoch,
+                    shell_id=shell_id,
+                    shell_shortname=shell_shortname,
+                    shell_worktree=selected,
+                    api_base=api_base,
+                    token=token,
+                    plugin_contract_generation=contract_generation,
+                )
+            elif record.get("state") != "active":
+                raise DeepSeekIdentityError(
+                    "HARNESS_BINDING_NOT_LIVE",
+                    "DeepSeek root is not active in this lifecycle epoch",
+                )
+            elif not registry.binding_current(
+                root_session_id=root_session_id,
+                conversation_id=conversation_id,
+                lifecycle_epoch=lifecycle_epoch,
+                shell_id=shell_id,
+                shell_shortname=shell_shortname,
+                shell_worktree=selected,
+                api_base=api_base,
+                token=token,
+                plugin_contract_generation=contract_generation,
+            ):
+                registry.rotate_binding(
+                    expected_snapshot_generation=snapshot["snapshot_generation"],
+                    root_session_id=root_session_id,
+                    expected_record_generation=record["record_generation"],
+                    token=token,
+                    plugin_contract_generation=contract_generation,
+                    recovery=(
+                        record.get("plugin_contract_generation")
+                        != contract_generation
+                    ),
+                )
+        current = registry.resolve_record(root_session_id)
+        if not registry.binding_current(
+            root_session_id=root_session_id,
+            conversation_id=conversation_id,
+            lifecycle_epoch=lifecycle_epoch,
+            shell_id=shell_id,
+            shell_shortname=shell_shortname,
+            shell_worktree=selected,
+            api_base=api_base,
+            token=token,
+            plugin_contract_generation=contract_generation,
+        ):
+            raise DeepSeekIdentityError(
+                "HARNESS_BINDING_MISMATCH",
+                "DeepSeek binding changed before admission",
+            )
+        return {
+            "root_session_id": root_session_id,
+            "conversation_id": conversation_id,
+            "lifecycle_epoch": lifecycle_epoch,
+            "record_generation": current["record_generation"],
+            "plugin_contract_generation": contract_generation,
+        }
+    except DeepSeekIdentityError as exc:
+        raw_artifact = (
+            candidate_preflight.get("proof_artifact")
+            if isinstance(candidate_preflight, Mapping)
+            else None
+        )
+        if (
+            candidate_preflight is not None
+            and isinstance(raw_artifact, str)
+            and exc.code in CANDIDATE_FENCE_CODES
+        ):
+            _fence_failed_candidate(
+                env=env, artifact=Path(raw_artifact), failure_code=exc.code
+            )
+        raise DeepSeekWebError(exc.code, exc.detail) from exc
+
+
+def preflight_candidate_execution(
+    *,
+    env: Mapping[str, str],
+    root_session_id: str,
+    conversation_id: str,
+    lifecycle_epoch: int,
+    worktree: Path,
+) -> dict[str, Any] | None:
+    """Validate proof authority completely before any binding mutation."""
+    artifact = _candidate_artifact(
+        env=env,
+        root_session_id=root_session_id,
+        conversation_id=conversation_id,
+        lifecycle_epoch=lifecycle_epoch,
+    )
+    if artifact is None:
+        return None
+    if not artifact.is_absolute() or len(artifact.parents) < 2:
+        raise DeepSeekWebError(
+            "HARNESS_PROOF_CAPABILITY_UNSAFE",
+            "proof capability path must be absolute",
+        )
+    shell_id, shell_shortname, api_base, token, selected = _binding_inputs(
+        env, worktree
+    )
+    registry = _identity_registry(env)
+    authority = _candidate_authority(registry)
+    try:
+        contract = authority.describe(artifact=artifact)
+        health = registry.read_live_health()
+        snapshot = registry.read_snapshot()
+        record = snapshot["records"].get(root_session_id)
+        if record is not None and not isinstance(record, Mapping):
+            raise DeepSeekIdentityError(
+                "HARNESS_REGISTRY_INVALID", "binding record is malformed"
+            )
+        record_generation = (
+            record.get("record_generation")
+            if isinstance(record, Mapping)
+            else None
+        )
+        lineage = sorted(
+            session_id
+            for session_id, item in snapshot["lineage"].items()
+            if isinstance(item, Mapping)
+            and item.get("root_session_id") == root_session_id
+            and item.get("lifecycle_epoch") == lifecycle_epoch
+            and (
+                record_generation is None
+                or item.get("record_generation") == record_generation
+            )
+        )
+        admitted = authority.admit(
+            artifact=artifact,
+            mode=contract["mode"],
+            exact_ref=_exact_engine_ref(),
+            pinned_dsh_version=_current_dsh_version(),
+            root_session_id=root_session_id,
+            conversation_id=conversation_id,
+            lifecycle_epoch=lifecycle_epoch,
+            verified_lineage=lineage,
+            plugin_contract_generation=health["plugin_contract_generation"],
+        )
+        if record is not None and (
+            record.get("state") != "active"
+            or not registry.binding_current(
+                root_session_id=root_session_id,
+                conversation_id=conversation_id,
+                lifecycle_epoch=lifecycle_epoch,
+                shell_id=shell_id,
+                shell_shortname=shell_shortname,
+                shell_worktree=selected,
+                api_base=api_base,
+                token=token,
+                plugin_contract_generation=health[
+                    "plugin_contract_generation"
+                ],
+            )
+        ):
+            raise DeepSeekIdentityError(
+                "HARNESS_PROOF_BINDING_MISMATCH",
+                "proof root has a partially recovered or stale binding",
+            )
+        return {
+            **admitted,
+            "proof_artifact": str(artifact),
+            "binding_snapshot_generation": snapshot[
+                "snapshot_generation"
+            ],
+            "binding_record_generation": record_generation,
+        }
+    except DeepSeekIdentityError as exc:
+        if exc.code in CANDIDATE_FENCE_CODES:
+            _fence_failed_candidate(
+                env=env, artifact=artifact, failure_code=exc.code
+            )
+        raise DeepSeekWebError(exc.code, exc.detail) from exc
+
+
+def retire_session_identity(
+    *, env: Mapping[str, str], root_session_id: str, quiesced: bool
+) -> dict[str, Any]:
+    """Close a disposable root, retiring it only after quiescence proof."""
+    registry = _identity_registry(env)
+    try:
+        snapshot = registry.read_snapshot()
+        record = snapshot["records"].get(root_session_id)
+        if not isinstance(record, dict):
+            raise DeepSeekIdentityError(
+                "HARNESS_BINDING_NOT_LIVE", "DeepSeek root binding is missing"
+            )
+        if record.get("state") == "active":
+            closing = registry.begin_close(
+                expected_snapshot_generation=snapshot["snapshot_generation"],
+                root_session_id=root_session_id,
+                expected_record_generation=record["record_generation"],
+            )
+            closing_snapshot_generation = closing.snapshot_generation
+            closing_record_generation = closing.record_generation
+        elif record.get("state") == "closing":
+            closing_snapshot_generation = snapshot["snapshot_generation"]
+            closing_record_generation = record["record_generation"]
+        elif record.get("state") == "terminal":
+            return {
+                "root_session_id": root_session_id,
+                "state": "terminal",
+                "lifecycle_epoch": record["lifecycle_epoch"],
+                "record_generation": record["record_generation"],
+            }
+        else:
+            raise DeepSeekIdentityError(
+                "HARNESS_BINDING_NOT_LIVE",
+                "DeepSeek root is not eligible for terminal retirement",
+            )
+        if not quiesced:
+            return {
+                "root_session_id": root_session_id,
+                "state": "closing",
+                "lifecycle_epoch": record["lifecycle_epoch"],
+                "record_generation": closing_record_generation,
+            }
+        receipt = registry.retire_binding(
+            expected_snapshot_generation=closing_snapshot_generation,
+            root_session_id=root_session_id,
+            expected_record_generation=closing_record_generation,
+            quiesced=True,
+        )
+        return {
+            "root_session_id": root_session_id,
+            "state": receipt.state,
+            "lifecycle_epoch": receipt.lifecycle_epoch,
+            "record_generation": receipt.record_generation,
+        }
+    except DeepSeekIdentityError as exc:
+        raise DeepSeekWebError(exc.code, exc.detail) from exc
+
+
+def admit_candidate_execution(
+    *,
+    env: Mapping[str, str],
+    root_session_id: str,
+    conversation_id: str,
+    lifecycle_epoch: int,
+) -> dict[str, Any] | None:
+    """Admit one server-minted proof root; ordinary callers return ``None``."""
+    artifact = _candidate_artifact(
+        env=env,
+        root_session_id=root_session_id,
+        conversation_id=conversation_id,
+        lifecycle_epoch=lifecycle_epoch,
+    )
+    if artifact is None:
+        return None
+    if not artifact.is_absolute() or len(artifact.parents) < 2:
+        raise DeepSeekWebError(
+            "HARNESS_PROOF_CAPABILITY_UNSAFE",
+            "proof capability path must be absolute",
+        )
+    registry = _identity_registry(env)
+    authority = _candidate_authority(registry)
+    try:
+        contract = authority.describe(artifact=artifact)
+        exact_ref = _exact_engine_ref()
+        pinned_version = _current_dsh_version()
+        health = registry.read_live_health()
+        record = registry.resolve_record(root_session_id)
+        snapshot = registry.read_snapshot()
+        lineage = sorted(
+            session_id
+            for session_id, item in snapshot["lineage"].items()
+            if isinstance(item, Mapping)
+            and item.get("root_session_id") == root_session_id
+            and item.get("lifecycle_epoch") == lifecycle_epoch
+            and item.get("record_generation") == record.get("record_generation")
+        )
+        return authority.admit(
+            artifact=artifact,
+            mode=contract["mode"],
+            exact_ref=exact_ref,
+            pinned_dsh_version=pinned_version,
+            root_session_id=root_session_id,
+            conversation_id=conversation_id,
+            lifecycle_epoch=lifecycle_epoch,
+            verified_lineage=lineage,
+            plugin_contract_generation=health["plugin_contract_generation"],
+        )
+    except DeepSeekIdentityError as exc:
+        if exc.code in CANDIDATE_FENCE_CODES:
+            _fence_failed_candidate(
+                env=env, artifact=artifact, failure_code=exc.code
+            )
+        raise DeepSeekWebError(exc.code, exc.detail) from exc
+
+
+def ratchet_candidate_after_host_restart(
+    *, env: Mapping[str, str], artifact: Path, ttl_seconds: int
+) -> dict[str, Any]:
+    """Advance proof authority only after every exact binding recovered."""
+    if not artifact.is_absolute() or len(artifact.parents) < 2:
+        raise DeepSeekWebError(
+            "HARNESS_PROOF_CAPABILITY_UNSAFE",
+            "proof capability path must be absolute",
+        )
+    registry = _identity_registry(env)
+    authority = _candidate_authority(registry)
+    try:
+        expected = authority.recovery_contract(artifact=artifact)
+        if (
+            expected["exact_ref"] != _exact_engine_ref()
+            or expected["pinned_dsh_version"]
+            != harness_versions.probe("deepseek")
+        ):
+            raise DeepSeekIdentityError(
+                "HARNESS_PROOF_CAPABILITY_MISMATCH",
+                "proof restart no longer runs the exact candidate runtime",
+            )
+        health = registry.read_live_health()
+        new_contract = health["plugin_contract_generation"]
+        snapshot = registry.read_snapshot()
+        actual_roots: dict[str, dict[str, Any]] = {}
+        for root_session_id, expected_root in expected["roots"].items():
+            record = snapshot["records"].get(root_session_id)
+            if (
+                not isinstance(record, Mapping)
+                or record.get("state") != "active"
+                or record.get("conversation_id")
+                != expected_root["conversation_id"]
+                or record.get("lifecycle_epoch")
+                != expected_root["lifecycle_epoch"]
+                or record.get("plugin_contract_generation") != new_contract
+            ):
+                raise DeepSeekIdentityError(
+                    "HARNESS_PROOF_RESTART_BINDING_MISMATCH",
+                    "proof restart did not recover every exact root binding",
+                )
+            lineage = sorted(
+                session_id
+                for session_id, item in snapshot["lineage"].items()
+                if isinstance(item, Mapping)
+                and item.get("root_session_id") == root_session_id
+                and item.get("lifecycle_epoch") == record["lifecycle_epoch"]
+                and item.get("record_generation") == record["record_generation"]
+            )
+            actual_roots[root_session_id] = {
+                "conversation_id": record["conversation_id"],
+                "lifecycle_epoch": record["lifecycle_epoch"],
+                "verified_lineage": lineage,
+            }
+        grant = authority.ratchet_after_host_restart(
+            artifact=artifact,
+            old_plugin_contract_generation=expected[
+                "plugin_contract_generation"
+            ],
+            new_plugin_contract_generation=new_contract,
+            roots=actual_roots,
+            ttl_seconds=ttl_seconds,
+        )
+        return {
+            "mode": grant.mode,
+            "generation": grant.generation,
+            "artifact": str(grant.artifact),
+            "proof_run_id": grant.proof_run_id,
+            "exact_ref": grant.exact_ref,
+            "plugin_contract_generation": grant.plugin_contract_generation,
+        }
+    except (DeepSeekIdentityError, DeepSeekWebError) as exc:
+        try:
+            _fence_failed_candidate(
+                env=env,
+                artifact=artifact,
+                failure_code=f"ratchet:{exc.code}",
+                require_live_root=False,
+            )
+        except (DeepSeekIdentityError, DeepSeekWebError) as fence_exc:
+            code = getattr(fence_exc, "code", "HARNESS_PROOF_RATCHET_FENCE_FAILED")
+            raise DeepSeekWebError(
+                "HARNESS_PROOF_RATCHET_FENCE_FAILED",
+                f"proof restart failed with {exc.code} and fencing failed with {code}",
+            ) from fence_exc
+        if isinstance(exc, DeepSeekWebError):
+            raise
+        raise DeepSeekWebError(exc.code, exc.detail) from exc
 
 
 def stop(*, env: Mapping[str, str] | None = None) -> dict[str, Any]:
@@ -1126,22 +2242,15 @@ def _existing_healthy(
     *,
     listen_host: str,
     allowed_peers: tuple[str, ...],
-    credential_shell: str | None,
-    credential_shell_id: int | None,
     identity_registry: DeepSeekIdentityRegistry,
 ) -> bool:
-    if state.get("schema_version") != 4:
+    if state.get("schema_version") != 5:
         return False
     if state.get("service_port") != service_port:
         return False
     if not _verified_process(state.get("web_pid"), state.get("web_start_ticks"), "web"):
         return False
     if not _http_ready(service_port):
-        return False
-    if (
-        state.get("credential_shell") != credential_shell
-        or state.get("credential_shell_id") != credential_shell_id
-    ):
         return False
     if (
         state.get("fork_id") != identity_registry.layout.fork_id
@@ -1215,16 +2324,12 @@ def ensure(
         state = _read_state()
         identity_registry = _identity_registry(env)
         listen_host, allowed_peers = _relay_configuration(sandbox=sandbox)
-        credential_shell = env.get("SC_SHELL_SHORTNAME") or None
-        credential_shell_id = int(env["SC_SHELL_ID"])
         reused = _existing_healthy(
             state,
             service_port,
             relay_port,
             listen_host=listen_host,
             allowed_peers=allowed_peers,
-            credential_shell=credential_shell,
-            credential_shell_id=credential_shell_id,
             identity_registry=identity_registry,
         )
         generation = None
@@ -1236,15 +2341,16 @@ def ensure(
                     "HARNESS_UNAVAILABLE",
                     "official dsh is not installed; run ./sc ensure-harness",
                 )
-            credential = _write_shell_credential(env)
             web_env = dict(env)
             identity_env = identity_registry.host_environment()
+            for name in tuple(web_env):
+                if name in {
+                    "SC_API_TOKEN", "SC_API_BASE", "SC_MEM_CREDENTIAL_FILE",
+                    "SC_SHELL_ID", "SC_SHELL_SHORTNAME", "SC_SHELL_WORKTREE",
+                    "DSH_SHELL",
+                } or name.startswith(("DSH_SC_", "SC_DSH_")):
+                    web_env.pop(name, None)
             web_env.update(identity_env)
-            if credential is not None:
-                credential_file, credential_shell, credential_shell_id = credential
-                web_env.pop("SC_API_TOKEN", None)
-                web_env.pop("SC_API_BASE", None)
-                web_env["SC_MEM_CREDENTIAL_FILE"] = str(credential_file)
             web_pid, web_ticks = _spawn(
                 [
                     executable,
@@ -1261,7 +2367,7 @@ def ensure(
                 env=web_env,
             )
             state = {
-                "schema_version": 4,
+                "schema_version": 5,
                 "web_pid": web_pid,
                 "web_start_ticks": web_ticks,
                 "service_port": service_port,
@@ -1270,8 +2376,7 @@ def ensure(
                 "relay_listen_host": listen_host,
                 "relay_allowed_peers": list(allowed_peers),
                 "url": f"http://127.0.0.1:{public_port}",
-                "credential_shell": credential_shell,
-                "credential_shell_id": credential_shell_id,
+                "host_identity": "neutral",
                 "fork_id": identity_registry.layout.fork_id,
                 "profile_id": identity_registry.layout.profile_id,
                 "registry_path": str(identity_registry.layout.registry.resolve()),
@@ -1313,8 +2418,13 @@ def ensure(
             # API token through the relay's process environment even though the
             # stock Host correctly receives only the owner-only artifact.
             relay_env = dict(os.environ)
-            relay_env.pop("SC_API_TOKEN", None)
-            relay_env.pop("SC_API_BASE", None)
+            for name in tuple(relay_env):
+                if name in {
+                    "SC_API_TOKEN", "SC_API_BASE", "SC_MEM_CREDENTIAL_FILE",
+                    "SC_SHELL_ID", "SC_SHELL_SHORTNAME", "SC_SHELL_WORKTREE",
+                    "DSH_SHELL",
+                } or name.startswith(("DSH_SC_", "SC_DSH_PROOF_")):
+                    relay_env.pop(name, None)
             relay_pid, relay_ticks = _spawn(
                 [
                     sys.executable,
@@ -1349,10 +2459,6 @@ def ensure(
                     "HARNESS_SERVICE_UNAVAILABLE",
                     "DeepSeek loopback publication relay did not become ready",
                 )
-        elif credential_shell is not None:
-            # Repair a missing/stale artifact (for example after shell-key
-            # rotation) without restarting an otherwise healthy same-shell Host.
-            _write_shell_credential(env)
         generation = generation or _read_generation(_generation_path())
         url = f"http://127.0.0.1:{relay_port}/?sc_generation={generation}"
         if not register_workspace:
@@ -1401,7 +2507,7 @@ def status() -> dict[str, Any]:
     plugin_health = "unavailable"
     plugin_contract_generation = None
     plugin_current = False
-    if state.get("schema_version") == 4:
+    if state.get("schema_version") == 5:
         try:
             identity = _identity_registry(os.environ)
             health = identity.read_live_health(
