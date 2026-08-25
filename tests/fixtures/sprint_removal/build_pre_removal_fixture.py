@@ -31,6 +31,7 @@ ALLOWED_REFERENCE_FILES = (
     ".super-coder/adapters/claude/adapter.json",
     ".super-coder/adapters/codex/adapter.json",
     ".super-coder/adapters/deepseek/adapter.json",
+    ".super-coder/assets/deepseek/dsh-shell-authority-contract.json",
     ".super-coder/adapters/kimi/adapter.json",
     ".super-coder/adapters/opencode/adapter.json",
     ".super-coder/adapters/vibe/adapter.json",
