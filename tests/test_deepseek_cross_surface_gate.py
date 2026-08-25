@@ -871,11 +871,37 @@ def test_stock_two_shell_cross_surface_refusals_are_side_effect_free(
                 deepseek_one_shot.run("missing-route", "default", "must not prompt")
         finally:
             active.close()
-        _host_rpc(upstream_port, "workspace.archiveSession", {"sessionId": managed_id})
+        # Stock DSH does not retain an archive marker for an empty session and
+        # may retire an imported session during later Host handoffs.  Create a
+        # current prompted managed session so the archive check exercises the
+        # durable production boundary rather than an ephemeral probe.
+        archive_context = _managed_context(
+            bob_worktree,
+            bob,
+            conversation_id="cross-surface-archive-probe",
+        )
+        archive_source = DeepSeekAdapter()
+        try:
+            archive_turn = archive_source.start(
+                archive_context,
+                "managed archive probe",
+            )
+            archive_events = list(archive_source.stream(archive_turn))
+        finally:
+            archive_source.close()
+        assert archive_events[-1].type == "run.completed"
+        _host_rpc(
+            upstream_port,
+            "workspace.archiveSession",
+            {"sessionId": archive_turn.session_ref},
+        )
         archived = DeepSeekAdapter()
         try:
             with pytest.raises(AdapterError, match="SESSION_ARCHIVED"):
-                archived.inspect(managed_id, ConversationContext(worktree=bob_worktree, env=bob))
+                archived.inspect(
+                    archive_turn.session_ref,
+                    archive_context,
+                )
         finally:
             archived.close()
         missing = DeepSeekAdapter()
