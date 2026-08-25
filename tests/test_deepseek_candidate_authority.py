@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
 import tempfile
 from datetime import datetime, timedelta, timezone
@@ -15,7 +16,13 @@ sys.path.insert(0, str(SCRIPTS))
 
 import deepseek_web
 from deepseek_candidate_authority import DeepSeekCandidateAuthority
-from deepseek_identity_registry import DeepSeekIdentityError
+from deepseek_identity_registry import (
+    HEALTH_CONTRACT,
+    DeepSeekIdentityError,
+    DeepSeekIdentityRegistry,
+    plugin_contract_generation,
+    process_start_ticks,
+)
 
 
 class Clock:
@@ -38,6 +45,76 @@ ROOTS = {
         "verified_lineage": [],
     },
 }
+
+SURFACE_ROOT = "sc-" + "a" * 32
+SURFACE_CONVERSATION = "candidate-surface-conversation"
+
+
+def owner_json(path: Path, value: object) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(value, sort_keys=True) + "\n")
+    path.chmod(0o600)
+
+
+def runtime_registry(parent: Path) -> tuple[DeepSeekIdentityRegistry, Path, str]:
+    repo = parent / "repo"
+    worktree = repo / ".sc-worktrees" / "dev"
+    worktree.mkdir(parents=True)
+    registry = DeepSeekIdentityRegistry(
+        repo_root=repo,
+        runtime_root=parent / "identity",
+    )
+    registry.materialize_profile()
+    inputs = {
+        "canonical_fork_id": registry.layout.fork_id,
+        "dedicated_profile_id": registry.layout.profile_id,
+        "plugin_bundle_digest": registry.plugin_digest,
+        "declared_variable_schema_digest": registry.schema_digest,
+        "canonical_registry_path_identity": registry.registry_path_identity,
+        "host_boot_generation": "candidate-host",
+        "plugin_load_hmr_generation": "candidate-plugin",
+    }
+    generation = plugin_contract_generation(inputs)
+    registry.observe_host(
+        host_boot_generation="candidate-host",
+        host_pid=os.getpid(),
+    )
+    owner_json(
+        registry.layout.health,
+        {
+            "contract": HEALTH_CONTRACT,
+            "loaded": True,
+            "fork_id": registry.layout.fork_id,
+            "profile_id": registry.layout.profile_id,
+            "registry_path": str(registry.layout.registry.resolve()),
+            "host_boot_generation": "candidate-host",
+            "host_pid": os.getpid(),
+            "host_start_ticks": process_start_ticks(os.getpid()),
+            "plugin_load_hmr_generation": "candidate-plugin",
+            "plugin_contract_generation": generation,
+            "registry_snapshot_generation": None,
+            "binding_record_generation": None,
+        },
+    )
+    return registry, worktree, generation
+
+
+def durable_identity_state(
+    registry: DeepSeekIdentityRegistry,
+    authority: DeepSeekCandidateAuthority,
+) -> tuple[bytes, dict[str, bytes], bytes, dict[str, bytes]]:
+    return (
+        registry.layout.registry.read_bytes(),
+        {
+            path.name: path.read_bytes()
+            for path in sorted(registry.layout.credentials.glob("*.json"))
+        },
+        authority.state_path.read_bytes(),
+        {
+            path.name: path.read_bytes()
+            for path in sorted(authority.artifacts.glob("*.json"))
+        },
+    )
 
 
 def mint(authority: DeepSeekCandidateAuthority):
@@ -266,6 +343,246 @@ def test_runtime_admission_uses_exact_ref_live_contract_and_current_lineage(
                 lifecycle_epoch=3,
             )
         assert wrong_ref.value.code == "HARNESS_PROOF_CAPABILITY_MISMATCH"
+
+
+@pytest.mark.parametrize(
+    ("failure", "expected_code"),
+    [
+        ("stale", "HARNESS_PROOF_CAPABILITY_STALE"),
+        ("expired", "HARNESS_PROOF_CAPABILITY_EXPIRED"),
+        ("wrong-ref", "HARNESS_PROOF_CAPABILITY_MISMATCH"),
+        ("wrong-generation", "HARNESS_PROOF_CAPABILITY_STALE"),
+        ("wrong-root", "HARNESS_PROOF_ROOT_REFUSED"),
+        ("partially-recovered", "HARNESS_PROOF_BINDING_MISMATCH"),
+    ],
+)
+def test_candidate_preflight_failures_leave_all_binding_state_unchanged(
+    failure: str,
+    expected_code: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with tempfile.TemporaryDirectory() as raw:
+        registry, worktree, contract_generation = runtime_registry(Path(raw))
+        clock = Clock()
+        authority = DeepSeekCandidateAuthority(
+            registry.layout.root / "proof-authority",
+            clock=clock,
+        )
+        grant = authority.mint(
+            mode="candidate",
+            exact_ref="a" * 40,
+            pinned_dsh_version="0.1.1-rc.2",
+            disposable_baseline="arch-clean-2026-08-25",
+            proof_run_id="proof-run-surface",
+            roots={
+                SURFACE_ROOT: {
+                    "conversation_id": SURFACE_CONVERSATION,
+                    "lifecycle_epoch": 1,
+                    "verified_lineage": [],
+                }
+            },
+            plugin_contract_generation=contract_generation,
+            ttl_seconds=600,
+            live_registry_roots=[],
+        )
+        artifact = grant.artifact
+        root_session_id = SURFACE_ROOT
+        exact_ref = "a" * 40
+        if failure == "stale":
+            authority.revoke(artifact=artifact)
+        elif failure == "expired":
+            clock.value += timedelta(seconds=601)
+        elif failure == "wrong-ref":
+            exact_ref = "b" * 40
+        elif failure == "wrong-generation":
+            presented = json.loads(artifact.read_text())
+            presented["generation"] = 99
+            owner_json(artifact, presented)
+        elif failure == "wrong-root":
+            root_session_id = "sc-" + "f" * 32
+        elif failure == "partially-recovered":
+            registry.create_binding(
+                expected_snapshot_generation=0,
+                root_session_id=SURFACE_ROOT,
+                conversation_id=SURFACE_CONVERSATION,
+                lifecycle_epoch=1,
+                shell_id=4,
+                shell_shortname="DEV4",
+                shell_worktree=worktree,
+                api_base="http://127.0.0.1:8837",
+                token="stale-recovery-token",
+                plugin_contract_generation=contract_generation,
+            )
+
+        monkeypatch.setattr(
+            deepseek_web, "_identity_registry", lambda _env: registry
+        )
+        monkeypatch.setattr(
+            deepseek_web, "_candidate_authority", lambda _registry: authority
+        )
+        monkeypatch.setattr(
+            deepseek_web, "_verify_shell_identity", lambda _env: None
+        )
+        monkeypatch.setattr(deepseek_web, "_exact_engine_ref", lambda: exact_ref)
+        monkeypatch.setattr(
+            deepseek_web,
+            "_current_dsh_version",
+            lambda: "0.1.1-rc.2",
+        )
+        env = {
+            "SC_API_TOKEN": "candidate-token",
+            "SC_API_BASE": "http://127.0.0.1:8837",
+            "SC_SHELL_ID": "4",
+            "SC_SHELL_SHORTNAME": "DEV4",
+            "SC_DSH_PROOF_CAPABILITY_FILE": str(artifact),
+        }
+        before = durable_identity_state(registry, authority)
+        with pytest.raises(deepseek_web.DeepSeekWebError) as refused:
+            deepseek_web.preflight_candidate_execution(
+                env=env,
+                root_session_id=root_session_id,
+                conversation_id=SURFACE_CONVERSATION,
+                lifecycle_epoch=1,
+                worktree=worktree,
+            )
+        assert refused.value.code == expected_code
+        assert durable_identity_state(registry, authority) == before
+
+
+def test_candidate_preflight_receipt_allows_exact_create_and_refuses_drift(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with tempfile.TemporaryDirectory() as raw:
+        registry, worktree, contract_generation = runtime_registry(Path(raw))
+        authority = DeepSeekCandidateAuthority(
+            registry.layout.root / "proof-authority"
+        )
+        grant = authority.mint(
+            mode="candidate",
+            exact_ref="a" * 40,
+            pinned_dsh_version="0.1.1-rc.2",
+            disposable_baseline="arch-clean-2026-08-25",
+            proof_run_id="proof-run-receipt",
+            roots={
+                SURFACE_ROOT: {
+                    "conversation_id": SURFACE_CONVERSATION,
+                    "lifecycle_epoch": 1,
+                    "verified_lineage": [],
+                }
+            },
+            plugin_contract_generation=contract_generation,
+            ttl_seconds=600,
+            live_registry_roots=[],
+        )
+        monkeypatch.setattr(
+            deepseek_web, "_identity_registry", lambda _env: registry
+        )
+        monkeypatch.setattr(
+            deepseek_web, "_candidate_authority", lambda _registry: authority
+        )
+        monkeypatch.setattr(
+            deepseek_web, "_verify_shell_identity", lambda _env: None
+        )
+        monkeypatch.setattr(deepseek_web, "_exact_engine_ref", lambda: "a" * 40)
+        monkeypatch.setattr(
+            deepseek_web,
+            "_current_dsh_version",
+            lambda: "0.1.1-rc.2",
+        )
+        env = {
+            "SC_API_TOKEN": "candidate-token",
+            "SC_API_BASE": "http://127.0.0.1:8837",
+            "SC_SHELL_ID": "4",
+            "SC_SHELL_SHORTNAME": "DEV4",
+            "SC_DSH_PROOF_CAPABILITY_FILE": str(grant.artifact),
+        }
+        preflight = deepseek_web.preflight_candidate_execution(
+            env=env,
+            root_session_id=SURFACE_ROOT,
+            conversation_id=SURFACE_CONVERSATION,
+            lifecycle_epoch=1,
+            worktree=worktree,
+        )
+        assert preflight is not None
+        assert preflight["binding_snapshot_generation"] == 0
+        assert preflight["binding_record_generation"] is None
+        bound = deepseek_web.bind_session_identity(
+            env=env,
+            root_session_id=SURFACE_ROOT,
+            conversation_id=SURFACE_CONVERSATION,
+            lifecycle_epoch=1,
+            worktree=worktree,
+            candidate_preflight=preflight,
+        )
+        assert bound["record_generation"] == 1
+        assert registry.read_snapshot()["snapshot_generation"] == 1
+
+    with tempfile.TemporaryDirectory() as raw:
+        registry, worktree, contract_generation = runtime_registry(Path(raw))
+        authority = DeepSeekCandidateAuthority(
+            registry.layout.root / "proof-authority"
+        )
+        grant = authority.mint(
+            mode="candidate",
+            exact_ref="a" * 40,
+            pinned_dsh_version="0.1.1-rc.2",
+            disposable_baseline="arch-clean-2026-08-25",
+            proof_run_id="proof-run-drift",
+            roots={
+                SURFACE_ROOT: {
+                    "conversation_id": SURFACE_CONVERSATION,
+                    "lifecycle_epoch": 1,
+                    "verified_lineage": [],
+                }
+            },
+            plugin_contract_generation=contract_generation,
+            ttl_seconds=600,
+            live_registry_roots=[],
+        )
+        monkeypatch.setattr(
+            deepseek_web, "_identity_registry", lambda _env: registry
+        )
+        monkeypatch.setattr(
+            deepseek_web, "_candidate_authority", lambda _registry: authority
+        )
+        env = {
+            "SC_API_TOKEN": "candidate-token",
+            "SC_API_BASE": "http://127.0.0.1:8837",
+            "SC_SHELL_ID": "4",
+            "SC_SHELL_SHORTNAME": "DEV4",
+            "SC_DSH_PROOF_CAPABILITY_FILE": str(grant.artifact),
+        }
+        preflight = deepseek_web.preflight_candidate_execution(
+            env=env,
+            root_session_id=SURFACE_ROOT,
+            conversation_id=SURFACE_CONVERSATION,
+            lifecycle_epoch=1,
+            worktree=worktree,
+        )
+        registry.create_binding(
+            expected_snapshot_generation=0,
+            root_session_id="unrelated-root",
+            conversation_id="unrelated-conversation",
+            lifecycle_epoch=1,
+            shell_id=8,
+            shell_shortname="OTHER",
+            shell_worktree=worktree,
+            api_base="http://127.0.0.1:8837",
+            token="unrelated-token",
+            plugin_contract_generation=contract_generation,
+        )
+        before = durable_identity_state(registry, authority)
+        with pytest.raises(deepseek_web.DeepSeekWebError) as stale:
+            deepseek_web.bind_session_identity(
+                env=env,
+                root_session_id=SURFACE_ROOT,
+                conversation_id=SURFACE_CONVERSATION,
+                lifecycle_epoch=1,
+                worktree=worktree,
+                candidate_preflight=preflight,
+            )
+        assert stale.value.code == "HARNESS_PROOF_CAPABILITY_STALE"
+        assert durable_identity_state(registry, authority) == before
 
 
 def test_ordinary_runtime_never_reads_candidate_authority(

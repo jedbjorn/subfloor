@@ -176,19 +176,22 @@ class DeepSeekAdapter(ConversationAdapter):
         self, context: ConversationContext, root_session_id: str
     ) -> None:
         env = context.env
-        deepseek_web.bind_session_identity(
+        proof_authority = deepseek_web.preflight_candidate_execution(
             env=env,
             root_session_id=root_session_id,
             conversation_id=self._conversation_id(context),
             lifecycle_epoch=context.lifecycle_epoch,
             worktree=context.checked_worktree(),
         )
-        self._proof_authority = deepseek_web.admit_candidate_execution(
+        deepseek_web.bind_session_identity(
             env=env,
             root_session_id=root_session_id,
             conversation_id=self._conversation_id(context),
             lifecycle_epoch=context.lifecycle_epoch,
+            worktree=context.checked_worktree(),
+            candidate_preflight=proof_authority,
         )
+        self._proof_authority = proof_authority
         if self._proof_authority is not None and self._shell_lease is not None:
             self._shell_lease.close()
             self._shell_lease = None

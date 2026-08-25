@@ -222,18 +222,20 @@ def run(selector: str, effort: str, prompt: str) -> int:
     try:
         lease = deepseek_web.acquire_shell_identity(env=env)
         deepseek_web.ensure(worktree, env=env, identity_lease=lease)
-        deepseek_web.bind_session_identity(
+        proof_authority = deepseek_web.preflight_candidate_execution(
             env=env,
             root_session_id=session_ref,
             conversation_id=f"one-shot:{session_ref}",
             lifecycle_epoch=1,
             worktree=worktree,
         )
-        proof_authority = deepseek_web.admit_candidate_execution(
+        deepseek_web.bind_session_identity(
             env=env,
             root_session_id=session_ref,
             conversation_id=f"one-shot:{session_ref}",
             lifecycle_epoch=1,
+            worktree=worktree,
+            candidate_preflight=proof_authority,
         )
         if proof_authority is not None:
             lease.close()

@@ -95,6 +95,9 @@ def canonical_identity(monkeypatch: pytest.MonkeyPatch) -> None:
         deepseek_web, "retire_session_identity", lambda **_kwargs: {}
     )
     monkeypatch.setattr(
+        deepseek_web, "preflight_candidate_execution", lambda **_kwargs: None
+    )
+    monkeypatch.setattr(
         deepseek_web, "admit_candidate_execution", lambda **_kwargs: None
     )
     monkeypatch.setattr(deepseek_web, "reserve_managed_session", lambda _session: None)
@@ -600,15 +603,20 @@ def test_candidate_managed_turn_releases_containment_only_after_exact_binding(
     )
     monkeypatch.setattr(
         deepseek_web,
-        "bind_session_identity",
-        lambda **_kwargs: events.append("binding-proven") or {},
+        "preflight_candidate_execution",
+        lambda **_kwargs: events.append("candidate-preflight") or {
+            "mode": "candidate",
+            "generation": 1,
+            "root_session_id": "sc-" + "9" * 32,
+            "plugin_contract_generation": "contract-one",
+            "binding_snapshot_generation": 0,
+            "binding_record_generation": None,
+        },
     )
     monkeypatch.setattr(
         deepseek_web,
-        "admit_candidate_execution",
-        lambda **_kwargs: events.append("candidate-admitted") or {
-            "mode": "candidate", "generation": 1,
-        },
+        "bind_session_identity",
+        lambda **_kwargs: events.append("binding-proven") or {},
     )
     fake = FakeHost()
     adapter = DeepSeekAdapter(client_factory=lambda: fake)
@@ -620,13 +628,70 @@ def test_candidate_managed_turn_releases_containment_only_after_exact_binding(
     assert events == [
         "lease-acquired",
         "host-proven",
+        "candidate-preflight",
         "binding-proven",
-        "candidate-admitted",
         "lease-closed",
     ]
     assert lease.closed is True
     assert adapter._shell_lease is None
-    assert adapter._proof_authority == {"mode": "candidate", "generation": 1}
+    assert adapter._proof_authority == {
+        "mode": "candidate",
+        "generation": 1,
+        "root_session_id": "sc-" + "9" * 32,
+        "plugin_contract_generation": "contract-one",
+        "binding_snapshot_generation": 0,
+        "binding_record_generation": None,
+    }
+
+
+@pytest.mark.parametrize("surface", ["browser", "sprint"])
+@pytest.mark.parametrize(
+    ("failure", "code"),
+    [
+        ("stale", "HARNESS_PROOF_CAPABILITY_STALE"),
+        ("expired", "HARNESS_PROOF_CAPABILITY_EXPIRED"),
+        ("wrong-ref", "HARNESS_PROOF_CAPABILITY_MISMATCH"),
+        ("wrong-generation", "HARNESS_PROOF_CAPABILITY_STALE"),
+        ("wrong-root", "HARNESS_PROOF_ROOT_REFUSED"),
+        ("partially-recovered", "HARNESS_PROOF_BINDING_MISMATCH"),
+    ],
+)
+def test_candidate_browser_and_sprint_preflight_refusal_never_binds(
+    surface: str,
+    failure: str,
+    code: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    persistent = {
+        "snapshot": b"registry-before",
+        "generation": 7,
+        "credentials": (b"credential-before",),
+        "lineage": ("child-before",),
+    }
+    before = copy.deepcopy(persistent)
+
+    def refuse(**_kwargs):
+        raise deepseek_web.DeepSeekWebError(
+            code, f"{surface} {failure} proof refused"
+        )
+
+    def mutate_binding(**_kwargs):
+        persistent["generation"] = 8
+        persistent["credentials"] += (b"credential-after",)
+        pytest.fail("candidate refusal reached binding mutation")
+
+    monkeypatch.setattr(deepseek_web, "preflight_candidate_execution", refuse)
+    monkeypatch.setattr(deepseek_web, "bind_session_identity", mutate_binding)
+    fake = FakeHost()
+    adapter = DeepSeekAdapter(client_factory=lambda: fake)
+    with pytest.raises(AdapterError) as refused:
+        adapter._managed_client(
+            context(tmp_path, fake),
+            "sc-" + ("b" if surface == "browser" else "c") * 32,
+        )
+    assert refused.value.code == code
+    assert persistent == before
 
 
 def test_candidate_one_shot_requires_enumerated_root_before_any_effect(
@@ -648,11 +713,76 @@ def test_candidate_one_shot_requires_enumerated_root_before_any_effect(
         "SC_SHELL_WORKTREE": str(tmp_path),
         "SC_DSH_PROOF_CAPABILITY_FILE": str(tmp_path / "capability.json"),
     }
-    with mock.patch.dict(deepseek_one_shot.os.environ, env, clear=True):
-        with pytest.raises(deepseek_host.DeepSeekHostError) as refused:
-            deepseek_one_shot.run("acme-dynamic/model-7", "high", "prompt")
+    with (
+        mock.patch.dict(deepseek_one_shot.os.environ, env, clear=True),
+        pytest.raises(deepseek_host.DeepSeekHostError) as refused,
+    ):
+        deepseek_one_shot.run("acme-dynamic/model-7", "high", "prompt")
     assert refused.value.code == "HARNESS_PROOF_ROOT_REFUSED"
     assert effects == []
+
+
+@pytest.mark.parametrize(
+    ("failure", "code"),
+    [
+        ("stale", "HARNESS_PROOF_CAPABILITY_STALE"),
+        ("expired", "HARNESS_PROOF_CAPABILITY_EXPIRED"),
+        ("wrong-ref", "HARNESS_PROOF_CAPABILITY_MISMATCH"),
+        ("wrong-generation", "HARNESS_PROOF_CAPABILITY_STALE"),
+        ("wrong-root", "HARNESS_PROOF_ROOT_REFUSED"),
+        ("partially-recovered", "HARNESS_PROOF_BINDING_MISMATCH"),
+    ],
+)
+def test_candidate_one_shot_preflight_refusal_never_binds(
+    failure: str,
+    code: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    persistent = {
+        "snapshot": b"registry-before",
+        "generation": 11,
+        "credentials": (b"credential-before",),
+        "lineage": ("child-before",),
+    }
+    before = copy.deepcopy(persistent)
+
+    class Lease:
+        def close(self) -> None:
+            return None
+
+    def refuse(**_kwargs):
+        raise deepseek_web.DeepSeekWebError(
+            code, f"one-shot {failure} proof refused"
+        )
+
+    def mutate_binding(**_kwargs):
+        persistent["generation"] = 12
+        persistent["credentials"] += (b"credential-after",)
+        pytest.fail("candidate refusal reached binding mutation")
+
+    monkeypatch.setattr(
+        deepseek_web, "acquire_shell_identity", lambda **_kwargs: Lease()
+    )
+    monkeypatch.setattr(deepseek_web, "ensure", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(deepseek_web, "preflight_candidate_execution", refuse)
+    monkeypatch.setattr(deepseek_web, "bind_session_identity", mutate_binding)
+    env = {
+        "SC_API_TOKEN": "test-shell-token",
+        "SC_API_BASE": "http://127.0.0.1:8837",
+        "SC_SHELL_ID": "4",
+        "SC_SHELL_SHORTNAME": "DEV4",
+        "SC_SHELL_WORKTREE": str(tmp_path),
+        "SC_DSH_PROOF_CAPABILITY_FILE": str(tmp_path / "capability.json"),
+        "SC_DSH_PROOF_ROOT_SESSION_ID": "sc-" + "d" * 32,
+    }
+    with (
+        mock.patch.dict(deepseek_one_shot.os.environ, env, clear=True),
+        pytest.raises(deepseek_host.DeepSeekHostError) as refused,
+    ):
+        deepseek_one_shot.run("acme-dynamic/model-7", "high", "prompt")
+    assert refused.value.code == code
+    assert persistent == before
 
 
 def test_start_reserves_the_deterministic_session_before_host_publication(

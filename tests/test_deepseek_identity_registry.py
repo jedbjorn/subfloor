@@ -26,6 +26,7 @@ PLUGIN = ENGINE / "assets" / "deepseek" / "sc-shell-env-plugin.mjs"
 PLUGIN_PROBE = ROOT / "tests" / "fixtures" / "deepseek_dsh_identity_plugin_probe.mjs"
 sys.path.insert(0, str(SCRIPTS))
 
+import deepseek_web
 from deepseek_identity_registry import (
     ALIASES,
     HEALTH_CONTRACT,
@@ -35,7 +36,6 @@ from deepseek_identity_registry import (
     plugin_contract_generation,
     process_start_ticks,
 )
-import deepseek_web
 
 
 def owner_json(path: Path, value: object) -> None:
@@ -515,6 +515,35 @@ def test_bash_and_pwsh_tool_executions_use_the_fixed_domain_launcher() -> None:
             assert partial == {
                 "error": "sc-shell-identity: refusing partial ToolExecution identity"
             }
+
+
+def test_execution_domain_uses_linux_seal_uapi_when_python_omits_names() -> None:
+    program = f"""
+import fcntl
+import os
+import runpy
+for name in (
+    'F_ADD_SEALS', 'F_GET_SEALS', 'F_SEAL_SEAL', 'F_SEAL_SHRINK',
+    'F_SEAL_GROW', 'F_SEAL_WRITE',
+):
+    if hasattr(fcntl, name):
+        delattr(fcntl, name)
+module = runpy.run_path({str(SCRIPTS / 'deepseek_execution_domain.py')!r})
+descriptor = os.memfd_create('seal-fallback', os.MFD_ALLOW_SEALING)
+module['_seal_descriptor'](descriptor, {{'probe': 'python-without-seal-names'}})
+assert fcntl.fcntl(descriptor, module['F_GET_SEALS']) & module['REQUIRED_SEALS'] == 15
+"""
+    completed = subprocess.run(
+        [sys.executable, "-c", program],
+        cwd=ROOT,
+        text=True,
+        capture_output=True,
+        timeout=10,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stdout == ""
+    assert completed.stderr == ""
 
 
 def test_production_domain_issue_verify_marker_deletion_and_teardown() -> None:

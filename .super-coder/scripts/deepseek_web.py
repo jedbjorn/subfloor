@@ -1121,6 +1121,25 @@ def _current_dsh_version() -> str:
     return version
 
 
+def _binding_inputs(
+    env: Mapping[str, str], worktree: Path
+) -> tuple[int, str, str, str, Path]:
+    _verify_shell_identity(env)
+    try:
+        return (
+            int(env["SC_SHELL_ID"]),
+            env["SC_SHELL_SHORTNAME"],
+            env["SC_API_BASE"],
+            env["SC_API_TOKEN"],
+            worktree.resolve(strict=True),
+        )
+    except (KeyError, ValueError, OSError) as exc:
+        raise DeepSeekWebError(
+            "HARNESS_SHELL_IDENTITY_UNAVAILABLE",
+            "DeepSeek session binding lacks canonical shell identity",
+        ) from exc
+
+
 def mint_candidate_capability(
     *,
     env: Mapping[str, str],
@@ -1165,31 +1184,65 @@ def bind_session_identity(
     conversation_id: str,
     lifecycle_epoch: int,
     worktree: Path,
+    candidate_preflight: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Bind one exact managed/one-shot root before model-facing admission."""
-    _verify_shell_identity(env)
     if lifecycle_epoch <= 0:
         raise DeepSeekWebError(
             "HARNESS_LIFECYCLE_INVALID",
             "DeepSeek lifecycle epoch must be positive",
         )
-    try:
-        shell_id = int(env["SC_SHELL_ID"])
-        shell_shortname = env["SC_SHELL_SHORTNAME"]
-        api_base = env["SC_API_BASE"]
-        token = env["SC_API_TOKEN"]
-        selected = worktree.resolve(strict=True)
-    except (KeyError, ValueError, OSError) as exc:
-        raise DeepSeekWebError(
-            "HARNESS_SHELL_IDENTITY_UNAVAILABLE",
-            "DeepSeek session binding lacks canonical shell identity",
-        ) from exc
+    shell_id, shell_shortname, api_base, token, selected = _binding_inputs(
+        env, worktree
+    )
     registry = _identity_registry(env)
     try:
         health = registry.read_live_health()
         contract_generation = health["plugin_contract_generation"]
         snapshot = registry.read_snapshot()
         record = snapshot["records"].get(root_session_id)
+        if candidate_preflight is not None:
+            expected = {
+                "root_session_id": root_session_id,
+                "plugin_contract_generation": contract_generation,
+                "binding_snapshot_generation": snapshot[
+                    "snapshot_generation"
+                ],
+                "binding_record_generation": (
+                    record.get("record_generation")
+                    if isinstance(record, Mapping)
+                    else None
+                ),
+            }
+            if any(
+                candidate_preflight.get(key) != value
+                for key, value in expected.items()
+            ):
+                raise DeepSeekIdentityError(
+                    "HARNESS_PROOF_CAPABILITY_STALE",
+                    "proof preflight no longer matches the binding snapshot",
+                )
+            if record is not None:
+                if not isinstance(record, Mapping) or record.get("state") != "active":
+                    raise DeepSeekIdentityError(
+                        "HARNESS_PROOF_BINDING_MISMATCH",
+                        "proof preflight cannot mutate a non-current binding",
+                    )
+                if not registry.binding_current(
+                    root_session_id=root_session_id,
+                    conversation_id=conversation_id,
+                    lifecycle_epoch=lifecycle_epoch,
+                    shell_id=shell_id,
+                    shell_shortname=shell_shortname,
+                    shell_worktree=selected,
+                    api_base=api_base,
+                    token=token,
+                    plugin_contract_generation=contract_generation,
+                ):
+                    raise DeepSeekIdentityError(
+                        "HARNESS_PROOF_BINDING_MISMATCH",
+                        "proof preflight cannot rotate a stale binding",
+                    )
         if record is None:
             registry.create_binding(
                 expected_snapshot_generation=snapshot["snapshot_generation"],
@@ -1203,6 +1256,8 @@ def bind_session_identity(
                 token=token,
                 plugin_contract_generation=contract_generation,
             )
+        elif candidate_preflight is not None:
+            pass
         else:
             if not isinstance(record, dict):
                 raise DeepSeekIdentityError(
@@ -1319,6 +1374,96 @@ def bind_session_identity(
             "lifecycle_epoch": lifecycle_epoch,
             "record_generation": current["record_generation"],
             "plugin_contract_generation": contract_generation,
+        }
+    except DeepSeekIdentityError as exc:
+        raise DeepSeekWebError(exc.code, exc.detail) from exc
+
+
+def preflight_candidate_execution(
+    *,
+    env: Mapping[str, str],
+    root_session_id: str,
+    conversation_id: str,
+    lifecycle_epoch: int,
+    worktree: Path,
+) -> dict[str, Any] | None:
+    """Validate proof authority completely before any binding mutation."""
+    raw_artifact = env.get("SC_DSH_PROOF_CAPABILITY_FILE")
+    if raw_artifact is None:
+        return None
+    artifact = Path(raw_artifact)
+    if not artifact.is_absolute() or len(artifact.parents) < 2:
+        raise DeepSeekWebError(
+            "HARNESS_PROOF_CAPABILITY_UNSAFE",
+            "proof capability path must be absolute",
+        )
+    shell_id, shell_shortname, api_base, token, selected = _binding_inputs(
+        env, worktree
+    )
+    registry = _identity_registry(env)
+    authority = _candidate_authority(registry)
+    try:
+        contract = authority.describe(artifact=artifact)
+        health = registry.read_live_health()
+        snapshot = registry.read_snapshot()
+        record = snapshot["records"].get(root_session_id)
+        if record is not None and not isinstance(record, Mapping):
+            raise DeepSeekIdentityError(
+                "HARNESS_REGISTRY_INVALID", "binding record is malformed"
+            )
+        record_generation = (
+            record.get("record_generation")
+            if isinstance(record, Mapping)
+            else None
+        )
+        lineage = sorted(
+            session_id
+            for session_id, item in snapshot["lineage"].items()
+            if isinstance(item, Mapping)
+            and item.get("root_session_id") == root_session_id
+            and item.get("lifecycle_epoch") == lifecycle_epoch
+            and (
+                record_generation is None
+                or item.get("record_generation") == record_generation
+            )
+        )
+        admitted = authority.admit(
+            artifact=artifact,
+            mode=contract["mode"],
+            exact_ref=_exact_engine_ref(),
+            pinned_dsh_version=_current_dsh_version(),
+            root_session_id=root_session_id,
+            conversation_id=conversation_id,
+            lifecycle_epoch=lifecycle_epoch,
+            verified_lineage=lineage,
+            plugin_contract_generation=health["plugin_contract_generation"],
+        )
+        if record is not None and (
+            record.get("state") != "active"
+            or not registry.binding_current(
+                root_session_id=root_session_id,
+                conversation_id=conversation_id,
+                lifecycle_epoch=lifecycle_epoch,
+                shell_id=shell_id,
+                shell_shortname=shell_shortname,
+                shell_worktree=selected,
+                api_base=api_base,
+                token=token,
+                plugin_contract_generation=health[
+                    "plugin_contract_generation"
+                ],
+            )
+        ):
+            raise DeepSeekIdentityError(
+                "HARNESS_PROOF_BINDING_MISMATCH",
+                "proof root has a partially recovered or stale binding",
+            )
+        return {
+            **admitted,
+            "binding_snapshot_generation": snapshot[
+                "snapshot_generation"
+            ],
+            "binding_record_generation": record_generation,
         }
     except DeepSeekIdentityError as exc:
         raise DeepSeekWebError(exc.code, exc.detail) from exc
