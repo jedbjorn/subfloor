@@ -18,6 +18,7 @@ import json
 import os
 import re
 import stat
+import sys
 import time
 import urllib.error
 import urllib.parse
@@ -33,6 +34,7 @@ ISSUER_CONTRACT = "sc-dsh-prototype-issuer-key-v1"
 ISSUER_ALGORITHM = "rsa-pkcs1v15-sha256"
 IDENTITY_CONTRACT = "sc-dsh-prototype-current-identity-v1"
 CREDENTIAL_CONTRACT = "sc-dsh-prototype-credential-v1"
+PRODUCTION_CREDENTIAL_CONTRACT = "sc-dsh-binding-credential-v1"
 DOMAIN_NAME = re.compile(r"[a-f0-9]{32}\.scope")
 DESCRIPTOR_FD = 198
 SHORTNAME = re.compile(r"[A-Z][A-Z0-9_-]{1,31}")
@@ -48,6 +50,30 @@ EARLY_OVERRIDE_NAMES = {"SC_DISPATCH", "SC_CALLER_ROOT", "SC_MEM_AS"}
 AUTHORIZED_CLASS = "dsh_shell_authorized"
 NEUTRAL_CLASS = "identity_neutral_read_only"
 REFUSED_CLASS = "refused"
+ALIASES = (
+    "DSH_SC_SHELL_ID",
+    "DSH_SC_SHELL_SHORTNAME",
+    "DSH_SC_SHELL_WORKTREE",
+    "DSH_SC_API_BASE",
+    "DSH_SC_MEM_CREDENTIAL_FILE",
+    "DSH_SC_BINDING_GENERATION",
+    "DSH_SC_PLUGIN_HEALTH_GENERATION",
+)
+LITERAL_ROUTE_FILES = {
+    "job": ".super-coder/scripts/job.py",
+    "mem": ".super-coder/scripts/mem.py",
+    "pr": ".super-coder/scripts/pr_cli.py",
+    "sprint": ".super-coder/scripts/sprint_cli.py",
+    "visual-qa": ".super-coder/scripts/visual_qa.py",
+    "vm": ".super-coder/scripts/vm.py",
+}
+CUSTOM_ROUTE_POLICIES = {
+    "feature": "feature",
+    "models": "models",
+    "skill": "skill",
+    "map-extractor": "map-extractor",
+    "vm-mcp-relay": "vm-mcp-relay",
+}
 
 
 @dataclass(frozen=True)
@@ -87,6 +113,7 @@ class IdentityContext:
     credential_file: str
     binding_generation: int
     plugin_health_generation: str
+    token: str
 
 
 @dataclass
@@ -386,7 +413,15 @@ def _managed_resolution(
         descriptor = _sealed_descriptor(descriptor_fd)
         if descriptor["contract"] == PRODUCTION_CONTRACT:
             if issuer_identity is None:
-                raise ValueError("managed membership has no live production issuer")
+                credential_file = descriptor.get("credential_file")
+                if not isinstance(credential_file, str):
+                    raise ValueError("managed membership has no live production issuer")
+                credential_path = Path(credential_file)
+                if not credential_path.is_absolute():
+                    raise ValueError("managed membership has no live production issuer")
+                issuer_identity = (
+                    credential_path.parent.parent / "host-identity.json"
+                )
             _verify_live_issuer(
                 descriptor,
                 descriptor_fd=descriptor_fd,
@@ -445,35 +480,38 @@ def _managed_resolution(
         return Resolution("unknown", str(exc))
     context = None
     if descriptor["contract"] == PRODUCTION_CONTRACT:
-        context = ExecutionDomainContext(
-            cgroup=str(descriptor["cgroup"]),
-            domain_id=str(descriptor["domain_id"]),
-            fork_id=str(descriptor["fork_id"]),
-            profile_id=str(descriptor["profile_id"]),
-            registry_snapshot_generation=int(
-                descriptor["registry_snapshot_generation"]
-            ),
-            execution_session_id=str(descriptor["execution_session_id"]),
-            root_session_id=str(descriptor["root_session_id"]),
-            conversation_id=str(descriptor["conversation_id"]),
-            lifecycle_epoch=int(descriptor["lifecycle_epoch"]),
-            shell_id=int(descriptor["shell_id"]),
-            shell_shortname=str(descriptor["shell_shortname"]),
-            shell_worktree=str(descriptor["shell_worktree"]),
-            api_base=str(descriptor["api_base"]),
-            credential_file=str(descriptor["credential_file"]),
-            binding_record_generation=int(
-                descriptor["binding_record_generation"]
-            ),
-            plugin_contract_generation=str(
-                descriptor["plugin_contract_generation"]
-            ),
-            lineage_record_generation=(
-                int(descriptor["lineage_record_generation"])
-                if descriptor["lineage_record_generation"] is not None
-                else None
-            ),
-        )
+        try:
+            context = ExecutionDomainContext(
+                cgroup=str(descriptor["cgroup"]),
+                domain_id=str(descriptor["domain_id"]),
+                fork_id=str(descriptor["fork_id"]),
+                profile_id=str(descriptor["profile_id"]),
+                registry_snapshot_generation=int(
+                    descriptor["registry_snapshot_generation"]
+                ),
+                execution_session_id=str(descriptor["execution_session_id"]),
+                root_session_id=str(descriptor["root_session_id"]),
+                conversation_id=str(descriptor["conversation_id"]),
+                lifecycle_epoch=int(descriptor["lifecycle_epoch"]),
+                shell_id=int(descriptor["shell_id"]),
+                shell_shortname=str(descriptor["shell_shortname"]),
+                shell_worktree=str(descriptor["shell_worktree"]),
+                api_base=str(descriptor["api_base"]),
+                credential_file=str(descriptor["credential_file"]),
+                binding_record_generation=int(
+                    descriptor["binding_record_generation"]
+                ),
+                plugin_contract_generation=str(
+                    descriptor["plugin_contract_generation"]
+                ),
+                lineage_record_generation=(
+                    int(descriptor["lineage_record_generation"])
+                    if descriptor["lineage_record_generation"] is not None
+                    else None
+                ),
+            )
+        except (TypeError, ValueError) as exc:
+            return Resolution("unknown", f"execution identity is malformed: {exc}")
     return Resolution(
         "managed", "sealed non-delegated cgroup-v2 membership", context
     )
@@ -686,7 +724,289 @@ def resolve_identity(
         credential_file=str(credential_path),
         binding_generation=binding_generation,
         plugin_health_generation=plugin_generation,
+        token=token,
     )
+
+
+def resolve_execution_identity(
+    *,
+    context: ExecutionDomainContext,
+    environment: Mapping[str, str],
+) -> IdentityContext:
+    """Validate the production descriptor's one immutable shell identity."""
+    presented = {name for name in environment if name.startswith("DSH_SC_")}
+    if presented != set(ALIASES):
+        raise ValueError("DSH alias set is partial or unknown")
+    expected_aliases = {
+        "DSH_SC_SHELL_ID": str(context.shell_id),
+        "DSH_SC_SHELL_SHORTNAME": context.shell_shortname,
+        "DSH_SC_SHELL_WORKTREE": context.shell_worktree,
+        "DSH_SC_API_BASE": context.api_base,
+        "DSH_SC_MEM_CREDENTIAL_FILE": context.credential_file,
+        "DSH_SC_BINDING_GENERATION": str(context.binding_record_generation),
+        "DSH_SC_PLUGIN_HEALTH_GENERATION": context.plugin_contract_generation,
+    }
+    if any(environment.get(name) != value for name, value in expected_aliases.items()):
+        raise ValueError("DSH aliases disagree with the execution descriptor")
+
+    if context.shell_id < 1 or SHORTNAME.fullmatch(context.shell_shortname) is None:
+        raise ValueError("execution shell identity is malformed")
+    worktree = Path(context.shell_worktree)
+    if not worktree.is_absolute() or not worktree.is_dir():
+        raise ValueError("execution shell worktree is unavailable")
+    api_base = _loopback_api_base(context.api_base)
+    credential_path = Path(context.credential_file)
+    if not credential_path.is_absolute():
+        raise ValueError("credential path is not absolute")
+
+    with _owner_json(credential_path, "credential artifact") as credential:
+        expected_fields = {
+            "contract",
+            "token",
+            "api_base",
+            "shell_id",
+            "shell_shortname",
+            "root_session_id",
+            "conversation_id",
+            "lifecycle_epoch",
+            "binding_generation",
+            "plugin_contract_generation",
+        }
+        if set(credential.data) != expected_fields:
+            raise ValueError("credential artifact has an unknown schema")
+        if credential.data["contract"] != PRODUCTION_CREDENTIAL_CONTRACT:
+            raise ValueError("credential artifact contract is stale")
+        expected_values = {
+            "api_base": api_base,
+            "shell_id": context.shell_id,
+            "shell_shortname": context.shell_shortname,
+            "root_session_id": context.root_session_id,
+            "conversation_id": context.conversation_id,
+            "lifecycle_epoch": context.lifecycle_epoch,
+            "binding_generation": context.binding_record_generation,
+            "plugin_contract_generation": context.plugin_contract_generation,
+        }
+        if any(credential.data[name] != value for name, value in expected_values.items()):
+            raise ValueError("credential artifact mismatches execution identity")
+        token = credential.data["token"]
+        if not isinstance(token, str) or not token:
+            raise ValueError("credential token is malformed")
+
+        request = urllib.request.Request(
+            f"{api_base}/_sc/mem/whoami",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=2) as response:
+                if response.status != 200:
+                    raise ValueError("authenticated whoami refused")
+                payload = response.read(65_537)
+        except (OSError, urllib.error.URLError) as exc:
+            raise ValueError("authenticated whoami is unavailable") from exc
+        if len(payload) > 65_536:
+            raise ValueError("authenticated whoami response is oversized")
+        try:
+            whoami = json.loads(payload)
+        except json.JSONDecodeError as exc:
+            raise ValueError("authenticated whoami response is malformed") from exc
+        if (
+            not isinstance(whoami, dict)
+            or whoami.get("shell_id") != context.shell_id
+            or whoami.get("shortname") != context.shell_shortname
+        ):
+            raise ValueError("authenticated whoami identity mismatches")
+        credential.assert_stable()
+
+    return IdentityContext(
+        shell_id=context.shell_id,
+        shell_shortname=context.shell_shortname,
+        shell_worktree=str(worktree),
+        api_base=api_base,
+        credential_file=str(credential_path),
+        binding_generation=context.binding_record_generation,
+        plugin_health_generation=context.plugin_contract_generation,
+        token=token,
+    )
+
+
+def _route_class(arguments: Sequence[str], policy: Mapping[str, object]) -> str:
+    route = arguments[0] if arguments else "help"
+    public = policy.get("public_command_policy")
+    if not isinstance(public, dict):
+        return REFUSED_CLASS
+    if route in {"help", "-h", "--help"}:
+        return NEUTRAL_CLASS
+    selector_policies = public.get("selector_policies")
+    if isinstance(selector_policies, dict) and route in selector_policies:
+        top_class = AUTHORIZED_CLASS
+    else:
+        top_class = ""
+    for command_class in (AUTHORIZED_CLASS, REFUSED_CLASS):
+        routes = public.get(command_class)
+        if isinstance(routes, list) and (
+            route in routes or (route.startswith("boot-") and "boot-*" in routes)
+        ):
+            top_class = command_class
+            break
+    if not top_class:
+        return REFUSED_CLASS
+    if top_class != AUTHORIZED_CLASS:
+        return top_class
+
+    custom = policy.get("custom_subcommand_policy")
+    if route in CUSTOM_ROUTE_POLICIES:
+        name = CUSTOM_ROUTE_POLICIES[route]
+        rows = custom.get(name) if isinstance(custom, dict) else None
+        token = arguments[1] if len(arguments) > 1 else "<bare-default-list>"
+        if route == "feature" and token == "<bare-default-list>":
+            return AUTHORIZED_CLASS
+        return rows.get(token, REFUSED_CLASS) if isinstance(rows, dict) else REFUSED_CLASS
+
+    literal_file = LITERAL_ROUTE_FILES.get(route)
+    if literal_file is not None:
+        literals = policy.get("literal_subcommand_policy")
+        rows = literals.get(literal_file) if isinstance(literals, dict) else None
+        token = arguments[1] if len(arguments) > 1 else ""
+        if route == "mem" and token in {"seed", "lns"}:
+            dynamic = custom.get("mem.dynamic") if isinstance(custom, dict) else None
+            command_class = (
+                dynamic.get(token, REFUSED_CLASS)
+                if isinstance(dynamic, dict)
+                else REFUSED_CLASS
+            )
+        else:
+            command_class = (
+                rows.get(token, REFUSED_CLASS)
+                if isinstance(rows, dict)
+                else REFUSED_CLASS
+            )
+        if command_class != AUTHORIZED_CLASS:
+            return command_class
+        if route == "vm" and token == "mcp":
+            nested = custom.get("vm.mcp") if isinstance(custom, dict) else None
+            child = arguments[2] if len(arguments) > 2 else ""
+            return (
+                nested.get(child, REFUSED_CLASS)
+                if isinstance(nested, dict)
+                else REFUSED_CLASS
+            )
+    return AUTHORIZED_CLASS
+
+
+def _load_policy(path: Path) -> dict[str, object]:
+    try:
+        value = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError("DSH command policy is unavailable") from exc
+    if not isinstance(value, dict) or value.get("schema_version") != 2:
+        raise ValueError("DSH command policy is stale")
+    return value
+
+
+def _refusal(reason: str) -> int:
+    bounded = " ".join(reason.split())[:240] or "admission failed"
+    print(f"sc: DSH command refused before effect: {bounded}", file=sys.stderr)
+    return 77
+
+
+def _exec_dispatch(
+    dispatch: Path,
+    arguments: Sequence[str],
+    environment: Mapping[str, str],
+) -> None:
+    if not dispatch.is_file() or not os.access(dispatch, os.R_OK):
+        raise ValueError("canonical dispatcher is unavailable")
+    os.execve("/bin/sh", ["sh", str(dispatch), *arguments], dict(environment))
+
+
+def admit_sc(
+    *,
+    caller_root: Path,
+    live_root: Path,
+    policy_path: Path,
+    arguments: Sequence[str],
+) -> int:
+    """Admit one stable ``sc`` route before ambient selectors or effects."""
+    try:
+        os.fstat(DESCRIPTOR_FD)
+    except OSError:
+        descriptor_fd = None
+    else:
+        descriptor_fd = DESCRIPTOR_FD
+    resolution = resolve_linux(descriptor_fd=descriptor_fd)
+    bridge_present = {
+        name for name in os.environ
+        if name in BRIDGE_NAMES or name.startswith("DSH_SC_")
+    }
+    default_dispatch = live_root / ".super-coder" / "scripts" / "dispatch.sh"
+
+    if resolution.provenance == "unknown":
+        return _refusal(resolution.reason)
+    if resolution.provenance == "native":
+        if bridge_present:
+            return _refusal("native caller presented DSH authority facts")
+        dispatch = default_dispatch
+        override = os.environ.get("SC_DISPATCH", "")
+        if override:
+            dispatch = Path(override)
+            if not dispatch.is_file() or not os.access(dispatch, os.R_OK):
+                print(
+                    f"\u2717 ./sc: SC_DISPATCH is set but not readable: {dispatch}",
+                    file=sys.stderr,
+                )
+                return 1
+        environment = dict(os.environ)
+        environment["SC_CALLER_ROOT"] = str(caller_root)
+        try:
+            _exec_dispatch(dispatch, arguments, environment)
+        except ValueError as exc:
+            print(f"\u2717 ./sc: {exc}", file=sys.stderr)
+            return 1
+        raise AssertionError("unreachable")
+
+    if any(name.startswith("SC_") for name in os.environ):
+        return _refusal("managed caller presented an ambient SC selector")
+    try:
+        policy = _load_policy(policy_path)
+    except ValueError as exc:
+        return _refusal(str(exc))
+    command_class = _route_class(arguments, policy)
+    if command_class == NEUTRAL_CLASS:
+        print("super-coder — managed DSH command surface")
+        print("  help is identity-neutral; unknown and operator routes are refused")
+        return 0
+    if command_class != AUTHORIZED_CLASS:
+        route = arguments[0] if arguments else "help"
+        return _refusal(f"route {route!r} is not shell-authorized")
+    if resolution.context is None:
+        return _refusal("managed execution has no immutable identity context")
+    try:
+        canonical_caller = caller_root.resolve(strict=True)
+        if canonical_caller != Path(resolution.context.shell_worktree).resolve(strict=True):
+            raise ValueError("invoked sc does not belong to the bound shell worktree")
+        identity = resolve_execution_identity(
+            context=resolution.context,
+            environment=os.environ,
+        )
+        environment = {
+            name: value
+            for name, value in os.environ.items()
+            if not name.startswith("SC_")
+        }
+        environment.update({
+            "DSH_SC_SHELL_ID": str(identity.shell_id),
+            "DSH_SC_SHELL_SHORTNAME": identity.shell_shortname,
+            "DSH_SC_SHELL_WORKTREE": identity.shell_worktree,
+            "DSH_SC_API_BASE": identity.api_base,
+            "DSH_SC_MEM_CREDENTIAL_FILE": identity.credential_file,
+            "DSH_SC_BINDING_GENERATION": str(identity.binding_generation),
+            "DSH_SC_PLUGIN_HEALTH_GENERATION": identity.plugin_health_generation,
+            "SC_CALLER_ROOT": identity.shell_worktree,
+        })
+        _exec_dispatch(default_dispatch, arguments, environment)
+    except ValueError as exc:
+        return _refusal(str(exc))
+    raise AssertionError("unreachable")
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -709,12 +1029,28 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--protected-effect", type=Path)
     parser.add_argument("--default-dispatch", type=Path)
     parser.add_argument("--native-credential-dir", type=Path)
+    parser.add_argument("--admit-sc", action="store_true")
+    parser.add_argument("--caller-root", type=Path)
+    parser.add_argument("--live-root", type=Path)
+    parser.add_argument("--policy-contract", type=Path)
     parser.add_argument("dispatch_args", nargs=argparse.REMAINDER)
     return parser
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
+    dispatch_args = list(args.dispatch_args)
+    if dispatch_args[:1] == ["--"]:
+        dispatch_args.pop(0)
+    if args.admit_sc:
+        if args.caller_root is None or args.live_root is None or args.policy_contract is None:
+            return _refusal("stable bootstrap omitted a fixed admission path")
+        return admit_sc(
+            caller_root=args.caller_root,
+            live_root=args.live_root,
+            policy_path=args.policy_contract,
+            arguments=dispatch_args,
+        )
     resolution = resolve_linux(
         proc_cgroup=args.proc_cgroup,
         cgroup_root=args.cgroup_root,
@@ -771,7 +1107,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         }, sort_keys=True))
     if decision != "neutral" and args.default_dispatch is not None:
         dispatch = Path(os.environ.get("SC_DISPATCH", str(args.default_dispatch)))
-        os.execv(dispatch, [str(dispatch), *args.dispatch_args])
+        os.execv(dispatch, [str(dispatch), *dispatch_args])
     receipt = {
         "decision": decision,
         "provenance": resolution.provenance,

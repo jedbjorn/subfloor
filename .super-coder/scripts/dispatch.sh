@@ -16,6 +16,10 @@ if [ -n "${SC_CALLER_ROOT:-}" ] && [ -d "${SC_CALLER_ROOT:-}" ]; then
 else
   here="$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)"
 fi
+# SC_CALLER_ROOT is a one-hop bootstrap projection. Keeping it in the handler
+# environment would turn a verified DSH dispatch fact back into an ambient
+# pre-guard selector on nested `sc` calls.
+unset SC_CALLER_ROOT
 cd "$here"
 
 # FOUR identities, never one ROOT (spec #68). The CALLER is the checkout holding

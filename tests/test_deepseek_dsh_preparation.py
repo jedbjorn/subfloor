@@ -623,10 +623,10 @@ class DeepSeekDshPreparationContractTests(unittest.TestCase):
                 "sha256": sha256(EFFECT_DRIVER),
             },
         )
-        self.assertIn("future guard seam", harness["neutral_route"])
+        self.assertIn("stable sc admission boundary", harness["neutral_route"])
         self.assertIn("authenticated whoami equality", harness["authorized_route"])
         self.assertIn("absent before replying", harness["effect_order"])
-        self.assertIn("deferred to task 650", harness["production_wiring"])
+        self.assertIn("task 650 wires the stable sc bootstrap", harness["production_wiring"])
         self.assertNotIn("windows", provenance)
         self.assertNotIn("windows_contributor", provenance)
         self.assertIn("Arch and Ubuntu Linux only", provenance["platform_boundary"])

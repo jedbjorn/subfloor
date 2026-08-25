@@ -24,6 +24,13 @@
       "contract": "sc-dsh-linux-cgroup-v2-v3",
       "descriptor_fd": 198,
       "platform": "linux"
+    },
+    "command_admission": {
+      "bootstrap": "../sc",
+      "verifier": "scripts/dsh_execution_provenance.py",
+      "policy": "assets/deepseek/dsh-shell-authority-contract.json",
+      "floor": "assets/deepseek/dsh-command-admission-v1.json",
+      "contract": "sc-dsh-command-admission-v1"
     }
   },
   "runtime_compatibility": {
