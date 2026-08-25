@@ -78,6 +78,13 @@ def test_ensure_starts_exact_stock_web_relay_registers_and_reuses() -> None:
                 return_value={"workspace_id": "ws-4", "workspace_created": True},
             ) as register,
                 mock.patch.object(
+                    deepseek_web.DeepSeekIdentityRegistry,
+                    "read_live_health",
+                    return_value={
+                        "plugin_contract_generation": "plugin-contract-test"
+                    },
+                ),
+                mock.patch.object(
                     deepseek_web,
                     "_verified_process",
                     side_effect=lambda pid, *_args, **_kwargs: isinstance(pid, int),
@@ -90,18 +97,16 @@ def test_ensure_starts_exact_stock_web_relay_registers_and_reuses() -> None:
         assert first["reused"] is False
         assert second["reused"] is True
         assert first["url"].startswith("http://127.0.0.1:18942/?sc_generation=")
-        assert spawned[0][:2] == (
-            [
-                "/bin/dsh",
-                "web",
-                "--host",
-                "127.0.0.1",
-                "--port",
-                "8942",
-                "--no-open",
-            ],
-            worktree,
-        )
+        assert spawned[0][0][0:2] == ["/bin/dsh", "--profile"]
+        assert spawned[0][0][2].startswith("sc-")
+        assert spawned[0][0][3:] == [
+            "--host",
+            "127.0.0.1",
+            "--port",
+            "8942",
+            "--no-open",
+        ]
+        assert spawned[0][1] == worktree
         assert spawned[1][0][3:5] == [
             "--listen-host",
             "0.0.0.0",
@@ -170,6 +175,13 @@ def test_shell_identity_reaches_stock_host_only_through_owner_only_artifact() ->
                 deepseek_web,
                 "_post_workspace",
                 return_value={"workspace_id": "ws-4", "workspace_created": True},
+            ),
+            mock.patch.object(
+                deepseek_web.DeepSeekIdentityRegistry,
+                "read_live_health",
+                return_value={
+                    "plugin_contract_generation": "plugin-contract-test"
+                },
             ),
             mock.patch.object(
                 deepseek_web,
@@ -249,6 +261,13 @@ def test_two_shell_handoff_rotates_only_after_empty_gateway_quiescence() -> None
                 ],
             ),
             mock.patch.object(
+                deepseek_web.DeepSeekIdentityRegistry,
+                "read_live_health",
+                return_value={
+                    "plugin_contract_generation": "plugin-contract-test"
+                },
+            ),
+            mock.patch.object(
                 deepseek_web,
                 "_verified_process",
                 side_effect=lambda pid, *_args, **_kwargs: isinstance(pid, int),
@@ -313,6 +332,13 @@ def test_non_sandbox_entry_still_uses_the_generation_gateway() -> None:
                 deepseek_web,
                 "_post_workspace",
                 return_value={"workspace_id": "ws-4", "workspace_created": True},
+            ),
+            mock.patch.object(
+                deepseek_web.DeepSeekIdentityRegistry,
+                "read_live_health",
+                return_value={
+                    "plugin_contract_generation": "plugin-contract-test"
+                },
             ),
             mock.patch.object(
                 deepseek_web,
@@ -1776,8 +1802,15 @@ def test_malformed_activity_refuses_handoff_without_terminating_host() -> None:
 
 
 def test_existing_service_requires_both_shell_id_and_shortname() -> None:
+    identity = mock.Mock()
+    identity.layout.fork_id = "fork-id"
+    identity.layout.profile_id = "sc-fork-id"
+    identity.layout.registry.resolve.return_value = Path("/registry.json")
+    identity.read_live_health.return_value = {
+        "plugin_contract_generation": "plugin-contract-test"
+    }
     state = {
-        "schema_version": 3,
+        "schema_version": 4,
         "service_port": 8942,
         "relay_port": 18942,
         "relay_policy": deepseek_web.RELAY_POLICY,
@@ -1789,6 +1822,11 @@ def test_existing_service_requires_both_shell_id_and_shortname() -> None:
         "web_start_ticks": 12,
         "relay_pid": 13,
         "relay_start_ticks": 14,
+        "fork_id": "fork-id",
+        "profile_id": "sc-fork-id",
+        "registry_path": "/registry.json",
+        "host_boot_generation": "host-boot-test",
+        "plugin_contract_generation": "plugin-contract-test",
     }
     with (
         mock.patch.object(deepseek_web, "_verified_process", return_value=True),
@@ -1798,10 +1836,12 @@ def test_existing_service_requires_both_shell_id_and_shortname() -> None:
         assert deepseek_web._existing_healthy(
             state, 8942, 18942, listen_host="0.0.0.0",
             allowed_peers=("127.0.0.1",), credential_shell="DEV4", credential_shell_id=4,
+            identity_registry=identity,
         ) is True
         assert deepseek_web._existing_healthy(
             state, 8942, 18942, listen_host="0.0.0.0",
             allowed_peers=("127.0.0.1",), credential_shell="DEV4", credential_shell_id=5,
+            identity_registry=identity,
         ) is False
 
 
@@ -1837,12 +1877,20 @@ def test_status_rejects_a_live_relay_without_the_host_gateway_policy() -> None:
     with tempfile.TemporaryDirectory() as raw:
         root = Path(raw)
         state = {
+            "schema_version": 4,
             "web_pid": 101,
             "web_start_ticks": 201,
             "service_port": 8942,
             "relay_pid": 102,
             "relay_start_ticks": 202,
             "relay_port": 18942,
+            "host_boot_generation": "host-boot-test",
+            "plugin_contract_generation": "plugin-contract-test",
+            "ready": True,
+        }
+        identity = mock.Mock()
+        identity.read_live_health.return_value = {
+            "plugin_contract_generation": "plugin-contract-test"
         }
         (root / "state.json").write_text(json.dumps(state))
         with (
@@ -1850,6 +1898,7 @@ def test_status_rejects_a_live_relay_without_the_host_gateway_policy() -> None:
             mock.patch.object(deepseek_web, "_verified_process", return_value=True),
             mock.patch.object(deepseek_web, "_http_ready", return_value=True),
             mock.patch.object(deepseek_web, "_tcp_ready", return_value=True),
+            mock.patch.object(deepseek_web, "_identity_registry", return_value=identity),
         ):
             unsafe = deepseek_web.status()
             state.update(
@@ -1860,11 +1909,18 @@ def test_status_rejects_a_live_relay_without_the_host_gateway_policy() -> None:
             )
             (root / "state.json").write_text(json.dumps(state))
             safe = deepseek_web.status()
+            identity.read_live_health.return_value = {
+                "plugin_contract_generation": "plugin-contract-new"
+            }
+            stale = deepseek_web.status()
 
     assert unsafe["ready"] is False
     assert unsafe["relay_safe"] is False
     assert safe["ready"] is True
     assert safe["relay_safe"] is True
+    assert stale["ready"] is False
+    assert stale["plugin_health"] == "mismatch"
+    assert stale["plugin_contract_generation"] == "plugin-contract-new"
 
 
 def test_workspace_registration_uses_stock_rpc_envelope_and_verifies_path() -> None:

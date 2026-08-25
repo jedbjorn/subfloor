@@ -15,7 +15,10 @@
     "selected_seam": "stock-host-api",
     "feasibility_evidence": "assets/deepseek/stock-host-seam.json",
     "shell_authority_contract": "assets/deepseek/dsh-shell-authority-contract.json",
-    "profile_home": "$DSH_HOME or ~/.dsh"
+    "profile_home": "engine-owned per-fork DSH_HOME",
+    "profile_contract": "sc-dsh-profile-v1",
+    "shell_identity_plugin": "assets/deepseek/sc-shell-env-plugin.mjs",
+    "registry_contract": "sc-dsh-identity-registry-v1"
   },
   "runtime_compatibility": {
     "minimum_cli_version": "0.1.1",

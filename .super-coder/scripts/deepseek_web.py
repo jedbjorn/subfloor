@@ -31,6 +31,10 @@ from pathlib import Path
 from typing import Any
 
 import ports
+from deepseek_identity_registry import (
+    DeepSeekIdentityError,
+    DeepSeekIdentityRegistry,
+)
 
 ENGINE = Path(__file__).resolve().parents[1]
 REPO_ROOT = ENGINE.parent.resolve()
@@ -346,7 +350,13 @@ def _verified_process(
     cmdline = _process_cmdline(pid, proc_root=proc_root)
     joined = "\0".join(cmdline)
     if identity == "web":
-        return "dsh" in joined and "web" in cmdline
+        return (
+            "dsh" in joined
+            and (
+                "web" in cmdline
+                or ("--host" in cmdline and "--no-open" in cmdline)
+            )
+        )
     return Path(__file__).name in joined and "relay" in cmdline
 
 
@@ -584,7 +594,16 @@ def _stop_unlocked() -> dict[str, Any]:
         for prefix in ("web", "relay")
     ):
         state = {}
-    activity = _close_gateway_admission(state)
+    relay_live = _verified_process(
+        state.get("relay_pid"), state.get("relay_start_ticks"), "relay"
+    )
+    if state and not _activity_path().exists() and not relay_live:
+        # Startup has not published the gateway, so no browser request can have
+        # crossed it.  A live private Host is safe to terminate without an
+        # activity ledger; a live relay without that ledger still fails closed.
+        activity = {"admission": "closed", "requests": {}}
+    else:
+        activity = _close_gateway_admission(state)
     if not _drain_gateway_work(state, activity):
         raise DeepSeekWebError(
             "HARNESS_WEB_GATEWAY_BUSY",
@@ -1077,6 +1096,17 @@ def _write_shell_credential(env: Mapping[str, str]) -> tuple[Path, str, int] | N
     return path, shortname, int(shell_id)
 
 
+def _identity_registry(env: Mapping[str, str]) -> DeepSeekIdentityRegistry:
+    override = env.get("SC_DEEPSEEK_IDENTITY_ROOT")
+    if override:
+        runtime_root = Path(override)
+    elif env.get("SC_DEEPSEEK_WEB_STATE"):
+        runtime_root = _state_path().with_name("deepseek-identity")
+    else:
+        runtime_root = ENGINE / "run" / "deepseek-identity"
+    return DeepSeekIdentityRegistry(repo_root=REPO_ROOT, runtime_root=runtime_root)
+
+
 def stop(*, env: Mapping[str, str] | None = None) -> dict[str, Any]:
     """Stop only while holding the same identity lease as every acting path."""
     env = os.environ if env is None else env
@@ -1098,8 +1128,9 @@ def _existing_healthy(
     allowed_peers: tuple[str, ...],
     credential_shell: str | None,
     credential_shell_id: int | None,
+    identity_registry: DeepSeekIdentityRegistry,
 ) -> bool:
-    if state.get("schema_version") != 3:
+    if state.get("schema_version") != 4:
         return False
     if state.get("service_port") != service_port:
         return False
@@ -1110,6 +1141,23 @@ def _existing_healthy(
     if (
         state.get("credential_shell") != credential_shell
         or state.get("credential_shell_id") != credential_shell_id
+    ):
+        return False
+    if (
+        state.get("fork_id") != identity_registry.layout.fork_id
+        or state.get("profile_id") != identity_registry.layout.profile_id
+        or state.get("registry_path")
+        != str(identity_registry.layout.registry.resolve())
+    ):
+        return False
+    try:
+        health = identity_registry.read_live_health(
+            expected_host_boot_generation=state.get("host_boot_generation")
+        )
+    except DeepSeekIdentityError:
+        return False
+    if state.get("plugin_contract_generation") != health.get(
+        "plugin_contract_generation"
     ):
         return False
     return (
@@ -1165,6 +1213,7 @@ def ensure(
         service_port = public_port if sandbox else public_port + ports.DEEPSEEK_RELAY_OFFSET
         relay_port = service_port + ports.DEEPSEEK_RELAY_OFFSET if sandbox else public_port
         state = _read_state()
+        identity_registry = _identity_registry(env)
         listen_host, allowed_peers = _relay_configuration(sandbox=sandbox)
         credential_shell = env.get("SC_SHELL_SHORTNAME") or None
         credential_shell_id = int(env["SC_SHELL_ID"])
@@ -1176,6 +1225,7 @@ def ensure(
             allowed_peers=allowed_peers,
             credential_shell=credential_shell,
             credential_shell_id=credential_shell_id,
+            identity_registry=identity_registry,
         )
         generation = None
         if not reused:
@@ -1188,6 +1238,8 @@ def ensure(
                 )
             credential = _write_shell_credential(env)
             web_env = dict(env)
+            identity_env = identity_registry.host_environment()
+            web_env.update(identity_env)
             if credential is not None:
                 credential_file, credential_shell, credential_shell_id = credential
                 web_env.pop("SC_API_TOKEN", None)
@@ -1196,7 +1248,8 @@ def ensure(
             web_pid, web_ticks = _spawn(
                 [
                     executable,
-                    "web",
+                    "--profile",
+                    identity_registry.layout.profile_id,
                     "--host",
                     "127.0.0.1",
                     "--port",
@@ -1208,7 +1261,7 @@ def ensure(
                 env=web_env,
             )
             state = {
-                "schema_version": 3,
+                "schema_version": 4,
                 "web_pid": web_pid,
                 "web_start_ticks": web_ticks,
                 "service_port": service_port,
@@ -1219,6 +1272,13 @@ def ensure(
                 "url": f"http://127.0.0.1:{public_port}",
                 "credential_shell": credential_shell,
                 "credential_shell_id": credential_shell_id,
+                "fork_id": identity_registry.layout.fork_id,
+                "profile_id": identity_registry.layout.profile_id,
+                "registry_path": str(identity_registry.layout.registry.resolve()),
+                "plugin_health_path": str(identity_registry.layout.health.resolve()),
+                "host_boot_generation": identity_env[
+                    "SC_DSH_HOST_BOOT_GENERATION"
+                ],
             }
             _write_state(state)
             if not _wait_ready(lambda: _http_ready(service_port)):
@@ -1227,6 +1287,17 @@ def ensure(
                     "HARNESS_SERVICE_UNAVAILABLE",
                     f"official dsh Web did not become ready; inspect {_log_path()}",
                 )
+            try:
+                health = identity_registry.read_live_health(
+                    expected_host_boot_generation=state["host_boot_generation"]
+                )
+            except DeepSeekIdentityError as exc:
+                _stop_unlocked()
+                raise DeepSeekWebError(exc.code, exc.detail) from exc
+            state["plugin_contract_generation"] = health[
+                "plugin_contract_generation"
+            ]
+            _write_state(state)
             generation = _write_generation()
             # The relay never calls the engine API.  Give it no shell
             # credential: inheriting the launcher environment would expose the
@@ -1318,6 +1389,22 @@ def status() -> dict[str, Any]:
         and isinstance(state.get("relay_allowed_peers"), list)
         and bool(state["relay_allowed_peers"])
     )
+    plugin_health = "unavailable"
+    plugin_contract_generation = None
+    plugin_current = False
+    if state.get("schema_version") == 4:
+        try:
+            identity = _identity_registry(os.environ)
+            health = identity.read_live_health(
+                expected_host_boot_generation=state.get("host_boot_generation")
+            )
+            plugin_contract_generation = health["plugin_contract_generation"]
+            plugin_current = plugin_contract_generation == state.get(
+                "plugin_contract_generation"
+            )
+            plugin_health = "loaded" if plugin_current else "mismatch"
+        except DeepSeekIdentityError as exc:
+            plugin_health = exc.code
     ready = (
         web
         and isinstance(service_port, int)
@@ -1325,13 +1412,16 @@ def status() -> dict[str, Any]:
         and relay
         and relay_safe
         and (relay_port is None or _tcp_ready("127.0.0.1", relay_port))
+        and plugin_current
     )
     return {
+        **state,
         "ready": ready,
         "web_process": web,
         "relay_process": relay,
         "relay_safe": relay_safe,
-        **state,
+        "plugin_health": plugin_health,
+        "plugin_contract_generation": plugin_contract_generation,
     }
 
 

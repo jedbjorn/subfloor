@@ -673,6 +673,9 @@
       ".super-coder/scripts/deepseek_web.py",
       ".super-coder/scripts/dispatch.sh"
     ],
+    "SC_DEEPSEEK_IDENTITY_ROOT": [
+      ".super-coder/scripts/deepseek_web.py"
+    ],
     "SC_DEEPSEEK_MODEL": [
       ".super-coder/scripts/deepseek_carrier_worker.py",
       ".super-coder/scripts/deepseek_inference_canary.py",
@@ -753,6 +756,16 @@
       ".super-coder/scripts/dsh_execution_provenance.py",
       ".super-coder/scripts/dsh_preparation_inventory.py",
       "sc"
+    ],
+    "SC_DSH_FORK_ID": [
+      ".super-coder/scripts/deepseek_identity_registry.py"
+    ],
+    "SC_DSH_HOST_BOOT_GENERATION": [
+      ".super-coder/scripts/deepseek_identity_registry.py",
+      ".super-coder/scripts/deepseek_web.py"
+    ],
+    "SC_DSH_PROFILE_ID": [
+      ".super-coder/scripts/deepseek_identity_registry.py"
     ],
     "SC_ENGINE_DIR": [
       ".super-coder/scripts/branch-guard.sh",
@@ -1319,6 +1332,7 @@
       "SC_DEEPSEEK_BOOTSTRAP_PYTHON",
       "SC_DEEPSEEK_CARRIER_PYTHON",
       "SC_DEEPSEEK_HOST_PORT",
+      "SC_DEEPSEEK_IDENTITY_ROOT",
       "SC_DEEPSEEK_MODEL",
       "SC_DEEPSEEK_PROVIDER",
       "SC_DEEPSEEK_PROVIDER_",
@@ -1338,6 +1352,9 @@
       "SC_DEVKIT_SEAT",
       "SC_DEV_PORT",
       "SC_DISABLED_HARNESSES",
+      "SC_DSH_FORK_ID",
+      "SC_DSH_HOST_BOOT_GENERATION",
+      "SC_DSH_PROFILE_ID",
       "SC_GITHUB_AUTH_ARGS",
       "SC_GITHUB_HOST_TRUST_B64",
       "SC_GITHUB_HOST_TRUST_SHA256",
