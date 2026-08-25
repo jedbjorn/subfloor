@@ -3,12 +3,17 @@
   "governing_revision": {
     "document_id": 174,
     "current_sha256": "84056c2fc7206b83f2d3beb71150545326d5e33f557cb5f2329f55321eab0bdf",
-    "sprint_bound_sha256": "a305eba5c73988d202e3f3f9d392d623645b3f799dfe4ab4945687026ae5a969",
+    "sprint_bound_sha256": "84056c2fc7206b83f2d3beb71150545326d5e33f557cb5f2329f55321eab0bdf",
     "scope_decision_id": 255,
-    "drift_disposition": "retain the immutable v3 Sprint binding as evidence; current Doc 174 v4 and Decision 255 govern this corrected head",
+    "drift_disposition": "retain Sprint 24 WU95 Doc 174 v3 only as replaced-binding drift evidence; Sprint 25 WU101 Doc 174 v4 and Decision 255 govern this corrected head",
     "task_id": 648,
-    "sprint_id": 24,
-    "work_unit_id": 95,
+    "sprint_id": 25,
+    "work_unit_id": 101,
+    "replaced_binding": {
+      "sprint_id": 24,
+      "work_unit_id": 95,
+      "sprint_bound_sha256": "a305eba5c73988d202e3f3f9d392d623645b3f799dfe4ab4945687026ae5a969"
+    },
     "implementation_base": "83a1bcaaac513e24446c78bab6b41c8932610fba"
   },
   "dsh_release": {
@@ -126,7 +131,7 @@
     "linux": "future engine wrapper signs a sealed descriptor, binds it to the protected non-delegated cgroup-v2 inode and authorized root PID/start-time lineage, places the suspended child in that domain, and releases it; the preparation verifier requires the trusted issuer signature, exact /proc ancestry and cgroup membership/identity/generation/expiry equality, non-writable admission, cgroup type domain, and empty subtree delegation",
     "linux_contributor": {
       "path": ".super-coder/scripts/dsh_execution_provenance.py",
-      "sha256": "9da62ab334ddbf50c98d1f609b120919c643b508a18b61be4368e50e2aecca69",
+      "sha256": "79a61164f694595d9212a3173ded815799bf7137fadb40c91a377e411684cfb7",
       "contract": "sc-dsh-linux-cgroup-v2-v2"
     },
     "prototype_issuer_fixture": {

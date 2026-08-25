@@ -361,8 +361,6 @@ def classify(
         return "neutral"
     if command_class != AUTHORIZED_CLASS:
         return "refused"
-    if environment.get("DSH_SHELL") != "1":
-        return "refused"
     if any(not environment.get(name) for name in aliases):
         return "refused"
     return "authorized"

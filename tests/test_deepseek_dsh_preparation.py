@@ -445,12 +445,17 @@ class DeepSeekDshPreparationContractTests(unittest.TestCase):
             {
                 "document_id": 174,
                 "current_sha256": "84056c2fc7206b83f2d3beb71150545326d5e33f557cb5f2329f55321eab0bdf",
-                "sprint_bound_sha256": "a305eba5c73988d202e3f3f9d392d623645b3f799dfe4ab4945687026ae5a969",
+                "sprint_bound_sha256": "84056c2fc7206b83f2d3beb71150545326d5e33f557cb5f2329f55321eab0bdf",
                 "scope_decision_id": 255,
-                "drift_disposition": "retain the immutable v3 Sprint binding as evidence; current Doc 174 v4 and Decision 255 govern this corrected head",
+                "drift_disposition": "retain Sprint 24 WU95 Doc 174 v3 only as replaced-binding drift evidence; Sprint 25 WU101 Doc 174 v4 and Decision 255 govern this corrected head",
                 "task_id": 648,
-                "sprint_id": 24,
-                "work_unit_id": 95,
+                "sprint_id": 25,
+                "work_unit_id": 101,
+                "replaced_binding": {
+                    "sprint_id": 24,
+                    "work_unit_id": 95,
+                    "sprint_bound_sha256": "a305eba5c73988d202e3f3f9d392d623645b3f799dfe4ab4945687026ae5a969",
+                },
                 "implementation_base": "83a1bcaaac513e24446c78bab6b41c8932610fba",
             },
         )
@@ -1061,7 +1066,6 @@ class DeepSeekDshPreparationContractTests(unittest.TestCase):
         exact = {"DSH_SHELL": "1", **aliases}
         cases = [
             ("managed", {}, "marker-and-aliases-deleted"),
-            ("managed", {"DSH_SHELL": "0", **aliases}, "marker-falsified"),
             ("managed", {**exact, "SC_DISPATCH": "TARGET"}, "dispatch-override"),
             ("managed", {**exact, "SC_MEM_AS": "Admin"}, "admin-selector"),
             ("native", {"DSH_SHELL": "1", "SC_DISPATCH": "TARGET"}, "native-spoof"),
@@ -1200,43 +1204,63 @@ class DeepSeekDshPreparationContractTests(unittest.TestCase):
             self.assertEqual(list(event_dir.iterdir()), [])
             self.assertFalse(protected_effect.exists())
 
-    def test_exact_authenticated_identity_precedes_first_protected_effect(self):
-        with tempfile.TemporaryDirectory() as raw:
-            root = Path(raw)
-            effect = root / "protected-effect.json"
-            effect_absent_at_whoami = []
+    def test_exact_authenticated_identity_ignores_marker_before_first_effect(self):
+        marker_cases = (
+            ("observed", {"DSH_SHELL": "1"}),
+            ("absent", {}),
+            ("zero", {"DSH_SHELL": "0"}),
+            ("falsified", {"DSH_SHELL": "caller-selected"}),
+        )
+        for label, marker_environment in marker_cases:
+            with self.subTest(marker=label), tempfile.TemporaryDirectory() as raw:
+                root = Path(raw)
+                effect = root / "protected-effect.json"
+                effect_absent_at_whoami = []
 
-            def observe_before_reply():
-                effect_absent_at_whoami.append(not effect.exists())
+                def observe_before_reply(
+                    effect_path=effect,
+                    observations=effect_absent_at_whoami,
+                ):
+                    observations.append(not effect_path.exists())
 
-            with whoami_server(before_reply=observe_before_reply) as (api_base, requests):
-                aliases, record, _credential = identity_material(root, api_base)
-                with linux_domain_fixture("managed") as fixture:
-                    completed = run_provenance_probe(
-                        fixture,
-                        environment={"DSH_SHELL": "1", **aliases},
-                        extra_args=authorized_probe_args(self.contract, record, effect),
-                    )
-            self.assertEqual(completed.returncode, 0, completed.stderr)
-            self.assertEqual(json.loads(completed.stdout)["decision"], "authorized")
-            self.assertEqual(
-                requests,
-                [{
-                    "path": "/_sc/mem/whoami",
-                    "authorization": "Bearer fixture-token",
-                    "method": "GET",
-                }],
-            )
-            self.assertEqual(effect_absent_at_whoami, [True])
-            self.assertEqual(
-                json.loads(effect.read_text()),
-                {
-                    "binding_generation": 7,
-                    "plugin_health_generation": "plugin-contract-9",
-                    "shell_id": 11,
-                    "shell_shortname": "DEV5",
-                },
-            )
+                with whoami_server(before_reply=observe_before_reply) as (
+                    api_base,
+                    requests,
+                ):
+                    aliases, record, _credential = identity_material(root, api_base)
+                    with linux_domain_fixture("managed") as fixture:
+                        completed = run_provenance_probe(
+                            fixture,
+                            environment={**marker_environment, **aliases},
+                            extra_args=authorized_probe_args(
+                                self.contract,
+                                record,
+                                effect,
+                            ),
+                        )
+                self.assertEqual(completed.returncode, 0, completed.stderr)
+                self.assertEqual(
+                    json.loads(completed.stdout)["decision"],
+                    "authorized",
+                )
+                self.assertEqual(
+                    requests,
+                    [{
+                        "path": "/_sc/mem/whoami",
+                        "authorization": "Bearer fixture-token",
+                        "method": "GET",
+                    }],
+                )
+                self.assertEqual(effect_absent_at_whoami, [True])
+                self.assertEqual(
+                    json.loads(effect.read_text()),
+                    {
+                        "binding_generation": 7,
+                        "plugin_health_generation": "plugin-contract-9",
+                        "shell_id": 11,
+                        "shell_shortname": "DEV5",
+                    },
+                )
 
     def _assert_identity_refusal(
         self,
