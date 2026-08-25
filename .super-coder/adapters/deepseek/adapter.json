@@ -14,6 +14,7 @@
     "commit": "b150a551b8d465e31e418e1b2eaf5e79bbb7d28e",
     "selected_seam": "stock-host-api",
     "feasibility_evidence": "assets/deepseek/stock-host-seam.json",
+    "shell_authority_contract": "assets/deepseek/dsh-shell-authority-contract.json",
     "profile_home": "$DSH_HOME or ~/.dsh"
   },
   "runtime_compatibility": {
