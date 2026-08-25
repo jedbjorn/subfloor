@@ -5,7 +5,7 @@ param(
 )
 
 $PolicyPath = Join-Path $PSScriptRoot "deepseek_dsh_windows_provenance_policy.json"
-$PolicySha256 = "1999766c891c34f9f62810e2013974b789a0be57b26115fb30de32671f3162c9"
+$PolicySha256 = "d59d7dd8f78f97fce736b75aa21d615fca75f0940a6a7f051a6b2b60de88da7f"
 $policyBytes = [System.IO.File]::ReadAllBytes($PolicyPath)
 $policyDigest = [Convert]::ToHexString(
     [System.Security.Cryptography.SHA256]::HashData($policyBytes)
@@ -14,6 +14,14 @@ if ($policyDigest -ne $PolicySha256.ToLowerInvariant()) { exit 77 }
 $Policy = ([System.Text.Encoding]::UTF8.GetString($policyBytes) |
     ConvertFrom-Json -ErrorAction Stop)
 $MaxDescriptorBytes = [Int64]$Policy.max_descriptor_bytes
+$AdapterPath = Join-Path $PSScriptRoot "deepseek_dsh_windows_native_adapter.ps1"
+$AdapterSha256 = "e2e2cda8222de2a15d0b511a633ddbc5809938fd6051aa449f5044a47797e313"
+$adapterBytes = [System.IO.File]::ReadAllBytes($AdapterPath)
+$adapterDigest = [Convert]::ToHexString(
+    [System.Security.Cryptography.SHA256]::HashData($adapterBytes)
+).ToLowerInvariant()
+if ($adapterDigest -ne $AdapterSha256) { exit 77 }
+. $AdapterPath
 
 $nativeSource = @"
 using System;
@@ -189,67 +197,31 @@ function Test-PolicyRule($Rule, $State) {
     }
 }
 
-function Read-SealedDescriptor([IntPtr]$Handle) {
-    $safe = [Microsoft.Win32.SafeHandles.SafeFileHandle]::new($Handle, $false)
-    $stream = [System.IO.FileStream]::new(
-        $safe,
-        [System.IO.FileAccess]::Read,
-        1024,
-        $false
-    )
-    $memory = [System.IO.MemoryStream]::new()
-    try {
-        $buffer = [byte[]]::new(1024)
-        while ($true) {
-            $read = $stream.Read($buffer, 0, $buffer.Length)
-            if ($read -eq 0) { break }
-            if (($memory.Length + $read) -gt $MaxDescriptorBytes) {
-                Refuse-Provenance
-            }
-            $memory.Write($buffer, 0, $read)
-        }
-        return $memory.ToArray()
-    } finally {
-        $memory.Dispose()
-        $stream.Dispose()
-    }
-}
-
 try {
     Add-Type -TypeDefinition $nativeSource
     $job = [IntPtr]::new($JobHandle)
     $descriptor = [IntPtr]::new($DescriptorHandle)
     $inExpectedJob = $false
-    if (-not [ScDshJobProbe]::IsProcessInJob(
+    $membershipQuerySucceeded = [ScDshJobProbe]::IsProcessInJob(
             [ScDshJobProbe]::GetCurrentProcess(),
             $job,
-            [ref]$inExpectedJob)) {
-        Refuse-Provenance
-    }
+            [ref]$inExpectedJob)
     $flags = [ScDshJobProbe]::LimitFlags($job)
-    $breakaway = (
-        [ScDshJobProbe]::JOB_OBJECT_LIMIT_BREAKAWAY_OK -bor
-        [ScDshJobProbe]::JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK
-    )
-    $permitsBreakaway = (($flags -band $breakaway) -ne 0)
-    $handleType = if ([ScDshJobProbe]::GetFileType($descriptor) -eq
-        [ScDshJobProbe]::FILE_TYPE_PIPE) { "pipe" } else { "other" }
+    $fileType = [ScDshJobProbe]::GetFileType($descriptor)
     $access = [ScDshJobProbe]::GrantedAccess($descriptor)
-    $readable = (($access -band [ScDshJobProbe]::FILE_READ_DATA) -ne 0)
-    $descriptorWritable = (
-        ($access -band [ScDshJobProbe]::FORBIDDEN_WRITE_ACCESS) -ne 0
-    )
+    $nativeArguments = @{
+        Policy = $Policy
+        MembershipQuerySucceeded = $membershipQuerySucceeded
+        JobMember = $inExpectedJob
+        LimitFlags = $flags
+        FileType = $fileType
+        GrantedAccess = $access
+    }
+    $nativeFacts = ConvertTo-ScDshNativeFacts @nativeArguments
     $state = @{
         policy = $Policy
         payload = $null
-        facts = [PSCustomObject]@{
-            job_member = $inExpectedJob
-            breakaway = $permitsBreakaway
-            handle_type = $handleType
-            readable = $readable
-            descriptor_writable = $descriptorWritable
-            signature_valid = $false
-        }
+        facts = $nativeFacts
         context = $null
     }
     foreach ($rule in $Policy.rules) {
@@ -259,14 +231,15 @@ try {
         }
     }
 
-    $envelopeBytes = Read-SealedDescriptor $descriptor
+    $readArguments = @{
+        Handle = $descriptor
+        MaxBytes = $MaxDescriptorBytes
+        TimeoutMs = [Int32]$Policy.descriptor_read_timeout_ms
+        EnvelopeHeader = $Policy.envelope_header
+    }
+    $envelopeBytes = Read-ScDshFramedDescriptor @readArguments
     $envelopeText = [System.Text.Encoding]::ASCII.GetString($envelopeBytes)
     $lines = $envelopeText.Split([char]10)
-    if ($lines.Count -ne 4 -or
-            $lines[0] -ne $Policy.envelope_header -or
-            $lines[3] -ne "") {
-        Refuse-Provenance
-    }
     $payloadBytes = [Convert]::FromBase64String($lines[1])
     $signature = [Convert]::FromBase64String($lines[2])
     if ([Convert]::ToBase64String($payloadBytes) -ne $lines[1] -or

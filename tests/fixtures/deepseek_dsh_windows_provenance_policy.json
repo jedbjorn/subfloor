@@ -2,6 +2,14 @@
   "contract": "sc-dsh-windows-job-object-v2",
   "envelope_header": "SC-DSH-DESCRIPTOR-V2",
   "max_descriptor_bytes": 8192,
+  "descriptor_read_timeout_ms": 250,
+  "native_adapter": {
+    "job_object_limit_breakaway_ok": 2048,
+    "job_object_limit_silent_breakaway_ok": 4096,
+    "file_type_pipe": 3,
+    "file_read_data": 1,
+    "forbidden_write_access": 1343029526
+  },
   "public_key_spki_base64": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEApfyngrNJm7UFl1H+vyoc3ov4nRFoxSkbYsrSYHEjhjE5cf7V/Pspl3sF6bPCdl98aufTxEvGqHsmSVXR6DaJ0re8+GuLFX/CBFcA77L0kX9EDWsHQlb9oS5lUV8r2YNuGHDi3O/c9NzleWrSRkWHJeL2YbpyLzaObvtuRFsX/sf6IkXQmtAfM+UyuiRztN1Cbes+S+TGY+MZ4ZoK5540oVAdMMBjCBxqRtRxMl5yS7KnnApjyIBwBbFtFnGjbSVF1In8NFW8L+6m5ZMdNbMYkjQXS1UMgSihEmqwgV7r8Wj70RX40PYpqSod0Qan4luURjBrcbUmArT346UoLmbxnwIDAQAB",
   "signature": {
     "digest": "SHA256",

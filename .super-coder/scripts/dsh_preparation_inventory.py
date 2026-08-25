@@ -153,6 +153,47 @@ def _imports(tree: ast.AST) -> dict[str, str]:
     return aliases
 
 
+def _db_default_aliases(tree: ast.AST, aliases: dict[str, str]) -> dict[str, str]:
+    injected: dict[str, str] = {}
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        positional = [*node.args.posonlyargs, *node.args.args]
+        paired = zip(positional[-len(node.args.defaults):], node.args.defaults)
+        for argument, default in paired:
+            canonical = _callee(default, aliases)
+            if canonical in DB_CALLS:
+                injected[argument.arg] = canonical
+        for argument, default in zip(node.args.kwonlyargs, node.args.kw_defaults):
+            if default is None:
+                continue
+            canonical = _callee(default, aliases)
+            if canonical in DB_CALLS:
+                injected[argument.arg] = canonical
+    return injected
+
+
+def _db_factory_names(tree: ast.AST, aliases: dict[str, str]) -> set[str]:
+    factories: set[str] = set()
+    changed = True
+    while changed:
+        changed = False
+        for node in ast.walk(tree):
+            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            for returned in ast.walk(node):
+                if not isinstance(returned, ast.Return) or not isinstance(
+                    returned.value, ast.Call
+                ):
+                    continue
+                callee = _callee(returned.value.func, aliases)
+                if callee in DB_CALLS or callee in factories:
+                    before = len(factories)
+                    factories.add(node.name)
+                    changed |= len(factories) != before
+    return factories
+
+
 def _raw_callee(node: ast.AST) -> str | None:
     if isinstance(node, ast.Name):
         return node.id
@@ -287,6 +328,8 @@ def _db_execute_category(node: ast.Call) -> str:
 def _python_calls(path: Path) -> Iterable[tuple[str, set[str], int, int]]:
     tree = ast.parse(path.read_text())
     aliases = _imports(tree)
+    aliases.update(_db_default_aliases(tree, aliases))
+    db_factories = _db_factory_names(tree, aliases)
     path_receivers: set[str] = set()
     db_receivers = set(DB_RECEIVER_NAMES)
     for node in ast.walk(tree):
@@ -321,7 +364,7 @@ def _python_calls(path: Path) -> Iterable[tuple[str, set[str], int, int]]:
                     if isinstance(value.func, ast.Attribute)
                     else None
                 )
-                if callee in DB_CALLS or (
+                if callee in DB_CALLS or callee in db_factories or (
                     receiver in db_receivers
                     and value.func.attr in {"cursor", "execute"}
                 ):
@@ -356,6 +399,112 @@ def _python_calls(path: Path) -> Iterable[tuple[str, set[str], int, int]]:
         yield callee, _categories(callee, node, path_receiver=path_receiver), node.lineno, node.col_offset
 
 
+def _dispatch_route_entrypoints(root: Path) -> dict[str, set[str]]:
+    source = (root / ".super-coder/scripts/dispatch.sh").read_text()
+    start = source.rfind('\ncase "$cmd" in\n')
+    if start < 0:
+        raise ValueError("final dispatcher case not found")
+    branches = re.compile(
+        r"^  ([A-Za-z0-9*?_|-]+)\)(.*?)(?="
+        r"^  [A-Za-z0-9*?_|-]+\)|^esac)",
+        re.MULTILINE | re.DOTALL,
+    )
+    entrypoints: dict[str, set[str]] = defaultdict(set)
+    for match in branches.finditer(source[start:]):
+        label, body = match.groups()
+        for route in label.split("|"):
+            if route in {"*", "help", "-h", "--help"}:
+                continue
+            for script in re.findall(
+                r'(?:\$S/|scripts/)([A-Za-z0-9_./-]+\.py)', body
+            ):
+                entrypoints[route].add(f".super-coder/scripts/{script}")
+    return entrypoints
+
+
+def _flatten_route_policy(contract: dict[str, object]) -> dict[str, str]:
+    public = contract["public_command_policy"]
+    routes: dict[str, str] = {}
+    for outcome in ("identity_neutral_read_only", "dsh_shell_authorized", "refused"):
+        for route in public[outcome]:
+            for expanded in str(route).split("|"):
+                routes[expanded] = outcome
+    for command, outcomes in public["selector_policies"].items():
+        for outcome, selectors in outcomes.items():
+            for selector in selectors:
+                routes[f"{command}:{selector}"] = outcome
+    return routes
+
+
+def _module_paths(root: Path) -> dict[str, str]:
+    modules: dict[str, str] = {}
+    for base, prefix in (
+        (root / ".super-coder/scripts", ""),
+        (root / ".super-coder/api", "api."),
+    ):
+        for path in base.rglob("*.py"):
+            relative_module = ".".join(path.relative_to(base).with_suffix("").parts)
+            relative_path = str(path.relative_to(root))
+            modules[f"{prefix}{relative_module}"] = relative_path
+            if prefix:
+                modules.setdefault(relative_module, relative_path)
+    return modules
+
+
+def _import_graph(root: Path, files: Iterable[Path]) -> dict[str, set[str]]:
+    modules = _module_paths(root)
+    graph: dict[str, set[str]] = defaultdict(set)
+    for path in files:
+        if path.suffix != ".py":
+            continue
+        relative = str(path.relative_to(root))
+        tree = ast.parse(path.read_text())
+        for node in ast.walk(tree):
+            names: list[str] = []
+            if isinstance(node, ast.Import):
+                names.extend(alias.name for alias in node.names)
+            elif isinstance(node, ast.ImportFrom) and node.module:
+                names.append(node.module)
+            for name in names:
+                candidate = modules.get(name)
+                if candidate is not None:
+                    graph[relative].add(candidate)
+    return graph
+
+
+def _reachable_sources(entrypoints: Iterable[str], graph: dict[str, set[str]]) -> set[str]:
+    pending = list(entrypoints)
+    reached: set[str] = set()
+    while pending:
+        path = pending.pop()
+        if path in reached:
+            continue
+        reached.add(path)
+        pending.extend(graph.get(path, set()) - reached)
+    return reached
+
+
+def _compact_effect_identifiers(identifiers: Iterable[str]) -> list[str]:
+    numbers = sorted(int(identifier.removeprefix("effect-")) for identifier in identifiers)
+    if not numbers:
+        return []
+    ranges: list[tuple[int, int]] = []
+    start = previous = numbers[0]
+    for number in numbers[1:]:
+        if number == previous + 1:
+            previous = number
+            continue
+        ranges.append((start, previous))
+        start = previous = number
+    ranges.append((start, previous))
+    return [
+        f"effect-{start:04d}"
+        if start == end
+        else f"effect-{start:04d}..effect-{end:04d}"
+        for start, end in ranges
+    ]
+
+
 def _literal_subparsers(path: Path) -> Counter[str]:
     tree = ast.parse(path.read_text())
     values = []
@@ -373,7 +522,9 @@ def _literal_subparsers(path: Path) -> Counter[str]:
     return Counter(values)
 
 
-def build_inventory(root: Path) -> dict[str, object]:
+def build_inventory(
+    root: Path, *, policy_contract: dict[str, object] | None = None
+) -> dict[str, object]:
     files = source_files(root)
     sc_signals: dict[str, set[str]] = defaultdict(set)
     effect_paths: dict[str, set[str]] = defaultdict(set)
@@ -425,9 +576,7 @@ def build_inventory(root: Path) -> dict[str, object]:
                 effect_paths[category].add(relative)
             if categories:
                 callsite = f"{relative}:{line}:{column}:{callee}"
-                effect_callsites[callsite] = (
-                    f"{','.join(sorted(categories))}|dsh_shell_authorized"
-                )
+                effect_callsites[callsite] = ",".join(sorted(categories))
 
     if unclassified_risky_calls:
         raise ValueError(
@@ -454,6 +603,73 @@ def build_inventory(root: Path) -> dict[str, object]:
             )
             for subcommand in counters
         }
+    route_entrypoints: dict[str, list[str]] = {}
+    route_source_reachability: dict[str, list[str]] = {}
+    route_effect_bindings: dict[str, dict[str, object]] = {}
+    direct_consumer_policy: dict[str, str] = {}
+    if policy_contract is not None:
+        routes = _flatten_route_policy(policy_contract)
+        base_entrypoints = _dispatch_route_entrypoints(root)
+        literal_policies = policy_contract.get("literal_subcommand_policy", {})
+        for command, entries in base_entrypoints.items():
+            for entry in entries:
+                for selector, outcome in literal_policies.get(entry, {}).items():
+                    routes[f"{command}:{selector}"] = outcome
+        for surface, selectors in policy_contract.get(
+            "custom_subcommand_policy", {}
+        ).items():
+            command = surface.split(".", 1)[0]
+            if command not in base_entrypoints:
+                continue
+            prefix = surface.split(".", 1)[1] + ":" if "." in surface else ""
+            for selector, outcome in selectors.items():
+                routes[f"{command}:{prefix}{selector}"] = outcome
+        for route in routes:
+            command = route.split(":", 1)[0]
+            entries = base_entrypoints.get(command, set())
+            if entries:
+                route_entrypoints[route] = sorted(entries)
+        graph = _import_graph(root, files)
+        callsite_ids = {
+            callsite: f"effect-{index:04d}"
+            for index, callsite in enumerate(sorted(effect_callsites), 1)
+        }
+        callsites_by_path: dict[str, list[str]] = defaultdict(list)
+        for callsite in effect_callsites:
+            callsites_by_path[callsite.rsplit(":", 3)[0]].append(callsite)
+        bound_callsites: set[str] = set()
+        for route, entries in route_entrypoints.items():
+            reached = _reachable_sources(entries, graph)
+            route_source_reachability[route] = sorted(reached)
+            outcome = routes[route]
+            route_callsites: set[str] = set()
+            for path in reached:
+                for callsite in callsites_by_path.get(path, []):
+                    bound_callsites.add(callsite)
+                    route_callsites.add(callsite_ids[callsite])
+            route_effect_bindings[route] = {
+                "effect_callsite_ranges": _compact_effect_identifiers(
+                    route_callsites
+                ),
+                "route_outcome": outcome,
+                "post_guard_reachability": (
+                    "guard_required_before_effect"
+                    if outcome == "dsh_shell_authorized"
+                    else "zero_after_route_refusal"
+                ),
+            }
+        direct_callsites: dict[str, list[str]] = defaultdict(list)
+        for callsite in sorted(set(effect_callsites) - bound_callsites):
+            path = callsite.rsplit(":", 3)[0]
+            route = f"direct:{path}"
+            direct_consumer_policy[route] = "refused"
+            direct_callsites[route].append(callsite_ids[callsite])
+        for route, identifiers in direct_callsites.items():
+            route_effect_bindings[route] = {
+                "effect_callsite_ranges": _compact_effect_identifiers(identifiers),
+                "route_outcome": "refused",
+                "post_guard_reachability": "zero_after_route_refusal",
+            }
     return {
         "source_sha256_inventory": source_hashes,
         "direct_sc_signal_inventory": {
@@ -480,12 +696,24 @@ def build_inventory(root: Path) -> dict[str, object]:
         "risky_call_classification": dict(sorted(risky_classification.items())),
         "risky_callsite_inventory": dict(sorted(risky_callsites.items())),
         "effect_callsite_inventory": dict(sorted(effect_callsites.items())),
+        "effect_callsite_id_inventory": {
+            identifier: callsite
+            for callsite, identifier in sorted(
+                (
+                    (callsite, f"effect-{index:04d}")
+                    for index, callsite in enumerate(sorted(effect_callsites), 1)
+                ),
+                key=lambda item: item[1],
+            )
+        },
+        "route_entrypoint_inventory": dict(sorted(route_entrypoints.items())),
+        "route_source_reachability": dict(sorted(route_source_reachability.items())),
+        "direct_consumer_policy": dict(sorted(direct_consumer_policy.items())),
+        "route_effect_binding_inventory": dict(sorted(route_effect_bindings.items())),
         "effect_callsite_policy_rule": (
-            "every effect, credential-discovery, and identity-discovery callsite "
-            "may execute under DSH only after its public route resolves to "
-            "dsh_shell_authorized and the complete guard succeeds; bounded neutral "
-            "calls are identity_neutral_read_only; refused and neutral routes must "
-            "reach zero protected callsites"
+            "each route-to-callsite edge inherits its route outcome; authorized "
+            "edges require the complete guard before effect, while refused, neutral, "
+            "and fail-closed direct-consumer edges have zero post-guard reachability"
         ),
         "effect_detector_vocabulary": {
             "filesystem_read_methods": sorted(FILESYSTEM_READ_METHODS),
@@ -515,10 +743,15 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--root", type=Path, required=True)
     parser.add_argument("--contract", type=Path)
+    parser.add_argument("--policy-contract", type=Path)
     args = parser.parse_args()
-    inventory = build_inventory(args.root.resolve())
+    policy_path = args.policy_contract or args.contract
+    policy_contract = json.loads(policy_path.read_text()) if policy_path else None
+    inventory = build_inventory(
+        args.root.resolve(), policy_contract=policy_contract
+    )
     if args.contract is not None:
-        contract = json.loads(args.contract.read_text())
+        contract = policy_contract
         contract.pop("direct_identity_signal_inventory", None)
         for name, value in inventory.items():
             contract[name] = value
