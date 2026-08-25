@@ -646,6 +646,102 @@ def test_candidate_managed_turn_releases_containment_only_after_exact_binding(
 
 @pytest.mark.parametrize("surface", ["browser", "sprint"])
 @pytest.mark.parametrize(
+    "code",
+    ["HARNESS_PROOF_CAPABILITY_REVOKED", "HARNESS_PROOF_CAPABILITY_STALE"],
+)
+def test_candidate_managed_reentry_revalidates_before_prompt_and_closes_unknown(
+    surface: str,
+    code: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake = FakeHost()
+    ctx = context(tmp_path, fake)
+    session_ref = DeepSeekAdapter._new_session_ref(ctx)
+    retired: list[dict[str, object]] = []
+    monkeypatch.setattr(
+        deepseek_web,
+        "preflight_candidate_execution",
+        lambda **_kwargs: {
+            "mode": "candidate",
+            "generation": 1,
+            "proof_run_id": "proof-managed",
+            "root_session_id": session_ref,
+            "plugin_contract_generation": "contract-one",
+            "binding_snapshot_generation": 0,
+            "binding_record_generation": None,
+        },
+    )
+    monkeypatch.setattr(deepseek_web, "bind_session_identity", lambda **_kwargs: {})
+
+    def refuse(**_kwargs):
+        raise deepseek_web.DeepSeekWebError(code, "proof authority refused")
+
+    monkeypatch.setattr(deepseek_web, "admit_candidate_execution", refuse)
+    monkeypatch.setattr(
+        deepseek_web,
+        "retire_session_identity",
+        lambda **kwargs: retired.append(dict(kwargs)) or {"state": "closing"},
+    )
+    adapter = DeepSeekAdapter(client_factory=lambda: fake)
+    if surface == "sprint":
+        fake.seed_session(session_ref, str(tmp_path))
+
+    with pytest.raises(AdapterError) as denied:
+        if surface == "browser":
+            adapter.start(ctx, "work")
+        else:
+            adapter.resume(session_ref, ctx, "work")
+
+    assert denied.value.code == code
+    assert [method for method, _payload in fake.calls if method == "session.prompt"] == []
+    assert retired == [{
+        "env": ctx.env,
+        "root_session_id": session_ref,
+        "quiesced": False,
+    }]
+
+
+def test_candidate_recovered_binding_starts_with_quiescence_unknown(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake = FakeHost()
+    ctx = context(tmp_path, fake)
+    session_ref = DeepSeekAdapter._new_session_ref(ctx)
+    retired: list[dict[str, object]] = []
+    monkeypatch.setattr(
+        deepseek_web,
+        "preflight_candidate_execution",
+        lambda **_kwargs: {
+            "mode": "candidate",
+            "generation": 1,
+            "proof_run_id": "proof-recovery",
+            "root_session_id": session_ref,
+            "plugin_contract_generation": "contract-one",
+            "binding_snapshot_generation": 4,
+            "binding_record_generation": 7,
+        },
+    )
+    monkeypatch.setattr(deepseek_web, "bind_session_identity", lambda **_kwargs: {})
+    monkeypatch.setattr(
+        deepseek_web,
+        "retire_session_identity",
+        lambda **kwargs: retired.append(dict(kwargs)) or {"state": "closing"},
+    )
+    adapter = DeepSeekAdapter(client_factory=lambda: fake)
+
+    adapter._bind_execution_identity(ctx, session_ref)
+    adapter.close()
+
+    assert retired == [{
+        "env": ctx.env,
+        "root_session_id": session_ref,
+        "quiesced": False,
+    }]
+
+
+@pytest.mark.parametrize("surface", ["browser", "sprint"])
+@pytest.mark.parametrize(
     ("failure", "code"),
     [
         ("stale", "HARNESS_PROOF_CAPABILITY_STALE"),

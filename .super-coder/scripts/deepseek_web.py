@@ -48,6 +48,15 @@ STOP_TIMEOUT_SECONDS = 5.0
 HTTP_TIMEOUT_SECONDS = 2.0
 RELAY_POLICY = "host-gateway-only-v1"
 GENERATION_COOKIE = "sc_deepseek_generation"
+CANDIDATE_FENCE_CODES = frozenset({
+    "HARNESS_PROOF_BINDING_MISMATCH",
+    "HARNESS_PROOF_CAPABILITY_EXPIRED",
+    "HARNESS_PROOF_CAPABILITY_MISMATCH",
+    "HARNESS_PROOF_CAPABILITY_REVOKED",
+    "HARNESS_PROOF_CAPABILITY_STALE",
+    "HARNESS_PROOF_RESTART_BINDING_MISMATCH",
+    "HARNESS_PROOF_ROOT_REFUSED",
+})
 SESSION_MUTATION_FIELDS = {
     "/api/session.create": ("sessionId",),
     "/api/session.selectModel": ("sessionId",),
@@ -1163,7 +1172,12 @@ def mint_candidate_capability(
             roots=roots,
             plugin_contract_generation=health["plugin_contract_generation"],
             ttl_seconds=ttl_seconds,
-            live_registry_roots=sorted(snapshot["records"]),
+            live_registry_roots=sorted(
+                root_session_id
+                for root_session_id, record in snapshot["records"].items()
+                if isinstance(record, Mapping)
+                and record.get("state") in {"active", "closing"}
+            ),
         )
         return {
             "mode": grant.mode,
@@ -1173,6 +1187,99 @@ def mint_candidate_capability(
             "exact_ref": grant.exact_ref,
             "plugin_contract_generation": grant.plugin_contract_generation,
         }
+    except DeepSeekIdentityError as exc:
+        raise DeepSeekWebError(exc.code, exc.detail) from exc
+
+
+def _candidate_root_terminal(root_session_id: str) -> bool:
+    state = _read_state()
+    service_port = state.get("service_port")
+    if not isinstance(service_port, int):
+        return False
+    try:
+        _host_rpc(service_port, "session.cancel", {"sessionId": root_session_id})
+    except DeepSeekWebError:
+        pass
+    for attempt in range(3):
+        if _history_is_terminal(service_port, root_session_id, 0):
+            return True
+        if attempt < 2:
+            time.sleep(0.05)
+    return False
+
+
+def _fence_candidate_capability(
+    *,
+    env: Mapping[str, str],
+    artifact: Path,
+    strict_revoke: bool,
+    require_live_root: bool,
+) -> dict[str, Any] | None:
+    registry = _identity_registry(env)
+    authority = _candidate_authority(registry)
+    contract = authority.refusal_contract(artifact=artifact)
+    roots = contract["roots"]
+    fenced = registry.begin_close_roots(
+        roots=roots,
+        require_live_root=require_live_root,
+    )
+    if require_live_root and not fenced:
+        return None
+    revoked = (
+        authority.revoke(artifact=artifact)
+        if strict_revoke
+        else authority.revoke_for_refusal(artifact=artifact)
+    )
+    outcomes: dict[str, dict[str, Any]] = {}
+    for root_session_id, receipt in fenced.items():
+        if receipt.state == "terminal":
+            outcomes[root_session_id] = {
+                "state": "terminal",
+                "record_generation": receipt.record_generation,
+            }
+            continue
+        terminal = _candidate_root_terminal(root_session_id)
+        outcomes[root_session_id] = retire_session_identity(
+            env=env,
+            root_session_id=root_session_id,
+            quiesced=terminal,
+        )
+    return {**revoked, "roots": outcomes}
+
+
+def _fence_failed_candidate(
+    *, env: Mapping[str, str], artifact: Path
+) -> None:
+    _fence_candidate_capability(
+        env=env,
+        artifact=artifact,
+        strict_revoke=False,
+        require_live_root=True,
+    )
+
+
+def revoke_candidate_capability(
+    *, env: Mapping[str, str], artifact: Path
+) -> dict[str, Any]:
+    """Revoke current proof authority and close every enumerated live root."""
+    if not artifact.is_absolute() or len(artifact.parents) < 2:
+        raise DeepSeekWebError(
+            "HARNESS_PROOF_CAPABILITY_UNSAFE",
+            "proof capability path must be absolute",
+        )
+    try:
+        result = _fence_candidate_capability(
+            env=env,
+            artifact=artifact,
+            strict_revoke=True,
+            require_live_root=False,
+        )
+        if result is None:
+            raise DeepSeekIdentityError(
+                "HARNESS_PROOF_CAPABILITY_INVALID",
+                "proof capability revocation produced no receipt",
+            )
+        return result
     except DeepSeekIdentityError as exc:
         raise DeepSeekWebError(exc.code, exc.detail) from exc
 
@@ -1376,6 +1483,13 @@ def bind_session_identity(
             "plugin_contract_generation": contract_generation,
         }
     except DeepSeekIdentityError as exc:
+        raw_artifact = env.get("SC_DSH_PROOF_CAPABILITY_FILE")
+        if (
+            candidate_preflight is not None
+            and raw_artifact is not None
+            and exc.code in CANDIDATE_FENCE_CODES
+        ):
+            _fence_failed_candidate(env=env, artifact=Path(raw_artifact))
         raise DeepSeekWebError(exc.code, exc.detail) from exc
 
 
@@ -1466,6 +1580,8 @@ def preflight_candidate_execution(
             "binding_record_generation": record_generation,
         }
     except DeepSeekIdentityError as exc:
+        if exc.code in CANDIDATE_FENCE_CODES:
+            _fence_failed_candidate(env=env, artifact=artifact)
         raise DeepSeekWebError(exc.code, exc.detail) from exc
 
 
@@ -1492,6 +1608,13 @@ def retire_session_identity(
         elif record.get("state") == "closing":
             closing_snapshot_generation = snapshot["snapshot_generation"]
             closing_record_generation = record["record_generation"]
+        elif record.get("state") == "terminal":
+            return {
+                "root_session_id": root_session_id,
+                "state": "terminal",
+                "lifecycle_epoch": record["lifecycle_epoch"],
+                "record_generation": record["record_generation"],
+            }
         else:
             raise DeepSeekIdentityError(
                 "HARNESS_BINDING_NOT_LIVE",
@@ -1566,6 +1689,8 @@ def admit_candidate_execution(
             plugin_contract_generation=health["plugin_contract_generation"],
         )
     except DeepSeekIdentityError as exc:
+        if exc.code in CANDIDATE_FENCE_CODES:
+            _fence_failed_candidate(env=env, artifact=artifact)
         raise DeepSeekWebError(exc.code, exc.detail) from exc
 
 

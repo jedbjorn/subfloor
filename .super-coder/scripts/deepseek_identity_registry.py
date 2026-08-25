@@ -1052,6 +1052,71 @@ class DeepSeekIdentityRegistry:
                 crash_at=crash_at,
             )
 
+    def begin_close_roots(
+        self,
+        *,
+        roots: Mapping[str, Mapping[str, Any]],
+        require_live_root: bool = False,
+        crash_at: str | None = None,
+    ) -> dict[str, TransactionReceipt]:
+        """Fence every present exact proof root in one registry commit."""
+        with self._mutation_lock():
+            snapshot = self._read_snapshot_unlocked()
+            present: dict[str, dict[str, Any]] = {}
+            for root_session_id, expected in sorted(roots.items()):
+                _validate_session(root_session_id, field="root_session_id")
+                record = snapshot["records"].get(root_session_id)
+                if record is None:
+                    continue
+                if (
+                    not isinstance(record, dict)
+                    or record.get("conversation_id")
+                    != expected.get("conversation_id")
+                    or record.get("lifecycle_epoch")
+                    != expected.get("lifecycle_epoch")
+                    or record.get("state") not in {"active", "closing", "terminal"}
+                ):
+                    raise DeepSeekIdentityError(
+                        "HARNESS_PROOF_BINDING_MISMATCH",
+                        "proof teardown found a mismatched root lifecycle",
+                )
+                present[root_session_id] = record
+            if require_live_root and not any(
+                record["state"] in {"active", "closing"}
+                for record in present.values()
+            ):
+                return {}
+            changed = False
+            for record in present.values():
+                if record["state"] == "active":
+                    record["record_generation"] += 1
+                    record["state"] = "closing"
+                    changed = True
+            if changed:
+                _crash("after_closing_update", crash_at)
+                snapshot["snapshot_generation"] += 1
+                _crash("before_registry_replace", crash_at)
+                _atomic_owner_write(
+                    self.layout.registry, _canonical_json(snapshot) + b"\n"
+                )
+                _crash("after_registry_replace", crash_at)
+            generation = snapshot["snapshot_generation"]
+            return {
+                root_session_id: TransactionReceipt(
+                    operation=(
+                        "terminal"
+                        if record["state"] == "terminal"
+                        else "closing"
+                    ),
+                    root_session_id=root_session_id,
+                    snapshot_generation=generation,
+                    record_generation=record["record_generation"],
+                    lifecycle_epoch=record["lifecycle_epoch"],
+                    state=record["state"],
+                )
+                for root_session_id, record in present.items()
+            }
+
     def retire_binding(
         self,
         *,

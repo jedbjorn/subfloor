@@ -125,6 +125,9 @@ class DeepSeekAdapter(ConversationAdapter):
         self._shell_lease: deepseek_web.ShellIdentityLease | None = None
         self._reserved_session: str | None = None
         self._proof_authority: Mapping[str, Any] | None = None
+        self._proof_context: ConversationContext | None = None
+        self._proof_session_id: str | None = None
+        self._proof_quiesced = True
 
     def _client(self) -> deepseek_host.HostTransport:
         try:
@@ -191,10 +194,52 @@ class DeepSeekAdapter(ConversationAdapter):
             worktree=context.checked_worktree(),
             candidate_preflight=proof_authority,
         )
+        same_proof_root = (
+            proof_authority is not None
+            and self._proof_context is not None
+            and self._proof_session_id == root_session_id
+        )
         self._proof_authority = proof_authority
+        if self._proof_authority is not None:
+            self._proof_context = context
+            self._proof_session_id = root_session_id
+            if not same_proof_root:
+                self._proof_quiesced = (
+                    proof_authority.get("binding_record_generation") is None
+                )
         if self._proof_authority is not None and self._shell_lease is not None:
             self._shell_lease.close()
             self._shell_lease = None
+
+    def _revalidate_proof_authority(
+        self, context: ConversationContext, root_session_id: str
+    ) -> None:
+        if self._proof_authority is None:
+            return
+        try:
+            admitted = deepseek_web.admit_candidate_execution(
+                env=context.env,
+                root_session_id=root_session_id,
+                conversation_id=self._conversation_id(context),
+                lifecycle_epoch=context.lifecycle_epoch,
+            )
+        except deepseek_web.DeepSeekWebError as exc:
+            raise AdapterError(exc.code, exc.detail) from exc
+        expected = {
+            key: self._proof_authority.get(key)
+            for key in (
+                "mode",
+                "generation",
+                "proof_run_id",
+                "root_session_id",
+                "plugin_contract_generation",
+            )
+        }
+        if admitted != expected:
+            raise AdapterError(
+                "HARNESS_PROOF_CAPABILITY_STALE",
+                "proof capability changed before the managed effect",
+            )
 
     def _require_recovery_target(
         self,
@@ -683,6 +728,9 @@ class DeepSeekAdapter(ConversationAdapter):
                 str(context.checked_worktree()),
                 workspace_id,
             )
+            if self._proof_authority is not None:
+                self._proof_quiesced = False
+                self._revalidate_proof_authority(context, session_ref)
             accepted = client.call(
                 "session.prompt",
                 {
@@ -695,6 +743,8 @@ class DeepSeekAdapter(ConversationAdapter):
             stream.close()
             raise
         if not isinstance(accepted, Mapping) or accepted.get("accepted") is not True:
+            if self._proof_authority is not None:
+                self._proof_quiesced = True
             stream.close()
             raise AdapterError(
                 "HARNESS_PROTOCOL_ERROR", "DeepSeek Host did not accept the prompt"
@@ -896,6 +946,8 @@ class DeepSeekAdapter(ConversationAdapter):
                 native_type,
             )]
         if native_type == "turn/end":
+            if self._proof_authority is not None:
+                self._proof_quiesced = True
             reason = data.get("reason")
             kind = reason.get("kind") if isinstance(reason, Mapping) else None
             if kind == "completed":
@@ -1048,6 +1100,15 @@ class DeepSeekAdapter(ConversationAdapter):
         client = turn.metadata.get("client")
         if client is None:
             return InterruptResult(False, "DeepSeek Host client is unavailable")
+        context = turn.metadata.get("context")
+        if self._proof_authority is not None:
+            if not isinstance(context, ConversationContext):
+                raise AdapterError(
+                    "HARNESS_IDENTITY_MISSING",
+                    "candidate cancellation lacks its exact conversation context",
+                )
+            self._revalidate_proof_authority(context, turn.session_ref)
+            self._proof_quiesced = False
         try:
             result = client.call("session.cancel", {"sessionId": turn.session_ref})
         except deepseek_host.DeepSeekHostError as exc:
@@ -1161,6 +1222,8 @@ class DeepSeekAdapter(ConversationAdapter):
             raise _adapter_error(exc) from exc
         boundary = _run_boundary(turn.run_ref)
         outcome, proven, interrupt = self._history_outcome(events, boundary)
+        if self._proof_authority is not None:
+            self._proof_quiesced = proven and outcome not in {"running", "unknown"}
         return ReconcileResult(
             outcome,
             proven,
@@ -1176,6 +1239,20 @@ class DeepSeekAdapter(ConversationAdapter):
         )
 
     def close(self) -> None:
+        close_error: AdapterError | None = None
+        if (
+            self._proof_authority is not None
+            and self._proof_context is not None
+            and self._proof_session_id is not None
+        ):
+            try:
+                deepseek_web.retire_session_identity(
+                    env=self._proof_context.env,
+                    root_session_id=self._proof_session_id,
+                    quiesced=self._proof_quiesced,
+                )
+            except deepseek_web.DeepSeekWebError as exc:
+                close_error = AdapterError(exc.code, exc.detail)
         if self._reserved_session is not None:
             deepseek_web.release_managed_session(self._reserved_session)
             self._reserved_session = None
@@ -1183,3 +1260,8 @@ class DeepSeekAdapter(ConversationAdapter):
             self._shell_lease.close()
             self._shell_lease = None
         self._proof_authority = None
+        self._proof_context = None
+        self._proof_session_id = None
+        self._proof_quiesced = True
+        if close_error is not None:
+            raise close_error

@@ -340,6 +340,19 @@ class DeepSeekCandidateAuthority:
                 ],
             }
 
+    def refusal_contract(self, *, artifact: Path) -> dict[str, Any]:
+        """Return current roots for fail-closed teardown of any owned generation."""
+        _raw, _token, presented_generation = self._presented(artifact)
+        with self._locked():
+            state = self._read_state()
+            return {
+                "state": state["state"],
+                "generation": state["generation"],
+                "presented_generation": presented_generation,
+                "proof_run_id": state["proof_run_id"],
+                "roots": json.loads(json.dumps(state["roots"])),
+            }
+
     def admit(
         self,
         *,
@@ -513,5 +526,21 @@ class DeepSeekCandidateAuthority:
             return {
                 "state": "revoked",
                 "generation": generation,
+                "proof_run_id": state["proof_run_id"],
+            }
+
+    def revoke_for_refusal(self, *, artifact: Path) -> dict[str, Any]:
+        """Revoke the current proof run after its owned roots were fenced."""
+        self._presented(artifact)
+        with self._locked():
+            state = self._read_state()
+            if state.get("state") == "active":
+                state["state"] = "revoked"
+                state["revoked_at"] = _stamp(self.clock())
+                state["token_sha256"] = None
+                _atomic_owner_write(self.state_path, _canonical(state) + b"\n")
+            return {
+                "state": state["state"],
+                "generation": state["generation"],
                 "proof_run_id": state["proof_run_id"],
             }
