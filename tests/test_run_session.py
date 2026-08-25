@@ -194,6 +194,60 @@ class ShellPathTest(unittest.TestCase):
         )
         self.assertEqual(warning, "")
 
+    def test_sibling_worktree_symlinked_environment_is_omitted(self) -> None:
+        sibling_venv = self.root / ".sc-worktrees" / "dev2" / ".venv"
+        sibling_bin = sibling_venv / "bin"
+        sibling_bin.mkdir(parents=True)
+        sibling_python = sibling_bin / "python"
+        sibling_python.write_text("probe fixture")
+        sibling_python.chmod(0o755)
+        (self.worktree / ".venv").symlink_to(
+            Path("..") / "dev2" / ".venv"
+        )
+        stderr = io.StringIO()
+
+        with mock.patch.object(
+            run.subprocess,
+            "run",
+            return_value=self._completed_probe(prefix=sibling_venv),
+        ) as probe, redirect_stderr(stderr):
+            path = run._shell_path(
+                self.worktree, "/usr/local/bin:/usr/bin"
+            )
+
+        self.assertEqual(path, f"{self.root}:/usr/local/bin:/usr/bin")
+        self.assertIn("symlinked .venv root", stderr.getvalue())
+        self.assertIn("run `sc deps`", stderr.getvalue())
+        probe.assert_not_called()
+
+    def test_symlinked_bin_escape_is_omitted(self) -> None:
+        project_venv = self.worktree / ".venv"
+        project_venv.mkdir()
+        sibling_bin = (
+            self.root / ".sc-worktrees" / "dev2" / ".venv" / "bin"
+        )
+        sibling_bin.mkdir(parents=True)
+        sibling_python = sibling_bin / "python"
+        sibling_python.write_text("probe fixture")
+        sibling_python.chmod(0o755)
+        (project_venv / "bin").symlink_to(sibling_bin)
+        stderr = io.StringIO()
+
+        with mock.patch.object(
+            run.subprocess,
+            "run",
+            return_value=self._completed_probe(prefix=project_venv),
+        ) as probe, redirect_stderr(stderr):
+            path = run._shell_path(
+                self.worktree, "/usr/local/bin:/usr/bin"
+            )
+
+        self.assertEqual(path, f"{self.root}:/usr/local/bin:/usr/bin")
+        warning = stderr.getvalue()
+        self.assertIn(".venv/bin resolves outside assigned .venv", warning)
+        self.assertIn("run `sc deps`", warning)
+        probe.assert_not_called()
+
     def test_absent_environment_is_omitted_without_warning(self) -> None:
         path, warning = self._path_and_warning()
         self.assertEqual(path, f"{self.root}:/usr/local/bin:/usr/bin")

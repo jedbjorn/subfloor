@@ -1274,10 +1274,29 @@ def _probe_worktree_venv(work_dir: Path) -> VenvEligibility:
     """Read-only proof that the assigned worktree owns a viable Python 3.14 venv."""
     venv = work_dir / ".venv"
     project_bin = venv / "bin"
+    if venv.is_symlink():
+        return VenvEligibility(None, "symlinked .venv root")
     if not project_bin.exists() and not project_bin.is_symlink():
         return VenvEligibility(None, None)
     if not project_bin.is_dir():
         return VenvEligibility(None, ".venv/bin is not a directory")
+
+    try:
+        assigned_root = work_dir.resolve(strict=True)
+        selected_venv = venv.resolve(strict=True)
+        selected_bin = project_bin.resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        return VenvEligibility(
+            None, f"unresolvable .venv containment ({exc})"
+        )
+    if selected_venv != assigned_root / ".venv":
+        return VenvEligibility(
+            None, ".venv resolves outside assigned worktree"
+        )
+    if selected_bin != selected_venv / "bin":
+        return VenvEligibility(
+            None, ".venv/bin resolves outside assigned .venv"
+        )
 
     python = project_bin / "python"
     try:
