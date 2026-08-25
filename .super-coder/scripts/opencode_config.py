@@ -33,7 +33,14 @@ def canonical_variant_options(
         ):
             return None
         if value.get("reasoningEffort") not in {
-            None, "none", "minimal", "low", "medium", "high", "xhigh",
+            None,
+            "none",
+            "minimal",
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max",
         }:
             return None
         if value.get("reasoningSummary") not in {

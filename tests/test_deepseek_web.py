@@ -9,6 +9,8 @@ import json
 import socket
 import sys
 import tempfile
+import threading
+import time
 from contextlib import suppress
 from pathlib import Path
 from unittest import mock
@@ -548,6 +550,31 @@ def test_shell_identity_lease_refuses_an_overlapping_owner() -> None:
 
         second = deepseek_web.acquire_shell_identity(env=env)
         second.close()
+
+
+def test_managed_identity_wait_queues_until_overlapping_owner_releases() -> None:
+    with tempfile.TemporaryDirectory() as raw:
+        env = {**service_env(Path(raw))}
+        first = deepseek_web.acquire_shell_identity(env=env)
+        acquired = threading.Event()
+        second: list[deepseek_web.ShellIdentityLease] = []
+
+        def wait_for_identity() -> None:
+            second.append(
+                deepseek_web.acquire_shell_identity(env=env, wait_seconds=1.0)
+            )
+            acquired.set()
+
+        worker = threading.Thread(target=wait_for_identity)
+        worker.start()
+        time.sleep(0.1)
+        assert not acquired.is_set()
+        first.close()
+        worker.join(timeout=2)
+
+        assert acquired.is_set()
+        assert len(second) == 1
+        second[0].close()
 
 
 def test_two_canonical_shells_refuse_before_host_or_workflow_side_effects() -> None:

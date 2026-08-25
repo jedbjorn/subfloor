@@ -25,7 +25,11 @@ from conversation_adapters.base import (  # noqa: E402
     ConversationContext,
     NativeTurn,
 )
-from conversation_adapters.deepseek import DeepSeekAdapter, _run_ref  # noqa: E402
+from conversation_adapters.deepseek import (  # noqa: E402
+    MANAGED_IDENTITY_WAIT_SECONDS,
+    DeepSeekAdapter,
+    _run_ref,
+)
 
 REAL_RESERVE_MANAGED_SESSION = deepseek_web.reserve_managed_session
 REAL_RELEASE_MANAGED_SESSION = deepseek_web.release_managed_session
@@ -538,6 +542,28 @@ def test_browser_start_stream_and_exact_call_order(tmp_path: Path) -> None:
         for method, payload in live.calls
     )
     assert live.streams[0].closed
+
+
+def test_managed_browser_queues_for_the_shared_host_identity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    captured: list[float] = []
+
+    class Lease:
+        def close(self) -> None:
+            return None
+
+    def acquire(**kwargs):
+        captured.append(kwargs["wait_seconds"])
+        return Lease()
+
+    monkeypatch.setattr(deepseek_web, "acquire_shell_identity", acquire)
+    live = FakeHost()
+    adapter = DeepSeekAdapter(client_factory=lambda: live)
+    adapter._managed_client(context(tmp_path, live))
+    adapter.close()
+
+    assert captured == [MANAGED_IDENTITY_WAIT_SECONDS]
 
 
 def test_start_reserves_the_deterministic_session_before_host_publication(

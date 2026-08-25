@@ -199,20 +199,37 @@ def _clear_terminal_unproven(env: Mapping[str, str]) -> None:
         pass
 
 
-def acquire_shell_identity(*, env: Mapping[str, str]) -> ShellIdentityLease:
-    """Acquire the full-lifetime Host identity lease or refuse before mutation."""
+def acquire_shell_identity(
+    *,
+    env: Mapping[str, str],
+    wait_seconds: float = 0.0,
+) -> ShellIdentityLease:
+    """Acquire the full-lifetime Host identity lease before any mutation.
+
+    Native Web and one-shot callers retain the fail-fast default. Managed
+    Managed conversation turns may opt into a bounded wait so simultaneous wake
+    turns serialize at the shared stock Host identity boundary.
+    """
+    if wait_seconds < 0:
+        raise ValueError("DeepSeek identity wait must be non-negative")
     path = _identity_lock_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     handle = path.open("a+")
     os.chmod(path, 0o600)
-    try:
-        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except BlockingIOError as exc:
-        handle.close()
-        raise DeepSeekWebError(
-            "HARNESS_SHELL_IDENTITY_BUSY",
-            "another DeepSeek execution owns the shared Host credential",
-        ) from exc
+    deadline = time.monotonic() + wait_seconds
+    while True:
+        try:
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            break
+        except BlockingIOError as exc:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                handle.close()
+                raise DeepSeekWebError(
+                    "HARNESS_SHELL_IDENTITY_BUSY",
+                    "another DeepSeek execution owns the shared Host credential",
+                ) from exc
+            time.sleep(min(0.05, remaining))
     try:
         _clear_terminal_unproven(env)
     except Exception:
