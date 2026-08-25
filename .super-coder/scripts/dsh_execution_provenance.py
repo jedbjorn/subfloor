@@ -28,12 +28,13 @@ from dataclasses import dataclass
 from pathlib import Path
 
 CONTRACT = "sc-dsh-linux-cgroup-v2-v2"
+PRODUCTION_CONTRACT = "sc-dsh-linux-cgroup-v2-v3"
 ISSUER_CONTRACT = "sc-dsh-prototype-issuer-key-v1"
 ISSUER_ALGORITHM = "rsa-pkcs1v15-sha256"
 IDENTITY_CONTRACT = "sc-dsh-prototype-current-identity-v1"
 CREDENTIAL_CONTRACT = "sc-dsh-prototype-credential-v1"
-DOMAIN_PREFIX = "/sc-dsh/"
 DOMAIN_NAME = re.compile(r"[a-f0-9]{32}\.scope")
+DESCRIPTOR_FD = 198
 SHORTNAME = re.compile(r"[A-Z][A-Z0-9_-]{1,31}")
 SHA256_DIGEST_INFO = bytes.fromhex("3031300d060960864801650304020105000420")
 REQUIRED_SEALS = (
@@ -53,6 +54,28 @@ REFUSED_CLASS = "refused"
 class Resolution:
     provenance: str
     reason: str
+    context: ExecutionDomainContext | None = None
+
+
+@dataclass(frozen=True)
+class ExecutionDomainContext:
+    cgroup: str
+    domain_id: str
+    fork_id: str
+    profile_id: str
+    registry_snapshot_generation: int
+    execution_session_id: str
+    root_session_id: str
+    conversation_id: str
+    lifecycle_epoch: int
+    shell_id: int
+    shell_shortname: str
+    shell_worktree: str
+    api_base: str
+    credential_file: str
+    binding_record_generation: int
+    plugin_contract_generation: str
+    lineage_record_generation: int | None
 
 
 @dataclass(frozen=True)
@@ -141,7 +164,7 @@ def _sealed_descriptor(fd: int) -> dict[str, object]:
     if not payload or len(payload) > 65_536:
         raise ValueError("execution descriptor has an invalid size")
     data = json.loads(payload)
-    expected = {
+    prototype = {
         "contract",
         "cgroup",
         "domain_id",
@@ -156,8 +179,48 @@ def _sealed_descriptor(fd: int) -> dict[str, object]:
         "cgroup_owner_uid",
         "signature",
     }
+    production = {
+        "contract",
+        "cgroup",
+        "domain_id",
+        "descriptor_device",
+        "descriptor_inode",
+        "expires_monotonic_ns",
+        "non_delegated",
+        "cgroup_device",
+        "cgroup_inode",
+        "cgroup_owner_uid",
+        "issuer_pid",
+        "issuer_start_ticks",
+        "host_pid",
+        "host_start_ticks",
+        "root_pid",
+        "root_start_ticks",
+        "fork_id",
+        "profile_id",
+        "registry_snapshot_generation",
+        "execution_session_id",
+        "root_session_id",
+        "conversation_id",
+        "lifecycle_epoch",
+        "shell_id",
+        "shell_shortname",
+        "shell_worktree",
+        "api_base",
+        "credential_file",
+        "binding_record_generation",
+        "plugin_contract_generation",
+        "lineage_record_generation",
+    }
+    expected = production if data.get("contract") == PRODUCTION_CONTRACT else prototype
     if set(data) != expected:
         raise ValueError("execution descriptor has an unknown schema")
+    opened = os.fstat(fd)
+    if data.get("contract") == PRODUCTION_CONTRACT and (
+        data["descriptor_device"] != opened.st_dev
+        or data["descriptor_inode"] != opened.st_ino
+    ):
+        raise ValueError("execution descriptor file identity mismatches")
     return data
 
 
@@ -247,12 +310,73 @@ def _require_root_lineage(
     raise ValueError("current process is outside the issued execution lineage")
 
 
+def _verify_live_issuer(
+    descriptor: Mapping[str, object],
+    *,
+    descriptor_fd: int,
+    issuer_identity: Path,
+    process_root: Path,
+) -> None:
+    with _owner_json(issuer_identity, "execution issuer identity") as identity:
+        expected = {
+            "contract",
+            "fork_id",
+            "profile_id",
+            "host_boot_generation",
+            "host_pid",
+            "host_start_ticks",
+            "observed_at",
+        }
+        if set(identity.data) != expected:
+            raise ValueError("execution issuer identity has an unknown schema")
+        if identity.data["contract"] != "sc-dsh-host-identity-v1":
+            raise ValueError("execution issuer identity contract is stale")
+        for name in ("fork_id", "profile_id", "host_pid", "host_start_ticks"):
+            if descriptor[name] != identity.data[name]:
+                raise ValueError("execution descriptor names another Host issuer")
+
+    issuer_pid = descriptor["issuer_pid"]
+    issuer_ticks = descriptor["issuer_start_ticks"]
+    host_pid = descriptor["host_pid"]
+    host_ticks = descriptor["host_start_ticks"]
+    root_pid = descriptor["root_pid"]
+    root_ticks = descriptor["root_start_ticks"]
+    if any(
+        not isinstance(value, int) or isinstance(value, bool) or value < 1
+        for value in (
+            issuer_pid,
+            issuer_ticks,
+            host_pid,
+            host_ticks,
+            root_pid,
+            root_ticks,
+        )
+    ):
+        raise ValueError("execution issuer lineage is malformed")
+    issuer_parent, observed_issuer_ticks = _process_identity(process_root, issuer_pid)
+    _host_parent, observed_host_ticks = _process_identity(process_root, host_pid)
+    root_parent, observed_root_ticks = _process_identity(process_root, root_pid)
+    if (
+        issuer_parent != host_pid
+        or observed_issuer_ticks != issuer_ticks
+        or observed_host_ticks != host_ticks
+        or root_parent != issuer_pid
+        or observed_root_ticks != root_ticks
+    ):
+        raise ValueError("execution issuer lineage is not live")
+    inherited = (process_root / str(issuer_pid) / "fd" / str(DESCRIPTOR_FD)).stat()
+    opened = os.fstat(descriptor_fd)
+    if (inherited.st_dev, inherited.st_ino) != (opened.st_dev, opened.st_ino):
+        raise ValueError("execution issuer does not hold this descriptor")
+
+
 def _managed_resolution(
     membership: str,
     *,
     cgroup_root: Path,
     descriptor_fd: int | None,
     issuer_key: Path | None,
+    issuer_identity: Path | None,
     process_root: Path,
     now_monotonic_ns: int,
 ) -> Resolution:
@@ -260,13 +384,23 @@ def _managed_resolution(
         return Resolution("unknown", "managed membership has no descriptor")
     try:
         descriptor = _sealed_descriptor(descriptor_fd)
-        if issuer_key is None:
-            raise ValueError("managed membership has no trusted prototype issuer")
-        _verify_issuer_signature(descriptor, issuer_key)
+        if descriptor["contract"] == PRODUCTION_CONTRACT:
+            if issuer_identity is None:
+                raise ValueError("managed membership has no live production issuer")
+            _verify_live_issuer(
+                descriptor,
+                descriptor_fd=descriptor_fd,
+                issuer_identity=issuer_identity,
+                process_root=process_root,
+            )
+        else:
+            if issuer_key is None:
+                raise ValueError("managed membership has no trusted prototype issuer")
+            _verify_issuer_signature(descriptor, issuer_key)
         name = Path(membership).name
         if not DOMAIN_NAME.fullmatch(name):
             raise ValueError("managed cgroup name is malformed")
-        if descriptor["contract"] != CONTRACT:
+        if descriptor["contract"] not in {CONTRACT, PRODUCTION_CONTRACT}:
             raise ValueError("execution descriptor contract is stale")
         if descriptor["cgroup"] != membership:
             raise ValueError("execution descriptor names another cgroup")
@@ -274,9 +408,12 @@ def _managed_resolution(
             raise ValueError("execution descriptor domain identity mismatches")
         if descriptor["non_delegated"] is not True:
             raise ValueError("execution domain is delegated")
-        if not isinstance(descriptor["binding_generation"], int):
+        binding_generation = descriptor.get(
+            "binding_record_generation", descriptor.get("binding_generation")
+        )
+        if not isinstance(binding_generation, int):
             raise TypeError("binding generation is malformed")
-        if descriptor["binding_generation"] < 1:
+        if binding_generation < 1:
             raise ValueError("binding generation is malformed")
         expires = descriptor["expires_monotonic_ns"]
         if not isinstance(expires, int) or expires <= now_monotonic_ns:
@@ -306,7 +443,40 @@ def _managed_resolution(
         _require_root_lineage(descriptor, process_root)
     except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
         return Resolution("unknown", str(exc))
-    return Resolution("managed", "sealed non-delegated cgroup-v2 membership")
+    context = None
+    if descriptor["contract"] == PRODUCTION_CONTRACT:
+        context = ExecutionDomainContext(
+            cgroup=str(descriptor["cgroup"]),
+            domain_id=str(descriptor["domain_id"]),
+            fork_id=str(descriptor["fork_id"]),
+            profile_id=str(descriptor["profile_id"]),
+            registry_snapshot_generation=int(
+                descriptor["registry_snapshot_generation"]
+            ),
+            execution_session_id=str(descriptor["execution_session_id"]),
+            root_session_id=str(descriptor["root_session_id"]),
+            conversation_id=str(descriptor["conversation_id"]),
+            lifecycle_epoch=int(descriptor["lifecycle_epoch"]),
+            shell_id=int(descriptor["shell_id"]),
+            shell_shortname=str(descriptor["shell_shortname"]),
+            shell_worktree=str(descriptor["shell_worktree"]),
+            api_base=str(descriptor["api_base"]),
+            credential_file=str(descriptor["credential_file"]),
+            binding_record_generation=int(
+                descriptor["binding_record_generation"]
+            ),
+            plugin_contract_generation=str(
+                descriptor["plugin_contract_generation"]
+            ),
+            lineage_record_generation=(
+                int(descriptor["lineage_record_generation"])
+                if descriptor["lineage_record_generation"] is not None
+                else None
+            ),
+        )
+    return Resolution(
+        "managed", "sealed non-delegated cgroup-v2 membership", context
+    )
 
 
 def resolve_linux(
@@ -315,6 +485,7 @@ def resolve_linux(
     cgroup_root: Path = Path("/sys/fs/cgroup"),
     descriptor_fd: int | None = None,
     issuer_key: Path | None = None,
+    issuer_identity: Path | None = None,
     process_root: Path = Path("/proc"),
     now_monotonic_ns: int | None = None,
 ) -> Resolution:
@@ -323,7 +494,7 @@ def resolve_linux(
         membership = _unified_membership(proc_cgroup.read_text())
     except (OSError, ValueError) as exc:
         return Resolution("unknown", str(exc))
-    if not membership.startswith(DOMAIN_PREFIX):
+    if "/sc-dsh/" not in membership:
         if descriptor_fd is not None:
             return Resolution("unknown", "descriptor is outside its named cgroup")
         return Resolution("native", "no managed cgroup membership")
@@ -332,6 +503,7 @@ def resolve_linux(
         cgroup_root=cgroup_root,
         descriptor_fd=descriptor_fd,
         issuer_key=issuer_key,
+        issuer_identity=issuer_identity,
         process_root=process_root,
         now_monotonic_ns=(
             time.monotonic_ns() if now_monotonic_ns is None else now_monotonic_ns
@@ -523,6 +695,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--cgroup-root", type=Path, default=Path("/sys/fs/cgroup"))
     parser.add_argument("--descriptor-fd", type=int)
     parser.add_argument("--prototype-issuer-key", type=Path)
+    parser.add_argument("--issuer-identity", type=Path)
     parser.add_argument("--process-root", type=Path, default=Path("/proc"))
     parser.add_argument("--now-monotonic-ns", type=int)
     parser.add_argument(
@@ -547,6 +720,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         cgroup_root=args.cgroup_root,
         descriptor_fd=args.descriptor_fd,
         issuer_key=args.prototype_issuer_key,
+        issuer_identity=args.issuer_identity,
         process_root=args.process_root,
         now_monotonic_ns=args.now_monotonic_ns,
     )

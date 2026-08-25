@@ -13,8 +13,24 @@ process.env.SC_DSH_HOST_BOOT_GENERATION = hostBootGeneration;
 
 const plugin = await import(pathToFileURL(pluginPath));
 let contributor;
+let observedSpec;
 const cleanup = [];
 const ctx = {
+  subprocess: {
+    spawn(spec) {
+      observedSpec = spec;
+      return {
+        pid: 1234,
+        stdin: undefined,
+        stdout: undefined,
+        stderr: undefined,
+        collected: {},
+        done: Promise.resolve({ exitCode: 0, signal: null }),
+        terminate() {},
+        async waitForExit() { return true; },
+      };
+    },
+  },
   shellEnv: {
     register(value) {
       contributor = value;
@@ -42,6 +58,18 @@ for await (const line of input) {
     const aliases = contributor.resolve({
       agent: { session: { header: { id: request.session_id } } },
     });
+    if (Array.isArray(request.spawn_argv)) {
+      const handle = ctx.subprocess.spawn({
+        argv: request.spawn_argv,
+        cwd: process.cwd(),
+        stdio: { stdin: "ignore", stdout: "pipe", stderr: "pipe" },
+        graceMs: 1000,
+        env: request.spawn_env ?? { DSH_SESSION_ID: request.session_id, ...aliases },
+      });
+      await handle.done;
+      process.stdout.write(`${JSON.stringify({ argv: observedSpec.argv })}\n`);
+      continue;
+    }
     process.stdout.write(`${JSON.stringify({ aliases })}\n`);
   } catch (error) {
     process.stdout.write(`${JSON.stringify({ error: String(error?.message ?? error) })}\n`);

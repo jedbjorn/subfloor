@@ -23,6 +23,7 @@ CONTRACT_PATH = ROOT / ".super-coder/assets/deepseek/dsh-shell-authority-contrac
 NODE_PROBE = ROOT / "tests/fixtures/deepseek_dsh_shell_env_probe.mjs"
 INVENTORY_PROBE = ROOT / ".super-coder/scripts/dsh_preparation_inventory.py"
 PROVENANCE_PROBE = ROOT / ".super-coder/scripts/dsh_execution_provenance.py"
+EXECUTION_LAUNCHER = ROOT / ".super-coder/scripts/deepseek_execution_domain.py"
 EFFECT_DRIVER = ROOT / "tests/fixtures/deepseek_dsh_effect_driver.py"
 PROTOTYPE_ISSUER_PATH = ROOT / "tests/fixtures/deepseek_dsh_prototype_issuer.py"
 SOURCE_ROOTS = (ROOT / ".super-coder/scripts", ROOT / ".super-coder/api")
@@ -448,15 +449,19 @@ class DeepSeekDshPreparationContractTests(unittest.TestCase):
                 "sprint_bound_sha256": "84056c2fc7206b83f2d3beb71150545326d5e33f557cb5f2329f55321eab0bdf",
                 "scope_decision_id": 255,
                 "drift_disposition": "retain Sprint 24 WU95 Doc 174 v3 only as replaced-binding drift evidence; Sprint 25 WU101 Doc 174 v4 and Decision 255 govern this corrected head",
-                "task_id": 648,
+                "task_id": 649,
                 "sprint_id": 25,
-                "work_unit_id": 101,
+                "work_unit_id": 107,
+                "preparation_work_unit": {
+                    "task_id": 648,
+                    "work_unit_id": 101,
+                },
                 "replaced_binding": {
                     "sprint_id": 24,
                     "work_unit_id": 95,
                     "sprint_bound_sha256": "a305eba5c73988d202e3f3f9d392d623645b3f799dfe4ab4945687026ae5a969",
                 },
-                "implementation_base": "83a1bcaaac513e24446c78bab6b41c8932610fba",
+                "implementation_base": "3dc47cd",
             },
         )
         self.assertEqual(adapter["official_runtime"]["version"], release["version"])
@@ -590,10 +595,18 @@ class DeepSeekDshPreparationContractTests(unittest.TestCase):
             },
         )
         self.assertEqual(
-            provenance["preparation_boundary"],
-            "prototype verifier and policy harness only; task 649 owns durable "
-            "issuer/domain lifecycle and task 650 owns production sc wiring",
+            provenance["production_linux_contributor"],
+            {
+                "path": ".super-coder/scripts/deepseek_execution_domain.py",
+                "sha256": sha256(EXECUTION_LAUNCHER),
+                "contract": "sc-dsh-linux-cgroup-v2-v3",
+                "descriptor_fd": 198,
+                "entry": "Wrap only a complete registry-current ToolExecution identity. Refuse partial, stale, copied, wrong-domain, dead-issuer, self-created, and self-entered evidence before user code.",
+                "teardown": "Drain or cgroup.kill the one execution domain within two seconds, remove it, and surface incomplete cleanup as failure.",
+            },
         )
+        self.assertIn("Production MUST use", provenance["preparation_boundary"])
+        self.assertIn("MUST NOT wire the prototype", provenance["preparation_boundary"])
         self.assertEqual(
             provenance["prototype_issuer_fixture"],
             {
