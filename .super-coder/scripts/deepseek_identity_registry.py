@@ -1086,9 +1086,15 @@ class DeepSeekIdentityRegistry:
         *,
         roots: Mapping[str, Mapping[str, Any]],
         require_live_root: bool = False,
+        fence_mismatch: bool = False,
         crash_at: str | None = None,
     ) -> dict[str, TransactionReceipt]:
-        """Fence every present exact proof root in one registry commit."""
+        """Fence every present exact proof root in one registry commit.
+
+        ``fence_mismatch`` is reserved for fail-closed proof teardown. Root
+        identifiers are globally non-reusable, so a lifecycle mismatch under
+        an enumerated ID is corruption to close, not foreign work to preserve.
+        """
         with self._mutation_lock():
             snapshot = self._read_snapshot_unlocked()
             present: dict[str, dict[str, Any]] = {}
@@ -1099,11 +1105,16 @@ class DeepSeekIdentityRegistry:
                     continue
                 if (
                     not isinstance(record, dict)
-                    or record.get("conversation_id")
-                    != expected.get("conversation_id")
-                    or record.get("lifecycle_epoch")
-                    != expected.get("lifecycle_epoch")
                     or record.get("state") not in {"active", "closing", "terminal"}
+                    or (
+                        not fence_mismatch
+                        and (
+                            record.get("conversation_id")
+                            != expected.get("conversation_id")
+                            or record.get("lifecycle_epoch")
+                            != expected.get("lifecycle_epoch")
+                        )
+                    )
                 ):
                     raise DeepSeekIdentityError(
                         "HARNESS_PROOF_BINDING_MISMATCH",

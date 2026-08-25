@@ -3,9 +3,11 @@ from __future__ import annotations
 
 import json
 import os
+import sqlite3
 import sys
 import tempfile
 import threading
+import hashlib
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
@@ -18,6 +20,7 @@ SCRIPTS = ROOT / ".super-coder" / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 
 import deepseek_web
+import deepseek_promotion_runner
 from conversation_adapters.base import ConversationContext, NativeTurn
 from conversation_adapters.deepseek import DeepSeekAdapter
 from deepseek_candidate_authority import DeepSeekCandidateAuthority
@@ -25,6 +28,7 @@ from deepseek_identity_registry import (
     HEALTH_CONTRACT,
     DeepSeekIdentityError,
     DeepSeekIdentityRegistry,
+    TransactionReceipt,
     plugin_contract_generation,
     process_start_ticks,
 )
@@ -59,6 +63,83 @@ def owner_json(path: Path, value: object) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(value, sort_keys=True) + "\n")
     path.chmod(0o600)
+
+
+def proof_env(
+    artifact: Path,
+    *,
+    root_session_id: str,
+    conversation_id: str,
+    lifecycle_epoch: int,
+    surface: str = "browser",
+) -> dict[str, str]:
+    authority_root = artifact.parent.parent
+    authority = json.loads((authority_root / "authority.json").read_text())
+    runner_id = "test-runner"
+    context = authority_root / "contexts" / (
+        hashlib.sha256(root_session_id.encode()).hexdigest() + ".json"
+    )
+    owner_json(
+        context,
+        {
+            "contract": deepseek_promotion_runner.CONTEXT_CONTRACT,
+            "runner_id": runner_id,
+            "proof_run_id": authority["proof_run_id"],
+            "mode": authority["mode"],
+            "surface": surface,
+            "root_session_id": root_session_id,
+            "conversation_id": conversation_id,
+            "lifecycle_epoch": lifecycle_epoch,
+            "generation": authority["generation"],
+            "artifact": str(artifact),
+        },
+    )
+    owner_json(
+        authority_root / "runner.json",
+        {
+            "contract": deepseek_promotion_runner.RUNNER_CONTRACT,
+            "state": "active",
+            "runner_id": runner_id,
+            "proof_run_id": authority["proof_run_id"],
+            "mode": authority["mode"],
+            "generation": authority["generation"],
+            "artifact": str(artifact),
+            "contexts": {root_session_id: str(context)},
+        },
+    )
+    return {"SC_DSH_PROOF_CONTEXT_FILE": str(context)}
+
+
+def runner_authorization(
+    root: Path,
+    *,
+    mode: str,
+    proof_run_id: str,
+    roots: dict[str, dict[str, object]],
+) -> dict[str, str]:
+    authority_root = root / "proof-authority"
+    token = "test-dedicated-runner-token"
+    state_path = authority_root / "runner.json"
+    owner_json(
+        state_path,
+        {
+            "contract": deepseek_promotion_runner.RUNNER_CONTRACT,
+            "state": "authorizing",
+            "runner_pid": os.getpid(),
+            "runner_start_ticks": deepseek_web.process_start_ticks(os.getpid()),
+            "runner_token_sha256": hashlib.sha256(token.encode()).hexdigest(),
+            "mode": mode,
+            "proof_run_id": proof_run_id,
+            "exact_ref": "a" * 40,
+            "roots_sha256": hashlib.sha256(
+                json.dumps(
+                    roots, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+                ).encode()
+            ).hexdigest(),
+            "acceptance": None,
+        },
+    )
+    return {"state_path": str(state_path), "token": token}
 
 
 def runtime_registry(parent: Path) -> tuple[DeepSeekIdentityRegistry, Path, str]:
@@ -102,6 +183,29 @@ def runtime_registry(parent: Path) -> tuple[DeepSeekIdentityRegistry, Path, str]
         },
     )
     return registry, worktree, generation
+
+
+def promotion_db(path: Path) -> tuple[str, str]:
+    browser = "candidate-browser-conversation"
+    sprint = "candidate-sprint-conversation"
+    con = sqlite3.connect(path)
+    try:
+        con.executescript(
+            "CREATE TABLE conversations (conversation_id TEXT PRIMARY KEY, harness TEXT);"
+            "CREATE TABLE conversation_events (conversation_id TEXT, event_type TEXT);"
+            "CREATE TABLE sprint_participant_conversations (conversation_id TEXT);"
+        )
+        con.executemany(
+            "INSERT INTO conversations VALUES (?, 'deepseek')",
+            [(browser,), (sprint,)],
+        )
+        con.execute(
+            "INSERT INTO sprint_participant_conversations VALUES (?)", (sprint,)
+        )
+        con.commit()
+    finally:
+        con.close()
+    return browser, sprint
 
 
 def durable_identity_state(
@@ -316,9 +420,10 @@ def test_runtime_admission_uses_exact_ref_live_contract_and_current_lineage(
                 },
             }}
 
-        def begin_close_roots(self, *, roots, require_live_root):
+        def begin_close_roots(self, *, roots, require_live_root, fence_mismatch):
             assert roots == ROOTS
             assert require_live_root is True
+            assert fence_mismatch is True
             return {}
 
     with tempfile.TemporaryDirectory() as raw:
@@ -331,8 +436,14 @@ def test_runtime_admission_uses_exact_ref_live_contract_and_current_lineage(
         monkeypatch.setattr(
             deepseek_web.harness_versions, "probe", lambda _harness: "0.1.1-rc.2"
         )
+        env = proof_env(
+            grant.artifact,
+            root_session_id="candidate-root-a",
+            conversation_id="conversation-a",
+            lifecycle_epoch=3,
+        )
         admitted = deepseek_web.admit_candidate_execution(
-            env={"SC_DSH_PROOF_CAPABILITY_FILE": str(grant.artifact)},
+            env=env,
             root_session_id="candidate-root-a",
             conversation_id="conversation-a",
             lifecycle_epoch=3,
@@ -347,7 +458,7 @@ def test_runtime_admission_uses_exact_ref_live_contract_and_current_lineage(
         monkeypatch.setattr(deepseek_web, "_exact_engine_ref", lambda: "b" * 40)
         with pytest.raises(deepseek_web.DeepSeekWebError) as wrong_ref:
             deepseek_web.admit_candidate_execution(
-                env={"SC_DSH_PROOF_CAPABILITY_FILE": str(grant.artifact)},
+                env=env,
                 root_session_id="candidate-root-a",
                 conversation_id="conversation-a",
                 lifecycle_epoch=3,
@@ -444,7 +555,12 @@ def test_candidate_preflight_failures_preserve_clean_state_and_fence_live_root(
             "SC_API_BASE": "http://127.0.0.1:8837",
             "SC_SHELL_ID": "4",
             "SC_SHELL_SHORTNAME": "DEV4",
-            "SC_DSH_PROOF_CAPABILITY_FILE": str(artifact),
+            **proof_env(
+                artifact,
+                root_session_id=root_session_id,
+                conversation_id=SURFACE_CONVERSATION,
+                lifecycle_epoch=1,
+            ),
         }
         before = durable_identity_state(registry, authority)
         with pytest.raises(deepseek_web.DeepSeekWebError) as refused:
@@ -511,7 +627,12 @@ def test_candidate_preflight_receipt_allows_exact_create_and_refuses_drift(
             "SC_API_BASE": "http://127.0.0.1:8837",
             "SC_SHELL_ID": "4",
             "SC_SHELL_SHORTNAME": "DEV4",
-            "SC_DSH_PROOF_CAPABILITY_FILE": str(grant.artifact),
+            **proof_env(
+                grant.artifact,
+                root_session_id=SURFACE_ROOT,
+                conversation_id=SURFACE_CONVERSATION,
+                lifecycle_epoch=1,
+            ),
         }
         preflight = deepseek_web.preflight_candidate_execution(
             env=env,
@@ -567,7 +688,12 @@ def test_candidate_preflight_receipt_allows_exact_create_and_refuses_drift(
             "SC_API_BASE": "http://127.0.0.1:8837",
             "SC_SHELL_ID": "4",
             "SC_SHELL_SHORTNAME": "DEV4",
-            "SC_DSH_PROOF_CAPABILITY_FILE": str(grant.artifact),
+            **proof_env(
+                grant.artifact,
+                root_session_id=SURFACE_ROOT,
+                conversation_id=SURFACE_CONVERSATION,
+                lifecycle_epoch=1,
+            ),
         }
         preflight = deepseek_web.preflight_candidate_execution(
             env=env,
@@ -641,7 +767,13 @@ def test_candidate_managed_terminal_retires_root_and_allows_clean_next_mint(
             "SC_API_BASE": "http://127.0.0.1:8837",
             "SC_SHELL_ID": "4",
             "SC_SHELL_SHORTNAME": "DEV4",
-            "SC_DSH_PROOF_CAPABILITY_FILE": str(grant.artifact),
+            **proof_env(
+                grant.artifact,
+                root_session_id=root_session_id,
+                conversation_id=conversation_id,
+                lifecycle_epoch=1,
+                surface=surface,
+            ),
         }
         context = ConversationContext(
             worktree=worktree,
@@ -698,19 +830,26 @@ def test_candidate_managed_terminal_retires_root_and_allows_clean_next_mint(
             env=env, artifact=grant.artifact
         )
         assert revoked["state"] == "revoked"
+        next_roots = {
+            f"{root_session_id}-next": {
+                "conversation_id": f"{conversation_id}-next",
+                "lifecycle_epoch": 1,
+                "verified_lineage": [],
+            }
+        }
         next_grant = deepseek_web.mint_candidate_capability(
             env=env,
             mode="candidate",
             disposable_baseline="arch-clean-2026-08-25",
             proof_run_id=f"proof-{surface}-next",
-            roots={
-                f"{root_session_id}-next": {
-                    "conversation_id": f"{conversation_id}-next",
-                    "lifecycle_epoch": 1,
-                    "verified_lineage": [],
-                }
-            },
+            roots=next_roots,
             ttl_seconds=600,
+            runner_authorization=runner_authorization(
+                registry.layout.root,
+                mode="candidate",
+                proof_run_id=f"proof-{surface}-next",
+                roots=next_roots,
+            ),
         )
         assert next_grant["generation"] == 1
 
@@ -759,15 +898,23 @@ def test_candidate_revocation_atomically_fences_all_roots_before_cancellation(
         monkeypatch.setattr(
             deepseek_web, "_current_dsh_version", lambda: "0.1.1-rc.2"
         )
-        env = {
+        base_env = {
             "SC_API_TOKEN": "candidate-token",
             "SC_API_BASE": "http://127.0.0.1:8837",
             "SC_SHELL_ID": "4",
             "SC_SHELL_SHORTNAME": "DEV4",
-            "SC_DSH_PROOF_CAPABILITY_FILE": str(grant.artifact),
         }
         credentials: dict[str, Path] = {}
         for root_session_id, expected in roots.items():
+            env = {
+                **base_env,
+                **proof_env(
+                    grant.artifact,
+                    root_session_id=root_session_id,
+                    conversation_id=expected["conversation_id"],
+                    lifecycle_epoch=1,
+                ),
+            }
             preflight = deepseek_web.preflight_candidate_execution(
                 env=env,
                 root_session_id=root_session_id,
@@ -841,6 +988,15 @@ def test_candidate_revocation_atomically_fences_all_roots_before_cancellation(
         )
         assert all(not credential.exists() for credential in credentials.values())
         before = registry.layout.registry.read_bytes()
+        env = {
+            **base_env,
+            **proof_env(
+                grant.artifact,
+                root_session_id="candidate-browser-root",
+                conversation_id="candidate-browser",
+                lifecycle_epoch=1,
+            ),
+        }
         with pytest.raises(deepseek_web.DeepSeekWebError) as stale:
             deepseek_web.admit_candidate_execution(
                 env=env,
@@ -909,7 +1065,12 @@ def test_failed_live_candidate_admission_revokes_and_retains_closing_root(
             "SC_API_BASE": "http://127.0.0.1:8837",
             "SC_SHELL_ID": "4",
             "SC_SHELL_SHORTNAME": "DEV4",
-            "SC_DSH_PROOF_CAPABILITY_FILE": str(grant.artifact),
+            **proof_env(
+                grant.artifact,
+                root_session_id=SURFACE_ROOT,
+                conversation_id=SURFACE_CONVERSATION,
+                lifecycle_epoch=1,
+            ),
         }
         preflight = deepseek_web.preflight_candidate_execution(
             env=env,
@@ -998,8 +1159,48 @@ def test_ordinary_runtime_never_reads_candidate_authority(
                 conversation_id="ordinary-conversation",
                 lifecycle_epoch=1,
             )
-        assert invalid.value.code == "HARNESS_PROOF_CAPABILITY_UNSAFE"
+        assert invalid.value.code == "HARNESS_PROOF_RUNNER_REQUIRED"
         assert sorted(root.glob("**/*")) == []
+
+
+def test_proof_authority_refuses_symlink_aliases_without_state_change(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with tempfile.TemporaryDirectory() as raw:
+        root = Path(raw)
+        registry, worktree, _contract = runtime_registry(root)
+        authority = DeepSeekCandidateAuthority(
+            registry.layout.root / "proof-authority"
+        )
+        grant = mint(authority)
+        env = proof_env(
+            grant.artifact,
+            root_session_id="candidate-root-a",
+            conversation_id="conversation-a",
+            lifecycle_epoch=3,
+        )
+        context_path = Path(env["SC_DSH_PROOF_CONTEXT_FILE"])
+        context_alias = root / "context-alias.json"
+        context_alias.symlink_to(context_path)
+        artifact_alias = root / "artifact-alias.json"
+        artifact_alias.symlink_to(grant.artifact)
+        before = durable_identity_state(registry, authority)
+        monkeypatch.setattr(deepseek_web, "_identity_registry", lambda _env: registry)
+
+        with pytest.raises(DeepSeekIdentityError) as artifact_denied:
+            authority.describe(artifact=artifact_alias)
+        assert artifact_denied.value.code == "HARNESS_PROOF_CAPABILITY_UNSAFE"
+
+        with pytest.raises(deepseek_web.DeepSeekWebError) as context_denied:
+            deepseek_web.preflight_candidate_execution(
+                env={**env, "SC_DSH_PROOF_CONTEXT_FILE": str(context_alias)},
+                root_session_id="candidate-root-a",
+                conversation_id="conversation-a",
+                lifecycle_epoch=3,
+                worktree=worktree,
+            )
+        assert context_denied.value.code == "HARNESS_PROOF_RUNNER_REQUIRED"
+        assert durable_identity_state(registry, authority) == before
 
 
 def test_server_mint_derives_runtime_and_uses_only_fixed_authority_root(
@@ -1047,6 +1248,12 @@ def test_server_mint_derives_runtime_and_uses_only_fixed_authority_root(
             proof_run_id="proof-run-25",
             roots=ROOTS,
             ttl_seconds=600,
+            runner_authorization=runner_authorization(
+                root,
+                mode="candidate",
+                proof_run_id="proof-run-25",
+                roots=ROOTS,
+            ),
         )
         assert grant["generation"] == 1
         assert grant["exact_ref"] == "a" * 40
@@ -1069,6 +1276,12 @@ def test_server_mint_derives_runtime_and_uses_only_fixed_authority_root(
             proof_run_id="proof-run-after-terminal",
             roots=ROOTS,
             ttl_seconds=600,
+            runner_authorization=runner_authorization(
+                root,
+                mode="candidate",
+                proof_run_id="proof-run-after-terminal",
+                roots=ROOTS,
+            ),
         )
         assert grant["generation"] == 1
         assert Path(grant["artifact"]).exists()
@@ -1114,6 +1327,12 @@ def test_server_mint_rechecks_clean_seat_under_registry_mutation_lock(
                 proof_run_id="proof-raced-clean-seat",
                 roots=ROOTS,
                 ttl_seconds=600,
+                runner_authorization=runner_authorization(
+                    registry.layout.root,
+                    mode="candidate",
+                    proof_run_id="proof-raced-clean-seat",
+                    roots=ROOTS,
+                ),
             )
             assert initial_read_done.wait(timeout=2)
             try:
@@ -1147,6 +1366,214 @@ def test_server_mint_rechecks_clean_seat_under_registry_mutation_lock(
         assert not authority.artifacts.exists()
 
 
+def test_dedicated_runner_drives_all_surfaces_restart_adoption_and_teardown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with tempfile.TemporaryDirectory() as raw:
+        root = Path(raw)
+        registry, worktree, first_contract = runtime_registry(root)
+        authority = DeepSeekCandidateAuthority(
+            registry.layout.root / "proof-authority"
+        )
+        db_path = root / "engine.db"
+        browser, sprint = promotion_db(db_path)
+        monkeypatch.setattr(deepseek_web, "_identity_registry", lambda _env: registry)
+        monkeypatch.setattr(deepseek_web, "_exact_engine_ref", lambda: "a" * 40)
+        monkeypatch.setattr(
+            deepseek_web, "_current_dsh_version", lambda: "0.1.1-rc.2"
+        )
+        monkeypatch.setattr(
+            deepseek_web.harness_versions, "probe", lambda _harness: "0.1.1-rc.2"
+        )
+
+        run = deepseek_promotion_runner.start(
+            env={},
+            db_path=db_path,
+            mode="candidate",
+            disposable_baseline="arch-clean-2026-08-25",
+            proof_run_id="runner-proof-one",
+            conversation_ids=[browser, sprint],
+            include_one_shot=True,
+            ttl_seconds=600,
+        )
+        state = json.loads(run.runner_state.read_text())
+        assert {root["surface"] for root in state["roots"].values()} == {
+            "browser", "sprint", "one-shot"
+        }
+        assert all(Path(path).exists() for path in state["contexts"].values())
+
+        authority_before = authority.state_path.read_bytes()
+        runner_before = run.runner_state.read_bytes()
+        with pytest.raises(deepseek_promotion_runner.PromotionRunnerError) as busy:
+            deepseek_promotion_runner.start(
+                env={},
+                db_path=db_path,
+                mode="candidate",
+                disposable_baseline="arch-clean-2026-08-25",
+                proof_run_id="runner-proof-overlap",
+                conversation_ids=[browser, sprint],
+                include_one_shot=True,
+                ttl_seconds=600,
+            )
+        assert busy.value.code == "HARNESS_PROOF_RUNNER_BUSY"
+        assert authority.state_path.read_bytes() == authority_before
+        assert run.runner_state.read_bytes() == runner_before
+
+        with pytest.raises(deepseek_web.DeepSeekWebError) as ordinary:
+            deepseek_web.mint_candidate_capability(
+                env={},
+                mode="candidate",
+                disposable_baseline="arch-clean-2026-08-25",
+                proof_run_id="ordinary-mint",
+                roots=ROOTS,
+                ttl_seconds=600,
+            )
+        assert ordinary.value.code == "HARNESS_PROOF_RUNNER_REQUIRED"
+
+        for root_session_id, root_facts in state["roots"].items():
+            if root_facts["surface"] in {"browser", "sprint"}:
+                injected = deepseek_promotion_runner.inject_conversation_context(
+                    env={},
+                    conversation_id=root_facts["conversation_id"],
+                    lifecycle_epoch=root_facts["lifecycle_epoch"],
+                )
+            else:
+                injected = run.environment_for(
+                    root_session_id=root_session_id, base_env={}
+                )
+                assert deepseek_web.proof_root_from_environment(
+                    env=injected, surface="one-shot"
+                ) == root_session_id
+            assert injected["SC_DSH_PROOF_CONTEXT_FILE"] == (
+                state["contexts"][root_session_id]
+            )
+            snapshot = registry.read_snapshot()
+            registry.create_binding(
+                expected_snapshot_generation=snapshot["snapshot_generation"],
+                root_session_id=root_session_id,
+                conversation_id=root_facts["conversation_id"],
+                lifecycle_epoch=root_facts["lifecycle_epoch"],
+                shell_id=4,
+                shell_shortname="DEV4",
+                shell_worktree=worktree,
+                api_base="http://127.0.0.1:8837",
+                token="candidate-token",
+                plugin_contract_generation=first_contract,
+            )
+
+        old_artifact = Path(state["artifact"])
+        health = json.loads(registry.layout.health.read_text())
+        health["plugin_load_hmr_generation"] = "candidate-plugin-restarted"
+        health["plugin_contract_generation"] = plugin_contract_generation(
+            {
+                "canonical_fork_id": registry.layout.fork_id,
+                "dedicated_profile_id": registry.layout.profile_id,
+                "plugin_bundle_digest": registry.plugin_digest,
+                "declared_variable_schema_digest": registry.schema_digest,
+                "canonical_registry_path_identity": registry.registry_path_identity,
+                "host_boot_generation": health["host_boot_generation"],
+                "plugin_load_hmr_generation": health[
+                    "plugin_load_hmr_generation"
+                ],
+            }
+        )
+        owner_json(registry.layout.health, health)
+        second_contract = health["plugin_contract_generation"]
+        for root_session_id in state["roots"]:
+            snapshot = registry.read_snapshot()
+            record = snapshot["records"][root_session_id]
+            registry.rotate_binding(
+                expected_snapshot_generation=snapshot["snapshot_generation"],
+                root_session_id=root_session_id,
+                expected_record_generation=record["record_generation"],
+                token="candidate-token",
+                plugin_contract_generation=second_contract,
+                recovery=True,
+            )
+
+        ratcheted = run.ratchet_after_host_restart(ttl_seconds=600)
+        assert ratcheted["generation"] == 2
+        assert ratcheted["plugin_contract_generation"] == second_contract
+        updated = json.loads(run.runner_state.read_text())
+        assert all(
+            json.loads(Path(path).read_text())["artifact"] == ratcheted["artifact"]
+            for path in updated["contexts"].values()
+        )
+        with pytest.raises(DeepSeekIdentityError) as stale:
+            authority.describe(artifact=old_artifact)
+        assert stale.value.code == "HARNESS_PROOF_CAPABILITY_STALE"
+
+        monkeypatch.setattr(deepseek_web, "_candidate_root_terminal", lambda _root: True)
+        revoked = run.revoke()
+        assert revoked["state"] == "revoked"
+        final_snapshot = registry.read_snapshot()
+        assert all(
+            final_snapshot["records"][root_session_id]["state"] == "terminal"
+            for root_session_id in state["roots"]
+        )
+        assert all(not Path(path).exists() for path in updated["contexts"].values())
+
+        next_run = deepseek_promotion_runner.start(
+            env={},
+            db_path=db_path,
+            mode="candidate",
+            disposable_baseline="arch-clean-2026-08-25",
+            proof_run_id="runner-proof-two",
+            conversation_ids=[browser, sprint],
+            include_one_shot=True,
+            ttl_seconds=600,
+        )
+        assert json.loads(next_run.runner_state.read_text())["generation"] == 1
+        next_run.revoke()
+
+
+def test_promoted_runner_requires_candidate_acceptance_and_retirement_ref(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with tempfile.TemporaryDirectory() as raw:
+        root = Path(raw)
+        registry, _worktree, _contract = runtime_registry(root)
+        db_path = root / "engine.db"
+        browser, sprint = promotion_db(db_path)
+        monkeypatch.setattr(deepseek_web, "_identity_registry", lambda _env: registry)
+        monkeypatch.setattr(deepseek_web, "_exact_engine_ref", lambda: "b" * 40)
+        monkeypatch.setattr(
+            deepseek_web, "_current_dsh_version", lambda: "0.1.1-rc.2"
+        )
+
+        arguments = {
+            "env": {},
+            "db_path": db_path,
+            "mode": "promoted",
+            "disposable_baseline": "arch-clean-2026-08-25",
+            "proof_run_id": "promoted-proof",
+            "conversation_ids": [browser, sprint],
+            "include_one_shot": True,
+            "ttl_seconds": 600,
+        }
+        with pytest.raises(deepseek_promotion_runner.PromotionRunnerError) as missing:
+            deepseek_promotion_runner.start(**arguments)
+        assert missing.value.code == "HARNESS_PROOF_ACCEPTANCE_REQUIRED"
+
+        acceptance = registry.layout.root / "proof-authority" / "candidate-acceptance.json"
+        owner_json(
+            acceptance,
+            {
+                "contract": deepseek_promotion_runner.ACCEPTANCE_CONTRACT,
+                "state": "candidate-accepted",
+                "candidate_ref": "a" * 40,
+                "retirement_ref": "b" * 40,
+                "reviewed": True,
+                "fnb_accepted": True,
+            },
+        )
+        promoted = deepseek_promotion_runner.start(**arguments)
+        state = json.loads(promoted.runner_state.read_text())
+        assert state["mode"] == "promoted"
+        assert state["acceptance"]["path"] == str(acceptance)
+        promoted.revoke()
+
+
 def test_server_restart_ratchet_requires_recovered_exact_bindings(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1154,25 +1581,27 @@ def test_server_restart_ratchet_requires_recovered_exact_bindings(
         def __init__(self, root: Path, *, wrong_epoch: bool = False) -> None:
             self.layout = type("Layout", (), {"root": root})()
             self.wrong_epoch = wrong_epoch
+            self.closed = False
 
         def read_live_health(self):
             return {"plugin_contract_generation": "contract-two"}
 
         def read_snapshot(self):
             return {
+                "snapshot_generation": 2 if self.closed else 1,
                 "records": {
                     "candidate-root-a": {
-                        "state": "active",
+                        "state": "closing" if self.closed else "active",
                         "conversation_id": "conversation-a",
                         "lifecycle_epoch": 99 if self.wrong_epoch else 3,
-                        "record_generation": 5,
+                        "record_generation": 6 if self.closed else 5,
                         "plugin_contract_generation": "contract-two",
                     },
                     "candidate-root-b": {
-                        "state": "active",
+                        "state": "closing" if self.closed else "active",
                         "conversation_id": "conversation-b",
                         "lifecycle_epoch": 7,
-                        "record_generation": 8,
+                        "record_generation": 9 if self.closed else 8,
                         "plugin_contract_generation": "contract-two",
                     },
                 },
@@ -1183,6 +1612,28 @@ def test_server_restart_ratchet_requires_recovered_exact_bindings(
                         "record_generation": 5,
                     },
                 },
+            }
+
+        def begin_close_roots(
+            self, *, roots, require_live_root, fence_mismatch
+        ):
+            assert roots == ROOTS
+            assert require_live_root is False
+            assert fence_mismatch is True
+            self.closed = True
+            return {
+                root_session_id: TransactionReceipt(
+                    operation="closing",
+                    root_session_id=root_session_id,
+                    snapshot_generation=2,
+                    record_generation=6 if root_session_id.endswith("a") else 9,
+                    lifecycle_epoch=(
+                        99 if self.wrong_epoch and root_session_id.endswith("a")
+                        else roots[root_session_id]["lifecycle_epoch"]
+                    ),
+                    state="closing",
+                )
+                for root_session_id in roots
             }
 
     with tempfile.TemporaryDirectory() as raw:
@@ -1217,17 +1668,131 @@ def test_server_restart_ratchet_requires_recovered_exact_bindings(
         monkeypatch.setattr(
             deepseek_web,
             "_identity_registry",
-            lambda _env: Registry(Path(raw), wrong_epoch=True),
+            lambda _env: failed_registry,
         )
-        before = (Path(raw) / "proof-authority" / "authority.json").read_bytes()
+        failed_registry = Registry(Path(raw), wrong_epoch=True)
+        monkeypatch.setattr(deepseek_web, "_candidate_root_terminal", lambda _root: False)
         with pytest.raises(deepseek_web.DeepSeekWebError) as mismatch:
             deepseek_web.ratchet_candidate_after_host_restart(
                 env={}, artifact=first.artifact, ttl_seconds=600
             )
         assert mismatch.value.code == "HARNESS_PROOF_RESTART_BINDING_MISMATCH"
-        assert (
-            Path(raw) / "proof-authority" / "authority.json"
-        ).read_bytes() == before
+        state = json.loads((Path(raw) / "proof-authority" / "authority.json").read_text())
+        assert state["state"] == "revoked"
+        assert state["failure"]["operation"] == "ratchet"
+        assert state["failure"]["code"] == (
+            "HARNESS_PROOF_RESTART_BINDING_MISMATCH"
+        )
+        assert all(
+            record["state"] == "closing"
+            for record in failed_registry.read_snapshot()["records"].values()
+        )
         assert len(list(
             (Path(raw) / "proof-authority" / "capabilities").glob("*.json")
         )) == 1
+
+
+@pytest.mark.parametrize(
+    ("failure", "expected_code"),
+    [
+        ("wrong-lifecycle", "HARNESS_PROOF_RESTART_BINDING_MISMATCH"),
+        ("missing-root", "HARNESS_PROOF_RESTART_BINDING_MISMATCH"),
+        ("wrong-contract", "HARNESS_PROOF_CAPABILITY_MISMATCH"),
+        ("expired", "HARNESS_PROOF_CAPABILITY_EXPIRED"),
+        ("stale-artifact", "HARNESS_PROOF_CAPABILITY_STALE"),
+        ("teardown-failure", "HARNESS_PROOF_RESTART_BINDING_MISMATCH"),
+    ],
+)
+def test_failed_ratchet_revokes_and_fences_real_registry_roots(
+    failure: str,
+    expected_code: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with tempfile.TemporaryDirectory() as raw:
+        root = Path(raw)
+        registry, worktree, contract_generation = runtime_registry(root)
+        clock = Clock()
+        authority = DeepSeekCandidateAuthority(
+            registry.layout.root / "proof-authority", clock=clock
+        )
+        grant = mint(authority)
+        for root_session_id, facts in ROOTS.items():
+            if failure == "missing-root" and root_session_id == "candidate-root-b":
+                continue
+            snapshot = registry.read_snapshot()
+            registry.create_binding(
+                expected_snapshot_generation=snapshot["snapshot_generation"],
+                root_session_id=root_session_id,
+                conversation_id=facts["conversation_id"],
+                lifecycle_epoch=(
+                    99
+                    if failure in {"wrong-lifecycle", "teardown-failure"}
+                    and root_session_id == "candidate-root-a"
+                    else facts["lifecycle_epoch"]
+                ),
+                shell_id=4,
+                shell_shortname="DEV4",
+                shell_worktree=worktree,
+                api_base="http://127.0.0.1:8837",
+                token="candidate-token",
+                plugin_contract_generation=contract_generation,
+            )
+        if failure == "expired":
+            clock.value += timedelta(seconds=601)
+        elif failure == "stale-artifact":
+            presented = json.loads(grant.artifact.read_text())
+            presented["generation"] = 99
+            owner_json(grant.artifact, presented)
+
+        monkeypatch.setattr(deepseek_web, "_identity_registry", lambda _env: registry)
+        monkeypatch.setattr(
+            deepseek_web, "_candidate_authority", lambda _registry: authority
+        )
+        monkeypatch.setattr(
+            deepseek_web,
+            "_exact_engine_ref",
+            lambda: ("b" if failure == "wrong-contract" else "a") * 40,
+        )
+        monkeypatch.setattr(
+            deepseek_web.harness_versions, "probe", lambda _harness: "0.1.1-rc.2"
+        )
+        if failure == "teardown-failure":
+            monkeypatch.setattr(
+                deepseek_web,
+                "_candidate_root_terminal",
+                lambda _root: (_ for _ in ()).throw(
+                    deepseek_web.DeepSeekWebError(
+                        "HARNESS_PROOF_TEARDOWN_UNKNOWN", "terminality unavailable"
+                    )
+                ),
+            )
+        else:
+            monkeypatch.setattr(
+                deepseek_web, "_candidate_root_terminal", lambda _root: False
+            )
+
+        with pytest.raises(deepseek_web.DeepSeekWebError) as refused:
+            deepseek_web.ratchet_candidate_after_host_restart(
+                env={}, artifact=grant.artifact, ttl_seconds=600
+            )
+        assert refused.value.code == expected_code
+        state = json.loads(authority.state_path.read_text())
+        assert state["state"] == "revoked"
+        assert state["failure"]["operation"] == "ratchet"
+        assert state["failure"]["code"] == expected_code
+        snapshot = registry.read_snapshot()
+        assert all(
+            record["state"] == "closing"
+            for record in snapshot["records"].values()
+        )
+        assert all(
+            Path(record["credential_file"]).exists()
+            for record in snapshot["records"].values()
+        )
+        if failure == "teardown-failure":
+            assert all(
+                outcome["teardown_error"] == "HARNESS_PROOF_TEARDOWN_UNKNOWN"
+                for outcome in state["failure"]["roots"].values()
+            )
+        with pytest.raises(DeepSeekIdentityError):
+            authority.describe(artifact=grant.artifact)

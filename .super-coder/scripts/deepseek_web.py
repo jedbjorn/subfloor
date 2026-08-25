@@ -11,12 +11,14 @@ from __future__ import annotations
 import argparse
 import asyncio
 import fcntl
+import hashlib
 import json
 import os
 import re
 import shutil
 import signal
 import socket
+import stat
 import struct
 import subprocess
 import sys
@@ -57,6 +59,8 @@ CANDIDATE_FENCE_CODES = frozenset({
     "HARNESS_PROOF_RESTART_BINDING_MISMATCH",
     "HARNESS_PROOF_ROOT_REFUSED",
 })
+PROMOTION_RUNNER_CONTRACT = "sc-dsh-promotion-runner-v1"
+PROOF_CONTEXT_CONTRACT = "sc-dsh-proof-context-v1"
 SESSION_MUTATION_FIELDS = {
     "/api/session.create": ("sessionId",),
     "/api/session.selectModel": ("sessionId",),
@@ -161,9 +165,22 @@ def _unproven_path() -> Path:
 def _read_unproven() -> dict[str, Any] | None:
     path = _unproven_path()
     try:
-        if path.is_symlink() or path.stat().st_mode & 0o777 != 0o600:
+        metadata = path.lstat()
+        if path.is_symlink() or metadata.st_mode & 0o777 != 0o600:
             raise OSError("unsafe unproven-work artifact")
-        value = json.loads(path.read_text())
+        with path.open("rb") as handle:
+            before = os.fstat(handle.fileno())
+            if (metadata.st_dev, metadata.st_ino) != (before.st_dev, before.st_ino):
+                raise OSError("proof artifact changed before reading")
+            value = json.load(handle)
+            after = os.fstat(handle.fileno())
+        if (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns) != (
+            after.st_dev,
+            after.st_ino,
+            after.st_size,
+            after.st_mtime_ns,
+        ):
+            raise OSError("proof artifact changed while reading")
     except FileNotFoundError:
         return None
     except (OSError, json.JSONDecodeError) as exc:
@@ -1130,6 +1147,228 @@ def _current_dsh_version() -> str:
     return version
 
 
+def _owner_proof_json(path: Path, *, code: str) -> dict[str, Any]:
+    try:
+        metadata = path.lstat()
+        if (
+            path.is_symlink()
+            or not stat.S_ISREG(metadata.st_mode)
+            or stat.S_IMODE(metadata.st_mode) != 0o600
+            or metadata.st_uid != os.getuid()
+        ):
+            raise OSError("unsafe owner-only proof artifact")
+        descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        with os.fdopen(descriptor, "r") as handle:
+            before = os.fstat(handle.fileno())
+            if (
+                before.st_dev != metadata.st_dev
+                or before.st_ino != metadata.st_ino
+                or before.st_uid != metadata.st_uid
+                or stat.S_IMODE(before.st_mode) != 0o600
+            ):
+                raise OSError("owner-only proof artifact changed before open")
+            value = json.load(handle)
+            after = os.fstat(handle.fileno())
+            if (
+                after.st_dev != before.st_dev
+                or after.st_ino != before.st_ino
+                or after.st_size != before.st_size
+                or after.st_mtime_ns != before.st_mtime_ns
+            ):
+                raise OSError("owner-only proof artifact changed during read")
+    except (FileNotFoundError, OSError, json.JSONDecodeError) as exc:
+        raise DeepSeekIdentityError(
+            code, "owner-only proof artifact is unavailable"
+        ) from exc
+    if not isinstance(value, dict):
+        raise DeepSeekIdentityError(code, "owner-only proof artifact is malformed")
+    return value
+
+
+def _canonical_proof_digest(value: object) -> str:
+    payload = json.dumps(
+        value, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+    ).encode()
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _validate_promotion_runner(
+    *,
+    registry: DeepSeekIdentityRegistry,
+    runner_authorization: Mapping[str, str] | None,
+    mode: str,
+    proof_run_id: str,
+    roots: Mapping[str, Mapping[str, Any]],
+) -> str:
+    expected_path = registry.layout.root / "proof-authority" / "runner.json"
+    raw_path = (
+        runner_authorization.get("state_path")
+        if isinstance(runner_authorization, Mapping)
+        else None
+    )
+    token = (
+        runner_authorization.get("token")
+        if isinstance(runner_authorization, Mapping)
+        else None
+    )
+    if not isinstance(raw_path, str) or not isinstance(token, str) or not token:
+        raise DeepSeekIdentityError(
+            "HARNESS_PROOF_RUNNER_REQUIRED",
+            "proof capability mint requires dedicated runner authorization",
+        )
+    presented_path = Path(raw_path)
+    try:
+        path = presented_path.resolve(strict=True)
+    except OSError as exc:
+        raise DeepSeekIdentityError(
+            "HARNESS_PROOF_RUNNER_REQUIRED",
+            "dedicated runner authorization is unavailable",
+        ) from exc
+    if (
+        not presented_path.is_absolute()
+        or presented_path.is_symlink()
+        or presented_path != path
+        or path != expected_path.resolve()
+    ):
+        raise DeepSeekIdentityError(
+            "HARNESS_PROOF_RUNNER_REQUIRED",
+            "proof capability mint rejected foreign runner authority",
+        )
+    state = _owner_proof_json(path, code="HARNESS_PROOF_RUNNER_REQUIRED")
+    expected_roots = {
+        root_session_id: dict(root) for root_session_id, root in roots.items()
+    }
+    exact_ref = _exact_engine_ref()
+    if (
+        state.get("contract") != PROMOTION_RUNNER_CONTRACT
+        or state.get("state") != "authorizing"
+        or state.get("runner_pid") != os.getpid()
+        or state.get("runner_start_ticks") != process_start_ticks(os.getpid())
+        or state.get("runner_token_sha256")
+        != hashlib.sha256(token.encode()).hexdigest()
+        or state.get("mode") != mode
+        or state.get("proof_run_id") != proof_run_id
+        or state.get("exact_ref") != exact_ref
+        or state.get("roots_sha256") != _canonical_proof_digest(expected_roots)
+    ):
+        raise DeepSeekIdentityError(
+            "HARNESS_PROOF_RUNNER_REQUIRED",
+            "dedicated runner identity or engine-derived proof facts changed",
+        )
+    acceptance = state.get("acceptance")
+    if (mode == "candidate" and acceptance is not None) or (
+        mode == "promoted"
+        and not isinstance(acceptance, Mapping)
+    ):
+        raise DeepSeekIdentityError(
+            "HARNESS_PROOF_ACCEPTANCE_REQUIRED",
+            "proof mode is not authorized by the candidate acceptance transition",
+        )
+    return exact_ref
+
+
+def _candidate_artifact(
+    *,
+    env: Mapping[str, str],
+    root_session_id: str | None = None,
+    conversation_id: str | None = None,
+    lifecycle_epoch: int | None = None,
+    surface: str | None = None,
+) -> Path | None:
+    raw_context = env.get("SC_DSH_PROOF_CONTEXT_FILE")
+    if raw_context is None:
+        if env.get("SC_DSH_PROOF_CAPABILITY_FILE") is not None:
+            raise DeepSeekWebError(
+                "HARNESS_PROOF_RUNNER_REQUIRED",
+                "ambient proof capability selection is refused",
+            )
+        return None
+    registry = _identity_registry(env)
+    authority_root = registry.layout.root / "proof-authority"
+    contexts_root = authority_root / "contexts"
+    presented_context = Path(raw_context)
+    try:
+        context_path = presented_context.resolve(strict=True)
+        if (
+            not presented_context.is_absolute()
+            or presented_context.is_symlink()
+            or presented_context != context_path
+        ):
+            raise OSError("aliased proof context")
+        if context_path.parent != contexts_root.resolve():
+            raise OSError("foreign proof context")
+        context = _owner_proof_json(
+            context_path, code="HARNESS_PROOF_RUNNER_REQUIRED"
+        )
+        runner = _owner_proof_json(
+            authority_root / "runner.json",
+            code="HARNESS_PROOF_RUNNER_REQUIRED",
+        )
+    except (OSError, DeepSeekIdentityError) as exc:
+        code = getattr(exc, "code", "HARNESS_PROOF_RUNNER_REQUIRED")
+        detail = getattr(exc, "detail", "dedicated proof context is unavailable")
+        raise DeepSeekWebError(code, detail) from exc
+    expected_context_path = runner.get("contexts", {}).get(
+        context.get("root_session_id")
+    )
+    if (
+        context.get("contract") != PROOF_CONTEXT_CONTRACT
+        or runner.get("contract") != PROMOTION_RUNNER_CONTRACT
+        or runner.get("state") != "active"
+        or context.get("runner_id") != runner.get("runner_id")
+        or context.get("proof_run_id") != runner.get("proof_run_id")
+        or context.get("mode") != runner.get("mode")
+        or expected_context_path != str(context_path)
+        or (surface is not None and context.get("surface") != surface)
+    ):
+        raise DeepSeekWebError(
+            "HARNESS_PROOF_RUNNER_REQUIRED",
+            "proof context is stale or does not match this exact execution",
+        )
+    if (
+        context.get("generation") != runner.get("generation")
+        or context.get("artifact") != runner.get("artifact")
+    ):
+        raise DeepSeekWebError(
+            "HARNESS_PROOF_CAPABILITY_STALE",
+            "proof context presents a stale capability generation",
+        )
+    if (
+        (root_session_id is not None and context.get("root_session_id") != root_session_id)
+        or (conversation_id is not None and context.get("conversation_id") != conversation_id)
+        or (lifecycle_epoch is not None and context.get("lifecycle_epoch") != lifecycle_epoch)
+    ):
+        raise DeepSeekWebError(
+            "HARNESS_PROOF_ROOT_REFUSED",
+            "proof context does not enumerate this exact root lifecycle",
+        )
+    artifact = context.get("artifact")
+    if not isinstance(artifact, str):
+        raise DeepSeekWebError(
+            "HARNESS_PROOF_RUNNER_REQUIRED", "proof context lacks an artifact"
+        )
+    return Path(artifact)
+
+
+def proof_root_from_environment(
+    *, env: Mapping[str, str], surface: str
+) -> str | None:
+    """Resolve the runner-installed exact root for a non-conversation surface."""
+    artifact = _candidate_artifact(env=env, surface=surface)
+    if artifact is None:
+        return None
+    context = _owner_proof_json(
+        Path(env["SC_DSH_PROOF_CONTEXT_FILE"]),
+        code="HARNESS_PROOF_RUNNER_REQUIRED",
+    )
+    root_session_id = context.get("root_session_id")
+    if not isinstance(root_session_id, str):
+        raise DeepSeekWebError(
+            "HARNESS_PROOF_ROOT_REFUSED", "proof context lacks an exact root"
+        )
+    return root_session_id
+
+
 def _binding_inputs(
     env: Mapping[str, str], worktree: Path
 ) -> tuple[int, str, str, str, Path]:
@@ -1157,10 +1396,18 @@ def mint_candidate_capability(
     proof_run_id: str,
     roots: Mapping[str, Mapping[str, Any]],
     ttl_seconds: int,
+    runner_authorization: Mapping[str, str] | None = None,
 ) -> dict[str, Any]:
     """Server-side mint from live exact-ref, Host, and clean-seat evidence."""
     registry = _identity_registry(env)
     try:
+        exact_ref = _validate_promotion_runner(
+            registry=registry,
+            runner_authorization=runner_authorization,
+            mode=mode,
+            proof_run_id=proof_run_id,
+            roots=roots,
+        )
         snapshot = registry.read_snapshot()
         health = registry.read_live_health()
         observed_live_roots = sorted(
@@ -1181,7 +1428,7 @@ def mint_candidate_capability(
         ) as locked_snapshot:
             grant = _candidate_authority(registry).mint(
                 mode=mode,
-                exact_ref=_exact_engine_ref(),
+                exact_ref=exact_ref,
                 pinned_dsh_version=_current_dsh_version(),
                 disposable_baseline=disposable_baseline,
                 proof_run_id=proof_run_id,
@@ -1232,6 +1479,7 @@ def _fence_candidate_capability(
     artifact: Path,
     strict_revoke: bool,
     require_live_root: bool,
+    failure_code: str | None = None,
 ) -> dict[str, Any] | None:
     registry = _identity_registry(env)
     authority = _candidate_authority(registry)
@@ -1240,13 +1488,16 @@ def _fence_candidate_capability(
     fenced = registry.begin_close_roots(
         roots=roots,
         require_live_root=require_live_root,
+        fence_mismatch=True,
     )
     if require_live_root and not fenced:
         return None
     revoked = (
         authority.revoke(artifact=artifact)
         if strict_revoke
-        else authority.revoke_for_refusal(artifact=artifact)
+        else authority.revoke_for_refusal(
+            artifact=artifact, reason_code=failure_code
+        )
     )
     outcomes: dict[str, dict[str, Any]] = {}
     for root_session_id, receipt in fenced.items():
@@ -1256,23 +1507,42 @@ def _fence_candidate_capability(
                 "record_generation": receipt.record_generation,
             }
             continue
-        terminal = _candidate_root_terminal(root_session_id)
-        outcomes[root_session_id] = retire_session_identity(
-            env=env,
-            root_session_id=root_session_id,
-            quiesced=terminal,
-        )
+        try:
+            terminal = _candidate_root_terminal(root_session_id)
+            outcomes[root_session_id] = retire_session_identity(
+                env=env,
+                root_session_id=root_session_id,
+                quiesced=terminal,
+            )
+        except DeepSeekWebError as exc:
+            outcomes[root_session_id] = {
+                "state": "closing",
+                "record_generation": receipt.record_generation,
+                "teardown_error": exc.code,
+            }
+    if (
+        not strict_revoke
+        and failure_code is not None
+        and isinstance(revoked.get("failure"), dict)
+    ):
+        authority.record_refusal_outcomes(artifact=artifact, roots=outcomes)
+        revoked["failure"]["roots"] = outcomes
     return {**revoked, "roots": outcomes}
 
 
 def _fence_failed_candidate(
-    *, env: Mapping[str, str], artifact: Path
-) -> None:
-    _fence_candidate_capability(
+    *,
+    env: Mapping[str, str],
+    artifact: Path,
+    failure_code: str | None = None,
+    require_live_root: bool = True,
+) -> dict[str, Any] | None:
+    return _fence_candidate_capability(
         env=env,
         artifact=artifact,
         strict_revoke=False,
-        require_live_root=True,
+        require_live_root=require_live_root,
+        failure_code=failure_code,
     )
 
 
@@ -1501,13 +1771,19 @@ def bind_session_identity(
             "plugin_contract_generation": contract_generation,
         }
     except DeepSeekIdentityError as exc:
-        raw_artifact = env.get("SC_DSH_PROOF_CAPABILITY_FILE")
+        raw_artifact = (
+            candidate_preflight.get("proof_artifact")
+            if isinstance(candidate_preflight, Mapping)
+            else None
+        )
         if (
             candidate_preflight is not None
-            and raw_artifact is not None
+            and isinstance(raw_artifact, str)
             and exc.code in CANDIDATE_FENCE_CODES
         ):
-            _fence_failed_candidate(env=env, artifact=Path(raw_artifact))
+            _fence_failed_candidate(
+                env=env, artifact=Path(raw_artifact), failure_code=exc.code
+            )
         raise DeepSeekWebError(exc.code, exc.detail) from exc
 
 
@@ -1520,10 +1796,14 @@ def preflight_candidate_execution(
     worktree: Path,
 ) -> dict[str, Any] | None:
     """Validate proof authority completely before any binding mutation."""
-    raw_artifact = env.get("SC_DSH_PROOF_CAPABILITY_FILE")
-    if raw_artifact is None:
+    artifact = _candidate_artifact(
+        env=env,
+        root_session_id=root_session_id,
+        conversation_id=conversation_id,
+        lifecycle_epoch=lifecycle_epoch,
+    )
+    if artifact is None:
         return None
-    artifact = Path(raw_artifact)
     if not artifact.is_absolute() or len(artifact.parents) < 2:
         raise DeepSeekWebError(
             "HARNESS_PROOF_CAPABILITY_UNSAFE",
@@ -1592,6 +1872,7 @@ def preflight_candidate_execution(
             )
         return {
             **admitted,
+            "proof_artifact": str(artifact),
             "binding_snapshot_generation": snapshot[
                 "snapshot_generation"
             ],
@@ -1599,7 +1880,9 @@ def preflight_candidate_execution(
         }
     except DeepSeekIdentityError as exc:
         if exc.code in CANDIDATE_FENCE_CODES:
-            _fence_failed_candidate(env=env, artifact=artifact)
+            _fence_failed_candidate(
+                env=env, artifact=artifact, failure_code=exc.code
+            )
         raise DeepSeekWebError(exc.code, exc.detail) from exc
 
 
@@ -1669,10 +1952,14 @@ def admit_candidate_execution(
     lifecycle_epoch: int,
 ) -> dict[str, Any] | None:
     """Admit one server-minted proof root; ordinary callers return ``None``."""
-    raw_artifact = env.get("SC_DSH_PROOF_CAPABILITY_FILE")
-    if raw_artifact is None:
+    artifact = _candidate_artifact(
+        env=env,
+        root_session_id=root_session_id,
+        conversation_id=conversation_id,
+        lifecycle_epoch=lifecycle_epoch,
+    )
+    if artifact is None:
         return None
-    artifact = Path(raw_artifact)
     if not artifact.is_absolute() or len(artifact.parents) < 2:
         raise DeepSeekWebError(
             "HARNESS_PROOF_CAPABILITY_UNSAFE",
@@ -1708,7 +1995,9 @@ def admit_candidate_execution(
         )
     except DeepSeekIdentityError as exc:
         if exc.code in CANDIDATE_FENCE_CODES:
-            _fence_failed_candidate(env=env, artifact=artifact)
+            _fence_failed_candidate(
+                env=env, artifact=artifact, failure_code=exc.code
+            )
         raise DeepSeekWebError(exc.code, exc.detail) from exc
 
 
@@ -1783,7 +2072,22 @@ def ratchet_candidate_after_host_restart(
             "exact_ref": grant.exact_ref,
             "plugin_contract_generation": grant.plugin_contract_generation,
         }
-    except DeepSeekIdentityError as exc:
+    except (DeepSeekIdentityError, DeepSeekWebError) as exc:
+        try:
+            _fence_failed_candidate(
+                env=env,
+                artifact=artifact,
+                failure_code=f"ratchet:{exc.code}",
+                require_live_root=False,
+            )
+        except (DeepSeekIdentityError, DeepSeekWebError) as fence_exc:
+            code = getattr(fence_exc, "code", "HARNESS_PROOF_RATCHET_FENCE_FAILED")
+            raise DeepSeekWebError(
+                "HARNESS_PROOF_RATCHET_FENCE_FAILED",
+                f"proof restart failed with {exc.code} and fencing failed with {code}",
+            ) from fence_exc
+        if isinstance(exc, DeepSeekWebError):
+            raise
         raise DeepSeekWebError(exc.code, exc.detail) from exc
 
 

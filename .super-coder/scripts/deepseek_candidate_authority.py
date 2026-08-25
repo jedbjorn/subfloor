@@ -261,7 +261,18 @@ class DeepSeekCandidateAuthority:
             )
 
     def _presented(self, artifact: Path) -> tuple[dict[str, Any], str, int]:
-        resolved = artifact.resolve()
+        try:
+            resolved = artifact.resolve(strict=True)
+        except OSError as exc:
+            raise DeepSeekIdentityError(
+                "HARNESS_PROOF_CAPABILITY_UNAVAILABLE",
+                "proof capability presentation is unavailable",
+            ) from exc
+        if not artifact.is_absolute() or artifact.is_symlink() or artifact != resolved:
+            raise DeepSeekIdentityError(
+                "HARNESS_PROOF_CAPABILITY_UNSAFE",
+                "proof capability must use its exact owner-only artifact path",
+            )
         if resolved.parent != self.artifacts:
             raise DeepSeekIdentityError(
                 "HARNESS_PROOF_CAPABILITY_UNSAFE",
@@ -529,7 +540,9 @@ class DeepSeekCandidateAuthority:
                 "proof_run_id": state["proof_run_id"],
             }
 
-    def revoke_for_refusal(self, *, artifact: Path) -> dict[str, Any]:
+    def revoke_for_refusal(
+        self, *, artifact: Path, reason_code: str | None = None
+    ) -> dict[str, Any]:
         """Revoke the current proof run after its owned roots were fenced."""
         self._presented(artifact)
         with self._locked():
@@ -538,9 +551,37 @@ class DeepSeekCandidateAuthority:
                 state["state"] = "revoked"
                 state["revoked_at"] = _stamp(self.clock())
                 state["token_sha256"] = None
+                if reason_code is not None:
+                    operation = "refusal"
+                    code = reason_code
+                    if reason_code.startswith("ratchet:"):
+                        operation = "ratchet"
+                        code = reason_code.removeprefix("ratchet:")
+                    state["failure"] = {
+                        "operation": operation,
+                        "code": code,
+                        "at": state["revoked_at"],
+                    }
                 _atomic_owner_write(self.state_path, _canonical(state) + b"\n")
             return {
                 "state": state["state"],
                 "generation": state["generation"],
                 "proof_run_id": state["proof_run_id"],
+                "failure": state.get("failure"),
             }
+
+    def record_refusal_outcomes(
+        self, *, artifact: Path, roots: Mapping[str, Mapping[str, Any]]
+    ) -> None:
+        """Attach nonsecret teardown evidence after durable revocation."""
+        self._presented(artifact)
+        with self._locked():
+            state = self._read_state()
+            failure = state.get("failure")
+            if state.get("state") != "revoked" or not isinstance(failure, dict):
+                raise DeepSeekIdentityError(
+                    "HARNESS_PROOF_CAPABILITY_INVALID",
+                    "proof refusal outcomes require revoked failure evidence",
+                )
+            failure["roots"] = json.loads(json.dumps(roots))
+            _atomic_owner_write(self.state_path, _canonical(state) + b"\n")

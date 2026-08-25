@@ -20,6 +20,7 @@ import deepseek_one_shot  # noqa: E402
 import deepseek_web  # noqa: E402
 import harness_versions  # noqa: E402
 import route_bindings  # noqa: E402
+import conversation_adapters.deepseek as deepseek_adapter  # noqa: E402
 from conversation_adapters.base import (  # noqa: E402
     AdapterError,
     ConversationContext,
@@ -578,6 +579,144 @@ def test_managed_browser_queues_for_the_shared_host_identity(
     assert captured == [MANAGED_IDENTITY_WAIT_SECONDS]
 
 
+def test_managed_identity_retries_only_transient_readiness_within_budget(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    attempts: list[int] = []
+    sleeps: list[float] = []
+
+    def bind(**_kwargs):
+        attempts.append(len(attempts) + 1)
+        if len(attempts) < 3:
+            raise deepseek_web.DeepSeekWebError(
+                "HARNESS_REGISTRY_STALE_WRITER", "snapshot raced"
+            )
+        return {}
+
+    monkeypatch.setattr(deepseek_web, "bind_session_identity", bind)
+    monkeypatch.setattr(deepseek_adapter.time, "sleep", sleeps.append)
+    live = FakeHost()
+    adapter = DeepSeekAdapter(client_factory=lambda: live)
+
+    assert adapter._managed_client(
+        context(tmp_path, live), "sc-" + "8" * 32
+    ) is live
+    adapter.close()
+
+    assert attempts == [1, 2, 3]
+    assert sleeps == [0.05, 0.05]
+    assert sum(sleeps) < 5.0
+
+
+def test_managed_identity_mismatch_refuses_immediately_without_retry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    attempts: list[int] = []
+    sleeps: list[float] = []
+
+    def refuse(**_kwargs):
+        attempts.append(1)
+        raise deepseek_web.DeepSeekWebError(
+            "HARNESS_SHELL_IDENTITY_MISMATCH", "wrong exact shell"
+        )
+
+    monkeypatch.setattr(deepseek_web, "bind_session_identity", refuse)
+    monkeypatch.setattr(deepseek_adapter.time, "sleep", sleeps.append)
+    live = FakeHost()
+    adapter = DeepSeekAdapter(client_factory=lambda: live)
+
+    with pytest.raises(AdapterError) as denied:
+        adapter._managed_client(context(tmp_path, live), "sc-" + "7" * 32)
+
+    assert denied.value.code == "HARNESS_SHELL_IDENTITY_MISMATCH"
+    assert attempts == [1]
+    assert sleeps == []
+
+
+def test_browser_readiness_exhaustion_becomes_alias_free_chat_only(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    attempts: list[int] = []
+    retired: list[dict[str, object]] = []
+
+    def unavailable(**_kwargs):
+        attempts.append(1)
+        raise deepseek_web.DeepSeekWebError(
+            "HARNESS_PLUGIN_HEALTH_UNAVAILABLE", "health publication pending"
+        )
+
+    monkeypatch.setattr(deepseek_web, "bind_session_identity", unavailable)
+    monkeypatch.setattr(deepseek_adapter.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(
+        deepseek_web,
+        "retire_session_identity",
+        lambda **kwargs: retired.append(dict(kwargs)) or {"state": "terminal"},
+    )
+    live = FakeHost()
+    ctx = context(tmp_path, live)
+    adapter = DeepSeekAdapter(client_factory=lambda: live)
+
+    turn = adapter.start(ctx, "chat without protected effects")
+    try:
+        assert attempts == [1, 1, 1]
+        assert retired == [{
+            "env": ctx.env,
+            "root_session_id": turn.session_ref,
+            "quiesced": True,
+        }]
+        assert turn.metadata["identity_degradation"] == {
+            "mode": "chat-only",
+            "reason": "HARNESS_PLUGIN_HEALTH_UNAVAILABLE",
+            "protected_effects": False,
+        }
+        assert turn.metadata["proof_authority"] is None
+        assert [
+            payload
+            for method, payload in live.calls
+            if method == "session.prompt"
+        ] == [{
+            "sessionId": turn.session_ref,
+            "mode": "queue",
+            "content": [{"type": "text", "text": "chat without protected effects"}],
+        }]
+    finally:
+        adapter.close()
+
+
+def test_sprint_readiness_exhaustion_refuses_only_pre_prompt_turn(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    attempts: list[int] = []
+    retired: list[dict[str, object]] = []
+
+    def unavailable(**_kwargs):
+        attempts.append(1)
+        raise deepseek_web.DeepSeekWebError(
+            "HARNESS_REGISTRY_UNAVAILABLE", "snapshot publication pending"
+        )
+
+    monkeypatch.setattr(deepseek_web, "bind_session_identity", unavailable)
+    monkeypatch.setattr(deepseek_adapter.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(
+        deepseek_web,
+        "retire_session_identity",
+        lambda **kwargs: retired.append(dict(kwargs)) or {"state": "terminal"},
+    )
+    live = FakeHost()
+    ctx = context(tmp_path, live)
+    ctx.env["SC_CONVERSATION_SURFACE"] = "sprint"
+    calls_before = list(live.calls)
+    adapter = DeepSeekAdapter(client_factory=lambda: live)
+
+    with pytest.raises(AdapterError) as denied:
+        adapter.start(ctx, "must not prompt")
+
+    assert denied.value.code == "HARNESS_REGISTRY_UNAVAILABLE"
+    assert attempts == [1, 1, 1]
+    assert retired == []
+    assert live.calls == calls_before
+
+
 def test_candidate_managed_turn_releases_containment_only_after_exact_binding(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -790,7 +929,7 @@ def test_candidate_browser_and_sprint_preflight_refusal_never_binds(
     assert persistent == before
 
 
-def test_candidate_one_shot_requires_enumerated_root_before_any_effect(
+def test_candidate_one_shot_refuses_ambient_capability_before_any_effect(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     effects: list[str] = []
@@ -814,7 +953,7 @@ def test_candidate_one_shot_requires_enumerated_root_before_any_effect(
         pytest.raises(deepseek_host.DeepSeekHostError) as refused,
     ):
         deepseek_one_shot.run("acme-dynamic/model-7", "high", "prompt")
-    assert refused.value.code == "HARNESS_PROOF_ROOT_REFUSED"
+    assert refused.value.code == "HARNESS_PROOF_RUNNER_REQUIRED"
     assert effects == []
 
 
@@ -859,6 +998,11 @@ def test_candidate_one_shot_preflight_refusal_never_binds(
 
     monkeypatch.setattr(
         deepseek_web, "acquire_shell_identity", lambda **_kwargs: Lease()
+    )
+    monkeypatch.setattr(
+        deepseek_web,
+        "proof_root_from_environment",
+        lambda **_kwargs: "sc-" + "d" * 32,
     )
     monkeypatch.setattr(deepseek_web, "ensure", lambda *_args, **_kwargs: {})
     monkeypatch.setattr(deepseek_web, "preflight_candidate_execution", refuse)
@@ -1591,6 +1735,90 @@ def test_one_shot_without_canonical_identity_refuses_before_host_access(
 
     assert refused.value.code == "HARNESS_SHELL_IDENTITY_UNAVAILABLE"
     assert fake.calls == []
+
+
+def test_one_shot_retries_transient_readiness_then_runs_only_that_invocation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    attempts: list[int] = []
+    sleeps: list[float] = []
+    invocations: list[dict[str, object]] = []
+    retirements: list[dict[str, object]] = []
+
+    def ensure(*_args, **_kwargs):
+        attempts.append(len(attempts) + 1)
+        if len(attempts) < 3:
+            raise deepseek_web.DeepSeekWebError(
+                "HARNESS_PLUGIN_HEALTH_UNAVAILABLE", "Host is publishing health"
+            )
+        return {}
+
+    monkeypatch.setenv("SC_API_TOKEN", "test-shell-token")
+    monkeypatch.setenv("SC_API_BASE", "http://127.0.0.1:8837")
+    monkeypatch.setenv("SC_SHELL_ID", "4")
+    monkeypatch.setenv("SC_SHELL_SHORTNAME", "DEV4")
+    monkeypatch.setenv("SC_SHELL_WORKTREE", str(tmp_path))
+    monkeypatch.setattr(deepseek_web, "ensure", ensure)
+    monkeypatch.setattr(deepseek_one_shot.time, "sleep", sleeps.append)
+    monkeypatch.setattr(
+        deepseek_one_shot,
+        "_run",
+        lambda selector, effort, prompt, **kwargs: invocations.append({
+            "selector": selector,
+            "effort": effort,
+            "prompt": prompt,
+            **kwargs,
+        }) or 0,
+    )
+    monkeypatch.setattr(
+        deepseek_web,
+        "retire_session_identity",
+        lambda **kwargs: retirements.append(dict(kwargs)) or {"state": "terminal"},
+    )
+
+    assert deepseek_one_shot.run("acme-dynamic/model-7", "high", "prompt") == 0
+
+    assert attempts == [1, 2, 3]
+    assert sleeps == [0.05, 0.05]
+    assert len(invocations) == 1
+    assert invocations[0]["prompt"] == "prompt"
+    assert invocations[0]["worktree"] == tmp_path
+    assert retirements == [{
+        "env": deepseek_one_shot.os.environ,
+        "root_session_id": invocations[0]["session_ref"],
+        "quiesced": True,
+    }]
+
+
+def test_one_shot_authority_mismatch_refuses_without_readiness_retry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    attempts: list[int] = []
+    sleeps: list[float] = []
+    invoked = mock.Mock()
+
+    def refuse(**_kwargs):
+        attempts.append(1)
+        raise deepseek_web.DeepSeekWebError(
+            "HARNESS_API_IDENTITY_MISMATCH", "API identity changed"
+        )
+
+    monkeypatch.setenv("SC_API_TOKEN", "test-shell-token")
+    monkeypatch.setenv("SC_API_BASE", "http://127.0.0.1:8837")
+    monkeypatch.setenv("SC_SHELL_ID", "4")
+    monkeypatch.setenv("SC_SHELL_SHORTNAME", "DEV4")
+    monkeypatch.setenv("SC_SHELL_WORKTREE", str(tmp_path))
+    monkeypatch.setattr(deepseek_web, "bind_session_identity", refuse)
+    monkeypatch.setattr(deepseek_one_shot.time, "sleep", sleeps.append)
+    monkeypatch.setattr(deepseek_one_shot, "_run", invoked)
+
+    with pytest.raises(deepseek_host.DeepSeekHostError) as denied:
+        deepseek_one_shot.run("acme-dynamic/model-7", "high", "prompt")
+
+    assert denied.value.code == "HARNESS_API_IDENTITY_MISMATCH"
+    assert attempts == [1]
+    assert sleeps == []
+    invoked.assert_not_called()
 
 
 def test_one_shot_uncertain_prompt_fences_future_handoff_before_lease_release(

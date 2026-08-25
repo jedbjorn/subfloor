@@ -2,13 +2,14 @@
   "schema_version": 2,
   "governing_revision": {
     "document_id": 174,
-    "current_sha256": "84056c2fc7206b83f2d3beb71150545326d5e33f557cb5f2329f55321eab0bdf",
+    "current_sha256": "06bb2bc31856575b88983d522fd881ad8e9b68c75714a804ff6cdb5bbd98aeb8",
     "sprint_bound_sha256": "84056c2fc7206b83f2d3beb71150545326d5e33f557cb5f2329f55321eab0bdf",
-    "scope_decision_id": 255,
-    "drift_disposition": "retain Sprint 24 WU95 Doc 174 v3 only as replaced-binding drift evidence; Sprint 25 WU101 Doc 174 v4 and Decision 255 govern this corrected head",
-    "task_id": 649,
+    "scope_decision_id": 261,
+    "reviewer_disposition_message_id": 1385,
+    "drift_disposition": "retain Sprint 25 WU104 Doc 174 v4 as the immutable Sprint binding; Doc 174 v5, Decision 261, and Reviewer disposition message 1385 are active reliability narrowing authority and do not edit that binding",
+    "task_id": 651,
     "sprint_id": 25,
-    "work_unit_id": 107,
+    "work_unit_id": 104,
     "preparation_work_unit": {
       "task_id": 648,
       "work_unit_id": 101
@@ -18,7 +19,7 @@
       "work_unit_id": 95,
       "sprint_bound_sha256": "a305eba5c73988d202e3f3f9d392d623645b3f799dfe4ab4945687026ae5a969"
     },
-    "implementation_base": "3dc47cd"
+    "implementation_base": "21a05f3eae09b70c4c42bae69a6d04e89bb1d8f7"
   },
   "dsh_release": {
     "distribution": "@deepseek-ai/dsh",
@@ -325,6 +326,11 @@
     "unknown": "refused"
   },
   "literal_subparser_counters": {
+    ".super-coder/scripts/deepseek_promotion_runner.py": {
+      "ratchet": 1,
+      "revoke": 1,
+      "start": 1
+    },
     ".super-coder/scripts/deepseek_web.py": {
       "ensure": 1,
       "generation": 1,
@@ -671,6 +677,10 @@
     "SC_CHAT_INACTIVITY_CEILING": [
       ".super-coder/scripts/activity_monitor.py"
     ],
+    "SC_CONVERSATION_SURFACE": [
+      ".super-coder/scripts/conversation_adapters/deepseek.py",
+      ".super-coder/scripts/conversation_launch.py"
+    ],
     "SC_DATABASE_URL": [
       ".super-coder/scripts/dispatch.sh",
       ".super-coder/scripts/dsh_preparation_inventory.py"
@@ -791,11 +801,13 @@
       ".super-coder/scripts/deepseek_web.py"
     ],
     "SC_DSH_PROOF_CAPABILITY_FILE": [
-      ".super-coder/scripts/deepseek_one_shot.py",
+      ".super-coder/scripts/deepseek_promotion_runner.py",
       ".super-coder/scripts/deepseek_web.py"
     ],
-    "SC_DSH_PROOF_ROOT_SESSION_ID": [
-      ".super-coder/scripts/deepseek_one_shot.py"
+    "SC_DSH_PROOF_CONTEXT_FILE": [
+      ".super-coder/scripts/conversation_adapters/deepseek.py",
+      ".super-coder/scripts/deepseek_promotion_runner.py",
+      ".super-coder/scripts/deepseek_web.py"
     ],
     "SC_ENGINE_DIR": [
       ".super-coder/scripts/branch-guard.sh",
@@ -1371,6 +1383,7 @@
       "SC_BIND",
       "SC_BROWSER_HANDOFF_ID",
       "SC_CHAT_INACTIVITY_CEILING",
+      "SC_CONVERSATION_SURFACE",
       "SC_DB_BACKUP_DIR",
       "SC_DEEPSEEK_BOOTSTRAP_PYTHON",
       "SC_DEEPSEEK_CARRIER_PYTHON",
@@ -1401,7 +1414,7 @@
       "SC_DSH_PROFILE_ID",
       "SC_DSH_PROOF_",
       "SC_DSH_PROOF_CAPABILITY_FILE",
-      "SC_DSH_PROOF_ROOT_SESSION_ID",
+      "SC_DSH_PROOF_CONTEXT_FILE",
       "SC_GITHUB_AUTH_ARGS",
       "SC_GITHUB_HOST_TRUST_B64",
       "SC_GITHUB_HOST_TRUST_SHA256",
@@ -1453,6 +1466,11 @@
     "subprocess.run": "process_effect"
   },
   "literal_subcommand_policy": {
+    ".super-coder/scripts/deepseek_promotion_runner.py": {
+      "ratchet": "refused",
+      "revoke": "refused",
+      "start": "refused"
+    },
     ".super-coder/scripts/deepseek_web.py": {
       "ensure": "refused",
       "generation": "refused",

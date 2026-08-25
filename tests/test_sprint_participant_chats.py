@@ -356,6 +356,7 @@ def test_closed_planner_reenter_persists_canonical_default_route(tmp_path) -> No
     assert archive_id == 42
     assert context.model == "planner-test"
     assert context.effort == "high"
+    assert context.env["SC_CONVERSATION_SURFACE"] == "sprint"
     assert tuple(
         stored[field] for field in ("harness", "provider", "model", "effort")
     ) == (
