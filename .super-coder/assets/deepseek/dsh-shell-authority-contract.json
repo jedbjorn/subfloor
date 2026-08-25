@@ -123,11 +123,27 @@
       "under managed membership refuse SC_DISPATCH, SC_CALLER_ROOT, SC_MEM_AS, and every ambient SC_* before target or credential inspection",
       "only then select the canonical dispatcher and classify the public command"
     ],
-    "linux": "engine wrapper creates a sealed descriptor, places the suspended child in an engine-created non-delegated cgroup-v2 domain, and releases it; resolver requires exact /proc/self/cgroup membership, descriptor seals/path/generation/expiry equality, cgroup type domain, and empty subtree delegation",
+    "linux": "future engine wrapper signs a sealed descriptor, binds it to the protected non-delegated cgroup-v2 inode and authorized root PID/start-time lineage, places the suspended child in that domain, and releases it; the preparation verifier requires the trusted issuer signature, exact /proc ancestry and cgroup membership/identity/generation/expiry equality, non-writable admission, cgroup type domain, and empty subtree delegation",
     "linux_contributor": {
       "path": ".super-coder/scripts/dsh_execution_provenance.py",
-      "sha256": "bbd11e5ba102d5779add1884eb8ad43b34f1771c2650242f7f280915f874dfb2",
-      "contract": "sc-dsh-linux-cgroup-v2-v1"
+      "sha256": "9da62ab334ddbf50c98d1f609b120919c643b508a18b61be4368e50e2aecca69",
+      "contract": "sc-dsh-linux-cgroup-v2-v2"
+    },
+    "prototype_issuer_fixture": {
+      "path": "tests/fixtures/deepseek_dsh_prototype_issuer.py",
+      "sha256": "5307345020ba851c3bd2674f15ccbd9a05f5cf0250f3800ace6a3de87de01896",
+      "authority": "deterministic test-only signer; never a product authority source"
+    },
+    "preparation_boundary": "prototype verifier and policy harness only; task 649 owns durable issuer/domain lifecycle and task 650 owns production sc wiring",
+    "preparation_policy_harness": {
+      "effect_driver": {
+        "path": "tests/fixtures/deepseek_dsh_effect_driver.py",
+        "sha256": "963a7251f8d7fdcf1a079388ed2e1bef5c7ca638bd76de9b65da4a693d86251e"
+      },
+      "neutral_route": "help|-h|--help resolves at the future guard seam without identity lookup, credential/API/DB access, discovery, filesystem mutation, subprocess start, or authority-bearing output",
+      "authorized_route": "mem resolves one frozen identity context only after complete aliases, stable owner-only nonsymlink credential/current-record files, current generations, literal loopback API, and authenticated whoami equality",
+      "effect_order": "the authenticated whoami observer proves the protected-effect sentinel is absent before replying; the harness writes the exact immutable identity receipt only after stable-file rechecks",
+      "production_wiring": "deferred to task 650; the current top-level sc bootstrap is not modified or claimed effect-free"
     },
     "platform_boundary": "Arch and Ubuntu Linux only; the disposable Arch VM is the sole clean-room platform gate, and native Windows/macOS contributors, runners, compatibility layers, and CI are excluded",
     "executor_rule": "on supported Linux, the dedicated subprocess wrapper places every Bash and pwsh foreground/background ToolExecution child in exactly one registered execution domain before user code starts",

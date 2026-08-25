@@ -2,16 +2,20 @@ import ast
 import ctypes
 import fcntl
 import hashlib
+import importlib.util
 import json
 import os
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
+import threading
 import unittest
 import urllib.request
 from collections import Counter
 from contextlib import contextmanager
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -20,6 +24,7 @@ NODE_PROBE = ROOT / "tests/fixtures/deepseek_dsh_shell_env_probe.mjs"
 INVENTORY_PROBE = ROOT / ".super-coder/scripts/dsh_preparation_inventory.py"
 PROVENANCE_PROBE = ROOT / ".super-coder/scripts/dsh_execution_provenance.py"
 EFFECT_DRIVER = ROOT / "tests/fixtures/deepseek_dsh_effect_driver.py"
+PROTOTYPE_ISSUER_PATH = ROOT / "tests/fixtures/deepseek_dsh_prototype_issuer.py"
 SOURCE_ROOTS = (ROOT / ".super-coder/scripts", ROOT / ".super-coder/api")
 REQUIRED_SEALS = (
     fcntl.F_SEAL_SEAL
@@ -27,6 +32,15 @@ REQUIRED_SEALS = (
     | fcntl.F_SEAL_GROW
     | fcntl.F_SEAL_WRITE
 )
+
+ISSUER_SPEC = importlib.util.spec_from_file_location(
+    "deepseek_dsh_prototype_issuer",
+    PROTOTYPE_ISSUER_PATH,
+)
+if ISSUER_SPEC is None or ISSUER_SPEC.loader is None:
+    raise RuntimeError("cannot load prototype issuer fixture")
+PROTOTYPE_ISSUER = importlib.util.module_from_spec(ISSUER_SPEC)
+ISSUER_SPEC.loader.exec_module(PROTOTYPE_ISSUER)
 
 
 def load_contract():
@@ -165,6 +179,12 @@ def sha256(path):
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def process_start_ticks(pid):
+    text = (Path("/proc") / str(pid) / "stat").read_text()
+    fields = text[text.rfind(")") + 2:].split()
+    return int(fields[19])
+
+
 @contextmanager
 def linux_domain_fixture(kind):
     with tempfile.TemporaryDirectory() as raw:
@@ -172,8 +192,11 @@ def linux_domain_fixture(kind):
         proc = root / "proc-cgroup"
         cgroup_root = root / "cgroup"
         cgroup_root.mkdir()
+        issuer_key = root / "prototype-issuer-public.json"
+        PROTOTYPE_ISSUER.write_public_key(issuer_key)
         now = 1_000_000
         descriptor_fd = None
+        lineage_process = None
         domain_id = "a" * 32
         membership = f"/sc-dsh/{domain_id}.scope"
         if kind == "missing":
@@ -182,39 +205,71 @@ def linux_domain_fixture(kind):
             proc.mkdir()
         elif kind == "ambiguous":
             proc.write_text("0::/\n0::/other\n")
-        elif kind == "native":
+        elif kind in {"native", "copied-descriptor"}:
             proc.write_text("0::/native.slice\n")
         else:
-            proc.write_text(f"0::{membership}\n")
+            visible_membership = membership
+            if kind == "cross-domain":
+                visible_membership = f"/sc-dsh/{'b' * 32}.scope"
+            proc.write_text(f"0::{visible_membership}\n")
             domain = cgroup_root / membership.lstrip("/")
             domain.mkdir(parents=True, mode=0o700)
             (domain / "cgroup.type").write_text("domain\n")
-            (domain / "cgroup.subtree_control").write_text("\n")
+            (domain / "cgroup.subtree_control").write_text(
+                "cpu\n" if kind == "delegated" else "\n"
+            )
+            cgroup_procs = domain / "cgroup.procs"
+            cgroup_procs.write_text(f"{os.getpid()}\n")
+            cgroup_procs.chmod(0o444)
+            if kind != "attacker-owned-domain":
+                domain.chmod(0o555)
             if kind != "no-descriptor":
                 descriptor_fd = os.memfd_create(
                     "sc-dsh-domain",
                     os.MFD_CLOEXEC | os.MFD_ALLOW_SEALING,
                 )
+                root_pid = os.getpid()
+                if kind == "unauthorized-self-entry":
+                    lineage_process = subprocess.Popen(
+                        [sys.executable, "-c", "import time; time.sleep(60)"],
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                    )
+                    root_pid = lineage_process.pid
+                metadata = domain.stat()
                 descriptor = {
-                    "contract": "sc-dsh-linux-cgroup-v2-v1",
+                    "contract": "sc-dsh-linux-cgroup-v2-v2",
                     "cgroup": membership,
                     "domain_id": domain_id,
                     "binding_generation": 7,
                     "expires_monotonic_ns": now if kind == "stale" else now + 1,
                     "non_delegated": kind != "delegated",
+                    "issuer_key_id": PROTOTYPE_ISSUER.KEY_ID,
+                    "root_pid": root_pid,
+                    "root_start_ticks": process_start_ticks(root_pid),
+                    "cgroup_device": metadata.st_dev,
+                    "cgroup_inode": metadata.st_ino,
+                    "cgroup_owner_uid": metadata.st_uid,
                 }
-                os.write(descriptor_fd, json.dumps(descriptor).encode())
+                signed = PROTOTYPE_ISSUER.sign_descriptor(descriptor)
+                if kind == "forged-descriptor":
+                    signed["binding_generation"] = 8
+                os.write(descriptor_fd, json.dumps(signed).encode())
                 fcntl.fcntl(descriptor_fd, fcntl.F_ADD_SEALS, REQUIRED_SEALS)
         try:
             yield {
                 "proc": proc,
                 "cgroup_root": cgroup_root,
                 "descriptor_fd": descriptor_fd,
+                "issuer_key": issuer_key,
                 "now": now,
             }
         finally:
             if descriptor_fd is not None:
                 os.close(descriptor_fd)
+            if lineage_process is not None:
+                lineage_process.terminate()
+                lineage_process.wait(timeout=5)
 
 
 def clean_probe_environment(extra=None):
@@ -242,6 +297,8 @@ def run_provenance_probe(fixture, *, environment=None, extra_args=()):
     if fixture["descriptor_fd"] is not None:
         command.extend(["--descriptor-fd", str(fixture["descriptor_fd"])])
         pass_fds = (fixture["descriptor_fd"],)
+    if fixture.get("issuer_key") is not None:
+        command.extend(["--prototype-issuer-key", str(fixture["issuer_key"])])
     command.extend(extra_args)
     return subprocess.run(
         command,
@@ -280,6 +337,98 @@ def watched_events(fd):
         return os.read(fd, 65_536)
     except BlockingIOError:
         return b""
+
+
+@contextmanager
+def whoami_server(*, shortname="DEV5", before_reply=None):
+    requests = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def _reply(self):
+            requests.append({
+                "path": self.path,
+                "authorization": self.headers.get("Authorization"),
+                "method": self.command,
+            })
+            if before_reply is not None:
+                before_reply()
+            payload = json.dumps({
+                "shell_id": 11,
+                "shell_shortname": shortname,
+            }).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+        do_GET = _reply
+        do_POST = _reply
+
+        def log_message(self, *_args):
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield f"http://127.0.0.1:{server.server_port}", requests
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
+def write_owner_json(path, data):
+    path.write_text(json.dumps(data, sort_keys=True))
+    path.chmod(0o600)
+
+
+def identity_material(root, api_base):
+    worktree = root / "worktree"
+    worktree.mkdir()
+    credential = root / "credential.json"
+    record = root / "identity-record.json"
+    aliases = {
+        "DSH_SC_SHELL_ID": "11",
+        "DSH_SC_SHELL_SHORTNAME": "DEV5",
+        "DSH_SC_SHELL_WORKTREE": str(worktree),
+        "DSH_SC_API_BASE": api_base,
+        "DSH_SC_MEM_CREDENTIAL_FILE": str(credential),
+        "DSH_SC_BINDING_GENERATION": "7",
+        "DSH_SC_PLUGIN_HEALTH_GENERATION": "plugin-contract-9",
+    }
+    write_owner_json(credential, {
+        "contract": "sc-dsh-prototype-credential-v1",
+        "token": "fixture-token",
+        "api_base": api_base,
+        "shell_id": 11,
+        "shell_shortname": "DEV5",
+        "binding_generation": 7,
+        "plugin_health_generation": "plugin-contract-9",
+    })
+    write_owner_json(record, {
+        "contract": "sc-dsh-prototype-current-identity-v1",
+        "current": True,
+        "shell_id": 11,
+        "shell_shortname": "DEV5",
+        "shell_worktree": str(worktree),
+        "api_base": api_base,
+        "credential_file": str(credential),
+        "binding_generation": 7,
+        "plugin_health_generation": "plugin-contract-9",
+    })
+    return aliases, record, credential
+
+
+def authorized_probe_args(contract, record, effect):
+    return tuple(
+        item for name in contract["aliases"] for item in ("--alias", name)
+    ) + (
+        "--policy-route", "mem",
+        "--identity-record", str(record),
+        "--protected-effect", str(effect),
+    )
 
 
 class DeepSeekDshPreparationContractTests(unittest.TestCase):
@@ -432,9 +581,34 @@ class DeepSeekDshPreparationContractTests(unittest.TestCase):
             {
                 "path": ".super-coder/scripts/dsh_execution_provenance.py",
                 "sha256": sha256(PROVENANCE_PROBE),
-                "contract": "sc-dsh-linux-cgroup-v2-v1",
+                "contract": "sc-dsh-linux-cgroup-v2-v2",
             },
         )
+        self.assertEqual(
+            provenance["preparation_boundary"],
+            "prototype verifier and policy harness only; task 649 owns durable "
+            "issuer/domain lifecycle and task 650 owns production sc wiring",
+        )
+        self.assertEqual(
+            provenance["prototype_issuer_fixture"],
+            {
+                "path": "tests/fixtures/deepseek_dsh_prototype_issuer.py",
+                "sha256": sha256(PROTOTYPE_ISSUER_PATH),
+                "authority": "deterministic test-only signer; never a product authority source",
+            },
+        )
+        harness = provenance["preparation_policy_harness"]
+        self.assertEqual(
+            harness["effect_driver"],
+            {
+                "path": "tests/fixtures/deepseek_dsh_effect_driver.py",
+                "sha256": sha256(EFFECT_DRIVER),
+            },
+        )
+        self.assertIn("future guard seam", harness["neutral_route"])
+        self.assertIn("authenticated whoami equality", harness["authorized_route"])
+        self.assertIn("absent before replying", harness["effect_order"])
+        self.assertIn("deferred to task 650", harness["production_wiring"])
         self.assertNotIn("windows", provenance)
         self.assertNotIn("windows_contributor", provenance)
         self.assertIn("Arch and Ubuntu Linux only", provenance["platform_boundary"])
@@ -828,6 +1002,57 @@ class DeepSeekDshPreparationContractTests(unittest.TestCase):
                 self.assertEqual(completed.returncode, 77, completed.stderr)
                 self.assertEqual(json.loads(completed.stdout)["provenance"], "unknown")
 
+    def test_linux_resolver_accepts_only_issuer_attested_protected_lineage(self):
+        with linux_domain_fixture("managed") as fixture:
+            completed = run_provenance_probe(
+                fixture,
+                environment={"DSH_SHELL": "1"},
+                extra_args=("--command-class", "identity_neutral_read_only"),
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            self.assertEqual(
+                json.loads(completed.stdout),
+                {
+                    "decision": "neutral",
+                    "provenance": "managed",
+                    "credential_count": None,
+                },
+            )
+
+    def test_linux_resolver_rejects_forged_sealed_descriptor(self):
+        with linux_domain_fixture("forged-descriptor") as fixture:
+            completed = run_provenance_probe(fixture)
+            self.assertEqual(completed.returncode, 77, completed.stderr)
+            self.assertIn("signature is invalid", json.loads(completed.stdout)["reason"])
+
+    def test_linux_resolver_rejects_owner_writable_self_created_domain(self):
+        with linux_domain_fixture("attacker-owned-domain") as fixture:
+            completed = run_provenance_probe(fixture)
+            self.assertEqual(completed.returncode, 77, completed.stderr)
+            self.assertIn("admission is writable", json.loads(completed.stdout)["reason"])
+
+    def test_linux_resolver_rejects_cross_domain_descriptor(self):
+        with linux_domain_fixture("cross-domain") as fixture:
+            completed = run_provenance_probe(fixture)
+            self.assertEqual(completed.returncode, 77, completed.stderr)
+            self.assertIn("names another cgroup", json.loads(completed.stdout)["reason"])
+
+    def test_linux_resolver_rejects_unauthorized_self_entry(self):
+        with linux_domain_fixture("unauthorized-self-entry") as fixture:
+            completed = run_provenance_probe(fixture)
+            self.assertEqual(completed.returncode, 77, completed.stderr)
+            self.assertIn(
+                "outside the issued execution lineage",
+                json.loads(completed.stdout)["reason"],
+            )
+
+    def test_linux_resolver_rejects_descriptor_copied_outside_domain(self):
+        with linux_domain_fixture("managed") as fixture:
+            fixture["proc"].write_text("0::/native.slice\n")
+            completed = run_provenance_probe(fixture)
+            self.assertEqual(completed.returncode, 77, completed.stderr)
+            self.assertIn("descriptor is outside", json.loads(completed.stdout)["reason"])
+
     def test_managed_and_spoofed_selectors_refuse_before_external_effects(self):
         aliases = {
             name: f"value-{index}"
@@ -905,8 +1130,12 @@ class DeepSeekDshPreparationContractTests(unittest.TestCase):
             self.assertEqual(
                 {path.name for path in event_dir.iterdir()},
                 {
-                    "api_effect",
+                    "api_read",
+                    "api_write",
                     "credential_discovery",
+                    "credential_read",
+                    "credential_write",
+                    "db_read",
                     "db_write",
                     "denied_marker_write",
                     "effect.db",
@@ -917,31 +1146,238 @@ class DeepSeekDshPreparationContractTests(unittest.TestCase):
                 },
             )
 
-    def test_exact_managed_aliases_authorize_without_admin_discovery(self):
-        aliases = {
-            name: f"value-{index}"
-            for index, name in enumerate(self.contract["aliases"])
-        }
+    def test_neutral_help_harness_has_zero_external_effects_or_authority_output(self):
         with tempfile.TemporaryDirectory() as raw:
-            admin_dir = Path(raw) / "credentials"
+            root = Path(raw)
+            admin_dir = root / "credentials"
+            event_dir = root / "effects"
             admin_dir.mkdir()
+            event_dir.mkdir()
             admin = admin_dir / "Admin.json"
             admin.write_text('{"token":"discoverable"}\n')
-            with (
-                linux_domain_fixture("managed") as fixture,
-                access_watch(admin_dir, admin) as watcher,
-            ):
-                completed = run_provenance_probe(
-                    fixture,
-                    environment={"DSH_SHELL": "1", **aliases},
-                    extra_args=tuple(
-                        item for name in self.contract["aliases"]
-                        for item in ("--alias", name)
-                    ) + ("--native-credential-dir", str(admin_dir)),
-                )
-                self.assertEqual(completed.returncode, 0, completed.stderr)
-                self.assertEqual(json.loads(completed.stdout)["decision"], "authorized")
-                self.assertEqual(watched_events(watcher), b"")
+            db = root / "neutral.db"
+            db.write_text("sentinel\n")
+            identity_record = root / "identity-record.json"
+            write_owner_json(identity_record, {"must": "not be read"})
+            protected_effect = root / "protected-effect"
+            with whoami_server() as (api_base, requests):
+                with (
+                    linux_domain_fixture("managed") as fixture,
+                    access_watch(
+                        EFFECT_DRIVER,
+                        admin_dir,
+                        admin,
+                        db,
+                        identity_record,
+                    ) as watcher,
+                ):
+                    completed = run_provenance_probe(
+                        fixture,
+                        environment={
+                            "DSH_EFFECT_DIR": str(event_dir),
+                            "DSH_ADMIN_CREDENTIAL": str(admin),
+                            "DSH_EFFECT_API": api_base,
+                        },
+                        extra_args=(
+                            "--policy-route", "help",
+                            "--identity-record", str(identity_record),
+                            "--protected-effect", str(protected_effect),
+                            "--default-dispatch", str(EFFECT_DRIVER),
+                        ),
+                    )
+                    self.assertEqual(completed.returncode, 0, completed.stderr)
+                    self.assertEqual(
+                        json.loads(completed.stdout),
+                        {
+                            "decision": "neutral",
+                            "provenance": "managed",
+                            "credential_count": None,
+                            "route": "help",
+                        },
+                    )
+                    self.assertEqual(watched_events(watcher), b"")
+                self.assertEqual(requests, [])
+            self.assertEqual(list(event_dir.iterdir()), [])
+            self.assertFalse(protected_effect.exists())
+
+    def test_exact_authenticated_identity_precedes_first_protected_effect(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            effect = root / "protected-effect.json"
+            effect_absent_at_whoami = []
+
+            def observe_before_reply():
+                effect_absent_at_whoami.append(not effect.exists())
+
+            with whoami_server(before_reply=observe_before_reply) as (api_base, requests):
+                aliases, record, _credential = identity_material(root, api_base)
+                with linux_domain_fixture("managed") as fixture:
+                    completed = run_provenance_probe(
+                        fixture,
+                        environment={"DSH_SHELL": "1", **aliases},
+                        extra_args=authorized_probe_args(self.contract, record, effect),
+                    )
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            self.assertEqual(json.loads(completed.stdout)["decision"], "authorized")
+            self.assertEqual(
+                requests,
+                [{
+                    "path": "/_sc/mem/whoami",
+                    "authorization": "Bearer fixture-token",
+                    "method": "GET",
+                }],
+            )
+            self.assertEqual(effect_absent_at_whoami, [True])
+            self.assertEqual(
+                json.loads(effect.read_text()),
+                {
+                    "binding_generation": 7,
+                    "plugin_health_generation": "plugin-contract-9",
+                    "shell_id": 11,
+                    "shell_shortname": "DEV5",
+                },
+            )
+
+    def _assert_identity_refusal(
+        self,
+        mutate,
+        *,
+        whoami_shortname="DEV5",
+        before_reply=None,
+    ):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            effect = root / "protected-effect.json"
+            with whoami_server(
+                shortname=whoami_shortname,
+                before_reply=before_reply,
+            ) as (api_base, requests):
+                aliases, record, credential = identity_material(root, api_base)
+                mutate(aliases, record, credential)
+                with linux_domain_fixture("managed") as fixture:
+                    completed = run_provenance_probe(
+                        fixture,
+                        environment={"DSH_SHELL": "1", **aliases},
+                        extra_args=authorized_probe_args(self.contract, record, effect),
+                    )
+            self.assertEqual(completed.returncode, 77, completed.stderr)
+            self.assertEqual(json.loads(completed.stdout)["decision"], "refused")
+            self.assertFalse(effect.exists())
+            return requests
+
+    def test_authorized_harness_rejects_partial_aliases_before_effect(self):
+        requests = self._assert_identity_refusal(
+            lambda aliases, _record, _credential: aliases.pop("DSH_SC_SHELL_ID")
+        )
+        self.assertEqual(requests, [])
+
+    def test_authorized_harness_rejects_unknown_aliases_before_effect(self):
+        requests = self._assert_identity_refusal(
+            lambda aliases, _record, _credential: aliases.__setitem__(
+                "DSH_SC_UNDECLARED", "unexpected"
+            )
+        )
+        self.assertEqual(requests, [])
+
+    def test_authorized_harness_rejects_malformed_aliases_before_effect(self):
+        requests = self._assert_identity_refusal(
+            lambda aliases, _record, _credential: aliases.__setitem__(
+                "DSH_SC_SHELL_ID", "not-an-id"
+            )
+        )
+        self.assertEqual(requests, [])
+
+    def test_authorized_harness_rejects_stale_current_record_before_effect(self):
+        def stale(_aliases, record, _credential):
+            data = json.loads(record.read_text())
+            data["current"] = False
+            write_owner_json(record, data)
+
+        requests = self._assert_identity_refusal(stale)
+        self.assertEqual(requests, [])
+
+    def test_authorized_harness_rejects_cross_shell_record_before_effect(self):
+        def cross_shell(_aliases, record, _credential):
+            data = json.loads(record.read_text())
+            data["shell_id"] = 12
+            write_owner_json(record, data)
+
+        requests = self._assert_identity_refusal(cross_shell)
+        self.assertEqual(requests, [])
+
+    def test_authorized_harness_rejects_unsafe_credential_before_effect(self):
+        requests = self._assert_identity_refusal(
+            lambda _aliases, _record, credential: credential.chmod(0o644)
+        )
+        self.assertEqual(requests, [])
+
+    def test_authorized_harness_rejects_symlink_credential_before_effect(self):
+        def symlink(aliases, record, credential):
+            link = credential.with_name("credential-link.json")
+            link.symlink_to(credential)
+            aliases["DSH_SC_MEM_CREDENTIAL_FILE"] = str(link)
+            data = json.loads(record.read_text())
+            data["credential_file"] = str(link)
+            write_owner_json(record, data)
+
+        requests = self._assert_identity_refusal(symlink)
+        self.assertEqual(requests, [])
+
+    def test_authorized_harness_rejects_nonloopback_api_before_effect(self):
+        requests = self._assert_identity_refusal(
+            lambda aliases, _record, _credential: aliases.__setitem__(
+                "DSH_SC_API_BASE", "http://192.0.2.1:8837"
+            )
+        )
+        self.assertEqual(requests, [])
+
+    def test_authorized_harness_rejects_whoami_mismatch_before_effect(self):
+        requests = self._assert_identity_refusal(
+            lambda _aliases, _record, _credential: None,
+            whoami_shortname="OTHER",
+        )
+        self.assertEqual(
+            requests,
+            [{
+                "path": "/_sc/mem/whoami",
+                "authorization": "Bearer fixture-token",
+                "method": "GET",
+            }],
+        )
+
+    def test_authorized_harness_rejects_changed_credential_before_effect(self):
+        changed = {"path": None}
+
+        def mutate(_aliases, _record, credential):
+            changed["path"] = credential
+
+        def change_during_whoami():
+            path = changed["path"]
+            data = json.loads(path.read_text())
+            data["token"] = "changed-token-after-request"
+            write_owner_json(path, data)
+
+        requests = self._assert_identity_refusal(
+            mutate,
+            before_reply=change_during_whoami,
+        )
+        self.assertEqual(len(requests), 1)
+
+    def test_authorized_harness_rejects_stale_generations_before_effect(self):
+        requests = self._assert_identity_refusal(
+            lambda aliases, _record, _credential: aliases.__setitem__(
+                "DSH_SC_BINDING_GENERATION", "8"
+            )
+        )
+        self.assertEqual(requests, [])
+
+    def test_authorized_harness_rejects_stale_plugin_generation_before_effect(self):
+        requests = self._assert_identity_refusal(
+            lambda aliases, _record, _credential: aliases.__setitem__(
+                "DSH_SC_PLUGIN_HEALTH_GENERATION", "plugin-contract-stale"
+            )
+        )
+        self.assertEqual(requests, [])
 
     def test_native_control_reaches_native_credential_discovery(self):
         with tempfile.TemporaryDirectory() as raw:
