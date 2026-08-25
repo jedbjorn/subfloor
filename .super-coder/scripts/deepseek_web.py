@@ -18,6 +18,7 @@ import re
 import shutil
 import signal
 import socket
+import sqlite3
 import stat
 import struct
 import subprocess
@@ -41,6 +42,7 @@ from deepseek_identity_registry import (
 )
 
 ENGINE = Path(__file__).resolve().parents[1]
+ENGINE_DB = ENGINE / "shell_db.db"
 REPO_ROOT = ENGINE.parent.resolve()
 STATE = ENGINE / "run" / "deepseek-web.json"
 LOG = ENGINE / "logs" / "deepseek-web.log"
@@ -1192,13 +1194,96 @@ def _canonical_proof_digest(value: object) -> str:
     return hashlib.sha256(payload).hexdigest()
 
 
+def _canonical_promotion_roots(
+    *, conversation_ids: tuple[str, ...]
+) -> dict[str, dict[str, Any]]:
+    """Derive the disposable Browser/Sprint roots from the fixed engine DB."""
+    if (
+        len(conversation_ids) != 2
+        or len(set(conversation_ids)) != 2
+        or any(not isinstance(value, str) or not value for value in conversation_ids)
+    ):
+        raise DeepSeekWebError(
+            "HARNESS_PROOF_RUNNER_INVALID",
+            "promotion requires two distinct canonical conversation identities",
+        )
+    try:
+        metadata = ENGINE_DB.lstat()
+        canonical_db = ENGINE_DB.resolve(strict=True)
+        if (
+            ENGINE_DB.is_symlink()
+            or not stat.S_ISREG(metadata.st_mode)
+            or canonical_db != ENGINE_DB.absolute()
+        ):
+            raise OSError("canonical engine DB path is unsafe")
+        connection = sqlite3.connect(
+            f"{canonical_db.as_uri()}?mode=ro", uri=True, timeout=5.0
+        )
+        connection.row_factory = sqlite3.Row
+        try:
+            roots: dict[str, dict[str, Any]] = {}
+            for conversation_id in conversation_ids:
+                row = connection.execute(
+                    "SELECT c.conversation_id,c.harness,c.state,"
+                    "c.conversation_scope,"
+                    "1+(SELECT COUNT(*) FROM conversation_events reopened "
+                    "WHERE reopened.conversation_id=c.conversation_id "
+                    "AND reopened.event_type='conversation.reopened') "
+                    "AS lifecycle_epoch,"
+                    "EXISTS(SELECT 1 FROM sprint_participant_conversations link "
+                    "WHERE link.conversation_id=c.conversation_id) AS is_sprint "
+                    "FROM conversations c WHERE c.conversation_id=?",
+                    (conversation_id,),
+                ).fetchone()
+                if (
+                    row is None
+                    or row["harness"] != "deepseek"
+                    or row["state"] not in {"idle", "queued", "running", "waiting"}
+                ):
+                    raise DeepSeekWebError(
+                        "HARNESS_PROOF_ROOT_REFUSED",
+                        "promotion roots must be live canonical DeepSeek conversations",
+                    )
+                surface = "sprint" if row["is_sprint"] else "browser"
+                expected_scope = "sprint" if surface == "sprint" else "normal"
+                if row["conversation_scope"] != expected_scope:
+                    raise DeepSeekWebError(
+                        "HARNESS_PROOF_ROOT_REFUSED",
+                        "promotion conversation scope disagrees with canonical topology",
+                    )
+                root_session_id = (
+                    f"sc-{uuid.uuid5(uuid.NAMESPACE_URL, conversation_id).hex}"
+                )
+                roots[root_session_id] = {
+                    "conversation_id": conversation_id,
+                    "lifecycle_epoch": int(row["lifecycle_epoch"]),
+                    "verified_lineage": [],
+                    "surface": surface,
+                }
+        finally:
+            connection.close()
+    except DeepSeekWebError:
+        raise
+    except (OSError, sqlite3.Error) as exc:
+        raise DeepSeekWebError(
+            "HARNESS_PROOF_ROOT_SOURCE_UNAVAILABLE",
+            "canonical engine conversation state is unavailable",
+        ) from exc
+    if {root["surface"] for root in roots.values()} != {"browser", "sprint"}:
+        raise DeepSeekWebError(
+            "HARNESS_PROOF_ROOT_REFUSED",
+            "promotion requires one canonical Browser and one Sprint conversation",
+        )
+    return roots
+
+
 def _validate_promotion_runner(
     *,
     registry: DeepSeekIdentityRegistry,
     runner_authorization: Mapping[str, str] | None,
     mode: str,
     proof_run_id: str,
-    roots: Mapping[str, Mapping[str, Any]],
+    roots: Mapping[str, Mapping[str, Any]] | None,
 ) -> str:
     expected_path = registry.layout.root / "proof-authority" / "runner.json"
     raw_path = (
@@ -1235,9 +1320,14 @@ def _validate_promotion_runner(
             "proof capability mint rejected foreign runner authority",
         )
     state = _owner_proof_json(path, code="HARNESS_PROOF_RUNNER_REQUIRED")
-    expected_roots = {
-        root_session_id: dict(root) for root_session_id, root in roots.items()
-    }
+    expected_roots = (
+        {
+            root_session_id: dict(root)
+            for root_session_id, root in roots.items()
+        }
+        if roots is not None
+        else None
+    )
     exact_ref = _exact_engine_ref()
     if (
         state.get("contract") != PROMOTION_RUNNER_CONTRACT
@@ -1249,7 +1339,11 @@ def _validate_promotion_runner(
         or state.get("mode") != mode
         or state.get("proof_run_id") != proof_run_id
         or state.get("exact_ref") != exact_ref
-        or state.get("roots_sha256") != _canonical_proof_digest(expected_roots)
+        or (
+            expected_roots is not None
+            and state.get("roots_sha256")
+            != _canonical_proof_digest(expected_roots)
+        )
     ):
         raise DeepSeekIdentityError(
             "HARNESS_PROOF_RUNNER_REQUIRED",
@@ -1394,7 +1488,7 @@ def mint_candidate_capability(
     mode: str,
     disposable_baseline: str,
     proof_run_id: str,
-    roots: Mapping[str, Mapping[str, Any]],
+    conversation_ids: tuple[str, ...],
     ttl_seconds: int,
     runner_authorization: Mapping[str, str] | None = None,
 ) -> dict[str, Any]:
@@ -1406,8 +1500,29 @@ def mint_candidate_capability(
             runner_authorization=runner_authorization,
             mode=mode,
             proof_run_id=proof_run_id,
-            roots=roots,
+            roots=None,
         )
+        managed_roots = _canonical_promotion_roots(
+            conversation_ids=conversation_ids
+        )
+        managed_authority_roots = {
+            root_session_id: {
+                key: value for key, value in root.items() if key != "surface"
+            }
+            for root_session_id, root in managed_roots.items()
+        }
+        verified_ref = _validate_promotion_runner(
+            registry=registry,
+            runner_authorization=runner_authorization,
+            mode=mode,
+            proof_run_id=proof_run_id,
+            roots=managed_authority_roots,
+        )
+        if verified_ref != exact_ref:
+            raise DeepSeekIdentityError(
+                "HARNESS_PROOF_RUNNER_REQUIRED",
+                "dedicated runner exact ref changed during root derivation",
+            )
         snapshot = registry.read_snapshot()
         health = registry.read_live_health()
         observed_live_roots = sorted(
@@ -1426,13 +1541,29 @@ def mint_candidate_capability(
                 "plugin_contract_generation"
             ]
         ) as locked_snapshot:
+            one_shot_root = f"sc-{uuid.uuid4().hex}"
+            roots = {
+                **managed_roots,
+                one_shot_root: {
+                    "conversation_id": f"one-shot:{one_shot_root}",
+                    "lifecycle_epoch": 1,
+                    "verified_lineage": [],
+                    "surface": "one-shot",
+                },
+            }
+            authority_roots = {
+                root_session_id: {
+                    key: value for key, value in root.items() if key != "surface"
+                }
+                for root_session_id, root in roots.items()
+            }
             grant = _candidate_authority(registry).mint(
                 mode=mode,
                 exact_ref=exact_ref,
                 pinned_dsh_version=_current_dsh_version(),
                 disposable_baseline=disposable_baseline,
                 proof_run_id=proof_run_id,
-                roots=roots,
+                roots=authority_roots,
                 plugin_contract_generation=health[
                     "plugin_contract_generation"
                 ],
@@ -1451,6 +1582,7 @@ def mint_candidate_capability(
             "proof_run_id": grant.proof_run_id,
             "exact_ref": grant.exact_ref,
             "plugin_contract_generation": grant.plugin_contract_generation,
+            "roots": roots,
         }
     except DeepSeekIdentityError as exc:
         raise DeepSeekWebError(exc.code, exc.detail) from exc

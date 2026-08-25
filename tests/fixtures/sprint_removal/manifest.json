@@ -260,6 +260,7 @@
     ".super-coder/scripts/conversation_state.py",
     ".super-coder/scripts/deepseek_candidate_authority.py",
     ".super-coder/scripts/deepseek_promotion_runner.py",
+    ".super-coder/scripts/deepseek_web.py",
     ".super-coder/scripts/dispatch.sh",
     ".super-coder/scripts/dsh_execution_provenance.py",
     ".super-coder/scripts/dsh_preparation_inventory.py",

@@ -3,9 +3,9 @@
 
 The runner, rather than Browser, Sprint, one-shot, or ambient configuration,
 owns capability mint, context installation, restart adoption, and teardown.
-Conversation roots are derived from the engine database; the one-shot root is
-minted here.  The later clean-room canary drives this API on the disposable
-Arch seat and owns its receipt.
+Conversation roots are derived from the canonical engine database and the
+one-shot root is minted by the server. The later clean-room canary drives this
+API on the disposable Arch seat and owns its receipt.
 """
 from __future__ import annotations
 
@@ -15,7 +15,6 @@ import hashlib
 import json
 import os
 import secrets
-import sqlite3
 import stat
 import sys
 import tempfile
@@ -187,46 +186,6 @@ def _owner_json(path: Path, code: str) -> dict[str, Any]:
     return value
 
 
-def _conversation_roots(
-    db_path: str | Path, conversation_ids: Sequence[str]
-) -> dict[str, dict[str, Any]]:
-    if not conversation_ids or len(set(conversation_ids)) != len(conversation_ids):
-        raise PromotionRunnerError(
-            "HARNESS_PROOF_RUNNER_INVALID",
-            "promotion runner requires distinct engine conversation identities",
-        )
-    con = sqlite3.connect(db_path)
-    con.row_factory = sqlite3.Row
-    try:
-        roots: dict[str, dict[str, Any]] = {}
-        for conversation_id in conversation_ids:
-            row = con.execute(
-                "SELECT c.conversation_id,c.harness,"
-                "1+(SELECT COUNT(*) FROM conversation_events reopened "
-                "WHERE reopened.conversation_id=c.conversation_id "
-                "AND reopened.event_type='conversation.reopened') AS lifecycle_epoch,"
-                "EXISTS(SELECT 1 FROM sprint_participant_conversations link "
-                "WHERE link.conversation_id=c.conversation_id) AS is_sprint "
-                "FROM conversations c WHERE c.conversation_id=?",
-                (conversation_id,),
-            ).fetchone()
-            if row is None or row["harness"] != "deepseek":
-                raise PromotionRunnerError(
-                    "HARNESS_PROOF_RUNNER_INVALID",
-                    "promotion roots must be existing DeepSeek conversations",
-                )
-            root = f"sc-{uuid.uuid5(uuid.NAMESPACE_URL, conversation_id).hex}"
-            roots[root] = {
-                "conversation_id": conversation_id,
-                "lifecycle_epoch": int(row["lifecycle_epoch"]),
-                "verified_lineage": [],
-                "surface": "sprint" if row["is_sprint"] else "browser",
-            }
-        return roots
-    finally:
-        con.close()
-
-
 def _acceptance(
     *, mode: str, exact_ref: str, authority_root: Path
 ) -> dict[str, Any] | None:
@@ -295,7 +254,6 @@ def _finish_runner_state(path: Path, *, state: str) -> None:
 def start(
     *,
     env: Mapping[str, str],
-    db_path: str | Path,
     mode: str,
     disposable_baseline: str,
     proof_run_id: str,
@@ -312,19 +270,9 @@ def start(
     registry = deepseek_web._identity_registry(env)
     authority_root = registry.layout.root / "proof-authority"
     exact_ref = deepseek_web._exact_engine_ref()
-    roots = _conversation_roots(db_path, conversation_ids)
-    if {root["surface"] for root in roots.values()} != {"browser", "sprint"}:
-        raise PromotionRunnerError(
-            "HARNESS_PROOF_RUNNER_INVALID",
-            "promotion runner requires engine-derived Browser and Sprint roots",
-        )
-    one_shot_root = f"sc-{uuid.uuid4().hex}"
-    roots[one_shot_root] = {
-        "conversation_id": f"one-shot:{one_shot_root}",
-        "lifecycle_epoch": 1,
-        "verified_lineage": [],
-        "surface": "one-shot",
-    }
+    roots = deepseek_web._canonical_promotion_roots(
+        conversation_ids=tuple(conversation_ids)
+    )
     acceptance = _acceptance(
         mode=mode, exact_ref=exact_ref, authority_root=authority_root
     )
@@ -372,13 +320,14 @@ def start(
                 mode=mode,
                 disposable_baseline=disposable_baseline,
                 proof_run_id=proof_run_id,
-                roots=authority_roots,
+                conversation_ids=tuple(conversation_ids),
                 ttl_seconds=ttl_seconds,
                 runner_authorization={"state_path": str(state_path), "token": token},
             )
             state["state"] = "active"
             state["artifact"] = grant["artifact"]
             state["generation"] = grant["generation"]
+            state["roots"] = grant["roots"]
             _write_contexts(state)
             _atomic_owner_json(state_path, state)
         except BaseException:
@@ -445,7 +394,6 @@ def parser() -> argparse.ArgumentParser:
     )
     commands = result.add_subparsers(dest="command", required=True)
     begin = commands.add_parser("start", help="mint and install a new proof run")
-    begin.add_argument("--db-path", default=str(ENGINE / "shell_db.db"))
     begin.add_argument("--mode", required=True, choices=("candidate", "promoted"))
     begin.add_argument("--disposable-baseline", required=True)
     begin.add_argument("--proof-run-id", required=True)
@@ -466,7 +414,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.command == "start":
             run = start(
                 env=env,
-                db_path=args.db_path,
                 mode=args.mode,
                 disposable_baseline=args.disposable_baseline,
                 proof_run_id=args.proof_run_id,

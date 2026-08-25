@@ -1,13 +1,14 @@
 """Exact-ref, revocable DeepSeek proof capability regressions."""
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import sqlite3
 import sys
 import tempfile
 import threading
-import hashlib
+import uuid
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
@@ -16,7 +17,8 @@ from pathlib import Path
 import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
-SCRIPTS = ROOT / ".super-coder" / "scripts"
+ENGINE = ROOT / ".super-coder"
+SCRIPTS = ENGINE / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 
 import deepseek_web
@@ -54,6 +56,17 @@ ROOTS = {
         "verified_lineage": [],
     },
 }
+
+
+def canonical_roots(
+    roots: dict[str, dict[str, object]] = ROOTS,
+) -> dict[str, dict[str, object]]:
+    surfaces = ("browser", "sprint")
+    assert len(roots) == len(surfaces)
+    return {
+        root_session_id: {**root, "surface": surface}
+        for (root_session_id, root), surface in zip(roots.items(), surfaces)
+    }
 
 SURFACE_ROOT = "sc-" + "a" * 32
 SURFACE_CONVERSATION = "candidate-surface-conversation"
@@ -185,22 +198,71 @@ def runtime_registry(parent: Path) -> tuple[DeepSeekIdentityRegistry, Path, str]
     return registry, worktree, generation
 
 
-def promotion_db(path: Path) -> tuple[str, str]:
-    browser = "candidate-browser-conversation"
-    sprint = "candidate-sprint-conversation"
+def promotion_db(
+    path: Path, *, namespace: str = "candidate"
+) -> tuple[str, str]:
+    browser = f"{namespace}-browser-conversation"
+    sprint = f"{namespace}-sprint-conversation"
     con = sqlite3.connect(path)
     try:
-        con.executescript(
-            "CREATE TABLE conversations (conversation_id TEXT PRIMARY KEY, harness TEXT);"
-            "CREATE TABLE conversation_events (conversation_id TEXT, event_type TEXT);"
-            "CREATE TABLE sprint_participant_conversations (conversation_id TEXT);"
-        )
+        con.executescript((ENGINE / "schema.sql").read_text())
+        for migration in sorted((ENGINE / "migrations").glob("*.sql")):
+            con.executescript(migration.read_text())
+        con.execute("PRAGMA foreign_keys=ON")
+        con.execute("INSERT INTO users (user_id,username) VALUES (1,'operator')")
         con.executemany(
-            "INSERT INTO conversations VALUES (?, 'deepseek')",
-            [(browser,), (sprint,)],
+            "INSERT INTO shells "
+            "(shell_id,display_name,shortname,flavor,system_prompt,user_id) "
+            "VALUES (?,?,?,?,?,1)",
+            (
+                (1, "Browser", "DEV1", "dev", "prompt"),
+                (2, "Sprint", "DEV2", "dev", "prompt"),
+                (3, "Planner", "PLN1", "planner", "prompt"),
+            ),
+        )
+        feature_id = con.execute(
+            "INSERT INTO roadmap (title,roadmap_status) "
+            "VALUES ('Candidate proof','in_progress')"
+        ).lastrowid
+        sprint_id = con.execute(
+            "INSERT INTO sprints (feature_id,originating_planner_shell_id) "
+            "VALUES (?,3)",
+            (feature_id,),
+        ).lastrowid
+        participant_id = con.execute(
+            "INSERT INTO sprint_participants "
+            "(sprint_id,shell_id,role,harness,model,effort) "
+            "VALUES (?,2,'developer','deepseek','deepseek-chat','high')",
+            (sprint_id,),
+        ).lastrowid
+        con.executemany(
+            "INSERT INTO conversations "
+            "(conversation_id,shell_id,owner_user_id,harness,worktree,title,"
+            "creation_idempotency_key,creation_request_hash,conversation_scope) "
+            "VALUES (?,?,1,'deepseek','/tmp',?,?,?,?)",
+            (
+                (
+                    browser,
+                    1,
+                    "Browser",
+                    f"{namespace}-browser-key",
+                    "browser-hash",
+                    "normal",
+                ),
+                (
+                    sprint,
+                    2,
+                    "Sprint",
+                    f"{namespace}-sprint-key",
+                    "sprint-hash",
+                    "sprint",
+                ),
+            ),
         )
         con.execute(
-            "INSERT INTO sprint_participant_conversations VALUES (?)", (sprint,)
+            "INSERT INTO sprint_participant_conversations "
+            "(sprint_participant_id,conversation_id) VALUES (?,?)",
+            (participant_id, sprint),
         )
         con.commit()
     finally:
@@ -835,14 +897,26 @@ def test_candidate_managed_terminal_retires_root_and_allows_clean_next_mint(
                 "conversation_id": f"{conversation_id}-next",
                 "lifecycle_epoch": 1,
                 "verified_lineage": [],
-            }
+            },
+            f"companion-{surface}-root": {
+                "conversation_id": f"companion-{surface}-conversation",
+                "lifecycle_epoch": 1,
+                "verified_lineage": [],
+            },
         }
+        monkeypatch.setattr(
+            deepseek_web,
+            "_canonical_promotion_roots",
+            lambda **_kwargs: canonical_roots(next_roots),
+        )
         next_grant = deepseek_web.mint_candidate_capability(
             env=env,
             mode="candidate",
             disposable_baseline="arch-clean-2026-08-25",
             proof_run_id=f"proof-{surface}-next",
-            roots=next_roots,
+            conversation_ids=tuple(
+                root["conversation_id"] for root in next_roots.values()
+            ),
             ttl_seconds=600,
             runner_authorization=runner_authorization(
                 registry.layout.root,
@@ -1239,6 +1313,11 @@ def test_server_mint_derives_runtime_and_uses_only_fixed_authority_root(
         )
         monkeypatch.setattr(deepseek_web, "_exact_engine_ref", lambda: "a" * 40)
         monkeypatch.setattr(
+            deepseek_web,
+            "_canonical_promotion_roots",
+            lambda **_kwargs: canonical_roots(),
+        )
+        monkeypatch.setattr(
             deepseek_web.harness_versions, "probe", lambda _harness: "0.1.1-rc.2"
         )
         grant = deepseek_web.mint_candidate_capability(
@@ -1246,7 +1325,7 @@ def test_server_mint_derives_runtime_and_uses_only_fixed_authority_root(
             mode="candidate",
             disposable_baseline="arch-clean-2026-08-25",
             proof_run_id="proof-run-25",
-            roots=ROOTS,
+            conversation_ids=("conversation-a", "conversation-b"),
             ttl_seconds=600,
             runner_authorization=runner_authorization(
                 root,
@@ -1274,7 +1353,7 @@ def test_server_mint_derives_runtime_and_uses_only_fixed_authority_root(
             mode="candidate",
             disposable_baseline="arch-clean-2026-08-25",
             proof_run_id="proof-run-after-terminal",
-            roots=ROOTS,
+            conversation_ids=("conversation-a", "conversation-b"),
             ttl_seconds=600,
             runner_authorization=runner_authorization(
                 root,
@@ -1315,6 +1394,11 @@ def test_server_mint_rechecks_clean_seat_under_registry_mutation_lock(
         )
         monkeypatch.setattr(deepseek_web, "_exact_engine_ref", lambda: "a" * 40)
         monkeypatch.setattr(
+            deepseek_web,
+            "_canonical_promotion_roots",
+            lambda **_kwargs: canonical_roots(),
+        )
+        monkeypatch.setattr(
             deepseek_web, "_current_dsh_version", lambda: "0.1.1-rc.2"
         )
 
@@ -1325,7 +1409,7 @@ def test_server_mint_rechecks_clean_seat_under_registry_mutation_lock(
                 mode="candidate",
                 disposable_baseline="arch-clean-2026-08-25",
                 proof_run_id="proof-raced-clean-seat",
-                roots=ROOTS,
+                conversation_ids=("conversation-a", "conversation-b"),
                 ttl_seconds=600,
                 runner_authorization=runner_authorization(
                     registry.layout.root,
@@ -1366,6 +1450,116 @@ def test_server_mint_rechecks_clean_seat_under_registry_mutation_lock(
         assert not authority.artifacts.exists()
 
 
+def test_runner_rejects_foreign_database_input_before_any_proof_effect(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    with tempfile.TemporaryDirectory() as raw:
+        root = Path(raw)
+        registry, _worktree, _contract = runtime_registry(root)
+        foreign_db = root / "foreign.db"
+        foreign_browser, foreign_sprint = promotion_db(
+            foreign_db, namespace="foreign"
+        )
+        monkeypatch.setattr(deepseek_web, "_identity_registry", lambda _env: registry)
+
+        with pytest.raises(SystemExit) as refused:
+            deepseek_promotion_runner.parser().parse_args(
+                [
+                    "start",
+                    "--db-path",
+                    str(foreign_db),
+                    "--mode",
+                    "candidate",
+                    "--disposable-baseline",
+                    "arch-clean-2026-08-25",
+                    "--proof-run-id",
+                    "foreign-proof",
+                    "--conversation",
+                    foreign_browser,
+                    "--conversation",
+                    foreign_sprint,
+                ]
+            )
+        assert refused.value.code == 2
+        assert "unrecognized arguments: --db-path" in capsys.readouterr().err
+
+        authority_root = registry.layout.root / "proof-authority"
+        assert not authority_root.exists()
+        assert deepseek_promotion_runner.inject_conversation_context(
+            env={}, conversation_id=foreign_browser, lifecycle_epoch=1
+        ) == {}
+        assert deepseek_promotion_runner.inject_conversation_context(
+            env={}, conversation_id=foreign_sprint, lifecycle_epoch=1
+        ) == {}
+        assert deepseek_web.proof_root_from_environment(
+            env={}, surface="one-shot"
+        ) is None
+        assert registry.read_snapshot()["records"] == {}
+
+
+def test_server_rederives_runner_roots_and_fails_closed_on_disagreement(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with tempfile.TemporaryDirectory() as raw:
+        root = Path(raw)
+        registry, _worktree, _contract = runtime_registry(root)
+        canonical_db = root / "engine.db"
+        browser, sprint = promotion_db(canonical_db)
+        trusted_resolver = deepseek_web._canonical_promotion_roots
+        calls = 0
+
+        def disagreeing_resolver(
+            *, conversation_ids: tuple[str, ...]
+        ) -> dict[str, dict[str, object]]:
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                return canonical_roots()
+            return trusted_resolver(conversation_ids=conversation_ids)
+
+        monkeypatch.setattr(deepseek_web, "_identity_registry", lambda _env: registry)
+        monkeypatch.setattr(deepseek_web, "ENGINE_DB", canonical_db)
+        monkeypatch.setattr(deepseek_web, "_exact_engine_ref", lambda: "a" * 40)
+        monkeypatch.setattr(
+            deepseek_web, "_canonical_promotion_roots", disagreeing_resolver
+        )
+
+        with pytest.raises(deepseek_web.DeepSeekWebError) as refused:
+            deepseek_promotion_runner.start(
+                env={},
+                mode="candidate",
+                disposable_baseline="arch-clean-2026-08-25",
+                proof_run_id="disagreed-proof",
+                conversation_ids=[browser, sprint],
+                include_one_shot=True,
+                ttl_seconds=600,
+            )
+        assert refused.value.code == "HARNESS_PROOF_RUNNER_REQUIRED"
+        assert calls == 2
+
+        authority_root = registry.layout.root / "proof-authority"
+        runner = json.loads((authority_root / "runner.json").read_text())
+        assert runner["state"] == "failed"
+        assert runner["runner_token_sha256"] is None
+        assert runner["artifact"] is None
+        assert runner["generation"] is None
+        assert runner["contexts"] == {}
+        assert not (authority_root / "authority.json").exists()
+        assert not (authority_root / "capabilities").exists()
+        assert not (authority_root / "contexts").exists()
+        assert deepseek_promotion_runner.inject_conversation_context(
+            env={}, conversation_id=browser, lifecycle_epoch=1
+        ) == {}
+        assert deepseek_promotion_runner.inject_conversation_context(
+            env={}, conversation_id=sprint, lifecycle_epoch=1
+        ) == {}
+        assert deepseek_web.proof_root_from_environment(
+            env={}, surface="one-shot"
+        ) is None
+        assert registry.read_snapshot()["records"] == {}
+
+
 def test_dedicated_runner_drives_all_surfaces_restart_adoption_and_teardown(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1378,6 +1572,7 @@ def test_dedicated_runner_drives_all_surfaces_restart_adoption_and_teardown(
         db_path = root / "engine.db"
         browser, sprint = promotion_db(db_path)
         monkeypatch.setattr(deepseek_web, "_identity_registry", lambda _env: registry)
+        monkeypatch.setattr(deepseek_web, "ENGINE_DB", db_path)
         monkeypatch.setattr(deepseek_web, "_exact_engine_ref", lambda: "a" * 40)
         monkeypatch.setattr(
             deepseek_web, "_current_dsh_version", lambda: "0.1.1-rc.2"
@@ -1388,7 +1583,6 @@ def test_dedicated_runner_drives_all_surfaces_restart_adoption_and_teardown(
 
         run = deepseek_promotion_runner.start(
             env={},
-            db_path=db_path,
             mode="candidate",
             disposable_baseline="arch-clean-2026-08-25",
             proof_run_id="runner-proof-one",
@@ -1400,6 +1594,29 @@ def test_dedicated_runner_drives_all_surfaces_restart_adoption_and_teardown(
         assert {root["surface"] for root in state["roots"].values()} == {
             "browser", "sprint", "one-shot"
         }
+        managed = {
+            root["surface"]: (root_session_id, root)
+            for root_session_id, root in state["roots"].items()
+            if root["surface"] in {"browser", "sprint"}
+        }
+        assert managed["browser"] == (
+            f"sc-{uuid.uuid5(uuid.NAMESPACE_URL, browser).hex}",
+            {
+                "conversation_id": browser,
+                "lifecycle_epoch": 1,
+                "verified_lineage": [],
+                "surface": "browser",
+            },
+        )
+        assert managed["sprint"] == (
+            f"sc-{uuid.uuid5(uuid.NAMESPACE_URL, sprint).hex}",
+            {
+                "conversation_id": sprint,
+                "lifecycle_epoch": 1,
+                "verified_lineage": [],
+                "surface": "sprint",
+            },
+        )
         assert all(Path(path).exists() for path in state["contexts"].values())
 
         authority_before = authority.state_path.read_bytes()
@@ -1407,7 +1624,6 @@ def test_dedicated_runner_drives_all_surfaces_restart_adoption_and_teardown(
         with pytest.raises(deepseek_promotion_runner.PromotionRunnerError) as busy:
             deepseek_promotion_runner.start(
                 env={},
-                db_path=db_path,
                 mode="candidate",
                 disposable_baseline="arch-clean-2026-08-25",
                 proof_run_id="runner-proof-overlap",
@@ -1425,7 +1641,7 @@ def test_dedicated_runner_drives_all_surfaces_restart_adoption_and_teardown(
                 mode="candidate",
                 disposable_baseline="arch-clean-2026-08-25",
                 proof_run_id="ordinary-mint",
-                roots=ROOTS,
+                conversation_ids=(browser, sprint),
                 ttl_seconds=600,
             )
         assert ordinary.value.code == "HARNESS_PROOF_RUNNER_REQUIRED"
@@ -1515,7 +1731,6 @@ def test_dedicated_runner_drives_all_surfaces_restart_adoption_and_teardown(
 
         next_run = deepseek_promotion_runner.start(
             env={},
-            db_path=db_path,
             mode="candidate",
             disposable_baseline="arch-clean-2026-08-25",
             proof_run_id="runner-proof-two",
@@ -1536,6 +1751,7 @@ def test_promoted_runner_requires_candidate_acceptance_and_retirement_ref(
         db_path = root / "engine.db"
         browser, sprint = promotion_db(db_path)
         monkeypatch.setattr(deepseek_web, "_identity_registry", lambda _env: registry)
+        monkeypatch.setattr(deepseek_web, "ENGINE_DB", db_path)
         monkeypatch.setattr(deepseek_web, "_exact_engine_ref", lambda: "b" * 40)
         monkeypatch.setattr(
             deepseek_web, "_current_dsh_version", lambda: "0.1.1-rc.2"
@@ -1543,7 +1759,6 @@ def test_promoted_runner_requires_candidate_acceptance_and_retirement_ref(
 
         arguments = {
             "env": {},
-            "db_path": db_path,
             "mode": "promoted",
             "disposable_baseline": "arch-clean-2026-08-25",
             "proof_run_id": "promoted-proof",
