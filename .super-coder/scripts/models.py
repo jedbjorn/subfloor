@@ -9,6 +9,7 @@ be honored on this machine.
 from __future__ import annotations
 
 import json
+import os
 import shlex
 import sys
 from pathlib import Path
@@ -33,7 +34,7 @@ def _open_db():
 
 def _shell_api_enabled() -> bool:
     """A launched shell reads the live server; no token means root DB mode."""
-    if not mem.SC_API_TOKEN:
+    if not mem.SC_API_TOKEN and not os.environ.get("DSH_SC_MEM_CREDENTIAL_FILE"):
         return False
     mem._PROG = "models"
     mem._require_api()

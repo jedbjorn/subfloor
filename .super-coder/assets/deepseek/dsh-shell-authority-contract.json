@@ -135,7 +135,7 @@
     "linux": "The engine wrapper forks a gated root, moves it into a non-delegated cgroup-v2 domain before release, seals the exact binding snapshot into inherited FD 198, and remains live in the Host -> issuer -> root lineage until bounded teardown. Pass = the verifier proves descriptor/cgroup identity, live lineage, generations, expiry, protected admission, and empty subtree delegation without an ambient selector.",
     "linux_contributor": {
       "path": ".super-coder/scripts/dsh_execution_provenance.py",
-      "sha256": "aeddd89ff6603165017687b85ec419733acb7f5168ca48d470c12518f481316f",
+      "sha256": "8649dae24a09004dddbbe6e670a0412026d3ef86d7eab032a3aca2f13bf7e10b",
       "contract": "sc-dsh-linux-cgroup-v2-v2"
     },
     "production_linux_contributor": {
@@ -157,10 +157,10 @@
         "path": "tests/fixtures/deepseek_dsh_effect_driver.py",
         "sha256": "963a7251f8d7fdcf1a079388ed2e1bef5c7ca638bd76de9b65da4a693d86251e"
       },
-      "neutral_route": "help|-h|--help resolves at the future guard seam without identity lookup, credential/API/DB access, discovery, filesystem mutation, subprocess start, or authority-bearing output",
+      "neutral_route": "help|-h|--help resolves at the stable sc admission boundary without identity lookup, credential/API/DB access, discovery, filesystem mutation, subprocess start, or authority-bearing output",
       "authorized_route": "mem resolves one frozen identity context only after complete aliases, stable owner-only nonsymlink credential/current-record files, current generations, literal loopback API, and authenticated whoami equality",
       "effect_order": "the authenticated whoami observer proves the protected-effect sentinel is absent before replying; the harness writes the exact immutable identity receipt only after stable-file rechecks",
-      "production_wiring": "deferred to task 650; the current top-level sc bootstrap is not modified or claimed effect-free"
+      "production_wiring": "task 650 wires the stable sc bootstrap to the live v3 descriptor verifier before ambient SC selectors, dispatcher selection, policy-specific imports, credential discovery, or command effects"
     },
     "platform_boundary": "Arch and Ubuntu Linux only; the disposable Arch VM is the sole clean-room platform gate, and native Windows/macOS contributors, runners, compatibility layers, and CI are excluded",
     "executor_rule": "on supported Linux, the dedicated subprocess wrapper places every Bash and pwsh foreground/background ToolExecution child in exactly one registered execution domain before user code starts",
@@ -544,7 +544,9 @@
     ],
     "credential_discovery": [
       ".super-coder/scripts/job.py",
-      ".super-coder/scripts/mem.py"
+      ".super-coder/scripts/mem.py",
+      ".super-coder/scripts/models.py",
+      ".super-coder/scripts/skill.py"
     ],
     "direct_db": [
       ".super-coder/scripts/dispatch.sh",
@@ -590,14 +592,14 @@
     ]
   },
   "source_sha256_inventory": {
-    ".super-coder/scripts/dispatch.sh": "b05b649715f8d3bda783d12f17467511a4d91faca512459431b3183bc12d7551",
-    ".super-coder/scripts/job.py": "3177445bbd244ebc0a5872cd96b7b99b5b0c4abe449da7ac521979afe35f295c",
+    ".super-coder/scripts/dispatch.sh": "7fe92b4230f9d089ebe6952c945f91ec3a925055d5929510a27bd1ed26a6f311",
+    ".super-coder/scripts/job.py": "ce068f6998bd090b983b3052617f4992abf97886525ff9bdc2c6f1ceecf78cf3",
     ".super-coder/scripts/map_finalize.py": "bbd8fd943eee12f2df923084a55fdb091f30a9c48df425de85828723def65a32",
-    ".super-coder/scripts/mem.py": "831d6c64f29e059199e78f822d8e1738e32540adfc8bbb8815e649e27f838d13",
-    ".super-coder/scripts/models.py": "aa3665a276269263416f57df8db06399dc110e0adaaf70050cd14bcb1a7cd57b",
+    ".super-coder/scripts/mem.py": "945a6892dc3514e69e3f45d27e9d93f4839987539aed15b3366ee9f05768262a",
+    ".super-coder/scripts/models.py": "af493d1ed1b48f4418ee5f2ea15dbf9ff7060c3dd3387cbe7c84c693cc17f83e",
     ".super-coder/scripts/pr_cli.py": "4ec130866495bf981240d63176c8008f77f0e9b748012bc229e05b657aff8fb0",
-    ".super-coder/scripts/skill.py": "f852de02e532a07b5dcaae4abea250e738e737c87592642f3d379327ebcaa34f",
-    "sc": "db53d857cfa3f23bdc3f7e8c65be17492956cfe10401928295abfe0a9564ce55"
+    ".super-coder/scripts/skill.py": "49e853c8fb7783638fbd787f8c92a51d1c8b17bbd6245a63071b93f62e495699",
+    "sc": "adcc6d03972eba246c0bdba32c6b5e00313ed36c0f7b0233aa4ee25cac5711ba"
   },
   "direct_sc_signal_inventory": {
     "SC_ADMIN": [
@@ -609,6 +611,9 @@
       ".super-coder/scripts/init_fork.py",
       ".super-coder/scripts/install.py",
       ".super-coder/scripts/update.py"
+    ],
+    "SC_ADMISSION_FLOOR": [
+      "sc"
     ],
     "SC_API_BASE": [
       ".super-coder/api/server.py",
@@ -851,11 +856,17 @@
     "SC_PLATFORM_KERNEL": [
       ".super-coder/scripts/dispatch.sh"
     ],
+    "SC_POLICY": [
+      "sc"
+    ],
     "SC_PROTECTED_BRANCHES": [
       ".super-coder/scripts/branch-guard.sh",
       ".super-coder/scripts/git_freshness.py",
       ".super-coder/scripts/git_hygiene.py",
       ".super-coder/scripts/run.py"
+    ],
+    "SC_PROVENANCE": [
+      "sc"
     ],
     "SC_PYTHON": [
       ".super-coder/scripts/dispatch.sh",
@@ -953,6 +964,9 @@
     ],
     "SC_SPRINT_FORCE_NEW_QUIET_SECONDS": [
       ".super-coder/scripts/sprint_message_delivery.py"
+    ],
+    "SC_SYSTEM_PYTHON": [
+      "sc"
     ],
     "SC_UID": [
       ".super-coder/scripts/dsh_preparation_inventory.py",
@@ -1053,7 +1067,9 @@
     ],
     "os.environ.get": [
       ".super-coder/scripts/job.py",
-      ".super-coder/scripts/mem.py"
+      ".super-coder/scripts/mem.py",
+      ".super-coder/scripts/models.py",
+      ".super-coder/scripts/skill.py"
     ],
     "os.fstat": [
       ".super-coder/scripts/mem.py"
@@ -1335,6 +1351,7 @@
       "SC_USER"
     ],
     "effect_configuration_refused": [
+      "SC_ADMISSION_FLOOR",
       "SC_ARTIFACT_MODE",
       "SC_BASE_IMAGE",
       "SC_BIND",
@@ -1378,7 +1395,9 @@
       "SC_PARENT_IMAGE",
       "SC_PG_SHM",
       "SC_PLATFORM_KERNEL",
+      "SC_POLICY",
       "SC_PROTECTED_BRANCHES",
+      "SC_PROVENANCE",
       "SC_PYTHON",
       "SC_PYTHON_EXECUTABLE",
       "SC_PYTHON_RUNTIME",
@@ -1391,6 +1410,7 @@
       "SC_SHARED_DIRS",
       "SC_SIGNAL",
       "SC_SPRINT_FORCE_NEW_QUIET_SECONDS",
+      "SC_SYSTEM_PYTHON",
       "SC_UPDATE_TARGET_REF"
     ],
     "classification": "ambient values are refused before protected effect under managed DSH; trusted values may be derived only after the guard"
@@ -2067,7 +2087,7 @@
   },
   "bounded_direct_consumer_inventory": {
     ".super-coder/scripts/dispatch.sh": {
-      "sha256": "b05b649715f8d3bda783d12f17467511a4d91faca512459431b3183bc12d7551",
+      "sha256": "7fe92b4230f9d089ebe6952c945f91ec3a925055d5929510a27bd1ed26a6f311",
       "sc_signals": [
         "SC_ADMIN",
         "SC_BIND",
@@ -2100,7 +2120,7 @@
       ]
     },
     ".super-coder/scripts/job.py": {
-      "sha256": "3177445bbd244ebc0a5872cd96b7b99b5b0c4abe449da7ac521979afe35f295c",
+      "sha256": "ce068f6998bd090b983b3052617f4992abf97886525ff9bdc2c6f1ceecf78cf3",
       "sc_signals": [
         "SC_API_BASE",
         "SC_API_TOKEN"
@@ -2131,7 +2151,7 @@
       ]
     },
     ".super-coder/scripts/mem.py": {
-      "sha256": "831d6c64f29e059199e78f822d8e1738e32540adfc8bbb8815e649e27f838d13",
+      "sha256": "945a6892dc3514e69e3f45d27e9d93f4839987539aed15b3366ee9f05768262a",
       "sc_signals": [
         "SC_API_BASE",
         "SC_API_TOKEN",
@@ -2149,11 +2169,12 @@
       ]
     },
     ".super-coder/scripts/models.py": {
-      "sha256": "aa3665a276269263416f57df8db06399dc110e0adaaf70050cd14bcb1a7cd57b",
+      "sha256": "af493d1ed1b48f4418ee5f2ea15dbf9ff7060c3dd3387cbe7c84c693cc17f83e",
       "sc_signals": [
         "SC_API_TOKEN"
       ],
       "effect_classes": [
+        "credential_discovery",
         "direct_db",
         "direct_db_read",
         "direct_db_write",
@@ -2166,11 +2187,12 @@
       "effect_classes": []
     },
     ".super-coder/scripts/skill.py": {
-      "sha256": "f852de02e532a07b5dcaae4abea250e738e737c87592642f3d379327ebcaa34f",
+      "sha256": "49e853c8fb7783638fbd787f8c92a51d1c8b17bbd6245a63071b93f62e495699",
       "sc_signals": [
         "SC_API_TOKEN"
       ],
       "effect_classes": [
+        "credential_discovery",
         "direct_db",
         "direct_db_read",
         "direct_db_write",
@@ -2178,10 +2200,14 @@
       ]
     },
     "sc": {
-      "sha256": "db53d857cfa3f23bdc3f7e8c65be17492956cfe10401928295abfe0a9564ce55",
+      "sha256": "adcc6d03972eba246c0bdba32c6b5e00313ed36c0f7b0233aa4ee25cac5711ba",
       "sc_signals": [
+        "SC_ADMISSION_FLOOR",
         "SC_CALLER_ROOT",
-        "SC_DISPATCH"
+        "SC_DISPATCH",
+        "SC_POLICY",
+        "SC_PROVENANCE",
+        "SC_SYSTEM_PYTHON"
       ],
       "effect_classes": [
         "filesystem_read",

@@ -237,7 +237,10 @@ def _require_api() -> None:
     shell think a write was API-backed when it wasn't)."""
     if SC_API_TOKEN and SC_API_BASE:
         return
-    credential_file = os.environ.get("SC_MEM_CREDENTIAL_FILE", "")
+    credential_file = (
+        os.environ.get("SC_MEM_CREDENTIAL_FILE", "")
+        or os.environ.get("DSH_SC_MEM_CREDENTIAL_FILE", "")
+    )
     if not SC_API_TOKEN and not SC_API_BASE and credential_file:
         _load_runtime_credential(Path(credential_file))
         return
