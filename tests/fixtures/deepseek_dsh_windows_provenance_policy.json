@@ -1,0 +1,38 @@
+{
+  "contract": "sc-dsh-windows-job-object-v2",
+  "envelope_header": "SC-DSH-DESCRIPTOR-V2",
+  "max_descriptor_bytes": 8192,
+  "public_key_spki_base64": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEApfyngrNJm7UFl1H+vyoc3ov4nRFoxSkbYsrSYHEjhjE5cf7V/Pspl3sF6bPCdl98aufTxEvGqHsmSVXR6DaJ0re8+GuLFX/CBFcA77L0kX9EDWsHQlb9oS5lUV8r2YNuGHDi3O/c9NzleWrSRkWHJeL2YbpyLzaObvtuRFsX/sf6IkXQmtAfM+UyuiRztN1Cbes+S+TGY+MZ4ZoK5540oVAdMMBjCBxqRtRxMl5yS7KnnApjyIBwBbFtFnGjbSVF1In8NFW8L+6m5ZMdNbMYkjQXS1UMgSihEmqwgV7r8Wj70RX40PYpqSod0Qan4luURjBrcbUmArT346UoLmbxnwIDAQAB",
+  "signature": {
+    "digest": "SHA256",
+    "padding": "Pkcs1"
+  },
+  "descriptor_fields": [
+    "binding_generation",
+    "contract",
+    "domain_id",
+    "expires_unix_ms",
+    "issued_unix_ms",
+    "job_handle",
+    "process_id"
+  ],
+  "rules": [
+    {"id": "job-member", "stage": "native", "left": "facts.job_member", "operator": "equals", "right": true},
+    {"id": "non-breakaway", "stage": "native", "left": "facts.breakaway", "operator": "equals", "right": false},
+    {"id": "pipe-handle", "stage": "native", "left": "facts.handle_type", "operator": "equals", "right": "pipe"},
+    {"id": "readable-handle", "stage": "native", "left": "facts.readable", "operator": "equals", "right": true},
+    {"id": "immutable-handle", "stage": "native", "left": "facts.descriptor_writable", "operator": "equals", "right": false},
+    {"id": "valid-signature", "stage": "descriptor", "left": "facts.signature_valid", "operator": "equals", "right": true},
+    {"id": "exact-schema", "stage": "descriptor", "left": "payload", "operator": "exact_fields", "right": "policy.descriptor_fields"},
+    {"id": "canonical-payload", "stage": "descriptor", "left": "payload", "operator": "canonical_json", "right": "context.payload_text"},
+    {"id": "contract-binding", "stage": "descriptor", "left": "payload.contract", "operator": "equals", "right": "policy.contract"},
+    {"id": "domain-shape", "stage": "descriptor", "left": "payload.domain_id", "operator": "matches", "right": "^[a-f0-9]{32}$"},
+    {"id": "domain-binding", "stage": "descriptor", "left": "payload.domain_id", "operator": "equals", "right": "context.expected_domain_id"},
+    {"id": "job-binding", "stage": "descriptor", "left": "payload.job_handle", "operator": "equals", "right": "context.expected_job_handle"},
+    {"id": "process-binding", "stage": "descriptor", "left": "payload.process_id", "operator": "equals", "right": "context.expected_process_id"},
+    {"id": "positive-generation", "stage": "descriptor", "left": "payload.binding_generation", "operator": "integer_min", "right": 1},
+    {"id": "issued-not-future", "stage": "descriptor", "left": "payload.issued_unix_ms", "operator": "integer_lte", "right": "context.now_unix_ms"},
+    {"id": "not-expired", "stage": "descriptor", "left": "payload.expires_unix_ms", "operator": "integer_gt", "right": "context.now_unix_ms"},
+    {"id": "bounded-lifetime", "stage": "descriptor", "left": "payload.expires_unix_ms", "operator": "integer_difference_lte", "right": "payload.issued_unix_ms", "limit": 30000}
+  ]
+}

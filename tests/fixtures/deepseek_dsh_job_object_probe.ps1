@@ -1,21 +1,19 @@
 param(
     [Parameter(Mandatory = $true)][Int64]$JobHandle,
-    [Parameter(Mandatory = $true)][Int64]$DescriptorHandle
+    [Parameter(Mandatory = $true)][Int64]$DescriptorHandle,
+    [Parameter(Mandatory = $true)][String]$ExpectedDomainId
 )
 
-$TrustedPublicKey = "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEApfyngrNJm7UFl1H+vyoc3ov4nRFoxSkbYsrSYHEjhjE5cf7V/Pspl3sF6bPCdl98aufTxEvGqHsmSVXR6DaJ0re8+GuLFX/CBFcA77L0kX9EDWsHQlb9oS5lUV8r2YNuGHDi3O/c9NzleWrSRkWHJeL2YbpyLzaObvtuRFsX/sf6IkXQmtAfM+UyuiRztN1Cbes+S+TGY+MZ4ZoK5540oVAdMMBjCBxqRtRxMl5yS7KnnApjyIBwBbFtFnGjbSVF1In8NFW8L+6m5ZMdNbMYkjQXS1UMgSihEmqwgV7r8Wj70RX40PYpqSod0Qan4luURjBrcbUmArT346UoLmbxnwIDAQAB"
-$DescriptorFields = @(
-    "binding_generation",
-    "contract",
-    "domain_id",
-    "expires_unix_ms",
-    "issued_unix_ms",
-    "job_handle",
-    "process_id"
-)
-$DescriptorContract = "sc-dsh-windows-job-object-v2"
-$MaxDescriptorBytes = 8192
-$MaxLifetimeMs = 30000
+$PolicyPath = Join-Path $PSScriptRoot "deepseek_dsh_windows_provenance_policy.json"
+$PolicySha256 = "1999766c891c34f9f62810e2013974b789a0be57b26115fb30de32671f3162c9"
+$policyBytes = [System.IO.File]::ReadAllBytes($PolicyPath)
+$policyDigest = [Convert]::ToHexString(
+    [System.Security.Cryptography.SHA256]::HashData($policyBytes)
+).ToLowerInvariant()
+if ($policyDigest -ne $PolicySha256.ToLowerInvariant()) { exit 77 }
+$Policy = ([System.Text.Encoding]::UTF8.GetString($policyBytes) |
+    ConvertFrom-Json -ErrorAction Stop)
+$MaxDescriptorBytes = [Int64]$Policy.max_descriptor_bytes
 
 $nativeSource = @"
 using System;
@@ -149,6 +147,48 @@ function Refuse-Provenance {
     throw [System.Security.SecurityException]::new("untrusted execution provenance")
 }
 
+function Get-PolicyValue($Reference, $State) {
+    if ($Reference -isnot [String]) {
+        return $Reference
+    }
+    if ($State.ContainsKey($Reference)) { return $State[$Reference] }
+    if (-not $Reference.Contains(".")) { return $Reference }
+    $parts = $Reference.Split(".")
+    $value = $State[$parts[0]]
+    foreach ($part in $parts[1..($parts.Count - 1)]) { $value = $value.$part }
+    return $value
+}
+
+function Test-PolicyRule($Rule, $State) {
+    $left = Get-PolicyValue $Rule.left $State
+    $right = Get-PolicyValue $Rule.right $State
+    switch ($Rule.operator) {
+        "equals" { return $left -ceq $right }
+        "matches" { return $left -is [String] -and $left -cmatch $right }
+        "exact_fields" {
+            $actual = @($left.PSObject.Properties.Name | Sort-Object)
+            $expected = @($right | Sort-Object)
+            return (Compare-Object $expected $actual).Count -eq 0
+        }
+        "canonical_json" {
+            $document = [System.Text.Json.JsonDocument]::Parse($right)
+            try {
+                return [System.Text.Json.JsonSerializer]::Serialize(
+                    $document.RootElement
+                ) -ceq $right
+            } finally { $document.Dispose() }
+        }
+        "integer_min" { return $left -is [Int64] -and $left -ge [Int64]$right }
+        "integer_lte" { return $left -is [Int64] -and $left -le [Int64]$right }
+        "integer_gt" { return $left -is [Int64] -and $left -gt [Int64]$right }
+        "integer_difference_lte" {
+            return $left -is [Int64] -and $right -is [Int64] -and
+                ($left - $right) -le [Int64]$Rule.limit
+        }
+        default { Refuse-Provenance }
+    }
+}
+
 function Read-SealedDescriptor([IntPtr]$Handle) {
     $safe = [Microsoft.Win32.SafeHandles.SafeFileHandle]::new($Handle, $false)
     $stream = [System.IO.FileStream]::new(
@@ -186,31 +226,44 @@ try {
             [ref]$inExpectedJob)) {
         Refuse-Provenance
     }
-    if (-not $inExpectedJob) { Refuse-Provenance }
-
     $flags = [ScDshJobProbe]::LimitFlags($job)
     $breakaway = (
         [ScDshJobProbe]::JOB_OBJECT_LIMIT_BREAKAWAY_OK -bor
         [ScDshJobProbe]::JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK
     )
-    if (($flags -band $breakaway) -ne 0) { Refuse-Provenance }
-    if ([ScDshJobProbe]::GetFileType($descriptor) -ne
-            [ScDshJobProbe]::FILE_TYPE_PIPE) {
-        Refuse-Provenance
-    }
+    $permitsBreakaway = (($flags -band $breakaway) -ne 0)
+    $handleType = if ([ScDshJobProbe]::GetFileType($descriptor) -eq
+        [ScDshJobProbe]::FILE_TYPE_PIPE) { "pipe" } else { "other" }
     $access = [ScDshJobProbe]::GrantedAccess($descriptor)
-    if (($access -band [ScDshJobProbe]::FILE_READ_DATA) -eq 0) {
-        Refuse-Provenance
+    $readable = (($access -band [ScDshJobProbe]::FILE_READ_DATA) -ne 0)
+    $descriptorWritable = (
+        ($access -band [ScDshJobProbe]::FORBIDDEN_WRITE_ACCESS) -ne 0
+    )
+    $state = @{
+        policy = $Policy
+        payload = $null
+        facts = [PSCustomObject]@{
+            job_member = $inExpectedJob
+            breakaway = $permitsBreakaway
+            handle_type = $handleType
+            readable = $readable
+            descriptor_writable = $descriptorWritable
+            signature_valid = $false
+        }
+        context = $null
     }
-    if (($access -band [ScDshJobProbe]::FORBIDDEN_WRITE_ACCESS) -ne 0) {
-        Refuse-Provenance
+    foreach ($rule in $Policy.rules) {
+        if ($rule.stage -eq "native" -and
+                -not (Test-PolicyRule $rule $state)) {
+            Refuse-Provenance
+        }
     }
 
     $envelopeBytes = Read-SealedDescriptor $descriptor
     $envelopeText = [System.Text.Encoding]::ASCII.GetString($envelopeBytes)
     $lines = $envelopeText.Split([char]10)
     if ($lines.Count -ne 4 -or
-            $lines[0] -ne "SC-DSH-DESCRIPTOR-V2" -or
+            $lines[0] -ne $Policy.envelope_header -or
             $lines[3] -ne "") {
         Refuse-Provenance
     }
@@ -223,45 +276,39 @@ try {
 
     $rsa = [System.Security.Cryptography.RSA]::Create()
     try {
-        $keyBytes = [Convert]::FromBase64String($TrustedPublicKey)
+        $keyBytes = [Convert]::FromBase64String($Policy.public_key_spki_base64)
         $bytesRead = 0
         $rsa.ImportSubjectPublicKeyInfo($keyBytes, [ref]$bytesRead)
-        if ($bytesRead -ne $keyBytes.Length -or -not $rsa.VerifyData(
+        $signatureValid = $bytesRead -eq $keyBytes.Length -and $rsa.VerifyData(
                 $payloadBytes,
                 $signature,
                 [System.Security.Cryptography.HashAlgorithmName]::SHA256,
-                [System.Security.Cryptography.RSASignaturePadding]::Pkcs1)) {
-            Refuse-Provenance
-        }
+                [System.Security.Cryptography.RSASignaturePadding]::Pkcs1)
     } finally {
         $rsa.Dispose()
     }
 
     $utf8 = [System.Text.UTF8Encoding]::new($false, $true)
     $payload = ($utf8.GetString($payloadBytes) | ConvertFrom-Json -ErrorAction Stop)
-    $actualFields = @($payload.PSObject.Properties.Name | Sort-Object)
-    if ((Compare-Object $DescriptorFields $actualFields).Count -ne 0) {
-        Refuse-Provenance
-    }
-    if ($payload.contract -ne $DescriptorContract -or
-            $payload.domain_id -notmatch "^[a-f0-9]{32}$") {
-        Refuse-Provenance
-    }
-    if ([Int64]$payload.job_handle -ne $JobHandle -or
-            [Int64]$payload.process_id -ne [ScDshJobProbe]::GetCurrentProcessId()) {
-        Refuse-Provenance
-    }
-    if ([Int64]$payload.binding_generation -le 0) { Refuse-Provenance }
     $now = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
-    $issued = [Int64]$payload.issued_unix_ms
-    $expires = [Int64]$payload.expires_unix_ms
-    if ($issued -gt $now -or $expires -le $now -or
-            ($expires - $issued) -gt $MaxLifetimeMs) {
-        Refuse-Provenance
+    $state.payload = $payload
+    $state.facts.signature_valid = $signatureValid
+    $state.context = [PSCustomObject]@{
+            payload_text = $utf8.GetString($payloadBytes)
+            expected_domain_id = $ExpectedDomainId
+            expected_job_handle = $JobHandle
+            expected_process_id = [ScDshJobProbe]::GetCurrentProcessId()
+            now_unix_ms = $now
+    }
+    foreach ($rule in $Policy.rules) {
+        if ($rule.stage -eq "descriptor" -and
+                -not (Test-PolicyRule $rule $state)) {
+            Refuse-Provenance
+        }
     }
 
     @{
-        contract = $DescriptorContract
+        contract = $Policy.contract
         provenance = "managed"
         job_member = $true
         non_breakaway = $true

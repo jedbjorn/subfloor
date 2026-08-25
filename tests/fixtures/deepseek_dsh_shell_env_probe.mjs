@@ -18,6 +18,7 @@ if (!packageRoot || !contractPath) {
 const contract = JSON.parse(await readFile(contractPath, "utf8"));
 const powershellParity = await runWindowsDescriptorVectors(
   new URL("./deepseek_dsh_windows_descriptor_vectors.json", import.meta.url),
+  new URL("./deepseek_dsh_windows_provenance_policy.json", import.meta.url),
   new URL("./deepseek_dsh_job_object_probe.ps1", import.meta.url),
 );
 

@@ -24,6 +24,7 @@ FILESYSTEM_WRITE_METHODS = {
     "rmtree", "symlink", "symlink_to", "touch", "unlink", "write_bytes",
     "write_text",
 }
+RECEIVER_TYPED_FILESYSTEM_METHODS = {"copy", "open", "remove", "replace", "walk"}
 FILESYSTEM_READ_CALLS = {
     "os.access", "os.fstat", "os.lstat", "os.pread", "os.read", "os.readlink",
     "os.stat", "os.walk", "shutil.which",
@@ -56,7 +57,18 @@ API_CALLS = {
     "requests.patch", "requests.post", "requests.put", "socket.create_connection",
     "socket.socket", "urllib.request.urlopen",
 }
-DB_CALLS = {"sqlite3.connect"}
+DB_CALLS = {
+    "db_driver.connect": "direct_db",
+    "db_driver.write_transaction": "direct_db_write",
+    "sqlite3.connect": "direct_db",
+}
+DB_NEUTRAL_CALLS = {
+    "db_driver.IntegrityError", "db_driver.OperationalError",
+    "db_driver.is_busy_error",
+}
+DB_RECEIVER_NAMES = {"con", "connection", "cur", "dst", "eng", "self.con"}
+DB_READ_METHODS = {"fetchall", "fetchmany", "fetchone"}
+DB_WRITE_METHODS = {"commit", "executemany", "executescript", "rollback"}
 DISCOVERY_CALLS = {
     "os.environ.get": "credential_discovery",
     "os.getcwd": "identity_discovery",
@@ -78,7 +90,7 @@ BOUNDED_NEUTRAL_RISKY_CALLS = {
 }
 RISKY_ROOTS = {
     "asyncio", "http", "httpx", "multiprocessing", "os", "pty",
-    "requests", "shutil", "socket", "sqlite3", "subprocess", "urllib",
+    "db_driver", "requests", "shutil", "socket", "sqlite3", "subprocess",
 }
 AUTHORIZED_LITERAL_SUBCOMMAND_PATHS = {
     ".super-coder/scripts/job.py",
@@ -176,7 +188,9 @@ def _open_mode(node: ast.Call) -> str:
 
 def _risky_classification(callee: str) -> str | None:
     if callee in DB_CALLS:
-        return "direct_db"
+        return DB_CALLS[callee]
+    if callee in DB_NEUTRAL_CALLS:
+        return "identity_neutral_read_only"
     if callee in API_CALLS:
         return "api_effect"
     if callee in PROCESS_CALLS:
@@ -194,7 +208,7 @@ def _risky_classification(callee: str) -> str | None:
     return None
 
 
-def _categories(callee: str, node: ast.Call) -> set[str]:
+def _categories(callee: str, node: ast.Call, *, path_receiver: bool = False) -> set[str]:
     method = callee.rsplit(".", 1)[-1]
     categories: set[str] = set()
     if callee.split(".", 1)[0] in RISKY_ROOTS:
@@ -203,7 +217,7 @@ def _categories(callee: str, node: ast.Call) -> set[str]:
             categories.add(classification)
         return categories
     if callee in DB_CALLS:
-        categories.add("direct_db")
+        categories.add(DB_CALLS[callee])
     if callee in API_CALLS or method in {"urlopen", "request"}:
         categories.add("api_effect")
     if callee in PROCESS_CALLS or (
@@ -213,24 +227,133 @@ def _categories(callee: str, node: ast.Call) -> set[str]:
     if callee == "open":
         mode = _open_mode(node)
         categories.add("filesystem_write" if set(mode) & set("wax+") else "filesystem_read")
-    if method in FILESYSTEM_READ_METHODS:
+    if method in FILESYSTEM_READ_METHODS and (
+        path_receiver or method not in RECEIVER_TYPED_FILESYSTEM_METHODS
+    ):
         categories.add("filesystem_read")
-    if method in FILESYSTEM_WRITE_METHODS:
+    if method in FILESYSTEM_WRITE_METHODS and (
+        path_receiver or method not in RECEIVER_TYPED_FILESYSTEM_METHODS
+    ):
         categories.add("filesystem_write")
     if callee == "os.open":
         categories.update({"filesystem_read", "filesystem_write"})
     return categories
 
 
+def _target_names(node: ast.AST) -> set[str]:
+    if isinstance(node, (ast.Name, ast.Attribute)):
+        raw = _raw_callee(node)
+        return {raw} if raw else set()
+    if isinstance(node, (ast.Tuple, ast.List)):
+        return set().union(*(_target_names(item) for item in node.elts))
+    return set()
+
+
+def _annotation_is_path(node: ast.AST | None, aliases: dict[str, str]) -> bool:
+    return node is not None and _callee(node, aliases) in {"Path", "pathlib.Path"}
+
+
+def _expression_is_path(
+    node: ast.AST, aliases: dict[str, str], path_receivers: set[str]
+) -> bool:
+    raw = _raw_callee(node)
+    if raw in path_receivers:
+        return True
+    if isinstance(node, ast.Call):
+        callee = _callee(node.func, aliases)
+        if callee in {"Path", "pathlib.Path"}:
+            return True
+        if isinstance(node.func, ast.Attribute):
+            receiver = _raw_callee(node.func.value)
+            return receiver in path_receivers and node.func.attr in {
+                "absolute", "expanduser", "resolve", "with_name", "with_stem",
+                "with_suffix",
+            }
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Div):
+        return _expression_is_path(node.left, aliases, path_receivers)
+    return False
+
+
+def _db_execute_category(node: ast.Call) -> str:
+    if not node.args or not isinstance(node.args[0], ast.Constant):
+        return "direct_db_write"
+    sql = node.args[0].value
+    if not isinstance(sql, str):
+        return "direct_db_write"
+    operation = sql.lstrip().split(None, 1)[0].upper() if sql.strip() else ""
+    return "direct_db_read" if operation in {"EXPLAIN", "PRAGMA", "SELECT"} else "direct_db_write"
+
+
 def _python_calls(path: Path) -> Iterable[tuple[str, set[str], int, int]]:
     tree = ast.parse(path.read_text())
     aliases = _imports(tree)
+    path_receivers: set[str] = set()
+    db_receivers = set(DB_RECEIVER_NAMES)
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            for argument in (*node.args.posonlyargs, *node.args.args, *node.args.kwonlyargs):
+                if _annotation_is_path(argument.annotation, aliases):
+                    path_receivers.add(argument.arg)
+        if isinstance(node, ast.AnnAssign) and _annotation_is_path(node.annotation, aliases):
+            path_receivers.update(_target_names(node.target))
+    changed = True
+    while changed:
+        changed = False
+        for node in ast.walk(tree):
+            if not isinstance(node, (ast.Assign, ast.AnnAssign)):
+                continue
+            value = node.value
+            if value is None:
+                continue
+            targets = (
+                set().union(*(_target_names(target) for target in node.targets))
+                if isinstance(node, ast.Assign)
+                else _target_names(node.target)
+            )
+            if _expression_is_path(value, aliases, path_receivers):
+                before = len(path_receivers)
+                path_receivers.update(targets)
+                changed |= len(path_receivers) != before
+            if isinstance(value, ast.Call):
+                callee = _callee(value.func, aliases)
+                receiver = (
+                    _raw_callee(value.func.value)
+                    if isinstance(value.func, ast.Attribute)
+                    else None
+                )
+                if callee in DB_CALLS or (
+                    receiver in db_receivers
+                    and value.func.attr in {"cursor", "execute"}
+                ):
+                    before = len(db_receivers)
+                    db_receivers.update(targets)
+                    changed |= len(db_receivers) != before
     for node in ast.walk(tree):
         if not isinstance(node, ast.Call):
             continue
         callee = _callee(node.func, aliases)
-        if callee:
-            yield callee, _categories(callee, node), node.lineno, node.col_offset
+        if not callee:
+            continue
+        if isinstance(node.func, ast.Attribute):
+            receiver = _raw_callee(node.func.value)
+            method = node.func.attr
+            if receiver in db_receivers:
+                if method == "execute":
+                    category = _db_execute_category(node)
+                    yield f"db_connection.execute.{category.rsplit('_', 1)[-1]}", {category}, node.lineno, node.col_offset
+                    continue
+                if method in DB_READ_METHODS:
+                    yield f"db_connection.{method}", {"direct_db_read"}, node.lineno, node.col_offset
+                    continue
+                if method in DB_WRITE_METHODS:
+                    yield f"db_connection.{method}", {"direct_db_write"}, node.lineno, node.col_offset
+                    continue
+            path_receiver = _expression_is_path(
+                node.func.value, aliases, path_receivers
+            )
+        else:
+            path_receiver = False
+        yield callee, _categories(callee, node, path_receiver=path_receiver), node.lineno, node.col_offset
 
 
 def _literal_subparsers(path: Path) -> Counter[str]:
@@ -367,9 +490,16 @@ def build_inventory(root: Path) -> dict[str, object]:
         "effect_detector_vocabulary": {
             "filesystem_read_methods": sorted(FILESYSTEM_READ_METHODS),
             "filesystem_write_methods": sorted(FILESYSTEM_WRITE_METHODS),
+            "receiver_typed_filesystem_methods": sorted(
+                RECEIVER_TYPED_FILESYSTEM_METHODS
+            ),
             "process_calls": sorted(PROCESS_CALLS),
             "api_calls": sorted(API_CALLS),
-            "db_calls": sorted(DB_CALLS),
+            "db_calls": dict(sorted(DB_CALLS.items())),
+            "db_neutral_calls": sorted(DB_NEUTRAL_CALLS),
+            "db_receiver_names": sorted(DB_RECEIVER_NAMES),
+            "db_read_methods": sorted(DB_READ_METHODS),
+            "db_write_methods": sorted(DB_WRITE_METHODS),
             "discovery_calls": dict(sorted(DISCOVERY_CALLS.items())),
             "bounded_neutral_risky_calls": sorted(BOUNDED_NEUTRAL_RISKY_CALLS),
             "risky_roots": sorted(RISKY_ROOTS),

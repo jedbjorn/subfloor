@@ -26,6 +26,9 @@ WINDOWS_DESCRIPTOR_PROBE = (
 WINDOWS_DESCRIPTOR_VECTORS = (
     ROOT / "tests/fixtures/deepseek_dsh_windows_descriptor_vectors.json"
 )
+WINDOWS_PROVENANCE_POLICY = (
+    ROOT / "tests/fixtures/deepseek_dsh_windows_provenance_policy.json"
+)
 EFFECT_DRIVER = ROOT / "tests/fixtures/deepseek_dsh_effect_driver.py"
 SOURCE_ROOTS = (ROOT / ".super-coder/scripts", ROOT / ".super-coder/api")
 REQUIRED_SEALS = (
@@ -648,6 +651,27 @@ class DeepSeekDshPreparationContractTests(unittest.TestCase):
             effects["filesystem_write"],
         )
         self.assertIn("os.chmod", self.contract["effect_call_vocabulary"]["filesystem_write"])
+        for path in (
+            ".super-coder/scripts/models.py",
+            ".super-coder/scripts/skill.py",
+            ".super-coder/api/conversation_routes.py",
+            ".super-coder/api/review_routes.py",
+            ".super-coder/api/server.py",
+            ".super-coder/scripts/sprint_runtime.py",
+        ):
+            self.assertTrue(
+                any(
+                    path in effects.get(category, [])
+                    for category in ("direct_db", "direct_db_read", "direct_db_write")
+                ),
+                path,
+            )
+        db_vocabulary = self.contract["effect_call_vocabulary"]
+        self.assertIn("db_driver.connect", db_vocabulary["direct_db"])
+        self.assertIn("db_connection.execute.read", db_vocabulary["direct_db_read"])
+        self.assertIn("db_connection.execute.write", db_vocabulary["direct_db_write"])
+        self.assertIn("db_connection.commit", db_vocabulary["direct_db_write"])
+        self.assertIn("db_connection.rollback", db_vocabulary["direct_db_write"])
         detector = self.contract["effect_detector_vocabulary"]
         self.assertTrue({"chmod", "mkdir", "rename"} <= set(detector["filesystem_write_methods"]))
         self.assertTrue(
@@ -689,6 +713,12 @@ class DeepSeekDshPreparationContractTests(unittest.TestCase):
             )
             self.assertEqual(outcome, expected_policy)
         effect_callsites = self.contract["effect_callsite_inventory"]
+        self.assertFalse(
+            any(
+                callsite_parts(key)[3] in {"lowered.replace", "value.replace"}
+                for key in effect_callsites
+            )
+        )
         self.assertEqual(
             {callsite_parts(key)[3] for key in effect_callsites},
             {
@@ -718,6 +748,8 @@ class DeepSeekDshPreparationContractTests(unittest.TestCase):
             sample.write_text(
                 "import asyncio\n"
                 "import http.client\n"
+                "import db_driver as driver\n"
+                "from db_driver import connect as open_engine_db\n"
                 "import os\n"
                 "import shutil as files\n"
                 "from os import kill as signal_process\n"
@@ -730,6 +762,16 @@ class DeepSeekDshPreparationContractTests(unittest.TestCase):
                 "os.write(1, b'x')\n"
                 "os.fsync(1)\n"
                 "files.copytree('source', 'target')\n"
+                "con = driver.connect('engine.db')\n"
+                "connection = open_engine_db('engine-alias.db')\n"
+                "connection.execute('SELECT 2')\n"
+                "con.execute('SELECT 1')\n"
+                "con.execute('UPDATE shells SET current_state=NULL')\n"
+                "con.commit()\n"
+                "con.rollback()\n"
+                "text = 'ordinary'.replace('o', 'x')\n"
+                "items = ['ordinary']; items.remove('ordinary')\n"
+                "stream = object(); stream.open()\n"
             )
             first = generated_inventory(root)
             self.assertEqual(
@@ -745,11 +787,25 @@ class DeepSeekDshPreparationContractTests(unittest.TestCase):
                 "os.killpg": "process_effect",
                 "os.write": "filesystem_write",
                 "shutil.copytree": "filesystem_write",
+                "db_driver.connect": "direct_db",
             }
             self.assertEqual(first["risky_call_classification"], expected)
             self.assertEqual(
                 set(first["risky_call_inventory"]),
                 set(first["risky_call_classification"]),
+            )
+            db_calls = first["effect_call_vocabulary"]
+            self.assertIn("db_connection.execute.read", db_calls["direct_db_read"])
+            self.assertIn("db_connection.execute.write", db_calls["direct_db_write"])
+            self.assertIn("db_connection.commit", db_calls["direct_db_write"])
+            self.assertIn("db_connection.rollback", db_calls["direct_db_write"])
+            self.assertFalse(
+                any(
+                    callsite_parts(key)[3] in {
+                        "text.replace", "items.remove", "stream.open"
+                    }
+                    for key in first["effect_callsite_inventory"]
+                )
             )
             sample.write_text(
                 "import socket\n"
@@ -929,7 +985,7 @@ class DeepSeekDshPreparationContractTests(unittest.TestCase):
         source = WINDOWS_PROBE.read_text()
         self.assertEqual(
             sha256(WINDOWS_PROBE),
-            "fce328fb3a0d86b7f9d602bf106e3ececcbb09b60afdccd8f3be7e77160a93e7",
+            self.contract["execution_provenance"]["windows_contributor"]["sha256"],
         )
         for marker in (
             "IsProcessInJob",
@@ -941,7 +997,9 @@ class DeepSeekDshPreparationContractTests(unittest.TestCase):
             "FORBIDDEN_WRITE_ACCESS",
             "ImportSubjectPublicKeyInfo",
             "VerifyData",
-            '$DescriptorContract = "sc-dsh-windows-job-object-v2"',
+            'foreach ($rule in $Policy.rules)',
+            '$rule.stage -eq "native"',
+            '$rule.stage -eq "descriptor"',
         ):
             self.assertIn(marker, source)
 
@@ -950,6 +1008,7 @@ class DeepSeekDshPreparationContractTests(unittest.TestCase):
                 "node",
                 str(WINDOWS_DESCRIPTOR_PROBE),
                 str(WINDOWS_DESCRIPTOR_VECTORS),
+                str(WINDOWS_PROVENANCE_POLICY),
                 str(WINDOWS_PROBE),
             ],
             cwd=ROOT,
@@ -983,6 +1042,86 @@ class DeepSeekDshPreparationContractTests(unittest.TestCase):
             receipt["vectorsSha256"],
             sha256(WINDOWS_DESCRIPTOR_VECTORS),
         )
+        self.assertEqual(receipt["policySha256"], sha256(WINDOWS_PROVENANCE_POLICY))
+        descriptor = self.contract["execution_provenance"]["windows_contributor"]["descriptor"]
+        self.assertEqual(descriptor["shared_policy_sha256"], sha256(WINDOWS_PROVENANCE_POLICY))
+        self.assertEqual(descriptor["executable_probe_sha256"], sha256(WINDOWS_DESCRIPTOR_PROBE))
+
+    def test_windows_contributor_sensitive_mutations_fail_shared_policy_proof(self):
+        source = WINDOWS_PROBE.read_text()
+        mutations = {
+            "membership": ("job_member = $inExpectedJob", "job_member = $true"),
+            "writable": (
+                "descriptor_writable = $descriptorWritable",
+                "descriptor_writable = $false",
+            ),
+            "signature": (
+                "signature_valid = $signatureValid",
+                "signature_valid = $true",
+            ),
+            "policy-loop": (
+                "-not (Test-PolicyRule $rule $state)",
+                "$false",
+            ),
+        }
+        with tempfile.TemporaryDirectory() as raw:
+            for name, (old, new) in mutations.items():
+                self.assertIn(old, source)
+                mutated = Path(raw) / f"{name}.ps1"
+                mutated.write_text(source.replace(old, new, 1))
+                completed = subprocess.run(
+                    [
+                        "node",
+                        str(WINDOWS_DESCRIPTOR_PROBE),
+                        str(WINDOWS_DESCRIPTOR_VECTORS),
+                        str(WINDOWS_PROVENANCE_POLICY),
+                        str(mutated),
+                    ],
+                    cwd=ROOT,
+                    text=True,
+                    capture_output=True,
+                    timeout=10,
+                    check=False,
+                )
+                self.assertNotEqual(completed.returncode, 0, name)
+
+    def test_refreshing_windows_policy_hash_cannot_bless_weakened_rules(self):
+        policy = json.loads(WINDOWS_PROVENANCE_POLICY.read_text())
+        source = WINDOWS_PROBE.read_text()
+        old_hash = sha256(WINDOWS_PROVENANCE_POLICY)
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            for rule_id in (
+                "job-member",
+                "immutable-handle",
+                "valid-signature",
+                "exact-schema",
+                "not-expired",
+            ):
+                mutated_policy = dict(policy)
+                mutated_policy["rules"] = [
+                    rule for rule in policy["rules"] if rule["id"] != rule_id
+                ]
+                policy_path = root / f"{rule_id}.json"
+                policy_path.write_text(f"{json.dumps(mutated_policy, indent=2)}\n")
+                new_hash = sha256(policy_path)
+                probe_path = root / f"{rule_id}.ps1"
+                probe_path.write_text(source.replace(old_hash, new_hash, 1))
+                completed = subprocess.run(
+                    [
+                        "node",
+                        str(WINDOWS_DESCRIPTOR_PROBE),
+                        str(WINDOWS_DESCRIPTOR_VECTORS),
+                        str(policy_path),
+                        str(probe_path),
+                    ],
+                    cwd=ROOT,
+                    text=True,
+                    capture_output=True,
+                    timeout=10,
+                    check=False,
+                )
+                self.assertNotEqual(completed.returncode, 0, rule_id)
 
     def test_real_pinned_dsh_components_reproduce_clean_room_fixture(self):
         dsh = shutil.which("dsh")
