@@ -258,6 +258,7 @@
     ".super-coder/scripts/conversation_launch.py",
     ".super-coder/scripts/conversation_state.py",
     ".super-coder/scripts/dispatch.sh",
+    ".super-coder/scripts/dsh_preparation_inventory.py",
     ".super-coder/scripts/init_fork.py",
     ".super-coder/scripts/install.py",
     ".super-coder/scripts/job.py",

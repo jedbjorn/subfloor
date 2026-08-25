@@ -6,6 +6,7 @@ import { access, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
+import { runWindowsDescriptorVectors } from "./deepseek_dsh_windows_descriptor_probe.mjs";
 
 const EXPECTED_VERSION = "0.1.1-rc.2";
 const packageRoot = process.argv[2];
@@ -15,6 +16,10 @@ if (!packageRoot || !contractPath) {
   throw new Error("usage: deepseek_dsh_shell_env_probe.mjs <@deepseek-ai/dsh package root> <contract>");
 }
 const contract = JSON.parse(await readFile(contractPath, "utf8"));
+const powershellParity = await runWindowsDescriptorVectors(
+  new URL("./deepseek_dsh_windows_descriptor_vectors.json", import.meta.url),
+  new URL("./deepseek_dsh_job_object_probe.ps1", import.meta.url),
+);
 
 const runtimeMarkers = {
   "profile-composition": [/homePatchPath/, /prepareProfile/, /runProfile/],
@@ -219,7 +224,7 @@ try {
     foreground: [resultA.stdout.text.trim(), resultB.stdout.text.trim()],
     background: ["A|SHELL_A|unset", "B|SHELL_B|unset"],
     unboundAliases: [],
-    powershellParity: "source-contract-passed",
+    powershellParity,
   }, null, 2)}\n`);
 } finally {
   await ctx.root.fiber.dispose();

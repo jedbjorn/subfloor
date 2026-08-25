@@ -20,6 +20,12 @@ NODE_PROBE = ROOT / "tests/fixtures/deepseek_dsh_shell_env_probe.mjs"
 INVENTORY_PROBE = ROOT / ".super-coder/scripts/dsh_preparation_inventory.py"
 PROVENANCE_PROBE = ROOT / ".super-coder/scripts/dsh_execution_provenance.py"
 WINDOWS_PROBE = ROOT / "tests/fixtures/deepseek_dsh_job_object_probe.ps1"
+WINDOWS_DESCRIPTOR_PROBE = (
+    ROOT / "tests/fixtures/deepseek_dsh_windows_descriptor_probe.mjs"
+)
+WINDOWS_DESCRIPTOR_VECTORS = (
+    ROOT / "tests/fixtures/deepseek_dsh_windows_descriptor_vectors.json"
+)
 EFFECT_DRIVER = ROOT / "tests/fixtures/deepseek_dsh_effect_driver.py"
 SOURCE_ROOTS = (ROOT / ".super-coder/scripts", ROOT / ".super-coder/api")
 REQUIRED_SEALS = (
@@ -160,6 +166,11 @@ def generated_inventory(root=ROOT):
 
 def sha256(path):
     return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def callsite_parts(key):
+    path, line, column, call = key.rsplit(":", 3)
+    return path, int(line), int(column), call
 
 
 @contextmanager
@@ -423,6 +434,28 @@ class DeepSeekDshPreparationContractTests(unittest.TestCase):
             sha256(WINDOWS_PROBE),
         )
         self.assertEqual(
+            provenance["windows_contributor"]["contract"],
+            "sc-dsh-windows-job-object-v2",
+        )
+        descriptor = provenance["windows_contributor"]["descriptor"]
+        self.assertEqual(descriptor["vector_sha256"], sha256(WINDOWS_DESCRIPTOR_VECTORS))
+        self.assertEqual(
+            descriptor["executable_probe_sha256"],
+            sha256(WINDOWS_DESCRIPTOR_PROBE),
+        )
+        self.assertEqual(
+            descriptor["schema"],
+            [
+                "binding_generation",
+                "contract",
+                "domain_id",
+                "expires_unix_ms",
+                "issued_unix_ms",
+                "job_handle",
+                "process_id",
+            ],
+        )
+        self.assertEqual(
             provenance["bootstrap_order"][3],
             "under managed membership refuse SC_DISPATCH, SC_CALLER_ROOT, "
             "SC_MEM_AS, and every ambient SC_* before target or credential inspection",
@@ -456,6 +489,47 @@ class DeepSeekDshPreparationContractTests(unittest.TestCase):
                 Counter(expected),
                 relative,
             )
+        literal_policy = self.contract["literal_subcommand_policy"]
+        self.assertEqual(
+            set(literal_policy),
+            set(self.contract["literal_subparser_counters"]),
+        )
+        for relative, counters in self.contract["literal_subparser_counters"].items():
+            self.assertEqual(set(literal_policy[relative]), set(counters), relative)
+            self.assertTrue(
+                set(literal_policy[relative].values())
+                <= {"dsh_shell_authorized", "refused"},
+                relative,
+            )
+        self.assertEqual(
+            literal_policy[".super-coder/scripts/job.py"]["_supervise"],
+            "refused",
+        )
+        self.assertEqual(
+            literal_policy[".super-coder/scripts/mem.py"]["which"],
+            "dsh_shell_authorized",
+        )
+        self.assertEqual(
+            literal_policy[".super-coder/scripts/migration.py"]["new"],
+            "refused",
+        )
+        authorized_literal_paths = {
+            ".super-coder/scripts/job.py",
+            ".super-coder/scripts/mem.py",
+            ".super-coder/scripts/pr_cli.py",
+            ".super-coder/scripts/sprint_cli.py",
+            ".super-coder/scripts/visual_qa.py",
+            ".super-coder/scripts/vm.py",
+        }
+        for relative, policies in literal_policy.items():
+            for subcommand, outcome in policies.items():
+                expected = (
+                    "refused"
+                    if relative not in authorized_literal_paths
+                    or (relative.endswith("/job.py") and subcommand == "_supervise")
+                    else "dsh_shell_authorized"
+                )
+                self.assertEqual(outcome, expected, f"{relative}:{subcommand}")
 
         custom = {
             "feature": compared_command_literals(
@@ -499,6 +573,32 @@ class DeepSeekDshPreparationContractTests(unittest.TestCase):
                 for surface, subcommands in self.contract["custom_subcommands"].items()
             },
         )
+        custom_policy = self.contract["custom_subcommand_policy"]
+        self.assertEqual(set(custom_policy), set(custom))
+        for surface, subcommands in custom.items():
+            self.assertEqual(set(custom_policy[surface]), subcommands, surface)
+            self.assertTrue(
+                set(custom_policy[surface].values())
+                <= {"dsh_shell_authorized", "refused"},
+                surface,
+            )
+        authorized_custom = {
+            "feature": {"list"},
+            "models": {"refresh", "list", "resolve"},
+            "skill": {"list", "put", "grant", "revoke", "rm", "retire", "unretire"},
+            "map-extractor": {"install"},
+            "vm-mcp-relay": {"up", "down", "status"},
+            "vm.mcp": {"status", "up", "down"},
+            "mem.dynamic": {"seed", "lns"},
+        }
+        for surface, policies in custom_policy.items():
+            for subcommand, outcome in policies.items():
+                expected = (
+                    "dsh_shell_authorized"
+                    if subcommand in authorized_custom.get(surface, set())
+                    else "refused"
+                )
+                self.assertEqual(outcome, expected, f"{surface}:{subcommand}")
 
     def test_complete_source_sc_signal_and_effect_inventory_is_exact(self):
         observed = generated_inventory()
@@ -507,9 +607,14 @@ class DeepSeekDshPreparationContractTests(unittest.TestCase):
             "direct_sc_signal_inventory",
             "ambient_sc_policy",
             "literal_subparser_counters",
+            "literal_subcommand_policy",
             "effect_call_vocabulary",
             "direct_effect_signal_inventory",
             "risky_call_inventory",
+            "risky_call_classification",
+            "risky_callsite_inventory",
+            "effect_callsite_inventory",
+            "effect_callsite_policy_rule",
             "effect_detector_vocabulary",
         ):
             self.assertEqual(observed[name], self.contract[name], name)
@@ -549,6 +654,57 @@ class DeepSeekDshPreparationContractTests(unittest.TestCase):
             {"os.posix_spawn", "asyncio.create_subprocess_exec"}
             <= set(detector["process_calls"])
         )
+        risky = self.contract["risky_call_inventory"]
+        classifications = self.contract["risky_call_classification"]
+        self.assertEqual(set(risky), set(classifications))
+        self.assertEqual(classifications["asyncio.open_connection"], "api_effect")
+        self.assertEqual(classifications["asyncio.start_server"], "api_effect")
+        self.assertEqual(classifications["http.client.HTTPConnection"], "api_effect")
+        self.assertEqual(classifications["os.kill"], "process_effect")
+        self.assertEqual(classifications["os.killpg"], "process_effect")
+        self.assertEqual(classifications["os.write"], "filesystem_write")
+        self.assertEqual(classifications["os.fsync"], "filesystem_write")
+        self.assertEqual(classifications["shutil.copytree"], "filesystem_write")
+        callsites = self.contract["risky_callsite_inventory"]
+        self.assertEqual(
+            {(callsite_parts(key)[3], callsite_parts(key)[0]) for key in callsites},
+            {
+                (call, path)
+                for call, paths in risky.items()
+                for path in paths
+            },
+        )
+        self.assertEqual(
+            len(callsites),
+            len({callsite_parts(key) for key in callsites}),
+        )
+        for key, value in callsites.items():
+            classification, outcome = value.split("|", 1)
+            call = callsite_parts(key)[3]
+            self.assertEqual(classification, classifications[call])
+            expected_policy = (
+                "identity_neutral_read_only"
+                if classification == "identity_neutral_read_only"
+                else "dsh_shell_authorized"
+            )
+            self.assertEqual(outcome, expected_policy)
+        effect_callsites = self.contract["effect_callsite_inventory"]
+        self.assertEqual(
+            {callsite_parts(key)[3] for key in effect_callsites},
+            {
+                call
+                for calls in self.contract["effect_call_vocabulary"].values()
+                for call in calls
+            },
+        )
+        self.assertEqual(
+            len(effect_callsites),
+            len({callsite_parts(key) for key in effect_callsites}),
+        )
+        for value in effect_callsites.values():
+            effect_classes, outcome = value.split("|", 1)
+            self.assertEqual(outcome, "dsh_shell_authorized")
+            self.assertNotEqual(effect_classes, "")
 
     def test_inventory_detector_reacts_to_new_authority_and_effect_forms(self):
         with tempfile.TemporaryDirectory() as raw:
@@ -560,32 +716,50 @@ class DeepSeekDshPreparationContractTests(unittest.TestCase):
             (root / "sc").write_text("#!/bin/sh\nexec sh dispatcher\n")
             sample = scripts / "sample.py"
             sample.write_text(
+                "import asyncio\n"
+                "import http.client\n"
                 "import os\n"
+                "import shutil as files\n"
+                "from os import kill as signal_process\n"
                 "SC_NEW_AUTHORITY = 'SC_NEW_AUTHORITY'\n"
-                "os.chmod('target', 0o700)\n"
+                "asyncio.open_connection('127.0.0.1', 9)\n"
+                "asyncio.start_server(lambda: None, '127.0.0.1', 9)\n"
+                "http.client.HTTPConnection('127.0.0.1')\n"
+                "signal_process(1, 0)\n"
+                "os.killpg(1, 0)\n"
+                "os.write(1, b'x')\n"
+                "os.fsync(1)\n"
+                "files.copytree('source', 'target')\n"
             )
             first = generated_inventory(root)
             self.assertEqual(
                 first["direct_sc_signal_inventory"]["SC_NEW_AUTHORITY"],
                 [".super-coder/scripts/sample.py"],
             )
+            expected = {
+                "asyncio.open_connection": "api_effect",
+                "asyncio.start_server": "api_effect",
+                "http.client.HTTPConnection": "api_effect",
+                "os.fsync": "filesystem_write",
+                "os.kill": "process_effect",
+                "os.killpg": "process_effect",
+                "os.write": "filesystem_write",
+                "shutil.copytree": "filesystem_write",
+            }
+            self.assertEqual(first["risky_call_classification"], expected)
             self.assertEqual(
-                first["direct_effect_signal_inventory"]["filesystem_write"],
-                [".super-coder/scripts/sample.py"],
+                set(first["risky_call_inventory"]),
+                set(first["risky_call_classification"]),
             )
             sample.write_text(
-                "import os\n"
-                "os.posix_spawn('/bin/true', ['/bin/true'], {})\n"
+                "import socket\n"
+                "socket.future_effect('target')\n"
             )
-            second = generated_inventory(root)
-            self.assertNotEqual(
-                first["source_sha256_inventory"],
-                second["source_sha256_inventory"],
-            )
-            self.assertEqual(
-                second["direct_effect_signal_inventory"]["process_effect"],
-                [".super-coder/scripts/sample.py", "sc"],
-            )
+            with self.assertRaisesRegex(
+                AssertionError,
+                r"(?s)unclassified risky calls:.*socket\.future_effect",
+            ):
+                generated_inventory(root)
 
     def test_linux_resolver_rejects_missing_ambiguous_stale_and_delegated_evidence(self):
         for kind in (
@@ -755,17 +929,60 @@ class DeepSeekDshPreparationContractTests(unittest.TestCase):
         source = WINDOWS_PROBE.read_text()
         self.assertEqual(
             sha256(WINDOWS_PROBE),
-            "05a087c9653e3215a34a7f87f65895f459c15896df25c45a3455ae51e7f2a4bd",
+            "fce328fb3a0d86b7f9d602bf106e3ececcbb09b60afdccd8f3be7e77160a93e7",
         )
         for marker in (
             "IsProcessInJob",
             "QueryInformationJobObject",
             "JOB_OBJECT_LIMIT_BREAKAWAY_OK",
             "JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK",
-            "GetFileType($descriptor)",
-            'contract = "sc-dsh-windows-job-object-v1"',
+            "NtQueryObject",
+            "FILE_TYPE_PIPE",
+            "FORBIDDEN_WRITE_ACCESS",
+            "ImportSubjectPublicKeyInfo",
+            "VerifyData",
+            '$DescriptorContract = "sc-dsh-windows-job-object-v2"',
         ):
             self.assertIn(marker, source)
+
+        completed = subprocess.run(
+            [
+                "node",
+                str(WINDOWS_DESCRIPTOR_PROBE),
+                str(WINDOWS_DESCRIPTOR_VECTORS),
+                str(WINDOWS_PROBE),
+            ],
+            cwd=ROOT,
+            text=True,
+            capture_output=True,
+            timeout=10,
+            check=False,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        receipt = json.loads(completed.stdout)
+        self.assertEqual(receipt["accepted"], ["valid"])
+        self.assertEqual(
+            receipt["refused"],
+            [
+                "arbitrary-file",
+                "mutable-pipe",
+                "unreadable",
+                "wrong-job",
+                "wrong-process",
+                "stale",
+                "extra-field",
+                "zero-generation",
+                "breakaway",
+                "not-job-member",
+                "bad-signature",
+                "malformed",
+            ],
+        )
+        self.assertEqual(receipt["powershellSha256"], sha256(WINDOWS_PROBE))
+        self.assertEqual(
+            receipt["vectorsSha256"],
+            sha256(WINDOWS_DESCRIPTOR_VECTORS),
+        )
 
     def test_real_pinned_dsh_components_reproduce_clean_room_fixture(self):
         dsh = shutil.which("dsh")
@@ -788,7 +1005,24 @@ class DeepSeekDshPreparationContractTests(unittest.TestCase):
             set(receipt["runtimeHashes"]),
             {seam["name"] for seam in self.contract["supported_seams"]},
         )
-        self.assertEqual(receipt["powershellParity"], "source-contract-passed")
+        self.assertEqual(receipt["powershellParity"]["accepted"], ["valid"])
+        self.assertEqual(
+            set(receipt["powershellParity"]["refused"]),
+            {
+                "arbitrary-file",
+                "mutable-pipe",
+                "unreadable",
+                "wrong-job",
+                "wrong-process",
+                "stale",
+                "extra-field",
+                "zero-generation",
+                "breakaway",
+                "not-job-member",
+                "bad-signature",
+                "malformed",
+            },
+        )
 
 
 if __name__ == "__main__":

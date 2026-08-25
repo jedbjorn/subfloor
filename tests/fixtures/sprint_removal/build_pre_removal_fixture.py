@@ -35,6 +35,7 @@ ALLOWED_REFERENCE_FILES = (
     ".super-coder/adapters/kimi/adapter.json",
     ".super-coder/adapters/opencode/adapter.json",
     ".super-coder/adapters/vibe/adapter.json",
+    ".super-coder/scripts/dsh_preparation_inventory.py",
     ".super-coder/scripts/harness_surfaces.py",
     "tests/fixtures/sprint_removal/build_pre_removal_fixture.py",
     "tests/fixtures/sprint_removal/manifest.json",
