@@ -1472,7 +1472,7 @@ def preflight_candidate_execution(
 def retire_session_identity(
     *, env: Mapping[str, str], root_session_id: str, quiesced: bool
 ) -> dict[str, Any]:
-    """Retire a disposable root only after its terminal/quiescence barrier."""
+    """Close a disposable root, retiring it only after quiescence proof."""
     registry = _identity_registry(env)
     try:
         snapshot = registry.read_snapshot()
@@ -1497,11 +1497,18 @@ def retire_session_identity(
                 "HARNESS_BINDING_NOT_LIVE",
                 "DeepSeek root is not eligible for terminal retirement",
             )
+        if not quiesced:
+            return {
+                "root_session_id": root_session_id,
+                "state": "closing",
+                "lifecycle_epoch": record["lifecycle_epoch"],
+                "record_generation": closing_record_generation,
+            }
         receipt = registry.retire_binding(
             expected_snapshot_generation=closing_snapshot_generation,
             root_session_id=root_session_id,
             expected_record_generation=closing_record_generation,
-            quiesced=quiesced,
+            quiesced=True,
         )
         return {
             "root_session_id": root_session_id,

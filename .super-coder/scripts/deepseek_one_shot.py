@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Public one-shot execution through the stock DeepSeek Host API."""
 from __future__ import annotations
 
@@ -257,15 +256,19 @@ def run(selector: str, effort: str, prompt: str) -> int:
             isinstance(exc, deepseek_host.DeepSeekHostError)
             and exc.code == "HARNESS_ONE_SHOT_BUSY"
         )
-        if not busy:
-            try:
-                deepseek_web.retire_session_identity(
-                    env=env, root_session_id=session_ref, quiesced=True
-                )
-            except deepseek_web.DeepSeekWebError as retire_exc:
+        try:
+            deepseek_web.retire_session_identity(
+                env=env, root_session_id=session_ref, quiesced=not busy
+            )
+        except deepseek_web.DeepSeekWebError as retire_exc:
+            if busy:
                 raise deepseek_host.DeepSeekHostError(
-                    retire_exc.code, retire_exc.detail
-                ) from retire_exc
+                    "HARNESS_ONE_SHOT_BUSY",
+                    f"{exc.detail}; exact binding close failed: {retire_exc.code}",
+                ) from exc
+            raise deepseek_host.DeepSeekHostError(
+                retire_exc.code, retire_exc.detail
+            ) from retire_exc
         raise
     else:
         try:

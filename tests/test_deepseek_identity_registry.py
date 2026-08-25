@@ -26,6 +26,8 @@ PLUGIN = ENGINE / "assets" / "deepseek" / "sc-shell-env-plugin.mjs"
 PLUGIN_PROBE = ROOT / "tests" / "fixtures" / "deepseek_dsh_identity_plugin_probe.mjs"
 sys.path.insert(0, str(SCRIPTS))
 
+import deepseek_host
+import deepseek_one_shot
 import deepseek_web
 from deepseek_identity_registry import (
     ALIASES,
@@ -1798,6 +1800,102 @@ def test_runtime_binding_tracks_exact_lifecycle_key_rotation_and_retirement(
             assert snapshot["records"]["lifecycle-root"]["credential_file"] is None
             assert list(registry.layout.credentials.glob("binding-*.json")) == []
             assert plugin.collect("lifecycle-root") == {"aliases": {}}
+
+
+def test_one_shot_unknown_cancellation_closes_binding_until_terminal_recovery(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with tempfile.TemporaryDirectory() as raw:
+        root = Path(raw)
+        registry, worktree = registry_fixture(root)
+        synthetic_health(registry)
+        state_path = root / "deepseek-web-state.json"
+        env = {
+            "SC_API_TOKEN": "one-shot-token",
+            "SC_API_BASE": "http://127.0.0.1:8837",
+            "SC_SHELL_ID": "909",
+            "SC_SHELL_SHORTNAME": "ONE-SHOT",
+            "SC_SHELL_WORKTREE": str(worktree),
+            "SC_DEEPSEEK_WEB_STATE": str(state_path),
+        }
+        for name, value in env.items():
+            monkeypatch.setenv(name, value)
+        monkeypatch.setattr(deepseek_web, "_identity_registry", lambda _env: registry)
+        monkeypatch.setattr(deepseek_web, "_verify_shell_identity", lambda _env: None)
+        monkeypatch.setattr(deepseek_web, "ensure", lambda *_args, **_kwargs: {})
+        session_refs: list[str] = []
+
+        class UnknownCancellation:
+            def call(self, method: str, payload: object) -> object:
+                assert method == "session.cancel"
+                return {"accepted": False}
+
+        def run_unknown(*_args: object, session_ref: str, **_kwargs: object) -> int:
+            session_refs.append(session_ref)
+            deepseek_one_shot._finalize_unknown(UnknownCancellation(), session_ref)
+            raise AssertionError("unknown cancellation must refuse")
+
+        monkeypatch.setattr(deepseek_one_shot, "_run", run_unknown)
+
+        with pytest.raises(deepseek_host.DeepSeekHostError) as refused:
+            deepseek_one_shot.run("acme-dynamic/model-7", "high", "prompt")
+
+        assert refused.value.code == "HARNESS_ONE_SHOT_BUSY"
+        assert len(session_refs) == 1
+        session_ref = session_refs[0]
+        marker = state_path.with_name("deepseek-shell-identity-unproven.json")
+        assert json.loads(marker.read_text()) == {
+            "session_id": session_ref,
+            "shell_id": 909,
+            "shortname": "ONE-SHOT",
+        }
+        closing = registry.read_snapshot()
+        record = closing["records"][session_ref]
+        credential = Path(record["credential_file"])
+        assert record["state"] == "closing"
+        assert record["record_generation"] == 2
+        assert credential.exists()
+
+        with pytest.raises(deepseek_web.DeepSeekWebError) as denied:
+            deepseek_web.bind_session_identity(
+                env=env,
+                root_session_id=session_ref,
+                conversation_id=f"one-shot:{session_ref}",
+                lifecycle_epoch=1,
+                worktree=worktree,
+            )
+        assert denied.value.code == "HARNESS_BINDING_NOT_LIVE"
+        assert registry.read_snapshot() == closing
+
+        terminal = deepseek_web.retire_session_identity(
+            env=env, root_session_id=session_ref, quiesced=True
+        )
+        assert terminal == {
+            "root_session_id": session_ref,
+            "state": "terminal",
+            "lifecycle_epoch": 1,
+            "record_generation": 3,
+        }
+        terminal_record = registry.read_snapshot()["records"][session_ref]
+        assert terminal_record["state"] == "terminal"
+        assert terminal_record["credential_file"] is None
+        assert not credential.exists()
+        assert marker.exists()
+
+        state_path.write_text(json.dumps({"service_port": 8942}))
+        history = {
+            "events": [{
+                "event": {
+                    "seq": 1,
+                    "type": "turn/end",
+                    "data": {"reason": {"kind": "cancelled"}},
+                }
+            }]
+        }
+        monkeypatch.setattr(deepseek_web, "_host_rpc", lambda *_args: history)
+        lease = deepseek_web.acquire_shell_identity(env=env)
+        lease.close()
+        assert not marker.exists()
 
 
 def test_runtime_binding_rejects_foreign_or_stale_lifecycle_without_effect(
