@@ -40,6 +40,7 @@ ALLOWED_REFERENCE_FILES = (
     "tests/fixtures/sprint_removal/manifest.json",
     "tests/fixtures/sprint_removal/pre_removal.sql",
     "tests/test_dos_app_sprint_canary.py",
+    "tests/test_deepseek_dsh_preparation.py",
     "tests/test_sprint_removal_manifest.py",
     "tests/test_harness_surfaces.py",
 )

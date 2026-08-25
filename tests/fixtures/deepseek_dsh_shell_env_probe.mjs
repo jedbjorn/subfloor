@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { access, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -8,9 +9,33 @@ import { pathToFileURL } from "node:url";
 
 const EXPECTED_VERSION = "0.1.1-rc.2";
 const packageRoot = process.argv[2];
+const contractPath = process.argv[3];
 
-if (!packageRoot) {
-  throw new Error("usage: deepseek_dsh_shell_env_probe.mjs <@deepseek-ai/dsh package root>");
+if (!packageRoot || !contractPath) {
+  throw new Error("usage: deepseek_dsh_shell_env_probe.mjs <@deepseek-ai/dsh package root> <contract>");
+}
+const contract = JSON.parse(await readFile(contractPath, "utf8"));
+
+const runtimeMarkers = {
+  "profile-composition": [/homePatchPath/, /prepareProfile/, /runProfile/],
+  "per-execution-shell-env": [/DSH_SHELL/, /DSH_SESSION_ID/, /collect\(execution\)/],
+  "ambient-scrub": [/scrubbedParentEnv/, /KEY\|PASSWORD\|SECRET\|TOKEN/],
+  "subprocess-merge": [/scrubbedParentEnv/, /childEnv\(spec\.env\)/],
+  "bash-collection": [/ctx\.shellEnv\.collect\(exec\)/],
+  "bash-dispatch": [/\.\.\.spec\.dshEnv/],
+  "powershell-collection": [/ctx\.shellEnv\.collect\(exec\)/],
+  "powershell-dispatch": [/\.\.\.spec\.dshEnv/],
+};
+const runtimeHashes = {};
+for (const seam of contract.supported_seams) {
+  const runtime = await readFile(join(packageRoot, seam.runtime));
+  const digest = createHash("sha256").update(runtime).digest("hex");
+  assert.equal(digest, seam.runtime_sha256, `${seam.name} runtime hash`);
+  const source = runtime.toString("utf8");
+  for (const marker of runtimeMarkers[seam.name] ?? []) {
+    assert.match(source, marker, `${seam.name} runtime contract`);
+  }
+  runtimeHashes[seam.name] = digest;
 }
 
 async function packageJson(name) {
@@ -190,6 +215,7 @@ try {
   process.stdout.write(`${JSON.stringify({
     contract: "dsh-shell-env-clean-room-fixture-v1",
     versions,
+    runtimeHashes,
     foreground: [resultA.stdout.text.trim(), resultB.stdout.text.trim()],
     background: ["A|SHELL_A|unset", "B|SHELL_B|unset"],
     unboundAliases: [],

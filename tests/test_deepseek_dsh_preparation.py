@@ -1,18 +1,33 @@
 import ast
-from collections import Counter
+import ctypes
+import fcntl
+import hashlib
 import json
 import os
-from pathlib import Path
 import re
 import shutil
 import subprocess
+import tempfile
 import unittest
-
+import urllib.request
+from collections import Counter
+from contextlib import contextmanager
+from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 CONTRACT_PATH = ROOT / ".super-coder/assets/deepseek/dsh-shell-authority-contract.json"
 NODE_PROBE = ROOT / "tests/fixtures/deepseek_dsh_shell_env_probe.mjs"
+INVENTORY_PROBE = ROOT / ".super-coder/scripts/dsh_preparation_inventory.py"
+PROVENANCE_PROBE = ROOT / ".super-coder/scripts/dsh_execution_provenance.py"
+WINDOWS_PROBE = ROOT / "tests/fixtures/deepseek_dsh_job_object_probe.ps1"
+EFFECT_DRIVER = ROOT / "tests/fixtures/deepseek_dsh_effect_driver.py"
 SOURCE_ROOTS = (ROOT / ".super-coder/scripts", ROOT / ".super-coder/api")
+REQUIRED_SEALS = (
+    fcntl.F_SEAL_SEAL
+    | fcntl.F_SEAL_SHRINK
+    | fcntl.F_SEAL_GROW
+    | fcntl.F_SEAL_WRITE
+)
 
 
 def load_contract():
@@ -130,29 +145,138 @@ def paths_matching(pattern):
     )
 
 
-def resolve_policy(
-    contract, *, provenance, environment, command_class,
-    admin_artifact_discoverable=False,
-):
-    bridge_names = {
-        key for key in environment
-        if key == "DSH_SHELL" or key.startswith("DSH_SC_")
+def generated_inventory(root=ROOT):
+    completed = subprocess.run(
+        ["python3", str(INVENTORY_PROBE), "--root", str(root)],
+        cwd=ROOT,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if completed.returncode:
+        raise AssertionError(completed.stderr)
+    return json.loads(completed.stdout)
+
+
+def sha256(path):
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+@contextmanager
+def linux_domain_fixture(kind):
+    with tempfile.TemporaryDirectory() as raw:
+        root = Path(raw)
+        proc = root / "proc-cgroup"
+        cgroup_root = root / "cgroup"
+        cgroup_root.mkdir()
+        now = 1_000_000
+        descriptor_fd = None
+        domain_id = "a" * 32
+        membership = f"/sc-dsh/{domain_id}.scope"
+        if kind == "missing":
+            pass
+        elif kind == "unreadable":
+            proc.mkdir()
+        elif kind == "ambiguous":
+            proc.write_text("0::/\n0::/other\n")
+        elif kind == "native":
+            proc.write_text("0::/native.slice\n")
+        else:
+            proc.write_text(f"0::{membership}\n")
+            domain = cgroup_root / membership.lstrip("/")
+            domain.mkdir(parents=True, mode=0o700)
+            (domain / "cgroup.type").write_text("domain\n")
+            (domain / "cgroup.subtree_control").write_text("\n")
+            if kind != "no-descriptor":
+                descriptor_fd = os.memfd_create(
+                    "sc-dsh-domain",
+                    os.MFD_CLOEXEC | os.MFD_ALLOW_SEALING,
+                )
+                descriptor = {
+                    "contract": "sc-dsh-linux-cgroup-v2-v1",
+                    "cgroup": membership,
+                    "domain_id": domain_id,
+                    "binding_generation": 7,
+                    "expires_monotonic_ns": now if kind == "stale" else now + 1,
+                    "non_delegated": kind != "delegated",
+                }
+                os.write(descriptor_fd, json.dumps(descriptor).encode())
+                fcntl.fcntl(descriptor_fd, fcntl.F_ADD_SEALS, REQUIRED_SEALS)
+        try:
+            yield {
+                "proc": proc,
+                "cgroup_root": cgroup_root,
+                "descriptor_fd": descriptor_fd,
+                "now": now,
+            }
+        finally:
+            if descriptor_fd is not None:
+                os.close(descriptor_fd)
+
+
+def clean_probe_environment(extra=None):
+    environment = {
+        name: value for name, value in os.environ.items()
+        if not name.startswith("DSH_") and not name.startswith("SC_")
     }
-    probes = {name: 0 for name in contract["effect_probes"]}
-    if provenance not in {"managed", "native"}:
-        return "refused", probes
-    if provenance == "native":
-        return ("refused", probes) if bridge_names else ("native", probes)
-    if command_class == "identity_neutral_read_only":
-        return "neutral", probes
-    if command_class == "refused":
-        return "refused", probes
-    aliases = set(contract["aliases"])
-    if set(environment) & aliases != aliases:
-        return "refused", probes
-    if environment.get("DSH_SHELL") != "1":
-        return "refused", probes
-    return "authorized", probes
+    if extra:
+        environment.update(extra)
+    return environment
+
+
+def run_provenance_probe(fixture, *, environment=None, extra_args=()):
+    command = [
+        "python3",
+        str(PROVENANCE_PROBE),
+        "--proc-cgroup",
+        str(fixture["proc"]),
+        "--cgroup-root",
+        str(fixture["cgroup_root"]),
+        "--now-monotonic-ns",
+        str(fixture["now"]),
+    ]
+    pass_fds = ()
+    if fixture["descriptor_fd"] is not None:
+        command.extend(["--descriptor-fd", str(fixture["descriptor_fd"])])
+        pass_fds = (fixture["descriptor_fd"],)
+    command.extend(extra_args)
+    return subprocess.run(
+        command,
+        cwd=ROOT,
+        env=clean_probe_environment(environment),
+        pass_fds=pass_fds,
+        text=True,
+        capture_output=True,
+        timeout=10,
+        check=False,
+    )
+
+
+@contextmanager
+def access_watch(*paths):
+    libc = ctypes.CDLL(None, use_errno=True)
+    fd = libc.inotify_init1(os.O_NONBLOCK | os.O_CLOEXEC)
+    if fd < 0:
+        raise OSError(ctypes.get_errno(), "inotify_init1")
+    try:
+        for path in paths:
+            watch = libc.inotify_add_watch(
+                fd,
+                os.fsencode(path),
+                0x00000001 | 0x00000020,
+            )
+            if watch < 0:
+                raise OSError(ctypes.get_errno(), f"inotify_add_watch {path}")
+        yield fd
+    finally:
+        os.close(fd)
+
+
+def watched_events(fd):
+    try:
+        return os.read(fd, 65_536)
+    except BlockingIOError:
+        return b""
 
 
 class DeepSeekDshPreparationContractTests(unittest.TestCase):
@@ -171,7 +295,57 @@ class DeepSeekDshPreparationContractTests(unittest.TestCase):
             adapter["official_runtime"]["shell_authority_contract"],
             "assets/deepseek/dsh-shell-authority-contract.json",
         )
-        self.assertEqual(len(self.contract["supported_seams"]), 8)
+        self.assertEqual(self.contract["schema_version"], 2)
+        self.assertEqual(
+            {
+                seam["name"]: (
+                    seam["source"], seam["source_sha256"], seam["contract"]
+                )
+                for seam in self.contract["supported_seams"]
+            },
+            {
+                "profile-composition": (
+                    "apps/cli/src/profile-boot.ts",
+                    "4a89a793d0a793e7573d7b275d9682459fa2e211edc6814d23b90c75588fa663",
+                    "bundle layers, dedicated profile patch, home patch, explicit overlays, then telemetry; production must use an engine-owned DSH_HOME so no shared home patch participates",
+                ),
+                "per-execution-shell-env": (
+                    "packages/shell/shell-env/src/index.ts",
+                    "a9347895a868d3a8928042833f253165c02e7f187e39593259cf164e2bae88c1",
+                    "ShellEnvRegistry.register declares owned DSH_* names and collect(execution) resolves a fresh immutable snapshot",
+                ),
+                "ambient-scrub": (
+                    "packages/subprocess/subprocess/src/index.ts",
+                    "0498a406106a51e34ac24e2e752dde67bb3c5c623333599e2af1805a30ca5499",
+                    "scrubbedParentEnv removes every ambient DSH_* and credential-shaped KEY/PASSWORD/SECRET/TOKEN name",
+                ),
+                "subprocess-merge": (
+                    "packages/subprocess/subprocess-local/src/spawn.ts",
+                    "3038096134defaf03f767b94fdcbb65c7103f60448f5973201732c93def72d71",
+                    "explicit caller environment is merged after scrubbedParentEnv for foreground, background, and terminal children",
+                ),
+                "bash-collection": (
+                    "packages/shell/tool-bash/src/index.ts",
+                    "e0302d4cc1d835ca4118434afc9913c4236773bbce92349ae7644d540d40c482",
+                    "ctx.shellEnv.collect(exec) is called once per foreground or background ToolExecution",
+                ),
+                "bash-dispatch": (
+                    "packages/shell/bash-local/src/index.ts",
+                    "c501ca1e9164642f1291c0e40b3a7226f6079af847aa8c22b4fda52fbf692d39",
+                    "spec.dshEnv is merged last into the explicit spawn environment for run and start",
+                ),
+                "powershell-collection": (
+                    "packages/shell/tool-pwsh/src/index.ts",
+                    "189024974fdb0d15605a96973aad2b8a4bdaf8c5fdaf4bbe7c2465794cf65e67",
+                    "ctx.shellEnv.collect(exec) supplies the same snapshot for PowerShell foreground and background ToolExecution",
+                ),
+                "powershell-dispatch": (
+                    "packages/shell/pwsh-local/src/index.ts",
+                    "a9f00ecb6b4394549792952f7f9ef344352236a4e225d28e2945331422bb864b",
+                    "spec.dshEnv is merged last into the PowerShell spawn environment",
+                ),
+            },
+        )
         self.assertEqual(
             self.contract["aliases"],
             [
@@ -214,6 +388,44 @@ class DeepSeekDshPreparationContractTests(unittest.TestCase):
         self.assertNotIn(
             "registry_snapshot_generation",
             self.contract["containment_baseline"]["global_identity_lease"],
+        )
+        provenance = self.contract["execution_provenance"]
+        self.assertEqual(
+            provenance["managed_rule"],
+            "domain membership selects DSH policy even when DSH_SHELL and every DSH_SC_* alias were deleted or falsified",
+        )
+        self.assertEqual(
+            provenance["native_rule"],
+            "no domain plus no DSH_* bridge names selects the unchanged native path",
+        )
+        self.assertEqual(
+            provenance["spoof_rule"],
+            "no domain plus any DSH_SHELL or DSH_SC_* name exits 77 before effect",
+        )
+        self.assertEqual(
+            provenance["unknown_rule"],
+            "missing, ambiguous, stale, breakaway, or unreadable domain evidence exits 77 before effect",
+        )
+        self.assertEqual(
+            provenance["admin_artifact_rule"],
+            "managed, spoofed, and unknown decisions never inspect runtime credential artifacts or attempt Admin discovery",
+        )
+        self.assertEqual(
+            provenance["linux_contributor"],
+            {
+                "path": ".super-coder/scripts/dsh_execution_provenance.py",
+                "sha256": sha256(PROVENANCE_PROBE),
+                "contract": "sc-dsh-linux-cgroup-v2-v1",
+            },
+        )
+        self.assertEqual(
+            provenance["windows_contributor"]["sha256"],
+            sha256(WINDOWS_PROBE),
+        )
+        self.assertEqual(
+            provenance["bootstrap_order"][3],
+            "under managed membership refuse SC_DISPATCH, SC_CALLER_ROOT, "
+            "SC_MEM_AS, and every ambient SC_* before target or credential inspection",
         )
 
     def test_every_public_dispatch_pattern_has_one_classification(self):
@@ -288,102 +500,279 @@ class DeepSeekDshPreparationContractTests(unittest.TestCase):
             },
         )
 
-    def test_every_direct_identity_consumer_is_inventoried(self):
-        patterns = {
-            "SC_API_TOKEN": r"\bSC_API_TOKEN\b",
-            "SC_API_BASE": r"\bSC_API_BASE\b",
-            "SC_MEM_CREDENTIAL_FILE": r"\bSC_MEM_CREDENTIAL_FILE\b",
-            "SC_SHELL_ID": r"\bSC_SHELL_ID\b",
-            "SC_SHELL_SHORTNAME": r"\bSC_SHELL_SHORTNAME\b",
-            "SC_SHELL_WORKTREE": r"\bSC_SHELL_WORKTREE\b",
-            "SC_ADMIN": r"\bSC_ADMIN\b",
-            "credential_discovery": r"\b_?discover_runtime_credential\b",
-        }
-        for name, pattern in patterns.items():
-            self.assertEqual(
-                paths_matching(pattern),
-                self.contract["direct_identity_signal_inventory"][name],
-                name,
+    def test_complete_source_sc_signal_and_effect_inventory_is_exact(self):
+        observed = generated_inventory()
+        for name in (
+            "source_sha256_inventory",
+            "direct_sc_signal_inventory",
+            "ambient_sc_policy",
+            "literal_subparser_counters",
+            "effect_call_vocabulary",
+            "direct_effect_signal_inventory",
+            "risky_call_inventory",
+            "effect_detector_vocabulary",
+        ):
+            self.assertEqual(observed[name], self.contract[name], name)
+
+        policy = self.contract["ambient_sc_policy"]
+        groups = [
+            set(policy[name])
+            for name in (
+                "pre_provenance_refused",
+                "credential_selection_refused",
+                "identity_selection_refused",
+                "effect_configuration_refused",
             )
-        self.assertNotIn(
-            ".super-coder/scripts/new_identity_consumer.py",
-            self.contract["direct_identity_signal_inventory"]["SC_API_TOKEN"],
+        ]
+        self.assertEqual(sum(map(len, groups)), len(set().union(*groups)))
+        self.assertEqual(
+            set().union(*groups),
+            set(self.contract["direct_sc_signal_inventory"]),
+        )
+        self.assertIn(
+            "sc",
+            self.contract["direct_sc_signal_inventory"]["SC_DISPATCH"],
+        )
+        self.assertIn(
+            ".super-coder/scripts/mem.py",
+            self.contract["direct_sc_signal_inventory"]["SC_MEM_AS"],
+        )
+        effects = self.contract["direct_effect_signal_inventory"]
+        self.assertIn(
+            ".super-coder/scripts/map_setup.py",
+            effects["filesystem_write"],
+        )
+        self.assertIn("os.chmod", self.contract["effect_call_vocabulary"]["filesystem_write"])
+        detector = self.contract["effect_detector_vocabulary"]
+        self.assertTrue({"chmod", "mkdir", "rename"} <= set(detector["filesystem_write_methods"]))
+        self.assertTrue(
+            {"os.posix_spawn", "asyncio.create_subprocess_exec"}
+            <= set(detector["process_calls"])
         )
 
-    def test_direct_effect_consumers_are_drift_detected(self):
-        patterns = {
-            "direct_db": r"sqlite3\.connect|exec sqlite3",
-            "credential_artifact": (
-                r"mem_credentials|runtime_credential|credential_file|"
-                r"SC_MEM_CREDENTIAL_FILE"
-            ),
-            "api_effect": r"urlopen\(|urllib\.request|requests\.|_api\(|/_sc/|/api/",
-            "filesystem_effect": (
-                r"\.write_text\(|\.write_bytes\(|\.unlink\(|os\.replace\(|"
-                r"os\.remove\(|shutil\.(?:copy|move|rmtree)\(|"
-                r"open\([^\n]*,[^\n]*[\"'](?:w|a|x)"
-            ),
-            "process_effect": (
-                r"subprocess\.(?:run|Popen|call|check_call|check_output)\(|"
-                r"os\.exec|exec \"?\$|docker |curl "
-            ),
-        }
-        for name, pattern in patterns.items():
+    def test_inventory_detector_reacts_to_new_authority_and_effect_forms(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            scripts = root / ".super-coder/scripts"
+            api = root / ".super-coder/api"
+            scripts.mkdir(parents=True)
+            api.mkdir(parents=True)
+            (root / "sc").write_text("#!/bin/sh\nexec sh dispatcher\n")
+            sample = scripts / "sample.py"
+            sample.write_text(
+                "import os\n"
+                "SC_NEW_AUTHORITY = 'SC_NEW_AUTHORITY'\n"
+                "os.chmod('target', 0o700)\n"
+            )
+            first = generated_inventory(root)
             self.assertEqual(
-                paths_matching(pattern),
-                self.contract["direct_effect_signal_inventory"][name],
-                name,
+                first["direct_sc_signal_inventory"]["SC_NEW_AUTHORITY"],
+                [".super-coder/scripts/sample.py"],
+            )
+            self.assertEqual(
+                first["direct_effect_signal_inventory"]["filesystem_write"],
+                [".super-coder/scripts/sample.py"],
+            )
+            sample.write_text(
+                "import os\n"
+                "os.posix_spawn('/bin/true', ['/bin/true'], {})\n"
+            )
+            second = generated_inventory(root)
+            self.assertNotEqual(
+                first["source_sha256_inventory"],
+                second["source_sha256_inventory"],
+            )
+            self.assertEqual(
+                second["direct_effect_signal_inventory"]["process_effect"],
+                [".super-coder/scripts/sample.py", "sc"],
             )
 
-    def test_execution_provenance_survives_marker_and_alias_mutation(self):
-        aliases = {name: f"value-{index}" for index, name in enumerate(self.contract["aliases"])}
+    def test_linux_resolver_rejects_missing_ambiguous_stale_and_delegated_evidence(self):
+        for kind in (
+            "missing",
+            "unreadable",
+            "ambiguous",
+            "no-descriptor",
+            "stale",
+            "delegated",
+        ):
+            with self.subTest(kind=kind), linux_domain_fixture(kind) as fixture:
+                completed = run_provenance_probe(fixture)
+                self.assertEqual(completed.returncode, 77, completed.stderr)
+                self.assertEqual(json.loads(completed.stdout)["provenance"], "unknown")
+
+    def test_managed_and_spoofed_selectors_refuse_before_external_effects(self):
+        aliases = {
+            name: f"value-{index}"
+            for index, name in enumerate(self.contract["aliases"])
+        }
         exact = {"DSH_SHELL": "1", **aliases}
         cases = [
-            ("managed", {}, "dsh_shell_authorized", "refused"),
-            ("managed", {"DSH_SHELL": "0"}, "dsh_shell_authorized", "refused"),
-            ("managed", exact, "dsh_shell_authorized", "authorized"),
-            ("managed", {}, "identity_neutral_read_only", "neutral"),
-            ("managed", exact, "refused", "refused"),
-            ("native", {"DSH_SHELL": "1"}, "dsh_shell_authorized", "refused"),
-            ("native", aliases, "dsh_shell_authorized", "refused"),
-            ("native", {}, "dsh_shell_authorized", "native"),
-            ("unknown", {}, "dsh_shell_authorized", "refused"),
+            ("managed", {}, "marker-and-aliases-deleted"),
+            ("managed", {"DSH_SHELL": "0", **aliases}, "marker-falsified"),
+            ("managed", {**exact, "SC_DISPATCH": "TARGET"}, "dispatch-override"),
+            ("managed", {**exact, "SC_MEM_AS": "Admin"}, "admin-selector"),
+            ("native", {"DSH_SHELL": "1", "SC_DISPATCH": "TARGET"}, "native-spoof"),
+            ("ambiguous", {"SC_DISPATCH": "TARGET"}, "unknown-membership"),
         ]
-        for provenance, environment, command_class, expected in cases:
-            with self.subTest(provenance=provenance, environment=environment):
-                decision, probes = resolve_policy(
-                    self.contract,
-                    provenance=provenance,
-                    environment=environment,
-                    command_class=command_class,
-                )
-                self.assertEqual(decision, expected)
-                if decision in {"refused", "neutral"}:
-                    self.assertEqual(set(probes.values()), {0})
+        with tempfile.TemporaryDirectory() as raw:
+            fixture_root = Path(raw)
+            admin_dir = fixture_root / "credentials"
+            event_dir = fixture_root / "effects"
+            admin_dir.mkdir()
+            event_dir.mkdir()
+            admin = admin_dir / "Admin.json"
+            admin.write_text(json.dumps({
+                "token": "discoverable-admin-token",
+                "api_base": "http://127.0.0.1:8837",
+            }))
+            for kind, environment, label in cases:
+                with self.subTest(label=label), linux_domain_fixture(kind) as fixture:
+                    actual_environment = {
+                        **environment,
+                        "DSH_EFFECT_DIR": str(event_dir),
+                        "DSH_ADMIN_CREDENTIAL": str(admin),
+                        "DSH_EFFECT_API": "http://127.0.0.1:9/denied",
+                    }
+                    if actual_environment.get("SC_DISPATCH") == "TARGET":
+                        actual_environment["SC_DISPATCH"] = str(EFFECT_DRIVER)
+                    with access_watch(EFFECT_DRIVER, admin_dir, admin) as watcher:
+                        completed = run_provenance_probe(
+                            fixture,
+                            environment=actual_environment,
+                            extra_args=(
+                                "--native-credential-dir",
+                                str(admin_dir),
+                                "--default-dispatch",
+                                str(EFFECT_DRIVER),
+                                *(item for pair in (
+                                    ("--alias", name)
+                                    for name in self.contract["aliases"]
+                                ) for item in pair),
+                            ),
+                        )
+                        self.assertEqual(completed.returncode, 77, completed.stderr)
+                        self.assertEqual(json.loads(completed.stdout)["decision"], "refused")
+                        self.assertEqual(watched_events(watcher), b"")
+                    self.assertEqual(list(event_dir.iterdir()), [])
 
-        decision, probes = resolve_policy(
-            self.contract,
-            provenance="managed",
-            environment={},
-            command_class="dsh_shell_authorized",
-            admin_artifact_discoverable=True,
+    def test_effect_driver_trips_every_external_sentinel(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            event_dir = root / "effects"
+            admin = root / "Admin.json"
+            admin.write_text('{"token":"discoverable"}\n')
+            completed = subprocess.run(
+                [str(EFFECT_DRIVER)],
+                env=clean_probe_environment({
+                    "DSH_EFFECT_DIR": str(event_dir),
+                    "DSH_ADMIN_CREDENTIAL": str(admin),
+                    "DSH_EFFECT_API": "http://127.0.0.1:9/expected-refusal",
+                }),
+                text=True,
+                capture_output=True,
+                timeout=10,
+                check=False,
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            self.assertEqual(
+                {path.name for path in event_dir.iterdir()},
+                {
+                    "api_effect",
+                    "credential_discovery",
+                    "db_write",
+                    "denied_marker_write",
+                    "effect.db",
+                    "filesystem_write",
+                    "message_write",
+                    "process_start",
+                    "wake_write",
+                },
+            )
+
+    def test_exact_managed_aliases_authorize_without_admin_discovery(self):
+        aliases = {
+            name: f"value-{index}"
+            for index, name in enumerate(self.contract["aliases"])
+        }
+        with tempfile.TemporaryDirectory() as raw:
+            admin_dir = Path(raw) / "credentials"
+            admin_dir.mkdir()
+            admin = admin_dir / "Admin.json"
+            admin.write_text('{"token":"discoverable"}\n')
+            with (
+                linux_domain_fixture("managed") as fixture,
+                access_watch(admin_dir, admin) as watcher,
+            ):
+                completed = run_provenance_probe(
+                    fixture,
+                    environment={"DSH_SHELL": "1", **aliases},
+                    extra_args=tuple(
+                        item for name in self.contract["aliases"]
+                        for item in ("--alias", name)
+                    ) + ("--native-credential-dir", str(admin_dir)),
+                )
+                self.assertEqual(completed.returncode, 0, completed.stderr)
+                self.assertEqual(json.loads(completed.stdout)["decision"], "authorized")
+                self.assertEqual(watched_events(watcher), b"")
+
+    def test_native_control_reaches_native_credential_discovery(self):
+        with tempfile.TemporaryDirectory() as raw:
+            admin_dir = Path(raw) / "credentials"
+            admin_dir.mkdir()
+            admin = admin_dir / "Admin.json"
+            admin.write_text('{"token":"discoverable"}\n')
+            with (
+                linux_domain_fixture("native") as fixture,
+                access_watch(admin_dir, admin) as watcher,
+            ):
+                completed = run_provenance_probe(
+                    fixture,
+                    extra_args=("--native-credential-dir", str(admin_dir)),
+                )
+                receipt = json.loads(completed.stdout)
+                self.assertEqual(completed.returncode, 0, completed.stderr)
+                self.assertEqual(receipt["decision"], "native")
+                self.assertEqual(receipt["credential_count"], 1)
+                self.assertNotEqual(watched_events(watcher), b"")
+
+    def test_every_source_hash_matches_the_exact_upstream_commit(self):
+        commit = self.contract["dsh_release"]["commit"]
+        for seam in self.contract["supported_seams"]:
+            with self.subTest(seam=seam["name"]):
+                url = (
+                    "https://raw.githubusercontent.com/deepseek-ai/"
+                    f"deepseek-harness/{commit}/{seam['source']}"
+                )
+                with urllib.request.urlopen(url, timeout=20) as response:
+                    source = response.read()
+                self.assertEqual(
+                    hashlib.sha256(source).hexdigest(),
+                    seam["source_sha256"],
+                )
+
+    def test_windows_job_object_contributor_is_exact_and_non_breakaway(self):
+        source = WINDOWS_PROBE.read_text()
+        self.assertEqual(
+            sha256(WINDOWS_PROBE),
+            "05a087c9653e3215a34a7f87f65895f459c15896df25c45a3455ae51e7f2a4bd",
         )
-        self.assertEqual(decision, "refused")
-        self.assertEqual(probes["credential_discovery"], 0)
-        self.assertEqual(probes["api_read"], 0)
-        self.assertEqual(probes["db_read"], 0)
-        self.assertEqual(probes["filesystem_read"], 0)
-        self.assertEqual(probes["process_start"], 0)
-        self.assertEqual(probes["message_write"], 0)
-        self.assertEqual(probes["wake_write"], 0)
-        self.assertEqual(probes["denied_marker_write"], 0)
+        for marker in (
+            "IsProcessInJob",
+            "QueryInformationJobObject",
+            "JOB_OBJECT_LIMIT_BREAKAWAY_OK",
+            "JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK",
+            "GetFileType($descriptor)",
+            'contract = "sc-dsh-windows-job-object-v1"',
+        ):
+            self.assertIn(marker, source)
 
     def test_real_pinned_dsh_components_reproduce_clean_room_fixture(self):
         dsh = shutil.which("dsh")
         self.assertIsNotNone(dsh, "pinned dsh is required for the executable fixture")
         package_root = Path(dsh).resolve().parents[1]
         completed = subprocess.run(
-            ["node", str(NODE_PROBE), str(package_root)],
+            ["node", str(NODE_PROBE), str(package_root), str(CONTRACT_PATH)],
             cwd=ROOT,
             text=True,
             capture_output=True,
@@ -395,6 +784,10 @@ class DeepSeekDshPreparationContractTests(unittest.TestCase):
         receipt = json.loads(completed.stdout)
         self.assertEqual(receipt["contract"], "dsh-shell-env-clean-room-fixture-v1")
         self.assertEqual(set(receipt["versions"].values()), {"0.1.1-rc.2"})
+        self.assertEqual(
+            set(receipt["runtimeHashes"]),
+            {seam["name"] for seam in self.contract["supported_seams"]},
+        )
         self.assertEqual(receipt["powershellParity"], "source-contract-passed")
 
 
