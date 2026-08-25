@@ -1,18 +1,16 @@
 name: tests
 
-# The PR gate: the full engine suite + the headless end-to-end proof, on every
-# PR and every push to main. GitHub-hosted BY DESIGN — this repo is public, and
+# The PR gate: the full engine suite + the headless end-to-end proof on every
+# PR. GitHub-hosted BY DESIGN — this repo is public, and
 # a self-hosted runner on a public repo lets any fork PR execute code on the
 # host (the same host that carries the substrates). The core suite is hermetic;
 # explicit browser/terminal acceptance jobs install only their pinned test
 # dependencies. Ubuntu-hosted runners keep every PR path isolated.
-# Anything that ever genuinely needs house hardware belongs in a separate
-# push-to-main-only workflow, never a PR-triggered one.
+# Trusted main/manual execution lives in trusted-main.yml, which is never
+# triggered by pull_request and therefore cannot be rewritten by a fork PR.
 
 on:
   pull_request:
-  push:
-    branches: [main]
 
 # Least-privilege GITHUB_TOKEN — both jobs only read the tree (CodeQL flags the
 # unbounded default). Nothing here pushes, comments, or releases.
