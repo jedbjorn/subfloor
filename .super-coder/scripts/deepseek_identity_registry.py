@@ -34,6 +34,7 @@ DEFAULT_ROOT = ENGINE / "run" / "deepseek-identity"
 REGISTRY_CONTRACT = "sc-dsh-identity-registry-v1"
 CREDENTIAL_CONTRACT = "sc-dsh-binding-credential-v1"
 HEALTH_CONTRACT = "sc-dsh-plugin-health-v1"
+HOST_IDENTITY_CONTRACT = "sc-dsh-host-identity-v1"
 PROFILE_CONTRACT = "sc-dsh-profile-v1"
 SCHEMA_VERSION = 1
 ALIASES = (
@@ -73,6 +74,7 @@ class RegistryLayout:
     lock: Path
     credentials: Path
     health: Path
+    host_identity: Path
     profile_identity: Path
 
 
@@ -246,6 +248,19 @@ def _crash(point: str, crash_at: str | None) -> None:
         raise SimulatedRegistryCrash(point)
 
 
+def process_start_ticks(pid: int, *, proc_root: Path = Path("/proc")) -> int | None:
+    """Read one Linux process identity without trusting its environment."""
+    try:
+        raw = (proc_root / str(pid) / "stat").read_text()
+        command_end = raw.rfind(")")
+        if command_end < 0:
+            return None
+        fields = raw[command_end + 1 :].split()
+        return int(fields[19])
+    except (OSError, ValueError, IndexError):
+        return None
+
+
 class DeepSeekIdentityRegistry:
     """One fork's profile, plugin health, and transactional binding registry."""
 
@@ -279,6 +294,7 @@ class DeepSeekIdentityRegistry:
             lock=root / "registry.lock",
             credentials=root / "credentials",
             health=root / "plugin-health.json",
+            host_identity=root / "host-identity.json",
             profile_identity=root / "profile-identity.json",
         )
 
@@ -449,6 +465,59 @@ class DeepSeekIdentityRegistry:
         values["SC_DSH_HOST_BOOT_GENERATION"] = uuid.uuid4().hex
         return values
 
+    def observe_host(
+        self,
+        *,
+        host_boot_generation: str,
+        host_pid: int,
+        host_start_ticks: int | None = None,
+    ) -> dict[str, Any]:
+        """Publish the engine-observed Linux Host identity under the registry lock."""
+        if not host_boot_generation or not isinstance(host_boot_generation, str):
+            raise DeepSeekIdentityError(
+                "HARNESS_PLUGIN_HEALTH_INVALID",
+                "Host boot generation is missing",
+            )
+        if not isinstance(host_pid, int) or isinstance(host_pid, bool) or host_pid <= 1:
+            raise DeepSeekIdentityError(
+                "HARNESS_PLUGIN_HEALTH_INVALID",
+                "Host PID is invalid",
+            )
+        observed_ticks = process_start_ticks(host_pid)
+        expected_ticks = (
+            observed_ticks if host_start_ticks is None else host_start_ticks
+        )
+        if (
+            not isinstance(expected_ticks, int)
+            or isinstance(expected_ticks, bool)
+            or expected_ticks <= 0
+            or observed_ticks != expected_ticks
+        ):
+            raise DeepSeekIdentityError(
+                "HARNESS_PLUGIN_HEALTH_UNAVAILABLE",
+                "Host process identity is not live",
+            )
+        identity = {
+            "contract": HOST_IDENTITY_CONTRACT,
+            "fork_id": self.layout.fork_id,
+            "profile_id": self.layout.profile_id,
+            "host_boot_generation": host_boot_generation,
+            "host_pid": host_pid,
+            "host_start_ticks": expected_ticks,
+            "observed_at": _utc_now(),
+        }
+        with self._mutation_lock():
+            if process_start_ticks(host_pid) != expected_ticks:
+                raise DeepSeekIdentityError(
+                    "HARNESS_PLUGIN_HEALTH_UNAVAILABLE",
+                    "Host process identity changed before publication",
+                )
+            _atomic_owner_write(
+                self.layout.host_identity,
+                _canonical_json(identity) + b"\n",
+            )
+        return identity
+
     def read_snapshot(self) -> dict[str, Any]:
         return self._read_snapshot_unlocked()
 
@@ -466,18 +535,29 @@ class DeepSeekIdentityRegistry:
                 "HARNESS_PLUGIN_HEALTH_UNAVAILABLE",
                 "DeepSeek identity plugin is not loaded",
             )
+        identity = _read_owner_json(
+            self.layout.host_identity,
+            missing_code="HARNESS_PLUGIN_HEALTH_UNAVAILABLE",
+        )
         host_boot_generation = (
             expected_host_boot_generation
             if expected_host_boot_generation is not None
             else health.get("host_boot_generation")
         )
         load_generation = health.get("plugin_load_hmr_generation")
-        if not isinstance(host_boot_generation, str) or not isinstance(
-            load_generation, str
+        host_pid = health.get("host_pid")
+        host_start_ticks = health.get("host_start_ticks")
+        if (
+            not isinstance(host_boot_generation, str)
+            or not isinstance(load_generation, str)
+            or not isinstance(host_pid, int)
+            or isinstance(host_pid, bool)
+            or not isinstance(host_start_ticks, int)
+            or isinstance(host_start_ticks, bool)
         ):
             raise DeepSeekIdentityError(
                 "HARNESS_PLUGIN_HEALTH_INVALID",
-                "plugin health generations are malformed",
+                "plugin health Host identity or generations are malformed",
             )
         expected: dict[str, str] = {
             "canonical_fork_id": self.layout.fork_id,
@@ -493,11 +573,27 @@ class DeepSeekIdentityRegistry:
             health.get("fork_id") != self.layout.fork_id
             or health.get("profile_id") != self.layout.profile_id
             or health.get("registry_path") != str(self.layout.registry.resolve())
+            or health.get("host_boot_generation") != host_boot_generation
             or health.get("plugin_contract_generation") != generation
+            or identity.get("contract") != HOST_IDENTITY_CONTRACT
+            or identity.get("fork_id") != self.layout.fork_id
+            or identity.get("profile_id") != self.layout.profile_id
+            or identity.get("host_boot_generation") != host_boot_generation
+            or identity.get("host_pid") != host_pid
+            or identity.get("host_start_ticks") != host_start_ticks
         ):
             raise DeepSeekIdentityError(
                 "HARNESS_PLUGIN_HEALTH_MISMATCH",
                 "loaded DeepSeek plugin contract disagrees with this fork",
+            )
+        if (
+            host_pid <= 1
+            or host_start_ticks <= 0
+            or process_start_ticks(host_pid) != host_start_ticks
+        ):
+            raise DeepSeekIdentityError(
+                "HARNESS_PLUGIN_HEALTH_UNAVAILABLE",
+                "loaded DeepSeek Host process is not live",
             )
         return health
 
@@ -655,14 +751,166 @@ class DeepSeekIdentityRegistry:
                 "plugin_contract_generation": plugin_contract_generation,
                 "state": "active",
                 "created_at": now,
+                "reopened_at": None,
                 "recovered_at": None,
                 "closed_at": None,
                 "retired_artifacts": [],
+                "tombstone_history": [],
             }
             return self._commit(
                 snapshot,
                 root_session_id=root_session_id,
                 operation="create",
+                crash_at=crash_at,
+            )
+
+    def reopen_binding(
+        self,
+        *,
+        expected_snapshot_generation: int,
+        root_session_id: str,
+        expected_record_generation: int,
+        conversation_id: str,
+        lifecycle_epoch: int,
+        shell_id: int,
+        shell_shortname: str,
+        shell_worktree: Path,
+        api_base: str,
+        token: str,
+        plugin_contract_generation: str,
+        crash_at: str | None = None,
+    ) -> TransactionReceipt:
+        """Conditionally reopen one terminal tombstone for the same owner."""
+        root_session_id = _validate_session(root_session_id, field="root_session_id")
+        if not conversation_id or not isinstance(conversation_id, str):
+            raise DeepSeekIdentityError(
+                "HARNESS_BINDING_INVALID", "engine conversation identity is empty"
+            )
+        if lifecycle_epoch <= 0 or shell_id <= 0 or not shell_shortname:
+            raise DeepSeekIdentityError(
+                "HARNESS_BINDING_INVALID",
+                "binding shell or lifecycle identity is invalid",
+            )
+        worktree = shell_worktree.resolve(strict=True)
+        if not worktree.is_dir():
+            raise DeepSeekIdentityError(
+                "HARNESS_BINDING_INVALID", "binding worktree is not a directory"
+            )
+        try:
+            worktree.relative_to(self.repo_root)
+        except ValueError as exc:
+            raise DeepSeekIdentityError(
+                "HARNESS_BINDING_INVALID", "binding worktree belongs to another fork"
+            ) from exc
+        api_base = _validate_loopback_api(api_base)
+        live = self.read_live_health()
+        if live["plugin_contract_generation"] != plugin_contract_generation:
+            raise DeepSeekIdentityError(
+                "HARNESS_PLUGIN_HEALTH_MISMATCH", "reopen used stale plugin health"
+            )
+        with self._mutation_lock():
+            locked_health = self.read_live_health()
+            if (
+                locked_health["plugin_contract_generation"]
+                != plugin_contract_generation
+            ):
+                raise DeepSeekIdentityError(
+                    "HARNESS_PLUGIN_HEALTH_MISMATCH",
+                    "plugin health changed before binding reopen",
+                )
+            snapshot = self._read_snapshot_unlocked()
+            self._expect_snapshot(snapshot, expected_snapshot_generation)
+            record = snapshot["records"].get(root_session_id)
+            if (
+                not isinstance(record, dict)
+                or record.get("state") != "terminal"
+                or root_session_id in snapshot["lineage"]
+            ):
+                raise DeepSeekIdentityError(
+                    "HARNESS_BINDING_REOPEN_REFUSED",
+                    "only an unambiguous terminal root binding may reopen",
+                )
+            if record.get("record_generation") != expected_record_generation:
+                raise DeepSeekIdentityError(
+                    "HARNESS_REGISTRY_STALE_WRITER",
+                    "terminal binding changed before reopen",
+                )
+            previous_epoch = record.get("lifecycle_epoch")
+            same_owner = (
+                record.get("root_session_id") == root_session_id
+                and record.get("conversation_id") == conversation_id
+                and record.get("shell_id") == shell_id
+                and record.get("shell_shortname") == shell_shortname
+                and record.get("shell_worktree") == str(worktree)
+            )
+            if (
+                not same_owner
+                or not isinstance(previous_epoch, int)
+                or isinstance(previous_epoch, bool)
+                or lifecycle_epoch <= previous_epoch
+                or record.get("credential_file") is not None
+                or record.get("retired_artifacts") != []
+            ):
+                raise DeepSeekIdentityError(
+                    "HARNESS_BINDING_REOPEN_REFUSED",
+                    "terminal binding owner or lifecycle epoch does not match reopen",
+                )
+            history = record.get("tombstone_history", [])
+            if not isinstance(history, list):
+                raise DeepSeekIdentityError(
+                    "HARNESS_REGISTRY_INVALID", "tombstone history is malformed"
+                )
+            next_generation = expected_record_generation + 1
+            credential = self._write_credential(
+                token=token,
+                api_base=api_base,
+                shell_id=shell_id,
+                shell_shortname=shell_shortname,
+                root_session_id=root_session_id,
+                conversation_id=conversation_id,
+                lifecycle_epoch=lifecycle_epoch,
+                record_generation=next_generation,
+                contract_generation=plugin_contract_generation,
+                crash_at=crash_at,
+            )
+            history.append(
+                {
+                    "state": "terminal",
+                    "conversation_id": record["conversation_id"],
+                    "lifecycle_epoch": previous_epoch,
+                    "record_generation": expected_record_generation,
+                    "shell_id": record["shell_id"],
+                    "shell_shortname": record["shell_shortname"],
+                    "shell_worktree": record["shell_worktree"],
+                    "api_base": record["api_base"],
+                    "plugin_contract_generation": record["plugin_contract_generation"],
+                    "created_at": record.get("created_at"),
+                    "reopened_at": record.get("reopened_at"),
+                    "recovered_at": record.get("recovered_at"),
+                    "closed_at": record.get("closed_at"),
+                }
+            )
+            now = _utc_now()
+            record.update(
+                {
+                    "lifecycle_epoch": lifecycle_epoch,
+                    "api_base": api_base,
+                    "credential_file": str(credential),
+                    "record_generation": next_generation,
+                    "plugin_contract_generation": plugin_contract_generation,
+                    "state": "active",
+                    "created_at": now,
+                    "reopened_at": now,
+                    "recovered_at": None,
+                    "closed_at": None,
+                    "retired_artifacts": [],
+                    "tombstone_history": history,
+                }
+            )
+            return self._commit(
+                snapshot,
+                root_session_id=root_session_id,
+                operation="reopen",
                 crash_at=crash_at,
             )
 

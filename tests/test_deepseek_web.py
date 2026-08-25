@@ -85,6 +85,11 @@ def test_ensure_starts_exact_stock_web_relay_registers_and_reuses() -> None:
                     },
                 ),
                 mock.patch.object(
+                    deepseek_web.DeepSeekIdentityRegistry,
+                    "observe_host",
+                    return_value={},
+                ),
+                mock.patch.object(
                     deepseek_web,
                     "_verified_process",
                     side_effect=lambda pid, *_args, **_kwargs: isinstance(pid, int),
@@ -184,6 +189,11 @@ def test_shell_identity_reaches_stock_host_only_through_owner_only_artifact() ->
                 },
             ),
             mock.patch.object(
+                deepseek_web.DeepSeekIdentityRegistry,
+                "observe_host",
+                return_value={},
+            ),
+            mock.patch.object(
                 deepseek_web,
                 "_verified_process",
                 side_effect=lambda pid, *_args, **_kwargs: isinstance(pid, int),
@@ -268,6 +278,11 @@ def test_two_shell_handoff_rotates_only_after_empty_gateway_quiescence() -> None
                 },
             ),
             mock.patch.object(
+                deepseek_web.DeepSeekIdentityRegistry,
+                "observe_host",
+                return_value={},
+            ),
+            mock.patch.object(
                 deepseek_web,
                 "_verified_process",
                 side_effect=lambda pid, *_args, **_kwargs: isinstance(pid, int),
@@ -339,6 +354,11 @@ def test_non_sandbox_entry_still_uses_the_generation_gateway() -> None:
                 return_value={
                     "plugin_contract_generation": "plugin-contract-test"
                 },
+            ),
+            mock.patch.object(
+                deepseek_web.DeepSeekIdentityRegistry,
+                "observe_host",
+                return_value={},
             ),
             mock.patch.object(
                 deepseek_web,

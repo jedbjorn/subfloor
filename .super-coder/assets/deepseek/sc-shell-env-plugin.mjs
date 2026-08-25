@@ -122,6 +122,18 @@ function safeCredential(path) {
   return path;
 }
 
+function linuxStartTicks(pid) {
+  const raw = readFileSync(`/proc/${pid}/stat`, "utf8");
+  const commandEnd = raw.lastIndexOf(")");
+  if (commandEnd < 0) throw new Error("Host process identity is unavailable");
+  const fields = raw.slice(commandEnd + 1).trim().split(/\s+/);
+  const value = Number(fields[19]);
+  if (!Number.isSafeInteger(value) || value <= 0) {
+    throw new Error("Host process identity is invalid");
+  }
+  return value;
+}
+
 export function apply(ctx, config) {
   if (process.platform !== "linux") {
     throw new Error("sc-shell-identity: supported on Linux only");
@@ -134,6 +146,8 @@ export function apply(ctx, config) {
   const registryPathIdentity = requiredString(config, "registryPathIdentity");
   const healthPath = requiredString(config, "healthPath");
   const hostBootGeneration = requiredString(process.env, "SC_DSH_HOST_BOOT_GENERATION");
+  const hostPid = process.pid;
+  const hostStartTicks = linuxStartTicks(hostPid);
   const pluginLoadHmrGeneration = randomUUID().replaceAll("-", "");
   const generationInputs = Object.freeze({
     canonical_fork_id: forkId,
@@ -154,6 +168,8 @@ export function apply(ctx, config) {
       profile_id: profileId,
       registry_path: registryPath,
       host_boot_generation: hostBootGeneration,
+      host_pid: hostPid,
+      host_start_ticks: hostStartTicks,
       plugin_load_hmr_generation: pluginLoadHmrGeneration,
       plugin_contract_generation: contractGeneration,
       registry_snapshot_generation: snapshot?.snapshot_generation ?? null,

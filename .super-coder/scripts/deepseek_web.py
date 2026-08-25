@@ -1281,6 +1281,15 @@ def ensure(
                 ],
             }
             _write_state(state)
+            try:
+                identity_registry.observe_host(
+                    host_boot_generation=state["host_boot_generation"],
+                    host_pid=web_pid,
+                    host_start_ticks=web_ticks,
+                )
+            except DeepSeekIdentityError as exc:
+                _stop_unlocked()
+                raise DeepSeekWebError(exc.code, exc.detail) from exc
             if not _wait_ready(lambda: _http_ready(service_port)):
                 _stop_unlocked()
                 raise DeepSeekWebError(
