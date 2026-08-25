@@ -247,7 +247,7 @@ def ensure_server(*, timeout: float = 10.0) -> tuple[str, str | None]:
                     and installed_version != server_version
                     and _pid_is_opencode_serve(state_pid)
                 ):
-                    # A healthy orphan is still the wrong Browser/Sprint
+                    # A healthy orphan is still the wrong managed-conversation
                     # execution seat after the CLI is upgraded. Rotate it only
                     # at first adoption, before this process can hand the
                     # endpoint to an active conversation.

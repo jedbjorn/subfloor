@@ -207,7 +207,7 @@ def acquire_shell_identity(
     """Acquire the full-lifetime Host identity lease before any mutation.
 
     Native Web and one-shot callers retain the fail-fast default. Managed
-    Browser/Sprint turns may opt into a bounded wait so simultaneous wake
+    Managed conversation turns may opt into a bounded wait so simultaneous wake
     turns serialize at the shared stock Host identity boundary.
     """
     if wait_seconds < 0:
