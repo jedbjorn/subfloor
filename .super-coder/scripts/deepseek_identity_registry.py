@@ -20,7 +20,7 @@ import stat
 import sys
 import tempfile
 import uuid
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -550,6 +550,35 @@ class DeepSeekIdentityRegistry:
 
     def read_snapshot(self) -> dict[str, Any]:
         return self._read_snapshot_unlocked()
+
+    @contextmanager
+    def candidate_mint_guard(
+        self, *, expected_plugin_contract_generation: str
+    ) -> Iterator[dict[str, Any]]:
+        """Linearize a clean-seat proof mint with every registry writer."""
+        with self._mutation_lock():
+            health = self.read_live_health()
+            if (
+                health["plugin_contract_generation"]
+                != expected_plugin_contract_generation
+            ):
+                raise DeepSeekIdentityError(
+                    "HARNESS_PLUGIN_HEALTH_MISMATCH",
+                    "plugin health changed before proof capability mint",
+                )
+            snapshot = self._read_snapshot_unlocked()
+            live_roots = sorted(
+                root_session_id
+                for root_session_id, record in snapshot["records"].items()
+                if isinstance(record, Mapping)
+                and record.get("state") in LIVE_STATES
+            )
+            if live_roots:
+                raise DeepSeekIdentityError(
+                    "HARNESS_PROOF_SEAT_NOT_CLEAN",
+                    "initial proof capability requires an empty live session set",
+                )
+            yield snapshot
 
     def read_live_health(
         self, *, expected_host_boot_generation: str | None = None

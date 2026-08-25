@@ -1163,22 +1163,40 @@ def mint_candidate_capability(
     try:
         snapshot = registry.read_snapshot()
         health = registry.read_live_health()
-        grant = _candidate_authority(registry).mint(
-            mode=mode,
-            exact_ref=_exact_engine_ref(),
-            pinned_dsh_version=_current_dsh_version(),
-            disposable_baseline=disposable_baseline,
-            proof_run_id=proof_run_id,
-            roots=roots,
-            plugin_contract_generation=health["plugin_contract_generation"],
-            ttl_seconds=ttl_seconds,
-            live_registry_roots=sorted(
-                root_session_id
-                for root_session_id, record in snapshot["records"].items()
-                if isinstance(record, Mapping)
-                and record.get("state") in {"active", "closing"}
-            ),
+        observed_live_roots = sorted(
+            root_session_id
+            for root_session_id, record in snapshot["records"].items()
+            if isinstance(record, Mapping)
+            and record.get("state") in {"active", "closing"}
         )
+        if observed_live_roots:
+            raise DeepSeekIdentityError(
+                "HARNESS_PROOF_SEAT_NOT_CLEAN",
+                "initial proof capability requires an empty live session set",
+            )
+        with registry.candidate_mint_guard(
+            expected_plugin_contract_generation=health[
+                "plugin_contract_generation"
+            ]
+        ) as locked_snapshot:
+            grant = _candidate_authority(registry).mint(
+                mode=mode,
+                exact_ref=_exact_engine_ref(),
+                pinned_dsh_version=_current_dsh_version(),
+                disposable_baseline=disposable_baseline,
+                proof_run_id=proof_run_id,
+                roots=roots,
+                plugin_contract_generation=health[
+                    "plugin_contract_generation"
+                ],
+                ttl_seconds=ttl_seconds,
+                live_registry_roots=sorted(
+                    root_session_id
+                    for root_session_id, record in locked_snapshot["records"].items()
+                    if isinstance(record, Mapping)
+                    and record.get("state") in {"active", "closing"}
+                ),
+            )
         return {
             "mode": grant.mode,
             "generation": grant.generation,

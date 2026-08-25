@@ -5,6 +5,9 @@ import json
 import os
 import sys
 import tempfile
+import threading
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -1013,6 +1016,20 @@ def test_server_mint_derives_runtime_and_uses_only_fixed_authority_root(
         def read_live_health(self):
             return {"plugin_contract_generation": "contract-one"}
 
+        @contextmanager
+        def candidate_mint_guard(self, *, expected_plugin_contract_generation):
+            assert expected_plugin_contract_generation == "contract-one"
+            snapshot = self.read_snapshot()
+            if any(
+                record.get("state") in {"active", "closing"}
+                for record in snapshot["records"].values()
+            ):
+                raise DeepSeekIdentityError(
+                    "HARNESS_PROOF_SEAT_NOT_CLEAN",
+                    "initial proof capability requires an empty live session set",
+                )
+            yield snapshot
+
     with tempfile.TemporaryDirectory() as raw:
         root = Path(raw)
         registry = Registry(root)
@@ -1055,6 +1072,79 @@ def test_server_mint_derives_runtime_and_uses_only_fixed_authority_root(
         )
         assert grant["generation"] == 1
         assert Path(grant["artifact"]).exists()
+
+
+def test_server_mint_rechecks_clean_seat_under_registry_mutation_lock(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with tempfile.TemporaryDirectory() as raw:
+        registry, worktree, contract_generation = runtime_registry(Path(raw))
+        authority = DeepSeekCandidateAuthority(
+            registry.layout.root / "proof-authority"
+        )
+        read_snapshot = registry.read_snapshot
+        initial_read_done = threading.Event()
+        release_mint = threading.Event()
+
+        def paused_initial_read() -> dict:
+            snapshot = read_snapshot()
+            if not initial_read_done.is_set():
+                assert snapshot["records"] == {}
+                initial_read_done.set()
+                if not release_mint.wait(timeout=5):
+                    raise AssertionError("timed out waiting for competing binding")
+            return snapshot
+
+        monkeypatch.setattr(registry, "read_snapshot", paused_initial_read)
+        monkeypatch.setattr(deepseek_web, "_identity_registry", lambda _env: registry)
+        monkeypatch.setattr(
+            deepseek_web, "_candidate_authority", lambda _registry: authority
+        )
+        monkeypatch.setattr(deepseek_web, "_exact_engine_ref", lambda: "a" * 40)
+        monkeypatch.setattr(
+            deepseek_web, "_current_dsh_version", lambda: "0.1.1-rc.2"
+        )
+
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            pending_mint = pool.submit(
+                deepseek_web.mint_candidate_capability,
+                env={},
+                mode="candidate",
+                disposable_baseline="arch-clean-2026-08-25",
+                proof_run_id="proof-raced-clean-seat",
+                roots=ROOTS,
+                ttl_seconds=600,
+            )
+            assert initial_read_done.wait(timeout=2)
+            try:
+                receipt = registry.create_binding(
+                    expected_snapshot_generation=0,
+                    root_session_id="ordinary-competing-root",
+                    conversation_id="ordinary-competing-conversation",
+                    lifecycle_epoch=1,
+                    shell_id=4,
+                    shell_shortname="DEV4",
+                    shell_worktree=worktree,
+                    api_base="http://127.0.0.1:8837",
+                    token="ordinary-token",
+                    plugin_contract_generation=contract_generation,
+                )
+            finally:
+                release_mint.set()
+            with pytest.raises(deepseek_web.DeepSeekWebError) as refused:
+                pending_mint.result(timeout=5)
+
+        assert refused.value.code == "HARNESS_PROOF_SEAT_NOT_CLEAN"
+        assert receipt.state == "active"
+        snapshot = read_snapshot()
+        assert set(snapshot["records"]) == {"ordinary-competing-root"}
+        competing = snapshot["records"]["ordinary-competing-root"]
+        assert competing["conversation_id"] == "ordinary-competing-conversation"
+        assert competing["record_generation"] == 1
+        assert competing["state"] == "active"
+        assert Path(competing["credential_file"]).exists()
+        assert not authority.state_path.exists()
+        assert not authority.artifacts.exists()
 
 
 def test_server_restart_ratchet_requires_recovered_exact_bindings(
