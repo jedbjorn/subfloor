@@ -29,6 +29,8 @@ from typing import Any
 ENGINE = Path(__file__).resolve().parents[1]
 REPO_ROOT = ENGINE.parent.resolve()
 PLUGIN = ENGINE / "assets" / "deepseek" / "sc-shell-env-plugin.mjs"
+EXECUTION_LAUNCHER = ENGINE / "scripts" / "deepseek_execution_domain.py"
+EXECUTION_PROVENANCE = ENGINE / "scripts" / "dsh_execution_provenance.py"
 DEFAULT_ROOT = ENGINE / "run" / "deepseek-identity"
 
 REGISTRY_CONTRACT = "sc-dsh-identity-registry-v1"
@@ -300,7 +302,23 @@ class DeepSeekIdentityRegistry:
 
     @property
     def plugin_digest(self) -> str:
-        return _sha256_file(self.plugin_path)
+        return _sha256_bytes(
+            _canonical_json(
+                {
+                    "identity_plugin": _sha256_file(self.plugin_path),
+                    "execution_launcher": self.execution_launcher_digest,
+                    "execution_provenance": self.execution_provenance_digest,
+                }
+            )
+        )
+
+    @property
+    def execution_launcher_digest(self) -> str:
+        return _sha256_file(EXECUTION_LAUNCHER)
+
+    @property
+    def execution_provenance_digest(self) -> str:
+        return _sha256_file(EXECUTION_PROVENANCE)
 
     @property
     def schema_digest(self) -> str:
@@ -419,6 +437,12 @@ class DeepSeekIdentityRegistry:
             "registryPath": str(self.layout.registry.resolve()),
             "registryPathIdentity": self.registry_path_identity,
             "healthPath": str(self.layout.health.resolve()),
+            "hostIdentityPath": str(self.layout.host_identity.resolve()),
+            "executionLauncherPath": str(EXECUTION_LAUNCHER.resolve(strict=True)),
+            "executionLauncherDigest": self.execution_launcher_digest,
+            "cgroupRoot": "/sys/fs/cgroup",
+            "descriptorFd": 198,
+            "descriptorTtlSeconds": 86400,
         }
         patch = (
             "# engine-owned; regenerated before every stock DeepSeek Host boot\n"
@@ -439,6 +463,11 @@ class DeepSeekIdentityRegistry:
             "declared_variable_schema_digest": self.schema_digest,
             "registry_path": str(self.layout.registry.resolve()),
             "registry_path_identity": self.registry_path_identity,
+            "execution_launcher": str(EXECUTION_LAUNCHER.resolve(strict=True)),
+            "execution_launcher_digest": self.execution_launcher_digest,
+            "execution_provenance_digest": self.execution_provenance_digest,
+            "execution_descriptor_fd": 198,
+            "cgroup_root": "/sys/fs/cgroup",
         }
         _atomic_owner_write(
             self.layout.profile_dir / "package.json",

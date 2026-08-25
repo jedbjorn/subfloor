@@ -1,7 +1,9 @@
 import { createHash, randomUUID } from "node:crypto";
 import {
   closeSync,
+  chmodSync,
   constants,
+  existsSync,
   fchmodSync,
   fstatSync,
   fsyncSync,
@@ -10,16 +12,18 @@ import {
   openSync,
   readFileSync,
   renameSync,
+  rmdirSync,
   unlinkSync,
   writeFileSync,
 } from "node:fs";
 import { dirname, isAbsolute, join } from "node:path";
 
 export const name = "sc-shell-identity";
-export const inject = ["shellEnv"];
+export const inject = ["shellEnv", "subprocess"];
 
 const HEALTH_CONTRACT = "sc-dsh-plugin-health-v1";
 const REGISTRY_CONTRACT = "sc-dsh-identity-registry-v1";
+const EXECUTION_DESCRIPTOR_FD = 198;
 const ALIASES = Object.freeze({
   DSH_SC_SHELL_ID: "Canonical positive engine shell ID.",
   DSH_SC_SHELL_SHORTNAME: "Canonical shortname for the same engine shell.",
@@ -134,6 +138,79 @@ function linuxStartTicks(pid) {
   return value;
 }
 
+function unifiedMembership(pid) {
+  const rows = readFileSync(`/proc/${pid}/cgroup`, "utf8")
+    .split("\n")
+    .map((row) => row.split(":", 3))
+    .filter((fields) => fields.length === 3 && fields[0] === "0" && fields[1] === "")
+    .map((fields) => fields[2]);
+  if (rows.length !== 1 || !rows[0].startsWith("/")) {
+    throw new Error("sc-shell-identity: unified cgroup membership is ambiguous");
+  }
+  return rows[0];
+}
+
+function executionDomainPath(cgroupRoot, domainId) {
+  const membership = unifiedMembership(process.pid);
+  return join(cgroupRoot, membership.replace(/^\/+/, ""), "sc-dsh", `${domainId}.scope`);
+}
+
+async function cleanupExecutionDomain(path) {
+  if (!existsSync(path)) return;
+  try { chmodSync(path, 0o700); } catch {}
+  try { chmodSync(join(path, "cgroup.procs"), 0o600); } catch {}
+  try {
+    if (readFileSync(join(path, "cgroup.procs"), "utf8").trim().length > 0) {
+      writeFileSync(join(path, "cgroup.kill"), "1", "utf8");
+    }
+  } catch {}
+  for (let attempt = 0; attempt < 200; attempt += 1) {
+    if (!existsSync(path)) return;
+    try {
+      if (readFileSync(join(path, "cgroup.procs"), "utf8").trim().length === 0) {
+        rmdirSync(path);
+        try { rmdirSync(dirname(path)); } catch {}
+        return;
+      }
+    } catch (error) {
+      if (!existsSync(path)) return;
+      if (attempt === 199) throw error;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  throw new Error("sc-shell-identity: execution domain cleanup did not quiesce");
+}
+
+function managedAliasState(environment) {
+  const presented = Object.keys(environment ?? {}).filter((name) => name.startsWith("DSH_SC_"));
+  if (presented.length === 0) return false;
+  const expected = Object.keys(ALIASES);
+  if (
+    presented.length !== expected.length
+    || presented.some((name) => !Object.hasOwn(ALIASES, name))
+    || expected.some((name) => typeof environment[name] !== "string" || environment[name].length === 0)
+  ) {
+    throw new Error("sc-shell-identity: refusing partial ToolExecution identity");
+  }
+  if (typeof environment.DSH_SESSION_ID !== "string" || environment.DSH_SESSION_ID.length === 0) {
+    throw new Error("sc-shell-identity: refusing ToolExecution without DSH session identity");
+  }
+  return true;
+}
+
+function executionHandle(handle, done) {
+  return Object.freeze({
+    pid: handle.pid,
+    stdin: handle.stdin,
+    stdout: handle.stdout,
+    stderr: handle.stderr,
+    collected: handle.collected,
+    done,
+    terminate: () => handle.terminate(),
+    waitForExit: (signal) => handle.waitForExit(signal),
+  });
+}
+
 export function apply(ctx, config) {
   if (process.platform !== "linux") {
     throw new Error("sc-shell-identity: supported on Linux only");
@@ -145,6 +222,25 @@ export function apply(ctx, config) {
   const registryPath = requiredString(config, "registryPath");
   const registryPathIdentity = requiredString(config, "registryPathIdentity");
   const healthPath = requiredString(config, "healthPath");
+  const hostIdentityPath = requiredString(config, "hostIdentityPath");
+  const executionLauncherPath = requiredString(config, "executionLauncherPath");
+  const executionLauncherDigest = requiredString(config, "executionLauncherDigest");
+  const cgroupRoot = requiredString(config, "cgroupRoot");
+  const descriptorFd = positiveInteger(config?.descriptorFd, "execution descriptor fd");
+  const descriptorTtlSeconds = positiveInteger(
+    config?.descriptorTtlSeconds,
+    "execution descriptor TTL",
+  );
+  if (
+    !isAbsolute(hostIdentityPath)
+    || !isAbsolute(executionLauncherPath)
+    || !isAbsolute(cgroupRoot)
+    || descriptorFd !== EXECUTION_DESCRIPTOR_FD
+    || descriptorTtlSeconds > 86400
+    || sha256(readFileSync(executionLauncherPath)) !== executionLauncherDigest
+  ) {
+    throw new Error("sc-shell-identity: execution-domain producer configuration is invalid");
+  }
   const hostBootGeneration = requiredString(process.env, "SC_DSH_HOST_BOOT_GENERATION");
   const hostPid = process.pid;
   const hostStartTicks = linuxStartTicks(hostPid);
@@ -226,10 +322,55 @@ export function apply(ctx, config) {
   };
 
   publishHealth();
+  const subprocessSpawnMethod = ctx.subprocess.spawn;
+  const subprocessSpawn = subprocessSpawnMethod.bind(ctx.subprocess);
+  ctx.subprocess.spawn = (spec) => {
+    if (!managedAliasState(spec?.env)) return subprocessSpawn(spec);
+    const domainId = randomUUID().replaceAll("-", "");
+    const domainPath = executionDomainPath(cgroupRoot, domainId);
+    const wrapped = {
+      ...spec,
+      argv: [
+        executionLauncherPath,
+        "--fork-id", forkId,
+        "--profile-id", profileId,
+        "--registry", registryPath,
+        "--host-identity", hostIdentityPath,
+        "--cgroup-root", cgroupRoot,
+        "--domain-id", domainId,
+        "--descriptor-fd", String(descriptorFd),
+        "--ttl-seconds", String(descriptorTtlSeconds),
+        "--",
+        ...spec.argv,
+      ],
+    };
+    let handle;
+    try {
+      handle = subprocessSpawn(wrapped);
+    } catch (error) {
+      void cleanupExecutionDomain(domainPath);
+      throw error;
+    }
+    const done = handle.done.then(
+      async (outcome) => {
+        await cleanupExecutionDomain(domainPath);
+        return outcome;
+      },
+      async (error) => {
+        await cleanupExecutionDomain(domainPath);
+        throw error;
+      },
+    );
+    return executionHandle(handle, done);
+  };
   ctx.shellEnv.register({
     name: "super-coder",
     variables: Object.fromEntries(Object.entries(ALIASES).map(([key, description]) => [key, { description }])),
     resolve,
   });
+  ctx.effect(
+    () => () => { ctx.subprocess.spawn = subprocessSpawnMethod; },
+    "sc-shell-identity: execution-domain wrapper disposal",
+  );
   ctx.effect(() => () => publishHealth({ loaded: false }), "sc-shell-identity: health disposal");
 }

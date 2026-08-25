@@ -13,6 +13,7 @@ import threading
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Self
 
@@ -66,7 +67,9 @@ def synthetic_health(
     *,
     host_boot_generation: str = "host-boot-1",
     plugin_load_hmr_generation: str = "plugin-load-1",
+    host_pid: int | None = None,
 ) -> str:
+    selected_host_pid = os.getpid() if host_pid is None else host_pid
     inputs = {
         "canonical_fork_id": registry.layout.fork_id,
         "dedicated_profile_id": registry.layout.profile_id,
@@ -79,7 +82,7 @@ def synthetic_health(
     generation = plugin_contract_generation(inputs)
     registry.observe_host(
         host_boot_generation=host_boot_generation,
-        host_pid=os.getpid(),
+        host_pid=selected_host_pid,
     )
     owner_json(
         registry.layout.health,
@@ -90,8 +93,8 @@ def synthetic_health(
             "profile_id": registry.layout.profile_id,
             "registry_path": str(registry.layout.registry.resolve()),
             "host_boot_generation": host_boot_generation,
-            "host_pid": os.getpid(),
-            "host_start_ticks": process_start_ticks(os.getpid()),
+            "host_pid": selected_host_pid,
+            "host_start_ticks": process_start_ticks(selected_host_pid),
             "plugin_load_hmr_generation": plugin_load_hmr_generation,
             "plugin_contract_generation": generation,
             "registry_snapshot_generation": None,
@@ -115,6 +118,14 @@ def plugin_config(
         "registryPath": str((registry_path or registry.layout.registry).resolve()),
         "registryPathIdentity": registry.registry_path_identity,
         "healthPath": str((health_path or registry.layout.health).resolve()),
+        "hostIdentityPath": str(registry.layout.host_identity.resolve()),
+        "executionLauncherPath": str(
+            (SCRIPTS / "deepseek_execution_domain.py").resolve()
+        ),
+        "executionLauncherDigest": registry.execution_launcher_digest,
+        "cgroupRoot": "/sys/fs/cgroup",
+        "descriptorFd": 198,
+        "descriptorTtlSeconds": 86400,
     }
 
 
@@ -171,6 +182,21 @@ class PluginProbe:
 
     def collect(self, session_id: str) -> dict[str, object]:
         return self.request({"session_id": session_id})
+
+    def spawn(
+        self,
+        session_id: str,
+        argv: list[str],
+        *,
+        environment: dict[str, str] | None = None,
+    ) -> dict[str, object]:
+        request: dict[str, object] = {
+            "session_id": session_id,
+            "spawn_argv": argv,
+        }
+        if environment is not None:
+            request["spawn_env"] = environment
+        return self.request(request)
 
     def __exit__(self, *_exc: object) -> None:
         assert self.process is not None
@@ -245,6 +271,21 @@ def wait_for(predicate, *, timeout: float = 8.0) -> None:
             return
         time.sleep(0.05)
     raise AssertionError("condition did not become true before timeout")
+
+
+@contextmanager
+def sleeping_process():
+    process = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(60)"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    try:
+        yield process
+    finally:
+        if process.poll() is None:
+            process.terminate()
+        process.wait(timeout=5)
 
 
 def test_profile_is_dedicated_per_fork_and_stock_composition_resolves() -> None:
@@ -425,6 +466,331 @@ def test_stock_host_plugin_health_hmr_removal_wrong_registry_and_restart() -> No
         finally:
             second.terminate()
             second.wait(timeout=5)
+
+
+def test_bash_and_pwsh_tool_executions_use_the_fixed_domain_launcher() -> None:
+    with tempfile.TemporaryDirectory() as raw:
+        registry, worktree = registry_fixture(Path(raw))
+        with PluginProbe(registry) as plugin:
+            create_binding(
+                registry,
+                worktree,
+                session_id="wrapped-session",
+                conversation_id="wrapped-conversation",
+                shell_id=37,
+                shortname="WRAPPED",
+                token="wrapped-secret",
+            )
+            requests = (
+                ["bash", "-c", "printf bash"],
+                ["pwsh", "-NoProfile", "-Command", "Write-Output pwsh"],
+            )
+            domain_ids = set()
+            for requested in requests:
+                wrapped = plugin.spawn("wrapped-session", requested)["argv"]
+                assert wrapped[0] == str(SCRIPTS / "deepseek_execution_domain.py")
+                assert wrapped[-len(requested) :] == requested
+                assert wrapped[wrapped.index("--descriptor-fd") + 1] == "198"
+                assert wrapped[wrapped.index("--registry") + 1] == str(
+                    registry.layout.registry.resolve()
+                )
+                domain_id = wrapped[wrapped.index("--domain-id") + 1]
+                assert len(domain_id) == 32
+                domain_ids.add(domain_id)
+            assert len(domain_ids) == 2
+            assert plugin.spawn(
+                "wrapped-session",
+                ["native-tool", "argument"],
+                environment={"PATH": os.environ["PATH"]},
+            ) == {"argv": ["native-tool", "argument"]}
+            partial = plugin.spawn(
+                "wrapped-session",
+                ["bash", "-c", "false"],
+                environment={
+                    "DSH_SESSION_ID": "wrapped-session",
+                    "DSH_SC_SHELL_ID": "37",
+                },
+            )
+            assert partial == {
+                "error": "sc-shell-identity: refusing partial ToolExecution identity"
+            }
+
+
+def test_production_domain_issue_verify_marker_deletion_and_teardown() -> None:
+    cgroup_root = Path("/sys/fs/cgroup")
+    membership_rows = [
+        fields[2]
+        for row in Path("/proc/self/cgroup").read_text().splitlines()
+        if len(fields := row.split(":", 2)) == 3
+        and fields[0] == "0"
+        and fields[1] == ""
+    ]
+    if len(membership_rows) != 1:
+        pytest.skip("unified cgroup-v2 membership is unavailable")
+    probe = (
+        cgroup_root
+        / membership_rows[0].lstrip("/")
+        / f"sc-dsh-test-probe-{os.getpid()}"
+    )
+    try:
+        probe.mkdir()
+        probe.rmdir()
+    except OSError as exc:
+        pytest.skip(f"current Linux seat has no delegated cgroup subtree: {exc}")
+
+    with tempfile.TemporaryDirectory() as raw:
+        registry, worktree = registry_fixture(Path(raw))
+        synthetic_health(registry)
+        create_binding(
+            registry,
+            worktree,
+            session_id="production-domain",
+            conversation_id="production-conversation",
+            shell_id=73,
+            shortname="DOMAIN",
+            token="domain-secret",
+        )
+        record = registry.resolve_record("production-domain")
+        environment = os.environ.copy()
+        environment.update(
+            {
+                "DSH_SESSION_ID": "production-domain",
+                "DSH_SC_SHELL_ID": str(record["shell_id"]),
+                "DSH_SC_SHELL_SHORTNAME": record["shell_shortname"],
+                "DSH_SC_SHELL_WORKTREE": record["shell_worktree"],
+                "DSH_SC_API_BASE": record["api_base"],
+                "DSH_SC_MEM_CREDENTIAL_FILE": record["credential_file"],
+                "DSH_SC_BINDING_GENERATION": str(record["record_generation"]),
+                "DSH_SC_PLUGIN_HEALTH_GENERATION": record[
+                    "plugin_contract_generation"
+                ],
+            }
+        )
+        child_program = f"""
+import fcntl
+import json
+import os
+import tempfile
+from pathlib import Path
+import sys
+sys.path.insert(0, {str(SCRIPTS)!r})
+from dsh_execution_provenance import REQUIRED_SEALS, resolve_linux
+
+issuer = Path({str(registry.layout.host_identity)!r})
+managed = resolve_linux(descriptor_fd=198, issuer_identity=issuer)
+assert managed.context is not None
+for name in list(os.environ):
+    if name == 'DSH_SHELL' or name.startswith('DSH_SC_'):
+        os.environ.pop(name)
+without_markers = resolve_linux(descriptor_fd=198, issuer_identity=issuer)
+payload = os.pread(198, 65537, 0)
+copied_fd = os.memfd_create('copied-domain', os.MFD_ALLOW_SEALING)
+os.write(copied_fd, payload)
+fcntl.fcntl(copied_fd, fcntl.F_ADD_SEALS, REQUIRED_SEALS)
+copied = resolve_linux(descriptor_fd=copied_fd, issuer_identity=issuer)
+forged_value = json.loads(payload)
+forged_fd = os.memfd_create('forged-domain', os.MFD_ALLOW_SEALING)
+forged_stat = os.fstat(forged_fd)
+forged_value['descriptor_device'] = forged_stat.st_dev
+forged_value['descriptor_inode'] = forged_stat.st_ino
+forged_value['binding_record_generation'] += 1
+os.write(forged_fd, json.dumps(forged_value, sort_keys=True, separators=(',', ':')).encode())
+fcntl.fcntl(forged_fd, fcntl.F_ADD_SEALS, REQUIRED_SEALS)
+forged = resolve_linux(descriptor_fd=forged_fd, issuer_identity=issuer)
+stale = resolve_linux(
+    descriptor_fd=198,
+    issuer_identity=issuer,
+    now_monotonic_ns=10**30,
+)
+with tempfile.TemporaryDirectory() as raw:
+    fake = Path(raw) / 'cgroup'
+    fake.write_text('0::/native.slice\\n')
+    wrong_domain = resolve_linux(
+        proc_cgroup=fake,
+        descriptor_fd=198,
+        issuer_identity=issuer,
+    )
+with tempfile.TemporaryDirectory() as raw:
+    dead_issuer = resolve_linux(
+        descriptor_fd=198,
+        issuer_identity=issuer,
+        process_root=Path(raw),
+    )
+domain_path = Path('/sys/fs/cgroup') / managed.context.cgroup.lstrip('/')
+print(json.dumps({{
+    'cgroup': managed.context.cgroup,
+    'domain_id': managed.context.domain_id,
+    'root_session_id': managed.context.root_session_id,
+    'shell_id': managed.context.shell_id,
+    'binding_record_generation': managed.context.binding_record_generation,
+    'managed': managed.provenance,
+    'without_markers': without_markers.provenance,
+    'copied': copied.provenance,
+    'copied_reason': copied.reason,
+    'forged': forged.provenance,
+    'forged_reason': forged.reason,
+    'stale': stale.provenance,
+    'wrong_domain': wrong_domain.provenance,
+    'dead_issuer': dead_issuer.provenance,
+    'domain_mode': domain_path.stat().st_mode & 0o777,
+    'cgroup_procs_mode': (domain_path / 'cgroup.procs').stat().st_mode & 0o777,
+}}))
+"""
+        domain_id = uuid.uuid4().hex
+        completed = subprocess.run(
+            [
+                str(SCRIPTS / "deepseek_execution_domain.py"),
+                "--fork-id",
+                registry.layout.fork_id,
+                "--profile-id",
+                registry.layout.profile_id,
+                "--registry",
+                str(registry.layout.registry),
+                "--host-identity",
+                str(registry.layout.host_identity),
+                "--cgroup-root",
+                str(cgroup_root),
+                "--domain-id",
+                domain_id,
+                "--descriptor-fd",
+                "198",
+                "--ttl-seconds",
+                "60",
+                "--",
+                sys.executable,
+                "-c",
+                child_program,
+            ],
+            cwd=ROOT,
+            env=environment,
+            text=True,
+            capture_output=True,
+            timeout=10,
+            check=False,
+        )
+        assert completed.returncode == 0, completed.stderr
+        receipt = json.loads(completed.stdout)
+        assert receipt == {
+            "cgroup": receipt["cgroup"],
+            "domain_id": domain_id,
+            "root_session_id": "production-domain",
+            "shell_id": 73,
+            "binding_record_generation": 1,
+            "managed": "managed",
+            "without_markers": "managed",
+            "copied": "unknown",
+            "copied_reason": "execution descriptor file identity mismatches",
+            "forged": "unknown",
+            "forged_reason": "execution issuer does not hold this descriptor",
+            "stale": "unknown",
+            "wrong_domain": "unknown",
+            "dead_issuer": "unknown",
+            "domain_mode": 0o555,
+            "cgroup_procs_mode": 0o444,
+        }
+        assert f"/sc-dsh/{domain_id}.scope" in receipt["cgroup"]
+        assert not (cgroup_root / receipt["cgroup"].lstrip("/")).exists()
+
+
+def test_execution_launcher_refuses_non_host_parent_and_stale_lineage() -> None:
+    with tempfile.TemporaryDirectory() as raw:
+        root = Path(raw)
+        registry, worktree = registry_fixture(root)
+        marker = root / "protected-effect"
+
+        def environment_for(session_id: str, record: dict[str, object]):
+            return {
+                **os.environ,
+                "DSH_SESSION_ID": session_id,
+                "DSH_SC_SHELL_ID": str(record["shell_id"]),
+                "DSH_SC_SHELL_SHORTNAME": str(record["shell_shortname"]),
+                "DSH_SC_SHELL_WORKTREE": str(record["shell_worktree"]),
+                "DSH_SC_API_BASE": str(record["api_base"]),
+                "DSH_SC_MEM_CREDENTIAL_FILE": str(record["credential_file"]),
+                "DSH_SC_BINDING_GENERATION": str(record["record_generation"]),
+                "DSH_SC_PLUGIN_HEALTH_GENERATION": str(
+                    record["plugin_contract_generation"]
+                ),
+            }
+
+        def run_launcher(session_id: str, record: dict[str, object], domain_id: str):
+            return subprocess.run(
+                [
+                    str(SCRIPTS / "deepseek_execution_domain.py"),
+                    "--fork-id",
+                    registry.layout.fork_id,
+                    "--profile-id",
+                    registry.layout.profile_id,
+                    "--registry",
+                    str(registry.layout.registry),
+                    "--host-identity",
+                    str(registry.layout.host_identity),
+                    "--domain-id",
+                    domain_id,
+                    "--",
+                    sys.executable,
+                    "-c",
+                    f"from pathlib import Path; Path({str(marker)!r}).write_text('effect')",
+                ],
+                cwd=ROOT,
+                env=environment_for(session_id, record),
+                text=True,
+                capture_output=True,
+                timeout=10,
+                check=False,
+            )
+
+        with sleeping_process() as unrelated_host:
+            synthetic_health(registry, host_pid=unrelated_host.pid)
+            create_binding(
+                registry,
+                worktree,
+                session_id="non-host-parent",
+                conversation_id="non-host-conversation",
+                shell_id=81,
+                shortname="NONHOST",
+                token="non-host-secret",
+            )
+            refused = run_launcher(
+                "non-host-parent",
+                registry.resolve_record("non-host-parent"),
+                uuid.uuid4().hex,
+            )
+            assert refused.returncode == 126
+            assert "not a direct child of the live Host" in refused.stderr
+            assert marker.exists() is False
+
+        synthetic_health(registry)
+        create_binding(
+            registry,
+            worktree,
+            session_id="lineage-root",
+            conversation_id="lineage-conversation",
+            shell_id=82,
+            shortname="LINEAGE",
+            token="lineage-secret",
+        )
+        snapshot = registry.read_snapshot()
+        root_record = snapshot["records"]["lineage-root"]
+        registry.register_lineage(
+            expected_snapshot_generation=snapshot["snapshot_generation"],
+            root_session_id="lineage-root",
+            child_session_id="lineage-child",
+            expected_record_generation=root_record["record_generation"],
+        )
+        current = registry.read_snapshot()
+        registry.rotate_binding(
+            expected_snapshot_generation=current["snapshot_generation"],
+            root_session_id="lineage-root",
+            expected_record_generation=root_record["record_generation"],
+            token="rotated-lineage-secret",
+            plugin_contract_generation=root_record["plugin_contract_generation"],
+        )
+        stale_record = registry.resolve_record("lineage-root")
+        stale = run_launcher("lineage-child", stale_record, uuid.uuid4().hex)
+        assert stale.returncode == 126
+        assert "ToolExecution lineage is stale" in stale.stderr
+        assert marker.exists() is False
 
 
 def test_unaffected_live_binding_survives_other_binding_mutations() -> None:

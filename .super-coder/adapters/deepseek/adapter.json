@@ -18,7 +18,13 @@
     "profile_home": "engine-owned per-fork DSH_HOME",
     "profile_contract": "sc-dsh-profile-v1",
     "shell_identity_plugin": "assets/deepseek/sc-shell-env-plugin.mjs",
-    "registry_contract": "sc-dsh-identity-registry-v1"
+    "registry_contract": "sc-dsh-identity-registry-v1",
+    "execution_domain": {
+      "producer": "scripts/deepseek_execution_domain.py",
+      "contract": "sc-dsh-linux-cgroup-v2-v3",
+      "descriptor_fd": 198,
+      "platform": "linux"
+    }
   },
   "runtime_compatibility": {
     "minimum_cli_version": "0.1.1",
