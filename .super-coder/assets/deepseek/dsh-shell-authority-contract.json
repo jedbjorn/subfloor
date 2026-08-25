@@ -1,0 +1,206 @@
+{
+  "schema_version": 1,
+  "governing_revision": {
+    "document_id": 174,
+    "sha256": "a305eba5c73988d202e3f3f9d392d623645b3f799dfe4ab4945687026ae5a969",
+    "task_id": 648,
+    "sprint_id": 24,
+    "work_unit_id": 95,
+    "implementation_base": "83a1bcaaac513e24446c78bab6b41c8932610fba"
+  },
+  "dsh_release": {
+    "distribution": "@deepseek-ai/dsh",
+    "version": "0.1.1-rc.2",
+    "tag": "dsh-v0.1.1-rc.2",
+    "commit": "b150a551b8d465e31e418e1b2eaf5e79bbb7d28e"
+  },
+  "supported_seams": [
+    {
+      "name": "profile-composition",
+      "package": "@deepseek-ai/dsh",
+      "source": "apps/cli/src/profile-boot.ts",
+      "source_sha256": "4a89a793d0a793e7573d7b275d9682459fa2e211edc6814d23b90c75588fa663",
+      "contract": "bundle layers, dedicated profile patch, home patch, explicit overlays, then telemetry; production must use an engine-owned DSH_HOME so no shared home patch participates"
+    },
+    {
+      "name": "per-execution-shell-env",
+      "package": "@deepseek-ai/dsh-shell-env",
+      "source": "packages/shell/shell-env/src/index.ts",
+      "source_sha256": "a9347895a868d3a8928042833f253165c02e7f187e39593259cf164e2bae88c1",
+      "contract": "ShellEnvRegistry.register declares owned DSH_* names and collect(execution) resolves a fresh immutable snapshot"
+    },
+    {
+      "name": "ambient-scrub",
+      "package": "@deepseek-ai/dsh-subprocess",
+      "source": "packages/subprocess/subprocess/src/index.ts",
+      "source_sha256": "0498a406106a51e34ac24e2e752dde67bb3c5c623333599e2af1805a30ca5499",
+      "contract": "scrubbedParentEnv removes every ambient DSH_* and credential-shaped KEY/PASSWORD/SECRET/TOKEN name"
+    },
+    {
+      "name": "subprocess-merge",
+      "package": "@deepseek-ai/dsh-subprocess-local",
+      "source": "packages/subprocess/subprocess-local/src/spawn.ts",
+      "source_sha256": "3038096134defaf03f767b94fdcbb65c7103f60448f5973201732c93def72d71",
+      "contract": "explicit caller environment is merged after scrubbedParentEnv for foreground, background, and terminal children"
+    },
+    {
+      "name": "bash-collection",
+      "package": "@deepseek-ai/dsh-tool-bash",
+      "source": "packages/shell/tool-bash/src/index.ts",
+      "source_sha256": "e0302d4cc1d835ca4118434afc9913c4236773bbce92349ae7644d540d40c482",
+      "contract": "ctx.shellEnv.collect(exec) is called once per foreground or background ToolExecution"
+    },
+    {
+      "name": "bash-dispatch",
+      "package": "@deepseek-ai/dsh-bash-local",
+      "source": "packages/shell/bash-local/src/index.ts",
+      "source_sha256": "c501ca1e9164642f1291c0e40b3a7226f6079af847aa8c22b4fda52fbf692d39",
+      "contract": "spec.dshEnv is merged last into the explicit spawn environment for run and start"
+    },
+    {
+      "name": "powershell-collection",
+      "package": "@deepseek-ai/dsh-tool-pwsh",
+      "source": "packages/shell/tool-pwsh/src/index.ts",
+      "source_sha256": "189024974fdb0d15605a96973aad2b8a4bdaf8c5fdaf4bbe7c2465794cf65e67",
+      "contract": "ctx.shellEnv.collect(exec) supplies the same snapshot for PowerShell foreground and background ToolExecution"
+    },
+    {
+      "name": "powershell-dispatch",
+      "package": "@deepseek-ai/dsh-pwsh-local",
+      "source": "packages/shell/pwsh-local/src/index.ts",
+      "source_sha256": "a9f00ecb6b4394549792952f7f9ef344352236a4e225d28e2945331422bb864b",
+      "contract": "spec.dshEnv is merged last into the PowerShell spawn environment"
+    }
+  ],
+  "aliases": [
+    "DSH_SC_SHELL_ID",
+    "DSH_SC_SHELL_SHORTNAME",
+    "DSH_SC_SHELL_WORKTREE",
+    "DSH_SC_API_BASE",
+    "DSH_SC_MEM_CREDENTIAL_FILE",
+    "DSH_SC_BINDING_GENERATION",
+    "DSH_SC_PLUGIN_HEALTH_GENERATION"
+  ],
+  "plugin_contract_generation_inputs": [
+    "canonical_fork_id",
+    "dedicated_profile_id",
+    "plugin_bundle_digest",
+    "declared_variable_schema_digest",
+    "canonical_registry_path_identity",
+    "host_boot_generation",
+    "plugin_load_hmr_generation"
+  ],
+  "registry_currency": {
+    "registry_snapshot_generation": "monotonic committed snapshot currency; checked independently at admission and never included in plugin_contract_generation",
+    "binding_record_generation": "monotonic generation local to one root binding; unrelated record mutation cannot change it"
+  },
+  "execution_provenance": {
+    "contract": "sc-dsh-os-execution-domain-v1",
+    "selection_stage": "top-level dispatcher before command-specific import, credential discovery, DB/API/filesystem access, or process start",
+    "linux": "engine-created non-delegated cgroup-v2 execution domain; resolve membership from /proc/self/cgroup",
+    "windows": "engine-created non-breakaway Job Object; resolve membership with the operating-system process API",
+    "executor_rule": "the dedicated subprocess wrapper places every Bash and PowerShell foreground/background child in exactly one registered execution domain before user code starts",
+    "managed_rule": "domain membership selects DSH policy even when DSH_SHELL and every DSH_SC_* alias were deleted or falsified",
+    "native_rule": "no domain plus no DSH_* bridge names selects the unchanged native path",
+    "spoof_rule": "no domain plus any DSH_SHELL or DSH_SC_* name exits 77 before effect",
+    "unknown_rule": "missing, ambiguous, stale, breakaway, or unreadable domain evidence exits 77 before effect",
+    "admin_artifact_rule": "managed, spoofed, and unknown decisions never inspect runtime credential artifacts or attempt Admin discovery"
+  },
+  "containment_baseline": {
+    "production_state": "serialized",
+    "global_identity_lease": "the existing DeepSeekAdapter ShellIdentityLease and managed queue remain authoritative until a separately reviewed retirement change",
+    "ambient_boundary": "ordinary SC_* currently survives the upstream DSH scrub, so it is poisoned in fixtures and is never accepted as DSH bridge authority",
+    "proof_authority": "candidate or promoted proof authority may come only from a server-minted exact-ref capability used by the dedicated promotion runner; environment, profile, request, prompt, Sprint role, persisted default, and ordinary sc calls always refuse selection"
+  },
+  "effect_probes": [
+    "command_specific_import",
+    "credential_discovery",
+    "api_read",
+    "api_write",
+    "db_read",
+    "db_write",
+    "filesystem_read",
+    "filesystem_write",
+    "process_start",
+    "message_write",
+    "wake_write",
+    "denied_marker_write"
+  ],
+  "public_command_policy": {
+    "identity_neutral_read_only": ["help|-h|--help"],
+    "dsh_shell_authorized": [
+      "mem", "pr", "sprint", "engine-ref", "job", "visual-qa",
+      "map-extractor", "render-check", "models", "skill", "ports", "url",
+      "preview", "vm", "vm-mcp-relay", "deps", "test", "lint",
+      "typecheck", "health"
+    ],
+    "refused": [
+      "install", "ensure-harness", "doctor", "update", "update-harnesses",
+      "harness-status", "docker-cache-gc", "rollback", "artifact-mode", "eject",
+      "remove", "init", "rebuild", "migrate", "migration", "snapshot", "token",
+      "persist", "sql", "map-sql", "sql-rw", "map-sql-rw", "map-schema", "render",
+      "map", "map-setup", "analytics", "seed-skills", "serve", "vm-broker",
+      "vm-bake", "vm-broker-up", "vm-broker-down", "vm-broker-sock",
+      "vm-broker-install", "vm-broker-uninstall", "ts-broker", "ts-broker-up",
+      "ts-broker-down", "ts-broker-sock", "ts-broker-install",
+      "ts-broker-uninstall", "pm2-broker", "pm2-broker-up", "pm2-broker-down",
+      "pm2-broker-sock", "pm2-broker-install", "pm2-broker-uninstall", "db-broker",
+      "db-broker-up", "db-broker-down", "db-broker-sock", "db-broker-install",
+      "db-broker-uninstall", "db-init", "pg-init", "pg-up", "pg-down", "admin",
+      "boot", "boot-*", "run", "launch", "enter", "enter-*", "down", "restart",
+      "build", "logs", "verify", "clean-db"
+    ],
+    "selector_policies": {
+      "feature": {
+        "dsh_shell_authorized": ["list", "<bare-default-list>"],
+        "refused": ["enable", "disable", "<unknown>"]
+      },
+      "job": {"refused": ["_supervise"]},
+      "vm-mcp-relay": {
+        "dsh_shell_authorized": ["up", "down", "status"],
+        "refused": ["fg", "<unknown>"]
+      }
+    },
+    "unknown_subcommand": "refused",
+    "unknown": "refused"
+  },
+  "literal_subparser_counters": {
+    ".super-coder/scripts/job.py": {"_supervise": 1, "kill": 1, "list": 1, "start": 1, "status": 1, "tail": 1, "wait": 1},
+    ".super-coder/scripts/mem.py": {"add": 4, "cancel": 1, "check": 1, "close": 1, "curated": 1, "decision": 1, "depends": 1, "doc": 1, "done": 1, "edit": 4, "flag": 1, "freeze": 1, "get": 1, "mark-read": 1, "message": 1, "narrative": 1, "open": 1, "oriented": 1, "project": 2, "qaqc": 1, "retire": 1, "roadmap": 1, "send": 1, "sent": 1, "standing": 1, "start": 1, "state": 1, "status": 2, "task": 1, "which": 1},
+    ".super-coder/scripts/migration.py": {"new": 1},
+    ".super-coder/scripts/pr_cli.py": {"subscribe": 1},
+    ".super-coder/scripts/sprint_cli.py": {"abort": 1, "accept": 1, "arm": 1, "authorize-merge": 1, "cancel-unit": 1, "cleanup": 1, "cleanup-status": 1, "compile-report": 1, "complete": 1, "complete-unit": 1, "declare": 1, "decline": 1, "dispatch": 1, "disposition-followup": 1, "inbox": 1, "monitor": 1, "pause": 1, "plan-unit": 1, "recall-unit": 1, "reconcile-pr": 1, "record-conformance": 1, "record-qaqc": 1, "record-review": 1, "register-pr": 1, "replan-unit": 1, "request-review": 1, "reroute-participant": 1, "resolve-unit": 1, "resume": 1, "send": 1, "spec-revision": 1, "watcher-state": 1},
+    ".super-coder/scripts/visual_qa.py": {"ci": 1, "init": 1, "run": 1},
+    ".super-coder/scripts/vm.py": {"capture": 1, "exec": 1, "mcp": 1, "push": 1, "reset": 1, "start": 1, "status": 1}
+  },
+  "custom_subcommands": {
+    "feature": ["list", "enable", "disable"],
+    "models": ["refresh", "list", "resolve"],
+    "skill": ["list", "put", "grant", "revoke", "rm", "retire", "unretire"],
+    "analytics": ["sweep"],
+    "artifact-mode": ["show", "path"],
+    "map-extractor": ["install"],
+    "map": ["finalize"],
+    "enter": ["deepseek"],
+    "vm-mcp-relay": ["up", "down", "status", "fg"],
+    "vm.mcp": ["status", "up", "down"],
+    "mem.dynamic": ["seed", "lns"]
+  },
+  "direct_identity_signal_inventory": {
+    "SC_API_TOKEN": [".super-coder/api/server.py", ".super-coder/scripts/conversation_adapters/deepseek.py", ".super-coder/scripts/conversation_launch.py", ".super-coder/scripts/deepseek_one_shot.py", ".super-coder/scripts/deepseek_web.py", ".super-coder/scripts/job.py", ".super-coder/scripts/map_finalize.py", ".super-coder/scripts/mem.py", ".super-coder/scripts/mem_credentials.py", ".super-coder/scripts/models.py", ".super-coder/scripts/operator_token.py", ".super-coder/scripts/rebuild.py", ".super-coder/scripts/run.py", ".super-coder/scripts/skill.py", ".super-coder/scripts/telemetry-hook.sh"],
+    "SC_API_BASE": [".super-coder/api/server.py", ".super-coder/scripts/conversation_adapters/deepseek.py", ".super-coder/scripts/conversation_launch.py", ".super-coder/scripts/deepseek_one_shot.py", ".super-coder/scripts/deepseek_web.py", ".super-coder/scripts/job.py", ".super-coder/scripts/map_finalize.py", ".super-coder/scripts/mem.py", ".super-coder/scripts/mem_credentials.py", ".super-coder/scripts/run.py", ".super-coder/scripts/telemetry-hook.sh"],
+    "SC_MEM_CREDENTIAL_FILE": [".super-coder/scripts/deepseek_web.py", ".super-coder/scripts/mem.py"],
+    "SC_SHELL_ID": [".super-coder/scripts/conversation_adapters/deepseek.py", ".super-coder/scripts/conversation_launch.py", ".super-coder/scripts/deepseek_one_shot.py", ".super-coder/scripts/deepseek_web.py", ".super-coder/scripts/run.py"],
+    "SC_SHELL_SHORTNAME": [".super-coder/scripts/conversation_adapters/deepseek.py", ".super-coder/scripts/conversation_launch.py", ".super-coder/scripts/deepseek_one_shot.py", ".super-coder/scripts/deepseek_web.py", ".super-coder/scripts/run.py"],
+    "SC_SHELL_WORKTREE": [".super-coder/scripts/branch-guard.sh", ".super-coder/scripts/conversation_launch.py", ".super-coder/scripts/deepseek_one_shot.py", ".super-coder/scripts/map_extractor_install.py", ".super-coder/scripts/map_finalize.py", ".super-coder/scripts/run.py"],
+    "SC_ADMIN": [".super-coder/api/server.py", ".super-coder/scripts/_serialize_guard.py", ".super-coder/scripts/dispatch.sh", ".super-coder/scripts/feature.py", ".super-coder/scripts/init_fork.py", ".super-coder/scripts/install.py", ".super-coder/scripts/update.py"],
+    "credential_discovery": [".super-coder/scripts/mem.py", ".super-coder/scripts/mem_credentials.py", ".super-coder/scripts/operator_token.py"]
+  },
+  "direct_effect_signal_inventory": {
+    "direct_db": [".super-coder/scripts/artifact_policy.py", ".super-coder/scripts/db_backup.py", ".super-coder/scripts/db_driver.py", ".super-coder/scripts/dispatch.sh", ".super-coder/scripts/install.py", ".super-coder/scripts/live_model/opencode.py", ".super-coder/scripts/map_db.py", ".super-coder/scripts/map_finalize.py", ".super-coder/scripts/map_schema_cli.py", ".super-coder/scripts/mem_credentials.py", ".super-coder/scripts/rebuild.py", ".super-coder/scripts/remove.py", ".super-coder/scripts/render_check.py", ".super-coder/scripts/rollback.py", ".super-coder/scripts/seed_dogfood.py", ".super-coder/scripts/seed_skills.py", ".super-coder/scripts/shell_liveness.py", ".super-coder/scripts/snapshot.py", ".super-coder/scripts/token_parsers/opencode.py"],
+    "credential_artifact": [".super-coder/api/server.py", ".super-coder/scripts/deepseek_web.py", ".super-coder/scripts/mem.py", ".super-coder/scripts/mem_credentials.py", ".super-coder/scripts/operator_token.py"],
+    "api_effect": [".super-coder/api/conversation_routes.py", ".super-coder/api/model_catalog.py", ".super-coder/api/review_routes.py", ".super-coder/api/server.py", ".super-coder/scripts/build_deepseek_carrier.py", ".super-coder/scripts/conversation_adapters/base.py", ".super-coder/scripts/deepseek_host.py", ".super-coder/scripts/deepseek_inference_canary.py", ".super-coder/scripts/deepseek_web.py", ".super-coder/scripts/dispatch.sh", ".super-coder/scripts/git_review.py", ".super-coder/scripts/job.py", ".super-coder/scripts/map_finalize.py", ".super-coder/scripts/mem.py", ".super-coder/scripts/models.py", ".super-coder/scripts/pm2.py", ".super-coder/scripts/pr_cli.py", ".super-coder/scripts/preview.py", ".super-coder/scripts/quota_probes/__init__.py", ".super-coder/scripts/quota_probes/anthropic.py", ".super-coder/scripts/runtime_flags.py", ".super-coder/scripts/sandbox_devkit.py", ".super-coder/scripts/shell_factory.py", ".super-coder/scripts/skill.py", ".super-coder/scripts/sprint_cli.py", ".super-coder/scripts/sprint_close.py", ".super-coder/scripts/telemetry-hook.sh", ".super-coder/scripts/visual_qa.py"],
+    "filesystem_effect": [".super-coder/api/db_broker.py", ".super-coder/api/model_catalog.py", ".super-coder/api/pm2_broker.py", ".super-coder/api/server.py", ".super-coder/api/ts_broker.py", ".super-coder/api/vm_broker.py", ".super-coder/scripts/artifact_policy.py", ".super-coder/scripts/browser_handoff.py", ".super-coder/scripts/build_deepseek_carrier.py", ".super-coder/scripts/conversation_adapters/opencode.py", ".super-coder/scripts/conversation_boot.py", ".super-coder/scripts/db_backup.py", ".super-coder/scripts/deepseek_inference_canary.py", ".super-coder/scripts/deepseek_runtime.py", ".super-coder/scripts/deepseek_skill_resume_canary.py", ".super-coder/scripts/deepseek_web.py", ".super-coder/scripts/devkit.py", ".super-coder/scripts/dispatch.sh", ".super-coder/scripts/eject.py", ".super-coder/scripts/engine_manifest.py", ".super-coder/scripts/feature.py", ".super-coder/scripts/git_review.py", ".super-coder/scripts/global_pointer.py", ".super-coder/scripts/install.py", ".super-coder/scripts/job.py", ".super-coder/scripts/map_extractor_install.py", ".super-coder/scripts/mem_credentials.py", ".super-coder/scripts/migration.py", ".super-coder/scripts/opencode_config.py", ".super-coder/scripts/ports.py", ".super-coder/scripts/preview.py", ".super-coder/scripts/rebuild.py", ".super-coder/scripts/remove.py", ".super-coder/scripts/rollback.py", ".super-coder/scripts/run.py", ".super-coder/scripts/runtime_flags.py", ".super-coder/scripts/sandbox_devkit.py", ".super-coder/scripts/sc_wrapper.py", ".super-coder/scripts/seed_skills.py", ".super-coder/scripts/skill_projection.py", ".super-coder/scripts/snapshot.py", ".super-coder/scripts/sprint_cleanup.py", ".super-coder/scripts/update.py", ".super-coder/scripts/update_compat.py", ".super-coder/scripts/visual_qa.py", ".super-coder/scripts/vm.py", ".super-coder/scripts/vm_mcp_relay.py"],
+    "process_effect": [".super-coder/api/pm2_broker.py", ".super-coder/api/server.py", ".super-coder/scripts/build_deepseek_carrier.py", ".super-coder/scripts/callable_floor.py", ".super-coder/scripts/conversation_adapters/base.py", ".super-coder/scripts/conversation_adapters/codex.py", ".super-coder/scripts/conversation_adapters/opencode.py", ".super-coder/scripts/dbq.py", ".super-coder/scripts/deepseek_inference_canary.py", ".super-coder/scripts/deepseek_skill_resume_canary.py", ".super-coder/scripts/deepseek_web.py", ".super-coder/scripts/devkit.py", ".super-coder/scripts/dispatch.sh", ".super-coder/scripts/feature.py", ".super-coder/scripts/git_freshness.py", ".super-coder/scripts/git_hygiene.py", ".super-coder/scripts/git_prune.py", ".super-coder/scripts/git_review.py", ".super-coder/scripts/github_pull_requests.py", ".super-coder/scripts/harness_versions.py", ".super-coder/scripts/install.py", ".super-coder/scripts/job.py", ".super-coder/scripts/map_extractor_install.py", ".super-coder/scripts/map_finalize.py", ".super-coder/scripts/map_repo.py", ".super-coder/scripts/map_setup.py", ".super-coder/scripts/pm2.py", ".super-coder/scripts/preview.py", ".super-coder/scripts/remove.py", ".super-coder/scripts/run.py", ".super-coder/scripts/sandbox_devkit.py", ".super-coder/scripts/sc_wrapper.py", ".super-coder/scripts/shell_liveness.py", ".super-coder/scripts/sprint_cleanup.py", ".super-coder/scripts/telemetry-hook.sh", ".super-coder/scripts/ts.py", ".super-coder/scripts/update.py", ".super-coder/scripts/update_compat.py", ".super-coder/scripts/visual_qa.py", ".super-coder/scripts/vm.py", ".super-coder/scripts/vm_mcp_relay.py"]
+  }
+}
