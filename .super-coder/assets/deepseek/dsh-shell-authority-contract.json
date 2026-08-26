@@ -160,7 +160,7 @@
       "under managed membership refuse SC_DISPATCH, SC_CALLER_ROOT, SC_MEM_AS, and every ambient SC_* before target or credential inspection",
       "only then select the canonical dispatcher and classify the public command"
     ],
-    "linux": "The engine wrapper forks a gated root, moves it into a non-delegated cgroup-v2 domain before release, seals the exact binding snapshot into inherited FD 198, and remains live in the Host -> issuer -> root lineage until bounded teardown. Pass = the verifier proves descriptor/cgroup identity, live lineage, generations, expiry, protected admission, and empty subtree delegation without an ambient selector.",
+    "linux": "The fixed plugin enters an engine-selected delegated systemd user scope before the engine wrapper forks a gated root. The wrapper creates a non-delegated cgroup-v2 domain under its issuer scope, moves the root before release, seals the exact binding snapshot into inherited FD 198, and remains live in the Host -> issuer -> root lineage until bounded teardown. Pass = the verifier proves descriptor/cgroup identity, live lineage, generations, expiry, protected admission, and empty subtree delegation without an ambient selector.",
     "linux_contributor": {
       "path": ".super-coder/scripts/dsh_execution_provenance.py",
       "sha256": "8649dae24a09004dddbbe6e670a0412026d3ef86d7eab032a3aca2f13bf7e10b",
@@ -168,9 +168,10 @@
     },
     "production_linux_contributor": {
       "path": ".super-coder/scripts/deepseek_execution_domain.py",
-      "sha256": "8d24f2afd0d398de0969a51a60b5b9aff5d2defdf1eb1e05890ba233547e05c6",
+      "sha256": "383723ac2caaa828064c1a97f4134167b48a1acc5d4d048e6f5c8865a48e82df",
       "contract": "sc-dsh-linux-cgroup-v2-v3",
       "descriptor_fd": 198,
+      "delegation": "/usr/bin/systemd-run --user --scope --property=Delegate=yes is the fixed supported-Linux scope launcher; the execution issuer creates roots only below its own delegated membership",
       "entry": "Wrap only a complete registry-current ToolExecution identity. Refuse partial, stale, copied, wrong-domain, dead-issuer, self-created, and self-entered evidence before user code.",
       "teardown": "Drain or cgroup.kill the one execution domain within two seconds, remove it, and surface incomplete cleanup as failure."
     },

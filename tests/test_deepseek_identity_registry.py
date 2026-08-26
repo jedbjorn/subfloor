@@ -493,7 +493,16 @@ def test_bash_and_pwsh_tool_executions_use_the_fixed_domain_launcher() -> None:
             domain_ids = set()
             for requested in requests:
                 wrapped = plugin.spawn("wrapped-session", requested)["argv"]
-                assert wrapped[0] == str(SCRIPTS / "deepseek_execution_domain.py")
+                assert wrapped[:7] == [
+                    "/usr/bin/systemd-run",
+                    "--user",
+                    "--scope",
+                    "--quiet",
+                    "--collect",
+                    "--property=Delegate=yes",
+                    "--",
+                ]
+                assert wrapped[7] == str(SCRIPTS / "deepseek_execution_domain.py")
                 assert wrapped[-len(requested) :] == requested
                 assert wrapped[wrapped.index("--descriptor-fd") + 1] == "198"
                 assert wrapped[wrapped.index("--registry") + 1] == str(
@@ -613,25 +622,9 @@ def test_real_admitted_tool_execution_survives_close_while_new_root_refuses(
     tool: str,
 ) -> None:
     cgroup_root = Path("/sys/fs/cgroup")
-    membership_rows = [
-        fields[2]
-        for row in Path("/proc/self/cgroup").read_text().splitlines()
-        if len(fields := row.split(":", 2)) == 3
-        and fields[0] == "0"
-        and fields[1] == ""
-    ]
-    if len(membership_rows) != 1:
-        pytest.skip("unified cgroup-v2 membership is unavailable")
-    probe = (
-        cgroup_root
-        / membership_rows[0].lstrip("/")
-        / f"sc-dsh-admitted-probe-{os.getpid()}-{tool}"
-    )
-    try:
-        probe.mkdir()
-        probe.rmdir()
-    except OSError as exc:
-        pytest.skip(f"current Linux seat has no delegated cgroup subtree: {exc}")
+    scope_launcher = Path("/usr/bin/systemd-run")
+    if not scope_launcher.is_file():
+        pytest.skip("the supported Linux delegated-scope launcher is unavailable")
     executable = shutil.which(tool)
     if executable is None:
         pytest.skip(f"{tool} is unavailable on this Linux seat")
@@ -698,6 +691,13 @@ def test_real_admitted_tool_execution_survives_close_while_new_root_refuses(
             ]
 
         launcher = [
+            str(scope_launcher),
+            "--user",
+            "--scope",
+            "--quiet",
+            "--collect",
+            "--property=Delegate=yes",
+            "--",
             str(SCRIPTS / "deepseek_execution_domain.py"),
             "--fork-id",
             registry.layout.fork_id,
@@ -757,8 +757,9 @@ def test_real_admitted_tool_execution_survives_close_while_new_root_refuses(
                 else f"[IO.File]::WriteAllText('{refused_effect}', 'refused')"
             ),
         ]
+        command_boundary = len(launcher) - len(command)
         refused = subprocess.run(
-            [*launcher[: launcher.index("--") + 1], *refused_command],
+            [*launcher[:command_boundary], *refused_command],
             cwd=ROOT,
             env=environment,
             text=True,

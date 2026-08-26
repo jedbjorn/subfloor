@@ -636,6 +636,7 @@ class DeepSeekDshPreparationContractTests(unittest.TestCase):
                 "sha256": sha256(EXECUTION_LAUNCHER),
                 "contract": "sc-dsh-linux-cgroup-v2-v3",
                 "descriptor_fd": 198,
+                "delegation": "/usr/bin/systemd-run --user --scope --property=Delegate=yes is the fixed supported-Linux scope launcher; the execution issuer creates roots only below its own delegated membership",
                 "entry": "Wrap only a complete registry-current ToolExecution identity. Refuse partial, stale, copied, wrong-domain, dead-issuer, self-created, and self-entered evidence before user code.",
                 "teardown": "Drain or cgroup.kill the one execution domain within two seconds, remove it, and surface incomplete cleanup as failure.",
             },

@@ -198,22 +198,22 @@ def _host_identity(
 
 
 def _domain_path(
-    *, cgroup_root: Path, host_pid: int, domain_id: str
+    *, cgroup_root: Path, issuer_pid: int, domain_id: str
 ) -> tuple[str, Path, Path]:
     if DOMAIN_ID.fullmatch(domain_id) is None:
         raise ExecutionDomainError("execution domain identity is malformed")
     root = cgroup_root.resolve(strict=True)
     if (root / "cgroup.controllers").is_file() is False:
         raise ExecutionDomainError("cgroup root is not unified cgroup-v2")
-    host_membership = _unified_membership(host_pid)
-    parent = root / host_membership.lstrip("/") / "sc-dsh"
+    issuer_membership = _unified_membership(issuer_pid)
+    parent = root / issuer_membership.lstrip("/") / "sc-dsh"
     parent.mkdir(mode=0o700, exist_ok=True)
     if parent.is_symlink() or not parent.is_dir():
         raise ExecutionDomainError("execution-domain parent is unsafe")
     os.chmod(parent, 0o700)
     domain = parent / f"{domain_id}.scope"
     domain.mkdir(mode=0o700)
-    membership = f"{host_membership.rstrip('/')}/sc-dsh/{domain_id}.scope"
+    membership = f"{issuer_membership.rstrip('/')}/sc-dsh/{domain_id}.scope"
     return membership, parent, domain
 
 
@@ -308,7 +308,7 @@ def launch(args: argparse.Namespace) -> int:
     )
     membership, parent, domain = _domain_path(
         cgroup_root=args.cgroup_root,
-        host_pid=host["host_pid"],
+        issuer_pid=os.getpid(),
         domain_id=args.domain_id,
     )
     memfd = os.memfd_create(
