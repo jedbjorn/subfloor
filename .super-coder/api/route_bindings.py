@@ -1411,6 +1411,7 @@ def live_native_selection(binding: dict) -> dict:
         isinstance(binding, dict)
         and binding.get("contract_version") == V2_CONTRACT_VERSION
         and binding.get("harness") in LIVE_NATIVE_HARNESSES
+        and binding.get("control_state") == "controlled"
     ):
         validate_legacy_v2_live_native(binding)
     else:
@@ -1506,6 +1507,7 @@ def verify_stored_v2_before_first_turn(
     if (
         isinstance(binding, dict)
         and binding.get("harness") in LIVE_NATIVE_HARNESSES
+        and binding.get("control_state") == "controlled"
     ):
         validate_legacy_v2_live_native(binding)
     else:

@@ -609,6 +609,50 @@ class SprintBoundRouteDispatchProof(unittest.TestCase):
         self.assertIsNone(projection.effort)
         self.assertEqual(projection.argument_tail, ())
 
+    def test_opencode_harness_default_survives_arm_queue_broker_and_launch(
+        self,
+    ) -> None:
+        status, _scope = self._runtime("opencode")
+        sprint_id = self._seed_sprint(
+            harness="opencode", model=None, effort=None
+        )
+
+        with mock.patch.object(
+            model_catalog, "harness_runtime_status", return_value=status
+        ):
+            wake_id = self._arm(sprint_id)
+            broker_run = self._deliver_and_claim(wake_id)
+        context, launch = self._prepare(broker_run)
+        projection = route_transport.context_projection(context, "opencode")
+
+        self.assertEqual(
+            tuple(self.con.execute(
+                "SELECT state,attempt_count,last_error "
+                "FROM sprint_wake_outbox WHERE wake_id=?",
+                (wake_id,),
+            ).fetchone()),
+            ("delivered", 1, None),
+        )
+        self.assertEqual(broker_run.route_contract_version, 2)
+        self.assertIsNone(broker_run.model)
+        self.assertIsNone(broker_run.effort)
+        self.assertEqual(broker_run.route_binding["transport"], "native-default")
+        self.assertEqual(
+            broker_run.route_binding["control_state"], "harness-default"
+        )
+        self.assertIsNone(launch["model"])
+        self.assertIsNone(launch["effort"])
+        self.assertEqual(launch["route_binding"], broker_run.route_binding)
+        self.assertEqual(launch["binding_digest"], broker_run.binding_digest)
+        self.assertIsNone(context.model)
+        self.assertIsNone(context.effort)
+        self.assertIsNone(projection.model)
+        self.assertIsNone(projection.effort)
+        self.assertEqual(projection.argument_tail, ())
+        with self.assertRaises(route_bindings.RouteResolutionError) as raised:
+            route_bindings.live_native_selection(broker_run.route_binding)
+        self.assertEqual(raised.exception.code, "unsupported_route_contract")
+
     def test_opencode_dispatch_uses_bound_variant_after_catalogue_changes(self) -> None:
         observation = self._seed_opencode_catalogue()
         sprint_id = self._seed_sprint(
