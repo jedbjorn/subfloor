@@ -849,6 +849,56 @@ class OpenCodeAdapter(ConversationAdapter):
             ) from exc
         return wrapper
 
+    def _prepare_live_route_agent(self, context: ConversationContext) -> None:
+        binding = context.route_binding
+        if (
+            not isinstance(binding, Mapping)
+            or binding.get("harness") != self.harness
+            or binding.get("control_state") != "controlled"
+        ):
+            return
+        try:
+            selection = route_transport.route_bindings.live_native_selection(
+                dict(binding)
+            )
+            state = self.transport.request("GET", "/provider")
+            models = connected_models(state)
+            current = next(
+                (
+                    model
+                    for model in models
+                    if model.get("id") == selection["model_id"]
+                ),
+                None,
+            )
+            advertised = {
+                selection["model_id"]: (
+                    list(current.get("native_option_ids") or [])
+                    if isinstance(current, Mapping)
+                    else []
+                )
+            } if current is not None else {}
+            route_transport.route_bindings.require_advertised_live_native(
+                dict(binding), advertised
+            )
+            option_id = selection["native_option_id"]
+            payload = (
+                current["variants"].get(option_id)
+                if option_id is not None
+                and isinstance(current.get("variants"), Mapping)
+                else None
+            )
+            opencode_config.ensure_live_route_agent(
+                context.checked_worktree(),
+                binding,
+                context.binding_digest or "",
+                payload,
+            )
+        except route_transport.route_bindings.RouteResolutionError as exc:
+            raise AdapterError(exc.code, exc.message) from exc
+        except opencode_config.OpenCodeConfigError as exc:
+            raise AdapterError(exc.code, str(exc)) from exc
+
     def _prompt(
         self,
         session_ref: str,
@@ -864,7 +914,10 @@ class OpenCodeAdapter(ConversationAdapter):
                 "providerID": route[0],
                 "modelID": route[1],
             }
-        if context.route_binding is not None:
+        if (
+            isinstance(context.route_binding, Mapping)
+            and context.route_binding.get("control_state") == "controlled"
+        ):
             body["agent"] = opencode_config.route_agent_name(
                 context.binding_digest or ""
             )
@@ -929,6 +982,7 @@ class OpenCodeAdapter(ConversationAdapter):
         worktree = context.checked_worktree()
         message = ensure_nonempty_message(message)
         self._prepare_shell_environment(context)
+        self._prepare_live_route_agent(context)
         body: dict[str, Any] = {}
         if context.title:
             body["title"] = context.title

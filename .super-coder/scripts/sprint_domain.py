@@ -327,6 +327,11 @@ def _participant_binding_candidate(
             "observed_version", runtime_status.get("version")
         )
         harness_support_state = model_catalog._support_state(runtime_status)
+    elif harness in route_bindings.LIVE_NATIVE_HARNESSES:
+        binding, binding_digest = route_bindings.resolve_live_native(
+            harness, model, effort
+        )
+        harness_version = None
     else:
         evidence = con.execute(
             "SELECT * FROM model_routes WHERE harness=? AND selector=?",
@@ -702,6 +707,7 @@ class SprintLifecycleStore:
             candidate.binding["catalogue_generation"]
             for candidate in candidates
             if candidate.binding["control_state"] == "controlled"
+            and candidate.binding["catalogue_generation"] is not None
         }
         if len(controlled_generations) > 1:
             raise SprintPreflightError(

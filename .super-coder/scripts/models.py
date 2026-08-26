@@ -73,7 +73,10 @@ def _command(binding: dict, shell: str) -> list[str]:
     command = ["./sc", "run", shell, "--harness", binding["harness"]]
     if binding["requested_model"] is not None:
         command.extend(["-m", binding["requested_model"]])
-    if binding["control_state"] == "controlled":
+    if (
+        binding["control_state"] == "controlled"
+        and binding["effective_effort"] is not None
+    ):
         command.extend(["--effort", binding["effective_effort"]])
     return command
 
@@ -100,6 +103,10 @@ def resolve(con, harness: str, selector: str | None = None, *,
             None, harness, selector, shell=shell, effort=effort, now=now,
             runtime_status=runtime_status, runtime_scope=runtime_scope,
         )
+    if harness in route_bindings.LIVE_NATIVE_HARNESSES:
+        return resolve_row(
+            None, harness, selector, shell=shell, effort=effort, now=now,
+        )
     if harness == "deepseek":
         model_catalog.ensure_deepseek_route(con, selector)
     observed_row = _route(con, harness, selector)
@@ -116,7 +123,15 @@ def resolve_row(row: dict | None, harness: str, selector: str | None, *,
                 runtime_scope: dict | None = None) -> dict:
     """Resolve through ``con``'s owned freshness write, or purely if omitted."""
     try:
-        if con is not None:
+        live_options = None
+        if harness in route_bindings.LIVE_NATIVE_HARNESSES and selector is not None:
+            proof = route_bindings._probe_controlled_route(harness, selector)
+            binding, binding_digest = route_bindings.resolve_live_native(
+                harness, selector, effort, route_proof=proof,
+            )
+            advertised = proof._advertised_options_by_model or {}
+            live_options = list(advertised.get(selector) or [])
+        elif con is not None:
             binding, binding_digest = route_bindings.resolve_persisted_v2(
                 con, row, harness, selector, effort, now=now,
                 runtime_status=runtime_status,
@@ -134,17 +149,34 @@ def resolve_row(row: dict | None, harness: str, selector: str | None, *,
         "ok": True,
         "harness": binding["harness"],
         "selector": binding["requested_model"],
-        "source": row.get("source") if row else None,
-        "availability": row.get("availability") if row else None,
+        "source": (
+            "harness-live"
+            if binding["contract_version"]
+            == route_bindings.LIVE_NATIVE_CONTRACT_VERSION
+            else (row.get("source") if row else None)
+        ),
+        "availability": (
+            "available"
+            if binding["contract_version"]
+            == route_bindings.LIVE_NATIVE_CONTRACT_VERSION
+            else (row.get("availability") if row else None)
+        ),
         "stale": False,
         "cli_version": row.get("cli_version") if row else None,
         "harness_version": row.get("harness_version") if row else None,
         "harness_support_state": (
             row.get("harness_support_state") if row else None
         ),
-        "supported_efforts": json.loads(row["supported_efforts"] or "[]")
-        if row and isinstance(row.get("supported_efforts"), str)
-        else (row.get("supported_efforts") if row else []),
+        "supported_efforts": (
+            live_options
+            if binding["contract_version"]
+            == route_bindings.LIVE_NATIVE_CONTRACT_VERSION
+            else (
+                json.loads(row["supported_efforts"] or "[]")
+                if row and isinstance(row.get("supported_efforts"), str)
+                else (row.get("supported_efforts") if row else [])
+            )
+        ),
         "binding": binding,
         "binding_digest": binding_digest,
         "command": _command(binding, shell),

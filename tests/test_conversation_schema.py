@@ -20,10 +20,12 @@ GIT_TARGETS = MIGRATIONS / "0142_conversation_git_targets.sql"
 ACTIVE_REGISTRY = MIGRATIONS / "0162_active_chat_registry.sql"
 REAPER_IDENTITY = MIGRATIONS / "0163_conversation_run_process_identity.sql"
 TOPOLOGY_RETIREMENT = MIGRATIONS / "0168_retire_sprint_conversation_topology.sql"
+LIVE_NATIVE_ROUTES = MIGRATIONS / "0236_live_native_conversation_routes.sql"
 
 sys.path.insert(0, str(ENGINE / "scripts"))
 import conversation_state  # noqa: E402
 import db_driver  # noqa: E402
+import migrate  # noqa: E402
 import snapshot  # noqa: E402
 
 
@@ -121,6 +123,58 @@ class ConversationDbCase(unittest.TestCase):
                 "UPDATE flavor_defaults SET effort=' HIGH ' "
                 "WHERE rowid=(SELECT rowid FROM flavor_defaults LIMIT 1)"
             )
+
+    def test_live_native_migration_preserves_v2_and_admits_only_bound_v3(self) -> None:
+        self.con.execute(
+            "INSERT INTO conversations "
+            "(conversation_id,shell_id,owner_user_id,harness,model,worktree,"
+            "creation_idempotency_key,creation_request_hash,"
+            "route_contract_version,route_binding) "
+            "VALUES ('cv_v2_preserved',1,1,'codex','gpt-test','/tmp/v2',"
+            "'v2-preserved','hash-v2-preserved',2,'{\"contract_version\":2}')"
+        )
+        self.con.execute(
+            "INSERT INTO conversations "
+            "(conversation_id,shell_id,owner_user_id,harness,model,effort,worktree,"
+            "creation_idempotency_key,creation_request_hash,"
+            "route_contract_version,route_binding) "
+            "VALUES ('cv_v3_exact',2,1,'opencode','ollama-cloud/glm-5.2',"
+            "'MAX.Future','/tmp/v3','v3-exact','hash-v3-exact',3,"
+            "'{\"contract_version\":3}')"
+        )
+
+        rows = self.con.execute(
+            "SELECT conversation_id,route_contract_version,route_binding "
+            "FROM conversations WHERE conversation_id IN "
+            "('cv_v2_preserved','cv_v3_exact') ORDER BY conversation_id"
+        ).fetchall()
+        self.assertEqual(
+            [tuple(row) for row in rows],
+            [
+                ("cv_v2_preserved", 2, '{"contract_version":2}'),
+                ("cv_v3_exact", 3, '{"contract_version":3}'),
+            ],
+        )
+        with self.assertRaisesRegex(
+            sqlite3.IntegrityError,
+            "conversation route contract and binding disagree",
+        ):
+            self.con.execute(
+                "INSERT INTO conversations "
+                "(shell_id,owner_user_id,harness,model,worktree,"
+                "creation_idempotency_key,creation_request_hash,"
+                "route_contract_version,route_binding) "
+                "VALUES (3,1,'deepseek','ollama-cloud/glm-5.2','/tmp/v3-null',"
+                "'v3-null','hash-v3-null',3,NULL)"
+            )
+        self.assertEqual(
+            self.con.execute(
+                "SELECT COUNT(*) FROM conversations "
+                "WHERE creation_idempotency_key='v3-null'"
+            ).fetchone()[0],
+            0,
+        )
+        self.assertEqual(self.con.execute("PRAGMA foreign_key_check").fetchall(), [])
 
     def add_conversation(
         self,
@@ -244,6 +298,89 @@ class ConversationDbCase(unittest.TestCase):
 
 
 class MigrationAndShapeTest(ConversationDbCase):
+    def test_live_native_migration_preserves_routes_and_dependent_registry(
+        self,
+    ) -> None:
+        con = sqlite3.connect(":memory:")
+        self.addCleanup(con.close)
+        con.row_factory = sqlite3.Row
+        apply_schema(con, through="0235_live_native_route_binding_v3.sql")
+        con.execute("INSERT INTO users (user_id,username) VALUES (41,'migration')")
+        con.execute(
+            "INSERT INTO shells "
+            "(shell_id,display_name,shortname,flavor,system_prompt,user_id) "
+            "VALUES (41,'Migration','mig41','dev','prompt',41)"
+        )
+        con.execute(
+            "INSERT INTO shells "
+            "(shell_id,display_name,shortname,flavor,system_prompt,user_id) "
+            "VALUES (42,'Migration v3','mig42','dev','prompt',41)"
+        )
+        con.execute(
+            "INSERT OR REPLACE INTO flavor_defaults "
+            "(flavor,harness,model,is_default,effort) VALUES "
+            "('dev','opencode','ollama-cloud/glm-5.2',0,'high')"
+        )
+        con.execute(
+            "INSERT INTO conversations "
+            "(conversation_id,shell_id,owner_user_id,harness,model,effort,worktree,"
+            "creation_idempotency_key,creation_request_hash,"
+            "route_contract_version,route_binding) VALUES "
+            "('cv_before_v3',41,41,'opencode','ollama-cloud/glm-5.2','high',"
+            "'/tmp/migration','before-v3','before-v3-hash',2,"
+            "'{\"contract_version\":2}')"
+        )
+        con.execute(
+            "INSERT INTO active_shell_chats (shell_id,chat_id) "
+            "VALUES (41,'cv_before_v3')"
+        )
+        before = tuple(con.execute(
+            "SELECT * FROM conversations WHERE conversation_id='cv_before_v3'"
+        ).fetchone())
+        con.commit()
+
+        migrate.apply(con, LIVE_NATIVE_ROUTES)
+
+        self.assertEqual(
+            tuple(con.execute(
+                "SELECT * FROM conversations "
+                "WHERE conversation_id='cv_before_v3'"
+            ).fetchone()),
+            before,
+        )
+        self.assertEqual(
+            tuple(con.execute(
+                "SELECT shell_id,chat_id FROM active_shell_chats"
+            ).fetchone()),
+            (41, "cv_before_v3"),
+        )
+        self.assertEqual(con.execute("PRAGMA foreign_keys").fetchone()[0], 1)
+        self.assertEqual(con.execute("PRAGMA foreign_key_check").fetchall(), [])
+        self.assertIsNotNone(con.execute(
+            "SELECT 1 FROM schema_migrations WHERE filename=?",
+            (LIVE_NATIVE_ROUTES.name,),
+        ).fetchone())
+
+        con.execute(
+            "UPDATE flavor_defaults SET effort='MAX.Future' "
+            "WHERE flavor='dev' AND harness='opencode'"
+        )
+        with self.assertRaises(sqlite3.IntegrityError):
+            con.execute(
+                "INSERT INTO flavor_defaults "
+                "(flavor,harness,model,effort) "
+                "VALUES ('strict-lower','claude','sonnet','MAX.Future')"
+            )
+        con.execute(
+            "INSERT INTO conversations "
+            "(shell_id,owner_user_id,harness,model,effort,worktree,"
+            "creation_idempotency_key,creation_request_hash,"
+            "route_contract_version,route_binding) VALUES "
+            "(42,41,'opencode','ollama-cloud/glm-5.2','MAX.Future',"
+            "'/tmp/migration-v3','after-v3','after-v3-hash',3,"
+            "'{\"contract_version\":3}')"
+        )
+
     def test_installed_fork_upgrades_from_pre_foundation_schema(self) -> None:
         con = sqlite3.connect(":memory:")
         apply_schema(con, through="0129_reseed_api_identity_wording.sql")

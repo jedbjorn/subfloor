@@ -120,6 +120,31 @@ class FakeOpenCode:
         self.status = "idle"
         self.exists = True
         self.stream_calls: list[tuple[str, dict]] = []
+        self.provider_state = {
+            "connected": ["openai", "openrouter"],
+            "all": [
+                {
+                    "id": "openai",
+                    "models": {
+                        "gpt-test": {
+                            "variants": {
+                                "high": {"reasoningEffort": "high"}
+                            }
+                        }
+                    },
+                },
+                {
+                    "id": "openrouter",
+                    "models": {
+                        "test-model": {
+                            "variants": {
+                                "high": {"reasoningEffort": "high"}
+                            }
+                        }
+                    },
+                },
+            ],
+        }
 
     def request(
         self,
@@ -132,6 +157,8 @@ class FakeOpenCode:
         self.requests.append((method, path, dict(query or {}), body))
         if path == "/global/health":
             return {"healthy": True, "version": "1.18.9"}
+        if method == "GET" and path == "/provider":
+            return self.provider_state
         if method == "POST" and path == "/session":
             return {"id": self.session_ref, "title": "test"}
         if path.endswith("/message"):
@@ -1205,8 +1232,14 @@ class ConversationAdapterTest(unittest.TestCase):
         })
         self.assertIn("shell", configured)
 
-    def test_opencode_stale_route_agent_refuses_before_native_identity(self):
+    def test_opencode_replaces_stale_route_agent_from_live_native_payload(self):
         native = FakeOpenCode()
+        native.provider_state["all"][0]["models"]["gpt-test"]["variants"][
+            "high"
+        ] = {
+            "reasoningEffort": "high",
+            "futureNativeKey": {"enabled": True},
+        }
         adapter = OpenCodeAdapter(
             transport=native,
             shell_runtime_dir=self.root / "runtime-shells",
@@ -1223,11 +1256,41 @@ class ConversationAdapterTest(unittest.TestCase):
             }}
         }))
 
-        with self.assertRaises(AdapterError) as refused:
+        turn = adapter.start(context, "dispatch current route")
+        configured = json.loads((self.root / "opencode.json").read_text())
+
+        self.assertEqual(configured["agent"][agent], {
+            "reasoningEffort": "high",
+            "futureNativeKey": {"enabled": True},
+            "mode": "primary",
+            "model": "openai/gpt-test",
+        })
+        self.assertEqual(turn.session_ref, "ses_exact")
+        self.assertEqual(
+            [(method, path) for method, path, _query, _body in native.requests],
+            [("GET", "/provider"), ("POST", "/session")],
+        )
+
+    def test_opencode_missing_live_option_refuses_before_session_or_prompt(self):
+        native = FakeOpenCode()
+        native.provider_state["all"][0]["models"]["gpt-test"]["variants"] = {
+            "low": {"reasoningEffort": "low"},
+        }
+        adapter = OpenCodeAdapter(
+            transport=native,
+            shell_runtime_dir=self.root / "runtime-shells",
+        )
+        context = v2_context(
+            self.root, "opencode", provider="openai", model="gpt-test"
+        )
+
+        with self.assertRaisesRegex(AdapterError, "native_route_unavailable"):
             adapter.start(context, "must not dispatch")
 
-        self.assertEqual(refused.exception.code, "HARNESS_CONFIG_INVALID")
-        self.assertEqual(native.requests, [])
+        self.assertEqual(
+            [(method, path) for method, path, _query, _body in native.requests],
+            [("GET", "/provider")],
+        )
 
     def test_opencode_transport_rejection_is_one_terminal_dispatch(self):
         native = FakeOpenCode()

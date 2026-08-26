@@ -149,14 +149,14 @@ class ConversationLaunchPreparer:
         shortname, flavor = self._shell(broker_run.shell_id)
         binding = None
         binding_digest = None
-        if (
-            broker_run.route_contract_version
-            == route_transport.route_bindings.CONTRACT_VERSION
-        ):
+        if broker_run.route_contract_version in {
+            route_transport.route_bindings.V2_CONTRACT_VERSION,
+            route_transport.route_bindings.LIVE_NATIVE_CONTRACT_VERSION,
+        }:
             binding = broker_run.route_binding
             binding_digest = broker_run.binding_digest
             try:
-                route_transport.route_bindings.validate_v2_binding(binding)
+                route_transport.route_bindings.validate_binding(binding)
                 if (
                     route_transport.route_bindings.digest_json(binding)
                     != binding_digest
@@ -172,7 +172,7 @@ class ConversationLaunchPreparer:
             ) as exc:
                 raise ConversationLaunchError(
                     "CONVERSATION_ROUTE_INVALID",
-                    "stored version-two conversation route binding is invalid",
+                    "stored versioned conversation route binding is invalid",
                 ) from exc
             if (
                 binding["harness"] != broker_run.harness
@@ -181,7 +181,7 @@ class ConversationLaunchPreparer:
             ):
                 raise ConversationLaunchError(
                     "CONVERSATION_ROUTE_INVALID",
-                    "stored version-two binding disagrees with conversation route",
+                    "stored versioned binding disagrees with conversation route",
                 )
         elif broker_run.route_contract_version != 1:
             raise ConversationLaunchError(

@@ -437,10 +437,14 @@ def _conversation_projection(row) -> dict:
     binding_digest = None
     control_state = None
     native_variant_id = None
-    if contract_version == route_bindings.CONTRACT_VERSION:
+    native_option_id = None
+    if contract_version in {
+        route_bindings.V2_CONTRACT_VERSION,
+        route_bindings.LIVE_NATIVE_CONTRACT_VERSION,
+    }:
         try:
             binding = json.loads(row["route_binding"])
-            route_bindings.validate_v2_binding(binding)
+            route_bindings.validate_binding(binding)
         except (TypeError, json.JSONDecodeError,
                 route_bindings.RouteResolutionError) as exc:
             raise ApiError(
@@ -452,6 +456,7 @@ def _conversation_projection(row) -> dict:
         binding_digest = route_bindings.digest_json(binding)
         control_state = binding["control_state"]
         native_variant_id = binding["native_variant_id"]
+        native_option_id = binding.get("native_option_id")
     return {
         "conversation_id": row["conversation_id"],
         "shell": {
@@ -467,6 +472,7 @@ def _conversation_projection(row) -> dict:
             "contract_version": contract_version,
             "control_state": control_state,
             "native_variant_id": native_variant_id,
+            "native_option_id": native_option_id,
             "binding_digest": binding_digest,
             "legacy": contract_version == 1,
         },
@@ -796,10 +802,10 @@ def _wait_for_cli_release(shell) -> str | None:
     return state
 
 
-def _stored_v2_binding(row) -> dict:
+def _stored_binding(row) -> dict:
     try:
         binding = json.loads(row["route_binding"])
-        route_bindings.validate_v2_binding(binding)
+        route_bindings.validate_binding(binding)
     except (TypeError, json.JSONDecodeError,
             route_bindings.RouteResolutionError) as exc:
         raise ApiError(
@@ -822,17 +828,48 @@ def _conversation_creation_replay(
             body.get("harness"), "harness", maximum=64
         ) == row["harness"]
     if "model" in body:
-        matches = matches and _nonblank(
-            body.get("model"), "model", maximum=255, optional=True
-        ) == row["model"]
+        raw_model = body.get("model")
+        if int(row["route_contract_version"]) == 3 and raw_model is not None:
+            if (
+                not isinstance(raw_model, str)
+                or raw_model != raw_model.strip()
+                or not raw_model
+                or len(raw_model) > 255
+            ):
+                raise ApiError(
+                    422,
+                    "native_route_unavailable",
+                    "model must be an exact non-blank native route ID",
+                )
+            requested_model = raw_model
+        else:
+            requested_model = _nonblank(
+                raw_model, "model", maximum=255, optional=True
+            )
+        matches = matches and requested_model == row["model"]
     if "effort" in body:
-        requested_effort = _nonblank(
-            body.get("effort"), "effort", maximum=64, optional=True
-        )
+        raw_effort = body.get("effort")
+        if int(row["route_contract_version"]) == 3 and raw_effort is not None:
+            if (
+                not isinstance(raw_effort, str)
+                or raw_effort != raw_effort.strip()
+                or not raw_effort
+                or len(raw_effort) > 64
+            ):
+                raise ApiError(
+                    422,
+                    "unsupported_native_option",
+                    "native option must be an exact non-blank ID",
+                )
+            requested_effort = raw_effort
+        else:
+            requested_effort = _nonblank(
+                raw_effort, "effort", maximum=64, optional=True
+            )
         if int(row["route_contract_version"]) == 1:
             matches = matches and requested_effort == row["effort"]
         else:
-            binding = _stored_v2_binding(row)
+            binding = _stored_binding(row)
             if binding["control_state"] != "controlled":
                 if requested_effort is not None:
                     raise ApiError(
@@ -844,6 +881,11 @@ def _conversation_creation_replay(
                          "requested_effort": requested_effort},
                     )
                 canonical_effort = None
+            elif (
+                binding["contract_version"]
+                == route_bindings.LIVE_NATIVE_CONTRACT_VERSION
+            ):
+                canonical_effort = requested_effort
             elif requested_effort is None:
                 canonical_effort = "high"
             elif binding["harness"] == "opencode":
@@ -852,10 +894,16 @@ def _conversation_creation_replay(
             else:
                 canonical_effort = requested_effort.lower()
             matches = matches and canonical_effort == binding["requested_effort"]
-    elif "model" in body and int(row["route_contract_version"]) == 2:
-        binding = _stored_v2_binding(row)
+    elif "model" in body and int(row["route_contract_version"]) in {2, 3}:
+        binding = _stored_binding(row)
         if binding["control_state"] == "controlled":
-            matches = matches and binding["requested_effort"] == "high"
+            expected = (
+                None
+                if binding["contract_version"]
+                == route_bindings.LIVE_NATIVE_CONTRACT_VERSION
+                else "high"
+            )
+            matches = matches and binding["requested_effort"] == expected
     if not matches:
         raise ApiError(
             409,
@@ -920,9 +968,28 @@ def _create_conversation(con, operator: dict, headers, body: dict):
             f"harness {harness!r} has no browser conversation adapter",
         )
     if "model" in body:
-        selected_model = _nonblank(
-            body.get("model"), "model", maximum=255, optional=True
-        )
+        raw_model = body.get("model")
+        if (
+            harness in route_bindings.LIVE_NATIVE_HARNESSES
+            and raw_model is not None
+        ):
+            if (
+                not isinstance(raw_model, str)
+                or not raw_model
+                or raw_model != raw_model.strip()
+                or len(raw_model) > 255
+            ):
+                raise ApiError(
+                    422,
+                    "native_route_unavailable",
+                    "model must be an exact non-blank native route ID",
+                    {"harness": harness, "model": raw_model},
+                )
+            selected_model = raw_model
+        else:
+            selected_model = _nonblank(
+                raw_model, "model", maximum=255, optional=True
+            )
     else:
         selected_model = (
             (defaults.get("models") or {}).get(harness)
@@ -930,9 +997,28 @@ def _create_conversation(con, operator: dict, headers, body: dict):
             else None
         )
     if "effort" in body:
-        selected_effort = _nonblank(
-            body.get("effort"), "effort", maximum=64, optional=True
-        )
+        raw_effort = body.get("effort")
+        if (
+            harness in route_bindings.LIVE_NATIVE_HARNESSES
+            and raw_effort is not None
+        ):
+            if (
+                not isinstance(raw_effort, str)
+                or not raw_effort
+                or raw_effort != raw_effort.strip()
+                or len(raw_effort) > 64
+            ):
+                raise ApiError(
+                    422,
+                    "unsupported_native_option",
+                    "native option must be an exact non-blank ID",
+                    {"harness": harness, "model": selected_model},
+                )
+            selected_effort = raw_effort
+        else:
+            selected_effort = _nonblank(
+                raw_effort, "effort", maximum=64, optional=True
+            )
     elif "model" not in body:
         selected_effort = (
             (defaults.get("efforts") or {}).get(harness)
@@ -942,10 +1028,23 @@ def _create_conversation(con, operator: dict, headers, body: dict):
     else:
         selected_effort = None
 
-    runtime_status = model_catalog.harness_runtime_status(harness)
-    runtime_scope = model_catalog.harness_versions.runtime_scope()
+    runtime_status = None
+    runtime_scope = None
+    if (
+        selected_model is None
+        or harness not in route_bindings.LIVE_NATIVE_HARNESSES
+    ):
+        runtime_status = model_catalog.harness_runtime_status(harness)
+        runtime_scope = model_catalog.harness_versions.runtime_scope()
     try:
-        if selected_model is not None and harness != "vibe":
+        if (
+            selected_model is not None
+            and harness in route_bindings.LIVE_NATIVE_HARNESSES
+        ):
+            binding, binding_digest = route_bindings.resolve_live_native(
+                harness, selected_model, selected_effort
+            )
+        elif selected_model is not None and harness != "vibe":
             if harness == "deepseek":
                 model_catalog.ensure_deepseek_route(con, selected_model)
             route = con.execute(
@@ -975,6 +1074,7 @@ def _create_conversation(con, operator: dict, headers, body: dict):
     harness = binding["harness"]
     model = binding["requested_model"]
     effort = binding["requested_effort"]
+    route_contract_version = binding["contract_version"]
     provider = run_mod.session_provider(harness, model)
     route_binding_json = route_bindings.canonical_json(binding)
     worktree = run_mod.shell_work_dir(shell["shortname"], shell["flavor"])
@@ -994,7 +1094,7 @@ def _create_conversation(con, operator: dict, headers, body: dict):
             "provider": provider,
             "model": model,
             "effort": effort,
-            "route_contract_version": route_bindings.CONTRACT_VERSION,
+            "route_contract_version": route_contract_version,
             "binding_digest": binding_digest,
             "worktree": str(worktree),
         }
@@ -1120,7 +1220,7 @@ def _create_conversation(con, operator: dict, headers, body: dict):
                 provider,
                 model,
                 effort,
-                route_bindings.CONTRACT_VERSION,
+                route_contract_version,
                 route_binding_json,
                 str(worktree),
                 title,
@@ -1137,7 +1237,7 @@ def _create_conversation(con, operator: dict, headers, body: dict):
                 "harness": harness,
                 "model": model,
                 "effort": effort,
-                "route_contract_version": route_bindings.CONTRACT_VERSION,
+                "route_contract_version": route_contract_version,
                 "control_state": binding["control_state"],
                 "binding_digest": binding_digest,
             },

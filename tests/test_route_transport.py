@@ -108,6 +108,19 @@ def uncontrolled(state: str, harness: str, model: str | None) -> tuple[dict, str
     return binding, digest
 
 
+def live_native(
+    harness: str,
+    native_option_id: str | None,
+) -> tuple[dict, str]:
+    model = "ollama-cloud/glm-5.2"
+    return route_transport.route_bindings.live_native_v3_binding(
+        harness,
+        model,
+        "glm-5.2",
+        native_option_id,
+    )
+
+
 class RouteTransportTest(unittest.TestCase):
     def setUp(self) -> None:
         temporary = tempfile.TemporaryDirectory()
@@ -167,6 +180,49 @@ class RouteTransportTest(unittest.TestCase):
         configured = json.loads((self.root / "opencode.json").read_text())
         self.assertEqual(list(configured["agent"]), [agent])
         self.assertEqual(configured["agent"][agent]["reasoningEffort"], "high")
+
+    def test_live_native_headless_uses_exact_option_without_route_agent(self):
+        for harness, flag in (("opencode", "--variant"), ("deepseek", "--effort")):
+            with self.subTest(harness=harness):
+                binding, digest = live_native(harness, "MAX.Future")
+                projection = route_transport.project(
+                    binding,
+                    digest,
+                    expected_harness=harness,
+                    worktree=self.root,
+                    interface="headless",
+                )
+                command = run.headless_command(
+                    run.load_adapter(harness), "hello", transport=projection
+                )
+
+                self.assertEqual(
+                    command[-5:],
+                    ["--selector" if harness == "deepseek" else "--model",
+                     "ollama-cloud/glm-5.2", flag, "MAX.Future", "hello"],
+                )
+                self.assertEqual(projection.native_variant_id, "MAX.Future")
+                self.assertFalse((self.root / "opencode.json").exists())
+
+    def test_live_native_headless_null_option_invokes_harness_default(self):
+        for harness in ("opencode", "deepseek"):
+            with self.subTest(harness=harness):
+                binding, digest = live_native(harness, None)
+                projection = route_transport.project(
+                    binding,
+                    digest,
+                    expected_harness=harness,
+                    worktree=self.root,
+                    interface="headless",
+                )
+                command = run.headless_command(
+                    run.load_adapter(harness), "hello", transport=projection
+                )
+
+                self.assertNotIn("--variant", command)
+                self.assertNotIn("--effort", command)
+                self.assertIsNone(projection.effort)
+                self.assertIsNone(projection.native_variant_id)
 
     def test_opencode_interactive_uses_model_and_full_agent_without_variant(self):
         binding, digest = controlled("opencode")

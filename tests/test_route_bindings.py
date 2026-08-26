@@ -689,6 +689,83 @@ class BindingIdentityTest(unittest.TestCase):
                     route_bindings.validate_v3_binding(binding)
                 self.assertEqual(raised.exception.code, "unsupported_native_option")
 
+    def test_cli_live_resolution_pins_all_decision_267_models_without_provider_calls(
+        self,
+    ) -> None:
+        selectors = (
+            "ollama-cloud/deepseek-v4-flash",
+            "ollama-cloud/glm-5.2",
+            "ollama-cloud/gpt-oss:120b",
+            "ollama-cloud/qwen3.5:397b",
+            "ollama-cloud/gemma4:31b",
+        )
+        for harness in ("opencode", "deepseek"):
+            for selector in selectors:
+                observation = controlled_observation(None, harness=harness)
+                observation["advertised_options_by_model"] = {
+                    selector: ["MAX.Future", "low"]
+                }
+                with self.subTest(harness=harness, selector=selector), mock.patch.object(
+                    model_catalog,
+                    "controlled_route_evidence",
+                    return_value=observation,
+                ) as probe:
+                    resolved = routes_cli.resolve(
+                        None,
+                        harness,
+                        selector,
+                        effort="MAX.Future",
+                        shell="DEV5",
+                    )
+
+                probe.assert_called_once_with(harness, selector)
+                self.assertTrue(resolved["ok"], resolved)
+                self.assertEqual(resolved["binding"]["contract_version"], 3)
+                self.assertEqual(resolved["selector"], selector)
+                self.assertEqual(
+                    resolved["binding"]["native_option_id"], "MAX.Future"
+                )
+                self.assertEqual(
+                    resolved["command"],
+                    [
+                        "./sc", "run", "DEV5", "--harness", harness,
+                        "-m", selector, "--effort", "MAX.Future",
+                    ],
+                )
+
+        selector = selectors[1]
+        observation = controlled_observation(None, harness="opencode")
+        observation["advertised_options_by_model"] = {selector: []}
+        with mock.patch.object(
+            model_catalog,
+            "controlled_route_evidence",
+            return_value=observation,
+        ):
+            default = routes_cli.resolve(
+                None, "opencode", selector, effort=None, shell="DEV5"
+            )
+        self.assertTrue(default["ok"], default)
+        self.assertIsNone(default["binding"]["native_option_id"])
+        self.assertEqual(
+            default["command"],
+            ["./sc", "run", "DEV5", "--harness", "opencode", "-m", selector],
+        )
+
+        missing = controlled_observation(None, harness="opencode")
+        missing["advertised_options_by_model"] = {selector: ["low"]}
+        with mock.patch.object(
+            model_catalog,
+            "controlled_route_evidence",
+            return_value=missing,
+        ):
+            refused = routes_cli.resolve(
+                None, "opencode", selector, effort="MAX.Future"
+            )
+        self.assertFalse(refused["ok"])
+        self.assertEqual(refused["code"], "native_route_unavailable")
+        self.assertEqual(refused["details"]["current_option_ids"], ["low"])
+        self.assertNotIn("command", refused)
+
     def test_legacy_v2_live_native_uses_current_exact_ids_without_rewrite(self):
         opencode, _ = resolve_controlled_v2(
             self.opencode_row(), "opencode", "provider/model", "k",

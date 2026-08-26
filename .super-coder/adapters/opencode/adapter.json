@@ -36,7 +36,8 @@
   "model": { "file": "opencode.json", "key": "model" },
   "headless": {
     "launch": ["opencode", "run"],
-    "model_flag": "--model"
+    "model_flag": "--model",
+    "effort": { "flag": "--variant" }
   },
   "conversation": {
     "contract_version": 1,

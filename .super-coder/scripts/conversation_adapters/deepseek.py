@@ -747,12 +747,13 @@ class DeepSeekAdapter(ConversationAdapter):
             route = deepseek_host.route_for(client, projection.model)
         except deepseek_host.DeepSeekHostError as exc:
             raise _adapter_error(exc) from exc
-        expected = route.binding_metadata(binding["requested_effort"])
-        if dict(metadata) != expected:
-            raise AdapterError(
-                "HARNESS_ROUTE_STALE",
-                "DeepSeek official configuration changed after exact route binding",
+        try:
+            route_transport.route_bindings.require_advertised_live_native(
+                dict(binding),
+                {route.selector: list(route.reasoning_efforts)},
             )
+        except route_transport.route_bindings.RouteResolutionError as exc:
+            raise AdapterError(exc.code, exc.message) from exc
         if context.provider is not None and context.provider != route.provider:
             raise AdapterError(
                 "HARNESS_ROUTE_INVALID",
@@ -765,19 +766,19 @@ class DeepSeekAdapter(ConversationAdapter):
         client: deepseek_host.HostTransport,
         session_ref: str,
         route: deepseek_host.ConfiguredRoute,
-        effort: str,
+        effort: str | None,
     ) -> None:
         payload = {
             "sessionId": session_ref,
             "provider": route.provider,
             "model": route.model,
-            **({} if effort == "default" else {"reasoningEffort": effort}),
+            **({} if effort is None else {"reasoningEffort": effort}),
         }
         selected = client.call("session.selectModel", payload)
         expected = {
             "provider": route.provider,
             "model": route.model,
-            **({} if effort == "default" else {"reasoningEffort": effort}),
+            **({} if effort is None else {"reasoningEffort": effort}),
         }
         if not isinstance(selected, Mapping) or selected.get("selected") != expected:
             raise AdapterError(
@@ -796,15 +797,28 @@ class DeepSeekAdapter(ConversationAdapter):
         route: deepseek_host.ConfiguredRoute | None = None,
         workspace_id: str,
     ) -> NativeTurn:
-        route = route or self._route(client, context)
+        if route is None and not resumed:
+            route = self._route(client, context)
         boundary = self._boundary(client, session_ref)
         binding = context.route_binding
-        effort = (
-            binding.get("requested_effort")
-            if isinstance(binding, Mapping)
-            else None
-        )
-        self._select(client, session_ref, route, effort or "default")
+        effort = None
+        if not resumed:
+            if not isinstance(binding, Mapping):
+                raise AdapterError(
+                    "HARNESS_ROUTE_INVALID", "DeepSeek route binding is missing"
+                )
+            try:
+                effort = route_transport.route_bindings.live_native_selection(
+                    dict(binding)
+                )["native_option_id"]
+            except route_transport.route_bindings.RouteResolutionError as exc:
+                raise AdapterError(exc.code, exc.message) from exc
+            if route is None:
+                raise AdapterError(
+                    "HARNESS_ROUTE_INVALID",
+                    "DeepSeek first dispatch requires an exact live route",
+                )
+            self._select(client, session_ref, route, effort)
         stream = client.open_events()
         try:
             # Native Web shares the Host and may change workspace/archive state.
@@ -899,7 +913,6 @@ class DeepSeekAdapter(ConversationAdapter):
                 context, session_ref, bind_identity=False
             )
             self._reserve(session_ref)
-            route = self._route(client, context)
             workspace_id = self._prepare_managed_session(
                 client, session_ref, context, resume=True
             )
@@ -910,7 +923,7 @@ class DeepSeekAdapter(ConversationAdapter):
                 context,
                 message,
                 resumed=True,
-                route=route,
+                route=None,
                 workspace_id=workspace_id,
             )
         except Exception:

@@ -653,10 +653,44 @@ class SprintBoundRouteDispatchProof(unittest.TestCase):
             route_bindings.live_native_selection(broker_run.route_binding)
         self.assertEqual(raised.exception.code, "unsupported_route_contract")
 
-    def test_opencode_dispatch_uses_bound_variant_after_catalogue_changes(self) -> None:
+    def test_opencode_selected_model_with_null_option_uses_harness_default(
+        self,
+    ) -> None:
         observation = self._seed_opencode_catalogue()
         sprint_id = self._seed_sprint(
-            harness="opencode", model=self.SELECTOR, effort="high"
+            harness="opencode", model=self.SELECTOR, effort=None
+        )
+
+        with mock.patch.object(
+            model_catalog, "controlled_route_evidence", return_value=observation
+        ):
+            wake_id = self._arm(sprint_id)
+            broker_run = self._deliver_and_claim(wake_id)
+        context, launch = self._prepare(broker_run)
+        projection = route_transport.context_projection(context, "opencode")
+
+        self.assertEqual(broker_run.route_contract_version, 3)
+        self.assertEqual(broker_run.route_binding["control_state"], "controlled")
+        self.assertIsNone(broker_run.route_binding["native_option_id"])
+        self.assertIsNone(broker_run.effort)
+        self.assertIsNone(launch["effort"])
+        self.assertIsNone(projection.effort)
+        self.assertEqual(projection.argument_tail, ())
+        self.assertIsNone(
+            route_bindings.live_native_selection(
+                broker_run.route_binding
+            )["native_option_id"]
+        )
+
+    def test_opencode_dispatch_uses_current_live_variant_after_catalogue_changes(
+        self,
+    ) -> None:
+        observation = self._seed_opencode_catalogue()
+        observation["advertised_options_by_model"] = {
+            self.SELECTOR: ["MAX.Future"]
+        }
+        sprint_id = self._seed_sprint(
+            harness="opencode", model=self.SELECTOR, effort="MAX.Future"
         )
         with mock.patch.object(
             model_catalog, "controlled_route_evidence", return_value=observation
@@ -687,6 +721,25 @@ class SprintBoundRouteDispatchProof(unittest.TestCase):
 
             def request(self, method, path, *, query=None, body=None):
                 self.calls.append((method, path, body))
+                if method == "GET" and path == "/provider":
+                    return {
+                        "connected": ["openai"],
+                        "all": [{
+                            "id": "openai",
+                            "models": {
+                                "sprint-bound-model": {
+                                    "variants": {
+                                        "MAX.Future": {
+                                            "reasoningEffort": "MAX.Future",
+                                            "futureNativeKey": {
+                                                "enabled": True,
+                                            },
+                                        },
+                                    },
+                                },
+                            },
+                        }],
+                    }
                 return {}
 
             def stream(self, *_args, **_kwargs):
@@ -698,6 +751,7 @@ class SprintBoundRouteDispatchProof(unittest.TestCase):
             shell_runtime_dir=self.root / "opencode-shells",
         )
         adapter._prepare_shell_environment(context)
+        adapter._prepare_live_route_agent(context)
         adapter._prompt("native-session", context, "Dispatch stored route")
         config = json.loads((broker_run.worktree / "opencode.json").read_text())
         current = json.loads(
@@ -708,23 +762,22 @@ class SprintBoundRouteDispatchProof(unittest.TestCase):
             ).fetchone()[0]
         )
 
+        self.assertEqual(broker_run.route_contract_version, 3)
+        self.assertEqual(broker_run.route_binding["contract_version"], 3)
+        self.assertIsNone(broker_run.route_binding["catalogue_generation"])
         self.assertEqual(
-            broker_run.route_binding["catalogue_generation"], self.GENERATION
+            broker_run.route_binding["native_option_id"], "MAX.Future"
         )
-        self.assertEqual(broker_run.route_binding["native_variant_id"], "high")
-        self.assertEqual(
-            broker_run.route_binding["adapter_metadata"]["variant_options"],
-            {"reasoningEffort": "high", "textVerbosity": "low"},
-        )
+        self.assertEqual(broker_run.route_binding["adapter_metadata"], {})
         self.assertEqual(launch["route_binding"], broker_run.route_binding)
-        self.assertEqual(projection.native_variant_id, "high")
+        self.assertEqual(projection.native_variant_id, "MAX.Future")
         self.assertEqual(
             config["agent"][projection.route_agent],
             {
                 "mode": "primary",
                 "model": self.SELECTOR,
-                "reasoningEffort": "high",
-                "textVerbosity": "low",
+                "reasoningEffort": "MAX.Future",
+                "futureNativeKey": {"enabled": True},
             },
         )
         self.assertEqual(current["native_variant_ids"], {"xhigh": "xhigh"})
