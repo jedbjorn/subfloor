@@ -23,11 +23,12 @@ Fetched server-side (no CORS), cached under the gitignored .super-coder/logs/
 dirty the tree and trip the publish guard) with a TTL; a failed refresh serves
 the stale cache and says so.
 
-Payload v6 exposes the flat `models` list consumed by the shared searchable
+Payload v8 exposes the flat `models` list consumed by the shared searchable
 picker. Legacy `families` metadata remains for API compatibility but is not a
 selection surface: the harness is the only picker prefilter, and family-null
-local routes are ordinary results. Entries carry their route source, local
-availability, CLI version, and effort support.
+local routes are ordinary results. OpenCode and DeepSeek blocks are refreshed
+from their executing seats on every read and expose only exact native option
+IDs plus non-sensitive display metadata.
 """
 from __future__ import annotations
 
@@ -136,8 +137,10 @@ def _entry(mid: str, release_date: str = "", name: str = "",
            cli_version: str | None = None,
            selector_binding: dict | None = None,
            adapter_metadata: dict | None = None,
-           native_variant_ids: dict[str, str] | None = None) -> dict:
-    return {"id": mid, "release_date": release_date, "name": name or mid,
+           native_variant_ids: dict[str, str] | None = None,
+           native_option_ids: list[str] | None = None,
+           native_default_option_id: str | None = None) -> dict:
+    entry = {"id": mid, "release_date": release_date, "name": name or mid,
             "family": family, "source": source,
             "availability": availability, "provider": provider,
             "provider_model": provider_model or mid,
@@ -145,7 +148,11 @@ def _entry(mid: str, release_date: str = "", name: str = "",
             "default_effort": default_effort, "cli_version": cli_version,
             "selector_binding": selector_binding,
             "adapter_metadata": adapter_metadata or {},
-            "native_variant_ids": native_variant_ids or {}}
+            "native_variant_ids": native_variant_ids or {},
+            "native_option_ids": native_option_ids or []}
+    if native_default_option_id is not None:
+        entry["native_default_option_id"] = native_default_option_id
+    return entry
 
 
 def _from_models_dev(fetch) -> dict[str, list[dict]]:
@@ -254,6 +261,8 @@ def _from_deepseek_host(
             adapter_metadata={
                 "route_metadata_by_effort": metadata_by_effort,
             },
+            native_option_ids=efforts,
+            native_default_option_id=route.default_effort,
         ))
     return entries
 
@@ -376,13 +385,13 @@ def build(
         harnesses[harness] = _merge(harnesses.get(harness, []), extra)
         sources.append(f"{HARNESS_PROVIDER[harness]}-api")
     deepseek = []
+    deepseek_observed_at = datetime.now(timezone.utc).isoformat()
     try:
         deepseek = _from_deepseek_host(
             deepseek_client,
         )
         harnesses["deepseek"] = deepseek
-        if deepseek:
-            sources.append(DEEPSEEK_SOURCE)
+        sources.append(DEEPSEEK_SOURCE)
     except Exception:  # noqa: BLE001 (official Host errors stay redacted)
         harnesses.setdefault("deepseek", [])
         harness_errors["deepseek"] = "official DeepSeek Host configuration unavailable"
@@ -406,6 +415,11 @@ def build(
             **({"errors": errors} if errors else {}),
             "harnesses": {h: {"families": _families(h, entries),
                               "models": entries,
+                              **({
+                                  "authority": "harness-live",
+                                  "observed_at": deepseek_observed_at,
+                                  "stale": False,
+                              } if h == "deepseek" else {}),
                               **({"error": harness_errors[h]}
                                  if h in harness_errors else {})}
                           for h, entries in harnesses.items()}}
@@ -485,7 +499,8 @@ def _publish_cache(payload: dict, con=None) -> bool:
 
 
 def _finish_cache_publication(
-    candidate: dict, response: dict, con, opencode_provider, *,
+    candidate: dict, response: dict, con, opencode_provider,
+    deepseek_client=None, *,
     publication_locked: bool = False,
 ) -> dict:
     for field in (
@@ -502,9 +517,10 @@ def _finish_cache_publication(
         response["generation_published"] = False
     winner = _load_cache()
     if winner and _cache_matches_authority(winner, con):
-        return _served(_with_live_opencode(
+        return _served(_with_live_native(
             {**winner, "stale": bool(winner.get("stale"))},
             opencode_provider,
+            deepseek_client,
         ), con)
     return {**response, "stale": True,
             "error": "Catalogue changed during refresh; retry"}
@@ -600,6 +616,8 @@ def _support_state(status: dict) -> str | None:
 def _compatible_route_status(harness: str, entry: dict,
                              status: dict) -> bool:
     """Require executable and exact source evidence, never a version range."""
+    if harness in route_bindings.LIVE_NATIVE_HARNESSES:
+        return entry.get("availability") == "available"
     if _evidence_kind(harness, entry.get("source") or "unknown") is None:
         return True
     if not isinstance(status, dict):
@@ -642,7 +660,15 @@ def _entry_evidence(harness: str, entry: dict,
     }
     efforts = list(dict.fromkeys(
         value for value in (entry.get("supported_efforts") or [])
-        if isinstance(value, str) and value == value.strip().lower() and value
+        if (
+            isinstance(value, str)
+            and value
+            and value == value.strip()
+            and (
+                harness in route_bindings.LIVE_NATIVE_HARNESSES
+                or value == value.lower()
+            )
+        )
     ))
     catalogue_adapter_metadata = entry.get("adapter_metadata") or {}
     variants_by_effort = (
@@ -1095,11 +1121,63 @@ def runtime_verification(con, *, env=os.environ,
     return report
 
 
+_PUBLIC_LIVE_MODEL_FIELDS = frozenset({
+    "id", "release_date", "name", "family", "source", "availability",
+    "provider", "provider_model", "supported_efforts", "default_effort",
+    "cli_version", "native_variant_ids", "native_option_ids",
+    "native_default_option_id", "harness_version", "harness_support_state",
+})
+
+
+def _public_live_blocks(payload: dict) -> dict:
+    """Keep live payloads server-side while exposing IDs and display data."""
+    result = {**payload}
+    harnesses = dict(payload.get("harnesses") or {})
+    for harness in route_bindings.LIVE_NATIVE_HARNESSES:
+        block = harnesses.get(harness)
+        if not isinstance(block, dict):
+            continue
+        public_block = {**block}
+        public_block["models"] = [
+            {
+                field: value
+                for field, value in model.items()
+                if field in _PUBLIC_LIVE_MODEL_FIELDS
+            }
+            for model in (block.get("models") or [])
+            if isinstance(model, dict)
+        ]
+        harnesses[harness] = public_block
+    result["harnesses"] = harnesses
+    return result
+
+
 def _served(payload: dict, con=None, *, publish: bool = False,
             publication_locked: bool = False) -> dict:
     if con is not None and publish:
         persist_routes(con, payload, publication_locked=publication_locked)
-    return payload
+    return _public_live_blocks(payload)
+
+
+def _bounded_discovery_error(exc: Exception) -> str:
+    text = str(exc).replace("\x00", "")
+    text = re.sub(
+        r"(?i)(authorization|bearer|api[-_]?key|token|secret|password|credential)"
+        r"(?:\s*[:=]\s*|\s+)[^\s,;]+",
+        r"\1=[REDACTED]",
+        text,
+    )
+    return text[:512] or type(exc).__name__
+
+
+def _replace_source_error(payload: dict, prefix: str, error: str | None) -> list[str]:
+    errors = [
+        item for item in (payload.get("errors") or [])
+        if not (isinstance(item, str) and item.startswith(prefix))
+    ]
+    if error:
+        errors.append(f"{prefix}{error}")
+    return errors
 
 
 def _with_live_opencode(payload: dict, provider_models) -> dict:
@@ -1112,42 +1190,101 @@ def _with_live_opencode(payload: dict, provider_models) -> dict:
     ]
     entries = []
     error = None
-    if shutil.which("opencode"):
-        try:
-            entries = [
-                _entry(
-                    model["id"],
-                    model.get("release_date") or "",
-                    model.get("name") or model["id"],
-                    model.get("family"),
-                    source="opencode-provider-api",
-                    availability="available",
-                    provider=model.get("provider"),
-                    provider_model=model.get("provider_model"),
-                    supported_efforts=model.get("supported_efforts") or [],
-                    default_effort=model.get("default_effort"),
-                    cli_version=model.get("cli_version"),
-                    selector_binding=model.get("selector_binding"),
-                    adapter_metadata=model.get("adapter_metadata"),
-                    native_variant_ids=model.get("native_variant_ids"),
-                )
-                for model in provider_models()
-            ]
-            sources.append("opencode-provider-api")
-        except Exception as exc:  # noqa: BLE001
-            error = str(exc)
+    observed_at = datetime.now(timezone.utc).isoformat()
+    try:
+        entries = [
+            _entry(
+                model["id"],
+                model.get("release_date") or "",
+                model.get("name") or model["id"],
+                model.get("family"),
+                source="opencode-provider-api",
+                availability="available",
+                provider=model.get("provider"),
+                provider_model=model.get("provider_model"),
+                supported_efforts=(
+                    model.get("native_option_ids")
+                    if "native_option_ids" in model
+                    else model.get("supported_efforts") or []
+                ),
+                default_effort=model.get("native_default_option_id"),
+                cli_version=model.get("cli_version"),
+                selector_binding=model.get("selector_binding"),
+                adapter_metadata=model.get("adapter_metadata"),
+                native_variant_ids=model.get("native_variant_ids"),
+                native_option_ids=(
+                    model.get("native_option_ids")
+                    if "native_option_ids" in model
+                    else list((model.get("native_variant_ids") or {}).values())
+                ),
+                native_default_option_id=model.get(
+                    "native_default_option_id"
+                ),
+            )
+            for model in provider_models()
+        ]
+        sources.append("opencode-provider-api")
+    except Exception as exc:  # noqa: BLE001
+        error = _bounded_discovery_error(exc)
     harnesses["opencode"] = {
         "families": _families("opencode", entries),
         "models": entries,
+        "authority": "harness-live",
+        "observed_at": observed_at,
+        "stale": False,
         **({"error": error} if error else {}),
     }
     result["harnesses"] = harnesses
     result["sources"] = sources
-    if error:
-        result["partial"] = True
-        result["errors"] = [*(result.get("errors") or []),
-                            f"opencode-provider-api: {error}"]
+    errors = _replace_source_error(result, "opencode-provider-api: ", error)
+    result["partial"] = bool(errors)
+    if errors:
+        result["errors"] = errors
+    else:
+        result.pop("errors", None)
     return result
+
+
+def _with_live_deepseek(payload: dict, client=None) -> dict:
+    """Replace cached DeepSeek routes with its current Host projection."""
+    result = {**payload}
+    harnesses = dict(payload.get("harnesses") or {})
+    sources = [
+        source for source in (payload.get("sources") or [])
+        if source != DEEPSEEK_SOURCE
+    ]
+    observed_at = datetime.now(timezone.utc).isoformat()
+    entries = []
+    error = None
+    try:
+        entries = _from_deepseek_host(client)
+        sources.append(DEEPSEEK_SOURCE)
+    except Exception:  # noqa: BLE001 (official Host errors stay redacted)
+        error = "official DeepSeek Host configuration unavailable"
+    harnesses["deepseek"] = {
+        "families": _families("deepseek", entries),
+        "models": entries,
+        "authority": "harness-live",
+        "observed_at": observed_at,
+        "stale": False,
+        **({"error": error} if error else {}),
+    }
+    result["harnesses"] = harnesses
+    result["sources"] = sources
+    errors = _replace_source_error(result, "deepseek-host-api: ", error)
+    result["partial"] = bool(errors)
+    if errors:
+        result["errors"] = errors
+    else:
+        result.pop("errors", None)
+    return result
+
+
+def _with_live_native(payload: dict, opencode_provider, deepseek_client=None) -> dict:
+    return _with_live_deepseek(
+        _with_live_opencode(payload, opencode_provider),
+        deepseek_client,
+    )
 
 
 def _runtime_statuses(harness_probe, *, include_deepseek: bool) -> dict:
@@ -1212,6 +1349,10 @@ def controlled_route_evidence(
                         selector_binding=model.get("selector_binding"),
                         adapter_metadata=model.get("adapter_metadata"),
                         native_variant_ids=model.get("native_variant_ids"),
+                        native_option_ids=model.get("native_option_ids"),
+                        native_default_option_id=model.get(
+                            "native_default_option_id"
+                        ),
                     )
                     for model in opencode_provider()
                 ]
@@ -1231,6 +1372,7 @@ def controlled_route_evidence(
         and _compatible_route_status(harness, entry, status)
     )
     if route_advertised:
+        assert entry is not None
         fingerprint = _entry_evidence(
             harness, entry, status
         )["source_fingerprint"]
@@ -1332,9 +1474,10 @@ def catalog(refresh: bool = False, fetch=_http_json, env=os.environ,
             )
         )
     if serve_cached:
-        return _served(_with_live_opencode(
+        assert cached is not None
+        return _served(_with_live_native(
             {**cached, "stale": bool(cached.get("stale"))},
-            opencode_provider), con)
+            opencode_provider, deepseek_client), con)
     refresh_started_at = datetime.now(timezone.utc).isoformat()
     try:
         fresh = build(
@@ -1343,7 +1486,7 @@ def catalog(refresh: bool = False, fetch=_http_json, env=os.environ,
     except Exception as e:  # noqa: BLE001
         refresh_completed_at = datetime.now(timezone.utc).isoformat()
         if cached:
-            response = _with_live_opencode(
+            response = _with_live_native(
                 {
                     **cached,
                     "stale": True,
@@ -1352,6 +1495,7 @@ def catalog(refresh: bool = False, fetch=_http_json, env=os.environ,
                     "refresh_completed_at": refresh_completed_at,
                 },
                 opencode_provider,
+                deepseek_client,
             )
             if refresh and con is not None:
                 verification = runtime_verification(
@@ -1376,10 +1520,12 @@ def catalog(refresh: bool = False, fetch=_http_json, env=os.environ,
                     )
                     return _finish_cache_publication(
                         cached_failure, response, con, opencode_provider,
+                        deepseek_client,
                         publication_locked=True,
                     )
             return _finish_cache_publication(
-                cached_failure, response, con, opencode_provider
+                cached_failure, response, con, opencode_provider,
+                deepseek_client,
             )
         fallback = {
             "v": PAYLOAD_VERSION, "fetched_at": None,
@@ -1388,8 +1534,8 @@ def catalog(refresh: bool = False, fetch=_http_json, env=os.environ,
             "refresh_started_at": refresh_started_at,
             "refresh_completed_at": refresh_completed_at,
         }
-        response = _with_live_opencode(
-            fallback, opencode_provider,
+        response = _with_live_native(
+            fallback, opencode_provider, deepseek_client,
         )
         if refresh and con is not None:
             verification = runtime_verification(
@@ -1406,10 +1552,12 @@ def catalog(refresh: bool = False, fetch=_http_json, env=os.environ,
                 )
                 return _finish_cache_publication(
                     fallback, response, con, opencode_provider,
+                    deepseek_client,
                     publication_locked=True,
                 )
         return _finish_cache_publication(
-            fallback, response, con, opencode_provider
+            fallback, response, con, opencode_provider,
+            deepseek_client,
         )
     response = _with_live_opencode(
         {**fresh, "stale": False}, opencode_provider
@@ -1464,6 +1612,7 @@ def catalog(refresh: bool = False, fetch=_http_json, env=os.environ,
                 )
             return _finish_cache_publication(
                 fresh, response, con, opencode_provider,
+                deepseek_client,
                 publication_locked=True,
             )
     else:
@@ -1472,5 +1621,5 @@ def catalog(refresh: bool = False, fetch=_http_json, env=os.environ,
         fresh["partial"] = True
         fresh["errors"] = response.get("errors") or fresh.get("errors") or []
     return _finish_cache_publication(
-        fresh, response, con, opencode_provider
+        fresh, response, con, opencode_provider, deepseek_client,
     )
