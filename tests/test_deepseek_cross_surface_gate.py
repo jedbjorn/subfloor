@@ -361,6 +361,25 @@ def _identity(base: str, token: str, shell_id: int, shortname: str, host_port: i
     }
 
 
+def _assert_sc_mem_which(env: dict[str, str], *, display_name: str) -> None:
+    completed = subprocess.run(
+        [str(ROOT / "sc"), "mem", "which"],
+        cwd=ROOT,
+        env={**os.environ, **env},
+        text=True,
+        capture_output=True,
+        timeout=5,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert f"engine API : {env['SC_API_BASE']}" in completed.stdout
+    assert (
+        f"shell      : {display_name} ({env['SC_SHELL_SHORTNAME']}) "
+        f"#{env['SC_SHELL_ID']}"
+    ) in completed.stdout
+    assert "identity   : resolved by the engine" in completed.stdout
+
+
 def _managed_context(
     worktree: Path, env: dict[str, str], *, conversation_id: str
 ) -> ConversationContext:
@@ -495,6 +514,12 @@ def test_stock_two_shell_cross_surface_refusals_are_side_effect_free(
         }
         alice.update(provider_environment)
         bob.update(provider_environment)
+
+        # The clean-room identities are not test-only request headers.  Drive
+        # the exact public command for each disposable shell so the receipt is
+        # anchored to the same server-side identity resolution operators use.
+        _assert_sc_mem_which(alice, display_name="Alice")
+        _assert_sc_mem_which(bob, display_name="Bob")
 
         # Same identity reuse, an overlapping different identity refusal, then
         # a real handoff and restart.  Each whoami call hits the temporary API.
