@@ -187,7 +187,7 @@
     "linux": "The fixed plugin enters an engine-selected delegated systemd user scope before the engine wrapper forks a gated root. The wrapper creates a non-delegated cgroup-v2 domain under its issuer scope, moves the root before release, seals the exact binding snapshot into inherited FD 198, and remains live in the Host -> issuer -> root lineage until bounded teardown. Pass = the verifier proves descriptor/cgroup identity, live lineage, generations, expiry, protected admission, and empty subtree delegation without an ambient selector.",
     "linux_contributor": {
       "path": ".super-coder/scripts/dsh_execution_provenance.py",
-      "sha256": "8649dae24a09004dddbbe6e670a0412026d3ef86d7eab032a3aca2f13bf7e10b",
+      "sha256": "2e2b94cd94682494a94bfb9b0f6df620ad0d6986eb420a3c7f585eded21fc728",
       "contract": "sc-dsh-linux-cgroup-v2-v2"
     },
     "production_linux_contributor": {

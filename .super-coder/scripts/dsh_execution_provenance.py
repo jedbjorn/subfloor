@@ -39,12 +39,10 @@ DOMAIN_NAME = re.compile(r"[a-f0-9]{32}\.scope")
 DESCRIPTOR_FD = 198
 SHORTNAME = re.compile(r"[A-Z][A-Z0-9_-]{1,31}")
 SHA256_DIGEST_INFO = bytes.fromhex("3031300d060960864801650304020105000420")
-REQUIRED_SEALS = (
-    fcntl.F_SEAL_SEAL
-    | fcntl.F_SEAL_SHRINK
-    | fcntl.F_SEAL_GROW
-    | fcntl.F_SEAL_WRITE
-)
+# Linux UAPI values from <linux/fcntl.h>. Some supported Python builds omit
+# these names even though their kernels implement memfd sealing.
+F_GET_SEALS = getattr(fcntl, "F_GET_SEALS", 1034)
+REQUIRED_SEALS = 0x0001 | 0x0002 | 0x0004 | 0x0008
 BRIDGE_NAMES = {"DSH_SHELL"}
 EARLY_OVERRIDE_NAMES = {"SC_DISPATCH", "SC_CALLER_ROOT", "SC_MEM_AS"}
 AUTHORIZED_CLASS = "dsh_shell_authorized"
@@ -184,7 +182,7 @@ def _unified_membership(text: str) -> str:
 
 
 def _sealed_descriptor(fd: int) -> dict[str, object]:
-    seals = fcntl.fcntl(fd, fcntl.F_GET_SEALS)
+    seals = fcntl.fcntl(fd, F_GET_SEALS)
     if seals & REQUIRED_SEALS != REQUIRED_SEALS:
         raise ValueError("execution descriptor is not immutably sealed")
     payload = os.pread(fd, 65_537, 0)

@@ -27,12 +27,8 @@ EXECUTION_LAUNCHER = ROOT / ".super-coder/scripts/deepseek_execution_domain.py"
 EFFECT_DRIVER = ROOT / "tests/fixtures/deepseek_dsh_effect_driver.py"
 PROTOTYPE_ISSUER_PATH = ROOT / "tests/fixtures/deepseek_dsh_prototype_issuer.py"
 SOURCE_ROOTS = (ROOT / ".super-coder/scripts", ROOT / ".super-coder/api")
-REQUIRED_SEALS = (
-    fcntl.F_SEAL_SEAL
-    | fcntl.F_SEAL_SHRINK
-    | fcntl.F_SEAL_GROW
-    | fcntl.F_SEAL_WRITE
-)
+F_ADD_SEALS = getattr(fcntl, "F_ADD_SEALS", 1033)
+REQUIRED_SEALS = 0x0001 | 0x0002 | 0x0004 | 0x0008
 
 ISSUER_SPEC = importlib.util.spec_from_file_location(
     "deepseek_dsh_prototype_issuer",
@@ -256,7 +252,7 @@ def linux_domain_fixture(kind):
                 if kind == "forged-descriptor":
                     signed["binding_generation"] = 8
                 os.write(descriptor_fd, json.dumps(signed).encode())
-                fcntl.fcntl(descriptor_fd, fcntl.F_ADD_SEALS, REQUIRED_SEALS)
+                fcntl.fcntl(descriptor_fd, F_ADD_SEALS, REQUIRED_SEALS)
         try:
             yield {
                 "proc": proc,
