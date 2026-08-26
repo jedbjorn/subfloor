@@ -661,7 +661,7 @@
     ".super-coder/scripts/job.py": "ce068f6998bd090b983b3052617f4992abf97886525ff9bdc2c6f1ceecf78cf3",
     ".super-coder/scripts/map_finalize.py": "bbd8fd943eee12f2df923084a55fdb091f30a9c48df425de85828723def65a32",
     ".super-coder/scripts/mem.py": "945a6892dc3514e69e3f45d27e9d93f4839987539aed15b3366ee9f05768262a",
-    ".super-coder/scripts/models.py": "af493d1ed1b48f4418ee5f2ea15dbf9ff7060c3dd3387cbe7c84c693cc17f83e",
+    ".super-coder/scripts/models.py": "fe2d0390254632469e9ae625672167e9fcfc42d7637b3681d257d0d55d52dd1e",
     ".super-coder/scripts/pr_cli.py": "4ec130866495bf981240d63176c8008f77f0e9b748012bc229e05b657aff8fb0",
     ".super-coder/scripts/skill.py": "49e853c8fb7783638fbd787f8c92a51d1c8b17bbd6245a63071b93f62e495699",
     "sc": "adcc6d03972eba246c0bdba32c6b5e00313ed36c0f7b0233aa4ee25cac5711ba"
@@ -2264,7 +2264,7 @@
       ]
     },
     ".super-coder/scripts/models.py": {
-      "sha256": "af493d1ed1b48f4418ee5f2ea15dbf9ff7060c3dd3387cbe7c84c693cc17f83e",
+      "sha256": "fe2d0390254632469e9ae625672167e9fcfc42d7637b3681d257d0d55d52dd1e",
       "sc_signals": [
         "SC_API_TOKEN"
       ],

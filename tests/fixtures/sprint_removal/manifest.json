@@ -249,6 +249,7 @@
     ".super-coder/migrations/0190_reseed_successful_sprint_chat_cleanup.sql",
     ".super-coder/migrations/0193_retire_sprint_liveness_acceptance.sql",
     ".super-coder/migrations/0230_deepseek_stock_host_route_binding.sql",
+    ".super-coder/migrations/0236_live_native_conversation_routes.sql",
     ".super-coder/render/compose.py",
     ".super-coder/schema.sql",
     ".super-coder/scripts/activity_readers.py",
