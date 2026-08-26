@@ -550,6 +550,11 @@ def get_flavor_defaults(con) -> dict:
         elif model is None:
             effort_state = "harness-default"
             effective_effort = None
+        elif harness in route_bindings.LIVE_NATIVE_HARNESSES:
+            effort_state = (
+                "controlled" if effort is not None else "harness-default"
+            )
+            effective_effort = effort
         elif effort is not None:
             effort_state = "controlled"
             effective_effort = effort
@@ -699,23 +704,45 @@ def set_flavor_default(con, body) -> tuple[bool, dict | None]:
     if model_supplied:
         raw_model = body.get("model")
         if raw_model is not None and (
-                not isinstance(raw_model, str) or not raw_model.strip()):
+                not isinstance(raw_model, str)
+                or not raw_model.strip()
+                or (
+                    harness in route_bindings.LIVE_NATIVE_HARNESSES
+                    and raw_model != raw_model.strip()
+                )):
             return False, _flavor_default_error(
                 "invalid_model_route",
                 "model must be null for Harness default or an exact "
                 "non-empty available route")
-        model = raw_model.strip() if isinstance(raw_model, str) else None
+        model = (
+            raw_model
+            if harness in route_bindings.LIVE_NATIVE_HARNESSES
+            else raw_model.strip()
+        ) if isinstance(raw_model, str) else None
         if model is None:
             effort = None
     if effort_supplied:
         raw_effort = body.get("effort")
         if raw_effort is not None and (
-                not isinstance(raw_effort, str) or not raw_effort.strip()):
+                not isinstance(raw_effort, str)
+                or not raw_effort.strip()
+                or (
+                    harness in route_bindings.LIVE_NATIVE_HARNESSES
+                    and raw_effort != raw_effort.strip()
+                )):
             return False, _flavor_default_error(
-                "unsupported_thinking_level",
+                (
+                    "unsupported_native_option"
+                    if harness in route_bindings.LIVE_NATIVE_HARNESSES
+                    else "unsupported_thinking_level"
+                ),
                 "Thinking level must be null or a non-blank string",
                 {"harness": harness, "model": model})
-        effort = raw_effort.strip() if isinstance(raw_effort, str) else None
+        effort = (
+            raw_effort
+            if harness in route_bindings.LIVE_NATIVE_HARNESSES
+            else raw_effort.strip()
+        ) if isinstance(raw_effort, str) else None
     if model is None and effort is not None:
         return False, _flavor_default_error(
             "unsupported_thinking_level",
@@ -731,15 +758,31 @@ def set_flavor_default(con, body) -> tuple[bool, dict | None]:
 
     observed_route = None
     route_proof = None
+    live_binding = None
     if model is not None:
-        if harness == "deepseek" and (model_supplied or effort_supplied):
-            model_catalog.ensure_deepseek_route(con, model)
-        row = con.execute(
-            "SELECT * FROM model_routes WHERE harness=? AND selector=?",
-            (harness, model),
-        ).fetchone()
-        observed_route = dict(row) if row else None
-        if harness != "vibe" and (model_supplied or effort_supplied):
+        if (
+            harness in route_bindings.LIVE_NATIVE_HARNESSES
+            and (model_supplied or effort_supplied)
+        ):
+            try:
+                live_binding, _ = route_bindings.resolve_live_native(
+                    harness, model, effort
+                )
+                effort = live_binding["requested_effort"]
+            except route_bindings.RouteResolutionError as exc:
+                return False, _flavor_default_error(
+                    exc.code, exc.message, exc.details)
+        if harness not in route_bindings.LIVE_NATIVE_HARNESSES:
+            row = con.execute(
+                "SELECT * FROM model_routes WHERE harness=? AND selector=?",
+                (harness, model),
+            ).fetchone()
+            observed_route = dict(row) if row else None
+        if (
+            harness not in route_bindings.LIVE_NATIVE_HARNESSES
+            and harness != "vibe"
+            and (model_supplied or effort_supplied)
+        ):
             if observed_route is None or (
                     observed_route.get("availability") != "available"):
                 return False, _flavor_default_error(
@@ -764,7 +807,11 @@ def set_flavor_default(con, body) -> tuple[bool, dict | None]:
                 return False, _flavor_default_error(
                     exc.code, exc.message, exc.details)
     with db_driver.write_transaction(con, "flavor_default.set"):
-        if model is not None and (model_supplied or effort_supplied):
+        if (
+            model is not None
+            and (model_supplied or effort_supplied)
+            and live_binding is None
+        ):
             if harness == "vibe":
                 if not _model_route_available_in_transaction(
                         con, observed_route, harness, model, None):

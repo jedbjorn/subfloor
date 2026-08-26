@@ -86,7 +86,7 @@ class ConversationApiCase(unittest.TestCase):
         }
 
     @classmethod
-    def controlled_evidence(cls, harness: str, _selector: str) -> dict:
+    def controlled_evidence(cls, harness: str, selector: str) -> dict:
         status = cls.runtime_status(harness)
         return {
             "runtime_status": status,
@@ -95,6 +95,11 @@ class ConversationApiCase(unittest.TestCase):
                 "runtime_identity": status["runtime_identity"],
             },
             "source_fingerprint": "f" * 64,
+            **(
+                {"advertised_options_by_model": {selector: ["low", "high"]}}
+                if harness in {"deepseek", "opencode"}
+                else {}
+            ),
         }
 
     @classmethod
@@ -1105,7 +1110,7 @@ class ConversationResourceTest(ConversationApiCase):
             ],
         )
 
-    def test_opencode_harness_default_and_exact_model_bind_v2(self) -> None:
+    def test_opencode_harness_default_and_exact_model_bind_live_native(self) -> None:
         with mock.patch.object(
             conversation_routes.run_mod,
             "flavor_defaults",
@@ -1142,9 +1147,76 @@ class ConversationResourceTest(ConversationApiCase):
         )
         self.assertEqual(status, 201, created)
         self.assertEqual(created["route"]["model"], "openai/gpt-connected")
-        self.assertEqual(created["route"]["effort"], "high")
+        self.assertIsNone(created["route"]["effort"])
+        self.assertEqual(created["route"]["contract_version"], 3)
         self.assertEqual(created["route"]["control_state"], "controlled")
-        self.assertEqual(created["route"]["native_variant_id"], "high")
+        self.assertIsNone(created["route"]["native_variant_id"])
+        self.assertIsNone(created["route"]["native_option_id"])
+
+    def test_live_native_conversation_preserves_exact_option_and_missing_writes_nothing(
+        self,
+    ) -> None:
+        selector = "ollama-cloud/glm-5.2"
+        evidence = self.controlled_evidence("opencode", selector)
+        evidence["advertised_options_by_model"] = {
+            selector: ["MAX.Future", "low"]
+        }
+        with mock.patch.object(
+            conversation_routes.model_catalog,
+            "controlled_route_evidence",
+            return_value=evidence,
+        ):
+            status, _, created = self.request(
+                "POST",
+                "/api/conversations",
+                body={
+                    "shell_id": 1,
+                    "harness": "opencode",
+                    "model": selector,
+                    "effort": "MAX.Future",
+                },
+                key="opencode-exact-native-option",
+            )
+
+        self.assertEqual(status, 201, created)
+        self.assertEqual(created["route"]["contract_version"], 3)
+        self.assertEqual(created["route"]["model"], selector)
+        self.assertEqual(created["route"]["effort"], "MAX.Future")
+        self.assertEqual(created["route"]["native_option_id"], "MAX.Future")
+        with self.connect() as con:
+            before = con.execute(
+                "SELECT COUNT(*) FROM conversations"
+            ).fetchone()[0]
+
+        missing = self.controlled_evidence("opencode", selector)
+        missing["advertised_options_by_model"] = {selector: ["low"]}
+        with mock.patch.object(
+            conversation_routes.model_catalog,
+            "controlled_route_evidence",
+            return_value=missing,
+        ):
+            status, _, refused = self.request(
+                "POST",
+                "/api/conversations",
+                body={
+                    "shell_id": 2,
+                    "harness": "opencode",
+                    "model": selector,
+                    "effort": "MAX.Future",
+                },
+                key="opencode-missing-native-option",
+            )
+
+        self.assertEqual(status, 422, refused)
+        self.assertEqual(refused["error"]["code"], "native_route_unavailable")
+        self.assertEqual(
+            refused["error"]["details"]["current_option_ids"], ["low"]
+        )
+        with self.connect() as con:
+            self.assertEqual(
+                con.execute("SELECT COUNT(*) FROM conversations").fetchone()[0],
+                before,
+            )
 
     def test_kimi_create_binds_typed_harness_default_without_catalogue(
         self,

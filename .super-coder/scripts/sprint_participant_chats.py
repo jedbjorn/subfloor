@@ -500,7 +500,7 @@ def prepare_wake_conversation(
                 "active Sprint route binding is invalid"
             ) from exc
         try:
-            route_bindings.validate_v2_binding(binding)
+            route_bindings.validate_binding(binding)
         except route_bindings.RouteResolutionError as exc:
             raise SprintConversationError(exc.message) from exc
         binding_digest = str(row["binding_digest"])
@@ -515,7 +515,7 @@ def prepare_wake_conversation(
         effort = binding["effective_effort"]
         route_revision = int(row["route_revision"])
         control_state = binding["control_state"]
-        route_contract_version = 2
+        route_contract_version = int(binding["contract_version"])
         prior_native_turn = con.execute(
             "SELECT 1 FROM sprint_participant_conversations link "
             "JOIN conversations conversation "
@@ -584,7 +584,7 @@ def create_prepared_wake_conversation(
     key = (
         f"generation:{route.generation}:participant:{route.participant_id}:"
         f"route:{route.route_revision}:wake:{wake_id}"
-        if route.route_contract_version == 2
+        if route.route_contract_version in {2, 3}
         else f"generation:{route.generation}:wake:{wake_id}"
     )
     request = {
@@ -597,11 +597,11 @@ def create_prepared_wake_conversation(
         "wake_id": wake_id,
         "worktree": route.worktree,
     }
-    if route.route_contract_version == 2:
+    if route.route_contract_version in {2, 3}:
         request.update(
             {
                 "binding_digest": route.binding_digest,
-                "route_contract_version": 2,
+                "route_contract_version": route.route_contract_version,
                 "route_revision": route.route_revision,
             }
         )

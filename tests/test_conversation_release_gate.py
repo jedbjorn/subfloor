@@ -211,7 +211,7 @@ class CrossHarnessReleaseGateTest(unittest.TestCase):
         }
 
     @classmethod
-    def controlled_evidence(cls, harness: str, _selector: str) -> dict:
+    def controlled_evidence(cls, harness: str, selector: str) -> dict:
         status = cls.runtime_status(harness)
         return {
             "runtime_status": status,
@@ -220,6 +220,11 @@ class CrossHarnessReleaseGateTest(unittest.TestCase):
                 "runtime_identity": status["runtime_identity"],
             },
             "source_fingerprint": "f" * 64,
+            **(
+                {"advertised_options_by_model": {selector: ["low", "high"]}}
+                if harness in {"deepseek", "opencode"}
+                else {}
+            ),
         }
 
     @classmethod

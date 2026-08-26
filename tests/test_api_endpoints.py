@@ -815,6 +815,83 @@ class FlavorDefaultsTest(unittest.TestCase):
         row = self._row("planner", "claude")
         self.assertEqual((row["model"], row["effort"]), ("opus-next", "low"))
 
+    def test_live_native_default_save_is_exact_and_missing_option_writes_nothing(
+        self,
+    ) -> None:
+        selector = "ollama-cloud/glm-5.2"
+        evidence = controlled_bundle("opencode", selector, None)
+        evidence["advertised_options_by_model"] = {
+            selector: ["MAX.Future", "low"]
+        }
+        with mock.patch.object(
+            server.model_catalog,
+            "controlled_route_evidence",
+            return_value=evidence,
+        ):
+            ok, err = server.set_flavor_default(
+                self.con,
+                {
+                    "flavor": "planner",
+                    "harness": "opencode",
+                    "model": selector,
+                    "effort": "MAX.Future",
+                },
+            )
+
+        self.assertTrue(ok, err)
+        row = self._row("planner", "opencode")
+        self.assertEqual((row["model"], row["effort"]), (
+            selector, "MAX.Future",
+        ))
+        projection = server.get_flavor_defaults(self.con)["flavors"]["planner"]
+        current = next(item for item in projection if item["harness"] == "opencode")
+        self.assertEqual(current["effort_state"], "controlled")
+        self.assertEqual(current["effective_effort"], "MAX.Future")
+
+        missing = controlled_bundle("opencode", selector, None)
+        missing["advertised_options_by_model"] = {selector: ["low"]}
+        with mock.patch.object(
+            server.model_catalog,
+            "controlled_route_evidence",
+            return_value=missing,
+        ):
+            ok, err = server.set_flavor_default(
+                self.con,
+                {
+                    "flavor": "planner",
+                    "harness": "opencode",
+                    "model": selector,
+                    "effort": "MAX.Future",
+                },
+            )
+
+        self.assertFalse(ok)
+        self.assertEqual(err["code"], "native_route_unavailable")
+        self.assertEqual(err["details"]["current_option_ids"], ["low"])
+        row = self._row("planner", "opencode")
+        self.assertEqual((row["model"], row["effort"]), (
+            selector, "MAX.Future",
+        ))
+
+        evidence["advertised_options_by_model"] = {selector: []}
+        with mock.patch.object(
+            server.model_catalog,
+            "controlled_route_evidence",
+            return_value=evidence,
+        ):
+            ok, err = server.set_flavor_default(
+                self.con,
+                {
+                    "flavor": "planner",
+                    "harness": "opencode",
+                    "model": selector,
+                    "effort": None,
+                },
+            )
+        self.assertTrue(ok, err)
+        row = self._row("planner", "opencode")
+        self.assertEqual((row["model"], row["effort"]), (selector, None))
+
     def test_model_default_persists_for_empty_effort_list_route(self) -> None:
         # Spec #160: 'default' is admitted and persisted even when the route
         # advertises no named levels; re-saving without an effort keeps it,

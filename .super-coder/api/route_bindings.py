@@ -879,9 +879,9 @@ def live_native_v3_binding(
         raise _v3_binding_error(
             "live-native bindings require OpenCode or DeepSeek"
         )
-    normalized_model = _normalize_model(model)
-    if normalized_model is None:
+    if not _exact_nonblank(model):
         raise _v3_binding_error("requested_model must be exact and non-blank")
+    normalized_model = model
     if not _exact_nonblank(provider_model):
         raise _v3_binding_error("provider_model must be exact and non-blank")
     if native_option_id is not None and not _exact_nonblank(native_option_id):
@@ -912,6 +912,52 @@ def live_native_v3_binding(
         raise AssertionError("live-native route binding key order drifted")
     validate_v3_binding(binding)
     return binding, digest_json(binding)
+
+
+def resolve_live_native(
+    harness: str,
+    model: str,
+    native_option_id: str | None,
+    *,
+    route_proof: _ControlledRouteProof | None = None,
+) -> tuple[dict, str]:
+    """Resolve one exact live-native selection against its executing harness."""
+    harness = normalize_harness(harness)
+    if not _exact_nonblank(model):
+        raise RouteResolutionError(
+            "native_route_unavailable",
+            "Live harness route ID must be exact and non-blank",
+            {"harness": harness, "model": model},
+        )
+    binding, binding_digest = live_native_v3_binding(
+        harness, model, model.split("/", 1)[-1], native_option_id
+    )
+    proof = route_proof or _probe_controlled_route(harness, model)
+    if (
+        not isinstance(proof, _ControlledRouteProof)
+        or proof._issuer is not _CONTROLLED_PROOF_ISSUER
+        or proof._harness != harness
+        or proof._selector != model
+    ):
+        raise RouteResolutionError(
+            "native_route_unavailable",
+            "Live harness route projection does not match the requested route",
+            {"harness": harness, "model": model},
+        )
+    _require_runtime(
+        harness,
+        model,
+        proof._runtime_status,
+        {
+            "runtime": proof._runtime,
+            "runtime_identity": proof._runtime_identity,
+        },
+        error_code="native_route_unavailable",
+    )
+    require_advertised_live_native(
+        binding, proof._advertised_options_by_model
+    )
+    return binding, binding_digest
 
 
 def _age_hours(value: str, now: datetime) -> float:
@@ -1509,7 +1555,10 @@ def verify_stored_v2_before_first_turn(
         and binding.get("harness") in LIVE_NATIVE_HARNESSES
         and binding.get("control_state") == "controlled"
     ):
-        validate_legacy_v2_live_native(binding)
+        if binding.get("contract_version") == V2_CONTRACT_VERSION:
+            validate_legacy_v2_live_native(binding)
+        else:
+            validate_v3_binding(binding)
     else:
         validate_v2_binding(binding)
     harness = binding["harness"]

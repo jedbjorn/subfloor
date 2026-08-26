@@ -116,6 +116,8 @@ def headless_effort_env(adapter: dict, effort: "str | None") -> dict[str, str]:
 
 def default_headless_effort(adapter: dict) -> "str | None":
     """Use high only when the adapter has an effort transport."""
+    if adapter.get("harness") in route_transport.route_bindings.LIVE_NATIVE_HARNESSES:
+        return None
     return "high" if ((adapter.get("headless") or {}).get("effort")) else None
 
 
@@ -172,8 +174,8 @@ def resolve_bound_headless_route(
     binding: dict,
     binding_digest: str,
 ) -> ResolvedHeadlessRoute:
-    """Consume one already-resolved v2 binding without applying defaults."""
-    route_transport.route_bindings.validate_v2_binding(binding)
+    """Consume one already-resolved binding without applying defaults."""
+    route_transport.route_bindings.validate_binding(binding)
     if route_transport.route_bindings.digest_json(binding) != binding_digest:
         raise route_transport.route_bindings.RouteResolutionError(
             "thinking_evidence_missing",
@@ -186,7 +188,7 @@ def resolve_bound_headless_route(
         or binding["requested_effort"] != effort
     ):
         raise ValueError(
-            "version-two route binding disagrees with the requested "
+            "versioned route binding disagrees with the requested "
             "harness, model, or effort"
         )
     return ResolvedHeadlessRoute(

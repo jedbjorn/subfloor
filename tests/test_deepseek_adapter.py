@@ -540,7 +540,7 @@ def test_unary_client_uses_exact_official_envelope(monkeypatch) -> None:
     }
 
 
-def test_stale_route_fails_before_session_mutation(tmp_path: Path) -> None:
+def test_stale_v2_metadata_does_not_block_current_exact_route(tmp_path: Path) -> None:
     bound = FakeHost()
     ctx = context(tmp_path, bound)
     changed = configuration()
@@ -548,9 +548,29 @@ def test_stale_route_fails_before_session_mutation(tmp_path: Path) -> None:
         "acme-dynamic"
     ]["baseURL"] = "https://changed.acme.test/v1"
     live = FakeHost(config=changed)
+    route = DeepSeekAdapter._route(live, ctx)
+
+    assert route.selector == "acme-dynamic/model-7"
+    assert route.endpoint_identity == "https://changed.acme.test/v1"
+    assert "session.create" not in [method for method, _ in live.calls]
+
+
+def test_missing_current_native_option_refuses_before_session_mutation(
+    tmp_path: Path,
+) -> None:
+    bound = FakeHost()
+    ctx = context(tmp_path, bound)
+    changed = configuration()
+    changed["llm.models"]["groups"][0]["models"][0]["reasoning"] = {
+        "efforts": [{"id": "low"}],
+        "defaultEffort": "low",
+    }
+    live = FakeHost(config=changed)
+
     with pytest.raises(AdapterError) as refused:
-        DeepSeekAdapter(client_factory=lambda: live).start(ctx, "hello")
-    assert refused.value.code == "HARNESS_ROUTE_STALE"
+        DeepSeekAdapter._route(live, ctx)
+
+    assert refused.value.code == "native_route_unavailable"
     assert "session.create" not in [method for method, _ in live.calls]
 
 

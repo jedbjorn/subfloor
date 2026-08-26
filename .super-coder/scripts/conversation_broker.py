@@ -320,7 +320,10 @@ class BrokerStore:
         contract_version = int(row["route_contract_version"])
         if contract_version == 1:
             return contract_version, None, None
-        if contract_version != route_transport.route_bindings.CONTRACT_VERSION:
+        if contract_version not in {
+            route_transport.route_bindings.V2_CONTRACT_VERSION,
+            route_transport.route_bindings.LIVE_NATIVE_CONTRACT_VERSION,
+        }:
             raise BrokerInvariantError(
                 "CONVERSATION_ROUTE_INVALID",
                 f"unsupported conversation route contract: {contract_version}",
@@ -330,22 +333,22 @@ class BrokerStore:
         except (TypeError, json.JSONDecodeError) as exc:
             raise BrokerInvariantError(
                 "CONVERSATION_ROUTE_INVALID",
-                "version-two conversation route binding is not valid JSON",
+                "versioned conversation route binding is not valid JSON",
             ) from exc
         if not isinstance(binding, dict):
             raise BrokerInvariantError(
                 "CONVERSATION_ROUTE_INVALID",
-                "version-two conversation route binding must be an object",
+                "versioned conversation route binding must be an object",
             )
         try:
-            route_transport.route_bindings.validate_v2_binding(binding)
+            route_transport.route_bindings.validate_binding(binding)
         except (
             TypeError,
             route_transport.route_bindings.RouteResolutionError,
         ) as exc:
             raise BrokerInvariantError(
                 "CONVERSATION_ROUTE_INVALID",
-                "version-two conversation route binding is invalid",
+                "versioned conversation route binding is invalid",
             ) from exc
         return (
             contract_version,

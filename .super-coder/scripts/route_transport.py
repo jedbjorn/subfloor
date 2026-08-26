@@ -1,4 +1,4 @@
-"""Apply immutable v2 route bindings without re-resolving their meaning."""
+"""Apply immutable route bindings without reinterpreting their identity."""
 from __future__ import annotations
 
 import sys
@@ -40,7 +40,7 @@ def project(
     if interface not in {"conversation", "headless", "interactive"}:
         raise ValueError(f"unsupported route transport interface: {interface}")
     value = dict(binding)
-    route_bindings.validate_v2_binding(value)
+    route_bindings.validate_binding(value)
     if route_bindings.digest_json(value) != binding_digest:
         raise route_bindings.RouteResolutionError(
             "thinking_evidence_missing",
@@ -63,7 +63,13 @@ def project(
         return TransportProjection(harness=harness, model=model, effort=None)
 
     effort = value["effective_effort"]
-    model_default = effort == route_bindings.DEFAULT_EFFORT
+    live_native = (
+        value["contract_version"]
+        == route_bindings.LIVE_NATIVE_CONTRACT_VERSION
+    )
+    model_default = (
+        effort is None if live_native else effort == route_bindings.DEFAULT_EFFORT
+    )
     if harness == "claude":
         return TransportProjection(
             harness, model, effort,
@@ -95,16 +101,31 @@ def project(
                 "HARNESS_CONFIG_INVALID",
                 "OpenCode controlled routes require an exact worktree",
             )
-        agent = opencode_config.ensure_route_agent(
-            worktree, value, binding_digest
-        )
+        agent = opencode_config.route_agent_name(binding_digest)
+        if interface != "conversation" and not live_native:
+            agent = opencode_config.ensure_route_agent(
+                worktree, value, binding_digest
+            )
         if interface == "interactive":
             arguments = ("--model", model, "--agent", agent)
         elif interface == "headless":
-            arguments = (
-                ("--agent", agent) if model_default
-                else ("--agent", agent, "--variant", value["native_variant_id"])
-            )
+            if live_native:
+                arguments = (
+                    ()
+                    if model_default
+                    else ("--variant", value["native_option_id"])
+                )
+            else:
+                arguments = (
+                    ("--agent", agent)
+                    if model_default
+                    else (
+                        "--agent",
+                        agent,
+                        "--variant",
+                        value["native_variant_id"],
+                    )
+                )
         else:
             arguments = ()
         return TransportProjection(
@@ -113,10 +134,23 @@ def project(
             effort,
             argument_tail=arguments,
             route_agent=agent,
-            native_variant_id=value["native_variant_id"],
+            native_variant_id=(
+                value["native_option_id"]
+                if live_native else value["native_variant_id"]
+            ),
         )
     if harness == "deepseek":
-        return TransportProjection(harness, model, effort)
+        return TransportProjection(
+            harness,
+            model,
+            effort,
+            argument_tail=(
+                () if model_default else ("--effort", effort)
+            ),
+            native_variant_id=(
+                value["native_option_id"] if live_native else None
+            ),
+        )
     raise AssertionError(f"no controlled transport for {harness}")
 
 
@@ -126,7 +160,7 @@ def context_projection(
     *,
     interface: str = "conversation",
 ) -> TransportProjection | None:
-    """Project a v2 context or return None only for an explicit legacy row."""
+    """Project a bound context or return None only for an explicit legacy row."""
     binding = getattr(context, "route_binding", None)
     digest = getattr(context, "binding_digest", None)
     if binding is None and digest is None:
