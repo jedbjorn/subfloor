@@ -2,6 +2,7 @@
 """Managed OpenCode server lifecycle and connected-provider projection."""
 from __future__ import annotations
 
+import copy
 import json
 import os
 import sys
@@ -299,7 +300,7 @@ class OpenCodeServerTest(unittest.TestCase):
         self.assertNotEqual(got[0]["id"], "openai/gpt-retired")
         self.assertNotEqual(got[0]["provider"], "not-connected")
 
-    def test_connected_models_admits_only_canonical_safe_openai_variants(self):
+    def test_connected_models_preserves_exact_native_variants_in_source_order(self):
         got = opencode.connected_models({
             "_sc_cli_version": "1.18.9",
             "connected": ["openai"],
@@ -317,6 +318,9 @@ class OpenCodeServerTest(unittest.TestCase):
                                 "reasoningSummary": "detailed",
                             },
                             "max": {"reasoningEffort": "max"},
+                            "Extreme.Mode": {
+                                "futureProviderField": {"mode": "EXACT"},
+                            },
                         },
                     }
                 },
@@ -325,23 +329,56 @@ class OpenCodeServerTest(unittest.TestCase):
 
         self.assertEqual(len(got), 1)
         model = got[0]
-        self.assertEqual(model["supported_efforts"], ["low", "high", "max"])
-        self.assertEqual(model["default_effort"], "high")
+        self.assertEqual(
+            model["supported_efforts"],
+            ["low", "high", "max", "Extreme.Mode"],
+        )
+        self.assertEqual(model["native_option_ids"], model["supported_efforts"])
+        self.assertIsNone(model["default_effort"])
+        self.assertIsNone(model["native_default_option_id"])
         self.assertEqual(model["native_variant_ids"], {
             "low": "low", "high": "high", "max": "max",
+            "Extreme.Mode": "Extreme.Mode",
         })
         self.assertEqual(
             model["adapter_metadata"]["variant_options_by_effort"],
             {
                 "low": {"reasoningEffort": "low"},
                 "high": {
+                    "disabled": False,
                     "reasoningEffort": "high",
                     "reasoningSummary": "detailed",
                 },
                 "max": {"reasoningEffort": "max"},
+                "Extreme.Mode": {
+                    "futureProviderField": {"mode": "EXACT"},
+                },
             },
         )
         self.assertEqual(model["cli_version"], "1.18.9")
+
+    def test_connected_models_rejects_malformed_or_oversized_native_options(self):
+        base = {
+            "connected": ["openai"],
+            "all": [{
+                "id": "openai",
+                "models": {"gpt-live": {"variants": {}}},
+            }],
+        }
+        malformed = copy.deepcopy(base)
+        malformed["all"][0]["models"]["gpt-live"]["variants"] = ["high"]
+        with self.assertRaisesRegex(
+            opencode.AdapterError, "variants must be an object"
+        ):
+            opencode.connected_models(malformed)
+
+        oversized = copy.deepcopy(base)
+        oversized["all"][0]["models"]["gpt-live"]["variants"] = {
+            f"option-{index}": {"future": index}
+            for index in range(opencode.MAX_NATIVE_OPTIONS + 1)
+        }
+        with self.assertRaisesRegex(opencode.AdapterError, "too many native options"):
+            opencode.connected_models(oversized)
 
     def test_connected_models_resolves_family_from_model_api_npm(self):
         # opencode 1.18.x /provider projection carries the SDK package at

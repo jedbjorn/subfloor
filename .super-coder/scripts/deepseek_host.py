@@ -13,11 +13,17 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Iterator, Mapping, Protocol
 
+import ports
+
 ENGINE = Path(__file__).resolve().parents[1]
 ADAPTER = ENGINE / "adapters" / "deepseek" / "adapter.json"
 TRANSPORT_CONTRACT = "deepseek-stock-host-v1"
 MAX_RESPONSE_BYTES = 4 * 1024 * 1024
 MAX_MODELS = 2_000
+MAX_PROVIDERS = 256
+MAX_MODEL_GROUPS = 256
+MAX_SETTINGS_NAMESPACES = 512
+MAX_REASONING_OPTIONS = 256
 MAX_IDENTIFIER_CHARS = 512
 SAFE_CREDENTIAL_REF = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,255}$")
 SAFE_CREDENTIAL_SOURCE = re.compile(r"^[a-z][a-z0-9-]{0,63}$")
@@ -119,6 +125,14 @@ def checked_host_url(value: str) -> str:
 
 def configured_host_url(env: Mapping[str, str] = os.environ) -> str:
     value = env.get("SC_DEEPSEEK_HOST_PORT")
+    if value is None:
+        try:
+            value = str(ports.resolve(persist=False)["deepseek_host_port"])
+        except (KeyError, OSError, RuntimeError, TypeError, ValueError) as exc:
+            raise DeepSeekHostError(
+                "HARNESS_HOST_UNAVAILABLE",
+                "managed DeepSeek Host port is unavailable",
+            ) from exc
     if not isinstance(value, str) or re.fullmatch(r"[1-9][0-9]{0,4}", value) is None:
         raise DeepSeekHostError(
             "HARNESS_HOST_UNAVAILABLE",
@@ -413,6 +427,15 @@ def configured_routes(
         raise DeepSeekHostError(
             "HARNESS_HOST_RESPONSE_INVALID", "configuration projection lists are malformed"
         )
+    if (
+        len(provider_rows) > MAX_PROVIDERS
+        or len(model_groups) > MAX_MODEL_GROUPS
+        or len(namespaces) > MAX_SETTINGS_NAMESPACES
+    ):
+        raise DeepSeekHostError(
+            "HARNESS_HOST_RESPONSE_INVALID",
+            "configuration projection exceeds safety limits",
+        )
     provider_map: dict[str, Mapping[str, Any]] = {}
     for row in provider_rows:
         if not isinstance(row, Mapping) or row.get("active") is not True:
@@ -472,6 +495,7 @@ def configured_routes(
             credential_map.update(described_credentials["credentials"])
     routes: list[ConfiguredRoute] = []
     seen: set[str] = set()
+    model_rows_seen = 0
     for group in model_groups:
         if not isinstance(group, Mapping):
             raise DeepSeekHostError(
@@ -481,17 +505,22 @@ def configured_routes(
         if provider not in provider_map:
             continue
         models = group.get("models")
-        if not isinstance(models, list) or len(models) > MAX_MODELS:
+        if not isinstance(models, list):
             raise DeepSeekHostError(
                 "HARNESS_HOST_RESPONSE_INVALID", f"provider {provider} model list is invalid"
             )
-        profile = profiles.get(provider)
-        if profile is None:
+        model_rows_seen += len(models)
+        if model_rows_seen > MAX_MODELS:
+            raise DeepSeekHostError(
+                "HARNESS_HOST_RESPONSE_INVALID", f"provider {provider} model list is invalid"
+            )
+        route_profile = profiles.get(provider)
+        if route_profile is None:
             raise DeepSeekHostError(
                 "HARNESS_HOST_RESPONSE_INVALID",
                 f"provider {provider} has no usable settings profile",
             )
-        _profile, endpoint, credential_ref = profile
+        _profile, endpoint, credential_ref = route_profile
         status = None
         if credential_ref is not None:
             status = _credential_status(credential_map.get(credential_ref))
@@ -514,15 +543,38 @@ def configured_routes(
             reasoning = model_row.get("reasoning")
             efforts: list[str] = []
             default_effort = None
-            if isinstance(reasoning, Mapping):
-                raw_efforts = reasoning.get("efforts")
-                if isinstance(raw_efforts, list):
-                    for effort_row in raw_efforts:
-                        if not isinstance(effort_row, Mapping):
-                            continue
-                        effort = effort_row.get("id")
-                        if isinstance(effort, str) and effort and effort == effort.strip().lower():
-                            efforts.append(effort)
+            if reasoning is not None:
+                if not isinstance(reasoning, Mapping):
+                    raise DeepSeekHostError(
+                        "HARNESS_HOST_RESPONSE_INVALID",
+                        "model reasoning projection is malformed",
+                    )
+                raw_efforts = reasoning.get("efforts", [])
+                if (
+                    not isinstance(raw_efforts, list)
+                    or len(raw_efforts) > MAX_REASONING_OPTIONS
+                ):
+                    raise DeepSeekHostError(
+                        "HARNESS_HOST_RESPONSE_INVALID",
+                        "model reasoning options exceed safety limits",
+                    )
+                seen_efforts: set[str] = set()
+                for effort_row in raw_efforts:
+                    if not isinstance(effort_row, Mapping):
+                        raise DeepSeekHostError(
+                            "HARNESS_HOST_RESPONSE_INVALID",
+                            "model reasoning option is malformed",
+                        )
+                    effort = _exact_string(
+                        effort_row.get("id"), "reasoning option id"
+                    )
+                    if effort in seen_efforts:
+                        raise DeepSeekHostError(
+                            "HARNESS_HOST_RESPONSE_INVALID",
+                            "duplicate exact reasoning option id",
+                        )
+                    seen_efforts.add(effort)
+                    efforts.append(effort)
                 default = reasoning.get("defaultEffort")
                 if default is not None:
                     if not isinstance(default, str) or default not in efforts:
@@ -544,11 +596,13 @@ def configured_routes(
             digest = __import__("hashlib").sha256(
                 json.dumps(identity, sort_keys=True, separators=(",", ":")).encode()
             ).hexdigest()
+            raw_name = model_row.get("name")
+            route_name = raw_name if isinstance(raw_name, str) else model
             routes.append(ConfiguredRoute(
                 selector=route_selector,
                 provider=provider,
                 model=model,
-                name=(model_row.get("name") if isinstance(model_row.get("name"), str) else model),
+                name=route_name,
                 endpoint_identity=endpoint,
                 credential_ref=credential_ref,
                 credential_status=status,

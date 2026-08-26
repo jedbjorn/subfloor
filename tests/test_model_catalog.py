@@ -75,6 +75,34 @@ def ids(harness_block):
     return [e["id"] for e in harness_block["models"]]
 
 
+class CatalogueHost:
+    def __init__(self, models):
+        self.models = models
+        self.calls = []
+
+    def call(self, method, payload):
+        self.calls.append((method, payload))
+        return {
+            "host.describe": {"version": "0.0.1"},
+            "llm.providers": {"providers": [{
+                "provider": "ollama-cloud",
+                "active": True,
+                "settingsNs": "llm",
+                "settingsPath": ["providers", "ollama-cloud"],
+            }]},
+            "llm.models": {"groups": [{
+                "id": "ollama-cloud",
+                "models": self.models,
+            }]},
+            "settings.describe": {"namespaces": [{
+                "ns": "llm",
+                "value": {"providers": {"ollama-cloud": {
+                    "baseURL": "https://ollama.com/v1",
+                }}},
+            }]},
+        }[method]
+
+
 def deepseek_wire_proof(provider, model, options_by_effort, env=None):
     del env
     manifest = deepseek_runtime.load_runtime_manifest()
@@ -1287,14 +1315,22 @@ class BuildTest(NoCLI):
         ))
         self.assertIn("opencode-provider-api", got["sources"])
 
-    def test_opencode_without_local_runtime_exposes_no_available_routes(self):
+    def test_opencode_live_failure_exposes_no_cached_available_routes(self):
         got = mc._with_live_opencode(
             mc.build(fetch=fetch_ok, env={}, run=None),
-            lambda: self.fail("provider API must not run without opencode"),
+            mock.Mock(side_effect=RuntimeError("managed seat unavailable")),
         )
         self.assertEqual(ids(got["harnesses"]["opencode"]), [])
+        self.assertEqual(
+            got["harnesses"]["opencode"]["error"],
+            "managed seat unavailable",
+        )
+        self.assertNotIn(
+            "ollama-cloud/deepseek-v4-pro",
+            json.dumps(got["harnesses"]["opencode"]),
+        )
 
-    def test_opencode_live_overlay_preserves_admitted_variant_evidence(self):
+    def test_opencode_live_overlay_preserves_exact_native_variant_projection(self):
         connected = mc.opencode_connected_models({
             "_sc_cli_version": "1.18.9",
             "connected": ["ollama-cloud"],
@@ -1318,7 +1354,9 @@ class BuildTest(NoCLI):
         model = got["harnesses"]["opencode"]["models"][0]
         self.assertEqual(model["id"], "ollama-cloud/deepseek-v4-pro")
         self.assertEqual(model["supported_efforts"], ["high", "max"])
-        self.assertEqual(model["default_effort"], "high")
+        self.assertEqual(model["native_option_ids"], ["high", "max"])
+        self.assertIsNone(model["default_effort"])
+        self.assertNotIn("native_default_option_id", model)
         self.assertEqual(
             model["native_variant_ids"], {"high": "high", "max": "max"}
         )
@@ -1328,6 +1366,95 @@ class BuildTest(NoCLI):
                 "high": {"reasoningEffort": "high"},
                 "max": {"reasoningEffort": "max"},
             },
+        )
+
+    def test_live_catalogue_projects_five_exact_models_without_provider_request(self):
+        model_ids = [
+            "deepseek-v4-flash",
+            "glm-5.2",
+            "gpt-oss:120b",
+            "qwen3.5:397b",
+            "gemma4:31b",
+        ]
+        open_models = mc.opencode_connected_models({
+            "_sc_cli_version": "1.18.23",
+            "connected": ["ollama-cloud"],
+            "all": [{
+                "id": "ollama-cloud",
+                "models": {
+                    model_id: {
+                        "variants": {
+                            "MAX.Future": {
+                                "reasoningEffort": "provider-exact",
+                                "futureField": {"kept": True},
+                            },
+                            "low": {"reasoningEffort": "low"},
+                        },
+                    }
+                    for model_id in model_ids
+                },
+            }],
+        })
+        host = CatalogueHost([
+            {
+                "id": model_id,
+                "reasoning": {
+                    "efforts": [{"id": "MAX.Future"}, {"id": "low"}],
+                    "defaultEffort": "MAX.Future",
+                },
+            }
+            for model_id in model_ids
+        ])
+        fetch_calls = []
+
+        def no_provider_request(url, headers=None):
+            fetch_calls.append((url, headers))
+            raise OSError("credential-free catalogue fixture")
+
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(
+            mc, "CACHE", Path(tmp) / "model_catalog.json"
+        ):
+            got = mc.catalog(
+                refresh=True,
+                fetch=no_provider_request,
+                env={},
+                run=None,
+                opencode_provider=lambda: open_models,
+                deepseek_client=host,
+            )
+
+        expected = [f"ollama-cloud/{model_id}" for model_id in model_ids]
+        for harness in ("opencode", "deepseek"):
+            block = got["harnesses"][harness]
+            self.assertEqual(block["authority"], "harness-live")
+            self.assertFalse(block["stale"])
+            observed_at = datetime.fromisoformat(block["observed_at"])
+            self.assertEqual(observed_at.tzinfo, timezone.utc)
+            self.assertEqual(ids(block), expected)
+            self.assertEqual(
+                [model["native_option_ids"] for model in block["models"]],
+                [["MAX.Future", "low"]] * 5,
+            )
+            self.assertTrue(all(
+                "adapter_metadata" not in model
+                and "selector_binding" not in model
+                for model in block["models"]
+            ))
+            self.assertNotIn("futureField", json.dumps(block))
+            self.assertNotIn("endpoint_identity", json.dumps(block))
+        self.assertNotIn(
+            "native_default_option_id",
+            got["harnesses"]["opencode"]["models"][0],
+        )
+        self.assertEqual(
+            got["harnesses"]["deepseek"]["models"][0]
+            ["native_default_option_id"],
+            "MAX.Future",
+        )
+        self.assertEqual(fetch_calls, [(mc.MODELS_DEV_URL, None)])
+        self.assertNotIn(
+            "credentials.describe",
+            [method for method, _payload in host.calls],
         )
 
     def test_all_sources_down_raises(self):
@@ -2022,7 +2149,7 @@ class RuntimeVerificationTest(unittest.TestCase):
             cached = json.loads(mc.CACHE.read_text())
 
         self.assertTrue(got["stale"])
-        self.assertEqual(got["sources"], ["static"])
+        self.assertEqual(got["sources"], ["static", "opencode-provider-api"])
         self.assertEqual(got["verification"]["summary"], {
             "harnesses_checked": 4,
             "harnesses_ready": 3,
@@ -2575,7 +2702,116 @@ class CatalogCacheTest(NoCLI):
         self.assertTrue(mc.CACHE.exists())
         second = mc.catalog(fetch=fetch_down, env={}, run=None)  # would fail live
         self.assertFalse(second["stale"], "fresh cache must serve without a fetch")
-        self.assertEqual(second["harnesses"], first["harnesses"])
+        for harness in ("claude", "codex", "kimi", "vibe"):
+            self.assertEqual(
+                second["harnesses"].get(harness),
+                first["harnesses"].get(harness),
+            )
+        for harness in ("opencode", "deepseek"):
+            self.assertEqual(
+                second["harnesses"][harness]["models"],
+                first["harnesses"][harness]["models"],
+            )
+            self.assertFalse(second["harnesses"][harness]["stale"])
+            self.assertNotEqual(
+                second["harnesses"][harness]["observed_at"],
+                first["harnesses"][harness]["observed_at"],
+            )
+
+    def test_global_stale_cache_cannot_replace_successful_live_blocks(self):
+        old_host = CatalogueHost([{
+            "id": "old-model",
+            "reasoning": {"efforts": [{"id": "old-option"}]},
+        }])
+        mc.catalog(
+            fetch=fetch_ok,
+            env={},
+            run=None,
+            opencode_provider=lambda: [{
+                "id": "old-provider/old-model",
+                "provider": "old-provider",
+                "provider_model": "old-model",
+                "native_option_ids": ["old-option"],
+            }],
+            deepseek_client=old_host,
+        )
+        cached = json.loads(mc.CACHE.read_text())
+        cached["stale"] = True
+        mc.CACHE.write_text(json.dumps(cached))
+
+        current_host = CatalogueHost([{
+            "id": "glm-5.2",
+            "reasoning": {
+                "efforts": [{"id": "MAX.Future"}, {"id": "low"}],
+                "defaultEffort": "MAX.Future",
+            },
+        }])
+        got = mc.catalog(
+            fetch=fetch_down,
+            env={},
+            run=None,
+            opencode_provider=lambda: [{
+                "id": "ollama-cloud/glm-5.2",
+                "provider": "ollama-cloud",
+                "provider_model": "glm-5.2",
+                "native_option_ids": ["MAX.Future", "low"],
+            }],
+            deepseek_client=current_host,
+        )
+
+        self.assertTrue(got["stale"])
+        self.assertEqual(
+            ids(got["harnesses"]["opencode"]),
+            ["ollama-cloud/glm-5.2"],
+        )
+        self.assertEqual(
+            ids(got["harnesses"]["deepseek"]),
+            ["ollama-cloud/glm-5.2"],
+        )
+        for harness in ("opencode", "deepseek"):
+            block = got["harnesses"][harness]
+            self.assertFalse(block["stale"])
+            self.assertEqual(
+                block["models"][0]["native_option_ids"],
+                ["MAX.Future", "low"],
+            )
+            self.assertNotIn("old-model", json.dumps(block))
+
+    def test_malformed_opencode_projection_fails_only_its_live_block(self):
+        host = CatalogueHost([{
+            "id": "glm-5.2",
+            "reasoning": {"efforts": []},
+        }])
+
+        def malformed_opencode():
+            return mc.opencode_connected_models({
+                "connected": ["ollama-cloud"],
+                "all": [{
+                    "id": "ollama-cloud",
+                    "models": {"glm-5.2": {"variants": ["max"]}},
+                }],
+            })
+
+        got = mc.catalog(
+            fetch=fetch_ok,
+            env={},
+            run=None,
+            opencode_provider=malformed_opencode,
+            deepseek_client=host,
+        )
+
+        self.assertTrue(got["partial"])
+        self.assertEqual(got["harnesses"]["opencode"]["models"], [])
+        self.assertIn(
+            "variants must be an object",
+            got["harnesses"]["opencode"]["error"],
+        )
+        self.assertEqual(
+            ids(got["harnesses"]["deepseek"]),
+            ["ollama-cloud/glm-5.2"],
+        )
+        self.assertFalse(got["harnesses"]["deepseek"]["stale"])
+        self.assertIn("claude-opus-4-8", ids(got["harnesses"]["claude"]))
 
     def test_fresh_cache_still_refreshes_connected_opencode_models(self):
         provider_models = mock.Mock(side_effect=[
@@ -2628,7 +2864,9 @@ class CatalogCacheTest(NoCLI):
                 env={},
                 run=None,
                 opencode_provider=mock.Mock(
-                    side_effect=RuntimeError("sidecar unavailable")
+                    side_effect=RuntimeError(
+                        "token=top-secret sidecar unavailable"
+                    )
                 ),
             )
             cached = mc.catalog(
@@ -2636,7 +2874,9 @@ class CatalogCacheTest(NoCLI):
                 env={},
                 run=None,
                 opencode_provider=mock.Mock(
-                    side_effect=RuntimeError("sidecar still unavailable")
+                    side_effect=RuntimeError(
+                        "password=hunter2 sidecar still unavailable"
+                    )
                 ),
             )
 
@@ -2646,15 +2886,17 @@ class CatalogCacheTest(NoCLI):
         self.assertEqual(got["harnesses"]["opencode"]["models"], [])
         self.assertEqual(
             got["harnesses"]["opencode"]["error"],
-            "sidecar unavailable",
+            "token=[REDACTED] sidecar unavailable",
         )
         self.assertTrue(cached["partial"])
         self.assertFalse(cached["stale"])
         self.assertIn("claude-opus-4-8", ids(cached["harnesses"]["claude"]))
         self.assertEqual(
             cached["harnesses"]["opencode"]["error"],
-            "sidecar still unavailable",
+            "password=[REDACTED] sidecar still unavailable",
         )
+        self.assertNotIn("top-secret", json.dumps(got))
+        self.assertNotIn("hunter2", json.dumps(cached))
 
     def test_stale_cache_served_when_refresh_fails(self):
         mc.catalog(fetch=fetch_ok, env={}, run=None)

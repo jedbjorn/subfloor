@@ -292,6 +292,58 @@ def test_configuration_is_dynamic_redacted_and_official_only() -> None:
     assert "secret" not in repr(route).lower()
 
 
+def test_configuration_preserves_exact_reasoning_ids_order_and_default() -> None:
+    config = configuration()
+    config["llm.models"]["groups"][0]["models"][0]["reasoning"] = {
+        "efforts": [
+            {"id": "MAX.Future"},
+            {"id": "low"},
+            {"id": "Provider/Exact"},
+        ],
+        "defaultEffort": "MAX.Future",
+    }
+
+    route = deepseek_host.configured_routes(FakeHost(config=config))[0]
+
+    assert route.reasoning_efforts == (
+        "MAX.Future", "low", "Provider/Exact",
+    )
+    assert route.default_effort == "MAX.Future"
+
+
+def test_configuration_allows_a_model_with_no_reasoning_options() -> None:
+    config = configuration()
+    del config["llm.models"]["groups"][0]["models"][0]["reasoning"]
+
+    route = deepseek_host.configured_routes(FakeHost(config=config))[0]
+
+    assert route.reasoning_efforts == ()
+    assert route.default_effort is None
+
+
+def test_configuration_rejects_duplicate_and_oversized_reasoning_options() -> None:
+    duplicate = configuration()
+    duplicate["llm.models"]["groups"][0]["models"][0]["reasoning"] = {
+        "efforts": [{"id": "Exact"}, {"id": "Exact"}],
+    }
+    with pytest.raises(deepseek_host.DeepSeekHostError) as refused:
+        deepseek_host.configured_routes(FakeHost(config=duplicate))
+    assert refused.value.code == "HARNESS_HOST_RESPONSE_INVALID"
+    assert "duplicate exact reasoning option id" in str(refused.value)
+
+    oversized = configuration()
+    oversized["llm.models"]["groups"][0]["models"][0]["reasoning"] = {
+        "efforts": [
+            {"id": f"option-{index}"}
+            for index in range(deepseek_host.MAX_REASONING_OPTIONS + 1)
+        ],
+    }
+    with pytest.raises(deepseek_host.DeepSeekHostError) as refused:
+        deepseek_host.configured_routes(FakeHost(config=oversized))
+    assert refused.value.code == "HARNESS_HOST_RESPONSE_INVALID"
+    assert "reasoning options exceed safety limits" in str(refused.value)
+
+
 def test_configuration_rejects_missing_host_api_version() -> None:
     config = configuration()
     config["host.describe"] = {}
@@ -353,12 +405,24 @@ def test_host_endpoint_is_exact_loopback(value: str) -> None:
         deepseek_host.checked_host_url(value)
 
 
-@pytest.mark.parametrize("value", [None, "", "0", "06500", "65536", " 6500"])
-def test_injected_host_port_is_required_and_exact(value: str | None) -> None:
-    env = {} if value is None else {"SC_DEEPSEEK_HOST_PORT": value}
+@pytest.mark.parametrize("value", ["", "0", "06500", "65536", " 6500"])
+def test_injected_host_port_is_exact(value: str) -> None:
+    env = {"SC_DEEPSEEK_HOST_PORT": value}
     with pytest.raises(deepseek_host.DeepSeekHostError) as refused:
         deepseek_host.configured_host_url(env)
     assert refused.value.code == "HARNESS_HOST_UNAVAILABLE"
+
+
+def test_missing_host_port_uses_the_managed_fork_seat() -> None:
+    with mock.patch.object(
+        deepseek_host.ports,
+        "resolve",
+        return_value={"deepseek_host_port": 6501},
+    ) as resolve:
+        endpoint = deepseek_host.configured_host_url({})
+
+    assert endpoint == "http://127.0.0.1:6501"
+    resolve.assert_called_once_with(persist=False)
 
 
 def test_injected_host_port_derives_the_only_endpoint() -> None:

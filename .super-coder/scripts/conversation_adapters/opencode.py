@@ -58,6 +58,12 @@ _SERVER_LOG_HANDLE = None
 
 VARIANT_ID = re.compile(r"^[a-z0-9][a-z0-9._-]{0,31}$")
 VARIANT_MANIFEST = opencode_config.VARIANT_MANIFEST
+MAX_CONNECTED_PROVIDERS = 256
+MAX_CONNECTED_MODELS = 2_000
+MAX_NATIVE_OPTIONS = 256
+MAX_NATIVE_OPTION_BYTES = 256 * 1024
+MAX_NATIVE_OPTION_DEPTH = 16
+MAX_NATIVE_IDENTIFIER_CHARS = 512
 FORBIDDEN_VARIANT_KEYS = frozenset({
     "apikey", "key", "token", "secret", "credential", "authorization",
     "headers", "baseurl", "npm", "provider", "model", "prompt",
@@ -508,72 +514,174 @@ def admitted_variants(
     return admitted
 
 
+def _native_projection_error(detail: str) -> AdapterError:
+    return AdapterError(
+        "HARNESS_PROTOCOL_ERROR",
+        f"OpenCode provider projection is malformed: {detail}",
+    )
+
+
+def _exact_native_identifier(value: Any, field: str) -> str:
+    if (
+        not isinstance(value, str)
+        or not value
+        or value != value.strip()
+        or len(value) > MAX_NATIVE_IDENTIFIER_CHARS
+    ):
+        raise _native_projection_error(f"invalid {field}")
+    return value
+
+
+def _validate_native_value(value: Any, *, depth: int = 0) -> None:
+    if depth > MAX_NATIVE_OPTION_DEPTH:
+        raise _native_projection_error("native option payload is too deep")
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return
+    if isinstance(value, list):
+        for item in value:
+            _validate_native_value(item, depth=depth + 1)
+        return
+    if isinstance(value, Mapping):
+        for key, item in value.items():
+            _exact_native_identifier(key, "native option field")
+            _validate_native_value(item, depth=depth + 1)
+        return
+    raise _native_projection_error("native option payload is not JSON")
+
+
+def native_variants(variants: Any) -> dict[str, dict[str, Any]]:
+    """Preserve the exact bounded variant map advertised by OpenCode."""
+    if variants is None:
+        return {}
+    if not isinstance(variants, Mapping):
+        raise _native_projection_error("variants must be an object")
+    if len(variants) > MAX_NATIVE_OPTIONS:
+        raise _native_projection_error("too many native options")
+
+    projected: dict[str, dict[str, Any]] = {}
+    encoded_bytes = 0
+    for option_id, payload in variants.items():
+        option_id = _exact_native_identifier(option_id, "native option id")
+        if not isinstance(payload, Mapping):
+            raise _native_projection_error(
+                f"native option {option_id} must be an object"
+            )
+        _validate_native_value(payload)
+        try:
+            encoded = json.dumps(
+                payload,
+                ensure_ascii=False,
+                allow_nan=False,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        except (TypeError, ValueError) as exc:
+            raise _native_projection_error(
+                f"native option {option_id} is not bounded JSON"
+            ) from exc
+        encoded_bytes += len(encoded)
+        if encoded_bytes > MAX_NATIVE_OPTION_BYTES:
+            raise _native_projection_error("native option payload is too large")
+        projected[option_id] = dict(payload)
+    return projected
+
+
 def connected_models(state: Mapping[str, Any] | None = None) -> list[dict[str, Any]]:
     """Flatten models belonging to providers OpenCode reports as connected."""
-    state = state or provider_state()
-    connected = {
-        item for item in (state.get("connected") or []) if isinstance(item, str)
-    }
+    state = provider_state() if state is None else state
+    if not isinstance(state, Mapping):
+        raise _native_projection_error("response must be an object")
+    connected_rows = state.get("connected")
+    provider_rows = state.get("all")
+    if not isinstance(connected_rows, list) or not isinstance(provider_rows, list):
+        raise _native_projection_error("connected and all must be arrays")
+    if (
+        len(connected_rows) > MAX_CONNECTED_PROVIDERS
+        or len(provider_rows) > MAX_CONNECTED_PROVIDERS
+    ):
+        raise _native_projection_error("too many providers")
+    connected_list = [
+        _exact_native_identifier(item, "connected provider id")
+        for item in connected_rows
+    ]
+    if len(set(connected_list)) != len(connected_list):
+        raise _native_projection_error("duplicate connected provider id")
+    connected = set(connected_list)
     models: list[dict[str, Any]] = []
-    for provider in state.get("all") or []:
-        if not isinstance(provider, dict) or provider.get("id") not in connected:
+    seen_providers: set[str] = set()
+    seen_routes: set[str] = set()
+    model_rows_seen = 0
+    for provider in provider_rows:
+        if not isinstance(provider, Mapping):
+            raise _native_projection_error("provider row must be an object")
+        provider_id = _exact_native_identifier(provider.get("id"), "provider id")
+        if provider_id not in connected:
             continue
-        provider_id = provider["id"]
-        for model_id, model in (provider.get("models") or {}).items():
-            if not isinstance(model_id, str) or not isinstance(model, dict):
-                continue
+        if provider_id in seen_providers:
+            raise _native_projection_error("duplicate connected provider row")
+        seen_providers.add(provider_id)
+        provider_models = provider.get("models")
+        if not isinstance(provider_models, Mapping):
+            raise _native_projection_error("provider models must be an object")
+        model_rows_seen += len(provider_models)
+        if model_rows_seen > MAX_CONNECTED_MODELS:
+            raise _native_projection_error("too many connected models")
+        for model_id, model in provider_models.items():
+            model_id = _exact_native_identifier(model_id, "model id")
+            if not isinstance(model, Mapping):
+                raise _native_projection_error("model row must be an object")
             status = model.get("status")
             if status not in (None, "active"):
+                if not isinstance(status, str):
+                    raise _native_projection_error("model status must be a string")
                 continue
             provider_family = _model_family(provider, model)
-            variants = admitted_variants(
-                model.get("variants"), provider_family=provider_family, model=model
-            )
-            projection = {
-                "provider": provider_id,
-                "provider_model": model_id,
-                "provider_family": provider_family,
-                "manifest": VARIANT_MANIFEST,
-                "variants": variants,
-            }
-            projection_fingerprint = hashlib.sha256(
-                json.dumps(
-                    projection,
-                    ensure_ascii=False,
-                    sort_keys=True,
-                    separators=(",", ":"),
-                ).encode("utf-8")
-            ).hexdigest()
+            variants = native_variants(model.get("variants"))
+            selector = f"{provider_id}/{model_id}"
+            if selector in seen_routes:
+                raise _native_projection_error("duplicate exact model route")
+            seen_routes.add(selector)
+            native_option_ids = list(variants)
             models.append(
                 {
-                    "id": f"{provider_id}/{model_id}",
+                    "id": selector,
                     "provider": provider_id,
                     "provider_model": model_id,
-                    "name": model.get("name") or model_id,
-                    "family": model.get("family"),
-                    "release_date": model.get("release_date") or "",
+                    "name": (
+                        model.get("name")
+                        if isinstance(model.get("name"), str)
+                        else model_id
+                    ),
+                    "family": (
+                        model.get("family")
+                        if isinstance(model.get("family"), str)
+                        else None
+                    ),
+                    "release_date": (
+                        model.get("release_date")
+                        if isinstance(model.get("release_date"), str)
+                        else ""
+                    ),
                     "status": status or "active",
-                    "supported_efforts": list(variants),
-                    "default_effort": "high" if "high" in variants else None,
+                    "variants": variants,
+                    "native_option_ids": native_option_ids,
+                    "native_default_option_id": None,
+                    "supported_efforts": native_option_ids,
+                    "default_effort": None,
                     "native_variant_ids": {
                         variant_id: variant_id for variant_id in variants
                     },
                     "selector_binding": {
-                        "kind": "connected-model",
-                        "selector": f"{provider_id}/{model_id}",
-                        "provider_model": model_id,
-                        "provider_family": provider_family,
-                        "projection_fingerprint": projection_fingerprint,
+                        "kind": "harness-live",
+                        "selector": selector,
                     },
                     "adapter_metadata": {
-                        "compatibility_manifest": VARIANT_MANIFEST,
                         "provider_family": provider_family,
                         "variant_options_by_effort": variants,
                     },
                     "cli_version": state.get("_sc_cli_version"),
                 }
             )
-    return sorted(models, key=lambda item: (item["provider"], item["id"]))
+    return models
 
 
 atexit.register(stop_server)

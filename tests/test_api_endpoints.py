@@ -1289,6 +1289,44 @@ class AuthenticatedCliCatalogueRouteTest(unittest.TestCase):
             )
         return fingerprint
 
+    def test_models_api_preserves_live_native_projection_fields(self) -> None:
+        payload = {
+            "v": 8,
+            "fetched_at": "2026-08-26T20:00:00+00:00",
+            "sources": ["opencode-provider-api", "deepseek-host-api"],
+            "stale": True,
+            "harnesses": {
+                harness: {
+                    "authority": "harness-live",
+                    "observed_at": "2026-08-26T20:00:01+00:00",
+                    "stale": False,
+                    "families": [],
+                    "models": [{
+                        "id": "ollama-cloud/glm-5.2",
+                        "native_option_ids": ["MAX.Future", "low"],
+                        **({"native_default_option_id": "MAX.Future"}
+                           if harness == "deepseek" else {}),
+                    }],
+                }
+                for harness in ("opencode", "deepseek")
+            },
+        }
+        with (
+            mock.patch.object(server, "db", side_effect=self.connect),
+            mock.patch.object(
+                server.model_catalog, "catalog", return_value=payload
+            ) as catalogue,
+        ):
+            status, _headers, raw = server.dispatch_http(
+                "GET", "/api/models", "Host: 127.0.0.1", b""
+            )
+
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(raw), payload)
+        catalogue.assert_called_once()
+        self.assertFalse(catalogue.call_args.kwargs["refresh"])
+        self.assertIn("con", catalogue.call_args.kwargs)
+
     def test_model_routes_require_shell_auth_and_apply_exact_filters(self) -> None:
         self.assertEqual(self.request("/_sc/model-routes", None)[0], 401)
         self.assertEqual(self.request("/_sc/model-routes", "wrong")[0], 401)
