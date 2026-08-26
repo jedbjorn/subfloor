@@ -26,9 +26,11 @@ PLUGIN = ENGINE / "assets" / "deepseek" / "sc-shell-env-plugin.mjs"
 PLUGIN_PROBE = ROOT / "tests" / "fixtures" / "deepseek_dsh_identity_plugin_probe.mjs"
 sys.path.insert(0, str(SCRIPTS))
 
+import deepseek_execution_domain
 import deepseek_host
 import deepseek_one_shot
 import deepseek_web
+import dsh_execution_provenance
 from deepseek_identity_registry import (
     ALIASES,
     HEALTH_CONTRACT,
@@ -517,6 +519,93 @@ def test_bash_and_pwsh_tool_executions_use_the_fixed_domain_launcher() -> None:
             assert partial == {
                 "error": "sc-shell-identity: refusing partial ToolExecution identity"
             }
+
+
+def test_admitted_tool_snapshot_survives_close_while_new_root_refuses() -> None:
+    with tempfile.TemporaryDirectory() as raw:
+        registry, worktree = registry_fixture(Path(raw))
+        contract_generation = synthetic_health(registry)
+        create_binding(
+            registry,
+            worktree,
+            session_id="immutable-tool-root",
+            conversation_id="immutable-tool-conversation",
+            shell_id=38,
+            shortname="IMMUTABLE",
+            token="immutable-secret",
+        )
+        record = registry.resolve_record("immutable-tool-root")
+        environment = {
+            "DSH_SESSION_ID": "immutable-tool-root",
+            "DSH_SC_SHELL_ID": "38",
+            "DSH_SC_SHELL_SHORTNAME": "IMMUTABLE",
+            "DSH_SC_SHELL_WORKTREE": str(worktree),
+            "DSH_SC_API_BASE": "http://127.0.0.1:8837",
+            "DSH_SC_MEM_CREDENTIAL_FILE": record["credential_file"],
+            "DSH_SC_BINDING_GENERATION": "1",
+            "DSH_SC_PLUGIN_HEALTH_GENERATION": contract_generation,
+        }
+        admitted = deepseek_execution_domain._binding_snapshot(
+            registry_path=registry.layout.registry,
+            fork_id=registry.layout.fork_id,
+            profile_id=registry.layout.profile_id,
+            environment=environment,
+        )
+        descriptor = os.memfd_create(
+            "immutable-tool-snapshot", os.MFD_ALLOW_SEALING
+        )
+        with os.fdopen(descriptor, "rb", closefd=True) as descriptor_file:
+            metadata = os.fstat(descriptor_file.fileno())
+            frozen = {
+                "contract": deepseek_execution_domain.CONTRACT,
+                "cgroup": "/proof/sc-dsh/" + "a" * 32 + ".scope",
+                "domain_id": "a" * 32,
+                "descriptor_device": metadata.st_dev,
+                "descriptor_inode": metadata.st_ino,
+                "expires_monotonic_ns": time.monotonic_ns() + 60_000_000_000,
+                "non_delegated": True,
+                "cgroup_device": 1,
+                "cgroup_inode": 2,
+                "cgroup_owner_uid": os.geteuid(),
+                "issuer_pid": os.getpid(),
+                "issuer_start_ticks": process_start_ticks(os.getpid()),
+                "host_pid": os.getpid(),
+                "host_start_ticks": process_start_ticks(os.getpid()),
+                "root_pid": os.getpid(),
+                "root_start_ticks": process_start_ticks(os.getpid()),
+                "fork_id": registry.layout.fork_id,
+                "profile_id": registry.layout.profile_id,
+                **admitted,
+            }
+            deepseek_execution_domain._seal_descriptor(
+                descriptor_file.fileno(), frozen
+            )
+            snapshot = registry.read_snapshot()
+            closed = registry.begin_close(
+                expected_snapshot_generation=snapshot["snapshot_generation"],
+                root_session_id="immutable-tool-root",
+                expected_record_generation=record["record_generation"],
+            )
+            assert closed.state == "closing"
+
+            with pytest.raises(
+                deepseek_execution_domain.ExecutionDomainError
+            ) as new_root:
+                deepseek_execution_domain._binding_snapshot(
+                    registry_path=registry.layout.registry,
+                    fork_id=registry.layout.fork_id,
+                    profile_id=registry.layout.profile_id,
+                    environment=environment,
+                )
+            assert str(new_root.value) == "ToolExecution binding is not active"
+
+            retained = dsh_execution_provenance._sealed_descriptor(
+                descriptor_file.fileno()
+            )
+            assert retained == frozen
+            assert retained["root_session_id"] == "immutable-tool-root"
+            assert retained["binding_record_generation"] == 1
+            assert retained["plugin_contract_generation"] == contract_generation
 
 
 def test_execution_domain_uses_linux_seal_uapi_when_python_omits_names() -> None:

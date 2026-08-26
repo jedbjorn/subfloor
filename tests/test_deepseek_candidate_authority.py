@@ -1952,6 +1952,23 @@ def test_failed_ratchet_revokes_and_fences_real_registry_roots(
                 token="candidate-token",
                 plugin_contract_generation=contract_generation,
             )
+        unrelated_root = "ordinary-serialized-root"
+        unrelated_snapshot = registry.read_snapshot()
+        registry.create_binding(
+            expected_snapshot_generation=unrelated_snapshot[
+                "snapshot_generation"
+            ],
+            root_session_id=unrelated_root,
+            conversation_id="ordinary-serialized-conversation",
+            lifecycle_epoch=1,
+            shell_id=5,
+            shell_shortname="DEV5",
+            shell_worktree=worktree,
+            api_base="http://127.0.0.1:8837",
+            token="ordinary-serialized-token",
+            plugin_contract_generation=contract_generation,
+        )
+        unrelated_before = dict(registry.resolve_record(unrelated_root))
         if failure == "expired":
             clock.value += timedelta(seconds=601)
         elif failure == "stale-artifact":
@@ -1996,13 +2013,34 @@ def test_failed_ratchet_revokes_and_fences_real_registry_roots(
         assert state["failure"]["operation"] == "ratchet"
         assert state["failure"]["code"] == expected_code
         snapshot = registry.read_snapshot()
-        assert all(
-            record["state"] == "closing"
-            for record in snapshot["records"].values()
+        expected_candidate_roots = set(ROOTS) - (
+            {"candidate-root-b"} if failure == "missing-root" else set()
         )
+        assert {
+            root_session_id: snapshot["records"][root_session_id]["state"]
+            for root_session_id in expected_candidate_roots
+        } == {
+            root_session_id: "closing"
+            for root_session_id in expected_candidate_roots
+        }
         assert all(
-            Path(record["credential_file"]).exists()
-            for record in snapshot["records"].values()
+            Path(snapshot["records"][root_session_id]["credential_file"]).exists()
+            for root_session_id in expected_candidate_roots
+        )
+        unrelated_after = registry.resolve_record(unrelated_root)
+        assert unrelated_after == unrelated_before
+        assert unrelated_after["state"] == "active"
+        assert Path(unrelated_after["credential_file"]).exists()
+        assert registry.binding_current(
+            root_session_id=unrelated_root,
+            conversation_id="ordinary-serialized-conversation",
+            lifecycle_epoch=1,
+            shell_id=5,
+            shell_shortname="DEV5",
+            shell_worktree=worktree,
+            api_base="http://127.0.0.1:8837",
+            token="ordinary-serialized-token",
+            plugin_contract_generation=contract_generation,
         )
         if failure == "teardown-failure":
             assert all(
