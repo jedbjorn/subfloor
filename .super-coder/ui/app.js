@@ -415,18 +415,61 @@ async function renderShells(root) {
 // value. Arrow keys move the highlight, Enter chooses it, and Escape/outside
 // click closes without changing the current selection.
 
+function nativeOptionLabel(optionId) {
+  return optionId == null || optionId === "" ? "Harness default" : optionId;
+}
+
+function liveNativeHarnessBlock(harness, catalog) {
+  if (!["opencode", "deepseek"].includes(harness)) return null;
+  const block = catalog.harnesses?.[harness];
+  return block?.authority === "harness-live" && !block.stale && !block.error
+    ? block : null;
+}
+
 function thinkingLevelState(harness, catalog, model, preferred = null) {
   if (harness === "vibe") return {
-    disabled: true, selected: "", supported: [],
+    disabled: true, selected: "", supported: [], native: false,
+    requiresConfirmation: false,
     label: "Thinking control unavailable",
     guidance: "Vibe uses its native thinking behavior.",
   };
   if (!model) return {
-    disabled: true, selected: "", supported: [], label: "Harness default",
+    disabled: true, selected: "", supported: [], native: false,
+    requiresConfirmation: false, label: "Harness default",
     guidance: "The harness chooses both model and thinking level.",
   };
-  const route = (catalog.harnesses?.[harness]?.models || [])
+  const block = catalog.harnesses?.[harness];
+  const route = (block?.models || [])
     .find((candidate) => candidate.id === model);
+  const liveBlock = liveNativeHarnessBlock(harness, catalog);
+  if (["opencode", "deepseek"].includes(harness)) {
+    if (!liveBlock || !route || route.availability !== "available") return {
+      disabled: true, selected: "", supported: [], native: true,
+      requiresConfirmation: false,
+      label: "Live options unavailable",
+      guidance: block?.error
+        ? `Current ${harness} discovery failed: ${block.error}`
+        : `Retry ${harness} discovery before selecting this route.`,
+    };
+    const supported = [...(route.native_option_ids || [])];
+    const requested = preferred == null || preferred === "" ? null : preferred;
+    const disappeared = requested !== null && !supported.includes(requested);
+    const selected = disappeared ? "" : requested || "";
+    const support = route.harness_support_state
+      ? ` Support: ${route.harness_support_state}`
+        + (route.harness_version ? ` (${route.harness_version}).` : ".")
+      : "";
+    return {
+      disabled: false, selected, supported, native: true,
+      requiresConfirmation: disappeared,
+      label: disappeared ? "Selection disappeared" : nativeOptionLabel(selected),
+      guidance: disappeared
+        ? `${requested} is no longer advertised for ${model}. Confirm Harness default or choose a current native option.`
+        : selected
+          ? `Native option ${selected} is advertised for ${model}.${support}`
+          : `${model} uses the harness's current default.${support}`,
+    };
+  }
   // Spec #160: the reserved Model default is always offered for a controlled
   // exact route, alongside its freshly proven named values.
   const supported = [
@@ -449,12 +492,14 @@ function thinkingLevelState(harness, catalog, model, preferred = null) {
       + (route.harness_version ? ` (${route.harness_version}).` : ".")
     : "";
   if (!fresh) return {
-    disabled: true, selected, supported,
+    disabled: true, selected, supported, native: false,
+    requiresConfirmation: false,
     label: selected ? thinkingLevelLabel(selected) : "Refresh required",
     guidance: "Refresh & verify Default Models before saving this route.",
   };
   return {
-    disabled: false, selected, supported,
+    disabled: false, selected, supported, native: false,
+    requiresConfirmation: false,
     label: selected ? thinkingLevelLabel(selected) : "Choose Thinking level",
     guidance: !selected
       ? "Choose a supported Thinking level before saving."
@@ -468,11 +513,51 @@ function thinkingLevelLabel(effort) {
   return effort === "default" ? "Model default" : effort;
 }
 
+function renderNativeOptionControl(select, harness, catalog, model, preferred = null) {
+  const state = thinkingLevelState(harness, catalog, model, preferred);
+  select.replaceChildren();
+  if (state.native && !state.disabled) {
+    if (state.requiresConfirmation) select.append(el("option", {
+      value: "__sc_native_confirmation_required__",
+      textContent: "Selection disappeared — confirm a choice",
+      selected: true, disabled: true,
+    }));
+    select.append(el("option", {
+      value: "", textContent: nativeOptionLabel(null),
+      selected: !state.requiresConfirmation && !state.selected,
+    }));
+    for (const optionId of state.supported) select.append(el("option", {
+      value: optionId,
+      textContent: nativeOptionLabel(optionId),
+      selected: !state.requiresConfirmation && optionId === state.selected,
+    }));
+  } else if (!state.supported.length) {
+    select.append(el("option", {
+      value: "", textContent: state.label, selected: true,
+    }));
+  } else {
+    if (!state.selected) select.append(el("option", {
+      value: "", textContent: "Choose Thinking level", selected: true,
+      disabled: true,
+    }));
+    for (const effort of state.supported) select.append(el("option", {
+      value: effort,
+      textContent: thinkingLevelLabel(effort),
+      selected: effort === state.selected,
+    }));
+  }
+  select.disabled = state.disabled;
+  select.title = state.guidance;
+  return state;
+}
+
 function dmModelPicker(harness, cat, row, save, onRouteChanged = () => {}) {
   const data = cat.harnesses?.[harness] || { models: [] };
   const currentRoute = (data.models || []).find((m) => m.id === row.model);
+  const liveBlock = liveNativeHarnessBlock(harness, cat);
   const currentAvailable = !row.model || (
-    currentRoute && currentRoute.availability === "available" && !cat.stale);
+    currentRoute && currentRoute.availability === "available"
+      && (!cat.stale || Boolean(liveBlock)));
   const current = el("span", {
     className: "dm-current" + (row.model ? "" : " dm-unset") +
       (currentAvailable ? "" : " dm-stale"),
@@ -523,6 +608,11 @@ function dmModelPicker(harness, cat, row, save, onRouteChanged = () => {}) {
     close();
   };
   const routeSub = (m) => {
+    if (liveBlock) {
+      const count = (m.native_option_ids || []).length;
+      return [`live · ${count} native option${count === 1 ? "" : "s"}`,
+        m.harness_version, m.source].filter(Boolean).join(" · ");
+    }
     const efforts = m.supported_efforts || [];
     const route = efforts.includes("high")
       ? "local · high-effort route" : "local route";
@@ -537,7 +627,7 @@ function dmModelPicker(harness, cat, row, save, onRouteChanged = () => {}) {
     const q = input.value.trim().toLowerCase();
     const hit = (m) => !q || [m.id, m.name, m.family]
       .some((s) => (s || "").toLowerCase().includes(q));
-    const models = cat.stale ? [] : (data.models || []).filter(
+    const models = cat.stale && !liveBlock ? [] : (data.models || []).filter(
       (m) => m.availability === "available" && hit(m));
     choices = [
       ...(!q || "harness default".includes(q)
@@ -715,31 +805,18 @@ async function renderDefaultModels(root, s, catalogOverride = null) {
         className: "dm-thinking",
         ariaLabel: `Thinking level for ${flavor} ${h}`,
       });
+      let thinkingState;
       const paintThinking = () => {
         const preferred = row.effort ?? row.effective_effort;
-        const state = thinkingLevelState(h, cat, row.model, preferred);
-        thinking.replaceChildren();
-        if (!state.supported.length) {
-          thinking.append(el("option", {
-            value: "", textContent: state.label, selected: true,
-          }));
-        } else {
-          if (!state.selected) thinking.append(el("option", {
-            value: "", textContent: "Choose Thinking level", selected: true,
-            disabled: true,
-          }));
-          for (const effort of state.supported) thinking.append(el("option", {
-            value: effort,
-            textContent: thinkingLevelLabel(effort),
-            selected: effort === state.selected,
-          }));
-        }
-        thinking.disabled = state.disabled;
-        thinking.title = state.guidance;
+        thinkingState = renderNativeOptionControl(
+          thinking, h, cat, row.model, preferred);
       };
       thinking.onchange = async () => {
-        const effort = thinking.value;
-        if (!row.model || !effort) return;
+        if (!row.model || thinkingState.disabled) return;
+        if (thinkingState.requiresConfirmation
+            && thinking.value === "__sc_native_confirmation_required__") return;
+        const effort = thinkingState.native ? thinking.value || null : thinking.value;
+        if (!thinkingState.native && !effort) return;
         thinking.disabled = true;
         try {
           await api("/flavor-defaults", "POST", {
@@ -748,7 +825,7 @@ async function renderDefaultModels(root, s, catalogOverride = null) {
           row.effort = effort;
           row.effective_effort = effort;
           row.effort_state = "controlled";
-          toast(`${flavor} · ${h} · Thinking level → ${effort}`);
+          toast(`${flavor} · ${h} · Thinking level → ${effort || "Harness default"}`);
         } catch (e) {
           toast("error: " + e.message);
         }
@@ -775,19 +852,18 @@ async function renderDefaultModels(root, s, catalogOverride = null) {
           const state = thinkingLevelState(
             h, cat, value, row.effort ?? row.effective_effort);
           if (state.disabled) throw new Error(state.guidance);
-          if (!state.selected) {
-            row.effort = null;
-            row.effective_effort = null;
+          if (state.requiresConfirmation) {
             row.effort_state = "selection-required";
-            toast(`Select a Thinking level to save ${value}.`);
-            return { effort: null, pending: true };
+            toast(`Confirm Harness default or choose a native option to save ${value}.`);
+            return { pending: true };
           }
+          const effort = state.native ? state.selected || null : state.selected;
           await api("/flavor-defaults", "POST", {
-            flavor, harness: h, model: value, effort: state.selected,
+            flavor, harness: h, model: value, effort,
           });
           row.effort_state = "controlled";
-          toast(`${flavor} · ${h} → ${value} · ${state.selected}`);
-          return { effort: state.selected };
+          toast(`${flavor} · ${h} → ${value} · ${effort || "Harness default"}`);
+          return { effort };
         } catch (e) { toast("error: " + e.message); throw e; }
       }, paintThinking);
       paintThinking();
@@ -3883,6 +3959,7 @@ async function chatRenderNew(host, shell, defaults, catalog) {
     textContent: "Start chat",
   });
   const routeNote = el("div", { className: "chat-route-note" });
+  let effortState;
   const paintEfforts = () => {
     const row = byHarness[harness] || {};
     const unavailable = chatHarnessUnavailableReason(
@@ -3893,36 +3970,20 @@ async function chatRenderNew(host, shell, defaults, catalog) {
     const preferred = modelSelect.value && !harnessDefault
       ? effortSelect.value || null
       : row.effort ?? row.effective_effort;
-    const state = thinkingLevelState(harness, catalog, model, preferred);
-    effortSelect.replaceChildren();
-    if (!state.supported.length) {
-      effortSelect.append(el("option", {
-        value: "", textContent: state.label, selected: true,
-      }));
-    } else {
-      if (!state.selected) effortSelect.append(el("option", {
-        value: "", textContent: "Choose Thinking level", selected: true,
-        disabled: true,
-      }));
-      for (const effort of state.supported) effortSelect.append(el("option", {
-        value: effort,
-        textContent: thinkingLevelLabel(effort),
-        selected: effort === state.selected,
-      }));
-    }
-    effortSelect.disabled = state.disabled;
-    effortSelect.title = state.guidance;
+    effortState = renderNativeOptionControl(
+      effortSelect, harness, catalog, model, preferred);
     const exactRouteMissing = chatRequiresExactRoute(harness) && !model;
     submit.disabled = Boolean(
       unavailable || exactRouteMissing
-        || model && (state.disabled || !state.selected),
+        || model && (effortState.disabled || effortState.requiresConfirmation
+          || (!effortState.native && !effortState.selected)),
     );
     const transport = harness === "opencode"
       ? " OpenCode models come only from connected providers." : "";
     routeNote.textContent = unavailable
       || (exactRouteMissing
         ? "DeepSeek requires an authenticated exact model route."
-        : state.guidance + transport);
+        : effortState.guidance + transport);
   };
   const paintModels = () => {
     harness = harnessSelect.value;
@@ -6380,9 +6441,9 @@ function sprintParticipantRoutes(participants) {
     const pendingControlled = participant.binding_status === "unbound-intent"
       && participant.intent_control_state === "controlled";
     const thinking = boundControlled
-      ? `Thinking level: ${participant.effective_effort}`
+      ? `Thinking level: ${nativeOptionLabel(participant.effective_effort)}`
       : pendingControlled
-        ? `Thinking level: ${participant.intent_effective_effort}`
+        ? `Thinking level: ${nativeOptionLabel(participant.intent_effective_effort)}`
         : "Thinking control unavailable";
     const binding = participant.binding_status === "bound"
       ? `route r${participant.route_revision} · ${participant.binding_digest.slice(0, 12)}…`

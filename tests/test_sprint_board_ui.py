@@ -16,6 +16,10 @@ SPRINT_BLOCK = APP[
     APP.index("const SPRINTS_REFRESH_MS"):
     APP.index("// ── Tabs + boot")
 ]
+NATIVE_OPTION_LABEL = APP[
+    APP.index("function nativeOptionLabel"):
+    APP.index("function liveNativeHarnessBlock")
+]
 ROUTER_AT = APP.index("function routeFromHash()")
 ROUTER = APP[
     ROUTER_AT:
@@ -100,7 +104,7 @@ def test_sprint_modals_follow_action_and_viewer_footer_contracts():
 
 
 def test_prepared_controlled_route_keeps_its_thinking_level_without_a_binding():
-    script = HEALTH_BOARD_HARNESS + SPRINT_BLOCK + r"""
+    script = HEALTH_BOARD_HARNESS + NATIVE_OPTION_LABEL + SPRINT_BLOCK + r"""
 const rows = sprintParticipantRoutes([
   {
     role: "developer", shortname: "DEV2", harness: "codex", model: "gpt-5.4",
@@ -128,6 +132,21 @@ const rows = sprintParticipantRoutes([
     intent_control_state: "harness-default", intent_effective_effort: null,
     route_revision: null, binding_digest: null,
   },
+  {
+    role: "developer", shortname: "DEV5", harness: "opencode",
+    model: "ollama-cloud/glm-5.2",
+    binding_status: "bound", control_state: "controlled", effective_effort: null,
+    intent_control_state: "controlled", intent_effective_effort: null,
+    route_revision: 3,
+    binding_digest: "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+  },
+  {
+    role: "reviewer", shortname: "REV2", harness: "deepseek",
+    model: "ollama-cloud/gemma4:31b",
+    binding_status: "unbound-intent", control_state: null, effective_effort: null,
+    intent_control_state: "controlled", intent_effective_effort: "MAX.Future",
+    route_revision: null, binding_digest: null,
+  },
 ]);
 console.log(JSON.stringify(rows.children.map((row) => row.textContent)));
 """
@@ -136,6 +155,8 @@ console.log(JSON.stringify(rows.children.map((row) => row.textContent)));
         "reviewer REV1codex · gpt-5.4Thinking level: xhigh · route r2 · aaaaaaaaaaaa… · Support: tested (codex-cli 0.147.0)",
         "developer DEV3vibe · vibe-modelThinking control unavailable · route r1 · bbbbbbbbbbbb… · Support: best-effort (vibe dev-build)",
         "developer DEV4codex · Harness defaultThinking control unavailable · unbound intent",
+        "developer DEV5opencode · ollama-cloud/glm-5.2Thinking level: Harness default · route r3 · cccccccccccc…",
+        "reviewer REV2deepseek · ollama-cloud/gemma4:31bThinking level: MAX.Future · unbound intent",
     ]
 
 

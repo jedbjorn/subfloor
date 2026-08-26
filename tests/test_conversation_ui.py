@@ -286,9 +286,10 @@ def test_start_chat_has_default_and_configured_paths_without_terminal_controls()
     assert "connected providers" in interface
     assert 'ariaLabel: "Thinking level"' in interface
     assert 'el("label", { className: "k" }, "Thinking level")' in interface
-    assert "thinkingLevelState(harness, catalog, model, preferred)" in interface
+    assert "renderNativeOptionControl(" in interface
     assert "unavailable || exactRouteMissing" in interface
-    assert "model && (state.disabled || !state.selected)" in interface
+    assert "effortState.requiresConfirmation" in interface
+    assert "(!effortState.native && !effortState.selected)" in interface
     assert "Refresh & verify Default Models before saving this route." in APP
     assert '"Start chat"' in interface
     assert "harness: harnessSelect.value" in interface
