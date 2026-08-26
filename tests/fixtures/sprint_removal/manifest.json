@@ -318,6 +318,7 @@
     "tests/mutations/u11_vendor_resolution.py",
     "tests/mutations/u12_shell_type_order.py",
     "tests/mutations/u4_quota_accounts_ui.py",
+    "tests/mutations/u6_live_native_ollama_gate.py",
     "tests/mutations/u6_sprint_stall_replay.py",
     "tests/run_conductor_real_matrix.py",
     "tests/test_activity_readers.py",

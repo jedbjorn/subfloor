@@ -23,6 +23,10 @@ ACCEPTANCE = ROOT / "tests" / "fixtures" / "sprint_v2_acceptance.json"
 HANDOFF_ACCEPTANCE = (
     ROOT / "tests" / "fixtures" / "sprint_handoff_hardening_acceptance.json"
 )
+OLLAMA_ACCEPTANCE = json.loads(
+    (ROOT / "tests" / "fixtures" / "ollama_live_native_acceptance.json")
+    .read_text()
+)
 sys.path[:0] = [
     str(ENGINE / "scripts"),
     str(ENGINE / "api"),
@@ -791,6 +795,144 @@ class SprintBoundRouteDispatchProof(unittest.TestCase):
                 },
                 "agent": projection.route_agent,
             },
+        )
+
+    def test_glm_max_ignores_stale_11822_through_sprint_first_dispatch(
+        self,
+    ) -> None:
+        selector = OLLAMA_ACCEPTANCE["glm_selector"]
+        option_id = OLLAMA_ACCEPTANCE["native_option_id"]
+        stored = OLLAMA_ACCEPTANCE["stored_opencode"]
+        live = OLLAMA_ACCEPTANCE["live_opencode"]
+        observation = self._seed_opencode_catalogue()
+        observation["runtime_status"].update({
+            "version": live["version"],
+            "observed_version": live["version"],
+        })
+        observation["source_fingerprint"] = "9" * 64
+        observation["advertised_options_by_model"] = {
+            selector: ["high", option_id]
+        }
+        self.con.execute(
+            "UPDATE model_routes SET selector=?,provider='ollama-cloud',"
+            "provider_model='glm-5.2',cli_version=?,harness_version=?,"
+            "last_seen_at=?,stale=?,last_error='deliberately stale fixture',"
+            "source_fingerprint=? WHERE harness='opencode' AND selector=?",
+            (
+                selector,
+                f"opencode {stored['harness_version']}",
+                stored["harness_version"],
+                stored["last_seen_at"],
+                stored["stale"],
+                stored["source_fingerprint"],
+                self.SELECTOR,
+            ),
+        )
+        self.con.commit()
+        sprint_id = self._seed_sprint(
+            harness="opencode", model=selector, effort=option_id
+        )
+
+        with mock.patch.object(
+            model_catalog, "controlled_route_evidence", return_value=observation
+        ) as live_probe:
+            wake_id = self._arm(sprint_id)
+            broker_run = self._deliver_and_claim(wake_id)
+
+        self.assertEqual(
+            live_probe.call_args_list,
+            [mock.call("opencode", selector)] * 4,
+        )
+        context, launch = self._prepare(broker_run)
+
+        class CredentialFreeTransport:
+            def __init__(self) -> None:
+                self.calls: list[tuple[str, str, dict | None]] = []
+
+            def request(self, method, path, *, query=None, body=None):
+                self.calls.append((method, path, body))
+                if method == "GET" and path == "/provider":
+                    return {
+                        "_sc_cli_version": live["version"],
+                        "connected": live["connected"],
+                        "all": [{
+                            "id": "ollama-cloud",
+                            "npm": "@future/ollama-cloud-sdk",
+                            "models": {
+                                "glm-5.2": {
+                                    "variants": live["variants"],
+                                },
+                            },
+                        }],
+                    }
+                return {}
+
+            def stream(self, *_args, **_kwargs):
+                return iter(())
+
+        transport = CredentialFreeTransport()
+        adapter = OpenCodeAdapter(
+            transport=transport,
+            shell_runtime_dir=self.root / "opencode-shells",
+        )
+        adapter._prepare_shell_environment(context)
+        adapter._prepare_live_route_agent(context)
+        adapter._prompt("glm-fixture-session", context, "fixture prompt")
+        projection = route_transport.context_projection(context, "opencode")
+        config = json.loads((broker_run.worktree / "opencode.json").read_text())
+        stored_after = self.con.execute(
+            "SELECT stale,generation_id,source_fingerprint,harness_version,"
+            "last_error FROM model_routes WHERE harness='opencode' AND selector=?",
+            (selector,),
+        ).fetchone()
+
+        self.assertEqual(
+            tuple(stored_after),
+            (
+                1,
+                stored["catalogue_generation"],
+                stored["source_fingerprint"],
+                stored["harness_version"],
+                "deliberately stale fixture",
+            ),
+        )
+        self.assertEqual(broker_run.route_contract_version, 3)
+        self.assertEqual(broker_run.route_binding["native_option_id"], option_id)
+        self.assertIsNone(broker_run.route_binding["catalogue_generation"])
+        self.assertEqual(broker_run.route_binding["adapter_metadata"], {})
+        self.assertEqual(launch["model"], selector)
+        self.assertEqual(launch["effort"], option_id)
+        self.assertEqual(projection.native_variant_id, option_id)
+        self.assertEqual(
+            config["agent"][projection.route_agent],
+            {
+                "reasoningEffort": option_id,
+                "futureProviderField": {"preserved": True},
+                "mode": "primary",
+                "model": selector,
+            },
+        )
+        self.assertEqual(
+            transport.calls,
+            [
+                ("GET", "/provider", None),
+                (
+                    "POST",
+                    "/session/glm-fixture-session/message",
+                    {
+                        "parts": [{"type": "text", "text": "fixture prompt"}],
+                        "model": {
+                            "providerID": "ollama-cloud",
+                            "modelID": "glm-5.2",
+                        },
+                        "agent": projection.route_agent,
+                    },
+                ),
+            ],
+        )
+        self.assertNotIn(
+            "thinking_evidence_stale",
+            json.dumps({"binding": broker_run.route_binding, "calls": transport.calls}),
         )
 
     def test_legacy_binding_ignores_freshness_when_exact_ids_remain(self) -> None:

@@ -30,6 +30,10 @@ from types import SimpleNamespace
 from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
+OLLAMA_ACCEPTANCE = json.loads(
+    (ROOT / "tests" / "fixtures" / "ollama_live_native_acceptance.json")
+    .read_text()
+)
 sys.path.insert(0, str(ROOT / ".super-coder" / "api"))
 sys.path.insert(0, str(ROOT / ".super-coder" / "scripts"))
 import model_catalog as mc  # noqa: E402
@@ -1373,28 +1377,60 @@ class BuildTest(NoCLI):
             },
         )
 
-    def test_live_catalogue_projects_five_exact_models_without_provider_request(self):
-        model_ids = [
-            "deepseek-v4-flash",
-            "glm-5.2",
-            "gpt-oss:120b",
-            "qwen3.5:397b",
-            "gemma4:31b",
-        ]
-        open_models = mc.opencode_connected_models({
+    def test_opencode_native_projection_has_no_enum_or_provider_family_gate(self):
+        projected = mc.opencode_connected_models({
             "_sc_cli_version": "1.18.23",
             "connected": ["ollama-cloud"],
             "all": [{
                 "id": "ollama-cloud",
+                "npm": "@future/ollama-cloud-sdk",
                 "models": {
-                    model_id: {
+                    "glm-5.2": {
                         "variants": {
                             "MAX.Future": {
                                 "reasoningEffort": "provider-exact",
-                                "futureField": {"kept": True},
+                                "futureProviderField": {
+                                    "preserved": True,
+                                },
                             },
-                            "low": {"reasoningEffort": "low"},
                         },
+                    },
+                },
+            }],
+        })
+
+        self.assertEqual(len(projected), 1)
+        self.assertEqual(projected[0]["id"], "ollama-cloud/glm-5.2")
+        self.assertEqual(projected[0]["native_option_ids"], ["MAX.Future"])
+        self.assertEqual(projected[0]["native_variant_ids"], {
+            "MAX.Future": "MAX.Future",
+        })
+        self.assertIsNone(
+            projected[0]["adapter_metadata"]["provider_family"]
+        )
+        self.assertEqual(
+            projected[0]["variants"]["MAX.Future"],
+            {
+                "reasoningEffort": "provider-exact",
+                "futureProviderField": {"preserved": True},
+            },
+        )
+
+    def test_live_catalogue_projects_five_exact_models_without_provider_request(self):
+        model_ids = [
+            selector.split("/", 1)[1]
+            for selector in OLLAMA_ACCEPTANCE["models"]
+        ]
+        live_opencode = OLLAMA_ACCEPTANCE["live_opencode"]
+        live_deepseek = OLLAMA_ACCEPTANCE["live_deepseek"]
+        open_models = mc.opencode_connected_models({
+            "_sc_cli_version": live_opencode["version"],
+            "connected": live_opencode["connected"],
+            "all": [{
+                "id": "ollama-cloud",
+                "models": {
+                    model_id: {
+                        "variants": live_opencode["variants"],
                     }
                     for model_id in model_ids
                 },
@@ -1404,8 +1440,13 @@ class BuildTest(NoCLI):
             {
                 "id": model_id,
                 "reasoning": {
-                    "efforts": [{"id": "MAX.Future"}, {"id": "low"}],
-                    "defaultEffort": "MAX.Future",
+                    "efforts": [
+                        {"id": option_id}
+                        for option_id in live_deepseek["native_option_ids"]
+                    ],
+                    "defaultEffort": live_deepseek[
+                        "native_default_option_id"
+                    ],
                 },
             }
             for model_id in model_ids
@@ -1428,7 +1469,7 @@ class BuildTest(NoCLI):
                 deepseek_client=host,
             )
 
-        expected = [f"ollama-cloud/{model_id}" for model_id in model_ids]
+        expected = OLLAMA_ACCEPTANCE["models"]
         for harness in ("opencode", "deepseek"):
             block = got["harnesses"][harness]
             self.assertEqual(block["authority"], "harness-live")
@@ -1438,14 +1479,14 @@ class BuildTest(NoCLI):
             self.assertEqual(ids(block), expected)
             self.assertEqual(
                 [model["native_option_ids"] for model in block["models"]],
-                [["MAX.Future", "low"]] * 5,
+                [["high", "max"]] * 5,
             )
             self.assertTrue(all(
                 "adapter_metadata" not in model
                 and "selector_binding" not in model
                 for model in block["models"]
             ))
-            self.assertNotIn("futureField", json.dumps(block))
+            self.assertNotIn("futureProviderField", json.dumps(block))
             self.assertNotIn("endpoint_identity", json.dumps(block))
         self.assertNotIn(
             "native_default_option_id",
@@ -1454,9 +1495,13 @@ class BuildTest(NoCLI):
         self.assertEqual(
             got["harnesses"]["deepseek"]["models"][0]
             ["native_default_option_id"],
-            "MAX.Future",
+            "max",
         )
         self.assertEqual(fetch_calls, [(mc.MODELS_DEV_URL, None)])
+        self.assertEqual(
+            [method for method, _payload in host.calls],
+            ["host.describe", "llm.providers", "llm.models", "settings.describe"],
+        )
         self.assertNotIn(
             "credentials.describe",
             [method for method, _payload in host.calls],

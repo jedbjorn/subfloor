@@ -10,6 +10,10 @@ from pathlib import Path
 import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
+OLLAMA_ACCEPTANCE = json.loads(
+    (ROOT / "tests" / "fixtures" / "ollama_live_native_acceptance.json")
+    .read_text()
+)
 APP = (ROOT / ".super-coder" / "ui" / "app.js").read_text()
 INDEX = (ROOT / ".super-coder" / "ui" / "index.html").read_text()
 STYLE = (ROOT / ".super-coder" / "ui" / "style.css").read_text()
@@ -200,6 +204,50 @@ console.log(JSON.stringify({
     assert [option["textContent"] for option in result["failed"]["options"]] == [
         "Live options unavailable",
     ]
+
+
+def test_live_native_model_picker_ignores_global_stale_catalogue():
+    helper = APP[
+        APP.index("function nativeOptionLabel"):
+        APP.index("async function renderDefaultModels")
+    ]
+    script = r"""
+const document = {addEventListener() {}, removeEventListener() {}};
+function el(tag, attrs = {}, ...children) {
+  const node = {
+    tag, children: [], hidden: false, isConnected: true, value: "",
+    append(...values) { this.children.push(...values); },
+    contains() { return false; },
+    scrollIntoView() {},
+    classList: {toggle() {}, remove() {}},
+  };
+  Object.assign(node, attrs);
+  node.append(...children);
+  return node;
+}
+""" + helper + "\nconst fixture = " + json.dumps(OLLAMA_ACCEPTANCE) + r""";
+const models = fixture.models.map((id) => ({
+  id, availability: "available", native_option_ids: ["high", "max"],
+}));
+const catalog = {stale: true, harnesses: {opencode: {
+  authority: "harness-live", stale: false, models,
+}}};
+const row = {model: fixture.glm_selector, effort: fixture.native_option_id};
+const picker = dmModelPicker("opencode", catalog, row, async () => ({}));
+picker.input.onfocus();
+const list = picker.results.children[1];
+console.log(JSON.stringify({
+  current: picker.current.textContent,
+  hidden: picker.results.hidden,
+  labels: list.children.map((card) => card.children[0].children[0]),
+}));
+"""
+    result = run_js(script)
+    assert result == {
+        "current": "ollama-cloud/glm-5.2",
+        "hidden": False,
+        "labels": ["Harness default", *OLLAMA_ACCEPTANCE["models"]],
+    }
 
 
 def test_default_models_saves_model_and_effort_atomically():
