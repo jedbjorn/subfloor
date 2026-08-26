@@ -312,6 +312,7 @@
     "tests/fixtures/quota_probes/README.md",
     "tests/fixtures/sprint_health/historical_replay.json",
     "tests/mutations/u105_deepseek_reliability.py",
+    "tests/mutations/u106_deepseek_retirement.py",
     "tests/mutations/u11_vendor_resolution.py",
     "tests/mutations/u12_shell_type_order.py",
     "tests/mutations/u4_quota_accounts_ui.py",

@@ -801,6 +801,58 @@ assert fcntl.fcntl(descriptor, module['F_GET_SEALS']) & module['REQUIRED_SEALS']
     assert completed.stderr == ""
 
 
+def test_provenance_uses_linux_seal_uapi_when_python_omits_names() -> None:
+    program = f"""
+import fcntl
+import json
+import os
+import runpy
+for name in (
+    'F_GET_SEALS', 'F_SEAL_SEAL', 'F_SEAL_SHRINK', 'F_SEAL_GROW',
+    'F_SEAL_WRITE',
+):
+    if hasattr(fcntl, name):
+        delattr(fcntl, name)
+module = runpy.run_path({str(SCRIPTS / 'dsh_execution_provenance.py')!r})
+descriptor = os.memfd_create('provenance-seal-fallback', os.MFD_ALLOW_SEALING)
+value = {{
+    'contract': module['CONTRACT'],
+    'cgroup': None,
+    'domain_id': None,
+    'binding_generation': None,
+    'expires_monotonic_ns': None,
+    'non_delegated': None,
+    'issuer_key_id': None,
+    'root_pid': None,
+    'root_start_ticks': None,
+    'cgroup_device': None,
+    'cgroup_inode': None,
+    'cgroup_owner_uid': None,
+    'signature': None,
+}}
+os.write(descriptor, json.dumps(value).encode())
+try:
+    module['_sealed_descriptor'](descriptor)
+except ValueError as exc:
+    assert str(exc) == 'execution descriptor is not immutably sealed'
+else:
+    raise AssertionError('unsealed descriptor was accepted')
+fcntl.fcntl(descriptor, 1033, module['REQUIRED_SEALS'])
+assert module['_sealed_descriptor'](descriptor) == value
+"""
+    completed = subprocess.run(
+        [sys.executable, "-c", program],
+        cwd=ROOT,
+        text=True,
+        capture_output=True,
+        timeout=10,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stdout == ""
+    assert completed.stderr == ""
+
+
 def test_production_domain_issue_verify_marker_deletion_and_teardown() -> None:
     cgroup_root = Path("/sys/fs/cgroup")
     membership_rows = [
@@ -871,7 +923,7 @@ without_markers = resolve_linux(descriptor_fd=198, issuer_identity=issuer)
 payload = os.pread(198, 65537, 0)
 copied_fd = os.memfd_create('copied-domain', os.MFD_ALLOW_SEALING)
 os.write(copied_fd, payload)
-fcntl.fcntl(copied_fd, fcntl.F_ADD_SEALS, REQUIRED_SEALS)
+fcntl.fcntl(copied_fd, getattr(fcntl, 'F_ADD_SEALS', 1033), REQUIRED_SEALS)
 copied = resolve_linux(descriptor_fd=copied_fd, issuer_identity=issuer)
 forged_value = json.loads(payload)
 forged_fd = os.memfd_create('forged-domain', os.MFD_ALLOW_SEALING)
@@ -880,7 +932,7 @@ forged_value['descriptor_device'] = forged_stat.st_dev
 forged_value['descriptor_inode'] = forged_stat.st_ino
 forged_value['binding_record_generation'] += 1
 os.write(forged_fd, json.dumps(forged_value, sort_keys=True, separators=(',', ':')).encode())
-fcntl.fcntl(forged_fd, fcntl.F_ADD_SEALS, REQUIRED_SEALS)
+fcntl.fcntl(forged_fd, getattr(fcntl, 'F_ADD_SEALS', 1033), REQUIRED_SEALS)
 forged = resolve_linux(descriptor_fd=forged_fd, issuer_identity=issuer)
 stale = resolve_linux(
     descriptor_fd=198,
@@ -2062,6 +2114,16 @@ def test_one_shot_unknown_cancellation_closes_binding_until_terminal_recovery(
         root = Path(raw)
         registry, worktree = registry_fixture(root)
         synthetic_health(registry)
+        create_binding(
+            registry,
+            worktree,
+            session_id="unrelated-root",
+            conversation_id="unrelated-conversation",
+            shell_id=910,
+            shortname="UNRELATED",
+            token="unrelated-token",
+        )
+        unrelated_before = dict(registry.resolve_record("unrelated-root"))
         state_path = root / "deepseek-web-state.json"
         env = {
             "SC_API_TOKEN": "one-shot-token",
@@ -2097,17 +2159,14 @@ def test_one_shot_unknown_cancellation_closes_binding_until_terminal_recovery(
         assert len(session_refs) == 1
         session_ref = session_refs[0]
         marker = state_path.with_name("deepseek-shell-identity-unproven.json")
-        assert json.loads(marker.read_text()) == {
-            "session_id": session_ref,
-            "shell_id": 909,
-            "shortname": "ONE-SHOT",
-        }
+        assert not marker.exists()
         closing = registry.read_snapshot()
         record = closing["records"][session_ref]
         credential = Path(record["credential_file"])
         assert record["state"] == "closing"
         assert record["record_generation"] == 2
         assert credential.exists()
+        assert registry.resolve_record("unrelated-root") == unrelated_before
 
         with pytest.raises(deepseek_web.DeepSeekWebError) as denied:
             deepseek_web.bind_session_identity(
@@ -2133,22 +2192,8 @@ def test_one_shot_unknown_cancellation_closes_binding_until_terminal_recovery(
         assert terminal_record["state"] == "terminal"
         assert terminal_record["credential_file"] is None
         assert not credential.exists()
-        assert marker.exists()
-
-        state_path.write_text(json.dumps({"service_port": 8942}))
-        history = {
-            "events": [{
-                "event": {
-                    "seq": 1,
-                    "type": "turn/end",
-                    "data": {"reason": {"kind": "cancelled"}},
-                }
-            }]
-        }
-        monkeypatch.setattr(deepseek_web, "_host_rpc", lambda *_args: history)
-        lease = deepseek_web.acquire_shell_identity(env=env)
-        lease.close()
         assert not marker.exists()
+        assert registry.resolve_record("unrelated-root") == unrelated_before
 
 
 def test_runtime_binding_rejects_foreign_or_stale_lifecycle_without_effect(

@@ -32,7 +32,6 @@ from .base import (
 SESSION_REF = re.compile(r"^sc-[0-9a-f]{32}$")
 RUN_REF_PREFIX = "deepseek-host-run-v1:"
 MAX_UNKNOWN_EVENTS = 24
-MANAGED_IDENTITY_WAIT_SECONDS = 5400.0
 READINESS_MAX_ATTEMPTS = 3
 READINESS_WINDOW_SECONDS = 5.0
 READINESS_RETRY_DELAY_SECONDS = 0.05
@@ -132,7 +131,6 @@ class DeepSeekAdapter(ConversationAdapter):
     ) -> None:
         super().__init__(manifest or load_manifest(self.harness))
         self.client_factory = client_factory
-        self._shell_lease: deepseek_web.ShellIdentityLease | None = None
         self._reserved_session: str | None = None
         self._proof_authority: Mapping[str, Any] | None = None
         self._proof_context: ConversationContext | None = None
@@ -173,14 +171,9 @@ class DeepSeekAdapter(ConversationAdapter):
         last_error: deepseek_web.DeepSeekWebError | None = None
         for attempt in range(READINESS_MAX_ATTEMPTS):
             try:
-                self._shell_lease = deepseek_web.acquire_shell_identity(
-                    env=env,
-                    wait_seconds=MANAGED_IDENTITY_WAIT_SECONDS,
-                )
                 deepseek_web.ensure(
                     context.checked_worktree(),
                     env=env,
-                    identity_lease=self._shell_lease,
                     register_workspace=not recovery,
                 )
                 host_ready = True
@@ -189,7 +182,6 @@ class DeepSeekAdapter(ConversationAdapter):
                 return self._client()
             except deepseek_web.DeepSeekWebError as exc:
                 last_error = exc
-                self._release_shell_lease()
                 if not self._retry_readiness(exc, attempt, started):
                     break
         assert last_error is not None
@@ -216,11 +208,6 @@ class DeepSeekAdapter(ConversationAdapter):
             return False
         time.sleep(min(READINESS_RETRY_DELAY_SECONDS, remaining))
         return True
-
-    def _release_shell_lease(self) -> None:
-        if self._shell_lease is not None:
-            self._shell_lease.close()
-            self._shell_lease = None
 
     @staticmethod
     def _browser_chat_only_allowed(context: ConversationContext) -> bool:
@@ -311,9 +298,6 @@ class DeepSeekAdapter(ConversationAdapter):
                 self._proof_quiesced = (
                     proof_authority.get("binding_record_generation") is None
                 )
-        if self._proof_authority is not None and self._shell_lease is not None:
-            self._shell_lease.close()
-            self._shell_lease = None
 
     def _revalidate_proof_authority(
         self, context: ConversationContext, root_session_id: str
@@ -1317,7 +1301,7 @@ class DeepSeekAdapter(ConversationAdapter):
             )
             # Recovery begins from a durable NativeTurn with no live transport.
             # Retain the newly authenticated client so every later reconcile and
-            # pending interrupt reuse this adapter's one full-lifetime lease.
+            # pending interrupt reuse one transport without reselecting identity.
             turn.metadata["client"] = client
         try:
             self._require_recovery_target(client, turn.session_ref, context)
@@ -1361,7 +1345,6 @@ class DeepSeekAdapter(ConversationAdapter):
         if self._reserved_session is not None:
             deepseek_web.release_managed_session(self._reserved_session)
             self._reserved_session = None
-        self._release_shell_lease()
         self._proof_authority = None
         self._proof_context = None
         self._proof_session_id = None
