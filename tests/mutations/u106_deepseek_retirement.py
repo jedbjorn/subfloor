@@ -232,6 +232,7 @@ def main(argv: list[str] | None = None) -> int:
             "06bb2bc31856575b88983d522fd881ad8e9b68c75714a804ff6cdb5bbd98aeb8"
         ),
         "scope_decision_id": 261,
+        "reviewer_disposition_message_id": 1385,
         "candidate_acceptance_decision_id": 262,
         "candidate_ref": "8a4551100ca14f0777f175719b577cb11b733565",
         "candidate_receipt_sha256": (

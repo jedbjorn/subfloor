@@ -1560,7 +1560,9 @@ def test_server_rederives_runner_roots_and_fails_closed_on_disagreement(
         assert registry.read_snapshot()["records"] == {}
 
 
+@pytest.mark.parametrize("mode", ["candidate", "promoted"])
 def test_dedicated_runner_drives_all_surfaces_restart_adoption_and_teardown(
+    mode: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     with tempfile.TemporaryDirectory() as raw:
@@ -1580,10 +1582,27 @@ def test_dedicated_runner_drives_all_surfaces_restart_adoption_and_teardown(
         monkeypatch.setattr(
             deepseek_web.harness_versions, "probe", lambda _harness: "0.1.1-rc.2"
         )
+        if mode == "promoted":
+            acceptance = (
+                registry.layout.root
+                / "proof-authority"
+                / "candidate-acceptance.json"
+            )
+            owner_json(
+                acceptance,
+                {
+                    "contract": deepseek_promotion_runner.ACCEPTANCE_CONTRACT,
+                    "state": "candidate-accepted",
+                    "candidate_ref": "c" * 40,
+                    "retirement_ref": "a" * 40,
+                    "reviewed": True,
+                    "fnb_accepted": True,
+                },
+            )
 
         run = deepseek_promotion_runner.start(
             env={},
-            mode="candidate",
+            mode=mode,
             disposable_baseline="arch-clean-2026-08-25",
             proof_run_id="runner-proof-one",
             conversation_ids=[browser, sprint],
@@ -1624,7 +1643,7 @@ def test_dedicated_runner_drives_all_surfaces_restart_adoption_and_teardown(
         with pytest.raises(deepseek_promotion_runner.PromotionRunnerError) as busy:
             deepseek_promotion_runner.start(
                 env={},
-                mode="candidate",
+                mode=mode,
                 disposable_baseline="arch-clean-2026-08-25",
                 proof_run_id="runner-proof-overlap",
                 conversation_ids=[browser, sprint],
@@ -1638,7 +1657,7 @@ def test_dedicated_runner_drives_all_surfaces_restart_adoption_and_teardown(
         with pytest.raises(deepseek_web.DeepSeekWebError) as ordinary:
             deepseek_web.mint_candidate_capability(
                 env={},
-                mode="candidate",
+                mode=mode,
                 disposable_baseline="arch-clean-2026-08-25",
                 proof_run_id="ordinary-mint",
                 conversation_ids=(browser, sprint),
@@ -1731,7 +1750,7 @@ def test_dedicated_runner_drives_all_surfaces_restart_adoption_and_teardown(
 
         next_run = deepseek_promotion_runner.start(
             env={},
-            mode="candidate",
+            mode=mode,
             disposable_baseline="arch-clean-2026-08-25",
             proof_run_id="runner-proof-two",
             conversation_ids=[browser, sprint],

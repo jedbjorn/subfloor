@@ -475,6 +475,7 @@ class DeepSeekDshPreparationContractTests(unittest.TestCase):
                 "historical_sprint_binding_sha256": "84056c2fc7206b83f2d3beb71150545326d5e33f557cb5f2329f55321eab0bdf",
                 "active_reliability_sha256": "06bb2bc31856575b88983d522fd881ad8e9b68c75714a804ff6cdb5bbd98aeb8",
                 "scope_decision_id": 261,
+                "reviewer_disposition_message_id": 1385,
                 "candidate_acceptance_decision_id": 262,
                 "candidate_ref": "8a4551100ca14f0777f175719b577cb11b733565",
                 "candidate_receipt_sha256": "77791c5d4e031cf9b16e7ddee3932f581bbafc5094f86e26fd8a2b1504c5ae69",
