@@ -311,6 +311,7 @@
     "tests/fixtures/live_model/kimi/sessions/wd_kimi_4a98ab53811d/session_6282b2af-d1ac-4313-8f5d-b6667fdebfea/agents/main/wire.jsonl",
     "tests/fixtures/quota_probes/README.md",
     "tests/fixtures/sprint_health/historical_replay.json",
+    "tests/mutations/u105_deepseek_reliability.py",
     "tests/mutations/u11_vendor_resolution.py",
     "tests/mutations/u12_shell_type_order.py",
     "tests/mutations/u4_quota_accounts_ui.py",

@@ -24,6 +24,7 @@ export const inject = ["shellEnv", "subprocess"];
 const HEALTH_CONTRACT = "sc-dsh-plugin-health-v1";
 const REGISTRY_CONTRACT = "sc-dsh-identity-registry-v1";
 const EXECUTION_DESCRIPTOR_FD = 198;
+const DELEGATED_SCOPE_LAUNCHER = "/usr/bin/systemd-run";
 const ALIASES = Object.freeze({
   DSH_SC_SHELL_ID: "Canonical positive engine shell ID.",
   DSH_SC_SHELL_SHORTNAME: "Canonical shortname for the same engine shell.",
@@ -331,6 +332,13 @@ export function apply(ctx, config) {
     const wrapped = {
       ...spec,
       argv: [
+        DELEGATED_SCOPE_LAUNCHER,
+        "--user",
+        "--scope",
+        "--quiet",
+        "--collect",
+        "--property=Delegate=yes",
+        "--",
         executionLauncherPath,
         "--fork-id", forkId,
         "--profile-id", profileId,

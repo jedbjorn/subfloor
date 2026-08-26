@@ -474,6 +474,40 @@ class DeepSeekDshPreparationContractTests(unittest.TestCase):
         )
         self.assertEqual(self.contract["schema_version"], 2)
         self.assertEqual(
+            self.contract["verification_package"],
+            {
+                "contract": "sc-dsh-reliability-verification-v1",
+                "sprint_id": 25,
+                "work_unit_id": 105,
+                "task_id": 652,
+                "historical_sprint_binding_sha256": "84056c2fc7206b83f2d3beb71150545326d5e33f557cb5f2329f55321eab0bdf",
+                "active_reliability_sha256": "06bb2bc31856575b88983d522fd881ad8e9b68c75714a804ff6cdb5bbd98aeb8",
+                "scope_decision_id": 261,
+                "reviewer_disposition_message_id": 1385,
+                "mutation_driver": "tests/mutations/u105_deepseek_reliability.py",
+                "receipt_contract": "sc-dsh-reliability-verification-receipt-v1",
+                "receipt_authority": (
+                    "the candidate_ref and candidate_tree are read from the clean "
+                    "owned worktree; every mutation must turn its focused test red "
+                    "and the exact restored source green"
+                ),
+                "protected_boundaries": [
+                    "bounded transient readiness with immediate invariant refusal",
+                    "Browser chat-only, Sprint turn-only, and one-shot invocation-only exhaustion",
+                    "model and native inference continuity after managed-authority refusal",
+                    "binding create, rotate, reopen, and protected-root revalidation",
+                    "fresh Bash and pwsh Linux execution domain per ToolExecution root",
+                    "already-admitted immutable ToolExecution snapshot with new-root refusal",
+                    "candidate ratchet revocation and enumerated-root-only fencing",
+                ],
+                "retirement_authority": {
+                    "work_unit_id": 106,
+                    "task_id": 653,
+                    "advanced_by_this_package": False,
+                },
+            },
+        )
+        self.assertEqual(
             {
                 seam["name"]: (
                     seam["source"], seam["source_sha256"], seam["contract"]
@@ -602,6 +636,7 @@ class DeepSeekDshPreparationContractTests(unittest.TestCase):
                 "sha256": sha256(EXECUTION_LAUNCHER),
                 "contract": "sc-dsh-linux-cgroup-v2-v3",
                 "descriptor_fd": 198,
+                "delegation": "/usr/bin/systemd-run --user --scope --property=Delegate=yes is the fixed supported-Linux scope launcher; the execution issuer creates roots only below its own delegated membership",
                 "entry": "Wrap only a complete registry-current ToolExecution identity. Refuse partial, stale, copied, wrong-domain, dead-issuer, self-created, and self-entered evidence before user code.",
                 "teardown": "Drain or cgroup.kill the one execution domain within two seconds, remove it, and surface incomplete cleanup as failure.",
             },

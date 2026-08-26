@@ -26,9 +26,11 @@ PLUGIN = ENGINE / "assets" / "deepseek" / "sc-shell-env-plugin.mjs"
 PLUGIN_PROBE = ROOT / "tests" / "fixtures" / "deepseek_dsh_identity_plugin_probe.mjs"
 sys.path.insert(0, str(SCRIPTS))
 
+import deepseek_execution_domain
 import deepseek_host
 import deepseek_one_shot
 import deepseek_web
+import dsh_execution_provenance
 from deepseek_identity_registry import (
     ALIASES,
     HEALTH_CONTRACT,
@@ -491,7 +493,16 @@ def test_bash_and_pwsh_tool_executions_use_the_fixed_domain_launcher() -> None:
             domain_ids = set()
             for requested in requests:
                 wrapped = plugin.spawn("wrapped-session", requested)["argv"]
-                assert wrapped[0] == str(SCRIPTS / "deepseek_execution_domain.py")
+                assert wrapped[:7] == [
+                    "/usr/bin/systemd-run",
+                    "--user",
+                    "--scope",
+                    "--quiet",
+                    "--collect",
+                    "--property=Delegate=yes",
+                    "--",
+                ]
+                assert wrapped[7] == str(SCRIPTS / "deepseek_execution_domain.py")
                 assert wrapped[-len(requested) :] == requested
                 assert wrapped[wrapped.index("--descriptor-fd") + 1] == "198"
                 assert wrapped[wrapped.index("--registry") + 1] == str(
@@ -517,6 +528,248 @@ def test_bash_and_pwsh_tool_executions_use_the_fixed_domain_launcher() -> None:
             assert partial == {
                 "error": "sc-shell-identity: refusing partial ToolExecution identity"
             }
+
+
+def test_admitted_tool_snapshot_survives_close_while_new_root_refuses() -> None:
+    with tempfile.TemporaryDirectory() as raw:
+        registry, worktree = registry_fixture(Path(raw))
+        contract_generation = synthetic_health(registry)
+        create_binding(
+            registry,
+            worktree,
+            session_id="immutable-tool-root",
+            conversation_id="immutable-tool-conversation",
+            shell_id=38,
+            shortname="IMMUTABLE",
+            token="immutable-secret",
+        )
+        record = registry.resolve_record("immutable-tool-root")
+        environment = {
+            "DSH_SESSION_ID": "immutable-tool-root",
+            "DSH_SC_SHELL_ID": "38",
+            "DSH_SC_SHELL_SHORTNAME": "IMMUTABLE",
+            "DSH_SC_SHELL_WORKTREE": str(worktree),
+            "DSH_SC_API_BASE": "http://127.0.0.1:8837",
+            "DSH_SC_MEM_CREDENTIAL_FILE": record["credential_file"],
+            "DSH_SC_BINDING_GENERATION": "1",
+            "DSH_SC_PLUGIN_HEALTH_GENERATION": contract_generation,
+        }
+        admitted = deepseek_execution_domain._binding_snapshot(
+            registry_path=registry.layout.registry,
+            fork_id=registry.layout.fork_id,
+            profile_id=registry.layout.profile_id,
+            environment=environment,
+        )
+        descriptor = os.memfd_create(
+            "immutable-tool-snapshot", os.MFD_ALLOW_SEALING
+        )
+        with os.fdopen(descriptor, "rb", closefd=True) as descriptor_file:
+            metadata = os.fstat(descriptor_file.fileno())
+            frozen = {
+                "contract": deepseek_execution_domain.CONTRACT,
+                "cgroup": "/proof/sc-dsh/" + "a" * 32 + ".scope",
+                "domain_id": "a" * 32,
+                "descriptor_device": metadata.st_dev,
+                "descriptor_inode": metadata.st_ino,
+                "expires_monotonic_ns": time.monotonic_ns() + 60_000_000_000,
+                "non_delegated": True,
+                "cgroup_device": 1,
+                "cgroup_inode": 2,
+                "cgroup_owner_uid": os.geteuid(),
+                "issuer_pid": os.getpid(),
+                "issuer_start_ticks": process_start_ticks(os.getpid()),
+                "host_pid": os.getpid(),
+                "host_start_ticks": process_start_ticks(os.getpid()),
+                "root_pid": os.getpid(),
+                "root_start_ticks": process_start_ticks(os.getpid()),
+                "fork_id": registry.layout.fork_id,
+                "profile_id": registry.layout.profile_id,
+                **admitted,
+            }
+            deepseek_execution_domain._seal_descriptor(
+                descriptor_file.fileno(), frozen
+            )
+            snapshot = registry.read_snapshot()
+            closed = registry.begin_close(
+                expected_snapshot_generation=snapshot["snapshot_generation"],
+                root_session_id="immutable-tool-root",
+                expected_record_generation=record["record_generation"],
+            )
+            assert closed.state == "closing"
+
+            with pytest.raises(
+                deepseek_execution_domain.ExecutionDomainError
+            ) as new_root:
+                deepseek_execution_domain._binding_snapshot(
+                    registry_path=registry.layout.registry,
+                    fork_id=registry.layout.fork_id,
+                    profile_id=registry.layout.profile_id,
+                    environment=environment,
+                )
+            assert str(new_root.value) == "ToolExecution binding is not active"
+
+            retained = dsh_execution_provenance._sealed_descriptor(
+                descriptor_file.fileno()
+            )
+            assert retained == frozen
+            assert retained["root_session_id"] == "immutable-tool-root"
+            assert retained["binding_record_generation"] == 1
+            assert retained["plugin_contract_generation"] == contract_generation
+
+
+@pytest.mark.parametrize("tool", ["bash", "pwsh"])
+def test_real_admitted_tool_execution_survives_close_while_new_root_refuses(
+    tool: str,
+) -> None:
+    cgroup_root = Path("/sys/fs/cgroup")
+    scope_launcher = Path("/usr/bin/systemd-run")
+    if not scope_launcher.is_file():
+        pytest.skip("the supported Linux delegated-scope launcher is unavailable")
+    executable = shutil.which(tool)
+    if executable is None:
+        pytest.skip(f"{tool} is unavailable on this Linux seat")
+
+    with tempfile.TemporaryDirectory() as raw:
+        root = Path(raw)
+        registry, worktree = registry_fixture(root)
+        contract_generation = synthetic_health(registry)
+        session_id = f"immutable-{tool}-root"
+        create_binding(
+            registry,
+            worktree,
+            session_id=session_id,
+            conversation_id=f"immutable-{tool}-conversation",
+            shell_id=39 if tool == "bash" else 40,
+            shortname=f"IMMUTABLE_{tool.upper()}",
+            token=f"immutable-{tool}-secret",
+        )
+        record = registry.resolve_record(session_id)
+        environment = {
+            **os.environ,
+            "DSH_SESSION_ID": session_id,
+            "DSH_SC_SHELL_ID": str(record["shell_id"]),
+            "DSH_SC_SHELL_SHORTNAME": str(record["shell_shortname"]),
+            "DSH_SC_SHELL_WORKTREE": str(record["shell_worktree"]),
+            "DSH_SC_API_BASE": str(record["api_base"]),
+            "DSH_SC_MEM_CREDENTIAL_FILE": str(record["credential_file"]),
+            "DSH_SC_BINDING_GENERATION": str(record["record_generation"]),
+            "DSH_SC_PLUGIN_HEALTH_GENERATION": contract_generation,
+        }
+        ready = root / f"{tool}-ready"
+        release = root / f"{tool}-release"
+        effect = root / f"{tool}-effect"
+        refused_effect = root / f"{tool}-refused-effect"
+        environment.update(
+            {
+                "SC_TEST_READY": str(ready),
+                "SC_TEST_RELEASE": str(release),
+                "SC_TEST_EFFECT": str(effect),
+            }
+        )
+        if tool == "bash":
+            command = [
+                executable,
+                "-c",
+                (
+                    'printf ready > "$SC_TEST_READY"; '
+                    'while [ ! -e "$SC_TEST_RELEASE" ]; do sleep 0.01; done; '
+                    'printf bash > "$SC_TEST_EFFECT"'
+                ),
+            ]
+        else:
+            command = [
+                executable,
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                (
+                    "[IO.File]::WriteAllText($env:SC_TEST_READY, 'ready'); "
+                    "while (-not [IO.File]::Exists($env:SC_TEST_RELEASE)) { "
+                    "Start-Sleep -Milliseconds 10 }; "
+                    "[IO.File]::WriteAllText($env:SC_TEST_EFFECT, 'pwsh')"
+                ),
+            ]
+
+        launcher = [
+            str(scope_launcher),
+            "--user",
+            "--scope",
+            "--quiet",
+            "--collect",
+            "--property=Delegate=yes",
+            "--",
+            str(SCRIPTS / "deepseek_execution_domain.py"),
+            "--fork-id",
+            registry.layout.fork_id,
+            "--profile-id",
+            registry.layout.profile_id,
+            "--registry",
+            str(registry.layout.registry),
+            "--host-identity",
+            str(registry.layout.host_identity),
+            "--cgroup-root",
+            str(cgroup_root),
+            "--domain-id",
+            uuid.uuid4().hex,
+            "--descriptor-fd",
+            "198",
+            "--ttl-seconds",
+            "60",
+            "--",
+            *command,
+        ]
+        with subprocess.Popen(
+            launcher,
+            cwd=ROOT,
+            env=environment,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        ) as admitted:
+            try:
+                wait_for(ready.exists)
+                assert ready.read_text() == "ready"
+                snapshot = registry.read_snapshot()
+                closed = registry.begin_close(
+                    expected_snapshot_generation=snapshot["snapshot_generation"],
+                    root_session_id=session_id,
+                    expected_record_generation=record["record_generation"],
+                )
+                assert closed.state == "closing"
+                time.sleep(0.1)
+                release.touch()
+                stdout, stderr = admitted.communicate(timeout=10)
+                assert admitted.returncode == 0, stderr
+                assert stdout == ""
+                assert effect.read_text() == tool
+            finally:
+                release.touch(exist_ok=True)
+                if admitted.poll() is None:
+                    admitted.terminate()
+                    admitted.wait(timeout=5)
+
+        refused_command = [
+            executable,
+            "-c" if tool == "bash" else "-Command",
+            (
+                f"printf refused > {refused_effect}"
+                if tool == "bash"
+                else f"[IO.File]::WriteAllText('{refused_effect}', 'refused')"
+            ),
+        ]
+        command_boundary = len(launcher) - len(command)
+        refused = subprocess.run(
+            [*launcher[:command_boundary], *refused_command],
+            cwd=ROOT,
+            env=environment,
+            text=True,
+            capture_output=True,
+            timeout=10,
+            check=False,
+        )
+        assert refused.returncode == 126
+        assert "ToolExecution binding is not active" in refused.stderr
+        assert refused_effect.exists() is False
 
 
 def test_execution_domain_uses_linux_seal_uapi_when_python_omits_names() -> None:

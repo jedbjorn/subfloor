@@ -633,6 +633,73 @@ def test_managed_identity_mismatch_refuses_immediately_without_retry(
     assert sleeps == []
 
 
+def test_managed_authority_refusal_preserves_model_and_native_inference(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    stopped: list[dict[str, object]] = []
+
+    def refuse(**_kwargs):
+        raise deepseek_web.DeepSeekWebError(
+            "HARNESS_API_IDENTITY_MISMATCH", "managed API identity changed"
+        )
+
+    monkeypatch.setattr(deepseek_web, "bind_session_identity", refuse)
+    monkeypatch.setattr(
+        deepseek_web,
+        "stop",
+        lambda **kwargs: stopped.append(dict(kwargs)) or {"stopped": True},
+    )
+    live = FakeHost()
+    ctx = context(tmp_path, FakeHost())
+    adapter = DeepSeekAdapter(client_factory=lambda: live)
+
+    with pytest.raises(AdapterError) as denied:
+        adapter.start(ctx, "managed turn must fail closed")
+
+    assert denied.value.code == "HARNESS_API_IDENTITY_MISMATCH"
+    assert live.calls == []
+    assert stopped == []
+
+    route = selected_route(live)
+    native_session = "native-unbound-session"
+    created = live.call(
+        "session.create", {"sessionId": native_session, "cwd": str(tmp_path)}
+    )
+    selected = live.call(
+        "session.selectModel",
+        {
+            "sessionId": native_session,
+            "provider": route.provider,
+            "model": route.model,
+            "reasoningEffort": "high",
+        },
+    )
+    accepted = live.call(
+        "session.prompt",
+        {
+            "sessionId": native_session,
+            "mode": "queue",
+            "content": [{"type": "text", "text": "native chat remains available"}],
+        },
+    )
+
+    assert route.selector == "acme-dynamic/model-7"
+    assert created == {"sessionId": native_session, "agentPreset": None}
+    assert selected == {
+        "selected": {
+            "provider": "acme-dynamic",
+            "model": "model-7",
+            "reasoningEffort": "high",
+        }
+    }
+    assert accepted == {"accepted": True}
+    assert [method for method, _payload in live.calls][-3:] == [
+        "session.create",
+        "session.selectModel",
+        "session.prompt",
+    ]
+
+
 def test_browser_readiness_exhaustion_becomes_alias_free_chat_only(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1788,6 +1855,44 @@ def test_one_shot_retries_transient_readiness_then_runs_only_that_invocation(
         "root_session_id": invocations[0]["session_ref"],
         "quiesced": True,
     }]
+
+
+def test_one_shot_readiness_exhaustion_fails_only_that_invocation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    attempts: list[int] = []
+    sleeps: list[float] = []
+    invoked = mock.Mock()
+    retirements: list[dict[str, object]] = []
+
+    def unavailable(*_args, **_kwargs):
+        attempts.append(1)
+        raise deepseek_web.DeepSeekWebError(
+            "HARNESS_HOST_UNAVAILABLE", "Host is still restarting"
+        )
+
+    monkeypatch.setenv("SC_API_TOKEN", "test-shell-token")
+    monkeypatch.setenv("SC_API_BASE", "http://127.0.0.1:8837")
+    monkeypatch.setenv("SC_SHELL_ID", "4")
+    monkeypatch.setenv("SC_SHELL_SHORTNAME", "DEV4")
+    monkeypatch.setenv("SC_SHELL_WORKTREE", str(tmp_path))
+    monkeypatch.setattr(deepseek_web, "ensure", unavailable)
+    monkeypatch.setattr(deepseek_one_shot.time, "sleep", sleeps.append)
+    monkeypatch.setattr(deepseek_one_shot, "_run", invoked)
+    monkeypatch.setattr(
+        deepseek_web,
+        "retire_session_identity",
+        lambda **kwargs: retirements.append(dict(kwargs)) or {"state": "terminal"},
+    )
+
+    with pytest.raises(deepseek_host.DeepSeekHostError) as denied:
+        deepseek_one_shot.run("acme-dynamic/model-7", "high", "prompt")
+
+    assert denied.value.code == "HARNESS_HOST_UNAVAILABLE"
+    assert attempts == [1, 1, 1]
+    assert sleeps == [0.05, 0.05]
+    invoked.assert_not_called()
+    assert retirements == []
 
 
 def test_one_shot_authority_mismatch_refuses_without_readiness_retry(
