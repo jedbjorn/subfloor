@@ -13,6 +13,10 @@ from pathlib import Path
 from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
+OLLAMA_ACCEPTANCE = json.loads(
+    (ROOT / "tests" / "fixtures" / "ollama_live_native_acceptance.json")
+    .read_text()
+)
 sys.path.insert(0, str(ROOT / ".super-coder" / "api"))
 sys.path.insert(0, str(ROOT / ".super-coder" / "scripts"))
 
@@ -692,18 +696,25 @@ class BindingIdentityTest(unittest.TestCase):
     def test_cli_live_resolution_pins_all_decision_267_models_without_provider_calls(
         self,
     ) -> None:
-        selectors = (
-            "ollama-cloud/deepseek-v4-flash",
-            "ollama-cloud/glm-5.2",
-            "ollama-cloud/gpt-oss:120b",
-            "ollama-cloud/qwen3.5:397b",
-            "ollama-cloud/gemma4:31b",
-        )
+        selectors = tuple(OLLAMA_ACCEPTANCE["models"])
+        option_id = OLLAMA_ACCEPTANCE["native_option_id"]
+        stored = OLLAMA_ACCEPTANCE["stored_opencode"]
+        stale_catalogue = mock.Mock()
+        stale_catalogue.execute.return_value.fetchone.return_value = {
+            "harness": "opencode",
+            "selector": OLLAMA_ACCEPTANCE["glm_selector"],
+            "availability": "available",
+            "stale": stored["stale"],
+            "last_seen_at": stored["last_seen_at"],
+            "generation_id": stored["catalogue_generation"],
+            "source_fingerprint": stored["source_fingerprint"],
+            "harness_version": stored["harness_version"],
+        }
         for harness in ("opencode", "deepseek"):
             for selector in selectors:
                 observation = controlled_observation(None, harness=harness)
                 observation["advertised_options_by_model"] = {
-                    selector: ["MAX.Future", "low"]
+                    selector: ["high", option_id]
                 }
                 with self.subTest(harness=harness, selector=selector), mock.patch.object(
                     model_catalog,
@@ -711,10 +722,10 @@ class BindingIdentityTest(unittest.TestCase):
                     return_value=observation,
                 ) as probe:
                     resolved = routes_cli.resolve(
-                        None,
+                        stale_catalogue,
                         harness,
                         selector,
-                        effort="MAX.Future",
+                        effort=option_id,
                         shell="DEV5",
                     )
 
@@ -723,15 +734,22 @@ class BindingIdentityTest(unittest.TestCase):
                 self.assertEqual(resolved["binding"]["contract_version"], 3)
                 self.assertEqual(resolved["selector"], selector)
                 self.assertEqual(
-                    resolved["binding"]["native_option_id"], "MAX.Future"
+                    resolved["binding"]["native_option_id"], option_id
                 )
+                self.assertIsNone(
+                    resolved["binding"]["catalogue_generation"]
+                )
+                self.assertEqual(resolved["binding"]["adapter_metadata"], {})
                 self.assertEqual(
                     resolved["command"],
                     [
                         "./sc", "run", "DEV5", "--harness", harness,
-                        "-m", selector, "--effort", "MAX.Future",
+                        "-m", selector, "--effort", option_id,
                     ],
                 )
+                self.assertNotIn("thinking_evidence_stale", json.dumps(resolved))
+
+        stale_catalogue.execute.assert_not_called()
 
         selector = selectors[1]
         observation = controlled_observation(None, harness="opencode")
@@ -759,7 +777,7 @@ class BindingIdentityTest(unittest.TestCase):
             return_value=missing,
         ):
             refused = routes_cli.resolve(
-                None, "opencode", selector, effort="MAX.Future"
+                None, "opencode", selector, effort=option_id
             )
         self.assertFalse(refused["ok"])
         self.assertEqual(refused["code"], "native_route_unavailable")
@@ -801,8 +819,12 @@ class BindingIdentityTest(unittest.TestCase):
                 route_bindings.verify_stored_v2_before_first_turn(
                     None,
                     binding,
-                    source_fingerprint="f" * 64,
-                    harness_version="obsolete-version",
+                    source_fingerprint=OLLAMA_ACCEPTANCE[
+                        "stored_opencode"
+                    ]["source_fingerprint"],
+                    harness_version=OLLAMA_ACCEPTANCE[
+                        "stored_opencode"
+                    ]["harness_version"],
                 )
             live_probe.assert_called_once_with(
                 binding["harness"], binding["requested_model"]

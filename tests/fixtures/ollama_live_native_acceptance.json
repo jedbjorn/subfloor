@@ -1,0 +1,38 @@
+{
+  "decision_id": 267,
+  "models": [
+    "ollama-cloud/deepseek-v4-flash",
+    "ollama-cloud/glm-5.2",
+    "ollama-cloud/gpt-oss:120b",
+    "ollama-cloud/qwen3.5:397b",
+    "ollama-cloud/gemma4:31b"
+  ],
+  "glm_selector": "ollama-cloud/glm-5.2",
+  "native_option_id": "max",
+  "stored_opencode": {
+    "harness_version": "1.18.22",
+    "catalogue_generation": "11111111111111111111111111111111",
+    "source_fingerprint": "3333333333333333333333333333333333333333333333333333333333333333",
+    "last_seen_at": "2026-07-01T00:00:00+00:00",
+    "stale": 1
+  },
+  "live_opencode": {
+    "version": "1.18.23",
+    "connected": ["ollama-cloud"],
+    "variants": {
+      "high": {
+        "reasoningEffort": "high"
+      },
+      "max": {
+        "reasoningEffort": "max",
+        "futureProviderField": {
+          "preserved": true
+        }
+      }
+    }
+  },
+  "live_deepseek": {
+    "native_option_ids": ["high", "max"],
+    "native_default_option_id": "max"
+  }
+}
