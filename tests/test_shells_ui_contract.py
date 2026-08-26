@@ -39,7 +39,7 @@ def run_js(script: str) -> dict:
 
 def test_thinking_selector_state_matrix_is_route_aware():
     helper = APP[
-        APP.index("function thinkingLevelState"):
+        APP.index("function nativeOptionLabel"):
         APP.index("function dmModelPicker")
     ]
     script = helper + r"""
@@ -85,12 +85,131 @@ console.log(JSON.stringify({
     assert "Refresh & verify" in result["stale"]["guidance"]
 
 
+def test_live_native_option_renderer_preserves_five_model_projection_exactly():
+    helper = APP[
+        APP.index("function nativeOptionLabel"):
+        APP.index("function dmModelPicker")
+    ]
+    script = r"""
+function el(_tag, attrs = {}) { return {...attrs}; }
+function select() {
+  return {
+    children: [], disabled: false, title: "",
+    replaceChildren() { this.children = []; },
+    append(value) { this.children.push(value); },
+  };
+}
+""" + helper + r"""
+const modelIds = [
+  "ollama-cloud/deepseek-v4-flash",
+  "ollama-cloud/glm-5.2",
+  "ollama-cloud/gpt-oss:120b",
+  "ollama-cloud/qwen3.5:397b",
+  "ollama-cloud/gemma4:31b",
+];
+const models = modelIds.map((id, index) => ({
+  id, availability: "available",
+  native_option_ids: [`MAX.Future/${index}`, `case-Sensitive:${index}`],
+}));
+const catalog = {stale: true, harnesses: {
+  opencode: {authority: "harness-live", stale: false, models},
+  deepseek: {authority: "harness-live", stale: false, models},
+}};
+const projections = [];
+for (const harness of ["opencode", "deepseek"]) {
+  for (const model of modelIds) {
+    const control = select();
+    const advertised = models.find((candidate) => candidate.id === model)
+      .native_option_ids;
+    const state = renderNativeOptionControl(
+      control, harness, catalog, model, advertised[0]);
+    projections.push({
+      harness, model, disabled: control.disabled,
+      values: control.children.map((option) => option.value),
+      labels: control.children.map((option) => option.textContent),
+      selected: state.selected,
+      advertised,
+    });
+  }
+}
+const disappeared = select();
+const disappearedState = renderNativeOptionControl(
+  disappeared, "opencode", catalog, modelIds[0], "Gone.Option");
+const noOptionsCatalog = structuredClone(catalog);
+noOptionsCatalog.harnesses.deepseek.models[0].native_option_ids = [];
+const noOptions = select();
+const noOptionsState = renderNativeOptionControl(
+  noOptions, "deepseek", noOptionsCatalog, modelIds[0], null);
+const failedCatalog = structuredClone(catalog);
+failedCatalog.harnesses.opencode.error = "managed seat unavailable";
+const failed = select();
+const failedState = renderNativeOptionControl(
+  failed, "opencode", failedCatalog, modelIds[0], "MAX.Future/0");
+console.log(JSON.stringify({
+  projections,
+  disappeared: {
+    requiresConfirmation: disappearedState.requiresConfirmation,
+    options: disappeared.children,
+  },
+  noOptions: {
+    state: noOptionsState,
+    options: noOptions.children,
+    disabled: noOptions.disabled,
+  },
+  failed: {
+    state: failedState,
+    options: failed.children,
+    disabled: failed.disabled,
+  },
+}));
+"""
+    result = run_js(script)
+    assert len(result["projections"]) == 10
+    assert {projection["model"] for projection in result["projections"]} == {
+        "ollama-cloud/deepseek-v4-flash",
+        "ollama-cloud/glm-5.2",
+        "ollama-cloud/gpt-oss:120b",
+        "ollama-cloud/qwen3.5:397b",
+        "ollama-cloud/gemma4:31b",
+    }
+    for projection in result["projections"]:
+        assert projection["disabled"] is False
+        assert projection["values"] == ["", *projection["advertised"]]
+        assert projection["labels"] == ["Harness default", *projection["advertised"]]
+        assert projection["selected"] == projection["advertised"][0]
+    assert result["disappeared"]["requiresConfirmation"] is True
+    assert [option["textContent"] for option in result["disappeared"]["options"]] == [
+        "Selection disappeared — confirm a choice",
+        "Harness default",
+        "MAX.Future/0",
+        "case-Sensitive:0",
+    ]
+    assert result["disappeared"]["options"][0]["disabled"] is True
+    assert result["disappeared"]["options"][0]["selected"] is True
+    assert result["disappeared"]["options"][0]["value"] == (
+        "__sc_native_confirmation_required__"
+    )
+    assert result["noOptions"]["disabled"] is False
+    assert [option["textContent"] for option in result["noOptions"]["options"]] == [
+        "Harness default",
+    ]
+    assert result["noOptions"]["state"]["requiresConfirmation"] is False
+    assert result["failed"]["disabled"] is True
+    assert result["failed"]["state"]["native"] is True
+    assert result["failed"]["state"]["supported"] == []
+    assert [option["textContent"] for option in result["failed"]["options"]] == [
+        "Live options unavailable",
+    ]
+
+
 def test_default_models_saves_model_and_effort_atomically():
     assert 'model: null, effort: null' in DEFAULT_MODELS
-    assert 'model: value, effort: state.selected' in DEFAULT_MODELS
+    assert 'model: value, effort,' in DEFAULT_MODELS
     assert 'model: row.model, effort' in DEFAULT_MODELS
     assert 'row.effort_state = "selection-required"' in DEFAULT_MODELS
     assert 'ariaLabel: `Thinking level for ${flavor} ${h}`' in DEFAULT_MODELS
+    assert "renderNativeOptionControl(" in DEFAULT_MODELS
+    assert "state.requiresConfirmation" in DEFAULT_MODELS
     assert "m.harness_support_state" in DEFAULT_MODELS
     assert "new Set(fd.default_harnesses || fd.harnesses || [])" in DEFAULT_MODELS
     assert "star.disabled = !defaultHarnesses.has(h)" in DEFAULT_MODELS
