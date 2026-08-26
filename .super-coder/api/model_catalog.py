@@ -1225,18 +1225,34 @@ def controlled_route_evidence(
     except Exception:  # noqa: BLE001 (unreadable live evidence is stale)
         entries = []
     entry = next((item for item in entries if item["id"] == selector), None)
-    if (
+    route_advertised = bool(
         entry is not None
         and entry.get("availability") == "available"
         and _compatible_route_status(harness, entry, status)
-    ):
+    )
+    if route_advertised:
         fingerprint = _entry_evidence(
             harness, entry, status
         )["source_fingerprint"]
+    advertised_options_by_model = None
+    if route_advertised:
+        assert entry is not None
+        if harness == "opencode":
+            native_variants = entry.get("native_variant_ids") or {}
+            native_option_ids = (
+                list(native_variants.values())
+                if isinstance(native_variants, dict)
+                else []
+            )
+        else:
+            supported = entry.get("supported_efforts") or []
+            native_option_ids = list(supported) if isinstance(supported, list) else []
+        advertised_options_by_model = {selector: native_option_ids}
     return {
         "runtime_status": status,
         "runtime_scope": scope,
         "source_fingerprint": fingerprint,
+        "advertised_options_by_model": advertised_options_by_model,
     }
 
 

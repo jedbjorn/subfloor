@@ -461,6 +461,7 @@ class SprintBoundRouteDispatchProof(unittest.TestCase):
             "runtime_status": status,
             "runtime_scope": scope,
             "source_fingerprint": self.FINGERPRINT,
+            "advertised_options_by_model": {self.SELECTOR: ["high"]},
         }
 
     def _publish_successor_catalogue(self, *, retain_high: bool = False) -> None:
@@ -608,6 +609,50 @@ class SprintBoundRouteDispatchProof(unittest.TestCase):
         self.assertIsNone(projection.effort)
         self.assertEqual(projection.argument_tail, ())
 
+    def test_opencode_harness_default_survives_arm_queue_broker_and_launch(
+        self,
+    ) -> None:
+        status, _scope = self._runtime("opencode")
+        sprint_id = self._seed_sprint(
+            harness="opencode", model=None, effort=None
+        )
+
+        with mock.patch.object(
+            model_catalog, "harness_runtime_status", return_value=status
+        ):
+            wake_id = self._arm(sprint_id)
+            broker_run = self._deliver_and_claim(wake_id)
+        context, launch = self._prepare(broker_run)
+        projection = route_transport.context_projection(context, "opencode")
+
+        self.assertEqual(
+            tuple(self.con.execute(
+                "SELECT state,attempt_count,last_error "
+                "FROM sprint_wake_outbox WHERE wake_id=?",
+                (wake_id,),
+            ).fetchone()),
+            ("delivered", 1, None),
+        )
+        self.assertEqual(broker_run.route_contract_version, 2)
+        self.assertIsNone(broker_run.model)
+        self.assertIsNone(broker_run.effort)
+        self.assertEqual(broker_run.route_binding["transport"], "native-default")
+        self.assertEqual(
+            broker_run.route_binding["control_state"], "harness-default"
+        )
+        self.assertIsNone(launch["model"])
+        self.assertIsNone(launch["effort"])
+        self.assertEqual(launch["route_binding"], broker_run.route_binding)
+        self.assertEqual(launch["binding_digest"], broker_run.binding_digest)
+        self.assertIsNone(context.model)
+        self.assertIsNone(context.effort)
+        self.assertIsNone(projection.model)
+        self.assertIsNone(projection.effort)
+        self.assertEqual(projection.argument_tail, ())
+        with self.assertRaises(route_bindings.RouteResolutionError) as raised:
+            route_bindings.live_native_selection(broker_run.route_binding)
+        self.assertEqual(raised.exception.code, "unsupported_route_contract")
+
     def test_opencode_dispatch_uses_bound_variant_after_catalogue_changes(self) -> None:
         observation = self._seed_opencode_catalogue()
         sprint_id = self._seed_sprint(
@@ -695,7 +740,7 @@ class SprintBoundRouteDispatchProof(unittest.TestCase):
             },
         )
 
-    def test_stale_binding_refuses_before_conversation_or_prompt_dispatch(self) -> None:
+    def test_legacy_binding_ignores_freshness_when_exact_ids_remain(self) -> None:
         observation = self._seed_opencode_catalogue()
         sprint_id = self._seed_sprint(
             harness="opencode", model=self.SELECTOR, effort="high"
@@ -706,7 +751,8 @@ class SprintBoundRouteDispatchProof(unittest.TestCase):
             wake_id = self._arm(sprint_id)
             stored_provenance = tuple(
                 self.con.execute(
-                    "SELECT source_fingerprint,harness_version FROM "
+                    "SELECT binding.binding_json,binding.binding_digest,"
+                    "binding.source_fingerprint,binding.harness_version FROM "
                     "sprint_participant_route_bindings binding "
                     "JOIN sprint_participants participant "
                     "ON participant.active_route_binding_id=binding.binding_id "
@@ -718,6 +764,9 @@ class SprintBoundRouteDispatchProof(unittest.TestCase):
             )
             self._publish_successor_catalogue(retain_high=True)
             observation["source_fingerprint"] = self.SUCCESSOR_FINGERPRINT
+            observation["advertised_options_by_model"] = {
+                self.SELECTOR: ["low", "high"]
+            }
             deliveries: list[tuple[str, str, str]] = []
             outcome = sprint_message_delivery.SprintWakeDeliveryService(
                 self.con, force_new_quiet_seconds=0
@@ -729,13 +778,15 @@ class SprintBoundRouteDispatchProof(unittest.TestCase):
             )
 
         self.assertIsNotNone(outcome)
-        self.assertEqual(stored_provenance, (self.FINGERPRINT, "1.18.9"))
-        self.assertEqual((wake_id, "pending", 1), (
+        self.assertEqual((wake_id, "delivered", 1), (
             outcome.wake_id,
             outcome.state,
             outcome.attempt_number,
         ))
-        self.assertEqual(deliveries, [])
+        self.assertEqual(len(deliveries), 1)
+        self.assertIn("Sprint 1 armed", deliveries[0][1])
+        self.assertIn("model=openai/sprint-bound-model", deliveries[0][1])
+        self.assertIn("Thinking level=high", deliveries[0][1])
         current = json.loads(
             self.con.execute(
                 "SELECT effort_metadata FROM model_routes "
@@ -748,16 +799,19 @@ class SprintBoundRouteDispatchProof(unittest.TestCase):
         self.assertEqual(current["digests"]["high"], self.BOUND_DIGEST)
         self.assertEqual(
             tuple(
-                tuple(row)
-                for row in self.con.execute(
-                    "SELECT COUNT(*) FROM conversations UNION ALL "
-                    "SELECT COUNT(*) FROM conversation_messages UNION ALL "
-                    "SELECT COUNT(*) FROM conversation_outbox UNION ALL "
-                    "SELECT COUNT(*) FROM conversation_runs UNION ALL "
-                    "SELECT COUNT(*) FROM active_shell_chats"
-                ).fetchall()
+                self.con.execute(
+                    "SELECT binding.binding_json,binding.binding_digest,"
+                    "binding.source_fingerprint,binding.harness_version FROM "
+                    "sprint_participant_route_bindings binding "
+                    "JOIN sprint_participants participant "
+                    "ON participant.active_route_binding_id=binding.binding_id "
+                    "JOIN sprint_wake_outbox wake "
+                    "ON wake.participant_id=participant.participant_id "
+                    "WHERE wake.wake_id=?",
+                    (wake_id,),
+                ).fetchone()
             ),
-            ((0,), (0,), (0,), (0,), (0,)),
+            stored_provenance,
         )
         self.assertEqual(
             tuple(
@@ -768,10 +822,76 @@ class SprintBoundRouteDispatchProof(unittest.TestCase):
                 ).fetchone()
             ),
             (
+                "delivered",
+                1,
+                None,
+            ),
+        )
+
+    def test_legacy_binding_refuses_when_exact_option_disappears(self) -> None:
+        observation = self._seed_opencode_catalogue()
+        sprint_id = self._seed_sprint(
+            harness="opencode", model=self.SELECTOR, effort="high"
+        )
+        with mock.patch.object(
+            model_catalog, "controlled_route_evidence", return_value=observation
+        ):
+            wake_id = self._arm(sprint_id)
+            immutable = tuple(self.con.execute(
+                "SELECT binding.binding_json,binding.binding_digest FROM "
+                "sprint_participant_route_bindings binding "
+                "JOIN sprint_participants participant "
+                "ON participant.active_route_binding_id=binding.binding_id "
+                "JOIN sprint_wake_outbox wake "
+                "ON wake.participant_id=participant.participant_id "
+                "WHERE wake.wake_id=?",
+                (wake_id,),
+            ).fetchone())
+            self._publish_successor_catalogue()
+            observation["source_fingerprint"] = self.SUCCESSOR_FINGERPRINT
+            observation["advertised_options_by_model"] = {
+                self.SELECTOR: ["xhigh"]
+            }
+            deliveries: list[tuple[str, str, str]] = []
+            outcome = sprint_message_delivery.SprintWakeDeliveryService(
+                self.con, force_new_quiet_seconds=0
+            ).deliver_once(
+                "missing-bound-option-proof",
+                lambda conversation_id, prompt, key: deliveries.append(
+                    (conversation_id, prompt, key)
+                ),
+            )
+
+        self.assertIsNotNone(outcome)
+        self.assertEqual(
+            (outcome.wake_id, outcome.state, outcome.attempt_number),
+            (wake_id, "pending", 1),
+        )
+        self.assertEqual(deliveries, [])
+        self.assertEqual(
+            tuple(self.con.execute(
+                "SELECT binding.binding_json,binding.binding_digest FROM "
+                "sprint_participant_route_bindings binding "
+                "JOIN sprint_participants participant "
+                "ON participant.active_route_binding_id=binding.binding_id "
+                "JOIN sprint_wake_outbox wake "
+                "ON wake.participant_id=participant.participant_id "
+                "WHERE wake.wake_id=?",
+                (wake_id,),
+            ).fetchone()),
+            immutable,
+        )
+        self.assertEqual(
+            tuple(self.con.execute(
+                "SELECT state,attempt_count,last_error "
+                "FROM sprint_wake_outbox WHERE wake_id=?",
+                (wake_id,),
+            ).fetchone()),
+            (
                 "pending",
                 1,
-                "route_evidence_stale: Stored Sprint route evidence changed "
-                "before its first native turn",
+                "native_route_unavailable: Bound native option is not "
+                "advertised by the current harness",
             ),
         )
 
@@ -883,7 +1003,7 @@ class SprintBoundRouteDispatchProof(unittest.TestCase):
             ((0,), (0,), (0,), (0,), (0,)),
         )
 
-    def test_pre_native_failure_does_not_bypass_later_stale_check(self) -> None:
+    def test_pre_native_failure_rechecks_live_ids_without_freshness_rejection(self) -> None:
         observation = self._seed_opencode_catalogue()
         sprint_id = self._seed_sprint(
             harness="opencode", model=self.SELECTOR, effort="high"
@@ -914,6 +1034,9 @@ class SprintBoundRouteDispatchProof(unittest.TestCase):
 
             self._publish_successor_catalogue(retain_high=True)
             observation["source_fingerprint"] = self.SUCCESSOR_FINGERPRINT
+            observation["advertised_options_by_model"] = {
+                self.SELECTOR: ["low", "high"]
+            }
             participants = {
                 str(row["role"]): int(row["participant_id"])
                 for row in self.con.execute(
@@ -940,6 +1063,14 @@ class SprintBoundRouteDispatchProof(unittest.TestCase):
                     "SELECT COUNT(*) FROM conversation_runs"
                 )
             )
+            immutable = tuple(self.con.execute(
+                "SELECT binding.binding_json,binding.binding_digest FROM "
+                "sprint_participant_route_bindings binding "
+                "JOIN sprint_participants participant "
+                "ON participant.active_route_binding_id=binding.binding_id "
+                "WHERE participant.participant_id=?",
+                (participants["developer"],),
+            ).fetchone())
             deliveries: list[tuple[str, str, str]] = []
             outcome = sprint_message_delivery.SprintWakeDeliveryService(
                 self.con, force_new_quiet_seconds=0
@@ -952,20 +1083,29 @@ class SprintBoundRouteDispatchProof(unittest.TestCase):
 
         self.assertIsNotNone(outcome)
         self.assertEqual(receipt.wake_id, outcome.wake_id)
-        self.assertEqual(("pending", 1), (outcome.state, outcome.attempt_number))
-        self.assertEqual(deliveries, [])
+        self.assertEqual(("delivered", 1), (outcome.state, outcome.attempt_number))
+        self.assertEqual(len(deliveries), 1)
         self.assertEqual(before, (1, 1, 1, 1))
         self.assertEqual(
-            tuple(
-                int(row[0])
-                for row in self.con.execute(
-                    "SELECT COUNT(*) FROM conversations UNION ALL "
-                    "SELECT COUNT(*) FROM conversation_messages UNION ALL "
-                    "SELECT COUNT(*) FROM conversation_outbox UNION ALL "
-                    "SELECT COUNT(*) FROM conversation_runs"
-                )
-            ),
-            before,
+            tuple(self.con.execute(
+                "SELECT binding.binding_json,binding.binding_digest FROM "
+                "sprint_participant_route_bindings binding "
+                "JOIN sprint_participants participant "
+                "ON participant.active_route_binding_id=binding.binding_id "
+                "WHERE participant.participant_id=?",
+                (participants["developer"],),
+            ).fetchone()),
+            immutable,
+        )
+        self.assertEqual(
+            self.con.execute("SELECT COUNT(*) FROM conversations").fetchone()[0],
+            2,
+        )
+        self.assertEqual(
+            self.con.execute(
+                "SELECT COUNT(*) FROM conversation_runs WHERE state='failed'"
+            ).fetchone()[0],
+            1,
         )
         self.assertEqual(
             tuple(
@@ -976,10 +1116,9 @@ class SprintBoundRouteDispatchProof(unittest.TestCase):
                 ).fetchone()
             ),
             (
-                "pending",
+                "delivered",
                 1,
-                "route_evidence_stale: Stored Sprint route evidence changed "
-                "before its first native turn",
+                None,
             ),
         )
 
