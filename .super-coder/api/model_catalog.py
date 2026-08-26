@@ -997,6 +997,8 @@ def latest_harness_error(con, harness: str) -> str | None:
 
 def _requires_high_effort(harness: str) -> bool:
     """Match run.py: high is implicit only when the adapter transports it."""
+    if harness in route_bindings.LIVE_NATIVE_HARNESSES:
+        return False
     try:
         cfg = json.loads((ADAPTERS / harness / "adapter.json").read_text())
     except Exception:  # noqa: BLE001

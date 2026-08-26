@@ -204,6 +204,11 @@ def controlled_bundle(
         "runtime_status": status,
         "runtime_scope": scope,
         "source_fingerprint": fingerprint,
+        **(
+            {"advertised_options_by_model": {selector: ["high"]}}
+            if harness in route_bindings.LIVE_NATIVE_HARNESSES
+            else {}
+        ),
     }
 
 
@@ -2248,7 +2253,7 @@ class RouteCliConnectionTest(unittest.TestCase):
         source_probe.assert_called_once_with(harness, "api-model")
         return exit_code, json.loads(output.getvalue())
 
-    def test_authenticated_controlled_routes_use_execution_seat_proof(self):
+    def test_authenticated_controlled_routes_use_live_execution_seat_proof(self):
         sandbox = {
             "runtime": "sandbox", "runtime_identity": "sandbox:test-image",
         }
@@ -2272,11 +2277,17 @@ class RouteCliConnectionTest(unittest.TestCase):
                 exit_code, result = self.authenticated_controlled(
                     harness, row, status=good, fingerprint="9" * 64,
                 )
-                self.assertEqual(exit_code, 2)
-                self.assertEqual(result["code"], "thinking_evidence_stale")
-                self.assertNotIn("binding", result)
-                self.assertNotIn("binding_digest", result)
-                self.assertNotIn("command", result)
+                if harness == "opencode":
+                    self.assertEqual(exit_code, 0, result)
+                    self.assertTrue(result["ok"])
+                    self.assertEqual(result["binding"]["contract_version"], 3)
+                    self.assertIsNone(result["binding"]["native_option_id"])
+                else:
+                    self.assertEqual(exit_code, 2)
+                    self.assertEqual(result["code"], "thinking_evidence_stale")
+                    self.assertNotIn("binding", result)
+                    self.assertNotIn("binding_digest", result)
+                    self.assertNotIn("command", result)
 
         codex = self.controlled_route("codex")
         cases = {
