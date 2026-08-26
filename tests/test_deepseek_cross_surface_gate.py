@@ -15,6 +15,7 @@ import os
 import shutil
 import socket
 import sqlite3
+import stat
 import subprocess
 import sys
 import threading
@@ -439,7 +440,7 @@ def _free_gateway_port() -> int:
 def test_stock_two_shell_cross_surface_refusals_are_side_effect_free(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """Exercise real identity, lease, Host/gateway and command boundaries."""
+    """Exercise real per-execution identity, Host/gateway and command boundaries."""
     dsh = shutil.which("dsh")
     if dsh is None:
         pytest.fail("pinned dsh 0.1.1-rc.2 is required for this production gate")
@@ -507,6 +508,9 @@ def test_stock_two_shell_cross_surface_refusals_are_side_effect_free(
             "DEEPSEEK_BASE_URL": provider.url,
             "DEEPSEEK_API_KEY": PROVIDER_TOKEN,
             "DSH_TELEMETRY_MODE": "DISABLED",
+            "SC_DEEPSEEK_WEB_STATE": str(root / "web-state.json"),
+            "SC_DEEPSEEK_WEB_LOCK": str(root / "web.lock"),
+            "SC_DEEPSEEK_WEB_LOG": str(root / "web.log"),
             # Launch preparation preserves the shell PATH.  Stock dsh is a
             # /usr/bin/env node script on CI, so the controlled identity must
             # retain that non-secret runtime dependency as well.
@@ -521,22 +525,16 @@ def test_stock_two_shell_cross_surface_refusals_are_side_effect_free(
         _assert_sc_mem_which(alice, display_name="Alice")
         _assert_sc_mem_which(bob, display_name="Bob")
 
-        # Same identity reuse, an overlapping different identity refusal, then
-        # a real handoff and restart.  Each whoami call hits the temporary API.
-        alice_lease = deepseek_web.acquire_shell_identity(env=alice)
+        # Both canonical identities reuse one neutral Host without a global
+        # shell lease. Each whoami call still hits the temporary API.
         try:
-            first = deepseek_web.ensure(
-                alice_worktree, env=alice, identity_lease=alice_lease
-            )
+            first = deepseek_web.ensure(alice_worktree, env=alice)
         except deepseek_web.DeepSeekWebError as exc:
             log = (root / "web.log").read_text(errors="replace")[-4_000:]
             pytest.fail(f"stock dsh startup failed: {exc}\n{log}")
-        reused = deepseek_web.ensure(alice_worktree, env=alice, identity_lease=alice_lease)
+        reused = deepseek_web.ensure(alice_worktree, env=alice)
         assert reused["reused"] is True
         old_generation = first["url"].split("sc_generation=", 1)[1]
-        with pytest.raises(deepseek_web.DeepSeekWebError, match="IDENTITY_BUSY"):
-            deepseek_web.ensure(bob_worktree, env=bob)
-        alice_lease.close()
         handed = deepseek_web.ensure(bob_worktree, env=bob)
         generation = handed["url"].split("sc_generation=", 1)[1]
         assert handed["host_identity"] == "neutral"
@@ -585,7 +583,7 @@ def test_stock_two_shell_cross_surface_refusals_are_side_effect_free(
         # A managed Browser/Sprint-shaped turn uses the real adapter and stock
         # Host, not a manually-created managed-looking chat.  Its immutable
         # binding, workspace membership, deterministic session ID, prompt,
-        # stream terminal, and lease release all cross production boundaries.
+        # stream terminal, and binding retirement all cross production boundaries.
         provider.requests.clear()
         for key, value in bob.items():
             monkeypatch.setenv(key, value)
@@ -750,10 +748,8 @@ def test_stock_two_shell_cross_surface_refusals_are_side_effect_free(
         generation = returned["url"].split("sc_generation=", 1)[1]
         cookie = _gateway_cookie(public_port, generation)
 
-        # A real public one-shot remains the owner through a live provider
-        # stream.  Arrival from the other canonical shell is refused until the
-        # stock Host has produced its terminal event, rather than merely while
-        # route/session setup is running.
+        # A real public one-shot remains bound through a live provider stream
+        # while the other canonical shell reuses the same neutral Host.
         for key, value in bob.items():
             monkeypatch.setenv(key, value)
         monkeypatch.setenv("SC_SHELL_WORKTREE", str(bob_worktree))
@@ -763,19 +759,24 @@ def test_stock_two_shell_cross_surface_refusals_are_side_effect_free(
         provider.hold = True
         one_shot_result: dict[str, Any] = {}
 
-        def run_one_shot() -> None:
+        def capture_one_shot(result: dict[str, Any], prompt: str) -> None:
             try:
-                one_shot_result["status"] = deepseek_one_shot.run(
-                    "deepseek-official/deepseek-v4-flash", "high", "held one-shot"
+                result["status"] = deepseek_one_shot.run(
+                    "deepseek-official/deepseek-v4-flash", "high", prompt
                 )
-            except BaseException as exc:  # asserted below in the parent thread
-                one_shot_result["error"] = exc
+            except deepseek_host.DeepSeekHostError as exc:
+                result["error"] = exc
 
-        one_shot = threading.Thread(target=run_one_shot, daemon=True)
+        one_shot = threading.Thread(
+            target=capture_one_shot,
+            args=(one_shot_result, "held one-shot"),
+            daemon=True,
+        )
         one_shot.start()
         assert provider.entered.wait(timeout=10), one_shot_result
-        with pytest.raises(deepseek_web.DeepSeekWebError, match="IDENTITY_BUSY"):
-            deepseek_web.ensure(alice_worktree, env=alice)
+        overlapping = deepseek_web.ensure(alice_worktree, env=alice)
+        assert overlapping["reused"] is True
+        assert overlapping["host_identity"] == "neutral"
         provider.release.set()
         one_shot.join(timeout=15)
         provider.hold = False
@@ -797,23 +798,20 @@ def test_stock_two_shell_cross_surface_refusals_are_side_effect_free(
             phase_result: dict[str, Any] = {}
             with monkeypatch.context() as phase_patch:
                 phase_patch.setattr(
-                    deepseek_host, "DeepSeekHostClient", lambda: blocker
+                    deepseek_host,
+                    "DeepSeekHostClient",
+                    lambda blocker=blocker: blocker,
                 )
-
-                def run_phase() -> None:
-                    try:
-                        phase_result["status"] = deepseek_one_shot.run(
-                            "deepseek-official/deepseek-v4-flash", "high",
-                            f"one-shot {phase}",
-                        )
-                    except BaseException as exc:
-                        phase_result["error"] = exc
-
-                phase_thread = threading.Thread(target=run_phase, daemon=True)
+                phase_thread = threading.Thread(
+                    target=capture_one_shot,
+                    args=(phase_result, f"one-shot {phase}"),
+                    daemon=True,
+                )
                 phase_thread.start()
                 assert blocker.entered.wait(timeout=10), phase
-                with pytest.raises(deepseek_web.DeepSeekWebError, match="IDENTITY_BUSY"):
-                    deepseek_web.ensure(alice_worktree, env=alice)
+                overlapping = deepseek_web.ensure(alice_worktree, env=alice)
+                assert overlapping["reused"] is True
+                assert overlapping["host_identity"] == "neutral"
                 blocker.release.set()
                 phase_thread.join(timeout=15)
             assert not phase_thread.is_alive(), phase
@@ -821,36 +819,28 @@ def test_stock_two_shell_cross_surface_refusals_are_side_effect_free(
             assert any(f"one-shot {phase}" in json.dumps(request) for request in provider.requests)
 
         # Force a provider stream loss after the prompt reached stock DSH.
-        # The one-shot must retain Bob's lease while cancellation is accepted
-        # and while history supplies terminal proof; Alice can acquire it only
-        # after the failed one-shot has finished its final close.
+        # Bob's exact binding remains responsible for cancellation and terminal
+        # proof while Alice continues to reuse the neutral Host independently.
         for phase in ("session.cancel", "session.history"):
             provider.requests.clear()
             blocker = _CancellationBlockingHost(phase)
             phase_result = {}
             with monkeypatch.context() as phase_patch:
                 phase_patch.setattr(
-                    deepseek_host, "DeepSeekHostClient", lambda: blocker
+                    deepseek_host,
+                    "DeepSeekHostClient",
+                    lambda blocker=blocker: blocker,
                 )
-
-                def run_cancel_phase() -> None:
-                    try:
-                        phase_result["status"] = deepseek_one_shot.run(
-                            "deepseek-official/deepseek-v4-flash", "high",
-                            f"one-shot {phase}",
-                        )
-                    except BaseException as exc:
-                        phase_result["error"] = exc
-
                 phase_thread = threading.Thread(
-                    target=run_cancel_phase, daemon=True
+                    target=capture_one_shot,
+                    args=(phase_result, f"one-shot {phase}"),
+                    daemon=True,
                 )
                 phase_thread.start()
                 assert blocker.entered.wait(timeout=10), phase
-                with pytest.raises(
-                    deepseek_web.DeepSeekWebError, match="IDENTITY_BUSY"
-                ):
-                    deepseek_web.ensure(alice_worktree, env=alice)
+                overlapping = deepseek_web.ensure(alice_worktree, env=alice)
+                assert overlapping["reused"] is True
+                assert overlapping["host_identity"] == "neutral"
                 blocker.release.set()
                 phase_thread.join(timeout=15)
             assert not phase_thread.is_alive(), phase
@@ -868,8 +858,6 @@ def test_stock_two_shell_cross_surface_refusals_are_side_effect_free(
                 "type": "text", "text": f"one-shot {phase}",
             }]
             assert prompts[0]["sessionId"].startswith("sc-")
-            released = deepseek_web.acquire_shell_identity(env=alice)
-            released.close()
 
         # Recovery and public one-shot each use their production entry point.
         # A wrong authenticated durable identity fails before Host mutation.
@@ -888,17 +876,15 @@ def test_stock_two_shell_cross_surface_refusals_are_side_effect_free(
             DeepSeekAdapter().inspect(managed_id, context)
         assert _protected_snapshot(database) == baseline
 
-        # A true one-shot overlap holds the live identity lease.  It refuses
-        # before route/session/prompt work and leaves the same five stores
-        # untouched; a matching recovery check also proves archived sessions
-        # never drive history inspection.
+        # No global lease blocks another canonical one-shot. Model discovery
+        # remains available and reports the exact missing route while the same
+        # five protected stores stay untouched; a matching recovery check also
+        # proves archived sessions never drive history inspection.
         monkeypatch.setenv("SC_SHELL_ID", "42")
-        active = deepseek_web.acquire_shell_identity(env=bob)
-        try:
-            with pytest.raises(deepseek_host.DeepSeekHostError, match="IDENTITY_BUSY"):
-                deepseek_one_shot.run("missing-route", "default", "must not prompt")
-        finally:
-            active.close()
+        with pytest.raises(deepseek_host.DeepSeekHostError) as route_missing:
+            deepseek_one_shot.run("missing-route", "default", "must not prompt")
+        assert route_missing.value.code == "HARNESS_ROUTE_UNAVAILABLE"
+        assert _protected_snapshot(database) == baseline
         # Stock DSH does not retain an archive marker for an empty session and
         # may retire an imported session during later Host handoffs.  Create a
         # current prompted managed session so the archive check exercises the
@@ -968,16 +954,31 @@ def test_stock_two_shell_cross_surface_refusals_are_side_effect_free(
         reopened_generation = reopened["url"].split("sc_generation=", 1)[1]
         assert reopened_generation != generation
         state = json.loads((root / "web-state.json").read_text())
-        owner_only = {root / "deepseek-web-generation.json"}
         assert not (root / "deepseek-shell-api.json").exists()
         assert json.loads((root / "deepseek-web-generation.json").read_text())["generation"] == reopened_generation
         # The controlled provider key necessarily belongs to stock DSH's live
-        # process environment.  The engine-owned shell credentials below must
-        # never cross into either stock process or any durable surface.
+        # process environment.  Engine-owned shell credentials may exist only
+        # in unique owner-only binding artifacts and must never cross into
+        # either stock process or another durable surface.
         secrets = (ALICE_TOKEN, BOB_TOKEN)
         capabilities = (
             stale_generation, old_generation, generation, reopened_generation,
         )
+        identity_registry = deepseek_web._identity_registry(bob)
+        credential_paths = set(identity_registry.layout.credentials.glob("*.json"))
+        assert credential_paths
+        for credential_path in credential_paths:
+            metadata = credential_path.lstat()
+            assert stat.S_ISREG(metadata.st_mode)
+            assert stat.S_IMODE(metadata.st_mode) == 0o600
+            assert not credential_path.is_symlink()
+            credential = json.loads(credential_path.read_text())
+            assert credential["contract"] == "sc-dsh-binding-credential-v1"
+            assert credential["token"] in secrets
+        owner_only = {
+            root / "deepseek-web-generation.json",
+            *credential_paths,
+        }
         for pid_key in ("web_pid", "relay_pid"):
             command = "\0".join(deepseek_web._process_cmdline(state[pid_key]))
             assert not any(value in command for value in (*secrets, *capabilities))

@@ -5,6 +5,8 @@ import asyncio
 import copy
 import json
 import sys
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, Mapping
 from unittest import mock
@@ -27,7 +29,6 @@ from conversation_adapters.base import (  # noqa: E402
     NativeTurn,
 )
 from conversation_adapters.deepseek import (  # noqa: E402
-    MANAGED_IDENTITY_WAIT_SECONDS,
     DeepSeekAdapter,
     _run_ref,
 )
@@ -83,11 +84,6 @@ def stock_cli_version(monkeypatch: pytest.MonkeyPatch) -> None:
 @pytest.fixture(autouse=True)
 def canonical_identity(monkeypatch: pytest.MonkeyPatch) -> None:
     """Keep unit Hosts isolated while every managed path has canonical identity."""
-    class Lease:
-        def close(self) -> None:
-            return None
-
-    monkeypatch.setattr(deepseek_web, "acquire_shell_identity", lambda **_kwargs: Lease())
     monkeypatch.setattr(deepseek_web, "ensure", lambda *_args, **_kwargs: {})
     monkeypatch.setattr(
         deepseek_web, "bind_session_identity", lambda **_kwargs: {}
@@ -557,26 +553,38 @@ def test_browser_start_stream_and_exact_call_order(tmp_path: Path) -> None:
     assert live.streams[0].closed
 
 
-def test_managed_browser_queues_for_the_shared_host_identity(
+def test_managed_clients_overlap_without_a_global_identity_queue(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    captured: list[float] = []
+    entered = threading.Barrier(2)
+    ensured: list[str] = []
 
-    class Lease:
-        def close(self) -> None:
-            return None
+    def ensure(_worktree, **kwargs):
+        ensured.append(kwargs["env"]["SC_SHELL_SHORTNAME"])
+        entered.wait(timeout=2)
+        return {}
 
-    def acquire(**kwargs):
-        captured.append(kwargs["wait_seconds"])
-        return Lease()
+    monkeypatch.setattr(deepseek_web, "ensure", ensure)
+    hosts = (FakeHost(), FakeHost())
+    contexts = (context(tmp_path, hosts[0]), context(tmp_path, hosts[1]))
+    contexts[0].env["SC_SHELL_SHORTNAME"] = "ALICE"
+    contexts[1].env["SC_SHELL_SHORTNAME"] = "BOB"
+    adapters = tuple(DeepSeekAdapter(client_factory=lambda host=host: host) for host in hosts)
 
-    monkeypatch.setattr(deepseek_web, "acquire_shell_identity", acquire)
-    live = FakeHost()
-    adapter = DeepSeekAdapter(client_factory=lambda: live)
-    adapter._managed_client(context(tmp_path, live), "sc-" + "9" * 32)
-    adapter.close()
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        futures = [
+            pool.submit(
+                adapter._managed_client,
+                managed_context,
+                "sc-" + digit * 32,
+            )
+            for adapter, managed_context, digit in zip(adapters, contexts, ("8", "9"))
+        ]
+        assert [future.result(timeout=3) for future in futures] == list(hosts)
 
-    assert captured == [MANAGED_IDENTITY_WAIT_SECONDS]
+    assert sorted(ensured) == ["ALICE", "BOB"]
+    assert not hasattr(deepseek_web, "acquire_shell_identity")
+    assert all(not hasattr(adapter, "_shell_lease") for adapter in adapters)
 
 
 def test_managed_identity_retries_only_transient_readiness_within_budget(
@@ -784,24 +792,11 @@ def test_sprint_readiness_exhaustion_refuses_only_pre_prompt_turn(
     assert live.calls == calls_before
 
 
-def test_candidate_managed_turn_releases_containment_only_after_exact_binding(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize("mode", ["candidate", "promoted"])
+def test_proof_managed_turn_uses_per_execution_binding_without_containment(
+    mode: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     events: list[str] = []
-
-    class Lease:
-        closed = False
-
-        def close(self) -> None:
-            self.closed = True
-            events.append("lease-closed")
-
-    lease = Lease()
-    monkeypatch.setattr(
-        deepseek_web,
-        "acquire_shell_identity",
-        lambda **_kwargs: events.append("lease-acquired") or lease,
-    )
     monkeypatch.setattr(
         deepseek_web,
         "ensure",
@@ -811,7 +806,7 @@ def test_candidate_managed_turn_releases_containment_only_after_exact_binding(
         deepseek_web,
         "preflight_candidate_execution",
         lambda **_kwargs: events.append("candidate-preflight") or {
-            "mode": "candidate",
+            "mode": mode,
             "generation": 1,
             "root_session_id": "sc-" + "9" * 32,
             "plugin_contract_generation": "contract-one",
@@ -832,16 +827,13 @@ def test_candidate_managed_turn_releases_containment_only_after_exact_binding(
 
     assert client is fake
     assert events == [
-        "lease-acquired",
         "host-proven",
         "candidate-preflight",
         "binding-proven",
-        "lease-closed",
     ]
-    assert lease.closed is True
-    assert adapter._shell_lease is None
+    assert not hasattr(adapter, "_shell_lease")
     assert adapter._proof_authority == {
-        "mode": "candidate",
+        "mode": mode,
         "generation": 1,
         "root_session_id": "sc-" + "9" * 32,
         "plugin_contract_generation": "contract-one",
@@ -1002,9 +994,9 @@ def test_candidate_one_shot_refuses_ambient_capability_before_any_effect(
     effects: list[str] = []
     monkeypatch.setattr(
         deepseek_web,
-        "acquire_shell_identity",
-        lambda **_kwargs: effects.append("lease") or pytest.fail(
-            "candidate root refusal acquired containment"
+        "ensure",
+        lambda *_args, **_kwargs: effects.append("ensure") or pytest.fail(
+            "ambient proof authority reached Host readiness"
         ),
     )
     env = {
@@ -1049,10 +1041,6 @@ def test_candidate_one_shot_preflight_refusal_never_binds(
     }
     before = copy.deepcopy(persistent)
 
-    class Lease:
-        def close(self) -> None:
-            return None
-
     def refuse(**_kwargs):
         raise deepseek_web.DeepSeekWebError(
             code, f"one-shot {failure} proof refused"
@@ -1063,9 +1051,6 @@ def test_candidate_one_shot_preflight_refusal_never_binds(
         persistent["credentials"] += (b"credential-after",)
         pytest.fail("candidate refusal reached binding mutation")
 
-    monkeypatch.setattr(
-        deepseek_web, "acquire_shell_identity", lambda **_kwargs: Lease()
-    )
     monkeypatch.setattr(
         deepseek_web,
         "proof_root_from_environment",
@@ -1389,13 +1374,13 @@ def test_refusal_matrix_has_zero_independent_protected_effects(
     elif refusal == "shell_identity":
         operation = "start"
 
-        def refuse_identity(**_kwargs):
+        def refuse_identity(*_args, **_kwargs):
             raise deepseek_web.DeepSeekWebError(
                 "HARNESS_SHELL_IDENTITY_MISMATCH",
                 "controlled shell mismatch",
             )
 
-        monkeypatch.setattr(deepseek_web, "acquire_shell_identity", refuse_identity)
+        monkeypatch.setattr(deepseek_web, "ensure", refuse_identity)
 
     adapter = DeepSeekAdapter(client_factory=lambda: live)
     try:
@@ -1926,7 +1911,7 @@ def test_one_shot_authority_mismatch_refuses_without_readiness_retry(
     invoked.assert_not_called()
 
 
-def test_one_shot_uncertain_prompt_fences_future_handoff_before_lease_release(
+def test_one_shot_uncertain_prompt_creates_no_global_authority_marker(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     class UncertainHost(FakeHost):
@@ -1942,20 +1927,30 @@ def test_one_shot_uncertain_prompt_fences_future_handoff_before_lease_release(
             return super().call(method, payload)
 
     fake = UncertainHost()
-    fenced: list[str] = []
     monkeypatch.setattr(deepseek_host, "DeepSeekHostClient", lambda: fake)
-    monkeypatch.setattr(
-        deepseek_web,
-        "mark_unproven_execution",
-        lambda _env, session: fenced.append(session),
-    )
-
-    with pytest.raises(deepseek_host.DeepSeekHostError) as refused:
-        deepseek_one_shot._run("acme-dynamic/model-7", "high", "prompt", worktree=tmp_path)
+    state = tmp_path / "deepseek-web-state.json"
+    with (
+        mock.patch.dict(
+            deepseek_one_shot.os.environ,
+            {
+                "SC_API_TOKEN": "one-shot-token",
+                "SC_API_BASE": "http://127.0.0.1:8837",
+                "SC_SHELL_ID": "4",
+                "SC_SHELL_SHORTNAME": "DEV4",
+                "SC_DEEPSEEK_WEB_STATE": str(state),
+            },
+            clear=False,
+        ),
+        pytest.raises(deepseek_host.DeepSeekHostError) as refused,
+    ):
+        deepseek_one_shot._run(
+            "acme-dynamic/model-7", "high", "prompt", worktree=tmp_path
+        )
 
     assert refused.value.code == "HARNESS_ONE_SHOT_BUSY"
     prompts = [payload for method, payload in fake.calls if method == "session.prompt"]
     cancels = [payload for method, payload in fake.calls if method == "session.cancel"]
     assert len(prompts) == 1
     assert cancels == [{"sessionId": prompts[0]["sessionId"]}]
-    assert fenced == [prompts[0]["sessionId"]]
+    assert not state.with_name("deepseek-shell-identity-unproven.json").exists()
+    assert not hasattr(deepseek_web, "mark_unproven_execution")

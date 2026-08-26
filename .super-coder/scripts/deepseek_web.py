@@ -89,20 +89,6 @@ class DeepSeekWebError(RuntimeError):
         super().__init__(f"{code}: {detail}")
 
 
-class ShellIdentityLease:
-    """Exclusive process-credential ownership for one DeepSeek execution."""
-
-    def __init__(self, handle) -> None:
-        self._handle = handle
-
-    def close(self) -> None:
-        if self._handle is None:
-            return
-        fcntl.flock(self._handle, fcntl.LOCK_UN)
-        self._handle.close()
-        self._handle = None
-
-
 def _exact_engine_ref() -> str:
     try:
         result = subprocess.run(
@@ -154,161 +140,6 @@ def _log_path() -> Path:
 def _lock_path() -> Path:
     override = os.environ.get("SC_DEEPSEEK_WEB_LOCK")
     return Path(override) if override else LOCK
-
-
-def _identity_lock_path() -> Path:
-    return _state_path().with_name("deepseek-shell-identity.lock")
-
-
-def _unproven_path() -> Path:
-    return _state_path().with_name("deepseek-shell-identity-unproven.json")
-
-
-def _read_unproven() -> dict[str, Any] | None:
-    path = _unproven_path()
-    try:
-        metadata = path.lstat()
-        if path.is_symlink() or metadata.st_mode & 0o777 != 0o600:
-            raise OSError("unsafe unproven-work artifact")
-        with path.open("rb") as handle:
-            before = os.fstat(handle.fileno())
-            if (metadata.st_dev, metadata.st_ino) != (before.st_dev, before.st_ino):
-                raise OSError("proof artifact changed before reading")
-            value = json.load(handle)
-            after = os.fstat(handle.fileno())
-        if (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns) != (
-            after.st_dev,
-            after.st_ino,
-            after.st_size,
-            after.st_mtime_ns,
-        ):
-            raise OSError("proof artifact changed while reading")
-    except FileNotFoundError:
-        return None
-    except (OSError, json.JSONDecodeError) as exc:
-        raise DeepSeekWebError(
-            "HARNESS_SHELL_IDENTITY_BUSY",
-            "DeepSeek has unreadable unproven work; credential rotation is refused",
-        ) from exc
-    if not isinstance(value, Mapping):
-        raise DeepSeekWebError(
-            "HARNESS_SHELL_IDENTITY_BUSY",
-            "DeepSeek has invalid unproven work; credential rotation is refused",
-        )
-    session_id = value.get("session_id")
-    shell_id = value.get("shell_id")
-    shortname = value.get("shortname")
-    if (
-        not isinstance(session_id, str)
-        or re.fullmatch(r"sc-[0-9a-f]{32}", session_id) is None
-        or not isinstance(shell_id, int)
-        or shell_id <= 0
-        or not isinstance(shortname, str)
-        or not shortname
-    ):
-        raise DeepSeekWebError(
-            "HARNESS_SHELL_IDENTITY_BUSY",
-            "DeepSeek has invalid unproven work; credential rotation is refused",
-        )
-    return {"session_id": session_id, "shell_id": shell_id, "shortname": shortname}
-
-
-def mark_unproven_execution(env: Mapping[str, str], session_id: str) -> None:
-    shell_id = env.get("SC_SHELL_ID", "")
-    shortname = env.get("SC_SHELL_SHORTNAME", "")
-    if not shell_id.isdecimal() or int(shell_id) <= 0 or not shortname:
-        raise DeepSeekWebError(
-            "HARNESS_SHELL_IDENTITY_UNAVAILABLE",
-            "cannot preserve unproven DeepSeek work without canonical shell identity",
-        )
-    path = _unproven_path()
-    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
-    descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    try:
-        with os.fdopen(descriptor, "w") as handle:
-            os.fchmod(handle.fileno(), 0o600)
-            json.dump(
-                {
-                    "session_id": session_id,
-                    "shell_id": int(shell_id),
-                    "shortname": shortname,
-                },
-                handle,
-            )
-        os.replace(temporary, path)
-    except OSError:
-        try:
-            temporary.unlink()
-        except FileNotFoundError:
-            pass
-        raise
-
-
-def _clear_terminal_unproven(env: Mapping[str, str]) -> None:
-    marker = _read_unproven()
-    if marker is None:
-        return
-    if (
-        env.get("SC_SHELL_ID") != str(marker["shell_id"])
-        or env.get("SC_SHELL_SHORTNAME") != marker["shortname"]
-    ):
-        raise DeepSeekWebError(
-            "HARNESS_SHELL_IDENTITY_BUSY",
-            "another shell owns DeepSeek work without terminal proof",
-        )
-    state = _read_state()
-    service_port = state.get("service_port")
-    if not isinstance(service_port, int) or not _history_is_terminal(
-        service_port, marker["session_id"], 0
-    ):
-        raise DeepSeekWebError(
-            "HARNESS_SHELL_IDENTITY_BUSY",
-            "DeepSeek work has no terminal proof; credential rotation is refused",
-        )
-    try:
-        _unproven_path().unlink()
-    except FileNotFoundError:
-        pass
-
-
-def acquire_shell_identity(
-    *,
-    env: Mapping[str, str],
-    wait_seconds: float = 0.0,
-) -> ShellIdentityLease:
-    """Acquire the full-lifetime Host identity lease before any mutation.
-
-    Native Web and one-shot callers retain the fail-fast default. Managed
-    Managed conversation turns may opt into a bounded wait so simultaneous wake
-    turns serialize at the shared stock Host identity boundary.
-    """
-    if wait_seconds < 0:
-        raise ValueError("DeepSeek identity wait must be non-negative")
-    path = _identity_lock_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    handle = path.open("a+")
-    os.chmod(path, 0o600)
-    deadline = time.monotonic() + wait_seconds
-    while True:
-        try:
-            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            break
-        except BlockingIOError as exc:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                handle.close()
-                raise DeepSeekWebError(
-                    "HARNESS_SHELL_IDENTITY_BUSY",
-                    "another DeepSeek execution owns the shared Host credential",
-                ) from exc
-            time.sleep(min(0.05, remaining))
-    try:
-        _clear_terminal_unproven(env)
-    except Exception:
-        fcntl.flock(handle, fcntl.LOCK_UN)
-        handle.close()
-        raise
-    return ShellIdentityLease(handle)
 
 
 def _verify_shell_identity(env: Mapping[str, str]) -> None:
@@ -2224,15 +2055,11 @@ def ratchet_candidate_after_host_restart(
 
 
 def stop(*, env: Mapping[str, str] | None = None) -> dict[str, Any]:
-    """Stop only while holding the same identity lease as every acting path."""
+    """Stop the owned Host under the service lifecycle lock."""
     env = os.environ if env is None else env
-    lease = acquire_shell_identity(env=env)
-    try:
-        _verify_shell_identity(env)
-        with _service_lock():
-            return _stop_unlocked()
-    finally:
-        lease.close()
+    _verify_shell_identity(env)
+    with _service_lock():
+        return _stop_unlocked()
 
 
 def _existing_healthy(
@@ -2292,21 +2119,9 @@ def ensure(
     worktree: Path,
     *,
     env: Mapping[str, str] | None = None,
-    identity_lease: ShellIdentityLease | None = None,
     register_workspace: bool = True,
 ) -> dict[str, Any]:
     env = os.environ if env is None else env
-    if identity_lease is None:
-        lease = acquire_shell_identity(env=env)
-        try:
-            return ensure(
-                worktree,
-                env=env,
-                identity_lease=lease,
-                register_workspace=register_workspace,
-            )
-        finally:
-            lease.close()
     _verify_shell_identity(env)
     with _service_lock():
         if _disabled(env):

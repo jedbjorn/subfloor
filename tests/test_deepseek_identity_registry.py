@@ -2062,6 +2062,16 @@ def test_one_shot_unknown_cancellation_closes_binding_until_terminal_recovery(
         root = Path(raw)
         registry, worktree = registry_fixture(root)
         synthetic_health(registry)
+        create_binding(
+            registry,
+            worktree,
+            session_id="unrelated-root",
+            conversation_id="unrelated-conversation",
+            shell_id=910,
+            shortname="UNRELATED",
+            token="unrelated-token",
+        )
+        unrelated_before = dict(registry.resolve_record("unrelated-root"))
         state_path = root / "deepseek-web-state.json"
         env = {
             "SC_API_TOKEN": "one-shot-token",
@@ -2097,17 +2107,14 @@ def test_one_shot_unknown_cancellation_closes_binding_until_terminal_recovery(
         assert len(session_refs) == 1
         session_ref = session_refs[0]
         marker = state_path.with_name("deepseek-shell-identity-unproven.json")
-        assert json.loads(marker.read_text()) == {
-            "session_id": session_ref,
-            "shell_id": 909,
-            "shortname": "ONE-SHOT",
-        }
+        assert not marker.exists()
         closing = registry.read_snapshot()
         record = closing["records"][session_ref]
         credential = Path(record["credential_file"])
         assert record["state"] == "closing"
         assert record["record_generation"] == 2
         assert credential.exists()
+        assert registry.resolve_record("unrelated-root") == unrelated_before
 
         with pytest.raises(deepseek_web.DeepSeekWebError) as denied:
             deepseek_web.bind_session_identity(
@@ -2133,22 +2140,8 @@ def test_one_shot_unknown_cancellation_closes_binding_until_terminal_recovery(
         assert terminal_record["state"] == "terminal"
         assert terminal_record["credential_file"] is None
         assert not credential.exists()
-        assert marker.exists()
-
-        state_path.write_text(json.dumps({"service_port": 8942}))
-        history = {
-            "events": [{
-                "event": {
-                    "seq": 1,
-                    "type": "turn/end",
-                    "data": {"reason": {"kind": "cancelled"}},
-                }
-            }]
-        }
-        monkeypatch.setattr(deepseek_web, "_host_rpc", lambda *_args: history)
-        lease = deepseek_web.acquire_shell_identity(env=env)
-        lease.close()
         assert not marker.exists()
+        assert registry.resolve_record("unrelated-root") == unrelated_before
 
 
 def test_runtime_binding_rejects_foreign_or_stale_lifecycle_without_effect(

@@ -9,8 +9,6 @@ import json
 import socket
 import sys
 import tempfile
-import threading
-import time
 from contextlib import suppress
 from pathlib import Path
 from unittest import mock
@@ -579,76 +577,10 @@ def test_shell_identity_rejects_same_shortname_with_a_different_shell_id() -> No
     assert refused.value.code == "HARNESS_SHELL_IDENTITY_MISMATCH"
 
 
-def test_shell_identity_lease_refuses_an_overlapping_owner() -> None:
-    with tempfile.TemporaryDirectory() as raw:
-        env = {**service_env(Path(raw))}
-        first = deepseek_web.acquire_shell_identity(env=env)
-        try:
-            with pytest.raises(deepseek_web.DeepSeekWebError) as refused:
-                deepseek_web.acquire_shell_identity(env=env)
-            assert refused.value.code == "HARNESS_SHELL_IDENTITY_BUSY"
-        finally:
-            first.close()
-
-        second = deepseek_web.acquire_shell_identity(env=env)
-        second.close()
-
-
-def test_managed_identity_wait_queues_until_overlapping_owner_releases() -> None:
-    with tempfile.TemporaryDirectory() as raw:
-        env = {**service_env(Path(raw))}
-        first = deepseek_web.acquire_shell_identity(env=env)
-        acquired = threading.Event()
-        second: list[deepseek_web.ShellIdentityLease] = []
-
-        def wait_for_identity() -> None:
-            second.append(
-                deepseek_web.acquire_shell_identity(env=env, wait_seconds=1.0)
-            )
-            acquired.set()
-
-        worker = threading.Thread(target=wait_for_identity)
-        worker.start()
-        time.sleep(0.1)
-        assert not acquired.is_set()
-        first.close()
-        worker.join(timeout=2)
-
-        assert acquired.is_set()
-        assert len(second) == 1
-        second[0].close()
-
-
-def test_two_canonical_shells_refuse_before_host_or_workflow_side_effects() -> None:
-    with tempfile.TemporaryDirectory() as raw:
-        root = Path(raw)
-        pln1 = service_env(root)
-        pln2 = {
-            **pln1,
-            "SC_API_TOKEN": "pln2-token",
-            "SC_SHELL_ID": "5",
-            "SC_SHELL_SHORTNAME": "DEV5",
-        }
-        protected_artifacts = [
-            root / "state.json",
-            root / "deepseek-shell-api.json",
-            root / "deepseek-web-generation.json",
-            root / "deepseek-web-activity.json",
-        ]
-        first = deepseek_web.acquire_shell_identity(env=pln1)
-        try:
-            with pytest.raises(deepseek_web.DeepSeekWebError) as refused:
-                deepseek_web.acquire_shell_identity(env=pln2)
-            assert refused.value.code == "HARNESS_SHELL_IDENTITY_BUSY"
-        finally:
-            first.close()
-
-        # A refusal occurs before any Host credential/generation mutation; no
-        # model prompt can consequently reach tool-backed memory, workflow,
-        # message, or wake surfaces under the wrong shell.
-        assert [path.exists() for path in protected_artifacts] == [False] * 4
-        second = deepseek_web.acquire_shell_identity(env=pln2)
-        second.close()
+def test_global_shell_identity_containment_is_retired() -> None:
+    assert not hasattr(deepseek_web, "ShellIdentityLease")
+    assert not hasattr(deepseek_web, "acquire_shell_identity")
+    assert not hasattr(deepseek_web, "mark_unproven_execution")
 
 
 def test_sandbox_service_fails_closed_without_exact_injected_host_port() -> None:
@@ -1858,34 +1790,6 @@ def test_existing_service_requires_exact_neutral_host_contract() -> None:
             changed, 8942, 18942, listen_host="0.0.0.0",
             allowed_peers=("127.0.0.1",), identity_registry=identity,
         ) is False
-
-
-def test_unproven_one_shot_blocks_other_shell_until_matching_terminal_proof() -> None:
-    with tempfile.TemporaryDirectory() as raw:
-        root = Path(raw)
-        env = service_env(root)
-        session_id = "sc-" + "6" * 32
-        with mock.patch.dict(deepseek_web.os.environ, env, clear=False):
-            deepseek_web.mark_unproven_execution(env, session_id)
-            with pytest.raises(deepseek_web.DeepSeekWebError) as blocked:
-                deepseek_web.acquire_shell_identity(
-                    env={**env, "SC_SHELL_ID": "5", "SC_SHELL_SHORTNAME": "DEV5"}
-                )
-            assert blocked.value.code == "HARNESS_SHELL_IDENTITY_BUSY"
-            assert (root / "deepseek-shell-identity-unproven.json").exists()
-            (root / "state.json").write_text(json.dumps({"service_port": 8942}))
-            terminal = {
-                "events": [{"event": {
-                    "seq": 1,
-                    "type": "turn/end",
-                    "data": {"reason": {"kind": "cancelled"}},
-                }}]
-            }
-            with mock.patch.object(deepseek_web, "_host_rpc", return_value=terminal):
-                lease = deepseek_web.acquire_shell_identity(env=env)
-            lease.close()
-
-    assert not (root / "deepseek-shell-identity-unproven.json").exists()
 
 
 def test_status_rejects_a_live_relay_without_the_host_gateway_policy() -> None:

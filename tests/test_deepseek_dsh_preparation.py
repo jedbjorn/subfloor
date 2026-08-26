@@ -465,6 +465,36 @@ class DeepSeekDshPreparationContractTests(unittest.TestCase):
                 "implementation_base": "21a05f3eae09b70c4c42bae69a6d04e89bb1d8f7",
             },
         )
+        self.assertEqual(
+            self.contract["retirement_package"],
+            {
+                "contract": "sc-dsh-containment-retirement-v1",
+                "sprint_id": 25,
+                "work_unit_id": 106,
+                "task_id": 653,
+                "historical_sprint_binding_sha256": "84056c2fc7206b83f2d3beb71150545326d5e33f557cb5f2329f55321eab0bdf",
+                "active_reliability_sha256": "06bb2bc31856575b88983d522fd881ad8e9b68c75714a804ff6cdb5bbd98aeb8",
+                "scope_decision_id": 261,
+                "candidate_acceptance_decision_id": 262,
+                "candidate_ref": "8a4551100ca14f0777f175719b577cb11b733565",
+                "candidate_receipt_sha256": "77791c5d4e031cf9b16e7ddee3932f581bbafc5094f86e26fd8a2b1504c5ae69",
+                "mutation_driver": "tests/mutations/u106_deepseek_retirement.py",
+                "receipt_contract": "sc-dsh-containment-retirement-receipt-v1",
+                "receipt_authority": (
+                    "the retirement_ref and retirement_tree are read from the clean "
+                    "exact worktree; every mutation must turn its focused promoted-path "
+                    "proof red and the restored source green"
+                ),
+                "protected_boundaries": [
+                    "global ShellIdentityLease and managed identity wait queue are absent",
+                    "unknown one-shot terminality closes only its exact transactional binding",
+                    "failed, stale, and partial promoted ratchets revoke and fence only enumerated disposable roots",
+                    "unrelated bindings and already-admitted immutable ToolExecution snapshots remain available",
+                    "model discovery and identity-neutral native inference survive managed-authority refusal",
+                    "Browser, Sprint, and one-shot preserve surface-specific bounded readiness behavior",
+                ],
+            },
+        )
         self.assertEqual(adapter["official_runtime"]["version"], release["version"])
         self.assertEqual(adapter["official_runtime"]["tag"], release["tag"])
         self.assertEqual(adapter["official_runtime"]["commit"], release["commit"])
@@ -588,18 +618,24 @@ class DeepSeekDshPreparationContractTests(unittest.TestCase):
             set(self.contract["registry_currency"]),
             {"registry_snapshot_generation", "binding_record_generation"},
         )
+        promoted = self.contract["promoted_runtime"]
+        self.assertEqual(promoted["production_state"], "promoted")
         self.assertEqual(
-            self.contract["containment_baseline"]["production_state"],
-            "serialized",
+            promoted["retired_containment"],
+            [
+                "DeepSeekAdapter ShellIdentityLease",
+                "managed identity wait queue",
+                "global unproven Host-credential marker",
+            ],
         )
         self.assertIn(
             "server-minted exact-ref capability",
-            self.contract["containment_baseline"]["proof_authority"],
+            promoted["proof_authority"],
         )
-        self.assertNotIn(
-            "registry_snapshot_generation",
-            self.contract["containment_baseline"]["global_identity_lease"],
-        )
+        self.assertIn("scrubs ambient SC credentials", promoted["ambient_boundary"])
+        self.assertIn("no promoted failure restores them", promoted["ambient_boundary"])
+        self.assertIn("unrelated bindings", promoted["failure_boundary"])
+        self.assertNotIn("containment_baseline", self.contract)
         provenance = self.contract["execution_provenance"]
         self.assertEqual(
             provenance["managed_rule"],

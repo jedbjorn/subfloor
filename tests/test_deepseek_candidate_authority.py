@@ -288,9 +288,9 @@ def durable_identity_state(
     )
 
 
-def mint(authority: DeepSeekCandidateAuthority):
+def mint(authority: DeepSeekCandidateAuthority, *, mode: str = "candidate"):
     return authority.mint(
-        mode="candidate",
+        mode=mode,
         exact_ref="a" * 40,
         pinned_dsh_version="0.1.1-rc.2",
         disposable_baseline="arch-clean-2026-08-25",
@@ -1789,7 +1789,9 @@ def test_promoted_runner_requires_candidate_acceptance_and_retirement_ref(
         promoted.revoke()
 
 
+@pytest.mark.parametrize("mode", ["candidate", "promoted"])
 def test_server_restart_ratchet_requires_recovered_exact_bindings(
+    mode: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     class Registry:
@@ -1853,7 +1855,7 @@ def test_server_restart_ratchet_requires_recovered_exact_bindings(
 
     with tempfile.TemporaryDirectory() as raw:
         authority = DeepSeekCandidateAuthority(Path(raw) / "proof-authority")
-        first = mint(authority)
+        first = mint(authority, mode=mode)
         monkeypatch.setattr(deepseek_web, "_exact_engine_ref", lambda: "a" * 40)
         monkeypatch.setattr(
             deepseek_web.harness_versions, "probe", lambda _harness: "0.1.1-rc.2"
@@ -1865,7 +1867,7 @@ def test_server_restart_ratchet_requires_recovered_exact_bindings(
             env={}, artifact=first.artifact, ttl_seconds=600
         )
         assert ratcheted == {
-            "mode": "candidate",
+            "mode": mode,
             "generation": 2,
             "artifact": ratcheted["artifact"],
             "proof_run_id": "proof-run-25",
@@ -1879,7 +1881,7 @@ def test_server_restart_ratchet_requires_recovered_exact_bindings(
 
     with tempfile.TemporaryDirectory() as raw:
         authority = DeepSeekCandidateAuthority(Path(raw) / "proof-authority")
-        first = mint(authority)
+        first = mint(authority, mode=mode)
         monkeypatch.setattr(
             deepseek_web,
             "_identity_registry",
@@ -1918,7 +1920,9 @@ def test_server_restart_ratchet_requires_recovered_exact_bindings(
         ("teardown-failure", "HARNESS_PROOF_RESTART_BINDING_MISMATCH"),
     ],
 )
+@pytest.mark.parametrize("mode", ["candidate", "promoted"])
 def test_failed_ratchet_revokes_and_fences_real_registry_roots(
+    mode: str,
     failure: str,
     expected_code: str,
     monkeypatch: pytest.MonkeyPatch,
@@ -1930,7 +1934,7 @@ def test_failed_ratchet_revokes_and_fences_real_registry_roots(
         authority = DeepSeekCandidateAuthority(
             registry.layout.root / "proof-authority", clock=clock
         )
-        grant = mint(authority)
+        grant = mint(authority, mode=mode)
         for root_session_id, facts in ROOTS.items():
             if failure == "missing-root" and root_session_id == "candidate-root-b":
                 continue
@@ -1952,20 +1956,20 @@ def test_failed_ratchet_revokes_and_fences_real_registry_roots(
                 token="candidate-token",
                 plugin_contract_generation=contract_generation,
             )
-        unrelated_root = "ordinary-serialized-root"
+        unrelated_root = "ordinary-unrelated-root"
         unrelated_snapshot = registry.read_snapshot()
         registry.create_binding(
             expected_snapshot_generation=unrelated_snapshot[
                 "snapshot_generation"
             ],
             root_session_id=unrelated_root,
-            conversation_id="ordinary-serialized-conversation",
+            conversation_id="ordinary-unrelated-conversation",
             lifecycle_epoch=1,
             shell_id=5,
             shell_shortname="DEV5",
             shell_worktree=worktree,
             api_base="http://127.0.0.1:8837",
-            token="ordinary-serialized-token",
+            token="ordinary-unrelated-token",
             plugin_contract_generation=contract_generation,
         )
         unrelated_before = dict(registry.resolve_record(unrelated_root))
@@ -2010,6 +2014,7 @@ def test_failed_ratchet_revokes_and_fences_real_registry_roots(
         assert refused.value.code == expected_code
         state = json.loads(authority.state_path.read_text())
         assert state["state"] == "revoked"
+        assert state["mode"] == mode
         assert state["failure"]["operation"] == "ratchet"
         assert state["failure"]["code"] == expected_code
         snapshot = registry.read_snapshot()
@@ -2033,13 +2038,13 @@ def test_failed_ratchet_revokes_and_fences_real_registry_roots(
         assert Path(unrelated_after["credential_file"]).exists()
         assert registry.binding_current(
             root_session_id=unrelated_root,
-            conversation_id="ordinary-serialized-conversation",
+            conversation_id="ordinary-unrelated-conversation",
             lifecycle_epoch=1,
             shell_id=5,
             shell_shortname="DEV5",
             shell_worktree=worktree,
             api_base="http://127.0.0.1:8837",
-            token="ordinary-serialized-token",
+            token="ordinary-unrelated-token",
             plugin_contract_generation=contract_generation,
         )
         if failure == "teardown-failure":

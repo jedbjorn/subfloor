@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import argparse
 import os
-import re
 import sys
 import time
 import uuid
@@ -68,20 +67,18 @@ def _finalize_unknown(client: deepseek_host.HostTransport, session_ref: str) -> 
     except deepseek_host.DeepSeekHostError:
         cancelled = None
     if not isinstance(cancelled, Mapping) or cancelled.get("accepted") is not True:
-        deepseek_web.mark_unproven_execution(os.environ, session_ref)
         raise deepseek_host.DeepSeekHostError(
             "HARNESS_ONE_SHOT_BUSY",
-            "one-shot cancellation lacks terminal proof; Host credential remains fenced",
+            "one-shot cancellation lacks terminal proof; its binding requires recovery",
         )
     for attempt in range(3):
         if _terminal_proven(client, session_ref):
             return
         if attempt < 2:
             time.sleep(0.05)
-    deepseek_web.mark_unproven_execution(os.environ, session_ref)
     raise deepseek_host.DeepSeekHostError(
         "HARNESS_ONE_SHOT_BUSY",
-        "one-shot cancellation lacks terminal proof; Host credential remains fenced",
+        "one-shot cancellation lacks terminal proof; its binding requires recovery",
     )
 
 
@@ -201,7 +198,7 @@ def _run(
 
 
 def run(selector: str, effort: str, prompt: str) -> int:
-    """Run under the shared Host identity lease through terminal cleanup."""
+    """Run with one transactional binding through terminal cleanup."""
     worktree = Path(os.environ.get("SC_SHELL_WORKTREE", os.getcwd())).resolve()
     if not worktree.is_dir():
         raise deepseek_host.DeepSeekHostError(
@@ -219,7 +216,6 @@ def run(selector: str, effort: str, prompt: str) -> int:
             "HARNESS_SHELL_IDENTITY_UNAVAILABLE",
             "DeepSeek one-shot requires canonical shell identity",
         )
-    lease = None
     try:
         proof_root = deepseek_web.proof_root_from_environment(
             env=env, surface="one-shot"
@@ -234,8 +230,7 @@ def run(selector: str, effort: str, prompt: str) -> int:
     last_error: deepseek_web.DeepSeekWebError | None = None
     for attempt in range(READINESS_MAX_ATTEMPTS):
         try:
-            lease = deepseek_web.acquire_shell_identity(env=env)
-            deepseek_web.ensure(worktree, env=env, identity_lease=lease)
+            deepseek_web.ensure(worktree, env=env)
             proof_authority = deepseek_web.preflight_candidate_execution(
                 env=env,
                 root_session_id=session_ref,
@@ -251,15 +246,9 @@ def run(selector: str, effort: str, prompt: str) -> int:
                 worktree=worktree,
                 candidate_preflight=proof_authority,
             )
-            if proof_authority is not None:
-                lease.close()
-                lease = None
             break
         except deepseek_web.DeepSeekWebError as exc:
             last_error = exc
-            if lease is not None:
-                lease.close()
-                lease = None
             remaining = READINESS_WINDOW_SECONDS - (time.monotonic() - started)
             if (
                 exc.code not in TRANSIENT_READINESS_CODES
@@ -308,11 +297,6 @@ def run(selector: str, effort: str, prompt: str) -> int:
         except deepseek_web.DeepSeekWebError as exc:
             raise deepseek_host.DeepSeekHostError(exc.code, exc.detail) from exc
         return result
-    finally:
-        if lease is not None:
-            lease.close()
-
-
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     try:
