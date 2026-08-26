@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Canonical version-two model route bindings.
+"""Canonical versioned model route bindings.
 
 This module owns identity, validation, and participant revision persistence.
 Launch adapters consume its result; they do not reinterpret nullable effort.
@@ -18,7 +18,12 @@ from urllib.parse import urlsplit
 import harness_versions
 from conversation_adapters.base import AdapterError, checked_version_compatibility
 
-CONTRACT_VERSION = 2
+V2_CONTRACT_VERSION = 2
+LIVE_NATIVE_CONTRACT_VERSION = 3
+# Compatibility alias for consumers that still create only v2 bindings.  The
+# live-native rollout is harness-scoped, so there is no single replacement
+# version for Claude, Codex, Kimi, or Vibe.
+CONTRACT_VERSION = V2_CONTRACT_VERSION
 FRESH_HOURS = 7 * 24
 HARNESS_SUPPORT_STATES = frozenset({"tested", "best-effort"})
 LEGACY_HARNESS_EVIDENCE_FORMAT = "legacy-semver"
@@ -38,6 +43,24 @@ BINDING_KEYS = (
     "selector_binding",
     "adapter_metadata",
 )
+V3_BINDING_KEYS = (
+    "contract_version",
+    "control_state",
+    "harness",
+    "requested_model",
+    "provider_model",
+    "requested_effort",
+    "effective_effort",
+    "native_variant_id",
+    "native_option_id",
+    "transport",
+    "catalogue_generation",
+    "evidence_digest",
+    "selector_binding",
+    "adapter_metadata",
+)
+LIVE_NATIVE_HARNESSES = frozenset({"deepseek", "opencode"})
+LIVE_NATIVE_EVIDENCE_FORMAT = "harness-live-v1"
 
 CONTROLLED_EVIDENCE = {
     "claude": {"claude-portable-manifest"},
@@ -115,7 +138,8 @@ class _ControlledRouteProof:
 
     __slots__ = (
         "_harness", "_selector", "_runtime_status", "_runtime",
-        "_runtime_identity", "_source_fingerprint", "_issuer",
+        "_runtime_identity", "_source_fingerprint",
+        "_advertised_options_by_model", "_issuer",
     )
 
     def __init__(
@@ -127,6 +151,7 @@ class _ControlledRouteProof:
         runtime_status: RuntimeEvidence,
         runtime_scope: dict,
         source_fingerprint: str | None,
+        advertised_options_by_model: dict[str, list[str]] | None,
     ) -> None:
         if issuer is not _CONTROLLED_PROOF_ISSUER:
             raise TypeError(
@@ -140,6 +165,11 @@ class _ControlledRouteProof:
             self, "_runtime_identity", runtime_scope.get("runtime_identity")
         )
         object.__setattr__(self, "_source_fingerprint", source_fingerprint)
+        object.__setattr__(
+            self,
+            "_advertised_options_by_model",
+            advertised_options_by_model,
+        )
         object.__setattr__(self, "_issuer", issuer)
 
     def __setattr__(self, _name, _value) -> None:
@@ -275,6 +305,14 @@ def _binding_error(reason: str) -> RouteResolutionError:
     )
 
 
+def _v3_binding_error(reason: str) -> RouteResolutionError:
+    return RouteResolutionError(
+        "unsupported_native_option",
+        "Invalid version-three live-native route binding",
+        {"reason": reason},
+    )
+
+
 def _validate_deepseek_metadata(binding: dict) -> None:
     """Pin one exact route projected by the stock loopback Host API."""
     metadata = binding["adapter_metadata"]
@@ -352,7 +390,7 @@ def validate_v2_binding(binding: dict) -> None:
     """Enforce the one semantic state contract accepted by every v2 consumer."""
     if not isinstance(binding, dict) or set(binding) != set(BINDING_KEYS):
         raise _binding_error("binding must contain exactly the canonical fixed keys")
-    if binding["contract_version"] != CONTRACT_VERSION:
+    if binding["contract_version"] != V2_CONTRACT_VERSION:
         raise _binding_error("contract_version must be 2")
 
     harness = binding["harness"]
@@ -433,6 +471,125 @@ def validate_v2_binding(binding: dict) -> None:
         raise _binding_error(
             "native-uncontrolled bindings require an exact Vibe model"
         )
+
+
+def validate_legacy_v2_live_native(binding: dict) -> None:
+    """Validate readable OpenCode/DeepSeek v2 identity, not old semantics."""
+    if not isinstance(binding, dict) or set(binding) != set(BINDING_KEYS):
+        raise _binding_error("binding must contain exactly the canonical fixed keys")
+    if binding["contract_version"] != V2_CONTRACT_VERSION:
+        raise _binding_error("contract_version must be 2")
+    harness = binding["harness"]
+    if harness not in LIVE_NATIVE_HARNESSES:
+        raise _binding_error("legacy live-native binding has the wrong harness")
+    if binding["control_state"] != "controlled":
+        raise _binding_error("legacy live-native binding must be controlled")
+    for field in (
+        "requested_model", "provider_model", "requested_effort",
+        "effective_effort",
+    ):
+        if not _exact_nonblank(binding[field]):
+            raise _binding_error(f"controlled {field} must be exact and non-blank")
+    requested_effort = binding["requested_effort"]
+    if requested_effort != requested_effort.lower():
+        raise _binding_error("legacy effort must retain its stored lowercase ID")
+    if binding["effective_effort"] != requested_effort:
+        raise _binding_error("requested and effective effort must match")
+    transports = {TRANSPORTS[harness]}
+    if harness == "deepseek":
+        transports.add("deepseek-provider-options-v1")
+    if binding["transport"] not in transports:
+        raise _binding_error("legacy transport does not match harness history")
+    if not _lower_hex(binding["catalogue_generation"], LOWER_HEX_32):
+        raise _binding_error(
+            "catalogue_generation must retain its stored v2 identity"
+        )
+    evidence_digest = binding["evidence_digest"]
+    if requested_effort == DEFAULT_EFFORT:
+        if evidence_digest is not None:
+            raise _binding_error("model-default binding carries an effort digest")
+    elif not _lower_hex(evidence_digest, LOWER_HEX_64):
+        raise _binding_error("named legacy option must retain its evidence digest")
+    selector = binding["selector_binding"]
+    if not isinstance(selector, dict) or not selector:
+        raise _binding_error("legacy selector_binding must remain an object")
+    if not isinstance(binding["adapter_metadata"], dict):
+        raise _binding_error("legacy adapter_metadata must remain an object")
+    native_variant = binding["native_variant_id"]
+    if harness == "opencode":
+        expected = None if requested_effort == DEFAULT_EFFORT else requested_effort
+        if native_variant != expected:
+            raise _binding_error("legacy OpenCode option identity is inconsistent")
+    elif native_variant is not None:
+        raise _binding_error("legacy DeepSeek binding cannot carry a variant ID")
+
+
+def validate_v3_binding(binding: dict) -> None:
+    """Validate the stable identity carried by one live-native route."""
+    if not isinstance(binding, dict) or set(binding) != set(V3_BINDING_KEYS):
+        raise _v3_binding_error(
+            "binding must contain exactly the canonical live-native keys"
+        )
+    if binding["contract_version"] != LIVE_NATIVE_CONTRACT_VERSION:
+        raise _v3_binding_error("contract_version must be 3")
+    if binding["control_state"] != "controlled":
+        raise _v3_binding_error("live-native bindings must be controlled")
+
+    harness = binding["harness"]
+    if harness not in LIVE_NATIVE_HARNESSES:
+        raise _v3_binding_error(
+            "live-native bindings require OpenCode or DeepSeek"
+        )
+    if not _exact_nonblank(harness) or harness != harness.lower():
+        raise _v3_binding_error("harness must be a normalized identifier")
+    for field in ("requested_model", "provider_model"):
+        if not _exact_nonblank(binding[field]):
+            raise _v3_binding_error(f"{field} must be exact and non-blank")
+
+    native_option = binding["native_option_id"]
+    if native_option is not None and not _exact_nonblank(native_option):
+        raise _v3_binding_error(
+            "native_option_id must be null or an exact non-blank identifier"
+        )
+    if binding["requested_effort"] != native_option:
+        raise _v3_binding_error("requested_effort must equal native_option_id")
+    if binding["effective_effort"] != native_option:
+        raise _v3_binding_error("effective_effort must equal native_option_id")
+    if binding["native_variant_id"] is not None:
+        raise _v3_binding_error("native_variant_id is legacy-v2-only")
+    if binding["transport"] != TRANSPORTS[harness]:
+        raise _v3_binding_error("transport does not match the live harness")
+    if binding["catalogue_generation"] is not None:
+        raise _v3_binding_error("catalogue_generation must be null")
+    if binding["evidence_digest"] is not None:
+        raise _v3_binding_error("evidence_digest must be null")
+    if binding["selector_binding"] != {
+        "kind": "harness-live",
+        "selector": binding["requested_model"],
+    }:
+        raise _v3_binding_error(
+            "selector_binding must contain only the stable live selector"
+        )
+    if binding["adapter_metadata"] != {}:
+        raise _v3_binding_error(
+            "live discovery payloads cannot enter binding identity"
+        )
+
+
+def validate_binding(binding: dict) -> None:
+    """Dispatch validation without reinterpreting an immutable version."""
+    version = binding.get("contract_version") if isinstance(binding, dict) else None
+    if version == V2_CONTRACT_VERSION:
+        validate_v2_binding(binding)
+        return
+    if version == LIVE_NATIVE_CONTRACT_VERSION:
+        validate_v3_binding(binding)
+        return
+    raise RouteResolutionError(
+        "unsupported_route_contract",
+        "Route binding contract version is unsupported",
+        {"contract_version": version},
+    )
 
 
 def _runtime_manifest_compatibility(harness: str, version: str):
@@ -584,6 +741,9 @@ def _probe_controlled_route(harness: str, model: str) -> _ControlledRouteProof:
         runtime_status=status,
         runtime_scope=scope,
         source_fingerprint=observation.get("source_fingerprint"),
+        advertised_options_by_model=observation.get(
+            "advertised_options_by_model"
+        ),
     )
 
 
@@ -700,6 +860,58 @@ def _uncontrolled_binding(harness: str, model: str | None, effort: str | None) -
         "selector_binding": None,
         "adapter_metadata": {},
     }
+
+
+def live_native_v3_binding(
+    harness: str,
+    model: str,
+    provider_model: str,
+    native_option_id: str | None,
+) -> tuple[dict, str]:
+    """Build stable v3 identity from exact harness-advertised IDs.
+
+    Discovery payloads deliberately do not enter this constructor.  The live
+    adapter proves membership before calling it and re-reads the payload at
+    first dispatch; this function persists only exact identity.
+    """
+    harness = normalize_harness(harness)
+    if harness not in LIVE_NATIVE_HARNESSES:
+        raise _v3_binding_error(
+            "live-native bindings require OpenCode or DeepSeek"
+        )
+    normalized_model = _normalize_model(model)
+    if normalized_model is None:
+        raise _v3_binding_error("requested_model must be exact and non-blank")
+    if not _exact_nonblank(provider_model):
+        raise _v3_binding_error("provider_model must be exact and non-blank")
+    if native_option_id is not None and not _exact_nonblank(native_option_id):
+        raise _v3_binding_error(
+            "native_option_id must be null or an exact non-blank identifier"
+        )
+
+    binding = {
+        "contract_version": LIVE_NATIVE_CONTRACT_VERSION,
+        "control_state": "controlled",
+        "harness": harness,
+        "requested_model": normalized_model,
+        "provider_model": provider_model,
+        "requested_effort": native_option_id,
+        "effective_effort": native_option_id,
+        "native_variant_id": None,
+        "native_option_id": native_option_id,
+        "transport": TRANSPORTS[harness],
+        "catalogue_generation": None,
+        "evidence_digest": None,
+        "selector_binding": {
+            "kind": "harness-live",
+            "selector": normalized_model,
+        },
+        "adapter_metadata": {},
+    }
+    if tuple(binding) != V3_BINDING_KEYS:
+        raise AssertionError("live-native route binding key order drifted")
+    validate_v3_binding(binding)
+    return binding, digest_json(binding)
 
 
 def _age_hours(value: str, now: datetime) -> float:
@@ -1193,6 +1405,90 @@ def legacy_route(*, row_contract_version: int, harness: str, model: str | None,
             "effort": effort, "legacy": True}
 
 
+def live_native_selection(binding: dict) -> dict:
+    """Read exact live-native identity without rewriting immutable history."""
+    if (
+        isinstance(binding, dict)
+        and binding.get("contract_version") == V2_CONTRACT_VERSION
+        and binding.get("harness") in LIVE_NATIVE_HARNESSES
+    ):
+        validate_legacy_v2_live_native(binding)
+    else:
+        validate_binding(binding)
+    harness = binding["harness"]
+    if harness not in LIVE_NATIVE_HARNESSES or binding["control_state"] != "controlled":
+        raise RouteResolutionError(
+            "unsupported_route_contract",
+            "Live-native compatibility requires a controlled OpenCode or DeepSeek route",
+            {"contract_version": binding["contract_version"], "harness": harness},
+        )
+    if binding["contract_version"] == LIVE_NATIVE_CONTRACT_VERSION:
+        option_id = binding["native_option_id"]
+    elif harness == "opencode":
+        option_id = binding["native_variant_id"]
+    else:
+        option_id = binding["requested_effort"]
+    if option_id == DEFAULT_EFFORT:
+        option_id = None
+    return {
+        "harness": harness,
+        "model_id": binding["requested_model"],
+        "native_option_id": option_id,
+        "transport": binding["transport"],
+    }
+
+
+def require_advertised_live_native(
+    binding: dict,
+    advertised_options_by_model: (
+        dict[str, list[str] | tuple[str, ...]] | None
+    ),
+) -> dict:
+    """Require current exact IDs while leaving the stored binding untouched."""
+    selection = live_native_selection(binding)
+    if not isinstance(advertised_options_by_model, dict):
+        raise RouteResolutionError(
+            "native_route_unavailable",
+            "Live harness route projection is unavailable",
+            {"harness": selection["harness"], "model": selection["model_id"]},
+        )
+    model = selection["model_id"]
+    if model not in advertised_options_by_model:
+        raise RouteResolutionError(
+            "native_route_unavailable",
+            "Bound model is not advertised by the current harness",
+            {
+                "harness": selection["harness"],
+                "model": model,
+                "current_model_ids": list(advertised_options_by_model),
+            },
+        )
+    current_options = advertised_options_by_model[model]
+    if (
+        not isinstance(current_options, (list, tuple))
+        or any(not _exact_nonblank(item) for item in current_options)
+        or len(set(current_options)) != len(current_options)
+    ):
+        raise RouteResolutionError(
+            "native_route_unavailable",
+            "Live harness option projection is malformed",
+            {"harness": selection["harness"], "model": model},
+        )
+    option_id = selection["native_option_id"]
+    if option_id is not None and option_id not in current_options:
+        raise RouteResolutionError(
+            "native_route_unavailable",
+            "Bound native option is not advertised by the current harness",
+            {
+                "harness": selection["harness"],
+                "model": model,
+                "native_option_id": option_id,
+                "current_option_ids": list(current_options),
+            },
+        )
+    return selection
+
+
 def verify_stored_v2_before_first_turn(
     _con,
     binding: dict,
@@ -1207,9 +1503,34 @@ def verify_stored_v2_before_first_turn(
     current execution seat and source, but never rebuilds or updates the
     binding from a newer catalogue generation.
     """
-    validate_v2_binding(binding)
+    if (
+        isinstance(binding, dict)
+        and binding.get("harness") in LIVE_NATIVE_HARNESSES
+    ):
+        validate_legacy_v2_live_native(binding)
+    else:
+        validate_v2_binding(binding)
     harness = binding["harness"]
     model = binding["requested_model"]
+    if harness in LIVE_NATIVE_HARNESSES and binding["control_state"] == "controlled":
+        # Contract-v2 compatibility: stored age/version/fingerprint are
+        # immutable history, while the current harness still has to advertise
+        # the exact stored model and native option before first dispatch.
+        proof = _probe_controlled_route(harness, model)
+        _require_runtime(
+            harness,
+            model,
+            proof._runtime_status,
+            {
+                "runtime": proof._runtime,
+                "runtime_identity": proof._runtime_identity,
+            },
+            error_code="native_route_unavailable",
+        )
+        require_advertised_live_native(
+            binding, proof._advertised_options_by_model
+        )
+        return
     if binding["control_state"] != "controlled":
         import model_catalog  # noqa: PLC0415
 
@@ -1297,11 +1618,20 @@ class ParticipantRouteBindingStore:
              source_fingerprint: str | None = None,
              harness_version: str | None = None,
              harness_support_state: str | None = None) -> dict:
-        validate_v2_binding(binding)
+        validate_binding(binding)
         if (not _lower_hex(binding_digest, LOWER_HEX_64)
                 or digest_json(binding) != binding_digest):
-            raise ValueError("binding does not match the canonical v2 contract")
-        if binding["control_state"] == "controlled":
+            raise ValueError("binding does not match its canonical contract")
+        contract_version = binding["contract_version"]
+        if contract_version == LIVE_NATIVE_CONTRACT_VERSION:
+            if any(value is not None for value in (
+                source_fingerprint, harness_version, harness_support_state,
+            )):
+                raise ValueError(
+                    "live-native Sprint bindings cannot store freshness provenance"
+                )
+            harness_evidence_format = LIVE_NATIVE_EVIDENCE_FORMAT
+        elif binding["control_state"] == "controlled":
             if (
                 not _lower_hex(source_fingerprint, LOWER_HEX_64)
                 or not _exact_nonblank(harness_version)
@@ -1311,6 +1641,7 @@ class ParticipantRouteBindingStore:
                     "controlled Sprint bindings require immutable source provenance "
                     "and support state"
                 )
+            harness_evidence_format = RAW_HARNESS_EVIDENCE_FORMAT
         else:
             runtime = _require_runtime(
                 binding["harness"], binding["requested_model"], runtime_status,
@@ -1326,6 +1657,7 @@ class ParticipantRouteBindingStore:
                 raise ValueError(
                     "uncontrolled Sprint bindings require immutable support provenance"
                 )
+            harness_evidence_format = RAW_HARNESS_EVIDENCE_FORMAT
         row = self.con.execute(
             "SELECT participant.active_route_binding_id,sprint.lifecycle "
             "FROM sprint_participants participant "
@@ -1351,23 +1683,36 @@ class ParticipantRouteBindingStore:
         else:
             raise ValueError("transition must be arm or reroute")
 
-        values = [binding[key] for key in BINDING_KEYS]
         cursor = self.con.execute(
             "INSERT INTO sprint_participant_route_bindings ("
             "participant_id,route_revision,contract_version,control_state,harness,"
             "requested_model,provider_model,requested_effort,effective_effort,"
-            "native_variant_id,transport,catalogue_generation,evidence_digest,"
+            "native_variant_id,native_option_id,transport,catalogue_generation,"
+            "evidence_digest,"
             "selector_binding,adapter_metadata,binding_json,binding_digest,"
             "source_fingerprint,harness_version,harness_evidence_format,"
             "harness_support_state"
-            ") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            ") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (
-                participant_id, revision, *values[:11],
+                participant_id,
+                revision,
+                binding["contract_version"],
+                binding["control_state"],
+                binding["harness"],
+                binding["requested_model"],
+                binding["provider_model"],
+                binding["requested_effort"],
+                binding["effective_effort"],
+                binding["native_variant_id"],
+                binding.get("native_option_id"),
+                binding["transport"],
+                binding["catalogue_generation"],
+                binding["evidence_digest"],
                 canonical_json(binding["selector_binding"])
                 if binding["selector_binding"] is not None else None,
                 canonical_json(binding["adapter_metadata"]),
                 canonical_json(binding), binding_digest,
-                source_fingerprint, harness_version, RAW_HARNESS_EVIDENCE_FORMAT,
+                source_fingerprint, harness_version, harness_evidence_format,
                 harness_support_state,
             ),
         )
@@ -1378,5 +1723,6 @@ class ParticipantRouteBindingStore:
         )
         return {"binding_id": binding_id, "participant_id": participant_id,
                 "route_revision": revision, "binding_digest": binding_digest,
+                "contract_version": contract_version,
                 "harness_version": harness_version,
                 "harness_support_state": harness_support_state}

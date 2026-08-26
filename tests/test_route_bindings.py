@@ -137,6 +137,10 @@ def route_schema(path: str | Path = ":memory:") -> sqlite3.Connection:
         ROOT / ".super-coder" / "migrations" /
         "0230_deepseek_stock_host_route_binding.sql"
     ).read_text())
+    con.executescript((
+        ROOT / ".super-coder" / "migrations" /
+        "0235_live_native_route_binding_v3.sql"
+    ).read_text())
     return con
 
 
@@ -642,6 +646,168 @@ class BindingIdentityTest(unittest.TestCase):
         with self.assertRaises(route_bindings.RouteResolutionError):
             route_bindings.validate_v2_binding(forged)
 
+    def test_live_native_v3_identity_preserves_exact_option_and_null_default(self):
+        named, named_digest = route_bindings.live_native_v3_binding(
+            "OpenCode",
+            "Ollama-Cloud/GLM-5.2",
+            "GLM-5.2",
+            "MaX-Custom",
+        )
+        default, default_digest = route_bindings.live_native_v3_binding(
+            "deepseek",
+            "ollama-cloud/glm-5.2",
+            "glm-5.2",
+            None,
+        )
+
+        self.assertEqual(tuple(named), route_bindings.V3_BINDING_KEYS)
+        self.assertEqual(named["contract_version"], 3)
+        self.assertEqual(named["requested_model"], "Ollama-Cloud/GLM-5.2")
+        self.assertEqual(named["native_option_id"], "MaX-Custom")
+        self.assertEqual(named["requested_effort"], "MaX-Custom")
+        self.assertEqual(named["effective_effort"], "MaX-Custom")
+        self.assertIsNone(named["native_variant_id"])
+        self.assertIsNone(named["catalogue_generation"])
+        self.assertIsNone(named["evidence_digest"])
+        self.assertEqual(named["adapter_metadata"], {})
+        self.assertIsNone(default["native_option_id"])
+        self.assertIsNone(default["requested_effort"])
+        self.assertIsNone(default["effective_effort"])
+        self.assertNotEqual(named_digest, default_digest)
+        route_bindings.validate_binding(named)
+        route_bindings.validate_binding(default)
+
+        invalid = (
+            {**named, "catalogue_generation": "1" * 32},
+            {**named, "native_option_id": " max "},
+            {**named, "adapter_metadata": {"temporary": True}},
+            {**named, "unexpected": None},
+        )
+        for binding in invalid:
+            with self.subTest(binding=binding):
+                with self.assertRaises(route_bindings.RouteResolutionError) as raised:
+                    route_bindings.validate_v3_binding(binding)
+                self.assertEqual(raised.exception.code, "unsupported_native_option")
+
+    def test_legacy_v2_live_native_uses_current_exact_ids_without_rewrite(self):
+        opencode, _ = resolve_controlled_v2(
+            self.opencode_row(), "opencode", "provider/model", "k",
+            now=self.NOW,
+            runtime_status=compatible_runtime("1.18.9", harness="opencode"),
+        )
+        deepseek, _ = resolve_controlled_v2(
+            self.deepseek_row(), "deepseek",
+            "deepseek-official/deepseek-v4-pro", "high",
+            now=self.NOW,
+            runtime_status=compatible_runtime(
+                "0.1.1-rc.2", harness="deepseek"
+            ),
+        )
+        original = {
+            binding["harness"]: route_bindings.canonical_json(binding)
+            for binding in (opencode, deepseek)
+        }
+
+        for binding, current in (
+            (opencode, {"provider/model": ["k", "MaX"]}),
+            (deepseek, {"deepseek-official/deepseek-v4-pro": ["high"]}),
+        ):
+            observation = controlled_observation(
+                "f" * 64, harness=binding["harness"]
+            )
+            observation["advertised_options_by_model"] = current
+            with self.subTest(harness=binding["harness"]), mock.patch.object(
+                model_catalog,
+                "controlled_route_evidence",
+                return_value=observation,
+            ) as live_probe:
+                route_bindings.verify_stored_v2_before_first_turn(
+                    None,
+                    binding,
+                    source_fingerprint="f" * 64,
+                    harness_version="obsolete-version",
+                )
+            live_probe.assert_called_once_with(
+                binding["harness"], binding["requested_model"]
+            )
+            selection = route_bindings.require_advertised_live_native(
+                binding, current
+            )
+            self.assertEqual(selection["model_id"], binding["requested_model"])
+            self.assertEqual(
+                route_bindings.canonical_json(binding),
+                original[binding["harness"]],
+            )
+
+        with self.assertRaises(route_bindings.RouteResolutionError) as raised:
+            route_bindings.require_advertised_live_native(
+                deepseek,
+                {"deepseek-official/deepseek-v4-pro": ["MaX"]},
+            )
+        self.assertEqual(raised.exception.code, "native_route_unavailable")
+        self.assertEqual(raised.exception.details["native_option_id"], "high")
+        self.assertEqual(raised.exception.details["current_option_ids"], ["MaX"])
+        self.assertEqual(
+            route_bindings.canonical_json(deepseek), original["deepseek"]
+        )
+
+        historical_deepseek = {
+            **deepseek,
+            "transport": "deepseek-provider-options-v1",
+            "adapter_metadata": {
+                "transport_contract": "deepseek-provider-options-v1",
+                "provider_options": {"set": {"reasoning_effort": "high"}},
+            },
+        }
+        historical_json = route_bindings.canonical_json(historical_deepseek)
+        with self.assertRaises(route_bindings.RouteResolutionError):
+            route_bindings.validate_v2_binding(historical_deepseek)
+        observation = controlled_observation(
+            "f" * 64, harness="deepseek"
+        )
+        observation["advertised_options_by_model"] = {
+            "deepseek-official/deepseek-v4-pro": ["high"]
+        }
+        with mock.patch.object(
+            model_catalog,
+            "controlled_route_evidence",
+            return_value=observation,
+        ):
+            route_bindings.verify_stored_v2_before_first_turn(
+                None,
+                historical_deepseek,
+                source_fingerprint="0" * 64,
+                harness_version="retired-carrier",
+            )
+        self.assertEqual(
+            route_bindings.live_native_selection(historical_deepseek),
+            {
+                "harness": "deepseek",
+                "model_id": "deepseek-official/deepseek-v4-pro",
+                "native_option_id": "high",
+                "transport": "deepseek-provider-options-v1",
+            },
+        )
+        self.assertEqual(
+            route_bindings.canonical_json(historical_deepseek),
+            historical_json,
+        )
+
+        legacy_default, _ = resolve_controlled_v2(
+            self.deepseek_row(), "deepseek",
+            "deepseek-official/deepseek-v4-pro", "default",
+            now=self.NOW,
+            runtime_status=compatible_runtime(
+                "0.1.1-rc.2", harness="deepseek"
+            ),
+        )
+        self.assertIsNone(
+            route_bindings.require_advertised_live_native(
+                legacy_default,
+                {"deepseek-official/deepseek-v4-pro": []},
+            )["native_option_id"]
+        )
+
     def _obsolete_ollama_carrier_binding_contract(self):
         binding = {
             "contract_version": 2,
@@ -1009,6 +1175,8 @@ class LegacySprintBindingUpgradeTest(unittest.TestCase):
             "0218_sprint_binding_support_provenance.sql",
             "0223_model_default_effort_binding.sql",
             "0227_deepseek_controlled_route_binding.sql",
+            "0230_deepseek_stock_host_route_binding.sql",
+            "0235_live_native_route_binding_v3.sql",
         ):
             self.con.executescript(
                 (ROOT / ".super-coder" / "migrations" / migration).read_text()
@@ -1039,6 +1207,88 @@ class LegacySprintBindingUpgradeTest(unittest.TestCase):
                 "WHERE name='sprint_participant_route_bindings'"
             )],
             [("sprint_participant_route_bindings", 2)],
+        )
+
+    def test_live_native_v3_migration_preserves_v2_bytes_and_appends_v3(self):
+        legacy = ParticipantRevisionTest.controlled_binding()
+        self._insert_legacy(
+            10,
+            legacy,
+            source_fingerprint="2" * 64,
+            harness_version="0.145.0",
+        )
+        for migration in (
+            "0217_harness_support_metadata.sql",
+            "0218_sprint_binding_support_provenance.sql",
+            "0223_model_default_effort_binding.sql",
+            "0227_deepseek_controlled_route_binding.sql",
+            "0230_deepseek_stock_host_route_binding.sql",
+        ):
+            self.con.executescript(
+                (ROOT / ".super-coder" / "migrations" / migration).read_text()
+            )
+        before = tuple(self.con.execute(
+            "SELECT participant_id,route_revision,binding_json,binding_digest,"
+            "source_fingerprint,harness_version,harness_evidence_format,"
+            "harness_support_state FROM sprint_participant_route_bindings "
+            "WHERE participant_id=10"
+        ).fetchone())
+
+        self.con.executescript((
+            ROOT / ".super-coder" / "migrations" /
+            "0235_live_native_route_binding_v3.sql"
+        ).read_text())
+        preserved = self.con.execute(
+            "SELECT participant_id,route_revision,binding_json,binding_digest,"
+            "source_fingerprint,harness_version,harness_evidence_format,"
+            "harness_support_state,native_option_id "
+            "FROM sprint_participant_route_bindings WHERE participant_id=10"
+        ).fetchone()
+        self.assertEqual(tuple(preserved)[:-1], before)
+        self.assertIsNone(preserved["native_option_id"])
+
+        self.con.execute("UPDATE sprints SET lifecycle='prepared' WHERE sprint_id=1")
+        live, digest = route_bindings.live_native_v3_binding(
+            "deepseek",
+            "Ollama-Cloud/GLM-5.2",
+            "GLM-5.2",
+            "Reasoning-Max",
+        )
+        receipt = route_bindings.ParticipantRouteBindingStore(self.con).bind(
+            11, live, digest, transition="arm"
+        )
+        appended = self.con.execute(
+            "SELECT contract_version,native_option_id,source_fingerprint,"
+            "harness_version,harness_evidence_format,harness_support_state,"
+            "binding_json,binding_digest FROM sprint_participant_route_bindings "
+            "WHERE binding_id=?",
+            (receipt["binding_id"],),
+        ).fetchone()
+        self.assertEqual(
+            tuple(appended)[:6],
+            (3, "Reasoning-Max", None, None, "harness-live-v1", None),
+        )
+        self.assertEqual(json.loads(appended["binding_json"]), live)
+        self.assertEqual(appended["binding_digest"], digest)
+        self.assertEqual(
+            self.con.execute(
+                "SELECT COUNT(*) FROM sprint_participant_route_bindings"
+            ).fetchone()[0],
+            2,
+        )
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.con.execute(
+                "UPDATE sprint_participant_route_bindings "
+                "SET native_option_id='changed' WHERE binding_id=?",
+                (receipt["binding_id"],),
+            )
+        self.assertEqual(
+            self.con.execute(
+                "SELECT native_option_id FROM sprint_participant_route_bindings "
+                "WHERE binding_id=?",
+                (receipt["binding_id"],),
+            ).fetchone()[0],
+            "Reasoning-Max",
         )
 
     def test_dirty_upgrade_preserves_legacy_semver_and_new_raw_rows_are_exact(self):
@@ -2425,20 +2675,69 @@ class ParticipantRevisionTest(unittest.TestCase):
             ),
         )
 
+    def insert_v3_raw(
+        self,
+        binding: dict,
+        *,
+        source_fingerprint: str | None = None,
+        harness_version: str | None = None,
+        harness_support_state: str | None = None,
+    ) -> None:
+        self.con.execute(
+            "INSERT INTO sprint_participant_route_bindings ("
+            "participant_id,route_revision,contract_version,control_state,harness,"
+            "requested_model,provider_model,requested_effort,effective_effort,"
+            "native_variant_id,native_option_id,transport,catalogue_generation,"
+            "evidence_digest,selector_binding,adapter_metadata,binding_json,"
+            "binding_digest,source_fingerprint,harness_version,"
+            "harness_evidence_format,harness_support_state"
+            ") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                11,
+                1,
+                binding["contract_version"],
+                binding["control_state"],
+                binding["harness"],
+                binding["requested_model"],
+                binding["provider_model"],
+                binding["requested_effort"],
+                binding["effective_effort"],
+                binding["native_variant_id"],
+                binding["native_option_id"],
+                binding["transport"],
+                binding["catalogue_generation"],
+                binding["evidence_digest"],
+                route_bindings.canonical_json(binding["selector_binding"]),
+                route_bindings.canonical_json(binding["adapter_metadata"]),
+                route_bindings.canonical_json(binding),
+                route_bindings.digest_json(binding),
+                source_fingerprint,
+                harness_version,
+                "harness-live-v1",
+                harness_support_state,
+            ),
+        )
+
     def stored_binding(self, binding_id: int) -> tuple[sqlite3.Row, dict]:
         rows = self.con.execute(
             "SELECT participant_id,route_revision,control_state,harness,"
-            "binding_json,binding_digest,source_fingerprint,harness_version FROM "
+            "binding_json,binding_digest,native_option_id,source_fingerprint,"
+            "harness_version,harness_evidence_format,harness_support_state FROM "
             "sprint_participant_route_bindings WHERE binding_id=?",
             (binding_id,),
         ).fetchall()
         self.assertEqual(len(rows), 1)
         row = rows[0]
         decoded = json.loads(row["binding_json"])
-        self.assertEqual(tuple(decoded), tuple(sorted(route_bindings.BINDING_KEYS)))
-        self.assertNotEqual(tuple(decoded), route_bindings.BINDING_KEYS)
+        keys = (
+            route_bindings.V3_BINDING_KEYS
+            if decoded["contract_version"] == 3
+            else route_bindings.BINDING_KEYS
+        )
+        self.assertEqual(tuple(decoded), tuple(sorted(keys)))
+        self.assertNotEqual(tuple(decoded), keys)
         self.assertEqual(route_bindings.digest_json(decoded), row["binding_digest"])
-        route_bindings.validate_v2_binding(decoded)
+        route_bindings.validate_binding(decoded)
         return row, decoded
 
     def test_uncontrolled_runtime_rejection_creates_no_binding_or_pointer(self):
@@ -2761,6 +3060,78 @@ class ParticipantRevisionTest(unittest.TestCase):
             "WHERE participant_id=11"
         ).fetchone()[0])
 
+    def test_live_native_v3_round_trip_stores_no_freshness_provenance(self):
+        binding, digest = route_bindings.live_native_v3_binding(
+            "opencode", "Ollama-Cloud/GLM-5.2", "GLM-5.2", "MaX-Custom"
+        )
+        receipt = self.store.bind(
+            10, binding, digest, transition="arm"
+        )
+
+        row, decoded = self.stored_binding(receipt["binding_id"])
+        self.assertEqual(decoded, binding)
+        self.assertEqual(row["native_option_id"], "MaX-Custom")
+        self.assertIsNone(row["source_fingerprint"])
+        self.assertIsNone(row["harness_version"])
+        self.assertEqual(
+            row["harness_evidence_format"], "harness-live-v1"
+        )
+        self.assertIsNone(row["harness_support_state"])
+        self.assertEqual(receipt["contract_version"], 3)
+        self.assertEqual(
+            self.con.execute(
+                "SELECT active_route_binding_id FROM sprint_participants "
+                "WHERE participant_id=10"
+            ).fetchone()[0],
+            receipt["binding_id"],
+        )
+
+        with self.assertRaisesRegex(ValueError, "cannot store freshness"):
+            self.store.bind(
+                11,
+                binding,
+                digest,
+                transition="arm",
+                source_fingerprint="2" * 64,
+                harness_version="1.18.22",
+                harness_support_state="tested",
+            )
+        self.assertIsNone(self.con.execute(
+            "SELECT active_route_binding_id FROM sprint_participants "
+            "WHERE participant_id=11"
+        ).fetchone()[0])
+
+        invalid_rows = (
+            (
+                "catalogue-generation",
+                {**binding, "catalogue_generation": "1" * 32},
+                {},
+            ),
+            (
+                "source-provenance",
+                binding,
+                {
+                    "source_fingerprint": "2" * 64,
+                    "harness_version": "1.18.22",
+                },
+            ),
+            (
+                "support-provenance",
+                binding,
+                {"harness_support_state": "tested"},
+            ),
+        )
+        for name, invalid, provenance in invalid_rows:
+            with self.subTest(name=name):
+                with self.assertRaises(sqlite3.IntegrityError):
+                    self.insert_v3_raw(invalid, **provenance)
+                self.assertEqual(
+                    self.con.execute(
+                        "SELECT COUNT(*) FROM sprint_participant_route_bindings"
+                    ).fetchone()[0],
+                    1,
+                )
+
     def _obsolete_deepseek_carrier_round_trip(self):
         binding, digest = resolve_controlled_v2(
             BindingIdentityTest.deepseek_row(),
@@ -3040,7 +3411,7 @@ class ParticipantRevisionTest(unittest.TestCase):
                 ).fetchone()[0])
 
         controlled = self.controlled_binding()
-        with self.assertRaisesRegex(ValueError, "canonical v2 contract"):
+        with self.assertRaisesRegex(ValueError, "canonical contract"):
             self.store.bind(10, controlled, "abcd", transition="arm")
         self.assertEqual(
             self.con.execute(
