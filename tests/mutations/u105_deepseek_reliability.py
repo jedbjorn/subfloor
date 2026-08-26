@@ -132,6 +132,32 @@ MUTATIONS = (
         '    if not isinstance(record, dict) or record.get("state") != "active":\n',
         '    if not isinstance(record, dict):\n',
     ),
+    Mutation(
+        "admitted-tool-is-not-revalidated-or-killed-after-close",
+        ROOT / ".super-coder/scripts/deepseek_execution_domain.py",
+        "tests/test_deepseek_identity_registry.py::test_real_admitted_tool_execution_survives_close_while_new_root_refuses",
+        (
+            "    _pid, status = os.waitpid(child, 0)\n"
+            "    cleanup_domain(domain, parent)\n"
+        ),
+        (
+            "    while True:\n"
+            "        _pid, status = os.waitpid(child, os.WNOHANG)\n"
+            "        if _pid:\n"
+            "            break\n"
+            "        try:\n"
+            "            _binding_snapshot(\n"
+            "                registry_path=args.registry.resolve(strict=True),\n"
+            "                fork_id=args.fork_id,\n"
+            "                profile_id=args.profile_id,\n"
+            "                environment=environment,\n"
+            "            )\n"
+            "        except ExecutionDomainError:\n"
+            "            os.kill(child, signal.SIGKILL)\n"
+            "        time.sleep(0.01)\n"
+            "    cleanup_domain(domain, parent)\n"
+        ),
+    ),
 )
 
 

@@ -608,6 +608,169 @@ def test_admitted_tool_snapshot_survives_close_while_new_root_refuses() -> None:
             assert retained["plugin_contract_generation"] == contract_generation
 
 
+@pytest.mark.parametrize("tool", ["bash", "pwsh"])
+def test_real_admitted_tool_execution_survives_close_while_new_root_refuses(
+    tool: str,
+) -> None:
+    cgroup_root = Path("/sys/fs/cgroup")
+    membership_rows = [
+        fields[2]
+        for row in Path("/proc/self/cgroup").read_text().splitlines()
+        if len(fields := row.split(":", 2)) == 3
+        and fields[0] == "0"
+        and fields[1] == ""
+    ]
+    if len(membership_rows) != 1:
+        pytest.skip("unified cgroup-v2 membership is unavailable")
+    probe = (
+        cgroup_root
+        / membership_rows[0].lstrip("/")
+        / f"sc-dsh-admitted-probe-{os.getpid()}-{tool}"
+    )
+    try:
+        probe.mkdir()
+        probe.rmdir()
+    except OSError as exc:
+        pytest.skip(f"current Linux seat has no delegated cgroup subtree: {exc}")
+    executable = shutil.which(tool)
+    if executable is None:
+        pytest.skip(f"{tool} is unavailable on this Linux seat")
+
+    with tempfile.TemporaryDirectory() as raw:
+        root = Path(raw)
+        registry, worktree = registry_fixture(root)
+        contract_generation = synthetic_health(registry)
+        session_id = f"immutable-{tool}-root"
+        create_binding(
+            registry,
+            worktree,
+            session_id=session_id,
+            conversation_id=f"immutable-{tool}-conversation",
+            shell_id=39 if tool == "bash" else 40,
+            shortname=f"IMMUTABLE_{tool.upper()}",
+            token=f"immutable-{tool}-secret",
+        )
+        record = registry.resolve_record(session_id)
+        environment = {
+            **os.environ,
+            "DSH_SESSION_ID": session_id,
+            "DSH_SC_SHELL_ID": str(record["shell_id"]),
+            "DSH_SC_SHELL_SHORTNAME": str(record["shell_shortname"]),
+            "DSH_SC_SHELL_WORKTREE": str(record["shell_worktree"]),
+            "DSH_SC_API_BASE": str(record["api_base"]),
+            "DSH_SC_MEM_CREDENTIAL_FILE": str(record["credential_file"]),
+            "DSH_SC_BINDING_GENERATION": str(record["record_generation"]),
+            "DSH_SC_PLUGIN_HEALTH_GENERATION": contract_generation,
+        }
+        ready = root / f"{tool}-ready"
+        release = root / f"{tool}-release"
+        effect = root / f"{tool}-effect"
+        refused_effect = root / f"{tool}-refused-effect"
+        environment.update(
+            {
+                "SC_TEST_READY": str(ready),
+                "SC_TEST_RELEASE": str(release),
+                "SC_TEST_EFFECT": str(effect),
+            }
+        )
+        if tool == "bash":
+            command = [
+                executable,
+                "-c",
+                (
+                    'printf ready > "$SC_TEST_READY"; '
+                    'while [ ! -e "$SC_TEST_RELEASE" ]; do sleep 0.01; done; '
+                    'printf bash > "$SC_TEST_EFFECT"'
+                ),
+            ]
+        else:
+            command = [
+                executable,
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                (
+                    "[IO.File]::WriteAllText($env:SC_TEST_READY, 'ready'); "
+                    "while (-not [IO.File]::Exists($env:SC_TEST_RELEASE)) { "
+                    "Start-Sleep -Milliseconds 10 }; "
+                    "[IO.File]::WriteAllText($env:SC_TEST_EFFECT, 'pwsh')"
+                ),
+            ]
+
+        launcher = [
+            str(SCRIPTS / "deepseek_execution_domain.py"),
+            "--fork-id",
+            registry.layout.fork_id,
+            "--profile-id",
+            registry.layout.profile_id,
+            "--registry",
+            str(registry.layout.registry),
+            "--host-identity",
+            str(registry.layout.host_identity),
+            "--cgroup-root",
+            str(cgroup_root),
+            "--domain-id",
+            uuid.uuid4().hex,
+            "--descriptor-fd",
+            "198",
+            "--ttl-seconds",
+            "60",
+            "--",
+            *command,
+        ]
+        with subprocess.Popen(
+            launcher,
+            cwd=ROOT,
+            env=environment,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        ) as admitted:
+            try:
+                wait_for(ready.exists)
+                assert ready.read_text() == "ready"
+                snapshot = registry.read_snapshot()
+                closed = registry.begin_close(
+                    expected_snapshot_generation=snapshot["snapshot_generation"],
+                    root_session_id=session_id,
+                    expected_record_generation=record["record_generation"],
+                )
+                assert closed.state == "closing"
+                time.sleep(0.1)
+                release.touch()
+                stdout, stderr = admitted.communicate(timeout=10)
+                assert admitted.returncode == 0, stderr
+                assert stdout == ""
+                assert effect.read_text() == tool
+            finally:
+                release.touch(exist_ok=True)
+                if admitted.poll() is None:
+                    admitted.terminate()
+                    admitted.wait(timeout=5)
+
+        refused_command = [
+            executable,
+            "-c" if tool == "bash" else "-Command",
+            (
+                f"printf refused > {refused_effect}"
+                if tool == "bash"
+                else f"[IO.File]::WriteAllText('{refused_effect}', 'refused')"
+            ),
+        ]
+        refused = subprocess.run(
+            [*launcher[: launcher.index("--") + 1], *refused_command],
+            cwd=ROOT,
+            env=environment,
+            text=True,
+            capture_output=True,
+            timeout=10,
+            check=False,
+        )
+        assert refused.returncode == 126
+        assert "ToolExecution binding is not active" in refused.stderr
+        assert refused_effect.exists() is False
+
+
 def test_execution_domain_uses_linux_seal_uapi_when_python_omits_names() -> None:
     program = f"""
 import fcntl
