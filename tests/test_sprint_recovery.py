@@ -607,8 +607,12 @@ class SprintRecoveryCase(SprintPRWatcherCase):
             "the bounded fallback does not become a recursive recovery loop",
         )
 
-    def test_shell_busy_retries_durably_then_pauses_with_one_notice(self):
-        message = self.send("busy-recovery-chain")
+    def test_assignment_shell_busy_retries_then_pauses_without_provider_run(self):
+        message = self.send(
+            "busy-recovery-chain",
+            kind="work_assignment",
+            actionable=True,
+        )
         original = int(message.wake_id)
         notifications = []
         store = sprint_domain.SprintLifecycleStore(
@@ -660,6 +664,23 @@ class SprintRecoveryCase(SprintPRWatcherCase):
                     event["attempt"],
                     event["backoff_seconds"],
                     event["replacement_wake_id"],
+                ),
+            )
+            self.assertEqual(
+                ("armed", current, 0, 0),
+                tuple(
+                    self.con.execute(
+                        "SELECT s.lifecycle,wm.wake_id,"
+                        "(SELECT COUNT(*) FROM sprint_reports report "
+                        "WHERE report.sprint_id=s.sprint_id "
+                        "AND report.report_kind='pause'),"
+                        "(SELECT COUNT(*) FROM conversation_runs run "
+                        "WHERE run.harness_session_after IS NOT NULL "
+                        "OR run.runner_ref IS NOT NULL) "
+                        "FROM sprints s JOIN sprint_wake_messages wm "
+                        "ON wm.message_id=? WHERE s.sprint_id=?",
+                        (message.message_id, self.sprint_id),
+                    ).fetchone()
                 ),
             )
             before_changes = self.con.total_changes
@@ -1897,7 +1918,7 @@ class SprintRecoveryCase(SprintPRWatcherCase):
             ],
         )
 
-    def test_resume_repairs_delivered_unread_assignment_once(self):
+    def test_resume_never_replays_delivered_unread_assignment(self):
         assignment = self.send(
             "pickup-assignment",
             kind="work_assignment",
@@ -1923,14 +1944,14 @@ class SprintRecoveryCase(SprintPRWatcherCase):
             reason="recover the unread assignment",
         )
 
-        self.assertEqual(1, len(receipt.requeued_wake_ids))
-        replacement = receipt.requeued_wake_ids[0]
-        self.assertNotEqual(old_wake, replacement)
+        self.assertFalse(receipt.changed)
+        self.assertEqual((), receipt.requeued_wake_ids)
         self.assertEqual(
-            (replacement, "pending"),
+            (old_wake, "delivered", 1),
             tuple(
                 self.con.execute(
-                    "SELECT wm.wake_id,w.state FROM sprint_wake_messages wm "
+                    "SELECT wm.wake_id,w.state,w.attempt_count "
+                    "FROM sprint_wake_messages wm "
                     "JOIN sprint_wake_outbox w USING (wake_id) "
                     "WHERE wm.message_id=?",
                     (assignment.message_id,),
@@ -1940,15 +1961,27 @@ class SprintRecoveryCase(SprintPRWatcherCase):
         event = json.loads(
             self.con.execute(
                 "SELECT payload FROM sprint_events WHERE sprint_id=? "
-                "AND event_type='wake.requeued' ORDER BY event_id DESC LIMIT 1",
+                "AND event_type='wake.pickup_exhausted' "
+                "ORDER BY event_id DESC LIMIT 1",
                 (self.sprint_id,),
             ).fetchone()[0]
         )
-        self.assertEqual("delivered", event["prior_wake_state"])
-        self.assertEqual("completed", event["prior_turn_state"]["message_state"])
-        self.assertEqual("succeeded", event["prior_turn_state"]["run_state"])
-        self.assertEqual(old_wake, event["prior_wake_id"])
-        self.assertEqual(replacement, event["replacement_wake_id"])
+        self.assertEqual(assignment.message_id, event["message_id"])
+        self.assertEqual(self.unit_id, event["work_unit_id"])
+        self.assertEqual(old_wake, event["wake_id"])
+        self.assertEqual("succeeded", event["run_state"])
+        self.assertEqual("ASSIGNMENT_TERMINAL_UNREAD", event["error_code"])
+        self.assertEqual("terminal_unread", event["failure_class"])
+        self.assertEqual(1, event["attempt_count"])
+        report = json.loads(
+            self.con.execute(
+                "SELECT body FROM sprint_reports WHERE sprint_id=? "
+                "AND report_kind='pause' ORDER BY report_id DESC LIMIT 1",
+                (self.sprint_id,),
+            ).fetchone()[0]
+        )
+        self.assertEqual("assignment_execution_already_started", report["reason"])
+        self.assertEqual(old_wake, report["detail"]["wake_id"])
 
         self.assertEqual(
             (),
@@ -1958,7 +1991,108 @@ class SprintRecoveryCase(SprintPRWatcherCase):
             ),
         )
         self.assertEqual(
-            1,
+            0,
+            self.con.execute(
+                "SELECT COUNT(*) FROM sprint_wake_outbox "
+                "WHERE idempotency_key LIKE 'sprint-recovery:%'"
+            ).fetchone()[0],
+        )
+
+    def test_resume_never_replays_interrupted_unread_assignment(self):
+        assignment = self.send(
+            "interrupted-assignment",
+            kind="work_assignment",
+            actionable=True,
+        )
+        wake_id = int(assignment.wake_id)
+        _prompt, wake_key = self.deliver_wake_with_turn(wake_id, terminal=False)
+        trigger_message_id = int(
+            self.con.execute(
+                "SELECT message_id FROM conversation_messages "
+                "WHERE idempotency_key=?",
+                (wake_key,),
+            ).fetchone()[0]
+        )
+        self.con.execute(
+            "UPDATE conversation_messages SET state='running' WHERE message_id=?",
+            (trigger_message_id,),
+        )
+        run_id = int(
+            self.con.execute(
+                "INSERT INTO conversation_runs "
+                "(conversation_id,shell_id,trigger_message_id,state,lease_owner,"
+                "lease_expires_at,started_at,heartbeat_at) "
+                "VALUES (?,1,?,'running','test-broker','2999-01-01 00:00:00',"
+                "'2026-08-01 00:00:00','2026-08-01 00:00:00')",
+                (self.developer_conversation_id, trigger_message_id),
+            ).lastrowid
+        )
+        self.con.execute(
+            "UPDATE conversations SET state='running' WHERE conversation_id=?",
+            (self.developer_conversation_id,),
+        )
+        self.con.commit()
+
+        pause = self.coordinator().pause(
+            self.sprint_id,
+            sprint_domain.LifecycleActor("planner", 3),
+            reason="interrupt the assignment turn",
+        )
+        self.assertEqual((run_id,), pause.interrupt_run_ids)
+        self.con.execute(
+            "UPDATE conversation_runs SET state='cancelled',ended_at=datetime('now') "
+            "WHERE run_id=?",
+            (run_id,),
+        )
+        self.con.execute(
+            "UPDATE conversation_messages SET state='cancelled',"
+            "completed_at=datetime('now') WHERE message_id=?",
+            (trigger_message_id,),
+        )
+        self.con.execute(
+            "UPDATE conversations SET state='idle' WHERE conversation_id=?",
+            (self.developer_conversation_id,),
+        )
+        self.con.commit()
+
+        receipt = self.coordinator().resume(
+            self.sprint_id,
+            sprint_domain.LifecycleActor("planner", 3),
+            reason="observe the interrupted assignment",
+        )
+
+        self.assertFalse(receipt.changed)
+        self.assertEqual((), receipt.requeued_wake_ids)
+        self.assertEqual(
+            (wake_id, "delivered", trigger_message_id, run_id, "cancelled"),
+            tuple(
+                self.con.execute(
+                    "SELECT wm.wake_id,w.state,m.message_id,r.run_id,r.state "
+                    "FROM sprint_wake_messages wm "
+                    "JOIN sprint_wake_outbox w USING (wake_id) "
+                    "JOIN conversation_messages m ON m.idempotency_key=w.idempotency_key "
+                    "JOIN conversation_runs r ON r.trigger_message_id=m.message_id "
+                    "WHERE wm.message_id=?",
+                    (assignment.message_id,),
+                ).fetchone()
+            ),
+        )
+        event = json.loads(
+            self.con.execute(
+                "SELECT payload FROM sprint_events WHERE sprint_id=? "
+                "AND event_type='wake.pickup_exhausted' "
+                "ORDER BY event_id DESC LIMIT 1",
+                (self.sprint_id,),
+            ).fetchone()[0]
+        )
+        self.assertEqual(wake_id, event["wake_id"])
+        self.assertEqual("cancelled", event["run_state"])
+        self.assertEqual("native_interrupted", event["failure_class"])
+        self.assertEqual(
+            "ASSIGNMENT_EXECUTION_INTERRUPTED", event["error_code"]
+        )
+        self.assertEqual(
+            0,
             self.con.execute(
                 "SELECT COUNT(*) FROM sprint_wake_outbox "
                 "WHERE idempotency_key LIKE 'sprint-recovery:%'"

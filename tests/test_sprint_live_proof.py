@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import concurrent.futures
 import contextlib
 import hashlib
 import io
@@ -35,6 +36,7 @@ sys.path[:0] = [
 
 import active_chat_registry
 import db_driver
+import deepseek_web
 import mem
 import model_catalog
 import route_bindings
@@ -47,11 +49,15 @@ import sprint_domain
 import sprint_message_delivery
 import sprint_pr_watcher
 import sprint_runtime
+from conversation_adapters.base import NativeTurn, NormalizedEvent
+from conversation_adapters.deepseek import DeepSeekAdapter
 from conversation_adapters.opencode import OpenCodeAdapter
 from conversation_broker import BrokerStore
 from conversation_launch import ConversationLaunchPreparer
 from github_pull_requests import PullRequest
 from sprint_route_binding_support import candidate as route_candidate
+from test_deepseek_adapter import FakeHost as FakeDeepSeekHost
+from test_deepseek_adapter import frame as deepseek_frame
 from test_sprint_v2_domain import apply_schema
 
 TOKENS = {
@@ -164,11 +170,26 @@ class SprintBoundRouteDispatchProof(unittest.TestCase):
 
     @staticmethod
     def _runtime(harness: str) -> tuple[dict, dict]:
+        scope = route_bindings.harness_versions.runtime_scope()
+        if harness == "deepseek":
+            return (
+                {
+                    "harness": harness,
+                    **scope,
+                    "version": "0.1.1",
+                    "observed_version": "0.1.1-rc.2",
+                    "compatibility": "verified",
+                    "minimum_version": "0.1.1",
+                    "maximum_version_exclusive": "0.1.2",
+                    "verified_version": "0.1.1",
+                    "error": None,
+                },
+                scope,
+            )
         versions = {"kimi": "0.33.0", "opencode": "1.18.9"}
         compatibility = route_bindings._runtime_manifest_compatibility(
             harness, versions[harness]
         )
-        scope = route_bindings.harness_versions.runtime_scope()
         return (
             {
                 "harness": harness,
@@ -696,7 +717,23 @@ class SprintBoundRouteDispatchProof(unittest.TestCase):
         with mock.patch.object(
             model_catalog, "controlled_route_evidence", return_value=observation
         ):
-            wake_id = self._arm(sprint_id)
+            self._arm(sprint_id)
+            planner_notice = self.con.execute(
+                "SELECT message_id FROM wake_message WHERE sprint_id=? "
+                "AND receiver_shell_id=3 AND message_kind='notification'",
+                (sprint_id,),
+            ).fetchone()
+            self.assertIsNotNone(planner_notice)
+            sprint_message_delivery.SprintMessageStore(self.con).mark_read(
+                int(planner_notice["message_id"]), 3
+            )
+            wake_id = int(self.con.execute(
+                "SELECT joined.wake_id FROM wake_message message "
+                "JOIN sprint_wake_messages joined USING (message_id) "
+                "WHERE message.sprint_id=? "
+                "AND message.message_kind='work_assignment'",
+                (sprint_id,),
+            ).fetchone()[0])
             broker_run = self._deliver_and_claim(wake_id)
         context, _launch = self._prepare(broker_run)
 
@@ -847,6 +884,373 @@ class SprintBoundRouteDispatchProof(unittest.TestCase):
                 (wake_id,),
             ).fetchone()),
             ("delivered", 1, None),
+        )
+
+    def test_deepseek_null_default_sprint_delivery_is_credential_free(self) -> None:
+        selector = "acme-dynamic/model-7"
+        status, scope = self._runtime("deepseek")
+        observation = {
+            "runtime_status": status,
+            "runtime_scope": scope,
+            "source_fingerprint": "8" * 64,
+            "advertised_options_by_model": {selector: ["low", "high"]},
+        }
+        sprint_id = self._seed_sprint(
+            harness="deepseek", model=selector, effort=None
+        )
+        with mock.patch.object(
+            model_catalog, "controlled_route_evidence", return_value=observation
+        ):
+            self._arm(sprint_id)
+            planner_notice = self.con.execute(
+                "SELECT message_id FROM wake_message WHERE sprint_id=? "
+                "AND receiver_shell_id=3 AND message_kind='notification'",
+                (sprint_id,),
+            ).fetchone()
+            self.assertIsNotNone(planner_notice)
+            sprint_message_delivery.SprintMessageStore(self.con).mark_read(
+                int(planner_notice["message_id"]), 3
+            )
+            wake_id = int(self.con.execute(
+                "SELECT joined.wake_id FROM wake_message message "
+                "JOIN sprint_wake_messages joined USING (message_id) "
+                "WHERE message.sprint_id=? "
+                "AND message.message_kind='work_assignment'",
+                (sprint_id,),
+            ).fetchone()[0])
+            broker_run = self._deliver_and_claim(wake_id)
+        context, _launch = self._prepare(broker_run)
+        context.env.update({
+            "SC_API_TOKEN": "credential-free-shell-token",
+            "SC_API_BASE": "http://127.0.0.1:8837",
+            "SC_SHELL_ID": str(broker_run.shell_id),
+            "SC_SHELL_SHORTNAME": "DEV1",
+        })
+        session_ref = DeepSeekAdapter._new_session_ref(context)
+        host = FakeDeepSeekHost(frames=[
+            deepseek_frame(
+                session_ref,
+                {"seq": 3, "type": "turn/start", "data": {}},
+            ),
+            deepseek_frame(
+                session_ref,
+                {
+                    "seq": 4,
+                    "type": "assistant/chunk",
+                    "data": {
+                        "chunk": {"type": "text-delta", "text": "done"}
+                    },
+                },
+            ),
+            deepseek_frame(
+                session_ref,
+                {
+                    "seq": 5,
+                    "type": "turn/end",
+                    "data": {"reason": {"kind": "completed"}},
+                },
+            ),
+        ])
+        adapter = DeepSeekAdapter(client_factory=lambda: host)
+        store = BrokerStore(self.db_path)
+        owner = "bound-route-broker"
+
+        with (
+            mock.patch.object(deepseek_web, "ensure", return_value={}),
+            mock.patch.object(
+                deepseek_web, "preflight_candidate_execution", return_value=None
+            ),
+            mock.patch.object(
+                deepseek_web, "bind_session_identity", return_value={}
+            ),
+            mock.patch.object(
+                deepseek_web, "retire_session_identity", return_value={}
+            ),
+            mock.patch.object(
+                deepseek_web, "reserve_managed_session", return_value=None
+            ),
+            mock.patch.object(
+                deepseek_web, "release_managed_session", return_value=None
+            ),
+        ):
+            store.mark_starting(broker_run.run_id, owner)
+            turn = adapter.start(context, broker_run.body)
+            store.mark_native_started(broker_run.run_id, owner, turn)
+            events = list(adapter.stream(turn))
+            store.append_events(broker_run.run_id, events[:-1])
+            self.assertTrue(store.finish_run(
+                broker_run.run_id,
+                "succeeded",
+                event_type=events[-1].type,
+                payload=events[-1].payload,
+            ))
+            adapter.close()
+
+        selection = [
+            payload for method, payload in host.calls
+            if method == "session.selectModel"
+        ]
+        prompts = [
+            payload for method, payload in host.calls if method == "session.prompt"
+        ]
+        assignment = self.con.execute(
+            "SELECT message.message_id,message.work_unit_id "
+            "FROM wake_message message "
+            "JOIN sprint_wake_messages joined USING (message_id) "
+            "WHERE joined.wake_id=? AND message.message_kind='work_assignment'",
+            (wake_id,),
+        ).fetchone()
+        run = self.con.execute(
+            "SELECT state,harness_session_after,error_code "
+            "FROM conversation_runs WHERE run_id=?",
+            (broker_run.run_id,),
+        ).fetchone()
+
+        self.assertIsNotNone(assignment)
+        self.assertIn(f"## wake_message #{assignment['message_id']}", broker_run.body)
+        self.assertEqual(broker_run.route_contract_version, 3)
+        self.assertEqual(broker_run.route_binding["requested_model"], selector)
+        self.assertEqual(broker_run.route_binding["provider_model"], "model-7")
+        self.assertIsNone(broker_run.route_binding["native_option_id"])
+        self.assertIsNone(broker_run.effort)
+        self.assertEqual(turn.session_ref, session_ref)
+        self.assertEqual(
+            [event.type for event in events],
+            [
+                "session.started",
+                "run.started",
+                "assistant.delta",
+                "run.completed",
+            ],
+        )
+        self.assertEqual(selection, [{
+            "sessionId": session_ref,
+            "provider": "acme-dynamic",
+            "model": "model-7",
+        }])
+        self.assertNotIn("reasoningEffort", selection[0])
+        self.assertEqual(len(prompts), 1)
+        self.assertEqual(prompts[0]["sessionId"], session_ref)
+        self.assertEqual(
+            sum(method == "session.create" for method, _payload in host.calls),
+            1,
+        )
+        self.assertEqual(tuple(run), ("succeeded", session_ref, None))
+        self.assertEqual(
+            self.con.execute(
+                "SELECT COUNT(*) FROM conversation_events WHERE run_id=? "
+                "AND event_type='run.completed'",
+                (broker_run.run_id,),
+            ).fetchone()[0],
+            1,
+        )
+        self.assertEqual(
+            [method for method, _payload in host.calls if method.startswith("provider.")],
+            [],
+        )
+
+    def test_terminal_unread_assignment_never_fans_out_provider_execution(
+        self,
+    ) -> None:
+        observation = self._seed_opencode_catalogue()
+        sprint_id = self._seed_sprint(
+            harness="opencode", model=self.SELECTOR, effort=None
+        )
+        with mock.patch.object(
+            model_catalog, "controlled_route_evidence", return_value=observation
+        ):
+            self._arm(sprint_id)
+            planner_notice = self.con.execute(
+                "SELECT message_id FROM wake_message WHERE sprint_id=? "
+                "AND receiver_shell_id=3 AND message_kind='notification'",
+                (sprint_id,),
+            ).fetchone()
+            self.assertIsNotNone(planner_notice)
+            sprint_message_delivery.SprintMessageStore(self.con).mark_read(
+                int(planner_notice["message_id"]), 3
+            )
+            self.assertIsNotNone(
+                self.con.execute(
+                    "SELECT read_at FROM wake_message WHERE message_id=?",
+                    (planner_notice["message_id"],),
+                ).fetchone()[0]
+            )
+
+            assignment = self.con.execute(
+                "SELECT message.message_id,message.work_unit_id,"
+                "message.to_participant_id,wake.wake_id,"
+                "sprint.conversation_generation "
+                "FROM wake_message message "
+                "JOIN sprint_wake_messages joined USING (message_id) "
+                "JOIN sprint_wake_outbox wake USING (wake_id) "
+                "JOIN sprints sprint ON sprint.sprint_id=message.sprint_id "
+                "WHERE message.sprint_id=? "
+                "AND message.message_kind='work_assignment'",
+                (sprint_id,),
+            ).fetchone()
+            self.assertIsNotNone(assignment)
+            wake_id = int(assignment["wake_id"])
+            first_run = self._deliver_and_claim(wake_id)
+
+        class CredentialFreeProviderAdapter:
+            def __init__(self) -> None:
+                self.sessions: list[str] = []
+                self.prompts: list[str] = []
+                self.routes: list[tuple[str | None, str | None, str | None]] = []
+                self.provider_requests = 0
+
+            def start(self, context, prompt: str) -> NativeTurn:
+                session_ref = f"fake-session:{context.conversation_id}"
+                self.sessions.append(session_ref)
+                self.prompts.append(prompt)
+                self.routes.append((context.provider, context.model, context.effort))
+                return NativeTurn(
+                    harness="opencode",
+                    session_ref=session_ref,
+                    run_ref=f"fake-run:{len(self.sessions)}",
+                    worktree=context.checked_worktree(),
+                )
+
+            @staticmethod
+            def stream(_turn: NativeTurn):
+                return iter((
+                    NormalizedEvent("run.started", {"status": "running"}),
+                    NormalizedEvent("run.completed", {"status": "completed"}),
+                ))
+
+        adapter = CredentialFreeProviderAdapter()
+        store = BrokerStore(self.db_path)
+        owner = "bound-route-broker"
+
+        def execute(run) -> None:
+            context, _launch = self._prepare(run)
+            store.mark_starting(run.run_id, owner)
+            turn = adapter.start(context, run.body)
+            store.mark_native_started(run.run_id, owner, turn)
+            events = list(adapter.stream(turn))
+            store.append_events(run.run_id, events[:-1])
+            self.assertTrue(store.finish_run(
+                run.run_id,
+                "succeeded",
+                event_type=events[-1].type,
+                payload=events[-1].payload,
+            ))
+
+        execute(first_run)
+        self.assertEqual(
+            self.con.execute(
+                "SELECT COUNT(*) FROM sprint_wake_attempts WHERE wake_id=?",
+                (wake_id,),
+            ).fetchone()[0],
+            1,
+        )
+
+        barrier = threading.Barrier(3)
+
+        def reconcile(trigger: str) -> tuple[int, ...]:
+            con = db_driver.connect(self.db_path)
+            try:
+                barrier.wait(timeout=5)
+                return sprint_domain.SprintLifecycleStore(
+                    con, probe_harness=lambda _harness: None
+                ).reconcile_unread_pickup(sprint_id, trigger=trigger)
+            finally:
+                con.close()
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+            workers = [
+                pool.submit(reconcile, trigger)
+                for trigger in (
+                    "automatic-participant-new",
+                    "automatic-participant-re-entry",
+                )
+            ]
+            barrier.wait(timeout=5)
+            concurrent_results = [worker.result(timeout=5) for worker in workers]
+        replacements = tuple(
+            wake_id for result in concurrent_results for wake_id in result
+        )
+        for replacement in replacements:
+            outcome = sprint_message_delivery.SprintWakeDeliveryService(
+                self.con, force_new_quiet_seconds=0
+            ).deliver_once(
+                "automatic-participant-re-entry",
+                lambda conversation_id, prompt, key: (
+                    sprint_runtime.enqueue_conversation_turn(
+                        self.db_path, conversation_id, prompt, key
+                    )
+                ),
+            )
+            self.assertIsNotNone(outcome)
+            self.assertEqual(replacement, outcome.wake_id)
+            replay = store.claim_next(owner)
+            self.assertIsNotNone(replay)
+            execute(replay)
+
+        assignment_marker = f"## wake_message #{int(assignment['message_id'])} "
+        assignment_prompts = [
+            prompt for prompt in adapter.prompts if assignment_marker in prompt
+        ]
+        linked = self.con.execute(
+            "SELECT COUNT(DISTINCT conversation.conversation_id),"
+            "COUNT(DISTINCT run.run_id),"
+            "COUNT(DISTINCT CASE WHEN event.event_type='run.completed' "
+            "THEN event.event_id END) "
+            "FROM sprint_participant_conversations link "
+            "JOIN conversations conversation "
+            "ON conversation.conversation_id=link.conversation_id "
+            "JOIN conversation_messages message "
+            "ON message.conversation_id=conversation.conversation_id "
+            "JOIN conversation_runs run ON run.trigger_message_id=message.message_id "
+            "LEFT JOIN conversation_events event ON event.run_id=run.run_id "
+            "WHERE link.sprint_participant_id=("
+            "SELECT to_participant_id FROM wake_message WHERE message_id=?) "
+            "AND instr(message.body,?)>0",
+            (assignment["message_id"], assignment_marker),
+        ).fetchone()
+        creation_key = self.con.execute(
+            "SELECT DISTINCT conversation.creation_idempotency_key "
+            "FROM sprint_participant_conversations link "
+            "JOIN conversations conversation "
+            "ON conversation.conversation_id=link.conversation_id "
+            "JOIN conversation_messages message "
+            "ON message.conversation_id=conversation.conversation_id "
+            "WHERE link.sprint_participant_id=? AND instr(message.body,?)>0",
+            (assignment["to_participant_id"], assignment_marker),
+        ).fetchone()[0]
+
+        self.assertEqual(replacements, ())
+        self.assertEqual(
+            sprint_domain.SprintLifecycleStore(
+                self.con, probe_harness=lambda _harness: None
+            ).reconcile_unread_pickup(
+                sprint_id,
+                trigger="automatic-participant-redelivery",
+            ),
+            (),
+        )
+        self.assertEqual(int(assignment["wake_id"]), wake_id)
+        self.assertRegex(str(assignment["conversation_generation"]), r"^[0-9a-f]{32}$")
+        self.assertEqual(first_run.route_contract_version, 3)
+        self.assertIsNone(first_run.route_binding["native_option_id"])
+        self.assertEqual(
+            creation_key,
+            f"generation:{assignment['conversation_generation']}:"
+            f"participant:{assignment['to_participant_id']}:"
+            f"route:1:wake:{wake_id}",
+        )
+        self.assertEqual(len(assignment_prompts), 1)
+        self.assertEqual(tuple(linked), (1, 1, 1))
+        self.assertEqual(len(adapter.sessions), 1)
+        self.assertEqual(adapter.routes, [("openai", self.SELECTOR, None)])
+        self.assertEqual(adapter.provider_requests, 0)
+        self.assertEqual(
+            self.con.execute(
+                "SELECT COUNT(*) FROM sprint_events WHERE sprint_id=? "
+                "AND event_type='wake.pickup_exhausted'",
+                (sprint_id,),
+            ).fetchone()[0],
+            1,
         )
 
     def test_opencode_dispatch_uses_current_live_variant_after_catalogue_changes(
