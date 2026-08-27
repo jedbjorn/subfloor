@@ -664,7 +664,7 @@
     ".super-coder/scripts/models.py": "fe2d0390254632469e9ae625672167e9fcfc42d7637b3681d257d0d55d52dd1e",
     ".super-coder/scripts/pr_cli.py": "4ec130866495bf981240d63176c8008f77f0e9b748012bc229e05b657aff8fb0",
     ".super-coder/scripts/skill.py": "49e853c8fb7783638fbd787f8c92a51d1c8b17bbd6245a63071b93f62e495699",
-    "sc": "a719ba72168b8a971312d7f6d64be5ac76467ff5f636f166b603fae094b44867"
+    "sc": "9aa52b79bb64c8ff3ee016e60f1b30b3ef19c113021fbd5cfe920694915d3d17"
   },
   "direct_sc_signal_inventory": {
     "SC_ADMIN": [
@@ -739,6 +739,9 @@
     "SC_CONVERSATION_SURFACE": [
       ".super-coder/scripts/conversation_adapters/deepseek.py",
       ".super-coder/scripts/conversation_launch.py"
+    ],
+    "SC_CUTOVER_GUARD": [
+      "sc"
     ],
     "SC_DATABASE_URL": [
       ".super-coder/scripts/dispatch.sh",
@@ -1443,6 +1446,7 @@
       "SC_BROWSER_HANDOFF_ID",
       "SC_CHAT_INACTIVITY_CEILING",
       "SC_CONVERSATION_SURFACE",
+      "SC_CUTOVER_GUARD",
       "SC_DB_BACKUP_DIR",
       "SC_DEEPSEEK_BOOTSTRAP_PYTHON",
       "SC_DEEPSEEK_CARRIER_PYTHON",
@@ -2295,10 +2299,11 @@
       ]
     },
     "sc": {
-      "sha256": "a719ba72168b8a971312d7f6d64be5ac76467ff5f636f166b603fae094b44867",
+      "sha256": "9aa52b79bb64c8ff3ee016e60f1b30b3ef19c113021fbd5cfe920694915d3d17",
       "sc_signals": [
         "SC_ADMISSION_FLOOR",
         "SC_CALLER_ROOT",
+        "SC_CUTOVER_GUARD",
         "SC_DISPATCH",
         "SC_POLICY",
         "SC_PROVENANCE",
