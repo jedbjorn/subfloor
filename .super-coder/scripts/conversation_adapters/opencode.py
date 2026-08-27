@@ -882,6 +882,11 @@ class OpenCodeAdapter(ConversationAdapter):
             route_transport.route_bindings.require_advertised_live_native(
                 dict(binding), advertised
             )
+            if (
+                binding.get("contract_version")
+                == route_transport.route_bindings.LIVE_NATIVE_CONTRACT_VERSION
+            ):
+                return
             option_id = selection["native_option_id"]
             payload = (
                 current["variants"].get(option_id)
@@ -919,9 +924,17 @@ class OpenCodeAdapter(ConversationAdapter):
             isinstance(context.route_binding, Mapping)
             and context.route_binding.get("control_state") == "controlled"
         ):
-            body["agent"] = opencode_config.route_agent_name(
-                context.binding_digest or ""
-            )
+            if (
+                context.route_binding.get("contract_version")
+                == route_transport.route_bindings.LIVE_NATIVE_CONTRACT_VERSION
+            ):
+                option_id = context.route_binding.get("native_option_id")
+                if option_id is not None:
+                    body["variant"] = option_id
+            else:
+                body["agent"] = opencode_config.route_agent_name(
+                    context.binding_digest or ""
+                )
         self.transport.request(
             "POST",
             f"/session/{session_ref}/message",
@@ -1018,6 +1031,12 @@ class OpenCodeAdapter(ConversationAdapter):
     ) -> NativeTurn:
         message = ensure_nonempty_message(message)
         self._prepare_shell_environment(context)
+        if (
+            isinstance(context.route_binding, Mapping)
+            and context.route_binding.get("contract_version")
+            == route_transport.route_bindings.LIVE_NATIVE_CONTRACT_VERSION
+        ):
+            self._prepare_live_route_agent(context)
         inspected = self.inspect(session_ref, context)
         if not inspected.exists:
             raise AdapterError(
