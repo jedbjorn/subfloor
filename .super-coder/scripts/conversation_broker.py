@@ -34,6 +34,7 @@ import conversation_git_targets
 import db_driver
 import route_transport
 from conversation_adapters import (
+    AdapterError,
     ConversationAdapter,
     ConversationContext,
     NativeTurn,
@@ -1485,9 +1486,13 @@ class ConversationBroker(threading.Thread):
                     wait=True,
                 ):
                     return False
-            if stream_error is not None:
-                # Preserve synchronous submission evidence. Reconciling an
-                # idle native session here would erase the precise failure.
+            if (
+                isinstance(stream_error, AdapterError)
+                and stream_error.code.startswith("HARNESS_SUBMISSION_")
+            ):
+                # A synchronous submission failure is precise evidence.
+                # Other stream failures remain uncertain and reconcile the
+                # exact native turn instead of abandoning in-flight work.
                 raise stream_error
             return False
         finally:

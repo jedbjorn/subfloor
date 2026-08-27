@@ -1415,6 +1415,11 @@ class ConversationAdapterTest(unittest.TestCase):
 
         self.assertEqual(caught.exception.code, "HARNESS_SUBMISSION_UNOBSERVED")
         self.assertEqual(
+            caught.exception.detail,
+            "OpenCode accepted the synchronous prompt request but reported no "
+            f"activity or terminal event for {native.session_ref}",
+        )
+        self.assertEqual(
             len([
                 request for request in native.requests
                 if request[1].endswith("/message")

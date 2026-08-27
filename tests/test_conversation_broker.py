@@ -209,6 +209,20 @@ class ReconcileSequenceAdapter(FakeAdapter):
         return next(self.results)
 
 
+class PostActivityStreamErrorAdapter(ReconcileSequenceAdapter):
+    """Lose a Kimi-shaped stream after activity, then reconcile exactly."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.harness = "kimi"
+
+    def stream(self, turn: NativeTurn) -> Iterator[NormalizedEvent]:
+        yield NormalizedEvent("session.started", {"session_ref": turn.session_ref})
+        yield NormalizedEvent("run.started", {"status": "running"})
+        yield NormalizedEvent("assistant.delta", {"text": "before stream loss"})
+        raise OSError("Kimi stdout stream closed while the process was live")
+
+
 class BlockingOpenCodeTransport:
     """Hold synchronous message delivery until the broker calls abort."""
 
@@ -1673,6 +1687,71 @@ class ServiceContractTest(ConversationBrokerCase):
         self.assertEqual(row["state"], "succeeded")
         self.assertGreaterEqual(attempts, 2)
         self.assertEqual(adapter.reconciled, 2)
+
+    def test_post_activity_stream_error_reconciles_without_replay(self) -> None:
+        adapter = PostActivityStreamErrorAdapter()
+        broker = self.start_broker(
+            lambda harness: adapter if harness == "kimi" else None,
+            recovery_seconds=1,
+        )
+        conversation_id = self.add_conversation(harness="kimi")
+        message_id = self.add_message(conversation_id)
+        broker.notify()
+
+        deadline = time.monotonic() + 3
+        row = None
+        events = []
+        while time.monotonic() < deadline:
+            with self.connect() as con:
+                row = con.execute(
+                    "SELECT run_id,state,error_code,error_detail "
+                    "FROM conversation_runs WHERE trigger_message_id=?",
+                    (message_id,),
+                ).fetchone()
+                if row is not None:
+                    events = con.execute(
+                        "SELECT event_type,payload FROM conversation_events "
+                        "WHERE run_id=? ORDER BY sequence",
+                        (row["run_id"],),
+                    ).fetchall()
+            if row is not None and row["state"] == "succeeded":
+                break
+            time.sleep(0.01)
+
+        if row is None:
+            self.fail("post-activity stream failure produced no durable run")
+        self.assertEqual(tuple(row)[1:], ("succeeded", None, None))
+        self.assertEqual(adapter.started, 1)
+        self.assertEqual(adapter.resumed, 0)
+        self.assertEqual(adapter.reconciled, 2)
+        self.assertEqual(
+            [event["event_type"] for event in events],
+            [
+                "session.started",
+                "run.started",
+                "assistant.delta",
+                "run.completed",
+            ],
+        )
+        terminal = json.loads(events[-1]["payload"])
+        self.assertEqual(
+            terminal,
+            {
+                "detail": "native run completed",
+                "outcome": "succeeded",
+                "proven": True,
+                "reconciled": True,
+            },
+        )
+        with self.connect() as con:
+            self.assertEqual(
+                con.execute(
+                    "SELECT COUNT(*) FROM conversation_runs "
+                    "WHERE conversation_id=?",
+                    (conversation_id,),
+                ).fetchone()[0],
+                1,
+            )
 
     def test_kimi_native_identities_are_persisted_before_first_event(
         self,

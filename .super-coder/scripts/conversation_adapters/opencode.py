@@ -1277,7 +1277,7 @@ class OpenCodeAdapter(ConversationAdapter):
         if not observed_activity:
             raise AdapterError(
                 "HARNESS_SUBMISSION_UNOBSERVED",
-                "OpenCode accepted the synchronous first-turn request but "
+                "OpenCode accepted the synchronous prompt request but "
                 f"reported no activity or terminal event for {turn.session_ref}",
             )
 
