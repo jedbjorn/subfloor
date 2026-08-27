@@ -74,7 +74,7 @@
     {
       "scenario": "Mid-Sprint spec edit is surfaced during resume",
       "file": "tests/test_sprint_recovery.py",
-      "test": "test_resume_records_drift_and_github_failure_without_blocking"
+      "test": "test_resume_records_drift_without_blocking"
     },
     {
       "scenario": "FnB authority can compile evidence when the Planner is unavailable",

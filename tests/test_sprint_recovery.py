@@ -2659,7 +2659,7 @@ class SprintRecoveryCase(SprintPRWatcherCase):
             ],
         )
 
-    def test_resume_stays_paused_when_registered_pr_read_fails(self):
+    def test_resume_records_drift_without_blocking(self):
         self.register()
         coordinator = self.coordinator()
         coordinator.pause(
@@ -2678,6 +2678,51 @@ class SprintRecoveryCase(SprintPRWatcherCase):
             (document_id,),
         )
         self.con.commit()
+
+        receipt = coordinator.resume(
+            self.sprint_id,
+            sprint_domain.LifecycleActor("planner", 3),
+        )
+
+        self.assertTrue(receipt.changed)
+        self.assertEqual((document_id,), receipt.spec_drift_document_ids)
+        self.assertEqual((), receipt.anomalies)
+        self.assertEqual(
+            "armed",
+            self.con.execute(
+                "SELECT lifecycle FROM sprints WHERE sprint_id=?",
+                (self.sprint_id,),
+            ).fetchone()[0],
+        )
+        payload = json.loads(
+            self.con.execute(
+                "SELECT payload FROM sprint_events WHERE sprint_id=? "
+                "AND event_type='lifecycle.reconciled'",
+                (self.sprint_id,),
+            ).fetchone()[0]
+        )
+        self.assertEqual([str(document_id)], sorted(payload["spec_drift"]))
+        self.assertEqual([], payload["anomalies"])
+        self.assertEqual(
+            [(None, 3, 0)],
+            [
+                tuple(row)
+                for row in self.con.execute(
+                    "SELECT to_participant_id,receiver_shell_id,actionable "
+                    "FROM wake_message "
+                    "WHERE idempotency_key LIKE 'sprint-resume:%'"
+                )
+            ],
+        )
+
+    def test_resume_stays_paused_when_registered_pr_read_fails(self):
+        self.register()
+        coordinator = self.coordinator()
+        coordinator.pause(
+            self.sprint_id,
+            sprint_domain.LifecycleActor("participant", 1),
+            reason="GitHub unavailable during resume",
+        )
         self.reader.current = GitHubReadError("github unavailable")
         transition_count = self.con.execute(
             "SELECT COUNT(*) FROM sprint_pr_transitions"
@@ -2719,12 +2764,6 @@ class SprintRecoveryCase(SprintPRWatcherCase):
             self.con.execute(
                 "SELECT COUNT(*) FROM wake_message "
                 "WHERE idempotency_key LIKE 'sprint-resume:%'"
-            ).fetchone()[0],
-        )
-        self.assertEqual(
-            "edited while paused",
-            self.con.execute(
-                "SELECT body FROM documents WHERE document_id=?", (document_id,)
             ).fetchone()[0],
         )
 
