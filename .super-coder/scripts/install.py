@@ -50,6 +50,40 @@ from pathlib import Path
 ENGINE = Path(__file__).resolve().parents[1]
 REPO_ROOT = ENGINE.parent
 PY = sys.executable
+HELP_FLAGS = frozenset(("-h", "--help"))
+INSTALLER_OWN_FLAGS = frozenset((
+    *HELP_FLAGS,
+    "--force",
+    "--skip-harness-install",
+    "--ensure-harness",
+    "--update-harnesses",
+    "--check-docker",
+    "--harness-epoch",
+    "--roll-harness-epoch",
+))
+
+
+def help_requested(argv: list[str]) -> bool:
+    return any(arg in HELP_FLAGS for arg in argv)
+
+
+def print_help() -> None:
+    print("""Usage: ./sc install [options]
+
+Install subfloor into a fresh Linux repository and seed its starting team.
+
+Options:
+  -h, --help                  show this help and exit without changing state
+  --force                     override source/already-installed safety guards
+  --skip-harness-install      detect harnesses without installing them
+  --username NAME             active operator username (required without a TTY)
+  --name NAME                 override the primary shell display name
+  --shortname NAME            override the primary shell shortname
+  --flavor FLAVOR             primary shell flavor (default: planner)
+  --role TEXT                 override the primary shell role
+  --mandate TEXT              override the primary shell mandate
+  --partner NAME              override the primary shell partner
+""")
 
 
 def require_supported_host() -> None:
@@ -72,6 +106,9 @@ def require_supported_host() -> None:
 # imported installer remains inspectable by tests and maintenance tooling; its
 # action entry point enforces the same boundary below.
 if __name__ == "__main__":
+    if help_requested(sys.argv[1:]):
+        print_help()
+        raise SystemExit(0)
     require_supported_host()
 
 sys.path.insert(0, str(ENGINE / "scripts"))
@@ -268,7 +305,7 @@ def already_installed() -> bool:
 
 
 def starting_team_exists() -> bool:
-    """Whether an incomplete prior install already persisted its seeded team."""
+    """Whether a prior install persisted the complete starting team."""
     db = ENGINE / "shell_db.db"
     if not db.exists():
         return False
@@ -276,9 +313,13 @@ def starting_team_exists() -> bool:
 
     try:
         with sqlite3.connect(db) as con:
-            return bool(con.execute(
-                "SELECT EXISTS(SELECT 1 FROM shells WHERE COALESCE(is_deleted,0)=0)"
-            ).fetchone()[0])
+            users = con.execute(
+                "SELECT COUNT(*) FROM users WHERE is_active=1"
+            ).fetchone()[0]
+            shells = con.execute(
+                "SELECT COUNT(*) FROM shells WHERE COALESCE(is_deleted,0)=0"
+            ).fetchone()[0]
+            return users == 1 and shells == 10
     except sqlite3.Error:
         return False
 
@@ -876,13 +917,14 @@ def step(msg: str) -> None:
 
 
 def main(argv: list[str]) -> int:
+    if help_requested(argv):
+        print_help()
+        return 0
     require_supported_host()
     force = "--force" in argv
     skip_harness = "--skip-harness-install" in argv
     # super-coder's own flags — strip them so they don't reach init_fork's parser.
-    own = {"--force", "--skip-harness-install", "--ensure-harness", "--update-harnesses",
-           "--check-docker", "--harness-epoch", "--roll-harness-epoch"}
-    fork_args = [a for a in argv if a not in own]
+    fork_args = [a for a in argv if a not in INSTALLER_OWN_FLAGS]
 
     # Standalone, machine-readable: the sandbox harness epoch. `sc` shells out to
     # these rather than reimplementing the file format, so there is one owner of
@@ -1065,6 +1107,11 @@ def main(argv: list[str]) -> int:
         run_critical_phase(
             "Seeding this fork's starting team",
             [PY, str(ENGINE / "scripts/init_fork.py"), *fork_args],
+        )
+    if not starting_team_exists():
+        sys.exit(
+            "install: starting team is incomplete — expected one active user "
+            "and ten active shells; repair the seed failure, then retry: ./sc install"
         )
 
     # 7. Wire the auto-remap hooks + map the host repo --------------------------

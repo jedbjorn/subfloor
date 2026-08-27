@@ -1,14 +1,17 @@
 from __future__ import annotations
 
-import importlib.util
 import contextlib
+import importlib.util
 import io
 import json
 import os
+import pty
+import select
 import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -42,6 +45,62 @@ class JsonResponse:
 def owner_json(path: Path, value: dict[str, object]) -> None:
     path.write_text(json.dumps(value, sort_keys=True) + "\n")
     path.chmod(0o600)
+
+
+def run_tty(
+    argv: list[str],
+    *,
+    cwd: Path,
+    env: dict[str, str],
+    timeout: float = 10,
+) -> tuple[int, bytes]:
+    """Run one command on a real PTY and return its exact terminal bytes."""
+    master, slave = pty.openpty()
+    process = subprocess.Popen(
+        argv,
+        cwd=cwd,
+        env=env,
+        stdin=slave,
+        stdout=slave,
+        stderr=slave,
+        close_fds=True,
+    )
+    os.close(slave)
+    output = bytearray()
+    deadline = time.monotonic() + timeout
+    try:
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                process.kill()
+                process.wait(timeout=5)
+                raise TimeoutError(f"TTY command did not exit: {argv!r}")
+            ready, _, _ = select.select([master], [], [], min(remaining, 0.1))
+            if ready:
+                try:
+                    chunk = os.read(master, 65536)
+                except OSError:
+                    chunk = b""
+                if chunk:
+                    output.extend(chunk)
+            if process.poll() is not None:
+                while True:
+                    ready, _, _ = select.select([master], [], [], 0)
+                    if not ready:
+                        break
+                    try:
+                        chunk = os.read(master, 65536)
+                    except OSError:
+                        break
+                    if not chunk:
+                        break
+                    output.extend(chunk)
+                return process.returncode, bytes(output)
+    finally:
+        os.close(master)
+        if process.poll() is None:
+            process.kill()
+            process.wait(timeout=5)
 
 
 def execution_context(root: Path) -> admission.ExecutionDomainContext:
@@ -387,6 +446,7 @@ class DshCommandAdmissionTests(unittest.TestCase):
             assets.mkdir(parents=True)
             shutil.copy2(ROOT / "sc", root / "sc")
             shutil.copy2(SCRIPTS / "dsh_execution_provenance.py", scripts)
+            shutil.copy2(SCRIPTS / "cli_entry.py", scripts)
             shutil.copy2(POLICY, assets)
             shutil.copy2(
                 ROOT / ".super-coder" / "assets" / "deepseek"
@@ -448,6 +508,115 @@ class DshCommandAdmissionTests(unittest.TestCase):
             self.assertEqual(fallback.returncode, 77, fallback.stderr)
             self.assertIn("provenance contributor unavailable", fallback.stderr)
             self.assertFalse(effect.exists())
+
+    def prepare_tty_bootstrap(self, raw: str) -> tuple[Path, dict[str, str], Path, Path]:
+        root = Path(raw)
+        scripts = root / ".super-coder" / "scripts"
+        assets = root / ".super-coder" / "assets" / "deepseek"
+        scripts.mkdir(parents=True)
+        assets.mkdir(parents=True)
+        shutil.copy2(ROOT / "sc", root / "sc")
+        shutil.copy2(SCRIPTS / "dsh_execution_provenance.py", scripts)
+        shutil.copy2(SCRIPTS / "cli_entry.py", scripts)
+        shutil.copy2(POLICY, assets)
+        shutil.copy2(
+            ROOT / ".super-coder" / "assets" / "deepseek"
+            / "dsh-command-admission-v1.json",
+            assets,
+        )
+        dispatch_log = root / "dispatch.log"
+        startup_marker = root / "bare-python-started"
+        startup = root / "python-startup.py"
+        startup.write_text(
+            "from pathlib import Path\n"
+            f"Path({str(startup_marker)!r}).write_text('bare python executed\\n')\n"
+        )
+        override = root / "dispatch.sh"
+        override.write_text(
+            "#!/bin/sh\n"
+            "printf '%s\\n' \"$*\" >> \"$DISPATCH_LOG\"\n"
+            "printf 'dispatch:%s\\n' \"$*\"\n"
+        )
+        override.chmod(0o700)
+        environment = {
+            name: value
+            for name, value in os.environ.items()
+            if not name.startswith("DSH_") and name != "SC_DISPATCH"
+        }
+        environment.update({
+            "DISPATCH_LOG": str(dispatch_log),
+            "PYTHONDONTWRITEBYTECODE": "1",
+            "PYTHONSTARTUP": str(startup),
+            "SC_DISPATCH": str(override),
+        })
+        return root, environment, dispatch_log, startup_marker
+
+    def test_real_bootstrap_tty_locator_never_executes_bare_python(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root, environment, dispatch_log, startup_marker = (
+                self.prepare_tty_bootstrap(raw)
+            )
+            observed = []
+            for route in ("help", "health"):
+                non_tty = subprocess.run(
+                    [str(root / "sc"), route],
+                    cwd=root,
+                    env=environment,
+                    capture_output=True,
+                    timeout=10,
+                    check=False,
+                )
+                tty_rc, tty_bytes = run_tty(
+                    [str(root / "sc"), route],
+                    cwd=root,
+                    env=environment,
+                )
+                tty_text = tty_bytes.decode().replace("\r\n", "\n")
+                self.assertEqual(non_tty.returncode, 0, non_tty.stderr.decode())
+                self.assertEqual(tty_rc, 0, tty_text)
+                self.assertEqual(tty_text.strip(), non_tty.stdout.decode().strip())
+                self.assertEqual(
+                    [byte for byte in tty_bytes if byte < 32 and byte not in b"\r\n\t"],
+                    [],
+                )
+                observed.extend((route, route))
+
+            self.assertFalse(startup_marker.exists())
+            self.assertEqual(dispatch_log.read_text().splitlines(), observed)
+
+    @unittest.skipUnless(shutil.which("make"), "GNU Make is not installed")
+    def test_real_bootstrap_tty_make_routes_dispatch_once(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root, environment, dispatch_log, startup_marker = (
+                self.prepare_tty_bootstrap(raw)
+            )
+            shutil.copy2(ROOT / ".super-coder" / "aliases.mk", root / ".super-coder")
+            (root / "Makefile").write_text("include .super-coder/aliases.mk\n")
+
+            expected = {
+                "dos-l": "launch",
+                "dos-health": "health",
+                "dos-e": "enter",
+            }
+            for target, route in expected.items():
+                rc, terminal = run_tty(
+                    ["make", "--no-print-directory", target],
+                    cwd=root,
+                    env=environment,
+                )
+                text = terminal.decode().replace("\r\n", "\n")
+                self.assertEqual(rc, 0, text)
+                self.assertIn(f"dispatch:{route}", text)
+                self.assertEqual(
+                    [byte for byte in terminal if byte < 32 and byte not in b"\r\n\t"],
+                    [],
+                )
+
+            self.assertFalse(startup_marker.exists())
+            self.assertEqual(
+                dispatch_log.read_text().splitlines(),
+                ["launch", "health", "enter"],
+            )
 
     def test_mem_adopts_the_admitted_dsh_credential_without_admin_discovery(self):
         with tempfile.TemporaryDirectory() as raw:
