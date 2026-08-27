@@ -45,10 +45,15 @@ if [ -f "$CALLER_ROOT/.git" ]; then
   esac
 fi
 
+SC_SYSTEM_PYTHON="$(command -p -v python3 2>/dev/null || true)"
+SC_CUTOVER_GUARD="$LIVE_ROOT/.super-coder/scripts/update_cutover.py"
+if [ -n "$SC_SYSTEM_PYTHON" ] && [ -r "$SC_CUTOVER_GUARD" ]; then
+  "$SC_SYSTEM_PYTHON" "$SC_CUTOVER_GUARD" --admit-dispatch -- "$@" || exit $?
+fi
+
 SC_PROVENANCE="$LIVE_ROOT/.super-coder/scripts/dsh_execution_provenance.py"
 SC_POLICY="$LIVE_ROOT/.super-coder/assets/deepseek/dsh-shell-authority-contract.json"
 SC_ADMISSION_FLOOR="$LIVE_ROOT/.super-coder/assets/deepseek/dsh-command-admission-v1.json"
-SC_SYSTEM_PYTHON="$(command -p -v python3 2>/dev/null || true)"
 if [ -n "$SC_SYSTEM_PYTHON" ] && [ -r "$SC_PROVENANCE" ] && \
    [ -r "$SC_POLICY" ] && [ -r "$SC_ADMISSION_FLOOR" ]; then
   exec "$SC_SYSTEM_PYTHON" "$SC_PROVENANCE" \

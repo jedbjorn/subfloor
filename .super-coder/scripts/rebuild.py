@@ -177,14 +177,14 @@ def backup_db(dst: Path, src: Path | None = None) -> None:
         src_con.close()
 
 
-def backup_existing(prefix: str = "prerebuild") -> None:
+def backup_existing(prefix: str = "prerebuild") -> Path | None:
     """Back up the live DB under the lifecycle-specific restore-point class.
 
     Direct rebuild/verify backups are diagnostics and must not outrank the
     pre-update DB that pairs with ``engine.ref.prev`` during rollback.
     """
     if not DB_PATH.exists():
-        return
+        return None
     if prefix not in {"prerebuild", "preupdate"}:
         raise ValueError(f"unsupported DB backup prefix: {prefix}")
     target = backup_dir()
@@ -195,6 +195,7 @@ def backup_existing(prefix: str = "prerebuild") -> None:
     backup_db(dst)
     prune_backups(f"shell_db.{prefix}", target)
     print(f"rebuild: backed up existing DB -> {dst}")
+    return dst
 
 
 def _remove_database(path: Path) -> None:

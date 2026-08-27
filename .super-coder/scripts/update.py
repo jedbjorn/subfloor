@@ -80,6 +80,7 @@ import rebuild as rebuild_mod  # noqa: E402
 import seed_skills  # noqa: E402
 import shell_factory  # noqa: E402
 import skill_projection  # noqa: E402
+import update_cutover  # noqa: E402
 sys.path.insert(0, str(ENGINE / "render"))
 import flat  # noqa: E402
 
@@ -993,7 +994,7 @@ def migrate_generated_artifacts_local() -> None:
     )
 
 
-def migrate_or_rebuild() -> None:
+def migrate_or_rebuild(*, backup: bool = True) -> None:
     if not DB_PATH.exists() or DB_PATH.stat().st_size == 0:
         print("→ no live DB (fresh fork) — building from text")
         rebuild_mod.main([])
@@ -1001,7 +1002,8 @@ def migrate_or_rebuild() -> None:
     # This restore point pairs with engine.ref.prev.  Keep it distinct from a
     # later verify/rebuild diagnostic backup so rollback cannot combine a
     # current-schema DB with the previous engine.
-    rebuild_mod.backup_existing(prefix="preupdate")
+    if backup:
+        rebuild_mod.backup_existing(prefix="preupdate")
     print("→ migrate in place (pending migrations → the live DB; data preserved)")
     # The updater already owns the preupdate restore point above. Bare
     # `./sc migrate` opts into its separate premigrate class at the CLI seam.
@@ -1059,13 +1061,104 @@ def start_pm2_review_server(service: tuple[str, str] | None) -> None:
     print(f"→ started new PM2 server {process} after DB migration")
 
 
-def migrate_with_service_cutover() -> None:
+def migrate_with_service_cutover(*, backup: bool = True) -> None:
     service = stop_pm2_review_server()
-    migrate_or_rebuild()
+    if backup:
+        migrate_or_rebuild()
+    else:
+        migrate_or_rebuild(backup=False)
     # Deliberately not in finally: a failed destructive migration must leave
     # the old server stopped instead of restarting code against a changed or
     # incompatible floor.
     start_pm2_review_server(service)
+
+
+def _restore_failed_cutover(prepared: update_cutover.PreparedCutover) -> None:
+    """Restore the DB and engine pair after a target cutover failure."""
+    previous_sha = prepared.plan.compatibility_ref
+    target_sha = prepared.plan.target_ref
+    previous_paths = _engine_paths_for(previous_sha, repo_root=REPO_ROOT)
+    target_paths = _engine_paths_for(target_sha, repo_root=REPO_ROOT)
+    previous_files = set(
+        _engine_files_at(
+            previous_sha,
+            repo_root=REPO_ROOT,
+            engine_paths=previous_paths,
+        )
+    )
+    target_files = set(
+        _engine_files_at(
+            target_sha,
+            repo_root=REPO_ROOT,
+            engine_paths=target_paths,
+        )
+    )
+    for relative in sorted(target_files - previous_files):
+        path = REPO_ROOT / relative
+        if path.is_file() or path.is_symlink():
+            path.unlink()
+    materialize_engine(
+        previous_sha,
+        engine_paths=[
+            path
+            for path in previous_paths
+            if _engine_path_exists_at(previous_sha, path, repo_root=REPO_ROOT)
+        ],
+    )
+    callable_floor.require_callable_floor(
+        REPO_ROOT,
+        expected_ref=previous_sha,
+        context="update recovery",
+    )
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    ENGINE_REF.write_text(previous_sha + "\n")
+    ENGINE_REF_PREV.unlink(missing_ok=True)
+    engine_manifest.write_manifest(
+        previous_paths,
+        files=_engine_files_at(
+            previous_sha,
+            repo_root=REPO_ROOT,
+            engine_paths=previous_paths,
+        ),
+    )
+    if prepared.backup_path is None or not prepared.backup_path.is_file():
+        raise RuntimeError("cutover DB restore point is unavailable")
+    for suffix in ("-wal", "-shm"):
+        Path(str(DB_PATH) + suffix).unlink(missing_ok=True)
+    shutil.copy2(prepared.backup_path, DB_PATH)
+    start_pm2_review_server(prepared.review_service)
+    reconcile_linked_dispatchers(previous_sha)
+    update_cutover.record_recovery(
+        prepared,
+        status="pair-restored",
+        detail=(
+            "compatibility engine and WAL-safe database restored; DSH remains "
+            "stopped pending an identity-authorized ordinary launch"
+        ),
+    )
+    print(
+        "→ DSH removal recovery: compatibility engine + DB pair restored; "
+        "DSH remains stopped. Run the ordinary identity-authorized launch "
+        "after verifying the restored floor."
+    )
+
+
+def _cutover_call(
+    prepared: update_cutover.PreparedCutover | None,
+    action,
+):
+    try:
+        return action()
+    except BaseException as original:
+        if prepared is None:
+            raise
+        try:
+            _restore_failed_cutover(prepared)
+        except BaseException as recovery:
+            raise RuntimeError(
+                f"DSH removal failed ({original}); pair recovery also failed: {recovery}"
+            ) from recovery
+        raise
 
 
 def sync_skills() -> None:
@@ -1228,8 +1321,13 @@ def main(argv: list[str]) -> int:
         sync_repo_checkout()
 
     target_sha = None
+    cutover_plan = None
     if not source and not no_fetch:
         target_sha = fetch_update_ref(branch, ref=ref)
+        try:
+            cutover_plan = update_cutover.inspect_target(target_sha)
+        except update_cutover.CutoverError as exc:
+            sys.exit(f"update: {exc}")
     if source:
         # The source repo IS the engine — it has no upstream to materialize from
         # and must keep tracking .super-coder/. Reconcile its own tree only.
@@ -1250,14 +1348,42 @@ def main(argv: list[str]) -> int:
             print("→ .gitignore: installed canonical subfloor ignore block")
         migrate_generated_artifacts_local()
 
+    prepared_cutover = None
     if no_fetch:
         print("→ --no-fetch: reconciling against the current working tree "
               "(engine + engine.ref unchanged)")
     else:
         assert target_sha is not None
-        materialize_fetched_engine(target_sha, force=force, publish_ref=False)
+        if cutover_plan is not None:
+            current_ref = (
+                ENGINE_REF.read_text().strip() if ENGINE_REF.is_file() else ""
+            )
+            try:
+                prepared_cutover = update_cutover.prepare_cutover(
+                    cutover_plan,
+                    current_ref=current_ref,
+                    backup=lambda: rebuild_mod.backup_existing(prefix="preupdate"),
+                    stop_review=stop_pm2_review_server,
+                    start_review=start_pm2_review_server,
+                )
+            except update_cutover.CutoverError as exc:
+                sys.exit(f"update: {exc}")
+        _cutover_call(
+            prepared_cutover,
+            lambda: materialize_fetched_engine(
+                target_sha, force=force, publish_ref=False
+            ),
+        )
+        if prepared_cutover is not None:
+            _cutover_call(
+                prepared_cutover,
+                lambda: update_cutover.run_cleanup(prepared_cutover),
+            )
 
-    workflow_action, workflow_changes = ensure_workflows(source_repo=source)
+    workflow_action, workflow_changes = _cutover_call(
+        prepared_cutover,
+        lambda: ensure_workflows(source_repo=source),
+    )
     if workflow_action == "seeded":
         print("→ visual QA: seeded the managed workflow shim")
     elif workflow_action == "updated":
@@ -1274,28 +1400,35 @@ def main(argv: list[str]) -> int:
     # installers (no npm); a failure warns and continues (install by hand later).
     # Auth/login stays manual; this only ensures the CLI binary is present.
     print("→ ensure harnesses installed (claude + opencode + codex + vibe + kimi)")
-    install_mod.ensure_harnesses()
+    _cutover_call(prepared_cutover, install_mod.ensure_harnesses)
 
     # …and that covers the HOST only — see expire_sandbox_harnesses() for the
     # half of the fleet ensure_harnesses() cannot reach.
-    epoch = expire_sandbox_harnesses()
+    epoch = _cutover_call(prepared_cutover, expire_sandbox_harnesses)
     if epoch:
         print(f"→ expire the sandbox's baked harness CLIs (epoch {epoch})")
         print("  they reinstall on the next image build — normal `./sc restart` / `make dos-r`")
 
-    migrate_with_service_cutover()
+    if prepared_cutover is None:
+        migrate_with_service_cutover()
+    else:
+        _cutover_call(
+            prepared_cutover,
+            lambda: migrate_or_rebuild(backup=False),
+        )
 
     # Broker systemd units contain absolute ExecStart paths. Refresh only the
     # services this fork had already installed so a moved repo does not keep
     # running the pre-move engine after an otherwise successful update.
-    refresh_installed_brokers()
+    _cutover_call(prepared_cutover, refresh_installed_brokers)
 
     print("→ sync skills catalogue (id-stable)")
-    sync_skills()
+    _cutover_call(prepared_cutover, sync_skills)
     print("→ re-grant catalogue skills to all shells")
-    print(f"  {regrant()} grant change(s)")
+    grant_changes = _cutover_call(prepared_cutover, regrant)
+    print(f"  {grant_changes} grant change(s)")
     print("→ reconcile managed skill projections")
-    projections = reconcile_skill_projections()
+    projections = _cutover_call(prepared_cutover, reconcile_skill_projections)
     print(
         f"  {len(projections['written'])} changed, "
         f"{len(projections['skipped'])} unchanged across "
@@ -1306,9 +1439,15 @@ def main(argv: list[str]) -> int:
         "retain previously loaded skill text until reboot"
     )
     print("→ wire map automation + map the repo")
-    run_script("map_setup.py", update_target_ref=target_sha)
+    _cutover_call(
+        prepared_cutover,
+        lambda: run_script("map_setup.py", update_target_ref=target_sha),
+    )
     print("→ snapshot the live state")
-    run_script("snapshot.py")
+    _cutover_call(
+        prepared_cutover,
+        lambda: run_script("snapshot.py"),
+    )
 
     # Self-heal the make wiring: forks installed before the engine scripted this
     # (or whose include was removed) get the `dos-*` aliases appended now. Source
@@ -1318,8 +1457,35 @@ def main(argv: list[str]) -> int:
         print(f"  {install_mod.wire_make_aliases()}")
 
     if target_sha is not None:
-        publish_engine_ref(target_sha)
-        reconcile_linked_dispatchers(target_sha, worktrees=worktrees)
+        if prepared_cutover is not None:
+            _cutover_call(
+                prepared_cutover,
+                lambda: start_pm2_review_server(prepared_cutover.review_service),
+            )
+            _cutover_call(
+                prepared_cutover,
+                lambda: reconcile_linked_dispatchers(
+                    target_sha, worktrees=worktrees
+                ),
+            )
+            _cutover_call(
+                prepared_cutover,
+                lambda: publish_engine_ref(target_sha),
+            )
+        else:
+            publish_engine_ref(target_sha)
+            try:
+                installed_floor = update_cutover.install_compatibility_marker(
+                    target_sha
+                )
+            except update_cutover.CutoverError as exc:
+                sys.exit(f"update: published floor but marker install failed: {exc}")
+            if installed_floor:
+                print(
+                    "→ installed DSH removal compatibility-floor marker at "
+                    f"{target_sha[:12]}"
+                )
+            reconcile_linked_dispatchers(target_sha, worktrees=worktrees)
     elif source:
         # A source repo tracks the engine in its working tree — the canonical
         # `sc` IS the current dispatcher, and there is no fetched pin to show
