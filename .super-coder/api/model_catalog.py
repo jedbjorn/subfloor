@@ -10,12 +10,10 @@ of this is load-bearing — a source that fails just thins the suggestions:
      newest-first sorting.
   2. Provider list-models APIs — only when the matching env key is present.
      Harness logins are OAuth, not API keys, so these are usually absent.
-  3. DeepSeek's stock loopback Host API — configured providers/models plus
-     value-free credential readiness, bound to the pinned official runtime.
-  4. OpenCode's loopback `/provider` projection — only providers OpenCode
+  3. OpenCode's loopback `/provider` projection — only providers OpenCode
      reports as connected, with exactly the models each connected provider
      exposes. This live overlay is refreshed on every served catalog.
-  5. A static floor (the ids the engine ships in flavor_defaults) when every
+  4. A static floor (the ids the engine ships in flavor_defaults) when every
      live source fails and no cache exists.
 
 Fetched server-side (no CORS), cached under the gitignored .super-coder/logs/
@@ -26,9 +24,9 @@ the stale cache and says so.
 Payload v8 exposes the flat `models` list consumed by the shared searchable
 picker. Legacy `families` metadata remains for API compatibility but is not a
 selection surface: the harness is the only picker prefilter, and family-null
-local routes are ordinary results. OpenCode and DeepSeek blocks are refreshed
-from their executing seats on every read and expose only exact native option
-IDs plus non-sensitive display metadata.
+local routes are ordinary results. The OpenCode block is refreshed from its
+executing seat on every read and exposes only exact native option IDs plus
+non-sensitive display metadata.
 """
 from __future__ import annotations
 
@@ -48,7 +46,6 @@ from pathlib import Path
 import harness_versions
 import route_bindings
 import toml_compat
-import deepseek_host
 from conversation_adapters.opencode import (
     connected_models as opencode_connected_models,
 )
@@ -96,9 +93,6 @@ PROVIDER_APIS = {
     "vibe": ("MISTRAL_API_KEY", "https://api.mistral.ai/v1/models",
              lambda k: {"Authorization": f"Bearer {k}"}),
 }
-
-DEEPSEEK_SOURCE = "deepseek-host-api"
-
 
 class _ModelCatalogueLimitError(ValueError):
     pass
@@ -214,59 +208,6 @@ def _from_provider_apis(fetch, env) -> dict[str, list[dict]]:
     return out
 
 
-def _from_deepseek_host(
-    client=None,
-    *,
-    selector: str | None = None,
-    discovery_out: dict | None = None,
-) -> list[dict]:
-    """Project exact configured routes through the stock official Host API."""
-    client = deepseek_host.DeepSeekHostClient() if client is None else client
-    routes = deepseek_host.configured_routes(client, selector=selector)
-    entries = []
-    selectors = [route.selector for route in routes]
-    if discovery_out is not None:
-        discovery_out.update({
-            "provider": "deepseek-host",
-            "selectors": selectors,
-            "attempted_selectors": selectors,
-            "proved_selectors": selectors,
-        })
-    for route in routes:
-        efforts = list(route.reasoning_efforts)
-        metadata_by_effort = {
-            effort: route.binding_metadata(effort)
-            for effort in [route_bindings.DEFAULT_EFFORT, *efforts]
-        }
-        entries.append(_entry(
-            route.selector,
-            name=route.name,
-            source=DEEPSEEK_SOURCE,
-            availability="available",
-            provider=route.provider,
-            provider_model=route.model,
-            supported_efforts=efforts,
-            default_effort=route.default_effort,
-            cli_version=route.runtime_version,
-            selector_binding={
-                "kind": "official-host-configured-model",
-                "selector": route.selector,
-                "provider_model": route.model,
-                "provider_route": route.provider,
-                "endpoint_identity": route.endpoint_identity,
-                "credential_ref": route.credential_ref,
-                "configuration_digest": route.configuration_digest,
-                "runtime_source_commit": route.source_commit,
-            },
-            adapter_metadata={
-                "route_metadata_by_effort": metadata_by_effort,
-            },
-            native_option_ids=efforts,
-            native_default_option_id=route.default_effort,
-        ))
-    return entries
-
-
 def _cli_version(binary: str, run) -> str | None:
     try:
         r = run([binary, "--version"], capture_output=True, text=True,
@@ -364,16 +305,10 @@ def _prefer(preferred: list[dict], advisory: list[dict]) -> list[dict]:
     return _merge(preferred, advisory)
 
 
-def build(
-    fetch=_http_json,
-    env=os.environ,
-    run=subprocess.run,
-    deepseek_client=None,
-) -> dict:
+def build(fetch=_http_json, env=os.environ, run=subprocess.run) -> dict:
     """One live sweep across all sources. Raises only if EVERY source fails —
     partial results (e.g. models.dev down but a keyed API up) still count."""
     harnesses: dict[str, list[dict]] = {}
-    harness_errors: dict[str, str] = {}
     sources: list[str] = []
     errors: list[str] = []
     try:
@@ -384,18 +319,6 @@ def build(
     for harness, extra in _from_provider_apis(fetch, env).items():
         harnesses[harness] = _merge(harnesses.get(harness, []), extra)
         sources.append(f"{HARNESS_PROVIDER[harness]}-api")
-    deepseek = []
-    deepseek_observed_at = datetime.now(timezone.utc).isoformat()
-    try:
-        deepseek = _from_deepseek_host(
-            deepseek_client,
-        )
-        harnesses["deepseek"] = deepseek
-        sources.append(DEEPSEEK_SOURCE)
-    except Exception:  # noqa: BLE001 (official Host errors stay redacted)
-        harnesses.setdefault("deepseek", [])
-        harness_errors["deepseek"] = "official DeepSeek Host configuration unavailable"
-        errors.append("deepseek-host-api: official DeepSeek Host configuration unavailable")
     local = {
         "claude": _from_claude_cli(run),
         "codex": _from_codex_cache(env, run),
@@ -414,14 +337,7 @@ def build(
             "partial": bool(errors),
             **({"errors": errors} if errors else {}),
             "harnesses": {h: {"families": _families(h, entries),
-                              "models": entries,
-                              **({
-                                  "authority": "harness-live",
-                                  "observed_at": deepseek_observed_at,
-                                  "stale": False,
-                              } if h == "deepseek" else {}),
-                              **({"error": harness_errors[h]}
-                                 if h in harness_errors else {})}
+                              "models": entries}
                           for h, entries in harnesses.items()}}
     return result
 
@@ -499,8 +415,7 @@ def _publish_cache(payload: dict, con=None) -> bool:
 
 
 def _finish_cache_publication(
-    candidate: dict, response: dict, con, opencode_provider,
-    deepseek_client=None, *,
+    candidate: dict, response: dict, con, opencode_provider, *,
     publication_locked: bool = False,
 ) -> dict:
     for field in (
@@ -517,10 +432,9 @@ def _finish_cache_publication(
         response["generation_published"] = False
     winner = _load_cache()
     if winner and _cache_matches_authority(winner, con):
-        return _served(_with_live_native(
+        return _served(_with_live_opencode(
             {**winner, "stale": bool(winner.get("stale"))},
             opencode_provider,
-            deepseek_client,
         ), con)
     return {**response, "stale": True,
             "error": "Catalogue changed during refresh; retry"}
@@ -558,6 +472,18 @@ def _headless_supported(harness: str) -> bool:
 
 def harness_runtime_status(harness: str) -> dict:
     """Return exact version-bounded runtime evidence for one shipped harness."""
+    if harness not in harness_versions.HARNESSES:
+        return {
+            "harness": harness,
+            **harness_versions.runtime_scope(),
+            "version": None,
+            "observed_version": None,
+            "compatibility": None,
+            "minimum_version": None,
+            "maximum_version_exclusive": None,
+            "verified_version": None,
+            "error": "HARNESS_UNSUPPORTED",
+        }
     try:
         return dict(
             harness_versions.compatibility_status((harness,)).get(harness) or {}
@@ -579,7 +505,6 @@ def _evidence_kind(harness: str, source: str) -> str | None:
     return {
         ("claude", "claude-cli"): "claude-portable-manifest",
         ("codex", "codex-cache"): "codex-model-cache",
-        ("deepseek", DEEPSEEK_SOURCE): "deepseek-host-config-v1",
         ("kimi", "kimi-config"): "kimi-alias-config",
         ("opencode", "opencode-provider-api"): "opencode-connected-variant",
     }.get((harness, source))
@@ -678,12 +603,6 @@ def _entry_evidence(harness: str, entry: dict,
     )
 
     def binding_adapter_metadata(effort: str) -> dict:
-        if harness == "deepseek":
-            mappings = catalogue_adapter_metadata.get(
-                "route_metadata_by_effort"
-            ) or {}
-            value = mappings.get(effort)
-            return dict(value) if isinstance(value, dict) else {}
         if harness != "opencode" or not variants_by_effort:
             return catalogue_adapter_metadata
         return {
@@ -718,10 +637,7 @@ def _entry_evidence(harness: str, entry: dict,
         "default_effort": entry.get("default_effort"),
         "native_variant_ids": entry.get("native_variant_ids") or {},
     })
-    metadata_efforts = [
-        *([route_bindings.DEFAULT_EFFORT] if harness == "deepseek" else []),
-        *efforts,
-    ]
+    metadata_efforts = efforts
     effort_metadata = {
         "supported": efforts,
         "default": entry.get("default_effort"),
@@ -836,10 +752,7 @@ def persist_routes(con, payload: dict, *, publication_locked: bool = False) -> N
     for harness, block in (payload.get("harnesses") or {}).items():
         for entry in block.get("models") or []:
             status = harness_statuses.get(harness) or {}
-            if (
-                (harness == "deepseek" and entry.get("availability") != "available")
-                or not _compatible_route_status(harness, entry, status)
-            ):
+            if not _compatible_route_status(harness, entry, status):
                 rejected_routes[(harness, entry["id"])] = _compatibility_error(
                     harness, entry, status
                 )
@@ -1247,53 +1160,8 @@ def _with_live_opencode(payload: dict, provider_models) -> dict:
     return result
 
 
-def _with_live_deepseek(payload: dict, client=None) -> dict:
-    """Replace cached DeepSeek routes with its current Host projection."""
-    result = {**payload}
-    harnesses = dict(payload.get("harnesses") or {})
-    sources = [
-        source for source in (payload.get("sources") or [])
-        if source != DEEPSEEK_SOURCE
-    ]
-    observed_at = datetime.now(timezone.utc).isoformat()
-    entries = []
-    error = None
-    try:
-        entries = _from_deepseek_host(client)
-        sources.append(DEEPSEEK_SOURCE)
-    except Exception:  # noqa: BLE001 (official Host errors stay redacted)
-        error = "official DeepSeek Host configuration unavailable"
-    harnesses["deepseek"] = {
-        "families": _families("deepseek", entries),
-        "models": entries,
-        "authority": "harness-live",
-        "observed_at": observed_at,
-        "stale": False,
-        **({"error": error} if error else {}),
-    }
-    result["harnesses"] = harnesses
-    result["sources"] = sources
-    errors = _replace_source_error(result, "deepseek-host-api: ", error)
-    result["partial"] = bool(errors)
-    if errors:
-        result["errors"] = errors
-    else:
-        result.pop("errors", None)
-    return result
-
-
-def _with_live_native(payload: dict, opencode_provider, deepseek_client=None) -> dict:
-    return _with_live_deepseek(
-        _with_live_opencode(payload, opencode_provider),
-        deepseek_client,
-    )
-
-
-def _runtime_statuses(harness_probe, *, include_deepseek: bool) -> dict:
-    statuses = dict(harness_probe())
-    if include_deepseek and "deepseek" not in statuses:
-        statuses["deepseek"] = harness_runtime_status("deepseek")
-    return statuses
+def _runtime_statuses(harness_probe) -> dict:
+    return dict(harness_probe())
 
 
 def controlled_route_evidence(
@@ -1304,7 +1172,6 @@ def controlled_route_evidence(
     run=None,
     opencode_provider=None,
     harness_probe=None,
-    deepseek_client=None,
 ) -> dict:
     """Probe one controlled route and bind its source to this runtime seat."""
     env = os.environ if env is None else env
@@ -1323,9 +1190,7 @@ def controlled_route_evidence(
     status: dict = {}
     fingerprint = None
     try:
-        statuses = _runtime_statuses(
-            harness_probe, include_deepseek=harness == "deepseek"
-        )
+        statuses = _runtime_statuses(harness_probe)
         status = dict(statuses.get(harness) or {})
         if harness == "claude":
             entries = _from_claude_cli(run)
@@ -1358,11 +1223,6 @@ def controlled_route_evidence(
                     )
                     for model in opencode_provider()
                 ]
-        elif harness == "deepseek":
-            entries = _from_deepseek_host(
-                deepseek_client,
-                selector=selector,
-            )
         else:
             entries = []
     except Exception:  # noqa: BLE001 (unreadable live evidence is stale)
@@ -1413,49 +1273,10 @@ def current_source_fingerprint(harness: str, selector: str, *, env=os.environ,
     return evidence["source_fingerprint"]
 
 
-def ensure_deepseek_route(
-    con,
-    selector: str,
-    *,
-    fetch=_http_json,
-    env=os.environ,
-    run=subprocess.run,
-    opencode_provider=opencode_connected_models,
-    harness_probe=harness_versions.compatibility_status,
-    deepseek_client=None,
-) -> dict | None:
-    """Publish one exact route from the official Host configuration."""
-    row = con.execute(
-        "SELECT * FROM model_routes WHERE harness='deepseek' AND selector=?",
-        (selector,),
-    ).fetchone()
-    if row is not None and not row["stale"]:
-        return dict(row)
-    try:
-        catalog(
-            refresh=True,
-            fetch=fetch,
-            env=env,
-            run=run,
-            con=con,
-            opencode_provider=opencode_provider,
-            harness_probe=harness_probe,
-            deepseek_client=deepseek_client,
-        )
-    except Exception:  # noqa: BLE001 (provider diagnostics remain redacted)
-        return None
-    row = con.execute(
-        "SELECT * FROM model_routes WHERE harness='deepseek' AND selector=?",
-        (selector,),
-    ).fetchone()
-    return dict(row) if row is not None and not row["stale"] else None
-
-
 def catalog(refresh: bool = False, fetch=_http_json, env=os.environ,
             run=subprocess.run, con=None,
             opencode_provider=opencode_connected_models,
-            harness_probe=harness_versions.compatibility_status,
-            deepseek_client=None) -> dict:
+            harness_probe=harness_versions.compatibility_status) -> dict:
     """The cached-with-fallbacks entry point the API serves.
 
     fresh cache → serve it; miss/stale/refresh → live sweep, cache the result;
@@ -1477,18 +1298,16 @@ def catalog(refresh: bool = False, fetch=_http_json, env=os.environ,
         )
     if serve_cached:
         assert cached is not None
-        return _served(_with_live_native(
+        return _served(_with_live_opencode(
             {**cached, "stale": bool(cached.get("stale"))},
-            opencode_provider, deepseek_client), con)
+            opencode_provider), con)
     refresh_started_at = datetime.now(timezone.utc).isoformat()
     try:
-        fresh = build(
-            fetch, env, run, deepseek_client=deepseek_client,
-        )
+        fresh = build(fetch, env, run)
     except Exception as e:  # noqa: BLE001
         refresh_completed_at = datetime.now(timezone.utc).isoformat()
         if cached:
-            response = _with_live_native(
+            response = _with_live_opencode(
                 {
                     **cached,
                     "stale": True,
@@ -1497,7 +1316,6 @@ def catalog(refresh: bool = False, fetch=_http_json, env=os.environ,
                     "refresh_completed_at": refresh_completed_at,
                 },
                 opencode_provider,
-                deepseek_client,
             )
             if refresh and con is not None:
                 verification = runtime_verification(
@@ -1522,12 +1340,10 @@ def catalog(refresh: bool = False, fetch=_http_json, env=os.environ,
                     )
                     return _finish_cache_publication(
                         cached_failure, response, con, opencode_provider,
-                        deepseek_client,
                         publication_locked=True,
                     )
             return _finish_cache_publication(
                 cached_failure, response, con, opencode_provider,
-                deepseek_client,
             )
         fallback = {
             "v": PAYLOAD_VERSION, "fetched_at": None,
@@ -1536,9 +1352,7 @@ def catalog(refresh: bool = False, fetch=_http_json, env=os.environ,
             "refresh_started_at": refresh_started_at,
             "refresh_completed_at": refresh_completed_at,
         }
-        response = _with_live_native(
-            fallback, opencode_provider, deepseek_client,
-        )
+        response = _with_live_opencode(fallback, opencode_provider)
         if refresh and con is not None:
             verification = runtime_verification(
                 con, env=env, harness_probe=harness_probe
@@ -1554,12 +1368,11 @@ def catalog(refresh: bool = False, fetch=_http_json, env=os.environ,
                 )
                 return _finish_cache_publication(
                     fallback, response, con, opencode_provider,
-                    deepseek_client,
                     publication_locked=True,
                 )
+        response = _served(response, con)
         return _finish_cache_publication(
             fallback, response, con, opencode_provider,
-            deepseek_client,
         )
     response = _with_live_opencode(
         {**fresh, "stale": False}, opencode_provider
@@ -1575,10 +1388,7 @@ def catalog(refresh: bool = False, fetch=_http_json, env=os.environ,
     if refresh and con is not None:
         probe_error = None
         try:
-            harnesses = _runtime_statuses(
-                harness_probe,
-                include_deepseek="deepseek" in (response.get("harnesses") or {}),
-            )
+            harnesses = _runtime_statuses(harness_probe)
         except Exception as exc:  # noqa: BLE001
             harnesses = {}
             probe_error = str(exc)
@@ -1614,7 +1424,6 @@ def catalog(refresh: bool = False, fetch=_http_json, env=os.environ,
                 )
             return _finish_cache_publication(
                 fresh, response, con, opencode_provider,
-                deepseek_client,
                 publication_locked=True,
             )
     else:
@@ -1623,5 +1432,5 @@ def catalog(refresh: bool = False, fetch=_http_json, env=os.environ,
         fresh["partial"] = True
         fresh["errors"] = response.get("errors") or fresh.get("errors") or []
     return _finish_cache_publication(
-        fresh, response, con, opencode_provider, deepseek_client,
+        fresh, response, con, opencode_provider,
     )

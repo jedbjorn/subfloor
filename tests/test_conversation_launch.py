@@ -163,7 +163,7 @@ def test_bound_headless_route_uses_exact_controlled_native_variant() -> None:
     assert route.effort == binding["native_variant_id"] == "high"
 
 
-def test_bound_headless_route_rejects_mismatched_deepseek_host_effort() -> None:
+def test_bound_headless_route_rejects_removed_deepseek_adapter() -> None:
     binding = unsupported_deepseek_binding()
 
     with pytest.raises(route_bindings.RouteResolutionError) as refused:
@@ -177,7 +177,7 @@ def test_bound_headless_route_rejects_mismatched_deepseek_host_effort() -> None:
 
     assert refused.value.code == "thinking_evidence_missing"
     assert refused.value.details == {
-        "reason": "DeepSeek Host effort must equal the immutable request"
+        "reason": "harness must identify a shipped adapter"
     }
 
 

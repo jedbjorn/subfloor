@@ -19,7 +19,7 @@ import run
 
 
 class HarnessSurfaceProjectionTest(unittest.TestCase):
-    def test_existing_surface_roster_and_deepseek_gates_are_explicit(self) -> None:
+    def test_surface_roster_contains_only_retained_harnesses(self) -> None:
         commands = []
 
         def executable(command: str) -> str:
@@ -36,11 +36,11 @@ class HarnessSurfaceProjectionTest(unittest.TestCase):
         )
         self.assertEqual(
             harness_surfaces.known_runnable_harnesses(),
-            ["claude", "codex", "deepseek", "kimi", "opencode", "vibe"],
+            ["claude", "codex", "kimi", "opencode", "vibe"],
         )
         self.assertEqual(
             harness_surfaces.known_interactive_harnesses(),
-            ["claude", "codex", "deepseek", "kimi", "opencode", "vibe"],
+            ["claude", "codex", "kimi", "opencode", "vibe"],
         )
         for harness in ("claude", "codex", "kimi", "opencode"):
             with self.subTest(harness=harness):
@@ -58,22 +58,8 @@ class HarnessSurfaceProjectionTest(unittest.TestCase):
             "browser": False,
             "sprint": False,
         })
-        self.assertEqual(projection["deepseek"], {
-            "shipped": True,
-            "installed": True,
-            "enabled": True,
-            "healthy": True,
-            "compatibility": "declared",
-            "surfaces": {
-                "terminal": False,
-                "one_shot": True,
-                "browser": True,
-                "sprint": True,
-            },
-            "unavailable_reason": None,
-        })
-        self.assertIn("dsh", commands)
-        self.assertNotIn("deepseek-harness", commands)
+        self.assertNotIn("deepseek", projection)
+        self.assertNotIn("dsh", commands)
 
     def test_missing_runtime_and_disablement_have_stable_distinct_reasons(self) -> None:
         missing = harness_surfaces.project(
@@ -84,24 +70,20 @@ class HarnessSurfaceProjectionTest(unittest.TestCase):
             executable=lambda command: command,
         )
 
-        self.assertFalse(missing["deepseek"]["installed"])
+        self.assertFalse(missing["codex"]["installed"])
         self.assertEqual(
-            missing["deepseek"]["unavailable_reason"], "HARNESS_UNAVAILABLE"
+            missing["codex"]["unavailable_reason"], "HARNESS_UNAVAILABLE"
         )
         self.assertFalse(disabled["codex"]["enabled"])
         self.assertFalse(disabled["codex"]["healthy"])
         self.assertEqual(disabled["codex"]["unavailable_reason"], "HARNESS_DISABLED")
-        self.assertFalse(disabled["deepseek"]["enabled"])
-        self.assertEqual(
-            disabled["deepseek"]["unavailable_reason"], "HARNESS_DISABLED"
-        )
 
     def test_unknown_historical_harness_is_readable_but_never_runnable(self) -> None:
         projection = harness_surfaces.project(
-            ["retired-harness"], executable=lambda command: command
+            ["deepseek", "retired-harness"], executable=lambda command: command
         )
 
-        self.assertEqual(projection["retired-harness"], {
+        expected = {
             "shipped": False,
             "installed": False,
             "enabled": False,
@@ -114,7 +96,9 @@ class HarnessSurfaceProjectionTest(unittest.TestCase):
                 "sprint": False,
             },
             "unavailable_reason": "HARNESS_NOT_SHIPPED",
-        })
+        }
+        self.assertEqual(projection["retired-harness"], expected)
+        self.assertEqual(projection["deepseek"], expected)
         self.assertNotIn(
             "retired-harness", harness_surfaces.known_terminal_harnesses()
         )
@@ -164,6 +148,11 @@ class HarnessSurfaceProjectionTest(unittest.TestCase):
                 path.parent.mkdir()
                 path.write_text(json.dumps(manifest))
             with mock.patch.object(harness_surfaces, "ADAPTERS", adapters), \
+                    mock.patch.object(
+                        harness_surfaces,
+                        "SUPPORTED_HARNESSES",
+                        frozenset(manifests),
+                    ), \
                     mock.patch.object(
                         harness_surfaces,
                         "_browser_contract_proven",

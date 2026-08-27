@@ -130,50 +130,16 @@ def test_spec_current_harness_versions_all_report_tested() -> None:
     }
 
 
-def test_deepseek_version_comes_from_the_official_dsh_probe() -> None:
+def test_removed_deepseek_is_absent_from_default_status_roster() -> None:
     with mock.patch.object(
-        harness_versions, "probe", return_value="0.1.1-rc.2"
+        harness_versions, "probe", return_value="unused"
     ) as probe:
-        result = harness_versions.compatibility_status(("deepseek",))
+        result = harness_versions.compatibility_status()
 
-    assert result == {
-        "deepseek": {
-            "harness": "deepseek",
-            **harness_versions.runtime_scope(),
-            "version": "0.1.1-rc.2",
-            "observed_version": "0.1.1-rc.2",
-            "compatibility": "verified",
-            "minimum_version": "0.1.1",
-            "maximum_version_exclusive": "0.1.2",
-            "verified_version": "0.1.1",
-            "error": None,
-        }
-    }
-    probe.assert_called_once_with("deepseek")
-
-
-def test_deepseek_probe_resolves_the_dsh_executable() -> None:
-    with (
-        mock.patch.object(
-            harness_versions.shutil, "which", return_value="/bin/dsh"
-        ) as which,
-        mock.patch.object(
-            harness_versions.subprocess,
-            "run",
-            return_value=SimpleNamespace(
-                returncode=0, stdout="0.1.1-rc.2\n", stderr=""
-            ),
-        ) as run,
-    ):
-        assert harness_versions.probe("deepseek") == "0.1.1-rc.2"
-
-    which.assert_called_once_with("dsh")
-    run.assert_called_once_with(
-        ["dsh", "--version"],
-        capture_output=True,
-        text=True,
-        timeout=harness_versions.TIMEOUT,
-    )
+    assert "deepseek" not in harness_versions.HARNESSES
+    assert "deepseek" not in result
+    assert "dsh" not in harness_versions.PROBE_COMMANDS.values()
+    assert all(call.args != ("deepseek",) for call in probe.call_args_list)
 
 
 def test_current_core_prerelease_is_best_effort_not_tested() -> None:

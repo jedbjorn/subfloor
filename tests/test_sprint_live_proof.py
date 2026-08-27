@@ -36,7 +36,6 @@ sys.path[:0] = [
 
 import active_chat_registry
 import db_driver
-import deepseek_web
 import mem
 import model_catalog
 import route_bindings
@@ -50,14 +49,11 @@ import sprint_message_delivery
 import sprint_pr_watcher
 import sprint_runtime
 from conversation_adapters.base import NativeTurn, NormalizedEvent
-from conversation_adapters.deepseek import DeepSeekAdapter
 from conversation_adapters.opencode import OpenCodeAdapter
 from conversation_broker import BrokerStore
 from conversation_launch import ConversationLaunchPreparer
 from github_pull_requests import PullRequest
 from sprint_route_binding_support import candidate as route_candidate
-from test_deepseek_adapter import FakeHost as FakeDeepSeekHost
-from test_deepseek_adapter import frame as deepseek_frame
 from test_sprint_v2_domain import apply_schema
 
 TOKENS = {
@@ -884,169 +880,6 @@ class SprintBoundRouteDispatchProof(unittest.TestCase):
                 (wake_id,),
             ).fetchone()),
             ("delivered", 1, None),
-        )
-
-    def test_deepseek_null_default_sprint_delivery_is_credential_free(self) -> None:
-        selector = "acme-dynamic/model-7"
-        status, scope = self._runtime("deepseek")
-        observation = {
-            "runtime_status": status,
-            "runtime_scope": scope,
-            "source_fingerprint": "8" * 64,
-            "advertised_options_by_model": {selector: ["low", "high"]},
-        }
-        sprint_id = self._seed_sprint(
-            harness="deepseek", model=selector, effort=None
-        )
-        with mock.patch.object(
-            model_catalog, "controlled_route_evidence", return_value=observation
-        ):
-            self._arm(sprint_id)
-            planner_notice = self.con.execute(
-                "SELECT message_id FROM wake_message WHERE sprint_id=? "
-                "AND receiver_shell_id=3 AND message_kind='notification'",
-                (sprint_id,),
-            ).fetchone()
-            self.assertIsNotNone(planner_notice)
-            sprint_message_delivery.SprintMessageStore(self.con).mark_read(
-                int(planner_notice["message_id"]), 3
-            )
-            wake_id = int(self.con.execute(
-                "SELECT joined.wake_id FROM wake_message message "
-                "JOIN sprint_wake_messages joined USING (message_id) "
-                "WHERE message.sprint_id=? "
-                "AND message.message_kind='work_assignment'",
-                (sprint_id,),
-            ).fetchone()[0])
-            broker_run = self._deliver_and_claim(wake_id)
-        context, _launch = self._prepare(broker_run)
-        context.env.update({
-            "SC_API_TOKEN": "credential-free-shell-token",
-            "SC_API_BASE": "http://127.0.0.1:8837",
-            "SC_SHELL_ID": str(broker_run.shell_id),
-            "SC_SHELL_SHORTNAME": "DEV1",
-        })
-        session_ref = DeepSeekAdapter._new_session_ref(context)
-        host = FakeDeepSeekHost(frames=[
-            deepseek_frame(
-                session_ref,
-                {"seq": 3, "type": "turn/start", "data": {}},
-            ),
-            deepseek_frame(
-                session_ref,
-                {
-                    "seq": 4,
-                    "type": "assistant/chunk",
-                    "data": {
-                        "chunk": {"type": "text-delta", "text": "done"}
-                    },
-                },
-            ),
-            deepseek_frame(
-                session_ref,
-                {
-                    "seq": 5,
-                    "type": "turn/end",
-                    "data": {"reason": {"kind": "completed"}},
-                },
-            ),
-        ])
-        adapter = DeepSeekAdapter(client_factory=lambda: host)
-        store = BrokerStore(self.db_path)
-        owner = "bound-route-broker"
-
-        with (
-            mock.patch.object(deepseek_web, "ensure", return_value={}),
-            mock.patch.object(
-                deepseek_web, "preflight_candidate_execution", return_value=None
-            ),
-            mock.patch.object(
-                deepseek_web, "bind_session_identity", return_value={}
-            ),
-            mock.patch.object(
-                deepseek_web, "retire_session_identity", return_value={}
-            ),
-            mock.patch.object(
-                deepseek_web, "reserve_managed_session", return_value=None
-            ),
-            mock.patch.object(
-                deepseek_web, "release_managed_session", return_value=None
-            ),
-        ):
-            store.mark_starting(broker_run.run_id, owner)
-            turn = adapter.start(context, broker_run.body)
-            store.mark_native_started(broker_run.run_id, owner, turn)
-            events = list(adapter.stream(turn))
-            store.append_events(broker_run.run_id, events[:-1])
-            self.assertTrue(store.finish_run(
-                broker_run.run_id,
-                "succeeded",
-                event_type=events[-1].type,
-                payload=events[-1].payload,
-            ))
-            adapter.close()
-
-        selection = [
-            payload for method, payload in host.calls
-            if method == "session.selectModel"
-        ]
-        prompts = [
-            payload for method, payload in host.calls if method == "session.prompt"
-        ]
-        assignment = self.con.execute(
-            "SELECT message.message_id,message.work_unit_id "
-            "FROM wake_message message "
-            "JOIN sprint_wake_messages joined USING (message_id) "
-            "WHERE joined.wake_id=? AND message.message_kind='work_assignment'",
-            (wake_id,),
-        ).fetchone()
-        run = self.con.execute(
-            "SELECT state,harness_session_after,error_code "
-            "FROM conversation_runs WHERE run_id=?",
-            (broker_run.run_id,),
-        ).fetchone()
-
-        self.assertIsNotNone(assignment)
-        self.assertIn(f"## wake_message #{assignment['message_id']}", broker_run.body)
-        self.assertEqual(broker_run.route_contract_version, 3)
-        self.assertEqual(broker_run.route_binding["requested_model"], selector)
-        self.assertEqual(broker_run.route_binding["provider_model"], "model-7")
-        self.assertIsNone(broker_run.route_binding["native_option_id"])
-        self.assertIsNone(broker_run.effort)
-        self.assertEqual(turn.session_ref, session_ref)
-        self.assertEqual(
-            [event.type for event in events],
-            [
-                "session.started",
-                "run.started",
-                "assistant.delta",
-                "run.completed",
-            ],
-        )
-        self.assertEqual(selection, [{
-            "sessionId": session_ref,
-            "provider": "acme-dynamic",
-            "model": "model-7",
-        }])
-        self.assertNotIn("reasoningEffort", selection[0])
-        self.assertEqual(len(prompts), 1)
-        self.assertEqual(prompts[0]["sessionId"], session_ref)
-        self.assertEqual(
-            sum(method == "session.create" for method, _payload in host.calls),
-            1,
-        )
-        self.assertEqual(tuple(run), ("succeeded", session_ref, None))
-        self.assertEqual(
-            self.con.execute(
-                "SELECT COUNT(*) FROM conversation_events WHERE run_id=? "
-                "AND event_type='run.completed'",
-                (broker_run.run_id,),
-            ).fetchone()[0],
-            1,
-        )
-        self.assertEqual(
-            [method for method, _payload in host.calls if method.startswith("provider.")],
-            [],
         )
 
     def test_terminal_unread_assignment_never_fans_out_provider_execution(

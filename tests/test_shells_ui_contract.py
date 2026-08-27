@@ -117,10 +117,9 @@ const models = modelIds.map((id, index) => ({
 }));
 const catalog = {stale: true, harnesses: {
   opencode: {authority: "harness-live", stale: false, models},
-  deepseek: {authority: "harness-live", stale: false, models},
 }};
 const projections = [];
-for (const harness of ["opencode", "deepseek"]) {
+for (const harness of ["opencode"]) {
   for (const model of modelIds) {
     const control = select();
     const advertised = models.find((candidate) => candidate.id === model)
@@ -140,10 +139,10 @@ const disappeared = select();
 const disappearedState = renderNativeOptionControl(
   disappeared, "opencode", catalog, modelIds[0], "Gone.Option");
 const noOptionsCatalog = structuredClone(catalog);
-noOptionsCatalog.harnesses.deepseek.models[0].native_option_ids = [];
+noOptionsCatalog.harnesses.opencode.models[0].native_option_ids = [];
 const noOptions = select();
 const noOptionsState = renderNativeOptionControl(
-  noOptions, "deepseek", noOptionsCatalog, modelIds[0], null);
+  noOptions, "opencode", noOptionsCatalog, modelIds[0], null);
 const failedCatalog = structuredClone(catalog);
 failedCatalog.harnesses.opencode.error = "managed seat unavailable";
 const failed = select();
@@ -168,7 +167,7 @@ console.log(JSON.stringify({
 }));
 """
     result = run_js(script)
-    assert len(result["projections"]) == 10
+    assert len(result["projections"]) == 5
     assert {projection["model"] for projection in result["projections"]} == {
         "ollama-cloud/deepseek-v4-flash",
         "ollama-cloud/glm-5.2",

@@ -146,18 +146,6 @@ def project(
             route_agent=agent,
             native_variant_id=value["native_variant_id"],
         )
-    if harness == "deepseek":
-        return TransportProjection(
-            harness,
-            model,
-            effort,
-            argument_tail=(
-                () if model_default else ("--effort", effort)
-            ),
-            native_variant_id=(
-                value["native_option_id"] if live_native else None
-            ),
-        )
     raise AssertionError(f"no controlled transport for {harness}")
 
 

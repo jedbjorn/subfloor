@@ -13,7 +13,6 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlsplit
 
 import harness_versions
 from conversation_adapters.base import AdapterError, checked_version_compatibility
@@ -59,15 +58,12 @@ V3_BINDING_KEYS = (
     "selector_binding",
     "adapter_metadata",
 )
-LIVE_NATIVE_HARNESSES = frozenset({"deepseek", "opencode"})
+LIVE_NATIVE_HARNESSES = frozenset({"opencode"})
 LIVE_NATIVE_EVIDENCE_FORMAT = "harness-live-v1"
 
 CONTROLLED_EVIDENCE = {
     "claude": {"claude-portable-manifest"},
     "codex": {"codex-model-cache"},
-    "deepseek": {
-        "deepseek-host-config-v1",
-    },
     "kimi": {"kimi-alias-config"},
     "opencode": {"opencode-connected-variant"},
 }
@@ -76,13 +72,9 @@ SUPPORTED_HARNESSES = frozenset((*CONTROLLED_EVIDENCE, "vibe"))
 TRANSPORTS = {
     "claude": "claude-effort-argument",
     "codex": "codex-reasoning-config",
-    "deepseek": "deepseek-stock-host-v1",
     "kimi": "kimi-effort-environment",
     "opencode": "opencode-route-agent",
 }
-
-DEEPSEEK_TRANSPORT_CONTRACT = TRANSPORTS["deepseek"]
-DEEPSEEK_CREDENTIAL_REF = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,255}$")
 
 # Reserved canonical effort: bind the exact model with no effort transport and
 # let the harness or alias's own default govern thinking.  Admitted for every
@@ -313,79 +305,6 @@ def _v3_binding_error(reason: str) -> RouteResolutionError:
     )
 
 
-def _validate_deepseek_metadata(binding: dict) -> None:
-    """Pin one exact route projected by the stock loopback Host API."""
-    metadata = binding["adapter_metadata"]
-    if set(metadata) != {
-        "provider_route", "endpoint_identity", "credential_ref",
-        "credential_status", "configuration_digest", "transport_contract",
-        "reasoning_effort", "runtime_version", "source_commit",
-    }:
-        raise _binding_error("DeepSeek metadata must contain the fixed Host evidence")
-    provider = metadata["provider_route"]
-    if not _exact_nonblank(provider):
-        raise _binding_error("DeepSeek provider route is missing")
-    if metadata["transport_contract"] != DEEPSEEK_TRANSPORT_CONTRACT:
-        raise _binding_error("DeepSeek transport contract is not canonical")
-    if not _lower_hex(metadata["configuration_digest"], LOWER_HEX_64):
-        raise _binding_error("DeepSeek configuration digest must be a SHA-256 digest")
-    if not _exact_nonblank(metadata["runtime_version"]):
-        raise _binding_error("DeepSeek runtime version is missing")
-    if (
-        not isinstance(metadata["source_commit"], str)
-        or re.fullmatch(r"[0-9a-f]{40}", metadata["source_commit"]) is None
-    ):
-        raise _binding_error("DeepSeek source commit is invalid")
-    endpoint = metadata["endpoint_identity"]
-    if endpoint == f"dsh-provider:{provider}":
-        pass
-    else:
-        parsed_endpoint = urlsplit(endpoint) if _exact_nonblank(endpoint) else None
-        if (
-            parsed_endpoint is None
-            or parsed_endpoint.scheme not in {"https", "http"}
-            or parsed_endpoint.hostname is None
-            or parsed_endpoint.username is not None
-            or parsed_endpoint.password is not None
-            or parsed_endpoint.query
-            or parsed_endpoint.fragment
-        ):
-            raise _binding_error(
-                "DeepSeek endpoint identity must be credential-free HTTP(S)"
-            )
-    requested_model = binding["requested_model"]
-    provider_model = binding["provider_model"]
-    if requested_model != f"{provider}/{provider_model}":
-        raise _binding_error("DeepSeek selector does not match its provider/model route")
-    credential_ref = metadata["credential_ref"]
-    credential_status = metadata["credential_status"]
-    if credential_ref is None:
-        if credential_status is not None:
-            raise _binding_error("DeepSeek uncredentialed route carries credential status")
-    else:
-        if (
-            not isinstance(credential_ref, str)
-            or DEEPSEEK_CREDENTIAL_REF.fullmatch(credential_ref) is None
-        ):
-            raise _binding_error("DeepSeek credential reference is invalid")
-        if (
-            not isinstance(credential_status, dict)
-            or not set(credential_status).issubset({"configured", "source", "writable"})
-            or set(credential_status) < {"configured", "writable"}
-            or credential_status.get("configured") is not True
-            or not isinstance(credential_status.get("writable"), bool)
-            or (
-                "source" in credential_status
-                and not isinstance(credential_status["source"], str)
-            )
-        ):
-            raise _binding_error("DeepSeek credential status is not value-free and configured")
-    effort = binding["requested_effort"]
-    expected_effort = None if effort == DEFAULT_EFFORT else effort
-    if metadata["reasoning_effort"] != expected_effort:
-        raise _binding_error("DeepSeek Host effort must equal the immutable request")
-
-
 def validate_v2_binding(binding: dict) -> None:
     """Enforce the one semantic state contract accepted by every v2 consumer."""
     if not isinstance(binding, dict) or set(binding) != set(BINDING_KEYS):
@@ -446,8 +365,6 @@ def validate_v2_binding(binding: dict) -> None:
                 )
         elif native_variant is not None:
             raise _binding_error("native variants are exclusive to OpenCode")
-        if harness == "deepseek":
-            _validate_deepseek_metadata(binding)
         return
 
     if state not in {"harness-default", "native-uncontrolled"}:
@@ -474,7 +391,7 @@ def validate_v2_binding(binding: dict) -> None:
 
 
 def validate_legacy_v2_live_native(binding: dict) -> None:
-    """Validate readable OpenCode/DeepSeek v2 identity, not old semantics."""
+    """Validate readable OpenCode v2 identity, not old semantics."""
     if not isinstance(binding, dict) or set(binding) != set(BINDING_KEYS):
         raise _binding_error("binding must contain exactly the canonical fixed keys")
     if binding["contract_version"] != V2_CONTRACT_VERSION:
@@ -495,10 +412,7 @@ def validate_legacy_v2_live_native(binding: dict) -> None:
         raise _binding_error("legacy effort must retain its stored lowercase ID")
     if binding["effective_effort"] != requested_effort:
         raise _binding_error("requested and effective effort must match")
-    transports = {TRANSPORTS[harness]}
-    if harness == "deepseek":
-        transports.add("deepseek-provider-options-v1")
-    if binding["transport"] not in transports:
+    if binding["transport"] != TRANSPORTS[harness]:
         raise _binding_error("legacy transport does not match harness history")
     if not _lower_hex(binding["catalogue_generation"], LOWER_HEX_32):
         raise _binding_error(
@@ -520,8 +434,6 @@ def validate_legacy_v2_live_native(binding: dict) -> None:
         expected = None if requested_effort == DEFAULT_EFFORT else requested_effort
         if native_variant != expected:
             raise _binding_error("legacy OpenCode option identity is inconsistent")
-    elif native_variant is not None:
-        raise _binding_error("legacy DeepSeek binding cannot carry a variant ID")
 
 
 def validate_v3_binding(binding: dict) -> None:
@@ -538,7 +450,7 @@ def validate_v3_binding(binding: dict) -> None:
     harness = binding["harness"]
     if harness not in LIVE_NATIVE_HARNESSES:
         raise _v3_binding_error(
-            "live-native bindings require OpenCode or DeepSeek"
+            "live-native bindings require OpenCode"
         )
     if not _exact_nonblank(harness) or harness != harness.lower():
         raise _v3_binding_error("harness must be a normalized identifier")
@@ -829,13 +741,6 @@ def _require_controlled_source(
 
 
 def _uncontrolled_binding(harness: str, model: str | None, effort: str | None) -> dict:
-    if harness == "deepseek":
-        raise RouteResolutionError(
-            "thinking_evidence_missing",
-            "DeepSeek requires an exact route from official Host configuration",
-            {"harness": harness, "model": model,
-             "remediation": "sc models refresh"},
-        )
     if effort is not None:
         raise RouteResolutionError(
             "unsupported_thinking_level",
@@ -877,7 +782,7 @@ def live_native_v3_binding(
     harness = normalize_harness(harness)
     if harness not in LIVE_NATIVE_HARNESSES:
         raise _v3_binding_error(
-            "live-native bindings require OpenCode or DeepSeek"
+            "live-native bindings require OpenCode"
         )
     if not _exact_nonblank(model):
         raise _v3_binding_error("requested_model must be exact and non-blank")
@@ -1002,7 +907,7 @@ def _validate_route_freshness(
         )
     if (
         row.get("availability") != "available"
-        or (harness != "deepseek" and not row.get("headless_supported"))
+        or not row.get("headless_supported")
     ):
         raise RouteResolutionError(
             "thinking_evidence_missing",
@@ -1378,20 +1283,6 @@ def _resolve_v2(
     adapter_metadata = _json_object(
         row.get("adapter_metadata"), field="adapter_metadata"
     )
-    if harness == "deepseek":
-        metadata_by_effort = effort_metadata.get("adapter_metadata_by_effort") or {}
-        selected_metadata = metadata_by_effort.get(requested)
-        if not isinstance(selected_metadata, dict):
-            raise RouteResolutionError(
-                "thinking_evidence_missing",
-                "DeepSeek route has no admitted provider-option mapping",
-                {
-                    "harness": harness,
-                    "model": model,
-                    "requested_effort": requested,
-                },
-            )
-        adapter_metadata = selected_metadata
     if harness == "opencode" and requested != DEFAULT_EFFORT:
         metadata_by_effort = effort_metadata.get("adapter_metadata_by_effort") or {}
         selected_metadata = metadata_by_effort.get(requested)
@@ -1466,15 +1357,13 @@ def live_native_selection(binding: dict) -> dict:
     if harness not in LIVE_NATIVE_HARNESSES or binding["control_state"] != "controlled":
         raise RouteResolutionError(
             "unsupported_route_contract",
-            "Live-native compatibility requires a controlled OpenCode or DeepSeek route",
+            "Live-native compatibility requires a controlled OpenCode route",
             {"contract_version": binding["contract_version"], "harness": harness},
         )
     if binding["contract_version"] == LIVE_NATIVE_CONTRACT_VERSION:
         option_id = binding["native_option_id"]
-    elif harness == "opencode":
-        option_id = binding["native_variant_id"]
     else:
-        option_id = binding["requested_effort"]
+        option_id = binding["native_variant_id"]
     if option_id == DEFAULT_EFFORT:
         option_id = None
     return {

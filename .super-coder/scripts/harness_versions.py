@@ -26,7 +26,7 @@ import subprocess
 import sys
 
 # Probe order = the order the harness picker lists them.
-HARNESSES = ("claude", "codex", "opencode", "vibe", "kimi", "deepseek")
+HARNESSES = ("claude", "codex", "opencode", "vibe", "kimi")
 TIMEOUT = 8
 SEMVER_TOKEN = re.compile(
     r"(?:^|(?<=\s))v?((\d+\.\d+\.\d+)(?:-[0-9A-Za-z.-]+)?"
@@ -41,9 +41,8 @@ MAINTAINED_OBSERVED_VERSIONS = {
     "opencode": "1.18.9",
     "vibe": "vibe 2.22.0",
     "kimi": "0.33.0",
-    "deepseek": "0.1.1-rc.2",
 }
-PROBE_COMMANDS = {"deepseek": "dsh"}
+PROBE_COMMANDS = {}
 
 
 def runtime_scope(*, env=None, hostname: str | None = None) -> dict[str, str]:

@@ -207,114 +207,6 @@ class BrokerStore:
         return int(sequence)
 
     @staticmethod
-    def _deepseek_usage_tokens(payload: Mapping[str, Any]) -> dict[str, int | None]:
-        raw = payload.get("tokens")
-        if not isinstance(raw, Mapping):
-            return {}
-        values: dict[str, int | None] = {}
-        for field in (
-            "input_tokens",
-            "output_tokens",
-            "cache_read_tokens",
-            "cache_write_tokens",
-            "reasoning_tokens",
-        ):
-            value = raw.get(field)
-            values[field] = (
-                int(value)
-                if isinstance(value, (int, float))
-                and not isinstance(value, bool)
-                and value >= 0
-                and int(value) == value
-                else None
-            )
-        return values if any(value is not None for value in values.values()) else {}
-
-    @staticmethod
-    def _record_deepseek_usage(con, row, payload: Mapping[str, Any], now: str) -> None:
-        """Feed normalized browser usage into the existing analytics store."""
-        if row["harness"] != "deepseek" or not row["harness_session_ref"]:
-            return
-        tokens = BrokerStore._deepseek_usage_tokens(payload)
-        if not tokens:
-            return
-        status = (
-            "ok"
-            if tokens["input_tokens"] is not None
-            and tokens["output_tokens"] is not None
-            else "partial"
-        )
-        params = [
-            row["shell_id"],
-            row["provider"],
-            row["title"],
-            row["created_at"],
-            now,
-        ]
-        for field in (
-            "input_tokens",
-            "output_tokens",
-            "cache_read_tokens",
-            "cache_write_tokens",
-            "reasoning_tokens",
-        ):
-            params.extend((tokens[field], tokens[field]))
-        params.extend(
-            (
-                status,
-                now,
-                row["harness"],
-                row["harness_session_ref"],
-                row["model"],
-            )
-        )
-        changed = con.execute(
-            "UPDATE session_token_usage SET shell_id=?,provider=?,title=?,"
-            "started_at=COALESCE(started_at,?),ended_at=?,"
-            + ",".join(
-                f"{field}=CASE WHEN ? IS NULL THEN {field} "
-                f"ELSE COALESCE({field},0)+? END"
-                for field in (
-                    "input_tokens",
-                    "output_tokens",
-                    "cache_read_tokens",
-                    "cache_write_tokens",
-                    "reasoning_tokens",
-                )
-            )
-            + ",status=CASE WHEN status='ok' OR ?='ok' THEN 'ok' "
-            "ELSE 'partial' END,parser_version='browser-events-v1',captured_at=? "
-            "WHERE harness=? AND harness_session_ref=? AND model IS ?",
-            params,
-        ).rowcount
-        if changed:
-            return
-        con.execute(
-            "INSERT INTO session_token_usage "
-            "(shell_id,harness,harness_session_ref,provider,model,title,"
-            "started_at,ended_at,input_tokens,output_tokens,cache_read_tokens,"
-            "cache_write_tokens,reasoning_tokens,status,parser_version,captured_at) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,'browser-events-v1',?)",
-            (
-                row["shell_id"],
-                row["harness"],
-                row["harness_session_ref"],
-                row["provider"],
-                row["model"],
-                row["title"],
-                row["created_at"],
-                now,
-                tokens["input_tokens"],
-                tokens["output_tokens"],
-                tokens["cache_read_tokens"],
-                tokens["cache_write_tokens"],
-                tokens["reasoning_tokens"],
-                status,
-                now,
-            ),
-        )
-
-    @staticmethod
     def _route_from_row(
         row,
     ) -> tuple[int, dict[str, Any] | None, str | None]:
@@ -808,8 +700,6 @@ class BrokerStore:
                 sequences = []
                 for event in events:
                     payload = dict(event.payload)
-                    if event.type == "usage":
-                        self._record_deepseek_usage(con, row, payload, now)
                     if event.native_type:
                         payload["native_type"] = event.native_type
                     if event.interrupt_evidence:
@@ -1728,11 +1618,6 @@ class ConversationBroker(threading.Thread):
             )
             self._deliver_interrupt(active)
             recovery = getattr(self.launch_preparer, "recovery", None)
-            if run.harness == "deepseek" and not callable(recovery):
-                raise BrokerError(
-                    "HARNESS_SHELL_IDENTITY_UNAVAILABLE",
-                    "DeepSeek recovery requires canonical launch preparation",
-                )
             context = recovery(run) if callable(recovery) else run.context()
             self._reconcile_loop(active, context)
         except Exception as exc:
