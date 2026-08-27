@@ -2659,7 +2659,7 @@ class SprintRecoveryCase(SprintPRWatcherCase):
             ],
         )
 
-    def test_resume_records_drift_and_github_failure_without_blocking(self):
+    def test_resume_records_drift_without_blocking(self):
         self.register()
         coordinator = self.coordinator()
         coordinator.pause(
@@ -2678,7 +2678,6 @@ class SprintRecoveryCase(SprintPRWatcherCase):
             (document_id,),
         )
         self.con.commit()
-        self.reader.current = GitHubReadError("github unavailable")
 
         receipt = coordinator.resume(
             self.sprint_id,
@@ -2687,10 +2686,7 @@ class SprintRecoveryCase(SprintPRWatcherCase):
 
         self.assertTrue(receipt.changed)
         self.assertEqual((document_id,), receipt.spec_drift_document_ids)
-        self.assertEqual(
-            ("acme/repo#42 reconciliation failed: github unavailable",),
-            receipt.anomalies,
-        )
+        self.assertEqual((), receipt.anomalies)
         self.assertEqual(
             "armed",
             self.con.execute(
@@ -2706,7 +2702,7 @@ class SprintRecoveryCase(SprintPRWatcherCase):
             ).fetchone()[0]
         )
         self.assertEqual([str(document_id)], sorted(payload["spec_drift"]))
-        self.assertEqual(list(receipt.anomalies), payload["anomalies"])
+        self.assertEqual([], payload["anomalies"])
         self.assertEqual(
             [(None, 3, 0)],
             [
@@ -2717,6 +2713,58 @@ class SprintRecoveryCase(SprintPRWatcherCase):
                     "WHERE idempotency_key LIKE 'sprint-resume:%'"
                 )
             ],
+        )
+
+    def test_resume_stays_paused_when_registered_pr_read_fails(self):
+        self.register()
+        coordinator = self.coordinator()
+        coordinator.pause(
+            self.sprint_id,
+            sprint_domain.LifecycleActor("participant", 1),
+            reason="GitHub unavailable during resume",
+        )
+        self.reader.current = GitHubReadError("github unavailable")
+        transition_count = self.con.execute(
+            "SELECT COUNT(*) FROM sprint_pr_transitions"
+        ).fetchone()[0]
+
+        with self.assertRaisesRegex(
+            sprint_domain.SprintInvariantError,
+            "complete registered PR reconciliation: acme/repo#42 "
+            "reconciliation failed: github unavailable",
+        ):
+            coordinator.resume(
+                self.sprint_id,
+                sprint_domain.LifecycleActor("planner", 3),
+            )
+
+        self.assertEqual(
+            "paused",
+            self.con.execute(
+                "SELECT lifecycle FROM sprints WHERE sprint_id=?",
+                (self.sprint_id,),
+            ).fetchone()[0],
+        )
+        self.assertEqual(
+            transition_count,
+            self.con.execute(
+                "SELECT COUNT(*) FROM sprint_pr_transitions"
+            ).fetchone()[0]
+        )
+        self.assertEqual(
+            0,
+            self.con.execute(
+                "SELECT COUNT(*) FROM sprint_events WHERE sprint_id=? "
+                "AND event_type='lifecycle.reconciled'",
+                (self.sprint_id,),
+            ).fetchone()[0],
+        )
+        self.assertEqual(
+            0,
+            self.con.execute(
+                "SELECT COUNT(*) FROM wake_message "
+                "WHERE idempotency_key LIKE 'sprint-resume:%'"
+            ).fetchone()[0],
         )
 
     def test_resume_surfaces_native_and_capacity_anomalies_without_blocking(self):
