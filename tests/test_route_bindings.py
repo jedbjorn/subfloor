@@ -693,6 +693,65 @@ class BindingIdentityTest(unittest.TestCase):
                     route_bindings.validate_v3_binding(binding)
                 self.assertEqual(raised.exception.code, "unsupported_native_option")
 
+    def test_opencode_cli_round_trip_is_byte_exact_without_fallback(self):
+        selector = "Ollama-Cloud/GLM-5.2"
+        option_id = "Case/Sensitive.MAX"
+        advertised = controlled_observation(None, harness="opencode")
+        advertised["advertised_options_by_model"] = {
+            selector: [option_id, "other"],
+        }
+        with mock.patch.object(
+            model_catalog,
+            "controlled_route_evidence",
+            return_value=advertised,
+        ) as probe:
+            named = routes_cli.resolve(
+                None,
+                "opencode",
+                selector,
+                effort=option_id,
+                shell="DEV5",
+            )
+        probe.assert_called_once_with("opencode", selector)
+        self.assertTrue(named["ok"], named)
+        self.assertEqual(named["binding"]["requested_model"], selector)
+        self.assertEqual(named["binding"]["native_option_id"], option_id)
+        self.assertEqual(named["binding"]["adapter_metadata"], {})
+        self.assertEqual(named["command"], [
+            "./sc", "run", "DEV5", "--harness", "opencode",
+            "-m", selector, "--effort", option_id,
+        ])
+
+        with mock.patch.object(
+            model_catalog,
+            "controlled_route_evidence",
+            return_value=advertised,
+        ):
+            default = routes_cli.resolve(
+                None, "opencode", selector, effort=None, shell="DEV5"
+            )
+        self.assertTrue(default["ok"], default)
+        self.assertIsNone(default["binding"]["native_option_id"])
+        self.assertEqual(default["command"], [
+            "./sc", "run", "DEV5", "--harness", "opencode", "-m", selector,
+        ])
+
+        disappeared = controlled_observation(None, harness="opencode")
+        disappeared["advertised_options_by_model"] = {selector: ["other"]}
+        with mock.patch.object(
+            model_catalog,
+            "controlled_route_evidence",
+            return_value=disappeared,
+        ):
+            refused = routes_cli.resolve(
+                None, "opencode", selector, effort=option_id, shell="DEV5"
+            )
+        self.assertFalse(refused["ok"])
+        self.assertEqual(refused["code"], "native_route_unavailable")
+        self.assertEqual(refused["details"]["current_option_ids"], ["other"])
+        self.assertNotIn("binding", refused)
+        self.assertNotIn("command", refused)
+
     def test_cli_live_resolution_pins_all_decision_267_models_without_provider_calls(
         self,
     ) -> None:

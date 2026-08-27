@@ -1300,12 +1300,7 @@ class SprintBoundRouteDispatchProof(unittest.TestCase):
                             "models": {
                                 "sprint-bound-model": {
                                     "variants": {
-                                        "MAX.Future": {
-                                            "reasoningEffort": "MAX.Future",
-                                            "futureNativeKey": {
-                                                "enabled": True,
-                                            },
-                                        },
+                                        "MAX.Future": ["opaque", "payload"],
                                     },
                                 },
                             },
@@ -1322,7 +1317,7 @@ class SprintBoundRouteDispatchProof(unittest.TestCase):
             shell_runtime_dir=self.root / "opencode-shells",
         )
         adapter._prepare_shell_environment(context)
-        adapter._prepare_live_route_agent(context)
+        adapter._prepare_live_route(context)
         adapter._prompt("native-session", context, "Dispatch stored route")
         config = json.loads((broker_run.worktree / "opencode.json").read_text())
         current = json.loads(
@@ -1342,6 +1337,7 @@ class SprintBoundRouteDispatchProof(unittest.TestCase):
         self.assertEqual(broker_run.route_binding["adapter_metadata"], {})
         self.assertEqual(launch["route_binding"], broker_run.route_binding)
         self.assertEqual(projection.native_variant_id, "MAX.Future")
+        self.assertIsNone(projection.route_agent)
         self.assertNotIn("agent", config)
         self.assertEqual(current["native_variant_ids"], {"xhigh": "xhigh"})
         self.assertEqual(
@@ -1435,7 +1431,7 @@ class SprintBoundRouteDispatchProof(unittest.TestCase):
             shell_runtime_dir=self.root / "opencode-shells",
         )
         adapter._prepare_shell_environment(context)
-        adapter._prepare_live_route_agent(context)
+        adapter._prepare_live_route(context)
         adapter._prompt("glm-fixture-session", context, "fixture prompt")
         projection = route_transport.context_projection(context, "opencode")
         config = json.loads((broker_run.worktree / "opencode.json").read_text())

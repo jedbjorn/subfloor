@@ -1409,13 +1409,7 @@ class BuildTest(NoCLI):
         self.assertEqual(
             model["native_variant_ids"], {"high": "high", "max": "max"}
         )
-        self.assertEqual(
-            model["adapter_metadata"]["variant_options_by_effort"],
-            {
-                "high": {"reasoningEffort": "high"},
-                "max": {"reasoningEffort": "max"},
-            },
-        )
+        self.assertEqual(model["adapter_metadata"], {})
 
     def test_opencode_native_projection_has_no_enum_or_provider_family_gate(self):
         projected = mc.opencode_connected_models({
@@ -1427,12 +1421,7 @@ class BuildTest(NoCLI):
                 "models": {
                     "glm-5.2": {
                         "variants": {
-                            "MAX.Future": {
-                                "reasoningEffort": "provider-exact",
-                                "futureProviderField": {
-                                    "preserved": True,
-                                },
-                            },
+                            "MAX.Future": ["opaque", "provider", "payload"],
                         },
                     },
                 },
@@ -1445,16 +1434,8 @@ class BuildTest(NoCLI):
         self.assertEqual(projected[0]["native_variant_ids"], {
             "MAX.Future": "MAX.Future",
         })
-        self.assertIsNone(
-            projected[0]["adapter_metadata"]["provider_family"]
-        )
-        self.assertEqual(
-            projected[0]["variants"]["MAX.Future"],
-            {
-                "reasoningEffort": "provider-exact",
-                "futureProviderField": {"preserved": True},
-            },
-        )
+        self.assertEqual(projected[0]["adapter_metadata"], {})
+        self.assertNotIn("variants", projected[0])
 
     def test_live_catalogue_projects_five_exact_models_without_provider_request(self):
         model_ids = [

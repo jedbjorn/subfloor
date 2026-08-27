@@ -96,36 +96,46 @@ def project(
             ),
         )
     if harness == "opencode":
+        if live_native:
+            variant_arguments = (
+                ()
+                if model_default
+                else ("--variant", value["native_option_id"])
+            )
+            return TransportProjection(
+                harness,
+                model,
+                effort,
+                argument_tail=(
+                    ("--model", model, *variant_arguments)
+                    if interface == "interactive"
+                    else variant_arguments if interface == "headless" else ()
+                ),
+                native_variant_id=value["native_option_id"],
+            )
         if worktree is None:
             raise opencode_config.OpenCodeConfigError(
                 "HARNESS_CONFIG_INVALID",
                 "OpenCode controlled routes require an exact worktree",
             )
         agent = opencode_config.route_agent_name(binding_digest)
-        if interface != "conversation" and not live_native:
+        if interface != "conversation":
             agent = opencode_config.ensure_route_agent(
                 worktree, value, binding_digest
             )
         if interface == "interactive":
             arguments = ("--model", model, "--agent", agent)
         elif interface == "headless":
-            if live_native:
-                arguments = (
-                    ()
-                    if model_default
-                    else ("--variant", value["native_option_id"])
+            arguments = (
+                ("--agent", agent)
+                if model_default
+                else (
+                    "--agent",
+                    agent,
+                    "--variant",
+                    value["native_variant_id"],
                 )
-            else:
-                arguments = (
-                    ("--agent", agent)
-                    if model_default
-                    else (
-                        "--agent",
-                        agent,
-                        "--variant",
-                        value["native_variant_id"],
-                    )
-                )
+            )
         else:
             arguments = ()
         return TransportProjection(
@@ -134,10 +144,7 @@ def project(
             effort,
             argument_tail=arguments,
             route_agent=agent,
-            native_variant_id=(
-                value["native_option_id"]
-                if live_native else value["native_variant_id"]
-            ),
+            native_variant_id=value["native_variant_id"],
         )
     if harness == "deepseek":
         return TransportProjection(

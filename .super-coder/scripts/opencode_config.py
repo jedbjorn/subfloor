@@ -284,30 +284,6 @@ def route_agent_name(binding_digest: str) -> str:
     return name
 
 
-def _live_native_payload(value: Any, *, depth: int = 0) -> Any:
-    if depth > 8:
-        raise OpenCodeConfigError(
-            "HARNESS_CONFIG_INVALID", "OpenCode native option payload is too deep"
-        )
-    if value is None or isinstance(value, (bool, int, float, str)):
-        return value
-    if isinstance(value, list):
-        return [_live_native_payload(item, depth=depth + 1) for item in value]
-    if isinstance(value, Mapping):
-        if any(not isinstance(key, str) or not key for key in value):
-            raise OpenCodeConfigError(
-                "HARNESS_CONFIG_INVALID",
-                "OpenCode native option fields must be non-empty strings",
-            )
-        return {
-            key: _live_native_payload(item, depth=depth + 1)
-            for key, item in value.items()
-        }
-    raise OpenCodeConfigError(
-        "HARNESS_CONFIG_INVALID", "OpenCode native option payload is not JSON"
-    )
-
-
 def route_agent_projection(binding: Mapping[str, Any]) -> dict[str, Any]:
     model = binding.get("requested_model")
     if not isinstance(model, str) or not model:
@@ -379,83 +355,4 @@ def ensure_route_agent(
         agents[name] = expected
 
     mutate(worktree, "ensure-route-agent", apply, timeout=timeout)
-    return name
-
-
-def ensure_live_route_agent(
-    worktree: Path,
-    binding: Mapping[str, Any],
-    binding_digest: str,
-    native_option_payload: Mapping[str, Any] | None,
-    *,
-    timeout: float = LOCK_TIMEOUT_SECONDS,
-) -> str:
-    """Replace one transient agent from the current managed-server payload."""
-    if binding.get("harness") != "opencode" or binding.get("control_state") != "controlled":
-        raise OpenCodeConfigError(
-            "HARNESS_CONFIG_INVALID", "live route agents require controlled OpenCode"
-        )
-    calculated = hashlib.sha256(
-        json.dumps(
-            binding, ensure_ascii=False, sort_keys=True, separators=(",", ":")
-        ).encode("utf-8")
-    ).hexdigest()
-    if calculated != binding_digest:
-        raise OpenCodeConfigError(
-            "HARNESS_CONFIG_INVALID",
-            "OpenCode live route agent binding digest does not match its content",
-        )
-    model = binding.get("requested_model")
-    if not isinstance(model, str) or not model:
-        raise OpenCodeConfigError(
-            "HARNESS_CONFIG_INVALID", "OpenCode binding has no exact model"
-        )
-    option_id = (
-        binding.get("native_option_id")
-        if binding.get("contract_version") == 3
-        else binding.get("native_variant_id")
-    )
-    if option_id is None and native_option_payload is not None:
-        raise OpenCodeConfigError(
-            "HARNESS_CONFIG_INVALID",
-            "Harness-default OpenCode routes cannot carry native options",
-        )
-    if option_id is not None and not isinstance(native_option_payload, Mapping):
-        raise OpenCodeConfigError(
-            "HARNESS_CONFIG_INVALID",
-            "OpenCode live route has no exact native option payload",
-        )
-    if native_option_payload is None:
-        expected = {"mode": "primary", "model": model}
-    else:
-        options = _live_native_payload(native_option_payload)
-        try:
-            encoded = json.dumps(
-                options,
-                ensure_ascii=False,
-                allow_nan=False,
-                separators=(",", ":"),
-            ).encode("utf-8")
-        except (TypeError, ValueError) as exc:
-            raise OpenCodeConfigError(
-                "HARNESS_CONFIG_INVALID",
-                "OpenCode native option payload is not bounded JSON",
-            ) from exc
-        if len(encoded) > 65_536:
-            raise OpenCodeConfigError(
-                "HARNESS_CONFIG_INVALID",
-                "OpenCode native option payload is too large",
-            )
-        expected = {**options, "mode": "primary", "model": model}
-    name = route_agent_name(binding_digest)
-
-    def apply(config: dict[str, Any]) -> None:
-        agents = config.setdefault("agent", {})
-        if not isinstance(agents, dict):
-            raise OpenCodeConfigError(
-                "HARNESS_CONFIG_INVALID", "OpenCode agent config must be an object"
-            )
-        agents[name] = expected
-
-    mutate(worktree, "ensure-live-route-agent", apply, timeout=timeout)
     return name
