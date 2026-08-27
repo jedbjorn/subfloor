@@ -230,6 +230,7 @@ class RouteTransportTest(unittest.TestCase):
             "--variant", "MaX.Future", "dispatch exactly once",
         ])
         self.assertNotIn("--agent", command)
+        self.assertIsNone(projection.route_agent)
         self.assertFalse((self.root / "opencode.json").exists())
 
     def test_opencode_live_native_headless_default_omits_variant(self):
@@ -259,6 +260,29 @@ class RouteTransportTest(unittest.TestCase):
         ])
         self.assertNotIn("--variant", command)
         self.assertNotIn("--agent", command)
+        self.assertIsNone(projection.route_agent)
+        self.assertFalse((self.root / "opencode.json").exists())
+
+    def test_opencode_live_native_interactive_uses_native_variant_without_agent(self):
+        binding, digest = route_transport.route_bindings.live_native_v3_binding(
+            "opencode",
+            "Ollama-Cloud/GLM-5.2",
+            "GLM-5.2",
+            "Case/Sensitive.MAX",
+        )
+
+        projection = route_transport.project(
+            binding,
+            digest,
+            expected_harness="opencode",
+            interface="interactive",
+        )
+
+        self.assertEqual(projection.argument_tail, (
+            "--model", "Ollama-Cloud/GLM-5.2",
+            "--variant", "Case/Sensitive.MAX",
+        ))
+        self.assertIsNone(projection.route_agent)
         self.assertFalse((self.root / "opencode.json").exists())
 
     def test_live_native_headless_null_option_invokes_harness_default(self):

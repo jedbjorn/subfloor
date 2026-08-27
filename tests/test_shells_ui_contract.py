@@ -206,6 +206,43 @@ console.log(JSON.stringify({
     ]
 
 
+def test_opencode_variant_control_preserves_exact_ids_and_default_omission():
+    helper = APP[
+        APP.index("function nativeOptionLabel"):
+        APP.index("function dmModelPicker")
+    ]
+    script = r"""
+function el(_tag, attrs = {}) { return {...attrs}; }
+const control = {
+  children: [], disabled: false, title: "",
+  replaceChildren() { this.children = []; },
+  append(value) { this.children.push(value); },
+};
+""" + helper + r"""
+const model = {
+  id: "Ollama-Cloud/GLM-5.2",
+  availability: "available",
+  native_option_ids: ["Case/Sensitive.MAX", "future:id"],
+};
+const catalog = {stale: false, harnesses: {
+  opencode: {authority: "harness-live", stale: false, models: [model]},
+}};
+const state = renderNativeOptionControl(
+  control, "opencode", catalog, model.id, "Case/Sensitive.MAX");
+console.log(JSON.stringify({
+  values: control.children.map((option) => option.value),
+  labels: control.children.map((option) => option.textContent),
+  selected: state.selected,
+}));
+"""
+    result = run_js(script)
+    assert result == {
+        "values": ["", "Case/Sensitive.MAX", "future:id"],
+        "labels": ["Harness default", "Case/Sensitive.MAX", "future:id"],
+        "selected": "Case/Sensitive.MAX",
+    }
+
+
 def test_live_native_model_picker_ignores_global_stale_catalogue():
     helper = APP[
         APP.index("function nativeOptionLabel"):

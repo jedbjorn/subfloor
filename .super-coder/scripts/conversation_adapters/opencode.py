@@ -6,7 +6,6 @@ import atexit
 import hashlib
 import json
 import os
-import re
 import secrets
 import shlex
 import shutil
@@ -15,7 +14,6 @@ import socket
 import subprocess
 import threading
 import time
-import unicodedata
 import urllib.error
 import uuid
 from collections.abc import Iterator, Mapping
@@ -57,23 +55,10 @@ _SERVER_ENDPOINT = SERVER_ENDPOINT
 _SERVER_PASSWORD: str | None = None
 _SERVER_LOG_HANDLE = None
 
-VARIANT_ID = re.compile(r"^[a-z0-9][a-z0-9._-]{0,31}$")
-VARIANT_MANIFEST = opencode_config.VARIANT_MANIFEST
 MAX_CONNECTED_PROVIDERS = 256
 MAX_CONNECTED_MODELS = 2_000
 MAX_NATIVE_OPTIONS = 256
-MAX_NATIVE_OPTION_BYTES = 256 * 1024
-MAX_NATIVE_OPTION_DEPTH = 16
 MAX_NATIVE_IDENTIFIER_CHARS = 512
-FORBIDDEN_VARIANT_KEYS = frozenset({
-    "apikey", "key", "token", "secret", "credential", "authorization",
-    "headers", "baseurl", "npm", "provider", "model", "prompt",
-    "instructions", "permission", "tools", "plugin", "mcp", "shell",
-})
-OPENAI_PROVIDER_PACKAGES = frozenset({
-    "@ai-sdk/openai", "@ai-sdk/openai-compatible", "@ai-sdk/azure",
-})
-ANTHROPIC_PROVIDER_PACKAGES = frozenset({"@ai-sdk/anthropic"})
 
 
 def _read_server_state() -> dict[str, Any] | None:
@@ -395,126 +380,6 @@ def provider_state() -> dict[str, Any]:
     return {**result, "_sc_cli_version": version}
 
 
-def _collision_identity(value: str) -> str:
-    return unicodedata.normalize("NFKC", value.strip()).casefold()
-
-
-def _provider_family(package: Any) -> str | None:
-    if not isinstance(package, str):
-        return None
-    if package in OPENAI_PROVIDER_PACKAGES:
-        return "openai-ai-sdk"
-    if package in ANTHROPIC_PROVIDER_PACKAGES:
-        return "anthropic-ai-sdk"
-    return None
-
-
-def _model_family(provider: Mapping[str, Any], model: Mapping[str, Any]) -> str | None:
-    # opencode's /provider projection carries the SDK package at
-    # model.api.npm; a top-level provider npm is legacy fallback.
-    api = model.get("api")
-    if isinstance(api, Mapping) and api.get("npm"):
-        return _provider_family(api.get("npm"))
-    return _provider_family(provider.get("npm"))
-
-
-def _contains_forbidden_key(value: Any) -> bool:
-    if not isinstance(value, dict):
-        return False
-    for key, nested in value.items():
-        if isinstance(key, str) and key.casefold() in FORBIDDEN_VARIANT_KEYS:
-            return True
-        if _contains_forbidden_key(nested):
-            return True
-    return False
-
-
-def _contains_substitution(value: Any) -> bool:
-    if isinstance(value, str):
-        lowered = value.casefold()
-        return "{env:" in lowered or "{file:" in lowered
-    if isinstance(value, dict):
-        return any(_contains_substitution(item) for item in value.values())
-    if isinstance(value, list):
-        return any(_contains_substitution(item) for item in value)
-    return False
-
-
-def _output_limit(model: Mapping[str, Any]) -> int | None:
-    for field in ("limit", "limits"):
-        limits = model.get(field)
-        if isinstance(limits, dict):
-            value = limits.get("output") or limits.get("output_tokens")
-            if isinstance(value, int) and not isinstance(value, bool):
-                return value
-    value = model.get("output_limit")
-    return value if isinstance(value, int) and not isinstance(value, bool) else None
-
-
-def _sanitize_variant(
-    value: Any,
-    *,
-    provider_family: str | None,
-    model: Mapping[str, Any],
-) -> dict[str, Any] | None:
-    if not isinstance(value, dict) or not value or _contains_forbidden_key(value):
-        return None
-    disabled = value.get("disabled", False)
-    if not isinstance(disabled, bool) or disabled:
-        return None
-    candidate = {key: item for key, item in value.items() if key != "disabled"}
-    if not candidate or _contains_substitution(candidate):
-        return None
-
-    canonical = opencode_config.canonical_variant_options(
-        candidate, provider_family=provider_family
-    )
-    if canonical is None:
-        return None
-    if provider_family == "anthropic-ai-sdk":
-        thinking = canonical["thinking"]
-        budget = thinking.get("budgetTokens")
-        limit = _output_limit(model)
-        if (
-            limit is None
-            or budget > limit
-        ):
-            return None
-    return canonical
-
-
-def admitted_variants(
-    variants: Any,
-    *,
-    provider_family: str | None,
-    model: Mapping[str, Any],
-) -> dict[str, dict[str, Any]]:
-    """Return only unique, already-canonical IDs with closed safe overlays."""
-    if not isinstance(variants, dict):
-        return {}
-    groups: dict[str, list[str]] = {}
-    for raw_id in variants:
-        if isinstance(raw_id, str):
-            groups.setdefault(_collision_identity(raw_id), []).append(raw_id)
-    admitted: dict[str, dict[str, Any]] = {}
-    for identity, raw_ids in groups.items():
-        if len(raw_ids) != 1:
-            continue
-        raw_id = raw_ids[0]
-        if (
-            raw_id != identity
-            or not raw_id.isascii()
-            or VARIANT_ID.fullmatch(raw_id) is None
-        ):
-            continue
-        overlay = _sanitize_variant(
-            variants[raw_id], provider_family=provider_family, model=model
-        )
-        if overlay is not None:
-            admitted[raw_id] = overlay
-    return admitted
-
-
 def _native_projection_error(detail: str) -> AdapterError:
     return AdapterError(
         "HARNESS_PROTOCOL_ERROR",
@@ -533,57 +398,18 @@ def _exact_native_identifier(value: Any, field: str) -> str:
     return value
 
 
-def _validate_native_value(value: Any, *, depth: int = 0) -> None:
-    if depth > MAX_NATIVE_OPTION_DEPTH:
-        raise _native_projection_error("native option payload is too deep")
-    if value is None or isinstance(value, (bool, int, float, str)):
-        return
-    if isinstance(value, list):
-        for item in value:
-            _validate_native_value(item, depth=depth + 1)
-        return
-    if isinstance(value, Mapping):
-        for key, item in value.items():
-            _exact_native_identifier(key, "native option field")
-            _validate_native_value(item, depth=depth + 1)
-        return
-    raise _native_projection_error("native option payload is not JSON")
-
-
-def native_variants(variants: Any) -> dict[str, dict[str, Any]]:
-    """Preserve the exact bounded variant map advertised by OpenCode."""
+def native_variant_ids(variants: Any) -> list[str]:
+    """Project exact variant keys without interpreting provider payloads."""
     if variants is None:
-        return {}
+        return []
     if not isinstance(variants, Mapping):
         raise _native_projection_error("variants must be an object")
     if len(variants) > MAX_NATIVE_OPTIONS:
         raise _native_projection_error("too many native options")
-
-    projected: dict[str, dict[str, Any]] = {}
-    encoded_bytes = 0
-    for option_id, payload in variants.items():
-        option_id = _exact_native_identifier(option_id, "native option id")
-        if not isinstance(payload, Mapping):
-            raise _native_projection_error(
-                f"native option {option_id} must be an object"
-            )
-        _validate_native_value(payload)
-        try:
-            encoded = json.dumps(
-                payload,
-                ensure_ascii=False,
-                allow_nan=False,
-                separators=(",", ":"),
-            ).encode("utf-8")
-        except (TypeError, ValueError) as exc:
-            raise _native_projection_error(
-                f"native option {option_id} is not bounded JSON"
-            ) from exc
-        encoded_bytes += len(encoded)
-        if encoded_bytes > MAX_NATIVE_OPTION_BYTES:
-            raise _native_projection_error("native option payload is too large")
-        projected[option_id] = dict(payload)
-    return projected
+    return [
+        _exact_native_identifier(option_id, "native option id")
+        for option_id in variants
+    ]
 
 
 def connected_models(state: Mapping[str, Any] | None = None) -> list[dict[str, Any]]:
@@ -635,13 +461,11 @@ def connected_models(state: Mapping[str, Any] | None = None) -> list[dict[str, A
                 if not isinstance(status, str):
                     raise _native_projection_error("model status must be a string")
                 continue
-            provider_family = _model_family(provider, model)
-            variants = native_variants(model.get("variants"))
+            native_option_ids = native_variant_ids(model.get("variants"))
             selector = f"{provider_id}/{model_id}"
             if selector in seen_routes:
                 raise _native_projection_error("duplicate exact model route")
             seen_routes.add(selector)
-            native_option_ids = list(variants)
             models.append(
                 {
                     "id": selector,
@@ -663,22 +487,18 @@ def connected_models(state: Mapping[str, Any] | None = None) -> list[dict[str, A
                         else ""
                     ),
                     "status": status or "active",
-                    "variants": variants,
                     "native_option_ids": native_option_ids,
                     "native_default_option_id": None,
                     "supported_efforts": native_option_ids,
                     "default_effort": None,
                     "native_variant_ids": {
-                        variant_id: variant_id for variant_id in variants
+                        variant_id: variant_id for variant_id in native_option_ids
                     },
                     "selector_binding": {
                         "kind": "harness-live",
                         "selector": selector,
                     },
-                    "adapter_metadata": {
-                        "provider_family": provider_family,
-                        "variant_options_by_effort": variants,
-                    },
+                    "adapter_metadata": {},
                     "cli_version": state.get("_sc_cli_version"),
                 }
             )
@@ -850,7 +670,7 @@ class OpenCodeAdapter(ConversationAdapter):
             ) from exc
         return wrapper
 
-    def _prepare_live_route_agent(self, context: ConversationContext) -> None:
+    def _prepare_live_route(self, context: ConversationContext) -> None:
         binding = context.route_binding
         if (
             not isinstance(binding, Mapping)
@@ -884,22 +704,13 @@ class OpenCodeAdapter(ConversationAdapter):
             )
             if (
                 binding.get("contract_version")
-                == route_transport.route_bindings.LIVE_NATIVE_CONTRACT_VERSION
+                == route_transport.route_bindings.V2_CONTRACT_VERSION
             ):
-                return
-            option_id = selection["native_option_id"]
-            payload = (
-                current["variants"].get(option_id)
-                if option_id is not None
-                and isinstance(current.get("variants"), Mapping)
-                else None
-            )
-            opencode_config.ensure_live_route_agent(
-                context.checked_worktree(),
-                binding,
-                context.binding_digest or "",
-                payload,
-            )
+                opencode_config.ensure_route_agent(
+                    context.checked_worktree(),
+                    binding,
+                    context.binding_digest or "",
+                )
         except route_transport.route_bindings.RouteResolutionError as exc:
             raise AdapterError(exc.code, exc.message) from exc
         except opencode_config.OpenCodeConfigError as exc:
@@ -996,7 +807,7 @@ class OpenCodeAdapter(ConversationAdapter):
         worktree = context.checked_worktree()
         message = ensure_nonempty_message(message)
         self._prepare_shell_environment(context)
-        self._prepare_live_route_agent(context)
+        self._prepare_live_route(context)
         body: dict[str, Any] = {}
         if context.title:
             body["title"] = context.title
@@ -1036,7 +847,7 @@ class OpenCodeAdapter(ConversationAdapter):
             and context.route_binding.get("contract_version")
             == route_transport.route_bindings.LIVE_NATIVE_CONTRACT_VERSION
         ):
-            self._prepare_live_route_agent(context)
+            self._prepare_live_route(context)
         inspected = self.inspect(session_ref, context)
         if not inspected.exists:
             raise AdapterError(

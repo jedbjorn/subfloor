@@ -1275,11 +1275,13 @@ class ConversationAdapterTest(unittest.TestCase):
 
         with mock.patch.object(
             opencode_adapter.opencode_config,
-            "ensure_live_route_agent",
+            "ensure_route_agent",
         ) as ensure_route_agent:
             first = adapter.start(context, "first")
             list(adapter.stream(first))
-            resumed = adapter.resume(first.session_ref, context, "second")
+            later = adapter.resume(first.session_ref, context, "later")
+            list(adapter.stream(later))
+            resumed = adapter.resume(first.session_ref, context, "resumed")
             list(adapter.stream(resumed))
 
         ensure_route_agent.assert_not_called()
@@ -1295,7 +1297,12 @@ class ConversationAdapterTest(unittest.TestCase):
                 "variant": "MAX.Future",
             },
             {
-                "parts": [{"type": "text", "text": "second"}],
+                "parts": [{"type": "text", "text": "later"}],
+                "model": {"providerID": "openai", "modelID": "gpt-test"},
+                "variant": "MAX.Future",
+            },
+            {
+                "parts": [{"type": "text", "text": "resumed"}],
                 "model": {"providerID": "openai", "modelID": "gpt-test"},
                 "variant": "MAX.Future",
             },
@@ -1304,7 +1311,7 @@ class ConversationAdapterTest(unittest.TestCase):
             len([request for request in native.requests if request[:2] == (
                 "GET", "/provider"
             )]),
-            2,
+            3,
         )
         self.assertEqual(
             len([request for request in native.requests if request[:2] == (
@@ -1360,8 +1367,16 @@ class ConversationAdapterTest(unittest.TestCase):
         list(adapter.stream(first))
         native.provider_state["all"][0]["models"]["gpt-test"]["variants"] = {}
 
-        with self.assertRaisesRegex(AdapterError, "native_route_unavailable"):
+        original_binding = dict(context.route_binding)
+        with mock.patch.object(
+            opencode_adapter.opencode_config,
+            "ensure_route_agent",
+        ) as ensure_route_agent, self.assertRaisesRegex(
+            AdapterError, "native_route_unavailable"
+        ):
             adapter.resume(first.session_ref, context, "must not dispatch")
+        ensure_route_agent.assert_not_called()
+        self.assertEqual(context.route_binding, original_binding)
 
         self.assertEqual(
             len([
@@ -1379,7 +1394,7 @@ class ConversationAdapterTest(unittest.TestCase):
         configured = json.loads((self.root / "opencode.json").read_text())
         self.assertNotIn("agent", configured)
 
-    def test_opencode_replaces_stale_route_agent_from_live_native_payload(self):
+    def test_opencode_v2_refuses_stale_route_agent_without_live_translation(self):
         native = FakeOpenCode()
         native.provider_state["all"][0]["models"]["gpt-test"]["variants"][
             "high"
@@ -1403,20 +1418,73 @@ class ConversationAdapterTest(unittest.TestCase):
             }}
         }))
 
-        turn = adapter.start(context, "dispatch current route")
-        configured = json.loads((self.root / "opencode.json").read_text())
+        with self.assertRaisesRegex(AdapterError, "HARNESS_CONFIG_INVALID"):
+            adapter.start(context, "must not dispatch")
 
+        configured = json.loads((self.root / "opencode.json").read_text())
         self.assertEqual(configured["agent"][agent], {
-            "reasoningEffort": "high",
-            "futureNativeKey": {"enabled": True},
             "mode": "primary",
             "model": "openai/gpt-test",
+            "reasoningEffort": "low",
         })
-        self.assertEqual(turn.session_ref, "ses_exact")
+        self.assertIn("shell", configured)
         self.assertEqual(
             [(method, path) for method, path, _query, _body in native.requests],
-            [("GET", "/provider"), ("POST", "/session")],
+            [("GET", "/provider")],
         )
+
+    def test_opencode_v3_concurrent_sessions_keep_exact_variants_without_agents(self):
+        routes = (
+            ("glm-5.2", "MaX.Future"),
+            ("gemma4:31b", "Case/Sensitive"),
+        )
+        barrier = threading.Barrier(len(routes) + 1)
+        results: list[tuple[FakeOpenCode, str, str]] = []
+        errors: list[Exception] = []
+
+        def run(model: str, variant: str) -> None:
+            native = FakeOpenCode()
+            native.session_ref = f"ses-{model}"
+            native.provider_state["all"][0]["models"] = {
+                model: {"variants": {variant: object()}},
+            }
+            adapter = OpenCodeAdapter(
+                transport=native,
+                shell_runtime_dir=self.root / "runtime-shells",
+            )
+            try:
+                barrier.wait(timeout=2)
+                turn = adapter.start(
+                    v3_opencode_context(self.root, model=model, variant=variant),
+                    f"prompt-{model}",
+                )
+                list(adapter.stream(turn))
+                results.append((native, model, variant))
+            except Exception as exc:  # noqa: BLE001 - captured for assertion
+                errors.append(exc)
+
+        workers = [threading.Thread(target=run, args=route) for route in routes]
+        for worker in workers:
+            worker.start()
+        barrier.wait(timeout=2)
+        for worker in workers:
+            worker.join(timeout=2)
+
+        self.assertTrue(all(not worker.is_alive() for worker in workers))
+        self.assertEqual(errors, [])
+        self.assertEqual(len(results), 2)
+        for native, model, variant in results:
+            prompts = [
+                request[3] for request in native.requests
+                if request[1].endswith("/message")
+            ]
+            self.assertEqual(prompts, [{
+                "parts": [{"type": "text", "text": f"prompt-{model}"}],
+                "model": {"providerID": "openai", "modelID": model},
+                "variant": variant,
+            }])
+        configured = json.loads((self.root / "opencode.json").read_text())
+        self.assertNotIn("agent", configured)
 
     def test_opencode_missing_live_option_refuses_before_session_or_prompt(self):
         native = FakeOpenCode()

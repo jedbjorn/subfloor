@@ -79,25 +79,31 @@ MUTATIONS = (
         OPENCODE,
         "tests/test_model_catalog.py",
         "opencode_native_projection_has_no_enum",
-        '        option_id = _exact_native_identifier(option_id, "native option id")\n'
-        "        if not isinstance(payload, Mapping):",
-        '        option_id = _exact_native_identifier(option_id, "native option id")\n'
-        '        if option_id not in {"low", "medium", "high", "max"}:\n'
-        "            continue\n"
-        "        if not isinstance(payload, Mapping):",
+        '    return [\n'
+        '        _exact_native_identifier(option_id, "native option id")\n'
+        '        for option_id in variants\n'
+        '    ]',
+        '    return [\n'
+        '        _exact_native_identifier(option_id, "native option id")\n'
+        '        for option_id in variants\n'
+        '        if option_id in {"low", "medium", "high", "max"}\n'
+        '    ]',
     ),
     Mutation(
-        "provider-family-admission",
-        "an unknown OpenCode provider family cannot hide live variants",
+        "provider-payload-admission",
+        "an unfamiliar provider payload shape cannot hide its exact variant ID",
         OPENCODE,
         "tests/test_model_catalog.py",
         "opencode_native_projection_has_no_enum",
-        "            provider_family = _model_family(provider, model)\n"
-        '            variants = native_variants(model.get("variants"))',
-        "            provider_family = _model_family(provider, model)\n"
-        "            if provider_family is None:\n"
-        "                continue\n"
-        '            variants = native_variants(model.get("variants"))',
+        '    return [\n'
+        '        _exact_native_identifier(option_id, "native option id")\n'
+        '        for option_id in variants\n'
+        '    ]',
+        '    return [\n'
+        '        _exact_native_identifier(option_id, "native option id")\n'
+        '        for option_id in variants\n'
+        '        if isinstance(variants[option_id], Mapping)\n'
+        '    ]',
     ),
     Mutation(
         "global-stale-disables-native-thinking",
