@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Sprints v2 lifecycle authority, arming transaction, and service gate.
 
 This module deliberately owns no GitHub or harness effects.  It commits the
@@ -25,8 +24,8 @@ from conversation_adapters import AdapterError, ProbeResult, adapter_for
 
 ENGINE = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ENGINE / "api"))
-import model_catalog  # noqa: E402  (canonical local route evidence)
-import route_bindings  # noqa: E402  (versioned participant route contract)
+import model_catalog
+import route_bindings
 
 SPRINT_TRANSITIONS = {
     "prepared": frozenset({"armed", "aborted"}),
@@ -1928,6 +1927,20 @@ class SprintLifecycleStore:
             "SELECT w.wake_id,w.sprint_id AS wake_sprint_id,"
             "m.to_participant_id AS participant_id,w.state,w.idempotency_key,"
             "w.attempt_count AS wake_attempt_count,MIN(m.message_id) AS message_id,"
+            "(SELECT assignment.message_id FROM wake_message assignment "
+            "JOIN sprint_wake_messages assignment_wm "
+            "ON assignment_wm.message_id=assignment.message_id "
+            "WHERE assignment_wm.wake_id=w.wake_id "
+            "AND assignment.read_at IS NULL "
+            "AND assignment.message_kind='work_assignment' "
+            "ORDER BY assignment.message_id LIMIT 1) AS assignment_message_id,"
+            "(SELECT assignment.work_unit_id FROM wake_message assignment "
+            "JOIN sprint_wake_messages assignment_wm "
+            "ON assignment_wm.message_id=assignment.message_id "
+            "WHERE assignment_wm.wake_id=w.wake_id "
+            "AND assignment.read_at IS NULL "
+            "AND assignment.message_kind='work_assignment' "
+            "ORDER BY assignment.message_id LIMIT 1) AS assignment_work_unit_id,"
             "(SELECT detail.work_unit_id FROM wake_message detail "
             "JOIN sprint_wake_messages detail_wm "
             "ON detail_wm.message_id=detail.message_id "
@@ -1963,6 +1976,67 @@ class SprintLifecycleStore:
             # duplicates the wake into the same chat under a fresh key.
             if turn["turn_live"]:
                 continue
+            # Relays may be recovered under a fresh wake, but an assignment is
+            # an execution command.  Once delivery or run ownership exists,
+            # changing its wake key would mint a second conversation identity
+            # and replay the prompt.  Preserve the original identity and stop
+            # for operator judgment, including when the evidence is ambiguous.
+            assignment_execution_exists = (
+                row["assignment_message_id"] is not None
+                and (
+                    row["state"] == "delivered"
+                    or turn["message_state"] is not None
+                    or turn["run_state"] is not None
+                    or turn["native_run_ref"] is not None
+                )
+            )
+            if assignment_execution_exists:
+                evidence_valid = self._pickup_turn_evidence_valid(row, turn)
+                run_state = turn["run_state"]
+                failure_class, error_code = {
+                    "succeeded": (
+                        "terminal_unread",
+                        "ASSIGNMENT_TERMINAL_UNREAD",
+                    ),
+                    "cancelled": (
+                        "native_interrupted",
+                        "ASSIGNMENT_EXECUTION_INTERRUPTED",
+                    ),
+                    "failed": (
+                        "native_failed",
+                        "ASSIGNMENT_EXECUTION_FAILED",
+                    ),
+                    "unknown": (
+                        "native_unknown",
+                        "ASSIGNMENT_EXECUTION_UNKNOWN",
+                    ),
+                }.get(
+                    str(run_state),
+                    ("ownership_ambiguous", "ASSIGNMENT_EXECUTION_AMBIGUOUS"),
+                )
+                if not evidence_valid:
+                    failure_class = "ownership_ambiguous"
+                    error_code = "ASSIGNMENT_EXECUTION_AMBIGUOUS"
+                pause_receipt = self._exhaust_pickup_in_transaction(
+                    sprint_id=sprint_id,
+                    participant_id=participant_id,
+                    wake_id=old_wake_id,
+                    message_id=int(row["assignment_message_id"]),
+                    work_unit_id=(
+                        int(row["assignment_work_unit_id"])
+                        if row["assignment_work_unit_id"] is not None
+                        else None
+                    ),
+                    turn=turn,
+                    pause_reason="assignment_execution_already_started",
+                    error_code=error_code,
+                    failure_class=failure_class,
+                    attempt_count=int(row["wake_attempt_count"]),
+                )
+                return _WakeReconcileResult(
+                    tuple(sorted(set(replacements))),
+                    pause_receipt,
+                )
             shell_busy = (
                 turn["run_state"] == "failed"
                 and turn["error_code"] == "SHELL_BUSY"
@@ -3453,14 +3527,14 @@ class SprintParticipantStore:
             raise SprintPreflightError(
                 exc.message, code=exc.code, details=exc.details
             ) from exc
-        if model is not None:
-            if not isinstance(model, str) or not model or model != model.strip():
-                raise ValueError(
-                    "participant model must be an exact non-empty selector"
-                )
-        if effort is not None:
-            if not isinstance(effort, str) or not effort.strip():
-                raise ValueError("participant effort must be non-empty when supplied")
+        if model is not None and (
+            not isinstance(model, str) or not model or model != model.strip()
+        ):
+            raise ValueError("participant model must be an exact non-empty selector")
+        if effort is not None and (
+            not isinstance(effort, str) or not effort.strip()
+        ):
+            raise ValueError("participant effort must be non-empty when supplied")
         if route is not None:
             route = route.strip()
             if not route:
