@@ -686,6 +686,169 @@ class SprintBoundRouteDispatchProof(unittest.TestCase):
             )["native_option_id"]
         )
 
+    def test_opencode_null_default_sprint_first_turn_is_exact_and_terminal(
+        self,
+    ) -> None:
+        observation = self._seed_opencode_catalogue()
+        sprint_id = self._seed_sprint(
+            harness="opencode", model=self.SELECTOR, effort=None
+        )
+        with mock.patch.object(
+            model_catalog, "controlled_route_evidence", return_value=observation
+        ):
+            wake_id = self._arm(sprint_id)
+            broker_run = self._deliver_and_claim(wake_id)
+        context, _launch = self._prepare(broker_run)
+
+        class ExactFirstTurnTransport:
+            def __init__(self) -> None:
+                self.session_ref = "ses_sprint_exact_null_default"
+                self.requests: list[tuple[str, str, dict | None]] = []
+                self.native_messages: list[dict] = []
+
+            def request(self, method, path, *, query=None, body=None):
+                self.requests.append((method, path, body))
+                if method == "GET" and path == "/provider":
+                    return {
+                        "connected": ["openai"],
+                        "all": [{
+                            "id": "openai",
+                            "models": {
+                                "sprint-bound-model": {
+                                    "variants": {
+                                        "MAX.Future": {
+                                            "reasoningEffort": "MAX.Future"
+                                        }
+                                    }
+                                }
+                            },
+                        }],
+                    }
+                if method == "POST" and path == "/session":
+                    return {"id": self.session_ref}
+                if method == "POST" and path.endswith("/message"):
+                    self.native_messages.append(dict(body or {}))
+                    return {
+                        "info": {
+                            "role": "assistant",
+                            "sessionID": self.session_ref,
+                        },
+                        "parts": [{"type": "text", "text": "done"}],
+                    }
+                raise AssertionError(
+                    f"unexpected credential-free OpenCode request: {method} {path}"
+                )
+
+            def stream(self, path, *, query=None):
+                return iter((
+                    {
+                        "type": "session.idle",
+                        "properties": {"sessionID": self.session_ref},
+                    },
+                    {
+                        "type": "session.status",
+                        "properties": {
+                            "sessionID": self.session_ref,
+                            "status": {"type": "busy"},
+                        },
+                    },
+                    {
+                        "type": "message.part.delta",
+                        "properties": {
+                            "sessionID": self.session_ref,
+                            "field": "text",
+                            "delta": "done",
+                        },
+                    },
+                    {
+                        "type": "session.idle",
+                        "properties": {"sessionID": self.session_ref},
+                    },
+                ))
+
+        transport = ExactFirstTurnTransport()
+        adapter = OpenCodeAdapter(
+            transport=transport,
+            shell_runtime_dir=self.root / "opencode-shells",
+        )
+        owner = "bound-route-broker"
+        store = BrokerStore(self.db_path)
+        store.mark_starting(broker_run.run_id, owner)
+        turn = adapter.start(context, broker_run.body)
+        self.assertEqual(transport.native_messages, [])
+        store.mark_native_started(broker_run.run_id, owner, turn)
+
+        events = list(adapter.stream(turn))
+        store.append_events(broker_run.run_id, events[:-1])
+        self.assertTrue(store.finish_run(
+            broker_run.run_id,
+            "succeeded",
+            event_type=events[-1].type,
+            payload=events[-1].payload,
+        ))
+
+        self.assertEqual(broker_run.route_contract_version, 3)
+        self.assertEqual(broker_run.route_binding["requested_model"], self.SELECTOR)
+        self.assertIsNone(broker_run.route_binding["native_option_id"])
+        self.assertEqual(turn.session_ref, transport.session_ref)
+        self.assertEqual(
+            [event.type for event in events],
+            [
+                "session.started",
+                "run.started",
+                "assistant.delta",
+                "run.completed",
+            ],
+        )
+        self.assertEqual(len(transport.native_messages), 1)
+        prompt = transport.native_messages[0]
+        self.assertEqual(
+            prompt["model"],
+            {"providerID": "openai", "modelID": "sprint-bound-model"},
+        )
+        self.assertNotIn("variant", prompt)
+        self.assertEqual(
+            [request[:2] for request in transport.requests].count(
+                ("POST", "/session")
+            ),
+            1,
+        )
+        self.assertEqual(
+            [request[:2] for request in transport.requests].count(
+                ("POST", f"/session/{transport.session_ref}/message")
+            ),
+            1,
+        )
+        with self.con:
+            run_row = self.con.execute(
+                "SELECT state,harness_session_after,error_code "
+                "FROM conversation_runs WHERE run_id=?",
+                (broker_run.run_id,),
+            ).fetchone()
+            message_count = self.con.execute(
+                "SELECT COUNT(*) FROM conversation_messages "
+                "WHERE conversation_id=?",
+                (broker_run.conversation_id,),
+            ).fetchone()[0]
+            terminal_count = self.con.execute(
+                "SELECT COUNT(*) FROM conversation_events "
+                "WHERE run_id=? AND event_type='run.completed'",
+                (broker_run.run_id,),
+            ).fetchone()[0]
+        self.assertEqual(tuple(run_row), (
+            "succeeded", transport.session_ref, None
+        ))
+        self.assertEqual(message_count, 1)
+        self.assertEqual(terminal_count, 1)
+        self.assertEqual(
+            tuple(self.con.execute(
+                "SELECT state,attempt_count,last_error "
+                "FROM sprint_wake_outbox WHERE wake_id=?",
+                (wake_id,),
+            ).fetchone()),
+            ("delivered", 1, None),
+        )
+
     def test_opencode_dispatch_uses_current_live_variant_after_catalogue_changes(
         self,
     ) -> None:

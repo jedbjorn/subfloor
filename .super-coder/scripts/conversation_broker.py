@@ -34,6 +34,7 @@ import conversation_git_targets
 import db_driver
 import route_transport
 from conversation_adapters import (
+    AdapterError,
     ConversationAdapter,
     ConversationContext,
     NativeTurn,
@@ -1403,6 +1404,7 @@ class ConversationBroker(threading.Thread):
         pending: list[NormalizedEvent] = []
         pending_since: float | None = None
         retry_after = 0.0
+        stream_error: Exception | None = None
         try:
             while not self._stop_event.is_set():
                 now = time.monotonic()
@@ -1438,7 +1440,10 @@ class ConversationBroker(threading.Thread):
                     if not pending:
                         pending_since = time.monotonic()
                     pending.append(item)
-                elif item is _STREAM_END or isinstance(item, Exception):
+                elif isinstance(item, Exception):
+                    stream_error = item
+                    break
+                elif item is _STREAM_END:
                     break
 
                 now = time.monotonic()
@@ -1481,6 +1486,14 @@ class ConversationBroker(threading.Thread):
                     wait=True,
                 ):
                     return False
+            if (
+                isinstance(stream_error, AdapterError)
+                and stream_error.code.startswith("HARNESS_SUBMISSION_")
+            ):
+                # A synchronous submission failure is precise evidence.
+                # Other stream failures remain uncertain and reconcile the
+                # exact native turn instead of abandoning in-flight work.
+                raise stream_error
             return False
         finally:
             stopped.set()
