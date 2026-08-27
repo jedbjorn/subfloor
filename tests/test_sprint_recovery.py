@@ -607,8 +607,12 @@ class SprintRecoveryCase(SprintPRWatcherCase):
             "the bounded fallback does not become a recursive recovery loop",
         )
 
-    def test_shell_busy_retries_durably_then_pauses_with_one_notice(self):
-        message = self.send("busy-recovery-chain")
+    def test_assignment_shell_busy_retries_then_pauses_without_provider_run(self):
+        message = self.send(
+            "busy-recovery-chain",
+            kind="work_assignment",
+            actionable=True,
+        )
         original = int(message.wake_id)
         notifications = []
         store = sprint_domain.SprintLifecycleStore(
@@ -660,6 +664,23 @@ class SprintRecoveryCase(SprintPRWatcherCase):
                     event["attempt"],
                     event["backoff_seconds"],
                     event["replacement_wake_id"],
+                ),
+            )
+            self.assertEqual(
+                ("armed", current, 0, 0),
+                tuple(
+                    self.con.execute(
+                        "SELECT s.lifecycle,wm.wake_id,"
+                        "(SELECT COUNT(*) FROM sprint_reports report "
+                        "WHERE report.sprint_id=s.sprint_id "
+                        "AND report.report_kind='pause'),"
+                        "(SELECT COUNT(*) FROM conversation_runs run "
+                        "WHERE run.harness_session_after IS NOT NULL "
+                        "OR run.runner_ref IS NOT NULL) "
+                        "FROM sprints s JOIN sprint_wake_messages wm "
+                        "ON wm.message_id=? WHERE s.sprint_id=?",
+                        (message.message_id, self.sprint_id),
+                    ).fetchone()
                 ),
             )
             before_changes = self.con.total_changes

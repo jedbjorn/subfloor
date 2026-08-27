@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """Sprints v2 lifecycle authority, arming transaction, and service gate.
 
 This module deliberately owns no GitHub or harness effects.  It commits the
@@ -24,8 +25,8 @@ from conversation_adapters import AdapterError, ProbeResult, adapter_for
 
 ENGINE = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ENGINE / "api"))
-import model_catalog
-import route_bindings
+import model_catalog  # noqa: E402  (canonical local route evidence)
+import route_bindings  # noqa: E402  (versioned participant route contract)
 
 SPRINT_TRANSITIONS = {
     "prepared": frozenset({"armed", "aborted"}),
@@ -1976,11 +1977,17 @@ class SprintLifecycleStore:
             # duplicates the wake into the same chat under a fresh key.
             if turn["turn_live"]:
                 continue
+            shell_busy = (
+                turn["run_state"] == "failed"
+                and turn["error_code"] == "SHELL_BUSY"
+            )
             # Relays may be recovered under a fresh wake, but an assignment is
             # an execution command.  Once delivery or run ownership exists,
             # changing its wake key would mint a second conversation identity
             # and replay the prompt.  Preserve the original identity and stop
             # for operator judgment, including when the evidence is ambiguous.
+            # SHELL_BUSY is positive pre-dispatch evidence and remains eligible
+            # for the bounded contention recovery below.
             assignment_execution_exists = (
                 row["assignment_message_id"] is not None
                 and (
@@ -1990,7 +1997,7 @@ class SprintLifecycleStore:
                     or turn["native_run_ref"] is not None
                 )
             )
-            if assignment_execution_exists:
+            if assignment_execution_exists and not shell_busy:
                 evidence_valid = self._pickup_turn_evidence_valid(row, turn)
                 run_state = turn["run_state"]
                 failure_class, error_code = {
@@ -2037,10 +2044,6 @@ class SprintLifecycleStore:
                     tuple(sorted(set(replacements))),
                     pause_receipt,
                 )
-            shell_busy = (
-                turn["run_state"] == "failed"
-                and turn["error_code"] == "SHELL_BUSY"
-            )
             busy_prefix = f"sprint-recovery:{sprint_id}:busy:"
             busy_recovery = wake_key.startswith(busy_prefix)
             if ":failed-wake:" in wake_key:
@@ -3527,14 +3530,14 @@ class SprintParticipantStore:
             raise SprintPreflightError(
                 exc.message, code=exc.code, details=exc.details
             ) from exc
-        if model is not None and (
-            not isinstance(model, str) or not model or model != model.strip()
-        ):
-            raise ValueError("participant model must be an exact non-empty selector")
-        if effort is not None and (
-            not isinstance(effort, str) or not effort.strip()
-        ):
-            raise ValueError("participant effort must be non-empty when supplied")
+        if model is not None:
+            if not isinstance(model, str) or not model or model != model.strip():
+                raise ValueError(
+                    "participant model must be an exact non-empty selector"
+                )
+        if effort is not None:
+            if not isinstance(effort, str) or not effort.strip():
+                raise ValueError("participant effort must be non-empty when supplied")
         if route is not None:
             route = route.strip()
             if not route:

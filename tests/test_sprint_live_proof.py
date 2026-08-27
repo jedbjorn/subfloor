@@ -41,11 +41,12 @@ import mem
 import model_catalog
 import route_bindings
 import route_transport
+import run as run_mod
 import server
+import sprint_participant_chats
 import sprint_cli
 import sprint_domain
 import sprint_message_delivery
-import sprint_participant_chats
 import sprint_pr_watcher
 import sprint_runtime
 from conversation_adapters.base import NativeTurn, NormalizedEvent
@@ -1651,10 +1652,8 @@ class SprintBoundRouteDispatchProof(unittest.TestCase):
             (
                 "pending",
                 1,
-                (
-                    "native_route_unavailable: Bound native option is not "
-                    "advertised by the current harness"
-                ),
+                "native_route_unavailable: Bound native option is not "
+                "advertised by the current harness",
             ),
         )
 
@@ -2030,10 +2029,8 @@ class SprintBoundRouteDispatchProof(unittest.TestCase):
             (
                 "pending",
                 1,
-                (
-                    "route_evidence_stale: Stored Sprint route has no immutable "
-                    "harness-version evidence"
-                ),
+                "route_evidence_stale: Stored Sprint route has no immutable "
+                "harness-version evidence",
             ),
         )
         self.assertEqual(
