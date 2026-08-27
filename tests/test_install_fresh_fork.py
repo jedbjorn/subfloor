@@ -1,15 +1,20 @@
 """Fresh-fork installer completion regression coverage."""
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import os
 import re
 import shutil
+import socket
+import sqlite3
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
+import urllib.request
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -180,9 +185,120 @@ class FreshForkInstallTest(unittest.TestCase):
                 "XDG_STATE_HOME": str(home / ".local/state"),
                 "NO_COLOR": "1",
             },
-            args=["--skip-harness-install", "--username", "Gate"],
+            args=["--force", "--skip-harness-install", "--username", "Gate"],
             timeout=120,
         )
+
+    def fetch_json(self, url: str) -> dict:
+        with urllib.request.urlopen(url, timeout=2) as response:
+            self.assertEqual(response.status, 200)
+            return json.loads(response.read())
+
+    @contextlib.contextmanager
+    def live_api(self, repo: Path, home: Path):
+        with socket.socket() as probe:
+            probe.bind(("127.0.0.1", 0))
+            port = probe.getsockname()[1]
+        with tempfile.TemporaryFile(mode="w+") as log:
+            process = subprocess.Popen(
+                [
+                    sys.executable,
+                    str(repo / ".super-coder/api/server.py"),
+                    "--port",
+                    str(port),
+                ],
+                cwd=repo,
+                env={
+                    **os.environ,
+                    "HOME": str(home),
+                    "PYTHONDONTWRITEBYTECODE": "1",
+                    "SC_BIND": "127.0.0.1",
+                },
+                stdout=log,
+                stderr=subprocess.STDOUT,
+                text=True,
+            )
+            try:
+                base = f"http://127.0.0.1:{port}"
+                deadline = time.monotonic() + 20
+                while True:
+                    try:
+                        self.fetch_json(f"{base}/api/health")
+                        break
+                    except (OSError, ValueError) as exc:
+                        if process.poll() is not None or time.monotonic() >= deadline:
+                            log.seek(0)
+                            self.fail(
+                                "fresh-install API did not become ready: "
+                                f"{exc}\n{log.read()}"
+                            )
+                        time.sleep(0.05)
+                yield base
+            finally:
+                if process.poll() is None:
+                    process.terminate()
+                    try:
+                        process.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                        process.wait(timeout=5)
+
+    def test_installer_help_forms_are_repository_and_state_pure(self) -> None:
+        cases = (
+            ["-h"],
+            ["--help"],
+            [
+                "--force",
+                "--skip-harness-install",
+                "--username",
+                "Gate",
+                "--flavor",
+                "planner",
+                "--help",
+            ],
+        )
+        for args in cases:
+            with self.subTest(args=args), tempfile.TemporaryDirectory() as raw:
+                repo, home = self.prepare_repo(raw)
+                before_repo = self.snapshot_tree(repo)
+                before_home = self.snapshot_tree(home)
+                before_index = subprocess.run(
+                    ["git", "status", "--porcelain=v1"],
+                    cwd=repo,
+                    capture_output=True,
+                    text=True,
+                    check=True,
+                ).stdout
+
+                result = subprocess.run(
+                    [str(repo / "sc"), "install", *args],
+                    cwd=repo,
+                    env={
+                        **os.environ,
+                        "HOME": str(home),
+                        "SC_PYTHON": sys.executable,
+                        "PYTHONDONTWRITEBYTECODE": "1",
+                    },
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                    check=False,
+                )
+
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn("Usage: ./sc install [options]", result.stdout)
+                self.assertIn("--skip-harness-install", result.stdout)
+                self.assertNotIn("Installed ✓", result.stdout)
+                self.assertEqual(self.snapshot_tree(repo), before_repo)
+                self.assertEqual(self.snapshot_tree(home), before_home)
+                after_index = subprocess.run(
+                    ["git", "status", "--porcelain=v1"],
+                    cwd=repo,
+                    capture_output=True,
+                    text=True,
+                    check=True,
+                ).stdout
+                self.assertEqual(after_index, before_index)
 
     def test_noninteractive_install_reaches_durable_completion_marker(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
@@ -219,6 +335,54 @@ class FreshForkInstallTest(unittest.TestCase):
                 [str(repo.resolve())],
             )
             self.assertIn("subfloor managed PATH", (home / ".profile").read_text())
+
+            database = repo / ".super-coder/shell_db.db"
+            with sqlite3.connect(database) as con:
+                self.assertEqual(
+                    con.execute(
+                        "SELECT username FROM users WHERE is_active=1"
+                    ).fetchall(),
+                    [("Gate",)],
+                )
+                self.assertEqual(
+                    con.execute(
+                        "SELECT flavor,COUNT(*) FROM shells "
+                        "WHERE COALESCE(is_deleted,0)=0 GROUP BY flavor"
+                    ).fetchall(),
+                    [
+                        ("admin", 1),
+                        ("cartographer", 1),
+                        ("dev", 4),
+                        ("planner", 2),
+                        ("reviewer", 2),
+                    ],
+                )
+
+            with self.live_api(repo, home) as base:
+                shells = self.fetch_json(f"{base}/api/shells")["shells"]
+                self.assertEqual(len(shells), 10)
+                self.assertEqual(
+                    {shell["shortname"] for shell in shells},
+                    {
+                        "ADM1",
+                        "CART1",
+                        "DEV1",
+                        "DEV2",
+                        "DEV3",
+                        "DEV4",
+                        "PLN1",
+                        "PLN2",
+                        "REV1",
+                        "REV2",
+                    },
+                )
+                conversations = self.fetch_json(
+                    f"{base}/api/conversations?open=true&limit=100"
+                )
+                self.assertEqual(
+                    conversations,
+                    {"items": [], "next_cursor": None},
+                )
 
     def test_direct_installer_rejects_other_python_minors_before_mutation(self) -> None:
         for version in ((3, 13, 9), (3, 15, 0)):
