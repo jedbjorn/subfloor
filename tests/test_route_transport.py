@@ -204,6 +204,63 @@ class RouteTransportTest(unittest.TestCase):
                 self.assertEqual(projection.native_variant_id, "MAX.Future")
                 self.assertFalse((self.root / "opencode.json").exists())
 
+    def test_opencode_live_native_headless_sends_exact_model_and_variant(self):
+        binding, digest = route_transport.route_bindings.live_native_v3_binding(
+            "opencode",
+            "Ollama-Cloud/GLM-5.2",
+            "GLM-5.2",
+            "MaX.Future",
+        )
+        projection = route_transport.project(
+            binding,
+            digest,
+            expected_harness="opencode",
+            worktree=self.root,
+            interface="headless",
+        )
+
+        command = run.headless_command(
+            run.load_adapter("opencode"),
+            "dispatch exactly once",
+            transport=projection,
+        )
+
+        self.assertEqual(command, [
+            "opencode", "run", "--model", "Ollama-Cloud/GLM-5.2",
+            "--variant", "MaX.Future", "dispatch exactly once",
+        ])
+        self.assertNotIn("--agent", command)
+        self.assertFalse((self.root / "opencode.json").exists())
+
+    def test_opencode_live_native_headless_default_omits_variant(self):
+        binding, digest = route_transport.route_bindings.live_native_v3_binding(
+            "opencode",
+            "Ollama-Cloud/GLM-5.2",
+            "GLM-5.2",
+            None,
+        )
+        projection = route_transport.project(
+            binding,
+            digest,
+            expected_harness="opencode",
+            worktree=self.root,
+            interface="headless",
+        )
+
+        command = run.headless_command(
+            run.load_adapter("opencode"),
+            "dispatch exactly once",
+            transport=projection,
+        )
+
+        self.assertEqual(command, [
+            "opencode", "run", "--model", "Ollama-Cloud/GLM-5.2",
+            "dispatch exactly once",
+        ])
+        self.assertNotIn("--variant", command)
+        self.assertNotIn("--agent", command)
+        self.assertFalse((self.root / "opencode.json").exists())
+
     def test_live_native_headless_null_option_invokes_harness_default(self):
         for harness in ("opencode", "deepseek"):
             with self.subTest(harness=harness):

@@ -102,6 +102,33 @@ def v2_context(
     )
 
 
+def v3_opencode_context(
+    root: Path,
+    *,
+    provider: str = "openai",
+    model: str = "gpt-test",
+    variant: str | None = "MAX.Future",
+) -> ConversationContext:
+    requested_model = f"{provider}/{model}"
+    binding, digest = (
+        opencode_adapter.route_transport.route_bindings.live_native_v3_binding(
+            "opencode",
+            requested_model,
+            model,
+            variant,
+        )
+    )
+    return ConversationContext(
+        worktree=root,
+        provider=provider,
+        model=requested_model,
+        effort=variant,
+        env={},
+        route_binding=binding,
+        binding_digest=digest,
+    )
+
+
 def kimi_step_event(
     event_type: str,
     *,
@@ -1232,6 +1259,126 @@ class ConversationAdapterTest(unittest.TestCase):
         })
         self.assertIn("shell", configured)
 
+    def test_opencode_v3_sends_exact_model_and_variant_on_start_and_resume(self):
+        native = FakeOpenCode()
+        native.provider_state["all"][0]["models"]["gpt-test"]["variants"] = {
+            "MAX.Future": {
+                "reasoningEffort": "ignored-by-super-coder",
+                "futureNativeKey": {"enabled": True},
+            },
+        }
+        adapter = OpenCodeAdapter(
+            transport=native,
+            shell_runtime_dir=self.root / "runtime-shells",
+        )
+        context = v3_opencode_context(self.root)
+
+        with mock.patch.object(
+            opencode_adapter.opencode_config,
+            "ensure_live_route_agent",
+        ) as ensure_route_agent:
+            first = adapter.start(context, "first")
+            list(adapter.stream(first))
+            resumed = adapter.resume(first.session_ref, context, "second")
+            list(adapter.stream(resumed))
+
+        ensure_route_agent.assert_not_called()
+
+        prompts = [
+            request for request in native.requests
+            if request[1].endswith("/message")
+        ]
+        self.assertEqual([request[3] for request in prompts], [
+            {
+                "parts": [{"type": "text", "text": "first"}],
+                "model": {"providerID": "openai", "modelID": "gpt-test"},
+                "variant": "MAX.Future",
+            },
+            {
+                "parts": [{"type": "text", "text": "second"}],
+                "model": {"providerID": "openai", "modelID": "gpt-test"},
+                "variant": "MAX.Future",
+            },
+        ])
+        self.assertEqual(
+            len([request for request in native.requests if request[:2] == (
+                "GET", "/provider"
+            )]),
+            2,
+        )
+        self.assertEqual(
+            len([request for request in native.requests if request[:2] == (
+                "POST", "/session"
+            )]),
+            1,
+        )
+        configured = json.loads((self.root / "opencode.json").read_text())
+        self.assertNotIn("agent", configured)
+
+    def test_opencode_v3_harness_default_omits_variant_on_every_prompt(self):
+        native = FakeOpenCode()
+        adapter = OpenCodeAdapter(
+            transport=native,
+            shell_runtime_dir=self.root / "runtime-shells",
+        )
+        context = v3_opencode_context(self.root, variant=None)
+
+        first = adapter.start(context, "first")
+        list(adapter.stream(first))
+        resumed = adapter.resume(first.session_ref, context, "second")
+        list(adapter.stream(resumed))
+
+        prompts = [
+            request[3] for request in native.requests
+            if request[1].endswith("/message")
+        ]
+        self.assertEqual(len(prompts), 2)
+        self.assertEqual(
+            [prompt["model"] for prompt in prompts],
+            [
+                {"providerID": "openai", "modelID": "gpt-test"},
+                {"providerID": "openai", "modelID": "gpt-test"},
+            ],
+        )
+        self.assertEqual(
+            [("variant" in prompt, "agent" in prompt) for prompt in prompts],
+            [(False, False), (False, False)],
+        )
+
+    def test_opencode_v3_disappeared_variant_refuses_resumed_prompt(self):
+        native = FakeOpenCode()
+        native.provider_state["all"][0]["models"]["gpt-test"]["variants"] = {
+            "MAX.Future": {},
+        }
+        adapter = OpenCodeAdapter(
+            transport=native,
+            shell_runtime_dir=self.root / "runtime-shells",
+        )
+        context = v3_opencode_context(self.root)
+
+        first = adapter.start(context, "first")
+        list(adapter.stream(first))
+        native.provider_state["all"][0]["models"]["gpt-test"]["variants"] = {}
+
+        with self.assertRaisesRegex(AdapterError, "native_route_unavailable"):
+            adapter.resume(first.session_ref, context, "must not dispatch")
+
+        self.assertEqual(
+            len([
+                request for request in native.requests
+                if request[1].endswith("/message")
+            ]),
+            1,
+        )
+        self.assertEqual(
+            len([request for request in native.requests if request[:2] == (
+                "GET", f"/session/{native.session_ref}"
+            )]),
+            0,
+        )
+        configured = json.loads((self.root / "opencode.json").read_text())
+        self.assertNotIn("agent", configured)
+
     def test_opencode_replaces_stale_route_agent_from_live_native_payload(self):
         native = FakeOpenCode()
         native.provider_state["all"][0]["models"]["gpt-test"]["variants"][
@@ -1294,6 +1441,9 @@ class ConversationAdapterTest(unittest.TestCase):
 
     def test_opencode_transport_rejection_is_one_terminal_dispatch(self):
         native = FakeOpenCode()
+        native.provider_state["all"][0]["models"]["gpt-test"]["variants"] = {
+            "MAX.Future": {},
+        }
         native.stream = mock.Mock(return_value=iter([
             {
                 "type": "session.status",
@@ -1314,9 +1464,7 @@ class ConversationAdapterTest(unittest.TestCase):
             transport=native,
             shell_runtime_dir=self.root / "runtime-shells",
         )
-        context = v2_context(
-            self.root, "opencode", provider="openai", model="gpt-test"
-        )
+        context = v3_opencode_context(self.root)
 
         turn = adapter.start(context, "dispatch once")
         events = list(adapter.stream(turn))
@@ -1326,9 +1474,11 @@ class ConversationAdapterTest(unittest.TestCase):
         ]
 
         self.assertEqual(len(prompts), 1)
-        self.assertEqual(prompts[0][3]["parts"], [
-            {"type": "text", "text": "dispatch once"}
-        ])
+        self.assertEqual(prompts[0][3], {
+            "parts": [{"type": "text", "text": "dispatch once"}],
+            "model": {"providerID": "openai", "modelID": "gpt-test"},
+            "variant": "MAX.Future",
+        })
         self.assertEqual(events[-1].type, "run.failed")
         self.assertEqual(events[-1].payload["error"], "UnsupportedVariantError")
         self.assertEqual(

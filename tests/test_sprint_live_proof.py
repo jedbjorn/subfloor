@@ -1342,15 +1342,7 @@ class SprintBoundRouteDispatchProof(unittest.TestCase):
         self.assertEqual(broker_run.route_binding["adapter_metadata"], {})
         self.assertEqual(launch["route_binding"], broker_run.route_binding)
         self.assertEqual(projection.native_variant_id, "MAX.Future")
-        self.assertEqual(
-            config["agent"][projection.route_agent],
-            {
-                "mode": "primary",
-                "model": self.SELECTOR,
-                "reasoningEffort": "MAX.Future",
-                "futureNativeKey": {"enabled": True},
-            },
-        )
+        self.assertNotIn("agent", config)
         self.assertEqual(current["native_variant_ids"], {"xhigh": "xhigh"})
         self.assertEqual(
             transport.calls[-1][2],
@@ -1360,7 +1352,7 @@ class SprintBoundRouteDispatchProof(unittest.TestCase):
                     "providerID": "openai",
                     "modelID": "sprint-bound-model",
                 },
-                "agent": projection.route_agent,
+                "variant": "MAX.Future",
             },
         )
 
@@ -1470,15 +1462,7 @@ class SprintBoundRouteDispatchProof(unittest.TestCase):
         self.assertEqual(launch["model"], selector)
         self.assertEqual(launch["effort"], option_id)
         self.assertEqual(projection.native_variant_id, option_id)
-        self.assertEqual(
-            config["agent"][projection.route_agent],
-            {
-                "reasoningEffort": option_id,
-                "futureProviderField": {"preserved": True},
-                "mode": "primary",
-                "model": selector,
-            },
-        )
+        self.assertNotIn("agent", config)
         self.assertEqual(
             transport.calls,
             [
@@ -1492,7 +1476,7 @@ class SprintBoundRouteDispatchProof(unittest.TestCase):
                             "providerID": "ollama-cloud",
                             "modelID": "glm-5.2",
                         },
-                        "agent": projection.route_agent,
+                        "variant": option_id,
                     },
                 ),
             ],
