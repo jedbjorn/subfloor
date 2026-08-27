@@ -333,7 +333,7 @@
   },
   "removal_manifest": {
     "path": ".super-coder/assets/dsh-removal/removal-manifest-v1.json",
-    "sha256": "3c09be1c96ff214fa75fa5c3f69385db162a2f0ff43313f5a06a12bb909ab110"
+    "sha256": "c5d1de0dd305ded5f5b7378c16db03acc5e9da5a8851a778c2dc5c81ff44c48c"
   },
   "runtime_state": {
     "ownership_contract": "sc-dsh-installed-update-fixture-v1",

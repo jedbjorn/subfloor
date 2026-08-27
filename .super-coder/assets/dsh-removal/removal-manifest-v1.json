@@ -1518,16 +1518,16 @@
       "sha256": "a07163d2ec6fc7139aef09ef8ff38ea9f11c3fddd7c944faa4a1d4db087eeb21"
     },
     {
-      "bytes": 24174,
+      "bytes": 24444,
       "ownership": "retained-shared-source",
       "path": "tests/fixtures/sprint_removal/build_pre_removal_fixture.py",
-      "sha256": "77d1eb9d2cf39f05b218fad10279fb011f66e7ec7cced50e44a5713d90bf1177"
+      "sha256": "043e91179c74e52678a6207eca04fe216d36a2143a7836dd41fe07704bcf585f"
     },
     {
-      "bytes": 51697,
+      "bytes": 51967,
       "ownership": "retained-shared-source",
       "path": "tests/fixtures/sprint_removal/manifest.json",
-      "sha256": "3f496c54e8b6fed00a03268feb972f74c05a7a6f667cc84dd220983dbf02d642"
+      "sha256": "559adf330c59b2c15be513dcfef900c77ebb77338a704ce43ac612817794efb1"
     },
     {
       "bytes": 9808,

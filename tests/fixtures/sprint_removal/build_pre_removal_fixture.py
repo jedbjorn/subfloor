@@ -32,6 +32,7 @@ ALLOWED_REFERENCE_FILES = (
     ".super-coder/adapters/codex/adapter.json",
     ".super-coder/adapters/deepseek/adapter.json",
     ".super-coder/assets/deepseek/dsh-shell-authority-contract.json",
+    ".super-coder/assets/dsh-removal/removal-manifest-v1.json",
     ".super-coder/adapters/kimi/adapter.json",
     ".super-coder/adapters/opencode/adapter.json",
     ".super-coder/adapters/vibe/adapter.json",
@@ -40,9 +41,13 @@ ALLOWED_REFERENCE_FILES = (
     "tests/fixtures/sprint_removal/build_pre_removal_fixture.py",
     "tests/fixtures/sprint_removal/manifest.json",
     "tests/fixtures/sprint_removal/pre_removal.sql",
+    "tests/fixtures/dsh_removal/build_fixtures.py",
+    "tests/fixtures/dsh_removal/compatibility-floor.json",
+    "tests/fixtures/dsh_removal/pre-bridge.json",
     "tests/test_dos_app_sprint_canary.py",
     "tests/test_deepseek_dsh_preparation.py",
     "tests/test_sprint_removal_manifest.py",
+    "tests/test_dsh_removal_preparation.py",
     "tests/test_harness_surfaces.py",
 )
 SOURCE_REFERENCE_PATTERN = (

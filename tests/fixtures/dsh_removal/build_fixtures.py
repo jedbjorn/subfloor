@@ -329,7 +329,7 @@ def build_manifest() -> dict[str, object]:
     }
 
 
-def build_payload(manifest: dict[str, object]) -> bytes:
+def build_payload_tar(manifest: dict[str, object]) -> bytes:
     raw = io.BytesIO()
     with tarfile.open(fileobj=raw, mode="w", format=tarfile.PAX_FORMAT) as archive:
         for artifact in manifest["tracked_artifacts"]:
@@ -343,7 +343,11 @@ def build_payload(manifest: dict[str, object]) -> bytes:
             info.uname = info.gname = ""
             with source.open("rb") as handle:
                 archive.addfile(info, handle)
-    return gzip.compress(raw.getvalue(), compresslevel=9, mtime=0)
+    return raw.getvalue()
+
+
+def build_payload(manifest: dict[str, object]) -> bytes:
+    return gzip.compress(build_payload_tar(manifest), compresslevel=9, mtime=0)
 
 
 def fixture_rows() -> dict[str, list[dict[str, object]]]:
@@ -482,10 +486,14 @@ def floor_fixture(*, floor: str, payload_sha256: str, manifest_sha256: str) -> d
     }
 
 
-def render() -> dict[Path, bytes]:
+def render(*, reuse_payload: bool = False) -> dict[Path, bytes]:
     manifest = build_manifest()
     manifest_bytes = (json.dumps(manifest, indent=2, sort_keys=True) + "\n").encode()
-    payload = build_payload(manifest)
+    payload = (
+        PAYLOAD_PATH.read_bytes()
+        if reuse_payload and PAYLOAD_PATH.exists()
+        else build_payload(manifest)
+    )
     common = {
         "payload_sha256": sha256_bytes(payload),
         "manifest_sha256": sha256_bytes(manifest_bytes),
@@ -504,7 +512,7 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--check", action="store_true")
     args = parser.parse_args()
-    outputs = render()
+    outputs = render(reuse_payload=args.check)
     stale: list[str] = []
     for path, body in outputs.items():
         if args.check:

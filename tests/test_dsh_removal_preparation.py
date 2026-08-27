@@ -124,7 +124,7 @@ def materialize_fixture(root: Path, fixture: dict) -> None:
 
 class DshRemovalPreparationTest(unittest.TestCase):
     def test_generated_inventory_and_fixtures_are_byte_exact(self) -> None:
-        rendered = FIXTURES.render()
+        rendered = FIXTURES.render(reuse_payload=True)
         self.assertEqual(
             {
                 str(MANIFEST_PATH),
@@ -166,6 +166,7 @@ class DshRemovalPreparationTest(unittest.TestCase):
         manifest = load(MANIFEST_PATH)
         expected = {row["path"]: row["sha256"] for row in manifest["tracked_artifacts"]}
         tar_bytes = gzip.decompress(PAYLOAD_PATH.read_bytes())
+        self.assertEqual(FIXTURES.build_payload_tar(manifest), tar_bytes)
         with tarfile.open(fileobj=io.BytesIO(tar_bytes), mode="r:") as archive:
             members = archive.getmembers()
             actual = {
