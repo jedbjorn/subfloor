@@ -1392,6 +1392,43 @@ class ConversationAdapterTest(unittest.TestCase):
         self.assertEqual(recovered.outcome, "unknown")
         self.assertFalse(recovered.proven)
 
+    def test_opencode_submitted_first_turn_without_activity_fails_precisely(
+        self,
+    ) -> None:
+        class IdleOnlyOpenCode(FakeOpenCode):
+            def stream(self, path, *, query=None):
+                self.stream_calls.append((path, dict(query or {})))
+                return iter(({
+                    "type": "session.idle",
+                    "properties": {"sessionID": self.session_ref},
+                },))
+
+        native = IdleOnlyOpenCode()
+        adapter = OpenCodeAdapter(
+            transport=native,
+            shell_runtime_dir=self.root / "runtime-shells",
+        )
+
+        turn = adapter.start(self.context, "dispatch exactly once")
+        with self.assertRaises(AdapterError) as caught:
+            list(adapter.stream(turn))
+
+        self.assertEqual(caught.exception.code, "HARNESS_SUBMISSION_UNOBSERVED")
+        self.assertEqual(
+            len([
+                request for request in native.requests
+                if request[1].endswith("/message")
+            ]),
+            1,
+        )
+        self.assertEqual(
+            len([
+                request for request in native.requests
+                if request[:2] == ("POST", "/session")
+            ]),
+            1,
+        )
+
     def test_opencode_shared_server_is_not_the_turn_process(self) -> None:
         adapter, _native = self.build("opencode")
         shared_server = mock.Mock(pid=4242)

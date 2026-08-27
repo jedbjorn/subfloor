@@ -1274,6 +1274,12 @@ class OpenCodeAdapter(ConversationAdapter):
                 yield event
                 if event.type in TERMINAL_EVENTS:
                     return
+        if not observed_activity:
+            raise AdapterError(
+                "HARNESS_SUBMISSION_UNOBSERVED",
+                "OpenCode accepted the synchronous first-turn request but "
+                f"reported no activity or terminal event for {turn.session_ref}",
+            )
 
     def interrupt(self, turn: NativeTurn) -> InterruptResult:
         with self._interrupt_lock(turn):

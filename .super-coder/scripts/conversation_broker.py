@@ -1403,6 +1403,7 @@ class ConversationBroker(threading.Thread):
         pending: list[NormalizedEvent] = []
         pending_since: float | None = None
         retry_after = 0.0
+        stream_error: Exception | None = None
         try:
             while not self._stop_event.is_set():
                 now = time.monotonic()
@@ -1438,7 +1439,10 @@ class ConversationBroker(threading.Thread):
                     if not pending:
                         pending_since = time.monotonic()
                     pending.append(item)
-                elif item is _STREAM_END or isinstance(item, Exception):
+                elif isinstance(item, Exception):
+                    stream_error = item
+                    break
+                elif item is _STREAM_END:
                     break
 
                 now = time.monotonic()
@@ -1481,6 +1485,10 @@ class ConversationBroker(threading.Thread):
                     wait=True,
                 ):
                     return False
+            if stream_error is not None:
+                # Preserve synchronous submission evidence. Reconciling an
+                # idle native session here would erase the precise failure.
+                raise stream_error
             return False
         finally:
             stopped.set()

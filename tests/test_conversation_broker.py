@@ -23,6 +23,7 @@ SCRIPTS = ENGINE / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 
 from conversation_adapters import (  # noqa: E402
+    AdapterError,
     ConversationContext,
     InterruptResult,
     KimiAdapter,
@@ -272,6 +273,94 @@ class BlockingOpenCodeTransport:
                     "sessionID": self.session_ref,
                     "field": "text",
                     "delta": f"resumed-{stream_number}",
+                },
+            }
+            yield {
+                "type": "session.idle",
+                "properties": {"sessionID": self.session_ref},
+            }
+
+        return events()
+
+
+class RejectingOpenCodeFirstTurnTransport:
+    """Reproduce WU113's exact idle, empty-session submission failure."""
+
+    def __init__(self) -> None:
+        self.session_ref = "ses_empty_first_turn"
+        self.prompt_count = 0
+        self.native_messages: list[dict] = []
+        self.requests: list[tuple[str, str]] = []
+
+    def request(self, method: str, path: str, *, query=None, body=None):
+        self.requests.append((method, path))
+        if method == "POST" and path == "/session":
+            return {"id": self.session_ref}
+        if method == "POST" and path.endswith("/message"):
+            self.prompt_count += 1
+            raise AdapterError(
+                "HARNESS_SUBMISSION_FAILED",
+                "OpenCode rejected the exact first-turn submission before inference",
+            )
+        if method == "GET" and path == f"/session/{self.session_ref}":
+            return {"id": self.session_ref}
+        if method == "GET" and path == "/session/status":
+            return {self.session_ref: {"type": "idle"}}
+        raise AssertionError(f"unexpected OpenCode request: {method} {path}")
+
+    def stream(self, path: str, *, query=None):
+        return iter(({
+            "type": "session.idle",
+            "properties": {"sessionID": self.session_ref},
+        },))
+
+
+class ConcurrentOpenCodeFirstTurnTransport:
+    """Credential-free exact-session proof for parallel OpenCode prompts."""
+
+    def __init__(self, barrier: threading.Barrier, serial: int) -> None:
+        self.barrier = barrier
+        self.session_ref = f"ses_parallel_{serial}"
+        self.prompt_count = 0
+        self.requests: list[tuple[str, str, dict | None]] = []
+        self.crossed = False
+
+    def request(self, method: str, path: str, *, query=None, body=None):
+        self.requests.append((method, path, body))
+        if method == "POST" and path == "/session":
+            return {"id": self.session_ref}
+        if method == "POST" and path.endswith("/message"):
+            self.prompt_count += 1
+            return {
+                "info": {
+                    "role": "assistant",
+                    "sessionID": self.session_ref,
+                },
+                "parts": [{"type": "text", "text": self.session_ref}],
+            }
+        raise AssertionError(f"unexpected OpenCode request: {method} {path}")
+
+    def stream(self, path: str, *, query=None):
+        def events():
+            yield {
+                "type": "session.idle",
+                "properties": {"sessionID": self.session_ref},
+            }
+            yield {
+                "type": "session.status",
+                "properties": {
+                    "sessionID": self.session_ref,
+                    "status": {"type": "busy"},
+                },
+            }
+            self.barrier.wait(2)
+            self.crossed = True
+            yield {
+                "type": "message.part.delta",
+                "properties": {
+                    "sessionID": self.session_ref,
+                    "field": "text",
+                    "delta": self.session_ref,
                 },
             }
             yield {
@@ -1461,6 +1550,88 @@ class ServiceContractTest(ConversationBrokerCase):
         self.assertTrue(all(adapter.started == 1 for adapter in adapters))
         self.assertTrue(all(adapter.crossed for adapter in adapters))
 
+    def test_opencode_concurrent_first_turns_submit_once_to_exact_sessions(
+        self,
+    ) -> None:
+        barrier = threading.Barrier(2)
+        transports: list[ConcurrentOpenCodeFirstTurnTransport] = []
+
+        def factory(harness: str) -> OpenCodeAdapter:
+            self.assertEqual(harness, "opencode")
+            transport = ConcurrentOpenCodeFirstTurnTransport(
+                barrier, len(transports) + 1
+            )
+            transports.append(transport)
+            return OpenCodeAdapter(
+                transport=transport,
+                shell_runtime_dir=self.root / "opencode-shells",
+            )
+
+        broker = self.start_broker(factory)
+        first = self.add_conversation(
+            shell_id=1,
+            harness="opencode",
+            provider="openai",
+            model="gpt-test",
+        )
+        second = self.add_conversation(
+            shell_id=2,
+            harness="opencode",
+            provider="openai",
+            model="gpt-test",
+        )
+        message_ids = (self.add_message(first), self.add_message(second))
+        broker.notify()
+
+        deadline = time.monotonic() + 3
+        rows = []
+        while time.monotonic() < deadline:
+            with self.connect() as con:
+                rows = con.execute(
+                    "SELECT run_id,trigger_message_id,state,harness_session_after "
+                    "FROM conversation_runs WHERE trigger_message_id IN (?,?) "
+                    "ORDER BY trigger_message_id",
+                    message_ids,
+                ).fetchall()
+            if len(rows) == 2 and all(row["state"] == "succeeded" for row in rows):
+                break
+            time.sleep(0.01)
+
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(
+            {row["trigger_message_id"] for row in rows},
+            set(message_ids),
+        )
+        self.assertEqual(
+            {row["harness_session_after"] for row in rows},
+            {transport.session_ref for transport in transports},
+        )
+        self.assertEqual([transport.prompt_count for transport in transports], [1, 1])
+        self.assertTrue(all(transport.crossed for transport in transports))
+        for transport in transports:
+            self.assertEqual(
+                [request[:2] for request in transport.requests],
+                [
+                    ("POST", "/session"),
+                    ("POST", f"/session/{transport.session_ref}/message"),
+                ],
+            )
+            prompt = transport.requests[1][2]
+            self.assertEqual(
+                prompt["model"],
+                {"providerID": "openai", "modelID": "gpt-test"},
+            )
+        with self.connect() as con:
+            terminal_counts = {
+                int(row["run_id"]): con.execute(
+                    "SELECT COUNT(*) FROM conversation_events "
+                    "WHERE run_id=? AND event_type='run.completed'",
+                    (row["run_id"],),
+                ).fetchone()[0]
+                for row in rows
+            }
+        self.assertEqual(set(terminal_counts.values()), {1})
+
     def test_transient_lease_renewal_contention_stays_recoverable(
         self,
     ) -> None:
@@ -1736,6 +1907,69 @@ class ServiceContractTest(ConversationBrokerCase):
             ],
         )
         self.assertEqual(transport.message_count, 3)
+
+    def test_opencode_first_turn_submission_failure_is_not_reclassified_idle(
+        self,
+    ) -> None:
+        transport = RejectingOpenCodeFirstTurnTransport()
+        adapter = OpenCodeAdapter(
+            transport=transport,
+            shell_runtime_dir=self.root / "opencode-shells",
+        )
+        broker = self.start_broker(
+            lambda harness: adapter if harness == "opencode" else None,
+        )
+        conversation_id = self.add_conversation(harness="opencode")
+        message_id = self.add_message(conversation_id)
+        broker.notify()
+
+        deadline = time.monotonic() + 3
+        row = None
+        while time.monotonic() < deadline:
+            with self.connect() as con:
+                row = con.execute(
+                    "SELECT run_id,state,harness_session_after,error_code,"
+                    "error_detail FROM conversation_runs "
+                    "WHERE trigger_message_id=?",
+                    (message_id,),
+                ).fetchone()
+            if row is not None and row["state"] in {
+                "failed", "unknown", "cancelled", "succeeded"
+            }:
+                break
+            time.sleep(0.01)
+
+        if row is None:
+            self.fail("OpenCode first-turn failure produced no durable run")
+        self.assertEqual(row["state"], "unknown")
+        self.assertEqual(row["harness_session_after"], transport.session_ref)
+        self.assertEqual(row["error_code"], "HARNESS_SUBMISSION_FAILED")
+        self.assertEqual(
+            row["error_detail"],
+            "OpenCode rejected the exact first-turn submission before inference",
+        )
+        self.assertEqual(transport.prompt_count, 1)
+        self.assertEqual(transport.native_messages, [])
+        self.assertEqual(
+            transport.requests.count(("POST", "/session")),
+            1,
+        )
+        self.assertEqual(
+            transport.requests.count(
+                ("POST", f"/session/{transport.session_ref}/message")
+            ),
+            1,
+        )
+        self.assertTrue(broker.wait_idle())
+        with self.connect() as con:
+            self.assertEqual(
+                con.execute(
+                    "SELECT COUNT(*) FROM conversation_runs "
+                    "WHERE conversation_id=?",
+                    (conversation_id,),
+                ).fetchone()[0],
+                1,
+            )
 
     def test_starting_crash_without_exact_identity_becomes_unknown(self) -> None:
         _conversation, _message, run_id = self.add_live_run(state="starting")
