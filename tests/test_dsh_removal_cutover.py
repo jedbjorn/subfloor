@@ -769,6 +769,10 @@ class InstalledTwoHopFixtureTest(unittest.TestCase):
             write_json(materialized_manifest, target_manifest)
             cleanup_script = root / ".super-coder/scripts/dsh_removal_cleanup.py"
             shutil.copy2(SCRIPTS / "dsh_removal_cleanup.py", cleanup_script)
+            shutil.copy2(
+                SCRIPTS / "cli_entry.py",
+                cleanup_script.with_name("cli_entry.py"),
+            )
             for row in target_manifest["tracked_artifacts"]:
                 (root / row["path"]).unlink()
             target_ref = commit(root, "materialized removal target")

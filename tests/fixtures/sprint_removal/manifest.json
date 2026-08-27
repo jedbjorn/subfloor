@@ -53,6 +53,7 @@
     "tests/fixtures/dsh_removal/pre-bridge.json",
     "tests/test_dos_app_sprint_canary.py",
     "tests/test_deepseek_dsh_preparation.py",
+    "tests/test_dsh_removal_cutover.py",
     "tests/skill_convergence_fixtures.py",
     "tests/test_sprint_entrypoint_removal.py",
     "tests/test_sprint_removal_manifest.py",
