@@ -14,6 +14,7 @@ from sprint_domain import (
     LifecycleActor,
     PauseReceipt,
     ResumeReceipt,
+    SprintInvariantError,
     SprintLifecycleStore,
 )
 from sprint_pr_watcher import SprintPRWatcher
@@ -97,6 +98,11 @@ class SprintRecoveryCoordinator:
         )
         native_anomalies = self.native_reconciler(native_run_ids)
         observations, pr_anomalies = self._read_registered_prs(sprint_id)
+        if pr_anomalies:
+            raise SprintInvariantError(
+                "Sprint resume requires complete registered PR reconciliation: "
+                + "; ".join(pr_anomalies)
+            )
         anomalies = (*native_anomalies, *pr_anomalies)
         resolved_review_message_ids: list[int] = []
 

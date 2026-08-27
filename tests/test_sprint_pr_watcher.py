@@ -52,6 +52,7 @@ class FakeReader:
     def __init__(self, current: PullRequest | Exception) -> None:
         self.current = current
         self.by_number: dict[int, PullRequest] = {}
+        self.listed_by_number: dict[int, PullRequest] | None = None
         self.get_calls: list[int] = []
         self.list_calls = 0
 
@@ -65,6 +66,8 @@ class FakeReader:
         self.list_calls += 1
         if isinstance(self.current, Exception):
             raise self.current
+        if self.listed_by_number is not None:
+            return list(self.listed_by_number.values())
         return list(self.by_number.values()) or [self.current]
 
 
@@ -2020,6 +2023,39 @@ class BatchAndNormalizationTest(SprintPRWatcherCase):
                     "FROM sprint_registered_prs p "
                     "JOIN sprint_pr_transitions t USING (registered_pr_id) "
                     "ORDER BY p.pr_number"
+                )
+            ],
+        )
+
+    def test_batch_read_restores_missing_base_sha_only_for_subscriptions(self):
+        self.reader.by_number = {
+            42: pull_request(number=42),
+            43: pull_request(number=43),
+        }
+        self.register(number=42)
+        self.register(number=43)
+        self.reader.listed_by_number = {
+            number: replace(item, base_sha=None)
+            for number, item in self.reader.by_number.items()
+        }
+        get_count = len(self.reader.get_calls)
+
+        self.assertTrue(self.watcher.poll_once())
+
+        self.assertEqual(1, self.reader.list_calls)
+        self.assertEqual([42, 43], self.reader.get_calls[get_count:])
+        self.assertEqual(
+            [(42, "c" * 40), (43, "c" * 40)],
+            [
+                (
+                    int(row["pr_number"]),
+                    json.loads(row["evidence"])["base_sha"],
+                )
+                for row in self.con.execute(
+                    "SELECT registered.pr_number,transition.evidence "
+                    "FROM sprint_registered_prs registered "
+                    "JOIN sprint_pr_transitions transition "
+                    "USING (registered_pr_id) ORDER BY registered.pr_number"
                 )
             ],
         )

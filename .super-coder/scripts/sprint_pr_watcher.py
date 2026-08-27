@@ -1073,7 +1073,7 @@ class SprintPRWatcher:
                     continue
                 for row in repo_rows:
                     pull_request = listed.get(int(row["pr_number"]))
-                    if pull_request is None:
+                    if pull_request is None or pull_request.base_sha is None:
                         self._read_exact(reader, row, trigger)
                         continue
                     self._observe(row, pull_request, trigger)

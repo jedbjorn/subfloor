@@ -13,17 +13,22 @@ import os
 import signal
 import subprocess
 from collections.abc import Callable, Iterable
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any
 
 LIST_LIMIT = 300
 MAX_RESPONSE_BYTES = 2 * 1024 * 1024
 GITHUB_TIMEOUT_SECONDS = 20.0
+_COMPAT_FIELDS = (
+    "number,headRefName,baseRefName,headRefOid,state,mergedAt,mergeCommit,"
+    "title,url,reviewDecision,statusCheckRollup"
+)
 _FIELDS = (
     "number,headRefName,baseRefName,baseRefOid,headRefOid,state,mergedAt,mergeCommit,"
     "title,url,reviewDecision,statusCheckRollup"
 )
+_BASE_REF_OID_SUPPORTED: bool | None = None
 _STATES = frozenset({"OPEN", "MERGED", "CLOSED"})
 _HEX = frozenset("0123456789abcdef")
 _FAILED_CHECKS = frozenset(
@@ -244,6 +249,9 @@ class GitHubPullRequestReader:
         self.runner = runner
         self.timeout = timeout
         self.max_response_bytes = max_response_bytes
+        self._base_ref_oid_supported = (
+            _BASE_REF_OID_SUPPORTED if runner is _run_read_process else None
+        )
 
     def _repo_args(self) -> list[str]:
         return ["--repo", self.repository] if self.repository else []
@@ -276,8 +284,53 @@ class GitHubPullRequestReader:
             raise GitHubReadError(_safe_error(result.stderr))
         return text
 
-    def list(self) -> list[PullRequest]:
+    def _remember_base_ref_oid_support(self, supported: bool) -> None:
+        global _BASE_REF_OID_SUPPORTED
+
+        self._base_ref_oid_supported = supported
+        if self.runner is _run_read_process:
+            _BASE_REF_OID_SUPPORTED = supported
+
+    @staticmethod
+    def _missing_base_ref_oid_field(exc: GitHubReadError) -> bool:
+        message = str(exc)
+        return "Unknown JSON field" in message and '"baseRefOid"' in message
+
+    def _run_pr_json(self, args: list[str]) -> tuple[str, bool]:
+        """Read PR JSON, falling back when an older gh lacks baseRefOid."""
+        include_base_sha = self._base_ref_oid_supported is not False
+        fields = _FIELDS if include_base_sha else _COMPAT_FIELDS
+        try:
+            raw = self._run([*args, "--json", fields, *self._repo_args()])
+        except GitHubReadError as exc:
+            if not include_base_sha or not self._missing_base_ref_oid_field(exc):
+                raise
+            self._remember_base_ref_oid_support(False)
+            raw = self._run(
+                [*args, "--json", _COMPAT_FIELDS, *self._repo_args()]
+            )
+            return raw, True
+        self._remember_base_ref_oid_support(include_base_sha)
+        return raw, not include_base_sha
+
+    def _read_base_sha(self, number: int) -> str:
+        repository = self.repository or "{owner}/{repo}"
         raw = self._run(
+            [
+                "gh",
+                "api",
+                f"repos/{repository}/pulls/{number}",
+                "--jq",
+                ".base.sha",
+            ]
+        )
+        base_sha = _sha_value(raw)
+        if base_sha is None:
+            raise GitHubReadError("GitHub PR response has no valid base commit SHA")
+        return base_sha
+
+    def list(self) -> list[PullRequest]:
+        raw, _ = self._run_pr_json(
             [
                 "gh",
                 "pr",
@@ -286,9 +339,6 @@ class GitHubPullRequestReader:
                 "all",
                 "--limit",
                 str(LIST_LIMIT),
-                "--json",
-                _FIELDS,
-                *self._repo_args(),
             ]
         )
         try:
@@ -304,9 +354,8 @@ class GitHubPullRequestReader:
     def get(self, number: int) -> PullRequest:
         if not isinstance(number, int) or number < 1:
             raise ValueError("PR number must be a positive integer")
-        raw = self._run(
-            ["gh", "pr", "view", str(number), "--json", _FIELDS,
-             *self._repo_args()]
+        raw, restore_base_sha = self._run_pr_json(
+            ["gh", "pr", "view", str(number)]
         )
         try:
             payload = json.loads(raw)
@@ -314,7 +363,12 @@ class GitHubPullRequestReader:
             raise GitHubReadError("GitHub PR read returned invalid JSON") from exc
         if not isinstance(payload, dict):
             raise GitHubReadError("GitHub PR read returned an invalid payload")
-        return normalize_pull_request(payload)
+        pull_request = normalize_pull_request(payload)
+        return (
+            replace(pull_request, base_sha=self._read_base_sha(number))
+            if restore_base_sha
+            else pull_request
+        )
 
     def patch(self, number: int) -> str:
         if not isinstance(number, int) or number < 1:
