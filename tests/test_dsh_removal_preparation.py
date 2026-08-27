@@ -94,15 +94,11 @@ def materialize_fixture(root: Path, fixture: dict) -> None:
     state = root / ".sc-state"
     (state / "local/dsh-removal").mkdir(parents=True)
     (engine / "run").mkdir(parents=True, exist_ok=True)
-    (engine / "assets/dsh-removal").mkdir(parents=True, exist_ok=True)
     (engine / "instance.json").write_text(
         json.dumps(fixture["instance"], sort_keys=True) + "\n"
     )
     (engine / "run/deepseek-web.json").write_text(
         json.dumps(fixture["runtime_state"], sort_keys=True) + "\n"
-    )
-    (engine / "assets/dsh-removal/removal-manifest-v1.json").write_bytes(
-        MANIFEST_PATH.read_bytes()
     )
     (state / "engine.ref").write_text(fixture["installed_engine_ref"] + "\n")
     control = fixture["compatibility_control"]
@@ -123,21 +119,10 @@ def materialize_fixture(root: Path, fixture: dict) -> None:
 
 
 class DshRemovalPreparationTest(unittest.TestCase):
-    def test_generated_inventory_and_fixtures_are_byte_exact(self) -> None:
-        rendered = FIXTURES.render(reuse_payload=True)
-        self.assertEqual(
-            {
-                str(MANIFEST_PATH),
-                str(PAYLOAD_PATH),
-                str(PRE_BRIDGE_PATH),
-                str(COMPATIBILITY_PATH),
-            },
-            {str(path) for path in rendered},
-        )
-        for path, expected in rendered.items():
-            self.assertEqual(expected, path.read_bytes(), str(path))
+    def test_committed_inventory_and_fixtures_are_internally_exact(self) -> None:
+        self.assertEqual([], FIXTURES.frozen_validation_errors())
 
-    def test_manifest_partitions_every_current_dsh_reference(self) -> None:
+    def test_manifest_freezes_disjoint_pre_removal_reference_partitions(self) -> None:
         manifest = load(MANIFEST_PATH)
         partitions = [
             manifest["tracked_artifacts"],
@@ -146,7 +131,6 @@ class DshRemovalPreparationTest(unittest.TestCase):
             manifest["immutable_reference_migrations"],
         ]
         paths = [row["path"] for group in partitions for row in group]
-        self.assertEqual(FIXTURES.reference_files(), sorted(paths))
         self.assertEqual(len(paths), len(set(paths)))
         self.assertEqual(26, len(manifest["tracked_artifacts"]))
         self.assertIn(
@@ -157,6 +141,19 @@ class DshRemovalPreparationTest(unittest.TestCase):
             ".super-coder/api/model_catalog.py",
             {row["path"] for row in manifest["shared_sources"]},
         )
+        self.assertIn(
+            ".dockerignore",
+            {row["path"] for row in manifest["shared_sources"]},
+        )
+        self.assertEqual(
+            [".dockerignore", ".gitignore"], manifest["scan"]["roots"][:2]
+        )
+        self.assertEqual(
+            "committed-artifact-internal-consistency-only",
+            manifest["freeze_policy"]["ci_validation"],
+        )
+        self.assertIn("--refresh", manifest["freeze_policy"]["refresh_command"])
+        self.assertIn("forbidden", manifest["freeze_policy"]["refresh_boundary"])
         self.assertNotIn(
             ".super-coder/migrations/0227_deepseek_controlled_route_binding.sql",
             {row["path"] for row in manifest["tracked_artifacts"]},
@@ -166,7 +163,6 @@ class DshRemovalPreparationTest(unittest.TestCase):
         manifest = load(MANIFEST_PATH)
         expected = {row["path"]: row["sha256"] for row in manifest["tracked_artifacts"]}
         tar_bytes = gzip.decompress(PAYLOAD_PATH.read_bytes())
-        self.assertEqual(FIXTURES.build_payload_tar(manifest), tar_bytes)
         with tarfile.open(fileobj=io.BytesIO(tar_bytes), mode="r:") as archive:
             members = archive.getmembers()
             actual = {
@@ -179,6 +175,30 @@ class DshRemovalPreparationTest(unittest.TestCase):
             FIXTURES.sha256_bytes(PAYLOAD_PATH.read_bytes()),
             load(PRE_BRIDGE_PATH)["tracked_payload"]["sha256"],
         )
+
+    def test_refresh_is_rejected_after_frozen_inputs_change(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            frozen = root / "frozen.py"
+            frozen.write_text("old\n")
+            manifest = {
+                "tracked_artifacts": [
+                    {
+                        "path": "frozen.py",
+                        "sha256": FIXTURES.sha256_file(frozen),
+                    }
+                ],
+                "shared_sources": [],
+                "verification_sources": [],
+                "immutable_reference_migrations": [],
+                "immutable_migration_ledger": [],
+            }
+            self.assertEqual([], FIXTURES.refresh_floor_errors(manifest, root=root))
+            frozen.write_text("new\n")
+            self.assertEqual(
+                ["changed frozen input: frozen.py"],
+                FIXTURES.refresh_floor_errors(manifest, root=root),
+            )
 
     def test_migration_floor_pins_every_existing_file_and_dsh_history(self) -> None:
         manifest = load(MANIFEST_PATH)
@@ -264,7 +284,7 @@ class DshRemovalPreparationTest(unittest.TestCase):
                     ).fetchone()[0],
                 )
 
-    def test_installed_floors_differ_only_at_the_compatibility_control(self) -> None:
+    def test_installed_floors_pin_expected_control_and_identity_differences(self) -> None:
         pre_bridge = load(PRE_BRIDGE_PATH)
         compatibility = load(COMPATIBILITY_PATH)
         with tempfile.TemporaryDirectory() as raw:
@@ -276,7 +296,16 @@ class DshRemovalPreparationTest(unittest.TestCase):
             materialize_fixture(pre_root, pre_bridge)
             materialize_fixture(compat_root, compatibility)
             marker = Path(".sc-state/local/dsh-removal/compatibility-floor.json")
+            installed_manifest = Path(
+                ".super-coder/assets/dsh-removal/removal-manifest-v1.json"
+            )
             self.assertFalse((pre_root / marker).exists())
+            self.assertFalse((pre_root / installed_manifest).exists())
+            self.assertFalse((compat_root / installed_manifest).exists())
+            self.assertNotEqual(
+                pre_bridge["installed_engine_ref"],
+                compatibility["installed_engine_ref"],
+            )
             self.assertEqual(
                 {
                     "contract": "sc-dsh-compatibility-floor-v1",

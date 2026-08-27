@@ -331,10 +331,6 @@
     "first": "0001_seed_skills.sql",
     "last": "0236_live_native_conversation_routes.sql"
   },
-  "removal_manifest": {
-    "path": ".super-coder/assets/dsh-removal/removal-manifest-v1.json",
-    "sha256": "c5d1de0dd305ded5f5b7378c16db03acc5e9da5a8851a778c2dc5c81ff44c48c"
-  },
   "runtime_state": {
     "ownership_contract": "sc-dsh-installed-update-fixture-v1",
     "profile_id": "sc-fixture",
@@ -347,6 +343,10 @@
     "web_start_ticks": 31337
   },
   "schema_version": 1,
+  "target_removal_manifest": {
+    "path": ".super-coder/assets/dsh-removal/removal-manifest-v1.json",
+    "sha256": "237106260717df940b00cef702502c8c497ae5b00f274e11f9b7a4f4896353fd"
+  },
   "tracked_payload": {
     "path": "tracked-artifacts.tar.gz",
     "sha256": "5b3dec1adef90eadd02d0b0f7a134362f9b6c7c1741df605e6550a9e721c41e7"

@@ -27,6 +27,8 @@ COMPATIBILITY_PATH = FIXTURE_DIR / "compatibility-floor.json"
 BASELINE_SOURCE_REF = "f5dbfa0a775ee4bc6f5038c4f9e56ba7ffc92792"
 REFERENCE_PATTERN = re.compile(r"deepseek|(?<![a-z0-9])dsh(?![a-z0-9])", re.I)
 SCAN_ROOTS = (
+    ".dockerignore",
+    ".gitignore",
     ".github",
     ".super-coder",
     "docs",
@@ -42,6 +44,13 @@ SCAN_EXCLUSIONS = (
     "tests/fixtures/dsh_removal/",
     "tests/fixtures/live_model/",
     "tests/test_dsh_removal_preparation.py",
+)
+
+FROZEN_PARTITIONS = (
+    "tracked_artifacts",
+    "shared_sources",
+    "verification_sources",
+    "immutable_reference_migrations",
 )
 
 DSH_MIGRATIONS = {
@@ -293,6 +302,22 @@ def build_manifest() -> dict[str, object]:
             "roots": list(SCAN_ROOTS),
             "excluded_provenance_roots": list(SCAN_EXCLUSIONS),
         },
+        "freeze_policy": {
+            "source_of_truth": [
+                ".super-coder/assets/dsh-removal/removal-manifest-v1.json",
+                "tests/fixtures/dsh_removal/pre-bridge.json",
+                "tests/fixtures/dsh_removal/compatibility-floor.json",
+                "tests/fixtures/dsh_removal/tracked-artifacts.tar.gz",
+            ],
+            "ci_validation": "committed-artifact-internal-consistency-only",
+            "refresh_command": (
+                "python tests/fixtures/dsh_removal/build_fixtures.py --refresh"
+            ),
+            "refresh_boundary": (
+                "pre-removal preparation only; forbidden after any frozen source, "
+                "artifact, verification input, or migration ledger byte changes"
+            ),
+        },
         "tracked_artifacts": [
             entry(path, ownership="engine-tracked", cleanup="exact-digest-delete")
             for path in owned
@@ -436,7 +461,13 @@ def fixture_rows() -> dict[str, list[dict[str, object]]]:
     }
 
 
-def floor_fixture(*, floor: str, payload_sha256: str, manifest_sha256: str) -> dict[str, object]:
+def floor_fixture(
+    *,
+    floor: str,
+    payload_sha256: str,
+    manifest_sha256: str,
+    migration_count: int,
+) -> dict[str, object]:
     compatibility = floor == "compatibility"
     return {
         "contract": "sc-dsh-installed-update-fixture-v1",
@@ -448,14 +479,14 @@ def floor_fixture(*, floor: str, payload_sha256: str, manifest_sha256: str) -> d
             "path": "tracked-artifacts.tar.gz",
             "sha256": payload_sha256,
         },
-        "removal_manifest": {
+        "target_removal_manifest": {
             "path": ".super-coder/assets/dsh-removal/removal-manifest-v1.json",
             "sha256": manifest_sha256,
         },
         "migration_floor": {
             "first": "0001_seed_skills.sql",
             "last": "0236_live_native_conversation_routes.sql",
-            "count": len(migration_ledger()),
+            "count": migration_count,
         },
         "compatibility_control": {
             "marker_path": ".sc-state/local/dsh-removal/compatibility-floor.json",
@@ -486,17 +517,14 @@ def floor_fixture(*, floor: str, payload_sha256: str, manifest_sha256: str) -> d
     }
 
 
-def render(*, reuse_payload: bool = False) -> dict[Path, bytes]:
+def render_refresh() -> dict[Path, bytes]:
     manifest = build_manifest()
     manifest_bytes = (json.dumps(manifest, indent=2, sort_keys=True) + "\n").encode()
-    payload = (
-        PAYLOAD_PATH.read_bytes()
-        if reuse_payload and PAYLOAD_PATH.exists()
-        else build_payload(manifest)
-    )
+    payload = build_payload(manifest)
     common = {
         "payload_sha256": sha256_bytes(payload),
         "manifest_sha256": sha256_bytes(manifest_bytes),
+        "migration_count": len(manifest["immutable_migration_ledger"]),
     }
     pre_bridge = floor_fixture(floor="pre-bridge", **common)
     compatibility = floor_fixture(floor="compatibility", **common)
@@ -508,21 +536,143 @@ def render(*, reuse_payload: bool = False) -> dict[Path, bytes]:
     }
 
 
+def refresh_floor_errors(
+    manifest: dict[str, object], *, root: Path = ROOT
+) -> list[str]:
+    """Return changes that make live-tree fixture refresh unsafe."""
+    errors: list[str] = []
+    for partition in FROZEN_PARTITIONS:
+        for row in manifest[partition]:
+            relative = str(row["path"])
+            path = root / relative
+            if not path.is_file():
+                errors.append(f"missing frozen input: {relative}")
+                continue
+            if sha256_file(path) != row["sha256"]:
+                errors.append(f"changed frozen input: {relative}")
+
+    expected_migrations = [
+        str(row["path"]) for row in manifest["immutable_migration_ledger"]
+    ]
+    actual_migrations = [
+        str(path.relative_to(root))
+        for path in sorted((root / ".super-coder/migrations").glob("*.sql"))
+    ]
+    if actual_migrations != expected_migrations:
+        errors.append("migration ledger membership changed")
+    return errors
+
+
+def assert_refresh_floor() -> None:
+    if not MANIFEST_PATH.exists():
+        return
+    errors = refresh_floor_errors(json.loads(MANIFEST_PATH.read_text()))
+    if errors:
+        raise SystemExit(
+            "DSH fixture refresh is forbidden beyond its preparation floor: "
+            + "; ".join(errors)
+        )
+
+
+def frozen_validation_errors() -> list[str]:
+    """Validate committed fixtures without consulting mutable live source bytes."""
+    errors: list[str] = []
+    try:
+        manifest_bytes = MANIFEST_PATH.read_bytes()
+        manifest = json.loads(manifest_bytes)
+        payload = PAYLOAD_PATH.read_bytes()
+        pre_bridge = json.loads(PRE_BRIDGE_PATH.read_bytes())
+        compatibility = json.loads(COMPATIBILITY_PATH.read_bytes())
+    except (OSError, json.JSONDecodeError) as exc:
+        return [f"cannot load frozen fixture: {exc}"]
+
+    paths = [
+        str(row["path"])
+        for partition in FROZEN_PARTITIONS
+        for row in manifest[partition]
+    ]
+    if len(paths) != len(set(paths)):
+        errors.append("manifest partitions overlap")
+
+    ledger = {str(row["path"]): row for row in manifest["immutable_migration_ledger"]}
+    for row in manifest["immutable_reference_migrations"]:
+        frozen = ledger.get(str(row["path"]))
+        if frozen is None or frozen["sha256"] != row["sha256"]:
+            errors.append(f"reference migration not pinned by ledger: {row['path']}")
+
+    payload_digest = sha256_bytes(payload)
+    manifest_digest = sha256_bytes(manifest_bytes)
+    for fixture in (pre_bridge, compatibility):
+        if fixture["tracked_payload"]["path"] != PAYLOAD_PATH.name:
+            errors.append(f"{fixture['floor']} payload path mismatch")
+        if fixture["tracked_payload"]["sha256"] != payload_digest:
+            errors.append(f"{fixture['floor']} payload digest mismatch")
+        if fixture["target_removal_manifest"]["path"] != str(
+            MANIFEST_PATH.relative_to(ROOT)
+        ):
+            errors.append(f"{fixture['floor']} target manifest path mismatch")
+        if fixture["target_removal_manifest"]["sha256"] != manifest_digest:
+            errors.append(f"{fixture['floor']} target manifest digest mismatch")
+        if fixture["migration_floor"]["count"] != len(
+            manifest["immutable_migration_ledger"]
+        ):
+            errors.append(f"{fixture['floor']} migration count mismatch")
+    if pre_bridge["database_rows"] != compatibility["database_rows"]:
+        errors.append("installed-floor database rows differ")
+
+    try:
+        tar_bytes = gzip.decompress(payload)
+        with tarfile.open(fileobj=io.BytesIO(tar_bytes), mode="r:") as archive:
+            members = archive.getmembers()
+            actual: dict[str, tuple[str, int]] = {}
+            for member in members:
+                if not member.isfile():
+                    errors.append(f"payload member is not a file: {member.name}")
+                    continue
+                extracted = archive.extractfile(member)
+                if extracted is None:
+                    errors.append(f"payload member cannot be read: {member.name}")
+                    continue
+                body = extracted.read()
+                actual[member.name] = (sha256_bytes(body), len(body))
+                if any((member.mtime, member.uid, member.gid)):
+                    errors.append(f"payload metadata is not deterministic: {member.name}")
+            if len(actual) != len(members):
+                errors.append("payload contains duplicate member paths")
+    except (OSError, EOFError, tarfile.TarError) as exc:
+        errors.append(f"payload cannot be decoded: {exc}")
+        actual = {}
+
+    expected = {
+        str(row["path"]): (str(row["sha256"]), int(row["bytes"]))
+        for row in manifest["tracked_artifacts"]
+    }
+    if actual != expected:
+        errors.append("payload members do not match frozen tracked-artifact digests")
+    return errors
+
+
+def check_frozen() -> None:
+    errors = frozen_validation_errors()
+    if errors:
+        raise SystemExit("invalid frozen DSH removal fixture: " + "; ".join(errors))
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--check", action="store_true")
+    mode = parser.add_mutually_exclusive_group(required=True)
+    mode.add_argument("--check", action="store_true")
+    mode.add_argument("--refresh", action="store_true")
     args = parser.parse_args()
-    outputs = render(reuse_payload=args.check)
-    stale: list[str] = []
-    for path, body in outputs.items():
-        if args.check:
-            if not path.exists() or path.read_bytes() != body:
-                stale.append(str(path.relative_to(ROOT)))
-            continue
+    if args.check:
+        check_frozen()
+        return 0
+
+    assert_refresh_floor()
+    for path, body in render_refresh().items():
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(body)
-    if stale:
-        raise SystemExit("stale generated DSH removal fixture(s): " + ", ".join(stale))
+    check_frozen()
     return 0
 
 

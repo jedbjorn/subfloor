@@ -68,6 +68,17 @@
     "global @deepseek-ai/dsh package tree",
     "unmarked caches"
   ],
+  "freeze_policy": {
+    "ci_validation": "committed-artifact-internal-consistency-only",
+    "refresh_boundary": "pre-removal preparation only; forbidden after any frozen source, artifact, verification input, or migration ledger byte changes",
+    "refresh_command": "python tests/fixtures/dsh_removal/build_fixtures.py --refresh",
+    "source_of_truth": [
+      ".super-coder/assets/dsh-removal/removal-manifest-v1.json",
+      "tests/fixtures/dsh_removal/pre-bridge.json",
+      "tests/fixtures/dsh_removal/compatibility-floor.json",
+      "tests/fixtures/dsh_removal/tracked-artifacts.tar.gz"
+    ]
+  },
   "generated_artifacts": [
     {
       "kind": "bounded-tree",
@@ -1348,6 +1359,8 @@
     ],
     "pattern": "deepseek|(?<![a-z0-9])dsh(?![a-z0-9])",
     "roots": [
+      ".dockerignore",
+      ".gitignore",
       ".github",
       ".super-coder",
       "docs",
@@ -1361,6 +1374,12 @@
   },
   "schema_version": 1,
   "shared_sources": [
+    {
+      "bytes": 625,
+      "ownership": "retained-shared-source",
+      "path": ".dockerignore",
+      "sha256": "c6a22c4ae40df7d07cf495be6f82ae23a88101d1d3be2e8dd35f78f2582ec730"
+    },
     {
       "bytes": 9165,
       "ownership": "retained-shared-source",
