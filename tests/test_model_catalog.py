@@ -614,6 +614,46 @@ class BuildTest(NoCLI):
         )
         self.assertNotIn("top-secret", json.dumps(got))
 
+    def test_missing_managed_deepseek_authority_isolated_from_opencode(self):
+        opencode = [{
+            "id": "ollama-cloud/glm-5.2",
+            "provider": "ollama-cloud",
+            "provider_model": "glm-5.2",
+            "native_option_ids": ["high", "max"],
+        }]
+        with tempfile.TemporaryDirectory() as raw, mock.patch.object(
+            mc, "CACHE", Path(raw) / "model_catalog.json"
+        ), mock.patch.object(
+            mc.deepseek_host,
+            "_managed_relay_authority",
+            side_effect=mc.deepseek_host.DeepSeekHostError(
+                "HARNESS_SERVICE_UNAVAILABLE",
+                "managed DeepSeek Host relay is unavailable",
+            ),
+        ), mock.patch.object(
+            mc.deepseek_host.ports,
+            "resolve",
+            side_effect=AssertionError("private Host port consulted"),
+        ):
+            got = mc.catalog(
+                refresh=True,
+                fetch=fetch_ok,
+                env={},
+                run=None,
+                opencode_provider=lambda: opencode,
+            )
+
+        self.assertEqual(
+            ids(got["harnesses"]["opencode"]),
+            ["ollama-cloud/glm-5.2"],
+        )
+        self.assertEqual(got["harnesses"]["deepseek"]["models"], [])
+        self.assertEqual(
+            got["harnesses"]["deepseek"]["error"],
+            "official DeepSeek Host configuration unavailable",
+        )
+        self.assertTrue(got["partial"])
+
     def _obsolete_deepseek_catalogue_uses_only_authenticated_exact_models(self):
         calls = []
 

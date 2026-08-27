@@ -736,6 +736,86 @@ def test_gateway_rejects_stale_generation_before_stock_host_forwarding() -> None
     asyncio.run(scenario())
 
 
+def test_gateway_forwards_managed_unary_discovery_body_without_capability() -> None:
+    async def scenario() -> None:
+        forwarded = []
+
+        async def upstream_handler(reader, writer) -> None:
+            header = await reader.readuntil(b"\r\n\r\n")
+            length = int(next(
+                line.split(b":", 1)[1].strip()
+                for line in header.split(b"\r\n")
+                if line.lower().startswith(b"content-length:")
+            ))
+            forwarded.append((header, await reader.readexactly(length)))
+            response_body = b'{"result":{"ok":true,"value":{"version":"0.1.1-rc.2"}}}'
+            writer.write(
+                b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+                + f"Content-Length: {len(response_body)}\r\n\r\n".encode()
+                + response_body
+            )
+            await writer.drain()
+            writer.close()
+            await writer.wait_closed()
+
+        upstream = await asyncio.start_server(
+            upstream_handler, "127.0.0.1", 0
+        )
+        target_port = upstream.sockets[0].getsockname()[1]
+        gateway = await asyncio.start_server(
+            lambda reader, writer: deepseek_web._relay_connection(
+                reader,
+                writer,
+                target_port,
+                frozenset({"127.0.0.1"}),
+                "a" * 64,
+                None,
+                "b" * 64,
+            ),
+            "127.0.0.1",
+            0,
+        )
+        gateway_port = gateway.sockets[0].getsockname()[1]
+        body = json.dumps({
+            "type": "client-request",
+            "rpcId": "managed-discovery",
+            "method": "host.describe",
+            "payload": {},
+        }, separators=(",", ":")).encode()
+        try:
+            reader, writer = await asyncio.open_connection(
+                "127.0.0.1", gateway_port
+            )
+            try:
+                writer.write(
+                    b"POST /api/host.describe HTTP/1.1\r\nHost: test\r\n"
+                    + b"Cookie: retained=value; sc_deepseek_managed_generation="
+                    + b"b" * 64
+                    + b"\r\nContent-Type: application/json\r\n"
+                    + f"Content-Length: {len(body)}\r\n\r\n".encode()
+                    + body
+                )
+                await writer.drain()
+                response = await asyncio.wait_for(reader.read(), timeout=1)
+            finally:
+                writer.close()
+                await writer.wait_closed()
+
+            assert b"HTTP/1.1 200 OK" in response
+            assert len(forwarded) == 1
+            assert forwarded[0][1] == body
+            header = forwarded[0][0]
+            assert b"Cookie: retained=value\r\n" in header
+            assert b"sc_deepseek_managed_generation" not in header
+        finally:
+            gateway.close()
+            upstream.close()
+            await gateway.wait_closed()
+            await upstream.wait_closed()
+
+    asyncio.run(scenario())
+
+
 @pytest.mark.parametrize(
     "protected_effect",
     (
@@ -1762,6 +1842,7 @@ def test_existing_service_requires_exact_neutral_host_contract() -> None:
         "service_port": 8942,
         "relay_port": 18942,
         "relay_policy": deepseek_web.RELAY_POLICY,
+        "relay_capability_contract": deepseek_web.RELAY_CAPABILITY_CONTRACT,
         "relay_listen_host": "0.0.0.0",
         "relay_allowed_peers": ["127.0.0.1"],
         "host_identity": "neutral",
@@ -1790,6 +1871,58 @@ def test_existing_service_requires_exact_neutral_host_contract() -> None:
             changed, 8942, 18942, listen_host="0.0.0.0",
             allowed_peers=("127.0.0.1",), identity_registry=identity,
         ) is False
+
+
+def test_managed_relay_authority_reads_only_current_owned_gateway_state() -> None:
+    browser_generation = "c" * 64
+    managed_generation = "d" * 64
+    with tempfile.TemporaryDirectory() as raw:
+        root = Path(raw)
+        state = {
+            "schema_version": 5,
+            "relay_pid": 102,
+            "relay_start_ticks": 202,
+            "relay_port": 18942,
+            "relay_policy": deepseek_web.RELAY_POLICY,
+            "relay_capability_contract": deepseek_web.RELAY_CAPABILITY_CONTRACT,
+            "relay_listen_host": "0.0.0.0",
+            "relay_allowed_peers": ["127.0.0.1", "172.18.0.1"],
+        }
+        generation_path = root / "deepseek-web-generation.json"
+        generation_path.write_text(json.dumps({
+            "generation": browser_generation,
+            "managed_generation": managed_generation,
+        }))
+        generation_path.chmod(0o600)
+        with (
+            mock.patch.dict(
+                deepseek_web.os.environ, service_env(root), clear=False
+            ),
+            mock.patch.object(deepseek_web, "_read_state", return_value=state),
+            mock.patch.object(deepseek_web, "_verified_process", return_value=True),
+            mock.patch.object(deepseek_web, "_tcp_ready", return_value=True),
+        ):
+            assert deepseek_web.managed_relay_authority() == {
+                "endpoint": "http://127.0.0.1:18942",
+                "generation": managed_generation,
+            }
+
+            with mock.patch.object(
+                deepseek_web,
+                "_read_state",
+                return_value={**state, "relay_port": "18942"},
+            ), pytest.raises(deepseek_web.DeepSeekWebError) as malformed_state:
+                deepseek_web.managed_relay_authority()
+            assert malformed_state.value.code == "HARNESS_SERVICE_UNAVAILABLE"
+
+            generation_path.write_text(json.dumps({
+                "generation": browser_generation,
+                "managed_generation": "stale",
+            }))
+            generation_path.chmod(0o600)
+            with pytest.raises(deepseek_web.DeepSeekWebError) as malformed_generation:
+                deepseek_web.managed_relay_authority()
+            assert malformed_generation.value.code == "HARNESS_WEB_GENERATION_STALE"
 
 
 def test_status_rejects_a_live_relay_without_the_host_gateway_policy() -> None:
@@ -1823,6 +1956,9 @@ def test_status_rejects_a_live_relay_without_the_host_gateway_policy() -> None:
             state.update(
                 {
                     "relay_policy": deepseek_web.RELAY_POLICY,
+                    "relay_capability_contract": (
+                        deepseek_web.RELAY_CAPABILITY_CONTRACT
+                    ),
                     "relay_allowed_peers": ["127.0.0.1", "172.18.0.1"],
                 }
             )

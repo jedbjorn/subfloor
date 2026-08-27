@@ -25,6 +25,7 @@ from __future__ import annotations
 import contextlib
 import io
 import json
+import os
 import sqlite3
 import sys
 import tempfile
@@ -1403,6 +1404,168 @@ class AuthenticatedCliCatalogueRouteTest(unittest.TestCase):
         catalogue.assert_called_once()
         self.assertFalse(catalogue.call_args.kwargs["refresh"])
         self.assertIn("con", catalogue.call_args.kwargs)
+
+    def test_models_api_uses_current_deepseek_managed_relay_without_credentials(
+        self,
+    ) -> None:
+        selectors = [
+            "ollama-cloud/deepseek-v4-flash",
+            "ollama-cloud/glm-5.2",
+            "ollama-cloud/gpt-oss:120b",
+            "ollama-cloud/qwen3.5:397b",
+            "ollama-cloud/gemma4:31b",
+        ]
+        generation = "a" * 64
+        authority_calls = []
+        host_requests = []
+        fetch_calls = []
+        host_module = server.model_catalog.deepseek_host
+        real_client = host_module.DeepSeekHostClient
+        real_catalog = server.model_catalog.catalog
+
+        class Response:
+            def __init__(self, request):
+                self.request = request
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return None
+
+            def read(self, _limit):
+                request = json.loads(self.request.data)
+                values = {
+                    "host.describe": {"version": "0.1.1-rc.2"},
+                    "llm.providers": {"providers": [{
+                        "provider": "ollama-cloud",
+                        "active": True,
+                        "settingsNs": "llm",
+                        "settingsPath": ["providers", "ollama-cloud"],
+                    }]},
+                    "llm.models": {"groups": [{
+                        "id": "ollama-cloud",
+                        "models": [
+                            {
+                                "id": selector.split("/", 1)[1],
+                                "reasoning": {
+                                    "efforts": [{"id": "high"}, {"id": "max"}],
+                                    "defaultEffort": "max",
+                                },
+                            }
+                            for selector in selectors
+                        ],
+                    }]},
+                    "settings.describe": {"namespaces": [{
+                        "ns": "llm",
+                        "value": {"providers": {"ollama-cloud": {
+                            "baseURL": "https://ollama.com/v1",
+                        }}},
+                    }]},
+                }
+                value = values[request["method"]]
+                return json.dumps({
+                    "type": "server-response",
+                    "rpcId": request["rpcId"],
+                    "result": {"ok": True, "value": value},
+                }).encode()
+
+        def authority():
+            authority_calls.append(True)
+            return {
+                "endpoint": "http://127.0.0.1:6500",
+                "generation": generation,
+            }
+
+        def opener(request, *, timeout):
+            body = json.loads(request.data)
+            host_requests.append({
+                "url": request.full_url,
+                "cookie": request.get_header("Cookie"),
+                "method": body["method"],
+                "timeout": timeout,
+            })
+            return Response(request)
+
+        def client_factory():
+            return real_client(opener=opener)
+
+        def fetch(url, headers=None):
+            fetch_calls.append((url, headers))
+            if url != server.model_catalog.MODELS_DEV_URL:
+                raise AssertionError(f"provider request attempted: {url}")
+            return {}
+
+        opencode_models = [
+            {
+                "id": selector,
+                "provider": "ollama-cloud",
+                "provider_model": selector.split("/", 1)[1],
+                "native_option_ids": ["high", "max"],
+            }
+            for selector in selectors
+        ]
+
+        def served_catalog(*, refresh=False, con=None):
+            del con
+            return real_catalog(
+                refresh=refresh,
+                fetch=fetch,
+                env={},
+                run=None,
+                con=None,
+                opencode_provider=lambda: opencode_models,
+            )
+
+        with tempfile.TemporaryDirectory() as raw, (
+            mock.patch.dict(os.environ, {}, clear=True)
+        ), mock.patch.object(
+            server.model_catalog, "CACHE", Path(raw) / "model_catalog.json"
+        ), mock.patch.object(
+            host_module, "_managed_relay_authority", side_effect=authority
+        ), mock.patch.object(
+            host_module, "DeepSeekHostClient", side_effect=client_factory
+        ), mock.patch.object(
+            host_module.ports,
+            "resolve",
+            side_effect=AssertionError("private Host port consulted"),
+        ), mock.patch.object(
+            server.model_catalog, "catalog", side_effect=served_catalog
+        ):
+            status, _headers, raw_body = server.dispatch_http(
+                "GET", "/api/models", "Host: 127.0.0.1", b""
+            )
+
+        self.assertEqual(status, 200)
+        payload = json.loads(raw_body)
+        self.assertEqual(
+            [model["id"] for model in payload["harnesses"]["deepseek"]["models"]],
+            selectors,
+        )
+        self.assertEqual(
+            [model["id"] for model in payload["harnesses"]["opencode"]["models"]],
+            selectors,
+        )
+        self.assertEqual(
+            [model["native_option_ids"]
+             for model in payload["harnesses"]["deepseek"]["models"]],
+            [["high", "max"]] * 5,
+        )
+        self.assertEqual(authority_calls, [True])
+        self.assertEqual(fetch_calls, [(server.model_catalog.MODELS_DEV_URL, None)])
+        self.assertEqual(
+            [request["method"] for request in host_requests],
+            ["host.describe", "llm.providers", "llm.models", "settings.describe"],
+        )
+        self.assertTrue(all(
+            request["url"].startswith("http://127.0.0.1:6500/api/")
+            and request["cookie"]
+            == f"sc_deepseek_managed_generation={generation}"
+            and request["timeout"] == 15.0
+            for request in host_requests
+        ))
+        self.assertNotIn("credentials.describe", json.dumps(host_requests))
+        self.assertNotIn("session.prompt", json.dumps(host_requests))
 
     def test_model_routes_require_shell_auth_and_apply_exact_filters(self) -> None:
         self.assertEqual(self.request("/_sc/model-routes", None)[0], 401)

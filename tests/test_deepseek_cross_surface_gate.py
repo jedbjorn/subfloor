@@ -537,9 +537,13 @@ def test_stock_two_shell_cross_surface_refusals_are_side_effect_free(
         old_generation = first["url"].split("sc_generation=", 1)[1]
         handed = deepseek_web.ensure(bob_worktree, env=bob)
         generation = handed["url"].split("sc_generation=", 1)[1]
+        managed_generation = json.loads(
+            (root / "deepseek-web-generation.json").read_text()
+        )["managed_generation"]
         assert handed["host_identity"] == "neutral"
         assert handed["reused"] is True
         assert generation == old_generation
+        assert managed_generation != generation
         stale_generation = "0" * 64
         assert stale_generation != generation
 
@@ -955,14 +959,24 @@ def test_stock_two_shell_cross_surface_refusals_are_side_effect_free(
         assert reopened_generation != generation
         state = json.loads((root / "web-state.json").read_text())
         assert not (root / "deepseek-shell-api.json").exists()
-        assert json.loads((root / "deepseek-web-generation.json").read_text())["generation"] == reopened_generation
+        reopened_capabilities = json.loads(
+            (root / "deepseek-web-generation.json").read_text()
+        )
+        assert reopened_capabilities["generation"] == reopened_generation
+        reopened_managed_generation = reopened_capabilities["managed_generation"]
+        assert reopened_managed_generation != managed_generation
         # The controlled provider key necessarily belongs to stock DSH's live
         # process environment.  Engine-owned shell credentials may exist only
         # in unique owner-only binding artifacts and must never cross into
         # either stock process or another durable surface.
         secrets = (ALICE_TOKEN, BOB_TOKEN)
         capabilities = (
-            stale_generation, old_generation, generation, reopened_generation,
+            stale_generation,
+            old_generation,
+            generation,
+            managed_generation,
+            reopened_generation,
+            reopened_managed_generation,
         )
         identity_registry = deepseek_web._identity_registry(bob)
         credential_paths = set(identity_registry.layout.credentials.glob("*.json"))
