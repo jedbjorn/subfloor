@@ -35,7 +35,6 @@ Usage:
 from __future__ import annotations
 
 import json
-import os
 import sys
 from pathlib import Path
 
@@ -61,7 +60,7 @@ def connect():
 
 
 def _shell_api_enabled() -> bool:
-    if not mem.SC_API_TOKEN and not os.environ.get("DSH_SC_MEM_CREDENTIAL_FILE"):
+    if not mem.SC_API_TOKEN:
         return False
     mem._PROG = "skill"
     mem._require_api()
