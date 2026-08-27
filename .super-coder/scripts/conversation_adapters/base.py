@@ -59,7 +59,6 @@ MAINTAINED_OBSERVED_VERSIONS = {
     "opencode": "1.18.9",
     "vibe": "vibe 2.22.0",
     "kimi": "0.33.0",
-    "deepseek": "0.1.0rc7",
 }
 
 

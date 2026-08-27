@@ -487,26 +487,17 @@ class BuildTest(NoCLI):
         self.assertEqual(got, expected)
         probe.assert_called_once_with(("vibe",))
 
-    def test_deepseek_runtime_status_uses_cli_probe_not_host_api_version(self):
-        expected = {
-            "harness": "deepseek",
-            **mc.harness_versions.runtime_scope(),
-            "version": "0.1.1-rc.2",
-            "observed_version": "0.1.1-rc.2",
-            "compatibility": "verified",
-            "minimum_version": "0.1.1",
-            "maximum_version_exclusive": "0.1.2",
-            "verified_version": "0.1.1",
-            "error": None,
-        }
+    def test_removed_deepseek_runtime_status_refuses_without_cli_probe(self):
         with mock.patch.object(
             mc.harness_versions, "compatibility_status",
-            return_value={"deepseek": expected},
+            side_effect=AssertionError("removed harness must not be probed"),
         ) as probe:
             got = mc.harness_runtime_status("deepseek")
 
-        self.assertEqual(got, expected)
-        probe.assert_called_once_with(("deepseek",))
+        self.assertEqual(got["harness"], "deepseek")
+        self.assertEqual(got["error"], "HARNESS_UNSUPPORTED")
+        self.assertIsNone(got["version"])
+        probe.assert_not_called()
 
     def test_harness_mapping_and_prefixing(self):
         got = mc.build(fetch=fetch_ok, env={}, run=None)
@@ -542,98 +533,15 @@ class BuildTest(NoCLI):
                          "keyed-API ids append deduped, models.dev order kept")
         self.assertIn("openai-api", got["sources"])
 
-    def test_deepseek_catalogue_projects_only_official_host_configuration(self):
-        calls = []
-
-        class Host:
-            def call(self, method, payload):
-                calls.append((method, payload))
-                return {
-                    "host.describe": {"version": "0.0.1"},
-                    "llm.providers": {"providers": [{
-                        "provider": "dynamic-provider", "active": True,
-                        "settingsNs": "llm",
-                        "settingsPath": ["providers", "dynamic-provider"],
-                    }]},
-                    "llm.models": {"groups": [{
-                        "id": "dynamic-provider",
-                        "models": [{
-                            "id": "exact-model",
-                            "reasoning": {
-                                "efforts": [{"id": "high"}],
-                                "defaultEffort": "high",
-                            },
-                        }],
-                    }]},
-                    "settings.describe": {"namespaces": [{
-                        "ns": "llm", "value": {"providers": {
-                            "dynamic-provider": {
-                                "baseURL": "https://dynamic.example/v1",
-                                "apiKeyEnv": "DYNAMIC_API_KEY",
-                            },
-                        }},
-                    }]},
-                    "credentials.describe": {"credentials": {
-                        "DYNAMIC_API_KEY": {
-                            "configured": True,
-                            "source": "environment",
-                            "writable": False,
-                        },
-                    }},
-                }[method]
-
-        got = mc.build(fetch=fetch_ok, env={}, run=None, deepseek_client=Host())
-        route = got["harnesses"]["deepseek"]["models"][0]
-        self.assertEqual(route["id"], "dynamic-provider/exact-model")
-        self.assertEqual(route["source"], "deepseek-host-api")
-        self.assertEqual(route["supported_efforts"], ["high"])
-        self.assertEqual(
-            route["adapter_metadata"]["route_metadata_by_effort"]["high"]
-            ["transport_contract"],
-            "deepseek-stock-host-v1",
-        )
-        self.assertEqual([method for method, _payload in calls], [
-            "host.describe", "llm.providers", "llm.models",
-            "settings.describe", "credentials.describe",
-        ])
-        self.assertNotIn("secret", json.dumps(route).lower())
-
-    def test_deepseek_host_failure_is_redacted_and_route_local(self):
-        class BrokenHost:
-            def call(self, _method, _payload):
-                raise RuntimeError("token=top-secret")
-
-        got = mc.build(
-            fetch=fetch_ok, env={}, run=None, deepseek_client=BrokenHost()
-        )
-
-        self.assertEqual(got["harnesses"]["deepseek"]["models"], [])
-        self.assertEqual(
-            got["harnesses"]["deepseek"]["error"],
-            "official DeepSeek Host configuration unavailable",
-        )
-        self.assertNotIn("top-secret", json.dumps(got))
-
-    def test_missing_managed_deepseek_authority_isolated_from_opencode(self):
+    def test_removed_dsh_catalogue_keeps_deepseek_family_under_opencode(self):
         opencode = [{
-            "id": "ollama-cloud/glm-5.2",
+            "id": "ollama-cloud/deepseek-v4-flash",
             "provider": "ollama-cloud",
-            "provider_model": "glm-5.2",
+            "provider_model": "deepseek-v4-flash",
             "native_option_ids": ["high", "max"],
         }]
         with tempfile.TemporaryDirectory() as raw, mock.patch.object(
             mc, "CACHE", Path(raw) / "model_catalog.json"
-        ), mock.patch.object(
-            mc.deepseek_host,
-            "_managed_relay_authority",
-            side_effect=mc.deepseek_host.DeepSeekHostError(
-                "HARNESS_SERVICE_UNAVAILABLE",
-                "managed DeepSeek Host relay is unavailable",
-            ),
-        ), mock.patch.object(
-            mc.deepseek_host.ports,
-            "resolve",
-            side_effect=AssertionError("private Host port consulted"),
         ):
             got = mc.catalog(
                 refresh=True,
@@ -645,184 +553,11 @@ class BuildTest(NoCLI):
 
         self.assertEqual(
             ids(got["harnesses"]["opencode"]),
-            ["ollama-cloud/glm-5.2"],
+            ["ollama-cloud/deepseek-v4-flash"],
         )
-        self.assertEqual(got["harnesses"]["deepseek"]["models"], [])
-        self.assertEqual(
-            got["harnesses"]["deepseek"]["error"],
-            "official DeepSeek Host configuration unavailable",
-        )
-        self.assertTrue(got["partial"])
+        self.assertNotIn("deepseek", got["harnesses"])
+        self.assertNotIn("deepseek-host-api", got["sources"])
 
-    def _obsolete_deepseek_catalogue_uses_only_authenticated_exact_models(self):
-        calls = []
-
-        def fetch(url, headers=None):
-            calls.append((url, headers))
-            if url == mc.MODELS_DEV_URL:
-                return MODELS_DEV
-            if url == "https://gateway.example/deepseek/v1/models":
-                return {"data": [
-                    {"id": "deepseek-v4-pro"},
-                    {"id": "deepseek-v4-flash", "name": "V4 Flash"},
-                ]}
-            raise AssertionError(url)
-
-        got = mc.build(fetch=fetch, env={
-            "DEEPSEEK_API_KEY": "secret-key",
-            "DEEPSEEK_BASE_URL": "https://gateway.example/deepseek/v1",
-        }, run=None, deepseek_wire_probe=deepseek_wire_proof)
-
-        block = got["harnesses"]["deepseek"]
-        self.assertEqual(ids(block), ["deepseek-v4-pro", "deepseek-v4-flash"])
-        self.assertEqual(got["sources"], ["models.dev", mc.DEEPSEEK_SOURCE])
-        self.assertFalse(got["partial"])
-        self.assertEqual(calls[-1], (
-            "https://gateway.example/deepseek/v1/models",
-            {"Authorization": "Bearer secret-key"},
-        ))
-        route = block["models"][0]
-        self.assertEqual(route["availability"], "available")
-        self.assertNotIn("error", block)
-        self.assertEqual(route["provider"], "deepseek-official")
-        self.assertEqual(route["provider_model"], "deepseek-v4-pro")
-        self.assertEqual(route["supported_efforts"], ["low", "high", "max"])
-        self.assertEqual(route["default_effort"], "high")
-        manifest = deepseek_runtime.load_runtime_manifest()
-        provider = deepseek_runtime.provider_adapter("deepseek-official")
-        discovery_digest = route_bindings.digest_json({
-            "provider": "deepseek-official",
-            "endpoint_identity": "https://gateway.example/deepseek/v1",
-            "models": ["deepseek-v4-flash", "deepseek-v4-pro"],
-            "provider_registry_sha256": manifest["provider_adapters"]["sha256"],
-        })
-        self.assertEqual(route["selector_binding"], {
-            "kind": "authenticated-provider-model",
-            "selector": "deepseek-v4-pro",
-            "provider_model": "deepseek-v4-pro",
-            "provider_route": "deepseek-official",
-            "provider_adapter_id": provider["adapter_id"],
-            "provider_adapter_digest": route_bindings.digest_json(provider),
-            "provider_registry_sha256": manifest["provider_adapters"]["sha256"],
-            "credential_kind": "deepseek-api-key",
-            "endpoint_identity": "https://gateway.example/deepseek/v1",
-            "discovery_evidence_digest": discovery_digest,
-            "models_url": "https://gateway.example/deepseek/v1/models",
-            "runtime_source_commit": "bb4ca698d63714e753f5621b07400e6ebb0b5d97",
-            "provider_wire_contract": deepseek_runtime.PROVIDER_WIRE_CONTRACT,
-            "provider_wire_digests": {
-                effort: deepseek_wire_proof(
-                    "deepseek-official", "deepseek-v4-pro",
-                    mc._deepseek_carrier_options()
-                )["proofs"][effort]["digest"]
-                for effort in ("default", "low", "high", "max")
-            },
-        })
-        mappings = route["adapter_metadata"]["provider_options_by_effort"]
-        self.assertEqual(mappings["default"], {
-            "omit": ["thinking", "reasoning_effort"], "set": {},
-        })
-        self.assertEqual(mappings["high"], {
-            "omit": [],
-            "set": {
-                "thinking": {"type": "enabled"},
-                "reasoning_effort": "high",
-            },
-        })
-
-    def _obsolete_ollama_route_uses_only_ollama_credential_and_exact_prefix(self):
-        calls = []
-
-        def fetch(url, headers=None):
-            calls.append((url, headers))
-            if url == mc.MODELS_DEV_URL:
-                return MODELS_DEV
-            if url == "https://ollama.com/v1/models":
-                return {"data": [
-                    {"id": "deepseek-v4-pro:0813"},
-                    {"id": "deepseek-v4-pro:0813-cloud"},
-                ]}
-            raise AssertionError(url)
-
-        got = mc.build(
-            fetch=fetch,
-            env={"OLLAMA_API_KEY": "ollama-secret"},
-            run=None,
-            deepseek_wire_probe=deepseek_wire_proof,
-        )
-
-        route = got["harnesses"]["deepseek"]["models"][0]
-        self.assertEqual(route["id"], "ollama-cloud/deepseek-v4-pro:0813")
-        self.assertEqual(route["provider"], "ollama-cloud")
-        self.assertEqual(route["provider_model"], "deepseek-v4-pro:0813")
-        self.assertEqual(route["supported_efforts"], [])
-        self.assertIsNone(route["default_effort"])
-        self.assertEqual(route["adapter_metadata"]["credential_kind"], "ollama-api-key")
-        self.assertEqual(
-            route["adapter_metadata"]["provider_options_by_effort"],
-            {"default": {"omit": ["thinking", "reasoning_effort"], "set": {}}},
-        )
-        self.assertEqual(calls[-1], (
-            "https://ollama.com/v1/models",
-            {"Authorization": "Bearer ollama-secret"},
-        ))
-        self.assertIn(mc.OLLAMA_CLOUD_SOURCE, got["sources"])
-        self.assertNotIn(mc.DEEPSEEK_SOURCE, got["sources"])
-        self.assertIn(
-            "ollama-cloud/deepseek-v4-pro:0813-cloud",
-            ids(got["harnesses"]["deepseek"]),
-        )
-        serialized = json.dumps(got)
-        self.assertNotIn("ollama-secret", serialized)
-        self.assertNotIn("OLLAMA_API_KEY", serialized)
-
-    def _obsolete_ollama_authenticated_exact_model_is_not_fixed_to_one_selector(self):
-        probe = mock.Mock(side_effect=deepseek_wire_proof)
-
-        got = mc.build(
-            fetch=lambda url, _headers=None: (
-                MODELS_DEV
-                if url == mc.MODELS_DEV_URL
-                else {"data": [{"id": "deepseek-v4-pro:0813-cloud"}]}
-            ),
-            env={"OLLAMA_API_KEY": "ollama-secret"},
-            run=None,
-            deepseek_wire_probe=probe,
-        )
-
-        self.assertEqual(
-            ids(got["harnesses"]["deepseek"]),
-            ["ollama-cloud/deepseek-v4-pro:0813-cloud"],
-        )
-        self.assertIn(mc.OLLAMA_CLOUD_SOURCE, got["sources"])
-        probe.assert_called_once()
-
-    def _obsolete_one_provider_failure_does_not_suppress_the_other_provider(self):
-        def fetch(url, headers=None):
-            if url == mc.MODELS_DEV_URL:
-                return MODELS_DEV
-            if url == "https://api.deepseek.com/models":
-                raise OSError("deepseek unavailable")
-            if url == "https://ollama.com/v1/models":
-                return {"data": [{"id": "deepseek-v4-pro:0813"}]}
-            raise AssertionError(url)
-
-        got = mc.build(
-            fetch=fetch,
-            env={
-                "DEEPSEEK_API_KEY": "deepseek-secret",
-                "OLLAMA_API_KEY": "ollama-secret",
-            },
-            run=None,
-            deepseek_wire_probe=deepseek_wire_proof,
-        )
-
-        self.assertEqual(
-            ids(got["harnesses"]["deepseek"]),
-            ["ollama-cloud/deepseek-v4-pro:0813"],
-        )
-        self.assertIn(mc.OLLAMA_CLOUD_SOURCE, got["sources"])
-        self.assertNotIn(mc.DEEPSEEK_SOURCE, got["sources"])
 
     def test_http_json_rejects_body_larger_than_four_mebibytes(self):
         reads = []
@@ -848,481 +583,6 @@ class BuildTest(NoCLI):
 
         self.assertEqual(reads, [4 * 1024 * 1024 + 1])
 
-    def _obsolete_deepseek_oversized_http_response_has_stable_fail_closed_result(self):
-        class Response:
-            def __init__(self, body):
-                self.body = body
-
-            def __enter__(self):
-                return self
-
-            def __exit__(self, *_args):
-                return False
-
-            def read(self, _amount):
-                return self.body
-
-        def open_request(request, timeout=None):
-            self.assertEqual(timeout, mc.TIMEOUT)
-            if request.full_url == mc.MODELS_DEV_URL:
-                return Response(json.dumps(MODELS_DEV).encode())
-            self.assertEqual(request.full_url, "https://api.deepseek.com/models")
-            return Response(b"x" * (4 * 1024 * 1024 + 1))
-
-        with mock.patch.object(mc.urllib.request, "urlopen", side_effect=open_request):
-            got = mc.build(
-                env={"DEEPSEEK_API_KEY": "secret-key"},
-                run=None,
-                deepseek_wire_probe=deepseek_wire_proof,
-            )
-
-        self.assertEqual(got["harnesses"]["deepseek"]["models"], [])
-        self.assertEqual(
-            got["harnesses"]["deepseek"]["error"],
-            "authenticated DeepSeek model response exceeds safety limits",
-        )
-        self.assertNotIn(mc.DEEPSEEK_SOURCE, got["sources"])
-
-    def _obsolete_deepseek_catalogue_caps_models_and_wire_probe_work(self):
-        proof_calls = []
-
-        def fetch(url, headers=None):
-            if url == mc.MODELS_DEV_URL:
-                return MODELS_DEV
-            return {"data": [{"id": f"deepseek-exact-{index}"}
-                             for index in range(8)]}
-
-        def prove(provider, model, options_by_effort, env=None):
-            proof_calls.append(model)
-            return deepseek_wire_proof(provider, model, options_by_effort, env)
-
-        got = mc.build(
-            fetch=fetch,
-            env={"DEEPSEEK_API_KEY": "secret-key"},
-            run=None,
-            deepseek_wire_probe=prove,
-        )
-
-        self.assertEqual(
-            ids(got["harnesses"]["deepseek"]),
-            [f"deepseek-exact-{index}" for index in range(8)],
-        )
-        self.assertEqual(
-            proof_calls,
-            [f"deepseek-exact-{index}" for index in range(8)],
-        )
-
-    def _obsolete_ollama_max_catalogue_proves_only_bounded_exact_selectors(self):
-        proof_calls = []
-        configured = "deepseek-v4-pro:0813"
-        rows = [{"id": configured}] + [
-            {"id": f"other-model-{index}"} for index in range(63)
-        ]
-
-        def fetch(url, headers=None):
-            if url == mc.MODELS_DEV_URL:
-                return MODELS_DEV
-            self.assertEqual(url, "https://ollama.com/v1/models")
-            return {"data": rows}
-
-        def unavailable_probe(provider, model, options_by_effort, env=None):
-            proof_calls.append((provider, model))
-            raise TimeoutError("bounded carrier proof timed out")
-
-        got = mc.build(
-            fetch=fetch,
-            env={"OLLAMA_API_KEY": "ollama-secret"},
-            run=None,
-            deepseek_wire_probe=unavailable_probe,
-        )
-
-        self.assertEqual(
-            proof_calls,
-            [
-                ("ollama-cloud", configured),
-                ("ollama-cloud", "other-model-0"),
-                ("ollama-cloud", "other-model-1"),
-                ("ollama-cloud", "other-model-10"),
-            ],
-        )
-        self.assertEqual(got["harnesses"]["deepseek"]["models"], [])
-        self.assertEqual(
-            got["harnesses"]["deepseek"]["error"],
-            mc.DEEPSEEK_PROVIDER_OPTIONS_UNVERIFIED,
-        )
-
-    def _obsolete_ollama_explicit_model_outside_background_sample_is_proved(self):
-        rows = [
-            {"id": model}
-            for model in ("model-a", "model-b", "model-c", "model-d", "wanted-model")
-        ]
-        proof_calls = []
-
-        def fetch(url, headers=None):
-            if url == mc.MODELS_DEV_URL:
-                return MODELS_DEV
-            return {"data": rows}
-
-        def prove(provider, model, options_by_effort, env=None):
-            proof_calls.append((provider, model))
-            return deepseek_wire_proof(provider, model, options_by_effort, env)
-
-        got = mc.build(
-            fetch=fetch,
-            env={"OLLAMA_API_KEY": "ollama-secret"},
-            run=None,
-            deepseek_wire_probe=prove,
-            deepseek_selector="ollama-cloud/wanted-model",
-        )
-
-        self.assertEqual(
-            ids(got["harnesses"]["deepseek"]),
-            ["ollama-cloud/wanted-model"],
-        )
-        self.assertEqual(proof_calls, [("ollama-cloud", "wanted-model")])
-        self.assertEqual(
-            got["harnesses"]["deepseek"]["authenticated_routes"][0][
-                "selectors"
-            ],
-            [f"ollama-cloud/{row['id']}" for row in rows],
-        )
-
-    def _obsolete_authenticated_provider_rejects_entire_malformed_generation_before_probe(self):
-        configured = "deepseek-v4-pro:0813"
-        invalid_rows = (
-            [{"id": configured}, {"id": configured}],
-            [{"id": configured}, {"id": ""}],
-            [{"id": configured}, {"id": " bad "}],
-            [{"id": configured}, {"id": 7}],
-            [{"id": configured}, {}],
-            [{"id": configured}, "not-an-object"],
-        )
-
-        for rows in invalid_rows:
-            probe = mock.Mock(side_effect=AssertionError("invalid rows must not probe"))
-            with self.subTest(rows=rows):
-                with self.assertRaisesRegex(
-                    mc._DeepSeekDiscoveryEvidenceError,
-                    mc.DEEPSEEK_DISCOVERY_EVIDENCE_INVALID,
-                ):
-                    mc._from_deepseek_provider(
-                        "ollama-cloud",
-                        lambda _url, _headers: {"data": rows},
-                        {"OLLAMA_API_KEY": "ollama-secret"},
-                        wire_probe=probe,
-                    )
-                probe.assert_not_called()
-
-    def _obsolete_invalid_authenticated_generation_is_route_local(self):
-        def fetch(url, headers=None):
-            if url == mc.MODELS_DEV_URL:
-                return MODELS_DEV
-            return {
-                "data": [
-                    {"id": "deepseek-v4-pro:0813"},
-                    {"id": "deepseek-v4-pro:0813"},
-                ]
-            }
-
-        probe = mock.Mock(side_effect=AssertionError("invalid rows must not probe"))
-        got = mc.build(
-            fetch=fetch,
-            env={"OLLAMA_API_KEY": "ollama-secret"},
-            run=None,
-            deepseek_wire_probe=probe,
-        )
-
-        self.assertEqual(ids(got["harnesses"]["claude"]), [
-            "claude-fable-5", "claude-opus-4-8", "claude-opus-4-7",
-        ])
-        self.assertEqual(got["harnesses"]["deepseek"]["models"], [])
-        self.assertEqual(
-            got["harnesses"]["deepseek"]["error"],
-            mc.DEEPSEEK_DISCOVERY_EVIDENCE_INVALID,
-        )
-        probe.assert_not_called()
-
-    def _obsolete_registry_failure_is_deepseek_only_on_a_cold_successful_build(self):
-        failures = (
-            FileNotFoundError("provider registry missing"),
-            deepseek_runtime.DeepSeekRuntimeError(
-                "HARNESS_PROVIDER_ADAPTER_DRIFT", "provider registry digest drifted"
-            ),
-        )
-
-        for failure in failures:
-            with self.subTest(failure=type(failure).__name__), mock.patch.object(
-                mc, "_deepseek_provider_registry", side_effect=failure
-            ):
-                got = mc.build(fetch=lambda _url, _headers=None: MODELS_DEV, env={}, run=None)
-
-            self.assertEqual(ids(got["harnesses"]["codex"]), ["gpt-5.5"])
-            self.assertEqual(got["harnesses"]["deepseek"]["models"], [])
-            self.assertEqual(
-                got["harnesses"]["deepseek"]["error"],
-                mc.DEEPSEEK_PROVIDER_REGISTRY_INVALID,
-            )
-            self.assertEqual(got["sources"], ["models.dev"])
-            self.assertTrue(got["partial"])
-
-    def _obsolete_deepseek_catalogue_fails_closed_before_probe_above_model_cap(self):
-        proof_calls = []
-
-        def fetch(url, headers=None):
-            if url == mc.MODELS_DEV_URL:
-                return MODELS_DEV
-            return {"data": [{"id": f"deepseek-exact-{index}"}
-                             for index in range(9)]}
-
-        got = mc.build(
-            fetch=fetch,
-            env={"DEEPSEEK_API_KEY": "secret-key"},
-            run=None,
-            deepseek_wire_probe=lambda provider, model, options_by_effort, env=None: (
-                proof_calls.append(model)
-            ),
-        )
-
-        self.assertEqual(got["harnesses"]["deepseek"]["models"], [])
-        self.assertEqual(
-            got["harnesses"]["deepseek"]["error"],
-            "authenticated DeepSeek model response exceeds safety limits",
-        )
-        self.assertNotIn(mc.DEEPSEEK_SOURCE, got["sources"])
-        self.assertEqual(proof_calls, [])
-
-    def _obsolete_deepseek_catalogue_fails_closed_before_probe_on_oversized_id(self):
-        proof_calls = []
-
-        def fetch(url, headers=None):
-            if url == mc.MODELS_DEV_URL:
-                return MODELS_DEV
-            return {"data": [{"id": "d" * 257}]}
-
-        got = mc.build(
-            fetch=fetch,
-            env={"DEEPSEEK_API_KEY": "secret-key"},
-            run=None,
-            deepseek_wire_probe=lambda provider, model, options_by_effort, env=None: (
-                proof_calls.append(model)
-            ),
-        )
-
-        self.assertEqual(got["harnesses"]["deepseek"]["models"], [])
-        self.assertEqual(
-            got["harnesses"]["deepseek"]["error"],
-            "authenticated DeepSeek model response exceeds safety limits",
-        )
-        self.assertEqual(proof_calls, [])
-
-    def _obsolete_deepseek_discovery_failure_is_redacted_and_fails_closed(self):
-        def fetch(url, headers=None):
-            if url == mc.MODELS_DEV_URL:
-                return MODELS_DEV
-            raise OSError("Authorization: Bearer secret-key")
-
-        got = mc.build(
-            fetch=fetch, env={"DEEPSEEK_API_KEY": "secret-key"}, run=None
-        )
-
-        self.assertTrue(got["partial"])
-        self.assertEqual(got["harnesses"]["deepseek"]["models"], [])
-        self.assertEqual(
-            got["harnesses"]["deepseek"]["error"],
-            mc.DEEPSEEK_DISCOVERY_ERROR,
-        )
-        serialized = json.dumps(got)
-        self.assertNotIn("secret-key", serialized)
-        self.assertNotIn("Bearer", serialized)
-
-    def _obsolete_deepseek_tampered_wire_receipt_admits_no_route(self):
-        def fetch(url, headers=None):
-            if url == mc.MODELS_DEV_URL:
-                return MODELS_DEV
-            self.assertEqual(
-                headers, {"Authorization": "Bearer secret-key"}
-            )
-            return {"data": [{"id": "deepseek-v4-pro"}]}
-
-        def tampered_wire(provider, model, options_by_effort, env=None):
-            proof = deepseek_wire_proof(provider, model, options_by_effort, env)
-            proof["proofs"]["default"]["digest"] = "0" * 64
-            return proof
-
-        got = mc.build(
-            fetch=fetch,
-            env={"DEEPSEEK_API_KEY": "secret-key"},
-            run=None,
-            deepseek_wire_probe=tampered_wire,
-        )
-
-        self.assertTrue(got["partial"])
-        self.assertEqual(got["sources"], ["models.dev"])
-        self.assertEqual(got["harnesses"]["deepseek"]["models"], [])
-        self.assertEqual(
-            got["harnesses"]["deepseek"]["error"],
-            mc.DEEPSEEK_PROVIDER_OPTIONS_UNVERIFIED,
-        )
-
-    def _obsolete_deepseek_wire_only_receipt_admits_no_route(self):
-        def fetch(url, headers=None):
-            if url == mc.MODELS_DEV_URL:
-                return MODELS_DEV
-            return {"data": [{"id": "deepseek-v4-pro"}]}
-
-        def wire_only(provider, model, options_by_effort, env=None):
-            proof = deepseek_wire_proof(provider, model, options_by_effort, env)
-            for item in proof["proofs"].values():
-                item.pop("native_request")
-                item["digest"] = route_bindings.digest_json({
-                    key: item[key]
-                    for key in (
-                        "contract", "model", "effort", "provider_options",
-                        "wire_options", "runtime_version", "source_commit",
-                        "patch_sha256",
-                    )
-                })
-            return proof
-
-        got = mc.build(
-            fetch=fetch,
-            env={"DEEPSEEK_API_KEY": "secret-key"},
-            run=None,
-            deepseek_wire_probe=wire_only,
-        )
-
-        self.assertEqual(got["harnesses"]["deepseek"]["models"], [])
-        self.assertEqual(
-            got["harnesses"]["deepseek"]["error"],
-            mc.DEEPSEEK_PROVIDER_OPTIONS_UNVERIFIED,
-        )
-
-    def _obsolete_deepseek_native_effort_mismatch_admits_no_route(self):
-        def fetch(url, headers=None):
-            if url == mc.MODELS_DEV_URL:
-                return MODELS_DEV
-            return {"data": [{"id": "deepseek-v4-pro"}]}
-
-        def mismatched_native(provider, model, options_by_effort, env=None):
-            proof = deepseek_wire_proof(provider, model, options_by_effort, env)
-            item = proof["proofs"]["low"]
-            item["native_request"]["reasoning_effort"] = "high"
-            item["digest"] = route_bindings.digest_json({
-                key: item[key]
-                for key in (
-                    "contract", "model", "effort", "provider_options",
-                    "wire_options", "native_request", "runtime_version",
-                    "source_commit", "patch_sha256",
-                )
-            })
-            return proof
-
-        got = mc.build(
-            fetch=fetch,
-            env={"DEEPSEEK_API_KEY": "secret-key"},
-            run=None,
-            deepseek_wire_probe=mismatched_native,
-        )
-
-        self.assertEqual(got["harnesses"]["deepseek"]["models"], [])
-        self.assertEqual(
-            got["harnesses"]["deepseek"]["error"],
-            mc.DEEPSEEK_PROVIDER_OPTIONS_UNVERIFIED,
-        )
-
-    def _obsolete_deepseek_missing_session_title_proof_admits_no_route(self):
-        def fetch(url, headers=None):
-            if url == mc.MODELS_DEV_URL:
-                return MODELS_DEV
-            return {"data": [{"id": "deepseek-v4-pro"}]}
-
-        def missing_purpose(provider, model, options_by_effort, env=None):
-            proof = deepseek_wire_proof(provider, model, options_by_effort, env)
-            item = proof["proofs"]["default"]
-            del item["purpose_proofs"]["session-title"]
-            item["digest"] = route_bindings.digest_json({
-                key: value for key, value in item.items() if key != "digest"
-            })
-            return proof
-
-        got = mc.build(
-            fetch=fetch,
-            env={"DEEPSEEK_API_KEY": "secret-key"},
-            run=None,
-            deepseek_wire_probe=missing_purpose,
-        )
-
-        self.assertEqual(got["harnesses"]["deepseek"]["models"], [])
-        self.assertEqual(
-            got["harnesses"]["deepseek"]["error"],
-            mc.DEEPSEEK_PROVIDER_OPTIONS_UNVERIFIED,
-        )
-
-    def _obsolete_deepseek_controlled_probe_reauthenticates_exact_source(self):
-        scope = mc.harness_versions.runtime_scope()
-        status = runtime_status(
-            "0.1.0rc7", harness="deepseek", scope=scope
-        )
-        calls = []
-
-        def fetch(url, headers=None):
-            calls.append((url, headers))
-            return {"data": [{"id": "deepseek-v4-pro"}]}
-
-        proof = mc.controlled_route_evidence(
-            "deepseek",
-            "deepseek-v4-pro",
-            env={"DEEPSEEK_API_KEY": "secret-key"},
-            harness_probe=lambda: {"deepseek": status},
-            deepseek_fetch=fetch,
-            deepseek_wire_probe=deepseek_wire_proof,
-        )
-
-        self.assertEqual(proof["runtime_status"], status)
-        self.assertEqual(proof["runtime_scope"], scope)
-        self.assertRegex(proof["source_fingerprint"], r"^[0-9a-f]{64}$")
-        self.assertEqual(calls, [(
-            "https://api.deepseek.com/models",
-            {"Authorization": "Bearer secret-key"},
-        )])
-
-        missing = mc.controlled_route_evidence(
-            "deepseek",
-            "deepseek-v4-pro",
-            env={},
-            harness_probe=lambda: {"deepseek": status},
-            deepseek_fetch=fetch,
-        )
-        self.assertIsNone(missing["source_fingerprint"])
-        self.assertEqual(len(calls), 1)
-
-    def _obsolete_deepseek_controlled_probe_serializes_only_selected_model(self):
-        scope = mc.harness_versions.runtime_scope()
-        status = runtime_status(
-            "0.1.0rc7", harness="deepseek", scope=scope
-        )
-        proof_calls = []
-
-        def fetch(_url, headers=None):
-            self.assertEqual(headers, {"Authorization": "Bearer secret-key"})
-            return {"data": [{"id": f"deepseek-exact-{index}"}
-                             for index in range(8)]}
-
-        def prove(provider, model, options_by_effort, env=None):
-            proof_calls.append(model)
-            return deepseek_wire_proof(provider, model, options_by_effort, env)
-
-        proof = mc.controlled_route_evidence(
-            "deepseek",
-            "deepseek-exact-7",
-            env={"DEEPSEEK_API_KEY": "secret-key"},
-            harness_probe=lambda: {"deepseek": status},
-            deepseek_fetch=fetch,
-            deepseek_wire_probe=prove,
-        )
-
-        self.assertRegex(proof["source_fingerprint"], r"^[0-9a-f]{64}$")
-        self.assertEqual(proof_calls, ["deepseek-exact-7"])
 
     def test_bad_provider_key_never_fails_the_sweep(self):
         def fetch(url, headers=None):
@@ -1443,7 +703,6 @@ class BuildTest(NoCLI):
             for selector in OLLAMA_ACCEPTANCE["models"]
         ]
         live_opencode = OLLAMA_ACCEPTANCE["live_opencode"]
-        live_deepseek = OLLAMA_ACCEPTANCE["live_deepseek"]
         open_models = mc.opencode_connected_models({
             "_sc_cli_version": live_opencode["version"],
             "connected": live_opencode["connected"],
@@ -1457,21 +716,6 @@ class BuildTest(NoCLI):
                 },
             }],
         })
-        host = CatalogueHost([
-            {
-                "id": model_id,
-                "reasoning": {
-                    "efforts": [
-                        {"id": option_id}
-                        for option_id in live_deepseek["native_option_ids"]
-                    ],
-                    "defaultEffort": live_deepseek[
-                        "native_default_option_id"
-                    ],
-                },
-            }
-            for model_id in model_ids
-        ])
         fetch_calls = []
 
         def no_provider_request(url, headers=None):
@@ -1487,46 +731,37 @@ class BuildTest(NoCLI):
                 env={},
                 run=None,
                 opencode_provider=lambda: open_models,
-                deepseek_client=host,
             )
 
         expected = OLLAMA_ACCEPTANCE["models"]
-        for harness in ("opencode", "deepseek"):
-            block = got["harnesses"][harness]
-            self.assertEqual(block["authority"], "harness-live")
-            self.assertFalse(block["stale"])
-            observed_at = datetime.fromisoformat(block["observed_at"])
-            self.assertEqual(observed_at.tzinfo, timezone.utc)
-            self.assertEqual(ids(block), expected)
-            self.assertEqual(
-                [model["native_option_ids"] for model in block["models"]],
-                [["high", "max"]] * 5,
-            )
-            self.assertTrue(all(
-                "adapter_metadata" not in model
-                and "selector_binding" not in model
-                for model in block["models"]
-            ))
-            self.assertNotIn("futureProviderField", json.dumps(block))
-            self.assertNotIn("endpoint_identity", json.dumps(block))
+        block = got["harnesses"]["opencode"]
+        self.assertEqual(block["authority"], "harness-live")
+        self.assertFalse(block["stale"])
+        observed_at = datetime.fromisoformat(block["observed_at"])
+        self.assertEqual(observed_at.tzinfo, timezone.utc)
+        self.assertEqual(ids(block), expected)
+        self.assertEqual(
+            [model["native_option_ids"] for model in block["models"]],
+            [["high", "max"]] * 5,
+        )
+        public_fields = {
+            "id", "release_date", "name", "family", "source",
+            "availability", "provider", "provider_model",
+            "supported_efforts", "default_effort", "cli_version",
+            "native_variant_ids", "native_option_ids",
+        }
+        self.assertEqual(
+            [set(model) for model in block["models"]],
+            [public_fields] * 5,
+        )
+        self.assertNotIn("futureProviderField", json.dumps(block))
+        self.assertNotIn("endpoint_identity", json.dumps(block))
+        self.assertNotIn("deepseek", got["harnesses"])
         self.assertNotIn(
             "native_default_option_id",
             got["harnesses"]["opencode"]["models"][0],
         )
-        self.assertEqual(
-            got["harnesses"]["deepseek"]["models"][0]
-            ["native_default_option_id"],
-            "max",
-        )
         self.assertEqual(fetch_calls, [(mc.MODELS_DEV_URL, None)])
-        self.assertEqual(
-            [method for method, _payload in host.calls],
-            ["host.describe", "llm.providers", "llm.models", "settings.describe"],
-        )
-        self.assertNotIn(
-            "credentials.describe",
-            [method for method, _payload in host.calls],
-        )
 
     def test_all_sources_down_raises(self):
         with self.assertRaises(RuntimeError):
@@ -1625,159 +860,6 @@ class RoutePersistenceTest(unittest.TestCase):
             "high_effort_supported, stale FROM model_routes").fetchone()
         self.assertEqual(tuple(row), ("kimi-code/k3", "available", 1, 1, 0))
 
-    def _obsolete_authenticated_deepseek_ids_stay_unbindable_before_wire_proof(self):
-        def fetch(url, _headers=None):
-            if url == mc.MODELS_DEV_URL:
-                return MODELS_DEV
-            return {"data": [{"id": "deepseek-v4-pro"}]}
-
-        def unavailable_wire(*_args, **_kwargs):
-            raise RuntimeError("carrier unavailable")
-
-        payload = mc.build(
-            fetch=fetch,
-            env={"DEEPSEEK_API_KEY": "secret-key"},
-            run=None,
-            deepseek_wire_probe=unavailable_wire,
-        )
-        payload.update(self.verification("deepseek", "0.1.0rc7"))
-        self.assertEqual(payload["harnesses"]["deepseek"]["models"], [])
-        self.assertEqual(
-            payload["harnesses"]["deepseek"]["error"],
-            mc.DEEPSEEK_PROVIDER_OPTIONS_UNVERIFIED,
-        )
-
-        mc.persist_routes(self.con, payload)
-
-        row = self.con.execute(
-            "SELECT availability,source_fingerprint,stale FROM model_routes "
-            "WHERE harness='deepseek' AND selector='deepseek-v4-pro'"
-        ).fetchone()
-        self.assertIsNone(row)
-        refused = routes_cli.resolve(
-            self.con,
-            "deepseek",
-            "deepseek-v4-pro",
-            effort="default",
-        )
-        self.assertFalse(refused["ok"])
-        self.assertEqual(refused["code"], "thinking_evidence_missing")
-        self.assertIsNone(refused.get("binding"))
-
-    def _obsolete_reordered_catalogue_keeps_explicit_authenticated_route_current(self):
-        rows = [
-            {"id": model}
-            for model in ("model-a", "model-b", "model-c", "model-d", "wanted-model")
-        ]
-
-        def fetch(url, headers=None):
-            if url == mc.MODELS_DEV_URL:
-                return MODELS_DEV
-            return {"data": rows}
-
-        arguments = {
-            "fetch": fetch,
-            "env": {"OLLAMA_API_KEY": "ollama-secret"},
-            "run": None,
-            "deepseek_wire_probe": deepseek_wire_proof,
-        }
-        status = self.verification("deepseek", "0.1.0rc7")[
-            "verification"
-        ]["harnesses"]["deepseek"]
-        with tempfile.TemporaryDirectory() as raw, mock.patch.object(
-            mc, "CACHE", Path(raw) / "model-catalog.json"
-        ):
-            admitted = mc.ensure_deepseek_route(
-                self.con,
-                "ollama-cloud/wanted-model",
-                **arguments,
-                opencode_provider=lambda: [],
-                harness_probe=lambda: {"deepseek": status},
-            )
-        self.assertIsNotNone(admitted)
-        self.assertEqual(admitted["provider_model"], "wanted-model")
-
-        rows.reverse()
-        background = mc.build(**arguments)
-        background.update(self.verification("deepseek", "0.1.0rc7"))
-        mc.persist_routes(self.con, background)
-
-        route = self.con.execute(
-            "SELECT stale,last_error,generation_id FROM model_routes "
-            "WHERE harness='deepseek' AND selector='ollama-cloud/wanted-model'"
-        ).fetchone()
-        generation = self.con.execute(
-            "SELECT generation_id FROM model_catalog_generations "
-            "ORDER BY completed_at DESC,generation_id DESC LIMIT 1"
-        ).fetchone()
-        self.assertEqual(tuple(route)[:2], (0, None))
-        self.assertEqual(route["generation_id"], generation["generation_id"])
-
-    def _obsolete_attempted_failed_deepseek_route_is_not_carried_current(self):
-        rows = [
-            {"id": model}
-            for model in ("model-a", "model-b", "model-c", "model-d", "wanted-model")
-        ]
-
-        def fetch(url, headers=None):
-            if url == mc.MODELS_DEV_URL:
-                return MODELS_DEV
-            return {"data": rows}
-
-        environment = {"OLLAMA_API_KEY": "ollama-secret"}
-        admitted = mc.build(
-            fetch=fetch,
-            env=environment,
-            run=None,
-            deepseek_wire_probe=deepseek_wire_proof,
-            deepseek_selector="ollama-cloud/model-a",
-        )
-        admitted.update(self.verification("deepseek", "0.1.0rc7"))
-        mc.persist_routes(self.con, admitted)
-
-        proof_calls = []
-
-        def selective_failure(provider, model, options_by_effort, env=None):
-            proof_calls.append(model)
-            if model == "model-a":
-                raise RuntimeError("exact route wire proof failed")
-            return deepseek_wire_proof(provider, model, options_by_effort, env)
-
-        refreshed = mc.build(
-            fetch=fetch,
-            env=environment,
-            run=None,
-            deepseek_wire_probe=selective_failure,
-        )
-        refreshed.update(self.verification("deepseek", "0.1.0rc7"))
-        mc.persist_routes(self.con, refreshed)
-
-        current_generation = self.con.execute(
-            "SELECT generation_id FROM model_catalog_generations "
-            "ORDER BY completed_at DESC,generation_id DESC LIMIT 1"
-        ).fetchone()["generation_id"]
-        routes = self.con.execute(
-            "SELECT selector,stale,last_error,generation_id FROM model_routes "
-            "WHERE harness='deepseek' ORDER BY selector"
-        ).fetchall()
-        self.assertEqual(proof_calls, ["model-a", "model-b", "model-c", "model-d"])
-        self.assertEqual(
-            [tuple(route) for route in routes],
-            [
-                (
-                    "ollama-cloud/model-a",
-                    1,
-                    "DeepSeek provider-option mapper has no outbound wire proof",
-                    admitted["catalogue_generation"],
-                ),
-                ("ollama-cloud/model-b", 0, None, current_generation),
-                ("ollama-cloud/model-c", 0, None, current_generation),
-                ("ollama-cloud/model-d", 0, None, current_generation),
-            ],
-        )
-        self.assertFalse(any(
-            route["selector"].endswith("wanted-model") for route in routes
-        ))
 
     def test_failed_refresh_keeps_route_and_marks_it_stale(self):
         fresh = {"fetched_at": "2026-07-21T00:00:00+00:00", "stale": False,
@@ -2784,22 +1866,17 @@ class CatalogCacheTest(NoCLI):
                 second["harnesses"].get(harness),
                 first["harnesses"].get(harness),
             )
-        for harness in ("opencode", "deepseek"):
-            self.assertEqual(
-                second["harnesses"][harness]["models"],
-                first["harnesses"][harness]["models"],
-            )
-            self.assertFalse(second["harnesses"][harness]["stale"])
-            self.assertNotEqual(
-                second["harnesses"][harness]["observed_at"],
-                first["harnesses"][harness]["observed_at"],
-            )
+        self.assertEqual(
+            second["harnesses"]["opencode"]["models"],
+            first["harnesses"]["opencode"]["models"],
+        )
+        self.assertFalse(second["harnesses"]["opencode"]["stale"])
+        self.assertNotEqual(
+            second["harnesses"]["opencode"]["observed_at"],
+            first["harnesses"]["opencode"]["observed_at"],
+        )
 
     def test_global_stale_cache_cannot_replace_successful_live_blocks(self):
-        old_host = CatalogueHost([{
-            "id": "old-model",
-            "reasoning": {"efforts": [{"id": "old-option"}]},
-        }])
         mc.catalog(
             fetch=fetch_ok,
             env={},
@@ -2810,19 +1887,11 @@ class CatalogCacheTest(NoCLI):
                 "provider_model": "old-model",
                 "native_option_ids": ["old-option"],
             }],
-            deepseek_client=old_host,
         )
         cached = json.loads(mc.CACHE.read_text())
         cached["stale"] = True
         mc.CACHE.write_text(json.dumps(cached))
 
-        current_host = CatalogueHost([{
-            "id": "glm-5.2",
-            "reasoning": {
-                "efforts": [{"id": "MAX.Future"}, {"id": "low"}],
-                "defaultEffort": "MAX.Future",
-            },
-        }])
         got = mc.catalog(
             fetch=fetch_down,
             env={},
@@ -2833,7 +1902,6 @@ class CatalogCacheTest(NoCLI):
                 "provider_model": "glm-5.2",
                 "native_option_ids": ["MAX.Future", "low"],
             }],
-            deepseek_client=current_host,
         )
 
         self.assertTrue(got["stale"])
@@ -2841,25 +1909,16 @@ class CatalogCacheTest(NoCLI):
             ids(got["harnesses"]["opencode"]),
             ["ollama-cloud/glm-5.2"],
         )
+        block = got["harnesses"]["opencode"]
+        self.assertFalse(block["stale"])
         self.assertEqual(
-            ids(got["harnesses"]["deepseek"]),
-            ["ollama-cloud/glm-5.2"],
+            block["models"][0]["native_option_ids"],
+            ["MAX.Future", "low"],
         )
-        for harness in ("opencode", "deepseek"):
-            block = got["harnesses"][harness]
-            self.assertFalse(block["stale"])
-            self.assertEqual(
-                block["models"][0]["native_option_ids"],
-                ["MAX.Future", "low"],
-            )
-            self.assertNotIn("old-model", json.dumps(block))
+        self.assertNotIn("old-model", json.dumps(block))
+        self.assertNotIn("deepseek", got["harnesses"])
 
     def test_malformed_opencode_projection_fails_only_its_live_block(self):
-        host = CatalogueHost([{
-            "id": "glm-5.2",
-            "reasoning": {"efforts": []},
-        }])
-
         def malformed_opencode():
             return mc.opencode_connected_models({
                 "connected": ["ollama-cloud"],
@@ -2874,7 +1933,6 @@ class CatalogCacheTest(NoCLI):
             env={},
             run=None,
             opencode_provider=malformed_opencode,
-            deepseek_client=host,
         )
 
         self.assertTrue(got["partial"])
@@ -2883,11 +1941,7 @@ class CatalogCacheTest(NoCLI):
             "variants must be an object",
             got["harnesses"]["opencode"]["error"],
         )
-        self.assertEqual(
-            ids(got["harnesses"]["deepseek"]),
-            ["ollama-cloud/glm-5.2"],
-        )
-        self.assertFalse(got["harnesses"]["deepseek"]["stale"])
+        self.assertNotIn("deepseek", got["harnesses"])
         self.assertIn("claude-opus-4-8", ids(got["harnesses"]["claude"]))
 
     def test_fresh_cache_still_refreshes_connected_opencode_models(self):
@@ -2990,8 +2044,10 @@ class CatalogCacheTest(NoCLI):
         old = json.loads(mc.CACHE.read_text())
         del old["v"]
         mc.CACHE.write_text(json.dumps(old))
-        got = mc.catalog(fetch=fetch_down, env={}, run=None)
-        self.assertEqual(got["sources"], ["static"],
+        got = mc.catalog(
+            fetch=fetch_down, env={}, run=None, opencode_provider=lambda: []
+        )
+        self.assertEqual(got["sources"], ["static", "opencode-provider-api"],
                          "shape-mismatched cache → treated as absent → floor")
 
     def test_refresh_flag_bypasses_fresh_cache(self):
@@ -3005,9 +2061,11 @@ class CatalogCacheTest(NoCLI):
         self.assertIn("claude-next", ids(got["harnesses"]["claude"]))
 
     def test_static_floor_when_no_cache_and_no_network(self):
-        got = mc.catalog(fetch=fetch_down, env={}, run=None)
+        got = mc.catalog(
+            fetch=fetch_down, env={}, run=None, opencode_provider=lambda: []
+        )
         self.assertTrue(got["stale"])
-        self.assertEqual(got["sources"], ["static"])
+        self.assertEqual(got["sources"], ["static", "opencode-provider-api"])
         for harness in ("claude", "codex", "vibe"):
             self.assertTrue(got["harnesses"][harness]["models"])
         self.assertEqual(

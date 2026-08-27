@@ -56,21 +56,6 @@ KILL_GRACE = 10             # SIGTERM → SIGKILL grace (seconds)
 POLL = 2                    # supervisor/wait poll interval (seconds)
 
 
-def _load_dsh_api_identity() -> None:
-    """Adopt only the credential path admitted by the stable ``sc`` guard."""
-    global SC_API_TOKEN, SC_API_BASE
-    if SC_API_TOKEN and SC_API_BASE:
-        return
-    if not os.environ.get("DSH_SC_MEM_CREDENTIAL_FILE"):
-        return
-    import mem
-
-    mem._PROG = "job"
-    mem._require_api()
-    SC_API_TOKEN = mem.SC_API_TOKEN
-    SC_API_BASE = mem.SC_API_BASE
-
-
 def die(msg: str) -> "NoReturn":  # noqa: F821
     sys.exit(f"job: {msg}")
 
@@ -458,7 +443,6 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: "list[str]") -> int:
     # Early-closed stdout is handled at the entrypoint (cli_entry.run_cli, #384).
     args = build_parser().parse_args(argv)
-    _load_dsh_api_identity()
     return args.fn(args)
 
 

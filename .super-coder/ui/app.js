@@ -420,7 +420,7 @@ function nativeOptionLabel(optionId) {
 }
 
 function liveNativeHarnessBlock(harness, catalog) {
-  if (!["opencode", "deepseek"].includes(harness)) return null;
+  if (harness !== "opencode") return null;
   const block = catalog.harnesses?.[harness];
   return block?.authority === "harness-live" && !block.stale && !block.error
     ? block : null;
@@ -442,7 +442,7 @@ function thinkingLevelState(harness, catalog, model, preferred = null) {
   const route = (block?.models || [])
     .find((candidate) => candidate.id === model);
   const liveBlock = liveNativeHarnessBlock(harness, catalog);
-  if (["opencode", "deepseek"].includes(harness)) {
+  if (harness === "opencode") {
     if (!liveBlock || !route || route.availability !== "available") return {
       disabled: true, selected: "", supported: [], native: true,
       requiresConfirmation: false,
@@ -2897,24 +2897,9 @@ function chatHarnessUnavailableReason(status) {
   return null;
 }
 
-const chatRequiresExactRoute = (harness) => harness === "deepseek";
-
-function chatOpenHarnessUnavailableReason(conversation, status) {
-  const harness = conversation?.route?.harness;
-  if (!status && chatRequiresExactRoute(harness))
-    return "HARNESS_UNAVAILABLE";
+function chatOpenHarnessUnavailableReason(_conversation, status) {
+  if (!status) return "HARNESS_UNAVAILABLE";
   return chatHarnessUnavailableReason(status);
-}
-
-function chatExactRouteUnavailableReason(conversation, catalog) {
-  const route = conversation?.route || {};
-  if (!chatRequiresExactRoute(route.harness)) return null;
-  const exact = (catalog?.harnesses?.[route.harness]?.models || [])
-    .find((candidate) => candidate.id === route.model);
-  if (!route.model || catalog?.stale || !exact || exact.stale
-      || exact.availability !== "available")
-    return "HARNESS_ROUTE_UNAVAILABLE";
-  return null;
 }
 
 function chatStartedLabel(conversation) {
@@ -3242,22 +3227,15 @@ function chatModelOptions(select, catalog, harness, defaultModel) {
   select.replaceChildren();
   const models = catalog.harnesses?.[harness]?.models || [];
   const available = models.filter((model) => model.availability === "available");
-  const exactRequired = chatRequiresExactRoute(harness);
   if (defaultModel) select.append(el("option", {
     value: "",
     textContent: `Use shell default — ${defaultModel}`,
-  }));
-  else if (exactRequired) select.append(el("option", {
-    value: "",
-    textContent: "Choose an exact model",
-    disabled: true,
-    selected: true,
   }));
   else select.append(el("option", {
     value: "",
     textContent: "Use harness default",
   }));
-  if (defaultModel && !exactRequired) select.append(el("option", {
+  if (defaultModel) select.append(el("option", {
     value: CHAT_HARNESS_DEFAULT_VALUE,
     textContent: "Use harness default",
   }));
@@ -3972,18 +3950,14 @@ async function chatRenderNew(host, shell, defaults, catalog) {
       : row.effort ?? row.effective_effort;
     effortState = renderNativeOptionControl(
       effortSelect, harness, catalog, model, preferred);
-    const exactRouteMissing = chatRequiresExactRoute(harness) && !model;
     submit.disabled = Boolean(
-      unavailable || exactRouteMissing
+      unavailable
         || model && (effortState.disabled || effortState.requiresConfirmation
           || (!effortState.native && !effortState.selected)),
     );
     const transport = harness === "opencode"
       ? " OpenCode models come only from connected providers." : "";
-    routeNote.textContent = unavailable
-      || (exactRouteMissing
-        ? "DeepSeek requires an authenticated exact model route."
-        : effortState.guidance + transport);
+    routeNote.textContent = unavailable || effortState.guidance + transport;
   };
   const paintModels = () => {
     harness = harnessSelect.value;
@@ -4678,8 +4652,7 @@ async function chatRenderOpen(
     const reopenable = closed && !sprintScoped;
     const unavailableReason = chatOpenHarnessUnavailableReason(
       conversation, harnessStatus,
-    )
-      || chatExactRouteUnavailableReason(conversation, modelCatalog);
+    );
     unavailable.hidden = !unavailableReason;
     unavailable.textContent = unavailableReason
       ? `${unavailableReason} — history remains readable.` : "";

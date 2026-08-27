@@ -947,7 +947,7 @@ class StoreContractTest(ConversationBrokerCase):
         )
         self.assertEqual(json.loads(rows[-1]["payload"])["text"], "two")
 
-    def test_deepseek_browser_usage_accumulates_into_existing_analytics(self) -> None:
+    def test_historical_deepseek_usage_stays_normalized_but_inert(self) -> None:
         conversation_id = self.add_conversation(
             harness="deepseek",
             provider="deepseek-official",
@@ -996,29 +996,23 @@ class StoreContractTest(ConversationBrokerCase):
         )
 
         with self.connect() as con:
-            rows = con.execute(
-                "SELECT shell_id,harness,harness_session_ref,provider,model,title,"
-                "input_tokens,output_tokens,cache_read_tokens,cache_write_tokens,"
-                "reasoning_tokens,status,parser_version FROM session_token_usage"
+            analytics = con.execute(
+                "SELECT harness,harness_session_ref FROM session_token_usage"
             ).fetchall()
-        self.assertEqual(len(rows), 1)
+            events = con.execute(
+                "SELECT event_type,payload FROM conversation_events "
+                "WHERE conversation_id=? AND event_type='usage' ORDER BY sequence",
+                (conversation_id,),
+            ).fetchall()
+        self.assertEqual(analytics, [])
+        self.assertEqual(len(events), 3)
         self.assertEqual(
-            tuple(rows[0]),
-            (
-                1,
-                "deepseek",
-                "deepseek-session-1",
-                "deepseek-official",
-                "deepseek-v4-pro",
-                "Browser route",
-                10,
-                4,
-                5,
-                None,
-                1,
-                "ok",
-                "browser-events-v1",
-            ),
+            [json.loads(row["payload"])["tokens"] for row in events],
+            [
+                {"input_tokens": 8, "output_tokens": 3, "reasoning_tokens": 1},
+                {"input_tokens": 2, "output_tokens": 1, "cache_read_tokens": 5},
+                {"input_tokens": -1, "output_tokens": True},
+            ],
         )
 
     def test_non_deepseek_usage_does_not_create_browser_analytics_rows(self) -> None:

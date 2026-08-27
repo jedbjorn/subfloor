@@ -506,149 +506,26 @@ class BindingIdentityTest(unittest.TestCase):
 
         self.assertEqual(refused.exception.code, "thinking_evidence_missing")
 
-    def _obsolete_deepseek_carrier_mapping_contract(self):
-        runtime = compatible_runtime("0.1.0rc7", harness="deepseek")
-        default, default_digest = resolve_controlled_v2(
-            self.deepseek_row(),
-            "deepseek",
-            "deepseek-v4-pro",
-            "default",
-            now=self.NOW,
-            runtime_status=runtime,
-        )
-        named, named_digest = resolve_controlled_v2(
-            self.deepseek_row(),
-            "deepseek",
-            "deepseek-v4-pro",
-            "high",
-            now=self.NOW,
-            runtime_status=runtime,
-        )
 
-        self.assertEqual(default["transport"], "deepseek-provider-options-v1")
-        self.assertEqual(default["adapter_metadata"], {
-            "provider_route": "deepseek-official",
-            "provider_adapter_id": "deepseek-native-v1",
-            "provider_adapter_digest": "1" * 64,
-            "provider_registry_sha256": "2" * 64,
-            "credential_kind": "deepseek-api-key",
-            "endpoint_identity": "https://api.deepseek.com",
-            "discovery_evidence_digest": "3" * 64,
-            "transport_contract": "deepseek-provider-options-v1",
-            "wire_evidence_digest": "5" * 64,
-            "runtime_version": "0.1.0rc7",
-            "source_commit": "b" * 40,
-            "patch_sha256": "7" * 64,
-            "composition_sha256": "8" * 64,
-            "provider_options": {
-                "omit": ["thinking", "reasoning_effort"], "set": {},
-            },
-        })
-        self.assertEqual(named["adapter_metadata"], {
-            "provider_route": "deepseek-official",
-            "provider_adapter_id": "deepseek-native-v1",
-            "provider_adapter_digest": "1" * 64,
-            "provider_registry_sha256": "2" * 64,
-            "credential_kind": "deepseek-api-key",
-            "endpoint_identity": "https://api.deepseek.com",
-            "discovery_evidence_digest": "3" * 64,
-            "transport_contract": "deepseek-provider-options-v1",
-            "wire_evidence_digest": "6" * 64,
-            "runtime_version": "0.1.0rc7",
-            "source_commit": "b" * 40,
-            "patch_sha256": "7" * 64,
-            "composition_sha256": "8" * 64,
-            "provider_options": {
-                "omit": [],
-                "set": {
-                    "thinking": {"type": "enabled"},
-                    "reasoning_effort": "high",
-                },
-            },
-        })
-        self.assertNotEqual(default_digest, named_digest)
-
-        forged = {
-            **default,
-            "adapter_metadata": named["adapter_metadata"],
-        }
-        with self.assertRaises(route_bindings.RouteResolutionError):
-            route_bindings.validate_v2_binding(forged)
-
-        changed_effort = {
-            **named,
-            "adapter_metadata": {
-                **named["adapter_metadata"],
-                "provider_options": {
-                    **named["adapter_metadata"]["provider_options"],
-                    "set": {
-                        **named["adapter_metadata"]["provider_options"]["set"],
-                        "reasoning_effort": "low",
-                    },
-                },
-            },
-        }
-        with self.assertRaises(route_bindings.RouteResolutionError):
-            route_bindings.validate_v2_binding(changed_effort)
-
-        unsupported_effort = {
-            **named,
-            "requested_effort": "medium",
-            "effective_effort": "medium",
-            "adapter_metadata": {
-                **named["adapter_metadata"],
-                "provider_options": {
-                    "omit": [],
-                    "set": {
-                        "thinking": {"type": "enabled"},
-                        "reasoning_effort": "medium",
-                    },
-                },
-            },
-        }
-        with self.assertRaises(route_bindings.RouteResolutionError) as invalid:
-            route_bindings.validate_v2_binding(unsupported_effort)
-        self.assertEqual(
-            invalid.exception.details,
-            {"reason": "DeepSeek effort is outside the carrier contract"},
-        )
-
-        with self.assertRaises(route_bindings.RouteResolutionError) as refused:
-            resolve_controlled_v2(
-                self.deepseek_row(),
+    def test_removed_deepseek_route_is_rejected_before_live_probe(self):
+        with mock.patch.object(
+            model_catalog,
+            "controlled_route_evidence",
+            side_effect=AssertionError("removed harness reached live discovery"),
+        ) as probe:
+            resolved = routes_cli.resolve(
+                None,
                 "deepseek",
-                "deepseek-v4-pro",
-                "medium",
-                now=self.NOW,
-                runtime_status=runtime,
+                "deepseek-official/deepseek-v4-pro",
+                effort="high",
             )
-        self.assertEqual(refused.exception.code, "unsupported_thinking_level")
 
-    def test_deepseek_binding_pins_redacted_host_route_and_effort(self):
-        runtime = compatible_runtime("0.1.1-rc.2", harness="deepseek")
-        default, default_digest = resolve_controlled_v2(
-            self.deepseek_row(), "deepseek",
-            "deepseek-official/deepseek-v4-pro", "default",
-            now=self.NOW, runtime_status=runtime,
-        )
-        named, named_digest = resolve_controlled_v2(
-            self.deepseek_row(), "deepseek",
-            "deepseek-official/deepseek-v4-pro", "high",
-            now=self.NOW, runtime_status=runtime,
-        )
-
-        self.assertEqual(default["transport"], "deepseek-stock-host-v1")
-        self.assertIsNone(default["adapter_metadata"]["reasoning_effort"])
-        self.assertEqual(named["adapter_metadata"]["reasoning_effort"], "high")
-        self.assertEqual(named["adapter_metadata"]["credential_status"], {
-            "configured": True, "source": "environment", "writable": False,
-        })
-        self.assertNotEqual(default_digest, named_digest)
-
-        forged = json.loads(json.dumps(named))
-        forged["adapter_metadata"]["reasoning_effort"] = "low"
-        with self.assertRaises(route_bindings.RouteResolutionError):
-            route_bindings.validate_v2_binding(forged)
+        self.assertFalse(resolved["ok"])
+        self.assertEqual(resolved["code"], "unsupported_thinking_level")
+        self.assertEqual(resolved["details"], {"harness": "deepseek"})
+        self.assertNotIn("binding", resolved)
+        self.assertNotIn("command", resolved)
+        probe.assert_not_called()
 
     def test_live_native_v3_identity_preserves_exact_option_and_null_default(self):
         named, named_digest = route_bindings.live_native_v3_binding(
@@ -658,7 +535,7 @@ class BindingIdentityTest(unittest.TestCase):
             "MaX-Custom",
         )
         default, default_digest = route_bindings.live_native_v3_binding(
-            "deepseek",
+            "opencode",
             "ollama-cloud/glm-5.2",
             "glm-5.2",
             None,
@@ -769,44 +646,44 @@ class BindingIdentityTest(unittest.TestCase):
             "source_fingerprint": stored["source_fingerprint"],
             "harness_version": stored["harness_version"],
         }
-        for harness in ("opencode", "deepseek"):
-            for selector in selectors:
-                observation = controlled_observation(None, harness=harness)
-                observation["advertised_options_by_model"] = {
-                    selector: ["high", option_id]
-                }
-                with self.subTest(harness=harness, selector=selector), mock.patch.object(
-                    model_catalog,
-                    "controlled_route_evidence",
-                    return_value=observation,
-                ) as probe:
-                    resolved = routes_cli.resolve(
-                        stale_catalogue,
-                        harness,
-                        selector,
-                        effort=option_id,
-                        shell="DEV5",
-                    )
+        harness = "opencode"
+        for selector in selectors:
+            observation = controlled_observation(None, harness=harness)
+            observation["advertised_options_by_model"] = {
+                selector: ["high", option_id]
+            }
+            with self.subTest(harness=harness, selector=selector), mock.patch.object(
+                model_catalog,
+                "controlled_route_evidence",
+                return_value=observation,
+            ) as probe:
+                resolved = routes_cli.resolve(
+                    stale_catalogue,
+                    harness,
+                    selector,
+                    effort=option_id,
+                    shell="DEV5",
+                )
 
-                probe.assert_called_once_with(harness, selector)
-                self.assertTrue(resolved["ok"], resolved)
-                self.assertEqual(resolved["binding"]["contract_version"], 3)
-                self.assertEqual(resolved["selector"], selector)
-                self.assertEqual(
-                    resolved["binding"]["native_option_id"], option_id
-                )
-                self.assertIsNone(
-                    resolved["binding"]["catalogue_generation"]
-                )
-                self.assertEqual(resolved["binding"]["adapter_metadata"], {})
-                self.assertEqual(
-                    resolved["command"],
-                    [
-                        "./sc", "run", "DEV5", "--harness", harness,
-                        "-m", selector, "--effort", option_id,
-                    ],
-                )
-                self.assertNotIn("thinking_evidence_stale", json.dumps(resolved))
+            probe.assert_called_once_with(harness, selector)
+            self.assertTrue(resolved["ok"], resolved)
+            self.assertEqual(resolved["binding"]["contract_version"], 3)
+            self.assertEqual(resolved["selector"], selector)
+            self.assertEqual(
+                resolved["binding"]["native_option_id"], option_id
+            )
+            self.assertIsNone(
+                resolved["binding"]["catalogue_generation"]
+            )
+            self.assertEqual(resolved["binding"]["adapter_metadata"], {})
+            self.assertEqual(
+                resolved["command"],
+                [
+                    "./sc", "run", "DEV5", "--harness", harness,
+                    "-m", selector, "--effort", option_id,
+                ],
+            )
+            self.assertNotIn("thinking_evidence_stale", json.dumps(resolved))
 
         stale_catalogue.execute.assert_not_called()
 
@@ -843,29 +720,14 @@ class BindingIdentityTest(unittest.TestCase):
         self.assertEqual(refused["details"]["current_option_ids"], ["low"])
         self.assertNotIn("command", refused)
 
-    def test_legacy_v2_live_native_uses_current_exact_ids_without_rewrite(self):
+    def test_legacy_opencode_v2_uses_current_exact_ids_without_rewrite(self):
         opencode, _ = resolve_controlled_v2(
             self.opencode_row(), "opencode", "provider/model", "k",
             now=self.NOW,
             runtime_status=compatible_runtime("1.18.9", harness="opencode"),
         )
-        deepseek, _ = resolve_controlled_v2(
-            self.deepseek_row(), "deepseek",
-            "deepseek-official/deepseek-v4-pro", "high",
-            now=self.NOW,
-            runtime_status=compatible_runtime(
-                "0.1.1-rc.2", harness="deepseek"
-            ),
-        )
-        original = {
-            binding["harness"]: route_bindings.canonical_json(binding)
-            for binding in (opencode, deepseek)
-        }
-
-        for binding, current in (
-            (opencode, {"provider/model": ["k", "MaX"]}),
-            (deepseek, {"deepseek-official/deepseek-v4-pro": ["high"]}),
-        ):
+        original = route_bindings.canonical_json(opencode)
+        for binding, current in ((opencode, {"provider/model": ["k", "MaX"]}),):
             observation = controlled_observation(
                 "f" * 64, harness=binding["harness"]
             )
@@ -894,127 +756,45 @@ class BindingIdentityTest(unittest.TestCase):
             self.assertEqual(selection["model_id"], binding["requested_model"])
             self.assertEqual(
                 route_bindings.canonical_json(binding),
-                original[binding["harness"]],
+                original,
             )
 
-        with self.assertRaises(route_bindings.RouteResolutionError) as raised:
-            route_bindings.require_advertised_live_native(
-                deepseek,
-                {"deepseek-official/deepseek-v4-pro": ["MaX"]},
-            )
-        self.assertEqual(raised.exception.code, "native_route_unavailable")
-        self.assertEqual(raised.exception.details["native_option_id"], "high")
-        self.assertEqual(raised.exception.details["current_option_ids"], ["MaX"])
-        self.assertEqual(
-            route_bindings.canonical_json(deepseek), original["deepseek"]
-        )
-
+    def test_historical_deepseek_binding_is_inert_and_byte_stable(self):
         historical_deepseek = {
-            **deepseek,
-            "transport": "deepseek-provider-options-v1",
-            "adapter_metadata": {
-                "transport_contract": "deepseek-provider-options-v1",
-                "provider_options": {"set": {"reasoning_effort": "high"}},
-            },
+            "contract_version": 2,
+            "control_state": "controlled",
+            "harness": "deepseek",
+            "requested_model": "deepseek-official/deepseek-v4-pro",
+            "provider_model": "deepseek-v4-pro",
+            "requested_effort": "high",
+            "effective_effort": "high",
+            "native_variant_id": None,
+            "transport": "deepseek-stock-host-v1",
+            "catalogue_generation": "1" * 32,
+            "evidence_digest": "2" * 64,
+            "selector_binding": {"kind": "historical"},
+            "adapter_metadata": {"historical": True},
         }
         historical_json = route_bindings.canonical_json(historical_deepseek)
-        with self.assertRaises(route_bindings.RouteResolutionError):
-            route_bindings.validate_v2_binding(historical_deepseek)
-        observation = controlled_observation(
-            "f" * 64, harness="deepseek"
-        )
-        observation["advertised_options_by_model"] = {
-            "deepseek-official/deepseek-v4-pro": ["high"]
-        }
+        with self.assertRaises(route_bindings.RouteResolutionError) as removed:
+            route_bindings.validate_binding(historical_deepseek)
+        self.assertEqual(removed.exception.code, "thinking_evidence_missing")
         with mock.patch.object(
             model_catalog,
             "controlled_route_evidence",
-            return_value=observation,
-        ):
+            side_effect=AssertionError("historical row reached live discovery"),
+        ) as probe, self.assertRaises(route_bindings.RouteResolutionError):
             route_bindings.verify_stored_v2_before_first_turn(
-                None,
-                historical_deepseek,
+                None, historical_deepseek,
                 source_fingerprint="0" * 64,
-                harness_version="retired-carrier",
+                harness_version="retired-runtime",
             )
-        self.assertEqual(
-            route_bindings.live_native_selection(historical_deepseek),
-            {
-                "harness": "deepseek",
-                "model_id": "deepseek-official/deepseek-v4-pro",
-                "native_option_id": "high",
-                "transport": "deepseek-provider-options-v1",
-            },
-        )
+        probe.assert_not_called()
         self.assertEqual(
             route_bindings.canonical_json(historical_deepseek),
             historical_json,
         )
 
-        legacy_default, _ = resolve_controlled_v2(
-            self.deepseek_row(), "deepseek",
-            "deepseek-official/deepseek-v4-pro", "default",
-            now=self.NOW,
-            runtime_status=compatible_runtime(
-                "0.1.1-rc.2", harness="deepseek"
-            ),
-        )
-        self.assertIsNone(
-            route_bindings.require_advertised_live_native(
-                legacy_default,
-                {"deepseek-official/deepseek-v4-pro": []},
-            )["native_option_id"]
-        )
-
-    def _obsolete_ollama_carrier_binding_contract(self):
-        binding = {
-            "contract_version": 2,
-            "control_state": "controlled",
-            "harness": "deepseek",
-            "requested_model": "ollama-cloud/deepseek-v4-pro",
-            "provider_model": "deepseek-v4-pro",
-            "requested_effort": "default",
-            "effective_effort": "default",
-            "native_variant_id": None,
-            "transport": "deepseek-provider-options-v1",
-            "catalogue_generation": "a" * 32,
-            "evidence_digest": None,
-            "selector_binding": {
-                "kind": "authenticated-provider-model",
-                "selector": "ollama-cloud/deepseek-v4-pro",
-            },
-            "adapter_metadata": {
-                "provider_route": "ollama-cloud",
-                "provider_adapter_id": "dsh-llm-pi-ai@0.1.0-rc.7/ollama-cloud",
-                "provider_adapter_digest": "1" * 64,
-                "provider_registry_sha256": "2" * 64,
-                "credential_kind": "ollama-api-key",
-                "endpoint_identity": "https://ollama.com/v1",
-                "discovery_evidence_digest": "3" * 64,
-                "transport_contract": "deepseek-provider-options-v1",
-                "provider_options": {
-                    "omit": ["thinking", "reasoning_effort"], "set": {},
-                },
-                "wire_evidence_digest": "4" * 64,
-                "runtime_version": "0.1.0rc7",
-                "source_commit": "b" * 40,
-                "patch_sha256": "5" * 64,
-                "composition_sha256": "6" * 64,
-            },
-        }
-
-        route_bindings.validate_v2_binding(binding)
-        for field, value in (
-            ("credential_kind", "deepseek-api-key"),
-            ("endpoint_identity", "https://token@ollama.com/v1"),
-            ("endpoint_identity", "https://"),
-            ("provider_adapter_digest", "0" * 63),
-        ):
-            forged = json.loads(json.dumps(binding))
-            forged["adapter_metadata"][field] = value
-            with self.subTest(field=field):
-                with self.assertRaises(route_bindings.RouteResolutionError):
-                    route_bindings.validate_v2_binding(forged)
 
     def test_uncontrolled_bindings_encode_every_inapplicable_value_as_null(self):
         default, default_digest = route_bindings.resolve_v2(
@@ -1407,7 +1187,7 @@ class LegacySprintBindingUpgradeTest(unittest.TestCase):
 
         self.con.execute("UPDATE sprints SET lifecycle='prepared' WHERE sprint_id=1")
         live, digest = route_bindings.live_native_v3_binding(
-            "deepseek",
+            "opencode",
             "Ollama-Cloud/GLM-5.2",
             "GLM-5.2",
             "Reasoning-Max",
@@ -3290,127 +3070,15 @@ class ParticipantRevisionTest(unittest.TestCase):
                     1,
                 )
 
-    def _obsolete_deepseek_carrier_round_trip(self):
-        binding, digest = resolve_controlled_v2(
-            BindingIdentityTest.deepseek_row(),
-            "deepseek",
-            "deepseek-v4-pro",
-            "default",
-            now=BindingIdentityTest.NOW,
-            runtime_status=compatible_runtime("0.1.0rc7", harness="deepseek"),
-        )
 
-        receipt = self.store.bind(
-            10,
-            binding,
-            digest,
-            transition="arm",
-            source_fingerprint=self.CONTROLLED_SOURCE_FINGERPRINT,
-            harness_version="0.1.0rc7",
-            harness_support_state="tested",
-        )
-
-        row, decoded = self.stored_binding(receipt["binding_id"])
-        self.assertEqual(
-            (row["control_state"], row["harness"], row["binding_digest"]),
-            ("controlled", "deepseek", digest),
-        )
-        self.assertEqual(decoded, binding)
-        self.assertEqual(decoded["adapter_metadata"]["provider_options"], {
-            "omit": ["thinking", "reasoning_effort"], "set": {},
-        })
-        self.assertEqual(
-            self.con.execute(
-                "SELECT active_route_binding_id FROM sprint_participants "
-                "WHERE participant_id=10"
-            ).fetchone()[0],
-            receipt["binding_id"],
-        )
-        self.assertEqual(
-            [tuple(row) for row in self.con.execute(
-                "SELECT name,seq FROM sqlite_sequence "
-                "WHERE name='sprint_participant_route_bindings'"
-            )],
-            [("sprint_participant_route_bindings", receipt["binding_id"])],
-        )
-
-        sibling = self.store.bind(
-            11,
-            binding,
-            digest,
-            transition="arm",
-            source_fingerprint=self.CONTROLLED_SOURCE_FINGERPRINT,
-            harness_version="0.1.0rc7",
-            harness_support_state="tested",
-        )
-        self.assertGreater(sibling["binding_id"], receipt["binding_id"])
-        self.assertEqual(
-            [tuple(row) for row in self.con.execute(
-                "SELECT name,seq FROM sqlite_sequence "
-                "WHERE name='sprint_participant_route_bindings'"
-            )],
-            [("sprint_participant_route_bindings", sibling["binding_id"])],
-        )
-
-    def test_deepseek_host_binding_survives_migrated_store_round_trip(self):
-        binding, digest = resolve_controlled_v2(
-            BindingIdentityTest.deepseek_row(), "deepseek",
-            "deepseek-official/deepseek-v4-pro", "high",
-            now=BindingIdentityTest.NOW,
-            runtime_status=compatible_runtime("0.1.1-rc.2", harness="deepseek"),
-        )
-
-        receipt = self.store.bind(
-            10, binding, digest, transition="arm",
-            source_fingerprint=self.CONTROLLED_SOURCE_FINGERPRINT,
-            harness_version="0.1.1-rc.2", harness_support_state="tested",
-        )
-        _row, decoded = self.stored_binding(receipt["binding_id"])
-        self.assertEqual(decoded, binding)
-        self.assertEqual(
-            decoded["adapter_metadata"]["transport_contract"],
-            "deepseek-stock-host-v1",
-        )
-
-    def _obsolete_deepseek_carrier_effort_store_contract(self):
-        binding, _ = resolve_controlled_v2(
-            BindingIdentityTest.deepseek_row(),
-            "deepseek",
-            "deepseek-v4-pro",
-            "high",
-            now=BindingIdentityTest.NOW,
-            runtime_status=compatible_runtime("0.1.0rc7", harness="deepseek"),
-        )
-        binding = {
-            **binding,
-            "requested_effort": "medium",
-            "effective_effort": "medium",
-            "adapter_metadata": {
-                **binding["adapter_metadata"],
-                "provider_options": {
-                    "omit": [],
-                    "set": {
-                        "thinking": {"type": "enabled"},
-                        "reasoning_effort": "medium",
-                    },
-                },
-            },
-        }
+    def test_new_deepseek_binding_is_rejected_without_store_write(self):
+        binding = {**self.binding, "harness": "deepseek"}
         digest = route_bindings.digest_json(binding)
 
-        with self.assertRaises(route_bindings.RouteResolutionError):
-            self.store.bind(
-                10,
-                binding,
-                digest,
-                transition="arm",
-                source_fingerprint=self.CONTROLLED_SOURCE_FINGERPRINT,
-                harness_version="0.1.0rc7",
-                harness_support_state="tested",
-            )
-        with self.assertRaises(sqlite3.IntegrityError):
-            self.insert_raw(binding, digest)
+        with self.assertRaises(route_bindings.RouteResolutionError) as refused:
+            self.store.bind(10, binding, digest, transition="arm")
 
+        self.assertEqual(refused.exception.code, "thinking_evidence_missing")
         self.assertEqual(
             self.con.execute(
                 "SELECT COUNT(*) FROM sprint_participant_route_bindings"
@@ -3422,7 +3090,8 @@ class ParticipantRevisionTest(unittest.TestCase):
             "WHERE participant_id=10"
         ).fetchone()[0])
 
-    def test_deepseek_refuses_harness_default_without_writing(self):
+
+    def test_removed_deepseek_harness_default_refuses_without_writing(self):
         with self.assertRaises(route_bindings.RouteResolutionError) as refused:
             route_bindings.resolve_v2(
                 None,
@@ -3433,7 +3102,7 @@ class ParticipantRevisionTest(unittest.TestCase):
                 ),
             )
 
-        self.assertEqual(refused.exception.code, "thinking_evidence_missing")
+        self.assertEqual(refused.exception.code, "unsupported_thinking_level")
         self.assertEqual(
             self.con.execute(
                 "SELECT COUNT(*) FROM sprint_participant_route_bindings"

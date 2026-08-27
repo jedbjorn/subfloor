@@ -9,7 +9,6 @@ be honored on this machine.
 from __future__ import annotations
 
 import json
-import os
 import shlex
 import sys
 from pathlib import Path
@@ -34,7 +33,7 @@ def _open_db():
 
 def _shell_api_enabled() -> bool:
     """A launched shell reads the live server; no token means root DB mode."""
-    if not mem.SC_API_TOKEN and not os.environ.get("DSH_SC_MEM_CREDENTIAL_FILE"):
+    if not mem.SC_API_TOKEN:
         return False
     mem._PROG = "models"
     mem._require_api()
@@ -107,8 +106,6 @@ def resolve(con, harness: str, selector: str | None = None, *,
         return resolve_row(
             None, harness, selector, shell=shell, effort=effort, now=now,
         )
-    if harness == "deepseek":
-        model_catalog.ensure_deepseek_route(con, selector)
     observed_row = _route(con, harness, selector)
     return resolve_row(
         observed_row, harness, selector, shell=shell, effort=effort, now=now,

@@ -15,6 +15,7 @@ Run:
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import sys
 import tempfile
@@ -23,6 +24,8 @@ import time
 import unittest
 from http.server import ThreadingHTTPServer
 from pathlib import Path
+from types import SimpleNamespace
+from unittest import mock
 
 ENGINE = Path(__file__).resolve().parents[1] / ".super-coder"
 SCHEMA = ENGINE / "schema.sql"
@@ -62,6 +65,40 @@ def start_job(jobs_dir: Path, cmd: list, timeout=None, label=None) -> Path:
         "log": str(jobdir / "log"),
     })
     return jobdir
+
+
+class CredentialAdmissionTest(unittest.TestCase):
+    def test_dsh_credential_artifact_does_not_enable_job_api_identity(self):
+        observed = []
+        args = SimpleNamespace(
+            fn=lambda _args: observed.append(
+                (job.SC_API_TOKEN, job.SC_API_BASE)
+            ) or 0
+        )
+        parser = mock.Mock()
+        parser.parse_args.return_value = args
+        fake_mem = SimpleNamespace(
+            _require_api=mock.Mock(
+                side_effect=AssertionError("DSH credential artifact consulted")
+            ),
+            SC_API_TOKEN="artifact-token",
+            SC_API_BASE="http://artifact-api",
+        )
+        with (
+            mock.patch.dict(
+                os.environ,
+                {"DSH_SC_MEM_CREDENTIAL_FILE": "/admitted/credential.json"},
+                clear=True,
+            ),
+            mock.patch.dict(sys.modules, {"mem": fake_mem}),
+            mock.patch.object(job, "SC_API_TOKEN", ""),
+            mock.patch.object(job, "SC_API_BASE", ""),
+            mock.patch.object(job, "build_parser", return_value=parser),
+        ):
+            self.assertEqual(job.main(["list"]), 0)
+
+        self.assertEqual(observed, [("", "")])
+        fake_mem._require_api.assert_not_called()
 
 
 class SupervisorTest(unittest.TestCase):

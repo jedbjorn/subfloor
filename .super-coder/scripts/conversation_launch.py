@@ -9,7 +9,6 @@ from pathlib import Path
 from typing import Any
 
 import db_driver
-import deepseek_promotion_runner
 import route_transport
 import run as run_mod
 import shell_liveness
@@ -126,11 +125,6 @@ class ConversationLaunchPreparer:
             ),
         }
         env["PATH"] = run_mod._shell_path(worktree, env.get("PATH", ""))
-        env = deepseek_promotion_runner.inject_conversation_context(
-            env=env,
-            conversation_id=broker_run.conversation_id,
-            lifecycle_epoch=broker_run.lifecycle_epoch,
-        )
         return ConversationContext(
             worktree=worktree.resolve(),
             provider=broker_run.provider,
@@ -295,11 +289,7 @@ class ConversationLaunchPreparer:
                 effort=plan.effort,
                 permission_mode="unrestricted",
                 title=broker_run.title,
-                env=deepseek_promotion_runner.inject_conversation_context(
-                    env=prepared_env,
-                    conversation_id=broker_run.conversation_id,
-                    lifecycle_epoch=broker_run.lifecycle_epoch,
-                ),
+                env=prepared_env,
                 route_binding=binding,
                 binding_digest=binding_digest,
                 conversation_id=broker_run.conversation_id,

@@ -1045,8 +1045,6 @@ def _create_conversation(con, operator: dict, headers, body: dict):
                 harness, selected_model, selected_effort
             )
         elif selected_model is not None and harness != "vibe":
-            if harness == "deepseek":
-                model_catalog.ensure_deepseek_route(con, selected_model)
             route = con.execute(
                 "SELECT * FROM model_routes WHERE harness=? AND selector=?",
                 (harness, selected_model),

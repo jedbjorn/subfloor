@@ -311,7 +311,7 @@ class DispatchGateTest(SprintWorkDispatchCase):
             ).fetchone()[0],
         )
 
-    def test_deepseek_bound_route_enters_the_generic_sprint_wake_chat(self) -> None:
+    def test_removed_deepseek_route_blocks_sprint_before_writes(self) -> None:
         self.create_unit(developer=1)
         self.con.execute(
             "UPDATE sprint_participants SET harness='deepseek',"
@@ -321,37 +321,33 @@ class DispatchGateTest(SprintWorkDispatchCase):
         )
         self.con.commit()
 
-        self.lifecycle.arm(
-            self.sprint_id, 3, conformance_reviewer_shell_id=2
-        )
-        self.deliver_pending_wakes()
+        with self.assertRaises(sprint_domain.SprintPreflightError) as refused:
+            self.lifecycle.arm(
+                self.sprint_id, 3, conformance_reviewer_shell_id=2
+            )
 
-        row = self.con.execute(
-            "SELECT conversation.harness,conversation.model,"
-            "conversation.effort,conversation.conversation_scope,"
-            "conversation.route_contract_version,conversation.route_binding,"
-            "binding.binding_digest,conversation.creation_idempotency_key "
-            "FROM sprint_participants participant "
-            "JOIN sprint_participant_route_bindings binding "
-            "ON binding.binding_id=participant.active_route_binding_id "
-            "JOIN sprint_participant_conversations link "
-            "ON link.sprint_participant_id=participant.participant_id "
-            "JOIN conversations conversation "
-            "ON conversation.conversation_id=link.conversation_id "
-            "WHERE participant.sprint_id=? AND participant.shell_id=1",
-            (self.sprint_id,),
-        ).fetchone()
-        binding = json.loads(row[5])
+        self.assertEqual(refused.exception.code, "unsupported_thinking_level")
+        self.assertEqual(refused.exception.details, {"harness": "deepseek"})
         self.assertEqual(
-            ("deepseek", "acme/model-7", "high", "sprint", 2),
-            tuple(row)[:5],
+            self.con.execute(
+                "SELECT lifecycle FROM sprints WHERE sprint_id=?",
+                (self.sprint_id,),
+            ).fetchone()[0],
+            "prepared",
         )
-        self.assertEqual(binding["transport"], "deepseek-stock-host-v1")
-        self.assertEqual(binding["adapter_metadata"]["provider_route"], "acme")
         self.assertEqual(
-            sprint_domain.route_bindings.digest_json(binding), row[6]
+            self.con.execute(
+                "SELECT COUNT(*) FROM sprint_participant_route_bindings"
+            ).fetchone()[0],
+            0,
         )
-        self.assertIn(":route:1:wake:", row[7])
+        self.assertEqual(
+            self.con.execute(
+                "SELECT COUNT(*) FROM sprint_participants "
+                "WHERE active_route_binding_id IS NOT NULL"
+            ).fetchone()[0],
+            0,
+        )
 
     def test_arm_binding_failure_rolls_back_every_binding_wake_and_state(self) -> None:
         self.create_unit(developer=1)

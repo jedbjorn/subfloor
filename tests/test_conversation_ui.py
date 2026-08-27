@@ -287,7 +287,8 @@ def test_start_chat_has_default_and_configured_paths_without_terminal_controls()
     assert 'ariaLabel: "Thinking level"' in interface
     assert 'el("label", { className: "k" }, "Thinking level")' in interface
     assert "renderNativeOptionControl(" in interface
-    assert "unavailable || exactRouteMissing" in interface
+    assert "unavailable\n        || model" in interface
+    assert "exactRouteMissing" not in interface
     assert "effortState.requiresConfirmation" in interface
     assert "(!effortState.native && !effortState.selected)" in interface
     assert "Refresh & verify Default Models before saving this route." in APP
@@ -302,41 +303,15 @@ def test_start_chat_has_default_and_configured_paths_without_terminal_controls()
 
 
 @pytest.mark.skipif(shutil.which("node") is None, reason="node is required")
-def test_deepseek_config_requires_an_available_exact_server_route():
+def test_removed_harness_status_disables_historical_composer():
     availability = APP[
         APP.index("function chatHarnessUnavailableReason"):
         APP.index("function chatStartedLabel")
     ]
-    models = APP[
-        APP.index("function chatModelOptions"):
-        APP.index("function chatCreateConversation")
-    ]
-    script = r"""
-const CHAT_HARNESS_DEFAULT_VALUE = "__sc_harness_default__";
-function el(_tag, attrs = {}) { return {...attrs}; }
-function select() {
-  return {
-    children: [],
-    replaceChildren() { this.children = []; },
-    append(value) { this.children.push(value); },
-    get options() { return this.children; },
-  };
-}
-""" + availability + models + r"""
-const catalog = {harnesses: {
-  deepseek: {models: [
-    {id: "deepseek-v4-pro", availability: "available"},
-    {id: "stale", availability: "unavailable"},
-  ]},
-  codex: {models: [{id: "gpt-test", availability: "available"}]},
-}};
-const deepseek = select();
-chatModelOptions(deepseek, catalog, "deepseek", null);
-const codex = select();
-chatModelOptions(codex, catalog, "codex", "gpt-test");
+    script = availability + r"""
+const conversation = {route: {harness: "deepseek", model: "old-model"}};
 console.log(JSON.stringify({
-  deepseek: deepseek.children,
-  codex: codex.children,
+  missing: chatOpenHarnessUnavailableReason(conversation, null),
   disabled: chatHarnessUnavailableReason({
     installed: true, enabled: false, healthy: false,
     surfaces: {browser: true}, unavailable_reason: "HARNESS_DISABLED",
@@ -348,25 +323,9 @@ console.log(JSON.stringify({
 }));
 """
 
-    result = run_js(script)
-    assert result == {
-        "deepseek": [
-            {
-                "value": "",
-                "textContent": "Choose an exact model",
-                "disabled": True,
-                "selected": True,
-            },
-            {"value": "deepseek-v4-pro", "textContent": "deepseek-v4-pro"},
-        ],
-        "codex": [
-            {"value": "", "textContent": "Use shell default — gpt-test"},
-            {
-                "value": "__sc_harness_default__",
-                "textContent": "Use harness default",
-            },
-            {"value": "gpt-test", "textContent": "gpt-test"},
-        ],
+    assert '"deepseek"' not in availability
+    assert run_js(script) == {
+        "missing": "HARNESS_UNAVAILABLE",
         "disabled": "HARNESS_DISABLED",
         "healthy": None,
     }
@@ -391,62 +350,33 @@ def test_historical_unavailable_harness_keeps_reads_and_controls_but_not_compose
     assert ".chat-harness-unavailable" in STYLE
 
 
-def test_historical_deepseek_route_availability_is_exact_and_fail_closed():
+def test_historical_removed_harness_is_unavailable_without_live_route_logic():
     helpers = APP[
         APP.index("function chatHarnessUnavailableReason"):
         APP.index("function chatStartedLabel")
     ]
     script = helpers + r"""
-const conversation = {
-  route: {harness: "deepseek", model: "deepseek-bound"},
-};
-const available = (models, stale = false) =>
-  chatExactRouteUnavailableReason(conversation, {
-    stale, harnesses: {deepseek: {models}},
-  });
+const removed = {route: {harness: "deepseek", model: "deepseek-bound"}};
+const unknown = {route: {harness: "retired-harness", model: "old-model"}};
 console.log(JSON.stringify({
-  zeroRoutes: available([]),
-  otherRouteOnly: available([
-    {id: "deepseek-other", availability: "available"},
-  ]),
-  boundUnavailable: available([
-    {id: "deepseek-bound", availability: "unauthenticated"},
-    {id: "deepseek-other", availability: "available"},
-  ]),
-  boundStale: available([
-    {id: "deepseek-bound", availability: "available", stale: true},
-  ]),
-  staleCatalog: available([
-    {id: "deepseek-bound", availability: "available"},
-  ], true),
-  exactAvailable: available([
-    {id: "deepseek-bound", availability: "available"},
-  ]),
-  missingStatus: chatOpenHarnessUnavailableReason(conversation, null),
-  disabledHarness: chatOpenHarnessUnavailableReason(conversation, {
+  removed: chatOpenHarnessUnavailableReason(removed, null),
+  unknown: chatOpenHarnessUnavailableReason(unknown, null),
+  disabled: chatOpenHarnessUnavailableReason(removed, {
     installed: true, enabled: false, healthy: false,
     surfaces: {browser: true}, unavailable_reason: "HARNESS_DISABLED",
   }),
-  otherHarness: chatExactRouteUnavailableReason({
-    route: {harness: "codex", model: "gpt-test"},
-  }, {stale: true, harnesses: {}}),
-  otherHarnessMissingStatus: chatOpenHarnessUnavailableReason({
-    route: {harness: "codex", model: "gpt-test"},
-  }, null),
+  healthy: chatOpenHarnessUnavailableReason(removed, {
+    installed: true, enabled: true, healthy: true,
+    surfaces: {browser: true}, unavailable_reason: null,
+  }),
 }));
 """
 
     assert run_js(script) == {
-        "zeroRoutes": "HARNESS_ROUTE_UNAVAILABLE",
-        "otherRouteOnly": "HARNESS_ROUTE_UNAVAILABLE",
-        "boundUnavailable": "HARNESS_ROUTE_UNAVAILABLE",
-        "boundStale": "HARNESS_ROUTE_UNAVAILABLE",
-        "staleCatalog": "HARNESS_ROUTE_UNAVAILABLE",
-        "exactAvailable": None,
-        "missingStatus": "HARNESS_UNAVAILABLE",
-        "disabledHarness": "HARNESS_DISABLED",
-        "otherHarness": None,
-        "otherHarnessMissingStatus": None,
+        "removed": "HARNESS_UNAVAILABLE",
+        "unknown": "HARNESS_UNAVAILABLE",
+        "disabled": "HARNESS_DISABLED",
+        "healthy": None,
     }
 
 

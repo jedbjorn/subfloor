@@ -7,10 +7,12 @@ import shutil
 from collections.abc import Callable, Iterable, Mapping
 from pathlib import Path
 
+import harness_versions
 from conversation_adapters import ADAPTER_TYPES, AdapterError
 from conversation_adapters.base import ADAPTERS, load_manifest
 
 SURFACES = ("terminal", "one_shot", "browser", "sprint")
+SUPPORTED_HARNESSES = frozenset(harness_versions.HARNESSES)
 _BROWSER_PROOF = (
     "exact_session_resume",
     "structured_streaming",
@@ -33,7 +35,7 @@ def _manifest_paths() -> dict[str, Path]:
     return {
         path.parent.name: path
         for path in ADAPTERS.glob("*/adapter.json")
-        if path.parent.is_dir()
+        if path.parent.is_dir() and path.parent.name in SUPPORTED_HARNESSES
     }
 
 

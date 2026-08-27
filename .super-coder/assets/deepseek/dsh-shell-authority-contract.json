@@ -609,9 +609,7 @@
     ],
     "credential_discovery": [
       ".super-coder/scripts/job.py",
-      ".super-coder/scripts/mem.py",
-      ".super-coder/scripts/models.py",
-      ".super-coder/scripts/skill.py"
+      ".super-coder/scripts/mem.py"
     ],
     "direct_db": [
       ".super-coder/scripts/dispatch.sh",
@@ -658,12 +656,12 @@
   },
   "source_sha256_inventory": {
     ".super-coder/scripts/dispatch.sh": "7fe92b4230f9d089ebe6952c945f91ec3a925055d5929510a27bd1ed26a6f311",
-    ".super-coder/scripts/job.py": "ce068f6998bd090b983b3052617f4992abf97886525ff9bdc2c6f1ceecf78cf3",
+    ".super-coder/scripts/job.py": "3177445bbd244ebc0a5872cd96b7b99b5b0c4abe449da7ac521979afe35f295c",
     ".super-coder/scripts/map_finalize.py": "bbd8fd943eee12f2df923084a55fdb091f30a9c48df425de85828723def65a32",
-    ".super-coder/scripts/mem.py": "945a6892dc3514e69e3f45d27e9d93f4839987539aed15b3366ee9f05768262a",
-    ".super-coder/scripts/models.py": "fe2d0390254632469e9ae625672167e9fcfc42d7637b3681d257d0d55d52dd1e",
+    ".super-coder/scripts/mem.py": "5bb19d7baa764e698277814a989957edbb6d5e36fea2500b0d1787abef821be2",
+    ".super-coder/scripts/models.py": "d7e519f142da9eebdcbea279379b8084669ea276b764fac5ac8dcfc55c0acba8",
     ".super-coder/scripts/pr_cli.py": "4ec130866495bf981240d63176c8008f77f0e9b748012bc229e05b657aff8fb0",
-    ".super-coder/scripts/skill.py": "49e853c8fb7783638fbd787f8c92a51d1c8b17bbd6245a63071b93f62e495699",
+    ".super-coder/scripts/skill.py": "f852de02e532a07b5dcaae4abea250e738e737c87592642f3d379327ebcaa34f",
     "sc": "9aa52b79bb64c8ff3ee016e60f1b30b3ef19c113021fbd5cfe920694915d3d17"
   },
   "direct_sc_signal_inventory": {
@@ -1155,9 +1153,7 @@
     ],
     "os.environ.get": [
       ".super-coder/scripts/job.py",
-      ".super-coder/scripts/mem.py",
-      ".super-coder/scripts/models.py",
-      ".super-coder/scripts/skill.py"
+      ".super-coder/scripts/mem.py"
     ],
     "os.fstat": [
       ".super-coder/scripts/mem.py"
@@ -2219,7 +2215,7 @@
       ]
     },
     ".super-coder/scripts/job.py": {
-      "sha256": "ce068f6998bd090b983b3052617f4992abf97886525ff9bdc2c6f1ceecf78cf3",
+      "sha256": "3177445bbd244ebc0a5872cd96b7b99b5b0c4abe449da7ac521979afe35f295c",
       "sc_signals": [
         "SC_API_BASE",
         "SC_API_TOKEN"
@@ -2250,7 +2246,7 @@
       ]
     },
     ".super-coder/scripts/mem.py": {
-      "sha256": "945a6892dc3514e69e3f45d27e9d93f4839987539aed15b3366ee9f05768262a",
+      "sha256": "5bb19d7baa764e698277814a989957edbb6d5e36fea2500b0d1787abef821be2",
       "sc_signals": [
         "SC_API_BASE",
         "SC_API_TOKEN",
@@ -2268,12 +2264,11 @@
       ]
     },
     ".super-coder/scripts/models.py": {
-      "sha256": "fe2d0390254632469e9ae625672167e9fcfc42d7637b3681d257d0d55d52dd1e",
+      "sha256": "d7e519f142da9eebdcbea279379b8084669ea276b764fac5ac8dcfc55c0acba8",
       "sc_signals": [
         "SC_API_TOKEN"
       ],
       "effect_classes": [
-        "credential_discovery",
         "direct_db",
         "direct_db_read",
         "direct_db_write",
@@ -2286,12 +2281,11 @@
       "effect_classes": []
     },
     ".super-coder/scripts/skill.py": {
-      "sha256": "49e853c8fb7783638fbd787f8c92a51d1c8b17bbd6245a63071b93f62e495699",
+      "sha256": "f852de02e532a07b5dcaae4abea250e738e737c87592642f3d379327ebcaa34f",
       "sc_signals": [
         "SC_API_TOKEN"
       ],
       "effect_classes": [
-        "credential_discovery",
         "direct_db",
         "direct_db_read",
         "direct_db_write",
