@@ -1,0 +1,1965 @@
+{
+  "active_state_owners": [
+    {
+      "removal": "delete DSH defaults",
+      "retained": "preserve harness='opencode', including DeepSeek-family model IDs",
+      "selector": "harness='deepseek'",
+      "table": "flavor_defaults"
+    },
+    {
+      "removal": "delete DSH catalogue routes and errors",
+      "retained": "preserve OpenCode routes and exact provider/model/option identity",
+      "selector": "harness='deepseek'",
+      "table": "model_routes"
+    },
+    {
+      "removal": "purge DSH-derived current catalogue cache generations",
+      "retained": "preserve generations containing retained harness evidence only",
+      "selector": "DSH-owned runtime, version, fingerprint, source, or error payload",
+      "table": "model_catalog_generations"
+    },
+    {
+      "removal": "delete the DSH parser cache",
+      "retained": "preserve normalized usage rows and retained harness caches",
+      "selector": "harness='deepseek'",
+      "table": "analytics_parse_cache"
+    },
+    {
+      "removal": "make every row inert and unavailable for create, send, reopen, or recovery",
+      "retained": "preserve identity, normalized messages, events, and transcript fields",
+      "selector": "harness='deepseek'",
+      "table": "conversations"
+    },
+    {
+      "removal": "terminalize with one generic removed-harness result and clear live process authority",
+      "retained": "preserve terminal historical run evidence",
+      "selector": "joined conversation harness='deepseek' and state is nonterminal",
+      "table": "conversation_runs"
+    },
+    {
+      "removal": "terminalize queued work without dispatch",
+      "retained": "preserve completed normalized delivery history",
+      "selector": "joined conversation harness='deepseek' and state is pending or claimed",
+      "table": "conversation_outbox"
+    },
+    {
+      "removal": "remove active process/admission pointers",
+      "retained": "preserve unrelated active chats",
+      "selector": "chat_id references a DSH conversation",
+      "table": "active_shell_chats"
+    },
+    {
+      "removal": "clear active route authority and require explicit Planner reroute",
+      "retained": "preserve participant, Sprint, messages, events, and disposition history",
+      "selector": "harness='deepseek'",
+      "table": "sprint_participants"
+    },
+    {
+      "removal": "detach active pointers; never rewrite immutable binding rows",
+      "retained": "preserve every historical binding byte and revision",
+      "selector": "harness='deepseek'",
+      "table": "sprint_participant_route_bindings"
+    }
+  ],
+  "baseline_source_ref": "f5dbfa0a775ee4bc6f5038c4f9e56ba7ffc92792",
+  "contract": "sc-dsh-removal-manifest-v1",
+  "external_preserve": [
+    "~/.dsh",
+    "global @deepseek-ai/dsh package tree",
+    "unmarked caches"
+  ],
+  "generated_artifacts": [
+    {
+      "kind": "bounded-tree",
+      "ownership": "engine runtime root from deepseek_runtime.RUN_ROOT",
+      "path": ".super-coder/run/deepseek"
+    },
+    {
+      "kind": "marked-bounded-tree",
+      "ownership": "registry/profile/credential/proof root carrying sc-dsh contracts and canonical fork identity",
+      "path": ".super-coder/run/deepseek-identity/<fork-id>"
+    },
+    {
+      "kind": "exact-file",
+      "ownership": "deepseek_web constant or sibling",
+      "path": ".super-coder/run/deepseek-web.json"
+    },
+    {
+      "kind": "exact-file",
+      "ownership": "deepseek_web constant or sibling",
+      "path": ".super-coder/run/deepseek-web.lock"
+    },
+    {
+      "kind": "exact-file",
+      "ownership": "deepseek_web constant or sibling",
+      "path": ".super-coder/run/deepseek-shell-api.json"
+    },
+    {
+      "kind": "exact-file",
+      "ownership": "deepseek_web constant or sibling",
+      "path": ".super-coder/run/deepseek-web-generation.json"
+    },
+    {
+      "kind": "exact-file",
+      "ownership": "deepseek_web constant or sibling",
+      "path": ".super-coder/run/deepseek-managed-session.json"
+    },
+    {
+      "kind": "exact-file",
+      "ownership": "deepseek_web constant or sibling",
+      "path": ".super-coder/run/deepseek-web-activity.json"
+    },
+    {
+      "kind": "exact-file",
+      "ownership": "deepseek_web constant or sibling",
+      "path": ".super-coder/run/deepseek-web-gateway.lock"
+    },
+    {
+      "kind": "exact-file",
+      "ownership": "deepseek_web constant or sibling",
+      "path": ".super-coder/logs/deepseek-web.log"
+    }
+  ],
+  "governing_spec": {
+    "document_id": 178,
+    "revision_sha256": "03220b8017f252d2842a273cfb274ad3d99b6092ba9033ebbc7c6e423bff1fcf",
+    "sprint_id": 28,
+    "task_id": 665,
+    "work_unit_id": 121
+  },
+  "immutable_migration_ledger": [
+    {
+      "bytes": 246606,
+      "filename": "0001_seed_skills.sql",
+      "path": ".super-coder/migrations/0001_seed_skills.sql",
+      "sha256": "16f3604a8375a6d49fb8b2900cae140fc5e880e38c9a62ec723436e4f97f3807"
+    },
+    {
+      "bytes": 2496,
+      "filename": "0002_roadmap_add_retired_status.sql",
+      "path": ".super-coder/migrations/0002_roadmap_add_retired_status.sql",
+      "sha256": "d01bfc506160a0c50b89df622d63d00452829c3a97296702afed8b91ff5d2ed8"
+    },
+    {
+      "bytes": 2921,
+      "filename": "0003_repo_navigation.sql",
+      "path": ".super-coder/migrations/0003_repo_navigation.sql",
+      "sha256": "394a6b29837d8f30731628a1e92293bc23d5e816b99f726773031675770b2f5e"
+    },
+    {
+      "bytes": 1999,
+      "filename": "0004_shell_messages.sql",
+      "path": ".super-coder/migrations/0004_shell_messages.sql",
+      "sha256": "ecf2ccf8ac8f239a963279021b292d7fe4108a6f01fdf91b4d525c121c7cd3d6"
+    },
+    {
+      "bytes": 1185,
+      "filename": "0005_singleton_cartographer.sql",
+      "path": ".super-coder/migrations/0005_singleton_cartographer.sql",
+      "sha256": "dbfe4a92293cd4a2602bfaffc762f64ba6b26e62c303cdd18b02bf6f58ede098"
+    },
+    {
+      "bytes": 1275,
+      "filename": "0006_flavor_defaults.sql",
+      "path": ".super-coder/migrations/0006_flavor_defaults.sql",
+      "sha256": "96964bb6e0aa7ff99b5261541183ceeff84e137d033d87b5706591d9d4c08655"
+    },
+    {
+      "bytes": 3340,
+      "filename": "0007_flavor_defaults_per_harness.sql",
+      "path": ".super-coder/migrations/0007_flavor_defaults_per_harness.sql",
+      "sha256": "1fb27b4cad5f0f6d42cf48149035cee7448b8210166a875b9a387425ec0f38d2"
+    },
+    {
+      "bytes": 840,
+      "filename": "0008_canonical_flavor_vocab.sql",
+      "path": ".super-coder/migrations/0008_canonical_flavor_vocab.sql",
+      "sha256": "e8ec0fb3acf38fa7bca54173c50287b2802142e9f9ae1eddcb5a24fec1f6abc1"
+    },
+    {
+      "bytes": 917,
+      "filename": "0009_codex_chatgpt_model_ids.sql",
+      "path": ".super-coder/migrations/0009_codex_chatgpt_model_ids.sql",
+      "sha256": "46658f2841f09630d492dbbe4b8bdc717a11cf3fdb81cf6305866b2528ec158a"
+    },
+    {
+      "bytes": 1224,
+      "filename": "0010_admin_flavor.sql",
+      "path": ".super-coder/migrations/0010_admin_flavor.sql",
+      "sha256": "7f729d9a55b904e4703b38786d9f0f3608dc0e665342d3efc6bf0042d4cafda9"
+    },
+    {
+      "bytes": 641,
+      "filename": "0011_admin_skills_noncommon.sql",
+      "path": ".super-coder/migrations/0011_admin_skills_noncommon.sql",
+      "sha256": "ab6cb7ea059cdc5ccf2364f464422b9ff3dd8be613fe8805f5292b57657f9ef1"
+    },
+    {
+      "bytes": 758,
+      "filename": "0012_spec_tasks.sql",
+      "path": ".super-coder/migrations/0012_spec_tasks.sql",
+      "sha256": "a6503f1b09d7fa9f9d0bd9c4a0d97cea4c3efdf03deb57364b9cadf8a0cbd273"
+    },
+    {
+      "bytes": 1646,
+      "filename": "0013_planner_reviewer_git_write.sql",
+      "path": ".super-coder/migrations/0013_planner_reviewer_git_write.sql",
+      "sha256": "e84a68a208a7bd14da9ce2b1b0fffd451060d7459426d3761fd214c6e1ba9dad"
+    },
+    {
+      "bytes": 651,
+      "filename": "0014_dev_spec_skill.sql",
+      "path": ".super-coder/migrations/0014_dev_spec_skill.sql",
+      "sha256": "52a8317b0d1f0bcc8dc91f44fd03a39adcedd24f3e09e05351d699d4fbe9d518"
+    },
+    {
+      "bytes": 2799,
+      "filename": "0015_claude_bookends_opencode_relicense.sql",
+      "path": ".super-coder/migrations/0015_claude_bookends_opencode_relicense.sql",
+      "sha256": "27b89ecb1b63d9a7364594acb6fe29ebf09ea1b4ab658bfa62dab658d1e32a25"
+    },
+    {
+      "bytes": 1568,
+      "filename": "0016_flat_files_are_renders.sql",
+      "path": ".super-coder/migrations/0016_flat_files_are_renders.sql",
+      "sha256": "83cde187bc9db98348b770ac9e0f6224fdd0c9a0f092733c750ee39481fa56ab"
+    },
+    {
+      "bytes": 1826,
+      "filename": "0017_feature_blockers.sql",
+      "path": ".super-coder/migrations/0017_feature_blockers.sql",
+      "sha256": "05ee380be6e8f8df6e5998f6ea7944c34ff0ef8b4ec598bf5023ec7cfb5c2820"
+    },
+    {
+      "bytes": 1689,
+      "filename": "0018_roadmap_project.sql",
+      "path": ".super-coder/migrations/0018_roadmap_project.sql",
+      "sha256": "a79f3b994aa1fc548995a9295315cfcf327a35b993d1b054ef0f3ed094cfc2ee"
+    },
+    {
+      "bytes": 1393,
+      "filename": "0019_open_weight_reviewer_cartographer.sql",
+      "path": ".super-coder/migrations/0019_open_weight_reviewer_cartographer.sql",
+      "sha256": "297babf3a48d2386b7c732b7cad2473e2caf60caee657c9431f5bb1b116b49a1"
+    },
+    {
+      "bytes": 6545,
+      "filename": "0020_planner_reviewer_thoroughness.sql",
+      "path": ".super-coder/migrations/0020_planner_reviewer_thoroughness.sql",
+      "sha256": "abbd8d19440deeac63e39df9420cf2a98dba377aaef730346cda1431a97d6292"
+    },
+    {
+      "bytes": 1146,
+      "filename": "0021_devops_flavor.sql",
+      "path": ".super-coder/migrations/0021_devops_flavor.sql",
+      "sha256": "e77ee192a76f96163636efbf70a0898f1acb3f01b9e911633e9befa73cc23015"
+    },
+    {
+      "bytes": 1418,
+      "filename": "0022_stacked_pr_prompt_rule.sql",
+      "path": ".super-coder/migrations/0022_stacked_pr_prompt_rule.sql",
+      "sha256": "3c076dcaf1c7d69fafe370ab9c98dec061ce87d10d63e6709a2e2d22fd94700c"
+    },
+    {
+      "bytes": 803,
+      "filename": "0023_dev_flavor_model_upgrade.sql",
+      "path": ".super-coder/migrations/0023_dev_flavor_model_upgrade.sql",
+      "sha256": "4fe87437cf89bc622e637e9336105aa2a135d96738686899350489da41317b10"
+    },
+    {
+      "bytes": 1244,
+      "filename": "0024_cartographer_model_refit.sql",
+      "path": ".super-coder/migrations/0024_cartographer_model_refit.sql",
+      "sha256": "dbba499cf316766be721f6f2c10f9c59a8fc68bf9b14b70b889bea62f2dcbcd2"
+    },
+    {
+      "bytes": 4573,
+      "filename": "0025_reseed_dev_kit_pg_sidecar.sql",
+      "path": ".super-coder/migrations/0025_reseed_dev_kit_pg_sidecar.sql",
+      "sha256": "56466bc420c4c7b62c0e058ff2e241d404ae26974141259bb8d6f5a029dbd1b7"
+    },
+    {
+      "bytes": 4097,
+      "filename": "0026_dev_kit_psycopg3.sql",
+      "path": ".super-coder/migrations/0026_dev_kit_psycopg3.sql",
+      "sha256": "dd218ae6328204e61bdad75ba28d0c7c1e640640da1bff56928acaa56063b67b"
+    },
+    {
+      "bytes": 1125,
+      "filename": "0027_shell_api_keys.sql",
+      "path": ".super-coder/migrations/0027_shell_api_keys.sql",
+      "sha256": "e8458cfd121c34726f20091da3923d4f44597186dce4536733cc7edf5d786b3f"
+    },
+    {
+      "bytes": 9547,
+      "filename": "0028_reseed_mem_db_map_messaging.sql",
+      "path": ".super-coder/migrations/0028_reseed_mem_db_map_messaging.sql",
+      "sha256": "9324971b0bd47ed13fa686e7a957f0c91e8c6ed588ce707de305a961b00aef01"
+    },
+    {
+      "bytes": 518,
+      "filename": "0029_fix_db_map_skill_snapshot_ref.sql",
+      "path": ".super-coder/migrations/0029_fix_db_map_skill_snapshot_ref.sql",
+      "sha256": "c9b6f42ec9cfe4d1b9f14e9502f889688b846ed17c4231b7488342b8ee6fef74"
+    },
+    {
+      "bytes": 3869,
+      "filename": "0030_reseed_dev_kit_drop_pg.sql",
+      "path": ".super-coder/migrations/0030_reseed_dev_kit_drop_pg.sql",
+      "sha256": "1750969ad8f22ba431f94c43e5e59a017bdd56162167aefc61c6b4abaf774417"
+    },
+    {
+      "bytes": 7773,
+      "filename": "0031_reseed_db_map_mem_get.sql",
+      "path": ".super-coder/migrations/0031_reseed_db_map_mem_get.sql",
+      "sha256": "b55db53dbe9067ea393ba5716bbac958a3e313c87eeae37cc30bd096904e98bc"
+    },
+    {
+      "bytes": 20600,
+      "filename": "0032_reseed_mem_api_only_cleanup.sql",
+      "path": ".super-coder/migrations/0032_reseed_mem_api_only_cleanup.sql",
+      "sha256": "ff25194c1386d2c10c0959d9e9f4f599ae2f791672f9f63f89f19cd910e626e1"
+    },
+    {
+      "bytes": 8497,
+      "filename": "0033_reseed_dev_kit_test_pg_app_only.sql",
+      "path": ".super-coder/migrations/0033_reseed_dev_kit_test_pg_app_only.sql",
+      "sha256": "1d08bfb817f07e6cf25318bbecb7c2f5ef7d13af685ca419dfadaa0a8c8cddee"
+    },
+    {
+      "bytes": 6159,
+      "filename": "0034_reseed_dev_kit_empty_sidecar_guard.sql",
+      "path": ".super-coder/migrations/0034_reseed_dev_kit_empty_sidecar_guard.sql",
+      "sha256": "fd43eb4d4aa4fe744383fdbd0a95a1311dd34fffe3eba5c4e8044d24ce6db708"
+    },
+    {
+      "bytes": 5964,
+      "filename": "0035_dev_kit_fork_owned_starter.sql",
+      "path": ".super-coder/migrations/0035_dev_kit_fork_owned_starter.sql",
+      "sha256": "06729ca6898d15b041d6aaf4f23ef56a35229216204379d80642c1c57729a9e9"
+    },
+    {
+      "bytes": 22966,
+      "filename": "0036_reseed_cwd_sc_paths.sql",
+      "path": ".super-coder/migrations/0036_reseed_cwd_sc_paths.sql",
+      "sha256": "5bd403d2f19b6c4c0fed642e4be361d52838007f82b4386b61d6c769bb5bf2e7"
+    },
+    {
+      "bytes": 1131,
+      "filename": "0037_reseed_shell_prompt_bare_sc.sql",
+      "path": ".super-coder/migrations/0037_reseed_shell_prompt_bare_sc.sql",
+      "sha256": "0b98371839fa14d9c770b6c833ba974b3f43d7b9adc60ea4474bd059d2ebc6d1"
+    },
+    {
+      "bytes": 6523,
+      "filename": "0038_reseed_configure_winbox_broker_plane.sql",
+      "path": ".super-coder/migrations/0038_reseed_configure_winbox_broker_plane.sql",
+      "sha256": "7f384ea033f89a91213541a30d3b0b0ec010178c9d8689fc31794af90e5ea5b6"
+    },
+    {
+      "bytes": 10912,
+      "filename": "0039_reseed_broker_doc_paths.sql",
+      "path": ".super-coder/migrations/0039_reseed_broker_doc_paths.sql",
+      "sha256": "5bea23985bea43bf733948cc471ba5fd3732dce52150fcc23d00f7f5795367f0"
+    },
+    {
+      "bytes": 54928,
+      "filename": "0040_reseed_skill_text_accuracy.sql",
+      "path": ".super-coder/migrations/0040_reseed_skill_text_accuracy.sql",
+      "sha256": "5faab2e4c7c6fa1587d9eac3896b3bc8964936cf14fd06b5fa8ebfddb23ec212"
+    },
+    {
+      "bytes": 30043,
+      "filename": "0041_reseed_cli_hardening.sql",
+      "path": ".super-coder/migrations/0041_reseed_cli_hardening.sql",
+      "sha256": "de9d88cb01b6914152b49b6f3649793ced28ab42e171f8e0f13c7a22ebcb812e"
+    },
+    {
+      "bytes": 20212,
+      "filename": "0042_reseed_local_skill_persistence.sql",
+      "path": ".super-coder/migrations/0042_reseed_local_skill_persistence.sql",
+      "sha256": "0a7a0f5db1fef3514be8e12ab71e9d680999bbf092283aa17155e78d222aff4d"
+    },
+    {
+      "bytes": 16636,
+      "filename": "0043_reseed_decisions_read_trigger.sql",
+      "path": ".super-coder/migrations/0043_reseed_decisions_read_trigger.sql",
+      "sha256": "e3259a3363d4bf211e210ebf7d6f68692a02e23729b88cf3f6d23901ba31fba5"
+    },
+    {
+      "bytes": 18121,
+      "filename": "0044_reseed_decisions_recall_cap.sql",
+      "path": ".super-coder/migrations/0044_reseed_decisions_recall_cap.sql",
+      "sha256": "d31cd4fce9c6d40531966122acc5c5d460b55d9ec4cbd9f9a60c003437babbf7"
+    },
+    {
+      "bytes": 699,
+      "filename": "0045_planner_claude_opus.sql",
+      "path": ".super-coder/migrations/0045_planner_claude_opus.sql",
+      "sha256": "66a4cff438230c074c9912ae067d6c4be9b62690da3fc6c8fd71b77a04be0b3a"
+    },
+    {
+      "bytes": 6259,
+      "filename": "0046_reseed_local_skill_mgmt_retire.sql",
+      "path": ".super-coder/migrations/0046_reseed_local_skill_mgmt_retire.sql",
+      "sha256": "2d12df07c365555e3246fb8c25b221c1b5455a17bec8bd69a9ea72da47b2f086"
+    },
+    {
+      "bytes": 2978,
+      "filename": "0047_decisions_feature_link.sql",
+      "path": ".super-coder/migrations/0047_decisions_feature_link.sql",
+      "sha256": "f3068c05993e39b0b513888f420946888eaecc13078825636ead9d35cc7d23c2"
+    },
+    {
+      "bytes": 3711,
+      "filename": "0048_reseed_memory_decision_link.sql",
+      "path": ".super-coder/migrations/0048_reseed_memory_decision_link.sql",
+      "sha256": "0bdfae4aba106cf0af59165c1dcebae4e9f5b6891e0c6d3d7fc66f8542df9c2b"
+    },
+    {
+      "bytes": 25599,
+      "filename": "0049_agents_skill.sql",
+      "path": ".super-coder/migrations/0049_agents_skill.sql",
+      "sha256": "94bb15cfa9e8a05722d01ee776327afe91ad2c2e187980558bed1f3101008ca1"
+    },
+    {
+      "bytes": 11799,
+      "filename": "0050_reseed_agents_field_fixes.sql",
+      "path": ".super-coder/migrations/0050_reseed_agents_field_fixes.sql",
+      "sha256": "e0a61c5458d4f0d591dd02fd58f087f19aa858c3fa8f399cd3de805d504f9a88"
+    },
+    {
+      "bytes": 178315,
+      "filename": "0053_reseed_authoring_syntax.sql",
+      "path": ".super-coder/migrations/0053_reseed_authoring_syntax.sql",
+      "sha256": "0bc989288cab6cded2065d95a604b1fa69cc645614b2eae8484b5cf922999028"
+    },
+    {
+      "bytes": 3701,
+      "filename": "0054_authoring_syntax_skill.sql",
+      "path": ".super-coder/migrations/0054_authoring_syntax_skill.sql",
+      "sha256": "c32d0d2ce65dc872ddbc2d76ab6e0dc65e9dbf7abf030b3c831a72fe768cde35"
+    },
+    {
+      "bytes": 650,
+      "filename": "0059_sprint_eventing.sql",
+      "path": ".super-coder/migrations/0059_sprint_eventing.sql",
+      "sha256": "053b05c5ec091bea21d2ed890a7bf136f2f07fe3f846dfdfe2caaae2ee15961c"
+    },
+    {
+      "bytes": 3208,
+      "filename": "0060_reseed_sprint_eventing.sql",
+      "path": ".super-coder/migrations/0060_reseed_sprint_eventing.sql",
+      "sha256": "8acf75cd7c6eca688ad17e53fc3dddce84a5fdceead226a02376b4e520e0f941"
+    },
+    {
+      "bytes": 1229,
+      "filename": "0062_message_dedupe_key.sql",
+      "path": ".super-coder/migrations/0062_message_dedupe_key.sql",
+      "sha256": "26de893bb5089612f668f216da224d35cfc124e01de55f5a7c4d22f00f8eb88f"
+    },
+    {
+      "bytes": 4288,
+      "filename": "0063_reseed_messaging.sql",
+      "path": ".super-coder/migrations/0063_reseed_messaging.sql",
+      "sha256": "ec4863d8d6b93c762b4cb9d7297f7f2d80c0a7b3cdda6407bbb01429449d633b"
+    },
+    {
+      "bytes": 2172,
+      "filename": "0064_spec_tasks_cancelled.sql",
+      "path": ".super-coder/migrations/0064_spec_tasks_cancelled.sql",
+      "sha256": "1a5f3acc4efa59f85027714c2f0ccde3fb1eabccb2e5175fd5bb53ffac1d4016"
+    },
+    {
+      "bytes": 20528,
+      "filename": "0065_reseed_task_cancel_flag_edit.sql",
+      "path": ".super-coder/migrations/0065_reseed_task_cancel_flag_edit.sql",
+      "sha256": "98edaab4fad5b081b9ed2b925fa066658247d7d5fa0b755ab1ec0e6af43fffb8"
+    },
+    {
+      "bytes": 64407,
+      "filename": "0066_reseed_skills_audit_batch.sql",
+      "path": ".super-coder/migrations/0066_reseed_skills_audit_batch.sql",
+      "sha256": "7b5f8c41b2a0383e90ee5396d9395efa7fdd4065a99df5d1d5b97db6132254ca"
+    },
+    {
+      "bytes": 5217,
+      "filename": "0067_reseed_sprint221_lessons.sql",
+      "path": ".super-coder/migrations/0067_reseed_sprint221_lessons.sql",
+      "sha256": "96823a1a8d0d9b89ed6e159101d1f9eb1fd8d68ae5f95aac27b9411148daea77"
+    },
+    {
+      "bytes": 558,
+      "filename": "0068_watch_daemon_heartbeat.sql",
+      "path": ".super-coder/migrations/0068_watch_daemon_heartbeat.sql",
+      "sha256": "a293ba97ba9e8747de0c523d382c44daf2cc51a8f6c0660f081fea6d8a1aa34e"
+    },
+    {
+      "bytes": 18019,
+      "filename": "0069_reseed_cartographer_alias.sql",
+      "path": ".super-coder/migrations/0069_reseed_cartographer_alias.sql",
+      "sha256": "25d382e75540db07f242b18ddf2d931bfaf270ea5cad67f018019283cbb3ab11"
+    },
+    {
+      "bytes": 2505,
+      "filename": "0070_telemetry_model_refit.sql",
+      "path": ".super-coder/migrations/0070_telemetry_model_refit.sql",
+      "sha256": "909c90542e0ae11fcaf37f3963c358e73c2292c15df8abfcf03430b907d698bc"
+    },
+    {
+      "bytes": 3332,
+      "filename": "0071_token_session_analytics.sql",
+      "path": ".super-coder/migrations/0071_token_session_analytics.sql",
+      "sha256": "9aa09dfd46c9efdd456047ff51af474170cd76f4dd78c5afb6fc4f02bda6f88b"
+    },
+    {
+      "bytes": 5454,
+      "filename": "0072_reseed_issue_reporting_rename.sql",
+      "path": ".super-coder/migrations/0072_reseed_issue_reporting_rename.sql",
+      "sha256": "9d185f5163ee9f4852599b0f9bbe1f2cb50d1f878b3f12330507d12dbffa0d3f"
+    },
+    {
+      "bytes": 1197,
+      "filename": "0073_analytics_parse_cache.sql",
+      "path": ".super-coder/migrations/0073_analytics_parse_cache.sql",
+      "sha256": "bd62c1c2583f7f349cc47dfe7c326c8d03a75e6fed464c3596cd0c4c5fa4ef78"
+    },
+    {
+      "bytes": 6130,
+      "filename": "0074_reseed_issue_reporting_staleness.sql",
+      "path": ".super-coder/migrations/0074_reseed_issue_reporting_staleness.sql",
+      "sha256": "6ff7d6a5b40c4448a75f0ee110da8538e9dfe51cbde1efb622b81bf423530276"
+    },
+    {
+      "bytes": 1397,
+      "filename": "0075_model_routes.sql",
+      "path": ".super-coder/migrations/0075_model_routes.sql",
+      "sha256": "822383e64d277ef6ea8f13bb7fa9368556f7e67ff0f9d7f77d4805f6f5bbc24c"
+    },
+    {
+      "bytes": 12916,
+      "filename": "0077_reseed_docs_single_writer.sql",
+      "path": ".super-coder/migrations/0077_reseed_docs_single_writer.sql",
+      "sha256": "08d262f7d15f630fc2add0797f549981d7cbbef43491899abd4ec9ccd424c956"
+    },
+    {
+      "bytes": 37955,
+      "filename": "0088_reseed_artifact_policy_skills.sql",
+      "path": ".super-coder/migrations/0088_reseed_artifact_policy_skills.sql",
+      "sha256": "8067910598aa044253c8c5e049d5c0eb2b7c6500965da9c2172958b05981f897"
+    },
+    {
+      "bytes": 7237,
+      "filename": "0090_engine_surgery_skill.sql",
+      "path": ".super-coder/migrations/0090_engine_surgery_skill.sql",
+      "sha256": "7f83a24daccb5e4b5f137fccbae1b53b9481fd9ab557575e9d5249dbe3516e92"
+    },
+    {
+      "bytes": 9063,
+      "filename": "0091_reseed_flag_sweep_dedup.sql",
+      "path": ".super-coder/migrations/0091_reseed_flag_sweep_dedup.sql",
+      "sha256": "078e7c0a964a7c181b4130d55db697cf4d079b1e3be00be4cc9e4b726de15c8e"
+    },
+    {
+      "bytes": 25469,
+      "filename": "0092_reseed_anticipated_activity_worker_fault.sql",
+      "path": ".super-coder/migrations/0092_reseed_anticipated_activity_worker_fault.sql",
+      "sha256": "99bb9772b987b0711b971d2ec5030cbe7ca5770b883751d56ad045cfc3e65629"
+    },
+    {
+      "bytes": 15800,
+      "filename": "0094_reseed_cartographer_desc_adequacy.sql",
+      "path": ".super-coder/migrations/0094_reseed_cartographer_desc_adequacy.sql",
+      "sha256": "96932e6a930c378825931b9c5f4c0b84f7c1683372d9d2c700a7554f6c00c4c8"
+    },
+    {
+      "bytes": 2998,
+      "filename": "0095_ootb_model_refit_opus_terra_kimi.sql",
+      "path": ".super-coder/migrations/0095_ootb_model_refit_opus_terra_kimi.sql",
+      "sha256": "63b1d6a0add967358713c6221fa2f7f0e3c780e0ec61e6de7ec65dda68ad2726"
+    },
+    {
+      "bytes": 8351,
+      "filename": "0096_harness_quota_accounts.sql",
+      "path": ".super-coder/migrations/0096_harness_quota_accounts.sql",
+      "sha256": "c623eb7c695b92237c2b478920bd115a50efb61404dd814eabf596cd0a594758"
+    },
+    {
+      "bytes": 6515,
+      "filename": "0097_quota_drop_account_identity.sql",
+      "path": ".super-coder/migrations/0097_quota_drop_account_identity.sql",
+      "sha256": "63167ce04977cf6c7c9a9f8096e4aa9b8ae908d47134da90801de0c14545242e"
+    },
+    {
+      "bytes": 5340,
+      "filename": "0100_lns_self_curation.sql",
+      "path": ".super-coder/migrations/0100_lns_self_curation.sql",
+      "sha256": "1e232bd65ae8669e0707207cf064bae0cfe5d297bc1e88e6772a4c23e97e5a7a"
+    },
+    {
+      "bytes": 9505,
+      "filename": "0101_reseed_memory_curate_lns_curation.sql",
+      "path": ".super-coder/migrations/0101_reseed_memory_curate_lns_curation.sql",
+      "sha256": "9c165a3cf357fc79cba12baeb26fe75a8ea81e02b10f963300445aba76de5e09"
+    },
+    {
+      "bytes": 24396,
+      "filename": "0105_flavor_skill_packs.sql",
+      "path": ".super-coder/migrations/0105_flavor_skill_packs.sql",
+      "sha256": "bab90d7973a47f825cdf1eb989410804cca383c37fef33af0ae50d1a089e7ac5"
+    },
+    {
+      "bytes": 1705,
+      "filename": "0108_reseed_decisions_chain_stop_rule.sql",
+      "path": ".super-coder/migrations/0108_reseed_decisions_chain_stop_rule.sql",
+      "sha256": "708cb6fe3a762abbbd5f8ff0a5e0e3df9111bf9c4bfdcf0e84c14fa92b15c87a"
+    },
+    {
+      "bytes": 1984,
+      "filename": "0110_shell_launch_records.sql",
+      "path": ".super-coder/migrations/0110_shell_launch_records.sql",
+      "sha256": "39cd0109d635939e72bef0b4ebd76e2a1092c8222e8e13961c893dde97236e3f"
+    },
+    {
+      "bytes": 4594,
+      "filename": "0111_reseed_flags_verbs.sql",
+      "path": ".super-coder/migrations/0111_reseed_flags_verbs.sql",
+      "sha256": "77ccd44b43691633a150344fb99db328c79b1247b1a1b846a2993e564748fef3"
+    },
+    {
+      "bytes": 925,
+      "filename": "0122_worktree_command_addressing.sql",
+      "path": ".super-coder/migrations/0122_worktree_command_addressing.sql",
+      "sha256": "20e495919fd708d1cab00283b7f6bd33cd0c18419bb187bebfd82c679ec47c1d"
+    },
+    {
+      "bytes": 3170,
+      "filename": "0126_reseed_fresh_install_shell_contract.sql",
+      "path": ".super-coder/migrations/0126_reseed_fresh_install_shell_contract.sql",
+      "sha256": "ed079392b70eca7d1f1736e4718ad461656189fbb517081384f3caa883a0acfa"
+    },
+    {
+      "bytes": 45681,
+      "filename": "0128_local_only_artifact_skills.sql",
+      "path": ".super-coder/migrations/0128_local_only_artifact_skills.sql",
+      "sha256": "78f1e7217d10b63bd5f36a8404f54306049f272112d575d94e1b39f2b4db4ef7"
+    },
+    {
+      "bytes": 1587,
+      "filename": "0129_reseed_api_identity_wording.sql",
+      "path": ".super-coder/migrations/0129_reseed_api_identity_wording.sql",
+      "sha256": "fdc1c6adde3df186bbf311bc97e0a58127a3e940324dece61f7b47eb7498aefc"
+    },
+    {
+      "bytes": 15769,
+      "filename": "0132_conversation_foundation.sql",
+      "path": ".super-coder/migrations/0132_conversation_foundation.sql",
+      "sha256": "1ac2d3d71a75dd282e63482a23cd4e9f8370318d0bbd3002e9ec1e65fbe97b99"
+    },
+    {
+      "bytes": 943,
+      "filename": "0133_one_open_normal_conversation_per_shell.sql",
+      "path": ".super-coder/migrations/0133_one_open_normal_conversation_per_shell.sql",
+      "sha256": "0e04854da7f4ee5625be0c26609647d5a9c15b70d3ab6edbe206385dd0c138f9"
+    },
+    {
+      "bytes": 260,
+      "filename": "0134_conversation_stars.sql",
+      "path": ".super-coder/migrations/0134_conversation_stars.sql",
+      "sha256": "15f717ff5c0ba95cbaa4669312fe877e6e86ebd0eba4db392ebf3245f47ea95d"
+    },
+    {
+      "bytes": 5833,
+      "filename": "0142_conversation_git_targets.sql",
+      "path": ".super-coder/migrations/0142_conversation_git_targets.sql",
+      "sha256": "e6bae0f0bd3e4b72b48fecf5b45108c0e47ad89c2840daab3e14465f540a2cf5"
+    },
+    {
+      "bytes": 19579,
+      "filename": "0144_remove_sprint_v1.sql",
+      "path": ".super-coder/migrations/0144_remove_sprint_v1.sql",
+      "sha256": "d60efb3416070c82a01ed0ac2d37d0f0e28eba2524c46235ebda29821d0e352e"
+    },
+    {
+      "bytes": 20564,
+      "filename": "0145_reseed_generic_guidance.sql",
+      "path": ".super-coder/migrations/0145_reseed_generic_guidance.sql",
+      "sha256": "a8bf2fd17c67db85b8567b2f201565869197cb354e9a8362db6b3d0daa62cbcb"
+    },
+    {
+      "bytes": 18737,
+      "filename": "0146_sprint_v2_domain.sql",
+      "path": ".super-coder/migrations/0146_sprint_v2_domain.sql",
+      "sha256": "33368c3df57288b215f71e3a682d5986df073e96dc9046ced51975d26760682f"
+    },
+    {
+      "bytes": 5049,
+      "filename": "0147_sprint_participant_conversations.sql",
+      "path": ".super-coder/migrations/0147_sprint_participant_conversations.sql",
+      "sha256": "571294e71dff1f92327465093953a598ebe9aede092f31c6d5ef923f7e4491db"
+    },
+    {
+      "bytes": 3975,
+      "filename": "0148_sprint_message_delivery.sql",
+      "path": ".super-coder/migrations/0148_sprint_message_delivery.sql",
+      "sha256": "1e00ee9425ab9bcf7f4618703d2fee34a10ca98c9803c1e2838184397b1721d7"
+    },
+    {
+      "bytes": 4837,
+      "filename": "0149_sprint_liveness_monitor.sql",
+      "path": ".super-coder/migrations/0149_sprint_liveness_monitor.sql",
+      "sha256": "f59d90a0d7b1a598c96746a37a84580bb8b4aff77f5030844d21e5697d10b914"
+    },
+    {
+      "bytes": 3188,
+      "filename": "0150_sprint_close_reports.sql",
+      "path": ".super-coder/migrations/0150_sprint_close_reports.sql",
+      "sha256": "501f098cbd56450ed2d0fb7db65a669fe22830081f26367f8010e7878ce23c93"
+    },
+    {
+      "bytes": 24935,
+      "filename": "0151_seed_sprint_v2_skills.sql",
+      "path": ".super-coder/migrations/0151_seed_sprint_v2_skills.sql",
+      "sha256": "83652abe172c544baf5a4ddd5a93bdba04054dec344f798ef645a988e6fca58d"
+    },
+    {
+      "bytes": 608,
+      "filename": "0152_sprint_surface_completion.sql",
+      "path": ".super-coder/migrations/0152_sprint_surface_completion.sql",
+      "sha256": "1faff48ff62c180739d49bd3dcd6e50e03c0eee79d541b64b6351b37a977d003"
+    },
+    {
+      "bytes": 30798,
+      "filename": "0153_harden_sprint_handoff_skills.sql",
+      "path": ".super-coder/migrations/0153_harden_sprint_handoff_skills.sql",
+      "sha256": "49bf4526e446153bccd94c86bef5b3f6a1aa42dd3d5388531b5986fb3b02b111"
+    },
+    {
+      "bytes": 1385,
+      "filename": "0154_remove_tombstoned_skills.sql",
+      "path": ".super-coder/migrations/0154_remove_tombstoned_skills.sql",
+      "sha256": "50d705197262e773ceae55825509b052531ee0f6854f83aee14a9533f08d6582"
+    },
+    {
+      "bytes": 10629,
+      "filename": "0155_reseed_catalogue_cleanup.sql",
+      "path": ".super-coder/migrations/0155_reseed_catalogue_cleanup.sql",
+      "sha256": "37450266a80a92e38dd62b00169328b7a6715b84d892236711422c1e17c138ef"
+    },
+    {
+      "bytes": 1525,
+      "filename": "0155_sprint_conversation_generations.sql",
+      "path": ".super-coder/migrations/0155_sprint_conversation_generations.sql",
+      "sha256": "f8eb2269413c5cdba85cba175a0e8e991996ac2daa627ba88c3dbb19c1af669e"
+    },
+    {
+      "bytes": 11800,
+      "filename": "0156_reseed_curation_governance.sql",
+      "path": ".super-coder/migrations/0156_reseed_curation_governance.sql",
+      "sha256": "0820e45e7dbb9fd3f9f5781e89186dd09123fbfc3271d2d971e55b11d3d358df"
+    },
+    {
+      "bytes": 1358,
+      "filename": "0157_reopen_closed_conversations.sql",
+      "path": ".super-coder/migrations/0157_reopen_closed_conversations.sql",
+      "sha256": "d7d663b85b3b65ffe23241e0954ff4f4ff1b7fb2f6f54115ef199d12ab49a4bd"
+    },
+    {
+      "bytes": 1892,
+      "filename": "0158_sprint_terminal_liveness_hardening.sql",
+      "path": ".super-coder/migrations/0158_sprint_terminal_liveness_hardening.sql",
+      "sha256": "bd4f9b51db059dcd5f1f3dccd017a50a72144709c9397e9f92ee4bae12c8e258"
+    },
+    {
+      "bytes": 50841,
+      "filename": "0159_reseed_sprint_native_wake_skills.sql",
+      "path": ".super-coder/migrations/0159_reseed_sprint_native_wake_skills.sql",
+      "sha256": "e56fa6c640b121396c3543bc38df69c7952a9bac82e7dc597719dfe6b052e843"
+    },
+    {
+      "bytes": 4154,
+      "filename": "0160_reseed_migration_management.sql",
+      "path": ".super-coder/migrations/0160_reseed_migration_management.sql",
+      "sha256": "7292a452a293bd70c82594e6ae07aad1de23565f5bc5925ef345e34edf3c5bf3"
+    },
+    {
+      "bytes": 4818,
+      "filename": "0161_reseed_flags_output_guidance.sql",
+      "path": ".super-coder/migrations/0161_reseed_flags_output_guidance.sql",
+      "sha256": "f3be181341c5eda132953a158e7814424fd2fd37d2cdb3dbd3311d0b357c4ee6"
+    },
+    {
+      "bytes": 4717,
+      "filename": "0162_active_chat_registry.sql",
+      "path": ".super-coder/migrations/0162_active_chat_registry.sql",
+      "sha256": "6c826f11e8aab5de59abfe6b391d3b6c94653cdcc601db42aef2060179fbe841"
+    },
+    {
+      "bytes": 2533,
+      "filename": "0163_conversation_run_process_identity.sql",
+      "path": ".super-coder/migrations/0163_conversation_run_process_identity.sql",
+      "sha256": "32d1977cb42ac3acacf5e7c9b9c3cfa7865d0c290e6d92c2d3b1862b18ab8e53"
+    },
+    {
+      "bytes": 15859,
+      "filename": "0164_wake_message_delivery.sql",
+      "path": ".super-coder/migrations/0164_wake_message_delivery.sql",
+      "sha256": "e9635a48bf96543ea441a7ab081577edf5cbad2e9b1b2ece457198147b97a4b9"
+    },
+    {
+      "bytes": 4009,
+      "filename": "0165_pr_subscriptions.sql",
+      "path": ".super-coder/migrations/0165_pr_subscriptions.sql",
+      "sha256": "cfa1ed123bd26aea870049c89626e62a7f347819a962c761d77bbb82f3488aff"
+    },
+    {
+      "bytes": 433,
+      "filename": "0166_sprint_coordinate_mode.sql",
+      "path": ".super-coder/migrations/0166_sprint_coordinate_mode.sql",
+      "sha256": "4f1ac56d8d5b2689bd07e862544d255e48af56a49e0af96da174e4f7ceb5c1c4"
+    },
+    {
+      "bytes": 21532,
+      "filename": "0167_reseed_sprint_authority_split.sql",
+      "path": ".super-coder/migrations/0167_reseed_sprint_authority_split.sql",
+      "sha256": "71a175bf0bad6c227589c0c55f23b7babb577a1f0042afca51bb257fefa7c11a"
+    },
+    {
+      "bytes": 3224,
+      "filename": "0168_retire_sprint_conversation_topology.sql",
+      "path": ".super-coder/migrations/0168_retire_sprint_conversation_topology.sql",
+      "sha256": "ca080617a075db789070f5f1cf71047d34778d07f51a6c10033327e0b98869ce"
+    },
+    {
+      "bytes": 46732,
+      "filename": "0169_reseed_sprint_v21_guidance.sql",
+      "path": ".super-coder/migrations/0169_reseed_sprint_v21_guidance.sql",
+      "sha256": "a3da7356cf3d02eb9e3433427307ab17aab2e1e8c41425bc89d039c6d64c4281"
+    },
+    {
+      "bytes": 34013,
+      "filename": "0170_reseed_sprint_handoff_order.sql",
+      "path": ".super-coder/migrations/0170_reseed_sprint_handoff_order.sql",
+      "sha256": "a8ba62473b2d18b17ab249c52c1e7d4a5d1ff73fcd87e2c5632fee9e85ec9901"
+    },
+    {
+      "bytes": 48832,
+      "filename": "0171_reseed_sprint_closeout_skills.sql",
+      "path": ".super-coder/migrations/0171_reseed_sprint_closeout_skills.sql",
+      "sha256": "8bd0afbffa114742b14474f74a0ecbcf8536ede95fab47c5e38a7f75d83edacc"
+    },
+    {
+      "bytes": 10434,
+      "filename": "0172_sanctioned_pause_liveness.sql",
+      "path": ".super-coder/migrations/0172_sanctioned_pause_liveness.sql",
+      "sha256": "bfb75e54a23428eb89fc793078c02c24daea7aec99620f28f507229616d04c9c"
+    },
+    {
+      "bytes": 9053,
+      "filename": "0173_force_new_wake_delivery.sql",
+      "path": ".super-coder/migrations/0173_force_new_wake_delivery.sql",
+      "sha256": "15129c48a68a247ce62587b5f80c318900e3ff5f624e48b4a84e5c0de09bb954"
+    },
+    {
+      "bytes": 41697,
+      "filename": "0174_reseed_force_new_wake_skills.sql",
+      "path": ".super-coder/migrations/0174_reseed_force_new_wake_skills.sql",
+      "sha256": "79fd45ac382f47a6b1ed7e01a5c7202905555f19a4104f15c73d87d403ba8d31"
+    },
+    {
+      "bytes": 872,
+      "filename": "0175_daemon_heartbeat_history.sql",
+      "path": ".super-coder/migrations/0175_daemon_heartbeat_history.sql",
+      "sha256": "34b9cd2e00d13c2b9ea0a32d9368afdbf167e696b49cb14c362a87704a26310b"
+    },
+    {
+      "bytes": 16750,
+      "filename": "0176_reseed_sprint_red_check_doctrine.sql",
+      "path": ".super-coder/migrations/0176_reseed_sprint_red_check_doctrine.sql",
+      "sha256": "caa62235422488cdb3ff6ace343afbc68968016c1cd978e2f60836bc8b5e6073"
+    },
+    {
+      "bytes": 1305,
+      "filename": "0177_pr_poll_failure_coalescing.sql",
+      "path": ".super-coder/migrations/0177_pr_poll_failure_coalescing.sql",
+      "sha256": "511ed9d565cff5722daa0d46157bbcf0f2a8071e86b0a0ec00fa11f53728548d"
+    },
+    {
+      "bytes": 26908,
+      "filename": "0178_reseed_sprint_watcher_state_skills.sql",
+      "path": ".super-coder/migrations/0178_reseed_sprint_watcher_state_skills.sql",
+      "sha256": "25477efd67b607383622ba2054ea942d56fe45c06012a9f2a4768fe8dd928cb8"
+    },
+    {
+      "bytes": 43913,
+      "filename": "0179_reseed_atomic_sprint_closeout.sql",
+      "path": ".super-coder/migrations/0179_reseed_atomic_sprint_closeout.sql",
+      "sha256": "1d62d4d8e1da67007ef6e2189e0462e8a5eb472ca9f58216c039e4b61fba04e1"
+    },
+    {
+      "bytes": 9416,
+      "filename": "0180_reseed_windows_vm_skills.sql",
+      "path": ".super-coder/migrations/0180_reseed_windows_vm_skills.sql",
+      "sha256": "c164dc8c4700b703044bce3ecef2a128f8339bfb00d41eef1f1f29a1395d8fb9"
+    },
+    {
+      "bytes": 9967,
+      "filename": "0181_reseed_windows_vm_adapter_recovery.sql",
+      "path": ".super-coder/migrations/0181_reseed_windows_vm_adapter_recovery.sql",
+      "sha256": "da1ab5b2140264cefb82f27b32113a9b6f079f4212bb01fa67f5aae708aff524"
+    },
+    {
+      "bytes": 10322,
+      "filename": "0182_reseed_windows_guest_shell_output.sql",
+      "path": ".super-coder/migrations/0182_reseed_windows_guest_shell_output.sql",
+      "sha256": "7d2bfcc582cc30160893d9da5aaa2507517113979ef452984982f25eac57ff79"
+    },
+    {
+      "bytes": 10637,
+      "filename": "0183_reseed_windows_gui_app_help.sql",
+      "path": ".super-coder/migrations/0183_reseed_windows_gui_app_help.sql",
+      "sha256": "eacf5f1a79af072e68db9a42bb4d19a53194871bf1f9061bf532c375d444b0bd"
+    },
+    {
+      "bytes": 56690,
+      "filename": "0184_reseed_sprint_skill_polish.sql",
+      "path": ".super-coder/migrations/0184_reseed_sprint_skill_polish.sql",
+      "sha256": "a62794316d0fda2cad8c29def0d8269c46cd096987a12b1ceba578ac07798d14"
+    },
+    {
+      "bytes": 10710,
+      "filename": "0185_optional_sprint_qaqc.sql",
+      "path": ".super-coder/migrations/0185_optional_sprint_qaqc.sql",
+      "sha256": "ef6306b3c9aeb6bbab8e4c824566f767b53ee383e9845430ccc694e4922f983a"
+    },
+    {
+      "bytes": 723,
+      "filename": "0186_admin_singleton.sql",
+      "path": ".super-coder/migrations/0186_admin_singleton.sql",
+      "sha256": "391676857c6d57529a65f34b5fc770f66fef690ee6a80620d02212db771d969b"
+    },
+    {
+      "bytes": 3866,
+      "filename": "0187_reseed_local_skill_management.sql",
+      "path": ".super-coder/migrations/0187_reseed_local_skill_management.sql",
+      "sha256": "dbed86aab3fd6f5887aad5e7c5f73d91c39bd2c879119ea84afce11a9fff715a"
+    },
+    {
+      "bytes": 12582,
+      "filename": "0188_realign_flavor_skill_packs.sql",
+      "path": ".super-coder/migrations/0188_realign_flavor_skill_packs.sql",
+      "sha256": "4bfe1560b157aa54490b9d855931a583713cac48c2c92833227c4a782334210e"
+    },
+    {
+      "bytes": 36884,
+      "filename": "0189_reseed_spec_scope_audience.sql",
+      "path": ".super-coder/migrations/0189_reseed_spec_scope_audience.sql",
+      "sha256": "42dbf344a209426582f26395160ecb7521cec1498d7d46f7ed484cd7fcfb214c"
+    },
+    {
+      "bytes": 38125,
+      "filename": "0190_reseed_successful_sprint_chat_cleanup.sql",
+      "path": ".super-coder/migrations/0190_reseed_successful_sprint_chat_cleanup.sql",
+      "sha256": "d27a815b1846c7abf8a01d66bff3f02122f5b4670dbb27ed8b70e089f2a9b445"
+    },
+    {
+      "bytes": 6949,
+      "filename": "0191_reseed_target_aware_dev_kit.sql",
+      "path": ".super-coder/migrations/0191_reseed_target_aware_dev_kit.sql",
+      "sha256": "d619bb6d32862dc40a1c93ef650cb8caeb46307a86b379e747b591895a1a1c3a"
+    },
+    {
+      "bytes": 16140,
+      "filename": "0192_reseed_sprint_pr_recovery.sql",
+      "path": ".super-coder/migrations/0192_reseed_sprint_pr_recovery.sql",
+      "sha256": "d685ec91a6532be76e184dfadf6c5d25d431f1733311e0e7fa68a1a5e348ba00"
+    },
+    {
+      "bytes": 347,
+      "filename": "0193_retire_sprint_liveness_acceptance.sql",
+      "path": ".super-coder/migrations/0193_retire_sprint_liveness_acceptance.sql",
+      "sha256": "887ca097d71bf388dfe45b93a9c30ffe61731bb8bebb86577db0c6d8421ed3bc"
+    },
+    {
+      "bytes": 653,
+      "filename": "0194_sprint_scoped_reply_waits.sql",
+      "path": ".super-coder/migrations/0194_sprint_scoped_reply_waits.sql",
+      "sha256": "2ccf371a7c3feca7273ae802b8cd359a138fc6b30f08ad4c219fc065333b8167"
+    },
+    {
+      "bytes": 49053,
+      "filename": "0195_reseed_sprint_progress_carriers.sql",
+      "path": ".super-coder/migrations/0195_reseed_sprint_progress_carriers.sql",
+      "sha256": "3e4710ae4f3a30112635b3bde2902884443994abe7f37d30cfa291d495656601"
+    },
+    {
+      "bytes": 753,
+      "filename": "0196_sprint_wake_recovery_provenance.sql",
+      "path": ".super-coder/migrations/0196_sprint_wake_recovery_provenance.sql",
+      "sha256": "56d1ad63652c204a37b9f82d42d4ae9f13e8002a6dc2187e5a07b09a858d38e8"
+    },
+    {
+      "bytes": 13164,
+      "filename": "0197_reseed_reopened_pr_resubscription.sql",
+      "path": ".super-coder/migrations/0197_reseed_reopened_pr_resubscription.sql",
+      "sha256": "98d2d710d02d624515778f3cabc8b4ade8f9c994fae74de0f700d91196b7877b"
+    },
+    {
+      "bytes": 13785,
+      "filename": "0198_reseed_engine_authored_review_handoff.sql",
+      "path": ".super-coder/migrations/0198_reseed_engine_authored_review_handoff.sql",
+      "sha256": "bd1773a1eef74a54aad77eedade0ed47755c1e342bcf4376e445c5e3ed58e9ae"
+    },
+    {
+      "bytes": 1064,
+      "filename": "0199_sprint_live_replanning.sql",
+      "path": ".super-coder/migrations/0199_sprint_live_replanning.sql",
+      "sha256": "aaa651d33deb1684df0efc87c2cec3e265f0336996202033e1fe814cfe4930dc"
+    },
+    {
+      "bytes": 40095,
+      "filename": "0200_reseed_sprint_live_replanning.sql",
+      "path": ".super-coder/migrations/0200_reseed_sprint_live_replanning.sql",
+      "sha256": "d087fff4041e6b6e454de0cc71dda3c5372c106cef6330b5a838bc5489f0efda"
+    },
+    {
+      "bytes": 5125,
+      "filename": "0201_sprint_cleanup_targets.sql",
+      "path": ".super-coder/migrations/0201_sprint_cleanup_targets.sql",
+      "sha256": "b7ca24665a8501c4d8294e8f541602234e1c0f828513df4f918a5fa8f88bffef"
+    },
+    {
+      "bytes": 41451,
+      "filename": "0202_reseed_context_efficient_skills.sql",
+      "path": ".super-coder/migrations/0202_reseed_context_efficient_skills.sql",
+      "sha256": "9662c63717b1de88e7ca4527a5c7e6761f40f7a56114febad932fa3bd754cf20"
+    },
+    {
+      "bytes": 50951,
+      "filename": "0203_sprint_cleanup_recovery.sql",
+      "path": ".super-coder/migrations/0203_sprint_cleanup_recovery.sql",
+      "sha256": "5caae31df7ea4c31a73623c80247453522cfb2faab2fcff78d36b6a880b8ad6d"
+    },
+    {
+      "bytes": 2131,
+      "filename": "0204_sprint_governing_revision_evidence.sql",
+      "path": ".super-coder/migrations/0204_sprint_governing_revision_evidence.sql",
+      "sha256": "c4a08b6d9539deaea259f76c2d7644343df0e96e228e62946be0b5b1787e5be7"
+    },
+    {
+      "bytes": 2899,
+      "filename": "0205_sprint_conformance_ownership.sql",
+      "path": ".super-coder/migrations/0205_sprint_conformance_ownership.sql",
+      "sha256": "bdc3ee338b822816e089dd32285aa472649c1e4a2c44f9f9ed84c9c6b5a4310c"
+    },
+    {
+      "bytes": 43430,
+      "filename": "0206_reseed_sprint_conformance_ownership.sql",
+      "path": ".super-coder/migrations/0206_reseed_sprint_conformance_ownership.sql",
+      "sha256": "05d667264c0efbe9cf361ad09fe536bb58edda48fe3ba76ccdaa88c70e4b39c6"
+    },
+    {
+      "bytes": 39041,
+      "filename": "0207_reseed_sprint_receipt_recovery.sql",
+      "path": ".super-coder/migrations/0207_reseed_sprint_receipt_recovery.sql",
+      "sha256": "806e86686bed89b776c0c92e42636f4e42ec89ccbad9028ae3e61e821b14fa15"
+    },
+    {
+      "bytes": 7456,
+      "filename": "0208_reseed_disposable_shell_base.sql",
+      "path": ".super-coder/migrations/0208_reseed_disposable_shell_base.sql",
+      "sha256": "26d97775929aa2724691e8a2e4b9f60ebc5b786cd44ae16a9f9ff174dd6882c5"
+    },
+    {
+      "bytes": 8263,
+      "filename": "0209_reseed_git_github_capabilities.sql",
+      "path": ".super-coder/migrations/0209_reseed_git_github_capabilities.sql",
+      "sha256": "44bc9158ba63dcb153a4b7dd985a1e3206da12b698a3b4db3c6c6584579e1482"
+    },
+    {
+      "bytes": 2281,
+      "filename": "0210_runtime_advisory_flags.sql",
+      "path": ".super-coder/migrations/0210_runtime_advisory_flags.sql",
+      "sha256": "8770c4d9e33a973ac7754f0e8d9a8d28d32b54c8f6d1df98fd74307172237dda"
+    },
+    {
+      "bytes": 7866,
+      "filename": "0211_reseed_native_package_dev_kit.sql",
+      "path": ".super-coder/migrations/0211_reseed_native_package_dev_kit.sql",
+      "sha256": "47603f5088f51650867a2e903724e14cdbd43e4dff997ca86c64d3897f17f339"
+    },
+    {
+      "bytes": 7923,
+      "filename": "0212_route_binding_foundation.sql",
+      "path": ".super-coder/migrations/0212_route_binding_foundation.sql",
+      "sha256": "30266fec8e137636bee33b976819fba7e27c8e21a4e1c151212eb307c743d4f9"
+    },
+    {
+      "bytes": 1919,
+      "filename": "0213_thinking_preset_conversations.sql",
+      "path": ".super-coder/migrations/0213_thinking_preset_conversations.sql",
+      "sha256": "4691f41dff11dcab9493d4bc8ee56939d1f047d64fcdc09a858ba62afde81bf6"
+    },
+    {
+      "bytes": 10766,
+      "filename": "0215_reseed_sprint_binding_guidance.sql",
+      "path": ".super-coder/migrations/0215_reseed_sprint_binding_guidance.sql",
+      "sha256": "aa95f6510cac55cab44a969bb6d1f07710d3a68cac433396689a6b4709c71f40"
+    },
+    {
+      "bytes": 1094,
+      "filename": "0216_sprint_binding_provenance.sql",
+      "path": ".super-coder/migrations/0216_sprint_binding_provenance.sql",
+      "sha256": "f72612b1acc4739f6b52dc0a44e9cd7168b2bfe4abe41e2d679d6e044c611bdb"
+    },
+    {
+      "bytes": 532,
+      "filename": "0217_harness_support_metadata.sql",
+      "path": ".super-coder/migrations/0217_harness_support_metadata.sql",
+      "sha256": "d76c59244641201dfa338e352cd75047374549832934ce736b24761a51e6f1fe"
+    },
+    {
+      "bytes": 1092,
+      "filename": "0218_sprint_binding_support_provenance.sql",
+      "path": ".super-coder/migrations/0218_sprint_binding_support_provenance.sql",
+      "sha256": "762ba98b382df91ab46f5fa2c5176b2f5424e548031a6e8fb5462bfaa87067d0"
+    },
+    {
+      "bytes": 577,
+      "filename": "0219_harness_support_refresh_boundary.sql",
+      "path": ".super-coder/migrations/0219_harness_support_refresh_boundary.sql",
+      "sha256": "ffeca8688e09a8d657406ebd0f33455994af11739d21485f6402fc5646d298df"
+    },
+    {
+      "bytes": 5321,
+      "filename": "0220_reseed_curate_recommendation_route.sql",
+      "path": ".super-coder/migrations/0220_reseed_curate_recommendation_route.sql",
+      "sha256": "1718933194baeb262c59a0d39d7b52861c1d039c8168fe6bc49eb2642892de7d"
+    },
+    {
+      "bytes": 673,
+      "filename": "0221_planner_unit_disposition.sql",
+      "path": ".super-coder/migrations/0221_planner_unit_disposition.sql",
+      "sha256": "24fa2fc971c5881f81305650d4a60d9eaa0b56b7d3b66b74d64ee936e1f600a2"
+    },
+    {
+      "bytes": 15723,
+      "filename": "0222_reseed_sprint_pln_disposition_verbs.sql",
+      "path": ".super-coder/migrations/0222_reseed_sprint_pln_disposition_verbs.sql",
+      "sha256": "43dca8c49d454be911cb8f2d7c0c96d69e25f033a42acd535fb48237b1ed173c"
+    },
+    {
+      "bytes": 9957,
+      "filename": "0223_model_default_effort_binding.sql",
+      "path": ".super-coder/migrations/0223_model_default_effort_binding.sql",
+      "sha256": "320b4b6315b9daaf77908da95a83677d5710878eeca7c7c4ce84974c5b0fa928"
+    },
+    {
+      "bytes": 2200,
+      "filename": "0224_conversation_boot_snapshots.sql",
+      "path": ".super-coder/migrations/0224_conversation_boot_snapshots.sql",
+      "sha256": "8d4927f22d1539fdcc7aa02dfebd9f1c18e645911425b91d58f9e9e807842513"
+    },
+    {
+      "bytes": 28773,
+      "filename": "0225_focused_dev_verification.sql",
+      "path": ".super-coder/migrations/0225_focused_dev_verification.sql",
+      "sha256": "888e8d75c285b674e5fecd329d5c0128c406d43a626a7a9692f56a5e3e7e4ba7"
+    },
+    {
+      "bytes": 15441,
+      "filename": "0226_reseed_cartographer_workflow_hardening.sql",
+      "path": ".super-coder/migrations/0226_reseed_cartographer_workflow_hardening.sql",
+      "sha256": "9d309cec89070c9ebb32084336df7f3544e32e81358959bd6611a0cc1d5a68f6"
+    },
+    {
+      "bytes": 9560,
+      "filename": "0227_deepseek_controlled_route_binding.sql",
+      "path": ".super-coder/migrations/0227_deepseek_controlled_route_binding.sql",
+      "sha256": "1505e28d5bd6426418b46a94402dad549e27ade30308f55256c248be1742ecc5"
+    },
+    {
+      "bytes": 8374,
+      "filename": "0228_reseed_python_test_tooling.sql",
+      "path": ".super-coder/migrations/0228_reseed_python_test_tooling.sql",
+      "sha256": "ebe75449dc6562aec9636c9e44d1d40f976680f5cd218211838e584d8f6a88dc"
+    },
+    {
+      "bytes": 5421,
+      "filename": "0229_reseed_messaging_wake_guidance.sql",
+      "path": ".super-coder/migrations/0229_reseed_messaging_wake_guidance.sql",
+      "sha256": "fb583deb049e951737177e19ca2721d813f9432fac72700006650bfad2a18a15"
+    },
+    {
+      "bytes": 9563,
+      "filename": "0230_deepseek_stock_host_route_binding.sql",
+      "path": ".super-coder/migrations/0230_deepseek_stock_host_route_binding.sql",
+      "sha256": "2445526e53776c02548c3141c5922e3224d105a12b8565108a233d8d3ac40b67"
+    },
+    {
+      "bytes": 774,
+      "filename": "0231_suppress_aborted_sprint_pr_wakes.sql",
+      "path": ".super-coder/migrations/0231_suppress_aborted_sprint_pr_wakes.sql",
+      "sha256": "59f918c961c08ee48e04140be2f68243c84552bac054c34f2f91cb270ce8ae79"
+    },
+    {
+      "bytes": 6079,
+      "filename": "0232_seed_harness_readiness_skill.sql",
+      "path": ".super-coder/migrations/0232_seed_harness_readiness_skill.sql",
+      "sha256": "5717daf081c52986e49bfdaf6525013def7726c323d826a1400ddd4699beff40"
+    },
+    {
+      "bytes": 766,
+      "filename": "0233_reseed_sprint_aware_pr_notifications.sql",
+      "path": ".super-coder/migrations/0233_reseed_sprint_aware_pr_notifications.sql",
+      "sha256": "ee048bef9b7b00c531a6e3d0613aa79aeb5fa0784a979d74777487e6085ec216"
+    },
+    {
+      "bytes": 55301,
+      "filename": "0234_reseed_ci_fallback_authority.sql",
+      "path": ".super-coder/migrations/0234_reseed_ci_fallback_authority.sql",
+      "sha256": "054ad87baf0792b71d418802c6543450c42a08ffb3073079cae5e744f39132ed"
+    },
+    {
+      "bytes": 11510,
+      "filename": "0235_live_native_route_binding_v3.sql",
+      "path": ".super-coder/migrations/0235_live_native_route_binding_v3.sql",
+      "sha256": "a8d1d539b6d654cb7646a0d37efbf5de7abc5ccf20434fc6a1fc7ab5e21abd53"
+    },
+    {
+      "bytes": 9008,
+      "filename": "0236_live_native_conversation_routes.sql",
+      "path": ".super-coder/migrations/0236_live_native_conversation_routes.sql",
+      "sha256": "793ca78190e401e6c01e866bde035c4109b46c1ffd28539a6d54a84386e4e732"
+    }
+  ],
+  "immutable_reference_migrations": [
+    {
+      "bytes": 3340,
+      "disposition": "preserve-retained-opencode-model-history",
+      "path": ".super-coder/migrations/0007_flavor_defaults_per_harness.sql",
+      "sha256": "1fb27b4cad5f0f6d42cf48149035cee7448b8210166a875b9a387425ec0f38d2"
+    },
+    {
+      "bytes": 2799,
+      "disposition": "preserve-retained-opencode-model-history",
+      "path": ".super-coder/migrations/0015_claude_bookends_opencode_relicense.sql",
+      "sha256": "27b89ecb1b63d9a7364594acb6fe29ebf09ea1b4ab658bfa62dab658d1e32a25"
+    },
+    {
+      "bytes": 2998,
+      "disposition": "preserve-retained-opencode-model-history",
+      "path": ".super-coder/migrations/0095_ootb_model_refit_opus_terra_kimi.sql",
+      "sha256": "63b1d6a0add967358713c6221fa2f7f0e3c780e0ec61e6de7ec65dda68ad2726"
+    },
+    {
+      "bytes": 9560,
+      "disposition": "preserve-dsh-history",
+      "path": ".super-coder/migrations/0227_deepseek_controlled_route_binding.sql",
+      "sha256": "1505e28d5bd6426418b46a94402dad549e27ade30308f55256c248be1742ecc5"
+    },
+    {
+      "bytes": 9563,
+      "disposition": "preserve-dsh-history",
+      "path": ".super-coder/migrations/0230_deepseek_stock_host_route_binding.sql",
+      "sha256": "2445526e53776c02548c3141c5922e3224d105a12b8565108a233d8d3ac40b67"
+    },
+    {
+      "bytes": 11510,
+      "disposition": "preserve-dsh-history",
+      "path": ".super-coder/migrations/0235_live_native_route_binding_v3.sql",
+      "sha256": "a8d1d539b6d654cb7646a0d37efbf5de7abc5ccf20434fc6a1fc7ab5e21abd53"
+    },
+    {
+      "bytes": 9008,
+      "disposition": "preserve-dsh-history",
+      "path": ".super-coder/migrations/0236_live_native_conversation_routes.sql",
+      "sha256": "793ca78190e401e6c01e866bde035c4109b46c1ffd28539a6d54a84386e4e732"
+    }
+  ],
+  "installed_fixture_contract": {
+    "cleanup_receipt": ".sc-state/local/dsh-removal/cleanup-receipt.json",
+    "compatibility_floor": "tests/fixtures/dsh_removal/compatibility-floor.json",
+    "compatibility_marker": ".sc-state/local/dsh-removal/compatibility-floor.json",
+    "cutover_receipt": ".sc-state/local/dsh-removal/cutover-receipt.json",
+    "payload": "tests/fixtures/dsh_removal/tracked-artifacts.tar.gz",
+    "pre_bridge": "tests/fixtures/dsh_removal/pre-bridge.json"
+  },
+  "ports": [
+    {
+      "formula": "instance.deepseek_host_port = 8900 + repository offset",
+      "name": "public",
+      "owner": "super-coder-dsh-relay"
+    },
+    {
+      "formula": "instance.deepseek_host_port + 10000",
+      "name": "private-host-bare-metal",
+      "owner": "stock-dsh-host"
+    },
+    {
+      "formula": "instance.deepseek_host_port + 10000",
+      "name": "private-relay-sandbox",
+      "owner": "super-coder-dsh-relay"
+    }
+  ],
+  "processes": [
+    {
+      "command_identity": [
+        "dsh",
+        "--profile",
+        "<profile-id>",
+        "--host",
+        "127.0.0.1"
+      ],
+      "name": "stock-dsh-host",
+      "pid_field": "web_pid",
+      "port_field": "service_port",
+      "start_ticks_field": "web_start_ticks",
+      "state_path": ".super-coder/run/deepseek-web.json"
+    },
+    {
+      "command_identity": [
+        "python",
+        "deepseek_web.py",
+        "relay"
+      ],
+      "name": "super-coder-dsh-relay",
+      "pid_field": "relay_pid",
+      "port_field": "relay_port",
+      "start_ticks_field": "relay_start_ticks",
+      "state_path": ".super-coder/run/deepseek-web.json"
+    }
+  ],
+  "retained_controls": [
+    "Claude, Codex, OpenCode, Vibe, and Kimi adapter manifests and install/probe paths",
+    "OpenCode-owned DeepSeek-family selectors and native-option identity",
+    "generic normalized conversation messages, events, transcripts, and completed usage",
+    "generic Sprint rows, participants, messages, events, and immutable route-binding history",
+    "instance port and dev_port plus API/review service ownership",
+    "schema.sql and every pre-existing ordered migration byte",
+    "user-owned ~/.dsh, external global packages, and unmarked caches"
+  ],
+  "scan": {
+    "excluded_provenance_roots": [
+      ".super-coder/assets/dsh-removal/",
+      "tests/fixtures/dsh_removal/",
+      "tests/fixtures/live_model/",
+      "tests/test_dsh_removal_preparation.py"
+    ],
+    "pattern": "deepseek|(?<![a-z0-9])dsh(?![a-z0-9])",
+    "roots": [
+      ".github",
+      ".super-coder",
+      "docs",
+      "maintainer",
+      "tests",
+      "Makefile",
+      "README.md",
+      "requirements.txt",
+      "sc"
+    ]
+  },
+  "schema_version": 1,
+  "shared_sources": [
+    {
+      "bytes": 9165,
+      "ownership": "retained-shared-source",
+      "path": ".github/workflows/tests.yml",
+      "sha256": "7b371f3f49dffe480331c389f5376aaef91c8c08bb06311a7e5db43feca51ee5"
+    },
+    {
+      "bytes": 3791,
+      "ownership": "retained-shared-source",
+      "path": ".github/workflows/trusted-main.yml",
+      "sha256": "a61922737587948a70ada038ee5ebc5cef7b8b38364c3565656a878512c794d9"
+    },
+    {
+      "bytes": 14950,
+      "ownership": "retained-shared-source",
+      "path": ".super-coder/Dockerfile",
+      "sha256": "6a195f88684e5b337644fb55b3c1f1b6704b51b42e736f8562dfbad0c000a7e9"
+    },
+    {
+      "bytes": 100068,
+      "ownership": "retained-shared-source",
+      "path": ".super-coder/api/conversation_routes.py",
+      "sha256": "990bd231315fccee2b8e200b4a0e045943956a5c8ce2d8f2453db54d5f9b41bc"
+    },
+    {
+      "bytes": 66302,
+      "ownership": "retained-shared-source",
+      "path": ".super-coder/api/model_catalog.py",
+      "sha256": "b94c14b54951d8eb86598432f065e95965f17faebb0e4dd1718889faac45795e"
+    },
+    {
+      "bytes": 70078,
+      "ownership": "retained-shared-source",
+      "path": ".super-coder/api/route_bindings.py",
+      "sha256": "01afcd683c4e3223b5de4241d6ceb20fc11424a2c4f5cd558416003c0a80ae5f"
+    },
+    {
+      "bytes": 1620,
+      "ownership": "retained-shared-source",
+      "path": ".super-coder/scripts/conversation_adapters/__init__.py",
+      "sha256": "59a59dc4fef2edbf34bd37aba22e4e6a82684a884a32350010ea6b8c10223b29"
+    },
+    {
+      "bytes": 25144,
+      "ownership": "retained-shared-source",
+      "path": ".super-coder/scripts/conversation_adapters/base.py",
+      "sha256": "bf275b6045186c9e1fe0a2d50dedf8143a7da3a86865cd76c9ac35e1efbd964f"
+    },
+    {
+      "bytes": 71511,
+      "ownership": "retained-shared-source",
+      "path": ".super-coder/scripts/conversation_broker.py",
+      "sha256": "2e09e1834797316f7d84926121c8150bbbf2356e57ee8e84f8f4f4326b462063"
+    },
+    {
+      "bytes": 12807,
+      "ownership": "retained-shared-source",
+      "path": ".super-coder/scripts/conversation_launch.py",
+      "sha256": "c9f518e013b62277c879247c66d8be106bbd341316faaf287c8bd80b62a45289"
+    },
+    {
+      "bytes": 92427,
+      "ownership": "retained-shared-source",
+      "path": ".super-coder/scripts/dispatch.sh",
+      "sha256": "7fe92b4230f9d089ebe6952c945f91ec3a925055d5929510a27bd1ed26a6f311"
+    },
+    {
+      "bytes": 6446,
+      "ownership": "retained-shared-source",
+      "path": ".super-coder/scripts/engine_manifest.py",
+      "sha256": "a87453b16361b0940cd3572b941cf48de346c2b4b9c8c5506ca5cdfd6c8394c0"
+    },
+    {
+      "bytes": 9197,
+      "ownership": "retained-shared-source",
+      "path": ".super-coder/scripts/harness_versions.py",
+      "sha256": "3edb1e49c49e3c5d11b425e02039e0b84d246a64eda4d0a3d777a4bef1e61d89"
+    },
+    {
+      "bytes": 50498,
+      "ownership": "retained-shared-source",
+      "path": ".super-coder/scripts/install.py",
+      "sha256": "129a44baec26240698f2bc93d1c0d6606175336495c30977e3cee1aa39a4e11c"
+    },
+    {
+      "bytes": 17497,
+      "ownership": "retained-shared-source",
+      "path": ".super-coder/scripts/job.py",
+      "sha256": "ce068f6998bd090b983b3052617f4992abf97886525ff9bdc2c6f1ceecf78cf3"
+    },
+    {
+      "bytes": 56602,
+      "ownership": "retained-shared-source",
+      "path": ".super-coder/scripts/mem.py",
+      "sha256": "945a6892dc3514e69e3f45d27e9d93f4839987539aed15b3366ee9f05768262a"
+    },
+    {
+      "bytes": 12711,
+      "ownership": "retained-shared-source",
+      "path": ".super-coder/scripts/models.py",
+      "sha256": "fe2d0390254632469e9ae625672167e9fcfc42d7637b3681d257d0d55d52dd1e"
+    },
+    {
+      "bytes": 8164,
+      "ownership": "retained-shared-source",
+      "path": ".super-coder/scripts/ports.py",
+      "sha256": "b05aec5304d3317c560c70b7075327a26251849e61bdff92573bd9847c7ca949"
+    },
+    {
+      "bytes": 25213,
+      "ownership": "retained-shared-source",
+      "path": ".super-coder/scripts/remove.py",
+      "sha256": "974fdca1ba8503e8251d962281d93e8c0a939afbf85323323c8dccf800b99519"
+    },
+    {
+      "bytes": 6734,
+      "ownership": "retained-shared-source",
+      "path": ".super-coder/scripts/route_transport.py",
+      "sha256": "ec5fe37defb8897ecf1b81b1b2dfc2b57118de4c2b861a7686007bd6d7d5f84f"
+    },
+    {
+      "bytes": 106963,
+      "ownership": "retained-shared-source",
+      "path": ".super-coder/scripts/run.py",
+      "sha256": "108f03944f206d1a4d05c1d6ba8a6c7e9c80b954ecc34a6b3f428cc78dd8176e"
+    },
+    {
+      "bytes": 21553,
+      "ownership": "retained-shared-source",
+      "path": ".super-coder/scripts/skill.py",
+      "sha256": "49e853c8fb7783638fbd787f8c92a51d1c8b17bbd6245a63071b93f62e495699"
+    },
+    {
+      "bytes": 287269,
+      "ownership": "retained-shared-source",
+      "path": ".super-coder/ui/app.js",
+      "sha256": "1ca5d492c36d0240752083837c1ebe82b6aea8f0176ac70b76e224e7c17cf2e0"
+    },
+    {
+      "bytes": 73523,
+      "ownership": "retained-shared-source",
+      "path": "docs/README.md",
+      "sha256": "c452be922ef55251b30473ee9f79c3467f39d5b27bad33bb99e34b399a53f021"
+    },
+    {
+      "bytes": 4905,
+      "ownership": "retained-shared-source",
+      "path": "sc",
+      "sha256": "a719ba72168b8a971312d7f6d64be5ac76467ff5f636f166b603fae094b44867"
+    },
+    {
+      "bytes": 965,
+      "ownership": "retained-shared-source",
+      "path": "tests/fixtures/ollama_live_native_acceptance.json",
+      "sha256": "a07163d2ec6fc7139aef09ef8ff38ea9f11c3fddd7c944faa4a1d4db087eeb21"
+    },
+    {
+      "bytes": 24174,
+      "ownership": "retained-shared-source",
+      "path": "tests/fixtures/sprint_removal/build_pre_removal_fixture.py",
+      "sha256": "77d1eb9d2cf39f05b218fad10279fb011f66e7ec7cced50e44a5713d90bf1177"
+    },
+    {
+      "bytes": 51697,
+      "ownership": "retained-shared-source",
+      "path": "tests/fixtures/sprint_removal/manifest.json",
+      "sha256": "3f496c54e8b6fed00a03268feb972f74c05a7a6f667cc84dd220983dbf02d642"
+    },
+    {
+      "bytes": 9808,
+      "ownership": "retained-shared-source",
+      "path": "tests/mutations/u6_live_native_ollama_gate.py",
+      "sha256": "21d209fa05170ef58bb1d4efc101fbd1be65128458ed5886af60adab8017d73c"
+    },
+    {
+      "bytes": 5015,
+      "ownership": "retained-shared-source",
+      "path": "tests/sprint_route_binding_support.py",
+      "sha256": "a046e2e3560de671ae849bab3f7ccaff1b7ae05f24f83b2d5db432000e846f0b"
+    },
+    {
+      "bytes": 78900,
+      "ownership": "retained-shared-source",
+      "path": "tests/test_api_endpoints.py",
+      "sha256": "a91580317bb62dbaa74c883a4ac3e919736e1cabcead2cb6d25c7c7ce416fb14"
+    },
+    {
+      "bytes": 129113,
+      "ownership": "retained-shared-source",
+      "path": "tests/test_conversation_api.py",
+      "sha256": "4e33a06525c0c8e96d7e7411bc15741604a19064dcff5f55951e9ec353ef9d64"
+    },
+    {
+      "bytes": 99862,
+      "ownership": "retained-shared-source",
+      "path": "tests/test_conversation_broker.py",
+      "sha256": "7982f04c5ff8d8e70d33b8a724f64e4392775386d991c8d9fc2476050e57f130"
+    },
+    {
+      "bytes": 67716,
+      "ownership": "retained-shared-source",
+      "path": "tests/test_conversation_diff_browser.py",
+      "sha256": "a93f5cdb0921a4dd9160e3003ff9f7b4c6dfdbfb12efe3f23ee2c93913ce9ec2"
+    },
+    {
+      "bytes": 19664,
+      "ownership": "retained-shared-source",
+      "path": "tests/test_conversation_launch.py",
+      "sha256": "ca3e8fc4f2cb18900625d54307fc37fca05935defc8dac16cadcf3ee108547ab"
+    },
+    {
+      "bytes": 29768,
+      "ownership": "retained-shared-source",
+      "path": "tests/test_conversation_release_gate.py",
+      "sha256": "67e2ad7b753ca59b039afb3f694a486d6eaa2c1c8ea18d7a1eb65bafbb39a55d"
+    },
+    {
+      "bytes": 60300,
+      "ownership": "retained-shared-source",
+      "path": "tests/test_conversation_schema.py",
+      "sha256": "1dbb37b3028cab86f788002ab833fe30621d07b8a6b3e932abd2e6c22727aa9e"
+    },
+    {
+      "bytes": 52213,
+      "ownership": "retained-shared-source",
+      "path": "tests/test_conversation_ui.py",
+      "sha256": "388f2aeec1bb908c0d0452144b3dc7bdcbe76463729ebb7b1e79c8abf4d2b0b1"
+    },
+    {
+      "bytes": 7220,
+      "ownership": "retained-shared-source",
+      "path": "tests/test_docker_build_context.py",
+      "sha256": "4e6c9fce049a906680c861df6cbc78dad63defd9cb56fa5f12060ab162f36aa9"
+    },
+    {
+      "bytes": 26959,
+      "ownership": "retained-shared-source",
+      "path": "tests/test_flavor_skill_packs.py",
+      "sha256": "a0f76af12de9e8d45b0162f3522d0fd4f05ba2609afd664ce9f12c9f9eb22dc1"
+    },
+    {
+      "bytes": 24924,
+      "ownership": "retained-shared-source",
+      "path": "tests/test_harness_epoch.py",
+      "sha256": "a2b18e1ec4853b1fa1a6fe29534906156fad9e5718bc3c45abe212d2ea6c58aa"
+    },
+    {
+      "bytes": 23252,
+      "ownership": "retained-shared-source",
+      "path": "tests/test_harness_surfaces.py",
+      "sha256": "ae1ded7d7431acbac7d5180f2bdc2490bc7e3a97a255487fe15070342e348240"
+    },
+    {
+      "bytes": 12526,
+      "ownership": "retained-shared-source",
+      "path": "tests/test_harness_versions.py",
+      "sha256": "44cf5eac93d0fe228f31e997dec5e9e31a566b0ac0ad5d67b86bd2fdde5abcd7"
+    },
+    {
+      "bytes": 124007,
+      "ownership": "retained-shared-source",
+      "path": "tests/test_model_catalog.py",
+      "sha256": "b49e6e0432bd7aa3802e46d2c354525f387841311412c3da4c88c479775c28b4"
+    },
+    {
+      "bytes": 13784,
+      "ownership": "retained-shared-source",
+      "path": "tests/test_operator_surface.py",
+      "sha256": "f8f745b6132d2a7a5aa15bbb019682804915989e1d703a562fde11717bb89a28"
+    },
+    {
+      "bytes": 3668,
+      "ownership": "retained-shared-source",
+      "path": "tests/test_ports.py",
+      "sha256": "af06b7ee448dbd8ab7517061597df16256971799fd215a1fe1d9c9e619594eeb"
+    },
+    {
+      "bytes": 20216,
+      "ownership": "retained-shared-source",
+      "path": "tests/test_remove.py",
+      "sha256": "3982fc4e5d26a494c026dab215d2ef175c454023cc7dc0b5b2fc919d51143a5c"
+    },
+    {
+      "bytes": 153962,
+      "ownership": "retained-shared-source",
+      "path": "tests/test_route_bindings.py",
+      "sha256": "8ebf98f792cc14259cff050f2aba141866e8f32cb1f3bdaa6f5ac807c7011a07"
+    },
+    {
+      "bytes": 14955,
+      "ownership": "retained-shared-source",
+      "path": "tests/test_route_transport.py",
+      "sha256": "0e5eb9e9d2577e2842963c76af7d00a6e6a1b392fe14669be18cf55405497c0a"
+    },
+    {
+      "bytes": 39829,
+      "ownership": "retained-shared-source",
+      "path": "tests/test_run_session.py",
+      "sha256": "e20fe45efbcc037086e8aaec3dfc7182127c4d5c34b4d1c4cb05f6fef1ca4a4d"
+    },
+    {
+      "bytes": 25610,
+      "ownership": "retained-shared-source",
+      "path": "tests/test_shells_ui_contract.py",
+      "sha256": "53d2d00bdb42075e675193c0ff6bd7ac39794a85fe25265bd96ae578e03c6ab1"
+    },
+    {
+      "bytes": 48111,
+      "ownership": "retained-shared-source",
+      "path": "tests/test_sprint_board_ui.py",
+      "sha256": "ff31cb2b76e4b16dbf16ce079b8b53a4e3369606552a13e48c7d911ad83b6910"
+    },
+    {
+      "bytes": 119447,
+      "ownership": "retained-shared-source",
+      "path": "tests/test_sprint_live_proof.py",
+      "sha256": "8cc9980a3561029e98db5ae2e715e97a253bc2020fb8c23b8796c67014ec0e4a"
+    },
+    {
+      "bytes": 99704,
+      "ownership": "retained-shared-source",
+      "path": "tests/test_sprint_work_dispatch.py",
+      "sha256": "231f1894c0ea635f43d9c60ce7ad36818fa393b0c8a5b27eea3951b4f213d1d7"
+    }
+  ],
+  "tracked_artifacts": [
+    {
+      "bytes": 3691,
+      "cleanup": "exact-digest-delete",
+      "ownership": "engine-tracked",
+      "path": ".super-coder/adapters/deepseek/adapter.json",
+      "sha256": "48a6fa7bf2ba40ac3896ab60eb4d5caa21962be90c319aeef061c8df8c6431bb"
+    },
+    {
+      "bytes": 1065,
+      "cleanup": "exact-digest-delete",
+      "ownership": "engine-tracked",
+      "path": ".super-coder/assets/deepseek/LICENSE.deepseek-harness",
+      "sha256": "ebb4f09972aee8608be255debaf78451a68e95c290f55c240dec2ecfa16ea6be"
+    },
+    {
+      "bytes": 2014,
+      "cleanup": "exact-digest-delete",
+      "ownership": "engine-tracked",
+      "path": ".super-coder/assets/deepseek/cordis-ollama-cloud.yml",
+      "sha256": "7bec59aa0af713e94513cc0a39ddcf9b3699d0c4132612d09d0c98dfbc108dbd"
+    },
+    {
+      "bytes": 1795,
+      "cleanup": "exact-digest-delete",
+      "ownership": "engine-tracked",
+      "path": ".super-coder/assets/deepseek/cordis.yml",
+      "sha256": "10ff54722966868f86fb6cfdbd07dc8d3c899c98b3296613290ec30d82c04a8c"
+    },
+    {
+      "bytes": 59313,
+      "cleanup": "exact-digest-delete",
+      "ownership": "engine-tracked",
+      "path": ".super-coder/assets/deepseek/deepseek-harness-bb4ca698-lifecycle.patch",
+      "sha256": "ad5a7d5f8ac54a7a00521d15a097ec510962fb00fa69019b3f69514eacde078f"
+    },
+    {
+      "bytes": 48,
+      "cleanup": "exact-digest-delete",
+      "ownership": "engine-tracked",
+      "path": ".super-coder/assets/deepseek/dsh-command-admission-v1.json",
+      "sha256": "b1bbf35c3e3417c668015029ee3402e882af40d160d6c0153f8f4400bda0e820"
+    },
+    {
+      "bytes": 70598,
+      "cleanup": "exact-digest-delete",
+      "ownership": "engine-tracked",
+      "path": ".super-coder/assets/deepseek/dsh-shell-authority-contract.json",
+      "sha256": "06485e5ca9bdf11de864dc46a6eb9910dc0ec3e52caef91cfd37f1bb2cdf7bf0"
+    },
+    {
+      "bytes": 2034,
+      "cleanup": "exact-digest-delete",
+      "ownership": "engine-tracked",
+      "path": ".super-coder/assets/deepseek/provider-adapters.json",
+      "sha256": "a0e35d3399caa84f2eed97aa8fac0c99a9503b5b2751a2e611025a850c95e5fa"
+    },
+    {
+      "bytes": 2462,
+      "cleanup": "exact-digest-delete",
+      "ownership": "engine-tracked",
+      "path": ".super-coder/assets/deepseek/runtime.json",
+      "sha256": "38df61aa9da9b7a719fdd2b7e4603d46581897f8299e155840fd1fadea6e86fa"
+    },
+    {
+      "bytes": 14596,
+      "cleanup": "exact-digest-delete",
+      "ownership": "engine-tracked",
+      "path": ".super-coder/assets/deepseek/sc-shell-env-plugin.mjs",
+      "sha256": "2cfc23a92be34d4e8e069f9cbbcee0dc142f4468ed4b5224f96a7c3a1c4314f2"
+    },
+    {
+      "bytes": 5106,
+      "cleanup": "exact-digest-delete",
+      "ownership": "engine-tracked",
+      "path": ".super-coder/assets/deepseek/stock-host-seam.json",
+      "sha256": "eda78819028df3ab9b642c3908f8e272124b2f7380e8e42e9a59446e350fc8e6"
+    },
+    {
+      "bytes": 13340,
+      "cleanup": "exact-digest-delete",
+      "ownership": "engine-tracked",
+      "path": ".super-coder/scripts/build_deepseek_carrier.py",
+      "sha256": "cf23af255aa3c913bde14c1067fc6ceb9bf9fa329d98d32abaed2c8a9837035a"
+    },
+    {
+      "bytes": 52910,
+      "cleanup": "exact-digest-delete",
+      "ownership": "engine-tracked",
+      "path": ".super-coder/scripts/conversation_adapters/deepseek.py",
+      "sha256": "6a2f9f87f69182e86bb4809f3e493bdf6552acbb7f84fcc76de9bed21c1422c3"
+    },
+    {
+      "bytes": 23019,
+      "cleanup": "exact-digest-delete",
+      "ownership": "engine-tracked",
+      "path": ".super-coder/scripts/deepseek_candidate_authority.py",
+      "sha256": "912ea522a6e0dfa3cfba16d7cefbf151016e854e73e3392dcddba6893e767050"
+    },
+    {
+      "bytes": 7731,
+      "cleanup": "exact-digest-delete",
+      "ownership": "engine-tracked",
+      "path": ".super-coder/scripts/deepseek_carrier_worker.py",
+      "sha256": "09a78cb3c6d33eb4df9856d9c7f77378887b748a30aa87abba90dc0cbb441c5f"
+    },
+    {
+      "bytes": 16531,
+      "cleanup": "exact-digest-delete",
+      "ownership": "engine-tracked",
+      "path": ".super-coder/scripts/deepseek_execution_domain.py",
+      "sha256": "383723ac2caaa828064c1a97f4134167b48a1acc5d4d048e6f5c8865a48e82df"
+    },
+    {
+      "bytes": 30248,
+      "cleanup": "exact-digest-delete",
+      "ownership": "engine-tracked",
+      "path": ".super-coder/scripts/deepseek_host.py",
+      "sha256": "8007a8b223d0058fe364a2c2e117401e5d29d359c4857624c71c726f9facaebb"
+    },
+    {
+      "bytes": 58207,
+      "cleanup": "exact-digest-delete",
+      "ownership": "engine-tracked",
+      "path": ".super-coder/scripts/deepseek_identity_registry.py",
+      "sha256": "9273f04003c66aebbb0cd841a2ee51c535c1da013a5e5e8cc54802731ae3b490"
+    },
+    {
+      "bytes": 11813,
+      "cleanup": "exact-digest-delete",
+      "ownership": "engine-tracked",
+      "path": ".super-coder/scripts/deepseek_inference_canary.py",
+      "sha256": "1e08f846ecd960b212296e279b72508470365f7da0395b57bf2fb65c0d17e2e7"
+    },
+    {
+      "bytes": 11514,
+      "cleanup": "exact-digest-delete",
+      "ownership": "engine-tracked",
+      "path": ".super-coder/scripts/deepseek_one_shot.py",
+      "sha256": "d8ccac9e0156b30f1f4db1146bf09b0f9ecc7d06d2ff1fe1d2c240ce1eae8248"
+    },
+    {
+      "bytes": 16522,
+      "cleanup": "exact-digest-delete",
+      "ownership": "engine-tracked",
+      "path": ".super-coder/scripts/deepseek_promotion_runner.py",
+      "sha256": "2f6481aae0c574bf77a647bbc8037975087fa95239292057f9de5542c03bdbb8"
+    },
+    {
+      "bytes": 65123,
+      "cleanup": "exact-digest-delete",
+      "ownership": "engine-tracked",
+      "path": ".super-coder/scripts/deepseek_runtime.py",
+      "sha256": "56fc7bde0bb4b1c369febc4eeae5133c053c1bcf89a36c79a7e68f4bfe118a0b"
+    },
+    {
+      "bytes": 19317,
+      "cleanup": "exact-digest-delete",
+      "ownership": "engine-tracked",
+      "path": ".super-coder/scripts/deepseek_skill_resume_canary.py",
+      "sha256": "1d0b3640d9579f42e9d0afa386e1f97c8360c6a372ea138534a343c292ddfba1"
+    },
+    {
+      "bytes": 110110,
+      "cleanup": "exact-digest-delete",
+      "ownership": "engine-tracked",
+      "path": ".super-coder/scripts/deepseek_web.py",
+      "sha256": "62b38e2d808cf5d112fb89c08a8a4637e77f1292d8882c9f8b58700046d56c90"
+    },
+    {
+      "bytes": 43813,
+      "cleanup": "exact-digest-delete",
+      "ownership": "engine-tracked",
+      "path": ".super-coder/scripts/dsh_execution_provenance.py",
+      "sha256": "2e2b94cd94682494a94bfb9b0f6df620ad0d6986eb420a3c7f585eded21fc728"
+    },
+    {
+      "bytes": 27051,
+      "cleanup": "exact-digest-delete",
+      "ownership": "engine-tracked",
+      "path": ".super-coder/scripts/dsh_preparation_inventory.py",
+      "sha256": "044b780002790b11043b880b8e223ef8f28fd7d285fe6f0cecdd83c710957cd2"
+    }
+  ],
+  "verification_sources": [
+    {
+      "bytes": 1877,
+      "ownership": "source-only-verification",
+      "path": "tests/fixtures/deepseek_dsh_effect_driver.py",
+      "sha256": "963a7251f8d7fdcf1a079388ed2e1bef5c7ca638bd76de9b65da4a693d86251e"
+    },
+    {
+      "bytes": 2418,
+      "ownership": "source-only-verification",
+      "path": "tests/fixtures/deepseek_dsh_identity_plugin_probe.mjs",
+      "sha256": "8e10c9d30f72dd2d0daeddc0fdec592fe0f3ae2d83fa28a72de35b4e595981f7"
+    },
+    {
+      "bytes": 2962,
+      "ownership": "source-only-verification",
+      "path": "tests/fixtures/deepseek_dsh_prototype_issuer.py",
+      "sha256": "5307345020ba851c3bd2674f15ccbd9a05f5cf0250f3800ace6a3de87de01896"
+    },
+    {
+      "bytes": 8845,
+      "ownership": "source-only-verification",
+      "path": "tests/fixtures/deepseek_dsh_shell_env_probe.mjs",
+      "sha256": "31fb2d947fa50cc6ee6b944f9d2d521f33d53ac2cd023551ded6dac611810258"
+    },
+    {
+      "bytes": 11919,
+      "ownership": "source-only-verification",
+      "path": "tests/mutations/u105_deepseek_reliability.py",
+      "sha256": "ac34978d996d43b3744ee7477d89f5a2f9bbb07eb14662e2a71c8113d28cec77"
+    },
+    {
+      "bytes": 10482,
+      "ownership": "source-only-verification",
+      "path": "tests/mutations/u106_deepseek_retirement.py",
+      "sha256": "72ccdc8c9dca4a173e908f0034fe93fe3b562c50608f1b7171ce46fa3eef87ae"
+    },
+    {
+      "bytes": 82689,
+      "ownership": "source-only-verification",
+      "path": "tests/test_deepseek_adapter.py",
+      "sha256": "951fdcb81e9bf3da6a79dd8b79260f46f149e5fa656d98be955f8b0543d16766"
+    },
+    {
+      "bytes": 81354,
+      "ownership": "source-only-verification",
+      "path": "tests/test_deepseek_candidate_authority.py",
+      "sha256": "b40ac65719eb26c5dd2e8e14bd067977071ce341378d6ca6771b5103e8369b78"
+    },
+    {
+      "bytes": 45761,
+      "ownership": "source-only-verification",
+      "path": "tests/test_deepseek_cross_surface_gate.py",
+      "sha256": "688890a283bfb5e39147083edcde14c6c00d8767ff955200f0c4d81a2d238c0d"
+    },
+    {
+      "bytes": 66383,
+      "ownership": "source-only-verification",
+      "path": "tests/test_deepseek_dsh_preparation.py",
+      "sha256": "4a966c988cd5a9d394fdd165d6b8ac83f563f4fb709d257c03c643342ab1260b"
+    },
+    {
+      "bytes": 85721,
+      "ownership": "source-only-verification",
+      "path": "tests/test_deepseek_identity_registry.py",
+      "sha256": "e0320a91d4e16d56e6c83a26caea951ba7fe17f6615913b5cf00c918f4f23c53"
+    },
+    {
+      "bytes": 43680,
+      "ownership": "source-only-verification",
+      "path": "tests/test_deepseek_runtime.py",
+      "sha256": "77bb6533375da4ed5aaaa1d2f898291e969aa106de3d5b77c3767aaa9b0b2f5b"
+    },
+    {
+      "bytes": 8214,
+      "ownership": "source-only-verification",
+      "path": "tests/test_deepseek_stock_contract.py",
+      "sha256": "938858e31b074c0ec44c7721e811f0cb31fe378e5b260b7ccf71070c6c714c20"
+    },
+    {
+      "bytes": 84243,
+      "ownership": "source-only-verification",
+      "path": "tests/test_deepseek_web.py",
+      "sha256": "2f13270ded6189e5ecf7ae4f7dabd27c15bcd0ab3b3690b301a63c182cdd0efe"
+    },
+    {
+      "bytes": 26694,
+      "ownership": "source-only-verification",
+      "path": "tests/test_dsh_command_admission.py",
+      "sha256": "f51923a3e3771946d21946448fae8eac3dd7dac016b2996a774cd65f5d25cb69"
+    }
+  ]
+}
