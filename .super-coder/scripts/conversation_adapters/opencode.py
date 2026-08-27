@@ -16,6 +16,7 @@ import subprocess
 import threading
 import time
 import unicodedata
+import urllib.error
 import uuid
 from collections.abc import Iterator, Mapping
 from pathlib import Path
@@ -1234,7 +1235,16 @@ class OpenCodeAdapter(ConversationAdapter):
                 "operator",
             )
             return
-        self._prompt(turn.session_ref, context, message)
+        try:
+            self._prompt(turn.session_ref, context, message)
+        except AdapterError as exc:
+            if not isinstance(exc.__cause__, urllib.error.HTTPError):
+                raise
+            raise AdapterError(
+                "HARNESS_SUBMISSION_FAILED",
+                exc.detail,
+                retryable=exc.retryable,
+            ) from exc
         observed_activity = False
         for raw in native_stream:
             event_session = self._session_of(raw)

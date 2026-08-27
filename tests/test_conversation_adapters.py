@@ -1434,6 +1434,52 @@ class ConversationAdapterTest(unittest.TestCase):
             1,
         )
 
+    def test_opencode_ambiguous_prompt_connection_loss_stays_reconcilable(
+        self,
+    ) -> None:
+        class ConnectionLostOpenCode(FakeOpenCode):
+            def request(self, method, path, *, query=None, body=None):
+                if method == "POST" and path.endswith("/message"):
+                    self.requests.append((method, path, dict(query or {}), body))
+                    try:
+                        raise OSError("connection reset")
+                    except OSError as cause:
+                        raise AdapterError(
+                            "HARNESS_UNAVAILABLE",
+                            f"POST {path} failed: connection reset",
+                            retryable=True,
+                        ) from cause
+                return super().request(
+                    method,
+                    path,
+                    query=query,
+                    body=body,
+                )
+
+        native = ConnectionLostOpenCode()
+        adapter = OpenCodeAdapter(
+            transport=native,
+            shell_runtime_dir=self.root / "runtime-shells",
+        )
+
+        turn = adapter.start(self.context, "dispatch exactly once")
+        with self.assertRaises(AdapterError) as caught:
+            list(adapter.stream(turn))
+
+        self.assertEqual(caught.exception.code, "HARNESS_UNAVAILABLE")
+        self.assertEqual(
+            caught.exception.detail,
+            f"POST /session/{native.session_ref}/message failed: connection reset",
+        )
+        self.assertTrue(caught.exception.retryable)
+        self.assertEqual(
+            len([
+                request for request in native.requests
+                if request[1].endswith("/message")
+            ]),
+            1,
+        )
+
     def test_opencode_shared_server_is_not_the_turn_process(self) -> None:
         adapter, _native = self.build("opencode")
         shared_server = mock.Mock(pid=4242)

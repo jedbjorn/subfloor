@@ -12,6 +12,8 @@ import tempfile
 import threading
 import time
 import unittest
+import urllib.error
+import urllib.parse
 from collections.abc import Iterator
 from datetime import datetime, timezone
 from pathlib import Path
@@ -22,6 +24,7 @@ ENGINE = ROOT / ".super-coder"
 SCRIPTS = ENGINE / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 
+import conversation_boot  # noqa: E402
 from conversation_adapters import (  # noqa: E402
     AdapterError,
     ConversationContext,
@@ -32,8 +35,8 @@ from conversation_adapters import (  # noqa: E402
     OpenCodeAdapter,
     ReconcileResult,
 )
+from conversation_adapters import base as base_adapter
 from conversation_boot import BootDirective  # noqa: E402
-import conversation_boot  # noqa: E402
 from conversation_broker import (  # noqa: E402
     BrokerInvariantError,
     BrokerRun,
@@ -297,8 +300,29 @@ class BlockingOpenCodeTransport:
         return events()
 
 
-class RejectingOpenCodeFirstTurnTransport:
-    """Reproduce WU113's exact idle, empty-session submission failure."""
+class StubUrlResponse:
+    def __init__(self, payload: bytes = b"", *, lines=()) -> None:
+        self.payload = payload
+        self.lines = tuple(lines)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args) -> None:
+        self.close()
+
+    def read(self) -> bytes:
+        return self.payload
+
+    def __iter__(self):
+        return iter(self.lines)
+
+    def close(self) -> None:
+        pass
+
+
+class RejectingOpenCodeFirstTurnEndpoint:
+    """Serve an idle session whose real HTTP prompt request returns 400."""
 
     def __init__(self) -> None:
         self.session_ref = "ses_empty_first_turn"
@@ -306,27 +330,46 @@ class RejectingOpenCodeFirstTurnTransport:
         self.native_messages: list[dict] = []
         self.requests: list[tuple[str, str]] = []
 
-    def request(self, method: str, path: str, *, query=None, body=None):
+    def urlopen(self, request, *, timeout):
+        method = request.get_method()
+        path = urllib.parse.urlsplit(request.full_url).path
         self.requests.append((method, path))
         if method == "POST" and path == "/session":
-            return {"id": self.session_ref}
+            return StubUrlResponse(
+                json.dumps({"id": self.session_ref}).encode()
+            )
+        if method == "GET" and path == "/event":
+            return StubUrlResponse(
+                lines=(
+                    (
+                        "data: "
+                        + json.dumps({
+                            "type": "session.idle",
+                            "properties": {"sessionID": self.session_ref},
+                        })
+                        + "\n"
+                    ).encode(),
+                    b"\n",
+                )
+            )
         if method == "POST" and path.endswith("/message"):
             self.prompt_count += 1
-            raise AdapterError(
-                "HARNESS_SUBMISSION_FAILED",
-                "OpenCode rejected the exact first-turn submission before inference",
+            raise urllib.error.HTTPError(
+                request.full_url,
+                400,
+                "Bad Request",
+                {},
+                None,
             )
         if method == "GET" and path == f"/session/{self.session_ref}":
-            return {"id": self.session_ref}
+            return StubUrlResponse(
+                json.dumps({"id": self.session_ref}).encode()
+            )
         if method == "GET" and path == "/session/status":
-            return {self.session_ref: {"type": "idle"}}
+            return StubUrlResponse(
+                json.dumps({self.session_ref: {"type": "idle"}}).encode()
+            )
         raise AssertionError(f"unexpected OpenCode request: {method} {path}")
-
-    def stream(self, path: str, *, query=None):
-        return iter(({
-            "type": "session.idle",
-            "properties": {"sessionID": self.session_ref},
-        },))
 
 
 class ConcurrentOpenCodeFirstTurnTransport:
@@ -1990,7 +2033,8 @@ class ServiceContractTest(ConversationBrokerCase):
     def test_opencode_first_turn_submission_failure_is_not_reclassified_idle(
         self,
     ) -> None:
-        transport = RejectingOpenCodeFirstTurnTransport()
+        endpoint = RejectingOpenCodeFirstTurnEndpoint()
+        transport = base_adapter.UrlHttpTransport("http://opencode.test")
         adapter = OpenCodeAdapter(
             transport=transport,
             shell_runtime_dir=self.root / "opencode-shells",
@@ -2000,46 +2044,49 @@ class ServiceContractTest(ConversationBrokerCase):
         )
         conversation_id = self.add_conversation(harness="opencode")
         message_id = self.add_message(conversation_id)
-        broker.notify()
+        with mock.patch.object(
+            base_adapter.urllib.request,
+            "urlopen",
+            side_effect=endpoint.urlopen,
+        ):
+            broker.notify()
 
-        deadline = time.monotonic() + 3
-        row = None
-        while time.monotonic() < deadline:
-            with self.connect() as con:
-                row = con.execute(
-                    "SELECT run_id,state,harness_session_after,error_code,"
-                    "error_detail FROM conversation_runs "
-                    "WHERE trigger_message_id=?",
-                    (message_id,),
-                ).fetchone()
-            if row is not None and row["state"] in {
-                "failed", "unknown", "cancelled", "succeeded"
-            }:
-                break
-            time.sleep(0.01)
+            deadline = time.monotonic() + 3
+            row = None
+            while time.monotonic() < deadline:
+                with self.connect() as con:
+                    row = con.execute(
+                        "SELECT run_id,state,harness_session_after,error_code,"
+                        "error_detail FROM conversation_runs "
+                        "WHERE trigger_message_id=?",
+                        (message_id,),
+                    ).fetchone()
+                if row is not None and row["state"] in {
+                    "failed", "unknown", "cancelled", "succeeded"
+                }:
+                    break
+                time.sleep(0.01)
+            self.assertTrue(broker.wait_idle())
 
         if row is None:
             self.fail("OpenCode first-turn failure produced no durable run")
         self.assertEqual(row["state"], "unknown")
-        self.assertEqual(row["harness_session_after"], transport.session_ref)
+        self.assertEqual(row["harness_session_after"], endpoint.session_ref)
         self.assertEqual(row["error_code"], "HARNESS_SUBMISSION_FAILED")
         self.assertEqual(
             row["error_detail"],
-            "OpenCode rejected the exact first-turn submission before inference",
+            f"POST /session/{endpoint.session_ref}/message returned HTTP 400",
         )
-        self.assertEqual(transport.prompt_count, 1)
-        self.assertEqual(transport.native_messages, [])
+        self.assertEqual(endpoint.prompt_count, 1)
+        self.assertEqual(endpoint.native_messages, [])
         self.assertEqual(
-            transport.requests.count(("POST", "/session")),
-            1,
+            endpoint.requests,
+            [
+                ("POST", "/session"),
+                ("GET", "/event"),
+                ("POST", f"/session/{endpoint.session_ref}/message"),
+            ],
         )
-        self.assertEqual(
-            transport.requests.count(
-                ("POST", f"/session/{transport.session_ref}/message")
-            ),
-            1,
-        )
-        self.assertTrue(broker.wait_idle())
         with self.connect() as con:
             self.assertEqual(
                 con.execute(
