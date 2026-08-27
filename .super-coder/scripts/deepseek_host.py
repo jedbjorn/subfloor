@@ -11,7 +11,7 @@ import urllib.request
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable, Iterator, Mapping, Protocol
+from typing import Any, Callable, Iterable, Iterator, Mapping, Protocol
 
 import ports
 
@@ -25,6 +25,7 @@ MAX_MODEL_GROUPS = 256
 MAX_SETTINGS_NAMESPACES = 512
 MAX_REASONING_OPTIONS = 256
 MAX_IDENTIFIER_CHARS = 512
+MANAGED_GENERATION_COOKIE = "sc_deepseek_managed_generation"
 SAFE_CREDENTIAL_REF = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,255}$")
 SAFE_CREDENTIAL_SOURCE = re.compile(r"^[a-z][a-z0-9-]{0,63}$")
 SENSITIVE = re.compile(
@@ -124,6 +125,7 @@ def checked_host_url(value: str) -> str:
 
 
 def configured_host_url(env: Mapping[str, str] = os.environ) -> str:
+    """Resolve the private Host endpoint for explicit diagnostic use only."""
     value = env.get("SC_DEEPSEEK_HOST_PORT")
     if value is None:
         try:
@@ -211,11 +213,48 @@ class DeepSeekHostClient:
         timeout: float = 15.0,
         stream_timeout: float = 300.0,
         opener: Any = urllib.request.urlopen,
+        endpoint: str | None = None,
+        authority_provider: Callable[[], Mapping[str, Any]] | None = None,
     ) -> None:
-        self.endpoint = configured_host_url()
         self.timeout = timeout
         self.stream_timeout = stream_timeout
         self._opener = opener
+        if endpoint is not None and authority_provider is not None:
+            raise DeepSeekHostError(
+                "HARNESS_HOST_REQUEST_INVALID",
+                "diagnostic endpoint and managed authority are mutually exclusive",
+            )
+        self._authority_provider = authority_provider
+        if endpoint is not None:
+            self._authority = _ManagedRelayAuthority(
+                endpoint=checked_host_url(endpoint), generation=None
+            )
+        else:
+            if self._authority_provider is None:
+                self._authority_provider = _managed_relay_authority
+            self._authority = self._refresh_authority()
+
+    @property
+    def endpoint(self) -> str:
+        return self._authority.endpoint
+
+    def _refresh_authority(self) -> "_ManagedRelayAuthority":
+        assert self._authority_provider is not None
+        try:
+            value = self._authority_provider()
+        except DeepSeekHostError:
+            raise
+        except Exception as exc:
+            code = getattr(exc, "code", "HARNESS_HOST_UNAVAILABLE")
+            detail = getattr(
+                exc,
+                "detail",
+                "managed DeepSeek Host authority is unavailable",
+            )
+            raise DeepSeekHostError(str(code), str(detail)) from exc
+        authority = _checked_managed_authority(value)
+        self._authority = authority
+        return authority
 
     def call(self, method: str, payload: Mapping[str, Any]) -> Any:
         method = _exact_string(method, "Host method")
@@ -234,20 +273,45 @@ class DeepSeekHostClient:
             ensure_ascii=False,
             separators=(",", ":"),
         ).encode("utf-8")
-        request = urllib.request.Request(
-            f"{self.endpoint}/api/{method}",
-            data=body,
-            headers={"Content-Type": "application/json"},
-            method="POST",
-        )
-        try:
-            with self._opener(request, timeout=self.timeout) as response:
-                raw = response.read(MAX_RESPONSE_BYTES + 1)
-        except (urllib.error.URLError, TimeoutError, OSError) as exc:
-            raise DeepSeekHostError(
-                "HARNESS_HOST_UNAVAILABLE",
-                f"DeepSeek Host request failed: {type(exc).__name__}",
-            ) from exc
+        raw = None
+        for attempt in range(2):
+            authority = self._authority
+            headers = {"Content-Type": "application/json"}
+            if authority.generation is not None:
+                headers["Cookie"] = (
+                    f"{MANAGED_GENERATION_COOKIE}={authority.generation}"
+                )
+            request = urllib.request.Request(
+                f"{authority.endpoint}/api/{method}",
+                data=body,
+                headers=headers,
+                method="POST",
+            )
+            try:
+                with self._opener(request, timeout=self.timeout) as response:
+                    raw = response.read(MAX_RESPONSE_BYTES + 1)
+                break
+            except urllib.error.HTTPError as exc:
+                if _is_stale_generation_response(exc):
+                    if attempt == 0 and self._authority_provider is not None:
+                        # The relay emits this exact refusal before opening the
+                        # upstream connection, so replay cannot submit twice.
+                        self._refresh_authority()
+                        continue
+                    raise DeepSeekHostError(
+                        "HARNESS_WEB_GENERATION_STALE",
+                        "managed DeepSeek Host authority remained stale",
+                    ) from exc
+                raise DeepSeekHostError(
+                    "HARNESS_HOST_UNAVAILABLE",
+                    f"DeepSeek Host request failed: HTTP {exc.code}",
+                ) from exc
+            except (urllib.error.URLError, TimeoutError, OSError) as exc:
+                raise DeepSeekHostError(
+                    "HARNESS_HOST_UNAVAILABLE",
+                    f"DeepSeek Host request failed: {type(exc).__name__}",
+                ) from exc
+        assert raw is not None
         if len(raw) > MAX_RESPONSE_BYTES:
             raise DeepSeekHostError(
                 "HARNESS_HOST_RESPONSE_INVALID",
@@ -289,20 +353,121 @@ class DeepSeekHostClient:
                 "HARNESS_HOST_CLIENT_UNAVAILABLE",
                 "Python websockets support is unavailable",
             ) from exc
-        url = self.endpoint.replace("http://", "ws://", 1) + "/api/events.mux"
-        try:
-            socket = connect(
-                url,
-                open_timeout=self.timeout,
-                close_timeout=2,
-                max_size=MAX_RESPONSE_BYTES,
+        socket = None
+        for attempt in range(2):
+            authority = self._authority
+            url = (
+                authority.endpoint.replace("http://", "ws://", 1)
+                + "/api/events.mux"
             )
-        except Exception as exc:
-            raise DeepSeekHostError(
-                "HARNESS_HOST_UNAVAILABLE",
-                f"DeepSeek Host event connection failed: {type(exc).__name__}",
-            ) from exc
+            headers = (
+                {"Cookie": f"{MANAGED_GENERATION_COOKIE}={authority.generation}"}
+                if authority.generation is not None
+                else None
+            )
+            try:
+                socket = connect(
+                    url,
+                    additional_headers=headers,
+                    open_timeout=self.timeout,
+                    close_timeout=2,
+                    max_size=MAX_RESPONSE_BYTES,
+                )
+                break
+            except Exception as exc:
+                if _is_stale_generation_exception(exc):
+                    if attempt == 0 and self._authority_provider is not None:
+                        self._refresh_authority()
+                        continue
+                    raise DeepSeekHostError(
+                        "HARNESS_WEB_GENERATION_STALE",
+                        "managed DeepSeek Host authority remained stale",
+                    ) from exc
+                raise DeepSeekHostError(
+                    "HARNESS_HOST_UNAVAILABLE",
+                    f"DeepSeek Host event connection failed: {type(exc).__name__}",
+                ) from exc
+        assert socket is not None
         return _WebSocketStream(socket, timeout=self.stream_timeout)
+
+
+@dataclass(frozen=True)
+class _ManagedRelayAuthority:
+    endpoint: str
+    generation: str | None
+
+
+def _checked_managed_authority(value: object) -> _ManagedRelayAuthority:
+    if not isinstance(value, Mapping) or set(value) != {"endpoint", "generation"}:
+        raise DeepSeekHostError(
+            "HARNESS_HOST_UNAVAILABLE",
+            "managed DeepSeek Host authority is malformed",
+        )
+    endpoint = value.get("endpoint")
+    generation = value.get("generation")
+    if not isinstance(endpoint, str):
+        raise DeepSeekHostError(
+            "HARNESS_HOST_UNAVAILABLE",
+            "managed DeepSeek Host authority is malformed",
+        )
+    try:
+        checked_endpoint = checked_host_url(endpoint)
+    except DeepSeekHostError as exc:
+        raise DeepSeekHostError(
+            "HARNESS_HOST_UNAVAILABLE",
+            "managed DeepSeek Host authority is malformed",
+        ) from exc
+    if (
+        not isinstance(generation, str)
+        or re.fullmatch(r"[0-9a-f]{64}", generation) is None
+    ):
+        raise DeepSeekHostError(
+            "HARNESS_WEB_GENERATION_STALE",
+            "managed DeepSeek Host generation is malformed",
+        )
+    return _ManagedRelayAuthority(checked_endpoint, generation)
+
+
+def _managed_relay_authority() -> Mapping[str, Any]:
+    try:
+        import deepseek_web
+    except ImportError as exc:
+        raise DeepSeekHostError(
+            "HARNESS_HOST_UNAVAILABLE",
+            "managed DeepSeek Host authority is unavailable",
+        ) from exc
+    try:
+        return deepseek_web.managed_relay_authority()
+    except deepseek_web.DeepSeekWebError as exc:
+        raise DeepSeekHostError(exc.code, exc.detail) from exc
+
+
+def _is_stale_generation_response(exc: urllib.error.HTTPError) -> bool:
+    if exc.code != 409:
+        return False
+    try:
+        raw = exc.read(MAX_RESPONSE_BYTES + 1)
+    except OSError:
+        return False
+    return _is_stale_generation_payload(raw)
+
+
+def _is_stale_generation_exception(exc: Exception) -> bool:
+    response = getattr(exc, "response", None)
+    return (
+        getattr(response, "status_code", None) == 409
+        and _is_stale_generation_payload(getattr(response, "body", None))
+    )
+
+
+def _is_stale_generation_payload(raw: object) -> bool:
+    if not isinstance(raw, (bytes, bytearray)) or len(raw) > MAX_RESPONSE_BYTES:
+        return False
+    try:
+        payload = json.loads(bytes(raw).decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return False
+    return payload == {"error": "HARNESS_WEB_GENERATION_STALE"}
 
 
 @dataclass(frozen=True)

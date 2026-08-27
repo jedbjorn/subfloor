@@ -80,7 +80,10 @@ def test_pinned_stock_dsh_workspace_session_archive_contract(
     try:
         _wait_ready(port, process)
         monkeypatch.setenv("SC_DEEPSEEK_HOST_PORT", str(port))
-        client = deepseek_host.DeepSeekHostClient(timeout=2)
+        client = deepseek_host.DeepSeekHostClient(
+            timeout=2,
+            endpoint=deepseek_host.configured_host_url(),
+        )
         created = client.call("workspace.create", {"path": str(workspace)})
         workspace_id = created["workspace"]["workspaceId"]
         second = client.call("workspace.create", {"path": str(other_workspace)})

@@ -50,8 +50,11 @@ LOCK = ENGINE / "run" / "deepseek-web.lock"
 START_TIMEOUT_SECONDS = 30.0
 STOP_TIMEOUT_SECONDS = 5.0
 HTTP_TIMEOUT_SECONDS = 2.0
+MAX_RELAY_REQUEST_BYTES = 4 * 1024 * 1024
 RELAY_POLICY = "host-gateway-only-v1"
 GENERATION_COOKIE = "sc_deepseek_generation"
+MANAGED_GENERATION_COOKIE = "sc_deepseek_managed_generation"
+RELAY_CAPABILITY_CONTRACT = "browser-managed-v1"
 CANDIDATE_FENCE_CODES = frozenset({
     "HARNESS_PROOF_BINDING_MISMATCH",
     "HARNESS_PROOF_CAPABILITY_EXPIRED",
@@ -916,13 +919,17 @@ def _reserved_session() -> str | None:
 def _write_generation() -> str:
     """Mint the relay-only capability without serializing it into service state."""
     token = uuid.uuid4().hex + uuid.uuid4().hex
+    managed_token = uuid.uuid4().hex + uuid.uuid4().hex
     path = _generation_path()
     temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
     try:
         descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         with os.fdopen(descriptor, "w") as handle:
             os.fchmod(handle.fileno(), 0o600)
-            json.dump({"generation": token}, handle)
+            json.dump(
+                {"generation": token, "managed_generation": managed_token},
+                handle,
+            )
             handle.write("\n")
         os.replace(temporary, path)
     except OSError:
@@ -935,11 +942,19 @@ def _write_generation() -> str:
 
 
 def _read_generation(path: Path) -> str:
+    return _read_generation_field(path, "generation")
+
+
+def _read_managed_generation(path: Path) -> str:
+    return _read_generation_field(path, "managed_generation")
+
+
+def _read_generation_field(path: Path, field: str) -> str:
     try:
         if path.is_symlink() or path.stat().st_mode & 0o777 != 0o600:
             raise OSError("unsafe generation artifact")
         value = json.loads(path.read_text())
-        token = value.get("generation") if isinstance(value, Mapping) else None
+        token = value.get(field) if isinstance(value, Mapping) else None
     except (OSError, json.JSONDecodeError) as exc:
         raise DeepSeekWebError(
             "HARNESS_WEB_GENERATION_STALE",
@@ -2073,6 +2088,8 @@ def _existing_healthy(
 ) -> bool:
     if state.get("schema_version") != 5:
         return False
+    if state.get("relay_capability_contract") != RELAY_CAPABILITY_CONTRACT:
+        return False
     if state.get("service_port") != service_port:
         return False
     if not _verified_process(state.get("web_pid"), state.get("web_start_ticks"), "web"):
@@ -2099,6 +2116,7 @@ def _existing_healthy(
     return (
         state.get("relay_port") == relay_port
         and state.get("relay_policy") == RELAY_POLICY
+        and state.get("relay_capability_contract") == RELAY_CAPABILITY_CONTRACT
         and state.get("relay_listen_host") == listen_host
         and state.get("relay_allowed_peers") == list(allowed_peers)
         and _verified_process(
@@ -2188,6 +2206,7 @@ def ensure(
                 "service_port": service_port,
                 "relay_port": relay_port,
                 "relay_policy": RELAY_POLICY,
+                "relay_capability_contract": RELAY_CAPABILITY_CONTRACT,
                 "relay_listen_host": listen_host,
                 "relay_allowed_peers": list(allowed_peers),
                 "url": f"http://127.0.0.1:{public_port}",
@@ -2306,6 +2325,31 @@ def browser_generation() -> str:
     return _read_generation(_generation_path())
 
 
+def managed_relay_authority() -> dict[str, str]:
+    """Return current candidate-owned relay authority for managed Host clients."""
+    state = _read_state()
+    relay_port = state.get("relay_port")
+    if (
+        state.get("schema_version") != 5
+        or not isinstance(relay_port, int)
+        or state.get("relay_policy") != RELAY_POLICY
+        or state.get("relay_capability_contract") != RELAY_CAPABILITY_CONTRACT
+        or state.get("relay_listen_host") not in {"127.0.0.1", "0.0.0.0"}
+        or not isinstance(state.get("relay_allowed_peers"), list)
+        or not state["relay_allowed_peers"]
+        or not _verified_process(state.get("relay_pid"), state.get("relay_start_ticks"), "relay")
+        or not _tcp_ready("127.0.0.1", relay_port)
+    ):
+        raise DeepSeekWebError(
+            "HARNESS_SERVICE_UNAVAILABLE",
+            "DeepSeek managed Host relay is unavailable",
+        )
+    return {
+        "endpoint": f"http://127.0.0.1:{relay_port}",
+        "generation": _read_managed_generation(_generation_path()),
+    }
+
+
 def status() -> dict[str, Any]:
     state = _read_state()
     service_port = state.get("service_port")
@@ -2316,6 +2360,7 @@ def status() -> dict[str, Any]:
     )
     relay_safe = relay_port is None or (
         state.get("relay_policy") == RELAY_POLICY
+        and state.get("relay_capability_contract") == RELAY_CAPABILITY_CONTRACT
         and isinstance(state.get("relay_allowed_peers"), list)
         and bool(state["relay_allowed_peers"])
     )
@@ -2362,6 +2407,7 @@ async def _relay_connection(
     allowed_peers: frozenset[str],
     generation: str | None = None,
     generation_file: Path | None = None,
+    managed_generation: str | None = None,
 ) -> None:
     forward_lock = None
 
@@ -2380,6 +2426,7 @@ async def _relay_connection(
     if generation_file is not None:
         try:
             generation = _read_generation(generation_file)
+            managed_generation = _read_managed_generation(generation_file)
         except DeepSeekWebError:
             writer.close()
             await writer.wait_closed()
@@ -2397,6 +2444,10 @@ async def _relay_connection(
         item.split("=", 1)[0].strip(): item.split("=", 1)[1].strip()
         for item in cookie.split(";") if "=" in item
     }
+    managed_client = (
+        managed_generation is not None
+        and parsed_cookie.get(MANAGED_GENERATION_COOKIE) == managed_generation
+    )
     query_generation = None
     clean_target = None
     if len(request_line) == 3:
@@ -2410,7 +2461,8 @@ async def _relay_connection(
             lines[0] = " ".join(request_line)
             request = ("\r\n".join(lines)).encode("iso-8859-1")
     if generation is not None and (
-        parsed_cookie.get(GENERATION_COOKIE) != generation
+        not managed_client
+        and parsed_cookie.get(GENERATION_COOKIE) != generation
         and query_generation != generation
     ):
         body = b'{"error":"HARNESS_WEB_GENERATION_STALE"}'
@@ -2453,28 +2505,41 @@ async def _relay_connection(
         target_path in SESSION_MUTATION_PATHS
         or target_path == WORKSPACE_DELETE_PATH
     )
-    prompt_record_id = None
-    if guarded_mutation:
-        content_length = next(
-            (
-                line.split(":", 1)[1].strip()
-                for line in lines[1:]
-                if line.lower().startswith("content-length:")
-            ),
-            "0",
+    body = b""
+    if not websocket:
+        content_lengths = [
+            line.split(":", 1)[1].strip()
+            for line in lines[1:]
+            if line.lower().startswith("content-length:")
+        ]
+        transfer_encoded = any(
+            line.lower().startswith("transfer-encoding:")
+            for line in lines[1:]
         )
+        raw_length = content_lengths[0] if len(content_lengths) == 1 else "0"
+        if (
+            len(content_lengths) > 1
+            or transfer_encoded
+            or re.fullmatch(r"0|[1-9][0-9]*", raw_length) is None
+            or int(raw_length) > MAX_RELAY_REQUEST_BYTES
+        ):
+            writer.close()
+            await writer.wait_closed()
+            return
+        length = int(raw_length)
         try:
-            length = int(content_length)
             body = await asyncio.wait_for(
                 reader.readexactly(length), timeout=HTTP_TIMEOUT_SECONDS
             )
+        except (asyncio.IncompleteReadError, TimeoutError):
+            writer.close()
+            await writer.wait_closed()
+            return
+    prompt_record_id = None
+    if guarded_mutation:
+        try:
             payload = json.loads(body)
-        except (
-            ValueError,
-            asyncio.IncompleteReadError,
-            TimeoutError,
-            json.JSONDecodeError,
-        ):
+        except json.JSONDecodeError:
             writer.close()
             await writer.wait_closed()
             return
@@ -2534,7 +2599,7 @@ async def _relay_connection(
         except BaseException:
             release_forward_lock()
             raise
-        if targets_reserved:
+        if targets_reserved and not managed_client:
             release_forward_lock()
             body = b'{"error":"HARNESS_WEB_SESSION_BUSY"}'
             writer.write(
@@ -2546,7 +2611,7 @@ async def _relay_connection(
             writer.close()
             await writer.wait_closed()
             return
-        if target_path == "/api/session.prompt":
+        if target_path == "/api/session.prompt" and not managed_client:
             try:
                 prompt_record_id = _record_browser_prompt_locked(
                     target_port, session_id
@@ -2566,12 +2631,23 @@ async def _relay_connection(
             except BaseException:
                 release_forward_lock()
                 raise
-        request += body
-    headers = [
-        line for line in lines[1:]
-        if line
-        and not (line.lower().startswith("referer:") and "sc_generation=" in line.lower())
-    ]
+    headers = []
+    for line in lines[1:]:
+        if not line:
+            continue
+        if line.lower().startswith("referer:") and "sc_generation=" in line.lower():
+            continue
+        if line.lower().startswith("cookie:"):
+            cookies = [
+                item.strip()
+                for item in line.split(":", 1)[1].split(";")
+                if item.strip().split("=", 1)[0].strip()
+                not in {GENERATION_COOKIE, MANAGED_GENERATION_COOKIE}
+            ]
+            if cookies:
+                headers.append("Cookie: " + "; ".join(cookies))
+            continue
+        headers.append(line)
     if not websocket:
         headers = [
             line for line in headers if not line.lower().startswith("connection:")
@@ -2579,7 +2655,7 @@ async def _relay_connection(
         request = "\r\n".join(
             [lines[0], *headers, "Connection: close", "", ""]
         ).encode("iso-8859-1")
-        if guarded_mutation:
+        if body:
             request += body
     else:
         request = "\r\n".join([lines[0], *headers, "", ""]).encode("iso-8859-1")
@@ -2776,6 +2852,7 @@ async def _relay(
     generation_file: Path,
 ) -> None:
     generation = _read_generation(generation_file)
+    managed_generation = _read_managed_generation(generation_file)
     server = await asyncio.start_server(
         lambda reader, writer: _relay_connection(
             reader,
@@ -2784,6 +2861,7 @@ async def _relay(
             allowed_peers,
             generation,
             generation_file,
+            managed_generation,
         ),
         listen_host,
         listen_port,

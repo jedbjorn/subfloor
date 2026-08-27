@@ -3,9 +3,11 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import io
 import json
 import sys
 import threading
+import urllib.error
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, Mapping
@@ -496,6 +498,7 @@ def test_stock_evidence_records_unattended_permission_contract() -> None:
 
 def test_unary_client_uses_exact_official_envelope(monkeypatch) -> None:
     captured = {}
+    generation = "a" * 64
 
     class Response:
         def __enter__(self):
@@ -515,17 +518,29 @@ def test_unary_client_uses_exact_official_envelope(monkeypatch) -> None:
         captured.update({
             "url": request.full_url,
             "body": json.loads(request.data),
+            "cookie": request.get_header("Cookie"),
             "timeout": timeout,
         })
         return Response()
 
-    monkeypatch.setenv("SC_DEEPSEEK_HOST_PORT", "6500")
+    monkeypatch.setenv("SC_DEEPSEEK_HOST_PORT", "6509")
+    monkeypatch.setattr(
+        deepseek_host.ports,
+        "resolve",
+        mock.Mock(side_effect=AssertionError("private Host port consulted")),
+    )
     monkeypatch.setattr(
         deepseek_host.uuid,
         "uuid4",
         lambda: "00000000-0000-0000-0000-000000000007",
     )
-    client = deepseek_host.DeepSeekHostClient(opener=opener)
+    client = deepseek_host.DeepSeekHostClient(
+        opener=opener,
+        authority_provider=lambda: {
+            "endpoint": "http://127.0.0.1:6500",
+            "generation": generation,
+        },
+    )
 
     assert client.call("host.describe", {}) == {"version": "0.1.1-rc.2"}
     assert captured == {
@@ -536,8 +551,235 @@ def test_unary_client_uses_exact_official_envelope(monkeypatch) -> None:
             "method": "host.describe",
             "payload": {},
         },
+        "cookie": f"sc_deepseek_managed_generation={generation}",
         "timeout": 15.0,
     }
+
+
+def test_unary_client_refreshes_exact_stale_managed_generation(monkeypatch) -> None:
+    generations = iter(("a" * 64, "b" * 64))
+    authority_calls = []
+    requests = []
+    monkeypatch.setenv("SC_DEEPSEEK_HOST_PORT", "6509")
+    resolve = mock.Mock(side_effect=AssertionError("private Host port consulted"))
+    monkeypatch.setattr(deepseek_host.ports, "resolve", resolve)
+
+    def authority():
+        generation = next(generations)
+        authority_calls.append(generation)
+        return {
+            "endpoint": "http://127.0.0.1:6500",
+            "generation": generation,
+        }
+
+    class Response:
+        def __init__(self, request):
+            self.request = request
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def read(self, _limit):
+            rpc_id = json.loads(self.request.data)["rpcId"]
+            return json.dumps({
+                "type": "server-response",
+                "rpcId": rpc_id,
+                "result": {"ok": True, "value": {"version": "0.1.1-rc.2"}},
+            }).encode()
+
+    def opener(request, *, timeout):
+        requests.append((
+            request.full_url,
+            request.get_header("Cookie"),
+            json.loads(request.data)["method"],
+            timeout,
+        ))
+        if len(requests) == 1:
+            raise urllib.error.HTTPError(
+                request.full_url,
+                409,
+                "Conflict",
+                {},
+                io.BytesIO(b'{"error":"HARNESS_WEB_GENERATION_STALE"}'),
+            )
+        return Response(request)
+
+    client = deepseek_host.DeepSeekHostClient(
+        opener=opener, authority_provider=authority
+    )
+
+    assert client.call("host.describe", {}) == {"version": "0.1.1-rc.2"}
+    assert authority_calls == ["a" * 64, "b" * 64]
+    assert requests == [
+        (
+            "http://127.0.0.1:6500/api/host.describe",
+            f"sc_deepseek_managed_generation={'a' * 64}",
+            "host.describe",
+            15.0,
+        ),
+        (
+            "http://127.0.0.1:6500/api/host.describe",
+            f"sc_deepseek_managed_generation={'b' * 64}",
+            "host.describe",
+            15.0,
+        ),
+    ]
+    assert resolve.call_count == 0
+
+
+def test_event_client_refreshes_exact_stale_managed_generation() -> None:
+    generations = iter(("a" * 64, "b" * 64))
+    authority_calls = []
+
+    def authority():
+        generation = next(generations)
+        authority_calls.append(generation)
+        return {
+            "endpoint": "http://127.0.0.1:6500",
+            "generation": generation,
+        }
+
+    class StaleHandshake(Exception):
+        response = type("Response", (), {
+            "status_code": 409,
+            "body": b'{"error":"HARNESS_WEB_GENERATION_STALE"}',
+        })()
+
+    class Socket:
+        closed = False
+
+        def close(self):
+            self.closed = True
+
+    socket = Socket()
+    with mock.patch(
+        "websockets.sync.client.connect",
+        side_effect=(StaleHandshake(), socket),
+    ) as connect:
+        client = deepseek_host.DeepSeekHostClient(
+            authority_provider=authority
+        )
+        stream = client.open_events()
+        stream.close()
+
+    assert authority_calls == ["a" * 64, "b" * 64]
+    assert [call.args[0] for call in connect.call_args_list] == [
+        "ws://127.0.0.1:6500/api/events.mux",
+        "ws://127.0.0.1:6500/api/events.mux",
+    ]
+    assert [
+        call.kwargs["additional_headers"]["Cookie"]
+        for call in connect.call_args_list
+    ] == [
+        f"sc_deepseek_managed_generation={'a' * 64}",
+        f"sc_deepseek_managed_generation={'b' * 64}",
+    ]
+    assert socket.closed is True
+
+
+@pytest.mark.parametrize(
+    ("authority", "code"),
+    [
+        (None, "HARNESS_HOST_UNAVAILABLE"),
+        ({}, "HARNESS_HOST_UNAVAILABLE"),
+        ({"endpoint": "http://127.0.0.1:6500"}, "HARNESS_HOST_UNAVAILABLE"),
+        (
+            {
+                "endpoint": "http://127.0.0.1:6500",
+                "generation": "not-current-authority",
+            },
+            "HARNESS_WEB_GENERATION_STALE",
+        ),
+        (
+            {"endpoint": "http://127.0.0.2:6500", "generation": "a" * 64},
+            "HARNESS_HOST_UNAVAILABLE",
+        ),
+    ],
+)
+def test_default_client_rejects_missing_or_malformed_managed_authority(
+    authority, code, monkeypatch
+) -> None:
+    opened = mock.Mock(side_effect=AssertionError("Host request attempted"))
+    monkeypatch.setenv("SC_DEEPSEEK_HOST_PORT", "6509")
+    monkeypatch.setattr(
+        deepseek_host.ports,
+        "resolve",
+        mock.Mock(side_effect=AssertionError("private Host port consulted")),
+    )
+
+    with pytest.raises(deepseek_host.DeepSeekHostError) as refused:
+        deepseek_host.DeepSeekHostClient(
+            opener=opened, authority_provider=lambda: authority
+        )
+
+    assert refused.value.code == code
+    assert opened.call_count == 0
+
+
+def test_concurrent_default_clients_share_managed_authority_without_ambient_port(
+    monkeypatch,
+) -> None:
+    generation = "c" * 64
+    observed = []
+    observed_lock = threading.Lock()
+    monkeypatch.setenv("SC_DEEPSEEK_HOST_PORT", "6509")
+    resolve = mock.Mock(side_effect=AssertionError("private Host port consulted"))
+    monkeypatch.setattr(deepseek_host.ports, "resolve", resolve)
+
+    class Response:
+        def __init__(self, request):
+            self.request = request
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def read(self, _limit):
+            body = json.loads(self.request.data)
+            return json.dumps({
+                "type": "server-response",
+                "rpcId": body["rpcId"],
+                "result": {"ok": True, "value": {"version": "0.1.1-rc.2"}},
+            }).encode()
+
+    def opener(request, *, timeout):
+        with observed_lock:
+            observed.append({
+                "url": request.full_url,
+                "cookie": request.get_header("Cookie"),
+                "method": json.loads(request.data)["method"],
+                "timeout": timeout,
+            })
+        return Response(request)
+
+    def attach(_index):
+        client = deepseek_host.DeepSeekHostClient(
+            opener=opener,
+            authority_provider=lambda: {
+                "endpoint": "http://127.0.0.1:6500",
+                "generation": generation,
+            },
+        )
+        return client.call("host.describe", {})
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        results = list(pool.map(attach, range(24)))
+
+    assert results == [{"version": "0.1.1-rc.2"}] * 24
+    assert observed == [
+        {
+            "url": "http://127.0.0.1:6500/api/host.describe",
+            "cookie": f"sc_deepseek_managed_generation={generation}",
+            "method": "host.describe",
+            "timeout": 15.0,
+        }
+    ] * 24
+    assert resolve.call_count == 0
 
 
 def test_stale_v2_metadata_does_not_block_current_exact_route(tmp_path: Path) -> None:
