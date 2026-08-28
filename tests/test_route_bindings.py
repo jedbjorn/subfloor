@@ -759,42 +759,6 @@ class BindingIdentityTest(unittest.TestCase):
                 original,
             )
 
-    def test_historical_deepseek_binding_is_inert_and_byte_stable(self):
-        historical_deepseek = {
-            "contract_version": 2,
-            "control_state": "controlled",
-            "harness": "deepseek",
-            "requested_model": "deepseek-official/deepseek-v4-pro",
-            "provider_model": "deepseek-v4-pro",
-            "requested_effort": "high",
-            "effective_effort": "high",
-            "native_variant_id": None,
-            "transport": "deepseek-stock-host-v1",
-            "catalogue_generation": "1" * 32,
-            "evidence_digest": "2" * 64,
-            "selector_binding": {"kind": "historical"},
-            "adapter_metadata": {"historical": True},
-        }
-        historical_json = route_bindings.canonical_json(historical_deepseek)
-        with self.assertRaises(route_bindings.RouteResolutionError) as removed:
-            route_bindings.validate_binding(historical_deepseek)
-        self.assertEqual(removed.exception.code, "thinking_evidence_missing")
-        with mock.patch.object(
-            model_catalog,
-            "controlled_route_evidence",
-            side_effect=AssertionError("historical row reached live discovery"),
-        ) as probe, self.assertRaises(route_bindings.RouteResolutionError):
-            route_bindings.verify_stored_v2_before_first_turn(
-                None, historical_deepseek,
-                source_fingerprint="0" * 64,
-                harness_version="retired-runtime",
-            )
-        probe.assert_not_called()
-        self.assertEqual(
-            route_bindings.canonical_json(historical_deepseek),
-            historical_json,
-        )
-
 
     def test_uncontrolled_bindings_encode_every_inapplicable_value_as_null(self):
         default, default_digest = route_bindings.resolve_v2(

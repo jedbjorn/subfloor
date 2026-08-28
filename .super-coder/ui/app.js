@@ -4654,8 +4654,7 @@ async function chatRenderOpen(
       conversation, harnessStatus,
     );
     unavailable.hidden = !unavailableReason;
-    unavailable.textContent = unavailableReason
-      ? `${unavailableReason} — history remains readable.` : "";
+    unavailable.textContent = unavailableReason || "";
     composer.disabled = Boolean(unavailableReason)
       || closing || (closed && !reopenable);
     send.disabled = Boolean(unavailableReason)

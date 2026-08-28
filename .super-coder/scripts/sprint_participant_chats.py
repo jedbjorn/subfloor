@@ -18,6 +18,7 @@ from typing import Any
 
 import active_chat_registry
 import run as run_mod
+from conversation_adapters import ADAPTER_TYPES
 
 ENGINE = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ENGINE / "api"))
@@ -203,10 +204,12 @@ def prepare_shell_wake_conversation(con, shell_id: int) -> PreparedShellWake:
     if shell["user_id"] is None:
         raise SprintConversationError("wake receiver shell has no browser owner")
 
+    browser_harnesses = tuple(sorted(ADAPTER_TYPES))
     prior = con.execute(
         "SELECT harness,model,effort FROM conversations WHERE shell_id=? "
+        f"AND harness IN ({','.join('?' for _ in browser_harnesses)}) "
         "ORDER BY created_at DESC,conversation_id DESC LIMIT 1",
-        (shell_id,),
+        (shell_id, *browser_harnesses),
     ).fetchone()
     defaults = run_mod.flavor_defaults(con).get(shell["flavor"], {})
     harness = (

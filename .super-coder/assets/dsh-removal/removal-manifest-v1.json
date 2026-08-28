@@ -2,61 +2,61 @@
   "active_state_owners": [
     {
       "removal": "delete DSH defaults",
-      "retained": "preserve harness='opencode', including DeepSeek-family model IDs",
+      "retained": "keep exact harness='opencode' rows, including DeepSeek-family model IDs",
       "selector": "harness='deepseek'",
       "table": "flavor_defaults"
     },
     {
       "removal": "delete DSH catalogue routes and errors",
-      "retained": "preserve OpenCode routes and exact provider/model/option identity",
+      "retained": "keep OpenCode routes and exact provider/model/option identity",
       "selector": "harness='deepseek'",
       "table": "model_routes"
     },
     {
       "removal": "purge DSH-derived current catalogue cache generations",
-      "retained": "preserve generations containing retained harness evidence only",
+      "retained": "keep only generations containing no DSH owner or reference",
       "selector": "DSH-owned runtime, version, fingerprint, source, or error payload",
       "table": "model_catalog_generations"
     },
     {
-      "removal": "delete the DSH parser cache",
-      "retained": "preserve normalized usage rows and retained harness caches",
+      "removal": "delete DSH parser cache and normalized DSH usage rows",
+      "retained": "keep retained-harness usage and cache rows byte-for-byte",
       "selector": "harness='deepseek'",
       "table": "analytics_parse_cache"
     },
     {
-      "removal": "make every row inert and unavailable for create, send, reopen, or recovery",
-      "retained": "preserve identity, normalized messages, events, and transcript fields",
+      "removal": "delete each DSH conversation root and every descendant message, event, transcript, attachment, recovery, usage, and index row",
+      "retained": "keep unrelated conversation graphs byte-for-byte",
       "selector": "harness='deepseek'",
       "table": "conversations"
     },
     {
-      "removal": "terminalize with one generic removed-harness result and clear live process authority",
-      "retained": "preserve terminal historical run evidence",
-      "selector": "joined conversation harness='deepseek' and state is nonterminal",
+      "removal": "delete every joined run; write no terminal result, tombstone, or recovery evidence",
+      "retained": "keep unrelated runs byte-for-byte",
+      "selector": "joined conversation harness='deepseek'",
       "table": "conversation_runs"
     },
     {
-      "removal": "terminalize queued work without dispatch",
-      "retained": "preserve completed normalized delivery history",
-      "selector": "joined conversation harness='deepseek' and state is pending or claimed",
+      "removal": "delete every joined outbox row without dispatch or terminal evidence",
+      "retained": "keep unrelated delivery rows byte-for-byte",
+      "selector": "joined conversation harness='deepseek'",
       "table": "conversation_outbox"
     },
     {
       "removal": "remove active process/admission pointers",
-      "retained": "preserve unrelated active chats",
+      "retained": "keep unrelated active chats byte-for-byte",
       "selector": "chat_id references a DSH conversation",
       "table": "active_shell_chats"
     },
     {
-      "removal": "clear active route authority and require explicit Planner reroute",
-      "retained": "preserve participant, Sprint, messages, events, and disposition history",
+      "removal": "delete the DSH participant and every DSH-owned assignment, relay, wake, report, expectation, event, and route reference",
+      "retained": "keep unrelated portions of a mixed Sprint only after every DSH relation is gone",
       "selector": "harness='deepseek'",
       "table": "sprint_participants"
     },
     {
-      "removal": "detach active pointers; never rewrite immutable binding rows",
-      "retained": "preserve every historical binding byte and revision",
+      "removal": "delete every DSH binding revision and all references to it",
+      "retained": "keep retained-harness binding revisions byte-for-byte",
       "selector": "harness='deepseek'",
       "table": "sprint_participant_route_bindings"
     }
@@ -133,10 +133,10 @@
   ],
   "governing_spec": {
     "document_id": 178,
-    "revision_sha256": "03220b8017f252d2842a273cfb274ad3d99b6092ba9033ebbc7c6e423bff1fcf",
-    "sprint_id": 28,
-    "task_id": 665,
-    "work_unit_id": 121
+    "revision_sha256": "be111eb206b9e6ea09352a90346e8a94544ac1ef3bd932716e4bd90451d33c42",
+    "sprint_id": 29,
+    "task_id": 680,
+    "work_unit_id": 129
   },
   "immutable_migration_ledger": [
     {
@@ -1247,43 +1247,43 @@
   "immutable_reference_migrations": [
     {
       "bytes": 3340,
-      "disposition": "preserve-retained-opencode-model-history",
+      "disposition": "retain-opencode-owned-model-data",
       "path": ".super-coder/migrations/0007_flavor_defaults_per_harness.sql",
       "sha256": "1fb27b4cad5f0f6d42cf48149035cee7448b8210166a875b9a387425ec0f38d2"
     },
     {
       "bytes": 2799,
-      "disposition": "preserve-retained-opencode-model-history",
+      "disposition": "retain-opencode-owned-model-data",
       "path": ".super-coder/migrations/0015_claude_bookends_opencode_relicense.sql",
       "sha256": "27b89ecb1b63d9a7364594acb6fe29ebf09ea1b4ab658bfa62dab658d1e32a25"
     },
     {
       "bytes": 2998,
-      "disposition": "preserve-retained-opencode-model-history",
+      "disposition": "retain-opencode-owned-model-data",
       "path": ".super-coder/migrations/0095_ootb_model_refit_opus_terra_kimi.sql",
       "sha256": "63b1d6a0add967358713c6221fa2f7f0e3c780e0ec61e6de7ec65dda68ad2726"
     },
     {
       "bytes": 9560,
-      "disposition": "preserve-dsh-history",
+      "disposition": "remove-after-purge-rebaseline",
       "path": ".super-coder/migrations/0227_deepseek_controlled_route_binding.sql",
       "sha256": "1505e28d5bd6426418b46a94402dad549e27ade30308f55256c248be1742ecc5"
     },
     {
       "bytes": 9563,
-      "disposition": "preserve-dsh-history",
+      "disposition": "remove-after-purge-rebaseline",
       "path": ".super-coder/migrations/0230_deepseek_stock_host_route_binding.sql",
       "sha256": "2445526e53776c02548c3141c5922e3224d105a12b8565108a233d8d3ac40b67"
     },
     {
       "bytes": 11510,
-      "disposition": "preserve-dsh-history",
+      "disposition": "remove-after-purge-rebaseline",
       "path": ".super-coder/migrations/0235_live_native_route_binding_v3.sql",
       "sha256": "a8d1d539b6d654cb7646a0d37efbf5de7abc5ccf20434fc6a1fc7ab5e21abd53"
     },
     {
       "bytes": 9008,
-      "disposition": "preserve-dsh-history",
+      "disposition": "remove-after-purge-rebaseline",
       "path": ".super-coder/migrations/0236_live_native_conversation_routes.sql",
       "sha256": "793ca78190e401e6c01e866bde035c4109b46c1ffd28539a6d54a84386e4e732"
     }
@@ -1344,10 +1344,9 @@
   "retained_controls": [
     "Claude, Codex, OpenCode, Vibe, and Kimi adapter manifests and install/probe paths",
     "OpenCode-owned DeepSeek-family selectors and native-option identity",
-    "generic normalized conversation messages, events, transcripts, and completed usage",
-    "generic Sprint rows, participants, messages, events, and immutable route-binding history",
+    "unrelated retained-harness conversation and Sprint graphs byte-for-byte",
     "instance port and dev_port plus API/review service ownership",
-    "schema.sql and every pre-existing ordered migration byte",
+    "ordinary updater, migration ledger, and service cutover only where no DSH owner or reference remains",
     "user-owned ~/.dsh, external global packages, and unmarked caches"
   ],
   "scan": {

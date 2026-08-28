@@ -37,7 +37,7 @@
     ],
     "conversation_messages": [
       {
-        "body": "preserve this normalized DSH prompt",
+        "body": "purge this DSH-owned prompt graph",
         "conversation_id": "cv_dsh_fixture",
         "idempotency_key": "dsh-message",
         "message_id": 9001,
@@ -103,7 +103,7 @@
         "route_contract_version": 3,
         "shell_id": 9001,
         "state": "running",
-        "title": "Historical DSH chat",
+        "title": "DSH purge input",
         "worktree": "/fixture/dsh"
       },
       {
@@ -345,7 +345,7 @@
   "schema_version": 1,
   "target_removal_manifest": {
     "path": ".super-coder/assets/dsh-removal/removal-manifest-v1.json",
-    "sha256": "237106260717df940b00cef702502c8c497ae5b00f274e11f9b7a4f4896353fd"
+    "sha256": "73d125ea52b06c7f7fadd3331f67b67ce663b74248ec989a082c670c99f2e0ee"
   },
   "tracked_payload": {
     "path": "tracked-artifacts.tar.gz",

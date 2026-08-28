@@ -456,9 +456,12 @@ def get_cli_skills(con) -> dict:
 def get_model_routes(con, *, harness: str | None = None,
                      selector: str | None = None) -> dict:
     """Small exact-route projection for authenticated shell CLI reads."""
+    shipped = tuple(known_harnesses())
+    if harness is not None and harness not in shipped:
+        return {"routes": []}
     sql = "SELECT * FROM model_routes"
-    clauses = []
-    params = []
+    clauses = [f"harness IN ({','.join('?' for _ in shipped)})"]
+    params = list(shipped)
     if harness is not None:
         clauses.append("harness=?")
         params.append(harness)
@@ -486,36 +489,6 @@ def known_default_harnesses() -> list[str]:
     return harness_surfaces.known_interactive_harnesses()
 
 
-def _historical_harnesses(con) -> set[str]:
-    """Names retained in durable rows, including removed/unknown harnesses."""
-    found: set[str] = set()
-    tables = {
-        row[0]
-        for row in con.execute("SELECT name FROM sqlite_master WHERE type='table'")
-    }
-    for table in (
-        "conversations",
-        "sprint_participants",
-        "flavor_defaults",
-        "model_routes",
-    ):
-        if table not in tables:
-            continue
-        columns = {
-            row[1] for row in con.execute(f'PRAGMA table_info("{table}")')
-        }
-        if "harness" not in columns:
-            continue
-        found.update(
-            row[0]
-            for row in con.execute(
-                f"SELECT DISTINCT lower(trim(harness)) FROM {table} "
-                "WHERE harness IS NOT NULL AND trim(harness)<>''"
-            )
-        )
-    return found
-
-
 def get_flavor_defaults(con) -> dict:
     """The model matrix and interactive launch defaults for each flavor.
 
@@ -524,6 +497,8 @@ def get_flavor_defaults(con) -> dict:
     run.py. Template flavors with no rows yet are included empty; missing cells
     are created on first write (see set_flavor_default).
     """
+    visible_harnesses = known_harnesses()
+    visible_harness_set = set(visible_harnesses)
     flavors: dict[str, list] = {}
     route_rows = {
         (r["harness"], r["selector"]): r
@@ -541,6 +516,8 @@ def get_flavor_defaults(con) -> dict:
             "SELECT flavor,harness,model,effort,is_default "
             "FROM flavor_defaults ORDER BY flavor,harness")):
         harness = r["harness"]
+        if harness not in visible_harness_set:
+            continue
         model = r["model"]
         effort = r["effort"]
         route = route_rows.get((harness, model)) or {}
@@ -588,9 +565,9 @@ def get_flavor_defaults(con) -> dict:
         flavors.setdefault(t.get("flavor"), [])
     return {
         "flavors": flavors,
-        "harnesses": known_harnesses(),
+        "harnesses": visible_harnesses,
         "default_harnesses": known_default_harnesses(),
-        "harness_status": harness_surfaces.project(_historical_harnesses(con)),
+        "harness_status": harness_surfaces.project(),
     }
 
 
