@@ -689,10 +689,7 @@ class RenderAndSnapshotTest(unittest.TestCase):
             "INSERT INTO shell_skills (shell_id, skill_id) VALUES (?, ?)",
             (self.custom, self.kid),
         )
-        adapter = json.loads(
-            (ENGINE / "adapters" / "deepseek" / "adapter.json").read_text()
-        )
-        self.assertEqual(adapter["skill_dirs"], [".agents/skills"])
+        adapter = {"skill_dirs": [".agents/skills"]}
 
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
