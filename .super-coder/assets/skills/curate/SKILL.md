@@ -91,8 +91,8 @@ retire it. If issue search or creation is unavailable, surface the failure to
 the FnB, keep the L&S, and create no local skill or asset.
 
 Deliberate fork-specific skill authoring is separate from curation and remains
-administrator-owned. The admin follows `local_skill_management`: authored
-asset → explicit seed → grant → snapshot → render.
+Planner-owned. The Planner follows `fork_skill_design`: draft → DB persist →
+grant → projection and snapshot receipts.
 
 ## Pass 4 — Category
 

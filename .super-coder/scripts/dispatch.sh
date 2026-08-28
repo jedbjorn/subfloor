@@ -399,7 +399,7 @@ sc_broker_preflight() {  # $1 = label, $2 = pidfile, $3 = logfile, $4 = sock
 # ── Windows VM broker (HOST-side; drives the test VM for sandboxed forks) ──────
 # A separate host process — the sandbox server can't hold the ssh key or reach
 # libvirt. It listens on a unix socket in the bind-mounted engine dir so
-# windows_devkit (in the container) can curl it without a route or a key. Refuses
+# the typed client (in the container) can curl it without a route or key. Refuses
 # to run in the sandbox (vm_broker.py guards on SC_SANDBOX).
 #
 # Supervision: `launch` brings it up (and `down` stops it) automatically when the
@@ -1496,8 +1496,8 @@ super-coder — forkable shell substrate
                              --until <duration> changes the age · --all removes all unused cache
   ./sc rollback            sound undo of a bad update — restore the DB + engine (engine.ref.prev) together
                              --engine-only repairs a new-engine / unchanged-old-DB half floor without restoring a DB backup
-  ./sc feature             list the opt-in features (pg · windows · tailnet · pm2 · app-deploy) and the state of both halves (config block + skill grants)
-  ./sc feature enable <f>  enable one: grant its skills to the owning flavors + create/point-at its instance.json block (disable reverses)
+  ./sc feature             list optional infrastructure (pg · windows · tailnet · pm2) and its instance.json state
+  ./sc feature enable <f>  create or point at one instance.json block (disable removes it)
   ./sc eject               ONE-WAY: stop tracking upstream and own the engine — un-gitignore + stage .super-coder/ as fork source (confirm-gated)
   ./sc remove              safely uninstall subfloor from this repo after a verified DB backup
                              --dry-run previews; --yes skips confirmation, never safety gates

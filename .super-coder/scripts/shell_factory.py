@@ -110,38 +110,10 @@ def reconcile_flavor_pack(con, flavor: str) -> int:
     ``inherit_common_skills: false`` durable across install, update, and
     catalogue reseeds.
     """
-    template = load_flavor(flavor)
-    explicit = tuple(template.get("skills", ()))
-    changed = 0
-    if not template.get("inherit_common_skills", True):
-        if explicit:
-            placeholders = ",".join("?" for _ in explicit)
-            cur = con.execute(
-                "DELETE FROM flavor_skills WHERE flavor=? AND skill_id NOT IN ("
-                f"SELECT skill_id FROM skills WHERE name IN ({placeholders})"
-                ")",
-                (flavor, *explicit),
-            )
-        else:
-            cur = con.execute(
-                "DELETE FROM flavor_skills WHERE flavor=?", (flavor,)
-            )
-        changed += cur.rowcount
-    else:
-        cur = con.execute(
-            "INSERT OR IGNORE INTO flavor_skills (flavor,skill_id) "
-            "SELECT ?,skill_id FROM skills WHERE is_deleted=0 AND common=1",
-            (flavor,),
-        )
-        changed += cur.rowcount
-    for name in explicit:
-        cur = con.execute(
-            "INSERT OR IGNORE INTO flavor_skills (flavor,skill_id) "
-            "SELECT ?,skill_id FROM skills WHERE name=? AND is_deleted=0",
-            (flavor, name),
-        )
-        changed += cur.rowcount
-    return changed
+    load_flavor(flavor)  # validate the shipped template + fork identity overlay
+    import seed_skills
+
+    return seed_skills.reconcile_standard_flavor_packs(con, [flavor])
 
 
 def _auto_shortname(con, abbr: str) -> str:

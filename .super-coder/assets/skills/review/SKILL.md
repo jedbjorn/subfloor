@@ -42,13 +42,8 @@ sc mem get shells
 
 ## Step 2: Review along the three axes
 
-**Agents overlay:** this shell granted `agents` + FnB invoked `--agents` ->
-that skill's overlay fans this step out to an adversarial finding-panel.
-Load it and apply it on top of this step. Steps 1, 3, and 4 stay yours,
-unchanged.
-
-Apply every axis on every review, plus the granted *lenses* matching what
-the diff touches:
+Apply every axis on every review, plus any granted fork-local capability skill
+matching what the diff touches:
 
 1. **Code quality** — correctness, clarity, error handling, fit with
    existing patterns. Trace the actual code path; NEVER trust the
@@ -63,14 +58,10 @@ the diff touches:
 
 | Diff touches | Lens |
 |---|---|
-| an API / endpoint / route | `api-design` → *Review lens* |
-| `tests/` | `test_authoring` → *Review lens* |
-| schema / migration | `database-migrations` |
 | a redline / UI change | `redline_review` |
 
-A granted skill that declares it supersedes a lens (says so in its
-description — e.g. a fork-local testing skill superseding `test_authoring`)
--> use the superseding skill: it carries the fork's actual standard.
+A matching fork-local skill carries the fork's actual environment, tools, and
+process boundary; the three axes above remain the review contract.
 
 ## Step 3: Open a flag per failure — record, don't send yet
 

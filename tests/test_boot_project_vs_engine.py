@@ -23,6 +23,7 @@ sys.path.insert(0, str(ROOT / ".super-coder" / "render"))
 import compose  # noqa: E402
 
 SLOT = "{{project_vs_engine}}"
+DEV_TOOLS_SLOT = "{{dev_tools}}"
 
 
 class ProjectVsEngineTest(unittest.TestCase):
@@ -31,6 +32,7 @@ class ProjectVsEngineTest(unittest.TestCase):
 
     def test_template_carries_slot_exactly_once(self):
         self.assertEqual(self.template.count(SLOT), 1)
+        self.assertEqual(self.template.count(DEV_TOOLS_SLOT), 1)
 
     def test_template_has_no_hardcoded_variant(self):
         # The block must come from the slot — a hardcoded copy in the template
@@ -64,46 +66,41 @@ class ProjectVsEngineTest(unittest.TestCase):
         for render in (fork_render, source_render):
             self.assertNotIn(SLOT, render)
         self.assertIn("gitignored dependency", fork_render)
-        self.assertIn("state:** absent", fork_render)
-        self.assertIn("no fork dev kit declared", fork_render)
         self.assertIn("you are upstream", source_render)
-        self.assertIn("`.subfloor/dev-kit.json` declared", source_render)
-        self.assertNotIn("state:** ready", source_render)
-        self.assertIn("readiness is proven", source_render)
+        self.assertNotIn("dev kit", fork_render.lower())
+        self.assertNotIn("dev kit", source_render.lower())
 
-    def test_devkit_status_distinguishes_absent_and_declared(self):
-        absent = compose.render_project_vs_engine(False, False)
-        declared = compose.render_project_vs_engine(False, True)
-        self.assertIn("state:** absent", absent)
-        self.assertIn("no fork dev kit declared", absent)
-        self.assertIn("does not define project policy", absent)
-        self.assertIn("tracked project-owned entrypoint", absent)
-        self.assertIn("command and required environment", absent)
-        self.assertNotIn("no fork dev kit declared", declared)
-        self.assertIn("`.subfloor/dev-kit.json` declared", declared)
-        self.assertNotIn("state:** ready", declared)
-        self.assertIn("current Docker receipt", declared)
-        self.assertIn("run each configured hook through", declared)
-        self.assertIn("`sc test`", declared)
-        self.assertIn("append focused arguments after the hook name", declared)
-        self.assertIn("runner reports the selected checkout", declared)
-        self.assertIn("child status", declared)
-        self.assertIn("Do not probe PATH", declared)
+    def test_dev_tools_render_only_for_developer_and_reviewer(self):
+        inventory = {
+            "state": "declared",
+            "checkout": "/repo",
+            "seat": "host",
+            "declaration": "`.subfloor/dev-kit.json` (valid)",
+            "hooks": {},
+            "sandbox": "absent",
+            "provision": "absent",
+            "evidence": "/repo/.sc-state/local/dev-kit/",
+            "baseline": {},
+            "dev_port": "unavailable",
+            "app_database": "unavailable",
+        }
+        for flavor in ("dev", "reviewer"):
+            rendered = compose.render_dev_tools(flavor, inventory)
+            self.assertIn("## DEV TOOLS", rendered)
+            self.assertIn("**State:** `declared`", rendered)
+            self.assertIn("`sc test` — unavailable (not declared)", rendered)
+        for flavor in ("admin", "planner", "devops", "cartographer", None):
+            self.assertEqual(compose.render_dev_tools(flavor, inventory), "")
 
-    def test_declared_file_presence_never_claims_ready_on_a_host_boot(self):
-        # run.py supplies only Path.is_file() here. That evidence also matches an
-        # invalid {"version": 2} declaration or a declaration with no hooks.
-        rendered = compose.render_project_vs_engine(False, True)
-        self.assertIn("`.subfloor/dev-kit.json` declared", rendered)
-        self.assertNotIn("state:** ready", rendered)
-        self.assertIn("hook execution", rendered)
+    def test_dev_tools_reject_unknown_state(self):
+        with self.assertRaisesRegex(ValueError, "unsupported dev-tool state"):
+            compose.render_dev_tools("dev", {"state": "invented"})
 
-    def test_repair_boot_replaces_status_with_explicit_non_readiness(self):
-        repair = compose.render_project_vs_engine(False, True, True)
-        self.assertIn("state:** repair", repair)
-        self.assertIn("makes no readiness claim", repair)
-        self.assertIn("exit to the host", repair)
-        self.assertNotIn("`.subfloor/dev-kit.json` declared", repair)
+    def test_repair_inventory_uses_canonical_recovery(self):
+        repair = compose.render_dev_tools("dev", {"state": "repair"})
+        self.assertIn("**State:** `repair`", repair)
+        self.assertIn("Exit to the host", repair)
+        self.assertIn("require `ready`", repair)
 
     def test_floor_and_declared_work_repo_render_as_separate_targets(self):
         lines = compose.render_target_freshness(

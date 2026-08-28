@@ -83,39 +83,102 @@ PROJECT_VS_ENGINE_SOURCE = (
     "   trusting whichever one the dispatcher resolves.\n"
 )
 
-DEVKIT_DECLARED_STATUS = (
-    "**Fork dev kit:** `.subfloor/dev-kit.json` declared; readiness is proven "
-    "only by hook execution or a current Docker receipt. Before project "
-    "dependency or quality checks, read the declaration and its executable, "
-    "then run each configured hook through `sc deps`, `sc test`, `sc lint`, or "
-    "`sc typecheck`; append focused arguments after the hook name. Pass = the "
-    "runner reports the selected checkout, cwd, seat, executable, and child "
-    "status. Do not probe PATH or reconstruct CI commands before the declared "
-    "hook runs."
-)
-DEVKIT_ABSENT_STATUS = (
-    "**Fork dev kit state:** absent — no fork dev kit declared; the engine "
-    "baseline remains available but does not define project policy. Before "
-    "project dependency or quality checks, locate the tracked project-owned "
-    "entrypoint through the repo map; pass = the command and required "
-    "environment come from tracked repository policy."
-)
-DEVKIT_REPAIR_STATUS = (
-    "**Fork dev kit state:** repair — provisioning is not ready. This shell "
-    "makes no readiness claim; exit to the host and run `sc launch` after repair."
-)
-
-
 def render_project_vs_engine(
     source_mode: bool, devkit_declared: bool, devkit_repair: bool = False
 ) -> str:
-    """Render repo position and the checkout's fork-dev-kit status together."""
-    project = PROJECT_VS_ENGINE_SOURCE if source_mode else PROJECT_VS_ENGINE_FORK
-    if devkit_repair:
-        devkit = DEVKIT_REPAIR_STATUS
-    else:
-        devkit = DEVKIT_DECLARED_STATUS if devkit_declared else DEVKIT_ABSENT_STATUS
-    return f"{project}\n\n{devkit}"
+    """Render repo position; dev-tool state has one role-scoped owner below."""
+    del devkit_declared, devkit_repair
+    return PROJECT_VS_ENGINE_SOURCE if source_mode else PROJECT_VS_ENGINE_FORK
+
+
+DEV_TOOL_STATES = (
+    "absent",
+    "declared",
+    "invalid",
+    "ready",
+    "failed",
+    "stale",
+    "advisory",
+    "repair",
+)
+DEV_TOOL_HOOKS = ("deps", "test", "lint", "typecheck")
+DEV_TOOL_RECOVERY = {
+    "absent": "Add a tracked declaration only when the fork needs one.",
+    "declared": "Run the exact configured hook to produce execution evidence.",
+    "invalid": "Correct the named tracked input, then retry.",
+    "ready": "Continue through the configured hook.",
+    "failed": "Inspect retained evidence and retry the same supported surface.",
+    "stale": "From the host run `sc launch`; use repair after a failed attempt.",
+    "advisory": "Inspect the named evidence and submit a reviewed tracked remediation.",
+    "repair": "Exit to the host, rerun `sc launch`, and require `ready`.",
+}
+
+
+def render_dev_tools(flavor: str | None, inventory: dict | None) -> str:
+    """Render the exact fork tool/seat inventory for the roles that exercise it."""
+    if flavor not in {"dev", "reviewer"}:
+        return ""
+    inventory = inventory or {
+        "state": "absent",
+        "checkout": "unavailable",
+        "seat": "unavailable",
+        "declaration": ".subfloor/dev-kit.json (absent)",
+        "hooks": {},
+        "sandbox": "absent",
+        "provision": "absent",
+        "evidence": ".sc-state/local/dev-kit/",
+        "logs": ".sc-state/local/devkit-logs/",
+        "baseline": {},
+        "dev_port": "unavailable",
+        "app_database": "unavailable",
+    }
+    state = inventory.get("state")
+    if state not in DEV_TOOL_STATES:
+        raise ValueError(f"unsupported dev-tool state: {state}")
+
+    lines = [
+        "## DEV TOOLS",
+        "",
+        f"- **Checkout:** `{inventory.get('checkout', 'unavailable')}`",
+        f"- **Seat:** `{inventory.get('seat', 'unavailable')}`",
+        f"- **Declaration:** {inventory.get('declaration', 'unavailable')}",
+        f"- **State:** `{state}` — {inventory.get('detail') or DEV_TOOL_RECOVERY[state]}",
+        "- **Hooks:**",
+    ]
+    hooks = inventory.get("hooks") or {}
+    for name in DEV_TOOL_HOOKS:
+        hook = hooks.get(name)
+        if not hook:
+            lines.append(f"  - `sc {name}` — unavailable (not declared)")
+            continue
+        status = hook.get("state", "unavailable")
+        cwd = hook.get("cwd", "unavailable")
+        executable = hook.get("executable", "unavailable")
+        lines.append(
+            f"  - `sc {name}` — {status}; cwd `{cwd}`; executable `{executable}`"
+        )
+    baseline = inventory.get("baseline") or {}
+    baseline_text = ", ".join(
+        f"`{name}` {status}" for name, status in sorted(baseline.items())
+    ) or "unavailable"
+    lines.extend(
+        [
+            f"- **Engine baseline:** {baseline_text}",
+            f"- **Sandbox extension:** {inventory.get('sandbox', 'absent')}",
+            f"- **Provisioning:** {inventory.get('provision', 'absent')}",
+            f"- **Dev server:** {inventory.get('dev_port', 'unavailable')}",
+            f"- **App database sidecar:** {inventory.get('app_database', 'unavailable')}",
+            (
+                f"- **Evidence:** "
+                f"`{inventory.get('evidence', '.sc-state/local/dev-kit/')}`; "
+                f"retained hook logs "
+                f"`{inventory.get('logs', '.sc-state/local/devkit-logs/')}`; "
+                "use `SC_DEVKIT_OUTPUT=full` for complete command output."
+            ),
+            f"- **Recovery:** {DEV_TOOL_RECOVERY[state]}",
+        ]
+    )
+    return "\n".join(lines)
 
 
 def render_execution_context(flavor: str | None, launch_mode: str) -> str:
@@ -452,6 +515,7 @@ def compose_boot(con: sqlite3.Connection, shell, user, session_id: str,
                  source_mode: bool = False,
                  devkit_declared: bool = False,
                  devkit_repair: bool = False,
+                 dev_tools: "dict | None" = None,
                  launch_mode: str = "container") -> str:
     """Assemble the full boot markdown for `shell`, driven by `user`.
 
@@ -480,6 +544,11 @@ def compose_boot(con: sqlite3.Connection, shell, user, session_id: str,
     template = template.replace(
         "{{execution_context}}", render_execution_context(flavor, launch_mode)
     )
+    dev_tools_block = render_dev_tools(flavor, dev_tools)
+    if dev_tools_block:
+        template = template.replace("{{dev_tools}}", dev_tools_block)
+    else:
+        template = template.replace("\n{{dev_tools}}\n", "\n")
     template = template.replace(
         "{{api_unreachable_guidance}}",
         render_api_unreachable_guidance(flavor, launch_mode),

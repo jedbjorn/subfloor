@@ -19,7 +19,7 @@ or hand-patching state to proceed -> you hold the exact repro; file it now.
 | Where | What |
 |---|---|
 | **Upstream — file it** | anything the engine materializes/owns: `.super-coder/`, `sc` + every subcommand, engine skills (this catalogue), the boot doc render, the sandbox / dev kit, `sc update` + migrations, the `_sc` API + `sc mem` |
-| **Fork — don't** | the repo's app code, fork-local skills (see `local_skill_management`), operator-owned host config |
+| **Fork — don't** | the repo's app code, DB-canonical fork-local skills, operator-owned host config |
 
 Unsure -> "would the same problem hit any other fork?" yes = upstream.
 
@@ -33,7 +33,7 @@ Match the left column -> file.
 | A `sc` command fails out of the box | `sc verify` always aborted — its own render step needed `SC_ADMIN` it never set (#227) |
 | A command exits green without doing the work | `sc test` silently fell back to unittest when pytest was missing — green-washed suites (#219) |
 | The documented remedy is a closed loop | `sc lint` said "run `sc deps` first," but deps skips pip in the sandbox — tool unobtainable from inside the box (#246) |
-| A skill instructs tools/paths your seat doesn't have | `configure_winbox` drove raw `ssh`/`virsh` — neither exists in the broker-only sandbox (#248) |
+| A skill instructs tools/paths your seat doesn't have | a sandbox skill drove raw host-only `ssh`/`virsh` paths (#248) |
 | A skill contradicts what the engine actually does | skills still taught raw `sqlite3` against the substrate DB after memory went API-only (#226) |
 | The API refuses what the skills document | `sc mem doc add` 400'd standalone docs the docs + onboard skills both document (#245) |
 | A permission wall mid-workflow | a dev shell could read a planner-owned feature but 404'd advancing its status (#224) |
@@ -108,7 +108,7 @@ This route recommends; it never creates or promotes a skill. Keep one compressed
 L&S entry until a reviewed upstream skill ships and is granted. If issue search
 or creation is unavailable, surface the failure to the FnB, keep the L&S, and
 create no local skill or asset. Deliberate fork-specific authoring remains the
-administrator-owned workflow in `local_skill_management`.
+Planner-owned workflow in `fork_skill_design`.
 
 ## Rules
 

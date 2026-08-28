@@ -132,8 +132,9 @@ The step-by-step version, with each flavor's skills and GUI tab:
   session: [*Messages, jobs & headless launch*](README.md#messages-jobs--headless-launch).
 - **The command surface.** Every `./sc` command and the `make dos-` aliases:
   [*CLI & dev kit*](README.md#cli--dev-kit).
-- **Opt-in extras.** A Postgres sidecar, a Windows test VM, tailnet / pm2 /
-  db brokers: [*Opt-in features*](README.md#opt-in-features).
+- **Opt-in extras.** Optional Postgres, Windows VM, tailnet, PM2, and database
+  broker infrastructure; Planner captures fork procedure as a local skill:
+  [*Opt-in features*](README.md#opt-in-features).
 - **Staying current.** `./sc update` pulls the new engine and migrates the DB
   in place, memory intact. Commit that protected-default-branch update with the
   exact operator command:

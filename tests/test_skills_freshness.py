@@ -22,11 +22,14 @@ Run:
 """
 from __future__ import annotations
 
+import io
 import sqlite3
 import sys
 import tempfile
 import unittest
+from contextlib import redirect_stdout
 from pathlib import Path
+from unittest import mock
 
 ENGINE = Path(__file__).resolve().parents[1] / ".super-coder"
 SCHEMA = ENGINE / "schema.sql"
@@ -133,6 +136,30 @@ class SkillsFreshnessTest(unittest.TestCase):
             "SELECT content FROM skills WHERE name='fork_only_skill'"
         ).fetchone()[0]
         self.assertEqual(body, "bespoke body")    # local skill survived untouched
+
+    def test_explicit_seed_skips_nonempty_uninitialized_worktree_db(self):
+        uninitialized = self.tmp / "worktree-shell.db"
+        con = sqlite3.connect(uninitialized)
+        con.execute("CREATE TABLE unrelated(value TEXT)")
+        con.commit()
+        con.close()
+        output = io.StringIO()
+
+        with mock.patch.object(seed_skills, "DB_PATH", uninitialized):
+            with redirect_stdout(output):
+                seed_skills._upsert_live([seed_skills.engine_skill_specs()[0]])
+
+        self.assertIn("no initialized live DB", output.getvalue())
+        con = sqlite3.connect(uninitialized)
+        try:
+            self.assertEqual(
+                con.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name"
+                ).fetchall(),
+                [("unrelated",)],
+            )
+        finally:
+            con.close()
 
 
 if __name__ == "__main__":

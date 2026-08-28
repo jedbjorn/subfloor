@@ -46,11 +46,12 @@ import artifact_policy
 
 ENGINE = Path(__file__).resolve().parents[1]
 SKILLS_DIR = ENGINE / "assets" / "skills"
+SHELL_TEMPLATES = ENGINE / "templates" / "shells"
 OUT = ENGINE / "migrations" / "0001_seed_skills.sql"
 DB_PATH = ENGINE / "shell_db.db"
 RETIRED_FILE = artifact_policy.retired_skills_path()
 TOMBSTONES_FILE = ENGINE / "assets" / "skill_tombstones.json"
-SKILL_NAME_RE = re.compile(r"^[a-z][a-z0-9_]*$")
+SKILL_NAME_RE = re.compile(r"^[a-z][a-z0-9_-]*$")
 
 
 @dataclass(frozen=True)
@@ -167,6 +168,62 @@ def reconcile_tombstoned_skills(con) -> TombstoneReconciliation:
         raise
     con.execute("RELEASE reconcile_skill_tombstones")
     return TombstoneReconciliation(tuple(row[1] for row in rows), grant_count)
+
+
+def reconcile_standard_flavor_packs(
+    con, flavors: "list[str] | tuple[str, ...] | None" = None
+) -> int:
+    """Converge engine-managed grants while preserving fork-local skill grants."""
+    if con.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='flavor_skills'"
+    ).fetchone() is None:
+        return 0
+    templates = {}
+    for path in sorted(SHELL_TEMPLATES.glob("*.json")):
+        template = json.loads(path.read_text())
+        templates[template.get("flavor", path.stem)] = template
+    selected = sorted(templates if flavors is None else set(flavors))
+    unknown = sorted(set(selected) - set(templates))
+    if unknown:
+        raise ValueError(f"unknown standard flavor: {unknown[0]}")
+
+    upstream = set(seeded_skill_names())
+    managed = upstream | set(tombstoned_skill_names()) | {"dev_kit"}
+    common = {
+        row[0]
+        for row in con.execute(
+            "SELECT name FROM skills WHERE common=1 AND is_deleted=0"
+        )
+        if row[0] in upstream
+    }
+    changed = 0
+    for flavor in selected:
+        template = templates[flavor]
+        desired = set(template.get("skills", ()))
+        if template.get("inherit_common_skills", True):
+            desired.update(common)
+
+        managed_marks = ",".join("?" for _ in managed)
+        desired_clause = ""
+        parameters: list[object] = [flavor, *sorted(managed)]
+        if desired:
+            desired_marks = ",".join("?" for _ in desired)
+            desired_clause = f" AND name NOT IN ({desired_marks})"
+            parameters.extend(sorted(desired))
+        changed += con.execute(
+            "DELETE FROM flavor_skills WHERE flavor=? AND skill_id IN ("
+            "SELECT skill_id FROM skills "
+            f"WHERE name IN ({managed_marks}){desired_clause})",
+            tuple(parameters),
+        ).rowcount
+        for name in sorted(desired):
+            changed += con.execute(
+                "INSERT OR IGNORE INTO flavor_skills (flavor, skill_id) "
+                "SELECT ?, skill_id FROM skills WHERE name=? AND is_deleted=0",
+                (flavor, name),
+            ).rowcount
+    con.commit()
+    return changed
 
 
 def sql_str(v) -> str:
@@ -387,6 +444,7 @@ def sync_engine_skills(con, specs: list[dict] | None = None) -> list[str]:
     # is_deleted=0 — re-assert the fork retire list so a retired skill stays
     # retired across heals, syncs, and rebuilds.
     apply_retired(con)
+    reconcile_standard_flavor_packs(con)
     return stale
 
 
@@ -412,6 +470,15 @@ def _upsert_live(skills: list[dict]) -> None:
     import db_driver  # lazy — sibling module; keeps import surface unchanged
     con = db_driver.connect(DB_PATH)
     try:
+        initialized = con.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='skills'"
+        ).fetchone()
+        if initialized is None:
+            print(
+                "seed_skills: no initialized live DB — skills land on first "
+                "rebuild/launch."
+            )
+            return
         synced = sync_engine_skills(con, specs=skills)
     finally:
         con.close()

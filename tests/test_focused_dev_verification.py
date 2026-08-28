@@ -50,26 +50,18 @@ class FocusedDeveloperVerificationSourceTest(unittest.TestCase):
     def test_role_guidance_keeps_ci_fallback_and_authority_boundaries(self):
         bodies = {
             name: (ASSETS / name / "SKILL.md").read_text()
-            for name in ("agents", "spec", "sprint_dev", "sprint_pln")
+            for name in ("spec", "sprint_dev", "sprint_pln")
         }
         bodies["dev_kit"] = (
             ENGINE / "assets" / "seed" / "skills" / "dev_kit" / "SKILL.md"
         ).read_text()
 
-        for name in ("agents", "spec", "sprint_dev"):
+        for name in ("spec", "sprint_dev"):
             with self.subTest(skill=name):
                 normalized = " ".join(bodies[name].split())
                 self.assertIn("boot `TESTING POSTURE`", normalized)
 
         normalized = {name: " ".join(body.split()) for name, body in bodies.items()}
-        self.assertIn("open/register the PR", normalized["agents"])
-        self.assertIn("pending", normalized["agents"])
-        self.assertIn("fix red", normalized["agents"])
-        self.assertIn("green as proof", normalized["agents"])
-        self.assertIn(
-            "No trustworthy local or registered-PR seat -> block", normalized["agents"]
-        )
-
         self.assertIn("available focused proof", normalized["spec"])
         self.assertIn("observed registered-PR checks", normalized["spec"])
         self.assertIn("pending -> wait", normalized["spec"])
@@ -78,7 +70,6 @@ class FocusedDeveloperVerificationSourceTest(unittest.TestCase):
         self.assertIn("optional browser skip is non-failing", normalized["spec"])
         self.assertNotIn("runs focused/full gates", normalized["spec"])
 
-        self.assertIn("never use bare `sc test`", normalized["agents"])
         self.assertIn(
             "Register complete code even when a local gate is unavailable",
             normalized["sprint_dev"],
@@ -93,13 +84,10 @@ class FocusedDeveloperVerificationSourceTest(unittest.TestCase):
         self.assertIn("incomplete code = failure", normalized["sprint_dev"])
         self.assertIn("Optional browser skip = non-failing", normalized["sprint_dev"])
 
-        self.assertIn("## Verification-seat fallback", bodies["dev_kit"])
-        self.assertIn("Pending -> wait for the native fact", normalized["dev_kit"])
-        self.assertIn("Red -> diagnose, fix, and push", normalized["dev_kit"])
-        self.assertIn(
-            "Green -> the proof is complete and review may start", normalized["dev_kit"]
-        )
-        self.assertIn("a Planner NEVER runs `sc deps`", normalized["dev_kit"])
+        self.assertIn("## Canonical states", bodies["dev_kit"])
+        self.assertIn("`deps`, `test`, `lint`, and `typecheck`", normalized["dev_kit"])
+        self.assertIn("Host hooks use the host checkout", normalized["dev_kit"])
+        self.assertIn("Container hooks use the", normalized["dev_kit"])
 
         self.assertIn("pending wait", normalized["sprint_pln"])
         self.assertIn("red fix", normalized["sprint_pln"])
@@ -190,11 +178,8 @@ class FocusedDeveloperVerificationMigrationTest(unittest.TestCase):
 
         paths = {
             name: ASSETS / name / "SKILL.md"
-            for name in ("agents", "spec", "sprint_dev", "sprint_pln")
+            for name in ("sprint_dev", "sprint_pln")
         }
-        paths["dev_kit"] = (
-            ENGINE / "assets" / "seed" / "skills" / "dev_kit" / "SKILL.md"
-        )
         for name, path in paths.items():
             expected = seed_skills.parse_skill(path)
             self.assertEqual(

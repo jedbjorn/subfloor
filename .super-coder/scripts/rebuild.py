@@ -313,6 +313,7 @@ def main(argv: list[str]) -> int:
                 seed_skills.seeded_skill_names())
             reconciled = seed_skills.reconcile_tombstoned_skills(con)
             flipped = seed_skills.apply_retired(con)
+            pack_changes = seed_skills.reconcile_standard_flavor_packs(con)
         finally:
             con.close()
         if reconciled.changed_names:
@@ -323,6 +324,8 @@ def main(argv: list[str]) -> int:
             )
         if flipped:
             print(f"rebuild: fork retire list applied ({', '.join(flipped)})")
+        if pack_changes:
+            print(f"rebuild: standard flavor grants reconciled ({pack_changes})")
 
         # Re-attach carried keys and mint only what remains absent on the
         # candidate. The outgoing DB stays untouched until every load and
