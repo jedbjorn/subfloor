@@ -121,19 +121,6 @@ class EnterPreAttachPrintTest(unittest.TestCase):
             "docker",
             "#!/bin/sh\n"
             "[ -n \"$SC_DOCKER_LOG\" ] && printf '%s\\n' \"$*\" >> \"$SC_DOCKER_LOG\"\n"
-            "case \"$*\" in *deepseek_web.py*generation*) printf '%064d\\n' 0; exit 0 ;; esac\n"
-            "if [ -n \"$SC_DOCKER_HANDOFF\" ]; then\n"
-            "  id=$(printf '%s\\n' \"$*\" | sed -n 's/.*SC_BROWSER_HANDOFF_ID=\\([0-9][0-9]*\\).*/\\1/p')\n"
-            "  root=$(cd \"$(git rev-parse --git-common-dir)/..\" && pwd)\n"
-            "  mkdir -p \"$root/.sc-state/local/run\"\n"
-            "  printf 'deepseek\\n' > \"$root/.sc-state/local/run/browser-handoff-$id\"\n"
-            "fi\n"
-            "exit 0\n",
-        )
-        self._stub(
-            "xdg-open",
-            "#!/bin/sh\n"
-            "[ -n \"$SC_BROWSER_LOG\" ] && printf '%s\\n' \"$*\" > \"$SC_BROWSER_LOG\"\n"
             "exit 0\n",
         )
         # A python that runs everything except ports.py — the one seam whose
@@ -144,14 +131,6 @@ class EnterPreAttachPrintTest(unittest.TestCase):
                    "  *sandbox_devkit.py*) exit 0 ;;\n"
                    "esac\n"
                    f"exec {sys.executable} \"$@\"\n")
-        self._stub(
-            "deepseek-python",
-            "#!/bin/sh\ncase \"$*\" in\n"
-            "  *ports.py*deepseekhostport*) echo 8942; exit 0 ;;\n"
-            "  *sandbox_devkit.py*) exit 0 ;;\n"
-            "esac\n"
-            f"exec {sys.executable} \"$@\"\n",
-        )
 
     def _stub(self, name: str, body: str) -> Path:
         path = self.bin / name
@@ -181,68 +160,17 @@ class EnterPreAttachPrintTest(unittest.TestCase):
                 self.assertIn(target, log.read_text())
                 self.assertNotIn("interface", log.read_text().lower())
 
-    def test_enter_deepseek_hands_capability_to_browser_without_argv_exposure(self):
-        log = self.bin / "docker.log"
-        browser_log = self.bin / "browser.log"
-        out = sc(
-            "enter",
-            "deepseek",
-            "DEV4",
-            env=self._env(
-                SC_DOCKER_LOG=str(log),
-                SC_BROWSER_LOG=str(browser_log),
-                SC_PYTHON=str(self.bin / "deepseek-python"),
-            ),
-        )
-
-        self.assertEqual(out.returncode, 0, out.stderr)
-        self.assertIn(
-            "./sc boot DEV4 --harness deepseek --local-web",
-            log.read_text(),
-        )
-        opened = browser_log.read_text().strip()
-        self.assertIn("DeepSeek Web browser handoff ready", out.stdout)
-        self.assertNotIn("sc_generation=", out.stdout)
-        self.assertRegex(opened, r"^http://127\.0\.0\.1:\d+/handoff/")
-        self.assertNotIn("sc_generation=", opened)
-
-    def test_picker_selected_deepseek_hands_browser_opening_to_the_host(self):
-        log = self.bin / "docker.log"
-        browser_log = self.bin / "browser.log"
-        out = sc(
-            "enter",
-            env=self._env(
-                SC_DOCKER_LOG=str(log),
-                SC_DOCKER_HANDOFF="1",
-                SC_BROWSER_LOG=str(browser_log),
-                SC_PYTHON=str(self.bin / "deepseek-python"),
-            ),
-        )
-
-        self.assertEqual(out.returncode, 0, out.stderr)
-        self.assertIn("SC_BROWSER_HANDOFF_ID=", log.read_text())
-        opened = browser_log.read_text().strip()
-        self.assertIn("DeepSeek Web browser handoff ready", out.stdout)
-        self.assertNotIn("sc_generation=", out.stdout)
-        self.assertRegex(opened, r"^http://127\.0\.0\.1:\d+/handoff/")
-        self.assertNotIn("sc_generation=", opened)
-
-    def test_terminal_selection_without_handoff_does_not_open_a_browser(self):
-        browser_log = self.bin / "browser.log"
-        out = sc(
-            "enter",
-            env=self._env(SC_BROWSER_LOG=str(browser_log)),
-        )
-
-        self.assertEqual(out.returncode, 0, out.stderr)
-        self.assertFalse(browser_log.exists())
-        self.assertNotIn("DeepSeek Web", out.stdout)
-
-    def test_launch_publishes_deepseek_relay_to_host_loopback_only(self):
+    def test_launch_has_no_retired_harness_mount_port_or_browser_handoff(self):
         source = (ROOT / ".super-coder" / "scripts" / "dispatch.sh").read_text()
-        self.assertIn('-p "127.0.0.1:$dsp:$dsrp"', source)
-        self.assertIn('dsrp="$(deepseekrelayport)"', source)
-        self.assertIn('-e SC_DEEPSEEK_HOST_PORT="$dsp"', source)
+        for retired in (
+            ".dsh",
+            "deepseekhostport",
+            "deepseekrelayport",
+            "SC_DEEPSEEK_HOST_PORT",
+            "SC_BROWSER_HANDOFF_ID",
+        ):
+            with self.subTest(retired=retired):
+                self.assertNotIn(retired, source)
 
     def test_an_underivable_url_never_costs_the_operator_their_shell(self):
         """`sc` runs under `set -e`, so an unguarded print is a new way for

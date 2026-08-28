@@ -57,7 +57,6 @@ import artifact_policy  # noqa: E402
 import callable_floor  # noqa: E402
 import conversation_boot  # noqa: E402
 import db_driver  # noqa: E402
-import deepseek_web  # noqa: E402  — official dsh Web/Host lifecycle
 import git_freshness  # noqa: E402
 import git_prune  # noqa: E402  — boot-time prune of provably-merged local branches
 import global_pointer  # noqa: E402
@@ -273,13 +272,11 @@ def headless_command(
 
 def load_adapter(harness: str) -> dict:
     """The harness-specific seam (adapters/<harness>/adapter.json): launch argv,
-    which files to emit at the repo root, and extra launch env. Unknown harness
-    falls back to running its own name + reading AGENTS.md."""
+    which files to emit at the repo root, and extra launch env."""
     path = ADAPTERS / harness / "adapter.json"
-    if path.exists():
-        return json.loads(path.read_text())
-    return {"harness": harness, "launch": [harness], "boot_artifact": "AGENTS.md",
-            "emit": [], "env": {}}
+    if not path.is_file():
+        raise ValueError("harness selector is not shipped")
+    return json.loads(path.read_text())
 
 
 def require_harness_surface(adapter: dict, surface: str) -> None:
@@ -291,14 +288,6 @@ def require_harness_surface(adapter: dict, surface: str) -> None:
         raise ValueError(f"harness '{harness}' does not support {label}")
 
 
-def require_local_web_surface(adapter: dict) -> None:
-    """Require the explicit engine-managed local-Web adapter contract."""
-    interactive = adapter.get("interactive")
-    if not isinstance(interactive, dict) or interactive.get("kind") != "local_web":
-        harness = adapter.get("harness", "unknown")
-        raise ValueError(f"harness '{harness}' does not support local Web entry")
-
-
 def interactive_launch(adapter: dict) -> dict | None:
     """Return the adapter's supported interactive launch contract."""
     surfaces = adapter.get("surfaces") or {}
@@ -307,9 +296,6 @@ def interactive_launch(adapter: dict) -> dict | None:
             "kind": "terminal",
             "launch": adapter.get("launch") or [adapter.get("harness", "unknown")],
         }
-    interactive = adapter.get("interactive")
-    if isinstance(interactive, dict) and interactive.get("kind") == "local_web":
-        return interactive
     return None
 
 
@@ -730,19 +716,6 @@ def detect_harnesses() -> list[str]:
         if shutil.which(cmd):
             found.append(adapter.get("harness", d.name))
     return found
-
-
-def signal_browser_handoff(handoff_id: str | None) -> None:
-    """Tell the host dispatcher that a picker-selected local Web app is ready."""
-    if not handoff_id or not handoff_id.isascii() or not handoff_id.isdigit():
-        return
-    path = REPO_ROOT / ".sc-state" / "local" / "run" / f"browser-handoff-{handoff_id}"
-    try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text("deepseek\n")
-    except OSError:
-        # The ready URL is already printed; browser opening remains best-effort.
-        return
 
 
 def pick_harness(detected: list[str], default: str, first: bool) -> str | None:
@@ -1468,7 +1441,11 @@ def prepare_launch(*, shell_id: int, harness: "str | None" = None,
     ensure_harness_path()
     harness = (harness or (fdef["default_harness"] if fdef else None)
                or _configured_harness() or "claude")
-    adapter = load_adapter(harness)
+    try:
+        adapter = load_adapter(harness)
+    except ValueError as exc:
+        con.close()
+        raise LaunchError(str(exc)) from exc
 
     # Model route: an explicit model wins; else the (flavor, harness) cell,
     # exactly main()'s flavor_defaults routing. An explicit effort wins; the
@@ -1768,7 +1745,6 @@ def main() -> None:
     args = raw_args
     first = "--first" in args
     headless = "--headless" in args
-    local_web = "--local-web" in args
     # --harness <name> / --harness=<name> forces the harness and skips the
     # picker; its value must not be mistaken for the shell shortname positional.
     # Headless adds -p/--prompt and -m/--model (value-taking, same rule).
@@ -1780,7 +1756,7 @@ def main() -> None:
     i = 0
     while i < len(args):
         a = args[i]
-        if a in ("--first", "--headless", "--host-admin", "--local-web"):
+        if a in ("--first", "--headless", "--host-admin"):
             i += 1
             continue
         if a == "--harness":
@@ -1813,8 +1789,6 @@ def main() -> None:
             positional.append(a)
         i += 1
     requested = positional[0] if positional else None
-    if local_web and (headless or host_admin):
-        sys.exit("session launch: --local-web cannot be combined with --headless or --host-admin")
     if host_admin and (headless or len(positional) > 1):
         sys.exit("usage: ./sc admin [admin-shortname] [--harness <h>]")
     if headless and not requested:
@@ -1933,15 +1907,9 @@ def main() -> None:
     # Explicit CLI intent wins over the persisted per-flavor Thinking level.
     flavor_model = fdef["models"].get(harness) if fdef else None
     flavor_effort = (fdef.get("efforts") or {}).get(harness) if fdef else None
-    adapter = load_adapter(harness)
-    launch_contract = interactive_launch(adapter)
-    if not local_web and not headless and not host_admin and launch_contract:
-        local_web = launch_contract["kind"] == "local_web"
     try:
-        if local_web:
-            require_local_web_surface(adapter)
-        else:
-            require_harness_surface(adapter, "one_shot" if headless else "terminal")
+        adapter = load_adapter(harness)
+        require_harness_surface(adapter, "one_shot" if headless else "terminal")
     except ValueError as exc:
         con.close()
         prefix = "sc run" if headless else "session launch"
@@ -2219,28 +2187,6 @@ def main() -> None:
 
     if os.environ.get("RENDER_ONLY"):
         print("→ RENDER_ONLY set — not exec'ing the harness.")
-        return
-
-    if local_web:
-        web_env = {
-            **os.environ,
-            **{k: str(v) for k, v in adapter.get("env", {}).items()},
-            **sandbox_env,
-            "SC_SHELL_ID": str(chosen["shell_id"]),
-            "SC_SHELL_SHORTNAME": chosen["shortname"],
-            "SC_API_TOKEN": full["api_key"] or "",
-            "SC_API_BASE": f"http://127.0.0.1:{api_port}" if api_port else "",
-        }
-        try:
-            service = deepseek_web.ensure(work_dir, env=web_env)
-        except deepseek_web.DeepSeekWebError as exc:
-            sys.exit(f"session launch: {exc.code}: {exc.detail}")
-        action = "reused" if service["reused"] else "started"
-        print(f"→ DeepSeek Web: {action} for {work_dir}")
-        # The host dispatcher consumes the generation capability through its
-        # owner-only handoff; never print it into the boot transcript.
-        print("→ DeepSeek Web browser handoff is ready")
-        signal_browser_handoff(os.environ.get("SC_BROWSER_HANDOFF_ID"))
         return
 
     # --name labels the session in the harness prompt box, resume picker, and

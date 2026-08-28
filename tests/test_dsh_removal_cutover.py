@@ -20,7 +20,6 @@ SCRIPTS = ROOT / ".super-coder/scripts"
 sys.path.insert(0, str(SCRIPTS))
 sys.path.insert(0, str(ROOT / "tests"))
 import dsh_removal_cleanup  # noqa: E402
-import deepseek_web  # noqa: E402
 import test_dsh_removal_preparation as preparation  # noqa: E402
 import update  # noqa: E402
 import update_cutover  # noqa: E402
@@ -231,73 +230,18 @@ class PrepareCutoverTest(unittest.TestCase):
             self.assertEqual(["stop", ("restart", service)], events)
             self.assertFalse(receipt.exists())
 
-    def test_quiesce_uses_dsh_owner_lock_and_proves_both_ports_released(self) -> None:
-        with tempfile.TemporaryDirectory() as raw:
-            engine = Path(raw) / ".super-coder"
-            state_path = engine / "run/deepseek-web.json"
-            write_json(
-                state_path,
-                {
-                    "relay_pid": 42,
-                    "relay_port": 8977,
-                    "relay_start_ticks": 420,
-                    "service_port": 18977,
-                    "web_pid": 41,
-                    "web_start_ticks": 410,
-                },
+    def test_removal_floor_cannot_prepare_another_runtime_cutover(self) -> None:
+        with tempfile.TemporaryDirectory() as raw, mock.patch.object(
+            update_cutover, "require_compatibility_floor"
+        ), self.assertRaisesRegex(
+            update_cutover.CutoverError, "only on the compatibility floor"
+        ):
+            update_cutover.prepare_cutover(
+                self.PLAN,
+                current_ref="1" * 40,
+                backup=lambda: Path(raw) / "must-not-run",
+                stop_review=lambda: None,
             )
-            events: list[object] = []
-
-            @contextlib.contextmanager
-            def owner_lock():
-                events.append("lock-enter")
-                yield
-                events.append("lock-exit")
-
-            with mock.patch.object(update_cutover, "ENGINE", engine), mock.patch.object(
-                deepseek_web, "_service_lock", owner_lock
-            ), mock.patch.object(
-                deepseek_web,
-                "_stop_unlocked",
-                side_effect=lambda: events.append("exact-stop")
-                or {"relay": True, "stopped": True, "web": True},
-            ), mock.patch.object(
-                deepseek_web,
-                "_tcp_ready",
-                side_effect=lambda _host, port: events.append(("port", port)) or False,
-            ):
-                before, outcome = update_cutover.quiesce_dsh()
-
-            self.assertEqual(41, before["web_pid"])
-            self.assertEqual(True, outcome["web"])
-            self.assertEqual(
-                [
-                    "lock-enter",
-                    "exact-stop",
-                    "lock-exit",
-                    ("port", 18977),
-                    ("port", 8977),
-                ],
-                events,
-            )
-
-    def test_quiesce_refuses_when_an_owned_port_survives(self) -> None:
-        with tempfile.TemporaryDirectory() as raw:
-            engine = Path(raw) / ".super-coder"
-            write_json(
-                engine / "run/deepseek-web.json",
-                {"relay_port": 8977, "service_port": 18977},
-            )
-            with mock.patch.object(update_cutover, "ENGINE", engine), mock.patch.object(
-                deepseek_web, "_service_lock", contextlib.nullcontext
-            ), mock.patch.object(
-                deepseek_web,
-                "_stop_unlocked",
-                return_value={"relay": True, "stopped": True, "web": True},
-            ), mock.patch.object(
-                deepseek_web, "_tcp_ready", side_effect=[False, True]
-            ), self.assertRaisesRegex(update_cutover.CutoverError, "8977"):
-                update_cutover.quiesce_dsh()
 
 
 class HalfAdoptedGuardTest(unittest.TestCase):

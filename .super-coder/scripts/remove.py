@@ -187,7 +187,7 @@ def show_plan(
     print("  remove     : repo runtime, engine, generated state, shell worktrees,")
     print("               install-owned extension images/volumes and integration")
     print("  preserve   : project files, branches, unrelated Git config, shared")
-    print("               machine tools, harness profiles (including ~/.dsh),")
+    print("               machine tools, harness profiles,")
     print("               credentials, engine-base images, and backups")
 
 
@@ -336,20 +336,6 @@ def _pg_configured(repo_root: Path) -> bool:
 
 def quiesce_runtime(repo_root: Path) -> None:
     stop_running_jobs(repo_root)
-    deepseek_manager = repo_root / ".super-coder" / "scripts" / "deepseek_web.py"
-    if deepseek_manager.is_file():
-        deepseek = _run(
-            sys.executable,
-            str(deepseek_manager),
-            "stop",
-            cwd=repo_root,
-        )
-        if deepseek.returncode != 0:
-            raise RemoveError(
-                "DeepSeek Web shutdown failed: "
-                + ((deepseek.stderr or deepseek.stdout).strip() or str(deepseek.returncode))
-            )
-        print("→ DeepSeek Web/Host service stopped")
     docker = shutil.which("docker")
     result = _run(str(repo_root / "sc"), "down", cwd=repo_root)
     if result.stdout:

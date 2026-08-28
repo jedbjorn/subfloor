@@ -5,7 +5,6 @@ from __future__ import annotations
 import sqlite3
 import sys
 import tempfile
-import venv
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -99,41 +98,6 @@ def controlled_opencode_binding() -> dict:
     return binding
 
 
-def unsupported_deepseek_binding() -> dict:
-    return {
-        "contract_version": 2,
-        "control_state": "controlled",
-        "harness": "deepseek",
-        "requested_model": "deepseek-official/deepseek-v4-pro",
-        "provider_model": "deepseek-v4-pro",
-        "requested_effort": "medium",
-        "effective_effort": "medium",
-        "native_variant_id": None,
-        "transport": "deepseek-stock-host-v1",
-        "catalogue_generation": "a" * 32,
-        "evidence_digest": "b" * 64,
-        "selector_binding": {
-            "kind": "official-host-configured-model",
-            "selector": "deepseek-official/deepseek-v4-pro",
-        },
-        "adapter_metadata": {
-            "provider_route": "deepseek-official",
-            "endpoint_identity": "https://api.deepseek.com",
-            "credential_ref": "DEEPSEEK_API_KEY",
-            "credential_status": {
-                "configured": True,
-                "source": "environment",
-                "writable": False,
-            },
-            "configuration_digest": "3" * 64,
-            "transport_contract": "deepseek-stock-host-v1",
-            "reasoning_effort": "high",
-            "runtime_version": "0.1.1-rc.2",
-            "source_commit": "b" * 40,
-        },
-    }
-
-
 def test_bound_headless_route_preserves_harness_default_nulls() -> None:
     binding = harness_default_binding()
     route = run_mod.resolve_bound_headless_route(
@@ -161,110 +125,6 @@ def test_bound_headless_route_uses_exact_controlled_native_variant() -> None:
 
     assert route.model == "openai/gpt-test"
     assert route.effort == binding["native_variant_id"] == "high"
-
-
-def test_bound_headless_route_rejects_removed_deepseek_adapter() -> None:
-    binding = unsupported_deepseek_binding()
-
-    with pytest.raises(route_bindings.RouteResolutionError) as refused:
-        run_mod.resolve_bound_headless_route(
-            harness="deepseek",
-            model="deepseek-official/deepseek-v4-pro",
-            effort="medium",
-            binding=binding,
-            binding_digest=route_bindings.digest_json(binding),
-        )
-
-    assert refused.value.code == "thinking_evidence_missing"
-    assert refused.value.details == {
-        "reason": "harness must identify a shipped adapter"
-    }
-
-
-def test_deepseek_public_one_shot_and_managed_browser_use_distinct_entrypoints() -> None:
-    adapter = run_mod.load_adapter("deepseek")
-
-    command = run_mod.headless_command(
-        adapter, "prompt", model="acme/model", effort="high"
-    )
-    assert command[-5:] == [
-        "--selector", "acme/model", "--effort", "high", "prompt"
-    ]
-    assert command[1].endswith("deepseek_one_shot.py")
-    assert run_mod.headless_command(adapter, "prompt", conversation_owned=True) == []
-    assert adapter["surfaces"]["one_shot"] is True
-
-
-def test_deepseek_managed_browser_launch_does_not_probe_cli(
-    launch_case, monkeypatch
-) -> None:
-    db_path, worktree = launch_case
-    project_venv = worktree / ".venv"
-    venv.EnvBuilder(with_pip=False).create(project_venv)
-
-    def connect():
-        con = sqlite3.connect(db_path)
-        con.row_factory = sqlite3.Row
-        return con
-
-    def reject_cli_probe(_binary: str) -> str:
-        raise AssertionError("native browser dispatch must not probe a CLI")
-
-    monkeypatch.setenv("RENDER_ONLY", "1")
-    monkeypatch.setattr(run_mod, "open_db", connect)
-    monkeypatch.setattr(
-        run_mod,
-        "authenticate",
-        lambda _con, interactive: {"user_id": 1, "username": "operator"},
-    )
-    monkeypatch.setattr(run_mod, "flavor_defaults", lambda _con: {})
-    monkeypatch.setattr(run_mod, "ensure_harness_path", lambda: None)
-    monkeypatch.setattr(
-        run_mod,
-        "resolve_headless_route",
-        lambda **_: SimpleNamespace(
-            model="ollama-cloud/deepseek-v4-pro:0813", effort="high"
-        ),
-    )
-    monkeypatch.setattr(run_mod, "cleanup_before_launch", lambda *_a, **_k: None)
-    monkeypatch.setattr(run_mod, "open_session", lambda *_a, **_k: ("0001", 42))
-    monkeypatch.setattr(run_mod.ports_mod, "resolve", lambda **_kwargs: {})
-    monkeypatch.setattr(run_mod, "shell_work_dir", lambda *_: worktree)
-    monkeypatch.setattr(run_mod, "ensure_worktree", lambda *_: None)
-    monkeypatch.setattr(run_mod, "sync_worktree", lambda *_: None)
-    monkeypatch.setattr(run_mod, "link_worktree_map", lambda *_: None)
-    monkeypatch.setattr(run_mod, "main_checkout_note", lambda *_: None)
-    monkeypatch.setattr(run_mod, "declared_work_repo_note", lambda *_: None)
-    monkeypatch.setattr(
-        run_mod.conversation_boot, "resolve_boot", lambda *_a, **_k: "boot bytes"
-    )
-    monkeypatch.setattr(run_mod.conversation_boot, "write_boot_files", lambda *_: None)
-    monkeypatch.setattr(run_mod, "render_harness_skills", lambda *_: None)
-    monkeypatch.setattr(run_mod, "emit_adapter", lambda *_: None)
-    monkeypatch.setattr(run_mod, "resolve_opencode_plugins", lambda *_: None)
-    monkeypatch.setattr(run_mod, "apply_merge_json", lambda *_: None)
-    monkeypatch.setattr(run_mod, "apply_managed_mcp", lambda *_: None)
-    monkeypatch.setattr(run_mod, "apply_sandbox", lambda *_: None)
-    monkeypatch.setattr(run_mod, "_cli_version", reject_cli_probe)
-
-    prepared = run_mod.prepare_launch(
-        shell_id=1,
-        harness="deepseek",
-        model="ollama-cloud/deepseek-v4-pro:0813",
-        effort="high",
-        headless_prompt="Do the work",
-        conversation_owned=True,
-        current_leased_run_id=7,
-        boot=BootDirective(
-            conversation_id="cv_" + "a" * 32,
-            phase="start",
-        ),
-    )
-    assert prepared.argv == []
-    assert prepared.env["PATH"].split(run_mod.os.pathsep)[:2] == [
-        str(run_mod.REPO_ROOT),
-        str(project_venv / "bin"),
-    ]
 
 
 @pytest.fixture
