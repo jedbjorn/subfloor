@@ -51,45 +51,6 @@ if [ -n "$SC_SYSTEM_PYTHON" ] && [ -r "$SC_CUTOVER_GUARD" ]; then
   "$SC_SYSTEM_PYTHON" "$SC_CUTOVER_GUARD" --admit-dispatch -- "$@" || exit $?
 fi
 
-SC_PROVENANCE="$LIVE_ROOT/.super-coder/scripts/dsh_execution_provenance.py"
-SC_POLICY="$LIVE_ROOT/.super-coder/assets/deepseek/dsh-shell-authority-contract.json"
-SC_ADMISSION_FLOOR="$LIVE_ROOT/.super-coder/assets/deepseek/dsh-command-admission-v1.json"
-if [ -n "$SC_SYSTEM_PYTHON" ] && [ -r "$SC_PROVENANCE" ] && \
-   [ -r "$SC_POLICY" ] && [ -r "$SC_ADMISSION_FLOOR" ]; then
-  exec "$SC_SYSTEM_PYTHON" "$SC_PROVENANCE" \
-    --admit-sc \
-    --caller-root "$CALLER_ROOT" \
-    --live-root "$LIVE_ROOT" \
-    --policy-contract "$SC_POLICY" \
-    -- "$@"
-fi
-
-# Compatibility floor for a native caller rolling back to an older engine.
-# Managed/ambiguous DSH provenance and every DSH bridge fact remain refused;
-# only a clean native caller may use the legacy dispatcher bootstrap.
-sc_native=0
-if [ -r /proc/self/cgroup ]; then
-  sc_unified_count=0
-  sc_managed_membership=0
-  while IFS= read -r sc_cgroup_row; do
-    case "$sc_cgroup_row" in
-      0::/*)
-        sc_unified_count=$((sc_unified_count + 1))
-        case "$sc_cgroup_row" in *"/sc-dsh/"*) sc_managed_membership=1 ;; esac ;;
-    esac
-  done < /proc/self/cgroup
-  [ "$sc_unified_count" -eq 1 ] && [ "$sc_managed_membership" -eq 0 ] && sc_native=1
-fi
-if [ "$sc_native" -ne 1 ] || [ "${DSH_SHELL+x}" = x ] || \
-   [ "${DSH_SC_SHELL_ID+x}" = x ] || [ "${DSH_SC_SHELL_SHORTNAME+x}" = x ] || \
-   [ "${DSH_SC_SHELL_WORKTREE+x}" = x ] || [ "${DSH_SC_API_BASE+x}" = x ] || \
-   [ "${DSH_SC_MEM_CREDENTIAL_FILE+x}" = x ] || \
-   [ "${DSH_SC_BINDING_GENERATION+x}" = x ] || \
-   [ "${DSH_SC_PLUGIN_HEALTH_GENERATION+x}" = x ]; then
-  echo "sc: DSH command refused before effect: provenance contributor unavailable" >&2
-  exit 77
-fi
-
 DISPATCH="$LIVE_ROOT/.super-coder/scripts/dispatch.sh"
 if [ -n "${SC_DISPATCH:-}" ]; then
   if [ ! -f "$SC_DISPATCH" ] || [ ! -r "$SC_DISPATCH" ]; then

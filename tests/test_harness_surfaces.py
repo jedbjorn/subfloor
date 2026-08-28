@@ -1,13 +1,10 @@
-"""Authoritative harness surface/status projection contracts."""
+"""Authoritative retained-harness surface and launch contracts."""
 from __future__ import annotations
 
 import json
-import io
 import sys
 import tempfile
-import types
 import unittest
-from contextlib import ExitStack
 from pathlib import Path
 from unittest import mock
 
@@ -26,47 +23,41 @@ class HarnessSurfaceProjectionTest(unittest.TestCase):
             commands.append(command)
             return f"/bin/{command}"
 
-        projection = harness_surfaces.project(
-            executable=executable,
-        )
+        projection = harness_surfaces.project(executable=executable)
 
-        self.assertEqual(
-            harness_surfaces.known_terminal_harnesses(),
-            ["claude", "codex", "kimi", "opencode", "vibe"],
-        )
-        self.assertEqual(
-            harness_surfaces.known_runnable_harnesses(),
-            ["claude", "codex", "kimi", "opencode", "vibe"],
-        )
-        self.assertEqual(
-            harness_surfaces.known_interactive_harnesses(),
-            ["claude", "codex", "kimi", "opencode", "vibe"],
-        )
+        expected = ["claude", "codex", "kimi", "opencode", "vibe"]
+        self.assertEqual(harness_surfaces.known_terminal_harnesses(), expected)
+        self.assertEqual(harness_surfaces.known_runnable_harnesses(), expected)
+        self.assertEqual(harness_surfaces.known_interactive_harnesses(), expected)
         for harness in ("claude", "codex", "kimi", "opencode"):
             with self.subTest(harness=harness):
-                self.assertEqual(projection[harness]["surfaces"], {
-                    "terminal": True,
-                    "one_shot": True,
-                    "browser": True,
-                    "sprint": True,
-                })
+                self.assertEqual(
+                    projection[harness]["surfaces"],
+                    {
+                        "terminal": True,
+                        "one_shot": True,
+                        "browser": True,
+                        "sprint": True,
+                    },
+                )
                 self.assertTrue(projection[harness]["healthy"])
                 self.assertIsNone(projection[harness]["unavailable_reason"])
-        self.assertEqual(projection["vibe"]["surfaces"], {
-            "terminal": True,
-            "one_shot": False,
-            "browser": False,
-            "sprint": False,
-        })
-        self.assertNotIn("deepseek", projection)
-        self.assertNotIn("dsh", commands)
+        self.assertEqual(
+            projection["vibe"]["surfaces"],
+            {
+                "terminal": True,
+                "one_shot": False,
+                "browser": False,
+                "sprint": False,
+            },
+        )
+        self.assertEqual(sorted(projection), expected)
+        self.assertEqual(sorted(commands), expected)
 
     def test_missing_runtime_and_disablement_have_stable_distinct_reasons(self) -> None:
-        missing = harness_surfaces.project(
-            executable=lambda command: None,
-        )
+        missing = harness_surfaces.project(executable=lambda command: None)
         disabled = harness_surfaces.project(
-            env={"SC_DISABLED_HARNESSES": " codex, DEEPSEEK "},
+            env={"SC_DISABLED_HARNESSES": " codex "},
             executable=lambda command: command,
         )
 
@@ -78,7 +69,7 @@ class HarnessSurfaceProjectionTest(unittest.TestCase):
         self.assertFalse(disabled["codex"]["healthy"])
         self.assertEqual(disabled["codex"]["unavailable_reason"], "HARNESS_DISABLED")
 
-    def test_model_visibility_is_separate_from_launch_default_eligibility(self) -> None:
+    def test_model_visibility_is_separate_from_terminal_launch_eligibility(self) -> None:
         manifests = {
             "one-shot-only": {
                 "harness": "one-shot-only",
@@ -99,19 +90,6 @@ class HarnessSurfaceProjectionTest(unittest.TestCase):
                     "sprint": False,
                 },
             },
-            "local-web-only": {
-                "harness": "local-web-only",
-                "surfaces": {
-                    "terminal": False,
-                    "one_shot": False,
-                    "browser": False,
-                    "sprint": False,
-                },
-                "interactive": {
-                    "kind": "local_web",
-                    "launch": ["local-web"],
-                },
-            },
         }
         with tempfile.TemporaryDirectory() as tmp:
             adapters = Path(tmp)
@@ -119,360 +97,72 @@ class HarnessSurfaceProjectionTest(unittest.TestCase):
                 path = adapters / harness / "adapter.json"
                 path.parent.mkdir()
                 path.write_text(json.dumps(manifest))
-            with mock.patch.object(harness_surfaces, "ADAPTERS", adapters), \
-                    mock.patch.object(
-                        harness_surfaces,
-                        "SUPPORTED_HARNESSES",
-                        frozenset(manifests),
-                    ), \
-                    mock.patch.object(
-                        harness_surfaces,
-                        "_browser_contract_proven",
-                        side_effect=lambda harness: harness == "browser-only",
-                    ):
+            with (
+                mock.patch.object(harness_surfaces, "ADAPTERS", adapters),
+                mock.patch.object(
+                    harness_surfaces,
+                    "SUPPORTED_HARNESSES",
+                    frozenset(manifests),
+                ),
+                mock.patch.object(
+                    harness_surfaces,
+                    "_browser_contract_proven",
+                    side_effect=lambda harness: harness == "browser-only",
+                ),
+            ):
                 visible = harness_surfaces.known_runnable_harnesses()
                 defaults = harness_surfaces.known_interactive_harnesses()
 
-        self.assertEqual(
-            visible, ["browser-only", "local-web-only", "one-shot-only"]
-        )
-        self.assertEqual(defaults, ["local-web-only"])
+        self.assertEqual(visible, ["browser-only", "one-shot-only"])
+        self.assertEqual(defaults, [])
 
-    def test_interactive_detection_includes_terminal_and_local_web_harnesses(self) -> None:
+    def test_interactive_detection_includes_only_terminal_harnesses(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             adapters = Path(tmp)
             terminal = adapters / "terminal" / "adapter.json"
-            local_web = adapters / "local-web" / "adapter.json"
-            browser_only = adapters / "browser-only" / "adapter.json"
+            nonterminal = adapters / "nonterminal" / "adapter.json"
             terminal.parent.mkdir()
-            local_web.parent.mkdir()
-            browser_only.parent.mkdir()
+            nonterminal.parent.mkdir()
             terminal.write_text(
                 '{"harness":"terminal","launch":["terminal"],'
                 '"surfaces":{"terminal":true}}'
             )
-            local_web.write_text(
-                '{"harness":"local-web","surfaces":{"terminal":false},'
-                '"interactive":{"kind":"local_web","launch":["web-cli","web"]}}'
-            )
-            browser_only.write_text(
-                '{"harness":"browser-only","runtime":{"command":"browser"},'
-                '"surfaces":{"terminal":false}}'
+            nonterminal.write_text(
+                '{"harness":"nonterminal","surfaces":{"terminal":false}}'
             )
             with mock.patch.object(run, "ADAPTERS", adapters), mock.patch.object(
                 run.shutil, "which", side_effect=lambda command: f"/bin/{command}"
             ):
                 detected = run.detect_harnesses()
 
-        self.assertEqual(detected, ["local-web", "terminal"])
-        self.assertNotIn("browser-only", detected)
+        self.assertEqual(detected, ["terminal"])
 
-    def test_picker_selected_local_web_signals_the_host_dispatcher(self) -> None:
+    def test_unshipped_selector_is_rejected_before_command_resolution(self) -> None:
         with tempfile.TemporaryDirectory() as tmp, mock.patch.object(
-            run, "REPO_ROOT", Path(tmp)
+            run, "ADAPTERS", Path(tmp)
+        ), mock.patch.object(
+            run.shutil,
+            "which",
+            side_effect=AssertionError("unshipped selector reached PATH lookup"),
+        ) as lookup, self.assertRaisesRegex(
+            ValueError, "harness selector is not shipped"
         ):
-            run.signal_browser_handoff("31415")
-            marker = (
-                Path(tmp)
-                / ".sc-state"
-                / "local"
-                / "run"
-                / "browser-handoff-31415"
-            )
-            self.assertEqual(marker.read_text(), "deepseek\n")
+            run.load_adapter("unshipped")
 
-            run.signal_browser_handoff("../../outside")
-            self.assertFalse((Path(tmp) / "outside").exists())
+        lookup.assert_not_called()
 
-    def test_selected_local_web_uses_web_validation_in_the_boot_path(self) -> None:
-        class StopAfterSelection(RuntimeError):
-            pass
-
-        con = mock.Mock()
-        chosen = {"shell_id": 5, "shortname": "DEV3", "flavor": "dev"}
+    def test_explicit_unsupported_surfaces_fail_early(self) -> None:
         adapter = {
-            "harness": "deepseek",
-            "surfaces": {"terminal": False},
-            "interactive": {"kind": "local_web", "launch": ["dsh", "web"]},
-        }
-        local_web_gate = mock.Mock(wraps=run.require_local_web_surface)
-        terminal_gate = mock.Mock(wraps=run.require_harness_surface)
-
-        with mock.patch.dict(run.os.environ, {"RENDER_ONLY": "1"}, clear=True), \
-                mock.patch.object(
-                    run.sys,
-                    "argv",
-                    ["run.py", "DEV3", "--harness", "deepseek"],
-                ), \
-                mock.patch.object(run.sys.stdin, "isatty", return_value=False), \
-                mock.patch.object(run, "open_db", return_value=con), \
-                mock.patch.object(run, "authenticate", return_value={"user_id": 1}), \
-                mock.patch.object(
-                    run,
-                    "flavor_defaults",
-                    return_value={
-                        "dev": {
-                            "default_harness": "claude",
-                            "models": {"deepseek": None},
-                        }
-                    },
-                ), \
-                mock.patch.object(run, "list_shells", return_value=[chosen]), \
-                mock.patch.object(run, "pick_shell", return_value=chosen), \
-                mock.patch.object(run, "browser_conversation_active", return_value=False), \
-                mock.patch.object(run, "confirm_live", return_value=True), \
-                mock.patch.object(run, "ensure_harness_path"), \
-                mock.patch.object(run, "load_adapter", return_value=adapter), \
-                mock.patch.object(run, "require_local_web_surface", local_web_gate), \
-                mock.patch.object(run, "require_harness_surface", terminal_gate), \
-                mock.patch.object(run, "cleanup_before_launch"), \
-                mock.patch.object(
-                    run, "open_session", side_effect=StopAfterSelection
-                ), \
-                self.assertRaises(StopAfterSelection):
-            run.main()
-
-        local_web_gate.assert_called_once_with(adapter)
-        terminal_gate.assert_not_called()
-
-    def test_local_web_boot_passes_selected_shell_id_not_inherited_identity(self) -> None:
-        class Con:
-            def execute(self, *_args):
-                return self
-
-            def fetchone(self):
-                return {
-                    "shell_id": 5,
-                    "display_name": "Code-01",
-                    "shortname": "DEV3",
-                    "api_key": "canonical-token",
-                }
-
-            def close(self) -> None:
-                return None
-
-        class Spinner:
-            label = ""
-
-            def __enter__(self):
-                return self
-
-            def __exit__(self, *_args):
-                return None
-
-        with tempfile.TemporaryDirectory() as raw:
-            worktree = Path(raw) / "worktree"
-            worktree.mkdir()
-            chosen = {"shell_id": 5, "shortname": "DEV3", "flavor": "dev"}
-            adapter = {
-                "harness": "deepseek",
-                "surfaces": {"terminal": False},
-                "interactive": {"kind": "local_web", "launch": ["dsh", "web"]},
-            }
-            captured = {}
-            transcript = io.StringIO()
-            fake_analytics = types.SimpleNamespace(
-                sweep=lambda **_kwargs: {"inserted": 0, "updated": 0}
-            )
-            patchers = (
-                mock.patch.object(run.sys, "argv", ["run.py", "DEV3", "--harness", "deepseek", "--local-web"]),
-                mock.patch.object(run.sys.stdin, "isatty", return_value=False),
-                mock.patch.object(run.callable_floor, "require_callable_floor"),
-                mock.patch.object(run.install, "is_source_repo", return_value=True),
-                mock.patch.object(run.subprocess, "run", return_value=mock.Mock(returncode=0)),
-                mock.patch.object(run.global_pointer, "write_global_pointers"),
-                mock.patch.multiple(
-                    run,
-                    open_db=mock.DEFAULT,
-                    authenticate=mock.DEFAULT,
-                    flavor_defaults=mock.DEFAULT,
-                    list_shells=mock.DEFAULT,
-                    pick_shell=mock.DEFAULT,
-                    browser_conversation_active=mock.DEFAULT,
-                    confirm_live=mock.DEFAULT,
-                    ensure_harness_path=mock.DEFAULT,
-                    load_adapter=mock.DEFAULT,
-                    cleanup_before_launch=mock.DEFAULT,
-                    open_session=mock.DEFAULT,
-                    shell_work_dir=mock.DEFAULT,
-                    ensure_worktree=mock.DEFAULT,
-                    sync_worktree=mock.DEFAULT,
-                    link_worktree_map=mock.DEFAULT,
-                    main_checkout_note=mock.DEFAULT,
-                    declared_work_repo_note=mock.DEFAULT,
-                    compose_boot=mock.DEFAULT,
-                    render_harness_skills=mock.DEFAULT,
-                    atomic_write=mock.DEFAULT,
-                    emit_adapter=mock.DEFAULT,
-                    resolve_opencode_plugins=mock.DEFAULT,
-                    apply_merge_json=mock.DEFAULT,
-                    apply_managed_mcp=mock.DEFAULT,
-                    apply_sandbox=mock.DEFAULT,
-                    review_gui_panel=mock.DEFAULT,
-                ),
-                mock.patch.object(run.seed_skills, "sync_engine_skills", return_value=[]),
-                mock.patch.object(run.ports_mod, "resolve", return_value={"port": 8837}),
-                mock.patch.object(run.style, "spinner", return_value=Spinner()),
-                mock.patch.object(run.sys, "stdout", transcript),
-                mock.patch.dict(sys.modules, {"analytics": fake_analytics}),
-                mock.patch.object(
-                    run.deepseek_web,
-                    "ensure",
-                    side_effect=lambda _worktree, *, env: captured.update(env) or {"reused": False, "url": "http://127.0.0.1:8942"},
-                ),
-            )
-            with mock.patch.dict(
-                run.os.environ, {"SC_SHELL_ID": "999", "SC_NO_AUTOPRUNE": "1"}, clear=True
-            ), ExitStack() as stack:
-                applied = [stack.enter_context(patcher) for patcher in patchers]
-                run.open_db.return_value = Con()
-                run.authenticate.return_value = {"user_id": 1}
-                run.flavor_defaults.return_value = {"dev": {"default_harness": "deepseek", "models": {"deepseek": None}}}
-                run.list_shells.return_value = [chosen]
-                run.pick_shell.return_value = chosen
-                run.browser_conversation_active.return_value = False
-                run.confirm_live.return_value = True
-                run.load_adapter.return_value = adapter
-                run.open_session.return_value = (17, 18)
-                run.shell_work_dir.return_value = worktree
-                run.sync_worktree.return_value = "current"
-                run.link_worktree_map.return_value = None
-                run.main_checkout_note.return_value = "current"
-                run.declared_work_repo_note.return_value = "current"
-                run.compose_boot.return_value = "boot"
-                run.render_harness_skills.return_value = {"written": [], "deleted": [], "skipped": [], "dirs": []}
-                run.emit_adapter.return_value = []
-                run.apply_merge_json.return_value = []
-                run.apply_managed_mcp.return_value = []
-                run.apply_sandbox.return_value = []
-                run.review_gui_panel.return_value = "gui"
-                run.main()
-
-        self.assertEqual(captured["SC_SHELL_ID"], "5")
-        self.assertEqual(captured["SC_SHELL_SHORTNAME"], "DEV3")
-        self.assertEqual(captured["SC_API_TOKEN"], "canonical-token")
-        self.assertEqual(captured["SC_API_BASE"], "http://127.0.0.1:8837")
-        self.assertNotIn("sc_generation=", transcript.getvalue())
-
-    def test_public_deepseek_run_overwrites_absent_or_stale_shell_id_at_exec(self) -> None:
-        # run.main() enters the selected worktree.  Restore the test runner's
-        # directory after TemporaryDirectory removes that synthetic worktree.
-        self.addCleanup(run.os.chdir, Path.cwd())
-
-        class Con:
-            def execute(self, *_args):
-                return self
-
-            def fetchone(self):
-                return {
-                    "shell_id": 5,
-                    "display_name": "Code-01",
-                    "shortname": "DEV3",
-                    "api_key": "canonical-token",
-                    "flavor": "dev",
-                }
-
-            def close(self) -> None:
-                return None
-
-        class Spinner:
-            label = ""
-
-            def __enter__(self):
-                return self
-
-            def __exit__(self, *_args):
-                return None
-
-        with tempfile.TemporaryDirectory() as raw:
-            worktree = Path(raw) / "worktree"
-            worktree.mkdir()
-            chosen = {"shell_id": 5, "shortname": "DEV3", "flavor": "dev"}
-            adapter = {
-                "harness": "deepseek",
-                "surfaces": {"one_shot": True},
-                "headless": {"engine_script": "deepseek_one_shot.py"},
-            }
-            captured = {}
-            fake_analytics = types.SimpleNamespace(
-                sweep=lambda **_kwargs: {"inserted": 0, "updated": 0}
-            )
-            with mock.patch.dict(
-                run.os.environ, {"SC_SHELL_ID": "999", "SC_NO_AUTOPRUNE": "1"}, clear=True
-            ), ExitStack() as stack:
-                for patcher in (
-                    mock.patch.object(run.sys, "argv", ["run.py", "DEV3", "--headless", "--harness", "deepseek", "--prompt", "hello"]),
-                    mock.patch.object(run.sys.stdin, "isatty", return_value=False),
-                    mock.patch.object(run.callable_floor, "require_callable_floor"),
-                    mock.patch.object(run.install, "is_source_repo", return_value=True),
-                    mock.patch.object(run.subprocess, "run", return_value=mock.Mock(returncode=0)),
-                    mock.patch.object(run.global_pointer, "write_global_pointers"),
-                    mock.patch.object(run, "open_db", return_value=Con()),
-                    mock.patch.object(run.seed_skills, "sync_engine_skills", return_value=[]),
-                    mock.patch.object(run, "authenticate", return_value={"user_id": 1}),
-                    mock.patch.object(run, "flavor_defaults", return_value={"dev": {"default_harness": "deepseek", "models": {"deepseek": None}}}),
-                    mock.patch.object(run, "list_shells", return_value=[chosen]),
-                    mock.patch.object(run, "pick_shell", return_value=chosen),
-                    mock.patch.object(run.shell_liveness, "compute", return_value={"supported": False, "indeterminate": 0}),
-                    mock.patch.object(run, "ensure_harness_path"),
-                    mock.patch.object(run, "load_adapter", return_value=adapter),
-                    mock.patch.object(run, "resolve_headless_route", return_value=run.ResolvedHeadlessRoute("deepseek", None, None, None)),
-                    mock.patch.object(run, "headless_command", return_value=["deepseek-one-shot", "hello"]),
-                    mock.patch.object(run, "cleanup_before_launch"),
-                    mock.patch.object(run.style, "spinner", return_value=Spinner()),
-                    mock.patch.object(run, "open_session", return_value=(17, 18)),
-                    mock.patch.object(run.ports_mod, "resolve", return_value={"port": 8837}),
-                    mock.patch.object(run, "shell_work_dir", return_value=worktree),
-                    mock.patch.object(run, "ensure_worktree"),
-                    mock.patch.object(run, "sync_worktree", return_value="current"),
-                    mock.patch.object(run, "link_worktree_map", return_value=None),
-                    mock.patch.object(run, "main_checkout_note", return_value="current"),
-                    mock.patch.object(run, "declared_work_repo_note", return_value="current"),
-                    mock.patch.object(run, "compose_boot", return_value="boot"),
-                    mock.patch.object(run, "render_harness_skills", return_value={"written": [], "deleted": [], "skipped": [], "dirs": []}),
-                    mock.patch.object(run, "atomic_write"),
-                    mock.patch.object(run, "emit_adapter", return_value=[]),
-                    mock.patch.object(run, "resolve_opencode_plugins"),
-                    mock.patch.object(run, "apply_merge_json", return_value=[]),
-                    mock.patch.object(run, "apply_managed_mcp", return_value=[]),
-                    mock.patch.object(run, "apply_sandbox", return_value=[]),
-                    mock.patch.object(run, "record_launch"),
-                    mock.patch.object(run.os, "execvpe", side_effect=lambda _cmd, _argv, env: captured.update(env)),
-                    mock.patch.dict(sys.modules, {"analytics": fake_analytics}),
-                ):
-                    stack.enter_context(patcher)
-                run.main()
-                stale_identity_env = dict(captured)
-                captured.clear()
-                run.os.environ.pop("SC_SHELL_ID")
-                run.main()
-
-        assert captured["SC_SHELL_ID"] == "5"
-        assert captured["SC_SHELL_SHORTNAME"] == "DEV3"
-        assert captured["SC_API_TOKEN"] == "canonical-token"
-        assert captured["SC_API_BASE"] == "http://127.0.0.1:8837"
-        assert stale_identity_env["SC_SHELL_ID"] == "5"
-
-    def test_explicit_unsupported_terminal_and_one_shot_requests_fail_early(self) -> None:
-        adapter = {
-            "harness": "deepseek",
+            "harness": "nonterminal",
             "surfaces": {"terminal": False, "one_shot": False},
         }
 
         for surface, label in (("terminal", "terminal"), ("one_shot", "one-shot")):
             with self.subTest(surface=surface), self.assertRaisesRegex(
                 ValueError,
-                rf"harness 'deepseek' does not support {label}",
+                rf"harness 'nonterminal' does not support {label}",
             ):
                 run.require_harness_surface(adapter, surface)
-
-    def test_local_web_entry_requires_an_explicit_interactive_contract(self) -> None:
-        run.require_local_web_surface({
-            "harness": "deepseek",
-            "interactive": {"kind": "local_web"},
-        })
-        with self.assertRaisesRegex(ValueError, "does not support local Web entry"):
-            run.require_local_web_surface({"harness": "codex"})
 
 
 if __name__ == "__main__":

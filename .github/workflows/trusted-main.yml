@@ -38,13 +38,10 @@ jobs:
         run: |
           pip install pytest -r requirements.txt
           npm install --global opencode-ai@1.18.9
-          npm install --global @deepseek-ai/dsh@0.1.1-rc.2
-          test "$(dsh --version)" = "0.1.1-rc.2"
       - name: Run Python 3.14 host contract
         run: >-
           python -m unittest -v
           tests.test_host_runtime_contract
-          tests.test_deepseek_runtime
           tests.test_install_fresh_fork
           tests.test_install_phases
           tests.test_model_catalog
