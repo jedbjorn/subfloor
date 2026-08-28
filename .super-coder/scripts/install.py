@@ -113,9 +113,9 @@ if __name__ == "__main__":
 sys.path.insert(0, str(ENGINE / "scripts"))
 import callable_floor  # noqa: E402
 import engine_manifest  # noqa: E402
-from engine_paths import GENERATED_INSTALL_PATHS  # noqa: E402
 import global_pointer  # noqa: E402
 import ports as ports_mod  # noqa: E402
+from engine_paths import GENERATED_INSTALL_PATHS  # noqa: E402
 
 
 # --- make-alias wiring (shared by install + update) -------------------------
@@ -1080,6 +1080,21 @@ def main(argv: list[str]) -> int:
         "Building the system DB (schema + migrations)",
         [PY, str(ENGINE / "scripts/rebuild.py")],
     )
+    import update_cutover
+
+    try:
+        fresh_removal_ready = update_cutover.record_fresh_install_readiness(
+            pinned,
+            repo_root=REPO_ROOT,
+            manifest_path=(ENGINE / "assets/dsh-removal/removal-manifest-v1.json"),
+            cleanup_receipt_path=(
+                REPO_ROOT / ".sc-state/local/dsh-removal/cleanup-receipt.json"
+            ),
+        )
+    except update_cutover.CutoverError as exc:
+        sys.exit(f"install: cannot publish DSH removal readiness: {exc}")
+    if fresh_removal_ready:
+        print(f"  DSH removal readiness published for {pinned[:12]}")
 
     # 6. Seed the starting team (interactive: username only) ------------------
     if starting_team_exists():
