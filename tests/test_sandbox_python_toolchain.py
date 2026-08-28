@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import sqlite3
-import sys
 import unittest
 from pathlib import Path
 
@@ -11,9 +10,6 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 ENGINE = ROOT / ".super-coder"
 DOCKERFILE = ROOT / ".super-coder" / "Dockerfile"
-sys.path.insert(0, str(ENGINE / "scripts"))
-
-import seed_skills  # noqa: E402
 
 
 class SandboxPythonToolchainTest(unittest.TestCase):
@@ -39,10 +35,7 @@ class SandboxPythonToolchainTest(unittest.TestCase):
 
 
 class PythonToolingSkillReseedTest(unittest.TestCase):
-    def test_terminal_reseed_converges_to_authoritative_dev_kit_skill(self) -> None:
-        expected = seed_skills.parse_skill(
-            ENGINE / "assets" / "seed" / "skills" / "dev_kit" / "SKILL.md"
-        )
+    def test_terminal_reseed_preserves_fork_customized_dev_kit_skill(self) -> None:
         con = sqlite3.connect(":memory:")
         self.addCleanup(con.close)
         con.executescript(
@@ -73,16 +66,15 @@ class PythonToolingSkillReseedTest(unittest.TestCase):
         self.assertEqual(
             actual,
             (
-                expected["name"],
-                expected["description"],
-                expected["category"],
-                expected["command"],
-                expected["common"],
-                expected["content"],
-                0,
+                "dev_kit",
+                "stale",
+                "stale",
+                "stale",
+                1,
+                "stale",
+                1,
             ),
         )
-        self.assertIn("Engine baseline", actual[5])
 
 
 if __name__ == "__main__":

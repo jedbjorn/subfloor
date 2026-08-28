@@ -91,33 +91,36 @@ DEV_TOOL_HOOKS = ("deps", "test", "lint", "typecheck")
 DEV_TOOL_BASELINE = ("curl", "node", "npm", "pytest", "rg", "sqlite3", "uv")
 
 
-def _dev_tool_receipt_matches(
+def _dev_tool_status_matches(
     status: dict, declaration: devkit.Declaration, checkout: Path, identity: str
 ) -> bool:
-    """Return whether readiness evidence names this checkout and declaration."""
+    """Return whether lifecycle status names this checkout and declaration."""
     declaration_digest = hashlib.sha256(
         declaration.canonical_json.encode()
     ).hexdigest()
-    sandbox = declaration.sandbox
-    if sandbox is not None and sandbox.packages is not None:
-        package_digest = hashlib.sha256(
-            json.dumps(
-                sandbox.packages.canonical_atoms, separators=(",", ":")
-            ).encode()
-        ).hexdigest()
-    elif sandbox is not None and sandbox.package_error is not None:
-        package_digest = "invalid"
-    else:
-        package_digest = "none"
+    package_digest = sandbox_devkit._declaration_package_digest(declaration)
     try:
         engine_ref = sandbox_devkit._engine_ref(checkout, ENGINE)
     except sandbox_devkit.SandboxImageError:
         return False
     return (
-        status.get("checkout_identity") == identity
+        status.get("format_version") == 1
+        and status.get("checkout_identity") == identity
         and status.get("declaration_digest") == declaration_digest
         and status.get("package_digest") == package_digest
         and status.get("engine_ref") == engine_ref
+    )
+
+
+def _dev_tool_receipt_matches(
+    status: dict, declaration: devkit.Declaration, checkout: Path, identity: str
+) -> bool:
+    """Return whether canonical ready evidence matches current tracked inputs."""
+    return bool(
+        _dev_tool_status_matches(status, declaration, checkout, identity)
+        and sandbox_devkit.persisted_readiness_matches(
+            checkout, ENGINE, declaration, status
+        )
     )
 
 
@@ -252,22 +255,22 @@ def collect_dev_tools(
                 status = json.loads(status_path.read_text())
             except (OSError, UnicodeError, json.JSONDecodeError):
                 state = "failed"
-        if (
-            status is None
-            and state != "failed"
-            or status is not None
-            and not _dev_tool_receipt_matches(
-                status, declaration, checkout, identity
-            )
-        ):
+        if status is None and state != "failed":
             state = "stale"
         elif status is not None:
-            if status.get("native_packages") == "advisory":
+            current_status = _dev_tool_status_matches(
+                status, declaration, checkout, identity
+            )
+            if not current_status:
+                state = "stale"
+            elif status.get("native_packages") == "advisory":
                 state = "advisory"
-            elif status.get("fork_readiness") == "ready":
-                state = "ready"
             elif status.get("state") == "failed" or status.get("core_runtime") == "failed":
                 state = "failed"
+            elif status.get("fork_readiness") == "ready" and _dev_tool_receipt_matches(
+                status, declaration, checkout, identity
+            ):
+                state = "ready"
             else:
                 state = "stale"
 

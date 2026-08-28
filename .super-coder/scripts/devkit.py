@@ -164,6 +164,16 @@ def _string_array(value: Any, field: str) -> tuple[str, ...]:
     return tuple(_string(item, f"{field}[{index}]") for index, item in enumerate(value))
 
 
+def _boot_field(value: str, field: str) -> str:
+    """Reject declaration text that can escape generated Markdown code spans."""
+    if "`" in value or any(ord(character) < 32 or ord(character) == 127 for character in value):
+        raise _error(
+            field,
+            "must not contain control characters or Markdown code delimiters",
+        )
+    return value
+
+
 def _is_absolute(value: str) -> bool:
     return Path(value).is_absolute() or PureWindowsPath(value).is_absolute()
 
@@ -203,10 +213,13 @@ def _hook(checkout: Path, name: str, value: Any) -> Hook:
     item = _object(value, field)
     _keys(item, field, allowed=("argv", "cwd"), required=("argv",))
     argv = _string_array(item["argv"], f"{field}.argv")
-    cwd_declared, cwd = _repo_path(
-        checkout, item.get("cwd", "."), f"{field}.cwd", kind="directory"
+    cwd_value = _boot_field(
+        _string(item.get("cwd", "."), f"{field}.cwd"), f"{field}.cwd"
     )
-    executable = argv[0]
+    cwd_declared, cwd = _repo_path(
+        checkout, cwd_value, f"{field}.cwd", kind="directory"
+    )
+    executable = _boot_field(argv[0], f"{field}.argv[0]")
     if "/" not in executable:
         if _is_absolute(executable):
             raise _error(f"{field}.argv[0]", "absolute executable paths are forbidden")

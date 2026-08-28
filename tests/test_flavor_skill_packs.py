@@ -195,7 +195,7 @@ class HardCutoverMigrationTest(unittest.TestCase):
         self.assertNotIn("every-session", body)
         self.assertNotIn("sc mem message send", body)
 
-    def test_0238_converges_dirty_standard_packs_without_local_drift(self) -> None:
+    def test_0239_converges_packs_without_rewriting_fork_dev_kit(self) -> None:
         migration = "0239_global_skill_simplification.sql"
         con = build_db(before=migration)
         bespoke = add_shell(con, "custom", None)
@@ -217,6 +217,19 @@ class HardCutoverMigrationTest(unittest.TestCase):
         con.execute(
             "INSERT OR IGNORE INTO flavor_skills(flavor,skill_id) "
             "SELECT 'dev',skill_id FROM skills WHERE name='snapshot'"
+        )
+        custom_dev_kit = (
+            "fork description",
+            "fork category",
+            "fork-command",
+            0,
+            "fork-owned dev_kit bytes",
+            0,
+        )
+        con.execute(
+            "UPDATE skills SET description=?,category=?,command=?,common=?,"
+            "content=?,is_deleted=? WHERE name='dev_kit'",
+            custom_dev_kit,
         )
 
         sql = (MIGRATIONS / migration).read_text()
@@ -245,19 +258,11 @@ class HardCutoverMigrationTest(unittest.TestCase):
                 name,
             )
 
-        dev_kit = seed_skills.parse_skill(
-            ENGINE / "assets" / "seed" / "skills" / "dev_kit" / "SKILL.md"
-        )
         actual_dev_kit = con.execute(
             "SELECT description,category,command,common,content,is_deleted "
             "FROM skills WHERE name='dev_kit'"
         ).fetchone()
-        self.assertEqual(
-            tuple(actual_dev_kit),
-            tuple(dev_kit[key] for key in (
-                "description", "category", "command", "common", "content"
-            )) + (0,),
-        )
+        self.assertEqual(tuple(actual_dev_kit), custom_dev_kit)
 
         common = {
             row[0]
@@ -286,6 +291,28 @@ class HardCutoverMigrationTest(unittest.TestCase):
                 "WHERE name='fork_testing_seat'"
             ).fetchone()),
             ("local", "fork", "local bytes"),
+        )
+
+    def test_0239_migrates_only_the_untouched_legacy_dev_kit_starter(self) -> None:
+        migration = "0239_global_skill_simplification.sql"
+        con = build_db(before=migration)
+        sql = (MIGRATIONS / migration).read_text()
+
+        con.executescript(sql)
+        con.executescript(sql)
+
+        expected = seed_skills.parse_skill(
+            ENGINE / "assets" / "seed" / "skills" / "dev_kit" / "SKILL.md"
+        )
+        actual = con.execute(
+            "SELECT description,category,command,common,content,is_deleted "
+            "FROM skills WHERE name='dev_kit'"
+        ).fetchone()
+        self.assertEqual(
+            tuple(actual),
+            tuple(expected[key] for key in (
+                "description", "category", "command", "common", "content"
+            )) + (0,),
         )
 
     def test_non_admin_skill_packs_use_the_canonical_sc_command(self) -> None:

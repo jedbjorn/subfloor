@@ -73,6 +73,9 @@ class WindowsSkillRetirementMigrationTest(unittest.TestCase):
         self.addCleanup(con.close)
         con.executescript(
             "PRAGMA foreign_keys=ON;"
+            "CREATE TABLE shells ("
+            "shell_id INTEGER PRIMARY KEY, flavor TEXT, "
+            "system_prompt TEXT NOT NULL);"
             "CREATE TABLE skills ("
             "skill_id INTEGER PRIMARY KEY, name TEXT UNIQUE, description TEXT, "
             "category TEXT, command TEXT, common INTEGER, content TEXT, "
