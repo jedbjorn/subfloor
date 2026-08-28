@@ -400,7 +400,7 @@ class RootCheckoutUnchangedTest(WorktreeFixture):
             hashlib.sha256((self.pristine / "shell_db.db").read_bytes()).hexdigest(),
             "root migrate must still really migrate")
 
-    def test_root_migrate_names_targets_and_defers_installed_purge(self):
+    def test_root_migrate_names_targets_when_current(self):
         run_sc(self.main, "migrate")
         done = run_sc(self.main, "migrate")
         self.assertEqual(done.returncode, 0, done.stderr)
@@ -410,8 +410,7 @@ class RootCheckoutUnchangedTest(WorktreeFixture):
             done.stdout,
         )
         self.assertIn(
-            "migrate: deferred 0237_purge_dsh_owned_data.sql — tracked source "
-            "checkouts do not consume installed purge receipts",
+            f"migrate: nothing pending — {self.live_db} is current.",
             done.stdout,
         )
 
@@ -806,9 +805,10 @@ class StandaloneRootTest(unittest.TestCase):
 
     def test_a_checkout_less_root_is_not_treated_as_a_linked_worktree(self):
         done = run_sc(self.tmp, "migrate")
-        self.assertEqual(done.returncode, 78)
-        self.assertEqual(done.stdout, "")
-        self.assertIn("half-adopted", done.stderr)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertNotIn("refused", done.stderr)
+        self.assertIn(f"migrate: db         {self.tmp / '.super-coder' / 'shell_db.db'}",
+                      done.stdout)
 
     def test_a_symlinked_invocation_is_the_same_root_not_a_second_one(self):
         """Normalization before comparison: reaching the same tree through a
@@ -817,9 +817,8 @@ class StandaloneRootTest(unittest.TestCase):
         link.symlink_to(self.tmp)
         self.addCleanup(link.unlink)
         done = run_sc(link, "migrate")
-        self.assertEqual(done.returncode, 78)
-        self.assertEqual(done.stdout, "")
-        self.assertIn("half-adopted", done.stderr)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertNotIn("refused", done.stderr)
 
 
 class MigratePreflightTest(unittest.TestCase):

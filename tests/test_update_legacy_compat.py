@@ -22,7 +22,6 @@ sys.path.insert(0, str(SCRIPTS))
 sys.path.insert(0, str(ROOT / "tests"))
 import update  # noqa: E402
 import update_compat  # noqa: E402
-import update_cutover  # noqa: E402
 from skill_convergence_fixtures import (  # noqa: E402
     LOCAL_SKILL_DESCRIPTION,
     LOCAL_SKILL_NAME,
@@ -59,97 +58,6 @@ def commit(root: Path, message: str) -> str:
 
 
 class LegacyUpdateCompatTest(unittest.TestCase):
-    def test_completed_fresh_install_receipt_bypasses_compatibility_marker(
-        self,
-    ) -> None:
-        current = "a" * 40
-        plan = update_cutover.CutoverPlan(
-            target_ref=current,
-            compatibility_ref="b" * 40,
-            cleanup_hook=".super-coder/scripts/dsh_removal_cleanup.py",
-            manifest_sha256="c" * 64,
-        )
-        with tempfile.TemporaryDirectory() as td:
-            root = Path(td)
-            state = root / ".sc-state"
-            engine_ref = state / "engine.ref"
-            skill_marker = state / "local/skill-sweep.ref"
-            engine_ref.parent.mkdir(parents=True)
-            engine_ref.write_text(current + "\n")
-            skill_marker.parent.mkdir(parents=True)
-            skill_marker.write_text(current + "\n")
-            with mock.patch.multiple(
-                update_compat,
-                REPO_ROOT=root,
-                STATE_DIR=state,
-                ENGINE_REF=engine_ref,
-                ENGINE_REF_PREV=state / "engine.ref.prev",
-                MARKER=state / "local/update-compat.done",
-                SKILL_SWEEP_MARKER=skill_marker,
-            ), mock.patch.object(
-                update_compat, "reconcile_host_wrapper"
-            ), mock.patch.object(
-                update, "repair_callable_dispatcher"
-            ), mock.patch.object(
-                update, "reconcile_linked_dispatchers"
-            ), mock.patch.object(
-                update_compat, "needs_legacy_bridge", return_value=(False, None)
-            ), mock.patch.object(
-                update_cutover, "inspect_target", return_value=plan
-            ), mock.patch.object(
-                update_cutover, "installed_removal_ready", return_value=True
-            ), mock.patch.object(
-                update_cutover, "require_compatibility_floor"
-            ) as require_floor:
-                self.assertEqual(0, update_compat.main())
-
-            require_floor.assert_not_called()
-
-    def test_incomplete_removal_still_requires_compatibility_marker(self) -> None:
-        current = "a" * 40
-        plan = update_cutover.CutoverPlan(
-            target_ref=current,
-            compatibility_ref="b" * 40,
-            cleanup_hook=".super-coder/scripts/dsh_removal_cleanup.py",
-            manifest_sha256="c" * 64,
-        )
-        with tempfile.TemporaryDirectory() as td:
-            root = Path(td)
-            state = root / ".sc-state"
-            engine_ref = state / "engine.ref"
-            skill_marker = state / "local/skill-sweep.ref"
-            engine_ref.parent.mkdir(parents=True)
-            engine_ref.write_text(current + "\n")
-            skill_marker.parent.mkdir(parents=True)
-            skill_marker.write_text(current + "\n")
-            with mock.patch.multiple(
-                update_compat,
-                REPO_ROOT=root,
-                STATE_DIR=state,
-                ENGINE_REF=engine_ref,
-                ENGINE_REF_PREV=state / "engine.ref.prev",
-                MARKER=state / "local/update-compat.done",
-                SKILL_SWEEP_MARKER=skill_marker,
-            ), mock.patch.object(
-                update_compat, "reconcile_host_wrapper"
-            ), mock.patch.object(
-                update, "repair_callable_dispatcher"
-            ), mock.patch.object(
-                update, "reconcile_linked_dispatchers"
-            ), mock.patch.object(
-                update_cutover, "inspect_target", return_value=plan
-            ), mock.patch.object(
-                update_cutover, "installed_removal_ready", return_value=False
-            ), mock.patch.object(
-                update_cutover, "require_compatibility_floor"
-            ) as require_floor, self.assertRaisesRegex(SystemExit, "half-adopted"):
-                update_compat.main()
-
-            require_floor.assert_called_once_with(
-                plan,
-                marker_path=state / "local/dsh-removal/compatibility-floor.json",
-            )
-
     def test_installed_repo_reconciles_managed_host_wrapper(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td) / "fork"
@@ -318,9 +226,6 @@ class LegacyUpdateCompatTest(unittest.TestCase):
             shutil.copy2(SCRIPTS / "map_setup.py", scripts / "map_setup.py")
             shutil.copy2(
                 SCRIPTS / "update_compat.py", scripts / "update_compat.py"
-            )
-            shutil.copy2(
-                SCRIPTS / "update_cutover.py", scripts / "update_cutover.py"
             )
             shutil.copy2(SCRIPTS / "sc_wrapper.py", scripts / "sc_wrapper.py")
             (scripts / "update.py").write_text(
