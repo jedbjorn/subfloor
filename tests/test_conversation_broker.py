@@ -947,7 +947,7 @@ class StoreContractTest(ConversationBrokerCase):
         )
         self.assertEqual(json.loads(rows[-1]["payload"])["text"], "two")
 
-    def test_non_deepseek_usage_does_not_create_browser_analytics_rows(self) -> None:
+    def test_codex_usage_does_not_create_browser_analytics_rows(self) -> None:
         conversation_id = self.add_conversation(harness="codex")
         self.add_message(conversation_id)
         store = BrokerStore(self.db_path)

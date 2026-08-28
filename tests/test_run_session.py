@@ -89,14 +89,13 @@ class FlavorRouteDefaultsTest(unittest.TestCase):
             }},
         )
 
-    def test_deepseek_family_provider_is_owned_only_by_opencode(self) -> None:
+    def test_provider_family_route_is_owned_by_opencode(self) -> None:
         self.assertEqual(
             "ollama-cloud",
             run.session_provider(
                 "opencode", "ollama-cloud/deepseek-v4-pro:0813"
             ),
         )
-        self.assertIsNone(run.session_provider("deepseek", "deepseek-v4-pro"))
 
 
 class ShellPathTest(unittest.TestCase):

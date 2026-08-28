@@ -167,21 +167,6 @@ class SprintBoundRouteDispatchProof(unittest.TestCase):
     @staticmethod
     def _runtime(harness: str) -> tuple[dict, dict]:
         scope = route_bindings.harness_versions.runtime_scope()
-        if harness == "deepseek":
-            return (
-                {
-                    "harness": harness,
-                    **scope,
-                    "version": "0.1.1",
-                    "observed_version": "0.1.1-rc.2",
-                    "compatibility": "verified",
-                    "minimum_version": "0.1.1",
-                    "maximum_version_exclusive": "0.1.2",
-                    "verified_version": "0.1.1",
-                    "error": None,
-                },
-                scope,
-            )
         versions = {"kimi": "0.33.0", "opencode": "1.18.9"}
         compatibility = route_bindings._runtime_manifest_compatibility(
             harness, versions[harness]
@@ -1468,114 +1453,6 @@ class SprintBoundRouteDispatchProof(unittest.TestCase):
                 "native_route_unavailable: Bound native option is not "
                 "advertised by the current harness",
             ),
-        )
-
-    def test_unsupported_deepseek_effort_refuses_before_wake_conversation(self) -> None:
-        sprint_id = self._seed_sprint(
-            harness="deepseek", model="deepseek-v4-pro", effort="medium"
-        )
-        participant_id = int(self.con.execute(
-            "SELECT participant_id FROM sprint_participants "
-            "WHERE sprint_id=? AND role='developer'",
-            (sprint_id,),
-        ).fetchone()[0])
-        binding = {
-            "contract_version": 2,
-            "control_state": "controlled",
-            "harness": "deepseek",
-            "requested_model": "deepseek-v4-pro",
-            "provider_model": "deepseek-v4-pro",
-            "requested_effort": "medium",
-            "effective_effort": "medium",
-            "native_variant_id": None,
-            "transport": "deepseek-provider-options-v1",
-            "catalogue_generation": "a" * 32,
-            "evidence_digest": "b" * 64,
-            "selector_binding": {
-                "kind": "authenticated-provider-model",
-                "selector": "deepseek-v4-pro",
-            },
-            "adapter_metadata": {
-                "provider_route": "deepseek-official",
-                "transport_contract": "deepseek-provider-options-v1",
-                "wire_evidence_digest": "c" * 64,
-                "provider_options": {
-                    "omit": [],
-                    "set": {
-                        "thinking": {"type": "enabled"},
-                        "reasoning_effort": "medium",
-                    },
-                },
-            },
-        }
-        digest = route_bindings.digest_json(binding)
-        self.con.execute("PRAGMA ignore_check_constraints=ON")
-        binding_id = int(self.con.execute(
-            "INSERT INTO sprint_participant_route_bindings ("
-            "participant_id,route_revision,contract_version,control_state,"
-            "harness,requested_model,provider_model,requested_effort,"
-            "effective_effort,native_variant_id,transport,"
-            "catalogue_generation,evidence_digest,selector_binding,"
-            "adapter_metadata,binding_json,binding_digest,source_fingerprint,"
-            "harness_version,harness_evidence_format,harness_support_state) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            (
-                participant_id,
-                1,
-                binding["contract_version"],
-                binding["control_state"],
-                binding["harness"],
-                binding["requested_model"],
-                binding["provider_model"],
-                binding["requested_effort"],
-                binding["effective_effort"],
-                binding["native_variant_id"],
-                binding["transport"],
-                binding["catalogue_generation"],
-                binding["evidence_digest"],
-                route_bindings.canonical_json(binding["selector_binding"]),
-                route_bindings.canonical_json(binding["adapter_metadata"]),
-                route_bindings.canonical_json(binding),
-                digest,
-                "d" * 64,
-                "0.1.0rc7",
-                "raw-observed-v1",
-                "tested",
-            ),
-        ).lastrowid)
-        self.con.execute(
-            "UPDATE sprint_participants SET active_route_binding_id=? "
-            "WHERE participant_id=?",
-            (binding_id, participant_id),
-        )
-        self.con.commit()
-        self.con.execute("PRAGMA ignore_check_constraints=OFF")
-
-        with self.assertRaises(
-            sprint_participant_chats.SprintConversationError
-        ) as refused:
-            sprint_participant_chats.prepare_wake_conversation(
-                self.con,
-                sprint_id=sprint_id,
-                participant_id=participant_id,
-            )
-
-        self.assertEqual(
-            str(refused.exception),
-            "Invalid version-two route binding",
-        )
-        self.assertEqual(
-            tuple(
-                tuple(row)
-                for row in self.con.execute(
-                    "SELECT COUNT(*) FROM conversations UNION ALL "
-                    "SELECT COUNT(*) FROM conversation_messages UNION ALL "
-                    "SELECT COUNT(*) FROM conversation_outbox UNION ALL "
-                    "SELECT COUNT(*) FROM conversation_runs UNION ALL "
-                    "SELECT COUNT(*) FROM active_shell_chats"
-                ).fetchall()
-            ),
-            ((0,), (0,), (0,), (0,), (0,)),
         )
 
     def test_pre_native_failure_rechecks_live_ids_without_freshness_rejection(self) -> None:

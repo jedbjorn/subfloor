@@ -329,27 +329,6 @@ class SkillCliConnectionTest(unittest.TestCase):
             self.assertEqual(skill_cli.main(["list"]), 0)
         opened.assert_called_once_with()
 
-    def test_dsh_credential_artifact_does_not_enable_shell_api(self):
-        con = mock.Mock()
-        with (
-            mock.patch.dict(
-                os.environ,
-                {"DSH_SC_MEM_CREDENTIAL_FILE": "/admitted/credential.json"},
-                clear=True,
-            ),
-            mock.patch.object(skill_cli.mem, "SC_API_TOKEN", ""),
-            mock.patch.object(
-                skill_cli.mem,
-                "_require_api",
-                side_effect=AssertionError("DSH credential artifact consulted"),
-            ) as require_api,
-            mock.patch.object(skill_cli, "connect", return_value=con) as opened,
-            mock.patch.object(skill_cli, "cmd_list", return_value=0),
-        ):
-            self.assertEqual(skill_cli.main(["list"]), 0)
-        require_api.assert_not_called()
-        opened.assert_called_once_with()
-
     def test_mutation_keeps_the_wal_enabled_write_connection(self):
         con = mock.Mock()
         with (

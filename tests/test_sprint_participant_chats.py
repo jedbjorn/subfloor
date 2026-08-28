@@ -388,7 +388,7 @@ def test_non_sprint_wake_ignores_prior_removed_harness_route() -> None:
             "conversation_id,shell_id,owner_user_id,harness,provider,model,effort,"
             "worktree,state,title,creation_idempotency_key,creation_request_hash,"
             "created_at,closed_at) VALUES ("
-            "'cv_removed',10,1,'deepseek','deepseek-official','deepseek-chat','high',"
+            "'cv_removed',10,1,'unsupported','example','legacy-chat','high',"
             "'/removed','closed','Removed history','removed','removed-hash',"
             "'2026-08-28 00:00:00','2026-08-28 00:01:00')"
         )

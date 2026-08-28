@@ -152,7 +152,6 @@ def resolve(persist: bool = False) -> dict:
         # Instance predates dev_port — backfill without disturbing the serve port
         # (respects hand-edits to `port`); persisted below if requested.
         cfg["dev_port"] = _dev_offset(cfg["port"], occupied)
-    cfg.pop("deepseek_host_port", None)
     if persist:
         CONFIG.write_text(json.dumps(cfg, indent=2) + "\n")
     return cfg

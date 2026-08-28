@@ -14,9 +14,6 @@ from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 MIGRATIONS = ROOT / ".super-coder" / "migrations"
-HISTORICAL_MIGRATIONS = (
-    ROOT / "tests" / "fixtures" / "dsh_removal" / "historical_migrations"
-)
 OLLAMA_ACCEPTANCE = json.loads(
     (ROOT / "tests" / "fixtures" / "ollama_live_native_acceptance.json")
     .read_text()
@@ -32,10 +29,7 @@ import server as api_server  # noqa: E402
 
 
 def migration_path(filename: str) -> Path:
-    current = MIGRATIONS / filename
-    if current.is_file():
-        return current
-    return HISTORICAL_MIGRATIONS / filename
+    return MIGRATIONS / filename
 
 
 def compatible_runtime(version: str = "2.22.0", *, harness: str | None = None,
@@ -44,7 +38,6 @@ def compatible_runtime(version: str = "2.22.0", *, harness: str | None = None,
     ranges = {
         "claude": ("2.1.220", "2.2.0", "2.1.222"),
         "codex": ("0.145.0", "0.147.0", "0.145.0"),
-        "deepseek": ("0.1.1-rc.2", "0.1.1-rc.3", "0.1.1-rc.2"),
         "kimi": ("0.30.0", "0.34.0", "0.33.0"),
         "opencode": ("1.18.9", "1.19.0", "1.18.9"),
         "vibe": ("2.22.0", "2.23.0", "2.22.0"),
@@ -72,7 +65,7 @@ def controlled_observation(
 ) -> dict:
     versions = {
         "claude": "2.1.222", "codex": "0.145.0",
-        "deepseek": "0.1.1-rc.2", "kimi": "0.33.0", "opencode": "1.18.9",
+        "kimi": "0.33.0", "opencode": "1.18.9",
     }
     scope = scope or route_bindings.harness_versions.runtime_scope()
     status = compatible_runtime(
@@ -144,15 +137,11 @@ def route_schema(path: str | Path = ":memory:") -> sqlite3.Connection:
         ROOT / ".super-coder" / "migrations" /
         "0223_model_default_effort_binding.sql"
     ).read_text())
-    con.executescript(migration_path(
-        "0227_deepseek_controlled_route_binding.sql"
-    ).read_text())
-    con.executescript(migration_path(
-        "0230_deepseek_stock_host_route_binding.sql"
-    ).read_text())
-    con.executescript(migration_path(
-        "0235_live_native_route_binding_v3.sql"
-    ).read_text())
+    rebaseline = migration_path("0238_final_schema_rebaseline.sql").read_text()
+    route_schema_sql = rebaseline.split(
+        "CREATE TABLE _flavor_defaults_live_native", 1
+    )[0]
+    con.executescript(route_schema_sql + "\nCOMMIT;\n")
     return con
 
 
@@ -268,54 +257,6 @@ class BindingIdentityTest(unittest.TestCase):
                 },
             }),
         )
-
-    @classmethod
-    def deepseek_row(cls) -> dict:
-        identity = {
-            "provider_route": "deepseek-official",
-            "endpoint_identity": "https://api.deepseek.com",
-            "credential_ref": "DEEPSEEK_API_KEY",
-            "credential_status": {
-                "configured": True, "source": "environment", "writable": False,
-            },
-            "configuration_digest": "3" * 64,
-            "transport_contract": "deepseek-stock-host-v1",
-            "runtime_version": "0.1.1-rc.2",
-            "source_commit": "b" * 40,
-        }
-        selected = {
-            "default": {**identity, "reasoning_effort": None},
-            "high": {**identity, "reasoning_effort": "high"},
-        }
-        return cls.controlled_row(
-            harness="deepseek",
-            selector="deepseek-official/deepseek-v4-pro",
-            provider_model="deepseek-v4-pro",
-            source="deepseek-host-api",
-            evidence_kind="deepseek-host-config-v1",
-            availability="available",
-            headless_supported=1,
-            cli_version="0.1.1-rc.2",
-            harness_version="0.1.1-rc.2",
-            supported_efforts='["high"]',
-            effort_metadata=json.dumps({
-                "supported": ["high"],
-                "default": "high",
-                "digests": {"high": "4" * 64},
-                "native_variant_ids": {},
-                "adapter_metadata_by_effort": selected,
-            }),
-            selector_binding=json.dumps({
-                "kind": "official-host-configured-model",
-                "selector": "deepseek-official/deepseek-v4-pro",
-                "provider_route": "deepseek-official",
-                "runtime_source_commit": "bb4ca698d63714e753f5621b07400e6ebb0b5d97",
-            }),
-            adapter_metadata=json.dumps({
-                "route_metadata_by_effort": selected,
-            }),
-        )
-
 
     def test_controlled_omitted_and_explicit_high_have_same_fixed_identity(self):
         implicit, implicit_digest = resolve_controlled_v2(
@@ -515,22 +456,22 @@ class BindingIdentityTest(unittest.TestCase):
         self.assertEqual(refused.exception.code, "thinking_evidence_missing")
 
 
-    def test_removed_deepseek_route_is_rejected_before_live_probe(self):
+    def test_unknown_route_is_rejected_before_live_probe(self):
         with mock.patch.object(
             model_catalog,
             "controlled_route_evidence",
-            side_effect=AssertionError("removed harness reached live discovery"),
+            side_effect=AssertionError("unknown harness reached live discovery"),
         ) as probe:
             resolved = routes_cli.resolve(
                 None,
-                "deepseek",
-                "deepseek-official/deepseek-v4-pro",
+                "unsupported",
+                "provider/model",
                 effort="high",
             )
 
         self.assertFalse(resolved["ok"])
         self.assertEqual(resolved["code"], "unsupported_thinking_level")
-        self.assertEqual(resolved["details"], {"harness": "deepseek"})
+        self.assertEqual(resolved["details"], {"harness": "unsupported"})
         self.assertNotIn("binding", resolved)
         self.assertNotIn("command", resolved)
         probe.assert_not_called()
@@ -1025,397 +966,6 @@ class BindingIdentityTest(unittest.TestCase):
             route_bindings.legacy_route(
                 row_contract_version=2, harness="vibe", model="old", effort=None
             )
-
-
-class LegacySprintBindingUpgradeTest(unittest.TestCase):
-    def setUp(self):
-        self.con = sqlite3.connect(":memory:")
-        self.con.row_factory = sqlite3.Row
-        self.con.execute("PRAGMA foreign_keys=ON")
-        self.con.executescript((
-            ROOT / ".super-coder" / "migrations" / "0075_model_routes.sql"
-        ).read_text())
-        self.con.executescript(
-            "CREATE TABLE sprints (sprint_id INTEGER PRIMARY KEY,lifecycle TEXT NOT NULL);"
-            "CREATE TABLE sprint_participants (participant_id INTEGER PRIMARY KEY,"
-            "sprint_id INTEGER NOT NULL REFERENCES sprints(sprint_id));"
-        )
-        for migration in (
-            "0212_route_binding_foundation.sql",
-            "0216_sprint_binding_provenance.sql",
-        ):
-            self.con.executescript((ROOT / ".super-coder" / "migrations" / migration).read_text())
-        self.con.execute("INSERT INTO sprints VALUES (1,'armed')")
-        self.con.executemany(
-            "INSERT INTO sprint_participants VALUES (?,1,NULL)", ((10,), (11,), (12,))
-        )
-        self.addCleanup(self.con.close)
-
-    def _insert_legacy(self, participant_id: int, binding: dict, *,
-                       source_fingerprint: str | None, harness_version: str) -> None:
-        values = [binding[key] for key in route_bindings.BINDING_KEYS]
-        self.con.execute(
-            "INSERT INTO sprint_participant_route_bindings ("
-            "participant_id,route_revision,contract_version,control_state,harness,"
-            "requested_model,provider_model,requested_effort,effective_effort,"
-            "native_variant_id,transport,catalogue_generation,evidence_digest,"
-            "selector_binding,adapter_metadata,binding_json,binding_digest,"
-            "source_fingerprint,harness_version"
-            ") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            (
-                participant_id, 1, *values[:11],
-                route_bindings.canonical_json(binding["selector_binding"])
-                if binding["selector_binding"] is not None else None,
-                route_bindings.canonical_json(binding["adapter_metadata"]),
-                route_bindings.canonical_json(binding), route_bindings.digest_json(binding),
-                source_fingerprint, harness_version,
-            ),
-        )
-
-    def test_deepseek_migration_keeps_one_advancing_sequence_row(self):
-        binding = ParticipantRevisionTest.controlled_binding()
-        self._insert_legacy(
-            10,
-            binding,
-            source_fingerprint="2" * 64,
-            harness_version="0.145.0",
-        )
-        for migration in (
-            "0217_harness_support_metadata.sql",
-            "0218_sprint_binding_support_provenance.sql",
-            "0223_model_default_effort_binding.sql",
-            "0227_deepseek_controlled_route_binding.sql",
-            "0230_deepseek_stock_host_route_binding.sql",
-            "0235_live_native_route_binding_v3.sql",
-        ):
-            self.con.executescript(migration_path(migration).read_text())
-
-        self.assertEqual(
-            [tuple(row) for row in self.con.execute(
-                "SELECT name,seq FROM sqlite_sequence "
-                "WHERE name='sprint_participant_route_bindings'"
-            )],
-            [("sprint_participant_route_bindings", 1)],
-        )
-
-        self.con.execute("UPDATE sprints SET lifecycle='prepared' WHERE sprint_id=1")
-        receipt = route_bindings.ParticipantRouteBindingStore(self.con).bind(
-            11,
-            binding,
-            route_bindings.digest_json(binding),
-            transition="arm",
-            source_fingerprint="2" * 64,
-            harness_version="0.145.0",
-            harness_support_state="tested",
-        )
-        self.assertEqual(receipt["binding_id"], 2)
-        self.assertEqual(
-            [tuple(row) for row in self.con.execute(
-                "SELECT name,seq FROM sqlite_sequence "
-                "WHERE name='sprint_participant_route_bindings'"
-            )],
-            [("sprint_participant_route_bindings", 2)],
-        )
-
-    def test_live_native_v3_migration_preserves_v2_bytes_and_appends_v3(self):
-        legacy = ParticipantRevisionTest.controlled_binding()
-        self._insert_legacy(
-            10,
-            legacy,
-            source_fingerprint="2" * 64,
-            harness_version="0.145.0",
-        )
-        for migration in (
-            "0217_harness_support_metadata.sql",
-            "0218_sprint_binding_support_provenance.sql",
-            "0223_model_default_effort_binding.sql",
-            "0227_deepseek_controlled_route_binding.sql",
-            "0230_deepseek_stock_host_route_binding.sql",
-        ):
-            self.con.executescript(migration_path(migration).read_text())
-        before = tuple(self.con.execute(
-            "SELECT participant_id,route_revision,binding_json,binding_digest,"
-            "source_fingerprint,harness_version,harness_evidence_format,"
-            "harness_support_state FROM sprint_participant_route_bindings "
-            "WHERE participant_id=10"
-        ).fetchone())
-
-        self.con.executescript(migration_path(
-            "0235_live_native_route_binding_v3.sql"
-        ).read_text())
-        preserved = self.con.execute(
-            "SELECT participant_id,route_revision,binding_json,binding_digest,"
-            "source_fingerprint,harness_version,harness_evidence_format,"
-            "harness_support_state,native_option_id "
-            "FROM sprint_participant_route_bindings WHERE participant_id=10"
-        ).fetchone()
-        self.assertEqual(tuple(preserved)[:-1], before)
-        self.assertIsNone(preserved["native_option_id"])
-
-        self.con.execute("UPDATE sprints SET lifecycle='prepared' WHERE sprint_id=1")
-        live, digest = route_bindings.live_native_v3_binding(
-            "opencode",
-            "Ollama-Cloud/GLM-5.2",
-            "GLM-5.2",
-            "Reasoning-Max",
-        )
-        receipt = route_bindings.ParticipantRouteBindingStore(self.con).bind(
-            11, live, digest, transition="arm"
-        )
-        appended = self.con.execute(
-            "SELECT contract_version,native_option_id,source_fingerprint,"
-            "harness_version,harness_evidence_format,harness_support_state,"
-            "binding_json,binding_digest FROM sprint_participant_route_bindings "
-            "WHERE binding_id=?",
-            (receipt["binding_id"],),
-        ).fetchone()
-        self.assertEqual(
-            tuple(appended)[:6],
-            (3, "Reasoning-Max", None, None, "harness-live-v1", None),
-        )
-        self.assertEqual(json.loads(appended["binding_json"]), live)
-        self.assertEqual(appended["binding_digest"], digest)
-        self.assertEqual(
-            self.con.execute(
-                "SELECT COUNT(*) FROM sprint_participant_route_bindings"
-            ).fetchone()[0],
-            2,
-        )
-        with self.assertRaises(sqlite3.IntegrityError):
-            self.con.execute(
-                "UPDATE sprint_participant_route_bindings "
-                "SET native_option_id='changed' WHERE binding_id=?",
-                (receipt["binding_id"],),
-            )
-        self.assertEqual(
-            self.con.execute(
-                "SELECT native_option_id FROM sprint_participant_route_bindings "
-                "WHERE binding_id=?",
-                (receipt["binding_id"],),
-            ).fetchone()[0],
-            "Reasoning-Max",
-        )
-
-    def test_dirty_upgrade_preserves_legacy_semver_and_new_raw_rows_are_exact(self):
-        now = datetime.now(timezone.utc)
-        controlled, _ = resolve_controlled_v2(
-            BindingIdentityTest.controlled_row(last_seen_at=now.isoformat()),
-            "codex", "gpt-test", "high", now=now,
-            runtime_status=compatible_runtime("0.145.0", harness="codex"),
-        )
-        default, _ = route_bindings.resolve_v2(
-            None, "claude", None,
-            runtime_status=compatible_runtime("2.1.223", harness="claude"),
-        )
-        vibe, _ = route_bindings.resolve_v2(
-            None, "vibe", "devstral", None,
-            runtime_status=compatible_runtime("2.22.0", harness="vibe"),
-        )
-        captured = {
-            10: ("2" * 64, "0.147.0"),
-            11: (None, "2.1.223"),
-            12: (None, "2.22.0"),
-        }
-        for participant_id, binding in ((10, controlled), (11, default), (12, vibe)):
-            self._insert_legacy(participant_id, binding,
-                                source_fingerprint=captured[participant_id][0],
-                                harness_version=captured[participant_id][1])
-        before = [tuple(row) for row in self.con.execute(
-            "SELECT binding_json,binding_digest FROM sprint_participant_route_bindings "
-            "ORDER BY participant_id"
-        )]
-        for migration in (
-            "0217_harness_support_metadata.sql",
-            "0218_sprint_binding_support_provenance.sql",
-        ):
-            self.con.executescript((ROOT / ".super-coder" / "migrations" / migration).read_text())
-        upgraded = self.con.execute(
-            "SELECT participant_id,binding_json,binding_digest,harness_evidence_format "
-            "FROM sprint_participant_route_bindings ORDER BY participant_id"
-        ).fetchall()
-        self.assertEqual(before, [tuple(row)[1:3] for row in upgraded])
-        self.assertEqual(
-            [row["harness_evidence_format"] for row in upgraded],
-            ["legacy-semver", "legacy-semver", "legacy-semver"],
-        )
-
-        scope = harness_versions.runtime_scope()
-        codex = {**compatible_runtime("0.147.0", harness="codex", scope=scope),
-                 "observed_version": "codex-cli 0.147.0"}
-        claude = {**compatible_runtime("2.1.223", harness="claude", scope=scope),
-                  "observed_version": "2.1.223 (Claude Code)"}
-        vibe_status = {**compatible_runtime("2.22.0", harness="vibe", scope=scope),
-                       "observed_version": "vibe 2.22.0"}
-        with (
-            mock.patch.object(model_catalog, "controlled_route_evidence", return_value={
-                "runtime_status": codex, "runtime_scope": scope,
-                "source_fingerprint": "2" * 64,
-            }),
-            mock.patch.object(model_catalog, "harness_runtime_status", side_effect=lambda h: {
-                "claude": claude, "vibe": vibe_status,
-            }[h]),
-        ):
-            for row in upgraded:
-                participant_id = int(row["participant_id"])
-                route_bindings.verify_stored_v2_before_first_turn(
-                    self.con, json.loads(row["binding_json"]),
-                    source_fingerprint=captured[participant_id][0],
-                    harness_version=captured[participant_id][1],
-                    harness_evidence_format=row["harness_evidence_format"],
-                )
-            changed = {**codex, "version": "0.148.0",
-                       "observed_version": "codex-cli 0.148.0"}
-            with mock.patch.object(model_catalog, "controlled_route_evidence", return_value={
-                "runtime_status": changed, "runtime_scope": scope,
-                "source_fingerprint": "2" * 64,
-            }), self.assertRaises(route_bindings.RouteResolutionError) as raised:
-                route_bindings.verify_stored_v2_before_first_turn(
-                    self.con, controlled, source_fingerprint="2" * 64,
-                    harness_version="0.147.0",
-                    harness_evidence_format="legacy-semver",
-                )
-        self.assertEqual(raised.exception.code, "route_evidence_stale")
-
-        raw_binding = route_bindings._uncontrolled_binding("vibe", "devstral", None)
-        raw_runtime = {**compatible_runtime("2.22.0", harness="vibe", scope=scope),
-                       "version": None, "observed_version": "vibe dev-build",
-                       "compatibility": "non-semver"}
-        with mock.patch.object(model_catalog, "harness_runtime_status", return_value=raw_runtime):
-            route_bindings.verify_stored_v2_before_first_turn(
-                self.con, raw_binding, source_fingerprint=None,
-                harness_version="vibe dev-build",
-                harness_evidence_format="raw-observed-v1",
-            )
-        changed_raw_runtime = {**raw_runtime, "observed_version": "vibe dev-build-next"}
-        with mock.patch.object(
-            model_catalog, "harness_runtime_status", return_value=changed_raw_runtime
-        ):
-            with self.assertRaises(route_bindings.RouteResolutionError) as raised:
-                route_bindings.verify_stored_v2_before_first_turn(
-                    self.con, raw_binding, source_fingerprint=None,
-                    harness_version="vibe dev-build",
-                    harness_evidence_format="raw-observed-v1",
-                )
-        self.assertEqual(raised.exception.code, "route_evidence_stale")
-
-    def test_dirty_v6_catalogue_requires_refresh_before_republication(self):
-        legacy_generation = "a" * 32
-        now = datetime.now(timezone.utc).isoformat()
-        self.con.executescript(
-            "CREATE TABLE flavor_defaults ("
-            "flavor TEXT NOT NULL,harness TEXT NOT NULL,model TEXT,"
-            "effort TEXT,is_default INTEGER NOT NULL DEFAULT 0,"
-            "PRIMARY KEY (flavor,harness));"
-        )
-        self.con.execute(
-            "INSERT INTO model_catalog_generations ("
-            "generation_id,payload_version,contract_version,started_at,completed_at,"
-            "state,runtime,source_summary,harness_versions,source_fingerprints,"
-            "error_summary,payload_digest) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
-            (legacy_generation, 6, 2, now, now, "successful", "host", "[]", "{}",
-             "{}", None, "1" * 64),
-        )
-        self.con.execute(
-            "INSERT INTO model_routes ("
-            "harness,selector,source,availability,headless_supported,"
-            "high_effort_supported,default_effort,supported_efforts,cli_version,"
-            "last_seen_at,stale,generation_id) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
-            ("codex", "legacy-codex", "codex-cache", "available", 1, 1,
-             "high", "[\"high\"]", "codex-cli 0.147.0", now, 0,
-             legacy_generation),
-        )
-        self.con.execute(
-            "INSERT INTO flavor_defaults (flavor,harness,model,effort,is_default) "
-            "VALUES ('legacy','codex','legacy-codex',NULL,1)"
-        )
-        self.con.commit()
-
-        for migration in (
-            "0217_harness_support_metadata.sql",
-            "0218_sprint_binding_support_provenance.sql",
-            "0219_harness_support_refresh_boundary.sql",
-        ):
-            self.con.executescript(
-                (ROOT / ".super-coder" / "migrations" / migration).read_text()
-            )
-
-        legacy_route = self.con.execute(
-            "SELECT stale,last_error,harness_support_state FROM model_routes "
-            "WHERE harness='codex' AND selector='legacy-codex'"
-        ).fetchone()
-        self.assertEqual(
-            tuple(legacy_route),
-            (1, "Catalogue refresh required after harness support evidence migration", None),
-        )
-        self.assertIsNone(self.con.execute(
-            "SELECT 1 FROM model_catalog_generations"
-        ).fetchone())
-
-        status = {
-            **GenerationPersistenceTest.status(
-                version="0.147.0", compatibility="verified"
-            ),
-            "observed_version": "codex-cli 0.147.0",
-            "verified_version": "0.147.0",
-            "maximum_version_exclusive": "0.148.0",
-        }
-        ordinary = GenerationPersistenceTest.payload(
-            "ordinary-codex", cli_version=status["observed_version"], status=status
-        )
-        refreshed_payload = GenerationPersistenceTest.payload(
-            "refreshed-codex", cli_version=status["observed_version"], status=status
-        )
-        legacy_cache = {
-            "v": 6,
-            "fetched_at": now,
-            "sources": ["codex-cache"],
-            "catalogue_generation": legacy_generation,
-            "harnesses": {"codex": {"models": [{"id": "legacy-codex"}]}},
-        }
-        with tempfile.TemporaryDirectory() as tmp, \
-             mock.patch.object(model_catalog, "CACHE", Path(tmp) / "catalog.json"), \
-             mock.patch.object(
-                 model_catalog, "build", side_effect=[ordinary, refreshed_payload]
-             ) as build:
-            model_catalog.CACHE.write_text(json.dumps(legacy_cache))
-            required = model_catalog.catalog(
-                con=self.con, opencode_provider=lambda: []
-            )
-            defaults = api_server.get_flavor_defaults(self.con)["flavors"]["legacy"]
-            unresolved = routes_cli.resolve(self.con, "codex", "legacy-codex")
-            refreshed = model_catalog.catalog(
-                refresh=True, con=self.con, harness_probe=lambda: {"codex": status},
-                opencode_provider=lambda: [],
-            )
-            cached = json.loads(model_catalog.CACHE.read_text())
-
-        self.assertEqual(build.call_count, 2)
-        self.assertTrue(required["stale"])
-        self.assertEqual(
-            required["error"],
-            "Catalogue refresh required after runtime evidence rebuild",
-        )
-        self.assertEqual(defaults[0]["harness_support_state"], None)
-        self.assertEqual(defaults[0]["effective_effort"], None)
-        self.assertFalse(unresolved["ok"])
-        self.assertEqual(unresolved["code"], "thinking_evidence_stale")
-        self.assertFalse(refreshed["stale"])
-        self.assertEqual(
-            refreshed["harnesses"]["codex"]["models"][0]["harness_support_state"],
-            "tested",
-        )
-        self.assertEqual(cached["v"], 8)
-        current = self.con.execute(
-            "SELECT selector,stale,harness_version,harness_support_state FROM model_routes "
-            "WHERE harness='codex' ORDER BY selector"
-        ).fetchall()
-        self.assertEqual(
-            [tuple(row) for row in current],
-            [
-                ("legacy-codex", 1, None, None),
-                ("refreshed-codex", 0, "codex-cli 0.147.0", "tested"),
-            ],
-        )
 
 
 class GenerationPersistenceTest(unittest.TestCase):
@@ -3038,38 +2588,14 @@ class ParticipantRevisionTest(unittest.TestCase):
                 )
 
 
-    def test_new_deepseek_binding_is_rejected_without_store_write(self):
-        binding = {**self.binding, "harness": "deepseek"}
+    def test_unknown_binding_is_rejected_without_store_write(self):
+        binding = {**self.binding, "harness": "unsupported"}
         digest = route_bindings.digest_json(binding)
 
         with self.assertRaises(route_bindings.RouteResolutionError) as refused:
             self.store.bind(10, binding, digest, transition="arm")
 
         self.assertEqual(refused.exception.code, "thinking_evidence_missing")
-        self.assertEqual(
-            self.con.execute(
-                "SELECT COUNT(*) FROM sprint_participant_route_bindings"
-            ).fetchone()[0],
-            0,
-        )
-        self.assertIsNone(self.con.execute(
-            "SELECT active_route_binding_id FROM sprint_participants "
-            "WHERE participant_id=10"
-        ).fetchone()[0])
-
-
-    def test_removed_deepseek_harness_default_refuses_without_writing(self):
-        with self.assertRaises(route_bindings.RouteResolutionError) as refused:
-            route_bindings.resolve_v2(
-                None,
-                "deepseek",
-                None,
-                runtime_status=compatible_runtime(
-                    "0.1.0rc7", harness="deepseek"
-                ),
-            )
-
-        self.assertEqual(refused.exception.code, "unsupported_thinking_level")
         self.assertEqual(
             self.con.execute(
                 "SELECT COUNT(*) FROM sprint_participant_route_bindings"

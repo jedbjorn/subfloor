@@ -24,7 +24,6 @@ import subprocess
 from pathlib import Path
 
 import sc_wrapper
-import update_cutover
 
 ENGINE = Path(__file__).resolve().parents[1]
 REPO_ROOT = ENGINE.parent
@@ -122,44 +121,6 @@ def main() -> int:
             update.reconcile_skill_projections()
             SKILL_SWEEP_MARKER.parent.mkdir(parents=True, exist_ok=True)
             SKILL_SWEEP_MARKER.write_text(f"{current}\n")
-
-        if pending is None:
-            try:
-                removal = update_cutover.inspect_target(
-                    current, repo_root=REPO_ROOT
-                )
-                if removal is not None:
-                    update_cutover.require_compatibility_floor(
-                        removal,
-                        marker_path=(
-                            STATE_DIR
-                            / "local/dsh-removal/compatibility-floor.json"
-                        ),
-                    )
-                    if not update_cutover.installed_removal_ready(
-                        engine_ref_path=ENGINE_REF,
-                        manifest_path=(REPO_ROOT / update_cutover.TARGET_MANIFEST_PATH),
-                        cleanup_receipt_path=(
-                            STATE_DIR / "local/dsh-removal/cleanup-receipt.json"
-                        ),
-                    ):
-                        raise update_cutover.CutoverError(
-                            "DSH removal target is half-adopted; run "
-                            "./sc rollback --engine-only before ordinary launch"
-                        )
-                elif update_cutover.install_compatibility_marker(
-                    current,
-                    repo_root=REPO_ROOT,
-                    marker_path=(
-                        STATE_DIR / "local/dsh-removal/compatibility-floor.json"
-                    ),
-                ):
-                    print(
-                        "→ update compatibility: installed DSH removal "
-                        f"compatibility-floor marker at {current[:12]}"
-                    )
-            except update_cutover.CutoverError as exc:
-                raise SystemExit(f"update compatibility: {exc}") from exc
 
     needed, current = needs_legacy_bridge()
     if not needed:

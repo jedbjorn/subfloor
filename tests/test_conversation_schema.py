@@ -15,17 +15,12 @@ ROOT = Path(__file__).resolve().parents[1]
 ENGINE = ROOT / ".super-coder"
 SCHEMA = ENGINE / "schema.sql"
 MIGRATIONS = ENGINE / "migrations"
-HISTORICAL_MIGRATIONS = (
-    ROOT / "tests" / "fixtures" / "dsh_removal" / "historical_migrations"
-)
 FOUNDATION = MIGRATIONS / "0132_conversation_foundation.sql"
 GIT_TARGETS = MIGRATIONS / "0142_conversation_git_targets.sql"
 ACTIVE_REGISTRY = MIGRATIONS / "0162_active_chat_registry.sql"
 REAPER_IDENTITY = MIGRATIONS / "0163_conversation_run_process_identity.sql"
 TOPOLOGY_RETIREMENT = MIGRATIONS / "0168_retire_sprint_conversation_topology.sql"
-LIVE_NATIVE_ROUTES = (
-    HISTORICAL_MIGRATIONS / "0236_live_native_conversation_routes.sql"
-)
+LIVE_NATIVE_ROUTES = MIGRATIONS / "0238_final_schema_rebaseline.sql"
 
 sys.path.insert(0, str(ENGINE / "scripts"))
 import conversation_state  # noqa: E402
@@ -36,10 +31,7 @@ import snapshot  # noqa: E402
 
 def apply_schema(con: sqlite3.Connection, *, through: str | None = None) -> None:
     con.executescript(SCHEMA.read_text())
-    migrations = list(MIGRATIONS.glob("*.sql"))
-    if through is not None:
-        migrations.extend(HISTORICAL_MIGRATIONS.glob("*.sql"))
-    for migration in sorted(migrations, key=lambda path: path.name):
+    for migration in sorted(MIGRATIONS.glob("*.sql")):
         if through is not None and migration.name > through:
             break
         con.executescript(migration.read_text())
@@ -172,7 +164,7 @@ class ConversationDbCase(unittest.TestCase):
                 "(shell_id,owner_user_id,harness,model,worktree,"
                 "creation_idempotency_key,creation_request_hash,"
                 "route_contract_version,route_binding) "
-                "VALUES (3,1,'deepseek','ollama-cloud/glm-5.2','/tmp/v3-null',"
+                "VALUES (3,1,'opencode','ollama-cloud/glm-5.2','/tmp/v3-null',"
                 "'v3-null','hash-v3-null',3,NULL)"
             )
         self.assertEqual(
@@ -312,7 +304,7 @@ class MigrationAndShapeTest(ConversationDbCase):
         con = sqlite3.connect(":memory:")
         self.addCleanup(con.close)
         con.row_factory = sqlite3.Row
-        apply_schema(con, through="0235_live_native_route_binding_v3.sql")
+        apply_schema(con, through="0234_reseed_ci_fallback_authority.sql")
         con.execute("INSERT INTO users (user_id,username) VALUES (41,'migration')")
         con.execute(
             "INSERT INTO shells "

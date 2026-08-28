@@ -130,18 +130,6 @@ def test_spec_current_harness_versions_all_report_tested() -> None:
     }
 
 
-def test_removed_deepseek_is_absent_from_default_status_roster() -> None:
-    with mock.patch.object(
-        harness_versions, "probe", return_value="unused"
-    ) as probe:
-        result = harness_versions.compatibility_status()
-
-    assert "deepseek" not in harness_versions.HARNESSES
-    assert "deepseek" not in result
-    assert "dsh" not in harness_versions.PROBE_COMMANDS.values()
-    assert all(call.args != ("deepseek",) for call in probe.call_args_list)
-
-
 def test_current_core_prerelease_is_best_effort_not_tested() -> None:
     with mock.patch.object(
         harness_versions, "probe", return_value="codex-cli 0.147.0-dev"

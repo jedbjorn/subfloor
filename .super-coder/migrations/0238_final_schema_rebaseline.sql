@@ -1,11 +1,7 @@
--- Feature #60 / spec #178 / task #684 — final generic schema rebaseline.
---
--- The preceding destructive floor removed every retired route and owned record.
--- Rebuild the route-bearing tables so fresh and upgraded installations share
--- one retained-harness schema.  Existing retained rows copy byte-for-byte.
+-- Rebuild route-bearing tables into the current live-native schema.
+-- Existing rows copy byte-for-byte.
 
 -- migrate: foreign-keys-off
--- migrate: requires-rebaseline-floor
 PRAGMA foreign_keys=OFF;
 
 BEGIN;

@@ -160,18 +160,6 @@ class EnterPreAttachPrintTest(unittest.TestCase):
                 self.assertIn(target, log.read_text())
                 self.assertNotIn("interface", log.read_text().lower())
 
-    def test_launch_has_no_retired_harness_mount_port_or_browser_handoff(self):
-        source = (ROOT / ".super-coder" / "scripts" / "dispatch.sh").read_text()
-        for retired in (
-            ".dsh",
-            "deepseekhostport",
-            "deepseekrelayport",
-            "SC_DEEPSEEK_HOST_PORT",
-            "SC_BROWSER_HANDOFF_ID",
-        ):
-            with self.subTest(retired=retired):
-                self.assertNotIn(retired, source)
-
     def test_an_underivable_url_never_costs_the_operator_their_shell(self):
         """`sc` runs under `set -e`, so an unguarded print is a new way for
         `enter` — the main entry path — to abort before the harness.

@@ -759,7 +759,6 @@ class FlavorDefaultsTest(unittest.TestCase):
             got["default_harnesses"],
             ["claude", "codex", "kimi", "opencode", "vibe"],
         )
-        self.assertNotIn("deepseek", got["harness_status"])
 
     def test_historical_unknown_harness_is_not_projected(self) -> None:
         self.con.execute(
@@ -1031,22 +1030,22 @@ class FlavorDefaultsTest(unittest.TestCase):
         self.assertEqual(row["model"], "devstral-latest")
         self.assertEqual(row["is_default"], 1)
 
-    def test_removed_deepseek_harness_default_is_rejected(self) -> None:
-        self.assertIsNone(self._row("planner", "deepseek"))
+    def test_unknown_harness_default_is_rejected(self) -> None:
+        self.assertIsNone(self._row("planner", "unsupported"))
 
         ok, err = server.set_flavor_default(
             self.con,
-            {"flavor": "planner", "harness": "deepseek", "model": None,
+            {"flavor": "planner", "harness": "unsupported", "model": None,
              "is_default": True},
         )
 
         self.assertFalse(ok)
         self.assertEqual(err, {
             "code": "validation_error",
-            "message": "unknown harness 'deepseek'",
+            "message": "unknown harness 'unsupported'",
             "details": {},
         })
-        self.assertIsNone(self._row("planner", "deepseek"))
+        self.assertIsNone(self._row("planner", "unsupported"))
 
     def test_noninteractive_harness_is_configurable_but_not_starrable(self) -> None:
         with mock.patch.object(

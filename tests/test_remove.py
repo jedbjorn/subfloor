@@ -351,7 +351,7 @@ class RuntimeQuiescenceTest(unittest.TestCase):
             root = Path(raw)
             repo = root / "repo"
             repo.mkdir()
-            external = root / "home" / ".dsh" / "sessions" / "keep.json"
+            external = root / "home" / ".user-state" / "sessions" / "keep.json"
             external.parent.mkdir(parents=True)
             external.write_bytes(b'{"owned":"user"}\n')
             results = [

@@ -141,8 +141,8 @@ const rows = sprintParticipantRoutes([
     binding_digest: "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
   },
   {
-    role: "reviewer", shortname: "REV2", harness: "deepseek",
-    model: "ollama-cloud/gemma4:31b",
+    role: "reviewer", shortname: "REV2", harness: "kimi",
+    model: "kimi-k2.6",
     binding_status: "unbound-intent", control_state: null, effective_effort: null,
     intent_control_state: "controlled", intent_effective_effort: "MAX.Future",
     route_revision: null, binding_digest: null,
@@ -156,7 +156,7 @@ console.log(JSON.stringify(rows.children.map((row) => row.textContent)));
         "developer DEV3vibe · vibe-modelThinking control unavailable · route r1 · bbbbbbbbbbbb… · Support: best-effort (vibe dev-build)",
         "developer DEV4codex · Harness defaultThinking control unavailable · unbound intent",
         "developer DEV5opencode · ollama-cloud/glm-5.2Thinking level: Harness default · route r3 · cccccccccccc…",
-        "reviewer REV2deepseek · ollama-cloud/gemma4:31bThinking level: MAX.Future · unbound intent",
+        "reviewer REV2kimi · kimi-k2.6Thinking level: MAX.Future · unbound intent",
     ]
 
 
