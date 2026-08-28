@@ -349,6 +349,7 @@
     "tests/test_live_model.py",
     "tests/test_lns_curation.py",
     "tests/test_mem.py",
+    "tests/test_opencode_deepseek_preservation.py",
     "tests/test_operator_surface.py",
     "tests/test_pr_poller.py",
     "tests/test_quota_accounts_ui.py",
