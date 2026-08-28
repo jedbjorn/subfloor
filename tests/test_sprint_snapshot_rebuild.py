@@ -107,6 +107,16 @@ def seed_prepared(
             "VALUES (?,?,?,?)",
             (sprint_id, document_id, revision, approval_id),
         )
+    if snapshot.table_exists(con, "sprint_spec_revision_history"):
+        con.execute(
+            "INSERT INTO sprint_spec_revision_history "
+            "(sprint_id,document_id,generation,bound_revision_sha256,"
+            "bound_revision_body,bound_revision_legacy,approval_id,actor_kind,reason) "
+            "SELECT sprint_id,document_id,1,bound_revision_sha256,"
+            "bound_revision_body,bound_revision_legacy,approval_id,'system',"
+            "'snapshot fixture' FROM sprint_specs WHERE sprint_id=?",
+            (sprint_id,),
+        )
     con.executemany(
         "INSERT INTO sprint_participants "
         "(participant_id,sprint_id,shell_id,role,harness,model,effort,route) "

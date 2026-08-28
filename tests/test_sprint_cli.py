@@ -70,6 +70,52 @@ class SprintCliDispatcherTest(unittest.TestCase):
         self.assertEqual(0, completed.returncode, completed.stderr)
         self.assertIn("cleanup-status", completed.stdout)
         self.assertIn("cleanup", completed.stdout)
+        self.assertIn("rebind-spec", completed.stdout)
+
+    def test_rebind_spec_posts_expected_revision_and_reason_idempotently(self):
+        output = io.StringIO()
+        response = {
+            "sprint_id": 29,
+            "document_id": 178,
+            "old_revision_sha256": "a" * 64,
+            "new_revision_sha256": "b" * 64,
+            "revision_id": 2,
+            "generation": 2,
+            "changed": True,
+        }
+        with (
+            mock.patch.object(mem, "_api", return_value=response) as api,
+            contextlib.redirect_stdout(output),
+        ):
+            self.assertEqual(
+                0,
+                sprint_cli.main(
+                    [
+                        "rebind-spec",
+                        "--sprint",
+                        "29",
+                        "--document",
+                        "178",
+                        "--expected-revision",
+                        "a" * 64,
+                        "--reason",
+                        "Reviewer decision 1667",
+                    ]
+                ),
+            )
+
+        api.assert_called_once_with(
+            "POST",
+            "/_sc/sprint/rebind-spec",
+            {
+                "sprint_id": 29,
+                "document_id": 178,
+                "expected_revision_sha256": "a" * 64,
+                "reason": "Reviewer decision 1667",
+            },
+            idempotent=True,
+        )
+        self.assertEqual(response, json.loads(output.getvalue()))
 
     def test_cleanup_commands_use_bounded_get_and_idempotent_post(self):
         output = io.StringIO()
@@ -1101,6 +1147,113 @@ class SprintCliApiTest(unittest.TestCase):
             )
             self.assertEqual([document_id], payload["spec_document_ids"])
             self.assertNotIn("spec_approval_ids", payload)
+        finally:
+            con.close()
+
+    def test_paused_spec_rebind_is_end_to_end_and_preserves_history(self):
+        self.use_isolated_db()
+        con = sqlite3.connect(self.db)
+        try:
+            feature_id = int(
+                con.execute(
+                    "INSERT INTO roadmap (title,roadmap_status) "
+                    "VALUES ('Rebind declaration','in_progress')"
+                ).lastrowid
+            )
+            original = "original governing body"
+            document_id = int(
+                con.execute(
+                    "INSERT INTO documents (feature_id,kind,seq,title,body) "
+                    "VALUES (?,'spec',1,'Rebind spec',?)",
+                    (feature_id, original),
+                ).lastrowid
+            )
+            con.commit()
+        finally:
+            con.close()
+
+        sprint_id = self.run_cli(
+            TOKENS["planner"],
+            "declare",
+            "--feature",
+            str(feature_id),
+            "--spec",
+            str(document_id),
+            "--participants-file",
+            self.participants_file(),
+            "--merge-grant",
+        )["sprint_id"]
+        replacement = "reviewer-approved governing body"
+        old_revision = hashlib.sha256(original.encode()).hexdigest()
+        new_revision = hashlib.sha256(replacement.encode()).hexdigest()
+        con = sqlite3.connect(self.db)
+        try:
+            con.execute(
+                "UPDATE sprints SET lifecycle='armed',armed_at=datetime('now'),"
+                "conformance_reviewer_shell_id=2,"
+                "conformance_owner_generation=1 "
+                "WHERE sprint_id=?",
+                (sprint_id,),
+            )
+            con.execute(
+                "UPDATE sprints SET lifecycle='paused',paused_at=datetime('now') "
+                "WHERE sprint_id=?",
+                (sprint_id,),
+            )
+            con.execute(
+                "UPDATE documents SET body=? WHERE document_id=?",
+                (replacement, document_id),
+            )
+            con.commit()
+        finally:
+            con.close()
+
+        argv = (
+            "rebind-spec",
+            "--sprint",
+            str(sprint_id),
+            "--document",
+            str(document_id),
+            "--expected-revision",
+            old_revision,
+            "--reason",
+            "Reviewer decision message 77",
+        )
+        receipt = self.run_cli(TOKENS["planner"], *argv)
+        self.assertEqual(old_revision, receipt["old_revision_sha256"])
+        self.assertEqual(new_revision, receipt["new_revision_sha256"])
+        self.assertTrue(receipt["changed"])
+        retry = self.run_cli(TOKENS["planner"], *argv)
+        self.assertFalse(retry["changed"])
+        self.assertEqual(receipt["revision_id"], retry["revision_id"])
+
+        con = sqlite3.connect(self.db)
+        try:
+            self.assertEqual(
+                (new_revision, replacement, None),
+                con.execute(
+                    "SELECT bound_revision_sha256,bound_revision_body,approval_id "
+                    "FROM sprint_specs WHERE sprint_id=? AND document_id=?",
+                    (sprint_id, document_id),
+                ).fetchone(),
+            )
+            self.assertEqual(
+                [(1, old_revision), (2, new_revision)],
+                con.execute(
+                    "SELECT generation,bound_revision_sha256 "
+                    "FROM sprint_spec_revision_history WHERE sprint_id=? "
+                    "ORDER BY generation",
+                    (sprint_id,),
+                ).fetchall(),
+            )
+            self.assertEqual(
+                1,
+                con.execute(
+                    "SELECT COUNT(*) FROM sprint_events "
+                    "WHERE sprint_id=? AND event_type='spec.rebound'",
+                    (sprint_id,),
+                ).fetchone()[0],
+            )
         finally:
             con.close()
 

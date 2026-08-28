@@ -135,7 +135,9 @@
     ".super-coder/migrations/0233_reseed_sprint_aware_pr_notifications.sql",
     ".super-coder/migrations/0234_reseed_ci_fallback_authority.sql",
     ".super-coder/migrations/0238_final_schema_rebaseline.sql",
-    "docs/deepseek-harness-removal.md"
+    "docs/deepseek-harness-removal.md",
+    ".super-coder/migrations/0239_sprint_spec_rebinding.sql",
+    ".super-coder/migrations/0240_reseed_sprint_spec_rebinding.sql"
   ],
   "baseline_migration_ledger": {
     "count": 142,
