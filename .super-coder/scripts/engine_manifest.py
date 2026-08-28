@@ -70,7 +70,6 @@ ENGINE_PATHS = [
     ".super-coder/api",
     ".super-coder/ui",
     ".super-coder/assets/github_known_hosts",
-    ".super-coder/assets/deepseek",
     ".super-coder/assets/dsh-removal",
     ".super-coder/assets/skill_tombstones.json",
     ".super-coder/assets/skills",

@@ -65,7 +65,6 @@ class GlobalPortNamespaceTest(unittest.TestCase):
             "repo": "sibling",
             "port": 8800,
             "dev_port": 8801,
-            "deepseek_host_port": 8900,
         }))
 
         with (
@@ -76,23 +75,21 @@ class GlobalPortNamespaceTest(unittest.TestCase):
         ):
             resolved = ports.resolve()
 
-        self.assertEqual(
-            len({resolved["port"], resolved["dev_port"], resolved["deepseek_host_port"]}),
-            3,
+        self.assertEqual(len({resolved["port"], resolved["dev_port"]}), 2)
+        self.assertTrue(
+            {resolved["port"], resolved["dev_port"]}.isdisjoint({8800, 8801})
         )
-        self.assertTrue({resolved["port"], resolved["dev_port"], resolved["deepseek_host_port"]}.isdisjoint(
-            {8800, 8801, 8900}
-        ))
 
-    def test_existing_config_backfills_a_stable_deepseek_host_port(self) -> None:
+    def test_existing_config_drops_retired_runtime_port(self) -> None:
         resolved = self.resolve({
             "repo": "ami",
             "port": 8821,
             "dev_port": 8844,
+            "deepseek_host_port": 8942,
             "harness": "codex",
         })
 
-        self.assertTrue(8900 <= resolved["deepseek_host_port"] <= 8999)
+        self.assertNotIn("deepseek_host_port", resolved)
         self.assertEqual(json.loads(self.current_config.read_text()), resolved)
 
     def test_exhausted_global_namespace_fails_instead_of_colliding(self) -> None:

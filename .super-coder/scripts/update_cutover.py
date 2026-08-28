@@ -333,24 +333,6 @@ def capture_generated_ownership(
     return captured
 
 
-def quiesce_dsh() -> tuple[dict[str, Any], dict[str, Any]]:
-    """Close admission and stop only identities verified by the DSH owner."""
-    import deepseek_web
-
-    state_path = ENGINE / "run/deepseek-web.json"
-    before = _read_runtime_state(state_path)
-    try:
-        with deepseek_web._service_lock():
-            outcome = deepseek_web._stop_unlocked()
-    except deepseek_web.DeepSeekWebError as exc:
-        raise CutoverError(f"DSH quiescence refused: {exc.code}: {exc.detail}") from exc
-    for field in ("service_port", "relay_port"):
-        port = before.get(field)
-        if isinstance(port, int) and deepseek_web._tcp_ready("127.0.0.1", port):
-            raise CutoverError(f"DSH quiescence left owned port {port} reachable")
-    return before, dict(outcome)
-
-
 def prepare_cutover(
     plan: CutoverPlan,
     *,
@@ -358,7 +340,7 @@ def prepare_cutover(
     backup: Callable[[], Path | None],
     stop_review: Callable[[], tuple[str, str] | None],
     start_review: Callable[[tuple[str, str] | None], None] | None = None,
-    quiesce: Callable[[], tuple[dict[str, Any], dict[str, Any]]] = quiesce_dsh,
+    quiesce: Callable[[], tuple[dict[str, Any], dict[str, Any]]] | None = None,
     receipt_path: Path | None = None,
     marker_path: Path | None = None,
     repo_root: Path = REPO_ROOT,
@@ -374,6 +356,10 @@ def prepare_cutover(
         raise CutoverError(
             f"installed engine ref {current_ref or '<missing>'} is not required "
             f"compatibility floor {plan.compatibility_ref}"
+        )
+    if quiesce is None:
+        raise CutoverError(
+            "runtime quiescence is available only on the compatibility floor"
         )
     backup_path = backup()
     if backup_path is None:

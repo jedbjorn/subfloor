@@ -39,7 +39,6 @@ sys.path.insert(0, str(ROOT / ".super-coder" / "scripts"))
 import model_catalog as mc  # noqa: E402
 import models as routes_cli  # noqa: E402
 import route_bindings  # noqa: E402
-import deepseek_runtime  # noqa: E402
 
 MODELS_DEV = {
     "anthropic": {"models": {
@@ -79,91 +78,6 @@ def ids(harness_block):
     return [e["id"] for e in harness_block["models"]]
 
 
-class CatalogueHost:
-    def __init__(self, models):
-        self.models = models
-        self.calls = []
-
-    def call(self, method, payload):
-        self.calls.append((method, payload))
-        return {
-            "host.describe": {"version": "0.0.1"},
-            "llm.providers": {"providers": [{
-                "provider": "ollama-cloud",
-                "active": True,
-                "settingsNs": "llm",
-                "settingsPath": ["providers", "ollama-cloud"],
-            }]},
-            "llm.models": {"groups": [{
-                "id": "ollama-cloud",
-                "models": self.models,
-            }]},
-            "settings.describe": {"namespaces": [{
-                "ns": "llm",
-                "value": {"providers": {"ollama-cloud": {
-                    "baseURL": "https://ollama.com/v1",
-                }}},
-            }]},
-        }[method]
-
-
-def deepseek_wire_proof(provider, model, options_by_effort, env=None):
-    del env
-    manifest = deepseek_runtime.load_runtime_manifest()
-    registry = deepseek_runtime.load_provider_adapter_registry(
-        expected_sha256=manifest["provider_adapters"]["sha256"]
-    )
-    adapter = registry["providers"][provider]
-    adapter_digest = route_bindings.digest_json(adapter)
-    proofs = {}
-    for effort, options in options_by_effort.items():
-        wire = {}
-        if effort != "default":
-            if adapter["wire_mode"] == "deepseek-request-patch":
-                wire["thinking"] = {"type": "enabled"}
-            wire["reasoning_effort"] = effort
-        native_request = {
-            "event_type": "provider.request",
-            "provider": provider,
-            "model": model,
-            "reasoning_effort": None if effort == "default" else effort,
-            "purpose": "conversation",
-        }
-        evidence = {
-            "contract": deepseek_runtime.PROVIDER_WIRE_CONTRACT,
-            "provider": provider,
-            "model": model,
-            "effort": effort,
-            "provider_options": dict(options),
-            "wire_options": wire,
-            "native_request": native_request,
-            "purpose_proofs": {
-                purpose: {
-                    "wire_options": wire,
-                    "native_request": {**native_request, "purpose": purpose},
-                }
-                for purpose in deepseek_runtime.PROVIDER_WIRE_PURPOSES
-            },
-            "runtime_version": "0.1.0rc7",
-            "source_commit": "bb4ca698d63714e753f5621b07400e6ebb0b5d97",
-            "patch_sha256": manifest["patch"]["sha256"],
-            "composition_sha256": adapter["composition_sha256"],
-            "provider_registry_sha256": manifest["provider_adapters"]["sha256"],
-            "provider_adapter_id": adapter["adapter_id"],
-            "provider_adapter_digest": adapter_digest,
-        }
-        proofs[effort] = {
-            **evidence,
-            "digest": route_bindings.digest_json(evidence),
-        }
-    return {
-        "contract": deepseek_runtime.PROVIDER_WIRE_CONTRACT,
-        "provider": provider,
-        "model": model,
-        "proofs": proofs,
-    }
-
-
 _AUTO_COMPATIBILITY = object()
 
 
@@ -176,7 +90,6 @@ def runtime_status(version="2.22.0", compatibility=_AUTO_COMPATIBILITY,
     ranges = {
         "claude": ("2.1.220", "2.2.0", "2.1.222"),
         "codex": ("0.145.0", "0.147.0", "0.145.0"),
-        "deepseek": (None, None, "0.1.0rc7"),
         "kimi": ("0.30.0", "0.34.0", "0.33.0"),
         "opencode": ("1.18.9", "1.19.0", "1.18.9"),
         "vibe": ("2.22.0", "2.23.0", "2.22.0"),
@@ -486,18 +399,6 @@ class BuildTest(NoCLI):
 
         self.assertEqual(got, expected)
         probe.assert_called_once_with(("vibe",))
-
-    def test_removed_deepseek_runtime_status_refuses_without_cli_probe(self):
-        with mock.patch.object(
-            mc.harness_versions, "compatibility_status",
-            side_effect=AssertionError("removed harness must not be probed"),
-        ) as probe:
-            got = mc.harness_runtime_status("deepseek")
-
-        self.assertEqual(got["harness"], "deepseek")
-        self.assertEqual(got["error"], "HARNESS_UNSUPPORTED")
-        self.assertIsNone(got["version"])
-        probe.assert_not_called()
 
     def test_harness_mapping_and_prefixing(self):
         got = mc.build(fetch=fetch_ok, env={}, run=None)

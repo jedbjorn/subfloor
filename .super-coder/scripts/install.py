@@ -9,10 +9,9 @@ from "engine present" to "a team you can launch":
                  is already installed (both would destroy content). --force skips.
     2. Require — python3 + sqlite3 (+ a heads-up if git/curl missing, and a
                  docker preflight for the sandbox run path — advisory, not fatal).
-    3. Harness — ensure the managed harness CLIs are installed; DeepSeek uses
-                 its exact official npm distribution, while the others use
-                 their official native installers. Pick the terminal launch
-                 default → instance.json.
+    3. Harness — ensure the managed harness CLIs are installed through their
+                 official native installers. Pick the terminal launch default
+                 → instance.json.
     4. Strip   — super-coder's own per-instance content; a fork inherits the
                  SYSTEM (schema + skill catalogue + render chain), never the memory.
     5. Build   — the system DB (schema + migrations; no per-instance content yet).
@@ -333,22 +332,15 @@ def detect_harness() -> str | None:
 
 # Official distributions. Claude Code dropped npm as the primary path
 # (https://code.claude.com/docs/en/setup); opencode + codex + vibe + kimi ship
-# their own native scripts. DeepSeek's official distribution is npm-only and is
-# exact-pinned to the stock Host seam proven by Feature 60's feasibility gate.
+# their own native scripts.
 # Every install remains best-effort: one unavailable vendor tool must not block
 # installation of the rest of Subfloor.
-DEEPSEEK_DISTRIBUTION = "@deepseek-ai/dsh"
-DEEPSEEK_VERSION = "0.1.1-rc.2"
 HARNESS_INSTALL = {
     "claude":   "curl -fsSL https://claude.ai/install.sh | bash",
     "opencode": "curl -fsSL https://opencode.ai/install | bash",
     "codex":    "curl -fsSL https://chatgpt.com/codex/install.sh | sh",
     "vibe":     "curl -LsSf https://mistral.ai/vibe/install.sh | bash",
     "kimi":     "curl -fsSL https://code.kimi.com/kimi-code/install.sh | bash",
-    "deepseek": (
-        f'npm install --global --prefix "$HOME/.local" '
-        f'"{DEEPSEEK_DISTRIBUTION}@{DEEPSEEK_VERSION}"'
-    ),
 }
 # Where each installer drops its binary. Checked post-install because the new
 # bin dir is NOT on this process's PATH — the installer edits shell rc files,
@@ -362,16 +354,10 @@ HARNESS_BIN = {
     "codex":    Path.home() / ".local" / "bin" / "codex",
     "vibe":     Path.home() / ".local" / "bin" / "vibe",
     "kimi":     Path.home() / ".kimi-code" / "bin" / "kimi",
-    "deepseek": Path.home() / ".local" / "bin" / "dsh",
 }
 
-HARNESS_COMMAND = {"deepseek": "dsh"}
-HARNESS_INSTALL_TOOL = {"deepseek": "npm"}
-
-
 def _harness_installed(name: str) -> bool:
-    command = HARNESS_COMMAND.get(name, name)
-    return bool(shutil.which(command)) or HARNESS_BIN.get(
+    return bool(shutil.which(name)) or HARNESS_BIN.get(
         name, Path("/nonexistent")
     ).exists()
 
@@ -507,12 +493,11 @@ def update_harnesses() -> dict[str, str]:
     """Refresh all harness CLIs through their managed distributions.
 
     Unlike :func:`ensure_harnesses`, this never skips an installed harness.
-    Native installers self-update; DeepSeek converges to the exact selected
-    stock version.
+    Native installers self-update through their vendor-owned channels.
     """
     status: dict[str, str] = {}
     for name, cmd in HARNESS_INSTALL.items():
-        tool = HARNESS_INSTALL_TOOL.get(name, "curl")
+        tool = "curl"
         if not shutil.which(tool):
             print(f"  ⚠ {name:9} {tool} unavailable — update by hand: {cmd}")
             status[name] = f"no-{tool}"
@@ -531,9 +516,9 @@ def update_harnesses() -> dict[str, str]:
 def ensure_harnesses() -> dict[str, str]:
     """Install every missing managed harness from its official distribution.
 
-    DeepSeek is exact-pinned; the native installers resolve their own current
-    release. A failed install warns and continues because any one harness can
-    be repaired independently. Returns ``{name: status}``.
+    Native installers resolve their own current release. A failed install warns
+    and continues because any one harness can be repaired independently.
+    Returns ``{name: status}``.
     """
     status: dict[str, str] = {}
     for name, cmd in HARNESS_INSTALL.items():
@@ -541,7 +526,7 @@ def ensure_harnesses() -> dict[str, str]:
             print(f"  ✓ {name:9} already installed")
             status[name] = "present"
             continue
-        tool = HARNESS_INSTALL_TOOL.get(name, "curl")
+        tool = "curl"
         if not shutil.which(tool):
             print(
                 f"  ⚠ {name:9} missing, and {tool} is unavailable — "
@@ -942,14 +927,14 @@ def main(argv: list[str]) -> int:
 
     # Standalone: refresh every harness through its managed distribution.
     if "--update-harnesses" in argv:
-        step("Updating managed harness CLIs (including pinned official DeepSeek)")
+        step("Updating managed harness CLIs")
         update_harnesses()
         return 0
 
     # Standalone: just ensure the harness CLIs and exit (for an already-installed
     # fork). Runs before the guards so it works anywhere.
     if "--ensure-harness" in argv:
-        step("Ensuring managed harness CLIs (including pinned official DeepSeek)")
+        step("Ensuring managed harness CLIs")
         ensure_harnesses()
         return 0
 
@@ -992,19 +977,16 @@ def main(argv: list[str]) -> int:
         print("  ⚠ git not on PATH — needed for the commit→PR flow later.")
     if not shutil.which("curl"):
         print("  ⚠ curl not on PATH — needed to auto-install a missing harness.")
-    if not shutil.which("npm"):
-        print("  ⚠ npm not on PATH — needed to install official DeepSeek Harness.")
     # Docker is the default run path (the sandbox); guide if it's missing or
     # under-configured. Never fatal — `./sc serve`+`boot` run without it.
     report_docker()
 
     # 3. Ensure harness CLIs --------------------------------------------------
-    # Install every managed harness if missing. DeepSeek uses its pinned official
-    # npm distribution; the terminal harnesses use their native installers. The
-    # picker only offers surfaces each manifest has proved.
+    # Install every managed harness if missing. The picker only offers surfaces
+    # each manifest has proved.
     # instance.json's harness is the launch default; the picker overrides it
     # per-launch.
-    step("Ensuring managed harness CLIs (including pinned official DeepSeek)")
+    step("Ensuring managed harness CLIs")
     if skip_harness:
         print("  --skip-harness-install set — detecting only, not installing")
         for n in HARNESS_INSTALL:

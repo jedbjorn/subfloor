@@ -119,7 +119,10 @@ def _nonblank(value: str | None, field: str, *, maximum: int) -> str:
 
 
 def _browser_adapter(harness: str) -> dict:
-    adapter = run_mod.load_adapter(harness)
+    try:
+        adapter = run_mod.load_adapter(harness)
+    except ValueError as exc:
+        raise SprintConversationError(str(exc)) from exc
     if not adapter.get("conversation"):
         raise SprintConversationError(
             f"harness '{harness}' has no browser conversation adapter"

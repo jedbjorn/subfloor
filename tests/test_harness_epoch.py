@@ -184,20 +184,15 @@ class HarnessEpochDockerfile(unittest.TestCase):
             "durable Codex state stays mounted; isolate its executable",
         )
 
-    def test_deepseek_uses_the_selected_stock_distribution_and_profile_mount(self):
+    def test_image_and_launcher_have_no_retired_distribution_or_profile_mount(self):
         folded = self.folded()
         dispatch = (ROOT / ".super-coder" / "scripts" / "dispatch.sh").read_text()
 
-        self.assertIn(
-            'npm install --global --prefix "$HOME/.local" '
-            '"@deepseek-ai/dsh@0.1.1-rc.2"',
-            folded,
-        )
-        self.assertNotIn("--install-container-carrier", folded)
-        self.assertIn('-v "$HOME/.dsh:$HOME/.dsh"', dispatch)
+        self.assertNotIn("@deepseek-ai/dsh", folded)
+        self.assertNotIn("$HOME/.dsh", dispatch)
 
 
-class OfficialDeepSeekInstall(unittest.TestCase):
+class RetainedHarnessInstall(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
         sys.path.insert(0, str(ENGINE / "scripts"))
@@ -205,42 +200,26 @@ class OfficialDeepSeekInstall(unittest.TestCase):
 
         cls.install = install_mod
 
-    def test_logical_harness_maps_to_official_dsh_binary_and_exact_pin(self):
-        self.assertEqual(self.install.HARNESS_COMMAND["deepseek"], "dsh")
-        self.assertEqual(
-            self.install.HARNESS_BIN["deepseek"],
-            Path.home() / ".local" / "bin" / "dsh",
-        )
-        self.assertEqual(
-            self.install.HARNESS_INSTALL["deepseek"],
-            'npm install --global --prefix "$HOME/.local" '
-            '"@deepseek-ai/dsh@0.1.1-rc.2"',
-        )
+    def test_only_retained_harnesses_have_installers_and_binaries(self):
+        retained = {"claude", "codex", "kimi", "opencode", "vibe"}
 
-    def test_missing_npm_blocks_only_deepseek_install(self):
+        self.assertEqual(set(self.install.HARNESS_INSTALL), retained)
+        self.assertEqual(set(self.install.HARNESS_BIN), retained)
+
+    def test_missing_curl_blocks_each_retained_install_independently(self):
         def available(command: str):
-            return None if command in {"npm", "dsh"} else f"/bin/{command}"
+            unavailable = {"curl", *self.install.HARNESS_INSTALL}
+            return None if command in unavailable else f"/bin/{command}"
 
-        with (
-            mock.patch.object(self.install.shutil, "which", side_effect=available),
-            mock.patch.dict(
-                self.install.HARNESS_BIN,
-                {"deepseek": Path("/definitely/missing/dsh")},
-            ),
-        ):
+        with mock.patch.object(self.install.shutil, "which", side_effect=available), \
+                mock.patch.dict(
+                    self.install.HARNESS_BIN,
+                    {name: Path(f"/definitely/missing/{name}") for name in self.install.HARNESS_BIN},
+                    clear=True,
+                ):
             status = self.install.ensure_harnesses()
 
-        self.assertEqual(status["deepseek"], "no-npm")
-        self.assertEqual(
-            {name: state for name, state in status.items() if name != "deepseek"},
-            {
-                "claude": "present",
-                "opencode": "present",
-                "codex": "present",
-                "vibe": "present",
-                "kimi": "present",
-            },
-        )
+        self.assertEqual(status, {name: "no-curl" for name in self.install.HARNESS_INSTALL})
 
 
 class ScFixture:

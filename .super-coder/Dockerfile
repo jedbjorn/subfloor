@@ -203,9 +203,7 @@ ENV HOME=/home/${SC_USER}
 # run.py's ensure_harness_path() agree (it derives the same dirs from Path.home).
 ENV PATH=/home/${SC_USER}/.local/bin:/home/${SC_USER}/.opencode/bin:${PATH}
 
-# Harness CLIs — official distributions (mirrors install.py). DeepSeek is the
-# exact stock release selected by the Feature 60 Host-seam gate; it deliberately
-# does not ride the latest-resolving native-installer policy of the other CLIs.
+# Harness CLIs — official distributions (mirrors install.py).
 # Codex drops a launcher in ~/.local/bin whose standalone target is under
 # ~/.codex/packages. Runtime mounts the host's whole ~/.codex so auth, sessions,
 # goals, plugins, and other durable state survive; without relocation that mount
@@ -230,9 +228,7 @@ RUN echo "harness epoch: ${SC_HARNESS_EPOCH}" \
  && install -m 0755 "$codex_code_mode_host" "$HOME/.local/libexec/codex-code-mode-host" \
  && ln -sfn "$HOME/.local/libexec/codex" "$HOME/.local/bin/codex" \
  && "$HOME/.local/bin/codex" --version \
- && curl -LsSf https://mistral.ai/vibe/install.sh | bash \
- && npm install --global --prefix "$HOME/.local" "@deepseek-ai/dsh@0.1.1-rc.2" \
- && "$HOME/.local/bin/dsh" --version
+ && curl -LsSf https://mistral.ai/vibe/install.sh | bash
 
 # Stamp the epoch the harness layers were built with, so an image can be asked
 # what it is rather than guessed at: `./sc harness-status` reads this label and

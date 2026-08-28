@@ -16,9 +16,8 @@ if [ -n "${SC_CALLER_ROOT:-}" ] && [ -d "${SC_CALLER_ROOT:-}" ]; then
 else
   here="$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)"
 fi
-# SC_CALLER_ROOT is a one-hop bootstrap projection. Keeping it in the handler
-# environment would turn a verified DSH dispatch fact back into an ambient
-# pre-guard selector on nested `sc` calls.
+# SC_CALLER_ROOT is a one-hop bootstrap projection and is not part of nested
+# command execution.
 unset SC_CALLER_ROOT
 cd "$here"
 
@@ -167,78 +166,6 @@ sc_refuse_linked() {
 
 port() { "$PY" "$S/ports.py" port; }
 devport() { "$PY" "$S/ports.py" devport; }
-deepseekhostport() { "$PY" "$S/ports.py" deepseekhostport; }
-deepseekrelayport() { "$PY" "$S/ports.py" deepseekrelayport; }
-
-sc_open_browser() {
-  sc_browser_url="$1"
-  if command -v xdg-open >/dev/null 2>&1; then
-    if xdg-open "$sc_browser_url" >/dev/null 2>&1; then
-      echo "→ opened DeepSeek Web in the host browser"
-      return 0
-    fi
-  fi
-  if command -v open >/dev/null 2>&1; then
-    if open "$sc_browser_url" >/dev/null 2>&1; then
-      echo "→ opened DeepSeek Web in the host browser"
-      return 0
-    fi
-  fi
-  echo "→ no host browser opener found; DeepSeek Web handoff was not opened"
-  return 1
-}
-
-sc_deepseek_browser_handoff() {
-  # Read the relay generation only into a 0600 handoff file. The opener gets
-  # a nonce-only loopback URL; the helper consumes the capability before its
-  # redirect reaches the upstream DSH UI.
-  sc_deepseek_generation="$(docker exec -i "$CNAME" python3 .super-coder/scripts/deepseek_web.py generation)" || return 1
-  [ "${#sc_deepseek_generation}" -eq 64 ] || return 1
-  [ -z "$(printf '%s' "$sc_deepseek_generation" | tr -d '0-9a-f')" ] || return 1
-  sc_handoff_dir="$ROOT/.sc-state/local/run"
-  sc_capability_path="$sc_handoff_dir/deepseek-browser-capability-$$"
-  sc_ready_path="$sc_handoff_dir/deepseek-browser-ready-$$"
-  umask 077
-  mkdir -p "$sc_handoff_dir" || return 1
-  rm -f "$sc_capability_path" "$sc_ready_path"
-  printf 'http://127.0.0.1:%s/?sc_generation=%s\n' "$(deepseekhostport)" "$sc_deepseek_generation" > "$sc_capability_path" || return 1
-  "$PY" "$(dirname "$0")/browser_handoff.py" --capability-file "$sc_capability_path" --ready-file "$sc_ready_path" >/dev/null 2>&1 &
-  sc_handoff_pid=$!
-  sc_handoff_wait=0
-  while [ "$sc_handoff_wait" -lt 50 ] && [ ! -s "$sc_ready_path" ]; do
-    sleep 0.02
-    sc_handoff_wait=$((sc_handoff_wait + 1))
-  done
-  if [ ! -s "$sc_ready_path" ]; then
-    kill "$sc_handoff_pid" 2>/dev/null || true
-    rm -f "$sc_capability_path" "$sc_ready_path"
-    return 1
-  fi
-  sc_handoff_url="$(cat "$sc_ready_path")"
-  rm -f "$sc_ready_path"
-  printf '%s\n' "$sc_handoff_url"
-}
-
-sc_enter_with_browser_handoff() {
-  sc_handoff_id="$$"
-  sc_handoff_path="$ROOT/.sc-state/local/run/browser-handoff-$sc_handoff_id"
-  rm -f "$sc_handoff_path"
-  if docker exec -it -e "SC_BROWSER_HANDOFF_ID=$sc_handoff_id" \
-      "$CNAME" ./sc boot "$@"; then
-    sc_enter_rc=0
-  else
-    sc_enter_rc=$?
-  fi
-  if [ "$sc_enter_rc" -eq 0 ] && [ -f "$sc_handoff_path" ]; then
-    rm -f "$sc_handoff_path"
-    sc_deepseek_url="$(sc_deepseek_browser_handoff)" || return "$sc_enter_rc"
-    echo "  DeepSeek Web browser handoff ready"
-    sc_open_browser "$sc_deepseek_url" || true
-  else
-    rm -f "$sc_handoff_path"
-  fi
-  return "$sc_enter_rc"
-}
 
 # The two localhost URLs an operator needs, derived from this fork's ports —
 # never a fixed 8800, because every fork lands on its own offset (ports.py).
@@ -302,7 +229,7 @@ dcheck() {
 # breaks claude — so seed it with empty json. Real creds come from a one-time
 # host login (`./sc doctor` guides it); this just keeps the mounts valid.
 dcreds() {
-  mkdir -p "$HOME/.claude" "$HOME/.config/opencode" "$HOME/.local/share/opencode" "$HOME/.codex" "$HOME/.vibe" "$HOME/.kimi-code" "$HOME/.dsh" 2>/dev/null || true
+  mkdir -p "$HOME/.claude" "$HOME/.config/opencode" "$HOME/.local/share/opencode" "$HOME/.codex" "$HOME/.vibe" "$HOME/.kimi-code" 2>/dev/null || true
   [ -e "$HOME/.claude.json" ] || echo '{}' > "$HOME/.claude.json"
 }
 
@@ -1270,8 +1197,6 @@ case "$cmd" in
     "$PY" "$S/ports.py" ensure >/dev/null
     p="$(port)"
     dp="$(devport)"
-    dsp="$(deepseekhostport)"
-    dsrp="$(deepseekrelayport)"
     dnet
     github_auth_rootless=""
     drootless && github_auth_rootless="--rootless"
@@ -1280,10 +1205,6 @@ case "$cmd" in
     # key + .env there; the mount below carries them in like every other harness).
     mistral_env=""
     [ -n "${MISTRAL_API_KEY:-}" ] && mistral_env="-e MISTRAL_API_KEY=${MISTRAL_API_KEY}"
-    # DeepSeek production canaries pass only the variable NAME to Docker. The
-    # value stays in Docker's inherited environment and never enters argv.
-    ollama_env=""
-    [ -n "${OLLAMA_API_KEY:-}" ] && ollama_env="-e OLLAMA_API_KEY"
     disabled_harnesses_env=""
     [ -n "${SC_DISABLED_HARNESSES:-}" ] && disabled_harnesses_env="-e SC_DISABLED_HARNESSES"
     # Forward DATABASE_URL into the sandbox when a pg sidecar is configured, so
@@ -1351,8 +1272,8 @@ case "$cmd" in
         --network "$SC_NET" \
         SC_GITHUB_AUTH_ARGS \
         -e HOME="$HOME" -e SC_BIND=0.0.0.0 -e SC_PYTHON=python3 -e PYTHONUNBUFFERED=1 \
-        -e SC_SANDBOX=1 -e SC_DEV_PORT="$dp" -e SC_DEEPSEEK_HOST_PORT="$dsp" \
-        $mistral_env $ollama_env $disabled_harnesses_env $pg_env \
+        -e SC_SANDBOX=1 -e SC_DEV_PORT="$dp" \
+        $mistral_env $disabled_harnesses_env $pg_env \
         -e GIT_AUTHOR_NAME="$git_name" -e GIT_AUTHOR_EMAIL="$git_email" \
         -e GIT_COMMITTER_NAME="$git_name" -e GIT_COMMITTER_EMAIL="$git_email" \
         -w "$here" \
@@ -1365,10 +1286,8 @@ case "$cmd" in
         -v "$HOME/.codex:$HOME/.codex" \
         -v "$HOME/.vibe:$HOME/.vibe" \
         -v "$HOME/.kimi-code:$HOME/.kimi-code" \
-        -v "$HOME/.dsh:$HOME/.dsh" \
         -p "127.0.0.1:$p:$p" \
         -p "127.0.0.1:$dp:$dp" \
-        -p "127.0.0.1:$dsp:$dsrp" \
         SC_DEVKIT_MOUNTS \
         "$IMG" ./sc serve --port "$p" || provision_rc=$?
     if [ "$provision_rc" -ne 0 ]; then
@@ -1419,19 +1338,7 @@ case "$cmd" in
       exit 1
     }
     sc_urls || true
-    if [ "${1:-}" = "deepseek" ]; then
-      shift
-      docker exec -it -e "SC_DISABLED_HARNESSES=${SC_DISABLED_HARNESSES:-}" \
-        "$CNAME" ./sc boot "$@" --harness deepseek --local-web || exit $?
-      sc_deepseek_url="$(sc_deepseek_browser_handoff)" || {
-        echo "✗ DeepSeek Web gateway did not provide a current browser generation" >&2
-        exit 1
-      }
-      echo "  DeepSeek Web browser handoff ready"
-      sc_open_browser "$sc_deepseek_url" || true
-      exit 0
-    fi
-    sc_enter_with_browser_handoff "$@" ;;
+    exec docker exec -it "$CNAME" ./sc boot "$@" ;;
   enter-*)
     if [ "${1:-}" = "--devkit-repair" ]; then
       echo "sc ${cmd}: repair posture is available only as ./sc enter --devkit-repair" >&2
@@ -1444,7 +1351,7 @@ case "$cmd" in
       exit 1
     }
     sc_urls || true
-    sc_enter_with_browser_handoff "${cmd#enter-}" "$@" ;;
+    exec docker exec -it "$CNAME" ./sc boot "${cmd#enter-}" "$@" ;;
   down)         docker rm -f "$CNAME" >/dev/null 2>&1 && echo "→ sandbox stopped" || echo "→ not running"
                 sc_vm_broker_down
                 sc_ts_broker_down
@@ -1659,8 +1566,6 @@ super-coder — forkable shell substrate
   ./sc admin               boot the sole active Admin directly on the host (no Docker or API required)
   ./sc enter               boot an interactive shell only when declared provisioning is ready
                              --devkit-repair enters state repair without claiming readiness
-  ./sc enter deepseek      select a shell, register its worktree with official dsh Web/Host,
-                             open the host browser, and always print the loopback URL
   ./sc enter-<shortname>   enter that shell directly when ready (skip the shell picker)
                              harness: --harness <name> or HARNESS=<name> forces it; else when
                              >1 harness is on PATH you're prompted (per-launch, not persisted)
