@@ -131,6 +131,37 @@ class RegistryTest(unittest.TestCase):
             TOMBSTONES,
         )
 
+    def test_ai_consumed_sources_do_not_route_to_tombstoned_skills(self):
+        roots = (
+            ENGINE / "assets" / "skills",
+            ENGINE / "assets" / "seed" / "skills",
+            ENGINE / "templates",
+        )
+        findings = {}
+        for root in roots:
+            for path in sorted(root.rglob("*")):
+                if path.suffix not in {".json", ".md"}:
+                    continue
+                body = path.read_text()
+                matched = [
+                    name
+                    for name in TOMBSTONES
+                    if any(
+                        reference in body
+                        for reference in (
+                            f"load `{name}`",
+                            f"use `{name}`",
+                            f"skill `{name}`",
+                            f"`{name}` skill",
+                            f"`{name}` lens",
+                            f"({name} lens)",
+                        )
+                    )
+                ]
+                if matched:
+                    findings[str(path.relative_to(ENGINE.parent))] = matched
+        self.assertEqual(findings, {})
+
 
 class ReconciliationTest(unittest.TestCase):
     def setUp(self):

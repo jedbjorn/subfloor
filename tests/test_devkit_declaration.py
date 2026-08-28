@@ -117,6 +117,20 @@ class DeclarationTest(unittest.TestCase):
         self.assertEqual(test.executable_kind, "relative")
         self.assertEqual(test.resolved_executable, tool.resolve())
 
+    def test_boot_visible_hook_fields_reject_markdown_injection(self):
+        (self.root / "safe").mkdir()
+        attacks = (
+            ({"argv": ["tool`\n## injected"]}, r"\.argv\[0\]"),
+            ({"argv": ["tool"], "cwd": "safe`\n## injected"}, r"\.cwd"),
+            ({"argv": ["tool\x1b[31m"]}, r"\.argv\[0\]"),
+        )
+        for hook, field in attacks:
+            with self.subTest(hook=hook):
+                self.assert_invalid(
+                    {"version": 1, "hooks": {"test": hook}},
+                    field + ": must not contain control characters or Markdown",
+                )
+
     def test_cwd_must_exist_and_stay_in_checkout(self):
         outside = Path(self.temp.name) / "outside"
         outside.mkdir()
@@ -1004,8 +1018,7 @@ class SourcePolicyTest(unittest.TestCase):
 
 
 class DevKitReseedConformanceTest(unittest.TestCase):
-    def test_trailing_reseed_converges_dirty_downstream_and_replays(self):
-        expected = seed_skills.parse_skill(DEVKIT_SKILL)
+    def test_trailing_reseed_preserves_custom_downstream_dev_kit_and_replays(self):
         with sqlite3.connect(":memory:") as con:
             con.executescript(
                 "CREATE TABLE shells ("
@@ -1039,13 +1052,13 @@ class DevKitReseedConformanceTest(unittest.TestCase):
             actual,
             (
                 41,
-                expected["name"],
-                expected["description"],
-                expected["category"],
-                expected["command"],
-                expected["common"],
-                expected["content"],
-                0,
+                "dev_kit",
+                "stale description",
+                "wrong",
+                "old-command",
+                1,
+                "You are in a container",
+                1,
             ),
         )
         self.assertEqual(local, ("local", "fork", None, 0, "bespoke body", 0))

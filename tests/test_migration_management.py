@@ -197,6 +197,9 @@ class MigrationManagementReseedTest(unittest.TestCase):
         con = sqlite3.connect(":memory:")
         try:
             con.executescript(
+                "CREATE TABLE shells ("
+                "shell_id INTEGER PRIMARY KEY, flavor TEXT, "
+                "system_prompt TEXT NOT NULL);"
                 "CREATE TABLE skills ("
                 "skill_id INTEGER PRIMARY KEY, name TEXT UNIQUE, description TEXT, "
                 "category TEXT, command TEXT, common INTEGER, content TEXT, "
@@ -233,6 +236,13 @@ class MigrationManagementReseedTest(unittest.TestCase):
         self.assertIn("ordered additive deltas", actual[5])
         self.assertIn("WAL-safe backup", actual[5])
         self.assertIn("fresh build, in-place migration", actual[5])
+        self.assertIn("./sc migration new <lowercase_snake_case_slug>", actual[5])
+        self.assertIn(
+            "./sc migrate /absolute/path/to/.super-coder/shell_db.db",
+            actual[5],
+        )
+        self.assertIn("0001_seed_skills.sql` is the generated exception", actual[5])
+        self.assertIn("nothing pending", actual[5])
 
 
 if __name__ == "__main__":

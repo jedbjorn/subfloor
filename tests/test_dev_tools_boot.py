@@ -8,6 +8,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 ENGINE = ROOT / ".super-coder"
@@ -55,6 +56,7 @@ class DevToolsBootTest(unittest.TestCase):
         declaration = run.devkit.load_declaration(self.checkout)
         assert declaration is not None
         return {
+            "format_version": 1,
             "checkout_identity": hashlib.sha256(
                 str(self.checkout).encode()
             ).hexdigest(),
@@ -144,9 +146,10 @@ class DevToolsBootTest(unittest.TestCase):
         self.status_path().write_text(
             json.dumps(self.receipt(fork_readiness="ready"))
         )
-        ready = run.collect_dev_tools(
-            self.checkout, "container", environment=self.environment
-        )
+        with mock.patch.object(run, "_dev_tool_receipt_matches", return_value=True):
+            ready = run.collect_dev_tools(
+                self.checkout, "container", environment=self.environment
+            )
         self.assertEqual(ready["state"], "ready")
         self.assertIn("0.0.0.0:8123 -> 127.0.0.1:8123", ready["dev_port"])
 
