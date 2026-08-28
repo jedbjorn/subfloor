@@ -39,6 +39,24 @@ CONFIG = ENGINE / "instance.json"
 PORT_BASE = 8800
 SPAN = 100  # offsets 0..99 → port 8800-8899
 
+# ``ports`` is also the shared read/write seam for the opt-in blocks below.
+# Return only keys the current engine owns.  Unknown legacy keys remain in the
+# installation-local file, but never enter a runtime view or command output.
+MANAGED_KEYS = frozenset({
+    "repo",
+    "port",
+    "dev_port",
+    "harness",
+    "installed_at",
+    "artifact_mode",
+    "work_repo",
+    "pg",
+    "vm",
+    "ts",
+    "pm2",
+    "db",
+})
+
 
 def _offset(seed: str) -> int:
     return int(hashlib.sha1(seed.encode()).hexdigest(), 16) % SPAN
@@ -117,20 +135,44 @@ def _derive(avoid: set[int] | None = None) -> dict:
     }
 
 
+def _load_config() -> dict:
+    if not CONFIG.exists():
+        return {}
+    try:
+        loaded = json.loads(CONFIG.read_text())
+    except json.JSONDecodeError:
+        return {}
+    return loaded if isinstance(loaded, dict) else {}
+
+
+def _runtime_view(stored: dict) -> dict:
+    return {key: value for key, value in stored.items() if key in MANAGED_KEYS}
+
+
+def _write_config(cfg: dict) -> None:
+    stored = _load_config()
+    preserved = {
+        key: value for key, value in stored.items() if key not in MANAGED_KEYS
+    }
+    preserved.update(cfg)
+    if preserved == stored:
+        return
+    CONFIG.write_text(json.dumps(preserved, indent=2) + "\n")
+
+
 def resolve(persist: bool = False) -> dict:
-    """Return this fork's config. An existing instance.json wins (respects hand
-    edits) and is returned verbatim; otherwise derive a free port from the repo
-    path. `persist=True` writes it to instance.json so it stays stable. To force
-    a re-derive (e.g. after a port clash), delete the file."""
+    """Return the current engine's instance view.
+
+    An existing instance.json wins for managed keys and otherwise ports derive
+    from the repo path. Unknown keys remain on disk but stay outside runtime
+    views. `persist=True` updates managed values without rewriting that inert
+    state. To force a re-derive (e.g. after a port clash), delete the file.
+    """
     cfg = None
     occupied = _sibling_ports()
-    if CONFIG.exists():
-        try:
-            loaded = json.loads(CONFIG.read_text())
-            if "port" in loaded:
-                cfg = loaded
-        except json.JSONDecodeError:
-            pass
+    loaded = _load_config()
+    if "port" in loaded:
+        cfg = _runtime_view(loaded)
     if cfg is None:
         cfg = _derive(occupied)
     else:
@@ -153,14 +195,13 @@ def resolve(persist: bool = False) -> dict:
         # (respects hand-edits to `port`); persisted below if requested.
         cfg["dev_port"] = _dev_offset(cfg["port"], occupied)
     if persist:
-        CONFIG.write_text(json.dumps(cfg, indent=2) + "\n")
+        _write_config(cfg)
     return cfg
 
 
 def save(cfg: dict) -> None:
-    """Persist the full config dict to instance.json verbatim. Preserves any
-    keys this module doesn't own (e.g. the `vm` block written by vm.py)."""
-    CONFIG.write_text(json.dumps(cfg, indent=2) + "\n")
+    """Persist current engine config while retaining unknown on-disk keys."""
+    _write_config(cfg)
 
 
 def main(argv: list[str]) -> int:
