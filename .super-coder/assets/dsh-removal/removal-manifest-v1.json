@@ -1753,11 +1753,11 @@
       "sha256": "b1bbf35c3e3417c668015029ee3402e882af40d160d6c0153f8f4400bda0e820"
     },
     {
-      "bytes": 70598,
+      "bytes": 70696,
       "cleanup": "exact-digest-delete",
       "ownership": "engine-tracked",
       "path": ".super-coder/assets/deepseek/dsh-shell-authority-contract.json",
-      "sha256": "06485e5ca9bdf11de864dc46a6eb9910dc0ec3e52caef91cfd37f1bb2cdf7bf0"
+      "sha256": "cd2eddb16fefae954061e1f0fc9e4346e43e87d8cdaae1e5c2b1deefd35f4de2"
     },
     {
       "bytes": 2034,

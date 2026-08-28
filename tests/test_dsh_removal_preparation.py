@@ -6,6 +6,7 @@ import importlib.util
 import io
 import json
 import sqlite3
+import subprocess
 import tarfile
 import tempfile
 import unittest
@@ -175,6 +176,32 @@ class DshRemovalPreparationTest(unittest.TestCase):
             FIXTURES.sha256_bytes(PAYLOAD_PATH.read_bytes()),
             load(PRE_BRIDGE_PATH)["tracked_payload"]["sha256"],
         )
+
+    def test_tracked_artifacts_match_the_declared_compatibility_ref(self) -> None:
+        manifest = load(MANIFEST_PATH)
+        floor_ref = manifest["cutover"]["minimum_floor_ref"]
+        self.assertEqual(
+            "75a4c9bf781812b4bcf33aedd7943887a87cfde2",
+            floor_ref,
+        )
+        expected = {
+            row["path"]: (row["sha256"], row["bytes"])
+            for row in manifest["tracked_artifacts"]
+        }
+        actual = {}
+        for path in sorted(expected):
+            result = subprocess.run(
+                ["git", "-C", str(ROOT), "show", f"{floor_ref}:{path}"],
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(
+                0,
+                result.returncode,
+                f"compatibility ref does not contain tracked artifact: {path}",
+            )
+            actual[path] = (FIXTURES.sha256_bytes(result.stdout), len(result.stdout))
+        self.assertEqual(expected, actual)
 
     def test_refresh_is_rejected_after_frozen_inputs_change(self) -> None:
         with tempfile.TemporaryDirectory() as raw:

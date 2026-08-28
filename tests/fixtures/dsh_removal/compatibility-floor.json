@@ -365,10 +365,10 @@
   "schema_version": 1,
   "target_removal_manifest": {
     "path": ".super-coder/assets/dsh-removal/removal-manifest-v1.json",
-    "sha256": "c686ba974f4344f18f21f9b092a66ab4d2b700d187e7d393f99971fe3288e608"
+    "sha256": "561b7b25ce58fb5c1e5a94a7bd53a91ee08ff7ca40a6e6efb386b7bbf0acd0f4"
   },
   "tracked_payload": {
     "path": "tracked-artifacts.tar.gz",
-    "sha256": "5b3dec1adef90eadd02d0b0f7a134362f9b6c7c1741df605e6550a9e721c41e7"
+    "sha256": "c60cf2e90b2540d89ffeb8ce5f0521ee85b020dd87fffd13c28995b92a1455bc"
   }
 }
