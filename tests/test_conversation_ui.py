@@ -303,13 +303,13 @@ def test_start_chat_has_default_and_configured_paths_without_terminal_controls()
 
 
 @pytest.mark.skipif(shutil.which("node") is None, reason="node is required")
-def test_removed_harness_status_disables_historical_composer():
+def test_missing_retained_harness_status_disables_composer():
     availability = APP[
         APP.index("function chatHarnessUnavailableReason"):
         APP.index("function chatStartedLabel")
     ]
     script = availability + r"""
-const conversation = {route: {harness: "deepseek", model: "old-model"}};
+const conversation = {route: {harness: "codex", model: "gpt-test"}};
 console.log(JSON.stringify({
   missing: chatOpenHarnessUnavailableReason(conversation, null),
   disabled: chatHarnessUnavailableReason({
@@ -323,7 +323,6 @@ console.log(JSON.stringify({
 }));
 """
 
-    assert '"deepseek"' not in availability
     assert run_js(script) == {
         "missing": "HARNESS_UNAVAILABLE",
         "disabled": "HARNESS_DISABLED",
@@ -331,7 +330,7 @@ console.log(JSON.stringify({
     }
 
 
-def test_historical_unavailable_harness_keeps_reads_and_controls_but_not_composer():
+def test_retained_unavailable_harness_keeps_controls_but_not_composer():
     interface = APP[APP.index("const CHAT_HARNESSES"):
                     APP.index("// ── Tabs + boot")]
     open_chat = interface[
@@ -340,7 +339,8 @@ def test_historical_unavailable_harness_keeps_reads_and_controls_but_not_compose
     ]
     assert 'api("/flavor-defaults").catch(() => null)' in interface
     assert 'api("/models").catch(() => null)' in interface
-    assert "history remains readable" in open_chat
+    assert "history remains readable" not in open_chat
+    assert "unavailable.textContent = unavailableReason || \"\"" in open_chat
     assert "composer.disabled = Boolean(unavailableReason)" in open_chat
     assert "send.disabled = Boolean(unavailableReason)" in open_chat
     assert "stop.disabled = conversation.state !== \"running\"" in open_chat
@@ -348,36 +348,6 @@ def test_historical_unavailable_harness_keeps_reads_and_controls_but_not_compose
     assert 'textContent: "Analytics"' in open_chat
     assert "chatReviewWorkspace(reviewHost, conversation)" in open_chat
     assert ".chat-harness-unavailable" in STYLE
-
-
-def test_historical_removed_harness_is_unavailable_without_live_route_logic():
-    helpers = APP[
-        APP.index("function chatHarnessUnavailableReason"):
-        APP.index("function chatStartedLabel")
-    ]
-    script = helpers + r"""
-const removed = {route: {harness: "deepseek", model: "deepseek-bound"}};
-const unknown = {route: {harness: "retired-harness", model: "old-model"}};
-console.log(JSON.stringify({
-  removed: chatOpenHarnessUnavailableReason(removed, null),
-  unknown: chatOpenHarnessUnavailableReason(unknown, null),
-  disabled: chatOpenHarnessUnavailableReason(removed, {
-    installed: true, enabled: false, healthy: false,
-    surfaces: {browser: true}, unavailable_reason: "HARNESS_DISABLED",
-  }),
-  healthy: chatOpenHarnessUnavailableReason(removed, {
-    installed: true, enabled: true, healthy: true,
-    surfaces: {browser: true}, unavailable_reason: null,
-  }),
-}));
-"""
-
-    assert run_js(script) == {
-        "removed": "HARNESS_UNAVAILABLE",
-        "unknown": "HARNESS_UNAVAILABLE",
-        "disabled": "HARNESS_DISABLED",
-        "healthy": None,
-    }
 
 
 def test_transcript_streams_normalized_events_and_reconnects_natively():

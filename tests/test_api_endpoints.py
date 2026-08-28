@@ -761,7 +761,7 @@ class FlavorDefaultsTest(unittest.TestCase):
         )
         self.assertNotIn("deepseek", got["harness_status"])
 
-    def test_historical_unknown_harness_stays_projected_without_launch_access(self) -> None:
+    def test_historical_unknown_harness_is_not_projected(self) -> None:
         self.con.execute(
             "INSERT INTO users (user_id,username) VALUES (910,'historical-owner')"
         )
@@ -777,19 +777,21 @@ class FlavorDefaultsTest(unittest.TestCase):
             "'removed-create','removed-hash')",
             (910, 910),
         )
+        self.con.execute(
+            "INSERT INTO flavor_defaults "
+            "(flavor,harness,model,effort,is_default) "
+            "VALUES ('planner','removed-harness','old-model','high',0)"
+        )
         self.con.commit()
 
         got = server.get_flavor_defaults(self.con)
 
-        self.assertEqual(
-            got["harness_status"]["removed-harness"]["unavailable_reason"],
-            "HARNESS_NOT_SHIPPED",
-        )
-        self.assertEqual(
-            got["harness_status"]["removed-harness"]["surfaces"],
-            {"terminal": False, "one_shot": False, "browser": False, "sprint": False},
-        )
+        self.assertNotIn("removed-harness", got["harness_status"])
         self.assertNotIn("removed-harness", got["harnesses"])
+        self.assertNotIn(
+            "removed-harness",
+            {row["harness"] for row in got["flavors"]["planner"]},
+        )
 
     def test_set_model(self) -> None:
         self._route("claude", "opus")
@@ -1364,11 +1366,11 @@ class AuthenticatedCliCatalogueRouteTest(unittest.TestCase):
             )
         return fingerprint
 
-    def test_models_api_preserves_live_native_projection_fields(self) -> None:
+    def test_models_api_serves_current_opencode_native_projection_fields(self) -> None:
         payload = {
             "v": 8,
             "fetched_at": "2026-08-26T20:00:00+00:00",
-            "sources": ["opencode-provider-api", "deepseek-host-api"],
+            "sources": ["opencode-provider-api"],
             "stale": True,
             "harnesses": {
                 harness: {
@@ -1379,11 +1381,9 @@ class AuthenticatedCliCatalogueRouteTest(unittest.TestCase):
                     "models": [{
                         "id": "ollama-cloud/glm-5.2",
                         "native_option_ids": ["MAX.Future", "low"],
-                        **({"native_default_option_id": "MAX.Future"}
-                           if harness == "deepseek" else {}),
                     }],
                 }
-                for harness in ("opencode", "deepseek")
+                for harness in ("opencode",)
             },
         }
         with (
@@ -1440,7 +1440,7 @@ class AuthenticatedCliCatalogueRouteTest(unittest.TestCase):
         self.assertEqual(unavailable["routes"], [])
         self.assertNotIn("runtime_status", unavailable)
 
-    def test_route_projection_carries_latest_bounded_harness_failure(self) -> None:
+    def test_route_projection_omits_removed_harness_failure(self) -> None:
         completed = (datetime.now(timezone.utc) + timedelta(minutes=1)).isoformat()
         con = self.connect()
         con.execute(
@@ -1457,7 +1457,7 @@ class AuthenticatedCliCatalogueRouteTest(unittest.TestCase):
                     "error": None,
                     "errors": [],
                     "harness_errors": {
-                        "deepseek": "authenticated DeepSeek exact model is absent"
+                        "removed-harness": "removed runtime failed"
                     },
                 }),
                 "c" * 64,
@@ -1467,16 +1467,11 @@ class AuthenticatedCliCatalogueRouteTest(unittest.TestCase):
         con.close()
 
         status, body = self.request(
-            "/_sc/model-routes?harness=deepseek&selector="
-            "ollama-cloud%2Fdeepseek-v4-pro%3A0813"
+            "/_sc/model-routes?harness=removed-harness&selector=old-model"
         )
 
         self.assertEqual(200, status)
-        self.assertEqual([], body["routes"])
-        self.assertEqual(
-            "authenticated DeepSeek exact model is absent",
-            body["harness_error"],
-        )
+        self.assertEqual({"routes": []}, body)
 
     def test_real_advisory_vibe_catalogue_resolves_locally_and_via_api(self) -> None:
         vibe_status = compatible_runtime()

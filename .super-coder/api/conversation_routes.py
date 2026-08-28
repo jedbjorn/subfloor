@@ -40,6 +40,8 @@ import run as run_mod
 from conversation_adapters import ADAPTER_TYPES
 
 _ALLOWED_HOST_SET = frozenset(("127.0.0.1", "localhost", "::1"))
+_BROWSER_HARNESSES = tuple(sorted(ADAPTER_TYPES))
+_BROWSER_HARNESS_SQL = ",".join("?" for _ in _BROWSER_HARNESSES)
 _CONVERSATION_STATES = frozenset(
     ("idle", "queued", "running", "waiting", "error", "closed")
 )
@@ -426,8 +428,9 @@ def _conversation_row(con, conversation_id: str, owner_user_id: int):
         " ORDER BY active.run_id DESC LIMIT 1) AS active_run_id,"
         + _SPRINT_MANAGED_COLUMN
         + " FROM conversations c JOIN shells s ON s.shell_id=c.shell_id "
-        "WHERE c.conversation_id=? AND c.owner_user_id=?",
-        (conversation_id, owner_user_id),
+        "WHERE c.conversation_id=? AND c.owner_user_id=? "
+        f"AND c.harness IN ({_BROWSER_HARNESS_SQL})",
+        (conversation_id, owner_user_id, *_BROWSER_HARNESSES),
     ).fetchone()
 
 
@@ -1259,8 +1262,8 @@ def _list_conversations(con, operator: dict, query):
     if "mode" in query:
         raise ApiError(422, "VALIDATION_ERROR", "unknown query field: mode")
     limit = _limit(query, maximum=100)
-    clauses = ["c.owner_user_id=?"]
-    params: list = [operator["user_id"]]
+    clauses = ["c.owner_user_id=?", f"c.harness IN ({_BROWSER_HARNESS_SQL})"]
+    params: list = [operator["user_id"], *_BROWSER_HARNESSES]
     shell = query.get("shell_id", [None])[0]
     shell_id = None
     if shell not in (None, ""):

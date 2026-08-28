@@ -200,7 +200,7 @@ class DshRemovalPreparationTest(unittest.TestCase):
                 FIXTURES.refresh_floor_errors(manifest, root=root),
             )
 
-    def test_migration_floor_pins_every_existing_file_and_dsh_history(self) -> None:
+    def test_migration_floor_pins_every_existing_file_for_purge_rebaseline(self) -> None:
         manifest = load(MANIFEST_PATH)
         ledger = manifest["immutable_migration_ledger"]
         self.assertEqual(184, len(ledger))
@@ -216,7 +216,7 @@ class DshRemovalPreparationTest(unittest.TestCase):
             {
                 Path(row["path"]).name
                 for row in manifest["immutable_reference_migrations"]
-                if row["disposition"] == "preserve-dsh-history"
+                if row["disposition"] == "remove-after-purge-rebaseline"
             },
         )
         self.assertEqual(
@@ -249,7 +249,7 @@ class DshRemovalPreparationTest(unittest.TestCase):
                     ],
                 )
                 self.assertEqual(
-                    ("running", 4242, 31337, "preserve this normalized DSH prompt"),
+                    ("running", 4242, 31337, "purge this DSH-owned prompt graph"),
                     tuple(
                         con.execute(
                             "SELECT r.state,r.process_pid,r.process_start_ticks,m.body "
@@ -330,7 +330,7 @@ class DshRemovalPreparationTest(unittest.TestCase):
             self.assertNotEqual(target["sha256"], FIXTURES.sha256_file(changed))
             self.assertEqual(target["sha256"], FIXTURES.sha256_file(pre_root / target["path"]))
 
-    def test_runtime_inventory_names_every_owner_and_preserves_controls(self) -> None:
+    def test_runtime_inventory_names_every_owner_and_retained_boundary(self) -> None:
         manifest = load(MANIFEST_PATH)
         self.assertEqual(
             {"stock-dsh-host", "super-coder-dsh-relay"},

@@ -78,34 +78,6 @@ class HarnessSurfaceProjectionTest(unittest.TestCase):
         self.assertFalse(disabled["codex"]["healthy"])
         self.assertEqual(disabled["codex"]["unavailable_reason"], "HARNESS_DISABLED")
 
-    def test_unknown_historical_harness_is_readable_but_never_runnable(self) -> None:
-        projection = harness_surfaces.project(
-            ["deepseek", "retired-harness"], executable=lambda command: command
-        )
-
-        expected = {
-            "shipped": False,
-            "installed": False,
-            "enabled": False,
-            "healthy": False,
-            "compatibility": "unknown",
-            "surfaces": {
-                "terminal": False,
-                "one_shot": False,
-                "browser": False,
-                "sprint": False,
-            },
-            "unavailable_reason": "HARNESS_NOT_SHIPPED",
-        }
-        self.assertEqual(projection["retired-harness"], expected)
-        self.assertEqual(projection["deepseek"], expected)
-        self.assertNotIn(
-            "retired-harness", harness_surfaces.known_terminal_harnesses()
-        )
-        self.assertNotIn(
-            "retired-harness", harness_surfaces.known_runnable_harnesses()
-        )
-
     def test_model_visibility_is_separate_from_launch_default_eligibility(self) -> None:
         manifests = {
             "one-shot-only": {

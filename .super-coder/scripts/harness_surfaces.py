@@ -4,7 +4,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Callable, Mapping
 from pathlib import Path
 
 import harness_versions
@@ -166,34 +166,16 @@ def known_interactive_harnesses() -> list[str]:
 
 
 def project(
-    historical_harnesses: Iterable[str] = (),
     *,
     env: Mapping[str, str] | None = None,
     executable: Callable[[str], str | None] = shutil.which,
 ) -> dict[str, dict[str, object]]:
-    """Project shipped and historical harnesses without rejecting old names."""
+    """Project only harnesses shipped by the current engine."""
     env = os.environ if env is None else env
     disabled = _disabled_harnesses(env)
     manifests = _manifest_paths()
-    names = set(manifests)
-    names.update(
-        str(name).strip().lower() for name in historical_harnesses if str(name).strip()
-    )
     projected: dict[str, dict[str, object]] = {}
-    for harness in sorted(names):
-        path = manifests.get(harness)
-        if path is None:
-            projected[harness] = {
-                "shipped": False,
-                "installed": False,
-                "enabled": False,
-                "healthy": False,
-                "compatibility": "unknown",
-                "surfaces": {name: False for name in SURFACES},
-                "unavailable_reason": "HARNESS_NOT_SHIPPED",
-            }
-            continue
-
+    for harness, path in sorted(manifests.items()):
         try:
             manifest = json.loads(path.read_text())
             if manifest.get("harness") != harness:
