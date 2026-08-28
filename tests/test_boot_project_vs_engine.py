@@ -76,10 +76,19 @@ class ProjectVsEngineTest(unittest.TestCase):
         declared = compose.render_project_vs_engine(False, True)
         self.assertIn("state:** absent", absent)
         self.assertIn("no fork dev kit declared", absent)
+        self.assertIn("does not define project policy", absent)
+        self.assertIn("tracked project-owned entrypoint", absent)
+        self.assertIn("command and required environment", absent)
         self.assertNotIn("no fork dev kit declared", declared)
         self.assertIn("`.subfloor/dev-kit.json` declared", declared)
         self.assertNotIn("state:** ready", declared)
         self.assertIn("current Docker receipt", declared)
+        self.assertIn("run each configured hook through", declared)
+        self.assertIn("`sc test`", declared)
+        self.assertIn("append focused arguments after the hook name", declared)
+        self.assertIn("runner reports the selected checkout", declared)
+        self.assertIn("child status", declared)
+        self.assertIn("Do not probe PATH", declared)
 
     def test_declared_file_presence_never_claims_ready_on_a_host_boot(self):
         # run.py supplies only Path.is_file() here. That evidence also matches an

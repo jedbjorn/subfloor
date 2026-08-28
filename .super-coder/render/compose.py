@@ -85,11 +85,20 @@ PROJECT_VS_ENGINE_SOURCE = (
 
 DEVKIT_DECLARED_STATUS = (
     "**Fork dev kit:** `.subfloor/dev-kit.json` declared; readiness is proven "
-    "only by hook execution or a current Docker receipt."
+    "only by hook execution or a current Docker receipt. Before project "
+    "dependency or quality checks, read the declaration and its executable, "
+    "then run each configured hook through `sc deps`, `sc test`, `sc lint`, or "
+    "`sc typecheck`; append focused arguments after the hook name. Pass = the "
+    "runner reports the selected checkout, cwd, seat, executable, and child "
+    "status. Do not probe PATH or reconstruct CI commands before the declared "
+    "hook runs."
 )
 DEVKIT_ABSENT_STATUS = (
     "**Fork dev kit state:** absent — no fork dev kit declared; the engine "
-    "baseline remains available."
+    "baseline remains available but does not define project policy. Before "
+    "project dependency or quality checks, locate the tracked project-owned "
+    "entrypoint through the repo map; pass = the command and required "
+    "environment come from tracked repository policy."
 )
 DEVKIT_REPAIR_STATUS = (
     "**Fork dev kit state:** repair — provisioning is not ready. This shell "
