@@ -42,7 +42,7 @@ def replay_database(fixture: dict) -> sqlite3.Connection:
         if len(selected) != self_floor["count"]:
             raise AssertionError("fixture migration count disagrees with frozen ledger")
         for row in selected:
-            migration = ROOT / row["path"]
+            migration = FIXTURES.frozen_source_path(row["path"])
             if FIXTURES.sha256_file(migration) != row["sha256"]:
                 raise AssertionError(f"immutable migration changed: {row['filename']}")
             con.executescript(migration.read_text())
@@ -224,7 +224,9 @@ class DshRemovalPreparationTest(unittest.TestCase):
             [
                 row["filename"]
                 for row in ledger
-                if FIXTURES.sha256_file(ROOT / row["path"]) != row["sha256"]
+                if FIXTURES.sha256_file(
+                    FIXTURES.frozen_source_path(row["path"])
+                ) != row["sha256"]
             ],
         )
 

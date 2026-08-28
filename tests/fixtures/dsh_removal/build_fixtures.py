@@ -19,6 +19,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[3]
 FIXTURE_DIR = Path(__file__).resolve().parent
+HISTORICAL_MIGRATIONS = FIXTURE_DIR / "historical_migrations"
 MANIFEST_PATH = ROOT / ".super-coder/assets/dsh-removal/removal-manifest-v1.json"
 PAYLOAD_PATH = FIXTURE_DIR / "tracked-artifacts.tar.gz"
 PRE_BRIDGE_PATH = FIXTURE_DIR / "pre-bridge.json"
@@ -202,6 +203,19 @@ def sha256_bytes(value: bytes) -> str:
 
 def sha256_file(path: Path) -> str:
     return sha256_bytes(path.read_bytes())
+
+
+def frozen_source_path(relative: str | Path, *, root: Path = ROOT) -> Path:
+    """Resolve bytes frozen before a migration was pruned from the live chain."""
+    relative = Path(relative)
+    current = root / relative
+    if current.is_file() or root != ROOT:
+        return current
+    if relative.parent == Path(".super-coder/migrations"):
+        historical = HISTORICAL_MIGRATIONS / relative.name
+        if historical.is_file():
+            return historical
+    return current
 
 
 def tracked_files() -> list[str]:
