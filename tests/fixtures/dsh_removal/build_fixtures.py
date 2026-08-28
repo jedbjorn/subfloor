@@ -19,6 +19,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[3]
 FIXTURE_DIR = Path(__file__).resolve().parent
+HISTORICAL_MIGRATIONS = FIXTURE_DIR / "historical_migrations"
 MANIFEST_PATH = ROOT / ".super-coder/assets/dsh-removal/removal-manifest-v1.json"
 PAYLOAD_PATH = FIXTURE_DIR / "tracked-artifacts.tar.gz"
 PRE_BRIDGE_PATH = FIXTURE_DIR / "pre-bridge.json"
@@ -202,6 +203,19 @@ def sha256_bytes(value: bytes) -> str:
 
 def sha256_file(path: Path) -> str:
     return sha256_bytes(path.read_bytes())
+
+
+def frozen_source_path(relative: str | Path, *, root: Path = ROOT) -> Path:
+    """Resolve bytes frozen before a migration was pruned from the live chain."""
+    relative = Path(relative)
+    current = root / relative
+    if current.is_file() or root != ROOT:
+        return current
+    if relative.parent == Path(".super-coder/migrations"):
+        historical = HISTORICAL_MIGRATIONS / relative.name
+        if historical.is_file():
+            return historical
+    return current
 
 
 def tracked_files() -> list[str]:
@@ -400,6 +414,19 @@ def fixture_rows() -> dict[str, list[dict[str, object]]]:
         separators=(",", ":"),
         sort_keys=True,
     )
+    opencode_option_binding = json.dumps(
+        {
+            "contract_version": 3,
+            "control_state": "controlled",
+            "harness": "opencode",
+            "requested_model": "ollama-cloud/deepseek-v4-pro",
+            "provider_model": "deepseek-v4-pro",
+            "native_option_id": "high",
+            "transport": "opencode-route-agent",
+        },
+        separators=(",", ":"),
+        sort_keys=True,
+    )
     return {
         "users": [
             {"user_id": 9001, "username": "dsh-fixture-operator", "email": "fixture@example.invalid", "initials": "DF"}
@@ -438,6 +465,7 @@ def fixture_rows() -> dict[str, list[dict[str, object]]]:
         "sprint_participant_route_bindings": [
             {"binding_id": 9001, "participant_id": 9001, "route_revision": 1, "contract_version": 3, "control_state": "controlled", "harness": "deepseek", "requested_model": "deepseek-official/deepseek-chat", "provider_model": "deepseek-chat", "requested_effort": "high", "effective_effort": "high", "native_option_id": "high", "transport": "deepseek-stock-host-v1", "selector_binding": deepseek_binding, "adapter_metadata": "{}", "binding_json": deepseek_binding, "binding_digest": sha256_bytes(deepseek_binding.encode()), "harness_evidence_format": "harness-live-v1", "harness_support_state": "tested"},
             {"binding_id": 9002, "participant_id": 9002, "route_revision": 1, "contract_version": 3, "control_state": "controlled", "harness": "opencode", "requested_model": "ollama-cloud/deepseek-v4-pro", "provider_model": "deepseek-v4-pro", "transport": "opencode-route-agent", "selector_binding": opencode_binding, "adapter_metadata": "{}", "binding_json": opencode_binding, "binding_digest": sha256_bytes(opencode_binding.encode()), "harness_evidence_format": "harness-live-v1", "harness_support_state": "tested"},
+            {"binding_id": 9003, "participant_id": 9002, "route_revision": 2, "contract_version": 3, "control_state": "controlled", "harness": "opencode", "requested_model": "ollama-cloud/deepseek-v4-pro", "provider_model": "deepseek-v4-pro", "requested_effort": "high", "effective_effort": "high", "native_option_id": "high", "transport": "opencode-route-agent", "selector_binding": opencode_option_binding, "adapter_metadata": "{}", "binding_json": opencode_option_binding, "binding_digest": sha256_bytes(opencode_option_binding.encode()), "harness_evidence_format": "harness-live-v1", "harness_support_state": "tested"},
         ],
         "conversations": [
             {"conversation_id": "cv_dsh_fixture", "shell_id": 9001, "owner_user_id": 9001, "harness": "deepseek", "provider": "deepseek-official", "model": "deepseek-chat", "effort": "high", "worktree": "/fixture/dsh", "harness_session_ref": "sc-" + "d" * 32, "state": "running", "title": "DSH purge input", "creation_idempotency_key": "dsh-fixture", "creation_request_hash": "d" * 64, "conversation_scope": "normal", "route_contract_version": 3, "route_binding": deepseek_binding},

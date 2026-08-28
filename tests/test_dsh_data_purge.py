@@ -77,7 +77,7 @@ def fresh_historical_replay() -> sqlite3.Connection:
     con.executescript((ROOT / ".super-coder/schema.sql").read_text())
     manifest = preparation.load(preparation.MANIFEST_PATH)
     for row in manifest["immutable_migration_ledger"]:
-        path = ROOT / row["path"]
+        path = preparation.FIXTURES.frozen_source_path(row["path"])
         if preparation.FIXTURES.sha256_file(path) != row["sha256"]:
             con.close()
             raise AssertionError(f"immutable migration changed: {row['filename']}")

@@ -38,6 +38,9 @@ _TXN_BEGIN = re.compile(r"^\s*BEGIN(\s+TRANSACTION)?\s*;\s*$", re.IGNORECASE)
 _TXN_COMMIT = re.compile(r"^\s*(COMMIT|END\s+TRANSACTION)\s*;\s*$", re.IGNORECASE)
 _FOREIGN_KEYS_OFF = "-- migrate: foreign-keys-off"
 _REQUIRES_DSH_PURGE_FLOOR = "-- migrate: requires-dsh-purge-floor"
+_REQUIRES_REBASELINE_FLOOR = "-- migrate: requires-rebaseline-floor"
+_FRESH_BUILD_STAMP_ONLY = "-- migrate: fresh-build-stamp-only"
+_REBASELINE_FLOOR_MIGRATION = "0237_purge_dsh_owned_data.sql"
 _GOVERNING_REVISION_MIGRATION = "0204_sprint_governing_revision_evidence.sql"
 
 
@@ -112,7 +115,13 @@ def _run_data_hook(con, path: Path) -> None:
     reconcile_governing_revision_evidence(con)
 
 
-def apply(con, path: Path, *, dsh_purge_authorized: bool = False) -> None:
+def apply(
+    con,
+    path: Path,
+    *,
+    dsh_purge_authorized: bool = False,
+    rebaseline_authorized: bool = False,
+) -> None:
     """Apply one migration file and stamp the ledger ATOMICALLY.
 
     executescript() disregards isolation_level and autocommits each statement of
@@ -125,6 +134,10 @@ def apply(con, path: Path, *, dsh_purge_authorized: bool = False) -> None:
     if _REQUIRES_DSH_PURGE_FLOOR in sql and not dsh_purge_authorized:
         raise MigrationPreconditionError(
             f"{path.name} requires a validated DSH purge floor"
+        )
+    if _REQUIRES_REBASELINE_FLOOR in sql and not rebaseline_authorized:
+        raise MigrationPreconditionError(
+            f"{path.name} requires the prior migration floor"
         )
     foreign_keys_off = _FOREIGN_KEYS_OFF in sql
     script = "BEGIN;\n" f"{_strip_outer_txn(sql).strip()}\n"
@@ -143,6 +156,24 @@ def apply(con, path: Path, *, dsh_purge_authorized: bool = False) -> None:
     finally:
         if foreign_keys_off:
             con.execute("PRAGMA foreign_keys=ON")
+
+
+def stamp_without_applying(con, path: Path) -> None:
+    """Record a migration whose destructive body is irrelevant to a fresh DB."""
+    try:
+        con.execute("BEGIN")
+        con.execute(
+            "INSERT INTO schema_migrations (filename) VALUES (?)", (path.name,)
+        )
+        con.commit()
+    except Exception:
+        con.rollback()
+        raise
+
+
+def rebaseline_floor_reached(con) -> bool:
+    """Return whether this installed DB crossed the immediately prior floor."""
+    return _REBASELINE_FLOOR_MIGRATION in applied_set(con)
 
 
 def backup_before_migrate(db_path: str) -> Path | None:
@@ -180,6 +211,11 @@ def migrate(
         applied = 0
         for path in todo:
             sql = path.read_text()
+            if fresh_build and _FRESH_BUILD_STAMP_ONLY in sql:
+                stamp_without_applying(con, path)
+                print(f"migrate: baseline-stamped {path.name}")
+                applied += 1
+                continue
             purge_authorized = False
             if _REQUIRES_DSH_PURGE_FLOOR in sql:
                 if fresh_build:
@@ -197,10 +233,23 @@ def migrate(
                         "migrate: validated DSH purge floor "
                         f"{proof['target_ref'][:12]}"
                     )
+            rebaseline_authorized = False
+            if _REQUIRES_REBASELINE_FLOOR in sql:
+                if fresh_build:
+                    rebaseline_authorized = True
+                elif not rebaseline_floor_reached(con):
+                    print(
+                        "migrate: deferred "
+                        f"{path.name} — prior migration floor is absent"
+                    )
+                    break
+                else:
+                    rebaseline_authorized = True
             apply(
                 con,
                 path,
                 dsh_purge_authorized=purge_authorized,
+                rebaseline_authorized=rebaseline_authorized,
             )  # each file self-commits atomically with its stamp
             print(f"migrate: applied {path.name}")
             applied += 1

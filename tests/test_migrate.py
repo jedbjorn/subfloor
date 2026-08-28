@@ -271,6 +271,84 @@ class AtomicMigrateTests(unittest.TestCase):
         declared.assert_not_called()
         require.assert_not_called()
 
+    def test_fresh_build_stamp_only_never_executes_destructive_body(self):
+        self._write(
+            "0001_historical_purge.sql",
+            "-- migrate: fresh-build-stamp-only\n"
+            "DELETE FROM t;\n"
+            "INSERT INTO missing_table VALUES (1);\n",
+        )
+        con = db_driver.connect(self.db)
+        try:
+            con.execute("INSERT INTO t (a) VALUES (41)")
+            con.commit()
+        finally:
+            con.close()
+
+        self._run(fresh_build=True)
+
+        with closing(db_driver.connect(self.db)) as con:
+            self.assertEqual(
+                [(41,)],
+                [tuple(row) for row in con.execute("SELECT a FROM t")],
+            )
+        self.assertEqual({"0001_historical_purge.sql"}, self._stamped())
+
+    def test_rebaseline_waits_for_immediately_prior_floor(self):
+        self._write(
+            "0238_rebaseline.sql",
+            "-- migrate: requires-rebaseline-floor\n"
+            "ALTER TABLE t ADD COLUMN final_shape;\n",
+        )
+        self._write(
+            "0239_later.sql",
+            "ALTER TABLE t ADD COLUMN later;\n",
+        )
+
+        self._run()
+
+        self.assertEqual(["a"], self._cols())
+        self.assertEqual(set(), self._stamped())
+
+    def test_rebaseline_applies_after_prior_floor_stamp(self):
+        self._write(
+            "0238_rebaseline.sql",
+            "-- migrate: requires-rebaseline-floor\n"
+            "ALTER TABLE t ADD COLUMN final_shape;\n",
+        )
+        con = db_driver.connect(self.db)
+        try:
+            migrate.applied_set(con)
+            con.execute(
+                "INSERT INTO schema_migrations (filename) VALUES (?)",
+                (migrate._REBASELINE_FLOOR_MIGRATION,),
+            )
+            con.commit()
+        finally:
+            con.close()
+
+        self._run()
+
+        self.assertEqual(["a", "final_shape"], self._cols())
+        self.assertEqual(
+            {migrate._REBASELINE_FLOOR_MIGRATION, "0238_rebaseline.sql"},
+            self._stamped(),
+        )
+
+    def test_direct_apply_rejects_unproven_rebaseline_floor(self):
+        path = self.migdir / "0238_rebaseline.sql"
+        self._write(
+            path.name,
+            "-- migrate: requires-rebaseline-floor\n"
+            "ALTER TABLE t ADD COLUMN final_shape;\n",
+        )
+        with closing(db_driver.connect(self.db)) as con, self.assertRaisesRegex(
+            migrate.MigrationPreconditionError, "prior migration floor"
+        ):
+            migrate.apply(con, path)
+
+        self.assertEqual(["a"], self._cols())
+
     def test_direct_apply_rejects_unproven_purge_floor(self):
         path = self.migdir / "0001_purge.sql"
         self._write(

@@ -13,6 +13,10 @@ from pathlib import Path
 from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
+MIGRATIONS = ROOT / ".super-coder" / "migrations"
+HISTORICAL_MIGRATIONS = (
+    ROOT / "tests" / "fixtures" / "dsh_removal" / "historical_migrations"
+)
 OLLAMA_ACCEPTANCE = json.loads(
     (ROOT / "tests" / "fixtures" / "ollama_live_native_acceptance.json")
     .read_text()
@@ -25,6 +29,13 @@ import models as routes_cli  # noqa: E402
 import route_bindings  # noqa: E402
 import harness_versions  # noqa: E402
 import server as api_server  # noqa: E402
+
+
+def migration_path(filename: str) -> Path:
+    current = MIGRATIONS / filename
+    if current.is_file():
+        return current
+    return HISTORICAL_MIGRATIONS / filename
 
 
 def compatible_runtime(version: str = "2.22.0", *, harness: str | None = None,
@@ -133,16 +144,13 @@ def route_schema(path: str | Path = ":memory:") -> sqlite3.Connection:
         ROOT / ".super-coder" / "migrations" /
         "0223_model_default_effort_binding.sql"
     ).read_text())
-    con.executescript((
-        ROOT / ".super-coder" / "migrations" /
+    con.executescript(migration_path(
         "0227_deepseek_controlled_route_binding.sql"
     ).read_text())
-    con.executescript((
-        ROOT / ".super-coder" / "migrations" /
+    con.executescript(migration_path(
         "0230_deepseek_stock_host_route_binding.sql"
     ).read_text())
-    con.executescript((
-        ROOT / ".super-coder" / "migrations" /
+    con.executescript(migration_path(
         "0235_live_native_route_binding_v3.sql"
     ).read_text())
     return con
@@ -1080,9 +1088,7 @@ class LegacySprintBindingUpgradeTest(unittest.TestCase):
             "0230_deepseek_stock_host_route_binding.sql",
             "0235_live_native_route_binding_v3.sql",
         ):
-            self.con.executescript(
-                (ROOT / ".super-coder" / "migrations" / migration).read_text()
-            )
+            self.con.executescript(migration_path(migration).read_text())
 
         self.assertEqual(
             [tuple(row) for row in self.con.execute(
@@ -1126,9 +1132,7 @@ class LegacySprintBindingUpgradeTest(unittest.TestCase):
             "0227_deepseek_controlled_route_binding.sql",
             "0230_deepseek_stock_host_route_binding.sql",
         ):
-            self.con.executescript(
-                (ROOT / ".super-coder" / "migrations" / migration).read_text()
-            )
+            self.con.executescript(migration_path(migration).read_text())
         before = tuple(self.con.execute(
             "SELECT participant_id,route_revision,binding_json,binding_digest,"
             "source_fingerprint,harness_version,harness_evidence_format,"
@@ -1136,8 +1140,7 @@ class LegacySprintBindingUpgradeTest(unittest.TestCase):
             "WHERE participant_id=10"
         ).fetchone())
 
-        self.con.executescript((
-            ROOT / ".super-coder" / "migrations" /
+        self.con.executescript(migration_path(
             "0235_live_native_route_binding_v3.sql"
         ).read_text())
         preserved = self.con.execute(

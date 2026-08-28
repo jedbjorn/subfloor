@@ -4,12 +4,13 @@
 -- descendants, and the frozen governing-spec digest.  Free text is never
 -- deletion authority.  OpenCode-owned DeepSeek-family models and retained
 -- mixed-Sprint rows are retained byte-for-byte.  The migration runner admits
--- this file only at the proven purge floor (or during a fresh rebuild) and
--- wraps this body and its ledger stamp in one transaction, so every deletion
--- and trigger change rolls back together on failure.
+-- this body only at the proven purge floor; a fresh rebuild stamps the file
+-- without executing it.  Body + ledger stamp share one transaction, so every
+-- deletion and trigger change rolls back together on failure.
 
 -- migrate: foreign-keys-off
 -- migrate: requires-dsh-purge-floor
+-- migrate: fresh-build-stamp-only
 PRAGMA foreign_keys=OFF;
 
 BEGIN;
