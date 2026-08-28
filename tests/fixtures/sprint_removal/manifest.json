@@ -133,7 +133,8 @@
     ".super-coder/migrations/0229_reseed_messaging_wake_guidance.sql",
     ".super-coder/migrations/0231_suppress_aborted_sprint_pr_wakes.sql",
     ".super-coder/migrations/0233_reseed_sprint_aware_pr_notifications.sql",
-    ".super-coder/migrations/0234_reseed_ci_fallback_authority.sql"
+    ".super-coder/migrations/0234_reseed_ci_fallback_authority.sql",
+    ".super-coder/migrations/0238_final_schema_rebaseline.sql"
   ],
   "baseline_migration_ledger": {
     "count": 142,
