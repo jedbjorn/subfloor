@@ -278,7 +278,10 @@ def main(argv: list[str]) -> int:
         finally:
             con.close()
 
-        migrate_mod.migrate(str(candidate))
+        # A candidate built from schema.sql has no user-owned live data.  It
+        # may replay the purge migration without an installed cutover receipt;
+        # in-place migration never receives this authorization.
+        migrate_mod.migrate(str(candidate), fresh_build=True)
 
         snap = snapshot_path()
         if snap.exists():

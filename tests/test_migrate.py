@@ -46,9 +46,11 @@ class AtomicMigrateTests(unittest.TestCase):
     def _write(self, name: str, sql: str) -> None:
         (self.migdir / name).write_text(sql)
 
-    def _run(self, *, backup: bool = False):
+    def _run(self, *, backup: bool = False, fresh_build: bool = False):
         with mock.patch.object(migrate, "MIGRATIONS_DIR", self.migdir):
-            return migrate.migrate(self.db, backup=backup)
+            return migrate.migrate(
+                self.db, backup=backup, fresh_build=fresh_build
+            )
 
     def _stamped(self) -> set[str]:
         con = db_driver.connect(self.db)
@@ -211,6 +213,85 @@ class AtomicMigrateTests(unittest.TestCase):
                 "WHERE type='table' AND name='schema_migrations'"
             ).fetchall()
         self.assertEqual(ledger, [])
+
+    def test_purge_floor_barrier_defers_itself_and_later_migrations(self):
+        self._write(
+            "0001_purge.sql",
+            "-- migrate: requires-dsh-purge-floor\n"
+            "ALTER TABLE t ADD COLUMN purged;\n",
+        )
+        self._write("0002_later.sql", "ALTER TABLE t ADD COLUMN later;\n")
+
+        with mock.patch.object(
+            migrate.update_cutover, "purge_floor_declared", return_value=False
+        ), mock.patch.object(
+            migrate.update_cutover, "require_purge_floor"
+        ) as require:
+            self._run()
+
+        self.assertEqual(["a"], self._cols())
+        self.assertEqual(set(), self._stamped())
+        require.assert_not_called()
+
+    def test_declared_purge_floor_refuses_before_body_when_receipt_is_invalid(self):
+        self._write(
+            "0001_purge.sql",
+            "-- migrate: requires-dsh-purge-floor\n"
+            "ALTER TABLE t ADD COLUMN purged;\n",
+        )
+        with mock.patch.object(
+            migrate.update_cutover, "purge_floor_declared", return_value=True
+        ), mock.patch.object(
+            migrate.update_cutover,
+            "require_purge_floor",
+            side_effect=migrate.update_cutover.CutoverError("receipt mismatch"),
+        ), self.assertRaisesRegex(
+            migrate.update_cutover.CutoverError, "receipt mismatch"
+        ):
+            self._run()
+
+        self.assertEqual(["a"], self._cols())
+        self.assertEqual(set(), self._stamped())
+
+    def test_fresh_build_explicitly_authorizes_purge_replay(self):
+        self._write(
+            "0001_purge.sql",
+            "-- migrate: requires-dsh-purge-floor\n"
+            "ALTER TABLE t ADD COLUMN purged;\n",
+        )
+        with mock.patch.object(
+            migrate.update_cutover, "purge_floor_declared"
+        ) as declared, mock.patch.object(
+            migrate.update_cutover, "require_purge_floor"
+        ) as require:
+            self._run(fresh_build=True)
+
+        self.assertEqual(["a", "purged"], self._cols())
+        self.assertEqual({"0001_purge.sql"}, self._stamped())
+        declared.assert_not_called()
+        require.assert_not_called()
+
+    def test_direct_apply_rejects_unproven_purge_floor(self):
+        path = self.migdir / "0001_purge.sql"
+        self._write(
+            path.name,
+            "-- migrate: requires-dsh-purge-floor\n"
+            "ALTER TABLE t ADD COLUMN purged;\n",
+        )
+        with closing(db_driver.connect(self.db)) as con, self.assertRaisesRegex(
+            migrate.MigrationPreconditionError, "validated DSH purge floor"
+        ):
+            migrate.apply(con, path)
+
+        self.assertEqual(["a"], self._cols())
+        with closing(db_driver.connect(self.db)) as con:
+            self.assertEqual(
+                [],
+                con.execute(
+                    "SELECT name FROM sqlite_master "
+                    "WHERE type='table' AND name='schema_migrations'"
+                ).fetchall(),
+            )
 
 
 if __name__ == "__main__":

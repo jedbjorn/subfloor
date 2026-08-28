@@ -173,8 +173,19 @@ def seed_extended_graph(con: sqlite3.Connection) -> None:
         "(9101,9001,9001,9002,'Purge DSH graph','Delete DSH rows',1,'planned')"
     )
     con.execute(
+        "INSERT INTO sprint_work_units "
+        "(work_unit_id,sprint_id,assigned_shell_id,reviewer_shell_id,title,"
+        "expected_output,planned_wave,disposition) VALUES "
+        "(9201,9001,9002,9002,'Document replaced DSH participant',"
+        "'Retain the mixed Sprint record exactly',2,'planned')"
+    )
+    con.execute(
         "INSERT INTO sprint_work_unit_tasks (sprint_id,work_unit_id,task_id) "
         "VALUES (9001,9101,9001)"
+    )
+    con.execute(
+        "INSERT INTO sprint_work_unit_tasks (sprint_id,work_unit_id,task_id) "
+        "VALUES (9001,9201,9001)"
     )
     con.execute(
         "INSERT INTO wake_message "
@@ -327,6 +338,11 @@ def seed_extended_graph(con: sqlite3.Connection) -> None:
         "VALUES (9201,9201,1,'cv_opencode_deepseek_fixture','delivered')"
     )
     con.execute(
+        "INSERT INTO sprint_wake_recovery_messages "
+        "(recovery_event_id,sprint_id,prior_wake_id,replacement_wake_id,message_id) "
+        "VALUES (9101,9001,9101,9201,9101)"
+    )
+    con.execute(
         "INSERT INTO sprint_liveness_expectations "
         "(message_id,sprint_id,participant_id,accepted_at,last_strong_at,"
         "last_strong_key) VALUES "
@@ -336,13 +352,28 @@ def seed_extended_graph(con: sqlite3.Connection) -> None:
         "INSERT INTO sprint_events "
         "(event_id,sprint_id,event_type,actor_kind,actor_shell_id,payload) "
         "VALUES (9201,9001,'retained','participant',9002,"
-        "'{\"participant_id\":9002,\"harness\":\"opencode\"}')"
+        "'{\"participant_id\":9002,\"harness\":\"opencode\","
+        "\"note\":\"DSH participant was replaced\"}')"
     )
     con.execute(
         "INSERT INTO sprint_reports "
         "(report_id,sprint_id,report_kind,author_shell_id,body,idempotency_key) "
-        "VALUES (9201,9001,'final',9002,'retained OpenCode report',"
+        "VALUES (9201,9001,'final',9002,"
+        "'Retained report: the DSH participant was replaced',"
         "'opencode-report')"
+    )
+    con.execute(
+        "INSERT INTO sprint_judgments "
+        "(judgment_id,sprint_id,participant_id,work_unit_id,kind,body) "
+        "VALUES (9201,9001,9002,9201,'decision',"
+        "'Retain this DSH replacement note')"
+    )
+    con.execute(
+        "INSERT INTO sprint_followups "
+        "(followup_id,sprint_id,source_report_id,severity,title,body,"
+        "spec_document_id,work_unit_id,idempotency_key) VALUES "
+        "(9201,9001,9201,'Low','Retained DSH note',"
+        "'Document the retained replacement',9001,9201,'opencode-followup')"
     )
     con.commit()
 
@@ -410,7 +441,7 @@ class DshDataPurgeTest(unittest.TestCase):
             )
             con.commit()
 
-            migrate.apply(con, MIGRATION)
+            migrate.apply(con, MIGRATION, dsh_purge_authorized=True)
 
             for table, column, identity in (
                 ("roadmap", "feature_id", 9100),
@@ -419,6 +450,7 @@ class DshDataPurgeTest(unittest.TestCase):
                 ("sprint_participants", "participant_id", 9301),
                 ("sprint_participant_route_bindings", "binding_id", 9301),
                 ("sprint_participant_conversations", "participant_conversation_id", 9301),
+                ("sprint_specs", "sprint_id", 9100),
             ):
                 self.assertEqual(
                     0,
@@ -475,9 +507,34 @@ class DshDataPurgeTest(unittest.TestCase):
                 ),
                 "event": rows(con, "SELECT * FROM sprint_events WHERE event_id=9201"),
                 "report": rows(con, "SELECT * FROM sprint_reports WHERE report_id=9201"),
+                "roadmap": rows(con, "SELECT * FROM roadmap WHERE feature_id=9001"),
+                "document": rows(con, "SELECT * FROM documents WHERE document_id=9001"),
+                "task": rows(con, "SELECT * FROM spec_tasks WHERE task_id=9001"),
+                "decision": rows(
+                    con, "SELECT * FROM shell_decisions WHERE decision_id=9001"
+                ),
+                "flag": rows(con, "SELECT * FROM flags WHERE flag_id=9001"),
+                "work_unit": rows(
+                    con, "SELECT * FROM sprint_work_units WHERE work_unit_id=9201"
+                ),
+                "work_unit_task": rows(
+                    con,
+                    "SELECT * FROM sprint_work_unit_tasks WHERE work_unit_id=9201",
+                ),
+                "sprint_spec": rows(
+                    con,
+                    "SELECT * FROM sprint_specs "
+                    "WHERE sprint_id=9001 AND document_id=9001",
+                ),
+                "judgment": rows(
+                    con, "SELECT * FROM sprint_judgments WHERE judgment_id=9201"
+                ),
+                "followup": rows(
+                    con, "SELECT * FROM sprint_followups WHERE followup_id=9201"
+                ),
             }
 
-            migrate.apply(con, MIGRATION)
+            migrate.apply(con, MIGRATION, dsh_purge_authorized=True)
 
             self.assertEqual((0,) * 9, typed_absence(con))
             for table, column, identity in (
@@ -485,25 +542,29 @@ class DshDataPurgeTest(unittest.TestCase):
                 ("conversation_events", "event_id", 9101),
                 ("conversation_git_targets", "target_id", "gt_" + "1" * 32),
                 ("conversation_boot_snapshots", "conversation_id", "cv_dsh_fixture"),
+                ("conversation_runs", "run_id", 9001),
+                ("conversation_outbox", "outbox_id", 9001),
+                ("active_shell_chats", "shell_id", 9001),
                 ("sprint_participant_conversations", "participant_conversation_id", 9101),
                 ("session_token_usage", "usage_id", 9101),
                 ("sprint_work_units", "work_unit_id", 9101),
                 ("wake_message", "message_id", 9101),
                 ("wake_message", "message_id", 9102),
                 ("sprint_wake_outbox", "wake_id", 9101),
+                ("sprint_wake_messages", "message_id", 9101),
+                ("sprint_wake_recovery_messages", "recovery_event_id", 9101),
                 ("sprint_liveness_expectations", "message_id", 9101),
                 ("sprint_events", "event_id", 9101),
                 ("sprint_judgments", "judgment_id", 9101),
                 ("sprint_reports", "report_id", 9101),
                 ("sprint_followups", "followup_id", 9101),
                 ("sprint_registered_prs", "registered_pr_id", 9101),
+                ("sprint_pr_transitions", "transition_id", 9101),
+                ("sprint_pr_work_units", "registered_pr_id", 9101),
                 ("pr_subscriptions", "subscription_id", 9101),
                 ("sprint_cleanup_targets", "cleanup_target_id", 9101),
                 ("sprint_cleanup_requests", "cleanup_request_id", 9101),
-                ("documents", "document_id", 9001),
-                ("spec_tasks", "task_id", 9001),
-                ("shell_decisions", "decision_id", 9001),
-                ("flags", "flag_id", 9001),
+                ("model_catalog_generations", "generation_id", "d" * 32),
             ):
                 self.assertEqual(
                     0,
@@ -527,16 +588,18 @@ class DshDataPurgeTest(unittest.TestCase):
                     "delivery_attempt": "SELECT * FROM sprint_wake_attempts WHERE attempt_id=9201",
                     "event": "SELECT * FROM sprint_events WHERE event_id=9201",
                     "report": "SELECT * FROM sprint_reports WHERE report_id=9201",
+                    "roadmap": "SELECT * FROM roadmap WHERE feature_id=9001",
+                    "document": "SELECT * FROM documents WHERE document_id=9001",
+                    "task": "SELECT * FROM spec_tasks WHERE task_id=9001",
+                    "decision": "SELECT * FROM shell_decisions WHERE decision_id=9001",
+                    "flag": "SELECT * FROM flags WHERE flag_id=9001",
+                    "work_unit": "SELECT * FROM sprint_work_units WHERE work_unit_id=9201",
+                    "work_unit_task": "SELECT * FROM sprint_work_unit_tasks WHERE work_unit_id=9201",
+                    "sprint_spec": "SELECT * FROM sprint_specs WHERE sprint_id=9001 AND document_id=9001",
+                    "judgment": "SELECT * FROM sprint_judgments WHERE judgment_id=9201",
+                    "followup": "SELECT * FROM sprint_followups WHERE followup_id=9201",
                 }[name]
                 self.assertEqual(before, rows(con, query), name)
-            self.assertEqual(
-                ("Retained mixed Sprint", None),
-                tuple(
-                    con.execute(
-                        "SELECT title,summary FROM roadmap WHERE feature_id=9001"
-                    ).fetchone()
-                ),
-            )
             self.assertEqual([], con.execute("PRAGMA foreign_key_check").fetchall())
             self.assertEqual(protected_triggers, protected_trigger_sql(con))
             self.assertIn(
@@ -576,8 +639,8 @@ class DshDataPurgeTest(unittest.TestCase):
         with closing(fresh_historical_replay()) as fresh, closing(
             preparation.replay_database(fixture)
         ) as bridge:
-            migrate.apply(fresh, MIGRATION)
-            migrate.apply(bridge, MIGRATION)
+            migrate.apply(fresh, MIGRATION, dsh_purge_authorized=True)
+            migrate.apply(bridge, MIGRATION, dsh_purge_authorized=True)
 
             self.assertEqual((0,) * 9, typed_absence(fresh))
             self.assertEqual(typed_absence(fresh), typed_absence(bridge))
@@ -613,7 +676,7 @@ class DshDataPurgeTest(unittest.TestCase):
             )
 
             with self.assertRaisesRegex(sqlite3.OperationalError, "no such table"):
-                migrate.apply(con, injected)
+                migrate.apply(con, injected, dsh_purge_authorized=True)
 
             self.assertEqual(
                 [("cv_dsh_fixture",), ("cv_dsh_sprint",)],

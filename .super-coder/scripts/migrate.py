@@ -28,6 +28,7 @@ MIGRATIONS_DIR = ENGINE / "migrations"
 sys.path.insert(0, str(ENGINE / "scripts"))
 import db_backup  # noqa: E402
 import db_driver  # noqa: E402
+import update_cutover  # noqa: E402
 
 # A migration file's own outermost transaction control (on its own line). A
 # trigger body's `BEGIN` (no trailing `;`) and `END;` (not `COMMIT;`/`END
@@ -36,7 +37,12 @@ import db_driver  # noqa: E402
 _TXN_BEGIN = re.compile(r"^\s*BEGIN(\s+TRANSACTION)?\s*;\s*$", re.IGNORECASE)
 _TXN_COMMIT = re.compile(r"^\s*(COMMIT|END\s+TRANSACTION)\s*;\s*$", re.IGNORECASE)
 _FOREIGN_KEYS_OFF = "-- migrate: foreign-keys-off"
+_REQUIRES_DSH_PURGE_FLOOR = "-- migrate: requires-dsh-purge-floor"
 _GOVERNING_REVISION_MIGRATION = "0204_sprint_governing_revision_evidence.sql"
+
+
+class MigrationPreconditionError(RuntimeError):
+    """A destructive migration was invoked without its proven delivery floor."""
 
 
 def applied_set(con) -> set[str]:
@@ -106,7 +112,7 @@ def _run_data_hook(con, path: Path) -> None:
     reconcile_governing_revision_evidence(con)
 
 
-def apply(con, path: Path) -> None:
+def apply(con, path: Path, *, dsh_purge_authorized: bool = False) -> None:
     """Apply one migration file and stamp the ledger ATOMICALLY.
 
     executescript() disregards isolation_level and autocommits each statement of
@@ -116,6 +122,10 @@ def apply(con, path: Path) -> None:
     explicit transaction (with rollback on error) makes a partial failure revert
     whole, leaving the migration unstamped and cleanly re-runnable."""
     sql = path.read_text()
+    if _REQUIRES_DSH_PURGE_FLOOR in sql and not dsh_purge_authorized:
+        raise MigrationPreconditionError(
+            f"{path.name} requires a validated DSH purge floor"
+        )
     foreign_keys_off = _FOREIGN_KEYS_OFF in sql
     script = "BEGIN;\n" f"{_strip_outer_txn(sql).strip()}\n"
     try:
@@ -147,7 +157,9 @@ def backup_before_migrate(db_path: str) -> Path | None:
     return result
 
 
-def migrate(db_path: str, *, backup: bool = False) -> int:
+def migrate(
+    db_path: str, *, backup: bool = False, fresh_build: bool = False
+) -> int:
     # Spec #68 req 5: name the two targets — WHICH database, and WHICH migration
     # source — before opening either, and again on the outcome. `./sc migrate`
     # run from a linked worktree used to maintain the main checkout's live DB and
@@ -165,10 +177,34 @@ def migrate(db_path: str, *, backup: bool = False) -> int:
         if not todo:
             print(f"migrate: nothing pending — {target} is current.")
             return 0
+        applied = 0
         for path in todo:
-            apply(con, path)  # each file self-commits atomically with its stamp
+            sql = path.read_text()
+            purge_authorized = False
+            if _REQUIRES_DSH_PURGE_FLOOR in sql:
+                if fresh_build:
+                    purge_authorized = True
+                elif not update_cutover.purge_floor_declared():
+                    print(
+                        "migrate: deferred "
+                        f"{path.name} — target has not declared the purge floor"
+                    )
+                    break
+                else:
+                    proof = update_cutover.require_purge_floor()
+                    purge_authorized = True
+                    print(
+                        "migrate: validated DSH purge floor "
+                        f"{proof['target_ref'][:12]}"
+                    )
+            apply(
+                con,
+                path,
+                dsh_purge_authorized=purge_authorized,
+            )  # each file self-commits atomically with its stamp
             print(f"migrate: applied {path.name}")
-        print(f"migrate: {len(todo)} migration(s) applied to {target}.")
+            applied += 1
+        print(f"migrate: {applied} migration(s) applied to {target}.")
     finally:
         con.close()
     return 0

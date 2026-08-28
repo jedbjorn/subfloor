@@ -1,13 +1,15 @@
 -- Feature #60 / spec #178 / task #681 — purge every DSH-owned data graph.
 --
 -- Ownership starts from typed DeepSeek harness rows, their foreign-key
--- descendants, bounded references inside an already-owned mixed Sprint, and
--- the frozen governing-spec digest.  OpenCode-owned DeepSeek-family models are
--- retained byte-for-byte.  The migration runner wraps this body and its ledger
--- stamp in one transaction, so every deletion and trigger change rolls back
--- together on failure.
+-- descendants, and the frozen governing-spec digest.  Free text is never
+-- deletion authority.  OpenCode-owned DeepSeek-family models and retained
+-- mixed-Sprint rows are retained byte-for-byte.  The migration runner admits
+-- this file only at the proven purge floor (or during a fresh rebuild) and
+-- wraps this body and its ledger stamp in one transaction, so every deletion
+-- and trigger change rolls back together on failure.
 
 -- migrate: foreign-keys-off
+-- migrate: requires-dsh-purge-floor
 PRAGMA foreign_keys=OFF;
 
 BEGIN;
@@ -163,35 +165,6 @@ SELECT sprint_id FROM _dsh_full_sprints;
 INSERT OR IGNORE INTO _dsh_affected_sprints (sprint_id)
 SELECT sprint_id FROM _dsh_participants;
 
-INSERT OR IGNORE INTO _dsh_documents (document_id)
-SELECT document.document_id
-FROM documents document
-JOIN sprints sprint ON sprint.feature_id=document.feature_id
-JOIN _dsh_affected_sprints affected USING (sprint_id)
-WHERE instr(lower(COALESCE(document.title,'')),'deepseek')>0
-   OR instr(lower(COALESCE(document.title,'')),'dsh')>0
-   OR instr(lower(COALESCE(document.body,'')),'deepseek')>0
-   OR instr(lower(COALESCE(document.body,'')),'dsh')>0;
-
-INSERT OR IGNORE INTO _dsh_tasks (task_id)
-SELECT task.task_id
-FROM spec_tasks task
-LEFT JOIN _dsh_documents document USING (document_id)
-WHERE document.document_id IS NOT NULL
-   OR (
-     task.feature_id IN (
-       SELECT sprint.feature_id
-       FROM sprints sprint
-       JOIN _dsh_affected_sprints affected USING (sprint_id)
-     )
-     AND (
-       instr(lower(task.title),'deepseek')>0
-       OR instr(lower(task.title),'dsh')>0
-       OR instr(lower(COALESCE(task.description,'')),'deepseek')>0
-       OR instr(lower(COALESCE(task.description,'')),'dsh')>0
-     )
-   );
-
 CREATE TEMP TABLE _dsh_decisions (
     decision_id INTEGER PRIMARY KEY
 );
@@ -202,20 +175,7 @@ FROM shell_decisions decision
 LEFT JOIN _dsh_features feature USING (feature_id)
 LEFT JOIN _dsh_documents document USING (document_id)
 WHERE feature.feature_id IS NOT NULL
-   OR document.document_id IS NOT NULL
-   OR (
-     decision.feature_id IN (
-       SELECT sprint.feature_id
-       FROM sprints sprint
-       JOIN _dsh_affected_sprints affected USING (sprint_id)
-     )
-     AND (
-       instr(lower(decision.decision),'deepseek')>0
-       OR instr(lower(decision.decision),'dsh')>0
-       OR instr(lower(COALESCE(decision.rationale,'')),'deepseek')>0
-       OR instr(lower(COALESCE(decision.rationale,'')),'dsh')>0
-     )
-   );
+   OR document.document_id IS NOT NULL;
 
 CREATE TEMP TABLE _dsh_flags (
     flag_id INTEGER PRIMARY KEY
@@ -225,22 +185,7 @@ INSERT INTO _dsh_flags (flag_id)
 SELECT flag.flag_id
 FROM flags flag
 LEFT JOIN _dsh_features feature USING (feature_id)
-WHERE feature.feature_id IS NOT NULL
-   OR (
-     flag.feature_id IN (
-       SELECT sprint.feature_id
-       FROM sprints sprint
-       JOIN _dsh_affected_sprints affected USING (sprint_id)
-     )
-     AND (
-       instr(lower(COALESCE(flag.display_name,'')),'deepseek')>0
-       OR instr(lower(COALESCE(flag.display_name,'')),'dsh')>0
-       OR instr(lower(COALESCE(flag.description,'')),'deepseek')>0
-       OR instr(lower(COALESCE(flag.description,'')),'dsh')>0
-       OR instr(lower(COALESCE(flag.resolution_notes,'')),'deepseek')>0
-       OR instr(lower(COALESCE(flag.resolution_notes,'')),'dsh')>0
-     )
-   );
+WHERE feature.feature_id IS NOT NULL;
 
 CREATE TEMP TABLE _dsh_work_units (
     work_unit_id INTEGER PRIMARY KEY,
@@ -257,19 +202,9 @@ LEFT JOIN _dsh_participants assigned
 LEFT JOIN _dsh_participants reviewer
   ON reviewer.sprint_id=unit.sprint_id
  AND reviewer.shell_id=unit.reviewer_shell_id
-LEFT JOIN _dsh_affected_sprints affected USING (sprint_id)
 WHERE full_sprint.sprint_id IS NOT NULL
    OR assigned.participant_id IS NOT NULL
-   OR reviewer.participant_id IS NOT NULL
-   OR (
-     affected.sprint_id IS NOT NULL
-     AND (
-       instr(lower(unit.title),'deepseek')>0
-       OR instr(lower(unit.title),'dsh')>0
-       OR instr(lower(unit.expected_output),'deepseek')>0
-       OR instr(lower(unit.expected_output),'dsh')>0
-     )
-   );
+   OR reviewer.participant_id IS NOT NULL;
 
 CREATE TEMP TABLE _dsh_registered_prs (
     registered_pr_id INTEGER PRIMARY KEY
@@ -318,16 +253,10 @@ WITH RECURSIVE owned(kind,id) AS (
     LEFT JOIN _dsh_work_units unit
       ON unit.work_unit_id=message.work_unit_id
      AND unit.sprint_id=message.sprint_id
-    LEFT JOIN _dsh_affected_sprints affected USING (sprint_id)
     WHERE full_sprint.sprint_id IS NOT NULL
        OR sender.participant_id IS NOT NULL
        OR receiver.participant_id IS NOT NULL
        OR unit.work_unit_id IS NOT NULL
-       OR (
-         affected.sprint_id IS NOT NULL
-         AND (instr(lower(message.body),'deepseek')>0
-              OR instr(lower(message.body),'dsh')>0)
-       )
     UNION
     SELECT 'wake',wake.wake_id
     FROM sprint_wake_outbox wake
@@ -362,39 +291,31 @@ INSERT INTO _dsh_events (event_id)
 SELECT event.event_id
 FROM sprint_events event
 LEFT JOIN _dsh_full_sprints full_sprint USING (sprint_id)
-LEFT JOIN _dsh_affected_sprints affected USING (sprint_id)
 WHERE full_sprint.sprint_id IS NOT NULL
-   OR (
-     affected.sprint_id IS NOT NULL
-     AND (
-       EXISTS (
-         SELECT 1
-         FROM _dsh_participants participant
-         WHERE participant.sprint_id=event.sprint_id
-           AND participant.shell_id=event.actor_shell_id
-       )
-       OR instr(lower(event.payload),'deepseek')>0
-       OR instr(lower(event.payload),'dsh')>0
-       OR EXISTS (
-         SELECT 1
-         FROM json_tree(event.payload) value
-         WHERE value.key IN (
-           'participant_id','from_participant_id','to_participant_id'
-         )
-           AND CAST(value.atom AS INTEGER) IN (
-             SELECT participant_id FROM _dsh_participants
-           )
-       )
-       OR EXISTS (
-         SELECT 1
-         FROM json_tree(event.payload) value
-         WHERE value.key='work_unit_id'
-           AND CAST(value.atom AS INTEGER) IN (
-             SELECT work_unit_id FROM _dsh_work_units
-           )
-       )
-     )
-   );
+   OR EXISTS (
+        SELECT 1
+        FROM _dsh_participants participant
+        WHERE participant.sprint_id=event.sprint_id
+          AND participant.shell_id=event.actor_shell_id
+      )
+   OR EXISTS (
+        SELECT 1
+        FROM json_tree(event.payload) value
+        WHERE value.key IN (
+          'participant_id','from_participant_id','to_participant_id'
+        )
+          AND CAST(value.atom AS INTEGER) IN (
+            SELECT participant_id FROM _dsh_participants
+          )
+      )
+   OR EXISTS (
+        SELECT 1
+        FROM json_tree(event.payload) value
+        WHERE value.key='work_unit_id'
+          AND CAST(value.atom AS INTEGER) IN (
+            SELECT work_unit_id FROM _dsh_work_units
+          )
+      );
 
 CREATE TEMP TABLE _dsh_reports (
     report_id INTEGER PRIMARY KEY
@@ -404,21 +325,13 @@ INSERT INTO _dsh_reports (report_id)
 SELECT report.report_id
 FROM sprint_reports report
 LEFT JOIN _dsh_full_sprints full_sprint USING (sprint_id)
-LEFT JOIN _dsh_affected_sprints affected USING (sprint_id)
 WHERE full_sprint.sprint_id IS NOT NULL
-   OR (
-     affected.sprint_id IS NOT NULL
-     AND (
-       EXISTS (
-         SELECT 1
-         FROM _dsh_participants participant
-         WHERE participant.sprint_id=report.sprint_id
-           AND participant.shell_id=report.author_shell_id
-       )
-       OR instr(lower(report.body),'deepseek')>0
-       OR instr(lower(report.body),'dsh')>0
-     )
-   );
+   OR EXISTS (
+        SELECT 1
+        FROM _dsh_participants participant
+        WHERE participant.sprint_id=report.sprint_id
+          AND participant.shell_id=report.author_shell_id
+      );
 
 CREATE TEMP TABLE _dsh_approvals (
     approval_id INTEGER PRIMARY KEY
@@ -577,22 +490,11 @@ DELETE FROM sprint_followups
 WHERE sprint_id IN (SELECT sprint_id FROM _dsh_full_sprints)
    OR source_report_id IN (SELECT report_id FROM _dsh_reports)
    OR work_unit_id IN (SELECT work_unit_id FROM _dsh_work_units)
-   OR spec_document_id IN (SELECT document_id FROM _dsh_documents)
-   OR (
-     sprint_id IN (SELECT sprint_id FROM _dsh_affected_sprints)
-     AND (
-       instr(lower(title),'deepseek')>0 OR instr(lower(title),'dsh')>0
-       OR instr(lower(body),'deepseek')>0 OR instr(lower(body),'dsh')>0
-     )
-   );
+   OR spec_document_id IN (SELECT document_id FROM _dsh_documents);
 DELETE FROM sprint_judgments
 WHERE sprint_id IN (SELECT sprint_id FROM _dsh_full_sprints)
    OR participant_id IN (SELECT participant_id FROM _dsh_participants)
-   OR work_unit_id IN (SELECT work_unit_id FROM _dsh_work_units)
-   OR (
-     sprint_id IN (SELECT sprint_id FROM _dsh_affected_sprints)
-     AND (instr(lower(body),'deepseek')>0 OR instr(lower(body),'dsh')>0)
-   );
+   OR work_unit_id IN (SELECT work_unit_id FROM _dsh_work_units);
 DELETE FROM sprint_reports WHERE report_id IN (SELECT report_id FROM _dsh_reports);
 DELETE FROM sprint_events WHERE event_id IN (SELECT event_id FROM _dsh_events);
 DELETE FROM sprint_cleanup_requests
@@ -645,22 +547,6 @@ DELETE FROM governing_revision_backfill_permits
 WHERE sprint_id IN (SELECT sprint_id FROM _dsh_full_sprints)
    OR document_id IN (SELECT document_id FROM _dsh_documents);
 DELETE FROM sprints WHERE sprint_id IN (SELECT sprint_id FROM _dsh_full_sprints);
-
--- A mixed Sprint parent remains only to retain unrelated participants.  Scrub
--- its bounded DSH label while leaving every retained child row unchanged.
-UPDATE roadmap
-SET title='Retained mixed Sprint',summary=NULL
-WHERE feature_id IN (
-        SELECT sprint.feature_id
-        FROM sprints sprint
-        JOIN _dsh_affected_sprints affected USING (sprint_id)
-      )
-  AND feature_id NOT IN (SELECT feature_id FROM _dsh_features)
-  AND (
-    instr(lower(title),'deepseek')>0 OR instr(lower(title),'dsh')>0
-    OR instr(lower(COALESCE(summary,'')),'deepseek')>0
-    OR instr(lower(COALESCE(summary,'')),'dsh')>0
-  );
 
 -- Exact governing-feature planning data is removed after its delivery graph.
 UPDATE shell_decisions
