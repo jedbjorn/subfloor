@@ -1178,8 +1178,17 @@ class DosAppSprintCanaryTest(unittest.TestCase):
             ).stdout.strip()
 
         installed_ref = (workspace / ".sc-state" / "engine.ref").read_text().strip()
+        readiness = json.loads(
+            (
+                workspace
+                / ".sc-state/local/dsh-removal/cleanup-receipt.json"
+            ).read_text()
+        )
         self.assertEqual(candidate_sha, installed_ref)
         self.assertEqual(candidate_sha, callable_ref)
+        self.assertEqual(candidate_sha, readiness["target_ref"])
+        self.assertEqual("fresh-install-empty-database", readiness["mode"])
+        self.assertEqual("complete", readiness["status"])
         self.assertNotEqual(stale_sha, installed_ref)
         self.assertNotEqual(stale_sha, callable_ref)
 

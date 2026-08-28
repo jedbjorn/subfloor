@@ -587,6 +587,49 @@ def record_recovery(
     _atomic_json(receipt_path, receipt)
 
 
+def record_fresh_install_readiness(
+    target_ref: str | None,
+    *,
+    repo_root: Path = REPO_ROOT,
+    manifest_path: Path | None = None,
+    cleanup_receipt_path: Path | None = None,
+) -> bool:
+    """Publish readiness for an empty DB rebuilt from an exact removal ref."""
+    if target_ref is None:
+        return False
+    plan = inspect_target(target_ref, repo_root=repo_root)
+    if plan is None:
+        return False
+    manifest_path = manifest_path or (repo_root / TARGET_MANIFEST_PATH)
+    cleanup_receipt_path = cleanup_receipt_path or CLEANUP_RECEIPT
+    try:
+        manifest_raw = manifest_path.read_bytes()
+    except OSError as exc:
+        raise CutoverError("fresh install removal manifest is unavailable") from exc
+    if hashlib.sha256(manifest_raw).hexdigest() != plan.manifest_sha256:
+        raise CutoverError(
+            "fresh install removal manifest does not match the pinned target ref"
+        )
+    expected = {
+        "compatibility_ref": plan.compatibility_ref,
+        "contract": CLEANUP_RECEIPT_CONTRACT,
+        "errors": [],
+        "manifest_sha256": plan.manifest_sha256,
+        "mode": "fresh-install-empty-database",
+        "status": "complete",
+        "target_ref": plan.target_ref,
+    }
+    if cleanup_receipt_path.exists():
+        receipt = _json_object(
+            cleanup_receipt_path.read_bytes(), label="installed cleanup receipt"
+        )
+        if receipt != expected:
+            raise CutoverError("fresh install cleanup receipt conflicts with target ref")
+        return False
+    _atomic_json(cleanup_receipt_path, expected)
+    return True
+
+
 def installed_removal_ready(
     *,
     engine_ref_path: Path | None = None,

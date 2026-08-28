@@ -202,6 +202,59 @@ class TargetInspectionTest(unittest.TestCase):
         with self.assertRaisesRegex(update_cutover.CutoverError, "cleanup_hook"):
             update_cutover.inspect_target(target_ref, repo_root=self.root)
 
+    def test_fresh_install_readiness_requires_exact_materialized_target(self) -> None:
+        manifest = self.root / update_cutover.TARGET_MANIFEST_PATH
+        write_json(
+            manifest,
+            {
+                "cutover": {
+                    "cleanup_hook": ".super-coder/scripts/dsh_removal_cleanup.py",
+                    "contract": update_cutover.CUTOVER_CONTRACT,
+                    "minimum_floor_ref": "1" * 40,
+                }
+            },
+        )
+        target_ref = commit(self.root, "fresh removal floor")
+        receipt = self.root / ".sc-state/local/dsh-removal/cleanup-receipt.json"
+
+        self.assertTrue(
+            update_cutover.record_fresh_install_readiness(
+                target_ref,
+                repo_root=self.root,
+                manifest_path=manifest,
+                cleanup_receipt_path=receipt,
+            )
+        )
+        self.assertEqual(
+            {
+                "compatibility_ref": "1" * 40,
+                "contract": update_cutover.CLEANUP_RECEIPT_CONTRACT,
+                "errors": [],
+                "manifest_sha256": hashlib.sha256(manifest.read_bytes()).hexdigest(),
+                "mode": "fresh-install-empty-database",
+                "status": "complete",
+                "target_ref": target_ref,
+            },
+            json.loads(receipt.read_text()),
+        )
+        self.assertFalse(
+            update_cutover.record_fresh_install_readiness(
+                target_ref,
+                repo_root=self.root,
+                manifest_path=manifest,
+                cleanup_receipt_path=receipt,
+            )
+        )
+
+        manifest.write_text(manifest.read_text() + "\n")
+        with self.assertRaisesRegex(update_cutover.CutoverError, "pinned target"):
+            update_cutover.record_fresh_install_readiness(
+                target_ref,
+                repo_root=self.root,
+                manifest_path=manifest,
+                cleanup_receipt_path=self.root / "other-receipt.json",
+            )
+
 
 class PurgeFloorAdmissionTest(unittest.TestCase):
     def setUp(self) -> None:

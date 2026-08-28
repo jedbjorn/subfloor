@@ -129,20 +129,21 @@ def main() -> int:
                     current, repo_root=REPO_ROOT
                 )
                 if removal is not None:
-                    update_cutover.require_compatibility_floor(
-                        removal,
-                        marker_path=(
-                            STATE_DIR
-                            / "local/dsh-removal/compatibility-floor.json"
-                        ),
-                    )
-                    if not update_cutover.installed_removal_ready(
+                    ready = update_cutover.installed_removal_ready(
                         engine_ref_path=ENGINE_REF,
                         manifest_path=(REPO_ROOT / update_cutover.TARGET_MANIFEST_PATH),
                         cleanup_receipt_path=(
                             STATE_DIR / "local/dsh-removal/cleanup-receipt.json"
                         ),
-                    ):
+                    )
+                    if not ready:
+                        update_cutover.require_compatibility_floor(
+                            removal,
+                            marker_path=(
+                                STATE_DIR
+                                / "local/dsh-removal/compatibility-floor.json"
+                            ),
+                        )
                         raise update_cutover.CutoverError(
                             "DSH removal target is half-adopted; run "
                             "./sc rollback --engine-only before ordinary launch"
