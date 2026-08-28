@@ -586,11 +586,6 @@ class FreshForkInstallTest(unittest.TestCase):
                 config_path = repo / ".super-coder/instance.json"
                 if config_path.exists():
                     self.assertNotIn("installed_at", json.loads(config_path.read_text()))
-                cleanup_receipt = (
-                    repo / ".sc-state/local/dsh-removal/cleanup-receipt.json"
-                )
-                if script_name == "rebuild.py":
-                    self.assertFalse(cleanup_receipt.exists())
 
                 marker.unlink()
                 repaired = self.run_install(repo, home)

@@ -339,7 +339,7 @@ class MigrationAndShapeTest(ConversationDbCase):
         ).fetchone())
         con.commit()
 
-        migrate.apply(con, LIVE_NATIVE_ROUTES, rebaseline_authorized=True)
+        migrate.apply(con, LIVE_NATIVE_ROUTES)
 
         self.assertEqual(
             tuple(con.execute(

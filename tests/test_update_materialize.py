@@ -1333,13 +1333,6 @@ class UpdateRefPublicationTest(unittest.TestCase):
             ensure_harnesses=mock.Mock(),
             wire_make_aliases=mock.Mock(return_value=()),
         ))
-        stack.enter_context(
-            mock.patch.multiple(
-                update.update_cutover,
-                inspect_target=mock.Mock(return_value=None),
-                install_compatibility_marker=mock.Mock(return_value=False),
-            )
-        )
         stack.enter_context(contextlib.redirect_stdout(io.StringIO()))
         return stack, ref, scripts, events
 
