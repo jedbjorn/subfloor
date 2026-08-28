@@ -1,4 +1,4 @@
-"""OpenCode-owned DeepSeek model routes survive DSH removal unchanged."""
+"""OpenCode-owned model routes preserve exact provider-native identity."""
 
 from __future__ import annotations
 
@@ -84,7 +84,6 @@ def test_catalogue_keeps_exact_deepseek_route_owned_by_opencode(
     assert models[0]["native_variant_ids"] == {OPTION: OPTION}
     assert "adapter_metadata" not in models[0]
     assert "native_default_option_id" not in models[0]
-    assert "deepseek" not in catalogue["harnesses"]
     assert catalogue["sources"].count("opencode-provider-api") == 1
 
 

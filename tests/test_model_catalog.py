@@ -434,7 +434,7 @@ class BuildTest(NoCLI):
                          "keyed-API ids append deduped, models.dev order kept")
         self.assertIn("openai-api", got["sources"])
 
-    def test_removed_dsh_catalogue_keeps_deepseek_family_under_opencode(self):
+    def test_opencode_catalogue_keeps_provider_model_family(self):
         opencode = [{
             "id": "ollama-cloud/deepseek-v4-flash",
             "provider": "ollama-cloud",
@@ -456,10 +456,6 @@ class BuildTest(NoCLI):
             ids(got["harnesses"]["opencode"]),
             ["ollama-cloud/deepseek-v4-flash"],
         )
-        self.assertNotIn("deepseek", got["harnesses"])
-        self.assertNotIn("deepseek-host-api", got["sources"])
-
-
     def test_http_json_rejects_body_larger_than_four_mebibytes(self):
         reads = []
 
@@ -657,7 +653,6 @@ class BuildTest(NoCLI):
         )
         self.assertNotIn("futureProviderField", json.dumps(block))
         self.assertNotIn("endpoint_identity", json.dumps(block))
-        self.assertNotIn("deepseek", got["harnesses"])
         self.assertNotIn(
             "native_default_option_id",
             got["harnesses"]["opencode"]["models"][0],
@@ -1817,7 +1812,6 @@ class CatalogCacheTest(NoCLI):
             ["MAX.Future", "low"],
         )
         self.assertNotIn("old-model", json.dumps(block))
-        self.assertNotIn("deepseek", got["harnesses"])
 
     def test_malformed_opencode_projection_fails_only_its_live_block(self):
         def malformed_opencode():
@@ -1842,7 +1836,6 @@ class CatalogCacheTest(NoCLI):
             "variants must be an object",
             got["harnesses"]["opencode"]["error"],
         )
-        self.assertNotIn("deepseek", got["harnesses"])
         self.assertIn("claude-opus-4-8", ids(got["harnesses"]["claude"]))
 
     def test_fresh_cache_still_refreshes_connected_opencode_models(self):

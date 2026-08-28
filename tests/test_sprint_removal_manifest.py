@@ -805,10 +805,7 @@ for name in sys.argv[2:]:
                 f"migrate: applied {cleanup.name}",
                 first_output.getvalue(),
             )
-            self.assertIn(
-                "migrate: deferred 0237_purge_dsh_owned_data.sql",
-                retry_output.getvalue(),
-            )
+            self.assertIn("migrate: nothing pending", retry_output.getvalue())
             with closing(sqlite3.connect(db_path)) as con:
                 con.row_factory = sqlite3.Row
                 con.execute("PRAGMA foreign_keys=ON")
@@ -818,13 +815,6 @@ for name in sys.argv[2:]:
                         "SELECT COUNT(*) FROM schema_migrations "
                         "WHERE filename=?",
                         (cleanup.name,),
-                    ).fetchone()[0],
-                )
-                self.assertEqual(
-                    0,
-                    con.execute(
-                        "SELECT COUNT(*) FROM schema_migrations "
-                        "WHERE filename='0237_purge_dsh_owned_data.sql'"
                     ).fetchone()[0],
                 )
                 self.assertEqual(

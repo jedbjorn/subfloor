@@ -72,7 +72,6 @@ class ConversationApiCase(unittest.TestCase):
         versions = {
             "claude": ("2.1.222", "2.1.220", "2.2.0"),
             "codex": ("0.145.0", "0.145.0", "0.147.0"),
-            "deepseek": ("0.1.0rc7", "0.1.0rc7", "0.1.0rc8"),
             "kimi": ("0.33.0", "0.30.0", "0.34.0"),
             "opencode": ("1.18.9", "1.18.9", "1.19.0"),
         }
@@ -97,7 +96,7 @@ class ConversationApiCase(unittest.TestCase):
             "source_fingerprint": "f" * 64,
             **(
                 {"advertised_options_by_model": {selector: ["low", "high"]}}
-                if harness in {"deepseek", "opencode"}
+                if harness == "opencode"
                 else {}
             ),
         }
@@ -602,23 +601,23 @@ class ConversationApiCase(unittest.TestCase):
 
 
 class ConversationResourceTest(ConversationApiCase):
-    def test_removed_deepseek_new_chat_is_rejected_without_a_row(self) -> None:
+    def test_unknown_harness_new_chat_is_rejected_without_a_row(self) -> None:
         status, _, error = self.request(
             "POST",
             "/api/conversations",
-            body={"shell_id": 1, "harness": "deepseek", "model": None},
-            key="deepseek-without-route",
+            body={"shell_id": 1, "harness": "unsupported", "model": None},
+            key="unsupported-without-route",
         )
 
         self.assertEqual(status, 422, error)
         self.assertEqual(error["error"], {
             "code": "HARNESS_CONVERSATION_UNSUPPORTED",
-            "message": "harness 'deepseek' has no browser conversation adapter",
+            "message": "harness 'unsupported' has no browser conversation adapter",
             "details": {},
         })
         with closing(self.connect()) as con:
             count = con.execute(
-                "SELECT COUNT(*) FROM conversations WHERE harness='deepseek'"
+                "SELECT COUNT(*) FROM conversations WHERE harness='unsupported'"
             ).fetchone()[0]
         self.assertEqual(count, 0)
 
@@ -629,7 +628,7 @@ class ConversationResourceTest(ConversationApiCase):
                 "INSERT INTO conversations ("
                 "conversation_id,shell_id,owner_user_id,harness,worktree,state,"
                 "creation_idempotency_key,creation_request_hash,closed_at) "
-                "VALUES (?,1,1,'deepseek',?,'closed','removed-history','removed-hash',"
+                "VALUES (?,1,1,'unsupported',?,'closed','removed-history','removed-hash',"
                 "'2026-08-28 00:01:00')",
                 (conversation_id, str(self.root / ".sc-worktrees/dev")),
             )
@@ -653,7 +652,7 @@ class ConversationResourceTest(ConversationApiCase):
                 "SELECT harness,state FROM conversations WHERE conversation_id=?",
                 (conversation_id,),
             ).fetchone()
-        self.assertEqual(tuple(purge_input), ("deepseek", "closed"))
+        self.assertEqual(tuple(purge_input), ("unsupported", "closed"))
 
     def test_write_contention_returns_a_retryable_service_error(self) -> None:
         with mock.patch.object(

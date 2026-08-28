@@ -184,14 +184,6 @@ class HarnessEpochDockerfile(unittest.TestCase):
             "durable Codex state stays mounted; isolate its executable",
         )
 
-    def test_image_and_launcher_have_no_retired_distribution_or_profile_mount(self):
-        folded = self.folded()
-        dispatch = (ROOT / ".super-coder" / "scripts" / "dispatch.sh").read_text()
-
-        self.assertNotIn("@deepseek-ai/dsh", folded)
-        self.assertNotIn("$HOME/.dsh", dispatch)
-
-
 class RetainedHarnessInstall(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:

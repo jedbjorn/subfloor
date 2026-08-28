@@ -300,9 +300,9 @@ class RouteTransportTest(unittest.TestCase):
         self.assertIsNone(projection.effort)
         self.assertIsNone(projection.native_variant_id)
 
-    def test_removed_deepseek_live_native_binding_is_rejected(self):
+    def test_unknown_live_native_binding_is_rejected(self):
         with self.assertRaises(route_transport.route_bindings.RouteResolutionError) as exc:
-            live_native("deepseek", "MAX.Future")
+            live_native("unsupported", "MAX.Future")
 
         self.assertEqual(exc.exception.code, "unsupported_thinking_level")
 

@@ -227,9 +227,6 @@ class LegacyUpdateCompatTest(unittest.TestCase):
             shutil.copy2(
                 SCRIPTS / "update_compat.py", scripts / "update_compat.py"
             )
-            shutil.copy2(
-                SCRIPTS / "update_cutover.py", scripts / "update_cutover.py"
-            )
             shutil.copy2(SCRIPTS / "sc_wrapper.py", scripts / "sc_wrapper.py")
             (scripts / "update.py").write_text(
                 "import os\n"

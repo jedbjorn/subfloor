@@ -45,12 +45,6 @@ if [ -f "$CALLER_ROOT/.git" ]; then
   esac
 fi
 
-SC_SYSTEM_PYTHON="$(command -p -v python3 2>/dev/null || true)"
-SC_CUTOVER_GUARD="$LIVE_ROOT/.super-coder/scripts/update_cutover.py"
-if [ -n "$SC_SYSTEM_PYTHON" ] && [ -r "$SC_CUTOVER_GUARD" ]; then
-  "$SC_SYSTEM_PYTHON" "$SC_CUTOVER_GUARD" --admit-dispatch -- "$@" || exit $?
-fi
-
 DISPATCH="$LIVE_ROOT/.super-coder/scripts/dispatch.sh"
 if [ -n "${SC_DISPATCH:-}" ]; then
   if [ ! -f "$SC_DISPATCH" ] || [ ! -r "$SC_DISPATCH" ]; then

@@ -222,7 +222,7 @@ class CrossHarnessReleaseGateTest(unittest.TestCase):
             "source_fingerprint": "f" * 64,
             **(
                 {"advertised_options_by_model": {selector: ["low", "high"]}}
-                if harness in {"deepseek", "opencode"}
+                if harness == "opencode"
                 else {}
             ),
         }

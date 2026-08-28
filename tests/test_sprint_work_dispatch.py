@@ -311,10 +311,10 @@ class DispatchGateTest(SprintWorkDispatchCase):
             ).fetchone()[0],
         )
 
-    def test_removed_deepseek_route_blocks_sprint_before_writes(self) -> None:
+    def test_unknown_route_blocks_sprint_before_writes(self) -> None:
         self.create_unit(developer=1)
         self.con.execute(
-            "UPDATE sprint_participants SET harness='deepseek',"
+            "UPDATE sprint_participants SET harness='unsupported',"
             "model='acme/model-7',effort='high' "
             "WHERE sprint_id=? AND shell_id=1",
             (self.sprint_id,),
@@ -327,7 +327,7 @@ class DispatchGateTest(SprintWorkDispatchCase):
             )
 
         self.assertEqual(refused.exception.code, "unsupported_thinking_level")
-        self.assertEqual(refused.exception.details, {"harness": "deepseek"})
+        self.assertEqual(refused.exception.details, {"harness": "unsupported"})
         self.assertEqual(
             self.con.execute(
                 "SELECT lifecycle FROM sprints WHERE sprint_id=?",

@@ -80,18 +80,6 @@ class GlobalPortNamespaceTest(unittest.TestCase):
             {resolved["port"], resolved["dev_port"]}.isdisjoint({8800, 8801})
         )
 
-    def test_existing_config_drops_retired_runtime_port(self) -> None:
-        resolved = self.resolve({
-            "repo": "ami",
-            "port": 8821,
-            "dev_port": 8844,
-            "deepseek_host_port": 8942,
-            "harness": "codex",
-        })
-
-        self.assertNotIn("deepseek_host_port", resolved)
-        self.assertEqual(json.loads(self.current_config.read_text()), resolved)
-
     def test_exhausted_global_namespace_fails_instead_of_colliding(self) -> None:
         with mock.patch.object(ports, "_free", return_value=False):
             with self.assertRaisesRegex(RuntimeError, "no free super-coder port"):

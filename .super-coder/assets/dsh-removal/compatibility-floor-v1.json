@@ -1,6 +1,0 @@
-{
-  "contract": "sc-dsh-compatibility-floor-declaration-v1",
-  "fresh_process_cleanup_hook": true,
-  "pre_materialization_hook": true,
-  "schema_version": 1
-}
