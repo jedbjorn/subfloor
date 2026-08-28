@@ -622,6 +622,39 @@ class ConversationResourceTest(ConversationApiCase):
             ).fetchone()[0]
         self.assertEqual(count, 0)
 
+    def test_removed_harness_history_is_ordinary_not_found(self) -> None:
+        conversation_id = "cv_" + "d" * 32
+        with closing(self.connect()) as con:
+            con.execute(
+                "INSERT INTO conversations ("
+                "conversation_id,shell_id,owner_user_id,harness,worktree,state,"
+                "creation_idempotency_key,creation_request_hash,closed_at) "
+                "VALUES (?,1,1,'deepseek',?,'closed','removed-history','removed-hash',"
+                "'2026-08-28 00:01:00')",
+                (conversation_id, str(self.root / ".sc-worktrees/dev")),
+            )
+            con.commit()
+
+        detail_status, _, detail = self.request(
+            "GET", f"/api/conversations/{conversation_id}"
+        )
+        list_status, _, listing = self.request("GET", "/api/conversations")
+
+        self.assertEqual(detail_status, 404, detail)
+        self.assertEqual(detail["error"], {
+            "code": "CONVERSATION_NOT_FOUND",
+            "message": "conversation does not exist",
+            "details": {},
+        })
+        self.assertEqual(list_status, 200, listing)
+        self.assertEqual(listing, {"items": [], "next_cursor": None})
+        with closing(self.connect()) as con:
+            purge_input = con.execute(
+                "SELECT harness,state FROM conversations WHERE conversation_id=?",
+                (conversation_id,),
+            ).fetchone()
+        self.assertEqual(tuple(purge_input), ("deepseek", "closed"))
+
     def test_write_contention_returns_a_retryable_service_error(self) -> None:
         with mock.patch.object(
             conversation_routes.db_driver,

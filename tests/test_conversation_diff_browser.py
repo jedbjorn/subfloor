@@ -416,15 +416,7 @@ def test_configure_reentry_refreshes_deepseek_status_and_exact_routes(static_ui)
     "case",
     [
         {
-            "models": [],
-            "reason": "HARNESS_ROUTE_UNAVAILABLE",
-        },
-        {
-            "models": [{"id": "deepseek-other", "availability": "available"}],
-            "reason": "HARNESS_ROUTE_UNAVAILABLE",
-        },
-        {
-            "models": [{"id": "deepseek-bound", "availability": "available"}],
+            "models": [{"id": "gpt-test", "availability": "available"}],
             "status": {
                 "installed": True,
                 "enabled": False,
@@ -435,7 +427,7 @@ def test_configure_reentry_refreshes_deepseek_status_and_exact_routes(static_ui)
             "reason": "HARNESS_DISABLED",
         },
         {
-            "models": [{"id": "deepseek-bound", "availability": "available"}],
+            "models": [{"id": "gpt-test", "availability": "available"}],
             "status": {
                 "installed": False,
                 "enabled": True,
@@ -446,26 +438,24 @@ def test_configure_reentry_refreshes_deepseek_status_and_exact_routes(static_ui)
             "reason": "HARNESS_NOT_INSTALLED",
         },
         {
-            "models": [{"id": "deepseek-bound", "availability": "available"}],
+            "models": [{"id": "gpt-test", "availability": "available"}],
             "status_failure": True,
             "reason": "HARNESS_UNAVAILABLE",
         },
         {
-            "models": [{"id": "deepseek-bound", "availability": "available"}],
+            "models": [{"id": "gpt-test", "availability": "available"}],
             "transition": True,
             "reason": "HARNESS_DISABLED",
         },
     ],
     ids=[
-        "zero-routes",
-        "different-route-available",
         "disabled",
         "uninstalled",
         "status-read-failure",
         "healthy-to-disabled-transition",
     ],
 )
-def test_historical_deepseek_unavailability_disables_only_composer(
+def test_retained_harness_unavailability_disables_only_composer(
     static_ui,
     case,
 ):
@@ -473,13 +463,13 @@ def test_historical_deepseek_unavailability_disables_only_composer(
     browser_errors: list[str] = []
     current = {
         **conversation(),
-        "title": "Historical DeepSeek proof",
+        "title": "Retained harness proof",
         "starred": False,
         "scope": "interactive",
         "sprint_managed": False,
         "route": {
-            "harness": "deepseek",
-            "model": "deepseek-bound",
+            "harness": "codex",
+            "model": "gpt-test",
             "control_state": "controlled",
         },
     }
@@ -529,12 +519,12 @@ def test_historical_deepseek_unavailability_disables_only_composer(
                 )
             return fulfill(route, {
                 "flavors": {},
-                "harness_status": {"deepseek": status_state["value"]},
+                "harness_status": {"codex": status_state["value"]},
             })
         if parsed.path == "/api/models":
             return fulfill(route, {
                 "stale": False,
-                "harnesses": {"deepseek": {"models": case["models"]}},
+                "harnesses": {"codex": {"models": case["models"]}},
             })
         if parsed.path == "/api/conversations":
             if query.get("starred") == ["true"]:
@@ -607,7 +597,7 @@ def test_historical_deepseek_unavailability_disables_only_composer(
             ) == before_status_reads + 1
         assert page.get_by_text("use a tool", exact=True).is_visible()
         assert page.locator(".chat-harness-unavailable").text_content() == (
-            f"{case['reason']} — history remains readable."
+            case["reason"]
         )
         assert composer.is_disabled()
         assert composer.get_attribute("placeholder") == (
