@@ -50,6 +50,10 @@
     "tests/fixtures/sprint_removal/pre_removal.sql",
     "tests/fixtures/dsh_removal/build_fixtures.py",
     "tests/fixtures/dsh_removal/compatibility-floor.json",
+    "tests/fixtures/dsh_removal/historical_migrations/0227_deepseek_controlled_route_binding.sql",
+    "tests/fixtures/dsh_removal/historical_migrations/0230_deepseek_stock_host_route_binding.sql",
+    "tests/fixtures/dsh_removal/historical_migrations/0235_live_native_route_binding_v3.sql",
+    "tests/fixtures/dsh_removal/historical_migrations/0236_live_native_conversation_routes.sql",
     "tests/fixtures/dsh_removal/pre-bridge.json",
     "tests/test_dos_app_sprint_canary.py",
     "tests/test_deepseek_dsh_preparation.py",
@@ -59,6 +63,7 @@
     "tests/test_sprint_entrypoint_removal.py",
     "tests/test_sprint_removal_manifest.py",
     "tests/test_dsh_removal_preparation.py",
+    "tests/test_schema_rebaseline.py",
     "tests/test_activity_monitor.py",
     "tests/test_sprint_v2_domain.py",
     "tests/test_sprint_message_delivery.py",
@@ -148,7 +153,8 @@
     ".super-coder/migrations/0233_reseed_sprint_aware_pr_notifications.sql",
     ".super-coder/migrations/0234_reseed_ci_fallback_authority.sql",
     ".super-coder/migrations/0235_live_native_route_binding_v3.sql",
-    ".super-coder/migrations/0237_purge_dsh_owned_data.sql"
+    ".super-coder/migrations/0237_purge_dsh_owned_data.sql",
+    ".super-coder/migrations/0238_final_schema_rebaseline.sql"
   ],
   "baseline_migration_ledger": {
     "count": 142,

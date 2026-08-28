@@ -15,12 +15,17 @@ ROOT = Path(__file__).resolve().parents[1]
 ENGINE = ROOT / ".super-coder"
 SCHEMA = ENGINE / "schema.sql"
 MIGRATIONS = ENGINE / "migrations"
+HISTORICAL_MIGRATIONS = (
+    ROOT / "tests" / "fixtures" / "dsh_removal" / "historical_migrations"
+)
 FOUNDATION = MIGRATIONS / "0132_conversation_foundation.sql"
 GIT_TARGETS = MIGRATIONS / "0142_conversation_git_targets.sql"
 ACTIVE_REGISTRY = MIGRATIONS / "0162_active_chat_registry.sql"
 REAPER_IDENTITY = MIGRATIONS / "0163_conversation_run_process_identity.sql"
 TOPOLOGY_RETIREMENT = MIGRATIONS / "0168_retire_sprint_conversation_topology.sql"
-LIVE_NATIVE_ROUTES = MIGRATIONS / "0236_live_native_conversation_routes.sql"
+LIVE_NATIVE_ROUTES = (
+    HISTORICAL_MIGRATIONS / "0236_live_native_conversation_routes.sql"
+)
 
 sys.path.insert(0, str(ENGINE / "scripts"))
 import conversation_state  # noqa: E402
@@ -31,7 +36,10 @@ import snapshot  # noqa: E402
 
 def apply_schema(con: sqlite3.Connection, *, through: str | None = None) -> None:
     con.executescript(SCHEMA.read_text())
-    for migration in sorted(MIGRATIONS.glob("*.sql")):
+    migrations = list(MIGRATIONS.glob("*.sql"))
+    if through is not None:
+        migrations.extend(HISTORICAL_MIGRATIONS.glob("*.sql"))
+    for migration in sorted(migrations, key=lambda path: path.name):
         if through is not None and migration.name > through:
             break
         con.executescript(migration.read_text())
