@@ -273,6 +273,26 @@
         "route_revision": 1,
         "selector_binding": "{\"contract_version\":3,\"control_state\":\"controlled\",\"harness\":\"opencode\",\"provider_model\":\"deepseek-v4-pro\",\"requested_model\":\"ollama-cloud/deepseek-v4-pro\",\"transport\":\"opencode-route-agent\"}",
         "transport": "opencode-route-agent"
+      },
+      {
+        "adapter_metadata": "{}",
+        "binding_digest": "2a050759549e44f9f5bf8170834ed51f2733134662f265a9aae36859182c6f9d",
+        "binding_id": 9003,
+        "binding_json": "{\"contract_version\":3,\"control_state\":\"controlled\",\"harness\":\"opencode\",\"native_option_id\":\"high\",\"provider_model\":\"deepseek-v4-pro\",\"requested_model\":\"ollama-cloud/deepseek-v4-pro\",\"transport\":\"opencode-route-agent\"}",
+        "contract_version": 3,
+        "control_state": "controlled",
+        "effective_effort": "high",
+        "harness": "opencode",
+        "harness_evidence_format": "harness-live-v1",
+        "harness_support_state": "tested",
+        "native_option_id": "high",
+        "participant_id": 9002,
+        "provider_model": "deepseek-v4-pro",
+        "requested_effort": "high",
+        "requested_model": "ollama-cloud/deepseek-v4-pro",
+        "route_revision": 2,
+        "selector_binding": "{\"contract_version\":3,\"control_state\":\"controlled\",\"harness\":\"opencode\",\"native_option_id\":\"high\",\"provider_model\":\"deepseek-v4-pro\",\"requested_model\":\"ollama-cloud/deepseek-v4-pro\",\"transport\":\"opencode-route-agent\"}",
+        "transport": "opencode-route-agent"
       }
     ],
     "sprint_participants": [

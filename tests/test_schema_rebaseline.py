@@ -140,8 +140,29 @@ class SchemaRebaselineTest(unittest.TestCase):
                 for name, query in queries.items()
             }
             self.assertEqual(
-                {"defaults": 1, "conversations": 1, "bindings": 1},
+                {"defaults": 1, "conversations": 1, "bindings": 2},
                 {name: len(rows) for name, rows in retained_before.items()},
+            )
+            option_binding_before = tuple(
+                con.execute(
+                    "SELECT requested_effort,effective_effort,native_option_id,"
+                    "binding_json,binding_digest "
+                    "FROM sprint_participant_route_bindings WHERE binding_id=9003"
+                ).fetchone()
+            )
+            self.assertEqual(
+                (
+                    "high",
+                    "high",
+                    "high",
+                    '{"contract_version":3,"control_state":"controlled",'
+                    '"harness":"opencode","native_option_id":"high",'
+                    '"provider_model":"deepseek-v4-pro",'
+                    '"requested_model":"ollama-cloud/deepseek-v4-pro",'
+                    '"transport":"opencode-route-agent"}',
+                    "2a050759549e44f9f5bf8170834ed51f2733134662f265a9aae36859182c6f9d",
+                ),
+                option_binding_before,
             )
 
             migrate.apply(con, REBASELINE, rebaseline_authorized=True)
@@ -151,6 +172,17 @@ class SchemaRebaselineTest(unittest.TestCase):
                 for name, query in queries.items()
             }
             self.assertEqual(retained_before, retained_after)
+            self.assertEqual(
+                option_binding_before,
+                tuple(
+                    con.execute(
+                        "SELECT requested_effort,effective_effort,native_option_id,"
+                        "binding_json,binding_digest "
+                        "FROM sprint_participant_route_bindings "
+                        "WHERE binding_id=9003"
+                    ).fetchone()
+                ),
+            )
 
             columns = [
                 row[1]
