@@ -71,7 +71,7 @@ class SkillProjectionTest(unittest.TestCase):
         self,
     ) -> None:
         shell_id = add_shell(self.con, "custom", None)
-        grant(self.con, shell_id, "query_authoring_pg")
+        grant(self.con, shell_id, "snapshot")
         with tempfile.TemporaryDirectory() as tmp:
             checkout = Path(tmp)
             stale = checkout / ".opencode/skills/stale/SKILL.md"
@@ -89,9 +89,9 @@ class SkillProjectionTest(unittest.TestCase):
             )
 
             for relative in (".claude/skills", ".opencode/skills"):
-                rendered = checkout / relative / "query_authoring_pg/SKILL.md"
+                rendered = checkout / relative / "snapshot/SKILL.md"
                 self.assertTrue(rendered.is_file())
-                self.assertIn("name: query_authoring_pg", rendered.read_text())
+                self.assertIn("name: snapshot", rendered.read_text())
             self.assertFalse((checkout / ".opencode/skills/stale").exists())
             self.assertIn(checkout / ".opencode/skills/stale", summary["deleted"])
             self.assertNotIn(checkout / ".opencode/skills/stale", summary["written"])
@@ -103,7 +103,7 @@ class SkillProjectionTest(unittest.TestCase):
         self,
     ) -> None:
         shell_id = add_shell(self.con, "custom", None)
-        grant(self.con, shell_id, "query_authoring_pg")
+        grant(self.con, shell_id, "snapshot")
         with tempfile.TemporaryDirectory() as tmp:
             checkout = Path(tmp)
             skill_projection.reconcile_shell(
@@ -117,7 +117,7 @@ class SkillProjectionTest(unittest.TestCase):
             summary = skill_projection.reconcile_shell(self.con, shell_id, checkout)
 
             for relative in (".claude/skills", ".agents/skills"):
-                removed = checkout / relative / "query_authoring_pg"
+                removed = checkout / relative / "snapshot"
                 self.assertFalse(removed.exists())
                 self.assertIn(removed, summary["deleted"])
             self.assertFalse(checkout.joinpath(".opencode/skills").exists())
@@ -172,7 +172,7 @@ class SkillProjectionTest(unittest.TestCase):
 
     def test_symlink_root_is_refused_without_touching_target(self) -> None:
         shell_id = add_shell(self.con, "custom", None)
-        grant(self.con, shell_id, "query_authoring_pg")
+        grant(self.con, shell_id, "snapshot")
         with tempfile.TemporaryDirectory() as tmp, tempfile.TemporaryDirectory() as out:
             checkout = Path(tmp)
             target = Path(out)
@@ -213,7 +213,7 @@ class SkillProjectionTest(unittest.TestCase):
         dev1 = add_shell(self.con, "dev1", "dev")
         add_shell(self.con, "dev2", "dev")
         skill_id = self.con.execute(
-            "SELECT skill_id FROM skills WHERE name='query_authoring_pg'"
+            "SELECT skill_id FROM skills WHERE name='snapshot'"
         ).fetchone()[0]
         self.con.execute(
             "INSERT INTO flavor_skills (flavor, skill_id) VALUES ('dev', ?)",
@@ -221,7 +221,7 @@ class SkillProjectionTest(unittest.TestCase):
         )
         with tempfile.TemporaryDirectory() as tmp:
             repo = Path(tmp)
-            root_live = repo / ".claude/skills/query_authoring_pg/SKILL.md"
+            root_live = repo / ".claude/skills/snapshot/SKILL.md"
             root_live.parent.mkdir(parents=True)
             root_live.write_text("preserve live unowned projection\n")
             root_retired = repo / ".claude/skills/retired_upstream/SKILL.md"
@@ -244,7 +244,7 @@ class SkillProjectionTest(unittest.TestCase):
                 self.con, repo_root=repo
             )
 
-            rendered = dev1_root / "query_authoring_pg/SKILL.md"
+            rendered = dev1_root / "snapshot/SKILL.md"
             self.assertTrue(rendered.is_file())
             self.assertFalse(stale.parent.exists())
             self.assertEqual(
@@ -319,6 +319,14 @@ class SkillProjectionTest(unittest.TestCase):
             con = sqlite3.connect(fixture.database)
             con.row_factory = sqlite3.Row
             try:
+                marks = ",".join("?" for _ in TOMBSTONE_SKILLS)
+                expected_grants = con.execute(
+                    "SELECT (SELECT COUNT(*) FROM shell_skills ss JOIN skills s "
+                    "ON s.skill_id=ss.skill_id WHERE s.name IN (" + marks + ")) + "
+                    "(SELECT COUNT(*) FROM flavor_skills fs JOIN skills s "
+                    "ON s.skill_id=fs.skill_id WHERE s.name IN (" + marks + "))",
+                    (*TOMBSTONE_SKILLS, *TOMBSTONE_SKILLS),
+                ).fetchone()[0]
                 reconciled = seed_skills.reconcile_tombstoned_skills(con)
                 summary = skill_projection.reconcile_existing_checkouts(
                     con, repo_root=fixture.root
@@ -327,7 +335,7 @@ class SkillProjectionTest(unittest.TestCase):
                 con.close()
 
             self.assertEqual(set(reconciled.changed_names), set(TOMBSTONE_SKILLS))
-            self.assertEqual(reconciled.grant_count, len(TOMBSTONE_SKILLS) * 2)
+            self.assertEqual(reconciled.grant_count, expected_grants)
             self.assertEqual(summary["checkouts"], list(fixture.checkouts))
             for skills_root in fixture.native_skill_roots:
                 self.assertTrue((skills_root / LOCAL_SKILL_NAME / "SKILL.md").is_file())

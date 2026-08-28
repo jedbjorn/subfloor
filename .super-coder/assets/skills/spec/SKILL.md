@@ -77,9 +77,6 @@ No task plan = no implementation.
 
 ## 4. Execute one task at a time
 
-When FnB explicitly invoked `--agents`, load `agents`; its adjudicated waves
-overlay this loop. Otherwise:
-
 ```text
 sc mem get tasks --doc <doc_id>
 sc mem task start <task_id>

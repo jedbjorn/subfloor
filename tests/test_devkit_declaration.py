@@ -31,7 +31,7 @@ DEVKIT_RESEED = (
     ROOT
     / ".super-coder"
     / "migrations"
-    / "0234_reseed_ci_fallback_authority.sql"
+    / "0239_global_skill_simplification.sql"
 )
 
 
@@ -988,27 +988,19 @@ class SourcePolicyTest(unittest.TestCase):
         readme_section = readme.split("### Dev kit", 1)[1].split("## Opt-in features", 1)[0]
         for guidance in (skill, readme_section):
             self.assertIn(".subfloor/dev-kit.json", guidance)
-            self.assertIn("exit `78`", guidance)
-            self.assertIn("no fork dev kit declared", guidance)
+            self.assertIn("sc deps", guidance)
+            self.assertIn("sc test", guidance)
             self.assertNotIn("every `requirements*.txt`", guidance)
 
-        self.assertLess(
-            skill.index("invariant exact-execution hooks"),
-            skill.index("## Read the active seat"),
-        )
         self.assertNotIn("## You are in a container", skill)
-        self.assertIn("boot document's execution-context section", skill)
         for state in ("absent", "invalid", "failed", "stale", "advisory", "ready", "repair"):
-            self.assertIn(f"| **{state}** |", skill)
+            self.assertIn(f"`{state}`", skill)
         self.assertIn("Engine baseline", skill)
-        self.assertIn("Native packages", skill)
-        self.assertIn("Fork extension", skill)
-        self.assertIn("Checkout setup", skill)
-        self.assertIn("Host prerequisites", skill)
-        self.assertIn("never infers manifests", skill)
-        self.assertIn("never installs privileged host packages", skill)
-        self.assertIn("`./sc` remains valid", skill)
-        self.assertIn("exit the container", skill)
+        self.assertIn("## Seats and evidence", skill)
+        self.assertIn("Host hooks use the host checkout", skill)
+        self.assertIn("Container hooks use the", skill)
+        self.assertIn("does not infer project policy", skill)
+        self.assertIn("not the fork's test assertions", skill)
 
 
 class DevKitReseedConformanceTest(unittest.TestCase):
@@ -1023,6 +1015,9 @@ class DevKitReseedConformanceTest(unittest.TestCase):
                 "skill_id INTEGER PRIMARY KEY, name TEXT UNIQUE, description TEXT, "
                 "category TEXT, command TEXT, common INTEGER, content TEXT, "
                 "is_deleted INTEGER DEFAULT 0);"
+                "CREATE TABLE shell_skills (shell_id INTEGER, skill_id INTEGER);"
+                "CREATE TABLE flavor_skills (flavor TEXT, skill_id INTEGER, "
+                "UNIQUE(flavor,skill_id));"
                 "INSERT INTO skills VALUES "
                 "(41,'dev_kit','stale description','wrong','old-command',1,"
                 "'You are in a container',1),"

@@ -49,8 +49,8 @@ you're with what should happen next — every role knows the workflow.
 
 If you are ever unsure what is happening, open the Review GUI or boot the
 **Admin Shell**. Admin works from `main` and looks after the system as a whole:
-it can check the team's health, help update subfloor, and create skills tailored
-to your repository.
+it can check the team's health and update Subfloor. A **Planner Shell** designs
+skills tailored to the repository through the DB-canonical local-skill tools.
 
 ### The technical details
 Subfloor is a **forkable shell substrate for a single code repository.** You install it into
@@ -172,7 +172,7 @@ themed: [**open the docs in md-converter**](https://md-converter.designs-os.com/
 | [**Messages, jobs & headless launch**](docs/README.md#messages-jobs--headless-launch) | Generic shell handoffs, detached jobs, model routes, and `sc run` |
 | [**Update a fork**](docs/README.md#update-a-fork) | `./sc update` / `rollback`; customize vs upstream vs eject |
 | [**CLI & dev kit**](docs/README.md#cli--dev-kit) | Every `./sc` command, the `make dos-` aliases, the sandbox toolchain |
-| [**Opt-in features**](docs/README.md#opt-in-features) | pg sidecar · Windows Test VM · tailnet / pm2 / db brokers |
+| [**Opt-in features**](docs/README.md#opt-in-features) | optional infrastructure plus the fork-local guidance boundary |
 | [**Review GUI**](docs/README.md#review-gui) | The localhost GUI's ten tabs + token & session analytics |
 
 > [!class2]

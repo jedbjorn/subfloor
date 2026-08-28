@@ -283,6 +283,8 @@ class BootPhaseLabelTest(unittest.TestCase):
                 run.git_prune, "status_line", return_value=None))
             stack.enter_context(mock.patch.object(run, "compose_boot", compose_boot))
             stack.enter_context(mock.patch.object(
+                run, "collect_dev_tools", return_value={"state": "absent"}))
+            stack.enter_context(mock.patch.object(
                 run,
                 "render_harness_skills",
                 return_value={

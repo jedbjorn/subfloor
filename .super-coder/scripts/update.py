@@ -1098,6 +1098,7 @@ def sync_skills() -> None:
         # fork retire list (.sc-state/skills_retired.json) before regrant()
         # hands the common catalogue back to every flavor/Bespoke pack.
         flipped = seed_skills.apply_retired(con)
+        pack_changes = seed_skills.reconcile_standard_flavor_packs(con)
     finally:
         con.close()
     print(f"  synced catalogue from {seed.name}")
@@ -1109,6 +1110,8 @@ def sync_skills() -> None:
         )
     if flipped:
         print(f"  fork retire list re-applied: {', '.join(flipped)}")
+    if pack_changes:
+        print(f"  standard flavor grants reconciled: {pack_changes}")
 
 
 def regrant() -> int:

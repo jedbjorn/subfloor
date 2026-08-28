@@ -265,9 +265,17 @@ ChatGPT account.
 The everyday cycle a fork runs once it's installed. Each step is owned by a
 **shell flavor**, and the work is done by the **skills** that flavor is granted
 (its flavor also sets its model defaults — see *Harnesses & models*). You move
-between flavors with `./sc enter-<shortname>`. Every flavor carries a common kit
-— `git`, `db_map`, `memory`, `messaging`, `snapshot`, `surface_catalogue`,
-`bootstrap` — so only the *flavor-specific* skills are called out per step below.
+between flavors with `./sc enter-<shortname>`. Every flavor carries the common
+Subfloor process kit — `bootstrap`, `curate`, `db_map`, `issue_reporting`,
+`memory`, `messaging`, and `surface_catalogue` — so only the flavor-specific
+skills are called out below.
+
+Global skills have four purposes: explain Subfloor, identify a supplied tool,
+identify a supplied testing environment, or define a core Subfloor process.
+General planning, coding, API, testing, database, deployment, VM, and host
+method stays model work. A Planner records real fork-specific capabilities as
+DB-canonical local skills through `fork_skill_design`; update and rebuild
+preserve those bodies and grants.
 
 ```linear
 Install :::class1 -> Map :::class2 -> Spec :::class1 -> Build :::class1 -> Review :::class2 -> Freeze :::class3 -> Verify :::class3
@@ -292,23 +300,23 @@ it owns:
 | Flavor | Flavor skills | Owns |
 |---|---|---|
 | **cartographer** | `cartographer` | map · re-map |
-| **planner** | `docs` · `blueprint` · `flags` · `api-design` · `onboard` | spec doc · approach · freeze + docs |
-| **dev** | `spec` · `dev_kit` · `test_authoring` · `database-migrations` · `redline_review` · `docs` · `flags` | break into tasks · implement · patch + test |
-| **reviewer** | `test_authoring` · `database-migrations` · `redline_review` · `api-design` · `flags` | review |
-| **admin** | `git_cleanup` · `self_update` · `migration_management` · `local_skill_management` | engine · verify-clean |
+| **planner** | `docs` · `flags` · `onboard` · `fork_skill_design` · `dev_kit` · planning workflow skills | spec doc · local capability design · freeze + docs |
+| **dev** | `spec` · `redline_review` · `harness_readiness` · `docs` · `flags` · `sprint_dev` | break into tasks · implement · patch + test |
+| **reviewer** | `review` · `redline_review` · `flags` · `sprint_rev` | adversarial review |
+| **admin** | `admin_git` · `git_cleanup` · `engine_migrations` · `self_update` · `snapshot` | engine lifecycle · verify-clean |
+| **devops** | `git` · `flags` · `docs` | tracked runtime changes; fork-local host/deploy tools |
 
 1. **Install** — `./sc install` seeds your **starting team**: two `planner`
    (one is your primary), four `dev`, two `reviewer` shells, the `admin` that owns
    `main` + the engine, and the singleton `cartographer`.
-   *(admin · `self_update`, `migration_management` · UI: Shells)*
+   *(admin · `self_update`, `engine_migrations` · UI: Shells)*
 2. **Map the repo** — the cartographer configures the index once with
    `./sc map-setup`, then `./sc map` builds it; git hooks re-map on every pull.
    It's infrastructure working shells *read* via `surface_catalogue`.
    *(cartographer · `cartographer` · UI: Map)*
 3. **Spec it** — the **planner** authors a spec document against a roadmap
-   feature — viability, blockers, the done-condition. `blueprint` shapes the
-   approach in a single session (no DB writes); both the spec and the docs ride
-   the `docs` skill. *(planner · `docs`, `blueprint`, `flags` · UI: Roadmap)*
+   feature — viability, blockers, the done-condition. The spec and shipped docs
+   ride the `docs` skill. *(planner · `docs`, `flags` · UI: Roadmap)*
 4. **Switch to dev** — `./sc enter-dev` boots the **dev** shell into its own git
    worktree on `shell/dev`, a base pinned to `origin/main`.
    *(dev · `bootstrap`, `memory` · UI: Shells)*
@@ -317,18 +325,19 @@ it owns:
    per session. `memory` rolls `current_state` ("last / next task") so sessions
    resume cleanly. *(dev · `spec`, `memory` · UI: Roadmap)*
 6. **Implement** — within each task, dev cuts a feature branch off `shell/dev`,
-   writes code, schema, and tests, and runs `./sc test`.
-   *(dev · `dev_kit`, `test_authoring`, `database-migrations`, `redline_review`, `git` · UI: Shells)*
+   writes code, schema, and tests, then uses the exact `## DEV TOOLS` boot
+   inventory to run the fork's declared checks.
+   *(dev · ambient DEV TOOLS, `redline_review`, `git` · UI: Shells)*
 7. **Send to review** — dev pushes and opens a PR (the `git` skill is
    branch → commit → push → **PR → stop**; dev never merges), then messages the
    reviewer. *(dev · `git`, `messaging` · UI: Flags)*
 8. **Review, send back** — the **reviewer** (a *different lineage* than the code
    — defaults to Opus — so it isn't blind to the author's mistakes) reads the diff
    against the spec through its review lenses, opens flags for failures, and
-   messages dev back. *(reviewer · `test_authoring`, `database-migrations`, `api-design`, `flags`, `messaging` · UI: Flags)*
+   messages dev back. *(reviewer · `review`, ambient DEV TOOLS, `flags`, `messaging` · UI: Flags)*
 9. **Patch + test** — dev addresses the flags, re-runs `./sc test`, and
    re-pushes; the thread closes when it's clean.
-   *(dev · `dev_kit`, `test_authoring`, `flags`, `git` · UI: Flags)*
+   *(dev · ambient DEV TOOLS, `flags`, `git` · UI: Flags)*
 10. **Operator merges** — merging is the FnB's gate, never a shell's (the one
     exception requires separate explicit operator authority). On dev's next boot
     the launcher auto-syncs the base onto `origin/main` and prunes the merged
@@ -667,8 +676,8 @@ fits the **fork-owned extension points**, you never touch engine files, and
 
 | Extension point | What it carries |
 |---|---|
-| **Local skills** | Fork-authored procedures (GUI → Skills) — serialized in `content.sql`, survive every update |
-| **Flavor overlays** | `.sc-state/flavors/<flavor>.json` — what a NEW shell of a flavor gets: `skills_add` / `skills_remove` against the engine template's list, plus role/mandate/focus overrides (e.g. swap the engine's `test_authoring` for a fork's own testing skill) |
+| **Local skills** | Planner-authored capability/process descriptions via `sc skill put` — DB-canonical, serialized in `content.sql`, explicitly granted, and preserved byte-for-byte across update/rebuild |
+| **Flavor overlays** | `.sc-state/flavors/<flavor>.json` — fork identity text (`role`, `mandate`, `focus`, `abbr`); skill assignments use `sc skill grant/revoke` instead |
 | **Skill retire list** | `.sc-state/skills_retired.json` (written by `./sc skill retire <name>`) — engine skills this fork has taken out of service, e.g. ones superseded by a fork-local skill. Retired skills leave every surface (boot doc, renders, grants) on ALL shells and stay retired across updates; `unretire` restores them, grants intact |
 | **`instance.json`** | Per-fork config: ports, harness default, the `pg` / `vm` / `ts` opt-in blocks |
 | **`.sc-state/`** | Your memory (content.sql), map tuning, engine pin — the fork's one tracked artifact |
@@ -738,7 +747,7 @@ sc sql "<query>"         # read-only passthrough to the engine DB; `sc map-sql` 
 ./sc preview             # live worktree UI previews, one subdomain per shell
 ./sc update              # fetch + materialize the engine, reconcile in place (--ref <tag|sha> pins)
 ./sc rollback            # sound undo of a bad update (restore DB + engine)
-./sc feature             # opt-in features: list / enable / disable (pg · windows · tailnet · pm2 · app-deploy)
+./sc feature             # optional infrastructure: list / enable / disable (pg · windows · tailnet · pm2)
 ./sc eject               # ONE-WAY: own the engine — stop tracking upstream (confirm-gated)
 ./sc verify              # rebuild + flat render + headless boot (no exec) — the proof
 ./sc help                # all commands
@@ -818,51 +827,47 @@ see your own changes, start a dev server **inside** the container on
 `0.0.0.0:$SC_DEV_PORT` — the launcher publishes it to `http://127.0.0.1:$SC_DEV_PORT`
 on the host — and use `datasette <db.sqlite>` the same way to browse a SQLite DB in
 a web GUI. Never restart the host stack from inside the sandbox; run your own
-instance instead. (The boot doc's `RUNNING THE APP` section and the `dev_kit` skill
-carry the full detail. For the FnB-facing review of a shell's UI changes, use
+instance instead. (The Developer and Reviewer boot documents' `DEV TOOLS`
+sections carry the active-seat detail; Planner can load `dev_kit` on demand. For
+the FnB-facing review of a shell's UI changes, use
 `./sc preview` — see *Shells & worktrees*.)
 
 ## Opt-in features
 
 > [!class2]
-> **UI** Shells (skill grants) · Scripts (VM wizard) · **Shells** varies per feature
+> **UI** Scripts (VM wizard) · **Shells** see fork-local guidance when configured
 
-Beyond the core loop, the engine ships **opt-in features** — capabilities every
-fork receives but none has on by default. Each one is the same pair underneath:
-a **config block** in the gitignored `.super-coder/instance.json` (enables the
-infrastructure — a sidecar container, a host-side broker) and **skill grants**
-(`common=0` — the skills ship to every fork's catalogue but auto-grant to no
-shell; the grant puts the procedure in the right hands). `./sc feature` is the
-front door to the pair:
+Beyond the core loop, the engine ships **optional infrastructure**: a sidecar
+or host broker controlled by a config block in the gitignored
+`.super-coder/instance.json`. `./sc feature` is the front door to those blocks.
+Fork-specific operating procedure is deliberately not a global grant; Planner
+uses `fork_skill_design` to describe the fork's real capability as a
+DB-canonical local skill.
 
 ```bash
-./sc feature                 # list the features + the state of both halves
-./sc feature enable pg       # grant the skills to the owning flavors + wire the config
-./sc feature disable pg      # reverse it (other shells' grants untouched)
+./sc feature                 # list infrastructure + its config state
+./sc feature enable pg       # wire an automatic block or print the link boundary
+./sc feature disable pg      # remove that instance block
 ```
 
-| Feature | Config block | Skills → flavors | What it gives the fork |
-|---|---|---|---|
-| **`pg`** | `pg` (auto-created) | `query_authoring_pg` → dev, reviewer, planner | A `postgres:17` sidecar on `sc-net`, `DATABASE_URL` forwarded into the sandbox — infrastructure for the fork's **app** against real Postgres (the engine DB stays SQLite, always) — plus the diagnostic-SQL runbook (psql mechanics, dialect traps, read-only handoff scripts). The fork owns its test fixtures and database setup; generic test doctrine continues through ordinary flavor packs. |
-| **`windows`** | `vm` (operator-linked) | `windows_devkit` → dev, reviewer · `windows_vm_gui` → dev, reviewer · `configure_winbox` → admin | The Windows Test VM loop — push → exec → capture → reset against a real Windows box, via the host-side broker (next section) — plus UIA-based GUI driving for exploratory QAQC |
-| **`tailnet`** | `ts` (operator-linked) | `tailscale` → devops | The tailnet broker — reach declared build/deploy hosts from the sandbox without holding a tailnet credential (section after) |
-| **`pm2`** | `pm2` (operator-linked) | `pm2` → admin, devops | The pm2 broker — observe + manage the host's pm2-supervised **app** stack (status, health, logs, scoped restarts) from the sandbox (section after) |
-| **`app-deploy`** | — (procedure-only) | `app_deploy_setup` → admin | A deploy-ritual scaffold for the fork's **app** (the engine deploys itself via `sc update`) — the admin fills the template (migration dirs, DB backup, ff-only sync, apply + move migrations, restart) and saves it as the repo's own project-local `deploy` skill, granted to every shell |
+| Feature | Config block | What it gives the fork |
+|---|---|---|
+| **`pg`** | `pg` (auto-created) | A `postgres:17` sidecar on `sc-net`, with `DATABASE_URL` forwarded for the fork's **app**; the engine memory DB remains SQLite. |
+| **`windows`** | `vm` (operator-linked) | The supplied Windows VM broker and its link boundary. |
+| **`tailnet`** | `ts` (operator-linked) | The tailnet broker for declared build/deploy hosts without sharing its credential with the sandbox. |
+| **`pm2`** | `pm2` (operator-linked) | The PM2 broker for a fail-closed set of host application processes. |
 
 `enable pg` is complete in one step — the sidecar needs no host input, so the
 block is auto-created and the next `./sc launch` starts it (data persists in a
 named volume; `./sc pg-down` stops it, volume retained). `windows`, `tailnet`, and
 `pm2` are **link-only**: their blocks carry host-specific, operator-verified
-config (a ready VM, a tailnet scope), so `enable` grants the skills and prints
-exactly how to link — the sections below are the full setup guides.
-`app-deploy` has no config block at all: `enable` grants the scaffold skill to
-the admin shell, and the finished product is a **project-local** skill — engine
-skills self-heal to the shipped body on every `sc update`, so the fleshed-out
-ritual must live under a name the engine doesn't ship.
+config (a ready VM, a tailnet scope), so `enable` prints exactly how to link.
+The sections below describe the supplied mechanisms. A fork-specific test,
+deployment, VM, database, or host procedure belongs in a differently named
+local skill so engine updates preserve its body and grants.
 
-Everything here can still be done by hand — the GUI's per-shell grant toggles
-and a hand-edited `instance.json` are the same mechanisms; `./sc feature` just
-makes the pair one visible, one-command surface.
+Everything here can still be done by hand through `instance.json`; `./sc
+feature` makes the supported block boundary visible and repeatable.
 
 ### Windows Test VM
 
@@ -900,7 +905,7 @@ gets persisted is verified, not hopeful:
 | `ssh` | key auth + remote exec work |
 | `transfer` | artifact transfer works both ways |
 | `snapshot` | the named clean snapshot exists for reset |
-| `toolchain` | the box is provisioned (`configure_winbox` has run) |
+| `toolchain` | the box has the declared build toolchain |
 
 **Setup is a three-role lifecycle, and the ordering *is* the design** — each role
 can only act once the previous has:
@@ -912,10 +917,11 @@ User: SSH foothold :::class4 -> Admin: install kit :::class1 -> Snapshot = clean
 1. **User (manual, once).** Bring up the VM, enable OpenSSH, authorize the key,
    share a transfer dir. The engine can't reach inside a fresh OS install — this
    bootstrap is irreducible.
-2. **Admin — `configure_winbox` (once / on toolchain change).** SSH in, install the
+2. **Operator provisioning (once / on toolchain change).** SSH in, install the
    build toolchain, verify each tool, **then** take the `clean` snapshot.
-3. **Dev + reviewer — `windows_devkit` (every test).** push → exec → capture →
-   reset against that snapshot.
+3. **Dev + reviewer loop.** Use the typed `./sc vm` surface to push → exec →
+   capture → reset against that snapshot; a Planner may record fork-specific
+   detail in a local skill.
 
 > [!class4]
 > **The one gotcha: provision *before* the snapshot, not after.** The clean snapshot
@@ -972,9 +978,9 @@ virtio-fs guest driver (from the `virtio-win` ISO), and mount it to a drive lett
 Same-host only — cross-host `scp` is a later variant.
 
 **4 · Provision the toolchain, then bake `clean` — in that order.** Boot the VM,
-install your build kit (the admin `configure_winbox` skill does this **via the
-broker** from the fork's committed winget manifest, and verifies exactly what
-the manifest installs; or by hand — e.g. `dotnet tool install --global wix`).
+install your build kit from the fork's tracked manifest through an
+operator-reviewed provisioning flow (or by hand — e.g. `dotnet tool install
+--global wix`).
 Then bake the offline baseline every test reverts to — one command, once the VM
 is linked (step 5):
 
@@ -986,9 +992,9 @@ is linked (step 5):
 clean --description "pristine OS + toolchain"` — the snapshot must be taken
 powered off.) Baking is **host-only, deliberately not a broker verb**: the
 snapshot is the trust anchor every test reverts to, so the sandbox may run
-*against* it but never redefine it — `configure_winbox` provisions + verifies,
-then hands you this one command. Re-provisioning later is re-run skill →
-re-run `./sc vm-bake` — and nothing "sticks" until it's baked, so never run a
+*against* it but never redefine it. Provision and verify, then run this one
+host command. Re-provisioning later is provision again → re-run `./sc vm-bake`
+— and nothing "sticks" until it's baked, so never run a
 test loop (which reverts) in between.
 
 **5 · Link it.** Fill the `vm` block — via the Scripts → **Windows Test VM** wizard
@@ -1008,11 +1014,11 @@ test loop (which reverts) in between.
 `libvirt_uri` is **optional** — set `qemu:///system` for a system-scope domain (the
 default `qemu:///session` can't see it); omit it otherwise.
 
-**6 · Grant the skills + start the broker.** All three skills are engine `common=0` —
-they propagate to every fork but **auto-grant to none**. `./sc feature enable windows`
-grants them in one step (`windows_devkit` + `windows_vm_gui` → dev + reviewer,
-`configure_winbox` → admin); or toggle them per shell in the GUI. The broker comes up
-automatically with `./sc launch` when a VM is linked; or drive it directly:
+**6 · Start the broker.** `./sc feature enable windows` prints the operator-link
+boundary; once the `vm` block is present, the broker comes up automatically
+with `./sc launch`. A Planner can use `fork_skill_design` to publish any
+fork-specific VM, GUI, or provisioning procedure as local guidance. You can
+also drive the broker directly:
 
 ```bash
 ./sc vm-broker-up            # start in the background (also: auto-started by ./sc launch)
@@ -1033,7 +1039,7 @@ doesn't touch the VM at all: it calls a small **host-side broker** that does.
 ```mermaid
 graph LR
   subgraph C["sandbox container (no key, no virsh, no route)"]
-    W["windows_devkit"]:::class1
+    W["typed ./sc vm client"]:::class1
   end
   subgraph H["host"]
     B["vm-broker<br/>(holds key + virsh)"]:::class2
@@ -1056,13 +1062,13 @@ graph LR
   listener *through the shared mount*. No published port, no route across the NAT, no
   firewall hole, no token: the socket is `chmod 0600`, reachable only by processes
   that share the mount.
-- `windows_devkit` uses the typed `./sc vm` status, start, push, exec, capture,
-  and end-only reset commands. The client reaches the broker without exposing
+- The typed `./sc vm` client supplies status, start, push, exec, capture, and
+  end-only reset commands. It reaches the broker without exposing
   the key; `virsh` remains host-only.
 - **GUI driving rides the same seam.** Supported harness adapters inject the
   managed `windows-mcp` definition before launch. `./sc vm mcp up` starts and
   verifies the broker tunnel, local relay, and HTTP endpoint used by the
-  `windows_vm_gui` skill — no persistent harness registration is required.
+  fork-local GUI procedure — no persistent harness registration is required.
 
 Full design: [`.super-coder/docs/windows-test-vm.md`](../.super-coder/docs/windows-test-vm.md) ·
 [`.super-coder/docs/windows-vm-broker.md`](../.super-coder/docs/windows-vm-broker.md).
@@ -1089,8 +1095,9 @@ parameterized by `{host, command}` and the `ts` block carries a fail-closed
 declared. Config lives under a `ts` key in the gitignored
 `.super-coder/instance.json` (**no secrets** — the host node's identity is the
 credential and never leaves the host), coexisting with the `vm` block.
-`./sc feature enable tailnet` grants the `tailscale` skill to devops shells;
-the `ts` block itself is yours to fill (link-only, like the VM).
+`./sc feature enable tailnet` prints the link boundary; the `ts` block itself
+is yours to fill. Planner can document a fork-specific host workflow as a
+local skill without placing the tailnet procedure in every installation.
 
 ```bash
 ./sc ts-broker-up            # start backgrounded (also auto-started by ./sc launch when a tailnet is linked)
@@ -1122,8 +1129,9 @@ allowlist alone; `stop`/`start` (an outage surface) additionally need
 `"allow_lifecycle": true`; `delete` is not a verb at all. Config lives under a
 `pm2` key in the gitignored `.super-coder/instance.json` (**no secrets**),
 coexisting with the `vm`/`ts` blocks. `./sc feature enable pm2` grants the
-`pm2` skill to admin + devops shells; the block itself is yours to fill
-(link-only, like the VM and the tailnet).
+operator link boundary; the block itself is yours to fill (link-only, like the
+VM and the tailnet). Planner can publish any fork-specific process-management
+procedure as a local skill.
 
 ```bash
 ./sc pm2-broker-up           # start backgrounded (also auto-started by ./sc launch when a stack is linked)

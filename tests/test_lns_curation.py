@@ -378,16 +378,16 @@ class CurationGovernanceTest(unittest.TestCase):
             self.assertIn("keep the l&s", text.lower())
             self.assertIn("create no local skill or asset", text)
         self.assertIn("FnB-authorized exception", reporting)
-        self.assertIn("administrator-owned", reporting)
+        self.assertIn("Planner-owned workflow in `fork_skill_design`", reporting)
 
     def test_planner_db_first_skill_workflow_remains_explicit(self):
         text = (
-            ENGINE / "assets" / "skills" / "local_skill_management" / "SKILL.md"
+            ENGINE / "assets" / "skills" / "fork_skill_design" / "SKILL.md"
         ).read_text()
         self.assertIn("sc skill put --file", text)
-        self.assertIn("requires the launched shell identity to resolve as Planner", text)
-        self.assertIn("DB + snapshot + flat render + skill projections reconciled", text)
-        self.assertIn("Creation alone grants nothing", text)
+        self.assertIn("Planner-owned draft", text)
+        self.assertIn("DB, local snapshot, flat catalogue, and managed skill", text)
+        self.assertIn("Creation grants nothing", text)
         self.assertNotIn("file -> seed -> grant -> local snapshot", text)
         self.assertNotIn("SC_ADMIN=1 sc snapshot", text)
 

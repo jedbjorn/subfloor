@@ -33,8 +33,23 @@ TOMBSTONE_SKILLS = (
     "sprint_orchestration_recover",
     "sprint_review",
     "engine_surgery",
+    "agents",
+    "api-design",
+    "app_deploy_setup",
+    "authoring_syntax",
+    "blueprint",
+    "configure_winbox",
+    "database-migrations",
+    "local_skill_management",
+    "migration_management",
+    "pm2",
+    "query_authoring_pg",
+    "tailscale",
+    "test_authoring",
     "test_authoring_pg",
     "test_authoring_sqlite",
+    "windows_devkit",
+    "windows_vm_gui",
 )
 LOCAL_SKILL_NAME = "dos_arch_testing"
 LOCAL_SKILL_DESCRIPTION = "Fork-owned dos-arch testing procedure"

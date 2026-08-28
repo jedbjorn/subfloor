@@ -31,7 +31,7 @@ import seed_skills
 import skill as skill_cli
 import render_check
 
-ENGINE_SKILLS = ("test_authoring", "review", "git")
+ENGINE_SKILLS = ("redline_review", "review", "git")
 
 SEED_SQL = "\n".join(
     f"INSERT INTO skills (name, description, common, content, is_deleted) "
@@ -64,7 +64,7 @@ def make_db() -> sqlite3.Connection:
                 "VALUES ('test_authoring_dosarch', 'fork skill', 'body')")
     # one grant on the skill we retire, to prove grants stay put
     con.execute("INSERT INTO shell_skills (shell_id, skill_id) "
-                "SELECT 1, skill_id FROM skills WHERE name='test_authoring'")
+                "SELECT 1, skill_id FROM skills WHERE name='redline_review'")
     con.commit()
     return con
 
@@ -130,20 +130,20 @@ class RetireTest(unittest.TestCase):
             seed_skills.retired_skill_names()
 
     def test_non_list_fails_loud(self):
-        self._retire_file({"retire": ["test_authoring"]})
+        self._retire_file({"retire": ["redline_review"]})
         with self.assertRaises(ValueError):
             seed_skills.retired_skill_names()
 
     # ── apply_retired ───────────────────────────────────────────────────────
     def test_retire_flips_engine_skill(self):
-        self._retire_file(["test_authoring"])
+        self._retire_file(["redline_review"])
         flipped = seed_skills.apply_retired(self.con)
-        self.assertEqual(flipped, ["test_authoring"])
-        self.assertEqual(self._deleted("test_authoring"), 1)
+        self.assertEqual(flipped, ["redline_review"])
+        self.assertEqual(self._deleted("redline_review"), 1)
         self.assertEqual(self._deleted("review"), 0)
 
     def test_apply_is_idempotent(self):
-        self._retire_file(["test_authoring"])
+        self._retire_file(["redline_review"])
         seed_skills.apply_retired(self.con)
         self.assertEqual(seed_skills.apply_retired(self.con), [],
                          "second apply must flip nothing")
@@ -157,29 +157,29 @@ class RetireTest(unittest.TestCase):
         )
 
     def test_unlisting_restores(self):
-        self._retire_file(["test_authoring"])
+        self._retire_file(["redline_review"])
         seed_skills.apply_retired(self.con)
         self._retire_file([])
         flipped = seed_skills.apply_retired(self.con)
-        self.assertEqual(flipped, ["test_authoring"])
-        self.assertEqual(self._deleted("test_authoring"), 0)
+        self.assertEqual(flipped, ["redline_review"])
+        self.assertEqual(self._deleted("redline_review"), 0)
 
     def test_survives_full_seed_rerun(self):
         # update.sync_skills re-executes the whole seed → is_deleted=0; the
         # re-apply must retire the skill again.
-        self._retire_file(["test_authoring"])
+        self._retire_file(["redline_review"])
         seed_skills.apply_retired(self.con)
         self.con.executescript(SEED_SQL)      # the resurrect
-        self.assertEqual(self._deleted("test_authoring"), 0)
+        self.assertEqual(self._deleted("redline_review"), 0)
         seed_skills.apply_retired(self.con)
-        self.assertEqual(self._deleted("test_authoring"), 1)
+        self.assertEqual(self._deleted("redline_review"), 1)
 
     def test_sync_engine_skills_reapplies(self):
-        self._retire_file(["test_authoring"])
+        self._retire_file(["redline_review"])
         seed_skills.apply_retired(self.con)
         self.con.executescript(SEED_SQL)      # simulate an upstream resurrect
         seed_skills.sync_engine_skills(self.con, specs=[])
-        self.assertEqual(self._deleted("test_authoring"), 1)
+        self.assertEqual(self._deleted("redline_review"), 1)
 
     def test_local_skill_never_touched(self):
         self._retire_file(["test_authoring_dosarch"])   # local name — ignored
@@ -188,20 +188,20 @@ class RetireTest(unittest.TestCase):
         self.assertEqual(self._deleted("test_authoring_dosarch"), 0)
 
     def test_grants_stay_dormant(self):
-        self._retire_file(["test_authoring"])
+        self._retire_file(["redline_review"])
         seed_skills.apply_retired(self.con)
         n = self.con.execute(
             "SELECT COUNT(*) FROM shell_skills ss "
             "JOIN skills s ON s.skill_id=ss.skill_id "
-            "WHERE s.name='test_authoring'").fetchone()[0]
+            "WHERE s.name='redline_review'").fetchone()[0]
         self.assertEqual(n, 1, "retire must not delete grant rows")
 
     # ── CLI (skill.py) ──────────────────────────────────────────────────────
     def test_cmd_retire_writes_file_and_flips(self):
-        skill_cli.cmd_retire(self.con, "test_authoring")
+        skill_cli.cmd_retire(self.con, "redline_review")
         self.assertEqual(json.loads(seed_skills.RETIRED_FILE.read_text()),
-                         ["test_authoring"])
-        self.assertEqual(self._deleted("test_authoring"), 1)
+                         ["redline_review"])
+        self.assertEqual(self._deleted("redline_review"), 1)
         self.reconcile_existing.assert_called_once_with(self.con)
 
     def test_cmd_retire_refuses_local_skill(self):
@@ -213,11 +213,11 @@ class RetireTest(unittest.TestCase):
             skill_cli.cmd_retire(self.con, "no_such_skill")
 
     def test_cmd_unretire_restores(self):
-        skill_cli.cmd_retire(self.con, "test_authoring")
+        skill_cli.cmd_retire(self.con, "redline_review")
         self.reconcile_existing.reset_mock()
-        skill_cli.cmd_unretire(self.con, "test_authoring")
+        skill_cli.cmd_unretire(self.con, "redline_review")
         self.assertEqual(json.loads(seed_skills.RETIRED_FILE.read_text()), [])
-        self.assertEqual(self._deleted("test_authoring"), 0)
+        self.assertEqual(self._deleted("redline_review"), 0)
         self.reconcile_existing.assert_called_once_with(self.con)
 
     def test_cmd_grant_reconciles_the_target_shell(self):
@@ -260,9 +260,9 @@ class RetireTest(unittest.TestCase):
             skill_cli.cmd_unretire(self.con, "review")
 
     def test_grant_of_retired_skill_is_loud(self):
-        skill_cli.cmd_retire(self.con, "test_authoring")
+        skill_cli.cmd_retire(self.con, "redline_review")
         with self.assertRaises(SystemExit):
-            skill_cli.resolve_skill(self.con, "test_authoring")
+            skill_cli.resolve_skill(self.con, "redline_review")
 
 
 class RenderCheckRetirementTest(unittest.TestCase):
@@ -280,7 +280,7 @@ class RenderCheckRetirementTest(unittest.TestCase):
                 "is_deleted INTEGER NOT NULL DEFAULT 0);"
             )
             content.write_text(SEED_SQL)
-            retired.write_text(json.dumps(["test_authoring"]))
+            retired.write_text(json.dumps(["redline_review"]))
 
             with (
                 mock.patch.object(render_check, "SCHEMA", schema),
@@ -297,9 +297,9 @@ class RenderCheckRetirementTest(unittest.TestCase):
             with closing(sqlite3.connect(db)) as con:
                 rows = con.execute(
                     "SELECT name, is_deleted FROM skills "
-                    "WHERE name IN ('review', 'test_authoring') ORDER BY name"
+                    "WHERE name IN ('redline_review', 'review') ORDER BY name"
                 ).fetchall()
-            self.assertEqual(rows, [("review", 0), ("test_authoring", 1)])
+            self.assertEqual(rows, [("redline_review", 1), ("review", 0)])
 
 
 class SkillCliConnectionTest(unittest.TestCase):

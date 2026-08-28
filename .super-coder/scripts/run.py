@@ -32,6 +32,7 @@ flavor_defaults.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import shutil
@@ -57,12 +58,14 @@ import artifact_policy  # noqa: E402
 import callable_floor  # noqa: E402
 import conversation_boot  # noqa: E402
 import db_driver  # noqa: E402
+import devkit  # noqa: E402
 import git_freshness  # noqa: E402
 import git_prune  # noqa: E402  — boot-time prune of provably-merged local branches
 import global_pointer  # noqa: E402
 import install  # noqa: E402  — reuse its canonical HARNESS_BIN (one source of truth)
 import opencode_config  # noqa: E402  — one locked owner for opencode.json
 import ports as ports_mod  # noqa: E402  — derive the per-fork API base URL
+import sandbox_devkit  # noqa: E402  — readiness receipt identity contract
 import seed_skills  # noqa: E402  — boot-time self-heal of stale engine skills
 import shell_liveness  # noqa: E402  — headless boot's one-shell-one-session guard
 import skill_projection  # noqa: E402  — exact bounded harness skill mirrors
@@ -83,6 +86,199 @@ VENV_PROBE_SCRIPT = (
     "print(json.dumps({'version': list(sys.version_info[:2]), "
     "'prefix': sys.prefix, 'base_prefix': sys.base_prefix}))"
 )
+
+DEV_TOOL_HOOKS = ("deps", "test", "lint", "typecheck")
+DEV_TOOL_BASELINE = ("curl", "node", "npm", "pytest", "rg", "sqlite3", "uv")
+
+
+def _dev_tool_receipt_matches(
+    status: dict, declaration: devkit.Declaration, checkout: Path, identity: str
+) -> bool:
+    """Return whether readiness evidence names this checkout and declaration."""
+    declaration_digest = hashlib.sha256(
+        declaration.canonical_json.encode()
+    ).hexdigest()
+    sandbox = declaration.sandbox
+    if sandbox is not None and sandbox.packages is not None:
+        package_digest = hashlib.sha256(
+            json.dumps(
+                sandbox.packages.canonical_atoms, separators=(",", ":")
+            ).encode()
+        ).hexdigest()
+    elif sandbox is not None and sandbox.package_error is not None:
+        package_digest = "invalid"
+    else:
+        package_digest = "none"
+    try:
+        engine_ref = sandbox_devkit._engine_ref(checkout, ENGINE)
+    except sandbox_devkit.SandboxImageError:
+        return False
+    return (
+        status.get("checkout_identity") == identity
+        and status.get("declaration_digest") == declaration_digest
+        and status.get("package_digest") == package_digest
+        and status.get("engine_ref") == engine_ref
+    )
+
+
+def collect_dev_tools(
+    checkout: Path,
+    launch_mode: str,
+    *,
+    repair: bool = False,
+    environment: dict[str, str] | None = None,
+) -> dict:
+    """Collect bounded dev-kit facts for the exact checkout receiving boot."""
+    if launch_mode not in {"container", "host"}:
+        raise ValueError(f"unsupported launch mode: {launch_mode}")
+    environment = dict(os.environ if environment is None else environment)
+    checkout = checkout.resolve(strict=True)
+    evidence_root = checkout / ".sc-state" / "local" / "dev-kit"
+    identity = hashlib.sha256(str(checkout).encode()).hexdigest()
+    status_path = evidence_root / identity[:20] / "status.json"
+    baseline = (
+        {name: "engine-supplied" for name in DEV_TOOL_BASELINE}
+        if launch_mode == "container"
+        else {
+            name: (
+                "available"
+                if shutil.which(name, path=environment.get("PATH"))
+                else "unavailable"
+            )
+            for name in DEV_TOOL_BASELINE
+        }
+    )
+    port = environment.get("SC_DEV_PORT")
+    dev_port = "unavailable"
+    if port:
+        dev_port = (
+            f"127.0.0.1:{port}"
+            if launch_mode == "host"
+            else f"0.0.0.0:{port} -> 127.0.0.1:{port}"
+        )
+    common = {
+        "checkout": str(checkout),
+        "seat": launch_mode,
+        "evidence": str(status_path if status_path.exists() else evidence_root),
+        "logs": str(checkout / ".sc-state" / "local" / "devkit-logs"),
+        "baseline": baseline,
+        "dev_port": dev_port,
+        "app_database": (
+            "configured (URL withheld)"
+            if "DATABASE_URL" in environment
+            else "unavailable"
+        ),
+    }
+    if repair:
+        return {
+            **common,
+            "state": "repair",
+            "declaration": "`.subfloor/dev-kit.json` (repair seat; no readiness claim)",
+            "hooks": {},
+            "sandbox": "unknown during repair",
+            "provision": "repair in progress",
+        }
+
+    try:
+        declaration = devkit.load_declaration(checkout)
+    except devkit.DevkitConfigError as exc:
+        return {
+            **common,
+            "state": "invalid",
+            "detail": f"Declaration validation failed: {exc}",
+            "declaration": "`.subfloor/dev-kit.json` (invalid)",
+            "hooks": {},
+            "sandbox": "unavailable",
+            "provision": "unavailable",
+        }
+    if declaration is None:
+        return {
+            **common,
+            "state": "absent",
+            "declaration": "`.subfloor/dev-kit.json` (absent)",
+            "hooks": {},
+            "sandbox": "absent",
+            "provision": "absent",
+        }
+
+    hooks = {}
+    available_hooks = 0
+    for name in DEV_TOOL_HOOKS:
+        hook = declaration.hooks.get(name)
+        if hook is None:
+            continue
+        executable = hook.resolved_executable
+        if executable is None and launch_mode == "container":
+            available = hook.executable in DEV_TOOL_BASELINE
+        elif executable is None:
+            found = shutil.which(hook.executable, path=environment.get("PATH"))
+            executable = Path(found) if found else None
+            available = bool(executable)
+        else:
+            available = bool(executable.is_file() and os.access(executable, os.X_OK))
+        available_hooks += int(available)
+        hooks[name] = {
+            "state": "configured" if available else "unavailable",
+            "cwd": hook.cwd_declared,
+            "executable": hook.executable,
+        }
+
+    sandbox = declaration.sandbox
+    sandbox_state = "absent"
+    if sandbox is not None:
+        parts = []
+        if sandbox.has_extension:
+            parts.append(f"declared (`{sandbox.dockerfile_declared}`)")
+        if sandbox.packages is not None:
+            parts.append("native packages declared")
+        sandbox_state = "; ".join(parts) or "declared (no extension)"
+    provision_state = (
+        f"declared via `{declaration.provision.hook}`"
+        if declaration.provision is not None
+        else "absent"
+    )
+    state = "ready" if hooks and available_hooks == len(hooks) else "declared"
+    needs_receipt = bool(
+        launch_mode == "container"
+        and (
+            declaration.provision is not None
+            or (sandbox is not None and (sandbox.has_extension or sandbox.packages is not None))
+        )
+    )
+    if needs_receipt:
+        status = None
+        if status_path.is_file():
+            try:
+                status = json.loads(status_path.read_text())
+            except (OSError, UnicodeError, json.JSONDecodeError):
+                state = "failed"
+        if (
+            status is None
+            and state != "failed"
+            or status is not None
+            and not _dev_tool_receipt_matches(
+                status, declaration, checkout, identity
+            )
+        ):
+            state = "stale"
+        elif status is not None:
+            if status.get("native_packages") == "advisory":
+                state = "advisory"
+            elif status.get("fork_readiness") == "ready":
+                state = "ready"
+            elif status.get("state") == "failed" or status.get("core_runtime") == "failed":
+                state = "failed"
+            else:
+                state = "stale"
+
+    return {
+        **common,
+        "state": state,
+        "declaration": "`.subfloor/dev-kit.json` (valid)",
+        "hooks": hooks,
+        "sandbox": sandbox_state,
+        "provision": provision_state,
+    }
 
 
 class VenvEligibility(NamedTuple):
@@ -1544,6 +1740,8 @@ def prepare_launch(*, shell_id: int, harness: "str | None" = None,
     floor_note = main_checkout_note(REPO_ROOT)
     work_repo_note = declared_work_repo_note(REPO_ROOT)
 
+    launch_mode = execution_mode()
+    repair_mode = bool(os.environ.get("SC_DEVKIT_REPAIR"))
     content = conversation_boot.resolve_boot(
         con,
         boot,
@@ -1555,10 +1753,13 @@ def prepare_launch(*, shell_id: int, harness: "str | None" = None,
             work_repo_note=work_repo_note,
             source_mode=install.is_source_repo(),
             devkit_declared=(work_dir / ".subfloor" / "dev-kit.json").is_file(),
-            devkit_repair=bool(os.environ.get("SC_DEVKIT_REPAIR")),
+            devkit_repair=repair_mode,
+            dev_tools=collect_dev_tools(
+                work_dir, launch_mode, repair=repair_mode
+            ),
             api_key=full["api_key"],
             api_port=api_port,
-            launch_mode=execution_mode()),
+            launch_mode=launch_mode),
     )
     render_harness_skills(
         con, full["shell_id"], work_dir, adapter
@@ -2036,6 +2237,8 @@ def main() -> None:
                 prune_note = None
 
         spinner.label = "rendering boot doc + skills"
+        launch_mode = execution_mode()
+        repair_mode = bool(os.environ.get("SC_DEVKIT_REPAIR"))
         content = compose_boot(con, full, user, session_id, archive_id,
                                work_dir=work_dir if work_dir != REPO_ROOT else None,
                                sync_note=sync_note,
@@ -2043,10 +2246,13 @@ def main() -> None:
                                work_repo_note=work_repo_note,
                                source_mode=install.is_source_repo(),
                                devkit_declared=(work_dir / ".subfloor" / "dev-kit.json").is_file(),
-                               devkit_repair=bool(os.environ.get("SC_DEVKIT_REPAIR")),
+                               devkit_repair=repair_mode,
+                               dev_tools=collect_dev_tools(
+                                   work_dir, launch_mode, repair=repair_mode
+                               ),
                                api_key=full["api_key"],
                                api_port=api_port,
-                               launch_mode=execution_mode())
+                               launch_mode=launch_mode)
 
         # Render this shell's granted skills to every directory declared by the
         # selected harness — gitignored and rebuilt per boot.

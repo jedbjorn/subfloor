@@ -53,11 +53,14 @@ class PythonToolingSkillReseedTest(unittest.TestCase):
             "skill_id INTEGER PRIMARY KEY, name TEXT UNIQUE, description TEXT, "
             "category TEXT, command TEXT, common INTEGER, content TEXT, "
             "is_deleted INTEGER DEFAULT 0);"
+            "CREATE TABLE shell_skills (shell_id INTEGER, skill_id INTEGER);"
+            "CREATE TABLE flavor_skills (flavor TEXT, skill_id INTEGER, "
+            "UNIQUE(flavor,skill_id));"
             "INSERT INTO skills VALUES "
             "(1,'dev_kit','stale','stale','stale',1,'stale',1);"
         )
         migration = (
-            ENGINE / "migrations" / "0234_reseed_ci_fallback_authority.sql"
+            ENGINE / "migrations" / "0239_global_skill_simplification.sql"
         ).read_text()
 
         con.executescript(migration)
@@ -79,7 +82,7 @@ class PythonToolingSkillReseedTest(unittest.TestCase):
                 0,
             ),
         )
-        self.assertIn("pinned `uv` + `pytest`", actual[5])
+        self.assertIn("Engine baseline", actual[5])
 
 
 if __name__ == "__main__":

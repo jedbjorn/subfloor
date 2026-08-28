@@ -197,6 +197,8 @@ flag detail: the `flags` skill.
 
 ---
 
+{{dev_tools}}
+
 {{execution_context}}
 
 ---
