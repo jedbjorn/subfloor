@@ -148,6 +148,140 @@ class TargetInspectionTest(unittest.TestCase):
             update_cutover.inspect_target(target_ref, repo_root=self.root)
 
 
+class PurgeFloorAdmissionTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        git(self.root, "init", "-q", "-b", "main")
+        self.compatibility_ref = "1" * 40
+        self.manifest = self.root / update_cutover.TARGET_MANIFEST_PATH
+        write_json(
+            self.manifest,
+            {
+                "contract": "sc-dsh-removal-manifest-v1",
+                "cutover": {
+                    "cleanup_hook": ".super-coder/scripts/dsh_removal_cleanup.py",
+                    "contract": update_cutover.CUTOVER_CONTRACT,
+                    "minimum_floor_ref": self.compatibility_ref,
+                },
+            },
+        )
+        self.target_ref = commit(self.root, "purge floor")
+        self.marker = self.root / ".sc-state/compatibility.json"
+        self.cutover_receipt = self.root / ".sc-state/cutover.json"
+        self.cleanup_receipt = self.root / ".sc-state/cleanup.json"
+        self.backup = self.root / ".sc-state/shell_db.preupdate.db"
+        self.backup.parent.mkdir(parents=True, exist_ok=True)
+        self.backup.write_bytes(b"database backup")
+        write_json(
+            self.marker,
+            {
+                "contract": update_cutover.FLOOR_MARKER_CONTRACT,
+                "engine_ref": self.compatibility_ref,
+                "fresh_process_cleanup_hook": True,
+                "pre_materialization_hook": True,
+            },
+        )
+        manifest_digest = hashlib.sha256(self.manifest.read_bytes()).hexdigest()
+        write_json(
+            self.cutover_receipt,
+            {
+                "backup_path": str(self.backup),
+                "compatibility_ref": self.compatibility_ref,
+                "contract": update_cutover.RECEIPT_CONTRACT,
+                "dsh_outcome": {"relay": True, "stopped": True, "web": True},
+                "generated_ownership": [],
+                "manifest_sha256": manifest_digest,
+                "prior_running": True,
+                "process_identities": {
+                    "relay_pid": 42,
+                    "relay_port": 8977,
+                    "relay_start_ticks": 420,
+                    "service_port": 18977,
+                    "web_pid": 41,
+                    "web_start_ticks": 410,
+                },
+                "review_service": None,
+                "target_ref": self.target_ref,
+            },
+        )
+        write_json(
+            self.cleanup_receipt,
+            {
+                "compatibility_ref": self.compatibility_ref,
+                "contract": update_cutover.CLEANUP_RECEIPT_CONTRACT,
+                "errors": [],
+                "manifest_sha256": manifest_digest,
+                "status": "complete",
+                "target_ref": self.target_ref,
+            },
+        )
+
+    def require(self) -> dict[str, str]:
+        return update_cutover.require_purge_floor(
+            repo_root=self.root,
+            manifest_path=self.manifest,
+            marker_path=self.marker,
+            cutover_receipt_path=self.cutover_receipt,
+            cleanup_receipt_path=self.cleanup_receipt,
+        )
+
+    def test_exact_marker_quiescence_target_manifest_and_cleanup_admit(self) -> None:
+        self.assertTrue(
+            update_cutover.purge_floor_declared(manifest_path=self.manifest)
+        )
+        self.assertEqual(
+            {
+                "compatibility_ref": self.compatibility_ref,
+                "manifest_sha256": hashlib.sha256(
+                    self.manifest.read_bytes()
+                ).hexdigest(),
+                "target_ref": self.target_ref,
+            },
+            self.require(),
+        )
+
+    def test_wrong_compatibility_marker_refuses(self) -> None:
+        marker = json.loads(self.marker.read_text())
+        marker["engine_ref"] = "3" * 40
+        write_json(self.marker, marker)
+
+        with self.assertRaisesRegex(update_cutover.CutoverError, "marker"):
+            self.require()
+
+    def test_unproven_quiescence_refuses(self) -> None:
+        receipt = json.loads(self.cutover_receipt.read_text())
+        receipt["dsh_outcome"]["relay"] = False
+        write_json(self.cutover_receipt, receipt)
+
+        with self.assertRaisesRegex(update_cutover.CutoverError, "quiescence"):
+            self.require()
+
+    def test_materialized_manifest_must_match_exact_target_ref(self) -> None:
+        manifest = json.loads(self.manifest.read_text())
+        manifest["post_commit_tamper"] = True
+        write_json(self.manifest, manifest)
+        digest = hashlib.sha256(self.manifest.read_bytes()).hexdigest()
+        cutover = json.loads(self.cutover_receipt.read_text())
+        cutover["manifest_sha256"] = digest
+        write_json(self.cutover_receipt, cutover)
+        cleanup = json.loads(self.cleanup_receipt.read_text())
+        cleanup["manifest_sha256"] = digest
+        write_json(self.cleanup_receipt, cleanup)
+
+        with self.assertRaisesRegex(update_cutover.CutoverError, "target ref"):
+            self.require()
+
+    def test_noncomplete_cleanup_refuses(self) -> None:
+        cleanup = json.loads(self.cleanup_receipt.read_text())
+        cleanup["status"] = "refused"
+        write_json(self.cleanup_receipt, cleanup)
+
+        with self.assertRaisesRegex(update_cutover.CutoverError, "cleanup receipt"):
+            self.require()
+
+
 class PrepareCutoverTest(unittest.TestCase):
     PLAN = update_cutover.CutoverPlan(
         target_ref="2" * 40,

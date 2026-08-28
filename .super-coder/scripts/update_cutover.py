@@ -33,6 +33,7 @@ FLOOR_DECLARATION_CONTRACT = "sc-dsh-compatibility-floor-declaration-v1"
 FLOOR_MARKER_CONTRACT = "sc-dsh-compatibility-floor-v1"
 CUTOVER_CONTRACT = "sc-dsh-removal-cutover-v1"
 RECEIPT_CONTRACT = "sc-dsh-cutover-receipt-v1"
+CLEANUP_RECEIPT_CONTRACT = "sc-dsh-cleanup-receipt-v1"
 _SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 
 
@@ -122,14 +123,7 @@ def _sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
-def inspect_target(ref: str, *, repo_root: Path = REPO_ROOT) -> CutoverPlan | None:
-    """Read a removal target's bounded contract without materializing it."""
-    if not _SHA_RE.fullmatch(ref):
-        raise CutoverError("target ref must be an exact 40-character SHA")
-    raw = _git_object(ref, TARGET_MANIFEST_PATH, repo_root=repo_root)
-    if raw is None:
-        return None
-    manifest = _json_object(raw, label="target DSH removal manifest")
+def _cutover_fields(manifest: Mapping[str, Any]) -> tuple[str, str] | None:
     cutover = manifest.get("cutover")
     if cutover is None:
         return None
@@ -145,12 +139,139 @@ def inspect_target(ref: str, *, repo_root: Path = REPO_ROOT) -> CutoverPlan | No
     cleanup_hook = cutover.get("cleanup_hook")
     if cleanup_hook != ".super-coder/scripts/dsh_removal_cleanup.py":
         raise CutoverError("target DSH removal cleanup_hook is not the supported hook")
+    return compatibility_ref, cleanup_hook
+
+
+def inspect_target(ref: str, *, repo_root: Path = REPO_ROOT) -> CutoverPlan | None:
+    """Read a removal target's bounded contract without materializing it."""
+    if not _SHA_RE.fullmatch(ref):
+        raise CutoverError("target ref must be an exact 40-character SHA")
+    raw = _git_object(ref, TARGET_MANIFEST_PATH, repo_root=repo_root)
+    if raw is None:
+        return None
+    manifest = _json_object(raw, label="target DSH removal manifest")
+    fields = _cutover_fields(manifest)
+    if fields is None:
+        return None
+    compatibility_ref, cleanup_hook = fields
     return CutoverPlan(
         target_ref=ref,
         compatibility_ref=compatibility_ref,
         cleanup_hook=cleanup_hook,
         manifest_sha256=hashlib.sha256(raw).hexdigest(),
     )
+
+
+def purge_floor_declared(*, manifest_path: Path | None = None) -> bool:
+    """Return whether the materialized engine declares the gated purge hop."""
+    manifest_path = manifest_path or (REPO_ROOT / TARGET_MANIFEST_PATH)
+    try:
+        manifest = _json_object(
+            manifest_path.read_bytes(), label="materialized DSH removal manifest"
+        )
+    except OSError:
+        return False
+    return _cutover_fields(manifest) is not None
+
+
+def require_purge_floor(
+    *,
+    repo_root: Path = REPO_ROOT,
+    manifest_path: Path | None = None,
+    marker_path: Path | None = None,
+    cutover_receipt_path: Path | None = None,
+    cleanup_receipt_path: Path | None = None,
+) -> dict[str, str]:
+    """Validate every durable purge-floor input before DB deletion begins."""
+    manifest_path = manifest_path or (repo_root / TARGET_MANIFEST_PATH)
+    marker_path = marker_path or FLOOR_MARKER
+    cutover_receipt_path = cutover_receipt_path or CUTOVER_RECEIPT
+    cleanup_receipt_path = cleanup_receipt_path or CLEANUP_RECEIPT
+    try:
+        manifest_raw = manifest_path.read_bytes()
+        manifest = _json_object(
+            manifest_raw, label="materialized DSH removal manifest"
+        )
+    except OSError as exc:
+        raise CutoverError("DSH purge floor manifest is unavailable") from exc
+    fields = _cutover_fields(manifest)
+    if fields is None:
+        raise CutoverError("DSH purge floor is not declared by this engine")
+    compatibility_ref, _cleanup_hook = fields
+    manifest_sha256 = hashlib.sha256(manifest_raw).hexdigest()
+
+    try:
+        marker = _json_object(
+            marker_path.read_bytes(), label="installed compatibility floor marker"
+        )
+        cutover_receipt = _json_object(
+            cutover_receipt_path.read_bytes(), label="cutover receipt"
+        )
+        cleanup_receipt = _json_object(
+            cleanup_receipt_path.read_bytes(), label="target cleanup receipt"
+        )
+    except OSError as exc:
+        raise CutoverError("DSH purge floor receipts are incomplete") from exc
+
+    expected_marker = {
+        "contract": FLOOR_MARKER_CONTRACT,
+        "engine_ref": compatibility_ref,
+        "fresh_process_cleanup_hook": True,
+        "pre_materialization_hook": True,
+    }
+    if marker != expected_marker:
+        raise CutoverError("DSH purge compatibility marker does not match the floor")
+
+    target_ref = cutover_receipt.get("target_ref")
+    process_identities = cutover_receipt.get("process_identities")
+    outcome = cutover_receipt.get("dsh_outcome")
+    backup_path = cutover_receipt.get("backup_path")
+    if (
+        cutover_receipt.get("contract") != RECEIPT_CONTRACT
+        or cutover_receipt.get("compatibility_ref") != compatibility_ref
+        or cutover_receipt.get("manifest_sha256") != manifest_sha256
+        or not isinstance(target_ref, str)
+        or not _SHA_RE.fullmatch(target_ref)
+        or not isinstance(backup_path, str)
+        or not backup_path
+        or not Path(backup_path).is_file()
+        or not isinstance(cutover_receipt.get("prior_running"), bool)
+        or not isinstance(cutover_receipt.get("generated_ownership"), list)
+        or not isinstance(process_identities, dict)
+        or set(process_identities)
+        != {
+            "relay_pid",
+            "relay_port",
+            "relay_start_ticks",
+            "service_port",
+            "web_pid",
+            "web_start_ticks",
+        }
+        or not isinstance(outcome, dict)
+        or set(outcome) != {"relay", "stopped", "web"}
+        or outcome.get("relay") is not True
+        or outcome.get("web") is not True
+        or not isinstance(outcome.get("stopped"), bool)
+        or cutover_receipt.get("recovery") is not None
+    ):
+        raise CutoverError("DSH purge cutover/quiescence receipt is invalid")
+
+    target_manifest = _git_object(target_ref, TARGET_MANIFEST_PATH, repo_root=repo_root)
+    if target_manifest != manifest_raw:
+        raise CutoverError("DSH purge target ref does not match materialized manifest")
+    if (
+        cleanup_receipt.get("contract") != CLEANUP_RECEIPT_CONTRACT
+        or cleanup_receipt.get("target_ref") != target_ref
+        or cleanup_receipt.get("compatibility_ref") != compatibility_ref
+        or cleanup_receipt.get("manifest_sha256") != manifest_sha256
+        or cleanup_receipt.get("status") != "complete"
+    ):
+        raise CutoverError("DSH purge cleanup receipt does not match the floor")
+    return {
+        "compatibility_ref": compatibility_ref,
+        "manifest_sha256": manifest_sha256,
+        "target_ref": target_ref,
+    }
 
 
 def target_declares_compatibility_floor(

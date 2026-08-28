@@ -33,7 +33,7 @@ import sys
 import tempfile
 import threading
 import unittest
-from contextlib import ExitStack, redirect_stderr, redirect_stdout
+from contextlib import ExitStack, closing, redirect_stderr, redirect_stdout
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from unittest import mock
@@ -400,12 +400,32 @@ class RootCheckoutUnchangedTest(WorktreeFixture):
             hashlib.sha256((self.pristine / "shell_db.db").read_bytes()).hexdigest(),
             "root migrate must still really migrate")
 
-    def test_root_migrate_names_its_targets_on_the_nothing_pending_outcome(self):
+    def test_root_migrate_names_targets_and_retains_the_purge_floor_barrier(self):
         run_sc(self.main, "migrate")
         done = run_sc(self.main, "migrate")
         self.assertEqual(done.returncode, 0, done.stderr)
         self.assertIn(f"migrate: db         {self.live_db}", done.stdout)
-        self.assertIn(f"nothing pending — {self.live_db} is current", done.stdout)
+        self.assertIn(
+            f"migrate: migrations {self.main / '.super-coder' / 'migrations'}",
+            done.stdout,
+        )
+        self.assertIn(
+            "migrate: deferred 0237_purge_dsh_owned_data.sql — "
+            "target has not declared the purge floor",
+            done.stdout,
+        )
+        self.assertIn(
+            f"migrate: 0 migration(s) applied to {self.live_db}.",
+            done.stdout,
+        )
+        with closing(sqlite3.connect(self.live_db)) as con:
+            self.assertEqual(
+                0,
+                con.execute(
+                    "SELECT COUNT(*) FROM schema_migrations "
+                    "WHERE filename='0237_purge_dsh_owned_data.sql'"
+                ).fetchone()[0],
+            )
 
     def test_root_verify_discloses_its_target_before_the_rebuild_runs(self):
         """The ordering IS the requirement, so both events are captured in ONE
