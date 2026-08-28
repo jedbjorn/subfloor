@@ -115,7 +115,6 @@ import callable_floor  # noqa: E402
 import engine_manifest  # noqa: E402
 import global_pointer  # noqa: E402
 import ports as ports_mod  # noqa: E402
-import update_cutover  # noqa: E402
 from engine_paths import GENERATED_INSTALL_PATHS  # noqa: E402
 
 
@@ -1081,6 +1080,8 @@ def main(argv: list[str]) -> int:
         "Building the system DB (schema + migrations)",
         [PY, str(ENGINE / "scripts/rebuild.py")],
     )
+    import update_cutover
+
     try:
         fresh_removal_ready = update_cutover.record_fresh_install_readiness(
             pinned,
