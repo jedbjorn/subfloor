@@ -237,10 +237,10 @@ class MigrationManagementReseedTest(unittest.TestCase):
         self.assertIn("WAL-safe backup", actual[5])
         self.assertIn("fresh build, in-place migration", actual[5])
         self.assertIn("./sc migration new <lowercase_snake_case_slug>", actual[5])
-        self.assertIn(
-            "./sc migrate /absolute/path/to/.super-coder/shell_db.db",
-            actual[5],
-        )
+        self.assertIn("\n./sc migrate\n", actual[5])
+        self.assertNotIn("./sc migrate /", actual[5])
+        self.assertIn("migrate: db         <absolute-path>", actual[5])
+        self.assertIn("ACTIVE SESSION `floor: live_engine_checkout`", actual[5])
         self.assertIn("0001_seed_skills.sql` is the generated exception", actual[5])
         self.assertIn("nothing pending", actual[5])
 

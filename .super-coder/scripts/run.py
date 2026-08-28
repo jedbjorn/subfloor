@@ -159,6 +159,13 @@ def collect_dev_tools(
             if launch_mode == "host"
             else f"0.0.0.0:{port} -> 127.0.0.1:{port}"
         )
+    database_url = environment.get("DATABASE_URL")
+    if database_url is None:
+        app_database = "unavailable"
+    elif not database_url.strip():
+        app_database = "invalid (empty DATABASE_URL)"
+    else:
+        app_database = "configured (URL withheld)"
     common = {
         "checkout": str(checkout),
         "seat": launch_mode,
@@ -166,11 +173,7 @@ def collect_dev_tools(
         "logs": str(checkout / ".sc-state" / "local" / "devkit-logs"),
         "baseline": baseline,
         "dev_port": dev_port,
-        "app_database": (
-            "configured (URL withheld)"
-            if "DATABASE_URL" in environment
-            else "unavailable"
-        ),
+        "app_database": app_database,
     }
     if repair:
         return {

@@ -35,6 +35,7 @@ Usage:
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import sqlite3
@@ -52,6 +53,20 @@ DB_PATH = ENGINE / "shell_db.db"
 RETIRED_FILE = artifact_policy.retired_skills_path()
 TOMBSTONES_FILE = ENGINE / "assets" / "skill_tombstones.json"
 SKILL_NAME_RE = re.compile(r"^[a-z][a-z0-9_-]*$")
+DEV_KIT_STARTER = (
+    ENGINE / "assets" / "seed" / "skills" / "dev_kit" / "SKILL.md"
+)
+LEGACY_DEV_KIT_STARTER = {
+    "description": (
+        "Run fork-owned dev-kit hooks and diagnose host or Docker provisioning "
+        "states without inferring project policy."
+    ),
+    "category": "substrate",
+    "command": None,
+    "common": 0,
+    "content_sha256": "66ae67912cdc5bd8bb3bf4fa382089b338a893e36ab7eef5cc7d5cc7eed47717",
+    "is_deleted": 0,
+}
 
 
 @dataclass(frozen=True)
@@ -224,6 +239,36 @@ def reconcile_standard_flavor_packs(
             ).rowcount
     con.commit()
     return changed
+
+
+def reconcile_dev_kit_starter(con) -> bool:
+    """Upgrade only the exact untouched pre-0239 fork starter."""
+    row = con.execute(
+        "SELECT description,category,command,common,content,is_deleted "
+        "FROM skills WHERE name='dev_kit'"
+    ).fetchone()
+    if row is None or not isinstance(row[4], str):
+        return False
+    actual = {
+        "description": row[0],
+        "category": row[1],
+        "command": row[2],
+        "common": row[3],
+        "content_sha256": hashlib.sha256(row[4].encode()).hexdigest(),
+        "is_deleted": row[5],
+    }
+    if actual != LEGACY_DEV_KIT_STARTER:
+        return False
+
+    desired = parse_skill(DEV_KIT_STARTER)
+    changed = con.execute(
+        "UPDATE skills SET description=?,category=?,command=?,common=?,"
+        "content=?,is_deleted=0 WHERE name='dev_kit'",
+        tuple(desired[field] for field in SEED_FIELDS),
+    ).rowcount
+    if changed:
+        con.commit()
+    return changed == 1
 
 
 def sql_str(v) -> str:

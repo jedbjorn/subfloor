@@ -311,6 +311,7 @@ def main(argv: list[str]) -> int:
         try:
             seed_skills.validate_upstream_skill_namespace(
                 seed_skills.seeded_skill_names())
+            dev_kit_upgraded = seed_skills.reconcile_dev_kit_starter(con)
             reconciled = seed_skills.reconcile_tombstoned_skills(con)
             flipped = seed_skills.apply_retired(con)
             pack_changes = seed_skills.reconcile_standard_flavor_packs(con)
@@ -322,6 +323,8 @@ def main(argv: list[str]) -> int:
                 f"({', '.join(reconciled.changed_names)}; "
                 f"{reconciled.grant_count} grant(s))"
             )
+        if dev_kit_upgraded:
+            print("rebuild: upgraded untouched legacy dev_kit starter")
         if flipped:
             print(f"rebuild: fork retire list applied ({', '.join(flipped)})")
         if pack_changes:

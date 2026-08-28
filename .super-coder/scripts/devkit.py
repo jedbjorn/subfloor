@@ -208,16 +208,26 @@ def _repo_path(
     return value, resolved
 
 
+def _boot_repo_path(
+    checkout: Path,
+    declared: Any,
+    field: str,
+    *,
+    base: Path | None = None,
+    kind: str | None = None,
+) -> tuple[str, Path]:
+    """Resolve one path that is later rendered inside generated Markdown."""
+    value = _boot_field(_string(declared, field), field)
+    return _repo_path(checkout, value, field, base=base, kind=kind)
+
+
 def _hook(checkout: Path, name: str, value: Any) -> Hook:
     field = f"$.hooks.{name}"
     item = _object(value, field)
     _keys(item, field, allowed=("argv", "cwd"), required=("argv",))
     argv = _string_array(item["argv"], f"{field}.argv")
-    cwd_value = _boot_field(
-        _string(item.get("cwd", "."), f"{field}.cwd"), f"{field}.cwd"
-    )
-    cwd_declared, cwd = _repo_path(
-        checkout, cwd_value, f"{field}.cwd", kind="directory"
+    cwd_declared, cwd = _boot_repo_path(
+        checkout, item.get("cwd", "."), f"{field}.cwd", kind="directory"
     )
     executable = _boot_field(argv[0], f"{field}.argv[0]")
     if "/" not in executable:
@@ -320,7 +330,7 @@ def _sandbox(checkout: Path, value: Any) -> Sandbox:
     context_declared: str | None = None
     context: Path | None = None
     if "dockerfile" in item:
-        dockerfile_declared, dockerfile = _repo_path(
+        dockerfile_declared, dockerfile = _boot_repo_path(
             checkout, item["dockerfile"], f"{field}.dockerfile", kind="file"
         )
         default_context = str(Path(dockerfile_declared).parent)

@@ -41,17 +41,19 @@ snapshot converge to the same state.
 
 The live engine DB is `.super-coder/shell_db.db` in the main checkout, not a
 Developer worktree. Before an authorized live migration, resolve that exact
-path, then use the supported backup-and-apply surface:
+path independently from the ACTIVE SESSION `floor: live_engine_checkout`, then
+use the supported backup-and-apply surface:
 
 ```bash
-./sc migrate /absolute/path/to/.super-coder/shell_db.db
+./sc migrate
 ```
 
-The command reports the absolute DB and migration-source paths before access,
-creates a WAL-safe backup with a `premigrate` restore point for an existing DB,
-then reports each applied filename and the final count (or `nothing pending`).
-Pass = the backup receipt names its restore path before the first migration
-applies. The FnB owns
+Require its first line, `migrate: db         <absolute-path>`, to match the
+independently resolved live DB exactly. The command then reports the migration
+source, creates a WAL-safe backup with a `premigrate` restore point for an
+existing DB, and reports each applied filename plus the final count (or
+`nothing pending`). Pass = the backup receipt names its restore path before the
+first migration applies. A DB-path mismatch stops the operation. The FnB owns
 the restart and cutover boundary. Never point engine work at `$DATABASE_URL`;
 that variable is for the fork application's database.
 

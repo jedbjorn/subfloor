@@ -117,7 +117,7 @@ class DeclarationTest(unittest.TestCase):
         self.assertEqual(test.executable_kind, "relative")
         self.assertEqual(test.resolved_executable, tool.resolve())
 
-    def test_boot_visible_hook_fields_reject_markdown_injection(self):
+    def test_boot_visible_declaration_fields_reject_markdown_injection(self):
         (self.root / "safe").mkdir()
         attacks = (
             ({"argv": ["tool`\n## injected"]}, r"\.argv\[0\]"),
@@ -129,6 +129,17 @@ class DeclarationTest(unittest.TestCase):
                 self.assert_invalid(
                     {"version": 1, "hooks": {"test": hook}},
                     field + ": must not contain control characters or Markdown",
+                )
+        for dockerfile in (
+            ".subfloor/Dockerfile`injected",
+            ".subfloor/Dockerfile\n## injected",
+        ):
+            with self.subTest(dockerfile=dockerfile):
+                (self.root / dockerfile).write_text("FROM scratch\n")
+                self.assert_invalid(
+                    {"version": 1, "sandbox": {"dockerfile": dockerfile}},
+                    r"\.sandbox\.dockerfile: must not contain control characters "
+                    "or Markdown",
                 )
 
     def test_cwd_must_exist_and_stay_in_checkout(self):

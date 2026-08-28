@@ -121,12 +121,21 @@ class DevToolsBootTest(unittest.TestCase):
         self.assertIn("configured (URL withheld)", rendered)
         self.assertNotIn("secret.example", rendered)
 
-        empty_database = run.collect_dev_tools(
-            self.checkout,
-            "host",
-            environment={**self.environment, "DATABASE_URL": ""},
-        )
-        self.assertEqual(empty_database["app_database"], "configured (URL withheld)")
+        for value in ("", " \t"):
+            with self.subTest(database_url=value):
+                empty_database = run.collect_dev_tools(
+                    self.checkout,
+                    "host",
+                    environment={**self.environment, "DATABASE_URL": value},
+                )
+                self.assertEqual(
+                    empty_database["app_database"],
+                    "invalid (empty DATABASE_URL)",
+                )
+                self.assertIn(
+                    "App database sidecar:** invalid (empty DATABASE_URL)",
+                    compose.render_dev_tools("dev", empty_database),
+                )
 
     def test_missing_executable_is_declared_but_not_ready(self) -> None:
         self.write_declaration(self.declaration(), executable=False)
