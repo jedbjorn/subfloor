@@ -3154,25 +3154,34 @@ function chatBubble(
   segment = "answer",
 ) {
   const bubble = el("article", { className: `chat-bubble chat-${kind}` });
-  if (kind === "assistant" && segment === "reasoning")
+  const isReasoning = kind === "assistant" && segment === "reasoning";
+  if (isReasoning)
     bubble.classList.add("chat-reasoning");
-  const header = el("div", { className: "chat-bubble-head" },
-    el("div", { className: "chat-who" },
-      kind === "user" ? "You"
-        : kind === "assistant" && segment === "reasoning" ? "Reasoning"
-        : kind === "assistant" ? chatShellLabel(conversation)
-        : "Activity"));
+  const label = kind === "user" ? "You"
+    : isReasoning ? "Reasoning"
+    : kind === "assistant" ? chatShellLabel(conversation)
+    : "Activity";
   const time = chatMessageTimeLabel(createdAt);
-  if (time) header.append(el("time", {
+  const timeNode = () => el("time", {
     className: "chat-message-time",
     dateTime: String(createdAt),
-  }, time));
-  bubble.append(header);
+  }, time);
   const content = kind === "activity"
     ? el("div", { className: "chat-activity-text" }, body)
     : mdBlock(body);
   if (kind === "assistant") content.classList.add("chat-assistant-body");
-  bubble.append(content);
+  if (isReasoning) {
+    const disclosure = el("details", { className: "chat-reasoning-disclosure" });
+    const summary = el("summary", {}, "Reasoning");
+    if (time) summary.append(timeNode());
+    disclosure.append(summary, content);
+    bubble.append(disclosure);
+  } else {
+    const header = el("div", { className: "chat-bubble-head" },
+      el("div", { className: "chat-who" }, label));
+    if (time) header.append(timeNode());
+    bubble.append(header, content);
+  }
   if (meta) bubble.append(el("div", { className: "chat-meta" }, meta));
   if (kind === "assistant") {
     const tokenLabel = chatContextTokenLabel(contextTokens);

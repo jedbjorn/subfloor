@@ -6,6 +6,7 @@ import atexit
 import hashlib
 import json
 import os
+import queue
 import secrets
 import shlex
 import shutil
@@ -49,6 +50,7 @@ SERVER_LOG = ENGINE / "logs" / "opencode-server.log"
 SERVER_STATE = ENGINE / "run" / "opencode-server.json"
 SHELL_RUNTIME_DIR = ENGINE / "run" / "opencode-shells"
 TURN_TIMEOUT_SECONDS = 5400.0
+TURN_CLEANUP_TIMEOUT_SECONDS = 10.0
 _SERVER_LOCK = threading.RLock()
 _SERVER_PROCESS: subprocess.Popen | None = None
 _SERVER_ENDPOINT = SERVER_ENDPOINT
@@ -59,6 +61,302 @@ MAX_CONNECTED_PROVIDERS = 256
 MAX_CONNECTED_MODELS = 2_000
 MAX_NATIVE_OPTIONS = 256
 MAX_NATIVE_IDENTIFIER_CHARS = 512
+
+
+class _OpenCodeProjection:
+    """Reduce one exact-session OpenCode typed-part stream."""
+
+    def __init__(self) -> None:
+        self.message_roles: dict[str, str] = {}
+        self.part_kinds: dict[str, str] = {}
+        self.part_messages: dict[str, str] = {}
+        self.part_text: dict[str, str] = {}
+        self.part_emitted: dict[str, str] = {}
+        self.tool_states: dict[str, str] = {}
+        self.run_started = False
+        self.last_usage: tuple[tuple[str, int | float], ...] | None = None
+
+    def _flush_text(self, part_id: str, native_type: str) -> list[NormalizedEvent]:
+        kind = self.part_kinds.get(part_id)
+        message_id = self.part_messages.get(part_id)
+        if kind not in {"text", "reasoning"} or not message_id:
+            return []
+        if self.message_roles.get(message_id) != "assistant":
+            return []
+        text = self.part_text.get(part_id, "")
+        emitted = self.part_emitted.get(part_id, "")
+        if not text.startswith(emitted):
+            raise AdapterError(
+                "HARNESS_PROTOCOL_ERROR",
+                f"OpenCode replaced emitted text for part {part_id}",
+            )
+        delta = text[len(emitted):]
+        if not delta:
+            return []
+        self.part_emitted[part_id] = text
+        return [
+            NormalizedEvent(
+                "assistant.delta",
+                {
+                    "text": delta,
+                    "segment": "reasoning" if kind == "reasoning" else "answer",
+                },
+                native_type,
+            )
+        ]
+
+    def _merge_full_text(self, part_id: str, text: str) -> None:
+        current = self.part_text.get(part_id, "")
+        if text.startswith(current):
+            self.part_text[part_id] = text
+            return
+        if current.startswith(text):
+            return
+        raise AdapterError(
+            "HARNESS_PROTOCOL_ERROR",
+            f"OpenCode returned irreconcilable text for part {part_id}",
+        )
+
+    def _tool_events(
+        self,
+        tool_ref: str,
+        name: str | None,
+        status: str,
+        native_type: str,
+    ) -> list[NormalizedEvent]:
+        previous = self.tool_states.get(tool_ref)
+        if status in {"pending", "running"}:
+            if previous is not None:
+                return []
+            self.tool_states[tool_ref] = "running"
+            return [
+                NormalizedEvent(
+                    "tool.started",
+                    {"tool_ref": tool_ref, "name": name},
+                    native_type,
+                )
+            ]
+        if status not in {"completed", "error"}:
+            return []
+        if previous in {"completed", "error"}:
+            return []
+        events = []
+        if previous is None:
+            events.append(
+                NormalizedEvent(
+                    "tool.started",
+                    {"tool_ref": tool_ref, "name": name},
+                    native_type,
+                )
+            )
+        self.tool_states[tool_ref] = status
+        events.append(
+            NormalizedEvent(
+                "tool.completed",
+                {
+                    "tool_ref": tool_ref,
+                    "status": "failed" if status == "error" else "completed",
+                },
+                native_type,
+            )
+        )
+        return events
+
+    def normalize(self, raw: Mapping[str, Any]) -> list[NormalizedEvent]:
+        event = OpenCodeAdapter._event_payload(raw)
+        native_type = event.get("type")
+        if not isinstance(native_type, str):
+            return []
+        props = event.get("properties")
+        props = props if isinstance(props, dict) else {}
+
+        if native_type == "session.status":
+            status = props.get("status")
+            status_type = status.get("type") if isinstance(status, dict) else status
+            if status_type != "busy" or self.run_started:
+                return []
+            self.run_started = True
+            return [
+                NormalizedEvent(
+                    "run.started", {"status": "running"}, native_type
+                )
+            ]
+        if native_type == "session.idle":
+            return [
+                NormalizedEvent(
+                    "run.completed", {"status": "completed"}, native_type
+                )
+            ]
+        if native_type == "session.error":
+            error = props.get("error")
+            name = OpenCodeAdapter._error_name(error)
+            interrupted = name == "MessageAbortedError"
+            return [
+                NormalizedEvent(
+                    "run.interrupted" if interrupted else "run.failed",
+                    {"error": name},
+                    native_type,
+                    "native" if interrupted else None,
+                )
+            ]
+        if native_type == "message.updated":
+            return self._message_updated(props, native_type)
+        if native_type == "message.part.delta":
+            return self._part_delta(props, native_type)
+        if native_type == "message.part.updated":
+            return self._part_updated(props, native_type)
+        if native_type in {"permission.asked", "permission.v2.asked"}:
+            return [
+                NormalizedEvent(
+                    "permission.requested",
+                    {
+                        "request_ref": props.get("id"),
+                        "action": props.get("permission") or props.get("action"),
+                        "resources": props.get("patterns") or props.get("resources", []),
+                    },
+                    native_type,
+                )
+            ]
+        if native_type in {"question.asked", "question.v2.asked"}:
+            return [
+                NormalizedEvent(
+                    "input.requested",
+                    {
+                        "request_ref": props.get("id"),
+                        "questions": props.get("questions", []),
+                    },
+                    native_type,
+                )
+            ]
+        if native_type in {
+            "session.next.tool.called",
+            "session.next.shell.started",
+        }:
+            tool_ref = props.get("callID") or props.get("id")
+            if not isinstance(tool_ref, str):
+                return []
+            return self._tool_events(
+                tool_ref,
+                props.get("tool") or ("bash" if props.get("command") else None),
+                "running",
+                native_type,
+            )
+        if native_type in {
+            "session.next.tool.success",
+            "session.next.tool.failed",
+            "session.next.shell.ended",
+        }:
+            tool_ref = props.get("callID") or props.get("id")
+            if not isinstance(tool_ref, str):
+                return []
+            return self._tool_events(
+                tool_ref,
+                None,
+                "error" if native_type.endswith("failed") else "completed",
+                native_type,
+            )
+        return []
+
+    def _message_updated(
+        self,
+        props: Mapping[str, Any],
+        native_type: str,
+    ) -> list[NormalizedEvent]:
+        info = props.get("info")
+        if not isinstance(info, dict):
+            return []
+        message_id = info.get("id")
+        role = info.get("role")
+        events: list[NormalizedEvent] = []
+        if isinstance(message_id, str) and isinstance(role, str):
+            self.message_roles[message_id] = role
+            for part_id, owner in tuple(self.part_messages.items()):
+                if owner == message_id:
+                    events.extend(self._flush_text(part_id, native_type))
+        if role != "assistant":
+            return events
+        tokens = info.get("tokens")
+        if not isinstance(tokens, dict):
+            return events
+        safe = {
+            key: value
+            for key, value in tokens.items()
+            if isinstance(value, (int, float)) and not isinstance(value, bool)
+        }
+        if not safe or not any(safe.values()):
+            return events
+        usage = tuple(sorted(safe.items()))
+        if usage == self.last_usage:
+            return events
+        self.last_usage = usage
+        events.append(NormalizedEvent("usage", {"tokens": safe}, native_type))
+        return events
+
+    def _part_delta(
+        self,
+        props: Mapping[str, Any],
+        native_type: str,
+    ) -> list[NormalizedEvent]:
+        if props.get("field") != "text" or not isinstance(props.get("delta"), str):
+            return []
+        part_id = props.get("partID")
+        if not isinstance(part_id, str):
+            return []
+        message_id = props.get("messageID")
+        if isinstance(message_id, str):
+            self.part_messages[part_id] = message_id
+        self.part_text[part_id] = self.part_text.get(part_id, "") + props["delta"]
+        return self._flush_text(part_id, native_type)
+
+    def _part_updated(
+        self,
+        props: Mapping[str, Any],
+        native_type: str,
+    ) -> list[NormalizedEvent]:
+        part = props.get("part")
+        if not isinstance(part, dict):
+            return []
+        part_id = part.get("id")
+        kind = part.get("type")
+        if not isinstance(part_id, str) or not isinstance(kind, str):
+            return []
+        message_id = part.get("messageID")
+        if isinstance(message_id, str):
+            self.part_messages[part_id] = message_id
+        if kind in {"text", "reasoning"}:
+            self.part_kinds[part_id] = kind
+            text = part.get("text")
+            if isinstance(text, str):
+                self._merge_full_text(part_id, text)
+            return self._flush_text(part_id, native_type)
+        if kind != "tool":
+            return []
+        state = part.get("state")
+        status = state.get("status") if isinstance(state, dict) else None
+        tool_ref = part.get("callID") or part_id
+        if not isinstance(status, str) or not isinstance(tool_ref, str):
+            return []
+        name = part.get("tool")
+        return self._tool_events(
+            tool_ref,
+            name if isinstance(name, str) else None,
+            status,
+            native_type,
+        )
+
+    def reconcile_response(self, response: Any) -> list[NormalizedEvent]:
+        if not isinstance(response, dict):
+            return []
+        events: list[NormalizedEvent] = []
+        info = response.get("info")
+        if isinstance(info, dict):
+            events.extend(self._message_updated({"info": info}, "message.response"))
+        for part in response.get("parts") or []:
+            if isinstance(part, dict):
+                events.extend(
+                    self._part_updated({"part": part}, "message.response")
+                )
+        return events
 
 
 def _read_server_state() -> dict[str, Any] | None:
@@ -721,7 +1019,7 @@ class OpenCodeAdapter(ConversationAdapter):
         session_ref: str,
         context: ConversationContext,
         message: str,
-    ) -> None:
+    ) -> Any:
         body: dict[str, Any] = {
             "parts": [{"type": "text", "text": message}],
         }
@@ -746,7 +1044,7 @@ class OpenCodeAdapter(ConversationAdapter):
                 body["agent"] = opencode_config.route_agent_name(
                     context.binding_digest or ""
                 )
-        self.transport.request(
+        return self.transport.request(
             "POST",
             f"/session/{session_ref}/message",
             query=self._query(context.checked_worktree()),
@@ -790,6 +1088,7 @@ class OpenCodeAdapter(ConversationAdapter):
                 "message": message,
                 "dispatch_pending": True,
                 "interrupt_lock": threading.Lock(),
+                "interrupt_done": threading.Event(),
                 "resumed": resumed,
             },
         )
@@ -875,6 +1174,11 @@ class OpenCodeAdapter(ConversationAdapter):
             info = props.get("info")
             if isinstance(info, dict):
                 value = info.get("sessionID") or info.get("sessionId")
+                if isinstance(value, str):
+                    return value
+            part = props.get("part")
+            if isinstance(part, dict):
+                value = part.get("sessionID") or part.get("sessionId")
                 return value if isinstance(value, str) else None
         return None
 
@@ -893,136 +1197,80 @@ class OpenCodeAdapter(ConversationAdapter):
     def _normalize(
         self,
         raw: Mapping[str, Any],
+        projection: _OpenCodeProjection | None = None,
     ) -> list[NormalizedEvent]:
-        event = self._event_payload(raw)
-        native_type = event.get("type")
-        if not isinstance(native_type, str):
-            return []
-        props = event.get("properties")
-        props = props if isinstance(props, dict) else {}
+        return (projection or _OpenCodeProjection()).normalize(raw)
 
-        if native_type == "session.status":
-            status = props.get("status")
-            status_type = (
-                status.get("type") if isinstance(status, dict) else status
+    @staticmethod
+    def _close_stream(native_stream: Any) -> None:
+        close = getattr(native_stream, "close", None)
+        if not callable(close):
+            return
+        try:
+            close()
+        except (OSError, RuntimeError, ValueError):
+            pass
+
+    def _abort_once(
+        self,
+        turn: NativeTurn,
+        *,
+        operator: bool = False,
+    ) -> InterruptResult:
+        with self._interrupt_lock(turn):
+            if operator:
+                turn.metadata["interrupt_requested"] = True
+            if turn.metadata.get("abort_sent"):
+                return InterruptResult(
+                    bool(turn.metadata.get("interrupt_acknowledged"))
+                )
+            turn.metadata["abort_sent"] = True
+            pre_dispatch = bool(turn.metadata.get("dispatch_pending"))
+        try:
+            result = self.transport.request(
+                "POST",
+                f"/session/{turn.session_ref}/abort",
+                query=self._query(turn.worktree),
             )
-            if status_type == "busy":
-                return [
-                    NormalizedEvent(
-                        "run.started",
-                        {"status": "running"},
-                        native_type,
-                    )
-                ]
-            return []
-        if native_type == "session.idle":
-            return [
-                NormalizedEvent(
-                    "run.completed",
-                    {"status": "completed"},
-                    native_type,
-                )
-            ]
-        if native_type == "session.error":
-            error = props.get("error")
-            name = self._error_name(error)
-            interrupted = name == "MessageAbortedError"
-            return [
-                NormalizedEvent(
-                    "run.interrupted" if interrupted else "run.failed",
-                    {"error": name},
-                    native_type,
-                    "native" if interrupted else None,
-                )
-            ]
-        if native_type == "message.part.delta":
-            if props.get("field") == "text" and isinstance(
-                props.get("delta"), str
-            ):
-                return [
-                    NormalizedEvent(
-                        "assistant.delta",
-                        {"text": props["delta"]},
-                        native_type,
-                    )
-                ]
-            return []
-        if native_type in {
-            "permission.asked",
-            "permission.v2.asked",
-        }:
-            return [
-                NormalizedEvent(
-                    "permission.requested",
-                    {
-                        "request_ref": props.get("id"),
-                        "action": props.get("action"),
-                        "resources": props.get("resources", []),
-                    },
-                    native_type,
-                )
-            ]
-        if native_type in {"question.asked", "question.v2.asked"}:
-            return [
-                NormalizedEvent(
-                    "input.requested",
-                    {
-                        "request_ref": props.get("id"),
-                        "questions": props.get("questions", []),
-                    },
-                    native_type,
-                )
-            ]
-        if native_type in {
-            "session.next.tool.called",
-            "session.next.shell.started",
-        }:
-            return [
-                NormalizedEvent(
-                    "tool.started",
-                    {
-                        "tool_ref": props.get("id"),
-                        "name": props.get("tool") or props.get("command"),
-                    },
-                    native_type,
-                )
-            ]
-        if native_type in {
-            "session.next.tool.success",
-            "session.next.tool.failed",
-            "session.next.shell.ended",
-        }:
-            return [
-                NormalizedEvent(
-                    "tool.completed",
-                    {
-                        "tool_ref": props.get("id"),
-                        "status": (
-                            "failed" if native_type.endswith("failed") else "completed"
-                        ),
-                    },
-                    native_type,
-                )
-            ]
-        if native_type == "message.updated":
-            info = props.get("info")
-            if isinstance(info, dict) and info.get("role") == "assistant":
-                tokens = info.get("tokens")
-                if isinstance(tokens, dict):
-                    safe = {
-                        key: value
-                        for key, value in tokens.items()
-                        if isinstance(value, (int, float))
-                    }
-                    if safe:
-                        return [
-                            NormalizedEvent(
-                                "usage",
-                                {"tokens": safe},
-                                native_type,
-                            )
-                        ]
-        return []
+            acknowledged = bool(result) or pre_dispatch
+            with self._interrupt_lock(turn):
+                if operator:
+                    turn.metadata["interrupt_acknowledged"] = acknowledged
+        finally:
+            done = turn.metadata.get("interrupt_done")
+            if isinstance(done, threading.Event):
+                done.set()
+        return InterruptResult(acknowledged)
+
+    def _join_turn_workers(
+        self,
+        turn: NativeTurn,
+        native_stream: Any,
+        workers: tuple[threading.Thread, threading.Thread],
+        stop: threading.Event,
+        *,
+        abort_prompt: bool,
+    ) -> None:
+        stop.set()
+        if abort_prompt:
+            try:
+                self._abort_once(turn)
+            except AdapterError:
+                pass
+        self._close_stream(native_stream)
+        deadline = time.monotonic() + TURN_CLEANUP_TIMEOUT_SECONDS
+        for worker in workers:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            worker.join(remaining)
+        live = [worker.name for worker in workers if worker.is_alive()]
+        turn.metadata.pop("workers", None)
+        if live:
+            raise AdapterError(
+                "HARNESS_CLEANUP_FAILED",
+                "OpenCode turn workers did not stop: " + ", ".join(live),
+            )
 
     def stream(self, turn: NativeTurn) -> Iterator[NormalizedEvent]:
         native_stream = turn.metadata.get("event_stream")
@@ -1058,6 +1306,7 @@ class OpenCodeAdapter(ConversationAdapter):
             else:
                 turn.metadata["dispatch_pending"] = False
         if interrupted_before_dispatch:
+            self._close_stream(native_stream)
             yield NormalizedEvent(
                 "run.interrupted",
                 {"status": "cancelled"},
@@ -1065,75 +1314,211 @@ class OpenCodeAdapter(ConversationAdapter):
                 "operator",
             )
             return
-        try:
-            self._prompt(turn.session_ref, context, message)
-        except AdapterError as exc:
-            if not isinstance(exc.__cause__, urllib.error.HTTPError):
-                raise
+
+        projection = _OpenCodeProjection()
+        coordination: queue.Queue[tuple[str, Any]] = queue.Queue()
+        stop = threading.Event()
+        sse_entered = threading.Event()
+        prompt_allowed = threading.Event()
+        prompt_state: dict[str, Any] = {}
+
+        def consume_sse() -> None:
+            sse_entered.set()
+            try:
+                for raw in native_stream:
+                    if stop.is_set():
+                        break
+                    coordination.put(("sse.raw", raw))
+            except BaseException as exc:  # noqa: BLE001 - cross-thread handoff
+                if not stop.is_set():
+                    coordination.put(("sse.error", exc))
+            finally:
+                coordination.put(("sse.end", None))
+
+        def dispatch_prompt() -> None:
+            prompt_allowed.wait()
+            if stop.is_set():
+                return
+            try:
+                prompt_state["response"] = self._prompt(
+                    turn.session_ref,
+                    context,
+                    message,
+                )
+                coordination.put(("prompt.done", None))
+            except BaseException as exc:  # noqa: BLE001 - cross-thread handoff
+                prompt_state["error"] = exc
+                coordination.put(("prompt.error", exc))
+
+        sse_worker = threading.Thread(
+            target=consume_sse,
+            name=f"opencode-turn-{turn.run_ref}-sse",
+        )
+        prompt_worker = threading.Thread(
+            target=dispatch_prompt,
+            name=f"opencode-turn-{turn.run_ref}-prompt",
+        )
+        workers = (sse_worker, prompt_worker)
+        turn.metadata["workers"] = workers
+        sse_worker.start()
+        if not sse_entered.wait(1):
+            stop.set()
+            self._close_stream(native_stream)
+            sse_worker.join(TURN_CLEANUP_TIMEOUT_SECONDS)
+            turn.metadata.pop("workers", None)
             raise AdapterError(
-                "HARNESS_SUBMISSION_FAILED",
-                exc.detail,
-                retryable=exc.retryable,
-            ) from exc
+                "HARNESS_CLEANUP_FAILED",
+                "OpenCode SSE consumer did not enter its read loop",
+            )
+        prompt_worker.start()
+        prompt_allowed.set()
+
         observed_activity = False
-        for raw in native_stream:
-            event_session = self._session_of(raw)
-            if event_session and event_session != turn.session_ref:
-                continue
-            for event in self._normalize(raw):
-                # Opening `/event` for an existing session can enqueue its
-                # current idle state before the message is dispatched. That
-                # idle belongs to the previous turn; accepting it would mark
-                # the new message complete without ever generating a reply.
-                if event.type == "run.completed" and not observed_activity:
+        prompt_done = False
+        terminal: NormalizedEvent | None = None
+        failure: BaseException | None = None
+        sse_ended = False
+        try:
+            while terminal is None and failure is None:
+                kind, value = coordination.get()
+                if kind == "prompt.done":
+                    prompt_done = True
                     continue
-                if event.type == "run.completed":
-                    with self._interrupt_lock(turn):
-                        if turn.metadata.get("interrupt_acknowledged"):
-                            event = NormalizedEvent(
-                                "run.interrupted",
-                                {"status": "cancelled"},
-                                event.native_type,
-                                "operator",
+                if kind == "prompt.error":
+                    failure = value
+                    continue
+                if kind == "sse.error":
+                    failure = value
+                    continue
+                if kind == "sse.end":
+                    sse_ended = True
+                    if terminal is None:
+                        if not observed_activity:
+                            prompt_worker.join(
+                                min(0.2, TURN_CLEANUP_TIMEOUT_SECONDS)
                             )
-                if event.type in {
-                    "run.started",
-                    "assistant.delta",
-                    "tool.started",
-                    "tool.completed",
-                    "permission.requested",
-                    "input.requested",
-                }:
-                    observed_activity = True
-                if event.type in TERMINAL_EVENTS:
-                    turn.metadata["terminal"] = event.type
-                    if event.interrupt_evidence:
-                        turn.metadata["interrupt_evidence"] = (
-                            event.interrupt_evidence
+                        if prompt_state.get("error") is not None:
+                            failure = prompt_state["error"]
+                        elif not observed_activity and "response" in prompt_state:
+                            failure = AdapterError(
+                                "HARNESS_SUBMISSION_UNOBSERVED",
+                                "OpenCode accepted the synchronous prompt request "
+                                "but reported no activity or terminal event for "
+                                f"{turn.session_ref}",
+                            )
+                        else:
+                            failure = AdapterError(
+                                "HARNESS_STREAM_LOST",
+                                "OpenCode event stream ended without a terminal event",
+                                retryable=True,
+                            )
+                    continue
+                if kind != "sse.raw" or not isinstance(value, Mapping):
+                    continue
+                event_session = self._session_of(value)
+                if event_session and event_session != turn.session_ref:
+                    continue
+                for event in self._normalize(value, projection):
+                    if event.type == "run.completed" and not observed_activity:
+                        continue
+                    if event.type == "run.completed":
+                        done = turn.metadata.get("interrupt_done")
+                        with self._interrupt_lock(turn):
+                            interrupt_pending = bool(
+                                turn.metadata.get("interrupt_requested")
+                                and not turn.metadata.get(
+                                    "interrupt_acknowledged"
+                                )
+                            )
+                        if interrupt_pending and isinstance(
+                            done, threading.Event
+                        ):
+                            done.wait(TURN_CLEANUP_TIMEOUT_SECONDS)
+                        with self._interrupt_lock(turn):
+                            if turn.metadata.get("interrupt_acknowledged"):
+                                event = NormalizedEvent(
+                                    "run.interrupted",
+                                    {"status": "cancelled"},
+                                    event.native_type,
+                                    "operator",
+                                )
+                    if event.type in {
+                        "run.started",
+                        "assistant.delta",
+                        "tool.started",
+                        "tool.completed",
+                        "permission.requested",
+                        "input.requested",
+                    }:
+                        observed_activity = True
+                    if event.type in TERMINAL_EVENTS:
+                        if (
+                            prompt_state.get("error") is None
+                            and prompt_worker.is_alive()
+                        ):
+                            prompt_worker.join(
+                                min(0.2, TURN_CLEANUP_TIMEOUT_SECONDS)
+                            )
+                        if prompt_state.get("error") is not None:
+                            failure = prompt_state["error"]
+                        else:
+                            terminal = event
+                        break
+                    yield event
+        finally:
+            if terminal is not None and prompt_worker.is_alive():
+                prompt_worker.join(min(0.2, TURN_CLEANUP_TIMEOUT_SECONDS))
+            self._join_turn_workers(
+                turn,
+                native_stream,
+                workers,
+                stop,
+                abort_prompt=(
+                    prompt_worker.is_alive()
+                    or (
+                        failure is not None
+                        and not (
+                            isinstance(failure, AdapterError)
+                            and isinstance(
+                                failure.__cause__, urllib.error.HTTPError
+                            )
                         )
-                yield event
-                if event.type in TERMINAL_EVENTS:
-                    return
-        if not observed_activity:
-            raise AdapterError(
-                "HARNESS_SUBMISSION_UNOBSERVED",
-                "OpenCode accepted the synchronous prompt request but "
-                f"reported no activity or terminal event for {turn.session_ref}",
+                    )
+                    or (failure is None and terminal is None)
+                ),
             )
 
+        if failure is not None:
+            if isinstance(failure, AdapterError):
+                if isinstance(failure.__cause__, urllib.error.HTTPError):
+                    raise AdapterError(
+                        "HARNESS_SUBMISSION_FAILED",
+                        failure.detail,
+                        retryable=failure.retryable,
+                    ) from failure
+                raise failure
+            raise failure
+        if terminal is None:
+            if sse_ended and not observed_activity and prompt_done:
+                raise AdapterError(
+                    "HARNESS_SUBMISSION_UNOBSERVED",
+                    "OpenCode accepted the synchronous prompt request but "
+                    f"reported no activity or terminal event for {turn.session_ref}",
+                )
+            raise AdapterError(
+                "HARNESS_STREAM_LOST",
+                "OpenCode turn ended without a terminal event",
+                retryable=True,
+            )
+        for event in projection.reconcile_response(prompt_state.get("response")):
+            yield event
+        turn.metadata["terminal"] = terminal.type
+        if terminal.interrupt_evidence:
+            turn.metadata["interrupt_evidence"] = terminal.interrupt_evidence
+        yield terminal
+
     def interrupt(self, turn: NativeTurn) -> InterruptResult:
-        with self._interrupt_lock(turn):
-            turn.metadata["interrupt_requested"] = True
-            result = self.transport.request(
-                "POST",
-                f"/session/{turn.session_ref}/abort",
-                query=self._query(turn.worktree),
-            )
-            acknowledged = bool(result) or bool(
-                turn.metadata.get("dispatch_pending")
-            )
-            turn.metadata["interrupt_acknowledged"] = acknowledged
-        return InterruptResult(acknowledged)
+        return self._abort_once(turn, operator=True)
 
     def inspect(
         self,

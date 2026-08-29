@@ -43,6 +43,8 @@ from conversation_adapters.base import SubprocessRunner
 
 KIMI_FIXTURES = ROOT / "tests" / "fixtures" / "conversations" / "kimi"
 KIMI_V2_STATE = KIMI_FIXTURES / "state-v2.json"
+OPENCODE_FIXTURES = ROOT / "tests" / "fixtures" / "conversations" / "opencode"
+OPENCODE_TYPED_TURN = OPENCODE_FIXTURES / "1.18.23-typed-turn.json"
 
 
 def v2_context(
@@ -239,34 +241,90 @@ class FakeOpenCode:
                     },
                 },
                 {
-                    "type": "message.part.delta",
+                    "type": "message.updated",
                     "properties": {
                         "sessionID": self.session_ref,
-                        "field": "reasoning",
-                        "delta": "secret reasoning",
+                        "info": {
+                            "id": "msg-assistant",
+                            "sessionID": self.session_ref,
+                            "role": "assistant",
+                        },
+                    },
+                },
+                {
+                    "type": "message.part.updated",
+                    "properties": {
+                        "sessionID": self.session_ref,
+                        "part": {
+                            "id": "reasoning-1",
+                            "messageID": "msg-assistant",
+                            "sessionID": self.session_ref,
+                            "type": "reasoning",
+                            "text": "",
+                        },
                     },
                 },
                 {
                     "type": "message.part.delta",
                     "properties": {
                         "sessionID": self.session_ref,
+                        "messageID": "msg-assistant",
+                        "partID": "reasoning-1",
+                        "field": "text",
+                        "delta": "secret reasoning",
+                    },
+                },
+                {
+                    "type": "message.part.updated",
+                    "properties": {
+                        "sessionID": self.session_ref,
+                        "part": {
+                            "id": "text-1",
+                            "messageID": "msg-assistant",
+                            "sessionID": self.session_ref,
+                            "type": "text",
+                            "text": "",
+                        },
+                    },
+                },
+                {
+                    "type": "message.part.delta",
+                    "properties": {
+                        "sessionID": self.session_ref,
+                        "messageID": "msg-assistant",
+                        "partID": "text-1",
                         "field": "text",
                         "delta": "hello",
                     },
                 },
                 {
-                    "type": "session.next.tool.called",
+                    "type": "message.part.updated",
                     "properties": {
                         "sessionID": self.session_ref,
-                        "id": "tool-1",
-                        "tool": "bash",
+                        "part": {
+                            "id": "tool-1",
+                            "messageID": "msg-assistant",
+                            "sessionID": self.session_ref,
+                            "type": "tool",
+                            "callID": "call-1",
+                            "tool": "bash",
+                            "state": {"status": "running", "input": {}},
+                        },
                     },
                 },
                 {
-                    "type": "session.next.tool.success",
+                    "type": "message.part.updated",
                     "properties": {
                         "sessionID": self.session_ref,
-                        "id": "tool-1",
+                        "part": {
+                            "id": "tool-1",
+                            "messageID": "msg-assistant",
+                            "sessionID": self.session_ref,
+                            "type": "tool",
+                            "callID": "call-1",
+                            "tool": "bash",
+                            "state": {"status": "completed", "output": "ok"},
+                        },
                     },
                 },
                 {
@@ -284,6 +342,98 @@ class FakeOpenCode:
                 },
             ]
         )
+
+
+class SynchronizedTypedOpenCode(FakeOpenCode):
+    """Replay 1.18.23 typed SSE while the synchronous prompt is blocked."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        fixture = json.loads(OPENCODE_TYPED_TURN.read_text())
+        self.session_ref = fixture["session_ref"]
+        self.events = fixture["events"]
+        self.response = fixture["response"]
+        self.message_started = threading.Event()
+        self.progress_sent = threading.Event()
+        self.release_message = threading.Event()
+
+    def request(self, method, path, *, query=None, body=None):
+        if method == "POST" and path.endswith("/message"):
+            self.requests.append((method, path, dict(query or {}), body))
+            self.message_started.set()
+            if not self.release_message.wait(2):
+                raise AssertionError("test did not release synchronous prompt")
+            return self.response
+        return super().request(method, path, query=query, body=body)
+
+    def stream(self, path, *, query=None):
+        self.stream_calls.append((path, dict(query or {})))
+
+        def replay():
+            yield self.events[0]
+            if not self.message_started.wait(2):
+                raise AssertionError("SSE consumer started no prompt worker")
+            for event in self.events[1:-1]:
+                yield event
+            self.progress_sent.set()
+            if not self.release_message.wait(2):
+                raise AssertionError("test did not release terminal SSE")
+            yield self.events[-1]
+
+        return replay()
+
+
+class CloseableBlockingStream:
+    def __init__(self, session_ref: str) -> None:
+        self.session_ref = session_ref
+        self.closed = threading.Event()
+        self.started = threading.Event()
+        self._first = True
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        self.started.set()
+        if self._first:
+            self._first = False
+            return {
+                "type": "session.status",
+                "properties": {
+                    "sessionID": self.session_ref,
+                    "status": {"type": "busy"},
+                },
+            }
+        self.closed.wait(2)
+        raise StopIteration
+
+    def close(self) -> None:
+        self.closed.set()
+
+
+class FailingPromptOpenCode(FakeOpenCode):
+    def __init__(self) -> None:
+        super().__init__()
+        self.event_stream = CloseableBlockingStream(self.session_ref)
+        self.abort_count = 0
+
+    def request(self, method, path, *, query=None, body=None):
+        if method == "POST" and path.endswith("/message"):
+            self.requests.append((method, path, dict(query or {}), body))
+            raise AdapterError(
+                "HARNESS_UNAVAILABLE",
+                "POST /message failed: connection reset",
+                retryable=True,
+            )
+        if method == "POST" and path.endswith("/abort"):
+            self.requests.append((method, path, dict(query or {}), body))
+            self.abort_count += 1
+            return True
+        return super().request(method, path, query=query, body=body)
+
+    def stream(self, path, *, query=None):
+        self.stream_calls.append((path, dict(query or {})))
+        return self.event_stream
 
 
 class FakeClaudeProcess:
@@ -1071,7 +1221,24 @@ class ConversationAdapterTest(unittest.TestCase):
                 self.assertIn("tool.started", types)
                 self.assertIn("tool.completed", types)
                 self.assertIn("run.completed", types)
-                self.assertNotIn("secret reasoning", repr(events))
+                if harness == "opencode":
+                    reasoning = [
+                        event for event in events
+                        if event.type == "assistant.delta"
+                        and event.payload.get("segment") == "reasoning"
+                    ]
+                    answers = [
+                        event for event in events
+                        if event.type == "assistant.delta"
+                        and event.payload.get("segment") != "reasoning"
+                    ]
+                    self.assertEqual(
+                        [event.payload["text"] for event in reasoning],
+                        ["secret reasoning"],
+                    )
+                    self.assertNotIn("secret reasoning", repr(answers))
+                else:
+                    self.assertNotIn("secret reasoning", repr(events))
                 self.assertEqual(
                     adapter.reconcile(turn, self.context).outcome,
                     "succeeded",
@@ -1555,6 +1722,201 @@ class ConversationAdapterTest(unittest.TestCase):
             )]),
             1,
         )
+
+    def test_opencode_streams_typed_progress_before_sync_response(self):
+        native = SynchronizedTypedOpenCode()
+        adapter = OpenCodeAdapter(
+            transport=native,
+            shell_runtime_dir=self.root / "runtime-shells",
+        )
+        turn = adapter.start(self.context, "typed progress")
+        events: list[NormalizedEvent] = []
+        progress_observed = threading.Event()
+        errors: list[BaseException] = []
+
+        def consume() -> None:
+            try:
+                for event in adapter.stream(turn):
+                    events.append(event)
+                    if event.type == "tool.completed":
+                        progress_observed.set()
+            except BaseException as exc:  # noqa: BLE001 - asserted below
+                errors.append(exc)
+
+        worker = threading.Thread(target=consume)
+        worker.start()
+        self.assertTrue(native.message_started.wait(1))
+        self.assertTrue(native.progress_sent.wait(1))
+        self.assertTrue(
+            progress_observed.wait(1),
+            "typed progress remained buffered behind synchronous /message",
+        )
+        self.assertTrue(worker.is_alive())
+
+        progress = list(events)
+        self.assertEqual(
+            [event.type for event in progress].count("run.started"),
+            1,
+        )
+        self.assertEqual(
+            [
+                (event.payload["text"], event.payload.get("segment"))
+                for event in progress
+                if event.type == "assistant.delta"
+            ],
+            [
+                ("think", "reasoning"),
+                ("ing", "reasoning"),
+                ("OK", "answer"),
+            ],
+        )
+        self.assertNotIn("must not project", repr(progress))
+        self.assertEqual(
+            [event.type for event in progress].count("tool.started"),
+            1,
+        )
+        self.assertEqual(
+            [event.type for event in progress].count("tool.completed"),
+            1,
+        )
+        usage = [event for event in progress if event.type == "usage"]
+        self.assertEqual(len(usage), 1)
+        self.assertEqual(
+            usage[0].payload["tokens"],
+            {"input": 8602, "output": 31, "reasoning": 0},
+        )
+
+        native.release_message.set()
+        worker.join(2)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual(events[-1].type, "run.completed")
+        self.assertEqual(
+            [event.type for event in events].count("run.completed"),
+            1,
+        )
+        self.assertEqual(
+            len([
+                request for request in native.requests
+                if request[1].endswith("/message")
+            ]),
+            1,
+        )
+
+    def test_opencode_prompt_failure_closes_stream_and_joins_workers(self):
+        native = FailingPromptOpenCode()
+        adapter = OpenCodeAdapter(
+            transport=native,
+            shell_runtime_dir=self.root / "runtime-shells",
+        )
+        turn = adapter.start(self.context, "fail once")
+
+        with self.assertRaises(AdapterError) as caught:
+            list(adapter.stream(turn))
+
+        self.assertEqual(caught.exception.code, "HARNESS_UNAVAILABLE")
+        self.assertTrue(native.event_stream.started.is_set())
+        self.assertTrue(native.event_stream.closed.is_set())
+        self.assertEqual(native.abort_count, 1)
+        self.assertEqual(
+            [
+                thread.name for thread in threading.enumerate()
+                if turn.run_ref in thread.name
+            ],
+            [],
+        )
+
+    def test_opencode_repeated_interrupt_aborts_exact_session_once(self):
+        adapter, native = self.build("opencode")
+        turn = adapter.start(self.context, "interrupt once")
+
+        self.assertTrue(adapter.interrupt(turn).acknowledged)
+        self.assertTrue(adapter.interrupt(turn).acknowledged)
+
+        aborts = [
+            request for request in native.requests
+            if request[:2] == (
+                "POST", f"/session/{native.session_ref}/abort"
+            )
+        ]
+        self.assertEqual(len(aborts), 1)
+
+    def test_opencode_typed_tool_error_is_one_failed_lifecycle(self):
+        adapter, _native = self.build("opencode")
+        projection = opencode_adapter._OpenCodeProjection()
+        raw = {
+            "type": "message.part.updated",
+            "properties": {
+                "sessionID": "ses_exact",
+                "part": {
+                    "id": "prt_failed",
+                    "messageID": "msg_assistant",
+                    "sessionID": "ses_exact",
+                    "type": "tool",
+                    "callID": "call_failed",
+                    "tool": "bash",
+                    "state": {"status": "error", "error": "denied"},
+                },
+            },
+        }
+
+        events = adapter._normalize(raw, projection)
+
+        self.assertEqual([event.type for event in events], [
+            "tool.started", "tool.completed"
+        ])
+        self.assertEqual(events[0].payload, {
+            "tool_ref": "call_failed", "name": "bash"
+        })
+        self.assertEqual(events[1].payload, {
+            "tool_ref": "call_failed", "status": "failed"
+        })
+        self.assertEqual(adapter._normalize(raw, projection), [])
+
+    def test_opencode_rejects_irreconcilable_completed_part_text(self):
+        adapter, _native = self.build("opencode")
+        projection = opencode_adapter._OpenCodeProjection()
+        adapter._normalize({
+            "type": "message.updated",
+            "properties": {
+                "sessionID": "ses_exact",
+                "info": {
+                    "id": "msg_assistant",
+                    "sessionID": "ses_exact",
+                    "role": "assistant",
+                },
+            },
+        }, projection)
+        adapter._normalize({
+            "type": "message.part.updated",
+            "properties": {
+                "sessionID": "ses_exact",
+                "part": {
+                    "id": "prt_answer",
+                    "messageID": "msg_assistant",
+                    "sessionID": "ses_exact",
+                    "type": "text",
+                    "text": "first",
+                },
+            },
+        }, projection)
+
+        with self.assertRaisesRegex(
+            AdapterError, "irreconcilable text for part prt_answer"
+        ):
+            adapter._normalize({
+                "type": "message.part.updated",
+                "properties": {
+                    "sessionID": "ses_exact",
+                    "part": {
+                        "id": "prt_answer",
+                        "messageID": "msg_assistant",
+                        "sessionID": "ses_exact",
+                        "type": "text",
+                        "text": "replacement",
+                    },
+                },
+            }, projection)
 
     def test_opencode_exact_resources_filtering_and_unknown_recovery(
         self,
