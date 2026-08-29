@@ -68,6 +68,14 @@ class GoverningRevisionCase(unittest.TestCase):
             ).lastrowid
         )
         revision = hashlib.sha256(self.original.encode()).hexdigest()
+        self.approval_id = int(
+            self.con.execute(
+                "INSERT INTO sprint_spec_approvals "
+                "(document_id,revision_sha256,reviewer_shell_id,verdict) "
+                "VALUES (?,?,3,'pass')",
+                (self.document_id, revision),
+            ).lastrowid
+        )
         self.sprint_id = int(
             self.con.execute(
                 "INSERT INTO sprints "
@@ -79,8 +87,27 @@ class GoverningRevisionCase(unittest.TestCase):
         self.con.execute(
             "INSERT INTO sprint_specs "
             "(sprint_id,document_id,bound_revision_sha256,bound_revision_body,"
-            "bound_revision_legacy) VALUES (?,?,?,?,0)",
-            (self.sprint_id, self.document_id, revision, self.original),
+            "bound_revision_legacy,approval_id) VALUES (?,?,?,?,0,?)",
+            (
+                self.sprint_id,
+                self.document_id,
+                revision,
+                self.original,
+                self.approval_id,
+            ),
+        )
+        self.con.execute(
+            "INSERT INTO sprint_spec_revision_history "
+            "(sprint_id,document_id,generation,bound_revision_sha256,"
+            "bound_revision_body,bound_revision_legacy,approval_id,actor_kind,"
+            "reason) VALUES (?,?,1,?,?,0,?,'system','test binding')",
+            (
+                self.sprint_id,
+                self.document_id,
+                revision,
+                self.original,
+                self.approval_id,
+            ),
         )
         self.con.executemany(
             "INSERT INTO sprint_participants (sprint_id,shell_id,role,harness) "
@@ -98,6 +125,243 @@ class GoverningRevisionCase(unittest.TestCase):
             (self.sprint_id,),
         )
         self.con.commit()
+
+    def test_paused_rebind_preserves_history_and_exact_retry_is_idempotent(self) -> None:
+        replacement = "# Revised governing bytes\n\nApproved correction.\n"
+        old_revision = hashlib.sha256(self.original.encode()).hexdigest()
+        new_revision = hashlib.sha256(replacement.encode()).hexdigest()
+        self.con.execute(
+            "UPDATE sprints SET lifecycle='paused',paused_at=datetime('now') "
+            "WHERE sprint_id=?",
+            (self.sprint_id,),
+        )
+        self.con.execute(
+            "UPDATE documents SET body=? WHERE document_id=?",
+            (replacement, self.document_id),
+        )
+        self.con.commit()
+        actor = sprint_domain.LifecycleActor("planner", 1)
+        store = sprint_domain.SprintSpecRevisionStore(self.con)
+
+        receipt = store.rebind(
+            self.sprint_id,
+            self.document_id,
+            actor,
+            expected_revision_sha256=old_revision,
+            reason="Reviewer decision message 77",
+        )
+
+        self.assertTrue(receipt.changed)
+        self.assertEqual(old_revision, receipt.old_revision_sha256)
+        self.assertEqual(new_revision, receipt.new_revision_sha256)
+        self.assertEqual(2, receipt.generation)
+        self.assertEqual(
+            (new_revision, replacement, 0, None),
+            tuple(
+                self.con.execute(
+                    "SELECT bound_revision_sha256,bound_revision_body,"
+                    "bound_revision_legacy,approval_id FROM sprint_specs "
+                    "WHERE sprint_id=?",
+                    (self.sprint_id,),
+                ).fetchone()
+            ),
+        )
+        history = [
+            tuple(row)
+            for row in self.con.execute(
+                "SELECT generation,bound_revision_sha256,bound_revision_body,"
+                "approval_id,actor_kind,actor_shell_id,reason "
+                "FROM sprint_spec_revision_history WHERE sprint_id=? "
+                "ORDER BY generation",
+                (self.sprint_id,),
+            )
+        ]
+        self.assertEqual(
+            [
+                (
+                    1,
+                    old_revision,
+                    self.original,
+                    self.approval_id,
+                    "system",
+                    None,
+                    "test binding",
+                ),
+                (
+                    2,
+                    new_revision,
+                    replacement,
+                    None,
+                    "planner",
+                    1,
+                    "Reviewer decision message 77",
+                ),
+            ],
+            history,
+        )
+        event = self.con.execute(
+            "SELECT payload FROM sprint_events WHERE event_type='spec.rebound'"
+        ).fetchone()
+        self.assertEqual(
+            {
+                "document_id": self.document_id,
+                "generation": 2,
+                "new_revision_sha256": new_revision,
+                "old_revision_sha256": old_revision,
+                "reason": "Reviewer decision message 77",
+                "revision_id": receipt.revision_id,
+            },
+            json.loads(event[0]),
+        )
+        self.assertNotIn(replacement, event[0])
+        self.assertEqual(
+            0,
+            self.con.execute(
+                "SELECT COUNT(*) FROM governing_revision_rebind_permits"
+            ).fetchone()[0],
+        )
+
+        replay = store.rebind(
+            self.sprint_id,
+            self.document_id,
+            actor,
+            expected_revision_sha256=old_revision,
+            reason="Reviewer decision message 77",
+        )
+        self.assertFalse(replay.changed)
+        self.assertEqual(receipt.revision_id, replay.revision_id)
+        self.assertEqual(
+            2,
+            self.con.execute(
+                "SELECT COUNT(*) FROM sprint_spec_revision_history "
+                "WHERE sprint_id=?",
+                (self.sprint_id,),
+            ).fetchone()[0],
+        )
+        self.assertEqual(
+            1,
+            self.con.execute(
+                "SELECT COUNT(*) FROM sprint_events WHERE event_type='spec.rebound'"
+            ).fetchone()[0],
+        )
+
+    def test_rebind_rejects_stale_expected_revision_without_effects(self) -> None:
+        self.con.execute(
+            "UPDATE sprints SET lifecycle='paused' WHERE sprint_id=?",
+            (self.sprint_id,),
+        )
+        self.con.execute(
+            "UPDATE documents SET body='new contract' WHERE document_id=?",
+            (self.document_id,),
+        )
+        self.con.commit()
+        with self.assertRaisesRegex(
+            sprint_domain.SprintConflictError, "binding changed"
+        ) as raised:
+            sprint_domain.SprintSpecRevisionStore(self.con).rebind(
+                self.sprint_id,
+                self.document_id,
+                sprint_domain.LifecycleActor("planner", 1),
+                expected_revision_sha256="0" * 64,
+                reason="stale caller",
+            )
+        self.assertEqual("spec_revision_changed", raised.exception.details["code"])
+        self.assertEqual(
+            (hashlib.sha256(self.original.encode()).hexdigest(), self.original),
+            tuple(
+                self.con.execute(
+                    "SELECT bound_revision_sha256,bound_revision_body "
+                    "FROM sprint_specs WHERE sprint_id=?",
+                    (self.sprint_id,),
+                ).fetchone()
+            ),
+        )
+        self.assertEqual(
+            (1, 0),
+            (
+                self.con.execute(
+                    "SELECT COUNT(*) FROM sprint_spec_revision_history"
+                ).fetchone()[0],
+                self.con.execute(
+                    "SELECT COUNT(*) FROM sprint_events WHERE event_type='spec.rebound'"
+                ).fetchone()[0],
+            ),
+        )
+
+    def test_rebind_requires_paused_lifecycle_and_owner_authority(self) -> None:
+        old_revision = hashlib.sha256(self.original.encode()).hexdigest()
+        self.con.execute(
+            "UPDATE documents SET body='new contract' WHERE document_id=?",
+            (self.document_id,),
+        )
+        self.con.commit()
+        store = sprint_domain.SprintSpecRevisionStore(self.con)
+        with self.assertRaisesRegex(
+            sprint_domain.SprintInvariantError, "only while the Sprint is paused"
+        ):
+            store.rebind(
+                self.sprint_id,
+                self.document_id,
+                sprint_domain.LifecycleActor("planner", 1),
+                expected_revision_sha256=old_revision,
+                reason="too early",
+            )
+        self.con.execute(
+            "UPDATE sprints SET lifecycle='paused' WHERE sprint_id=?",
+            (self.sprint_id,),
+        )
+        self.con.commit()
+        with self.assertRaisesRegex(
+            sprint_domain.SprintAuthorityError, "originating Planner or FnB"
+        ):
+            store.rebind(
+                self.sprint_id,
+                self.document_id,
+                sprint_domain.LifecycleActor("participant", 2),
+                expected_revision_sha256=old_revision,
+                reason="wrong actor",
+            )
+        self.assertEqual(
+            (1, 0),
+            (
+                self.con.execute(
+                    "SELECT COUNT(*) FROM sprint_spec_revision_history"
+                ).fetchone()[0],
+                self.con.execute(
+                    "SELECT COUNT(*) FROM sprint_events WHERE event_type='spec.rebound'"
+                ).fetchone()[0],
+            ),
+        )
+
+    def test_rebind_history_and_active_projection_reject_untracked_rewrites(self) -> None:
+        with self.assertRaisesRegex(sqlite3.IntegrityError, "immutable"):
+            self.con.execute(
+                "UPDATE sprint_specs SET bound_revision_body='invented' "
+                "WHERE sprint_id=?",
+                (self.sprint_id,),
+            )
+        with self.assertRaisesRegex(sqlite3.IntegrityError, "append-only"):
+            self.con.execute(
+                "UPDATE sprint_spec_revision_history SET reason='invented' "
+                "WHERE sprint_id=?",
+                (self.sprint_id,),
+            )
+        with self.assertRaisesRegex(sqlite3.IntegrityError, "append-only"):
+            self.con.execute(
+                "DELETE FROM sprint_spec_revision_history WHERE sprint_id=?",
+                (self.sprint_id,),
+            )
+        self.assertEqual(
+            (self.original, "test binding"),
+            tuple(
+                self.con.execute(
+                    "SELECT ss.bound_revision_body,h.reason FROM sprint_specs ss "
+                    "JOIN sprint_spec_revision_history h USING (sprint_id,document_id) "
+                    "WHERE ss.sprint_id=?",
+                    (self.sprint_id,),
+                ).fetchone()
+            ),
+        )
 
     def test_exact_bound_body_survives_drift_and_is_participant_scoped(self) -> None:
         self.con.execute(
@@ -119,17 +383,30 @@ class GoverningRevisionCase(unittest.TestCase):
             )
 
     def test_legacy_mismatch_is_explicit_and_never_returns_current_text(self) -> None:
+        legacy_document_id = int(
+            self.con.execute(
+                "INSERT INTO documents (feature_id,kind,seq,title,body) "
+                "VALUES (?,'spec',2,'Legacy governing spec','untrusted current text')",
+                (self.feature_id,),
+            ).lastrowid
+        )
+        revision = hashlib.sha256(self.original.encode()).hexdigest()
         self.con.execute(
-            "UPDATE sprint_specs SET bound_revision_body=NULL WHERE sprint_id=?",
-            (self.sprint_id,),
+            "INSERT INTO sprint_specs "
+            "(sprint_id,document_id,bound_revision_sha256,bound_revision_body,"
+            "bound_revision_legacy) VALUES (?,?,?,NULL,1)",
+            (self.sprint_id, legacy_document_id, revision),
         )
         self.con.execute(
-            "UPDATE documents SET body='untrusted current text' WHERE document_id=?",
-            (self.document_id,),
+            "INSERT INTO sprint_spec_revision_history "
+            "(sprint_id,document_id,generation,bound_revision_sha256,"
+            "bound_revision_body,bound_revision_legacy,actor_kind,reason) "
+            "VALUES (?,?,1,?,NULL,1,'system','legacy test binding')",
+            (self.sprint_id, legacy_document_id, revision),
         )
         with self.assertRaises(sprint_domain.BoundRevisionUnavailable) as raised:
             sprint_domain.SprintSpecRevisionStore(self.con).read(
-                self.sprint_id, self.document_id, caller_shell_id=2
+                self.sprint_id, legacy_document_id, caller_shell_id=2
             )
         self.assertEqual("bound_revision_unavailable", raised.exception.details["code"])
         self.assertEqual(

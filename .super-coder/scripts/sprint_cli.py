@@ -175,6 +175,21 @@ def cmd_spec_revision(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_rebind_spec(args: argparse.Namespace) -> int:
+    result = _post(
+        "/_sc/sprint/rebind-spec",
+        {
+            "sprint_id": args.sprint,
+            "document_id": args.document,
+            "expected_revision_sha256": args.expected_revision,
+            "reason": args.reason,
+        },
+        idempotent=True,
+    )
+    print(json.dumps(result, indent=2, sort_keys=True))
+    return 0
+
+
 def cmd_send(args: argparse.Namespace) -> int:
     result = _post(
         "/_sc/sprint/send",
@@ -611,6 +626,16 @@ def build_parser() -> argparse.ArgumentParser:
         "--body-only", action="store_true", help="write the exact body only"
     )
     spec_revision.set_defaults(fn=cmd_spec_revision)
+
+    rebind_spec = sub.add_parser(
+        "rebind-spec",
+        help="Planner or FnB binds one paused Sprint spec to its current body",
+    )
+    rebind_spec.add_argument("--sprint", type=int, required=True)
+    rebind_spec.add_argument("--document", type=int, required=True)
+    rebind_spec.add_argument("--expected-revision", required=True)
+    rebind_spec.add_argument("--reason", required=True)
+    rebind_spec.set_defaults(fn=cmd_rebind_spec)
 
     send = sub.add_parser(
         "send", help="Send one typed relay to another Sprint participant"

@@ -1134,21 +1134,34 @@ class SprintBoardApiCase(unittest.TestCase):
 
     def test_browser_bound_revision_reports_legacy_unavailability(self):
         current_body = "legacy current body must remain unavailable"
+        bound_revision = hashlib.sha256(b"body").hexdigest()
         with self.connect() as con:
-            con.execute(
-                "UPDATE sprint_specs SET bound_revision_body=NULL "
-                "WHERE sprint_id=? AND document_id=?",
-                (self.ids["sprint_id"], self.ids["document_id"]),
+            legacy_document_id = int(
+                con.execute(
+                    "INSERT INTO documents (feature_id,kind,seq,title,body) "
+                    "VALUES (?,'spec',98,'Legacy bound spec',?)",
+                    (self.ids["feature_id"], current_body),
+                ).lastrowid
             )
             con.execute(
-                "UPDATE documents SET body=? WHERE document_id=?",
-                (current_body, self.ids["document_id"]),
+                "INSERT INTO sprint_specs "
+                "(sprint_id,document_id,bound_revision_sha256,"
+                "bound_revision_body,bound_revision_legacy) "
+                "VALUES (?,?,?,NULL,1)",
+                (self.ids["sprint_id"], legacy_document_id, bound_revision),
+            )
+            con.execute(
+                "INSERT INTO sprint_spec_revision_history "
+                "(sprint_id,document_id,generation,bound_revision_sha256,"
+                "bound_revision_body,bound_revision_legacy,actor_kind,reason) "
+                "VALUES (?,?,1,?,NULL,1,'system','legacy browser fixture')",
+                (self.ids["sprint_id"], legacy_document_id, bound_revision),
             )
             con.commit()
         status, _, body = self.request(
             "GET",
             f"/api/sprints/{self.ids['sprint_id']}/spec-revisions/"
-            f"{self.ids['document_id']}",
+            f"{legacy_document_id}",
         )
         self.assertEqual(409, status, body)
         error = body["error"]
@@ -1160,8 +1173,8 @@ class SprintBoardApiCase(unittest.TestCase):
         self.assertEqual(
             {
                 "sprint_id": self.ids["sprint_id"],
-                "document_id": self.ids["document_id"],
-                "bound_revision_sha256": hashlib.sha256(b"body").hexdigest(),
+                "document_id": legacy_document_id,
+                "bound_revision_sha256": bound_revision,
                 "current_revision_sha256": hashlib.sha256(
                     current_body.encode()
                 ).hexdigest(),
