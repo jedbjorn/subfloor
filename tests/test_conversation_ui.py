@@ -400,8 +400,11 @@ def test_reasoning_streams_as_distinct_assistant_segments_without_approval_ui():
     assert "anchor = sequence" in reducer
     assert "assistantSegments.delete(event.run_id)" in reducer
     assert 'bubble.classList.add("chat-reasoning")' in interface
-    assert 'segment === "reasoning" ? "Reasoning"' in interface
+    assert 'isReasoning ? "Reasoning"' in interface
+    assert 'el("details", { className: "chat-reasoning-disclosure" }' in interface
+    assert 'el("summary", {}, "Reasoning")' in interface
     assert ".chat-bubble.chat-assistant.chat-reasoning" in STYLE
+    assert ".chat-reasoning-disclosure" in STYLE
     assert "approval control" not in interface.lower()
     assert "approval button" not in interface.lower()
 

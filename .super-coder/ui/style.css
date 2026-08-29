@@ -472,6 +472,13 @@ body.interface-view main {
   background: color-mix(in srgb, var(--panel) 88%, var(--accent));
   border-style: dashed; color: var(--dim);
 }
+.chat-reasoning-disclosure { min-width: min(600px, 62vw); }
+.chat-reasoning-disclosure > summary {
+  display: flex; align-items: baseline; justify-content: space-between; gap: .8rem;
+  cursor: pointer; color: var(--dim); font-size: calc(.62rem + 1px);
+  text-transform: uppercase; letter-spacing: .12em;
+}
+.chat-reasoning-disclosure[open] > summary { margin-bottom: .45rem; }
 .chat-bubble.chat-activity {
   align-self: flex-start; background: transparent; border-style: dashed;
   color: var(--dim); font-size: .78rem; padding: .4rem .65rem;

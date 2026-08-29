@@ -407,6 +407,47 @@ class HttpTransport(Protocol):
     ) -> Iterable[Mapping[str, Any]]: ...
 
 
+class _SSEIterator:
+    """Decode one SSE response while allowing another thread to close it."""
+
+    def __init__(self, response: Any) -> None:
+        self.response = response
+        self.lines = iter(response)
+        self.data: list[str] = []
+        self.closed = False
+
+    def __iter__(self) -> _SSEIterator:
+        return self
+
+    def __next__(self) -> Mapping[str, Any]:
+        while not self.closed:
+            raw_line = next(self.lines)
+            line = raw_line.decode("utf-8", "replace").rstrip("\r\n")
+            if line.startswith("data:"):
+                self.data.append(line[5:].lstrip())
+                continue
+            if line or not self.data:
+                continue
+            encoded = "\n".join(self.data)
+            self.data.clear()
+            try:
+                value = json.loads(encoded)
+            except json.JSONDecodeError as exc:
+                raise AdapterError(
+                    "HARNESS_PROTOCOL_ERROR",
+                    "SSE event contained invalid JSON",
+                ) from exc
+            if isinstance(value, dict):
+                return value
+        raise StopIteration
+
+    def close(self) -> None:
+        if self.closed:
+            return
+        self.closed = True
+        self.response.close()
+
+
 class UrlHttpTransport:
     """Small JSON + SSE transport for the loopback OpenCode server."""
 
@@ -506,32 +547,7 @@ class UrlHttpTransport:
                 retryable=True,
             ) from exc
 
-        return self._iter_sse(response)
-
-    @staticmethod
-    def _iter_sse(response: Any) -> Iterator[Mapping[str, Any]]:
-        data: list[str] = []
-        try:
-            for raw_line in response:
-                line = raw_line.decode("utf-8", "replace").rstrip("\r\n")
-                if line.startswith("data:"):
-                    data.append(line[5:].lstrip())
-                    continue
-                if line or not data:
-                    continue
-                encoded = "\n".join(data)
-                data.clear()
-                try:
-                    value = json.loads(encoded)
-                except json.JSONDecodeError as exc:
-                    raise AdapterError(
-                        "HARNESS_PROTOCOL_ERROR",
-                        "SSE event contained invalid JSON",
-                    ) from exc
-                if isinstance(value, dict):
-                    yield value
-        finally:
-            response.close()
+        return _SSEIterator(response)
 
 
 class ProcessRunner(Protocol):

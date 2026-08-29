@@ -771,9 +771,33 @@ class SprintBoundRouteDispatchProof(unittest.TestCase):
                         },
                     },
                     {
+                        "type": "message.updated",
+                        "properties": {
+                            "info": {
+                                "id": "msg_sprint_exact_null_default",
+                                "role": "assistant",
+                                "sessionID": self.session_ref,
+                            },
+                        },
+                    },
+                    {
+                        "type": "message.part.updated",
+                        "properties": {
+                            "part": {
+                                "id": "part_sprint_exact_null_default",
+                                "messageID": "msg_sprint_exact_null_default",
+                                "sessionID": self.session_ref,
+                                "type": "text",
+                                "text": "",
+                            },
+                        },
+                    },
+                    {
                         "type": "message.part.delta",
                         "properties": {
                             "sessionID": self.session_ref,
+                            "messageID": "msg_sprint_exact_null_default",
+                            "partID": "part_sprint_exact_null_default",
                             "field": "text",
                             "delta": "done",
                         },

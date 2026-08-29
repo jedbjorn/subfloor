@@ -67,7 +67,12 @@ class SupervisionFixture:
         (self.engine / "Dockerfile").write_text("FROM scratch\n")
         (self.root / ".sc-state").mkdir()
         (self.root / ".sc-state" / "engine.ref").write_text("a" * 40 + "\n")
-        (self.root / ".gitignore").write_text("/.sc-state/local/\n")
+        (self.root / ".gitignore").write_text(
+            "/.sc-state/local/\n"
+            "/.super-coder/shell_db.db\n"
+            "/.super-coder/shell_db.db-wal\n"
+            "/.super-coder/shell_db.db-shm\n"
+        )
         subprocess.run(("git", "init", "-q", str(self.root)), check=True)
         self._write_scripts()
         self._write_fake_commands()
@@ -362,7 +367,12 @@ class SupervisionFixture:
             "hooks": {"deps": {"argv": ["./.subfloor/provision"]}},
             "provision": {"hook": "deps", "inputs": []},
         }))
-        (self.root / ".gitignore").write_text("/.sc-state/local/\n")
+        (self.root / ".gitignore").write_text(
+            "/.sc-state/local/\n"
+            "/.super-coder/shell_db.db\n"
+            "/.super-coder/shell_db.db-wal\n"
+            "/.super-coder/shell_db.db-shm\n"
+        )
         subprocess.run(("git", "init", "-q", str(self.root)), check=True)
         subprocess.run(("git", "-C", str(self.root), "add", "."), check=True)
         subprocess.run(
@@ -378,6 +388,17 @@ class SupervisionFixture:
         return (
             self.docker_state / f"{self.env['SC_TEST_PG_NAME']}.id"
         ).read_text().strip()
+
+    def tracked_status(self) -> str:
+        return subprocess.run(
+            (
+                "git", "-C", str(self.root), "status", "--short",
+                "--untracked-files=no",
+            ),
+            check=True,
+            text=True,
+            capture_output=True,
+        ).stdout
 
 
 class RestrictedLaunchTests(unittest.TestCase):
@@ -430,11 +451,16 @@ class RestrictedLaunchTests(unittest.TestCase):
 
     def test_successful_provision_reports_hook_output_and_ready_state(self):
         self.fx.configure_provision()
+        self.assertEqual(self.fx.tracked_status(), "")
         self.fx.env["SC_TEST_PROVISION_OUTPUT"] = "dependencies installed"
 
         result = self.fx.run("launch", "--no-build")
 
-        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            result.returncode,
+            0,
+            f"{result.stderr}\ntracked status:\n{self.fx.tracked_status()}",
+        )
         self.assertIn("dependencies installed", result.stdout)
         self.assertIn("provision state: ready", result.stdout)
         self.assertNotIn("container-1", result.stdout)

@@ -300,10 +300,151 @@ class BlockingOpenCodeTransport:
         return events()
 
 
+class ProgressiveOpenCodeTransport:
+    """Emit typed 1.18.23 progress while synchronous /message is blocked."""
+
+    def __init__(self) -> None:
+        self.session_ref = "ses_progressive"
+        self.message_started = threading.Event()
+        self.progress_sent = threading.Event()
+        self.release_message = threading.Event()
+        self.requests: list[tuple[str, str]] = []
+
+    def request(self, method: str, path: str, *, query=None, body=None):
+        self.requests.append((method, path))
+        if method == "POST" and path == "/session":
+            return {"id": self.session_ref}
+        if method == "POST" and path.endswith("/message"):
+            self.message_started.set()
+            if not self.release_message.wait(2):
+                raise AssertionError("test did not release OpenCode message")
+            return {
+                "info": {
+                    "id": "msg_assistant",
+                    "sessionID": self.session_ref,
+                    "role": "assistant",
+                },
+                "parts": [
+                    {
+                        "id": "prt_reasoning",
+                        "messageID": "msg_assistant",
+                        "sessionID": self.session_ref,
+                        "type": "reasoning",
+                        "text": "thinking",
+                    },
+                    {
+                        "id": "prt_answer",
+                        "messageID": "msg_assistant",
+                        "sessionID": self.session_ref,
+                        "type": "text",
+                        "text": "answer",
+                    },
+                ],
+            }
+        if method == "POST" and path.endswith("/abort"):
+            self.release_message.set()
+            return True
+        raise AssertionError(f"unexpected OpenCode request: {method} {path}")
+
+    def stream(self, path: str, *, query=None):
+        def events():
+            yield {
+                "type": "session.idle",
+                "properties": {"sessionID": self.session_ref},
+            }
+            if not self.message_started.wait(2):
+                raise AssertionError("OpenCode prompt worker never started")
+            yield {
+                "type": "session.status",
+                "properties": {
+                    "sessionID": self.session_ref,
+                    "status": {"type": "busy"},
+                },
+            }
+            yield {
+                "type": "message.updated",
+                "properties": {
+                    "sessionID": self.session_ref,
+                    "info": {
+                        "id": "msg_assistant",
+                        "sessionID": self.session_ref,
+                        "role": "assistant",
+                    },
+                },
+            }
+            for part_id, part_type, text in (
+                ("prt_reasoning", "reasoning", "thinking"),
+                ("prt_answer", "text", "answer"),
+            ):
+                yield {
+                    "type": "message.part.updated",
+                    "properties": {
+                        "sessionID": self.session_ref,
+                        "part": {
+                            "id": part_id,
+                            "messageID": "msg_assistant",
+                            "sessionID": self.session_ref,
+                            "type": part_type,
+                            "text": "",
+                        },
+                    },
+                }
+                yield {
+                    "type": "message.part.delta",
+                    "properties": {
+                        "sessionID": self.session_ref,
+                        "messageID": "msg_assistant",
+                        "partID": part_id,
+                        "field": "text",
+                        "delta": text,
+                    },
+                }
+            yield {
+                "type": "message.part.updated",
+                "properties": {
+                    "sessionID": self.session_ref,
+                    "part": {
+                        "id": "prt_tool",
+                        "messageID": "msg_assistant",
+                        "sessionID": self.session_ref,
+                        "type": "tool",
+                        "callID": "call_1",
+                        "tool": "bash",
+                        "state": {"status": "running", "input": {}},
+                    },
+                },
+            }
+            self.progress_sent.set()
+            if not self.release_message.wait(2):
+                raise AssertionError("test did not release terminal SSE")
+            yield {
+                "type": "message.part.updated",
+                "properties": {
+                    "sessionID": self.session_ref,
+                    "part": {
+                        "id": "prt_tool",
+                        "messageID": "msg_assistant",
+                        "sessionID": self.session_ref,
+                        "type": "tool",
+                        "callID": "call_1",
+                        "tool": "bash",
+                        "state": {"status": "completed", "output": "ok"},
+                    },
+                },
+            }
+            yield {
+                "type": "session.idle",
+                "properties": {"sessionID": self.session_ref},
+            }
+
+        return events()
+
+
 class StubUrlResponse:
     def __init__(self, payload: bytes = b"", *, lines=()) -> None:
         self.payload = payload
         self.lines = tuple(lines)
+        self.closed = False
 
     def __enter__(self):
         return self
@@ -318,7 +459,7 @@ class StubUrlResponse:
         return iter(self.lines)
 
     def close(self) -> None:
-        pass
+        self.closed = True
 
 
 class RejectingOpenCodeFirstTurnEndpoint:
@@ -1956,6 +2097,79 @@ class ServiceContractTest(ConversationBrokerCase):
         )
         self.assertEqual(transport.message_count, 3)
 
+    def test_opencode_typed_progress_is_durable_before_message_returns(
+        self,
+    ) -> None:
+        transport = ProgressiveOpenCodeTransport()
+        self.addCleanup(transport.release_message.set)
+        adapter = OpenCodeAdapter(
+            transport=transport,
+            shell_runtime_dir=self.root / "opencode-shells",
+        )
+        broker = self.start_broker(
+            lambda harness: adapter if harness == "opencode" else None
+        )
+        conversation_id = self.add_conversation(harness="opencode")
+        message_id = self.add_message(conversation_id)
+        broker.notify()
+        self.assertTrue(transport.message_started.wait(1))
+        self.assertTrue(transport.progress_sent.wait(1))
+
+        deadline = time.monotonic() + 2
+        run_id = None
+        projected: list[tuple[str, dict]] = []
+        while time.monotonic() < deadline:
+            con = self.connect()
+            run = con.execute(
+                "SELECT run_id,state FROM conversation_runs "
+                "WHERE trigger_message_id=?",
+                (message_id,),
+            ).fetchone()
+            if run is not None:
+                run_id = int(run["run_id"])
+                projected = [
+                    (row["event_type"], json.loads(row["payload"]))
+                    for row in con.execute(
+                        "SELECT event_type,payload FROM conversation_events "
+                        "WHERE run_id=? ORDER BY sequence",
+                        (run_id,),
+                    )
+                ]
+            con.close()
+            if any(event_type == "tool.started" for event_type, _ in projected):
+                break
+            time.sleep(0.01)
+
+        self.assertIsNotNone(run_id)
+        assistant = [
+            (payload["text"], payload["segment"])
+            for event_type, payload in projected
+            if event_type == "assistant.delta"
+        ]
+        self.assertEqual(
+            assistant,
+            [("thinking", "reasoning"), ("answer", "answer")],
+        )
+        self.assertEqual(
+            [event_type for event_type, _ in projected].count("tool.started"),
+            1,
+        )
+        self.assertNotIn("run.completed", [item[0] for item in projected])
+
+        transport.release_message.set()
+        self.wait_run_state(run_id, "succeeded")
+        con = self.connect()
+        terminals = con.execute(
+            "SELECT event_type FROM conversation_events "
+            "WHERE run_id=? AND event_type IN "
+            "('run.completed','run.failed','run.interrupted')",
+            (run_id,),
+        ).fetchall()
+        con.close()
+        self.assertEqual([row["event_type"] for row in terminals], [
+            "run.completed"
+        ])
+
     def test_opencode_first_turn_submission_failure_is_not_reclassified_idle(
         self,
     ) -> None:
@@ -2022,6 +2236,25 @@ class ServiceContractTest(ConversationBrokerCase):
                 ).fetchone()[0],
                 1,
             )
+
+    def test_opencode_sse_handle_closes_the_owned_http_response(self) -> None:
+        response = StubUrlResponse(lines=(
+            b'data: {"type":"session.idle","properties":{}}\n',
+            b"\n",
+        ))
+        transport = base_adapter.UrlHttpTransport("http://opencode.test")
+        with mock.patch.object(
+            base_adapter.urllib.request,
+            "urlopen",
+            return_value=response,
+        ):
+            stream = transport.stream("/event")
+
+        self.assertEqual(next(iter(stream))["type"], "session.idle")
+        stream.close()
+        self.assertTrue(response.closed)
+        with self.assertRaises(StopIteration):
+            next(iter(stream))
 
     def test_starting_crash_without_exact_identity_becomes_unknown(self) -> None:
         _conversation, _message, run_id = self.add_live_run(state="starting")
