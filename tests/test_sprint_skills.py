@@ -1439,6 +1439,7 @@ class SprintSkillTest(unittest.TestCase):
             "arm",
             "inbox",
             "spec-revision",
+            "rebind-spec",
             "send",
             "accept",
             "decline",

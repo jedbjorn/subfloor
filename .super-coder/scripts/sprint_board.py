@@ -247,6 +247,16 @@ _EVENT_FIELDS = {
             "notification_state",
         }
     ),
+    "spec.rebound": frozenset(
+        {
+            "document_id",
+            "old_revision_sha256",
+            "new_revision_sha256",
+            "revision_id",
+            "generation",
+            "reason",
+        }
+    ),
     "spec.edit_notification_unavailable": frozenset(
         {"document_id", "edit_event_id", "planner_shell_id"}
     ),

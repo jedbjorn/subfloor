@@ -2795,6 +2795,21 @@ class Handler(BaseHTTPRequestHandler):
                     for document_id, selected in selected_specs.items()
                 ),
             )
+            con.execute(
+                "INSERT INTO sprint_spec_revision_history "
+                "(sprint_id,document_id,generation,bound_revision_sha256,"
+                "bound_revision_body,bound_revision_legacy,approval_id,"
+                "actor_kind,actor_shell_id,reason,created_at) "
+                "SELECT sprint_id,document_id,1,bound_revision_sha256,"
+                "bound_revision_body,bound_revision_legacy,approval_id,?,?,"
+                "'binding declared',included_at FROM sprint_specs "
+                "WHERE sprint_id=?",
+                (
+                    "fnb" if caller["flavor"] == "admin" else "planner",
+                    shell_id,
+                    sprint_id,
+                ),
+            )
             con.executemany(
                 "INSERT INTO sprint_participants "
                 "(sprint_id,shell_id,role,harness,model,effort,route) "
@@ -3031,6 +3046,28 @@ class Handler(BaseHTTPRequestHandler):
                     "conformance_reviewer_shell_id": int(owner[0]),
                     "conformance_owner_generation": int(owner[1]),
                     "participant_bindings": bindings,
+                })
+            if path == "/_sc/sprint/rebind-spec":
+                receipt = sprint_domain.SprintSpecRevisionStore(con).rebind(
+                    sprint_id,
+                    self._sprint_integer(body, "document_id"),
+                    self._sprint_actor(con, sprint_id, shell_id),
+                    expected_revision_sha256=(
+                        self._sprint_optional_text(
+                            body, "expected_revision_sha256"
+                        )
+                        or ""
+                    ),
+                    reason=self._sprint_optional_text(body, "reason") or "",
+                )
+                return self._send(200, {
+                    "sprint_id": receipt.sprint_id,
+                    "document_id": receipt.document_id,
+                    "old_revision_sha256": receipt.old_revision_sha256,
+                    "new_revision_sha256": receipt.new_revision_sha256,
+                    "revision_id": receipt.revision_id,
+                    "generation": receipt.generation,
+                    "changed": receipt.changed,
                 })
             if path == "/_sc/sprint/replan-unit":
                 planner_shell_id = self._sprint_planner_proxy(

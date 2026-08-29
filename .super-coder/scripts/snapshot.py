@@ -49,6 +49,7 @@ SPRINT_INSTANCE_TABLES = [
     "sprint_spec_approvals",
     "sprints",
     "sprint_specs",
+    "sprint_spec_revision_history",
     # Bindings load before participants because the latter's active-pointer
     # ownership trigger must be able to see the referenced immutable row.
     # Snapshot load has foreign_keys disabled, so the binding's participant FK

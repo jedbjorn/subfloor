@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import io
 import json
 import sys
 import tempfile
 import unittest
+from contextlib import redirect_stdout
 from pathlib import Path
 from unittest import mock
 
@@ -84,6 +86,57 @@ class GlobalPortNamespaceTest(unittest.TestCase):
         with mock.patch.object(ports, "_free", return_value=False):
             with self.assertRaisesRegex(RuntimeError, "no free super-coder port"):
                 ports._resolve_offset(0, set())
+
+    def test_unknown_instance_key_is_inert_but_preserved_on_disk(self) -> None:
+        stored = {
+            "repo": "ami",
+            "port": 8812,
+            "dev_port": 8844,
+            "harness": "opencode",
+            "retired_host_port": 8977,
+        }
+        original = json.dumps(stored, separators=(",", ":"))
+        self.current_config.write_text(original)
+
+        with (
+            mock.patch.object(ports, "REPO_ROOT", self.current),
+            mock.patch.object(ports, "CONFIG", self.current_config),
+            mock.patch.object(ports, "_free", return_value=True),
+        ):
+            resolved = ports.resolve(persist=True)
+            output = io.StringIO()
+            with redirect_stdout(output):
+                self.assertEqual(ports.main(["show"]), 0)
+
+        self.assertNotIn("retired_host_port", resolved)
+        self.assertNotIn("retired_host_port", json.loads(output.getvalue()))
+        self.assertEqual(self.current_config.read_text(), original)
+
+    def test_save_changes_managed_blocks_without_rewriting_unknown_keys(self) -> None:
+        stored = {
+            "repo": "ami",
+            "port": 8812,
+            "dev_port": 8844,
+            "harness": "opencode",
+            "vm": {"domain": "old"},
+            "future_extension": {"opaque": True},
+        }
+        self.current_config.write_text(json.dumps(stored))
+
+        with (
+            mock.patch.object(ports, "REPO_ROOT", self.current),
+            mock.patch.object(ports, "CONFIG", self.current_config),
+            mock.patch.object(ports, "_free", return_value=True),
+        ):
+            resolved = ports.resolve()
+            resolved.pop("vm")
+            resolved["ts"] = {"hosts": ["build"]}
+            ports.save(resolved)
+
+        persisted = json.loads(self.current_config.read_text())
+        self.assertNotIn("vm", persisted)
+        self.assertEqual(persisted["ts"], {"hosts": ["build"]})
+        self.assertEqual(persisted["future_extension"], {"opaque": True})
 
 
 if __name__ == "__main__":

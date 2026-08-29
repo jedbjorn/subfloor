@@ -16,6 +16,7 @@ MIGRATIONS = (
     ENGINE / "migrations" / "0231_suppress_aborted_sprint_pr_wakes.sql",
     ENGINE / "migrations" / "0233_reseed_sprint_aware_pr_notifications.sql",
     ENGINE / "migrations" / "0234_reseed_ci_fallback_authority.sql",
+    ENGINE / "migrations" / "0240_reseed_sprint_spec_rebinding.sql",
 )
 sys.path.insert(0, str(ENGINE / "scripts"))
 

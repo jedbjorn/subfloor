@@ -191,6 +191,17 @@ class SpecApprovalReceipt:
 
 
 @dataclass(frozen=True)
+class SpecRebindReceipt:
+    sprint_id: int
+    document_id: int
+    old_revision_sha256: str
+    new_revision_sha256: str
+    revision_id: int
+    generation: int
+    changed: bool
+
+
+@dataclass(frozen=True)
 class WorkUnitCompletionReceipt:
     sprint_id: int
     work_unit_id: int
@@ -534,6 +545,212 @@ class SprintSpecRevisionStore:
             "availability": "available",
             "body": str(bound_body),
         }
+
+    def rebind(
+        self,
+        sprint_id: int,
+        document_id: int,
+        actor: LifecycleActor,
+        *,
+        expected_revision_sha256: str,
+        reason: str,
+    ) -> SpecRebindReceipt:
+        """Replace one paused binding while retaining exact revision history."""
+        if len(expected_revision_sha256) != 64 or any(
+            char not in "0123456789abcdef" for char in expected_revision_sha256
+        ):
+            raise ValueError("expected revision must be one lowercase SHA-256")
+        reason = reason.strip()
+        if not reason:
+            raise ValueError("spec rebind reason is required")
+        if len(reason) > 2000:
+            raise ValueError("spec rebind reason exceeds 2000 characters")
+        if actor.kind not in {"planner", "fnb"}:
+            raise SprintAuthorityError(
+                "only the originating Planner or FnB may rebind a Sprint spec"
+            )
+        if actor.shell_id is None:
+            raise SprintAuthorityError("spec rebind authority requires a shell identity")
+
+        with db_driver.write_transaction(self.con, "sprint.spec.rebind"):
+            sprint = self.con.execute(
+                "SELECT feature_id,originating_planner_shell_id,lifecycle "
+                "FROM sprints WHERE sprint_id=?",
+                (sprint_id,),
+            ).fetchone()
+            if sprint is None:
+                raise KeyError(f"unknown Sprint: {sprint_id}")
+            if sprint["lifecycle"] != "paused":
+                raise SprintInvariantError(
+                    "governing specs may be rebound only while the Sprint is paused"
+                )
+            if actor.kind == "planner" and actor.shell_id != sprint[
+                "originating_planner_shell_id"
+            ]:
+                raise SprintAuthorityError(
+                    "only the originating Planner may rebind this Sprint spec"
+                )
+
+            binding = self.con.execute(
+                "SELECT ss.bound_revision_sha256,ss.bound_revision_body,"
+                "d.kind,d.feature_id,d.body "
+                "FROM sprint_specs ss JOIN documents d USING (document_id) "
+                "WHERE ss.sprint_id=? AND ss.document_id=?",
+                (sprint_id, document_id),
+            ).fetchone()
+            if binding is None:
+                raise KeyError(
+                    f"document {document_id} is not bound to Sprint {sprint_id}"
+                )
+            if (
+                binding["kind"] != "spec"
+                or binding["feature_id"] is None
+                or int(binding["feature_id"]) != int(sprint["feature_id"])
+            ):
+                raise SprintInvariantError(
+                    "rebind requires a governing spec for the Sprint feature"
+                )
+            current_body = binding["body"]
+            if not isinstance(current_body, str) or not current_body.strip():
+                raise SprintInvariantError(
+                    "rebind requires a non-empty current governing spec"
+                )
+            new_revision = hashlib.sha256(current_body.encode()).hexdigest()
+            old_revision = str(binding["bound_revision_sha256"])
+            history = self.con.execute(
+                "SELECT revision_id,generation,bound_revision_sha256,actor_kind,"
+                "actor_shell_id,reason FROM sprint_spec_revision_history "
+                "WHERE sprint_id=? AND document_id=? "
+                "ORDER BY generation DESC LIMIT 2",
+                (sprint_id, document_id),
+            ).fetchall()
+            if not history:
+                raise SprintInvariantError(
+                    "governing spec binding has no revision history"
+                )
+            latest = history[0]
+            if old_revision != latest["bound_revision_sha256"]:
+                raise SprintInvariantError(
+                    "active governing spec does not match its revision history"
+                )
+
+            if expected_revision_sha256 != old_revision:
+                replay = (
+                    new_revision == old_revision
+                    and len(history) == 2
+                    and history[1]["bound_revision_sha256"]
+                    == expected_revision_sha256
+                    and history[0]["actor_kind"] == actor.kind
+                    and history[0]["actor_shell_id"] == actor.shell_id
+                    and history[0]["reason"] == reason
+                )
+                if replay:
+                    return SpecRebindReceipt(
+                        sprint_id,
+                        document_id,
+                        expected_revision_sha256,
+                        old_revision,
+                        int(latest["revision_id"]),
+                        int(latest["generation"]),
+                        False,
+                    )
+                raise SprintConflictError(
+                    "governing spec binding changed; read the active revision and retry",
+                    {
+                        "code": "spec_revision_changed",
+                        "expected_revision_sha256": expected_revision_sha256,
+                        "active_revision_sha256": old_revision,
+                    },
+                )
+            if new_revision == old_revision:
+                return SpecRebindReceipt(
+                    sprint_id,
+                    document_id,
+                    old_revision,
+                    new_revision,
+                    int(latest["revision_id"]),
+                    int(latest["generation"]),
+                    False,
+                )
+
+            generation = int(latest["generation"]) + 1
+            revision_id = int(
+                self.con.execute(
+                    "INSERT INTO sprint_spec_revision_history "
+                    "(sprint_id,document_id,generation,bound_revision_sha256,"
+                    "bound_revision_body,bound_revision_legacy,actor_kind,"
+                    "actor_shell_id,reason) VALUES (?,?,?,?,?,0,?,?,?)",
+                    (
+                        sprint_id,
+                        document_id,
+                        generation,
+                        new_revision,
+                        current_body,
+                        actor.kind,
+                        actor.shell_id,
+                        reason,
+                    ),
+                ).lastrowid
+            )
+            self.con.execute(
+                "INSERT INTO governing_revision_rebind_permits "
+                "(sprint_id,document_id,old_revision_sha256,new_revision_id) "
+                "VALUES (?,?,?,?)",
+                (sprint_id, document_id, old_revision, revision_id),
+            )
+            changed = self.con.execute(
+                "UPDATE sprint_specs SET bound_revision_sha256=?,"
+                "bound_revision_body=?,bound_revision_legacy=0,approval_id=NULL "
+                "WHERE sprint_id=? AND document_id=? "
+                "AND bound_revision_sha256=?",
+                (
+                    new_revision,
+                    current_body,
+                    sprint_id,
+                    document_id,
+                    old_revision,
+                ),
+            ).rowcount
+            if changed != 1:
+                raise SprintConflictError(
+                    "governing spec binding changed during rebind",
+                    {"code": "spec_revision_changed"},
+                )
+            self.con.execute(
+                "DELETE FROM governing_revision_rebind_permits "
+                "WHERE sprint_id=? AND document_id=?",
+                (sprint_id, document_id),
+            )
+            self.con.execute(
+                "INSERT INTO sprint_events "
+                "(sprint_id,event_type,actor_kind,actor_shell_id,payload) "
+                "VALUES (?,'spec.rebound',?,?,?)",
+                (
+                    sprint_id,
+                    actor.kind,
+                    actor.shell_id,
+                    json.dumps(
+                        {
+                            "document_id": document_id,
+                            "old_revision_sha256": old_revision,
+                            "new_revision_sha256": new_revision,
+                            "revision_id": revision_id,
+                            "generation": generation,
+                            "reason": reason,
+                        },
+                        sort_keys=True,
+                    ),
+                ),
+            )
+        return SpecRebindReceipt(
+            sprint_id,
+            document_id,
+            old_revision,
+            new_revision,
+            revision_id,
+            generation,
+            True,
+        )
 
 
 class SprintLifecycleStore:
