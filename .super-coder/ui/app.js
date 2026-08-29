@@ -3240,9 +3240,7 @@ function chatModelOptions(select, catalog, harness, defaultModel) {
     textContent: "Use harness default",
   }));
   for (const model of available) {
-    const support = model.harness_support_state
-      ? ` — ${model.harness_support_state}` : "";
-    select.append(el("option", { value: model.id, textContent: model.id + support }));
+    select.append(el("option", { value: model.id, textContent: model.id }));
   }
   if (!select.options.length) {
     select.append(el("option", {
