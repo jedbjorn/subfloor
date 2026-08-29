@@ -211,7 +211,7 @@ class MigrationManagementReseedTest(unittest.TestCase):
             con.executescript(
                 (
                     ENGINE
-                    / "migrations/0239_global_skill_simplification.sql"
+                    / "migrations/0241_global_skill_simplification.sql"
                 ).read_text()
             )
             actual = con.execute(

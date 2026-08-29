@@ -195,8 +195,8 @@ class HardCutoverMigrationTest(unittest.TestCase):
         self.assertNotIn("every-session", body)
         self.assertNotIn("sc mem message send", body)
 
-    def test_0239_converges_packs_without_rewriting_fork_dev_kit(self) -> None:
-        migration = "0239_global_skill_simplification.sql"
+    def test_0241_converges_packs_without_rewriting_fork_dev_kit(self) -> None:
+        migration = "0241_global_skill_simplification.sql"
         con = build_db(before=migration)
         bespoke = add_shell(con, "custom", None)
         con.execute(
@@ -293,8 +293,8 @@ class HardCutoverMigrationTest(unittest.TestCase):
             ("local", "fork", "local bytes"),
         )
 
-    def test_0239_migrates_only_the_untouched_legacy_dev_kit_starter(self) -> None:
-        migration = "0239_global_skill_simplification.sql"
+    def test_0241_migrates_only_the_untouched_legacy_dev_kit_starter(self) -> None:
+        migration = "0241_global_skill_simplification.sql"
         con = build_db(before=migration)
         sql = (MIGRATIONS / migration).read_text()
 

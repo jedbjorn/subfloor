@@ -244,7 +244,7 @@
     ".super-coder/migrations/0141_rebuild_completed_sprint_cancellations.sql",
     ".super-coder/migrations/0190_reseed_successful_sprint_chat_cleanup.sql",
     ".super-coder/migrations/0193_retire_sprint_liveness_acceptance.sql",
-    ".super-coder/migrations/0239_global_skill_simplification.sql",
+    ".super-coder/migrations/0241_global_skill_simplification.sql",
     ".super-coder/render/compose.py",
     ".super-coder/schema.sql",
     ".super-coder/scripts/activity_readers.py",

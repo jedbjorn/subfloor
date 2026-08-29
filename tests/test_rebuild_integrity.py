@@ -37,7 +37,7 @@ def legacy_dev_kit() -> tuple:
     try:
         con.executescript(SCHEMA.read_text())
         for migration in sorted(MIGRATIONS.glob("*.sql")):
-            if migration.name >= "0239_":
+            if migration.name >= "0241_":
                 break
             con.executescript(migration.read_text())
         return con.execute(

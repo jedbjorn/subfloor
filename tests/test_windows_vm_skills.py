@@ -12,7 +12,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 ENGINE = ROOT / ".super-coder"
 SKILLS = ENGINE / "assets" / "skills"
-MIGRATION = ENGINE / "migrations" / "0239_global_skill_simplification.sql"
+MIGRATION = ENGINE / "migrations" / "0241_global_skill_simplification.sql"
 README = ROOT / "docs" / "README.md"
 BROKER_DOC = ENGINE / "docs" / "windows-vm-broker.md"
 DISPATCH = ENGINE / "scripts" / "dispatch.sh"

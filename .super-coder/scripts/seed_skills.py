@@ -242,7 +242,7 @@ def reconcile_standard_flavor_packs(
 
 
 def reconcile_dev_kit_starter(con) -> bool:
-    """Upgrade only the exact untouched pre-0239 fork starter."""
+    """Upgrade only the exact untouched pre-0241 fork starter."""
     row = con.execute(
         "SELECT description,category,command,common,content,is_deleted "
         "FROM skills WHERE name='dev_kit'"

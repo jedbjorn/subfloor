@@ -1,4 +1,4 @@
--- 0239 — converge the global skill namespace and standard flavor packs.
+-- 0241 — converge the global skill namespace and standard flavor packs.
 --
 -- Fresh builds receive full global bodies from regenerated 0001. In-place
 -- update syncs that same seed after migrations. This delta removes retired
@@ -172,7 +172,7 @@ deployment ritual, database technique, or VM lifecycle.',
 ;
 
 -- dev_kit became fork-owned in 0035. Upgrade only the exact untouched
--- pre-0239 engine starter; any downstream change remains byte-for-byte.
+-- pre-0241 engine starter; any downstream change remains byte-for-byte.
 UPDATE skills SET
   description=(SELECT description FROM _sc_desired_dev_kit),
   category=(SELECT category FROM _sc_desired_dev_kit),

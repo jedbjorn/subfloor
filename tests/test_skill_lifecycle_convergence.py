@@ -30,7 +30,7 @@ from skill_convergence_fixtures import (
 
 TRAILING_MIGRATIONS = (
     MIGRATIONS / "0154_remove_tombstoned_skills.sql",
-    MIGRATIONS / "0239_global_skill_simplification.sql",
+    MIGRATIONS / "0241_global_skill_simplification.sql",
 )
 
 

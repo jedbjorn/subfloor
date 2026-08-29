@@ -53,7 +53,7 @@ class PythonToolingSkillReseedTest(unittest.TestCase):
             "(1,'dev_kit','stale','stale','stale',1,'stale',1);"
         )
         migration = (
-            ENGINE / "migrations" / "0239_global_skill_simplification.sql"
+            ENGINE / "migrations" / "0241_global_skill_simplification.sql"
         ).read_text()
 
         con.executescript(migration)

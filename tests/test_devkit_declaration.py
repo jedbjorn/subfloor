@@ -31,7 +31,7 @@ DEVKIT_RESEED = (
     ROOT
     / ".super-coder"
     / "migrations"
-    / "0239_global_skill_simplification.sql"
+    / "0241_global_skill_simplification.sql"
 )
 
 
