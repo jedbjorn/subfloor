@@ -302,6 +302,30 @@ def test_start_chat_has_default_and_configured_paths_without_terminal_controls()
     assert "attach" not in interface.lower()
 
 
+def test_model_picker_labels_do_not_expose_harness_support_confidence():
+    options = APP[
+        APP.index("function chatModelOptions"):
+        APP.index("function chatCreateConversation")
+    ]
+    script = r"""
+const CHAT_HARNESS_DEFAULT_VALUE = "__sc_harness_default__";
+const el = (tag, props) => ({tag, ...props});
+const select = {options: [], replaceChildren() { this.options = []; },
+  append(option) { this.options.push(option); }};
+""" + options + r"""
+chatModelOptions(select, {harnesses: {codex: {models: [
+  {id: "gpt-5.6-sol", availability: "available", harness_support_state: "best-effort"},
+  {id: "gpt-hidden", availability: "unavailable", harness_support_state: "tested"},
+]}}}, "codex", "gpt-5.6-sol");
+console.log(JSON.stringify(select.options));
+"""
+    assert run_js(script) == [
+        {"tag": "option", "value": "", "textContent": "Use shell default — gpt-5.6-sol"},
+        {"tag": "option", "value": "__sc_harness_default__", "textContent": "Use harness default"},
+        {"tag": "option", "value": "gpt-5.6-sol", "textContent": "gpt-5.6-sol"},
+    ]
+
+
 @pytest.mark.skipif(shutil.which("node") is None, reason="node is required")
 def test_missing_retained_harness_status_disables_composer():
     availability = APP[
