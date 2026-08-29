@@ -190,27 +190,33 @@ class MigrationManagementReseedTest(unittest.TestCase):
             manifest["allowed_reference_files"],
         )
 
-    def test_terminal_reseed_matches_the_authoritative_skill_asset(self):
+    def test_terminal_reseed_publishes_the_engine_migration_skill(self):
         expected = seed_skills.parse_skill(
-            ENGINE / "assets/skills/migration_management/SKILL.md"
+            ENGINE / "assets/skills/engine_migrations/SKILL.md"
         )
         con = sqlite3.connect(":memory:")
         try:
             con.executescript(
+                "CREATE TABLE shells ("
+                "shell_id INTEGER PRIMARY KEY, flavor TEXT, "
+                "system_prompt TEXT NOT NULL);"
                 "CREATE TABLE skills ("
                 "skill_id INTEGER PRIMARY KEY, name TEXT UNIQUE, description TEXT, "
                 "category TEXT, command TEXT, common INTEGER, content TEXT, "
                 "is_deleted INTEGER DEFAULT 0);"
+                "CREATE TABLE shell_skills (shell_id INTEGER, skill_id INTEGER);"
+                "CREATE TABLE flavor_skills (flavor TEXT, skill_id INTEGER, "
+                "UNIQUE(flavor,skill_id));"
             )
             con.executescript(
                 (
                     ENGINE
-                    / "migrations/0160_reseed_migration_management.sql"
+                    / "migrations/0241_global_skill_simplification.sql"
                 ).read_text()
             )
             actual = con.execute(
                 "SELECT name,description,category,command,common,content,is_deleted "
-                "FROM skills WHERE name='migration_management'"
+                "FROM skills WHERE name='engine_migrations'"
             ).fetchone()
         finally:
             con.close()
@@ -227,9 +233,16 @@ class MigrationManagementReseedTest(unittest.TestCase):
                 0,
             ),
         )
-        self.assertIn("./sc migration new <slug>", actual[5])
-        self.assertIn("WAL-safe `premigrate` backup", actual[5])
-        self.assertIn("separate `preupdate` backup", actual[5])
+        self.assertIn("ordered additive deltas", actual[5])
+        self.assertIn("WAL-safe backup", actual[5])
+        self.assertIn("fresh build, in-place migration", actual[5])
+        self.assertIn("./sc migration new <lowercase_snake_case_slug>", actual[5])
+        self.assertIn("\n./sc migrate\n", actual[5])
+        self.assertNotIn("./sc migrate /", actual[5])
+        self.assertIn("migrate: db         <absolute-path>", actual[5])
+        self.assertIn("ACTIVE SESSION `floor: live_engine_checkout`", actual[5])
+        self.assertIn("0001_seed_skills.sql` is the generated exception", actual[5])
+        self.assertIn("nothing pending", actual[5])
 
 
 if __name__ == "__main__":

@@ -164,6 +164,16 @@ def _string_array(value: Any, field: str) -> tuple[str, ...]:
     return tuple(_string(item, f"{field}[{index}]") for index, item in enumerate(value))
 
 
+def _boot_field(value: str, field: str) -> str:
+    """Reject declaration text that can escape generated Markdown code spans."""
+    if "`" in value or any(ord(character) < 32 or ord(character) == 127 for character in value):
+        raise _error(
+            field,
+            "must not contain control characters or Markdown code delimiters",
+        )
+    return value
+
+
 def _is_absolute(value: str) -> bool:
     return Path(value).is_absolute() or PureWindowsPath(value).is_absolute()
 
@@ -198,15 +208,28 @@ def _repo_path(
     return value, resolved
 
 
+def _boot_repo_path(
+    checkout: Path,
+    declared: Any,
+    field: str,
+    *,
+    base: Path | None = None,
+    kind: str | None = None,
+) -> tuple[str, Path]:
+    """Resolve one path that is later rendered inside generated Markdown."""
+    value = _boot_field(_string(declared, field), field)
+    return _repo_path(checkout, value, field, base=base, kind=kind)
+
+
 def _hook(checkout: Path, name: str, value: Any) -> Hook:
     field = f"$.hooks.{name}"
     item = _object(value, field)
     _keys(item, field, allowed=("argv", "cwd"), required=("argv",))
     argv = _string_array(item["argv"], f"{field}.argv")
-    cwd_declared, cwd = _repo_path(
+    cwd_declared, cwd = _boot_repo_path(
         checkout, item.get("cwd", "."), f"{field}.cwd", kind="directory"
     )
-    executable = argv[0]
+    executable = _boot_field(argv[0], f"{field}.argv[0]")
     if "/" not in executable:
         if _is_absolute(executable):
             raise _error(f"{field}.argv[0]", "absolute executable paths are forbidden")
@@ -307,7 +330,7 @@ def _sandbox(checkout: Path, value: Any) -> Sandbox:
     context_declared: str | None = None
     context: Path | None = None
     if "dockerfile" in item:
-        dockerfile_declared, dockerfile = _repo_path(
+        dockerfile_declared, dockerfile = _boot_repo_path(
             checkout, item["dockerfile"], f"{field}.dockerfile", kind="file"
         )
         default_context = str(Path(dockerfile_declared).parent)

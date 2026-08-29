@@ -18,30 +18,24 @@ ROOT_ONLY_MARKER = "<!-- sc-root-only:"
 RATIFIED_OPT_INS = {
     "admin": {
         "admin_git",
-        "authoring_syntax",
+        "engine_migrations",
         "git_cleanup",
-        "migration_management",
         "self_update",
+        "snapshot",
     },
     "planner": {
-        "api-design",
-        "authoring_syntax",
-        "blueprint",
+        "dev_kit",
         "docs",
         "flag_sweep",
         "flags",
+        "fork_skill_design",
         "git",
-        "local_skill_management",
         "onboard",
         "sprint_close",
         "sprint_pln",
         "sprint_prep",
     },
     "dev": {
-        "agents",
-        "authoring_syntax",
-        "database-migrations",
-        "dev_kit",
         "docs",
         "flags",
         "git",
@@ -49,8 +43,10 @@ RATIFIED_OPT_INS = {
         "redline_review",
         "spec",
         "sprint_dev",
-        "test_authoring",
     },
+    "reviewer": {"flags", "git", "redline_review", "review", "sprint_rev"},
+    "devops": {"docs", "flags", "git"},
+    "cartographer": {"cartographer", "git"},
 }
 
 sys.path.insert(0, str(ENGINE / "scripts"))
@@ -152,7 +148,7 @@ class HardCutoverMigrationTest(unittest.TestCase):
                 template["flavor"],
             )
 
-    def test_admin_planner_dev_opt_ins_match_ratified_packs(self) -> None:
+    def test_standard_opt_ins_match_ratified_packs(self) -> None:
         con = build_db()
         common = {
             row[0]
@@ -199,44 +195,48 @@ class HardCutoverMigrationTest(unittest.TestCase):
         self.assertNotIn("every-session", body)
         self.assertNotIn("sc mem message send", body)
 
-    def test_0188_converges_dirty_standard_packs_without_bespoke_drift(self) -> None:
-        migration = "0188_realign_flavor_skill_packs.sql"
+    def test_0241_converges_packs_without_rewriting_fork_dev_kit(self) -> None:
+        migration = "0241_global_skill_simplification.sql"
         con = build_db(before=migration)
         bespoke = add_shell(con, "custom", None)
-        bespoke_names = {
-            "authoring_syntax",
-            "flag_sweep",
-            "git",
-            "local_skill_management",
-        }
-        con.executemany(
-            "INSERT INTO shell_skills (shell_id, skill_id) "
-            "SELECT ?, skill_id FROM skills WHERE name=?",
-            [(bespoke, name) for name in sorted(bespoke_names)],
-        )
-
         con.execute(
-            "DELETE FROM flavor_skills WHERE flavor IN ('planner','dev') "
-            "AND skill_id IN (SELECT skill_id FROM skills "
-            "WHERE name IN ('authoring_syntax','flag_sweep',"
-            "'local_skill_management'))"
+            "INSERT INTO skills(name,description,category,content,common) "
+            "VALUES ('fork_testing_seat','local','fork','local bytes',0)"
+        )
+        local_id = con.execute(
+            "SELECT skill_id FROM skills WHERE name='fork_testing_seat'"
+        ).fetchone()[0]
+        con.execute(
+            "INSERT INTO shell_skills(shell_id,skill_id) VALUES (?,?)",
+            (bespoke, local_id),
         )
         con.execute(
-            "INSERT OR IGNORE INTO flavor_skills (flavor, skill_id) "
-            "SELECT 'admin', skill_id FROM skills "
-            "WHERE name IN ('git','flag_sweep','local_skill_management')"
+            "INSERT INTO flavor_skills(flavor,skill_id) VALUES ('dev',?)",
+            (local_id,),
         )
         con.execute(
-            "DELETE FROM flavor_skills WHERE skill_id IN "
-            "(SELECT skill_id FROM skills WHERE name='admin_git')"
+            "INSERT OR IGNORE INTO flavor_skills(flavor,skill_id) "
+            "SELECT 'dev',skill_id FROM skills WHERE name='snapshot'"
         )
-        con.execute("DELETE FROM skills WHERE name='admin_git'")
+        custom_dev_kit = (
+            "fork description",
+            "fork category",
+            "fork-command",
+            0,
+            "fork-owned dev_kit bytes",
+            0,
+        )
+        con.execute(
+            "UPDATE skills SET description=?,category=?,command=?,common=?,"
+            "content=?,is_deleted=? WHERE name='dev_kit'",
+            custom_dev_kit,
+        )
 
         sql = (MIGRATIONS / migration).read_text()
         con.executescript(sql)
         con.executescript(sql)
 
-        for name in ("admin_git", "flag_sweep"):
+        for name in ("harness_readiness",):
             expected = seed_skills.parse_skill(
                 ENGINE / "assets" / "skills" / name / "SKILL.md"
             )
@@ -258,6 +258,12 @@ class HardCutoverMigrationTest(unittest.TestCase):
                 name,
             )
 
+        actual_dev_kit = con.execute(
+            "SELECT description,category,command,common,content,is_deleted "
+            "FROM skills WHERE name='dev_kit'"
+        ).fetchone()
+        self.assertEqual(tuple(actual_dev_kit), custom_dev_kit)
+
         common = {
             row[0]
             for row in con.execute(
@@ -265,9 +271,6 @@ class HardCutoverMigrationTest(unittest.TestCase):
             )
         }
         for flavor, expected in RATIFIED_OPT_INS.items():
-            expected_at_0188 = expected - (
-                {"harness_readiness"} if flavor == "dev" else set()
-            )
             actual = {
                 row[0]
                 for row in con.execute(
@@ -277,60 +280,40 @@ class HardCutoverMigrationTest(unittest.TestCase):
                     (flavor,),
                 )
             }
-            self.assertEqual(actual - common, expected_at_0188, flavor)
-        self.assertEqual(resolved_names(con, bespoke), bespoke_names)
+            expected_with_local = expected | (
+                {"fork_testing_seat"} if flavor == "dev" else set()
+            )
+            self.assertEqual(actual - common, expected_with_local, flavor)
+        self.assertEqual(resolved_names(con, bespoke), {"fork_testing_seat"})
+        self.assertEqual(
+            tuple(con.execute(
+                "SELECT description,category,content FROM skills "
+                "WHERE name='fork_testing_seat'"
+            ).fetchone()),
+            ("local", "fork", "local bytes"),
+        )
 
-    def test_0232_seeds_harness_readiness_and_grants_dev_idempotently(self) -> None:
-        migration = "0232_seed_harness_readiness_skill.sql"
+    def test_0241_migrates_only_the_untouched_legacy_dev_kit_starter(self) -> None:
+        migration = "0241_global_skill_simplification.sql"
         con = build_db(before=migration)
-        skill = con.execute(
-            "INSERT INTO skills (name,description,category,common,content,is_deleted) "
-            "VALUES ('harness_readiness','stale','wrong',1,'stale body',1)"
-        ).lastrowid
-        bespoke = add_shell(con, "custom", None)
-        con.execute(
-            "INSERT INTO shell_skills (shell_id,skill_id) VALUES (?,?)",
-            (bespoke, skill),
-        )
-        con.execute(
-            "INSERT INTO flavor_skills (flavor,skill_id) VALUES ('planner',?)",
-            (skill,),
-        )
-
         sql = (MIGRATIONS / migration).read_text()
+
         con.executescript(sql)
         con.executescript(sql)
 
         expected = seed_skills.parse_skill(
-            ENGINE / "assets" / "skills" / "harness_readiness" / "SKILL.md"
+            ENGINE / "assets" / "seed" / "skills" / "dev_kit" / "SKILL.md"
         )
         actual = con.execute(
             "SELECT description,category,command,common,content,is_deleted "
-            "FROM skills WHERE name='harness_readiness'"
+            "FROM skills WHERE name='dev_kit'"
         ).fetchone()
         self.assertEqual(
             tuple(actual),
-            (
-                expected["description"],
-                expected["category"],
-                expected["command"],
-                expected["common"],
-                expected["content"],
-                0,
-            ),
+            tuple(expected[key] for key in (
+                "description", "category", "command", "common", "content"
+            )) + (0,),
         )
-        self.assertEqual(
-            [
-                tuple(row)
-                for row in con.execute(
-                    "SELECT fs.flavor FROM flavor_skills fs JOIN skills s "
-                    "USING(skill_id) WHERE s.name='harness_readiness' "
-                    "ORDER BY fs.flavor"
-                )
-            ],
-            [("dev",), ("planner",)],
-        )
-        self.assertEqual(resolved_names(con, bespoke), {"harness_readiness"})
 
     def test_non_admin_skill_packs_use_the_canonical_sc_command(self) -> None:
         con = build_db()
@@ -371,7 +354,7 @@ class HardCutoverMigrationTest(unittest.TestCase):
         dev1 = add_shell(con, "dev1", "dev")
         dev2 = add_shell(con, "dev2", "dev")
         bespoke = add_shell(con, "custom", None)
-        kid = skill_id(con, "query_authoring_pg")
+        kid = skill_id(con, "snapshot")
         con.executemany(
             "INSERT INTO shell_skills (shell_id, skill_id) VALUES (?, ?)",
             [(dev1, kid), (bespoke, kid)],
@@ -388,19 +371,19 @@ class HardCutoverMigrationTest(unittest.TestCase):
             ).fetchone()[0],
             0,
         )
-        self.assertNotIn("query_authoring_pg", resolved_names(con, dev1))
+        self.assertNotIn("snapshot", resolved_names(con, dev1))
         self.assertEqual(resolved_names(con, dev1), resolved_names(con, dev2))
-        self.assertIn("query_authoring_pg", resolved_names(con, bespoke))
+        self.assertIn("snapshot", resolved_names(con, bespoke))
 
     def test_stale_flavored_shell_row_is_never_effective(self) -> None:
         con = build_db()
         dev = add_shell(con, "dev", "dev")
-        kid = skill_id(con, "query_authoring_pg")
+        kid = skill_id(con, "snapshot")
         con.execute(
             "INSERT INTO shell_skills (shell_id, skill_id) VALUES (?, ?)",
             (dev, kid),
         )
-        self.assertNotIn("query_authoring_pg", resolved_names(con, dev))
+        self.assertNotIn("snapshot", resolved_names(con, dev))
 
 
 class GrantApiTest(unittest.TestCase):
@@ -410,7 +393,7 @@ class GrantApiTest(unittest.TestCase):
         self.dev2 = add_shell(self.con, "dev2", "dev")
         self.custom1 = add_shell(self.con, "custom1", None)
         self.custom2 = add_shell(self.con, "custom2", None)
-        self.kid = skill_id(self.con, "query_authoring_pg")
+        self.kid = skill_id(self.con, "snapshot")
 
     def tearDown(self) -> None:
         self.con.close()
@@ -420,19 +403,19 @@ class GrantApiTest(unittest.TestCase):
             self.con, "dev", self.kid, True
         )
         self.assertTrue(ok, err)
-        self.assertIn("query_authoring_pg", resolved_names(self.con, self.dev1))
-        self.assertIn("query_authoring_pg", resolved_names(self.con, self.dev2))
+        self.assertIn("snapshot", resolved_names(self.con, self.dev1))
+        self.assertIn("snapshot", resolved_names(self.con, self.dev2))
 
         ok, err = server.set_grant(self.con, self.dev1, self.kid, False)
         self.assertFalse(ok)
         self.assertIn("edit the flavor pack", err)
-        self.assertIn("query_authoring_pg", resolved_names(self.con, self.dev2))
+        self.assertIn("snapshot", resolved_names(self.con, self.dev2))
 
     def test_bespoke_writes_can_diverge(self) -> None:
         ok, err = server.set_grant(self.con, self.custom1, self.kid, True)
         self.assertTrue(ok, err)
-        self.assertIn("query_authoring_pg", resolved_names(self.con, self.custom1))
-        self.assertNotIn("query_authoring_pg", resolved_names(self.con, self.custom2))
+        self.assertIn("snapshot", resolved_names(self.con, self.custom1))
+        self.assertNotIn("snapshot", resolved_names(self.con, self.custom2))
 
     def test_unknown_targets_do_not_write(self) -> None:
         self.assertFalse(
@@ -592,7 +575,7 @@ class RenderAndSnapshotTest(unittest.TestCase):
         self.con = build_db()
         self.dev = add_shell(self.con, "dev", "dev")
         self.custom = add_shell(self.con, "custom", None)
-        self.kid = skill_id(self.con, "query_authoring_pg")
+        self.kid = skill_id(self.con, "snapshot")
 
     def tearDown(self) -> None:
         self.con.close()
@@ -606,10 +589,10 @@ class RenderAndSnapshotTest(unittest.TestCase):
             "INSERT INTO shell_skills (shell_id, skill_id) VALUES (?, ?)",
             (self.custom, self.kid),
         )
-        self.assertNotIn("query_authoring_pg", compose.render_skills(
+        self.assertNotIn("snapshot", compose.render_skills(
             self.con, self.dev
         ))
-        self.assertIn("query_authoring_pg", compose.render_skills(
+        self.assertIn("snapshot", compose.render_skills(
             self.con, self.custom
         ))
         with tempfile.TemporaryDirectory() as tmp:
@@ -621,11 +604,11 @@ class RenderAndSnapshotTest(unittest.TestCase):
             )
             self.assertFalse(
                 (Path(tmp) / "dev" / ".claude" / "skills"
-                 / "query_authoring_pg").exists()
+                 / "snapshot").exists()
             )
             self.assertTrue(
                 (Path(tmp) / "custom" / ".claude" / "skills"
-                 / "query_authoring_pg" / "SKILL.md").exists()
+                 / "snapshot" / "SKILL.md").exists()
             )
 
     def test_skill_render_supports_a_harness_native_directory(self) -> None:
@@ -643,7 +626,7 @@ class RenderAndSnapshotTest(unittest.TestCase):
 
             self.assertTrue(
                 (Path(tmp) / ".opencode" / "skills"
-                 / "query_authoring_pg" / "SKILL.md").exists()
+                 / "snapshot" / "SKILL.md").exists()
             )
 
     def test_codex_adapter_renders_and_prunes_native_skill_mirror(self) -> None:
@@ -669,10 +652,10 @@ class RenderAndSnapshotTest(unittest.TestCase):
             )
             for skill_root in (".claude", ".agents"):
                 rendered = (
-                    root / skill_root / "skills" / "query_authoring_pg" / "SKILL.md"
+                    root / skill_root / "skills" / "snapshot" / "SKILL.md"
                 )
                 self.assertTrue(rendered.exists())
-                self.assertIn("name: query_authoring_pg", rendered.read_text())
+                self.assertIn("name: snapshot", rendered.read_text())
 
             self.con.execute(
                 "DELETE FROM shell_skills WHERE shell_id=? AND skill_id=?",
@@ -681,7 +664,7 @@ class RenderAndSnapshotTest(unittest.TestCase):
             run.render_harness_skills(self.con, self.custom, root, adapter)
             for skill_root in (".claude", ".agents"):
                 self.assertFalse(
-                    (root / skill_root / "skills" / "query_authoring_pg").exists()
+                    (root / skill_root / "skills" / "snapshot").exists()
                 )
 
     def test_native_only_adapter_also_renders_boot_advertised_skill_mirror(self) -> None:
@@ -702,10 +685,10 @@ class RenderAndSnapshotTest(unittest.TestCase):
             )
             for skill_root in (".claude", ".agents"):
                 rendered = (
-                    root / skill_root / "skills" / "query_authoring_pg" / "SKILL.md"
+                    root / skill_root / "skills" / "snapshot" / "SKILL.md"
                 )
                 self.assertTrue(rendered.exists())
-                self.assertIn("name: query_authoring_pg", rendered.read_text())
+                self.assertIn("name: snapshot", rendered.read_text())
 
     def test_snapshot_serializes_pack_grants_by_skill_name(self) -> None:
         self.con.execute(
@@ -724,12 +707,12 @@ class RenderAndSnapshotTest(unittest.TestCase):
         self.assertIn(
             f"INSERT INTO shell_skills (shell_id, skill_id) "
             f"SELECT {self.custom}, skill_id FROM skills "
-            "WHERE name='query_authoring_pg';",
+            "WHERE name='snapshot';",
             shell_dump,
         )
         self.assertNotIn(
             f"SELECT {self.dev}, skill_id FROM skills "
-            "WHERE name='query_authoring_pg';",
+            "WHERE name='snapshot';",
             shell_dump,
         )
 

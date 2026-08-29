@@ -22,6 +22,7 @@ ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS = ROOT / ".super-coder" / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 
+import run as run_mod  # noqa: E402
 import sandbox_devkit  # noqa: E402
 from sandbox_devkit import (  # noqa: E402
     MOUNT_MARKER,
@@ -1268,6 +1269,58 @@ class SandboxImagePlanTest(unittest.TestCase):
         self.assertFalse(stale["ready"])
         provision_checkout(stale_plan, "sandbox", runner=docker, emit=False)
         self.assertTrue(readiness(stale_plan, runner=docker)["ready"])
+
+    def test_boot_inventory_rejects_content_only_provision_input_drift(self):
+        fixture = ImageFixture(
+            self.base,
+            "boot-input-drift",
+            sandbox=False,
+            provision=True,
+        )
+        plan = fixture.plan()
+        docker = FakeDocker()
+        build_images(plan, runner=docker)
+        docker.containers["sandbox"] = docker.images[plan.base_tag]["Id"]
+        provision_checkout(plan, "sandbox", runner=docker, emit=False)
+
+        with mock.patch.object(run_mod, "ENGINE", fixture.engine):
+            current = run_mod.collect_dev_tools(
+                fixture.root, "container", environment={"PATH": "/usr/bin"}
+            )
+            self.assertEqual(current["state"], "ready")
+
+            (fixture.root / "requirements.lock").write_text("changed bytes\n")
+            stale = run_mod.collect_dev_tools(
+                fixture.root, "container", environment={"PATH": "/usr/bin"}
+            )
+            self.assertEqual(stale["state"], "stale")
+
+    def test_boot_inventory_rejects_ready_receipt_image_label_mismatch(self):
+        fixture = ImageFixture(
+            self.base,
+            "boot-image-mismatch",
+            sandbox=False,
+            provision=True,
+        )
+        plan = fixture.plan()
+        docker = FakeDocker()
+        build_images(plan, runner=docker)
+        docker.containers["sandbox"] = docker.images[plan.base_tag]["Id"]
+        provision_checkout(plan, "sandbox", runner=docker, emit=False)
+        ready_path = next(
+            (fixture.root / ".sc-state" / "local" / "dev-kit").glob(
+                "*/ready.json"
+            )
+        )
+        receipt = json.loads(ready_path.read_text())
+        receipt["image"]["labels"]["sc.engine_ref"] = "stale"
+        ready_path.write_text(json.dumps(receipt))
+
+        with mock.patch.object(run_mod, "ENGINE", fixture.engine):
+            inventory = run_mod.collect_dev_tools(
+                fixture.root, "container", environment={"PATH": "/usr/bin"}
+            )
+        self.assertEqual(inventory["state"], "stale")
 
     def test_readiness_rejects_container_running_a_retagged_old_image(self):
         fixture = ImageFixture(self.base, "fork", provision=True)

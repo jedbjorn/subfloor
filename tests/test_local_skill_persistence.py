@@ -135,9 +135,9 @@ class LocalSkillWorld(unittest.TestCase):
 
 
 class LocalSkillManagementSeedTest(unittest.TestCase):
-    def test_engine_asset_and_generated_seed_match_for_management_skill(self):
+    def test_engine_asset_and_generated_seed_match_for_design_skill(self):
         spec = seed_skills.parse_skill(
-            ENGINE / "assets" / "skills" / "local_skill_management" / "SKILL.md"
+            ENGINE / "assets" / "skills" / "fork_skill_design" / "SKILL.md"
         )
         con = sqlite3.connect(":memory:")
         try:
@@ -148,7 +148,7 @@ class LocalSkillManagementSeedTest(unittest.TestCase):
             self.assertEqual(
                 con.execute(
                     "SELECT description, category, command, common, content "
-                    "FROM skills WHERE name='local_skill_management'"
+                    "FROM skills WHERE name='fork_skill_design'"
                 ).fetchone(),
                 tuple(
                     spec[key]

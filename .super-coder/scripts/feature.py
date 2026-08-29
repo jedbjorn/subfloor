@@ -1,111 +1,83 @@
 #!/usr/bin/env python3
-"""./sc feature — the front door to the engine's opt-in features.
+"""./sc feature — the front door to optional engine infrastructure.
 
-Opt-ins have always existed as two mechanisms that compose:
+Each feature controls one `instance.json` block that enables an engine-supplied
+sidecar or host broker. The engine exposes the mechanism and its link boundary;
+fork-specific operating procedure belongs in a DB-canonical local skill designed
+by the Planner with `fork_skill_design`.
 
-    1. an `instance.json` block (pg / vm / ts / pm2) — enables the INFRASTRUCTURE
-       (sidecar container, host-side broker) for this fork;
-    2. `common=0` skill grants — puts the PROCEDURE in the right shells' hands
-       (the skills ship to every fork's catalogue but auto-grant to none).
-
-This command makes the pair first-class: `list` shows every feature and the
-state of both halves; `enable` grants the feature's skills to the flavors that
-own them (and creates the config block where that is scriptable); `disable`
-reverses it. The mechanisms underneath are unchanged — feature.py only
-orchestrates them, so everything here can still be done by hand.
-
-The vm/ts blocks are NOT auto-created: they carry host-specific, operator-
-verified config (a linked VM, a tailnet scope) that `enable` cannot invent —
-it grants the skills and prints exactly how to link. `pg` needs no host input
-(the sidecar is fully derived), so its block IS auto-created. A feature may
-also be procedure-only (`block: None`) — no infrastructure half at all, just
-grants; `app-deploy` is one.
-
-Grants land in shell_skills, which is fork memory — enable/disable therefore
-re-snapshots, so `.sc-state/local/content.sql` stays current and a rebuild keeps the
-grants.
+The vm/ts/pm2 blocks carry operator-verified host configuration and therefore
+remain link-only. Postgres needs no host input, so its block can be created
+directly.
 
 Usage:
     ./sc feature                      # = list
     ./sc feature list
-    ./sc feature enable  <name>       # pg · windows · tailnet · pm2 · app-deploy
+    ./sc feature enable  <name>       # pg · windows · tailnet · pm2
     ./sc feature disable <name>
 """
 from __future__ import annotations
 
 import json
-import os
-import subprocess
 import sys
 from pathlib import Path
 
 ENGINE = Path(__file__).resolve().parents[1]
-REPO_ROOT = ENGINE.parent
-DB_PATH = ENGINE / "shell_db.db"
 INSTANCE = ENGINE / "instance.json"
-PY = sys.executable
 
-sys.path.insert(0, str(ENGINE / "scripts"))
-import db_driver  # noqa: E402
-import artifact_policy  # noqa: E402
-import skill_projection  # noqa: E402
-
-# The registry. `block` is the instance.json key (None = procedure-only, no
-# infrastructure half); `block_auto` says whether enable may create it (only
-# when it needs no operator-supplied host config). `grants` maps skill name →
-# the flavors whose shells own that procedure. `link` is the printed how-to
-# for the operator-supplied blocks / procedure-only next steps.
+# `block_auto` is true only when enable needs no operator-supplied host config.
+# `link` describes the supported boundary for operator-linked infrastructure.
 FEATURES: dict[str, dict] = {
     "pg": {
         "title": "Postgres sidecar (app-only)",
         "block": "pg",
         "block_auto": True,
-        "grants": {"query_authoring_pg": ["dev", "reviewer", "planner"]},
-        "next": ["./sc launch   # starts the sidecar + forwards DATABASE_URL "
-                 "(or: ./sc pg-up)"],
+        "next": [
+            (
+                "./sc launch   # starts the sidecar + forwards DATABASE_URL "
+                "(or: ./sc pg-up)"
+            )
+        ],
     },
     "windows": {
         "title": "Windows Test VM (link-only)",
         "block": "vm",
         "block_auto": False,
-        "grants": {"windows_devkit": ["dev", "reviewer"],
-                   "windows_vm_gui": ["dev", "reviewer"],
-                   "configure_winbox": ["admin"]},
-        "link": ["link your VM: GUI → Scripts → 'Windows Test VM' wizard "
-                 "(live-checks each field), or hand-fill the `vm` block in "
-                 ".super-coder/instance.json — see README → 'Windows Test VM'",
-                 "./sc launch   # brings the vm-broker up once a VM is linked"],
+        "link": [
+            (
+                "link your VM: GUI → Scripts → 'Windows Test VM' wizard "
+                "(live-checks each field), or hand-fill the `vm` block in "
+                ".super-coder/instance.json — see README → 'Windows Test VM'"
+            ),
+            "./sc launch   # brings the vm-broker up once a VM is linked",
+        ],
     },
     "tailnet": {
         "title": "Tailnet broker",
         "block": "ts",
         "block_auto": False,
-        "grants": {"tailscale": ["devops"]},
-        "link": ["hand-fill the `ts` block in .super-coder/instance.json "
-                 "(allowed_hosts is the fail-closed scope) — see README → "
-                 "'Tailnet broker'",
-                 "./sc launch   # brings the ts-broker up once a tailnet is linked"],
+        "link": [
+            (
+                "hand-fill the `ts` block in .super-coder/instance.json "
+                "(allowed_hosts is the fail-closed scope) — see README → "
+                "'Tailnet broker'"
+            ),
+            "./sc launch   # brings the ts-broker up once a tailnet is linked",
+        ],
     },
     "pm2": {
         "title": "pm2 broker (host process stack)",
         "block": "pm2",
         "block_auto": False,
-        "grants": {"pm2": ["admin", "devops"]},
-        "link": ["hand-fill the `pm2` block in .super-coder/instance.json "
-                 "(processes is the fail-closed scope; health_url optional; "
-                 "stop/start stay gated behind allow_lifecycle) — see README "
-                 "→ 'pm2 broker'",
-                 "./sc launch   # brings the pm2-broker up once a stack is linked"],
-    },
-    "app-deploy": {
-        "title": "App deploy ritual (admin-authored)",
-        "block": None,          # procedure-only — nothing to link in instance.json
-        "block_auto": False,
-        "grants": {"app_deploy_setup": ["admin"]},
-        "link": ["run the app_deploy_setup skill in your admin shell — it "
-                 "authors this repo's own project-local `deploy` skill "
-                 "(migration dirs, backup, ff-only sync, migrate, restart) "
-                 "and grants it to every shell"],
+        "link": [
+            (
+                "hand-fill the `pm2` block in .super-coder/instance.json "
+                "(processes is the fail-closed scope; health_url optional; "
+                "stop/start stay gated behind allow_lifecycle) — see README "
+                "→ 'pm2 broker'"
+            ),
+            "./sc launch   # brings the pm2-broker up once a stack is linked",
+        ],
     },
 }
 
@@ -123,70 +95,18 @@ def _write_instance(cfg: dict) -> None:
     INSTANCE.write_text(json.dumps(cfg, indent=2) + "\n")
 
 
-def grant(con, skill: str, flavors: list[str]) -> int:
-    """Grant `skill` once to each named flavor pack. Idempotent."""
-    q = ",".join("?" for _ in flavors)
-    cur = con.execute(
-        f"INSERT OR IGNORE INTO flavor_skills (flavor, skill_id) "
-        f"SELECT f.flavor, k.skill_id "
-        f"FROM (SELECT flavor FROM flavor_skills WHERE flavor IN ({q}) "
-        f"      UNION SELECT flavor FROM shells WHERE flavor IN ({q})) f, skills k "
-        f"WHERE k.name=? AND k.is_deleted=0",
-        (*flavors, *flavors, skill))
-    return cur.rowcount
-
-
-def revoke(con, skill: str, flavors: list[str]) -> int:
-    """Revoke `skill` from named flavor packs; Bespoke grants stay untouched."""
-    q = ",".join("?" for _ in flavors)
-    cur = con.execute(
-        f"DELETE FROM flavor_skills WHERE skill_id IN "
-        f"(SELECT skill_id FROM skills WHERE name=? AND is_deleted=0) "
-        f"AND flavor IN ({q})",
-        (skill, *flavors))
-    return cur.rowcount
-
-
-def _grant_state(con, skill: str) -> list[str]:
-    """['dev', 'reviewer'] — flavor packs holding the skill."""
-    rows = con.execute(
-        "SELECT g.flavor FROM flavor_skills g "
-        "JOIN skills k ON k.skill_id=g.skill_id "
-        "WHERE k.name=? AND k.is_deleted=0 ORDER BY g.flavor", (skill,)).fetchall()
-    return [flavor for (flavor,) in rows]
-
-
-def _snapshot() -> None:
-    """Grants are fork memory — persist them under the active artifact policy."""
-    env = {**os.environ, "SC_ADMIN": "1"}
-    r = subprocess.run([PY, str(ENGINE / "scripts" / "snapshot.py")], env=env)
-    if r.returncode != 0:
-        target = artifact_policy.content_path().relative_to(REPO_ROOT)
-        print(f"⚠ snapshot failed — grants are live in the DB but {target} is stale; "
-              "run ./sc snapshot", file=sys.stderr)
-
-
 def cmd_list() -> int:
     cfg = _instance()
-    con = db_driver.connect(DB_PATH) if DB_PATH.exists() else None
     print("opt-in features — enable with: ./sc feature enable <name>\n")
     for name, f in FEATURES.items():
         blk = f["block"]
-        if blk is None:
-            blk_state = "— none needed (procedure-only)"
-        else:
-            linked = blk in cfg
-            blk_state = f"✓ `{blk}` linked" if linked else (
-                f"✗ `{blk}` block absent" + ("" if f["block_auto"] else " (operator-linked)"))
+        linked = blk in cfg
+        blk_state = f"✓ `{blk}` linked" if linked else (
+            f"✗ `{blk}` block absent" + ("" if f["block_auto"] else " (operator-linked)"))
         print(f"  {name:10} {f['title']}")
         print(f"             config: {blk_state}")
-        for skill in f["grants"]:
-            held = _grant_state(con, skill) if con else []
-            state = " ".join(held) if held else "none"
-            print(f"             skill:  {skill} → {state}")
+        print("             guidance: fork-local via Planner `fork_skill_design`")
         print()
-    if con:
-        con.close()
     return 0
 
 
@@ -200,42 +120,11 @@ def _resolve(name: str) -> dict:
 
 def cmd_enable(name: str) -> int:
     f = _resolve(name)
-    if not DB_PATH.exists():
-        sys.exit("feature: no live DB — run ./sc rebuild (or ./sc install) first.")
     print(f"→ enable {name} — {f['title']}")
-
-    con = db_driver.connect(DB_PATH)
-    try:
-        granted = 0
-        for skill, flavors in f["grants"].items():
-            n = grant(con, skill, flavors)
-            granted += n
-            state = " ".join(_grant_state(con, skill)) or "none"
-            missing = [fl for fl in flavors if con.execute(
-                "SELECT COUNT(*) FROM shells WHERE flavor=? AND COALESCE(is_deleted,0)=0",
-                (fl,)).fetchone()[0] == 0]
-            note = f"  (no live {'/'.join(missing)} shell yet — create one and re-run)" if missing else ""
-            print(f"  skill {skill} → {state}{note}")
-        con.commit()
-        try:
-            skill_projection.reconcile_flavors(
-                con,
-                (flavor for flavors in f["grants"].values() for flavor in flavors),
-            )
-        except skill_projection.ProjectionError as exc:
-            sys.exit(skill_projection.partial_failure_message(
-                f"feature enable {name}", exc
-            ))
-    finally:
-        con.close()
 
     cfg = _instance()
     blk = f["block"]
-    if blk is None:
-        print("  config: none needed (procedure-only) — next steps:")
-        for step in f.get("link", []):
-            print(f"    - {step}")
-    elif blk in cfg:
+    if blk in cfg:
         print(f"  config `{blk}` already linked in instance.json")
     elif f["block_auto"]:
         cfg[blk] = {}
@@ -246,10 +135,9 @@ def cmd_enable(name: str) -> int:
         for step in f.get("link", []):
             print(f"    - {step}")
 
-    if granted:
-        _snapshot()
     for step in f.get("next", []):
         print(f"  next: {step}")
+    print("  guidance: describe fork-specific operation with Planner `fork_skill_design`")
     return 0
 
 
@@ -257,35 +145,9 @@ def cmd_disable(name: str) -> int:
     f = _resolve(name)
     print(f"→ disable {name} — {f['title']}")
 
-    if DB_PATH.exists():
-        con = db_driver.connect(DB_PATH)
-        try:
-            revoked = 0
-            for skill, flavors in f["grants"].items():
-                n = revoke(con, skill, flavors)
-                revoked += n
-                print(f"  skill {skill}: revoked {n} grant(s) "
-                      f"(flavors: {', '.join(flavors)}; other shells untouched)")
-            con.commit()
-            try:
-                skill_projection.reconcile_flavors(
-                    con,
-                    (flavor for flavors in f["grants"].values() for flavor in flavors),
-                )
-            except skill_projection.ProjectionError as exc:
-                sys.exit(skill_projection.partial_failure_message(
-                    f"feature disable {name}", exc
-                ))
-        finally:
-            con.close()
-        if revoked:
-            _snapshot()
-
     cfg = _instance()
     blk = f["block"]
-    if blk is None:
-        print("  config: none to remove (procedure-only)")
-    elif blk in cfg:
+    if blk in cfg:
         del cfg[blk]
         _write_instance(cfg)
         print(f"  config `{blk}` removed from instance.json")

@@ -544,6 +544,7 @@ def main() -> int:
     con = db_driver.connect(DB_PATH)
     try:
         reconciled = seed_skills.reconcile_tombstoned_skills(con)
+        pack_changes = seed_skills.reconcile_standard_flavor_packs(con)
         persist_instance(con)
     finally:
         con.close()
@@ -553,6 +554,8 @@ def main() -> int:
             f"({', '.join(reconciled.changed_names)}; "
             f"{reconciled.grant_count} grant(s))"
         )
+    if pack_changes:
+        print(f"snapshot: standard flavor grants reconciled ({pack_changes})")
     # Relocate-on-write: drop a stale legacy copy so the new .sc-state/ path is
     # the single source after the first snapshot post-B7.
     if LEGACY_PATH.exists():

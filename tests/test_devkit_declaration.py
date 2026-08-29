@@ -31,7 +31,7 @@ DEVKIT_RESEED = (
     ROOT
     / ".super-coder"
     / "migrations"
-    / "0234_reseed_ci_fallback_authority.sql"
+    / "0241_global_skill_simplification.sql"
 )
 
 
@@ -116,6 +116,31 @@ class DeclarationTest(unittest.TestCase):
         self.assertIsNone(deps.resolved_executable)
         self.assertEqual(test.executable_kind, "relative")
         self.assertEqual(test.resolved_executable, tool.resolve())
+
+    def test_boot_visible_declaration_fields_reject_markdown_injection(self):
+        (self.root / "safe").mkdir()
+        attacks = (
+            ({"argv": ["tool`\n## injected"]}, r"\.argv\[0\]"),
+            ({"argv": ["tool"], "cwd": "safe`\n## injected"}, r"\.cwd"),
+            ({"argv": ["tool\x1b[31m"]}, r"\.argv\[0\]"),
+        )
+        for hook, field in attacks:
+            with self.subTest(hook=hook):
+                self.assert_invalid(
+                    {"version": 1, "hooks": {"test": hook}},
+                    field + ": must not contain control characters or Markdown",
+                )
+        for dockerfile in (
+            ".subfloor/Dockerfile`injected",
+            ".subfloor/Dockerfile\n## injected",
+        ):
+            with self.subTest(dockerfile=dockerfile):
+                (self.root / dockerfile).write_text("FROM scratch\n")
+                self.assert_invalid(
+                    {"version": 1, "sandbox": {"dockerfile": dockerfile}},
+                    r"\.sandbox\.dockerfile: must not contain control characters "
+                    "or Markdown",
+                )
 
     def test_cwd_must_exist_and_stay_in_checkout(self):
         outside = Path(self.temp.name) / "outside"
@@ -988,32 +1013,23 @@ class SourcePolicyTest(unittest.TestCase):
         readme_section = readme.split("### Dev kit", 1)[1].split("## Opt-in features", 1)[0]
         for guidance in (skill, readme_section):
             self.assertIn(".subfloor/dev-kit.json", guidance)
-            self.assertIn("exit `78`", guidance)
-            self.assertIn("no fork dev kit declared", guidance)
+            self.assertIn("sc deps", guidance)
+            self.assertIn("sc test", guidance)
             self.assertNotIn("every `requirements*.txt`", guidance)
 
-        self.assertLess(
-            skill.index("invariant exact-execution hooks"),
-            skill.index("## Read the active seat"),
-        )
         self.assertNotIn("## You are in a container", skill)
-        self.assertIn("boot document's execution-context section", skill)
         for state in ("absent", "invalid", "failed", "stale", "advisory", "ready", "repair"):
-            self.assertIn(f"| **{state}** |", skill)
+            self.assertIn(f"`{state}`", skill)
         self.assertIn("Engine baseline", skill)
-        self.assertIn("Native packages", skill)
-        self.assertIn("Fork extension", skill)
-        self.assertIn("Checkout setup", skill)
-        self.assertIn("Host prerequisites", skill)
-        self.assertIn("never infers manifests", skill)
-        self.assertIn("never installs privileged host packages", skill)
-        self.assertIn("`./sc` remains valid", skill)
-        self.assertIn("exit the container", skill)
+        self.assertIn("## Seats and evidence", skill)
+        self.assertIn("Host hooks use the host checkout", skill)
+        self.assertIn("Container hooks use the", skill)
+        self.assertIn("does not infer project policy", skill)
+        self.assertIn("not the fork's test assertions", skill)
 
 
 class DevKitReseedConformanceTest(unittest.TestCase):
-    def test_trailing_reseed_converges_dirty_downstream_and_replays(self):
-        expected = seed_skills.parse_skill(DEVKIT_SKILL)
+    def test_trailing_reseed_preserves_custom_downstream_dev_kit_and_replays(self):
         with sqlite3.connect(":memory:") as con:
             con.executescript(
                 "CREATE TABLE shells ("
@@ -1023,6 +1039,9 @@ class DevKitReseedConformanceTest(unittest.TestCase):
                 "skill_id INTEGER PRIMARY KEY, name TEXT UNIQUE, description TEXT, "
                 "category TEXT, command TEXT, common INTEGER, content TEXT, "
                 "is_deleted INTEGER DEFAULT 0);"
+                "CREATE TABLE shell_skills (shell_id INTEGER, skill_id INTEGER);"
+                "CREATE TABLE flavor_skills (flavor TEXT, skill_id INTEGER, "
+                "UNIQUE(flavor,skill_id));"
                 "INSERT INTO skills VALUES "
                 "(41,'dev_kit','stale description','wrong','old-command',1,"
                 "'You are in a container',1),"
@@ -1044,13 +1063,13 @@ class DevKitReseedConformanceTest(unittest.TestCase):
             actual,
             (
                 41,
-                expected["name"],
-                expected["description"],
-                expected["category"],
-                expected["command"],
-                expected["common"],
-                expected["content"],
-                0,
+                "dev_kit",
+                "stale description",
+                "wrong",
+                "old-command",
+                1,
+                "You are in a container",
+                1,
             ),
         )
         self.assertEqual(local, ("local", "fork", None, 0, "bespoke body", 0))

@@ -84,8 +84,9 @@ publication path.
 This skill owns the render/snapshot pipeline + the `render-check` guard:
 
 - `self_update` — `sc update` refreshes the same local `_sc` files.
-- `local_skill_management` — fork-local skills persist via the local snapshot.
-- `migration_management` — a **content-seed** migration (skills, flavor
-  defaults) changes what renders; rebuild + render + `render-check` after.
+- `fork_skill_design` — DB-canonical fork-local skills persist via the local
+  snapshot.
+- `engine_migrations` — a **content-seed** migration (skills, flavor defaults)
+  changes what renders; rebuild + render + `render-check` after.
 - `docs` / `spec` — document bodies live in the DB, render to `docs_sc/` /
   `specs_sc/`; authored via `sc mem doc`, serialized here.

@@ -28,7 +28,10 @@ from skill_convergence_fixtures import (
     build_dirty_skill_fork,
 )
 
-MIGRATION = MIGRATIONS / "0154_remove_tombstoned_skills.sql"
+TRAILING_MIGRATIONS = (
+    MIGRATIONS / "0154_remove_tombstoned_skills.sql",
+    MIGRATIONS / "0241_global_skill_simplification.sql",
+)
 
 
 def logical_dump(path: Path) -> str:
@@ -122,8 +125,9 @@ class SkillLifecycleConvergenceTest(unittest.TestCase):
 
     def test_trailing_migration_converges_dirty_database_twice(self) -> None:
         with closing(sqlite3.connect(self.fixture.database)) as con:
-            con.executescript(MIGRATION.read_text())
-            con.executescript(MIGRATION.read_text())
+            for migration in TRAILING_MIGRATIONS:
+                con.executescript(migration.read_text())
+                con.executescript(migration.read_text())
         self.assert_converged()
 
     def test_rebuild_reconciles_stale_snapshot_twice_before_publish(self) -> None:

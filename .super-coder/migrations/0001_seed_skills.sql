@@ -110,491 +110,6 @@ ON CONFLICT(name) DO UPDATE SET
   content=excluded.content, is_deleted=0;
 
 INSERT INTO skills (name, description, category, command, common, content, is_deleted) VALUES (
-  'agents',
-  '--agents [model] — delegate work to spawned subagents under the system''s discipline. Dev — execute a spec''s task plan as implementer waves; reviewer — fan the three review axes out to an adversarial finding-panel. Overlay on spec/review; parent-only memory writes; AGENTS spawn ledger with a hard 6h validity window; parent-set timeouts. Load ONLY when the FnB invokes --agents.',
-  'craft',
-  NULL,
-  0,
-  '# agents — delegated waves under your discipline
-
-FnB invokes this as `--agents [model]`. It is an **overlay** on `spec` (dev
-mode) and `review` (review mode): it changes only what is written here.
-Everything upstream and downstream of the named steps — loading the spec,
-task tracking, flags, the FnB handoff gate — is the base skill, unchanged.
-Load the base skill first; apply this on top.
-
-`[model]` = worker tier, passed verbatim to the harness''s agent tool. No arg
--> agents inherit your model. Heavier judgment work -> heavier worker; you
-may bump a single agent''s tier for a task judged hard. You — the parent —
-NEVER change tier; you stay the judge.
-
-**Core loop = implement -> you verify -> adversarially refute -> you fix.**
-The refute step is where the quality comes from. Parallel implementers are an
-optional scale-up for genuinely large, file-disjoint work, not the headline:
-your loop (compose -> wait -> adjudicate -> re-verify) is serial, and field
-runs measured hundreds of k of subagent tokens even on small waves — the
-spend buys verification depth + an audit trail, not wall-clock.
-
-Fit test before spawning: multi-surface + file-disjoint + spec''d + high
-correctness stakes -> waves. Single-file / small fix -> run the base
-procedure solo; at most spawn one adversarial skeptic against your own diff
-— the cheap, high-ROI slice of this skill.
-
-- **Harness:** subagent tooling exists in the claude harness only. No
-  subagent tooling in your harness -> this skill is inert; run the base
-  procedure.
-- **Not a workflow-script system.** NEVER build deterministic orchestration
-  scripts — spawn agents directly and stay in the loop between waves. You
-  decide scale, batching, and prompts live, per this session''s demands.
-
----
-
-## The contract — four rules, non-negotiable
-
-1. **You are the only memory writer.** Agents NEVER run `sc mem` — no task
-   status, flags, messages, current_state, narrative — and NEVER `git push`,
-   open PRs, or message shells. They return diffs + findings; you adjudicate
-   and record. Keeps the shared DB coherent and the reviewer''s FnB handoff
-   gate intact.
-2. **Prompt ingredients, not canned prompts.** Compose every agent prompt
-   fresh; each MUST carry: the spec excerpt / done-condition it serves, the
-   exact file paths in play, the fork conventions that apply, the expected
-   base commit (agent verifies via `git log -1` before editing and REPORTS a
-   mismatch instead of silently proceeding), the deadline block (see the
-   ledger check), and a required return shape.
-3. **Isolation by conflict risk.** Concurrent writers on the same files — or
-   any writer that must touch git state — each get their own isolated
-   worktree (writers never share a tree''s index). A file-disjoint wave may
-   share your tree, edits only: agents run no `git
-   add`/`stash`/`checkout`/`commit`. Read *Worktree reality* below before
-   reaching for isolation — it has real costs. Reviewer/checker agents are
-   read-only; no isolation needed.
-4. **Agent claims are inputs, not results.** Follow the boot `TESTING POSTURE`:
-   re-run smallest affected targets, lint, and the spec''s done-condition
-   yourself; never use bare `sc test` merely to duplicate configured CI.
-   "Agent says tests pass" is not verification. Pull diffs yourself
-   (`git -C <worktree> diff`); NEVER adjudicate pasted diffs/output — pastes
-   are lossy.
-
----
-
-## Worktree reality — what isolation actually gives an agent
-
-Harness worktrees are fresh trees; two properties bite (both observed on
-first fork runs — super-coder #303, #304):
-
-- **They seed from the default branch (origin/main), not your branch HEAD.**
-  In a stacked feature, a later-wave implementer authors — and "verifies" —
-  against a base missing the earlier waves'' commits. Hence the base-commit
-  ingredient in contract rule 2, and hence: writers return diffs, you apply
-  each one to YOUR tree with `git apply --3way` (note: it STAGES — inspect
-  via `git diff HEAD`), and every check runs on the merged state.
-- **They lack untracked toolchains.** No `node_modules`; sandboxed
-  interpreters typically mount only into the primary worktree — an isolated
-  agent often cannot run the app''s suite at all. Say so in the prompt so it
-  doesn''t burn a turn rediscovering it; treat its tree as an authoring
-  surface — verification is yours, in your tree.
-
----
-
-## The ledger check — before EVERY spawn, before acting on ANY result
-
-The ledger = one line embedded in current_state (one wave live at a time, so
-one line is the complete record):
-
-```
-AGENTS wave=2/3 spawned=2026-07-06T14:32Z timeout=30m out=task4,task5
-```
-
-Review mode uses axis/lens names in `out=` (e.g.
-`out=quality,edges,conformance,api-design`). Stamp `spawned=` from the clock
-(UTC) at the moment you spawn — NEVER recalled or recomputed from context.
-Remove the line at wave close.
-
-Execute this check verbatim; do not interpret it:
-
-```
-1. Read current_state.
-   No AGENTS line → you may spawn. Write the AGENTS line,
-   spawned=<now UTC>, in the same act as spawning.
-2. AGENTS line present → age = now(UTC) − spawned.
-3. age > 6h → the wave is DEAD. Unconditionally:
-   a. Stop any agent still running.
-   b. Discard their output UNREAD — do not apply, adjudicate, or "just
-      check" it, even if it looks correct.
-   c. Reconcile the task plan against reality: a task is done only if its
-      diff is on the branch and verification passes NOW.
-   d. Remove the AGENTS line; narrative: "wave expired (spawned <ts>);
-      reconciled <n> tasks".
-   e. Only now may current-session judgment start a NEW wave — fresh
-      spawn, fresh timestamp.
-4. age ≤ 6h → the wave is LIVE:
-   - agents running → monitor; never spawn a duplicate for anything
-     listed in out=.
-   - agents not running (a prior session died) → their tasks revert to
-     pending; respawning is a NEW wave: check no orphan diff already
-     landed, then rewrite the AGENTS line with a fresh timestamp.
-```
-
-Every agent prompt ends with this deadline block, filled in:
-
-```
-Your deadline is <spawned + timeout> UTC. Past it, stop and return
-partial results. If the current time is after <spawned + 6h>, do no
-work — return immediately. Run all verification synchronously; never
-end your turn waiting on a background task — your final message is
-your only channel back.
-```
-
-The 6-hour window is a hard constant: choose timeouts freely under it;
-nothing extends it. Step 3b is deliberate — expired output is discarded even
-when it looks correct; "looks correct" hours later against a moved tree is
-exactly the trap. Step 3c recovers anything real: a diff that genuinely
-landed and verifies NOW passes reconciliation as done. Stale ledger text is
-never evidence.
-
----
-
-## Dev mode — overlay on `spec` Step 4
-
-After the task plan exists (base skill, Steps 1–3, unchanged):
-
-1. Classify pending tasks into **dependency waves** — independent tasks run
-   in parallel; dependent tasks sequence. Ordering non-obvious -> use
-   `blueprint` for the dependency read; a plan that already encodes the
-   order stands on its own.
-2. Per wave: run the ledger check -> mark each wave task `in_progress`
-   (`sc mem task start`) -> spawn one implementer per task (isolation per
-   contract rule 3) -> pull each returned diff yourself and apply it to your
-   tree -> spawn checker agent(s) prompted to **refute** it -> adjudicate +
-   run the affected tests on the merged state -> `sc mem task done` -> update
-   current_state -> next wave.
-3. One wave live at a time.
-
-Stance amendment: `spec`''s "one task at a time" becomes "one **wave** at a
-time" under `--agents`; each task is still independently verified before it
-is marked done. `spec` Step 5 (handoff on completion) is unchanged — yours,
-never an agent''s.
-
-## Review mode — overlay on `review` Step 2
-
-`review` Steps 1, 3, and 4 — loading the diff and its spec, flags, the
-FnB-gated handoff — are unchanged. Agents never open flags.
-
-1. Run the ledger check, then fan out **one agent per axis** (code quality /
-   edge cases & gaps / spec conformance) **plus one per applicable lens**
-   from the base skill''s lens table. Each agent is read-only and returns
-   candidate findings in a fixed shape:
-   `file:line · claim · severity · how to reproduce`.
-2. Dedupe the returns. Uncertain finding -> optionally spawn a skeptic
-   prompted to refute it. Adjudicate every survivor yourself — re-read the
-   code path; a finding is a lead, not a verdict.
-3. Proceed to base Step 3 with the adjudicated findings. Agents widen the
-   search; you remain the gate.
-
----
-
-## Monitoring
-
-Agents cannot self-report (contract rule 1) — monitoring is your checkpoint
-discipline, written to surfaces the FnB already watches:
-
-| Surface | What it shows |
-|---|---|
-| task plan (`sc mem get tasks`) | live board — wave tasks flip `in_progress` at spawn, `done` at adjudication; the GUI Tasks tab renders it |
-| `current_state` | the in-flight AGENTS ledger line, rewritten at every wave boundary |
-| narrative | one line per inflection: wave landed, timeout, checker refuted an implementation |
-| on demand | "status?" from the FnB → inspect your running agents'' output, answer in two lines |
-
-Limit: mid-task granularity inside a single agent is visible only by
-inspecting its output on demand. No per-agent progress bar — a write surface
-for agents would break rule 1.
-
-## Timeouts
-
-Set a timeout per agent at spawn, sized to the task, recorded in the ledger
-line — the budget is visible, not private.
-
-At expiry: inspect the agent''s partial output -> stop it -> respawn with a
-**narrower** prompt (a timeout usually means the prompt was too broad) /
-take the task inline.
-
-**Two-strike rule:** a task whose agent times out twice is done inline by
-you, full stop. No respawn loops. Every timeout gets a narrative line —
-timeouts are signal about the plan''s granularity.',
-  0
-)
-ON CONFLICT(name) DO UPDATE SET
-  description=excluded.description, category=excluded.category,
-  command=excluded.command, common=excluded.common,
-  content=excluded.content, is_deleted=0;
-
-INSERT INTO skills (name, description, category, command, common, content, is_deleted) VALUES (
-  'api-design',
-  'REST/HTTP API design patterns — resource naming, status codes, pagination, filtering, errors, versioning, idempotency. Use when designing or reviewing API endpoints.',
-  'craft',
-  NULL,
-  0,
-  '# api-design — designing & reviewing HTTP APIs
-
-## Resources & methods
-- Name resources as **plural nouns**, never verbs: `/users`, `/users/{id}/orders`.
-- `GET` read (safe, idempotent) · `POST` create / non-idempotent action ·
-  `PUT` full replace (idempotent) · `PATCH` partial update · `DELETE` remove.
-- Nest one level deep max; beyond that, link by id.
-
-## Status codes
-- `200` ok · `201` created (+ `Location`) · `204` no content.
-- `400` bad input · `401` unauth · `403` forbidden · `404` not found ·
-  `409` conflict · `422` validation · `429` rate-limited.
-- `5xx` = server''s fault; NEVER return `5xx` for a client error.
-
-## Payloads
-- One error shape everywhere: `{ "error": { "code", "message", "details" } }`.
-- **Pagination**: cursor-based for large/changing sets (`?cursor=&limit=`),
-  return `next_cursor`; offset only for small stable sets.
-- **Filtering/sorting**: explicit query params (`?status=open&sort=-created`);
-  whitelist fields — NEVER interpolate them into a query.
-- Timestamps ISO-8601 UTC; ids opaque strings.
-
-## Robustness
-- **Idempotency**: make retries safe — `PUT`/`DELETE` naturally; for `POST`,
-  accept an idempotency key.
-- **Versioning**: prefix (`/v1/…`) or header; add fields backward-compatibly,
-  never repurpose an existing one.
-- Validate at the boundary; unknown fields = reject or ignore — pick one and
-  document it. NEVER leak internals (stack traces, SQL) in error responses.
-
-## Review lens
-Each endpoint does one thing? Right method + status? Errors uniform? Inputs
-validated/whitelisted? Retries safe? Breaking change hiding in a "small"
-tweak?',
-  0
-)
-ON CONFLICT(name) DO UPDATE SET
-  description=excluded.description, category=excluded.category,
-  command=excluded.command, common=excluded.common,
-  content=excluded.content, is_deleted=0;
-
-INSERT INTO skills (name, description, category, command, common, content, is_deleted) VALUES (
-  'app_deploy_setup',
-  'Admin-run, one-time scaffold — turn the shipped deploy template into this repo''s own project-local `deploy` skill (migration dirs, DB backup, ff-only sync, apply + move migrations, restart), then grant it to every shell.',
-  'substrate',
-  NULL,
-  0,
-  '# app_deploy_setup — scaffold this app''s deploy ritual (once, admin)
-
-The engine deploys itself (`sc update`); the host app''s deploy — app process,
-app DB, app migrations — is the fork''s own. Fill the template below with this
-app''s specifics and save it as a NEW project-local `deploy` skill.
-
-NEVER save the result by editing this skill: engine skills self-heal on every
-`sc update` — a fork edit to any skill named in `assets/skills/` is detected
-as stale and reverted to the shipped body. A project-local name (one the
-engine doesn''t ship) is never touched and persists through rebuilds via
-`sc snapshot` -> `.sc-state/local/content.sql`. Leave this scaffold as shipped.
-
-## 1. Scaffold the migration dirs
-
-```bash
-mkdir -p migrations_app/pending migrations_app/completed
-touch migrations_app/pending/.gitkeep migrations_app/completed/.gitkeep
-```
-
-Commit them. Renaming to fit the repo''s layout (`db/migrations/…`,
-`deploy/migrations/…`) is fine -> keep `pending/` + `completed/` as siblings
-and use the same paths in the template. These hold the APP''s schema
-migrations — NOT `.super-coder/migrations/` (engine DB, ledger-tracked, owned
-by `sc update`).
-
-## 2. Fill the template
-
-Every `⟨ADMIN: …⟩` slot is app-specific — get it from the operator or the
-repo. Run each command once by hand before writing it in; an untested command
-does not enter a deploy skill.
-
-```markdown
-# deploy — ⟨ADMIN: app name⟩ post-merge deploy ritual
-
-Run from the repo root on the host. Every step aborts loudly rather than
-guessing; if a step fails, stop — the app is down and the DB is backed up.
-
-1. **Down** — stop the app:
-   ⟨ADMIN: stop command — e.g. pm2 stop ecosystem.config.cjs / systemctl stop <app> / docker compose down⟩
-
-2. **Backup** — snapshot the app DB before anything mutates:
-   ⟨ADMIN: backup command + destination + how many to retain⟩
-
-3. **Sync main** — `git switch main` (if on a branch), then `git pull --ff-only`.
-   `--ff-only` aborts on a diverged or dirty main — resolve by hand; never
-   merge inside a deploy.
-
-4. **Migrate** — apply every file in `migrations_app/pending/` in sort order:
-   ⟨ADMIN: apply command per file — e.g. psql "$DB_URL" -f <file> / sqlite3 <db> < <file> / alembic upgrade head⟩
-   After each success: `git mv migrations_app/pending/<file> migrations_app/completed/`
-   On first failure: stop, restore the backup, investigate.
-
-5. **Record** — commit and push the moves — the move IS the applied-ledger,
-   and an uncommitted move dirties main and breaks the NEXT deploy''s --ff-only:
-   `git add migrations_app && git commit -m "deploy: apply <files>" && git push`
-
-6. **Up** — restart the app:
-   ⟨ADMIN: start command⟩
-
-7. **Verify** — prove the new code is serving:
-   ⟨ADMIN: health check — e.g. curl -fsS http://127.0.0.1:<port>/health⟩
-```
-
-## 3. Save as a project-local skill
-
-Persist the filled template through the `local_skill_management` path — the
-ONE authoring lane for fork-local skills (#321: hand-rolled `sc sql-rw`
-INSERTs leave no asset file to re-seed from and contradict that skill''s
-contract in the same catalogue):
-
-1. Write the asset file at `.super-coder/assets/skills/deploy/SKILL.md` —
-   frontmatter carries the identity; body = the filled template:
-
-   ```markdown
-   ---
-   name: deploy
-   description: Post-merge deploy ritual for this app — down, backup, ff-only sync, migrate pending→completed, restart, verify.
-   category: substrate
-   common: true
-   ---
-   <the filled template>
-   ```
-
-   `common: true` = grant-to-every-shell: new shells receive it at creation,
-   and `sc update` re-grants every common skill to every live shell.
-
-2. Seed it into the catalogue + grant it live: `sc seed-skills` (upserts the
-   asset into the DB, grants common skills to every live shell).
-
-3. Persist: `SC_ADMIN=1 sc snapshot` → the skill + grants survive in the
-   ignored local snapshot. There is no generated-content commit.
-
-Details, updates, and removal: the `local_skill_management` skill.
-
-## 4. Optional make surface
-
-Operator wants make muscle-memory -> add a bare `deploy` target to the repo''s
-own root Makefile (the fork''s convention space). NEVER add it to
-`.super-coder/aliases.mk` — engine-owned; every target there must delegate to
-`./sc`, and the engine knows nothing about the app.
-
-## 5. Done
-
-Dry-run the ritual end-to-end once in a quiet window -> all 7 steps pass
-before any shell relies on it. This scaffold stays granted to admin only; the
-finished `deploy` skill is the one every shell carries.',
-  0
-)
-ON CONFLICT(name) DO UPDATE SET
-  description=excluded.description, category=excluded.category,
-  command=excluded.command, common=excluded.common,
-  content=excluded.content, is_deleted=0;
-
-INSERT INTO skills (name, description, category, command, common, content, is_deleted) VALUES (
-  'authoring_syntax',
-  'House syntax for text authored for AI consumption — skill bodies, shell focus/mandate text, agent prompts. Directives with success conditions, specific prohibitions, light operators, need-to-know. Fires when authoring or editing one, or on "syntax check X".',
-  'craft',
-  NULL,
-  0,
-  '# authoring_syntax — write for the shell that loads it
-
-House syntax for text authored for AI consumption — skill bodies, shell
-focus/mandate text, agent prompts. Governs how the text reads; lifecycle
-mechanics (create / seed / grant / persist) stay in `local_skill_management`.
-
-Retrofit = touch-time: an existing doc converts when next edited. No mass
-pass. Engine skill bodies are upstream-owned — a syntax fix to one is an
-upstream PR (`issue_reporting` boundary), never a fork edit.
-
-## Fires when
-
-- authoring / editing any AI-consumed doc
-- "syntax check X" -> run Self-test against X, return findings ranked, no
-  rewrite
-
-## Rules
-
-- directive + success condition. every instruction = action + observable
-  pass. "bounce the api -> `make health` returns ok" not "make sure the api
-  is running".
-- prohibitions are specific. bar the exact action: "NEVER `echo $SECRET`"
-  not "be careful with secrets". no compliance test = cut or sharpen.
-- operators, light: `->` then / leads-to. `=` is / defined-as. `/` or. `+`
-  and. use only where compression loses nothing; else prose.
-- need-to-know. cut the why unless it changes the action taken. NEVER name a
-  tool / path / failure mode the reader would not otherwise encounter.
-- CAPS = emphasis. rare — caps on every rule = caps on none.
-- imperative voice. "validate input" not "you should validate input".
-- format: prose = reasoning. tables / short bullets = structured data.
-  `path:line` = code.
-- one source of truth. state a constraint once, where it''s used; restate
-  only adjacent to a distant use.
-
-## Self-test
-
-- per line: could the reader comply and still fail? -> add the success
-  condition.
-- per line: delete it — does behavior change? no -> stays deleted.
-- per doc: anything explaining rather than directing? -> cut or convert.
-
-This skill obeys itself. Every edit to it passes the Self-test before write.',
-  0
-)
-ON CONFLICT(name) DO UPDATE SET
-  description=excluded.description, category=excluded.category,
-  command=excluded.command, common=excluded.common,
-  content=excluded.content, is_deleted=0;
-
-INSERT INTO skills (name, description, category, command, common, content, is_deleted) VALUES (
-  'blueprint',
-  'Turn a one-line objective into a sequenced construction plan — decompose into steps, find the dependency order, mark what can run in parallel, name the verification gate. Use before multi-step builds.',
-  'craft',
-  NULL,
-  0,
-  '# blueprint — objective → sequenced plan
-
-Catalogue skill (opt-in). Run before any build spanning more than a couple of
-steps. Output = the seven items below, in order.
-
-1. **Objective** — one sentence + done-condition (the observable check that
-   ends the build).
-2. **Prior decisions** — `sc mem get decisions` (active-decision index;
-   `sc mem get decisions <id>` = full row + rationale). A recorded decision
-   constrains the plan: honor it, or supersede it explicitly with
-   `sc mem decision "…" --parent <old_id>`. NEVER silently re-litigate a
-   settled decision.
-3. **Decompose** — concrete steps, each verifiable on its own.
-4. **Order** — dependency sequence (what must precede what); steps with no
-   dependency on each other -> mark **parallelizable**.
-5. **Per step** — the change + files/areas touched (ground in the real repo
-   via `surface_catalogue`, not memory) + its verification (test / run /
-   review).
-6. **Risks / unknowns** — list what could break the plan; spike the riskiest
-   unknown first, not last.
-7. **Gate** — adversarial pass before calling it done: each step''s
-   verification proves the done-condition, or the plan fails the gate.
-
-## Stance
-
-- Plan to the next solid checkpoint, not the whole universe — re-plan as
-  reality lands.
-- Sequence a thin slice that works end-to-end early, then deepen — never
-  build all the pieces and integrate last.
-- In super-coder, land the plan as a **spec** on the roadmap (`docs` skill):
-  feature row + `spec` document -> reviewable, freezes on ship.',
-  0
-)
-ON CONFLICT(name) DO UPDATE SET
-  description=excluded.description, category=excluded.category,
-  command=excluded.command, common=excluded.common,
-  content=excluded.content, is_deleted=0;
-
-INSERT INTO skills (name, description, category, command, common, content, is_deleted) VALUES (
   'bootstrap',
   'First-run orientation. Run ONCE when the boot doc shows "## FIRST RUN" (bootstrapped=0), BEFORE other work — read the repo map + your identity, set current_state, mark yourself oriented.',
   'substrate',
@@ -900,100 +415,6 @@ ON CONFLICT(name) DO UPDATE SET
   content=excluded.content, is_deleted=0;
 
 INSERT INTO skills (name, description, category, command, common, content, is_deleted) VALUES (
-  'configure_winbox',
-  'Provision the Windows Test VM — push the fork''s committed winget manifest to the guest via the vm-broker, install + verify what the MANIFEST says, then hand the operator the one-command snapshot bake (./sc vm-bake). Admin-only; runs before the snapshot, re-runs on any toolchain change.',
-  'substrate',
-  NULL,
-  0,
-  '# configure_winbox — provisioning the Windows Test VM
-
-Admin half of the Windows Test VM capability: install the build toolchain into
-the operator''s Windows VM, then get the **clean snapshot** — the one every
-`windows_devkit` run reverts to — re-baked on top of it. Sibling to
-`self_update` / `migration_management`: infrastructure work only the admin
-shell does. Grant is explicit, per-fork (`common=0`).
-
-## Scope boundary
-
-You do NOT create the VM, install the guest OS, or enable OpenSSH inside it —
-that bootstrap is the operator''s, host-side, once. Assume a reachable guest
-with key auth already working; provision the *toolchain* on top of it.
-
-## Execution plane = the broker — no ssh, no virsh
-
-The sandbox holds no SSH key, no `virsh`, no route to the VM. Every guest
-operation goes through the host-side **vm-broker** over its unix socket,
-exactly like `windows_devkit`. NEVER fall back to raw `ssh`/`virsh`.
-
-```bash
-SOCK="$(sc vm-broker-sock)"
-curl -s --unix-socket "$SOCK" http://vm/health                        # broker up?
-curl -s --unix-socket "$SOCK" http://vm/exec -d ''{"command":"ver"}''   # run in guest
-curl -s --unix-socket "$SOCK" http://vm/push -d ''{"src":"winget-manifest.json"}''
-```
-
-`/health` fails → broker down → ask the operator to run `./sc launch`
-(auto-starts the broker when a VM is linked) or `./sc vm-broker-up`.
-
-## Order is the design — provision BEFORE the snapshot
-
-```
-operator: OS + OpenSSH + key   →   YOU: manifest toolchain + verify (broker)   →   operator: ./sc vm-bake   →   devs run loop
-```
-
-Clean snapshot = pristine OS + toolchain; every test reverts to it. Provision
-*after* snapshotting → the first test hits an empty box. Toolchain bump →
-re-run this skill → re-bake — an unbaked bump is invisible, every test still
-reverts to the old box.
-
-## Procedure
-
-1. **Confirm the link + the plane.** `.super-coder/instance.json` `vm` block
-   names the domain, snapshot, transfer dir → `/health` returns ok →
-   `exec {"command":"ver"}` returns a Windows version string = broker → guest
-   proven end to end.
-
-2. **Push the fork''s committed manifest into the guest.** The fork commits a
-   `winget export` (e.g. `winget-manifest.json` at the repo root) — you supply
-   the mechanism, the fork supplies the package list. `push` stages it into
-   the transfer share the guest has mounted (a drive letter, e.g. `Z:`); then
-   install over `exec`:
-
-   ```
-   winget import --import-file Z:\winget-manifest.json --accept-package-agreements --accept-source-agreements
-   ```
-
-3. **Verify what the MANIFEST installs — not a remembered tool list.** Read
-   the committed manifest; probe each package it declares over `exec`
-   (`git --version`, `dotnet --version`, `pwsh -v`, `where.exe wix` —
-   whichever the manifest carries), each returning success. NEVER probe a
-   tool the manifest doesn''t install (fails a faithful import) and NEVER
-   install a tool the manifest doesn''t declare (breaks toolchain-as-code) —
-   a tool the fork needs but the manifest lacks = manifest PR, never an
-   ad-hoc install. The `windows_devkit` wizard''s `toolchain` probe must also
-   pass — check what it probes for this fork.
-
-4. **Hand the bake to the operator.** Redefining the snapshot is
-   host-authority only, deliberately not a broker verb (a sandbox that could
-   re-bake could persist tampering across every reset). All probes green →
-   ask the operator to run:
-
-   ```bash
-   ./sc vm-bake     # graceful shutdown → delete old snapshot → re-bake OFFLINE
-   ```
-
-   One command, idempotent, leaves the guest powered off. NEVER hand off a
-   bake before the probes are green — a snapshot of a half-installed box is a
-   clean snapshot of a broken kit. Confirm afterwards with the wizard''s
-   `snapshot` check or a `windows_devkit` reset round-trip.',
-  0
-)
-ON CONFLICT(name) DO UPDATE SET
-  description=excluded.description, category=excluded.category,
-  command=excluded.command, common=excluded.common,
-  content=excluded.content, is_deleted=0;
-
-INSERT INTO skills (name, description, category, command, common, content, is_deleted) VALUES (
   'curate',
   'The periodic L&S sweep. Run when the STATUS L&S line says "curation due" — resolve contradictions, merge entries stating one rule, recommend recurring processes upstream, move environment facts out, then stamp `sc mem curated`. Yours alone; never delegate it.',
   'substrate',
@@ -1085,8 +506,8 @@ retire it. If issue search or creation is unavailable, surface the failure to
 the FnB, keep the L&S, and create no local skill or asset.
 
 Deliberate fork-specific skill authoring is separate from curation and remains
-administrator-owned. The admin follows `local_skill_management`: authored
-asset → explicit seed → grant → snapshot → render.
+Planner-owned. The Planner follows `fork_skill_design`: draft → DB persist →
+grant → projection and snapshot receipts.
 
 ## Pass 4 — Category
 
@@ -1119,67 +540,6 @@ issues do not bypass the cap by deleting knowledge before its replacement ships.
 The trigger firing often does not mean the threshold is wrong; it means entries
 are being written faster than they are reconciled. Fix that at write time, with
 `--supersedes`.',
-  0
-)
-ON CONFLICT(name) DO UPDATE SET
-  description=excluded.description, category=excluded.category,
-  command=excluded.command, common=excluded.common,
-  content=excluded.content, is_deleted=0;
-
-INSERT INTO skills (name, description, category, command, common, content, is_deleted) VALUES (
-  'database-migrations',
-  'Database migration safety + how super-coder''s own migrations work (schema.sql baseline + ordered migrations/ deltas + ledger). Use when altering tables, adding columns, or running backfills — in the host repo''s DB or super-coder''s.',
-  'craft',
-  NULL,
-  0,
-  '# database-migrations — change schemas safely
-
-Catalogue skill (opt-in). Two halves: super-coder''s own migration model, and
-general safety for the host repo''s database.
-
-## super-coder''s model
-
-- `schema.sql` = current baseline (full schema). `migrations/*.sql` = ordered,
-  additive deltas applied on top; the `schema_migrations` ledger dedups so
-  each runs once. `rebuild` = schema -> migrations -> snapshot-load.
-- NEVER fold a migration back into `schema.sql` — it double-applies. Add a
-  new numbered migration instead. Exception: pre-fork (no downstream forks
-  yet), editing the baseline directly is acceptable; once forks exist, only
-  additive migrations propagate.
-- System content (e.g. the skill catalogue) = seeded by migration + re-seed;
-  per-instance content rides in the snapshot. See `db_map` / `snapshot`.
-
-## General safety (host repo DBs)
-
-- **Expand -> migrate -> contract**: add columns/tables before reading them;
-  deploy code that tolerates both shapes; remove the old shape only after
-  nothing uses it.
-- **Backfills**: batch large updates (no table-long lock); make them
-  resumable + idempotent; separate the schema change from the data change.
-- **New columns on a populated table**: nullable or defaulted — `NOT NULL`
-  with no default fails on existing rows.
-- **Reversibility**: know each migration''s rollback before applying it; a
-  destructive change (drop/rename) needs a deploy plan, not just a script.
-- **SQLite**: limited `ALTER` — changing a constraint = recreate-and-copy
-  (new table -> copy -> drop -> rename) with `foreign_keys` off during the
-  swap. Renames break FK references — check them.
-- **Postgres**: locks are the hazard, not `ALTER` limits. `CREATE INDEX
-  CONCURRENTLY` on populated tables (a plain CREATE INDEX takes a write
-  lock for the whole build; note CONCURRENTLY can''t run inside a
-  transaction). `ALTER TABLE … ADD COLUMN` with a volatile default rewrites
-  the table — add nullable, backfill in batches, then set the default.
-  `ALTER TYPE … ADD VALUE` (enums) is append-only and (pre-PG12) refuses to
-  run in a transaction with other work; removing/reordering values = new
-  type + column swap. Set `lock_timeout` before DDL so a blocked ALTER
-  fails fast instead of queueing behind (and ahead of) live traffic.
-- Dialect specifics beyond these belong to your fork''s own skills (e.g. a
-  `query_authoring_pg`-style companion) — this skill stays stack-neutral.
-
-## Stance
-
-Migrate forward in small, reversible steps. A schema change is a deploy
-event: migrated ≠ deployed — restart the consumer, then verify the running
-process, not just the DB.',
   0
 )
 ON CONFLICT(name) DO UPDATE SET
@@ -1753,6 +1113,84 @@ ON CONFLICT(name) DO UPDATE SET
   content=excluded.content, is_deleted=0;
 
 INSERT INTO skills (name, description, category, command, common, content, is_deleted) VALUES (
+  'engine_migrations',
+  'Maintain Subfloor''s schema baseline, ordered migration ledger, live-DB backup boundary, rebuild/update compatibility, and source-repository migration files. Admin-only by default.',
+  'substrate',
+  NULL,
+  0,
+  '# engine_migrations — maintain Subfloor''s database floor
+
+Subfloor owns `.super-coder/schema.sql` as the current baseline and
+`.super-coder/migrations/*.sql` as ordered additive deltas. The
+`schema_migrations` ledger applies each delta once. `sc rebuild` creates the
+baseline, applies every migration, then restores instance content; `sc update`
+materializes source and reconciles migrations before the next boot.
+
+## Author in the source repository
+
+Allocate migrations through the collision-safe source command:
+
+```bash
+./sc migration new <lowercase_snake_case_slug>
+```
+
+Pass = it reports the created next-numbered path and its source-removal
+allowlist entry. Keep historical migrations append-only and change `schema.sql`
+only when the current baseline itself must describe a new schema object. Never
+fold an already shipped delta into the baseline in a way that makes rebuild
+apply it twice.
+
+`0001_seed_skills.sql` is the generated exception: update authoritative global
+skill assets, run `./sc seed-skills`, and commit the regenerated 0001 body with
+the trailing reconciliation migration. Do not hand-edit 0001 or regenerate it
+for fork-local skills.
+
+For seeded system content, update the authoritative asset or generator and add
+a trailing reconciliation migration. Preserve per-instance rows carried by the
+snapshot. Pass = fresh build, in-place migration, and rebuild from an older
+snapshot converge to the same state.
+
+## Protect the live cache
+
+The live engine DB is `.super-coder/shell_db.db` in the main checkout, not a
+Developer worktree. Before an authorized live migration, resolve that exact
+path independently from the ACTIVE SESSION `floor: live_engine_checkout`, then
+use the supported backup-and-apply surface:
+
+```bash
+./sc migrate
+```
+
+Require its first line, `migrate: db         <absolute-path>`, to match the
+independently resolved live DB exactly. The command then reports the migration
+source, creates a WAL-safe backup with a `premigrate` restore point for an
+existing DB, and reports each applied filename plus the final count (or
+`nothing pending`). Pass = the backup receipt names its restore path before the
+first migration applies. A DB-path mismatch stops the operation. The FnB owns
+the restart and cutover boundary. Never point engine work at `$DATABASE_URL`;
+that variable is for the fork application''s database.
+
+## Verify compatibility
+
+Run the migration on a dirty fixture containing the stale rows it must
+reconcile, then run it again. Require:
+
+- one application recorded in `schema_migrations`;
+- identical desired state after repeated migration and rebuild;
+- preserved shell memory and genuine fork-local content;
+- no stale grant, projection, or system row restored by an older snapshot; and
+- the running engine healthy after the authorized restart.
+
+Stop before live application when the backup, exact DB path, compatibility
+fixture, or FnB maintenance authority is absent.',
+  0
+)
+ON CONFLICT(name) DO UPDATE SET
+  description=excluded.description, category=excluded.category,
+  command=excluded.command, common=excluded.common,
+  content=excluded.content, is_deleted=0;
+
+INSERT INTO skills (name, description, category, command, common, content, is_deleted) VALUES (
   'flag_sweep',
   'Planner-owned periodic or on-demand delivery reconciliation — auto-close flags whose gating work is provably done, open missing ship/docs handoffs, and surface judgment calls to the FnB. Use for a requested sweep or when delivery state needs reconciliation.',
   'substrate',
@@ -2046,6 +1484,98 @@ ON CONFLICT(name) DO UPDATE SET
   content=excluded.content, is_deleted=0;
 
 INSERT INTO skills (name, description, category, command, common, content, is_deleted) VALUES (
+  'fork_skill_design',
+  'Design and maintain DB-canonical fork-local skills that describe the fork''s real systems, tools, testing seats, and core processes. Planner-only; use when a capability needs durable shell guidance without becoming global doctrine.',
+  'substrate',
+  NULL,
+  0,
+  '# fork_skill_design — describe fork capabilities
+
+Use a fork-local skill when shells need durable knowledge specific to this
+repository, stack, host, VM, deployment surface, database, or core fork
+process. Keep global skills limited to Subfloor itself, supplied tools and
+testing environments, and core Subfloor processes.
+
+## Discover the real capability
+
+Read the repo map, tracked configuration, declared dev-kit hooks, and current
+readiness evidence before drafting. Identify:
+
+- the capability and the shells that need it;
+- its tracked declaration or owning source;
+- the seat, host, VM, service, or database it reaches;
+- readiness states and evidence locations;
+- authority, recovery, and data-tenancy boundaries; and
+- one observable success receipt.
+
+Pass = every operational claim names evidence available in this fork. Do not
+infer package managers, test policy, credentials, hosts, or deployment steps.
+
+## Apply the purpose test
+
+Keep a line only when it explains this fork, a supplied tool or testing
+environment, or a core fork process. Use an imperative only when variation
+would break shared state, authority, compatibility, or recovery. Remove generic
+planning, coding, API, test, database, deployment, VM, and troubleshooting
+method.
+
+## Draft and persist
+
+Write a Planner-owned draft with a lowercase underscore name and
+`common: false`:
+
+```yaml
+---
+name: repo_capability
+description: State the capability and when it fires.
+category: substrate
+common: false
+---
+```
+
+Describe locations, commands, states, boundaries, and receipts. A testing-seat
+skill identifies the runner, fixtures, reach, readiness, and evidence; it does
+not choose assertions. A VM or host skill identifies the supplied control
+surface and reset boundary; it does not invent a lifecycle. A deployment or
+database skill records the fork''s tracked procedure and authority; it does not
+teach generic deployment or SQL technique.
+
+Persist and grant through the supported DB-canonical surface:
+
+```bash
+sc skill put --file <path/to/SKILL.md>
+sc skill grant <skill_name> <shell>...
+sc skill list
+```
+
+`put` succeeds only after DB, local snapshot, flat catalogue, and managed skill
+projections reconcile. Naming a standard shell changes its shared flavor pack;
+naming a Bespoke shell changes only that shell. Creation grants nothing.
+
+## Update, retire, and recover
+
+```bash
+sc skill put --file <path/to/SKILL.md>
+sc skill revoke <skill_name> <shell>...
+sc skill rm <skill_name>
+```
+
+Retry the exact command after fixing a reported snapshot, render, or projection
+path. Pass = the full persistence receipt returns and the projected body
+matches `sc skill list` plus the intended grant. `rm` is only for fork-local
+names; retire an upstream skill with `sc skill retire <name>` and restore it
+with `sc skill unretire <name>`.
+
+Never place a fork-local body under `.super-coder/assets/skills/`, regenerate
+the engine seed for it, set it common, or write the engine DB directly.',
+  0
+)
+ON CONFLICT(name) DO UPDATE SET
+  description=excluded.description, category=excluded.category,
+  command=excluded.command, common=excluded.common,
+  content=excluded.content, is_deleted=0;
+
+INSERT INTO skills (name, description, category, command, common, content, is_deleted) VALUES (
   'git',
   'Git conventions for a super-coder shell — one repo, one cwd. Sync the base before work, branch before committing, open PRs (never merge without the FnB''s OK), attribute commits per-shell. Use before any git work.',
   'substrate',
@@ -2274,6 +1804,63 @@ ON CONFLICT(name) DO UPDATE SET
   content=excluded.content, is_deleted=0;
 
 INSERT INTO skills (name, description, category, command, common, content, is_deleted) VALUES (
+  'harness_readiness',
+  'Read Subfloor harness/model support states, refresh the supplied local evidence, run bounded compatibility checks, and prepare an exact upstream handoff when the installed runtime is unqualified. Developer-only.',
+  'substrate',
+  NULL,
+  0,
+  '# harness_readiness — qualify the installed route
+
+Subfloor reports maintained harness support as `tested`, `best-effort`, or
+`newer-unverified`. These states describe source evidence; they do not hide a
+locally discovered model or silently substitute another route.
+
+## Read the supplied evidence
+
+```bash
+sc harness-status
+sc models refresh
+sc models list <harness>
+sc models resolve <harness> <selector> [--effort <level>] --json
+```
+
+Record the complete version line, active host/container seat, exact selector,
+effort, evidence source, digest/fingerprint, and resolve result. Pass = list and
+resolve agree on the same fresh local route. A public model absent from local
+evidence remains unavailable for that account; an unsupported effort fails
+before dispatch.
+
+## Use the smallest available compatibility check
+
+When the FnB authorizes a provider call or harness refresh, exercise the exact
+installed model/effort through the fork''s declared hook or the adapter''s native
+one-shot surface. Pass = one request uses the requested route, returns parseable
+events and session identity, and performs no fallback or changed-effort retry.
+
+`sc update-harnesses`, sandbox rebuild, provider-token use, and session restart
+remain operator-authorized boundaries. A host result does not prove the
+container seat, and a passing newer build does not promote the maintained
+source baseline.
+
+## Hand source maintenance upstream
+
+Use `issue_reporting` when the installed version or adapter contract remains
+unqualified. Include the complete version line, seat and engine commit,
+selector/effort, status/list/resolve outputs, sanitized native-check result,
+expected versus actual behavior, and the narrow failing boundary.
+
+Tracking forks do not edit materialized `.super-coder/` metadata or adapters.
+Pass after a published fix = the exact build reports `tested`, simulated newer
+builds remain `best-effort`, and the local route still resolves from fresh
+evidence after the authorized update/restart.',
+  0
+)
+ON CONFLICT(name) DO UPDATE SET
+  description=excluded.description, category=excluded.category,
+  command=excluded.command, common=excluded.common,
+  content=excluded.content, is_deleted=0;
+
+INSERT INTO skills (name, description, category, command, common, content, is_deleted) VALUES (
   'issue_reporting',
   'Report engine defects upstream — the moment a sc command fails or lies, a skill contradicts your reality, the API blocks a documented workflow, or you work around the engine to proceed. File a GitHub issue on super-coder; your repo''s app bugs stay in the fork.',
   'substrate',
@@ -2293,7 +1880,7 @@ or hand-patching state to proceed -> you hold the exact repro; file it now.
 | Where | What |
 |---|---|
 | **Upstream — file it** | anything the engine materializes/owns: `.super-coder/`, `sc` + every subcommand, engine skills (this catalogue), the boot doc render, the sandbox / dev kit, `sc update` + migrations, the `_sc` API + `sc mem` |
-| **Fork — don''t** | the repo''s app code, fork-local skills (see `local_skill_management`), operator-owned host config |
+| **Fork — don''t** | the repo''s app code, DB-canonical fork-local skills, operator-owned host config |
 
 Unsure -> "would the same problem hit any other fork?" yes = upstream.
 
@@ -2307,7 +1894,7 @@ Match the left column -> file.
 | A `sc` command fails out of the box | `sc verify` always aborted — its own render step needed `SC_ADMIN` it never set (#227) |
 | A command exits green without doing the work | `sc test` silently fell back to unittest when pytest was missing — green-washed suites (#219) |
 | The documented remedy is a closed loop | `sc lint` said "run `sc deps` first," but deps skips pip in the sandbox — tool unobtainable from inside the box (#246) |
-| A skill instructs tools/paths your seat doesn''t have | `configure_winbox` drove raw `ssh`/`virsh` — neither exists in the broker-only sandbox (#248) |
+| A skill instructs tools/paths your seat doesn''t have | a sandbox skill drove raw host-only `ssh`/`virsh` paths (#248) |
 | A skill contradicts what the engine actually does | skills still taught raw `sqlite3` against the substrate DB after memory went API-only (#226) |
 | The API refuses what the skills document | `sc mem doc add` 400''d standalone docs the docs + onboard skills both document (#245) |
 | A permission wall mid-workflow | a dev shell could read a planner-owned feature but 404''d advancing its status (#224) |
@@ -2382,7 +1969,7 @@ This route recommends; it never creates or promotes a skill. Keep one compressed
 L&S entry until a reviewed upstream skill ships and is granted. If issue search
 or creation is unavailable, surface the failure to the FnB, keep the L&S, and
 create no local skill or asset. Deliberate fork-specific authoring remains the
-administrator-owned workflow in `local_skill_management`.
+Planner-owned workflow in `fork_skill_design`.
 
 ## Rules
 
@@ -2392,106 +1979,6 @@ administrator-owned workflow in `local_skill_management`.
   recommendation route above.
 - Filing ≠ unblocked: defect blocks work -> also open a fork flag linking the
   issue URL.',
-  0
-)
-ON CONFLICT(name) DO UPDATE SET
-  description=excluded.description, category=excluded.category,
-  command=excluded.command, common=excluded.common,
-  content=excluded.content, is_deleted=0;
-
-INSERT INTO skills (name, description, category, command, common, content, is_deleted) VALUES (
-  'local_skill_management',
-  'Create, update, assign, and remove DB-canonical fork-local skills through the supported CLI. Use for fork AI-team capabilities that must survive snapshot/rebuild without engine asset edits or Admin intervention.',
-  'substrate',
-  NULL,
-  0,
-  '# local_skill_management — manage fork-local skills through the DB
-
-Fork-local skills are canonical in the live engine DB and persist in the local
-snapshot. Keep the input `SKILL.md` only as an authoring draft; never copy it
-under `.super-coder/assets/skills/` or edit the engine seed.
-
-## Create or update
-
-1. Write a draft `SKILL.md` in a Planner-owned path. Use flat frontmatter:
-
-   ```yaml
-   ---
-   name: repo_skill
-   description: State what the skill does and when it fires.
-   category: substrate
-   common: false
-   ---
-
-   # Procedure
-
-   Give instructions with observable success conditions.
-   ```
-
-   Use a lowercase underscore name. Keep `common: false`: fork-local grants are
-   always explicit. Apply `authoring_syntax` to the description and body.
-
-2. Commit the draft to the catalogue:
-
-   ```bash
-   sc skill put --file <path/to/SKILL.md>
-   ```
-
-   Success prints `DB + snapshot + flat render + skill projections reconciled`.
-   The command requires the launched shell identity to resolve as Planner,
-   creates or updates the DB row, preserves every existing grant, and creates
-   no managed asset copy. An engine-owned name refuses before any write and
-   points to the upstream engine-skill workflow.
-
-3. Grant a new skill explicitly:
-
-   ```bash
-   sc skill grant <skill_name> <shell>...
-   ```
-
-   Naming a standard shell updates its shared flavor pack. Naming a Bespoke
-   shell updates that shell only. Success includes the same persistence receipt.
-   Creation alone grants nothing.
-
-## Change assignments
-
-```bash
-sc skill grant <skill_name> <shell>...
-sc skill revoke <skill_name> <shell>...
-sc skill list
-```
-
-Unknown skills and shells fail loudly. Every successful grant or revoke writes
-the DB, local snapshot, flat catalogue render, and affected harness projections;
-do not run `SC_ADMIN=1`, `sc snapshot`, or `sc render` afterward.
-
-## Remove
-
-```bash
-sc skill rm <skill_name>
-```
-
-Local removal soft-deletes the catalogue row, revokes its flavor and Bespoke
-grants, persists every layer, and removes managed projections. Re-running the
-same removal is safe and reconciles a prior partial persistence failure.
-
-Engine skills refuse `rm`. Use `sc skill retire <name>` only when the fork must
-retire an engine-owned skill; use `sc skill unretire <name>` to restore it.
-
-## Recover a partial persistence failure
-
-A failed command names each committed and uncommitted layer. Fix the reported
-snapshot, render, or projection path, then retry the exact same `sc skill`
-command. Stop only when it prints the full persistence receipt; a DB-only
-commit is live but not yet rebuild-durable.
-
-## Boundaries
-
-- Never edit `.super-coder/assets/skills/` for a fork-local skill.
-- Never run `sc seed-skills` for a fork-local skill.
-- Never use `SC_ADMIN=1`, `sc sql-rw`, or an Admin handoff for this lifecycle.
-- Never set a fork-local skill `common: true`; use explicit grants.
-- Change engine-owned skill bodies only through the upstream engine workflow.',
   0
 )
 ON CONFLICT(name) DO UPDATE SET
@@ -2609,15 +2096,31 @@ ON CONFLICT(name) DO UPDATE SET
 
 INSERT INTO skills (name, description, category, command, common, content, is_deleted) VALUES (
   'messaging',
-  'Shell-to-shell inbox — send a markdown message to another shell (typed: shell/task/result), check your unread inbox, verify delivery via the sent view, mark messages read. Driven by `sc mem message`. Use to coordinate with another shell; the recipient sees it on its next boot via the STATUS Inbox count.',
+  'Shell-to-shell messaging — ordinary `sc mem message` inbox mail by default, with wake delivery only when explicitly instructed. Use to send, check, verify, or mark ordinary messages and to follow a named wake-producing workflow.',
   'substrate',
   'sc mem message',
   1,
-  '# messaging — the shell inbox
+  '# messaging — ordinary inbox + explicit wakes
 
-Shell-to-shell markdown messages, driven by `sc mem message`. Sender = you;
-recipient addressed by `shortname`. Body = markdown, preserved verbatim.
-Recipient discovers it on its next boot via the `## STATUS` `Inbox:` count.
+Choose delivery before sending:
+
+| Mode | Use when | Surface |
+|---|---|---|
+| Normal message | Default for every shell-to-shell message. | `sc mem message` |
+| Wake message | The operator or a loaded workflow explicitly instructs a wake. | The exact wake-producing command named by that instruction/workflow. |
+
+Urgency, message kind, or a desire for a prompt response does not authorize a
+wake. An explicit wake instruction with no supported command -> surface the
+missing capability and stop. NEVER write the engine DB directly, call internal
+Python, or send both modes unless the instruction requires both.
+
+## Normal messages — the shell inbox
+
+Normal messages are shell-to-shell markdown driven by `sc mem message`.
+Sender = you; recipient addressed by `shortname`; body preserved verbatim.
+The recipient discovers the message on its next boot via the `## STATUS`
+`Inbox:` count. `sc mem message send` always sends this normal mode; it never
+wakes or rotates a chat.
 
 Trigger: `--message`
 Args: `check [N] | send <to-shortname> <body> [--kind k] | sent | mark-read <id>`
@@ -2681,6 +2184,27 @@ sc mem message mark-read <message_id>
 Pass the `message_id` that `check` surfaced. Only messages addressed to you
 clear — another shell''s message = no-op; re-marking a read message = no-op.
 
+## Wake messages — active chat delivery
+
+A wake message creates durable delivery intent for the recipient''s active
+chat. Pending wakes coalesce per receiver; one wake turn drains every
+undelivered wake message for that shell. A wake does not enter the normal
+`sc mem message` inbox or `sent` view.
+
+Use only the wake type selected by the instruction/workflow:
+
+| Recipient state | Delivery result |
+|---|---|
+| Verified live turn | Re-enter at the turn''s natural boundary. |
+| Idle registered chat | Any coalesced New rotates; all Re-enter resumes. |
+| No registered chat | Create a chat and deliver as New. |
+
+Engine-wide wakes need no Sprint. Sprint-scoped wakes deliver only while that
+Sprint is armed; a producer may create delivery intent earlier and leave it
+queued. Typed Sprint commands and engine producers return their durable
+message/wake receipt. Receipt present = complete; do not add a normal-message
+duplicate.
+
 ## Stance
 
 - On boot, `Inbox:` non-zero -> run `--message check` and surface the first
@@ -2688,101 +2212,6 @@ clear — another shell''s message = no-op; re-marking a read message = no-op.
 - No threading: a reply = a new `send`; include `Re: <topic>` in the body if
   it matters.
 - `mark-read` only after you have actually acted on the message.',
-  0
-)
-ON CONFLICT(name) DO UPDATE SET
-  description=excluded.description, category=excluded.category,
-  command=excluded.command, common=excluded.common,
-  content=excluded.content, is_deleted=0;
-
-INSERT INTO skills (name, description, category, command, common, content, is_deleted) VALUES (
-  'migration_management',
-  'Author and apply fork-specific DB schema migrations — naming, format, how to apply locally and verify.',
-  'substrate',
-  NULL,
-  0,
-  '# migration_management — fork-specific schema changes
-
-Migrations live in `.super-coder/migrations/`, apply in numeric order, tracked
-by the `schema_migrations` ledger table. Engine updates apply pending
-migrations automatically; apply local pending migrations with `./sc migrate`.
-
-**Scope:** fork-specific changes — tables, columns, constraints, or
-system-content seeds (skills, flavor defaults) this fork needs that will not
-ship upstream. Upstream engine migrations arrive via `sc update`; no action
-from you.
-
-## Authoring a migration
-
-1. **Create it through the guardrail:**
-   ```bash
-   ./sc migration new <slug>
-   ```
-   Use a lowercase `snake_case` slug. The command refuses unexpected duplicate
-   number prefixes, allocates the next free zero-padded number, writes the
-   standard transaction/idempotence skeleton, and (in the subfloor source
-   repo) updates the source removal-test allowlist in the same act. The
-   exact historical `0155` pair is frozen and explicitly allowed; never
-   renumber an applied migration.
-
-2. **Fill in the generated file** at
-   `.super-coder/migrations/NNNN_<slug>.sql`:
-   - Wrap in `BEGIN; ... COMMIT;`
-   - Idempotent: `CREATE TABLE IF NOT EXISTS`, `INSERT OR IGNORE`,
-     `CREATE INDEX IF NOT EXISTS`, `DROP TABLE IF EXISTS` before recreate
-   - Comment header: migration number + intent (+ doctrine notes if relevant)
-   - Structure + system content only — per-instance data (shell memory,
-     grants, roadmap, flags) lives in `.sc-state/local/content.sql` via snapshot,
-     never in migrations
-
-3. **Apply locally:**
-   ```bash
-   ./sc migrate
-   ```
-   This takes a WAL-safe `premigrate` backup before opening the migration
-   chain and keeps the newest 5 backups in that lifecycle class. `./sc update`
-   retains its separate `preupdate` backup and does not double-back up during
-   the same update run. Both paths apply pending migrations in order.
-   Confirm it landed:
-   ```sql
-   SELECT * FROM schema_migrations ORDER BY applied_at DESC LIMIT 5;
-   ```
-
-4. **Verify:**
-   ```bash
-   ./sc verify
-   ```
-   Headless boot proof — shells, memory, and schema intact.
-
-5. **Snapshot + commit:**
-   ```bash
-   SC_ADMIN=1 sc snapshot
-   ```
-   Commit the migration and any authoritative source asset it carries; the
-   snapshot remains local.
-   - **Engine skill seed:** edit `assets/skills/<name>/SKILL.md`, run
-     `./sc seed-skills` to regenerate `0001_seed_skills.sql`, and put the same
-     full-body UPSERT in the new trailing migration so existing installations
-     converge. Then run `./sc render-check`: its hermetic rebuild proves the
-     ignored local `skills_sc/` mirror, which is verification output rather
-     than a tracked artifact.
-
-## What makes a good migration
-
-- **Additive by default.** Add columns/tables/indexes. No DROP or RENAME
-  unless correcting a prior mistake; prefer a new column over renaming one
-  code may reference.
-- **No per-instance content.** Shell memory, skill grants, roadmap items,
-  flags -> snapshot. Migrations carry structure + system content that
-  propagates to all forks.
-- **Comment the why** — future readers need the intent, not just the SQL.
-
-## Rollback
-
-No per-migration rollback. `sc rollback` restores the full DB + engine to the
-prior update point (`engine.ref.prev`). Use only when a migration is so broken
-the DB is corrupt or the app won''t start; for logical errors, write a
-corrective migration instead.',
   0
 )
 ON CONFLICT(name) DO UPDATE SET
@@ -2854,220 +2283,6 @@ collide. Offer the FnB:
 ## Stance
 Ingest once. After onboarding: author via the shell/GUI, render DB→flat. NEVER
 edit the flat files or re-import them.',
-  0
-)
-ON CONFLICT(name) DO UPDATE SET
-  description=excluded.description, category=excluded.category,
-  command=excluded.command, common=excluded.common,
-  content=excluded.content, is_deleted=0;
-
-INSERT INTO skills (name, description, category, command, common, content, is_deleted) VALUES (
-  'pm2',
-  'Observe + manage the host''s pm2-supervised app stack through the host-side pm2-broker — status, app health, log tails, and scoped restarts, holding no host access yourself. The admin shell''s deploy-confirmation companion. Use when verifying a deploy, checking the live app, or bouncing a declared process.',
-  'substrate',
-  NULL,
-  0,
-  '# pm2 — driving the host process stack
-
-Observe + manage the host''s pm2-supervised app from the sandbox: process
-status, app health, log tails, scoped restarts. Opt-in + link-only
-(`common=0`; **admin** + **devops** flavors): the operator brings a host whose
-app is already pm2-managed; you drive a scoped loop against it.
-
-## Every verb goes through the host-side pm2-broker
-
-The sandbox has no `pm2` binary and no route to the host''s 127.0.0.1-bound
-ports — NEVER shell out to pm2 or curl a host port directly (even read-only
-`curl host:8000/health` has no route). Call the broker over its unix socket in
-the bind-mounted repo; the broker runs pm2 and curls the app''s local port
-host-side. Detail: `.super-coder/docs/pm2-broker.md`.
-
-```bash
-SOCK="$(sc pm2-broker-sock)"
-curl -s --unix-socket "$SOCK" http://pm2/health      # liveness check first
-```
-
-"not reachable" = broker down -> ask the operator to run `sc pm2-broker-up` on
-the host. You cannot start it yourself (host-side process).
-
-## Precondition — `pm2` block in `.super-coder/instance.json`
-
-```json
-"pm2": { "processes": ["myapp-api", "myapp-ui"],
-         "health_url": "http://127.0.0.1:8000/health",
-         "allow_lifecycle": false }
-```
-
-- No `pm2` block = no stack linked -> stop; ask the operator to set it
-  (hand-edit, or `PUT /api/pm2`).
-- `processes` = fail-closed allow-list: every verb (even `status`) works only
-  against names listed there; empty/absent list denies all. You see what the
-  fork declared, never the host''s full process table.
-- The block carries no secret material — pm2 + the app stay host-side.
-
-## Verbs
-
-| Verb | Call |
-|---|---|
-| **status** | `curl -s --unix-socket "$SOCK" http://pm2/status` -> `{processes: [{name, status, pid, uptime_s, restarts, cpu, memory}], missing: []}` |
-| **app-health** | `curl -s --unix-socket "$SOCK" http://pm2/app-health` -> `{ok, code, body}` — broker curls `health_url` host-side |
-| **logs** | `curl -s --unix-socket "$SOCK" http://pm2/logs -d ''{"proc":"myapp-api","lines":100}''` -> `{out, err}` tails (capped at 1000) |
-| **restart** | `curl -s --unix-socket "$SOCK" http://pm2/restart -d ''{"proc":"myapp-api"}''` -> `{ok, exit, stdout, stderr}` |
-| **stop / start** | same shape as restart — refused unless `"allow_lifecycle": true` |
-
-`restart` = the deploy verb (bounce a process so it loads what `make deploy`
-put on disk); it rides the allowlist alone. `stop`/`start` can leave the app
-down -> they need the extra `allow_lifecycle` opt-in.
-
-## Deploy confirmation — the loop this exists for
-
-A host-run `make deploy` is invisible from the sandbox; this loop makes the
-live-app half of a deploy audit verifiable:
-
-1. `status` -> every declared process `online`, restart counts sane.
-2. `restart` the affected process(es) if the deploy didn''t already.
-3. `status` again -> uptime reset + still `online` + restarts didn''t spiral.
-4. `app-health` -> `ok` on the health URL.
-5. `logs` -> no fresh stack traces in `err`.
-
-## Rules
-
-- Drive, don''t hold: no pm2 binary, no host shell, no route to host ports —
-  link-only stays link-only.
-- Keep `processes` to what the fork actually manages (it is the blast
-  radius); widen deliberately, not by default.
-- Think you need stop/start -> state why to the operator; `allow_lifecycle`
-  is their call, not yours.
-- A deploy is confirmed only by `status: online` + `app-health` green
-  TOGETHER — either alone can lie (a crash-looper reports online between
-  crashes; a stale process can serve health).
-- Lanes: fork infra + deploys = yours (admin/devops); app features = dev''s;
-  the super-coder engine = admin''s via `self_update`.',
-  0
-)
-ON CONFLICT(name) DO UPDATE SET
-  description=excluded.description, category=excluded.category,
-  command=excluded.command, common=excluded.common,
-  content=excluded.content, is_deleted=0;
-
-INSERT INTO skills (name, description, category, command, common, content, is_deleted) VALUES (
-  'query_authoring_pg',
-  'Compose + run SQL against a Postgres-backed fork''s app DB — psql mechanics, psql variables vs driver :params, SQLite→Postgres dialect traps, read-only diagnostics, paste-ready handoff when the DB is outside the sandbox. Use when diagnosing app data issues or verifying data by query.',
-  'craft',
-  NULL,
-  0,
-  '# query_authoring_pg — diagnostic SQL against the app''s Postgres
-
-The PG feature provides the Postgres sidecar through `dev_kit` and this
-diagnostic-SQL procedure. Test fixtures and database setup remain owned by the
-downstream repository. Use this skill when diagnosing data issues, verifying a
-migration''s effect, or checking an invariant by query.
-
-## Know which DB you''re pointed at
-
-| DB | Where | What its data proves |
-|---|---|---|
-| Sandbox sidecar (`$DATABASE_URL`) | inside your container | your dev/test copy — only what you or the tests put there. Empty/missing rows here prove NOTHING about the FnB''s data. |
-| The FnB''s stack DB (dev/prod) | on the host, outside your container | the data actually being diagnosed — reachable only by handoff (below) |
-
-Name the DB in every finding. An FnB-reported data issue lives in THEIR DB —
-never confirm or refute it against your sidecar. Reproduce the shape locally
-if useful; the verdict query runs on their side.
-
-## psql mechanics
-
-SQL is not a shell command — `SELECT …` pasted at a fish/bash prompt dies at
-the shell. Run it through psql:
-
-```bash
-psql "$DATABASE_URL" -X -P pager=off -c "SELECT count(*) FROM users;"   # one-shot
-psql "$DATABASE_URL" -X -v ON_ERROR_STOP=1 -f diag.sql                  # scripted
-```
-
-- `-X` skips any psqlrc; `-P pager=off` keeps output capture-friendly.
-- `\x auto` (in-session) for wide rows.
-- Schema truth = `\dt` + `\d <table>` — check a column''s actual type before
-  writing predicates against it; never guess from habit.
-
-## Parameters — `:name` is driver syntax
-
-`:c`-style placeholders bind in psycopg/SQLAlchemy, NOT in psql. Either
-substitute literals before running, or use psql variables:
-
-```bash
-psql "$DATABASE_URL" -X -v c=42 -v who=alice -f diag.sql
-```
-```sql
-WHERE contact_id = :c AND username = :''who''
--- :var → raw substitution · :''var'' → quoted literal · :"var" → identifier
-```
-
-NEVER hand anyone a query with unbound `:params` and no `-v` line to run it
-with — it fails at their prompt, not yours.
-
-## Dialect traps (SQLite habits)
-
-Engine DB = SQLite; app DB = Postgres. Habits that break:
-
-| SQLite habit | Postgres |
-|---|---|
-| `flag = 0` / `flag = 1` | on a `boolean` column that''s a type error — use `NOT flag` / `flag`. A schema ported from SQLite may still use integers: `\d` decides. |
-| `INSERT OR IGNORE` | `INSERT … ON CONFLICT DO NOTHING` |
-| `datetime(''now'')` | `now()` |
-| `strftime(…)` / date math | `to_char(…)`, `date_trunc(…)`, `now() - interval ''7 days''` |
-| `"double-quoted"` strings | double quotes mean **identifiers**; string literals are `''single-quoted''` only |
-| `LIKE` (case-insensitive for ASCII) | `LIKE` is case-sensitive — use `ILIKE` |
-| `GROUP_CONCAT(x)` | `string_agg(x, '','')` |
-| `rowid` | doesn''t exist — use the primary key |
-
-## Diagnostic shape
-
-- Read-only, ALWAYS. Diagnostics never mutate — a fix goes through the app
-  or a migration, never a hand-run UPDATE. Scripted files open with
-  `BEGIN; SET TRANSACTION READ ONLY;` and end with `ROLLBACK;`.
-- One row, many answers — pack independent checks into
-  `SELECT EXISTS(…) AS <check_name>` columns so a single row answers the
-  whole question.
-- `\echo ''=== section ===''` between probes; one comment per section saying
-  how to read its result.
-- `LIMIT` every exploratory SELECT; never dump whole tables into a report.
-
-## Handoff — DB outside your sandbox
-
-1. Write `<topic>_diag.sql` to the fork''s shared scratch dir,
-   self-documenting to the skeleton below.
-2. Give the operator ONE paste-ready line for their shell, resolving the DSN
-   from wherever the fork keeps it (env file, secret store):
-
-```bash
-# bash/zsh
-psql "$(grep -m1 ''^DATABASE_URL='' <env-file> | cut -d= -f2-)" -X -f <abs-path>.sql
-# fish — no quotes around the substitution
-psql (grep -m1 ''^DATABASE_URL='' <env-file> | cut -d= -f2-) -X -f <abs-path>.sql
-```
-
-3. In your message: how to read each section''s output + what each outcome
-   implies next.
-
-Skeleton:
-
-```sql
--- orphaned-orders diagnostic · 2026-07-06
--- run: psql "$DATABASE_URL" -X -v ON_ERROR_STOP=1 -v u=42 -f orders_diag.sql
-BEGIN; SET TRANSACTION READ ONLY;
-
-\echo === A. user :u — exists / active? ===
-SELECT EXISTS (SELECT 1 FROM users WHERE user_id = :u)                    AS user_exists,
-       EXISTS (SELECT 1 FROM users WHERE user_id = :u AND NOT is_deleted) AS user_active;
--- user_exists=f → wrong id; user_active=f → soft-deleted, explains missing rows.
-
-\echo === B. orders with no owning user (expect zero rows) ===
-SELECT o.order_id FROM orders o LEFT JOIN users u USING (user_id)
-WHERE u.user_id IS NULL LIMIT 20;
--- any rows → the delete path leaks orders; note the ids.
-
-ROLLBACK;
-```',
   0
 )
 ON CONFLICT(name) DO UPDATE SET
@@ -3165,13 +2380,8 @@ sc mem get shells
 
 ## Step 2: Review along the three axes
 
-**Agents overlay:** this shell granted `agents` + FnB invoked `--agents` ->
-that skill''s overlay fans this step out to an adversarial finding-panel.
-Load it and apply it on top of this step. Steps 1, 3, and 4 stay yours,
-unchanged.
-
-Apply every axis on every review, plus the granted *lenses* matching what
-the diff touches:
+Apply every axis on every review, plus any granted fork-local capability skill
+matching what the diff touches:
 
 1. **Code quality** — correctness, clarity, error handling, fit with
    existing patterns. Trace the actual code path; NEVER trust the
@@ -3186,14 +2396,10 @@ the diff touches:
 
 | Diff touches | Lens |
 |---|---|
-| an API / endpoint / route | `api-design` → *Review lens* |
-| `tests/` | `test_authoring` → *Review lens* |
-| schema / migration | `database-migrations` |
 | a redline / UI change | `redline_review` |
 
-A granted skill that declares it supersedes a lens (says so in its
-description — e.g. a fork-local testing skill superseding `test_authoring`)
--> use the superseding skill: it carries the fork''s actual standard.
+A matching fork-local skill carries the fork''s actual environment, tools, and
+process boundary; the three axes above remain the review contract.
 
 ## Step 3: Open a flag per failure — record, don''t send yet
 
@@ -3424,9 +2630,10 @@ publication path.
 This skill owns the render/snapshot pipeline + the `render-check` guard:
 
 - `self_update` — `sc update` refreshes the same local `_sc` files.
-- `local_skill_management` — fork-local skills persist via the local snapshot.
-- `migration_management` — a **content-seed** migration (skills, flavor
-  defaults) changes what renders; rebuild + render + `render-check` after.
+- `fork_skill_design` — DB-canonical fork-local skills persist via the local
+  snapshot.
+- `engine_migrations` — a **content-seed** migration (skills, flavor defaults)
+  changes what renders; rebuild + render + `render-check` after.
 - `docs` / `spec` — document bodies live in the DB, render to `docs_sc/` /
   `specs_sc/`; authored via `sc mem doc`, serialized here.',
   0
@@ -3444,9 +2651,9 @@ INSERT INTO skills (name, description, category, command, common, content, is_de
   0,
   '# spec — analyze and execute a spec
 
-Load before implementing any feature/spec/roadmap item. A governing spec is
-missing -> use `docs` to author it first. Analyze before code; unresolved
-ambiguity goes to FnB, while hard blockers get flags. `<self>` = your shell id.
+Load before any feature/spec/roadmap build. Missing spec -> author via `docs`.
+Analyze before code; ask FnB on ambiguity, flag hard blockers. `<self>` = your
+shell id.
 
 ## 1. Select the spec
 
@@ -3459,10 +2666,9 @@ sc mem get documents --doc <doc_id>
 sc mem get tasks --doc <doc_id>
 ```
 
-The feature list includes `kind`, `seq`, `frozen`, and `task_count`. Resume the
-one unfrozen spec with tasks. An unfrozen zero-task spec is backlog; engaging it
-creates the plan below. Multiple plausible open specs -> ask FnB. Existing
-tasks -> skip planning and track the first unfinished one.
+The list includes `kind`, `seq`, `frozen`, and `task_count`. Resume the unfrozen
+spec with tasks; zero tasks = backlog and needs the plan below. Multiple
+plausible specs -> ask FnB. Existing tasks -> track the first unfinished one.
 
 ## 2. Analyze before planning
 
@@ -3484,9 +2690,8 @@ sc mem flag open "[Spec] <blocked fact> | Blocker for: <feature>" \
 
 ## 3. Engage and plan
 
-Building this session moves `brainstorm|long_term|near_term` to `in_progress`;
-planning ahead moves it to `next`. Matching/later stages are no-ops. Reading
-for reference moves nothing, and unspec''d small fixes have no stage ceremony.
+Building now moves `brainstorm|long_term|near_term` to `in_progress`; planning
+ahead -> `next`; matching/later stages and reference reads do not move.
 
 ```text
 sc mem roadmap status <feature_id> in_progress
@@ -3516,9 +2721,6 @@ No task plan = no implementation.
 
 ## 4. Execute one task at a time
 
-When FnB explicitly invoked `--agents`, load `agents`; its adjudicated waves
-overlay this loop. Otherwise:
-
 ```text
 sc mem get tasks --doc <doc_id>
 sc mem task start <task_id>
@@ -3536,11 +2738,14 @@ sc mem task cancel <task_id> --notes "moved to F<id> as task #<n>"
 sc mem state "[<feature>] — last: <last_done>. next: <next_up>."
 ```
 
-The final Verification task follows the boot `TESTING POSTURE`; require focused
-local proof + green configured CI, every In Scope done-condition, and the
-Anticipated User Activity contract. Unexpected reach, weakened hardening, or
-crossed tenancy fails. A large spec may stop after a verified task slice; leave
-later tasks pending and state the next one.
+Final Verification follows the boot `TESTING POSTURE`. Complete code; run every
+available focused proof; use observed registered-PR checks only for an
+unavailable local gate: pending -> wait, red -> fix, green -> review. No checks
+or untrustworthy watcher after one bounded read -> block; an optional browser
+skip is non-failing. Require every In Scope done-condition + Anticipated User
+Activity contract; unexpected reach, weakened hardening, or crossed tenancy
+fails. A large spec may stop after a verified task slice; leave later tasks
+pending and state the next one.
 
 ## 5. Ship and hand docs to Planner
 
@@ -3725,11 +2930,10 @@ INSERT INTO skills (name, description, category, command, common, content, is_de
   0,
   '# sprint_dev — own one editing lane
 
-Use for an actionable work-unit assignment in an armed Sprint. Use the simplest
-path supported by current durable state. Treat ownership, lifecycle
-preconditions, durable writes, and typed handoffs as hard boundaries; use
-judgment inside them. Repeat a read only when later activity could have changed
-it or the next command requires live revalidation.
+Use for an actionable armed-Sprint assignment. Use the simplest path supported
+by current durable state. Treat ownership, lifecycle, writes, and handoffs as
+hard boundaries. Repeat a read only when later activity could have changed it
+or a command requires live revalidation.
 
 ## Route the entry
 
@@ -3747,19 +2951,15 @@ sc sprint accept --sprint <id> --message <message-id>
 sc sprint decline --sprint <id> --message <message-id> --reason <reason>
 ```
 
-Accepting marks assignment ownership and starts work. Decline with a concrete
-reason when unable to accept. After handling an informational message, run
-`accept`; it marks the message read and does not change Sprint or work-unit
-state.
+Accepting starts ownership; decline concretely. After an informational message,
+`accept` marks the message read and does not change Sprint or work-unit state.
 
-An unusable success receipt from idempotent bookkeeping does not stall the
-Sprint. Retry the exact command once, then use its normal read surface once to
-prove the exact postcondition. For informational `accept`, prior inbox presence
-+ absence of that exact message id proves the read landed. Continue under that
-proof + name the receipt defect in the next normal handoff. NEVER use this
-recovery to infer assignment ownership, review outcome, merge authorization,
-lifecycle/work-unit transition, governing revision, PR head/green state, or
-cleanup authority. An unproved postcondition stops.
+For an unusable bookkeeping receipt, retry the exact command once, then use its
+normal read surface once to prove the postcondition. For informational `accept`,
+prior inbox presence + absence of that exact message id proves the read landed;
+name the defect next handoff. NEVER infer assignment ownership, review outcome,
+merge authorization, lifecycle/work-unit transition, governing revision, PR
+head/green state, or cleanup authority. An unproved postcondition stops.
 
 Assignments and review requests use Force-new delivery; verdicts and PR-event
 wakes use Re-enter. Delivery waits for a natural boundary; the runtime owns
@@ -3767,12 +2967,10 @@ bundling, rotation, and recovery. Stop after a successful typed handoff.
 
 ## Bound the lane
 
-Read the assignment, expected output, bound spec revision, dependencies,
-Reviewer, repository/worktree, merge grant, and prior judgments. Own at most one
-active work unit; never start a second editing lane or edit another shell''s
-worktree. Resolve ambiguity with the shippable in-scope reading + recorded
-rationale. Ask the Planner before changing the unit boundary, shared interface,
-deliverable cut, priority, or scope.
+Read assignment, output, bound revision, dependencies, roles, worktree, grant,
+and judgments. Own one active unit; never start another lane or edit another
+shell''s worktree. Resolve ambiguity to shippable in-scope work + rationale. Ask
+Planner before changing boundary, interface, deliverable, priority, or scope.
 
 Put one question, blocker, decision, answer, or useful context item in a short
 body file. Unit questions/blockers require a reply:
@@ -3804,32 +3002,32 @@ cross-unit authority. Confirm the durable reply, then `accept` the incoming
 message. At a decision boundary, stop until the required answer arrives;
 unread recovery re-wakes, so send no duplicate reminder.
 
-A stable key identifies recipient + exact body + intent + reply linkage +
-scope. Reuse it only for the same failed/ambiguous write; when any of those
-fields changes, use a new key. Keep bodies near 6,000 characters and below the
-8,000-character hard limit; run `wc -m < <path>`. A handoff completes only when
-the command exits successfully and confirms its durable message/state + wake.
-If a command is rejected or transport fails, correct and retry safely. If the
-relay itself fails, give FnB the attempted command, evidence, impact, and
-recommendation; invent no alternate protocol.
+Stable key = recipient + exact body + intent + reply + scope. Reuse it only for
+the same failed/ambiguous write; when any of those fields changes, use a new
+key. Keep bodies near 6,000 characters and below
+8,000; run `wc -m < <path>`. Handoff completes only when the command exits
+successfully and confirms durable state + wake. If a command is rejected or
+transport fails, correct/retry. If relay itself fails, give FnB command +
+evidence + impact + recommendation; invent no alternate protocol.
 
 A Developer does not pause the Sprint. Report blocker or integrity evidence to
 the Planner, continue safe independent work, and stop at the unsafe boundary.
 The Reviewer decides continue/replan/pause; the Planner executes the decision.
 
-Store scratch proof, diffs, evidence packets, review notes, and report drafts in
-gitignored `shared/sprints/sprint-<n>/`. Never commit or PR them. Durable
-judgments belong in `record-review`, reports in `sprint_reports`, and decisions
-in the relay.
+Scratch proof/diffs/reports -> gitignored `shared/sprints/sprint-<n>/`; never
+commit/PR them. Durable judgment -> `record-review`; reports -> `sprint_reports`;
+decisions -> relay.
 
 ## Build and verify
 
 Sync + branch; implement the smallest complete change. Per boot `TESTING
-POSTURE`, run the smallest affected gate + failures; configured CI green =
-full-suite proof, red -> diagnose/fix/push/rerun. Keep external calls outside
-DB transactions; preserve durable identities and append-only evidence. Record
-CI failures, infrastructure anomalies, retries, review friction, and
-departures for closeout.
+POSTURE`, finish code + run every available smallest affected gate. If the
+selected interpreter, runner, or declared dependency cannot execute one,
+record exact seat evidence; the registered PR supplies only that proof. Test
+assertion/source collection red or incomplete code = failure. Optional browser
+skip = non-failing. Keep external calls outside DB transactions; preserve
+durable identities and append-only evidence. Record failures, anomalies,
+retries, review friction, and departures for closeout.
 
 Immediately before `complete-unit`, `register-pr`, or `request-review`, re-run
 `sc sprint inbox --sprint <id>` once and act on new messages. After the typed
@@ -3856,10 +3054,14 @@ sc sprint register-pr --sprint <id> --repository <owner/name> \
   --pr <number> --work-unit <id>
 ```
 
-After `register-pr` succeeds, retain ownership. Expect red/green/closed
-Re-enter wakes outside an armed Sprint. While the PR remains attached to an
-aborted Sprint, expect observation without a wake; reconciliation restores
-wakes. Fix red; judge green. Planner/Reviewer get none.
+Register complete code even when a local gate is unavailable; registration
+obtains evidence, not review. After `register-pr` succeeds, retain ownership;
+Red/green/closed Re-enter wakes continue. Required checks: pending -> native
+wake; red -> fix/push; green -> judge/request review; none or untrustworthy
+watcher after one bounded read -> report + block. Follow context: armed -> fix
+red + judge/pass green; paused -> fix red now + judge green, review after
+resume; no active Sprint -> fix red if needed + no action on green.
+Planner/Reviewer get none.
 
 If the same registered PR was externally closed, then reopened, rebased, and
 pushed, replay the exact `register-pr` command. Require `created: false`, which
@@ -3884,7 +3086,7 @@ Do not repeat this read as a polling loop.
 
 Complete each round in order:
 
-1. Finish readiness judgment + local verification.
+1. Finish readiness judgment + available local proof; require observed green.
 2. Perform the once-only inbox check; handle and `accept` new messages.
 3. Use `submit` first or `resubmit` after changes requested. The engine injects
    the PR URL, registered id, exact green head, and work-unit id into the
@@ -3963,15 +3165,12 @@ INSERT INTO skills (name, description, category, command, common, content, is_de
   0,
   '# sprint_pln — govern the armed Sprint
 
-Use as originating Planner after `sprint_prep` arms a Sprint. System records
-facts; Reviewer owns review/conformance judgment + reports; Planner owns plan
-structure and executes control transitions. FnB retains board-level override
-under decision #46.
+Use after `sprint_prep` arms Sprint. System records; Reviewer judges/reports;
+Planner structures/controls; FnB board override = decision #46.
 
 Use the simplest path supported by current durable state. Treat authority,
-lifecycle preconditions, durable writes, and typed handoffs as hard boundaries.
-Repeat a read only when later activity could have changed it or the next command
-requires live revalidation.
+lifecycle, writes, and handoffs as hard boundaries. Repeat a read only when
+later activity could have changed it or a command requires revalidation.
 
 ## Route the entry
 
@@ -3993,8 +3192,8 @@ rotation, recovery, and coordinate mode. Stop after a successful typed handoff.
 
 ## Durable running loop
 
-Read only lifecycle, unit, dependency, route, PR, expectation, and anomaly
-facts required by the trigger. Browser presence is not progress.
+Read only trigger-required lifecycle, unit, dependency, route, PR, expectation,
+and anomaly facts. Browser presence is not progress.
 
 ```text
 sc sprint inbox --sprint <id>
@@ -4022,8 +3221,11 @@ cleanup authority. An unproved postcondition stops.
 
 - Keep dependencies as hard sequence; restructure current projection under
   Planner authority, record why, and never rewrite completed history.
-- Developers own PR green/review/correction/merge. Reviewers own verdicts and
-  conformance. Do not proxy routine handoffs or judgments.
+- Developers own local/PR proof, review/fix/merge. Complete code + unavailable
+  local gate -> registered CI: pending wait, red fix, green review; browser skip
+  is non-failing. With fallback, Planner NEVER mutates packages/toolchains or
+  runs repair. No checks/untrustworthy watcher after one read -> blocker.
+  Reviewers own verdicts/conformance; do not proxy handoffs/judgments.
 - Record Reviewer decision id + exact action + receipt; never rewrite rationale
   as Planner judgment.
 - Mid-Sprint spec edits require owning Planner/FnB + durable Reviewer decision.
@@ -4940,402 +4142,6 @@ SELECT path, kind, file FROM dr_route ORDER BY path;                    -- UI ro
   jump straight to the API surface or schema; a dimension is empty -> fall
   back to section + descriptions. Symbol-level semantics (functions/classes)
   are a later pass.',
-  0
-)
-ON CONFLICT(name) DO UPDATE SET
-  description=excluded.description, category=excluded.category,
-  command=excluded.command, common=excluded.common,
-  content=excluded.content, is_deleted=0;
-
-INSERT INTO skills (name, description, category, command, common, content, is_deleted) VALUES (
-  'tailscale',
-  'Reach the fork''s hosts over the tailnet — read tailnet status and exec commands on a tailnet host through the host-side ts-broker, holding no tailnet credential yourself. The devops shell''s signature skill. Use when operating remote hosts, deploys, or backups over Tailscale.',
-  'substrate',
-  NULL,
-  0,
-  '# tailscale — driving the tailnet
-
-Operate remote hosts over Tailscale from a sandboxed shell: read tailnet
-status, run commands on tailnet hosts. Opt-in + link-only — the operator
-brings a host that is already `tailscale up`; you drive a scoped loop against
-it. Grant is explicit, per-fork (`common=0`); the **devops** flavor''s
-signature skill.
-
-## Drive through the host broker — never `tailscale` directly
-
-The sandbox can''t join the tailnet (no route, no TUN, no `NET_ADMIN`) and
-must not hold a tailnet credential. NEVER run `tailscale` or bring up
-`tailscaled` — call the host-side **ts-broker** over its unix socket in the
-bind-mounted repo; the broker owns the host''s `tailscale up` node, and the
-tailnet identity never enters the fork. (Detail:
-`.super-coder/docs/tailscale-broker.md` — sibling of the Windows VM broker;
-`windows_devkit` works the same way.)
-
-```bash
-SOCK="$(sc ts-broker-sock)"
-curl -s --unix-socket "$SOCK" http://ts/health      # liveness check first
-```
-
-curl fails "not reachable" → broker down → ask the operator to run
-`sc ts-broker-up` on the host. You cannot start it yourself (host process,
-not sandbox).
-
-## Precondition — the link is configured
-
-Tailnet config = `ts` key in `.super-coder/instance.json`. Carries no secret
-material — the host node''s identity is the credential and it stays host-side:
-
-```json
-"ts": { "ssh_user": "tester", "allowed_hosts": ["build-box","deploy-target"],
-        "tailscale_bin": "tailscale" }
-```
-
-No `ts` block → no tailnet linked: stop + ask the operator to set it
-(hand-edit or `PUT /api/ts`). `allowed_hosts` = fail-closed allow-list:
-`exec` only reaches hosts listed there; empty/absent list denies all. Declare
-only the hosts the fork operates — widen deliberately, never by default.
-
-## The verbs
-
-| Verb | Call |
-|---|---|
-| **status** | `curl -s --unix-socket "$SOCK" http://ts/status` → `{backend, self, peers[]}` from the host node''s view |
-| **exec** | `curl -s --unix-socket "$SOCK" http://ts/exec -d ''{"host":"build-box","command":"uptime"}''` → `{ok, exit, stdout, stderr}` |
-
-The broker runs `tailscale ssh <ssh_user>@<host>` non-interactively (tailnet
-ACLs govern auth — no key, no prompt). You name a host + a command; the host
-must be in `allowed_hosts`.
-
-`status` before `exec`: peers carry hostname, MagicDNS name, Tailscale IP,
-and online state — confirm the target is online first; a timeout on a down
-host wastes a 2-minute exec window.
-
-## Mullvad ↔ Tailscale on Linux
-
-Tailscale and the Mullvad app fight over the default route + nftables on
-Linux; running both drops tailnet traffic. Sequential-use only: bring one
-down before the other comes up. `exec`/`status` suddenly fail on a host that
-worked → check whether Mullvad came up on the HOST (the broker''s node), not
-in your sandbox — host-side network state, not a broker bug; surface it to
-the operator.
-
-## Lanes
-
-Operating hosts / deploys / backups = yours (devops). App features = dev''s;
-the super-coder engine = admin''s.',
-  0
-)
-ON CONFLICT(name) DO UPDATE SET
-  description=excluded.description, category=excluded.category,
-  command=excluded.command, common=excluded.common,
-  content=excluded.content, is_deleted=0;
-
-INSERT INTO skills (name, description, category, command, common, content, is_deleted) VALUES (
-  'test_authoring',
-  'Principles for stringent pytest tests — tests a realistic bug turns red. The downstream repository owns stack-specific fixtures and database setup.',
-  'craft',
-  NULL,
-  0,
-  '# test_authoring — stringent pytest tests
-
-Apply when writing a test or reviewing a diff that touches `tests/`.
-Pass condition for any test: a realistic bug turns it red. A test no bug
-can fail reads as coverage while guarding nothing — sharpen or cut it.
-
-Stack infrastructure—fixture setup, callers, and database access patterns—lives
-in the downstream repository. Load its fork-local testing skill alongside this
-one when granted. None granted means this skill stands alone; infer setup from
-the repository''s existing tests and development tooling.
-
-## Rules (the floor)
-
-1. **Count + content + negative.** After a count assertion (`written == 1`),
-   assert the content (the right row: fields + FKs) + the negative (the row
-   that must NOT exist). Wrong body / wrong participant / stray contact must
-   turn the test red. `>= 1` is banned where the exact count is knowable.
-
-2. **No config-mirror tautologies.** NEVER assert output equals a constant
-   the code under test imports in-process
-   (`assert resp == list(THE_SAME_CONSTANT)`) — it catches hardcoding only,
-   never a wrong value. Pin the literal expectation in the test, or derive it
-   from independent behavior (e.g. the error classes a real
-   `classify_error()` emits across sample failures).
-
-3. **Round-trips assert the negative space.** Insert `new` -> assert `new`
-   present + prior value gone + sibling fields untouched.
-   `assert get() == put_value` alone passes against a stub that echoes input.
-
-4. **Every error / edge branch gets its own case.** Failure path / reject
-   path / NULL path / empty-input path -> one test each. `is not None` /
-   bare truthiness banned where the exact value is knowable.
-
-5. **Negative tests assert the effect is absent.** Denied / rejected / gated
-   path -> assert the underlying action did not happen (no row written,
-   resource still unreachable, no egress call) — a 4xx or a
-   `permission_denied` string alone does not pass.
-
-6. **Schema changes: test behavior, not `PRAGMA`.** To prove a column
-   nullable, insert a NULL row -> assert accepted. The catalog flag can be
-   right while a CHECK or trigger still rejects.
-
-7. **Idempotency / migration tests run on a dirty fixture.** Seed the exact
-   state the migration cleans (the rows it removes still present) -> run once
-   and twice -> assert convergence. Idempotency-on-clean proves almost
-   nothing.
-
-8. **Reject silent-empty.** Bad filter / typo''d enum value -> assert 422
-   explicitly, never a 200 reading as "nothing found."
-
-9. **Cleanup lives in the fixture, never after the asserts.** A resource
-   opened in a test body (connection, file handle, subprocess) and closed
-   on the line after the assertions leaks exactly when the test FAILS —
-   the worst possible correlation: the suite hangs or exhausts a pool
-   only when it is catching bugs (a close-after-assert probe connection
-   deadlocked three concurrent pytest runs of one file for four hours in
-   a release gate). Open in a fixture (`yield` + teardown /
-   `addfinalizer`) or a `with` block; teardown must run on the red path.
-   Audit pattern: AST-scan the suite for opens whose close sits after an
-   `assert` in the same body.
-
-## Review lens (tests/ diff)
-
-- Read the assertions, not the test name.
-- Per `assert`: name a one-line code change that would still pass it. That
-  change is a real bug -> the assertion is too weak; demand the fix.
-- Count-only / substring-only / `is not None` -> demand the exact value.
-- Output compared to a constant the code imports -> flag rule 2.
-- Only the success branch tested -> name the missing edge + require it.
-
-## Mechanizable subset (enforce in CI)
-
-Grep-able; wire into a `.github` workflow that fails the build so the floor
-holds when this skill isn''t loaded. Point the CI failure message back at
-this skill.
-
-- `assert .* (==|!=) (list|set)\(<KNOWN_CONSTANT>\)` — config-mirror shape.
-- `assert .* >= 1` / bare `assert .* is not None` in a new test diff —
-  demand an exact value.
-- Count assertion with no content assertion in the following N lines.
-
-## Never
-
-- Close a resource on the line after an assert — a failing assert skips
-  it; fixtures own teardown (rule 9).
-- Mock the function under test, then assert the mock returned what you set.
-- Assert a key exists without asserting its value.
-- Let a count or status code stand in for "the right thing happened."
-- Test only the happy path of code that has error branches.
-- Ship a test whose assertions no realistic bug could violate.',
-  0
-)
-ON CONFLICT(name) DO UPDATE SET
-  description=excluded.description, category=excluded.category,
-  command=excluded.command, common=excluded.common,
-  content=excluded.content, is_deleted=0;
-
-INSERT INTO skills (name, description, category, command, common, content, is_deleted) VALUES (
-  'windows_devkit',
-  'Drive the linked Windows Test VM from its supplied state with typed status, start, push, exec, capture, and end-only reset commands. Use for Windows installer, service, registry, and system-level verification that Wine cannot represent.',
-  'substrate',
-  NULL,
-  0,
-  '# windows_devkit — drive the supplied Windows test VM
-
-Use the operator-supplied VM and application state. Inspect first, start or open
-only what is absent, perform the test, and reset once at the end. Planning,
-probing, skill review, and static verification never reset the VM.
-
-## Preflight
-
-The linked fork must have a `vm` block in `.super-coder/instance.json`, created
-and validated through Scripts → **Windows Test VM**. The operator owns the VM,
-testing snapshot, credentials, and guest toolchain.
-
-- No `vm` block: stop and ask the operator to link the VM.
-- Invalid configuration or missing broker: report the structured `./sc vm`
-  error and ask the operator to run `./sc vm-broker-up`. Do not read key
-  material, use `ssh` or `virsh` directly, or build raw broker requests.
-- Missing guest toolchain: ask the operator to run `configure_winbox` and
-  re-bake. Never install tools during the test and poison the testing snapshot.
-- If GUI work reports adapter state `unknown` because `SC_HARNESS` is absent,
-  the session predates the adapter identity contract. Relaunch the shell through
-  the engine; do not add persistent harness configuration. A declared
-  `unsupported` adapter is a capability stop, not a relaunch prompt.
-
-## Canonical workflow
-
-1. Assume the operator supplied a running VM with the testing application open.
-2. Run `./sc vm status --json`. This is read-only: it never starts, restarts, or
-   resets the VM.
-3. If the domain is off, run `./sc vm start --json`. If it is already running
-   but SSH is not ready, the same command waits for readiness without restarting
-   it. Do not invent sleeps.
-4. `./sc vm exec` runs in the SSH session context and cannot open a GUI
-   application on the interactive desktop. If the testing application is
-   absent, run `./sc vm mcp up --json`, open it with the injected Windows MCP
-   `App` tool, and visually confirm that it is open before proceeding.
-5. Use `push`, `exec`, and `capture` as needed, then perform the test.
-6. A test failure does not skip cleanup. When testing is finished and you still
-   have control, run `./sc vm mcp down --json` if GUI transport was used, then
-   run `./sc vm reset --off --json` once. This restores the configured testing
-   snapshot and leaves the domain powered off.
-7. Report the test result and cleanup result separately. Include any structured
-   error and never claim an unconfirmed operation succeeded.
-
-There is no reset at the beginning or during a test. Do not automatically retry
-a reset after a timeout, disconnect, malformed response, or
-`reset_result_unknown`; its effect may already have occurred.
-
-## Typed commands
-
-```text
-./sc vm status --json
-./sc vm start --json
-./sc vm push <repo-file> [destination] --json
-./sc vm exec --json -- <simple guest command and arguments>
-./sc vm exec --command-file <utf8-command-file> --json
-./sc vm capture [--output .sc-state/local/vm-captures/<name>] --json
-./sc vm mcp status|up|down --json
-./sc vm reset --off --json
-```
-
-- `exec` accepts arguments after `--` or one UTF-8 command file, never both.
-  Arguments after `--` are re-joined with single spaces; local shell token
-  boundaries are not preserved. Use that form for simple commands, or pass the
-  entire guest command as one locally quoted argument. For complex, quoted, or
-  multiline PowerShell, use `--command-file` so quotes, dollar variables,
-  pipes, backticks, paths with spaces, and Unicode reach the broker unchanged.
-- `cmd.exe` is the guest default SSH shell. Invoke PowerShell syntax explicitly,
-  for example with
-  `powershell -NoProfile -Command "Get-ChildItem Env:"`.
-- Client-to-broker command content remains unchanged, but guest console stdout
-  may transliterate non-ASCII on return. For byte-exact output, base64-encode
-  it guest-side and decode it locally.
-- `capture` writes an atomic mode-0600 artifact under
-  `.sc-state/local/vm-captures/`; use the returned path for visual inspection.
-- `mcp up` verifies the tunnel, relay, and HTTP endpoint before success.
-  `mcp down` reports relay and tunnel cleanup separately.
-- Every command exits nonzero on an operation failure. With `--json`, inspect
-  the single object containing `schema_version`, `ok`, `operation`, `result`,
-  and `error`.
-
-## Stance
-
-- Observe before changing state. Retain a supplied running domain and open app.
-- Drive through `./sc vm`; never assemble broker HTTP, socket curl, JSON, SSH,
-  PowerShell transport quoting, screenshot decoding, or relay process control.
-- Reset is end-only cleanup, not test setup. Attempt it once while you still
-  have control, and report its observed final state honestly.
-- Guest output, screenshots, configuration, and credentials remain local to the
-  linked repo and operator.',
-  0
-)
-ON CONFLICT(name) DO UPDATE SET
-  description=excluded.description, category=excluded.category,
-  command=excluded.command, common=excluded.common,
-  content=excluded.content, is_deleted=0;
-
-INSERT INTO skills (name, description, category, command, common, content, is_deleted) VALUES (
-  'windows_vm_gui',
-  'Drive the linked Windows Test VM through adapter-provided Windows MCP tools, using UI Automation element IDs, visual verification, managed MCP lifecycle, and one end-only powered-off reset.',
-  'substrate',
-  NULL,
-  0,
-  '# windows_vm_gui — drive the supplied Windows GUI
-
-Use this for exploratory GUI QA/QC and visual verification that cannot be
-expressed through `windows_devkit` commands alone. The operator supplies the VM
-and application state. Observe first, start or open only what is absent, and
-reset once when all testing is finished.
-
-## Preflight and tool availability
-
-The harness adapter declares the managed streamable-HTTP `windows-mcp` server
-before the harness launches. Claude, Codex, and OpenCode expose it where their
-active adapter supports Windows MCP. Kimi and Vibe are unsupported until their
-adapters gain an equivalent injection mechanism.
-
-The harness tool list may be fixed at launch. If Windows MCP tools are absent,
-do not run persistent registration commands or edit user/project harness
-configuration. Report the adapter state from `./sc vm status --json`. State
-`unknown` with no `SC_HARNESS` means this session predates the adapter identity
-contract: relaunch through the engine so it can inject the active harness
-identity. State `unsupported` means the active adapter declares no injection
-mechanism; it is an honest capability stop, not a reason to fabricate GUI
-access or relaunch repeatedly.
-
-## Missing guest Windows-MCP
-
-Windows-MCP is baked guest toolchain, never an ad-hoc test dependency. If it is
-missing, the operator must use the `configure_winbox` flow to:
-
-1. Add Python 3.13+ (for example, `Python.Python.3.13`) to the fork''s committed
-   winget manifest and import it into the guest.
-2. Run `pip install uv`, verify `uvx windows-mcp serve --help` exits zero, and
-   register the auto-start task with:
-
-   ```text
-   windows-mcp install --transport streamable-http --host 127.0.0.1 --port 8000
-   ```
-
-   The server must be bound to localhost ONLY (never expose it on the VM network).
-3. Run `./sc vm-bake` so resets restore the prepared server.
-
-The guest requires Python 3.13+ and `uv`. Prefer English-language Windows due
-to the App-tool limitation. UAC prompts and elevated windows are inaccessible
-unless the server itself runs elevated.
-
-## Canonical workflow
-
-1. Assume the operator supplied a running VM with the testing application open.
-2. Run `./sc vm status --json`. It is read-only and must not reset, restart, or
-   otherwise mutate the VM.
-3. If the VM is off, run `./sc vm start --json`. For a running VM whose SSH is
-   not ready, the same command performs bounded readiness checks without a
-   restart. Do not invent sleeps.
-4. Run `./sc vm mcp up --json`. Success means the broker tunnel, verified local
-   relay, and MCP HTTP endpoint are ready. Then use the already-provided
-   Windows MCP tools; do not register them from inside the skill.
-5. `./sc vm exec` runs in the SSH session context and cannot open a GUI
-   application on the interactive desktop. If the application is absent, open
-   it with the injected Windows MCP `App` tool and visually confirm that it is
-   open before proceeding.
-6. Perform the GUI test. A test failure does not skip cleanup.
-7. When all testing is finished and you still have control, run
-   `./sc vm mcp down --json`, then `./sc vm reset --off --json` once. Report MCP
-   cleanup and reset results separately from the test result.
-
-There is no opening or mid-test reset. If MCP setup or teardown returns a
-structured failure, include it for the operator and do not claim success. Never
-automatically repeat an uncertain reset.
-
-## Driving rules
-
-- Call `Snapshot` first. Act on UI Automation element IDs, not screenshot
-  coordinates.
-- Re-run `Snapshot` after a window-set change; stale element IDs can misclick.
-- Use `Click`, `Type`, and `Scroll` on element IDs, and verify meaningful state
-  changes with `Screenshot`.
-- Standard WPF, WinForms, and WinUI chrome is normally UIA-visible. A
-  custom-rendered canvas with no UIA element is the only coordinate fallback:
-  take a screenshot, perform one coordinate action, then take another
-  screenshot before continuing.
-- Batch reads instead of issuing repeated single-element queries.
-- Keep application state and screenshots local; never expose the relay beyond
-  its configured loopback endpoint.
-
-## Prefer a scripted path when repeatable
-
-Anything likely to run more than twice belongs in an in-process framework or a
-typed `./sc vm exec` test, not a click sequence:
-
-```text
-in-process test framework  →  UIA by element ID  →  coordinates only when UIA is blind
-```
-
-Use `./sc vm capture --json` when the result needs a durable local screenshot
-artifact. Use `windows_devkit` for push, exact guest commands, and the shared
-end-only cleanup contract.',
   0
 )
 ON CONFLICT(name) DO UPDATE SET

@@ -931,9 +931,9 @@ def _prove_packages(
     return observed, proof_digest, command
 
 
-def _source_commit(plan: ImagePlan) -> tuple[str, bool]:
+def _source_commit_for(checkout: Path) -> tuple[str, bool]:
     commit = _run(
-        ("git", "-C", str(plan.checkout), "rev-parse", "HEAD"),
+        ("git", "-C", str(checkout), "rev-parse", "HEAD"),
         runner=subprocess.run,
         capture=True,
     )
@@ -941,7 +941,7 @@ def _source_commit(plan: ImagePlan) -> tuple[str, bool]:
         (
             "git",
             "-C",
-            str(plan.checkout),
+            str(checkout),
             "status",
             "--porcelain",
             "--untracked-files=no",
@@ -950,6 +950,10 @@ def _source_commit(plan: ImagePlan) -> tuple[str, bool]:
         capture=True,
     )
     return commit, not bool(dirty)
+
+
+def _source_commit(plan: ImagePlan) -> tuple[str, bool]:
+    return _source_commit_for(plan.checkout)
 
 
 def _status_path(plan: ImagePlan) -> tuple[Path, str]:
@@ -1848,6 +1852,47 @@ def _input_digest(path: Path, field: str) -> str:
     return _digest_file(path, field)
 
 
+def _provision_contract(
+    declaration: Declaration, checkout: Path
+) -> dict[str, Any] | None:
+    if declaration.provision is None:
+        return None
+    provision = declaration.provision
+    hook = declaration.hooks[provision.hook]
+    inputs = [
+        {
+            "path": declared,
+            "sha256": _input_digest(path, f"provision.inputs[{index}]"),
+        }
+        for index, (declared, path) in enumerate(
+            zip(provision.inputs_declared, provision.inputs)
+        )
+    ]
+    automatic_inputs = [
+        {
+            "path": str(declaration.path.relative_to(checkout)),
+            "sha256": _input_digest(declaration.path, "dev-kit declaration"),
+        }
+    ]
+    if hook.resolved_executable is not None:
+        automatic_inputs.append(
+            {
+                "path": str(hook.resolved_executable.relative_to(checkout)),
+                "sha256": _input_digest(
+                    hook.resolved_executable, "provision hook executable"
+                ),
+            }
+        )
+    return {
+        "name": hook.name,
+        "argv": list(hook.argv),
+        "cwd": hook.cwd_declared,
+        "canonical_cwd": str(hook.cwd),
+        "inputs": inputs,
+        "automatic_inputs": automatic_inputs,
+    }
+
+
 def _capability_payload(
     plan: ImagePlan,
     *,
@@ -1898,42 +1943,7 @@ def _capability_payload(
             f"cannot prove readiness with stale or foreign image {tag!r}: "
             + ", ".join(mismatches)
         )
-    provision_payload = None
-    if plan.declaration.provision is not None:
-        provision = plan.declaration.provision
-        hook = plan.declaration.hooks[provision.hook]
-        inputs = [
-            {
-                "path": declared,
-                "sha256": _input_digest(path, f"provision.inputs[{index}]"),
-            }
-            for index, (declared, path) in enumerate(
-                zip(provision.inputs_declared, provision.inputs)
-            )
-        ]
-        automatic_inputs = [
-            {
-                "path": str(plan.declaration.path.relative_to(plan.checkout)),
-                "sha256": _input_digest(plan.declaration.path, "dev-kit declaration"),
-            }
-        ]
-        if hook.resolved_executable is not None:
-            automatic_inputs.append(
-                {
-                    "path": str(hook.resolved_executable.relative_to(plan.checkout)),
-                    "sha256": _input_digest(
-                        hook.resolved_executable, "provision hook executable"
-                    ),
-                }
-            )
-        provision_payload = {
-            "name": hook.name,
-            "argv": list(hook.argv),
-            "cwd": hook.cwd_declared,
-            "canonical_cwd": str(hook.cwd),
-            "inputs": inputs,
-            "automatic_inputs": automatic_inputs,
-        }
+    provision_payload = _provision_contract(plan.declaration, plan.checkout)
     commit, clean = _source_commit(plan)
     proof = _read_receipt(_status_path(plan)[0].with_name("package-proof.json")) or {}
     return {
@@ -1994,6 +2004,177 @@ def _read_receipt(path: Path) -> dict[str, Any] | None:
     except (OSError, json.JSONDecodeError):
         return None
     return value if isinstance(value, dict) else None
+
+
+def readiness_receipt_matches(
+    receipt: dict[str, Any] | None, fingerprint: str
+) -> bool:
+    """Validate the canonical ready-receipt envelope for one fingerprint."""
+    return bool(
+        receipt is not None
+        and receipt.get("format_version") == READINESS_CONTRACT_VERSION
+        and receipt.get("state") == "ready"
+        and receipt.get("fingerprint") == fingerprint
+    )
+
+
+def _declaration_package_digest(declaration: Declaration) -> str:
+    sandbox = declaration.sandbox
+    if sandbox is not None and sandbox.packages is not None:
+        return _sha256_text(
+            json.dumps(sandbox.packages.canonical_atoms, separators=(",", ":"))
+        )
+    if sandbox is not None and sandbox.package_error is not None:
+        return "invalid"
+    return "none"
+
+
+def persisted_readiness_matches(
+    checkout: Path,
+    engine: Path,
+    declaration: Declaration,
+    status: dict[str, Any],
+) -> bool:
+    """Validate stored readiness against current tracked inputs without Docker."""
+    checkout = checkout.resolve(strict=True)
+    engine = engine.resolve(strict=True)
+    identity = _sha256_text(str(checkout))
+    declaration_digest = _sha256_text(declaration.canonical_json)
+    package_digest = _declaration_package_digest(declaration)
+    try:
+        engine_ref = _engine_ref(checkout, engine)
+        current_commit, clean = _source_commit_for(checkout)
+        provision = _provision_contract(declaration, checkout)
+    except SandboxImageError:
+        return False
+    if (
+        status.get("format_version") != 1
+        or status.get("checkout_identity") != identity
+        or status.get("declaration_digest") != declaration_digest
+        or status.get("package_digest") != package_digest
+        or status.get("engine_ref") != engine_ref
+        or clean is not True
+    ):
+        return False
+
+    ready_path = (
+        checkout
+        / ".sc-state"
+        / "local"
+        / "dev-kit"
+        / identity[:20]
+        / "ready.json"
+    )
+    package_receipt = status.get("package_receipt")
+    if not isinstance(package_receipt, dict):
+        return False
+    if package_receipt.get("path") != str(ready_path):
+        return False
+    fingerprint = package_receipt.get("fingerprint")
+    if not isinstance(fingerprint, str):
+        return False
+    receipt = _read_receipt(ready_path)
+    if not readiness_receipt_matches(receipt, fingerprint):
+        return False
+    assert receipt is not None
+    if (
+        receipt.get("checkout_identity") != identity
+        or receipt.get("source_commit") != current_commit
+        or receipt.get("source_tracked_clean") is not True
+    ):
+        return False
+
+    image = receipt.get("image")
+    packages = receipt.get("packages")
+    if not isinstance(image, dict) or not isinstance(packages, dict):
+        return False
+    labels = image.get("labels")
+    if not isinstance(labels, dict):
+        return False
+    expected_labels = {"sc.engine_ref": engine_ref}
+    if labels.get("sc.image_kind") == "engine-base":
+        try:
+            expected_labels["sc.engine_dockerfile_digest"] = _digest_file(
+                engine / "Dockerfile", "engine Dockerfile"
+            )
+        except SandboxImageError:
+            return False
+    else:
+        sandbox = declaration.sandbox
+        dockerfile_digest = (
+            _digest_file(sandbox.dockerfile, "sandbox.dockerfile")
+            if sandbox is not None and sandbox.dockerfile is not None
+            else "none"
+        )
+        expected_labels.update(
+            {
+                "sc.declaration_digest": declaration_digest,
+                "sc.dockerfile_digest": dockerfile_digest,
+                "sc.package_digest": package_digest,
+                "sc.readiness_contract": str(READINESS_CONTRACT_VERSION),
+                "sc.package_contract": str(PACKAGE_CONTRACT_VERSION),
+                "sc.context_contract": str(CONTEXT_CONTRACT_VERSION),
+            }
+        )
+    if any(labels.get(key) != value for key, value in expected_labels.items()):
+        return False
+    status_image_fields = {
+        "selected_tag": ("tag", None),
+        "selected_image_id": ("id", None),
+        "parent_id": ("parent_id", "none"),
+        "engine_base_id": ("engine_base_id", "none"),
+        "package_layer_id": ("package_layer_id", "none"),
+    }
+    if any(
+        status.get(status_key, default) != image.get(image_key)
+        for status_key, (image_key, default) in status_image_fields.items()
+    ):
+        return False
+    requested = (
+        list(declaration.sandbox.packages.canonical_atoms)
+        if declaration.sandbox is not None
+        and declaration.sandbox.packages is not None
+        else []
+    )
+    if (
+        packages.get("contract_version") != PACKAGE_CONTRACT_VERSION
+        or packages.get("requested") != requested
+    ):
+        return False
+
+    dockerfile_digest = (
+        _digest_file(
+            declaration.sandbox.dockerfile,
+            "sandbox.dockerfile",
+        )
+        if declaration.sandbox is not None
+        and declaration.sandbox.dockerfile is not None
+        else "none"
+    )
+    payload = {
+        "format_version": READINESS_CONTRACT_VERSION,
+        "seat": "docker",
+        "checkout": str(checkout),
+        "checkout_identity": identity,
+        "source_commit": current_commit,
+        "source_tracked_clean": True,
+        "declaration_digest": declaration_digest,
+        "contracts": {
+            "readiness": READINESS_CONTRACT_VERSION,
+            "packages": PACKAGE_CONTRACT_VERSION,
+            "context": CONTEXT_CONTRACT_VERSION,
+        },
+        "image": image,
+        "packages": packages,
+        "extension": {
+            "dockerfile_digest": dockerfile_digest,
+            "context_digest": status.get("context_digest", "none"),
+        },
+        "provision": provision,
+    }
+    return readiness_receipt_matches(
+        receipt, provisioning_fingerprint(payload)
+    )
 
 
 def _acquire_lock(path: Path, timeout: float) -> int:
@@ -2111,11 +2292,7 @@ def provision_checkout(
         fingerprint = provisioning_fingerprint(payload)
         receipt_path = root / "ready.json"
         receipt = _read_receipt(receipt_path)
-        if (
-            receipt is not None
-            and receipt.get("state") == "ready"
-            and receipt.get("fingerprint") == fingerprint
-        ):
+        if readiness_receipt_matches(receipt, fingerprint):
             _record_ready_status(
                 plan,
                 payload,
@@ -2355,12 +2532,7 @@ def readiness(
         )
         fingerprint = provisioning_fingerprint(payload)
         receipt = _read_receipt(root / "ready.json")
-        if (
-            receipt is not None
-            and receipt.get("format_version") == READINESS_CONTRACT_VERSION
-            and receipt.get("state") == "ready"
-            and receipt.get("fingerprint") == fingerprint
-        ):
+        if readiness_receipt_matches(receipt, fingerprint):
             return {
                 "state": "ready",
                 "ready": True,
