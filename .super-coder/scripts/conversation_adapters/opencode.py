@@ -38,6 +38,7 @@ from .base import (
     ReconcileResult,
     SessionInspection,
     UrlHttpTransport,
+    command_version,
     ensure_exact_session,
     ensure_nonempty_message,
     load_manifest,
@@ -979,21 +980,8 @@ class OpenCodeAdapter(ConversationAdapter):
         )
 
     def probe(self) -> ProbeResult:
-        self._ensure_global_transport()
-        health = self.transport.request("GET", "/global/health")
-        if not isinstance(health, dict) or not health.get("healthy"):
-            raise AdapterError(
-                "HARNESS_UNAVAILABLE",
-                "OpenCode server health check failed",
-                retryable=True,
-            )
-        version = health.get("version")
-        if not isinstance(version, str):
-            raise AdapterError(
-                "HARNESS_PROTOCOL_ERROR",
-                "OpenCode health response omitted version",
-            )
-        return self._probe_result(version)
+        launch = self.manifest["launch"][0]
+        return self._probe_result(command_version([launch, "--version"]))
 
     def close(self) -> None:
         process = self._context_server

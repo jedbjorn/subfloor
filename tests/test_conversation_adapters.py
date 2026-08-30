@@ -1922,7 +1922,12 @@ class ConversationAdapterTest(unittest.TestCase):
         self,
     ) -> None:
         adapter, native = self.build("opencode")
-        result = adapter.probe()
+        with mock.patch.object(
+            opencode_adapter,
+            "command_version",
+            return_value="1.18.9",
+        ):
+            result = adapter.probe()
         self.assertEqual(result.version, "1.18.9")
         turn = adapter.start(self.context, "hello")
         self.assertEqual(

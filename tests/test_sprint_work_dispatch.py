@@ -25,8 +25,14 @@ import sprint_domain
 import sprint_liveness
 import sprint_message_delivery as delivery
 import sprint_runtime
-from conversation_adapters import AdapterError, CodexAdapter, KimiAdapter
+from conversation_adapters import (
+    AdapterError,
+    CodexAdapter,
+    KimiAdapter,
+    OpenCodeAdapter,
+)
 from conversation_adapters import base as adapter_base
+from conversation_adapters import opencode as opencode_adapter
 from conversation_adapters.base import AdapterCapabilities, checked_probe_result
 from sprint_route_binding_support import candidate as route_candidate
 
@@ -238,6 +244,72 @@ class DispatchGateTest(SprintWorkDispatchCase):
         lifecycle.arm(self.sprint_id, 3, conformance_reviewer_shell_id=2)
 
         self.assertEqual([("codex", False), ("kimi", False)], observed)
+
+    def test_opencode_arm_and_reroute_probe_never_touch_global_server(self) -> None:
+        self.create_unit(developer=1)
+        self.con.execute(
+            "UPDATE sprint_participants SET harness='opencode',model=NULL,"
+            "effort=NULL WHERE sprint_id=? AND shell_id=1",
+            (self.sprint_id,),
+        )
+        self.con.commit()
+
+        def adapter(harness: str):
+            if harness == "opencode":
+                return OpenCodeAdapter()
+            if harness == "codex":
+                return CodexAdapter(rpc=mock.Mock())
+            if harness == "kimi":
+                return KimiAdapter()
+            raise AssertionError(harness)
+
+        versions = {
+            "codex": "codex-cli 0.147.0",
+            "kimi": "0.33.0",
+            "opencode": "1.18.9",
+        }
+
+        def version_output(argv, **_kwargs):
+            return SimpleNamespace(
+                returncode=0,
+                stdout=versions[Path(argv[0]).name] + "\n",
+                stderr="",
+            )
+
+        existing_global = mock.Mock()
+        with (
+            mock.patch.object(sprint_domain, "adapter_for", side_effect=adapter),
+            mock.patch.object(
+                adapter_base.subprocess,
+                "run",
+                side_effect=version_output,
+            ),
+            mock.patch.object(opencode_adapter, "ensure_server") as ensure_server,
+        ):
+            lifecycle = sprint_domain.SprintLifecycleStore(self.con)
+            lifecycle.arm(self.sprint_id, 3, conformance_reviewer_shell_id=2)
+            lifecycle.pause(
+                self.sprint_id,
+                sprint_domain.LifecycleActor("planner", 3),
+                reason="verify process-free OpenCode reroute",
+            )
+            with mock.patch.object(
+                opencode_adapter,
+                "_SERVER_PROCESS",
+                existing_global,
+            ):
+                receipt = sprint_domain.SprintParticipantStore(self.con).reroute(
+                    self.sprint_id,
+                    3,
+                    participant_shell_id=4,
+                    harness="opencode",
+                    model=None,
+                    effort=None,
+                )
+
+        self.assertTrue(receipt.changed)
+        ensure_server.assert_not_called()
+        self.assertEqual(existing_global.mock_calls, [])
 
     def test_arm_binds_every_participant_once_and_preserves_generation(self) -> None:
         self.create_unit(developer=1)
