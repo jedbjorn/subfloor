@@ -32,6 +32,10 @@ ROOT = Path(__file__).resolve().parents[1]
 UNCHARTED_BY_DESIGN = {
     # `./sc help` listing itself is noise.
     "help",
+    # General engine SQL is deliberately absent from ordinary help. Admin's
+    # engine_database skill owns discovery and guarded usage.
+    "sql",
+    "sql-rw",
 }
 
 

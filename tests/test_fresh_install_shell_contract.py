@@ -40,8 +40,9 @@ class FreshInstallShellContractTest(unittest.TestCase):
             ROOT / ".super-coder" / "assets" / "skills" / "cartographer"
             / "SKILL.md"
         ).read_text()
-        self.assertIn("$SC_ROOT/.sc-state/local/map/config.json", skill)
-        self.assertIn("$SC_ROOT/.sc-state/map_extractors/", skill)
+        self.assertIn("`.sc-state/local/map/config.json`", skill)
+        self.assertIn("`.sc-state/map_extractors/<name>.py`", skill)
+        self.assertNotIn("SC_ROOT", skill)
         self.assertIn("never a commit", skill)
         self.assertNotIn("**Commit** the config + hooks", skill)
 

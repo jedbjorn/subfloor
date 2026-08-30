@@ -24,6 +24,7 @@
     ".super-coder/assets/skills/sprint_dev/SKILL.md",
     ".super-coder/assets/skills/sprint_rev/SKILL.md",
     ".super-coder/assets/skills/sprint_close/SKILL.md",
+    ".super-coder/assets/skills/engine_database/SKILL.md",
     ".super-coder/scripts/activity_monitor.py",
     ".super-coder/scripts/sprint_close.py",
     ".super-coder/scripts/sprint_cleanup.py",

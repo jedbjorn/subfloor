@@ -77,6 +77,9 @@ BINDING_GUIDANCE_RESEED = (
 DISPOSITION_VERBS_RESEED = (
     ENGINE / "migrations" / "0222_reseed_sprint_pln_disposition_verbs.sql"
 )
+ROLE_AWARE_BOOT_RESEED = (
+    ENGINE / "migrations" / "0243_role_aware_boot_contract.sql"
+)
 
 
 class SprintSkillTest(unittest.TestCase):
@@ -889,6 +892,7 @@ class SprintSkillTest(unittest.TestCase):
             con.executescript(GITHUB_CAPABILITY_RESEED.read_text())
             con.executescript(BINDING_GUIDANCE_RESEED.read_text())
             con.executescript(DISPOSITION_VERBS_RESEED.read_text())
+            con.executescript(ROLE_AWARE_BOOT_RESEED.read_text())
 
             self.assertIsNotNone(
                 con.execute(
