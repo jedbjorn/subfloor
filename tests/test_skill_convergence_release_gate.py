@@ -178,11 +178,18 @@ class SkillConvergenceReleaseGateTest(unittest.TestCase):
                 "repair_git_worktrees",
                 "migrate_engine_untrack",
                 "migrate_generated_artifacts_local",
-                "migrate_with_service_cutover",
                 "refresh_installed_brokers",
                 "run_script",
+                "snapshot_under_cutover",
             ):
                 stack.enter_context(mock.patch.object(update, name))
+            stack.enter_context(
+                mock.patch.object(
+                    update,
+                    "migrate_with_service_cutover",
+                    side_effect=lambda **kwargs: kwargs["reconcile"](),
+                )
+            )
             stack.enter_context(mock.patch.object(update, "is_source_repo", return_value=False))
             stack.enter_context(
                 mock.patch.object(update, "ensure_workflows", return_value=("unchanged", []))

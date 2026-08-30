@@ -28,6 +28,8 @@ MIGRATIONS_DIR = ENGINE / "migrations"
 sys.path.insert(0, str(ENGINE / "scripts"))
 import db_backup  # noqa: E402
 import db_driver  # noqa: E402
+import instance_state  # noqa: E402
+import state_relocation  # noqa: E402
 
 # A migration file's own outermost transaction control (on its own line). A
 # trigger body's `BEGIN` (no trailing `;`) and `END;` (not `COMMIT;`/`END
@@ -208,7 +210,21 @@ def parse_args(argv: list[str]) -> str:
     return argv[0]
 
 
+def cli_main(argv: list[str]) -> int:
+    db_path = parse_args(argv)
+    active = instance_state.active_database_path(ENGINE)
+    target = Path(db_path).resolve()
+    if target != active.resolve():
+        raise SystemExit(
+            f"migrate: refusing non-canonical target {target}; expected {active}"
+        )
+    state = instance_state.maintenance_state(ENGINE)
+    with state_relocation.exclusive_maintenance(state, command="migrate"):
+        state_relocation.refuse_live_database_owners(active)
+        return migrate(str(active), backup=True)
+
+
 if __name__ == "__main__":
     from cli_entry import run_cli
 
-    sys.exit(run_cli(lambda: migrate(parse_args(sys.argv[1:]), backup=True)))
+    sys.exit(run_cli(cli_main, sys.argv[1:]))

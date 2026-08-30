@@ -30,13 +30,16 @@ import db_driver
 import instance_state
 import map_db
 import seed_skills
+import state_relocation
 from _serialize_guard import require_admin
 
 ENGINE = Path(__file__).resolve().parents[1]
 REPO_ROOT = ENGINE.parent
-DB_PATH = instance_state.active_database_path(ENGINE)
+DB_PATH = instance_state.maintenance_database_path(ENGINE)
 # Generated instance state is always local and gitignored.
-OUT_PATH = artifact_policy.content_path()
+# Recovery-safe equivalent of ``artifact_policy.content_path()``; ``main``
+# applies the ordinary selector before either target is opened.
+OUT_PATH = instance_state.maintenance_snapshot_path(REPO_ROOT)
 # One-release cleanup: if a not-yet-migrated fork still carries the old in-engine
 # copy, remove it once we write the new one so it can't shadow or drift.
 LEGACY_PATH = ENGINE / "snapshot" / "content.sql"
@@ -535,7 +538,7 @@ def persist_instance(con) -> Path:
     return OUT_PATH
 
 
-def main() -> int:
+def _main_under_lease() -> int:
     require_admin("snapshot")
     copied = artifact_policy.prepare_local_state()
     if copied:
@@ -573,6 +576,17 @@ def main() -> int:
     print(f"snapshot: wrote {displayed}")
     snapshot_map()
     return 0
+
+
+def main(*, lease_held: bool = False) -> int:
+    instance_state.active_database_path(ENGINE)
+    state = instance_state.maintenance_state(ENGINE)
+    if lease_held:
+        state_relocation.refuse_live_database_owners(DB_PATH)
+        return _main_under_lease()
+    with state_relocation.exclusive_maintenance(state, command="snapshot"):
+        state_relocation.refuse_live_database_owners(DB_PATH)
+        return _main_under_lease()
 
 
 if __name__ == "__main__":

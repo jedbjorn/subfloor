@@ -12,10 +12,10 @@ import sqlite3
 import stat
 import sys
 from collections.abc import Iterator
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from fcntl import LOCK_EX, LOCK_NB, LOCK_UN, flock
+from fcntl import LOCK_EX, LOCK_NB, LOCK_SH, LOCK_UN, flock
 from pathlib import Path
 
 import instance_state
@@ -167,6 +167,32 @@ def exclusive_maintenance(
             os.close(descriptor)
 
 
+@contextmanager
+def shared_runtime(
+    state: instance_state.InstanceState,
+    *,
+    command: str,
+) -> Iterator[None]:
+    """Retain shared ownership for one runtime's complete DB lifetime."""
+    descriptor = _safe_lock_file(state.maintenance_lock)
+    try:
+        try:
+            flock(descriptor, LOCK_SH | LOCK_NB)
+        except OSError as exc:
+            if exc.errno not in {errno.EACCES, errno.EAGAIN}:
+                raise
+            raise MaintenanceBusy(
+                "maintenance_busy: an exclusive maintenance command owns the "
+                "instance lease"
+            ) from exc
+        yield
+    finally:
+        try:
+            flock(descriptor, LOCK_UN)
+        finally:
+            os.close(descriptor)
+
+
 def _database_identities(paths: tuple[Path, ...]) -> set[tuple[int, int]]:
     identities: set[tuple[int, int]] = set()
     for path in paths:
@@ -188,8 +214,32 @@ def refuse_live_database_owners(
     if not identities or not proc_root.exists():
         return
     indeterminate: list[str] = []
+
+    def _could_be_engine_runtime(process: Path) -> bool:
+        try:
+            command = (process / "cmdline").read_bytes().replace(b"\0", b" ")
+        except (FileNotFoundError, ProcessLookupError):
+            return False
+        except PermissionError:
+            return True
+        return any(
+            marker in command
+            for marker in (b".super-coder", b"server.py", b"shell_db.db")
+        )
+
     for process in proc_root.iterdir():
         if not process.name.isdigit() or int(process.name) == os.getpid():
+            continue
+        try:
+            if process.stat().st_uid != os.geteuid():
+                # A foreign uid cannot open the owner-only private DB. Skipping
+                # it avoids treating protected system processes as ambiguity.
+                continue
+        except (FileNotFoundError, ProcessLookupError):
+            continue
+        except PermissionError:
+            if _could_be_engine_runtime(process):
+                indeterminate.append(process.name)
             continue
         descriptors = process / "fd"
         try:
@@ -197,7 +247,8 @@ def refuse_live_database_owners(
         except (FileNotFoundError, ProcessLookupError):
             continue
         except PermissionError:
-            indeterminate.append(process.name)
+            if _could_be_engine_runtime(process):
+                indeterminate.append(process.name)
             continue
         for entry in entries:
             try:
@@ -383,13 +434,19 @@ def relocate_legacy_state(
     command: str = "relocate",
     proc_root: Path = Path("/proc"),
     failpoint: str | None = None,
+    lease_held: bool = False,
 ) -> RelocationResult:
     """Relocate once, or deterministically recover/replay the same move."""
     engine = Path(engine)
     repo_root = engine.parent
     resolved = state or instance_state.resolve(instance_config=engine / "instance.json")
     legacy = instance_state.legacy_database_path(engine)
-    with exclusive_maintenance(resolved, command=command):
+    lease = (
+        nullcontext()
+        if lease_held
+        else exclusive_maintenance(resolved, command=command)
+    )
+    with lease:
         receipt = _read_receipt(resolved)
         recovered = False
         if receipt is not None and receipt["status"] == "legacy":
@@ -469,13 +526,19 @@ def restore_legacy_for_old_floor(
     *,
     state: instance_state.InstanceState,
     proc_root: Path = Path("/proc"),
+    lease_held: bool = False,
 ) -> Path:
     """Reconstruct the verified legacy pair for an engine without the resolver."""
     engine = Path(engine)
     legacy = instance_state.legacy_database_path(engine)
     if not state.database.exists():
         raise RelocationError("private database is missing during legacy rollback")
-    with exclusive_maintenance(state, command="rollback-to-legacy"):
+    lease = (
+        nullcontext()
+        if lease_held
+        else exclusive_maintenance(state, command="rollback-to-legacy")
+    )
+    with lease:
         refuse_live_database_owners(state.database, proc_root=proc_root)
         fingerprint = database_fingerprint(state.database)
         candidate = engine / f".shell_db.rollback.{os.getpid()}.tmp"
@@ -510,6 +573,7 @@ def remove_private_state(
     *,
     verified_backup: Path,
     proc_root: Path = Path("/proc"),
+    lease_held: bool = False,
 ) -> None:
     """Delete only the claimed live root after proving its external backup."""
     backup = Path(verified_backup)
@@ -528,7 +592,12 @@ def remove_private_state(
     )
     if archive_payload.get("instance_id") != state.instance_id:
         raise RelocationError("refusing foreign removal archive")
-    with exclusive_maintenance(state, command="remove"):
+    lease = (
+        nullcontext()
+        if lease_held
+        else exclusive_maintenance(state, command="remove")
+    )
+    with lease:
         refuse_live_database_owners(state.database, proc_root=proc_root)
         if state.database.exists() and database_fingerprint(
             backup

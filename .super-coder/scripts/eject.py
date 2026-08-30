@@ -54,6 +54,7 @@ EJECTED_MARKER = STATE_DIR / "ejected"
 MANIFEST = ENGINE / "engine.manifest"
 
 sys.path.insert(0, str(ENGINE / "scripts"))
+import instance_state  # noqa: E402
 import update as update_mod  # noqa: E402  (is_source_repo, git helper)
 
 # Post-eject .gitignore block: the engine is tracked now, but its runtime /
@@ -137,6 +138,10 @@ def main(argv: list[str]) -> int:
         print("eject: already ejected — the engine is fork source "
               f"(marker: {EJECTED_MARKER.relative_to(REPO_ROOT)}).")
         return 0
+
+    # Eject preserves private live state, but must not change the engine floor
+    # while relocation publication is incomplete.
+    instance_state.active_database_path(ENGINE)
 
     pinned = ENGINE_REF.read_text().strip() if ENGINE_REF.exists() else ""
 

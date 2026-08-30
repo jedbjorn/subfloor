@@ -614,6 +614,7 @@ def main(argv: list[str]) -> int:
     args = build_parser().parse_args(argv)
     manifest_path: Path | None = None
     data: dict | None = None
+    maintenance_lease = None
     try:
         repo_root = validate_target()
         engine = repo_root / ".super-coder"
@@ -642,6 +643,12 @@ def main(argv: list[str]) -> int:
         destination = new_backup_dir(repo_root)
         print(f"→ backup destination ready: {destination}")
         quiesce_runtime(repo_root)
+        lease_state = private_state or instance_state.maintenance_state(engine)
+        maintenance_lease = state_relocation.exclusive_maintenance(
+            lease_state, command="remove"
+        )
+        maintenance_lease.__enter__()
+        state_relocation.refuse_live_database_owners(database)
         remove_worktrees(repo_root, worktrees)
 
         _backup, data = backup_database(repo_root, destination, database)
@@ -666,6 +673,7 @@ def main(argv: list[str]) -> int:
             state_relocation.remove_private_state(
                 private_state,
                 verified_backup=_backup,
+                lease_held=True,
             )
             data["removed"].append(str(private_state.root))
         remaining = verify_removed(repo_root)
@@ -702,6 +710,9 @@ def main(argv: list[str]) -> int:
             print(f"  backup manifest: {manifest_path}", file=sys.stderr)
         print(f"remove: {exc}", file=sys.stderr)
         return 1
+    finally:
+        if maintenance_lease is not None:
+            maintenance_lease.__exit__(None, None, None)
 
 
 if __name__ == "__main__":

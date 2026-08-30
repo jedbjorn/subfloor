@@ -176,15 +176,17 @@ def previous_floor_supports_private_state(prev_sha: str) -> bool:
     )
 
 
-def reconstruct_legacy_if_required(prev_sha: str) -> None:
+def reconstruct_legacy_if_required(prev_sha: str, *, lease_held: bool = False) -> None:
     state = instance_state._bound_private_state(ENGINE)
     if state is None or DB_PATH != state.database:
         return
     if previous_floor_supports_private_state(prev_sha):
         return
+    kwargs = {"lease_held": True} if lease_held else {}
     legacy = state_relocation.restore_legacy_for_old_floor(
         ENGINE,
         state=state,
+        **kwargs,
     )
     print(f"→ reconstructed verified legacy DB for old floor -> {legacy}")
 
@@ -246,8 +248,7 @@ def verify_engine_only_floor(prev_sha: str) -> None:
             "paired backup or operator-directed recovery instead.")
 
 
-def main(argv: list[str] | None = None) -> int:
-    argv = sys.argv[1:] if argv is None else argv
+def _main_under_lease(argv: list[str]) -> int:
     unknown = [arg for arg in argv if arg != "--engine-only"]
     if unknown:
         sys.exit(f"rollback: unknown argument(s): {' '.join(unknown)}")
@@ -266,7 +267,7 @@ def main(argv: list[str] | None = None) -> int:
         verify_engine_only_floor(prev_sha)
         print("→ repairing a new-engine / unchanged-DB half floor")
         backup_current_db()
-        reconstruct_legacy_if_required(prev_sha)
+        reconstruct_legacy_if_required(prev_sha, lease_held=True)
         restore_engine(prev_sha)
         ENGINE_REF_PREV.unlink(missing_ok=True)
         print("\nrollback: done — restored the previous engine and preserved "
@@ -285,7 +286,7 @@ def main(argv: list[str] | None = None) -> int:
     restore_db(src)
 
     if prev_sha:
-        reconstruct_legacy_if_required(prev_sha)
+        reconstruct_legacy_if_required(prev_sha, lease_held=True)
         restore_engine(prev_sha)
         ENGINE_REF_PREV.unlink(missing_ok=True)  # consumed — no double-rollback
     else:
@@ -297,6 +298,16 @@ def main(argv: list[str] | None = None) -> int:
     print("\nrollback: done — restored to the pre-update floor.")
     print("  Restart your session to boot onto the restored state.")
     return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    argv = sys.argv[1:] if argv is None else argv
+    # A durable publishing receipt has exactly one recovery verb: update.
+    active = instance_state.active_database_path(ENGINE)
+    state = instance_state.maintenance_state(ENGINE)
+    with state_relocation.exclusive_maintenance(state, command="rollback"):
+        state_relocation.refuse_live_database_owners(active)
+        return _main_under_lease(argv)
 
 
 if __name__ == "__main__":

@@ -35,6 +35,12 @@ class MaintenanceCutoverRequired(InstanceStateError):
     """Private state cannot become active before the spec #133 cutover gate."""
 
 
+RELOCATION_RECOVERY = (
+    "relocation_incomplete: private-state publication must be recovered before "
+    "this command can use engine state; run `./sc update` from the host Admin seat"
+)
+
+
 @dataclass(frozen=True)
 class InstanceState:
     """Canonical private paths for one opaque installation identity."""
@@ -557,7 +563,9 @@ def active_database_path(
     if state is None:
         return legacy
     receipt = _relocation_receipt(state)
-    if receipt is not None and receipt["status"] in {"publishing", "private"}:
+    if receipt is not None and receipt["status"] == "publishing":
+        raise MaintenanceCutoverRequired(RELOCATION_RECOVERY)
+    if receipt is not None and receipt["status"] == "private":
         return state.database
     if legacy.exists() and state.database.exists():
         raise MaintenanceCutoverRequired(
@@ -566,6 +574,42 @@ def active_database_path(
     if legacy.exists():
         return legacy
     return state.database
+
+
+def maintenance_database_path(
+    engine: Path,
+    *,
+    private_state: InstanceState | None = None,
+) -> Path:
+    """Return the recovery target without activating an incomplete cutover.
+
+    Only lifecycle code that first runs ``relocate_legacy_state`` may use this
+    selector. Ordinary consumers must use ``active_database_path`` so a durable
+    ``publishing`` receipt remains fail-stopped.
+    """
+    engine = Path(engine)
+    state = private_state or _bound_private_state(engine)
+    if state is None:
+        return legacy_database_path(engine)
+    receipt = _relocation_receipt(state)
+    if receipt is not None and receipt["status"] in {"publishing", "private"}:
+        return state.database
+    return active_database_path(engine, private_state=state)
+
+
+def maintenance_snapshot_path(
+    repo_root: Path,
+    *,
+    private_state: InstanceState | None = None,
+) -> Path:
+    """Return the snapshot paired with the recovery-only database selector."""
+    root = Path(repo_root)
+    state = private_state or _bound_private_state(root / ".super-coder")
+    if state is not None and maintenance_database_path(
+        root / ".super-coder", private_state=state
+    ) == state.database:
+        return state.snapshot
+    return root / ".sc-state" / "local" / "content.sql"
 
 
 def legacy_database_path(engine: Path) -> Path:
@@ -583,6 +627,18 @@ def _bound_private_state(engine: Path) -> InstanceState | None:
         if "does not exist" in str(exc) or "has no instance ID" in str(exc):
             return None
         raise
+
+
+def maintenance_state(engine: Path) -> InstanceState:
+    """Return the common lease namespace, including pre-instance legacy floors."""
+    engine = Path(engine)
+    state = _bound_private_state(engine)
+    if state is not None:
+        return state
+    root = engine.parent / ".sc-state" / "local"
+    root.mkdir(parents=True, exist_ok=True, mode=0o700)
+    os.chmod(root, 0o700)
+    return InstanceState(instance_id="legacy", root=root)
 
 
 def _relocation_receipt(state: InstanceState) -> dict | None:

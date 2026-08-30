@@ -9,12 +9,18 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS = ROOT / ".super-coder" / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 import instance_state
+import migrate
+import rebuild
+import snapshot
 import state_relocation
+sys.path.insert(0, str(ROOT / ".super-coder" / "api"))
+import server
 
 
 def _hold_open(path: str, ready, release) -> None:
@@ -155,6 +161,19 @@ class StateRelocationTests(RelocationFixture):
             json.loads(self.state.relocation_receipt.read_text())["status"],
             "publishing",
         )
+        with self.assertRaisesRegex(
+            instance_state.MaintenanceCutoverRequired,
+            "relocation_incomplete.*./sc update",
+        ):
+            instance_state.active_database_path(
+                self.engine, private_state=self.state
+            )
+        self.assertEqual(
+            instance_state.maintenance_database_path(
+                self.engine, private_state=self.state
+            ),
+            self.state.database,
+        )
         result = self.relocate()
         self.assertTrue(result.recovered)
         self.assertFalse(self.legacy.exists())
@@ -163,6 +182,62 @@ class StateRelocationTests(RelocationFixture):
             json.loads(self.state.relocation_receipt.read_text())["status"],
             "private",
         )
+        connection = sqlite3.connect(self.state.database)
+        try:
+            self.assertEqual(
+                connection.execute("SELECT value FROM payload").fetchone()[0],
+                "kept",
+            )
+        finally:
+            connection.close()
+
+    def test_publishing_refuses_launch_rebuild_migrate_and_snapshot(self):
+        self.create_database()
+        with self.assertRaisesRegex(
+            state_relocation.RelocationError, "after relocation receipt"
+        ):
+            self.relocate(failpoint="after_receipt")
+
+        environment = {"XDG_STATE_HOME": str(self.state_home)}
+        with mock.patch.dict(os.environ, environment), mock.patch.object(
+            server, "ENGINE", self.engine
+        ), mock.patch.object(
+            server.ports_mod, "resolve", return_value={"port": 8800}
+        ), self.assertRaisesRegex(SystemExit, "relocation_incomplete"):
+            server.main([])
+
+        with mock.patch.dict(os.environ, environment), mock.patch.object(
+            rebuild, "ENGINE", self.engine
+        ), mock.patch.object(rebuild, "_main_under_lease") as mutate, \
+                self.assertRaisesRegex(
+                    instance_state.MaintenanceCutoverRequired,
+                    "relocation_incomplete",
+                ):
+            rebuild.main(["--no-backup"])
+        mutate.assert_not_called()
+
+        with mock.patch.dict(os.environ, environment), mock.patch.object(
+            migrate, "ENGINE", self.engine
+        ), mock.patch.object(migrate, "migrate") as mutate, \
+                self.assertRaisesRegex(
+                    instance_state.MaintenanceCutoverRequired,
+                    "relocation_incomplete",
+                ):
+            migrate.cli_main([str(self.state.database)])
+        mutate.assert_not_called()
+
+        with mock.patch.dict(os.environ, environment), mock.patch.object(
+            snapshot, "ENGINE", self.engine
+        ), mock.patch.object(snapshot, "_main_under_lease") as mutate, \
+                self.assertRaisesRegex(
+                    instance_state.MaintenanceCutoverRequired,
+                    "relocation_incomplete",
+                ):
+            snapshot.main()
+        mutate.assert_not_called()
+        self.assertTrue(self.legacy.exists())
+        self.assertFalse(self.state.database.exists())
+        self.assertFalse(Path(str(self.state.database) + ".rebuild").exists())
 
     def test_retry_recovers_after_database_publish_before_final_receipt(self):
         self.create_database()
@@ -173,6 +248,12 @@ class StateRelocationTests(RelocationFixture):
 
         self.assertTrue(self.legacy.exists())
         self.assertTrue(self.state.database.exists())
+        with self.assertRaisesRegex(
+            instance_state.MaintenanceCutoverRequired, "relocation_incomplete"
+        ):
+            instance_state.active_database_path(
+                self.engine, private_state=self.state
+            )
         result = self.relocate()
         self.assertTrue(result.recovered)
         self.assertFalse(self.legacy.exists())
@@ -236,6 +317,26 @@ class StateRelocationTests(RelocationFixture):
             self.state, command="second"
         ):
             self.fail("second lease owner entered")
+
+    def test_live_runtime_blocks_maintenance(self):
+        with state_relocation.shared_runtime(
+            self.state, command="api"
+        ), self.assertRaisesRegex(
+            state_relocation.MaintenanceBusy, "maintenance_busy"
+        ), state_relocation.exclusive_maintenance(
+            self.state, command="update"
+        ):
+            self.fail("maintenance entered while runtime owned the DB")
+
+    def test_maintenance_blocks_runtime_start(self):
+        with state_relocation.exclusive_maintenance(
+            self.state, command="update"
+        ), self.assertRaisesRegex(
+            state_relocation.MaintenanceBusy, "maintenance_busy"
+        ), state_relocation.shared_runtime(
+            self.state, command="api"
+        ):
+            self.fail("runtime entered while maintenance owned the DB")
 
     def test_rollback_to_old_floor_reconstructs_verified_legacy_pair(self):
         self.create_database()

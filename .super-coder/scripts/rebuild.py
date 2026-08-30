@@ -33,13 +33,15 @@ import map_repo  # noqa: E402
 import migrate as migrate_mod  # noqa: E402
 import seed_skills  # noqa: E402  (re-assert the fork retire list post-seed)
 
-DB_PATH = instance_state.active_database_path(ENGINE)
+DB_PATH = instance_state.maintenance_database_path(ENGINE)
 
 # Compatibility/readability constant: the historical preferred location.
 # Writes resolve dynamically through backup_dir() so a restricted host seat can
 # fall through to SC_DB_BACKUP_DIR or the repo-local gitignored destination.
 BACKUP_DIR = db_backup_mod.preferred_home_dir(REPO_ROOT)
-SNAPSHOT = artifact_policy.content_path()
+# Recovery-safe equivalent of ``artifact_policy.content_path()``. Importing
+# update during ``publishing`` must not invoke the ordinary selector early.
+SNAPSHOT = instance_state.maintenance_snapshot_path(REPO_ROOT)
 
 
 def _promote_legacy_update_restore_point(target: Path) -> None:
@@ -266,8 +268,7 @@ def parse_args(argv: list[str]) -> bool:
     return "--no-backup" in argv
 
 
-def main(argv: list[str]) -> int:
-    no_backup = parse_args(argv)
+def _main_under_lease(no_backup: bool) -> int:
 
     schema = SCHEMA_SQLITE
     if not schema.exists():
@@ -374,6 +375,20 @@ def main(argv: list[str]) -> int:
     size_kb = DB_PATH.stat().st_size / 1024
     print(f"rebuild: done -> {display_path(DB_PATH)} ({size_kb:.0f} KB)")
     return 0
+
+
+def main(argv: list[str], *, lease_held: bool = False) -> int:
+    no_backup = parse_args(argv)
+    # Rebuild is not relocation recovery: it must never publish a third DB
+    # while a verified relocation candidate awaits adoption.
+    instance_state.active_database_path(ENGINE)
+    state = instance_state.maintenance_state(ENGINE)
+    if lease_held:
+        state_relocation.refuse_live_database_owners(DB_PATH)
+        return _main_under_lease(no_backup)
+    with state_relocation.exclusive_maintenance(state, command="rebuild"):
+        state_relocation.refuse_live_database_owners(DB_PATH)
+        return _main_under_lease(no_backup)
 
 
 if __name__ == "__main__":

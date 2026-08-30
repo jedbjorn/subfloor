@@ -1284,10 +1284,11 @@ class UpdateRefPublicationTest(unittest.TestCase):
             if kwargs.get("publish_ref", True):
                 ref.write_text(sha + "\n")
 
-        def migrate() -> None:
+        def migrate(*, reconcile) -> None:
             events.append("migration")
             if fail == "migration":
                 raise RuntimeError("migration failed")
+            reconcile()
 
         def publish(sha: str) -> None:
             events.append("publish")
@@ -1326,6 +1327,9 @@ class UpdateRefPublicationTest(unittest.TestCase):
                 return_value={"written": [], "skipped": [], "checkouts": []}
             ),
             run_script=mock.Mock(side_effect=run_script),
+            snapshot_under_cutover=mock.Mock(
+                side_effect=lambda: run_script("snapshot.py")
+            ),
         ))
         stack.enter_context(mock.patch.multiple(
             update.install_mod,
