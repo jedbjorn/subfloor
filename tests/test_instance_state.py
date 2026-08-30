@@ -449,6 +449,30 @@ class InstanceStateResolverTests(unittest.TestCase):
         self.assertFalse(resolved.snapshot.exists())
         self.assertFalse(resolved.backups.exists())
 
+    def test_relative_backup_override_is_anchored_to_canonical_repo_root(self):
+        paths = instance_state.active_backup_paths(
+            self.repo,
+            {"HOME": "relative-home", "SC_DB_BACKUP_DIR": "backups"},
+        )
+
+        self.assertEqual(paths.override, (self.repo / "backups").resolve())
+        self.assertEqual(
+            paths.home,
+            (self.repo / "relative-home" / "db_backups" / "repo").resolve(),
+        )
+        self.assertEqual(
+            paths.local,
+            (self.repo / ".sc-state" / "db_backups").resolve(),
+        )
+        self.assertTrue(all(path.is_absolute() for path in paths.candidates))
+
+    def test_backup_paths_refuse_a_relative_repository_anchor(self):
+        with self.assertRaisesRegex(
+            instance_state.InstanceStateError,
+            "repository root must be absolute",
+        ):
+            instance_state.active_backup_paths(Path("relative-repo"), {})
+
 
 class ProductionSeamInventoryTests(unittest.TestCase):
     DIRECT_RESOLVER_CALLS: ClassVar[dict[str, tuple[str, ...]]] = dict.fromkeys(

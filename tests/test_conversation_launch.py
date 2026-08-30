@@ -328,12 +328,17 @@ def test_recovery_view_masks_private_state_and_parent_root_alias(
     state_home = root / "state"
     monkeypatch.setenv("HOME", str(home))
     monkeypatch.setenv("XDG_STATE_HOME", str(state_home))
+    monkeypatch.setenv("SC_DB_BACKUP_DIR", "backups")
     private = instance_state.resolve(
         instance_config=engine / "instance.json",
         environ=os.environ,
         id_factory=lambda: "0123456789abcdef0123456789abcdef",
     )
     private.database.write_text("private secret\n")
+    backup = repo / "backups" / "shell_db.preboundary.db"
+    backup.parent.mkdir()
+    backup.write_text("backup secret\n")
+    (worktree / "backups").symlink_to(backup.parent, target_is_directory=True)
     con = sqlite3.connect(db_path)
     con.execute("UPDATE shells SET api_key='canonical-token' WHERE shell_id=1")
     con.commit()
@@ -352,7 +357,11 @@ def test_recovery_view_masks_private_state_and_parent_root_alias(
             "-c",
             f"! cat {secret} >/dev/null 2>&1 && "
             f"! cat /proc/{os.getpid()}/root{secret} >/dev/null 2>&1 && "
-            f"! cat {engine / 'schema.sql'} >/dev/null 2>&1",
+            f"! cat {engine / 'schema.sql'} >/dev/null 2>&1 && "
+            f"! cat {backup} >/dev/null 2>&1 && "
+            "! cat backups/shell_db.preboundary.db >/dev/null 2>&1 && "
+            "! /bin/sh -c 'cat backups/shell_db.preboundary.db' "
+            ">/dev/null 2>&1",
         ]),
         cwd=context.worktree,
         env=context.env,

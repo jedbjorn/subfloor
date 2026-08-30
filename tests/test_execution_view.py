@@ -44,12 +44,18 @@ def installation(tmp_path: Path) -> tuple[Path, Path, dict[str, str], Path]:
     return repo, engine, env, private.root
 
 
-def run_in(view: execution_view.ExecutionView, script: str) -> subprocess.CompletedProcess:
+def run_in(
+    view: execution_view.ExecutionView,
+    script: str,
+    *,
+    cwd: Path | None = None,
+) -> subprocess.CompletedProcess:
     return subprocess.run(
         view.command(["/bin/sh", "-c", script]),
         text=True,
         capture_output=True,
         check=False,
+        cwd=cwd,
         timeout=10,
     )
 
@@ -113,6 +119,38 @@ def test_source_view_keeps_tracked_engine_source_but_masks_live_state(
         f"grep -q secret {engine / 'schema.sql'} && "
         f"grep -q secret {engine / 'migrations' / '0001.sql'} && "
         f"! cat {private_root / 'shell_db.db'} >/dev/null 2>&1",
+    )
+    assert probe.returncode == 0, probe.stderr
+
+
+def test_relative_backup_override_is_masked_across_harness_cwd(
+    tmp_path: Path,
+) -> None:
+    repo, engine, env, _private_root = installation(tmp_path)
+    env["SC_DB_BACKUP_DIR"] = "backups"
+    backup = repo / "backups" / "shell_db.preboundary.db"
+    backup.parent.mkdir()
+    backup.write_text("backup secret\n")
+    worktree = repo / ".sc-worktrees" / "dev"
+    worktree.mkdir(parents=True)
+    (worktree / "backups").symlink_to(backup.parent, target_is_directory=True)
+    view = execution_view.build(
+        engine=engine,
+        repo_root=repo,
+        flavor="dev",
+        source_mode=False,
+        environ=env,
+    )
+
+    assert backup.parent.resolve() in view.masked_paths
+    probe = run_in(
+        view,
+        f"! cat {backup} >/dev/null 2>&1 && "
+        "! cat backups/shell_db.preboundary.db >/dev/null 2>&1 && "
+        "! /bin/sh -c 'cat backups/shell_db.preboundary.db' "
+        ">/dev/null 2>&1 && "
+        f"! cat /proc/{os.getpid()}/root{backup} >/dev/null 2>&1",
+        cwd=worktree,
     )
     assert probe.returncode == 0, probe.stderr
 
