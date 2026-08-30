@@ -210,7 +210,7 @@ class StateRelocationTests(RelocationFixture):
             rebuild, "ENGINE", self.engine
         ), mock.patch.object(rebuild, "_main_under_lease") as mutate, \
                 self.assertRaisesRegex(
-                    instance_state.MaintenanceCutoverRequired,
+                    rebuild.instance_state.MaintenanceCutoverRequired,
                     "relocation_incomplete",
                 ):
             rebuild.main(["--no-backup"])
@@ -220,7 +220,7 @@ class StateRelocationTests(RelocationFixture):
             migrate, "ENGINE", self.engine
         ), mock.patch.object(migrate, "migrate") as mutate, \
                 self.assertRaisesRegex(
-                    instance_state.MaintenanceCutoverRequired,
+                    migrate.instance_state.MaintenanceCutoverRequired,
                     "relocation_incomplete",
                 ):
             migrate.cli_main([str(self.state.database)])
@@ -230,7 +230,7 @@ class StateRelocationTests(RelocationFixture):
             snapshot, "ENGINE", self.engine
         ), mock.patch.object(snapshot, "_main_under_lease") as mutate, \
                 self.assertRaisesRegex(
-                    instance_state.MaintenanceCutoverRequired,
+                    snapshot.instance_state.MaintenanceCutoverRequired,
                     "relocation_incomplete",
                 ):
             snapshot.main()
