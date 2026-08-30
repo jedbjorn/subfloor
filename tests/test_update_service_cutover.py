@@ -280,6 +280,10 @@ class UpdateServiceCutoverTest(unittest.TestCase):
             side_effect=lambda *_args, **_kwargs: order.append("relocate")
             or mock.Mock(database=update.DB_PATH),
         ), mock.patch.object(
+            update.instance_state,
+            "active_database_path",
+            return_value=update.DB_PATH,
+        ), mock.patch.object(
             update, "migrate_or_rebuild",
             side_effect=lambda **_kwargs: order.append("migrate"),
         ), mock.patch.object(
@@ -296,8 +300,9 @@ class UpdateServiceCutoverTest(unittest.TestCase):
 
     def test_migration_failure_never_restarts_incompatible_old_code(self):
         service = ("/usr/bin/pm2", "sc-example")
+        docker_service = ("/usr/bin/docker", "sc-example")
         with mock.patch.object(
-            update, "stop_docker_review_server", return_value=None
+            update, "stop_docker_review_server", return_value=docker_service
         ), mock.patch.object(
             update, "stop_pm2_review_server", return_value=service
         ) as stop, mock.patch.object(
@@ -305,12 +310,21 @@ class UpdateServiceCutoverTest(unittest.TestCase):
             "relocate_legacy_state",
             return_value=mock.Mock(database=update.DB_PATH),
         ), mock.patch.object(
+            update.instance_state,
+            "active_database_path",
+            return_value=update.DB_PATH,
+        ), mock.patch.object(
             update, "migrate_or_rebuild", side_effect=RuntimeError("migration failed")
-        ), mock.patch.object(update, "start_pm2_review_server") as start, \
+        ), mock.patch.object(
+            update, "start_pm2_review_server"
+        ) as pm2_start, mock.patch.object(
+            update, "start_docker_review_server"
+        ) as docker_start, \
                 self.assertRaisesRegex(RuntimeError, "migration failed"):
             update.migrate_with_service_cutover()
         stop.assert_called_once_with()
-        start.assert_not_called()
+        pm2_start.assert_not_called()
+        docker_start.assert_not_called()
 
     def test_reconciliation_finishes_before_lease_release_and_relaunch(self):
         order = []
