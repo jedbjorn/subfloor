@@ -3149,6 +3149,15 @@ function chatUpdateContextTokens(node, value) {
   label.textContent = text;
 }
 
+function chatCollapseOtherReasoning(disclosure) {
+  if (!disclosure.open) return;
+  for (const other of document.querySelectorAll(
+    ".chat-reasoning-disclosure[open]",
+  )) {
+    if (other !== disclosure) other.open = false;
+  }
+}
+
 function chatBubble(
   kind, body, meta = "", conversation = null, createdAt = "", contextTokens = null,
   segment = "answer",
@@ -3173,6 +3182,7 @@ function chatBubble(
   if (isReasoning) {
     const disclosure = el("details", { className: "chat-reasoning-disclosure" });
     const summary = el("summary", {}, "Reasoning");
+    disclosure.ontoggle = () => chatCollapseOtherReasoning(disclosure);
     if (time) summary.append(timeNode());
     disclosure.append(summary, content);
     bubble.append(disclosure);

@@ -403,10 +403,55 @@ def test_reasoning_streams_as_distinct_assistant_segments_without_approval_ui():
     assert 'isReasoning ? "Reasoning"' in interface
     assert 'el("details", { className: "chat-reasoning-disclosure" }' in interface
     assert 'el("summary", {}, "Reasoning")' in interface
+    assert "disclosure.append(summary, content)" in interface
+    assert "disclosure.ontoggle = () => chatCollapseOtherReasoning(disclosure)" in interface
     assert ".chat-bubble.chat-assistant.chat-reasoning" in STYLE
     assert ".chat-reasoning-disclosure" in STYLE
+    reasoning_style = STYLE[
+        STYLE.index(".chat-reasoning-disclosure {"):
+        STYLE.index(".chat-bubble.chat-activity")
+    ]
+    assert 'content: "▸"' in reasoning_style
+    assert "summary::-webkit-details-marker" in reasoning_style
+    assert ".chat-reasoning-disclosure[open] > summary::before" in reasoning_style
+    assert "transform: rotate(90deg)" in reasoning_style
     assert "approval control" not in interface.lower()
     assert "approval button" not in interface.lower()
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node is required")
+def test_reasoning_disclosures_allow_only_one_open_section():
+    interface = APP[APP.index("const CHAT_HARNESSES"):
+                    APP.index("// ── Tabs + boot")]
+    helper = interface[
+        interface.index("function chatCollapseOtherReasoning"):
+        interface.index("function chatBubble")
+    ]
+    script = r"""
+const first = {open: true};
+const second = {open: true};
+let queries = 0;
+global.document = {
+  querySelectorAll(selector) {
+    if (selector !== ".chat-reasoning-disclosure[open]") throw new Error(selector);
+    queries += 1;
+    return [first, second];
+  },
+};
+""" + helper + r"""
+chatCollapseOtherReasoning(second);
+const openingSecond = {first: first.open, second: second.open, queries};
+first.open = true;
+second.open = false;
+chatCollapseOtherReasoning(second);
+console.log(JSON.stringify({openingSecond, closingSecond: {
+  first: first.open, second: second.open, queries,
+}}));
+"""
+    assert run_js(script) == {
+        "openingSecond": {"first": False, "second": True, "queries": 1},
+        "closingSecond": {"first": True, "second": False, "queries": 1},
+    }
 
 
 def test_transcript_installs_snapshot_then_coalesces_keyed_live_updates():
