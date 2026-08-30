@@ -117,13 +117,16 @@ class ConversationLaunchPreparer:
             "SC_SHELL_ID": str(row["shell_id"]),
             "SC_SHELL_SHORTNAME": str(row["shortname"]),
             "SC_SHELL_WORKTREE": str(worktree),
-            "SC_ENGINE_DIR": str(run_mod.ENGINE),
             "SC_HARNESS": broker_run.harness,
-            "SC_ROOT": str(run_mod.REPO_ROOT),
             "SC_CONVERSATION_SURFACE": self._conversation_surface(
                 broker_run.conversation_id
             ),
         }
+        env.pop("SC_ENGINE_DIR", None)
+        env.pop("SC_ROOT", None)
+        if row["flavor"] == "admin":
+            env["SC_ENGINE_DIR"] = str(run_mod.ENGINE)
+            env["SC_ROOT"] = str(run_mod.REPO_ROOT)
         env["PATH"] = run_mod._shell_path(worktree, env.get("PATH", ""))
         return ConversationContext(
             worktree=worktree.resolve(),
@@ -295,6 +298,9 @@ class ConversationLaunchPreparer:
                 conversation_id=broker_run.conversation_id,
                 lifecycle_epoch=broker_run.lifecycle_epoch,
                 boot_content=getattr(plan, "boot_content", None),
+                execution_prefix=getattr(
+                    getattr(plan, "execution_view", None), "prefix", ()
+                ),
             ),
             int(plan.archive_id),
         )

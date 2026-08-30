@@ -563,6 +563,10 @@ class OpenSessionContentionTest(unittest.TestCase):
                 mock.patch.object(run, "list_shells", return_value=[chosen]), \
                 mock.patch.object(run, "pick_shell", side_effect=pick_after_prelude), \
                 mock.patch.object(
+                    run.execution_view,
+                    "build",
+                    return_value=run.execution_view.ExecutionView(mode="test")), \
+                mock.patch.object(
                     run.shell_liveness, "compute",
                     return_value={"supported": False, "indeterminate": 0}), \
                 mock.patch.object(run, "ensure_harness_path"), \
@@ -789,6 +793,10 @@ class HeadlessSessionFailureTest(unittest.TestCase):
                 mock.patch.object(run, "list_shells", return_value=[chosen]), \
                 mock.patch.object(run, "pick_shell", return_value=chosen), \
                 mock.patch.object(
+                    run.execution_view,
+                    "build",
+                    return_value=run.execution_view.ExecutionView(mode="test")), \
+                mock.patch.object(
                     run.shell_liveness, "compute",
                     return_value={"supported": False, "indeterminate": 0}), \
                 mock.patch.object(run, "ensure_harness_path"), \
@@ -835,6 +843,10 @@ class HeadlessSessionFailureTest(unittest.TestCase):
                 mock.patch.object(run, "flavor_defaults", return_value=fdefaults), \
                 mock.patch.object(run, "list_shells", return_value=[chosen]), \
                 mock.patch.object(run, "pick_shell", return_value=chosen), \
+                mock.patch.object(
+                    run.execution_view,
+                    "build",
+                    return_value=run.execution_view.ExecutionView(mode="test")), \
                 mock.patch.object(
                     run.shell_liveness, "compute",
                     return_value={"supported": False, "indeterminate": 0}), \

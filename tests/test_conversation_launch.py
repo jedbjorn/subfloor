@@ -172,6 +172,7 @@ def test_preparer_returns_canonical_environment_and_archive(launch_case):
             effort="high",
             env={"SC_API_TOKEN": "shell-token", "MARKER": "prepared"},
             boot_content="immutable boot bytes",
+            execution_view=SimpleNamespace(prefix=("view-helper", "--")),
         )
 
     preparer = ConversationLaunchPreparer(
@@ -187,6 +188,7 @@ def test_preparer_returns_canonical_environment_and_archive(launch_case):
     assert context.env["SC_CONVERSATION_SURFACE"] == "browser"
     assert context.conversation_id == "cv_" + "a" * 32
     assert context.boot_content == "immutable boot bytes"
+    assert context.execution_prefix == ("view-helper", "--")
     assert context.permission_mode == "unrestricted"
     assert called == [{
         "shell_id": 1,

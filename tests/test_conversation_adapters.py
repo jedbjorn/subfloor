@@ -2212,6 +2212,44 @@ class ConversationAdapterTest(unittest.TestCase):
         self.assertTrue(adapter.interrupt(resumed).acknowledged)
         self.assertEqual(runner.processes[-1].signals, [signal.SIGINT])
 
+    def test_native_processes_receive_parent_owned_execution_prefix(self) -> None:
+        context = replace(
+            self.context,
+            execution_prefix=("view-helper", "--"),
+        )
+
+        claude, claude_runner = self.build("claude")
+        claude.start(context, "contained")
+        self.assertEqual(claude_runner.calls[-1][0][:2], ["view-helper", "--"])
+
+        kimi, kimi_runner = self.build("kimi")
+        kimi.start(context, "contained")
+        self.assertEqual(kimi_runner.calls[-1][0][:2], ["view-helper", "--"])
+
+        with mock.patch.object(codex_adapter, "JsonLineRpcProcess") as rpc_process:
+            codex = CodexAdapter()
+            codex._transport(context)
+        self.assertEqual(
+            rpc_process.call_args.kwargs["argv"][:2],
+            ["view-helper", "--"],
+        )
+
+        restricted_server = mock.Mock()
+        restricted_server.poll.return_value = None
+        with mock.patch.object(
+            opencode_adapter,
+            "start_context_server",
+            return_value=(
+                restricted_server,
+                mock.Mock(),
+                "http://127.0.0.1:12345",
+                "password",
+            ),
+        ) as start_context_server:
+            opencode = OpenCodeAdapter(endpoint="http://127.0.0.1:1")
+            opencode._ensure_context_transport(context)
+        start_context_server.assert_called_once_with(context)
+
     def test_claude_resume_accepts_resolved_worktree_descendants(self) -> None:
         adapter, runner = self.build("claude")
         session_ref = "11111111-1111-4111-8111-111111111111"

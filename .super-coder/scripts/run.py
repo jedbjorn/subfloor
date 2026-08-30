@@ -57,6 +57,7 @@ import callable_floor  # noqa: E402
 import conversation_boot  # noqa: E402
 import db_driver  # noqa: E402
 import devkit  # noqa: E402
+import execution_view  # noqa: E402  — role/repo-mode harness containment
 import git_freshness  # noqa: E402
 import git_prune  # noqa: E402  — boot-time prune of provably-merged local branches
 import global_pointer  # noqa: E402
@@ -1387,6 +1388,7 @@ class LaunchPlan(NamedTuple):
     effort: "str | None"
     cli_version: "str | None"
     boot_content: str
+    execution_view: execution_view.ExecutionView
 
 
 def cleanup_before_launch(
@@ -1637,6 +1639,21 @@ def prepare_launch(*, shell_id: int, harness: "str | None" = None,
             "(unknown, deleted, or neither owned nor shared)")
     chosen = dict(row)
 
+    if os.environ.get("RENDER_ONLY"):
+        shell_view = execution_view.ExecutionView(mode="render-only")
+    else:
+        try:
+            shell_view = execution_view.build(
+                engine=ENGINE,
+                repo_root=REPO_ROOT,
+                flavor=chosen["flavor"],
+                source_mode=install.is_source_repo(),
+            )
+            shell_view.preflight()
+        except execution_view.ExecutionViewError as exc:
+            con.close()
+            raise LaunchError(str(exc)) from exc
+
     # Harness route, picker-free: the reservation's harness wins; else this
     # flavor's default harness; else instance.json / 'claude' — the same
     # fallback chain main() feeds its picker as the default.
@@ -1868,25 +1885,28 @@ def prepare_launch(*, shell_id: int, harness: "str | None" = None,
         if route_projection is not None
         else (headless_effort_env(adapter, session_effort) if headless else {})
     )
-    env = {**os.environ, **{k: str(v) for k, v in adapter.get("env", {}).items()},
-           **sandbox_env, **effort_env}
+    env = shell_view.environment(
+        {**os.environ, **{k: str(v) for k, v in adapter.get("env", {}).items()},
+         **sandbox_env, **effort_env}
+    )
     env["SC_SHELL_FLAVOR"] = chosen["flavor"] or ""
     env["SC_API_TOKEN"] = full["api_key"] or ""
     env["SC_API_BASE"] = f"http://127.0.0.1:{api_port}" if api_port else ""
     env["SC_SHELL_ID"] = str(chosen["shell_id"])
     env["SC_SHELL_SHORTNAME"] = chosen["shortname"]
-    env["SC_ENGINE_DIR"] = str(ENGINE)
     env["SC_HARNESS"] = harness
     env["SC_SHELL_WORKTREE"] = str(work_dir)
-    env["SC_ROOT"] = str(REPO_ROOT)
+    if not shell_view.restricted:
+        env["SC_ENGINE_DIR"] = str(ENGINE)
+        env["SC_ROOT"] = str(REPO_ROOT)
     env["PATH"] = _shell_path(work_dir, env.get("PATH", ""))
 
-    return LaunchPlan(argv=argv, env=env, cwd=str(work_dir),
+    return LaunchPlan(argv=shell_view.command(argv), env=env, cwd=str(work_dir),
                       session_id=session_id, archive_id=archive_id,
                       harness=harness, model=session_model,
                       effort=session_effort,
                       cli_version=_cli_version(argv[0]) if argv else None,
-                      boot_content=content)
+                      boot_content=content, execution_view=shell_view)
 
 
 # ── Main ────────────────────────────────────────────────────────────────────
@@ -2055,6 +2075,23 @@ def main() -> None:
     else:
         launchable = list_shells(con, user["user_id"])
         chosen = pick_shell(launchable, requested, first, fdefaults, snap)
+    if os.environ.get("RENDER_ONLY"):
+        shell_view = execution_view.ExecutionView(mode="render-only")
+    else:
+        try:
+            shell_view = execution_view.build(
+                engine=ENGINE,
+                repo_root=REPO_ROOT,
+                flavor=chosen["flavor"],
+                source_mode=source_repo,
+            )
+            shell_view.preflight()
+        except execution_view.ExecutionViewError as exc:
+            con.close()
+            prefix = "sc admin" if host_admin else (
+                "sc run" if headless else "session launch"
+            )
+            sys.exit(f"{prefix}: {exc}")
     if browser_conversation_active(con, chosen["shell_id"]):
         con.close()
         sys.exit(
@@ -2422,8 +2459,10 @@ def main() -> None:
         )
     )
     effort_env = headless_effort_env(adapter, session_effort) if headless else {}
-    env = {**os.environ, **{k: str(v) for k, v in adapter.get("env", {}).items()},
-           **sandbox_env, **effort_env}
+    env = shell_view.environment(
+        {**os.environ, **{k: str(v) for k, v in adapter.get("env", {}).items()},
+         **sandbox_env, **effort_env}
+    )
     # The booted shell's flavor, inherited by everything the harness spawns.
     # branch-guard.sh reads it to exempt the admin shell (which works on main
     # by mandate); like SC_PROTECTED_BRANCHES it's a guardrail, not a boundary.
@@ -2434,12 +2473,8 @@ def main() -> None:
     env["SC_SHELL_SHORTNAME"] = chosen["shortname"]
     env["SC_API_TOKEN"] = full["api_key"] or ""
     env["SC_API_BASE"] = f"http://127.0.0.1:{api_port}" if api_port else ""
-    # Optional fast-path for the branch-guard hooks: the absolute engine path, so
-    # they skip the `git rev-parse --git-common-dir` walk. NOT load-bearing — the
-    # hooks resolve the engine env-independently (a fork gitignores .super-coder/,
-    # so it is absent from worktrees; a worktree-relative path failed open). This
-    # just saves a subshell per edit on the normal launch path.
-    env["SC_ENGINE_DIR"] = str(ENGINE)
+    # Admin keeps the engine-path fast path for maintenance hooks. Restricted
+    # shells use the env-independent git-common-dir resolution instead.
     env["SC_HARNESS"] = harness
     # The shell's HOME worktree — the dir we exec the harness from (below). The
     # branch-guard reads it to judge "outside your worktree" against the assigned
@@ -2454,12 +2489,11 @@ def main() -> None:
     # root for a convenient `./sc …` call — and because Bash cwd persists, every
     # LATER bare git/grep then silently targeted the main tree (a different branch),
     # so the shell's own worktree edits looked gone. Kill the trigger structurally:
-    # export the root and prepend it to PATH so `sc …` resolves bare from ANY cwd,
-    # and raw DB reads can address the engine by $SC_ROOT — no `cd` ever needed. One
-    # invariant ("never cd; address the engine by path") instead of per-command
-    # vigilance. Works in both the docker sandbox and the no-docker host path since
-    # run.py is the single exec chokepoint for every harness.
-    env["SC_ROOT"] = str(REPO_ROOT)
+    # prepend the worktree to PATH so `sc …` resolves bare from any cwd. Admin
+    # additionally receives the maintenance root; restricted shells do not.
+    if not shell_view.restricted:
+        env["SC_ENGINE_DIR"] = str(ENGINE)
+        env["SC_ROOT"] = str(REPO_ROOT)
     env["PATH"] = _shell_path(work_dir, env.get("PATH", ""))
     # Operator-declared shared dirs that all shells may write into without
     # branch-guard warnings — host-level handoff/screenshot folders. Set
@@ -2472,8 +2506,9 @@ def main() -> None:
     # H-25: claim the pid we are ABOUT to become for this shell.
     record_launch(full["shell_id"], work_dir, harness, headless=headless)
     os.chdir(work_dir)
+    command = shell_view.command(cmd)
     print(f"→ exec {' '.join(cmd)}\n")
-    os.execvpe(cmd[0], cmd, env)
+    os.execvpe(command[0], command, env)
 
 
 def _self_start_ticks() -> "int | None":
