@@ -311,8 +311,10 @@ def starting_team_exists() -> bool:
         return False
     import sqlite3
 
+    con = None
     try:
-        with sqlite3.connect(db) as con:
+        con = sqlite3.connect(db)
+        with con:
             users = con.execute(
                 "SELECT COUNT(*) FROM users WHERE is_active=1"
             ).fetchone()[0]
@@ -322,6 +324,9 @@ def starting_team_exists() -> bool:
             return users == 1 and shells == 10
     except sqlite3.Error:
         return False
+    finally:
+        if con is not None:
+            con.close()
 
 
 def detect_harness() -> str | None:
