@@ -240,6 +240,7 @@ class ScFixture:
             "callable_floor.py",
             "engine_manifest.py",
             "global_pointer.py",
+            "instance_state.py",
             "ports.py",
             "artifact_policy.py",
             "harness_versions.py",

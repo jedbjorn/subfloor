@@ -482,16 +482,18 @@ def production_consumer_inventory() -> tuple[StateConsumer, ...]:
 
 
 def main(argv: list[str]) -> int:
-    if len(argv) == 2 and argv[0] == "active-database":
-        print(active_database_path(Path(argv[1])))
-        return 0
-    raise InstanceStateError(
-        "usage: instance_state.py active-database <engine-directory>"
-    )
+    try:
+        if len(argv) == 2 and argv[0] == "active-database":
+            print(active_database_path(Path(argv[1])))
+            return 0
+        raise InstanceStateError(
+            "usage: instance_state.py active-database <engine-directory>"
+        )
+    except InstanceStateError as exc:
+        raise SystemExit(f"instance-state: {exc}") from exc
 
 
 if __name__ == "__main__":
-    try:
-        raise SystemExit(main(sys.argv[1:]))
-    except InstanceStateError as exc:
-        raise SystemExit(f"instance-state: {exc}") from exc
+    from cli_entry import run_cli
+
+    raise SystemExit(run_cli(main, sys.argv[1:]))
