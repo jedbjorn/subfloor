@@ -221,7 +221,7 @@ def ensure_backup_ignore(repo_root: Path) -> None:
 
 
 def new_backup_dir(repo_root: Path) -> Path:
-    root = repo_root / ".sc-state" / "db_backups" / "removal"
+    root = instance_state.active_backup_paths(repo_root).local / "removal"
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
     destination = root / stamp
     destination.mkdir(parents=True, mode=0o700)

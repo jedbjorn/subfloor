@@ -32,6 +32,8 @@ import socket
 import sys
 from pathlib import Path
 
+import instance_state
+
 ENGINE = Path(__file__).resolve().parents[1]
 REPO_ROOT = ENGINE.parent
 CONFIG = ENGINE / "instance.json"
@@ -150,14 +152,11 @@ def _runtime_view(stored: dict) -> dict:
 
 
 def _write_config(cfg: dict) -> None:
-    stored = _load_config()
-    preserved = {
-        key: value for key, value in stored.items() if key not in MANAGED_KEYS
-    }
-    preserved.update(cfg)
-    if preserved == stored:
-        return
-    CONFIG.write_text(json.dumps(preserved, indent=2) + "\n")
+    instance_state.merge_instance_config(
+        CONFIG,
+        cfg,
+        replace_keys=MANAGED_KEYS,
+    )
 
 
 def resolve(persist: bool = False) -> dict:

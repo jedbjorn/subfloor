@@ -11,6 +11,8 @@ from contextlib import contextmanager
 from fcntl import LOCK_EX, LOCK_UN, flock
 from pathlib import Path
 
+import instance_state
+
 ENGINE = Path(__file__).resolve().parents[1]
 REPO_ROOT = ENGINE.parent
 STATE_DIR = REPO_ROOT / ".sc-state"
@@ -64,7 +66,7 @@ def tracks_local_artifacts() -> bool:
 
 
 def content_path() -> Path:
-    return LOCAL_DIR / "content.sql"
+    return instance_state.active_snapshot_path(REPO_ROOT)
 
 
 def render_root() -> Path:
@@ -113,7 +115,7 @@ def devkit_log_root(repo_root: Path | None = None) -> Path:
 @contextmanager
 def content_write_lock():
     """Serialize snapshot + flat-render pairs across API and CLI processes."""
-    path = LOCAL_DIR / ".content-write.lock"
+    path = instance_state.active_snapshot_lock_path(REPO_ROOT)
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a+") as handle:
         flock(handle.fileno(), LOCK_EX)
@@ -159,7 +161,7 @@ def prepare_local_state() -> list[Path]:
     """
     copied: list[Path] = []
     pairs = [
-        (STATE_DIR / "content.sql", LOCAL_DIR / "content.sql"),
+        (STATE_DIR / "content.sql", content_path()),
         (STATE_DIR / "map_content.sql", LOCAL_DIR / "map" / "content.sql"),
         (STATE_DIR / "map.config.json", LOCAL_DIR / "map" / "config.json"),
         (STATE_DIR / "skills_retired.json", LOCAL_DIR / "skills_retired.json"),

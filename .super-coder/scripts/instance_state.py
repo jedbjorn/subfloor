@@ -12,7 +12,7 @@ import os
 import secrets
 import stat
 import sys
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Collection, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
 from fcntl import LOCK_EX, LOCK_UN, flock
@@ -51,6 +51,10 @@ class InstanceState:
         return self.root / "content.sql"
 
     @property
+    def snapshot_lock(self) -> Path:
+        return self.root / ".content-write.lock"
+
+    @property
     def backups(self) -> Path:
         return self.root / "db_backups"
 
@@ -78,6 +82,20 @@ class StateConsumer:
     owner: str
     paths: tuple[str, ...]
     responsibility: str
+
+
+@dataclass(frozen=True)
+class ActiveBackupPaths:
+    """Pre-cutover backup destinations selected through the common seam."""
+
+    home: Path
+    local: Path
+    override: Path | None = None
+
+    @property
+    def candidates(self) -> tuple[Path, ...]:
+        ordered = (self.override, self.home, self.local)
+        return tuple(dict.fromkeys(path for path in ordered if path is not None))
 
 
 # Exact WU141 preparation inventory.  DB owners adopt active_database_path in
@@ -142,6 +160,14 @@ PRODUCTION_CONSUMERS = (
             ".super-coder/scripts/shell_liveness.py",
         ),
         "launch refusal and bounded liveness reads",
+    ),
+    StateConsumer(
+        "instance_configuration",
+        (
+            ".super-coder/scripts/ports.py",
+            ".super-coder/scripts/feature.py",
+        ),
+        "locked owner-local configuration mutation",
     ),
     StateConsumer(
         "catalogue_writers",
@@ -329,23 +355,35 @@ def ensure_instance_id(
         return winner
 
 
-def update_bound_instance_config(
+def merge_instance_config(
     config_path: Path,
     changes: Mapping[str, object],
     *,
+    remove: Collection[str] = (),
+    replace_keys: Collection[str] = (),
+    require_instance_id: bool = False,
     owner_uid: int | None = None,
 ) -> dict:
-    """Atomically update fields without changing a bound installation ID."""
-    if INSTANCE_ID_KEY in changes:
+    """Lock, reread, and atomically merge one owner-local configuration."""
+    if INSTANCE_ID_KEY in changes or INSTANCE_ID_KEY in remove:
         raise InstanceStateError("instance ID can only be assigned by the resolver")
+    if INSTANCE_ID_KEY in replace_keys:
+        raise InstanceStateError("instance ID cannot be a replaceable configuration key")
     uid = os.geteuid() if owner_uid is None else owner_uid
     config_path = Path(config_path)
     with _instance_id_lock(config_path, uid):
         payload = _read_instance_config(config_path, uid)
         instance_id = _persisted_instance_id(payload)
-        if instance_id is None:
+        if require_instance_id and instance_id is None:
             raise InstanceStateError("instance configuration has no instance ID")
+        for key in replace_keys:
+            if key not in changes:
+                payload.pop(key, None)
+        for key in remove:
+            payload.pop(key, None)
         payload.update(changes)
+        if payload == _read_instance_config(config_path, uid):
+            return payload
         _atomic_write_json(
             config_path,
             payload,
@@ -356,6 +394,21 @@ def update_bound_instance_config(
         if _persisted_instance_id(durable) != instance_id:
             raise InstanceStateError("instance identity changed during configuration update")
         return durable
+
+
+def update_bound_instance_config(
+    config_path: Path,
+    changes: Mapping[str, object],
+    *,
+    owner_uid: int | None = None,
+) -> dict:
+    """Atomically update fields on an already-bound installation."""
+    return merge_instance_config(
+        config_path,
+        changes,
+        require_instance_id=True,
+        owner_uid=owner_uid,
+    )
 
 
 def _state_home(environ: Mapping[str, str]) -> Path:
@@ -498,11 +551,54 @@ def active_database_path(
     private target here.  Until then, even a fully validated ``InstanceState``
     is refused rather than selected.
     """
+    _refuse_private_activation(private_state)
+    return Path(engine) / "shell_db.db"
+
+
+def _refuse_private_activation(private_state: InstanceState | None) -> None:
     if private_state is not None:
         raise MaintenanceCutoverRequired(
             "private engine state requires the spec #133 maintenance cutover"
         )
-    return Path(engine) / "shell_db.db"
+
+
+def active_snapshot_path(
+    repo_root: Path,
+    *,
+    private_state: InstanceState | None = None,
+) -> Path:
+    """Return the effective snapshot path without activating private state."""
+    _refuse_private_activation(private_state)
+    return Path(repo_root) / ".sc-state" / "local" / "content.sql"
+
+
+def active_snapshot_lock_path(
+    repo_root: Path,
+    *,
+    private_state: InstanceState | None = None,
+) -> Path:
+    """Return the lock paired with the effective snapshot path."""
+    _refuse_private_activation(private_state)
+    return Path(repo_root) / ".sc-state" / "local" / ".content-write.lock"
+
+
+def active_backup_paths(
+    repo_root: Path,
+    environ: Mapping[str, str] | None = None,
+    *,
+    private_state: InstanceState | None = None,
+) -> ActiveBackupPaths:
+    """Return ordered pre-cutover backup paths through one activation seam."""
+    _refuse_private_activation(private_state)
+    env = os.environ if environ is None else environ
+    root = Path(repo_root)
+    home = Path(env.get("HOME") or Path.home()).expanduser()
+    configured = env.get("SC_DB_BACKUP_DIR", "").strip()
+    return ActiveBackupPaths(
+        override=Path(configured).expanduser() if configured else None,
+        home=home / "db_backups" / root.name,
+        local=root / ".sc-state" / "db_backups",
+    )
 
 
 def production_consumer_inventory() -> tuple[StateConsumer, ...]:
@@ -515,10 +611,14 @@ def main(argv: list[str]) -> int:
         if len(argv) == 2 and argv[0] == "active-database":
             print(active_database_path(Path(argv[1])))
             return 0
+        if len(argv) == 4 and argv[0] == "config-set":
+            merge_instance_config(Path(argv[1]), {argv[2]: json.loads(argv[3])})
+            return 0
         raise InstanceStateError(
-            "usage: instance_state.py active-database <engine-directory>"
+            "usage: instance_state.py active-database <engine-directory> | "
+            "config-set <instance.json> <key> <json-value>"
         )
-    except InstanceStateError as exc:
+    except (InstanceStateError, json.JSONDecodeError) as exc:
         raise SystemExit(f"instance-state: {exc}") from exc
 
 

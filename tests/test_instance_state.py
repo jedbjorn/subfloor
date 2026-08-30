@@ -12,6 +12,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from typing import ClassVar
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 MODULE_PATH = ROOT / ".super-coder" / "scripts" / "instance_state.py"
@@ -33,6 +34,35 @@ def _concurrent_resolve_worker(config, state_home, candidate, barrier, results):
         id_factory=candidate_factory,
     )
     results.put(("ok", resolved.instance_id, str(resolved.root)))
+
+
+def _configuration_writer_worker(kind, config, barrier, results):
+    scripts = str(ROOT / ".super-coder" / "scripts")
+    if scripts not in sys.path:
+        sys.path.insert(0, scripts)
+    original_merge = instance_state.merge_instance_config
+
+    def synchronized_merge(*args, **kwargs):
+        barrier.wait(timeout=10)
+        return original_merge(*args, **kwargs)
+
+    try:
+        if kind == "ports":
+            import ports
+
+            ports.CONFIG = config
+            ports.instance_state.merge_instance_config = synchronized_merge
+            ports.save({"port": 8837, "dev_port": 8838, "repo": "repo"})
+        else:
+            import feature
+
+            feature.INSTANCE = config
+            feature.instance_state.merge_instance_config = synchronized_merge
+            feature._update_instance({"pg": {}})
+        results.put(("ok", kind))
+    except BaseException as exc:
+        results.put(("error", kind, repr(exc)))
+        raise
 
 
 class InstanceStateResolverTests(unittest.TestCase):
@@ -66,6 +96,9 @@ class InstanceStateResolverTests(unittest.TestCase):
         )
         self.assertEqual(resolved.database, resolved.root / "shell_db.db")
         self.assertEqual(resolved.snapshot, resolved.root / "content.sql")
+        self.assertEqual(
+            resolved.snapshot_lock, resolved.root / ".content-write.lock"
+        )
         self.assertEqual(resolved.backups, resolved.root / "db_backups")
         self.assertEqual(resolved.maintenance_lock, resolved.root / "maintenance.lock")
         self.assertEqual(
@@ -153,6 +186,79 @@ class InstanceStateResolverTests(unittest.TestCase):
                     self.assertEqual(json.loads(config.read_text())["port"], 8837)
                 roots = list((state_home / "subfloor" / "instances").iterdir())
                 self.assertEqual([root.name for root in roots], [winner])
+
+    def test_configuration_writers_cannot_erase_a_concurrent_identity(self):
+        context = multiprocessing.get_context("fork")
+        for kind in ("ports", "feature"):
+            with self.subTest(writer=kind):
+                case = self.base / kind
+                config = case / "repo" / ".super-coder" / "instance.json"
+                config.parent.mkdir(parents=True)
+                config.write_text(json.dumps({"port": 8837}) + "\n")
+                state_home = case / "state"
+                barrier = context.Barrier(2)
+                results = context.Queue()
+                writer = context.Process(
+                    target=_configuration_writer_worker,
+                    args=(kind, config, barrier, results),
+                )
+                resolver = context.Process(
+                    target=_concurrent_resolve_worker,
+                    args=(config, state_home, "a" * 32, barrier, results),
+                )
+                writer.start()
+                resolver.start()
+                for process in (writer, resolver):
+                    process.join(timeout=15)
+                    self.assertFalse(process.is_alive(), f"{kind} race deadlocked")
+                    self.assertEqual(process.exitcode, 0)
+                outcomes = [results.get(timeout=2), results.get(timeout=2)]
+                self.assertEqual({outcome[0] for outcome in outcomes}, {"ok"})
+                stored = json.loads(config.read_text())
+                self.assertEqual(stored["instance_id"], "a" * 32)
+                self.assertEqual(
+                    instance_state.ensure_instance_id(
+                        config, id_factory=lambda: "b" * 32
+                    ),
+                    "a" * 32,
+                )
+                roots = list((state_home / "subfloor" / "instances").iterdir())
+                self.assertEqual([root.name for root in roots], ["a" * 32])
+
+    def test_every_configuration_writer_refuses_malformed_state(self):
+        scripts = str(ROOT / ".super-coder" / "scripts")
+        if scripts not in sys.path:
+            sys.path.insert(0, scripts)
+        import feature
+        import ports
+
+        self.config.write_text("{\n")
+        with (
+            mock.patch.object(ports, "CONFIG", self.config),
+            self.assertRaisesRegex(RuntimeError, "cannot read"),
+        ):
+            ports.save({"port": 8837})
+        with (
+            mock.patch.object(feature, "INSTANCE", self.config),
+            self.assertRaisesRegex(RuntimeError, "cannot read"),
+        ):
+            feature._update_instance({"pg": {}})
+        self.assertEqual(self.config.read_text(), "{\n")
+        self.assertFalse(self.state_home.exists())
+
+    def test_configuration_cli_preserves_the_bound_identity(self):
+        resolved = self.resolve()
+
+        self.assertEqual(
+            instance_state.main(
+                ["config-set", str(self.config), "pg", json.dumps({})]
+            ),
+            0,
+        )
+
+        stored = json.loads(self.config.read_text())
+        self.assertEqual(stored["instance_id"], resolved.instance_id)
+        self.assertEqual(stored["pg"], {})
 
     def test_repository_movement_keeps_private_binding(self):
         first = self.resolve()
@@ -312,28 +418,71 @@ class InstanceStateResolverTests(unittest.TestCase):
         self.assertFalse(legacy.exists())
         self.assertFalse(resolved.database.exists())
 
+    def test_snapshot_and_backup_paths_share_the_refusing_activation_seam(self):
+        resolved = self.resolve()
+        snapshot = self.repo / ".sc-state" / "local" / "content.sql"
+        snapshot_lock = snapshot.parent / ".content-write.lock"
+        backup_paths = instance_state.active_backup_paths(
+            self.repo,
+            {"HOME": str(self.base / "home"), "SC_DB_BACKUP_DIR": str(self.base / "override")},
+        )
+
+        self.assertEqual(instance_state.active_snapshot_path(self.repo), snapshot)
+        self.assertEqual(
+            instance_state.active_snapshot_lock_path(self.repo), snapshot_lock
+        )
+        self.assertEqual(backup_paths.override, self.base / "override")
+        self.assertEqual(
+            backup_paths.home, self.base / "home" / "db_backups" / "repo"
+        )
+        self.assertEqual(
+            backup_paths.local, self.repo / ".sc-state" / "db_backups"
+        )
+        for selector in (
+            instance_state.active_snapshot_path,
+            instance_state.active_snapshot_lock_path,
+            instance_state.active_backup_paths,
+        ):
+            with self.assertRaisesRegex(
+                instance_state.MaintenanceCutoverRequired,
+                "spec #133 maintenance cutover",
+            ):
+                selector(self.repo, private_state=resolved)
+        self.assertFalse(snapshot.exists())
+        self.assertFalse(resolved.snapshot.exists())
+        self.assertFalse(resolved.backups.exists())
+
 
 class ProductionSeamInventoryTests(unittest.TestCase):
-    DIRECT_RESOLVER_OWNERS: ClassVar[set[str]] = {
-        ".super-coder/api/server.py",
-        ".super-coder/api/conversation_routes.py",
-        ".super-coder/scripts/analytics.py",
-        ".super-coder/scripts/init_fork.py",
-        ".super-coder/scripts/install.py",
-        ".super-coder/scripts/map_db.py",
-        ".super-coder/scripts/models.py",
-        ".super-coder/scripts/rebuild.py",
-        ".super-coder/scripts/remove.py",
-        ".super-coder/scripts/render.py",
-        ".super-coder/scripts/render_check.py",
-        ".super-coder/scripts/rollback.py",
-        ".super-coder/scripts/run.py",
-        ".super-coder/scripts/seed_dogfood.py",
-        ".super-coder/scripts/seed_skills.py",
-        ".super-coder/scripts/shell_liveness.py",
-        ".super-coder/scripts/skill.py",
-        ".super-coder/scripts/snapshot.py",
-        ".super-coder/scripts/update.py",
+    DIRECT_RESOLVER_CALLS: ClassVar[dict[str, tuple[str, ...]]] = dict.fromkeys(
+        {
+            ".super-coder/api/server.py",
+            ".super-coder/api/conversation_routes.py",
+            ".super-coder/scripts/analytics.py",
+            ".super-coder/scripts/init_fork.py",
+            ".super-coder/scripts/install.py",
+            ".super-coder/scripts/map_db.py",
+            ".super-coder/scripts/models.py",
+            ".super-coder/scripts/rebuild.py",
+            ".super-coder/scripts/remove.py",
+            ".super-coder/scripts/render.py",
+            ".super-coder/scripts/render_check.py",
+            ".super-coder/scripts/rollback.py",
+            ".super-coder/scripts/run.py",
+            ".super-coder/scripts/seed_dogfood.py",
+            ".super-coder/scripts/seed_skills.py",
+            ".super-coder/scripts/shell_liveness.py",
+            ".super-coder/scripts/skill.py",
+            ".super-coder/scripts/snapshot.py",
+            ".super-coder/scripts/update.py",
+        },
+        ("active_database_path",),
+    ) | {
+        ".super-coder/scripts/artifact_policy.py": (
+            "active_snapshot_path",
+            "active_snapshot_lock_path",
+        ),
+        ".super-coder/scripts/db_backup.py": ("active_backup_paths",),
     }
 
     def test_inventory_is_exact_and_every_direct_owner_uses_resolver(self):
@@ -349,33 +498,62 @@ class ProductionSeamInventoryTests(unittest.TestCase):
                 "install_and_update",
                 "rollback_remove_and_eject",
                 "shell_entry_and_liveness",
+                "instance_configuration",
                 "catalogue_writers",
                 "legacy_and_candidate_paths",
             },
         )
         paths = [path for entry in inventory for path in entry.paths]
         self.assertEqual(len(paths), len(set(paths)))
-        self.assertLessEqual(self.DIRECT_RESOLVER_OWNERS, set(paths))
+        self.assertLessEqual(set(self.DIRECT_RESOLVER_CALLS), set(paths))
         for relative in paths:
             source = ROOT / relative
             self.assertTrue(source.is_file(), relative)
 
-        for relative in self.DIRECT_RESOLVER_OWNERS:
+        for relative, calls in self.DIRECT_RESOLVER_CALLS.items():
             source = (ROOT / relative).read_text()
             self.assertIn("instance_state", source, relative)
-            self.assertIn("active_database_path", source, relative)
+            for call in calls:
+                self.assertIn(call, source, relative)
 
         dispatcher = (ROOT / ".super-coder/scripts/dispatch.sh").read_text()
         self.assertIn(
             '"$S/instance_state.py" active-database "$ENGINE"',
             dispatcher,
         )
+        self.assertEqual(dispatcher.count('instance_state.py" config-set'), 2)
+        self.assertNotIn("p.write_text(json.dumps(d", dispatcher)
+        self.assertNotIn('> "$f"', dispatcher)
+        for relative in (
+            ".super-coder/scripts/ports.py",
+            ".super-coder/scripts/feature.py",
+        ):
+            source = (ROOT / relative).read_text()
+            self.assertIn("instance_state.merge_instance_config", source, relative)
+            self.assertNotRegex(source, r"INSTANCE\.write_text|CONFIG\.write_text")
         driver = (ROOT / ".super-coder/scripts/db_driver.py").read_text()
         self.assertIn("instance_state.active_database_path", driver)
         installer = (ROOT / ".super-coder/scripts/install.py").read_text()
         self.assertIn("installation_state = instance_state.resolve(", installer)
         self.assertIn("instance_config=ports_mod.CONFIG", installer)
         self.assertIn("instance_state.update_bound_instance_config", installer)
+        expected_call_chain = {
+            ".super-coder/scripts/snapshot.py": ("artifact_policy.content_path",),
+            ".super-coder/scripts/rebuild.py": (
+                "artifact_policy.content_path",
+                "db_backup_mod.select_backup_dir",
+            ),
+            ".super-coder/scripts/update.py": ("rebuild_mod.backup_existing",),
+            ".super-coder/scripts/rollback.py": ("db_backup_mod.latest_backup",),
+            ".super-coder/scripts/remove.py": (
+                "instance_state.active_backup_paths",
+                "db_backup.backup_database",
+            ),
+        }
+        for relative, calls in expected_call_chain.items():
+            source = (ROOT / relative).read_text()
+            for call in calls:
+                self.assertIn(call, source, relative)
 
     def test_daemons_receive_resolved_path_and_do_not_choose_a_live_target(self):
         server = (ROOT / ".super-coder/api/server.py").read_text()
@@ -448,6 +626,32 @@ class ProductionSeamInventoryTests(unittest.TestCase):
             discovered - classified,
             "runtime state references are missing from the cutover inventory",
         )
+
+    def test_snapshot_and_backup_owners_have_no_second_active_selector(self):
+        snapshot_selector = re.compile(
+            r"LOCAL_DIR\s*/\s*[\"']content\.sql[\"']|"
+            r"LOCAL_DIR\s*/\s*[\"']\.content-write\.lock[\"']"
+        )
+        backup_selector = re.compile(
+            r"[\"']db_backups[\"']\s*/\s*repo_root\.name|"
+            r"repo_root\s*/\s*[\"']\.sc-state[\"']\s*/\s*[\"']db_backups[\"']"
+        )
+        self.assertRegex('LOCAL_DIR / "content.sql"', snapshot_selector)
+        self.assertRegex(
+            'repo_root / ".sc-state" / "db_backups"', backup_selector
+        )
+        for relative in (
+            ".super-coder/scripts/artifact_policy.py",
+            ".super-coder/scripts/db_backup.py",
+            ".super-coder/scripts/rebuild.py",
+            ".super-coder/scripts/snapshot.py",
+            ".super-coder/scripts/update.py",
+            ".super-coder/scripts/rollback.py",
+            ".super-coder/scripts/remove.py",
+        ):
+            source = (ROOT / relative).read_text()
+            self.assertNotRegex(source, snapshot_selector, relative)
+            self.assertNotRegex(source, backup_selector, relative)
 
 
 if __name__ == "__main__":

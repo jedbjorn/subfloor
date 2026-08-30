@@ -705,18 +705,9 @@ sc_db_init() {
   f="$ENGINE/instance.json"
   if [ -f "$f" ] && "$PY" -c "import json,sys; d=json.load(open('$f')); sys.exit(0 if 'db' in d else 1)" 2>/dev/null; then
     echo "→ db: already configured in $f"
-  elif [ -f "$f" ]; then
-    "$PY" -c "
-import json,pathlib
-p=pathlib.Path('$f')
-d=json.loads(p.read_text())
-d['db']={'dsn_env':'SC_RO_DSN','allow_tables':['skill_runs','tool_call_attempts','models'],'row_cap':1000,'statement_timeout_ms':5000}
-p.write_text(json.dumps(d,indent=2)+'\n')
-print('-> db: added to $f')
-"
   else
-    printf '{\"db\":{\"dsn_env\":\"SC_RO_DSN\",\"allow_tables\":[\"skill_runs\",\"tool_call_attempts\",\"models\"],\"row_cap\":1000,\"statement_timeout_ms\":5000}}\n' > "$f"
-    echo "→ db: created $f with db block"
+    "$PY" "$S/instance_state.py" config-set "$f" db '{"dsn_env":"SC_RO_DSN","allow_tables":["skill_runs","tool_call_attempts","models"],"row_cap":1000,"statement_timeout_ms":5000}' || return 1
+    echo "→ db: added to $f"
   fi
   echo "  Host-side setup (the sandbox never sees the credential):"
   echo "    1. Provision a read-only role on the live DB, e.g.:"
@@ -782,21 +773,11 @@ sc_pg_down() {
 }
 sc_pg_init() {
   f="$ENGINE/instance.json"
-  if [ -f "$f" ]; then
-    if "$PY" -c "import json,sys; d=json.load(open('$f')); sys.exit(0 if 'pg' in d else 1)" 2>/dev/null; then
-      echo "→ pg: already configured in $f"; return 0
-    fi
-    "$PY" -c "
-import json,pathlib
-p=pathlib.Path('$f')
-d=json.loads(p.read_text())
-d['pg']={}
-p.write_text(json.dumps(d,indent=2)+'\n')
-print('-> pg: added to $f')
-"
+  if [ -f "$f" ] && "$PY" -c "import json,sys; d=json.load(open('$f')); sys.exit(0 if 'pg' in d else 1)" 2>/dev/null; then
+    echo "→ pg: already configured in $f"; return 0
   else
-    printf '{\"pg\":{}}\n' > "$f"
-    echo "→ pg: created $f with pg block"
+    "$PY" "$S/instance_state.py" config-set "$f" pg '{}' || return 1
+    echo "→ pg: added to $f"
   fi
   echo "  next: ./sc pg-up   (or ./sc launch — pg starts automatically)"
 }
