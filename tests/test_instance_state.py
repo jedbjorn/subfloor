@@ -93,6 +93,28 @@ class InstanceStateResolverTests(unittest.TestCase):
         self.assertTrue(stored["custom"])
         self.assertEqual(stored["instance_id"], self.fixed_id)
 
+    def test_bound_configuration_update_preserves_identity_and_unknown_fields(self):
+        self.config.write_text(json.dumps({"custom": True}) + "\n")
+        resolved = self.resolve()
+
+        stored = instance_state.update_bound_instance_config(
+            self.config,
+            {"port": 8837, "installed_at": "2099-01-01"},
+        )
+
+        self.assertEqual(stored["instance_id"], resolved.instance_id)
+        self.assertTrue(stored["custom"])
+        self.assertEqual(stored["port"], 8837)
+        self.assertEqual(stored["installed_at"], "2099-01-01")
+        with self.assertRaisesRegex(
+            instance_state.InstanceStateError,
+            "only be assigned by the resolver",
+        ):
+            instance_state.update_bound_instance_config(
+                self.config,
+                {"instance_id": "f" * 32},
+            )
+
     def test_concurrent_first_assignment_has_one_durable_winner(self):
         context = multiprocessing.get_context("fork")
         for existing in (False, True):
@@ -351,10 +373,9 @@ class ProductionSeamInventoryTests(unittest.TestCase):
         driver = (ROOT / ".super-coder/scripts/db_driver.py").read_text()
         self.assertIn("instance_state.active_database_path", driver)
         installer = (ROOT / ".super-coder/scripts/install.py").read_text()
-        self.assertIn(
-            "instance_state.resolve(instance_config=ports_mod.CONFIG)",
-            installer,
-        )
+        self.assertIn("installation_state = instance_state.resolve(", installer)
+        self.assertIn("instance_config=ports_mod.CONFIG", installer)
+        self.assertIn("instance_state.update_bound_instance_config", installer)
 
     def test_daemons_receive_resolved_path_and_do_not_choose_a_live_target(self):
         server = (ROOT / ".super-coder/api/server.py").read_text()
@@ -376,6 +397,15 @@ class ProductionSeamInventoryTests(unittest.TestCase):
             source.count("return Path(engine) / \"shell_db.db\""),
             1,
         )
+        runtime_selector = re.compile(
+            r"(?:/|\+)\s*[\"']shell_db\.db[\"']|"
+            r"[\"']shell_db\.db[\"']\s*(?:/|\+)"
+        )
+        self.assertRegex(
+            'source = repo_root / ".super-coder" / "shell_db.db"',
+            runtime_selector,
+            "the bypass detector must fail on a second runtime selector",
+        )
         for directory in (
             ROOT / ".super-coder" / "api",
             ROOT / ".super-coder" / "scripts",
@@ -387,7 +417,7 @@ class ProductionSeamInventoryTests(unittest.TestCase):
                         continue
                     self.assertNotRegex(
                         path.read_text(),
-                        r"(?:ENGINE|engine)\s*/\s*[\"']shell_db\.db[\"']",
+                        runtime_selector,
                         path.relative_to(ROOT).as_posix(),
                     )
 

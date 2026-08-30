@@ -329,6 +329,35 @@ def ensure_instance_id(
         return winner
 
 
+def update_bound_instance_config(
+    config_path: Path,
+    changes: Mapping[str, object],
+    *,
+    owner_uid: int | None = None,
+) -> dict:
+    """Atomically update fields without changing a bound installation ID."""
+    if INSTANCE_ID_KEY in changes:
+        raise InstanceStateError("instance ID can only be assigned by the resolver")
+    uid = os.geteuid() if owner_uid is None else owner_uid
+    config_path = Path(config_path)
+    with _instance_id_lock(config_path, uid):
+        payload = _read_instance_config(config_path, uid)
+        instance_id = _persisted_instance_id(payload)
+        if instance_id is None:
+            raise InstanceStateError("instance configuration has no instance ID")
+        payload.update(changes)
+        _atomic_write_json(
+            config_path,
+            payload,
+            uid,
+            label="instance configuration",
+        )
+        durable = _read_instance_config(config_path, uid)
+        if _persisted_instance_id(durable) != instance_id:
+            raise InstanceStateError("instance identity changed during configuration update")
+        return durable
+
+
 def _state_home(environ: Mapping[str, str]) -> Path:
     configured = environ.get("XDG_STATE_HOME", "").strip()
     if configured:
