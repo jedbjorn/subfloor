@@ -125,7 +125,7 @@ class ClaudeAdapter(ConversationAdapter):
             resume=resume,
         )
         process = self.runner.spawn(
-            command,
+            context.execution_argv(command),
             cwd=worktree,
             env=merged_env(self.manifest, context),
         )

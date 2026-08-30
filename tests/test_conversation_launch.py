@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import os
 import sqlite3
+import subprocess
 import sys
 import tempfile
 from pathlib import Path
@@ -15,6 +17,7 @@ ENGINE = ROOT / ".super-coder"
 sys.path.insert(0, str(ENGINE / "scripts"))
 sys.path.insert(0, str(ENGINE / "api"))
 
+import instance_state  # noqa: E402
 import route_bindings  # noqa: E402
 import run as run_mod  # noqa: E402
 from conversation_boot import BootDirective  # noqa: E402
@@ -172,6 +175,7 @@ def test_preparer_returns_canonical_environment_and_archive(launch_case):
             effort="high",
             env={"SC_API_TOKEN": "shell-token", "MARKER": "prepared"},
             boot_content="immutable boot bytes",
+            execution_view=SimpleNamespace(prefix=("view-helper", "--")),
         )
 
     preparer = ConversationLaunchPreparer(
@@ -187,6 +191,7 @@ def test_preparer_returns_canonical_environment_and_archive(launch_case):
     assert context.env["SC_CONVERSATION_SURFACE"] == "browser"
     assert context.conversation_id == "cv_" + "a" * 32
     assert context.boot_content == "immutable boot bytes"
+    assert context.execution_prefix == ("view-helper", "--")
     assert context.permission_mode == "unrestricted"
     assert called == [{
         "shell_id": 1,
@@ -201,6 +206,170 @@ def test_preparer_returns_canonical_environment_and_archive(launch_case):
             phase="start",
         ),
     }]
+
+
+@pytest.mark.parametrize("surface", ["browser", "sprint"])
+def test_recovery_rebuilds_and_preflights_canonical_restricted_view(
+    launch_case, monkeypatch, surface
+):
+    db_path, worktree = launch_case
+    con = sqlite3.connect(db_path)
+    con.execute("UPDATE shells SET api_key='canonical-token' WHERE shell_id=1")
+    con.commit()
+    con.close()
+    build_calls = []
+    preflights = []
+
+    def project_environment(env):
+        projected = dict(env)
+        projected.pop("SC_ROOT", None)
+        projected.pop("SC_ENGINE_DIR", None)
+        projected["SC_EXECUTION_VIEW"] = "restricted-source"
+        return projected
+
+    view = SimpleNamespace(
+        prefix=("view-helper", "--"),
+        preflight=lambda: preflights.append(True),
+        environment=project_environment,
+    )
+    monkeypatch.setattr(run_mod, "shell_work_dir", lambda *_: worktree)
+    monkeypatch.setattr(run_mod.ports_mod, "resolve", lambda: {"port": 8837})
+    monkeypatch.setattr(run_mod.install, "is_source_repo", lambda: True)
+    monkeypatch.setattr(
+        run_mod.execution_view,
+        "build",
+        lambda **kwargs: build_calls.append(kwargs) or view,
+    )
+    monkeypatch.setenv("SC_ROOT", "/spoofed/root")
+    monkeypatch.setenv("SC_ENGINE_DIR", "/spoofed/engine")
+    preparer = ConversationLaunchPreparer(db_path)
+    monkeypatch.setattr(preparer, "_conversation_surface", lambda _: surface)
+
+    context = preparer.recovery(make_run(worktree))
+
+    assert build_calls == [{
+        "engine": run_mod.ENGINE,
+        "repo_root": run_mod.REPO_ROOT,
+        "flavor": "dev",
+        "source_mode": True,
+    }]
+    assert preflights == [True]
+    assert context.execution_prefix == ("view-helper", "--")
+    assert context.env["SC_EXECUTION_VIEW"] == "restricted-source"
+    assert context.env["SC_CONVERSATION_SURFACE"] == surface
+    assert "SC_ROOT" not in context.env
+    assert "SC_ENGINE_DIR" not in context.env
+
+
+def test_recovery_admin_remains_unwrapped(launch_case, monkeypatch):
+    db_path, worktree = launch_case
+    con = sqlite3.connect(db_path)
+    con.execute(
+        "UPDATE shells SET flavor='admin',api_key='canonical-token' "
+        "WHERE shell_id=1"
+    )
+    con.commit()
+    con.close()
+    view = SimpleNamespace(
+        prefix=(),
+        preflight=lambda: None,
+        environment=lambda env: dict(env),
+    )
+    monkeypatch.setattr(run_mod, "shell_work_dir", lambda *_: worktree)
+    monkeypatch.setattr(run_mod.ports_mod, "resolve", lambda: {"port": 8837})
+    monkeypatch.setattr(run_mod.execution_view, "build", lambda **_: view)
+
+    context = ConversationLaunchPreparer(db_path).recovery(make_run(worktree))
+
+    assert context.execution_prefix == ()
+    assert context.env["SC_ROOT"] == str(run_mod.REPO_ROOT)
+    assert context.env["SC_ENGINE_DIR"] == str(run_mod.ENGINE)
+
+
+def test_recovery_failed_preflight_refuses_before_context(
+    launch_case, monkeypatch
+):
+    db_path, worktree = launch_case
+    con = sqlite3.connect(db_path)
+    con.execute("UPDATE shells SET api_key='canonical-token' WHERE shell_id=1")
+    con.commit()
+    con.close()
+
+    def refuse():
+        raise run_mod.execution_view.ExecutionViewError(
+            run_mod.execution_view.RESTRICTED_VIEW_ERROR
+        )
+
+    view = SimpleNamespace(prefix=("view-helper", "--"), preflight=refuse)
+    monkeypatch.setattr(run_mod, "shell_work_dir", lambda *_: worktree)
+    monkeypatch.setattr(run_mod.ports_mod, "resolve", lambda: {"port": 8837})
+    monkeypatch.setattr(run_mod.execution_view, "build", lambda **_: view)
+
+    with pytest.raises(ConversationLaunchError) as caught:
+        ConversationLaunchPreparer(db_path).recovery(make_run(worktree))
+
+    assert caught.value.code == "CONVERSATION_LAUNCH_REFUSED"
+    assert caught.value.detail == run_mod.execution_view.RESTRICTED_VIEW_ERROR
+
+
+def test_recovery_view_masks_private_state_and_parent_root_alias(
+    launch_case, monkeypatch
+):
+    db_path, worktree = launch_case
+    root = db_path.parent
+    repo = root / "fork"
+    engine = repo / ".super-coder"
+    engine.mkdir(parents=True)
+    (engine / "schema.sql").write_text("schema secret\n")
+    (engine / "migrations").mkdir()
+    (engine / "migrations" / "0001.sql").write_text("migration secret\n")
+    home = root / "home"
+    home.mkdir(mode=0o700)
+    state_home = root / "state"
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("XDG_STATE_HOME", str(state_home))
+    monkeypatch.setenv("SC_DB_BACKUP_DIR", "backups")
+    private = instance_state.resolve(
+        instance_config=engine / "instance.json",
+        environ=os.environ,
+        id_factory=lambda: "0123456789abcdef0123456789abcdef",
+    )
+    private.database.write_text("private secret\n")
+    backup = repo / "backups" / "shell_db.preboundary.db"
+    backup.parent.mkdir()
+    backup.write_text("backup secret\n")
+    (worktree / "backups").symlink_to(backup.parent, target_is_directory=True)
+    con = sqlite3.connect(db_path)
+    con.execute("UPDATE shells SET api_key='canonical-token' WHERE shell_id=1")
+    con.commit()
+    con.close()
+    monkeypatch.setattr(run_mod, "ENGINE", engine)
+    monkeypatch.setattr(run_mod, "REPO_ROOT", repo)
+    monkeypatch.setattr(run_mod, "shell_work_dir", lambda *_: worktree)
+    monkeypatch.setattr(run_mod.ports_mod, "resolve", lambda: {"port": 8837})
+    monkeypatch.setattr(run_mod.install, "is_source_repo", lambda: False)
+
+    context = ConversationLaunchPreparer(db_path).recovery(make_run(worktree))
+    secret = private.database
+    probe = subprocess.run(
+        context.execution_argv([
+            "/bin/sh",
+            "-c",
+            f"! cat {secret} >/dev/null 2>&1 && "
+            f"! cat /proc/{os.getpid()}/root{secret} >/dev/null 2>&1 && "
+            f"! cat {engine / 'schema.sql'} >/dev/null 2>&1 && "
+            f"! cat {backup} >/dev/null 2>&1 && "
+            "! cat backups/shell_db.preboundary.db >/dev/null 2>&1 && "
+            "! /bin/sh -c 'cat backups/shell_db.preboundary.db' "
+            ">/dev/null 2>&1",
+        ]),
+        cwd=context.worktree,
+        env=context.env,
+        check=False,
+    )
+
+    assert probe.returncode == 0
+    assert context.env["SC_EXECUTION_VIEW"] == "restricted-downstream"
 
 
 def test_preparer_marks_a_resume_turn_with_the_resume_phase(launch_case):

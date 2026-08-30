@@ -268,6 +268,11 @@ class BootPhaseLabelTest(unittest.TestCase):
                 run, "flavor_defaults", return_value=fdefaults))
             stack.enter_context(mock.patch.object(run, "list_shells", return_value=[chosen]))
             stack.enter_context(mock.patch.object(run, "pick_shell", return_value=chosen))
+            stack.enter_context(mock.patch.object(
+                run.execution_view,
+                "build",
+                return_value=run.execution_view.ExecutionView(mode="test"),
+            ))
             stack.enter_context(mock.patch.object(run, "ensure_harness_path"))
             stack.enter_context(mock.patch.object(
                 run.style, "spinner", side_effect=recording_spinner))

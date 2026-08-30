@@ -548,7 +548,9 @@ class KimiAdapter(ConversationAdapter):
         env, root = self._environment(context)
         existing = self._session_dirs(root)
         command = self._command(context, message, None)
-        process = self.runner.spawn(command, cwd=worktree, env=env)
+        process = self.runner.spawn(
+            context.execution_argv(command), cwd=worktree, env=env
+        )
         try:
             session_dir, prompt_time, prompt_offset = self._discover_start(
                 root,
@@ -607,7 +609,9 @@ class KimiAdapter(ConversationAdapter):
             ) from exc
         known_markers = self._prompt_markers(wire)
         command = self._command(context, message, session_ref)
-        process = self.runner.spawn(command, cwd=worktree, env=env)
+        process = self.runner.spawn(
+            context.execution_argv(command), cwd=worktree, env=env
+        )
         try:
             prompt_time, prompt_offset = self._discover_resume(
                 wire,

@@ -15,6 +15,7 @@ import shell_liveness
 from conversation_adapters import ConversationContext
 from conversation_boot import BootDirective, BootSnapshotError
 
+
 class ConversationLaunchError(RuntimeError):
     """Stable pre-dispatch refusal owned by browser conversation launching."""
 
@@ -82,8 +83,28 @@ class ConversationLaunchPreparer:
             con.close()
         return "sprint" if row is not None and row["is_sprint"] else "browser"
 
+    @staticmethod
+    def _execution_view(
+        flavor: str | None,
+    ) -> run_mod.execution_view.ExecutionView:
+        """Rebuild and prove policy from canonical installation identity."""
+        try:
+            view = run_mod.execution_view.build(
+                engine=run_mod.ENGINE,
+                repo_root=run_mod.REPO_ROOT,
+                flavor=flavor,
+                source_mode=run_mod.install.is_source_repo(),
+            )
+            view.preflight()
+            return view
+        except run_mod.execution_view.ExecutionViewError as exc:
+            raise ConversationLaunchError(
+                "CONVERSATION_LAUNCH_REFUSED",
+                str(exc),
+            ) from exc
+
     def recovery(self, broker_run) -> ConversationContext:
-        """Rebuild only canonical identity for crash recovery, with no launch effects."""
+        """Rebuild canonical identity and execution policy for crash recovery."""
         con = db_driver.connect(self.db_path)
         try:
             row = con.execute(
@@ -110,20 +131,23 @@ class ConversationLaunchPreparer:
                 "HARNESS_SHELL_IDENTITY_UNAVAILABLE",
                 "recovery could not resolve the shell API endpoint",
             )
-        env = {
+        view = self._execution_view(row["flavor"])
+        base_env = {
             **run_mod.os.environ,
             "SC_API_TOKEN": str(row["api_key"]),
             "SC_API_BASE": f"http://127.0.0.1:{api_port}",
             "SC_SHELL_ID": str(row["shell_id"]),
             "SC_SHELL_SHORTNAME": str(row["shortname"]),
             "SC_SHELL_WORKTREE": str(worktree),
-            "SC_ENGINE_DIR": str(run_mod.ENGINE),
             "SC_HARNESS": broker_run.harness,
-            "SC_ROOT": str(run_mod.REPO_ROOT),
             "SC_CONVERSATION_SURFACE": self._conversation_surface(
                 broker_run.conversation_id
             ),
         }
+        if row["flavor"] == "admin":
+            base_env["SC_ENGINE_DIR"] = str(run_mod.ENGINE)
+            base_env["SC_ROOT"] = str(run_mod.REPO_ROOT)
+        env = view.environment(base_env)
         env["PATH"] = run_mod._shell_path(worktree, env.get("PATH", ""))
         return ConversationContext(
             worktree=worktree.resolve(),
@@ -137,6 +161,7 @@ class ConversationLaunchPreparer:
             binding_digest=broker_run.binding_digest,
             conversation_id=broker_run.conversation_id,
             lifecycle_epoch=broker_run.lifecycle_epoch,
+            execution_prefix=view.prefix,
         )
 
     def __call__(self, broker_run) -> tuple[ConversationContext, int]:
@@ -295,6 +320,9 @@ class ConversationLaunchPreparer:
                 conversation_id=broker_run.conversation_id,
                 lifecycle_epoch=broker_run.lifecycle_epoch,
                 boot_content=getattr(plan, "boot_content", None),
+                execution_prefix=getattr(
+                    getattr(plan, "execution_view", None), "prefix", ()
+                ),
             ),
             int(plan.archive_id),
         )

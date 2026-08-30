@@ -194,6 +194,11 @@ class ConversationContext:
     conversation_id: str | None = None
     lifecycle_epoch: int = 1
     boot_content: str | None = None
+    execution_prefix: tuple[str, ...] = ()
+
+    def execution_argv(self, argv: Iterable[str]) -> list[str]:
+        """Apply the parent-owned execution view to one top-level harness."""
+        return [*self.execution_prefix, *(str(value) for value in argv)]
 
     def checked_worktree(self) -> Path:
         if self.permission_mode not in PERMISSION_MODES:

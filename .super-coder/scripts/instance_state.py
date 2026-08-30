@@ -167,6 +167,7 @@ PRODUCTION_CONSUMERS = (
         "shell_entry_and_liveness",
         (
             ".super-coder/scripts/dispatch.sh",
+            ".super-coder/scripts/execution_view.py",
             ".super-coder/scripts/run.py",
             ".super-coder/scripts/shell_liveness.py",
         ),
@@ -692,23 +693,33 @@ def active_backup_paths(
 ) -> ActiveBackupPaths:
     """Return ordered backup paths paired with the authoritative database."""
     env = os.environ if environ is None else environ
-    root = Path(repo_root)
+    root = Path(repo_root).expanduser()
+    if not root.is_absolute():
+        raise InstanceStateError("backup repository root must be absolute")
+    root = root.resolve()
+    configured = env.get("SC_DB_BACKUP_DIR", "").strip()
+    override = Path(configured).expanduser() if configured else None
+    if override is not None:
+        if not override.is_absolute():
+            override = root / override
+        override = override.resolve()
     state = private_state or _bound_private_state(root / ".super-coder")
     if state is not None and active_database_path(
         root / ".super-coder", private_state=state
     ) == state.database:
-        configured = env.get("SC_DB_BACKUP_DIR", "").strip()
         return ActiveBackupPaths(
-            override=Path(configured).expanduser() if configured else None,
-            home=state.backups,
-            local=state.backups,
+            override=override,
+            home=state.backups.resolve(),
+            local=state.backups.resolve(),
         )
     home = Path(env.get("HOME") or Path.home()).expanduser()
-    configured = env.get("SC_DB_BACKUP_DIR", "").strip()
+    if not home.is_absolute():
+        home = root / home
+    home = home.resolve()
     return ActiveBackupPaths(
-        override=Path(configured).expanduser() if configured else None,
-        home=home / "db_backups" / root.name,
-        local=root / ".sc-state" / "db_backups",
+        override=override,
+        home=(home / "db_backups" / root.name).resolve(),
+        local=(root / ".sc-state" / "db_backups").resolve(),
     )
 
 
