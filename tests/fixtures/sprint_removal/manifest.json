@@ -321,6 +321,7 @@
     "tests/test_conductor_reconciliation.py",
     "tests/test_conductor_runtime.py",
     "tests/test_conductor_slot_skills.py",
+    "tests/test_conversation_adapters.py",
     "tests/test_conversation_api.py",
     "tests/test_conversation_broker.py",
     "tests/test_conversation_diff_browser.py",
