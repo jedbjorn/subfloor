@@ -360,15 +360,12 @@ def merge_instance_config(
     changes: Mapping[str, object],
     *,
     remove: Collection[str] = (),
-    replace_keys: Collection[str] = (),
     require_instance_id: bool = False,
     owner_uid: int | None = None,
 ) -> dict:
     """Lock, reread, and atomically merge one owner-local configuration."""
     if INSTANCE_ID_KEY in changes or INSTANCE_ID_KEY in remove:
         raise InstanceStateError("instance ID can only be assigned by the resolver")
-    if INSTANCE_ID_KEY in replace_keys:
-        raise InstanceStateError("instance ID cannot be a replaceable configuration key")
     uid = os.geteuid() if owner_uid is None else owner_uid
     config_path = Path(config_path)
     with _instance_id_lock(config_path, uid):
@@ -376,9 +373,6 @@ def merge_instance_config(
         instance_id = _persisted_instance_id(payload)
         if require_instance_id and instance_id is None:
             raise InstanceStateError("instance configuration has no instance ID")
-        for key in replace_keys:
-            if key not in changes:
-                payload.pop(key, None)
         for key in remove:
             payload.pop(key, None)
         payload.update(changes)

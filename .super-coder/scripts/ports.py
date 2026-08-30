@@ -58,6 +58,7 @@ MANAGED_KEYS = frozenset({
     "pm2",
     "db",
 })
+PORT_KEYS = frozenset({"repo", "port", "dev_port"})
 
 
 def _offset(seed: str) -> int:
@@ -152,11 +153,21 @@ def _runtime_view(stored: dict) -> dict:
 
 
 def _write_config(cfg: dict) -> None:
+    changes = {key: value for key, value in cfg.items() if key in PORT_KEYS}
     instance_state.merge_instance_config(
         CONFIG,
-        cfg,
-        replace_keys=MANAGED_KEYS,
+        changes,
     )
+
+
+def update(
+    changes: dict[str, object], *, remove: tuple[str, ...] = ()
+) -> dict:
+    """Apply one scoped managed-key delta under the instance lock."""
+    unmanaged = (set(changes) | set(remove)) - MANAGED_KEYS
+    if unmanaged:
+        raise ValueError(f"unmanaged instance configuration key: {min(unmanaged)}")
+    return instance_state.merge_instance_config(CONFIG, changes, remove=remove)
 
 
 def resolve(persist: bool = False) -> dict:
@@ -196,11 +207,6 @@ def resolve(persist: bool = False) -> dict:
     if persist:
         _write_config(cfg)
     return cfg
-
-
-def save(cfg: dict) -> None:
-    """Persist current engine config while retaining unknown on-disk keys."""
-    _write_config(cfg)
 
 
 def main(argv: list[str]) -> int:

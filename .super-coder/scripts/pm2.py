@@ -38,7 +38,6 @@ import sys
 import time
 import urllib.error
 import urllib.request
-from pathlib import Path
 
 import ports
 
@@ -65,13 +64,11 @@ def read() -> dict | None:
 def write(pm2: dict | None) -> dict | None:
     """Persist (or clear) the pm2 block, preserving every other config key
     (ports, and the `vm` / `ts` blocks — all coexist)."""
-    cfg = ports.resolve(persist=False)
     if pm2:
-        cfg["pm2"] = pm2
+        ports.update({"pm2": pm2})
     else:
-        cfg.pop("pm2", None)
-    ports.save(cfg)
-    return cfg.get("pm2")
+        ports.update({}, remove=("pm2",))
+    return pm2
 
 
 # -- primitives ---------------------------------------------------------------

@@ -52,7 +52,7 @@ def _configuration_writer_worker(kind, config, barrier, results):
 
             ports.CONFIG = config
             ports.instance_state.merge_instance_config = synchronized_merge
-            ports.save({"port": 8837, "dev_port": 8838, "repo": "repo"})
+            ports.update({"vm": {"domain": "test"}})
         else:
             import feature
 
@@ -237,7 +237,7 @@ class InstanceStateResolverTests(unittest.TestCase):
             mock.patch.object(ports, "CONFIG", self.config),
             self.assertRaisesRegex(RuntimeError, "cannot read"),
         ):
-            ports.save({"port": 8837})
+            ports.update({"vm": {"domain": "test"}})
         with (
             mock.patch.object(feature, "INSTANCE", self.config),
             self.assertRaisesRegex(RuntimeError, "cannot read"),
@@ -531,12 +531,23 @@ class ProductionSeamInventoryTests(unittest.TestCase):
             source = (ROOT / relative).read_text()
             self.assertIn("instance_state.merge_instance_config", source, relative)
             self.assertNotRegex(source, r"INSTANCE\.write_text|CONFIG\.write_text")
+        for relative in (
+            ".super-coder/scripts/vm.py",
+            ".super-coder/scripts/ts.py",
+            ".super-coder/scripts/pm2.py",
+            ".super-coder/scripts/dbq.py",
+        ):
+            source = (ROOT / relative).read_text()
+            self.assertIn("ports.update", source, relative)
+            self.assertNotIn("ports.save", source, relative)
         driver = (ROOT / ".super-coder/scripts/db_driver.py").read_text()
         self.assertIn("instance_state.active_database_path", driver)
         installer = (ROOT / ".super-coder/scripts/install.py").read_text()
         self.assertIn("installation_state = instance_state.resolve(", installer)
         self.assertIn("instance_config=ports_mod.CONFIG", installer)
         self.assertIn("instance_state.update_bound_instance_config", installer)
+        self.assertIn("installer_changes", installer)
+        self.assertNotIn("update_bound_instance_config(ports_mod.CONFIG, cfg)", installer)
         expected_call_chain = {
             ".super-coder/scripts/snapshot.py": ("artifact_policy.content_path",),
             ".super-coder/scripts/rebuild.py": (

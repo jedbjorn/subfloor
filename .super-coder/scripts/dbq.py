@@ -55,7 +55,6 @@ import socket
 import subprocess
 import sys
 import urllib.parse
-from pathlib import Path
 
 import ports
 
@@ -82,13 +81,11 @@ def read() -> dict | None:
 def write(db: dict | None) -> dict | None:
     """Persist (or clear) the db block, preserving every other config key
     (ports, and the pm2/vm/ts blocks — all coexist)."""
-    cfg = ports.resolve(persist=False)
     if db:
-        cfg["db"] = db
+        ports.update({"db": db})
     else:
-        cfg.pop("db", None)
-    ports.save(cfg)
-    return cfg.get("db")
+        ports.update({}, remove=("db",))
+    return db
 
 
 def _policy(cfg: dict) -> dict:

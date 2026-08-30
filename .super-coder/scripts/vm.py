@@ -436,13 +436,11 @@ def read() -> dict | None:
 
 def write(vm: dict | None) -> dict | None:
     """Persist (or clear) the vm block, preserving every other config key."""
-    cfg = ports.resolve(persist=False)
     if vm:
-        cfg["vm"] = vm
+        ports.update({"vm": vm})
     else:
-        cfg.pop("vm", None)
-    ports.save(cfg)
-    return cfg.get("vm")
+        ports.update({}, remove=("vm",))
+    return vm
 
 
 # -- check primitives --------------------------------------------------------

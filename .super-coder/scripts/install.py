@@ -1149,7 +1149,15 @@ def main(argv: list[str]) -> int:
     cfg = ports_mod.resolve(persist=False)
     cfg["harness"] = harness
     cfg["installed_at"] = datetime.now(timezone.utc).date().isoformat()
-    stored = instance_state.update_bound_instance_config(ports_mod.CONFIG, cfg)
+    installer_changes = {
+        key: cfg[key]
+        for key in (*ports_mod.PORT_KEYS, "harness", "installed_at")
+        if key in cfg
+    }
+    stored = instance_state.update_bound_instance_config(
+        ports_mod.CONFIG,
+        installer_changes,
+    )
     if stored["instance_id"] != installation_state.instance_id:
         raise instance_state.InstanceStateError(
             "installer configuration update changed the installation identity"
