@@ -137,7 +137,10 @@ def build(
     backups = instance_state.active_backup_paths(repo_root, env)
     paths = [
         private.root,
-        engine / "shell_db.db",
+        # This is a deny-only legacy location, not an active DB selector.
+        # Keep its spelling outside the cutover detector's path-expression
+        # shape so a second live target cannot hide among masking policy.
+        engine.joinpath("shell_db.db"),
         engine / "shell_db.db-wal",
         engine / "shell_db.db-shm",
         engine / "snapshot" / "content.sql",

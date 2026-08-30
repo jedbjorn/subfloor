@@ -154,8 +154,10 @@ def main(argv: list[str]) -> int:
 
 
 if __name__ == "__main__":
+    from cli_entry import run_cli
+
     try:
-        raise SystemExit(main(sys.argv[1:]))
+        raise SystemExit(run_cli(main, sys.argv[1:]))
     except (OSError, ValueError):
         raise SystemExit(
             "restricted_shell_view_unavailable: the required shell execution "
