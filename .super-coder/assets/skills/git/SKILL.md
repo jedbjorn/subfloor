@@ -34,7 +34,7 @@ The launcher auto-syncs at boot when provably nothing can be lost (on base branc
 
 1. `git fetch origin main && git rev-list --count HEAD..origin/main` -> record remote freshness; continue through the branch/target gate even when the count is 0.
 2. Compare `git rev-parse --show-toplevel` + `git branch --show-current` with ACTIVE SESSION before any destructive command. A mismatch -> stop + surface it.
-3. Exact `shell/<shortname>` base -> discard local-only commits, tracked changes, and non-ignored untracked files without asking: `git reset --hard origin/main && git clean -fd`. Durable work belongs in the engine DB or a pushed remote branch with a PR. Pass = `git status --short` is empty + `git rev-parse HEAD` equals `git rev-parse origin/main`.
+3. Exact `shell/<shortname>` base -> discard local-only commits, tracked changes, and non-ignored untracked files without asking: `git reset --hard origin/main && git clean -fd`. Durable coordination belongs in the control plane and code belongs on a pushed remote branch with a PR. Pass = `git status --short` is empty + `git rev-parse HEAD` equals `git rev-parse origin/main`.
 4. NEVER reset or clean a feature branch / open PR. Clean stale feature branch -> `git rebase origin/main`. Dirty or unpushed feature work -> list it + ask the FnB to land / stash / discard.
 5. NEVER `git pull`/merge on the base — merge bubbles accumulate + squash-merged work replays as conflicts.
 
@@ -96,13 +96,13 @@ NEVER delete a branch carrying unmerged, un-PR'd work — no PR = lost work.
   snapshots and `_sc` renders live under ignored `.sc-state/local/` and never
   enter Git. `.sc-state/engine.ref` is the deliberate tracked exception: it is
   the dependency pin and is updated by `sc update`.
-- Exception: in the super-coder SOURCE repo, `schema.sql` + `migrations/` are tracked — there the engine *is* the project.
+- Exception: in the Subfloor source repo, tracked engine database source is project source; identify exact files through the repository catalogue.
 
 ## After DB work
 
-An `sc mem` write lands in the shared engine DB immediately. The admin/API
-save-local path refreshes the ignored snapshot and renders used by rebuild and
-review. There is no generated-content commit or Publish PR. See `snapshot`.
+A confirmed `sc mem` write lands in the shared control plane immediately. The
+Admin/API persistence path owns generated serialization and renders; they are
+not a Developer commit or Publish PR.
 
 ## Notes
 

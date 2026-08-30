@@ -37,19 +37,19 @@ a trailing reconciliation migration. Preserve per-instance rows carried by the
 snapshot. Pass = fresh build, in-place migration, and rebuild from an older
 snapshot converge to the same state.
 
-## Protect the live cache
+## Protect the live instance
 
-The live engine DB is `.super-coder/shell_db.db` in the main checkout, not a
-Developer worktree. Before an authorized live migration, resolve that exact
-path independently from the ACTIVE SESSION `floor: live_engine_checkout`, then
-use the supported backup-and-apply surface:
+The Admin boot names the private instance-state directory. Before an authorized
+live migration, load `engine_database` and independently resolve the canonical
+database through the state resolver. Require that path to match the boot's
+private state, then use the supported backup-and-apply surface:
 
 ```bash
 ./sc migrate
 ```
 
 Require its first line, `migrate: db         <absolute-path>`, to match the
-independently resolved live DB exactly. The command then reports the migration
+independently resolved canonical database exactly. The command then reports the migration
 source, creates a WAL-safe backup with a `premigrate` restore point for an
 existing DB, and reports each applied filename plus the final count (or
 `nothing pending`). Pass = the backup receipt names its restore path before the

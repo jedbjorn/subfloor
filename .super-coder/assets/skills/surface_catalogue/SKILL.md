@@ -7,11 +7,10 @@ common: true
 
 # surface_catalogue — read the repo from the map, not by grepping
 
-super-coder lives inside a host repo. The `dr_*` tables = a scan of that repo
-— query them first to orient, not the tree. They live in the **map db**,
-`.sc-state/local/map/map.db` — a separate file from your memory db
-(`.super-coder/shell_db.db`). Inspect structure with `sc map-schema`; query
-data with `sc map-sql "…"`.
+The `dr_*` catalogue is a scan of the host repo. Query it first to orient, not
+the tree. It is separate from Subfloor control-plane memory and from the
+product's runtime database. Inspect structure with `sc map-schema`; query data
+with `sc map-sql "…"`.
 
 NEVER map the repo yourself. The map stays fresh automatically (git hooks
 re-map on pull / branch-switch / rebase) and is owned by the **cartographer**

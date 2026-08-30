@@ -36,10 +36,10 @@
 # The harness hooks locate this script env-independently, the same way `sc` does:
 # walk to the MAIN worktree root via `git rev-parse --git-common-dir`/.. and read
 # its .super-coder/. A fork gitignores the engine, so it is ABSENT from every
-# shell worktree — a worktree-relative path resolved to nothing and the hook
-# failed open; $SC_ENGINE_DIR (exported by run.py) is only an optional fast-path
-# override, never a dependency. The pre-commit hook resolves the script by its own
-# $0 path (it runs outside run.py's env).
+# shell worktree, so a worktree-relative path resolves to nothing. The hook
+# therefore walks Git's common directory to the main checkout. The pre-commit
+# hook resolves the script by its own `$0` path because it runs outside the
+# harness launch environment.
 set -euo pipefail
 
 # Not a git work tree (rare for a fork, but be safe) → nothing to guard.

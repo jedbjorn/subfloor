@@ -39,7 +39,7 @@ Run this sequence on first boot, after a shape notice, or when the map drifts:
    SELECT role, COUNT(*) n FROM dr_filepath GROUP BY role ORDER BY n DESC;
    ```
 
-3. Tune `$SC_ROOT/.sc-state/local/map/config.json` only where defaults are
+3. Tune `.sc-state/local/map/config.json` in the assigned worktree only where defaults are
    wrong. Config is per-clone runtime state and never a commit. All keys are
    optional; skip sets extend defaults and cannot re-include engine-owned
    paths:
@@ -70,7 +70,7 @@ Automation remains healthy when:
 
 - `post-merge` / `post-checkout` / `post-rewrite` run `sc map` through
   `core.hooksPath`.
-- `sc rebuild` remaps after rebuilding the engine DB.
+- Admin control-plane rebuilds remap through their supported lifecycle.
 - pm2's `sc-map-<repo>` one-shot cycles stopped -> online hourly while the
   stack is up. A repo without pm2 relies on hooks + manual `sc map`.
 
@@ -161,8 +161,8 @@ WHERE path LIKE '<app migrations dir>/%';
 ```
 
 Create an authored section when those files form a real area. Pass = working
-shells can identify the app DB definition without confusing it with
-`.super-coder/shell_db.db`. No product DB -> `N/A`.
+shells can identify the app DB definition without confusing it with Subfloor
+control-plane state. No product DB -> `N/A`.
 
 ## Semantic extractors
 
@@ -174,14 +174,13 @@ coverage.
 Adopt an extractor:
 
 1. Inspect stack dependencies/file mix with `sc map-sql`.
-2. Read the closest reference under
-   `$SC_ENGINE_DIR/templates/map_extractors/`. Author/adapt
-   `$SC_SHELL_WORKTREE/.sc-state/map_extractors/<name>.py` in your worktree.
+2. Author `.sc-state/map_extractors/<name>.py` in the assigned worktree against
+   the extractor contract above.
 3. Run `sc map-extractor install
-   "$SC_SHELL_WORKTREE/.sc-state/map_extractors/<name>.py"`. Pass = output
+   ".sc-state/map_extractors/<name>.py"`. Pass = output
    prints the installed canonical path + SHA-256 matching the authored bytes.
 4. NEVER `cp`, `mv`, redirect, or use a file-edit tool into
-   `$SC_ROOT/.sc-state/map_extractors/`. The guarded installer is the only
+   another checkout's `.sc-state/map_extractors/`. The guarded installer is the only
    supported cross-worktree write.
 5. Run `sc map`, inspect structure with `sc map-schema <dr_table>`, then query
    rows with `sc map-sql`. Pass = expected semantic rows exist + the map log

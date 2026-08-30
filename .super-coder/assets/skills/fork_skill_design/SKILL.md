@@ -82,5 +82,6 @@ matches `sc skill list` plus the intended grant. `rm` is only for fork-local
 names; retire an upstream skill with `sc skill retire <name>` and restore it
 with `sc skill unretire <name>`.
 
-Never place a fork-local body under `.super-coder/assets/skills/`, regenerate
-the engine seed for it, set it common, or write the engine DB directly.
+Keep fork-local skill bodies on the supported `sc skill` surface; do not place
+them under engine assets, regenerate the engine seed for them, or set them
+common.

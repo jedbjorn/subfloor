@@ -43,7 +43,8 @@ class ProjectVsEngineTest(unittest.TestCase):
     def test_fork_block_keeps_the_dependency_stance(self):
         fork = compose.PROJECT_VS_ENGINE_FORK
         flat = " ".join(fork.split())
-        self.assertIn("gitignored dependency", fork)
+        self.assertIn("Subfloor engine dependency", fork)
+        self.assertIn("not project source", fork)
         self.assertIn("authored upstream in subfloor", flat)
         self.assertIn("`./sc update`", fork)
         self.assertNotIn("you are upstream", fork)
@@ -54,7 +55,7 @@ class ProjectVsEngineTest(unittest.TestCase):
         self.assertIn("There is no upstream above you", source)
         self.assertIn("`./sc update`", source)  # the self-update loop
         self.assertIn("fork-language", source)  # the skills caveat
-        self.assertNotIn("gitignored dependency", source)
+        self.assertNotIn("Subfloor engine dependency", source)
 
     def test_substitution_resolves_per_mode(self):
         fork_render = self.template.replace(
@@ -65,7 +66,7 @@ class ProjectVsEngineTest(unittest.TestCase):
         )
         for render in (fork_render, source_render):
             self.assertNotIn(SLOT, render)
-        self.assertIn("gitignored dependency", fork_render)
+        self.assertIn("Subfloor engine dependency", fork_render)
         self.assertIn("you are upstream", source_render)
         self.assertNotIn("dev kit", fork_render.lower())
         self.assertNotIn("dev kit", source_render.lower())

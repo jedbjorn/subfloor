@@ -1391,6 +1391,13 @@ def reconcile_under_cutover(
     print("→ re-grant catalogue skills to all shells")
     grant_changes = regrant()
     print(f"  {grant_changes} grant change(s)")
+    con = db_driver.connect(DB_PATH)
+    try:
+        prompt_changes = shell_factory.refresh_standard_prompts(con)
+        con.commit()
+    finally:
+        con.close()
+    print(f"→ refresh standard-flavor prompts ({prompt_changes} changed; Bespoke preserved)")
     print("→ reconcile managed skill projections")
     projections = reconcile_skill_projections()
     print(

@@ -142,6 +142,37 @@ def render_prompt(name: str, role: str, repo: str, focus: str, mandate: str) -> 
     return text
 
 
+def refresh_standard_prompts(con, *, repo: str | None = None) -> int:
+    """Re-render engine-owned flavor prompts without touching Bespoke identity."""
+    initialized = con.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='shells'"
+    ).fetchone()
+    if initialized is None:
+        return 0
+    repo = repo or REPO_ROOT.name
+    changed = 0
+    rows = con.execute(
+        "SELECT shell_id, display_name, role, mandate, flavor, system_prompt "
+        "FROM shells WHERE flavor IS NOT NULL AND COALESCE(is_deleted,0)=0 "
+        "ORDER BY shell_id"
+    ).fetchall()
+    for row in rows:
+        flavor = row[4]
+        template = load_flavor(flavor)
+        role = row[2] or template["role"]
+        mandate = row[3] or template["mandate"].replace("{{repo}}", repo)
+        focus = template.get("focus", "").replace("{{repo}}", repo)
+        prompt = render_prompt(row[1], role, repo, focus, mandate)
+        if row[5] == prompt:
+            continue
+        con.execute(
+            "UPDATE shells SET system_prompt=? WHERE shell_id=?",
+            (prompt, row[0]),
+        )
+        changed += 1
+    return changed
+
+
 def create_shell(con, *, flavor: str | None, name: str,
                  shortname: str | None = None, partner: str | None = None,
                  repo: str | None = None, role: str | None = None,
