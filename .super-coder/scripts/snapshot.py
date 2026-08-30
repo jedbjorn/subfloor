@@ -44,6 +44,14 @@ OUT_PATH = instance_state.maintenance_snapshot_path(REPO_ROOT)
 # copy, remove it once we write the new one so it can't shadow or drift.
 LEGACY_PATH = ENGINE / "snapshot" / "content.sql"
 
+
+def bind_state_targets(*, database: Path, snapshot: Path) -> None:
+    """Bind canonical targets after an in-process relocation cutover."""
+    global DB_PATH, OUT_PATH
+    DB_PATH = Path(database)
+    OUT_PATH = Path(snapshot)
+
+
 # Every durable Sprints v2 table.  Keep this as the one snapshot authority for
 # the domain: tests compare it to the migrated schema so a future sprint_*
 # table cannot silently fall out of rebuilds.  Generic conversations are

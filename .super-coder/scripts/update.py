@@ -133,6 +133,17 @@ def snapshot_under_cutover() -> None:
     snapshot_mod.main(lease_held=True)
 
 
+def bind_cutover_state(database: Path) -> None:
+    """Rebind every imported state owner to the relocated canonical pair."""
+    global DB_PATH
+    import snapshot as snapshot_mod
+
+    DB_PATH = Path(database)
+    snapshot_path = instance_state.active_snapshot_path(REPO_ROOT)
+    rebuild_mod.bind_state_targets(database=DB_PATH, snapshot=snapshot_path)
+    snapshot_mod.bind_state_targets(database=DB_PATH, snapshot=snapshot_path)
+
+
 def run_update_compat() -> None:
     """Finish a partially adopted legacy update before reconciliation.
 
@@ -1153,7 +1164,6 @@ def require_restarted_runtime_health() -> None:
 
 def migrate_with_service_cutover(*, backup: bool = True, reconcile=None) -> None:
     """Run all update reconciliation under one stopped-runtime lease."""
-    global DB_PATH
     docker_service = stop_docker_review_server()
     service = stop_pm2_review_server()
     legacy_was_present = instance_state.legacy_database_path(ENGINE).exists()
@@ -1168,15 +1178,14 @@ def migrate_with_service_cutover(*, backup: bool = True, reconcile=None) -> None
             )
             # Recovery must advance the ordinary selector before any other
             # update consumer opens the canonical DB.
-            DB_PATH = instance_state.active_database_path(
+            database = instance_state.active_database_path(
                 ENGINE, private_state=state
             )
-            if DB_PATH != relocation.database:
+            if database != relocation.database:
                 raise state_relocation.RelocationError(
                     "recovered relocation did not activate its published database"
                 )
-            rebuild_mod.DB_PATH = DB_PATH
-            rebuild_mod.SNAPSHOT = instance_state.active_snapshot_path(REPO_ROOT)
+            bind_cutover_state(database)
             # A legacy relocation already created and verified the one preupdate
             # restore point. An already-private update retains the ordinary backup.
             migrate_or_rebuild(backup=backup and not legacy_was_present)
@@ -1320,6 +1329,57 @@ def expire_sandbox_harnesses() -> str | None:
     return epoch
 
 
+def reconcile_under_cutover(
+    *,
+    source: bool,
+    target_sha: str | None,
+    worktrees: tuple[Path, ...],
+) -> None:
+    """Reconcile the new floor while relocation ownership is still held."""
+    refresh_installed_brokers()
+
+    print("→ sync skills catalogue (id-stable)")
+    sync_skills()
+    print("→ re-grant catalogue skills to all shells")
+    grant_changes = regrant()
+    print(f"  {grant_changes} grant change(s)")
+    print("→ reconcile managed skill projections")
+    projections = reconcile_skill_projections()
+    print(
+        f"  {len(projections['written'])} changed, "
+        f"{len(projections['skipped'])} unchanged across "
+        f"{len(projections['checkouts'])} existing checkout(s)"
+    )
+    print(
+        "  note: DB and disk are current; already-running harness sessions may "
+        "retain previously loaded skill text until reboot"
+    )
+    print("→ wire map automation + map the repo")
+    run_script("map_setup.py", update_target_ref=target_sha)
+    print("→ snapshot the live state")
+    snapshot_under_cutover()
+
+    if not source:
+        print("→ wire make aliases (dos- command standard)")
+        print(f"  {install_mod.wire_make_aliases()}")
+
+    if target_sha is not None:
+        publish_engine_ref(target_sha)
+        reconcile_linked_dispatchers(target_sha, worktrees=worktrees)
+    elif source:
+        canonical = REPO_ROOT / "sc"
+        if canonical.is_file():
+            reconcile_linked_dispatchers(
+                None,
+                worktrees=worktrees,
+                target_bytes=canonical.read_bytes(),
+            )
+    else:
+        dispatcher_ref = callable_floor.read_engine_ref(REPO_ROOT)
+        if dispatcher_ref:
+            reconcile_linked_dispatchers(dispatcher_ref, worktrees=worktrees)
+
+
 def main(argv: list[str]) -> int:
     run_update_compat()
     no_fetch = "--no-fetch" in argv
@@ -1421,55 +1481,13 @@ def main(argv: list[str]) -> int:
         print(f"→ expire the sandbox's baked harness CLIs (epoch {epoch})")
         print("  they reinstall on the next image build — normal `./sc restart` / `make dos-r`")
 
-    def reconcile_cutover() -> None:
-        # Everything below can change the DB, its paired snapshot, or the
-        # dispatcher that selects them. Keep it inside the same maintenance
-        # lease as relocation/migration; the runtime is relaunched only after
-        # this callback returns successfully.
-        refresh_installed_brokers()
-
-        print("→ sync skills catalogue (id-stable)")
-        sync_skills()
-        print("→ re-grant catalogue skills to all shells")
-        grant_changes = regrant()
-        print(f"  {grant_changes} grant change(s)")
-        print("→ reconcile managed skill projections")
-        projections = reconcile_skill_projections()
-        print(
-            f"  {len(projections['written'])} changed, "
-            f"{len(projections['skipped'])} unchanged across "
-            f"{len(projections['checkouts'])} existing checkout(s)"
+    migrate_with_service_cutover(
+        reconcile=lambda: reconcile_under_cutover(
+            source=source,
+            target_sha=target_sha,
+            worktrees=worktrees,
         )
-        print(
-            "  note: DB and disk are current; already-running harness sessions may "
-            "retain previously loaded skill text until reboot"
-        )
-        print("→ wire map automation + map the repo")
-        run_script("map_setup.py", update_target_ref=target_sha)
-        print("→ snapshot the live state")
-        snapshot_under_cutover()
-
-        if not source:
-            print("→ wire make aliases (dos- command standard)")
-            print(f"  {install_mod.wire_make_aliases()}")
-
-        if target_sha is not None:
-            publish_engine_ref(target_sha)
-            reconcile_linked_dispatchers(target_sha, worktrees=worktrees)
-        elif source:
-            canonical = REPO_ROOT / "sc"
-            if canonical.is_file():
-                reconcile_linked_dispatchers(
-                    None,
-                    worktrees=worktrees,
-                    target_bytes=canonical.read_bytes(),
-                )
-        else:
-            dispatcher_ref = callable_floor.read_engine_ref(REPO_ROOT)
-            if dispatcher_ref:
-                reconcile_linked_dispatchers(dispatcher_ref, worktrees=worktrees)
-
-    migrate_with_service_cutover(reconcile=reconcile_cutover)
+    )
 
     print("\nupdate: done — new floor laid in place; your rows are intact.")
     if source:

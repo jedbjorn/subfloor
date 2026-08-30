@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import contextlib
 import io
+import os
+import sqlite3
 import sys
 import tempfile
 import unittest
@@ -12,6 +14,7 @@ from unittest import mock
 ENGINE = Path(__file__).resolve().parents[1] / ".super-coder"
 sys.path.insert(0, str(ENGINE / "scripts"))
 import update  # noqa: E402
+import snapshot as snapshot_mod  # noqa: E402
 
 
 class Stop(Exception):
@@ -19,6 +22,109 @@ class Stop(Exception):
 
 
 class UpdateServiceCutoverTest(unittest.TestCase):
+    def test_first_legacy_adoption_rebinds_snapshot_and_completes_once(self):
+        with tempfile.TemporaryDirectory() as raw:
+            repo = Path(raw) / "repo"
+            engine = repo / ".super-coder"
+            engine.mkdir(parents=True)
+            state_home = Path(raw) / "state"
+            environment = {"XDG_STATE_HOME": str(state_home)}
+            with mock.patch.dict(os.environ, environment):
+                state = update.instance_state.resolve(
+                    instance_config=engine / "instance.json",
+                    state_home=state_home,
+                    id_factory=lambda: "a" * 32,
+                )
+            legacy_db = engine / "shell_db.db"
+            connection = sqlite3.connect(legacy_db)
+            try:
+                connection.execute(
+                    "CREATE TABLE schema_migrations (filename TEXT)"
+                )
+                connection.execute(
+                    "INSERT INTO schema_migrations VALUES ('0001_fixture.sql')"
+                )
+                connection.execute("CREATE TABLE payload (value TEXT)")
+                connection.execute("INSERT INTO payload VALUES ('kept')")
+                connection.commit()
+            finally:
+                connection.close()
+            legacy_snapshot = repo / ".sc-state" / "local" / "content.sql"
+            legacy_snapshot.parent.mkdir(parents=True)
+            legacy_snapshot.write_text("legacy snapshot\n")
+
+            migration_targets = []
+            snapshot_targets = []
+
+            def migrate(**_kwargs):
+                migration_targets.append(update.DB_PATH)
+
+            def snapshot_body():
+                snapshot_targets.append(
+                    (snapshot_mod.DB_PATH, snapshot_mod.OUT_PATH)
+                )
+                snapshot_mod.OUT_PATH.write_text("private snapshot\n")
+
+            service = ("/usr/bin/pm2", "sc-example")
+            target_sha = "b" * 40
+            with mock.patch.dict(os.environ, environment), mock.patch.multiple(
+                update,
+                ENGINE=engine,
+                REPO_ROOT=repo,
+                DB_PATH=legacy_db,
+                stop_docker_review_server=mock.Mock(return_value=None),
+                stop_pm2_review_server=mock.Mock(return_value=service),
+                migrate_or_rebuild=mock.Mock(side_effect=migrate),
+                refresh_installed_brokers=mock.Mock(),
+                sync_skills=mock.Mock(),
+                regrant=mock.Mock(return_value=0),
+                reconcile_skill_projections=mock.Mock(return_value={
+                    "written": [], "skipped": [], "checkouts": []
+                }),
+                run_script=mock.Mock(),
+                publish_engine_ref=mock.Mock(),
+                reconcile_linked_dispatchers=mock.Mock(),
+                start_pm2_review_server=mock.Mock(),
+                start_docker_review_server=mock.Mock(),
+                require_restarted_runtime_health=mock.Mock(),
+            ), mock.patch.multiple(
+                snapshot_mod,
+                ENGINE=engine,
+                REPO_ROOT=repo,
+                DB_PATH=legacy_db,
+                OUT_PATH=legacy_snapshot,
+                LEGACY_PATH=engine / "snapshot" / "content.sql",
+                _main_under_lease=mock.Mock(side_effect=snapshot_body),
+            ), mock.patch.object(
+                update.rebuild_mod, "DB_PATH", legacy_db
+            ), mock.patch.object(
+                update.rebuild_mod, "SNAPSHOT", legacy_snapshot
+            ), mock.patch.object(
+                update.install_mod, "wire_make_aliases", return_value=()
+            ), contextlib.redirect_stdout(io.StringIO()):
+                update.migrate_with_service_cutover(
+                    reconcile=lambda: update.reconcile_under_cutover(
+                        source=False,
+                        target_sha=target_sha,
+                        worktrees=(),
+                    )
+                )
+
+                self.assertEqual(migration_targets, [state.database])
+                self.assertEqual(
+                    snapshot_targets, [(state.database, state.snapshot)]
+                )
+                self.assertEqual(update.rebuild_mod.DB_PATH, state.database)
+                self.assertEqual(update.rebuild_mod.SNAPSHOT, state.snapshot)
+                self.assertFalse(legacy_db.exists())
+                self.assertFalse(legacy_snapshot.exists())
+                self.assertTrue(state.database.exists())
+                self.assertEqual(state.snapshot.read_text(), "private snapshot\n")
+                update.publish_engine_ref.assert_called_once_with(target_sha)
+                update.start_pm2_review_server.assert_called_once_with(service)
+                update.start_docker_review_server.assert_called_once_with(None)
+                update.require_restarted_runtime_health.assert_called_once_with()
+
     def test_update_uses_only_its_preupdate_backup_class(self):
         with tempfile.TemporaryDirectory() as raw:
             database = Path(raw) / "shell_db.db"

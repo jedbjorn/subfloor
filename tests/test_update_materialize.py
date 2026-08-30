@@ -1140,8 +1140,8 @@ class SourceRepoDispatcherReconciliationTest(unittest.TestCase):
             (self.root / "sc").read_bytes(),
         )
 
-    def test_update_main_reconciles_source_repos_from_the_tree(self):
-        source = inspect.getsource(update.main)
+    def test_update_reconciliation_uses_source_tree_dispatcher(self):
+        source = inspect.getsource(update.reconcile_under_cutover)
         self.assertIn("elif source:", source)
         self.assertIn("target_bytes=canonical.read_bytes()", source)
 

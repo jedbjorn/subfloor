@@ -44,6 +44,13 @@ BACKUP_DIR = db_backup_mod.preferred_home_dir(REPO_ROOT)
 SNAPSHOT = instance_state.maintenance_snapshot_path(REPO_ROOT)
 
 
+def bind_state_targets(*, database: Path, snapshot: Path) -> None:
+    """Bind canonical targets after an in-process relocation cutover."""
+    global DB_PATH, SNAPSHOT
+    DB_PATH = Path(database)
+    SNAPSHOT = Path(snapshot)
+
+
 def _promote_legacy_update_restore_point(target: Path) -> None:
     """Bridge one update launched by the pre-prefix engine.
 
