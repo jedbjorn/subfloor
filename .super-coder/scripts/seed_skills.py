@@ -50,7 +50,9 @@ ENGINE = Path(__file__).resolve().parents[1]
 SKILLS_DIR = ENGINE / "assets" / "skills"
 SHELL_TEMPLATES = ENGINE / "templates" / "shells"
 OUT = ENGINE / "migrations" / "0001_seed_skills.sql"
-DB_PATH = instance_state.active_database_path(ENGINE)
+# Update imports the seed helpers while recovering relocation publication.
+# The standalone command validates active_database_path in ``main``.
+DB_PATH = instance_state.maintenance_database_path(ENGINE)
 RETIRED_FILE = artifact_policy.retired_skills_path()
 TOMBSTONES_FILE = ENGINE / "assets" / "skill_tombstones.json"
 SKILL_NAME_RE = re.compile(r"^[a-z][a-z0-9_-]*$")
@@ -536,6 +538,7 @@ def _upsert_live(skills: list[dict]) -> None:
 
 
 def main() -> int:
+    instance_state.active_database_path(ENGINE)
     if not SKILLS_DIR.exists():
         sys.exit(f"seed_skills: no {SKILLS_DIR}")
     skills = [parse_skill(d / "SKILL.md")

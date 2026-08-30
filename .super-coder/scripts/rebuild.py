@@ -28,17 +28,27 @@ import backfill_shell_api_keys  # noqa: E402  (re-provision api_keys post-rebuil
 import db_backup as db_backup_mod  # noqa: E402
 import db_driver  # noqa: E402
 import instance_state  # noqa: E402
+import state_relocation  # noqa: E402
 import map_repo  # noqa: E402
 import migrate as migrate_mod  # noqa: E402
 import seed_skills  # noqa: E402  (re-assert the fork retire list post-seed)
 
-DB_PATH = instance_state.active_database_path(ENGINE)
+DB_PATH = instance_state.maintenance_database_path(ENGINE)
 
 # Compatibility/readability constant: the historical preferred location.
 # Writes resolve dynamically through backup_dir() so a restricted host seat can
 # fall through to SC_DB_BACKUP_DIR or the repo-local gitignored destination.
 BACKUP_DIR = db_backup_mod.preferred_home_dir(REPO_ROOT)
-SNAPSHOT = artifact_policy.content_path()
+# Recovery-safe equivalent of ``artifact_policy.content_path()``. Importing
+# update during ``publishing`` must not invoke the ordinary selector early.
+SNAPSHOT = instance_state.maintenance_snapshot_path(REPO_ROOT)
+
+
+def bind_state_targets(*, database: Path, snapshot: Path) -> None:
+    """Bind canonical targets after an in-process relocation cutover."""
+    global DB_PATH, SNAPSHOT
+    DB_PATH = Path(database)
+    SNAPSHOT = Path(snapshot)
 
 
 def _promote_legacy_update_restore_point(target: Path) -> None:
@@ -76,6 +86,13 @@ def snapshot_path() -> Path:
         return SNAPSHOT
     tracked = REPO_ROOT / ".sc-state" / "content.sql"
     return tracked if tracked.exists() else SNAPSHOT_LEGACY
+
+
+def display_path(path: Path) -> str:
+    try:
+        return str(path.relative_to(REPO_ROOT))
+    except ValueError:
+        return str(path)
 
 
 def read_existing_keys(db_path: Path | None = None) -> dict:
@@ -258,8 +275,7 @@ def parse_args(argv: list[str]) -> bool:
     return "--no-backup" in argv
 
 
-def main(argv: list[str]) -> int:
-    no_backup = parse_args(argv)
+def _main_under_lease(no_backup: bool) -> int:
 
     schema = SCHEMA_SQLITE
     if not schema.exists():
@@ -288,11 +304,11 @@ def main(argv: list[str]) -> int:
             try:
                 con.executescript(snap.read_text())
                 con.commit()
-                print(f"rebuild: loaded {snap.relative_to(REPO_ROOT)}")
+                print(f"rebuild: loaded {display_path(snap)}")
             finally:
                 con.close()
         else:
-            print(f"rebuild: no {SNAPSHOT.relative_to(REPO_ROOT)} — built empty "
+            print(f"rebuild: no {display_path(SNAPSHOT)} — built empty "
                   "(no per-instance content).")
 
         # A snapshot from before immutable governing bodies omits the new
@@ -352,6 +368,10 @@ def main(argv: list[str]) -> int:
     for suffix in ("-wal", "-shm"):
         Path(str(candidate) + suffix).unlink(missing_ok=True)
 
+    private_state = instance_state._bound_private_state(ENGINE)
+    if private_state is not None and DB_PATH == private_state.database:
+        state_relocation.ensure_database_generation(private_state)
+
     try:
         map_repo.main()
     except SystemExit as e:
@@ -360,8 +380,22 @@ def main(argv: list[str]) -> int:
         print(f"rebuild: map failed ({e}) — run `./sc map`")
 
     size_kb = DB_PATH.stat().st_size / 1024
-    print(f"rebuild: done -> {DB_PATH.relative_to(ENGINE.parent)} ({size_kb:.0f} KB)")
+    print(f"rebuild: done -> {display_path(DB_PATH)} ({size_kb:.0f} KB)")
     return 0
+
+
+def main(argv: list[str], *, lease_held: bool = False) -> int:
+    no_backup = parse_args(argv)
+    # Rebuild is not relocation recovery: it must never publish a third DB
+    # while a verified relocation candidate awaits adoption.
+    instance_state.active_database_path(ENGINE)
+    state = instance_state.maintenance_state(ENGINE)
+    if lease_held:
+        state_relocation.refuse_live_database_owners(DB_PATH)
+        return _main_under_lease(no_backup)
+    with state_relocation.exclusive_maintenance(state, command="rebuild"):
+        state_relocation.refuse_live_database_owners(DB_PATH)
+        return _main_under_lease(no_backup)
 
 
 if __name__ == "__main__":

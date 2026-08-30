@@ -401,53 +401,50 @@ class InstanceStateResolverTests(unittest.TestCase):
 
         self.assertFalse(self.state_home.exists())
 
-    def test_active_database_stays_legacy_until_maintenance_cutover(self):
+    def test_fresh_bound_install_activates_private_paths(self):
         resolved = self.resolve()
         legacy = self.engine / "shell_db.db"
 
-        self.assertEqual(instance_state.active_database_path(self.engine), legacy)
-        with self.assertRaisesRegex(
-            instance_state.MaintenanceCutoverRequired,
-            "spec #133 maintenance cutover",
-        ):
+        self.assertEqual(
             instance_state.active_database_path(
-                self.engine,
-                private_state=resolved,
-            )
+                self.engine, private_state=resolved
+            ),
+            resolved.database,
+        )
 
         self.assertFalse(legacy.exists())
         self.assertFalse(resolved.database.exists())
 
-    def test_snapshot_and_backup_paths_share_the_refusing_activation_seam(self):
+    def test_fresh_snapshot_and_backup_paths_share_private_activation(self):
         resolved = self.resolve()
         snapshot = self.repo / ".sc-state" / "local" / "content.sql"
-        snapshot_lock = snapshot.parent / ".content-write.lock"
         backup_paths = instance_state.active_backup_paths(
             self.repo,
             {"HOME": str(self.base / "home"), "SC_DB_BACKUP_DIR": str(self.base / "override")},
+            private_state=resolved,
         )
 
-        self.assertEqual(instance_state.active_snapshot_path(self.repo), snapshot)
         self.assertEqual(
-            instance_state.active_snapshot_lock_path(self.repo), snapshot_lock
+            instance_state.active_snapshot_path(
+                self.repo, private_state=resolved
+            ),
+            resolved.snapshot,
+        )
+        self.assertEqual(
+            instance_state.active_snapshot_lock_path(
+                self.repo, private_state=resolved
+            ),
+            resolved.snapshot_lock,
         )
         self.assertEqual(backup_paths.override, self.base / "override")
-        self.assertEqual(
-            backup_paths.home, self.base / "home" / "db_backups" / "repo"
-        )
-        self.assertEqual(
-            backup_paths.local, self.repo / ".sc-state" / "db_backups"
-        )
+        self.assertEqual(backup_paths.home, resolved.backups)
+        self.assertEqual(backup_paths.local, resolved.backups)
         for selector in (
             instance_state.active_snapshot_path,
             instance_state.active_snapshot_lock_path,
             instance_state.active_backup_paths,
         ):
-            with self.assertRaisesRegex(
-                instance_state.MaintenanceCutoverRequired,
-                "spec #133 maintenance cutover",
-            ):
-                selector(self.repo, private_state=resolved)
+            self.assertIsNotNone(selector(self.repo, private_state=resolved))
         self.assertFalse(snapshot.exists())
         self.assertFalse(resolved.snapshot.exists())
         self.assertFalse(resolved.backups.exists())
@@ -557,7 +554,7 @@ class ProductionSeamInventoryTests(unittest.TestCase):
             ".super-coder/scripts/update.py": ("rebuild_mod.backup_existing",),
             ".super-coder/scripts/rollback.py": ("db_backup_mod.latest_backup",),
             ".super-coder/scripts/remove.py": (
-                "instance_state.active_backup_paths",
+                "instance_state.removal_backup_root",
                 "db_backup.backup_database",
             ),
         }
@@ -580,12 +577,14 @@ class ProductionSeamInventoryTests(unittest.TestCase):
         self.assertRegex(server, r"conversation_broker\.start_service\([^)]*DB_PATH")
         self.assertRegex(server, r"conversation_reaper\.start_service\([^)]*DB_PATH")
 
-    def test_private_target_activation_exists_only_as_a_refusing_seam(self):
+    def test_private_target_activation_has_one_legacy_migration_seam(self):
         source = MODULE_PATH.read_text()
         self.assertEqual(
             source.count("return Path(engine) / \"shell_db.db\""),
             1,
         )
+        self.assertIn("receipt = _relocation_receipt(state)", source)
+        self.assertIn("return state.database", source)
         runtime_selector = re.compile(
             r"(?:/|\+)\s*[\"']shell_db\.db[\"']|"
             r"[\"']shell_db\.db[\"']\s*(?:/|\+)"

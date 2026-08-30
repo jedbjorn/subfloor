@@ -325,8 +325,10 @@ class FreshForkInstallTest(unittest.TestCase):
                 / config["instance_id"]
             )
             self.assertTrue((private_root / "owner.json").is_file())
-            self.assertFalse((private_root / "shell_db.db").exists())
-            self.assertTrue((repo / ".super-coder/shell_db.db").is_file())
+            self.assertTrue((private_root / "shell_db.db").is_file())
+            self.assertTrue((private_root / "database-generation").is_file())
+            self.assertFalse((private_root / "relocation.json").exists())
+            self.assertFalse((repo / ".super-coder/shell_db.db").exists())
 
             reinstalled = self.run_install(repo, home)
             self.assertEqual(
@@ -340,8 +342,8 @@ class FreshForkInstallTest(unittest.TestCase):
             self.assertEqual(reinstalled_config["instance_id"], config["instance_id"])
             roots = list((home / ".local/state/subfloor/instances").iterdir())
             self.assertEqual([root.name for root in roots], [config["instance_id"]])
-            self.assertFalse((private_root / "shell_db.db").exists())
-            self.assertTrue((repo / ".super-coder/shell_db.db").is_file())
+            self.assertTrue((private_root / "shell_db.db").is_file())
+            self.assertFalse((repo / ".super-coder/shell_db.db").exists())
             self.assertIn("Installed ✓", result.stdout)
             self.assertEqual(sys.version_info[:2], (3, 14))
             self.assertIn(
@@ -360,7 +362,7 @@ class FreshForkInstallTest(unittest.TestCase):
             )
             self.assertIn("subfloor managed PATH", (home / ".profile").read_text())
 
-            database = repo / ".super-coder/shell_db.db"
+            database = private_root / "shell_db.db"
             with sqlite3.connect(database) as con:
                 self.assertEqual(
                     con.execute(

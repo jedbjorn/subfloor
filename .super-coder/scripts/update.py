@@ -56,8 +56,10 @@ import importlib.util
 import os
 import re
 import shutil
+import sqlite3
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 ENGINE = Path(__file__).resolve().parents[1]
@@ -80,10 +82,14 @@ import rebuild as rebuild_mod  # noqa: E402
 import seed_skills  # noqa: E402
 import shell_factory  # noqa: E402
 import skill_projection  # noqa: E402
+import state_relocation  # noqa: E402
 sys.path.insert(0, str(ENGINE / "render"))
 import flat  # noqa: E402
 
-DB_PATH = instance_state.active_database_path(ENGINE)
+# Update is the one recovery command allowed to import while a durable
+# relocation publication is incomplete. It must run relocation under the
+# maintenance lease before this target is opened.
+DB_PATH = instance_state.maintenance_database_path(ENGINE)
 
 EJECTED_MARKER = STATE_DIR / "ejected"
 
@@ -118,6 +124,24 @@ def run_script(name: str, *, update_target_ref: str | None = None) -> None:
         env["SC_UPDATE_TARGET_REF"] = update_target_ref
     if subprocess.run([PY, str(ENGINE / "scripts" / name)], env=env).returncode != 0:
         sys.exit(f"update: {name} failed.")
+
+
+def snapshot_under_cutover() -> None:
+    """Snapshot in-process so the parent update retains its exclusive lease."""
+    import snapshot as snapshot_mod
+
+    snapshot_mod.main(lease_held=True)
+
+
+def bind_cutover_state(database: Path) -> None:
+    """Rebind every imported state owner to the relocated canonical pair."""
+    global DB_PATH
+    import snapshot as snapshot_mod
+
+    DB_PATH = Path(database)
+    snapshot_path = instance_state.active_snapshot_path(REPO_ROOT)
+    rebuild_mod.bind_state_targets(database=DB_PATH, snapshot=snapshot_path)
+    snapshot_mod.bind_state_targets(database=DB_PATH, snapshot=snapshot_path)
 
 
 def run_update_compat() -> None:
@@ -998,7 +1022,7 @@ def migrate_generated_artifacts_local() -> None:
 def migrate_or_rebuild(*, backup: bool = True) -> None:
     if not DB_PATH.exists() or DB_PATH.stat().st_size == 0:
         print("→ no live DB (fresh fork) — building from text")
-        rebuild_mod.main([])
+        rebuild_mod.main([], lease_held=True)
         return
     # This restore point pairs with engine.ref.prev.  Keep it distinct from a
     # later verify/rebuild diagnostic backup so rollback cannot combine a
@@ -1062,16 +1086,176 @@ def start_pm2_review_server(service: tuple[str, str] | None) -> None:
     print(f"→ started new PM2 server {process} after DB migration")
 
 
-def migrate_with_service_cutover(*, backup: bool = True) -> None:
+def stop_docker_review_server() -> tuple[str, str] | None:
+    """Stop this fork's running sandbox, if one exists."""
+    docker = shutil.which("docker")
+    if docker is None:
+        return None
+    container = f"sc-{REPO_ROOT.name}"
+    probe = subprocess.run(
+        [docker, "inspect", "-f", "{{.State.Running}}", container],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if probe.returncode != 0:
+        if "no such" in (probe.stderr or probe.stdout).lower():
+            return None
+        sys.exit(
+            f"update: could not inspect Docker runtime {container}:\n"
+            + (probe.stderr or probe.stdout).strip()
+        )
+    if probe.stdout.strip() != "true":
+        return None
+    stopped = subprocess.run(
+        [docker, "stop", container], capture_output=True, text=True, check=False
+    )
+    if stopped.returncode != 0:
+        sys.exit(
+            f"update: could not stop Docker runtime {container}; refusing to "
+            "mutate the live DB:\n" + (stopped.stderr or stopped.stdout).strip()
+        )
+    print(f"→ stopped Docker runtime {container} before DB maintenance")
+    return docker, container
+
+
+def start_docker_review_server(service: tuple[str, str] | None) -> None:
+    if service is None:
+        return
+    docker, container = service
+    started = subprocess.run(
+        [docker, "start", container], capture_output=True, text=True, check=False
+    )
+    if started.returncode != 0:
+        sys.exit(
+            f"update: DB maintenance succeeded but Docker runtime {container} "
+            "could not start:\n" + (started.stderr or started.stdout).strip()
+        )
+    ready = subprocess.run(
+        [docker, "inspect", "-f", "{{.State.Running}}", container],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if ready.returncode != 0 or ready.stdout.strip() != "true":
+        sys.exit(
+            f"update: Docker runtime {container} did not become ready after start"
+        )
+    print(f"→ started Docker runtime {container} after DB maintenance")
+
+
+def require_restarted_runtime_health() -> None:
+    """Require the relaunched API to answer before update reports success."""
+    port = ports.resolve(persist=False).get("port")
+    if not isinstance(port, int):
+        sys.exit("update: restarted runtime has no resolvable health port")
+    url = f"http://127.0.0.1:{port}/api/health"
+    for _attempt in range(20):
+        probe = subprocess.run(
+            ["curl", "-fsS", url], capture_output=True, text=True, check=False
+        )
+        if probe.returncode == 0:
+            return
+        time.sleep(0.25)
+    sys.exit(
+        "update: runtime restart did not reach API readiness; runtime remains failed"
+    )
+
+
+def _stop_restarted_runtime(label: str, service: tuple[str, str]) -> str | None:
+    """Stop one runtime attempted during relaunch; return bounded failure text."""
+    executable, name = service
+    try:
+        stopped = subprocess.run(
+            [executable, "stop", name], capture_output=True, text=True, check=False
+        )
+    except OSError as exc:
+        return f"{label} {name}: {exc}"
+    if stopped.returncode != 0:
+        detail = (stopped.stderr or stopped.stdout).strip() or "stop command failed"
+        return f"{label} {name}: {detail}"
+    print(f"→ stopped restarted {label} runtime {name} after relaunch failure")
+    return None
+
+
+def restart_review_servers(
+    pm2_service: tuple[str, str] | None,
+    docker_service: tuple[str, str] | None,
+) -> None:
+    """Restart the prior runtimes atomically, or return them all to stopped."""
+    attempted: list[tuple[str, tuple[str, str]]] = []
+    try:
+        if pm2_service is not None:
+            attempted.append(("PM2", pm2_service))
+        start_pm2_review_server(pm2_service)
+        if docker_service is not None:
+            attempted.append(("Docker", docker_service))
+        start_docker_review_server(docker_service)
+        if attempted:
+            require_restarted_runtime_health()
+    except (Exception, SystemExit) as exc:
+        cleanup_failures = [
+            failure
+            for label, service in reversed(attempted)
+            if (failure := _stop_restarted_runtime(label, service)) is not None
+        ]
+        if cleanup_failures:
+            detail = "\n  - ".join(cleanup_failures)
+            stopped_status = (
+                "runtime shutdown could not be proven:\n  - " + detail
+            )
+        else:
+            stopped_status = "all managed runtimes are stopped"
+        raise SystemExit(
+            f"{exc}\nupdate: relaunch failed; {stopped_status}; "
+            "private state remains authoritative; retry: ./sc update; "
+            "recover: ./sc rollback"
+        ) from exc
+
+
+def migrate_with_service_cutover(*, backup: bool = True, reconcile=None) -> None:
+    """Run all update reconciliation under one stopped-runtime lease."""
+    docker_service = stop_docker_review_server()
     service = stop_pm2_review_server()
-    if backup:
-        migrate_or_rebuild()
-    else:
-        migrate_or_rebuild(backup=False)
+    legacy_was_present = instance_state.legacy_database_path(ENGINE).exists()
+    try:
+        state = instance_state.resolve(instance_config=ENGINE / "instance.json")
+        with state_relocation.exclusive_maintenance(state, command="update"):
+            relocation = state_relocation.relocate_legacy_state(
+                ENGINE,
+                state=state,
+                command="update",
+                lease_held=True,
+            )
+            # Recovery must advance the ordinary selector before any other
+            # update consumer opens the canonical DB.
+            database = instance_state.active_database_path(
+                ENGINE, private_state=state
+            )
+            if database != relocation.database:
+                raise state_relocation.RelocationError(
+                    "recovered relocation did not activate its published database"
+                )
+            bind_cutover_state(database)
+            # A legacy relocation already created and verified the one preupdate
+            # restore point. An already-private update retains the ordinary backup.
+            migrate_or_rebuild(backup=backup and not legacy_was_present)
+            if reconcile is not None:
+                reconcile()
+    except (
+        state_relocation.RelocationError,
+        instance_state.InstanceStateError,
+        sqlite3.Error,
+    ) as exc:
+        sys.exit(
+            "update: private-state relocation refused; runtime remains stopped: "
+            f"{exc}\n  inspect: ./sc health\n  retry:   ./sc update\n"
+            "  recover: ./sc rollback"
+        )
     # Deliberately not in finally: a failed destructive migration must leave
     # the old server stopped instead of restarting code against a changed or
     # incompatible floor.
-    start_pm2_review_server(service)
+    restart_review_servers(service, docker_service)
 
 
 def sync_skills() -> None:
@@ -1193,6 +1377,57 @@ def expire_sandbox_harnesses() -> str | None:
     return epoch
 
 
+def reconcile_under_cutover(
+    *,
+    source: bool,
+    target_sha: str | None,
+    worktrees: tuple[Path, ...],
+) -> None:
+    """Reconcile the new floor while relocation ownership is still held."""
+    refresh_installed_brokers()
+
+    print("→ sync skills catalogue (id-stable)")
+    sync_skills()
+    print("→ re-grant catalogue skills to all shells")
+    grant_changes = regrant()
+    print(f"  {grant_changes} grant change(s)")
+    print("→ reconcile managed skill projections")
+    projections = reconcile_skill_projections()
+    print(
+        f"  {len(projections['written'])} changed, "
+        f"{len(projections['skipped'])} unchanged across "
+        f"{len(projections['checkouts'])} existing checkout(s)"
+    )
+    print(
+        "  note: DB and disk are current; already-running harness sessions may "
+        "retain previously loaded skill text until reboot"
+    )
+    print("→ wire map automation + map the repo")
+    run_script("map_setup.py", update_target_ref=target_sha)
+    print("→ snapshot the live state")
+    snapshot_under_cutover()
+
+    if not source:
+        print("→ wire make aliases (dos- command standard)")
+        print(f"  {install_mod.wire_make_aliases()}")
+
+    if target_sha is not None:
+        publish_engine_ref(target_sha)
+        reconcile_linked_dispatchers(target_sha, worktrees=worktrees)
+    elif source:
+        canonical = REPO_ROOT / "sc"
+        if canonical.is_file():
+            reconcile_linked_dispatchers(
+                None,
+                worktrees=worktrees,
+                target_bytes=canonical.read_bytes(),
+            )
+    else:
+        dispatcher_ref = callable_floor.read_engine_ref(REPO_ROOT)
+        if dispatcher_ref:
+            reconcile_linked_dispatchers(dispatcher_ref, worktrees=worktrees)
+
+
 def main(argv: list[str]) -> int:
     run_update_compat()
     no_fetch = "--no-fetch" in argv
@@ -1294,61 +1529,13 @@ def main(argv: list[str]) -> int:
         print(f"→ expire the sandbox's baked harness CLIs (epoch {epoch})")
         print("  they reinstall on the next image build — normal `./sc restart` / `make dos-r`")
 
-    migrate_with_service_cutover()
-
-    # Broker systemd units contain absolute ExecStart paths. Refresh only the
-    # services this fork had already installed so a moved repo does not keep
-    # running the pre-move engine after an otherwise successful update.
-    refresh_installed_brokers()
-
-    print("→ sync skills catalogue (id-stable)")
-    sync_skills()
-    print("→ re-grant catalogue skills to all shells")
-    grant_changes = regrant()
-    print(f"  {grant_changes} grant change(s)")
-    print("→ reconcile managed skill projections")
-    projections = reconcile_skill_projections()
-    print(
-        f"  {len(projections['written'])} changed, "
-        f"{len(projections['skipped'])} unchanged across "
-        f"{len(projections['checkouts'])} existing checkout(s)"
+    migrate_with_service_cutover(
+        reconcile=lambda: reconcile_under_cutover(
+            source=source,
+            target_sha=target_sha,
+            worktrees=worktrees,
+        )
     )
-    print(
-        "  note: DB and disk are current; already-running harness sessions may "
-        "retain previously loaded skill text until reboot"
-    )
-    print("→ wire map automation + map the repo")
-    run_script("map_setup.py", update_target_ref=target_sha)
-    print("→ snapshot the live state")
-    run_script("snapshot.py")
-
-    # Self-heal the make wiring: forks installed before the engine scripted this
-    # (or whose include was removed) get the `dos-*` aliases appended now. Source
-    # repo manages its own Makefile — skip it. Idempotent; a no-op if already wired.
-    if not source:
-        print("→ wire make aliases (dos- command standard)")
-        print(f"  {install_mod.wire_make_aliases()}")
-
-    if target_sha is not None:
-        publish_engine_ref(target_sha)
-        reconcile_linked_dispatchers(target_sha, worktrees=worktrees)
-    elif source:
-        # A source repo tracks the engine in its working tree — the canonical
-        # `sc` IS the current dispatcher, and there is no fetched pin to show
-        # it from. Skipping reconciliation here left source-repo shell
-        # worktrees on stale launchers forever (flag #166: skills documented
-        # `sc sprint` while worktree dispatchers predated the verb).
-        canonical = REPO_ROOT / "sc"
-        if canonical.is_file():
-            reconcile_linked_dispatchers(
-                None,
-                worktrees=worktrees,
-                target_bytes=canonical.read_bytes(),
-            )
-    else:
-        dispatcher_ref = callable_floor.read_engine_ref(REPO_ROOT)
-        if dispatcher_ref:
-            reconcile_linked_dispatchers(dispatcher_ref, worktrees=worktrees)
 
     print("\nupdate: done — new floor laid in place; your rows are intact.")
     if source:

@@ -1140,8 +1140,8 @@ class SourceRepoDispatcherReconciliationTest(unittest.TestCase):
             (self.root / "sc").read_bytes(),
         )
 
-    def test_update_main_reconciles_source_repos_from_the_tree(self):
-        source = inspect.getsource(update.main)
+    def test_update_reconciliation_uses_source_tree_dispatcher(self):
+        source = inspect.getsource(update.reconcile_under_cutover)
         self.assertIn("elif source:", source)
         self.assertIn("target_bytes=canonical.read_bytes()", source)
 
@@ -1284,10 +1284,11 @@ class UpdateRefPublicationTest(unittest.TestCase):
             if kwargs.get("publish_ref", True):
                 ref.write_text(sha + "\n")
 
-        def migrate() -> None:
+        def migrate(*, reconcile) -> None:
             events.append("migration")
             if fail == "migration":
                 raise RuntimeError("migration failed")
+            reconcile()
 
         def publish(sha: str) -> None:
             events.append("publish")
@@ -1326,6 +1327,9 @@ class UpdateRefPublicationTest(unittest.TestCase):
                 return_value={"written": [], "skipped": [], "checkouts": []}
             ),
             run_script=mock.Mock(side_effect=run_script),
+            snapshot_under_cutover=mock.Mock(
+                side_effect=lambda: run_script("snapshot.py")
+            ),
         ))
         stack.enter_context(mock.patch.multiple(
             update.install_mod,

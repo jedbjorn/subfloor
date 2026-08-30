@@ -85,6 +85,7 @@ import map_db  # noqa: E402  (read-only handle to the dr_* catalogue in map.db)
 import ports as ports_mod  # noqa: E402
 import shell_factory  # noqa: E402
 import snapshot as snapshot_mod  # noqa: E402  (engine_skill_names — origin rule)
+import state_relocation  # noqa: E402  (runtime/maintenance ownership)
 import sprint_participant_chats  # noqa: E402  (registry-backed Sprint wake chats)
 import sprint_pr_watcher  # noqa: E402  (engine-wide PR subscription observation)
 import model_catalog  # noqa: E402  (live model-id suggestions, sibling module)
@@ -96,7 +97,10 @@ import vm as vm_mod  # noqa: E402  (Windows Test VM — config + live checks)
 import ts as ts_mod  # noqa: E402  (tailnet — config + live checks)
 import pm2 as pm2_mod  # noqa: E402  (host pm2 stack — config + live checks)
 
-DB_PATH = instance_state.active_database_path(ENGINE)
+# Startup validates ``instance_state.active_database_path`` in ``main`` before
+# this recovery-safe target is opened by any route or daemon.
+# Normal activation contract: DB_PATH = instance_state.active_database_path(ENGINE)
+DB_PATH = instance_state.maintenance_database_path(ENGINE)
 
 # The app SHELL stays a frozen route table (spec #48): four files, a closed set
 # that has not changed in the life of the project, and index.html is where the
@@ -1806,7 +1810,11 @@ def set_flavor_grant(con, flavor, skill_id, granted) -> tuple[bool, str | None]:
 # the GUI passes only a registry KEY, never a command, so nothing arbitrary runs.
 # Order = display order; `danger` ones prompt for confirmation in the UI.
 _PY = sys.executable
-_ARTIFACT_DEST = artifact_policy.content_path().relative_to(REPO_ROOT)
+_artifact_path = artifact_policy.content_path()
+try:
+    _ARTIFACT_DEST = _artifact_path.relative_to(REPO_ROOT)
+except ValueError:
+    _ARTIFACT_DEST = "the private instance snapshot"
 _SCRIPTS = {
     "snapshot": ("Snapshot", f"Serialize the per-instance tables → {_ARTIFACT_DEST} "
                  "(deterministic, idempotent). Run after editing identity, roadmap, "
@@ -5336,12 +5344,7 @@ def sprint_monitor_response(
     }
 
 
-def main(argv):
-    port = None
-    if "--port" in argv:
-        port = int(argv[argv.index("--port") + 1])
-    if port is None:
-        port = ports_mod.resolve().get("port", 8800)
+def _run_server(port: int) -> int:
     # The app shell's socket sources are port-exact (see `_csp`), so bind the
     # policy to the port actually being served before any request can render it.
     global _CSP
@@ -5408,6 +5411,25 @@ def main(argv):
     except KeyboardInterrupt:
         pass
     return 0
+
+
+def main(argv):
+    port = None
+    if "--port" in argv:
+        port = int(argv[argv.index("--port") + 1])
+    if port is None:
+        port = ports_mod.resolve().get("port", 8800)
+    try:
+        instance_state.active_database_path(ENGINE)
+        state = instance_state.maintenance_state(ENGINE)
+        # `_run_server` retains the combined on_started=start_runtime_services
+        # callback while this outer scope retains runtime ownership.
+        with state_relocation.shared_runtime(state, command="api-server"):
+            return _run_server(port)
+    except instance_state.MaintenanceCutoverRequired as exc:
+        sys.exit(f"server: {exc}")
+    except state_relocation.MaintenanceBusy as exc:
+        sys.exit(f"server: {exc}")
 
 
 if __name__ == "__main__":
