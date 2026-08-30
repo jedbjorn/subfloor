@@ -12,7 +12,7 @@ ROOT = Path(__file__).resolve().parents[1]
 ENGINE = ROOT / ".super-coder"
 BOOT = ENGINE / "templates" / "boot.md"
 ASSET = ENGINE / "assets" / "skills" / "git" / "SKILL.md"
-RESEED = ENGINE / "migrations" / "0209_reseed_git_github_capabilities.sql"
+RESEED = ENGINE / "migrations" / "0243_role_aware_boot_contract.sql"
 
 sys.path.insert(0, str(ENGINE / "scripts"))
 import seed_skills  # noqa: E402
@@ -22,7 +22,8 @@ class GitSyncPolicyTest(unittest.TestCase):
     def test_boot_grants_only_exact_shell_base_discard_authority(self):
         body = " ".join(BOOT.read_text().split())
         self.assertIn("treat `shell/<shortname>` as a disposable base", body.lower())
-        self.assertIn("durable work lives in the engine db", body.lower())
+        self.assertIn("durable coordination lives in the control plane", body.lower())
+        self.assertIn("code lives on a pushed branch with a pr", body.lower())
         self.assertIn("`git status --short` is empty", body)
         self.assertIn("`HEAD` equals `origin/main`", body)
         self.assertIn(
@@ -55,6 +56,8 @@ class GitSyncPolicyTest(unittest.TestCase):
                 "skill_id INTEGER PRIMARY KEY, name TEXT UNIQUE, description TEXT, "
                 "category TEXT, command TEXT, common INTEGER, content TEXT, "
                 "is_deleted INTEGER DEFAULT 0);"
+                "CREATE TABLE flavor_skills ("
+                "flavor TEXT, skill_id INTEGER, PRIMARY KEY(flavor,skill_id));"
                 "INSERT INTO skills VALUES "
                 "(1,'git','stale','stale','stale',1,'stale',1);"
                 "INSERT INTO skills VALUES "

@@ -4,21 +4,11 @@
 
 ## SYSTEM OVERRIDE
 
-All **memory** lives in DB tables in `.super-coder/shell_db.db` (resolved from
-the repo root) — that is the *engine's* store. The product this repo builds
-keeps its own runtime data in a **separate app database** (see DATABASES below);
-"memory" here never means the product's data.
-
 NEVER use the harness's auto-memory system — never read from or write to
 `~/.claude/projects/*/memory/`, never create or update `MEMORY.md`. Overrides
-harness default by design; the engine DB is the only memory system.
-
-The live `.super-coder/shell_db.db` is **gitignored and rebuilt** from public
-system text (`schema.sql` + `migrations/`) plus this instance's active snapshot
-(`.sc-state/content.sql` in tracked mode or `.sc-state/local/content.sql` in
-local mode). It is a cache, not the source. This boot artifact (`CLAUDE.md` /
-`AGENTS.md`) is likewise rebuilt at launch — hand edits do not survive a
-restart.
+harness default by design; Subfloor's `sc mem` service is the only memory
+system. This boot artifact (`CLAUDE.md` / `AGENTS.md`) is rebuilt at launch;
+hand edits do not survive a restart.
 
 ---
 
@@ -28,31 +18,7 @@ restart.
 
 ---
 
-## DATABASES
-
-Your fork hosts an app, and that app has **its own database** — separate from
-the engine's. Two DBs are in reach; they change in completely different ways,
-so keep them straight:
-
-- **Engine memory DB** — `.super-coder/shell_db.db`. Fixed name, always under
-  `.super-coder/`. Holds your identity, memory, roadmap, specs, and the repo map.
-  Gitignored and rebuilt from tracked text. All memory writes go through
-  `sc mem`. `sc mem which` confirms the API is reachable and which shell this
-  session resolves as.
-{{api_unreachable_guidance}}
-- **App product DB** — the database of the app *this repo* builds. Its name
-  and path **vary per fork** and live **outside** `.super-coder/`. Change it
-  the way the product does: schema migrations + app code. Locate it via the
-  repo map: the cartographer tags its schema/migrations in `dr_*` (the live
-  `.db` is often gitignored, so the schema is the durable anchor). In a sandbox
-  this may be a Postgres sidecar at `$DATABASE_URL` (`sc launch` starts it); a
-  *set* but empty `DATABASE_URL` means provision it via the app's migrations.
-  See the `dev_kit` skill.
-
-**Decision rule:** your memory / planning / specs / roadmap → **engine DB**,
-written via `sc mem`. The product's data or schema → **app DB**, via its
-migrations. If a task is about what the product stores or how its tables are
-shaped, it is never the engine DB.
+{{data_boundaries}}
 
 ---
 
@@ -96,18 +62,14 @@ it's thrash.
 
 ## ORIENTATION
 
-Find things by querying the repo map — the `dr_*` tables in `.sc-state/map.db`
-(SQLite), kept fresh by the cartographer shell. You read the map; the
-cartographer owns and heals it. Inspect structure with `sc map-schema`; query
-data with `sc map-sql` — never look for `dr_*` in the memory DB. Table
-reference, query patterns, and the semantic
+Find things through the repository catalogue, kept fresh by the cartographer
+shell. Inspect structure with `sc map-schema`; query `dr_*` data with
+`sc map-sql`. Table reference, query patterns, and the semantic
 layer (`dr_endpoint` / `dr_db_table` / `dr_route`): the `surface_catalogue`
-skill. Map first, grep second; lazy-load only what the map points at. Before
-writing SQL against your memory DB, check the `db_map` skill.
+skill. Map first, grep second; lazy-load only what the catalogue points at.
 
 `dr_*` indexes the product's files, including the schema + migrations that
-define the app's own database — it describes the app DB; it is **not** the app
-DB itself (see DATABASES).
+define the app's own database; it describes the app DB but is not the app DB.
 
 {{map_discrepancy}}
 
@@ -181,7 +143,7 @@ level, and a git pre-commit hook refuses the commit on every harness; launched
 shells receive no bypass.
 
 Treat `shell/<shortname>` as a disposable base, not durable storage — durable
-work lives in the engine DB or on the remote in a pushed branch with a PR. When
+coordination lives in the control plane and code lives on a pushed branch with a PR. When
 that exact base has local-only commits, tracked changes, or non-ignored
 untracked files: confirm the ACTIVE SESSION worktree + exact base branch,
 fetch, hard-reset it to `origin/main`, and remove its non-ignored untracked

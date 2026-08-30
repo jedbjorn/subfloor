@@ -18,6 +18,7 @@ ROOT_ONLY_MARKER = "<!-- sc-root-only:"
 RATIFIED_OPT_INS = {
     "admin": {
         "admin_git",
+        "engine_database",
         "engine_migrations",
         "git_cleanup",
         "self_update",
@@ -280,7 +281,10 @@ class HardCutoverMigrationTest(unittest.TestCase):
                     (flavor,),
                 )
             }
-            expected_with_local = expected | (
+            # 0241 predates the Admin-only engine_database skill introduced by
+            # 0243; this fixture proves the historical migration in isolation.
+            expected_at_0241 = expected - {"engine_database"}
+            expected_with_local = expected_at_0241 | (
                 {"fork_testing_seat"} if flavor == "dev" else set()
             )
             self.assertEqual(actual - common, expected_with_local, flavor)

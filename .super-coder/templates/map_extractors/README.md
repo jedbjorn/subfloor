@@ -2,16 +2,16 @@
 
 These are **reference** extractors. They are NOT run from here. Read the closest
 reference, then author the adapted source at
-`$SC_SHELL_WORKTREE/.sc-state/map_extractors/<name>.py` on the Cartographer's
-branch. Install it only with:
+`.sc-state/map_extractors/<name>.py` in the Cartographer's assigned worktree.
+Install it only with:
 
 ```sh
-sc map-extractor install "$SC_SHELL_WORKTREE/.sc-state/map_extractors/<name>.py"
+sc map-extractor install ".sc-state/map_extractors/<name>.py"
 ```
 
 Pass = output prints the canonical installed path + SHA-256 matching the
-authored bytes. NEVER copy, move, redirect, or edit directly into
-`$SC_ROOT/.sc-state/map_extractors/`.
+authored bytes. NEVER copy, move, redirect, or edit directly into another
+checkout's `.sc-state/map_extractors/`.
 
 The engine maps the generic 80% — files, languages, roles, dependencies, env
 vars. Extractors add the semantic, per-repo dimensions the engine can't know

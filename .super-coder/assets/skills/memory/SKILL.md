@@ -7,12 +7,12 @@ common: true
 
 # memory — write as you go
 
-All memory = DB rows; no flat files. Write at the moment it matters, never in a
-close ritual.
+All memory uses the Subfloor control-plane service; managed flat files are not
+a write surface. Write at the moment it matters, never in a close ritual.
 
-Every write goes through `sc mem` -> lands in the live shared engine DB, visible
-to all shells on commit. It always targets your own shell (the engine resolves
-API identity for you) — never name a shell.
+Every write goes through `sc mem` and becomes durably visible to other shells.
+The service resolves your shell identity; never name a shell in an identity
+write.
 
 ## current_state — rolling status, NOT a log
 

@@ -1477,18 +1477,18 @@ super-coder — forkable shell substrate
                              (a model the shells cannot reach is nearly always this — see .super-coder/docs/harness-freshness.md)
   ./sc docker-cache-gc     remove unused host-global Docker build cache older than seven days
                              --until <duration> changes the age · --all removes all unused cache
-  ./sc rollback            sound undo of a bad update — restore the DB + engine (engine.ref.prev) together
-                             --engine-only repairs a new-engine / unchanged-old-DB half floor without restoring a DB backup
+  ./sc rollback            Admin-only undo of a bad update — restore the paired control-plane + engine generation
+                             --engine-only repairs a new-engine / unchanged-state half floor
   ./sc feature             list optional infrastructure (pg · windows · tailnet · pm2) and its instance.json state
   ./sc feature enable <f>  create or point at one instance.json block (disable removes it)
   ./sc eject               ONE-WAY: stop tracking upstream and own the engine — un-gitignore + stage .super-coder/ as fork source (confirm-gated)
   ./sc remove              safely uninstall subfloor from this repo after a verified DB backup
                              --dry-run previews; --yes skips confirmation, never safety gates
-  ./sc rebuild             build the .db from schema + migrations + snapshot
-  ./sc migrate             apply pending migrations to an existing .db
+  ./sc rebuild             Admin-only verified rebuild of the private control plane
+  ./sc migrate             Admin-only application of pending engine changes
   ./sc migration new <slug>
                            allocate the next free migration number, write the standard skeleton, and update the source removal-test allowlist
-  ./sc snapshot            dump per-instance tables to gitignored .sc-state/local/
+  ./sc snapshot            Admin-only serialization of private instance content
                              live-state commands (rebuild · migrate · verify · snapshot · render · clean-db) act on the SHARED live
                              instance at the main checkout, so they REFUSE from a linked worktree rather than substitute it, naming
                              the target declined (decision #81); -h/--help still answers from any checkout. render-check is the
@@ -1499,12 +1499,8 @@ super-coder — forkable shell substrate
                            subscribe the authenticated Developer shell to engine-wide PR event wakes
   ./sc sprint <cmd>        authenticated Sprints v2 actions (run without a command for the full verb list)
                              caller identity is resolved by the engine; report and review bodies use files, and mutating retries carry stable keys where required
-  ./sc token               print the browser sign-in operator token (an operator capability: the Admin runtime
-                             credential from the owner-only artifact .super-coder/run/mem/<shortname>.json, mode 0600)
-                             — stdout carries ONLY the token, for paste into the browser sign-in prompt. Never
-                             rotates; a missing/unreadable/insecure artifact refuses on stderr with the service
-                             action (`./sc restart` / `make dos-r`). A recovery path — the browser attaches its
-                             own credential, so pasting a token by hand is no longer the everyday sign-in
+  ./sc token               print the browser sign-in operator token — an Admin/operator recovery capability;
+                             stdout carries only the token and failure names the supported service action
   sc engine-ref            print the full engine pin from the canonical live checkout — safe from any shell
                              worktree; stdout is the 40-character SHA only
   ./sc job start -- <cmd>  run a long local command (suite/bench/build) detached + supervised — it
@@ -1516,12 +1512,9 @@ super-coder — forkable shell substrate
   ./sc models resolve <h> [<model>] [--effort <level>] [--shell <shortname>]
                              print one exact, locally runnable high-effort call; list [harness] shows routes
   ./sc visual-qa <mode>    viewport screenshot QA: ci boots/captures · run captures a local app · init scaffolds config
-  sc sql "<query>"         read-only passthrough to the engine DB (schema/skills/flags) — absolute path, cwd-independent (no `cd` to root)
-  sc map-sql "<query>"     read-only passthrough to the repo-map DB (dr_* catalogue) — absolute path, cwd-independent
+  sc map-sql "<query>"     read-only query of the repository catalogue (`dr_*`)
   sc map-schema [dr_table] list live dr_* objects or stable column/index metadata — read-only, no arbitrary SQL
-  sc sql-rw · sc map-sql-rw
-                           read-WRITE passthroughs — bypass the API's triggers/caps; `sc mem` is the write path.
-                             Only for procedures with no API surface (map authoring) where a skill names it
+  sc map-sql-rw            Cartographer-only catalogue authoring when its skill names the exact procedure
   ./sc skill <cmd>         skill catalogue surface: list · grant <name> <shell>... · revoke <name> <shell>... · rm <name> · retire <name> · unretire <name>
                              shells by id or shortname; rm refuses engine skills — retire/unretire manages the fork retire
                              list (active tracked/local retire path, rides updates); snapshot after writes to persist

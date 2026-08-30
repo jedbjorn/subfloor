@@ -28,8 +28,8 @@ Read each doc; decide together:
   feature.
 Skip noise (changelogs, license, vendored docs) unless the FnB wants it.
 
-All writes below go through `sc mem` -> live shared engine DB; the import never
-touches the app DB.
+All writes below go through `sc mem` to durable shared control-plane state; the
+import never touches the app DB.
 
 ## 3. Backfill the roadmap
 Create one feature per coherent area/initiative the docs imply; status by how
@@ -49,7 +49,7 @@ sc mem doc add "…" --kind spec --feature <id> --body-file ./path/to/spec.md --
 Spec describes shipped work -> freeze it: `sc mem doc freeze <document_id>`.
 
 ## 5. Persist
-Each `sc mem` write is live in the shared engine DB immediately -> the GUI's
+Each confirmed `sc mem` write is live in the shared control plane immediately -> the GUI's
 Docs/Roadmap tabs reflect the import as you go. Flat `_sc` copies + git commit
 = an admin/GUI publish step, not part of onboarding.
 

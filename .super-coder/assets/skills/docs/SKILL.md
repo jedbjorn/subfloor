@@ -66,7 +66,7 @@ isn't a feature/spec (a quick fix) needs no work-stream.
 Before writing — don't duplicate, don't re-litigate, and don't transcribe the
 request uncritically:
 ```
-sc mem get documents      # every spec/doc in the engine DB (kind, seq, frozen, task_count)
+sc mem get documents      # every control-plane spec/doc (kind, seq, frozen, task_count)
 sc mem get decisions      # active-decision index (<id> = full row + rationale; --all incl. superseded)
 sc map-sql "SELECT path FROM dr_filepath WHERE role='doc';"   # repo's own docs (map db)
 ```

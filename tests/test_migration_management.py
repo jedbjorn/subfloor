@@ -211,7 +211,7 @@ class MigrationManagementReseedTest(unittest.TestCase):
             con.executescript(
                 (
                     ENGINE
-                    / "migrations/0241_global_skill_simplification.sql"
+                    / "migrations/0243_role_aware_boot_contract.sql"
                 ).read_text()
             )
             actual = con.execute(
@@ -240,7 +240,8 @@ class MigrationManagementReseedTest(unittest.TestCase):
         self.assertIn("\n./sc migrate\n", actual[5])
         self.assertNotIn("./sc migrate /", actual[5])
         self.assertIn("migrate: db         <absolute-path>", actual[5])
-        self.assertIn("ACTIVE SESSION `floor: live_engine_checkout`", actual[5])
+        self.assertIn("Admin boot names the private instance-state directory", actual[5])
+        self.assertIn("independently resolved canonical database", actual[5])
         self.assertIn("0001_seed_skills.sql` is the generated exception", actual[5])
         self.assertIn("nothing pending", actual[5])
 

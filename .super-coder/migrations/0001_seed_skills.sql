@@ -216,7 +216,7 @@ Run this sequence on first boot, after a shape notice, or when the map drifts:
    SELECT role, COUNT(*) n FROM dr_filepath GROUP BY role ORDER BY n DESC;
    ```
 
-3. Tune `$SC_ROOT/.sc-state/local/map/config.json` only where defaults are
+3. Tune `.sc-state/local/map/config.json` in the assigned worktree only where defaults are
    wrong. Config is per-clone runtime state and never a commit. All keys are
    optional; skip sets extend defaults and cannot re-include engine-owned
    paths:
@@ -247,7 +247,7 @@ Automation remains healthy when:
 
 - `post-merge` / `post-checkout` / `post-rewrite` run `sc map` through
   `core.hooksPath`.
-- `sc rebuild` remaps after rebuilding the engine DB.
+- Admin control-plane rebuilds remap through their supported lifecycle.
 - pm2''s `sc-map-<repo>` one-shot cycles stopped -> online hourly while the
   stack is up. A repo without pm2 relies on hooks + manual `sc map`.
 
@@ -338,8 +338,8 @@ WHERE path LIKE ''<app migrations dir>/%'';
 ```
 
 Create an authored section when those files form a real area. Pass = working
-shells can identify the app DB definition without confusing it with
-`.super-coder/shell_db.db`. No product DB -> `N/A`.
+shells can identify the app DB definition without confusing it with Subfloor
+control-plane state. No product DB -> `N/A`.
 
 ## Semantic extractors
 
@@ -351,14 +351,13 @@ coverage.
 Adopt an extractor:
 
 1. Inspect stack dependencies/file mix with `sc map-sql`.
-2. Read the closest reference under
-   `$SC_ENGINE_DIR/templates/map_extractors/`. Author/adapt
-   `$SC_SHELL_WORKTREE/.sc-state/map_extractors/<name>.py` in your worktree.
+2. Author `.sc-state/map_extractors/<name>.py` in the assigned worktree against
+   the extractor contract above.
 3. Run `sc map-extractor install
-   "$SC_SHELL_WORKTREE/.sc-state/map_extractors/<name>.py"`. Pass = output
+   ".sc-state/map_extractors/<name>.py"`. Pass = output
    prints the installed canonical path + SHA-256 matching the authored bytes.
 4. NEVER `cp`, `mv`, redirect, or use a file-edit tool into
-   `$SC_ROOT/.sc-state/map_extractors/`. The guarded installer is the only
+   another checkout''s `.sc-state/map_extractors/`. The guarded installer is the only
    supported cross-worktree write.
 5. Run `sc map`, inspect structure with `sc map-schema <dr_table>`, then query
    rows with `sc map-sql`. Pass = expected semantic rows exist + the map log
@@ -549,131 +548,91 @@ ON CONFLICT(name) DO UPDATE SET
 
 INSERT INTO skills (name, description, category, command, common, content, is_deleted) VALUES (
   'db_map',
-  'Data model behind the engine memory surfaces + the `sc mem` command for each. Check before reading or writing memory — identity, decisions, roadmap, documents, flags. Reads/writes go through the API (`sc mem`), never raw sqlite.',
+  'Supported Subfloor control-plane surfaces, ownership, scope, and `sc mem` commands. Check before reading or writing identity, decisions, roadmap, documents, tasks, or flags.',
   'substrate',
   NULL,
   1,
-  '# db_map — super-coder''s DB at a glance
+  '# db_map — use the supported control-plane surfaces
 
-All identity, memory, and content live in the engine DB
-(`.super-coder/shell_db.db`). NEVER touch that file — read and write it only
-through the engine API, via `sc mem`:
+Subfloor control-plane state is already wired to the launched shell. Read and
+write it through `sc mem`; the service resolves shell identity and enforces
+ownership, caps, immutability, and durable transactions. `sc mem which`
+confirms the active identity and API reachability.
 
-- **Read** = `sc mem get <surface>`: your own `state`, `seed`, `lns`,
-  `decisions`, `flags`, `narrative`, `messages`; shared planning state
-  `roadmap`, `projects`, `documents`, `tasks`, `shells` (`--json` for raw).
-  `documents`/`tasks` take `--feature <id>` / `--doc <id>`; `--doc` on
-  `documents` returns the one doc *with* its body. `flags` is open-only by
-  default; `get flags <id>` includes one resolved row, while `get flags
-  --feature <id> --resolved` returns bounded closure evidence.
-- **Write** = `sc mem <cmd> …` (see `## Common writes`).
+The repository catalogue is separate: inspect its `dr_*` objects with
+`sc map-schema` and query them with `sc map-sql`. Product runtime data is also
+separate and follows the fork application''s code, migrations, dev-kit commands,
+and app database connection.
 
-There is NO raw `sqlite3` path — not as a fallback, not for "ad-hoc" reads.
-If the API isn''t wired, `sc mem` fails loud instead of writing the DB behind
-its back. `sc mem` is already wired to this launched shell — the engine
-resolves API identity for you; never name a shell in a write. Decisions read
-FLEET-WIDE (every row, tagged `@shortname`) so cross-shell citations
-resolve; every other identity surface reads as you.
+## Read surfaces
 
-**The `sc sql` lane** (read-only; `sc sql-rw` gated) is real and blessed for
-what `sc mem` doesn''t cover: admin/reporting reads and sweep queries — the
-flag_sweep / git_cleanup skills run it by design. The doctrine is one level
-down: memory-surface reads and writes go through `sc mem`; `sc sql` is for
-reporting ACROSS surfaces, never a write path for identity/memory (that is
-what `sc mem` scopes and validates).
-
-The table below = the data model behind those surfaces (what each `sc mem`
-write touches), not a query cheatsheet. Lazy-load: `get` the one surface you
-need, don''t bulk-read.
-
-**Need a read/write `sc mem` doesn''t expose?** Report the gap, don''t reach for
-the DB — the direct path is closed by design, and a fork can''t patch the
-engine (`sc update` would overwrite it). Open a flag naming the data + the
-use, surface it to the FnB (who carries it upstream); message a
-planner-flavor shell too if the fork has one. Until it lands: do what you can
-through the API, flag the rest — NEVER query the DB directly.
-
-```
-sc mem flag open "[Engine] need to <read|write> <what> — no sc mem surface for it | Blocker for: <your work>"
+```text
+sc mem get state
+sc mem get seed
+sc mem get lns
+sc mem get decisions [<id>]
+sc mem get flags [<id>] [--feature <id>] [--resolved]
+sc mem get narrative
+sc mem get messages
+sc mem get roadmap
+sc mem get projects
+sc mem get documents [--feature <id> | --doc <id>]
+sc mem get tasks [--feature <id> | --doc <id>]
+sc mem get shells
 ```
 
-The repo map (`dr_*`) lives in its own db, `.sc-state/map.db` (see the
-`surface_catalogue` skill). The `dr_*` tables also exist in `shell_db.db` but
-are ALWAYS empty there — a `dr_*` query against `shell_db.db` silently returns
-0 rows instead of erroring. Never query `dr_*` here; this map covers only
-`shell_db.db` (memory/identity/content).
+Identity surfaces (`state`, `seed`, `lns`, narrative, and messages) resolve as
+the calling shell. Decisions are fleet-visible and tagged by author. Planning,
+document, task, project, and shell reads are shared coordination surfaces.
+Use `--json` only when a supported command consumer needs structured output.
 
-## Tables
+## Write surfaces
 
-| Table | Holds | Write rule |
-|---|---|---|
-| `shells` | identity core: `mandate`, `system_prompt`, `current_state` (rolling, ~500 chars), `lineage_seed`, `active_archive_id`. (`connections`/`workspace` retired — boot `## CONNECTIONS` is derived from the `dr_*` map, not authored here) | UPDATE in place |
-| `shell_identity_entries` | seed (cap 10) + L&S (`kind=''lns''`, cap 20); triggers enforce caps | INSERT to add; UPDATE `retired_at` to curate out — NEVER edit a seed body (Law 3) |
-| `shell_decisions` | major decisions | INSERT only; supersede via `parent_decision_id` |
-| `shell_memory_archives` | one row per session; `full_narrative` appended progressively | INSERT at session open; UPDATE narrative |
-| `roadmap` | one row per planned feature; `roadmap_status` = planning horizon (`brainstorm`→`in_progress`→`next`→`near_term`→`long_term`→`shipped`→`retired`), `sort_order` within a bucket. `shipped` = delivered; `retired` = off the board without shipping (decided-against / split / absorbed / replaced) — keep the row. `project_id` (nullable) = the work-stream the feature belongs to; the GUI Flow view groups on it (NULL = Ungrouped) | INSERT/UPDATE |
-| `feature_blockers` | roadmap dependency edges: one row = `feature_id` depends on `blocked_by` (prerequisite lands first). Directed, kept acyclic (GUI Flow view wires them; the card''s "depends on" picker sets them) | INSERT/DELETE the edge; set the whole set via `sc mem roadmap depends` |
-| `documents` | content store — spec/doc bodies; `frozen=1` on ship (immutable); `render_path` = flat-file target | INSERT a new `seq` per stage; NEVER edit a frozen body |
-| `flags` | open + resolved tasks; `feature_id` links a flag to the feature it blocks | INSERT to open; UPDATE `resolved=1` + `resolved_date` to close |
-| `skills` / `flavor_skills` / `shell_skills` | skill catalogue + shared packs for standard flavors + per-shell packs for Bespoke shells; `resolved_shell_skills` is the effective read view | managed by engine; name any standard shell to change its flavor pack, or a Bespoke shell to change only itself, via `sc skill grant/revoke` |
-| `projects` / `project_shells` | project standing + shell linkage; a `projects` row also doubles as a work-stream that roadmap features attach to via `roadmap.project_id` (the Flow-view grouping) | UPDATE `standing`; INSERT to add |
+Each successful command confirms a durable API write:
 
-`<self>` = your `shell_id` (in the boot doc''s ACTIVE SESSION block).
-
-## Common writes
-
-Each routes through the engine API to the live shared DB. `sc mem which`
-orients; `sc mem <cmd> -h` shows flags. Writes always target your own shell —
-the engine resolves API identity for you.
-
-```
-# current_state (rolling status, not a log — replaces in place):
+```text
 sc mem state "…"
+sc mem seed "…"
+sc mem lns "…" --new
+sc mem lns "…" --supersedes <ids>
+sc mem retire <entry_id>
+sc mem decision "…" --rationale "…" [--parent <id>] [--feature <id> | --doc <id>]
 
-# plant a seed / L&S entry (date stamped for you):
-sc mem seed "…"            # sc mem lns "…" for a lesson
-sc mem retire <entry_id>   # curate one out (frees a cap slot)
+sc mem roadmap add "…" --status <status> --summary "…" [--project <id|shortname>]
+sc mem roadmap status <feature_id> <status>
+sc mem roadmap project <feature_id> <id|shortname|none>
+sc mem roadmap depends <feature_id> [--on <feature_id>]…
 
-# record a Major decision (supersede with --parent <id>):
-sc mem decision "…" --rationale "…"
-
-# roadmap: add a feature / move its horizon:
-sc mem roadmap add "…" --status brainstorm --summary "…" [--project <shortname|id>]
-sc mem roadmap status <feature_id> shipped
-
-# roadmap grouping + sequencing (drive the GUI Flow view):
-sc mem roadmap project <feature_id> <shortname|id>   # assign a work-stream (or ''none'' to clear)
-sc mem roadmap depends <feature_id> --on <id> [--on <id>]   # set dependencies (replaces; omit --on to clear; refuses cycles)
-
-# author a spec/doc body (--body-file reads the markdown), then freeze on ship:
-sc mem doc add "…" --kind spec --feature <id> --body-file ./draft.md --render-path specs_sc/….md
+sc mem doc add "…" --kind <spec|doc> --feature <id> --body-file <path> --render-path <path>
 sc mem doc freeze <document_id>
+sc mem task add "…" --feature <id> --doc <id> --seq <n> [--desc "…"]
+sc mem task start <task_id>
+sc mem task done <task_id>
+sc mem task cancel <task_id> --notes "…"
 
-# spec_tasks (the plan): add a task / advance it / close it honestly:
-sc mem task add "…" --feature <id> --doc <doc_id> --seq <n> [--desc "…"]
-sc mem task start <task_id>     # sc mem task done <task_id>
-sc mem task cancel <task_id> --notes "moved to F<id> as task #<n>"   # split/re-scope — never mark unbuilt work done
-
-# open / edit / close a flag:
-sc mem get flags <flag_id>                         # exact, open or resolved
-sc mem get flags --feature <feature_id> --resolved # bounded closure evidence
-sc mem flag open "[Area] … | Blocker for: …" --name CC-001 [--feature <id>]
-sc mem flag edit <flag_id> [--description "…"] [--priority High] [--feature <id>]
+sc mem flag open "…" --name <name> [--priority <priority>] [--feature <id>]
+sc mem flag edit <flag_id> [--description "…"] [--priority <priority>] [--feature <id>]
 sc mem flag close <flag_id> --notes "…"
 
-# projects (standing + linkage):
 sc mem project add <shortname> "<title>" --purpose "…" --standing "…"
-sc mem project standing <shortname|id> "…"     # sc mem project status <…> paused
-
-# inbox + first-run:
-sc mem message send <shortname> "…"     # check / mark-read too (see `messaging`)
-sc mem oriented                          # mark first-run done (bootstrapped=1)
+sc mem project standing <id|shortname> "…"
+sc mem message send <shortname> "…"
+sc mem oriented
 ```
 
-## After writing
+Load the owning skill before a governed write: `memory` for state/identity,
+`spec` for roadmap tasks, `docs` for documents, `flags` for blockers, and
+`messaging` for shell coordination. Frozen documents require a new document
+revision; decisions are superseded with `--parent`; seed entries are retired
+rather than rewritten.
 
-Nothing more to run — the write is live in the shared engine DB on commit,
-visible to every shell. Persisting to git is an admin/GUI step, not yours.',
+## Failure behavior
+
+An unavailable API stops control-plane work; ordinary shells do not fall back
+to files or arbitrary queries. A missing supported read/write projection is an
+engine gap: report the exact data and use needed, then stop at that boundary.
+Admin storage, backup, rebuild, and repair internals live in the Admin-only
+`engine_database` skill.',
   0
 )
 ON CONFLICT(name) DO UPDATE SET
@@ -748,7 +707,7 @@ isn''t a feature/spec (a quick fix) needs no work-stream.
 Before writing — don''t duplicate, don''t re-litigate, and don''t transcribe the
 request uncritically:
 ```
-sc mem get documents      # every spec/doc in the engine DB (kind, seq, frozen, task_count)
+sc mem get documents      # every control-plane spec/doc (kind, seq, frozen, task_count)
 sc mem get decisions      # active-decision index (<id> = full row + rationale; --all incl. superseded)
 sc map-sql "SELECT path FROM dr_filepath WHERE role=''doc'';"   # repo''s own docs (map db)
 ```
@@ -1113,6 +1072,94 @@ ON CONFLICT(name) DO UPDATE SET
   content=excluded.content, is_deleted=0;
 
 INSERT INTO skills (name, description, category, command, common, content, is_deleted) VALUES (
+  'engine_database',
+  'Admin-only map of Subfloor''s private instance database, schema, tables, backups, snapshots, rebuild path, SQL diagnosis, and repair boundaries.',
+  'substrate',
+  NULL,
+  0,
+  '# engine_database — inspect and repair the control plane
+
+Admin only. The boot `ENGINE MAINTENANCE` block names the active engine floor
+and private instance-state directory. Resolve the canonical database again
+before any repair:
+
+```bash
+python3 .super-coder/scripts/instance_state.py active-database .super-coder
+```
+
+Require the printed absolute path to sit under the boot''s private instance
+state. The private directory owns the live `shell_db.db` plus WAL/SHM sidecars,
+local control-plane snapshot, verified backups, relocation receipt, maintenance
+lease, and DB-generation evidence. The repository catalogue remains a separate
+map store; a product database remains the fork application''s concern.
+
+## Source and rebuild model
+
+In the Subfloor source repository, `.super-coder/schema.sql` is the current
+baseline and `.super-coder/migrations/*.sql` are ordered, ledger-tracked deltas.
+Installed downstream floors materialize the same engine source. `sc rebuild`
+creates a candidate from that source plus the private instance snapshot,
+verifies it, and publishes only through the maintenance cutover. Load
+`engine_migrations` before changing the baseline or migrations and `snapshot`
+before serializing instance content.
+
+## Data model
+
+| Surface | Storage |
+|---|---|
+| Shell core | `shells` — role, flavor, mandate, system prompt, current state, active session/archive identity |
+| Seed and L&S | `shell_identity_entries` — capped identity entries with retirement |
+| Decisions | `shell_decisions` — append-only decisions and supersession links |
+| Narrative | `shell_memory_archives` — per-session narrative |
+| Planning | `roadmap`, `feature_blockers`, `projects`, `project_shells`, `spec_tasks` |
+| Documents | `documents` — revisioned spec/doc bodies and freeze state |
+| Flags | `flags` — open/resolved work linked to features |
+| Skills | `skills`, `flavor_skills`, `shell_skills`, `resolved_shell_skills` |
+| Coordination | message, wake, conversation, Sprint, PR-subscription, and liveness tables |
+
+Normal reads and writes still use `sc mem` and bounded APIs. The table map is
+for diagnosis, migration authoring, and recovery—not ordinary shell work.
+
+## SQL and mutation boundary
+
+`sc sql` is the Admin read-only diagnostic lane and remains available from the
+host Admin seat when the API is down. `sc sql-rw` is an overt escape hatch and
+must refuse outside a named procedure satisfying all of these gates:
+
+- managed runtime stopped;
+- exclusive maintenance lease held;
+- WAL-safe backup verified before mutation;
+- exact canonical target independently matched;
+- candidate and ledger verified before publication;
+- restart health and rollback evidence retained.
+
+Prefer the typed maintenance command (`sc migrate`, `sc rebuild`, `sc update`,
+`sc rollback`, or the named recovery procedure) over direct SQL. Keep external
+calls outside transactions. A path mismatch, unresolved private state,
+conflicting legacy/private copies, failed backup, or absent authority stops the
+operation with the runtime down.
+
+## Recovery routing
+
+- API down, database healthy: use host Admin `sc health`, `sc logs`, and
+  read-only `sc sql`, then restore the managed service with `sc restart` /
+  `make dos-r`.
+- Migration or rebuild work: load `engine_migrations` and require its backup,
+  candidate, ledger, and restart receipts.
+- Snapshot or render repair: load `snapshot`; do not hand-edit serialized or
+  rendered state.
+- Update/rollback failure: load `self_update`; preserve the engine/database
+  generation pair.
+- Ambiguous or damaged canonical state: keep the runtime stopped and present
+  the exact database, backup, generation, and relocation evidence to the FnB.',
+  0
+)
+ON CONFLICT(name) DO UPDATE SET
+  description=excluded.description, category=excluded.category,
+  command=excluded.command, common=excluded.common,
+  content=excluded.content, is_deleted=0;
+
+INSERT INTO skills (name, description, category, command, common, content, is_deleted) VALUES (
   'engine_migrations',
   'Maintain Subfloor''s schema baseline, ordered migration ledger, live-DB backup boundary, rebuild/update compatibility, and source-repository migration files. Admin-only by default.',
   'substrate',
@@ -1150,19 +1197,19 @@ a trailing reconciliation migration. Preserve per-instance rows carried by the
 snapshot. Pass = fresh build, in-place migration, and rebuild from an older
 snapshot converge to the same state.
 
-## Protect the live cache
+## Protect the live instance
 
-The live engine DB is `.super-coder/shell_db.db` in the main checkout, not a
-Developer worktree. Before an authorized live migration, resolve that exact
-path independently from the ACTIVE SESSION `floor: live_engine_checkout`, then
-use the supported backup-and-apply surface:
+The Admin boot names the private instance-state directory. Before an authorized
+live migration, load `engine_database` and independently resolve the canonical
+database through the state resolver. Require that path to match the boot''s
+private state, then use the supported backup-and-apply surface:
 
 ```bash
 ./sc migrate
 ```
 
 Require its first line, `migrate: db         <absolute-path>`, to match the
-independently resolved live DB exactly. The command then reports the migration
+independently resolved canonical database exactly. The command then reports the migration
 source, creates a WAL-safe backup with a `premigrate` restore point for an
 existing DB, and reports each applied filename plus the final count (or
 `nothing pending`). Pass = the backup receipt names its restore path before the
@@ -1206,18 +1253,12 @@ close what''s provably resolved, open what''s provably missing.
 
 ---
 
-## Step 1: Load the open flags with their state
+## Step 1: Load the bounded delivery audit
 
-```sql
-SELECT f.flag_id, f.display_name, f.priority, f.description,
-       f.feature_id, r.title AS feature, r.roadmap_status,
-       (SELECT COUNT(*) FROM documents d
-        WHERE d.feature_id = f.feature_id AND d.frozen=1) AS frozen_docs
-FROM flags f
-LEFT JOIN roadmap r ON r.feature_id = f.feature_id
-WHERE f.resolved=0 AND COALESCE(f.is_deleted,0)=0
-ORDER BY f.priority, f.flag_id;
-```
+Run `sc mem delivery-audit`. The Planner-only API response contains
+`recent_flag_names`, `open_flags`, `implemented_but_unshipped`, and
+`shipped_but_undocumented`. It preserves the deterministic queries and dedup
+guards below without granting arbitrary engine SQL.
 
 `frozen_docs` counts ANY frozen document on the feature — kind=''spec'' AND
 kind=''doc'' both qualify (#319: forks that freeze kind=''doc'' rows for shipped
@@ -1265,8 +1306,7 @@ NEVER reopen a flag. A close whose evidence you had to infer -> Step 4.
 
 Two gaps drop silently, in sequence: 3A (done but never marked shipped)
 precedes 3B (shipped but undocumented) — a feature exits 3A before 3B can
-apply. Pick `SC-###` for any open below = next free id
-(`SELECT display_name FROM flags ORDER BY flag_id DESC LIMIT 5;`).
+apply. Pick `SC-###` from the highest numbered value in `recent_flag_names`.
 
 ### 3A — Implemented but not marked shipped (ship-drift)
 
@@ -1276,19 +1316,10 @@ hand-off step) — the flip sometimes gets missed. Deterministic signal = spec''
 `[Ship]` flag — it governs both halves of the dropped hand-off (mark shipped +
 reconcile the doc to the spec) and stays open until a planner does both.
 
-```sql
--- specs finished (Verification done) on features still short of shipped, with no open ship/docs flag:
-SELECT DISTINCT r.feature_id, r.title, r.roadmap_status
-FROM roadmap r
-JOIN documents d   ON d.feature_id = r.feature_id AND d.kind=''spec''
-JOIN spec_tasks t  ON t.document_id = d.document_id AND t.title=''Verification'' AND t.status=''done''
-WHERE r.roadmap_status NOT IN (''shipped'',''retired'')
-  AND NOT EXISTS (
-    SELECT 1 FROM flags f
-    WHERE f.feature_id = r.feature_id AND f.resolved=0 AND COALESCE(f.is_deleted,0)=0
-      AND (f.description LIKE ''[Ship]%'' OR f.description LIKE ''[Docs]%''
-           OR f.description LIKE ''%not marked shipped%'' OR f.description LIKE ''%doc%pending%''));
-```
+Use the `implemented_but_unshipped` rows. The projection includes only specs
+whose Verification task is done, whose feature is not shipped/retired, and
+whose open `[Ship]`/`[Docs]` or organic ship/docs-pending handoff does not
+already cover the feature.
 
 Per row, open the flag in Planner''s own queue. Do not message yourself:
 
@@ -1302,19 +1333,9 @@ Devs open a docs-pending flag when they ship — sometimes skipped. Find
 `shipped` features with no frozen doc + no open docs-pending flag; open one
 per row. (Finished-but-not-shipped is 3A''s job, not this one.)
 
-```sql
--- shipped features with no frozen doc and no open docs-pending flag:
-SELECT r.feature_id, r.title, r.roadmap_status
-FROM roadmap r
-WHERE r.roadmap_status = ''shipped''
-  AND NOT EXISTS (
-    SELECT 1 FROM documents d
-    WHERE d.feature_id = r.feature_id AND d.frozen=1)
-  AND NOT EXISTS (
-    SELECT 1 FROM flags f
-    WHERE f.feature_id = r.feature_id AND f.resolved=0 AND COALESCE(f.is_deleted,0)=0
-      AND (f.description LIKE ''[Docs]%'' OR f.description LIKE ''%doc%pending%''));
-```
+Use the `shipped_but_undocumented` rows. The projection includes only shipped
+features with no frozen document and no open `[Docs]` or organic docs-pending
+handoff.
 
 The dedup guards match the `[Docs]`/`[Ship]` tag at position zero FIRST — the
 templates below mint "doc pending" (singular) and legacy hand-written flags say
@@ -1566,8 +1587,9 @@ matches `sc skill list` plus the intended grant. `rm` is only for fork-local
 names; retire an upstream skill with `sc skill retire <name>` and restore it
 with `sc skill unretire <name>`.
 
-Never place a fork-local body under `.super-coder/assets/skills/`, regenerate
-the engine seed for it, set it common, or write the engine DB directly.',
+Keep fork-local skill bodies on the supported `sc skill` surface; do not place
+them under engine assets, regenerate the engine seed for them, or set them
+common.',
   0
 )
 ON CONFLICT(name) DO UPDATE SET
@@ -1610,7 +1632,7 @@ The launcher auto-syncs at boot when provably nothing can be lost (on base branc
 
 1. `git fetch origin main && git rev-list --count HEAD..origin/main` -> record remote freshness; continue through the branch/target gate even when the count is 0.
 2. Compare `git rev-parse --show-toplevel` + `git branch --show-current` with ACTIVE SESSION before any destructive command. A mismatch -> stop + surface it.
-3. Exact `shell/<shortname>` base -> discard local-only commits, tracked changes, and non-ignored untracked files without asking: `git reset --hard origin/main && git clean -fd`. Durable work belongs in the engine DB or a pushed remote branch with a PR. Pass = `git status --short` is empty + `git rev-parse HEAD` equals `git rev-parse origin/main`.
+3. Exact `shell/<shortname>` base -> discard local-only commits, tracked changes, and non-ignored untracked files without asking: `git reset --hard origin/main && git clean -fd`. Durable coordination belongs in the control plane and code belongs on a pushed remote branch with a PR. Pass = `git status --short` is empty + `git rev-parse HEAD` equals `git rev-parse origin/main`.
 4. NEVER reset or clean a feature branch / open PR. Clean stale feature branch -> `git rebase origin/main`. Dirty or unpushed feature work -> list it + ask the FnB to land / stash / discard.
 5. NEVER `git pull`/merge on the base — merge bubbles accumulate + squash-merged work replays as conflicts.
 
@@ -1672,13 +1694,13 @@ NEVER delete a branch carrying unmerged, un-PR''d work — no PR = lost work.
   snapshots and `_sc` renders live under ignored `.sc-state/local/` and never
   enter Git. `.sc-state/engine.ref` is the deliberate tracked exception: it is
   the dependency pin and is updated by `sc update`.
-- Exception: in the super-coder SOURCE repo, `schema.sql` + `migrations/` are tracked — there the engine *is* the project.
+- Exception: in the Subfloor source repo, tracked engine database source is project source; identify exact files through the repository catalogue.
 
 ## After DB work
 
-An `sc mem` write lands in the shared engine DB immediately. The admin/API
-save-local path refreshes the ignored snapshot and renders used by rebuild and
-review. There is no generated-content commit or Publish PR. See `snapshot`.
+A confirmed `sc mem` write lands in the shared control plane immediately. The
+Admin/API persistence path owns generated serialization and renders; they are
+not a Developer commit or Publish PR.
 
 ## Notes
 
@@ -1994,12 +2016,12 @@ INSERT INTO skills (name, description, category, command, common, content, is_de
   1,
   '# memory — write as you go
 
-All memory = DB rows; no flat files. Write at the moment it matters, never in a
-close ritual.
+All memory uses the Subfloor control-plane service; managed flat files are not
+a write surface. Write at the moment it matters, never in a close ritual.
 
-Every write goes through `sc mem` -> lands in the live shared engine DB, visible
-to all shells on commit. It always targets your own shell (the engine resolves
-API identity for you) — never name a shell.
+Every write goes through `sc mem` and becomes durably visible to other shells.
+The service resolves your shell identity; never name a shell in an identity
+write.
 
 ## current_state — rolling status, NOT a log
 
@@ -2111,8 +2133,8 @@ Choose delivery before sending:
 
 Urgency, message kind, or a desire for a prompt response does not authorize a
 wake. An explicit wake instruction with no supported command -> surface the
-missing capability and stop. NEVER write the engine DB directly, call internal
-Python, or send both modes unless the instruction requires both.
+missing capability and stop. Use only the supported message commands; do not
+call internal Python or send both modes unless the instruction requires both.
 
 ## Normal messages — the shell inbox
 
@@ -2248,8 +2270,8 @@ Read each doc; decide together:
   feature.
 Skip noise (changelogs, license, vendored docs) unless the FnB wants it.
 
-All writes below go through `sc mem` -> live shared engine DB; the import never
-touches the app DB.
+All writes below go through `sc mem` to durable shared control-plane state; the
+import never touches the app DB.
 
 ## 3. Backfill the roadmap
 Create one feature per coherent area/initiative the docs imply; status by how
@@ -2269,7 +2291,7 @@ sc mem doc add "…" --kind spec --feature <id> --body-file ./path/to/spec.md --
 Spec describes shipped work -> freeze it: `sc mem doc freeze <document_id>`.
 
 ## 5. Persist
-Each `sc mem` write is live in the shared engine DB immediately -> the GUI''s
+Each confirmed `sc mem` write is live in the shared control plane immediately -> the GUI''s
 Docs/Roadmap tabs reflect the import as you go. Flat `_sc` copies + git commit
 = an admin/GUI publish step, not part of onboarding.
 
@@ -3228,17 +3250,16 @@ cleanup authority. An unproved postcondition stops.
   Reviewers own verdicts/conformance; do not proxy handoffs/judgments.
 - Record Reviewer decision id + exact action + receipt; never rewrite rationale
   as Planner judgment.
-- Mid-Sprint spec edits require owning Planner/FnB + durable Reviewer decision.
-  Record old/new revision hashes; binding changes only when the decision says so.
+- Reviewer-approved Planner/FnB spec rebind:
+  pause -> `sc mem doc edit` -> `sc sprint rebind-spec --sprint <id>
+  --document <id> --expected-revision <old-sha256> --reason <decision>` ->
+  replan -> resume. Pass = old/new hashes + changed boolean; conflict -> reread.
 - Use native wakes. Start no recurring loop, scheduled job, manual participant
-  boot, or external watcher. One stalled-gate inspection is allowed:
+  boot, or external watcher. Do not repeat a stalled-gate inspection:
 
 ```text
 sc sprint watcher-state --sprint <id>
 ```
-
-Do not repeat this read as a polling loop. Act on its bounded watcher evidence,
-then return to native delivery.
 
 ## Relay contract
 
@@ -4047,11 +4068,10 @@ INSERT INTO skills (name, description, category, command, common, content, is_de
   1,
   '# surface_catalogue — read the repo from the map, not by grepping
 
-super-coder lives inside a host repo. The `dr_*` tables = a scan of that repo
-— query them first to orient, not the tree. They live in the **map db**,
-`.sc-state/local/map/map.db` — a separate file from your memory db
-(`.super-coder/shell_db.db`). Inspect structure with `sc map-schema`; query
-data with `sc map-sql "…"`.
+The `dr_*` catalogue is a scan of the host repo. Query it first to orient, not
+the tree. It is separate from Subfloor control-plane memory and from the
+product''s runtime database. Inspect structure with `sc map-schema`; query data
+with `sc map-sql "…"`.
 
 NEVER map the repo yourself. The map stays fresh automatically (git hooks
 re-map on pull / branch-switch / rebase) and is owned by the **cartographer**

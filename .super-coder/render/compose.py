@@ -43,8 +43,8 @@ MAP_DISCREPANCY_BLOCK = (
 # upstream that is them, and fork shells keep the never-edit-engine rule.
 PROJECT_VS_ENGINE_FORK = (
     "**Your project is this repo** — everything except `.super-coder/`.\n"
-    "`.super-coder/` is the **engine** you run on (your memory + identity\n"
-    "substrate), a gitignored dependency. Engine changes are authored upstream\n"
+    "`.super-coder/` is the **Subfloor engine dependency**, not project source.\n"
+    "Engine changes are authored upstream\n"
     "in subfloor (formerly super-coder) and delivered here by `./sc update`."
 )
 PROJECT_VS_ENGINE_SOURCE = (
@@ -55,9 +55,8 @@ PROJECT_VS_ENGINE_SOURCE = (
     "here.\n"
     "\n"
     "Getting your own updates: after an engine change merges, sync with main\n"
-    "and run `./sc update` — in this repo it skips fetch/materialize (the\n"
-    "engine is already here) and reconciles in place: migrations, skills\n"
-    "catalogue, repo map, snapshot. Restart your session to boot onto the new\n"
+    "and run `./sc update` — in this repo it reconciles the tracked engine and\n"
+    "its managed catalogue in place. Restart your session to boot onto the new\n"
     "floor.\n"
     "\n"
     "Engine skills speak fork-language. Where a skill says \"never edit\n"
@@ -70,17 +69,16 @@ PROJECT_VS_ENGINE_SOURCE = (
     "\n"
     "1. **Your `./sc` resolves the engine from the MAIN CHECKOUT, not your\n"
     "   worktree** (`sc:11-21` derives it from git's common dir). That tree\n"
-    "   hosts the gitignored live DB and runs the server; being current in\n"
-    "   your worktree says nothing about it. The `floor:` line in ACTIVE\n"
-    "   SESSION reports exactly that.\n"
+    "   runs the managed service; being current in your worktree says nothing\n"
+    "   about it. The `floor:` line in ACTIVE SESSION reports exactly that.\n"
     "2. **Verify claims about engine code against the remote, not your\n"
     "   tree** — `git show origin/main:<path>`. A stale checkout answers\n"
     "   confidently, and a command that reads it inherits the staleness.\n"
     "3. **Pull after every merge; reconcile before restarting.** A restart\n"
     "   kills live sessions, so the FnB owns that boundary.\n"
-    "4. **The live DB is the one you are migrating.** Back it up before\n"
-    "   applying anything, and name the DB path explicitly rather than\n"
-    "   trusting whichever one the dispatcher resolves.\n"
+    "4. **Tracked engine source is your work surface; live instance state is\n"
+    "   Admin-maintained.** Author source changes on a branch and use the named\n"
+    "   maintenance procedure for any live-state cutover.\n"
 )
 
 def render_project_vs_engine(
@@ -89,6 +87,67 @@ def render_project_vs_engine(
     """Render repo position; dev-tool state has one role-scoped owner below."""
     del devkit_declared, devkit_repair
     return PROJECT_VS_ENGINE_SOURCE if source_mode else PROJECT_VS_ENGINE_FORK
+
+
+def render_data_boundaries(
+    flavor: str | None,
+    source_mode: bool,
+    launch_mode: str,
+    database_path: str | Path | None = None,
+) -> str:
+    """Render capability guidance without disclosing Admin internals to workers."""
+    if launch_mode not in {"container", "host"}:
+        raise ValueError(f"unsupported launch mode: {launch_mode}")
+
+    if flavor == "admin":
+        state = Path(database_path).resolve().parent if database_path else None
+        state_text = f"`{state}`" if state else "unavailable — resolve before repair"
+        source_note = (
+            "- This source repository's tracked engine schema and migrations are "
+            "project source; live instance state remains a separate maintenance target.\n"
+            if source_mode
+            else "- The fork application's data and schema remain outside Admin ownership "
+            "unless the operator separately assigns them.\n"
+        )
+        api_note = render_api_unreachable_guidance(flavor, launch_mode)
+        return (
+            "## ENGINE MAINTENANCE\n\n"
+            f"- **Engine floor:** `{ENGINE}`\n"
+            f"- **Private instance state:** {state_text}\n"
+            "- Use `sc mem` for normal identity, planning, document, and message work; "
+            "use `sc map-*` for the separate repository catalogue.\n"
+            "- `sc sql` is read-only diagnosis. Mutations require the named stopped-runtime, "
+            "exclusive-lease, backup, verification, and recovery procedure.\n"
+            f"{source_note}"
+            "- Load `engine_database` for storage, table, backup, rebuild, and repair details; "
+            "load `engine_migrations`, `snapshot`, or `self_update` for that operation.\n"
+            f"{api_note}"
+        )
+
+    if source_mode:
+        return (
+            "## DATA BOUNDARIES\n\n"
+            "- Subfloor control-plane state is already wired to this shell; use `sc mem` "
+            "and other granted `sc` commands. API failure does not grant a file fallback.\n"
+            "- Tracked engine schema and migrations are project source. Edit them on a "
+            "feature branch through the engine migration procedure; live instance state "
+            "remains Admin-maintained.\n"
+            "- Inspect repository structure with `sc map-schema` and `sc map-sql`; the "
+            "catalogue is separate from control-plane memory.\n"
+            "- An unrelated application's data and schema remain that product's concern.\n"
+        )
+
+    return (
+        "## DATA BOUNDARIES\n\n"
+        "- Subfloor control-plane state is an opaque service already wired to this shell; "
+        "use `sc mem` and other granted `sc` commands. If the API is unavailable, surface "
+        "it to the FnB and stop.\n"
+        "- Inspect repository structure with `sc map-schema` and `sc map-sql`.\n"
+        "- Change product data and schema through the fork's app code, migrations, declared "
+        "dev-kit commands, and app database connection.\n"
+        "- The Subfloor dependency is not project source and is absent from this shell's "
+        "engine-state view.\n"
+    )
 
 
 DEV_TOOL_STATES = (
@@ -417,7 +476,10 @@ def render_skills(con, shell_id: int) -> str:
 
 def render_api(port: "int | None", api_key: "str | None") -> str:
     if port is None or not api_key:
-        return "(API not configured — run `sc rebuild` to assign a key)"
+        return (
+            "(API not configured — surface this to the FnB/Admin; ordinary "
+            "shells have no file fallback)"
+        )
     return (
         f"- **Base URL:** `http://127.0.0.1:{port}`\n\n"
         "Write memory via `sc mem` — it is already wired to this launched shell; the engine "
@@ -541,6 +603,14 @@ def compose_boot(con: sqlite3.Connection, shell, user, session_id: str,
     template = template.replace(
         "{{project_vs_engine}}",
         render_project_vs_engine(source_mode, devkit_declared, devkit_repair))
+    database_row = con.execute("PRAGMA database_list").fetchone()
+    database_path = database_row[2] if database_row and database_row[2] else None
+    template = template.replace(
+        "{{data_boundaries}}",
+        render_data_boundaries(
+            flavor, source_mode, launch_mode, database_path=database_path
+        ),
+    )
     template = template.replace(
         "{{execution_context}}", render_execution_context(flavor, launch_mode)
     )
@@ -549,10 +619,6 @@ def compose_boot(con: sqlite3.Connection, shell, user, session_id: str,
         template = template.replace("{{dev_tools}}", dev_tools_block)
     else:
         template = template.replace("\n{{dev_tools}}\n", "\n")
-    template = template.replace(
-        "{{api_unreachable_guidance}}",
-        render_api_unreachable_guidance(flavor, launch_mode),
-    )
     shell_id = shell["shell_id"]
     counts = fetch_counts(con, shell_id)
 

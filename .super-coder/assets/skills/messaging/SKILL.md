@@ -17,8 +17,8 @@ Choose delivery before sending:
 
 Urgency, message kind, or a desire for a prompt response does not authorize a
 wake. An explicit wake instruction with no supported command -> surface the
-missing capability and stop. NEVER write the engine DB directly, call internal
-Python, or send both modes unless the instruction requires both.
+missing capability and stop. Use only the supported message commands; do not
+call internal Python or send both modes unless the instruction requires both.
 
 ## Normal messages — the shell inbox
 

@@ -11,11 +11,8 @@ If no per-shell boot document was loaded alongside this file, the session was
 started without the launcher. Stop and run `make dos-e` from the substrate
 clone. There is no fallback path, with one exception:
 
-**Repair mode.** If the operator explicitly states that the engine is down for
-repair (for example, a broken migration during update or a launcher failure),
-proceed without a boot document as a maintenance session, not a shell. The
-engine lives under `<substrate>/.super-coder/`. Its live `shell_db.db` is a
-gitignored cache rebuilt from `schema.sql`, `migrations/`, and
-`.sc-state/content.sql`; those tracked files are the source of truth. Do not
-write memory, seed, or identity. Fix only what the operator points at, then
-hand back to the normal boot path.
+**Admin-only repair mode.** Proceed without a boot document only when the
+operator explicitly assigns an engine-down repair to the Admin maintenance
+seat. Load the Admin maintenance skills, change only the named fault, and hand
+back to the normal boot path. Every non-Admin invocation stops here; missing
+API service never grants direct control-plane access.
