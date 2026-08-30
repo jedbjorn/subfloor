@@ -12,7 +12,9 @@ import os
 import secrets
 import stat
 from collections.abc import Callable, Mapping
+from contextlib import contextmanager
 from dataclasses import dataclass
+from fcntl import LOCK_EX, LOCK_UN, flock
 from pathlib import Path
 
 INSTANCE_ID_KEY = "instance_id"
@@ -100,6 +102,7 @@ DEFERRED_CONSUMERS = (
             ".super-coder/scripts/artifact_policy.py",
             ".super-coder/scripts/snapshot.py",
             ".super-coder/scripts/render.py",
+            ".super-coder/render/compose.py",
         ),
         "private snapshot and render inputs",
     ),
@@ -110,7 +113,11 @@ DEFERRED_CONSUMERS = (
     ),
     DeferredConsumer(
         "install_and_update",
-        (".super-coder/scripts/install.py", ".super-coder/scripts/update.py"),
+        (
+            ".super-coder/scripts/install.py",
+            ".super-coder/scripts/update.py",
+            ".super-coder/scripts/engine_manifest.py",
+        ),
         "fresh identity creation and stopped-runtime relocation",
     ),
     DeferredConsumer(
@@ -125,6 +132,7 @@ DEFERRED_CONSUMERS = (
     DeferredConsumer(
         "shell_entry_and_liveness",
         (
+            ".super-coder/scripts/dispatch.sh",
             ".super-coder/scripts/run.py",
             ".super-coder/scripts/shell_liveness.py",
         ),
@@ -141,6 +149,15 @@ DEFERRED_CONSUMERS = (
             ".super-coder/scripts/seed_dogfood.py",
         ),
         "remaining direct engine-DB owners",
+    ),
+    DeferredConsumer(
+        "legacy_and_candidate_paths",
+        (
+            ".super-coder/scripts/map_db.py",
+            ".super-coder/scripts/map_repo.py",
+            ".super-coder/scripts/render_check.py",
+        ),
+        "legacy fallback classification and candidate-only verification",
     ),
 )
 
@@ -179,11 +196,28 @@ def _lstat_owned_regular(path: Path, label: str, owner_uid: int) -> os.stat_resu
     return info
 
 
-def _atomic_write_json(path: Path, payload: dict, owner_uid: int) -> None:
+def _fsync_directory(path: Path) -> None:
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    descriptor = os.open(path, flags)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _atomic_write_json(
+    path: Path,
+    payload: dict,
+    owner_uid: int,
+    *,
+    label: str,
+) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     if path.exists() or path.is_symlink():
-        _lstat_owned_regular(path, "instance configuration", owner_uid)
-    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+        _lstat_owned_regular(path, label, owner_uid)
+    temporary = path.with_name(
+        f".{path.name}.{os.getpid()}.{secrets.token_hex(8)}.tmp"
+    )
     try:
         fd = os.open(temporary, os.O_CREAT | os.O_EXCL | os.O_WRONLY, PRIVATE_FILE_MODE)
         with os.fdopen(fd, "w") as handle:
@@ -192,9 +226,65 @@ def _atomic_write_json(path: Path, payload: dict, owner_uid: int) -> None:
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(temporary, path)
+        _fsync_directory(path.parent)
     except BaseException:
         temporary.unlink(missing_ok=True)
         raise
+
+
+@contextmanager
+def _instance_id_lock(config_path: Path, owner_uid: int):
+    """Serialize one installation's initial identity assignment."""
+    lock_directory = config_path.parent / "run"
+    try:
+        lock_directory.mkdir(parents=True, exist_ok=True, mode=PRIVATE_DIRECTORY_MODE)
+    except OSError as exc:
+        raise InstanceStateError(f"cannot create instance identity lock: {exc}") from exc
+    try:
+        directory_info = lock_directory.lstat()
+    except OSError as exc:
+        raise InstanceStateError(f"cannot inspect instance identity lock: {exc}") from exc
+    if stat.S_ISLNK(directory_info.st_mode) or not stat.S_ISDIR(
+        directory_info.st_mode
+    ):
+        raise InstanceStateError("refusing unsafe instance identity lock directory")
+    if directory_info.st_uid != owner_uid or stat.S_IMODE(directory_info.st_mode) & 0o022:
+        raise InstanceStateError("refusing foreign instance identity lock directory")
+    lock_path = lock_directory / "instance-id.lock"
+    flags = os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(lock_path, flags, PRIVATE_FILE_MODE)
+    except OSError as exc:
+        raise InstanceStateError(f"cannot open instance identity lock: {exc}") from exc
+    try:
+        info = os.fstat(descriptor)
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != owner_uid:
+            raise InstanceStateError("refusing foreign instance identity lock")
+        if stat.S_IMODE(info.st_mode) & 0o022:
+            raise InstanceStateError("refusing writable-by-others instance identity lock")
+        flock(descriptor, LOCK_EX)
+        try:
+            yield
+        finally:
+            flock(descriptor, LOCK_UN)
+    finally:
+        os.close(descriptor)
+
+
+def _read_instance_config(config_path: Path, owner_uid: int) -> dict:
+    if not (config_path.exists() or config_path.is_symlink()):
+        return {}
+    _lstat_owned_regular(config_path, "instance configuration", owner_uid)
+    return _load_json_object(config_path, "instance configuration")
+
+
+def _persisted_instance_id(payload: dict) -> str | None:
+    current = payload.get(INSTANCE_ID_KEY)
+    if current is None:
+        return None
+    if not _valid_instance_id(current):
+        raise InstanceStateError("instance configuration has an invalid instance ID")
+    return current
 
 
 def ensure_instance_id(
@@ -207,26 +297,31 @@ def ensure_instance_id(
     """Read or atomically create the opaque ID in the owner-local config."""
     uid = os.geteuid() if owner_uid is None else owner_uid
     config_path = Path(config_path)
-    if config_path.exists() or config_path.is_symlink():
-        _lstat_owned_regular(config_path, "instance configuration", uid)
-        payload = _load_json_object(config_path, "instance configuration")
-    else:
-        if not create:
-            raise InstanceStateError("instance configuration has no instance ID")
-        payload = {}
-    current = payload.get(INSTANCE_ID_KEY)
+    payload = _read_instance_config(config_path, uid)
+    current = _persisted_instance_id(payload)
     if current is not None:
-        if not _valid_instance_id(current):
-            raise InstanceStateError("instance configuration has an invalid instance ID")
         return current
     if not create:
         raise InstanceStateError("instance configuration has no instance ID")
     candidate = (id_factory or (lambda: secrets.token_hex(16)))()
     if not _valid_instance_id(candidate):
         raise InstanceStateError("instance ID factory returned an invalid identifier")
-    payload[INSTANCE_ID_KEY] = candidate
-    _atomic_write_json(config_path, payload, uid)
-    return candidate
+    with _instance_id_lock(config_path, uid):
+        payload = _read_instance_config(config_path, uid)
+        winner = _persisted_instance_id(payload)
+        if winner is not None:
+            return winner
+        payload[INSTANCE_ID_KEY] = candidate
+        _atomic_write_json(
+            config_path,
+            payload,
+            uid,
+            label="instance configuration",
+        )
+        winner = _persisted_instance_id(_read_instance_config(config_path, uid))
+        if winner is None:
+            raise InstanceStateError("instance ID publication did not persist")
+        return winner
 
 
 def _state_home(environ: Mapping[str, str]) -> Path:
@@ -311,6 +406,7 @@ def _ensure_private_root(
         metadata,
         {INSTANCE_ID_KEY: instance_id, "owner_uid": owner_uid},
         owner_uid,
+        label="private state owner metadata",
     )
 
 
@@ -342,7 +438,16 @@ def resolve(
     if not base.is_absolute():
         raise InstanceStateError("private state root must be absolute")
     root = base / STATE_VENDOR / STATE_COLLECTION / instance_id
-    _ensure_private_root(root, instance_id, owner_uid=uid, create=create)
+    if not create:
+        _ensure_private_root(root, instance_id, owner_uid=uid, create=False)
+        return InstanceState(instance_id=instance_id, root=root)
+    with _instance_id_lock(Path(instance_config), uid):
+        durable_id = _persisted_instance_id(
+            _read_instance_config(Path(instance_config), uid)
+        )
+        if durable_id != instance_id:
+            raise InstanceStateError("instance identity changed during resolution")
+        _ensure_private_root(root, instance_id, owner_uid=uid, create=True)
     return InstanceState(instance_id=instance_id, root=root)
 
 

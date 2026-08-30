@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import multiprocessing
 import os
 import re
 import stat
@@ -18,6 +19,19 @@ assert SPEC is not None and SPEC.loader is not None
 instance_state = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = instance_state
 SPEC.loader.exec_module(instance_state)
+
+
+def _concurrent_resolve_worker(config, state_home, candidate, barrier, results):
+    def candidate_factory():
+        barrier.wait(timeout=10)
+        return candidate
+
+    resolved = instance_state.resolve(
+        instance_config=config,
+        state_home=state_home,
+        id_factory=candidate_factory,
+    )
+    results.put(("ok", resolved.instance_id, str(resolved.root)))
 
 
 class InstanceStateResolverTests(unittest.TestCase):
@@ -77,6 +91,45 @@ class InstanceStateResolverTests(unittest.TestCase):
         self.assertEqual(stored["port"], 8837)
         self.assertTrue(stored["custom"])
         self.assertEqual(stored["instance_id"], self.fixed_id)
+
+    def test_concurrent_first_assignment_has_one_durable_winner(self):
+        context = multiprocessing.get_context("fork")
+        for existing in (False, True):
+            with self.subTest(existing_idless_configuration=existing):
+                case = self.base / ("existing" if existing else "absent")
+                config = case / "repo" / ".super-coder" / "instance.json"
+                config.parent.mkdir(parents=True)
+                if existing:
+                    config.write_text(json.dumps({"port": 8837}) + "\n")
+                state_home = case / "state"
+                barrier = context.Barrier(2)
+                results = context.Queue()
+                processes = [
+                    context.Process(
+                        target=_concurrent_resolve_worker,
+                        args=(config, state_home, character * 32, barrier, results),
+                    )
+                    for character in ("a", "b")
+                ]
+                for process in processes:
+                    process.start()
+                for process in processes:
+                    process.join(timeout=15)
+                    self.assertFalse(process.is_alive(), "resolver race deadlocked")
+                    self.assertEqual(process.exitcode, 0)
+
+                outcomes = [results.get(timeout=2) for _ in processes]
+                self.assertEqual(
+                    {outcome[0] for outcome in outcomes}, {"ok"}, outcomes
+                )
+                self.assertEqual(len({outcome[1] for outcome in outcomes}), 1)
+                self.assertEqual(len({outcome[2] for outcome in outcomes}), 1)
+                winner = json.loads(config.read_text())["instance_id"]
+                self.assertEqual({outcome[1] for outcome in outcomes}, {winner})
+                if existing:
+                    self.assertEqual(json.loads(config.read_text())["port"], 8837)
+                roots = list((state_home / "subfloor" / "instances").iterdir())
+                self.assertEqual([root.name for root in roots], [winner])
 
     def test_repository_movement_keeps_private_binding(self):
         first = self.resolve()
@@ -141,6 +194,18 @@ class InstanceStateResolverTests(unittest.TestCase):
 
         with self.assertRaisesRegex(
             instance_state.InstanceStateError, "symlinked instance configuration"
+        ):
+            self.resolve()
+
+    def test_refuses_symlinked_identity_lock_directory(self):
+        self.config.write_text(json.dumps({"port": 8837}) + "\n")
+        foreign = self.base / "foreign-locks"
+        foreign.mkdir()
+        (self.engine / "run").symlink_to(foreign, target_is_directory=True)
+
+        with self.assertRaisesRegex(
+            instance_state.InstanceStateError,
+            "unsafe instance identity lock directory",
         ):
             self.resolve()
 
@@ -223,6 +288,7 @@ class DeferredCutoverInventoryTests(unittest.TestCase):
                 "rollback_remove_and_eject",
                 "shell_entry_and_liveness",
                 "catalogue_writers",
+                "legacy_and_candidate_paths",
             },
         )
         paths = [path for entry in inventory for path in entry.paths]
@@ -236,34 +302,32 @@ class DeferredCutoverInventoryTests(unittest.TestCase):
                 f"{relative} crossed the spec #133 deferred-cutover boundary",
             )
 
-    def test_inventory_covers_every_current_direct_database_path_owner(self):
-        pattern = re.compile(r'DB_PATH\s*=\s*ENGINE\s*/\s*"shell_db\.db"')
+    def test_inventory_classifies_every_runtime_state_path_reference(self):
+        pattern = re.compile(
+            r"shell_db\.db|\.sc-state/(?:local/)?content\.sql|"
+            r"db_backups|snapshot/content\.sql"
+        )
         discovered = {
             source.relative_to(ROOT).as_posix()
-            for directory in (ROOT / ".super-coder" / "api", ROOT / ".super-coder" / "scripts")
-            for source in directory.rglob("*.py")
+            for directory in (
+                ROOT / ".super-coder" / "api",
+                ROOT / ".super-coder" / "scripts",
+                ROOT / ".super-coder" / "render",
+            )
+            for extension in ("*.py", "*.sh")
+            for source in directory.rglob(extension)
             if pattern.search(source.read_text())
         }
+        discovered.remove(".super-coder/scripts/instance_state.py")
+        classified = {
+            path
+            for entry in instance_state.deferred_consumer_inventory()
+            for path in entry.paths
+        }
         self.assertEqual(
-            discovered,
-            {
-                ".super-coder/api/conversation_routes.py",
-                ".super-coder/api/server.py",
-                ".super-coder/scripts/analytics.py",
-                ".super-coder/scripts/init_fork.py",
-                ".super-coder/scripts/models.py",
-                ".super-coder/scripts/rebuild.py",
-                ".super-coder/scripts/remove.py",
-                ".super-coder/scripts/render.py",
-                ".super-coder/scripts/rollback.py",
-                ".super-coder/scripts/run.py",
-                ".super-coder/scripts/seed_dogfood.py",
-                ".super-coder/scripts/seed_skills.py",
-                ".super-coder/scripts/shell_liveness.py",
-                ".super-coder/scripts/skill.py",
-                ".super-coder/scripts/snapshot.py",
-                ".super-coder/scripts/update.py",
-            },
+            set(),
+            discovered - classified,
+            "runtime state references are missing from the cutover inventory",
         )
 
 
