@@ -115,6 +115,7 @@ import callable_floor  # noqa: E402
 import engine_manifest  # noqa: E402
 from engine_paths import GENERATED_INSTALL_PATHS  # noqa: E402
 import global_pointer  # noqa: E402
+import instance_state  # noqa: E402
 import ports as ports_mod  # noqa: E402
 
 
@@ -305,7 +306,7 @@ def already_installed() -> bool:
 
 def starting_team_exists() -> bool:
     """Whether a prior install persisted the complete starting team."""
-    db = ENGINE / "shell_db.db"
+    db = instance_state.active_database_path(ENGINE)
     if not db.exists():
         return False
     import sqlite3
@@ -970,6 +971,15 @@ def main(argv: list[str]) -> int:
     except GitignoreError as exc:
         sys.exit(f"install: {exc}")
 
+    # Bind this installation before creating any database, snapshot, map, or
+    # other per-instance artifact. Retries and --force validate and retain the
+    # same identity instead of deriving a second private root.
+    step("Establishing installation identity")
+    installation_state = instance_state.resolve(
+        instance_config=ports_mod.CONFIG,
+    )
+    print(f"  instance : {installation_state.instance_id}")
+
     # 2. Requirements ---------------------------------------------------------
     step("Checking requirements")
     report_host_runtime()
@@ -1139,7 +1149,19 @@ def main(argv: list[str]) -> int:
     cfg = ports_mod.resolve(persist=False)
     cfg["harness"] = harness
     cfg["installed_at"] = datetime.now(timezone.utc).date().isoformat()
-    ports_mod.CONFIG.write_text(json.dumps(cfg, indent=2) + "\n")
+    installer_changes = {
+        key: cfg[key]
+        for key in (*ports_mod.PORT_KEYS, "harness", "installed_at")
+        if key in cfg
+    }
+    stored = instance_state.update_bound_instance_config(
+        ports_mod.CONFIG,
+        installer_changes,
+    )
+    if stored["instance_id"] != installation_state.instance_id:
+        raise instance_state.InstanceStateError(
+            "installer configuration update changed the installation identity"
+        )
 
     # 9. Done -----------------------------------------------------------------
     step("Installed ✓")

@@ -31,8 +31,10 @@ import sys
 from datetime import date
 from pathlib import Path
 
+import instance_state
+
 ENGINE = Path(__file__).resolve().parents[1]
-DB_PATH = ENGINE / "shell_db.db"
+DB_PATH = instance_state.active_database_path(ENGINE)
 SPEC = ENGINE / "assets" / "seed" / "super-coder-founding-spec.md"
 
 MAINTAINER_PROMPT = """\

@@ -318,6 +318,30 @@ class FreshForkInstallTest(unittest.TestCase):
                 config["installed_at"],
                 re.compile(r"^\d{4}-\d{2}-\d{2}$"),
             )
+            self.assertRegex(config["instance_id"], re.compile(r"^[0-9a-f]{32}$"))
+            private_root = (
+                home
+                / ".local/state/subfloor/instances"
+                / config["instance_id"]
+            )
+            self.assertTrue((private_root / "owner.json").is_file())
+            self.assertFalse((private_root / "shell_db.db").exists())
+            self.assertTrue((repo / ".super-coder/shell_db.db").is_file())
+
+            reinstalled = self.run_install(repo, home)
+            self.assertEqual(
+                reinstalled.returncode,
+                0,
+                f"stdout:\n{reinstalled.stdout}\nstderr:\n{reinstalled.stderr}",
+            )
+            reinstalled_config = json.loads(
+                (repo / ".super-coder" / "instance.json").read_text()
+            )
+            self.assertEqual(reinstalled_config["instance_id"], config["instance_id"])
+            roots = list((home / ".local/state/subfloor/instances").iterdir())
+            self.assertEqual([root.name for root in roots], [config["instance_id"]])
+            self.assertFalse((private_root / "shell_db.db").exists())
+            self.assertTrue((repo / ".super-coder/shell_db.db").is_file())
             self.assertIn("Installed ✓", result.stdout)
             self.assertEqual(sys.version_info[:2], (3, 14))
             self.assertIn(
@@ -584,8 +608,15 @@ class FreshForkInstallTest(unittest.TestCase):
                 self.assertIn("retry: ./sc install", failed.stderr)
                 self.assertNotIn("Installed ✓", failed.stdout)
                 config_path = repo / ".super-coder/instance.json"
-                if config_path.exists():
-                    self.assertNotIn("installed_at", json.loads(config_path.read_text()))
+                failed_config = json.loads(config_path.read_text())
+                self.assertRegex(
+                    failed_config["instance_id"],
+                    re.compile(r"^[0-9a-f]{32}$"),
+                )
+                self.assertNotIn("installed_at", failed_config)
+                failed_id = failed_config["instance_id"]
+                roots = list((home / ".local/state/subfloor/instances").iterdir())
+                self.assertEqual([root.name for root in roots], [failed_id])
 
                 marker.unlink()
                 repaired = self.run_install(repo, home)
@@ -599,6 +630,10 @@ class FreshForkInstallTest(unittest.TestCase):
                     json.loads(config_path.read_text())["installed_at"],
                     re.compile(r"^\d{4}-\d{2}-\d{2}$"),
                 )
+                repaired_config = json.loads(config_path.read_text())
+                self.assertEqual(repaired_config["instance_id"], failed_id)
+                roots = list((home / ".local/state/subfloor/instances").iterdir())
+                self.assertEqual([root.name for root in roots], [failed_id])
 
 
 if __name__ == "__main__":

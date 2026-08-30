@@ -49,6 +49,7 @@ class SupervisionFixture:
             "engine_paths.py",
             "global_pointer.py",
             "install.py",
+            "instance_state.py",
             "devkit.py",
             "github_auth.py",
             "sandbox_github_auth.py",

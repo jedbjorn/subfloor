@@ -62,7 +62,6 @@ from pathlib import Path
 
 ENGINE = Path(__file__).resolve().parents[1]
 REPO_ROOT = ENGINE.parent
-DB_PATH = ENGINE / "shell_db.db"
 STATE_DIR = REPO_ROOT / ".sc-state"
 ENGINE_REF = STATE_DIR / "engine.ref"
 ENGINE_REF_PREV = STATE_DIR / "engine.ref.prev"
@@ -74,6 +73,7 @@ import callable_floor  # noqa: E402
 import db_driver  # noqa: E402
 import engine_manifest  # noqa: E402
 import install as install_mod  # noqa: E402  (ensure_harnesses)
+import instance_state  # noqa: E402
 import migrate as migrate_mod  # noqa: E402
 import ports  # noqa: E402
 import rebuild as rebuild_mod  # noqa: E402
@@ -82,6 +82,8 @@ import shell_factory  # noqa: E402
 import skill_projection  # noqa: E402
 sys.path.insert(0, str(ENGINE / "render"))
 import flat  # noqa: E402
+
+DB_PATH = instance_state.active_database_path(ENGINE)
 
 EJECTED_MARKER = STATE_DIR / "ejected"
 

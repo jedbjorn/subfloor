@@ -7,13 +7,16 @@ connection PRAGMAs live in a single place.
 """
 from __future__ import annotations
 
-from collections.abc import Callable, Iterator
-from contextlib import contextmanager
-from dataclasses import dataclass
 import logging
 import random
 import sqlite3
 import time
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
+from dataclasses import dataclass
+from pathlib import Path
+
+import instance_state
 
 
 DEFAULT_BUSY_TIMEOUT_MS = 5000
@@ -25,6 +28,11 @@ SLOW_WRITE_WAIT_MS = 250.0
 SLOW_WRITE_HOLD_MS = 100.0
 
 _LOG = logging.getLogger("super_coder.db")
+
+
+def engine_database_path(engine: Path) -> Path:
+    """Resolve the active engine DB without selecting a private target."""
+    return instance_state.active_database_path(engine)
 
 
 @dataclass(frozen=True)

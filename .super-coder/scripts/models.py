@@ -15,14 +15,15 @@ from pathlib import Path
 from urllib.parse import urlencode
 
 ENGINE = Path(__file__).resolve().parents[1]
-DB_PATH = ENGINE / "shell_db.db"
-
 sys.path.insert(0, str(ENGINE / "api"))
 sys.path.insert(0, str(ENGINE / "scripts"))
 import model_catalog  # noqa: E402
 import route_bindings  # noqa: E402
 import db_driver  # noqa: E402
+import instance_state  # noqa: E402
 import mem  # noqa: E402
+
+DB_PATH = instance_state.active_database_path(ENGINE)
 
 
 def _open_db():

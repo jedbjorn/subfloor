@@ -17,6 +17,8 @@ SCRIPTS = ROOT / ".super-coder" / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 
 import ports  # noqa: E402
+import ts  # noqa: E402
+import vm  # noqa: E402
 
 
 class GlobalPortNamespaceTest(unittest.TestCase):
@@ -112,8 +114,9 @@ class GlobalPortNamespaceTest(unittest.TestCase):
         self.assertNotIn("retired_host_port", json.loads(output.getvalue()))
         self.assertEqual(self.current_config.read_text(), original)
 
-    def test_save_changes_managed_blocks_without_rewriting_unknown_keys(self) -> None:
+    def test_scoped_updates_preserve_concurrent_blocks_and_unknown_keys(self) -> None:
         stored = {
+            "instance_id": "a" * 32,
             "repo": "ami",
             "port": 8812,
             "dev_port": 8844,
@@ -121,22 +124,36 @@ class GlobalPortNamespaceTest(unittest.TestCase):
             "vm": {"domain": "old"},
             "future_extension": {"opaque": True},
         }
-        self.current_config.write_text(json.dumps(stored))
+        for order in (("vm", "ts"), ("ts", "vm")):
+            with self.subTest(order=order):
+                self.current_config.write_text(json.dumps(stored))
+                with mock.patch.object(ports, "CONFIG", self.current_config):
+                    # Both callers derive their intent before either write.
+                    first = ports.resolve(persist=False)
+                    second = ports.resolve(persist=False)
+                    values = {
+                        "vm": {"domain": "new"},
+                        "ts": {"hosts": ["build"]},
+                    }
+                    first[order[0]] = values[order[0]]
+                    second[order[1]] = values[order[1]]
+                    writers = {"vm": vm.write, "ts": ts.write}
+                    writers[order[0]](first[order[0]])
+                    writers[order[1]](second[order[1]])
 
-        with (
-            mock.patch.object(ports, "REPO_ROOT", self.current),
-            mock.patch.object(ports, "CONFIG", self.current_config),
-            mock.patch.object(ports, "_free", return_value=True),
-        ):
-            resolved = ports.resolve()
-            resolved.pop("vm")
-            resolved["ts"] = {"hosts": ["build"]}
-            ports.save(resolved)
+                    persisted = json.loads(self.current_config.read_text())
+                    self.assertEqual(persisted["vm"], values["vm"])
+                    self.assertEqual(persisted["ts"], values["ts"])
+                    self.assertEqual(persisted["instance_id"], "a" * 32)
+                    self.assertEqual(
+                        persisted["future_extension"], {"opaque": True}
+                    )
 
-        persisted = json.loads(self.current_config.read_text())
-        self.assertNotIn("vm", persisted)
-        self.assertEqual(persisted["ts"], {"hosts": ["build"]})
-        self.assertEqual(persisted["future_extension"], {"opaque": True})
+                    vm.write(None)
+                    persisted = json.loads(self.current_config.read_text())
+                    self.assertNotIn("vm", persisted)
+                    self.assertEqual(persisted["ts"], values["ts"])
+                    self.assertEqual(persisted["instance_id"], "a" * 32)
 
 
 if __name__ == "__main__":

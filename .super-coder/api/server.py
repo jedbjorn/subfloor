@@ -40,7 +40,6 @@ from urllib.parse import urlparse, parse_qs, unquote
 
 ENGINE = Path(__file__).resolve().parents[1]
 REPO_ROOT = ENGINE.parent
-DB_PATH = ENGINE / "shell_db.db"
 UI_DIR = ENGINE / "ui"
 
 # Rolling webapp event log — visibility into what the API actually did, since a
@@ -67,6 +66,7 @@ import conversation_reaper  # noqa: E402  (Feature #31 orphan process ladder)
 import db_driver  # noqa: E402
 import git_hygiene  # noqa: E402  (live repo dirty/stale/clean snapshot)
 import harness_surfaces  # noqa: E402  (authoritative per-harness surfaces)
+import instance_state  # noqa: E402
 import mem_credentials  # noqa: E402  (runtime Admin credential provisioning, spec #30 req 11)
 import runtime_flags  # noqa: E402  (system-managed non-blocking runtime advisories)
 import sprint_close  # noqa: E402  (Sprints v2 conformance + report evidence)
@@ -95,6 +95,8 @@ from quota_probes import dispatch as quota_dispatch  # noqa: E402  (account quot
 import vm as vm_mod  # noqa: E402  (Windows Test VM — config + live checks)
 import ts as ts_mod  # noqa: E402  (tailnet — config + live checks)
 import pm2 as pm2_mod  # noqa: E402  (host pm2 stack — config + live checks)
+
+DB_PATH = instance_state.active_database_path(ENGINE)
 
 # The app SHELL stays a frozen route table (spec #48): four files, a closed set
 # that has not changed in the life of the project, and index.html is where the

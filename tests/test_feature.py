@@ -31,8 +31,11 @@ class RegistryIntegrityTest(unittest.TestCase):
         # same instance.json key — if this drifts, launch won't see the sidecar.
         self.assertEqual(feature.FEATURES["pg"]["block"], "pg")
         sc = (ROOT / ".super-coder" / "scripts" / "dispatch.sh").read_text()
-        self.assertIn("d['pg']={}", sc.replace(" ", ""),
-                      "sc pg-init no longer writes the `pg` key feature.py expects")
+        self.assertIn(
+            'instance_state.py" config-set "$f" pg',
+            sc,
+            "sc pg-init must use the locked instance configuration writer",
+        )
 
     def test_registry_does_not_name_retired_global_procedures(self):
         retired = {
@@ -48,31 +51,31 @@ class RegistryIntegrityTest(unittest.TestCase):
 
 class InfrastructureToggleTest(unittest.TestCase):
     def test_pg_enable_creates_auto_block_without_a_live_database(self):
-        written = mock.Mock()
+        updated = mock.Mock()
         with (
             mock.patch.object(feature, "_instance", return_value={}),
-            mock.patch.object(feature, "_write_instance", written),
+            mock.patch.object(feature, "_update_instance", updated),
         ):
             self.assertEqual(feature.cmd_enable("pg"), 0)
-        written.assert_called_once_with({"pg": {}})
+        updated.assert_called_once_with({"pg": {}})
 
     def test_link_only_enable_does_not_invent_host_configuration(self):
-        written = mock.Mock()
+        updated = mock.Mock()
         with (
             mock.patch.object(feature, "_instance", return_value={}),
-            mock.patch.object(feature, "_write_instance", written),
+            mock.patch.object(feature, "_update_instance", updated),
         ):
             self.assertEqual(feature.cmd_enable("windows"), 0)
-        written.assert_not_called()
+        updated.assert_not_called()
 
     def test_disable_removes_only_the_selected_block(self):
-        written = mock.Mock()
+        updated = mock.Mock()
         with (
             mock.patch.object(feature, "_instance", return_value={"pg": {}, "vm": {}}),
-            mock.patch.object(feature, "_write_instance", written),
+            mock.patch.object(feature, "_update_instance", updated),
         ):
             self.assertEqual(feature.cmd_disable("pg"), 0)
-        written.assert_called_once_with({"vm": {}})
+        updated.assert_called_once_with({}, remove=("pg",))
 
 
 if __name__ == "__main__":

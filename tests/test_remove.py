@@ -98,7 +98,6 @@ class RemoveFixture(unittest.TestCase):
             mock.patch.object(remove_mod, "REPO_ROOT", self.repo),
             mock.patch.object(remove_mod, "ENGINE", self.engine),
             mock.patch.object(remove_mod, "STATE_DIR", state),
-            mock.patch.object(remove_mod, "DB_PATH", self.db),
             mock.patch.object(
                 remove_mod,
                 "BACKUP_ROOT",
@@ -131,7 +130,22 @@ class RemoveFixture(unittest.TestCase):
 
 class EndToEndRemoveTest(RemoveFixture):
     def test_verified_wal_backup_and_repo_cleanup(self) -> None:
-        self.assertEqual(remove_mod.main(["--yes"]), 0)
+        backup_impl = remove_mod.db_backup.backup_database
+        with (
+            mock.patch.object(
+                remove_mod.instance_state,
+                "active_database_path",
+                return_value=self.db,
+            ) as resolve_database,
+            mock.patch.object(
+                remove_mod.db_backup,
+                "backup_database",
+                wraps=backup_impl,
+            ) as backup_database,
+        ):
+            self.assertEqual(remove_mod.main(["--yes"]), 0)
+        resolve_database.assert_called_once_with(self.engine)
+        self.assertEqual(backup_database.call_args.args[0], self.db)
 
         destination = self.removal_dir()
         backup = next(destination.glob("shell_db.removal.*.db"))

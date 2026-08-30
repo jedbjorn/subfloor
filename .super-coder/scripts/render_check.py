@@ -39,12 +39,13 @@ sys.path.insert(0, str(ENGINE / "render"))
 sys.path.insert(0, str(ENGINE / "scripts"))
 import artifact_policy  # noqa: E402
 import flat  # noqa: E402
+import instance_state  # noqa: E402
 import migrate as migrate_mod  # noqa: E402
 import seed_skills  # noqa: E402
 
 CONTENT = artifact_policy.content_path()
 ACTIVE_ROOT = artifact_policy.render_root()
-LIVE_DB = ENGINE / "shell_db.db"
+LIVE_DB = instance_state.active_database_path(ENGINE)
 
 
 def _build_tracked_db(path: Path) -> None:

@@ -44,12 +44,13 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import artifact_policy
+import instance_state
 
 ENGINE = Path(__file__).resolve().parents[1]
 SKILLS_DIR = ENGINE / "assets" / "skills"
 SHELL_TEMPLATES = ENGINE / "templates" / "shells"
 OUT = ENGINE / "migrations" / "0001_seed_skills.sql"
-DB_PATH = ENGINE / "shell_db.db"
+DB_PATH = instance_state.active_database_path(ENGINE)
 RETIRED_FILE = artifact_policy.retired_skills_path()
 TOMBSTONES_FILE = ENGINE / "assets" / "skill_tombstones.json"
 SKILL_NAME_RE = re.compile(r"^[a-z][a-z0-9_-]*$")

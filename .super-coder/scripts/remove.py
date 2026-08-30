@@ -35,13 +35,13 @@ from pathlib import Path
 ENGINE = Path(__file__).resolve().parents[1]
 REPO_ROOT = ENGINE.parent
 STATE_DIR = REPO_ROOT / ".sc-state"
-DB_PATH = ENGINE / "shell_db.db"
 BACKUP_ROOT = STATE_DIR / "db_backups" / "removal"
 
 sys.path.insert(0, str(ENGINE / "scripts"))
 import db_backup
 import engine_manifest
 import install
+import instance_state
 import sandbox_devkit
 import sc_wrapper
 
@@ -169,13 +169,14 @@ def engine_drift(repo_root: Path) -> tuple[dict[str, str], list[str]]:
 
 def show_plan(
     repo_root: Path,
+    database: Path,
     worktrees: list[Path],
     edits: dict[str, str],
     added: list[str],
 ) -> None:
     print("subfloor remove — teardown plan")
     print(f"  repository : {repo_root}")
-    print(f"  database   : {DB_PATH if DB_PATH.exists() else '(no live DB)'}")
+    print(f"  database   : {database if database.exists() else '(no live DB)'}")
     print(f"  backups    : {BACKUP_ROOT}/<UTC timestamp>/")
     print(f"  worktrees  : {len(worktrees)} clean managed worktree(s)")
     if edits or added:
@@ -220,7 +221,7 @@ def ensure_backup_ignore(repo_root: Path) -> None:
 
 
 def new_backup_dir(repo_root: Path) -> Path:
-    root = repo_root / ".sc-state" / "db_backups" / "removal"
+    root = instance_state.active_backup_paths(repo_root).local / "removal"
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
     destination = root / stamp
     destination.mkdir(parents=True, mode=0o700)
@@ -255,8 +256,11 @@ def write_manifest(path: Path, data: dict) -> None:
     os.replace(tmp, path)
 
 
-def backup_database(repo_root: Path, destination: Path) -> tuple[Path | None, dict]:
-    source = repo_root / ".super-coder" / "shell_db.db"
+def backup_database(
+    repo_root: Path,
+    destination: Path,
+    source: Path,
+) -> tuple[Path | None, dict]:
     engine_ref_path = repo_root / ".sc-state" / "engine.ref"
     engine_ref = ""
     try:
@@ -602,6 +606,7 @@ def main(argv: list[str]) -> int:
     data: dict | None = None
     try:
         repo_root = validate_target()
+        database = instance_state.active_database_path(repo_root / ".super-coder")
         worktrees = managed_worktrees(repo_root)
         dirty = dirty_worktrees(worktrees)
         if dirty:
@@ -614,7 +619,7 @@ def main(argv: list[str]) -> int:
             install.validate_gitignore(repo_root)
         except install.GitignoreError as exc:
             raise RemoveError(str(exc)) from exc
-        show_plan(repo_root, worktrees, edits, added)
+        show_plan(repo_root, database, worktrees, edits, added)
         if args.dry_run:
             print("dry-run: no services stopped and no files changed")
             return 0
@@ -627,7 +632,7 @@ def main(argv: list[str]) -> int:
         quiesce_runtime(repo_root)
         remove_worktrees(repo_root, worktrees)
 
-        _backup, data = backup_database(repo_root, destination)
+        _backup, data = backup_database(repo_root, destination, database)
         manifest_path = destination / "manifest.json"
         _ACTIVE_DATA = data
         _ACTIVE_MANIFEST = manifest_path

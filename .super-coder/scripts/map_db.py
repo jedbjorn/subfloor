@@ -25,13 +25,14 @@ import sqlite3
 from pathlib import Path
 
 import artifact_policy
+import instance_state
 
 ENGINE = Path(__file__).resolve().parents[1]
 REPO_ROOT = ENGINE.parent
 MAP_DB_PATH = artifact_policy.map_db_path()
 MAP_SCHEMA = ENGINE / "map_schema.sql"
 MAP_CONTENT = artifact_policy.map_content_path()
-ENGINE_DB = ENGINE / "shell_db.db"  # legacy source of pre-split dr_section
+ENGINE_DB = instance_state.active_database_path(ENGINE)
 
 
 def ensure_schema(con: sqlite3.Connection) -> None:

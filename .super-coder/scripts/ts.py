@@ -27,11 +27,9 @@ sandbox names verbs over the broker's unix socket and holds nothing. The broker
 from __future__ import annotations
 
 import json
-import os
 import socket
 import subprocess
 import sys
-from pathlib import Path
 
 import ports
 
@@ -55,13 +53,11 @@ def read() -> dict | None:
 def write(ts: dict | None) -> dict | None:
     """Persist (or clear) the ts block, preserving every other config key
     (ports, and the `vm` block written by vm.py — both coexist)."""
-    cfg = ports.resolve(persist=False)
     if ts:
-        cfg["ts"] = ts
+        ports.update({"ts": ts})
     else:
-        cfg.pop("ts", None)
-    ports.save(cfg)
-    return cfg.get("ts")
+        ports.update({}, remove=("ts",))
+    return ts
 
 
 # -- primitives --------------------------------------------------------------

@@ -33,7 +33,6 @@ from pathlib import Path
 
 ENGINE = Path(__file__).resolve().parents[1]
 REPO_ROOT = ENGINE.parent
-DB_PATH = ENGINE / "shell_db.db"
 STATE_DIR = REPO_ROOT / ".sc-state"
 ENGINE_REF = STATE_DIR / "engine.ref"
 ENGINE_REF_PREV = STATE_DIR / "engine.ref.prev"
@@ -42,8 +41,11 @@ sys.path.insert(0, str(ENGINE / "scripts"))
 import callable_floor  # noqa: E402
 import db_backup as db_backup_mod  # noqa: E402
 import engine_manifest  # noqa: E402
+import instance_state  # noqa: E402
 import rebuild as rebuild_mod  # noqa: E402  (BACKUP_DIR, backup_db, prune_backups, KEEP_BACKUPS)
 import update as update_mod  # noqa: E402  (materialize_engine, super_coder_remote, git)
+
+DB_PATH = instance_state.active_database_path(ENGINE)
 
 # Compatibility alias for callers that inspect the preferred location. Runtime
 # reads/writes use rebuild_mod.backup_dir() so restricted seats share the same

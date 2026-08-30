@@ -18,8 +18,10 @@ import os
 import sqlite3
 import sys
 import time
+from collections.abc import Mapping
 from pathlib import Path
-from typing import Mapping
+
+import instance_state
 
 KEEP_BACKUPS = 5
 
@@ -31,28 +33,13 @@ class BackupDestinationError(RuntimeError):
 def preferred_home_dir(
     repo_root: Path, environ: Mapping[str, str] | None = None
 ) -> Path:
-    env = os.environ if environ is None else environ
-    home = Path(env.get("HOME") or Path.home()).expanduser()
-    return home / "db_backups" / repo_root.name
+    return instance_state.active_backup_paths(repo_root, environ).home
 
 
 def candidate_dirs(
     repo_root: Path, environ: Mapping[str, str] | None = None
 ) -> list[Path]:
-    env = os.environ if environ is None else environ
-    candidates: list[Path] = []
-    override = env.get("SC_DB_BACKUP_DIR", "").strip()
-    if override:
-        candidates.append(Path(override).expanduser())
-    candidates.extend(
-        [
-            preferred_home_dir(repo_root, env),
-            repo_root / ".sc-state" / "db_backups",
-        ]
-    )
-    # An override may intentionally name the normal home or local directory.
-    # Probe it once and preserve the documented priority.
-    return list(dict.fromkeys(candidates))
+    return list(instance_state.active_backup_paths(repo_root, environ).candidates)
 
 
 def _probe_writable(directory: Path) -> None:

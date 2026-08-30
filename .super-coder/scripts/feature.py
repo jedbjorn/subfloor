@@ -22,6 +22,8 @@ import json
 import sys
 from pathlib import Path
 
+import instance_state
+
 ENGINE = Path(__file__).resolve().parents[1]
 INSTANCE = ENGINE / "instance.json"
 
@@ -91,8 +93,10 @@ def _instance() -> dict:
         sys.exit(f"feature: {INSTANCE} is not valid JSON — fix it first.")
 
 
-def _write_instance(cfg: dict) -> None:
-    INSTANCE.write_text(json.dumps(cfg, indent=2) + "\n")
+def _update_instance(
+    changes: dict[str, object], *, remove: tuple[str, ...] = ()
+) -> None:
+    instance_state.merge_instance_config(INSTANCE, changes, remove=remove)
 
 
 def cmd_list() -> int:
@@ -127,8 +131,7 @@ def cmd_enable(name: str) -> int:
     if blk in cfg:
         print(f"  config `{blk}` already linked in instance.json")
     elif f["block_auto"]:
-        cfg[blk] = {}
-        _write_instance(cfg)
+        _update_instance({blk: {}})
         print(f"  config `{blk}` added to instance.json")
     else:
         print(f"  config `{blk}` is operator-linked — next steps:")
@@ -148,8 +151,7 @@ def cmd_disable(name: str) -> int:
     cfg = _instance()
     blk = f["block"]
     if blk in cfg:
-        del cfg[blk]
-        _write_instance(cfg)
+        _update_instance({}, remove=(blk,))
         print(f"  config `{blk}` removed from instance.json")
         if name == "pg":
             print("  note: a running sidecar keeps running — stop it with ./sc pg-down "
