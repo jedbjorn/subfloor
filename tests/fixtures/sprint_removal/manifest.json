@@ -36,6 +36,7 @@
     ".super-coder/scripts/sprint_participant_chats.py",
     ".super-coder/scripts/sprint_runtime.py",
     ".super-coder/scripts/sprint_pr_watcher.py",
+    ".super-coder/scripts/instance_state.py",
     ".super-coder/scripts/sprint_recovery.py",
     ".super-coder/scripts/sprint_review_loop.py",
     ".super-coder/scripts/harness_surfaces.py",
