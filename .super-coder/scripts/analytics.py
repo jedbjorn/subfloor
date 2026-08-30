@@ -37,12 +37,13 @@ from pathlib import Path
 
 ENGINE = Path(__file__).resolve().parents[1]
 REPO_ROOT = ENGINE.parent
-DB_PATH = ENGINE / "shell_db.db"
-
 sys.path.insert(0, str(ENGINE / "scripts"))
 import db_driver  # noqa: E402
+import instance_state  # noqa: E402
 
 import token_parsers  # noqa: E402
+
+DB_PATH = instance_state.active_database_path(ENGINE)
 
 WORKTREES = ".sc-worktrees"
 

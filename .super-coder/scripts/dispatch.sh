@@ -54,9 +54,12 @@ LINKED=0
 ROOT="$LIVE_ROOT"          # every path below this line is the LIVE instance's
 ENGINE="$ROOT/.super-coder"
 PY="${SC_PYTHON:-python3}"
-DB="$ENGINE/shell_db.db"
 S="$ENGINE/scripts"
 MAPDB=""
+
+sc_engine_db() {
+  "$PY" "$S/instance_state.py" active-database "$ENGINE"
+}
 
 sc_require_supported_host() {
   SC_PLATFORM_KERNEL="$(command -p uname -s 2>/dev/null || true)"
@@ -825,10 +828,11 @@ sc_db_backup_preflight() {
 sc_db_backup() {
   prefix="${1:-manual}"
   destination="${2:-}"
+  database="$(sc_engine_db)"
   if [ -n "$destination" ]; then
-    "$PY" "$S/db_backup.py" backup "$DB" "$ROOT" "$prefix" "$destination"
+    "$PY" "$S/db_backup.py" backup "$database" "$ROOT" "$prefix" "$destination"
   else
-    "$PY" "$S/db_backup.py" backup "$DB" "$ROOT" "$prefix"
+    "$PY" "$S/db_backup.py" backup "$database" "$ROOT" "$prefix"
   fi
 }
 
@@ -958,7 +962,7 @@ esac
 # migrate) probes first because it executes host Python. Container entry
 # deliberately remains a Docker handoff rather than a host-runtime gate.
 case "$cmd" in
-  install|ensure-harness|doctor|update|update-harnesses|harness-status|docker-cache-gc|rollback|feature|artifact-mode|eject|remove|init|rebuild|migrate|migration|snapshot|mem|pr|token|persist|job|visual-qa|map-sql|map-sql-rw|map-schema|map-extractor|render|render-check|map|map-setup|analytics|models|seed-skills|skill|ports|url|preview|serve|vm|vm-broker|vm-bake|vm-broker-up|vm-broker-down|vm-broker-sock|vm-mcp-relay|vm-broker-install|vm-broker-uninstall|ts-broker|ts-broker-up|ts-broker-down|ts-broker-sock|ts-broker-install|ts-broker-uninstall|pm2-broker|pm2-broker-up|pm2-broker-down|pm2-broker-sock|pm2-broker-install|pm2-broker-uninstall|db-broker|db-broker-up|db-broker-down|db-broker-sock|db-broker-install|db-broker-uninstall|db-init|pg-init|pg-up|pg-down|admin|boot|boot-*|run|deps|test|lint|typecheck|launch|down|restart|build|verify|health)
+  install|ensure-harness|doctor|update|update-harnesses|harness-status|docker-cache-gc|rollback|feature|artifact-mode|eject|remove|init|rebuild|migrate|migration|snapshot|mem|pr|token|persist|job|visual-qa|sql|sql-rw|map-sql|map-sql-rw|map-schema|map-extractor|render|render-check|map|map-setup|analytics|models|seed-skills|skill|ports|url|preview|serve|vm|vm-broker|vm-bake|vm-broker-up|vm-broker-down|vm-broker-sock|vm-mcp-relay|vm-broker-install|vm-broker-uninstall|ts-broker|ts-broker-up|ts-broker-down|ts-broker-sock|ts-broker-install|ts-broker-uninstall|pm2-broker|pm2-broker-up|pm2-broker-down|pm2-broker-sock|pm2-broker-install|pm2-broker-uninstall|db-broker|db-broker-up|db-broker-down|db-broker-sock|db-broker-install|db-broker-uninstall|db-init|pg-init|pg-up|pg-down|admin|boot|boot-*|run|deps|test|lint|typecheck|launch|down|restart|build|verify|health|clean-db)
     case "$cmd" in
       deps|test|lint|typecheck)
         sc_devkit_help_form "$@" || sc_python_probe ;;
@@ -1008,17 +1012,17 @@ case "$cmd" in
   # rebuild/migrate: the script owns the whole argument contract (help, unknown
   # tokens), so the dispatcher forwards VERBATIM and only inserts the refusal —
   # after the help question, before the action.
-  rebuild)      sc_help_form "$@" || sc_refuse_linked rebuild "$DB"
+  rebuild)      sc_help_form "$@" || sc_refuse_linked rebuild "$(sc_engine_db)"
                 exec "$PY" "$S/rebuild.py" "$@" ;;
-  migrate)      sc_help_form "$@" || sc_refuse_linked migrate "$DB"
-                exec "$PY" "$S/migrate.py" "$DB" "$@" ;;
+  migrate)      sc_help_form "$@" || sc_refuse_linked migrate "$(sc_engine_db)"
+                exec "$PY" "$S/migrate.py" "$(sc_engine_db)" "$@" ;;
   migration)    exec "$PY" "$CALLER_ENGINE/scripts/migration.py" "$@" ;;
   # snapshot/render name the artifact they would overwrite as well as the DB
   # they read; resolving that path costs a subprocess, so only the refusing
   # branch pays for it.
   snapshot)     if [ "$LINKED" -eq 1 ]; then
                   sc_refuse_linked snapshot \
-                    "$DB -> $("$PY" "$S/artifact_policy.py" path content)"
+                    "$(sc_engine_db) -> $("$PY" "$S/artifact_policy.py" path content)"
                 fi
                 exec "$PY" "$S/snapshot.py" ;;
   mem)          exec "$PY" "$S/mem.py" "$@" ;;
@@ -1056,15 +1060,15 @@ case "$cmd" in
   # procedures with no dedicated surface (direct skill INSERTs, cartographer
   # map authoring) — only use one where a skill names it. Skill grants have
   # their own surface now: `./sc skill`.
-  sql)          exec sqlite3 -readonly "$DB" "$@" ;;
+  sql)          exec sqlite3 -readonly "$(sc_engine_db)" "$@" ;;
   map-sql)      exec sqlite3 -readonly "$(sc_mapdb)" "$@" ;;
-  sql-rw)       exec sqlite3 "$DB" "$@" ;;
+  sql-rw)       exec sqlite3 "$(sc_engine_db)" "$@" ;;
   map-sql-rw)   exec sqlite3 "$(sc_mapdb)" "$@" ;;
   map-schema)   exec "$PY" "$S/map_schema_cli.py" "$@" ;;
   map-extractor) exec "$PY" "$S/map_extractor_install.py" "$@" ;;
   render)       if [ "$LINKED" -eq 1 ]; then
                   sc_refuse_linked render \
-                    "$DB -> $("$PY" "$S/artifact_policy.py" path renders)"
+                    "$(sc_engine_db) -> $("$PY" "$S/artifact_policy.py" path renders)"
                 fi
                 [ $# -gt 0 ] && exec "$PY" "$S/render.py" "$@" || exec "$PY" "$S/render.py" flat ;;
   # render-check is SOURCE-PURE: it builds a throwaway DB from tracked text and
@@ -1438,18 +1442,19 @@ case "$cmd" in
     fi
     exec docker logs -f "$CNAME" ;;
   verify)
-    sc_refuse_linked verify "$DB"
+    database="$(sc_engine_db)"
+    sc_refuse_linked verify "$database"
     # Destructive by design: rebuild.py REPLACES the DB below. Say which DB and
     # which source before that happens — a footer printed after the fact is a
     # disclosure a crash can skip, and this is the command that eats unsnapshotted
     # memory when it is pointed at an instance the caller did not mean.
-    echo "→ verify: about to REBUILD $DB"
+    echo "→ verify: about to REBUILD $database"
     echo "          from engine source $ENGINE"
     "$PY" "$S/rebuild.py"
     # The engine source intentionally carries no per-instance snapshot in local
     # artifact mode. Exercise the real fresh-fork initialization path before
     # the headless boot when rebuild therefore produced an empty instance.
-    if "$PY" - "$DB" <<'PY'
+    if "$PY" - "$database" <<'PY'
 import sqlite3
 import sys
 
@@ -1471,8 +1476,9 @@ PY
     SC_ADMIN=1 "$PY" "$S/render.py" flat
     RENDER_ONLY=1 exec "$PY" "$S/run.py" --first ;;
   health)       curl -s "http://127.0.0.1:$(port)/api/health" && echo "" ;;
-  clean-db)     sc_refuse_linked clean-db "$DB"
-                rm -f "$DB" "$DB-wal" "$DB-shm" && echo "removed $DB (rebuild with: ./sc rebuild)" ;;
+  clean-db)     database="$(sc_engine_db)"
+                sc_refuse_linked clean-db "$database"
+                rm -f "$database" "$database-wal" "$database-shm" && echo "removed $database (rebuild with: ./sc rebuild)" ;;
   help|-h|--help)
     cat <<'EOF'
 super-coder — forkable shell substrate

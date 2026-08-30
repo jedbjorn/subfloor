@@ -35,15 +35,17 @@ from pathlib import Path
 ENGINE = Path(__file__).resolve().parents[1]
 REPO_ROOT = ENGINE.parent
 STATE_DIR = REPO_ROOT / ".sc-state"
-DB_PATH = ENGINE / "shell_db.db"
 BACKUP_ROOT = STATE_DIR / "db_backups" / "removal"
 
 sys.path.insert(0, str(ENGINE / "scripts"))
 import db_backup
 import engine_manifest
 import install
+import instance_state
 import sandbox_devkit
 import sc_wrapper
+
+DB_PATH = instance_state.active_database_path(ENGINE)
 
 BACKUP_IGNORE = "/.sc-state/db_backups/"
 BACKUP_IGNORE_COMMENT = "# subfloor removal backup — preserved after make dos-remove"

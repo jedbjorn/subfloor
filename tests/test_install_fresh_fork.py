@@ -318,6 +318,15 @@ class FreshForkInstallTest(unittest.TestCase):
                 config["installed_at"],
                 re.compile(r"^\d{4}-\d{2}-\d{2}$"),
             )
+            self.assertRegex(config["instance_id"], re.compile(r"^[0-9a-f]{32}$"))
+            private_root = (
+                home
+                / ".local/state/subfloor/instances"
+                / config["instance_id"]
+            )
+            self.assertTrue((private_root / "owner.json").is_file())
+            self.assertFalse((private_root / "shell_db.db").exists())
+            self.assertTrue((repo / ".super-coder/shell_db.db").is_file())
             self.assertIn("Installed ✓", result.stdout)
             self.assertEqual(sys.version_info[:2], (3, 14))
             self.assertIn(

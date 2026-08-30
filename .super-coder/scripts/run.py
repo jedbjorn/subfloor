@@ -47,8 +47,6 @@ from typing import NamedTuple
 
 ENGINE = Path(__file__).resolve().parents[1]
 REPO_ROOT = ENGINE.parent
-DB_PATH = ENGINE / "shell_db.db"
-
 sys.path.insert(0, str(ENGINE / "render"))
 import flat  # noqa: E402
 from compose import compose_boot  # noqa: E402
@@ -63,6 +61,7 @@ import git_freshness  # noqa: E402
 import git_prune  # noqa: E402  — boot-time prune of provably-merged local branches
 import global_pointer  # noqa: E402
 import install  # noqa: E402  — reuse its canonical HARNESS_BIN (one source of truth)
+import instance_state  # noqa: E402
 import opencode_config  # noqa: E402  — one locked owner for opencode.json
 import ports as ports_mod  # noqa: E402  — derive the per-fork API base URL
 import sandbox_devkit  # noqa: E402  — readiness receipt identity contract
@@ -70,6 +69,8 @@ import seed_skills  # noqa: E402  — boot-time self-heal of stale engine skills
 import shell_liveness  # noqa: E402  — headless boot's one-shell-one-session guard
 import skill_projection  # noqa: E402  — exact bounded harness skill mirrors
 import style  # noqa: E402  — launcher ANSI; degrades to plain text off-TTY
+
+DB_PATH = instance_state.active_database_path(ENGINE)
 
 sys.path.insert(0, str(ENGINE / "api"))
 import model_catalog  # noqa: E402  — HARNESS_PROVIDER: one source for harness → provider

@@ -115,6 +115,7 @@ import callable_floor  # noqa: E402
 import engine_manifest  # noqa: E402
 from engine_paths import GENERATED_INSTALL_PATHS  # noqa: E402
 import global_pointer  # noqa: E402
+import instance_state  # noqa: E402
 import ports as ports_mod  # noqa: E402
 
 
@@ -305,7 +306,7 @@ def already_installed() -> bool:
 
 def starting_team_exists() -> bool:
     """Whether a prior install persisted the complete starting team."""
-    db = ENGINE / "shell_db.db"
+    db = instance_state.active_database_path(ENGINE)
     if not db.exists():
         return False
     import sqlite3
@@ -1140,6 +1141,7 @@ def main(argv: list[str]) -> int:
     cfg["harness"] = harness
     cfg["installed_at"] = datetime.now(timezone.utc).date().isoformat()
     ports_mod.CONFIG.write_text(json.dumps(cfg, indent=2) + "\n")
+    instance_state.resolve(instance_config=ports_mod.CONFIG)
 
     # 9. Done -----------------------------------------------------------------
     step("Installed ✓")

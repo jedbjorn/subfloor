@@ -25,7 +25,6 @@ from urllib.parse import parse_qs, urlparse
 
 ENGINE = Path(__file__).resolve().parents[1]
 REPO_ROOT = ENGINE.parent
-DB_PATH = ENGINE / "shell_db.db"
 SCRIPTS = ENGINE / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 
@@ -34,10 +33,13 @@ import conversation_broker
 import conversation_events
 import conversation_git_targets
 import db_driver
+import instance_state
 import model_catalog
 import route_bindings
 import run as run_mod
 from conversation_adapters import ADAPTER_TYPES
+
+DB_PATH = instance_state.active_database_path(ENGINE)
 
 _ALLOWED_HOST_SET = frozenset(("127.0.0.1", "localhost", "::1"))
 _BROWSER_HARNESSES = tuple(sorted(ADAPTER_TYPES))

@@ -16,16 +16,17 @@ import sys
 from pathlib import Path
 
 ENGINE = Path(__file__).resolve().parents[1]
-DB_PATH = ENGINE / "shell_db.db"
-
 sys.path.insert(0, str(ENGINE / "render"))
 sys.path.insert(0, str(ENGINE / "scripts"))
 import artifact_policy
 import db_driver
 import flat
+import instance_state
 import skill_projection
 from _serialize_guard import require_admin
 from seed_skills import sync_engine_skills
+
+DB_PATH = instance_state.active_database_path(ENGINE)
 
 
 def _open():

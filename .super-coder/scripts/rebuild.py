@@ -20,7 +20,6 @@ from pathlib import Path
 
 ENGINE = Path(__file__).resolve().parents[1]
 REPO_ROOT = ENGINE.parent
-DB_PATH = ENGINE / "shell_db.db"
 SCHEMA_SQLITE = ENGINE / "schema.sql"
 SNAPSHOT_LEGACY = ENGINE / "snapshot" / "content.sql"
 sys.path.insert(0, str(ENGINE / "scripts"))
@@ -28,9 +27,12 @@ import artifact_policy  # noqa: E402
 import backfill_shell_api_keys  # noqa: E402  (re-provision api_keys post-rebuild)
 import db_backup as db_backup_mod  # noqa: E402
 import db_driver  # noqa: E402
+import instance_state  # noqa: E402
 import map_repo  # noqa: E402
 import migrate as migrate_mod  # noqa: E402
 import seed_skills  # noqa: E402  (re-assert the fork retire list post-seed)
+
+DB_PATH = instance_state.active_database_path(ENGINE)
 
 # Compatibility/readability constant: the historical preferred location.
 # Writes resolve dynamically through backup_dir() so a restricted host seat can

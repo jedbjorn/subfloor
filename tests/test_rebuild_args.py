@@ -268,12 +268,13 @@ class RebuildDispatchParityTest(unittest.TestCase):
         # requirement is unchanged and is what the second line still says: the
         # dispatcher adds nothing to argv and removes nothing from it. The first
         # line is pinned too because ORDER is the contract: the help question is
-        # asked before the refusal, which is asked before the exec.
+        # asked before the refusal, which resolves the active DB through the
+        # canonical seam before the exec.
         lines = [ln.strip() for ln in (REPO / ".super-coder" / "scripts" / "dispatch.sh").read_text().splitlines()]
         start = next(i for i, ln in enumerate(lines) if ln.startswith("rebuild)"))
         self.assertEqual(
             lines[start],
-            'rebuild)      sc_help_form "$@" || sc_refuse_linked rebuild "$DB"')
+            'rebuild)      sc_help_form "$@" || sc_refuse_linked rebuild "$(sc_engine_db)"')
         self.assertEqual(
             lines[start + 1], 'exec "$PY" "$S/rebuild.py" "$@" ;;')
 

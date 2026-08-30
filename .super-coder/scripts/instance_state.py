@@ -1,9 +1,9 @@
 """Resolve one installation's private engine-state namespace.
 
-This module establishes the path contract only.  Production consumers remain
-on their legacy paths until the maintenance-cutover prerequisites in spec #133
-exist.  Importing this module must therefore never relocate, copy, publish, or
-open the live engine database.
+Every production consumer obtains its effective DB path through this module.
+The effective target remains the repo-local legacy database until the
+maintenance-cutover prerequisites in spec #133 exist.  This module never
+relocates, copies, publishes, deletes, or opens the live engine database.
 """
 from __future__ import annotations
 
@@ -11,6 +11,7 @@ import json
 import os
 import secrets
 import stat
+import sys
 from collections.abc import Callable, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -28,6 +29,10 @@ OWNER_METADATA = "owner.json"
 
 class InstanceStateError(RuntimeError):
     """The private instance-state identity or filesystem boundary is unsafe."""
+
+
+class MaintenanceCutoverRequired(InstanceStateError):
+    """Private state cannot become active before the spec #133 cutover gate."""
 
 
 @dataclass(frozen=True)
@@ -67,19 +72,19 @@ class InstanceState:
 
 
 @dataclass(frozen=True)
-class DeferredConsumer:
-    """One production cutover owner intentionally deferred behind spec #133."""
+class StateConsumer:
+    """One classified production state owner or reference."""
 
     owner: str
     paths: tuple[str, ...]
     responsibility: str
 
 
-# Exact WU141 preparation inventory.  These owners must adopt InstanceState in
-# the stopped-runtime relocation unit, not opportunistically in this resolver
-# unit.  Keeping the inventory executable lets focused tests pin the boundary.
-DEFERRED_CONSUMERS = (
-    DeferredConsumer(
+# Exact WU141 preparation inventory.  DB owners adopt active_database_path in
+# this unit while private-location activation remains behind spec #133.
+# Keeping the inventory executable lets focused tests pin both boundaries.
+PRODUCTION_CONSUMERS = (
+    StateConsumer(
         "api_and_daemons",
         (
             ".super-coder/api/server.py",
@@ -91,12 +96,12 @@ DEFERRED_CONSUMERS = (
         ),
         "API lifetime and daemon DB-path injection",
     ),
-    DeferredConsumer(
+    StateConsumer(
         "db_driver",
         (".super-coder/scripts/db_driver.py",),
         "canonical connection entry point",
     ),
-    DeferredConsumer(
+    StateConsumer(
         "snapshot_and_render",
         (
             ".super-coder/scripts/artifact_policy.py",
@@ -106,12 +111,12 @@ DEFERRED_CONSUMERS = (
         ),
         "private snapshot and render inputs",
     ),
-    DeferredConsumer(
+    StateConsumer(
         "backup_and_rebuild",
         (".super-coder/scripts/db_backup.py", ".super-coder/scripts/rebuild.py"),
         "WAL-safe backup selection and canonical publication",
     ),
-    DeferredConsumer(
+    StateConsumer(
         "install_and_update",
         (
             ".super-coder/scripts/install.py",
@@ -120,7 +125,7 @@ DEFERRED_CONSUMERS = (
         ),
         "fresh identity creation and stopped-runtime relocation",
     ),
-    DeferredConsumer(
+    StateConsumer(
         "rollback_remove_and_eject",
         (
             ".super-coder/scripts/rollback.py",
@@ -129,7 +134,7 @@ DEFERRED_CONSUMERS = (
         ),
         "deterministic recovery and exact private-state ownership",
     ),
-    DeferredConsumer(
+    StateConsumer(
         "shell_entry_and_liveness",
         (
             ".super-coder/scripts/dispatch.sh",
@@ -138,7 +143,7 @@ DEFERRED_CONSUMERS = (
         ),
         "launch refusal and bounded liveness reads",
     ),
-    DeferredConsumer(
+    StateConsumer(
         "catalogue_writers",
         (
             ".super-coder/scripts/seed_skills.py",
@@ -150,7 +155,7 @@ DEFERRED_CONSUMERS = (
         ),
         "remaining direct engine-DB owners",
     ),
-    DeferredConsumer(
+    StateConsumer(
         "legacy_and_candidate_paths",
         (
             ".super-coder/scripts/map_db.py",
@@ -451,6 +456,42 @@ def resolve(
     return InstanceState(instance_id=instance_id, root=root)
 
 
-def deferred_consumer_inventory() -> tuple[DeferredConsumer, ...]:
-    """Return the production adoption inventory deferred to WU142/U2."""
-    return DEFERRED_CONSUMERS
+def active_database_path(
+    engine: Path,
+    *,
+    private_state: InstanceState | None = None,
+) -> Path:
+    """Return the one effective live DB target for the current engine floor.
+
+    WU141 establishes this production seam without activating private state.
+    Spec #133 must supply a stopped runtime, exclusive maintenance lease,
+    WAL-safe backup, and deterministic recovery before a later unit can pass a
+    private target here.  Until then, even a fully validated ``InstanceState``
+    is refused rather than selected.
+    """
+    if private_state is not None:
+        raise MaintenanceCutoverRequired(
+            "private engine state requires the spec #133 maintenance cutover"
+        )
+    return Path(engine) / "shell_db.db"
+
+
+def production_consumer_inventory() -> tuple[StateConsumer, ...]:
+    """Return the classified production state-owner/reference inventory."""
+    return PRODUCTION_CONSUMERS
+
+
+def main(argv: list[str]) -> int:
+    if len(argv) == 2 and argv[0] == "active-database":
+        print(active_database_path(Path(argv[1])))
+        return 0
+    raise InstanceStateError(
+        "usage: instance_state.py active-database <engine-directory>"
+    )
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main(sys.argv[1:]))
+    except InstanceStateError as exc:
+        raise SystemExit(f"instance-state: {exc}") from exc

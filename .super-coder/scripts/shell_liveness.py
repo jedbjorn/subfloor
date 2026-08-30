@@ -77,10 +77,12 @@ import sqlite3
 import sys
 from pathlib import Path
 
+import instance_state
+
 ENGINE = Path(__file__).resolve().parents[1]
 REPO_ROOT = ENGINE.parent
 ADAPTERS = ENGINE / "adapters"
-DB_PATH = ENGINE / "shell_db.db"
+DB_PATH = instance_state.active_database_path(ENGINE)
 PROC = Path("/proc")
 
 _FALLBACK_BINS = {"claude", "codex", "opencode", "vibe", "kimi"}

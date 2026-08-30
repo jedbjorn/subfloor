@@ -27,13 +27,14 @@ from pathlib import Path
 
 import artifact_policy
 import db_driver
+import instance_state
 import map_db
 import seed_skills
 from _serialize_guard import require_admin
 
 ENGINE = Path(__file__).resolve().parents[1]
 REPO_ROOT = ENGINE.parent
-DB_PATH = ENGINE / "shell_db.db"
+DB_PATH = instance_state.active_database_path(ENGINE)
 # Generated instance state is always local and gitignored.
 OUT_PATH = artifact_policy.content_path()
 # One-release cleanup: if a not-yet-migrated fork still carries the old in-engine

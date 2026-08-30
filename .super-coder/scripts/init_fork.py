@@ -31,11 +31,12 @@ import sys
 from pathlib import Path
 
 ENGINE = Path(__file__).resolve().parents[1]
-DB_PATH = ENGINE / "shell_db.db"
-
 sys.path.insert(0, str(ENGINE / "scripts"))
 import db_driver  # noqa: E402
 import install as install_mod  # noqa: E402
+import instance_state  # noqa: E402
+
+DB_PATH = instance_state.active_database_path(ENGINE)
 
 # The starting team seeded at install, besides the singleton cartographer (added
 # separately below). Your interviewed primary shell — default planner — fills one

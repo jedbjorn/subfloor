@@ -11,6 +11,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from typing import ClassVar
 
 ROOT = Path(__file__).resolve().parents[1]
 MODULE_PATH = ROOT / ".super-coder" / "scripts" / "instance_state.py"
@@ -272,10 +273,49 @@ class InstanceStateResolverTests(unittest.TestCase):
 
         self.assertFalse(self.state_home.exists())
 
+    def test_active_database_stays_legacy_until_maintenance_cutover(self):
+        resolved = self.resolve()
+        legacy = self.engine / "shell_db.db"
 
-class DeferredCutoverInventoryTests(unittest.TestCase):
-    def test_inventory_is_exact_and_production_imports_are_deferred(self):
-        inventory = instance_state.deferred_consumer_inventory()
+        self.assertEqual(instance_state.active_database_path(self.engine), legacy)
+        with self.assertRaisesRegex(
+            instance_state.MaintenanceCutoverRequired,
+            "spec #133 maintenance cutover",
+        ):
+            instance_state.active_database_path(
+                self.engine,
+                private_state=resolved,
+            )
+
+        self.assertFalse(legacy.exists())
+        self.assertFalse(resolved.database.exists())
+
+
+class ProductionSeamInventoryTests(unittest.TestCase):
+    DIRECT_RESOLVER_OWNERS: ClassVar[set[str]] = {
+        ".super-coder/api/server.py",
+        ".super-coder/api/conversation_routes.py",
+        ".super-coder/scripts/analytics.py",
+        ".super-coder/scripts/init_fork.py",
+        ".super-coder/scripts/install.py",
+        ".super-coder/scripts/map_db.py",
+        ".super-coder/scripts/models.py",
+        ".super-coder/scripts/rebuild.py",
+        ".super-coder/scripts/remove.py",
+        ".super-coder/scripts/render.py",
+        ".super-coder/scripts/render_check.py",
+        ".super-coder/scripts/rollback.py",
+        ".super-coder/scripts/run.py",
+        ".super-coder/scripts/seed_dogfood.py",
+        ".super-coder/scripts/seed_skills.py",
+        ".super-coder/scripts/shell_liveness.py",
+        ".super-coder/scripts/skill.py",
+        ".super-coder/scripts/snapshot.py",
+        ".super-coder/scripts/update.py",
+    }
+
+    def test_inventory_is_exact_and_every_direct_owner_uses_resolver(self):
+        inventory = instance_state.production_consumer_inventory()
         owners = {entry.owner for entry in inventory}
         self.assertEqual(
             owners,
@@ -293,14 +333,63 @@ class DeferredCutoverInventoryTests(unittest.TestCase):
         )
         paths = [path for entry in inventory for path in entry.paths]
         self.assertEqual(len(paths), len(set(paths)))
+        self.assertLessEqual(self.DIRECT_RESOLVER_OWNERS, set(paths))
         for relative in paths:
             source = ROOT / relative
             self.assertTrue(source.is_file(), relative)
-            self.assertNotIn(
-                "import instance_state",
-                source.read_text(),
-                f"{relative} crossed the spec #133 deferred-cutover boundary",
-            )
+
+        for relative in self.DIRECT_RESOLVER_OWNERS:
+            source = (ROOT / relative).read_text()
+            self.assertIn("instance_state", source, relative)
+            self.assertIn("active_database_path", source, relative)
+
+        dispatcher = (ROOT / ".super-coder/scripts/dispatch.sh").read_text()
+        self.assertIn(
+            '"$S/instance_state.py" active-database "$ENGINE"',
+            dispatcher,
+        )
+        driver = (ROOT / ".super-coder/scripts/db_driver.py").read_text()
+        self.assertIn("instance_state.active_database_path", driver)
+        installer = (ROOT / ".super-coder/scripts/install.py").read_text()
+        self.assertIn(
+            "instance_state.resolve(instance_config=ports_mod.CONFIG)",
+            installer,
+        )
+
+    def test_daemons_receive_resolved_path_and_do_not_choose_a_live_target(self):
+        server = (ROOT / ".super-coder/api/server.py").read_text()
+        for relative in (
+            ".super-coder/scripts/conversation_broker.py",
+            ".super-coder/scripts/conversation_reaper.py",
+            ".super-coder/scripts/sprint_runtime.py",
+            ".super-coder/scripts/sprint_pr_watcher.py",
+        ):
+            source = (ROOT / relative).read_text()
+            self.assertNotIn('ENGINE / "shell_db.db"', source, relative)
+        self.assertIn("DB_PATH = instance_state.active_database_path(ENGINE)", server)
+        self.assertRegex(server, r"conversation_broker\.start_service\([^)]*DB_PATH")
+        self.assertRegex(server, r"conversation_reaper\.start_service\([^)]*DB_PATH")
+
+    def test_private_target_activation_exists_only_as_a_refusing_seam(self):
+        source = MODULE_PATH.read_text()
+        self.assertEqual(
+            source.count("return Path(engine) / \"shell_db.db\""),
+            1,
+        )
+        for directory in (
+            ROOT / ".super-coder" / "api",
+            ROOT / ".super-coder" / "scripts",
+            ROOT / ".super-coder" / "render",
+        ):
+            for extension in ("*.py", "*.sh"):
+                for path in directory.rglob(extension):
+                    if path == MODULE_PATH:
+                        continue
+                    self.assertNotRegex(
+                        path.read_text(),
+                        r"(?:ENGINE|engine)\s*/\s*[\"']shell_db\.db[\"']",
+                        path.relative_to(ROOT).as_posix(),
+                    )
 
     def test_inventory_classifies_every_runtime_state_path_reference(self):
         pattern = re.compile(
@@ -321,7 +410,7 @@ class DeferredCutoverInventoryTests(unittest.TestCase):
         discovered.remove(".super-coder/scripts/instance_state.py")
         classified = {
             path
-            for entry in instance_state.deferred_consumer_inventory()
+            for entry in instance_state.production_consumer_inventory()
             for path in entry.paths
         }
         self.assertEqual(

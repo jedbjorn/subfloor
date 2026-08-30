@@ -41,6 +41,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import artifact_policy
 import db_driver
+import instance_state
 import mem
 import render as render_mod
 import seed_skills
@@ -48,7 +49,7 @@ import skill_projection
 import snapshot
 
 ENGINE = Path(__file__).resolve().parents[1]
-DB_PATH = ENGINE / "shell_db.db"
+DB_PATH = instance_state.active_database_path(ENGINE)
 MAX_SKILL_FILE_BYTES = 128 * 1024
 LOCAL_FRONTMATTER_FIELDS = {"name", "description", "category", "command", "common"}
 
