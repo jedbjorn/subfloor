@@ -153,6 +153,53 @@ class FakeAdapter:
         self.closed += 1
 
 
+class RecoveryExecutionAdapter(FakeAdapter):
+    """Capture the server argv that recovery hands to an adapter."""
+
+    def __init__(self, harness: str) -> None:
+        super().__init__(harness=harness)
+        self.execution_argvs: list[list[str]] = []
+        self.surfaces: list[str | None] = []
+
+    def reconcile(
+        self,
+        turn: NativeTurn,
+        context: ConversationContext,
+    ) -> ReconcileResult:
+        self.execution_argvs.append(
+            context.execution_argv([self.harness, "inspection-server"])
+        )
+        self.surfaces.append(context.env.get("SC_CONVERSATION_SURFACE"))
+        return super().reconcile(turn, context)
+
+
+class RecoveryExecutionPreparer:
+    def __init__(self, worktree: Path, surface: str) -> None:
+        self.worktree = worktree
+        self.surface = surface
+        self.recovered: list[int] = []
+
+    def recovery(self, run: BrokerRun) -> ConversationContext:
+        self.recovered.append(run.run_id)
+        return ConversationContext(
+            worktree=self.worktree,
+            provider=run.provider,
+            model=run.model,
+            effort=run.effort,
+            env={"SC_CONVERSATION_SURFACE": self.surface},
+            conversation_id=run.conversation_id,
+            execution_prefix=("landlock-view", "--"),
+        )
+
+
+class RefusingRecoveryPreparer:
+    def recovery(self, _run: BrokerRun) -> ConversationContext:
+        raise AdapterError(
+            "CONVERSATION_LAUNCH_REFUSED",
+            "restricted execution view preflight failed",
+        )
+
+
 class BarrierAdapter(FakeAdapter):
     """Prove separate instances of one harness can stream concurrently."""
 
@@ -1420,6 +1467,68 @@ class StoreContractTest(ConversationBrokerCase):
 
 
 class ServiceContractTest(ConversationBrokerCase):
+    def _assert_recovery_execution_view(self, harness: str, surface: str) -> None:
+        _conversation_id, _message_id, run_id = self.add_live_run(
+            state="running",
+            session_after=f"{harness}-session",
+            runner_ref=f"{harness}-run",
+            harness=harness,
+        )
+        adapter = RecoveryExecutionAdapter(harness)
+        preparer = RecoveryExecutionPreparer(self.worktree, surface)
+
+        broker = self.start_broker(
+            lambda _harness: adapter,
+            launch_preparer=preparer,
+        )
+
+        self.wait_run_state(run_id, "succeeded")
+        self.assertTrue(broker.wait_idle())
+        self.assertEqual(preparer.recovered, [run_id])
+        self.assertEqual(
+            adapter.execution_argvs,
+            [["landlock-view", "--", harness, "inspection-server"]],
+        )
+        self.assertEqual(adapter.surfaces, [surface])
+        self.assertEqual(adapter.started, 0)
+        self.assertEqual(adapter.resumed, 0)
+
+    def test_browser_codex_recovery_keeps_restricted_server_argv(self) -> None:
+        self._assert_recovery_execution_view("codex", "browser")
+
+    def test_sprint_opencode_recovery_keeps_restricted_server_argv(self) -> None:
+        self._assert_recovery_execution_view("opencode", "sprint")
+
+    def test_recovery_preflight_refusal_prevents_adapter_dispatch(self) -> None:
+        _conversation_id, _message_id, run_id = self.add_live_run(
+            state="running",
+            session_after="native-session",
+            runner_ref="native-run",
+        )
+        adapter = FakeAdapter()
+
+        broker = self.start_broker(
+            lambda _harness: adapter,
+            launch_preparer=RefusingRecoveryPreparer(),
+        )
+
+        self.wait_run_state(run_id, "unknown")
+        self.assertTrue(broker.wait_idle())
+        self.assertEqual(adapter.started, 0)
+        self.assertEqual(adapter.resumed, 0)
+        self.assertEqual(adapter.reconciled, 0)
+        with self.connect() as con:
+            row = con.execute(
+                "SELECT error_code,error_detail FROM conversation_runs "
+                "WHERE run_id=?",
+                (run_id,),
+            ).fetchone()
+        self.assertEqual(row["error_code"], "CONVERSATION_LAUNCH_REFUSED")
+        self.assertEqual(
+            row["error_detail"],
+            "restricted execution view preflight failed",
+        )
+
     def test_routine_dispatch_requires_post_commit_notification(self) -> None:
         adapters: list[FakeAdapter] = []
 
