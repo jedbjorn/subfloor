@@ -1033,17 +1033,13 @@ case "$cmd" in
   job)               exec "$PY" "$S/job.py" "$@" ;;
   # Advisory viewport screenshots for fork apps (CI + local capture + init).
   visual-qa)         exec "$PY" "$S/visual_qa.py" "$@" ;;
-  # Raw read passthrough to the engine + map DBs, resolved by absolute path so no
-  # skill example ever needs a cwd-relative `sqlite3 .super-coder/…` (which pulls a
-  # shell into `cd`-ing to the root — the cwd trap). Read-only is ENFORCED
-  # (sqlite3 -readonly), matching the label: writes go via `sc mem`
-  # (triggers/caps). The -rw variants are the explicit escape hatch for the few
-  # procedures with no dedicated surface (direct skill INSERTs, cartographer
-  # map authoring) — only use one where a skill names it. Skill grants have
-  # their own surface now: `./sc skill`.
-  sql)          exec sqlite3 -readonly "$(sc_engine_db)" "$@" ;;
+  # General engine SQL is an Admin maintenance capability. The helper resolves
+  # the bearer token through the API, with a canonical-DB fallback solely for
+  # API-down host Admin diagnosis; caller-set flavor/path strings never grant it.
+  # Repository-map SQL is separate and retains its Cartographer authority.
+  sql)          exec "$PY" "$S/engine_sql.py" read-only "$@" ;;
   map-sql)      exec sqlite3 -readonly "$(sc_mapdb)" "$@" ;;
-  sql-rw)       exec sqlite3 "$(sc_engine_db)" "$@" ;;
+  sql-rw)       exec "$PY" "$S/engine_sql.py" read-write "$@" ;;
   map-sql-rw)   exec sqlite3 "$(sc_mapdb)" "$@" ;;
   map-schema)   exec "$PY" "$S/map_schema_cli.py" "$@" ;;
   map-extractor) exec "$PY" "$S/map_extractor_install.py" "$@" ;;

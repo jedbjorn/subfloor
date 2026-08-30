@@ -139,7 +139,8 @@
     ".super-coder/migrations/0238_final_schema_rebaseline.sql",
     "docs/deepseek-harness-removal.md",
     ".super-coder/migrations/0239_sprint_spec_rebinding.sql",
-    ".super-coder/migrations/0240_reseed_sprint_spec_rebinding.sql"
+    ".super-coder/migrations/0240_reseed_sprint_spec_rebinding.sql",
+    ".super-coder/migrations/0242_reseed_flag_sweep_delivery_audit.sql"
   ],
   "baseline_migration_ledger": {
     "count": 142,
