@@ -39,6 +39,7 @@ import server  # noqa: E402
 TOKEN = "test-token-deadbeef"
 PEER_TOKEN = "peer-token-cafebabe"   # second shell — cross-shell read coverage
 REVIEW_TOKEN = "review-token-012345"
+PLANNER_TOKEN = "planner-token-6789ab"
 
 
 class MemMessageHelpContractTest(unittest.TestCase):
@@ -94,6 +95,13 @@ def build_engine_db(path: Path) -> None:
         (REVIEW_TOKEN,),
     )
     con.execute(
+        "INSERT INTO shells (shell_id, display_name, shortname, flavor, mandate, "
+        "system_prompt, user_id, is_shared, has_identity, bootstrapped, api_key) "
+        "VALUES (4, 'Planner', 'pln1', 'planner', 'test', 'sp', "
+        "1, 0, 1, 0, ?)",
+        (PLANNER_TOKEN,),
+    )
+    con.execute(
         "INSERT INTO shell_memory_archives (archive_id, shell_id, session_id, date) "
         "VALUES (1, 1, '0001', '2026-01-01')")
     con.execute("UPDATE shells SET active_archive_id=1 WHERE shell_id=1")
@@ -140,9 +148,93 @@ class ApiMemTest(unittest.TestCase):
     def run_mem(self, *argv) -> int:
         return mem.main(list(argv))
 
+    def write(self, sql, *params):
+        con = sqlite3.connect(self.db)
+        try:
+            cur = con.execute(sql, params)
+            con.commit()
+            return cur.lastrowid
+        finally:
+            con.close()
+
     # ── identity comes from the token, not an argument ────────────────────────
     def test_whoami_resolves_token_to_shell(self):
         self.assertEqual(self.run_mem("which"), 0)
+
+    def test_delivery_audit_is_planner_only_and_preserves_dedup(self):
+        implemented = self.write(
+            "INSERT INTO roadmap "
+            "(title,roadmap_status,sort_order,owning_shell,summary) "
+            "VALUES ('audit implemented','in_progress',900,4,'x')"
+        )
+        shipped = self.write(
+            "INSERT INTO roadmap "
+            "(title,roadmap_status,sort_order,owning_shell,summary) "
+            "VALUES ('audit shipped','shipped',901,4,'x')"
+        )
+        covered = self.write(
+            "INSERT INTO roadmap "
+            "(title,roadmap_status,sort_order,owning_shell,summary) "
+            "VALUES ('audit covered','in_progress',902,4,'x')"
+        )
+        for feature in (implemented, covered):
+            document = self.write(
+                "INSERT INTO documents (feature_id,kind,seq,title) "
+                "VALUES (?,'spec',1,?)",
+                feature,
+                f"audit spec {feature}",
+            )
+            self.write(
+                "INSERT INTO spec_tasks "
+                "(shell_id,feature_id,document_id,seq,title,status) "
+                "VALUES (4,?,?,1,'Verification','done')",
+                feature,
+                document,
+            )
+        self.write(
+            "INSERT INTO flags "
+            "(shell_id,display_name,description,priority,feature_id,resolved) "
+            "VALUES (4,'SC-998','[Ship] already handed off','Medium',?,0)",
+            covered,
+        )
+        open_flag = self.write(
+            "INSERT INTO flags "
+            "(shell_id,display_name,description,priority,feature_id,resolved) "
+            "VALUES (4,'SC-999','ordinary blocker','High',?,0)",
+            implemented,
+        )
+
+        saved = mem.SC_API_TOKEN
+        mem.SC_API_TOKEN = PLANNER_TOKEN
+        try:
+            data = mem._api("GET", "/_sc/mem/delivery-audit")
+            self.assertIn(
+                implemented,
+                [row["feature_id"] for row in data["implemented_but_unshipped"]],
+            )
+            self.assertNotIn(
+                covered,
+                [row["feature_id"] for row in data["implemented_but_unshipped"]],
+            )
+            self.assertIn(
+                shipped,
+                [row["feature_id"] for row in data["shipped_but_undocumented"]],
+            )
+            row = next(row for row in data["open_flags"]
+                       if row["flag_id"] == open_flag)
+            self.assertEqual(row["roadmap_status"], "in_progress")
+            self.assertEqual(row["frozen_docs"], 0)
+            self.assertIn("SC-999", data["recent_flag_names"])
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                self.assertEqual(self.run_mem("delivery-audit", "--json"), 0)
+            self.assertIn('"implemented_but_unshipped"', out.getvalue())
+        finally:
+            mem.SC_API_TOKEN = saved
+
+        with self.assertRaises(SystemExit) as caught:
+            self.run_mem("delivery-audit")
+        self.assertIn("planner_only_delivery_audit", str(caught.exception))
 
     def test_write_lands_on_the_token_shell(self):
         self.run_mem("state", "hello state")

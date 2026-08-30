@@ -433,6 +433,58 @@ def get_skills(con) -> dict:
     return {"skills": skills, "shells": get_shells(con), "flavors": flavors}
 
 
+def get_delivery_audit(con) -> dict:
+    """Narrow current-state projection used by Planner's flag sweep."""
+    recent_flag_names = [
+        row["display_name"] for row in rows(con.execute(
+            "SELECT display_name FROM flags "
+            "WHERE display_name IS NOT NULL ORDER BY flag_id DESC LIMIT 5"
+        ))
+    ]
+    open_flags = rows(con.execute(
+        "SELECT f.flag_id, f.display_name, f.priority, f.description, "
+        "f.feature_id, r.title AS feature, r.roadmap_status, "
+        "(SELECT COUNT(*) FROM documents d "
+        " WHERE d.feature_id=f.feature_id AND d.frozen=1) AS frozen_docs "
+        "FROM flags f LEFT JOIN roadmap r ON r.feature_id=f.feature_id "
+        "WHERE COALESCE(f.resolved,0)=0 AND COALESCE(f.is_deleted,0)=0 "
+        "ORDER BY f.priority, f.flag_id"
+    ))
+    implemented = rows(con.execute(
+        "SELECT DISTINCT r.feature_id, r.title, r.roadmap_status "
+        "FROM roadmap r "
+        "JOIN documents d ON d.feature_id=r.feature_id AND d.kind='spec' "
+        "JOIN spec_tasks t ON t.document_id=d.document_id "
+        " AND t.title='Verification' AND t.status='done' "
+        "WHERE r.roadmap_status NOT IN ('shipped','retired') "
+        "AND NOT EXISTS (SELECT 1 FROM flags f "
+        " WHERE f.feature_id=r.feature_id AND COALESCE(f.resolved,0)=0 "
+        " AND COALESCE(f.is_deleted,0)=0 "
+        " AND (f.description LIKE '[Ship]%' OR f.description LIKE '[Docs]%' "
+        " OR f.description LIKE '%not marked shipped%' "
+        " OR f.description LIKE '%doc%pending%')) "
+        "ORDER BY r.feature_id"
+    ))
+    undocumented = rows(con.execute(
+        "SELECT r.feature_id, r.title, r.roadmap_status FROM roadmap r "
+        "WHERE r.roadmap_status='shipped' "
+        "AND NOT EXISTS (SELECT 1 FROM documents d "
+        " WHERE d.feature_id=r.feature_id AND d.frozen=1) "
+        "AND NOT EXISTS (SELECT 1 FROM flags f "
+        " WHERE f.feature_id=r.feature_id AND COALESCE(f.resolved,0)=0 "
+        " AND COALESCE(f.is_deleted,0)=0 "
+        " AND (f.description LIKE '[Docs]%' "
+        " OR f.description LIKE '%doc%pending%')) "
+        "ORDER BY r.feature_id"
+    ))
+    return {
+        "recent_flag_names": recent_flag_names,
+        "open_flags": open_flags,
+        "implemented_but_unshipped": implemented,
+        "shipped_but_undocumented": undocumented,
+    }
+
+
 def get_cli_skills(con) -> dict:
     """Exact read projection used by authenticated ``sc skill list`` calls."""
     skills = rows(con.execute(
@@ -3553,9 +3605,24 @@ class Handler(BaseHTTPRequestHandler):
         try:
             if path == "/_sc/mem/whoami":
                 r = con.execute(
-                    "SELECT shell_id, shortname, display_name FROM shells WHERE shell_id=?",
+                    "SELECT shell_id, shortname, display_name, flavor "
+                    "FROM shells WHERE shell_id=?",
                     (sid,)).fetchone()
                 return self._send(200, dict(r) if r else {"shell_id": sid})
+
+            if path == "/_sc/mem/delivery-audit":
+                actor = con.execute(
+                    "SELECT flavor FROM shells WHERE shell_id=? "
+                    "AND COALESCE(is_deleted,0)=0",
+                    (sid,),
+                ).fetchone()
+                if actor is None or actor[0] != "planner":
+                    return self._send(403, {"error": {
+                        "code": "planner_only_delivery_audit",
+                        "message": "delivery audit is available only to Planner",
+                        "details": {},
+                    }})
+                return self._send(200, get_delivery_audit(con))
 
             if path == "/_sc/mem/state":
                 r = con.execute("SELECT current_state FROM shells WHERE shell_id=?",

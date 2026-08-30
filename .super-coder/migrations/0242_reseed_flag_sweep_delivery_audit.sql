@@ -1,17 +1,19 @@
----
-name: flag_sweep
-description: Planner-owned periodic or on-demand delivery reconciliation — auto-close flags whose gating work is provably done, open missing ship/docs handoffs, and surface judgment calls to the FnB. Use for a requested sweep or when delivery state needs reconciliation.
-category: substrate
-common: false
----
+-- 0242 — publish flag_sweep's Planner-only bounded delivery-audit client.
 
-# flag_sweep — reconcile flags against state
+BEGIN;
+
+UPDATE skills SET
+  description='Planner-owned periodic or on-demand delivery reconciliation — auto-close flags whose gating work is provably done, open missing ship/docs handoffs, and surface judgment calls to the FnB. Use for a requested sweep or when delivery state needs reconciliation.',
+  category='substrate',
+  command=NULL,
+  common=0,
+  content='# flag_sweep — reconcile flags against state
 
 Planner-owned. Run periodically or when the FnB asks for delivery-state
 reconciliation; never make it a boot ritual. Working shells close the flags
 their own work clears (boot doc, "Finish before you stop"); this sweep is the
 backstop for dropped handoffs + shipped work nobody documented. Two directions:
-close what's provably resolved, open what's provably missing.
+close what''s provably resolved, open what''s provably missing.
 
 ---
 
@@ -22,8 +24,8 @@ Run `sc mem delivery-audit`. The Planner-only API response contains
 `shipped_but_undocumented`. It preserves the deterministic queries and dedup
 guards below without granting arbitrary engine SQL.
 
-`frozen_docs` counts ANY frozen document on the feature — kind='spec' AND
-kind='doc' both qualify (#319: forks that freeze kind='doc' rows for shipped
+`frozen_docs` counts ANY frozen document on the feature — kind=''spec'' AND
+kind=''doc'' both qualify (#319: forks that freeze kind=''doc'' rows for shipped
 docs got false "undocumented" positives every sweep under a spec-only count).
 
 Sort every open flag into exactly one bucket (Step 2 / Step 4). Auto-close
@@ -44,7 +46,7 @@ sc mem flag close <flag_id> --notes "Auto: frozen spec doc now exists for featur
 ```
 
 **B. Ship-blocker, feature now shipped** = flag of the form
-`… | Blocker for: <X>` + linked feature's `roadmap_status` is `shipped` (or
+`… | Blocker for: <X>` + linked feature''s `roadmap_status` is `shipped` (or
 later) + the flag text is about that feature shipping / becoming available. A
 separate concern that merely hangs off the same feature does NOT qualify:
 ```
@@ -73,7 +75,7 @@ apply. Pick `SC-###` from the highest numbered value in `recent_flag_names`.
 ### 3A — Implemented but not marked shipped (ship-drift)
 
 The dev flips the horizon to `shipped` when Verification passes (`spec` skill,
-hand-off step) — the flip sometimes gets missed. Deterministic signal = spec's
+hand-off step) — the flip sometimes gets missed. Deterministic signal = spec''s
 **Verification task `done`** + feature **not** `shipped`. Open a durable
 `[Ship]` flag — it governs both halves of the dropped hand-off (mark shipped +
 reconcile the doc to the spec) and stays open until a planner does both.
@@ -83,7 +85,7 @@ whose Verification task is done, whose feature is not shipped/retired, and
 whose open `[Ship]`/`[Docs]` or organic ship/docs-pending handoff does not
 already cover the feature.
 
-Per row, open the flag in Planner's own queue. Do not message yourself:
+Per row, open the flag in Planner''s own queue. Do not message yourself:
 
 ```
 sc mem flag open "[Ship] <title> implemented, not marked shipped | Blocker for: <title> ship + doc" --name SC-### --priority Medium --feature <feature_id>
@@ -93,7 +95,7 @@ sc mem flag open "[Ship] <title> implemented, not marked shipped | Blocker for: 
 
 Devs open a docs-pending flag when they ship — sometimes skipped. Find
 `shipped` features with no frozen doc + no open docs-pending flag; open one
-per row. (Finished-but-not-shipped is 3A's job, not this one.)
+per row. (Finished-but-not-shipped is 3A''s job, not this one.)
 
 Use the `shipped_but_undocumented` rows. The projection includes only shipped
 features with no frozen document and no open `[Docs]` or organic docs-pending
@@ -101,13 +103,13 @@ handoff.
 
 The dedup guards match the `[Docs]`/`[Ship]` tag at position zero FIRST — the
 templates below mint "doc pending" (singular) and legacy hand-written flags say
-"feature doc pending", so a prose-only `'%docs pending%'` pattern matched
+"feature doc pending", so a prose-only `''%docs pending%''` pattern matched
 neither and every later sweep re-listed already-flagged rows (found session
-ADM1/0003, seven covered rows re-surfaced). The `'%doc%pending%'` fallback
+ADM1/0003, seven covered rows re-surfaced). The `''%doc%pending%''` fallback
 catches untagged organic wordings; its over-breadth only ever SKIPS an open —
 the conservative direction.
 
-Per row, open the flag in Planner's own queue. Do not message yourself:
+Per row, open the flag in Planner''s own queue. Do not message yourself:
 
 ```
 sc mem flag open "[Docs] <title> shipped, doc pending | Blocker for: <title> doc" --name SC-### --priority Medium --feature <feature_id>
@@ -115,14 +117,14 @@ sc mem flag open "[Docs] <title> shipped, doc pending | Blocker for: <title> doc
 
 ---
 
-## Step 4: Surface the rest — don't guess
+## Step 4: Surface the rest — don''t guess
 
-Everything that isn't a clean Step-2 close / Step-3 open -> short list to the
+Everything that isn''t a clean Step-2 close / Step-3 open -> short list to the
 FnB (no `send` unless a specific shell owns it): review-failure flags (author
 dev closes those when the fix lands), FnB-decision flags, blockers whose
-resolution you can't verify from state, anything ambiguous. One line each:
+resolution you can''t verify from state, anything ambiguous. One line each:
 
-> `SC-042` [High] — <description> · feature #N at <status> · *why I didn't auto-act*
+> `SC-042` [High] — <description> · feature #N at <status> · *why I didn''t auto-act*
 
 The FnB or the owning shell closes these with a real note. Auto-act ONLY on
 unambiguous evidence.
@@ -134,9 +136,13 @@ unambiguous evidence.
 - **Deterministic-only auto-close.** Evidence in the DB + cited in the note,
   or it surfaces. A wrongly-closed live blocker is worse than a straggler.
 - **Backstop, not owner.** The shell that did the work closes its own flag
-  with the richer "how" note; don't race to close a flag whose owner is still
+  with the richer "how" note; don''t race to close a flag whose owner is still
   active on that feature.
 - **Both directions, every sweep.** An implemented-but-unshipped spec and an
   undocumented shipped feature are dropped handoffs; the signal is already in
   the DB (a `done` Verification task, a missing frozen doc) — surfacing them
-  is deterministic.
+  is deterministic.',
+  is_deleted=0
+WHERE name='flag_sweep';
+
+COMMIT;

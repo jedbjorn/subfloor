@@ -605,13 +605,15 @@ class SeedSkillsRunsCallerSourceTest(WorktreeFixture):
 
 class LiveSurfacesStillResolveTest(WorktreeFixture):
     """Requirement 4: the shared-runtime surfaces keep reaching the shared
-    runtime. The refusal is for commands that MUTATE live state, and a guard
-    that swallowed `mem`/`sql`/`map-sql` would strand every shell."""
+    runtime. Memory stays API-backed, general engine SQL is Admin-only, and
+    repository-map SQL remains a separate catalogue authority."""
 
-    def test_sql_from_the_worktree_reads_the_live_instance_database(self):
+    def test_unidentified_sql_from_the_worktree_refuses_without_a_result(self):
         done = run_sc(self.wt, "sql", "SELECT who FROM live_marker;")
-        self.assertEqual(done.returncode, 0, done.stderr)
-        self.assertIn("LIVE-INSTANCE-DB", done.stdout)
+        self.assertEqual(done.returncode, 1)
+        self.assertEqual(done.stdout, "")
+        self.assertIn("admin_only_engine_state", done.stderr)
+        self.assertNotIn("LIVE-INSTANCE-DB", done.stderr)
 
     def test_map_sql_from_the_worktree_reads_the_live_catalogue(self):
         mapdb = subprocess.run(

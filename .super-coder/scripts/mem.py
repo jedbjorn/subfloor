@@ -66,6 +66,7 @@ Run from the repo root, like every engine command:
     ./sc mem doc freeze <document_id>
     ./sc mem doc qaqc <spec_document_id> --verdict approved|changes_requested [--findings-doc ID]
     ./sc mem narrative "<line>"
+    ./sc mem delivery-audit          [--json]      # Planner-only bounded delivery reconciliation
     ./sc mem message check [N]                         # your unread inbox (read-only)
     ./sc mem message send <to-shortname> "<body>" [--kind shell|task|result]
     ./sc mem message sent                              # outbound view — verify delivery
@@ -339,6 +340,26 @@ def cmd_which(args) -> int:
         print(f"credential : discovered from runtime artifact {_DISCOVERED_FROM}")
     else:
         print("identity   : resolved by the engine for this launched shell, server-side")
+    return 0
+
+
+def cmd_delivery_audit(args) -> int:
+    data = _api("GET", "/_sc/mem/delivery-audit")
+    if args.json:
+        print(json.dumps(data, indent=2, default=str))
+        return 0
+    print("recent flag names: " + (
+        ", ".join(data.get("recent_flag_names", [])) or "(none)"
+    ))
+    sections = (
+        ("open flags", "open_flags"),
+        ("implemented but unshipped", "implemented_but_unshipped"),
+        ("shipped but undocumented", "shipped_but_undocumented"),
+    )
+    for label, key in sections:
+        print(f"{label}: {len(data.get(key, []))}")
+        for row in data.get(key, []):
+            print("  " + json.dumps(row, sort_keys=True, default=str))
     return 0
 
 
@@ -948,6 +969,13 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub.add_parser("which", help="confirm the memory API is reachable + which shell this session resolves as") \
        .set_defaults(fn=cmd_which)
+
+    sp = sub.add_parser(
+        "delivery-audit",
+        help="Planner-only bounded delivery-reconciliation projection",
+    )
+    sp.add_argument("--json", action="store_true", help="raw JSON")
+    sp.set_defaults(fn=cmd_delivery_audit)
 
     sp = sub.add_parser("get", help=f"read a memory surface ({'/'.join(GET_SURFACES)}; doc/docs = documents)")
     sp.add_argument("surface", choices=GET_SURFACES,

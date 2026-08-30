@@ -1,0 +1,97 @@
+"""Authorization contract for Admin-only general engine SQL."""
+from __future__ import annotations
+
+import os
+import sqlite3
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+from unittest import mock
+
+ENGINE = Path(__file__).resolve().parents[1] / ".super-coder"
+sys.path.insert(0, str(ENGINE / "scripts"))
+import engine_sql
+
+
+class EngineSqlTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.db = Path(self.tmp.name) / "engine.db"
+        con = sqlite3.connect(self.db)
+        con.execute(
+            "CREATE TABLE shells (api_key TEXT, flavor TEXT, is_deleted INTEGER)"
+        )
+        con.execute(
+            "INSERT INTO shells VALUES ('admin-token','admin',0)"
+        )
+        con.execute(
+            "INSERT INTO shells VALUES ('dev-token','dev',0)"
+        )
+        con.commit()
+        con.close()
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _path(self):
+        return mock.patch.object(
+            engine_sql.instance_state, "active_database_path",
+            return_value=self.db,
+        )
+
+    def test_api_down_admin_keeps_read_only_diagnosis(self):
+        completed = mock.Mock(returncode=0)
+        env = {
+            "SC_API_TOKEN": "admin-token",
+            "SC_API_BASE": "http://127.0.0.1:1",
+            "SC_SHELL_FLAVOR": "dev",
+            "SC_ROOT": "/attacker/path",
+            "SC_ENGINE_DIR": "/attacker/engine",
+        }
+        with mock.patch.dict(os.environ, env, clear=True), self._path(), \
+             mock.patch.object(engine_sql, "_api_flavor", return_value=None), \
+             mock.patch.object(engine_sql.shutil, "which", return_value="/bin/sqlite3"), \
+             mock.patch.object(engine_sql.subprocess, "run", return_value=completed) as run:
+            self.assertEqual(engine_sql.main(["read-only", "SELECT 1;"]), 0)
+        self.assertEqual(
+            run.call_args.args[0],
+            ["/bin/sqlite3", "-readonly", str(self.db), "SELECT 1;"],
+        )
+
+    def test_non_admin_refuses_before_query_even_when_flavor_is_spoofed(self):
+        env = {
+            "SC_API_TOKEN": "dev-token",
+            "SC_API_BASE": "http://127.0.0.1:8837",
+            "SC_SHELL_FLAVOR": "admin",
+        }
+        with mock.patch.dict(os.environ, env, clear=True), \
+             mock.patch.object(engine_sql, "_api_flavor", return_value="dev"), \
+             mock.patch.object(
+                 engine_sql.instance_state,
+                 "active_database_path",
+                 side_effect=AssertionError("DB path must not be resolved"),
+             ), self.assertRaises(SystemExit) as caught:
+            engine_sql.main(["read-only", "SELECT secret FROM shells;"])
+        self.assertIn(engine_sql.ERROR_CODE, str(caught.exception))
+
+    def test_api_down_local_non_admin_is_still_refused(self):
+        with mock.patch.dict(
+            os.environ,
+            {"SC_API_TOKEN": "dev-token", "SC_SHELL_FLAVOR": "admin"},
+            clear=True,
+        ), self._path(), \
+             mock.patch.object(engine_sql, "_api_flavor", return_value=None), \
+             self.assertRaises(SystemExit) as caught:
+            engine_sql.main(["read-write", "DELETE FROM shells;"])
+        self.assertIn(engine_sql.ERROR_CODE, str(caught.exception))
+
+    def test_missing_identity_does_not_adopt_an_admin_credential(self):
+        with mock.patch.dict(os.environ, {}, clear=True), \
+             self.assertRaises(SystemExit) as caught:
+            engine_sql.main(["read-only", "SELECT 1;"])
+        self.assertIn(engine_sql.ERROR_CODE, str(caught.exception))
+
+
+if __name__ == "__main__":
+    unittest.main()

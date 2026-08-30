@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
 """`./sc skill` — the explicit write surface for the skill catalogue (#237).
 
-Skill grants used to live only as raw SQL blocks inside the
-local_skill_management skill, executable solely through the `sc sql-rw`
-escape hatch — and a grant whose skill name didn't resolve was a SILENT
-no-op (`INSERT ... SELECT` over zero rows, #253). This surface makes the
+Skill grants used to live only as raw SQL blocks, where a grant whose skill
+name didn't resolve was a SILENT no-op (`INSERT ... SELECT` over zero rows,
+#253). This surface makes the
 lifecycle first-class and loud: unknown skill or shell names are hard
 errors, engine skills refuse `rm` (the seed would just resurrect them),
 and every supported mutation persists the local snapshot and projections.
