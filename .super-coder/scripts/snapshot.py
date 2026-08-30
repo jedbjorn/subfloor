@@ -566,7 +566,11 @@ def main() -> int:
         except OSError:
             pass
         print(f"snapshot: removed legacy {LEGACY_PATH.relative_to(REPO_ROOT)}")
-    print(f"snapshot: wrote {OUT_PATH.relative_to(REPO_ROOT)}")
+    try:
+        displayed = OUT_PATH.relative_to(REPO_ROOT)
+    except ValueError:
+        displayed = OUT_PATH
+    print(f"snapshot: wrote {displayed}")
     snapshot_map()
     return 0
 

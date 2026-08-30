@@ -1806,7 +1806,11 @@ def set_flavor_grant(con, flavor, skill_id, granted) -> tuple[bool, str | None]:
 # the GUI passes only a registry KEY, never a command, so nothing arbitrary runs.
 # Order = display order; `danger` ones prompt for confirmation in the UI.
 _PY = sys.executable
-_ARTIFACT_DEST = artifact_policy.content_path().relative_to(REPO_ROOT)
+_artifact_path = artifact_policy.content_path()
+try:
+    _ARTIFACT_DEST = _artifact_path.relative_to(REPO_ROOT)
+except ValueError:
+    _ARTIFACT_DEST = "the private instance snapshot"
 _SCRIPTS = {
     "snapshot": ("Snapshot", f"Serialize the per-instance tables → {_ARTIFACT_DEST} "
                  "(deterministic, idempotent). Run after editing identity, roadmap, "

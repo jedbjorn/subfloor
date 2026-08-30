@@ -74,6 +74,11 @@ class InstanceState:
     def recovery_evidence(self) -> Path:
         return self.root / "recovery"
 
+    @property
+    def removal_backups(self) -> Path:
+        """Preserved removal evidence outside the deletable live-state root."""
+        return self.root.parent / f"{self.instance_id}.removed" / "db_backups"
+
 
 @dataclass(frozen=True)
 class StateConsumer:
@@ -187,6 +192,7 @@ PRODUCTION_CONSUMERS = (
             ".super-coder/scripts/map_db.py",
             ".super-coder/scripts/map_repo.py",
             ".super-coder/scripts/render_check.py",
+            ".super-coder/scripts/state_relocation.py",
         ),
         "legacy fallback classification and candidate-only verification",
     ),
@@ -537,23 +543,59 @@ def active_database_path(
     *,
     private_state: InstanceState | None = None,
 ) -> Path:
-    """Return the one effective live DB target for the current engine floor.
+    """Return the only authoritative live DB target.
 
-    WU141 establishes this production seam without activating private state.
-    Spec #133 must supply a stopped runtime, exclusive maintenance lease,
-    WAL-safe backup, and deterministic recovery before a later unit can pass a
-    private target here.  Until then, even a fully validated ``InstanceState``
-    is refused rather than selected.
+    A caller may inject a validated state object in tests/maintenance code.
+    Production activation is otherwise derived from the owner-local instance
+    identity and a durable relocation receipt.  A fresh bound installation
+    selects private state before its first DB is built.  Two complete copies
+    without a receipt are never guessed between.
     """
-    _refuse_private_activation(private_state)
+    engine = Path(engine)
+    legacy = legacy_database_path(engine)
+    state = private_state or _bound_private_state(engine)
+    if state is None:
+        return legacy
+    receipt = _relocation_receipt(state)
+    if receipt is not None and receipt["status"] in {"publishing", "private"}:
+        return state.database
+    if legacy.exists() and state.database.exists():
+        raise MaintenanceCutoverRequired(
+            "conflicting legacy and private engine databases require Admin recovery"
+        )
+    if legacy.exists():
+        return legacy
+    return state.database
+
+
+def legacy_database_path(engine: Path) -> Path:
+    """Return the migration-only historical DB target."""
     return Path(engine) / "shell_db.db"
 
 
-def _refuse_private_activation(private_state: InstanceState | None) -> None:
-    if private_state is not None:
-        raise MaintenanceCutoverRequired(
-            "private engine state requires the spec #133 maintenance cutover"
-        )
+def _bound_private_state(engine: Path) -> InstanceState | None:
+    config = engine / "instance.json"
+    if not (config.exists() or config.is_symlink()):
+        return None
+    try:
+        return resolve(instance_config=config, create=False)
+    except InstanceStateError as exc:
+        if "does not exist" in str(exc) or "has no instance ID" in str(exc):
+            return None
+        raise
+
+
+def _relocation_receipt(state: InstanceState) -> dict | None:
+    path = state.relocation_receipt
+    if not (path.exists() or path.is_symlink()):
+        return None
+    _lstat_owned_regular(path, "relocation receipt", os.geteuid())
+    payload = _load_json_object(path, "relocation receipt")
+    if payload.get("instance_id") != state.instance_id:
+        raise InstanceStateError("relocation receipt names a different instance")
+    if payload.get("status") not in {"publishing", "private", "legacy"}:
+        raise InstanceStateError("relocation receipt has an invalid status")
+    return payload
 
 
 def active_snapshot_path(
@@ -561,9 +603,14 @@ def active_snapshot_path(
     *,
     private_state: InstanceState | None = None,
 ) -> Path:
-    """Return the effective snapshot path without activating private state."""
-    _refuse_private_activation(private_state)
-    return Path(repo_root) / ".sc-state" / "local" / "content.sql"
+    """Return the snapshot paired with the authoritative database."""
+    root = Path(repo_root)
+    state = private_state or _bound_private_state(root / ".super-coder")
+    if state is not None and active_database_path(
+        root / ".super-coder", private_state=state
+    ) == state.database:
+        return state.snapshot
+    return root / ".sc-state" / "local" / "content.sql"
 
 
 def active_snapshot_lock_path(
@@ -572,8 +619,13 @@ def active_snapshot_lock_path(
     private_state: InstanceState | None = None,
 ) -> Path:
     """Return the lock paired with the effective snapshot path."""
-    _refuse_private_activation(private_state)
-    return Path(repo_root) / ".sc-state" / "local" / ".content-write.lock"
+    root = Path(repo_root)
+    state = private_state or _bound_private_state(root / ".super-coder")
+    if state is not None and active_database_path(
+        root / ".super-coder", private_state=state
+    ) == state.database:
+        return state.snapshot_lock
+    return root / ".sc-state" / "local" / ".content-write.lock"
 
 
 def active_backup_paths(
@@ -582,10 +634,19 @@ def active_backup_paths(
     *,
     private_state: InstanceState | None = None,
 ) -> ActiveBackupPaths:
-    """Return ordered pre-cutover backup paths through one activation seam."""
-    _refuse_private_activation(private_state)
+    """Return ordered backup paths paired with the authoritative database."""
     env = os.environ if environ is None else environ
     root = Path(repo_root)
+    state = private_state or _bound_private_state(root / ".super-coder")
+    if state is not None and active_database_path(
+        root / ".super-coder", private_state=state
+    ) == state.database:
+        configured = env.get("SC_DB_BACKUP_DIR", "").strip()
+        return ActiveBackupPaths(
+            override=Path(configured).expanduser() if configured else None,
+            home=state.backups,
+            local=state.backups,
+        )
     home = Path(env.get("HOME") or Path.home()).expanduser()
     configured = env.get("SC_DB_BACKUP_DIR", "").strip()
     return ActiveBackupPaths(
@@ -593,6 +654,21 @@ def active_backup_paths(
         home=home / "db_backups" / root.name,
         local=root / ".sc-state" / "db_backups",
     )
+
+
+def removal_backup_root(
+    repo_root: Path,
+    *,
+    private_state: InstanceState | None = None,
+) -> Path:
+    """Return a preserved backup root outside a private live-state deletion."""
+    root = Path(repo_root)
+    state = private_state or _bound_private_state(root / ".super-coder")
+    if state is not None and active_database_path(
+        root / ".super-coder", private_state=state
+    ) == state.database:
+        return state.removal_backups
+    return root / ".sc-state" / "db_backups"
 
 
 def production_consumer_inventory() -> tuple[StateConsumer, ...]:

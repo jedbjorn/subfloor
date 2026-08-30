@@ -42,6 +42,7 @@ import db_backup
 import engine_manifest
 import install
 import instance_state
+import state_relocation
 import sandbox_devkit
 import sc_wrapper
 
@@ -177,7 +178,10 @@ def show_plan(
     print("subfloor remove — teardown plan")
     print(f"  repository : {repo_root}")
     print(f"  database   : {database if database.exists() else '(no live DB)'}")
-    print(f"  backups    : {BACKUP_ROOT}/<UTC timestamp>/")
+    print(
+        "  backups    : "
+        f"{instance_state.removal_backup_root(repo_root) / 'removal'}/<UTC timestamp>/"
+    )
     print(f"  worktrees  : {len(worktrees)} clean managed worktree(s)")
     if edits or added:
         print(f"  engine drift: {len(edits)} changed + {len(added)} added file(s)")
@@ -221,7 +225,13 @@ def ensure_backup_ignore(repo_root: Path) -> None:
 
 
 def new_backup_dir(repo_root: Path) -> Path:
-    root = instance_state.active_backup_paths(repo_root).local / "removal"
+    private_state = instance_state._bound_private_state(repo_root / ".super-coder")
+    if private_state is not None and instance_state.active_database_path(
+        repo_root / ".super-coder", private_state=private_state
+    ) == private_state.database:
+        root = state_relocation.prepare_removal_archive(private_state) / "removal"
+    else:
+        root = instance_state.removal_backup_root(repo_root) / "removal"
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
     destination = root / stamp
     destination.mkdir(parents=True, mode=0o700)
@@ -606,7 +616,9 @@ def main(argv: list[str]) -> int:
     data: dict | None = None
     try:
         repo_root = validate_target()
-        database = instance_state.active_database_path(repo_root / ".super-coder")
+        engine = repo_root / ".super-coder"
+        private_state = instance_state._bound_private_state(engine)
+        database = instance_state.active_database_path(engine)
         worktrees = managed_worktrees(repo_root)
         dirty = dirty_worktrees(worktrees)
         if dirty:
@@ -648,6 +660,14 @@ def main(argv: list[str]) -> int:
         removed, preserved = remove_installation(repo_root)
         data["removed"].extend(removed)
         data["preserved"].extend(preserved)
+        if private_state is not None and database == private_state.database:
+            if _backup is None:
+                raise RemoveError("private live state disappeared before removal")
+            state_relocation.remove_private_state(
+                private_state,
+                verified_backup=_backup,
+            )
+            data["removed"].append(str(private_state.root))
         remaining = verify_removed(repo_root)
         if remaining:
             data["status"] = "partial"

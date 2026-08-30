@@ -57,8 +57,13 @@ class UpdateServiceCutoverTest(unittest.TestCase):
             update, "stop_pm2_review_server",
             side_effect=lambda: order.append("stop-old") or service,
         ), mock.patch.object(
+            update.state_relocation,
+            "relocate_legacy_state",
+            side_effect=lambda *_args, **_kwargs: order.append("relocate")
+            or mock.Mock(database=update.DB_PATH),
+        ), mock.patch.object(
             update, "migrate_or_rebuild",
-            side_effect=lambda: order.append("migrate"),
+            side_effect=lambda **_kwargs: order.append("migrate"),
         ), mock.patch.object(
             update, "start_pm2_review_server",
             side_effect=lambda value: order.append(("start-new", value)),
@@ -66,7 +71,7 @@ class UpdateServiceCutoverTest(unittest.TestCase):
             update.migrate_with_service_cutover()
         self.assertEqual(
             order,
-            ["stop-old", "migrate", ("start-new", service)],
+            ["stop-old", "relocate", "migrate", ("start-new", service)],
         )
 
     def test_migration_failure_never_restarts_incompatible_old_code(self):
@@ -74,6 +79,10 @@ class UpdateServiceCutoverTest(unittest.TestCase):
         with mock.patch.object(
             update, "stop_pm2_review_server", return_value=service
         ) as stop, mock.patch.object(
+            update.state_relocation,
+            "relocate_legacy_state",
+            return_value=mock.Mock(database=update.DB_PATH),
+        ), mock.patch.object(
             update, "migrate_or_rebuild", side_effect=RuntimeError("migration failed")
         ), mock.patch.object(update, "start_pm2_review_server") as start, \
                 self.assertRaisesRegex(RuntimeError, "migration failed"):

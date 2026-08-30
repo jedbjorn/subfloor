@@ -56,6 +56,7 @@ import importlib.util
 import os
 import re
 import shutil
+import sqlite3
 import subprocess
 import sys
 from pathlib import Path
@@ -80,6 +81,7 @@ import rebuild as rebuild_mod  # noqa: E402
 import seed_skills  # noqa: E402
 import shell_factory  # noqa: E402
 import skill_projection  # noqa: E402
+import state_relocation  # noqa: E402
 sys.path.insert(0, str(ENGINE / "render"))
 import flat  # noqa: E402
 
@@ -1063,11 +1065,30 @@ def start_pm2_review_server(service: tuple[str, str] | None) -> None:
 
 
 def migrate_with_service_cutover(*, backup: bool = True) -> None:
+    global DB_PATH
     service = stop_pm2_review_server()
-    if backup:
-        migrate_or_rebuild()
-    else:
-        migrate_or_rebuild(backup=False)
+    legacy_was_present = instance_state.legacy_database_path(ENGINE).exists()
+    try:
+        relocation = state_relocation.relocate_legacy_state(
+            ENGINE,
+            command="update",
+        )
+    except (
+        state_relocation.RelocationError,
+        instance_state.InstanceStateError,
+        sqlite3.Error,
+    ) as exc:
+        sys.exit(
+            "update: private-state relocation refused; runtime remains stopped: "
+            f"{exc}\n  inspect: ./sc health\n  retry:   ./sc update\n"
+            "  recover: ./sc rollback"
+        )
+    DB_PATH = relocation.database
+    rebuild_mod.DB_PATH = DB_PATH
+    rebuild_mod.SNAPSHOT = instance_state.active_snapshot_path(REPO_ROOT)
+    # A legacy relocation already created and verified the one preupdate
+    # restore point.  An already-private update retains the ordinary backup.
+    migrate_or_rebuild(backup=backup and not legacy_was_present)
     # Deliberately not in finally: a failed destructive migration must leave
     # the old server stopped instead of restarting code against a changed or
     # incompatible floor.

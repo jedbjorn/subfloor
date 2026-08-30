@@ -56,6 +56,23 @@ def read_db(path: Path) -> str:
 
 
 class HalfFloorRollbackTest(unittest.TestCase):
+    def test_old_floor_reconstruction_uses_private_state_only_when_required(self):
+        state = mock.Mock(database=Path("/private/shell_db.db"))
+        with mock.patch.object(
+            rollback.instance_state, "_bound_private_state", return_value=state
+        ), mock.patch.object(
+            rollback, "DB_PATH", state.database
+        ), mock.patch.object(
+            rollback, "previous_floor_supports_private_state", return_value=False
+        ), mock.patch.object(
+            rollback.state_relocation,
+            "restore_legacy_for_old_floor",
+            return_value=Path("/repo/.super-coder/shell_db.db"),
+        ) as restore, contextlib.redirect_stdout(io.StringIO()):
+            rollback.reconstruct_legacy_if_required("old-ref")
+
+        restore.assert_called_once_with(rollback.ENGINE, state=state)
+
     def test_current_subset_and_previous_superset_fallbacks_reduce_delta(self):
         with tempfile.TemporaryDirectory() as raw_tmp:
             root = Path(raw_tmp)

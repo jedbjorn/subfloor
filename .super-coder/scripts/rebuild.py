@@ -28,6 +28,7 @@ import backfill_shell_api_keys  # noqa: E402  (re-provision api_keys post-rebuil
 import db_backup as db_backup_mod  # noqa: E402
 import db_driver  # noqa: E402
 import instance_state  # noqa: E402
+import state_relocation  # noqa: E402
 import map_repo  # noqa: E402
 import migrate as migrate_mod  # noqa: E402
 import seed_skills  # noqa: E402  (re-assert the fork retire list post-seed)
@@ -76,6 +77,13 @@ def snapshot_path() -> Path:
         return SNAPSHOT
     tracked = REPO_ROOT / ".sc-state" / "content.sql"
     return tracked if tracked.exists() else SNAPSHOT_LEGACY
+
+
+def display_path(path: Path) -> str:
+    try:
+        return str(path.relative_to(REPO_ROOT))
+    except ValueError:
+        return str(path)
 
 
 def read_existing_keys(db_path: Path | None = None) -> dict:
@@ -288,11 +296,11 @@ def main(argv: list[str]) -> int:
             try:
                 con.executescript(snap.read_text())
                 con.commit()
-                print(f"rebuild: loaded {snap.relative_to(REPO_ROOT)}")
+                print(f"rebuild: loaded {display_path(snap)}")
             finally:
                 con.close()
         else:
-            print(f"rebuild: no {SNAPSHOT.relative_to(REPO_ROOT)} — built empty "
+            print(f"rebuild: no {display_path(SNAPSHOT)} — built empty "
                   "(no per-instance content).")
 
         # A snapshot from before immutable governing bodies omits the new
@@ -352,6 +360,10 @@ def main(argv: list[str]) -> int:
     for suffix in ("-wal", "-shm"):
         Path(str(candidate) + suffix).unlink(missing_ok=True)
 
+    private_state = instance_state._bound_private_state(ENGINE)
+    if private_state is not None and DB_PATH == private_state.database:
+        state_relocation.ensure_database_generation(private_state)
+
     try:
         map_repo.main()
     except SystemExit as e:
@@ -360,7 +372,7 @@ def main(argv: list[str]) -> int:
         print(f"rebuild: map failed ({e}) — run `./sc map`")
 
     size_kb = DB_PATH.stat().st_size / 1024
-    print(f"rebuild: done -> {DB_PATH.relative_to(ENGINE.parent)} ({size_kb:.0f} KB)")
+    print(f"rebuild: done -> {display_path(DB_PATH)} ({size_kb:.0f} KB)")
     return 0
 
 
