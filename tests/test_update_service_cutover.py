@@ -22,6 +22,115 @@ class Stop(Exception):
 
 
 class UpdateServiceCutoverTest(unittest.TestCase):
+    def assert_restart_failure_stops_all(
+        self,
+        *,
+        pm2: bool,
+        docker: bool,
+        docker_start_fails: bool = False,
+    ) -> None:
+        pm2_service = ("/usr/bin/pm2", "sc-example") if pm2 else None
+        docker_service = ("/usr/bin/docker", "sc-example") if docker else None
+        running = set()
+        stopped = []
+
+        def start_pm2(service):
+            if service is not None:
+                running.add("PM2")
+
+        def start_docker(service):
+            if service is None:
+                return
+            if docker_start_fails:
+                raise SystemExit("injected Docker start failure")
+            running.add("Docker")
+
+        def stop_restarted(label, _service):
+            running.discard(label)
+            stopped.append(label)
+            return None
+
+        health_failure = mock.Mock(
+            side_effect=SystemExit("injected readiness failure")
+        )
+        with mock.patch.object(
+            update, "stop_pm2_review_server", return_value=pm2_service
+        ), mock.patch.object(
+            update, "stop_docker_review_server", return_value=docker_service
+        ), mock.patch.object(
+            update.instance_state, "resolve", return_value=mock.Mock()
+        ), mock.patch.object(
+            update.instance_state,
+            "active_database_path",
+            return_value=update.DB_PATH,
+        ), mock.patch.object(
+            update.state_relocation,
+            "exclusive_maintenance",
+            return_value=contextlib.nullcontext(),
+        ), mock.patch.object(
+            update.state_relocation,
+            "relocate_legacy_state",
+            return_value=mock.Mock(database=update.DB_PATH),
+        ), mock.patch.object(
+            update, "bind_cutover_state"
+        ), mock.patch.object(
+            update, "migrate_or_rebuild"
+        ), mock.patch.object(
+            update, "start_pm2_review_server", side_effect=start_pm2
+        ), mock.patch.object(
+            update, "start_docker_review_server", side_effect=start_docker
+        ), mock.patch.object(
+            update, "require_restarted_runtime_health", health_failure
+        ), mock.patch.object(
+            update, "_stop_restarted_runtime", side_effect=stop_restarted
+        ), self.assertRaisesRegex(
+            SystemExit,
+            "all managed runtimes are stopped.*private state remains authoritative",
+        ):
+            update.migrate_with_service_cutover()
+
+        self.assertEqual(running, set())
+        expected = [label for label, present in (
+            ("Docker", docker), ("PM2", pm2)
+        ) if present]
+        self.assertEqual(stopped, expected)
+        if docker_start_fails:
+            health_failure.assert_not_called()
+        else:
+            health_failure.assert_called_once_with()
+
+    def test_pm2_is_stopped_when_later_docker_start_fails(self):
+        self.assert_restart_failure_stops_all(
+            pm2=True, docker=True, docker_start_fails=True
+        )
+
+    def test_both_runtimes_stop_when_final_health_fails(self):
+        self.assert_restart_failure_stops_all(pm2=True, docker=True)
+
+    def test_pm2_only_runtime_stops_when_final_health_fails(self):
+        self.assert_restart_failure_stops_all(pm2=True, docker=False)
+
+    def test_docker_only_runtime_stops_when_final_health_fails(self):
+        self.assert_restart_failure_stops_all(pm2=False, docker=True)
+
+    def test_shutdown_failure_is_named_instead_of_claiming_stopped(self):
+        service = ("/usr/bin/pm2", "sc-example")
+        with mock.patch.object(
+            update, "start_pm2_review_server"
+        ), mock.patch.object(
+            update, "start_docker_review_server"
+        ), mock.patch.object(
+            update, "require_restarted_runtime_health",
+            side_effect=SystemExit("injected readiness failure"),
+        ), mock.patch.object(
+            update, "_stop_restarted_runtime",
+            return_value="PM2 sc-example: stop denied",
+        ), self.assertRaisesRegex(
+            SystemExit,
+            "shutdown could not be proven:\\n  - PM2 sc-example: stop denied",
+        ):
+            update.restart_review_servers(service, None)
+
     def test_first_legacy_adoption_rebinds_snapshot_and_completes_once(self):
         with tempfile.TemporaryDirectory() as raw:
             repo = Path(raw) / "repo"

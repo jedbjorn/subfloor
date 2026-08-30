@@ -1162,6 +1162,57 @@ def require_restarted_runtime_health() -> None:
     )
 
 
+def _stop_restarted_runtime(label: str, service: tuple[str, str]) -> str | None:
+    """Stop one runtime attempted during relaunch; return bounded failure text."""
+    executable, name = service
+    try:
+        stopped = subprocess.run(
+            [executable, "stop", name], capture_output=True, text=True, check=False
+        )
+    except OSError as exc:
+        return f"{label} {name}: {exc}"
+    if stopped.returncode != 0:
+        detail = (stopped.stderr or stopped.stdout).strip() or "stop command failed"
+        return f"{label} {name}: {detail}"
+    print(f"→ stopped restarted {label} runtime {name} after relaunch failure")
+    return None
+
+
+def restart_review_servers(
+    pm2_service: tuple[str, str] | None,
+    docker_service: tuple[str, str] | None,
+) -> None:
+    """Restart the prior runtimes atomically, or return them all to stopped."""
+    attempted: list[tuple[str, tuple[str, str]]] = []
+    try:
+        if pm2_service is not None:
+            attempted.append(("PM2", pm2_service))
+        start_pm2_review_server(pm2_service)
+        if docker_service is not None:
+            attempted.append(("Docker", docker_service))
+        start_docker_review_server(docker_service)
+        if attempted:
+            require_restarted_runtime_health()
+    except (Exception, SystemExit) as exc:
+        cleanup_failures = [
+            failure
+            for label, service in reversed(attempted)
+            if (failure := _stop_restarted_runtime(label, service)) is not None
+        ]
+        if cleanup_failures:
+            detail = "\n  - ".join(cleanup_failures)
+            stopped_status = (
+                "runtime shutdown could not be proven:\n  - " + detail
+            )
+        else:
+            stopped_status = "all managed runtimes are stopped"
+        raise SystemExit(
+            f"{exc}\nupdate: relaunch failed; {stopped_status}; "
+            "private state remains authoritative; retry: ./sc update; "
+            "recover: ./sc rollback"
+        ) from exc
+
+
 def migrate_with_service_cutover(*, backup: bool = True, reconcile=None) -> None:
     """Run all update reconciliation under one stopped-runtime lease."""
     docker_service = stop_docker_review_server()
@@ -1204,10 +1255,7 @@ def migrate_with_service_cutover(*, backup: bool = True, reconcile=None) -> None
     # Deliberately not in finally: a failed destructive migration must leave
     # the old server stopped instead of restarting code against a changed or
     # incompatible floor.
-    start_pm2_review_server(service)
-    start_docker_review_server(docker_service)
-    if service is not None or docker_service is not None:
-        require_restarted_runtime_health()
+    restart_review_servers(service, docker_service)
 
 
 def sync_skills() -> None:
