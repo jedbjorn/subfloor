@@ -74,6 +74,51 @@ class EngineSqlTest(unittest.TestCase):
              ), self.assertRaises(SystemExit) as caught:
             engine_sql.main(["read-only", "SELECT secret FROM shells;"])
         self.assertIn(engine_sql.ERROR_CODE, str(caught.exception))
+        self.assertNotIn(str(self.db), str(caught.exception))
+
+    def test_api_up_admin_write_fails_closed_before_sqlite(self):
+        env = {
+            "SC_API_TOKEN": "admin-token",
+            "SC_API_BASE": "http://127.0.0.1:8837",
+        }
+        with mock.patch.dict(os.environ, env, clear=True), self._path(), \
+             mock.patch.object(engine_sql, "_api_flavor", return_value="admin"), \
+             mock.patch.object(
+                 engine_sql.shutil,
+                 "which",
+                 side_effect=AssertionError("sqlite must not be resolved"),
+             ), mock.patch.object(
+                 engine_sql.subprocess,
+                 "run",
+                 side_effect=AssertionError("query must not be executed"),
+             ), self.assertRaises(SystemExit) as caught:
+            engine_sql.main(["read-write", "THIS IS NOT SQL"])
+        self.assertIn(
+            engine_sql.MAINTENANCE_ERROR_CODE,
+            str(caught.exception),
+        )
+
+    def test_api_down_admin_write_fails_closed_before_sqlite(self):
+        env = {
+            "SC_API_TOKEN": "admin-token",
+            "SC_API_BASE": "http://127.0.0.1:1",
+        }
+        with mock.patch.dict(os.environ, env, clear=True), self._path(), \
+             mock.patch.object(engine_sql, "_api_flavor", return_value=None), \
+             mock.patch.object(
+                 engine_sql.shutil,
+                 "which",
+                 side_effect=AssertionError("sqlite must not be resolved"),
+             ), mock.patch.object(
+                 engine_sql.subprocess,
+                 "run",
+                 side_effect=AssertionError("query must not be executed"),
+             ), self.assertRaises(SystemExit) as caught:
+            engine_sql.main(["read-write", "THIS IS NOT SQL"])
+        self.assertIn(
+            engine_sql.MAINTENANCE_ERROR_CODE,
+            str(caught.exception),
+        )
 
     def test_api_down_local_non_admin_is_still_refused(self):
         with mock.patch.dict(
@@ -82,9 +127,15 @@ class EngineSqlTest(unittest.TestCase):
             clear=True,
         ), self._path(), \
              mock.patch.object(engine_sql, "_api_flavor", return_value=None), \
+             mock.patch.object(
+                 engine_sql.subprocess,
+                 "run",
+                 side_effect=AssertionError("query must not be executed"),
+             ), \
              self.assertRaises(SystemExit) as caught:
             engine_sql.main(["read-write", "DELETE FROM shells;"])
         self.assertIn(engine_sql.ERROR_CODE, str(caught.exception))
+        self.assertNotIn(str(self.db), str(caught.exception))
 
     def test_missing_identity_does_not_adopt_an_admin_credential(self):
         with mock.patch.dict(os.environ, {}, clear=True), \

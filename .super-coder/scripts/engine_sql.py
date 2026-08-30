@@ -23,10 +23,18 @@ import instance_state
 
 ENGINE = Path(__file__).resolve().parents[1]
 ERROR_CODE = "admin_only_engine_state"
+MAINTENANCE_ERROR_CODE = "maintenance_cutover_required"
 
 
 def refuse() -> NoReturn:
     sys.exit(f"{ERROR_CODE}: general engine SQL is available only to Admin")
+
+
+def refuse_write() -> NoReturn:
+    sys.exit(
+        f"{MAINTENANCE_ERROR_CODE}: engine SQL writes require the Spec #133 "
+        "maintenance contract"
+    )
 
 
 def _api_flavor(token: str, base: str) -> str | None:
@@ -84,12 +92,18 @@ def main(argv: list[str]) -> int:
     db_path = instance_state.active_database_path(ENGINE)
     _require_local_admin(token, db_path)
 
+    # Spec #133 owns the stopped-runtime proof, exclusive maintenance lease,
+    # WAL-safe backup, verification, and recovery contract. Until that
+    # contract exists, arbitrary writes must fail closed before sqlite parses
+    # or executes caller input.
+    if mode == "read-write":
+        refuse_write()
+
     sqlite = shutil.which("sqlite3")
     if not sqlite:
         sys.exit("engine SQL: sqlite3 is unavailable")
     command = [sqlite]
-    if mode == "read-only":
-        command.append("-readonly")
+    command.append("-readonly")
     command.extend((str(db_path), *sqlite_args))
     return subprocess.run(command, check=False).returncode
 
