@@ -747,14 +747,18 @@ def stop_context_servers() -> None:
         servers = list(_CONTEXT_SERVERS)
         _CONTEXT_SERVERS.clear()
     for process, log_handle in servers:
-        if process.poll() is None:
-            process.terminate()
-            try:
-                process.wait(timeout=3)
-            except subprocess.TimeoutExpired:
-                process.kill()
-                process.wait(timeout=3)
-        log_handle.close()
+        _stop_context_server(process, log_handle)
+
+
+def _stop_context_server(process: subprocess.Popen, log_handle: Any) -> None:
+    if process.poll() is None:
+        process.terminate()
+        try:
+            process.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=3)
+    log_handle.close()
 
 
 def provider_state() -> dict[str, Any]:
@@ -921,24 +925,33 @@ class OpenCodeAdapter(ConversationAdapter):
         self.shell_runtime_dir = shell_runtime_dir
         if transport is not None:
             self.transport = transport
-        else:
-            if endpoint is None:
-                endpoint, managed_password = ensure_server()
-                if password is None:
-                    password = managed_password
+        elif endpoint is not None:
             self.transport = UrlHttpTransport(
                 endpoint,
                 password=password,
                 timeout=TURN_TIMEOUT_SECONDS,
             )
+        else:
+            # A conversation's canonical context decides whether server launch
+            # is restricted.  Starting the global server here would happen
+            # before that policy exists and create an unwrapped side channel.
+            self.transport = None
         self._context_server: subprocess.Popen | None = None
         self._context_log = None
         self._context_prefix: tuple[str, ...] = ()
 
+    def _ensure_global_transport(self) -> None:
+        if self.transport is not None:
+            return
+        endpoint, password = ensure_server()
+        self.transport = UrlHttpTransport(
+            endpoint,
+            password=password,
+            timeout=TURN_TIMEOUT_SECONDS,
+        )
+
     def _ensure_context_transport(self, context: ConversationContext) -> None:
         prefix = tuple(context.execution_prefix)
-        if not prefix:
-            return
         if self._context_server is not None:
             if prefix != self._context_prefix:
                 raise AdapterError(
@@ -952,6 +965,9 @@ class OpenCodeAdapter(ConversationAdapter):
                 "restricted OpenCode server exited",
                 retryable=True,
             )
+        if not prefix:
+            self._ensure_global_transport()
+            return
         process, log_handle, endpoint, password = start_context_server(context)
         self._context_server = process
         self._context_log = log_handle
@@ -963,6 +979,7 @@ class OpenCodeAdapter(ConversationAdapter):
         )
 
     def probe(self) -> ProbeResult:
+        self._ensure_global_transport()
         health = self.transport.request("GET", "/global/health")
         if not isinstance(health, dict) or not health.get("healthy"):
             raise AdapterError(
@@ -977,6 +994,22 @@ class OpenCodeAdapter(ConversationAdapter):
                 "OpenCode health response omitted version",
             )
         return self._probe_result(version)
+
+    def close(self) -> None:
+        process = self._context_server
+        log_handle = self._context_log
+        self._context_server = None
+        self._context_log = None
+        self._context_prefix = ()
+        if process is None or log_handle is None:
+            return
+        with _SERVER_LOCK:
+            _CONTEXT_SERVERS[:] = [
+                owned
+                for owned in _CONTEXT_SERVERS
+                if owned[0] is not process
+            ]
+        _stop_context_server(process, log_handle)
 
     @staticmethod
     def _bound_model(context: ConversationContext) -> str | None:

@@ -36,6 +36,7 @@ from conversation_adapters import (  # noqa: E402
     ReconcileResult,
 )
 from conversation_adapters import base as base_adapter
+from conversation_adapters import opencode as opencode_adapter
 from conversation_boot import BootDirective  # noqa: E402
 from conversation_broker import (  # noqa: E402
     BrokerInvariantError,
@@ -1497,7 +1498,58 @@ class ServiceContractTest(ConversationBrokerCase):
         self._assert_recovery_execution_view("codex", "browser")
 
     def test_sprint_opencode_recovery_keeps_restricted_server_argv(self) -> None:
-        self._assert_recovery_execution_view("opencode", "sprint")
+        _conversation_id, _message_id, run_id = self.add_live_run(
+            state="running",
+            session_after="opencode-session",
+            runner_ref="opencode-run",
+            harness="opencode",
+        )
+        preparer = RecoveryExecutionPreparer(self.worktree, "sprint")
+        restricted_server = mock.Mock()
+        restricted_server.poll.return_value = None
+        restricted_log = mock.Mock()
+        transport = mock.Mock()
+        transport.request.side_effect = (
+            {"id": "opencode-session"},
+            {"opencode-session": {"type": "idle"}},
+        )
+
+        with mock.patch.object(
+            opencode_adapter,
+            "ensure_server",
+        ) as ensure_server, mock.patch.object(
+            opencode_adapter,
+            "start_context_server",
+            return_value=(
+                restricted_server,
+                restricted_log,
+                "http://127.0.0.1:12345",
+                "password",
+            ),
+        ) as start_context_server, mock.patch.object(
+            opencode_adapter,
+            "UrlHttpTransport",
+            return_value=transport,
+        ):
+            broker = self.start_broker(
+                lambda _harness: OpenCodeAdapter(),
+                launch_preparer=preparer,
+            )
+            self.wait_run_state(run_id, "unknown")
+            self.assertTrue(broker.wait_idle())
+
+        ensure_server.assert_not_called()
+        recovered_context = start_context_server.call_args.args[0]
+        self.assertEqual(
+            recovered_context.execution_prefix,
+            ("landlock-view", "--"),
+        )
+        self.assertEqual(
+            recovered_context.env["SC_CONVERSATION_SURFACE"],
+            "sprint",
+        )
+        restricted_server.terminate.assert_called_once_with()
+        restricted_log.close.assert_called_once_with()
 
     def test_recovery_preflight_refusal_prevents_adapter_dispatch(self) -> None:
         _conversation_id, _message_id, run_id = self.add_live_run(

@@ -2234,21 +2234,41 @@ class ConversationAdapterTest(unittest.TestCase):
             ["view-helper", "--"],
         )
 
-        restricted_server = mock.Mock()
-        restricted_server.poll.return_value = None
-        with mock.patch.object(
-            opencode_adapter,
-            "start_context_server",
-            return_value=(
-                restricted_server,
-                mock.Mock(),
-                "http://127.0.0.1:12345",
-                "password",
-            ),
-        ) as start_context_server:
-            opencode = OpenCodeAdapter(endpoint="http://127.0.0.1:1")
-            opencode._ensure_context_transport(context)
-        start_context_server.assert_called_once_with(context)
+        for surface in ("browser", "sprint"):
+            with self.subTest(surface=surface):
+                restricted = replace(
+                    context,
+                    env={**context.env, "SC_CONVERSATION_SURFACE": surface},
+                )
+                restricted_server = mock.Mock()
+                restricted_server.poll.return_value = None
+                restricted_log = mock.Mock()
+                native = FakeOpenCode()
+                with mock.patch.object(
+                    opencode_adapter,
+                    "ensure_server",
+                ) as ensure_server, mock.patch.object(
+                    opencode_adapter,
+                    "start_context_server",
+                    return_value=(
+                        restricted_server,
+                        restricted_log,
+                        "http://127.0.0.1:12345",
+                        "password",
+                    ),
+                ) as start_context_server, mock.patch.object(
+                    opencode_adapter,
+                    "UrlHttpTransport",
+                    return_value=native,
+                ):
+                    opencode = OpenCodeAdapter()
+                    ensure_server.assert_not_called()
+                    opencode.start(restricted, "contained")
+                    ensure_server.assert_not_called()
+                    opencode.close()
+                start_context_server.assert_called_once_with(restricted)
+                restricted_server.terminate.assert_called_once_with()
+                restricted_log.close.assert_called_once_with()
 
     def test_claude_resume_accepts_resolved_worktree_descendants(self) -> None:
         adapter, runner = self.build("claude")

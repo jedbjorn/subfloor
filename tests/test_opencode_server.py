@@ -367,14 +367,22 @@ class OpenCodeServerTest(unittest.TestCase):
         with self.assertRaisesRegex(opencode.AdapterError, "too many native options"):
             opencode.connected_models(oversized)
 
-    def test_default_adapter_uses_managed_server_password(self):
+    def test_default_adapter_defers_managed_server_until_probe(self):
         with mock.patch.object(
             opencode, "ensure_server",
             return_value=("http://127.0.0.1:43212", "managed-secret"),
         ) as ensure, mock.patch.object(
             opencode, "UrlHttpTransport"
         ) as transport:
-            opencode.OpenCodeAdapter()
+            native = transport.return_value
+            native.request.return_value = {
+                "healthy": True,
+                "version": "1.18.9",
+            }
+            adapter = opencode.OpenCodeAdapter()
+            ensure.assert_not_called()
+            transport.assert_not_called()
+            adapter.probe()
         ensure.assert_called_once_with()
         transport.assert_called_once_with(
             "http://127.0.0.1:43212",
