@@ -474,10 +474,16 @@ body.interface-view main {
 }
 .chat-reasoning-disclosure { min-width: min(600px, 62vw); }
 .chat-reasoning-disclosure > summary {
-  display: flex; align-items: baseline; justify-content: space-between; gap: .8rem;
+  display: flex; align-items: baseline; gap: .45rem; list-style: none;
   cursor: pointer; color: var(--dim); font-size: calc(.62rem + 1px);
   text-transform: uppercase; letter-spacing: .12em;
 }
+.chat-reasoning-disclosure > summary::-webkit-details-marker { display: none; }
+.chat-reasoning-disclosure > summary::before {
+  content: "▸"; flex: none; transition: transform .12s;
+}
+.chat-reasoning-disclosure > summary > .chat-message-time { margin-left: auto; }
+.chat-reasoning-disclosure[open] > summary::before { transform: rotate(90deg); }
 .chat-reasoning-disclosure[open] > summary { margin-bottom: .45rem; }
 .chat-bubble.chat-activity {
   align-self: flex-start; background: transparent; border-style: dashed;

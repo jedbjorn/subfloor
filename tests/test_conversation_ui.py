@@ -407,6 +407,14 @@ def test_reasoning_streams_as_distinct_assistant_segments_without_approval_ui():
     assert "disclosure.ontoggle = () => chatCollapseOtherReasoning(disclosure)" in interface
     assert ".chat-bubble.chat-assistant.chat-reasoning" in STYLE
     assert ".chat-reasoning-disclosure" in STYLE
+    reasoning_style = STYLE[
+        STYLE.index(".chat-reasoning-disclosure {"):
+        STYLE.index(".chat-bubble.chat-activity")
+    ]
+    assert 'content: "▸"' in reasoning_style
+    assert "summary::-webkit-details-marker" in reasoning_style
+    assert ".chat-reasoning-disclosure[open] > summary::before" in reasoning_style
+    assert "transform: rotate(90deg)" in reasoning_style
     assert "approval control" not in interface.lower()
     assert "approval button" not in interface.lower()
 
