@@ -248,7 +248,8 @@ class SupervisionFixture:
                 if [ "$3" = "{{.Image}}" ]; then
                   cat "$state_dir/$4.image"
                 else
-                  echo true
+                  [ "${SC_TEST_CONTAINER_CRASH_LOOP:-}" != 1 ] || echo false
+                  [ "${SC_TEST_CONTAINER_CRASH_LOOP:-}" = 1 ] || echo true
                 fi
                 exit 0
               fi
@@ -481,6 +482,19 @@ class RestrictedLaunchTests(unittest.TestCase):
         self.assertIn("retained", result.stderr)
         container = f"sc-{self.fx.root.name}"
         self.assertTrue((self.fx.docker_state / f"{container}.id").exists())
+
+    def test_launch_fails_closed_and_retains_a_crash_looping_container(self):
+        self.fx.env["SC_TEST_CONTAINER_CRASH_LOOP"] = "1"
+
+        result = self.fx.run("launch", "--no-build")
+
+        self.assertEqual(result.returncode, 1)
+        self.assertNotIn("sandbox up", result.stdout)
+        self.assertIn("review API did not become healthy", result.stderr)
+        self.assertIn("retained", result.stderr)
+        container = f"sc-{self.fx.root.name}"
+        self.assertTrue((self.fx.docker_state / f"{container}.id").exists())
+        self.assertFalse(any(call.startswith("curl ") for call in self.fx.calls()))
 
     def test_docker_cache_gc_is_explicit_and_age_bounded_by_default(self):
         result = self.fx.run("docker-cache-gc")
