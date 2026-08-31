@@ -1,0 +1,183 @@
+{
+  "feature_id": 10,
+  "spec_id": 186,
+  "spec_revision_sha256": "31542632d8eae0414b90f11369309b55eb6687713856637346d0cc1dcccf8fb1",
+  "decision_id": 302,
+  "prerequisite_prs": [1420, 1424, 1425, 1426, 1427],
+  "verification": [
+    {
+      "id": "V01",
+      "claim": "Fork-worker boots and stored prompts omit engine storage and general-SQL internals.",
+      "anchors": [
+        "tests/test_role_aware_boot_contract.py#test_fork_worker_routes_each_data_surface_without_engine_internals",
+        "tests/test_role_aware_boot_contract.py#test_global_pointer_is_path_free_and_repair_is_admin_only"
+      ]
+    },
+    {
+      "id": "V02",
+      "claim": "Fork-worker boots route control-plane memory, repository catalogue, and product data to distinct supported surfaces.",
+      "anchors": [
+        "tests/test_role_aware_boot_contract.py#test_fork_worker_routes_each_data_surface_without_engine_internals"
+      ]
+    },
+    {
+      "id": "V03",
+      "claim": "Shell guidance does not conflate the repository map with memory or invite raw memory SQL.",
+      "anchors": [
+        "tests/test_role_aware_boot_contract.py#test_common_guidance_is_api_only_and_admin_skill_owns_internals"
+      ]
+    },
+    {
+      "id": "V04",
+      "claim": "Common DB guidance is API-only while Admin retains explicit maintenance guidance.",
+      "anchors": [
+        "tests/test_role_aware_boot_contract.py#test_common_guidance_is_api_only_and_admin_skill_owns_internals",
+        "tests/test_role_aware_boot_contract.py#test_admin_gets_exact_private_target_and_maintenance_routing"
+      ]
+    },
+    {
+      "id": "V05",
+      "claim": "Downstream non-Admin direct, process-root, child-process, schema, migration, backup, and state paths are masked.",
+      "anchors": [
+        "tests/test_execution_view.py#test_downstream_view_masks_state_schema_and_process_root_alias",
+        "tests/test_execution_view.py#test_sandbox_landlock_view_masks_direct_and_process_root_aliases",
+        "tests/test_execution_view.py#test_detached_descendant_survives_wrapper_and_keeps_restriction",
+        "tests/test_execution_view.py#test_relative_backup_override_is_masked_across_harness_cwd"
+      ]
+    },
+    {
+      "id": "V06",
+      "claim": "Caller-controlled flavor and path environment values cannot widen command or filesystem authority.",
+      "anchors": [
+        "tests/test_engine_sql.py#test_non_admin_refuses_before_query_even_when_flavor_is_spoofed",
+        "tests/test_execution_view.py#test_relative_backup_override_is_masked_across_harness_cwd"
+      ]
+    },
+    {
+      "id": "V07",
+      "claim": "Non-Admin engine SQL refuses while scoped memory, map, conversation, Sprint, and fork workflows remain available.",
+      "anchors": [
+        "tests/test_engine_sql.py#test_api_down_local_non_admin_is_still_refused",
+        "tests/test_mem.py#test_write_lands_on_the_token_shell",
+        "tests/test_map_repo.py#test_declared_work_repo_is_the_map_target",
+        "tests/test_conversation_broker.py#test_sprint_opencode_recovery_keeps_restricted_server_argv",
+        "tests/test_sprint_work_dispatch.py#test_armed_pulse_enqueues_every_parallel_ready_lane"
+      ]
+    },
+    {
+      "id": "V08",
+      "claim": "Planner delivery audit preserves deterministic candidate and deduplication behavior without arbitrary SQL.",
+      "anchors": [
+        "tests/test_mem.py#test_delivery_audit_is_planner_only_and_preserves_dedup"
+      ]
+    },
+    {
+      "id": "V09",
+      "claim": "Cartographer retains repository-map authority without engine-state authority.",
+      "anchors": [
+        "tests/test_fresh_install_shell_contract.py#test_cartographer_targets_canonical_local_map_state",
+        "tests/test_map_repo.py#test_declared_work_repo_is_the_map_target"
+      ]
+    },
+    {
+      "id": "V10",
+      "claim": "Host/container Admin keeps read-only diagnosis while mutation remains maintenance-gated.",
+      "anchors": [
+        "tests/test_execution_view.py#test_admin_is_unwrapped_and_keeps_maintenance_environment",
+        "tests/test_engine_sql.py#test_api_down_admin_keeps_read_only_diagnosis",
+        "tests/test_engine_sql.py#test_api_up_admin_write_fails_closed_before_sqlite"
+      ]
+    },
+    {
+      "id": "V11",
+      "claim": "Source workers see tracked engine source but not live state; source Admin retains the maintenance view.",
+      "anchors": [
+        "tests/test_execution_view.py#test_source_view_keeps_tracked_engine_source_but_masks_live_state",
+        "tests/test_role_aware_boot_contract.py#test_source_worker_sees_tracked_source_but_not_live_state",
+        "tests/test_role_aware_boot_contract.py#test_admin_gets_exact_private_target_and_maintenance_routing"
+      ]
+    },
+    {
+      "id": "V12",
+      "claim": "Fresh install creates private state and upgrade relocation preserves the installation identity and completion boundary.",
+      "anchors": [
+        "tests/test_state_relocation.py#test_fresh_install_uses_private_state_without_a_relocation_receipt",
+        "tests/test_update_service_cutover.py#test_first_legacy_adoption_rebinds_snapshot_and_completes_once",
+        "tests/test_install_fresh_fork.py#test_noninteractive_install_reaches_durable_completion_marker",
+        "tests/test_update_materialize.py#test_reload_replaces_a_pre_materialization_skill_name_validator",
+        "tests/test_update_materialize.py#test_materialized_skill_owner_reloads_before_migration_and_sync"
+      ]
+    },
+    {
+      "id": "V13",
+      "claim": "Relocation is idempotent, detects conflicts, rolls back across the boundary, and removes only claimed state after backup.",
+      "anchors": [
+        "tests/test_state_relocation.py#test_retry_is_idempotent_after_private_publication",
+        "tests/test_state_relocation.py#test_conflicting_complete_databases_fail_closed",
+        "tests/test_state_relocation.py#test_rollback_to_old_floor_reconstructs_verified_legacy_pair",
+        "tests/test_state_relocation.py#test_remove_deletes_only_claimed_live_root_after_external_backup"
+      ]
+    },
+    {
+      "id": "V14",
+      "claim": "Linked-worktree dispatch, conversation recovery, Git metadata, declared work roots, and fork tooling survive the restricted view.",
+      "anchors": [
+        "tests/test_update_materialize.py#test_clean_stale_worktree_dispatcher_runs_current_read_only_help",
+        "tests/test_conversation_launch.py#test_recovery_view_masks_private_state_and_parent_root_alias",
+        "tests/test_map_repo.py#test_declared_work_repo_is_the_map_target",
+        "tests/test_fresh_install_shell_contract.py#test_install_is_committed_before_first_shell_worktree"
+      ]
+    },
+    {
+      "id": "V15",
+      "claim": "Targeted tests, the full engine gate, verify, render-check, disposable multi-flavor paths, and the accepted weak-model canary all report success.",
+      "anchors": [
+        "tests/test_verify_clean_clone.py#test_verify_initializes_an_empty_source_instance",
+        "tests/test_render_check.py#test_matching_source_rows_identify_a_stale_mirror",
+        "tests/test_flavor_skill_packs.py#test_boot_and_flat_render_use_resolved_grants",
+        "tests/test_supervision_sc.py#test_launch_mounts_only_the_bound_private_instance_state",
+        "tests/test_supervision_sc.py#test_launch_fails_closed_when_review_api_never_becomes_healthy"
+      ]
+    }
+  ],
+  "gates": {
+    "targeted": [
+      "tests/test_instance_state.py",
+      "tests/test_state_relocation.py",
+      "tests/test_install_fresh_fork.py",
+      "tests/test_update_service_cutover.py",
+      "tests/test_update_materialize.py",
+      "tests/test_rollback_half_floor.py",
+      "tests/test_remove.py",
+      "tests/test_execution_view.py",
+      "tests/test_conversation_launch.py",
+      "tests/test_conversation_broker.py",
+      "tests/test_sprint_work_dispatch.py",
+      "tests/test_engine_sql.py",
+      "tests/test_mem.py",
+      "tests/test_role_aware_boot_contract.py",
+      "tests/test_fresh_install_shell_contract.py",
+      "tests/test_flavor_skill_packs.py",
+      "tests/test_map_repo.py"
+    ],
+    "full": "./sc test tests/ -q",
+    "verify": "./sc verify",
+    "render_check": "./sc render-check"
+  },
+  "canary": {
+    "decision_id": 298,
+    "model": "halo/qwen3.8-27b-q8-mtp2",
+    "variant": null,
+    "flavors": ["admin", "cartographer", "planner", "dev", "reviewer"],
+    "required_receipts": [
+      "campaign.json",
+      "admin/receipt.json",
+      "cartographer/receipt.json",
+      "planner/receipt.json",
+      "dev/receipt.json",
+      "reviewer/receipt.json",
+      "synthesis.json",
+      "final-baseline.json"
+    ]
+  }
+}

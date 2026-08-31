@@ -52,6 +52,7 @@ Usage:
 from __future__ import annotations
 
 import ast
+import importlib
 import importlib.util
 import os
 import re
@@ -548,6 +549,25 @@ def _materialized_engine_paths(repo_root: Path = REPO_ROOT) -> list[str]:
             + _MATERIALIZE_FAILURE_REMEDY
         )
     return list(paths)
+
+
+def reload_materialized_seed_skills() -> None:
+    """Refresh the catalogue owner after replacing the engine in-process.
+
+    ``update.py`` imports seed_skills before materialization.  Reload the same
+    module object so update and every already-imported consumer see the newly
+    materialized validators and catalogue helpers before any post-migration
+    skill write.  A fresh, separate module would leave those retained
+    references stale.
+    """
+    importlib.invalidate_caches()
+    try:
+        importlib.reload(seed_skills)
+    except Exception as exc:
+        sys.exit(
+            "update: reloading the materialized skill catalogue failed: "
+            f"{exc}" + _MATERIALIZE_FAILURE_REMEDY
+        )
 
 
 def _assert_materialized_engine_paths(
@@ -1509,6 +1529,7 @@ def main(argv: list[str]) -> int:
         materialize_fetched_engine(
             target_sha, force=force, publish_ref=False
         )
+        reload_materialized_seed_skills()
 
     workflow_action, workflow_changes = ensure_workflows(source_repo=source)
     if workflow_action == "seeded":
