@@ -29,3 +29,14 @@ def test_sandbox_dockerfile_copies_no_repository_paths() -> None:
 
     assert "COPY" not in instructions
     assert "ADD" not in instructions
+
+
+def test_kimi_installer_has_a_bounded_network_window() -> None:
+    dockerfile = (ROOT / ".super-coder" / "Dockerfile").read_text()
+    kimi_install = dockerfile.split("# Kimi Code", 1)[1].split(
+        "# A user matching", 1
+    )[0]
+
+    assert "--connect-timeout" in kimi_install
+    assert "--max-time" in kimi_install
+    assert "timeout --signal=TERM --kill-after=" in kimi_install

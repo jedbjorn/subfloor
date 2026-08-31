@@ -114,6 +114,11 @@ class BranchGuardTest(unittest.TestCase):
                 self.assertIn("Create a feature branch first", result.stderr)
                 self.assertNotIn("no-verify", result.stderr)
 
+    def test_explicit_admin_marker_allows_default_branch_commit(self):
+        result = self.pre_commit(SC_SHELL_FLAVOR="admin")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_exact_operator_install_and_update_commits_bypass_the_hook(self):
         repo = Path(tempfile.mkdtemp(prefix="sc-bg-bypass-", dir=Path.home()))
         self.addCleanup(shutil.rmtree, repo, ignore_errors=True)

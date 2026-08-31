@@ -20,6 +20,7 @@ RATIFIED_OPT_INS = {
         "admin_git",
         "engine_database",
         "engine_migrations",
+        "flags",
         "git_cleanup",
         "self_update",
         "snapshot",
@@ -183,6 +184,7 @@ class HardCutoverMigrationTest(unittest.TestCase):
         ):
             self.assertIn(section, body)
         self.assertIn("git pull --ff-only origin main", body)
+        self.assertIn("SC_SHELL_FLAVOR=admin git commit", body)
         self.assertIn("Never switch its branch, stash,", body)
         self.assertNotIn("git checkout -b", body)
 
@@ -284,6 +286,8 @@ class HardCutoverMigrationTest(unittest.TestCase):
             # 0241 predates the Admin-only engine_database skill introduced by
             # 0243; this fixture proves the historical migration in isolation.
             expected_at_0241 = expected - {"engine_database"}
+            if flavor == "admin":
+                expected_at_0241 -= {"flags"}
             expected_with_local = expected_at_0241 | (
                 {"fork_testing_seat"} if flavor == "dev" else set()
             )
