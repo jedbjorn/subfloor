@@ -705,6 +705,113 @@ class HeadlessSessionFailureTest(unittest.TestCase):
         )
         liveness.assert_not_called()
 
+    def test_host_admin_preserves_explicit_opencode_model_to_session_boundary(self) -> None:
+        con = mock.Mock()
+        chosen = {"shell_id": 1, "shortname": "ADM1", "flavor": "admin"}
+        fdefaults = {
+            "admin": {
+                "default_harness": "opencode",
+                "models": {"opencode": "ollama-cloud/glm-5.2"},
+                "efforts": {},
+            }
+        }
+        open_session = mock.Mock(side_effect=_StopAfterSession)
+
+        with mock.patch.dict(run.os.environ, {}, clear=True), \
+                mock.patch.object(
+                    run.sys,
+                    "argv",
+                    [
+                        "run.py", "--host-admin", "--harness", "opencode",
+                        "--model", "deepseek-v4-flash:cloud",
+                    ],
+                ), \
+                mock.patch.object(run.global_pointer, "write_global_pointers"), \
+                mock.patch.object(run, "open_db", return_value=con), \
+                mock.patch.object(run.seed_skills, "sync_engine_skills", return_value=[]), \
+                mock.patch.object(run, "authenticate", return_value={"user_id": 1}), \
+                mock.patch.object(run, "flavor_defaults", return_value=fdefaults), \
+                mock.patch.object(run, "select_host_admin", return_value=chosen), \
+                mock.patch.object(run, "browser_conversation_active", return_value=False), \
+                mock.patch.object(run.sys.stdin, "isatty", return_value=False), \
+                mock.patch.object(run, "ensure_harness_path"), \
+                mock.patch.object(
+                    run,
+                    "load_adapter",
+                    return_value={
+                        "harness": "opencode",
+                        "launch": ["opencode"],
+                        "headless": {"model_flag": "--model"},
+                    },
+                ), \
+                mock.patch.object(run, "require_host_harness"), \
+                mock.patch.object(run, "preflight_controlled_opencode_route"), \
+                mock.patch.object(run, "open_session", open_session), \
+                self.assertRaises(_StopAfterSession):
+            run.main()
+
+        open_session.assert_called_once_with(
+            con,
+            1,
+            lifecycle={
+                "harness": "opencode",
+                "provider": "ollama-cloud",
+                "model": "deepseek-v4-flash:cloud",
+            },
+        )
+
+    def test_host_admin_refuses_unavailable_controlled_route_before_session(self) -> None:
+        con = mock.Mock()
+        chosen = {"shell_id": 1, "shortname": "ADM1", "flavor": "admin"}
+        fdefaults = {
+            "admin": {
+                "default_harness": "opencode",
+                "models": {"opencode": "ollama-cloud/glm-5.2"},
+                "efforts": {},
+            }
+        }
+        open_session = mock.Mock()
+
+        with mock.patch.dict(run.os.environ, {}, clear=True), \
+                mock.patch.object(
+                    run.sys, "argv", [
+                        "run.py", "--host-admin", "--harness", "opencode",
+                        "--model", "deepseek-v4-flash:cloud",
+                    ],
+                ), \
+                mock.patch.object(run.global_pointer, "write_global_pointers"), \
+                mock.patch.object(run, "open_db", return_value=con), \
+                mock.patch.object(run.seed_skills, "sync_engine_skills", return_value=[]), \
+                mock.patch.object(run, "authenticate", return_value={"user_id": 1}), \
+                mock.patch.object(run, "flavor_defaults", return_value=fdefaults), \
+                mock.patch.object(run, "select_host_admin", return_value=chosen), \
+                mock.patch.object(run, "browser_conversation_active", return_value=False), \
+                mock.patch.object(run.sys.stdin, "isatty", return_value=False), \
+                mock.patch.object(run, "ensure_harness_path"), \
+                mock.patch.object(
+                    run, "load_adapter", return_value={
+                        "harness": "opencode",
+                        "launch": ["opencode"],
+                        "headless": {"model_flag": "--model"},
+                    },
+                ), \
+                mock.patch.object(run, "require_host_harness"), \
+                mock.patch.object(
+                    run, "preflight_controlled_opencode_route",
+                    side_effect=ValueError(
+                        "controlled OpenCode route unavailable before launch: "
+                        "requested=deepseek-v4-flash:cloud "
+                        "selector=ollama-cloud/deepseek-v4-flash"
+                    ),
+                ), \
+                mock.patch.object(run, "open_session", open_session), \
+                self.assertRaises(SystemExit) as raised:
+            run.main()
+
+        self.assertIn("route unavailable before launch", str(raised.exception))
+        con.close.assert_called_once_with()
+        open_session.assert_not_called()
+
     def test_host_admin_non_admin_reference_refuses_before_boot_artifacts(self) -> None:
         con = mock.Mock()
         pointers = mock.Mock()

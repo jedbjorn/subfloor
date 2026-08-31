@@ -30,6 +30,8 @@ PROVIDER = "Ollama-Cloud"
 MODEL = "DeepSeek-V4-Flash:Q4"
 SELECTOR = f"{PROVIDER}/{MODEL}"
 OPTION = "Reasoning/MAX.Future"
+CONTROLLED = "deepseek-v4-flash:cloud"
+CONTROLLED_SELECTOR = "ollama-cloud/deepseek-v4-flash"
 
 
 def opencode_state(*, options: list[str] | None = None) -> dict:
@@ -158,6 +160,162 @@ def test_one_shot_uses_exact_opencode_model_and_native_variant(
     assert projection.native_variant_id == OPTION
     assert projection.route_agent is None
     assert not (tmp_path / "opencode.json").exists()
+
+
+def test_admin_interactive_preserves_explicit_controlled_model_in_native_argv() -> None:
+    model, route = run_mod.resolve_interactive_model(
+        harness="opencode",
+        flavor_model="ollama-cloud/glm-5.2",
+        requested_model=CONTROLLED,
+        host_admin=True,
+    )
+
+    assert route == run_mod.ControlledOpenCodeRoute(
+        CONTROLLED, CONTROLLED_SELECTOR
+    )
+    assert model == CONTROLLED
+    assert run_mod.controlled_opencode_model_args(
+        run_mod.load_adapter("opencode"), route
+    ) == ["--model", CONTROLLED_SELECTOR]
+    notice = run_mod.controlled_opencode_launch_notice(route)
+    assert f"requested model route: {CONTROLLED}" in notice
+    assert f"OpenCode selector: {CONTROLLED_SELECTOR}" in notice
+    assert "launch pending runtime observation" in notice
+    assert "model route observed:" not in notice
+    template = json.loads(
+        (ENGINE / "adapters" / "opencode" / "opencode.json").read_text()
+    )
+    assert template["plugin"][-1].endswith("/enforce-model-route.js")
+
+    ordinary_model, ordinary_route = run_mod.resolve_interactive_model(
+        harness="opencode",
+        flavor_model="ordinary/default",
+        requested_model=CONTROLLED,
+        host_admin=False,
+    )
+    assert (ordinary_model, ordinary_route) == ("ordinary/default", None)
+
+    with pytest.raises(ValueError, match="must be a provider/model selector"):
+        run_mod.resolve_interactive_model(
+            harness="opencode",
+            flavor_model="ollama-cloud/glm-5.2",
+            requested_model="uncontrolled-name",
+            host_admin=True,
+        )
+
+
+def test_controlled_route_preflight_requires_exact_selector() -> None:
+    adapter = run_mod.load_adapter("opencode")
+    route = run_mod.ControlledOpenCodeRoute(CONTROLLED, CONTROLLED_SELECTOR)
+    completed = subprocess.CompletedProcess(
+        ["opencode", "models", "ollama-cloud"], 0,
+        stdout=f"{CONTROLLED_SELECTOR}\nollama-cloud/glm-5.2\n", stderr="",
+    )
+    runner = mock.Mock(return_value=completed)
+
+    run_mod.preflight_controlled_opencode_route(adapter, route, run=runner)
+
+    runner.assert_called_once_with(
+        ["opencode", "models", "ollama-cloud"],
+        text=True, capture_output=True, check=False, timeout=20,
+    )
+
+
+def test_controlled_route_preflight_refuses_unavailable_selector() -> None:
+    route = run_mod.ControlledOpenCodeRoute(CONTROLLED, CONTROLLED_SELECTOR)
+    completed = subprocess.CompletedProcess(
+        ["opencode", "models", "ollama-cloud"], 0,
+        stdout="ollama-cloud/glm-5.2\n", stderr="",
+    )
+
+    with pytest.raises(ValueError, match="route unavailable before launch") as refused:
+        run_mod.preflight_controlled_opencode_route(
+            run_mod.load_adapter("opencode"), route,
+            run=lambda *_args, **_kwargs: completed,
+        )
+
+    assert f"requested={CONTROLLED}" in str(refused.value)
+    assert f"selector={CONTROLLED_SELECTOR}" in str(refused.value)
+
+
+def run_route_guard(requested: str | None, provider: str, model: str) -> dict:
+    plugin = ENGINE / "adapters" / "opencode" / "enforce-model-route.js"
+    script = f"""
+import fs from "node:fs";
+const source = fs.readFileSync({json.dumps(str(plugin))}, "utf8");
+const loaded = await import(`data:text/javascript;base64,${{Buffer.from(source).toString("base64")}}`);
+const hooks = await loaded.EnforceModelRoute();
+if ({json.dumps(requested)} === null) delete process.env.SC_OPENCODE_ENFORCED_MODEL;
+else process.env.SC_OPENCODE_ENFORCED_MODEL = JSON.stringify({{
+  requested: {json.dumps(CONTROLLED)}, selector: {json.dumps(requested)},
+}});
+let dispatched = false;
+try {{
+  await hooks["chat.params"]({{
+    model: {{providerID: {json.dumps(provider)}, id: {json.dumps(model)}}},
+  }});
+  dispatched = true;
+  console.log(JSON.stringify({{accepted: true, dispatched}}));
+}} catch (error) {{
+  console.log(JSON.stringify({{accepted: false, dispatched, error: error.message}}));
+}}
+"""
+    completed = subprocess.run(
+        ["node", "--input-type=module", "-e", script],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stderr
+    return {
+        **json.loads(completed.stdout.strip().splitlines()[-1]),
+        "stderr": completed.stderr,
+    }
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node is required")
+def test_controlled_route_observes_exact_runtime_model_before_dispatch() -> None:
+    result = run_route_guard(
+        CONTROLLED_SELECTOR, "ollama-cloud", "deepseek-v4-flash"
+    )
+
+    assert result["accepted"] is True
+    assert result["dispatched"] is True
+    assert (
+        f"requested={CONTROLLED} observed={CONTROLLED_SELECTOR}"
+        in result["stderr"]
+    )
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node is required")
+def test_controlled_route_refuses_wrong_model_without_false_success() -> None:
+    result = run_route_guard(CONTROLLED_SELECTOR, "ollama-cloud", "glm-5.2")
+
+    assert result["accepted"] is False
+    assert result["dispatched"] is False
+    assert f"requested={CONTROLLED}" in result["error"]
+    assert "observed=ollama-cloud/glm-5.2" in result["error"]
+    assert "model route observed" not in result["stderr"]
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node is required")
+def test_controlled_route_refuses_unavailable_observation() -> None:
+    result = run_route_guard(CONTROLLED_SELECTOR, "", "")
+
+    assert result["accepted"] is False
+    assert result["dispatched"] is False
+    assert f"requested={CONTROLLED}" in result["error"]
+    assert "observed=unavailable" in result["error"]
+    assert "model route observed" not in result["stderr"]
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node is required")
+def test_route_guard_is_inert_without_admin_controlled_request() -> None:
+    result = run_route_guard(None, "ollama-cloud", "glm-5.2")
+
+    assert result["accepted"] is True
+    assert result["dispatched"] is True
+    assert result["stderr"] == ""
 
 
 class RecordingTransport:

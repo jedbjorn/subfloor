@@ -1137,7 +1137,7 @@ case "$cmd" in
   pg-down)      sc_pg_down ;;
   admin)
     if sc_help_form "$@"; then
-      echo "usage: ./sc admin [admin-shortname] [--harness <h>]"
+      echo "usage: ./sc admin [admin-shortname] [--harness <h>] [--model <route>]"
       echo "Boot the sole active Admin directly on the host; no Docker or API is required."
       exit 0
     fi
