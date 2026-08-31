@@ -331,6 +331,18 @@ class ResolvedHeadlessRoute(NamedTuple):
     effort: str | None
 
 
+class ControlledOpenCodeRoute(NamedTuple):
+    requested: str
+    selector: str
+
+
+CONTROLLED_OLLAMA_CLOUD_ROUTES = {
+    # Ollama names the route with its cloud tag. OpenCode's connected
+    # ollama-cloud provider exposes the same route without that transport tag.
+    "deepseek-v4-flash:cloud": "ollama-cloud/deepseek-v4-flash",
+}
+
+
 def resolve_headless_route(
     *,
     harness: str,
@@ -400,6 +412,83 @@ def resolve_bound_headless_route(
         model=binding["requested_model"],
         effort=binding["effective_effort"],
     )
+
+
+def resolve_interactive_model(
+    *,
+    harness: str,
+    flavor_model: "str | None",
+    requested_model: "str | None",
+    host_admin: bool,
+) -> tuple["str | None", "ControlledOpenCodeRoute | None"]:
+    """Bind only an explicit host-Admin OpenCode request to its route guard."""
+    if not (host_admin and harness == "opencode" and requested_model):
+        return flavor_model, None
+    selector = CONTROLLED_OLLAMA_CLOUD_ROUTES.get(
+        requested_model, requested_model if "/" in requested_model else None
+    )
+    if selector is None:
+        raise ValueError(
+            "controlled OpenCode route must be a provider/model selector or "
+            f"the supported Ollama Cloud route; requested={requested_model}"
+        )
+    return requested_model, ControlledOpenCodeRoute(requested_model, selector)
+
+
+def controlled_opencode_model_args(
+    adapter: dict, route: ControlledOpenCodeRoute
+) -> list[str]:
+    """Return the native CLI route that OpenCode's runtime hook will observe."""
+    flag = (adapter.get("headless") or {}).get("model_flag")
+    if not flag:
+        raise ValueError(
+            "controlled OpenCode route cannot be enforced: adapter has no "
+            "native model flag"
+        )
+    return [flag, route.selector]
+
+
+def controlled_opencode_launch_notice(route: ControlledOpenCodeRoute) -> str:
+    """Describe intent without claiming the runtime route was observed."""
+    return (
+        f"→ requested model route: {route.requested}; "
+        f"OpenCode selector: {route.selector}; "
+        "launch pending runtime observation before provider dispatch"
+    )
+
+
+def preflight_controlled_opencode_route(
+    adapter: dict,
+    route: ControlledOpenCodeRoute,
+    *,
+    run=subprocess.run,
+) -> None:
+    """Refuse an unavailable selector before creating durable launch state."""
+    provider = route.selector.split("/", 1)[0]
+    launch = adapter.get("launch") or ["opencode"]
+    try:
+        completed = run(
+            [launch[0], "models", provider],
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=20,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise ValueError(
+            "controlled OpenCode route unavailable before launch: "
+            f"requested={route.requested} selector={route.selector}: {exc}"
+        ) from exc
+    available = (
+        set(completed.stdout.splitlines()) if completed.returncode == 0 else set()
+    )
+    if route.selector not in available:
+        detail = completed.stderr.strip()
+        suffix = f": {detail}" if detail else ""
+        raise ValueError(
+            "controlled OpenCode route unavailable before launch: "
+            f"requested={route.requested} selector={route.selector}{suffix}"
+        )
 
 
 def validate_headless_request(adapter: dict, model: "str | None",
@@ -2018,7 +2107,10 @@ def main() -> None:
         i += 1
     requested = positional[0] if positional else None
     if host_admin and (headless or len(positional) > 1):
-        sys.exit("usage: ./sc admin [admin-shortname] [--harness <h>]")
+        sys.exit(
+            "usage: ./sc admin [admin-shortname] [--harness <h>] "
+            "[--model <route>]"
+        )
     if headless and not requested:
         sys.exit('usage: ./sc run <shortname> [-p "<prompt>"] [--harness <h>] '
                  '[-m <model>] [--effort <level>]')
@@ -2167,6 +2259,7 @@ def main() -> None:
             sys.exit(f"sc admin: {exc}")
         if not os.environ.get("RENDER_ONLY"):
             global_pointer.write_global_pointers()
+    controlled_opencode_route = None
     if headless:
         try:
             resolved_route = resolve_headless_route(
@@ -2183,7 +2276,21 @@ def main() -> None:
         session_model = resolved_route.model
         session_effort = resolved_route.effort
     else:
-        session_model = flavor_model
+        try:
+            session_model, controlled_opencode_route = resolve_interactive_model(
+                harness=harness,
+                flavor_model=flavor_model,
+                requested_model=flag_model,
+                host_admin=host_admin,
+            )
+            if controlled_opencode_route:
+                preflight_controlled_opencode_route(
+                    adapter, controlled_opencode_route
+                )
+        except ValueError as exc:
+            con.close()
+            prefix = "sc admin" if host_admin else "session launch"
+            sys.exit(f"{prefix}: {exc}")
         session_effort = None
 
     try:
@@ -2226,7 +2333,11 @@ def main() -> None:
         try:
             session_id, archive_id = open_session(con, chosen["shell_id"], lifecycle={
                 "harness": harness,
-                "provider": session_provider(harness, session_model),
+                "provider": session_provider(
+                    harness,
+                    controlled_opencode_route.selector
+                    if controlled_opencode_route else session_model,
+                ),
                 "model": session_model,
             })
         except SessionOpenError as exc:
@@ -2357,6 +2468,15 @@ def main() -> None:
     mcfg = adapter.get("model") or {}
     if headless:
         pass
+    elif controlled_opencode_route:
+        try:
+            model_args = controlled_opencode_model_args(
+                adapter, controlled_opencode_route
+            )
+        except ValueError as exc:
+            con.close()
+            sys.exit(f"sc admin: {exc}")
+        print(controlled_opencode_launch_notice(controlled_opencode_route))
     elif flavor_model and mcfg.get("flag"):
         model_args = [mcfg["flag"], flavor_model]
         print(f"→ model: {flavor_model} (flavor default for {chosen['flavor']})")
@@ -2476,6 +2596,14 @@ def main() -> None:
     # Admin keeps the engine-path fast path for maintenance hooks. Restricted
     # shells use the env-independent git-common-dir resolution instead.
     env["SC_HARNESS"] = harness
+    env.pop("SC_OPENCODE_ENFORCED_MODEL", None)
+    if controlled_opencode_route:
+        # This narrows one Admin turn; it is not an authorization signal.
+        # enforce-model-route.js consumes it at OpenCode's pre-dispatch hook.
+        env["SC_OPENCODE_ENFORCED_MODEL"] = json.dumps({
+            "requested": controlled_opencode_route.requested,
+            "selector": controlled_opencode_route.selector,
+        }, separators=(",", ":"))
     # The shell's HOME worktree — the dir we exec the harness from (below). The
     # branch-guard reads it to judge "outside your worktree" against the assigned
     # tree, not the live cwd: a shell whose cwd has drifted to the repo root (to

@@ -2,7 +2,10 @@
   "$schema": "https://opencode.ai/config.json",
   "lsp": true,
   "instructions": ["AGENTS.md", ".super-coder/adapters/opencode/tool-discipline.md"],
-  "plugin": ["./.super-coder/adapters/opencode/protect-default-branch.js"],
+  "plugin": [
+    "./.super-coder/adapters/opencode/protect-default-branch.js",
+    "./.super-coder/adapters/opencode/enforce-model-route.js"
+  ],
   "permission": {
     "edit": "allow",
     "webfetch": "allow",
