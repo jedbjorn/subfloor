@@ -1209,9 +1209,19 @@ case "$cmd" in
     # when the host uses a non-default XDG_STATE_HOME.
     state_dir="$(dirname "$(sc_engine_db)")"
     state_mount=""
+    state_namespace_mounts=""
     if [ "$state_dir" != "$ENGINE" ]; then
       state_target="$HOME/.local/state/subfloor/instances/$(basename "$state_dir")"
       state_mount="-v $state_dir:$state_target"
+      # Rootless Docker maps container root to the invoking host user.  The
+      # selected bind leaf therefore appears root-owned inside, while the image
+      # namespace was built for the host numeric uid.  Overlay only the empty
+      # namespace ancestors with private root-owned tmpfs mounts so the strict
+      # resolver sees one coherent owner.  The selected instance remains the
+      # sole host-state bind; rootful launch keeps the image-owned uid tree.
+      if [ -n "$github_auth_rootless" ]; then
+        state_namespace_mounts="--tmpfs $HOME/.local/state:uid=0,gid=0,mode=0700 --tmpfs $HOME/.local/state/subfloor:uid=0,gid=0,mode=0700 --tmpfs $HOME/.local/state/subfloor/instances:uid=0,gid=0,mode=0700"
+      fi
     fi
     # Pinned-interpreter passthrough. When the fork's .venv was built from an
     # out-of-tree interpreter — a uv-managed standalone CPython under $HOME, used
@@ -1272,6 +1282,7 @@ case "$cmd" in
         -e GIT_COMMITTER_NAME="$git_name" -e GIT_COMMITTER_EMAIL="$git_email" \
         -w "$here" \
         -v "$here:$here" \
+        $state_namespace_mounts \
         $state_mount \
         $py_mount \
         -v "$HOME/.claude:$HOME/.claude" \

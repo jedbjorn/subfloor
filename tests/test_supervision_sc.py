@@ -172,7 +172,10 @@ class SupervisionFixture:
             printf ' %s' "$@" >> "$SC_TEST_LOG"
             printf '\\n' >> "$SC_TEST_LOG"
             state_dir="$SC_TEST_DOCKER_STATE"
-            if [ "$1" = info ]; then exit 0; fi
+            if [ "$1" = info ]; then
+              [ "${SC_TEST_ROOTLESS:-}" != 1 ] || echo rootless
+              exit 0
+            fi
             if [ "$1" = image ] && [ "$2" = inspect ]; then
               [ "$SC_TEST_IMAGE" = present ] || exit 1
               case " $* " in
@@ -470,6 +473,39 @@ class RestrictedLaunchTests(unittest.TestCase):
         self.assertNotIn(
             f" -v {state_root.parent}:{state_root.parent} ", sandbox_run
         )
+        self.assertNotIn(" --tmpfs ", sandbox_run)
+
+    def test_rootless_launch_owns_private_namespace_and_mounts_only_bound_leaf(
+        self,
+    ):
+        self.fx.env["XDG_STATE_HOME"] = str(Path(self.fx._tmp.name) / "xdg-state")
+        self.fx.env["SC_TEST_ROOTLESS"] = "1"
+        state_root = self.fx.bind_private_state()
+
+        result = self.fx.run("launch", "--no-build")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        sandbox_run = next(
+            line
+            for line in self.fx.calls()
+            if line.startswith("docker run -d")
+            and f"--name sc-{self.fx.root.name}" in line
+        )
+        namespace = self.fx.home / ".local" / "state"
+        for target in (
+            namespace,
+            namespace / "subfloor",
+            namespace / "subfloor" / "instances",
+        ):
+            self.assertIn(
+                f" --tmpfs {target}:uid=0,gid=0,mode=0700 ", sandbox_run
+            )
+        state_target = namespace / "subfloor" / "instances" / state_root.name
+        self.assertIn(f" -v {state_root}:{state_target} ", sandbox_run)
+        self.assertNotIn(
+            f" -v {state_root.parent}:{state_root.parent} ", sandbox_run
+        )
+        self.assertIn(" --user 0:0 ", sandbox_run)
 
     def test_launch_fails_closed_when_review_api_never_becomes_healthy(self):
         self.fx.env["SC_TEST_CURL_FAIL"] = "1"
