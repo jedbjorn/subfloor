@@ -395,10 +395,35 @@ class InstanceStateResolverTests(unittest.TestCase):
         ):
             self.assertEqual(self.resolve(create=False), resolved)
 
+    def test_accepts_visible_owner_uid_when_mapping_uses_another_domain(self):
+        resolved = self.resolve()
+
+        with mock.patch.object(
+            instance_state, "_namespace_host_uid", return_value=0
+        ):
+            self.assertEqual(self.resolve(create=False), resolved)
+
+    def test_refuses_owner_uid_outside_visible_and_mapped_domains(self):
+        resolved = self.resolve()
+        metadata = resolved.root / "owner.json"
+        payload = json.loads(metadata.read_text())
+        payload["owner_uid"] = 2000
+        metadata.write_text(json.dumps(payload))
+
+        with mock.patch.object(
+            instance_state, "_namespace_host_uid", return_value=1000
+        ), self.assertRaisesRegex(
+            instance_state.InstanceStateError, "foreign private instance state"
+        ):
+            self.resolve(create=False)
+
     def test_uid_mapping_fails_closed_when_owner_is_not_mapped(self):
         uid_map = self.base / "uid_map"
         uid_map.write_text("0 1000 1\n1 100000 65536\n")
         self.assertEqual(instance_state._namespace_host_uid(0, uid_map), 1000)
+
+        uid_map.write_text("1000 0 1\n")
+        self.assertEqual(instance_state._namespace_host_uid(1000, uid_map), 0)
 
         uid_map.write_text("1 100000 65536\nmalformed\n")
         self.assertEqual(instance_state._namespace_host_uid(0, uid_map), 0)

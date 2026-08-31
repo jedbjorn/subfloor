@@ -22,6 +22,30 @@ class Stop(Exception):
 
 
 class UpdateServiceCutoverTest(unittest.TestCase):
+    def test_in_process_snapshot_uses_scoped_update_admin_authority(self):
+        observed_admin = []
+
+        def snapshot(*, lease_held):
+            snapshot_mod.require_admin("snapshot")
+            observed_admin.append((lease_held, os.environ.get("SC_ADMIN")))
+
+        with mock.patch.dict(os.environ, {}, clear=False), mock.patch.object(
+            snapshot_mod, "main", side_effect=snapshot
+        ):
+            os.environ.pop("SC_ADMIN", None)
+            update.snapshot_under_cutover()
+            self.assertNotIn("SC_ADMIN", os.environ)
+
+        self.assertEqual(observed_admin, [(True, "1")])
+
+    def test_in_process_snapshot_restores_admin_environment_after_failure(self):
+        with mock.patch.dict(os.environ, {"SC_ADMIN": "caller"}), mock.patch.object(
+            snapshot_mod, "main", side_effect=SystemExit("snapshot failed")
+        ):
+            with self.assertRaisesRegex(SystemExit, "snapshot failed"):
+                update.snapshot_under_cutover()
+            self.assertEqual(os.environ.get("SC_ADMIN"), "caller")
+
     def assert_restart_failure_stops_all(
         self,
         *,
@@ -169,6 +193,7 @@ class UpdateServiceCutoverTest(unittest.TestCase):
                 migration_targets.append(update.DB_PATH)
 
             def snapshot_body():
+                self.assertEqual(os.environ.get("SC_ADMIN"), "1")
                 snapshot_targets.append(
                     (snapshot_mod.DB_PATH, snapshot_mod.OUT_PATH)
                 )
