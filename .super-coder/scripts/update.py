@@ -1424,7 +1424,7 @@ def reconcile_under_cutover(
     source: bool,
     target_sha: str | None,
     worktrees: tuple[Path, ...],
-    target_source: str | None = None,
+    target_source: str | None,
 ) -> None:
     """Reconcile the new floor while relocation ownership is still held."""
     refresh_installed_brokers()
