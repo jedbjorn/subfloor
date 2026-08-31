@@ -12,9 +12,10 @@ the last snapshot and lose unsnapshotted in-session writes).
 B7 model: the engine is a **gitignored, materialized dependency** — it is not
 committed to the fork. So an update FETCHES the engine and MATERIALIZES it into
 `.super-coder/` (copy from the fetched ref), instead of `git checkout`ing tracked
-paths. The upstream SHA is pinned in `.sc-state/engine.ref`; the previous pin is
-kept as `.sc-state/engine.ref.prev` — the engine half of the restore point that
-makes `./sc rollback` sound (DB + engine restored together).
+paths. The upstream SHA is pinned in `.sc-state/engine.ref`; its explicit fetch
+locator is tracked in `.sc-state/engine.source`; and the previous pin is kept as
+`.sc-state/engine.ref.prev` — the engine half of the restore point that makes
+`./sc rollback` sound (DB + engine restored together).
 
 Flow:
     1. attempt to fast-forward the current checkout with `git pull --ff-only`,
@@ -768,6 +769,27 @@ def publish_engine_ref(sha: str) -> None:
     print(f"  engine pinned at {sha[:12]} (.sc-state/engine.ref)")
 
 
+def resolve_engine_source() -> str | None:
+    """Resolve the exact fetch locator through this update's bound repo root."""
+    remote = super_coder_remote()
+    result = git("remote", "get-url", remote, check=False)
+    source = result.stdout.strip()
+    if result.returncode != 0 or not install_mod.valid_engine_source(source):
+        return None
+    return source
+
+
+def publish_engine_provenance(sha: str, source: str) -> None:
+    """Publish source first, then the atomic ref pointer as the commit point."""
+    if not install_mod.valid_engine_source(source):
+        raise ValueError("engine source is not a supported absolute Git locator")
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    pending = STATE_DIR / "engine.source.pending"
+    pending.write_text(source + "\n")
+    os.replace(pending, STATE_DIR / "engine.source")
+    publish_engine_ref(sha)
+
+
 def materialize_fetched_engine(
     sha: str,
     *,
@@ -1402,6 +1424,7 @@ def reconcile_under_cutover(
     source: bool,
     target_sha: str | None,
     worktrees: tuple[Path, ...],
+    target_source: str | None = None,
 ) -> None:
     """Reconcile the new floor while relocation ownership is still held."""
     refresh_installed_brokers()
@@ -1439,7 +1462,9 @@ def reconcile_under_cutover(
         print(f"  {install_mod.wire_make_aliases()}")
 
     if target_sha is not None:
-        publish_engine_ref(target_sha)
+        if target_source is None:
+            raise RuntimeError("update: fetched engine has no source provenance")
+        publish_engine_provenance(target_sha, target_source)
         reconcile_linked_dispatchers(target_sha, worktrees=worktrees)
     elif source:
         canonical = REPO_ROOT / "sc"
@@ -1499,8 +1524,15 @@ def main(argv: list[str]) -> int:
         sync_repo_checkout()
 
     target_sha = None
+    target_source = None
     if not source and not no_fetch:
         target_sha = fetch_update_ref(branch, ref=ref)
+        target_source = resolve_engine_source()
+        if target_source is None:
+            sys.exit(
+                "update: fetched engine remote has no supported absolute source "
+                "locator; engine.ref was not advanced"
+            )
     if source:
         # The source repo IS the engine — it has no upstream to materialize from
         # and must keep tracking .super-coder/. Reconcile its own tree only.
@@ -1562,6 +1594,7 @@ def main(argv: list[str]) -> int:
             source=source,
             target_sha=target_sha,
             worktrees=worktrees,
+            target_source=target_source,
         )
     )
 
@@ -1584,7 +1617,7 @@ def main(argv: list[str]) -> int:
         branch_hint = f"repin-{pin}" if pin else "repin-<sha>"
         print("  This edited tracked files in place but did NOT touch git. Recommended flow:")
         print(f"    git checkout -b {branch_hint}")
-        print("    git add sc .sc-state/engine.ref .gitignore   "
+        print("    git add sc .sc-state/engine.ref .sc-state/engine.source .gitignore   "
               "# sc when the materialize changed it; + Makefile/workflow "
               "changes when reported")
         print("    git commit -m 'chore(engine): repin' && git push -u origin HEAD")

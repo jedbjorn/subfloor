@@ -1316,11 +1316,15 @@ class UpdateRefPublicationTest(unittest.TestCase):
             repair_git_worktrees=mock.Mock(return_value=()),
             sync_repo_checkout=mock.Mock(),
             fetch_update_ref=mock.Mock(return_value=self.NEW),
+            resolve_engine_source=mock.Mock(return_value="file:///engine-source"),
             migrate_engine_untrack=mock.Mock(),
             migrate_generated_artifacts_local=mock.Mock(),
             materialize_fetched_engine=mock.Mock(side_effect=materialize),
             reload_materialized_seed_skills=mock.Mock(side_effect=reload_seed),
             publish_engine_ref=mock.Mock(side_effect=publish),
+            publish_engine_provenance=mock.Mock(
+                side_effect=lambda sha, _source: publish(sha)
+            ),
             reconcile_linked_dispatchers=mock.Mock(side_effect=reconcile),
             ensure_workflows=mock.Mock(return_value=("current", [])),
             expire_sandbox_harnesses=mock.Mock(return_value=None),

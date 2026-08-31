@@ -681,7 +681,8 @@ _GITIGNORE_BLOCK = f"""{_GITIGNORE_BEGIN}
 /.codex/hooks.json
 # Shell worktrees — one per shell, linked inside the repo root.
 /.sc-worktrees/
-# The engine pin is tracked. Every generated instance artifact is local-only.
+# The engine pin + source provenance are tracked. Every generated instance
+# artifact is local-only.
 /.sc-state/engine.ref.prev
 /.sc-state/content.sql
 /.sc-state/map_content.sql
@@ -896,11 +897,50 @@ def resolve_engine_ref() -> str | None:
     return sha
 
 
-def write_engine_ref(sha: str) -> None:
-    """Publish a callable engine SHA as the fork's rollback/version pin."""
+def resolve_engine_source() -> str | None:
+    """Return the explicit Git locator used to obtain the installed engine."""
+    remote = sc_remote()
+    if not remote:
+        return None
+    result = sh("git", "-C", str(REPO_ROOT), "remote", "get-url", remote)
+    source = result.stdout.strip()
+    if result.returncode != 0 or not valid_engine_source(source):
+        return None
+    return source
+
+
+def valid_engine_source(source: str) -> bool:
+    """Accept only one absolute Git transport locator without whitespace."""
+    if not source or any(character.isspace() for character in source):
+        return False
+    if source.startswith(("https://", "ssh://", "git://", "file://")):
+        return True
+    return bool(re.fullmatch(r"git@[^:]+:.+", source))
+
+
+def write_engine_provenance(sha: str, source: str) -> None:
+    """Publish source first, then the atomic ref pointer as the commit point."""
+    if not re.fullmatch(r"[0-9a-f]{40}", sha):
+        raise ValueError("engine SHA must be a lowercase 40-character SHA-1")
+    if not valid_engine_source(source):
+        raise ValueError("engine source is not a supported absolute Git locator")
     state = REPO_ROOT / ".sc-state"
     state.mkdir(parents=True, exist_ok=True)
-    (state / "engine.ref").write_text(sha + "\n")
+    pending_source = state / "engine.source.pending"
+    pending_ref = state / "engine.ref.pending"
+    pending_source.write_text(source + "\n")
+    pending_ref.write_text(sha + "\n")
+    os.replace(pending_source, state / "engine.source")
+    os.replace(pending_ref, state / "engine.ref")
+
+
+def write_engine_ref(sha: str) -> None:
+    """Compatibility helper for callers that can only publish a pin."""
+    state = REPO_ROOT / ".sc-state"
+    state.mkdir(parents=True, exist_ok=True)
+    pending = state / "engine.ref.pending"
+    pending.write_text(sha + "\n")
+    os.replace(pending, state / "engine.ref")
 
 
 def step(msg: str) -> None:
@@ -1034,15 +1074,20 @@ def main(argv: list[str]) -> int:
     print("  git rm -r --cached .super-coder (files kept on disk)" if untrack_engine()
           else "  (engine already untracked)")
     pinned = resolve_engine_ref()
+    source = resolve_engine_source()
     callable_floor.require_callable_floor(
         REPO_ROOT,
         expected_ref=pinned,
         allow_unpinned=pinned is None,
         context="install",
     )
-    if pinned is not None:
+    if pinned is not None and source is not None:
+        write_engine_provenance(pinned, source)
+        print(f"  pinned engine.ref at {pinned[:12]} with tracked source provenance")
+    elif pinned is not None:
         write_engine_ref(pinned)
         print(f"  pinned engine.ref at {pinned[:12]}")
+        print("  (engine source is unavailable — fresh clones will refuse install)")
     else:
         print("  (could not resolve upstream ref — `./sc update` will pin it)")
     # First engine hash manifest: the checkout just brought the engine in, so
