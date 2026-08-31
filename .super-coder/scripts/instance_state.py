@@ -464,6 +464,28 @@ def _ensure_owned_directory(
     return existed
 
 
+def _namespace_host_uid(
+    owner_uid: int,
+    uid_map: Path = Path("/proc/self/uid_map"),
+) -> int:
+    """Translate a namespace UID to its kernel-mapped host UID when available."""
+    try:
+        mappings = uid_map.read_text().splitlines()
+    except OSError:
+        return owner_uid
+    for mapping in mappings:
+        fields = mapping.split()
+        if len(fields) != 3:
+            continue
+        try:
+            namespace_start, host_start, length = map(int, fields)
+        except ValueError:
+            continue
+        if namespace_start <= owner_uid < namespace_start + length:
+            return host_start + owner_uid - namespace_start
+    return owner_uid
+
+
 def _ensure_private_root(
     root: Path,
     instance_id: str,
@@ -491,7 +513,11 @@ def _ensure_private_root(
     if metadata.exists() or metadata.is_symlink():
         _lstat_owned_regular(metadata, "private state owner metadata", owner_uid)
         payload = _load_json_object(metadata, "private state owner metadata")
-        if payload.get(INSTANCE_ID_KEY) != instance_id or payload.get("owner_uid") != owner_uid:
+        metadata_owner_uid = _namespace_host_uid(owner_uid)
+        if (
+            payload.get(INSTANCE_ID_KEY) != instance_id
+            or payload.get("owner_uid") != metadata_owner_uid
+        ):
             raise InstanceStateError("refusing foreign private instance state")
         return
     if existed or not create:
