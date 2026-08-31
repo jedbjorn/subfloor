@@ -48,8 +48,13 @@ gitignored. After `self_update` succeeds, stage only the durable public update:
 ```bash
 git add .sc-state/engine.ref
 git status --short
-git commit -m "chore: update super-coder engine pin"
+SC_SHELL_FLAVOR=admin git commit -m "chore: update super-coder engine pin"
 ```
+
+Set the marker on this commit command even inside an Admin shell. The update
+may have replaced the pre-commit hook during a session launched by the old
+floor, whose inherited environment cannot contain the new Admin exemption.
+The marker makes that one post-update handoff explicit without bypassing hooks.
 
 Add the root `sc` dispatcher or another public file only when the update
 deliberately changed it. Never force-add `.super-coder/`, local snapshots,

@@ -292,8 +292,25 @@ def _instance_id_lock(config_path: Path, owner_uid: int):
         directory_info.st_mode
     ):
         raise InstanceStateError("refusing unsafe instance identity lock directory")
-    if directory_info.st_uid != owner_uid or stat.S_IMODE(directory_info.st_mode) & 0o022:
+    if directory_info.st_uid != owner_uid:
         raise InstanceStateError("refusing foreign instance identity lock directory")
+    if stat.S_IMODE(directory_info.st_mode) != PRIVATE_DIRECTORY_MODE:
+        try:
+            os.chmod(lock_directory, PRIVATE_DIRECTORY_MODE)
+            directory_info = lock_directory.lstat()
+        except OSError as exc:
+            raise InstanceStateError(
+                f"cannot secure instance identity lock directory: {exc}"
+            ) from exc
+        if (
+            stat.S_ISLNK(directory_info.st_mode)
+            or not stat.S_ISDIR(directory_info.st_mode)
+            or directory_info.st_uid != owner_uid
+            or stat.S_IMODE(directory_info.st_mode) != PRIVATE_DIRECTORY_MODE
+        ):
+            raise InstanceStateError(
+                "refusing unsafe instance identity lock directory"
+            )
     lock_path = lock_directory / "instance-id.lock"
     flags = os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0)
     try:

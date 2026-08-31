@@ -338,6 +338,17 @@ class InstanceStateResolverTests(unittest.TestCase):
         ):
             self.resolve()
 
+    def test_normalizes_owner_owned_identity_lock_directory_permissions(self):
+        self.config.write_text(json.dumps({"port": 8837}) + "\n")
+        lock_directory = self.engine / "run"
+        lock_directory.mkdir(mode=0o775)
+        os.chmod(lock_directory, 0o775)
+
+        resolved = self.resolve()
+
+        self.assertEqual(resolved.instance_id, self.fixed_id)
+        self.assertEqual(stat.S_IMODE(lock_directory.stat().st_mode), 0o700)
+
     def test_refuses_symlinked_private_directory(self):
         foreign = self.base / "foreign-state"
         foreign.mkdir()
