@@ -3,9 +3,12 @@
 # single-owner dispatcher). The dispatcher body is engine-owned and
 # materialized by `./sc update` (.super-coder/scripts/dispatch.sh), so every
 # checkout of an install — the main checkout or any linked worktree, on any
-# branch age — dispatches the LIVE engine floor. This file only resolves WHERE
-# that floor is during normal dispatch: it carries no verbs or help text and
-# never writes. A stale committed copy remains harmless for ordinary dispatch.
+# branch age — dispatches the LIVE engine floor. During normal dispatch this
+# file only resolves WHERE that floor is: it carries no verbs or help text and
+# never writes. Its one admission exception is `install` in a fresh main
+# checkout. That path materializes the exact tracked engine provenance before
+# handing control to the engine-owned installer. A stale committed copy remains
+# harmless for ordinary dispatch.
 # Run from the repo root:  ./sc <command> [args]
 set -e
 
@@ -20,6 +23,7 @@ case "$0" in
 esac
 CALLER_ROOT="$(CDPATH= cd -- "$sc_boot_dir" && pwd -P)"
 LIVE_ROOT="$CALLER_ROOT"
+sc_boot_linked=0
 if [ -f "$CALLER_ROOT/.git" ]; then
   IFS= read -r sc_gitdir_line < "$CALLER_ROOT/.git" || sc_gitdir_line=
   case "$sc_gitdir_line" in
@@ -38,6 +42,7 @@ if [ -f "$CALLER_ROOT/.git" ]; then
         esac
         sc_commondir="$(CDPATH= cd -- "$sc_commondir" 2>/dev/null && pwd -P || true)"
         if [ -n "$sc_commondir" ]; then
+          sc_boot_linked=1
           sc_common_parent=${sc_commondir%/*}
           [ -d "$sc_common_parent/.super-coder" ] && LIVE_ROOT="$sc_common_parent"
         fi
@@ -53,14 +58,109 @@ if [ -n "${SC_DISPATCH:-}" ]; then
   fi
   DISPATCH="$SC_DISPATCH"
 fi
+
+sc_bootstrap_refuse() {
+  echo "✗ ./sc install: cannot materialize the engine: $1" >&2
+  echo "  No engine was published and no launch or health check was attempted." >&2
+  exit 1
+}
+
+sc_bootstrap_engine() {
+  sc_boot_state="$CALLER_ROOT/.sc-state"
+  sc_boot_ref_file="$sc_boot_state/engine.ref"
+  sc_boot_source_file="$sc_boot_state/engine.source"
+
+  [ -d "$sc_boot_state" ] && [ ! -L "$sc_boot_state" ] ||
+    sc_bootstrap_refuse "missing or unsafe .sc-state directory"
+  [ -f "$sc_boot_ref_file" ] && [ ! -L "$sc_boot_ref_file" ] ||
+    sc_bootstrap_refuse "missing or unsafe .sc-state/engine.ref"
+  [ -f "$sc_boot_source_file" ] && [ ! -L "$sc_boot_source_file" ] ||
+    sc_bootstrap_refuse "missing or unsafe .sc-state/engine.source"
+
+  IFS= read -r sc_boot_ref < "$sc_boot_ref_file" ||
+    sc_bootstrap_refuse "engine.ref must contain one newline-terminated SHA"
+  case "$sc_boot_ref" in
+    *[!0-9a-f]*|'') sc_bootstrap_refuse "engine.ref is not a lowercase SHA-1" ;;
+  esac
+  [ "${#sc_boot_ref}" -eq 40 ] ||
+    sc_bootstrap_refuse "engine.ref is not a 40-character SHA-1"
+  [ "$(awk 'END { print NR }' "$sc_boot_ref_file")" -eq 1 ] ||
+    sc_bootstrap_refuse "engine.ref must contain exactly one line"
+
+  IFS= read -r sc_boot_source < "$sc_boot_source_file" ||
+    sc_bootstrap_refuse "engine.source must contain one newline-terminated locator"
+  [ "$(awk 'END { print NR }' "$sc_boot_source_file")" -eq 1 ] ||
+    sc_bootstrap_refuse "engine.source must contain exactly one line"
+  case "$sc_boot_source" in
+    *' '*|*'	'*) sc_bootstrap_refuse "engine.source contains whitespace" ;;
+    https://*|ssh://*|git://*|file://*|git@?*:?*) : ;;
+    *) sc_bootstrap_refuse "engine.source is not a supported absolute Git locator" ;;
+  esac
+
+  for sc_boot_tool in git tar awk cmp mktemp; do
+    command -v "$sc_boot_tool" >/dev/null 2>&1 ||
+      sc_bootstrap_refuse "$sc_boot_tool is unavailable"
+  done
+  mkdir -p "$sc_boot_state/local" ||
+    sc_bootstrap_refuse "cannot create the local bootstrap staging directory"
+  [ ! -L "$sc_boot_state/local" ] ||
+    sc_bootstrap_refuse ".sc-state/local is an unsafe symlink"
+  sc_boot_candidate=$(mktemp -d "$sc_boot_state/local/engine-bootstrap.XXXXXX") ||
+    sc_bootstrap_refuse "cannot create a private bootstrap candidate"
+  sc_boot_cleanup() {
+    rm -rf -- "$sc_boot_candidate"
+  }
+  trap sc_boot_cleanup 0 1 2 15
+
+  git -C "$CALLER_ROOT" fetch --no-tags "$sc_boot_source" "$sc_boot_ref" ||
+    sc_bootstrap_refuse "the declared source could not fetch engine.ref"
+  sc_boot_fetched=$(git -C "$CALLER_ROOT" rev-parse --verify 'FETCH_HEAD^{commit}' 2>/dev/null || true)
+  [ "$sc_boot_fetched" = "$sc_boot_ref" ] ||
+    sc_bootstrap_refuse "the fetched commit does not equal engine.ref"
+
+  git -C "$CALLER_ROOT" cat-file blob "$sc_boot_ref:sc" > "$sc_boot_candidate/sc" ||
+    sc_bootstrap_refuse "engine.ref does not contain the stable launcher"
+  cmp -s "$CALLER_ROOT/sc" "$sc_boot_candidate/sc" ||
+    sc_bootstrap_refuse "the tracked launcher does not match engine.ref"
+  git -C "$CALLER_ROOT" archive --format=tar \
+    --output="$sc_boot_candidate/engine.tar" "$sc_boot_ref" .super-coder ||
+    sc_bootstrap_refuse "engine.ref does not contain a materializable engine"
+  tar -xf "$sc_boot_candidate/engine.tar" -C "$sc_boot_candidate" ||
+    sc_bootstrap_refuse "the engine archive could not be extracted"
+  rm -f -- "$sc_boot_candidate/engine.tar" "$sc_boot_candidate/sc"
+
+  [ -r "$sc_boot_candidate/.super-coder/scripts/dispatch.sh" ] &&
+    [ -r "$sc_boot_candidate/.super-coder/scripts/install.py" ] &&
+    [ -r "$sc_boot_candidate/.super-coder/schema.sql" ] ||
+    sc_bootstrap_refuse "the staged engine is incomplete"
+  [ ! -e "$CALLER_ROOT/.super-coder" ] && [ ! -L "$CALLER_ROOT/.super-coder" ] ||
+    sc_bootstrap_refuse "a partial engine target appeared during staging"
+  mv "$sc_boot_candidate/.super-coder" "$CALLER_ROOT/.super-coder" ||
+    sc_bootstrap_refuse "the complete engine could not be published"
+  echo "→ materialized engine ${sc_boot_ref%????????????????????????????} from tracked provenance"
+  sc_boot_cleanup
+  trap - 0 1 2 15
+  DISPATCH="$CALLER_ROOT/.super-coder/scripts/dispatch.sh"
+}
+
+if [ ! -f "$DISPATCH" ] && [ ! -e "$LIVE_ROOT/.super-coder" ] &&
+   [ "$sc_boot_linked" -eq 0 ] && [ -z "${SC_DISPATCH:-}" ] &&
+   [ "${1:-}" = install ]; then
+  sc_bootstrap_engine
+fi
 if [ ! -f "$DISPATCH" ]; then
   {
     if [ ! -d "$LIVE_ROOT/.super-coder" ]; then
       echo "✗ ./sc: no engine found."
       echo "    caller root : $CALLER_ROOT"
       echo "    live root   : $LIVE_ROOT"
-      echo "  Neither holds .super-coder/. Run from a super-coder install, or"
-      echo "  install one first (see README)."
+      if [ "$sc_boot_linked" -eq 1 ]; then
+        echo "  A linked worktree cannot own the initial engine materialization."
+        echo "  Run ./sc install from the primary checkout first."
+      else
+        echo "  Neither holds .super-coder/. Run from a super-coder install, or"
+        echo "  install one first (see README)."
+      fi
     else
       echo "✗ ./sc: engine floor predates this launcher."
       echo "    engine       : $LIVE_ROOT/.super-coder"

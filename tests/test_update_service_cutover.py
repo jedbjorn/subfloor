@@ -180,6 +180,7 @@ class UpdateServiceCutoverTest(unittest.TestCase):
                 update,
                 ENGINE=engine,
                 REPO_ROOT=repo,
+                STATE_DIR=repo / ".sc-state",
                 DB_PATH=legacy_db,
                 stop_docker_review_server=mock.Mock(return_value=None),
                 stop_pm2_review_server=mock.Mock(return_value=service),
@@ -216,6 +217,7 @@ class UpdateServiceCutoverTest(unittest.TestCase):
                         source=False,
                         target_sha=target_sha,
                         worktrees=(),
+                        target_source="file:///engine-source",
                     )
                 )
 
@@ -230,6 +232,10 @@ class UpdateServiceCutoverTest(unittest.TestCase):
                 self.assertTrue(state.database.exists())
                 self.assertEqual(state.snapshot.read_text(), "private snapshot\n")
                 update.publish_engine_ref.assert_called_once_with(target_sha)
+                self.assertEqual(
+                    (repo / ".sc-state/engine.source").read_text(),
+                    "file:///engine-source\n",
+                )
                 update.start_pm2_review_server.assert_called_once_with(service)
                 update.start_docker_review_server.assert_called_once_with(None)
                 update.require_restarted_runtime_health.assert_called_once_with()
