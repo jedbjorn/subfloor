@@ -194,8 +194,11 @@ RUN echo "harness epoch: ${SC_HARNESS_EPOCH}" \
 # real home is /root).
 RUN if ! getent group ${SC_GID} >/dev/null; then groupadd -g ${SC_GID} ${SC_USER}; fi \
  && if ! getent passwd ${SC_UID} >/dev/null; then useradd -m -u ${SC_UID} -g ${SC_GID} -s /bin/bash ${SC_USER}; fi \
- && mkdir -p /home/${SC_USER} \
- && chown ${SC_UID}:${SC_GID} /home/${SC_USER}
+ && mkdir -p /home/${SC_USER}/.local/state/subfloor/instances \
+ && chown -R ${SC_UID}:${SC_GID} /home/${SC_USER} \
+ && chmod 0700 /home/${SC_USER}/.local/state \
+               /home/${SC_USER}/.local/state/subfloor \
+               /home/${SC_USER}/.local/state/subfloor/instances
 
 USER ${SC_USER}
 ENV HOME=/home/${SC_USER}

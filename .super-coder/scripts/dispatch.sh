@@ -1200,6 +1200,19 @@ case "$cmd" in
     sc_pg_configured && pg_env="-e DATABASE_URL=${SC_DATABASE_URL:-postgresql://sc:sc@$PGNAME:5432/sc}"
     git_name="$(git -C "$here" config user.name 2>/dev/null || true)"
     git_email="$(git -C "$here" config user.email 2>/dev/null || true)"
+    # A private-state install keeps its engine DB outside the checkout.  The
+    # repo bind below therefore cannot make that state visible to the sandbox,
+    # and mounting the whole owner-local state collection would expose sibling
+    # instances.  Bind only this installation's resolved state directory into
+    # the image's private, pre-created state namespace.  The instance ID stays
+    # identical, so the in-container resolver selects this exact directory even
+    # when the host uses a non-default XDG_STATE_HOME.
+    state_dir="$(dirname "$(sc_engine_db)")"
+    state_mount=""
+    if [ "$state_dir" != "$ENGINE" ]; then
+      state_target="$HOME/.local/state/subfloor/instances/$(basename "$state_dir")"
+      state_mount="-v $state_dir:$state_target"
+    fi
     # Pinned-interpreter passthrough. When the fork's .venv was built from an
     # out-of-tree interpreter — a uv-managed standalone CPython under $HOME, used
     # to pin the app's Python independent of the host's rolling system python —
@@ -1259,6 +1272,7 @@ case "$cmd" in
         -e GIT_COMMITTER_NAME="$git_name" -e GIT_COMMITTER_EMAIL="$git_email" \
         -w "$here" \
         -v "$here:$here" \
+        $state_mount \
         $py_mount \
         -v "$HOME/.claude:$HOME/.claude" \
         -v "$HOME/.claude.json:$HOME/.claude.json" \
@@ -1276,6 +1290,12 @@ case "$cmd" in
       echo "  retry:  ./sc launch --no-build" >&2
       echo "  repair: ./sc enter --devkit-repair" >&2
       exit "$provision_rc"
+    fi
+    if ! sc_wait_until sc_sandbox_alive; then
+      echo "✗ sandbox launch failed: review API did not become healthy; retained '$CNAME' for inspection." >&2
+      echo "  inspect: ./sc logs" >&2
+      echo "  retry:   ./sc launch --no-build" >&2
+      exit 1
     fi
     if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
       printf '\033[1m→ sandbox up\033[0m · \033[1mReview GUI  \033[36mhttp://127.0.0.1:%s\033[0m\n' "$p"
