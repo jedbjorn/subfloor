@@ -383,6 +383,26 @@ class InstanceStateResolverTests(unittest.TestCase):
         ):
             self.resolve()
 
+    def test_accepts_owner_metadata_through_kernel_uid_mapping(self):
+        resolved = self.resolve()
+        metadata = resolved.root / "owner.json"
+        payload = json.loads(metadata.read_text())
+        payload["owner_uid"] = 1000
+        metadata.write_text(json.dumps(payload))
+
+        with mock.patch.object(
+            instance_state, "_namespace_host_uid", return_value=1000
+        ):
+            self.assertEqual(self.resolve(create=False), resolved)
+
+    def test_uid_mapping_fails_closed_when_owner_is_not_mapped(self):
+        uid_map = self.base / "uid_map"
+        uid_map.write_text("0 1000 1\n1 100000 65536\n")
+        self.assertEqual(instance_state._namespace_host_uid(0, uid_map), 1000)
+
+        uid_map.write_text("1 100000 65536\nmalformed\n")
+        self.assertEqual(instance_state._namespace_host_uid(0, uid_map), 0)
+
     def test_create_false_is_read_only_and_requires_existing_identity(self):
         with self.assertRaisesRegex(
             instance_state.InstanceStateError, "has no instance ID"
