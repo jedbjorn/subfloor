@@ -513,10 +513,14 @@ def _ensure_private_root(
     if metadata.exists() or metadata.is_symlink():
         _lstat_owned_regular(metadata, "private state owner metadata", owner_uid)
         payload = _load_json_object(metadata, "private state owner metadata")
-        metadata_owner_uid = _namespace_host_uid(owner_uid)
+        # Filesystem ownership is reported in this process's UID namespace,
+        # while owner metadata may have been created from either that visible
+        # UID or its parent-namespace mapping.  Accept only those two proven
+        # representations of the already-validated filesystem owner.
+        accepted_owner_uids = {owner_uid, _namespace_host_uid(owner_uid)}
         if (
             payload.get(INSTANCE_ID_KEY) != instance_id
-            or payload.get("owner_uid") != metadata_owner_uid
+            or payload.get("owner_uid") not in accepted_owner_uids
         ):
             raise InstanceStateError("refusing foreign private instance state")
         return

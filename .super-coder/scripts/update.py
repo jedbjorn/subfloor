@@ -131,7 +131,18 @@ def snapshot_under_cutover() -> None:
     """Snapshot in-process so the parent update retains its exclusive lease."""
     import snapshot as snapshot_mod
 
-    snapshot_mod.main(lease_held=True)
+    # The subprocess path establishes update's Admin authority in run_script().
+    # Keep the same narrow authorization boundary now that snapshot runs in
+    # this process, and do not leak it into the caller's ambient environment.
+    previous_admin = os.environ.get("SC_ADMIN")
+    os.environ["SC_ADMIN"] = "1"
+    try:
+        snapshot_mod.main(lease_held=True)
+    finally:
+        if previous_admin is None:
+            os.environ.pop("SC_ADMIN", None)
+        else:
+            os.environ["SC_ADMIN"] = previous_admin
 
 
 def bind_cutover_state(database: Path) -> None:
