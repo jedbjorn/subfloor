@@ -14,7 +14,6 @@ ENGINE = ROOT / ".super-coder"
 SCRIPTS = ENGINE / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 
-import instance_state
 import map_db
 
 
@@ -36,7 +35,7 @@ class PrivateStateIndependenceTests(unittest.TestCase):
         module = importlib.util.module_from_spec(spec)
 
         with mock.patch.object(
-            instance_state,
+            map_db.instance_state,
             "active_database_path",
             side_effect=AssertionError("must not resolve private state at import"),
         ):
@@ -84,7 +83,7 @@ class PrivateStateIndependenceTests(unittest.TestCase):
         ), mock.patch.object(
             map_db.instance_state,
             "active_database_path",
-            side_effect=instance_state.InstanceStateError(
+            side_effect=map_db.instance_state.InstanceStateError(
                 "cannot read private state owner metadata: permission denied"
             ),
         ):
