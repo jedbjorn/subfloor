@@ -181,8 +181,12 @@ ARG SC_HARNESS_EPOCH=0
 # would let the mount shadow the baked binary with an incompatible host binary.
 # KIMI_NO_MODIFY_PATH skips its shell-rc edit.
 RUN echo "harness epoch: ${SC_HARNESS_EPOCH}" \
- && curl -fsSL https://code.kimi.com/kimi-code/install.sh \
-      | env KIMI_INSTALL_DIR=/usr/local KIMI_NO_MODIFY_PATH=1 bash
+ && curl -fsSL --connect-timeout 15 --max-time 60 \
+      -o /tmp/kimi-install.sh https://code.kimi.com/kimi-code/install.sh \
+ && timeout --signal=TERM --kill-after=10s 180s \
+      env KIMI_INSTALL_DIR=/usr/local KIMI_NO_MODIFY_PATH=1 \
+      bash /tmp/kimi-install.sh \
+ && rm -f /tmp/kimi-install.sh
 
 # A user matching the host uid/gid so bind-mounted files aren't root-owned.
 # A host GID or UID may already exist in the base image — sudo builds pass
