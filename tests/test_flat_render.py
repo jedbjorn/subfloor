@@ -139,6 +139,15 @@ class FlatDocumentReconciliationTest(unittest.TestCase):
             ):
                 flat._render_documents(con, written, skipped, root)
 
+            self.assertEqual(
+                flat.document_render_issues(con),
+                [
+                    (
+                        "duplicate document render path 'specs_sc//shared.md': "
+                        "document IDs 11 and 12"
+                    )
+                ],
+            )
             self.assertEqual(target.read_text(), "preserved\n")
             self.assertEqual(written, [])
             self.assertEqual(skipped, [])

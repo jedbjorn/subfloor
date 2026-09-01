@@ -101,6 +101,38 @@ EJECTED_MARKER = STATE_DIR / "ejected"
 # this export remains the warned fallback and the stable name callers know.
 ENGINE_PATHS = engine_manifest.ENGINE_PATHS
 
+_UPDATE_ADVISORIES: list[tuple[str, str, str]] = []
+
+
+def reset_update_report() -> None:
+    _UPDATE_ADVISORIES.clear()
+
+
+def record_update_advisory(area: str, detail: str, action: str) -> None:
+    entry = (
+        area,
+        " ".join(str(detail).split()),
+        " ".join(str(action).split()),
+    )
+    if entry in _UPDATE_ADVISORIES:
+        return
+    _UPDATE_ADVISORIES.append(entry)
+    print(f"! update advisory [{entry[0]}]: {entry[1]}")
+    print(f"  follow-up: {entry[2]}")
+
+
+def render_update_report(*, only_if_any: bool = False) -> int:
+    if only_if_any and not _UPDATE_ADVISORIES:
+        return 0
+    print("\nupdate report:")
+    if not _UPDATE_ADVISORIES:
+        print("  no follow-ups detected")
+        return 0
+    for index, (area, detail, action) in enumerate(_UPDATE_ADVISORIES, 1):
+        print(f"  {index}. [{area}] {detail}")
+        print(f"     follow-up: {action}")
+    return len(_UPDATE_ADVISORIES)
+
 _VISUAL_QA_MARKER_RE = re.compile(
     r"^# managed-by: subfloor — visual-qa shim v(?P<version>\d+)$"
 )
@@ -725,22 +757,55 @@ def sync_repo_checkout() -> None:
     an operator updating one commit behind, and the warning is what the silent
     version lacked. `--no-fetch` skips this step outright.
     """
+    status = git("status", "--short", check=False)
+    if status.returncode != 0:
+        record_update_advisory(
+            "checkout",
+            "Git could not inspect the working tree before update",
+            "run `git status` and reconcile the checkout after update",
+        )
+    elif status.stdout.strip():
+        count = len(status.stdout.splitlines())
+        record_update_advisory(
+            "checkout",
+            f"working tree contains {count} local change(s); update preserved them",
+            "review `git status --short` and commit, stash, or discard each change",
+        )
+
     branch = git("rev-parse", "--abbrev-ref", "HEAD", check=False).stdout.strip()
     if not branch or branch == "HEAD":
+        record_update_advisory(
+            "checkout",
+            "detached HEAD prevented checkout fast-forward",
+            "attach the checkout to its intended branch and reconcile its upstream",
+        )
         print("→ engine sync: detached HEAD — skipped (no branch to fast-forward)")
         return
     upstream = git("rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}",
                    check=False)
     tracking = upstream.stdout.strip()
     if upstream.returncode != 0 or not tracking:
+        record_update_advisory(
+            "checkout",
+            f"branch {branch!r} has no upstream and was not fast-forwarded",
+            "set or inspect the branch upstream after update",
+        )
         print(f"→ engine sync: '{branch}' tracks no upstream — skipped")
         return
     before = git("rev-parse", "HEAD", check=False).stdout.strip()
     pull = git("pull", "--ff-only", check=False)
     if pull.returncode != 0:
+        detail = pull.stderr.strip().splitlines()[-1] if pull.stderr.strip() else ""
+        record_update_advisory(
+            "checkout",
+            f"fast-forward failed for {branch} -> {tracking}: "
+            f"{detail or 'Git refused the pull'}",
+            "reconcile the checkout by hand; the engine update continued "
+            "from the current tree",
+        )
         print(f"! engine sync: `git pull --ff-only` failed for "
               f"{branch} → {tracking}.")
-        print(f"  {pull.stderr.strip().splitlines()[-1] if pull.stderr.strip() else ''}")
+        print(f"  {detail}")
         print(f"  Updating anyway from the CURRENT tree — update never merges, "
               f"rebases or resets. Reconcile {REPO_ROOT} by hand for the newer floor.")
         return
@@ -1487,19 +1552,61 @@ def regrant() -> int:
 
 def reconcile_skill_projections() -> dict:
     """Sweep existing checkouts and the managed skill catalogue after DB sync."""
+    summary: dict = {
+        "written": [],
+        "skipped": [],
+        "deleted": [],
+        "checkouts": [],
+        "complete": True,
+        "render_issues": [],
+    }
     con = db_driver.connect(DB_PATH)
     try:
         try:
             summary = skill_projection.reconcile_existing_checkouts(con)
         except skill_projection.ProjectionError as exc:
-            sys.exit(skill_projection.partial_failure_message(
-                "update catalogue reconciliation", exc
-            ))
-        catalogue = flat.render_skills_catalogue(con)
+            summary["complete"] = False
+            record_update_advisory(
+                "skill projection",
+                skill_projection.partial_failure_message(
+                    "update catalogue reconciliation", exc
+                ),
+                "fix the named path, then run `./sc update --no-fetch`",
+            )
+        else:
+            summary["complete"] = True
+        try:
+            catalogue = flat.render_skills_catalogue(con)
+        except Exception as exc:  # noqa: BLE001 - projection is advisory
+            summary["complete"] = False
+            record_update_advisory(
+                "skill catalogue",
+                f"{type(exc).__name__}: {exc}",
+                "resolve the named projection issue, then run `./sc update --no-fetch`",
+            )
+        else:
+            summary["written"].extend(catalogue["written"])
+            summary["skipped"].extend(catalogue["skipped"])
+        try:
+            render_issues = flat.document_render_issues(con)
+        except Exception as exc:  # noqa: BLE001 - diagnostic is advisory
+            record_update_advisory(
+                "document render check",
+                "could not inspect document render consistency: "
+                f"{type(exc).__name__}: {exc}",
+                "inspect the document catalogue and run `./sc render flat` as FnB",
+            )
+        else:
+            summary["render_issues"] = render_issues
+            for issue in render_issues:
+                record_update_advisory(
+                    "document render",
+                    issue,
+                    "resolve document path ownership, then run `./sc render flat` "
+                    "as FnB",
+                )
     finally:
         con.close()
-    summary["written"].extend(catalogue["written"])
-    summary["skipped"].extend(catalogue["skipped"])
     return summary
 
 
@@ -1557,10 +1664,17 @@ def reconcile_under_cutover(
         f"{len(projections['skipped'])} unchanged across "
         f"{len(projections['checkouts'])} existing checkout(s)"
     )
-    print(
-        "  note: DB and disk are current; already-running harness sessions may "
-        "retain previously loaded skill text until reboot"
-    )
+    if not projections.get("complete", True):
+        print("  continued with projection follow-up(s); see update report")
+        print(
+            "  note: DB changes are current; incomplete disk projections remain "
+            "visible in the report"
+        )
+    else:
+        print(
+            "  note: DB and disk are current; already-running harness sessions may "
+            "retain previously loaded skill text until reboot"
+        )
     print("→ wire map automation + map the repo")
     run_script("map_setup.py", update_target_ref=target_sha)
     print("→ snapshot the live state")
@@ -1590,6 +1704,7 @@ def reconcile_under_cutover(
 
 
 def main(argv: list[str]) -> int:
+    reset_update_report()
     run_update_compat()
     no_fetch = "--no-fetch" in argv
     force = "--force" in argv
@@ -1708,6 +1823,7 @@ def main(argv: list[str]) -> int:
     )
 
     print("\nupdate: done — new floor laid in place; your rows are intact.")
+    render_update_report()
     if source:
         # Source repo tracks the engine itself — no fork repin PR; just commit
         # the reconciled tree on a branch as usual.
