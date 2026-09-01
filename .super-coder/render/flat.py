@@ -270,6 +270,21 @@ def _render_skills_catalogue(con, written, skipped, root: Path) -> None:
                       with_banner("\n".join(index).rstrip()), written, skipped)
 
 
+def render_skills_catalogue(
+    con: sqlite3.Connection, root: Path | None = None
+) -> dict:
+    """Render only the managed ``skills_sc`` catalogue.
+
+    Update reconciliation uses this narrow surface so an unrelated document or
+    roadmap render error cannot prevent native skill projections from converging.
+    """
+    root = root or artifact_policy.render_root()
+    written: list[Path] = []
+    skipped: list[Path] = []
+    _render_skills_catalogue(con, written, skipped, root)
+    return {"written": written, "skipped": skipped}
+
+
 def render_visibility(con: sqlite3.Connection, root: "Path | None" = None) -> dict:
     """Render flat `_sc` visibility files under the active artifact root.
 

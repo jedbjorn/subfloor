@@ -1486,7 +1486,7 @@ def regrant() -> int:
 
 
 def reconcile_skill_projections() -> dict:
-    """Sweep existing checkouts and the active catalogue render after DB sync."""
+    """Sweep existing checkouts and the managed skill catalogue after DB sync."""
     con = db_driver.connect(DB_PATH)
     try:
         try:
@@ -1495,7 +1495,7 @@ def reconcile_skill_projections() -> dict:
             sys.exit(skill_projection.partial_failure_message(
                 "update catalogue reconciliation", exc
             ))
-        catalogue = flat.render_visibility(con)
+        catalogue = flat.render_skills_catalogue(con)
     finally:
         con.close()
     summary["written"].extend(catalogue["written"])

@@ -317,6 +317,15 @@ class LegacyUpdateCompatTest(unittest.TestCase):
             fixture = build_dirty_skill_fork(Path(td) / "downstream")
             with closing(sqlite3.connect(fixture.database)) as con:
                 update.seed_skills.reconcile_tombstoned_skills(con)
+                con.executemany(
+                    "INSERT INTO documents "
+                    "(feature_id,kind,seq,title,body,render_path) "
+                    "VALUES (NULL,'doc',?,?,?,?)",
+                    (
+                        (9001, "Legacy owner", "owner", "docs_sc/shared.md"),
+                        (9002, "Legacy duplicate", "duplicate", "docs_sc//shared.md"),
+                    ),
+                )
                 con.commit()
 
             shell_authored = (
@@ -326,7 +335,7 @@ class LegacyUpdateCompatTest(unittest.TestCase):
             shell_authored.parent.mkdir()
             shell_authored.write_text("shell-owned\n")
             real_projection = update.skill_projection.reconcile_existing_checkouts
-            real_catalogue = update.flat.render_visibility
+            real_catalogue = update.flat.render_skills_catalogue
 
             def reconcile(con):
                 return real_projection(con, repo_root=fixture.root)
@@ -348,7 +357,7 @@ class LegacyUpdateCompatTest(unittest.TestCase):
                 "reconcile_existing_checkouts",
                 side_effect=reconcile,
             ) as projection, mock.patch.object(
-                update.flat, "render_visibility", side_effect=render_catalogue
+                update.flat, "render_skills_catalogue", side_effect=render_catalogue
             ), mock.patch.object(
                 update, "repair_callable_dispatcher"
             ), mock.patch.object(
@@ -371,6 +380,9 @@ class LegacyUpdateCompatTest(unittest.TestCase):
                 (fixture.root / ".sc-state/engine.ref").read_text(),
             )
             self.assertEqual(shell_authored.read_text(), "shell-owned\n")
+            self.assertFalse(
+                fixture.catalogue_root.parent.joinpath("docs_sc/shared.md").exists()
+            )
             self.assertEqual(
                 {
                     str(path.relative_to(fixture.root)): path.read_bytes()

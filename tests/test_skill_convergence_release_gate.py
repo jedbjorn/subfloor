@@ -153,7 +153,7 @@ class SkillConvergenceReleaseGateTest(unittest.TestCase):
     @contextmanager
     def patched_update(self, fixture, projection_runs, catalogue_runs):
         real_projection = skill_projection.reconcile_existing_checkouts
-        real_catalogue = update.flat.render_visibility
+        real_catalogue = update.flat.render_skills_catalogue
 
         def reconcile(con):
             summary = real_projection(con, repo_root=fixture.root)
@@ -216,7 +216,7 @@ class SkillConvergenceReleaseGateTest(unittest.TestCase):
             )
             stack.enter_context(
                 mock.patch.object(
-                    update.flat, "render_visibility", side_effect=render_catalogue
+                    update.flat, "render_skills_catalogue", side_effect=render_catalogue
                 )
             )
             yield
