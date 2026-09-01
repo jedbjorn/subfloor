@@ -491,6 +491,12 @@ sc skill list
 projections reconcile. Naming a standard shell changes its shared flavor pack;
 naming a Bespoke shell changes only that shell. Creation grants nothing.
 
+A launched Planner seat runs under the restricted execution view and cannot
+open the engine DB directly; `sc skill put` then falls back to the engine API''s
+Planner-owned skill lane, which runs the identical validation and persistence
+server-side. `retire`/`unretire` remain Admin-local: they write the fork''s
+tracked retire manifest on the host.
+
 ## Update, retire, and recover
 
 ```bash
@@ -501,12 +507,16 @@ sc skill rm <skill_name>
 
 Retry the exact command after fixing a reported snapshot, render, or projection
 path. Pass = the full persistence receipt returns and the projected body
-matches `sc skill list` plus the intended grant. `rm` is only for fork-local
-names; retire an upstream skill with `sc skill retire <name>` and restore it
-with `sc skill unretire <name>`.
+matches `sc skill list` plus the intended grant. On a launched seat the same
+receipt rides the API fallback, so a failure names which of the four layers
+(DB, snapshot, flat render, projection) is still outstanding. `rm` is only for
+fork-local names; retire an upstream skill with `sc skill retire <name>` and
+restore it with `sc skill unretire <name>` — both from an Admin host seat,
+which owns the fork''s tracked retire list.
 
-Never place a fork-local body under `.super-coder/assets/skills/`, regenerate
-the engine seed for it, set it common, or write the engine DB directly.',
+Keep fork-local skill bodies on the supported `sc skill` surface; do not place
+them under engine assets, regenerate the engine seed for them, or set them
+common.',
   0
 )
 ON CONFLICT(name) DO UPDATE SET

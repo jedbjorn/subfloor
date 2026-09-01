@@ -610,6 +610,7 @@ sc mem roadmap depends <feature_id> [--on <feature_id>]…
 
 sc mem doc add "…" --kind <spec|doc> --feature <id> --body-file <path> --render-path <path>
 sc mem doc freeze <document_id>
+sc mem doc move <document_id> --feature <target_feature_id>
 sc mem task add "…" --feature <id> --doc <id> --seq <n> [--desc "…"]
 sc mem task start <task_id>
 sc mem task done <task_id>
@@ -629,7 +630,10 @@ Load the owning skill before a governed write: `memory` for state/identity,
 `spec` for roadmap tasks, `docs` for documents, `flags` for blockers, and
 `messaging` for shell coordination. Frozen documents require a new document
 revision; decisions are superseded with `--parent`; seed entries are retired
-rather than rewritten.
+rather than rewritten. `doc move` preserves one unfrozen spec''s identity,
+tasks, and document-linked decisions while reassigning them atomically to an
+active feature; it refuses frozen, ordinary-doc, terminal-target, and
+Sprint-bound moves.
 
 ## Failure behavior
 
@@ -669,9 +673,11 @@ copy to `specs_sc/` / `docs_sc/`; the GUI opens it rendered in md-converter.
 Feature = the `roadmap` row; exists from `brainstorm` onward, before any spec.
 Specs hang off the feature, not off each other: several unfrozen specs per
 feature, each a `documents (kind=''spec'')` row, ordered by `seq`. No
-feature-to-feature links; no second roadmap row for related work — related
-work = another spec under the same feature. Freeze = the ship-time record of
-what was built to; it never gates the feature''s other specs.
+feature-to-feature links; related work within one mental model is another spec
+under the same feature. A genuinely new era may split into a fresh feature by
+moving its unfrozen active spec through the guarded workflow below. Freeze =
+the ship-time record of what was built to; it never gates the feature''s other
+specs.
 
 | state | test | meaning |
 |---|---|---|
@@ -682,6 +688,25 @@ what was built to; it never gates the feature''s other specs.
 The **doc** (`kind=''doc''`) = the feature''s readable face — write it when the
 first spec ships, under the same `feature_id`. Sibling of the specs, not a
 parent.
+
+## Split an active era from feature history
+
+When accumulated history makes a feature''s active context misleading or a new
+era has become a separate mental model, preserve the old feature as history and
+move the existing unfrozen active spec intact:
+
+1. Create the fresh feature with its correct work-stream, status, and summary.
+2. Run `sc mem doc move <document_id> --feature <target_feature_id>`.
+3. Re-read the document and task ledger under the target feature; the same ids,
+   task states, and document-linked decisions must now project there.
+4. Edit the historical feature''s title/summary to name the split, then set its
+   truthful terminal status (`shipped` for delivered history, `retired` for
+   abandoned history).
+
+The move assigns the spec''s next target-feature sequence and is atomic across
+the document, its tasks, and document-linked decisions. It refuses frozen
+specs, ordinary docs, terminal targets, and any spec already bound to a Sprint.
+Do not duplicate the spec or cancel/recreate its tasks when this move applies.
 
 ## Assess the work-stream on every feature
 
@@ -1578,6 +1603,12 @@ sc skill list
 projections reconcile. Naming a standard shell changes its shared flavor pack;
 naming a Bespoke shell changes only that shell. Creation grants nothing.
 
+A launched Planner seat runs under the restricted execution view and cannot
+open the engine DB directly; `sc skill put` then falls back to the engine API''s
+Planner-owned skill lane, which runs the identical validation and persistence
+server-side. `retire`/`unretire` remain Admin-local: they write the fork''s
+tracked retire manifest on the host.
+
 ## Update, retire, and recover
 
 ```bash
@@ -1588,9 +1619,12 @@ sc skill rm <skill_name>
 
 Retry the exact command after fixing a reported snapshot, render, or projection
 path. Pass = the full persistence receipt returns and the projected body
-matches `sc skill list` plus the intended grant. `rm` is only for fork-local
-names; retire an upstream skill with `sc skill retire <name>` and restore it
-with `sc skill unretire <name>`.
+matches `sc skill list` plus the intended grant. On a launched seat the same
+receipt rides the API fallback, so a failure names which of the four layers
+(DB, snapshot, flat render, projection) is still outstanding. `rm` is only for
+fork-local names; retire an upstream skill with `sc skill retire <name>` and
+restore it with `sc skill unretire <name>` — both from an Admin host seat,
+which owns the fork''s tracked retire list.
 
 Keep fork-local skill bodies on the supported `sc skill` surface; do not place
 them under engine assets, regenerate the engine seed for them, or set them
@@ -2760,6 +2794,9 @@ never marked done or left pending under a shipped feature:
 sc mem task cancel <task_id> --notes "moved to F<id> as task #<n>"
 sc mem state "[<feature>] — last: <last_done>. next: <next_up>."
 ```
+
+Intact spec move: `sc mem doc move <document_id> --feature <target_feature_id>`
+(see `docs`).
 
 Final Verification follows the boot `TESTING POSTURE`. Complete code; run every
 available focused proof; use observed registered-PR checks only for an

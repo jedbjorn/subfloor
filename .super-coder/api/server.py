@@ -78,6 +78,7 @@ import sprint_review_loop  # noqa: E402  (Sprints v2 Dev/Review command surface)
 import sprint_runtime  # noqa: E402  (Sprint dispatch + engine wake delivery)
 import sprint_board  # noqa: E402  (read-only Sprints v2 FnB board projections)
 import skill_projection  # noqa: E402  (exact bounded grant mirrors)
+import skill as skill_mod  # noqa: E402  (planner-owned fork-local catalogue)
 sys.path.insert(0, str(ENGINE / "api"))
 import conversation_routes  # noqa: E402  (Feature #24 browser conversations)
 import review_routes  # noqa: E402  (Feature #26 browser Diff review)
@@ -511,6 +512,141 @@ def get_cli_skills(con) -> dict:
     for skill in skills:
         skill["grant_scopes"] = scopes.get(skill["skill_id"], [])
     return {"skills": skills}
+
+
+# ===========================================================================
+# Authenticated Planner-owned fork-local skill mutations (`sc skill` API lane)
+# ===========================================================================
+#
+# Launched shells (Planner included) run under the restricted execution view
+# (spec execution_view), which masks the engine private-state root, the legacy
+# engine DB, and the snapshot/render files. `sc skill put|grant|revoke|rm`
+# therefore cannot open the DB from the shell seat; only the API (running
+# unrestrained on the host) can. These routes mirror the local CLI mutations:
+# they reuse skill.py's validation + persistence ladder and are planner-only —
+# the same check the CLI enforces via ``require_planner`` for local writes.
+# Retire/unretire stay Admin-only: they edit the fork-tracked retire manifest
+# and deliberately require a tracked file write on the host.
+
+
+class SkillApiError(ValueError):
+    """Client-visible skill mutation failure with a stable HTTP status."""
+
+    def __init__(self, status: int, message: str) -> None:
+        super().__init__(message)
+        self.status = status
+
+
+def _resolve_planner_shell(con, shell_id: int) -> dict:
+    """Reject non-planner shell tokens before any mutation.
+
+    Mirrors ``skill.require_planner`` for the API lane: the authenticated
+    bearer must resolve to an active shell whose flavor is exactly ``planner``.
+    Returns the shell row for downstream messaging; raises SkillApiError on miss.
+    """
+    row = con.execute(
+        "SELECT shell_id, shortname, display_name, flavor FROM shells "
+        "WHERE shell_id=? AND COALESCE(is_deleted,0)=0",
+        (shell_id,),
+    ).fetchone()
+    if row is None:
+        raise SkillApiError(401, "invalid or unknown token")
+    if dict(row).get("flavor") != "planner":
+        label = row["shortname"] or row["display_name"] or row["shell_id"]
+        raise SkillApiError(
+            403,
+            f"skill mutations are Planner-owned; shell {label} has "
+            f"flavor {row['flavor'] or 'bespoke'}",
+        )
+    return dict(row)
+
+
+def _skills_mutation_report(fn, *args, **kwargs):
+    """Unwrap skill.py's CLI-exit failures into structured HTTP errors.
+
+    The local CLI exits via ``sys.exit`` on every validation/conflict failure;
+    on the API lane we convert SystemExit strings, DraftValidationError, and
+    SkillConflictError into 400/404/409 responses so the shell's ``mem._api``
+    surfaces them as actionable CLI messages instead of a bare HTTP 500.
+    """
+    try:
+        return 200, fn(*args, **kwargs)
+    except skill_mod.DraftValidationError as exc:
+        return 400, {"error": str(exc)}
+    except skill_mod.SkillConflictError as exc:
+        return 409, {"error": str(exc)}
+    except SystemExit as exc:
+        message = str(exc.code) if exc.code is not None else "skill mutation refused"
+        # Strip the CLI's `sc skill: ` envelope so the client prints its own.
+        prefix = "sc skill: "
+        if message.startswith(prefix):
+            message = message[len(prefix):]
+        return 400, {"error": message}
+
+
+def api_skill_put(con, content: object) -> tuple[int, dict]:
+    """Create/update one fork-local skill from a JSON ``content`` payload."""
+    if not isinstance(content, str) or not content.strip():
+        raise SkillApiError(400, "content must be the skill's SKILL.md body text")
+    if len(content.encode("utf-8")) > skill_mod.MAX_SKILL_FILE_BYTES:
+        raise SkillApiError(
+            400,
+            f"content is {len(content.encode('utf-8'))} bytes; "
+            f"maximum is {skill_mod.MAX_SKILL_FILE_BYTES} bytes",
+        )
+    spec = skill_mod.parse_local_skill_spec(content)
+    verb = skill_mod._put_spec(con, spec)
+    return {"ok": True, "action": "put", "name": spec["name"], "verb": verb}
+
+
+def api_skill_grant(con, name: object, shells: object) -> tuple[int, dict]:
+    """Grant one skill to every named shell ref via its pack/owner row."""
+    if not isinstance(name, str) or not name.strip():
+        raise SkillApiError(400, "name must be a skill name")
+    if not isinstance(shells, list) or not all(isinstance(s, str) for s in shells):
+        raise SkillApiError(400, "shells must be a list of shell names/ids")
+    rows = skill_mod._grant_spec(con, name.strip(), [s.strip() for s in shells if s.strip()])
+    return {
+        "ok": True,
+        "action": "grant",
+        "name": name.strip(),
+        "results": [
+            {"scope": scope, "changed": changed, "shell": ref}
+            for scope, changed, ref in rows
+        ],
+    }
+
+
+def api_skill_revoke(con, name: object, shells: object) -> tuple[int, dict]:
+    """Revoke one skill from every named shell ref."""
+    if not isinstance(name, str) or not name.strip():
+        raise SkillApiError(400, "name must be a skill name")
+    if not isinstance(shells, list) or not all(isinstance(s, str) for s in shells):
+        raise SkillApiError(400, "shells must be a list of shell names/ids")
+    rows = skill_mod._revoke_spec(con, name.strip(), [s.strip() for s in shells if s.strip()])
+    return {
+        "ok": True,
+        "action": "revoke",
+        "name": name.strip(),
+        "results": [
+            {"scope": scope, "changed": changed, "shell": ref}
+            for scope, changed, ref in rows
+        ],
+    }
+
+
+def api_skill_rm(con, name: object) -> tuple[int, dict]:
+    """Soft-delete one fork-local skill and revoke all grants."""
+    if not isinstance(name, str) or not name.strip():
+        raise SkillApiError(400, "name must be a skill name")
+    n, already = skill_mod._rm_spec(con, name.strip())
+    return {
+        "ok": True,
+        "action": "rm",
+        "name": name.strip(),
+        "revoked_grants": n,
+        "already_removed": already,
+    }
 
 
 def get_model_routes(con, *, harness: str | None = None,
@@ -4010,6 +4146,74 @@ class Handler(BaseHTTPRequestHandler):
         finally:
             con.close()
 
+    # -- authenticated Planner skill catalogue mutations (`sc skill` API lane) --
+
+    def _skills_mutation_post(self, path: str, body: dict):
+        """Route POST /_sc/skills/<action> for a launched Planner shell.
+
+        Planner-only; every local CLI rule is enforced server-side via the
+        shared skill module so the restricted shell seat reaches the same
+        catalogue state that a host Admin sees.
+        """
+        sid = self._require_shell_auth()
+        if sid is None:
+            return
+        con = db()
+        try:
+            try:
+                _resolve_planner_shell(con, sid)
+            except SkillApiError as exc:
+                return self._send(exc.status, {"error": str(exc)})
+            if path == "/_sc/skills/put":
+                status, result = _skills_mutation_report(
+                    api_skill_put, con, body.get("content"))
+                return self._send(status, result)
+            if path == "/_sc/skills/grant":
+                status, result = _skills_mutation_report(
+                    api_skill_grant, con, body.get("name"), body.get("shells"))
+                return self._send(status, result)
+            if path == "/_sc/skills/revoke":
+                status, result = _skills_mutation_report(
+                    api_skill_revoke, con, body.get("name"), body.get("shells"))
+                return self._send(status, result)
+            if path == "/_sc/skills/rm":
+                status, result = _skills_mutation_report(
+                    api_skill_rm, con, body.get("name"))
+                return self._send(status, result)
+            return self._send(404, {"error": "not found"})
+        except Exception as e:
+            return self._fail(e)
+        finally:
+            con.close()
+
+    def _skills_mutation_assign(self, body: dict):
+        """PUT /_sc/skills/assign — grant {name, shell} or revoke {name, shell, granted:false}."""
+        sid = self._require_shell_auth()
+        if sid is None:
+            return
+        con = db()
+        try:
+            try:
+                _resolve_planner_shell(con, sid)
+            except SkillApiError as exc:
+                return self._send(exc.status, {"error": str(exc)})
+            name = body.get("name")
+            shell = body.get("shell") if body.get("shell") is not None else body.get("shells")
+            granted = bool(body.get("granted", True))
+            if shell is None:
+                return self._send(400, {"error": "shell (or shells) is required"})
+            if isinstance(shell, list):
+                fn = api_skill_grant if granted else api_skill_revoke
+                status, result = _skills_mutation_report(fn, con, name, shell)
+                return self._send(status, result)
+            fn = api_skill_grant if granted else api_skill_revoke
+            status, result = _skills_mutation_report(fn, con, name, [shell])
+            return self._send(status, result)
+        except Exception as e:
+            return self._fail(e)
+        finally:
+            con.close()
+
     def _mem_post(self, path: str, body: dict):
         sid = self._require_shell_auth()
         if sid is None:
@@ -4903,6 +5107,13 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         path = urlparse(self.path).path
+        if path.startswith("/_sc/skills/"):
+            # Planner-owned fork-local skill catalogue. Retire/unretire remain
+            # Admin-only (fork-tracked retire manifest on the host).
+            try:
+                return self._skills_mutation_post(path, self._body())
+            except Exception as exc:  # noqa: BLE001 — _fail handles reporting
+                return self._fail(exc)
         if path.startswith("/_sc/mem/"):
             return self._mem_post(path, self._body())
         if path.startswith("/_sc/pr/"):
@@ -5187,6 +5398,15 @@ class Handler(BaseHTTPRequestHandler):
         # pm2 block:    PUT /api/pm2  {pm2: {...}}  (persists to instance.json)
         path = urlparse(self.path).path
         parts = path.strip("/").split("/")
+        if len(parts) == 4 and parts[:3] == ["_sc", "skills", "retire"]:
+            return self._send(403, {"error":
+                "skill retire/unretire are Admin-only: they write the tracked "
+                "fork retire manifest on the host"})
+        if len(parts) == 4 and parts[:3] == ["_sc", "skills", "assign"]:
+            try:
+                return self._skills_mutation_assign(self._body())
+            except Exception as exc:  # noqa: BLE001
+                return self._fail(exc)
         con = db()
         try:
             if len(parts) == 3 and parts[:2] == ["_sc", "runtime-flags"]:
