@@ -10,6 +10,16 @@ and every supported mutation persists the local snapshot and projections.
 Naming a standard shell targets its shared flavor pack; naming a Bespoke shell
 targets only that shell.
 
+Launched shells reach this module through two lanes. A local Admin seat opens
+the DB directly and enforces `require_planner` before `put`. A launched shell
+(including the Planner, whose restricted execution view masks the private
+engine-state root) is detected by a failed direct-DB open and rerouted
+through authenticated `/_sc/skills/*` routes on the review API, which runs
+the same validation and persistence ladder server-side. Both lanes share
+`cmd_*_api`/`_put_spec`/`_grant_spec`/`_revoke_spec`/`_rm_spec`. Retire and
+unretire stay Admin-only in both lanes because they write the fork-tracked
+retire manifest on the host.
+
 Engine catalogue rows are authored as assets + `./sc seed-skills`. Fork-local
 rows are DB-canonical and enter through `put --file`; the input file remains a
 draft and is never copied into managed engine assets.
@@ -60,6 +70,95 @@ def connect():
 
 
 def _shell_api_enabled() -> bool:
+    """True when the caller is a launched shell and must go through the API.
+
+    `sc skill list` already used this lane for reads. It's keyed off the API
+    token alone — a host Admin running `sc` in the repo root has no token, so
+    it always takes the direct-DB path.
+    """
+    if not mem.SC_API_TOKEN:
+        return False
+    mem._PROG = "skill"
+    mem._require_api()
+    return True
+
+
+def _put_with_api_fallback(path: Path) -> int:
+    """Run `put` locally; fall back to the API lane when the DB is unreachable.
+
+    The restricted execution view (launched non-Admin shells) masks the
+    private engine-state root, so a Planner calling `sc skill put` from its
+    seat hits a filesystem permission error before the flavor check. Retry
+    through the engine API, which runs unrestricted and reuses the same
+    validation + persistence ladder. Any other failure surfaces unchanged.
+    """
+    try:
+        con = connect()
+    except SystemExit as exc:
+        if not mem.SC_API_TOKEN:
+            raise
+        if "no live DB" in str(exc):
+            raise
+        return cmd_put_api(path)
+    except (OSError, PermissionError):
+        if not mem.SC_API_TOKEN:
+            raise
+        return cmd_put_api(path)
+    try:
+        return cmd_put(con, path)
+    finally:
+        con.close()
+
+
+def _grant_with_api_fallback(name: str, shell_refs: list[str]) -> int:
+    try:
+        con = connect()
+    except SystemExit as exc:
+        if not mem.SC_API_TOKEN or "no live DB" in str(exc):
+            raise
+        return cmd_grant_api(name, shell_refs)
+    except (OSError, PermissionError):
+        if not mem.SC_API_TOKEN:
+            raise
+        return cmd_grant_api(name, shell_refs)
+    try:
+        return cmd_grant(con, name, shell_refs)
+    finally:
+        con.close()
+
+
+def _revoke_with_api_fallback(name: str, shell_refs: list[str]) -> int:
+    try:
+        con = connect()
+    except SystemExit as exc:
+        if not mem.SC_API_TOKEN or "no live DB" in str(exc):
+            raise
+        return cmd_revoke_api(name, shell_refs)
+    except (OSError, PermissionError):
+        if not mem.SC_API_TOKEN:
+            raise
+        return cmd_revoke_api(name, shell_refs)
+    try:
+        return cmd_revoke(con, name, shell_refs)
+    finally:
+        con.close()
+
+
+def _rm_with_api_fallback(name: str) -> int:
+    try:
+        con = connect()
+    except SystemExit as exc:
+        if not mem.SC_API_TOKEN or "no live DB" in str(exc):
+            raise
+        return cmd_rm_api(name)
+    except (OSError, PermissionError):
+        if not mem.SC_API_TOKEN:
+            raise
+        return cmd_rm_api(name)
+    try:
+        return cmd_rm(con, name)
+    finally:
+        con.close()
     if not mem.SC_API_TOKEN:
         return False
     mem._PROG = "skill"
@@ -229,8 +328,82 @@ def _persist_mutation(con, action: str, reconcile) -> None:
     print("persist: DB + snapshot + flat render + skill projections reconciled")
 
 
+class DraftValidationError(ValueError):
+    """One frontmatter/body rule failed — message is client-displayable."""
+
+
+class SkillConflictError(ValueError):
+    """The requested skill mutation violates an engine/fork boundary rule."""
+
+
+def parse_local_skill_spec(text: str) -> dict:
+    """Validate frontmatter + body text and return the skill row spec.
+
+    Raises DraftValidationError with a client-readable message on any rule
+    failure. Shared by the CLI file path and the API JSON-content path so both
+    lanes enforce the identical contract.
+    """
+    lines = text.splitlines()
+    if not lines or lines[0].strip() != "---":
+        raise DraftValidationError("draft must start with YAML frontmatter")
+    try:
+        boundary = next(
+            index
+            for index, line in enumerate(lines[1:], start=1)
+            if line.strip() == "---"
+        )
+    except StopIteration:
+        raise DraftValidationError("draft has no closing frontmatter delimiter")
+
+    meta: dict[str, str] = {}
+    for line in lines[1:boundary]:
+        if not line.strip():
+            continue
+        if ":" not in line:
+            raise DraftValidationError(f"invalid frontmatter line: {line!r}")
+        key, value = (part.strip() for part in line.split(":", 1))
+        if key not in LOCAL_FRONTMATTER_FIELDS:
+            raise DraftValidationError(f"unsupported frontmatter field {key!r}")
+        if key in meta:
+            raise DraftValidationError(f"duplicate frontmatter field {key!r}")
+        meta[key] = value
+
+    name = meta.get("name", "")
+    description = meta.get("description", "")
+    if not name or not seed_skills.SKILL_NAME_RE.fullmatch(name) or len(name) > 64:
+        raise DraftValidationError(
+            "frontmatter `name` must be 1-64 lowercase letters, "
+            "digits, or underscores and start with a letter"
+        )
+    if not description:
+        raise DraftValidationError(
+            "frontmatter `description` must be a non-empty line"
+        )
+
+    common_value = meta.get("common", "false").lower()
+    if common_value not in {"false", "0", "no"}:
+        if common_value in {"true", "1", "yes"}:
+            raise DraftValidationError(
+                "fork-local skills must use `common: false`; assign "
+                "them explicitly with `sc skill grant`"
+            )
+        raise DraftValidationError("frontmatter `common` must be true or false")
+
+    body = "\n".join(lines[boundary + 1:]).strip()
+    if not body:
+        raise DraftValidationError("draft must include a non-empty procedure body")
+    return {
+        "name": name,
+        "description": description,
+        "category": meta.get("category") or None,
+        "command": meta.get("command") or None,
+        "common": 0,
+        "content": body,
+    }
+
+
 def parse_local_skill_file(path: Path) -> dict:
-    """Validate the bounded flat frontmatter accepted by `skill put`."""
+    """Read a draft from disk and hand its body to the shared validator."""
     try:
         raw = path.read_bytes()
     except OSError as exc:
@@ -244,62 +417,10 @@ def parse_local_skill_file(path: Path) -> dict:
         text = raw.decode("utf-8")
     except UnicodeDecodeError as exc:
         sys.exit(f"sc skill: draft {path} must be UTF-8: {exc}")
-
-    lines = text.splitlines()
-    if not lines or lines[0].strip() != "---":
-        sys.exit(f"sc skill: draft {path} must start with YAML frontmatter")
     try:
-        boundary = next(
-            index
-            for index, line in enumerate(lines[1:], start=1)
-            if line.strip() == "---"
-        )
-    except StopIteration:
-        sys.exit(f"sc skill: draft {path} has no closing frontmatter delimiter")
-
-    meta: dict[str, str] = {}
-    for line in lines[1:boundary]:
-        if not line.strip():
-            continue
-        if ":" not in line:
-            sys.exit(f"sc skill: invalid frontmatter line in {path}: {line!r}")
-        key, value = (part.strip() for part in line.split(":", 1))
-        if key not in LOCAL_FRONTMATTER_FIELDS:
-            sys.exit(f"sc skill: unsupported frontmatter field {key!r} in {path}")
-        if key in meta:
-            sys.exit(f"sc skill: duplicate frontmatter field {key!r} in {path}")
-        meta[key] = value
-
-    name = meta.get("name", "")
-    description = meta.get("description", "")
-    if not name or not seed_skills.SKILL_NAME_RE.fullmatch(name) or len(name) > 64:
-        sys.exit(
-            "sc skill: frontmatter `name` must be 1-64 lowercase letters, "
-            "digits, or underscores and start with a letter"
-        )
-    if not description:
-        sys.exit("sc skill: frontmatter `description` must be a non-empty line")
-
-    common_value = meta.get("common", "false").lower()
-    if common_value not in {"false", "0", "no"}:
-        if common_value in {"true", "1", "yes"}:
-            sys.exit(
-                "sc skill: fork-local skills must use `common: false`; assign "
-                "them explicitly with `sc skill grant`"
-            )
-        sys.exit("sc skill: frontmatter `common` must be true or false")
-
-    body = "\n".join(lines[boundary + 1:]).strip()
-    if not body:
-        sys.exit(f"sc skill: draft {path} must include a non-empty procedure body")
-    return {
-        "name": name,
-        "description": description,
-        "category": meta.get("category") or None,
-        "command": meta.get("command") or None,
-        "common": 0,
-        "content": body,
-    }
+        return parse_local_skill_spec(text)
+    except DraftValidationError as exc:
+        sys.exit(f"sc skill: draft {path}: {exc}")
 
 
 def print_catalogue(rows: list[dict]) -> int:
@@ -332,6 +453,70 @@ def cmd_list(con) -> int:
 
 def cmd_list_api() -> int:
     return print_catalogue(mem._api("GET", "/_sc/skills").get("skills") or [])
+
+
+def cmd_put_api(path: Path) -> int:
+    """`sc skill put` over the API lane; parses the draft locally first."""
+    try:
+        raw = path.read_bytes()
+    except OSError as exc:
+        sys.exit(f"sc skill: cannot read draft {path}: {exc}")
+    if len(raw) > MAX_SKILL_FILE_BYTES:
+        sys.exit(
+            f"sc skill: draft {path} is {len(raw)} bytes; maximum is "
+            f"{MAX_SKILL_FILE_BYTES} bytes"
+        )
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        sys.exit(f"sc skill: draft {path} must be UTF-8: {exc}")
+    try:
+        spec = parse_local_skill_spec(text)
+    except DraftValidationError as exc:
+        sys.exit(f"sc skill: draft {path}: {exc}")
+    result = mem._api(
+        "POST", "/_sc/skills/put", {"content": text}, idempotent=False
+    )
+    print(f"put: {result['name']} {result['verb']} (via engine API); "
+          "grants unchanged")
+    return 0
+
+
+def cmd_grant_api(name: str, shell_refs: list[str]) -> int:
+    result = mem._api(
+        "POST", "/_sc/skills/grant",
+        {"name": name, "shells": shell_refs}, idempotent=False,
+    )
+    for row in result.get("results") or []:
+        suffix = "" if row["changed"] else "  (already granted)"
+        print(f"grant: {result['name']} → {row['scope']}{suffix}")
+    print(f"(via engine API — {len(result.get('results') or [])} target(s))")
+    return 0
+
+
+def cmd_revoke_api(name: str, shell_refs: list[str]) -> int:
+    result = mem._api(
+        "POST", "/_sc/skills/revoke",
+        {"name": name, "shells": shell_refs}, idempotent=False,
+    )
+    for row in result.get("results") or []:
+        suffix = "" if row["changed"] else "  (was not granted)"
+        print(f"revoke: {result['name']} ⇸ {row['scope']}{suffix}")
+    print(f"(via engine API — {len(result.get('results') or [])} target(s))")
+    return 0
+
+
+def cmd_rm_api(name: str) -> int:
+    result = mem._api(
+        "POST", "/_sc/skills/rm", {"name": name}, idempotent=False
+    )
+    suffix = " (already removed; persistence reconciled)" if result.get(
+        "already_removed") else ""
+    print(
+        f"rm: {result['name']} soft-deleted, {result['revoked_grants']} "
+        f"grant(s) revoked.{suffix} (via engine API)"
+    )
+    return 0
 
 
 def cmd_grant(con, name: str, shell_refs: list[str]) -> int:
@@ -370,16 +555,21 @@ def cmd_revoke(con, name: str, shell_refs: list[str]) -> int:
     return 0
 
 
-def cmd_put(con, path: Path) -> int:
-    require_planner(con)
-    spec = parse_local_skill_file(path)
+def _put_spec(con, spec: dict) -> str:
+    """Create-or-replace one fork-local skill row and persist every layer.
+
+    Caller must enforce planner ownership before invoking. Returns the action
+    verb (created|restored|updated) on success; on failure raises
+    SystemExit|SkillConflictError so the caller can report or re-raise with a
+    boundary prefix.
+    """
     name = spec["name"]
     reserved = set(seed_skills.seeded_skill_names()) | set(
         seed_skills.tombstoned_skill_names()
     )
     if name in reserved:
-        sys.exit(
-            f"sc skill: '{name}' is ENGINE-owned and cannot be overwritten by "
+        raise SkillConflictError(
+            f"'{name}' is ENGINE-owned and cannot be overwritten by "
             "the fork-local lane; change it in the upstream engine skill workflow"
         )
 
@@ -418,7 +608,103 @@ def cmd_put(con, path: Path) -> int:
         f"put {name}",
         lambda: skill_projection.reconcile_existing_checkouts(con),
     )
-    print(f"put: {name} {verb} in the DB; grants unchanged")
+    return verb
+
+
+def _grant_spec(con, name: str, shell_refs: list[str]) -> list[tuple[str, bool, str]]:
+    """Grant one skill to every shell ref (flavor pack or Bespoke shell)."""
+    skill_id = resolve_skill_id(con, name)
+    rows: list[tuple[str, bool, str]] = []
+    targets: list[int] = []
+    for ref in shell_refs:
+        shell_id, label = resolve_shell(con, ref)
+        targets.append(shell_id)
+        changed, scope = set_target_grant(con, shell_id, label, skill_id, True)
+        rows.append((scope, bool(changed), ref))
+    con.commit()
+    _persist_mutation(
+        con,
+        f"grant {name}",
+        lambda: skill_projection.reconcile_assignment_targets(con, targets),
+    )
+    return rows
+
+
+def _revoke_spec(con, name: str, shell_refs: list[str]) -> list[tuple[str, bool, str]]:
+    """Revoke one skill from every shell ref (flavor pack or Bespoke shell)."""
+    skill_id = resolve_skill_id(con, name)
+    rows: list[tuple[str, bool, str]] = []
+    targets: list[int] = []
+    for ref in shell_refs:
+        shell_id, label = resolve_shell(con, ref)
+        targets.append(shell_id)
+        changed, scope = set_target_grant(con, shell_id, label, skill_id, False)
+        rows.append((scope, bool(changed), ref))
+    con.commit()
+    _persist_mutation(
+        con,
+        f"revoke {name}",
+        lambda: skill_projection.reconcile_assignment_targets(con, targets),
+    )
+    return rows
+
+
+def _rm_spec(con, name: str) -> tuple[int, bool]:
+    """Soft-delete one fork-local skill + revoke all grants. Returns count."""
+    engine_owned = set(seed_skills.seeded_skill_names()) | set(
+        seed_skills.tombstoned_skill_names()
+    )
+    if name in engine_owned:
+        raise SkillConflictError(
+            f"'{name}' is an ENGINE skill — the seed re-inserts it on every "
+            "update/rebuild, so a local rm cannot stick. `./sc skill retire "
+            f"{name}` retires it fork-wide (durable), or `./sc skill revoke` "
+            "removes it from a flavor or Bespoke shell."
+        )
+    row = con.execute(
+        "SELECT skill_id, is_deleted FROM skills WHERE name=?", (name,)
+    ).fetchone()
+    if row is None:
+        raise SkillConflictError(f"no local skill '{name}' in the live DB")
+    skill_id, already_deleted = row
+    n = con.execute("DELETE FROM flavor_skills WHERE skill_id=?", (skill_id,)).rowcount
+    n += con.execute("DELETE FROM shell_skills WHERE skill_id=?", (skill_id,)).rowcount
+    con.execute("UPDATE skills SET is_deleted=1 WHERE skill_id=?", (skill_id,))
+    con.commit()
+    _persist_mutation(
+        con,
+        f"rm {name}",
+        lambda: skill_projection.reconcile_existing_checkouts(con),
+    )
+    return int(n), bool(already_deleted)
+
+
+def resolve_skill_id(con, name: str) -> int:
+    """Resolve a skill name to its id, raising SkillConflictError on a miss."""
+    try:
+        return resolve_skill(con, name)
+    except SystemExit as exc:
+        raise SkillConflictError(str(exc) or f"no skill '{name}'") from exc
+
+
+def cmd_put(con, path: Path) -> int:
+    require_planner(con)
+    spec = parse_local_skill_file(path)
+    try:
+        verb = _put_spec(con, spec)
+    except SkillConflictError as exc:
+        sys.exit(f"sc skill: {exc}")
+    print(f"put: {spec['name']} {verb} in the DB; grants unchanged")
+    return 0
+
+
+def cmd_rm(con, name: str) -> int:
+    try:
+        n, already = _rm_spec(con, name)
+    except SkillConflictError as exc:
+        sys.exit(f"sc skill: {exc}")
+    suffix = " (already removed; persistence reconciled)" if already else ""
+    print(f"rm: {name} soft-deleted, {n} grant(s) revoked.{suffix}")
     return 0
 
 
@@ -486,35 +772,6 @@ def cmd_unretire(con, name: str) -> int:
     return 0
 
 
-def cmd_rm(con, name: str) -> int:
-    engine_owned = set(seed_skills.seeded_skill_names()) | set(
-        seed_skills.tombstoned_skill_names()
-    )
-    if name in engine_owned:
-        sys.exit(f"sc skill: '{name}' is an ENGINE skill — the seed re-inserts it "
-                 "on every update/rebuild, so a local rm cannot stick. "
-                 f"`./sc skill retire {name}` retires it fork-wide (durable), or "
-                 "`./sc skill revoke` removes it from a flavor or Bespoke shell.")
-    row = con.execute(
-        "SELECT skill_id, is_deleted FROM skills WHERE name=?", (name,)
-    ).fetchone()
-    if row is None:
-        sys.exit(f"sc skill: no local skill '{name}' in the live DB")
-    skill_id, already_deleted = row
-    n = con.execute("DELETE FROM flavor_skills WHERE skill_id=?", (skill_id,)).rowcount
-    n += con.execute("DELETE FROM shell_skills WHERE skill_id=?", (skill_id,)).rowcount
-    con.execute("UPDATE skills SET is_deleted=1 WHERE skill_id=?", (skill_id,))
-    con.commit()
-    _persist_mutation(
-        con,
-        f"rm {name}",
-        lambda: skill_projection.reconcile_existing_checkouts(con),
-    )
-    suffix = " (already removed; persistence reconciled)" if already_deleted else ""
-    print(f"rm: {name} soft-deleted, {n} grant(s) revoked.{suffix}")
-    return 0
-
-
 def main(argv: list[str]) -> int:
     usage = ("usage: ./sc skill list | put --file <SKILL.md> | "
              "grant <name> <shell>... | "
@@ -526,6 +783,28 @@ def main(argv: list[str]) -> int:
     cmd, args = argv[0], argv[1:]
     if cmd == "list" and not args and _shell_api_enabled():
         return cmd_list_api()
+    if cmd == "put" and len(args) == 2 and args[0] == "--file":
+        # The restricted execution view masks the engine's private state root,
+        # so a launched Planner cannot open the DB directly; when that happens
+        # the API lane runs the same validation + persistence ladder remotely.
+        return _put_with_api_fallback(Path(args[1]))
+    if cmd == "grant" and len(args) >= 2:
+        return _grant_with_api_fallback(args[0], args[1:])
+    if cmd == "revoke" and len(args) >= 2:
+        return _revoke_with_api_fallback(args[0], args[1:])
+    if cmd == "rm" and len(args) == 1:
+        return _rm_with_api_fallback(args[0])
+    con = connect()
+    try:
+        if cmd == "list" and not args:
+            return cmd_list(con)
+        if cmd == "retire" and len(args) == 1:
+            return cmd_retire(con, args[0])
+        if cmd == "unretire" and len(args) == 1:
+            return cmd_unretire(con, args[0])
+        sys.exit(usage)
+    finally:
+        con.close()
     con = connect()
     try:
         if cmd == "list" and not args:
