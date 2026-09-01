@@ -106,6 +106,10 @@ def main() -> int:
         # while their tracked bootstrap still routes to a retired script.
         import update
 
+        reset_report = getattr(update, "reset_update_report", None)
+        if reset_report is not None:
+            reset_report()
+
         update.repair_callable_dispatcher(current)
         # A current updater publishes only after migrate + snapshot. Defer its
         # linked-worktree overlays until then so a crash cannot leave bytes that
@@ -118,9 +122,18 @@ def main() -> int:
                 "→ update compatibility: reconcile managed skill projections "
                 f"at {current[:12]}"
             )
-            update.reconcile_skill_projections()
-            SKILL_SWEEP_MARKER.parent.mkdir(parents=True, exist_ok=True)
-            SKILL_SWEEP_MARKER.write_text(f"{current}\n")
+            summary = update.reconcile_skill_projections() or {}
+            if summary.get("complete", True):
+                SKILL_SWEEP_MARKER.parent.mkdir(parents=True, exist_ok=True)
+                SKILL_SWEEP_MARKER.write_text(f"{current}\n")
+            else:
+                print(
+                    "  compatibility skill sweep incomplete; marker retained "
+                    "for retry"
+                )
+        render_report = getattr(update, "render_update_report", None)
+        if render_report is not None:
+            render_report(only_if_any=True)
 
     needed, current = needs_legacy_bridge()
     if not needed:

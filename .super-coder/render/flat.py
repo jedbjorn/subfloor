@@ -100,6 +100,33 @@ def document_rel_path(row) -> str:
     return f"{base}/{slug}.md"
 
 
+def document_render_issues(con: sqlite3.Connection) -> list[str]:
+    """Return document projection inconsistencies without writing anything."""
+    rows = con.execute(
+        "SELECT document_id,feature_id,kind,seq,title,body,render_path "
+        "FROM documents WHERE body IS NOT NULL AND body != '' "
+        "ORDER BY feature_id,kind,seq,document_id"
+    ).fetchall()
+    owners: dict[Path, int] = {}
+    issues: list[str] = []
+    for row in rows:
+        rel = document_rel_path(row)
+        try:
+            target = _document_target(Path(), rel, row["kind"])
+        except ValueError as exc:
+            issues.append(f"document ID {row['document_id']}: {exc}")
+            continue
+        previous = owners.get(target)
+        if previous is not None:
+            issues.append(
+                f"duplicate document render path {rel!r}: "
+                f"document IDs {previous} and {row['document_id']}"
+            )
+            continue
+        owners[target] = row["document_id"]
+    return issues
+
+
 # ── Flat visibility render ────────────────────────────────────────────────────
 
 def _render_documents(con, written, skipped, root: Path) -> None:
@@ -115,19 +142,9 @@ def _render_documents(con, written, skipped, root: Path) -> None:
         "LEFT JOIN roadmap r ON r.feature_id = d.feature_id "
         "ORDER BY d.feature_id, d.kind, d.seq"
     ).fetchall()
-    owners: dict[Path, tuple[int, str]] = {}
-    for row in rows:
-        if not row["body"]:
-            continue
-        rel = document_rel_path(row)
-        target = _document_target(root, rel, row["kind"])
-        previous = owners.get(target)
-        if previous is not None:
-            raise ValueError(
-                f"duplicate document render path {rel!r}: "
-                f"document IDs {previous[0]} and {row['document_id']}"
-            )
-        owners[target] = (row["document_id"], rel)
+    issues = document_render_issues(con)
+    if issues:
+        raise ValueError(issues[0])
 
     expected: set[Path] = set()
     for r in rows:

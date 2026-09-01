@@ -58,6 +58,39 @@ def commit(root: Path, message: str) -> str:
 
 
 class LegacyUpdateCompatTest(unittest.TestCase):
+    def test_projection_and_render_inconsistencies_are_advisory(self) -> None:
+        connection = sqlite3.connect(":memory:")
+        output = io.StringIO()
+        with mock.patch.object(
+            update.db_driver, "connect", return_value=connection
+        ), mock.patch.object(
+            update.skill_projection,
+            "reconcile_existing_checkouts",
+            side_effect=update.skill_projection.ProjectionError("unsafe skill root"),
+        ), mock.patch.object(
+            update.flat,
+            "render_skills_catalogue",
+            side_effect=ValueError("catalogue collision"),
+        ), mock.patch.object(
+            update.flat,
+            "document_render_issues",
+            return_value=["duplicate document path: IDs 1 and 2"],
+        ), contextlib.redirect_stdout(output):
+            update.reset_update_report()
+            summary = update.reconcile_skill_projections()
+            update.render_update_report()
+
+        self.assertFalse(summary["complete"])
+        self.assertEqual(
+            summary["render_issues"],
+            ["duplicate document path: IDs 1 and 2"],
+        )
+        rendered = output.getvalue()
+        self.assertIn("[skill projection]", rendered)
+        self.assertIn("[skill catalogue]", rendered)
+        self.assertIn("[document render]", rendered)
+        self.assertIn("update report:", rendered)
+
     def test_installed_repo_reconciles_managed_host_wrapper(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td) / "fork"
@@ -364,7 +397,7 @@ class LegacyUpdateCompatTest(unittest.TestCase):
                 update, "reconcile_linked_dispatchers"
             ), mock.patch.object(
                 update_compat, "needs_legacy_bridge", return_value=(False, None)
-            ):
+            ), contextlib.redirect_stdout(io.StringIO()) as output:
                 self.assertEqual(0, update_compat.main())
                 first_projection = {
                     str(path.relative_to(fixture.root)): path.read_bytes()
@@ -380,6 +413,8 @@ class LegacyUpdateCompatTest(unittest.TestCase):
                 (fixture.root / ".sc-state/engine.ref").read_text(),
             )
             self.assertEqual(shell_authored.read_text(), "shell-owned\n")
+            self.assertIn("[document render]", output.getvalue())
+            self.assertIn("duplicate document render path", output.getvalue())
             self.assertFalse(
                 fixture.catalogue_root.parent.joinpath("docs_sc/shared.md").exists()
             )

@@ -267,19 +267,13 @@ class SkillConvergenceReleaseGateTest(unittest.TestCase):
             )
         return projected, catalogued
 
-    def test_update_failure_is_loud_then_two_retries_converge_to_noop(self) -> None:
+    def test_update_advises_then_two_retries_converge_to_noop(self) -> None:
         fixture = self.build_fixture("update-fork")
         projection_runs = []
         catalogue_runs = []
         with self.patched_update(fixture, projection_runs, catalogue_runs):
             with self.blocked_projection_root(fixture) as (parked, sentinel):
-                with self.assertRaisesRegex(
-                    SystemExit,
-                    "update catalogue reconciliation committed in the DB, but "
-                    "skill projection failed: managed skill root is a symlink.*"
-                    "run `./sc update --no-fetch`.*retry exact cleanup",
-                ):
-                    update.main(["--no-fetch"])
+                self.assertEqual(update.main(["--no-fetch"]), 0)
                 self.assertEqual(sentinel.read_bytes(), b"outside projection control\n")
                 self.assertTrue(parked.joinpath(TOMBSTONE_SKILLS[0]).is_dir())
                 self.assertEqual(
