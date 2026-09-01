@@ -162,6 +162,7 @@
     ".super-coder/api/sprint_routes.py",
     ".super-coder/api/transport.py",
     ".super-coder/assets/skills/authoring_syntax/SKILL.md",
+    ".super-coder/assets/skills/db_map/SKILL.md",
     ".super-coder/assets/skills/docs/SKILL.md",
     ".super-coder/assets/skills/git/SKILL.md",
     ".super-coder/assets/skills/memory/SKILL.md",

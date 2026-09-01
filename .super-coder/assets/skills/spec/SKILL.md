@@ -94,12 +94,8 @@ sc mem task cancel <task_id> --notes "moved to F<id> as task #<n>"
 sc mem state "[<feature>] — last: <last_done>. next: <next_up>."
 ```
 
-Cancellation applies when work is copied or replanned into a different spec.
-When the existing unfrozen spec itself starts a fresh feature era, use
-`sc mem doc move <document_id> --feature <target_feature_id>` instead: the
-document, its task ledger, and its document-linked decisions move atomically,
-so their identities and statuses remain intact. Follow the `docs` split
-workflow to verify the target and annotate the historical feature.
+Intact spec move: `sc mem doc move <document_id> --feature <target_feature_id>`
+(see `docs`).
 
 Final Verification follows the boot `TESTING POSTURE`. Complete code; run every
 available focused proof; use observed registered-PR checks only for an
