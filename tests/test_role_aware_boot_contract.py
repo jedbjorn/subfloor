@@ -13,6 +13,7 @@ ENGINE = ROOT / ".super-coder"
 sys.path[:0] = [str(ENGINE / "render"), str(ENGINE / "scripts")]
 
 compose = importlib.import_module("compose")
+seed_skills = importlib.import_module("seed_skills")
 shell_factory = importlib.import_module("shell_factory")
 
 
@@ -29,6 +30,14 @@ WORKER_FORBIDDEN = (
 
 
 class BoundaryRenderingTest(unittest.TestCase):
+    def test_universal_boot_calibrates_work_to_fnb_and_project(self):
+        rendered = compose.TEMPLATE_PATH.read_text()
+
+        self.assertIn("Let the FnB's intent set the posture", rendered)
+        self.assertIn("Use prior decisions and the\nproject's actual needs", rendered)
+        self.assertIn("include them in the work itself\nonly when relevant", rendered)
+        self.assertIn("ask the FnB before choosing for them", rendered)
+
     def test_fork_worker_routes_each_data_surface_without_engine_internals(self):
         boundary = compose.render_data_boundaries("dev", False, "host")
         rendered = (
@@ -128,8 +137,105 @@ class StandardPromptRefreshTest(unittest.TestCase):
             0,
         )
 
+    def test_planner_and_reviewer_prompts_use_proportionate_judgment(self):
+        planner = shell_factory.load_flavor("planner")
+        reviewer = shell_factory.load_flavor("reviewer")
+
+        self.assertIn("keep the plan proportionate", planner["focus"])
+        self.assertNotIn("Interrogate every objective", planner["focus"])
+        self.assertNotIn("edge cases are named", planner["mandate"])
+
+        self.assertIn("Match review depth and skepticism", reviewer["focus"])
+        self.assertIn("optional hardening or personal preference", reviewer["focus"])
+        self.assertNotIn("adversarial by default", reviewer["mandate"].lower())
+        self.assertNotIn("three axes, every time", reviewer["focus"])
+
+
+class AdaptivePostureMigrationTest(unittest.TestCase):
+    def test_exact_legacy_mandates_converge_without_touching_custom_rows(self):
+        con = sqlite3.connect(":memory:")
+        con.execute(
+            "CREATE TABLE shells ("
+            "shell_id INTEGER PRIMARY KEY, flavor TEXT, mandate TEXT, "
+            "system_prompt TEXT)"
+        )
+        con.execute(
+            "CREATE TABLE skills ("
+            "skill_id INTEGER PRIMARY KEY, name TEXT UNIQUE, description TEXT, "
+            "category TEXT, command TEXT, common INTEGER, content TEXT, "
+            "is_deleted INTEGER DEFAULT 0)"
+        )
+        old_planner = (
+            "Turn objectives into specs and sequenced plans for sample-app. "
+            "Own the roadmap; decide before building. A spec ships only when "
+            "the workflow is defined end to end, the edge cases are named, "
+            "and the open questions are answered — not assumed."
+        )
+        old_reviewer = (
+            "Review changes, specs, and decisions in sample-app. Adversarial by "
+            "default: assume a defect is present until you have verified it is "
+            "not. Find the bug the author missed, the edge case no one handled, "
+            "and the gap between the spec and the diff."
+        )
+        con.executemany(
+            "INSERT INTO shells VALUES (?,?,?,?)",
+            (
+                (1, "planner", old_planner, f"prefix\n{old_planner}\nsuffix"),
+                (2, "reviewer", old_reviewer, f"prefix\n{old_reviewer}\nsuffix"),
+                (3, "planner", "Custom planning mandate", "custom prompt"),
+            ),
+        )
+
+        con.executescript(
+            (ENGINE / "migrations" / "0246_adaptive_shell_posture.sql").read_text()
+        )
+
+        planner = con.execute(
+            "SELECT mandate,system_prompt FROM shells WHERE shell_id=1"
+        ).fetchone()
+        reviewer = con.execute(
+            "SELECT mandate,system_prompt FROM shells WHERE shell_id=2"
+        ).fetchone()
+        custom = con.execute(
+            "SELECT mandate,system_prompt FROM shells WHERE shell_id=3"
+        ).fetchone()
+        review = con.execute(
+            "SELECT description,category,command,common,content,is_deleted "
+            "FROM skills WHERE name='review'"
+        ).fetchone()
+        con.close()
+
+        self.assertIn("materially affect what should be built", planner[0])
+        self.assertNotIn("edge cases are named", planner[1])
+        self.assertIn("Verify consequential claims", reviewer[0])
+        self.assertNotIn("Adversarial by default", reviewer[1])
+        self.assertEqual(custom, ("Custom planning mandate", "custom prompt"))
+        expected_review = seed_skills.parse_skill(
+            ENGINE / "assets" / "skills" / "review" / "SKILL.md"
+        )
+        self.assertEqual(
+            review,
+            (
+                expected_review["description"],
+                expected_review["category"],
+                expected_review["command"],
+                expected_review["common"],
+                expected_review["content"],
+                0,
+            ),
+        )
+
 
 class SkillSplitTest(unittest.TestCase):
+    def test_review_skill_uses_material_lenses_not_forced_exhaustiveness(self):
+        body = (ENGINE / "assets" / "skills" / "review" / "SKILL.md").read_text()
+
+        self.assertIn("Review what matters for this change", body)
+        self.assertIn("do not manufacture\ncoverage to complete a checklist", body)
+        self.assertIn("Match skepticism to the work", body)
+        self.assertNotIn("Apply every axis on every review", body)
+        self.assertNotIn("Adversarial by default", body)
+
     def test_common_guidance_is_api_only_and_admin_skill_owns_internals(self):
         for name in (
             "cartographer",

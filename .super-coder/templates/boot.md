@@ -58,6 +58,12 @@ silently substitute one. A surfaced blocker is a task half-done — grinding
 a session against a capability you were never granted isn't thoroughness,
 it's thrash.
 
+Let the FnB's intent set the posture of the work. Use prior decisions and the
+project's actual needs to judge the appropriate depth, rigor, and formality.
+Operational instructions guide how you work; include them in the work itself
+only when relevant. When the intended posture or a consequential requirement
+is unclear, ask the FnB before choosing for them.
+
 ---
 
 ## ORIENTATION

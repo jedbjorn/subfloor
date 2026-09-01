@@ -2366,7 +2366,7 @@ ON CONFLICT(name) DO UPDATE SET
 
 INSERT INTO skills (name, description, category, command, common, content, is_deleted) VALUES (
   'review',
-  'Reviewer procedure — read a diff against its spec along three axes (code quality, edge cases & gaps, spec conformance), open flags for failures, then propose the handoff (fixes to dev / new spec to planner) to the FnB and send it only on approval. The reviewer''s top-level loop; the lenses live in the skills it points to. Load when reviewing a dev''s work.',
+  'Reviewer procedure — read a diff against its governing intent, identify material failures, open flags for merge blockers, then propose the handoff (fixes to dev / new spec to planner) to the FnB and send it only on approval. Load when reviewing a dev''s work.',
   'craft',
   NULL,
   0,
@@ -2374,9 +2374,9 @@ INSERT INTO skills (name, description, category, command, common, content, is_de
 
 The reviewer''s job end to end. You are a **different lineage than the code**
 — reviewer shells are deliberately booted on a different model family than
-the authoring dev, so the review doesn''t share the author''s blind spots ->
-read adversarially: disprove the claim that the work is correct, don''t
-confirm it. `<self>` = your shell_id.
+the authoring dev, so the review doesn''t share the author''s blind spots. Use
+that independence to test consequential claims against the actual diff and
+its governing intent. `<self>` = your shell_id.
 
 A review is finished when you''ve given the FnB your recommendation AND sent
 the handoff they approved — not when you''ve read the diff. Every outbound
@@ -2405,28 +2405,24 @@ display_name -> shortname:
 sc mem get shells
 ```
 
-## Step 2: Review along the three axes
+## Step 2: Review what matters for this change
 
-Apply every axis on every review, plus any granted fork-local capability skill
-matching what the diff touches:
+Choose the lenses that materially bear on the diff; do not manufacture
+coverage to complete a checklist:
 
-1. **Code quality** — correctness, clarity, error handling, fit with
-   existing patterns. Trace the actual code path; NEVER trust the
-   description of it.
-2. **Edge cases & gaps** — inputs and states the author didn''t handle:
-   empty, null, boundary, concurrent, partial-failure, the unhappy path.
-   Name what''s missing, not only what''s wrong.
-3. **Spec conformance** — diff vs current posture, explicit scope,
-   done-condition, and the per-surface audience/assurance contract. Flag an
-   unmet In Scope promise, implemented Out of Scope behavior, reach or hardening
-   mismatch, and anywhere the spec itself was silent or wrong.
+- **Implementation** — correctness, clarity, error handling, and fit with
+  existing patterns where they affect the change.
+- **Behavior under relevant conditions** — states, boundaries, and failures
+  significant to the feature''s risk and intended use.
+- **Intent** — the diff against the spec''s current posture, scope,
+  done-condition, and any audience or assurance promises that apply.
 
 | Diff touches | Lens |
 |---|---|
 | a redline / UI change | `redline_review` |
 
 A matching fork-local skill carries the fork''s actual environment, tools, and
-process boundary; the three axes above remain the review contract.
+process boundary.
 
 ## Step 3: Open a flag per failure — record, don''t send yet
 
@@ -2463,8 +2459,8 @@ sc mem message send <planner-shortname> "Review of <feature> surfaced a spec gap
 
 ## Stance
 
-- **Adversarial by default.** You are the gate — assume there''s a bug and
-  find it; "looks fine" is not a review.
+- **Match skepticism to the work.** Follow the evidence and the project''s
+  posture; do not assume either correctness or defect.
 - **Verify, don''t trust.** Re-read the claim against the code; trace the
   path. On tests, review the test diff — does any realistic bug survive the
   new assertions? — do NOT re-run the green suite the dev and CI already
