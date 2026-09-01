@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Resolve, open, and seed the map DB — the repo catalogue (dr_*).
 
 The map is a derived cache of the host repo, owned by the cartographer. It lives
@@ -32,7 +31,6 @@ REPO_ROOT = ENGINE.parent
 MAP_DB_PATH = artifact_policy.map_db_path()
 MAP_SCHEMA = ENGINE / "map_schema.sql"
 MAP_CONTENT = artifact_policy.map_content_path()
-ENGINE_DB = instance_state.active_database_path(ENGINE)
 
 
 def ensure_schema(con: sqlite3.Connection) -> None:
@@ -64,10 +62,18 @@ def seed_authored(con: sqlite3.Connection) -> None:
         con.commit()
         return
     # Transition: lift dr_section out of the pre-split engine DB if it still has it.
-    if not ENGINE_DB.exists():
+    # Resolve this optional source only after the durable map sources miss. In
+    # downstream sandboxes the owner-private engine namespace is intentionally
+    # unreadable; that boundary must not block an independent derived-map refresh.
+    try:
+        engine_db = instance_state.active_database_path(ENGINE)
+    except instance_state.InstanceStateError as exc:
+        print(f"map_db: legacy section import unavailable ({exc}) — continuing")
+        return
+    if not engine_db.exists():
         return
     try:
-        eng = sqlite3.connect(f"file:{ENGINE_DB}?mode=ro", uri=True)
+        eng = sqlite3.connect(f"file:{engine_db}?mode=ro", uri=True)
     except sqlite3.OperationalError:
         return
     try:
@@ -100,7 +106,7 @@ def connect(*, seed: bool = True) -> sqlite3.Connection:
     return con
 
 
-def open_ro() -> "sqlite3.Connection | None":
+def open_ro() -> sqlite3.Connection | None:
     """Open the map DB read-only for rendering. None if it doesn't exist yet
     (a fork that hasn't mapped) — callers degrade to 'not mapped'."""
     if not MAP_DB_PATH.exists():
