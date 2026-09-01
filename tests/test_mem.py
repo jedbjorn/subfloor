@@ -822,6 +822,205 @@ class ApiMemTest(unittest.TestCase):
             server.run_snapshot_render = real_rsr
             server.serialize_doc_write = lambda: {"ok": True, "output": "(test stub)"}
 
+    def test_move_spec_to_feature_preserves_identity_and_plan(self):
+        self.run_mem("roadmap", "add", "split source")
+        self.run_mem("roadmap", "add", "split target")
+        source = self.q(
+            "SELECT feature_id FROM roadmap WHERE title='split source'"
+        )[0]
+        target = self.q(
+            "SELECT feature_id FROM roadmap WHERE title='split target'"
+        )[0]
+        self.write(
+            "INSERT INTO documents (feature_id,kind,seq,title) "
+            "VALUES (?,'spec',1,'existing target spec')",
+            target,
+        )
+        did = self.write(
+            "INSERT INTO documents (feature_id,kind,seq,title) "
+            "VALUES (?,'spec',7,'active v2 spec')",
+            source,
+        )
+        tid = self.write(
+            "INSERT INTO spec_tasks "
+            "(feature_id,document_id,seq,title,status,shell_id) "
+            "VALUES (?,?,0,'Preparation','in_progress',1)",
+            source,
+            did,
+        )
+        decision_id = self.write(
+            "INSERT INTO shell_decisions "
+            "(shell_id,decision_date,decision,rationale,feature_id,document_id) "
+            "VALUES (1,'2026-09-01','move with the spec','why',?,?)",
+            source,
+            did,
+        )
+
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            self.assertEqual(
+                self.run_mem(
+                    "doc", "move", str(did), "--feature", str(target)
+                ),
+                0,
+            )
+        self.assertIn(f"feature #{source} → #{target}", output.getvalue())
+        self.assertIn("as spec seq 2 (1 task(s), 1 decision(s))", output.getvalue())
+        self.assertIn("local snapshot + flat render refreshed", output.getvalue())
+        document = self.q(
+            "SELECT feature_id,seq,title FROM documents WHERE document_id=?", did
+        )
+        self.assertEqual((target, 2, "active v2 spec"), tuple(document))
+        self.assertEqual(
+            tuple(
+                self.q(
+                    "SELECT feature_id,status FROM spec_tasks WHERE task_id=?", tid
+                )
+            ),
+            (target, "in_progress"),
+        )
+        self.assertEqual(
+            self.q(
+                "SELECT feature_id FROM shell_decisions WHERE decision_id=?",
+                decision_id,
+            )[0],
+            target,
+        )
+
+    def test_move_spec_to_feature_refuses_ineligible_history(self):
+        self.run_mem("roadmap", "add", "move refusal source")
+        self.run_mem("roadmap", "add", "move refusal target")
+        self.run_mem(
+            "roadmap", "add", "move terminal target", "--status", "shipped"
+        )
+        source = self.q(
+            "SELECT feature_id FROM roadmap WHERE title='move refusal source'"
+        )[0]
+        target = self.q(
+            "SELECT feature_id FROM roadmap WHERE title='move refusal target'"
+        )[0]
+        terminal = self.q(
+            "SELECT feature_id FROM roadmap WHERE title='move terminal target'"
+        )[0]
+        frozen = self.write(
+            "INSERT INTO documents (feature_id,kind,seq,title,frozen) "
+            "VALUES (?,'spec',1,'frozen history',1)",
+            source,
+        )
+        ordinary = self.write(
+            "INSERT INTO documents (feature_id,kind,seq,title) "
+            "VALUES (?,'doc',1,'ordinary doc')",
+            source,
+        )
+        terminal_bound = self.write(
+            "INSERT INTO documents (feature_id,kind,seq,title) "
+            "VALUES (?,'spec',2,'terminal target candidate')",
+            source,
+        )
+        sprint_bound = self.write(
+            "INSERT INTO documents (feature_id,kind,seq,title) "
+            "VALUES (?,'spec',3,'sprint history')",
+            source,
+        )
+        sprint_id = self.write(
+            "INSERT INTO sprints (feature_id,originating_planner_shell_id) "
+            "VALUES (?,4)",
+            source,
+        )
+        self.write(
+            "INSERT INTO sprint_specs "
+            "(sprint_id,document_id,bound_revision_sha256) VALUES (?,?,?)",
+            sprint_id,
+            sprint_bound,
+            "a" * 64,
+        )
+
+        refused = (
+            (frozen, target, "frozen"),
+            (ordinary, target, "only spec"),
+            (terminal_bound, terminal, "terminal"),
+            (sprint_bound, target, f"Sprint #{sprint_id}"),
+            (terminal_bound, source, "already belongs"),
+        )
+        for did, feature_id, message in refused:
+            with self.subTest(document_id=did, message=message):
+                with self.assertRaises(SystemExit) as caught:
+                    mem._api(
+                        "PATCH",
+                        f"/_sc/mem/docs/{did}/feature",
+                        {"feature_id": feature_id},
+                    )
+                self.assertIn("409", str(caught.exception))
+                self.assertIn(message, str(caught.exception))
+                self.assertEqual(
+                    self.q(
+                        "SELECT feature_id FROM documents WHERE document_id=?", did
+                    )[0],
+                    source,
+                )
+
+    def test_move_spec_to_feature_rolls_back_related_rows(self):
+        self.run_mem("roadmap", "add", "atomic move source")
+        self.run_mem("roadmap", "add", "atomic move target")
+        source = self.q(
+            "SELECT feature_id FROM roadmap WHERE title='atomic move source'"
+        )[0]
+        target = self.q(
+            "SELECT feature_id FROM roadmap WHERE title='atomic move target'"
+        )[0]
+        did = self.write(
+            "INSERT INTO documents (feature_id,kind,seq,title) "
+            "VALUES (?,'spec',1,'atomic move spec')",
+            source,
+        )
+        tid = self.write(
+            "INSERT INTO spec_tasks (feature_id,document_id,seq,title,shell_id) "
+            "VALUES (?,?,0,'Preparation',1)",
+            source,
+            did,
+        )
+        self.write(
+            "CREATE TRIGGER fail_atomic_spec_move "
+            "BEFORE UPDATE OF feature_id ON spec_tasks "
+            f"WHEN OLD.task_id={tid} BEGIN "
+            "SELECT RAISE(ABORT,'forced move failure'); END"
+        )
+        try:
+            with self.assertRaises(SystemExit) as caught:
+                mem._api(
+                    "PATCH",
+                    f"/_sc/mem/docs/{did}/feature",
+                    {"feature_id": target},
+                )
+            self.assertIn("409", str(caught.exception))
+            self.assertIn("forced move failure", str(caught.exception))
+            self.assertEqual(
+                self.q(
+                    "SELECT feature_id FROM documents WHERE document_id=?", did
+                )[0],
+                source,
+            )
+            self.assertEqual(
+                self.q("SELECT feature_id FROM spec_tasks WHERE task_id=?", tid)[0],
+                source,
+            )
+        finally:
+            self.write("DROP TRIGGER fail_atomic_spec_move")
+
+    def test_feature_move_guidance_is_seeded_for_shells(self):
+        for skill in ("db_map", "docs", "spec"):
+            with self.subTest(skill=skill):
+                content = self.q(
+                    "SELECT content FROM skills WHERE name=? AND is_deleted=0",
+                    skill,
+                )[0]
+                self.assertIn(
+                    "sc mem doc move <document_id> --feature <target_feature_id>",
+                    content,
+                )
+        docs = self.q("SELECT content FROM skills WHERE name='docs'")[0]
+        self.assertIn("Split an active era from feature history", docs)
+
     # ── doc write vs local save — ONE shared serialization boundary ───────────
     def test_doc_write_and_snapshot_share_one_lock(self):
         # Doc-write serialize and /api/snapshot both write the same non-atomic

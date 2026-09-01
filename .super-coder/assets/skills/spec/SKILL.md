@@ -94,6 +94,9 @@ sc mem task cancel <task_id> --notes "moved to F<id> as task #<n>"
 sc mem state "[<feature>] — last: <last_done>. next: <next_up>."
 ```
 
+Intact spec move: `sc mem doc move <document_id> --feature <target_feature_id>`
+(see `docs`).
+
 Final Verification follows the boot `TESTING POSTURE`. Complete code; run every
 available focused proof; use observed registered-PR checks only for an
 unavailable local gate: pending -> wait, red -> fix, green -> review. No checks

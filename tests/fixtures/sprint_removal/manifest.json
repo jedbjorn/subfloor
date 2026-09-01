@@ -142,7 +142,8 @@
     ".super-coder/migrations/0239_sprint_spec_rebinding.sql",
     ".super-coder/migrations/0240_reseed_sprint_spec_rebinding.sql",
     ".super-coder/migrations/0242_reseed_flag_sweep_delivery_audit.sql",
-    ".super-coder/migrations/0243_role_aware_boot_contract.sql"
+    ".super-coder/migrations/0243_role_aware_boot_contract.sql",
+    ".super-coder/migrations/0245_reseed_spec_feature_reassignment.sql"
   ],
   "baseline_migration_ledger": {
     "count": 142,
@@ -161,6 +162,7 @@
     ".super-coder/api/sprint_routes.py",
     ".super-coder/api/transport.py",
     ".super-coder/assets/skills/authoring_syntax/SKILL.md",
+    ".super-coder/assets/skills/db_map/SKILL.md",
     ".super-coder/assets/skills/docs/SKILL.md",
     ".super-coder/assets/skills/git/SKILL.md",
     ".super-coder/assets/skills/memory/SKILL.md",

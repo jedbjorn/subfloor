@@ -63,6 +63,7 @@ Run from the repo root, like every engine command:
     ./sc mem oriented                # mark first-run complete (bootstrapped=1)
     ./sc mem doc add "<title>" --body-file PATH [--feature ID] [--kind spec|doc] [--seq N]
     ./sc mem doc edit <document_id>  [--title "…"] [--body-file PATH] [--render-path …]   # unfrozen only
+    ./sc mem doc move <document_id>  --feature <target_feature_id>   # unfrozen spec + plan, atomic
     ./sc mem doc freeze <document_id>
     ./sc mem doc qaqc <spec_document_id> --verdict approved|changes_requested [--findings-doc ID]
     ./sc mem narrative "<line>"
@@ -831,6 +832,20 @@ def cmd_oriented(args) -> int:
 
 
 def cmd_doc(args) -> int:
+    if args.doc_cmd == "move":
+        r = _api(
+            "PATCH",
+            f"/_sc/mem/docs/{args.document_id}/feature",
+            {"feature_id": args.feature},
+            timeout=_DOC_WRITE_TIMEOUT,
+        )
+        rc = _finish_api(
+            f"mem: spec document #{args.document_id} moved "
+            f"feature #{r['source_feature_id']} → #{r['target_feature_id']} "
+            f"as spec seq {r['target_seq']} "
+            f"({r['tasks_moved']} task(s), {r['decisions_moved']} decision(s))"
+        )
+        return _note_serialize(r) or rc
     if args.doc_cmd == "qaqc":
         payload = {
             "document_id": args.document_id,
@@ -1118,7 +1133,7 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("oriented", help="mark this shell oriented (bootstrapped=1)") \
        .set_defaults(fn=cmd_oriented)
 
-    sp = sub.add_parser("doc", help="add, edit, or freeze a spec/doc document")
+    sp = sub.add_parser("doc", help="add, edit, move, or freeze a spec/doc document")
     dsub = sp.add_subparsers(dest="doc_cmd", required=True)
     da = dsub.add_parser("add")
     da.add_argument("title")
@@ -1132,6 +1147,12 @@ def build_parser() -> argparse.ArgumentParser:
     de.add_argument("--title")
     de.add_argument("--body-file", dest="body_file")
     de.add_argument("--render-path", dest="render_path")
+    dm = dsub.add_parser(
+        "move",
+        help="move an unfrozen spec and its plan to another active feature",
+    )
+    dm.add_argument("document_id", type=int)
+    dm.add_argument("--feature", type=int, required=True, help="target feature id")
     df = dsub.add_parser("freeze")
     df.add_argument("document_id", type=int)
     dq = dsub.add_parser(
