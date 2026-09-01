@@ -23,6 +23,7 @@ CREATE TABLE roadmap (
     roadmap_status TEXT
 );
 CREATE TABLE documents (
+    document_id INTEGER PRIMARY KEY,
     feature_id INTEGER,
     kind TEXT,
     seq INTEGER,
@@ -45,7 +46,7 @@ class FlatDocumentReconciliationTest(unittest.TestCase):
             con.execute("INSERT INTO roadmap VALUES (7, 'Gateway', 'next')")
             con.execute(
                 "INSERT INTO documents VALUES "
-                "(7, 'spec', 1, 'Gateway', 'Current body', "
+                "(11, 7, 'spec', 1, 'Gateway', 'Current body', "
                 "'specs_sc/current.md', 0)"
             )
             current = root / "specs_sc" / "current.md"
@@ -107,6 +108,40 @@ class FlatDocumentReconciliationTest(unittest.TestCase):
             self.assertFalse(stale_spec.exists())
             self.assertFalse(stale_doc.exists())
             self.assertEqual("keep.md\n", outside.read_text())
+
+    def test_duplicate_document_targets_fail_before_any_write(self):
+        with tempfile.TemporaryDirectory() as td, closing(
+            sqlite3.connect(":memory:")
+        ) as con:
+            root = Path(td)
+            con.row_factory = sqlite3.Row
+            con.executescript(SCHEMA)
+            con.execute("INSERT INTO roadmap VALUES (7, 'Gateway', 'next')")
+            con.execute(
+                "INSERT INTO documents VALUES "
+                "(11, 7, 'spec', 1, 'First', 'First body', "
+                "'specs_sc/shared.md', 0)"
+            )
+            con.execute(
+                "INSERT INTO documents VALUES "
+                "(12, 7, 'spec', 2, 'Second', 'Second body', "
+                "'specs_sc//shared.md', 0)"
+            )
+            target = root / "specs_sc" / "shared.md"
+            target.parent.mkdir()
+            target.write_text("preserved\n")
+            written: list[Path] = []
+            skipped: list[Path] = []
+
+            with self.assertRaisesRegex(
+                ValueError,
+                "duplicate document render path.*document IDs 11 and 12",
+            ):
+                flat._render_documents(con, written, skipped, root)
+
+            self.assertEqual(target.read_text(), "preserved\n")
+            self.assertEqual(written, [])
+            self.assertEqual(skipped, [])
 
 
 if __name__ == "__main__":

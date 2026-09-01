@@ -32,9 +32,12 @@ Codex reads project-local hooks from `<repo>/.codex/hooks.json`. The hook is a
 `PreToolUse` matcher on `^apply_patch$` (codex's file-edit tool) that runs the
 shared `.super-coder/scripts/branch-guard.sh` and denies the edit (exit 2) while a
 protected default branch is in play. `.codex/hooks.json` is emitted (gitignored)
-each launch. Codex only delivers the apply_patch *patch text* (`tool_input.command`),
-not a file path, so the guard uses its cwd-branch check (not the target-file check
-claude/opencode get).
+each launch. Codex delivers the apply_patch text in `tool_input.command`; the
+guard extracts Add/Update/Delete targets from its patch headers before applying
+the same target-file check used for other harnesses. Scratch-only patches under
+`/tmp`, `/var/tmp`, `/dev/shm`, or `$TMPDIR` remain available even when the cwd
+is a protected Admin checkout. A payload without a usable target falls back to
+the cwd-branch check.
 
 **Two things gate whether this hook actually enforces — both verified empirically:**
 

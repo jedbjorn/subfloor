@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import contextlib
 import io
+import json
 import os
 import sqlite3
 import sys
@@ -22,6 +23,16 @@ class Stop(Exception):
 
 
 class UpdateServiceCutoverTest(unittest.TestCase):
+    def setUp(self):
+        self.intent_temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.intent_temp.cleanup)
+        self.intent_path = Path(self.intent_temp.name) / "update-runtime-intent.json"
+        patcher = mock.patch.object(
+            update, "_runtime_intent_path", return_value=self.intent_path
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def test_in_process_snapshot_uses_scoped_update_admin_authority(self):
         observed_admin = []
 
@@ -136,6 +147,98 @@ class UpdateServiceCutoverTest(unittest.TestCase):
 
     def test_docker_only_runtime_stops_when_final_health_fails(self):
         self.assert_restart_failure_stops_all(pm2=False, docker=True)
+
+    def test_failed_update_retains_docker_relaunch_intent(self):
+        state = mock.Mock()
+        with mock.patch.object(
+            update.instance_state, "resolve", return_value=state
+        ), mock.patch.object(
+            update, "stop_docker_review_server", return_value=("docker", "sc-example")
+        ), mock.patch.object(
+            update, "stop_pm2_review_server", return_value=None
+        ), mock.patch.object(
+            update.state_relocation,
+            "exclusive_maintenance",
+            side_effect=update.state_relocation.MaintenanceBusy("busy"),
+        ), self.assertRaisesRegex(SystemExit, "runtime remains stopped"):
+            update.migrate_with_service_cutover()
+
+        self.assertEqual(
+            json.loads(self.intent_path.read_text()),
+            {"runtimes": ["docker"], "version": 1},
+        )
+
+    def test_invalid_runtime_intent_refuses_before_shutdown(self):
+        self.intent_path.write_text("not json\n")
+        state = mock.Mock()
+        with mock.patch.object(
+            update.instance_state, "resolve", return_value=state
+        ), mock.patch.object(
+            update, "stop_docker_review_server"
+        ) as docker_stop, mock.patch.object(
+            update, "stop_pm2_review_server"
+        ) as pm2_stop, self.assertRaisesRegex(
+            SystemExit, "runtime relaunch intent refused before shutdown"
+        ):
+            update.migrate_with_service_cutover()
+
+        docker_stop.assert_not_called()
+        pm2_stop.assert_not_called()
+
+    def test_retry_rehydrates_absent_docker_and_clears_intent_after_health(self):
+        self.intent_path.write_text(
+            json.dumps({"version": 1, "runtimes": ["docker"]})
+        )
+        state = mock.Mock()
+        with mock.patch.object(
+            update.instance_state, "resolve", return_value=state
+        ), mock.patch.object(
+            update, "stop_docker_review_server", return_value=None
+        ), mock.patch.object(
+            update, "stop_pm2_review_server", return_value=None
+        ), mock.patch.object(
+            update.shutil, "which", side_effect=lambda name: f"/bin/{name}"
+        ), mock.patch.object(
+            update.state_relocation,
+            "exclusive_maintenance",
+            return_value=contextlib.nullcontext(),
+        ), mock.patch.object(
+            update.state_relocation,
+            "relocate_legacy_state",
+            return_value=mock.Mock(database=update.DB_PATH),
+        ), mock.patch.object(
+            update.instance_state, "active_database_path", return_value=update.DB_PATH
+        ), mock.patch.object(update, "bind_cutover_state"), mock.patch.object(
+            update, "migrate_or_rebuild"
+        ), mock.patch.object(update, "start_pm2_review_server") as pm2_start, \
+             mock.patch.object(update, "start_docker_review_server") as docker_start, \
+             mock.patch.object(update, "require_restarted_runtime_health") as health:
+            update.migrate_with_service_cutover()
+
+        pm2_start.assert_called_once_with(None)
+        docker_start.assert_called_once_with(("/bin/docker", f"sc-{update.REPO_ROOT.name}"))
+        health.assert_called_once_with()
+        self.assertFalse(self.intent_path.exists())
+
+    def test_absent_docker_container_is_recreated_through_normal_launch(self):
+        completed = [
+            mock.Mock(returncode=1, stdout="", stderr="No such container"),
+            mock.Mock(returncode=0, stdout="launched", stderr=""),
+            mock.Mock(returncode=0, stdout="true\n", stderr=""),
+        ]
+        with mock.patch.object(
+            update.subprocess, "run", side_effect=completed
+        ) as run, contextlib.redirect_stdout(io.StringIO()):
+            update.start_docker_review_server(("/bin/docker", "sc-example"))
+
+        self.assertEqual(
+            [call.args[0] for call in run.call_args_list],
+            [
+                ["/bin/docker", "start", "sc-example"],
+                [str(update.REPO_ROOT / "sc"), "launch", "--no-build"],
+                ["/bin/docker", "inspect", "-f", "{{.State.Running}}", "sc-example"],
+            ],
+        )
 
     def test_shutdown_failure_is_named_instead_of_claiming_stopped(self):
         service = ("/usr/bin/pm2", "sc-example")

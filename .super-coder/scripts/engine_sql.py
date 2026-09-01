@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import NoReturn
 
 import instance_state
+import mem
 
 ENGINE = Path(__file__).resolve().parents[1]
 ERROR_CODE = "admin_only_engine_state"
@@ -61,7 +62,10 @@ def _admin_token() -> str:
         return token
 
     if not token:
-        refuse()
+        mem._PROG = "sc sql"
+        if not mem._discover_runtime_credential():
+            refuse()
+        token = mem.SC_API_TOKEN
     return token
 
 

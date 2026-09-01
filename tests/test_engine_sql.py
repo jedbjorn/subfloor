@@ -1,6 +1,7 @@
 """Authorization contract for Admin-only general engine SQL."""
 from __future__ import annotations
 
+import json
 import os
 import sqlite3
 import sys
@@ -54,6 +55,52 @@ class EngineSqlTest(unittest.TestCase):
              mock.patch.object(engine_sql.shutil, "which", return_value="/bin/sqlite3"), \
              mock.patch.object(engine_sql.subprocess, "run", return_value=completed) as run:
             self.assertEqual(engine_sql.main(["read-only", "SELECT 1;"]), 0)
+        self.assertEqual(
+            run.call_args.args[0],
+            ["/bin/sqlite3", "-readonly", str(self.db), "SELECT 1;"],
+        )
+
+    def test_api_down_host_admin_discovers_owner_only_runtime_credential(self):
+        credential_dir = Path(self.tmp.name) / "credentials"
+        credential_dir.mkdir()
+        artifact = credential_dir / "admin.json"
+        artifact.write_text(json.dumps({
+            "shell_id": 1,
+            "shortname": "admin",
+            "api_base": "http://127.0.0.1:1",
+            "token": "admin-token",
+        }))
+        artifact.chmod(0o600)
+        completed = mock.Mock(returncode=0)
+        saved = (
+            engine_sql.mem._CRED_DIR,
+            engine_sql.mem.SC_API_TOKEN,
+            engine_sql.mem.SC_API_BASE,
+            engine_sql.mem._DISCOVERED_FROM,
+        )
+        self.addCleanup(
+            setattr, engine_sql.mem, "_CRED_DIR", saved[0]
+        )
+        self.addCleanup(
+            setattr, engine_sql.mem, "SC_API_TOKEN", saved[1]
+        )
+        self.addCleanup(
+            setattr, engine_sql.mem, "SC_API_BASE", saved[2]
+        )
+        self.addCleanup(
+            setattr, engine_sql.mem, "_DISCOVERED_FROM", saved[3]
+        )
+        engine_sql.mem._CRED_DIR = credential_dir
+        engine_sql.mem.SC_API_TOKEN = ""
+        engine_sql.mem.SC_API_BASE = ""
+        engine_sql.mem._DISCOVERED_FROM = None
+
+        with mock.patch.dict(os.environ, {}, clear=True), self._path(), \
+             mock.patch.object(engine_sql, "_api_flavor", return_value=None), \
+             mock.patch.object(engine_sql.shutil, "which", return_value="/bin/sqlite3"), \
+             mock.patch.object(engine_sql.subprocess, "run", return_value=completed) as run:
+            self.assertEqual(engine_sql.main(["read-only", "SELECT 1;"]), 0)
+
         self.assertEqual(
             run.call_args.args[0],
             ["/bin/sqlite3", "-readonly", str(self.db), "SELECT 1;"],

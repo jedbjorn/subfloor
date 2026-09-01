@@ -1123,6 +1123,11 @@ def authenticate(con, interactive: bool = True):
     return row
 
 
+def interactive_authentication(*, headless: bool, render_only: bool) -> bool:
+    """Whether this launch may ask for user credentials."""
+    return not headless and not render_only
+
+
 # ── Shell selection ─────────────────────────────────────────────────────────
 
 def list_shells(con, user_id: int) -> list:
@@ -2149,7 +2154,13 @@ def main() -> None:
                 pass
             heal_note = None
 
-    user = authenticate(con, interactive=not headless)
+    user = authenticate(
+        con,
+        interactive=interactive_authentication(
+            headless=headless,
+            render_only=bool(os.environ.get("RENDER_ONLY")),
+        ),
+    )
     fdefaults = flavor_defaults(con)
     # Liveness snapshot for the interactive picker: one /proc pass (ms) so the
     # boot list can show shell status — BROWSER / Busy / Orphaned /

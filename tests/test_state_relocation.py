@@ -133,6 +133,28 @@ class StateRelocationTests(RelocationFixture):
         )
         self.assertEqual(len(list(self.state.backups.glob("shell_db.preupdate.*.db"))), 1)
 
+    def test_private_receipt_allows_normal_database_writes_before_next_update(self):
+        self.create_database()
+        self.relocate()
+        connection = sqlite3.connect(self.state.database)
+        try:
+            connection.execute("UPDATE payload SET value='advanced'")
+            connection.commit()
+        finally:
+            connection.close()
+
+        result = self.relocate()
+
+        self.assertTrue(result.relocated)
+        connection = sqlite3.connect(self.state.database)
+        try:
+            self.assertEqual(
+                connection.execute("SELECT value FROM payload").fetchone()[0],
+                "advanced",
+            )
+        finally:
+            connection.close()
+
     def test_pre_publication_failure_leaves_legacy_authoritative(self):
         self.create_database()
         with self.assertRaisesRegex(

@@ -1258,6 +1258,101 @@ class ApiMemTest(unittest.TestCase):
         self.assertEqual(self.q("SELECT render_path FROM documents "
                                 "WHERE document_id=?", did)[0], "docs_sc/pathless.md")
 
+    def test_doc_add_rejects_duplicate_render_path(self):
+        body = self.tmp / "duplicate-add.md"
+        body.write_text("# duplicate\n")
+        self.run_mem("roadmap", "add", "duplicate add feature")
+        feature_id = self.q(
+            "SELECT feature_id FROM roadmap WHERE title='duplicate add feature'"
+        )[0]
+        self.assertEqual(
+            self.run_mem(
+                "doc", "add", "render owner", "--kind", "doc",
+                "--body-file", str(body), "--render-path", "docs_sc/owned.md",
+                "--feature", str(feature_id),
+            ),
+            0,
+        )
+        with self.assertRaises(SystemExit) as caught:
+            self.run_mem(
+                "doc", "add", "render intruder", "--kind", "doc",
+                "--body-file", str(body), "--render-path", "docs_sc//owned.md",
+                "--feature", str(feature_id),
+            )
+        self.assertIn("document IDs", str(caught.exception))
+        self.assertIsNone(
+            self.q("SELECT document_id FROM documents WHERE title='render intruder'")
+        )
+
+    def test_doc_edit_rejects_derived_render_path_collision(self):
+        body = self.tmp / "duplicate-edit.md"
+        body.write_text("# duplicate\n")
+        self.run_mem("roadmap", "add", "duplicate edit feature")
+        feature_id = self.q(
+            "SELECT feature_id FROM roadmap WHERE title='duplicate edit feature'"
+        )[0]
+        self.run_mem(
+            "doc", "add", "derived owner", "--kind", "doc",
+            "--body-file", str(body), "--feature", str(feature_id),
+        )
+        self.run_mem(
+            "doc", "add", "derived candidate", "--kind", "doc",
+            "--body-file", str(body), "--feature", str(feature_id),
+        )
+        candidate = self.q(
+            "SELECT document_id FROM documents WHERE title='derived candidate'"
+        )[0]
+
+        with self.assertRaises(SystemExit) as caught:
+            self.run_mem("doc", "edit", str(candidate), "--title", "derived owner")
+
+        self.assertIn("document IDs", str(caught.exception))
+        self.assertEqual(
+            self.q("SELECT title FROM documents WHERE document_id=?", candidate)[0],
+            "derived candidate",
+        )
+
+    def test_concurrent_doc_adds_cannot_claim_one_render_path(self):
+        self.run_mem("roadmap", "add", "concurrent render owners")
+        feature_id = self.q(
+            "SELECT feature_id FROM roadmap WHERE title='concurrent render owners'"
+        )[0]
+        barrier = threading.Barrier(2)
+        outcomes = []
+
+        def add(title):
+            barrier.wait()
+            try:
+                mem._api("POST", "/_sc/mem/docs", {
+                    "feature_id": feature_id,
+                    "kind": "doc",
+                    "title": title,
+                    "body": "# concurrent\n",
+                    "render_path": "docs_sc/concurrent-owner.md",
+                })
+                outcomes.append("created")
+            except SystemExit as exc:
+                outcomes.append(str(exc))
+
+        threads = [
+            threading.Thread(target=add, args=("concurrent owner A",)),
+            threading.Thread(target=add, args=("concurrent owner B",)),
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(10)
+
+        self.assertEqual(sum(outcome == "created" for outcome in outcomes), 1)
+        self.assertTrue(any("409" in outcome for outcome in outcomes))
+        self.assertEqual(
+            self.q(
+                "SELECT COUNT(*) FROM documents WHERE render_path=?",
+                "docs_sc/concurrent-owner.md",
+            )[0],
+            1,
+        )
+
     # ── decision guard: a bare sibling verb is a guess, not a decision (#311) ─
     def test_decision_bare_verb_guarded(self):
         before = self.q("SELECT COUNT(*) FROM shell_decisions")[0]

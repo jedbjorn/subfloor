@@ -55,6 +55,7 @@ from __future__ import annotations
 import ast
 import importlib
 import importlib.util
+import json
 import os
 import re
 import shutil
@@ -1180,10 +1181,26 @@ def start_docker_review_server(service: tuple[str, str] | None) -> None:
         [docker, "start", container], capture_output=True, text=True, check=False
     )
     if started.returncode != 0:
-        sys.exit(
-            f"update: DB maintenance succeeded but Docker runtime {container} "
-            "could not start:\n" + (started.stderr or started.stdout).strip()
+        detail = (started.stderr or started.stdout).strip()
+        if "no such" not in detail.lower():
+            sys.exit(
+                f"update: DB maintenance succeeded but Docker runtime {container} "
+                f"could not start:\n{detail}"
+            )
+        recreated = subprocess.run(
+            [str(REPO_ROOT / "sc"), "launch", "--no-build"],
+            cwd=REPO_ROOT,
+            capture_output=True,
+            text=True,
+            check=False,
         )
+        if recreated.returncode != 0:
+            recreate_detail = (recreated.stderr or recreated.stdout).strip()
+            sys.exit(
+                f"update: DB maintenance succeeded but absent Docker runtime "
+                f"{container} could not be recreated:\n{recreate_detail}"
+            )
+        print(f"→ recreated Docker runtime {container} after DB maintenance")
     ready = subprocess.run(
         [docker, "inspect", "-f", "{{.State.Running}}", container],
         capture_output=True,
@@ -1195,6 +1212,70 @@ def start_docker_review_server(service: tuple[str, str] | None) -> None:
             f"update: Docker runtime {container} did not become ready after start"
         )
     print(f"→ started Docker runtime {container} after DB maintenance")
+
+
+def _runtime_intent_path(state: instance_state.InstanceState) -> Path:
+    return state.root / "update-runtime-intent.json"
+
+
+def _load_runtime_intent(state: instance_state.InstanceState) -> set[str]:
+    path = _runtime_intent_path(state)
+    if not path.exists() and not path.is_symlink():
+        return set()
+    try:
+        instance_state._lstat_owned_regular(
+            path, "update runtime intent", os.geteuid()
+        )
+        payload = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError, instance_state.InstanceStateError) as exc:
+        raise state_relocation.RelocationError(
+            f"update runtime intent is unreadable: {exc}"
+        ) from exc
+    if payload.get("version") != 1 or not isinstance(payload.get("runtimes"), list):
+        raise state_relocation.RelocationError("update runtime intent is invalid")
+    runtimes = set(payload["runtimes"])
+    if not runtimes.issubset({"docker", "pm2"}):
+        raise state_relocation.RelocationError("update runtime intent is invalid")
+    return runtimes
+
+
+def _write_runtime_intent(
+    state: instance_state.InstanceState, runtimes: set[str]
+) -> None:
+    if not runtimes:
+        return
+    path = _runtime_intent_path(state)
+    instance_state._atomic_write_json(
+        path,
+        {"version": 1, "runtimes": sorted(runtimes)},
+        os.geteuid(),
+        label="update runtime intent",
+    )
+
+
+def _clear_runtime_intent(state: instance_state.InstanceState) -> None:
+    _runtime_intent_path(state).unlink(missing_ok=True)
+
+
+def _service_targets_from_intent(
+    runtimes: set[str],
+    pm2_service: tuple[str, str] | None,
+    docker_service: tuple[str, str] | None,
+) -> tuple[tuple[str, str] | None, tuple[str, str] | None]:
+    if pm2_service is None and "pm2" in runtimes:
+        pm2_bin = shutil.which("pm2")
+        if pm2_bin is None:
+            raise SystemExit("update: retained PM2 relaunch intent but pm2 is unavailable")
+        process = f"sc-{ports.resolve(persist=False).get('repo', REPO_ROOT.name)}"
+        pm2_service = (pm2_bin, process)
+    if docker_service is None and "docker" in runtimes:
+        docker = shutil.which("docker")
+        if docker is None:
+            raise SystemExit(
+                "update: retained Docker relaunch intent but docker is unavailable"
+            )
+        docker_service = (docker, f"sc-{REPO_ROOT.name}")
+    return pm2_service, docker_service
 
 
 def require_restarted_runtime_health() -> None:
@@ -1268,11 +1349,24 @@ def restart_review_servers(
 
 def migrate_with_service_cutover(*, backup: bool = True, reconcile=None) -> None:
     """Run all update reconciliation under one stopped-runtime lease."""
+    state = instance_state.resolve(instance_config=ENGINE / "instance.json")
+    try:
+        runtime_intent = _load_runtime_intent(state)
+    except state_relocation.RelocationError as exc:
+        sys.exit(
+            "update: runtime relaunch intent refused before shutdown: "
+            f"{exc}\n  inspect: ./sc health\n  recover: ./sc rollback"
+        )
     docker_service = stop_docker_review_server()
+    if docker_service is not None:
+        runtime_intent.add("docker")
+        _write_runtime_intent(state, runtime_intent)
     service = stop_pm2_review_server()
+    if service is not None:
+        runtime_intent.add("pm2")
+        _write_runtime_intent(state, runtime_intent)
     legacy_was_present = instance_state.legacy_database_path(ENGINE).exists()
     try:
-        state = instance_state.resolve(instance_config=ENGINE / "instance.json")
         with state_relocation.exclusive_maintenance(state, command="update"):
             relocation = state_relocation.relocate_legacy_state(
                 ENGINE,
@@ -1308,7 +1402,11 @@ def migrate_with_service_cutover(*, backup: bool = True, reconcile=None) -> None
     # Deliberately not in finally: a failed destructive migration must leave
     # the old server stopped instead of restarting code against a changed or
     # incompatible floor.
+    service, docker_service = _service_targets_from_intent(
+        runtime_intent, service, docker_service
+    )
     restart_review_servers(service, docker_service)
+    _clear_runtime_intent(state)
 
 
 def sync_skills() -> None:
