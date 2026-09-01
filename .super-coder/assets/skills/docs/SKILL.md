@@ -23,9 +23,11 @@ copy to `specs_sc/` / `docs_sc/`; the GUI opens it rendered in md-converter.
 Feature = the `roadmap` row; exists from `brainstorm` onward, before any spec.
 Specs hang off the feature, not off each other: several unfrozen specs per
 feature, each a `documents (kind='spec')` row, ordered by `seq`. No
-feature-to-feature links; no second roadmap row for related work — related
-work = another spec under the same feature. Freeze = the ship-time record of
-what was built to; it never gates the feature's other specs.
+feature-to-feature links; related work within one mental model is another spec
+under the same feature. A genuinely new era may split into a fresh feature by
+moving its unfrozen active spec through the guarded workflow below. Freeze =
+the ship-time record of what was built to; it never gates the feature's other
+specs.
 
 | state | test | meaning |
 |---|---|---|
@@ -36,6 +38,25 @@ what was built to; it never gates the feature's other specs.
 The **doc** (`kind='doc'`) = the feature's readable face — write it when the
 first spec ships, under the same `feature_id`. Sibling of the specs, not a
 parent.
+
+## Split an active era from feature history
+
+When accumulated history makes a feature's active context misleading or a new
+era has become a separate mental model, preserve the old feature as history and
+move the existing unfrozen active spec intact:
+
+1. Create the fresh feature with its correct work-stream, status, and summary.
+2. Run `sc mem doc move <document_id> --feature <target_feature_id>`.
+3. Re-read the document and task ledger under the target feature; the same ids,
+   task states, and document-linked decisions must now project there.
+4. Edit the historical feature's title/summary to name the split, then set its
+   truthful terminal status (`shipped` for delivered history, `retired` for
+   abandoned history).
+
+The move assigns the spec's next target-feature sequence and is atomic across
+the document, its tasks, and document-linked decisions. It refuses frozen
+specs, ordinary docs, terminal targets, and any spec already bound to a Sprint.
+Do not duplicate the spec or cancel/recreate its tasks when this move applies.
 
 ## Assess the work-stream on every feature
 

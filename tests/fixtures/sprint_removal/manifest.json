@@ -142,7 +142,8 @@
     ".super-coder/migrations/0239_sprint_spec_rebinding.sql",
     ".super-coder/migrations/0240_reseed_sprint_spec_rebinding.sql",
     ".super-coder/migrations/0242_reseed_flag_sweep_delivery_audit.sql",
-    ".super-coder/migrations/0243_role_aware_boot_contract.sql"
+    ".super-coder/migrations/0243_role_aware_boot_contract.sql",
+    ".super-coder/migrations/0245_reseed_spec_feature_reassignment.sql"
   ],
   "baseline_migration_ledger": {
     "count": 142,

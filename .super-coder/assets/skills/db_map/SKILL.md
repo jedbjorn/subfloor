@@ -58,6 +58,7 @@ sc mem roadmap depends <feature_id> [--on <feature_id>]…
 
 sc mem doc add "…" --kind <spec|doc> --feature <id> --body-file <path> --render-path <path>
 sc mem doc freeze <document_id>
+sc mem doc move <document_id> --feature <target_feature_id>
 sc mem task add "…" --feature <id> --doc <id> --seq <n> [--desc "…"]
 sc mem task start <task_id>
 sc mem task done <task_id>
@@ -77,7 +78,10 @@ Load the owning skill before a governed write: `memory` for state/identity,
 `spec` for roadmap tasks, `docs` for documents, `flags` for blockers, and
 `messaging` for shell coordination. Frozen documents require a new document
 revision; decisions are superseded with `--parent`; seed entries are retired
-rather than rewritten.
+rather than rewritten. `doc move` preserves one unfrozen spec's identity,
+tasks, and document-linked decisions while reassigning them atomically to an
+active feature; it refuses frozen, ordinary-doc, terminal-target, and
+Sprint-bound moves.
 
 ## Failure behavior
 

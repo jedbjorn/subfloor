@@ -1699,6 +1699,83 @@ def patch_document(
         return False, str(exc)
 
 
+def move_spec_to_feature(con, document_id: int, target_feature_id: int):
+    """Move one active spec and its denormalized ownership links atomically."""
+    try:
+        with db_driver.write_transaction(con, "document.move_feature"):
+            document = con.execute(
+                "SELECT feature_id,kind,frozen FROM documents WHERE document_id=?",
+                (document_id,),
+            ).fetchone()
+            if document is None:
+                return None, 404, "no such document"
+            if document["kind"] != "spec":
+                return None, 409, "only spec documents can move between features"
+            if document["frozen"]:
+                return None, 409, "document is frozen — shipped history cannot move"
+            source_feature_id = document["feature_id"]
+            if source_feature_id is None:
+                return None, 409, "spec is not attached to a source feature"
+            if source_feature_id == target_feature_id:
+                return None, 409, "spec already belongs to the target feature"
+
+            target = con.execute(
+                "SELECT roadmap_status FROM roadmap WHERE feature_id=?",
+                (target_feature_id,),
+            ).fetchone()
+            if target is None:
+                return None, 404, "no such target feature"
+            if target["roadmap_status"] in {"shipped", "retired"}:
+                return (
+                    None,
+                    409,
+                    "target feature is terminal — choose an active roadmap feature",
+                )
+
+            sprint = con.execute(
+                "SELECT sprint_id FROM sprint_specs WHERE document_id=? "
+                "ORDER BY sprint_id LIMIT 1",
+                (document_id,),
+            ).fetchone()
+            if sprint is not None:
+                return (
+                    None,
+                    409,
+                    f"spec is bound to Sprint #{sprint['sprint_id']} and cannot move",
+                )
+
+            target_seq = int(
+                con.execute(
+                    "SELECT COALESCE(MAX(seq),0)+1 FROM documents "
+                    "WHERE feature_id=? AND kind='spec'",
+                    (target_feature_id,),
+                ).fetchone()[0]
+            )
+            con.execute(
+                "UPDATE documents SET feature_id=?,seq=?,updated_at=datetime('now') "
+                "WHERE document_id=?",
+                (target_feature_id, target_seq, document_id),
+            )
+            tasks = con.execute(
+                "UPDATE spec_tasks SET feature_id=? WHERE document_id=?",
+                (target_feature_id, document_id),
+            ).rowcount
+            decisions = con.execute(
+                "UPDATE shell_decisions SET feature_id=? WHERE document_id=?",
+                (target_feature_id, document_id),
+            ).rowcount
+            return {
+                "document_id": document_id,
+                "source_feature_id": source_feature_id,
+                "target_feature_id": target_feature_id,
+                "target_seq": target_seq,
+                "tasks_moved": tasks,
+                "decisions_moved": decisions,
+            }, 200, None
+    except db_driver.IntegrityError as exc:
+        return None, 409, str(exc)
+
+
 def create_flag(con, body):
     if not body.get("description"):
         return None, "description required"
@@ -4363,6 +4440,27 @@ class Handler(BaseHTTPRequestHandler):
                                         body, {"status", "title", "description",
                                                "completed_date", "resolution_notes"})
                 return self._send(200 if ok else 400, {"ok": ok, "error": err})
+
+            # PATCH /_sc/mem/docs/{id}/feature — move one active spec while
+            # preserving its identity and plan. This must precede the bare
+            # /docs/{id} check.
+            if len(parts) == 5 and parts[2] == "docs" and parts[4] == "feature":
+                did = int(parts[3])
+                target = body.get("feature_id")
+                if target is None:
+                    return self._send(400, {"error": "feature_id required"})
+                try:
+                    target = int(target)
+                except (TypeError, ValueError):
+                    return self._send(400, {"error": "feature_id must be an integer"})
+                result, status, error = move_spec_to_feature(con, did, target)
+                if error:
+                    return self._send(status, {"ok": False, "error": error})
+                return self._send(200, {
+                    "ok": True,
+                    **result,
+                    "serialize": serialize_doc_write(),
+                })
 
             # PATCH /_sc/mem/docs/{id}/freeze — must precede the bare /docs/{id} check
             # Shared: specs/docs are collaborative (matches the fleet-wide GET
