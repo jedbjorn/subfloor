@@ -22,13 +22,19 @@ Usage:
 """
 from __future__ import annotations
 
+import json
+import os
 import sqlite3  # kept for map.db (which stays SQLite)
+import sys
+import urllib.error
+import urllib.request
 from pathlib import Path
 
 import artifact_policy
 import db_driver
 import instance_state
 import map_db
+import ports
 import seed_skills
 import state_relocation
 from _serialize_guard import require_admin
@@ -586,8 +592,80 @@ def _main_under_lease() -> int:
     return 0
 
 
-def main(*, lease_held: bool = False) -> int:
+def _main_runtime_owned() -> int:
+    """Serialize a coherent read view while the healthy API owns the runtime."""
+    copied = artifact_policy.prepare_local_state()
+    if copied:
+        print(f"snapshot: localized {len(copied)} existing artifact(s)")
+    if not DB_PATH.exists():
+        raise SystemExit(f"snapshot: no live DB at {DB_PATH} — run `./sc rebuild` first.")
+    con = db_driver.connect(DB_PATH)
+    try:
+        persist_instance(con)
+    finally:
+        con.close()
+    try:
+        displayed = OUT_PATH.relative_to(REPO_ROOT)
+    except ValueError:
+        displayed = OUT_PATH
+    print(f"snapshot: wrote {displayed}")
+    snapshot_map()
+    return 0
+
+
+def _snapshot_via_runtime_api() -> str | None:
+    """Ask a healthy runtime to serialize; return None only when it is absent."""
+    base = os.environ.get("SC_API_BASE", "").rstrip("/")
+    if not base:
+        port = ports.resolve(persist=False).get("port")
+        if not isinstance(port, int):
+            return None
+        base = f"http://127.0.0.1:{port}"
+    request = urllib.request.Request(
+        base + "/api/scripts/snapshot", data=b"", method="POST"
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=185) as response:
+            raw_payload = response.read()
+    except urllib.error.HTTPError as exc:
+        try:
+            payload = json.loads(exc.read())
+            detail = payload.get("output") or payload.get("error") or str(exc)
+        except (ValueError, AttributeError):
+            detail = str(exc)
+        raise SystemExit(f"snapshot: runtime-owned serialization failed: {detail}") from exc
+    except urllib.error.URLError as exc:
+        if isinstance(exc.reason, ConnectionRefusedError):
+            return None
+        raise SystemExit(
+            f"snapshot: runtime API request failed: {exc.reason}"
+        ) from exc
+    except ConnectionRefusedError:
+        return None
+    except OSError as exc:
+        raise SystemExit(f"snapshot: runtime API request failed: {exc}") from exc
+    try:
+        payload = json.loads(raw_payload)
+    except (ValueError, TypeError) as exc:
+        raise SystemExit("snapshot: runtime API returned an invalid response") from exc
+    if not payload.get("ok"):
+        raise SystemExit(
+            "snapshot: runtime-owned serialization failed: "
+            + str(payload.get("output") or "unknown API failure")
+        )
+    return str(payload.get("output") or "snapshot: runtime-owned serialization complete")
+
+
+def main(*, lease_held: bool = False, runtime_owned: bool = False) -> int:
     instance_state.active_database_path(ENGINE)
+    require_admin("snapshot")
+    if runtime_owned:
+        return _main_runtime_owned()
+    if not lease_held:
+        runtime_output = _snapshot_via_runtime_api()
+        if runtime_output is not None:
+            print(runtime_output)
+            return 0
     state = instance_state.maintenance_state(ENGINE)
     if lease_held:
         state_relocation.refuse_live_database_owners(DB_PATH)
@@ -600,4 +678,11 @@ def main(*, lease_held: bool = False) -> int:
 if __name__ == "__main__":
     from cli_entry import run_cli
 
-    raise SystemExit(run_cli(main))
+    def cli_main(argv: list[str]) -> int:
+        if argv == ["--runtime-owned"]:
+            return main(runtime_owned=True)
+        if argv:
+            raise SystemExit("usage: snapshot.py")
+        return main()
+
+    raise SystemExit(run_cli(cli_main, sys.argv[1:]))

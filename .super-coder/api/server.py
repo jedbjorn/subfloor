@@ -96,6 +96,8 @@ from quota_probes import dispatch as quota_dispatch  # noqa: E402  (account quot
 import vm as vm_mod  # noqa: E402  (Windows Test VM — config + live checks)
 import ts as ts_mod  # noqa: E402  (tailnet — config + live checks)
 import pm2 as pm2_mod  # noqa: E402  (host pm2 stack — config + live checks)
+sys.path.insert(0, str(ENGINE / "render"))
+import flat as flat_render  # noqa: E402  (document render-path ownership)
 
 # Startup validates ``instance_state.active_database_path`` in ``main`` before
 # this recovery-safe target is opened by any route or daemon.
@@ -1553,6 +1555,33 @@ def patch_shell(con, shell_id, body):
                          SHELL_EDITABLE)
 
 
+def document_render_path_conflict(
+    con,
+    candidate: dict,
+    *,
+    exclude_document_id: int | None = None,
+) -> str | None:
+    """Return a stable ownership error when a populated document path collides."""
+    if not candidate.get("body"):
+        return None
+    candidate_path = Path(flat_render.document_rel_path(candidate))
+    rows = con.execute(
+        "SELECT document_id,feature_id,kind,seq,title,body,render_path "
+        "FROM documents WHERE body IS NOT NULL AND body != '' "
+        "ORDER BY document_id"
+    ).fetchall()
+    for row in rows:
+        if exclude_document_id is not None and row["document_id"] == exclude_document_id:
+            continue
+        if Path(flat_render.document_rel_path(row)) == candidate_path:
+            owner = candidate.get("document_id") or "new document"
+            return (
+                f"duplicate document render path {str(candidate_path)!r}: "
+                f"document IDs {row['document_id']} and {owner}"
+            )
+    return None
+
+
 def patch_document(
     con,
     doc_id,
@@ -1573,7 +1602,8 @@ def patch_document(
     try:
         with db_driver.write_transaction(con, "document.edit"):
             document = con.execute(
-                "SELECT feature_id,frozen,body FROM documents WHERE document_id=?",
+                "SELECT document_id,feature_id,kind,seq,title,body,render_path,frozen "
+                "FROM documents WHERE document_id=?",
                 (doc_id,),
             ).fetchone()
             if document is None:
@@ -1583,6 +1613,14 @@ def patch_document(
                     False,
                     "document is frozen — open the next spec, don't edit this one",
                 )
+
+            candidate = dict(document)
+            candidate.update({column: body[column] for column in cols})
+            conflict = document_render_path_conflict(
+                con, candidate, exclude_document_id=doc_id
+            )
+            if conflict is not None:
+                return False, conflict
 
             before_body = document["body"] or ""
             body_changed = "body" in body and body["body"] != document["body"]
@@ -1896,7 +1934,7 @@ _SCRIPTS = {
     "snapshot": ("Snapshot", f"Serialize the per-instance tables → {_ARTIFACT_DEST} "
                  "(deterministic, idempotent). Run after editing identity, roadmap, "
                  "docs, or flags so the change survives a rebuild.",
-                 [_PY, str(ENGINE / "scripts/snapshot.py")], False),
+                 [_PY, str(ENGINE / "scripts/snapshot.py"), "--runtime-owned"], False),
     "render": ("Render flat", "Regenerate the flat _sc files under the active artifact root "
                "(specs_sc / docs_sc / skills_sc / roadmap_sc.md) from the DB. Incremental.",
                [_PY, str(ENGINE / "scripts/render.py"), "flat"], False),
@@ -4173,23 +4211,49 @@ class Handler(BaseHTTPRequestHandler):
                 fid = body.get("feature_id")
                 fid = int(fid) if fid is not None else None
                 kind = body.get("kind") or "spec"
-                seq = body.get("seq")
-                if seq is None:  # next seq for this (feature, kind) — mirrors the old CLI
-                    seq = con.execute(
-                        "SELECT COALESCE(MAX(seq),0)+1 FROM documents "
-                        "WHERE feature_id IS ? AND kind=?", (fid, kind)).fetchone()[0]
-                cur = con.execute(
-                    "INSERT INTO documents (feature_id, kind, seq, title, body, render_path) "
-                    "VALUES (?, ?, ?, ?, ?, ?)",
-                    (fid,
-                     kind,
-                     seq,
-                     (body.get("title") or "").strip() or None,
-                     body.get("body") or None,
-                     body.get("render_path") or None))
-                con.commit()
-                return self._send(201, {"document_id": cur.lastrowid,
-                                        "serialize": serialize_doc_write()})
+                conflict_error = None
+                document_id = None
+                with db_driver.write_transaction(con, "document.add"):
+                    seq = body.get("seq")
+                    if seq is None:
+                        seq = con.execute(
+                            "SELECT COALESCE(MAX(seq),0)+1 FROM documents "
+                            "WHERE feature_id IS ? AND kind=?",
+                            (fid, kind),
+                        ).fetchone()[0]
+                    candidate = {
+                        "document_id": None,
+                        "feature_id": fid,
+                        "kind": kind,
+                        "seq": seq,
+                        "title": (body.get("title") or "").strip() or None,
+                        "body": body.get("body") or None,
+                        "render_path": body.get("render_path") or None,
+                    }
+                    conflict = document_render_path_conflict(con, candidate)
+                    if conflict is not None:
+                        conflict_error = conflict
+                    else:
+                        cur = con.execute(
+                            "INSERT INTO documents "
+                            "(feature_id, kind, seq, title, body, render_path) "
+                            "VALUES (?, ?, ?, ?, ?, ?)",
+                            (
+                                fid,
+                                kind,
+                                seq,
+                                candidate["title"],
+                                candidate["body"],
+                                candidate["render_path"],
+                            ),
+                        )
+                        document_id = cur.lastrowid
+                if conflict_error is not None:
+                    return self._send(409, {"error": conflict_error})
+                return self._send(201, {
+                    "document_id": document_id,
+                    "serialize": serialize_doc_write(),
+                })
 
             if path == "/_sc/mem/narrative":
                 text = (body.get("text") or "").strip()
@@ -4909,7 +4973,12 @@ class Handler(BaseHTTPRequestHandler):
                     }
                 })
             if path.startswith("/api/scripts/"):
-                r = run_script(path.rsplit("/", 1)[1])
+                script_key = path.rsplit("/", 1)[1]
+                if script_key == "snapshot":
+                    with _CONTENT_WRITE_LOCK, artifact_policy.content_write_lock():
+                        r = run_script(script_key)
+                else:
+                    r = run_script(script_key)
                 if r is None:
                     return self._send(404, {"error": "no such script"})
                 return self._send(200 if r["ok"] else 500, r)

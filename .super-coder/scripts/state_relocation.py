@@ -467,8 +467,6 @@ def relocate_legacy_state(
         if receipt is not None and receipt["status"] == "private":
             if not resolved.database.exists():
                 raise RelocationError("relocation receipt exists but private DB is missing")
-            if database_fingerprint(resolved.database) != receipt.get("database"):
-                raise RelocationError("private database conflicts with relocation receipt")
             if legacy.exists():
                 if database_fingerprint(legacy) != receipt.get("database"):
                     raise RelocationError("conflicting complete legacy and private databases")

@@ -110,11 +110,25 @@ def _render_documents(con, written, skipped, root: Path) -> None:
     are removed so both managed directories remain exact DB projections.
     """
     rows = con.execute(
-        "SELECT d.feature_id, d.kind, d.seq, d.title, d.body, d.render_path, "
+        "SELECT d.document_id, d.feature_id, d.kind, d.seq, d.title, d.body, d.render_path, "
         "d.frozen, r.roadmap_status, r.title AS feature_title FROM documents d "
         "LEFT JOIN roadmap r ON r.feature_id = d.feature_id "
         "ORDER BY d.feature_id, d.kind, d.seq"
     ).fetchall()
+    owners: dict[Path, tuple[int, str]] = {}
+    for row in rows:
+        if not row["body"]:
+            continue
+        rel = document_rel_path(row)
+        target = _document_target(root, rel, row["kind"])
+        previous = owners.get(target)
+        if previous is not None:
+            raise ValueError(
+                f"duplicate document render path {rel!r}: "
+                f"document IDs {previous[0]} and {row['document_id']}"
+            )
+        owners[target] = (row["document_id"], rel)
+
     expected: set[Path] = set()
     for r in rows:
         if not r["body"]:

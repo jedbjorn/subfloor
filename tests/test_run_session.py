@@ -63,6 +63,18 @@ INSERT INTO lock_probe (probe_id, value) VALUES (1, 0);
 """
 
 
+class RenderOnlyAuthenticationTest(unittest.TestCase):
+    def test_render_only_is_noninteractive_even_with_a_tty(self) -> None:
+        self.assertFalse(
+            run.interactive_authentication(headless=False, render_only=True)
+        )
+
+    def test_normal_terminal_boot_remains_interactive(self) -> None:
+        self.assertTrue(
+            run.interactive_authentication(headless=False, render_only=False)
+        )
+
+
 class FlavorRouteDefaultsTest(unittest.TestCase):
     def test_loader_projects_nullable_per_harness_effort(self) -> None:
         con = sqlite3.connect(":memory:")

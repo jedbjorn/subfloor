@@ -64,6 +64,15 @@ class BranchGuardTest(unittest.TestCase):
                               cwd=self.repo, env=env, capture_output=True,
                               check=False)
 
+    def guard_codex_patch(self, patch: str) -> subprocess.CompletedProcess:
+        env = {k: v for k, v in os.environ.items()
+               if k not in ("SC_SHELL_FLAVOR", "SC_SHARED_DIRS", "TMPDIR",
+                            "SC_PROTECTED_BRANCHES", "SC_SHELL_WORKTREE")}
+        payload = json.dumps({"tool_input": {"command": patch}})
+        return subprocess.run(["bash", str(GUARD)], input=payload, text=True,
+                              cwd=self.repo, env=env, capture_output=True,
+                              check=False)
+
     def pre_commit(self, **markers: str) -> subprocess.CompletedProcess:
         """Run the universal commit backstop with an explicit caller context."""
         env = {
@@ -84,6 +93,22 @@ class BranchGuardTest(unittest.TestCase):
 
     def test_tracked_area_target_blocked_on_protected_branch(self):
         r = self.guard(str(self.repo / "src" / "new_module.py"))
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("protected branch 'main'", r.stderr)
+
+    def test_codex_tmp_patch_allowed_on_protected_branch(self):
+        r = self.guard_codex_patch(
+            "*** Begin Patch\n*** Add File: /tmp/recovery.py\n+repair\n*** End Patch"
+        )
+        self.assertEqual(r.returncode, 0, r.stderr)
+
+    def test_codex_mixed_patch_still_blocks_repository_target(self):
+        r = self.guard_codex_patch(
+            "*** Begin Patch\n"
+            "*** Add File: /tmp/recovery.py\n+repair\n"
+            f"*** Add File: {self.repo / 'src' / 'change.py'}\n+change\n"
+            "*** End Patch"
+        )
         self.assertEqual(r.returncode, 2)
         self.assertIn("protected branch 'main'", r.stderr)
 
