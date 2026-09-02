@@ -106,7 +106,8 @@ node_modules/
 /.codex/hooks.json
 # Shell worktrees — one per shell, linked inside the repo root.
 /.sc-worktrees/
-# The engine pin is tracked. Every generated instance artifact is local-only.
+# The engine pin + source provenance are tracked. Every generated instance
+# artifact is local-only.
 /.sc-state/engine.ref.prev
 /.sc-state/content.sql
 /.sc-state/map_content.sql
