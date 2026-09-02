@@ -60,10 +60,65 @@ INSTALLER_OWN_FLAGS = frozenset((
     "--harness-epoch",
     "--roll-harness-epoch",
 ))
+# Value-taking installer flag: `--runtime <mode>` / `--runtime=<mode>`. The
+# selection lives in instance.json under RUNTIME_KEY (scripts/runtime.py owns
+# the vocabulary); the constants here keep the installer readable.
+RUNTIME_FLAG = "--runtime"
+RUNTIME_KEY = "runtime"
+RUNTIME_HOST = "host"
+RUNTIME_SANDBOX = "sandbox"
+
+
+def _runtime_module():
+    """Lazy import: minimal maintenance fixtures copy install.py without it."""
+    import runtime  # noqa: PLC0415
+
+    return runtime
+
+
+def _host_runtime_selected() -> bool:
+    """Whether this install's instance.json selects the host runtime.
+
+    An engine copy without runtime.py predates the selection and can only be
+    a sandbox install, so the missing module answers `False`, never an error.
+    """
+    try:
+        return _runtime_module().is_host()
+    except ImportError:
+        return False
 
 
 def help_requested(argv: list[str]) -> bool:
     return any(arg in HELP_FLAGS for arg in argv)
+
+
+def split_runtime_flag(argv: list[str]) -> tuple[str | None, list[str]]:
+    """Pull `--runtime <mode>` out of argv; return (mode, remaining argv).
+
+    The mode is returned as typed and validated by the caller, so a bad value
+    fails with the installer's own message instead of reaching init_fork's
+    parser as an unknown option. None means the flag was not given.
+    """
+    mode: str | None = None
+    remaining: list[str] = []
+    i = 0
+    while i < len(argv):
+        arg = argv[i]
+        if arg == RUNTIME_FLAG:
+            if i + 1 >= len(argv):
+                raise SystemExit(
+                    f"install: {RUNTIME_FLAG} needs a value (host · sandbox)"
+                )
+            mode = argv[i + 1]
+            i += 2
+            continue
+        if arg.startswith(RUNTIME_FLAG + "="):
+            mode = arg.split("=", 1)[1]
+            i += 1
+            continue
+        remaining.append(arg)
+        i += 1
+    return mode, remaining
 
 
 def print_help() -> None:
@@ -75,6 +130,9 @@ Options:
   -h, --help                  show this help and exit without changing state
   --force                     override source/already-installed safety guards
   --skip-harness-install      detect harnesses without installing them
+  --runtime MODE              lifecycle runtime: sandbox (default — docker container)
+                              or host (supervised host process, no docker anywhere);
+                              recorded in instance.json, later: ./sc runtime <mode>
   --username NAME             active operator username (required without a TTY)
   --name NAME                 override the primary shell display name
   --shortname NAME            override the primary shell shortname
@@ -599,6 +657,14 @@ def report_docker() -> dict:
     return st
 
 
+def report_host_runtime_selected() -> None:
+    """Print the runtime block for a host-runtime install (docker unused)."""
+    print("  runtime   ✓ host — the review server runs as a supervised host process")
+    print("            (nohup + pidfile under .super-coder/run/) and shells boot directly")
+    print("            on this host with the harness's normal permission prompts.")
+    print("            docker is not probed, built, or started. Switch: ./sc runtime sandbox")
+
+
 # ── Harness login preflight ──────────────────────────────────────────────────
 # The sandbox mounts your host harness creds in (binaries are baked in the image;
 # auth is host-mounted so you don't re-login on every restart). So a one-time
@@ -955,7 +1021,13 @@ def main(argv: list[str]) -> int:
     force = "--force" in argv
     skip_harness = "--skip-harness-install" in argv
     # super-coder's own flags — strip them so they don't reach init_fork's parser.
-    fork_args = [a for a in argv if a not in INSTALLER_OWN_FLAGS]
+    requested_runtime, argv_without_runtime = split_runtime_flag(argv)
+    fork_args = [a for a in argv_without_runtime if a not in INSTALLER_OWN_FLAGS]
+    if requested_runtime is not None:
+        try:
+            requested_runtime = _runtime_module().validate(requested_runtime)
+        except ValueError as exc:
+            sys.exit(f"install: {exc}")
 
     # Standalone, machine-readable: the sandbox harness epoch. `sc` shells out to
     # these rather than reimplementing the file format, so there is one owner of
@@ -987,9 +1059,14 @@ def main(argv: list[str]) -> int:
     # Standalone preflight (re-run after configuring docker / logging in) —
     # `./sc doctor`: is the sandbox ready to launch + boot a harness?
     if "--check-docker" in argv:
-        step("Sandbox runtime (docker)")
-        report_docker()
-        step("Harness login (host creds the sandbox mounts in)")
+        if _host_runtime_selected():
+            step("Runtime (host)")
+            report_host_runtime_selected()
+            step("Harness login (host creds — the host IS the runtime)")
+        else:
+            step("Sandbox runtime (docker)")
+            report_docker()
+            step("Harness login (host creds the sandbox mounts in)")
         report_logins()
         return 0
 
@@ -1033,8 +1110,13 @@ def main(argv: list[str]) -> int:
     if not shutil.which("curl"):
         print("  ⚠ curl not on PATH — needed to auto-install a missing harness.")
     # Docker is the default run path (the sandbox); guide if it's missing or
-    # under-configured. Never fatal — `./sc serve`+`boot` run without it.
-    report_docker()
+    # under-configured. Never fatal — `./sc serve`+`boot` run without it. A
+    # host-runtime install never needs docker, so it is not even probed.
+    selected_runtime = requested_runtime or RUNTIME_SANDBOX
+    if selected_runtime == RUNTIME_HOST:
+        report_host_runtime_selected()
+    else:
+        report_docker()
 
     # 3. Ensure harness CLIs --------------------------------------------------
     # Install every managed harness if missing. The picker only offers surfaces
@@ -1054,7 +1136,10 @@ def main(argv: list[str]) -> int:
 
     # 3.1 Harness login — the sandbox mounts host creds in, so a one-time host
     # login is what populates them. Detect + guide; the oauth flow isn't scriptable.
-    step("Harness login (one-time, on the host — the sandbox mounts these creds in)")
+    if selected_runtime == RUNTIME_HOST:
+        step("Harness login (one-time, on the host — the host IS the runtime)")
+    else:
+        step("Harness login (one-time, on the host — the sandbox mounts these creds in)")
     report_logins()
 
     # 3.5 Wire the host repo's .gitignore -------------------------------------
@@ -1199,9 +1284,14 @@ def main(argv: list[str]) -> int:
     cfg = ports_mod.resolve(persist=False)
     cfg["harness"] = harness
     cfg["installed_at"] = datetime.now(timezone.utc).date().isoformat()
+    # The runtime key is written only when the operator chose one: an absent
+    # key reads as sandbox everywhere, and a --force re-install without the
+    # flag keeps whatever runtime the install already selected.
+    if requested_runtime is not None:
+        cfg[RUNTIME_KEY] = requested_runtime
     installer_changes = {
         key: cfg[key]
-        for key in (*ports_mod.PORT_KEYS, "harness", "installed_at")
+        for key in (*ports_mod.PORT_KEYS, "harness", "installed_at", RUNTIME_KEY)
         if key in cfg
     }
     stored = instance_state.update_bound_instance_config(
@@ -1216,11 +1306,16 @@ def main(argv: list[str]) -> int:
     # 9. Done -----------------------------------------------------------------
     step("Installed ✓")
     print(f"  harness : {harness}")
+    print(f"  runtime : {stored.get(RUNTIME_KEY) or RUNTIME_SANDBOX}")
     print(f"  GUI port: {cfg['port']}  (http://127.0.0.1:{cfg['port']})")
     print("\nNext:")
     print("  git add -A && git commit --no-verify -m 'chore: install subfloor'")
-    print("  make dos-l          # starts the sandbox + GUI")
-    print("  make dos-e          # attach + boot your shell")
+    if (stored.get(RUNTIME_KEY) or RUNTIME_SANDBOX) == RUNTIME_HOST:
+        print("  make dos-l          # starts the host review server + GUI")
+        print("  make dos-e          # boot your shell on the host")
+    else:
+        print("  make dos-l          # starts the sandbox + GUI")
+        print("  make dos-e          # attach + boot your shell")
     return 0
 
 

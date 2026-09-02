@@ -101,7 +101,7 @@ one signed-in coding harness.
 | **Harness account** | Have a plan for Claude Code, OpenCode, Codex, Vibe, or Kimi Code; sign in once in Linux. |
 
 > [!class4]
-> **The bar: Linux, Python 3.14.x with `sqlite3`, a reachable docker daemon, and a harness CLI on PATH.** `./sc doctor` reports the selected absolute interpreter, version, SQLite result, docker mode (rootless / rootful), and the exact next command. `SC_PYTHON`, when non-empty, selects the exact interpreter. No docker at all? The `./sc serve` + `./sc boot` escape hatch runs the shell on the Linux host.
+> **The bar: Linux, Python 3.14.x with `sqlite3`, a reachable docker daemon, and a harness CLI on PATH.** `./sc doctor` reports the selected absolute interpreter, version, SQLite result, docker mode (rootless / rootful), and the exact next command. `SC_PYTHON`, when non-empty, selects the exact interpreter. No docker at all? Install with `./sc install --runtime host`: the **host runtime** runs the review server as a supervised host process (nohup + pidfile under `.super-coder/run/`) and boots shells directly on the host, and every lifecycle verb follows it — `launch`, `enter`, `down`, `restart`, `logs`, `update-harnesses`, `doctor`, and `update` (which stops and relaunches the host server around DB maintenance). The selection is the `runtime` key in `.super-coder/instance.json`; `./sc runtime host|sandbox` switches it later. `./sc serve` + `./sc boot` remain the bare primitives under either runtime.
 
 On macOS or Windows, create a Linux VM, install these prerequisites in the
 guest, and keep the checkout on guest-owned storage when practical. Host-shared
@@ -121,7 +121,7 @@ git fetch super-coder
 git checkout super-coder/main -- .super-coder sc
 
 # 2. Bootstrap the fork — installs harness CLIs, builds the DB, seeds your starting team:
-./sc install
+./sc install                    # add --runtime host to run without docker (see the bar above)
 
 # 3. Commit the install before creating shell worktrees:
 git add -A && git commit --no-verify -m "chore: install subfloor"
@@ -1240,8 +1240,10 @@ The Roadmap tab renders the same feature rows two ways, toggled top-centre:
 > CLI and the `db_map` skill write.
 
 The server runs **inside the sandbox container** as its foreground process, so
-`./sc launch` brings it up (printing its URL) and `./sc down` stops it;
-`./sc enter` starts a CLI-owned shell session, while the Chats tab starts a
+`./sc launch` brings it up (printing its URL) and `./sc down` stops it. Under
+the host runtime (`./sc runtime host`) the same two verbs start and stop it as
+a supervised host process instead, with its log at `.super-coder/run/server.log`
+(`./sc logs` tails it). `./sc enter` starts a CLI-owned shell session, while the Chats tab starts a
 separate browser-owned conversation through the same harness adapters. The two
 surfaces never own one shell concurrently. The port publishes to `127.0.0.1`
 only.
