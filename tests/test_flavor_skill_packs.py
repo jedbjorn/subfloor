@@ -47,7 +47,7 @@ RATIFIED_OPT_INS = {
         "sprint_dev",
     },
     "reviewer": {"flags", "git", "redline_review", "review", "sprint_rev"},
-    "devops": {"docs", "flags", "git"},
+    "devops": {"docs", "flags", "git", "tailscale"},
     "cartographer": {"cartographer", "git"},
 }
 
@@ -288,6 +288,9 @@ class HardCutoverMigrationTest(unittest.TestCase):
             expected_at_0241 = expected - {"engine_database"}
             if flavor == "admin":
                 expected_at_0241 -= {"flags"}
+            # 0241 tombstoned tailscale; the 0247 restore re-upstreams it.
+            if flavor == "devops":
+                expected_at_0241 -= {"tailscale"}
             expected_with_local = expected_at_0241 | (
                 {"fork_testing_seat"} if flavor == "dev" else set()
             )

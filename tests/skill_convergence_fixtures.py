@@ -44,7 +44,6 @@ TOMBSTONE_SKILLS = (
     "migration_management",
     "pm2",
     "query_authoring_pg",
-    "tailscale",
     "test_authoring",
     "test_authoring_pg",
     "test_authoring_sqlite",
