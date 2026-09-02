@@ -73,9 +73,14 @@ def _git(root: Path, *args: str) -> str:
 
 class EnginePathsCoverageTest(unittest.TestCase):
     def test_head_allow_list_is_a_literal_matching_the_export(self):
+        # This install keeps the engine as a gitignored dependency, so "HEAD"
+        # (a fork commit) carries no engine files. The materialized pin is the
+        # fork's engine-HEAD equivalent: same literal-list contract, same
+        # ref-shaped lookup.
+        engine_ref = (ROOT / ".sc-state" / "engine.ref").read_text().strip()
         warning = io.StringIO()
         with contextlib.redirect_stderr(warning):
-            resolved = update._engine_paths_for("HEAD", repo_root=ROOT)
+            resolved = update._engine_paths_for(engine_ref, repo_root=ROOT)
 
         self.assertEqual(warning.getvalue(), "")
         self.assertEqual(resolved, update.engine_manifest.ENGINE_PATHS)

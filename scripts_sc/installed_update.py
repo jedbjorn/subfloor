@@ -22,7 +22,24 @@ def load_installed_updater():
     # gitignored dependency here. Keep that one-off identity outside the engine
     # so an engine materialization cannot overwrite it mid-update.
     update.is_source_repo = lambda: False
+    # keep the engine's own matcher probeable under a stable private name
+    update._engine_super_coder_remote = update.super_coder_remote
     update.super_coder_remote = lambda: ENGINE_REMOTE
+
+    # The harness epoch is only a cache-bust hint for the optional sandbox
+    # image. A read-only or otherwise unavailable machine config directory
+    # must not block engine/DB reconciliation for this host-native install
+    # (fork fix 9310e1a3, previously patched into the replaceable engine tree).
+    _engine_expire = update.expire_sandbox_harnesses
+
+    def expire_sandbox_harnesses():
+        try:
+            return _engine_expire()
+        except OSError as exc:
+            print(f"  ⚠ sandbox harness epoch not updated ({exc})")
+            return None
+
+    update.expire_sandbox_harnesses = expire_sandbox_harnesses
     return update
 
 

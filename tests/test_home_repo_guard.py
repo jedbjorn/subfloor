@@ -29,7 +29,7 @@ import unittest
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-HOOK = ROOT / ".super-coder" / "hooks" / "pre-commit"
+HOOK = ROOT / "scripts_sc" / "hooks" / "pre-commit"
 
 GIT_ENV = {"GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
            "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"}
@@ -46,8 +46,11 @@ class HomeRepoGuardTest(unittest.TestCase):
         (cls.engine / "scripts").mkdir(parents=True)
         (cls.engine / "instance.json").write_text(
             json.dumps({"repo": "home", "work_repo": WORK_REPO}))
-        stub = cls.engine / "scripts" / "branch-guard.sh"
+        stub = cls.engine / "hooks"
+        stub.mkdir(parents=True)
+        stub = stub / "pre-commit"
         stub.write_text("#!/usr/bin/env bash\nexit 0\n")  # permissive: isolate the home guard
+        stub.chmod(0o755)
         cls._run(cls.home, "git", "init", "-q", "-b", "main")
         (cls.home / "f.txt").write_text("x\n")
         cls._run(cls.home, "git", "add", "f.txt")

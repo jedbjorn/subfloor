@@ -48,7 +48,8 @@ What that buys you in practice:
 ## Install
 
 > [!class4]
-> **The bar: Python 3, git, curl, and one signed-in harness CLI on PATH.**
+> **The bar: Linux, Python 3.14.x with `sqlite3`, git, curl, and one signed-in harness CLI on PATH.**
+> Set `SC_PYTHON=/absolute/path/to/python3` to select a specific interpreter.
 > `./sc doctor` checks the bare-metal runtime and harness login.
 
 Five steps, from an existing git repo to a booted shell:

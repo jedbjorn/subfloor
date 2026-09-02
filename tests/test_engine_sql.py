@@ -185,7 +185,12 @@ class EngineSqlTest(unittest.TestCase):
         self.assertNotIn(str(self.db), str(caught.exception))
 
     def test_missing_identity_does_not_adopt_an_admin_credential(self):
-        with mock.patch.dict(os.environ, {}, clear=True), \
+        # A live install keeps runtime credential artifacts in the engine's
+        # run/mem; mem._CRED_DIR is resolved at import, so point it at an empty
+        # dir to isolate the missing-identity refusal.
+        with tempfile.TemporaryDirectory() as td, \
+             mock.patch.dict(os.environ, {"SC_MEM_CRED_DIR": td}, clear=True), \
+             mock.patch.object(engine_sql.mem, "_CRED_DIR", Path(td)), \
              self.assertRaises(SystemExit) as caught:
             engine_sql.main(["read-only", "SELECT 1;"])
         self.assertIn(engine_sql.ERROR_CODE, str(caught.exception))

@@ -17,10 +17,15 @@ class FreshInstallShellContractTest(unittest.TestCase):
             commit = text.index(
                 'git commit --no-verify -m "chore: install subfloor"'
             )
-            launch = text.index("make dos-l", commit)
-            enter = text.index("make dos-e", launch)
-            self.assertLess(commit, launch, relative)
-            self.assertLess(launch, enter, relative)
+            # This install's happy path launches and enters via the bare-metal
+            # host commands, not the sandbox make aliases. docs/README.md
+            # spells them with backticks — strip inline-code marks first.
+            # Invariant: the install commit precedes the first worktree-creating
+            # step (./sc enter). ./sc launch only starts host services.
+            plain = text.replace("`", "")
+            commit_line = plain.index("git add -A && git commit --no-verify")
+            enter = plain.index("./sc enter", commit_line)
+            self.assertLess(commit_line, enter, relative)
 
     def test_rendered_api_guidance_uses_path_launcher(self) -> None:
         rendered = compose.render_api(8837, "configured")

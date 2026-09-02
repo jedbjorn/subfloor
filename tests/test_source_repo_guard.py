@@ -1,13 +1,17 @@
 #!/usr/bin/env python3
-"""The source-repo guard must survive the super-coder → subfloor rename.
+"""The installed-mode identity adapter must survive the source/fork overlap.
 
-is_source_repo() is the ONLY thing standing between the source repo and the
-fork-flavored B7 engine untrack (`git rm -r --cached .super-coder`) plus the
-fork gitignore block. The day origin was renamed to subfloor, the
-basename == "super-coder" check silently flipped to False and the untrack
-fired on the dogfood repo. Three modules carry the check (install, update,
-map_repo); all must key off install.SOURCE_REPO_NAMES and accept every canonical
-source name, including the public CLI repository basename.
+This install's origin IS jedbjorn/subfloor.git — an origin whose basename sits
+in the engine's SOURCE_REPO_NAMES. The bare engine check therefore reads this
+repo as the engine SOURCE repo, which would (a) let `update` reconcile in
+place instead of materializing the pinned engine, and (b) flip every boot to
+the wrong "you are upstream" PROJECT vs ENGINE stance. The one protection is
+the adapter layer (scripts_sc/installed_update.py + installed_run.py): it must
+pin installed-mode identity on BOTH modules regardless of origin, name the
+sc-engine-local remote, and tolerate an unavailable sandbox epoch.
+
+The engine's own canonical-name tests live upstream (subfloor); this suite
+pins what keeps THIS install out of source-mode.
 
 Run:
     python3 tests/test_source_repo_guard.py
@@ -19,117 +23,95 @@ import unittest
 from pathlib import Path
 from types import SimpleNamespace
 
-ENGINE = Path(__file__).resolve().parents[1] / ".super-coder"
+ROOT = Path(__file__).resolve().parents[1]
+ENGINE = ROOT / ".super-coder"
 sys.path.insert(0, str(ENGINE / "scripts"))
+sys.path.insert(0, str(ROOT / "scripts_sc"))
 import install  # noqa: E402
-import map_repo  # noqa: E402
-import update  # noqa: E402
+import installed_update  # noqa: E402
 
 
-class SourceRepoGuardTest(unittest.TestCase):
-    def test_canonical_names(self):
+class InstalledIdentityAdapterTest(unittest.TestCase):
+    def setUp(self):
+        self.update = installed_update.load_installed_updater()
+
+    def test_engine_baseline_still_recognizes_the_source_names(self):
+        # The ENGINE's canonical set is upstream's decision — pin it so a
+        # rename there surfaces here instead of silently changing stance.
         self.assertIn("super-coder", install.SOURCE_REPO_NAMES)
         self.assertIn("subfloor", install.SOURCE_REPO_NAMES)
-        self.assertIn("subfloor-cli", install.SOURCE_REPO_NAMES)
-        self.assertIn("sc-cachy", install.SOURCE_REPO_NAMES)
 
-    def test_install_accepts_source_names(self):
-        # Fallback pinned False so ONLY the basename decision is under test —
-        # in this checkout the engine is tracked, which would mask a miss.
-        orig, orig_tracked = install.origin_basename, install._engine_tracked
-        install._engine_tracked = lambda: False
-        try:
-            for base, want in [("super-coder", True), ("subfloor", True),
-                               ("subfloor-cli", True),
-                               ("sc-cachy", True),
-                               ("my-fork", False), (None, False)]:
-                install.origin_basename = lambda b=base: b
-                self.assertEqual(install.is_source_repo(), want, base)
-        finally:
-            install.origin_basename = orig
-            install._engine_tracked = orig_tracked
+    def test_this_origin_basename_lands_in_the_engine_source_set(self):
+        # The trap itself: this install's origin basename reads as source.
+        self.assertEqual(install.origin_basename(), "subfloor")
+        self.assertTrue(install.is_source_repo())
 
-    def test_tracked_engine_reads_as_source_without_origin(self):
-        # A remote-less home substrate must still read as source (else the B7
-        # untrack fires on it) — the tracked-engine fallback is what saves it.
-        orig, orig_tracked = install.origin_basename, install._engine_tracked
-        try:
-            install.origin_basename = lambda: None
-            install._engine_tracked = lambda: True
-            self.assertTrue(install.is_source_repo())
-            install._engine_tracked = lambda: False
-            self.assertFalse(install.is_source_repo())
-        finally:
-            install.origin_basename = orig
-            install._engine_tracked = orig_tracked
+    def test_adapter_pins_installed_mode_on_both_modules(self):
+        installed_update.load_installed_updater()
+        import update as update_mod
 
-    def test_update_accepts_source_names(self):
-        # update.is_source_repo delegates to install's — one detection.
-        orig, orig_tracked = install.origin_basename, install._engine_tracked
-        install._engine_tracked = lambda: False
-        try:
-            for base, want in [("subfloor", True), ("super-coder", True),
-                               ("subfloor-cli", True), ("sc-cachy", True),
-                               ("my-fork", False)]:
-                install.origin_basename = lambda b=base: b
-                self.assertEqual(update.is_source_repo(), want, base)
-        finally:
-            install.origin_basename = orig
-            install._engine_tracked = orig_tracked
+        self.assertFalse(self.update.is_source_repo())
+        self.assertFalse(update_is_source_repo_after_adapter())
 
-    def test_map_repo_accepts_source_names(self):
-        # Home-mapped mode delegates to install's detection — one detection.
-        # Pin MAP_ROOT to the home repo: in work-repo mode is_source_repo asks
-        # the MAPPED tree (tracked engine) and ignores origin entirely.
-        orig, orig_tracked = install.origin_basename, install._engine_tracked
-        orig_root = map_repo.MAP_ROOT
-        install._engine_tracked = lambda: False
-        map_repo.MAP_ROOT = map_repo.REPO_ROOT
-        try:
-            for base, want in [("subfloor", True), ("super-coder", True),
-                               ("subfloor-cli", True), ("sc-cachy", True),
-                               ("other", False)]:
-                install.origin_basename = lambda b=base: b
-                self.assertEqual(map_repo.is_source_repo(), want, base)
-        finally:
-            install.origin_basename = orig
-            install._engine_tracked = orig_tracked
-            map_repo.MAP_ROOT = orig_root
+    def test_adapter_names_the_engine_remote(self):
+        installed_update.load_installed_updater()
+        self.assertEqual(self.update.super_coder_remote(), "sc-engine-local")
 
-    def test_map_repo_workrepo_mode_asks_the_mapped_tree(self):
-        # Work-repo mode: the mapped tree's tracked engine decides; origin
-        # spoofing must have no effect. A non-repo dir -> not source.
-        orig, orig_root = install.origin_basename, map_repo.MAP_ROOT
-        install.origin_basename = lambda: "sc-cachy"   # would say source
-        map_repo.MAP_ROOT = Path("/nonexistent-mapped-repo")
+    def test_engine_remote_matcher_accepts_renamed_url(self):
+        orig = self.update.git
         try:
-            self.assertFalse(map_repo.is_source_repo())
-        finally:
-            install.origin_basename = orig
-            map_repo.MAP_ROOT = orig_root
-
-    def test_update_remote_matcher_accepts_renamed_url(self):
-        orig = update.git
-        try:
-            update.git = lambda *a, **k: SimpleNamespace(
+            self.update.git = lambda *a, **k: SimpleNamespace(
                 stdout="origin\tgit@github.com:me/my-fork.git (fetch)\n"
-                       "engine\thttps://github.com/jedbjorn/subfloor.git (fetch)\n",
+                       "sc-engine-local\thttps://github.com/jedbjorn/subfloor.git (fetch)\n",
                 returncode=0)
-            self.assertEqual(update.super_coder_remote(), "engine")
-        finally:
-            update.git = orig
+            # probe the ENGINE's own matcher, bypassing the adapter override
+            import update as update_mod
 
-    def test_update_remote_matcher_rejects_fork_name_containing_source_name(self):
-        orig = update.git
+            engine_fn = update_mod.__dict__.get("_engine_super_coder_remote")
+            self.assertIsNotNone(engine_fn)
+            self.assertEqual(engine_fn(), "sc-engine-local")
+        finally:
+            self.update.git = orig
+
+    def test_engine_remote_matcher_rejects_fork_name_containing_source_name(self):
+        orig = self.update.git
         try:
-            update.git = lambda *a, **k: SimpleNamespace(
+            self.update.git = lambda *a, **k: SimpleNamespace(
                 stdout="origin\thttps://github.com/jedbjorn/subfloor-marketing.git (fetch)\n"
-                       "engine\tgit@github.com:jedbjorn/subfloor.git (fetch)\n",
+                       "sc-engine-local\tgit@github.com:jedbjorn/subfloor.git (fetch)\n",
                 returncode=0,
             )
-            self.assertEqual(update.super_coder_remote(), "engine")
+            import update as update_mod
+
+            engine_fn = update_mod.__dict__.get("_engine_super_coder_remote")
+            self.assertIsNotNone(engine_fn)
+            self.assertEqual(engine_fn(), "sc-engine-local")
         finally:
-            update.git = orig
+            self.update.git = orig
+
+    def test_adapter_tolerates_unavailable_sandbox_epoch_state(self):
+        import io
+        from contextlib import redirect_stdout
+        from unittest import mock
+
+        update = installed_update.load_installed_updater()
+        warning = io.StringIO()
+        with mock.patch.object(
+            update.install_mod,
+            "roll_harness_epoch",
+            side_effect=OSError("read-only machine config"),
+        ), redirect_stdout(warning):
+            self.assertIsNone(update.expire_sandbox_harnesses())
+        self.assertIn("sandbox harness epoch not updated", warning.getvalue())
+
+
+def update_is_source_repo_after_adapter() -> bool:
+    """Read update.is_source_repo through a FRESH import — the adapter mutates
+    the module attribute, so a clean re-import probes the patched state only if
+    the module is shared. sys.modules caching makes this the same object."""
+    import update  # noqa: PLC0415
+
+    return update.is_source_repo()
 
 
 if __name__ == "__main__":

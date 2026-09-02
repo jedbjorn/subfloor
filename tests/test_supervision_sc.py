@@ -846,7 +846,10 @@ class MakeDispatchTests(unittest.TestCase):
             env=self.make_env(),
         )
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(result.stdout.strip(), "./sc launch --no-build")
+        # This install routes lifecycle targets through the host adapter
+        # (Makefile SC override), not bare ./sc.
+        self.assertEqual(
+            result.stdout.strip(), "sh scripts_sc/host_sc.sh launch --no-build")
 
     def test_dos_restart_forwards_yes_and_no_build(self):
         result = subprocess.run(
@@ -857,7 +860,9 @@ class MakeDispatchTests(unittest.TestCase):
             env=self.make_env(),
         )
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(result.stdout.strip(), "./sc restart --yes --no-build")
+        self.assertEqual(
+            result.stdout.strip(),
+            "sh scripts_sc/host_sc.sh restart --yes --no-build")
 
 
 if __name__ == "__main__":

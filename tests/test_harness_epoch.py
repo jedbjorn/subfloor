@@ -516,8 +516,11 @@ class UpdateExpiresSandboxHarnesses(unittest.TestCase):
     host's — the gap that let an update ship a new floor on frozen CLIs."""
 
     def setUp(self) -> None:
+        sys.path.insert(0, str(ROOT / "scripts_sc"))
         sys.path.insert(0, str(ENGINE / "scripts"))
-        import update as update_mod  # noqa: PLC0415 — engine scripts are path-loaded
+        import installed_update  # type: ignore[import-not-found]
+
+        update_mod = installed_update.load_installed_updater()
         self.update_mod = update_mod
         self._tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self._tmp.cleanup)

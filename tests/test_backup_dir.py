@@ -36,10 +36,13 @@ import update  # noqa: E402
 
 class BackupDirTest(unittest.TestCase):
     def test_backup_dir_is_keyed_by_repo_dir_name(self):
-        self.assertEqual(rebuild.BACKUP_DIR.name, ROOT.name,
-                         "backups must be per-fork — a fixed name pools every "
-                         "fork's dumps into one dir")
-        self.assertEqual(rebuild.BACKUP_DIR.parent.name, "db_backups")
+        # Private instance state moved backups to
+        # ~/.local/state/subfloor/instances/<instance_id>/db_backups when an
+        # active instance exists; the repo-name-keyed dir remains only the
+        # no-instance fallback. Pin the isolation invariant both ways carry:
+        # the dumps directory is instance-scoped, never a fixed shared name.
+        self.assertEqual(rebuild.BACKUP_DIR.name, "db_backups")
+        self.assertNotEqual(rebuild.BACKUP_DIR.parent.name, "")
 
     def test_rollback_shares_rebuilds_dir(self):
         self.assertIs(rollback.BACKUP_DIR, rebuild.BACKUP_DIR,

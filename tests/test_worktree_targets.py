@@ -47,10 +47,12 @@ import migrate as migrate_mod  # noqa: E402
 import model_catalog  # noqa: E402
 
 # Copied engine minus caches and anything instance-owned: the fixture's live
-# state is the sentinel this module writes, never a real fork's.
+# state is the sentinel this module writes, never a real fork's. "run" holds
+# the install's live sockets/pids — copying those (a unix socket has no device
+# at the destination) fails the copytree; the fixture never wants them.
 IGNORE = shutil.ignore_patterns(
     "__pycache__", "*.pyc", "shell_db.db*", "backups", "node_modules",
-    "logs",
+    "logs", "run", "instance.json",
 )
 
 # A skill row in a migration only one checkout holds exercises that checkout's

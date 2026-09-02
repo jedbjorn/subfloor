@@ -1,0 +1,48 @@
+#!/usr/bin/env bash
+# sc-cachy pre-commit — fork-owned layer IN FRONT of the engine's hook.
+#
+# core.hooksPath points at the engine's materialized hooks dir
+# (.super-coder/hooks), which every update wipes. This install needs one
+# extra check the engine does not ship: the HOME-SUBSTRATE guard.
+#
+# instance.json declares `work_repo` (~/Repos/subfloor): the repo the shells
+# actually maintain. THIS repo is only their memory substrate — the observed
+# failure mode is a shell resolving bare `git` to the home repo and committing
+# here. Refuse unless the commit is deliberate home maintenance:
+# SC_HOME_MAINTENANCE=1 (FnB-approved engine publish flow) or the admin
+# flavor. Installs without work_repo never reach the check. Repo identity is
+# compared by git-common-dir so every worktree of the home repo is covered.
+#
+# The engine's own branch-guard backstop runs AFTER this guard, unchanged.
+
+engine="${SC_ENGINE_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")/.." && pwd)}"
+fork_root="$(cd -- "$engine/.." && pwd)"
+
+if [ "${SC_HOME_MAINTENANCE:-}" != "1" ] \
+   && [ "${SC_SHELL_FLAVOR:-}" != "admin" ] \
+   && [ -f "$engine/instance.json" ]; then
+  work_repo="$(python3 -c '
+import json, os, sys
+try:
+    raw = (json.load(open(sys.argv[1])).get("work_repo") or "").strip()
+    print(os.path.expanduser(raw))
+except Exception:
+    print("")
+' "$engine/instance.json" 2>/dev/null || echo "")"
+  if [ -n "$work_repo" ]; then
+    here="$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null || echo "")"
+    home="$(git -C "$fork_root" rev-parse --path-format=absolute --git-common-dir 2>/dev/null || echo "")"
+    if [ -n "$here" ] && [ "$here" = "$home" ]; then
+      {
+        echo "Blocked: this commit targets the HOME substrate repo ('$fork_root') — not your work repo."
+        echo "Your work repo is: $work_repo"
+        echo "    git -C $work_repo status    # branch, commit, and PR THERE"
+        echo "Home and work repo are different products — never retarget this work onto the home repo."
+        echo "Deliberate home maintenance only (with FnB approval): SC_HOME_MAINTENANCE=1 git commit …"
+      } >&2
+      exit 2
+    fi
+  fi
+fi
+
+exec bash "$engine/hooks/pre-commit"

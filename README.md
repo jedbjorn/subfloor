@@ -115,8 +115,7 @@ harness already ships, nothing patched, nothing forked: [*Architecture*](docs/RE
 ## Install quickstart
 
 > [!class4]
-> **The bar: Python 3, git, curl, and one signed-in harness CLI on PATH.**
-> `./sc doctor` checks the bare-metal seat. Docker is optional.
+> **The bar: Linux, Python 3.14.x with `sqlite3`, git, curl, and one signed-in harness CLI on PATH.** Set `SC_PYTHON=/absolute/path/to/python3` to select a specific interpreter. `./sc doctor` checks the bare-metal seat. Docker is optional.
 
 Drop subfloor into an existing git repo and boot a shell:
 
@@ -138,7 +137,7 @@ claude                          # or:  opencode auth login  ·  codex login  · 
 ./sc launch
 
 # 5. Commit the install before creating shell worktrees:
-git add -A && git commit -m "chore: install subfloor"
+git add -A && git commit --no-verify -m "chore: install subfloor"
 
 # 6. Attach a session:
 ./sc enter                      # auth + pick a shell + pick a harness + boot

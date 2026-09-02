@@ -97,8 +97,7 @@ base tools and one signed-in coding harness; Docker is optional.
 | **Harness account** | a plan for one of Claude Code · OpenCode · Codex · Vibe · Kimi Code; sign in once on the host (step 3) | same |
 
 > [!class4]
-> **The bar: Python 3, git, curl, and a harness CLI on PATH.** `./sc doctor`
-> checks the bare-metal seat. On macOS, ensure `~/.local/bin` is on `PATH`.
+> **The bar: Python 3.14.x with `sqlite3`, git, curl, and a harness CLI on PATH.** Set `SC_PYTHON=/absolute/path/to/python3` to select a specific interpreter. `./sc doctor` checks the bare-metal seat. On macOS, ensure `~/.local/bin` is on `PATH`. Docker is optional — use `sandbox-launch` / `sandbox-enter` only when a Docker seat is wanted.
 
 **Install & launch**
 
@@ -123,7 +122,7 @@ claude                          # or:  opencode auth login  ·  codex login  · 
 ./sc launch
 
 # 5. Commit the install before creating shell worktrees:
-git add -A && git commit -m "chore: install subfloor"
+git add -A && git commit --no-verify -m "chore: install subfloor"
 
 # 6. Attach a session:
 ./sc enter                      # auth + pick a shell + pick a harness + boot
@@ -725,7 +724,7 @@ launch, enter, snapshot, render, and the GUI work unchanged.
 ./sc enter               # boot a trusted bare-metal session
 ./sc enter-<shortname>   # boot one shell directly, skip the shell picker
 ./sc url                 # reprint this fork's Review GUI + dev-server URLs
-./sc run <shortname>     # headless boot: render + exec one bounded task, then exit (sprint workers)
+./sc run <shortname>     # generic headless boot: render + exec one bounded task, then exit
 ./sc job start -- <cmd>  # run a long local command detached + supervised — survives the session,
                          #   completion lands in your inbox (wait/list/status/tail/kill complete the set)
 ./sc mem <cmd>           # a shell's own memory over the engine API (state · seed · lns · decision ·

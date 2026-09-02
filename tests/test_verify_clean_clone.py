@@ -30,31 +30,22 @@ class VerifyCleanCloneTest(unittest.TestCase):
                 ["git", "checkout", "--quiet", sha], cwd=checkout, check=True,
             )
             # Include locally edited launch-floor files when this regression
-            # test is run before their fixes have been committed.
+            # test is run before their fixes have been committed. This install
+            # keeps the engine as a gitignored dependency, so the clone carries
+            # no .super-coder/ — copy the whole materialized floor in (minus
+            # runtime state and the instance binding), matching what an
+            # install would leave on disk. Dropping instance.json is the
+            # point: the clone must verify as its OWN instance, never bind to
+            # this checkout's live private state.
             shutil.copy2(ROOT / "sc", checkout / "sc")
-            shutil.copy2(
-                ROOT / ".super-coder" / "scripts" / "pr_cli.py",
-                checkout / ".super-coder" / "scripts" / "pr_cli.py",
-            )
-            shutil.copy2(
-                ROOT / ".super-coder" / "scripts" / "run.py",
-                checkout / ".super-coder" / "scripts" / "run.py",
-            )
-            shutil.copy2(
-                ROOT / ".super-coder" / "scripts" / "git_freshness.py",
-                checkout / ".super-coder" / "scripts" / "git_freshness.py",
-            )
-            shutil.copy2(
-                ROOT / ".super-coder" / "render" / "compose.py",
-                checkout / ".super-coder" / "render" / "compose.py",
-            )
-            shutil.copy2(
-                ROOT / ".super-coder" / "scripts" / "global_pointer.py",
-                checkout / ".super-coder" / "scripts" / "global_pointer.py",
-            )
-            shutil.copy2(
-                ROOT / ".super-coder" / "scripts" / "skill_projection.py",
-                checkout / ".super-coder" / "scripts" / "skill_projection.py",
+            ignore = shutil.ignore_patterns(
+                "__pycache__", "run", "instance.json",
+                "*.db", "*.db-wal", "*.db-shm")
+            shutil.copytree(
+                ROOT / ".super-coder",
+                checkout / ".super-coder",
+                ignore=ignore,
+                dirs_exist_ok=True,
             )
             env = os.environ.copy()
             env.pop("SC_ARTIFACT_MODE", None)
