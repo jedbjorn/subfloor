@@ -33,11 +33,15 @@ git -C "$SUBFLOOR" fetch origin main
 TARGET="$(git -C "$SUBFLOOR" rev-parse --verify origin/main)"
 
 # This remote is updater plumbing only. It fetches engine objects from the
-# already-refreshed sibling without merging either repository.
+# already-refreshed sibling without merging either repository. The engine's
+# provenance validator (install.py:valid_engine_source) only accepts absolute
+# transport locators, so a file:// URL is required — a bare local path fails
+# the check and aborts the update before the pin advances.
+SUBFLOOR_URL="file://$SUBFLOOR"
 if git -C "$ROOT" remote get-url "$REMOTE" >/dev/null 2>&1; then
-  git -C "$ROOT" remote set-url "$REMOTE" "$SUBFLOOR"
+  git -C "$ROOT" remote set-url "$REMOTE" "$SUBFLOOR_URL"
 else
-  git -C "$ROOT" remote add "$REMOTE" "$SUBFLOOR"
+  git -C "$ROOT" remote add "$REMOTE" "$SUBFLOOR_URL"
 fi
 
 CONVERTED=0
