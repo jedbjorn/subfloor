@@ -15,8 +15,18 @@
 #
 # The engine's own branch-guard backstop runs AFTER this guard, unchanged.
 
-engine="${SC_ENGINE_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")/.." && pwd)}"
-fork_root="$(cd -- "$engine/.." && pwd)"
+# This hook lives at <fork>/scripts_sc/hooks/pre-commit, so the fork root is
+# two levels up and the materialized engine is <fork>/.super-coder. Resolving
+# the engine as this hook's own parent dir made the final exec re-enter this
+# file forever, hanging every commit. SC_ENGINE_DIR (tests, relocated engines)
+# still wins, and the fork root is then that engine's parent.
+if [ -n "${SC_ENGINE_DIR:-}" ]; then
+  engine="$SC_ENGINE_DIR"
+  fork_root="$(cd -- "$engine/.." && pwd)"
+else
+  fork_root="$(cd -- "$(dirname "${BASH_SOURCE[0]:-$0}")/../.." && pwd)"
+  engine="$fork_root/.super-coder"
+fi
 
 if [ "${SC_HOME_MAINTENANCE:-}" != "1" ] \
    && [ "${SC_SHELL_FLAVOR:-}" != "admin" ] \

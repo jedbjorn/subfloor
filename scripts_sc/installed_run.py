@@ -33,9 +33,24 @@ def apply_installed_identity() -> None:
     update.is_source_repo = lambda: False
 
 
+def dispatch_args(argv: list[str]) -> list[str]:
+    """Mirror the engine dispatcher's `boot` / `boot-<shortname>` verbs.
+
+    host_sc.sh hands this wrapper the verb the dispatcher would have received
+    (`boot`, `boot-cc`). run.py takes only the shortname positional, so the
+    bare verb is dropped and `boot-<shortname>` becomes `<shortname>` — the
+    same rewrite as dispatch.sh's `boot-*)` case. Anything else passes through.
+    """
+    if argv and argv[0] == "boot":
+        return argv[1:]
+    if argv and argv[0].startswith("boot-"):
+        return [argv[0][len("boot-"):], *argv[1:]]
+    return argv
+
+
 def main(argv: list[str]) -> int:
     apply_installed_identity()
-    sys.argv = [str(ENGINE_SCRIPTS / "run.py"), *argv]
+    sys.argv = [str(ENGINE_SCRIPTS / "run.py"), *dispatch_args(argv)]
     runpy.run_path(str(ENGINE_SCRIPTS / "run.py"), run_name="__main__")
     return 0
 
