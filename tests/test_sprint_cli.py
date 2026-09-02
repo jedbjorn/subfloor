@@ -27,13 +27,16 @@ import server
 import sprint_cli
 import sprint_domain
 import sprint_message_delivery
+import sprint_pr_watcher
 from github_pull_requests import PullRequest
+from sprint_route_binding_support import candidate as route_candidate
 from test_sprint_v2_domain import apply_schema
 
 TOKENS = {
     "admin": "admin-token",
     "developer": "dev-token",
     "reviewer": "review-token",
+    "reviewer3": "reviewer3-token",
     "planner": "planner-token",
 }
 
@@ -53,6 +56,120 @@ class SprintCliDispatcherTest(unittest.TestCase):
         self.assertIn("record-qaqc", completed.stdout)
         self.assertIn("compile-report", completed.stdout)
         self.assertIn("watcher-state", completed.stdout)
+        self.assertIn("reconcile-pr", completed.stdout)
+
+    def test_worktree_sprint_help_lists_cleanup_recovery_commands(self):
+        completed = subprocess.run(
+            [sys.executable, str(ENGINE / "scripts" / "sprint.py"), "--help"],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+        self.assertEqual(0, completed.returncode, completed.stderr)
+        self.assertIn("cleanup-status", completed.stdout)
+        self.assertIn("cleanup", completed.stdout)
+        self.assertIn("rebind-spec", completed.stdout)
+
+    def test_rebind_spec_posts_expected_revision_and_reason_idempotently(self):
+        output = io.StringIO()
+        response = {
+            "sprint_id": 29,
+            "document_id": 178,
+            "old_revision_sha256": "a" * 64,
+            "new_revision_sha256": "b" * 64,
+            "revision_id": 2,
+            "generation": 2,
+            "changed": True,
+        }
+        with (
+            mock.patch.object(mem, "_api", return_value=response) as api,
+            contextlib.redirect_stdout(output),
+        ):
+            self.assertEqual(
+                0,
+                sprint_cli.main(
+                    [
+                        "rebind-spec",
+                        "--sprint",
+                        "29",
+                        "--document",
+                        "178",
+                        "--expected-revision",
+                        "a" * 64,
+                        "--reason",
+                        "Reviewer decision 1667",
+                    ]
+                ),
+            )
+
+        api.assert_called_once_with(
+            "POST",
+            "/_sc/sprint/rebind-spec",
+            {
+                "sprint_id": 29,
+                "document_id": 178,
+                "expected_revision_sha256": "a" * 64,
+                "reason": "Reviewer decision 1667",
+            },
+            idempotent=True,
+        )
+        self.assertEqual(response, json.loads(output.getvalue()))
+
+    def test_cleanup_commands_use_bounded_get_and_idempotent_post(self):
+        output = io.StringIO()
+        with (
+            mock.patch.object(mem, "_require_api"),
+            mock.patch.object(
+                mem,
+                "_api",
+                side_effect=(
+                    {"sprint_id": 11, "aggregate_state": "pending", "targets": []},
+                    {
+                        "cleanup_request_id": 7,
+                        "created": True,
+                        "action": "adopted_legacy",
+                        "target_ids": [1, 2],
+                    },
+                ),
+            ) as api,
+            contextlib.redirect_stdout(output),
+        ):
+            self.assertEqual(
+                0, sprint_cli.main(["cleanup-status", "--sprint", "11"])
+            )
+            self.assertEqual(
+                0,
+                sprint_cli.main(
+                    [
+                        "cleanup",
+                        "--sprint",
+                        "11",
+                        "--adopt-legacy",
+                        "--key",
+                        "legacy-11",
+                    ]
+                ),
+            )
+
+        self.assertEqual(
+            mock.call("GET", "/_sc/sprint/cleanup-runs/11"),
+            api.call_args_list[0],
+        )
+        self.assertEqual(
+            mock.call(
+                "POST",
+                "/_sc/sprint/cleanup-runs",
+                {
+                    "sprint_id": 11,
+                    "idempotency_key": "legacy-11",
+                    "adopt_legacy": True,
+                },
+                idempotent=True,
+            ),
+            api.call_args_list[1],
+        )
 
 
 class Reader:
@@ -74,10 +191,38 @@ class Reader:
         )
 
 
+_SPRINT_CLI_TEMP_PATH: Path | None = None
+
+
+def tearDownModule():
+    """Prove the class cleanup removes its database tree after every suite run."""
+    if _SPRINT_CLI_TEMP_PATH is None:
+        raise AssertionError("SprintCliApiTest did not create its temporary directory")
+    if _SPRINT_CLI_TEMP_PATH.exists():
+        raise AssertionError(
+            f"SprintCliApiTest leaked temporary directory: {_SPRINT_CLI_TEMP_PATH}"
+        )
+
+
 class SprintCliApiTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.tmp = Path(tempfile.mkdtemp())
+        global _SPRINT_CLI_TEMP_PATH
+        cls._route_patch = mock.patch.object(
+            sprint_domain, "_participant_binding_candidate", side_effect=route_candidate
+        )
+        cls._route_patch.start()
+        cls.addClassCleanup(cls._route_patch.stop)
+        cls._evidence_patch = mock.patch.object(
+            sprint_domain.route_bindings,
+            "verify_stored_v2_before_first_turn",
+        )
+        cls._evidence_patch.start()
+        cls.addClassCleanup(cls._evidence_patch.stop)
+        cls._temporary = tempfile.TemporaryDirectory()
+        cls.addClassCleanup(cls._temporary.cleanup)
+        cls.tmp = Path(cls._temporary.name)
+        _SPRINT_CLI_TEMP_PATH = cls.tmp
         cls.db = cls.tmp / "shell.db"
         con = sqlite3.connect(cls.db)
         con.row_factory = sqlite3.Row
@@ -128,10 +273,12 @@ class SprintCliApiTest(unittest.TestCase):
         )
         con.execute(
             "INSERT INTO sprint_specs "
-            "(sprint_id,document_id,bound_revision_sha256,approval_id) "
-            "VALUES (?,?,?,?)",
-            (cls.sprint_id, document_id, revision, approval_id),
+            "(sprint_id,document_id,bound_revision_sha256,approval_id,"
+            "bound_revision_body) VALUES (?,?,?,?,?)",
+            (cls.sprint_id, document_id, revision, approval_id, body),
         )
+        cls.document_id = document_id
+        cls.bound_body = body
         con.executemany(
             "INSERT INTO sprint_participants "
             "(sprint_id,shell_id,role,harness) VALUES (?,?,?,?)",
@@ -260,6 +407,112 @@ class SprintCliApiTest(unittest.TestCase):
             self.assertEqual(0, pr_cli.main(list(argv)))
         return json.loads(output.getvalue())
 
+    def test_spec_revision_reads_exact_body_and_rejects_nonparticipant(self):
+        response = self.run_cli(
+            TOKENS["reviewer"],
+            "spec-revision",
+            "--sprint",
+            str(self.sprint_id),
+            "--document",
+            str(self.document_id),
+        )
+        self.assertEqual(self.bound_body, response["body"])
+        self.assertEqual("available", response["availability"])
+        self.assertEqual(
+            hashlib.sha256(self.bound_body.encode()).hexdigest(),
+            response["bound_revision_sha256"],
+        )
+
+        mem.SC_API_TOKEN = TOKENS["developer"]
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            self.assertEqual(
+                0,
+                sprint_cli.main(
+                    [
+                        "spec-revision",
+                        "--sprint",
+                        str(self.sprint_id),
+                        "--document",
+                        str(self.document_id),
+                        "--body-only",
+                    ]
+                ),
+            )
+        self.assertEqual(self.bound_body, output.getvalue())
+
+        with self.assertRaisesRegex(SystemExit, "HTTP 403"):
+            self.run_cli(
+                TOKENS["admin"],
+                "spec-revision",
+                "--sprint",
+                str(self.sprint_id),
+                "--document",
+                str(self.document_id),
+            )
+
+    def test_informational_accept_returns_durable_idempotent_read_receipt(self):
+        con = sqlite3.connect(self.db)
+        con.row_factory = sqlite3.Row
+        try:
+            receipt = sprint_message_delivery.SprintMessageStore(con).relay(
+                self.sprint_id,
+                from_shell_id=2,
+                to_shortname="DEV1",
+                body="Review approved; continue through the live merge gate.",
+                idempotency_key="informational-read-receipt",
+                work_unit_id=self.unit_id,
+            )
+            message_id = receipt.message_id
+        finally:
+            con.close()
+
+        inbox = self.run_cli(
+            TOKENS["developer"], "inbox", "--sprint", str(self.sprint_id)
+        )
+        self.assertIn(message_id, [item["message_id"] for item in inbox["messages"]])
+
+        expected = {
+            "message_id": message_id,
+            "read": True,
+            "disposition": None,
+        }
+        first = self.run_cli(
+            TOKENS["developer"],
+            "accept",
+            "--sprint",
+            str(self.sprint_id),
+            "--message",
+            str(message_id),
+        )
+        replay = self.run_cli(
+            TOKENS["developer"],
+            "accept",
+            "--sprint",
+            str(self.sprint_id),
+            "--message",
+            str(message_id),
+        )
+        self.assertEqual(expected, first)
+        self.assertEqual(expected, replay)
+
+        after = self.run_cli(
+            TOKENS["developer"], "inbox", "--sprint", str(self.sprint_id)
+        )
+        self.assertNotIn(
+            message_id, [item["message_id"] for item in after["messages"]]
+        )
+        con = sqlite3.connect(self.db)
+        try:
+            self.assertIsNotNone(
+                con.execute(
+                    "SELECT read_at FROM wake_message WHERE message_id=?",
+                    (message_id,),
+                ).fetchone()[0]
+            )
+        finally:
+            con.close()
+
     def test_engine_wide_subscription_uses_authenticated_developer_identity(self):
         with mock.patch.object(
             server.sprint_pr_watcher,
@@ -296,6 +549,63 @@ class SprintCliApiTest(unittest.TestCase):
         self.assertEqual((1, None, None, "re-enter"), message[:4])
         self.assertIn("number=85", message[4])
         self.assertIn("event=green", message[4])
+
+    def test_reconcile_pr_allows_originating_planner_and_projects_receipt(self):
+        argv = (
+            "reconcile-pr",
+            "--sprint",
+            str(self.sprint_id),
+            "--repository",
+            "Acme/Repo",
+            "--pr",
+            "42",
+            "--work-unit",
+            str(self.unit_id),
+            "--reason",
+            "repair aborted Sprint ownership",
+        )
+        with mock.patch.object(
+            server.sprint_pr_watcher,
+            "GitHubPullRequestReader",
+            return_value=Reader(),
+        ), self.assertRaisesRegex(SystemExit, "HTTP 403.*originating Planner"):
+            self.run_cli(TOKENS["developer"], *argv)
+
+        expected = sprint_pr_watcher.RegistrationReconciliationReceipt(
+            self.registered_pr_id,
+            True,
+            9,
+            "merged",
+            "a" * 40,
+            "b" * 40,
+            (self.unit_id,),
+        )
+        with mock.patch.object(
+            server.sprint_pr_watcher.SprintPRWatcher,
+            "reconcile_aborted_registration",
+            return_value=expected,
+        ) as reconcile:
+            response = self.run_cli(TOKENS["planner"], *argv)
+
+        self.assertEqual(
+            {
+                "changed": True,
+                "completed_work_unit_ids": [self.unit_id],
+                "from_sprint_id": 9,
+                "head_sha": "a" * 40,
+                "merge_sha": "b" * 40,
+                "normalized_state": "merged",
+                "registered_pr_id": self.registered_pr_id,
+            },
+            response,
+        )
+        call = reconcile.call_args
+        self.assertEqual(self.sprint_id, call.args[0])
+        self.assertEqual("planner", call.kwargs["actor"].kind)
+        self.assertEqual(3, call.kwargs["actor"].shell_id)
+        self.assertEqual("Acme/Repo", call.kwargs["repository"])
+        self.assertEqual(42, call.kwargs["pr_number"])
+        self.assertEqual(self.unit_id, call.kwargs["work_unit_id"])
 
     def deliver_message(self, message_id: int) -> None:
         # The delivery worker is out of frame in these surface tests: stamp
@@ -406,6 +716,7 @@ class SprintCliApiTest(unittest.TestCase):
                     (3, "Planner", "PLN1", "planner", "prompt", TOKENS["planner"]),
                     (4, "Developer 2", "DEV2", "dev", "prompt", "dev2-token"),
                     (5, "FnB", "FNB", "admin", "prompt", TOKENS["admin"]),
+                    (7, "Reviewer 2", "REV3", "reviewer", "prompt", "reviewer3-token"),
                 ),
             )
             con.commit()
@@ -435,9 +746,10 @@ class SprintCliApiTest(unittest.TestCase):
                     (feature_id,),
                 ).lastrowid
             )
-            con.execute(
-                "UPDATE sprints SET lifecycle='armed',armed_at=? WHERE sprint_id=?",
-                ("2026-08-04 11:00:00", sprint_id),
+            con.executemany(
+                "INSERT INTO sprint_participants "
+                "(sprint_id,shell_id,role,harness) VALUES (?,?,?,'codex')",
+                ((sprint_id, 3, "planner"), (sprint_id, 2, "reviewer")),
             )
             participant_id = int(
                 con.execute(
@@ -445,6 +757,12 @@ class SprintCliApiTest(unittest.TestCase):
                     "(sprint_id,shell_id,role,harness) VALUES (?,1,'developer','codex')",
                     (sprint_id,),
                 ).lastrowid
+            )
+            con.execute(
+                "UPDATE sprints SET conformance_reviewer_shell_id=2,"
+                "conformance_owner_generation=1,lifecycle='armed',armed_at=? "
+                "WHERE sprint_id=?",
+                ("2026-08-04 11:00:00", sprint_id),
             )
             subscription_ids = []
             registered_ids = []
@@ -621,7 +939,16 @@ class SprintCliApiTest(unittest.TestCase):
             "--spec-approval",
             str(approval_id),
             "--participants-file",
-            self.participants_file(),
+            self.write(
+                json.dumps(
+                    [
+                        {"shell_id": 3, "role": "planner", "harness": "codex"},
+                        {"shell_id": 1, "role": "developer", "harness": "codex"},
+                        {"shell_id": 2, "role": "reviewer", "harness": "kimi"},
+                        {"shell_id": 7, "role": "reviewer", "harness": "kimi"},
+                    ]
+                )
+            ),
             "--merge-grant",
         )
         sprint_id = declaration["sprint_id"]
@@ -641,8 +968,29 @@ class SprintCliApiTest(unittest.TestCase):
             "--task",
             str(task_id),
         )
-        armed = self.run_cli(TOKENS["planner"], "arm", "--sprint", str(sprint_id))
+        with self.assertRaisesRegex(
+            SystemExit,
+            "HTTP 422.*not an active Reviewer participant",
+        ):
+            self.run_cli(
+                TOKENS["planner"],
+                "arm",
+                "--sprint",
+                str(sprint_id),
+                "--conformance-reviewer-shell",
+                "1",
+            )
+        armed = self.run_cli(
+            TOKENS["planner"],
+            "arm",
+            "--sprint",
+            str(sprint_id),
+            "--conformance-reviewer-shell",
+            "2",
+        )
         self.assertEqual(2, len(armed["wake_ids"]))
+        self.assertEqual(2, armed["conformance_reviewer_shell_id"])
+        self.assertEqual(1, armed["conformance_owner_generation"])
 
         with mock.patch.object(
             server.sprint_pr_watcher,
@@ -685,8 +1033,22 @@ class SprintCliApiTest(unittest.TestCase):
                 str(sprint_id),
                 "--reason",
                 "fixture is healthy",
+                "--conformance-reviewer-shell",
+                "7",
             )
         self.assertTrue(resumed["changed"])
+        self.assertEqual(7, resumed["conformance_reviewer_shell_id"])
+        self.assertEqual(2, resumed["conformance_owner_generation"])
+        con = sqlite3.connect(self.db)
+        try:
+            con.execute(
+                "UPDATE sprint_work_units SET disposition='completed',"
+                "completed_at=datetime('now') WHERE sprint_id=?",
+                (sprint_id,),
+            )
+            con.commit()
+        finally:
+            con.close()
         completed = self.run_cli(
             TOKENS["planner"],
             "complete",
@@ -702,9 +1064,11 @@ class SprintCliApiTest(unittest.TestCase):
         con = sqlite3.connect(self.db)
         try:
             self.assertEqual(
-                ("completed", "accepted"),
+                ("completed", "accepted", 7, 2),
                 con.execute(
-                    "SELECT lifecycle,terminal_outcome FROM sprints WHERE sprint_id=?",
+                    "SELECT lifecycle,terminal_outcome,"
+                    "conformance_reviewer_shell_id,conformance_owner_generation "
+                    "FROM sprints WHERE sprint_id=?",
                     (sprint_id,),
                 ).fetchone(),
             )
@@ -756,9 +1120,16 @@ class SprintCliApiTest(unittest.TestCase):
         con = sqlite3.connect(self.db)
         try:
             self.assertEqual(
-                (document_id, hashlib.sha256(body.encode()).hexdigest(), None),
+                (
+                    document_id,
+                    hashlib.sha256(body.encode()).hexdigest(),
+                    None,
+                    body,
+                    0,
+                ),
                 con.execute(
-                    "SELECT document_id,bound_revision_sha256,approval_id "
+                    "SELECT document_id,bound_revision_sha256,approval_id,"
+                    "bound_revision_body,bound_revision_legacy "
                     "FROM sprint_specs WHERE sprint_id=?",
                     (sprint_id,),
                 ).fetchone(),
@@ -776,6 +1147,113 @@ class SprintCliApiTest(unittest.TestCase):
             )
             self.assertEqual([document_id], payload["spec_document_ids"])
             self.assertNotIn("spec_approval_ids", payload)
+        finally:
+            con.close()
+
+    def test_paused_spec_rebind_is_end_to_end_and_preserves_history(self):
+        self.use_isolated_db()
+        con = sqlite3.connect(self.db)
+        try:
+            feature_id = int(
+                con.execute(
+                    "INSERT INTO roadmap (title,roadmap_status) "
+                    "VALUES ('Rebind declaration','in_progress')"
+                ).lastrowid
+            )
+            original = "original governing body"
+            document_id = int(
+                con.execute(
+                    "INSERT INTO documents (feature_id,kind,seq,title,body) "
+                    "VALUES (?,'spec',1,'Rebind spec',?)",
+                    (feature_id, original),
+                ).lastrowid
+            )
+            con.commit()
+        finally:
+            con.close()
+
+        sprint_id = self.run_cli(
+            TOKENS["planner"],
+            "declare",
+            "--feature",
+            str(feature_id),
+            "--spec",
+            str(document_id),
+            "--participants-file",
+            self.participants_file(),
+            "--merge-grant",
+        )["sprint_id"]
+        replacement = "reviewer-approved governing body"
+        old_revision = hashlib.sha256(original.encode()).hexdigest()
+        new_revision = hashlib.sha256(replacement.encode()).hexdigest()
+        con = sqlite3.connect(self.db)
+        try:
+            con.execute(
+                "UPDATE sprints SET lifecycle='armed',armed_at=datetime('now'),"
+                "conformance_reviewer_shell_id=2,"
+                "conformance_owner_generation=1 "
+                "WHERE sprint_id=?",
+                (sprint_id,),
+            )
+            con.execute(
+                "UPDATE sprints SET lifecycle='paused',paused_at=datetime('now') "
+                "WHERE sprint_id=?",
+                (sprint_id,),
+            )
+            con.execute(
+                "UPDATE documents SET body=? WHERE document_id=?",
+                (replacement, document_id),
+            )
+            con.commit()
+        finally:
+            con.close()
+
+        argv = (
+            "rebind-spec",
+            "--sprint",
+            str(sprint_id),
+            "--document",
+            str(document_id),
+            "--expected-revision",
+            old_revision,
+            "--reason",
+            "Reviewer decision message 77",
+        )
+        receipt = self.run_cli(TOKENS["planner"], *argv)
+        self.assertEqual(old_revision, receipt["old_revision_sha256"])
+        self.assertEqual(new_revision, receipt["new_revision_sha256"])
+        self.assertTrue(receipt["changed"])
+        retry = self.run_cli(TOKENS["planner"], *argv)
+        self.assertFalse(retry["changed"])
+        self.assertEqual(receipt["revision_id"], retry["revision_id"])
+
+        con = sqlite3.connect(self.db)
+        try:
+            self.assertEqual(
+                (new_revision, replacement, None),
+                con.execute(
+                    "SELECT bound_revision_sha256,bound_revision_body,approval_id "
+                    "FROM sprint_specs WHERE sprint_id=? AND document_id=?",
+                    (sprint_id, document_id),
+                ).fetchone(),
+            )
+            self.assertEqual(
+                [(1, old_revision), (2, new_revision)],
+                con.execute(
+                    "SELECT generation,bound_revision_sha256 "
+                    "FROM sprint_spec_revision_history WHERE sprint_id=? "
+                    "ORDER BY generation",
+                    (sprint_id,),
+                ).fetchall(),
+            )
+            self.assertEqual(
+                1,
+                con.execute(
+                    "SELECT COUNT(*) FROM sprint_events "
+                    "WHERE sprint_id=? AND event_type='spec.rebound'",
+                    (sprint_id,),
+                ).fetchone()[0],
+            )
         finally:
             con.close()
 
@@ -862,6 +1340,239 @@ class SprintCliApiTest(unittest.TestCase):
                 con.execute(
                     "SELECT document_id,bound_revision_sha256,approval_id "
                     "FROM sprint_specs WHERE sprint_id=?",
+                    (sprint_id,),
+                ).fetchone(),
+            )
+        finally:
+            con.close()
+
+    def test_planner_repeats_recalls_reassigns_and_reroutes_live_work(self):
+        self.use_isolated_db()
+        feature_id, approval_id, task_id = self.seed_declaration("live-replan")
+        participants = self.write(
+            json.dumps(
+                [
+                    {"shell_id": 3, "role": "planner", "harness": "codex"},
+                    {"shell_id": 1, "role": "developer", "harness": "codex"},
+                    {
+                        "shell_id": 4,
+                        "role": "developer",
+                        "harness": "codex",
+                        "model": "old-model",
+                    },
+                    {"shell_id": 2, "role": "reviewer", "harness": "kimi"},
+                ]
+            )
+        )
+        sprint_id = self.run_cli(
+            TOKENS["planner"],
+            "declare",
+            "--feature",
+            str(feature_id),
+            "--spec-approval",
+            str(approval_id),
+            "--participants-file",
+            participants,
+            "--merge-grant",
+        )["sprint_id"]
+        first_unit = self.run_cli(
+            TOKENS["planner"],
+            "plan-unit",
+            "--sprint",
+            str(sprint_id),
+            "--developer-shell",
+            "1",
+            "--reviewer-shell",
+            "2",
+            "--title",
+            "Original lane",
+            "--expected-output-file",
+            self.write("Original output"),
+            "--task",
+            str(task_id),
+        )["work_unit_id"]
+        repeated_unit = self.run_cli(
+            TOKENS["planner"],
+            "plan-unit",
+            "--sprint",
+            str(sprint_id),
+            "--developer-shell",
+            "1",
+            "--reviewer-shell",
+            "2",
+            "--title",
+            "Repeat governing task",
+            "--expected-output-file",
+            self.write("Conformance rerun"),
+            "--task",
+            str(task_id),
+            "--depends-on",
+            str(first_unit),
+            "--output-kind",
+            "report-only",
+        )["work_unit_id"]
+        self.assertNotEqual(first_unit, repeated_unit)
+
+        armed = self.run_cli(
+            TOKENS["planner"],
+            "arm",
+            "--sprint",
+            str(sprint_id),
+            "--conformance-reviewer-shell",
+            "2",
+        )
+        self.assertEqual(4, len(armed["participant_bindings"]))
+        self.assertEqual(
+            {1},
+            {binding["route_revision"] for binding in armed["participant_bindings"]},
+        )
+        con = sqlite3.connect(self.db)
+        try:
+            first_assignment_message = int(
+                con.execute(
+                    "SELECT message_id FROM wake_message WHERE sprint_id=? "
+                    "AND work_unit_id=? AND message_kind='work_assignment'",
+                    (sprint_id, first_unit),
+                ).fetchone()[0]
+            )
+        finally:
+            con.close()
+        self.deliver_message(first_assignment_message)
+        assignment = self.run_cli(
+            TOKENS["developer"], "inbox", "--sprint", str(sprint_id)
+        )["messages"][0]
+        self.run_cli(
+            TOKENS["developer"],
+            "accept",
+            "--sprint",
+            str(sprint_id),
+            "--message",
+            str(assignment["message_id"]),
+        )
+        self.run_cli(
+            TOKENS["planner"],
+            "pause",
+            "--sprint",
+            str(sprint_id),
+            "--reason",
+            "Planner is restructuring the live plan",
+        )
+        with self.assertRaisesRegex(SystemExit, "HTTP 403.*change the Sprint plan"):
+            self.run_cli(
+                TOKENS["developer"],
+                "recall-unit",
+                "--sprint",
+                str(sprint_id),
+                "--work-unit",
+                str(first_unit),
+                "--reason",
+                "unauthorized",
+            )
+        recalled = self.run_cli(
+            TOKENS["planner"],
+            "recall-unit",
+            "--sprint",
+            str(sprint_id),
+            "--work-unit",
+            str(first_unit),
+            "--reason",
+            "move work to replacement capacity",
+        )
+        self.assertTrue(recalled["changed"])
+        replanned = self.run_cli(
+            TOKENS["planner"],
+            "replan-unit",
+            "--sprint",
+            str(sprint_id),
+            "--work-unit",
+            str(first_unit),
+            "--developer-shell",
+            "4",
+            "--title",
+            "Replacement lane",
+            "--expected-output-file",
+            self.write("Replacement output"),
+            "--task",
+            str(task_id),
+            "--wave",
+            "3",
+        )
+        self.assertTrue(replanned["changed"])
+        rerouted = self.run_cli(
+            TOKENS["planner"],
+            "reroute-participant",
+            "--sprint",
+            str(sprint_id),
+            "--participant-shell",
+            "4",
+            "--harness",
+            "codex",
+            "--model",
+            "replacement-model",
+            "--effort",
+            "medium",
+            "--route",
+            "codex/replacement-model",
+        )
+        self.assertEqual(
+            (True, "bound", "controlled", 2, 64),
+            (
+                rerouted["changed"],
+                rerouted["binding_status"],
+                rerouted["control_state"],
+                rerouted["route_revision"],
+                len(rerouted["binding_digest"]),
+            ),
+        )
+        resumed = self.run_cli(
+            TOKENS["planner"],
+            "resume",
+            "--sprint",
+            str(sprint_id),
+            "--reason",
+            "replacement plan validated",
+        )
+        self.assertTrue(resumed["changed"])
+        con = sqlite3.connect(self.db)
+        try:
+            replacement_message = int(
+                con.execute(
+                    "SELECT message_id FROM wake_message WHERE sprint_id=? "
+                    "AND work_unit_id=? AND message_kind='work_assignment' "
+                    "ORDER BY message_id DESC LIMIT 1",
+                    (sprint_id, first_unit),
+                ).fetchone()[0]
+            )
+        finally:
+            con.close()
+        self.deliver_message(replacement_message)
+        replacement_inbox = self.run_cli(
+            "dev2-token", "inbox", "--sprint", str(sprint_id)
+        )
+        self.assertEqual(first_unit, replacement_inbox["messages"][0]["work_unit_id"])
+
+        con = sqlite3.connect(self.db)
+        try:
+            self.assertEqual(
+                2,
+                con.execute(
+                    "SELECT COUNT(*) FROM sprint_work_unit_tasks WHERE task_id=?",
+                    (task_id,),
+                ).fetchone()[0],
+            )
+            self.assertEqual(
+                (4, "Replacement lane", 3),
+                con.execute(
+                    "SELECT assigned_shell_id,title,planned_wave "
+                    "FROM sprint_work_units WHERE work_unit_id=?",
+                    (first_unit,),
+                ).fetchone(),
+            )
+            self.assertEqual(
+                ("replacement-model", "medium", "codex/replacement-model"),
+                con.execute(
+                    "SELECT model,effort,route FROM sprint_participants "
+                    "WHERE sprint_id=? AND shell_id=4",
                     (sprint_id,),
                 ).fetchone(),
             )
@@ -994,6 +1705,8 @@ class SprintCliApiTest(unittest.TestCase):
                     "arm",
                     "--sprint",
                     str(declaration["sprint_id"]),
+                    "--conformance-reviewer-shell",
+                    str(reviewer_shell_id),
                 )
 
                 self.assertEqual(2, len(armed["wake_ids"]))
@@ -1131,9 +1844,10 @@ class SprintCliApiTest(unittest.TestCase):
             ),
         )
         for selectors, error in cases:
-            with self.subTest(selectors=selectors):
-                with self.assertRaisesRegex(SystemExit, error):
-                    self.run_cli(TOKENS["planner"], *base, *selectors)
+            with self.subTest(selectors=selectors), self.assertRaisesRegex(
+                SystemExit, error
+            ):
+                self.run_cli(TOKENS["planner"], *base, *selectors)
         con = sqlite3.connect(self.db)
         try:
             self.assertEqual(0, con.execute("SELECT COUNT(*) FROM sprints").fetchone()[0])
@@ -1172,12 +1886,24 @@ class SprintCliApiTest(unittest.TestCase):
         with contextlib.closing(sqlite3.connect(self.db)) as con:
             message = con.execute(
                 "SELECT from_participant_id,to_participant_id,"
-                "message_kind,body,actionable,work_unit_id,disposition "
+                "message_kind,body,actionable,work_unit_id,disposition,"
+                "intent,requires_reply,reply_to_message_id "
                 "FROM wake_message WHERE message_id=?",
                 (response["message_id"],),
             ).fetchone()
             self.assertEqual(
-                (2, 1, "notification", "Please confirm the downstream handoff.", 0, None, None),
+                (
+                    2,
+                    1,
+                    "notification",
+                    "Please confirm the downstream handoff.",
+                    0,
+                    None,
+                    None,
+                    "information",
+                    0,
+                    None,
+                ),
                 message,
             )
             wake = con.execute(
@@ -1213,6 +1939,93 @@ class SprintCliApiTest(unittest.TestCase):
         self.assertEqual(response["message_id"], replay["message_id"])
         self.assertEqual(response["wake_id"], replay["wake_id"])
         self.assertFalse(replay["message_created"])
+
+    def test_participant_send_persists_scope_and_reply_linkage(self):
+        question = self.run_cli(
+            TOKENS["developer"],
+            "send",
+            "--sprint",
+            str(self.sprint_id),
+            "--to",
+            "PLN1",
+            "--body-file",
+            self.write("Which unit contract applies?"),
+            "--key",
+            "cli-participant-unit-question",
+            "--intent",
+            "question",
+            "--requires-reply",
+            "--work-unit",
+            str(self.unit_id),
+        )
+        answer = self.run_cli(
+            TOKENS["planner"],
+            "send",
+            "--sprint",
+            str(self.sprint_id),
+            "--to",
+            "DEV1",
+            "--body-file",
+            self.write("Use the unit-bound contract."),
+            "--key",
+            "cli-participant-unit-answer",
+            "--reply-to",
+            str(question["message_id"]),
+        )
+
+        with contextlib.closing(sqlite3.connect(self.db)) as con:
+            rows = con.execute(
+                "SELECT message_id,intent,requires_reply,work_unit_id,"
+                "reply_to_message_id FROM wake_message "
+                "WHERE message_id IN (?,?) ORDER BY message_id",
+                (question["message_id"], answer["message_id"]),
+            ).fetchall()
+            self.assertEqual(
+                [
+                    (
+                        question["message_id"],
+                        "question",
+                        1,
+                        self.unit_id,
+                        None,
+                    ),
+                    (
+                        answer["message_id"],
+                        "information",
+                        0,
+                        self.unit_id,
+                        question["message_id"],
+                    ),
+                ],
+                rows,
+            )
+
+    def test_participant_send_rejects_unscoped_reply_wait_without_a_write(self):
+        with contextlib.closing(sqlite3.connect(self.db)) as con:
+            before = con.execute("SELECT COUNT(*) FROM wake_message").fetchone()[0]
+        with self.assertRaisesRegex(
+            SystemExit, "HTTP 409.*exactly one work-unit or Sprint-level scope"
+        ):
+            self.run_cli(
+                TOKENS["developer"],
+                "send",
+                "--sprint",
+                str(self.sprint_id),
+                "--to",
+                "PLN1",
+                "--body-file",
+                self.write("Unscoped question."),
+                "--key",
+                "cli-participant-unscoped-question",
+                "--intent",
+                "question",
+                "--requires-reply",
+            )
+        with contextlib.closing(sqlite3.connect(self.db)) as con:
+            self.assertEqual(
+                before,
+                con.execute("SELECT COUNT(*) FROM wake_message").fetchone()[0],
+            )
 
     def test_participant_send_rejects_non_string_body_and_key_as_bad_requests(self):
         mem.SC_API_TOKEN = TOKENS["developer"]
@@ -1388,7 +2201,14 @@ class SprintCliApiTest(unittest.TestCase):
             "no-code",
         )
         self.assertTrue(replanned["changed"])
-        self.run_cli(TOKENS["planner"], "arm", "--sprint", str(sprint_id))
+        self.run_cli(
+            TOKENS["planner"],
+            "arm",
+            "--sprint",
+            str(sprint_id),
+            "--conformance-reviewer-shell",
+            "2",
+        )
         self.deliver_sprint_messages(sprint_id)
 
         inbox = self.run_cli(
@@ -1404,6 +2224,8 @@ class SprintCliApiTest(unittest.TestCase):
             "--message",
             str(report_message),
         )
+        self.assertEqual(report_message, accepted["message_id"])
+        self.assertTrue(accepted["read"])
         self.assertEqual("accepted", accepted["disposition"])
         declined_inbox = self.run_cli(
             "dev2-token", "inbox", "--sprint", str(sprint_id)
@@ -1441,7 +2263,73 @@ class SprintCliApiTest(unittest.TestCase):
             "--result-file",
             self.write("Report document #77"),
         )
-        self.assertEqual([], completed_unit["wake_ids"])
+        self.assertEqual(sprint_id, completed_unit["sprint_id"])
+        self.assertEqual(report_unit, completed_unit["work_unit_id"])
+        self.assertEqual("completed", completed_unit["disposition"])
+        self.assertEqual("report_only", completed_unit["output_kind"])
+        self.assertEqual(19, completed_unit["stored_result_length"])
+        self.assertEqual(
+            hashlib.sha256(b"Report document #77").hexdigest(),
+            completed_unit["stored_result_sha256"],
+        )
+        self.assertIsInstance(completed_unit["completed_at"], str)
+        self.assertTrue(completed_unit["changed"])
+        self.assertFalse(completed_unit["idempotent"])
+        self.assertEqual(1, len(completed_unit["wake_ids"]))
+        self.assertEqual(
+            completed_unit["wake_ids"], completed_unit["created_wake_ids"]
+        )
+        self.assertEqual([], completed_unit["reused_wake_ids"])
+        self.assertNotIn("Report document #77", json.dumps(completed_unit))
+        with contextlib.closing(sqlite3.connect(self.db)) as con:
+            counts_before_retry = tuple(
+                con.execute(
+                    "SELECT "
+                    "(SELECT COUNT(*) FROM sprint_events),"
+                    "(SELECT COUNT(*) FROM wake_message),"
+                    "(SELECT COUNT(*) FROM sprint_wake_outbox)"
+                ).fetchone()
+            )
+        completed_retry = self.run_cli(
+            TOKENS["developer"],
+            "complete-unit",
+            "--sprint",
+            str(sprint_id),
+            "--work-unit",
+            str(report_unit),
+            "--result-file",
+            self.write("Report document #77"),
+        )
+        for field in (
+            "sprint_id",
+            "work_unit_id",
+            "disposition",
+            "completed_at",
+            "output_kind",
+            "stored_result_length",
+            "stored_result_sha256",
+            "wake_ids",
+        ):
+            self.assertEqual(completed_unit[field], completed_retry[field])
+        self.assertFalse(completed_retry["changed"])
+        self.assertTrue(completed_retry["idempotent"])
+        self.assertEqual([], completed_retry["created_wake_ids"])
+        self.assertEqual(
+            completed_unit["wake_ids"], completed_retry["reused_wake_ids"]
+        )
+        self.assertNotIn("Report document #77", json.dumps(completed_retry))
+        with contextlib.closing(sqlite3.connect(self.db)) as con:
+            self.assertEqual(
+                counts_before_retry,
+                tuple(
+                    con.execute(
+                        "SELECT "
+                        "(SELECT COUNT(*) FROM sprint_events),"
+                        "(SELECT COUNT(*) FROM wake_message),"
+                        "(SELECT COUNT(*) FROM sprint_wake_outbox)"
+                    ).fetchone()
+                ),
+            )
 
         conformance = self.run_cli(
             TOKENS["reviewer"],
@@ -1560,7 +2448,14 @@ class SprintCliApiTest(unittest.TestCase):
             "--task",
             str(task_id),
         )["work_unit_id"]
-        armed = self.run_cli(TOKENS["admin"], "arm", "--sprint", str(sprint_id))
+        armed = self.run_cli(
+            TOKENS["admin"],
+            "arm",
+            "--sprint",
+            str(sprint_id),
+            "--conformance-reviewer-shell",
+            "2",
+        )
         self.assertEqual(2, len(armed["wake_ids"]))
         aborted = self.run_cli(
             TOKENS["admin"],
@@ -1623,7 +2518,14 @@ class SprintCliApiTest(unittest.TestCase):
             str(task_id),
         )["work_unit_id"]
         with self.assertRaisesRegex(SystemExit, "HTTP 409.*already armed"):
-            self.run_cli(TOKENS["planner"], "arm", "--sprint", str(sprint_id))
+            self.run_cli(
+                TOKENS["planner"],
+                "arm",
+                "--sprint",
+                str(sprint_id),
+                "--conformance-reviewer-shell",
+                "2",
+            )
 
         con = sqlite3.connect(self.db)
         try:
@@ -1695,8 +2597,22 @@ class SprintCliApiTest(unittest.TestCase):
 
         unit_id = self.run_cli(TOKENS["planner"], *plan_argv)["work_unit_id"]
         with self.assertRaisesRegex(SystemExit, "HTTP 403.*owning Planner"):
-            self.run_cli(TOKENS["reviewer"], "arm", "--sprint", str(sprint_id))
-        self.run_cli(TOKENS["planner"], "arm", "--sprint", str(sprint_id))
+            self.run_cli(
+                TOKENS["reviewer"],
+                "arm",
+                "--sprint",
+                str(sprint_id),
+                "--conformance-reviewer-shell",
+                "2",
+            )
+        self.run_cli(
+            TOKENS["planner"],
+            "arm",
+            "--sprint",
+            str(sprint_id),
+            "--conformance-reviewer-shell",
+            "2",
+        )
         with self.assertRaisesRegex(SystemExit, "HTTP 409.*Developer participant"):
             self.run_cli(
                 TOKENS["reviewer"],
@@ -1710,7 +2626,7 @@ class SprintCliApiTest(unittest.TestCase):
                 "--work-unit",
                 str(unit_id),
             )
-        with self.assertRaisesRegex(SystemExit, "HTTP 403.*cannot transition"):
+        with self.assertRaisesRegex(SystemExit, "HTTP 403.*owning Planner or FnB"):
             self.run_cli(
                 TOKENS["reviewer"],
                 "complete",
@@ -1734,6 +2650,85 @@ class SprintCliApiTest(unittest.TestCase):
         finally:
             con.close()
 
+    def test_compile_report_allows_non_owner_reviewer_participant(self):
+        self.use_isolated_db()
+        feature_id, approval_id, task_id = self.seed_declaration("report-reader")
+        participants = self.write(
+            json.dumps(
+                [
+                    {"shell_id": 3, "role": "planner", "harness": "codex"},
+                    {"shell_id": 1, "role": "developer", "harness": "codex"},
+                    {"shell_id": 2, "role": "reviewer", "harness": "kimi"},
+                    {"shell_id": 7, "role": "reviewer", "harness": "codex"},
+                ]
+            )
+        )
+        sprint_id = self.run_cli(
+            TOKENS["planner"],
+            "declare",
+            "--feature",
+            str(feature_id),
+            "--spec-approval",
+            str(approval_id),
+            "--participants-file",
+            participants,
+            "--merge-grant",
+        )["sprint_id"]
+        self.run_cli(
+            TOKENS["planner"],
+            "plan-unit",
+            "--sprint",
+            str(sprint_id),
+            "--developer-shell",
+            "1",
+            "--reviewer-shell",
+            "2",
+            "--title",
+            "Report authority",
+            "--expected-output-file",
+            self.write("Keep Reviewer evidence readable."),
+            "--task",
+            str(task_id),
+        )
+        self.run_cli(
+            TOKENS["planner"],
+            "arm",
+            "--sprint",
+            str(sprint_id),
+            "--conformance-reviewer-shell",
+            "2",
+        )
+
+        report = self.run_cli(
+            TOKENS["reviewer3"],
+            "compile-report",
+            "--sprint",
+            str(sprint_id),
+            "--limit",
+            "50",
+        )
+
+        self.assertEqual(sprint_id, report["scope"]["sprint_id"])
+        self.assertEqual(1, report["planned_vs_actual"]["total"])
+        self.assertEqual(
+            "Report authority",
+            report["planned_vs_actual"]["items"][0]["title"],
+        )
+        con = sqlite3.connect(self.db)
+        try:
+            self.assertEqual(
+                ("armed", 0),
+                con.execute(
+                    "SELECT sprint.lifecycle,"
+                    "(SELECT COUNT(*) FROM sprint_reports report "
+                    " WHERE report.sprint_id=sprint.sprint_id) "
+                    "FROM sprints sprint WHERE sprint.sprint_id=?",
+                    (sprint_id,),
+                ).fetchone(),
+            )
+        finally:
+            con.close()
+
     def test_real_review_merge_dispatch_monitor_and_close_surfaces(self):
         request = self.run_cli(
             TOKENS["developer"],
@@ -1742,12 +2737,26 @@ class SprintCliApiTest(unittest.TestCase):
             str(self.sprint_id),
             "--registered-pr",
             str(self.registered_pr_id),
-            "--readiness-file",
-            self.write("All gates green."),
+            "--intent",
+            "submit",
             "--key",
             "cli-review-request",
         )
         self.assertTrue(request["created"])
+        con = sqlite3.connect(self.db)
+        try:
+            self.assertEqual(
+                "Submitting PR for review: "
+                "https://github.com/acme/repo/pull/42; registered Sprint PR "
+                f"{self.registered_pr_id}; exact head {'a' * 40}; work unit "
+                f"{self.unit_id}.",
+                con.execute(
+                    "SELECT body FROM wake_message WHERE message_id=?",
+                    (request["message_id"],),
+                ).fetchone()[0],
+            )
+        finally:
+            con.close()
         self.deliver_message(request["message_id"])
 
         con = sqlite3.connect(self.db)
@@ -1833,6 +2842,17 @@ class SprintCliApiTest(unittest.TestCase):
             {"state": "missing", "beat_at": None, "interval_seconds": 5},
             monitor["runtime"],
         )
+
+        con = sqlite3.connect(self.db)
+        try:
+            con.execute(
+                "UPDATE sprint_work_units SET disposition='completed',"
+                "completed_at=datetime('now') WHERE sprint_id=?",
+                (self.sprint_id,),
+            )
+            con.commit()
+        finally:
+            con.close()
 
         findings = self.write(
             json.dumps(

@@ -33,7 +33,7 @@ import sys
 import tempfile
 import threading
 import unittest
-from contextlib import ExitStack, redirect_stderr, redirect_stdout
+from contextlib import ExitStack, closing, redirect_stderr, redirect_stdout
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from unittest import mock
@@ -42,7 +42,9 @@ from urllib.parse import urlparse
 REPO = Path(__file__).resolve().parents[1]
 ENGINE = REPO / ".super-coder"
 sys.path.insert(0, str(ENGINE / "scripts"))
+sys.path.insert(0, str(ENGINE / "api"))
 import migrate as migrate_mod  # noqa: E402
+import model_catalog  # noqa: E402
 
 # Copied engine minus caches and anything instance-owned: the fixture's live
 # state is the sentinel this module writes, never a real fork's.
@@ -84,8 +86,23 @@ class _CatalogApiHandler(BaseHTTPRequestHandler):
     route = {
         "harness": "codex", "selector": "wt-live-model", "source": "live-api",
         "availability": "available", "stale": 0, "headless_supported": 1,
-        "high_effort_supported": 1, "cli_version": "test",
+        "high_effort_supported": 1, "cli_version": "codex-cli 0.145.0",
+        "harness_version": "codex-cli 0.145.0",
+        "harness_compatibility": "supported",
+        "harness_support_state": "best-effort",
         "supported_efforts": '["high"]',
+        "last_seen_at": "2099-01-01T00:00:00+00:00",
+        "generation_id": "1" * 32,
+        "evidence_kind": "codex-model-cache",
+        "source_fingerprint": "3" * 64,
+        "effort_metadata": json.dumps({
+            "supported": ["high"], "default": "high",
+            "digests": {"high": "2" * 64}, "native_variant_ids": {},
+        }),
+        "selector_binding": json.dumps({
+            "kind": "exact-model", "selector": "wt-live-model",
+        }),
+        "adapter_metadata": "{}",
     }
     skill = {
         "skill_id": 999, "name": "wt-live-skill", "common": 0,
@@ -383,12 +400,19 @@ class RootCheckoutUnchangedTest(WorktreeFixture):
             hashlib.sha256((self.pristine / "shell_db.db").read_bytes()).hexdigest(),
             "root migrate must still really migrate")
 
-    def test_root_migrate_names_its_targets_on_the_nothing_pending_outcome(self):
+    def test_root_migrate_names_targets_when_current(self):
         run_sc(self.main, "migrate")
         done = run_sc(self.main, "migrate")
         self.assertEqual(done.returncode, 0, done.stderr)
         self.assertIn(f"migrate: db         {self.live_db}", done.stdout)
-        self.assertIn(f"nothing pending — {self.live_db} is current", done.stdout)
+        self.assertIn(
+            f"migrate: migrations {self.main / '.super-coder' / 'migrations'}",
+            done.stdout,
+        )
+        self.assertIn(
+            f"migrate: nothing pending — {self.live_db} is current.",
+            done.stdout,
+        )
 
     def test_root_verify_discloses_its_target_before_the_rebuild_runs(self):
         """The ordering IS the requirement, so both events are captured in ONE
@@ -581,13 +605,15 @@ class SeedSkillsRunsCallerSourceTest(WorktreeFixture):
 
 class LiveSurfacesStillResolveTest(WorktreeFixture):
     """Requirement 4: the shared-runtime surfaces keep reaching the shared
-    runtime. The refusal is for commands that MUTATE live state, and a guard
-    that swallowed `mem`/`sql`/`map-sql` would strand every shell."""
+    runtime. Memory stays API-backed, general engine SQL is Admin-only, and
+    repository-map SQL remains a separate catalogue authority."""
 
-    def test_sql_from_the_worktree_reads_the_live_instance_database(self):
+    def test_unidentified_sql_from_the_worktree_refuses_without_a_result(self):
         done = run_sc(self.wt, "sql", "SELECT who FROM live_marker;")
-        self.assertEqual(done.returncode, 0, done.stderr)
-        self.assertIn("LIVE-INSTANCE-DB", done.stdout)
+        self.assertEqual(done.returncode, 1)
+        self.assertEqual(done.stdout, "")
+        self.assertIn("admin_only_engine_state", done.stderr)
+        self.assertNotIn("LIVE-INSTANCE-DB", done.stderr)
 
     def test_map_sql_from_the_worktree_reads_the_live_catalogue(self):
         mapdb = subprocess.run(
@@ -634,8 +660,49 @@ class LiveSurfacesStillResolveTest(WorktreeFixture):
 
         before = state_digest(self.main)
         self._make_live_engine_read_only()
+        runtime = Path(self._tmp) / "controlled-runtime"
+        runtime.mkdir(exist_ok=True)
+        binary = runtime / "codex"
+        binary.write_text("#!/bin/sh\nprintf 'codex-cli 0.145.0\\n'\n")
+        binary.chmod(0o755)
+        codex_home = runtime / "codex-home"
+        codex_home.mkdir(exist_ok=True)
+        codex_home.joinpath("models_cache.json").write_text(json.dumps({
+            "models": [{
+                "slug": "wt-live-model", "display_name": "Worktree Live",
+                "visibility": "list", "default_reasoning_level": "high",
+                "supported_reasoning_levels": [{"effort": "high"}],
+            }],
+        }))
+        status = {
+            "version": "0.145.0", "observed_version": "codex-cli 0.145.0",
+            "compatibility": "supported",
+            "minimum_version": "0.145.0",
+            "maximum_version_exclusive": "0.148.0",
+            "verified_version": "0.147.0", "error": None,
+        }
+        entry = model_catalog._entry(
+            "wt-live-model", name="Worktree Live", source="codex-cache",
+            availability="available", provider="openai",
+            supported_efforts=["high"], default_effort="high",
+            cli_version="codex-cli 0.145.0",
+        )
+        original_fingerprint = _CatalogApiHandler.route["source_fingerprint"]
+        _CatalogApiHandler.route["source_fingerprint"] = (
+            model_catalog._entry_evidence("codex", entry, status)[
+                "source_fingerprint"
+            ]
+        )
+        self.addCleanup(
+            _CatalogApiHandler.route.__setitem__,
+            "source_fingerprint", original_fingerprint,
+        )
         api, thread, base = start_catalog_api()
-        env = {"SC_API_TOKEN": "shell-token", "SC_API_BASE": base}
+        env = {
+            "SC_API_TOKEN": "shell-token", "SC_API_BASE": base,
+            "CODEX_HOME": str(codex_home),
+            "PATH": f"{runtime}:{os.environ.get('PATH', '')}",
+        }
         try:
             listed = run_sc(
                 self.wt, "models", "list", "codex", env_overrides=env

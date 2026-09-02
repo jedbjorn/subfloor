@@ -59,9 +59,17 @@ Five steps, from an existing git repo to a booted shell:
    [*Install*](README.md#install).
 2. **Bootstrap the fork.** `./sc install` checks requirements, installs the
    harness CLIs, wires your `.gitignore`, builds the DB, and seeds your
-   starting team. What it does under the hood, and the flags to script it:
+   starting team. Commit the bootstrap:
+
+   ```bash
+   git add -A && git commit --no-verify -m "chore: install subfloor"
+   ```
+
+   What it does under the hood, and the flags to script it:
    [*Install → Installer internals*](README.md#install).
-3. **Sign in once, on the host.** Each harness authenticates with your own
+3. **Launch.** `make dos-l` builds and starts the sandbox container and Review
+   GUI, published to `127.0.0.1` only.
+4. **Sign in and enter.** Each harness authenticates with your own
    account — `claude`, `opencode auth login`, `codex login`, `vibe --setup`,
    or `kimi login`. [*Install → Harness sign-in*](README.md#install).
 4. **Launch.** `./sc launch` starts the host-native engine server plus the
@@ -121,7 +129,16 @@ The step-by-step version, with each flavor's skills and GUI tab:
   session: [*Messages, jobs & headless launch*](README.md#messages-jobs--headless-launch).
 - **The command surface.** Every `./sc` command and the `make dos-` aliases:
   [*CLI & dev kit*](README.md#cli--dev-kit).
-- **Opt-in extras.** A Postgres sidecar, a Windows test VM, tailnet / pm2 /
-  db brokers: [*Opt-in features*](README.md#opt-in-features).
+- **Opt-in extras.** Optional Postgres, Windows VM, tailnet, PM2, and database
+  broker infrastructure; Planner captures fork procedure as a local skill:
+  [*Opt-in features*](README.md#opt-in-features).
 - **Staying current.** `./sc update` pulls the new engine and migrates the DB
-  in place, memory intact: [*Update a fork*](README.md#update-a-fork).
+  in place, memory intact. Commit that protected-default-branch update with the
+  exact operator command:
+
+  ```bash
+  ./sc update
+  git add .sc-state/engine.ref sc && git commit --no-verify -m "chore: update subfloor"
+  ```
+
+  Full details: [*Update a fork*](README.md#update-a-fork).

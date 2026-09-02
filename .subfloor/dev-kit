@@ -1,0 +1,135 @@
+#!/bin/sh
+# super-coder's fork-owned project policy.  The engine only validates and runs
+# this argv; dependency and quality-gate choices belong to this source repo.
+set -eu
+
+root="${SC_DEVKIT_ROOT:-}"
+if [ -z "$root" ]; then
+  root="$(git rev-parse --show-toplevel 2>/dev/null)" || {
+    echo "dev-kit: not inside the super-coder source checkout" >&2
+    exit 64
+  }
+fi
+cd "$root"
+
+python="${SC_PYTHON:-python3}"
+venv="$root/.venv"
+hostmanaged=""
+if [ "${SC_DEVKIT_SEAT:-host}" = docker ] && [ -e "$venv/bin/python" ]; then
+  case "$(readlink -f "$venv/bin/python" 2>/dev/null || true)" in
+    "$root"/*) : ;;
+    *) hostmanaged=1 ;;
+  esac
+fi
+
+hostmanaged_tool_error() {
+  echo "dev-kit $1: unavailable in the host-managed venv; install it into the pinned venv on the host (./sc deps only verifies this shared tree in Docker)" >&2
+  exit 126
+}
+
+case "${1:-}" in
+  deps)
+    shift
+    [ "$#" -eq 0 ] || {
+      echo "dev-kit deps: unexpected arguments: $*" >&2
+      exit 64
+    }
+    if [ -n "$hostmanaged" ]; then
+      echo "→ deps: host-managed venv detected in Docker; verifying without pip"
+      missing="$("$venv/bin/python" - requirements.txt pytest httpx coverage ruff mypy datasette <<'PY'
+import importlib.metadata as metadata
+import re
+import sys
+
+requirements = []
+for path in sys.argv[1:2]:
+    try:
+        lines = open(path, encoding="utf-8").read().splitlines()
+    except OSError:
+        continue
+    for raw in lines:
+        line = raw.split("#", 1)[0].strip()
+        if not line or line.startswith("-") or "://" in line or line.startswith((".", "/")):
+            continue
+        name = re.split(r"[<>=!~\[; ]", line, maxsplit=1)[0].strip()
+        if name:
+            requirements.append((name, line))
+requirements.extend((name, name) for name in sys.argv[2:])
+
+missing = []
+seen = set()
+for name, declared in requirements:
+    normalized = re.sub(r"[-_.]+", "-", name).lower()
+    if normalized in seen:
+        continue
+    seen.add(normalized)
+    try:
+        metadata.version(name)
+    except metadata.PackageNotFoundError:
+        missing.append(declared)
+print("\n".join(missing))
+PY
+)"
+      if [ -n "$missing" ]; then
+        echo "✗ deps: host-managed venv is missing required packages:" >&2
+        printf '%s\n' "$missing" | sed 's/^/    /' >&2
+        echo "  Fix: install them into the pinned venv on the host; Docker will not mutate the shared tree." >&2
+        exit 1
+      fi
+      echo "✓ deps: host-managed tree verified; no pip mutation"
+      exit 0
+    fi
+    if [ ! -x "$venv/bin/python" ]; then
+      echo "→ deps: creating $venv"
+      "$python" -m venv "$venv"
+    fi
+    echo "→ deps: install super-coder runtime and test requirements"
+    "$venv/bin/python" -m pip install -q -r requirements.txt
+    "$venv/bin/python" -m pip install -q --upgrade-strategy only-if-needed \
+      pytest httpx coverage ruff mypy datasette
+    echo "✓ deps: done"
+    ;;
+  test)
+    shift
+    if [ "$#" -eq 0 ]; then set -- tests/; fi
+    if [ -x "$venv/bin/python" ] && "$venv/bin/python" -c 'import pytest' 2>/dev/null; then
+      python="$venv/bin/python"
+    elif [ -n "$hostmanaged" ]; then
+      hostmanaged_tool_error pytest
+    fi
+    exec "$python" -m pytest "$@"
+    ;;
+  lint)
+    shift
+    if [ -x "$venv/bin/ruff" ]; then
+      tool="$venv/bin/ruff"
+    else
+      tool="$(command -v ruff 2>/dev/null || true)"
+    fi
+    [ -n "$tool" ] || {
+      [ -z "$hostmanaged" ] || hostmanaged_tool_error ruff
+      echo "dev-kit lint: ruff unavailable; run the declared ./sc deps hook" >&2
+      exit 126
+    }
+    exec "$tool" check "$@"
+    ;;
+  typecheck)
+    shift
+    if [ -x "$venv/bin/mypy" ]; then
+      tool="$venv/bin/mypy"
+    else
+      tool="$(command -v mypy 2>/dev/null || true)"
+    fi
+    [ -n "$tool" ] || {
+      [ -z "$hostmanaged" ] || hostmanaged_tool_error mypy
+      echo "dev-kit typecheck: mypy unavailable; run the declared ./sc deps hook" >&2
+      exit 126
+    }
+    if [ "$#" -eq 0 ]; then set -- .; fi
+    exec "$tool" "$@"
+    ;;
+  *)
+    echo "usage: .subfloor/dev-kit <deps|test|lint|typecheck> [args...]" >&2
+    exit 64
+    ;;
+esac

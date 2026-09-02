@@ -22,7 +22,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tests"))
 pytest.importorskip("playwright.sync_api")
 from playwright.sync_api import sync_playwright
-from segmented_response_traces import LIVE_SEGMENT_EVENTS, version_two_snapshot
+from segmented_response_traces import LIVE_SEGMENT_EVENTS, version_three_snapshot
 
 UI = ROOT / ".super-coder" / "ui"
 CONVERSATION_ID = "cv_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
@@ -286,6 +286,180 @@ def observation_page(*, fresh: bool = True, fingerprint: str = "a" * 64) -> dict
     }
 
 
+def test_retained_harness_unavailability_disables_only_composer(
+    static_ui,
+    case,
+):
+    requests: list[tuple[str, str]] = []
+    browser_errors: list[str] = []
+    current = {
+        **conversation(),
+        "title": "Retained harness proof",
+        "starred": False,
+        "scope": "interactive",
+        "sprint_managed": False,
+        "route": {
+            "harness": "codex",
+            "model": "gpt-test",
+            "control_state": "controlled",
+        },
+    }
+    snapshot = version_three_snapshot()
+    healthy_status = {
+        "installed": True,
+        "enabled": True,
+        "healthy": True,
+        "surfaces": {"browser": True},
+        "unavailable_reason": None,
+    }
+    status_state = {
+        "value": case.get("status", healthy_status),
+        "failure": case.get("status_failure", False),
+    }
+
+    def fulfill(route, payload, *, status=200):
+        route.fulfill(
+            status=status,
+            content_type="application/json",
+            body=json.dumps(payload),
+        )
+
+    def route_api(route):
+        request = route.request
+        parsed = urlparse(request.url)
+        query = parse_qs(parsed.query)
+        requests.append((request.method, parsed.path))
+        if parsed.path == "/api/health":
+            return fulfill(route, {"repo": "subfloor"})
+        if parsed.path == "/api/shells":
+            return fulfill(route, {
+                "repo_root": str(ROOT),
+                "shells": [{
+                    "shell_id": 1,
+                    "display_name": "CC",
+                    "shortname": "cc",
+                    "flavor": "dev",
+                }],
+            })
+        if parsed.path == "/api/flavor-defaults":
+            if status_state["failure"]:
+                return fulfill(
+                    route,
+                    {"error": {"code": "STATUS_READ_FAILED"}},
+                    status=503,
+                )
+            return fulfill(route, {
+                "flavors": {},
+                "harness_status": {"codex": status_state["value"]},
+            })
+        if parsed.path == "/api/models":
+            return fulfill(route, {
+                "stale": False,
+                "harnesses": {"codex": {"models": case["models"]}},
+            })
+        if parsed.path == "/api/conversations":
+            if query.get("starred") == ["true"]:
+                return fulfill(route, {"items": [], "next_cursor": None})
+            return fulfill(route, {"items": [current], "next_cursor": None})
+        if parsed.path == f"/api/conversations/{CONVERSATION_ID}":
+            return fulfill(route, current)
+        if parsed.path == f"/api/conversations/{CONVERSATION_ID}/transcript":
+            return fulfill(route, snapshot)
+        return fulfill(
+            route,
+            {"error": {"code": "UNMOCKED", "message": parsed.path}},
+            status=404,
+        )
+
+    with (
+        sync_playwright() as playwright,
+        closing(playwright.chromium.launch(headless=True)) as browser,
+    ):
+        page = browser.new_page(viewport={"width": 1280, "height": 800})
+        page.add_init_script(
+            """
+            class FakeEventSource {
+              constructor() { queueMicrotask(() => this.onopen && this.onopen()); }
+              addEventListener() {}
+              close() {}
+            }
+            window.EventSource = FakeEventSource;
+            """
+        )
+        page.route("**/api/**", route_api)
+        page.on(
+            "pageerror",
+            lambda error: browser_errors.append(f"pageerror: {error}"),
+        )
+        page.goto(
+            f"{static_ui}/#interface/cc/{CONVERSATION_ID}",
+            wait_until="networkidle",
+        )
+
+        composer = page.locator(".chat-composer-input")
+        page.wait_for_timeout(500)
+        assert composer.count() == 1, json.dumps({
+            "requests": requests,
+            "browser_errors": browser_errors,
+            "page": page.locator("body").inner_text(),
+        }, indent=2)
+        if case.get("transition"):
+            assert composer.is_enabled()
+            assert page.get_by_role("button", name="Send").is_enabled()
+            before_status_reads = sum(
+                request == ("GET", "/api/flavor-defaults")
+                for request in requests
+            )
+            status_state["value"] = {
+                "installed": True,
+                "enabled": False,
+                "healthy": False,
+                "surfaces": {"browser": True},
+                "unavailable_reason": "HARNESS_DISABLED",
+            }
+            page.evaluate(
+                "() => renderInterface(document.querySelector('#view-interface'))"
+            )
+            composer = page.locator(".chat-composer-input")
+            composer.wait_for()
+            assert sum(
+                request == ("GET", "/api/flavor-defaults")
+                for request in requests
+            ) == before_status_reads + 1
+        assert page.get_by_text("use a tool", exact=True).is_visible()
+        assert page.locator(".chat-harness-unavailable").text_content() == (
+            case["reason"]
+        )
+        assert composer.is_disabled()
+        assert composer.get_attribute("placeholder") == (
+            f"This harness is unavailable — {case['reason']}."
+        )
+        assert page.get_by_role("button", name="Send").is_disabled()
+        assert page.locator(".chat-stop").is_enabled()
+        assert page.locator(".chat-title-button").is_enabled()
+        assert page.locator(".chat-history-star").is_enabled()
+        assert page.locator(".chat-actions").get_by_role(
+            "button", name="Close"
+        ).is_enabled()
+        assert page.locator(".chat-actions").get_by_role(
+            "button", name="Analytics"
+        ).is_enabled()
+        assert page.get_by_role("tab", name="Diff").is_enabled()
+
+        page.evaluate(
+            """
+            const composer = document.querySelector('.chat-composer-input');
+            composer.value = 'must not enqueue';
+            composer.dispatchEvent(new KeyboardEvent('keydown', {
+              key: 'Enter', bubbles: true,
+            }));
+            document.querySelector('.chat-compose-actions .primary').click();
+            """
+        )
+        assert not [request for request in requests if request[0] == "POST"]
+        assert browser_errors == []
+
+
 def test_diff_workspace_preserves_live_chat_and_uses_get_only(
     static_ui,
     tmp_path,
@@ -310,7 +484,7 @@ def test_diff_workspace_preserves_live_chat_and_uses_get_only(
     ]
     transcript_page = {
         "conversation_id": CONVERSATION_ID,
-        "projection_version": 2,
+        "projection_version": 3,
         "through_sequence": 22,
         "assistant_cursor": {
             "run_id": 77,
@@ -347,6 +521,7 @@ def test_diff_workspace_preserves_live_chat_and_uses_get_only(
                 "created_at": "2026-07-30 20:00:02",
                 "text": "initial",
                 "outcome": None,
+                "segment": "answer",
                 "segment_anchor_sequence": 0,
                 "first_sequence": 22,
                 "last_sequence": 22,
@@ -901,7 +1076,7 @@ def test_chat_performance_uses_bounded_requests_and_keyed_frames(static_ui):
     stars = [summary(100 + number, starred=True) for number in range(3)]
     transcript = {
         "conversation_id": CONVERSATION_ID,
-        "projection_version": 2,
+        "projection_version": 3,
         "through_sequence": 7000,
         "assistant_cursor": {
             "run_id": 77,
@@ -936,6 +1111,7 @@ def test_chat_performance_uses_bounded_requests_and_keyed_frames(static_ui):
                 "created_at": "2026-07-30 20:00:02",
                 "text": "initial",
                 "outcome": None,
+                "segment": "answer",
                 "segment_anchor_sequence": 0,
                 "first_sequence": 2,
                 "last_sequence": 7000,
@@ -1114,10 +1290,10 @@ def test_chat_performance_uses_bounded_requests_and_keyed_frames(static_ui):
             """
         )
 
-        assert not [
+        assert sorted(
             path for path, _query in requests
             if path in {"/api/models", "/api/flavor-defaults"}
-        ]
+        ) == ["/api/flavor-defaults", "/api/models"]
         assert sum(
             path.endswith("/transcript") for path, _query in requests
         ) == 1
@@ -1210,7 +1386,7 @@ def test_segmented_live_trace_refresh_replay_and_node_identity(static_ui):
     requests: list[str] = []
     browser_errors: list[str] = []
     selected = {**conversation(), "title": "Segmented trace"}
-    snapshot = version_two_snapshot()
+    snapshot = version_three_snapshot()
 
     def fulfill(route, payload, *, status=200):
         route.fulfill(

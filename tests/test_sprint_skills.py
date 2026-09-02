@@ -26,20 +26,60 @@ RESEEDED_SKILLS = set(SKILLS) | {"db_map"}
 AUTHORITY_SPLIT_SKILLS = {"sprint_pln", "sprint_rev"}
 V21_ROLE_SKILLS = set(SKILLS)
 HANDOFF_ROLE_SKILLS = {"sprint_dev", "sprint_rev", "sprint_pln"}
+FOCUSED_DEV_VERIFICATION_SKILLS = {
+    "agents",
+    "dev_kit",
+    "spec",
+    "sprint_dev",
+    "sprint_pln",
+}
 CLOSEOUT_ROLE_SKILLS = {"sprint_close", "sprint_dev", "sprint_pln", "sprint_rev"}
 FORCE_NEW_ROLE_SKILLS = {"sprint_dev", "sprint_pln", "sprint_rev"}
 POLISHED_SPRINT_SKILLS = set(SKILLS) - {"sprint_prep"}
+CHAT_CLEANUP_SKILLS = {"sprint_close", "sprint_pln", "sprint_rev"}
+CLEANUP_RECOVERY_SKILLS = {
+    "git",
+    "sprint_close",
+    "sprint_pln",
+    "sprint_prep",
+    "sprint_rev",
+}
+PROGRESS_CARRIER_ROLE_SKILLS = {"sprint_dev", "sprint_pln", "sprint_rev"}
+LIVE_REPLAN_ROLE_SKILLS = {"sprint_pln", "sprint_rev"}
+CONFORMANCE_OWNER_SKILLS = {
+    "sprint_close",
+    "sprint_pln",
+    "sprint_prep",
+    "sprint_rev",
+}
 
-ARTIFACT_PATH_RULE = """## Sprint artifact paths
-
-Sprint working artifacts (per-unit review notes, raw diffs, evidence packets,
-report drafts, and Dev scratch proof) go to the gitignored
-`shared/sprints/sprint-<n>/` directory. They are never committed, branched, or
-PR'd in the work repo; a review-notes commit is a finding.
-
-DB rows stay the durable record: judgments via `record-review`, report bodies in
-`sprint_reports`, and decisions in the durable relay. Files in the Sprint
-artifact directory are working material only."""
+SPEC_SKILL = ENGINE / "assets" / "skills" / "spec" / "SKILL.md"
+CONTEXT_EFFICIENT_SKILLS = ("sprint_dev", "sprint_rev", "sprint_pln", "spec")
+CONTEXT_EFFICIENT_SKILL_BYTE_CEILING = 44_361
+CONTEXT_EFFICIENT_RESEED = (
+    ENGINE / "migrations" / "0202_reseed_context_efficient_skills.sql"
+)
+CONFORMANCE_OWNER_RESEED = (
+    ENGINE / "migrations" / "0206_reseed_sprint_conformance_ownership.sql"
+)
+INFORMATIONAL_RECEIPT_RESEED = (
+    ENGINE / "migrations" / "0207_reseed_sprint_receipt_recovery.sql"
+)
+DISPOSABLE_SHELL_BASE_RESEED = (
+    ENGINE / "migrations" / "0208_reseed_disposable_shell_base.sql"
+)
+GITHUB_CAPABILITY_RESEED = (
+    ENGINE / "migrations" / "0209_reseed_git_github_capabilities.sql"
+)
+BINDING_GUIDANCE_RESEED = (
+    ENGINE / "migrations" / "0215_reseed_sprint_binding_guidance.sql"
+)
+DISPOSITION_VERBS_RESEED = (
+    ENGINE / "migrations" / "0222_reseed_sprint_pln_disposition_verbs.sql"
+)
+ROLE_AWARE_BOOT_RESEED = (
+    ENGINE / "migrations" / "0243_role_aware_boot_contract.sql"
+)
 
 
 class SprintSkillTest(unittest.TestCase):
@@ -85,6 +125,193 @@ class SprintSkillTest(unittest.TestCase):
                     )
                 ]
                 self.assertEqual([flavor], grants)
+
+    def test_context_efficient_terminal_reseed_is_exact_and_idempotent(self):
+        with sqlite3.connect(":memory:") as con:
+            con.executescript(
+                "CREATE TABLE skills ("
+                "skill_id INTEGER PRIMARY KEY, name TEXT UNIQUE, description TEXT, "
+                "category TEXT, command TEXT, common INTEGER, content TEXT, "
+                "is_deleted INTEGER DEFAULT 0);"
+            )
+            for index, name in enumerate(CONTEXT_EFFICIENT_SKILLS, 1):
+                con.execute(
+                    "INSERT INTO skills VALUES (?,?,?,?,?,?,?,1)",
+                    (index, name, "stale", "stale", "stale", 1, "stale"),
+                )
+            con.execute(
+                "INSERT INTO skills VALUES (99,'fork_only','local','fork',NULL,0,"
+                "'bespoke body',0)"
+            )
+
+            migration = CONTEXT_EFFICIENT_RESEED.read_text()
+            con.executescript(migration)
+            con.executescript(migration)
+
+            for name in CONTEXT_EFFICIENT_SKILLS:
+                if name in HANDOFF_ROLE_SKILLS | FOCUSED_DEV_VERIFICATION_SKILLS:
+                    continue  # Later reseeds deliberately supersede role bodies.
+                parsed = seed_skills.parse_skill(ASSETS / name / "SKILL.md")
+                actual = con.execute(
+                    "SELECT description,category,command,common,content,is_deleted "
+                    "FROM skills WHERE name=?",
+                    (name,),
+                ).fetchone()
+                self.assertEqual(
+                    tuple(actual),
+                    (
+                        parsed["description"],
+                        parsed["category"],
+                        parsed["command"],
+                        parsed["common"],
+                        parsed["content"],
+                        0,
+                    ),
+                )
+            local = con.execute(
+                "SELECT description,category,command,common,content,is_deleted "
+                "FROM skills WHERE name='fork_only'"
+            ).fetchone()
+            self.assertEqual(
+                tuple(local),
+                ("local", "fork", None, 0, "bespoke body", 0),
+            )
+
+    def test_conformance_owner_reseed_is_exact_and_idempotent(self):
+        with sqlite3.connect(":memory:") as con:
+            con.executescript(
+                "CREATE TABLE skills ("
+                "skill_id INTEGER PRIMARY KEY, name TEXT UNIQUE, description TEXT, "
+                "category TEXT, command TEXT, common INTEGER, content TEXT, "
+                "is_deleted INTEGER DEFAULT 0);"
+            )
+            for index, name in enumerate(sorted(CONFORMANCE_OWNER_SKILLS), 1):
+                con.execute(
+                    "INSERT INTO skills VALUES (?,?,?,?,?,?,?,1)",
+                    (index, name, "stale", "stale", "stale", 1, "stale"),
+                )
+            con.execute(
+                "INSERT INTO skills VALUES "
+                "(99,'fork_only','local','fork',NULL,0,'bespoke body',0)"
+            )
+
+            migration = CONFORMANCE_OWNER_RESEED.read_text()
+            con.executescript(migration)
+            con.executescript(migration)
+            con.executescript(INFORMATIONAL_RECEIPT_RESEED.read_text())
+            con.executescript(BINDING_GUIDANCE_RESEED.read_text())
+            con.executescript(DISPOSITION_VERBS_RESEED.read_text())
+
+            for name in sorted(CONFORMANCE_OWNER_SKILLS):
+                with self.subTest(name=name):
+                    if name in FOCUSED_DEV_VERIFICATION_SKILLS:
+                        continue  # Migration 0234 supersedes this historical body.
+                    parsed = seed_skills.parse_skill(ASSETS / name / "SKILL.md")
+                    rows = con.execute(
+                        "SELECT description,category,command,common,content,is_deleted "
+                        "FROM skills WHERE name=?",
+                        (name,),
+                    ).fetchall()
+                    self.assertEqual(1, len(rows))
+                    self.assertEqual(
+                        (
+                            parsed["description"],
+                            parsed["category"],
+                            parsed["command"],
+                            parsed["common"],
+                            parsed["content"],
+                            0,
+                        ),
+                        tuple(rows[0]),
+                    )
+            self.assertEqual(
+                ("fork", "bespoke body", 0),
+                tuple(
+                    con.execute(
+                        "SELECT category,content,is_deleted FROM skills "
+                        "WHERE name='fork_only'"
+                    ).fetchone()
+                ),
+            )
+
+    def test_informational_receipt_reseed_is_exact_and_idempotent(self):
+        with sqlite3.connect(":memory:") as con:
+            con.executescript(
+                "CREATE TABLE skills ("
+                "skill_id INTEGER PRIMARY KEY, name TEXT UNIQUE, description TEXT, "
+                "category TEXT, command TEXT, common INTEGER, content TEXT, "
+                "is_deleted INTEGER DEFAULT 0);"
+            )
+            for index, name in enumerate(sorted(HANDOFF_ROLE_SKILLS), 1):
+                con.execute(
+                    "INSERT INTO skills VALUES (?,?,?,?,?,?,?,1)",
+                    (index, name, "stale", "stale", "stale", 1, "stale"),
+                )
+            con.execute(
+                "INSERT INTO skills VALUES "
+                "(99,'fork_only','local','fork',NULL,0,'bespoke body',0)"
+            )
+
+            migration = INFORMATIONAL_RECEIPT_RESEED.read_text()
+            con.executescript(migration)
+            con.executescript(migration)
+            con.executescript(DISPOSITION_VERBS_RESEED.read_text())
+
+            for name in sorted(HANDOFF_ROLE_SKILLS):
+                with self.subTest(name=name):
+                    if name in FOCUSED_DEV_VERIFICATION_SKILLS:
+                        continue  # Migration 0225 deliberately supersedes this body.
+                    parsed = seed_skills.parse_skill(ASSETS / name / "SKILL.md")
+                    row = con.execute(
+                        "SELECT description,category,command,common,content,is_deleted "
+                        "FROM skills WHERE name=?",
+                        (name,),
+                    ).fetchone()
+                    self.assertEqual(
+                        (
+                            parsed["description"],
+                            parsed["category"],
+                            parsed["command"],
+                            parsed["common"],
+                            parsed["content"],
+                            0,
+                        ),
+                        tuple(row),
+                    )
+            self.assertEqual(
+                ("fork", "bespoke body", 0),
+                tuple(
+                    con.execute(
+                        "SELECT category,content,is_deleted FROM skills "
+                        "WHERE name='fork_only'"
+                    ).fetchone()
+                ),
+            )
+
+    def test_role_skills_bound_unusable_receipt_recovery(self):
+        for name in sorted(HANDOFF_ROLE_SKILLS):
+            with self.subTest(name=name):
+                body = " ".join(
+                    (ASSETS / name / "SKILL.md").read_text().lower().split()
+                )
+                self.assertIn("retry the exact command once", body)
+                self.assertIn("normal read surface once", body)
+                self.assertIn(
+                    "prior inbox presence + absence of that exact message id proves "
+                    "the read landed",
+                    body,
+                )
+                for forbidden_inference in (
+                    "assignment ownership",
+                    "review outcome",
+                    "merge authorization",
+                    "lifecycle/work-unit transition",
+                    "governing revision",
+                    "pr head/green state",
+                    "cleanup authority",
+                ):
+                    self.assertIn(forbidden_inference, body)
+                self.assertIn("an unproved postcondition stops", body)
 
     def test_handoff_migration_converges_a_drifted_existing_skill_body(self):
         con = sqlite3.connect(":memory:")
@@ -450,9 +677,6 @@ class SprintSkillTest(unittest.TestCase):
                     )
                     normalized = " ".join(parsed["content"].split())
                     self.assertIn("sc sprint watcher-state --sprint <id>", normalized)
-                    self.assertIn(
-                        "carries no evidence about the PR watcher", normalized
-                    )
                     self.assertIn("Do not repeat", normalized)
         finally:
             con.close()
@@ -476,6 +700,13 @@ class SprintSkillTest(unittest.TestCase):
             ).read_text()
             con.executescript(migration)
             con.executescript(migration)
+            con.executescript(
+                (
+                    ENGINE / "migrations" / "0203_sprint_cleanup_recovery.sql"
+                ).read_text()
+            )
+            con.executescript(CONFORMANCE_OWNER_RESEED.read_text())
+            con.executescript(BINDING_GUIDANCE_RESEED.read_text())
 
             parsed = seed_skills.parse_skill(ASSETS / "sprint_prep" / "SKILL.md")
             row = con.execute(
@@ -533,6 +764,11 @@ class SprintSkillTest(unittest.TestCase):
             ).read_text()
             con.executescript(migration)
             con.executescript(migration)
+            for later_migration in sorted(
+                (ENGINE / "migrations").glob("*.sql")
+            ):
+                if later_migration.name > "0184_reseed_sprint_skill_polish.sql":
+                    con.executescript(later_migration.read_text())
 
             for name in sorted(POLISHED_SPRINT_SKILLS):
                 with self.subTest(name=name):
@@ -553,6 +789,459 @@ class SprintSkillTest(unittest.TestCase):
                             parsed["content"],
                             0,
                         ),
+                    )
+        finally:
+            con.close()
+
+    def test_successful_chat_cleanup_reseed_matches_assets_and_is_idempotent(self):
+        con = sqlite3.connect(":memory:")
+        try:
+            con.executescript((ENGINE / "schema.sql").read_text())
+            for migration in sorted((ENGINE / "migrations").glob("*.sql")):
+                if migration.name >= "0190_reseed_successful_sprint_chat_cleanup.sql":
+                    break
+                con.executescript(migration.read_text())
+            placeholders = ",".join("?" for _ in CHAT_CLEANUP_SKILLS)
+            con.execute(
+                f"UPDATE skills SET description='stale',category='stale',"
+                f"command='stale',common=1,content='manual peer close',"
+                f"is_deleted=1 WHERE name IN ({placeholders})",
+                tuple(sorted(CHAT_CLEANUP_SKILLS)),
+            )
+            developer_before = tuple(
+                con.execute(
+                    "SELECT description,category,command,common,content,is_deleted "
+                    "FROM skills WHERE name='sprint_dev'"
+                ).fetchone()
+            )
+
+            migration = (
+                ENGINE
+                / "migrations"
+                / "0190_reseed_successful_sprint_chat_cleanup.sql"
+            ).read_text()
+            con.executescript(migration)
+            con.executescript(migration)
+            self.assertEqual(
+                developer_before,
+                tuple(
+                    con.execute(
+                        "SELECT description,category,command,common,content,is_deleted "
+                        "FROM skills WHERE name='sprint_dev'"
+                    ).fetchone()
+                ),
+            )
+            for later_migration in sorted(
+                (ENGINE / "migrations").glob("*.sql")
+            ):
+                if later_migration.name > "0190_reseed_successful_sprint_chat_cleanup.sql":
+                    con.executescript(later_migration.read_text())
+
+            for name in sorted(CHAT_CLEANUP_SKILLS):
+                with self.subTest(name=name):
+                    parsed = seed_skills.parse_skill(ASSETS / name / "SKILL.md")
+                    rows = con.execute(
+                        "SELECT description,category,command,common,content,is_deleted "
+                        "FROM skills WHERE name=?",
+                        (name,),
+                    ).fetchall()
+                    self.assertEqual(1, len(rows))
+                    self.assertEqual(
+                        (
+                            parsed["description"],
+                            parsed["category"],
+                            parsed["command"],
+                            parsed["common"],
+                            parsed["content"],
+                            0,
+                        ),
+                        tuple(rows[0]),
+                    )
+                    normalized = " ".join(parsed["content"].split())
+                    self.assertIn("originating Planner", normalized)
+                    self.assertIn("report-authoring Reviewer", normalized)
+                    self.assertIn("Do not manually close peer chats", normalized)
+                    self.assertIn("failed conformance", normalized)
+        finally:
+            con.close()
+
+    def test_cleanup_recovery_migration_matches_assets_and_replays_idempotently(self):
+        con = sqlite3.connect(":memory:")
+        try:
+            con.executescript((ENGINE / "schema.sql").read_text())
+            for migration in sorted((ENGINE / "migrations").glob("*.sql")):
+                if migration.name >= "0203_sprint_cleanup_recovery.sql":
+                    break
+                con.executescript(migration.read_text())
+            placeholders = ",".join("?" for _ in CLEANUP_RECOVERY_SKILLS)
+            con.execute(
+                f"UPDATE skills SET description='stale',category='stale',"
+                f"command='stale',common=1,content='no cleanup recovery',"
+                f"is_deleted=1 WHERE name IN ({placeholders})",
+                tuple(sorted(CLEANUP_RECOVERY_SKILLS)),
+            )
+
+            migration = (
+                ENGINE / "migrations" / "0203_sprint_cleanup_recovery.sql"
+            ).read_text()
+            con.executescript(migration)
+            con.executescript(migration)
+            con.executescript(CONFORMANCE_OWNER_RESEED.read_text())
+            con.executescript(INFORMATIONAL_RECEIPT_RESEED.read_text())
+            con.executescript(DISPOSABLE_SHELL_BASE_RESEED.read_text())
+            con.executescript(GITHUB_CAPABILITY_RESEED.read_text())
+            con.executescript(BINDING_GUIDANCE_RESEED.read_text())
+            con.executescript(DISPOSITION_VERBS_RESEED.read_text())
+            con.executescript(ROLE_AWARE_BOOT_RESEED.read_text())
+
+            self.assertIsNotNone(
+                con.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' "
+                    "AND name='sprint_cleanup_requests'"
+                ).fetchone()
+            )
+            for name in sorted(CLEANUP_RECOVERY_SKILLS):
+                with self.subTest(name=name):
+                    if name in FOCUSED_DEV_VERIFICATION_SKILLS:
+                        continue  # Migration 0234 supersedes this historical body.
+                    parsed = seed_skills.parse_skill(ASSETS / name / "SKILL.md")
+                    rows = con.execute(
+                        "SELECT description,category,command,common,content,is_deleted "
+                        "FROM skills WHERE name=?",
+                        (name,),
+                    ).fetchall()
+                    self.assertEqual(1, len(rows))
+                    self.assertEqual(
+                        (
+                            parsed["description"],
+                            parsed["category"],
+                            parsed["command"],
+                            parsed["common"],
+                            parsed["content"],
+                            0,
+                        ),
+                        tuple(rows[0]),
+                    )
+
+            all_content = " ".join(
+                row[0]
+                for row in con.execute(
+                    f"SELECT content FROM skills WHERE name IN ({placeholders})",
+                    tuple(sorted(CLEANUP_RECOVERY_SKILLS)),
+                )
+            )
+            self.assertIn("sc sprint cleanup-status", all_content)
+            self.assertIn("--adopt-legacy", all_content)
+            self.assertIn("not reusable", all_content)
+        finally:
+            con.close()
+
+    def test_pr_recovery_reseed_matches_asset_and_replays_idempotently(self):
+        con = sqlite3.connect(":memory:")
+        try:
+            con.executescript((ENGINE / "schema.sql").read_text())
+            for migration in sorted((ENGINE / "migrations").glob("*.sql")):
+                if migration.name >= "0192_reseed_sprint_pr_recovery.sql":
+                    break
+                con.executescript(migration.read_text())
+            con.execute(
+                "UPDATE skills SET description='stale',category='stale',"
+                "command='stale',common=1,content='no recovery surface',"
+                "is_deleted=1 WHERE name='sprint_pln'"
+            )
+
+            migration = (
+                ENGINE / "migrations" / "0192_reseed_sprint_pr_recovery.sql"
+            ).read_text()
+            con.executescript(migration)
+            con.executescript(migration)
+            self.assertIn(
+                "sc sprint reconcile-pr",
+                con.execute(
+                    "SELECT content FROM skills WHERE name='sprint_pln'"
+                ).fetchone()[0],
+            )
+            for later_migration in sorted(
+                (ENGINE / "migrations").glob("*.sql")
+            ):
+                if later_migration.name > "0192_reseed_sprint_pr_recovery.sql":
+                    con.executescript(later_migration.read_text())
+
+            parsed = seed_skills.parse_skill(ASSETS / "sprint_pln" / "SKILL.md")
+            row = con.execute(
+                "SELECT description,category,command,common,content,is_deleted "
+                "FROM skills WHERE name='sprint_pln'"
+            ).fetchone()
+            self.assertEqual(
+                (
+                    parsed["description"],
+                    parsed["category"],
+                    parsed["command"],
+                    parsed["common"],
+                    parsed["content"],
+                    0,
+                ),
+                tuple(row),
+            )
+        finally:
+            con.close()
+
+    def test_reopened_pr_reseed_matches_asset_and_replays_idempotently(self):
+        con = sqlite3.connect(":memory:")
+        try:
+            con.executescript((ENGINE / "schema.sql").read_text())
+            for migration in sorted((ENGINE / "migrations").glob("*.sql")):
+                if migration.name >= "0197_reseed_reopened_pr_resubscription.sql":
+                    break
+                con.executescript(migration.read_text())
+            con.execute(
+                "UPDATE skills SET description='stale',category='stale',"
+                "command='stale',common=1,content='no resubscription guidance',"
+                "is_deleted=1 WHERE name='sprint_dev'"
+            )
+
+            migration = (
+                ENGINE
+                / "migrations"
+                / "0197_reseed_reopened_pr_resubscription.sql"
+            ).read_text()
+            con.executescript(migration)
+            con.executescript(migration)
+            self.assertIn(
+                "replay the exact `register-pr` command",
+                con.execute(
+                    "SELECT content FROM skills WHERE name='sprint_dev'"
+                ).fetchone()[0],
+            )
+            for later_migration in sorted(
+                (ENGINE / "migrations").glob("*.sql")
+            ):
+                if later_migration.name > "0197_reseed_reopened_pr_resubscription.sql":
+                    con.executescript(later_migration.read_text())
+
+            parsed = seed_skills.parse_skill(ASSETS / "sprint_dev" / "SKILL.md")
+            row = con.execute(
+                "SELECT description,category,command,common,content,is_deleted "
+                "FROM skills WHERE name='sprint_dev'"
+            ).fetchone()
+            self.assertEqual(
+                (
+                    parsed["description"],
+                    parsed["category"],
+                    parsed["command"],
+                    parsed["common"],
+                    parsed["content"],
+                    0,
+                ),
+                tuple(row),
+            )
+        finally:
+            con.close()
+
+    def test_disposition_verbs_reseed_matches_asset_and_replays_idempotently(self):
+        con = sqlite3.connect(":memory:")
+        try:
+            con.executescript((ENGINE / "schema.sql").read_text())
+            for migration in sorted((ENGINE / "migrations").glob("*.sql")):
+                if migration.name >= "0222_reseed_sprint_pln_disposition_verbs.sql":
+                    break
+                con.executescript(migration.read_text())
+            con.execute(
+                "UPDATE skills SET description='stale',category='stale',"
+                "command='stale',common=1,content='no disposition verbs',"
+                "is_deleted=1 WHERE name='sprint_pln'"
+            )
+
+            migration = (
+                ENGINE
+                / "migrations"
+                / "0222_reseed_sprint_pln_disposition_verbs.sql"
+            ).read_text()
+            con.executescript(migration)
+            con.executescript(migration)
+            self.assertIn(
+                "sc sprint resolve-unit",
+                con.execute(
+                    "SELECT content FROM skills WHERE name='sprint_pln'"
+                ).fetchone()[0],
+            )
+            for later_migration in sorted(
+                (ENGINE / "migrations").glob("*.sql")
+            ):
+                if (
+                    later_migration.name
+                    > "0222_reseed_sprint_pln_disposition_verbs.sql"
+                ):
+                    con.executescript(later_migration.read_text())
+
+            parsed = seed_skills.parse_skill(ASSETS / "sprint_pln" / "SKILL.md")
+            row = con.execute(
+                "SELECT description,category,command,common,content,is_deleted "
+                "FROM skills WHERE name='sprint_pln'"
+            ).fetchone()
+            self.assertEqual(
+                (
+                    parsed["description"],
+                    parsed["category"],
+                    parsed["command"],
+                    parsed["common"],
+                    parsed["content"],
+                    0,
+                ),
+                tuple(row),
+            )
+        finally:
+            con.close()
+
+    def test_engine_authored_review_handoff_reseed_is_idempotent(self):
+        con = sqlite3.connect(":memory:")
+        try:
+            con.executescript((ENGINE / "schema.sql").read_text())
+            for migration in sorted((ENGINE / "migrations").glob("*.sql")):
+                if migration.name >= "0198_reseed_engine_authored_review_handoff.sql":
+                    break
+                con.executescript(migration.read_text())
+            con.execute(
+                "UPDATE skills SET description='stale',category='stale',"
+                "command='stale',common=1,content='wait for duplicate wake',"
+                "is_deleted=1 WHERE name='sprint_dev'"
+            )
+
+            migration = (
+                ENGINE
+                / "migrations"
+                / "0198_reseed_engine_authored_review_handoff.sql"
+            ).read_text()
+            con.executescript(migration)
+            con.executescript(migration)
+            for later_migration in sorted(
+                (ENGINE / "migrations").glob("*.sql")
+            ):
+                if later_migration.name > "0198_reseed_engine_authored_review_handoff.sql":
+                    con.executescript(later_migration.read_text())
+
+            parsed = seed_skills.parse_skill(ASSETS / "sprint_dev" / "SKILL.md")
+            row = con.execute(
+                "SELECT description,category,command,common,content,is_deleted "
+                "FROM skills WHERE name='sprint_dev'"
+            ).fetchone()
+            self.assertEqual(
+                (
+                    parsed["description"],
+                    parsed["category"],
+                    parsed["command"],
+                    parsed["common"],
+                    parsed["content"],
+                    0,
+                ),
+                tuple(row),
+            )
+            self.assertIn("--intent <submit|resubmit>", row[4])
+            self.assertIn(
+                "do not wait for a second pr-fact wake",
+                " ".join(row[4].lower().split()),
+            )
+        finally:
+            con.close()
+
+    def test_live_replanning_reseed_matches_assets_and_replays_idempotently(self):
+        con = sqlite3.connect(":memory:")
+        try:
+            con.executescript((ENGINE / "schema.sql").read_text())
+            for migration in sorted((ENGINE / "migrations").glob("*.sql")):
+                if migration.name >= "0200_reseed_sprint_live_replanning.sql":
+                    break
+                con.executescript(migration.read_text())
+            placeholders = ",".join("?" for _ in LIVE_REPLAN_ROLE_SKILLS)
+            con.execute(
+                f"UPDATE skills SET description='stale',category='stale',"
+                f"command='stale',common=1,content='immutable sprint plan',"
+                f"is_deleted=1 WHERE name IN ({placeholders})",
+                tuple(sorted(LIVE_REPLAN_ROLE_SKILLS)),
+            )
+
+            migration = (
+                ENGINE / "migrations" / "0200_reseed_sprint_live_replanning.sql"
+            ).read_text()
+            con.executescript(migration)
+            con.executescript(migration)
+            for later_migration in sorted(
+                (ENGINE / "migrations").glob("*.sql")
+            ):
+                if later_migration.name > "0200_reseed_sprint_live_replanning.sql":
+                    con.executescript(later_migration.read_text())
+
+            for name in sorted(LIVE_REPLAN_ROLE_SKILLS):
+                with self.subTest(name=name):
+                    parsed = seed_skills.parse_skill(ASSETS / name / "SKILL.md")
+                    rows = con.execute(
+                        "SELECT description,category,command,common,content,is_deleted "
+                        "FROM skills WHERE name=?",
+                        (name,),
+                    ).fetchall()
+                    self.assertEqual(1, len(rows))
+                    self.assertEqual(
+                        (
+                            parsed["description"],
+                            parsed["category"],
+                            parsed["command"],
+                            parsed["common"],
+                            parsed["content"],
+                            0,
+                        ),
+                        tuple(rows[0]),
+                    )
+        finally:
+            con.close()
+
+    def test_progress_carrier_reseed_matches_assets_and_replays_idempotently(self):
+        con = sqlite3.connect(":memory:")
+        try:
+            con.executescript((ENGINE / "schema.sql").read_text())
+            for migration in sorted((ENGINE / "migrations").glob("*.sql")):
+                if migration.name >= "0195_reseed_sprint_progress_carriers.sql":
+                    break
+                con.executescript(migration.read_text())
+            placeholders = ",".join("?" for _ in PROGRESS_CARRIER_ROLE_SKILLS)
+            con.execute(
+                f"UPDATE skills SET description='stale',category='stale',"
+                f"command='stale',common=1,content='legacy liveness workflow',"
+                f"is_deleted=1 WHERE name IN ({placeholders})",
+                tuple(sorted(PROGRESS_CARRIER_ROLE_SKILLS)),
+            )
+
+            migration = (
+                ENGINE
+                / "migrations"
+                / "0195_reseed_sprint_progress_carriers.sql"
+            ).read_text()
+            con.executescript(migration)
+            con.executescript(migration)
+            for later_migration in sorted(
+                (ENGINE / "migrations").glob("*.sql")
+            ):
+                if later_migration.name > "0195_reseed_sprint_progress_carriers.sql":
+                    con.executescript(later_migration.read_text())
+
+            for name in sorted(PROGRESS_CARRIER_ROLE_SKILLS):
+                with self.subTest(name=name):
+                    parsed = seed_skills.parse_skill(ASSETS / name / "SKILL.md")
+                    rows = con.execute(
+                        "SELECT description,category,command,common,content,is_deleted "
+                        "FROM skills WHERE name=?",
+                        (name,),
+                    ).fetchall()
+                    self.assertEqual(1, len(rows))
+                    self.assertEqual(
+                        (
+                            parsed["description"],
+                            parsed["category"],
+                            parsed["command"],
+                            parsed["common"],
+                            parsed["content"],
+                            0,
+                        ),
+                        tuple(rows[0]),
                     )
         finally:
             con.close()
@@ -629,6 +1318,33 @@ class SprintSkillTest(unittest.TestCase):
             normalized.index("clean or post-sprint-only findings"),
         )
 
+    def test_role_guidance_selects_and_recovers_one_conformance_owner(self):
+        prep = " ".join(
+            (ASSETS / "sprint_prep" / "SKILL.md").read_text().split()
+        )
+        planner = " ".join(
+            (ASSETS / "sprint_pln" / "SKILL.md").read_text().split()
+        )
+        reviewer = " ".join(
+            (ASSETS / "sprint_rev" / "SKILL.md").read_text().split()
+        )
+        close = " ".join(
+            (ASSETS / "sprint_close" / "SKILL.md").read_text().split()
+        )
+
+        self.assertIn(
+            "sc sprint arm --sprint <id> --conformance-reviewer-shell <shell-id>",
+            prep,
+        )
+        self.assertIn("select exactly one participating Reviewer", prep)
+        self.assertIn("Replace that owner only while paused", planner)
+        self.assertIn("--conformance-reviewer-shell <replacement-shell-id>", planner)
+        self.assertIn("new ownership generation", planner)
+        self.assertIn("selected conformance owner", reviewer)
+        self.assertIn("different Reviewer", reviewer)
+        self.assertIn("owner shell and generation match", close)
+        self.assertIn("Any other Reviewer records no conformance", close)
+
     def test_planner_executes_reenter_and_does_not_initiate_conformance(self):
         planner = (ASSETS / "sprint_pln" / "SKILL.md").read_text()
         reenter = planner[
@@ -648,15 +1364,21 @@ class SprintSkillTest(unittest.TestCase):
             planner,
         )
 
-    def test_closeout_role_skills_share_the_exact_artifact_path_rule(self):
+    def test_closeout_role_skills_keep_artifacts_local_and_db_records_durable(self):
         for name in sorted(CLOSEOUT_ROLE_SKILLS):
             with self.subTest(name=name):
                 body = (ASSETS / name / "SKILL.md").read_text()
-                self.assertEqual(body.count(ARTIFACT_PATH_RULE), 1)
+                normalized = " ".join(body.split())
+                self.assertGreaterEqual(body.count("shared/sprints/sprint-<n>/"), 1)
+                self.assertIn("gitignored", normalized)
+                self.assertRegex(normalized, r"[Nn]ever commit|never committed")
+                self.assertIn("durable", normalized)
+                self.assertIn("record-review", normalized)
+                self.assertIn("sprint_reports", normalized)
+                self.assertIn("relay", normalized)
 
     def test_close_skill_routes_to_owning_roles_and_keeps_fallback_bounded(self):
         close = (ASSETS / "sprint_close" / "SKILL.md").read_text()
-        normalized = " ".join(close.split())
         self.assertIn("## Route the entry", close)
         self.assertIn("Load `sprint_rev`", close)
         self.assertIn("Load `sprint_pln`", close)
@@ -692,10 +1414,23 @@ class SprintSkillTest(unittest.TestCase):
         normalized_planner = " ".join(planner.split())
         self.assertIn("clean `record-conformance` command atomically", normalized_planner)
         self.assertIn("Do not run `complete`", planner)
-        self.assertIn("notification has no actionable liveness expectation", planner)
+        self.assertIn(
+            "notification is informational because closure is already terminal",
+            normalized_planner,
+        )
         normalized_close = " ".join(close.split())
         self.assertIn("completes the Sprint", normalized_close)
         self.assertIn("informational Planner receipt", normalized_close)
+
+    def test_originating_planner_owns_pr_reconciliation(self):
+        planner = " ".join(
+            (ASSETS / "sprint_pln" / "SKILL.md").read_text().split()
+        )
+
+        self.assertIn("originating Planner may reconcile that identity", planner)
+        self.assertIn("refuses a live source Sprint or target Sprint", planner)
+        self.assertIn("a non-originating Planner", planner)
+        self.assertIn("separate Reviewer decision before resuming", planner)
 
     def test_skills_use_only_the_shipped_shell_command_surface(self):
         expected = {
@@ -703,14 +1438,20 @@ class SprintSkillTest(unittest.TestCase):
             "declare",
             "plan-unit",
             "replan-unit",
+            "recall-unit",
+            "reroute-participant",
             "arm",
             "inbox",
+            "spec-revision",
+            "rebind-spec",
             "send",
             "accept",
             "decline",
             "complete-unit",
             "cancel-unit",
+            "resolve-unit",
             "register-pr",
+            "reconcile-pr",
             "pause",
             "resume",
             "complete",
@@ -724,14 +1465,20 @@ class SprintSkillTest(unittest.TestCase):
             "record-conformance",
             "disposition-followup",
             "compile-report",
+            "cleanup-status",
+            "cleanup",
         }
         combined = "\n".join(
             (ASSETS / name / "SKILL.md").read_text() for name in SKILLS
         )
-        for command in expected:
+        for command in expected - {"monitor", "spec-revision"}:
             self.assertIn(f"sc sprint {command}", combined)
+        self.assertNotIn("sc sprint monitor", combined)
         dispatcher = (ROOT / ".super-coder" / "scripts" / "dispatch.sh").read_text()
-        self.assertIn('sprint)       exec "$PY" "$S/sprint_cli.py" "$@" ;;', dispatcher)
+        self.assertIn(
+            'sprint)       sc_python_probe; exec "$PY" "$S/sprint_cli.py" "$@" ;;',
+            dispatcher,
+        )
         parser = sprint_cli.build_parser()
         commands = next(
             action
@@ -749,14 +1496,17 @@ class SprintSkillTest(unittest.TestCase):
                     "sc sprint inbox --sprint <id>",
                     "sc sprint accept --sprint <id> --message <message-id>",
                     "sc sprint decline --sprint <id> --message <message-id>",
-                    "sc sprint send --sprint <id> --to <shortname> --body-file <path> \\",
+                    "--intent question --requires-reply --work-unit <work-unit-id>",
+                    "--intent decision --requires-reply --sprint-level",
+                    "--intent information --reply-to <message-id>",
                 ):
                     self.assertIn(command, body)
                 normalized = " ".join(body.lower().split())
                 for guidance in (
                     "on every entry",
                     "route the entry",
-                    "incoming question",
+                    "original message",
+                    "inherits its",
                     "blocker",
                     "decision boundary",
                     "duplicate",
@@ -771,17 +1521,51 @@ class SprintSkillTest(unittest.TestCase):
                     "re-run `sc sprint inbox --sprint <id>`",
                 ):
                     self.assertIn(guidance, normalized)
-                self.assertEqual(
-                    1,
-                    body.count(
-                        "sc sprint send --sprint <id> --to <shortname> "
-                        "--body-file <path> \\\n  --key <stable-key>"
-                    ),
-                )
                 self.assertIn("reuse it only", normalized)
-                self.assertIn("recipient or body changes", normalized)
+                self.assertIn("when any of those fields changes", normalized)
                 for invented in ("ASK:", "ANSWER:", "BLOCKED:"):
                     self.assertNotIn(invented, body)
+
+    def test_role_messages_are_scoped_and_progress_carrier_driven(self):
+        bodies = {
+            name: (ASSETS / name / "SKILL.md").read_text()
+            for name in PROGRESS_CARRIER_ROLE_SKILLS
+        }
+        for name, body in bodies.items():
+            with self.subTest(name=name):
+                normalized = " ".join(body.split())
+                self.assertIn(
+                    "--intent question --requires-reply --work-unit <work-unit-id>",
+                    normalized,
+                )
+                self.assertIn("Use `--intent blocker`", normalized)
+                self.assertIn(
+                    "--intent decision --requires-reply --sprint-level",
+                    normalized,
+                )
+                self.assertIn(
+                    "--intent information --reply-to <message-id>",
+                    normalized,
+                )
+                self.assertIn(
+                    "never add `--work-unit` or `--sprint-level` to a reply",
+                    normalized,
+                )
+                self.assertNotIn("liveness", body.lower())
+                self.assertNotIn("sc sprint monitor", body)
+
+        self.assertIn(
+            "--intent handoff --key <stable-merged-handoff-key>",
+            " ".join(bodies["sprint_dev"].split()),
+        )
+        reviewer = " ".join(bodies["sprint_rev"].split())
+        self.assertIn("retain that exact message id", reviewer)
+        self.assertIn(
+            "accepted request's message id, registered PR, work unit, and exact head",
+            reviewer,
+        )
+        self.assertIn("exact notification message id", reviewer)
+        self.assertIn("Only an armed Sprint whose units are all terminal", reviewer)
 
     def test_authority_split_assigns_reviewer_decisions_and_planner_actions(self):
         planner = (ASSETS / "sprint_pln" / "SKILL.md").read_text()
@@ -789,14 +1573,17 @@ class SprintSkillTest(unittest.TestCase):
         normalized_planner = " ".join(planner.lower().split())
         normalized_reviewer = " ".join(reviewer.lower().split())
 
-        self.assertIn("## Reviewer decision actions", planner)
+        self.assertIn("## Reviewer decisions and Planner actions", planner)
         self.assertIn(
-            "pause, cancel, re-enter, and abort are reviewer decisions",
+            "planner independently owns operational plan structure",
             normalized_planner,
         )
-        self.assertIn("planner actions", normalized_planner)
+        self.assertIn("pause-safe recall", normalized_planner)
+        self.assertIn("repeated task lanes", normalized_planner)
         for command in (
             "sc sprint pause --sprint <id>",
+            "sc sprint recall-unit --sprint <id>",
+            "sc sprint reroute-participant --sprint <id>",
             "sc sprint cancel-unit --sprint <id>",
         ):
             self.assertIn(command, planner)
@@ -805,15 +1592,20 @@ class SprintSkillTest(unittest.TestCase):
         self.assertIn("do not run `complete`", normalized_planner)
         self.assertNotIn("you decide scope, sequencing, and recovery", normalized_planner)
 
-        self.assertIn("## Control and conclude decisions", reviewer)
+        self.assertIn("## Conformance decisions and Planner controls", reviewer)
         self.assertIn(
-            "owns all pause, cancel, and conclude decisions", normalized_reviewer
+            "planner independently owns operational plan structure",
+            normalized_reviewer,
+        )
+        self.assertIn(
+            "reviewer owns review, re-enter, abort, and conclude",
+            normalized_reviewer,
         )
         self.assertIn("author the final Sprint report", reviewer)
         self.assertIn("sc sprint record-conformance", reviewer)
         self.assertIn("sc sprint compile-report", reviewer)
         self.assertIn(
-            "`decision`: `pause`, `resume`, `replan`, `re-enter`, `cancel`, or `abort`",
+            "`decision`: `re-enter`, `abort`, or the exact safety-critical recommendation",
             reviewer,
         )
         self.assertNotIn("`cancel`, `conclude`", reviewer)
@@ -824,6 +1616,31 @@ class SprintSkillTest(unittest.TestCase):
             normalized = " ".join(body.lower().split())
             self.assertIn("fnb board-level override", normalized)
             self.assertIn("decision #46", normalized)
+
+    def test_planner_control_decisions_reply_before_accept_and_action(self):
+        planner = (ASSETS / "sprint_pln" / "SKILL.md").read_text()
+        control = planner[
+            planner.index("## Reviewer decisions and Planner actions"):
+            planner.index("The FnB board-level override")
+        ]
+
+        linked_reply = "--reply-to <decision-message-id>"
+        accept = "sc sprint accept --sprint <id> --message <decision-message-id>"
+        action = "execute the requested transition"
+        self.assertIn(linked_reply, control)
+        self.assertIn(accept, control)
+        self.assertIn(action, control)
+        self.assertLess(control.index(linked_reply), control.index(accept))
+        self.assertLess(control.index(accept), control.index(action))
+        self.assertIn(
+            "reply command to confirm its durable message and wake",
+            control,
+        )
+        self.assertIn(
+            "linked reply must precede any pause or\n"
+            "   abort that makes the Sprint relay unavailable",
+            control,
+        )
 
     def test_developer_reports_integrity_concerns_without_taking_pause_action(self):
         developer = (ASSETS / "sprint_dev" / "SKILL.md").read_text()
@@ -861,18 +1678,36 @@ class SprintSkillTest(unittest.TestCase):
         developer = bodies["sprint_dev"]
         reviewer = bodies["sprint_rev"]
         planner = bodies["sprint_pln"]
-        self.assertIn("outside an armed Sprint", developer)
+        normalized_developer = " ".join(developer.split())
+        self.assertIn(
+            "Red/green/closed Re-enter wakes continue", normalized_developer
+        )
+        self.assertIn("armed -> fix red + judge/pass green", normalized_developer)
+        self.assertIn(
+            "paused -> fix red now + judge green, review after resume",
+            normalized_developer,
+        )
+        self.assertIn(
+            "no active Sprint -> fix red if needed", normalized_developer
+        )
+        self.assertIn("no action on green", normalized_developer)
         self.assertIn("Reviewer decides", developer)
-        self.assertIn("replan, cancel", reviewer)
+        self.assertIn("recalling unreleased work", " ".join(reviewer.split()))
         self.assertIn("Compile the bounded evidence packet first", reviewer)
         self.assertIn("Developer-owned subscriptions", planner)
 
         boot = (ENGINE / "templates" / "boot.md").read_text()
+        normalized_boot = " ".join(boot.split())
         self.assertIn("## ACTIVE CHAT DELIVERY", boot)
         self.assertIn("Every `wake_message` creates durable delivery intent", boot)
         self.assertIn("verified live turn", boot)
         self.assertIn("coordinate mode", boot)
         self.assertIn("reaper", boot)
+        self.assertIn("including after a Sprint ends", boot)
+        self.assertIn(
+            "an armed Sprint, a paused Sprint, and no active Sprint",
+            normalized_boot,
+        )
         self.assertIn("defaults satisfy the gate", boot)
 
     def test_force_new_and_blind_review_contracts_are_folded_into_roles(self):
@@ -896,6 +1731,9 @@ class SprintSkillTest(unittest.TestCase):
         reviewer = " ".join(bodies["sprint_rev"].lower().split())
         for guidance in (
             "bare one-line locator",
+            "the engine injects",
+            "--intent <submit|resubmit>",
+            "do not wait for a second pr-fact wake",
             "no scope narrative",
             "verification evidence",
             "review-focus steering",
@@ -913,9 +1751,12 @@ class SprintSkillTest(unittest.TestCase):
             self.assertIn(guidance, reviewer)
 
     def test_reviewer_forbids_accepted_red_and_routes_failures(self):
-        reviewer = " ".join(
-            (ASSETS / "sprint_rev" / "SKILL.md").read_text().split()
-        )
+        body = (ASSETS / "sprint_rev" / "SKILL.md").read_text()
+        reviewer = " ".join(body.split())
+        red = reviewer[
+            reviewer.index("### Red-check doctrine"):
+            reviewer.index("Complete a unit verdict in this exact order")
+        ]
         for guidance in (
             "Accepted-red is not a legal review outcome",
             "A departure that leaves checks failing is never acceptable",
@@ -923,13 +1764,11 @@ class SprintSkillTest(unittest.TestCase):
             "send the Planner a `replan` decision",
             "remains green-only, without exception or waiver",
             "do not note the failure and approve anyway",
-            "`Note it and pass anyway` is the acceptance-shaped anti-pattern",
-            "In the dos-arch incident",
-            "created a deadlock: the green-only handoff gate could never pass",
-            "Decision #93 records why this no-waiver rule exists",
         ):
             with self.subTest(guidance=guidance):
-                self.assertIn(guidance, reviewer)
+                self.assertIn(guidance, red)
+        self.assertLess(red.index("In-scope failure"), red.index("Out-of-scope failure"))
+        self.assertNotIn("approve anyway", red.split("do not note", 1)[0].lower())
 
     def test_every_affected_file_argument_names_the_hard_ceiling(self):
         parser = sprint_cli.build_parser()
@@ -999,19 +1838,16 @@ class SprintSkillTest(unittest.TestCase):
         )
         planner = " ".join(bodies["sprint_pln"].split())
         self.assertIn("dependency graph and capacity plan match the decision", planner)
-        self.assertIn("rather than silently re-routing", planner)
-        for fact in (
-            "scheduled dispatch",
-            "unread wake recovery",
-            "liveness evaluation",
-            "registered-PR observation",
-        ):
+        self.assertIn("Planner may reassign or reroute for operational capacity", planner)
+        for fact in ("scheduled dispatch", "unread wake recovery"):
             self.assertIn(fact, planner)
-        self.assertIn(
-            "Run `monitor` once for concrete evidence", bodies["sprint_pln"]
-        )
+        self.assertIn("registered-PR watcher owns subscription observation", planner)
+        self.assertNotIn("sc sprint monitor", bodies["sprint_pln"])
         self.assertIn(
             "After `register-pr` succeeds", bodies["sprint_dev"]
+        )
+        self.assertIn(
+            "replay the exact `register-pr` command", bodies["sprint_dev"]
         )
         self.assertIn(
             "stop and await the native verdict wake", bodies["sprint_dev"]
@@ -1064,6 +1900,135 @@ class SprintSkillTest(unittest.TestCase):
         )
         self.assertIn("do not run the Sprint inbox, accept it", planner)
 
+    def test_compact_developer_and_spec_keep_every_stateful_route(self):
+        developer = (ASSETS / "sprint_dev" / "SKILL.md").read_text()
+        developer_sections = [
+            "## Route the entry",
+            "## Bound the lane",
+            "## Build and verify",
+            "## Report-only or no-code completion",
+            "## Register and observe the PR",
+            "## Review handoff and correction",
+            "## Merge boundary",
+            "## Post-merge handoff",
+            "## Report and stop",
+        ]
+        positions = [developer.index(section) for section in developer_sections]
+        self.assertEqual(positions, sorted(positions))
+        for command in (
+            "sc sprint complete-unit",
+            "sc sprint register-pr",
+            "sc sprint watcher-state",
+            "sc sprint request-review",
+            "sc sprint authorize-merge",
+            "--intent handoff --key <stable-merged-handoff-key>",
+        ):
+            self.assertEqual(developer.count(command), 1)
+        self.assertIn("created: false", developer)
+        self.assertIn("--intent <submit|resubmit>", developer)
+        self.assertNotIn("sc sprint pause --sprint <id>", developer)
+
+        spec = SPEC_SKILL.read_text()
+        parsed_spec = seed_skills.parse_skill(SPEC_SKILL)
+        self.assertEqual(
+            parsed_spec["description"],
+            "Load before implementing any feature, spec, or roadmap item. "
+            "Analyze viability, surface blockers, plan Preparation → implementation "
+            "→ Verification, and track spec_tasks/current_state across sessions.",
+        )
+        spec_sections = [
+            "## 1. Select the spec",
+            "## 2. Analyze before planning",
+            "## 3. Engage and plan",
+            "## 4. Execute one task at a time",
+            "## 5. Ship and hand docs to Planner",
+            "## Scope change and stop rules",
+        ]
+        positions = [spec.index(section) for section in spec_sections]
+        self.assertEqual(positions, sorted(positions))
+        for command in (
+            "sc mem get documents --feature <id>",
+            "sc mem get documents --doc <doc_id>",
+            "sc mem get tasks --doc <doc_id>",
+            "sc mem task add \"Preparation\"",
+            "sc mem task add \"Verification\"",
+            "sc mem task start <task_id>",
+            "sc mem task done <task_id>",
+            "sc mem task cancel <task_id>",
+            "sc mem roadmap status <feature_id> shipped",
+        ):
+            self.assertIn(command, spec)
+        normalized = " ".join(spec.split())
+        for invariant in (
+            "Current Posture",
+            "In Scope",
+            "Out of Scope",
+            "Anticipated User Activity",
+            "tenancy",
+            "No task plan = no implementation",
+            "Do not freeze or author the shipped doc as Developer",
+        ):
+            self.assertIn(invariant, normalized)
+        self.assertLess(spec.index("sc mem task start"), spec.index("sc mem task done"))
+        self.assertNotIn("sc mem doc freeze", spec)
+
+    def test_compact_planner_keeps_control_and_replan_routes(self):
+        planner = (ASSETS / "sprint_pln" / "SKILL.md").read_text()
+        sections = [
+            "## Route the entry",
+            "## Durable running loop",
+            "## Relay contract",
+            "## Reviewer decisions and Planner actions",
+            "### Pause or resume",
+            "### Modify, recall, repeat, reassign, or reroute",
+            "### Re-enter after conformance",
+            "### Conclude or abort",
+            "## Handoffs and stop",
+        ]
+        positions = [planner.index(section) for section in sections]
+        self.assertEqual(positions, sorted(positions))
+        for command in (
+            "sc sprint watcher-state --sprint <id>",
+            "sc sprint reconcile-pr",
+            "sc sprint cancel-unit",
+            "sc sprint replan-unit",
+            "sc sprint recall-unit",
+            "sc sprint reroute-participant",
+            "sc mem task add",
+            "sc sprint plan-unit",
+        ):
+            self.assertIn(command, planner)
+        recall_route = planner[
+            planner.index("Never edit a released lane in place"):
+            planner.index("Recall preserves message/event history")
+        ]
+        ordered = [
+            recall_route.index(command)
+            for command in (
+                "sc sprint pause",
+                "sc sprint recall-unit",
+                "sc sprint replan-unit",
+                "sc sprint resume",
+            )
+        ]
+        self.assertEqual(ordered, sorted(ordered))
+        self.assertNotIn("sc sprint monitor", planner)
+
+    def test_context_efficient_skills_meet_budget_without_auxiliary_resources(self):
+        paths = [ASSETS / name / "SKILL.md" for name in CONTEXT_EFFICIENT_SKILLS]
+        sizes = {path.parent.name: len(path.read_bytes()) for path in paths}
+
+        self.assertLessEqual(
+            sum(sizes.values()),
+            CONTEXT_EFFICIENT_SKILL_BYTE_CEILING,
+        )
+        for path in paths:
+            with self.subTest(skill=path.parent.name):
+                self.assertEqual(
+                    sorted(item.name for item in path.parent.iterdir()),
+                    ["SKILL.md"],
+                )
+
     def test_role_handoffs_are_explicitly_ordered_and_message_last(self):
         developer = (ASSETS / "sprint_dev" / "SKILL.md").read_text()
         post_merge = developer[
@@ -1100,7 +2065,7 @@ class SprintSkillTest(unittest.TestCase):
         planner = (ASSETS / "sprint_pln" / "SKILL.md").read_text()
         wave_handoff = planner[
             planner.index("Never dispatch the next wave"):
-            planner.index("On a clean completion receipt")
+            planner.index("On an initial clean completion receipt")
         ]
         self.assertIn(
             "merged-work handoff wake is the only normal next-wave dispatch trigger",
@@ -1141,8 +2106,8 @@ class SprintSkillTest(unittest.TestCase):
         stop = reviewer[reviewer.index("## Stop"):]
         normalized_stop = " ".join(stop.lower().split())
         self.assertIn(
-            "when it confirms completed state and all receipt identities, stop "
-            "immediately",
+            "when it confirms completed state, pending cleanup, and all receipt "
+            "identities, stop immediately",
             normalized_stop,
         )
         self.assertIn("run no trailing command", normalized_stop)

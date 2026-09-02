@@ -7,9 +7,12 @@ import json
 import sqlite3
 import sys
 import tempfile
+import time
 import unittest
 from contextlib import closing
+from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -20,8 +23,10 @@ sys.path.insert(0, str(ENGINE / "scripts"))
 
 import conversation_broker
 import conversation_events
+import conversation_launch
 import conversation_routes
 import sprint_participant_chats
+from conversation_adapters import NativeTurn, NormalizedEvent
 from segmented_response_traces import (
     HISTORICAL_SEGMENT_TRACES,
     PENDING_BOUNDARY_TRACE,
@@ -62,6 +67,98 @@ class _DisconnectingWriter:
 
 
 class ConversationApiCase(unittest.TestCase):
+    @staticmethod
+    def runtime_status(harness: str) -> dict:
+        versions = {
+            "claude": ("2.1.222", "2.1.220", "2.2.0"),
+            "codex": ("0.145.0", "0.145.0", "0.147.0"),
+            "kimi": ("0.33.0", "0.30.0", "0.34.0"),
+            "opencode": ("1.18.9", "1.18.9", "1.19.0"),
+        }
+        version, minimum, maximum = versions[harness]
+        scope = conversation_routes.model_catalog.harness_versions.runtime_scope()
+        return {
+            "harness": harness, **scope, "version": version,
+            "compatibility": "verified", "minimum_version": minimum,
+            "maximum_version_exclusive": maximum,
+            "verified_version": version, "error": None,
+        }
+
+    @classmethod
+    def controlled_evidence(cls, harness: str, selector: str) -> dict:
+        status = cls.runtime_status(harness)
+        return {
+            "runtime_status": status,
+            "runtime_scope": {
+                "runtime": status["runtime"],
+                "runtime_identity": status["runtime_identity"],
+            },
+            "source_fingerprint": "f" * 64,
+            **(
+                {"advertised_options_by_model": {selector: ["low", "high"]}}
+                if harness == "opencode"
+                else {}
+            ),
+        }
+
+    @classmethod
+    def seed_controlled_route(
+        cls, con: sqlite3.Connection, harness: str, model: str,
+    ) -> None:
+        status = cls.runtime_status(harness)
+        now = datetime.now(timezone.utc).isoformat()
+        con.execute(
+            "INSERT OR IGNORE INTO model_catalog_generations ("
+            "generation_id,payload_version,contract_version,started_at,"
+            "completed_at,state,runtime,source_summary,harness_versions,"
+            "source_fingerprints,error_summary,payload_digest"
+            ") VALUES (?,?,?,?,?,'successful',?,'[]','{}','{}',NULL,?)",
+            ("a" * 32, 6, 2, now, now, status["runtime"], "b" * 64),
+        )
+        opencode = harness == "opencode"
+        con.execute(
+            "INSERT INTO model_routes ("
+            "harness,selector,provider_model,source,availability,"
+            "headless_supported,high_effort_supported,supported_efforts,"
+            "default_effort,cli_version,last_seen_at,stale,generation_id,"
+            "evidence_kind,evidence_digest,source_fingerprint,harness_version,"
+            "harness_compatibility,selector_binding,effort_metadata,"
+            "adapter_metadata) VALUES (?,?,?,?,?,1,1,'[\"low\",\"high\"]',"
+            "'high',?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                harness, model, model,
+                "opencode-provider-api" if opencode else "codex-cache",
+                "available", f"{harness} {status['version']}", now, 0,
+                "a" * 32,
+                "opencode-connected-variant" if opencode
+                else "codex-model-cache",
+                "e" * 64, "f" * 64, status["version"], "verified",
+                json.dumps({"kind": "exact-model", "selector": model}),
+                json.dumps({
+                    "supported": ["low", "high"], "default": "high",
+                    "digests": {"low": "d" * 64, "high": "e" * 64},
+                    "native_variant_ids": {"low": "low", "high": "high"}
+                    if opencode else {},
+                    "adapter_metadata_by_effort": {
+                        effort: {
+                            "compatibility_manifest": "opencode-1.18.9-v1",
+                            "provider_family": "openai-ai-sdk",
+                            "variant_options": {"reasoningEffort": effort},
+                        }
+                        for effort in ("low", "high")
+                    } if opencode else {},
+                }),
+                json.dumps({
+                    "compatibility_manifest": "opencode-1.18.9-v1",
+                    "provider_family": "openai-ai-sdk",
+                    "variant_options_by_effort": {
+                        effort: {"reasoningEffort": effort}
+                        for effort in ("low", "high")
+                    },
+                }) if opencode else "{}",
+            ),
+        )
+
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
@@ -81,6 +178,11 @@ class ConversationApiCase(unittest.TestCase):
             "(2,'Review','review','dev','prompt',1,'review-token'),"
             "(3,'Admin','ADM1','admin','prompt',1,'admin-token')"
         )
+        default_model = con.execute(
+            "SELECT model FROM flavor_defaults "
+            "WHERE flavor='dev' AND harness='codex'"
+        ).fetchone()[0]
+        self.seed_controlled_route(con, "codex", default_model)
         con.commit()
         con.close()
         (self.root / ".sc-worktrees" / "dev").mkdir(parents=True)
@@ -103,6 +205,16 @@ class ConversationApiCase(unittest.TestCase):
                 conversation_routes,
                 "_live_shell_session",
                 return_value=None,
+            ),
+            mock.patch.object(
+                conversation_routes.model_catalog,
+                "harness_runtime_status",
+                side_effect=self.runtime_status,
+            ),
+            mock.patch.object(
+                conversation_routes.model_catalog,
+                "controlled_route_evidence",
+                side_effect=self.controlled_evidence,
             ),
         )
         for patch in patches:
@@ -157,7 +269,16 @@ class ConversationApiCase(unittest.TestCase):
                 "(sprint_id,feature_id,originating_planner_shell_id,"
                 "merge_grant_enabled) VALUES (7,31,1,1)"
             )
-            con.execute("UPDATE sprints SET lifecycle='armed' WHERE sprint_id=7")
+            con.execute(
+                "INSERT INTO sprint_participants "
+                "(sprint_id,shell_id,role,harness,model,effort,disposition) "
+                "VALUES (7,2,'reviewer','codex','gpt-test','high','idle')"
+            )
+            con.execute(
+                "UPDATE sprints SET conformance_reviewer_shell_id=2,"
+                "conformance_owner_generation=1,lifecycle='armed' "
+                "WHERE sprint_id=7"
+            )
             participant_id = con.execute(
                 "INSERT INTO sprint_participants "
                 "(sprint_id,shell_id,role,harness,model,effort,disposition) "
@@ -418,7 +539,7 @@ class ConversationApiCase(unittest.TestCase):
             expected.append((item_id, kind, anchor if kind == "assistant" else None,
                              first, last, value))
         self.assertEqual(actual, expected)
-        self.assertEqual(transcript["projection_version"], 2)
+        self.assertEqual(transcript["projection_version"], 3)
 
     def test_creation_observation_is_post_commit_and_cannot_fail_create(self):
         def observer(db_path, conversation_id):
@@ -480,6 +601,59 @@ class ConversationApiCase(unittest.TestCase):
 
 
 class ConversationResourceTest(ConversationApiCase):
+    def test_unknown_harness_new_chat_is_rejected_without_a_row(self) -> None:
+        status, _, error = self.request(
+            "POST",
+            "/api/conversations",
+            body={"shell_id": 1, "harness": "unsupported", "model": None},
+            key="unsupported-without-route",
+        )
+
+        self.assertEqual(status, 422, error)
+        self.assertEqual(error["error"], {
+            "code": "HARNESS_CONVERSATION_UNSUPPORTED",
+            "message": "harness 'unsupported' has no browser conversation adapter",
+            "details": {},
+        })
+        with closing(self.connect()) as con:
+            count = con.execute(
+                "SELECT COUNT(*) FROM conversations WHERE harness='unsupported'"
+            ).fetchone()[0]
+        self.assertEqual(count, 0)
+
+    def test_removed_harness_history_is_ordinary_not_found(self) -> None:
+        conversation_id = "cv_" + "d" * 32
+        with closing(self.connect()) as con:
+            con.execute(
+                "INSERT INTO conversations ("
+                "conversation_id,shell_id,owner_user_id,harness,worktree,state,"
+                "creation_idempotency_key,creation_request_hash,closed_at) "
+                "VALUES (?,1,1,'unsupported',?,'closed','removed-history','removed-hash',"
+                "'2026-08-28 00:01:00')",
+                (conversation_id, str(self.root / ".sc-worktrees/dev")),
+            )
+            con.commit()
+
+        detail_status, _, detail = self.request(
+            "GET", f"/api/conversations/{conversation_id}"
+        )
+        list_status, _, listing = self.request("GET", "/api/conversations")
+
+        self.assertEqual(detail_status, 404, detail)
+        self.assertEqual(detail["error"], {
+            "code": "CONVERSATION_NOT_FOUND",
+            "message": "conversation does not exist",
+            "details": {},
+        })
+        self.assertEqual(list_status, 200, listing)
+        self.assertEqual(listing, {"items": [], "next_cursor": None})
+        with closing(self.connect()) as con:
+            purge_input = con.execute(
+                "SELECT harness,state FROM conversations WHERE conversation_id=?",
+                (conversation_id,),
+            ).fetchone()
+        self.assertEqual(tuple(purge_input), ("unsupported", "closed"))
+
     def test_write_contention_returns_a_retryable_service_error(self) -> None:
         with mock.patch.object(
             conversation_routes.db_driver,
@@ -964,7 +1138,7 @@ class ConversationResourceTest(ConversationApiCase):
             ],
         )
 
-    def test_opencode_uses_the_common_unresolved_model_refusal(self) -> None:
+    def test_opencode_harness_default_and_exact_model_bind_live_native(self) -> None:
         with mock.patch.object(
             conversation_routes.run_mod,
             "flavor_defaults",
@@ -981,13 +1155,13 @@ class ConversationResourceTest(ConversationApiCase):
                 body={"shell_id": 1, "harness": "opencode"},
                 key="opencode-no-model",
             )
-        self.assertEqual(status, 422)
-        self.assertEqual(error["error"]["code"], "HARNESS_ROUTE_INVALID")
-        self.assertEqual(
-            error["error"]["message"],
-            "harness 'opencode' cannot resolve a model: no model was supplied "
-            "and no flavor default exists for it; supply an explicit model",
-        )
+        self.assertEqual(status, 201, error)
+        self.assertEqual(error["route"]["control_state"], "harness-default")
+        self.assertIsNone(error["route"]["model"])
+        self.assertIsNone(error["route"]["effort"])
+
+        with self.connect() as con:
+            self.seed_controlled_route(con, "opencode", "openai/gpt-connected")
 
         status, _, created = self.request(
             "POST",
@@ -1001,11 +1175,80 @@ class ConversationResourceTest(ConversationApiCase):
         )
         self.assertEqual(status, 201, created)
         self.assertEqual(created["route"]["model"], "openai/gpt-connected")
+        self.assertIsNone(created["route"]["effort"])
+        self.assertEqual(created["route"]["contract_version"], 3)
+        self.assertEqual(created["route"]["control_state"], "controlled")
+        self.assertIsNone(created["route"]["native_variant_id"])
+        self.assertIsNone(created["route"]["native_option_id"])
 
-    def test_kimi_create_refuses_unresolved_model_before_writing_a_chat(
+    def test_live_native_conversation_preserves_exact_option_and_missing_writes_nothing(
         self,
     ) -> None:
-        resolver = conversation_routes.run_mod.resolve_headless_route
+        selector = "ollama-cloud/glm-5.2"
+        evidence = self.controlled_evidence("opencode", selector)
+        evidence["advertised_options_by_model"] = {
+            selector: ["MAX.Future", "low"]
+        }
+        with mock.patch.object(
+            conversation_routes.model_catalog,
+            "controlled_route_evidence",
+            return_value=evidence,
+        ):
+            status, _, created = self.request(
+                "POST",
+                "/api/conversations",
+                body={
+                    "shell_id": 1,
+                    "harness": "opencode",
+                    "model": selector,
+                    "effort": "MAX.Future",
+                },
+                key="opencode-exact-native-option",
+            )
+
+        self.assertEqual(status, 201, created)
+        self.assertEqual(created["route"]["contract_version"], 3)
+        self.assertEqual(created["route"]["model"], selector)
+        self.assertEqual(created["route"]["effort"], "MAX.Future")
+        self.assertEqual(created["route"]["native_option_id"], "MAX.Future")
+        with self.connect() as con:
+            before = con.execute(
+                "SELECT COUNT(*) FROM conversations"
+            ).fetchone()[0]
+
+        missing = self.controlled_evidence("opencode", selector)
+        missing["advertised_options_by_model"] = {selector: ["low"]}
+        with mock.patch.object(
+            conversation_routes.model_catalog,
+            "controlled_route_evidence",
+            return_value=missing,
+        ):
+            status, _, refused = self.request(
+                "POST",
+                "/api/conversations",
+                body={
+                    "shell_id": 2,
+                    "harness": "opencode",
+                    "model": selector,
+                    "effort": "MAX.Future",
+                },
+                key="opencode-missing-native-option",
+            )
+
+        self.assertEqual(status, 422, refused)
+        self.assertEqual(refused["error"]["code"], "native_route_unavailable")
+        self.assertEqual(
+            refused["error"]["details"]["current_option_ids"], ["low"]
+        )
+        with self.connect() as con:
+            self.assertEqual(
+                con.execute("SELECT COUNT(*) FROM conversations").fetchone()[0],
+                before,
+            )
+
+    def test_kimi_create_binds_typed_harness_default_without_catalogue(
+        self,
+    ) -> None:
         with mock.patch.object(
             conversation_routes.run_mod,
             "flavor_defaults",
@@ -1015,39 +1258,146 @@ class ConversationResourceTest(ConversationApiCase):
                     "models": {},
                 }
             },
-        ), mock.patch.object(
-            conversation_routes.run_mod,
-            "resolve_headless_route",
-            wraps=resolver,
-        ) as resolve:
+        ):
             status, _, error = self.request(
                 "POST",
                 "/api/conversations",
                 body={"shell_id": 1, "harness": "kimi"},
                 key="kimi-unresolved-model",
             )
-        self.assertEqual(status, 422, error)
-        self.assertEqual(
-            error["error"]["code"],
-            "HARNESS_ROUTE_INVALID",
-        )
-        self.assertEqual(
-            error["error"]["message"],
-            "harness 'kimi' cannot resolve a model: no model was supplied and "
-            "no flavor default exists for it; supply an explicit model",
-        )
-        resolve.assert_called_once_with(
-            harness="kimi",
-            adapter=mock.ANY,
-            flavor_model=None,
-            model=None,
-            effort=None,
-        )
+        self.assertEqual(status, 201, error)
+        self.assertEqual(error["route"]["contract_version"], 2)
+        self.assertEqual(error["route"]["control_state"], "harness-default")
+        self.assertIsNone(error["route"]["model"])
+        self.assertIsNone(error["route"]["effort"])
         with closing(self.connect()) as con:
             self.assertEqual(
                 con.execute("SELECT COUNT(*) FROM conversations").fetchone()[0],
-                0,
+                1,
             )
+
+    def test_harness_default_first_prompt_dispatches_without_route_defaults(
+        self,
+    ) -> None:
+        status, _, created = self.request(
+            "POST",
+            "/api/conversations",
+            body={"shell_id": 1, "harness": "kimi", "model": None},
+            key="kimi-native-default-dispatch",
+        )
+        self.assertEqual(status, 201, created)
+        conversation_id = created["conversation_id"]
+        status, _, accepted = self.request(
+            "POST",
+            f"/api/conversations/{conversation_id}/messages",
+            body={"text": "dispatch without defaults"},
+            key="kimi-native-default-message",
+        )
+        self.assertEqual(status, 202, accepted)
+        with self.connect() as con:
+            con.execute(
+                "INSERT INTO shell_memory_archives "
+                "(archive_id,shell_id,session_id,date) "
+                "VALUES (42,1,'native-default-session','2026-08-17')"
+            )
+
+        prepared_calls = []
+        dispatched_contexts = []
+
+        def prepare(**kwargs):
+            prepared_calls.append(kwargs)
+            binding = kwargs["route_binding"]
+            self.assertEqual(
+                kwargs["binding_digest"],
+                conversation_broker.route_transport.route_bindings.digest_json(
+                    binding
+                ),
+            )
+            self.assertEqual(binding["control_state"], "harness-default")
+            self.assertEqual(binding["transport"], "native-default")
+            self.assertIsNone(binding["requested_model"])
+            self.assertIsNone(binding["effective_effort"])
+            return SimpleNamespace(
+                cwd=str(self.root / ".sc-worktrees" / "dev"),
+                archive_id=42,
+                harness="kimi",
+                model=None,
+                effort=None,
+                env={"SC_HARNESS": "kimi"},
+            )
+
+        class DeterministicAdapter:
+            def start(adapter_self, context, message):
+                dispatched_contexts.append(context)
+                self.assertEqual(message, "dispatch without defaults")
+                return NativeTurn(
+                    harness="kimi",
+                    session_ref="native-default-session",
+                    run_ref="native-default-run",
+                    worktree=context.checked_worktree(),
+                )
+
+            def stream(adapter_self, _turn):
+                yield NormalizedEvent("run.completed", {"status": "completed"})
+
+            def close(adapter_self):
+                pass
+
+        preparer = conversation_launch.ConversationLaunchPreparer(
+            self.db_path,
+            prepare_launch=prepare,
+            liveness=lambda: {"supported": True, "processes": []},
+        )
+        broker = conversation_broker.ConversationBroker(
+            self.db_path,
+            adapter_factory=lambda _harness: DeterministicAdapter(),
+            launch_preparer=preparer,
+            owner="native-default-test-broker",
+            heartbeat_seconds=60,
+            recovery_seconds=60,
+        )
+        broker.start()
+        self.addCleanup(broker.join, 2)
+        self.addCleanup(broker.stop)
+        self.assertTrue(broker.wait_started())
+        broker.notify()
+
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline:
+            with closing(self.connect()) as con:
+                row = con.execute(
+                    "SELECT state,error_code FROM conversation_runs "
+                    "WHERE conversation_id=?",
+                    (conversation_id,),
+                ).fetchone()
+            if row is not None and row["state"] == "succeeded":
+                break
+            time.sleep(0.01)
+        else:
+            self.fail("Harness-default prompt did not dispatch successfully")
+
+        broker.stop()
+        broker.join(2)
+        self.assertFalse(broker.is_alive())
+        self.assertEqual(len(prepared_calls), 1)
+        self.assertEqual(len(dispatched_contexts), 1)
+        context = dispatched_contexts[0]
+        self.assertIsNone(context.model)
+        self.assertIsNone(context.effort)
+        self.assertEqual(context.route_binding["control_state"], "harness-default")
+        self.assertRegex(context.binding_digest, r"^[0-9a-f]{64}$")
+        with closing(self.connect()) as con:
+            run = con.execute(
+                "SELECT state,error_code,error_detail FROM conversation_runs "
+                "WHERE conversation_id=?",
+                (conversation_id,),
+            ).fetchone()
+            run_count = con.execute(
+                "SELECT COUNT(*) FROM conversation_runs WHERE conversation_id=?",
+                (conversation_id,),
+            ).fetchone()[0]
+        self.assertEqual(tuple(run), ("succeeded", None, None))
+        self.assertEqual(run_count, 1)
 
     def test_create_is_idempotent_and_never_exposes_native_identity(self) -> None:
         first = self.create(title="API")
@@ -1057,6 +1407,10 @@ class ConversationResourceTest(ConversationApiCase):
         self.assertNotIn("harness_session_ref", json.dumps(first))
         self.assertNotIn("mode", first)
         self.assertEqual(first["route"]["harness"], "codex")
+        self.assertEqual(first["route"]["contract_version"], 2)
+        self.assertEqual(first["route"]["control_state"], "controlled")
+        self.assertFalse(first["route"]["legacy"])
+        self.assertRegex(first["route"]["binding_digest"], r"^[0-9a-f]{64}$")
 
         status, _, error = self.request(
             "POST",
@@ -1075,6 +1429,194 @@ class ConversationResourceTest(ConversationApiCase):
         con.close()
         self.assertEqual(count, 1)
         self.assertEqual(tuple(event), (1, "conversation.created"))
+
+    def test_controlled_replay_uses_stored_binding_after_catalogue_drift(self) -> None:
+        first = self.create(key="controlled-replay")
+        with self.connect() as con:
+            con.execute("UPDATE model_routes SET stale=1")
+        with mock.patch.object(
+            conversation_routes.model_catalog,
+            "harness_runtime_status",
+            side_effect=AssertionError("replay must not probe today's runtime"),
+        ) as runtime_probe:
+            status, _, replay = self.request(
+                "POST",
+                "/api/conversations",
+                body={"shell_id": 1, "harness": "codex", "effort": " HIGH "},
+                key="controlled-replay",
+            )
+        self.assertEqual(status, 201, replay)
+        self.assertEqual(replay, first)
+        runtime_probe.assert_not_called()
+
+    def test_explicit_model_omission_means_high_on_replay(self) -> None:
+        with self.connect() as con:
+            model = con.execute(
+                "SELECT model FROM flavor_defaults "
+                "WHERE flavor='dev' AND harness='codex'"
+            ).fetchone()[0]
+        status, _, first = self.request(
+            "POST", "/api/conversations",
+            body={"shell_id": 1, "harness": "codex",
+                  "model": model, "effort": "low"},
+            key="explicit-low",
+        )
+        self.assertEqual(status, 201, first)
+        self.assertEqual(first["route"]["effort"], "low")
+
+        status, _, error = self.request(
+            "POST", "/api/conversations",
+            body={"shell_id": 1, "harness": "codex", "model": model},
+            key="explicit-low",
+        )
+        self.assertEqual(status, 409, error)
+        self.assertEqual(
+            error["error"]["code"], "CONVERSATION_IDEMPOTENCY_CONFLICT")
+
+    def test_harness_default_null_replay_and_nonnull_refusal(self) -> None:
+        body = {"shell_id": 1, "harness": "kimi", "model": None}
+        status, _, first = self.request(
+            "POST", "/api/conversations", body=body, key="default-replay",
+        )
+        self.assertEqual(status, 201, first)
+        self.assertEqual(first["route"]["control_state"], "harness-default")
+
+        status, _, replay = self.request(
+            "POST", "/api/conversations",
+            body={**body, "effort": None}, key="default-replay",
+        )
+        self.assertEqual(status, 201, replay)
+        self.assertEqual(replay, first)
+
+        status, _, error = self.request(
+            "POST", "/api/conversations",
+            body={**body, "effort": "high"}, key="default-replay",
+        )
+        self.assertEqual(status, 422, error)
+        self.assertEqual(
+            error["error"]["code"], "unsupported_thinking_level")
+        with self.connect() as con:
+            rows = con.execute(
+                "SELECT route_contract_version,route_binding,model,effort "
+                "FROM conversations WHERE creation_idempotency_key=?",
+                ("default-replay",),
+            ).fetchall()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual((rows[0]["route_contract_version"], rows[0]["model"],
+                          rows[0]["effort"]), (2, None, None))
+        self.assertEqual(
+            json.loads(rows[0]["route_binding"])["control_state"],
+            "harness-default",
+        )
+
+    def test_unsupported_controlled_effort_persists_no_conversation(self) -> None:
+        status, _, error = self.request(
+            "POST", "/api/conversations",
+            body={"shell_id": 1, "harness": "codex", "effort": "max"},
+            key="unsupported-effort",
+        )
+        self.assertEqual(status, 422, error)
+        self.assertEqual(
+            error["error"]["code"], "unsupported_thinking_level")
+        with self.connect() as con:
+            self.assertEqual(
+                con.execute(
+                    "SELECT COUNT(*) FROM conversations "
+                    "WHERE creation_idempotency_key='unsupported-effort'"
+                ).fetchone()[0],
+                0,
+            )
+
+    def test_model_default_binds_route_with_no_advertised_efforts(self) -> None:
+        # Spec #160: conversation create admits 'default' on a route whose
+        # supported_efforts list is empty, and persists the controlled
+        # binding with requested=effective='default' and no effort digest.
+        with self.connect() as con:
+            status = self.runtime_status("codex")
+            now = datetime.now(timezone.utc).isoformat()
+            con.execute(
+                "INSERT INTO model_routes ("
+                "harness,selector,provider_model,source,availability,"
+                "headless_supported,high_effort_supported,supported_efforts,"
+                "default_effort,cli_version,last_seen_at,stale,generation_id,"
+                "evidence_kind,evidence_digest,source_fingerprint,"
+                "harness_version,harness_compatibility,selector_binding,"
+                "effort_metadata,adapter_metadata) VALUES ("
+                "'codex','gpt-plain','gpt-plain','codex-cache','available',"
+                "1,0,'[]',NULL,?,?,0,?,"
+                "'codex-model-cache',?,?,?,'verified',?,?,?)",
+                (
+                    f"codex {status['version']}", now, "a" * 32,
+                    "e" * 64, "f" * 64, status["version"],
+                    json.dumps({"kind": "exact-model", "selector": "gpt-plain"}),
+                    json.dumps({
+                        "supported": [], "default": None,
+                        "digests": {}, "native_variant_ids": {},
+                    }),
+                    "{}",
+                ),
+            )
+        status, _, created = self.request(
+            "POST", "/api/conversations",
+            body={"shell_id": 1, "harness": "codex", "model": "gpt-plain",
+                  "effort": " DEFAULT "},
+            key="model-default",
+        )
+        self.assertEqual(status, 201, created)
+        self.assertEqual(created["route"]["effort"], "default")
+        self.assertEqual(created["route"]["control_state"], "controlled")
+        with self.connect() as con:
+            row = con.execute(
+                "SELECT route_binding FROM conversations "
+                "WHERE creation_idempotency_key='model-default'"
+            ).fetchone()
+        binding = json.loads(row["route_binding"])
+        conversation_routes.route_bindings.validate_v2_binding(binding)
+        self.assertEqual(binding["requested_effort"], "default")
+        self.assertEqual(binding["effective_effort"], "default")
+        self.assertIsNone(binding["evidence_digest"])
+        self.assertEqual(
+            conversation_routes.route_bindings.digest_json(binding),
+            created["route"]["binding_digest"],
+        )
+
+        status, _, error = self.request(
+            "POST", "/api/conversations",
+            body={"shell_id": 1, "harness": "codex", "model": "gpt-plain",
+                  "effort": "high"},
+            key="model-default-named",
+        )
+        self.assertEqual(status, 422, error)
+        self.assertEqual(
+            error["error"]["code"], "unsupported_thinking_level")
+        self.assertEqual(
+            error["error"]["details"]["default_effort"], "default")
+
+    def test_legacy_creation_key_replays_without_v2_resolution(self) -> None:
+        with self.connect() as con:
+            con.execute(
+                "INSERT INTO conversations "
+                "(conversation_id,shell_id,owner_user_id,harness,model,effort,"
+                "worktree,title,creation_idempotency_key,creation_request_hash) "
+                "VALUES ('cv_11111111111111111111111111111111',1,1,'codex',"
+                "'historical-model','MiXeD',?,'Legacy','legacy-key','old-hash')",
+                (str(self.root / ".sc-worktrees" / "dev"),),
+            )
+        with mock.patch.object(
+            conversation_routes.model_catalog,
+            "harness_runtime_status",
+            side_effect=AssertionError("legacy replay must not resolve v2"),
+        ) as runtime_probe:
+            status, _, replay = self.request(
+                "POST", "/api/conversations",
+                body={"shell_id": 1, "harness": "codex", "title": "Legacy"},
+                key="legacy-key",
+            )
+        self.assertEqual(status, 201, replay)
+        self.assertTrue(replay["route"]["legacy"])
+        self.assertEqual(replay["route"]["effort"], "MiXeD")
+        self.assertIsNone(replay["route"]["binding_digest"])
+        runtime_probe.assert_not_called()
 
     def test_fnb_close_closes_sprint_chat_and_enables_coordinate_mode(
         self,
@@ -2033,7 +2575,7 @@ class ConversationPerformanceFixtureTest(ConversationApiCase):
         self.assertEqual(status, 200, transcript)
         self.assertEqual(headers["Cache-Control"], "no-store")
         self.assertEqual(transcript["conversation_id"], conversation_id)
-        self.assertEqual(transcript["projection_version"], 2)
+        self.assertEqual(transcript["projection_version"], 3)
         self.assertEqual(transcript["through_sequence"], through_sequence)
         self.assertEqual(transcript["truncation"], None)
         self.assertEqual(
@@ -2069,6 +2611,217 @@ class ConversationPerformanceFixtureTest(ConversationApiCase):
                 ).fetchone()[0],
                 source_rows,
             )
+
+    def test_transcript_pages_twenty_complete_turns_with_scoped_cursors(
+        self,
+    ) -> None:
+        with closing(self.connect()) as con:
+            conversation_id = self.seed_conversation(
+                con,
+                number=704,
+                state="closed",
+            )
+            other_conversation_id = self.seed_conversation(
+                con,
+                number=705,
+                state="closed",
+            )
+            foreign_conversation_id = self.seed_conversation(
+                con,
+                number=706,
+                owner_user_id=2,
+                state="closed",
+            )
+            self.seed_transcript(
+                con,
+                conversation_id=conversation_id,
+                turns=45,
+                deltas_per_turn=1,
+            )
+            con.commit()
+
+        pages = []
+        cursor = None
+        for expected_prompts in (
+            [f"prompt {index}" for index in range(25, 45)],
+            [f"prompt {index}" for index in range(5, 25)],
+            [f"prompt {index}" for index in range(5)],
+        ):
+            suffix = f"?cursor={cursor}" if cursor else ""
+            status, _, transcript = self.request(
+                "GET",
+                f"/api/conversations/{conversation_id}/transcript{suffix}",
+            )
+            self.assertEqual(status, 200, transcript)
+            users = [
+                item for item in transcript["items"] if item["kind"] == "user"
+            ]
+            assistants = [
+                item
+                for item in transcript["items"]
+                if item["kind"] == "assistant"
+            ]
+            self.assertEqual([item["text"] for item in users], expected_prompts)
+            self.assertEqual(len(assistants), len(expected_prompts))
+            self.assertEqual(
+                [item["message_id"] for item in assistants],
+                [item["message_id"] for item in users],
+            )
+            self.assertTrue(all(item["text"] == "x" for item in assistants))
+            pages.append({item["message_id"] for item in users})
+            cursor = transcript["older_cursor"]
+
+        self.assertIsNone(cursor)
+        self.assertEqual(len(set().union(*pages)), 45)
+        self.assertTrue(all(pages[left].isdisjoint(pages[right])
+                            for left in range(3)
+                            for right in range(left + 1, 3)))
+
+        first_status, _, first_page = self.request(
+            "GET",
+            f"/api/conversations/{conversation_id}/transcript",
+        )
+        self.assertEqual(first_status, 200, first_page)
+        scoped_cursor = first_page["older_cursor"]
+        for path in (
+            (
+                f"/api/conversations/{other_conversation_id}/transcript"
+                f"?cursor={scoped_cursor}"
+            ),
+            (
+                f"/api/conversations/{conversation_id}/transcript"
+                f"?cursor={scoped_cursor}&cursor={scoped_cursor}"
+            ),
+            f"/api/conversations/{conversation_id}/transcript?cursor=not-a-cursor",
+        ):
+            with self.subTest(path=path):
+                status, _, error = self.request("GET", path)
+                self.assertEqual(status, 422, error)
+                self.assertEqual(error["error"]["code"], "CURSOR_INVALID")
+
+        status, _, error = self.request(
+            "GET",
+            f"/api/conversations/{foreign_conversation_id}/transcript"
+            f"?cursor={scoped_cursor}",
+        )
+        self.assertEqual(status, 404, error)
+        self.assertEqual(error["error"]["code"], "CONVERSATION_NOT_FOUND")
+
+    def test_transcript_attaches_exact_context_tokens_to_assistant_only(self) -> None:
+        with closing(self.connect()) as con:
+            conversation_id = self.seed_conversation(
+                con,
+                number=701,
+                state="closed",
+            )
+            _message_id, _run_id, _through = self.seed_segmented_trace(
+                con,
+                conversation_id=conversation_id,
+                events=(
+                    ("assistant.delta", {"text": "answer"}),
+                    ("tool.started", {"tool_ref": "tool-1", "name": "Shell"}),
+                    (
+                        "usage",
+                        {
+                            "tokens": {
+                                "input_tokens": 10000,
+                                "output_tokens": 345,
+                                "cache_read_tokens": 2000,
+                                "cache_write_tokens": 0,
+                            }
+                        },
+                    ),
+                ),
+            )
+            con.commit()
+
+        status, _, transcript = self.request(
+            "GET",
+            f"/api/conversations/{conversation_id}/transcript",
+        )
+
+        self.assertEqual(status, 200, transcript)
+        self.assertEqual(len(transcript["items"]), 2)
+        user, assistant = transcript["items"]
+        self.assertEqual(user["kind"], "user")
+        self.assertNotIn("context_tokens", user)
+        self.assertEqual(assistant["kind"], "assistant")
+        self.assertEqual(assistant["text"], "answer")
+        self.assertEqual(assistant["context_tokens"], 12345)
+
+    def test_reasoning_and_answer_deltas_remain_distinct_ordered_segments(self) -> None:
+        with closing(self.connect()) as con:
+            conversation_id = self.seed_conversation(
+                con,
+                number=702,
+                state="closed",
+            )
+            _message_id, run_id, _through = self.seed_segmented_trace(
+                con,
+                conversation_id=conversation_id,
+                events=(
+                    ("assistant.delta", {"text": "answer one", "segment": "answer"}),
+                    ("assistant.delta", {"text": "reason ", "segment": "reasoning"}),
+                    ("assistant.delta", {"text": "continued", "segment": "reasoning"}),
+                    ("assistant.delta", {"text": "answer two", "segment": "answer"}),
+                ),
+            )
+            con.commit()
+
+        status, _, transcript = self.request(
+            "GET",
+            f"/api/conversations/{conversation_id}/transcript",
+        )
+
+        self.assertEqual(status, 200, transcript)
+        assistants = [
+            item for item in transcript["items"] if item["kind"] == "assistant"
+        ]
+        self.assertEqual(
+            [
+                (
+                    item["item_id"],
+                    item["segment"],
+                    item["text"],
+                    item["first_sequence"],
+                    item["last_sequence"],
+                )
+                for item in assistants
+            ],
+            [
+                (f"run:{run_id}:assistant:0", "answer", "answer one", 3, 3),
+                (f"run:{run_id}:assistant:4", "reasoning", "reason continued", 4, 5),
+                (f"run:{run_id}:assistant:6", "answer", "answer two", 6, 6),
+            ],
+        )
+        self.assertNotIn("reasoning", assistants[0]["text"])
+
+    def test_unknown_assistant_segment_fails_closed_to_answer_rendering(self) -> None:
+        with closing(self.connect()) as con:
+            conversation_id = self.seed_conversation(
+                con,
+                number=703,
+                state="closed",
+            )
+            self.seed_segmented_trace(
+                con,
+                conversation_id=conversation_id,
+                events=(("assistant.delta", {"text": "visible", "segment": "future"}),),
+            )
+            con.commit()
+
+        status, _, transcript = self.request(
+            "GET",
+            f"/api/conversations/{conversation_id}/transcript",
+        )
+
+        self.assertEqual(status, 200, transcript)
+        assistants = [
+            item for item in transcript["items"] if item["kind"] == "assistant"
+        ]
+        self.assertEqual(len(assistants), 1)
+        self.assertEqual(assistants[0]["segment"], "answer")
+        self.assertEqual(assistants[0]["text"], "visible")
 
     def test_segmented_plain_prose_keeps_one_stable_anchor_zero_item(self) -> None:
         self.assert_historical_segment_trace("plain_prose")

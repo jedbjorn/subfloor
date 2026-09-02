@@ -58,6 +58,73 @@ def commit(root: Path, message: str) -> str:
 
 
 class LegacyUpdateCompatTest(unittest.TestCase):
+    def test_projection_and_render_inconsistencies_are_advisory(self) -> None:
+        connection = sqlite3.connect(":memory:")
+        output = io.StringIO()
+        with mock.patch.object(
+            update.db_driver, "connect", return_value=connection
+        ), mock.patch.object(
+            update.skill_projection,
+            "reconcile_existing_checkouts",
+            side_effect=update.skill_projection.ProjectionError("unsafe skill root"),
+        ), mock.patch.object(
+            update.flat,
+            "render_skills_catalogue",
+            side_effect=ValueError("catalogue collision"),
+        ), mock.patch.object(
+            update.flat,
+            "document_render_issues",
+            return_value=["duplicate document path: IDs 1 and 2"],
+        ), contextlib.redirect_stdout(output):
+            update.reset_update_report()
+            summary = update.reconcile_skill_projections()
+            update.render_update_report()
+
+        self.assertFalse(summary["complete"])
+        self.assertEqual(
+            summary["render_issues"],
+            ["duplicate document path: IDs 1 and 2"],
+        )
+        rendered = output.getvalue()
+        self.assertIn("[skill projection]", rendered)
+        self.assertIn("[skill catalogue]", rendered)
+        self.assertIn("[document render]", rendered)
+        self.assertIn("update report:", rendered)
+
+    def test_installed_repo_reconciles_managed_host_wrapper(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "fork"
+            engine = root / ".super-coder"
+            engine.mkdir(parents=True)
+            (engine / "instance.json").write_text('{"installed_at":"2026-08-09"}\n')
+            with mock.patch.multiple(
+                update_compat,
+                REPO_ROOT=root,
+                ENGINE=engine,
+            ), mock.patch.object(
+                update_compat.sc_wrapper, "register_install", return_value="ready"
+            ) as register, contextlib.redirect_stdout(io.StringIO()) as output:
+                update_compat.reconcile_host_wrapper()
+
+            register.assert_called_once_with(root)
+            self.assertIn("managed host sc wrapper: ready", output.getvalue())
+
+    def test_uninstalled_repo_does_not_claim_host_wrapper(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "fork"
+            engine = root / ".super-coder"
+            engine.mkdir(parents=True)
+            with mock.patch.multiple(
+                update_compat,
+                REPO_ROOT=root,
+                ENGINE=engine,
+            ), mock.patch.object(
+                update_compat.sc_wrapper, "register_install"
+            ) as register:
+                update_compat.reconcile_host_wrapper()
+
+            register.assert_not_called()
+
     def make_ref_boundary(self, root: Path) -> tuple[str, str]:
         scripts = root / ".super-coder" / "scripts"
         scripts.mkdir(parents=True)
@@ -193,6 +260,7 @@ class LegacyUpdateCompatTest(unittest.TestCase):
             shutil.copy2(
                 SCRIPTS / "update_compat.py", scripts / "update_compat.py"
             )
+            shutil.copy2(SCRIPTS / "sc_wrapper.py", scripts / "sc_wrapper.py")
             (scripts / "update.py").write_text(
                 "import os\n"
                 "from pathlib import Path\n"
@@ -282,6 +350,15 @@ class LegacyUpdateCompatTest(unittest.TestCase):
             fixture = build_dirty_skill_fork(Path(td) / "downstream")
             with closing(sqlite3.connect(fixture.database)) as con:
                 update.seed_skills.reconcile_tombstoned_skills(con)
+                con.executemany(
+                    "INSERT INTO documents "
+                    "(feature_id,kind,seq,title,body,render_path) "
+                    "VALUES (NULL,'doc',?,?,?,?)",
+                    (
+                        (9001, "Legacy owner", "owner", "docs_sc/shared.md"),
+                        (9002, "Legacy duplicate", "duplicate", "docs_sc//shared.md"),
+                    ),
+                )
                 con.commit()
 
             shell_authored = (
@@ -291,7 +368,7 @@ class LegacyUpdateCompatTest(unittest.TestCase):
             shell_authored.parent.mkdir()
             shell_authored.write_text("shell-owned\n")
             real_projection = update.skill_projection.reconcile_existing_checkouts
-            real_catalogue = update.flat.render_visibility
+            real_catalogue = update.flat.render_skills_catalogue
 
             def reconcile(con):
                 return real_projection(con, repo_root=fixture.root)
@@ -313,14 +390,14 @@ class LegacyUpdateCompatTest(unittest.TestCase):
                 "reconcile_existing_checkouts",
                 side_effect=reconcile,
             ) as projection, mock.patch.object(
-                update.flat, "render_visibility", side_effect=render_catalogue
+                update.flat, "render_skills_catalogue", side_effect=render_catalogue
             ), mock.patch.object(
                 update, "repair_callable_dispatcher"
             ), mock.patch.object(
                 update, "reconcile_linked_dispatchers"
             ), mock.patch.object(
                 update_compat, "needs_legacy_bridge", return_value=(False, None)
-            ):
+            ), contextlib.redirect_stdout(io.StringIO()) as output:
                 self.assertEqual(0, update_compat.main())
                 first_projection = {
                     str(path.relative_to(fixture.root)): path.read_bytes()
@@ -336,6 +413,11 @@ class LegacyUpdateCompatTest(unittest.TestCase):
                 (fixture.root / ".sc-state/engine.ref").read_text(),
             )
             self.assertEqual(shell_authored.read_text(), "shell-owned\n")
+            self.assertIn("[document render]", output.getvalue())
+            self.assertIn("duplicate document render path", output.getvalue())
+            self.assertFalse(
+                fixture.catalogue_root.parent.joinpath("docs_sc/shared.md").exists()
+            )
             self.assertEqual(
                 {
                     str(path.relative_to(fixture.root)): path.read_bytes()

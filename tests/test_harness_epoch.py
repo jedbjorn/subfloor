@@ -19,7 +19,9 @@ from __future__ import annotations
 
 import contextlib
 import io
+import json
 import os
+import pwd
 import re
 import shutil
 import subprocess
@@ -184,6 +186,35 @@ class HarnessEpochDockerfile(unittest.TestCase):
             "durable Codex state stays mounted; isolate its executable",
         )
 
+class RetainedHarnessInstall(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        sys.path.insert(0, str(ENGINE / "scripts"))
+        import install as install_mod  # noqa: PLC0415
+
+        cls.install = install_mod
+
+    def test_only_retained_harnesses_have_installers_and_binaries(self):
+        retained = {"claude", "codex", "kimi", "opencode", "vibe"}
+
+        self.assertEqual(set(self.install.HARNESS_INSTALL), retained)
+        self.assertEqual(set(self.install.HARNESS_BIN), retained)
+
+    def test_missing_curl_blocks_each_retained_install_independently(self):
+        def available(command: str):
+            unavailable = {"curl", *self.install.HARNESS_INSTALL}
+            return None if command in unavailable else f"/bin/{command}"
+
+        with mock.patch.object(self.install.shutil, "which", side_effect=available), \
+                mock.patch.dict(
+                    self.install.HARNESS_BIN,
+                    {name: Path(f"/definitely/missing/{name}") for name in self.install.HARNESS_BIN},
+                    clear=True,
+                ):
+            status = self.install.ensure_harnesses()
+
+        self.assertEqual(status, {name: "no-curl" for name in self.install.HARNESS_INSTALL})
+
 
 class ScFixture:
     """A throwaway fork tree with a fake docker, enough to drive `sc`'s harness
@@ -197,6 +228,7 @@ class ScFixture:
         self.fakebin = Path(self._tmp.name) / "bin"
         self.log = Path(self._tmp.name) / "calls.log"
         self.epoch_file = Path(self._tmp.name) / "state" / "harness-epoch"
+        self.image_state = Path(self._tmp.name) / "image.json"
         self.scripts.mkdir(parents=True)
         self.fakebin.mkdir()
         self.log.touch()
@@ -206,16 +238,30 @@ class ScFixture:
         for script in (
             "dispatch.sh",
             "install.py",
+            "engine_paths.py",
             "callable_floor.py",
             "engine_manifest.py",
             "global_pointer.py",
+            "instance_state.py",
             "ports.py",
             "artifact_policy.py",
             "harness_versions.py",
+            "devkit.py",
+            "runtime_flags.py",
+            "sandbox_devkit.py",
             "cli_entry.py",
         ):
             shutil.copy2(ENGINE / "scripts" / script, self.scripts / script)
+        (self.engine / "assets").mkdir()
+        shutil.copy2(
+            ENGINE / "assets" / "github_known_hosts",
+            self.engine / "assets" / "github_known_hosts",
+        )
         (self.engine / "Dockerfile").write_text("FROM scratch\n")
+        (self.root / ".sc-state").mkdir()
+        (self.root / ".sc-state" / "engine.ref").write_text("a" * 40 + "\n")
+        (self.root / ".gitignore").write_text("/.sc-state/local/\n")
+        subprocess.run(("git", "init", "-q", str(self.root)), check=True)
         self._write_fake_docker()
         # Stub curl too. The no-docker branch of update-harnesses runs the real
         # vendor installers; a regression that took that branch under docker
@@ -238,8 +284,27 @@ class ScFixture:
             "SC_TEST_LOG": str(self.log),
             "SC_TEST_LABEL": "",
             "SC_TEST_RUNNING": "1",
+            "SC_TEST_IMAGE_STATE": str(self.image_state),
             "NO_COLOR": "1",
         })
+        from sandbox_devkit import image_plan  # noqa: PLC0415
+
+        plan = image_plan(
+            self.root,
+            self.engine,
+            "0",
+            user=pwd.getpwuid(os.getuid()).pw_name,
+            uid=str(os.getuid()),
+            gid=str(os.getgid()),
+        )
+        self.image_state.parent.mkdir(parents=True, exist_ok=True)
+        self.image_state.write_text(json.dumps([{
+            "Id": "sha256:" + "b" * 64,
+            "Config": {"Labels": {
+                **plan.runtime_labels,
+                "sc.parent_id": "sha256:" + "a" * 64,
+            }},
+        }]))
 
     def close(self) -> None:
         self._tmp.cleanup()
@@ -259,8 +324,36 @@ class ScFixture:
             printf '\\n' >> "$SC_TEST_LOG"
             case "$1" in
               info) exit 0 ;;
-              build) exit 0 ;;
-              image) printf '%s\\n' "$SC_TEST_LABEL"; exit 0 ;;
+              build)
+                labels="$SC_TEST_IMAGE_STATE.labels"
+                : > "$labels"
+                while [ "$#" -gt 0 ]; do
+                  if [ "$1" = --label ]; then
+                    printf '%s\\n' "$2" >> "$labels"
+                    shift 2
+                  else
+                    shift
+                  fi
+                done
+                printf '[{"Id":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","Config":{"Labels":{' > "$SC_TEST_IMAGE_STATE"
+                first=1
+                while IFS= read -r label; do
+                  key="${label%%=*}"
+                  value="${label#*=}"
+                  [ "$first" -eq 1 ] || printf ',' >> "$SC_TEST_IMAGE_STATE"
+                  printf '"%s":"%s"' "$key" "$value" >> "$SC_TEST_IMAGE_STATE"
+                  first=0
+                done < "$labels"
+                printf '}}}]' >> "$SC_TEST_IMAGE_STATE"
+                exit 0 ;;
+              image)
+                case " $* " in
+                  *" --format "*) printf '%s\\n' "$SC_TEST_LABEL" ;;
+                  *" python:3.14-slim "*)
+                    printf '[{"Id":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","Config":{"Labels":{}}}]\\n' ;;
+                  *) cat "$SC_TEST_IMAGE_STATE" ;;
+                esac
+                exit 0 ;;
               inspect) [ -n "$SC_TEST_RUNNING" ] && echo true || echo false; exit 0 ;;
               exec)
                 # `docker exec <name> claude --version` — the launch banner probe.

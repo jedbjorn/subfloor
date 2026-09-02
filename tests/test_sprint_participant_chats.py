@@ -66,6 +66,7 @@ def substrate(database: str = ":memory:"):
           creation_idempotency_key TEXT NOT NULL,
           creation_request_hash TEXT NOT NULL,
           conversation_scope TEXT NOT NULL DEFAULT 'normal',
+          created_at TEXT NOT NULL DEFAULT (datetime('now')),
           closed_at TEXT,
           last_activity_at TEXT NOT NULL DEFAULT (datetime('now')),
           version INTEGER NOT NULL DEFAULT 1,
@@ -356,6 +357,7 @@ def test_closed_planner_reenter_persists_canonical_default_route(tmp_path) -> No
     assert archive_id == 42
     assert context.model == "planner-test"
     assert context.effort == "high"
+    assert context.env["SC_CONVERSATION_SURFACE"] == "sprint"
     assert tuple(
         stored[field] for field in ("harness", "provider", "model", "effort")
     ) == (
@@ -377,6 +379,29 @@ def test_closed_planner_reenter_persists_canonical_default_route(tmp_path) -> No
     assert stored["creation_request_hash"] == hashlib.sha256(
         json.dumps(expected_request, separators=(",", ":"), sort_keys=True).encode()
     ).hexdigest()
+
+
+def test_non_sprint_wake_ignores_prior_removed_harness_route() -> None:
+    with substrate() as con:
+        con.execute(
+            "INSERT INTO conversations ("
+            "conversation_id,shell_id,owner_user_id,harness,provider,model,effort,"
+            "worktree,state,title,creation_idempotency_key,creation_request_hash,"
+            "created_at,closed_at) VALUES ("
+            "'cv_removed',10,1,'unsupported','example','legacy-chat','high',"
+            "'/removed','closed','Removed history','removed','removed-hash',"
+            "'2026-08-28 00:00:00','2026-08-28 00:01:00')"
+        )
+        con.commit()
+
+        prepared = sprint_participant_chats.prepare_shell_wake_conversation(con, 10)
+
+    assert (
+        prepared.harness,
+        prepared.provider,
+        prepared.model,
+        prepared.effort,
+    ) == ("codex", "openai", "gpt-test", "high")
 
 
 def test_explicit_participant_route_is_preserved_byte_for_byte() -> None:

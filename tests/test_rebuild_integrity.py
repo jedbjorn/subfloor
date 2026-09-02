@@ -15,6 +15,7 @@ SCHEMA = ENGINE / "schema.sql"
 MIGRATIONS = ENGINE / "migrations"
 sys.path.insert(0, str(ENGINE / "scripts"))
 import rebuild  # noqa: E402
+import seed_skills  # noqa: E402
 
 
 def apply_engine_schema(path: Path) -> None:
@@ -31,7 +32,76 @@ def digest(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def legacy_dev_kit() -> tuple:
+    con = sqlite3.connect(":memory:")
+    try:
+        con.executescript(SCHEMA.read_text())
+        for migration in sorted(MIGRATIONS.glob("*.sql")):
+            if migration.name >= "0241_":
+                break
+            con.executescript(migration.read_text())
+        return con.execute(
+            "SELECT description,category,command,common,content,is_deleted "
+            "FROM skills WHERE name='dev_kit'"
+        ).fetchone()
+    finally:
+        con.close()
+
+
 class RebuildIntegrityTest(unittest.TestCase):
+    def test_post_snapshot_reconciles_only_untouched_legacy_dev_kit(self):
+        legacy = legacy_dev_kit()
+        desired = seed_skills.parse_skill(seed_skills.DEV_KIT_STARTER)
+        for customization in ("", "\nFork-owned customization."):
+            with self.subTest(
+                customization=bool(customization)
+            ), tempfile.TemporaryDirectory() as raw_tmp:
+                tmp = Path(raw_tmp)
+                outgoing = tmp / "shell_db.db"
+                snapshot = tmp / "content.sql"
+                apply_engine_schema(outgoing)
+                body = legacy[4] + customization
+                values = (*legacy[:4], body, legacy[5])
+                snapshot.write_text(
+                    "BEGIN;\n"
+                    "INSERT INTO skills "
+                    "(name,description,category,command,common,content,is_deleted) "
+                    "VALUES ('dev_kit',{},{},{},{},{},{}) "
+                    "ON CONFLICT(name) DO UPDATE SET "
+                    "description=excluded.description,category=excluded.category,"
+                    "command=excluded.command,common=excluded.common,"
+                    "content=excluded.content,is_deleted=excluded.is_deleted;\n"
+                    "COMMIT;\n".format(
+                        *(seed_skills.sql_str(value) for value in values)
+                    )
+                )
+
+                with mock.patch.multiple(
+                    rebuild,
+                    ENGINE=tmp / ".super-coder",
+                    DB_PATH=outgoing,
+                    REPO_ROOT=tmp,
+                    SNAPSHOT=snapshot,
+                    SNAPSHOT_LEGACY=tmp / "missing-content.sql",
+                ), mock.patch.object(rebuild.map_repo, "main"):
+                    self.assertEqual(rebuild.main(["--no-backup"]), 0)
+
+                con = sqlite3.connect(outgoing)
+                try:
+                    actual = con.execute(
+                        "SELECT description,category,command,common,content,"
+                        "is_deleted FROM skills WHERE name='dev_kit'"
+                    ).fetchone()
+                finally:
+                    con.close()
+                expected = (
+                    values
+                    if customization
+                    else tuple(desired[field] for field in seed_skills.SEED_FIELDS)
+                    + (0,)
+                )
+                self.assertEqual(actual, expected)
+
     def test_valid_candidate_atomically_replaces_outgoing_db(self):
         with tempfile.TemporaryDirectory() as raw_tmp:
             tmp = Path(raw_tmp)

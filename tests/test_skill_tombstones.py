@@ -27,8 +27,23 @@ TOMBSTONES = [
     "sprint_orchestration_recover",
     "sprint_review",
     "engine_surgery",
+    "agents",
+    "api-design",
+    "app_deploy_setup",
+    "authoring_syntax",
+    "blueprint",
+    "configure_winbox",
+    "database-migrations",
+    "local_skill_management",
+    "migration_management",
+    "pm2",
+    "query_authoring_pg",
+    "tailscale",
+    "test_authoring",
     "test_authoring_pg",
     "test_authoring_sqlite",
+    "windows_devkit",
+    "windows_vm_gui",
 ]
 
 DDL = """
@@ -89,6 +104,10 @@ class RegistryTest(unittest.TestCase):
                 with self.assertRaises((TypeError, ValueError)):
                     seed_skills.tombstoned_skill_names()
 
+    def test_registry_accepts_existing_hyphenated_catalogue_names(self):
+        self.write_registry(["api-design"])
+        self.assertEqual(seed_skills.tombstoned_skill_names(), ["api-design"])
+
     def test_namespace_validation_rejects_active_overlap(self):
         self.write_registry(["retired_name"])
         with self.assertRaisesRegex(ValueError, "retired_name"):
@@ -111,6 +130,37 @@ class RegistryTest(unittest.TestCase):
             seed_skills.validate_upstream_skill_namespace(sorted(seeded)),
             TOMBSTONES,
         )
+
+    def test_ai_consumed_sources_do_not_route_to_tombstoned_skills(self):
+        roots = (
+            ENGINE / "assets" / "skills",
+            ENGINE / "assets" / "seed" / "skills",
+            ENGINE / "templates",
+        )
+        findings = {}
+        for root in roots:
+            for path in sorted(root.rglob("*")):
+                if path.suffix not in {".json", ".md"}:
+                    continue
+                body = path.read_text()
+                matched = [
+                    name
+                    for name in TOMBSTONES
+                    if any(
+                        reference in body
+                        for reference in (
+                            f"load `{name}`",
+                            f"use `{name}`",
+                            f"skill `{name}`",
+                            f"`{name}` skill",
+                            f"`{name}` lens",
+                            f"({name} lens)",
+                        )
+                    )
+                ]
+                if matched:
+                    findings[str(path.relative_to(ENGINE.parent))] = matched
+        self.assertEqual(findings, {})
 
 
 class ReconciliationTest(unittest.TestCase):
@@ -163,7 +213,7 @@ class ReconciliationTest(unittest.TestCase):
     def test_dirty_database_converges_twice_and_preserves_local_state_exactly(self):
         first = seed_skills.reconcile_tombstoned_skills(self.con)
         self.assertEqual(first.changed_names, tuple(sorted(TOMBSTONES)))
-        self.assertEqual(first.grant_count, 26)
+        self.assertEqual(first.grant_count, len(TOMBSTONES) * 2)
         self.assertEqual(
             self.con.execute("SELECT * FROM skills").fetchall(), [self.local_row]
         )
@@ -191,13 +241,16 @@ class ReconciliationTest(unittest.TestCase):
         with self.assertRaisesRegex(sqlite3.IntegrityError, "refuse"):
             seed_skills.reconcile_tombstoned_skills(self.con)
         self.assertEqual(
-            self.con.execute("SELECT COUNT(*) FROM skills").fetchone()[0], 14
+            self.con.execute("SELECT COUNT(*) FROM skills").fetchone()[0],
+            len(TOMBSTONES) + 1,
         )
         self.assertEqual(
-            self.con.execute("SELECT COUNT(*) FROM shell_skills").fetchone()[0], 14
+            self.con.execute("SELECT COUNT(*) FROM shell_skills").fetchone()[0],
+            len(TOMBSTONES) + 1,
         )
         self.assertEqual(
-            self.con.execute("SELECT COUNT(*) FROM flavor_skills").fetchone()[0], 14
+            self.con.execute("SELECT COUNT(*) FROM flavor_skills").fetchone()[0],
+            len(TOMBSTONES) + 1,
         )
 
 

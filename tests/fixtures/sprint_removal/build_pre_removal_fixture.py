@@ -28,11 +28,19 @@ SCAN_ROOTS = (
     ".github",
 )
 ALLOWED_REFERENCE_FILES = (
+    ".super-coder/adapters/claude/adapter.json",
+    ".super-coder/adapters/codex/adapter.json",
+    ".super-coder/adapters/kimi/adapter.json",
+    ".super-coder/adapters/opencode/adapter.json",
+    ".super-coder/adapters/vibe/adapter.json",
+    ".super-coder/scripts/harness_surfaces.py",
     "tests/fixtures/sprint_removal/build_pre_removal_fixture.py",
     "tests/fixtures/sprint_removal/manifest.json",
     "tests/fixtures/sprint_removal/pre_removal.sql",
     "tests/test_dos_app_sprint_canary.py",
+    "tests/test_opencode_model_preservation.py",
     "tests/test_sprint_removal_manifest.py",
+    "tests/test_harness_surfaces.py",
 )
 SOURCE_REFERENCE_PATTERN = (
     r"(?:sprint|conductor|SC_SPRINT_|"

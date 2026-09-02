@@ -15,6 +15,7 @@ Run:
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import sys
 import tempfile
@@ -23,6 +24,8 @@ import time
 import unittest
 from http.server import ThreadingHTTPServer
 from pathlib import Path
+from types import SimpleNamespace
+from unittest import mock
 
 ENGINE = Path(__file__).resolve().parents[1] / ".super-coder"
 SCHEMA = ENGINE / "schema.sql"

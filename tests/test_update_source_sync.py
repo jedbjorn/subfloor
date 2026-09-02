@@ -50,9 +50,11 @@ class SourceSyncCase(unittest.TestCase):
     def sync(self) -> str:
         """Run the sync against the fixture checkout, returning its output."""
         buf = io.StringIO()
+        update.reset_update_report()
         with mock.patch.object(update, "REPO_ROOT", self.work), \
                 contextlib.redirect_stdout(buf):
             update.sync_repo_checkout()
+            update.render_update_report()
         return buf.getvalue()
 
     def fall_behind(self, n: int = 1) -> str:
@@ -124,6 +126,8 @@ class SourceSyncCase(unittest.TestCase):
         self.assertTrue((self.work / "scratch.txt").exists(),
                         "the operator's file was discarded")
         self.assertIn("fast-forwarded", out)
+        self.assertIn("working tree contains 1 local change(s)", out)
+        self.assertIn("review `git status --short`", out)
 
     def test_overlapping_uncommitted_work_warns_without_blocking(self):
         """Git refuses an unsafe pull; update keeps its recovery path open."""
@@ -136,6 +140,7 @@ class SourceSyncCase(unittest.TestCase):
         self.assertEqual((self.work / "a.txt").read_text(), "operator edit\n")
         self.assertIn("git pull --ff-only", out)
         self.assertIn("Updating anyway", out)
+        self.assertIn("update report:", out)
 
     def test_diverged_warns_without_merging_resetting_or_blocking(self):
         tip = self.fall_behind()

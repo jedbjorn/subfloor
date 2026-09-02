@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import ast
+import hashlib
 import json
 import re
 import sqlite3
@@ -17,7 +18,9 @@ sys.path[:0] = [str(ENGINE / "api"), str(ENGINE / "scripts")]
 
 import server
 import sprint_board
+import route_bindings
 from github_pull_requests import PullRequest
+from sprint_route_binding_support import candidate as route_candidate
 
 _DYNAMIC_EVENT_CALLS = {
     ("sprint_domain.py", "f'lifecycle.{target}'"): {"lifecycle.completed"},
@@ -111,6 +114,8 @@ class SprintBoardApiCase(unittest.TestCase):
                 (feature_id,),
             ).lastrowid
         )
+        bound_body = "body"
+        bound_revision = hashlib.sha256(bound_body.encode()).hexdigest()
         task_ids = [
             int(
                 con.execute(
@@ -125,8 +130,8 @@ class SprintBoardApiCase(unittest.TestCase):
             con.execute(
                 "INSERT INTO sprint_spec_approvals "
                 "(document_id,revision_sha256,reviewer_shell_id,verdict) "
-                "VALUES (?,'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',4,'pass')",
-                (document_id,),
+                "VALUES (?,?,4,'pass')",
+                (document_id, bound_revision),
             ).lastrowid
         )
         sprint_id = int(
@@ -139,9 +144,9 @@ class SprintBoardApiCase(unittest.TestCase):
         )
         con.execute(
             "INSERT INTO sprint_specs "
-            "(sprint_id,document_id,bound_revision_sha256,approval_id) "
-            "VALUES (?,?,'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',?)",
-            (sprint_id, document_id, approval_id),
+            "(sprint_id,document_id,bound_revision_sha256,approval_id,"
+            "bound_revision_body) VALUES (?,?,?,?,?)",
+            (sprint_id, document_id, bound_revision, approval_id, bound_body),
         )
         participant_ids = {}
         for shell_id, role in ((2, "planner"), (3, "developer"), (4, "reviewer")):
@@ -160,7 +165,9 @@ class SprintBoardApiCase(unittest.TestCase):
                 (sprint_id, shell_id),
             )
         con.execute(
-            "UPDATE sprints SET lifecycle='armed',armed_at='2026-08-01 10:01:00' "
+            "UPDATE sprints SET conformance_reviewer_shell_id=4,"
+            "conformance_owner_generation=1,lifecycle='armed',"
+            "armed_at='2026-08-01 10:01:00' "
             "WHERE sprint_id=?",
             (sprint_id,),
         )
@@ -295,6 +302,7 @@ class SprintBoardApiCase(unittest.TestCase):
             "second_sprint_id": second,
             "third_sprint_id": third,
             "unit": unit_ids[2],
+            "active_unit": unit_ids[5],
             "ready_unit": unit_ids[7],
             "other_unit": unit_ids[0],
             "developer_participant_id": participant_ids["developer"],
@@ -385,6 +393,304 @@ class SprintBoardApiCase(unittest.TestCase):
         cancelled = next(row for row in units.values() if row["disposition"] == "cancelled")
         self.assertEqual("done", cancelled["column"])
         self.assertEqual("cancelled cleanly", cancelled["completion_result"])
+        self.assertEqual(
+            {"aggregate_state": None, "target_count": 0, "pending_count": 0,
+             "running_count": 0, "succeeded_count": 0, "failed_count": 0},
+            board["cleanup"],
+        )
+
+    def test_board_and_list_project_cleanup_aggregate_without_target_paths(self):
+        with self.connect() as con:
+            con.execute(
+                "UPDATE sprints SET lifecycle='completed',terminal_outcome='accepted',"
+                "completed_at=datetime('now') WHERE sprint_id=?",
+                (self.ids["sprint_id"],),
+            )
+            con.executemany(
+                "INSERT INTO sprint_cleanup_targets "
+                "(sprint_id,shell_id,target_kind,canonical_path,repository_root,"
+                "git_common_dir,expected_base_branch,state,last_error_code) "
+                "VALUES (?,?,?,?,?,?,?,?,?)",
+                (
+                    (
+                        self.ids["sprint_id"], 3, "worktree",
+                        "/repo/.sc-worktrees/dev1", "/repo", "/repo/.git",
+                        "shell/dev1", "failed", "fixture_failed",
+                    ),
+                    (
+                        self.ids["sprint_id"], None, "artifact_dir",
+                        f"/repo/shared/sprints/sprint-{self.ids['sprint_id']}",
+                        "/repo", "/repo/.git", None, "pending", None,
+                    ),
+                ),
+            )
+
+        status, _, board = self.request(
+            "GET", f"/api/sprints/{self.ids['sprint_id']}"
+        )
+        self.assertEqual(200, status, board)
+        self.assertEqual(
+            {"aggregate_state": "failed", "target_count": 2, "pending_count": 1,
+             "running_count": 0, "succeeded_count": 0, "failed_count": 1},
+            board["cleanup"],
+        )
+        status, _, listing = self.request("GET", "/api/sprints?limit=100")
+        self.assertEqual(200, status, listing)
+        projected = next(
+            row for row in listing["items"]
+            if row["sprint_id"] == self.ids["sprint_id"]
+        )
+        self.assertEqual(board["cleanup"], projected["cleanup"])
+        self.assertNotIn("/repo", json.dumps(projected["cleanup"]))
+
+    def test_shell_cleanup_api_projects_bounded_status_and_stable_error_codes(self):
+        with self.connect() as con:
+            con.execute(
+                "INSERT INTO shells "
+                "(shell_id,display_name,shortname,flavor,system_prompt,user_id,api_key) "
+                "VALUES (8,'Outsider','OUT1','dev','prompt',1,'outside-token')"
+            )
+            con.execute(
+                "UPDATE sprints SET lifecycle='completed',terminal_outcome='accepted',"
+                "completed_at=datetime('now') WHERE sprint_id=?",
+                (self.ids["sprint_id"],),
+            )
+            con.execute(
+                "INSERT INTO sprint_cleanup_targets "
+                "(sprint_id,shell_id,target_kind,canonical_path,repository_root,"
+                "git_common_dir,expected_base_branch,state,attempt_count,"
+                "last_error_code,last_error_detail,before_evidence) "
+                "VALUES (?,3,'worktree','/repo/.sc-worktrees/dev1','/repo',"
+                "'/repo/.git','shell/dev1','failed',3,'fixture_failed',"
+                "'bounded detail',?)",
+                (
+                    self.ids["sprint_id"],
+                    json.dumps(
+                        {
+                            "branch": "feat/disposable",
+                            "status_count": 1,
+                            "status_sample": ["?? private-name.txt"],
+                        }
+                    ),
+                ),
+            )
+
+        status, _, body = self.request(
+            "GET",
+            f"/_sc/sprint/cleanup-runs/{self.ids['sprint_id']}",
+            "dev-token",
+        )
+        self.assertEqual(200, status, body)
+        self.assertEqual(("failed", 1), (body["aggregate_state"], body["target_count"]))
+        self.assertEqual(".sc-worktrees/dev1", body["targets"][0]["path_label"])
+        self.assertNotIn("/repo", json.dumps(body))
+        self.assertNotIn("private-name", json.dumps(body))
+
+        status, _, denied = self.request(
+            "GET",
+            f"/_sc/sprint/cleanup-runs/{self.ids['sprint_id']}",
+            "outside-token",
+        )
+        self.assertEqual(403, status, denied)
+        self.assertEqual("cleanup_status_forbidden", denied["details"]["code"])
+
+        payload = {
+            "sprint_id": self.ids["sprint_id"],
+            "idempotency_key": "retry-board-fixture",
+            "adopt_legacy": False,
+        }
+        status, _, denied = self.request(
+            "POST", "/_sc/sprint/cleanup-runs", "dev-token", body=payload
+        )
+        self.assertEqual(403, status, denied)
+        self.assertEqual("cleanup_retry_forbidden", denied["details"]["code"])
+
+        status, _, first = self.request(
+            "POST", "/_sc/sprint/cleanup-runs", "planner-token", body=payload
+        )
+        self.assertEqual(201, status, first)
+        status, _, replay = self.request(
+            "POST", "/_sc/sprint/cleanup-runs", "planner-token", body=payload
+        )
+        self.assertEqual(200, status, replay)
+        self.assertEqual(
+            ("requeued", True, False, first["cleanup_request_id"], [first["target_ids"][0]]),
+            (
+                first["action"],
+                first["created"],
+                replay["created"],
+                replay["cleanup_request_id"],
+                replay["target_ids"],
+            ),
+        )
+
+    def test_health_messages_project_exact_scoped_waits_beyond_audit_history(self):
+        with self.connect() as con:
+            planner = int(
+                con.execute(
+                    "SELECT participant_id FROM sprint_participants "
+                    "WHERE sprint_id=? AND shell_id=2",
+                    (self.ids["sprint_id"],),
+                ).fetchone()[0]
+            )
+            developer = int(
+                con.execute(
+                    "SELECT participant_id FROM sprint_participants "
+                    "WHERE sprint_id=? AND shell_id=7",
+                    (self.ids["sprint_id"],),
+                ).fetchone()[0]
+            )
+            reviewer = int(
+                con.execute(
+                    "SELECT participant_id FROM sprint_participants "
+                    "WHERE sprint_id=? AND shell_id=4",
+                    (self.ids["sprint_id"],),
+                ).fetchone()[0]
+            )
+
+            def add_message(
+                *,
+                key: str,
+                recipient: int,
+                receiver_shell_id: int,
+                unit_id: int | None,
+                body: str,
+                intent: str = "information",
+                requires_reply: bool = False,
+                created_at: str = "2026-08-01 10:30:00",
+                delivered_at: str | None = None,
+                read_at: str | None = None,
+            ) -> int:
+                return int(
+                    con.execute(
+                        "INSERT INTO wake_message "
+                        "(sprint_id,sender_shell_id,receiver_shell_id,"
+                        "from_participant_id,to_participant_id,work_unit_id,"
+                        "message_kind,body,declared_type,actionable,idempotency_key,"
+                        "intent,requires_reply,created_at,delivered_at,read_at) "
+                        "VALUES (?,2,?,?,?,?,'notification',?,'re-enter',0,?,?,?,?,?,?)",
+                        (
+                            self.ids["sprint_id"],
+                            receiver_shell_id,
+                            planner,
+                            recipient,
+                            unit_id,
+                            body,
+                            key,
+                            intent,
+                            int(requires_reply),
+                            created_at,
+                            delivered_at,
+                            read_at,
+                        ),
+                    ).lastrowid
+                )
+
+            old_unit_wait = add_message(
+                key="health-old-unit-wait",
+                recipient=developer,
+                receiver_shell_id=7,
+                unit_id=self.ids["active_unit"],
+                body="Old decision still required",
+                intent="decision",
+                requires_reply=True,
+                created_at="2026-08-01 10:02:00",
+                delivered_at="2026-08-01 10:03:00",
+            )
+            for index in range(100):
+                add_message(
+                    key=f"health-audit-{index}",
+                    recipient=developer,
+                    receiver_shell_id=7,
+                    unit_id=self.ids["active_unit"],
+                    body=f"Audit message {index}",
+                    created_at="2026-08-01 10:20:00",
+                )
+            current_unit_wait = add_message(
+                key="health-current-unit-wait",
+                recipient=developer,
+                receiver_shell_id=7,
+                unit_id=self.ids["active_unit"],
+                body="Current blocker requires action",
+                intent="blocker",
+                requires_reply=True,
+                created_at="2026-08-01 10:40:00",
+                delivered_at="2026-08-01 10:41:00",
+            )
+            sprint_wait = add_message(
+                key="health-sprint-wait",
+                recipient=reviewer,
+                receiver_shell_id=4,
+                unit_id=None,
+                body="Sprint decision required",
+                intent="question",
+                requires_reply=True,
+                created_at="2026-08-01 10:42:00",
+                delivered_at="2026-08-01 10:43:00",
+                read_at="2026-08-01 10:44:00",
+            )
+
+        status, _, board = self.request(
+            "GET", f"/api/sprints/{self.ids['sprint_id']}"
+        )
+        self.assertEqual(200, status, board)
+        projected = {row["message_id"]: row for row in board["health_messages"]}
+        self.assertEqual(
+            {old_unit_wait, current_unit_wait, sprint_wait}, set(projected)
+        )
+        self.assertEqual(
+            {
+                "scope": "work_unit",
+                "work_unit_id": self.ids["active_unit"],
+                "intent": "decision",
+                "requires_reply": True,
+                "created_at": "2026-08-01 10:02:00",
+                "delivered_at": "2026-08-01 10:03:00",
+                "read_at": None,
+                "reply_to_message_id": None,
+                "linked_reply_message_ids": [],
+                "linked_reply_count": 0,
+                "linked_replies_truncated": False,
+            },
+            {
+                key: projected[old_unit_wait][key]
+                for key in (
+                    "scope",
+                    "work_unit_id",
+                    "intent",
+                    "requires_reply",
+                    "created_at",
+                    "delivered_at",
+                    "read_at",
+                    "reply_to_message_id",
+                    "linked_reply_message_ids",
+                    "linked_reply_count",
+                    "linked_replies_truncated",
+                )
+            },
+        )
+        self.assertEqual("blocker", projected[current_unit_wait]["intent"])
+        self.assertEqual(
+            ("sprint", None, "question", "2026-08-01 10:44:00"),
+            (
+                projected[sprint_wait]["scope"],
+                projected[sprint_wait]["work_unit_id"],
+                projected[sprint_wait]["intent"],
+                projected[sprint_wait]["read_at"],
+            ),
+        )
+        active = next(
+            row
+            for row in board["work_units"]
+            if row["work_unit_id"] == self.ids["active_unit"]
+        )
+        self.assertNotIn(
+            old_unit_wait,
+            {message["message_id"] for message in active["messages"]},
+        )
+        self.assertIn(
+            {"message_id": old_unit_wait}, active["health"]["message_refs"]
+        )
 
     def test_board_projects_stale_runtime_and_bounded_pickup_exhaustion(self):
         exhausted = {
@@ -593,6 +899,58 @@ class SprintBoardApiCase(unittest.TestCase):
                 },
             ),
             (
+                "sprint.cleanup_scheduled",
+                {
+                    "aggregate_state": "pending",
+                    "artifact_target_ids": [4],
+                    "target_count": 4,
+                    "worktree_target_ids": [1, 2, 3],
+                    "secret": "hidden",
+                },
+            ),
+            (
+                "sprint.cleanup_adopted",
+                {
+                    "aggregate_state": "pending",
+                    "request_kind": "adopted_legacy",
+                    "target_count": 4,
+                    "target_ids": [1, 2, 3, 4],
+                    "secret": "hidden",
+                },
+            ),
+            (
+                "sprint.cleanup_requeued",
+                {
+                    "aggregate_state": "pending",
+                    "request_kind": "requeued",
+                    "target_count": 4,
+                    "target_ids": [2],
+                    "secret": "hidden",
+                },
+            ),
+            (
+                "sprint.cleanup_failed",
+                {
+                    "aggregate_state": "failed",
+                    "attempt_count": 3,
+                    "cleanup_target_id": 2,
+                    "claim_generation": 4,
+                    "error_code": "fetch_failed",
+                    "path_label": ".sc-worktrees/dev1",
+                    "target_kind": "worktree",
+                    "secret": "hidden",
+                },
+            ),
+            (
+                "sprint.cleanup_completed",
+                {
+                    "aggregate_state": "succeeded",
+                    "succeeded_count": 4,
+                    "target_count": 4,
+                    "secret": "hidden",
+                },
+            ),
+            (
                 "review.approved",
                 {
                     "work_unit_id": self.ids["unit"],
@@ -611,6 +969,17 @@ class SprintBoardApiCase(unittest.TestCase):
                     "message_id": 9,
                     "conversation_id": "cv-fix",
                     "head_sha": "fix-head",
+                    "secret": "hidden",
+                },
+            ),
+            (
+                "review.request_invalidated",
+                {
+                    "work_unit_id": self.ids["unit"],
+                    "registered_pr_id": 1,
+                    "invalidated_message_id": 8,
+                    "head_sha": "replacement-head",
+                    "previous_head_sha": "stale-head",
                     "secret": "hidden",
                 },
             ),
@@ -697,6 +1066,178 @@ class SprintBoardApiCase(unittest.TestCase):
         self.assertEqual(status, 401, body)
         self.assertEqual("unauthorized", body["error"]["code"])
 
+    def test_browser_reads_exact_bound_revision_without_current_substitution(self):
+        with self.connect() as con:
+            con.execute(
+                "UPDATE documents SET body='current drift' WHERE document_id=?",
+                (self.ids["document_id"],),
+            )
+            con.commit()
+        status, _, body = self.request(
+            "GET",
+            f"/api/sprints/{self.ids['sprint_id']}/spec-revisions/"
+            f"{self.ids['document_id']}",
+        )
+        self.assertEqual(200, status, body)
+        self.assertEqual("body", body["body"])
+        self.assertEqual("available", body["availability"])
+        self.assertEqual(
+            hashlib.sha256(b"body").hexdigest(), body["bound_revision_sha256"]
+        )
+
+    def test_browser_bound_revision_rejects_malformed_document_id(self):
+        for document_id in ("not-an-int", "0", "-1"):
+            with self.subTest(document_id=document_id):
+                status, _, body = self.request(
+                    "GET",
+                    f"/api/sprints/{self.ids['sprint_id']}/spec-revisions/"
+                    f"{document_id}",
+                )
+                self.assertEqual(422, status, body)
+                self.assertEqual(
+                    {
+                        "code": "validation_error",
+                        "message": "document_id must be a positive integer",
+                        "details": {"document_id": document_id},
+                    },
+                    body["error"],
+                )
+                self.assertNotIn("body", json.dumps(body))
+
+    def test_browser_bound_revision_rejects_unbound_document_id(self):
+        with self.connect() as con:
+            unbound_id = int(
+                con.execute(
+                    "INSERT INTO documents (feature_id,kind,seq,title,body) "
+                    "VALUES (?,'spec',99,'Unbound','unbound current body')",
+                    (self.ids["feature_id"],),
+                ).lastrowid
+            )
+            con.commit()
+        status, _, body = self.request(
+            "GET",
+            f"/api/sprints/{self.ids['sprint_id']}/spec-revisions/{unbound_id}",
+        )
+        self.assertEqual(404, status, body)
+        self.assertEqual(
+            {
+                "code": "spec_revision_not_found",
+                "message": "governing revision not found",
+                "details": {
+                    "sprint_id": self.ids["sprint_id"],
+                    "document_id": unbound_id,
+                },
+            },
+            body["error"],
+        )
+        self.assertNotIn("unbound current body", json.dumps(body))
+
+    def test_browser_bound_revision_reports_legacy_unavailability(self):
+        current_body = "legacy current body must remain unavailable"
+        bound_revision = hashlib.sha256(b"body").hexdigest()
+        with self.connect() as con:
+            legacy_document_id = int(
+                con.execute(
+                    "INSERT INTO documents (feature_id,kind,seq,title,body) "
+                    "VALUES (?,'spec',98,'Legacy bound spec',?)",
+                    (self.ids["feature_id"], current_body),
+                ).lastrowid
+            )
+            con.execute(
+                "INSERT INTO sprint_specs "
+                "(sprint_id,document_id,bound_revision_sha256,"
+                "bound_revision_body,bound_revision_legacy) "
+                "VALUES (?,?,?,NULL,1)",
+                (self.ids["sprint_id"], legacy_document_id, bound_revision),
+            )
+            con.execute(
+                "INSERT INTO sprint_spec_revision_history "
+                "(sprint_id,document_id,generation,bound_revision_sha256,"
+                "bound_revision_body,bound_revision_legacy,actor_kind,reason) "
+                "VALUES (?,?,1,?,NULL,1,'system','legacy browser fixture')",
+                (self.ids["sprint_id"], legacy_document_id, bound_revision),
+            )
+            con.commit()
+        status, _, body = self.request(
+            "GET",
+            f"/api/sprints/{self.ids['sprint_id']}/spec-revisions/"
+            f"{legacy_document_id}",
+        )
+        self.assertEqual(409, status, body)
+        error = body["error"]
+        self.assertEqual("bound_revision_unavailable", error["code"])
+        self.assertEqual(
+            "bound governing revision is unavailable for this legacy binding",
+            error["message"],
+        )
+        self.assertEqual(
+            {
+                "sprint_id": self.ids["sprint_id"],
+                "document_id": legacy_document_id,
+                "bound_revision_sha256": bound_revision,
+                "current_revision_sha256": hashlib.sha256(
+                    current_body.encode()
+                ).hexdigest(),
+                "availability": "unavailable_legacy_drift",
+            },
+            error["details"],
+        )
+        self.assertNotIn(current_body, json.dumps(body))
+
+    def test_browser_document_edit_requires_origin_and_records_fnb_evidence(self):
+        path = f"/api/documents/{self.ids['document_id']}"
+        status, _, denied = self.request(
+            "PATCH",
+            path,
+            body={"body": "attacker text"},
+            extra_headers={"Origin": "https://attacker.example"},
+        )
+        self.assertEqual(403, status, denied)
+        with self.connect() as con:
+            self.assertEqual(
+                "body",
+                con.execute(
+                    "SELECT body FROM documents WHERE document_id=?",
+                    (self.ids["document_id"],),
+                ).fetchone()[0],
+            )
+            self.assertEqual(
+                0,
+                con.execute(
+                    "SELECT COUNT(*) FROM sprint_events "
+                    "WHERE event_type='spec.body_edited'"
+                ).fetchone()[0],
+            )
+
+        status, _, response = self.request(
+            "PATCH",
+            path,
+            body={"body": "FnB edit"},
+            extra_headers={
+                "Origin": "http://127.0.0.1:8800",
+                "Sec-Fetch-Site": "same-origin",
+            },
+        )
+        self.assertEqual(200, status, response)
+        with self.connect() as con:
+            event = con.execute(
+                "SELECT actor_kind,actor_shell_id,payload FROM sprint_events "
+                "WHERE event_type='spec.body_edited'"
+            ).fetchone()
+            self.assertEqual(("fnb", None), event[:2])
+            payload = json.loads(event["payload"])
+            self.assertEqual("fnb", payload["authority"])
+            self.assertEqual("review_ui", payload["editor_surface"])
+            self.assertEqual("not_required", payload["notification_state"])
+            self.assertEqual(
+                0,
+                con.execute(
+                    "SELECT COUNT(*) FROM wake_message "
+                    "WHERE message_kind='notification' "
+                    "AND body LIKE '%governing document%'"
+                ).fetchone()[0],
+            )
+
     def test_board_snapshot_opens_and_closes_one_read_transaction(self):
         with self.connect() as con:
             statements = []
@@ -708,6 +1249,129 @@ class SprintBoardApiCase(unittest.TestCase):
             self.assertFalse(con.in_transaction)
             self.assertEqual(1, sum(sql == "BEGIN" for sql in statements))
             self.assertEqual(1, sum(sql == "ROLLBACK" for sql in statements))
+
+    def test_board_projects_prepared_legacy_and_bound_route_contracts(self):
+        sprint_id = self.ids["sprint_id"]
+        with self.connect() as con:
+            prepared_sprint_id = int(
+                con.execute(
+                    "INSERT INTO sprints "
+                    "(feature_id,originating_planner_shell_id,lifecycle) "
+                    "SELECT feature_id,originating_planner_shell_id,'prepared' "
+                    "FROM sprints WHERE sprint_id=?",
+                    (sprint_id,),
+                ).lastrowid
+            )
+            con.executemany(
+                "INSERT INTO sprint_participants "
+                "(sprint_id,shell_id,role,harness,model,effort,disposition) "
+                "VALUES (?,?,'developer',?,?,?,'idle')",
+                (
+                    (prepared_sprint_id, 5, "codex", "gpt-5.4", "high"),
+                    (prepared_sprint_id, 6, "vibe", "vibe-model", None),
+                    (prepared_sprint_id, 7, "codex", None, None),
+                ),
+            )
+            prepared = sprint_board.SprintBoardProjection(con).board(
+                prepared_sprint_id
+            )
+            self.assertEqual(
+                {"unbound-intent"},
+                {row["binding_status"] for row in prepared["participants"]},
+            )
+            prepared_by_shell = {
+                row["shortname"]: row for row in prepared["participants"]
+            }
+            self.assertEqual(
+                (
+                    None,
+                    None,
+                    "controlled",
+                    "high",
+                    None,
+                    None,
+                    None,
+                ),
+                (
+                    prepared_by_shell["DEV2"]["control_state"],
+                    prepared_by_shell["DEV2"]["effective_effort"],
+                    prepared_by_shell["DEV2"]["intent_control_state"],
+                    prepared_by_shell["DEV2"]["intent_effective_effort"],
+                    prepared_by_shell["DEV2"]["route_revision"],
+                    prepared_by_shell["DEV2"]["binding_digest"],
+                    prepared_by_shell["DEV2"]["catalogue_generation"],
+                ),
+            )
+            self.assertEqual(
+                ("native-uncontrolled", None),
+                (
+                    prepared_by_shell["DEV3"]["intent_control_state"],
+                    prepared_by_shell["DEV3"]["intent_effective_effort"],
+                ),
+            )
+            self.assertEqual(
+                ("harness-default", None),
+                (
+                    prepared_by_shell["DEV4"]["intent_control_state"],
+                    prepared_by_shell["DEV4"]["intent_effective_effort"],
+                ),
+            )
+            participant = con.execute(
+                "SELECT participant_id,harness,model,effort "
+                "FROM sprint_participants WHERE sprint_id=? AND role='developer' "
+                "ORDER BY participant_id LIMIT 1",
+                (sprint_id,),
+            ).fetchone()
+            con.execute(
+                "UPDATE sprints SET lifecycle='paused',paused_at=datetime('now') "
+                "WHERE sprint_id=?",
+                (sprint_id,),
+            )
+            resolved = route_candidate(con, participant)
+            receipt = route_bindings.ParticipantRouteBindingStore(con).bind(
+                int(participant["participant_id"]),
+                resolved.binding,
+                resolved.binding_digest,
+                transition="reroute",
+                runtime_status=resolved.runtime_status,
+                runtime_scope=resolved.runtime_scope,
+            )
+            con.commit()
+
+            armed = sprint_board.SprintBoardProjection(con).board(sprint_id)
+            bound = next(
+                row for row in armed["participants"]
+                if row["participant_id"] == int(participant["participant_id"])
+            )
+            legacy = next(
+                row for row in armed["participants"]
+                if row["participant_id"] != int(participant["participant_id"])
+            )
+            self.assertEqual(
+                (
+                    "bound",
+                    2,
+                    "harness-default",
+                    1,
+                    receipt["binding_digest"],
+                ),
+                (
+                    bound["binding_status"],
+                    bound["route_contract_version"],
+                    bound["control_state"],
+                    bound["route_revision"],
+                    bound["binding_digest"],
+                ),
+            )
+            self.assertEqual(
+                ("legacy", 1, None, None),
+                (
+                    legacy["binding_status"],
+                    legacy["route_contract_version"],
+                    legacy["route_revision"],
+                    legacy["binding_digest"],
+                ),
+            )
 
     def test_every_read_surface_is_side_effect_free_and_never_reads_external_prs(self):
         sprint_id = self.ids["sprint_id"]

@@ -23,6 +23,10 @@ WAKE_INDICATOR = APP[
     APP.index("function chatWakePendingIndicator"):
     APP.index("function chatPaintShellStatus")
 ]
+SHELL_INDICATORS = APP[
+    APP.index("function chatUnreadBadge(shell)"):
+    APP.index("function chatHeaderLabel(conversation)")
+]
 
 
 def run_js(script: str) -> dict:
@@ -70,8 +74,8 @@ def test_open_chat_restore_matches_the_flat_shell_projection():
 def test_sprint_badge_enters_the_current_conversation_without_a_wake():
     interface = APP[APP.index("async function renderInterface"):
                     APP.index("// ── Tabs + boot")]
-    badge = interface[interface.index('className: "chat-sprint-badge"'):
-                      interface.index('const status = el("span"')]
+    badge = APP[APP.index("function chatSprintBadge"):
+                APP.index("function chatPaintShellStatus")]
     assert "sprint.current_conversation_id" in badge
     assert "location.hash = chatHash(" in badge
     assert "chatApi(" not in badge
@@ -93,7 +97,7 @@ def test_shell_card_orders_left_identity_and_right_status_cluster():
     interface = APP[APP.index("async function renderInterface"):
                     APP.index("// ── Tabs + boot")]
     identity = interface[interface.index("const identity = el("):
-                         interface.index("const mail = chatUnreadBadge(item)")]
+                         interface.index("const button = el(")]
     assert identity.index('className: "chat-shell-shortname"') < identity.index(
         'className: "chat-shell-identity-separator"'
     ) < identity.index('className: "chat-shell-name"')
@@ -101,12 +105,9 @@ def test_shell_card_orders_left_identity_and_right_status_cluster():
     status = interface[interface.index('const status = el("span"'):
                        interface.index("rail.append(shellRow)")]
     assert 'className: "chat-shell-status"' in status
-    assert "chatPaintShellStatus(status, mail, badge, wake)" in status
+    assert "chatPaintShellIndicators(statusItem, item)" in status
     assert "shellStatusItems.set" in status
-    assert (
-        "chatPaintShellStatus(target.status, target.mail, target.badge, wake)"
-        in interface
-    )
+    assert "chatPaintShellIndicators(target, next)" in interface
 
     status_style = STYLE[STYLE.index(".chat-shell-status {"):
                          STYLE.index(".chat-sprint-badge {")]
@@ -154,10 +155,96 @@ def test_pending_wake_indicator_refreshes_without_a_new_polling_loop():
                     APP.index("// ── Tabs + boot")]
     assert 'const shellProjectionRequest = api("/shells")' in POLL_BLOCK
     assert "const { shells: nextShells } = await shellProjectionRequest" in POLL_BLOCK
-    assert "paintWakeIndicators(nextShells)" in POLL_BLOCK
+    assert "paintShellIndicators(nextShells)" in POLL_BLOCK
     assert "refreshWakeIndicators" in interface
     assert "onWakeDelivered(conversation.shell.shell_id)" in APP
     assert APP.count("setInterval(pollHistory, CHAT_HISTORY_POLL_MS)") == 1
+
+
+def test_shell_indicator_poll_adds_changes_and_removes_sprint_badges():
+    script = r"""
+class FakeElement {
+  constructor(tag) {
+    this.tag = tag;
+    this.nodeType = 1;
+    this.children = [];
+    this.className = "";
+    this.hidden = false;
+    this.classList = {
+      toggle: (name, on) => {
+        const names = new Set(this.className.split(" ").filter(Boolean));
+        if (on) names.add(name); else names.delete(name);
+        this.className = [...names].join(" ");
+      },
+    };
+  }
+  append(...nodes) { this.children.push(...nodes); }
+  replaceChildren(...nodes) { this.children = [...nodes]; }
+  get textContent() {
+    return this.children.map((child) =>
+      typeof child === "string" ? child : child.textContent).join("");
+  }
+}
+const el = (tag, props = {}, ...children) => {
+  const node = Object.assign(new FakeElement(tag), props);
+  node.append(...children);
+  return node;
+};
+globalThis.location = {hash: ""};
+const chatHash = (shell, conversation) => `${shell}/${conversation}`;
+""" + SHELL_INDICATORS + r"""
+const target = {row: new FakeElement("div"), status: new FakeElement("span")};
+
+chatPaintShellIndicators(target, {
+  shortname: "DEV1",
+  sprint: {sprint_id: 12, role: "developer", disposition: "assigned",
+           current_conversation_id: "cv12"},
+});
+const first = {
+  rowClass: target.row.className,
+  status: target.status.textContent,
+};
+
+chatPaintShellIndicators(target, {
+  shortname: "DEV1",
+  sprint: {sprint_id: 13, role: "reviewer", disposition: "review",
+           current_conversation_id: "cv13"},
+});
+const changedBadge = target.status.children[0];
+changedBadge.onclick();
+const changed = {
+  rowClass: target.row.className,
+  status: target.status.textContent,
+  title: changedBadge.title,
+  hash: location.hash,
+};
+
+chatPaintShellIndicators(target, {shortname: "DEV1", sprint: null});
+const removed = {
+  rowClass: target.row.className,
+  status: target.status.textContent,
+  hidden: target.status.hidden,
+};
+console.log(JSON.stringify({first, changed, removed}));
+"""
+    result = run_js(script)
+    assert result == {
+        "first": {
+            "rowClass": "has-assignment",
+            "status": "Sprint 12",
+        },
+        "changed": {
+            "rowClass": "has-assignment",
+            "status": "Sprint 13",
+            "title": "Sprint 13 · reviewer · review",
+            "hash": "DEV1/cv13",
+        },
+        "removed": {
+            "rowClass": "",
+            "status": "",
+            "hidden": True,
+        },
+    }
 
 
 def test_sprint_conversations_are_not_closed_by_normal_chat_controls():
@@ -179,11 +266,11 @@ def test_sprint_conversations_are_not_closed_by_normal_chat_controls():
 def test_start_chat_has_default_and_configured_paths_without_terminal_controls():
     interface = APP[APP.index("const CHAT_HARNESSES"):
                     APP.index("// ── Tabs + boot")]
-    assert (
-        'const CHAT_HARNESSES = ["opencode", "claude", "codex", "kimi"]'
-        in interface
-    )
-    assert "const availableHarnesses = CHAT_HARNESSES;" in interface
+    assert "const CHAT_HARNESSES_FROM_SERVER = (defaults)" in interface
+    assert "defaults.harness_status" in interface
+    assert "status.surfaces?.browser" in interface
+    assert ': LEGACY_CHAT_HARNESSES;' in interface
+    assert "const availableHarnesses = CHAT_HARNESSES_FROM_SERVER(defaults);" in interface
     assert 'shell.flavor === "conductor"' not in interface
     assert 'const CHAT_CONFIGURE_ROUTE = "configure"' in interface
     assert 'textContent: "＋ Chat"' in interface
@@ -194,16 +281,97 @@ def test_start_chat_has_default_and_configured_paths_without_terminal_controls()
     assert "await chatRenderNew(pane, shell, defaults, catalog)" in interface
     assert "Use shell default" in interface
     assert "Use harness default" in interface
-    assert 'harness !== "opencode" || connectedDefault' in interface
+    assert 'const CHAT_HARNESS_DEFAULT_VALUE = "__sc_harness_default__"' in interface
     assert "No connected provider models available" in interface
-    assert "providers connected in OpenCode" in interface
-    assert "submit.disabled = !ready" in interface
+    assert "connected providers" in interface
+    assert 'ariaLabel: "Thinking level"' in interface
+    assert 'el("label", { className: "k" }, "Thinking level")' in interface
+    assert "renderNativeOptionControl(" in interface
+    assert "unavailable\n        || model" in interface
+    assert "exactRouteMissing" not in interface
+    assert "effortState.requiresConfirmation" in interface
+    assert "(!effortState.native && !effortState.selected)" in interface
+    assert "Refresh & verify Default Models before saving this route." in APP
     assert '"Start chat"' in interface
     assert "harness: harnessSelect.value" in interface
     assert "if (modelSelect.value) body.model = modelSelect.value" in interface
+    assert "body.model = null" in interface
+    assert "if (effortSelect.value) body.effort = effortSelect.value" in interface
     assert "xterm" not in interface.lower()
     assert "tmux" not in interface.lower()
     assert "attach" not in interface.lower()
+
+
+def test_model_picker_labels_do_not_expose_harness_support_confidence():
+    options = APP[
+        APP.index("function chatModelOptions"):
+        APP.index("function chatCreateConversation")
+    ]
+    script = r"""
+const CHAT_HARNESS_DEFAULT_VALUE = "__sc_harness_default__";
+const el = (tag, props) => ({tag, ...props});
+const select = {options: [], replaceChildren() { this.options = []; },
+  append(option) { this.options.push(option); }};
+""" + options + r"""
+chatModelOptions(select, {harnesses: {codex: {models: [
+  {id: "gpt-5.6-sol", availability: "available", harness_support_state: "best-effort"},
+  {id: "gpt-hidden", availability: "unavailable", harness_support_state: "tested"},
+]}}}, "codex", "gpt-5.6-sol");
+console.log(JSON.stringify(select.options));
+"""
+    assert run_js(script) == [
+        {"tag": "option", "value": "", "textContent": "Use shell default — gpt-5.6-sol"},
+        {"tag": "option", "value": "__sc_harness_default__", "textContent": "Use harness default"},
+        {"tag": "option", "value": "gpt-5.6-sol", "textContent": "gpt-5.6-sol"},
+    ]
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node is required")
+def test_missing_retained_harness_status_disables_composer():
+    availability = APP[
+        APP.index("function chatHarnessUnavailableReason"):
+        APP.index("function chatStartedLabel")
+    ]
+    script = availability + r"""
+const conversation = {route: {harness: "codex", model: "gpt-test"}};
+console.log(JSON.stringify({
+  missing: chatOpenHarnessUnavailableReason(conversation, null),
+  disabled: chatHarnessUnavailableReason({
+    installed: true, enabled: false, healthy: false,
+    surfaces: {browser: true}, unavailable_reason: "HARNESS_DISABLED",
+  }),
+  healthy: chatHarnessUnavailableReason({
+    installed: true, enabled: true, healthy: true,
+    surfaces: {browser: true}, unavailable_reason: null,
+  }),
+}));
+"""
+
+    assert run_js(script) == {
+        "missing": "HARNESS_UNAVAILABLE",
+        "disabled": "HARNESS_DISABLED",
+        "healthy": None,
+    }
+
+
+def test_retained_unavailable_harness_keeps_controls_but_not_composer():
+    interface = APP[APP.index("const CHAT_HARNESSES"):
+                    APP.index("// ── Tabs + boot")]
+    open_chat = interface[
+        interface.index("async function chatRenderOpen"):
+        interface.index("async function renderInterface")
+    ]
+    assert 'api("/flavor-defaults").catch(() => null)' in interface
+    assert 'api("/models").catch(() => null)' in interface
+    assert "history remains readable" not in open_chat
+    assert "unavailable.textContent = unavailableReason || \"\"" in open_chat
+    assert "composer.disabled = Boolean(unavailableReason)" in open_chat
+    assert "send.disabled = Boolean(unavailableReason)" in open_chat
+    assert "stop.disabled = conversation.state !== \"running\"" in open_chat
+    assert "close.disabled = sprintManaged || closed || closing" in open_chat
+    assert 'textContent: "Analytics"' in open_chat
+    assert "chatReviewWorkspace(reviewHost, conversation)" in open_chat
+    assert ".chat-harness-unavailable" in STYLE
 
 
 def test_transcript_streams_normalized_events_and_reconnects_natively():
@@ -219,14 +387,82 @@ def test_transcript_streams_normalized_events_and_reconnects_natively():
     assert "mdBlock(body)" in interface
 
 
+def test_reasoning_streams_as_distinct_assistant_segments_without_approval_ui():
+    interface = APP[APP.index("const CHAT_HARNESSES"):
+                    APP.index("// ── Tabs + boot")]
+    reducer = interface[
+        interface.index("const reduceEvent = (event) =>"):
+        interface.index("chatOpenStream(", interface.index(
+            "const reduceEvent = (event) =>"))
+    ]
+    assert 'event.payload?.segment === "reasoning"' in reducer
+    assert "previousSegment !== segment" in reducer
+    assert "anchor = sequence" in reducer
+    assert "assistantSegments.delete(event.run_id)" in reducer
+    assert 'bubble.classList.add("chat-reasoning")' in interface
+    assert 'isReasoning ? "Reasoning"' in interface
+    assert 'el("details", { className: "chat-reasoning-disclosure" }' in interface
+    assert 'el("summary", {}, "Reasoning")' in interface
+    assert "disclosure.append(summary, content)" in interface
+    assert "disclosure.ontoggle = () => chatCollapseOtherReasoning(disclosure)" in interface
+    assert ".chat-bubble.chat-assistant.chat-reasoning" in STYLE
+    assert ".chat-reasoning-disclosure" in STYLE
+    reasoning_style = STYLE[
+        STYLE.index(".chat-reasoning-disclosure {"):
+        STYLE.index(".chat-bubble.chat-activity")
+    ]
+    assert 'content: "▸"' in reasoning_style
+    assert "summary::-webkit-details-marker" in reasoning_style
+    assert ".chat-reasoning-disclosure[open] > summary::before" in reasoning_style
+    assert "transform: rotate(90deg)" in reasoning_style
+    assert "approval control" not in interface.lower()
+    assert "approval button" not in interface.lower()
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node is required")
+def test_reasoning_disclosures_allow_only_one_open_section():
+    interface = APP[APP.index("const CHAT_HARNESSES"):
+                    APP.index("// ── Tabs + boot")]
+    helper = interface[
+        interface.index("function chatCollapseOtherReasoning"):
+        interface.index("function chatBubble")
+    ]
+    script = r"""
+const first = {open: true};
+const second = {open: true};
+let queries = 0;
+global.document = {
+  querySelectorAll(selector) {
+    if (selector !== ".chat-reasoning-disclosure[open]") throw new Error(selector);
+    queries += 1;
+    return [first, second];
+  },
+};
+""" + helper + r"""
+chatCollapseOtherReasoning(second);
+const openingSecond = {first: first.open, second: second.open, queries};
+first.open = true;
+second.open = false;
+chatCollapseOtherReasoning(second);
+console.log(JSON.stringify({openingSecond, closingSecond: {
+  first: first.open, second: second.open, queries,
+}}));
+"""
+    assert run_js(script) == {
+        "openingSecond": {"first": False, "second": True, "queries": 1},
+        "closingSecond": {"first": True, "second": False, "queries": 1},
+    }
+
+
 def test_transcript_installs_snapshot_then_coalesces_keyed_live_updates():
     interface = APP[APP.index("const CHAT_HARNESSES"):
                     APP.index("// ── Tabs + boot")]
     keyed = interface[interface.index("function chatCreateTranscriptState"):
                       interface.index("async function renderInterface")]
 
-    assert "snapshot.projection_version !== 2" in keyed
-    assert "items.has(item.item_id)" in keyed
+    assert "snapshot.projection_version !== 3" in interface
+    assert "chatTranscriptPageItems(snapshot)" in keyed
+    assert "items.has(item.item_id)" in interface
     assert "nodes: new Map()" in keyed
     assert "dirty: new Set(items.keys())" in keyed
     assert "transcript.replaceChildren(...nodes)" in keyed
@@ -241,6 +477,8 @@ def test_transcript_installs_snapshot_then_coalesces_keyed_live_updates():
     assert "if (reconcilePromise" in keyed
     assert "`run:${runId}:assistant:${anchor}`" in keyed
     assert "assistant.text += event.payload?.text || \"\"" in keyed
+    assert 'type === "usage"' in keyed
+    assert "assistant.context_tokens = contextTokens" in keyed
     assert "transcriptState.throughSequence" in keyed
     assert "/events?after=${afterSequence}" in interface
     assert "/transcript`" in keyed
@@ -250,13 +488,107 @@ def test_transcript_installs_snapshot_then_coalesces_keyed_live_updates():
     ]
 
 
+def test_transcript_window_keeps_five_twenty_turn_pages_and_live_tail():
+    helpers = APP[
+        APP.index("function chatTranscriptPageItems"):
+        APP.index("function chatTranscriptItemNode")
+    ]
+    script = r"""
+const CHAT_TRANSCRIPT_PAGE_TURNS = 20;
+const CHAT_TRANSCRIPT_MAX_PAGES = 5;
+""" + helpers + r"""
+function snapshot(conversationId, first, last, olderCursor) {
+  return {
+    conversation_id: conversationId,
+    projection_version: 3,
+    through_sequence: 140,
+    controls: {active_run_id: null},
+    older_cursor: olderCursor,
+    truncation: last < 140 ? {reason: "turn_limit"} : null,
+    items: Array.from({length: last - first + 1}, (_, offset) => {
+      const turn = first + offset;
+      return {
+        item_id: `message:${turn}`,
+        kind: "user",
+        order_sequence: turn,
+        message_id: turn,
+        run_id: null,
+        text: `prompt ${turn}`,
+        state: "completed",
+      };
+    }),
+  };
+}
+const state = chatCreateTranscriptState(snapshot("cv_test", 121, 140, "c120"));
+for (const [first, last, cursor] of [
+  [101, 120, "c100"], [81, 100, "c80"], [61, 80, "c60"],
+  [41, 60, "c40"], [21, 40, "c20"], [1, 20, null],
+]) chatMergeOlderTranscriptPage(state, snapshot("cv_test", first, last, cursor));
+
+let overlap = "";
+try {
+  chatMergeOlderTranscriptPage(state, snapshot("cv_test", 1, 20, null));
+} catch (error) { overlap = error.message; }
+
+const beforeLiveUsers = state.order.filter(
+  (id) => state.items.get(id)?.kind === "user",
+).length;
+state.items.set("message:141", {
+  item_id: "message:141", kind: "user", order_sequence: 141,
+  message_id: 141, run_id: null, text: "prompt 141", state: "queued",
+});
+chatTrackLiveTranscriptItem(state, "message:141", true);
+const users = state.order.filter((id) => state.items.get(id)?.kind === "user");
+console.log(JSON.stringify({
+  pages: state.pages.length,
+  beforeLiveUsers,
+  users: users.length,
+  hasOldest: state.items.has("message:1"),
+  hasTailStart: state.items.has("message:121"),
+  hasLive: state.items.has("message:141"),
+  displaced: state.windowDisplaced,
+  overlap,
+}));
+"""
+    assert run_js(script) == {
+        "pages": 5,
+        "beforeLiveUsers": 100,
+        "users": 81,
+        "hasOldest": False,
+        "hasTailStart": True,
+        "hasLive": True,
+        "displaced": True,
+        "overlap": "Transcript history page overlaps loaded turns.",
+    }
+
+
+def test_transcript_history_load_is_retryable_and_preserves_scroll_anchor():
+    keyed = APP[
+        APP.index("function chatCreateTranscriptState"):
+        APP.index("async function renderInterface")
+    ]
+    assert "CHAT_TRANSCRIPT_PAGE_TURNS = 20" in APP
+    assert "CHAT_TRANSCRIPT_MAX_PAGES = 5" in APP
+    assert "if (!cursor || pageState.olderLoading) return" in keyed
+    assert "chatMergeOlderTranscriptPage(pageState, snapshot)" in keyed
+    assert "pageState.olderError = error" in keyed
+    assert "state.pendingPrepend" in keyed
+    assert "anchor.offsetTop - anchorOffset" in keyed
+    assert 'className: "chat-transcript-history"' in keyed
+    assert 'className: "chat-transcript-window-gap"' in keyed
+    assert "await reconcileTranscript(true)" in keyed
+    assert ".chat-transcript-history" in STYLE
+    assert ".chat-transcript-window-gap" in STYLE
+
+
 def test_segmented_transcript_source_contract_is_versioned_and_run_scoped():
     interface = APP[APP.index("const CHAT_HARNESSES"):
                     APP.index("// ── Tabs + boot")]
     keyed = interface[interface.index("function chatCreateTranscriptState"):
                       interface.index("async function renderInterface")]
 
-    assert "snapshot.projection_version !== 2" in keyed
+    assert "snapshot.projection_version !== 3" in interface
+    assert "chatTranscriptPageItems(snapshot)" in keyed
     assert "assistant_cursor" in keyed
     assert "segment_anchor_sequence" in keyed
     assert "tool.started" in keyed
@@ -309,10 +641,9 @@ def test_transcript_follow_pauses_for_reading_and_offers_jump_to_latest():
         "- transcript.clientHeight <= 32"
     ) in interface
     assert "const previousTop = transcript.scrollTop" in interface
-    assert (
-        "transcript.scrollTop = followTail "
-        "? transcript.scrollHeight : previousTop"
-    ) in interface
+    assert "transcript.scrollTop = followTail" in interface
+    assert "? transcript.scrollHeight" in interface
+    assert ": anchor?.isConnected ? anchor.offsetTop - anchorOffset : previousTop" in interface
     assert "const followTail = shouldFollow()" in interface
     assert 'className: "chat-jump-latest"' in interface
     assert 'ariaLabel: "Jump to latest message"' in interface
@@ -393,8 +724,9 @@ def test_closed_chat_composer_offers_reopen():
     interface = APP[APP.index("const CHAT_HARNESSES"):
                     APP.index("// ── Tabs + boot")]
     assert "const reopenable = closed && !sprintScoped" in interface
-    assert "composer.disabled = closing || (closed && !reopenable)" in interface
-    assert "send.disabled = closing || (closed && !reopenable)" in interface
+    assert "composer.disabled = Boolean(unavailableReason)" in interface
+    assert "|| closing || (closed && !reopenable)" in interface
+    assert "send.disabled = Boolean(unavailableReason)" in interface
     assert (
         "This conversation is closed — send a message to reopen it."
         in interface
@@ -445,7 +777,7 @@ def test_message_bubbles_show_local_creation_time_and_omit_invalid_values():
         APP.index("function chatShellLabel")
     ]
     bubble = APP[
-        APP.index("function chatBubble"):
+        APP.index("function chatContextTokenLabel"):
         APP.index("function chatTranscriptAtBottom")
     ]
     script = r"""
@@ -453,14 +785,19 @@ process.env.TZ = "UTC";
 function el(tag, props = {}, ...children) {
   return {
     tag, ...props, children,
+    classList: { add() {} },
     append(...items) { this.children.push(...items); },
   };
 }
 function mdBlock(body) { return el("div", { className: "md" }, body); }
 function chatShellLabel() { return "Shell"; }
+const fmt = (value) => value.toLocaleString("en-US");
 """ + helper + bubble + r"""
 const createdAt = "2026-08-06T06:17:00+02:00";
 const user = chatBubble("user", "hello", "completed", null, createdAt);
+const userWithTokens = chatBubble("user", "hello", "", null, createdAt, 12345);
+const assistant = chatBubble("assistant", "hello", "", null, createdAt, 12345);
+const assistantWithoutTokens = chatBubble("assistant", "hello", "", null, createdAt);
 const activity = chatBubble("activity", "working");
 console.log(JSON.stringify({
   valid: chatMessageTimeLabel(createdAt),
@@ -475,6 +812,14 @@ console.log(JSON.stringify({
     time: user.children[0].children[1].children[0],
   },
   activityHeaderItems: activity.children[0].children.length,
+  assistantToken: {
+    className: assistant.children.at(-1).className,
+    text: assistant.children.at(-1).children[0],
+  },
+  userHasToken: userWithTokens.children.some(
+    (child) => child.className === "chat-context-tokens"),
+  assistantWithoutTokensHasToken: assistantWithoutTokens.children.some(
+    (child) => child.className === "chat-context-tokens"),
 }));
 """
     assert run_js(script) == {
@@ -490,6 +835,12 @@ console.log(JSON.stringify({
             "time": "04:17",
         },
         "activityHeaderItems": 1,
+        "assistantToken": {
+            "className": "chat-context-tokens",
+            "text": "12,345 tok",
+        },
+        "userHasToken": False,
+        "assistantWithoutTokensHasToken": False,
     }
     transcript_item = APP[
         APP.index("function chatTranscriptItemNode"):
@@ -546,7 +897,8 @@ console.log(JSON.stringify({
         APP.index("async function renderInterface"):
         APP.index("// ── Tabs + boot")
     ]
-    assert "chatUnreadBadge(item)" in interface
+    assert "const mail = chatUnreadBadge(shell)" in SHELL_INDICATORS
+    assert "chatPaintShellIndicators(statusItem, item)" in interface
     assert ".chat-shell-mail" in STYLE
 
 
@@ -615,15 +967,19 @@ def test_interface_arrival_defers_configuration_and_phases_history_requests():
     interface = APP[APP.index("async function renderInterface"):
                     APP.index("// ── Tabs + boot")]
     loader = APP[APP.index("function chatLoadConfiguration"):
-                 APP.index("function chatStopStream")]
+                     APP.index("function chatStopStream")]
+    open_chat = interface[interface.index("const loadTranscript = async"):
+                          interface.index("await loadTranscript()")]
 
-    assert 'api("/models")' not in interface
-    assert 'api("/flavor-defaults")' not in interface
+    assert 'api("/models").catch(() => null)' in open_chat
+    assert 'api("/flavor-defaults").catch(() => null)' in open_chat
     assert 'api("/flavor-defaults")' in loader
     assert 'api("/models")' in loader
-    assert "if (chatConfiguration) return Promise.resolve(chatConfiguration)" in loader
     assert "if (chatConfigurationPromise) return chatConfigurationPromise" in loader
     assert "chatConfigurationPromise = null" in loader
+    assert "request.then(clear, clear)" in loader
+    assert "let chatConfiguration =" not in APP
+    assert "let chatHarnessDefaults" not in APP
     assert 'chatApi("/conversations?open=true&limit=100")' in interface
     assert "starred=false&limit=20" in interface
     assert "starred=true&limit=100" in interface
@@ -830,6 +1186,7 @@ def test_layout_retains_shell_rail_chat_history_and_bubble_transcript():
         ".chat-transcript",
         ".chat-bubble.chat-user",
         ".chat-bubble.chat-assistant",
+        ".chat-context-tokens",
         ".chat-composer",
         ".chat-jump-latest",
         ".chat-jump-latest[hidden]",

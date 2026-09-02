@@ -1,0 +1,156 @@
+{
+  "schema_version": 3,
+  "source_summary": {
+    "sprint_count": 8,
+    "liveness_expectations": 105,
+    "quota_reviewer_episodes": 21,
+    "liveness_nudges": 2,
+    "wake_requeues": 19
+  },
+  "quota_episode_topology": {
+    "sprint_key": "history-02",
+    "generation_alias": "G2",
+    "messages_per_wake": 1,
+    "successful_attempts_per_wake": 1,
+    "shared_wakes": false,
+    "shared_conversations": false,
+    "stale_generations": false,
+    "requeues_include_episode_wakes": false
+  },
+  "historical_snapshots": [
+    {"sprint_key": "history-01", "generation_alias": "G1", "run_start_offset": 12, "accepted_offset": 27, "project_offset": 28, "accepted_expectation_count": 3},
+    {"sprint_key": "history-02", "generation_alias": "G2", "run_start_offset": 12, "accepted_offset": 30, "project_offset": 31, "accepted_expectation_count": 2},
+    {"sprint_key": "history-03", "generation_alias": "G3", "run_start_offset": 13, "accepted_offset": 32, "project_offset": 33, "accepted_expectation_count": 1},
+    {"sprint_key": "history-04", "generation_alias": "G4", "run_start_offset": 15, "accepted_offset": 52, "project_offset": 53, "accepted_expectation_count": 1},
+    {"sprint_key": "history-05", "generation_alias": "G5", "run_start_offset": 16, "accepted_offset": 33, "project_offset": 34, "accepted_expectation_count": 1},
+    {"sprint_key": "history-06", "generation_alias": "G6", "run_start_offset": 15, "accepted_offset": 33, "project_offset": 34, "accepted_expectation_count": 2},
+    {"sprint_key": "history-07", "generation_alias": "G7", "run_start_offset": 15, "accepted_offset": 35, "project_offset": 36, "accepted_expectation_count": 1},
+    {"sprint_key": "history-08", "generation_alias": "G8", "run_start_offset": 11, "accepted_offset": 30, "project_offset": 31, "accepted_expectation_count": 2}
+  ],
+  "recovery_topology": {
+    "trigger": "pulse",
+    "prior_wake_state": "delivered",
+    "replacement_wake_state": "delivered",
+    "attempts_per_wake": 1,
+    "replacement_message_kind": "notification",
+    "replacement_scope": "sprint",
+    "prior_membership": "unknown-source",
+    "replacement_create_offset": 0,
+    "replacement_attempt_offset": 0,
+    "shared_wakes_or_messages": false
+  },
+  "wake_recoveries": [
+    {"sequence": "R01", "sprint_key": "history-01", "generation_alias": "G1", "event_offset": 0, "participant_alias": "P1", "conversation_alias": "C1", "prior_create_offset": -5, "prior_attempt_offset": -5, "prior_turn_state": "queued", "prior_run_state": null, "reason": null, "replacement_run_start_offset": 92, "replacement_run_end_offset": 107, "replacement_run_state": "succeeded", "replacement_turn_state": "completed", "creation_mode": "legacy"},
+    {"sequence": "R02", "sprint_key": "history-01", "generation_alias": "G1", "event_offset": 364, "participant_alias": "P1", "conversation_alias": "C1", "prior_create_offset": -8, "prior_attempt_offset": -5, "prior_turn_state": "running", "prior_run_state": "running", "reason": null, "replacement_run_start_offset": 95, "replacement_run_end_offset": 117, "replacement_run_state": "succeeded", "replacement_turn_state": "completed", "creation_mode": "legacy"},
+    {"sequence": "R03", "sprint_key": "history-01", "generation_alias": "G1", "event_offset": 379, "participant_alias": "P1", "conversation_alias": "C1", "prior_create_offset": -8, "prior_attempt_offset": -5, "prior_turn_state": "queued", "prior_run_state": null, "reason": null, "replacement_run_start_offset": 121, "replacement_run_end_offset": 134, "replacement_run_state": "succeeded", "replacement_turn_state": "completed", "creation_mode": "legacy"},
+    {"sequence": "R04", "sprint_key": "history-01", "generation_alias": "G1", "event_offset": 1875, "participant_alias": "P1", "conversation_alias": "C1", "prior_create_offset": -8, "prior_attempt_offset": -5, "prior_turn_state": "running", "prior_run_state": "running", "reason": null, "replacement_run_start_offset": 20, "replacement_run_end_offset": 67, "replacement_run_state": "succeeded", "replacement_turn_state": "completed", "creation_mode": "legacy"},
+    {"sequence": "R05", "sprint_key": "history-01", "generation_alias": "G1", "event_offset": 1910, "participant_alias": "P1", "conversation_alias": "C1", "prior_create_offset": -8, "prior_attempt_offset": -5, "prior_turn_state": "queued", "prior_run_state": null, "reason": null, "replacement_run_start_offset": 50, "replacement_run_end_offset": 65, "replacement_run_state": "succeeded", "replacement_turn_state": "completed", "creation_mode": "legacy"},
+    {"sequence": "R06", "sprint_key": "history-01", "generation_alias": "G1", "event_offset": 2355, "participant_alias": "P1", "conversation_alias": "C1", "prior_create_offset": -6, "prior_attempt_offset": -5, "prior_turn_state": "running", "prior_run_state": "running", "reason": null, "replacement_run_start_offset": 21, "replacement_run_end_offset": 40, "replacement_run_state": "succeeded", "replacement_turn_state": "completed", "creation_mode": "legacy"},
+    {"sequence": "R07", "sprint_key": "history-01", "generation_alias": "G1", "event_offset": 2510, "participant_alias": "P1", "conversation_alias": "C1", "prior_create_offset": -7, "prior_attempt_offset": -5, "prior_turn_state": "running", "prior_run_state": "running", "reason": null, "replacement_run_start_offset": 26, "replacement_run_end_offset": 41, "replacement_run_state": "succeeded", "replacement_turn_state": "completed", "creation_mode": "legacy"},
+    {"sequence": "R08", "sprint_key": "history-01", "generation_alias": "G1", "event_offset": 4700, "participant_alias": "P1", "conversation_alias": "C1", "prior_create_offset": -8, "prior_attempt_offset": -5, "prior_turn_state": "running", "prior_run_state": "running", "reason": null, "replacement_run_start_offset": 18, "replacement_run_end_offset": 33, "replacement_run_state": "succeeded", "replacement_turn_state": "completed", "creation_mode": "legacy"},
+    {"sequence": "R09", "sprint_key": "history-01", "generation_alias": "G1", "event_offset": 8261, "participant_alias": "RA", "conversation_alias": "C2", "prior_create_offset": -7, "prior_attempt_offset": -5, "prior_turn_state": "queued", "prior_run_state": null, "reason": null, "replacement_run_start_offset": 1267, "replacement_run_end_offset": 1296, "replacement_run_state": "succeeded", "replacement_turn_state": "completed", "creation_mode": "legacy"},
+    {"sequence": "R10", "sprint_key": "history-01", "generation_alias": "G1", "event_offset": 8261, "participant_alias": "P1", "conversation_alias": "C1", "prior_create_offset": -5, "prior_attempt_offset": -5, "prior_turn_state": "running", "prior_run_state": "running", "reason": null, "replacement_run_start_offset": 32, "replacement_run_end_offset": 74, "replacement_run_state": "succeeded", "replacement_turn_state": "completed", "creation_mode": "legacy"},
+    {"sequence": "R11", "sprint_key": "history-01", "generation_alias": "G1", "event_offset": 8311, "participant_alias": "P1", "conversation_alias": "C1", "prior_create_offset": -8, "prior_attempt_offset": -5, "prior_turn_state": "queued", "prior_run_state": null, "reason": null, "replacement_run_start_offset": 41, "replacement_run_end_offset": 56, "replacement_run_state": "succeeded", "replacement_turn_state": "completed", "creation_mode": "legacy"},
+    {"sequence": "R12", "sprint_key": "history-01", "generation_alias": "G1", "event_offset": 8757, "participant_alias": "P1", "conversation_alias": "C1", "prior_create_offset": -6, "prior_attempt_offset": -5, "prior_turn_state": "running", "prior_run_state": "running", "reason": null, "replacement_run_start_offset": 78, "replacement_run_end_offset": 91, "replacement_run_state": "succeeded", "replacement_turn_state": "completed", "creation_mode": "legacy"},
+    {"sequence": "R13", "sprint_key": "history-02", "generation_alias": "G2", "event_offset": 0, "participant_alias": "RB", "conversation_alias": "C13", "prior_create_offset": -6, "prior_attempt_offset": -5, "prior_turn_state": "failed", "prior_run_state": "unknown", "reason": "HARNESS_WORKTREE_MISMATCH", "replacement_run_start_offset": 1, "replacement_run_end_offset": 1, "replacement_run_state": "unknown", "replacement_turn_state": "failed", "creation_mode": "current"},
+    {"sequence": "R14", "sprint_key": "history-02", "generation_alias": "G2", "event_offset": 5, "participant_alias": "RC", "conversation_alias": "C14", "prior_create_offset": -7, "prior_attempt_offset": -5, "prior_turn_state": "failed", "prior_run_state": "unknown", "reason": "HARNESS_WORKTREE_MISMATCH", "replacement_run_start_offset": 1, "replacement_run_end_offset": 1, "replacement_run_state": "unknown", "replacement_turn_state": "failed", "creation_mode": "current"},
+    {"sequence": "R15", "sprint_key": "history-02", "generation_alias": "G2", "event_offset": 3966, "participant_alias": "RC", "conversation_alias": "C15", "prior_create_offset": -7, "prior_attempt_offset": -5, "prior_turn_state": "failed", "prior_run_state": "unknown", "reason": "HARNESS_WORKTREE_MISMATCH", "replacement_run_start_offset": 1, "replacement_run_end_offset": 1, "replacement_run_state": "unknown", "replacement_turn_state": "failed", "creation_mode": "current"},
+    {"sequence": "R16", "sprint_key": "history-02", "generation_alias": "G2", "event_offset": 3971, "participant_alias": "RB", "conversation_alias": "C16", "prior_create_offset": -7, "prior_attempt_offset": -5, "prior_turn_state": "failed", "prior_run_state": "unknown", "reason": "HARNESS_WORKTREE_MISMATCH", "replacement_run_start_offset": 1, "replacement_run_end_offset": 1, "replacement_run_state": "unknown", "replacement_turn_state": "failed", "creation_mode": "current"},
+    {"sequence": "R17", "sprint_key": "history-02", "generation_alias": "G2", "event_offset": 4062, "participant_alias": "RA", "conversation_alias": "C17", "prior_create_offset": -8, "prior_attempt_offset": -5, "prior_turn_state": "failed", "prior_run_state": "unknown", "reason": "HARNESS_WORKTREE_MISMATCH", "replacement_run_start_offset": 0, "replacement_run_end_offset": 0, "replacement_run_state": "unknown", "replacement_turn_state": "failed", "creation_mode": "current"},
+    {"sequence": "R18", "sprint_key": "history-02", "generation_alias": "G2", "event_offset": 5312, "participant_alias": "RA", "conversation_alias": "C18", "prior_create_offset": -6, "prior_attempt_offset": -5, "prior_turn_state": "failed", "prior_run_state": "unknown", "reason": "HARNESS_WORKTREE_MISMATCH", "replacement_run_start_offset": 1, "replacement_run_end_offset": 1, "replacement_run_state": "unknown", "replacement_turn_state": "failed", "creation_mode": "manual-legacy"},
+    {"sequence": "R19", "sprint_key": "history-05", "generation_alias": "G5", "event_offset": 0, "participant_alias": "RA", "conversation_alias": "C19", "prior_create_offset": -527, "prior_attempt_offset": -527, "prior_turn_state": "completed", "prior_run_state": "succeeded", "reason": null, "replacement_run_start_offset": 3, "replacement_run_end_offset": 259, "replacement_run_state": "succeeded", "replacement_turn_state": "completed", "creation_mode": "current"}
+  ],
+  "historical_nudges": [
+    {"sequence": "N1", "sprint_key": "history-01", "generation_alias": "G1", "expectation_alias": "E1", "unit_alias": "U1", "participant_alias": "D1", "accepted_to_nudge_seconds": 1801, "delivery_offset": 0, "read_offset": 51, "run_start_offset": 1, "run_end_offset": 255, "run_state": "succeeded", "conversation_alias": "CN1"},
+    {"sequence": "N2", "sprint_key": "history-06", "generation_alias": "G6", "expectation_alias": "E2", "unit_alias": "U2", "participant_alias": "D2", "accepted_to_nudge_seconds": 905, "delivery_offset": 0, "read_offset": 35, "run_start_offset": 6, "run_end_offset": 44, "run_state": "succeeded", "conversation_alias": "CN2"}
+  ],
+  "sprints": [
+    {
+      "key": "history-01",
+      "generation_alias": "G1",
+      "liveness_expectation_count": 16,
+      "quota_reviewer_episode_count": 0,
+      "nudge_count": 1,
+      "wake_requeues": 12
+    },
+    {
+      "key": "history-02",
+      "generation_alias": "G2",
+      "liveness_expectation_count": 45,
+      "quota_reviewer_episode_count": 21,
+      "nudge_count": 0,
+      "wake_requeues": 6
+    },
+    {
+      "key": "history-03",
+      "generation_alias": "G3",
+      "liveness_expectation_count": 2,
+      "quota_reviewer_episode_count": 0,
+      "nudge_count": 0,
+      "wake_requeues": 0
+    },
+    {
+      "key": "history-04",
+      "generation_alias": "G4",
+      "liveness_expectation_count": 2,
+      "quota_reviewer_episode_count": 0,
+      "nudge_count": 0,
+      "wake_requeues": 0
+    },
+    {
+      "key": "history-05",
+      "generation_alias": "G5",
+      "liveness_expectation_count": 11,
+      "quota_reviewer_episode_count": 0,
+      "nudge_count": 0,
+      "wake_requeues": 1
+    },
+    {
+      "key": "history-06",
+      "generation_alias": "G6",
+      "liveness_expectation_count": 11,
+      "quota_reviewer_episode_count": 0,
+      "nudge_count": 1,
+      "wake_requeues": 0
+    },
+    {
+      "key": "history-07",
+      "generation_alias": "G7",
+      "liveness_expectation_count": 2,
+      "quota_reviewer_episode_count": 0,
+      "nudge_count": 0,
+      "wake_requeues": 0
+    },
+    {
+      "key": "history-08",
+      "generation_alias": "G8",
+      "liveness_expectation_count": 16,
+      "quota_reviewer_episode_count": 0,
+      "nudge_count": 0,
+      "wake_requeues": 0
+    }
+  ],
+  "quota_reviewer_episodes": [
+    {"sequence": "E01", "unit_alias": "UA", "reviewer_alias": "R1", "wake_alias": "W01", "conversation_alias": "C01", "accepted_to_escalation_seconds": 301, "escalation_to_verdict_seconds": 115, "verdict": "changes_requested"},
+    {"sequence": "E02", "unit_alias": "UB", "reviewer_alias": "R2", "wake_alias": "W02", "conversation_alias": "C02", "accepted_to_escalation_seconds": 302, "escalation_to_verdict_seconds": 100, "verdict": "changes_requested"},
+    {"sequence": "E03", "unit_alias": "UA", "reviewer_alias": "R1", "wake_alias": "W03", "conversation_alias": "C03", "accepted_to_escalation_seconds": 304, "escalation_to_verdict_seconds": 163, "verdict": "changes_requested"},
+    {"sequence": "E04", "unit_alias": "UB", "reviewer_alias": "R2", "wake_alias": "W04", "conversation_alias": "C04", "accepted_to_escalation_seconds": 300, "escalation_to_verdict_seconds": 338, "verdict": "changes_requested"},
+    {"sequence": "E05", "unit_alias": "UA", "reviewer_alias": "R1", "wake_alias": "W05", "conversation_alias": "C05", "accepted_to_escalation_seconds": 302, "escalation_to_verdict_seconds": 321, "verdict": "changes_requested"},
+    {"sequence": "E06", "unit_alias": "UB", "reviewer_alias": "R2", "wake_alias": "W06", "conversation_alias": "C06", "accepted_to_escalation_seconds": 304, "escalation_to_verdict_seconds": 394, "verdict": "changes_requested"},
+    {"sequence": "E07", "unit_alias": "UA", "reviewer_alias": "R1", "wake_alias": "W07", "conversation_alias": "C07", "accepted_to_escalation_seconds": 302, "escalation_to_verdict_seconds": 295, "verdict": "approved"},
+    {"sequence": "E08", "unit_alias": "UB", "reviewer_alias": "R2", "wake_alias": "W08", "conversation_alias": "C08", "accepted_to_escalation_seconds": 301, "escalation_to_verdict_seconds": 406, "verdict": "changes_requested"},
+    {"sequence": "E09", "unit_alias": "UB", "reviewer_alias": "R2", "wake_alias": "W09", "conversation_alias": "C09", "accepted_to_escalation_seconds": 302, "escalation_to_verdict_seconds": 248, "verdict": "approved"},
+    {"sequence": "E10", "unit_alias": "UC", "reviewer_alias": "R3", "wake_alias": "W10", "conversation_alias": "C10", "accepted_to_escalation_seconds": 303, "escalation_to_verdict_seconds": 384, "verdict": "changes_requested"},
+    {"sequence": "E11", "unit_alias": "UD", "reviewer_alias": "R1", "wake_alias": "W11", "conversation_alias": "C11", "accepted_to_escalation_seconds": 303, "escalation_to_verdict_seconds": 162, "verdict": "changes_requested"},
+    {"sequence": "E12", "unit_alias": "UC", "reviewer_alias": "R3", "wake_alias": "W12", "conversation_alias": "C12", "accepted_to_escalation_seconds": 300, "escalation_to_verdict_seconds": 479, "verdict": "changes_requested"},
+    {"sequence": "E13", "unit_alias": "UD", "reviewer_alias": "R1", "wake_alias": "W13", "conversation_alias": "C13", "accepted_to_escalation_seconds": 301, "escalation_to_verdict_seconds": 374, "verdict": "changes_requested"},
+    {"sequence": "E14", "unit_alias": "UC", "reviewer_alias": "R3", "wake_alias": "W14", "conversation_alias": "C14", "accepted_to_escalation_seconds": 301, "escalation_to_verdict_seconds": 429, "verdict": "approved"},
+    {"sequence": "E15", "unit_alias": "UD", "reviewer_alias": "R1", "wake_alias": "W15", "conversation_alias": "C15", "accepted_to_escalation_seconds": 303, "escalation_to_verdict_seconds": 205, "verdict": "approved"},
+    {"sequence": "E16", "unit_alias": "UE", "reviewer_alias": "R2", "wake_alias": "W16", "conversation_alias": "C16", "accepted_to_escalation_seconds": 300, "escalation_to_verdict_seconds": 135, "verdict": "changes_requested"},
+    {"sequence": "E17", "unit_alias": "UE", "reviewer_alias": "R2", "wake_alias": "W17", "conversation_alias": "C17", "accepted_to_escalation_seconds": 304, "escalation_to_verdict_seconds": 249, "verdict": "changes_requested"},
+    {"sequence": "E18", "unit_alias": "UE", "reviewer_alias": "R2", "wake_alias": "W18", "conversation_alias": "C18", "accepted_to_escalation_seconds": 304, "escalation_to_verdict_seconds": 229, "verdict": "approved"},
+    {"sequence": "E19", "unit_alias": "UF", "reviewer_alias": "R1", "wake_alias": "W19", "conversation_alias": "C19", "accepted_to_escalation_seconds": 307, "escalation_to_verdict_seconds": 348, "verdict": "approved"},
+    {"sequence": "E20", "unit_alias": "UG", "reviewer_alias": "R2", "wake_alias": "W20", "conversation_alias": "C20", "accepted_to_escalation_seconds": 302, "escalation_to_verdict_seconds": 13, "verdict": "approved"},
+    {"sequence": "E21", "unit_alias": "UH", "reviewer_alias": "R2", "wake_alias": "W21", "conversation_alias": "C21", "accepted_to_escalation_seconds": 303, "escalation_to_verdict_seconds": 350, "verdict": "approved"}
+  ]
+}

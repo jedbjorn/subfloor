@@ -20,6 +20,7 @@ import re
 import shutil
 import stat
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -31,13 +32,27 @@ ROOT = Path(__file__).resolve().parents[1]
 UNCHARTED_BY_DESIGN = {
     # `./sc help` listing itself is noise.
     "help",
+    # General engine SQL is deliberately absent from ordinary help. Admin's
+    # engine_database skill owns discovery and guarded usage.
+    "sql",
+    "sql-rw",
 }
 
 
 def sc(*args: str, env: dict | None = None) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(["./sc", *args], cwd=ROOT, text=True,
-                          capture_output=True, check=False,
-                          env={**os.environ, "NO_COLOR": "1", **(env or {})})
+    return subprocess.run(
+        ["./sc", *args],
+        cwd=ROOT,
+        text=True,
+        capture_output=True,
+        check=False,
+        env={
+            **os.environ,
+            "NO_COLOR": "1",
+            "SC_DISPATCH": str(ROOT / ".super-coder" / "scripts" / "dispatch.sh"),
+            **(env or {}),
+        },
+    )
 
 
 def fork_ports() -> dict:
@@ -96,17 +111,30 @@ class EnterPreAttachPrintTest(unittest.TestCase):
     def setUp(self):
         self.bin = Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, self.bin)
+        # These tests exercise URL ordering and attach dispatch, not the
+        # provisioning contract.  The launcher resolves helpers from the live
+        # main checkout even when SC_DISPATCH points at this worktree, so keep
+        # readiness at its already-satisfied seam here.
+        self._stub(
+            "python3",
+            "#!/bin/sh\n"
+            "case \"$*\" in *sandbox_devkit.py*) exit 0 ;; esac\n"
+            f"exec {sys.executable} \"$@\"\n",
+        )
         self._stub(
             "docker",
             "#!/bin/sh\n"
-            "[ -n \"$SC_DOCKER_LOG\" ] && printf '%s\\n' \"$*\" > \"$SC_DOCKER_LOG\"\n"
+            "[ -n \"$SC_DOCKER_LOG\" ] && printf '%s\\n' \"$*\" >> \"$SC_DOCKER_LOG\"\n"
             "exit 0\n",
         )
         # A python that runs everything except ports.py — the one seam whose
         # failure must not decide whether the operator gets a shell.
         self._stub("no-ports-python",
-                   "#!/bin/sh\ncase \"$*\" in *ports.py*) exit 1 ;; esac\n"
-                   "exec python3 \"$@\"\n")
+                   "#!/bin/sh\ncase \"$*\" in\n"
+                   "  *ports.py*) exit 1 ;;\n"
+                   "  *sandbox_devkit.py*) exit 0 ;;\n"
+                   "esac\n"
+                   f"exec {sys.executable} \"$@\"\n")
 
     def _stub(self, name: str, body: str) -> Path:
         path = self.bin / name
@@ -161,6 +189,32 @@ class EnterPreAttachPrintTest(unittest.TestCase):
 
 class HelpChartTest(unittest.TestCase):
     """A live verb absent from the chart is a verb its operator cannot find."""
+
+    def test_logs_help_does_not_select_the_docker_runtime(self):
+        with tempfile.TemporaryDirectory() as directory:
+            bin_dir = Path(directory)
+            marker = bin_dir / "docker-ran"
+            docker = bin_dir / "docker"
+            docker.write_text(
+                "#!/bin/sh\n"
+                f"touch {marker}\n"
+                "exit 99\n"
+            )
+            docker.chmod(docker.stat().st_mode | stat.S_IEXEC)
+
+            out = sc(
+                "logs",
+                "--help",
+                env={"PATH": f"{bin_dir}:{os.environ['PATH']}"},
+            )
+
+            self.assertEqual(out.returncode, 0, out.stderr)
+            self.assertEqual(
+                out.stdout,
+                "usage: ./sc logs\n"
+                "  Tail the managed server logs until interrupted.\n",
+            )
+            self.assertFalse(marker.exists())
 
     def test_update_help_matches_ff_only_runtime_contract(self):
         help_text = sc("help").stdout

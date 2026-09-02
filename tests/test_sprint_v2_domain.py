@@ -12,7 +12,6 @@ from contextlib import closing
 from pathlib import Path
 from unittest import mock
 
-
 ROOT = Path(__file__).resolve().parents[1]
 ENGINE = ROOT / ".super-coder"
 SCHEMA = ENGINE / "schema.sql"
@@ -20,11 +19,17 @@ MIGRATIONS = ENGINE / "migrations"
 FOUNDATION = MIGRATIONS / "0146_sprint_v2_domain.sql"
 GENERATION_MIGRATION = MIGRATIONS / "0155_sprint_conversation_generations.sql"
 OPTIONAL_QAQC_MIGRATION = MIGRATIONS / "0185_optional_sprint_qaqc.sql"
+LIVE_REPLAN_MIGRATION = MIGRATIONS / "0199_sprint_live_replanning.sql"
+CONFORMANCE_OWNER_MIGRATION = (
+    MIGRATIONS / "0205_sprint_conformance_ownership.sql"
+)
 
 sys.path.insert(0, str(ENGINE / "scripts"))
 import db_driver  # noqa: E402
 import migrate  # noqa: E402
 import sprint_domain  # noqa: E402
+import sprint_message_delivery  # noqa: E402
+from sprint_route_binding_support import candidate as route_candidate  # noqa: E402
 
 
 def apply_schema(con: sqlite3.Connection, *, through: str | None = None) -> None:
@@ -38,6 +43,17 @@ def apply_schema(con: sqlite3.Connection, *, through: str | None = None) -> None
 
 class SprintDomainCase(unittest.TestCase):
     def setUp(self) -> None:
+        route_patch = mock.patch.object(
+            sprint_domain, "_participant_binding_candidate", side_effect=route_candidate
+        )
+        route_patch.start()
+        self.addCleanup(route_patch.stop)
+        evidence_patch = mock.patch.object(
+            sprint_domain.route_bindings,
+            "verify_stored_v2_before_first_turn",
+        )
+        evidence_patch.start()
+        self.addCleanup(evidence_patch.stop)
         self.con = sqlite3.connect(":memory:")
         self.addCleanup(self.con.close)
         self.con.row_factory = sqlite3.Row
@@ -93,9 +109,9 @@ class SprintDomainCase(unittest.TestCase):
         ).lastrowid
         self.con.execute(
             "INSERT INTO sprint_specs "
-            "(sprint_id,document_id,bound_revision_sha256,approval_id) "
-            "VALUES (?,?,?,?)",
-            (sprint_id, document_id, revision, approval_id),
+            "(sprint_id,document_id,bound_revision_sha256,approval_id,"
+            "bound_revision_body) VALUES (?,?,?,?,?)",
+            (sprint_id, document_id, revision, approval_id, body),
         )
         self.con.executemany(
             "INSERT INTO sprint_participants "
@@ -118,6 +134,95 @@ class SprintDomainCase(unittest.TestCase):
 
 
 class MigrationAndShapeTest(SprintDomainCase):
+    @staticmethod
+    def _pre_owner_terminal_db(*, reviewer_shell_ids: tuple[int, ...]):
+        con = sqlite3.connect(":memory:")
+        con.row_factory = sqlite3.Row
+        apply_schema(con, through="0204_sprint_governing_revision_evidence.sql")
+        con.execute("INSERT INTO users (user_id,username) VALUES (1,'operator')")
+        con.executemany(
+            "INSERT INTO shells "
+            "(shell_id,display_name,shortname,flavor,system_prompt,user_id) "
+            "VALUES (?,?,?,?,?,1)",
+            (
+                (1, "Developer", "DEV1", "dev", "prompt"),
+                (2, "Reviewer one", "REV1", "reviewer", "prompt"),
+                (3, "Planner", "PLN1", "planner", "prompt"),
+                (5, "Reviewer two", "REV2", "reviewer", "prompt"),
+            ),
+        )
+        feature_id = int(
+            con.execute("INSERT INTO roadmap (title) VALUES ('Feature')").lastrowid
+        )
+        sprint_id = int(
+            con.execute(
+                "INSERT INTO sprints "
+                "(feature_id,originating_planner_shell_id,merge_grant_enabled) "
+                "VALUES (?,3,1)",
+                (feature_id,),
+            ).lastrowid
+        )
+        participants = [(sprint_id, 3, "planner"), (sprint_id, 1, "developer")]
+        participants.extend(
+            (sprint_id, reviewer_shell_id, "reviewer")
+            for reviewer_shell_id in reviewer_shell_ids
+        )
+        con.executemany(
+            "INSERT INTO sprint_participants "
+            "(sprint_id,shell_id,role,harness) VALUES (?,?,?,'codex')",
+            participants,
+        )
+        reviewer_shell_id = reviewer_shell_ids[0]
+        con.execute(
+            "INSERT INTO sprint_work_units "
+            "(sprint_id,assigned_shell_id,reviewer_shell_id,title,expected_output,"
+            "disposition,completed_at) "
+            "VALUES (?,1,?,'Historical lane','Historical output','completed',"
+            "'2026-08-01 00:00:00')",
+            (sprint_id, reviewer_shell_id),
+        )
+        participant_id = int(
+            con.execute(
+                "SELECT participant_id FROM sprint_participants "
+                "WHERE sprint_id=? AND shell_id=?",
+                (sprint_id, reviewer_shell_id),
+            ).fetchone()[0]
+        )
+        con.execute(
+            "INSERT INTO wake_message "
+            "(sprint_id,receiver_shell_id,to_participant_id,message_kind,body,"
+            "declared_type,actionable,read_at,delivered_at,idempotency_key) "
+            "VALUES (?,?,?,'notification','Old broadcast closeout','new',0,"
+            "'2026-08-01 00:00:00','2026-08-01 00:00:00',?)",
+            (
+                sprint_id,
+                reviewer_shell_id,
+                participant_id,
+                f"historical:{sprint_id}:delivery-terminal",
+            ),
+        )
+        con.execute(
+            "INSERT INTO sprint_events "
+            "(sprint_id,event_type,actor_kind,payload) "
+            "VALUES (?,'sprint.delivery_terminal','system',?)",
+            (
+                sprint_id,
+                json.dumps(
+                    {
+                        "terminal_count": 1,
+                        "completed_count": 1,
+                        "cancelled_count": 0,
+                    }
+                ),
+            ),
+        )
+        con.execute(
+            "UPDATE sprints SET lifecycle='armed' WHERE sprint_id=?",
+            (sprint_id,),
+        )
+        con.commit()
+        return con, sprint_id
+
     @staticmethod
     def _seed_prechange_binding(con: sqlite3.Connection) -> tuple[int, int, str, int]:
         con.execute("INSERT INTO users (user_id,username) VALUES (1,'operator')")
@@ -214,6 +319,312 @@ class MigrationAndShapeTest(SprintDomainCase):
                 ),
             )
             self.assertEqual(2, con.execute("SELECT COUNT(*) FROM sprint_specs").fetchone()[0])
+            self.assertEqual([], con.execute("PRAGMA foreign_key_check").fetchall())
+
+    def test_conformance_owner_migration_backfills_only_unambiguous_history(self) -> None:
+        with closing(sqlite3.connect(":memory:")) as con:
+            con.row_factory = sqlite3.Row
+            apply_schema(con, through="0204_sprint_governing_revision_evidence.sql")
+            con.execute("INSERT INTO users (user_id,username) VALUES (1,'operator')")
+            con.executemany(
+                "INSERT INTO shells "
+                "(shell_id,display_name,shortname,flavor,system_prompt,user_id) "
+                "VALUES (?,?,?,?,?,1)",
+                (
+                    (2, "Reviewer one", "REV1", "reviewer", "prompt"),
+                    (3, "Planner", "PLN1", "planner", "prompt"),
+                    (5, "Reviewer two", "REV2", "reviewer", "prompt"),
+                ),
+            )
+            feature_id = int(
+                con.execute("INSERT INTO roadmap (title) VALUES ('Feature')").lastrowid
+            )
+            unambiguous = int(
+                con.execute(
+                    "INSERT INTO sprints "
+                    "(feature_id,originating_planner_shell_id) VALUES (?,3)",
+                    (feature_id,),
+                ).lastrowid
+            )
+            ambiguous = int(
+                con.execute(
+                    "INSERT INTO sprints "
+                    "(feature_id,originating_planner_shell_id) VALUES (?,3)",
+                    (feature_id,),
+                ).lastrowid
+            )
+            con.executemany(
+                "INSERT INTO sprint_participants "
+                "(sprint_id,shell_id,role,harness) VALUES (?,?,?,'codex')",
+                (
+                    (unambiguous, 3, "planner"),
+                    (unambiguous, 2, "reviewer"),
+                    (ambiguous, 3, "planner"),
+                    (ambiguous, 2, "reviewer"),
+                    (ambiguous, 5, "reviewer"),
+                ),
+            )
+            con.commit()
+
+            con.executescript(CONFORMANCE_OWNER_MIGRATION.read_text())
+
+            self.assertEqual(
+                [(unambiguous, 2, 1), (ambiguous, None, 0)],
+                [
+                    tuple(row)
+                    for row in con.execute(
+                        "SELECT sprint_id,conformance_reviewer_shell_id,"
+                        "conformance_owner_generation FROM sprints "
+                        "ORDER BY sprint_id"
+                    )
+                ],
+            )
+            with self.assertRaisesRegex(
+                sqlite3.IntegrityError,
+                "active Reviewer participant",
+            ):
+                con.execute(
+                    "UPDATE sprints SET conformance_reviewer_shell_id=3,"
+                    "conformance_owner_generation=2 WHERE sprint_id=?",
+                    (unambiguous,),
+                )
+            with self.assertRaisesRegex(sqlite3.IntegrityError, "generation is invalid"):
+                con.execute(
+                    "UPDATE sprints SET conformance_owner_generation=2 "
+                    "WHERE sprint_id=?",
+                    (unambiguous,),
+                )
+            with self.assertRaisesRegex(
+                sqlite3.IntegrityError,
+                "arming requires a Sprint conformance owner",
+            ):
+                con.execute(
+                    "UPDATE sprints SET lifecycle='armed' WHERE sprint_id=?",
+                    (ambiguous,),
+                )
+            con.execute(
+                "UPDATE sprints SET conformance_reviewer_shell_id=5,"
+                "conformance_owner_generation=1,merge_grant_enabled=1 "
+                "WHERE sprint_id=?",
+                (ambiguous,),
+            )
+            con.execute(
+                "UPDATE sprints SET lifecycle='armed' WHERE sprint_id=?",
+                (ambiguous,),
+            )
+            with self.assertRaisesRegex(
+                sqlite3.IntegrityError,
+                "reassigned only while paused",
+            ):
+                con.execute(
+                    "UPDATE sprints SET conformance_reviewer_shell_id=2,"
+                    "conformance_owner_generation=2 WHERE sprint_id=?",
+                    (ambiguous,),
+                )
+            con.execute(
+                "UPDATE sprints SET lifecycle='paused' WHERE sprint_id=?",
+                (ambiguous,),
+            )
+            con.execute(
+                "UPDATE sprints SET conformance_reviewer_shell_id=2,"
+                "conformance_owner_generation=2 WHERE sprint_id=?",
+                (ambiguous,),
+            )
+            self.assertEqual(
+                (2, 2, "paused"),
+                tuple(
+                    con.execute(
+                        "SELECT conformance_reviewer_shell_id,"
+                        "conformance_owner_generation,lifecycle FROM sprints "
+                        "WHERE sprint_id=?",
+                        (ambiguous,),
+                    ).fetchone()
+                ),
+            )
+
+    def test_conformance_owner_upgrade_reconciles_terminal_history_once(self) -> None:
+        for reviewers, expected_owner in (((2,), 2), ((2, 5), None)):
+            with self.subTest(reviewers=reviewers), closing(
+                self._pre_owner_terminal_db(reviewer_shell_ids=reviewers)[0]
+            ) as con:
+                sprint_id = int(con.execute("SELECT sprint_id FROM sprints").fetchone()[0])
+                con.executescript(CONFORMANCE_OWNER_MIGRATION.read_text())
+                notifications: list[bool] = []
+                store = sprint_domain.SprintLifecycleStore(
+                    con,
+                    probe_harness=lambda _harness: None,
+                    notify_commit=lambda: notifications.append(con.in_transaction)
+                    or True,
+                )
+
+                self.assertEqual(((sprint_id, "armed"),), store.recover_on_startup())
+                before_retry = (
+                    con.total_changes,
+                    con.execute(
+                        "SELECT COUNT(*) FROM wake_message"
+                    ).fetchone()[0],
+                    con.execute(
+                        "SELECT COUNT(*) FROM sprint_events"
+                    ).fetchone()[0],
+                    con.execute(
+                        "SELECT COUNT(*) FROM sprint_reports"
+                    ).fetchone()[0],
+                )
+                store.recover_on_startup()
+                after_retry = (
+                    con.total_changes,
+                    con.execute(
+                        "SELECT COUNT(*) FROM wake_message"
+                    ).fetchone()[0],
+                    con.execute(
+                        "SELECT COUNT(*) FROM sprint_events"
+                    ).fetchone()[0],
+                    con.execute(
+                        "SELECT COUNT(*) FROM sprint_reports"
+                    ).fetchone()[0],
+                )
+
+                self.assertEqual(
+                    1,
+                    con.execute(
+                        "SELECT COUNT(*) FROM wake_message "
+                        "WHERE body='Old broadcast closeout' AND read_at IS NOT NULL "
+                        "AND delivered_at IS NOT NULL"
+                    ).fetchone()[0],
+                )
+                if expected_owner is not None:
+                    self.assertEqual(
+                        ("armed", expected_owner, 1),
+                        tuple(
+                            con.execute(
+                                "SELECT lifecycle,conformance_reviewer_shell_id,"
+                                "conformance_owner_generation FROM sprints "
+                                "WHERE sprint_id=?",
+                                (sprint_id,),
+                            ).fetchone()
+                        ),
+                    )
+                    self.assertEqual(
+                        1,
+                        con.execute(
+                            "SELECT COUNT(*) FROM wake_message "
+                            "WHERE sprint_id=? AND idempotency_key=?",
+                            (
+                                sprint_id,
+                                f"sprint:{sprint_id}:delivery-terminal:1:"
+                                "owner:2:generation:1",
+                            ),
+                        ).fetchone()[0],
+                    )
+                    self.assertEqual(
+                        1,
+                        con.execute(
+                            "SELECT COUNT(*) FROM sprint_events WHERE sprint_id=? "
+                            "AND event_type='sprint.delivery_terminal' "
+                            "AND json_extract(payload,'$.conformance_reviewer_shell_id')=2 "
+                            "AND json_extract(payload,'$.conformance_owner_generation')=1",
+                            (sprint_id,),
+                        ).fetchone()[0],
+                    )
+                    self.assertEqual([], notifications)
+                else:
+                    self.assertEqual(
+                        ("paused", None, 0),
+                        tuple(
+                            con.execute(
+                                "SELECT lifecycle,conformance_reviewer_shell_id,"
+                                "conformance_owner_generation FROM sprints "
+                                "WHERE sprint_id=?",
+                                (sprint_id,),
+                            ).fetchone()
+                        ),
+                    )
+                    self.assertEqual(
+                        (1, 1, 1),
+                        tuple(
+                            con.execute(
+                                "SELECT "
+                                "(SELECT COUNT(*) FROM sprint_reports "
+                                " WHERE sprint_id=? AND report_kind='pause'),"
+                                "(SELECT COUNT(*) FROM sprint_events "
+                                " WHERE sprint_id=? "
+                                " AND event_type='conformance_owner.required'),"
+                                "(SELECT COUNT(*) FROM wake_message "
+                                " WHERE sprint_id IS NULL AND receiver_shell_id=3 "
+                                " AND body LIKE ?)",
+                                (
+                                    sprint_id,
+                                    sprint_id,
+                                    f"Sprint {sprint_id} reached delivery terminal%",
+                                ),
+                            ).fetchone()
+                        ),
+                    )
+                    self.assertEqual([False], notifications)
+                self.assertEqual(before_retry[1:], after_retry[1:])
+
+    def test_live_replanning_migration_preserves_and_repeats_task_binding(self) -> None:
+        with closing(sqlite3.connect(":memory:")) as con:
+            con.row_factory = sqlite3.Row
+            apply_schema(con, through="0198_reseed_engine_authored_review_handoff.sql")
+            sprint_id, document_id, _, _ = self._seed_prechange_binding(con)
+            con.execute(
+                "INSERT INTO shells "
+                "(shell_id,display_name,shortname,flavor,system_prompt,user_id) "
+                "VALUES (1,'Developer','DEV1','dev','prompt',1)"
+            )
+            feature_id = int(
+                con.execute(
+                    "SELECT feature_id FROM sprints WHERE sprint_id=?", (sprint_id,)
+                ).fetchone()[0]
+            )
+            task_id = int(
+                con.execute(
+                    "INSERT INTO spec_tasks (feature_id,document_id,seq,title) "
+                    "VALUES (?,?,1,'Repeat governing task')",
+                    (feature_id, document_id),
+                ).lastrowid
+            )
+            unit_ids = [
+                int(
+                    con.execute(
+                        "INSERT INTO sprint_work_units "
+                        "(sprint_id,assigned_shell_id,reviewer_shell_id,title,"
+                        "expected_output) VALUES (?,1,2,?,?)",
+                        (sprint_id, f"Lane {number}", f"Output {number}"),
+                    ).lastrowid
+                )
+                for number in (1, 2)
+            ]
+            con.execute(
+                "INSERT INTO sprint_work_unit_tasks "
+                "(sprint_id,work_unit_id,task_id) VALUES (?,?,?)",
+                (sprint_id, unit_ids[0], task_id),
+            )
+
+            con.executescript(LIVE_REPLAN_MIGRATION.read_text())
+            con.execute(
+                "INSERT INTO sprint_work_unit_tasks "
+                "(sprint_id,work_unit_id,task_id) VALUES (?,?,?)",
+                (sprint_id, unit_ids[1], task_id),
+            )
+
+            self.assertEqual(
+                [(unit_ids[0], task_id), (unit_ids[1], task_id)],
+                [
+                    tuple(row)
+                    for row in con.execute(
+                        "SELECT work_unit_id,task_id FROM sprint_work_unit_tasks "
+                        "ORDER BY work_unit_id"
+                    )
+                ],
+            )
+            with self.assertRaises(sqlite3.IntegrityError):
+                con.execute(
+                    "INSERT INTO sprint_work_unit_tasks "
+                    "(sprint_id,work_unit_id,task_id) VALUES (?,?,?)",
+                    (sprint_id, unit_ids[1], task_id),
+                )
             self.assertEqual([], con.execute("PRAGMA foreign_key_check").fetchall())
 
     def test_optional_qaqc_migration_failure_rolls_back_original_table(self) -> None:
@@ -574,6 +985,577 @@ class SpecApprovalTest(SprintDomainCase):
         )
 
 
+class LiveReplanningTest(SprintDomainCase):
+    def test_resume_skips_a_sparse_historical_assignment_generation(self) -> None:
+        sprint_id, work_unit_id = self.create_sprint()
+        self.store.arm(sprint_id, 3)
+        assignment = self.con.execute(
+            "SELECT message.message_id,wake.wake_id FROM wake_message message "
+            "JOIN sprint_wake_messages wake USING (message_id) "
+            "WHERE message.work_unit_id=? AND message.message_kind='work_assignment'",
+            (work_unit_id,),
+        ).fetchone()
+        self.con.execute(
+            "UPDATE wake_message SET delivered_at=datetime('now') WHERE message_id=?",
+            (assignment["message_id"],),
+        )
+        self.con.execute(
+            "UPDATE sprint_wake_outbox SET state='delivered',"
+            "delivered_at=datetime('now') WHERE wake_id=?",
+            (assignment["wake_id"],),
+        )
+        self.con.commit()
+        messages = sprint_message_delivery.SprintMessageStore(self.con)
+        messages.mark_read(
+            int(assignment["message_id"]),
+            1,
+            sprint_id=sprint_id,
+        )
+        self.store.pause(
+            sprint_id,
+            sprint_domain.LifecycleActor("planner", 3),
+            reason="replace the released assignment",
+        )
+        units = sprint_domain.SprintWorkUnitStore(self.con)
+        self.assertTrue(
+            units.recall(
+                sprint_id,
+                work_unit_id,
+                3,
+                reason="reconcile a historical assignment generation",
+            )
+        )
+        sparse_key = f"sprint:{sprint_id}:work-unit:{work_unit_id}:assignment:2"
+        self.con.execute(
+            "UPDATE wake_message SET idempotency_key=? WHERE message_id=?",
+            (sparse_key, assignment["message_id"]),
+        )
+        self.con.commit()
+        self.assertTrue(
+            units.replan(
+                sprint_id,
+                work_unit_id,
+                3,
+                title="Corrective assignment",
+                expected_output="Dispatch from a fresh durable generation",
+            )
+        )
+
+        receipt = self.store.resume(
+            sprint_id,
+            sprint_domain.LifecycleActor("planner", 3),
+            reason="the corrective assignment is ready",
+        )
+
+        self.assertTrue(receipt.changed)
+        self.assertEqual(1, len(receipt.dispatched_wake_ids))
+        assignments = [
+            tuple(row)
+            for row in self.con.execute(
+                "SELECT body,idempotency_key,disposition FROM wake_message "
+                "WHERE work_unit_id=? AND message_kind='work_assignment' "
+                "ORDER BY message_id",
+                (work_unit_id,),
+            )
+        ]
+        self.assertEqual(
+            [
+                (
+                    "Foundation\n\nShip the durable foundation",
+                    sparse_key,
+                    "accepted",
+                ),
+                (
+                    "Corrective assignment\n\n"
+                    "Dispatch from a fresh durable generation",
+                    f"sprint:{sprint_id}:work-unit:{work_unit_id}:assignment:3",
+                    "pending",
+                ),
+            ],
+            assignments,
+        )
+        self.assertEqual(
+            0,
+            self.con.execute(
+                "SELECT COUNT(*) FROM wake_message WHERE idempotency_key=?",
+                (f"sprint:{sprint_id}:work-unit:{work_unit_id}:assignment:1",),
+            ).fetchone()[0],
+        )
+
+    def test_paused_recall_reassign_and_reroute_dispatches_fresh_generation(self) -> None:
+        self.con.execute(
+            "INSERT INTO shells "
+            "(shell_id,display_name,shortname,flavor,system_prompt,user_id) "
+            "VALUES (5,'Developer 2','DEV2','dev','prompt',1)"
+        )
+        sprint_id, work_unit_id = self.create_sprint()
+        document_id = int(
+            self.con.execute(
+                "SELECT document_id FROM sprint_specs WHERE sprint_id=?", (sprint_id,)
+            ).fetchone()[0]
+        )
+        feature_id = int(
+            self.con.execute(
+                "SELECT feature_id FROM sprints WHERE sprint_id=?", (sprint_id,)
+            ).fetchone()[0]
+        )
+        task_id = int(
+            self.con.execute(
+                "INSERT INTO spec_tasks (feature_id,document_id,seq,title) "
+                "VALUES (?,?,1,'Governing task')",
+                (feature_id, document_id),
+            ).lastrowid
+        )
+        self.con.execute(
+            "INSERT INTO sprint_work_unit_tasks "
+            "(sprint_id,work_unit_id,task_id) VALUES (?,?,?)",
+            (sprint_id, work_unit_id, task_id),
+        )
+        self.con.execute(
+            "INSERT INTO sprint_participants "
+            "(sprint_id,shell_id,role,harness,model,effort) "
+            "VALUES (?,5,'developer','codex','old-model','high')",
+            (sprint_id,),
+        )
+        self.con.commit()
+
+        assignment_wake = self.store.arm(sprint_id, 3)[0]
+        assignment_message = int(
+            self.con.execute(
+                "SELECT message_id FROM sprint_wake_messages WHERE wake_id=?",
+                (assignment_wake,),
+            ).fetchone()[0]
+        )
+        self.con.execute(
+            "UPDATE wake_message SET delivered_at=datetime('now') WHERE message_id=?",
+            (assignment_message,),
+        )
+        self.con.execute(
+            "UPDATE sprint_wake_outbox SET state='delivered',"
+            "delivered_at=datetime('now') WHERE wake_id=?",
+            (assignment_wake,),
+        )
+        self.con.commit()
+        sprint_message_delivery.SprintMessageStore(self.con).mark_read(
+            assignment_message, 1, sprint_id=sprint_id
+        )
+        self.store.pause(
+            sprint_id,
+            sprint_domain.LifecycleActor("planner", 3),
+            reason="Planner is restructuring assignments",
+        )
+
+        units = sprint_domain.SprintWorkUnitStore(self.con)
+        self.assertTrue(
+            units.recall(
+                sprint_id,
+                work_unit_id,
+                3,
+                reason="move the lane to available capacity",
+            )
+        )
+        self.assertTrue(
+            units.replan(
+                sprint_id,
+                work_unit_id,
+                3,
+                assigned_shell_id=5,
+                title="Reassigned foundation",
+                expected_output="Ship through the replacement route",
+                task_ids=(task_id,),
+                planned_wave=4,
+            )
+        )
+        participant_id = int(
+            self.con.execute(
+                "SELECT participant_id FROM sprint_participants "
+                "WHERE sprint_id=? AND shell_id=5",
+                (sprint_id,),
+            ).fetchone()[0]
+        )
+        prepared = sprint_domain.sprint_participant_chats.PreparedParticipantRoute(
+            participant_id=participant_id,
+            shell_id=5,
+            role="developer",
+            shortname="DEV2",
+            harness="codex",
+            provider="openai",
+            model="replacement-model",
+            effort="medium",
+            worktree="/tmp/dev2",
+        )
+        with mock.patch.object(
+            sprint_domain.sprint_participant_chats,
+            "prepare_participant_route",
+            return_value=prepared,
+        ):
+            changed = sprint_domain.SprintParticipantStore(
+                self.con, probe_harness=lambda _harness: None
+            ).reroute(
+                sprint_id,
+                3,
+                participant_shell_id=5,
+                harness="codex",
+                model="replacement-model",
+                effort="medium",
+                route="codex/replacement-model",
+            )
+        self.assertTrue(changed)
+
+        receipt = self.store.resume(
+            sprint_id,
+            sprint_domain.LifecycleActor("planner", 3),
+            reason="replan is complete",
+        )
+
+        self.assertEqual(1, len(receipt.dispatched_wake_ids))
+        recall_event = json.loads(
+            self.con.execute(
+                "SELECT payload FROM sprint_events WHERE sprint_id=? "
+                "AND event_type='work_unit.recalled'",
+                (sprint_id,),
+            ).fetchone()[0]
+        )
+        self.assertEqual("planned", recall_event["after"])
+        self.assertEqual(
+            "accepted",
+            self.con.execute(
+                "SELECT disposition FROM wake_message WHERE message_id=?",
+                (assignment_message,),
+            ).fetchone()[0],
+        )
+        self.assertEqual(
+            (5, "Reassigned foundation", 4),
+            tuple(
+                self.con.execute(
+                    "SELECT assigned_shell_id,title,planned_wave "
+                    "FROM sprint_work_units WHERE work_unit_id=?",
+                    (work_unit_id,),
+                ).fetchone()
+            ),
+        )
+        self.assertEqual(
+            ("replacement-model", "medium", "codex/replacement-model"),
+            tuple(
+                self.con.execute(
+                    "SELECT model,effort,route FROM sprint_participants "
+                    "WHERE participant_id=?",
+                    (participant_id,),
+                ).fetchone()
+            ),
+        )
+        fresh = self.con.execute(
+            "SELECT receiver_shell_id,idempotency_key FROM wake_message "
+            "WHERE work_unit_id=? AND message_kind='work_assignment' "
+            "ORDER BY message_id DESC LIMIT 1",
+            (work_unit_id,),
+        ).fetchone()
+        self.assertEqual(5, fresh["receiver_shell_id"])
+        self.assertTrue(str(fresh["idempotency_key"]).endswith(":assignment:2"))
+
+    def test_recall_rejects_armed_and_registered_pr_lanes(self) -> None:
+        sprint_id, work_unit_id = self.create_sprint()
+        self.store.arm(sprint_id, 3)
+        units = sprint_domain.SprintWorkUnitStore(self.con)
+        with self.assertRaisesRegex(
+            sprint_domain.SprintInvariantError, "only while the Sprint is paused"
+        ):
+            units.recall(sprint_id, work_unit_id, 3, reason="too early")
+
+        self.store.pause(
+            sprint_id,
+            sprint_domain.LifecycleActor("planner", 3),
+            reason="inspect lane",
+        )
+        owner = int(
+            self.con.execute(
+                "SELECT participant_id FROM sprint_participants "
+                "WHERE sprint_id=? AND shell_id=1",
+                (sprint_id,),
+            ).fetchone()[0]
+        )
+        registered_pr_id = int(
+            self.con.execute(
+                "INSERT INTO sprint_registered_prs "
+                "(sprint_id,owner_participant_id,repository,pr_number) "
+                "VALUES (?,?,'acme/repo',99)",
+                (sprint_id, owner),
+            ).lastrowid
+        )
+        self.con.execute(
+            "INSERT INTO sprint_pr_work_units "
+            "(sprint_id,registered_pr_id,work_unit_id) VALUES (?,?,?)",
+            (sprint_id, registered_pr_id, work_unit_id),
+        )
+        self.con.commit()
+        with self.assertRaisesRegex(
+            sprint_domain.SprintInvariantError, "preserve that lane"
+        ):
+            units.recall(sprint_id, work_unit_id, 3, reason="unsafe rewind")
+
+
+class ResolveUnitTest(SprintDomainCase):
+    def _release_unit(self, sprint_id: int) -> int:
+        assignment_wake = self.store.arm(sprint_id, 3)[0]
+        assignment_message = int(
+            self.con.execute(
+                "SELECT message_id FROM sprint_wake_messages WHERE wake_id=?",
+                (assignment_wake,),
+            ).fetchone()[0]
+        )
+        self.con.execute(
+            "UPDATE wake_message SET delivered_at=datetime('now') "
+            "WHERE message_id=?",
+            (assignment_message,),
+        )
+        self.con.execute(
+            "UPDATE sprint_wake_outbox SET state='delivered',"
+            "delivered_at=datetime('now') WHERE wake_id=?",
+            (assignment_wake,),
+        )
+        self.con.commit()
+        sprint_message_delivery.SprintMessageStore(self.con).mark_read(
+            assignment_message, 1, sprint_id=sprint_id
+        )
+        return assignment_message
+
+    def _pause(self, sprint_id: int) -> None:
+        self.store.pause(
+            sprint_id,
+            sprint_domain.LifecycleActor("planner", 3),
+            reason="Planner is restructuring the live plan",
+        )
+
+    def _bind_pr(self, sprint_id: int, work_unit_id: int) -> int:
+        owner = int(
+            self.con.execute(
+                "SELECT participant_id FROM sprint_participants "
+                "WHERE sprint_id=? AND shell_id=1",
+                (sprint_id,),
+            ).fetchone()[0]
+        )
+        registered_pr_id = int(
+            self.con.execute(
+                "INSERT INTO sprint_registered_prs "
+                "(sprint_id,owner_participant_id,repository,pr_number) "
+                "VALUES (?,?,'acme/repo',99)",
+                (sprint_id, owner),
+            ).lastrowid
+        )
+        self.con.execute(
+            "INSERT INTO sprint_pr_work_units "
+            "(sprint_id,registered_pr_id,work_unit_id) VALUES (?,?,?)",
+            (sprint_id, registered_pr_id, work_unit_id),
+        )
+        self.con.commit()
+        return registered_pr_id
+
+    def test_resolve_refuses_armed_non_planner_blank_and_bad_target(self) -> None:
+        sprint_id, work_unit_id = self.create_sprint()
+        units = sprint_domain.SprintWorkUnitStore(self.con)
+        with self.assertRaisesRegex(ValueError, "must be completed or cancelled"):
+            units.resolve(sprint_id, work_unit_id, 3, target="blocked", reason="x")
+        with self.assertRaisesRegex(ValueError, "resolution reason is required"):
+            units.resolve(sprint_id, work_unit_id, 3, target="completed", reason=" ")
+        self.store.arm(sprint_id, 3)
+        with self.assertRaisesRegex(
+            sprint_domain.SprintInvariantError,
+            "resolved only while the Sprint is paused",
+        ):
+            units.resolve(
+                sprint_id, work_unit_id, 3, target="completed", reason="too early"
+            )
+        self._pause(sprint_id)
+        with self.assertRaisesRegex(
+            sprint_domain.SprintAuthorityError, "only the originating Planner"
+        ):
+            units.resolve(
+                sprint_id, work_unit_id, 4, target="completed", reason="intruder"
+            )
+        self.assertEqual(
+            "ready",
+            self.con.execute(
+                "SELECT disposition FROM sprint_work_units WHERE work_unit_id=?",
+                (work_unit_id,),
+            ).fetchone()[0],
+        )
+
+    def test_resolve_completed_supersedes_pr_link_and_notifies(self) -> None:
+        sprint_id, work_unit_id = self.create_sprint()
+        assignment_message = self._release_unit(sprint_id)
+        registered_pr_id = self._bind_pr(sprint_id, work_unit_id)
+        self._pause(sprint_id)
+
+        units = sprint_domain.SprintWorkUnitStore(self.con)
+        changed = units.resolve(
+            sprint_id,
+            work_unit_id,
+            3,
+            target="completed",
+            reason="PR #99 merged while the Sprint was paused",
+        )
+
+        self.assertTrue(changed)
+        unit = self.con.execute(
+            "SELECT disposition,completion_result,completion_source,completed_at "
+            "FROM sprint_work_units WHERE work_unit_id=?",
+            (work_unit_id,),
+        ).fetchone()
+        self.assertEqual(
+            (
+                "completed",
+                "PR #99 merged while the Sprint was paused",
+                "planner_override",
+                unit["completed_at"],
+            ),
+            tuple(unit),
+        )
+        self.assertIsNotNone(unit["completed_at"])
+        link = self.con.execute(
+            "SELECT superseded_at FROM sprint_pr_work_units "
+            "WHERE registered_pr_id=? AND work_unit_id=?",
+            (registered_pr_id, work_unit_id),
+        ).fetchone()
+        self.assertIsNotNone(link["superseded_at"])
+        self.assertIsNotNone(
+            self.con.execute(
+                "SELECT 1 FROM sprint_registered_prs WHERE registered_pr_id=?",
+                (registered_pr_id,),
+            ).fetchone(),
+            "resolution retains the PR registration",
+        )
+        self.assertEqual(
+            "accepted",
+            self.con.execute(
+                "SELECT disposition FROM wake_message WHERE message_id=?",
+                (assignment_message,),
+            ).fetchone()[0],
+            "the accepted assignment is history, not rewritten",
+        )
+        event = json.loads(
+            self.con.execute(
+                "SELECT payload FROM sprint_events WHERE sprint_id=? "
+                "AND event_type='planner_override'",
+                (sprint_id,),
+            ).fetchone()[0]
+        )
+        self.assertEqual(
+            {
+                "after": "completed",
+                "before": "active",
+                "pr_numbers": [99],
+                "reason": "PR #99 merged while the Sprint was paused",
+                "retired_message_ids": [assignment_message],
+                "work_unit_id": work_unit_id,
+            },
+            event,
+        )
+        notices = self.con.execute(
+            "SELECT to_participant_id,body FROM wake_message "
+            "WHERE idempotency_key LIKE 'planner-override:%' "
+            "ORDER BY to_participant_id",
+            (),
+        ).fetchall()
+        recipients = {
+            int(row["participant_id"])
+            for row in self.con.execute(
+                "SELECT participant_id FROM sprint_participants "
+                "WHERE sprint_id=? AND role IN ('developer','reviewer')",
+                (sprint_id,),
+            )
+        }
+        self.assertEqual(recipients, {int(row[0]) for row in notices})
+        for notice in notices:
+            self.assertIn("from active to completed", notice["body"])
+            self.assertIn("PR #99 merged", notice["body"])
+
+    def test_resolve_cancelled_keeps_pr_and_leaves_completion_source(self) -> None:
+        sprint_id, work_unit_id = self.create_sprint()
+        self._release_unit(sprint_id)
+        registered_pr_id = self._bind_pr(sprint_id, work_unit_id)
+        self._pause(sprint_id)
+
+        changed = sprint_domain.SprintWorkUnitStore(self.con).resolve(
+            sprint_id,
+            work_unit_id,
+            3,
+            target="cancelled",
+            reason="lane abandoned; the registered PR keeps its history",
+        )
+
+        self.assertTrue(changed)
+        unit = self.con.execute(
+            "SELECT disposition,completion_source FROM sprint_work_units "
+            "WHERE work_unit_id=?",
+            (work_unit_id,),
+        ).fetchone()
+        self.assertEqual(("cancelled", None), tuple(unit))
+        self.assertIsNotNone(
+            self.con.execute(
+                "SELECT superseded_at FROM sprint_pr_work_units "
+                "WHERE registered_pr_id=?",
+                (registered_pr_id,),
+            ).fetchone()[0]
+        )
+
+    def test_resolve_replay_and_terminal_conflicts(self) -> None:
+        sprint_id, work_unit_id = self.create_sprint()
+        self._release_unit(sprint_id)
+        self._pause(sprint_id)
+        units = sprint_domain.SprintWorkUnitStore(self.con)
+        self.assertTrue(
+            units.resolve(
+                sprint_id, work_unit_id, 3, target="completed", reason="done"
+            )
+        )
+
+        self.assertFalse(
+            units.resolve(
+                sprint_id, work_unit_id, 3, target="completed", reason="done"
+            )
+        )
+        self.assertEqual(
+            (1, 2),
+            tuple(
+                self.con.execute(
+                    "SELECT "
+                    "(SELECT COUNT(*) FROM sprint_events "
+                    "WHERE event_type='planner_override'),"
+                    "(SELECT COUNT(*) FROM wake_message "
+                    "WHERE idempotency_key LIKE 'planner-override:%')"
+                ).fetchone()
+            ),
+            "replay returns the prior result without new evidence",
+        )
+        with self.assertRaisesRegex(
+            sprint_domain.SprintConflictError, "already completed"
+        ):
+            units.resolve(
+                sprint_id, work_unit_id, 3, target="completed", reason="different"
+            )
+        with self.assertRaisesRegex(
+            sprint_domain.SprintConflictError, "already completed"
+        ):
+            units.resolve(sprint_id, work_unit_id, 3, target="cancelled", reason="done")
+
+    def test_resolve_conflicts_with_externally_completed_unit(self) -> None:
+        sprint_id, work_unit_id = self.create_sprint()
+        self.store.arm(sprint_id, 3)
+        self._pause(sprint_id)
+        units = sprint_domain.SprintWorkUnitStore(self.con)
+        units.recall(sprint_id, work_unit_id, 3, reason="return to plan")
+        self.assertTrue(
+            units.cancel(sprint_id, work_unit_id, 3, reason="scope dropped")
+        )
+
+        with self.assertRaisesRegex(
+            sprint_domain.SprintConflictError, "already cancelled"
+        ):
+            units.resolve(
+                sprint_id, work_unit_id, 3, target="cancelled", reason="scope dropped"
+            )
+
+
 class LifecycleTest(SprintDomainCase):
     def test_sprint_insert_must_start_prepared(self) -> None:
         sprint_id, _ = self.create_sprint()
@@ -671,6 +1653,61 @@ class LifecycleTest(SprintDomainCase):
                 "VALUES (1,1,'codex','/normal-2','Other normal chat',"
                 "'normal-2','hash')"
             )
+
+    def test_arm_persists_model_default_binding_with_stable_digest(self) -> None:
+        # Spec #160: a participant that selected 'default' arms into a
+        # controlled binding with requested=effective='default', no effort
+        # digest, and an identity stable across resolutions but distinct from
+        # the same route's named-effort binding.
+        sprint_id, _ = self.create_sprint()
+        self.con.execute(
+            "UPDATE sprint_participants SET harness='kimi',"
+            "model='kimi-code/legacy',effort='default' "
+            "WHERE sprint_id=? AND role='reviewer'",
+            (sprint_id,),
+        )
+        self.con.commit()
+
+        self.store.arm(sprint_id, 3)
+
+        row = self.con.execute(
+            "SELECT b.control_state,b.requested_effort,b.effective_effort,"
+            "b.evidence_digest,b.native_variant_id,b.binding_json,"
+            "b.binding_digest "
+            "FROM sprint_participant_route_bindings b "
+            "JOIN sprint_participants p ON p.participant_id=b.participant_id "
+            "WHERE p.sprint_id=? AND p.role='reviewer'",
+            (sprint_id,),
+        ).fetchone()
+        self.assertEqual(
+            ("controlled", "default", "default", None, None), tuple(row[:5])
+        )
+        decoded = json.loads(row["binding_json"])
+        sprint_domain.route_bindings.validate_v2_binding(decoded)
+        self.assertEqual(
+            sprint_domain.route_bindings.digest_json(decoded),
+            row["binding_digest"],
+        )
+
+        # Re-resolving the same intent reproduces the exact persisted digest;
+        # the same route at a named effort is a distinct identity.
+        participant = self.con.execute(
+            "SELECT participant_id,harness,model,effort "
+            "FROM sprint_participants WHERE sprint_id=? AND role='reviewer'",
+            (sprint_id,),
+        ).fetchone()
+        repeat = route_candidate(None, participant)
+        self.assertEqual(row["binding_digest"], repeat.binding_digest)
+        named = route_candidate(
+            None,
+            {
+                "participant_id": participant["participant_id"],
+                "harness": "kimi",
+                "model": "kimi-code/legacy",
+                "effort": "high",
+            },
+        )
+        self.assertNotEqual(row["binding_digest"], named.binding_digest)
 
     def test_arm_rolls_back_when_initial_release_fails(self) -> None:
         sprint_id, _ = self.create_sprint()
@@ -1025,7 +2062,7 @@ class LifecycleTest(SprintDomainCase):
             ),
         )
 
-    def test_arm_rejects_spec_edited_after_approval_without_effect(self) -> None:
+    def test_arm_uses_immutable_bound_spec_after_current_document_edit(self) -> None:
         sprint_id, unit_id = self.create_sprint()
         self.con.execute(
             "UPDATE documents SET body='edited after QAQC' "
@@ -1035,13 +2072,10 @@ class LifecycleTest(SprintDomainCase):
         )
         self.con.commit()
 
-        with self.assertRaisesRegex(
-            sprint_domain.SprintInvariantError, "exact current governing spec"
-        ):
-            self.store.arm(sprint_id, 3)
+        self.store.arm(sprint_id, 3)
 
         self.assertEqual(
-            ("prepared", "planned", 0),
+            ("armed", "ready", 2),
             (
                 self.con.execute(
                     "SELECT lifecycle FROM sprints WHERE sprint_id=?", (sprint_id,)
@@ -1056,6 +2090,15 @@ class LifecycleTest(SprintDomainCase):
                 ).fetchone()[0],
             ),
         )
+        document_id = int(
+            self.con.execute(
+                "SELECT document_id FROM sprint_specs WHERE sprint_id=?", (sprint_id,)
+            ).fetchone()[0]
+        )
+        evidence = sprint_domain.SprintSpecRevisionStore(self.con).read(
+            sprint_id, document_id, caller_shell_id=1
+        )
+        self.assertEqual("governing spec revision 1", evidence["body"])
 
     def test_transition_authority_and_database_backstop(self) -> None:
         sprint_id, _ = self.create_sprint()
@@ -1220,8 +2263,11 @@ class ArmedServiceSwitchTest(SprintDomainCase):
                     "merge_grant_enabled) VALUES (1,1,3,1)"
                 )
                 seed.execute(
-                    "INSERT INTO sprint_specs VALUES (1,1,?,1,datetime('now'))",
-                    (revision,),
+                    "INSERT INTO sprint_specs "
+                    "(sprint_id,document_id,bound_revision_sha256,approval_id,"
+                    "included_at,bound_revision_body) "
+                    "VALUES (1,1,?,1,datetime('now'),?)",
+                    (revision, body),
                 )
                 seed.executemany(
                     "INSERT INTO sprint_participants "

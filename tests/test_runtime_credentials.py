@@ -8,8 +8,8 @@ Two halves, one contract:
   `.super-coder/run/mem/`, refreshes them every boot (key rotation), and
   sweeps artifacts whose shell is gone, demoted, deleted, or unkeyed.
 - `mem.py` discovery — with BOTH SC_API_BASE/SC_API_TOKEN absent, `sc mem`
-  adopts the unique Admin artifact and still calls the API; multiple Admins
-  refuse until SC_MEM_AS names one; a symlinked or otherwise insecure
+  adopts the unique Admin artifact and still calls the API; a symlinked or
+  otherwise insecure
   artifact and a stale (rotated) token refuse with the supported action.
 
 The trust boundary is the real artifact, never a path: neither half may follow
@@ -93,8 +93,7 @@ def deadline(seconds=5):
 
 
 def build_shells_db(path: Path) -> None:
-    """Engine-shaped DB with a keyed Admin, a keyed dev, an unkeyed Admin,
-    and a deleted Admin — the full provisioning matrix."""
+    """Engine-shaped DB with one active Admin plus negative dev/deleted rows."""
     con = sqlite3.connect(path)
     con.executescript(SCHEMA.read_text())
     for p in sorted(MIGRATIONS.glob("*.sql")):
@@ -103,7 +102,7 @@ def build_shells_db(path: Path) -> None:
     rows = [
         (1, "Adm One", "ADM1", "admin", "k-adm1", 0),
         (2, "Dev One", "DEV1", "dev", "k-dev1", 0),
-        (3, "Adm Two", "ADM2", "admin", None, 0),
+        (3, "Adm Two", "ADM2", "admin", None, 1),
         (4, "Adm Three", "ADM3", "admin", "k-adm3", 1),
     ]
     con.executemany(
@@ -279,6 +278,17 @@ class DiscoveryTest(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertIn("Peer", out)                     # env identity, not TC's
         self.assertIsNone(mem._DISCOVERED_FROM)
+
+    def test_explicit_owner_only_credential_file_wires_managed_shell(self):
+        artifact = self.write_artifact("PEER", PEER_TOKEN)
+        with mock.patch.dict(
+            os.environ, {"SC_MEM_CREDENTIAL_FILE": str(artifact)}
+        ):
+            rc, out = self.run_which()
+        self.assertEqual(rc, 0)
+        self.assertIn("Peer", out)
+        self.assertEqual(mem._DISCOVERED_FROM, artifact)
+        self.assertEqual(mem.SC_API_TOKEN, PEER_TOKEN)
 
     def test_ambiguous_admin_identity_refuses(self):
         self.write_artifact("TC", TOKEN)

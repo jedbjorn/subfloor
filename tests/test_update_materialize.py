@@ -1140,8 +1140,8 @@ class SourceRepoDispatcherReconciliationTest(unittest.TestCase):
             (self.root / "sc").read_bytes(),
         )
 
-    def test_update_main_reconciles_source_repos_from_the_tree(self):
-        source = inspect.getsource(update.main)
+    def test_update_reconciliation_uses_source_tree_dispatcher(self):
+        source = inspect.getsource(update.reconcile_under_cutover)
         self.assertIn("elif source:", source)
         self.assertIn("target_bytes=canonical.read_bytes()", source)
 
@@ -1281,13 +1281,18 @@ class UpdateRefPublicationTest(unittest.TestCase):
                 raise RuntimeError(f"{name} failed")
 
         def materialize(sha: str, **kwargs) -> None:
+            events.append("materialize")
             if kwargs.get("publish_ref", True):
                 ref.write_text(sha + "\n")
 
-        def migrate() -> None:
+        def reload_seed() -> None:
+            events.append("reload-seed")
+
+        def migrate(*, reconcile) -> None:
             events.append("migration")
             if fail == "migration":
                 raise RuntimeError("migration failed")
+            reconcile()
 
         def publish(sha: str) -> None:
             events.append("publish")
@@ -1311,21 +1316,29 @@ class UpdateRefPublicationTest(unittest.TestCase):
             repair_git_worktrees=mock.Mock(return_value=()),
             sync_repo_checkout=mock.Mock(),
             fetch_update_ref=mock.Mock(return_value=self.NEW),
+            resolve_engine_source=mock.Mock(return_value="file:///engine-source"),
             migrate_engine_untrack=mock.Mock(),
             migrate_generated_artifacts_local=mock.Mock(),
             materialize_fetched_engine=mock.Mock(side_effect=materialize),
+            reload_materialized_seed_skills=mock.Mock(side_effect=reload_seed),
             publish_engine_ref=mock.Mock(side_effect=publish),
+            publish_engine_provenance=mock.Mock(
+                side_effect=lambda sha, _source: publish(sha)
+            ),
             reconcile_linked_dispatchers=mock.Mock(side_effect=reconcile),
             ensure_workflows=mock.Mock(return_value=("current", [])),
             expire_sandbox_harnesses=mock.Mock(return_value=None),
             migrate_with_service_cutover=mock.Mock(side_effect=migrate),
             refresh_installed_brokers=mock.Mock(),
-            sync_skills=mock.Mock(),
+            sync_skills=mock.Mock(side_effect=lambda: events.append("sync-skills")),
             regrant=mock.Mock(return_value=0),
             reconcile_skill_projections=mock.Mock(
                 return_value={"written": [], "skipped": [], "checkouts": []}
             ),
             run_script=mock.Mock(side_effect=run_script),
+            snapshot_under_cutover=mock.Mock(
+                side_effect=lambda: run_script("snapshot.py")
+            ),
         ))
         stack.enter_context(mock.patch.multiple(
             update.install_mod,
@@ -1335,6 +1348,30 @@ class UpdateRefPublicationTest(unittest.TestCase):
         ))
         stack.enter_context(contextlib.redirect_stdout(io.StringIO()))
         return stack, ref, scripts, events
+
+    def test_materialized_skill_owner_reloads_before_migration_and_sync(self):
+        with tempfile.TemporaryDirectory() as td:
+            state = Path(td) / ".sc-state"
+            state.mkdir()
+            stack, _ref, _scripts, events = self._patch_main(state, fail=None)
+            with stack:
+                self.assertEqual(0, update.main([]))
+
+        self.assertLess(events.index("materialize"), events.index("reload-seed"))
+        self.assertLess(events.index("reload-seed"), events.index("migration"))
+        self.assertLess(events.index("reload-seed"), events.index("sync-skills"))
+
+    def test_reload_replaces_a_pre_materialization_skill_name_validator(self):
+        stale_validator = update.re.compile(r"^[a-z][a-z0-9_]*$")
+        with mock.patch.object(
+            update.seed_skills, "SKILL_NAME_RE", stale_validator
+        ):
+            with self.assertRaisesRegex(ValueError, "malformed name 'api-design'"):
+                update.seed_skills.tombstoned_skill_names()
+
+            update.reload_materialized_seed_skills()
+
+            self.assertIn("api-design", update.seed_skills.tombstoned_skill_names())
 
     def test_failure_before_publication_never_overlays_linked_dispatchers(self):
         for failed in ("migration", "snapshot.py"):
@@ -1378,7 +1415,10 @@ class UpdateRefPublicationTest(unittest.TestCase):
             self.assertEqual(
                 events,
                 [
+                    "materialize",
+                    "reload-seed",
                     "migration",
+                    "sync-skills",
                     "map_setup.py",
                     "snapshot.py",
                     "publish",

@@ -49,8 +49,8 @@ you're with what should happen next — every role knows the workflow.
 
 If you are ever unsure what is happening, open the Review GUI or boot the
 **Admin Shell**. Admin works from `main` and looks after the system as a whole:
-it can check the team's health, help update subfloor, and create skills tailored
-to your repository.
+it can check the team's health and update Subfloor. A **Planner Shell** designs
+skills tailored to the repository through the DB-canonical local-skill tools.
 
 ### The technical details
 Subfloor is a **forkable shell substrate for a single code repository.** You install it into
@@ -149,6 +149,17 @@ whole team behind it. Installer internals and harness sign-in, step by step:
 [*Install*](docs/README.md#install). First boot and the daily loop, guided:
 [*Quick start*](docs/quick-start.md).
 
+Installation intentionally activates the universal branch guard before the
+first commit. The command above is the operator-owned bootstrap exception on
+the repository's default branch. Later direct operator commits there require
+the same deliberate bypass; launched shells remain branch-first and receive no
+bypass recipe. The protected-default-branch update is:
+
+```bash
+./sc update
+git add .sc-state/engine.ref sc && git commit --no-verify -m "chore: update subfloor"
+```
+
 ## Docs
 
 One page, eleven sections — [docs/README.md](docs/README.md), or tab through it
@@ -165,7 +176,7 @@ themed: [**open the docs in md-converter**](https://md-converter.designs-os.com/
 | [**Messages, jobs & headless launch**](docs/README.md#messages-jobs--headless-launch) | Generic shell handoffs, detached jobs, model routes, and `sc run` |
 | [**Update a fork**](docs/README.md#update-a-fork) | `./sc update` / `rollback`; customize vs upstream vs eject |
 | [**CLI & dev kit**](docs/README.md#cli--dev-kit) | Every `./sc` command, the `make dos-` aliases, the sandbox toolchain |
-| [**Opt-in features**](docs/README.md#opt-in-features) | pg sidecar · Windows Test VM · tailnet / pm2 / db brokers |
+| [**Opt-in features**](docs/README.md#opt-in-features) | optional infrastructure plus the fork-local guidance boundary |
 | [**Review GUI**](docs/README.md#review-gui) | The localhost GUI's ten tabs + token & session analytics |
 
 > [!class2]

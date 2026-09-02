@@ -3,9 +3,10 @@
 
 The catalog is layered and best-effort: models.dev (keyless, all five
 harnesses) → provider APIs (only with env keys) → OpenCode's connected-provider
-projection → cache → static floor. Payload v4 retains family metadata:
+    projection → cache → static floor. Payload v8 retains family metadata
 (newest-first; claude families with a CLI alias resolve `latest` to the
-alias) plus the flat `models` list for sub-version search. These tests pin
+alias), the flat `models` list for sub-version search, and fork-local harness
+and configured-route verification. These tests pin
 that contract: harness→provider mapping and opencode prefixing, family
 grouping/alias resolution, opportunistic merges that never fail the sweep,
 stale-cache-on-failure, version-mismatched caches ignored, and the floor
@@ -16,19 +17,28 @@ Run:
 """
 from __future__ import annotations
 
+import contextlib
+import io
 import json
 import sqlite3
 import sys
 import tempfile
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
+OLLAMA_ACCEPTANCE = json.loads(
+    (ROOT / "tests" / "fixtures" / "ollama_live_native_acceptance.json")
+    .read_text()
+)
 sys.path.insert(0, str(ROOT / ".super-coder" / "api"))
 sys.path.insert(0, str(ROOT / ".super-coder" / "scripts"))
 import model_catalog as mc  # noqa: E402
 import models as routes_cli  # noqa: E402
+import route_bindings  # noqa: E402
 
 MODELS_DEV = {
     "anthropic": {"models": {
@@ -68,6 +78,115 @@ def ids(harness_block):
     return [e["id"] for e in harness_block["models"]]
 
 
+_AUTO_COMPATIBILITY = object()
+
+
+def runtime_status(version="2.22.0", compatibility=_AUTO_COMPATIBILITY,
+                   error=None, *, harness=None, scope=None):
+    harness = harness or (
+        "claude" if isinstance(version, str) and version.startswith("2.1.")
+        else "vibe"
+    )
+    ranges = {
+        "claude": ("2.1.220", "2.2.0", "2.1.222"),
+        "codex": ("0.145.0", "0.147.0", "0.145.0"),
+        "kimi": ("0.30.0", "0.34.0", "0.33.0"),
+        "opencode": ("1.18.9", "1.19.0", "1.18.9"),
+        "vibe": ("2.22.0", "2.23.0", "2.22.0"),
+    }
+    minimum, maximum, verified = ranges[harness]
+    if compatibility is _AUTO_COMPATIBILITY:
+        compatibility = "verified" if version == verified else "supported"
+    scope = scope or routes_cli.model_catalog.harness_versions.runtime_scope()
+    return {
+        "harness": harness,
+        **scope,
+        "version": version,
+        "compatibility": compatibility,
+        "minimum_version": minimum,
+        "maximum_version_exclusive": maximum,
+        "verified_version": verified,
+        "error": error,
+    }
+
+
+def controlled_bundle(
+    harness: str, selector: str, status: dict, fingerprint: str | None
+) -> dict:
+    scope = {
+        "runtime": status["runtime"],
+        "runtime_identity": status["runtime_identity"],
+    }
+    return {
+        "runtime_status": status,
+        "runtime_scope": scope,
+        "source_fingerprint": fingerprint,
+        **(
+            {"advertised_options_by_model": {selector: ["high"]}}
+            if harness in route_bindings.LIVE_NATIVE_HARNESSES
+            else {}
+        ),
+    }
+
+
+def controlled_row(
+    harness: str, selector: str, status: dict, fingerprint: str
+) -> dict:
+    sources = {
+        "claude": ("claude-cli", "claude-portable-manifest"),
+        "codex": ("codex-cache", "codex-model-cache"),
+        "kimi": ("kimi-config", "kimi-alias-config"),
+        "opencode": (
+            "opencode-provider-api", "opencode-connected-variant"
+        ),
+    }
+    source, evidence_kind = sources[harness]
+    metadata = {
+        "supported": ["high"],
+        "default": "high",
+        "digests": {"high": "4" * 64},
+        "native_variant_ids": (
+            {"high": "high"} if harness == "opencode" else {}
+        ),
+    }
+    adapter_metadata = {}
+    if harness == "opencode":
+        selected = {
+            "compatibility_manifest": "opencode-1.18.9-v1",
+            "provider_family": "openai-ai-sdk",
+            "variant_options": {"reasoningEffort": "high"},
+        }
+        metadata["adapter_metadata_by_effort"] = {"high": selected}
+        adapter_metadata = {
+            "compatibility_manifest": "opencode-1.18.9-v1",
+            "provider_family": "openai-ai-sdk",
+            "variant_options_by_effort": {
+                "high": {"reasoningEffort": "high"},
+            },
+        }
+    return {
+        "harness": harness,
+        "selector": selector,
+        "provider_model": selector,
+        "source": source,
+        "availability": "available",
+        "headless_supported": 1,
+        "stale": 0,
+        "last_error": None,
+        "last_seen_at": datetime.now(timezone.utc).isoformat(),
+        "generation_id": "1" * 32,
+        "evidence_kind": evidence_kind,
+        "source_fingerprint": fingerprint,
+        "cli_version": f"{harness} {status['version']}",
+        "harness_version": status["version"],
+        "harness_compatibility": status["compatibility"],
+        "supported_efforts": ["high"],
+        "effort_metadata": metadata,
+        "selector_binding": {"kind": "exact-model", "selector": selector},
+        "adapter_metadata": adapter_metadata,
+    }
+
+
 class NoCLI(unittest.TestCase):
     """Base: opencode binary absent unless a test opts in."""
 
@@ -77,7 +196,210 @@ class NoCLI(unittest.TestCase):
         self.addCleanup(p.stop)
 
 
+class ControlledRouteEvidenceTest(unittest.TestCase):
+    def test_each_collector_binds_source_to_exact_sandbox_route(self):
+        sandbox = {
+            "runtime": "sandbox",
+            "runtime_identity": "sandbox:collector-image",
+        }
+        versions = {
+            "claude": "2.1.222", "codex": "0.145.0",
+            "kimi": "0.33.0", "opencode": "1.18.9",
+        }
+        selectors = {
+            "claude": "opus", "codex": "cache-model",
+            "kimi": "configured-alias", "opencode": "provider/model",
+        }
+
+        def run(argv, **_kwargs):
+            return SimpleNamespace(
+                returncode=0,
+                stdout=f"{argv[0]} {versions[argv[0]]}\n",
+                stderr="",
+            )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            codex_home = root / "codex"
+            codex_home.mkdir()
+            (codex_home / "models_cache.json").write_text(json.dumps({
+                "models": [{
+                    "slug": "cache-model",
+                    "display_name": "Cache Model",
+                    "supported_reasoning_levels": [
+                        {"effort": "low"}, {"effort": "high"},
+                    ],
+                    "default_reasoning_level": "high",
+                }],
+            }))
+            kimi_home = root / "kimi"
+            kimi_home.mkdir()
+            (kimi_home / "config.toml").write_text(
+                "[models.configured-alias]\n"
+                'provider = "moonshot"\n'
+                'model = "kimi-k2"\n'
+                'support_efforts = ["low", "high"]\n'
+                'default_effort = "high"\n'
+            )
+            envs = {
+                "claude": {},
+                "codex": {"CODEX_HOME": str(codex_home)},
+                "kimi": {"KIMI_CODE_HOME": str(kimi_home)},
+                "opencode": {},
+            }
+            connected = [{
+                "id": "provider/model",
+                "provider": "provider",
+                "provider_model": "model",
+                "cli_version": "opencode 1.18.9",
+                "supported_efforts": ["high"],
+                "default_effort": "high",
+                "selector_binding": {
+                    "kind": "connected-model", "selector": "provider/model",
+                },
+                "adapter_metadata": {
+                    "compatibility_manifest": "opencode-1.18.9-v1",
+                    "provider_family": "openai-ai-sdk",
+                    "variant_options_by_effort": {
+                        "high": {"reasoningEffort": "high"},
+                    },
+                },
+                "native_variant_ids": {"high": "high"},
+            }]
+
+            for harness, selector in selectors.items():
+                status = runtime_status(
+                    versions[harness], harness=harness, scope=sandbox
+                )
+                toml_available = mock.patch.object(
+                    mc.toml_compat, "AVAILABLE", True
+                ) if harness == "kimi" else contextlib.nullcontext()
+                toml_loads = mock.patch.object(
+                    mc.toml_compat, "loads", return_value={
+                        "models": {"configured-alias": {
+                            "provider": "moonshot",
+                            "model": "kimi-k2",
+                            "support_efforts": ["low", "high"],
+                            "default_effort": "high",
+                        }},
+                    }
+                ) if harness == "kimi" else contextlib.nullcontext()
+                with (
+                    self.subTest(harness=harness, state="present"),
+                    mock.patch.object(
+                        mc.harness_versions, "runtime_scope",
+                        return_value=sandbox,
+                    ),
+                    mock.patch.object(
+                        mc.shutil, "which", return_value=f"/bin/{harness}"
+                    ),
+                    toml_available,
+                    toml_loads,
+                ):
+                    proof = mc.controlled_route_evidence(
+                        harness, selector, env=envs[harness], run=run,
+                        opencode_provider=lambda: connected,
+                        harness_probe=lambda: {harness: status},
+                    )
+                self.assertEqual(proof["runtime_status"], status)
+                self.assertEqual(proof["runtime_scope"], sandbox)
+                self.assertRegex(
+                    proof["source_fingerprint"],
+                    r"^[0-9a-f]{64}$",
+                )
+
+                canonical_toml_available = mock.patch.object(
+                    mc.toml_compat, "AVAILABLE", True
+                ) if harness == "kimi" else contextlib.nullcontext()
+                canonical_toml_loads = mock.patch.object(
+                    mc.toml_compat, "loads", return_value={
+                        "models": {"configured-alias": {
+                            "provider": "moonshot",
+                            "model": "kimi-k2",
+                            "support_efforts": ["low", "high"],
+                            "default_effort": "high",
+                        }},
+                    }
+                ) if harness == "kimi" else contextlib.nullcontext()
+                with (
+                    self.subTest(harness=harness, state="canonical-resolver"),
+                    mock.patch.dict(mc.os.environ, envs[harness], clear=True),
+                    mock.patch.object(mc.subprocess, "run", side_effect=run),
+                    mock.patch.object(
+                        mc, "opencode_connected_models", return_value=connected
+                    ),
+                    mock.patch.object(
+                        mc.harness_versions, "compatibility_status",
+                        return_value={harness: status},
+                    ),
+                    mock.patch.object(
+                        mc.harness_versions, "runtime_scope",
+                        return_value=sandbox,
+                    ),
+                    mock.patch.object(
+                        mc.shutil, "which", return_value=f"/bin/{harness}"
+                    ),
+                    canonical_toml_available,
+                    canonical_toml_loads,
+                ):
+                    binding, digest = route_bindings.resolve_v2(
+                        controlled_row(
+                            harness, selector, status,
+                            proof["source_fingerprint"],
+                        ),
+                        harness,
+                        selector,
+                        "high",
+                    )
+                self.assertEqual(binding["requested_model"], selector)
+                self.assertEqual(binding["effective_effort"], "high")
+                self.assertRegex(digest, r"^[0-9a-f]{64}$")
+
+                missing_env = {
+                    "codex": {"CODEX_HOME": str(root / "missing-codex")},
+                    "kimi": {"KIMI_CODE_HOME": str(root / "missing-kimi")},
+                }.get(harness, envs[harness])
+                missing_which = None if harness == "claude" else f"/bin/{harness}"
+                missing_provider = (lambda: []) if harness == "opencode" \
+                    else (lambda: connected)
+                toml_available = mock.patch.object(
+                    mc.toml_compat, "AVAILABLE", True
+                ) if harness == "kimi" else contextlib.nullcontext()
+                toml_loads = mock.patch.object(
+                    mc.toml_compat, "loads", return_value={}
+                ) if harness == "kimi" else contextlib.nullcontext()
+                with (
+                    self.subTest(harness=harness, state="missing"),
+                    mock.patch.object(
+                        mc.harness_versions, "runtime_scope",
+                        return_value=sandbox,
+                    ),
+                    mock.patch.object(
+                        mc.shutil, "which", return_value=missing_which
+                    ),
+                    toml_available,
+                    toml_loads,
+                ):
+                    missing = mc.controlled_route_evidence(
+                        harness, selector, env=missing_env, run=run,
+                        opencode_provider=missing_provider,
+                        harness_probe=lambda: {harness: status},
+                    )
+                self.assertIsNone(missing["source_fingerprint"])
+
+
 class BuildTest(NoCLI):
+    def test_single_harness_runtime_status_uses_version_bounded_probe(self):
+        expected = runtime_status()
+        with mock.patch.object(
+            mc.harness_versions, "compatibility_status",
+            return_value={"vibe": expected},
+        ) as probe:
+            got = mc.harness_runtime_status("vibe")
+
+        self.assertEqual(got, expected)
+        probe.assert_called_once_with(("vibe",))
+
     def test_harness_mapping_and_prefixing(self):
         got = mc.build(fetch=fetch_ok, env={}, run=None)
         self.assertEqual(got["v"], mc.PAYLOAD_VERSION)
@@ -111,6 +433,53 @@ class BuildTest(NoCLI):
         self.assertEqual(ids(got["harnesses"]["codex"]), ["gpt-5.5", "gpt-9-preview"],
                          "keyed-API ids append deduped, models.dev order kept")
         self.assertIn("openai-api", got["sources"])
+
+    def test_opencode_catalogue_keeps_provider_model_family(self):
+        opencode = [{
+            "id": "ollama-cloud/deepseek-v4-flash",
+            "provider": "ollama-cloud",
+            "provider_model": "deepseek-v4-flash",
+            "native_option_ids": ["high", "max"],
+        }]
+        with tempfile.TemporaryDirectory() as raw, mock.patch.object(
+            mc, "CACHE", Path(raw) / "model_catalog.json"
+        ):
+            got = mc.catalog(
+                refresh=True,
+                fetch=fetch_ok,
+                env={},
+                run=None,
+                opencode_provider=lambda: opencode,
+            )
+
+        self.assertEqual(
+            ids(got["harnesses"]["opencode"]),
+            ["ollama-cloud/deepseek-v4-flash"],
+        )
+    def test_http_json_rejects_body_larger_than_four_mebibytes(self):
+        reads = []
+
+        class Response:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def read(self, amount):
+                reads.append(amount)
+                return b"x" * (4 * 1024 * 1024 + 1)
+
+        with mock.patch.object(
+            mc.urllib.request, "urlopen", return_value=Response()
+        ):
+            with self.assertRaisesRegex(
+                ValueError, "model catalogue response exceeds safety limits"
+            ):
+                mc._http_json("https://provider.example/models")
+
+        self.assertEqual(reads, [4 * 1024 * 1024 + 1])
+
 
     def test_bad_provider_key_never_fails_the_sweep(self):
         def fetch(url, headers=None):
@@ -152,12 +521,143 @@ class BuildTest(NoCLI):
         ))
         self.assertIn("opencode-provider-api", got["sources"])
 
-    def test_opencode_without_local_runtime_exposes_no_available_routes(self):
+    def test_opencode_live_failure_exposes_no_cached_available_routes(self):
         got = mc._with_live_opencode(
             mc.build(fetch=fetch_ok, env={}, run=None),
-            lambda: self.fail("provider API must not run without opencode"),
+            mock.Mock(side_effect=RuntimeError("managed seat unavailable")),
         )
         self.assertEqual(ids(got["harnesses"]["opencode"]), [])
+        self.assertEqual(
+            got["harnesses"]["opencode"]["error"],
+            "managed seat unavailable",
+        )
+        self.assertNotIn(
+            "ollama-cloud/deepseek-v4-pro",
+            json.dumps(got["harnesses"]["opencode"]),
+        )
+
+    def test_opencode_live_overlay_preserves_exact_native_variant_projection(self):
+        connected = mc.opencode_connected_models({
+            "_sc_cli_version": "1.18.9",
+            "connected": ["ollama-cloud"],
+            "all": [{
+                "id": "ollama-cloud",
+                "npm": "@ai-sdk/openai-compatible",
+                "models": {"deepseek-v4-pro": {
+                    "variants": {
+                        "high": {"reasoningEffort": "high"},
+                        "max": {"reasoningEffort": "max"},
+                    }
+                }},
+            }],
+        })
+        with mock.patch.object(mc.shutil, "which", return_value="/usr/bin/opencode"):
+            got = mc._with_live_opencode(
+                mc.build(fetch=fetch_ok, env={}, run=None),
+                lambda: connected,
+            )
+
+        model = got["harnesses"]["opencode"]["models"][0]
+        self.assertEqual(model["id"], "ollama-cloud/deepseek-v4-pro")
+        self.assertEqual(model["supported_efforts"], ["high", "max"])
+        self.assertEqual(model["native_option_ids"], ["high", "max"])
+        self.assertIsNone(model["default_effort"])
+        self.assertNotIn("native_default_option_id", model)
+        self.assertEqual(
+            model["native_variant_ids"], {"high": "high", "max": "max"}
+        )
+        self.assertEqual(model["adapter_metadata"], {})
+
+    def test_opencode_native_projection_has_no_enum_or_provider_family_gate(self):
+        projected = mc.opencode_connected_models({
+            "_sc_cli_version": "1.18.23",
+            "connected": ["ollama-cloud"],
+            "all": [{
+                "id": "ollama-cloud",
+                "npm": "@future/ollama-cloud-sdk",
+                "models": {
+                    "glm-5.2": {
+                        "variants": {
+                            "MAX.Future": ["opaque", "provider", "payload"],
+                        },
+                    },
+                },
+            }],
+        })
+
+        self.assertEqual(len(projected), 1)
+        self.assertEqual(projected[0]["id"], "ollama-cloud/glm-5.2")
+        self.assertEqual(projected[0]["native_option_ids"], ["MAX.Future"])
+        self.assertEqual(projected[0]["native_variant_ids"], {
+            "MAX.Future": "MAX.Future",
+        })
+        self.assertEqual(projected[0]["adapter_metadata"], {})
+        self.assertNotIn("variants", projected[0])
+
+    def test_live_catalogue_projects_five_exact_models_without_provider_request(self):
+        model_ids = [
+            selector.split("/", 1)[1]
+            for selector in OLLAMA_ACCEPTANCE["models"]
+        ]
+        live_opencode = OLLAMA_ACCEPTANCE["live_opencode"]
+        open_models = mc.opencode_connected_models({
+            "_sc_cli_version": live_opencode["version"],
+            "connected": live_opencode["connected"],
+            "all": [{
+                "id": "ollama-cloud",
+                "models": {
+                    model_id: {
+                        "variants": live_opencode["variants"],
+                    }
+                    for model_id in model_ids
+                },
+            }],
+        })
+        fetch_calls = []
+
+        def no_provider_request(url, headers=None):
+            fetch_calls.append((url, headers))
+            raise OSError("credential-free catalogue fixture")
+
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(
+            mc, "CACHE", Path(tmp) / "model_catalog.json"
+        ):
+            got = mc.catalog(
+                refresh=True,
+                fetch=no_provider_request,
+                env={},
+                run=None,
+                opencode_provider=lambda: open_models,
+            )
+
+        expected = OLLAMA_ACCEPTANCE["models"]
+        block = got["harnesses"]["opencode"]
+        self.assertEqual(block["authority"], "harness-live")
+        self.assertFalse(block["stale"])
+        observed_at = datetime.fromisoformat(block["observed_at"])
+        self.assertEqual(observed_at.tzinfo, timezone.utc)
+        self.assertEqual(ids(block), expected)
+        self.assertEqual(
+            [model["native_option_ids"] for model in block["models"]],
+            [["high", "max"]] * 5,
+        )
+        public_fields = {
+            "id", "release_date", "name", "family", "source",
+            "availability", "provider", "provider_model",
+            "supported_efforts", "default_effort", "cli_version",
+            "native_variant_ids", "native_option_ids",
+        }
+        self.assertEqual(
+            [set(model) for model in block["models"]],
+            [public_fields] * 5,
+        )
+        self.assertNotIn("futureProviderField", json.dumps(block))
+        self.assertNotIn("endpoint_identity", json.dumps(block))
+        self.assertNotIn(
+            "native_default_option_id",
+            got["harnesses"]["opencode"]["models"][0],
+        )
+        self.assertEqual(fetch_calls, [(mc.MODELS_DEV_URL, None)])
 
     def test_all_sources_down_raises(self):
         with self.assertRaises(RuntimeError):
@@ -185,6 +685,7 @@ class LocalRouteDiscoveryTest(unittest.TestCase):
         self.assertEqual(model["source"], "codex-cache")
         self.assertIn("high", model["supported_efforts"])
 
+    @unittest.skipUnless(mc.toml_compat.AVAILABLE, "stdlib TOML parser unavailable")
     def test_kimi_config_selector_is_alias_not_provider_model(self):
         with tempfile.TemporaryDirectory() as tmp:
             Path(tmp, "config.toml").write_text(
@@ -211,9 +712,33 @@ class RoutePersistenceTest(unittest.TestCase):
         self.con.row_factory = sqlite3.Row
         migration = ROOT / ".super-coder" / "migrations" / "0075_model_routes.sql"
         self.con.executescript(migration.read_text())
+        self.con.executescript(
+            "CREATE TABLE sprints (sprint_id INTEGER PRIMARY KEY,lifecycle TEXT);"
+            "CREATE TABLE sprint_participants ("
+            "participant_id INTEGER PRIMARY KEY,sprint_id INTEGER);"
+        )
+        self.con.executescript((
+            ROOT / ".super-coder" / "migrations" /
+            "0212_route_binding_foundation.sql"
+        ).read_text())
+        self.con.executescript((
+            ROOT / ".super-coder" / "migrations" /
+            "0217_harness_support_metadata.sql"
+        ).read_text())
 
     def tearDown(self):
         self.con.close()
+
+    @staticmethod
+    def verification(harness: str, version: str) -> dict:
+        return {"verification": {"runtime": "host", "harnesses": {
+            harness: {
+                "version": version, "compatibility": "verified",
+                "minimum_version": version,
+                "maximum_version_exclusive": "99.0.0",
+                "verified_version": version, "error": None,
+            }
+        }}}
 
     def test_persist_marks_exact_high_effort_route_runnable(self):
         payload = {
@@ -221,7 +746,9 @@ class RoutePersistenceTest(unittest.TestCase):
             "harnesses": {"kimi": {"models": [mc._entry(
                 "kimi-code/k3", source="kimi-config", availability="available",
                 provider="managed:kimi-code", provider_model="k3",
-                supported_efforts=["low", "high"])]}},
+                supported_efforts=["low", "high"],
+                cli_version="kimi 0.33.0")]}},
+            **self.verification("kimi", "0.33.0"),
         }
         mc.persist_routes(self.con, payload)
         row = self.con.execute(
@@ -229,11 +756,14 @@ class RoutePersistenceTest(unittest.TestCase):
             "high_effort_supported, stale FROM model_routes").fetchone()
         self.assertEqual(tuple(row), ("kimi-code/k3", "available", 1, 1, 0))
 
+
     def test_failed_refresh_keeps_route_and_marks_it_stale(self):
         fresh = {"fetched_at": "2026-07-21T00:00:00+00:00", "stale": False,
                  "harnesses": {"claude": {"models": [mc._entry(
                      "fable", source="claude-cli", availability="available",
-                     supported_efforts=["high"])]}}}
+                     supported_efforts=["high"],
+                     cli_version="claude 2.1.222")]}},
+                 **self.verification("claude", "2.1.222")}
         mc.persist_routes(self.con, fresh)
         mc.persist_routes(self.con, {"fetched_at": None, "stale": True,
                                      "error": "network down", "harnesses": {}})
@@ -241,38 +771,588 @@ class RoutePersistenceTest(unittest.TestCase):
             "SELECT stale, last_error FROM model_routes WHERE selector='fable'").fetchone()
         self.assertEqual(tuple(row), (1, "network down"))
 
+    def test_partial_opencode_failure_preserves_other_harness_routes(self):
+        claude = self.verification("claude", "2.1.222")
+        opencode = self.verification("opencode", "1.18.18")
+        statuses = {
+            "claude": claude["verification"]["harnesses"]["claude"],
+            "opencode": opencode["verification"]["harnesses"]["opencode"],
+        }
+        initial = {
+            "fetched_at": "2026-08-20T00:00:00+00:00",
+            "stale": False,
+            "harnesses": {
+                "claude": {"models": [mc._entry(
+                    "opus", source="claude-cli", availability="available",
+                    cli_version="claude 2.1.222",
+                )]},
+                "opencode": {"models": [mc._entry(
+                    "halo/qwen", source="opencode-provider-api",
+                    availability="available", cli_version="opencode 1.18.18",
+                )]},
+            },
+            "verification": {"runtime": "host", "harnesses": statuses},
+        }
+        mc.persist_routes(self.con, initial)
+
+        partial = {
+            **initial,
+            "fetched_at": "2026-08-20T00:01:00+00:00",
+            "partial": True,
+            "errors": ["opencode-provider-api: sidecar unavailable"],
+            "harnesses": {
+                "claude": initial["harnesses"]["claude"],
+                "opencode": {
+                    "models": [],
+                    "error": "HARNESS_UNAVAILABLE: sidecar unavailable",
+                },
+            },
+        }
+        mc.persist_routes(self.con, partial)
+
+        rows = self.con.execute(
+            "SELECT harness,selector,stale,last_error FROM model_routes "
+            "ORDER BY harness"
+        ).fetchall()
+        self.assertEqual(
+            [tuple(row) for row in rows],
+            [
+                ("claude", "opus", 0, None),
+                ("opencode", "halo/qwen", 1,
+                 "HARNESS_UNAVAILABLE: sidecar unavailable"),
+            ],
+        )
+        generation = self.con.execute(
+            "SELECT state,error_summary FROM model_catalog_generations "
+            "ORDER BY completed_at DESC,generation_id DESC LIMIT 1"
+        ).fetchone()
+        self.assertEqual(generation["state"], "successful")
+        self.assertEqual(
+            json.loads(generation["error_summary"])["errors"],
+            ["opencode-provider-api: sidecar unavailable"],
+        )
+
     def test_resolver_returns_exact_high_effort_sc_run_call(self):
-        fresh = {"fetched_at": "2026-07-21T00:00:00+00:00", "stale": False,
+        fresh = {"fetched_at": datetime.now(timezone.utc).isoformat(), "stale": False,
                  "harnesses": {"codex": {"models": [mc._entry(
                      "gpt-5.6-sol", source="codex-cache",
-                     availability="available", supported_efforts=["high"])]}}}
+                     availability="available", supported_efforts=["high"],
+                     cli_version="codex-cli 0.145.0")]}},
+                 **self.verification("codex", "0.145.0")}
         mc.persist_routes(self.con, fresh)
-        got = routes_cli.resolve(
-            self.con, "codex", "gpt-5.6-sol", shell="DEV3")
+        fingerprint = self.con.execute(
+            "SELECT source_fingerprint FROM model_routes WHERE harness='codex' "
+            "AND selector='gpt-5.6-sol'"
+        ).fetchone()[0]
+        observation = controlled_bundle(
+            "codex", "gpt-5.6-sol",
+            runtime_status("0.145.0", harness="codex"), fingerprint,
+        )
+        with mock.patch.object(
+            mc, "controlled_route_evidence", return_value=observation
+        ) as collector:
+            got = routes_cli.resolve(
+                self.con, "codex", "gpt-5.6-sol", shell="DEV3"
+            )
+        collector.assert_called_once_with("codex", "gpt-5.6-sol")
         self.assertTrue(got["ok"])
         self.assertEqual(
             got["command"],
             ["./sc", "run", "DEV3", "--harness", "codex", "-m",
              "gpt-5.6-sol", "--effort", "high"])
 
-    def test_resolver_rejects_unverified_high_effort(self):
-        fresh = {"fetched_at": "2026-07-21T00:00:00+00:00", "stale": False,
+    def test_empty_effort_list_alias_admits_only_model_default(self):
+        # Spec #160 + decision #223: an alias that declares no effort list
+        # persists supported_efforts=[]; the reserved 'default' still binds
+        # (no effort transport), omitted effort falls back to it through the
+        # bind-time chain, and every explicit named level keeps failing
+        # membership.
+        fresh = {"fetched_at": datetime.now(timezone.utc).isoformat(), "stale": False,
                  "harnesses": {"kimi": {"models": [mc._entry(
                      "kimi-code/legacy", source="kimi-config",
-                     availability="available", supported_efforts=[])]}}}
+                     availability="available", supported_efforts=[],
+                     cli_version="kimi 0.33.0")]}},
+                 **self.verification("kimi", "0.33.0")}
         mc.persist_routes(self.con, fresh)
-        got = routes_cli.resolve(self.con, "kimi", "kimi-code/legacy")
-        self.assertFalse(got["ok"])
-        self.assertIn("high-effort", got["error"])
+        fingerprint = self.con.execute(
+            "SELECT source_fingerprint FROM model_routes WHERE harness='kimi' "
+            "AND selector='kimi-code/legacy'"
+        ).fetchone()[0]
+        observation = controlled_bundle(
+            "kimi", "kimi-code/legacy",
+            runtime_status("0.33.0", harness="kimi"), fingerprint,
+        )
+        with mock.patch.object(
+            mc, "controlled_route_evidence", return_value=observation
+        ):
+            bound = routes_cli.resolve(
+                self.con, "kimi", "kimi-code/legacy", effort="default",
+                shell="DEV3",
+            )
+            named = routes_cli.resolve(
+                self.con, "kimi", "kimi-code/legacy", effort="high"
+            )
+            omitted = routes_cli.resolve(
+                self.con, "kimi", "kimi-code/legacy"
+            )
+        self.assertTrue(bound["ok"])
+        binding = bound["binding"]
+        self.assertEqual(binding["control_state"], "controlled")
+        self.assertEqual(binding["requested_effort"], "default")
+        self.assertEqual(binding["effective_effort"], "default")
+        self.assertIsNone(binding["evidence_digest"])
+        self.assertIsNone(binding["native_variant_id"])
+        self.assertEqual(
+            bound["command"],
+            ["./sc", "run", "DEV3", "--harness", "kimi", "-m",
+             "kimi-code/legacy", "--effort", "default"])
+        self.assertEqual(
+            route_bindings.digest_json(binding), bound["binding_digest"])
+        # Decision #223: the omitted effort resolves to the reserved Model
+        # default with the exact identity of an explicit 'default'.
+        self.assertTrue(omitted["ok"])
+        self.assertEqual(omitted["binding"], binding)
+        self.assertEqual(omitted["binding_digest"], bound["binding_digest"])
+        self.assertFalse(named["ok"])
+        self.assertEqual(named["code"], "unsupported_thinking_level")
+        self.assertEqual(named["details"]["default_effort"], "default")
+        self.assertEqual(named["details"]["requested_effort"], "high")
+
+    def test_default_binds_alongside_advertised_named_efforts(self):
+        fresh = {"fetched_at": datetime.now(timezone.utc).isoformat(), "stale": False,
+                 "harnesses": {"codex": {"models": [mc._entry(
+                     "gpt-5.6-sol", source="codex-cache",
+                     availability="available", supported_efforts=["low", "high"],
+                     cli_version="codex-cli 0.145.0")]}},
+                 **self.verification("codex", "0.145.0")}
+        mc.persist_routes(self.con, fresh)
+        fingerprint = self.con.execute(
+            "SELECT source_fingerprint FROM model_routes WHERE harness='codex' "
+            "AND selector='gpt-5.6-sol'"
+        ).fetchone()[0]
+        observation = controlled_bundle(
+            "codex", "gpt-5.6-sol",
+            runtime_status("0.145.0", harness="codex"), fingerprint,
+        )
+        with mock.patch.object(
+            mc, "controlled_route_evidence", return_value=observation
+        ):
+            bound_default = routes_cli.resolve(
+                self.con, "codex", "gpt-5.6-sol", effort=" DEFAULT "
+            )
+            bound_named = routes_cli.resolve(
+                self.con, "codex", "gpt-5.6-sol", effort="high"
+            )
+        self.assertTrue(bound_default["ok"])
+        # Trimmed and case-folded like any other effort; the digest covers the
+        # literal 'default' and is distinct from the named-effort binding.
+        self.assertEqual(
+            bound_default["binding"]["requested_effort"], "default")
+        self.assertTrue(bound_named["ok"])
+        self.assertEqual(bound_named["binding"]["requested_effort"], "high")
+        self.assertNotEqual(
+            bound_default["binding_digest"], bound_named["binding_digest"])
+
+
+class RuntimeVerificationTest(unittest.TestCase):
+    def setUp(self):
+        self.con = sqlite3.connect(":memory:")
+        self.con.row_factory = sqlite3.Row
+        self.addCleanup(self.con.close)
+        self.con.executescript((
+            ROOT / ".super-coder" / "migrations" / "0075_model_routes.sql"
+        ).read_text())
+        self.con.execute(
+            "CREATE TABLE flavor_defaults ("
+            "flavor TEXT NOT NULL,harness TEXT NOT NULL,model TEXT,"
+            "is_default INTEGER NOT NULL DEFAULT 0,"
+            "PRIMARY KEY (flavor,harness))"
+        )
+
+    @staticmethod
+    def harnesses():
+        base = {
+            "minimum_version": "1.0.0",
+            "maximum_version_exclusive": "2.0.0",
+            "verified_version": "1.5.0",
+        }
+        return {
+            "codex": {
+                **base, "version": "2.0.0",
+                "compatibility": "newer-unverified", "error": None,
+            },
+            "claude": {
+                **base, "version": "1.5.0",
+                "compatibility": "verified", "error": None,
+            },
+            "opencode": {
+                **base, "version": "1.6.0",
+                "compatibility": "supported", "error": None,
+            },
+            "vibe": {
+                "version": None, "compatibility": None,
+                "minimum_version": None,
+                "maximum_version_exclusive": None,
+                "verified_version": None,
+                "error": "HARNESS_UNAVAILABLE",
+            },
+        }
+
+    def insert_default(self, flavor, harness, model, is_default=0):
+        self.con.execute(
+            "INSERT INTO flavor_defaults (flavor,harness,model,is_default) "
+            "VALUES (?,?,?,?)",
+            (flavor, harness, model, is_default),
+        )
+
+    def test_report_projects_best_effort_route_as_runnable(self):
+        self.insert_default("dev", "codex", "gpt-ready", 1)
+        self.insert_default("planner", "codex", "gpt-missing", 1)
+        self.insert_default("reviewer", "claude", None, 1)
+        self.insert_default("cartographer", "opencode", "openai/local", 1)
+        self.insert_default("dev", "vibe", "vibe-model")
+        mc.persist_routes(self.con, {
+            "fetched_at": "2026-08-09T00:00:00+00:00",
+            "stale": False,
+            "harnesses": {
+                "codex": {"models": [mc._entry(
+                    "gpt-ready", source="codex-cache",
+                    availability="available", supported_efforts=["high"],
+                    cli_version="codex-cli 2.0.0",
+                )]},
+                "opencode": {"models": [mc._entry(
+                    "openai/local", source="opencode-provider-api",
+                    availability="available", cli_version="opencode 1.6.0",
+                )]},
+            },
+            "verification": {"runtime": "sandbox",
+                             "harnesses": self.harnesses()},
+        })
+
+        report = mc.runtime_verification(
+            self.con, env={"SC_SANDBOX": "1"}, harness_probe=self.harnesses
+        )
+
+        self.assertEqual(report["runtime"], "sandbox")
+        self.assertEqual(report["harnesses"]["codex"]["compatibility"],
+                         "newer-unverified")
+        self.assertEqual(report["summary"], {
+            "harnesses_checked": 4,
+            "harnesses_ready": 3,
+            "exact_routes": 4,
+            "exact_routes_runnable": 2,
+            "harness_defaults": 1,
+        })
+        by_key = {
+            (row["flavor"], row["harness"]): row
+            for row in report["defaults"]
+        }
+        self.assertEqual(by_key[("dev", "codex")], {
+            "flavor": "dev", "harness": "codex", "model": "gpt-ready",
+            "is_default": True, "state": "runnable", "runnable": True,
+            "reason": None,
+        })
+        self.assertEqual(by_key[("planner", "codex")]["state"],
+                         "route-missing")
+        self.assertFalse(by_key[("planner", "codex")]["runnable"])
+        self.assertEqual(by_key[("reviewer", "claude")]["state"],
+                         "harness-default")
+        self.assertIsNone(by_key[("reviewer", "claude")]["runnable"])
+        self.assertEqual(by_key[("cartographer", "opencode")]["state"],
+                         "runnable")
+        self.assertTrue(by_key[("cartographer", "opencode")]["runnable"])
+        self.assertEqual(by_key[("dev", "vibe")]["reason"],
+                         "HARNESS_UNAVAILABLE")
+        self.assertFalse(by_key[("dev", "vibe")]["runnable"])
+
+    def test_probe_failure_is_visible_without_skipping_the_response(self):
+        def fail_probe():
+            raise RuntimeError("probe transport failed")
+
+        report = mc.runtime_verification(
+            self.con, env={}, harness_probe=fail_probe
+        )
+
+        self.assertEqual(report["runtime"], "host")
+        self.assertEqual(report["error"], "probe transport failed")
+        self.assertEqual(report["harnesses"], {})
+        self.assertEqual(report["defaults"], [])
+        self.assertEqual(report["summary"], {
+            "harnesses_checked": 0,
+            "harnesses_ready": 0,
+            "exact_routes": 0,
+            "exact_routes_runnable": 0,
+            "harness_defaults": 0,
+        })
+
+    def test_non_runnable_route_states_keep_exact_failure_reasons(self):
+        self.insert_default("dev", "codex", "gpt-stale")
+        self.insert_default("planner", "claude", "opus-advisory")
+        self.insert_default("reviewer", "vibe", "vibe-local")
+        self.insert_default("cartographer", "kimi", "kimi-low")
+        mc.persist_routes(self.con, {
+            "fetched_at": "2026-08-09T00:00:00+00:00",
+            "stale": False,
+            "harnesses": {
+                "codex": {"models": [mc._entry(
+                    "gpt-stale", availability="available",
+                    supported_efforts=["high"]
+                )]},
+                "claude": {"models": [mc._entry(
+                    "opus-advisory", availability="advisory",
+                    supported_efforts=["high"]
+                )]},
+                "vibe": {"models": [mc._entry(
+                    "vibe-local", availability="available"
+                )]},
+                "kimi": {"models": [mc._entry(
+                    "kimi-low", availability="available",
+                    supported_efforts=["low"]
+                )]},
+            },
+        })
+        self.con.execute(
+            "UPDATE model_routes SET stale=1,last_error='catalog offline' "
+            "WHERE harness='codex' AND selector='gpt-stale'"
+        )
+        statuses = self.harnesses()
+        statuses["codex"] = {
+            **statuses["claude"], "version": "1.6.0",
+            "compatibility": "supported",
+        }
+        statuses["vibe"] = {
+            "version": "vibe 1.0.0", "compatibility": None,
+            "minimum_version": None, "maximum_version_exclusive": None,
+            "verified_version": None, "error": None,
+        }
+        statuses["kimi"] = {
+            **statuses["claude"], "version": "1.6.0",
+            "compatibility": "supported",
+        }
+
+        report = mc.runtime_verification(
+            self.con, env={}, harness_probe=lambda: statuses
+        )
+
+        by_harness = {row["harness"]: row for row in report["defaults"]}
+        self.assertEqual(
+            (by_harness["codex"]["state"], by_harness["codex"]["reason"]),
+            ("route-stale", "catalog offline"),
+        )
+        self.assertEqual(
+            (by_harness["claude"]["state"], by_harness["claude"]["reason"]),
+            ("route-unavailable", "route is advisory, not locally available"),
+        )
+        self.assertEqual(
+            (by_harness["vibe"]["state"], by_harness["vibe"]["reason"]),
+            ("headless-unsupported", "harness has no headless launch seam"),
+        )
+        self.assertEqual(
+            (by_harness["kimi"]["state"], by_harness["kimi"]["reason"]),
+            ("effort-unsupported",
+             "default high-effort route was not locally verified"),
+        )
+        self.assertTrue(all(
+            row["runnable"] is False for row in report["defaults"]
+        ))
+
+    def test_explicit_refresh_caches_verification_for_later_gui_reads(self):
+        self.insert_default("dev", "codex", "gpt-5.5", 1)
+        with tempfile.TemporaryDirectory() as tmp:
+            old_cache = mc.CACHE
+            mc.CACHE = Path(tmp) / "model_catalog.json"
+            self.addCleanup(lambda: setattr(mc, "CACHE", old_cache))
+            probe = mock.Mock(return_value=self.harnesses())
+            with mock.patch.object(mc.shutil, "which", return_value=None):
+                first = mc.catalog(
+                    refresh=True, fetch=fetch_ok, env={}, run=None, con=self.con,
+                    opencode_provider=lambda: [], harness_probe=probe,
+                )
+                second = mc.catalog(
+                    fetch=fetch_down, env={}, run=None, con=self.con,
+                    opencode_provider=lambda: [],
+                    harness_probe=mock.Mock(
+                        side_effect=AssertionError("reprobed")
+                    ),
+                )
+
+        probe.assert_called_once_with()
+        self.assertEqual(first["verification"]["summary"]["exact_routes"], 1)
+        self.assertEqual(
+            first["verification"]["summary"]["exact_routes_runnable"], 0
+        )
+        self.assertEqual(second["verification"], first["verification"])
+        self.assertFalse(second["stale"])
+
+    def test_failed_first_refresh_still_persists_fork_verification(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            old_cache = mc.CACHE
+            mc.CACHE = Path(tmp) / "model_catalog.json"
+            self.addCleanup(lambda: setattr(mc, "CACHE", old_cache))
+            with mock.patch.object(mc.shutil, "which", return_value=None):
+                got = mc.catalog(
+                    refresh=True, fetch=fetch_down, env={}, run=None,
+                    con=self.con, opencode_provider=lambda: [],
+                    harness_probe=self.harnesses,
+                )
+            cached = json.loads(mc.CACHE.read_text())
+
+        self.assertTrue(got["stale"])
+        self.assertEqual(got["sources"], ["static", "opencode-provider-api"])
+        self.assertEqual(got["verification"]["summary"], {
+            "harnesses_checked": 4,
+            "harnesses_ready": 3,
+            "exact_routes": 0,
+            "exact_routes_runnable": 0,
+            "harness_defaults": 0,
+        })
+        self.assertEqual(cached["verification"], got["verification"])
+        self.assertIsNone(cached["fetched_at"])
 
 
 class RouteCliConnectionTest(unittest.TestCase):
     ROUTE = {
         "harness": "codex", "selector": "api-model", "source": "live-api",
         "availability": "available", "stale": 0, "headless_supported": 1,
-        "high_effort_supported": 1, "cli_version": "1",
+        "high_effort_supported": 1, "cli_version": "codex-cli 0.145.0",
+        "harness_version": "0.145.0", "harness_compatibility": "verified",
+        "harness_support_state": "tested",
         "supported_efforts": '["high"]',
+        "last_seen_at": datetime.now(timezone.utc).isoformat(),
+        "generation_id": "1" * 32,
+        "evidence_kind": "codex-model-cache",
+        "source_fingerprint": "3" * 64,
+        "effort_metadata": json.dumps({
+            "supported": ["high"], "default": "high",
+            "digests": {"high": "2" * 64}, "native_variant_ids": {},
+        }),
+        "selector_binding": '{"kind":"exact-model","selector":"api-model"}',
+        "adapter_metadata": "{}",
     }
+
+    @classmethod
+    def controlled_route(cls, harness: str) -> dict:
+        versions = {
+            "claude": "2.1.222", "codex": "0.145.0",
+            "kimi": "0.33.0", "opencode": "1.18.9",
+        }
+        evidence = {
+            "claude": "claude-portable-manifest",
+            "codex": "codex-model-cache",
+            "kimi": "kimi-alias-config",
+            "opencode": "opencode-connected-variant",
+        }
+        row = {
+            **cls.ROUTE,
+            "harness": harness,
+            "cli_version": f"{harness} {versions[harness]}",
+            "harness_version": versions[harness],
+            "evidence_kind": evidence[harness],
+        }
+        if harness == "opencode":
+            row["effort_metadata"] = json.dumps({
+                "supported": ["high"], "default": "high",
+                "digests": {"high": "2" * 64},
+                "native_variant_ids": {"high": "high"},
+                "adapter_metadata_by_effort": {
+                    "high": {
+                        "compatibility_manifest": "opencode-1.18.9-v1",
+                        "provider_family": "openai-ai-sdk",
+                        "variant_options": {"reasoningEffort": "high"},
+                    },
+                },
+            })
+            row["adapter_metadata"] = json.dumps({
+                "compatibility_manifest": "opencode-1.18.9-v1",
+                "provider_family": "openai-ai-sdk",
+                "variant_options_by_effort": {
+                    "high": {"reasoningEffort": "high"},
+                },
+            })
+        return row
+
+    def authenticated_controlled(self, harness: str, row: dict, *,
+                                 status: dict, fingerprint: str) -> tuple[int, dict]:
+        output = io.StringIO()
+        with (
+            mock.patch.object(routes_cli.mem, "SC_API_TOKEN", "shell-token"),
+            mock.patch.object(routes_cli.mem, "SC_API_BASE", "http://engine"),
+            mock.patch.object(
+                routes_cli.mem, "_api", return_value={"routes": [row]}
+            ),
+            mock.patch.object(
+                routes_cli.model_catalog, "controlled_route_evidence",
+                return_value=controlled_bundle(
+                    harness, "api-model", status, fingerprint
+                ),
+            ) as source_probe,
+            mock.patch.object(
+                routes_cli, "_open_db", side_effect=AssertionError("opened DB")
+            ),
+            contextlib.redirect_stdout(output),
+        ):
+            exit_code = routes_cli.main([
+                "resolve", harness, "api-model", "--json",
+            ])
+        source_probe.assert_called_once_with(harness, "api-model")
+        return exit_code, json.loads(output.getvalue())
+
+    def test_authenticated_controlled_routes_use_live_execution_seat_proof(self):
+        sandbox = {
+            "runtime": "sandbox", "runtime_identity": "sandbox:test-image",
+        }
+        versions = {
+            "claude": "2.1.222", "codex": "0.145.0",
+            "kimi": "0.33.0", "opencode": "1.18.9",
+        }
+        for harness, version in versions.items():
+            row = self.controlled_route(harness)
+            good = runtime_status(
+                version, harness=harness, scope=sandbox
+            )
+            with self.subTest(harness=harness, case="matching-sandbox"):
+                exit_code, result = self.authenticated_controlled(
+                    harness, row, status=good, fingerprint="3" * 64,
+                )
+                self.assertEqual(exit_code, 0, result)
+                self.assertTrue(result["ok"])
+                self.assertEqual(result["binding"]["harness"], harness)
+            with self.subTest(harness=harness, case="source-mismatch"):
+                exit_code, result = self.authenticated_controlled(
+                    harness, row, status=good, fingerprint="9" * 64,
+                )
+                if harness == "opencode":
+                    self.assertEqual(exit_code, 0, result)
+                    self.assertTrue(result["ok"])
+                    self.assertEqual(result["binding"]["contract_version"], 3)
+                    self.assertIsNone(result["binding"]["native_option_id"])
+                else:
+                    self.assertEqual(exit_code, 2)
+                    self.assertEqual(result["code"], "thinking_evidence_stale")
+                    self.assertNotIn("binding", result)
+                    self.assertNotIn("binding_digest", result)
+                    self.assertNotIn("command", result)
+
+        codex = self.controlled_route("codex")
+        cases = {
+            "container-missing": runtime_status(
+                None, compatibility=None, error="HARNESS_UNAVAILABLE",
+                harness="codex", scope=sandbox,
+            ),
+            "container-version-mismatch": runtime_status(
+                "0.146.0", harness="codex", scope=sandbox,
+            ),
+        }
+        for name, status in cases.items():
+            with self.subTest(case=name):
+                exit_code, result = self.authenticated_controlled(
+                    "codex", codex, status=status, fingerprint="3" * 64,
+                )
+                self.assertEqual(exit_code, 2)
+                self.assertEqual(result["code"], "thinking_evidence_stale")
+                self.assertNotIn("binding", result)
+                self.assertNotIn("binding_digest", result)
+                self.assertNotIn("command", result)
 
     def test_list_and_resolve_use_shell_api_without_opening_database(self):
         with (
@@ -283,6 +1363,13 @@ class RouteCliConnectionTest(unittest.TestCase):
             ) as api,
             mock.patch.object(
                 routes_cli, "_open_db", side_effect=AssertionError("opened DB")
+            ),
+            mock.patch.object(
+                routes_cli.model_catalog, "controlled_route_evidence",
+                return_value=controlled_bundle(
+                    "codex", "api-model",
+                    runtime_status("0.145.0", harness="codex"), "3" * 64,
+                ),
             ),
         ):
             self.assertEqual(routes_cli.main(["list", "codex"]), 0)
@@ -306,6 +1393,343 @@ class RouteCliConnectionTest(unittest.TestCase):
         ):
             self.assertEqual(routes_cli.main(["list"]), 0)
         opened.assert_called_once_with()
+
+    def test_resolve_rejects_an_explicitly_blank_shell(self):
+        for value in ("", "   "):
+            with self.subTest(value=value), self.assertRaisesRegex(
+                SystemExit, "--shell requires a non-blank value"
+            ):
+                routes_cli._resolve_args([
+                    "resolve", "codex", "api-model", "--shell", value,
+                ])
+
+    def test_authenticated_resolve_normalizes_harness_before_lookup(self):
+        api = mock.Mock(return_value={"routes": [self.ROUTE]})
+
+        def resolve(harness: str) -> dict:
+            output = io.StringIO()
+            with (
+                mock.patch.object(routes_cli.mem, "SC_API_TOKEN", "shell-token"),
+                mock.patch.object(routes_cli.mem, "SC_API_BASE", "http://engine"),
+                mock.patch.object(routes_cli.mem, "_api", api),
+                mock.patch.object(
+                    routes_cli, "_open_db", side_effect=AssertionError("opened DB")
+                ),
+                mock.patch.object(
+                    routes_cli.model_catalog, "controlled_route_evidence",
+                    return_value=controlled_bundle(
+                        "codex", "api-model",
+                        runtime_status("0.145.0", harness="codex"), "3" * 64,
+                    ),
+                ),
+                contextlib.redirect_stdout(output),
+            ):
+                self.assertEqual(routes_cli.main([
+                    "resolve", harness, "api-model", "--json",
+                ]), 0)
+            return json.loads(output.getvalue())
+
+        mixed = resolve("Codex")
+        lower = resolve("codex")
+
+        self.assertEqual(api.call_args_list, [
+            mock.call(
+                "GET", "/_sc/model-routes?harness=codex&selector=api-model"
+            ),
+            mock.call(
+                "GET", "/_sc/model-routes?harness=codex&selector=api-model"
+            ),
+        ])
+        self.assertEqual(mixed["binding"], lower["binding"])
+        self.assertEqual(mixed["binding_digest"], lower["binding_digest"])
+
+    def test_local_resolve_rejects_unknown_harness_and_accepts_mixed_case(self):
+        def resolve(harness: str) -> tuple[int, dict, mock.Mock]:
+            output = io.StringIO()
+            con = mock.Mock()
+            with (
+                mock.patch.object(routes_cli.mem, "SC_API_TOKEN", ""),
+                mock.patch.object(routes_cli, "_open_db", return_value=con),
+                contextlib.redirect_stdout(output),
+            ):
+                status = routes_cli.main(["resolve", harness, "--json"])
+            return status, json.loads(output.getvalue()), con
+
+        with mock.patch.object(
+            routes_cli.model_catalog, "harness_runtime_status",
+            return_value=runtime_status("2.1.223", harness="claude"),
+        ):
+            refused_status, refused, refused_con = resolve("not-a-harness")
+            accepted_status, accepted, accepted_con = resolve("ClAuDe")
+
+        self.assertEqual(refused_status, 2)
+        self.assertEqual(refused["code"], "unsupported_thinking_level")
+        self.assertEqual(refused["error"], "Harness is not supported")
+        self.assertNotIn("binding", refused)
+        self.assertNotIn("binding_digest", refused)
+        self.assertNotIn("command", refused)
+        refused_con.close.assert_called_once_with()
+        self.assertEqual(accepted_status, 0)
+        self.assertEqual(accepted["harness"], "claude")
+        self.assertEqual(accepted["binding"]["harness"], "claude")
+        self.assertEqual(
+            accepted["binding"]["control_state"], "harness-default"
+        )
+        self.assertEqual(
+            accepted["command"],
+            ["./sc", "run", "<shell>", "--harness", "claude"],
+        )
+        accepted_con.close.assert_called_once_with()
+
+    def test_local_uncontrolled_resolve_requires_runtime_but_not_version_range(self):
+        con = mock.Mock()
+        with mock.patch.object(
+            routes_cli.model_catalog, "harness_runtime_status",
+            return_value=runtime_status(
+                version=None, compatibility=None, error="HARNESS_UNAVAILABLE",
+                harness="claude",
+            ),
+        ):
+            unavailable_harness = routes_cli.resolve(con, "claude")
+        with mock.patch.object(
+            routes_cli.model_catalog, "harness_runtime_status",
+            return_value=runtime_status(
+                version="3.0.0", compatibility="newer-unverified"
+            ),
+        ):
+            incompatible_vibe = routes_cli.resolve(
+                con, "vibe", "devstral-latest"
+            )
+
+        self.assertFalse(unavailable_harness["ok"])
+        self.assertEqual(unavailable_harness["code"], "thinking_evidence_missing")
+        self.assertNotIn("binding", unavailable_harness)
+        self.assertNotIn("binding_digest", unavailable_harness)
+        self.assertNotIn("command", unavailable_harness)
+        self.assertIn("no compatible installed runtime", unavailable_harness["error"])
+        self.assertTrue(incompatible_vibe["ok"])
+        self.assertEqual(
+            incompatible_vibe["binding"]["control_state"], "native-uncontrolled"
+        )
+
+    def test_local_ready_uncontrolled_routes_keep_typed_null_identity(self):
+        con = mock.Mock()
+        with mock.patch.object(
+            routes_cli.model_catalog, "harness_runtime_status",
+            side_effect=lambda harness: runtime_status(
+                "2.1.223", harness="claude"
+            ) if harness == "claude" else runtime_status(harness="vibe"),
+        ):
+            default_first = routes_cli.resolve(con, "claude")
+            default_replay = routes_cli.resolve(con, "claude")
+            vibe_first = routes_cli.resolve(con, "vibe", "vibe-local")
+            vibe_replay = routes_cli.resolve(con, "vibe", "vibe-local")
+
+        for result, state in (
+            (default_first, "harness-default"),
+            (vibe_first, "native-uncontrolled"),
+        ):
+            binding = result["binding"]
+            self.assertTrue(result["ok"])
+            self.assertEqual(binding["control_state"], state)
+            self.assertIsNone(binding["requested_effort"])
+            self.assertIsNone(binding["effective_effort"])
+            self.assertIsNone(binding["catalogue_generation"])
+            self.assertIsNone(binding["evidence_digest"])
+            self.assertNotIn("--effort", result["command"])
+        self.assertEqual(
+            default_first["binding_digest"], default_replay["binding_digest"]
+        )
+        self.assertEqual(
+            vibe_first["binding_digest"], vibe_replay["binding_digest"]
+        )
+
+    def test_authenticated_uncontrolled_resolve_requires_runtime_not_version_range(self):
+        cases = (
+            (
+                ["resolve", "claude", "--json"],
+                {"routes": [], "runtime_status": runtime_status(
+                    "2.1.223", harness="claude"
+                )},
+                runtime_status(
+                    version=None, compatibility=None,
+                    error="HARNESS_UNAVAILABLE",
+                    harness="claude",
+                ),
+                "/_sc/model-routes?harness=claude",
+            ),
+            (
+                ["resolve", "vibe", "devstral-latest", "--json"],
+                {"routes": [], "runtime_status": runtime_status()},
+                runtime_status(
+                    version="3.0.0", compatibility="newer-unverified"
+                ),
+                "/_sc/model-routes?harness=vibe&selector=devstral-latest",
+            ),
+        )
+        for argv, projection, local_status, path in cases:
+            with self.subTest(argv=argv):
+                output = io.StringIO()
+                api = mock.Mock(return_value=projection)
+                with (
+                    mock.patch.object(
+                        routes_cli.mem, "SC_API_TOKEN", "shell-token"
+                    ),
+                    mock.patch.object(
+                        routes_cli.mem, "SC_API_BASE", "http://engine"
+                    ),
+                    mock.patch.object(routes_cli.mem, "_api", api),
+                    mock.patch.object(
+                        routes_cli.model_catalog, "harness_runtime_status",
+                        return_value=local_status,
+                    ),
+                    mock.patch.object(
+                        routes_cli, "_open_db",
+                        side_effect=AssertionError("opened DB"),
+                    ),
+                    contextlib.redirect_stdout(output),
+                ):
+                    status = routes_cli.main(argv)
+                result = json.loads(output.getvalue())
+                accepted = local_status.get("error") is None
+                self.assertEqual(status, 0 if accepted else 2)
+                self.assertEqual(result["ok"], accepted)
+                if accepted:
+                    self.assertEqual(
+                        result["binding"]["control_state"], "native-uncontrolled"
+                    )
+                else:
+                    self.assertEqual(result["code"], "thinking_evidence_missing")
+                    self.assertNotIn("binding", result)
+                api.assert_called_once_with("GET", path)
+
+    def test_authenticated_ready_uncontrolled_binding_is_stable(self):
+        projections = {
+            "/_sc/model-routes?harness=claude": {
+                "routes": [],
+            },
+            "/_sc/model-routes?harness=vibe&selector=vibe-local": {
+                "routes": [],
+            },
+        }
+
+        def resolve(argv):
+            output = io.StringIO()
+            with (
+                mock.patch.object(routes_cli.mem, "SC_API_TOKEN", "shell-token"),
+                mock.patch.object(routes_cli.mem, "SC_API_BASE", "http://engine"),
+                mock.patch.object(
+                    routes_cli.mem, "_api",
+                    side_effect=lambda _method, path: projections[path],
+                ),
+                mock.patch.object(
+                    routes_cli.model_catalog, "harness_runtime_status",
+                    side_effect=lambda harness: runtime_status(
+                        "2.1.223", harness="claude"
+                    ) if harness == "claude" else runtime_status(harness="vibe"),
+                ),
+                mock.patch.object(
+                    routes_cli, "_open_db", side_effect=AssertionError("opened DB")
+                ),
+                contextlib.redirect_stdout(output),
+            ):
+                self.assertEqual(routes_cli.main(argv), 0)
+            return json.loads(output.getvalue())
+
+        for argv in (
+            ["resolve", "claude", "--json"],
+            ["resolve", "vibe", "vibe-local", "--json"],
+        ):
+            with self.subTest(argv=argv):
+                first = resolve(argv)
+                replay = resolve(argv)
+                self.assertEqual(first["binding_digest"], replay["binding_digest"])
+                self.assertIsNone(first["binding"]["requested_effort"])
+                self.assertIsNone(first["binding"]["effective_effort"])
+                self.assertIsNone(first["binding"]["catalogue_generation"])
+                self.assertIsNone(first["binding"]["evidence_digest"])
+                self.assertNotIn("--effort", first["command"])
+
+    def test_authenticated_resolution_uses_the_shell_execution_runtime(self):
+        host = {"runtime": "host", "runtime_identity": "host:api-host"}
+        sandbox = {
+            "runtime": "sandbox", "runtime_identity": "sandbox:shell-image",
+        }
+        host_ready = runtime_status(scope=host)
+        host_missing = runtime_status(
+            version=None, compatibility=None, error="HARNESS_UNAVAILABLE",
+            scope=host,
+        )
+        sandbox_ready = runtime_status(scope=sandbox)
+        sandbox_missing = runtime_status(
+            version=None, compatibility=None, error="HARNESS_UNAVAILABLE",
+            scope=sandbox,
+        )
+        sandbox_incompatible = runtime_status(
+            version="2.23.0", compatibility="newer-unverified", scope=sandbox,
+        )
+        cases = (
+            ("host-ready-container-missing", host_ready, sandbox_missing,
+             sandbox, False),
+            ("host-missing-container-ready", host_missing, sandbox_ready,
+             sandbox, True),
+            ("best-effort-image-version", host_ready, sandbox_incompatible,
+             sandbox, True),
+            ("matching-bare-metal", host_ready, host_ready, host, True),
+        )
+
+        for name, api_status, shell_status, shell_scope, accepted in cases:
+            with self.subTest(name=name):
+                output = io.StringIO()
+                api = mock.Mock(return_value={
+                    "routes": [],
+                    # A legacy/malicious server value must never be admission
+                    # evidence for the shell's execution runtime.
+                    "runtime_status": api_status,
+                })
+                local_probe = mock.Mock(return_value=shell_status)
+                with (
+                    mock.patch.object(routes_cli.mem, "SC_API_TOKEN", "shell-token"),
+                    mock.patch.object(routes_cli.mem, "SC_API_BASE", "http://engine"),
+                    mock.patch.object(routes_cli.mem, "_api", api),
+                    mock.patch.object(
+                        routes_cli.model_catalog, "harness_runtime_status",
+                        local_probe,
+                    ),
+                    mock.patch.object(
+                        routes_cli.model_catalog.harness_versions,
+                        "runtime_scope", return_value=shell_scope,
+                    ),
+                    mock.patch.object(
+                        routes_cli, "_open_db",
+                        side_effect=AssertionError("opened DB"),
+                    ),
+                    contextlib.redirect_stdout(output),
+                ):
+                    exit_code = routes_cli.main([
+                        "resolve", "vibe", "devstral-latest", "--json",
+                    ])
+                result = json.loads(output.getvalue())
+
+                self.assertEqual(exit_code, 0 if accepted else 2)
+                self.assertEqual(result["ok"], accepted)
+                if accepted:
+                    self.assertEqual(
+                        result["binding"]["control_state"],
+                        "native-uncontrolled",
+                    )
+                    self.assertIsNone(result["binding"]["requested_effort"])
+                    self.assertNotIn("--effort", result["command"])
+                else:
+                    self.assertEqual(result["code"], "thinking_evidence_missing")
+                    self.assertNotIn("binding", result)
+                    self.assertNotIn("binding_digest", result)
+                    self.assertNotIn("command", result)
+                local_probe.assert_called_once_with("vibe")
+                api.assert_called_once_with(
+                    "GET",
+                    "/_sc/model-routes?harness=vibe&selector=devstral-latest",
+                )
 
     def test_refresh_keeps_the_wal_enabled_write_lane(self):
         con = mock.Mock()
@@ -333,7 +1757,86 @@ class CatalogCacheTest(NoCLI):
         self.assertTrue(mc.CACHE.exists())
         second = mc.catalog(fetch=fetch_down, env={}, run=None)  # would fail live
         self.assertFalse(second["stale"], "fresh cache must serve without a fetch")
-        self.assertEqual(second["harnesses"], first["harnesses"])
+        for harness in ("claude", "codex", "kimi", "vibe"):
+            self.assertEqual(
+                second["harnesses"].get(harness),
+                first["harnesses"].get(harness),
+            )
+        self.assertEqual(
+            second["harnesses"]["opencode"]["models"],
+            first["harnesses"]["opencode"]["models"],
+        )
+        self.assertFalse(second["harnesses"]["opencode"]["stale"])
+        self.assertNotEqual(
+            second["harnesses"]["opencode"]["observed_at"],
+            first["harnesses"]["opencode"]["observed_at"],
+        )
+
+    def test_global_stale_cache_cannot_replace_successful_live_blocks(self):
+        mc.catalog(
+            fetch=fetch_ok,
+            env={},
+            run=None,
+            opencode_provider=lambda: [{
+                "id": "old-provider/old-model",
+                "provider": "old-provider",
+                "provider_model": "old-model",
+                "native_option_ids": ["old-option"],
+            }],
+        )
+        cached = json.loads(mc.CACHE.read_text())
+        cached["stale"] = True
+        mc.CACHE.write_text(json.dumps(cached))
+
+        got = mc.catalog(
+            fetch=fetch_down,
+            env={},
+            run=None,
+            opencode_provider=lambda: [{
+                "id": "ollama-cloud/glm-5.2",
+                "provider": "ollama-cloud",
+                "provider_model": "glm-5.2",
+                "native_option_ids": ["MAX.Future", "low"],
+            }],
+        )
+
+        self.assertTrue(got["stale"])
+        self.assertEqual(
+            ids(got["harnesses"]["opencode"]),
+            ["ollama-cloud/glm-5.2"],
+        )
+        block = got["harnesses"]["opencode"]
+        self.assertFalse(block["stale"])
+        self.assertEqual(
+            block["models"][0]["native_option_ids"],
+            ["MAX.Future", "low"],
+        )
+        self.assertNotIn("old-model", json.dumps(block))
+
+    def test_malformed_opencode_projection_fails_only_its_live_block(self):
+        def malformed_opencode():
+            return mc.opencode_connected_models({
+                "connected": ["ollama-cloud"],
+                "all": [{
+                    "id": "ollama-cloud",
+                    "models": {"glm-5.2": {"variants": ["max"]}},
+                }],
+            })
+
+        got = mc.catalog(
+            fetch=fetch_ok,
+            env={},
+            run=None,
+            opencode_provider=malformed_opencode,
+        )
+
+        self.assertTrue(got["partial"])
+        self.assertEqual(got["harnesses"]["opencode"]["models"], [])
+        self.assertIn(
+            "variants must be an object",
+            got["harnesses"]["opencode"]["error"],
+        )
+        self.assertIn("claude-opus-4-8", ids(got["harnesses"]["claude"]))
 
     def test_fresh_cache_still_refreshes_connected_opencode_models(self):
         provider_models = mock.Mock(side_effect=[
@@ -374,6 +1877,52 @@ class CatalogCacheTest(NoCLI):
         self.assertFalse(second["stale"], "the base cache remains fresh")
         self.assertEqual(provider_models.call_count, 2)
 
+    def test_opencode_overlay_failure_does_not_make_fresh_catalog_stale(self):
+        with mock.patch.object(
+            mc.shutil, "which",
+            side_effect=lambda name: (
+                "/usr/bin/opencode" if name == "opencode" else None
+            ),
+        ):
+            got = mc.catalog(
+                fetch=fetch_ok,
+                env={},
+                run=None,
+                opencode_provider=mock.Mock(
+                    side_effect=RuntimeError(
+                        "token=top-secret sidecar unavailable"
+                    )
+                ),
+            )
+            cached = mc.catalog(
+                fetch=fetch_down,
+                env={},
+                run=None,
+                opencode_provider=mock.Mock(
+                    side_effect=RuntimeError(
+                        "password=hunter2 sidecar still unavailable"
+                    )
+                ),
+            )
+
+        self.assertTrue(got["partial"])
+        self.assertFalse(got["stale"])
+        self.assertIn("claude-opus-4-8", ids(got["harnesses"]["claude"]))
+        self.assertEqual(got["harnesses"]["opencode"]["models"], [])
+        self.assertEqual(
+            got["harnesses"]["opencode"]["error"],
+            "token=[REDACTED] sidecar unavailable",
+        )
+        self.assertTrue(cached["partial"])
+        self.assertFalse(cached["stale"])
+        self.assertIn("claude-opus-4-8", ids(cached["harnesses"]["claude"]))
+        self.assertEqual(
+            cached["harnesses"]["opencode"]["error"],
+            "password=[REDACTED] sidecar still unavailable",
+        )
+        self.assertNotIn("top-secret", json.dumps(got))
+        self.assertNotIn("hunter2", json.dumps(cached))
+
     def test_stale_cache_served_when_refresh_fails(self):
         mc.catalog(fetch=fetch_ok, env={}, run=None)
         aged = json.loads(mc.CACHE.read_text())
@@ -389,8 +1938,10 @@ class CatalogCacheTest(NoCLI):
         old = json.loads(mc.CACHE.read_text())
         del old["v"]
         mc.CACHE.write_text(json.dumps(old))
-        got = mc.catalog(fetch=fetch_down, env={}, run=None)
-        self.assertEqual(got["sources"], ["static"],
+        got = mc.catalog(
+            fetch=fetch_down, env={}, run=None, opencode_provider=lambda: []
+        )
+        self.assertEqual(got["sources"], ["static", "opencode-provider-api"],
                          "shape-mismatched cache → treated as absent → floor")
 
     def test_refresh_flag_bypasses_fresh_cache(self):
@@ -404,9 +1955,11 @@ class CatalogCacheTest(NoCLI):
         self.assertIn("claude-next", ids(got["harnesses"]["claude"]))
 
     def test_static_floor_when_no_cache_and_no_network(self):
-        got = mc.catalog(fetch=fetch_down, env={}, run=None)
+        got = mc.catalog(
+            fetch=fetch_down, env={}, run=None, opencode_provider=lambda: []
+        )
         self.assertTrue(got["stale"])
-        self.assertEqual(got["sources"], ["static"])
+        self.assertEqual(got["sources"], ["static", "opencode-provider-api"])
         for harness in ("claude", "codex", "vibe"):
             self.assertTrue(got["harnesses"][harness]["models"])
         self.assertEqual(

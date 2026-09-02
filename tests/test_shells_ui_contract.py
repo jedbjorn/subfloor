@@ -10,6 +10,10 @@ from pathlib import Path
 import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
+OLLAMA_ACCEPTANCE = json.loads(
+    (ROOT / "tests" / "fixtures" / "ollama_live_native_acceptance.json")
+    .read_text()
+)
 APP = (ROOT / ".super-coder" / "ui" / "app.js").read_text()
 INDEX = (ROOT / ".super-coder" / "ui" / "index.html").read_text()
 STYLE = (ROOT / ".super-coder" / "ui" / "style.css").read_text()
@@ -17,6 +21,8 @@ SHELL_STATE = APP[APP.index("let selectedShell ="):
                   APP.index("// Rough token estimator")]
 SHELL_RENDER = APP[APP.index("async function renderShells(root)"):
                    APP.index("// Default Models — the flavor_defaults")]
+DEFAULT_MODELS = APP[APP.index("function thinkingLevelState"):
+                     APP.index("// Harness — the shell's surfaces")]
 ROUTER_AT = APP.index("function routeFromHash()")
 ROUTER = APP[ROUTER_AT:
              APP.index('document.querySelectorAll("nav button").forEach',
@@ -33,6 +39,264 @@ def run_js(script: str) -> dict:
     )
     assert proc.returncode == 0, proc.stderr
     return json.loads(proc.stdout.strip().splitlines()[-1])
+
+
+def test_thinking_selector_state_matrix_is_route_aware():
+    helper = APP[
+        APP.index("function nativeOptionLabel"):
+        APP.index("function dmModelPicker")
+    ]
+    script = helper + r"""
+const catalog = {stale: false, harnesses: {codex: {models: [
+  {id: "gpt-high", availability: "available", supported_efforts: ["low", "high"],
+   harness_support_state: "tested", harness_version: "codex-cli 0.147.0"},
+  {id: "gpt-explicit", availability: "available", supported_efforts: ["low", "medium"]},
+  {id: "gpt-plain", availability: "available", supported_efforts: []},
+]}}};
+console.log(JSON.stringify({
+  controlled: thinkingLevelState("codex", catalog, "gpt-high", "low"),
+  defaulted: thinkingLevelState("codex", catalog, "gpt-high", null),
+  explicit: thinkingLevelState("codex", catalog, "gpt-explicit", null),
+  modelDefault: thinkingLevelState("codex", catalog, "gpt-explicit", "default"),
+  noThinking: thinkingLevelState("codex", catalog, "gpt-plain", null),
+  harnessDefault: thinkingLevelState("codex", catalog, null, null),
+  vibe: thinkingLevelState("vibe", catalog, "devstral", null),
+  stale: thinkingLevelState("codex", {...catalog, stale: true}, "gpt-high", "high"),
+}));
+"""
+    result = run_js(script)
+    assert result["controlled"]["selected"] == "low"
+    assert result["controlled"]["supported"] == ["default", "low", "high"]
+    assert result["defaulted"]["selected"] == "high"
+    assert "Support: tested (codex-cli 0.147.0)" in result["defaulted"]["guidance"]
+    # Decision #223: with no stored preference the selector preselects the
+    # bind-time chain — high where advertised, else Model default.
+    assert result["explicit"]["selected"] == "default"
+    assert result["explicit"]["label"] == "Model default"
+    assert result["explicit"]["disabled"] is False
+    assert result["explicit"]["supported"] == ["default", "low", "medium"]
+    assert result["noThinking"]["selected"] == "default"
+    assert result["noThinking"]["disabled"] is False
+    assert result["noThinking"]["supported"] == ["default"]
+    assert result["modelDefault"]["selected"] == "default"
+    assert result["modelDefault"]["label"] == "Model default"
+    assert "model-default" in result["modelDefault"]["guidance"]
+    assert result["harnessDefault"]["label"] == "Harness default"
+    assert result["harnessDefault"]["disabled"] is True
+    assert result["harnessDefault"]["supported"] == []
+    assert result["vibe"]["label"] == "Thinking control unavailable"
+    assert result["stale"]["disabled"] is True
+    assert "Refresh & verify" in result["stale"]["guidance"]
+
+
+def test_live_native_option_renderer_preserves_five_model_projection_exactly():
+    helper = APP[
+        APP.index("function nativeOptionLabel"):
+        APP.index("function dmModelPicker")
+    ]
+    script = r"""
+function el(_tag, attrs = {}) { return {...attrs}; }
+function select() {
+  return {
+    children: [], disabled: false, title: "",
+    replaceChildren() { this.children = []; },
+    append(value) { this.children.push(value); },
+  };
+}
+""" + helper + r"""
+const modelIds = [
+  "ollama-cloud/deepseek-v4-flash",
+  "ollama-cloud/glm-5.2",
+  "ollama-cloud/gpt-oss:120b",
+  "ollama-cloud/qwen3.5:397b",
+  "ollama-cloud/gemma4:31b",
+];
+const models = modelIds.map((id, index) => ({
+  id, availability: "available",
+  native_option_ids: [`MAX.Future/${index}`, `case-Sensitive:${index}`],
+}));
+const catalog = {stale: true, harnesses: {
+  opencode: {authority: "harness-live", stale: false, models},
+}};
+const projections = [];
+for (const harness of ["opencode"]) {
+  for (const model of modelIds) {
+    const control = select();
+    const advertised = models.find((candidate) => candidate.id === model)
+      .native_option_ids;
+    const state = renderNativeOptionControl(
+      control, harness, catalog, model, advertised[0]);
+    projections.push({
+      harness, model, disabled: control.disabled,
+      values: control.children.map((option) => option.value),
+      labels: control.children.map((option) => option.textContent),
+      selected: state.selected,
+      advertised,
+    });
+  }
+}
+const disappeared = select();
+const disappearedState = renderNativeOptionControl(
+  disappeared, "opencode", catalog, modelIds[0], "Gone.Option");
+const noOptionsCatalog = structuredClone(catalog);
+noOptionsCatalog.harnesses.opencode.models[0].native_option_ids = [];
+const noOptions = select();
+const noOptionsState = renderNativeOptionControl(
+  noOptions, "opencode", noOptionsCatalog, modelIds[0], null);
+const failedCatalog = structuredClone(catalog);
+failedCatalog.harnesses.opencode.error = "managed seat unavailable";
+const failed = select();
+const failedState = renderNativeOptionControl(
+  failed, "opencode", failedCatalog, modelIds[0], "MAX.Future/0");
+console.log(JSON.stringify({
+  projections,
+  disappeared: {
+    requiresConfirmation: disappearedState.requiresConfirmation,
+    options: disappeared.children,
+  },
+  noOptions: {
+    state: noOptionsState,
+    options: noOptions.children,
+    disabled: noOptions.disabled,
+  },
+  failed: {
+    state: failedState,
+    options: failed.children,
+    disabled: failed.disabled,
+  },
+}));
+"""
+    result = run_js(script)
+    assert len(result["projections"]) == 5
+    assert {projection["model"] for projection in result["projections"]} == {
+        "ollama-cloud/deepseek-v4-flash",
+        "ollama-cloud/glm-5.2",
+        "ollama-cloud/gpt-oss:120b",
+        "ollama-cloud/qwen3.5:397b",
+        "ollama-cloud/gemma4:31b",
+    }
+    for projection in result["projections"]:
+        assert projection["disabled"] is False
+        assert projection["values"] == ["", *projection["advertised"]]
+        assert projection["labels"] == ["Harness default", *projection["advertised"]]
+        assert projection["selected"] == projection["advertised"][0]
+    assert result["disappeared"]["requiresConfirmation"] is True
+    assert [option["textContent"] for option in result["disappeared"]["options"]] == [
+        "Selection disappeared — confirm a choice",
+        "Harness default",
+        "MAX.Future/0",
+        "case-Sensitive:0",
+    ]
+    assert result["disappeared"]["options"][0]["disabled"] is True
+    assert result["disappeared"]["options"][0]["selected"] is True
+    assert result["disappeared"]["options"][0]["value"] == (
+        "__sc_native_confirmation_required__"
+    )
+    assert result["noOptions"]["disabled"] is False
+    assert [option["textContent"] for option in result["noOptions"]["options"]] == [
+        "Harness default",
+    ]
+    assert result["noOptions"]["state"]["requiresConfirmation"] is False
+    assert result["failed"]["disabled"] is True
+    assert result["failed"]["state"]["native"] is True
+    assert result["failed"]["state"]["supported"] == []
+    assert [option["textContent"] for option in result["failed"]["options"]] == [
+        "Live options unavailable",
+    ]
+
+
+def test_opencode_variant_control_preserves_exact_ids_and_default_omission():
+    helper = APP[
+        APP.index("function nativeOptionLabel"):
+        APP.index("function dmModelPicker")
+    ]
+    script = r"""
+function el(_tag, attrs = {}) { return {...attrs}; }
+const control = {
+  children: [], disabled: false, title: "",
+  replaceChildren() { this.children = []; },
+  append(value) { this.children.push(value); },
+};
+""" + helper + r"""
+const model = {
+  id: "Ollama-Cloud/GLM-5.2",
+  availability: "available",
+  native_option_ids: ["Case/Sensitive.MAX", "future:id"],
+};
+const catalog = {stale: false, harnesses: {
+  opencode: {authority: "harness-live", stale: false, models: [model]},
+}};
+const state = renderNativeOptionControl(
+  control, "opencode", catalog, model.id, "Case/Sensitive.MAX");
+console.log(JSON.stringify({
+  values: control.children.map((option) => option.value),
+  labels: control.children.map((option) => option.textContent),
+  selected: state.selected,
+}));
+"""
+    result = run_js(script)
+    assert result == {
+        "values": ["", "Case/Sensitive.MAX", "future:id"],
+        "labels": ["Harness default", "Case/Sensitive.MAX", "future:id"],
+        "selected": "Case/Sensitive.MAX",
+    }
+
+
+def test_live_native_model_picker_ignores_global_stale_catalogue():
+    helper = APP[
+        APP.index("function nativeOptionLabel"):
+        APP.index("async function renderDefaultModels")
+    ]
+    script = r"""
+const document = {addEventListener() {}, removeEventListener() {}};
+function el(tag, attrs = {}, ...children) {
+  const node = {
+    tag, children: [], hidden: false, isConnected: true, value: "",
+    append(...values) { this.children.push(...values); },
+    contains() { return false; },
+    scrollIntoView() {},
+    classList: {toggle() {}, remove() {}},
+  };
+  Object.assign(node, attrs);
+  node.append(...children);
+  return node;
+}
+""" + helper + "\nconst fixture = " + json.dumps(OLLAMA_ACCEPTANCE) + r""";
+const models = fixture.models.map((id) => ({
+  id, availability: "available", native_option_ids: ["high", "max"],
+}));
+const catalog = {stale: true, harnesses: {opencode: {
+  authority: "harness-live", stale: false, models,
+}}};
+const row = {model: fixture.glm_selector, effort: fixture.native_option_id};
+const picker = dmModelPicker("opencode", catalog, row, async () => ({}));
+picker.input.onfocus();
+const list = picker.results.children[1];
+console.log(JSON.stringify({
+  current: picker.current.textContent,
+  hidden: picker.results.hidden,
+  labels: list.children.map((card) => card.children[0].children[0]),
+}));
+"""
+    result = run_js(script)
+    assert result == {
+        "current": "ollama-cloud/glm-5.2",
+        "hidden": False,
+        "labels": ["Harness default", *OLLAMA_ACCEPTANCE["models"]],
+    }
+
+
+def test_default_models_saves_model_and_effort_atomically():
+    assert 'model: null, effort: null' in DEFAULT_MODELS
+    assert 'model: value, effort,' in DEFAULT_MODELS
+    assert 'model: row.model, effort' in DEFAULT_MODELS
+    assert 'row.effort_state = "selection-required"' in DEFAULT_MODELS
+    assert 'ariaLabel: `Thinking level for ${flavor} ${h}`' in DEFAULT_MODELS
+    assert "renderNativeOptionControl(" in DEFAULT_MODELS
+    assert "state.requiresConfirmation" in DEFAULT_MODELS
+    assert "m.harness_support_state" in DEFAULT_MODELS
+    assert "new Set(fd.default_harnesses || fd.harnesses || [])" in DEFAULT_MODELS
+    assert "star.disabled = !defaultHarnesses.has(h)" in DEFAULT_MODELS
 
 
 def test_skills_is_nested_under_shells_instead_of_global_navigation():
@@ -333,3 +597,100 @@ const tick = () => new Promise((resolve) => setImmediate(resolve));
     assert "second role" in result["text"]
     assert "Code-01" not in result["text"]
     assert "first role" not in result["text"]
+
+
+def test_model_refresh_verifies_and_renders_fork_local_harness_evidence():
+    script = r"""
+class FakeElement {
+  constructor(tag) {
+    this.tagName = tag;
+    this.nodeType = 1;
+    this.children = [];
+    this.className = "";
+    this._text = "";
+    this.disabled = false;
+  }
+  append(...nodes) { this.children.push(...nodes); }
+  set textContent(value) { this._text = String(value ?? ""); this.children = []; }
+  get textContent() {
+    return this._text + this.children.map(
+      (child) => typeof child === "string" ? child : child.textContent
+    ).join("");
+  }
+}
+globalThis.document = {
+  createElement: (tag) => new FakeElement(tag),
+  createTextNode: (text) => ({ nodeType: 3, textContent: String(text ?? "") }),
+};
+const el = (tag, props = {}, ...kids) => {
+  const node = Object.assign(new FakeElement(tag), props);
+  for (const kid of kids)
+    node.append(kid?.nodeType ? kid : document.createTextNode(kid ?? ""));
+  return node;
+};
+const catalog = {
+  harnesses: {}, sources: ["models.dev", "codex-cache"],
+  fetched_at: "2026-08-09T18:00:00+00:00", stale: false,
+  verification: {
+    checked_at: "2026-08-09T18:01:00+00:00", runtime: "sandbox",
+    harnesses: {
+      codex: {
+        version: "0.147.0", compatibility: "newer-unverified", error: null,
+      },
+      vibe: { version: null, compatibility: null, error: "HARNESS_UNAVAILABLE" },
+    },
+    defaults: [{
+      flavor: "planner", harness: "vibe", model: "vibe-model",
+      runnable: false, state: "harness-error", reason: "HARNESS_UNAVAILABLE",
+    }],
+    summary: {
+      harnesses_ready: 1, harnesses_checked: 2,
+      exact_routes_runnable: 1, exact_routes: 2, harness_defaults: 0,
+    },
+  },
+};
+const requests = [];
+async function api(path) {
+  requests.push(path);
+  if (path === "/flavor-defaults")
+    return { flavors: {}, harnesses: ["codex", "vibe"] };
+  if (path === "/models" || path === "/models?refresh=1") return catalog;
+  throw new Error("unexpected API call: " + path);
+}
+const statuses = [];
+function setStatus(value) { statuses.push(value); }
+function toast() {}
+const microlabel = (text) => el("span", {}, text);
+function all(root, predicate, found = []) {
+  if (predicate(root)) found.push(root);
+  for (const child of root.children || [])
+    if (child?.nodeType === 1) all(child, predicate, found);
+  return found;
+}
+""" + DEFAULT_MODELS + r"""
+(async () => {
+  const root = new FakeElement("div");
+  await renderDefaultModels(root, {});
+  const button = all(root, (node) => node.tagName === "button")[0];
+  await button.onclick();
+  console.log(JSON.stringify({ text: root.textContent, requests, statuses }));
+})().catch((error) => {
+  console.error(error.stack || error);
+  process.exit(1);
+});
+"""
+    result = run_js(script)
+    assert result["requests"] == [
+        "/flavor-defaults", "/models", "/models?refresh=1",
+        "/flavor-defaults",
+    ]
+    assert result["statuses"] == [
+        "refreshing model catalog and harnesses…",
+        "refresh complete — review verification warnings",
+    ]
+    assert "Refresh & verify" in result["text"]
+    assert "Fork verification" in result["text"]
+    assert "codex0.147.0newer-unverified" in result["text"]
+    assert "vibenot installedHARNESS_UNAVAILABLE" in result["text"]
+    assert "exact defaults: 1/2 runnable" in result["text"]
+    assert "planner · vibe · vibe-model — HARNESS_UNAVAILABLE" in result["text"]

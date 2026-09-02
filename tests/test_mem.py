@@ -39,6 +39,7 @@ import server  # noqa: E402
 TOKEN = "test-token-deadbeef"
 PEER_TOKEN = "peer-token-cafebabe"   # second shell — cross-shell read coverage
 REVIEW_TOKEN = "review-token-012345"
+PLANNER_TOKEN = "planner-token-6789ab"
 
 
 class MemMessageHelpContractTest(unittest.TestCase):
@@ -94,6 +95,13 @@ def build_engine_db(path: Path) -> None:
         (REVIEW_TOKEN,),
     )
     con.execute(
+        "INSERT INTO shells (shell_id, display_name, shortname, flavor, mandate, "
+        "system_prompt, user_id, is_shared, has_identity, bootstrapped, api_key) "
+        "VALUES (4, 'Planner', 'pln1', 'planner', 'test', 'sp', "
+        "1, 0, 1, 0, ?)",
+        (PLANNER_TOKEN,),
+    )
+    con.execute(
         "INSERT INTO shell_memory_archives (archive_id, shell_id, session_id, date) "
         "VALUES (1, 1, '0001', '2026-01-01')")
     con.execute("UPDATE shells SET active_archive_id=1 WHERE shell_id=1")
@@ -140,9 +148,93 @@ class ApiMemTest(unittest.TestCase):
     def run_mem(self, *argv) -> int:
         return mem.main(list(argv))
 
+    def write(self, sql, *params):
+        con = sqlite3.connect(self.db)
+        try:
+            cur = con.execute(sql, params)
+            con.commit()
+            return cur.lastrowid
+        finally:
+            con.close()
+
     # ── identity comes from the token, not an argument ────────────────────────
     def test_whoami_resolves_token_to_shell(self):
         self.assertEqual(self.run_mem("which"), 0)
+
+    def test_delivery_audit_is_planner_only_and_preserves_dedup(self):
+        implemented = self.write(
+            "INSERT INTO roadmap "
+            "(title,roadmap_status,sort_order,owning_shell,summary) "
+            "VALUES ('audit implemented','in_progress',900,4,'x')"
+        )
+        shipped = self.write(
+            "INSERT INTO roadmap "
+            "(title,roadmap_status,sort_order,owning_shell,summary) "
+            "VALUES ('audit shipped','shipped',901,4,'x')"
+        )
+        covered = self.write(
+            "INSERT INTO roadmap "
+            "(title,roadmap_status,sort_order,owning_shell,summary) "
+            "VALUES ('audit covered','in_progress',902,4,'x')"
+        )
+        for feature in (implemented, covered):
+            document = self.write(
+                "INSERT INTO documents (feature_id,kind,seq,title) "
+                "VALUES (?,'spec',1,?)",
+                feature,
+                f"audit spec {feature}",
+            )
+            self.write(
+                "INSERT INTO spec_tasks "
+                "(shell_id,feature_id,document_id,seq,title,status) "
+                "VALUES (4,?,?,1,'Verification','done')",
+                feature,
+                document,
+            )
+        self.write(
+            "INSERT INTO flags "
+            "(shell_id,display_name,description,priority,feature_id,resolved) "
+            "VALUES (4,'SC-998','[Ship] already handed off','Medium',?,0)",
+            covered,
+        )
+        open_flag = self.write(
+            "INSERT INTO flags "
+            "(shell_id,display_name,description,priority,feature_id,resolved) "
+            "VALUES (4,'SC-999','ordinary blocker','High',?,0)",
+            implemented,
+        )
+
+        saved = mem.SC_API_TOKEN
+        mem.SC_API_TOKEN = PLANNER_TOKEN
+        try:
+            data = mem._api("GET", "/_sc/mem/delivery-audit")
+            self.assertIn(
+                implemented,
+                [row["feature_id"] for row in data["implemented_but_unshipped"]],
+            )
+            self.assertNotIn(
+                covered,
+                [row["feature_id"] for row in data["implemented_but_unshipped"]],
+            )
+            self.assertIn(
+                shipped,
+                [row["feature_id"] for row in data["shipped_but_undocumented"]],
+            )
+            row = next(row for row in data["open_flags"]
+                       if row["flag_id"] == open_flag)
+            self.assertEqual(row["roadmap_status"], "in_progress")
+            self.assertEqual(row["frozen_docs"], 0)
+            self.assertIn("SC-999", data["recent_flag_names"])
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                self.assertEqual(self.run_mem("delivery-audit", "--json"), 0)
+            self.assertIn('"implemented_but_unshipped"', out.getvalue())
+        finally:
+            mem.SC_API_TOKEN = saved
+
+        with self.assertRaises(SystemExit) as caught:
+            self.run_mem("delivery-audit")
+        self.assertIn("planner_only_delivery_audit", str(caught.exception))
 
     def test_write_lands_on_the_token_shell(self):
         self.run_mem("state", "hello state")
@@ -730,6 +822,205 @@ class ApiMemTest(unittest.TestCase):
             server.run_snapshot_render = real_rsr
             server.serialize_doc_write = lambda: {"ok": True, "output": "(test stub)"}
 
+    def test_move_spec_to_feature_preserves_identity_and_plan(self):
+        self.run_mem("roadmap", "add", "split source")
+        self.run_mem("roadmap", "add", "split target")
+        source = self.q(
+            "SELECT feature_id FROM roadmap WHERE title='split source'"
+        )[0]
+        target = self.q(
+            "SELECT feature_id FROM roadmap WHERE title='split target'"
+        )[0]
+        self.write(
+            "INSERT INTO documents (feature_id,kind,seq,title) "
+            "VALUES (?,'spec',1,'existing target spec')",
+            target,
+        )
+        did = self.write(
+            "INSERT INTO documents (feature_id,kind,seq,title) "
+            "VALUES (?,'spec',7,'active v2 spec')",
+            source,
+        )
+        tid = self.write(
+            "INSERT INTO spec_tasks "
+            "(feature_id,document_id,seq,title,status,shell_id) "
+            "VALUES (?,?,0,'Preparation','in_progress',1)",
+            source,
+            did,
+        )
+        decision_id = self.write(
+            "INSERT INTO shell_decisions "
+            "(shell_id,decision_date,decision,rationale,feature_id,document_id) "
+            "VALUES (1,'2026-09-01','move with the spec','why',?,?)",
+            source,
+            did,
+        )
+
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            self.assertEqual(
+                self.run_mem(
+                    "doc", "move", str(did), "--feature", str(target)
+                ),
+                0,
+            )
+        self.assertIn(f"feature #{source} → #{target}", output.getvalue())
+        self.assertIn("as spec seq 2 (1 task(s), 1 decision(s))", output.getvalue())
+        self.assertIn("local snapshot + flat render refreshed", output.getvalue())
+        document = self.q(
+            "SELECT feature_id,seq,title FROM documents WHERE document_id=?", did
+        )
+        self.assertEqual((target, 2, "active v2 spec"), tuple(document))
+        self.assertEqual(
+            tuple(
+                self.q(
+                    "SELECT feature_id,status FROM spec_tasks WHERE task_id=?", tid
+                )
+            ),
+            (target, "in_progress"),
+        )
+        self.assertEqual(
+            self.q(
+                "SELECT feature_id FROM shell_decisions WHERE decision_id=?",
+                decision_id,
+            )[0],
+            target,
+        )
+
+    def test_move_spec_to_feature_refuses_ineligible_history(self):
+        self.run_mem("roadmap", "add", "move refusal source")
+        self.run_mem("roadmap", "add", "move refusal target")
+        self.run_mem(
+            "roadmap", "add", "move terminal target", "--status", "shipped"
+        )
+        source = self.q(
+            "SELECT feature_id FROM roadmap WHERE title='move refusal source'"
+        )[0]
+        target = self.q(
+            "SELECT feature_id FROM roadmap WHERE title='move refusal target'"
+        )[0]
+        terminal = self.q(
+            "SELECT feature_id FROM roadmap WHERE title='move terminal target'"
+        )[0]
+        frozen = self.write(
+            "INSERT INTO documents (feature_id,kind,seq,title,frozen) "
+            "VALUES (?,'spec',1,'frozen history',1)",
+            source,
+        )
+        ordinary = self.write(
+            "INSERT INTO documents (feature_id,kind,seq,title) "
+            "VALUES (?,'doc',1,'ordinary doc')",
+            source,
+        )
+        terminal_bound = self.write(
+            "INSERT INTO documents (feature_id,kind,seq,title) "
+            "VALUES (?,'spec',2,'terminal target candidate')",
+            source,
+        )
+        sprint_bound = self.write(
+            "INSERT INTO documents (feature_id,kind,seq,title) "
+            "VALUES (?,'spec',3,'sprint history')",
+            source,
+        )
+        sprint_id = self.write(
+            "INSERT INTO sprints (feature_id,originating_planner_shell_id) "
+            "VALUES (?,4)",
+            source,
+        )
+        self.write(
+            "INSERT INTO sprint_specs "
+            "(sprint_id,document_id,bound_revision_sha256) VALUES (?,?,?)",
+            sprint_id,
+            sprint_bound,
+            "a" * 64,
+        )
+
+        refused = (
+            (frozen, target, "frozen"),
+            (ordinary, target, "only spec"),
+            (terminal_bound, terminal, "terminal"),
+            (sprint_bound, target, f"Sprint #{sprint_id}"),
+            (terminal_bound, source, "already belongs"),
+        )
+        for did, feature_id, message in refused:
+            with self.subTest(document_id=did, message=message):
+                with self.assertRaises(SystemExit) as caught:
+                    mem._api(
+                        "PATCH",
+                        f"/_sc/mem/docs/{did}/feature",
+                        {"feature_id": feature_id},
+                    )
+                self.assertIn("409", str(caught.exception))
+                self.assertIn(message, str(caught.exception))
+                self.assertEqual(
+                    self.q(
+                        "SELECT feature_id FROM documents WHERE document_id=?", did
+                    )[0],
+                    source,
+                )
+
+    def test_move_spec_to_feature_rolls_back_related_rows(self):
+        self.run_mem("roadmap", "add", "atomic move source")
+        self.run_mem("roadmap", "add", "atomic move target")
+        source = self.q(
+            "SELECT feature_id FROM roadmap WHERE title='atomic move source'"
+        )[0]
+        target = self.q(
+            "SELECT feature_id FROM roadmap WHERE title='atomic move target'"
+        )[0]
+        did = self.write(
+            "INSERT INTO documents (feature_id,kind,seq,title) "
+            "VALUES (?,'spec',1,'atomic move spec')",
+            source,
+        )
+        tid = self.write(
+            "INSERT INTO spec_tasks (feature_id,document_id,seq,title,shell_id) "
+            "VALUES (?,?,0,'Preparation',1)",
+            source,
+            did,
+        )
+        self.write(
+            "CREATE TRIGGER fail_atomic_spec_move "
+            "BEFORE UPDATE OF feature_id ON spec_tasks "
+            f"WHEN OLD.task_id={tid} BEGIN "
+            "SELECT RAISE(ABORT,'forced move failure'); END"
+        )
+        try:
+            with self.assertRaises(SystemExit) as caught:
+                mem._api(
+                    "PATCH",
+                    f"/_sc/mem/docs/{did}/feature",
+                    {"feature_id": target},
+                )
+            self.assertIn("409", str(caught.exception))
+            self.assertIn("forced move failure", str(caught.exception))
+            self.assertEqual(
+                self.q(
+                    "SELECT feature_id FROM documents WHERE document_id=?", did
+                )[0],
+                source,
+            )
+            self.assertEqual(
+                self.q("SELECT feature_id FROM spec_tasks WHERE task_id=?", tid)[0],
+                source,
+            )
+        finally:
+            self.write("DROP TRIGGER fail_atomic_spec_move")
+
+    def test_feature_move_guidance_is_seeded_for_shells(self):
+        for skill in ("db_map", "docs", "spec"):
+            with self.subTest(skill=skill):
+                content = self.q(
+                    "SELECT content FROM skills WHERE name=? AND is_deleted=0",
+                    skill,
+                )[0]
+                self.assertIn(
+                    "sc mem doc move <document_id> --feature <target_feature_id>",
+                    content,
+                )
+        docs = self.q("SELECT content FROM skills WHERE name='docs'")[0]
+        self.assertIn("Split an active era from feature history", docs)
+
     # ── doc write vs local save — ONE shared serialization boundary ───────────
     def test_doc_write_and_snapshot_share_one_lock(self):
         # Doc-write serialize and /api/snapshot both write the same non-atomic
@@ -966,6 +1257,101 @@ class ApiMemTest(unittest.TestCase):
         self.run_mem("doc", "edit", str(did), "--render-path", "docs_sc/pathless.md")
         self.assertEqual(self.q("SELECT render_path FROM documents "
                                 "WHERE document_id=?", did)[0], "docs_sc/pathless.md")
+
+    def test_doc_add_rejects_duplicate_render_path(self):
+        body = self.tmp / "duplicate-add.md"
+        body.write_text("# duplicate\n")
+        self.run_mem("roadmap", "add", "duplicate add feature")
+        feature_id = self.q(
+            "SELECT feature_id FROM roadmap WHERE title='duplicate add feature'"
+        )[0]
+        self.assertEqual(
+            self.run_mem(
+                "doc", "add", "render owner", "--kind", "doc",
+                "--body-file", str(body), "--render-path", "docs_sc/owned.md",
+                "--feature", str(feature_id),
+            ),
+            0,
+        )
+        with self.assertRaises(SystemExit) as caught:
+            self.run_mem(
+                "doc", "add", "render intruder", "--kind", "doc",
+                "--body-file", str(body), "--render-path", "docs_sc//owned.md",
+                "--feature", str(feature_id),
+            )
+        self.assertIn("document IDs", str(caught.exception))
+        self.assertIsNone(
+            self.q("SELECT document_id FROM documents WHERE title='render intruder'")
+        )
+
+    def test_doc_edit_rejects_derived_render_path_collision(self):
+        body = self.tmp / "duplicate-edit.md"
+        body.write_text("# duplicate\n")
+        self.run_mem("roadmap", "add", "duplicate edit feature")
+        feature_id = self.q(
+            "SELECT feature_id FROM roadmap WHERE title='duplicate edit feature'"
+        )[0]
+        self.run_mem(
+            "doc", "add", "derived owner", "--kind", "doc",
+            "--body-file", str(body), "--feature", str(feature_id),
+        )
+        self.run_mem(
+            "doc", "add", "derived candidate", "--kind", "doc",
+            "--body-file", str(body), "--feature", str(feature_id),
+        )
+        candidate = self.q(
+            "SELECT document_id FROM documents WHERE title='derived candidate'"
+        )[0]
+
+        with self.assertRaises(SystemExit) as caught:
+            self.run_mem("doc", "edit", str(candidate), "--title", "derived owner")
+
+        self.assertIn("document IDs", str(caught.exception))
+        self.assertEqual(
+            self.q("SELECT title FROM documents WHERE document_id=?", candidate)[0],
+            "derived candidate",
+        )
+
+    def test_concurrent_doc_adds_cannot_claim_one_render_path(self):
+        self.run_mem("roadmap", "add", "concurrent render owners")
+        feature_id = self.q(
+            "SELECT feature_id FROM roadmap WHERE title='concurrent render owners'"
+        )[0]
+        barrier = threading.Barrier(2)
+        outcomes = []
+
+        def add(title):
+            barrier.wait()
+            try:
+                mem._api("POST", "/_sc/mem/docs", {
+                    "feature_id": feature_id,
+                    "kind": "doc",
+                    "title": title,
+                    "body": "# concurrent\n",
+                    "render_path": "docs_sc/concurrent-owner.md",
+                })
+                outcomes.append("created")
+            except SystemExit as exc:
+                outcomes.append(str(exc))
+
+        threads = [
+            threading.Thread(target=add, args=("concurrent owner A",)),
+            threading.Thread(target=add, args=("concurrent owner B",)),
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(10)
+
+        self.assertEqual(sum(outcome == "created" for outcome in outcomes), 1)
+        self.assertTrue(any("409" in outcome for outcome in outcomes))
+        self.assertEqual(
+            self.q(
+                "SELECT COUNT(*) FROM documents WHERE render_path=?",
+                "docs_sc/concurrent-owner.md",
+            )[0],
+            1,
+        )
 
     # ── decision guard: a bare sibling verb is a guess, not a decision (#311) ─
     def test_decision_bare_verb_guarded(self):

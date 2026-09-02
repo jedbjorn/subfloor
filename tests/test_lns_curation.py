@@ -363,24 +363,33 @@ class CurationGovernanceTest(unittest.TestCase):
         self.assertIn("create no local skill or asset", text)
         self.assertNotIn("sc skill add", text)
 
-    def test_boot_and_issue_reporting_publish_the_authorized_exception(self):
-        boot = (ENGINE / "templates" / "boot.md").read_text()
+    def test_curate_and_issue_reporting_publish_the_authorized_exception(self):
+        curate = (ENGINE / "assets" / "skills" / "curate" / "SKILL.md").read_text()
         reporting = (
             ENGINE / "assets" / "skills" / "issue_reporting" / "SKILL.md"
         ).read_text()
-        for text in (boot, reporting):
+        self.assertIn(
+            "authorized exception to the \"enhancement ideas go to the FnB "
+            "first\" gate in `issue_reporting`",
+            " ".join(curate.split()),
+        )
+        for text in (curate, reporting):
             self.assertIn("skills: recommend <topic>", text)
             self.assertIn("keep the l&s", text.lower())
             self.assertIn("create no local skill or asset", text)
         self.assertIn("FnB-authorized exception", reporting)
-        self.assertIn("administrator-owned", reporting)
+        self.assertIn("Planner-owned workflow in `fork_skill_design`", reporting)
 
-    def test_admin_asset_seed_snapshot_workflow_remains_explicit(self):
+    def test_planner_db_first_skill_workflow_remains_explicit(self):
         text = (
-            ENGINE / "assets" / "skills" / "local_skill_management" / "SKILL.md"
+            ENGINE / "assets" / "skills" / "fork_skill_design" / "SKILL.md"
         ).read_text()
-        self.assertIn("file -> seed -> grant -> local snapshot", text)
-        self.assertIn("SC_ADMIN=1 sc snapshot", text)
+        self.assertIn("sc skill put --file", text)
+        self.assertIn("Planner-owned draft", text)
+        self.assertIn("DB, local snapshot, flat catalogue, and managed skill", text)
+        self.assertIn("Creation grants nothing", text)
+        self.assertNotIn("file -> seed -> grant -> local snapshot", text)
+        self.assertNotIn("SC_ADMIN=1 sc snapshot", text)
 
     def test_trailing_migration_matches_changed_skill_assets_exactly(self):
         con = sqlite3.connect(self.db)

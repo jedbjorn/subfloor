@@ -121,6 +121,45 @@ class GitHubReaderTest(unittest.TestCase):
         self.assertEqual(calls[0][:4], ["gh", "pr", "view", "823"])
         self.assertEqual(calls[1], ["gh", "pr", "diff", "823", "--patch"])
 
+    def test_old_gh_restores_base_sha_after_base_ref_oid_rejection(self) -> None:
+        payload = json.dumps(MockGitHub().pr(821)).encode()
+        base_sha = b"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n"
+        responses = [
+            SimpleNamespace(
+                returncode=1,
+                stdout=b"",
+                stderr=b'Unknown JSON field: "baseRefOid"\n',
+            ),
+            SimpleNamespace(returncode=0, stdout=payload, stderr=b""),
+            SimpleNamespace(returncode=0, stdout=base_sha, stderr=b""),
+        ]
+        calls = []
+
+        def runner(args, **kwargs):
+            calls.append(args)
+            return responses.pop(0)
+
+        reader = GitHubPullRequestReader(
+            "/tmp/repo", repository="acme/project", runner=runner
+        )
+
+        pull_request = reader.get(821)
+
+        self.assertEqual("b" * 40, pull_request.base_sha)
+        self.assertEqual([], responses)
+        self.assertIn("baseRefOid", calls[0][5])
+        self.assertNotIn("baseRefOid", calls[1][5])
+        self.assertEqual(
+            [
+                "gh",
+                "api",
+                "repos/acme/project/pulls/821",
+                "--jq",
+                ".base.sha",
+            ],
+            calls[2],
+        )
+
     def test_explicit_repository_scopes_every_read(self) -> None:
         payload = json.dumps(MockGitHub().pr(821)).encode()
         calls = []

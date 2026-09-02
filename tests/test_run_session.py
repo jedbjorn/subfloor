@@ -2,15 +2,19 @@
 """Regression tests for atomic, contention-safe launcher session opening."""
 from __future__ import annotations
 
+import io
+import json
 import os
 import sqlite3
+import subprocess
 import sys
 import tempfile
 import threading
 import unittest
-from contextlib import contextmanager
-from types import SimpleNamespace
+import venv
+from contextlib import contextmanager, nullcontext, redirect_stderr
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 SCRIPTS = Path(__file__).resolve().parents[1] / ".super-coder" / "scripts"
@@ -57,6 +61,306 @@ CREATE TABLE lock_probe (
 INSERT INTO shells (shell_id, active_archive_id) VALUES (1, NULL);
 INSERT INTO lock_probe (probe_id, value) VALUES (1, 0);
 """
+
+
+class RenderOnlyAuthenticationTest(unittest.TestCase):
+    def test_render_only_is_noninteractive_even_with_a_tty(self) -> None:
+        self.assertFalse(
+            run.interactive_authentication(headless=False, render_only=True)
+        )
+
+    def test_normal_terminal_boot_remains_interactive(self) -> None:
+        self.assertTrue(
+            run.interactive_authentication(headless=False, render_only=False)
+        )
+
+
+class FlavorRouteDefaultsTest(unittest.TestCase):
+    def test_loader_projects_nullable_per_harness_effort(self) -> None:
+        con = sqlite3.connect(":memory:")
+        con.row_factory = sqlite3.Row
+        self.addCleanup(con.close)
+        con.execute(
+            "CREATE TABLE flavor_defaults ("
+            "flavor TEXT,harness TEXT,model TEXT,effort TEXT,is_default INTEGER)"
+        )
+
+        con.executemany(
+            "INSERT INTO flavor_defaults VALUES (?,?,?,?,?)",
+            [
+                ("dev", "codex", "gpt-test", "low", 1),
+                ("dev", "kimi", None, None, 0),
+            ],
+        )
+        self.assertEqual(
+            run.flavor_defaults(con),
+            {"dev": {
+                "default_harness": "codex",
+                "models": {"codex": "gpt-test", "kimi": None},
+                "efforts": {"codex": "low", "kimi": None},
+            }},
+        )
+
+    def test_provider_family_route_is_owned_by_opencode(self) -> None:
+        self.assertEqual(
+            "ollama-cloud",
+            run.session_provider(
+                "opencode", "ollama-cloud/deepseek-v4-pro:0813"
+            ),
+        )
+
+
+class ShellPathTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name) / "repo"
+        self.worktree = self.root / ".sc-worktrees" / "dev1"
+        self.worktree.mkdir(parents=True)
+        self.root_patch = mock.patch.object(run, "REPO_ROOT", self.root)
+        self.root_patch.start()
+        self.addCleanup(self.root_patch.stop)
+
+    def _python(self, *, executable: bool = True) -> Path:
+        project_bin = self.worktree / ".venv" / "bin"
+        project_bin.mkdir(parents=True)
+        python = project_bin / "python"
+        python.write_text("probe fixture")
+        python.chmod(0o755 if executable else 0o644)
+        return python
+
+    def _completed_probe(
+        self,
+        *,
+        version: tuple[int, int] = (3, 14),
+        prefix: Path | None = None,
+        base_prefix: Path | None = None,
+        returncode: int = 0,
+    ) -> subprocess.CompletedProcess:
+        prefix = prefix or self.worktree / ".venv"
+        base_prefix = base_prefix or self.root / "baseline-python"
+        return subprocess.CompletedProcess(
+            args=[],
+            returncode=returncode,
+            stdout=json.dumps({
+                "version": list(version),
+                "prefix": str(prefix),
+                "base_prefix": str(base_prefix),
+            }),
+            stderr="",
+        )
+
+    def _path_and_warning(self, completed=None) -> tuple[str, str]:
+        stderr = io.StringIO()
+        patcher = (
+            mock.patch.object(run.subprocess, "run", return_value=completed)
+            if completed is not None
+            else nullcontext()
+        )
+        with patcher, redirect_stderr(stderr):
+            path = run._shell_path(self.worktree, "/usr/local/bin:/usr/bin")
+        return path, stderr.getvalue()
+
+    def test_python_314_virtualenv_precedes_inherited_tools(self) -> None:
+        python = self._python()
+        completed = self._completed_probe()
+
+        with mock.patch.object(
+            run.subprocess, "run", return_value=completed
+        ) as probe:
+            path = run._shell_path(
+                self.worktree, "/usr/local/bin:/usr/bin"
+            )
+
+        self.assertEqual(
+            path,
+            f"{self.root}:{python.parent}:/usr/local/bin:/usr/bin",
+        )
+        probe.assert_called_once_with(
+            [
+                str(python),
+                "-I",
+                "-S",
+                "-c",
+                run.VENV_PROBE_SCRIPT,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=3,
+            check=False,
+        )
+
+    def test_real_python_314_virtualenv_is_admitted(self) -> None:
+        project_venv = self.worktree / ".venv"
+        venv.EnvBuilder(with_pip=False).create(project_venv)
+
+        path, warning = self._path_and_warning()
+
+        self.assertEqual(
+            path,
+            f"{self.root}:{project_venv / 'bin'}:/usr/local/bin:/usr/bin",
+        )
+        self.assertEqual(warning, "")
+
+    def test_sibling_worktree_symlinked_environment_is_omitted(self) -> None:
+        sibling_venv = self.root / ".sc-worktrees" / "dev2" / ".venv"
+        sibling_bin = sibling_venv / "bin"
+        sibling_bin.mkdir(parents=True)
+        sibling_python = sibling_bin / "python"
+        sibling_python.write_text("probe fixture")
+        sibling_python.chmod(0o755)
+        (self.worktree / ".venv").symlink_to(
+            Path("..") / "dev2" / ".venv"
+        )
+        stderr = io.StringIO()
+
+        with mock.patch.object(
+            run.subprocess,
+            "run",
+            return_value=self._completed_probe(prefix=sibling_venv),
+        ) as probe, redirect_stderr(stderr):
+            path = run._shell_path(
+                self.worktree, "/usr/local/bin:/usr/bin"
+            )
+
+        self.assertEqual(path, f"{self.root}:/usr/local/bin:/usr/bin")
+        self.assertIn("symlinked .venv root", stderr.getvalue())
+        self.assertIn("run `sc deps`", stderr.getvalue())
+        probe.assert_not_called()
+
+    def test_symlinked_bin_escape_is_omitted(self) -> None:
+        project_venv = self.worktree / ".venv"
+        project_venv.mkdir()
+        sibling_bin = (
+            self.root / ".sc-worktrees" / "dev2" / ".venv" / "bin"
+        )
+        sibling_bin.mkdir(parents=True)
+        sibling_python = sibling_bin / "python"
+        sibling_python.write_text("probe fixture")
+        sibling_python.chmod(0o755)
+        (project_venv / "bin").symlink_to(sibling_bin)
+        stderr = io.StringIO()
+
+        with mock.patch.object(
+            run.subprocess,
+            "run",
+            return_value=self._completed_probe(prefix=project_venv),
+        ) as probe, redirect_stderr(stderr):
+            path = run._shell_path(
+                self.worktree, "/usr/local/bin:/usr/bin"
+            )
+
+        self.assertEqual(path, f"{self.root}:/usr/local/bin:/usr/bin")
+        warning = stderr.getvalue()
+        self.assertIn(".venv/bin resolves outside assigned .venv", warning)
+        self.assertIn("run `sc deps`", warning)
+        probe.assert_not_called()
+
+    def test_absent_environment_is_omitted_without_warning(self) -> None:
+        path, warning = self._path_and_warning()
+        self.assertEqual(path, f"{self.root}:/usr/local/bin:/usr/bin")
+        self.assertEqual(warning, "")
+
+    def test_non_directory_bin_is_omitted_with_remedy(self) -> None:
+        project_bin = self.worktree / ".venv" / "bin"
+        project_bin.parent.mkdir(parents=True)
+        project_bin.write_text("not a directory")
+        path, warning = self._path_and_warning()
+        self.assertEqual(path, f"{self.root}:/usr/local/bin:/usr/bin")
+        self.assertIn(str(self.worktree), warning)
+        self.assertIn(".venv/bin is not a directory", warning)
+        self.assertIn("run `sc deps`", warning)
+
+    def test_missing_interpreter_is_omitted_with_remedy(self) -> None:
+        (self.worktree / ".venv" / "bin").mkdir(parents=True)
+        path, warning = self._path_and_warning()
+        self.assertEqual(path, f"{self.root}:/usr/local/bin:/usr/bin")
+        self.assertIn("missing .venv/bin/python", warning)
+        self.assertIn("run `sc deps`", warning)
+
+    def test_dangling_interpreter_is_omitted_with_remedy(self) -> None:
+        project_bin = self.worktree / ".venv" / "bin"
+        project_bin.mkdir(parents=True)
+        (project_bin / "python").symlink_to(self.root / "missing-python")
+        path, warning = self._path_and_warning()
+        self.assertEqual(path, f"{self.root}:/usr/local/bin:/usr/bin")
+        self.assertIn("dangling .venv/bin/python symlink", warning)
+        self.assertTrue((project_bin / "python").is_symlink())
+
+    def test_non_executable_interpreter_is_omitted_with_remedy(self) -> None:
+        python = self._python(executable=False)
+        path, warning = self._path_and_warning()
+        self.assertEqual(path, f"{self.root}:/usr/local/bin:/usr/bin")
+        self.assertIn("not an executable regular file", warning)
+        self.assertEqual(python.stat().st_mode & 0o777, 0o644)
+
+    def test_timed_out_probe_is_omitted_with_remedy(self) -> None:
+        self._python()
+        stderr = io.StringIO()
+        with mock.patch.object(
+            run.subprocess,
+            "run",
+            side_effect=subprocess.TimeoutExpired("python", 3),
+        ), redirect_stderr(stderr):
+            path = run._shell_path(self.worktree, "/usr/bin")
+        self.assertEqual(path, f"{self.root}:/usr/bin")
+        self.assertIn("Python probe timed out after 3 seconds", stderr.getvalue())
+
+    def test_foreign_prefix_is_omitted_with_remedy(self) -> None:
+        self._python()
+        foreign = self.root / "other-worktree" / ".venv"
+        path, warning = self._path_and_warning(
+            self._completed_probe(prefix=foreign)
+        )
+        self.assertEqual(path, f"{self.root}:/usr/local/bin:/usr/bin")
+        self.assertIn(f"Python reported foreign prefix {foreign}", warning)
+
+    def test_python_313_environment_is_omitted_with_remedy(self) -> None:
+        self._python()
+        path, warning = self._path_and_warning(
+            self._completed_probe(version=(3, 13))
+        )
+        self.assertEqual(path, f"{self.root}:/usr/local/bin:/usr/bin")
+        self.assertIn("Python 3.14 is required; found 3.13", warning)
+
+    def test_python_315_environment_is_omitted_with_remedy(self) -> None:
+        self._python()
+        path, warning = self._path_and_warning(
+            self._completed_probe(version=(3, 15))
+        )
+        self.assertEqual(path, f"{self.root}:/usr/local/bin:/usr/bin")
+        self.assertIn("Python 3.14 is required; found 3.15", warning)
+
+    def test_nonzero_probe_is_omitted_with_remedy(self) -> None:
+        self._python()
+        path, warning = self._path_and_warning(
+            self._completed_probe(returncode=9)
+        )
+        self.assertEqual(path, f"{self.root}:/usr/local/bin:/usr/bin")
+        self.assertIn("Python probe exited 9", warning)
+
+    def test_invalid_probe_report_is_omitted_with_remedy(self) -> None:
+        self._python()
+        completed = subprocess.CompletedProcess(
+            args=[], returncode=0, stdout="not-json", stderr=""
+        )
+        path, warning = self._path_and_warning(completed)
+        self.assertEqual(path, f"{self.root}:/usr/local/bin:/usr/bin")
+        self.assertIn("Python probe returned an invalid report", warning)
+
+    def test_non_virtual_prefix_is_omitted_with_remedy(self) -> None:
+        self._python()
+        prefix = self.worktree / ".venv"
+        path, warning = self._path_and_warning(
+            self._completed_probe(prefix=prefix, base_prefix=prefix)
+        )
+        self.assertEqual(path, f"{self.root}:/usr/local/bin:/usr/bin")
+        self.assertIn("Python reported no virtual environment", warning)
+
+    def test_interactive_and_prepared_launches_share_the_path_builder(self) -> None:
+        source = (SCRIPTS / "run.py").read_text()
+        assignment = 'env["PATH"] = _shell_path(work_dir, env.get("PATH", ""))'
+        self.assertEqual(source.count(assignment), 2)
 
 
 class _FailAfterArchive:
@@ -271,6 +575,10 @@ class OpenSessionContentionTest(unittest.TestCase):
                 mock.patch.object(run, "list_shells", return_value=[chosen]), \
                 mock.patch.object(run, "pick_shell", side_effect=pick_after_prelude), \
                 mock.patch.object(
+                    run.execution_view,
+                    "build",
+                    return_value=run.execution_view.ExecutionView(mode="test")), \
+                mock.patch.object(
                     run.shell_liveness, "compute",
                     return_value={"supported": False, "indeterminate": 0}), \
                 mock.patch.object(run, "ensure_harness_path"), \
@@ -309,6 +617,259 @@ class OpenSessionContentionTest(unittest.TestCase):
 
 
 class HeadlessSessionFailureTest(unittest.TestCase):
+    def test_host_admin_refuses_sandbox_before_boot_artifacts_or_database(self) -> None:
+        with mock.patch.dict(run.os.environ, {"SC_SANDBOX": "1"}, clear=True), \
+                mock.patch.object(run.sys, "argv", ["run.py", "--host-admin"]), \
+                mock.patch.object(run.global_pointer, "write_global_pointers") as pointers, \
+                mock.patch.object(run, "open_db") as open_db, \
+                self.assertRaises(SystemExit) as raised:
+            run.main()
+
+        self.assertIn("run make dos-admin from a host terminal", str(raised.exception))
+        pointers.assert_not_called()
+        open_db.assert_not_called()
+
+    def test_host_admin_missing_harness_refuses_before_session_creation(self) -> None:
+        con = mock.Mock()
+        chosen = {"shell_id": 1, "shortname": "ADM1", "flavor": "admin"}
+        fdefaults = {
+            "admin": {"default_harness": "codex", "models": {"codex": "gpt-test"}}
+        }
+        open_session = mock.Mock()
+        liveness = mock.Mock()
+
+        with mock.patch.dict(run.os.environ, {}, clear=True), \
+                mock.patch.object(
+                    run.sys, "argv", ["run.py", "--host-admin", "--harness", "codex"]
+                ), \
+                mock.patch.object(
+                    run.global_pointer, "write_global_pointers"
+                ) as pointers, \
+                mock.patch.object(run, "open_db", return_value=con), \
+                mock.patch.object(run.seed_skills, "sync_engine_skills", return_value=[]), \
+                mock.patch.object(run, "authenticate", return_value={"user_id": 1}), \
+                mock.patch.object(run, "flavor_defaults", return_value=fdefaults), \
+                mock.patch.object(run, "select_host_admin", return_value=chosen), \
+                mock.patch.object(run, "browser_conversation_active", return_value=False), \
+                mock.patch.object(run.sys.stdin, "isatty", return_value=True), \
+                mock.patch.object(run.shell_liveness, "compute", liveness), \
+                mock.patch.object(run, "ensure_harness_path"), \
+                mock.patch.object(
+                    run, "load_adapter", return_value={"harness": "codex", "launch": ["codex"]}
+                ), \
+                mock.patch.object(run.shutil, "which", return_value=None), \
+                mock.patch.object(run, "open_session", open_session), \
+                self.assertRaises(SystemExit) as raised:
+            run.main()
+
+        self.assertEqual(
+            str(raised.exception),
+            "sc admin: host harness 'codex' is not installed; run ./sc "
+            "ensure-harness or use make dos-e for the container Admin route",
+        )
+        con.close.assert_called_once_with()
+        pointers.assert_not_called()
+        liveness.assert_not_called()
+        open_session.assert_not_called()
+
+    def test_host_admin_reaches_session_open_when_api_is_unavailable(self) -> None:
+        con = mock.Mock()
+        chosen = {"shell_id": 1, "shortname": "ADM1", "flavor": "admin"}
+        fdefaults = {
+            "admin": {"default_harness": "codex", "models": {"codex": "gpt-test"}}
+        }
+        open_session = mock.Mock(side_effect=_StopAfterSession)
+        liveness = mock.Mock()
+
+        with mock.patch.dict(
+                run.os.environ,
+                {
+                    "SC_API_BASE": "http://127.0.0.1:1",
+                    "SC_API_TOKEN": "unreachable-test-token",
+                },
+                clear=True,
+            ), \
+                mock.patch.object(
+                    run.sys, "argv", ["run.py", "--host-admin", "--harness", "codex"]
+                ), \
+                mock.patch.object(run.global_pointer, "write_global_pointers"), \
+                mock.patch.object(run, "open_db", return_value=con), \
+                mock.patch.object(run.seed_skills, "sync_engine_skills", return_value=[]), \
+                mock.patch.object(run, "authenticate", return_value={"user_id": 1}), \
+                mock.patch.object(run, "flavor_defaults", return_value=fdefaults), \
+                mock.patch.object(run, "select_host_admin", return_value=chosen), \
+                mock.patch.object(run, "browser_conversation_active", return_value=False), \
+                mock.patch.object(run.sys.stdin, "isatty", return_value=False), \
+                mock.patch.object(run.shell_liveness, "compute", liveness), \
+                mock.patch.object(run, "ensure_harness_path"), \
+                mock.patch.object(
+                    run, "load_adapter", return_value={"launch": ["codex"]}
+                ), \
+                mock.patch.object(run, "require_host_harness"), \
+                mock.patch.object(run, "open_session", open_session), \
+                self.assertRaises(_StopAfterSession):
+            run.main()
+
+        open_session.assert_called_once_with(
+            con,
+            1,
+            lifecycle={"harness": "codex", "provider": "openai", "model": "gpt-test"},
+        )
+        liveness.assert_not_called()
+
+    def test_host_admin_preserves_explicit_opencode_model_to_session_boundary(self) -> None:
+        con = mock.Mock()
+        chosen = {"shell_id": 1, "shortname": "ADM1", "flavor": "admin"}
+        fdefaults = {
+            "admin": {
+                "default_harness": "opencode",
+                "models": {"opencode": "ollama-cloud/glm-5.2"},
+                "efforts": {},
+            }
+        }
+        open_session = mock.Mock(side_effect=_StopAfterSession)
+
+        with mock.patch.dict(run.os.environ, {}, clear=True), \
+                mock.patch.object(
+                    run.sys,
+                    "argv",
+                    [
+                        "run.py", "--host-admin", "--harness", "opencode",
+                        "--model", "deepseek-v4-flash:cloud",
+                    ],
+                ), \
+                mock.patch.object(run.global_pointer, "write_global_pointers"), \
+                mock.patch.object(run, "open_db", return_value=con), \
+                mock.patch.object(run.seed_skills, "sync_engine_skills", return_value=[]), \
+                mock.patch.object(run, "authenticate", return_value={"user_id": 1}), \
+                mock.patch.object(run, "flavor_defaults", return_value=fdefaults), \
+                mock.patch.object(run, "select_host_admin", return_value=chosen), \
+                mock.patch.object(run, "browser_conversation_active", return_value=False), \
+                mock.patch.object(run.sys.stdin, "isatty", return_value=False), \
+                mock.patch.object(run, "ensure_harness_path"), \
+                mock.patch.object(
+                    run,
+                    "load_adapter",
+                    return_value={
+                        "harness": "opencode",
+                        "launch": ["opencode"],
+                        "headless": {"model_flag": "--model"},
+                    },
+                ), \
+                mock.patch.object(run, "require_host_harness"), \
+                mock.patch.object(run, "preflight_controlled_opencode_route"), \
+                mock.patch.object(run, "open_session", open_session), \
+                self.assertRaises(_StopAfterSession):
+            run.main()
+
+        open_session.assert_called_once_with(
+            con,
+            1,
+            lifecycle={
+                "harness": "opencode",
+                "provider": "ollama-cloud",
+                "model": "deepseek-v4-flash:cloud",
+            },
+        )
+
+    def test_host_admin_refuses_unavailable_controlled_route_before_session(self) -> None:
+        con = mock.Mock()
+        chosen = {"shell_id": 1, "shortname": "ADM1", "flavor": "admin"}
+        fdefaults = {
+            "admin": {
+                "default_harness": "opencode",
+                "models": {"opencode": "ollama-cloud/glm-5.2"},
+                "efforts": {},
+            }
+        }
+        open_session = mock.Mock()
+
+        with mock.patch.dict(run.os.environ, {}, clear=True), \
+                mock.patch.object(
+                    run.sys, "argv", [
+                        "run.py", "--host-admin", "--harness", "opencode",
+                        "--model", "deepseek-v4-flash:cloud",
+                    ],
+                ), \
+                mock.patch.object(run.global_pointer, "write_global_pointers"), \
+                mock.patch.object(run, "open_db", return_value=con), \
+                mock.patch.object(run.seed_skills, "sync_engine_skills", return_value=[]), \
+                mock.patch.object(run, "authenticate", return_value={"user_id": 1}), \
+                mock.patch.object(run, "flavor_defaults", return_value=fdefaults), \
+                mock.patch.object(run, "select_host_admin", return_value=chosen), \
+                mock.patch.object(run, "browser_conversation_active", return_value=False), \
+                mock.patch.object(run.sys.stdin, "isatty", return_value=False), \
+                mock.patch.object(run, "ensure_harness_path"), \
+                mock.patch.object(
+                    run, "load_adapter", return_value={
+                        "harness": "opencode",
+                        "launch": ["opencode"],
+                        "headless": {"model_flag": "--model"},
+                    },
+                ), \
+                mock.patch.object(run, "require_host_harness"), \
+                mock.patch.object(
+                    run, "preflight_controlled_opencode_route",
+                    side_effect=ValueError(
+                        "controlled OpenCode route unavailable before launch: "
+                        "requested=deepseek-v4-flash:cloud "
+                        "selector=ollama-cloud/deepseek-v4-flash"
+                    ),
+                ), \
+                mock.patch.object(run, "open_session", open_session), \
+                self.assertRaises(SystemExit) as raised:
+            run.main()
+
+        self.assertIn("route unavailable before launch", str(raised.exception))
+        con.close.assert_called_once_with()
+        open_session.assert_not_called()
+
+    def test_host_admin_non_admin_reference_refuses_before_boot_artifacts(self) -> None:
+        con = mock.Mock()
+        pointers = mock.Mock()
+        with mock.patch.dict(run.os.environ, {}, clear=True), \
+                mock.patch.object(run.sys, "argv", ["run.py", "--host-admin", "DEV1"]), \
+                mock.patch.object(
+                    run.global_pointer, "write_global_pointers", pointers
+                ), \
+                mock.patch.object(run, "open_db", return_value=con), \
+                mock.patch.object(run.seed_skills, "sync_engine_skills", return_value=[]), \
+                mock.patch.object(run, "authenticate", return_value={"user_id": 1}), \
+                mock.patch.object(run, "flavor_defaults", return_value={}), \
+                mock.patch.object(
+                    run,
+                    "select_host_admin",
+                    side_effect=run.LaunchError(
+                        "shell 'DEV1' is not the sole active Admin ('ADM1')"
+                    ),
+                ), \
+                self.assertRaises(SystemExit) as raised:
+            run.main()
+
+        self.assertEqual(
+            str(raised.exception),
+            "sc admin: shell 'DEV1' is not the sole active Admin ('ADM1')",
+        )
+        con.close.assert_called_once_with()
+        pointers.assert_not_called()
+
+    def test_host_admin_db_failure_points_to_global_repair_before_artifacts(self) -> None:
+        failure = run.db_driver.OperationalError("database disk image is malformed")
+        with mock.patch.dict(run.os.environ, {}, clear=True), \
+                mock.patch.object(run.sys, "argv", ["run.py", "--host-admin"]), \
+                mock.patch.object(
+                    run.global_pointer, "write_global_pointers"
+                ) as pointers, \
+                mock.patch.object(run, "open_db", side_effect=failure), \
+                self.assertRaises(SystemExit) as raised:
+            run.main()
+
+        message = str(raised.exception)
+        self.assertIn(str(run.DB_PATH), message)
+        self.assertIn("database disk image is malformed", message)
+        self.assertIn("global repair-mode instructions", message)
+        pointers.assert_not_called()
+
     def test_removed_launch_context_flags_fail_before_database_access(self) -> None:
         for option in ("--slot", "--sprint", "--await-sprint-active"):
             with self.subTest(option=option), mock.patch.object(
@@ -350,6 +911,10 @@ class HeadlessSessionFailureTest(unittest.TestCase):
                 mock.patch.object(run, "flavor_defaults", return_value=fdefaults), \
                 mock.patch.object(run, "list_shells", return_value=[chosen]), \
                 mock.patch.object(run, "pick_shell", return_value=chosen), \
+                mock.patch.object(
+                    run.execution_view,
+                    "build",
+                    return_value=run.execution_view.ExecutionView(mode="test")), \
                 mock.patch.object(
                     run.shell_liveness, "compute",
                     return_value={"supported": False, "indeterminate": 0}), \
@@ -397,6 +962,10 @@ class HeadlessSessionFailureTest(unittest.TestCase):
                 mock.patch.object(run, "flavor_defaults", return_value=fdefaults), \
                 mock.patch.object(run, "list_shells", return_value=[chosen]), \
                 mock.patch.object(run, "pick_shell", return_value=chosen), \
+                mock.patch.object(
+                    run.execution_view,
+                    "build",
+                    return_value=run.execution_view.ExecutionView(mode="test")), \
                 mock.patch.object(
                     run.shell_liveness, "compute",
                     return_value={"supported": False, "indeterminate": 0}), \

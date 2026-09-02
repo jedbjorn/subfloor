@@ -2,6 +2,7 @@
 """Shared and native contract tests for Feature #24 conversation adapters."""
 from __future__ import annotations
 
+import hashlib
 import io
 import json
 import os
@@ -13,6 +14,7 @@ import tempfile
 import threading
 import unittest
 from collections.abc import Iterable, Iterator, Mapping
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 from unittest import mock
@@ -34,13 +36,99 @@ from conversation_adapters import (  # noqa: E402
     ReconcileResult,
     adapter_for,
 )
+from conversation_adapters import base as base_adapter
 from conversation_adapters import codex as codex_adapter
 from conversation_adapters import opencode as opencode_adapter
-from conversation_adapters import base as base_adapter
 from conversation_adapters.base import SubprocessRunner
 
 KIMI_FIXTURES = ROOT / "tests" / "fixtures" / "conversations" / "kimi"
 KIMI_V2_STATE = KIMI_FIXTURES / "state-v2.json"
+OPENCODE_FIXTURES = ROOT / "tests" / "fixtures" / "conversations" / "opencode"
+OPENCODE_TYPED_TURN = OPENCODE_FIXTURES / "1.18.23-typed-turn.json"
+
+
+def v2_context(
+    root: Path,
+    harness: str,
+    *,
+    provider: str | None = "openrouter",
+    model: str = "test-model",
+    effort: str = "high",
+    env: Mapping[str, str] | None = None,
+) -> ConversationContext:
+    requested_model = (
+        f"{provider}/{model}" if harness == "opencode" and provider else model
+    )
+    adapter_metadata = {}
+    native_variant_id = None
+    if harness == "opencode":
+        native_variant_id = effort
+        adapter_metadata = {
+            "compatibility_manifest": "opencode-1.18.9-v1",
+            "provider_family": "openai-ai-sdk",
+            "variant_options": {"reasoningEffort": effort},
+        }
+    binding = {
+        "contract_version": 2,
+        "control_state": "controlled",
+        "harness": harness,
+        "requested_model": requested_model,
+        "provider_model": model,
+        "requested_effort": effort,
+        "effective_effort": effort,
+        "native_variant_id": native_variant_id,
+        "transport": {
+            "claude": "claude-effort-argument",
+            "codex": "codex-reasoning-config",
+            "kimi": "kimi-effort-environment",
+            "opencode": "opencode-route-agent",
+        }[harness],
+        "catalogue_generation": "1" * 32,
+        "evidence_digest": "2" * 64,
+        "selector_binding": {"kind": "exact-test-route"},
+        "adapter_metadata": adapter_metadata,
+    }
+    digest = hashlib.sha256(
+        json.dumps(
+            binding, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        ).encode()
+    ).hexdigest()
+    return ConversationContext(
+        worktree=root,
+        provider=provider,
+        model=requested_model,
+        effort=effort,
+        env=env or {},
+        route_binding=binding,
+        binding_digest=digest,
+    )
+
+
+def v3_opencode_context(
+    root: Path,
+    *,
+    provider: str = "openai",
+    model: str = "gpt-test",
+    variant: str | None = "MAX.Future",
+) -> ConversationContext:
+    requested_model = f"{provider}/{model}"
+    binding, digest = (
+        opencode_adapter.route_transport.route_bindings.live_native_v3_binding(
+            "opencode",
+            requested_model,
+            model,
+            variant,
+        )
+    )
+    return ConversationContext(
+        worktree=root,
+        provider=provider,
+        model=requested_model,
+        effort=variant,
+        env={},
+        route_binding=binding,
+        binding_digest=digest,
+    )
 
 
 def kimi_step_event(
@@ -61,6 +149,31 @@ class FakeOpenCode:
         self.status = "idle"
         self.exists = True
         self.stream_calls: list[tuple[str, dict]] = []
+        self.provider_state = {
+            "connected": ["openai", "openrouter"],
+            "all": [
+                {
+                    "id": "openai",
+                    "models": {
+                        "gpt-test": {
+                            "variants": {
+                                "high": {"reasoningEffort": "high"}
+                            }
+                        }
+                    },
+                },
+                {
+                    "id": "openrouter",
+                    "models": {
+                        "test-model": {
+                            "variants": {
+                                "high": {"reasoningEffort": "high"}
+                            }
+                        }
+                    },
+                },
+            ],
+        }
 
     def request(
         self,
@@ -73,6 +186,8 @@ class FakeOpenCode:
         self.requests.append((method, path, dict(query or {}), body))
         if path == "/global/health":
             return {"healthy": True, "version": "1.18.9"}
+        if method == "GET" and path == "/provider":
+            return self.provider_state
         if method == "POST" and path == "/session":
             return {"id": self.session_ref, "title": "test"}
         if path.endswith("/message"):
@@ -126,34 +241,90 @@ class FakeOpenCode:
                     },
                 },
                 {
-                    "type": "message.part.delta",
+                    "type": "message.updated",
                     "properties": {
                         "sessionID": self.session_ref,
-                        "field": "reasoning",
-                        "delta": "secret reasoning",
+                        "info": {
+                            "id": "msg-assistant",
+                            "sessionID": self.session_ref,
+                            "role": "assistant",
+                        },
+                    },
+                },
+                {
+                    "type": "message.part.updated",
+                    "properties": {
+                        "sessionID": self.session_ref,
+                        "part": {
+                            "id": "reasoning-1",
+                            "messageID": "msg-assistant",
+                            "sessionID": self.session_ref,
+                            "type": "reasoning",
+                            "text": "",
+                        },
                     },
                 },
                 {
                     "type": "message.part.delta",
                     "properties": {
                         "sessionID": self.session_ref,
+                        "messageID": "msg-assistant",
+                        "partID": "reasoning-1",
+                        "field": "text",
+                        "delta": "secret reasoning",
+                    },
+                },
+                {
+                    "type": "message.part.updated",
+                    "properties": {
+                        "sessionID": self.session_ref,
+                        "part": {
+                            "id": "text-1",
+                            "messageID": "msg-assistant",
+                            "sessionID": self.session_ref,
+                            "type": "text",
+                            "text": "",
+                        },
+                    },
+                },
+                {
+                    "type": "message.part.delta",
+                    "properties": {
+                        "sessionID": self.session_ref,
+                        "messageID": "msg-assistant",
+                        "partID": "text-1",
                         "field": "text",
                         "delta": "hello",
                     },
                 },
                 {
-                    "type": "session.next.tool.called",
+                    "type": "message.part.updated",
                     "properties": {
                         "sessionID": self.session_ref,
-                        "id": "tool-1",
-                        "tool": "bash",
+                        "part": {
+                            "id": "tool-1",
+                            "messageID": "msg-assistant",
+                            "sessionID": self.session_ref,
+                            "type": "tool",
+                            "callID": "call-1",
+                            "tool": "bash",
+                            "state": {"status": "running", "input": {}},
+                        },
                     },
                 },
                 {
-                    "type": "session.next.tool.success",
+                    "type": "message.part.updated",
                     "properties": {
                         "sessionID": self.session_ref,
-                        "id": "tool-1",
+                        "part": {
+                            "id": "tool-1",
+                            "messageID": "msg-assistant",
+                            "sessionID": self.session_ref,
+                            "type": "tool",
+                            "callID": "call-1",
+                            "tool": "bash",
+                            "state": {"status": "completed", "output": "ok"},
+                        },
                     },
                 },
                 {
@@ -171,6 +342,98 @@ class FakeOpenCode:
                 },
             ]
         )
+
+
+class SynchronizedTypedOpenCode(FakeOpenCode):
+    """Replay 1.18.23 typed SSE while the synchronous prompt is blocked."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        fixture = json.loads(OPENCODE_TYPED_TURN.read_text())
+        self.session_ref = fixture["session_ref"]
+        self.events = fixture["events"]
+        self.response = fixture["response"]
+        self.message_started = threading.Event()
+        self.progress_sent = threading.Event()
+        self.release_message = threading.Event()
+
+    def request(self, method, path, *, query=None, body=None):
+        if method == "POST" and path.endswith("/message"):
+            self.requests.append((method, path, dict(query or {}), body))
+            self.message_started.set()
+            if not self.release_message.wait(2):
+                raise AssertionError("test did not release synchronous prompt")
+            return self.response
+        return super().request(method, path, query=query, body=body)
+
+    def stream(self, path, *, query=None):
+        self.stream_calls.append((path, dict(query or {})))
+
+        def replay():
+            yield self.events[0]
+            if not self.message_started.wait(2):
+                raise AssertionError("SSE consumer started no prompt worker")
+            for event in self.events[1:-1]:
+                yield event
+            self.progress_sent.set()
+            if not self.release_message.wait(2):
+                raise AssertionError("test did not release terminal SSE")
+            yield self.events[-1]
+
+        return replay()
+
+
+class CloseableBlockingStream:
+    def __init__(self, session_ref: str) -> None:
+        self.session_ref = session_ref
+        self.closed = threading.Event()
+        self.started = threading.Event()
+        self._first = True
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        self.started.set()
+        if self._first:
+            self._first = False
+            return {
+                "type": "session.status",
+                "properties": {
+                    "sessionID": self.session_ref,
+                    "status": {"type": "busy"},
+                },
+            }
+        self.closed.wait(2)
+        raise StopIteration
+
+    def close(self) -> None:
+        self.closed.set()
+
+
+class FailingPromptOpenCode(FakeOpenCode):
+    def __init__(self) -> None:
+        super().__init__()
+        self.event_stream = CloseableBlockingStream(self.session_ref)
+        self.abort_count = 0
+
+    def request(self, method, path, *, query=None, body=None):
+        if method == "POST" and path.endswith("/message"):
+            self.requests.append((method, path, dict(query or {}), body))
+            raise AdapterError(
+                "HARNESS_UNAVAILABLE",
+                "POST /message failed: connection reset",
+                retryable=True,
+            )
+        if method == "POST" and path.endswith("/abort"):
+            self.requests.append((method, path, dict(query or {}), body))
+            self.abort_count += 1
+            return True
+        return super().request(method, path, query=query, body=body)
+
+    def stream(self, path, *, query=None):
+        self.stream_calls.append((path, dict(query or {})))
+        return self.event_stream
 
 
 class FakeClaudeProcess:
@@ -624,6 +887,24 @@ class FakeCodexRpc:
                     },
                 },
                 {
+                    "method": "thread/tokenUsage/updated",
+                    "params": {
+                        "threadId": self.session_ref,
+                        "turnId": self.run_ref,
+                        "tokenUsage": {
+                            "last": {
+                                "inputTokens": 12000,
+                                "cachedInputTokens": 9000,
+                                "outputTokens": 345,
+                                "reasoningOutputTokens": 200,
+                                "totalTokens": 12345,
+                            },
+                            "total": {"totalTokens": 98765},
+                            "modelContextWindow": 258400,
+                        },
+                    },
+                },
+                {
                     "method": "turn/completed",
                     "params": {
                         "threadId": self.session_ref,
@@ -667,18 +948,24 @@ class ConversationAdapterTest(unittest.TestCase):
         self.linked_vm.stop()
         self.temp.cleanup()
 
-    def test_declared_compatibility_ranges_enforce_closed_open_boundaries(self) -> None:
+    def test_declared_compatibility_ranges_enforce_floor_and_flag_newer(self) -> None:
         cases = {
-            "claude": ("2.1.219", "2.1.220", "2.1.222", "2.2.0"),
-            "codex": ("0.144.999", "0.145.0", "0.146.1", "0.147.0"),
+            "claude": ("2.1.219", "2.1.220", "2.1.223", "2.2.0"),
+            "codex": ("0.144.999", "0.145.0", "0.147.0", "0.148.0"),
             "opencode": ("1.18.8", "1.18.9", "1.18.13", "1.19.0"),
             "kimi": ("0.29.999", "0.30.0", "0.33.0", "0.34.0"),
+        }
+        current_observed = {
+            "claude": "2.1.223 (Claude Code)",
+            "codex": "codex-cli 0.147.0",
+            "opencode": "1.18.13",
+            "kimi": "0.33.0",
         }
         for harness, (below, lower, current, upper) in cases.items():
             with self.subTest(harness=harness):
                 adapter, _native = self.build(harness)
                 lower_result = adapter._probe_result(lower)
-                current_result = adapter._probe_result(current)
+                current_result = adapter._probe_result(current_observed[harness])
                 self.assertEqual(lower_result.minimum_version, lower)
                 self.assertEqual(current_result.version, current)
                 self.assertEqual(
@@ -696,17 +983,42 @@ class ConversationAdapterTest(unittest.TestCase):
                     rf"{harness} {re.escape(below)} is older than required {re.escape(lower)}",
                 ):
                     adapter._probe_result(below)
-                with self.assertRaisesRegex(
-                    AdapterError,
-                    rf"{harness} {re.escape(upper)} is outside supported range",
-                ):
-                    adapter._probe_result(upper)
+                upper_result = adapter._probe_result(upper)
+                self.assertEqual(upper_result.version, upper)
+                self.assertEqual(upper_result.compatibility, "newer-unverified")
+                self.assertEqual(upper_result.maximum_version_exclusive, upper)
+
+    def test_same_core_non_tokens_are_not_verified(self) -> None:
+        adapter, _native = self.build("codex")
+        for observed in (
+            "codex-cli 0.147.0dev", "codex-cli 0.147.0.1",
+            "codex-cli 0.147.0_dev", "codex-cli 0.147.0~dev",
+            "codex-cli 0.147.0/dev", "codex-cli 0.147.0:dev",
+        ):
+            with self.subTest(observed=observed):
+                result = adapter._probe_result(observed)
+                self.assertEqual(result.version, observed)
+                self.assertEqual(result.compatibility, "non-semver")
+                self.assertEqual(result.verified_version, "0.147.0")
+
+    def test_custom_current_core_is_not_verified(self) -> None:
+        adapter, _native = self.build("codex")
+        for observed in (
+            "codex-cli 0.147.0(dev)",
+            "codex-cli 0.147.0 custom-build",
+            "wrapper 0.147.0 (not-the-canary)",
+        ):
+            with self.subTest(observed=observed):
+                result = adapter._probe_result(observed)
+                self.assertEqual(result.version, observed)
+                self.assertEqual(result.compatibility, "custom-unverified")
+                self.assertEqual(result.verified_version, "0.147.0")
 
     def test_verified_probe_result_names_missing_manifest_keys(self) -> None:
         adapter, _native = self.build("claude")
-        result = adapter._probe_result("2.1.222")
+        result = adapter._probe_result("2.1.223 (Claude Code)")
         self.assertEqual(result.compatibility, "verified")
-        self.assertEqual(result.verified_version, "2.1.222")
+        self.assertEqual(result.verified_version, "2.1.223")
         self.assertEqual(result.maximum_version_exclusive, "2.2.0")
 
         manifest = json.loads(
@@ -748,6 +1060,21 @@ class ConversationAdapterTest(unittest.TestCase):
             ),
         ):
             base_adapter.load_manifest("claude")
+
+    def test_successful_non_semver_probe_preserves_manifest_validation(self) -> None:
+        adapter, _native = self.build("codex")
+        with mock.patch.object(
+            base_adapter.subprocess,
+            "run",
+            return_value=mock.Mock(
+                returncode=0, stdout="codex dev-build\n", stderr=""
+            ),
+        ):
+            result = adapter.probe()
+
+        self.assertEqual(result.version, "codex dev-build")
+        self.assertEqual(result.compatibility, "non-semver")
+        self.assertEqual(result.verified_version, "0.147.0")
 
     def write_claude_session(
         self,
@@ -894,7 +1221,24 @@ class ConversationAdapterTest(unittest.TestCase):
                 self.assertIn("tool.started", types)
                 self.assertIn("tool.completed", types)
                 self.assertIn("run.completed", types)
-                self.assertNotIn("secret reasoning", repr(events))
+                if harness == "opencode":
+                    reasoning = [
+                        event for event in events
+                        if event.type == "assistant.delta"
+                        and event.payload.get("segment") == "reasoning"
+                    ]
+                    answers = [
+                        event for event in events
+                        if event.type == "assistant.delta"
+                        and event.payload.get("segment") != "reasoning"
+                    ]
+                    self.assertEqual(
+                        [event.payload["text"] for event in reasoning],
+                        ["secret reasoning"],
+                    )
+                    self.assertNotIn("secret reasoning", repr(answers))
+                else:
+                    self.assertNotIn("secret reasoning", repr(events))
                 self.assertEqual(
                     adapter.reconcile(turn, self.context).outcome,
                     "succeeded",
@@ -991,11 +1335,599 @@ class ConversationAdapterTest(unittest.TestCase):
             no_effort_native.calls[-1][2],
         )
 
+    def test_v2_binding_drives_each_native_effort_transport_exactly_once(self):
+        claude, claude_native = self.build("claude")
+        claude_context = replace(
+            v2_context(self.root, "claude"), model=None, effort=None
+        )
+        claude.start(claude_context, "work")
+        claude_argv = claude_native.calls[-1][0]
+        self.assertEqual(claude_argv.count("--effort"), 1)
+        self.assertEqual(
+            claude_argv[claude_argv.index("--effort") + 1], "high"
+        )
+        self.assertEqual(
+            claude_argv[claude_argv.index("--model") + 1], "test-model"
+        )
+
+        codex, codex_native = self.build("codex")
+        codex_context = replace(
+            v2_context(self.root, "codex"), model=None, effort=None
+        )
+        codex.start(codex_context, "work")
+        turn_params = next(
+            params for method, params in codex_native.requests
+            if method == "turn/start"
+        )
+        self.assertEqual(turn_params["effort"], "high")
+        self.assertEqual(turn_params["model"], "test-model")
+
+        kimi, kimi_native = self.build("kimi")
+        kimi_context = replace(
+            v2_context(
+                self.root,
+                "kimi",
+                env={"KIMI_MODEL_THINKING_EFFORT": "ambient"},
+            ),
+            model=None,
+            effort=None,
+        )
+        kimi.start(
+            kimi_context,
+            "work",
+        )
+        kimi_argv, _cwd, kimi_env = kimi_native.calls[-1]
+        self.assertEqual(kimi_env["KIMI_MODEL_THINKING_EFFORT"], "high")
+        self.assertEqual(kimi_argv.count("-m"), 1)
+        self.assertEqual(kimi_argv[kimi_argv.index("-m") + 1], "test-model")
+
+    def test_opencode_v2_binding_uses_full_agent_on_start_resume_and_prompt(self):
+        native = FakeOpenCode()
+        adapter = OpenCodeAdapter(
+            transport=native,
+            shell_runtime_dir=self.root / "runtime-shells",
+        )
+        context = replace(
+            v2_context(
+                self.root, "opencode", provider="openai", model="gpt-test"
+            ),
+            provider="stale-provider",
+            model=None,
+            effort=None,
+        )
+        expected_agent = f"sc-route-{context.binding_digest}"
+
+        first = adapter.start(context, "first")
+        list(adapter.stream(first))
+        resumed = adapter.resume(first.session_ref, context, "second")
+        list(adapter.stream(resumed))
+
+        prompts = [
+            request for request in native.requests
+            if request[1].endswith("/message")
+        ]
+        self.assertEqual(len(prompts), 2)
+        self.assertEqual(
+            [request[3]["agent"] for request in prompts],
+            [expected_agent, expected_agent],
+        )
+        self.assertEqual(
+            [request[3]["model"] for request in prompts],
+            [
+                {"providerID": "openai", "modelID": "gpt-test"},
+                {"providerID": "openai", "modelID": "gpt-test"},
+            ],
+        )
+        configured = json.loads((self.root / "opencode.json").read_text())
+        self.assertEqual(configured["agent"][expected_agent], {
+            "mode": "primary",
+            "model": "openai/gpt-test",
+            "reasoningEffort": "high",
+        })
+        self.assertIn("shell", configured)
+
+    def test_opencode_v3_sends_exact_model_and_variant_on_start_and_resume(self):
+        native = FakeOpenCode()
+        native.provider_state["all"][0]["models"]["gpt-test"]["variants"] = {
+            "MAX.Future": {
+                "reasoningEffort": "ignored-by-super-coder",
+                "futureNativeKey": {"enabled": True},
+            },
+        }
+        adapter = OpenCodeAdapter(
+            transport=native,
+            shell_runtime_dir=self.root / "runtime-shells",
+        )
+        context = v3_opencode_context(self.root)
+
+        with mock.patch.object(
+            opencode_adapter.opencode_config,
+            "ensure_route_agent",
+        ) as ensure_route_agent:
+            first = adapter.start(context, "first")
+            list(adapter.stream(first))
+            later = adapter.resume(first.session_ref, context, "later")
+            list(adapter.stream(later))
+            resumed = adapter.resume(first.session_ref, context, "resumed")
+            list(adapter.stream(resumed))
+
+        ensure_route_agent.assert_not_called()
+
+        prompts = [
+            request for request in native.requests
+            if request[1].endswith("/message")
+        ]
+        self.assertEqual([request[3] for request in prompts], [
+            {
+                "parts": [{"type": "text", "text": "first"}],
+                "model": {"providerID": "openai", "modelID": "gpt-test"},
+                "variant": "MAX.Future",
+            },
+            {
+                "parts": [{"type": "text", "text": "later"}],
+                "model": {"providerID": "openai", "modelID": "gpt-test"},
+                "variant": "MAX.Future",
+            },
+            {
+                "parts": [{"type": "text", "text": "resumed"}],
+                "model": {"providerID": "openai", "modelID": "gpt-test"},
+                "variant": "MAX.Future",
+            },
+        ])
+        self.assertEqual(
+            len([request for request in native.requests if request[:2] == (
+                "GET", "/provider"
+            )]),
+            3,
+        )
+        self.assertEqual(
+            len([request for request in native.requests if request[:2] == (
+                "POST", "/session"
+            )]),
+            1,
+        )
+        configured = json.loads((self.root / "opencode.json").read_text())
+        self.assertNotIn("agent", configured)
+
+    def test_opencode_v3_harness_default_omits_variant_on_every_prompt(self):
+        native = FakeOpenCode()
+        adapter = OpenCodeAdapter(
+            transport=native,
+            shell_runtime_dir=self.root / "runtime-shells",
+        )
+        context = v3_opencode_context(self.root, variant=None)
+
+        first = adapter.start(context, "first")
+        list(adapter.stream(first))
+        resumed = adapter.resume(first.session_ref, context, "second")
+        list(adapter.stream(resumed))
+
+        prompts = [
+            request[3] for request in native.requests
+            if request[1].endswith("/message")
+        ]
+        self.assertEqual(len(prompts), 2)
+        self.assertEqual(
+            [prompt["model"] for prompt in prompts],
+            [
+                {"providerID": "openai", "modelID": "gpt-test"},
+                {"providerID": "openai", "modelID": "gpt-test"},
+            ],
+        )
+        self.assertEqual(
+            [("variant" in prompt, "agent" in prompt) for prompt in prompts],
+            [(False, False), (False, False)],
+        )
+
+    def test_opencode_v3_disappeared_variant_refuses_resumed_prompt(self):
+        native = FakeOpenCode()
+        native.provider_state["all"][0]["models"]["gpt-test"]["variants"] = {
+            "MAX.Future": {},
+        }
+        adapter = OpenCodeAdapter(
+            transport=native,
+            shell_runtime_dir=self.root / "runtime-shells",
+        )
+        context = v3_opencode_context(self.root)
+
+        first = adapter.start(context, "first")
+        list(adapter.stream(first))
+        native.provider_state["all"][0]["models"]["gpt-test"]["variants"] = {}
+
+        original_binding = dict(context.route_binding)
+        with mock.patch.object(
+            opencode_adapter.opencode_config,
+            "ensure_route_agent",
+        ) as ensure_route_agent, self.assertRaisesRegex(
+            AdapterError, "native_route_unavailable"
+        ):
+            adapter.resume(first.session_ref, context, "must not dispatch")
+        ensure_route_agent.assert_not_called()
+        self.assertEqual(context.route_binding, original_binding)
+
+        self.assertEqual(
+            len([
+                request for request in native.requests
+                if request[1].endswith("/message")
+            ]),
+            1,
+        )
+        self.assertEqual(
+            len([request for request in native.requests if request[:2] == (
+                "GET", f"/session/{native.session_ref}"
+            )]),
+            0,
+        )
+        configured = json.loads((self.root / "opencode.json").read_text())
+        self.assertNotIn("agent", configured)
+
+    def test_opencode_v2_refuses_stale_route_agent_without_live_translation(self):
+        native = FakeOpenCode()
+        native.provider_state["all"][0]["models"]["gpt-test"]["variants"][
+            "high"
+        ] = {
+            "reasoningEffort": "high",
+            "futureNativeKey": {"enabled": True},
+        }
+        adapter = OpenCodeAdapter(
+            transport=native,
+            shell_runtime_dir=self.root / "runtime-shells",
+        )
+        context = v2_context(
+            self.root, "opencode", provider="openai", model="gpt-test"
+        )
+        agent = f"sc-route-{context.binding_digest}"
+        (self.root / "opencode.json").write_text(json.dumps({
+            "agent": {agent: {
+                "mode": "primary",
+                "model": "openai/gpt-test",
+                "reasoningEffort": "low",
+            }}
+        }))
+
+        with self.assertRaisesRegex(AdapterError, "HARNESS_CONFIG_INVALID"):
+            adapter.start(context, "must not dispatch")
+
+        configured = json.loads((self.root / "opencode.json").read_text())
+        self.assertEqual(configured["agent"][agent], {
+            "mode": "primary",
+            "model": "openai/gpt-test",
+            "reasoningEffort": "low",
+        })
+        self.assertIn("shell", configured)
+        self.assertEqual(
+            [(method, path) for method, path, _query, _body in native.requests],
+            [("GET", "/provider")],
+        )
+
+    def test_opencode_v3_concurrent_sessions_keep_exact_variants_without_agents(self):
+        routes = (
+            ("glm-5.2", "MaX.Future"),
+            ("gemma4:31b", "Case/Sensitive"),
+        )
+        barrier = threading.Barrier(len(routes) + 1)
+        results: list[tuple[FakeOpenCode, str, str]] = []
+        errors: list[Exception] = []
+
+        def run(model: str, variant: str) -> None:
+            native = FakeOpenCode()
+            native.session_ref = f"ses-{model}"
+            native.provider_state["all"][0]["models"] = {
+                model: {"variants": {variant: object()}},
+            }
+            adapter = OpenCodeAdapter(
+                transport=native,
+                shell_runtime_dir=self.root / "runtime-shells",
+            )
+            try:
+                barrier.wait(timeout=2)
+                turn = adapter.start(
+                    v3_opencode_context(self.root, model=model, variant=variant),
+                    f"prompt-{model}",
+                )
+                list(adapter.stream(turn))
+                results.append((native, model, variant))
+            except Exception as exc:  # noqa: BLE001 - captured for assertion
+                errors.append(exc)
+
+        workers = [threading.Thread(target=run, args=route) for route in routes]
+        for worker in workers:
+            worker.start()
+        barrier.wait(timeout=2)
+        for worker in workers:
+            worker.join(timeout=2)
+
+        self.assertTrue(all(not worker.is_alive() for worker in workers))
+        self.assertEqual(errors, [])
+        self.assertEqual(len(results), 2)
+        for native, model, variant in results:
+            prompts = [
+                request[3] for request in native.requests
+                if request[1].endswith("/message")
+            ]
+            self.assertEqual(prompts, [{
+                "parts": [{"type": "text", "text": f"prompt-{model}"}],
+                "model": {"providerID": "openai", "modelID": model},
+                "variant": variant,
+            }])
+        configured = json.loads((self.root / "opencode.json").read_text())
+        self.assertNotIn("agent", configured)
+
+    def test_opencode_missing_live_option_refuses_before_session_or_prompt(self):
+        native = FakeOpenCode()
+        native.provider_state["all"][0]["models"]["gpt-test"]["variants"] = {
+            "low": {"reasoningEffort": "low"},
+        }
+        adapter = OpenCodeAdapter(
+            transport=native,
+            shell_runtime_dir=self.root / "runtime-shells",
+        )
+        context = v2_context(
+            self.root, "opencode", provider="openai", model="gpt-test"
+        )
+
+        with self.assertRaisesRegex(AdapterError, "native_route_unavailable"):
+            adapter.start(context, "must not dispatch")
+
+        self.assertEqual(
+            [(method, path) for method, path, _query, _body in native.requests],
+            [("GET", "/provider")],
+        )
+
+    def test_opencode_transport_rejection_is_one_terminal_dispatch(self):
+        native = FakeOpenCode()
+        native.provider_state["all"][0]["models"]["gpt-test"]["variants"] = {
+            "MAX.Future": {},
+        }
+        native.stream = mock.Mock(return_value=iter([
+            {
+                "type": "session.status",
+                "properties": {
+                    "sessionID": native.session_ref,
+                    "status": {"type": "busy"},
+                },
+            },
+            {
+                "type": "session.error",
+                "properties": {
+                    "sessionID": native.session_ref,
+                    "error": {"name": "UnsupportedVariantError"},
+                },
+            },
+        ]))
+        adapter = OpenCodeAdapter(
+            transport=native,
+            shell_runtime_dir=self.root / "runtime-shells",
+        )
+        context = v3_opencode_context(self.root)
+
+        turn = adapter.start(context, "dispatch once")
+        events = list(adapter.stream(turn))
+        prompts = [
+            request for request in native.requests
+            if request[1].endswith("/message")
+        ]
+
+        self.assertEqual(len(prompts), 1)
+        self.assertEqual(prompts[0][3], {
+            "parts": [{"type": "text", "text": "dispatch once"}],
+            "model": {"providerID": "openai", "modelID": "gpt-test"},
+            "variant": "MAX.Future",
+        })
+        self.assertEqual(events[-1].type, "run.failed")
+        self.assertEqual(events[-1].payload["error"], "UnsupportedVariantError")
+        self.assertEqual(
+            len([request for request in native.requests if request[:2] == (
+                "POST", "/session"
+            )]),
+            1,
+        )
+
+    def test_opencode_streams_typed_progress_before_sync_response(self):
+        native = SynchronizedTypedOpenCode()
+        adapter = OpenCodeAdapter(
+            transport=native,
+            shell_runtime_dir=self.root / "runtime-shells",
+        )
+        turn = adapter.start(self.context, "typed progress")
+        events: list[NormalizedEvent] = []
+        progress_observed = threading.Event()
+        errors: list[BaseException] = []
+
+        def consume() -> None:
+            try:
+                for event in adapter.stream(turn):
+                    events.append(event)
+                    if event.type == "tool.completed":
+                        progress_observed.set()
+            except BaseException as exc:  # noqa: BLE001 - asserted below
+                errors.append(exc)
+
+        worker = threading.Thread(target=consume)
+        worker.start()
+        self.assertTrue(native.message_started.wait(1))
+        self.assertTrue(native.progress_sent.wait(1))
+        self.assertTrue(
+            progress_observed.wait(1),
+            "typed progress remained buffered behind synchronous /message",
+        )
+        self.assertTrue(worker.is_alive())
+
+        progress = list(events)
+        self.assertEqual(
+            [event.type for event in progress].count("run.started"),
+            1,
+        )
+        self.assertEqual(
+            [
+                (event.payload["text"], event.payload.get("segment"))
+                for event in progress
+                if event.type == "assistant.delta"
+            ],
+            [
+                ("think", "reasoning"),
+                ("ing", "reasoning"),
+                ("OK", "answer"),
+            ],
+        )
+        self.assertNotIn("must not project", repr(progress))
+        self.assertEqual(
+            [event.type for event in progress].count("tool.started"),
+            1,
+        )
+        self.assertEqual(
+            [event.type for event in progress].count("tool.completed"),
+            1,
+        )
+        usage = [event for event in progress if event.type == "usage"]
+        self.assertEqual(len(usage), 1)
+        self.assertEqual(
+            usage[0].payload["tokens"],
+            {"input": 8602, "output": 31, "reasoning": 0},
+        )
+
+        native.release_message.set()
+        worker.join(2)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual(events[-1].type, "run.completed")
+        self.assertEqual(
+            [event.type for event in events].count("run.completed"),
+            1,
+        )
+        self.assertEqual(
+            len([
+                request for request in native.requests
+                if request[1].endswith("/message")
+            ]),
+            1,
+        )
+
+    def test_opencode_prompt_failure_closes_stream_and_joins_workers(self):
+        native = FailingPromptOpenCode()
+        adapter = OpenCodeAdapter(
+            transport=native,
+            shell_runtime_dir=self.root / "runtime-shells",
+        )
+        turn = adapter.start(self.context, "fail once")
+
+        with self.assertRaises(AdapterError) as caught:
+            list(adapter.stream(turn))
+
+        self.assertEqual(caught.exception.code, "HARNESS_UNAVAILABLE")
+        self.assertTrue(native.event_stream.started.is_set())
+        self.assertTrue(native.event_stream.closed.is_set())
+        self.assertEqual(native.abort_count, 1)
+        self.assertEqual(
+            [
+                thread.name for thread in threading.enumerate()
+                if turn.run_ref in thread.name
+            ],
+            [],
+        )
+
+    def test_opencode_repeated_interrupt_aborts_exact_session_once(self):
+        adapter, native = self.build("opencode")
+        turn = adapter.start(self.context, "interrupt once")
+
+        self.assertTrue(adapter.interrupt(turn).acknowledged)
+        self.assertTrue(adapter.interrupt(turn).acknowledged)
+
+        aborts = [
+            request for request in native.requests
+            if request[:2] == (
+                "POST", f"/session/{native.session_ref}/abort"
+            )
+        ]
+        self.assertEqual(len(aborts), 1)
+
+    def test_opencode_typed_tool_error_is_one_failed_lifecycle(self):
+        adapter, _native = self.build("opencode")
+        projection = opencode_adapter._OpenCodeProjection()
+        raw = {
+            "type": "message.part.updated",
+            "properties": {
+                "sessionID": "ses_exact",
+                "part": {
+                    "id": "prt_failed",
+                    "messageID": "msg_assistant",
+                    "sessionID": "ses_exact",
+                    "type": "tool",
+                    "callID": "call_failed",
+                    "tool": "bash",
+                    "state": {"status": "error", "error": "denied"},
+                },
+            },
+        }
+
+        events = adapter._normalize(raw, projection)
+
+        self.assertEqual([event.type for event in events], [
+            "tool.started", "tool.completed"
+        ])
+        self.assertEqual(events[0].payload, {
+            "tool_ref": "call_failed", "name": "bash"
+        })
+        self.assertEqual(events[1].payload, {
+            "tool_ref": "call_failed", "status": "failed"
+        })
+        self.assertEqual(adapter._normalize(raw, projection), [])
+
+    def test_opencode_rejects_irreconcilable_completed_part_text(self):
+        adapter, _native = self.build("opencode")
+        projection = opencode_adapter._OpenCodeProjection()
+        adapter._normalize({
+            "type": "message.updated",
+            "properties": {
+                "sessionID": "ses_exact",
+                "info": {
+                    "id": "msg_assistant",
+                    "sessionID": "ses_exact",
+                    "role": "assistant",
+                },
+            },
+        }, projection)
+        adapter._normalize({
+            "type": "message.part.updated",
+            "properties": {
+                "sessionID": "ses_exact",
+                "part": {
+                    "id": "prt_answer",
+                    "messageID": "msg_assistant",
+                    "sessionID": "ses_exact",
+                    "type": "text",
+                    "text": "first",
+                },
+            },
+        }, projection)
+
+        with self.assertRaisesRegex(
+            AdapterError, "irreconcilable text for part prt_answer"
+        ):
+            adapter._normalize({
+                "type": "message.part.updated",
+                "properties": {
+                    "sessionID": "ses_exact",
+                    "part": {
+                        "id": "prt_answer",
+                        "messageID": "msg_assistant",
+                        "sessionID": "ses_exact",
+                        "type": "text",
+                        "text": "replacement",
+                    },
+                },
+            }, projection)
+
     def test_opencode_exact_resources_filtering_and_unknown_recovery(
         self,
     ) -> None:
         adapter, native = self.build("opencode")
-        result = adapter.probe()
+        with mock.patch.object(
+            opencode_adapter,
+            "command_version",
+            return_value="1.18.9",
+        ):
+            result = adapter.probe()
         self.assertEqual(result.version, "1.18.9")
         turn = adapter.start(self.context, "hello")
         self.assertEqual(
@@ -1044,6 +1976,94 @@ class ConversationAdapterTest(unittest.TestCase):
         recovered = adapter.reconcile(fresh, self.context)
         self.assertEqual(recovered.outcome, "unknown")
         self.assertFalse(recovered.proven)
+
+    def test_opencode_submitted_first_turn_without_activity_fails_precisely(
+        self,
+    ) -> None:
+        class IdleOnlyOpenCode(FakeOpenCode):
+            def stream(self, path, *, query=None):
+                self.stream_calls.append((path, dict(query or {})))
+                return iter(({
+                    "type": "session.idle",
+                    "properties": {"sessionID": self.session_ref},
+                },))
+
+        native = IdleOnlyOpenCode()
+        adapter = OpenCodeAdapter(
+            transport=native,
+            shell_runtime_dir=self.root / "runtime-shells",
+        )
+
+        turn = adapter.start(self.context, "dispatch exactly once")
+        with self.assertRaises(AdapterError) as caught:
+            list(adapter.stream(turn))
+
+        self.assertEqual(caught.exception.code, "HARNESS_SUBMISSION_UNOBSERVED")
+        self.assertEqual(
+            caught.exception.detail,
+            "OpenCode accepted the synchronous prompt request but reported no "
+            f"activity or terminal event for {native.session_ref}",
+        )
+        self.assertEqual(
+            len([
+                request for request in native.requests
+                if request[1].endswith("/message")
+            ]),
+            1,
+        )
+        self.assertEqual(
+            len([
+                request for request in native.requests
+                if request[:2] == ("POST", "/session")
+            ]),
+            1,
+        )
+
+    def test_opencode_ambiguous_prompt_connection_loss_stays_reconcilable(
+        self,
+    ) -> None:
+        class ConnectionLostOpenCode(FakeOpenCode):
+            def request(self, method, path, *, query=None, body=None):
+                if method == "POST" and path.endswith("/message"):
+                    self.requests.append((method, path, dict(query or {}), body))
+                    try:
+                        raise OSError("connection reset")
+                    except OSError as cause:
+                        raise AdapterError(
+                            "HARNESS_UNAVAILABLE",
+                            f"POST {path} failed: connection reset",
+                            retryable=True,
+                        ) from cause
+                return super().request(
+                    method,
+                    path,
+                    query=query,
+                    body=body,
+                )
+
+        native = ConnectionLostOpenCode()
+        adapter = OpenCodeAdapter(
+            transport=native,
+            shell_runtime_dir=self.root / "runtime-shells",
+        )
+
+        turn = adapter.start(self.context, "dispatch exactly once")
+        with self.assertRaises(AdapterError) as caught:
+            list(adapter.stream(turn))
+
+        self.assertEqual(caught.exception.code, "HARNESS_UNAVAILABLE")
+        self.assertEqual(
+            caught.exception.detail,
+            f"POST /session/{native.session_ref}/message failed: connection reset",
+        )
+        self.assertTrue(caught.exception.retryable)
+        self.assertEqual(
+            len([
+                request for request in native.requests
+                if request[1].endswith("/message")
+            ]),
+            1,
+        )
 
     def test_opencode_shared_server_is_not_the_turn_process(self) -> None:
         adapter, _native = self.build("opencode")
@@ -1196,6 +2216,64 @@ class ConversationAdapterTest(unittest.TestCase):
         self.assertNotIn("--session-id", argv)
         self.assertTrue(adapter.interrupt(resumed).acknowledged)
         self.assertEqual(runner.processes[-1].signals, [signal.SIGINT])
+
+    def test_native_processes_receive_parent_owned_execution_prefix(self) -> None:
+        context = replace(
+            self.context,
+            execution_prefix=("view-helper", "--"),
+        )
+
+        claude, claude_runner = self.build("claude")
+        claude.start(context, "contained")
+        self.assertEqual(claude_runner.calls[-1][0][:2], ["view-helper", "--"])
+
+        kimi, kimi_runner = self.build("kimi")
+        kimi.start(context, "contained")
+        self.assertEqual(kimi_runner.calls[-1][0][:2], ["view-helper", "--"])
+
+        with mock.patch.object(codex_adapter, "JsonLineRpcProcess") as rpc_process:
+            codex = CodexAdapter()
+            codex._transport(context)
+        self.assertEqual(
+            rpc_process.call_args.kwargs["argv"][:2],
+            ["view-helper", "--"],
+        )
+
+        for surface in ("browser", "sprint"):
+            with self.subTest(surface=surface):
+                restricted = replace(
+                    context,
+                    env={**context.env, "SC_CONVERSATION_SURFACE": surface},
+                )
+                restricted_server = mock.Mock()
+                restricted_server.poll.return_value = None
+                restricted_log = mock.Mock()
+                native = FakeOpenCode()
+                with mock.patch.object(
+                    opencode_adapter,
+                    "ensure_server",
+                ) as ensure_server, mock.patch.object(
+                    opencode_adapter,
+                    "start_context_server",
+                    return_value=(
+                        restricted_server,
+                        restricted_log,
+                        "http://127.0.0.1:12345",
+                        "password",
+                    ),
+                ) as start_context_server, mock.patch.object(
+                    opencode_adapter,
+                    "UrlHttpTransport",
+                    return_value=native,
+                ):
+                    opencode = OpenCodeAdapter()
+                    ensure_server.assert_not_called()
+                    opencode.start(restricted, "contained")
+                    ensure_server.assert_not_called()
+                    opencode.close()
+                start_context_server.assert_called_once_with(restricted)
+                restricted_server.terminate.assert_called_once_with()
+                restricted_log.close.assert_called_once_with()
 
     def test_claude_resume_accepts_resolved_worktree_descendants(self) -> None:
         adapter, runner = self.build("claude")
@@ -1948,6 +3026,40 @@ class ConversationAdapterTest(unittest.TestCase):
             process.pid,
         )
 
+    def test_codex_initialize_timeout_cleans_up_process_group(self) -> None:
+        process = mock.Mock()
+        process.pid = 4321
+        process.stdin = io.StringIO()
+        process.stdout = io.StringIO()
+        process.stderr = io.StringIO()
+        process.poll.return_value = None
+        timeout = AdapterError(
+            "HARNESS_TIMEOUT",
+            "Codex request timed out: initialize",
+            retryable=True,
+        )
+        with (
+            mock.patch(
+                "conversation_adapters.codex.subprocess.Popen",
+                return_value=process,
+            ),
+            mock.patch.object(
+                JsonLineRpcProcess,
+                "request",
+                side_effect=timeout,
+            ),
+            mock.patch(
+                "conversation_adapters.codex.cleanup_owned_process"
+            ) as cleanup,
+        ):
+            with self.assertRaisesRegex(
+                AdapterError,
+                "Codex request timed out: initialize",
+            ):
+                JsonLineRpcProcess(cwd=self.root, env={})
+
+        cleanup.assert_called_once_with(process, 5.0)
+
     def test_shared_runner_reaps_group_after_leader_exit(self) -> None:
         process = mock.Mock()
         process.pid = 4321
@@ -2234,6 +3346,20 @@ class ConversationAdapterTest(unittest.TestCase):
             "permission.requested",
             [event.type for event in events],
         )
+        usage = next(event for event in events if event.type == "usage")
+        self.assertEqual(
+            usage.payload,
+            {
+                "tokens": {
+                    "inputTokens": 12000,
+                    "cachedInputTokens": 9000,
+                    "outputTokens": 345,
+                    "reasoningOutputTokens": 200,
+                    "totalTokens": 12345,
+                }
+            },
+        )
+        self.assertNotIn("98765", repr(usage.payload))
         resumed = adapter.resume(turn.session_ref, self.context, "again")
         self.assertIn("thread/resume", [method for method, _ in rpc.requests])
         rpc.read_status = "inProgress"

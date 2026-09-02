@@ -12,6 +12,8 @@ import tempfile
 import threading
 import time
 import unittest
+import urllib.error
+import urllib.parse
 from collections.abc import Iterator
 from datetime import datetime, timezone
 from pathlib import Path
@@ -22,7 +24,9 @@ ENGINE = ROOT / ".super-coder"
 SCRIPTS = ENGINE / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 
+import conversation_boot  # noqa: E402
 from conversation_adapters import (  # noqa: E402
+    AdapterError,
     ConversationContext,
     InterruptResult,
     KimiAdapter,
@@ -31,11 +35,15 @@ from conversation_adapters import (  # noqa: E402
     OpenCodeAdapter,
     ReconcileResult,
 )
+from conversation_adapters import base as base_adapter
+from conversation_adapters import opencode as opencode_adapter
+from conversation_boot import BootDirective  # noqa: E402
 from conversation_broker import (  # noqa: E402
     BrokerInvariantError,
     BrokerRun,
     BrokerStore,
     ConversationBroker,
+    unexpected_error_code,
 )
 
 
@@ -44,6 +52,15 @@ def apply_schema(con: sqlite3.Connection) -> None:
     for migration in sorted((ENGINE / "migrations").glob("*.sql")):
         con.executescript(migration.read_text())
     con.execute("PRAGMA foreign_keys=ON")
+
+
+def test_unexpected_error_code_retains_only_exception_class() -> None:
+    secret = "opaque-provider-secret"
+
+    code = unexpected_error_code(KeyError(secret))
+
+    assert code == "BROKER_RUN_KEYERROR"
+    assert secret not in code
 
 
 class FakeAdapter:
@@ -137,6 +154,53 @@ class FakeAdapter:
         self.closed += 1
 
 
+class RecoveryExecutionAdapter(FakeAdapter):
+    """Capture the server argv that recovery hands to an adapter."""
+
+    def __init__(self, harness: str) -> None:
+        super().__init__(harness=harness)
+        self.execution_argvs: list[list[str]] = []
+        self.surfaces: list[str | None] = []
+
+    def reconcile(
+        self,
+        turn: NativeTurn,
+        context: ConversationContext,
+    ) -> ReconcileResult:
+        self.execution_argvs.append(
+            context.execution_argv([self.harness, "inspection-server"])
+        )
+        self.surfaces.append(context.env.get("SC_CONVERSATION_SURFACE"))
+        return super().reconcile(turn, context)
+
+
+class RecoveryExecutionPreparer:
+    def __init__(self, worktree: Path, surface: str) -> None:
+        self.worktree = worktree
+        self.surface = surface
+        self.recovered: list[int] = []
+
+    def recovery(self, run: BrokerRun) -> ConversationContext:
+        self.recovered.append(run.run_id)
+        return ConversationContext(
+            worktree=self.worktree,
+            provider=run.provider,
+            model=run.model,
+            effort=run.effort,
+            env={"SC_CONVERSATION_SURFACE": self.surface},
+            conversation_id=run.conversation_id,
+            execution_prefix=("landlock-view", "--"),
+        )
+
+
+class RefusingRecoveryPreparer:
+    def recovery(self, _run: BrokerRun) -> ConversationContext:
+        raise AdapterError(
+            "CONVERSATION_LAUNCH_REFUSED",
+            "restricted execution view preflight failed",
+        )
+
+
 class BarrierAdapter(FakeAdapter):
     """Prove separate instances of one harness can stream concurrently."""
 
@@ -194,6 +258,20 @@ class ReconcileSequenceAdapter(FakeAdapter):
     ) -> ReconcileResult:
         self.reconciled += 1
         return next(self.results)
+
+
+class PostActivityStreamErrorAdapter(ReconcileSequenceAdapter):
+    """Lose a Kimi-shaped stream after activity, then reconcile exactly."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.harness = "kimi"
+
+    def stream(self, turn: NativeTurn) -> Iterator[NormalizedEvent]:
+        yield NormalizedEvent("session.started", {"session_ref": turn.session_ref})
+        yield NormalizedEvent("run.started", {"status": "running"})
+        yield NormalizedEvent("assistant.delta", {"text": "before stream loss"})
+        raise OSError("Kimi stdout stream closed while the process was live")
 
 
 class BlockingOpenCodeTransport:
@@ -270,6 +348,275 @@ class BlockingOpenCodeTransport:
         return events()
 
 
+class ProgressiveOpenCodeTransport:
+    """Emit typed 1.18.23 progress while synchronous /message is blocked."""
+
+    def __init__(self) -> None:
+        self.session_ref = "ses_progressive"
+        self.message_started = threading.Event()
+        self.progress_sent = threading.Event()
+        self.release_message = threading.Event()
+        self.requests: list[tuple[str, str]] = []
+
+    def request(self, method: str, path: str, *, query=None, body=None):
+        self.requests.append((method, path))
+        if method == "POST" and path == "/session":
+            return {"id": self.session_ref}
+        if method == "POST" and path.endswith("/message"):
+            self.message_started.set()
+            if not self.release_message.wait(2):
+                raise AssertionError("test did not release OpenCode message")
+            return {
+                "info": {
+                    "id": "msg_assistant",
+                    "sessionID": self.session_ref,
+                    "role": "assistant",
+                },
+                "parts": [
+                    {
+                        "id": "prt_reasoning",
+                        "messageID": "msg_assistant",
+                        "sessionID": self.session_ref,
+                        "type": "reasoning",
+                        "text": "thinking",
+                    },
+                    {
+                        "id": "prt_answer",
+                        "messageID": "msg_assistant",
+                        "sessionID": self.session_ref,
+                        "type": "text",
+                        "text": "answer",
+                    },
+                ],
+            }
+        if method == "POST" and path.endswith("/abort"):
+            self.release_message.set()
+            return True
+        raise AssertionError(f"unexpected OpenCode request: {method} {path}")
+
+    def stream(self, path: str, *, query=None):
+        def events():
+            yield {
+                "type": "session.idle",
+                "properties": {"sessionID": self.session_ref},
+            }
+            if not self.message_started.wait(2):
+                raise AssertionError("OpenCode prompt worker never started")
+            yield {
+                "type": "session.status",
+                "properties": {
+                    "sessionID": self.session_ref,
+                    "status": {"type": "busy"},
+                },
+            }
+            yield {
+                "type": "message.updated",
+                "properties": {
+                    "sessionID": self.session_ref,
+                    "info": {
+                        "id": "msg_assistant",
+                        "sessionID": self.session_ref,
+                        "role": "assistant",
+                    },
+                },
+            }
+            for part_id, part_type, text in (
+                ("prt_reasoning", "reasoning", "thinking"),
+                ("prt_answer", "text", "answer"),
+            ):
+                yield {
+                    "type": "message.part.updated",
+                    "properties": {
+                        "sessionID": self.session_ref,
+                        "part": {
+                            "id": part_id,
+                            "messageID": "msg_assistant",
+                            "sessionID": self.session_ref,
+                            "type": part_type,
+                            "text": "",
+                        },
+                    },
+                }
+                yield {
+                    "type": "message.part.delta",
+                    "properties": {
+                        "sessionID": self.session_ref,
+                        "messageID": "msg_assistant",
+                        "partID": part_id,
+                        "field": "text",
+                        "delta": text,
+                    },
+                }
+            yield {
+                "type": "message.part.updated",
+                "properties": {
+                    "sessionID": self.session_ref,
+                    "part": {
+                        "id": "prt_tool",
+                        "messageID": "msg_assistant",
+                        "sessionID": self.session_ref,
+                        "type": "tool",
+                        "callID": "call_1",
+                        "tool": "bash",
+                        "state": {"status": "running", "input": {}},
+                    },
+                },
+            }
+            self.progress_sent.set()
+            if not self.release_message.wait(2):
+                raise AssertionError("test did not release terminal SSE")
+            yield {
+                "type": "message.part.updated",
+                "properties": {
+                    "sessionID": self.session_ref,
+                    "part": {
+                        "id": "prt_tool",
+                        "messageID": "msg_assistant",
+                        "sessionID": self.session_ref,
+                        "type": "tool",
+                        "callID": "call_1",
+                        "tool": "bash",
+                        "state": {"status": "completed", "output": "ok"},
+                    },
+                },
+            }
+            yield {
+                "type": "session.idle",
+                "properties": {"sessionID": self.session_ref},
+            }
+
+        return events()
+
+
+class StubUrlResponse:
+    def __init__(self, payload: bytes = b"", *, lines=()) -> None:
+        self.payload = payload
+        self.lines = tuple(lines)
+        self.closed = False
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args) -> None:
+        self.close()
+
+    def read(self) -> bytes:
+        return self.payload
+
+    def __iter__(self):
+        return iter(self.lines)
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class RejectingOpenCodeFirstTurnEndpoint:
+    """Serve an idle session whose real HTTP prompt request returns 400."""
+
+    def __init__(self) -> None:
+        self.session_ref = "ses_empty_first_turn"
+        self.prompt_count = 0
+        self.native_messages: list[dict] = []
+        self.requests: list[tuple[str, str]] = []
+
+    def urlopen(self, request, *, timeout):
+        method = request.get_method()
+        path = urllib.parse.urlsplit(request.full_url).path
+        self.requests.append((method, path))
+        if method == "POST" and path == "/session":
+            return StubUrlResponse(
+                json.dumps({"id": self.session_ref}).encode()
+            )
+        if method == "GET" and path == "/event":
+            return StubUrlResponse(
+                lines=(
+                    (
+                        "data: "
+                        + json.dumps({
+                            "type": "session.idle",
+                            "properties": {"sessionID": self.session_ref},
+                        })
+                        + "\n"
+                    ).encode(),
+                    b"\n",
+                )
+            )
+        if method == "POST" and path.endswith("/message"):
+            self.prompt_count += 1
+            raise urllib.error.HTTPError(
+                request.full_url,
+                400,
+                "Bad Request",
+                {},
+                None,
+            )
+        if method == "GET" and path == f"/session/{self.session_ref}":
+            return StubUrlResponse(
+                json.dumps({"id": self.session_ref}).encode()
+            )
+        if method == "GET" and path == "/session/status":
+            return StubUrlResponse(
+                json.dumps({self.session_ref: {"type": "idle"}}).encode()
+            )
+        raise AssertionError(f"unexpected OpenCode request: {method} {path}")
+
+
+class ConcurrentOpenCodeFirstTurnTransport:
+    """Credential-free exact-session proof for parallel OpenCode prompts."""
+
+    def __init__(self, barrier: threading.Barrier, serial: int) -> None:
+        self.barrier = barrier
+        self.session_ref = f"ses_parallel_{serial}"
+        self.prompt_count = 0
+        self.requests: list[tuple[str, str, dict | None]] = []
+        self.crossed = False
+
+    def request(self, method: str, path: str, *, query=None, body=None):
+        self.requests.append((method, path, body))
+        if method == "POST" and path == "/session":
+            return {"id": self.session_ref}
+        if method == "POST" and path.endswith("/message"):
+            self.prompt_count += 1
+            return {
+                "info": {
+                    "role": "assistant",
+                    "sessionID": self.session_ref,
+                },
+                "parts": [{"type": "text", "text": self.session_ref}],
+            }
+        raise AssertionError(f"unexpected OpenCode request: {method} {path}")
+
+    def stream(self, path: str, *, query=None):
+        def events():
+            yield {
+                "type": "session.idle",
+                "properties": {"sessionID": self.session_ref},
+            }
+            yield {
+                "type": "session.status",
+                "properties": {
+                    "sessionID": self.session_ref,
+                    "status": {"type": "busy"},
+                },
+            }
+            self.barrier.wait(2)
+            self.crossed = True
+            yield {
+                "type": "message.part.delta",
+                "properties": {
+                    "sessionID": self.session_ref,
+                    "field": "text",
+                    "delta": self.session_ref,
+                },
+            }
+            yield {
+                "type": "session.idle",
+                "properties": {"sessionID": self.session_ref},
+            }
+
+        return events()
+
+
 class ConversationBrokerCase(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
@@ -301,7 +648,13 @@ class ConversationBrokerCase(unittest.TestCase):
     def tearDown(self) -> None:
         for broker in self.brokers:
             broker.stop()
+        for broker in self.brokers:
             broker.join(2)
+            self.assertFalse(broker.is_alive(), "broker dispatcher did not stop")
+            self.assertTrue(
+                broker.wait_idle(2),
+                "broker worker did not stop before fixture cleanup",
+            )
         self.tmp.cleanup()
 
     def connect(self) -> sqlite3.Connection:
@@ -324,18 +677,24 @@ class ConversationBrokerCase(unittest.TestCase):
         state: str = "queued",
         session_ref: str | None = None,
         harness: str = "codex",
+        provider: str | None = None,
+        model: str | None = None,
+        title: str | None = None,
     ) -> str:
         self.serial += 1
         key = f"conversation-{self.serial}"
         con = self.connect()
         con.execute(
             "INSERT INTO conversations "
-            "(shell_id,owner_user_id,harness,worktree,state,"
+            "(shell_id,owner_user_id,harness,provider,model,title,worktree,state,"
             "harness_session_ref,creation_idempotency_key,"
-            "creation_request_hash) VALUES (?,1,?,?,?,?,?,?)",
+            "creation_request_hash) VALUES (?,1,?,?,?,?,?,?,?,?,?)",
             (
                 shell_id,
                 harness,
+                provider,
+                model,
+                title,
                 str(self.worktree),
                 state,
                 session_ref,
@@ -777,6 +1136,32 @@ class StoreContractTest(ConversationBrokerCase):
         )
         self.assertEqual(json.loads(rows[-1]["payload"])["text"], "two")
 
+    def test_codex_usage_does_not_create_browser_analytics_rows(self) -> None:
+        conversation_id = self.add_conversation(harness="codex")
+        self.add_message(conversation_id)
+        store = BrokerStore(self.db_path)
+        run = store.claim_next("broker")
+        store.mark_starting(run.run_id, "broker")
+        store.mark_native_started(
+            run.run_id,
+            "broker",
+            NativeTurn("codex", "codex-session", "codex-run", self.worktree),
+        )
+
+        store.append_event(
+            run.run_id,
+            NormalizedEvent(
+                "usage",
+                {"tokens": {"input_tokens": 8, "output_tokens": 3}},
+            ),
+        )
+
+        with self.connect() as con:
+            count = con.execute(
+                "SELECT COUNT(*) FROM session_token_usage"
+            ).fetchone()[0]
+        self.assertEqual(count, 0)
+
     def test_terminal_observation_is_post_commit_and_cannot_fail_run(self) -> None:
         conversation_id = self.add_conversation()
         self.add_message(conversation_id)
@@ -903,6 +1288,8 @@ class StoreContractTest(ConversationBrokerCase):
         run = store.claim_next("broker")
         self.assertIsNotNone(run)
         self.assertEqual(run.message_id, message_id)
+        self.assertEqual(run.lifecycle_epoch, 2)
+        self.assertEqual(run.context().lifecycle_epoch, 2)
         store.mark_starting(run.run_id, "broker")
         store.mark_native_started(
             run.run_id,
@@ -1081,6 +1468,119 @@ class StoreContractTest(ConversationBrokerCase):
 
 
 class ServiceContractTest(ConversationBrokerCase):
+    def _assert_recovery_execution_view(self, harness: str, surface: str) -> None:
+        _conversation_id, _message_id, run_id = self.add_live_run(
+            state="running",
+            session_after=f"{harness}-session",
+            runner_ref=f"{harness}-run",
+            harness=harness,
+        )
+        adapter = RecoveryExecutionAdapter(harness)
+        preparer = RecoveryExecutionPreparer(self.worktree, surface)
+
+        broker = self.start_broker(
+            lambda _harness: adapter,
+            launch_preparer=preparer,
+        )
+
+        self.wait_run_state(run_id, "succeeded")
+        self.assertTrue(broker.wait_idle())
+        self.assertEqual(preparer.recovered, [run_id])
+        self.assertEqual(
+            adapter.execution_argvs,
+            [["landlock-view", "--", harness, "inspection-server"]],
+        )
+        self.assertEqual(adapter.surfaces, [surface])
+        self.assertEqual(adapter.started, 0)
+        self.assertEqual(adapter.resumed, 0)
+
+    def test_browser_codex_recovery_keeps_restricted_server_argv(self) -> None:
+        self._assert_recovery_execution_view("codex", "browser")
+
+    def test_sprint_opencode_recovery_keeps_restricted_server_argv(self) -> None:
+        _conversation_id, _message_id, run_id = self.add_live_run(
+            state="running",
+            session_after="opencode-session",
+            runner_ref="opencode-run",
+            harness="opencode",
+        )
+        preparer = RecoveryExecutionPreparer(self.worktree, "sprint")
+        restricted_server = mock.Mock()
+        restricted_server.poll.return_value = None
+        restricted_log = mock.Mock()
+        transport = mock.Mock()
+        transport.request.side_effect = (
+            {"id": "opencode-session"},
+            {"opencode-session": {"type": "idle"}},
+        )
+
+        with mock.patch.object(
+            opencode_adapter,
+            "ensure_server",
+        ) as ensure_server, mock.patch.object(
+            opencode_adapter,
+            "start_context_server",
+            return_value=(
+                restricted_server,
+                restricted_log,
+                "http://127.0.0.1:12345",
+                "password",
+            ),
+        ) as start_context_server, mock.patch.object(
+            opencode_adapter,
+            "UrlHttpTransport",
+            return_value=transport,
+        ):
+            broker = self.start_broker(
+                lambda _harness: OpenCodeAdapter(),
+                launch_preparer=preparer,
+            )
+            self.wait_run_state(run_id, "unknown")
+            self.assertTrue(broker.wait_idle())
+
+        ensure_server.assert_not_called()
+        recovered_context = start_context_server.call_args.args[0]
+        self.assertEqual(
+            recovered_context.execution_prefix,
+            ("landlock-view", "--"),
+        )
+        self.assertEqual(
+            recovered_context.env["SC_CONVERSATION_SURFACE"],
+            "sprint",
+        )
+        restricted_server.terminate.assert_called_once_with()
+        restricted_log.close.assert_called_once_with()
+
+    def test_recovery_preflight_refusal_prevents_adapter_dispatch(self) -> None:
+        _conversation_id, _message_id, run_id = self.add_live_run(
+            state="running",
+            session_after="native-session",
+            runner_ref="native-run",
+        )
+        adapter = FakeAdapter()
+
+        broker = self.start_broker(
+            lambda _harness: adapter,
+            launch_preparer=RefusingRecoveryPreparer(),
+        )
+
+        self.wait_run_state(run_id, "unknown")
+        self.assertTrue(broker.wait_idle())
+        self.assertEqual(adapter.started, 0)
+        self.assertEqual(adapter.resumed, 0)
+        self.assertEqual(adapter.reconciled, 0)
+        with self.connect() as con:
+            row = con.execute(
+                "SELECT error_code,error_detail FROM conversation_runs "
+                "WHERE run_id=?",
+                (run_id,),
+            ).fetchone()
+        self.assertEqual(row["error_code"], "CONVERSATION_LAUNCH_REFUSED")
+        self.assertEqual(
+            row["error_detail"],
+            "restricted execution view preflight failed",
+        )
+
     def test_routine_dispatch_requires_post_commit_notification(self) -> None:
         adapters: list[FakeAdapter] = []
 
@@ -1335,6 +1835,88 @@ class ServiceContractTest(ConversationBrokerCase):
         self.assertTrue(all(adapter.started == 1 for adapter in adapters))
         self.assertTrue(all(adapter.crossed for adapter in adapters))
 
+    def test_opencode_concurrent_first_turns_submit_once_to_exact_sessions(
+        self,
+    ) -> None:
+        barrier = threading.Barrier(2)
+        transports: list[ConcurrentOpenCodeFirstTurnTransport] = []
+
+        def factory(harness: str) -> OpenCodeAdapter:
+            self.assertEqual(harness, "opencode")
+            transport = ConcurrentOpenCodeFirstTurnTransport(
+                barrier, len(transports) + 1
+            )
+            transports.append(transport)
+            return OpenCodeAdapter(
+                transport=transport,
+                shell_runtime_dir=self.root / "opencode-shells",
+            )
+
+        broker = self.start_broker(factory)
+        first = self.add_conversation(
+            shell_id=1,
+            harness="opencode",
+            provider="openai",
+            model="gpt-test",
+        )
+        second = self.add_conversation(
+            shell_id=2,
+            harness="opencode",
+            provider="openai",
+            model="gpt-test",
+        )
+        message_ids = (self.add_message(first), self.add_message(second))
+        broker.notify()
+
+        deadline = time.monotonic() + 3
+        rows = []
+        while time.monotonic() < deadline:
+            with self.connect() as con:
+                rows = con.execute(
+                    "SELECT run_id,trigger_message_id,state,harness_session_after "
+                    "FROM conversation_runs WHERE trigger_message_id IN (?,?) "
+                    "ORDER BY trigger_message_id",
+                    message_ids,
+                ).fetchall()
+            if len(rows) == 2 and all(row["state"] == "succeeded" for row in rows):
+                break
+            time.sleep(0.01)
+
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(
+            {row["trigger_message_id"] for row in rows},
+            set(message_ids),
+        )
+        self.assertEqual(
+            {row["harness_session_after"] for row in rows},
+            {transport.session_ref for transport in transports},
+        )
+        self.assertEqual([transport.prompt_count for transport in transports], [1, 1])
+        self.assertTrue(all(transport.crossed for transport in transports))
+        for transport in transports:
+            self.assertEqual(
+                [request[:2] for request in transport.requests],
+                [
+                    ("POST", "/session"),
+                    ("POST", f"/session/{transport.session_ref}/message"),
+                ],
+            )
+            prompt = transport.requests[1][2]
+            self.assertEqual(
+                prompt["model"],
+                {"providerID": "openai", "modelID": "gpt-test"},
+            )
+        with self.connect() as con:
+            terminal_counts = {
+                int(row["run_id"]): con.execute(
+                    "SELECT COUNT(*) FROM conversation_events "
+                    "WHERE run_id=? AND event_type='run.completed'",
+                    (row["run_id"],),
+                ).fetchone()[0]
+                for row in rows
+            }
+        self.assertEqual(set(terminal_counts.values()), {1})
+
     def test_transient_lease_renewal_contention_stays_recoverable(
         self,
     ) -> None:
@@ -1376,6 +1958,71 @@ class ServiceContractTest(ConversationBrokerCase):
         self.assertEqual(row["state"], "succeeded")
         self.assertGreaterEqual(attempts, 2)
         self.assertEqual(adapter.reconciled, 2)
+
+    def test_post_activity_stream_error_reconciles_without_replay(self) -> None:
+        adapter = PostActivityStreamErrorAdapter()
+        broker = self.start_broker(
+            lambda harness: adapter if harness == "kimi" else None,
+            recovery_seconds=1,
+        )
+        conversation_id = self.add_conversation(harness="kimi")
+        message_id = self.add_message(conversation_id)
+        broker.notify()
+
+        deadline = time.monotonic() + 3
+        row = None
+        events = []
+        while time.monotonic() < deadline:
+            with self.connect() as con:
+                row = con.execute(
+                    "SELECT run_id,state,error_code,error_detail "
+                    "FROM conversation_runs WHERE trigger_message_id=?",
+                    (message_id,),
+                ).fetchone()
+                if row is not None:
+                    events = con.execute(
+                        "SELECT event_type,payload FROM conversation_events "
+                        "WHERE run_id=? ORDER BY sequence",
+                        (row["run_id"],),
+                    ).fetchall()
+            if row is not None and row["state"] == "succeeded":
+                break
+            time.sleep(0.01)
+
+        if row is None:
+            self.fail("post-activity stream failure produced no durable run")
+        self.assertEqual(tuple(row)[1:], ("succeeded", None, None))
+        self.assertEqual(adapter.started, 1)
+        self.assertEqual(adapter.resumed, 0)
+        self.assertEqual(adapter.reconciled, 2)
+        self.assertEqual(
+            [event["event_type"] for event in events],
+            [
+                "session.started",
+                "run.started",
+                "assistant.delta",
+                "run.completed",
+            ],
+        )
+        terminal = json.loads(events[-1]["payload"])
+        self.assertEqual(
+            terminal,
+            {
+                "detail": "native run completed",
+                "outcome": "succeeded",
+                "proven": True,
+                "reconciled": True,
+            },
+        )
+        with self.connect() as con:
+            self.assertEqual(
+                con.execute(
+                    "SELECT COUNT(*) FROM conversation_runs "
+                    "WHERE conversation_id=?",
+                    (conversation_id,),
+                ).fetchone()[0],
+                1,
+            )
 
     def test_kimi_native_identities_are_persisted_before_first_event(
         self,
@@ -1611,6 +2258,165 @@ class ServiceContractTest(ConversationBrokerCase):
         )
         self.assertEqual(transport.message_count, 3)
 
+    def test_opencode_typed_progress_is_durable_before_message_returns(
+        self,
+    ) -> None:
+        transport = ProgressiveOpenCodeTransport()
+        self.addCleanup(transport.release_message.set)
+        adapter = OpenCodeAdapter(
+            transport=transport,
+            shell_runtime_dir=self.root / "opencode-shells",
+        )
+        broker = self.start_broker(
+            lambda harness: adapter if harness == "opencode" else None
+        )
+        conversation_id = self.add_conversation(harness="opencode")
+        message_id = self.add_message(conversation_id)
+        broker.notify()
+        self.assertTrue(transport.message_started.wait(1))
+        self.assertTrue(transport.progress_sent.wait(1))
+
+        deadline = time.monotonic() + 2
+        run_id = None
+        projected: list[tuple[str, dict]] = []
+        while time.monotonic() < deadline:
+            con = self.connect()
+            run = con.execute(
+                "SELECT run_id,state FROM conversation_runs "
+                "WHERE trigger_message_id=?",
+                (message_id,),
+            ).fetchone()
+            if run is not None:
+                run_id = int(run["run_id"])
+                projected = [
+                    (row["event_type"], json.loads(row["payload"]))
+                    for row in con.execute(
+                        "SELECT event_type,payload FROM conversation_events "
+                        "WHERE run_id=? ORDER BY sequence",
+                        (run_id,),
+                    )
+                ]
+            con.close()
+            if any(event_type == "tool.started" for event_type, _ in projected):
+                break
+            time.sleep(0.01)
+
+        self.assertIsNotNone(run_id)
+        assistant = [
+            (payload["text"], payload["segment"])
+            for event_type, payload in projected
+            if event_type == "assistant.delta"
+        ]
+        self.assertEqual(
+            assistant,
+            [("thinking", "reasoning"), ("answer", "answer")],
+        )
+        self.assertEqual(
+            [event_type for event_type, _ in projected].count("tool.started"),
+            1,
+        )
+        self.assertNotIn("run.completed", [item[0] for item in projected])
+
+        transport.release_message.set()
+        self.wait_run_state(run_id, "succeeded")
+        con = self.connect()
+        terminals = con.execute(
+            "SELECT event_type FROM conversation_events "
+            "WHERE run_id=? AND event_type IN "
+            "('run.completed','run.failed','run.interrupted')",
+            (run_id,),
+        ).fetchall()
+        con.close()
+        self.assertEqual([row["event_type"] for row in terminals], [
+            "run.completed"
+        ])
+
+    def test_opencode_first_turn_submission_failure_is_not_reclassified_idle(
+        self,
+    ) -> None:
+        endpoint = RejectingOpenCodeFirstTurnEndpoint()
+        transport = base_adapter.UrlHttpTransport("http://opencode.test")
+        adapter = OpenCodeAdapter(
+            transport=transport,
+            shell_runtime_dir=self.root / "opencode-shells",
+        )
+        broker = self.start_broker(
+            lambda harness: adapter if harness == "opencode" else None,
+        )
+        conversation_id = self.add_conversation(harness="opencode")
+        message_id = self.add_message(conversation_id)
+        with mock.patch.object(
+            base_adapter.urllib.request,
+            "urlopen",
+            side_effect=endpoint.urlopen,
+        ):
+            broker.notify()
+
+            deadline = time.monotonic() + 3
+            row = None
+            while time.monotonic() < deadline:
+                with self.connect() as con:
+                    row = con.execute(
+                        "SELECT run_id,state,harness_session_after,error_code,"
+                        "error_detail FROM conversation_runs "
+                        "WHERE trigger_message_id=?",
+                        (message_id,),
+                    ).fetchone()
+                if row is not None and row["state"] in {
+                    "failed", "unknown", "cancelled", "succeeded"
+                }:
+                    break
+                time.sleep(0.01)
+            self.assertTrue(broker.wait_idle())
+
+        if row is None:
+            self.fail("OpenCode first-turn failure produced no durable run")
+        self.assertEqual(row["state"], "unknown")
+        self.assertEqual(row["harness_session_after"], endpoint.session_ref)
+        self.assertEqual(row["error_code"], "HARNESS_SUBMISSION_FAILED")
+        self.assertEqual(
+            row["error_detail"],
+            f"POST /session/{endpoint.session_ref}/message returned HTTP 400",
+        )
+        self.assertEqual(endpoint.prompt_count, 1)
+        self.assertEqual(endpoint.native_messages, [])
+        self.assertEqual(
+            endpoint.requests,
+            [
+                ("POST", "/session"),
+                ("GET", "/event"),
+                ("POST", f"/session/{endpoint.session_ref}/message"),
+            ],
+        )
+        with self.connect() as con:
+            self.assertEqual(
+                con.execute(
+                    "SELECT COUNT(*) FROM conversation_runs "
+                    "WHERE conversation_id=?",
+                    (conversation_id,),
+                ).fetchone()[0],
+                1,
+            )
+
+    def test_opencode_sse_handle_closes_the_owned_http_response(self) -> None:
+        response = StubUrlResponse(lines=(
+            b'data: {"type":"session.idle","properties":{}}\n',
+            b"\n",
+        ))
+        transport = base_adapter.UrlHttpTransport("http://opencode.test")
+        with mock.patch.object(
+            base_adapter.urllib.request,
+            "urlopen",
+            return_value=response,
+        ):
+            stream = transport.stream("/event")
+
+        self.assertEqual(next(iter(stream))["type"], "session.idle")
+        stream.close()
+        self.assertTrue(response.closed)
+        with self.assertRaises(StopIteration):
+            next(iter(stream))
+
     def test_starting_crash_without_exact_identity_becomes_unknown(self) -> None:
         _conversation, _message, run_id = self.add_live_run(state="starting")
         adapter = FakeAdapter()
@@ -1733,6 +2539,577 @@ class ServiceContractTest(ConversationBrokerCase):
         self.assertEqual(adapter.started, 1)
         self.assertEqual(adapter.resumed, 0)
         self.assertTrue(broker.wait_idle())
+
+
+class BootSeamPreparer:
+    """The real conversation_boot seam as the broker's launch_preparer.
+
+    Exercises binding, validation, and byte restoration against the test DB
+    without dragging in the rest of run.prepare_launch; compose is a probe so
+    tests can count compositions and change the volatile shell state between
+    turns. ``last_content`` is the exact byte string this turn resolved and
+    materialized, for dispatch-edge assertions."""
+
+    def __init__(
+        self,
+        db_path: Path,
+        compose,
+        *,
+        archive_id: int,
+        write_failures: int = 0,
+    ) -> None:
+        self.db_path = db_path
+        self.compose = compose
+        self.archive_id = archive_id
+        self.write_failures = write_failures
+        self.compose_calls = 0
+        self.last_content: str | None = None
+
+    def __call__(self, broker_run: BrokerRun):
+        con = sqlite3.connect(self.db_path)
+        con.row_factory = sqlite3.Row
+        try:
+            directive = BootDirective(
+                conversation_id=broker_run.conversation_id,
+                phase="resume" if broker_run.session_before else "start",
+            )
+
+            def composing() -> str:
+                self.compose_calls += 1
+                return self.compose()
+
+            content = conversation_boot.resolve_boot(con, directive, composing)
+        finally:
+            con.close()
+        if self.write_failures:
+            self.write_failures -= 1
+            raise OSError("injected boot write failure")
+        conversation_boot.write_boot_files(Path(broker_run.worktree), content)
+        self.last_content = content
+        return broker_run.context(), self.archive_id
+
+
+class BootAssertingAdapter(FakeAdapter):
+    """At each native dispatch edge, both worktree boot files must already
+    hold the exact bytes this turn's preparation resolved."""
+
+    def __init__(self, preparer: BootSeamPreparer, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self.preparer = preparer
+        self.messages: list[str] = []
+        self.resume_sessions: list[str] = []
+
+    def _assert_boot_owned(self, context: ConversationContext) -> None:
+        expected = self.preparer.last_content
+        if expected is None:
+            raise AssertionError("native dispatch before boot preparation")
+        for name in conversation_boot.BOOT_FILES:
+            actual = (context.worktree / name).read_bytes()
+            if actual != expected.encode("utf-8"):
+                raise AssertionError(f"{name} drifted from the bound snapshot")
+
+    def start(self, context: ConversationContext, message: str) -> NativeTurn:
+        self.messages.append(message)
+        self._assert_boot_owned(context)
+        return super().start(context, message)
+
+    def resume(
+        self,
+        session_ref: str,
+        context: ConversationContext,
+        message: str,
+    ) -> NativeTurn:
+        self.messages.append(message)
+        self.resume_sessions.append(session_ref)
+        self._assert_boot_owned(context)
+        return super().resume(session_ref, context, message)
+
+
+class BootSnapshotContractTest(ConversationBrokerCase):
+    """Spec #163 broker boundaries: bind before start, exact reuse on resume."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        con = self.connect()
+        self.archive_id = int(
+            con.execute(
+                "INSERT INTO shell_memory_archives "
+                "(shell_id,session_id,date,full_narrative) "
+                "VALUES (1,'9001','2026-08-19','boot snapshot tests')"
+            ).lastrowid
+        )
+        con.commit()
+        con.close()
+        self.boot_state = {"marker": "one"}
+
+    def compose(self) -> str:
+        return f"boot marker {self.boot_state['marker']}"
+
+    def stamp_ledger(self, applied_at: str = "2000-01-01 00:00:00") -> None:
+        """Mark the 0224 migration applied, so later conversations are new."""
+        con = self.connect()
+        con.execute(
+            "CREATE TABLE IF NOT EXISTS schema_migrations ("
+            "  filename TEXT PRIMARY KEY,"
+            "  applied_at TEXT NOT NULL DEFAULT (datetime('now')))"
+        )
+        con.execute(
+            "INSERT OR REPLACE INTO schema_migrations (filename,applied_at) "
+            "VALUES ('0224_conversation_boot_snapshots.sql',?)",
+            (applied_at,),
+        )
+        con.commit()
+        con.close()
+
+    def snapshot_row(self, conversation_id: str):
+        con = self.connect()
+        row = con.execute(
+            "SELECT content,content_sha256,content_bytes,binding_origin "
+            "FROM conversation_boot_snapshots WHERE conversation_id=?",
+            (conversation_id,),
+        ).fetchone()
+        con.close()
+        return row
+
+    def requeue(self, conversation_id: str) -> int:
+        """Post the next message as the API would: conversation back to queued."""
+        con = self.connect()
+        con.execute(
+            "UPDATE conversations SET state='queued' WHERE conversation_id=?",
+            (conversation_id,),
+        )
+        con.commit()
+        con.close()
+        return self.add_message(conversation_id)
+
+    def add_message_body(self, conversation_id: str, body: str) -> int:
+        self.serial += 1
+        key = f"message-{self.serial}"
+        con = self.connect()
+        message_id = con.execute(
+            "INSERT INTO conversation_messages "
+            "(conversation_id,sender_kind,sender_ref,message_kind,body,"
+            "idempotency_key,request_hash,state) "
+            "VALUES (?,'user','1','prompt',?,?,?,'queued')",
+            (conversation_id, body, key, f"hash-{key}"),
+        ).lastrowid
+        con.execute(
+            "INSERT INTO conversation_outbox (conversation_id,message_id) "
+            "VALUES (?,?)",
+            (conversation_id, message_id),
+        )
+        con.commit()
+        con.close()
+        return int(message_id)
+
+    def file_states(self) -> dict:
+        return {
+            name: (
+                (self.worktree / name).read_bytes(),
+                (self.worktree / name).stat().st_mtime_ns,
+            )
+            for name in conversation_boot.BOOT_FILES
+        }
+
+    def test_first_turn_binds_before_native_start(self) -> None:
+        self.stamp_ledger()
+        preparer = BootSeamPreparer(
+            self.db_path, self.compose, archive_id=self.archive_id
+        )
+        adapter = BootAssertingAdapter(preparer)
+        broker = self.start_broker(
+            lambda _harness: adapter, launch_preparer=preparer
+        )
+        conversation_id = self.add_conversation()
+        message_id = self.add_message(conversation_id)
+        broker.notify()
+
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline:
+            con = self.connect()
+            state = con.execute(
+                "SELECT state FROM conversation_runs WHERE trigger_message_id=?",
+                (message_id,),
+            ).fetchone()
+            con.close()
+            if state and state[0] == "succeeded":
+                break
+            time.sleep(0.01)
+        else:
+            self.fail("first turn did not finish")
+
+        row = self.snapshot_row(conversation_id)
+        self.assertIsNotNone(row)
+        self.assertEqual(row["content"], "boot marker one")
+        self.assertEqual(row["binding_origin"], "new_conversation")
+        self.assertEqual(adapter.messages, ["hello"])
+        self.assertEqual(preparer.compose_calls, 1)
+
+    def test_resume_reuses_bytes_and_never_rewrites_matching_files(self) -> None:
+        self.stamp_ledger()
+        preparer = BootSeamPreparer(
+            self.db_path, self.compose, archive_id=self.archive_id
+        )
+        adapter = BootAssertingAdapter(preparer)
+        broker = self.start_broker(
+            lambda _harness: adapter, launch_preparer=preparer
+        )
+        conversation_id = self.add_conversation()
+        first_message = self.add_message(conversation_id)
+        broker.notify()
+        self.wait_message_run(conversation_id, first_message, "succeeded")
+        digest = self.snapshot_row(conversation_id)["content_sha256"]
+        files = self.file_states()
+
+        # Volatile boot inputs change; the conversation's bytes must not.
+        self.boot_state["marker"] = "two"
+        second_message = self.requeue(conversation_id)
+        broker.notify()
+        self.wait_message_run(conversation_id, second_message, "succeeded")
+
+        self.assertEqual(adapter.started, 1)
+        self.assertEqual(adapter.resumed, 1)
+        self.assertEqual(adapter.messages, ["hello", "hello"])
+        self.assertEqual(preparer.compose_calls, 1)
+        self.assertEqual(
+            self.snapshot_row(conversation_id)["content_sha256"], digest
+        )
+        self.assertEqual(self.file_states(), files)
+
+    def test_resume_restores_files_replaced_by_another_chat(self) -> None:
+        self.stamp_ledger()
+        preparer = BootSeamPreparer(
+            self.db_path, self.compose, archive_id=self.archive_id
+        )
+        adapter = BootAssertingAdapter(preparer)
+        broker = self.start_broker(
+            lambda _harness: adapter, launch_preparer=preparer
+        )
+        conversation_id = self.add_conversation()
+        first_message = self.add_message(conversation_id)
+        broker.notify()
+        self.wait_message_run(conversation_id, first_message, "succeeded")
+        digest = self.snapshot_row(conversation_id)["content_sha256"]
+
+        # A different chat (or any external lifecycle) replaced the shared
+        # worktree files; resume must restore the stored bytes before dispatch.
+        for name in conversation_boot.BOOT_FILES:
+            (self.worktree / name).write_text("another chat's boot")
+        second_message = self.requeue(conversation_id)
+        broker.notify()
+        self.wait_message_run(conversation_id, second_message, "succeeded")
+
+        self.assertEqual(adapter.resumed, 1)
+        self.assertEqual(preparer.compose_calls, 1)
+        self.assertEqual(
+            self.snapshot_row(conversation_id)["content_sha256"], digest
+        )
+        for name in conversation_boot.BOOT_FILES:
+            self.assertEqual(
+                (self.worktree / name).read_bytes(),
+                b"boot marker one",
+            )
+
+    def test_boot_write_failure_keeps_snapshot_and_retry_does_not_recompose(
+        self,
+    ) -> None:
+        self.stamp_ledger()
+        preparer = BootSeamPreparer(
+            self.db_path,
+            self.compose,
+            archive_id=self.archive_id,
+            write_failures=1,
+        )
+        adapter = BootAssertingAdapter(preparer)
+        broker = self.start_broker(
+            lambda _harness: adapter, launch_preparer=preparer
+        )
+        conversation_id = self.add_conversation()
+        first_message = self.add_message(conversation_id)
+        broker.notify()
+        self.wait_message_run(conversation_id, first_message, "failed")
+
+        # Committed before the failed write; no prompt ever reached a native
+        # session for the first message.
+        row = self.snapshot_row(conversation_id)
+        self.assertIsNotNone(row)
+        self.assertEqual(adapter.started, 0)
+        self.assertEqual(adapter.resumed, 0)
+
+        second_message = self.requeue(conversation_id)
+        broker.notify()
+        self.wait_message_run(conversation_id, second_message, "succeeded")
+
+        self.assertEqual(preparer.compose_calls, 1)
+        self.assertEqual(
+            self.snapshot_row(conversation_id)["content_sha256"],
+            row["content_sha256"],
+        )
+        self.assertEqual(adapter.messages, ["hello"])
+
+    def test_unbound_legacy_conversation_adopts_once_on_first_resume(
+        self,
+    ) -> None:
+        # No schema_migrations ledger in this fixture: the conversation cannot
+        # be proven post-migration, so the legacy adoption rule applies.
+        preparer = BootSeamPreparer(
+            self.db_path, self.compose, archive_id=self.archive_id
+        )
+        adapter = BootAssertingAdapter(
+            preparer, native_session_ref="native-old"
+        )
+        broker = self.start_broker(
+            lambda _harness: adapter, launch_preparer=preparer
+        )
+        conversation_id = self.add_conversation(session_ref="native-old")
+        first_message = self.add_message(conversation_id)
+        broker.notify()
+        self.wait_message_run(conversation_id, first_message, "succeeded")
+
+        row = self.snapshot_row(conversation_id)
+        self.assertIsNotNone(row)
+        self.assertEqual(row["binding_origin"], "legacy_first_resume")
+        self.assertEqual(adapter.resumed, 1)
+        self.assertEqual(adapter.started, 0)
+
+        second_message = self.requeue(conversation_id)
+        broker.notify()
+        self.wait_message_run(conversation_id, second_message, "succeeded")
+        self.assertEqual(preparer.compose_calls, 1)
+        self.assertEqual(
+            self.snapshot_row(conversation_id)["content_sha256"],
+            row["content_sha256"],
+        )
+        self.assertEqual(adapter.resumed, 2)
+
+    def test_unbound_post_migration_conversation_fails_closed(self) -> None:
+        self.stamp_ledger()
+
+        preparer = BootSeamPreparer(
+            self.db_path, self.compose, archive_id=self.archive_id
+        )
+        adapter = BootAssertingAdapter(preparer)
+        broker = self.start_broker(
+            lambda _harness: adapter, launch_preparer=preparer
+        )
+        conversation_id = self.add_conversation(session_ref="native-new")
+        message_id = self.add_message(conversation_id)
+        broker.notify()
+        self.wait_message_run(conversation_id, message_id, "failed")
+
+        con = self.connect()
+        error = con.execute(
+            "SELECT error_code FROM conversation_runs "
+            "WHERE trigger_message_id=?",
+            (message_id,),
+        ).fetchone()[0]
+        con.close()
+        self.assertEqual(error, "BOOT_SNAPSHOT_MISSING")
+        self.assertIsNone(self.snapshot_row(conversation_id))
+        self.assertEqual(adapter.started, 0)
+        self.assertEqual(adapter.resumed, 0)
+        self.assertEqual(preparer.compose_calls, 0)
+
+    def wait_message_run(
+        self, conversation_id: str, message_id: int, state: str
+    ) -> None:
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline:
+            con = self.connect()
+            row = con.execute(
+                "SELECT state FROM conversation_runs "
+                "WHERE conversation_id=? AND trigger_message_id=?",
+                (conversation_id, message_id),
+            ).fetchone()
+            con.close()
+            if row is not None and row[0] == state:
+                return
+            time.sleep(0.01)
+        self.fail(
+            f"message {message_id} run did not reach {state}"
+        )
+
+    def test_close_reopen_with_rotation_restores_original_snapshot(self) -> None:
+        self.stamp_ledger()
+        preparer = BootSeamPreparer(
+            self.db_path, self.compose, archive_id=self.archive_id
+        )
+        adapter = BootAssertingAdapter(
+            preparer, native_session_ref="native-A"
+        )
+        broker = self.start_broker(
+            lambda _harness: adapter, launch_preparer=preparer
+        )
+        chat_a = self.add_conversation()
+        first = self.add_message(chat_a)
+        broker.notify()
+        self.wait_message_run(chat_a, first, "succeeded")
+        digest_a = self.snapshot_row(chat_a)["content_sha256"]
+        self.assertEqual(
+            self.snapshot_row(chat_a)["content"], "boot marker one"
+        )
+
+        # Close A, then run a different chat B on the same shell: the shared
+        # worktree files move to B's freshly composed snapshot.
+        con = self.connect()
+        con.execute(
+            "UPDATE conversations SET state='closed',closed_at=datetime('now') "
+            "WHERE conversation_id=?",
+            (chat_a,),
+        )
+        con.commit()
+        con.close()
+        self.boot_state["marker"] = "two"
+        chat_b = self.add_conversation()
+        second = self.add_message(chat_b)
+        broker.notify()
+        self.wait_message_run(chat_b, second, "succeeded")
+        digest_b = self.snapshot_row(chat_b)["content_sha256"]
+        self.assertNotEqual(digest_a, digest_b)
+        self.assertEqual(
+            self.snapshot_row(chat_b)["content"], "boot marker two"
+        )
+        for name in conversation_boot.BOOT_FILES:
+            self.assertEqual(
+                (self.worktree / name).read_bytes(), b"boot marker two"
+            )
+
+        # Reopen A (the API's closed->idle walk + active-chat rotation): the
+        # API auto-closes the idle open chat B first, then A's original
+        # snapshot is restored and the original native session resumes.
+        con = self.connect()
+        con.execute(
+            "UPDATE conversations SET state='closed',closed_at=datetime('now') "
+            "WHERE conversation_id=?",
+            (chat_b,),
+        )
+        con.execute(
+            "UPDATE conversations SET state='idle',closed_at=NULL "
+            "WHERE conversation_id=?",
+            (chat_a,),
+        )
+        con.execute(
+            "INSERT OR REPLACE INTO active_shell_chats (shell_id,chat_id) "
+            "VALUES (1,?)",
+            (chat_a,),
+        )
+        con.commit()
+        con.close()
+        third = self.requeue(chat_a)
+        broker.notify()
+        self.wait_message_run(chat_a, third, "succeeded")
+
+        self.assertEqual(adapter.started, 2)  # A's first turn, B's first turn
+        self.assertEqual(adapter.resumed, 1)  # A's reopen resumes native-A
+        self.assertEqual(preparer.compose_calls, 2)  # one per conversation
+        self.assertEqual(
+            self.snapshot_row(chat_a)["content_sha256"], digest_a
+        )
+        for name in conversation_boot.BOOT_FILES:
+            self.assertEqual(
+                (self.worktree / name).read_bytes(), b"boot marker one"
+            )
+
+    def test_broker_restart_between_turns_reuses_the_snapshot(self) -> None:
+        self.stamp_ledger()
+        preparer = BootSeamPreparer(
+            self.db_path, self.compose, archive_id=self.archive_id
+        )
+        first_adapter = BootAssertingAdapter(preparer)
+        broker = self.start_broker(
+            lambda _harness: first_adapter, launch_preparer=preparer
+        )
+        conversation_id = self.add_conversation()
+        first = self.add_message(conversation_id)
+        broker.notify()
+        self.wait_message_run(conversation_id, first, "succeeded")
+        digest = self.snapshot_row(conversation_id)["content_sha256"]
+        broker.stop()
+        broker.join(2)
+        self.assertFalse(broker.is_alive())
+
+        # Engine restart: a fresh broker process resumes the same conversation.
+        second_adapter = BootAssertingAdapter(preparer)
+        restarted = self.start_broker(
+            lambda _harness: second_adapter, launch_preparer=preparer
+        )
+        second = self.requeue(conversation_id)
+        restarted.notify()
+        self.wait_message_run(conversation_id, second, "succeeded")
+
+        self.assertEqual(preparer.compose_calls, 1)
+        self.assertEqual(second_adapter.resumed, 1)
+        self.assertEqual(second_adapter.started, 0)
+        self.assertEqual(
+            self.snapshot_row(conversation_id)["content_sha256"], digest
+        )
+
+    def test_every_supported_harness_resumes_exact_session_and_prompt(self) -> None:
+        """Claude, Codex, Kimi, and OpenCode chats each bind one snapshot and
+        resume the persisted native session with only the next queued prompt."""
+        self.stamp_ledger()
+        preparer = BootSeamPreparer(
+            self.db_path, self.compose, archive_id=self.archive_id
+        )
+        adapters = {
+            harness: BootAssertingAdapter(
+                preparer,
+                harness=harness,
+                native_session_ref=f"native-{harness}",
+            )
+            for harness in ("claude", "codex", "kimi", "opencode")
+        }
+        broker = self.start_broker(
+            lambda harness: adapters[harness], launch_preparer=preparer
+        )
+        for harness, adapter in adapters.items():
+            with self.subTest(harness=harness):
+                conversation_id = self.add_conversation(harness=harness)
+                first = self.add_message_body(
+                    conversation_id, f"first {harness} prompt"
+                )
+                broker.notify()
+                self.wait_message_run(conversation_id, first, "succeeded")
+                digest = self.snapshot_row(conversation_id)["content_sha256"]
+
+                con = self.connect()
+                con.execute(
+                    "UPDATE conversations SET state='queued' "
+                    "WHERE conversation_id=?",
+                    (conversation_id,),
+                )
+                con.commit()
+                con.close()
+                second = self.add_message_body(
+                    conversation_id, f"second {harness} prompt"
+                )
+                broker.notify()
+                self.wait_message_run(conversation_id, second, "succeeded")
+
+                self.assertEqual(adapter.started, 1)
+                self.assertEqual(adapter.resumed, 1)
+                self.assertEqual(
+                    adapter.messages,
+                    [f"first {harness} prompt", f"second {harness} prompt"],
+                )
+                self.assertEqual(
+                    adapter.resume_sessions, [f"native-{harness}"]
+                )
+                self.assertEqual(
+                    self.snapshot_row(conversation_id)["content_sha256"],
+                    digest,
+                )
+                con = self.connect()
+                con.execute(
+                    "UPDATE conversations SET state='closed',"
+                    "closed_at=datetime('now') WHERE conversation_id=?",
+                    (conversation_id,),
+                )
+                con.commit()
+                con.close()
+
+        # Exactly one composition per conversation across all four harnesses.
+        self.assertEqual(preparer.compose_calls, 4)
 
 
 if __name__ == "__main__":

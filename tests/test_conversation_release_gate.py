@@ -11,6 +11,7 @@ import time
 import unittest
 from collections.abc import Iterator
 from contextlib import closing
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest import mock
 
@@ -192,6 +193,114 @@ class ReleaseGateAdapter:
 
 
 class CrossHarnessReleaseGateTest(unittest.TestCase):
+    @staticmethod
+    def runtime_status(harness: str) -> dict:
+        versions = {
+            "claude": ("2.1.222", "2.1.220", "2.2.0"),
+            "codex": ("0.145.0", "0.145.0", "0.147.0"),
+            "kimi": ("0.33.0", "0.30.0", "0.34.0"),
+            "opencode": ("1.18.9", "1.18.9", "1.19.0"),
+        }
+        version, minimum, maximum = versions[harness]
+        scope = conversation_routes.model_catalog.harness_versions.runtime_scope()
+        return {
+            "harness": harness, **scope, "version": version,
+            "compatibility": "verified", "minimum_version": minimum,
+            "maximum_version_exclusive": maximum,
+            "verified_version": version, "error": None,
+        }
+
+    @classmethod
+    def controlled_evidence(cls, harness: str, selector: str) -> dict:
+        status = cls.runtime_status(harness)
+        return {
+            "runtime_status": status,
+            "runtime_scope": {
+                "runtime": status["runtime"],
+                "runtime_identity": status["runtime_identity"],
+            },
+            "source_fingerprint": "f" * 64,
+            **(
+                {"advertised_options_by_model": {selector: ["low", "high"]}}
+                if harness == "opencode"
+                else {}
+            ),
+        }
+
+    @classmethod
+    def seed_controlled_routes(cls, con: sqlite3.Connection) -> None:
+        now = datetime.now(timezone.utc).isoformat()
+        runtime = cls.runtime_status("codex")["runtime"]
+        con.execute(
+            "INSERT INTO model_catalog_generations ("
+            "generation_id,payload_version,contract_version,started_at,"
+            "completed_at,state,runtime,source_summary,harness_versions,"
+            "source_fingerprints,error_summary,payload_digest"
+            ") VALUES (?,?,?,?,?,'successful',?,'[]','{}','{}',NULL,?)",
+            ("a" * 32, 6, 2, now, now, runtime, "b" * 64),
+        )
+        models = {
+            row[0]: row[1]
+            for row in con.execute(
+                "SELECT harness,model FROM flavor_defaults WHERE flavor='dev'"
+            )
+            if row[0] in REQUIRED_HARNESSES and row[1]
+        }
+        models["opencode"] = "openai/test-model"
+        evidence_kinds = {
+            "claude": "claude-portable-manifest",
+            "codex": "codex-model-cache",
+            "kimi": "kimi-alias-config",
+            "opencode": "opencode-connected-variant",
+        }
+        sources = {
+            "claude": "claude-cli", "codex": "codex-cache",
+            "kimi": "kimi-config", "opencode": "opencode-provider-api",
+        }
+        for harness, model in models.items():
+            status = cls.runtime_status(harness)
+            opencode = harness == "opencode"
+            con.execute(
+                "INSERT INTO model_routes ("
+                "harness,selector,provider_model,source,availability,"
+                "headless_supported,high_effort_supported,supported_efforts,"
+                "default_effort,cli_version,last_seen_at,stale,generation_id,"
+                "evidence_kind,evidence_digest,source_fingerprint,harness_version,"
+                "harness_compatibility,selector_binding,effort_metadata,"
+                "adapter_metadata) VALUES (?,?,?,?,?,1,1,'[\"low\",\"high\"]',"
+                "'high',?,?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    harness, model, model, sources[harness], "available",
+                    f"{harness} {status['version']}", now, 0, "a" * 32,
+                    evidence_kinds[harness], "e" * 64, "f" * 64,
+                    status["version"], "verified",
+                    json.dumps({"kind": "exact-model", "selector": model}),
+                    json.dumps({
+                        "supported": ["low", "high"], "default": "high",
+                        "digests": {"low": "d" * 64, "high": "e" * 64},
+                        "native_variant_ids": {
+                            "low": "low", "high": "high",
+                        } if opencode else {},
+                        "adapter_metadata_by_effort": {
+                            effort: {
+                                "compatibility_manifest": "opencode-1.18.9-v1",
+                                "provider_family": "openai-ai-sdk",
+                                "variant_options": {"reasoningEffort": effort},
+                            }
+                            for effort in ("low", "high")
+                        } if opencode else {},
+                    }),
+                    json.dumps({
+                        "compatibility_manifest": "opencode-1.18.9-v1",
+                        "provider_family": "openai-ai-sdk",
+                        "variant_options_by_effort": {
+                            effort: {"reasoningEffort": effort}
+                            for effort in ("low", "high")
+                        },
+                    }) if opencode else "{}",
+                ),
+            )
+
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
         self.root = Path(self.tmp.name).resolve()
@@ -208,6 +317,7 @@ class CrossHarnessReleaseGateTest(unittest.TestCase):
             "VALUES (1,'Developer','dev','dev','prompt',1),"
             "(2,'Developer 2','dev2','dev','prompt',1)"
         )
+        self.seed_controlled_routes(con)
         con.commit()
         con.close()
         (self.root / ".sc-worktrees" / "dev").mkdir(parents=True)
@@ -236,6 +346,16 @@ class CrossHarnessReleaseGateTest(unittest.TestCase):
                 conversation_routes.conversation_broker,
                 "notify_commit",
                 side_effect=self.notify_broker,
+            ),
+            mock.patch.object(
+                conversation_routes.model_catalog,
+                "harness_runtime_status",
+                side_effect=self.runtime_status,
+            ),
+            mock.patch.object(
+                conversation_routes.model_catalog,
+                "controlled_route_evidence",
+                side_effect=self.controlled_evidence,
             ),
         )
         for patch in self.patches:
@@ -589,7 +709,7 @@ class CrossHarnessReleaseGateTest(unittest.TestCase):
             f"/api/conversations/{conversation_id}/transcript",
         )
         self.assertEqual(status, 200, transcript)
-        self.assertEqual(transcript["projection_version"], 2)
+        self.assertEqual(transcript["projection_version"], 3)
         self.assertIsNone(transcript["truncation"])
         projected = []
         for item in transcript["items"]:

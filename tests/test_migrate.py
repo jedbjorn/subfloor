@@ -212,6 +212,5 @@ class AtomicMigrateTests(unittest.TestCase):
             ).fetchall()
         self.assertEqual(ledger, [])
 
-
 if __name__ == "__main__":
     unittest.main()

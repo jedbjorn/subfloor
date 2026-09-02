@@ -52,6 +52,7 @@ class FakeReader:
     def __init__(self, current: PullRequest | Exception) -> None:
         self.current = current
         self.by_number: dict[int, PullRequest] = {}
+        self.listed_by_number: dict[int, PullRequest] | None = None
         self.get_calls: list[int] = []
         self.list_calls = 0
 
@@ -65,6 +66,8 @@ class FakeReader:
         self.list_calls += 1
         if isinstance(self.current, Exception):
             raise self.current
+        if self.listed_by_number is not None:
+            return list(self.listed_by_number.values())
         return list(self.by_number.values()) or [self.current]
 
 
@@ -281,8 +284,8 @@ class RegistrationTest(SprintPRWatcherCase):
         self.assertTrue(first.created)
         self.assertFalse(second.created)
         self.assertEqual(first.registered_pr_id, second.registered_pr_id)
-        self.assertEqual([42], self.reader.get_calls)
-        self.assertEqual(["acme/repo"], self.repositories)
+        self.assertEqual([42, 42], self.reader.get_calls)
+        self.assertEqual(["acme/repo", "acme/repo"], self.repositories)
         self.assertEqual(
             [("acme/repo", 42)],
             [
@@ -320,6 +323,152 @@ class RegistrationTest(SprintPRWatcherCase):
                     "FROM sprint_pr_transitions"
                 )
             ],
+        )
+
+    def test_exact_registration_replay_reactivates_a_reopened_subscription(self):
+        def ownership() -> tuple:
+            return tuple(
+                self.con.execute(
+                    "SELECT registered.registered_pr_id,registered.sprint_id,"
+                    "registered.owner_participant_id,subscription.subscription_id,"
+                    "subscription.owner_shell_id,link.work_unit_id "
+                    "FROM sprint_registered_prs registered "
+                    "JOIN pr_subscriptions subscription "
+                    "ON subscription.sprint_registered_pr_id="
+                    "registered.registered_pr_id "
+                    "JOIN sprint_pr_work_units link "
+                    "ON link.registered_pr_id=registered.registered_pr_id"
+                ).fetchone()
+            )
+
+        def durable_counts() -> tuple:
+            return tuple(
+                self.con.execute(
+                    "SELECT "
+                    "(SELECT COUNT(*) FROM pr_subscription_transitions),"
+                    "(SELECT COUNT(*) FROM sprint_pr_transitions),"
+                    "(SELECT COUNT(*) FROM wake_message "
+                    " WHERE idempotency_key LIKE 'pr-transition:%'),"
+                    "(SELECT COUNT(*) FROM sprint_wake_messages wm "
+                    " JOIN wake_message m USING (message_id) "
+                    " WHERE m.idempotency_key LIKE 'pr-transition:%'),"
+                    "(SELECT COUNT(*) FROM sprint_wake_outbox outbox "
+                    " WHERE EXISTS (SELECT 1 FROM sprint_wake_messages wm "
+                    " JOIN wake_message m USING (message_id) "
+                    " WHERE wm.wake_id=outbox.wake_id "
+                    " AND m.idempotency_key LIKE 'pr-transition:%'))"
+                ).fetchone()
+            )
+
+        self.reader.current = pull_request(
+            state="CLOSED", checks=None, checks_failed=False
+        )
+        first = self.register()
+        expected_ownership = (
+            first.registered_pr_id,
+            self.sprint_id,
+            self.developer_id,
+            1,
+            1,
+            self.unit_id,
+        )
+        self.assertEqual(expected_ownership, ownership())
+        self.assertFalse(self.watcher.poll_once())
+
+        reopened_head = "d" * 40
+        self.reader.current = pull_request(
+            checks="SUCCESS",
+            checks_failed=False,
+            head_sha=reopened_head,
+        )
+        replay = self.register()
+
+        self.assertFalse(replay.created)
+        self.assertEqual(first.registered_pr_id, replay.registered_pr_id)
+        self.assertEqual([42, 42], self.reader.get_calls)
+        transitions = [
+            ("closed", "a" * 40, "registration"),
+            ("green", reopened_head, "registration"),
+        ]
+        self.assertEqual(
+            transitions,
+            [
+                (
+                    row["normalized_state"],
+                    row["observed_head_sha"],
+                    json.loads(row["evidence"])["trigger"],
+                )
+                for row in self.con.execute(
+                    "SELECT normalized_state,observed_head_sha,evidence "
+                    "FROM pr_subscription_transitions ORDER BY transition_id"
+                )
+            ],
+        )
+        self.assertEqual(
+            transitions,
+            [
+                (
+                    row["normalized_state"],
+                    row["observed_head_sha"],
+                    json.loads(row["evidence"])["trigger"],
+                )
+                for row in self.con.execute(
+                    "SELECT normalized_state,observed_head_sha,evidence "
+                    "FROM sprint_pr_transitions ORDER BY transition_id"
+                )
+            ],
+        )
+        self.assertEqual(
+            [
+                (
+                    1,
+                    None,
+                    None,
+                    "re-enter",
+                    "GitHub PR event: repository=acme/repo, number=42, head_sha="
+                    + "a" * 40
+                    + ", event=closed. Your active Sprint PR was closed without "
+                    "merge; tell the Planner if this blocks the Sprint.",
+                ),
+                (
+                    1,
+                    None,
+                    None,
+                    "re-enter",
+                    "GitHub PR event: repository=acme/repo, number=42, head_sha="
+                    + reopened_head
+                    + ", event=green. Your active Sprint PR is green; judge "
+                    "readiness and pass the baton to review when ready.",
+                ),
+            ],
+            [
+                tuple(row)
+                for row in self.con.execute(
+                    "SELECT receiver_shell_id,sprint_id,to_participant_id,"
+                    "declared_type,body FROM wake_message "
+                    "WHERE idempotency_key LIKE 'pr-transition:%' "
+                    "ORDER BY message_id"
+                )
+            ],
+        )
+        expected_counts = (2, 2, 2, 2, 1)
+        self.assertEqual(expected_counts, durable_counts())
+
+        unchanged = self.register()
+
+        self.assertFalse(unchanged.created)
+        self.assertEqual(first.registered_pr_id, unchanged.registered_pr_id)
+        self.assertEqual([42, 42, 42], self.reader.get_calls)
+        self.assertEqual(expected_ownership, ownership())
+        self.assertEqual(expected_counts, durable_counts())
+
+        self.assertTrue(self.watcher.poll_once())
+        self.assertEqual([42, 42, 42, 42], self.reader.get_calls)
+        self.assertEqual(
+            2,
+            self.con.execute(
+                "SELECT COUNT(*) FROM sprint_pr_transitions"
+            ).fetchone()[0],
         )
 
     def test_registration_without_checks_records_one_diagnostic_event(self):
@@ -452,7 +601,392 @@ class RegistrationTest(SprintPRWatcherCase):
         )
 
 
+class RegistrationRecoveryTest(SprintPRWatcherCase):
+    def _prepare_replacement(
+        self, *, abort_source: bool = True, pause: bool = True
+    ) -> tuple[int, int]:
+        self.con.execute(
+            "INSERT INTO shells "
+            "(shell_id,display_name,shortname,flavor,system_prompt,user_id) "
+            "VALUES (4,'FnB','FNB','admin','prompt',1)"
+        )
+        source_spec = self.con.execute(
+            "SELECT document_id,bound_revision_sha256,approval_id "
+            "FROM sprint_specs WHERE sprint_id=?",
+            (self.sprint_id,),
+        ).fetchone()
+        feature_id = int(
+            self.con.execute(
+                "SELECT feature_id FROM sprints WHERE sprint_id=?",
+                (self.sprint_id,),
+            ).fetchone()[0]
+        )
+        target_sprint_id = int(
+            self.con.execute(
+                "INSERT INTO sprints "
+                "(feature_id,originating_planner_shell_id,merge_grant_enabled) "
+                "VALUES (?,3,1)",
+                (feature_id,),
+            ).lastrowid
+        )
+        self.con.execute(
+            "INSERT INTO sprint_specs "
+            "(sprint_id,document_id,bound_revision_sha256,approval_id) "
+            "VALUES (?,?,?,?)",
+            (target_sprint_id, *tuple(source_spec)),
+        )
+        self.con.executemany(
+            "INSERT INTO sprint_participants "
+            "(sprint_id,shell_id,role,harness) VALUES (?,?,?,?)",
+            (
+                (target_sprint_id, 3, "planner", "codex"),
+                (target_sprint_id, 1, "developer", "codex"),
+                (target_sprint_id, 2, "reviewer", "codex"),
+            ),
+        )
+        target_unit_id = int(
+            self.con.execute(
+                "INSERT INTO sprint_work_units "
+                "(sprint_id,assigned_shell_id,reviewer_shell_id,title,"
+                "expected_output) VALUES (?,1,2,'Replacement','Ship it')",
+                (target_sprint_id,),
+            ).lastrowid
+        )
+        self.con.commit()
+        lifecycle = sprint_domain.SprintLifecycleStore(
+            self.con, probe_harness=lambda _harness: None
+        )
+        if abort_source:
+            lifecycle.abort(
+                self.sprint_id,
+                sprint_domain.LifecycleActor("fnb", 4),
+                reason="replace the failed Sprint",
+                terminal_outcome="recovered elsewhere",
+            )
+        else:
+            lifecycle.transition(
+                self.sprint_id,
+                "paused",
+                sprint_domain.LifecycleActor("participant", 1),
+                reason="source remains recoverable",
+            )
+        lifecycle.arm(target_sprint_id, 3)
+        self.con.execute(
+            "UPDATE sprint_work_units SET disposition='active' "
+            "WHERE work_unit_id=?",
+            (target_unit_id,),
+        )
+        self.con.commit()
+        if pause:
+            lifecycle.transition(
+                target_sprint_id,
+                "paused",
+                sprint_domain.LifecycleActor("participant", 1),
+                reason="await ownership repair",
+            )
+        return target_sprint_id, target_unit_id
+
+    def test_originating_planner_reconciles_merged_pr_atomically(self):
+        self.reader.current = pull_request(state="MERGED", checks="SUCCESS", checks_failed=False)
+        original = self.register()
+        target_sprint_id, target_unit_id = self._prepare_replacement()
+
+        receipt = self.watcher.reconcile_aborted_registration(
+            target_sprint_id,
+            actor=sprint_domain.LifecycleActor("planner", 3),
+            repository="Acme/Repo",
+            pr_number=42,
+            work_unit_id=target_unit_id,
+            reason="preserve the merged replacement implementation",
+        )
+        self.reader.current = pull_request(
+            state="CLOSED", checks=None, checks_failed=False
+        )
+        replay = self.watcher.reconcile_aborted_registration(
+            target_sprint_id,
+            actor=sprint_domain.LifecycleActor("planner", 3),
+            repository="acme/repo",
+            pr_number=42,
+            work_unit_id=target_unit_id,
+            reason="preserve the merged replacement implementation",
+        )
+
+        self.assertTrue(receipt.changed)
+        self.assertFalse(replay.changed)
+        self.assertEqual(original.registered_pr_id, receipt.registered_pr_id)
+        self.assertEqual(self.sprint_id, receipt.from_sprint_id)
+        self.assertEqual("merged", receipt.normalized_state)
+        self.assertEqual("a" * 40, receipt.head_sha)
+        self.assertEqual("b" * 40, receipt.merge_sha)
+        self.assertEqual((target_unit_id,), receipt.completed_work_unit_ids)
+        self.assertEqual(receipt, replace(replay, changed=True))
+        target_participant_id = int(
+            self.con.execute(
+                "SELECT participant_id FROM sprint_participants "
+                "WHERE sprint_id=? AND shell_id=1 AND role='developer'",
+                (target_sprint_id,),
+            ).fetchone()[0]
+        )
+        self.assertEqual(
+            (target_sprint_id, target_participant_id, "acme/repo", 42),
+            tuple(
+                self.con.execute(
+                    "SELECT sprint_id,owner_participant_id,repository,pr_number "
+                    "FROM sprint_registered_prs WHERE registered_pr_id=?",
+                    (receipt.registered_pr_id,),
+                ).fetchone()
+            ),
+        )
+        self.assertEqual(
+            [(target_sprint_id, receipt.registered_pr_id, target_unit_id)],
+            [
+                tuple(row)
+                for row in self.con.execute(
+                    "SELECT sprint_id,registered_pr_id,work_unit_id "
+                    "FROM sprint_pr_work_units"
+                )
+            ],
+        )
+        self.assertEqual(
+            (1, receipt.registered_pr_id),
+            tuple(
+                self.con.execute(
+                    "SELECT owner_shell_id,sprint_registered_pr_id "
+                    "FROM pr_subscriptions WHERE repository='acme/repo' AND pr_number=42"
+                ).fetchone()
+            ),
+        )
+        self.assertEqual(
+            "completed",
+            self.con.execute(
+                "SELECT disposition FROM sprint_work_units WHERE work_unit_id=?",
+                (target_unit_id,),
+            ).fetchone()[0],
+        )
+        events = self.con.execute(
+            "SELECT sprint_id,actor_kind,actor_shell_id,payload FROM sprint_events "
+            "WHERE event_type='pr.registration_reconciled' ORDER BY event_id"
+        ).fetchall()
+        self.assertEqual(2, len(events))
+        self.assertEqual({self.sprint_id, target_sprint_id}, {int(row[0]) for row in events})
+        for event in events:
+            payload = json.loads(event["payload"])
+            self.assertEqual("planner", event["actor_kind"])
+            self.assertEqual(3, event["actor_shell_id"])
+            self.assertEqual(self.sprint_id, payload["from_sprint_id"])
+            self.assertEqual(target_sprint_id, payload["to_sprint_id"])
+            self.assertEqual([self.unit_id], payload["from_work_unit_ids"])
+            self.assertEqual(target_unit_id, payload["to_work_unit_id"])
+            self.assertEqual("a" * 40, payload["head_sha"])
+            self.assertEqual("b" * 40, payload["merge_sha"])
+        self.assertEqual(
+            2,
+            self.con.execute(
+                "SELECT COUNT(*) FROM sprint_events "
+                "WHERE event_type='pr.registration_reconciled'"
+            ).fetchone()[0],
+        )
+        self.assertEqual(
+            1,
+            self.con.execute(
+                "SELECT COUNT(*) FROM sprint_events WHERE sprint_id=? "
+                "AND event_type='work_unit.completed' "
+                "AND json_extract(payload,'$.source')='planner.pr_recovery'",
+                (target_sprint_id,),
+            ).fetchone()[0],
+        )
+
+    def test_fnb_rebinds_open_pr_without_completing_the_target_unit(self):
+        original = self.register()
+        target_sprint_id, target_unit_id = self._prepare_replacement()
+
+        receipt = self.watcher.reconcile_aborted_registration(
+            target_sprint_id,
+            actor=sprint_domain.LifecycleActor("fnb", 4),
+            repository="acme/repo",
+            pr_number=42,
+            work_unit_id=target_unit_id,
+            reason="continue the preserved PR through normal review",
+        )
+
+        self.assertTrue(receipt.changed)
+        self.assertEqual(original.registered_pr_id, receipt.registered_pr_id)
+        self.assertEqual(self.sprint_id, receipt.from_sprint_id)
+        self.assertEqual("red", receipt.normalized_state)
+        self.assertEqual("a" * 40, receipt.head_sha)
+        self.assertIsNone(receipt.merge_sha)
+        self.assertEqual((), receipt.completed_work_unit_ids)
+        self.assertEqual(
+            (target_sprint_id, target_unit_id, "active"),
+            tuple(
+                self.con.execute(
+                    "SELECT link.sprint_id,link.work_unit_id,unit.disposition "
+                    "FROM sprint_pr_work_units link JOIN sprint_work_units unit "
+                    "ON unit.work_unit_id=link.work_unit_id "
+                    "WHERE link.registered_pr_id=?",
+                    (receipt.registered_pr_id,),
+                ).fetchone()
+            ),
+        )
+        self.assertEqual(
+            0,
+            self.con.execute(
+                "SELECT COUNT(*) FROM sprint_events WHERE sprint_id=? "
+                "AND event_type='work_unit.completed'",
+                (target_sprint_id,),
+            ).fetchone()[0],
+        )
+
+    def test_reconciliation_requires_the_target_sprint_to_be_paused(self):
+        original = self.register()
+        target_sprint_id, target_unit_id = self._prepare_replacement(pause=False)
+
+        with self.assertRaisesRegex(
+            sprint_domain.SprintInvariantError, "paused target Sprint"
+        ):
+            self.watcher.reconcile_aborted_registration(
+                target_sprint_id,
+                actor=sprint_domain.LifecycleActor("fnb", 4),
+                repository="acme/repo",
+                pr_number=42,
+                work_unit_id=target_unit_id,
+                reason="unsafe live repair",
+            )
+
+        self.assertEqual(
+            self.sprint_id,
+            self.con.execute(
+                "SELECT sprint_id FROM sprint_registered_prs WHERE registered_pr_id=?",
+                (original.registered_pr_id,),
+            ).fetchone()[0],
+        )
+        self.assertEqual(
+            0,
+            self.con.execute(
+                "SELECT COUNT(*) FROM sprint_events "
+                "WHERE event_type='pr.registration_reconciled'"
+            ).fetchone()[0],
+        )
+
+    def test_reconciliation_rejects_non_owner_and_live_source_without_changes(self):
+        original = self.register()
+        target_sprint_id, target_unit_id = self._prepare_replacement(
+            abort_source=False
+        )
+
+        for actor, message in (
+            (
+                sprint_domain.LifecycleActor("planner", 2),
+                "only the originating Planner",
+            ),
+            (sprint_domain.LifecycleActor("fnb", 4), "aborted Sprint"),
+        ):
+            with self.assertRaisesRegex(sprint_domain.SprintLifecycleError, message):
+                self.watcher.reconcile_aborted_registration(
+                    target_sprint_id,
+                    actor=actor,
+                    repository="acme/repo",
+                    pr_number=42,
+                    work_unit_id=target_unit_id,
+                    reason="attempted repair",
+                )
+
+        self.assertEqual([42, 42], self.reader.get_calls)
+        self.assertEqual(
+            self.sprint_id,
+            self.con.execute(
+                "SELECT sprint_id FROM sprint_registered_prs WHERE registered_pr_id=?",
+                (original.registered_pr_id,),
+            ).fetchone()[0],
+        )
+        self.assertEqual(
+            0,
+            self.con.execute(
+                "SELECT COUNT(*) FROM sprint_events "
+                "WHERE event_type='pr.registration_reconciled'"
+            ).fetchone()[0],
+        )
+
+
 class TransitionRoutingTest(SprintPRWatcherCase):
+    def test_owner_loss_on_final_merge_carries_pause_receipt_past_commit(self):
+        self.register()
+        self.con.execute(
+            "UPDATE sprint_work_units SET disposition='merge_ready' "
+            "WHERE work_unit_id=?",
+            (self.unit_id,),
+        )
+        trigger_message_id = int(
+            self.con.execute(
+                "INSERT INTO conversation_messages "
+                "(conversation_id,sender_kind,sender_ref,message_kind,body,"
+                "idempotency_key,request_hash,state) "
+                "VALUES (?,'engine','test','prompt','active merge turn',"
+                "'owner-loss-merge','owner-loss-merge','running')",
+                (self.developer_conversation_id,),
+            ).lastrowid
+        )
+        run_id = int(
+            self.con.execute(
+                "INSERT INTO conversation_runs "
+                "(conversation_id,shell_id,trigger_message_id,state,lease_owner,"
+                "lease_expires_at,started_at,heartbeat_at) "
+                "VALUES (?,1,?,'running','test-broker','2999-01-01 00:00:00',"
+                "'2026-08-01 00:00:00','2026-08-01 00:00:00')",
+                (self.developer_conversation_id, trigger_message_id),
+            ).lastrowid
+        )
+        self.con.execute(
+            "UPDATE sprint_participants SET disposition='declined' "
+            "WHERE sprint_id=? AND shell_id=2",
+            (self.sprint_id,),
+        )
+        self.con.commit()
+        self.reader.current = pull_request(
+            state="MERGED", checks="SUCCESS", checks_failed=False
+        )
+        delivered: list[sprint_domain.PauseReceipt] = []
+
+        def capture_pause(
+            store: sprint_domain.SprintLifecycleStore,
+            receipt: sprint_domain.PauseReceipt,
+        ) -> None:
+            self.assertIs(store.con, self.con)
+            self.assertFalse(self.con.in_transaction)
+            self.assertEqual(
+                "paused",
+                self.con.execute(
+                    "SELECT lifecycle FROM sprints WHERE sprint_id=?",
+                    (self.sprint_id,),
+                ).fetchone()[0],
+            )
+            delivered.append(receipt)
+
+        with mock.patch.object(
+            sprint_domain.SprintLifecycleStore,
+            "signal_pause_receipt",
+            new=capture_pause,
+        ):
+            self.assertTrue(self.watcher.poll_once())
+
+        self.assertEqual(1, len(delivered))
+        self.assertEqual((run_id,), delivered[0].interrupt_run_ids)
+        self.assertEqual(
+            (self.developer_conversation_id,),
+            delivered[0].notification_conversation_ids,
+        )
+        self.assertEqual(
+            ("paused", "completed"),
+            tuple(
+                self.con.execute(
+                    "SELECT s.lifecycle,u.disposition FROM sprints s "
+                    "JOIN sprint_work_units u USING (sprint_id) "
+                    "WHERE s.sprint_id=?",
+                    (self.sprint_id,),
+                ).fetchone()
+            ),
+        )
+
     def test_queued_checkrun_stays_pending_without_green_owner_wake(self):
         raw = {
             "number": 42,
@@ -527,7 +1061,8 @@ class TransitionRoutingTest(SprintPRWatcherCase):
             {
                 "GitHub PR event: repository=acme/repo, number=42, head_sha="
                 + "a" * 40
-                + ", event=red. Your PR went red; fix it."
+                + ", event=red. Your active Sprint PR went red; fix the failing "
+                "checks."
             },
             {str(row["body"]) for row in routed},
         )
@@ -738,6 +1273,7 @@ class RecoveryAndFailureTest(SprintPRWatcherCase):
         self.assertEqual(before, after)
 
     def test_paused_change_is_observed_immediately_and_deduplicated(self):
+        self.reader.current = pull_request(checks="SUCCESS", checks_failed=False)
         self.register()
         lifecycle = sprint_domain.SprintLifecycleStore(self.con)
         lifecycle.transition(
@@ -746,9 +1282,38 @@ class RecoveryAndFailureTest(SprintPRWatcherCase):
             sprint_domain.LifecycleActor("participant", 1),
             reason="test",
         )
+        self.reader.current = pull_request()
+        self.assertTrue(self.watcher.poll_once())
+        self.assertEqual(["green", "red"], self._states())
+        paused_red_message = self.con.execute(
+            "SELECT body FROM wake_message "
+            "WHERE idempotency_key LIKE 'pr-transition:%' "
+            "ORDER BY message_id DESC LIMIT 1"
+        ).fetchone()
+        self.assertEqual(
+            "GitHub PR event: repository=acme/repo, number=42, head_sha="
+            + "a" * 40
+            + ", event=red. Your paused Sprint PR went red; fix the failing "
+            "checks now; do not wait for the Sprint to resume.",
+            paused_red_message["body"],
+        )
+
         self.reader.current = pull_request(checks="SUCCESS", checks_failed=False)
         self.assertTrue(self.watcher.poll_once())
-        self.assertEqual(["red", "green"], self._states())
+        self.assertEqual(["green", "red", "green"], self._states())
+        paused_message = self.con.execute(
+            "SELECT body FROM wake_message "
+            "WHERE idempotency_key LIKE 'pr-transition:%' "
+            "ORDER BY message_id DESC LIMIT 1"
+        ).fetchone()
+        self.assertEqual(
+            "GitHub PR event: repository=acme/repo, number=42, head_sha="
+            + "a" * 40
+            + ", event=green. Your paused Sprint PR is green; judge readiness "
+            "and wait for the Sprint to resume.",
+            paused_message["body"],
+        )
+        self.assertNotIn("pass the baton", paused_message["body"])
 
         lifecycle.transition(
             self.sprint_id,
@@ -756,12 +1321,18 @@ class RecoveryAndFailureTest(SprintPRWatcherCase):
             sprint_domain.LifecycleActor("planner", 3),
         )
         self.assertTrue(self.watcher.poll_once())
-        self.assertEqual(["red", "green"], self._states())
+        self.assertEqual(["green", "red", "green"], self._states())
         self.assertTrue(self.watcher.poll_once())
-        self.assertEqual(["red", "green"], self._states())
+        self.assertEqual(["green", "red", "green"], self._states())
 
-    def test_terminal_sprint_does_not_gate_an_active_subscription(self):
+    def test_completed_sprint_does_not_gate_an_active_subscription(self):
         self.register()
+        self.con.execute(
+            "UPDATE sprint_work_units SET disposition='completed',"
+            "completed_at=datetime('now') WHERE sprint_id=?",
+            (self.sprint_id,),
+        )
+        self.con.commit()
         lifecycle = sprint_domain.SprintLifecycleStore(self.con)
         lifecycle.transition(
             self.sprint_id,
@@ -770,10 +1341,78 @@ class RecoveryAndFailureTest(SprintPRWatcherCase):
             terminal_outcome="delivered",
         )
         calls = len(self.reader.get_calls)
+        self.reader.current = pull_request(checks="SUCCESS", checks_failed=False)
 
         self.assertTrue(self.watcher.poll_once())
         self.assertEqual(calls + 1, len(self.reader.get_calls))
         self.assertEqual(0, self.reader.list_calls)
+        message = self.con.execute(
+            "SELECT body FROM wake_message "
+            "WHERE idempotency_key LIKE 'pr-transition:%' "
+            "ORDER BY message_id DESC LIMIT 1"
+        ).fetchone()
+        self.assertEqual(
+            "GitHub PR event: repository=acme/repo, number=42, head_sha="
+            + "a" * 40
+            + ", event=green. Your PR is green outside an active Sprint; "
+            "no action is needed.",
+            message["body"],
+        )
+
+    def test_aborted_sprint_uses_non_sprint_notification_policy(self):
+        self.register()
+        self.con.execute(
+            "INSERT INTO shells "
+            "(shell_id,display_name,shortname,flavor,system_prompt,user_id) "
+            "VALUES (4,'FnB','FNB','admin','prompt',1)"
+        )
+        self.con.commit()
+        sprint_domain.SprintLifecycleStore(self.con).abort(
+            self.sprint_id,
+            sprint_domain.LifecycleActor("fnb", 4),
+            reason="the implementation was abandoned",
+            terminal_outcome="cancelled",
+        )
+        wake_count = self.con.execute(
+            "SELECT COUNT(*) FROM wake_message "
+            "WHERE idempotency_key LIKE 'pr-transition:%'"
+        ).fetchone()[0]
+        self.reader.current = pull_request(
+            state="CLOSED", checks=None, checks_failed=False
+        )
+
+        self.assertTrue(self.watcher.poll_once())
+
+        self.assertEqual(["red", "closed"], self._states())
+        self.assertEqual(
+            ["red", "closed"],
+            [
+                str(row[0])
+                for row in self.con.execute(
+                    "SELECT normalized_state FROM pr_subscription_transitions "
+                    "ORDER BY transition_id"
+                )
+            ],
+        )
+        self.assertEqual(
+            wake_count + 1,
+            self.con.execute(
+                "SELECT COUNT(*) FROM wake_message "
+                "WHERE idempotency_key LIKE 'pr-transition:%'"
+            ).fetchone()[0],
+        )
+        message = self.con.execute(
+            "SELECT body FROM wake_message "
+            "WHERE idempotency_key LIKE 'pr-transition:%' "
+            "ORDER BY message_id DESC LIMIT 1"
+        ).fetchone()
+        self.assertEqual(
+            "GitHub PR event: repository=acme/repo, number=42, head_sha="
+            + "a" * 40
+            + ", event=closed. Your PR was closed without merge outside an "
+            "active Sprint; no action is needed unless the closure was unexpected.",
+            message["body"],
+        )
 
     def test_failure_is_durable_backs_off_and_never_invents_state(self):
         self.reader.current = GitHubReadError("rate limit reached")
@@ -1121,8 +1760,13 @@ class EngineWideSubscriptionTest(SprintPRWatcherCase):
             (1, None, None, "re-enter"),
             tuple(message)[:4],
         )
-        self.assertIn("repository=acme/repo, number=42", message["body"])
-        self.assertIn("head_sha=" + "a" * 40 + ", event=red", message["body"])
+        self.assertEqual(
+            "GitHub PR event: repository=acme/repo, number=42, head_sha="
+            + "a" * 40
+            + ", event=red. Your PR went red outside an active Sprint; fix it if "
+            "it still needs attention, otherwise no action is needed.",
+            message["body"],
+        )
 
     def test_no_subscriptions_performs_zero_github_calls(self):
         self.assertFalse(self.watcher.poll_once())
@@ -1379,6 +2023,39 @@ class BatchAndNormalizationTest(SprintPRWatcherCase):
                     "FROM sprint_registered_prs p "
                     "JOIN sprint_pr_transitions t USING (registered_pr_id) "
                     "ORDER BY p.pr_number"
+                )
+            ],
+        )
+
+    def test_batch_read_restores_missing_base_sha_only_for_subscriptions(self):
+        self.reader.by_number = {
+            42: pull_request(number=42),
+            43: pull_request(number=43),
+        }
+        self.register(number=42)
+        self.register(number=43)
+        self.reader.listed_by_number = {
+            number: replace(item, base_sha=None)
+            for number, item in self.reader.by_number.items()
+        }
+        get_count = len(self.reader.get_calls)
+
+        self.assertTrue(self.watcher.poll_once())
+
+        self.assertEqual(1, self.reader.list_calls)
+        self.assertEqual([42, 43], self.reader.get_calls[get_count:])
+        self.assertEqual(
+            [(42, "c" * 40), (43, "c" * 40)],
+            [
+                (
+                    int(row["pr_number"]),
+                    json.loads(row["evidence"])["base_sha"],
+                )
+                for row in self.con.execute(
+                    "SELECT registered.pr_number,transition.evidence "
+                    "FROM sprint_registered_prs registered "
+                    "JOIN sprint_pr_transitions transition "
+                    "USING (registered_pr_id) ORDER BY registered.pr_number"
                 )
             ],
         )

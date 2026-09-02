@@ -8,6 +8,7 @@ import sys
 import unittest
 from contextlib import closing
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 ENGINE = ROOT / ".super-coder"
@@ -29,7 +30,9 @@ def rendered_notification(
     return (
         f"Sprint {sprint_id} completed by Reviewer conformance. "
         f"conformance_report_id={report_id}; final_report_id={final_report_id}; "
-        f"followup_ids={followups}; outcome={TERMINAL_OUTCOME}.\n\n"
+        f"followup_ids={followups}; outcome={TERMINAL_OUTCOME}; "
+        "cleanup_state=pending. Managed participant worktrees are not reusable "
+        "until the engine-authored cleanup receipt reports succeeded.\n\n"
         f"Reason: {COMPLETION_REASON}"
     )
 
@@ -45,6 +48,12 @@ class SprintCloseCase(SprintDomainCase):
         super().setUp()
         self.sprint_id, self.unit_id = self.create_sprint()
         self.store.arm(self.sprint_id, 3)
+        self.con.execute(
+            "UPDATE sprint_work_units SET disposition='completed',"
+            "completed_at=datetime('now') WHERE work_unit_id=?",
+            (self.unit_id,),
+        )
+        self.con.commit()
         self.close = sprint_close.SprintCloseStore(self.con)
         self.document_id = int(
             self.con.execute(
@@ -68,6 +77,63 @@ class SprintCloseCase(SprintDomainCase):
         kwargs.setdefault("reason", COMPLETION_REASON)
         kwargs.setdefault("terminal_outcome", TERMINAL_OUTCOME)
         return self.close.record_conformance(*args, **kwargs)
+
+    def add_participant(self, shell_id: int, role: str) -> int:
+        flavor = "dev" if role == "developer" else role
+        prefix = "DEV" if role == "developer" else "REV"
+        self.con.execute(
+            "INSERT INTO shells "
+            "(shell_id,display_name,shortname,flavor,system_prompt,user_id) "
+            "VALUES (?,?,?,?,?,1)",
+            (shell_id, f"{role} {shell_id}", f"{prefix}{shell_id}", flavor, "prompt"),
+        )
+        participant_id = int(
+            self.con.execute(
+                "INSERT INTO sprint_participants "
+                "(sprint_id,shell_id,role,harness,model,effort) "
+                "VALUES (?,?,?,'codex','model','high')",
+                (self.sprint_id, shell_id, role),
+            ).lastrowid
+        )
+        self.con.commit()
+        return participant_id
+
+    def activate_chat(
+        self,
+        shell_id: int,
+        key: str,
+        *,
+        linked: bool = True,
+    ) -> str:
+        conversation_id = str(
+            self.con.execute(
+                "INSERT INTO conversations "
+                "(shell_id,owner_user_id,harness,worktree,state,conversation_scope,"
+                "creation_idempotency_key,creation_request_hash) "
+                "VALUES (?,1,'codex','/tmp/work','idle',?,?,?) "
+                "RETURNING conversation_id",
+                (shell_id, "sprint" if linked else "normal", key, key),
+            ).fetchone()[0]
+        )
+        if linked:
+            participant_id = int(
+                self.con.execute(
+                    "SELECT participant_id FROM sprint_participants "
+                    "WHERE sprint_id=? AND shell_id=?",
+                    (self.sprint_id, shell_id),
+                ).fetchone()[0]
+            )
+            self.con.execute(
+                "INSERT INTO sprint_participant_conversations "
+                "(sprint_participant_id,conversation_id) VALUES (?,?)",
+                (participant_id, conversation_id),
+            )
+        self.con.execute(
+            "INSERT INTO active_shell_chats (shell_id,chat_id) VALUES (?,?)",
+            (shell_id, conversation_id),
+        )
+        self.con.commit()
+        return conversation_id
 
 
 class SprintCloseMigrationTest(unittest.TestCase):
@@ -189,6 +255,181 @@ class SprintCloseMigrationTest(unittest.TestCase):
 
 
 class ConformanceFollowupTest(SprintCloseCase):
+    def test_nonterminal_conformance_rolls_back_every_closeout_write(self):
+        self.con.execute(
+            "UPDATE sprint_work_units SET disposition='active',completed_at=NULL "
+            "WHERE work_unit_id=?",
+            (self.unit_id,),
+        )
+        self.con.commit()
+
+        with self.assertRaises(sprint_domain.SprintConflictError) as caught:
+            self.record_conformance(
+                self.sprint_id,
+                2,
+                body="Must roll back",
+                findings=[self.finding()],
+                final_report=FINAL_REPORT,
+                idempotency_key="nonterminal-conformance",
+            )
+
+        self.assertEqual(
+            {
+                "code": "sprint_work_nonterminal",
+                "work_unit_count": 1,
+                "nonterminal_count": 1,
+                "nonterminal_work_units": [
+                    {"work_unit_id": self.unit_id, "disposition": "active"}
+                ],
+                "truncated": False,
+            },
+            caught.exception.details,
+        )
+        self.assertEqual(
+            ("armed", 0, 0, 0, 0, 0),
+            tuple(
+                self.con.execute(
+                    "SELECT sprint.lifecycle,"
+                    "(SELECT COUNT(*) FROM sprint_reports report "
+                    " WHERE report.sprint_id=sprint.sprint_id),"
+                    "(SELECT COUNT(*) FROM sprint_followups followup "
+                    " WHERE followup.sprint_id=sprint.sprint_id),"
+                    "(SELECT COUNT(*) FROM wake_message message "
+                    " WHERE message.idempotency_key="
+                    " 'nonterminal-conformance:planner-completed'),"
+                    "(SELECT COUNT(*) FROM sprint_events event "
+                    " WHERE event.sprint_id=sprint.sprint_id "
+                    " AND event.event_type IN "
+                    " ('conformance.recorded','lifecycle.completed')) ,"
+                    "(SELECT COUNT(*) FROM sprint_cleanup_targets target "
+                    " WHERE target.sprint_id=sprint.sprint_id) "
+                    "FROM sprints sprint WHERE sprint.sprint_id=?",
+                    (self.sprint_id,),
+                ).fetchone()
+            ),
+        )
+
+    def test_fallback_completion_rolls_back_report_then_retries_cleanly(self):
+        self.con.execute(
+            "UPDATE sprint_work_units SET disposition='active',completed_at=NULL "
+            "WHERE work_unit_id=?",
+            (self.unit_id,),
+        )
+        self.con.commit()
+
+        with self.assertRaises(sprint_domain.SprintConflictError) as caught:
+            self.close.complete(
+                self.sprint_id,
+                3,
+                reason="FnB fallback",
+                terminal_outcome="accepted",
+                final_report="Fallback final report",
+                idempotency_key="nonterminal-fallback",
+            )
+
+        self.assertEqual("sprint_work_nonterminal", caught.exception.details["code"])
+        self.assertEqual(
+            ("armed", 0, 0, 0),
+            tuple(
+                self.con.execute(
+                    "SELECT sprint.lifecycle,"
+                    "(SELECT COUNT(*) FROM sprint_reports report "
+                    " WHERE report.sprint_id=sprint.sprint_id "
+                    " AND report.idempotency_key='nonterminal-fallback'),"
+                    "(SELECT COUNT(*) FROM sprint_events event "
+                    " WHERE event.sprint_id=sprint.sprint_id "
+                    " AND event.event_type IN "
+                    " ('final_report.recorded','lifecycle.completed')) ,"
+                    "(SELECT COUNT(*) FROM sprint_cleanup_targets target "
+                    " WHERE target.sprint_id=sprint.sprint_id) "
+                    "FROM sprints sprint WHERE sprint.sprint_id=?",
+                    (self.sprint_id,),
+                ).fetchone()
+            ),
+        )
+
+        self.con.execute(
+            "UPDATE sprint_work_units SET disposition='completed',"
+            "completed_at=datetime('now') WHERE work_unit_id=?",
+            (self.unit_id,),
+        )
+        self.con.commit()
+        receipt = self.close.complete(
+            self.sprint_id,
+            3,
+            reason="FnB fallback",
+            terminal_outcome="accepted",
+            final_report="Fallback final report",
+            idempotency_key="nonterminal-fallback",
+        )
+
+        self.assertTrue(receipt.changed)
+        self.assertTrue(receipt.report_created)
+        self.assertEqual(
+            ("completed", "accepted", "Fallback final report"),
+            tuple(
+                self.con.execute(
+                    "SELECT sprint.lifecycle,sprint.terminal_outcome,report.body "
+                    "FROM sprints sprint JOIN sprint_reports report "
+                    "ON report.sprint_id=sprint.sprint_id "
+                    "WHERE sprint.sprint_id=? "
+                    "AND report.idempotency_key='nonterminal-fallback'",
+                    (self.sprint_id,),
+                ).fetchone()
+            ),
+        )
+
+    def test_completion_refuses_armed_sprint_without_work_units(self):
+        self.store.pause(
+            self.sprint_id,
+            sprint_domain.LifecycleActor("planner", 3),
+            reason="isolate empty Sprint fixture",
+        )
+        sprint_id, unit_id = self.create_sprint()
+        self.con.execute(
+            "DELETE FROM sprint_work_units WHERE work_unit_id=?",
+            (unit_id,),
+        )
+        self.con.execute(
+            "UPDATE sprints SET conformance_reviewer_shell_id=2,"
+            "conformance_owner_generation=1,lifecycle='armed' WHERE sprint_id=?",
+            (sprint_id,),
+        )
+        self.con.commit()
+
+        with self.assertRaises(sprint_domain.SprintConflictError) as caught:
+            self.close.complete(
+                sprint_id,
+                3,
+                reason="No work",
+                terminal_outcome="accepted",
+            )
+
+        self.assertEqual(
+            {
+                "code": "sprint_work_missing",
+                "work_unit_count": 0,
+                "nonterminal_count": 0,
+                "nonterminal_work_units": [],
+                "truncated": False,
+            },
+            caught.exception.details,
+        )
+        self.assertEqual(
+            ("armed", 0, 0),
+            tuple(
+                self.con.execute(
+                    "SELECT sprint.lifecycle,"
+                    "(SELECT COUNT(*) FROM sprint_reports report "
+                    " WHERE report.sprint_id=sprint.sprint_id),"
+                    "(SELECT COUNT(*) FROM sprint_cleanup_targets target "
+                    " WHERE target.sprint_id=sprint.sprint_id) "
+                    "FROM sprints sprint WHERE sprint.sprint_id=?",
+                    (sprint_id,),
+                ).fetchone()
+            ),
+        )
+
     def test_close_payloads_accept_8000_and_reject_8001_without_partial_writes(self):
         with self.assertRaisesRegex(
             ValueError,
@@ -466,6 +707,7 @@ class ConformanceFollowupTest(SprintCloseCase):
         self.assertEqual(("participant", 2), tuple(lifecycle_event)[:2])
         self.assertEqual(
             {
+                "closed_conversation_ids": [],
                 "from": "armed",
                 "reason": COMPLETION_REASON,
                 "via": "conformance",
@@ -483,6 +725,326 @@ class ConformanceFollowupTest(SprintCloseCase):
                     (receipt.planner_message_id,),
                 )
             ],
+        )
+
+    def test_conformance_closes_only_linked_nonretained_chats_and_replay_is_idle(
+        self,
+    ):
+        self.add_participant(5, "reviewer")
+        self.add_participant(6, "developer")
+        developer_chat = self.activate_chat(1, "linked-developer")
+        author_chat = self.activate_chat(2, "linked-author")
+        planner_chat = self.activate_chat(3, "linked-planner")
+        other_reviewer_chat = self.activate_chat(5, "linked-other-reviewer")
+        former_linked_chat = self.activate_chat(6, "linked-former-developer")
+        self.con.execute(
+            "UPDATE conversations SET state='closed',closed_at=datetime('now') "
+            "WHERE conversation_id=?",
+            (former_linked_chat,),
+        )
+        unrelated_chat = self.activate_chat(6, "unrelated-normal", linked=False)
+        notified: list[str] = []
+
+        def notify_after_commit(conversation_id: str) -> int:
+            self.assertFalse(self.con.in_transaction)
+            state = self.con.execute(
+                "SELECT state FROM conversations WHERE conversation_id=?",
+                (conversation_id,),
+            ).fetchone()[0]
+            self.assertEqual("closed", state)
+            notified.append(conversation_id)
+            return 1
+
+        with mock.patch.object(
+            sprint_close.conversation_events,
+            "notify",
+            side_effect=notify_after_commit,
+        ):
+            first = self.record_conformance(
+                self.sprint_id,
+                2,
+                body="Close only this Sprint's eligible chats.",
+                findings=[],
+                final_report=FINAL_REPORT,
+                idempotency_key="chat-cleanup",
+            )
+
+        self.assertTrue(first.created)
+        self.assertEqual([developer_chat, other_reviewer_chat], notified)
+        self.assertEqual(
+            [
+                (developer_chat, "closed", 1),
+                (author_chat, "idle", 0),
+                (planner_chat, "idle", 0),
+                (other_reviewer_chat, "closed", 1),
+                (unrelated_chat, "idle", 0),
+            ],
+            [
+                tuple(row)
+                for row in self.con.execute(
+                    "SELECT conversation_id,state,closed_at IS NOT NULL "
+                    "FROM conversations WHERE conversation_id IN (?,?,?,?,?) "
+                    "ORDER BY CASE conversation_id "
+                    "WHEN ? THEN 1 WHEN ? THEN 2 WHEN ? THEN 3 WHEN ? THEN 4 ELSE 5 END",
+                    (
+                        developer_chat,
+                        author_chat,
+                        planner_chat,
+                        other_reviewer_chat,
+                        unrelated_chat,
+                        developer_chat,
+                        author_chat,
+                        planner_chat,
+                        other_reviewer_chat,
+                    ),
+                )
+            ],
+        )
+        self.assertEqual(
+            [(2, author_chat), (3, planner_chat), (6, unrelated_chat)],
+            [
+                tuple(row)
+                for row in self.con.execute(
+                    "SELECT shell_id,chat_id FROM active_shell_chats ORDER BY shell_id"
+                )
+            ],
+        )
+        close_events = [
+            (row["conversation_id"], json.loads(row["payload"]))
+            for row in self.con.execute(
+                "SELECT conversation_id,payload FROM conversation_events "
+                "WHERE event_type='conversation.closed' "
+                "AND json_extract(payload,'$.reason')='sprint_completed' "
+                "ORDER BY event_id"
+            )
+        ]
+        self.assertEqual(
+            [
+                (
+                    developer_chat,
+                    {
+                        "reason": "sprint_completed",
+                        "retained_shell_ids": [2, 3],
+                        "sprint_id": self.sprint_id,
+                        "state": "closed",
+                    },
+                ),
+                (
+                    other_reviewer_chat,
+                    {
+                        "reason": "sprint_completed",
+                        "retained_shell_ids": [2, 3],
+                        "sprint_id": self.sprint_id,
+                        "state": "closed",
+                    },
+                ),
+            ],
+            close_events,
+        )
+        lifecycle_payload = json.loads(
+            self.con.execute(
+                "SELECT payload FROM sprint_events WHERE sprint_id=? "
+                "AND event_type='lifecycle.completed'",
+                (self.sprint_id,),
+            ).fetchone()[0]
+        )
+        self.assertEqual(
+            [developer_chat, other_reviewer_chat],
+            lifecycle_payload["closed_conversation_ids"],
+        )
+
+        later_chat = self.activate_chat(1, "post-completion-normal", linked=False)
+        with mock.patch.object(sprint_close.conversation_events, "notify") as notify:
+            replay = self.record_conformance(
+                self.sprint_id,
+                2,
+                body="Close only this Sprint's eligible chats.",
+                findings=[],
+                final_report=FINAL_REPORT,
+                idempotency_key="chat-cleanup",
+            )
+        self.assertFalse(replay.created)
+        notify.assert_not_called()
+        self.assertEqual(
+            ("idle", 0, later_chat),
+            tuple(
+                self.con.execute(
+                    "SELECT conversation.state,conversation.closed_at IS NOT NULL,"
+                    "active.chat_id FROM conversations conversation "
+                    "JOIN active_shell_chats active "
+                    "ON active.chat_id=conversation.conversation_id "
+                    "WHERE conversation.conversation_id=?",
+                    (later_chat,),
+                ).fetchone()
+            ),
+        )
+        with (
+            mock.patch.object(sprint_close.conversation_events, "notify") as notify,
+            self.assertRaisesRegex(
+                sprint_domain.SprintInvariantError,
+                "different input",
+            ),
+        ):
+            self.record_conformance(
+                self.sprint_id,
+                2,
+                body="Divergent replay body.",
+                findings=[],
+                final_report=FINAL_REPORT,
+                idempotency_key="chat-cleanup",
+            )
+        notify.assert_not_called()
+        self.assertEqual(
+            ("idle", 0, later_chat),
+            tuple(
+                self.con.execute(
+                    "SELECT conversation.state,conversation.closed_at IS NOT NULL,"
+                    "active.chat_id FROM conversations conversation "
+                    "JOIN active_shell_chats active "
+                    "ON active.chat_id=conversation.conversation_id "
+                    "WHERE conversation.conversation_id=?",
+                    (later_chat,),
+                ).fetchone()
+            ),
+        )
+        self.assertEqual(
+            2,
+            self.con.execute(
+                "SELECT COUNT(*) FROM conversation_events "
+                "WHERE event_type='conversation.closed' "
+                "AND json_extract(payload,'$.reason')='sprint_completed'"
+            ).fetchone()[0],
+        )
+
+    def test_conformance_close_failure_rolls_back_reports_lifecycle_and_chats(self):
+        self.add_participant(5, "reviewer")
+        developer_chat = self.activate_chat(1, "rollback-developer")
+        other_reviewer_chat = self.activate_chat(5, "rollback-reviewer")
+        original_close = sprint_domain.active_chat_registry.close_for_displacement
+        close_calls = 0
+
+        def fail_second_close(con, shell_id, *, allow_live_process):
+            nonlocal close_calls
+            close_calls += 1
+            if close_calls == 2:
+                raise sprint_domain.active_chat_registry.ActiveChatError(
+                    "injected second close failure"
+                )
+            return original_close(
+                con,
+                shell_id,
+                allow_live_process=allow_live_process,
+            )
+
+        with (
+            mock.patch.object(
+                sprint_domain.active_chat_registry,
+                "close_for_displacement",
+                side_effect=fail_second_close,
+            ),
+            mock.patch.object(sprint_close.conversation_events, "notify") as notify,
+            self.assertRaisesRegex(
+                sprint_domain.active_chat_registry.ActiveChatError,
+                "injected second close failure",
+            ),
+        ):
+            self.record_conformance(
+                self.sprint_id,
+                2,
+                body="This transaction must roll back.",
+                findings=[self.finding()],
+                final_report=FINAL_REPORT,
+                idempotency_key="chat-cleanup-rollback",
+            )
+
+        notify.assert_not_called()
+        self.assertEqual(2, close_calls)
+        self.assertEqual(
+            ("armed", None, 0, 0, 0, 0, 0),
+            tuple(
+                self.con.execute(
+                    "SELECT sprint.lifecycle,sprint.terminal_outcome,"
+                    "(SELECT COUNT(*) FROM sprint_reports WHERE sprint_id=?),"
+                    "(SELECT COUNT(*) FROM sprint_followups WHERE sprint_id=?),"
+                    "(SELECT COUNT(*) FROM wake_message "
+                    " WHERE idempotency_key='chat-cleanup-rollback:planner-completed'),"
+                    "(SELECT COUNT(*) FROM sprint_events WHERE sprint_id=? "
+                    " AND event_type='lifecycle.completed'),"
+                    "(SELECT COUNT(*) FROM conversation_events "
+                    " WHERE event_type='conversation.closed' "
+                    " AND json_extract(payload,'$.reason')='sprint_completed') "
+                    "FROM sprints sprint WHERE sprint.sprint_id=?",
+                    (self.sprint_id,) * 4,
+                ).fetchone()
+            ),
+        )
+        self.assertEqual(
+            [(1, developer_chat), (5, other_reviewer_chat)],
+            [
+                tuple(row)
+                for row in self.con.execute(
+                    "SELECT shell_id,chat_id FROM active_shell_chats "
+                    "WHERE shell_id IN (1,5) ORDER BY shell_id"
+                )
+            ],
+        )
+        self.assertEqual(
+            sorted(
+                [
+                    (developer_chat, "idle", 0),
+                    (other_reviewer_chat, "idle", 0),
+                ]
+            ),
+            [
+                tuple(row)
+                for row in self.con.execute(
+                    "SELECT conversation_id,state,closed_at IS NOT NULL "
+                    "FROM conversations WHERE conversation_id IN (?,?) "
+                    "ORDER BY conversation_id",
+                    tuple(sorted((developer_chat, other_reviewer_chat))),
+                )
+            ],
+        )
+
+    def test_paused_conformance_precondition_preserves_linked_chat(self):
+        developer_chat = self.activate_chat(1, "paused-developer")
+        self.store.pause(
+            self.sprint_id,
+            sprint_domain.LifecycleActor("participant", 1),
+            reason="pause before conformance",
+        )
+
+        with self.assertRaisesRegex(
+            sprint_domain.SprintInvariantError,
+            "conformance requires an armed Sprint, not paused",
+        ):
+            self.record_conformance(
+                self.sprint_id,
+                2,
+                body="Rejected while paused.",
+                findings=[],
+                final_report=FINAL_REPORT,
+                idempotency_key="paused-conformance",
+            )
+
+        self.assertEqual(
+            ("paused", developer_chat, "idle", 0, 0, 0),
+            tuple(
+                self.con.execute(
+                    "SELECT sprint.lifecycle,active.chat_id,conversation.state,"
+                    "conversation.closed_at IS NOT NULL,"
+                    "(SELECT COUNT(*) FROM sprint_reports WHERE sprint_id=? "
+                    " AND report_kind IN ('conformance','final')),"
+                    "(SELECT COUNT(*) FROM conversation_events "
+                    " WHERE event_type='conversation.closed' "
+                    " AND json_extract(payload,'$.reason')='sprint_completed') "
+                    "FROM sprints sprint JOIN active_shell_chats active "
+                    "ON active.shell_id=1 JOIN conversations conversation "
+                    "ON conversation.conversation_id=active.chat_id "
+                    "WHERE sprint.sprint_id=?",
+                    (self.sprint_id, self.sprint_id),
+                ).fetchone()
+            ),
         )
 
     def test_planner_receipt_is_informational_after_automatic_completion(self):
@@ -664,12 +1226,13 @@ class ConformanceFollowupTest(SprintCloseCase):
         )
 
     def test_wrong_role_and_cross_sprint_links_leave_no_report(self):
+        self.add_participant(5, "reviewer")
         before = self.con.execute(
             "SELECT COUNT(*) FROM sprint_reports WHERE sprint_id=?",
             (self.sprint_id,),
         ).fetchone()[0]
         with self.assertRaisesRegex(
-            sprint_domain.SprintAuthorityError, "participating Reviewer"
+            sprint_domain.SprintAuthorityError, "selected conformance Reviewer"
         ):
             self.record_conformance(
                 self.sprint_id,
@@ -678,6 +1241,17 @@ class ConformanceFollowupTest(SprintCloseCase):
                 findings=[],
                 final_report=FINAL_REPORT,
                 idempotency_key="wrong-role",
+            )
+        with self.assertRaisesRegex(
+            sprint_domain.SprintAuthorityError, "selected conformance Reviewer"
+        ):
+            self.record_conformance(
+                self.sprint_id,
+                5,
+                body="Competing Reviewer",
+                findings=[],
+                final_report=FINAL_REPORT,
+                idempotency_key="competing-reviewer",
             )
         with self.assertRaisesRegex(
             sprint_domain.SprintInvariantError, "not bound"
@@ -970,6 +1544,14 @@ class EvidenceCompilerTest(SprintCloseCase):
             hashlib.sha256(b"governing spec revision 1").hexdigest(),
             spec["bound_revision_sha256"],
         )
+        self.assertEqual("available", spec["bound_body_availability"])
+        self.assertEqual(
+            f"sc sprint spec-revision --sprint {self.sprint_id} "
+            f"--document {self.document_id}",
+            spec["read_command"],
+        )
+        self.assertNotIn("body", spec)
+        self.assertNotIn("bound_revision_body", spec)
         edit = packet["spec_revisions"]["mid_sprint_edits"]["items"][0]
         self.assertEqual("b" * 64, edit["payload"]["to_revision_sha256"])
         self.assertEqual(

@@ -45,8 +45,9 @@
 # as untracked content in the main working tree.
 /.sc-worktrees/
 
-# The engine pin is the only tracked .sc-state artifact. Per-instance snapshots,
-# map authorship, retire lists, and flat views are generated local state.
+# The engine pin and explicit source locator are the only tracked .sc-state
+# provenance artifacts. Per-instance snapshots, map authorship, retire lists,
+# and flat views are generated local state.
 /.sc-state/engine.ref.prev
 /.sc-state/content.sql
 /.sc-state/map_content.sql

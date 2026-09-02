@@ -2,6 +2,7 @@
 """Feature #24 conversation schema, transition, and rebuild contracts."""
 from __future__ import annotations
 
+import hashlib
 import json
 import sqlite3
 import sys
@@ -19,10 +20,12 @@ GIT_TARGETS = MIGRATIONS / "0142_conversation_git_targets.sql"
 ACTIVE_REGISTRY = MIGRATIONS / "0162_active_chat_registry.sql"
 REAPER_IDENTITY = MIGRATIONS / "0163_conversation_run_process_identity.sql"
 TOPOLOGY_RETIREMENT = MIGRATIONS / "0168_retire_sprint_conversation_topology.sql"
+LIVE_NATIVE_ROUTES = MIGRATIONS / "0238_final_schema_rebaseline.sql"
 
 sys.path.insert(0, str(ENGINE / "scripts"))
 import conversation_state  # noqa: E402
 import db_driver  # noqa: E402
+import migrate  # noqa: E402
 import snapshot  # noqa: E402
 
 
@@ -67,6 +70,111 @@ class ConversationDbCase(unittest.TestCase):
     def next_key(self, prefix: str) -> str:
         self.serial += 1
         return f"{prefix}-{self.serial}"
+
+    def test_thinking_route_migration_preserves_legacy_and_gates_v2(self) -> None:
+        conversation = self.add_conversation()
+        legacy = self.con.execute(
+            "SELECT route_contract_version,route_binding FROM conversations "
+            "WHERE conversation_id=?", (conversation,),
+        ).fetchone()
+        preset = self.con.execute(
+            "SELECT effort FROM flavor_defaults LIMIT 1"
+        ).fetchone()
+        self.assertEqual(tuple(legacy), (1, None))
+        self.assertEqual(preset["effort"], None)
+
+        values = (
+            1, 1, "codex", "/tmp/v2", "v2-null", "hash-v2-null",
+        )
+        with self.assertRaisesRegex(
+                sqlite3.IntegrityError,
+                "conversation route contract and binding disagree"):
+            self.con.execute(
+                "INSERT INTO conversations "
+                "(shell_id,owner_user_id,harness,worktree,"
+                "creation_idempotency_key,creation_request_hash,"
+                "route_contract_version,route_binding) "
+                "VALUES (?,?,?,?,?,?,2,NULL)", values,
+            )
+        self.assertEqual(
+            self.con.execute(
+                "SELECT COUNT(*) FROM conversations "
+                "WHERE creation_idempotency_key='v2-null'"
+            ).fetchone()[0],
+            0,
+        )
+
+        self.con.execute(
+            "INSERT INTO conversations "
+            "(shell_id,owner_user_id,harness,worktree,"
+            "creation_idempotency_key,creation_request_hash,"
+            "route_contract_version,route_binding) "
+            "VALUES (?,?,?,?,?,?,2,'{}')",
+            (2, 1, "codex", "/tmp/v2", "v2-bound", "hash-v2-bound"),
+        )
+        with self.assertRaisesRegex(
+                sqlite3.IntegrityError, "conversation route identity is immutable"):
+            self.con.execute(
+                "UPDATE conversations SET effort='low' "
+                "WHERE creation_idempotency_key='v2-bound'"
+            )
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.con.execute(
+                "UPDATE flavor_defaults SET effort=' HIGH ' "
+                "WHERE rowid=(SELECT rowid FROM flavor_defaults LIMIT 1)"
+            )
+
+    def test_live_native_migration_preserves_v2_and_admits_only_bound_v3(self) -> None:
+        self.con.execute(
+            "INSERT INTO conversations "
+            "(conversation_id,shell_id,owner_user_id,harness,model,worktree,"
+            "creation_idempotency_key,creation_request_hash,"
+            "route_contract_version,route_binding) "
+            "VALUES ('cv_v2_preserved',1,1,'codex','gpt-test','/tmp/v2',"
+            "'v2-preserved','hash-v2-preserved',2,'{\"contract_version\":2}')"
+        )
+        self.con.execute(
+            "INSERT INTO conversations "
+            "(conversation_id,shell_id,owner_user_id,harness,model,effort,worktree,"
+            "creation_idempotency_key,creation_request_hash,"
+            "route_contract_version,route_binding) "
+            "VALUES ('cv_v3_exact',2,1,'opencode','ollama-cloud/glm-5.2',"
+            "'MAX.Future','/tmp/v3','v3-exact','hash-v3-exact',3,"
+            "'{\"contract_version\":3}')"
+        )
+
+        rows = self.con.execute(
+            "SELECT conversation_id,route_contract_version,route_binding "
+            "FROM conversations WHERE conversation_id IN "
+            "('cv_v2_preserved','cv_v3_exact') ORDER BY conversation_id"
+        ).fetchall()
+        self.assertEqual(
+            [tuple(row) for row in rows],
+            [
+                ("cv_v2_preserved", 2, '{"contract_version":2}'),
+                ("cv_v3_exact", 3, '{"contract_version":3}'),
+            ],
+        )
+        with self.assertRaisesRegex(
+            sqlite3.IntegrityError,
+            "conversation route contract and binding disagree",
+        ):
+            self.con.execute(
+                "INSERT INTO conversations "
+                "(shell_id,owner_user_id,harness,model,worktree,"
+                "creation_idempotency_key,creation_request_hash,"
+                "route_contract_version,route_binding) "
+                "VALUES (3,1,'opencode','ollama-cloud/glm-5.2','/tmp/v3-null',"
+                "'v3-null','hash-v3-null',3,NULL)"
+            )
+        self.assertEqual(
+            self.con.execute(
+                "SELECT COUNT(*) FROM conversations "
+                "WHERE creation_idempotency_key='v3-null'"
+            ).fetchone()[0],
+            0,
+        )
+        self.assertEqual(self.con.execute("PRAGMA foreign_key_check").fetchall(), [])
 
     def add_conversation(
         self,
@@ -190,6 +298,89 @@ class ConversationDbCase(unittest.TestCase):
 
 
 class MigrationAndShapeTest(ConversationDbCase):
+    def test_live_native_migration_preserves_routes_and_dependent_registry(
+        self,
+    ) -> None:
+        con = sqlite3.connect(":memory:")
+        self.addCleanup(con.close)
+        con.row_factory = sqlite3.Row
+        apply_schema(con, through="0234_reseed_ci_fallback_authority.sql")
+        con.execute("INSERT INTO users (user_id,username) VALUES (41,'migration')")
+        con.execute(
+            "INSERT INTO shells "
+            "(shell_id,display_name,shortname,flavor,system_prompt,user_id) "
+            "VALUES (41,'Migration','mig41','dev','prompt',41)"
+        )
+        con.execute(
+            "INSERT INTO shells "
+            "(shell_id,display_name,shortname,flavor,system_prompt,user_id) "
+            "VALUES (42,'Migration v3','mig42','dev','prompt',41)"
+        )
+        con.execute(
+            "INSERT OR REPLACE INTO flavor_defaults "
+            "(flavor,harness,model,is_default,effort) VALUES "
+            "('dev','opencode','ollama-cloud/glm-5.2',0,'high')"
+        )
+        con.execute(
+            "INSERT INTO conversations "
+            "(conversation_id,shell_id,owner_user_id,harness,model,effort,worktree,"
+            "creation_idempotency_key,creation_request_hash,"
+            "route_contract_version,route_binding) VALUES "
+            "('cv_before_v3',41,41,'opencode','ollama-cloud/glm-5.2','high',"
+            "'/tmp/migration','before-v3','before-v3-hash',2,"
+            "'{\"contract_version\":2}')"
+        )
+        con.execute(
+            "INSERT INTO active_shell_chats (shell_id,chat_id) "
+            "VALUES (41,'cv_before_v3')"
+        )
+        before = tuple(con.execute(
+            "SELECT * FROM conversations WHERE conversation_id='cv_before_v3'"
+        ).fetchone())
+        con.commit()
+
+        migrate.apply(con, LIVE_NATIVE_ROUTES)
+
+        self.assertEqual(
+            tuple(con.execute(
+                "SELECT * FROM conversations "
+                "WHERE conversation_id='cv_before_v3'"
+            ).fetchone()),
+            before,
+        )
+        self.assertEqual(
+            tuple(con.execute(
+                "SELECT shell_id,chat_id FROM active_shell_chats"
+            ).fetchone()),
+            (41, "cv_before_v3"),
+        )
+        self.assertEqual(con.execute("PRAGMA foreign_keys").fetchone()[0], 1)
+        self.assertEqual(con.execute("PRAGMA foreign_key_check").fetchall(), [])
+        self.assertIsNotNone(con.execute(
+            "SELECT 1 FROM schema_migrations WHERE filename=?",
+            (LIVE_NATIVE_ROUTES.name,),
+        ).fetchone())
+
+        con.execute(
+            "UPDATE flavor_defaults SET effort='MAX.Future' "
+            "WHERE flavor='dev' AND harness='opencode'"
+        )
+        with self.assertRaises(sqlite3.IntegrityError):
+            con.execute(
+                "INSERT INTO flavor_defaults "
+                "(flavor,harness,model,effort) "
+                "VALUES ('strict-lower','claude','sonnet','MAX.Future')"
+            )
+        con.execute(
+            "INSERT INTO conversations "
+            "(shell_id,owner_user_id,harness,model,effort,worktree,"
+            "creation_idempotency_key,creation_request_hash,"
+            "route_contract_version,route_binding) VALUES "
+            "(42,41,'opencode','ollama-cloud/glm-5.2','MAX.Future',"
+            "'/tmp/migration-v3','after-v3','after-v3-hash',3,"
+            "'{\"contract_version\":3}')"
+        )
+
     def test_installed_fork_upgrades_from_pre_foundation_schema(self) -> None:
         con = sqlite3.connect(":memory:")
         apply_schema(con, through="0129_reseed_api_identity_wording.sql")
@@ -1095,6 +1286,7 @@ class SnapshotPolicyTest(ConversationDbCase):
         "conversations",
         "active_shell_chats",
         "conversation_git_targets",
+        "conversation_boot_snapshots",
         "conversation_messages",
         "conversation_runs",
         "conversation_events",
@@ -1184,6 +1376,175 @@ class SnapshotPolicyTest(ConversationDbCase):
             "PRAGMA foreign_key_check"
         ).fetchall(), [])
         target.close()
+
+
+class BootSnapshotSchemaCase(ConversationDbCase):
+    """Spec #163 conversation_boot_snapshots schema contract."""
+
+    MIGRATION = MIGRATIONS / "0224_conversation_boot_snapshots.sql"
+    DIGEST = hashlib.sha256(b"boot content").hexdigest()
+
+    def bind(self, conversation: str, **overrides) -> None:
+        row = {
+            "conversation_id": conversation,
+            "content": "boot content",
+            "content_sha256": self.DIGEST,
+            "content_bytes": len(b"boot content"),
+            "format_version": 1,
+            "binding_origin": "new_conversation",
+        }
+        row.update(overrides)
+        self.con.execute(
+            "INSERT INTO conversation_boot_snapshots "
+            "(conversation_id,content,content_sha256,content_bytes,"
+            "format_version,binding_origin) "
+            "VALUES (?,?,?,?,?,?)",
+            (
+                row["conversation_id"],
+                row["content"],
+                row["content_sha256"],
+                row["content_bytes"],
+                row["format_version"],
+                row["binding_origin"],
+            ),
+        )
+
+    def test_round_trip_and_bound_at_default(self) -> None:
+        conversation = self.add_conversation()
+        self.bind(conversation)
+        row = self.con.execute(
+            "SELECT content,content_sha256,content_bytes,format_version,"
+            "binding_origin,bound_at FROM conversation_boot_snapshots "
+            "WHERE conversation_id=?",
+            (conversation,),
+        ).fetchone()
+        self.assertEqual(
+            tuple(row)[:5],
+            ("boot content", self.DIGEST, 12, 1, "new_conversation"),
+        )
+        self.assertIsNotNone(row[5])
+
+    def test_one_snapshot_per_conversation(self) -> None:
+        conversation = self.add_conversation()
+        self.bind(conversation)
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.bind(conversation, binding_origin="legacy_first_resume")
+
+    def test_digest_must_be_lowercase_hex_sha256(self) -> None:
+        conversation = self.add_conversation()
+        for bad in ("x" * 64, "A" + self.DIGEST[1:], self.DIGEST[:63]):
+            with self.subTest(digest=bad):
+                with self.assertRaises(sqlite3.IntegrityError):
+                    self.bind(conversation, content_sha256=bad)
+
+    def test_content_is_bounded_and_non_empty(self) -> None:
+        conversation = self.add_conversation()
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.bind(conversation, content="", content_bytes=0)
+        oversized = "a" * (1048576 + 1)
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.bind(
+                conversation,
+                content=oversized,
+                content_bytes=len(oversized),
+            )
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.bind(conversation, content="ok", content_bytes=1048577)
+
+    def test_content_bytes_agrees_with_utf8_bytes(self) -> None:
+        conversation = self.add_conversation()
+        text = "boot ünïcode"  # 13 chars, 15 UTF-8 bytes
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.bind(conversation, content=text, content_bytes=len(text))
+        self.bind(
+            conversation,
+            content=text,
+            content_bytes=len(text.encode("utf-8")),
+        )
+
+    def test_format_version_and_origin_are_constrained(self) -> None:
+        conversation = self.add_conversation()
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.bind(conversation, format_version=0)
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.bind(conversation, binding_origin="fresh_render")
+
+    def test_snapshot_is_immutable(self) -> None:
+        conversation = self.add_conversation()
+        self.bind(conversation)
+        for column, value in (
+            ("content", "tampered"),
+            ("content_sha256", "f" * 64),
+            ("content_bytes", 99),
+            ("format_version", 2),
+            ("binding_origin", "legacy_first_resume"),
+            ("bound_at", "1999-01-01 00:00:00"),
+        ):
+            with self.subTest(column=column):
+                with self.assertRaises(sqlite3.IntegrityError):
+                    self.con.execute(
+                        "UPDATE conversation_boot_snapshots "
+                        f"SET {column}=? WHERE conversation_id=?",
+                        (value, conversation),
+                    )
+
+    def test_snapshot_follows_conversation_delete_cascade(self) -> None:
+        conversation = self.add_conversation()
+        self.bind(conversation)
+        self.con.execute(
+            "DELETE FROM conversations WHERE conversation_id=?",
+            (conversation,),
+        )
+        self.assertIsNone(
+            self.con.execute(
+                "SELECT 1 FROM conversation_boot_snapshots "
+                "WHERE conversation_id=?",
+                (conversation,),
+            ).fetchone(),
+        )
+
+    def test_migration_leaves_legacy_conversations_unbound(self) -> None:
+        legacy = sqlite3.connect(":memory:")
+        legacy.row_factory = sqlite3.Row
+        apply_schema(legacy, through="0223_model_default_effort_binding.sql")
+        legacy.execute(
+            "INSERT INTO users (user_id, username) VALUES (1,'operator')"
+        )
+        legacy.execute(
+            "INSERT INTO shells "
+            "(shell_id,display_name,shortname,flavor,system_prompt,user_id) "
+            "VALUES (1,'Dev','dev1','dev','prompt',1)"
+        )
+        legacy.execute(
+            "INSERT INTO conversations "
+            "(shell_id,owner_user_id,harness,worktree,state,"
+            "creation_idempotency_key,creation_request_hash) "
+            "VALUES (1,1,'codex','/tmp/worktree-1','idle','legacy','legacy-h')"
+        )
+        legacy.executescript(self.MIGRATION.read_text())
+        legacy.execute("PRAGMA foreign_keys=ON")
+        conversation = legacy.execute(
+            "SELECT conversation_id FROM conversations"
+        ).fetchone()[0]
+        self.assertIsNone(
+            legacy.execute(
+                "SELECT 1 FROM conversation_boot_snapshots "
+                "WHERE conversation_id=?",
+                (conversation,),
+            ).fetchone(),
+        )
+        self.assertEqual(
+            tuple(
+                legacy.execute(
+                    "SELECT state,harness FROM conversations"
+                ).fetchone()
+            ),
+            ("idle", "codex"),
+        )
+        self.assertEqual(
+            legacy.execute("PRAGMA foreign_key_check").fetchall(), []
+        )
+        legacy.close()
 
 
 if __name__ == "__main__":

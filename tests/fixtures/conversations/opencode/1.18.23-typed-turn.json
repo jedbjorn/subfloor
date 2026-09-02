@@ -1,0 +1,226 @@
+{
+  "cli_version": "1.18.23",
+  "source": "sanitized live /event capture plus exact-tag tool state shape",
+  "session_ref": "ses_exact",
+  "events": [
+    {
+      "type": "session.idle",
+      "properties": {"sessionID": "ses_exact"}
+    },
+    {
+      "type": "message.updated",
+      "properties": {
+        "sessionID": "ses_exact",
+        "info": {"id": "msg_user", "sessionID": "ses_exact", "role": "user"}
+      }
+    },
+    {
+      "type": "message.part.updated",
+      "properties": {
+        "sessionID": "ses_exact",
+        "part": {
+          "id": "prt_user",
+          "messageID": "msg_user",
+          "sessionID": "ses_exact",
+          "type": "text",
+          "text": "must not project"
+        }
+      }
+    },
+    {
+      "type": "session.status",
+      "properties": {"sessionID": "ses_exact", "status": {"type": "busy"}}
+    },
+    {
+      "type": "session.status",
+      "properties": {"sessionID": "ses_exact", "status": {"type": "busy"}}
+    },
+    {
+      "type": "message.updated",
+      "properties": {
+        "sessionID": "ses_exact",
+        "info": {
+          "id": "msg_assistant",
+          "sessionID": "ses_exact",
+          "role": "assistant",
+          "tokens": {"input": 0, "output": 0, "reasoning": 0}
+        }
+      }
+    },
+    {
+      "type": "message.part.delta",
+      "properties": {
+        "sessionID": "ses_exact",
+        "messageID": "msg_assistant",
+        "partID": "prt_reasoning",
+        "field": "text",
+        "delta": "think"
+      }
+    },
+    {
+      "type": "message.part.updated",
+      "properties": {
+        "sessionID": "ses_exact",
+        "part": {
+          "id": "prt_reasoning",
+          "messageID": "msg_assistant",
+          "sessionID": "ses_exact",
+          "type": "reasoning",
+          "text": ""
+        }
+      }
+    },
+    {
+      "type": "message.part.updated",
+      "properties": {
+        "sessionID": "ses_exact",
+        "part": {
+          "id": "prt_reasoning",
+          "messageID": "msg_assistant",
+          "sessionID": "ses_exact",
+          "type": "reasoning",
+          "text": "thinking",
+          "time": {"start": 1, "end": 2}
+        }
+      }
+    },
+    {
+      "type": "message.part.updated",
+      "properties": {
+        "sessionID": "ses_exact",
+        "part": {
+          "id": "prt_answer",
+          "messageID": "msg_assistant",
+          "sessionID": "ses_exact",
+          "type": "text",
+          "text": ""
+        }
+      }
+    },
+    {
+      "type": "message.part.delta",
+      "properties": {
+        "sessionID": "ses_exact",
+        "messageID": "msg_assistant",
+        "partID": "prt_answer",
+        "field": "text",
+        "delta": "OK"
+      }
+    },
+    {
+      "type": "message.part.updated",
+      "properties": {
+        "sessionID": "ses_exact",
+        "part": {
+          "id": "prt_answer",
+          "messageID": "msg_assistant",
+          "sessionID": "ses_exact",
+          "type": "text",
+          "text": "OK",
+          "time": {"start": 2, "end": 3}
+        }
+      }
+    },
+    {
+      "type": "message.part.updated",
+      "properties": {
+        "sessionID": "ses_exact",
+        "part": {
+          "id": "prt_tool",
+          "messageID": "msg_assistant",
+          "sessionID": "ses_exact",
+          "type": "tool",
+          "callID": "call_1",
+          "tool": "bash",
+          "state": {"status": "running", "input": {"command": "pwd"}}
+        }
+      }
+    },
+    {
+      "type": "message.part.updated",
+      "properties": {
+        "sessionID": "ses_exact",
+        "part": {
+          "id": "prt_tool",
+          "messageID": "msg_assistant",
+          "sessionID": "ses_exact",
+          "type": "tool",
+          "callID": "call_1",
+          "tool": "bash",
+          "state": {"status": "running", "input": {"command": "pwd"}}
+        }
+      }
+    },
+    {
+      "type": "message.part.updated",
+      "properties": {
+        "sessionID": "ses_exact",
+        "part": {
+          "id": "prt_tool",
+          "messageID": "msg_assistant",
+          "sessionID": "ses_exact",
+          "type": "tool",
+          "callID": "call_1",
+          "tool": "bash",
+          "state": {"status": "completed", "output": "/tmp"}
+        }
+      }
+    },
+    {
+      "type": "message.part.updated",
+      "properties": {
+        "sessionID": "ses_exact",
+        "part": {
+          "id": "prt_tool",
+          "messageID": "msg_assistant",
+          "sessionID": "ses_exact",
+          "type": "tool",
+          "callID": "call_1",
+          "tool": "bash",
+          "state": {"status": "completed", "output": "/tmp"}
+        }
+      }
+    },
+    {
+      "type": "message.updated",
+      "properties": {
+        "sessionID": "ses_exact",
+        "info": {
+          "id": "msg_assistant",
+          "sessionID": "ses_exact",
+          "role": "assistant",
+          "tokens": {"input": 8602, "output": 31, "reasoning": 0}
+        }
+      }
+    },
+    {
+      "type": "message.updated",
+      "properties": {
+        "sessionID": "ses_exact",
+        "info": {
+          "id": "msg_assistant",
+          "sessionID": "ses_exact",
+          "role": "assistant",
+          "tokens": {"input": 8602, "output": 31, "reasoning": 0}
+        }
+      }
+    },
+    {
+      "type": "session.idle",
+      "properties": {"sessionID": "ses_exact"}
+    }
+  ],
+  "response": {
+    "info": {
+      "id": "msg_assistant",
+      "sessionID": "ses_exact",
+      "role": "assistant",
+      "tokens": {"input": 8602, "output": 31, "reasoning": 0}
+    },
+    "parts": [
+      {"id": "prt_reasoning", "messageID": "msg_assistant", "sessionID": "ses_exact", "type": "reasoning", "text": "thinking"},
+      {"id": "prt_answer", "messageID": "msg_assistant", "sessionID": "ses_exact", "type": "text", "text": "OK"},
+      {"id": "prt_tool", "messageID": "msg_assistant", "sessionID": "ses_exact", "type": "tool", "callID": "call_1", "tool": "bash", "state": {"status": "completed", "output": "/tmp"}}
+    ]
+  }
+}

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import pty
 import shutil
 import subprocess
 import tempfile
@@ -40,6 +41,14 @@ class VerifyCleanCloneTest(unittest.TestCase):
                 checkout / ".super-coder" / "scripts" / "run.py",
             )
             shutil.copy2(
+                ROOT / ".super-coder" / "scripts" / "git_freshness.py",
+                checkout / ".super-coder" / "scripts" / "git_freshness.py",
+            )
+            shutil.copy2(
+                ROOT / ".super-coder" / "render" / "compose.py",
+                checkout / ".super-coder" / "render" / "compose.py",
+            )
+            shutil.copy2(
                 ROOT / ".super-coder" / "scripts" / "global_pointer.py",
                 checkout / ".super-coder" / "scripts" / "global_pointer.py",
             )
@@ -49,14 +58,34 @@ class VerifyCleanCloneTest(unittest.TestCase):
             )
             env = os.environ.copy()
             env.pop("SC_ARTIFACT_MODE", None)
-            result = subprocess.run(
-                ["./sc", "verify"], cwd=checkout, env=env,
-                capture_output=True, text=True,
-            )
+            master, slave = pty.openpty()
+            try:
+                process = subprocess.Popen(
+                    ["./sc", "verify"],
+                    cwd=checkout,
+                    env=env,
+                    stdin=slave,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                )
+                os.close(slave)
+                slave = -1
+                try:
+                    stdout, stderr = process.communicate(timeout=120)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.communicate()
+                    raise
+            finally:
+                if slave >= 0:
+                    os.close(slave)
+                os.close(master)
             self.assertEqual(
-                result.returncode, 0,
-                f"stdout:\n{result.stdout}\n\nstderr:\n{result.stderr}",
+                process.returncode, 0,
+                f"stdout:\n{stdout}\n\nstderr:\n{stderr}",
             )
+            self.assertNotIn("Username:", stdout)
 
 
 if __name__ == "__main__":

@@ -7,17 +7,15 @@ name: render-check
 
 on:
   pull_request:
-  push:
-    branches: [main]
 
 jobs:
   render-check:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: '3.x'
+          python-version: '3.14'
       - name: Rebuild the DB from public system text
         run: ./sc rebuild
       - name: Prove public skill migrations match engine assets

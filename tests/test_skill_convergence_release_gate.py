@@ -153,7 +153,7 @@ class SkillConvergenceReleaseGateTest(unittest.TestCase):
     @contextmanager
     def patched_update(self, fixture, projection_runs, catalogue_runs):
         real_projection = skill_projection.reconcile_existing_checkouts
-        real_catalogue = update.flat.render_visibility
+        real_catalogue = update.flat.render_skills_catalogue
 
         def reconcile(con):
             summary = real_projection(con, repo_root=fixture.root)
@@ -178,11 +178,18 @@ class SkillConvergenceReleaseGateTest(unittest.TestCase):
                 "repair_git_worktrees",
                 "migrate_engine_untrack",
                 "migrate_generated_artifacts_local",
-                "migrate_with_service_cutover",
                 "refresh_installed_brokers",
                 "run_script",
+                "snapshot_under_cutover",
             ):
                 stack.enter_context(mock.patch.object(update, name))
+            stack.enter_context(
+                mock.patch.object(
+                    update,
+                    "migrate_with_service_cutover",
+                    side_effect=lambda **kwargs: kwargs["reconcile"](),
+                )
+            )
             stack.enter_context(mock.patch.object(update, "is_source_repo", return_value=False))
             stack.enter_context(
                 mock.patch.object(update, "ensure_workflows", return_value=("unchanged", []))
@@ -209,7 +216,7 @@ class SkillConvergenceReleaseGateTest(unittest.TestCase):
             )
             stack.enter_context(
                 mock.patch.object(
-                    update.flat, "render_visibility", side_effect=render_catalogue
+                    update.flat, "render_skills_catalogue", side_effect=render_catalogue
                 )
             )
             yield
@@ -260,19 +267,13 @@ class SkillConvergenceReleaseGateTest(unittest.TestCase):
             )
         return projected, catalogued
 
-    def test_update_failure_is_loud_then_two_retries_converge_to_noop(self) -> None:
+    def test_update_advises_then_two_retries_converge_to_noop(self) -> None:
         fixture = self.build_fixture("update-fork")
         projection_runs = []
         catalogue_runs = []
         with self.patched_update(fixture, projection_runs, catalogue_runs):
             with self.blocked_projection_root(fixture) as (parked, sentinel):
-                with self.assertRaisesRegex(
-                    SystemExit,
-                    "update catalogue reconciliation committed in the DB, but "
-                    "skill projection failed: managed skill root is a symlink.*"
-                    "run `./sc update --no-fetch`.*retry exact cleanup",
-                ):
-                    update.main(["--no-fetch"])
+                self.assertEqual(update.main(["--no-fetch"]), 0)
                 self.assertEqual(sentinel.read_bytes(), b"outside projection control\n")
                 self.assertTrue(parked.joinpath(TOMBSTONE_SKILLS[0]).is_dir())
                 self.assertEqual(

@@ -9,6 +9,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -17,12 +18,23 @@ MIGRATIONS = ENGINE / "migrations"
 
 sys.path.insert(0, str(ENGINE / "scripts"))
 sys.path.insert(0, str(ENGINE / "api"))
+import active_chat_registry
 import db_driver
 import server
 import sprint_domain
+import sprint_liveness
 import sprint_message_delivery as delivery
 import sprint_runtime
-from conversation_adapters import AdapterError
+from conversation_adapters import (
+    AdapterError,
+    CodexAdapter,
+    KimiAdapter,
+    OpenCodeAdapter,
+)
+from conversation_adapters import base as adapter_base
+from conversation_adapters import opencode as opencode_adapter
+from conversation_adapters.base import AdapterCapabilities, checked_probe_result
+from sprint_route_binding_support import candidate as route_candidate
 
 
 def apply_schema(con: sqlite3.Connection) -> None:
@@ -34,6 +46,17 @@ def apply_schema(con: sqlite3.Connection) -> None:
 
 class SprintWorkDispatchCase(unittest.TestCase):
     def setUp(self) -> None:
+        route_patch = mock.patch.object(
+            sprint_domain, "_participant_binding_candidate", side_effect=route_candidate
+        )
+        route_patch.start()
+        self.addCleanup(route_patch.stop)
+        evidence_patch = mock.patch.object(
+            sprint_domain.route_bindings,
+            "verify_stored_v2_before_first_turn",
+        )
+        evidence_patch.start()
+        self.addCleanup(evidence_patch.stop)
         quiet_env = mock.patch.dict(
             "os.environ", {"SC_SPRINT_FORCE_NEW_QUIET_SECONDS": "0"}
         )
@@ -218,9 +241,522 @@ class DispatchGateTest(SprintWorkDispatchCase):
             ),
         )
 
-        lifecycle.arm(self.sprint_id, 3)
+        lifecycle.arm(self.sprint_id, 3, conformance_reviewer_shell_id=2)
 
         self.assertEqual([("codex", False), ("kimi", False)], observed)
+
+    def test_opencode_arm_and_reroute_probe_never_touch_global_server(self) -> None:
+        self.create_unit(developer=1)
+        self.con.execute(
+            "UPDATE sprint_participants SET harness='opencode',model=NULL,"
+            "effort=NULL WHERE sprint_id=? AND shell_id=1",
+            (self.sprint_id,),
+        )
+        self.con.commit()
+
+        def adapter(harness: str):
+            if harness == "opencode":
+                return OpenCodeAdapter()
+            if harness == "codex":
+                return CodexAdapter(rpc=mock.Mock())
+            if harness == "kimi":
+                return KimiAdapter()
+            raise AssertionError(harness)
+
+        versions = {
+            "codex": "codex-cli 0.147.0",
+            "kimi": "0.33.0",
+            "opencode": "1.18.9",
+        }
+
+        def version_output(argv, **_kwargs):
+            return SimpleNamespace(
+                returncode=0,
+                stdout=versions[Path(argv[0]).name] + "\n",
+                stderr="",
+            )
+
+        existing_global = mock.Mock()
+        with (
+            mock.patch.object(sprint_domain, "adapter_for", side_effect=adapter),
+            mock.patch.object(
+                adapter_base.subprocess,
+                "run",
+                side_effect=version_output,
+            ),
+            mock.patch.object(opencode_adapter, "ensure_server") as ensure_server,
+        ):
+            lifecycle = sprint_domain.SprintLifecycleStore(self.con)
+            lifecycle.arm(self.sprint_id, 3, conformance_reviewer_shell_id=2)
+            lifecycle.pause(
+                self.sprint_id,
+                sprint_domain.LifecycleActor("planner", 3),
+                reason="verify process-free OpenCode reroute",
+            )
+            with mock.patch.object(
+                opencode_adapter,
+                "_SERVER_PROCESS",
+                existing_global,
+            ):
+                receipt = sprint_domain.SprintParticipantStore(self.con).reroute(
+                    self.sprint_id,
+                    3,
+                    participant_shell_id=4,
+                    harness="opencode",
+                    model=None,
+                    effort=None,
+                )
+
+        self.assertTrue(receipt.changed)
+        ensure_server.assert_not_called()
+        self.assertEqual(existing_global.mock_calls, [])
+
+    def test_arm_binds_every_participant_once_and_preserves_generation(self) -> None:
+        self.create_unit(developer=1)
+        self.con.execute(
+            "UPDATE sprint_participants SET model='gpt-test',effort='high' "
+            "WHERE sprint_id=? AND shell_id=3",
+            (self.sprint_id,),
+        )
+        self.con.execute(
+            "UPDATE sprint_participants SET harness='vibe',model='devstral',"
+            "effort=NULL WHERE sprint_id=? AND shell_id=1",
+            (self.sprint_id,),
+        )
+        self.con.execute(
+            "UPDATE sprint_participants SET model='kimi-test',effort='medium' "
+            "WHERE sprint_id=? AND role='reviewer'",
+            (self.sprint_id,),
+        )
+        self.con.commit()
+        generation = self.con.execute(
+            "SELECT conversation_generation FROM sprints WHERE sprint_id=?",
+            (self.sprint_id,),
+        ).fetchone()[0]
+        self.assertEqual(
+            0,
+            self.con.execute(
+                "SELECT COUNT(*) FROM sprint_participant_route_bindings"
+            ).fetchone()[0],
+        )
+
+        self.lifecycle.arm(
+            self.sprint_id, 3, conformance_reviewer_shell_id=2
+        )
+
+        rows = self.con.execute(
+            "SELECT participant.shell_id,binding.route_revision,"
+            "binding.control_state,binding.requested_model,"
+            "binding.requested_effort,binding.effective_effort,"
+            "binding.catalogue_generation,binding.evidence_digest,"
+            "binding.harness_version,binding.harness_support_state "
+            "FROM sprint_participants participant "
+            "JOIN sprint_participant_route_bindings binding "
+            "ON binding.binding_id=participant.active_route_binding_id "
+            "WHERE participant.sprint_id=? ORDER BY participant.shell_id",
+            (self.sprint_id,),
+        ).fetchall()
+        self.assertEqual(5, len(rows))
+        self.assertEqual({1, 2, 3, 4, 5}, {int(row[0]) for row in rows})
+        self.assertTrue(all(int(row[1]) == 1 for row in rows))
+        vibe = next(row for row in rows if int(row[0]) == 1)
+        default = next(row for row in rows if int(row[0]) == 4)
+        self.assertEqual(
+            ("native-uncontrolled", "devstral", None, None, None, None),
+            tuple(vibe)[2:8],
+        )
+        self.assertEqual(
+            ("harness-default", None, None, None, None, None),
+            tuple(default)[2:8],
+        )
+        controlled = [row for row in rows if row[2] == "controlled"]
+        self.assertEqual(3, len(controlled))
+        self.assertTrue(all(row[6] == "1" * 32 for row in controlled))
+        self.assertTrue(all(row[7] == "2" * 64 for row in controlled))
+        self.assertTrue(all(row[9] in {"tested", "best-effort"} for row in rows))
+        self.assertTrue(all(row[9] == "tested" for row in controlled))
+        self.assertEqual(
+            generation,
+            self.con.execute(
+                "SELECT conversation_generation FROM sprints WHERE sprint_id=?",
+                (self.sprint_id,),
+            ).fetchone()[0],
+        )
+
+    def test_unknown_route_blocks_sprint_before_writes(self) -> None:
+        self.create_unit(developer=1)
+        self.con.execute(
+            "UPDATE sprint_participants SET harness='unsupported',"
+            "model='acme/model-7',effort='high' "
+            "WHERE sprint_id=? AND shell_id=1",
+            (self.sprint_id,),
+        )
+        self.con.commit()
+
+        with self.assertRaises(sprint_domain.SprintPreflightError) as refused:
+            self.lifecycle.arm(
+                self.sprint_id, 3, conformance_reviewer_shell_id=2
+            )
+
+        self.assertEqual(refused.exception.code, "unsupported_thinking_level")
+        self.assertEqual(refused.exception.details, {"harness": "unsupported"})
+        self.assertEqual(
+            self.con.execute(
+                "SELECT lifecycle FROM sprints WHERE sprint_id=?",
+                (self.sprint_id,),
+            ).fetchone()[0],
+            "prepared",
+        )
+        self.assertEqual(
+            self.con.execute(
+                "SELECT COUNT(*) FROM sprint_participant_route_bindings"
+            ).fetchone()[0],
+            0,
+        )
+        self.assertEqual(
+            self.con.execute(
+                "SELECT COUNT(*) FROM sprint_participants "
+                "WHERE active_route_binding_id IS NOT NULL"
+            ).fetchone()[0],
+            0,
+        )
+
+    def test_arm_binding_failure_rolls_back_every_binding_wake_and_state(self) -> None:
+        self.create_unit(developer=1)
+        original = sprint_domain.route_bindings.ParticipantRouteBindingStore.bind
+        calls = 0
+
+        def fail_second(store, *args, **kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                raise ValueError("injected second binding failure")
+            return original(store, *args, **kwargs)
+
+        with (
+            mock.patch.object(
+                sprint_domain.route_bindings.ParticipantRouteBindingStore,
+                "bind",
+                new=fail_second,
+            ),
+            self.assertRaisesRegex(ValueError, "second binding failure"),
+        ):
+            self.lifecycle.arm(
+                self.sprint_id, 3, conformance_reviewer_shell_id=2
+            )
+
+        self.assertEqual(
+            ("prepared", 0, 0, 0),
+            (
+                self.con.execute(
+                    "SELECT lifecycle FROM sprints WHERE sprint_id=?",
+                    (self.sprint_id,),
+                ).fetchone()[0],
+                self.con.execute(
+                    "SELECT COUNT(*) FROM sprint_participant_route_bindings"
+                ).fetchone()[0],
+                self.con.execute("SELECT COUNT(*) FROM wake_message").fetchone()[0],
+                self.con.execute(
+                    "SELECT COUNT(*) FROM sprint_participants "
+                    "WHERE active_route_binding_id IS NOT NULL"
+                ).fetchone()[0],
+            ),
+        )
+
+    def test_prepared_reroute_stays_unbound_then_paused_reroute_advances_only_target(
+        self,
+    ) -> None:
+        unit_id = self.create_unit(developer=1)
+        participants = sprint_domain.SprintParticipantStore(
+            self.con, probe_harness=lambda _harness: None
+        )
+        prepared = participants.reroute(
+            self.sprint_id,
+            3,
+            participant_shell_id=4,
+            harness="vibe",
+            model="devstral",
+            effort=None,
+            route="Vibe devstral",
+        )
+        self.assertEqual(
+            (True, "unbound-intent", "native-uncontrolled", None, None),
+            (
+                prepared.changed,
+                prepared.binding_status,
+                prepared.control_state,
+                prepared.route_revision,
+                prepared.binding_digest,
+            ),
+        )
+        self.assertEqual(
+            0,
+            self.con.execute(
+                "SELECT COUNT(*) FROM sprint_participant_route_bindings"
+            ).fetchone()[0],
+        )
+        generation = self.con.execute(
+            "SELECT conversation_generation FROM sprints WHERE sprint_id=?",
+            (self.sprint_id,),
+        ).fetchone()[0]
+        self.lifecycle.arm(
+            self.sprint_id, 3, conformance_reviewer_shell_id=2
+        )
+        before = {
+            int(row[0]): (int(row[1]), str(row[2]))
+            for row in self.con.execute(
+                "SELECT participant.shell_id,binding.route_revision,"
+                "binding.binding_digest FROM sprint_participants participant "
+                "JOIN sprint_participant_route_bindings binding "
+                "ON binding.binding_id=participant.active_route_binding_id "
+                "WHERE participant.sprint_id=?",
+                (self.sprint_id,),
+            )
+        }
+        self.lifecycle.pause(
+            self.sprint_id,
+            sprint_domain.LifecycleActor("planner", 3),
+            reason="reroute idle reserve",
+        )
+        revised = participants.reroute(
+            self.sprint_id,
+            3,
+            participant_shell_id=4,
+            harness="vibe",
+            model="codestral",
+            effort=None,
+            route="Vibe codestral",
+        )
+        self.assertEqual("bound", revised.binding_status)
+        self.assertEqual(2, revised.route_revision)
+        after = {
+            int(row[0]): (int(row[1]), str(row[2]))
+            for row in self.con.execute(
+                "SELECT participant.shell_id,binding.route_revision,"
+                "binding.binding_digest FROM sprint_participants participant "
+                "JOIN sprint_participant_route_bindings binding "
+                "ON binding.binding_id=participant.active_route_binding_id "
+                "WHERE participant.sprint_id=?",
+                (self.sprint_id,),
+            )
+        }
+        self.assertNotEqual(before[4], after[4])
+        self.assertEqual((2, revised.binding_digest), after[4])
+        self.assertEqual(
+            {shell: value for shell, value in before.items() if shell != 4},
+            {shell: value for shell, value in after.items() if shell != 4},
+        )
+        self.assertEqual(
+            generation,
+            self.con.execute(
+                "SELECT conversation_generation FROM sprints WHERE sprint_id=?",
+                (self.sprint_id,),
+            ).fetchone()[0],
+        )
+        with self.assertRaisesRegex(
+            sprint_domain.SprintInvariantError, "still owns released work unit"
+        ):
+            participants.reroute(
+                self.sprint_id,
+                3,
+                participant_shell_id=1,
+                harness="vibe",
+                model="blocked",
+                effort=None,
+            )
+        self.assertEqual(
+            "ready",
+            self.con.execute(
+                "SELECT disposition FROM sprint_work_units WHERE work_unit_id=?",
+                (unit_id,),
+            ).fetchone()[0],
+        )
+        self.assertEqual(1, before[1][0])
+        self.assertEqual(before[1], after[1])
+
+    def test_paused_reroute_closes_idle_linked_chat_before_fresh_delivery(self):
+        unit_id = self.create_unit(developer=1)
+        self.lifecycle.arm(
+            self.sprint_id, 3, conformance_reviewer_shell_id=2
+        )
+        self.deliver_pending_wakes()
+        original_message_id = self.assignment_message(unit_id)
+        self.assertEqual(
+            "accepted", self.messages.mark_read(original_message_id, 1)
+        )
+        original_chat_id = self.conversation_for(1)
+        participant_id = int(
+            self.con.execute(
+                "SELECT participant_id FROM sprint_participants "
+                "WHERE sprint_id=? AND shell_id=1",
+                (self.sprint_id,),
+            ).fetchone()[0]
+        )
+        self.assertEqual(
+            ("idle", "sprint", participant_id),
+            tuple(
+                self.con.execute(
+                    "SELECT conversation.state,conversation.conversation_scope,"
+                    "link.sprint_participant_id "
+                    "FROM conversations conversation "
+                    "JOIN sprint_participant_conversations link "
+                    "ON link.conversation_id=conversation.conversation_id "
+                    "WHERE conversation.conversation_id=?",
+                    (original_chat_id,),
+                ).fetchone()
+            ),
+        )
+        self.lifecycle.pause(
+            self.sprint_id,
+            sprint_domain.LifecycleActor("planner", 3),
+            reason="replace the idle Developer route",
+        )
+
+        notifications: list[tuple[str, bool]] = []
+        with mock.patch.object(
+            sprint_domain.conversation_events,
+            "notify",
+            side_effect=lambda chat_id: notifications.append(
+                (chat_id, self.con.in_transaction)
+            ),
+        ):
+            receipt = sprint_domain.SprintParticipantStore(
+                self.con, probe_harness=lambda _harness: None
+            ).reroute(
+                self.sprint_id,
+                3,
+                participant_shell_id=1,
+                harness="codex",
+                model="replacement-model",
+                effort="medium",
+                route="codex/replacement-model",
+            )
+
+        self.assertEqual((True, "bound", 2), (
+            receipt.changed,
+            receipt.binding_status,
+            receipt.route_revision,
+        ))
+        self.assertEqual(
+            ("closed", 0),
+            (
+                self.con.execute(
+                    "SELECT state FROM conversations WHERE conversation_id=?",
+                    (original_chat_id,),
+                ).fetchone()[0],
+                self.con.execute(
+                    "SELECT COUNT(*) FROM active_shell_chats WHERE shell_id=1"
+                ).fetchone()[0],
+            ),
+        )
+        closed_event = self.con.execute(
+            "SELECT payload FROM conversation_events WHERE conversation_id=? "
+            "AND event_type='conversation.closed'",
+            (original_chat_id,),
+        ).fetchone()
+        self.assertEqual(
+            {
+                "reason": "paused participant reroute",
+                "state": "closed",
+                "sprint_id": self.sprint_id,
+                "participant_id": participant_id,
+            },
+            json.loads(closed_event[0]),
+        )
+        self.assertEqual([(original_chat_id, False)], notifications)
+
+        replacement = self.con.execute(
+            "SELECT message_id,declared_type,delivered_at,to_participant_id "
+            "FROM wake_message WHERE sprint_id=? AND work_unit_id=? "
+            "AND message_kind='work_assignment' ORDER BY message_id DESC LIMIT 1",
+            (self.sprint_id, unit_id),
+        ).fetchone()
+        self.assertEqual(
+            ("force-new", None, participant_id),
+            tuple(replacement[field] for field in (
+                "declared_type", "delivered_at", "to_participant_id"
+            )),
+        )
+        self.assertNotEqual(
+            original_message_id, int(replacement["message_id"])
+        )
+        self.assertEqual(
+            ("replacement-model", "medium", 2),
+            tuple(
+                self.con.execute(
+                    "SELECT participant.model,participant.effort,"
+                    "binding.route_revision FROM sprint_participants participant "
+                    "JOIN sprint_participant_route_bindings binding "
+                    "ON binding.binding_id=participant.active_route_binding_id "
+                    "WHERE participant.participant_id=?",
+                    (participant_id,),
+                ).fetchone()
+            ),
+        )
+
+    def test_paused_reroute_refuses_unlinked_idle_active_chat(self):
+        self.create_unit(developer=1)
+        self.lifecycle.arm(
+            self.sprint_id, 3, conformance_reviewer_shell_id=2
+        )
+        self.lifecycle.pause(
+            self.sprint_id,
+            sprint_domain.LifecycleActor("planner", 3),
+            reason="verify chat ownership before reroute",
+        )
+        chat_id = "cv_unrelated_reroute"
+        self.con.execute(
+            "INSERT INTO conversations "
+            "(conversation_id,shell_id,owner_user_id,harness,worktree,title,"
+            "creation_idempotency_key,creation_request_hash) "
+            "VALUES (?,4,1,'codex','/tmp/dev2','Unrelated chat',?,?)",
+            (chat_id, "unrelated-reroute-chat", "unrelated-reroute-hash"),
+        )
+        active_chat_registry.register(self.con, 4, chat_id)
+        before = tuple(
+            self.con.execute(
+                "SELECT harness,model,effort,route FROM sprint_participants "
+                "WHERE sprint_id=? AND shell_id=4",
+                (self.sprint_id,),
+            ).fetchone()
+        )
+        self.con.commit()
+
+        with self.assertRaisesRegex(
+            sprint_domain.SprintInvariantError, "unrelated active chat"
+        ):
+            sprint_domain.SprintParticipantStore(
+                self.con, probe_harness=lambda _harness: None
+            ).reroute(
+                self.sprint_id,
+                3,
+                participant_shell_id=4,
+                harness="codex",
+                model="replacement-model",
+                effort="medium",
+                route="codex/replacement-model",
+            )
+
+        self.assertEqual(
+            (before, ("idle", chat_id)),
+            (
+                tuple(
+                    self.con.execute(
+                        "SELECT harness,model,effort,route FROM sprint_participants "
+                        "WHERE sprint_id=? AND shell_id=4",
+                        (self.sprint_id,),
+                    ).fetchone()
+                ),
+                tuple(
+                    self.con.execute(
+                        "SELECT conversation.state,active.chat_id "
+                        "FROM active_shell_chats active JOIN conversations conversation "
+                        "ON conversation.conversation_id=active.chat_id "
+                        "WHERE active.shell_id=4"
+                    ).fetchone()
+                ),
+            ),
+        )
 
     def test_arm_default_preflight_uses_the_conversation_adapter_probe(self) -> None:
         self.create_unit(developer=1)
@@ -237,7 +773,9 @@ class DispatchGateTest(SprintWorkDispatchCase):
             "adapter_for",
             side_effect=lambda harness: adapters[harness],
         ) as adapter_factory:
-            sprint_domain.SprintLifecycleStore(self.con).arm(self.sprint_id, 3)
+            sprint_domain.SprintLifecycleStore(self.con).arm(
+                self.sprint_id, 3, conformance_reviewer_shell_id=2
+            )
 
         self.assertEqual(
             [mock.call("codex"), mock.call("kimi")],
@@ -262,7 +800,7 @@ class DispatchGateTest(SprintWorkDispatchCase):
         ) as caught:
             sprint_domain.SprintLifecycleStore(
                 self.con, probe_harness=unavailable
-            ).arm(self.sprint_id, 3)
+            ).arm(self.sprint_id, 3, conformance_reviewer_shell_id=2)
 
         self.assert_arm_left_no_writes()
         handler = object.__new__(server.Handler)
@@ -283,32 +821,126 @@ class DispatchGateTest(SprintWorkDispatchCase):
 
         with self.assertRaisesRegex(
             sprint_domain.SprintInvariantError,
-            "unknown-harness.*no browser conversation adapter",
+            "Harness is not supported",
         ) as caught:
-            self.lifecycle.arm(self.sprint_id, 3)
-
-        self.assertIsInstance(caught.exception, sprint_domain.SprintPreflightError)
-        self.assert_arm_left_no_writes()
-
-    def test_arm_rejects_out_of_range_harness_before_any_write(self) -> None:
-        self.create_unit(developer=1)
-
-        def unsupported(harness: str):
-            raise AdapterError(
-                "HARNESS_VERSION_UNSUPPORTED",
-                f"{harness} 99.0.0 is outside supported range [1.0.0, 2.0.0)",
+            self.lifecycle.arm(
+                self.sprint_id, 3, conformance_reviewer_shell_id=2
             )
 
-        with self.assertRaisesRegex(
-            sprint_domain.SprintInvariantError,
-            "HARNESS_VERSION_UNSUPPORTED",
-        ) as caught:
-            sprint_domain.SprintLifecycleStore(
-                self.con, probe_harness=unsupported
-            ).arm(self.sprint_id, 3)
-
         self.assertIsInstance(caught.exception, sprint_domain.SprintPreflightError)
         self.assert_arm_left_no_writes()
+
+    def test_arm_uses_bound_route_evidence_not_static_harness_probe(self) -> None:
+        self.create_unit(developer=1)
+        observed: list[tuple[str, str]] = []
+        capabilities = AdapterCapabilities(
+            exact_session_resume=True,
+            structured_streaming=True,
+            interruption=True,
+            interactive_permission_response=True,
+            server_backed=True,
+            session_inspection=True,
+        )
+        manifest = {
+            "conversation": {
+                "minimum_cli_version": "1.0.0",
+                "maximum_cli_version_exclusive": "2.0.0",
+                "verified_cli_version": "1.5.0",
+            }
+        }
+
+        def newer(harness: str):
+            result = checked_probe_result(
+                harness=harness,
+                manifest=manifest,
+                capabilities=capabilities,
+                version="2.0.0",
+            )
+            observed.append((harness, result.compatibility))
+            return result
+
+        sprint_domain.SprintLifecycleStore(
+            self.con, probe_harness=newer
+        ).arm(self.sprint_id, 3, conformance_reviewer_shell_id=2)
+
+        self.assertEqual(
+            [("codex", "newer-unverified"), ("kimi", "newer-unverified")],
+            observed,
+        )
+        self.assertEqual(
+            "armed",
+            self.con.execute(
+                "SELECT lifecycle FROM sprints WHERE sprint_id=?",
+                (self.sprint_id,),
+            ).fetchone()[0],
+        )
+
+    def test_arm_does_not_reapply_static_harness_version_admission(self) -> None:
+        self.create_unit(developer=1)
+
+        def too_old(harness: str):
+            raise AdapterError(
+                "HARNESS_VERSION_UNSUPPORTED",
+                f"{harness} 0.9.0 is older than required 1.0.0",
+            )
+
+        sprint_domain.SprintLifecycleStore(
+            self.con, probe_harness=too_old
+        ).arm(self.sprint_id, 3, conformance_reviewer_shell_id=2)
+        self.assertEqual(
+            self.con.execute(
+                "SELECT lifecycle FROM sprints WHERE sprint_id=?",
+                (self.sprint_id,),
+            ).fetchone()[0],
+            "armed",
+        )
+
+    def test_non_semver_adapter_output_admits_arm_and_paused_reroute(self) -> None:
+        self.create_unit(developer=1)
+        adapters = {
+            "codex": CodexAdapter(rpc=mock.Mock()),
+            "kimi": KimiAdapter(),
+        }
+
+        def version_output(argv, **_kwargs):
+            return SimpleNamespace(
+                returncode=0,
+                stdout=f"{argv[0]} dev-build\n",
+                stderr="",
+            )
+
+        with (
+            mock.patch.object(
+                sprint_domain,
+                "adapter_for",
+                side_effect=lambda harness: adapters[harness],
+            ),
+            mock.patch.object(adapter_base.subprocess, "run", side_effect=version_output),
+        ):
+            lifecycle = sprint_domain.SprintLifecycleStore(self.con)
+            lifecycle.arm(self.sprint_id, 3, conformance_reviewer_shell_id=2)
+            lifecycle.pause(
+                self.sprint_id,
+                sprint_domain.LifecycleActor("planner", 3),
+                reason="verify non-semver reroute",
+            )
+            receipt = sprint_domain.SprintParticipantStore(self.con).reroute(
+                self.sprint_id,
+                3,
+                participant_shell_id=4,
+                harness="codex",
+                model="dev-build-route",
+                effort="high",
+            )
+
+        self.assertTrue(receipt.changed)
+        self.assertEqual(receipt.control_state, "controlled")
+        self.assertEqual(
+            self.con.execute(
+                "SELECT lifecycle FROM sprints WHERE sprint_id=?", (self.sprint_id,)
+            ).fetchone()[0],
+            "paused",
+        )
 
     def test_arm_selection_race_returns_retryable_conflict_without_lifecycle_writes(
         self,
@@ -319,7 +951,7 @@ class DispatchGateTest(SprintWorkDispatchCase):
         def mutate_once(_harness: str):
             nonlocal raced
             if raced:
-                return None
+                return
             raced = True
             self.con.execute(
                 "UPDATE sprint_participants SET model='raced-model' "
@@ -327,15 +959,15 @@ class DispatchGateTest(SprintWorkDispatchCase):
                 (self.sprint_id,),
             )
             self.con.commit()
-            return None
+            return
 
         with self.assertRaisesRegex(
             sprint_domain.SprintInvariantError,
-            "changed during harness preflight; retry arm",
+            "route intents changed during binding preflight; retry arm",
         ) as caught:
             sprint_domain.SprintLifecycleStore(
                 self.con, probe_harness=mutate_once
-            ).arm(self.sprint_id, 3)
+            ).arm(self.sprint_id, 3, conformance_reviewer_shell_id=2)
 
         self.assert_arm_left_no_writes()
         handler = object.__new__(server.Handler)
@@ -345,7 +977,7 @@ class DispatchGateTest(SprintWorkDispatchCase):
                 409,
                 {
                     "error": (
-                        "participant launch selections changed during harness "
+                        "participant route intents changed during binding "
                         "preflight; retry arm"
                     )
                 },
@@ -357,7 +989,9 @@ class DispatchGateTest(SprintWorkDispatchCase):
         late_wave = self.create_unit(developer=1, wave=9, title="Late wave")
         early_wave = self.create_unit(developer=4, wave=0, title="Early wave")
 
-        wake_ids = self.lifecycle.arm(self.sprint_id, 3)
+        wake_ids = self.lifecycle.arm(
+            self.sprint_id, 3, conformance_reviewer_shell_id=2
+        )
 
         self.assertEqual(3, len(wake_ids))
         self.assertEqual(
@@ -400,12 +1034,17 @@ class DispatchGateTest(SprintWorkDispatchCase):
             ),
         )
         self.assertEqual(
-            "Sprint 1 armed. Recorded participant launch selections:\n"
-            "- planner PLN1: codex · model=default · effort=default\n"
-            "- developer DEV1: codex · model=default · effort=default\n"
-            "- developer DEV2: codex · model=default · effort=default\n"
-            "- reviewer REV1: kimi · model=default · effort=default\n"
-            "- reviewer REV2: kimi · model=default · effort=default",
+            "Sprint 1 armed. Bound participant routes:\n"
+            "- planner PLN1: codex · model=Harness default · "
+            "Thinking level=uncontrolled · harness-default · route revision 1\n"
+            "- developer DEV1: codex · model=Harness default · "
+            "Thinking level=uncontrolled · harness-default · route revision 1\n"
+            "- developer DEV2: codex · model=Harness default · "
+            "Thinking level=uncontrolled · harness-default · route revision 1\n"
+            "- reviewer REV1: kimi · model=Harness default · "
+            "Thinking level=uncontrolled · harness-default · route revision 1\n"
+            "- reviewer REV2: kimi · model=Harness default · "
+            "Thinking level=uncontrolled · harness-default · route revision 1",
             planner_wake["body"],
         )
 
@@ -422,7 +1061,9 @@ class DispatchGateTest(SprintWorkDispatchCase):
             sprint_domain.SprintInvariantError,
             "recorded model selections",
         ):
-            self.lifecycle.arm(self.sprint_id, 3)
+            self.lifecycle.arm(
+                self.sprint_id, 3, conformance_reviewer_shell_id=2
+            )
 
         self.assertEqual(
             ("prepared", 0, [(1, "planned")]),
@@ -449,7 +1090,9 @@ class DispatchGateTest(SprintWorkDispatchCase):
             sprint_domain.SprintInvariantError,
             "recorded model selections",
         ):
-            self.lifecycle.arm(self.sprint_id, 3)
+            self.lifecycle.arm(
+                self.sprint_id, 3, conformance_reviewer_shell_id=2
+            )
 
         self.assertEqual(
             ("prepared", 0, [(1, "planned")]),
@@ -475,7 +1118,9 @@ class DispatchGateTest(SprintWorkDispatchCase):
             title="Blocked",
         )
 
-        self.lifecycle.arm(self.sprint_id, 3)
+        self.lifecycle.arm(
+            self.sprint_id, 3, conformance_reviewer_shell_id=2
+        )
         self.assertEqual(
             [(first, "ready"), (same_shell, "planned"), (blocked, "planned")],
             self.dispositions(),
@@ -487,11 +1132,25 @@ class DispatchGateTest(SprintWorkDispatchCase):
         )
         self.assertEqual("active", self.dispositions()[0][1])
 
-        released = self.units.complete(
+        receipt = self.units.complete(
             self.sprint_id, first, 1, result="Durable non-code result"
         )
 
-        self.assertEqual(2, len(released))
+        self.assertEqual(self.sprint_id, receipt.sprint_id)
+        self.assertEqual(first, receipt.work_unit_id)
+        self.assertEqual("completed", receipt.disposition)
+        self.assertEqual("no_code", receipt.output_kind)
+        self.assertEqual(23, receipt.stored_result_length)
+        self.assertEqual(
+            hashlib.sha256(b"Durable non-code result").hexdigest(),
+            receipt.stored_result_sha256,
+        )
+        self.assertTrue(receipt.completed_at)
+        self.assertTrue(receipt.changed)
+        self.assertFalse(receipt.idempotent)
+        self.assertEqual(2, len(receipt.wake_ids))
+        self.assertEqual(receipt.wake_ids, receipt.created_wake_ids)
+        self.assertEqual((), receipt.reused_wake_ids)
         self.assertEqual(
             [(first, "completed"), (same_shell, "ready"), (blocked, "ready")],
             self.dispositions(),
@@ -524,7 +1183,9 @@ class DispatchGateTest(SprintWorkDispatchCase):
         report = self.create_unit(
             developer=4, title="Report", output_kind="report_only"
         )
-        self.lifecycle.arm(self.sprint_id, 3)
+        self.lifecycle.arm(
+            self.sprint_id, 3, conformance_reviewer_shell_id=2
+        )
         self.deliver_pending_wakes()
         self.messages.mark_read(self.assignment_message(code), 1)
         self.messages.mark_read(self.assignment_message(report), 4)
@@ -542,24 +1203,199 @@ class DispatchGateTest(SprintWorkDispatchCase):
             ).fetchone()[0]
         )
 
-        self.assertEqual(
-            [],
-            self.units.complete(
-                self.sprint_id, report, 4, result="Published conformance report #77"
-            ),
+        receipt = self.units.complete(
+            self.sprint_id, report, 4, result="Published conformance report #77"
         )
+        self.assertEqual((), receipt.wake_ids)
+        self.assertTrue(receipt.changed)
+        self.assertFalse(receipt.idempotent)
         row = self.con.execute(
-            "SELECT disposition,completion_result FROM sprint_work_units "
+            "SELECT disposition,completion_result,completed_at FROM sprint_work_units "
             "WHERE work_unit_id=?",
             (report,),
         ).fetchone()
-        self.assertEqual(("completed", "Published conformance report #77"), tuple(row))
+        self.assertEqual(
+            ("completed", "Published conformance report #77", receipt.completed_at),
+            tuple(row),
+        )
         event = self.con.execute(
             "SELECT payload FROM sprint_events WHERE event_type='work_unit.completed' "
             "AND actor_shell_id=4"
         ).fetchone()
+        event_payload = json.loads(event[0])
         self.assertEqual(
-            "Published conformance report #77", json.loads(event[0])["result"]
+            {
+                "output_kind": "report_only",
+                "stored_result_length": 32,
+                "stored_result_sha256": hashlib.sha256(
+                    b"Published conformance report #77"
+                ).hexdigest(),
+                "wake_ids": [],
+                "work_unit_id": report,
+            },
+            event_payload,
+        )
+        self.assertNotIn("Published conformance report #77", json.dumps(receipt.__dict__))
+
+        counts_before_retry = tuple(
+            self.con.execute(
+                "SELECT "
+                "(SELECT COUNT(*) FROM sprint_events),"
+                "(SELECT COUNT(*) FROM wake_message),"
+                "(SELECT COUNT(*) FROM sprint_wake_outbox)"
+            ).fetchone()
+        )
+        retry = self.units.complete(
+            self.sprint_id, report, 4, result="Published conformance report #77"
+        )
+        self.assertFalse(retry.changed)
+        self.assertTrue(retry.idempotent)
+        self.assertEqual(receipt.completed_at, retry.completed_at)
+        self.assertEqual(receipt.stored_result_sha256, retry.stored_result_sha256)
+        self.assertEqual((), retry.created_wake_ids)
+        self.assertEqual(receipt.wake_ids, retry.reused_wake_ids)
+        self.assertEqual(
+            counts_before_retry,
+            tuple(
+                self.con.execute(
+                    "SELECT "
+                    "(SELECT COUNT(*) FROM sprint_events),"
+                    "(SELECT COUNT(*) FROM wake_message),"
+                    "(SELECT COUNT(*) FROM sprint_wake_outbox)"
+                ).fetchone()
+            ),
+        )
+
+    def test_completion_receipt_tracks_created_and_retry_reused_terminal_wake(self):
+        report = self.create_unit(developer=1, output_kind="report_only")
+        self.lifecycle.arm(
+            self.sprint_id, 3, conformance_reviewer_shell_id=2
+        )
+        self.deliver_pending_wakes()
+        self.messages.mark_read(self.assignment_message(report), 1)
+
+        receipt = self.units.complete(
+            self.sprint_id, report, 1, result="Terminal report"
+        )
+
+        self.assertEqual(1, len(receipt.wake_ids))
+        self.assertEqual(receipt.wake_ids, receipt.created_wake_ids)
+        self.assertEqual((), receipt.reused_wake_ids)
+        counts = tuple(
+            self.con.execute(
+                "SELECT "
+                "(SELECT COUNT(*) FROM sprint_events),"
+                "(SELECT COUNT(*) FROM wake_message),"
+                "(SELECT COUNT(*) FROM sprint_wake_outbox)"
+            ).fetchone()
+        )
+
+        retry = self.units.complete(
+            self.sprint_id, report, 1, result="Terminal report"
+        )
+
+        self.assertFalse(retry.changed)
+        self.assertTrue(retry.idempotent)
+        self.assertEqual(receipt.wake_ids, retry.wake_ids)
+        self.assertEqual((), retry.created_wake_ids)
+        self.assertEqual(receipt.wake_ids, retry.reused_wake_ids)
+        self.assertEqual(
+            counts,
+            tuple(
+                self.con.execute(
+                    "SELECT "
+                    "(SELECT COUNT(*) FROM sprint_events),"
+                    "(SELECT COUNT(*) FROM wake_message),"
+                    "(SELECT COUNT(*) FROM sprint_wake_outbox)"
+                ).fetchone()
+            ),
+        )
+
+    def test_completion_receipt_identifies_coalesced_terminal_wake_as_reused(self):
+        report = self.create_unit(developer=1, output_kind="report_only")
+        self.lifecycle.arm(
+            self.sprint_id, 3, conformance_reviewer_shell_id=2
+        )
+        self.deliver_pending_wakes()
+        self.messages.mark_read(self.assignment_message(report), 1)
+        reviewer = int(
+            self.con.execute(
+                "SELECT participant_id FROM sprint_participants "
+                "WHERE sprint_id=? AND shell_id=2",
+                (self.sprint_id,),
+            ).fetchone()[0]
+        )
+        pending = self.messages.send(
+            self.sprint_id,
+            to_participant_id=reviewer,
+            message_kind="notification",
+            body="Already pending",
+            idempotency_key="existing-reviewer-wake",
+        )
+        self.assertIsNotNone(pending.wake_id)
+
+        receipt = self.units.complete(
+            self.sprint_id, report, 1, result="Coalesced report"
+        )
+
+        self.assertEqual((), receipt.created_wake_ids)
+        self.assertEqual((pending.wake_id,), receipt.reused_wake_ids)
+        self.assertEqual((pending.wake_id,), receipt.wake_ids)
+        self.assertEqual(
+            2,
+            self.con.execute(
+                "SELECT COUNT(*) FROM sprint_wake_messages WHERE wake_id=?",
+                (pending.wake_id,),
+            ).fetchone()[0],
+        )
+
+    def test_completion_failure_rolls_back_report_transition_event_and_wake(self):
+        report = self.create_unit(developer=1, output_kind="report_only")
+        self.lifecycle.arm(
+            self.sprint_id, 3, conformance_reviewer_shell_id=2
+        )
+        self.deliver_pending_wakes()
+        self.messages.mark_read(self.assignment_message(report), 1)
+        before = tuple(
+            self.con.execute(
+                "SELECT "
+                "(SELECT COUNT(*) FROM sprint_events),"
+                "(SELECT COUNT(*) FROM wake_message),"
+                "(SELECT COUNT(*) FROM sprint_wake_outbox)"
+            ).fetchone()
+        )
+        original_event = self.units._event
+
+        def fail_completion_event(sprint_id, event_type, actor, payload, **kwargs):
+            if event_type == "work_unit.completed":
+                raise RuntimeError("injected receipt failure")
+            return original_event(sprint_id, event_type, actor, payload, **kwargs)
+
+        with mock.patch.object(
+            self.units, "_event", side_effect=fail_completion_event
+        ), self.assertRaisesRegex(RuntimeError, "injected receipt failure"):
+            self.units.complete(self.sprint_id, report, 1, result="Must roll back")
+
+        self.assertEqual(
+            ("active", None, None),
+            tuple(
+                self.con.execute(
+                    "SELECT disposition,completion_result,completed_at "
+                    "FROM sprint_work_units WHERE work_unit_id=?",
+                    (report,),
+                ).fetchone()
+            ),
+        )
+        self.assertEqual(
+            before,
+            tuple(
+                self.con.execute(
+                    "SELECT "
+                    "(SELECT COUNT(*) FROM sprint_events),"
+                    "(SELECT COUNT(*) FROM wake_message),"
+                    "(SELECT COUNT(*) FROM sprint_wake_outbox)"
+                ).fetchone()
+            ),
         )
 
     def test_non_code_result_accepts_8000_and_rejects_8001_without_state_change(self):
@@ -568,7 +1404,9 @@ class DispatchGateTest(SprintWorkDispatchCase):
             title="Bounded report",
             output_kind="report_only",
         )
-        self.lifecycle.arm(self.sprint_id, 3)
+        self.lifecycle.arm(
+            self.sprint_id, 3, conformance_reviewer_shell_id=2
+        )
         self.deliver_pending_wakes()
         self.messages.mark_read(self.assignment_message(report), 1)
 
@@ -588,10 +1426,11 @@ class DispatchGateTest(SprintWorkDispatchCase):
             ),
         )
 
-        self.assertEqual(
-            [],
-            self.units.complete(self.sprint_id, report, 1, result="x" * 8000),
+        receipt = self.units.complete(
+            self.sprint_id, report, 1, result="x" * 8000
         )
+        self.assertEqual(1, len(receipt.wake_ids))
+        self.assertEqual(receipt.wake_ids, receipt.created_wake_ids)
         self.assertEqual(
             ("completed", 8000),
             tuple(
@@ -676,7 +1515,9 @@ class DispatchGateTest(SprintWorkDispatchCase):
 
     def test_declined_assignment_returns_to_pool_with_a_new_durable_identity(self) -> None:
         unit = self.create_unit(developer=1)
-        self.lifecycle.arm(self.sprint_id, 3)
+        self.lifecycle.arm(
+            self.sprint_id, 3, conformance_reviewer_shell_id=2
+        )
         first_message = self.assignment_message(unit)
         first_key = self.con.execute(
             "SELECT idempotency_key FROM wake_message WHERE message_id=?",
@@ -761,9 +1602,12 @@ class DispatchGateTest(SprintWorkDispatchCase):
             {
                 "assigned_shell_id": 4,
                 "reviewer_shell_id": 2,
-            "planned_wave": 1,
-            "output_kind": "code",
-            "dependency_ids": [upstream],
+                "title": "Target",
+                "expected_output": "Output 2",
+                "task_ids": [2],
+                "planned_wave": 1,
+                "output_kind": "code",
+                "dependency_ids": [upstream],
             },
             payload["before"],
         )
@@ -771,14 +1615,19 @@ class DispatchGateTest(SprintWorkDispatchCase):
             {
                 "assigned_shell_id": 4,
                 "reviewer_shell_id": 5,
-            "planned_wave": 7,
-            "output_kind": "code",
-            "dependency_ids": [],
+                "title": "Target",
+                "expected_output": "Output 2",
+                "task_ids": [2],
+                "planned_wave": 7,
+                "output_kind": "code",
+                "dependency_ids": [],
             },
             payload["after"],
         )
 
-        self.lifecycle.arm(self.sprint_id, 3)
+        self.lifecycle.arm(
+            self.sprint_id, 3, conformance_reviewer_shell_id=2
+        )
         self.deliver_pending_wakes()
         self.messages.mark_read(self.assignment_message(upstream), 1)
         self.units.complete(
@@ -843,6 +1692,42 @@ class DispatchGateTest(SprintWorkDispatchCase):
 
 
 class DeliveryTerminalTest(SprintWorkDispatchCase):
+    def add_live_run(self, shell_id: int = 1) -> tuple[int, str]:
+        conversation_id = str(
+            self.con.execute(
+                "SELECT pc.conversation_id FROM sprint_participant_conversations pc "
+                "JOIN sprint_participants p "
+                "ON p.participant_id=pc.sprint_participant_id "
+                "WHERE p.sprint_id=? AND p.shell_id=?",
+                (self.sprint_id, shell_id),
+            ).fetchone()[0]
+        )
+        token = int(
+            self.con.execute("SELECT COUNT(*)+1 FROM conversation_runs").fetchone()[0]
+        )
+        message_id = int(
+            self.con.execute(
+                "INSERT INTO conversation_messages "
+                "(conversation_id,sender_kind,sender_ref,message_kind,body,"
+                "idempotency_key,request_hash,state) "
+                "VALUES (?,'engine','test','prompt','active Sprint turn',?,?,"
+                "'running')",
+                (conversation_id, f"terminal:{token}", f"terminal:{token}"),
+            ).lastrowid
+        )
+        run_id = int(
+            self.con.execute(
+                "INSERT INTO conversation_runs "
+                "(conversation_id,shell_id,trigger_message_id,state,lease_owner,"
+                "lease_expires_at,started_at,heartbeat_at) "
+                "VALUES (?,?,?,'running','test-broker','2999-01-01 00:00:00',"
+                "'2026-08-01 00:00:00','2026-08-01 00:00:00')",
+                (conversation_id, shell_id, message_id),
+            ).lastrowid
+        )
+        self.con.commit()
+        return run_id, conversation_id
+
     def accept_arming_notification(self) -> None:
         message_id = int(
             self.con.execute(
@@ -913,20 +1798,9 @@ class DeliveryTerminalTest(SprintWorkDispatchCase):
             if row["idempotency_key"] == base
             or str(row["idempotency_key"]).startswith(f"{base}:")
         ]
-        self.assertEqual([2, 5], [int(row["shell_id"]) for row in messages])
-        participant_ids = {
-            int(row["shell_id"]): int(row["participant_id"])
-            for row in self.con.execute(
-                "SELECT shell_id,participant_id FROM sprint_participants "
-                "WHERE sprint_id=? AND role='reviewer'",
-                (self.sprint_id,),
-            )
-        }
+        self.assertEqual([2], [int(row["shell_id"]) for row in messages])
         self.assertEqual(
-            [
-                f"{base}:reviewer:{participant_ids[2]}",
-                f"{base}:reviewer:{participant_ids[5]}",
-            ],
+            [f"{base}:owner:2:generation:1"],
             [str(row["idempotency_key"]) for row in messages],
         )
         expected_body = (
@@ -937,10 +1811,7 @@ class DeliveryTerminalTest(SprintWorkDispatchCase):
             "either a re-enter decision or your conclude decision."
         )
         self.assertEqual(
-            [
-                ("notification", expected_body, "new", 0, None),
-                ("notification", expected_body, "new", 0, None),
-            ],
+            [("notification", expected_body, "new", 0, None)],
             [
                 (
                     row["message_kind"],
@@ -959,6 +1830,8 @@ class DeliveryTerminalTest(SprintWorkDispatchCase):
                 "terminal_count": terminal_count,
                 "completed_count": completed,
                 "cancelled_count": cancelled,
+                "conformance_reviewer_shell_id": 2,
+                "conformance_owner_generation": 1,
             },
             json.loads(event["payload"]),
         )
@@ -968,7 +1841,9 @@ class DeliveryTerminalTest(SprintWorkDispatchCase):
         second = self.create_unit(
             developer=1, dependencies=(first,), title="Final"
         )
-        self.lifecycle.arm(self.sprint_id, 3)
+        self.lifecycle.arm(
+            self.sprint_id, 3, conformance_reviewer_shell_id=2
+        )
         self.lifecycle.pause(
             self.sprint_id,
             sprint_domain.LifecycleActor("participant", 1),
@@ -987,13 +1862,15 @@ class DeliveryTerminalTest(SprintWorkDispatchCase):
         self.complete_merge(second, "merged-final")
 
         self.assertEqual([(first, "completed"), (second, "completed")], self.dispositions())
-        self.assertEqual(2, len(self.terminal_messages()))
+        self.assertEqual(1, len(self.terminal_messages()))
         self.assertEqual(1, len(self.terminal_events()))
         self.assert_episode(2, 2, 0)
 
     def test_paused_report_completion_wakes_only_on_resume(self) -> None:
         report = self.create_unit(developer=1, output_kind="report_only")
-        self.lifecycle.arm(self.sprint_id, 3)
+        self.lifecycle.arm(
+            self.sprint_id, 3, conformance_reviewer_shell_id=2
+        )
         self.deliver_pending_wakes()
         self.accept_arming_notification()
         self.messages.mark_read(self.assignment_message(report), 1)
@@ -1010,18 +1887,20 @@ class DeliveryTerminalTest(SprintWorkDispatchCase):
         self.lifecycle.resume(
             self.sprint_id, sprint_domain.LifecycleActor("planner", 3)
         )
-        self.assertEqual(2, len(self.terminal_messages()))
+        self.assertEqual(1, len(self.terminal_messages()))
         self.assertEqual(1, len(self.terminal_events()))
         self.assert_episode(1, 1, 0)
 
-    def test_single_reviewer_uses_the_canonical_episode_key(self) -> None:
+    def test_single_reviewer_key_still_binds_owner_and_generation(self) -> None:
         self.con.execute(
             "DELETE FROM sprint_participants WHERE sprint_id=? AND shell_id=5",
             (self.sprint_id,),
         )
         self.con.commit()
         report = self.create_unit(developer=1, output_kind="report_only")
-        self.lifecycle.arm(self.sprint_id, 3)
+        self.lifecycle.arm(
+            self.sprint_id, 3, conformance_reviewer_shell_id=2
+        )
         self.deliver_pending_wakes()
         self.messages.mark_read(self.assignment_message(report), 1)
 
@@ -1031,7 +1910,7 @@ class DeliveryTerminalTest(SprintWorkDispatchCase):
         self.assertEqual(1, len(messages))
         self.assertEqual(2, int(messages[0]["shell_id"]))
         self.assertEqual(
-            f"sprint:{self.sprint_id}:delivery-terminal:1",
+            f"sprint:{self.sprint_id}:delivery-terminal:1:owner:2:generation:1",
             messages[0]["idempotency_key"],
         )
         self.assertEqual(1, len(self.terminal_events()))
@@ -1044,12 +1923,14 @@ class DeliveryTerminalTest(SprintWorkDispatchCase):
             title="Cancelled downstream",
         )
         self.units.cancel(self.sprint_id, upstream, 3, reason="No longer needed")
-        self.lifecycle.arm(self.sprint_id, 3)
+        self.lifecycle.arm(
+            self.sprint_id, 3, conformance_reviewer_shell_id=2
+        )
         self.assertEqual([(upstream, "cancelled"), (downstream, "planned")], self.dispositions())
 
         self.units.cancel(self.sprint_id, downstream, 3, reason="No work remains")
 
-        self.assertEqual(2, len(self.terminal_messages()))
+        self.assertEqual(1, len(self.terminal_messages()))
         self.assertEqual(1, len(self.terminal_events()))
         self.assert_episode(2, 0, 2)
 
@@ -1061,18 +1942,22 @@ class DeliveryTerminalTest(SprintWorkDispatchCase):
         self.assertEqual([], self.terminal_messages())
         self.assertEqual([], self.terminal_events())
 
-        self.lifecycle.arm(self.sprint_id, 3)
+        self.lifecycle.arm(
+            self.sprint_id, 3, conformance_reviewer_shell_id=2
+        )
 
         self.assertEqual(
             [(first, "cancelled"), (second, "cancelled")], self.dispositions()
         )
-        self.assertEqual(2, len(self.terminal_messages()))
+        self.assertEqual(1, len(self.terminal_messages()))
         self.assertEqual(1, len(self.terminal_events()))
         self.assert_episode(2, 0, 2)
 
     def test_episode_replay_dedupes_and_added_scope_refires_with_fresh_key(self) -> None:
         first = self.create_unit(developer=1, output_kind="report_only")
-        self.lifecycle.arm(self.sprint_id, 3)
+        self.lifecycle.arm(
+            self.sprint_id, 3, conformance_reviewer_shell_id=2
+        )
         self.deliver_pending_wakes()
         self.accept_arming_notification()
         self.messages.mark_read(self.assignment_message(first), 1)
@@ -1087,7 +1972,7 @@ class DeliveryTerminalTest(SprintWorkDispatchCase):
         self.lifecycle.resume(
             self.sprint_id, sprint_domain.LifecycleActor("planner", 3)
         )
-        self.assertEqual(2, len(self.terminal_messages()))
+        self.assertEqual(1, len(self.terminal_messages()))
         self.assertEqual(1, len(self.terminal_events()))
 
         second = self.create_unit(developer=1, output_kind="no_code")
@@ -1095,7 +1980,7 @@ class DeliveryTerminalTest(SprintWorkDispatchCase):
         self.deliver_pending_wakes()
         self.messages.mark_read(self.assignment_message(second), 1)
         self.units.complete(self.sprint_id, second, 1, result="Second result")
-        self.assertEqual(4, len(self.terminal_messages()))
+        self.assertEqual(2, len(self.terminal_messages()))
         self.assertEqual(2, len(self.terminal_events()))
         self.assert_episode(2, 2, 0)
 
@@ -1107,11 +1992,354 @@ class DeliveryTerminalTest(SprintWorkDispatchCase):
         self.lifecycle.resume(
             self.sprint_id, sprint_domain.LifecycleActor("planner", 3)
         )
-        self.assertEqual(4, len(self.terminal_messages()))
+        self.assertEqual(2, len(self.terminal_messages()))
         self.assertEqual(2, len(self.terminal_events()))
+
+    def test_owner_replacement_requires_pause_and_emits_one_new_episode(self) -> None:
+        report = self.create_unit(developer=1, output_kind="report_only")
+        self.lifecycle.arm(
+            self.sprint_id, 3, conformance_reviewer_shell_id=2
+        )
+        self.deliver_pending_wakes()
+        self.accept_arming_notification()
+        self.messages.mark_read(self.assignment_message(report), 1)
+        self.units.complete(self.sprint_id, report, 1, result="Terminal report")
+        self.deliver_pending_wakes()
+        first_terminal_message = int(
+            self.con.execute(
+                "SELECT message_id FROM wake_message WHERE sprint_id=? "
+                "AND idempotency_key LIKE ?",
+                (
+                    self.sprint_id,
+                    f"sprint:{self.sprint_id}:delivery-terminal:%:owner:2:%",
+                ),
+            ).fetchone()[0]
+        )
+        self.assertIsNone(self.messages.mark_read(first_terminal_message, 2))
+
+        with self.assertRaises(sprint_domain.SprintConflictError) as armed_conflict:
+            self.lifecycle.resume(
+                self.sprint_id,
+                sprint_domain.LifecycleActor("planner", 3),
+                reason="replace while armed",
+                conformance_reviewer_shell_id=5,
+            )
+        self.assertEqual(
+            {"code": "conformance_owner_change_requires_pause"},
+            armed_conflict.exception.details,
+        )
+        self.assertEqual(
+            (2, 1, "armed"),
+            tuple(
+                self.con.execute(
+                    "SELECT conformance_reviewer_shell_id,"
+                    "conformance_owner_generation,lifecycle FROM sprints "
+                    "WHERE sprint_id=?",
+                    (self.sprint_id,),
+                ).fetchone()
+            ),
+        )
+
+        self.lifecycle.pause(
+            self.sprint_id,
+            sprint_domain.LifecycleActor("planner", 3),
+            reason="replace closeout owner",
+        )
+        with self.assertRaisesRegex(ValueError, "ownership replacement reason"):
+            self.lifecycle.resume(
+                self.sprint_id,
+                sprint_domain.LifecycleActor("planner", 3),
+                conformance_reviewer_shell_id=5,
+            )
+        self.assertEqual(
+            (2, 1, "paused"),
+            tuple(
+                self.con.execute(
+                    "SELECT conformance_reviewer_shell_id,"
+                    "conformance_owner_generation,lifecycle FROM sprints "
+                    "WHERE sprint_id=?",
+                    (self.sprint_id,),
+                ).fetchone()
+            ),
+        )
+
+        receipt = self.lifecycle.resume(
+            self.sprint_id,
+            sprint_domain.LifecycleActor("planner", 3),
+            reason="Reviewer 2 is unavailable",
+            conformance_reviewer_shell_id=5,
+        )
+
+        self.assertTrue(receipt.changed)
+        self.assertEqual(
+            (5, 2, "armed"),
+            tuple(
+                self.con.execute(
+                    "SELECT conformance_reviewer_shell_id,"
+                    "conformance_owner_generation,lifecycle FROM sprints "
+                    "WHERE sprint_id=?",
+                    (self.sprint_id,),
+                ).fetchone()
+            ),
+        )
+        messages = self.terminal_messages()
+        self.assertEqual([2, 5], [int(row["shell_id"]) for row in messages])
+        self.assertEqual(
+            [
+                f"sprint:{self.sprint_id}:delivery-terminal:1:owner:2:generation:1",
+                f"sprint:{self.sprint_id}:delivery-terminal:1:owner:5:generation:2",
+            ],
+            [str(row["idempotency_key"]) for row in messages],
+        )
+        self.assertEqual(2, len(self.terminal_events()))
+
+    def test_owner_loss_terminal_pause_signals_only_after_commit(self) -> None:
+        report = self.create_unit(developer=1, output_kind="report_only")
+        interrupts: list[tuple[int, bool, str]] = []
+        notifications: list[tuple[str, bool, str]] = []
+        commits: list[tuple[bool, str]] = []
+
+        def interrupt(run_id: int) -> bool:
+            lifecycle = str(
+                self.con.execute(
+                    "SELECT lifecycle FROM sprints WHERE sprint_id=?",
+                    (self.sprint_id,),
+                ).fetchone()[0]
+            )
+            interrupts.append((run_id, self.con.in_transaction, lifecycle))
+            return True
+
+        def notify_commit() -> bool:
+            lifecycle = str(
+                self.con.execute(
+                    "SELECT lifecycle FROM sprints WHERE sprint_id=?",
+                    (self.sprint_id,),
+                ).fetchone()[0]
+            )
+            commits.append((self.con.in_transaction, lifecycle))
+            return True
+
+        lifecycle = sprint_domain.SprintLifecycleStore(
+            self.con,
+            probe_harness=lambda _harness: None,
+            interrupt_run=interrupt,
+            notify_commit=notify_commit,
+        )
+        units = sprint_domain.SprintWorkUnitStore(
+            self.con, lifecycle_store=lifecycle
+        )
+        lifecycle.arm(self.sprint_id, 3, conformance_reviewer_shell_id=2)
+        self.deliver_pending_wakes()
+        self.messages.mark_read(self.assignment_message(report), 1)
+        run_id, conversation_id = self.add_live_run()
+        self.con.execute(
+            "UPDATE sprint_participants SET disposition='declined' "
+            "WHERE sprint_id=? AND shell_id=2",
+            (self.sprint_id,),
+        )
+        self.con.commit()
+
+        with mock.patch.object(
+            sprint_domain.conversation_events,
+            "notify",
+            side_effect=lambda value: notifications.append(
+                (
+                    value,
+                    self.con.in_transaction,
+                    str(
+                        self.con.execute(
+                            "SELECT lifecycle FROM sprints WHERE sprint_id=?",
+                            (self.sprint_id,),
+                        ).fetchone()[0]
+                    ),
+                )
+            ),
+        ):
+            receipt = units.complete(self.sprint_id, report, 1, result="Done")
+            self.assertEqual((), receipt.wake_ids)
+            self.assertTrue(receipt.changed)
+
+        self.assertEqual([(run_id, False, "paused")], interrupts)
+        self.assertEqual([(conversation_id, False, "paused")], notifications)
+        self.assertEqual([(False, "paused")], commits)
+        self.assertEqual(
+            ("paused", "completed", "conformance_owner_required"),
+            tuple(
+                self.con.execute(
+                    "SELECT s.lifecycle,u.disposition,"
+                    "json_extract(r.body,'$.reason') "
+                    "FROM sprints s JOIN sprint_work_units u USING (sprint_id) "
+                    "JOIN sprint_reports r USING (sprint_id) "
+                    "WHERE s.sprint_id=? AND r.report_kind='pause'",
+                    (self.sprint_id,),
+                ).fetchone()
+            ),
+        )
+        self.assertEqual(
+            1,
+            self.con.execute(
+                "SELECT COUNT(*) FROM wake_message WHERE sprint_id IS NULL "
+                "AND receiver_shell_id=3 AND body LIKE ?",
+                (f"Sprint {self.sprint_id} reached delivery terminal%",),
+            ).fetchone()[0],
+        )
+
+    def test_owner_loss_terminal_pause_delivers_nothing_on_rollback(self) -> None:
+        report = self.create_unit(developer=1, output_kind="report_only")
+        interrupts: list[int] = []
+        notifications: list[str] = []
+        commits: list[bool] = []
+        lifecycle = sprint_domain.SprintLifecycleStore(
+            self.con,
+            probe_harness=lambda _harness: None,
+            interrupt_run=lambda run_id: interrupts.append(run_id) or True,
+            notify_commit=lambda: commits.append(self.con.in_transaction) or True,
+        )
+        units = sprint_domain.SprintWorkUnitStore(
+            self.con, lifecycle_store=lifecycle
+        )
+        lifecycle.arm(self.sprint_id, 3, conformance_reviewer_shell_id=2)
+        self.deliver_pending_wakes()
+        self.messages.mark_read(self.assignment_message(report), 1)
+        self.add_live_run()
+        self.con.execute(
+            "UPDATE sprint_participants SET disposition='declined' "
+            "WHERE sprint_id=? AND shell_id=2",
+            (self.sprint_id,),
+        )
+        self.con.commit()
+        original_event = lifecycle._event
+
+        def fail_after_pause(
+            sprint_id: int,
+            event_type: str,
+            actor: sprint_domain.LifecycleActor,
+            payload: dict,
+        ) -> int:
+            if event_type == "conformance_owner.required":
+                raise RuntimeError("injected owner recovery rollback")
+            return original_event(sprint_id, event_type, actor, payload)
+
+        with mock.patch.object(lifecycle, "_event", side_effect=fail_after_pause), mock.patch.object(
+            sprint_domain.conversation_events,
+            "notify",
+            side_effect=lambda value: notifications.append(value),
+        ), self.assertRaisesRegex(RuntimeError, "injected owner recovery rollback"):
+            units.complete(self.sprint_id, report, 1, result="Done")
+
+        self.assertEqual([], interrupts)
+        self.assertEqual([], notifications)
+        self.assertEqual([], commits)
+        self.assertEqual(
+            ("armed", "active", 0, 0, 0),
+            tuple(
+                self.con.execute(
+                    "SELECT s.lifecycle,u.disposition,"
+                    "(SELECT COUNT(*) FROM sprint_reports r "
+                    " WHERE r.sprint_id=s.sprint_id AND r.report_kind='pause'),"
+                    "(SELECT COUNT(*) FROM sprint_events e "
+                    " WHERE e.sprint_id=s.sprint_id "
+                    " AND e.event_type='conformance_owner.required'),"
+                    "(SELECT COUNT(*) FROM wake_message m "
+                    " WHERE m.sprint_id IS NULL AND m.receiver_shell_id=3 "
+                    " AND m.body LIKE ?) "
+                    "FROM sprints s JOIN sprint_work_units u USING (sprint_id) "
+                    "WHERE s.sprint_id=?",
+                    (
+                        f"Sprint {self.sprint_id} reached delivery terminal%",
+                        self.sprint_id,
+                    ),
+                ).fetchone()
+            ),
+        )
 
 
 class ProductionPulseTest(SprintWorkDispatchCase):
+    def test_armed_pulse_never_evaluates_historical_liveness(self) -> None:
+        unit = self.create_unit(developer=1)
+        self.lifecycle.arm(
+            self.sprint_id, 3, conformance_reviewer_shell_id=2
+        )
+        message = self.con.execute(
+            "SELECT message_id,to_participant_id FROM wake_message "
+            "WHERE work_unit_id=? AND message_kind='work_assignment'",
+            (unit,),
+        ).fetchone()
+        self.con.execute(
+            "UPDATE wake_message SET disposition='accepted',"
+            "read_at='2000-01-01 00:00:00' WHERE message_id=?",
+            (message["message_id"],),
+        )
+        self.con.execute(
+            "INSERT OR IGNORE INTO sprint_liveness_expectations "
+            "(message_id,sprint_id,participant_id,accepted_at,last_strong_at,"
+            "last_strong_key,next_evaluation_at) VALUES (?,?,?,?,?,?,?)",
+            (
+                message["message_id"],
+                self.sprint_id,
+                message["to_participant_id"],
+                "2000-01-01 00:00:00",
+                "2000-01-01 00:00:00",
+                f"message.accepted:{message['message_id']}",
+                "2000-01-01 00:05:00",
+            ),
+        )
+        self.con.execute(
+            "UPDATE sprint_liveness_expectations SET last_strong_at=?,"
+            "last_strong_key=?,next_evaluation_at=? WHERE message_id=?",
+            (
+                "2000-01-01 00:00:00",
+                f"message.accepted:{message['message_id']}",
+                "2000-01-01 00:05:00",
+                message["message_id"],
+            ),
+        )
+        self.con.commit()
+        before = tuple(
+            self.con.execute(
+                "SELECT last_evaluated_at,next_evaluation_at,nudge_at,escalated_at "
+                "FROM sprint_liveness_expectations WHERE message_id=?",
+                (message["message_id"],),
+            ).fetchone()
+        )
+        runtime = sprint_runtime.SprintRuntimeService(
+            self.db_path,
+            owner="no-liveness-runtime-test",
+        )
+
+        with mock.patch.object(
+            sprint_liveness.SprintLivenessMonitor,
+            "evaluate",
+            side_effect=AssertionError("retired liveness evaluator called"),
+        ):
+            self.assertTrue(runtime.pulse_once(startup=True))
+
+        self.assertEqual(
+            before,
+            tuple(
+                self.con.execute(
+                    "SELECT last_evaluated_at,next_evaluation_at,nudge_at,"
+                    "escalated_at FROM sprint_liveness_expectations "
+                    "WHERE message_id=?",
+                    (message["message_id"],),
+                ).fetchone()
+            ),
+        )
+        self.assertEqual(
+            0,
+            self.con.execute(
+                "SELECT COUNT(*) FROM wake_message "
+                "WHERE message_kind IN ('nudge','escalation')"
+            ).fetchone()[0],
+        )
+        self.assertEqual(
+            0,
+            self.con.execute(
+                "SELECT COUNT(*) FROM sprint_events "
+                "WHERE event_type LIKE 'liveness.%'"
+            ).fetchone()[0],
+        )
+
     def test_successful_pulses_advance_runtime_heartbeat_but_failure_does_not(self) -> None:
         runtime = sprint_runtime.SprintRuntimeService(
             self.db_path,
@@ -1178,7 +2406,9 @@ class ProductionPulseTest(SprintWorkDispatchCase):
     def test_armed_pulse_enqueues_every_parallel_ready_lane(self) -> None:
         first = self.create_unit(developer=1, wave=4)
         second = self.create_unit(developer=4, wave=0)
-        self.lifecycle.arm(self.sprint_id, 3)
+        self.lifecycle.arm(
+            self.sprint_id, 3, conformance_reviewer_shell_id=2
+        )
         runtime = sprint_runtime.SprintRuntimeService(
             self.db_path,
             owner="runtime-test",
@@ -1220,7 +2450,9 @@ class ProductionPulseTest(SprintWorkDispatchCase):
 
     def test_armed_pulse_delivers_wake_as_one_idempotent_native_turn(self) -> None:
         unit = self.create_unit(developer=1)
-        wake_id = self.lifecycle.arm(self.sprint_id, 3)[0]
+        wake_id = self.lifecycle.arm(
+            self.sprint_id, 3, conformance_reviewer_shell_id=2
+        )[0]
         wake_key = self.con.execute(
             "SELECT idempotency_key FROM sprint_wake_outbox WHERE wake_id=?",
             (wake_id,),

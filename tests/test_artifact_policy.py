@@ -16,8 +16,8 @@ ROOT = Path(__file__).resolve().parents[1]
 ENGINE = ROOT / ".super-coder"
 sys.path.insert(0, str(ENGINE / "scripts"))
 sys.path.insert(0, str(ENGINE / "render"))
-import artifact_policy  # noqa: E402
-import flat  # noqa: E402
+import artifact_policy
+import flat
 
 
 class ArtifactPolicyTest(unittest.TestCase):
@@ -61,6 +61,15 @@ class ArtifactPolicyTest(unittest.TestCase):
         self.assertEqual(
             artifact_policy.render_root(), self.state / "local" / "renders"
         )
+        self.assertEqual(
+            artifact_policy.devkit_log_root(),
+            self.state / "local" / "devkit-logs",
+        )
+        other = self.tmp / "other-checkout"
+        self.assertEqual(
+            artifact_policy.devkit_log_root(other),
+            other / ".sc-state" / "local" / "devkit-logs",
+        )
 
     def test_instance_can_opt_into_local(self):
         self.write_json(artifact_policy.INSTANCE_CONFIG, {"artifact_mode": "local"})
@@ -99,6 +108,12 @@ class ArtifactPolicyTest(unittest.TestCase):
         with mock.patch("builtins.print") as output:
             self.assertEqual(artifact_policy.main(["path", "map-db"]), 0)
         output.assert_called_once_with(self.state / "local" / "map" / "map.db")
+
+    def test_content_write_lock_uses_ignored_local_state(self):
+        lock = self.state / "local" / ".content-write.lock"
+        with artifact_policy.content_write_lock():
+            self.assertTrue(lock.is_file())
+        self.assertTrue(lock.is_file())
 
     def test_localization_copies_durable_files_and_sqlite_once(self):
         self.write_json(artifact_policy.INSTANCE_CONFIG, {"artifact_mode": "local"})

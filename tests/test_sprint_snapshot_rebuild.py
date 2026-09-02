@@ -15,16 +15,20 @@ ENGINE = ROOT / ".super-coder"
 SCHEMA = ENGINE / "schema.sql"
 MIGRATIONS = ENGINE / "migrations"
 sys.path.insert(0, str(ENGINE / "scripts"))
+sys.path.insert(0, str(ENGINE / "api"))
 import db_driver  # noqa: E402
 import rebuild  # noqa: E402
+import route_bindings  # noqa: E402
 import snapshot  # noqa: E402
 
 
-def apply_engine_schema(path: Path) -> None:
+def apply_engine_schema(path: Path, *, through: str | None = None) -> None:
     con = sqlite3.connect(path)
     try:
         con.executescript(SCHEMA.read_text())
         for migration in sorted(MIGRATIONS.glob("*.sql")):
+            if through is not None and migration.name > through:
+                break
             con.executescript(migration.read_text())
         con.execute("PRAGMA foreign_keys=ON")
         con.commit()
@@ -46,7 +50,12 @@ def rows_by_table(path: Path, tables: list[str]) -> dict[str, list[tuple]]:
         con.close()
 
 
-def seed_prepared(con: sqlite3.Connection, *, reviewed: bool = True) -> int:
+def seed_prepared(
+    con: sqlite3.Connection,
+    *,
+    reviewed: bool = True,
+    immutable_body: bool = True,
+) -> int:
     con.execute("PRAGMA foreign_keys=ON")
     con.execute("INSERT INTO users (user_id,username) VALUES (1,'operator')")
     con.executemany(
@@ -84,12 +93,30 @@ def seed_prepared(con: sqlite3.Connection, *, reviewed: bool = True) -> int:
         "VALUES (1,?,3,1)",
         (feature_id,),
     ).lastrowid
-    con.execute(
-        "INSERT INTO sprint_specs "
-        "(sprint_id,document_id,bound_revision_sha256,approval_id) "
-        "VALUES (?,?,?,?)",
-        (sprint_id, document_id, revision, approval_id),
-    )
+    if immutable_body:
+        con.execute(
+            "INSERT INTO sprint_specs "
+            "(sprint_id,document_id,bound_revision_sha256,approval_id,"
+            "bound_revision_body,bound_revision_legacy) VALUES (?,?,?,?,?,0)",
+            (sprint_id, document_id, revision, approval_id, body),
+        )
+    else:
+        con.execute(
+            "INSERT INTO sprint_specs "
+            "(sprint_id,document_id,bound_revision_sha256,approval_id) "
+            "VALUES (?,?,?,?)",
+            (sprint_id, document_id, revision, approval_id),
+        )
+    if snapshot.table_exists(con, "sprint_spec_revision_history"):
+        con.execute(
+            "INSERT INTO sprint_spec_revision_history "
+            "(sprint_id,document_id,generation,bound_revision_sha256,"
+            "bound_revision_body,bound_revision_legacy,approval_id,actor_kind,reason) "
+            "SELECT sprint_id,document_id,1,bound_revision_sha256,"
+            "bound_revision_body,bound_revision_legacy,approval_id,'system',"
+            "'snapshot fixture' FROM sprint_specs WHERE sprint_id=?",
+            (sprint_id,),
+        )
     con.executemany(
         "INSERT INTO sprint_participants "
         "(participant_id,sprint_id,shell_id,role,harness,model,effort,route) "
@@ -138,6 +165,49 @@ def seed_prepared(con: sqlite3.Connection, *, reviewed: bool = True) -> int:
 
 
 def arm_with_representative_state(con: sqlite3.Connection) -> None:
+    binding = {
+        "contract_version": 2,
+        "control_state": "controlled",
+        "harness": "kimi",
+        "requested_model": "kimi-code/k3",
+        "provider_model": "k3",
+        "requested_effort": "high",
+        "effective_effort": "high",
+        "native_variant_id": None,
+        "transport": "kimi-effort-environment",
+        "catalogue_generation": "a" * 32,
+        "evidence_digest": "b" * 64,
+        "selector_binding": {"kind": "configured-alias",
+                             "selector": "kimi-code/k3"},
+        "adapter_metadata": {},
+    }
+    binding_digest = route_bindings.digest_json(binding)
+    binding_id = con.execute(
+        "INSERT INTO sprint_participant_route_bindings ("
+        "participant_id,route_revision,contract_version,control_state,harness,"
+        "requested_model,provider_model,requested_effort,effective_effort,"
+        "native_variant_id,transport,catalogue_generation,evidence_digest,"
+        "selector_binding,adapter_metadata,binding_json,binding_digest,"
+        "source_fingerprint,harness_version,harness_evidence_format,"
+        "harness_support_state) "
+        "VALUES (2,1,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (
+            binding["contract_version"], binding["control_state"],
+            binding["harness"], binding["requested_model"],
+            binding["provider_model"], binding["requested_effort"],
+            binding["effective_effort"], binding["native_variant_id"],
+            binding["transport"], binding["catalogue_generation"],
+            binding["evidence_digest"],
+            route_bindings.canonical_json(binding["selector_binding"]),
+            route_bindings.canonical_json(binding["adapter_metadata"]),
+            route_bindings.canonical_json(binding), binding_digest,
+            "c" * 64, "0.33.0", "raw-observed-v1", "tested",
+        ),
+    ).lastrowid
+    con.execute(
+        "UPDATE sprint_participants SET active_route_binding_id=? "
+        "WHERE participant_id=2", (binding_id,)
+    )
     conversations = (
         ("cv_plan", 3, "planner-work"),
         ("cv_dev", 1, "developer-work"),
@@ -191,8 +261,10 @@ def arm_with_representative_state(con: sqlite3.Connection) -> None:
         ((3, "cv_plan"), (1, "cv_dev"), (2, "cv_rev")),
     )
     con.execute(
-        "UPDATE sprints SET lifecycle='armed',armed_at='2026-08-01 21:00:00',"
-        "updated_at='2026-08-01 21:00:00',version=2 WHERE sprint_id=1"
+        "UPDATE sprints SET conformance_reviewer_shell_id=2,"
+        "conformance_owner_generation=1,lifecycle='armed',"
+        "armed_at='2026-08-01 21:00:00',updated_at='2026-08-01 21:00:00',"
+        "version=2 WHERE sprint_id=1"
     )
     con.execute(
         "UPDATE sprint_work_units SET disposition='active',"
@@ -280,10 +352,62 @@ def arm_with_representative_state(con: sqlite3.Connection) -> None:
         "spec_document_id,work_unit_id,idempotency_key) "
         "VALUES (1,1,1,'Medium','Follow-up','Inspect after close',56,1,'followup-1')"
     )
+    recovery_event_id = int(
+        con.execute(
+            "INSERT INTO sprint_events "
+            "(sprint_id,event_type,actor_kind,actor_shell_id,payload) "
+            "VALUES (1,'wake.requeued','system',NULL,'{\"replacement_wake_id\":1}')"
+        ).lastrowid
+    )
     con.execute(
-        "INSERT INTO sprint_events "
-        "(sprint_id,event_type,actor_kind,actor_shell_id,payload) "
-        "VALUES (1,'fixture.in_flight','system',NULL,'{\"head\":\"aaaaaaaa\"}')"
+        "INSERT INTO sprint_wake_recovery_messages "
+        "(recovery_event_id,sprint_id,prior_wake_id,replacement_wake_id,message_id) "
+        "VALUES (?,1,1,1,1)",
+        (recovery_event_id,),
+    )
+    con.execute(
+        "INSERT INTO sprints "
+        "(sprint_id,feature_id,originating_planner_shell_id,merge_grant_enabled) "
+        "SELECT 2,feature_id,originating_planner_shell_id,1 FROM sprints "
+        "WHERE sprint_id=1"
+    )
+    con.execute(
+        "INSERT INTO sprint_participants "
+        "(participant_id,sprint_id,shell_id,role,harness) "
+        "VALUES (4,2,2,'reviewer','claude')"
+    )
+    con.execute(
+        "UPDATE sprints SET lifecycle='paused',paused_at='2026-08-01 21:59:00' "
+        "WHERE sprint_id=1"
+    )
+    con.execute(
+        "UPDATE sprints SET conformance_reviewer_shell_id=2,"
+        "conformance_owner_generation=1,lifecycle='armed',"
+        "armed_at='2026-08-01 22:00:00' WHERE sprint_id=2"
+    )
+    con.execute(
+        "UPDATE sprints SET lifecycle='completed',terminal_outcome='accepted',"
+        "completed_at='2026-08-01 22:01:00' WHERE sprint_id=2"
+    )
+    con.execute(
+        "INSERT INTO sprint_cleanup_targets "
+        "(sprint_id,shell_id,target_kind,canonical_path,repository_root,"
+        "git_common_dir,expected_base_branch) VALUES "
+        "(2,1,'worktree','/repo/.sc-worktrees/dev1','/repo','/repo/.git',"
+        "'shell/dev1')"
+    )
+    con.execute(
+        "INSERT INTO sprint_cleanup_requests "
+        "(cleanup_request_id,sprint_id,caller_shell_id,request_kind,"
+        "idempotency_key,request_hash,response_json) VALUES "
+        "(1,2,3,'adopted_legacy','snapshot-cleanup-request',"
+        "'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',"
+        "'{\"action\":\"adopted_legacy\",\"projection\":{},"
+        "\"sprint_id\":2,\"target_ids\":[1]}')"
+    )
+    con.execute(
+        "UPDATE sprints SET lifecycle='armed',updated_at='2026-08-01 22:02:00' "
+        "WHERE sprint_id=1"
     )
     con.commit()
 
@@ -380,6 +504,29 @@ class SprintSnapshotRebuildTest(unittest.TestCase):
             self.assertEqual([], con.execute("PRAGMA foreign_key_check").fetchall())
         finally:
             con.close()
+
+    def test_pre_revision_snapshot_hash_matches_and_recovers_exact_body(self) -> None:
+        self.db.unlink()
+        apply_engine_schema(
+            self.db, through="0203_sprint_cleanup_recovery.sql"
+        )
+        con = sqlite3.connect(self.db)
+        try:
+            seed_prepared(con, immutable_body=False)
+        finally:
+            con.close()
+
+        self.snapshot_and_rebuild()
+
+        con = sqlite3.connect(self.db)
+        try:
+            row = con.execute(
+                "SELECT bound_revision_body,bound_revision_legacy "
+                "FROM sprint_specs"
+            ).fetchone()
+        finally:
+            con.close()
+        self.assertEqual(("# Exact Sprint governing spec\n\nOne bounded unit.", 1), row)
 
     def test_armed_in_flight_sprint_roundtrips_every_v2_table_exactly(self) -> None:
         self.assert_roundtrip(armed=True)
@@ -485,17 +632,24 @@ class SprintSnapshotRebuildTest(unittest.TestCase):
                     (4, 0, "2026-08-01 18:00:00", "2026-08-01 18:01:00"),
                 ),
             )
+            con.executemany(
+                "INSERT INTO sprint_participants "
+                "(sprint_id,shell_id,role,harness) VALUES (?,2,'reviewer','claude')",
+                ((2,), (3,)),
+            )
             con.execute(
-                "UPDATE sprints SET lifecycle='armed',armed_at='2026-08-01 20:01:00' "
-                "WHERE sprint_id=2"
+                "UPDATE sprints SET conformance_reviewer_shell_id=2,"
+                "conformance_owner_generation=1,lifecycle='armed',"
+                "armed_at='2026-08-01 20:01:00' WHERE sprint_id=2"
             )
             con.execute(
                 "UPDATE sprints SET lifecycle='paused',paused_at='2026-08-01 20:03:00' "
                 "WHERE sprint_id=2"
             )
             con.execute(
-                "UPDATE sprints SET lifecycle='armed',armed_at='2026-08-01 19:01:00' "
-                "WHERE sprint_id=3"
+                "UPDATE sprints SET conformance_reviewer_shell_id=2,"
+                "conformance_owner_generation=1,lifecycle='armed',"
+                "armed_at='2026-08-01 19:01:00' WHERE sprint_id=3"
             )
             con.execute(
                 "UPDATE sprints SET lifecycle='completed',"
@@ -529,9 +683,20 @@ class SprintSnapshotRebuildTest(unittest.TestCase):
                     (3, "2026-08-01 20:00:00", "2026-08-01 20:03:00"),
                 ),
             )
-            con.execute("UPDATE sprints SET lifecycle='armed' WHERE sprint_id=2")
+            con.executemany(
+                "INSERT INTO sprint_participants "
+                "(sprint_id,shell_id,role,harness) VALUES (?,2,'reviewer','claude')",
+                ((2,), (3,)),
+            )
+            con.execute(
+                "UPDATE sprints SET conformance_reviewer_shell_id=2,"
+                "conformance_owner_generation=1,lifecycle='armed' WHERE sprint_id=2"
+            )
             con.execute("UPDATE sprints SET lifecycle='paused' WHERE sprint_id=2")
-            con.execute("UPDATE sprints SET lifecycle='armed' WHERE sprint_id=3")
+            con.execute(
+                "UPDATE sprints SET conformance_reviewer_shell_id=2,"
+                "conformance_owner_generation=1,lifecycle='armed' WHERE sprint_id=3"
+            )
             con.execute("UPDATE sprints SET lifecycle='paused' WHERE sprint_id=3")
             con.execute("UPDATE sprints SET lifecycle='armed' WHERE sprint_id=2")
             con.commit()

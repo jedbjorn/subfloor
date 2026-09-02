@@ -219,7 +219,9 @@ class SpinnerTest(unittest.TestCase):
 
 
 class BootPhaseLabelTest(unittest.TestCase):
-    def _run_main(self, *, admin: bool, no_prune: bool) -> tuple[list[str], int, int]:
+    def _run_main(
+        self, *, admin: bool, no_prune: bool, sandbox: bool = False
+    ) -> tuple[list[str], int, int, str]:
         flavor = "admin" if admin else "dev"
         chosen = {"shell_id": 1, "shortname": "DEV1", "flavor": flavor}
         full = {"shell_id": 1, "display_name": "Dev One", "api_key": None}
@@ -238,10 +240,13 @@ class BootPhaseLabelTest(unittest.TestCase):
         env = {"SC_RAW_BOOT": "1"}
         if no_prune:
             env["SC_NO_AUTOPRUNE"] = "1"
+        if sandbox:
+            env["SC_SANDBOX"] = "1"
         stdout = _Stdout(tty=False)
         stdin = _Stdout(tty=False)
         sync = mock.Mock(return_value="in sync with origin/main")
         prune = mock.Mock(return_value={})
+        compose_boot = mock.Mock(return_value="boot")
         analytics = mock.Mock()
         analytics.sweep.return_value = {"inserted": 0, "updated": 0}
         fdefaults = {flavor: {"default_harness": "claude", "models": {"claude": None}}}
@@ -263,6 +268,11 @@ class BootPhaseLabelTest(unittest.TestCase):
                 run, "flavor_defaults", return_value=fdefaults))
             stack.enter_context(mock.patch.object(run, "list_shells", return_value=[chosen]))
             stack.enter_context(mock.patch.object(run, "pick_shell", return_value=chosen))
+            stack.enter_context(mock.patch.object(
+                run.execution_view,
+                "build",
+                return_value=run.execution_view.ExecutionView(mode="test"),
+            ))
             stack.enter_context(mock.patch.object(run, "ensure_harness_path"))
             stack.enter_context(mock.patch.object(
                 run.style, "spinner", side_effect=recording_spinner))
@@ -276,7 +286,9 @@ class BootPhaseLabelTest(unittest.TestCase):
             stack.enter_context(mock.patch.object(run.git_prune, "prune", prune))
             stack.enter_context(mock.patch.object(
                 run.git_prune, "status_line", return_value=None))
-            stack.enter_context(mock.patch.object(run, "compose_boot", return_value="boot"))
+            stack.enter_context(mock.patch.object(run, "compose_boot", compose_boot))
+            stack.enter_context(mock.patch.object(
+                run, "collect_dev_tools", return_value={"state": "absent"}))
             stack.enter_context(mock.patch.object(
                 run,
                 "render_harness_skills",
@@ -298,10 +310,17 @@ class BootPhaseLabelTest(unittest.TestCase):
             with self.assertRaises(_ExecReached):
                 run.main()
 
-        return labels, sync.call_count, prune.call_count
+        return (
+            labels,
+            sync.call_count,
+            prune.call_count,
+            compose_boot.call_args.kwargs["launch_mode"],
+        )
 
     def test_admin_boot_with_prune_disabled_skips_both_phase_labels(self) -> None:
-        labels, sync_calls, prune_calls = self._run_main(admin=True, no_prune=True)
+        labels, sync_calls, prune_calls, launch_mode = self._run_main(
+            admin=True, no_prune=True
+        )
 
         self.assertEqual([
             "sweeping analytics",
@@ -310,9 +329,21 @@ class BootPhaseLabelTest(unittest.TestCase):
         ], labels)
         self.assertEqual(0, sync_calls)
         self.assertEqual(0, prune_calls)
+        self.assertEqual("host", launch_mode)
+
+    def test_container_admin_passes_container_mode_to_boot_renderer(self) -> None:
+        _, sync_calls, prune_calls, launch_mode = self._run_main(
+            admin=True, no_prune=True, sandbox=True
+        )
+
+        self.assertEqual(0, sync_calls)
+        self.assertEqual(0, prune_calls)
+        self.assertEqual("container", launch_mode)
 
     def test_worktree_boot_with_prune_enabled_reports_every_phase(self) -> None:
-        labels, sync_calls, prune_calls = self._run_main(admin=False, no_prune=False)
+        labels, sync_calls, prune_calls, launch_mode = self._run_main(
+            admin=False, no_prune=False
+        )
 
         self.assertEqual([
             "sweeping analytics",
@@ -323,6 +354,7 @@ class BootPhaseLabelTest(unittest.TestCase):
         ], labels)
         self.assertEqual(1, sync_calls)
         self.assertEqual(1, prune_calls)
+        self.assertEqual("host", launch_mode)
 
 
 if __name__ == "__main__":
