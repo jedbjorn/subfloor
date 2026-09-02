@@ -1309,8 +1309,10 @@ def _host_server_pid() -> int | None:
         os.kill(pid, 0)
     except OSError:
         return None
+    # -ww: unlimited width, or a long interpreter path pushes the script
+    # argument past ps's default column cut and the server looks foreign.
     probe = subprocess.run(
-        ["ps", "-p", str(pid), "-o", "args="],
+        ["ps", "-ww", "-p", str(pid), "-o", "args="],
         capture_output=True, text=True, check=False,
     )
     if probe.returncode != 0 or "api/server.py" not in probe.stdout:

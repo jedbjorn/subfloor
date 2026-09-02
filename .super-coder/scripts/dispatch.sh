@@ -193,7 +193,7 @@ sc_host_server_pid() {
   [ -f "$HOST_SERVER_PID" ] || return 1
   host_pid="$(sed -n '1p' "$HOST_SERVER_PID" 2>/dev/null || true)"
   [ -n "$host_pid" ] && kill -0 "$host_pid" 2>/dev/null || return 1
-  ps -p "$host_pid" -o args= 2>/dev/null | grep -q "api/server\.py" || return 1
+  ps -ww -p "$host_pid" -o args= 2>/dev/null | grep -q "api/server\.py" || return 1
   printf '%s\n' "$host_pid"
 }
 sc_host_server_alive() { sc_host_server_pid >/dev/null; }
