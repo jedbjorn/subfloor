@@ -3242,10 +3242,14 @@ function chatOpenStream(
   return source;
 }
 
-function chatModelOptions(select, catalog, harness, defaultModel) {
+function chatModelOptions(select, catalog, harness, defaultModel, query = "") {
   select.replaceChildren();
   const models = catalog.harnesses?.[harness]?.models || [];
-  const available = models.filter((model) => model.availability === "available");
+  const q = String(query || "").trim().toLowerCase();
+  const matches = (model) => !q || [model.id, model.name, model.family, model.provider]
+    .some((field) => String(field || "").toLowerCase().includes(q));
+  const available = models.filter((model) =>
+    model.availability === "available" && matches(model));
   if (defaultModel) select.append(el("option", {
     value: "",
     textContent: `Use shell default — ${defaultModel}`,
@@ -3258,15 +3262,32 @@ function chatModelOptions(select, catalog, harness, defaultModel) {
     value: CHAT_HARNESS_DEFAULT_VALUE,
     textContent: "Use harness default",
   }));
+  // Group by family so a long provider list reads as a few labelled blocks;
+  // models without family data stay flat after the groups, in catalogue order.
+  const families = new Map();
+  const ungrouped = [];
   for (const model of available) {
+    if (!model.family) { ungrouped.push(model); continue; }
+    if (!families.has(model.family)) families.set(model.family, []);
+    families.get(model.family).push(model);
+  }
+  for (const [family, members] of families) {
+    const group = el("optgroup", { label: family });
+    for (const model of members) {
+      group.append(el("option", { value: model.id, textContent: model.id }));
+    }
+    select.append(group);
+  }
+  for (const model of ungrouped) {
     select.append(el("option", { value: model.id, textContent: model.id }));
   }
-  if (!select.options.length) {
+  if (!available.length) {
     select.append(el("option", {
       value: "",
-      textContent: "No connected provider models available",
+      textContent: q
+        ? `No models match "${query.trim()}"`
+        : "No connected provider models available",
       disabled: true,
-      selected: true,
     }));
   }
   return true;
@@ -3942,6 +3963,12 @@ async function chatRenderNew(host, shell, defaults, catalog) {
     }));
   }
   const modelSelect = el("select");
+  const modelSearch = el("input", {
+    type: "text",
+    className: "search chat-model-search",
+    placeholder: "Filter models — id, name, family, or provider",
+    ariaLabel: "Filter models",
+  });
   const effortSelect = el("select", { ariaLabel: "Thinking level" });
   const title = el("input", {
     type: "text",
@@ -3978,10 +4005,16 @@ async function chatRenderNew(host, shell, defaults, catalog) {
   };
   const paintModels = () => {
     harness = harnessSelect.value;
-    chatModelOptions(modelSelect, catalog, harness, byHarness[harness]?.model);
+    const keep = modelSelect.value;
+    chatModelOptions(
+      modelSelect, catalog, harness, byHarness[harness]?.model, modelSearch.value);
+    // A narrowed list keeps the operator's pick while it still matches.
+    if (keep && [...modelSelect.options].some((option) => option.value === keep))
+      modelSelect.value = keep;
     paintEfforts();
   };
   harnessSelect.onchange = paintModels;
+  modelSearch.oninput = paintModels;
   modelSelect.onchange = paintEfforts;
   effortSelect.onchange = paintEfforts;
   paintModels();
@@ -3991,7 +4024,7 @@ async function chatRenderNew(host, shell, defaults, catalog) {
       el("p", { className: "muted" },
         "This prepares the shell through its normal CLI path, then runs each turn headlessly.")),
     el("label", { className: "k" }, "Harness"), harnessSelect,
-    el("label", { className: "k" }, "Model"), modelSelect,
+    el("label", { className: "k" }, "Model"), modelSearch, modelSelect,
     el("label", { className: "k" }, "Thinking level"), effortSelect,
     routeNote,
     el("label", { className: "k" }, "Title"), title,

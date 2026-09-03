@@ -552,6 +552,7 @@ body.interface-view main {
 .chat-new-copy h2 { margin: 0 0 .25rem; font-size: 1.05rem; }
 .chat-new-copy p { margin: 0 0 1rem; }
 .chat-route-note { color: var(--dim); font-size: .72rem; margin-top: .3rem; }
+.chat-new-form .chat-model-search { width: 100%; box-sizing: border-box; margin: 0 0 .35rem; }
 .chat-new-form .act { margin-top: 1rem; }
 
 /* ── Conversation Diff review workspace ─────────────────────────────────── */

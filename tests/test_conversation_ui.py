@@ -327,6 +327,71 @@ console.log(JSON.stringify(select.options));
 
 
 @pytest.mark.skipif(shutil.which("node") is None, reason="node is required")
+def test_model_picker_groups_by_family_and_filters_on_the_search_query():
+    options = APP[
+        APP.index("function chatModelOptions"):
+        APP.index("function chatCreateConversation")
+    ]
+    script = r"""
+const CHAT_HARNESS_DEFAULT_VALUE = "__sc_harness_default__";
+const el = (tag, props) => ({tag, ...props, kids: [],
+  append(node) { this.kids.push(node); }});
+const select = {options: [], replaceChildren() { this.options = []; },
+  append(node) { this.options.push(node); }};
+""" + options + r"""
+const catalog = {harnesses: {opencode: {models: [
+  {id: "ollama-cloud/glm-5.3", availability: "available", family: "glm", provider: "ollama-cloud"},
+  {id: "ollama-cloud/glm-5.1", availability: "available", family: "glm", provider: "ollama-cloud"},
+  {id: "ollama-cloud/deepseek-v4-pro", availability: "available", family: "deepseek", provider: "ollama-cloud"},
+  {id: "halo/ornith1.5-35b", availability: "available", provider: "halo"},
+  {id: "halo/hidden", availability: "unavailable", provider: "halo"},
+]}}};
+const shape = () => select.options.map((node) => node.tag === "optgroup"
+  ? [node.label, node.kids.map((kid) => kid.value)]
+  : [node.value, node.textContent, Boolean(node.disabled)]);
+chatModelOptions(select, catalog, "opencode", null);
+const grouped = shape();
+chatModelOptions(select, catalog, "opencode", null, "GLM");
+const filtered = shape();
+chatModelOptions(select, catalog, "opencode", null, "halo");
+const byProvider = shape();
+chatModelOptions(select, catalog, "opencode", null, "nothing-here");
+const empty = shape();
+console.log(JSON.stringify({grouped, filtered, byProvider, empty}));
+"""
+    assert run_js(script) == {
+        "grouped": [
+            ["", "Use harness default", False],
+            ["glm", ["ollama-cloud/glm-5.3", "ollama-cloud/glm-5.1"]],
+            ["deepseek", ["ollama-cloud/deepseek-v4-pro"]],
+            ["halo/ornith1.5-35b", "halo/ornith1.5-35b", False],
+        ],
+        "filtered": [
+            ["", "Use harness default", False],
+            ["glm", ["ollama-cloud/glm-5.3", "ollama-cloud/glm-5.1"]],
+        ],
+        "byProvider": [
+            ["", "Use harness default", False],
+            ["halo/ornith1.5-35b", "halo/ornith1.5-35b", False],
+        ],
+        "empty": [
+            ["", "Use harness default", False],
+            ["", 'No models match "nothing-here"', True],
+        ],
+    }
+
+
+def test_start_chat_offers_a_model_filter_above_the_picker():
+    new_chat = APP[APP.index("async function chatRenderNew"):
+                   APP.index("function chatTranscriptPageItems")]
+    assert 'className: "search chat-model-search"' in new_chat
+    assert 'ariaLabel: "Filter models"' in new_chat
+    assert "modelSearch.oninput = paintModels;" in new_chat
+    assert "byHarness[harness]?.model, modelSearch.value);" in new_chat
+    assert '"Model"), modelSearch, modelSelect,' in new_chat
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node is required")
 def test_missing_retained_harness_status_disables_composer():
     availability = APP[
         APP.index("function chatHarnessUnavailableReason"):
