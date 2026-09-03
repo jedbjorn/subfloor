@@ -381,14 +381,100 @@ console.log(JSON.stringify({grouped, filtered, byProvider, empty}));
     }
 
 
-def test_start_chat_offers_a_model_filter_above_the_picker():
+def test_start_chat_uses_the_searchable_dropdown_over_the_hidden_select():
     new_chat = APP[APP.index("async function chatRenderNew"):
                    APP.index("function chatTranscriptPageItems")]
-    assert 'className: "search chat-model-search"' in new_chat
-    assert 'ariaLabel: "Filter models"' in new_chat
-    assert "modelSearch.oninput = paintModels;" in new_chat
-    assert "byHarness[harness]?.model, modelSearch.value);" in new_chat
-    assert '"Model"), modelSearch, modelSelect,' in new_chat
+    assert "const modelDropdown = chatModelDropdown(modelSelect, describeModel);" in new_chat
+    assert "modelDropdown.refresh();" in new_chat
+    assert '"Model"), modelDropdown.root,' in new_chat
+    assert "modelSelect.onchange = paintEfforts;" in new_chat
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node is required")
+def test_model_dropdown_opens_with_search_on_top_and_picks_through_the_select():
+    source = APP[
+        APP.index("function chatModelDropdown"):
+        APP.index("function chatCreateConversation")
+    ]
+    script = r"""
+class Node {
+  constructor(tag) {
+    this.tagName = tag.toUpperCase(); this.children = []; this.isConnected = true;
+    this.classes = new Set();
+    this.classList = {
+      toggle: (name, on) => { on ? this.classes.add(name) : this.classes.delete(name); },
+    };
+  }
+  append(...kids) { for (const kid of kids) this.children.push(kid); }
+  replaceChildren(...kids) { this.children = [...kids]; }
+  focus() { focused.push(this.className); }
+  contains(node) { return node === this || this.children.some((kid) => kid.contains?.(node)); }
+  dispatchEvent(event) { changes.push(event.type + ":" + this.value); }
+  get options() {
+    return this.children.flatMap((kid) => kid.tagName === "OPTGROUP" ? kid.children : [kid]);
+  }
+  get selectedIndex() { return this.options.findIndex((o) => o.value === this.value); }
+}
+const focused = []; const changes = [];
+const document = { addEventListener() {}, removeEventListener() {} };
+const el = (tag, props = {}, ...kids) => {
+  const node = Object.assign(new Node(tag), tag === "input" ? {value: ""} : {}, props);
+  node.append(...kids.map((kid) => kid instanceof Node ? kid : {text: kid}));
+  return node;
+};
+""" + source + r"""
+const select = el("select");
+const group = el("optgroup", {label: "glm"});
+group.append(el("option", {value: "ollama-cloud/glm-5.3", textContent: "ollama-cloud/glm-5.3"}),
+             el("option", {value: "ollama-cloud/glm-5.1", textContent: "ollama-cloud/glm-5.1"}));
+select.append(el("option", {value: "", textContent: "Use harness default"}), group,
+              el("option", {value: "halo/ornith", textContent: "halo/ornith"}));
+select.value = "";
+const meta = {"halo/ornith": "ornith halo"};
+const dd = chatModelDropdown(select, (id) => meta[id] || "");
+const [trigger, panel, hiddenSelect] = dd.root.children;
+const [search, list] = panel.children;
+const rows = () => list.children.map((n) =>
+  n.className === "dm-sect" ? "#" + n.children[0].text
+  : n.className === "dm-note" ? "!" + n.children[0].text
+  : (n.classes.has("dm-highlight") ? "*" : "") + n.children[0].children[0].text);
+const out = {order: [trigger.className, search.className.split(" ")[0], list.className.split(" ")[0]],
+  hiddenSelect: hiddenSelect.hidden, closedLabel: trigger.textContent, panelHidden: panel.hidden};
+trigger.onclick();
+out.opened = {panelHidden: panel.hidden, expanded: trigger.ariaExpanded, rows: rows(), focused: focused.slice()};
+search.value = "halo"; search.oninput();
+out.byProvider = rows();
+search.value = "zzz"; search.oninput();
+out.empty = rows();
+search.value = "glm"; search.oninput();
+search.onkeydown({key: "ArrowDown", preventDefault() {}});
+search.onkeydown({key: "Enter", preventDefault() {}});
+out.picked = {value: select.value, label: trigger.textContent, panelHidden: panel.hidden,
+  changes, searchCleared: search.value};
+console.log(JSON.stringify(out));
+"""
+    assert run_js(script) == {
+        "order": ["chat-model-trigger", "dm-search", "dm-cardlist"],
+        "hiddenSelect": True,
+        "closedLabel": "Use harness default",
+        "panelHidden": True,
+        "opened": {
+            "panelHidden": False,
+            "expanded": "true",
+            "rows": ["*Use harness default", "#glm", "ollama-cloud/glm-5.3",
+                     "ollama-cloud/glm-5.1", "halo/ornith"],
+            "focused": ["dm-search chat-model-search"],
+        },
+        "byProvider": ["*halo/ornith"],
+        "empty": ['!No models match "zzz"'],
+        "picked": {
+            "value": "ollama-cloud/glm-5.1",
+            "label": "ollama-cloud/glm-5.1",
+            "panelHidden": True,
+            "changes": ["change:ollama-cloud/glm-5.1"],
+            "searchCleared": "",
+        },
+    }
 
 
 @pytest.mark.skipif(shutil.which("node") is None, reason="node is required")

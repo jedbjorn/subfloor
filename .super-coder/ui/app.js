@@ -3293,6 +3293,143 @@ function chatModelOptions(select, catalog, harness, defaultModel, query = "") {
   return true;
 }
 
+// Start-chat model dropdown. Closed, it is one control showing the current
+// route; open, the search box sits at the top of the list with the family
+// groups beneath it. The hidden native <select> stays the value carrier so
+// submit + thinking-level logic read one place; the dropdown mirrors its
+// options and dispatches `change` on a pick.
+function chatModelDropdown(select, describe = () => "") {
+  const trigger = el("button", {
+    type: "button",
+    className: "chat-model-trigger",
+    ariaHasPopup: "listbox",
+    ariaExpanded: "false",
+  });
+  const search = el("input", {
+    type: "text",
+    className: "dm-search chat-model-search",
+    placeholder: "Search models — id, name, family, or provider",
+    ariaLabel: "Search models",
+    autocomplete: "off",
+  });
+  const list = el("div", {
+    className: "dm-cardlist chat-model-list",
+    role: "listbox",
+  });
+  const panel = el("div", { className: "chat-model-panel", hidden: true },
+    search, list);
+  const root = el("div", { className: "chat-model-dropdown" },
+    trigger, panel, select);
+  select.hidden = true;
+  let open = false;
+  let highlighted = 0;
+  let choices = [];
+  const label = () => {
+    const option = select.options[select.selectedIndex];
+    trigger.textContent = option ? option.textContent : "Select a model";
+    trigger.title = option?.value || "";
+  };
+  const groups = () => {
+    const out = [];
+    for (const node of select.children) {
+      if (node.tagName === "OPTGROUP")
+        out.push({ label: node.label, options: [...node.children] });
+      else out.push({ label: null, options: [node] });
+    }
+    return out;
+  };
+  const applyHighlight = () => {
+    choices.forEach((choice, j) => {
+      choice.node.classList.toggle("dm-highlight", j === highlighted);
+      choice.node.ariaSelected = String(j === highlighted);
+    });
+    choices[highlighted]?.node.scrollIntoView?.({ block: "nearest" });
+  };
+  const setHighlight = (i) => { highlighted = i; applyHighlight(); };
+  const paint = () => {
+    list.replaceChildren();
+    choices = [];
+    if (!open) return;
+    const q = search.value.trim().toLowerCase();
+    const hit = (option, group) => !q
+      || [option.value, option.textContent, group, describe(option.value)]
+        .some((field) => String(field || "").toLowerCase().includes(q));
+    for (const group of groups()) {
+      const options = group.options.filter(
+        (option) => !option.disabled && hit(option, group.label));
+      if (!options.length) continue;
+      if (group.label) list.append(el("div", { className: "dm-sect" }, group.label));
+      for (const option of options) {
+        const index = choices.length;
+        const card = el("button", {
+          type: "button",
+          role: "option",
+          className: "dm-mcard",
+          title: option.value || option.textContent,
+        });
+        card.append(el("b", {}, option.textContent));
+        card.onmouseenter = () => setHighlight(index);
+        card.onclick = () => pick(option.value);
+        choices.push({ value: option.value, node: card });
+        list.append(card);
+      }
+    }
+    if (!choices.length) list.append(el("div", { className: "dm-note" },
+      q ? `No models match "${search.value.trim()}"`
+        : "No connected provider models available"));
+    highlighted = Math.max(0, Math.min(highlighted, choices.length - 1));
+    applyHighlight();
+  };
+  const close = () => {
+    open = false;
+    highlighted = 0;
+    search.value = "";
+    panel.hidden = true;
+    trigger.ariaExpanded = "false";
+    paint();
+  };
+  const show = () => {
+    open = true;
+    panel.hidden = false;
+    trigger.ariaExpanded = "true";
+    paint();
+    const current = choices.findIndex((choice) => choice.value === select.value);
+    setHighlight(Math.max(0, current));
+    search.focus();
+  };
+  const pick = (value) => {
+    select.value = value;
+    label();
+    close();
+    select.dispatchEvent(new Event("change"));
+    trigger.focus();
+  };
+  trigger.onclick = () => (open ? close() : show());
+  search.oninput = () => { highlighted = 0; paint(); };
+  search.onkeydown = (event) => {
+    if (event.key === "Escape") { close(); trigger.focus(); return; }
+    if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+      event.preventDefault();
+      const delta = event.key === "ArrowDown" ? 1 : -1;
+      setHighlight(Math.max(0, Math.min(highlighted + delta, choices.length - 1)));
+      return;
+    }
+    if (event.key === "Enter" && choices[highlighted]) {
+      event.preventDefault();
+      pick(choices[highlighted].value);
+    }
+  };
+  // Outside click collapses; picks land first because the cards live inside
+  // `panel`. Self-unregisters once this render generation is detached.
+  const outside = (event) => {
+    if (!root.isConnected) { document.removeEventListener("mousedown", outside); return; }
+    if (open && !root.contains(event.target)) close();
+  };
+  document.addEventListener("mousedown", outside);
+  label();
+  return { root, refresh: () => { label(); if (open) paint(); } };
+}
+
 function chatCreateConversation(shell, fields = {}) {
   return chatApi(
     "/conversations",
@@ -3963,12 +4100,14 @@ async function chatRenderNew(host, shell, defaults, catalog) {
     }));
   }
   const modelSelect = el("select");
-  const modelSearch = el("input", {
-    type: "text",
-    className: "search chat-model-search",
-    placeholder: "Filter models — id, name, family, or provider",
-    ariaLabel: "Filter models",
-  });
+  const describeModel = (id) => {
+    const model = (catalog.harnesses?.[harness]?.models || [])
+      .find((entry) => entry.id === id);
+    return model
+      ? [model.name, model.family, model.provider].filter(Boolean).join(" ")
+      : "";
+  };
+  const modelDropdown = chatModelDropdown(modelSelect, describeModel);
   const effortSelect = el("select", { ariaLabel: "Thinking level" });
   const title = el("input", {
     type: "text",
@@ -4005,16 +4144,11 @@ async function chatRenderNew(host, shell, defaults, catalog) {
   };
   const paintModels = () => {
     harness = harnessSelect.value;
-    const keep = modelSelect.value;
-    chatModelOptions(
-      modelSelect, catalog, harness, byHarness[harness]?.model, modelSearch.value);
-    // A narrowed list keeps the operator's pick while it still matches.
-    if (keep && [...modelSelect.options].some((option) => option.value === keep))
-      modelSelect.value = keep;
+    chatModelOptions(modelSelect, catalog, harness, byHarness[harness]?.model);
+    modelDropdown.refresh();
     paintEfforts();
   };
   harnessSelect.onchange = paintModels;
-  modelSearch.oninput = paintModels;
   modelSelect.onchange = paintEfforts;
   effortSelect.onchange = paintEfforts;
   paintModels();
@@ -4024,7 +4158,7 @@ async function chatRenderNew(host, shell, defaults, catalog) {
       el("p", { className: "muted" },
         "This prepares the shell through its normal CLI path, then runs each turn headlessly.")),
     el("label", { className: "k" }, "Harness"), harnessSelect,
-    el("label", { className: "k" }, "Model"), modelSearch, modelSelect,
+    el("label", { className: "k" }, "Model"), modelDropdown.root,
     el("label", { className: "k" }, "Thinking level"), effortSelect,
     routeNote,
     el("label", { className: "k" }, "Title"), title,

@@ -552,7 +552,25 @@ body.interface-view main {
 .chat-new-copy h2 { margin: 0 0 .25rem; font-size: 1.05rem; }
 .chat-new-copy p { margin: 0 0 1rem; }
 .chat-route-note { color: var(--dim); font-size: .72rem; margin-top: .3rem; }
-.chat-new-form .chat-model-search { width: 100%; box-sizing: border-box; margin: 0 0 .35rem; }
+.chat-model-dropdown { position: relative; }
+.chat-model-trigger {
+  width: 100%; display: flex; justify-content: space-between; align-items: center; gap: .6rem;
+  text-align: left; cursor: pointer; background: var(--panel2); color: var(--ink);
+  border: 1px solid var(--line); border-radius: 8px; padding: .5rem .6rem; font: inherit;
+}
+.chat-model-trigger::after { content: "▾"; color: var(--dim); flex: none; }
+.chat-model-trigger[aria-expanded="true"], .chat-model-trigger:focus-visible {
+  outline: none; border-color: rgba(255,255,255,.25);
+}
+.chat-model-panel {
+  position: absolute; left: 0; right: 0; top: calc(100% + 4px); z-index: 20;
+  display: flex; flex-direction: column; gap: .4rem; padding: .5rem;
+  background: var(--panel); border: 1px solid var(--line); border-radius: 8px;
+  box-shadow: 0 10px 28px rgba(0,0,0,.4);
+}
+.chat-model-panel[hidden] { display: none; }
+.chat-model-panel .dm-sect { padding-top: .35rem; }
+.chat-model-list { max-height: 18rem; }
 .chat-new-form .act { margin-top: 1rem; }
 
 /* ── Conversation Diff review workspace ─────────────────────────────────── */
