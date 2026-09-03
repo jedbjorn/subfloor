@@ -2847,6 +2847,25 @@ class Handler(BaseHTTPRequestHandler):
         return self._fail(exc)
 
     @staticmethod
+    def _require_sprint_participant_or_admin(
+        con, sprint_id: int, shell_id: int
+    ) -> None:
+        if con.execute(
+            "SELECT 1 FROM sprints WHERE sprint_id=?", (sprint_id,)
+        ).fetchone() is None:
+            raise KeyError(f"unknown Sprint: {sprint_id}")
+        row = con.execute(
+            "SELECT s.flavor,EXISTS(SELECT 1 FROM sprint_participants p "
+            "WHERE p.sprint_id=? AND p.shell_id=?) AS participates "
+            "FROM shells s WHERE s.shell_id=?",
+            (sprint_id, shell_id, shell_id),
+        ).fetchone()
+        if row is None or (not row["participates"] and row["flavor"] != "admin"):
+            raise sprint_domain.SprintAuthorityError(
+                "only a Sprint participant or FnB may read the Sprint board"
+            )
+
+    @staticmethod
     def _require_sprint_planner(con, sprint_id: int, shell_id: int) -> None:
         sprint = con.execute(
             "SELECT originating_planner_shell_id FROM sprints WHERE sprint_id=?",
@@ -3215,6 +3234,15 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(
                     200,
                     {"sprint_id": sprint_id, "messages": [dict(row) for row in messages]},
+                )
+            if parts[3] == "board":
+                # Read-only projection of the whole Sprint (lifecycle,
+                # participants + current routes, work units, dependencies,
+                # PRs) for its own participants; the FnB browser board reads
+                # the same projection over /api/sprints/<id>.
+                self._require_sprint_participant_or_admin(con, sprint_id, shell_id)
+                return self._send(
+                    200, sprint_board.SprintBoardProjection(con).board(sprint_id)
                 )
             store = sprint_close.SprintCloseStore(con)
             if parts[3] == "report":

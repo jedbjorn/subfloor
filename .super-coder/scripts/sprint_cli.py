@@ -499,6 +499,12 @@ def cmd_disposition_followup(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_show(args: argparse.Namespace) -> int:
+    result = mem._api("GET", f"/_sc/sprint/{args.sprint}/board")
+    print(json.dumps(result, indent=2, sort_keys=True))
+    return 0
+
+
 def cmd_compile_report(args: argparse.Namespace) -> int:
     result = mem._api("GET", f"/_sc/sprint/{args.sprint}/report?limit={args.limit}")
     print(json.dumps(result["evidence_packet"], indent=2, sort_keys=True))
@@ -853,6 +859,16 @@ def build_parser() -> argparse.ArgumentParser:
     )
     followup.add_argument("--resolution-file", help=PAYLOAD_FILE_HELP)
     followup.set_defaults(fn=cmd_disposition_followup)
+
+    show = sub.add_parser(
+        "show",
+        help=(
+            "Read one Sprint: lifecycle, participants with current routes, "
+            "work units, dependencies, and PRs"
+        ),
+    )
+    show.add_argument("--sprint", type=int, required=True)
+    show.set_defaults(fn=cmd_show)
 
     report = sub.add_parser(
         "compile-report", help="Planner prints the bounded evidence packet"

@@ -2729,6 +2729,89 @@ class SprintCliApiTest(unittest.TestCase):
         finally:
             con.close()
 
+    def test_show_reads_the_board_for_participants_and_fnb_only(self):
+        self.use_isolated_db()
+        feature_id, approval_id, task_id = self.seed_declaration("show-reader")
+        participants = self.write(
+            json.dumps(
+                [
+                    {"shell_id": 3, "role": "planner", "harness": "codex"},
+                    {"shell_id": 1, "role": "developer", "harness": "codex"},
+                    {
+                        "shell_id": 2,
+                        "role": "reviewer",
+                        "harness": "kimi",
+                        "model": "kimi-k2",
+                        "effort": "high",
+                    },
+                ]
+            )
+        )
+        sprint_id = self.run_cli(
+            TOKENS["planner"],
+            "declare",
+            "--feature",
+            str(feature_id),
+            "--spec-approval",
+            str(approval_id),
+            "--participants-file",
+            participants,
+            "--merge-grant",
+        )["sprint_id"]
+        unit_id = self.run_cli(
+            TOKENS["planner"],
+            "plan-unit",
+            "--sprint",
+            str(sprint_id),
+            "--developer-shell",
+            "1",
+            "--reviewer-shell",
+            "2",
+            "--title",
+            "Board read",
+            "--expected-output-file",
+            self.write("Participants can read their own Sprint."),
+            "--task",
+            str(task_id),
+        )["work_unit_id"]
+
+        prepared = self.run_cli(
+            TOKENS["planner"], "show", "--sprint", str(sprint_id)
+        )
+        self.assertEqual("prepared", prepared["sprint"]["lifecycle"])
+        by_shell = {row["shell_id"]: row for row in prepared["participants"]}
+        self.assertEqual({1, 2, 3}, set(by_shell))
+        self.assertEqual("unbound-intent", by_shell[2]["binding_status"])
+        self.assertEqual(("kimi", "kimi-k2", "high"), (
+            by_shell[2]["harness"], by_shell[2]["model"], by_shell[2]["effort"]
+        ))
+
+        self.run_cli(
+            TOKENS["planner"],
+            "arm",
+            "--sprint",
+            str(sprint_id),
+            "--conformance-reviewer-shell",
+            "2",
+        )
+
+        for token in (TOKENS["planner"], TOKENS["developer"], TOKENS["admin"]):
+            board = self.run_cli(token, "show", "--sprint", str(sprint_id))
+            self.assertEqual("armed", board["sprint"]["lifecycle"])
+            by_shell = {row["shell_id"]: row for row in board["participants"]}
+            self.assertEqual("bound", by_shell[2]["binding_status"])
+            self.assertEqual(1, by_shell[2]["route_revision"])
+            self.assertEqual("developer", by_shell[1]["role"])
+            self.assertEqual(
+                [unit_id], [unit["work_unit_id"] for unit in board["work_units"]]
+            )
+            self.assertEqual(1, board["work_units"][0]["developer"]["shell_id"])
+
+        with self.assertRaisesRegex(SystemExit, "HTTP 403"):
+            self.run_cli("dev2-token", "show", "--sprint", str(sprint_id))
+        with self.assertRaisesRegex(SystemExit, "HTTP 404"):
+            self.run_cli(TOKENS["planner"], "show", "--sprint", "999")
+
     def test_real_review_merge_dispatch_monitor_and_close_surfaces(self):
         request = self.run_cli(
             TOKENS["developer"],
