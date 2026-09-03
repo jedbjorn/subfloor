@@ -9,6 +9,19 @@ const el = (t, props = {}, ...kids) => {
 };
 const esc = (s) => (s ?? "").replace(/[&<>]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c]));
 
+// Forgiving model search. Both sides fold to lowercase letters + digits only,
+// then every whitespace-separated term of the query must appear in one of the
+// folded fields: "glm 5-3 flash", "GLM5.3", and "flash glm" all reach
+// ollama-cloud/glm-5.3-flash. Fields fold separately so a term never spans two.
+const modelSearchFold = (value) =>
+  String(value ?? "").toLowerCase().replace(/[^\p{L}\p{N}]+/gu, "");
+function modelSearchHit(query, fields) {
+  const terms = String(query ?? "").split(/\s+/).map(modelSearchFold).filter(Boolean);
+  if (!terms.length) return true;
+  const haystack = fields.map(modelSearchFold).join("|");
+  return terms.every((term) => haystack.includes(term));
+}
+
 // Unified list search box — identical look + placement (first element under the
 // header) on every page that filters a list (Roadmap board, Docs, Flags).
 // `onq(value)` fires on each keystroke; the caller owns the persisted query
@@ -624,13 +637,12 @@ function dmModelPicker(harness, cat, row, save, onRouteChanged = () => {}) {
     results.textContent = "";
     applyHighlight = () => {};   // the list this closed over is detached now
     if (!open) { results.hidden = true; return; }
-    const q = input.value.trim().toLowerCase();
-    const hit = (m) => !q || [m.id, m.name, m.family]
-      .some((s) => (s || "").toLowerCase().includes(q));
+    const q = input.value.trim();
+    const hit = (m) => modelSearchHit(q, [m.id, m.name, m.family]);
     const models = cat.stale && !liveBlock ? [] : (data.models || []).filter(
       (m) => m.availability === "available" && hit(m));
     choices = [
-      ...(!q || "harness default".includes(q)
+      ...(modelSearchHit(q, ["harness default"])
         ? [{ value: null, label: "Harness default", sub: "clear the model override" }]
         : []),
       ...models.map((m) => ({ value: m.id, label: m.id, sub: routeSub(m) })),
@@ -3245,9 +3257,9 @@ function chatOpenStream(
 function chatModelOptions(select, catalog, harness, defaultModel, query = "") {
   select.replaceChildren();
   const models = catalog.harnesses?.[harness]?.models || [];
-  const q = String(query || "").trim().toLowerCase();
-  const matches = (model) => !q || [model.id, model.name, model.family, model.provider]
-    .some((field) => String(field || "").toLowerCase().includes(q));
+  const q = String(query || "").trim();
+  const matches = (model) =>
+    modelSearchHit(q, [model.id, model.name, model.family, model.provider]);
   const available = models.filter((model) =>
     model.availability === "available" && matches(model));
   if (defaultModel) select.append(el("option", {
@@ -3350,10 +3362,9 @@ function chatModelDropdown(select, describe = () => "") {
     list.replaceChildren();
     choices = [];
     if (!open) return;
-    const q = search.value.trim().toLowerCase();
-    const hit = (option, group) => !q
-      || [option.value, option.textContent, group, describe(option.value)]
-        .some((field) => String(field || "").toLowerCase().includes(q));
+    const q = search.value.trim();
+    const hit = (option, group) => modelSearchHit(
+      q, [option.value, option.textContent, group, describe(option.value)]);
     for (const group of groups()) {
       const options = group.options.filter(
         (option) => !option.disabled && hit(option, group.label));
