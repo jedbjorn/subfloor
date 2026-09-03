@@ -80,6 +80,9 @@ DISPOSITION_VERBS_RESEED = (
 ROLE_AWARE_BOOT_RESEED = (
     ENGINE / "migrations" / "0243_role_aware_boot_contract.sql"
 )
+SUBFLOOR_COMMAND_RESEED = (
+    ENGINE / "migrations" / "0247_reseed_subfloor_command.sql"
+)
 
 
 class SprintSkillTest(unittest.TestCase):
@@ -893,6 +896,7 @@ class SprintSkillTest(unittest.TestCase):
             con.executescript(BINDING_GUIDANCE_RESEED.read_text())
             con.executescript(DISPOSITION_VERBS_RESEED.read_text())
             con.executescript(ROLE_AWARE_BOOT_RESEED.read_text())
+            con.executescript(SUBFLOOR_COMMAND_RESEED.read_text())
 
             self.assertIsNotNone(
                 con.execute(
