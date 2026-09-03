@@ -418,7 +418,7 @@ def _pid_is_opencode_serve(pid: int) -> bool:
     """Best-effort identity check so only an opencode serve is ever reaped."""
     try:
         raw = Path(f"/proc/{pid}/cmdline").read_bytes()
-        cmdline = raw.replace(b"\x00", " ").decode("utf-8", errors="replace")
+        cmdline = raw.replace(b"\x00", b" ").decode("utf-8", errors="replace")
     except OSError:
         try:
             result = subprocess.run(
