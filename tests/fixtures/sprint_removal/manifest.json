@@ -88,6 +88,7 @@
     ".super-coder/migrations/0245_reseed_spec_feature_reassignment.sql",
     ".super-coder/migrations/0246_adaptive_shell_posture.sql",
     ".super-coder/migrations/0247_reseed_subfloor_command.sql",
+    ".super-coder/migrations/0248_reseed_sprint_pln_orientation.sql",
     ".super-coder/scripts/activity_monitor.py",
     ".super-coder/scripts/harness_surfaces.py",
     ".super-coder/scripts/instance_state.py",

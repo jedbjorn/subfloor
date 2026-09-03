@@ -1,11 +1,18 @@
----
-name: sprint_pln
-description: Run an armed Sprints v2 collaboration loop as Planner — dispatch and restructure lanes, change participant routes, and execute Reviewer decisions through durable pause, resume, and close protocols.
-category: workflow
-common: false
----
+-- 0248 — reseed sprint_pln with Planner orientation and read surfaces.
+-- The Planner skill now explains how a Sprint runs and names every read a
+-- shell has (including the new `sc sprint show` board read) before the
+-- control procedures. No schema change: a full-body UPSERT converges upgraded
+-- installations on the same text a fresh seed produces.
 
-# sprint_pln — govern the armed Sprint
+BEGIN;
+
+INSERT INTO skills (name, description, category, command, common, content, is_deleted) VALUES (
+  'sprint_pln',
+  'Run an armed Sprints v2 collaboration loop as Planner — dispatch and restructure lanes, change participant routes, and execute Reviewer decisions through durable pause, resume, and close protocols.',
+  'workflow',
+  NULL,
+  0,
+  '# sprint_pln — govern the armed Sprint
 
 Use after `sprint_prep` arms Sprint. System records; Reviewer judges/reports;
 Planner structures/controls; FnB board override = decision #46.
@@ -27,7 +34,7 @@ dispatches every dependency-ready lane as a Force-new Developer wake) ⇄
 `completed` or `aborted` (terminal; nothing is deleted). One Sprint is armed at
 a time.
 
-A lane's life: dispatched → Developer builds on a branch, registers the PR,
+A lane''s life: dispatched → Developer builds on a branch, registers the PR,
 requests review → Reviewer records a verdict → Developer authorizes the merge
 on live green → the merged-work handoff wakes you → you dispatch whatever
 became ready. After the last lane the conformance Reviewer records the
@@ -296,12 +303,12 @@ sc sprint resolve-unit --sprint <id> --work-unit <id> \
   --to completed|cancelled --reason <reason>
 ```
 
-Paused-only; retires the lane's open expectations, supersedes its PR links
+Paused-only; retires the lane''s open expectations, supersedes its PR links
 (registration kept for reconcile-pr), and wakes both seats. Recall+replan
 ships revised work; resolve only closes the lane.
 
 To change future assignment/review model, pause armed Sprint, take each
-participant's `shell_id` and current route from `sc sprint show`, preview the
+participant''s `shell_id` and current route from `sc sprint show`, preview the
 replacement with `sc models resolve`, then replace the route and resume:
 
 ```text
@@ -311,8 +318,8 @@ sc sprint reroute-participant --sprint <id> --participant-shell <id> \
 ```
 
 Prepared Sprints may reroute directly. Paused reroute retires the
-participant's own released expectations and queues fresh ones on the
-replacement route at resume; another seat's open turn still blocks. Existing
+participant''s own released expectations and queues fresh ones on the
+replacement route at resume; another seat''s open turn still blocks. Existing
 chats/runs remain history; next Force-new delivery uses replacement. Reroute
 declared participants only. On decline, preserve reason and choose
 replacement from current capacity; ask Reviewer only if review/conformance
@@ -399,4 +406,11 @@ On an initial clean completion receipt, verify the named Sprint is terminal and
 record `cleanup_state=pending`; run no close command. Stop until the
 engine-authored cleanup success or failure receipt arrives. The Planner does
 not author a second report, accept an actionable handoff, poll cleanup, or ask
-another role to reset a worktree.
+another role to reset a worktree.',
+  0
+) ON CONFLICT(name) DO UPDATE SET
+  description=excluded.description, category=excluded.category,
+  command=excluded.command, common=excluded.common,
+  content=excluded.content, is_deleted=0;
+
+COMMIT;
