@@ -646,6 +646,32 @@ remain ignored. Then restart the session to boot onto the new floor.
 > default), `--force` to knowingly discard it, or `./sc eject` to own the
 > engine outright (see *Customize a fork vs diverge from it*, next).
 
+### An update that aborts partway — re-run it
+
+An update that fails **after** the materialize step leaves a consistent,
+resumable state: `engine.ref` is not advanced, the new engine is fully on disk,
+and whatever migrations ran are already recorded in the ledger. **Re-run `./sc
+update`.** The second run is dispatched from the on-disk (new) engine, the
+materialize is a byte-identical no-op, `migrate` reports nothing pending, and
+the run continues from where the first one stopped and advances the pin.
+
+Don't reach for `./sc rollback` here — that is the remedy for a *completed*
+update that turned out bad, not for one that stopped halfway.
+
+> [!class4]
+> **Why a fix that is already upstream can still bite a fork once.** The
+> crossing is driven by the updater you *already have*: `update.py` is loaded
+> into memory before the new engine is written over it, so for the rest of that
+> run old updater code is reading new engine data. A defect fixed in the updater
+> therefore takes effect from the **next** crossing — a fork pinned before the
+> fix hits it exactly once, and the re-run is the crossing that clears it. This
+> is the same constraint that makes a breaking engine change ship as a two-hop
+> floor (a compatibility release first, the real change second). Worked example:
+> [#1430](https://github.com/jedbjorn/subfloor/issues/1430), where a pre-fix
+> updater validated the new engine's skill-tombstone registry with its own
+> older, hyphen-rejecting name pattern and aborted catalogue sync on
+> `api-design`.
+
 ### Roll back a bad update
 
 ```bash
