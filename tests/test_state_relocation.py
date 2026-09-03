@@ -1,6 +1,8 @@
 """Relocation lifecycle, recovery, exclusion, and selector coverage."""
 from __future__ import annotations
 
+import contextlib
+import io
 import json
 import multiprocessing
 import os
@@ -291,6 +293,71 @@ class StateRelocationTests(RelocationFixture):
         self.assertTrue(self.legacy.exists())
         self.assertTrue(self.state.database.exists())
         self.assertFalse(self.state.relocation_receipt.exists())
+
+    def create_blank_database(self, path: Path | None = None) -> Path:
+        # What `sqlite3.connect()` leaves behind when nothing was ever created:
+        # a header-only file with an empty sqlite_master.
+        target = path or self.legacy
+        target.parent.mkdir(parents=True, exist_ok=True)
+        sqlite3.connect(target).close()
+        Path(str(target) + "-wal").write_bytes(b"")
+        return target
+
+    def test_blank_legacy_file_is_discarded_when_private_state_is_live(self):
+        self.create_database(self.state.database, value="private")
+        self.create_blank_database()
+        self.assertTrue(state_relocation.is_blank_database(self.legacy))
+
+        with contextlib.redirect_stderr(io.StringIO()) as err:
+            result = self.relocate()
+
+        self.assertFalse(result.relocated)
+        self.assertEqual(result.database, self.state.database)
+        self.assertFalse(self.legacy.exists())
+        self.assertFalse(Path(str(self.legacy) + "-wal").exists())
+        self.assertIn("discarded blank legacy database file", err.getvalue())
+        connection = sqlite3.connect(self.state.database)
+        try:
+            self.assertEqual(
+                "private",
+                connection.execute("SELECT value FROM payload").fetchone()[0],
+            )
+        finally:
+            connection.close()
+
+    def test_blank_legacy_file_is_discarded_after_private_publication(self):
+        self.create_database(value="legacy")
+        first = self.relocate()
+        self.assertTrue(first.relocated)
+        self.assertTrue(self.state.relocation_receipt.exists())
+        self.create_blank_database()
+
+        with contextlib.redirect_stderr(io.StringIO()):
+            again = self.relocate()
+
+        self.assertEqual(again.database, self.state.database)
+        self.assertFalse(self.legacy.exists())
+        self.assertTrue(self.state.relocation_receipt.exists())
+
+    def test_populated_legacy_is_never_treated_as_blank(self):
+        self.create_database(value="legacy")
+        self.assertFalse(state_relocation.is_blank_database(self.legacy))
+        self.create_database(self.state.database, value="private")
+        with self.assertRaisesRegex(
+            state_relocation.RelocationError, "conflicting complete"
+        ):
+            self.relocate()
+        self.assertTrue(self.legacy.exists())
+
+    def test_blank_legacy_without_private_state_follows_the_ordinary_path(self):
+        self.create_blank_database()
+        self.assertFalse(self.state.database.exists())
+        # No private DB means nothing is authoritative yet; the guard stays out
+        # of the way and the ordinary relocation decides, as before.
+        result = self.relocate()
+        self.assertTrue(result.relocated)
+        self.assertFalse(self.legacy.exists())
+        self.assertTrue(self.state.database.exists())
 
     def test_fresh_install_uses_private_state_without_a_relocation_receipt(self):
         self.assertEqual(

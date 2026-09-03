@@ -381,6 +381,43 @@ def _relocate_auxiliary_state(repo_root: Path, state: instance_state.InstanceSta
     shutil.rmtree(legacy_backups)
 
 
+def is_blank_database(path: Path) -> bool:
+    """A SQLite file with no schema objects at all — never a real engine DB.
+
+    `sqlite3.connect()` on a missing path creates exactly this: a header-only
+    file with an empty `sqlite_master`. Anything that opened the legacy path
+    without meaning to (a test driving the live root, a probe, an aborted
+    tool) leaves one behind, and the relocation guard would otherwise read
+    it as a second complete database and refuse forever. A DB that carries
+    even one table is NOT blank and keeps the fail-closed treatment.
+    """
+    if not path.is_file() or path.is_symlink():
+        return False
+    try:
+        connection = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+    except sqlite3.Error:
+        return False
+    try:
+        count = connection.execute("SELECT count(*) FROM sqlite_master").fetchone()[0]
+    except sqlite3.Error:
+        return False
+    finally:
+        connection.close()
+    return count == 0
+
+
+def _discard_blank_legacy(legacy: Path, *, proc_root: Path) -> bool:
+    """Drop a blank legacy file when the private DB is the only real one."""
+    refuse_live_database_owners(legacy, proc_root=proc_root)
+    _remove_legacy_database(legacy)
+    print(
+        f"→ relocation: discarded blank legacy database file {legacy} "
+        "(no schema objects; private state is authoritative)",
+        file=sys.stderr,
+    )
+    return True
+
+
 def _remove_legacy_database(database: Path) -> None:
     for suffix in ("-wal", "-shm", ""):
         Path(str(database) + suffix).unlink(missing_ok=True)
@@ -449,6 +486,16 @@ def relocate_legacy_state(
     with lease:
         receipt = _read_receipt(resolved)
         recovered = False
+        # A blank legacy file next to a real private DB is a stray, not a
+        # conflict: discard it before any branch below can read it as a
+        # second complete database. Only when the private DB exists — a lone
+        # legacy file, blank or not, still follows the ordinary path.
+        if (
+            legacy.exists()
+            and resolved.database.exists()
+            and is_blank_database(legacy)
+        ):
+            _discard_blank_legacy(legacy, proc_root=proc_root)
         if receipt is not None and receipt["status"] == "legacy":
             if not legacy.exists():
                 raise RelocationError(
