@@ -55,7 +55,10 @@ CACHE = ENGINE / "logs" / "model_catalog.json"
 ADAPTERS = ENGINE / "adapters"
 TTL_HOURS = 24
 TIMEOUT = 8
-MAX_HTTP_JSON_BYTES = 4 * 1024 * 1024
+# models.dev/api.json passed 4 MiB in 2026-09 (212 providers, ~7.5k models);
+# the cap guards memory against a hostile endpoint, not against growth,
+# so keep generous headroom over the real catalogue.
+MAX_HTTP_JSON_BYTES = 16 * 1024 * 1024
 MODELS_DEV_URL = "https://models.dev/api.json"
 
 # harness -> models.dev provider key. kimi maps to "kimi-for-coding" (the

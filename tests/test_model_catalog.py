@@ -468,7 +468,7 @@ class BuildTest(NoCLI):
 
             def read(self, amount):
                 reads.append(amount)
-                return b"x" * (4 * 1024 * 1024 + 1)
+                return b"x" * (mc.MAX_HTTP_JSON_BYTES + 1)
 
         with mock.patch.object(
             mc.urllib.request, "urlopen", return_value=Response()
@@ -478,7 +478,7 @@ class BuildTest(NoCLI):
             ):
                 mc._http_json("https://provider.example/models")
 
-        self.assertEqual(reads, [4 * 1024 * 1024 + 1])
+        self.assertEqual(reads, [mc.MAX_HTTP_JSON_BYTES + 1])
 
 
     def test_bad_provider_key_never_fails_the_sweep(self):
