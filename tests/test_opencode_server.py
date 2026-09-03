@@ -389,3 +389,34 @@ class OpenCodeServerTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class OpenCodeServeIdentityTest(unittest.TestCase):
+    """`_pid_is_opencode_serve` reads /proc cmdline as bytes; it must not crash.
+
+    The catalogue swallows any exception from the provider probe as "no
+    routes", so a TypeError here silently emptied the GUI's OpenCode model
+    picker on every host where an orphan serve reached the identity check.
+    """
+
+    def _with_cmdline(self, raw: bytes) -> bool:
+        with mock.patch.object(opencode.Path, "read_bytes", return_value=raw):
+            return opencode._pid_is_opencode_serve(17195)
+
+    def test_recognizes_an_opencode_serve_from_proc_cmdline(self) -> None:
+        raw = (
+            b"/home/op/.opencode/bin/opencode\x00serve\x00--hostname\x00"
+            b"127.0.0.1\x00--port\x0055353\x00"
+        )
+        self.assertTrue(self._with_cmdline(raw))
+
+    def test_rejects_a_process_that_is_not_an_opencode_serve(self) -> None:
+        self.assertFalse(self._with_cmdline(b"python3\x00server.py\x00--port\x008837\x00"))
+        self.assertFalse(self._with_cmdline(b"/usr/bin/opencode\x00models\x00"))
+
+    def test_falls_back_to_ps_when_proc_is_unreadable(self) -> None:
+        completed = mock.Mock(returncode=0, stdout="/usr/bin/opencode serve --port 1\n")
+        with mock.patch.object(
+            opencode.Path, "read_bytes", side_effect=OSError("no /proc")
+        ), mock.patch.object(opencode.subprocess, "run", return_value=completed):
+            self.assertTrue(opencode._pid_is_opencode_serve(17195))
