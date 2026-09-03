@@ -53,8 +53,10 @@ What that buys you in practice:
 > Ubuntu LTS, stable Fedora, and Arch-compatible Linux (including CachyOS) are
 > tested examples, not an exclusive list.
 > On macOS or Windows, create a Linux VM and run this flow inside the guest.
+> No docker? `./sc install --runtime host` keeps the same lifecycle with a
+> supervised host process instead of a container.
 > The Linux prerequisites, guest-filesystem recommendation, docker modes, and
-> no-docker escape hatch: [*Install*](README.md#install).
+> the host runtime: [*Install*](README.md#install).
 
 Four steps, from an existing git repo to a booted shell:
 

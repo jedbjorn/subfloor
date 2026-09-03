@@ -1279,6 +1279,126 @@ def start_docker_review_server(service: tuple[str, str] | None) -> None:
     print(f"→ started Docker runtime {container} after DB maintenance")
 
 
+HOST_SERVER_PID = ENGINE / "run" / "server.pid"
+
+
+def _host_runtime_selected() -> bool:
+    """Whether instance.json selects the host runtime (scripts/runtime.py).
+
+    Lazy import with a sandbox answer on ImportError: minimal maintenance
+    fixtures copy update.py without runtime.py, and an engine that predates
+    the selection can only be a sandbox install.
+    """
+    try:
+        import runtime  # noqa: PLC0415
+    except ImportError:
+        return False
+    return runtime.is_host()
+
+
+def _host_server_pid() -> int | None:
+    """The pid `./sc launch` recorded, only while it is alive and still ours."""
+    try:
+        raw = HOST_SERVER_PID.read_text().splitlines()[0].strip()
+        pid = int(raw)
+    except (OSError, IndexError, ValueError):
+        return None
+    if pid <= 0:
+        return None
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return None
+    # -ww: unlimited width, or a long interpreter path pushes the script
+    # argument past ps's default column cut and the server looks foreign.
+    probe = subprocess.run(
+        ["ps", "-ww", "-p", str(pid), "-o", "args="],
+        capture_output=True, text=True, check=False,
+    )
+    if probe.returncode != 0 or "api/server.py" not in probe.stdout:
+        return None
+    return pid
+
+
+def _host_api_answers() -> bool:
+    port = ports.resolve(persist=False).get("port")
+    if not isinstance(port, int):
+        return False
+    probe = subprocess.run(
+        ["curl", "-fsS", f"http://127.0.0.1:{port}/api/health"],
+        capture_output=True, text=True, check=False,
+    )
+    return probe.returncode == 0
+
+
+def stop_host_review_server() -> tuple[str, str] | None:
+    """Stop the host-runtime review server `./sc launch` started, if live.
+
+    Only the pidfile process is ours to stop. Under the host runtime a server
+    that still answers the port WITHOUT that pidfile (a foreground `./sc serve`,
+    a hand-rolled unit) would keep serving a DB this update is about to
+    migrate, so the update refuses rather than proceed beside it. Under the
+    sandbox runtime nothing here applies: the docker and PM2 stops above own
+    that path, and a stray host listener is not this updater's to judge.
+    """
+    if not _host_runtime_selected():
+        return None
+    pid = _host_server_pid()
+    if pid is None:
+        if _host_api_answers():
+            sys.exit(
+                "update: a review server answers this fork's port but ./sc launch "
+                "did not start it; refusing to migrate the live DB beside it.\n"
+                "  stop that server (foreground ./sc serve, or your own unit), then retry"
+            )
+        return None
+    try:
+        os.kill(pid, 15)
+    except OSError as exc:
+        sys.exit(
+            f"update: could not stop host review server (pid {pid}); "
+            f"refusing to migrate the live DB: {exc}"
+        )
+    for _attempt in range(40):
+        try:
+            os.kill(pid, 0)
+        except OSError:
+            break
+        # An exited child that nobody has reaped yet is a zombie: it holds no
+        # socket and serves nothing, so it counts as stopped.
+        state = subprocess.run(
+            ["ps", "-p", str(pid), "-o", "stat="],
+            capture_output=True, text=True, check=False,
+        ).stdout.strip()
+        if not state or state.startswith("Z"):
+            break
+        time.sleep(0.25)
+    else:
+        sys.exit(
+            f"update: host review server (pid {pid}) did not stop after SIGTERM; "
+            "refusing to migrate the live DB"
+        )
+    HOST_SERVER_PID.unlink(missing_ok=True)
+    print(f"→ stopped host review server (pid {pid}) before DB maintenance")
+    return str(REPO_ROOT / "sc"), "host"
+
+
+def start_host_review_server(service: tuple[str, str] | None) -> None:
+    """Relaunch the host runtime through the dispatcher's own `launch`."""
+    if service is None:
+        return
+    sc_path, _label = service
+    started = subprocess.run(
+        [sc_path, "launch"], capture_output=True, text=True, check=False
+    )
+    if started.returncode != 0:
+        sys.exit(
+            "update: DB maintenance succeeded but the host review server could "
+            "not start:\n" + (started.stderr or started.stdout).strip()
+        )
+    print("→ started host review server after DB maintenance")
+
+
 def _runtime_intent_path(state: instance_state.InstanceState) -> Path:
     return state.root / "update-runtime-intent.json"
 
@@ -1299,7 +1419,7 @@ def _load_runtime_intent(state: instance_state.InstanceState) -> set[str]:
     if payload.get("version") != 1 or not isinstance(payload.get("runtimes"), list):
         raise state_relocation.RelocationError("update runtime intent is invalid")
     runtimes = set(payload["runtimes"])
-    if not runtimes.issubset({"docker", "pm2"}):
+    if not runtimes.issubset({"docker", "pm2", "host"}):
         raise state_relocation.RelocationError("update runtime intent is invalid")
     return runtimes
 
@@ -1326,7 +1446,12 @@ def _service_targets_from_intent(
     runtimes: set[str],
     pm2_service: tuple[str, str] | None,
     docker_service: tuple[str, str] | None,
-) -> tuple[tuple[str, str] | None, tuple[str, str] | None]:
+    host_service: tuple[str, str] | None = None,
+) -> tuple[
+    tuple[str, str] | None, tuple[str, str] | None, tuple[str, str] | None
+]:
+    if host_service is None and "host" in runtimes:
+        host_service = (str(REPO_ROOT / "sc"), "host")
     if pm2_service is None and "pm2" in runtimes:
         pm2_bin = shutil.which("pm2")
         if pm2_bin is None:
@@ -1340,7 +1465,7 @@ def _service_targets_from_intent(
                 "update: retained Docker relaunch intent but docker is unavailable"
             )
         docker_service = (docker, f"sc-{REPO_ROOT.name}")
-    return pm2_service, docker_service
+    return pm2_service, docker_service, host_service
 
 
 def require_restarted_runtime_health() -> None:
@@ -1364,9 +1489,12 @@ def require_restarted_runtime_health() -> None:
 def _stop_restarted_runtime(label: str, service: tuple[str, str]) -> str | None:
     """Stop one runtime attempted during relaunch; return bounded failure text."""
     executable, name = service
+    # PM2 and Docker take `<bin> stop <name>`; the host runtime is stopped by
+    # the dispatcher's own `down`, which only signals the pidfile it started.
+    argv = [executable, "down"] if label == "Host" else [executable, "stop", name]
     try:
         stopped = subprocess.run(
-            [executable, "stop", name], capture_output=True, text=True, check=False
+            argv, capture_output=True, text=True, check=False
         )
     except OSError as exc:
         return f"{label} {name}: {exc}"
@@ -1380,6 +1508,7 @@ def _stop_restarted_runtime(label: str, service: tuple[str, str]) -> str | None:
 def restart_review_servers(
     pm2_service: tuple[str, str] | None,
     docker_service: tuple[str, str] | None,
+    host_service: tuple[str, str] | None = None,
 ) -> None:
     """Restart the prior runtimes atomically, or return them all to stopped."""
     attempted: list[tuple[str, tuple[str, str]]] = []
@@ -1390,6 +1519,9 @@ def restart_review_servers(
         if docker_service is not None:
             attempted.append(("Docker", docker_service))
         start_docker_review_server(docker_service)
+        if host_service is not None:
+            attempted.append(("Host", host_service))
+        start_host_review_server(host_service)
         if attempted:
             require_restarted_runtime_health()
     except (Exception, SystemExit) as exc:
@@ -1430,6 +1562,10 @@ def migrate_with_service_cutover(*, backup: bool = True, reconcile=None) -> None
     if service is not None:
         runtime_intent.add("pm2")
         _write_runtime_intent(state, runtime_intent)
+    host_service = stop_host_review_server()
+    if host_service is not None:
+        runtime_intent.add("host")
+        _write_runtime_intent(state, runtime_intent)
     legacy_was_present = instance_state.legacy_database_path(ENGINE).exists()
     try:
         with state_relocation.exclusive_maintenance(state, command="update"):
@@ -1467,10 +1603,10 @@ def migrate_with_service_cutover(*, backup: bool = True, reconcile=None) -> None
     # Deliberately not in finally: a failed destructive migration must leave
     # the old server stopped instead of restarting code against a changed or
     # incompatible floor.
-    service, docker_service = _service_targets_from_intent(
-        runtime_intent, service, docker_service
+    service, docker_service, host_service = _service_targets_from_intent(
+        runtime_intent, service, docker_service, host_service
     )
-    restart_review_servers(service, docker_service)
+    restart_review_servers(service, docker_service, host_service)
     _clear_runtime_intent(state)
 
 
@@ -1631,6 +1767,10 @@ def expire_sandbox_harnesses() -> str | None:
     """
     epoch = install_mod.roll_harness_epoch()
     if install_mod.docker_status().get("state") == "absent":
+        return None
+    # A host-runtime install may well have docker for other reasons, but its
+    # shells never run an image: the roll stays harmless and unannounced.
+    if _host_runtime_selected():
         return None
     return epoch
 

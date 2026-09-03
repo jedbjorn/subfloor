@@ -170,6 +170,117 @@ sc_refuse_linked() {
 port() { "$PY" "$S/ports.py" port; }
 devport() { "$PY" "$S/ports.py" devport; }
 
+# ── Runtime selection (sandbox | host) ───────────────────────────────────────
+# One instance.json key (`runtime`, scripts/runtime.py) decides which lifecycle
+# the docker verbs drive. `host` runs the review server as a supervised host
+# process (nohup + pidfile under .super-coder/run/) and boots shells directly
+# on this host — no daemon, image, or container anywhere in the path. An absent
+# key reads as `sandbox`, so every existing install keeps its behavior.
+# `./sc install --runtime host` or `./sc runtime host` selects it.
+sc_runtime() { "$PY" "$S/runtime.py" get 2>/dev/null || echo sandbox; }
+sc_host_runtime() { [ "$(sc_runtime)" = host ]; }
+
+HOST_SERVER_PID="$ENGINE/run/server.pid"
+HOST_SERVER_LOG="$ENGINE/run/server.log"
+
+sc_host_api_healthy() {
+  curl -fsS "http://127.0.0.1:$(port)/api/health" >/dev/null 2>&1
+}
+# Print the pid from the pidfile only while it is alive AND still this fork's
+# review server — a recycled pid belonging to something else is never ours to
+# signal. Silent failure otherwise.
+sc_host_server_pid() {
+  [ -f "$HOST_SERVER_PID" ] || return 1
+  host_pid="$(sed -n '1p' "$HOST_SERVER_PID" 2>/dev/null || true)"
+  [ -n "$host_pid" ] && kill -0 "$host_pid" 2>/dev/null || return 1
+  ps -ww -p "$host_pid" -o args= 2>/dev/null | grep -q "api/server\.py" || return 1
+  printf '%s\n' "$host_pid"
+}
+sc_host_server_alive() { sc_host_server_pid >/dev/null; }
+sc_host_server_up() {
+  "$PY" "$S/ports.py" ensure >/dev/null
+  host_port="$(port)"
+  if sc_host_server_alive; then
+    echo "→ host review server already running (pid $(sc_host_server_pid)) · http://127.0.0.1:$host_port"
+    return 0
+  fi
+  if sc_host_api_healthy; then
+    echo "✗ something already answers http://127.0.0.1:$host_port/api/health but ./sc launch did not start it." >&2
+    echo "  a sandbox from before the switch (./sc runtime sandbox; ./sc down) or a foreground" >&2
+    echo "  ./sc serve — stop it, then retry ./sc launch" >&2
+    return 1
+  fi
+  if ! mkdir -p "$ENGINE/run" 2>/dev/null || [ ! -w "$ENGINE/run" ]; then
+    echo "✗ host-runtime: $ENGINE/run is not writable by $(id -un)" >&2
+    echo "  fix: sudo chown -R $(id -u):$(id -g) '$ENGINE/run'" >&2
+    return 1
+  fi
+  rm -f "$HOST_SERVER_PID"
+  nohup env SC_BIND=127.0.0.1 PYTHONUNBUFFERED=1 \
+    "$PY" "$ENGINE/api/server.py" --port "$host_port" >"$HOST_SERVER_LOG" 2>&1 &
+  host_pid=$!
+  printf '%s\n' "$host_pid" > "$HOST_SERVER_PID"
+  attempts=0
+  while [ "$attempts" -lt 40 ]; do
+    if sc_host_api_healthy; then
+      echo "→ host review server up (pid $host_pid) · http://127.0.0.1:$host_port · log $HOST_SERVER_LOG"
+      return 0
+    fi
+    kill -0 "$host_pid" 2>/dev/null || break
+    attempts=$((attempts + 1))
+    sleep 0.25
+  done
+  echo "✗ host review server did not become healthy; see $HOST_SERVER_LOG" >&2
+  kill "$host_pid" 2>/dev/null || true
+  rm -f "$HOST_SERVER_PID"
+  return 1
+}
+# Stops only what `launch` started (the pidfile). A server that answers on the
+# port without our pidfile — a foreground `./sc serve`, a systemd unit — is
+# reported and left alone, the same contract the brokers keep.
+sc_host_server_down() {
+  host_pid="$(sc_host_server_pid || true)"
+  if [ -n "$host_pid" ]; then
+    kill "$host_pid" 2>/dev/null || true
+    attempts=0
+    while kill -0 "$host_pid" 2>/dev/null && [ "$attempts" -lt 40 ]; do
+      attempts=$((attempts + 1))
+      sleep 0.25
+    done
+    if kill -0 "$host_pid" 2>/dev/null; then
+      echo "✗ host review server (pid $host_pid) did not stop after SIGTERM" >&2
+      return 1
+    fi
+    echo "→ host review server stopped"
+  elif sc_host_api_healthy; then
+    echo "→ a review server answers on 127.0.0.1:$(port) but ./sc launch did not start it — leaving it"
+  else
+    echo "→ host review server not running"
+  fi
+  rm -f "$HOST_SERVER_PID"
+}
+# Host-runtime entry: the shell boots on this host through run.py, the same
+# primitive the sandbox runs inside the container. $1 = shortname ("" = picker).
+sc_host_enter() {
+  host_shortname="$1"
+  shift
+  if [ "${1:-}" = "--devkit-repair" ]; then
+    echo "sc enter: --devkit-repair repairs sandbox image provisioning; this install's runtime is host" >&2
+    exit 2
+  fi
+  if ! sc_host_api_healthy; then
+    echo "✗ host review server is not answering on 127.0.0.1:$(port) — ./sc launch first" >&2
+    exit 1
+  fi
+  sc_urls || true
+  SC_DEV_PORT="$(devport)"
+  export SC_DEV_PORT
+  if [ -n "$host_shortname" ]; then
+    exec "$PY" "$S/run.py" "$host_shortname" "$@"
+  fi
+  exec "$PY" "$S/run.py" "$@"
+}
+
 # The two localhost URLs an operator needs, derived from this fork's ports —
 # never a fixed 8800, because every fork lands on its own offset (ports.py).
 # One printer, three callers (`url`, `enter`, `enter-<shortname>`): entry
@@ -324,8 +435,8 @@ drunning() { [ "$(docker inspect -f '{{.State.Running}}' "$CNAME" 2>/dev/null ||
 # anything on the docker path. Never fatal: this is a status surface, and a
 # probe that cannot run should say so rather than take a launch down with it.
 sc_harness_status() {
-  # In-container (or no docker at all): this process IS the runtime.
-  if [ -n "${SC_SANDBOX:-}" ] || ! command -v docker >/dev/null 2>&1 || ! docker info >/dev/null 2>&1; then
+  # In-container, host runtime, or no docker at all: this process IS the runtime.
+  if [ -n "${SC_SANDBOX:-}" ] || sc_host_runtime || ! command -v docker >/dev/null 2>&1 || ! docker info >/dev/null 2>&1; then
     echo "harness CLIs (this runtime):"
     "$PY" "$S/harness_versions.py" || true
     return 0
@@ -896,7 +1007,14 @@ sc_restart_health_summary() {
   launch_rc="$1"
   SC_RESTART_FAILED=0
   echo "→ restart health"
-  if [ "$launch_rc" -eq 0 ] && sc_wait_until sc_sandbox_alive; then
+  if sc_host_runtime; then
+    if [ "$launch_rc" -eq 0 ] && sc_wait_until sc_host_api_healthy; then
+      echo "  host server: restarted"
+    else
+      echo "  host server: failed (launch or health)"
+      SC_RESTART_FAILED=1
+    fi
+  elif [ "$launch_rc" -eq 0 ] && sc_wait_until sc_sandbox_alive; then
     echo "  sandbox: restarted"
   else
     echo "  sandbox: failed (launch or health)"
@@ -943,7 +1061,7 @@ esac
 # migrate) probes first because it executes host Python. Container entry
 # deliberately remains a Docker handoff rather than a host-runtime gate.
 case "$cmd" in
-  install|ensure-harness|doctor|update|update-harnesses|harness-status|docker-cache-gc|rollback|feature|artifact-mode|eject|remove|init|rebuild|migrate|migration|snapshot|mem|pr|token|persist|job|visual-qa|sql|sql-rw|map-sql|map-sql-rw|map-schema|map-extractor|render|render-check|map|map-setup|analytics|models|seed-skills|skill|ports|url|preview|serve|vm|vm-broker|vm-bake|vm-broker-up|vm-broker-down|vm-broker-sock|vm-mcp-relay|vm-broker-install|vm-broker-uninstall|ts-broker|ts-broker-up|ts-broker-down|ts-broker-sock|ts-broker-install|ts-broker-uninstall|pm2-broker|pm2-broker-up|pm2-broker-down|pm2-broker-sock|pm2-broker-install|pm2-broker-uninstall|db-broker|db-broker-up|db-broker-down|db-broker-sock|db-broker-install|db-broker-uninstall|db-init|pg-init|pg-up|pg-down|admin|boot|boot-*|run|deps|test|lint|typecheck|launch|down|restart|build|verify|health|clean-db)
+  install|ensure-harness|doctor|update|update-harnesses|harness-status|docker-cache-gc|rollback|feature|runtime|artifact-mode|eject|remove|init|rebuild|migrate|migration|snapshot|mem|pr|token|persist|job|visual-qa|sql|sql-rw|map-sql|map-sql-rw|map-schema|map-extractor|render|render-check|map|map-setup|analytics|models|seed-skills|skill|ports|url|preview|serve|vm|vm-broker|vm-bake|vm-broker-up|vm-broker-down|vm-broker-sock|vm-mcp-relay|vm-broker-install|vm-broker-uninstall|ts-broker|ts-broker-up|ts-broker-down|ts-broker-sock|ts-broker-install|ts-broker-uninstall|pm2-broker|pm2-broker-up|pm2-broker-down|pm2-broker-sock|pm2-broker-install|pm2-broker-uninstall|db-broker|db-broker-up|db-broker-down|db-broker-sock|db-broker-install|db-broker-uninstall|db-init|pg-init|pg-up|pg-down|admin|boot|boot-*|run|deps|test|lint|typecheck|launch|down|restart|build|verify|health|clean-db)
     case "$cmd" in
       deps|test|lint|typecheck)
         sc_devkit_help_form "$@" || sc_python_probe ;;
@@ -967,7 +1085,10 @@ case "$cmd" in
   # rebuild, and name the no-rebuild bounce that activates exactly this image.
   # Without docker the host IS the runtime, so the installers are correct there.
   update-harnesses)
-    if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
+    if sc_host_runtime; then
+      echo "→ runtime host — updating this host's harness CLIs (the host IS the runtime)"
+      "$PY" "$S/install.py" --update-harnesses
+    elif command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
       epoch="$(harness_epoch_roll)"
       echo "→ harness epoch rolled to $epoch"
       dbuild
@@ -982,6 +1103,7 @@ case "$cmd" in
   docker-cache-gc) exec "$PY" "$S/docker_cache.py" "$@" ;;
   rollback)     exec "$PY" "$S/rollback.py" "$@" ;;
   feature)      exec "$PY" "$S/feature.py" "$@" ;;
+  runtime)      exec "$PY" "$S/runtime.py" "$@" ;;
   artifact-mode) exec "$PY" "$S/artifact_policy.py" "$@" ;;
   eject)        exec "$PY" "$S/eject.py" "$@" ;;
   remove)       if sc_help_form "$@"; then
@@ -1172,6 +1294,20 @@ case "$cmd" in
       esac
       shift
     done
+    if sc_host_runtime; then
+      [ -z "$no_build" ] || echo "→ runtime host: --no-build is implied (there is no image)"
+      sc_host_server_up || exit 1
+      echo "  dev server:    \$SC_DEV_PORT=$(devport) → http://127.0.0.1:$(devport)"
+      echo "  boot a shell:  ./sc enter   (or ./sc enter-<shortname>)"
+      sc_vm_broker_up || true
+      sc_ts_broker_up || true
+      sc_pm2_broker_up || true
+      sc_db_broker_up || true
+      # The Postgres sidecar is a docker container even under the host runtime
+      # (app-only, opt-in); it is started only when the fork linked it.
+      if sc_pg_configured; then sc_pg_up || true; fi
+      exit 0
+    fi
     dcheck
     if [ -n "$no_build" ]; then dimage_preflight; else dbuild; fi
     dcreds
@@ -1336,6 +1472,7 @@ case "$cmd" in
     # Start the PG sidecar when configured — self-skips otherwise.
     sc_pg_up || true ;;
   enter)
+    if sc_host_runtime; then sc_host_enter "" "$@"; fi
     if [ "${1:-}" = "--devkit-repair" ]; then
       shift
       echo "! dev-kit state: repair — provisioning is not ready; no readiness claim is made." >&2
@@ -1352,6 +1489,7 @@ case "$cmd" in
     sc_urls || true
     exec docker exec -it "$CNAME" ./sc boot "$@" ;;
   enter-*)
+    if sc_host_runtime; then sc_host_enter "${cmd#enter-}" "$@"; fi
     if [ "${1:-}" = "--devkit-repair" ]; then
       echo "sc ${cmd}: repair posture is available only as ./sc enter --devkit-repair" >&2
       exit 2
@@ -1364,7 +1502,17 @@ case "$cmd" in
     }
     sc_urls || true
     exec docker exec -it "$CNAME" ./sc boot "${cmd#enter-}" "$@" ;;
-  down)         docker rm -f "$CNAME" >/dev/null 2>&1 && echo "→ sandbox stopped" || echo "→ not running"
+  down)         if sc_host_runtime; then
+                  down_rc=0
+                  sc_host_server_down || down_rc=1
+                  sc_vm_broker_down
+                  sc_ts_broker_down
+                  sc_pm2_broker_down
+                  sc_db_broker_down
+                  if sc_pg_configured; then sc_pg_down || down_rc=1; fi
+                  exit "$down_rc"
+                fi
+                docker rm -f "$CNAME" >/dev/null 2>&1 && echo "→ sandbox stopped" || echo "→ not running"
                 sc_vm_broker_down
                 sc_ts_broker_down
                 sc_pm2_broker_down
@@ -1407,6 +1555,21 @@ case "$cmd" in
         *) echo "→ restart aborted (nothing touched)"; exit 1 ;;
       esac
     fi
+    if sc_host_runtime; then
+      # No image to refresh or cut over: backup, stop what launch started,
+      # start it again, then prove health — the same shape, minus docker.
+      [ -z "$no_build" ] || echo "→ runtime host: --no-build is implied (there is no image)"
+      backup_dir="$(sc_db_backup_preflight)"
+      sc_db_backup prerestart "$backup_dir"
+      if ! "$0" down; then
+        echo "✗ restart stopped: teardown did not complete; no replacement services were launched." >&2
+        exit 1
+      fi
+      launch_rc=0
+      "$0" launch || launch_rc=$?
+      sc_restart_health_summary "$launch_rc"
+      exit $?
+    fi
     dcheck
     if [ -n "$no_build" ]; then
       dimage_preflight
@@ -1432,6 +1595,10 @@ case "$cmd" in
   # --harnesses expires the baked harness CLIs first, so the build re-runs their
   # installers instead of serving them from a cache that has no expiry of its own.
   build)
+    if sc_host_runtime; then
+      echo "sc build: runtime is host — there is no sandbox image to build (./sc runtime sandbox to switch)" >&2
+      exit 2
+    fi
     dcheck
     case "${1:-}" in
       --harnesses)
@@ -1447,6 +1614,13 @@ case "$cmd" in
       echo "usage: ./sc logs"
       echo "  Tail the managed server logs until interrupted."
       exit 0
+    fi
+    if sc_host_runtime; then
+      [ -f "$HOST_SERVER_LOG" ] || {
+        echo "sc logs: no host review server log yet — ./sc launch first" >&2
+        exit 1
+      }
+      exec tail -f "$HOST_SERVER_LOG"
     fi
     exec docker logs -f "$CNAME" ;;
   verify)
@@ -1495,7 +1669,8 @@ super-coder — forkable shell substrate
 
   ./sc install             first-launch bootstrap for a fork (requirements, harness, first shell)
   ./sc ensure-harness      install claude + opencode + codex + vibe + kimi if missing (official native installers, no npm)
-  ./sc doctor              sandbox readiness: docker (rootless/rootful) + harness login
+  ./sc doctor              runtime readiness: docker (rootless/rootful) + harness login — or, under
+                             runtime host, the host process contract + harness login
   ./sc update              fetch + materialize the engine (gitignored dep) + reconcile IN PLACE (migrate, sync skills, map);
                              --no-fetch skips the fetch · --ref <tag|sha> pins a version · blocks on local engine edits (--force discards them)
                              first runs git pull --ff-only for any tracked checkout; source repos then reconcile FROM that tree.
@@ -1566,7 +1741,12 @@ super-coder — forkable shell substrate
 
   Sandbox (docker — the default way to run; allow-everything is safe because the
   container only sees this repo + your harness creds):
+  ./sc runtime [mode]      show or select the lifecycle runtime: sandbox (docker, the default) · host
+                             (review server as a supervised host process + shells booted on this host;
+                             no docker anywhere). launch/enter/down/restart/logs/build/update-harnesses/
+                             doctor/update follow the selection; ./sc install --runtime host sets it at install
   ./sc launch              build the exact base/fork image, start the sandbox, and run declared provisioning
+                             (runtime host: start the host review server + configured brokers; no image)
                              states: absent · invalid · failed · stale · ready; failed setup retains container + evidence
                              every launch refreshes configured-origin Git + GitHub API capabilities;
                              --no-build reuses only a ready labeled image but still refreshes auth
