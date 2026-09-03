@@ -12,17 +12,6 @@ DB="$ENGINE/shell_db.db"
 CMD="${1:-}"
 [ $# -gt 0 ] && shift
 
-# The engine's hooks dir is materialized (wiped by every update). This install
-# needs its home-substrate pre-commit guard to survive updates, so keep
-# core.hooksPath on the fork-owned wrapper dir; it chains to the engine hook.
-FORK_HOOKS="$ROOT/scripts_sc/hooks"
-if [ -d "$FORK_HOOKS" ] && git -C "$ROOT" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
-  current="$(git -C "$ROOT" config --get core.hooksPath || true)"
-  if [ "$current" != "$FORK_HOOKS" ]; then
-    git -C "$ROOT" config core.hooksPath "$FORK_HOOKS"
-  fi
-fi
-
 port() { "$PY" "$S/ports.py" port; }
 devport() { "$PY" "$S/ports.py" devport; }
 
