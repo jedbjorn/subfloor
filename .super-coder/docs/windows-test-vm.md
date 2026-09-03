@@ -1,8 +1,8 @@
 ---
 title: Windows Test VM — Opt-in
-tags: [super-coder, design, testing, opt-in]
+tags: [subfloor, design, testing, opt-in]
 date: 2026-06-13
-project: super-coder
+project: subfloor
 purpose: Opt-in Windows VM link for high-fidelity testing
 ---
 
@@ -10,7 +10,7 @@ purpose: Opt-in Windows VM link for high-fidelity testing
 
 ## Overview
 
-A super-coder fork that builds Windows software needs to test on **real Windows** — installers, services, registry, system-level behavior, where Wine is useless. This design adds an **opt-in capability** that links a fork to a Windows VM the operator already runs on their own box, gives the shell a verified push/exec/capture/reset loop against it, and exposes a guided setup modal in the Scripts tab.
+A Subfloor fork that builds Windows software needs to test on **real Windows** — installers, services, registry, system-level behavior, where Wine is useless. This design adds an **opt-in capability** that links a fork to a Windows VM the operator already runs on their own box, gives the shell a verified push/exec/capture/reset loop against it, and exposes a guided setup modal in the Scripts tab.
 
 The engine ships the *orchestration*; the operator brings the *VM* (license, image, OS install are theirs — unreachable from the tool).
 
@@ -18,7 +18,7 @@ The engine ships the *orchestration*; the operator brings the *VM* (license, ima
 > The product is **verified config**, not stored strings. The modal's value is that every field is live-tested — `can I see the domain, SSH in, run a command, read the transfer dir, revert the snapshot` — before it is saved.
 
 > [!class4]
-> **Scope boundary:** super-coder cannot create the VM. Installing the guest OS, enabling OpenSSH inside Windows, and building the clean snapshot are manual, host-side, and outside what a web modal can reach. This design is **link-only** — it assumes a ready VM and captures + validates the connection to it.
+> **Scope boundary:** Subfloor cannot create the VM. Installing the guest OS, enabling OpenSSH inside Windows, and building the clean snapshot are manual, host-side, and outside what a web modal can reach. This design is **link-only** — it assumes a ready VM and captures + validates the connection to it.
 
 ## Decisions
 
@@ -114,7 +114,7 @@ Lives in the existing fork-level `instance.json` (where the port is already pers
 | `libvirt_uri` | **optional** — `virsh` connection. Set `qemu:///system` for a system-scope domain; the default `qemu:///session` can't see it. Omit otherwise. |
 
 > [!class3]
-> **Secrets posture matches the rest of the engine.** Super-coder stores zero credentials in the DB or on disk today — harness keys live in operator home, git uses the SSH agent. The `vm` block holds a key *path*, never key material. The wizard can generate a keypair into operator home and show the **public** key to install in the guest's `authorized_keys`; the DB/config never sees the private half.
+> **Secrets posture matches the rest of the engine.** Subfloor stores zero credentials in the DB or on disk today — harness keys live in operator home, git uses the SSH agent. The `vm` block holds a key *path*, never key material. The wizard can generate a keypair into operator home and show the **public** key to install in the guest's `authorized_keys`; the DB/config never sees the private half.
 
 ## API
 
@@ -191,4 +191,4 @@ Deliberately deferred — named so the build stays small and nothing is silently
 | Prereqs wizard | The guest-side automation (install OpenSSH, build snapshot, mount share) the modal can't reach. Link-only for now |
 | Remote VM (scp-only) | Assumes the VM is on the same host as the build (virtio-fs share). Cross-host is a later provider variant |
 | Multiple VMs / matrix | One VM per fork. Multi-target testing is a future generalization |
-| Generic test-target interface | The broader super-coder win — pluggable providers (VM, container, device) behind one interface. Windows-via-VM is provider #1; abstract once there's a second |
+| Generic test-target interface | The broader Subfloor win — pluggable providers (VM, container, device) behind one interface. Windows-via-VM is provider #1; abstract once there's a second |

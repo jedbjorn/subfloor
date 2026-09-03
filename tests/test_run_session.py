@@ -625,7 +625,7 @@ class HeadlessSessionFailureTest(unittest.TestCase):
                 self.assertRaises(SystemExit) as raised:
             run.main()
 
-        self.assertIn("run make dos-admin from a host terminal", str(raised.exception))
+        self.assertIn("run subfloor admin from a host terminal", str(raised.exception))
         pointers.assert_not_called()
         open_db.assert_not_called()
 
@@ -665,7 +665,7 @@ class HeadlessSessionFailureTest(unittest.TestCase):
         self.assertEqual(
             str(raised.exception),
             "sc admin: host harness 'codex' is not installed; run ./sc "
-            "ensure-harness or use make dos-e for the container Admin route",
+            "ensure-harness or use subfloor enter for the container Admin route",
         )
         con.close.assert_called_once_with()
         pointers.assert_not_called()

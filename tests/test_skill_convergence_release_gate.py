@@ -202,7 +202,7 @@ class SkillConvergenceReleaseGateTest(unittest.TestCase):
                 mock.patch.object(update.install_mod, "ensure_gitignore", return_value=False)
             )
             stack.enter_context(
-                mock.patch.object(update.install_mod, "wire_make_aliases", return_value=False)
+                mock.patch.object(update.shell_alias, "install", return_value=[])
             )
             stack.enter_context(
                 mock.patch.object(update.seed_skills, "apply_retired", return_value=[])

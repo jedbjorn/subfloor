@@ -1,8 +1,8 @@
 ---
 title: Harness freshness — keeping shells on current CLIs and models
-tags: [super-coder, sandbox, harness, docker, models, runbook]
+tags: [subfloor, sandbox, harness, docker, models, runbook]
 date: 2026-07-26
-project: super-coder
+project: subfloor
 purpose: Why a shell cannot reach a model that exists, and the commands that fix it — the harness epoch, what rolls it, and what a restart does
 ---
 
@@ -72,13 +72,13 @@ it costs the harness downloads and nothing else.
 
 | Command | What it does |
 |---|---|
-| `./sc harness-status` / `make dos-harness-status` | Versions **inside the sandbox** + whether the image owes a rebuild |
-| `./sc restart` / `make dos-r` | Roll a fresh epoch, rebuild the image, then bounce into it |
+| `./sc harness-status` / `subfloor harness-status` | Versions **inside the sandbox** + whether the image owes a rebuild |
+| `./sc restart` / `subfloor restart` | Roll a fresh epoch, rebuild the image, then bounce into it |
 | `./sc restart --no-build` | Deliberately reuse the existing image; no refresh and no build |
-| `./sc update-harnesses` / `make dos-update-harnesses` | Roll and rebuild without bouncing; activate that exact build with `restart --no-build` |
+| `./sc update-harnesses` / `subfloor update-harnesses` | Roll and rebuild without bouncing; activate that exact build with `restart --no-build` |
 | `./sc build --harnesses` | Same staged refresh without the rest of `update-harnesses`' output |
 | `./sc build` | Ordinary rebuild — passes the **stored** epoch, so it stays cache-warm |
-| `./sc update` / `make dos-u` | Marks harness layers stale as part of the update; the normal restart refreshes and activates them |
+| `./sc update` / `subfloor update` | Marks harness layers stale as part of the update; the normal restart refreshes and activates them |
 
 ## Routine cadence
 
@@ -87,13 +87,13 @@ official installer for current, finishes the image build, and only then tears
 down the running sandbox.
 
 ```
-make dos-u                 # update the engine floor
-make dos-r                 # fresh harnesses + safe bounce
-make dos-harness-status    # confirm
+subfloor update             # update the engine floor
+subfloor restart            # fresh harnesses + safe bounce
+subfloor harness-status     # confirm
 ```
 
 To stage the potentially slow/networked build while the old sandbox keeps
-running, use `make dos-update-harnesses`, then activate that exact image later
+running, use `subfloor update-harnesses`, then activate that exact image later
 with `./sc restart --no-build`.
 
 ## Runbook: a shell cannot reach a model that exists
@@ -118,8 +118,8 @@ docker exec sc-<repo> sh -c 'grep -c "claude-opus-5" "$(readlink -f "$(command -
 **3. Refresh and bounce.**
 
 ```
-make dos-r                  # refreshes harnesses, builds, then safely bounces
-make dos-harness-status     # verify the new build is what shells got
+subfloor restart            # refreshes harnesses, builds, then safely bounces
+subfloor harness-status     # verify the new build is what shells got
 ```
 
 **4. If the CLI is current and the model still is not offered**, it is no longer

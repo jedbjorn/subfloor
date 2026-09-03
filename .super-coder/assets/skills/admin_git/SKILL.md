@@ -48,7 +48,7 @@ gitignored. After `self_update` succeeds, stage only the durable public update:
 ```bash
 git add .sc-state/engine.ref
 git status --short
-SC_SHELL_FLAVOR=admin git commit -m "chore: update super-coder engine pin"
+SC_SHELL_FLAVOR=admin git commit -m "chore: update subfloor engine pin"
 ```
 
 Set the marker on this commit command even inside an Admin shell. The update
@@ -86,7 +86,7 @@ deleted.
 git ls-files --error-unmatch .super-coder/schema.sql
 ```
 
-Exit 0 means this repository authors super-coder itself: `.super-coder/` is
+Exit 0 means this repository authors Subfloor itself: `.super-coder/` is
 tracked source, not a dependency, and `.sc-state/engine.ref` is not the delivery
 unit. Engine implementation still arrives through a Developer branch and PR;
 Admin fast-forwards main and merges only the exact approved PR. Apply live

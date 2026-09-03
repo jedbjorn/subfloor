@@ -42,6 +42,7 @@ import db_backup
 import engine_manifest
 import install
 import instance_state
+import make_cleanup
 import state_relocation
 import sandbox_devkit
 import sc_wrapper
@@ -407,20 +408,9 @@ def quiesce_runtime(repo_root: Path) -> None:
 
 
 def cleanup_makefile(repo_root: Path) -> bool:
-    path = repo_root / "Makefile"
-    if not path.exists():
-        return False
-    text = path.read_text()
-    if text == install.INSTALLER_MAKEFILE:
-        path.unlink()
-        return True
-    updated = text.replace(install.APPENDED_ALIASES_BLOCK, "")
-    updated = install._ALIASES_RE.sub("", updated)
-    if updated == text:
-        return False
-    updated = re.sub(r"\n{3,}", "\n\n", updated)
-    path.write_text(updated)
-    return True
+    # Legacy forks may still carry the retired make-alias include; the same
+    # unwiring `./sc make-cleanup` performs, so a remove never leaves it behind.
+    return make_cleanup.cleanup_makefile(repo_root)
 
 
 def cleanup_gitignore(repo_root: Path) -> bool:
@@ -574,8 +564,7 @@ def verify_removed(repo_root: Path) -> list[str]:
     ):
         if (repo_root / relative).exists() or (repo_root / relative).is_symlink():
             remaining.append(str(relative))
-    makefile = repo_root / "Makefile"
-    if makefile.is_file() and install._ALIASES_RE.search(makefile.read_text()):
+    if make_cleanup.makefile_still_wired(repo_root):
         remaining.append("Makefile alias include")
     return remaining
 

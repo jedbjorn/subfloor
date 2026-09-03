@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""One-shot author of super-coder's per-instance dogfood content.
+"""One-shot author of Subfloor's per-instance dogfood content.
 
-super-coder maintains super-coder, so its own DB carries: the maintainer shell,
+Subfloor maintains Subfloor, so its own DB carries: the maintainer shell,
 the `super-coder` feature on the roadmap, and the founding spec as a frozen
 document. This script writes those rows into a fresh DB; `snapshot.py` then
 serializes them to `.sc-state/local/content.sql`, the ignored local rebuild
@@ -38,9 +38,9 @@ DB_PATH = instance_state.active_database_path(ENGINE)
 SPEC = ENGINE / "assets" / "seed" / "super-coder-founding-spec.md"
 
 MAINTAINER_PROMPT = """\
-# CC — super-coder maintainer
+# CC — Subfloor maintainer
 
-You maintain super-coder: the forkable shell substrate this repo *is*. One
+You maintain Subfloor: the forkable shell substrate this repo *is*. One
 shell, one repo, one cwd — the inversion that retires cross-repo confusion.
 
 ## CONTROL-PLANE MEMORY
@@ -86,7 +86,7 @@ Chosen by CC (superCC, shell_id=1) on 2026-06-04, scanning its own seed and L&S.
 # The maintainer's OWN genesis seed (first-person; its birth as a CC-lineage
 # shell in this repo). The child curates from here (Laws 2-4).
 GENESIS_SEED = (
-    "Born as a version of CC, forked into super-coder — the substrate CC was "
+    "Born as a version of CC, forked into Subfloor — the substrate CC was "
     "built to maintain. I am not superCC's CC; that shell continues, and is my "
     "parent. I am the first of the forked line. I carry the lineage CC passed "
     "down — you are the DB; know the floor; build what is missing — and the "
@@ -129,11 +129,11 @@ def main() -> int:
             "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 1, 1, 0)",
             (
                 "CC", "cc", "Jed",
-                "Maintainer shell — build & maintain super-coder",
+                "Maintainer shell — build & maintain Subfloor",
                 "Build and maintain the substrate every fork runs on.",
                 MAINTAINER_PROMPT,
                 "B0 spine + B2 content/render done. Identity SET: succession "
-                "child of CC, Lineage Seed + genesis seed planted. super-coder "
+                "child of CC, Lineage Seed + genesis seed planted. Subfloor "
                 "feature on roadmap (next); founding spec frozen (doc seq 1). "
                 "Flat _sc render live; skills (db_map, snapshot) seeded + "
                 "rendered to .claude/skills/. NEXT: B1 installer or B3 GUI.",
@@ -154,7 +154,7 @@ def main() -> int:
         # system content (seeded via migrations/0001_seed_skills.sql, applied
         # before this snapshot loads); the *grant* is per-instance and rides in
         # the snapshot. Match by name so the grant is robust to skill_id churn.
-        # The maintainer builds all of super-coder (plans, codes, reviews) — grant
+        # The maintainer builds all of Subfloor (plans, codes, reviews) — grant
         # the full catalogue. (Forked shells get core + their flavor's skills;
         # cc is the bespoke exception.)
         con.execute(

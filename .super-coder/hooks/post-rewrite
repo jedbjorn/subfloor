@@ -1,5 +1,5 @@
 #!/bin/sh
-# super-coder auto-remap — keep the dr_* catalogue fresh after a rebase/amend.
+# Subfloor auto-remap — keep the dr_* catalogue fresh after a rebase/amend.
 # Tracked hook, fired via core.hooksPath (wired by `./sc map-setup`). Owned by
 # the cartographer; no working shell maps. Best-effort: never block the rewrite.
 # (git feeds the rewritten refs on stdin; we don't need them — just remap.)

@@ -1,4 +1,4 @@
-// super-coder branch guard — OpenCode plugin (tool.execute.before).
+// Subfloor branch guard — OpenCode plugin (tool.execute.before).
 //
 // Blocks write/edit/patch while HEAD is a protected default branch, forcing a
 // feature branch before work lands. Throwing in tool.execute.before aborts that

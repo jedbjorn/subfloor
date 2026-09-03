@@ -1,12 +1,12 @@
 #!/bin/sh
-# super-coder's fork-owned project policy.  The engine only validates and runs
+# Subfloor's fork-owned project policy.  The engine only validates and runs
 # this argv; dependency and quality-gate choices belong to this source repo.
 set -eu
 
 root="${SC_DEVKIT_ROOT:-}"
 if [ -z "$root" ]; then
   root="$(git rev-parse --show-toplevel 2>/dev/null)" || {
-    echo "dev-kit: not inside the super-coder source checkout" >&2
+    echo "dev-kit: not inside the Subfloor source checkout" >&2
     exit 64
   }
 fi
@@ -83,7 +83,7 @@ PY
       echo "→ deps: creating $venv"
       "$python" -m venv "$venv"
     fi
-    echo "→ deps: install super-coder runtime and test requirements"
+    echo "→ deps: install Subfloor runtime and test requirements"
     "$venv/bin/python" -m pip install -q -r requirements.txt
     "$venv/bin/python" -m pip install -q --upgrade-strategy only-if-needed \
       pytest httpx coverage ruff mypy datasette

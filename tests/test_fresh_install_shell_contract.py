@@ -17,8 +17,8 @@ class FreshInstallShellContractTest(unittest.TestCase):
             commit = text.index(
                 'git commit --no-verify -m "chore: install subfloor"'
             )
-            launch = text.index("make dos-l", commit)
-            enter = text.index("make dos-e", launch)
+            launch = text.index("subfloor launch", commit)
+            enter = text.index("subfloor enter", launch)
             self.assertLess(commit, launch, relative)
             self.assertLess(launch, enter, relative)
 

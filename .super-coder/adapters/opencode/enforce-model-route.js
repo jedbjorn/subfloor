@@ -46,6 +46,6 @@ export const EnforceModelRoute = async () => ({
         `${evidence} expected=${expected}`,
       );
     }
-    console.error(`super-coder OpenCode model route observed: ${evidence}`);
+    console.error(`Subfloor OpenCode model route observed: ${evidence}`);
   },
 });

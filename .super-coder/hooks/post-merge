@@ -1,5 +1,5 @@
 #!/bin/sh
-# super-coder auto-remap — keep the dr_* catalogue fresh after a pull/merge.
+# Subfloor auto-remap — keep the dr_* catalogue fresh after a pull/merge.
 # Tracked hook, fired via core.hooksPath (wired by `./sc map-setup`). Owned by
 # the cartographer; no working shell maps. Best-effort: a map failure must never
 # block the git operation.

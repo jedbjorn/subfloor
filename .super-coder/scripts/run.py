@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Launch a shell against this repo.
 
-super-coder is forked into ONE repo, so a shell works the repo root — no
+Subfloor is forked into ONE repo, so a shell works the repo root — no
 per-shell workdir, no cross-repo cwd confusion (that is the whole inversion).
 
 Flow:
@@ -1183,7 +1183,7 @@ def require_host_harness(adapter: dict, harness: str) -> None:
         return
     raise LaunchError(
         f"host harness '{command}' is not installed; run ./sc ensure-harness "
-        "or use make dos-e for the container Admin route"
+        "or use subfloor enter for the container Admin route"
     )
 
 
@@ -2060,7 +2060,7 @@ def main() -> None:
     if host_admin and os.environ.get("SC_SANDBOX"):
         sys.exit(
             "sc admin: host Admin launch is unavailable inside the sandbox; "
-            "run make dos-admin from a host terminal"
+            "run subfloor admin from a host terminal"
         )
     if not os.environ.get("RENDER_ONLY") and not host_admin:
         global_pointer.write_global_pointers()
@@ -2133,7 +2133,7 @@ def main() -> None:
         sys.exit(
             f"sc admin: cannot open the live engine DB at {DB_PATH}: {detail}\n"
             "Use the global repair-mode instructions to repair or rebuild that exact DB, "
-            "then retry make dos-admin."
+            "then retry subfloor admin."
         )
     # Self-heal stale engine skills before anything this boot reads them
     # (compose's SKILLS block, render_skill_md). A DB stranded by an in-place

@@ -261,6 +261,7 @@ class LegacyUpdateCompatTest(unittest.TestCase):
                 SCRIPTS / "update_compat.py", scripts / "update_compat.py"
             )
             shutil.copy2(SCRIPTS / "sc_wrapper.py", scripts / "sc_wrapper.py")
+            shutil.copy2(SCRIPTS / "shell_alias.py", scripts / "shell_alias.py")
             (scripts / "update.py").write_text(
                 "import os\n"
                 "from pathlib import Path\n"

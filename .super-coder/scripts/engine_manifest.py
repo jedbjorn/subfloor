@@ -55,7 +55,6 @@ FORK_TEMPLATE_PATHS = (
 # resolving each update or rollback ref's own literal list.
 ENGINE_PATHS = [
     "sc",
-    ".super-coder/aliases.mk",
     ".super-coder/Dockerfile",
     ".super-coder/schema.sql",
     ".super-coder/map_schema.sql",

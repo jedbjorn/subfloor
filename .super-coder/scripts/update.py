@@ -78,6 +78,7 @@ import callable_floor  # noqa: E402
 import db_driver  # noqa: E402
 import engine_manifest  # noqa: E402
 import install as install_mod  # noqa: E402  (ensure_harnesses)
+import shell_alias  # noqa: E402
 import instance_state  # noqa: E402
 import migrate as migrate_mod  # noqa: E402
 import ports  # noqa: E402
@@ -734,7 +735,7 @@ def check_local_edits(force: bool, *, target_ref: str | None = None) -> None:
         "update: refusing to overwrite local engine edits. Your options:\n"
         "  - revert them (the engine is upstream-owned; see README →\n"
         "    'Customize a fork vs diverge from it')\n"
-        "  - upstream them: PR the change to super-coder, then update normally\n"
+        "  - upstream them: PR the change to Subfloor, then update normally\n"
         "  - ./sc update --force   discard the local edits and take upstream's engine\n"
         "  - ./sc eject            one-way: stop tracking upstream and own the engine")
 
@@ -1820,9 +1821,15 @@ def reconcile_under_cutover(
     print("→ snapshot the live state")
     snapshot_under_cutover()
 
-    if not source:
-        print("→ wire make aliases (dos- command standard)")
-        print(f"  {install_mod.wire_make_aliases()}")
+    # The `subfloor` operator command (bash + fish function) rides every
+    # update so a host whose shell config was reset gets it back; the bridge
+    # in update_compat.py does the same from a newly materialized engine.
+    print("→ install the subfloor command (bash + fish)")
+    try:
+        for line in shell_alias.install():
+            print(f"  {line}")
+    except shell_alias.AliasError as exc:
+        print(f"  ⚠ {exc} — re-run `./sc alias` after fixing it")
 
     if target_sha is not None:
         if target_source is None:
@@ -1900,7 +1907,7 @@ def main(argv: list[str]) -> int:
     if source:
         # The source repo IS the engine — it has no upstream to materialize from
         # and must keep tracking .super-coder/. Reconcile its own tree only.
-        print("→ super-coder SOURCE repo — engine is tracked here; "
+        print("→ Subfloor SOURCE repo — engine is tracked here; "
               "skipping fetch/materialize/untrack (reconcile in place only)")
         # --no-fetch keeps its meaning (touch no network) and is the escape
         # hatch for reconciling a tree deliberately.
@@ -1951,7 +1958,7 @@ def main(argv: list[str]) -> int:
     epoch = expire_sandbox_harnesses()
     if epoch:
         print(f"→ expire the sandbox's baked harness CLIs (epoch {epoch})")
-        print("  they reinstall on the next image build — normal `./sc restart` / `make dos-r`")
+        print("  they reinstall on the next image build — normal `subfloor restart`")
 
     migrate_with_service_cutover(
         reconcile=lambda: reconcile_under_cutover(
@@ -1983,7 +1990,7 @@ def main(argv: list[str]) -> int:
         print("  This edited tracked files in place but did NOT touch git. Recommended flow:")
         print(f"    git checkout -b {branch_hint}")
         print("    git add sc .sc-state/engine.ref .sc-state/engine.source .gitignore   "
-              "# sc when the materialize changed it; + Makefile/workflow "
+              "# sc when the materialize changed it; + workflow "
               "changes when reported")
         print("    git commit -m 'chore(engine): repin' && git push -u origin HEAD")
         print("    gh pr create")

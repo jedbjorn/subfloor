@@ -144,7 +144,8 @@
     ".super-coder/migrations/0242_reseed_flag_sweep_delivery_audit.sql",
     ".super-coder/migrations/0243_role_aware_boot_contract.sql",
     ".super-coder/migrations/0245_reseed_spec_feature_reassignment.sql",
-    ".super-coder/migrations/0246_adaptive_shell_posture.sql"
+    ".super-coder/migrations/0246_adaptive_shell_posture.sql",
+    ".super-coder/migrations/0247_reseed_subfloor_command.sql"
   ],
   "baseline_migration_ledger": {
     "count": 142,
@@ -840,7 +841,8 @@
       ],
       ".super-coder/scripts/dispatch.sh": [
         "./sc sprint <cmd>        authenticated Sprints v2 actions (run without a command for the full verb list)",
-        "sprint)       sc_python_probe; exec \"$PY\" \"$S/sprint_cli.py\" \"$@\" ;;"
+        "sprint)       sc_python_probe; exec \"$PY\" \"$S/sprint_cli.py\" \"$@\" ;;",
+        "Memory & catalogue    mem · map · map-sql · map-schema · sql · skill · models · job · pr · sprint · token"
       ]
     },
     "forbidden_pattern": "(?:\\bsprints?\\b|\\bconductor\\b|SC_SPRINT_|pr_event|watched_prs|watch-daemon|interface_(?:generations|sessions|writer_leases|input_state|idempotency_keys|recovery_observations)|planner_(?:wake_batches|wake_items|action_receipts|alerts))",

@@ -1,4 +1,4 @@
-// super-coder review UI — vanilla JS, no build step. Talks to the same-origin
+// Subfloor review UI — vanilla JS, no build step. Talks to the same-origin
 // stdlib API. Read everything; edit only what the laws and freeze rules allow.
 
 const $ = (s, r = document) => r.querySelector(s);
@@ -3038,7 +3038,7 @@ function chatAdminCliOnlyNotice(shell, repoRoot) {
       `${shell.display_name} maintains main directly at the repo root, `
       + "so browser chats are disabled for it. Open a terminal and run:"),
     el("pre", { className: "chat-admin-commands" },
-      `cd ${repoRoot || "<repo root>"}\nmake dos-e s=${shell.shortname}`));
+      `cd ${repoRoot || "<repo root>"}\nsubfloor enter ${shell.shortname}`));
 }
 
 function chatWorkingDots() {

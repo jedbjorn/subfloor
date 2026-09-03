@@ -170,7 +170,7 @@ class EnterPreAttachPrintTest(unittest.TestCase):
 
         Both entry verbs, because both carry their own guard: `enter-*` is a
         second dispatch line, not a fallthrough into `enter`, and it is the
-        one `make dos-e s=<shell>` uses."""
+        one `subfloor enter <shell>` uses."""
         env = self._env(SC_PYTHON=str(self.bin / "no-ports-python"))
         for argv in (("enter",), ("enter-DEV1",)):
             with self.subTest(verb=argv[0]):
@@ -217,7 +217,7 @@ class HelpChartTest(unittest.TestCase):
             self.assertFalse(marker.exists())
 
     def test_update_help_matches_ff_only_runtime_contract(self):
-        help_text = sc("help").stdout
+        help_text = sc("help", "--all").stdout
         update_block = help_text.split("./sc update", 1)[1].split(
             "./sc update-harnesses", 1
         )[0]
@@ -225,7 +225,7 @@ class HelpChartTest(unittest.TestCase):
         self.assertIn("engine update continues", update_block)
 
     def test_every_dispatch_verb_is_charted(self):
-        help_text = sc("help").stdout
+        help_text = sc("help", "--all").stdout
         uncharted = [
             v for v in dispatch_verbs()
             if v not in UNCHARTED_BY_DESIGN and not v.startswith("-")
@@ -236,7 +236,7 @@ class HelpChartTest(unittest.TestCase):
                          f"dispatchable but absent from ./sc help: {uncharted}")
 
     def test_removed_v1_sprint_verbs_are_unknown_and_absent_from_help(self):
-        help_text = sc("help").stdout
+        help_text = sc("help", "--all").stdout
         for verb in (
             "directives",
             "events",

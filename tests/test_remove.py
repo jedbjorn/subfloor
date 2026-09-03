@@ -18,6 +18,7 @@ ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS = ROOT / ".super-coder" / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 import install
+import make_cleanup
 import remove as remove_mod
 
 
@@ -68,7 +69,7 @@ class RemoveFixture(unittest.TestCase):
         (state / "content.sql").write_text("generated\n")
         (self.repo / ".gitignore").write_text("*.keep\n" + install._GITIGNORE_BLOCK)
         (self.repo / "Makefile").write_text(
-            "test:\n\t@echo host\n" + install.APPENDED_ALIASES_BLOCK
+            "test:\n\t@echo host\n" + make_cleanup.APPENDED_ALIASES_BLOCK
         )
         git(self.repo, "config", "core.hooksPath", str(self.engine / "hooks"))
         git(
@@ -494,13 +495,13 @@ class GitignoreLifecycleTest(unittest.TestCase):
         self.assertEqual(removed.count(remove_mod.BACKUP_IGNORE), 1)
 
 class WiringTest(unittest.TestCase):
-    def test_dispatcher_and_make_alias_are_public(self) -> None:
+    def test_dispatcher_verbs_are_public_and_make_alias_is_retired(self) -> None:
         dispatcher = (ROOT / ".super-coder" / "scripts" / "dispatch.sh").read_text()
-        aliases = (ROOT / ".super-coder/aliases.mk").read_text()
         self.assertIn('remove)       if sc_help_form "$@"; then', dispatcher)
         self.assertIn('exec "$PY" "$S/remove.py" "$@"', dispatcher)
-        self.assertIn("dos-remove:           ; $(SC) remove $(ARGS)", aliases)
-        self.assertIn("dos-remove", aliases)
+        self.assertIn('alias)        exec "$PY" "$S/shell_alias.py" "$@" ;;', dispatcher)
+        self.assertIn('make-cleanup) exec "$PY" "$S/make_cleanup.py" "$@" ;;', dispatcher)
+        self.assertFalse((ROOT / ".super-coder/aliases.mk").exists())
 
 
 if __name__ == "__main__":

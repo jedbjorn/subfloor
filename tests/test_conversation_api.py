@@ -730,7 +730,7 @@ class ConversationResourceTest(ConversationApiCase):
         self.assertEqual(status, 422)
         self.assertEqual(error["error"]["code"], "ADMIN_SHELL_CLI_ONLY")
         self.assertIn(f"cd {self.root}", error["error"]["message"])
-        self.assertIn("make dos-e s=ADM1", error["error"]["message"])
+        self.assertIn("subfloor enter ADM1", error["error"]["message"])
         self.assertEqual(
             error["error"]["details"],
             {"shell_id": 3, "shortname": "ADM1", "repo_root": str(self.root)},

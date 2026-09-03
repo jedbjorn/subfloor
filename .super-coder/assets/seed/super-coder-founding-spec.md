@@ -1,16 +1,16 @@
 ---
-title: super-coder — Founding Spec
-tags: [super-coder, spec, architecture, harness-agnostic, fork]
+title: Subfloor — Founding Spec
+tags: [subfloor, spec, architecture, harness-agnostic, fork]
 date: 2026-06-04
-project: super-coder
+project: subfloor
 purpose: Harness-agnostic shell substrate per repo
 ---
 
-# super-coder — Founding Spec
+# Subfloor — Founding Spec
 
 ## Overview
 
-super-coder is a **forkable shell substrate for a single code repository**. You
+Subfloor is a **forkable shell substrate for a single code repository**. You
 fork it into a project repo; it brings the shell system — DB-backed identity,
 memory, skills, roadmap — and runs that repo through whatever coding harness you
 point at it (Claude Code today, OpenCode next).
@@ -20,11 +20,11 @@ workflows, and the agent loop are the harness's job — we free-ride every
 improvement Anthropic or OpenCode ships and never maintain a runtime ourselves.
 
 > [!class1]
-> What super-coder owns: identity, memory, seed/L&S, decisions, flags, the
+> What Subfloor owns: identity, memory, seed/L&S, decisions, flags, the
 > roadmap, and spec/doc content. What it does **not** own: the agent loop, the
 > tools, the model API. Those are the harness's, and they stay the harness's.
 
-Sibling to superCC: superCC is the personal-assistant substrate, super-coder is
+Sibling to superCC: superCC is the personal-assistant substrate, Subfloor is
 the coding substrate. Both descend from the same shell lineage (CC).
 
 ```stats
@@ -52,18 +52,18 @@ superCC is one substrate, many shells, reaching **out** to many external repos.
 That created the core pain: cross-repo confusion — identical filenames, diverged
 contents, the wrong cwd one Edit away every session.
 
-super-coder flips it. The substrate is **forked into** a single repo. Its
+Subfloor flips it. The substrate is **forked into** a single repo. Its
 shell(s) live there and only ever touch that repo. One shell, one repo, one cwd.
 The confusion is retired by construction.
 
 ### CC's role changes
 
-CC stops being a cross-repo worker and becomes the **maintainer of super-coder
+CC stops being a cross-repo worker and becomes the **maintainer of Subfloor
 itself** — its only project. Each forked instance runs its own shell(s); CC
 keeps the system they all run on. Regional shell manager, not field worker.
 
 ```linear
-superCC era :::class4 -> many repos one shell :::class4 -> confusion :::class4 -> super-coder :::class3 -> one repo one shell :::class3
+superCC era :::class4 -> many repos one shell :::class4 -> confusion :::class4 -> Subfloor :::class3 -> one repo one shell :::class3
 ```
 
 ## Architecture
@@ -95,7 +95,7 @@ graph TD
 
 ## Directory Structure
 
-super-coder forks into the repo **root** and namespaces everything it owns, so
+Subfloor forks into the repo **root** and namespaces everything it owns, so
 it never collides with the host project and its provenance is unmissable.
 
 ```
@@ -106,7 +106,7 @@ it never collides with the host project and its provenance is unmissable.
     migrations/             # system migrations (text, git-tracked, propagate)
     snapshot/               # per-instance content + memory dump (rebuilds .db)
     render/  adapters/  scripts/
-    README.md               # how super-coder works (system, not the project)
+    README.md               # how Subfloor works (system, not the project)
     shell_db.db             # GITIGNORED, rebuilt
   docs_sc/                  # rendered, read-only
   specs_sc/                 # rendered, read-only
@@ -118,7 +118,7 @@ it never collides with the host project and its provenance is unmissable.
 | Convention | Why |
 |---|---|
 | **`.super-coder/`** | the engine; dotted reads as tooling, still shows in PR diffs |
-| **`_sc` suffix** | rendered + super-coder-created — provenance at a glance, zero collision with a host `/docs` |
+| **`_sc` suffix** | rendered + Subfloor-created — provenance at a glance, zero collision with a host `/docs` |
 | **render banner** | the file's own do-not-edit warning (see Content & Render) |
 | **two READMEs** | project keeps its root `README.md`; the system README lives in `.super-coder/` |
 
@@ -343,7 +343,7 @@ superCC-UI × dos-arch shell-admin) shows who-has-which-tools and surfaces data
 for review.
 
 > [!class4]
-> **Open:** the super-coder maintainer shell's lineage — succession child of CC
+> **Open:** the Subfloor maintainer shell's lineage — succession child of CC
 > vs clone vs fresh — is a session-time identity call, not a spec blocker.
 
 ## GUI (v1)
@@ -374,7 +374,7 @@ frozen specs stay read-only — open the next spec, don't edit the old.
 
 ### Flags
 
-Simple, like superCC — grouped by feature (super-coder's analog of superCC's
+Simple, like superCC — grouped by feature (Subfloor's analog of superCC's
 per-project grouping). Create + resolve from the GUI.
 
 > [!class3]
@@ -387,23 +387,23 @@ per-project grouping). Create + resolve from the GUI.
 
 ```mermaid
 graph LR
-  SC[super-coder]:::class1 -->|fork| R1[dos-arch]:::class2
+  SC[Subfloor]:::class1 -->|fork| R1[dos-arch]:::class2
   SC -->|fork| R2[rst-c]:::class2
   SC -->|fork| R3[md-converter]:::class2
   SC -->|seed migration| R1
   SC -->|seed migration| R2
 ```
 
-- **Fork** = clone super-coder into the target repo, run the installer, which
-  builds a **fresh** `.db` (schema + system migrations, **no** super-coder's own
+- **Fork** = clone Subfloor into the target repo, run the installer, which
+  builds a **fresh** `.db` (schema + system migrations, **no** Subfloor's own
   per-instance content).
-- **Update** = ship improvement to super-coder → each fork pulls → a seeding
+- **Update** = ship improvement to Subfloor → each fork pulls → a seeding
   script applies the new system migrations (skills, render chain, schema). This
   is the dos-arch reseed pattern, proven.
 
 > [!class3]
-> The installer must never copy super-coder's live `.db`. Fork inherits the
-> *system*, not super-coder's memory or roadmap.
+> The installer must never copy Subfloor's live `.db`. Fork inherits the
+> *system*, not Subfloor's memory or roadmap.
 
 ## Installer
 
@@ -420,7 +420,7 @@ API/UI surface stays single-user/localhost — network controls are the operator
 
 ## Onboarding & Mapping
 
-super-coder can be dropped into **almost any repo** — greenfield or years-deep.
+Subfloor can be dropped into **almost any repo** — greenfield or years-deep.
 Install-time automation maps it; a first-runtime skill reconciles the map with
 the FnB and backfills. Then it's ready to work.
 
@@ -449,7 +449,7 @@ Drop in :::class1 -> Map (auto) :::class2 -> Reconcile + ingest :::class3 -> Rea
 
 ### The host's pre-existing docs
 
-Because super-coder renders to `_sc` dirs, the host's original `/docs` `/specs`
+Because Subfloor renders to `_sc` dirs, the host's original `/docs` `/specs`
 are never in the way. After ingest, the onboarding skill offers them three exits
 — **freeze** (leave untouched), **archive** (push to an abandoned branch, drop
 from main), or **delete** — all optional. Coexist by default.
@@ -485,17 +485,17 @@ from the launcher.
 ## Phasing & Open Questions
 
 ```linear
-Spec :::class3 -> Build super-coder :::class1 -> Fork to repos :::class2 -> Migrate shells :::class4
+Spec :::class3 -> Build Subfloor :::class1 -> Fork to repos :::class2 -> Migrate shells :::class4
 ```
 
 ### Sequence (per Jed)
 
-1. **Spec** — this document (superCC `shared/`; becomes super-coder's founding
+1. **Spec** — this document (superCC `shared/`; becomes Subfloor's founding
    spec + first roadmap row once the repo exists — dogfood).
-2. **Build** super-coder in future session(s).
+2. **Build** Subfloor in future session(s).
 3. **Fork** locally into dos-arch, rst-c, emergence_project_private, md-converter.
 4. **Migrate** RST → his repo; a version of CC → dos-arch; a version of CC →
-   maintain super-coder.
+   maintain Subfloor.
 
 ### Decisions — settled this session
 
@@ -519,4 +519,4 @@ Spec :::class3 -> Build super-coder :::class1 -> Fork to repos :::class2 -> Migr
 ### Related work (other repos)
 
 - [x] **md-converter open-in-mdc:** use the existing `?c=` inline deep-link — no md-converter change; reuse the Python encoder.
-- [ ] **md-converter** also becomes a super-coder fork target.
+- [ ] **md-converter** also becomes a Subfloor fork target.

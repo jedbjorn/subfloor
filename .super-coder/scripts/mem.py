@@ -155,7 +155,7 @@ def _refuse_unsafe(path: Path, reason: str) -> "NoReturn":  # noqa: F821
     die(f"runtime credential {path} is {reason} — the trust boundary covers "
         "only an owner-only regular file; remove what is there and let the "
         "supervised service re-provision it with mode 0600 at boot "
-        "(`./sc restart` / `make dos-r`).", EXIT_UNSAFE)
+        "(`subfloor restart`).", EXIT_UNSAFE)
 
 
 def _load_runtime_credential(path: Path) -> None:
@@ -178,7 +178,7 @@ def _load_runtime_credential(path: Path) -> None:
         pre = os.lstat(path)
     except OSError as exc:
         die(f"runtime credential {path} is unreadable ({exc}) — restart the "
-            "supervised service (`./sc restart` / `make dos-r`), which re-provisions it.")
+            "supervised service (`subfloor restart`), which re-provisions it.")
     reason = _unsafe_reason(pre)
     if reason:
         _refuse_unsafe(path, reason)
@@ -188,7 +188,7 @@ def _load_runtime_credential(path: Path) -> None:
         if exc.errno in (errno.ELOOP, errno.EMLINK):
             _refuse_unsafe(path, "a symbolic link")
         die(f"runtime credential {path} is unreadable ({exc}) — restart the "
-            "supervised service (`./sc restart` / `make dos-r`), which re-provisions it.")
+            "supervised service (`subfloor restart`), which re-provisions it.")
     try:
         reason = _unsafe_reason(os.fstat(fd))   # the authoritative check
         if reason:
@@ -198,7 +198,7 @@ def _load_runtime_credential(path: Path) -> None:
             token, base = data["token"], data["api_base"]
         except (OSError, ValueError, KeyError):
             die(f"runtime credential {path} is malformed — the supervised service "
-                "re-provisions it at boot: `./sc restart` / `make dos-r`.")
+                "re-provisions it at boot: `subfloor restart`.")
     finally:
         os.close(fd)
     SC_API_TOKEN, SC_API_BASE, _DISCOVERED_FROM = token, base, path
@@ -220,7 +220,7 @@ def _discover_runtime_credential() -> bool:
         if not artifacts:
             die(f"no runtime credential for Admin shell '{want}' in {_CRED_DIR} — "
                 "the supervised service provisions one per Admin shell at boot "
-                "(`./sc restart` / `make dos-r`).")
+                "(`subfloor restart`).")
     if not artifacts:
         return False
     if len(artifacts) > 1:
@@ -308,7 +308,7 @@ def _api(method: str, path: str, payload: "dict | None" = None,
                 die(f"the runtime credential {_DISCOVERED_FROM} is stale — the API "
                     "refused it (the key was rotated after the artifact was written). "
                     "The supervised service refreshes the artifact at boot: "
-                    "`./sc restart` / `make dos-r`, then retry.")
+                    "`subfloor restart`, then retry.")
             try:
                 msg = json.loads(e.read()).get("error", e.reason)
             except Exception:

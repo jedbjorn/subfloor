@@ -1,6 +1,6 @@
 ---
 name: issue_reporting
-description: Report engine defects upstream — the moment a sc command fails or lies, a skill contradicts your reality, the API blocks a documented workflow, or you work around the engine to proceed. File a GitHub issue on super-coder; your repo's app bugs stay in the fork.
+description: Report engine defects upstream — the moment a sc command fails or lies, a skill contradicts your reality, the API blocks a documented workflow, or you work around the engine to proceed. File a GitHub issue on Subfloor; your repo's app bugs stay in the fork.
 category: substrate
 common: true
 ---

@@ -1,11 +1,11 @@
-// pm2 process definition for super-coder's review layer.
+// pm2 process definition for Subfloor's review layer.
 //
 // One stdlib server (api/server.py) serves the JSON API + the static UI on this
 // fork's derived port (scripts/ports.py → .super-coder/instance.json). The pm2
 // process name is unique PER FORK ("sc-<repo>") so several forks — and the host
 // repo's own pm2 apps — coexist in the one shared pm2 daemon without clashing.
 //
-// `make up` runs `ports.py ensure` first, so instance.json exists before this
+// `subfloor launch` runs `ports.py ensure` first, so instance.json exists before this
 // file is read.
 
 const path = require("path");

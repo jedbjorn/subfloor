@@ -1,15 +1,15 @@
 ---
 name: git
-description: Git conventions for a super-coder shell — one repo, one cwd. Sync the base before work, branch before committing, open PRs (never merge without the FnB's OK), attribute commits per-shell. Use before any git work.
+description: Git conventions for a Subfloor shell — one repo, one cwd. Sync the base before work, branch before committing, open PRs (never merge without the FnB's OK), attribute commits per-shell. Use before any git work.
 category: substrate
 common: false
 ---
 
-# git — version control, the super-coder way
+# git — version control, the Subfloor way
 
 One repo at its root -> plain `git` (cwd = repo root) is safe.
 
-Project = this repo minus `.super-coder/`. Engine = `.super-coder/` — gitignored, materialized by `sc update`, authored upstream in super-coder. NEVER commit or edit anything under `.super-coder/`.
+Project = this repo minus `.super-coder/`. Engine = `.super-coder/` — gitignored, materialized by `sc update`, authored upstream in Subfloor. NEVER commit or edit anything under `.super-coder/`.
 
 ## GitHub capability boundary
 

@@ -281,7 +281,7 @@ class Router:
         ) or "<li><em>no dev-shell worktree UIs found</em></li>"
         body = (f"<!doctype html><meta charset=utf-8>"
                 f"<title>sc preview</title>"
-                f"<h1>super-coder · live worktree previews</h1><ul>{rows}</ul>"
+                f"<h1>Subfloor · live worktree previews</h1><ul>{rows}</ul>"
                 f"<p>Each link is a dev shell's worktree, live with HMR.</p>")
         await _respond(writer, 200, body, content_type="text/html; charset=utf-8")
 

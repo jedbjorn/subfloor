@@ -285,7 +285,7 @@ sc_host_enter() {
 # never a fixed 8800, because every fork lands on its own offset (ports.py).
 # One printer, three callers (`url`, `enter`, `enter-<shortname>`): entry
 # restates the links before handing the terminal to the harness, and `./sc url`
-# / `make dos-url` is the recall path once they have scrolled away.
+# / `subfloor url` is the recall path once they have scrolled away.
 sc_urls() {
   # Under `set -e` a failed derivation would abort the caller, so it is a
   # return here and `enter` ignores it: an operator who cannot be told the
@@ -1106,6 +1106,8 @@ case "$cmd" in
   runtime)      exec "$PY" "$S/runtime.py" "$@" ;;
   artifact-mode) exec "$PY" "$S/artifact_policy.py" "$@" ;;
   eject)        exec "$PY" "$S/eject.py" "$@" ;;
+  alias)        exec "$PY" "$S/shell_alias.py" "$@" ;;
+  make-cleanup) exec "$PY" "$S/make_cleanup.py" "$@" ;;
   remove)       if sc_help_form "$@"; then
                   exec "$PY" "$CALLER_ENGINE/scripts/remove.py" "$@"
                 fi
@@ -1264,7 +1266,7 @@ case "$cmd" in
       exit 0
     fi
     if [ -n "${SC_SANDBOX:-}" ]; then
-      echo "sc admin: host Admin launch is unavailable inside the sandbox; run make dos-admin from a host terminal" >&2
+      echo "sc admin: host Admin launch is unavailable inside the sandbox; run subfloor admin from a host terminal" >&2
       exit 1
     fi
     exec "$PY" "$S/run.py" --host-admin "$@" ;;
@@ -1298,7 +1300,7 @@ case "$cmd" in
       [ -z "$no_build" ] || echo "→ runtime host: --no-build is implied (there is no image)"
       sc_host_server_up || exit 1
       echo "  dev server:    \$SC_DEV_PORT=$(devport) → http://127.0.0.1:$(devport)"
-      echo "  boot a shell:  ./sc enter   (or ./sc enter-<shortname>)"
+      echo "  boot a shell:  subfloor enter [shortname]   (./sc enter is the same)"
       sc_vm_broker_up || true
       sc_ts_broker_up || true
       sc_pm2_broker_up || true
@@ -1450,7 +1452,7 @@ case "$cmd" in
       echo "→ sandbox up · review GUI at http://127.0.0.1:$p"
     fi
     echo "  dev server:    bind 0.0.0.0:$dp inside (\$SC_DEV_PORT) → http://127.0.0.1:$dp"
-    echo "  boot a shell:  ./sc enter   (or ./sc enter-<shortname>)"
+    echo "  boot a shell:  subfloor enter [shortname]   (./sc enter is the same)"
     # One line naming the claude build the shells got. It is the version that
     # decides which models an alias like `opus` can resolve to, and until this
     # line existed nothing anywhere reported it — a sandbox stuck one release
@@ -1520,8 +1522,8 @@ case "$cmd" in
                 sc_pg_down ;;
   # restart is a hard bounce — down runs `docker rm -f`, which SIGKILLs every
   # live session inside the sandbox along with whatever those sessions had not
-  # yet written to the DB. Too easy to reach by accident (dos-r sits next to
-  # dos-e), so: typed confirmation (only YES / Yes / yes proceed — anything
+  # yet written to the DB. Too easy to reach by accident (`restart` sits next
+  # to `enter`), so: typed confirmation (only YES / Yes / yes proceed — anything
   # else, including a closed stdin, aborts) + a WAL-safe DB backup BEFORE
   # anything is torn down. --yes/-y skips the prompt for scripted callers.
   # --no-build validates and deliberately reuses the existing image. The
@@ -1662,10 +1664,42 @@ PY
                 sc_refuse_linked clean-db "$database"
                 rm -f "$database" "$database-wal" "$database-shm" && echo "removed $database (rebuild with: ./sc rebuild)" ;;
   help|-h|--help)
-    cat <<'EOF'
-super-coder — forkable shell substrate
+    if [ "${1:-}" != "--all" ]; then
+      cat <<'EOF'
+Subfloor — forkable shell substrate for one repository
 
-  Host support: Linux-only — Ubuntu LTS, stable Fedora, and Arch-compatible Linux (including CachyOS) are tested examples.
+  subfloor <verb> [args] is ./sc <verb> [args] from the enclosing checkout — a bash + fish
+  function ./sc install writes and every ./sc update refreshes (./sc alias re-installs it).
+  Host support: Linux-only — Arch Linux (including CachyOS) and Ubuntu LTS.
+
+  Everyday
+    subfloor enter [shortname]   boot a shell session — the picker, or one shell directly
+    subfloor admin               boot the sole Admin directly on the host (no docker, no API)
+    subfloor launch              build + start the sandbox and review GUI (host runtime: the host server)
+    subfloor restart             confirm + DB backup, then bounce everything (--yes · --no-build)
+    subfloor down                stop the sandbox / host server
+    subfloor update              pull + materialize the engine, reconcile in place (--ref · --no-fetch)
+    subfloor test                run the fork's declared backend + UI suites
+    subfloor url                 print this fork's review GUI + dev-server URLs
+    subfloor help                this chart · --all prints every verb with its flags
+
+  Install & upkeep      install · doctor · ensure-harness · update-harnesses · harness-status
+                        rollback · runtime · feature · persist · alias · make-cleanup · remove · eject
+  Memory & catalogue    mem · map · map-sql · map-schema · sql · skill · models · job · pr · sprint · token
+  Engine (Admin)        rebuild · migrate · migration · snapshot · render · render-check · verify
+                        seed-skills · engine-ref · clean-db
+  Host brokers          vm · vm-broker-* · ts-broker-* · pm2-broker-* · db-broker-* · db-init · pg-*
+  Primitives            serve · boot · run · deps · lint · typecheck · build · logs · health · ports · preview
+
+  Full reference: ./sc help --all · docs: docs/README.md#cli--dev-kit
+EOF
+      exit 0
+    fi
+    cat <<'EOF'
+Subfloor — forkable shell substrate — full command reference (./sc help for the short chart)
+
+  Host support: Linux-only — Arch Linux (including CachyOS) and Ubuntu LTS.
+  subfloor <verb> [args] is ./sc <verb> [args] from the enclosing checkout.
 
   ./sc install             first-launch bootstrap for a fork (requirements, harness, first shell)
   ./sc ensure-harness      install claude + opencode + codex + vibe + kimi if missing (official native installers, no npm)
@@ -1751,13 +1785,16 @@ super-coder — forkable shell substrate
                              every launch refreshes configured-origin Git + GitHub API capabilities;
                              --no-build reuses only a ready labeled image but still refreshes auth
   ./sc admin               boot the sole active Admin directly on the host (no Docker or API required)
-  ./sc enter               boot an interactive shell only when declared provisioning is ready
+  ./sc enter [shortname]   boot an interactive shell only when declared provisioning is ready
+                             a shortname skips the picker (same as enter-<shortname>)
                              --devkit-repair enters state repair without claiming readiness
   ./sc enter-<shortname>   enter that shell directly when ready (skip the shell picker)
                              harness: --harness <name> or HARNESS=<name> forces it; else when
                              >1 harness is on PATH you're prompted (per-launch, not persisted)
-  make dos-help            supported operator aliases for lifecycle, models,
-                             job, maintenance, browser token, and generic ./sc forwarding
+  ./sc alias               install or refresh the `subfloor` command for bash + fish
+                             --status reports · --remove drops it · --print bash|fish shows the function
+  ./sc make-cleanup        one-time: retire a fork's make dos-* wiring (Makefile include + aliases.mk)
+                             --dry-run previews; runbook: docs/README.md "Retire the make aliases"
   ./sc run <shortname>     headless boot: render + exec the harness NON-interactively (claude · codex ·
                              opencode · kimi); -p "<prompt>" · --harness <h> · -m <model> · --effort;
                              refuses a shell that already has a live session
@@ -1858,7 +1895,7 @@ super-coder — forkable shell substrate
   ./sc health              curl the review layer's /api/health
   ./sc ports               show this fork's derived port
   ./sc url                 print this fork's review GUI + dev-server URLs (derived, never a fixed 8800)
-                             — the recall path when the boot summary has scrolled away. Alias: make dos-url
+                             — the recall path when the boot summary has scrolled away (subfloor url)
   ./sc preview             live-preview every dev shell's worktree UI on one port,
                              routed by subdomain (http://<shortname>.localhost:<dev_port>/)
   ./sc clean-db            remove the rebuilt .db (text serializations untouched)

@@ -230,7 +230,7 @@ class DispatcherRuntimeProbeTest(unittest.TestCase):
 
     def test_global_help_states_linux_only_support_on_every_host(self) -> None:
         hosts = {"supported": "Linux", "unsupported": "Darwin"}
-        support_line = "Host support: Linux-only — Ubuntu LTS, stable Fedora, and Arch-compatible Linux (including CachyOS) are tested examples."
+        support_line = "Host support: Linux-only — Arch Linux (including CachyOS) and Ubuntu LTS."
         for name, kernel in hosts.items():
             self.configure_host(kernel)
             for command in ((), ("help",), ("-h",), ("--help",)):
@@ -260,19 +260,28 @@ class DispatcherRuntimeProbeTest(unittest.TestCase):
         self.assertNotIn("macos-latest", workflow)
         self.assertIn("create a linux vm", public_docs[0].lower())
         self.assertIn("guest-owned storage", public_docs[1])
-        self.assertIn("make dos-l", public_docs[2])
-        self.assertIn("make dos-e", public_docs[2])
+        self.assertIn("subfloor launch", public_docs[2])
+        self.assertIn("subfloor enter", public_docs[2])
 
-    def test_installer_banner_uses_declared_make_aliases(self) -> None:
+    def test_installer_banner_uses_the_subfloor_command(self) -> None:
         installer = (ENGINE / "scripts" / "install.py").read_text()
-        aliases = (ENGINE / "aliases.mk").read_text()
+        alias = subprocess.run(
+            [sys.executable, str(ENGINE / "scripts" / "shell_alias.py"), "--print", "bash"],
+            text=True, capture_output=True, check=True,
+        ).stdout + subprocess.run(
+            [sys.executable, str(ENGINE / "scripts" / "shell_alias.py"), "--print", "fish"],
+            text=True, capture_output=True, check=True,
+        ).stdout
 
-        self.assertIn("make dos-l", installer)
-        self.assertIn("make dos-e", installer)
+        self.assertIn("subfloor launch", installer)
+        self.assertIn("subfloor enter", installer)
+        self.assertNotIn("make dos-", installer)
         self.assertNotIn("make launch", installer)
         self.assertNotIn("make enter", installer)
-        self.assertIn("dos-launch", aliases)
-        self.assertIn("dos-enter", aliases)
+        self.assertIn("subfloor() {", alias)
+        self.assertIn("function subfloor", alias)
+        self.assertFalse((ENGINE / "aliases.mk").exists())
+        self.assertFalse((ENGINE.parent / "Makefile").exists())
 
     def test_active_engine_surfaces_do_not_claim_native_mac_support(self) -> None:
         surfaces = [
@@ -330,7 +339,7 @@ class DispatcherRuntimeProbeTest(unittest.TestCase):
         self.assertFalse((self.root / ".super-coder/scripts/install-ran").exists())
         self.assertEqual(self.snapshot_tree(self.root), before)
 
-    def test_help_stays_readable_but_doctor_and_make_delegate_to_the_gate(self) -> None:
+    def test_help_stays_readable_but_doctor_and_subfloor_delegate_to_the_gate(self) -> None:
         python = self.sentinel_python()
         self.configure_host("Darwin")
         for command in ((), ("help",), ("-h",), ("--help",)):
@@ -339,7 +348,7 @@ class DispatcherRuntimeProbeTest(unittest.TestCase):
                     str(python), *command, bare=not command
                 )
                 self.assertEqual(help_result.returncode, 0, help_result.stderr)
-                self.assertIn("super-coder", help_result.stdout)
+                self.assertIn("Subfloor", help_result.stdout)
 
         doctor = self.invoke(str(python), "doctor")
         self.assertEqual(doctor.returncode, 1)
@@ -352,12 +361,21 @@ class DispatcherRuntimeProbeTest(unittest.TestCase):
         self.assertIn("detected kernel: MINGW64_NT", windows.stderr)
         self.assertFalse((self.root / "python-ran").exists())
 
-        (self.root / "Makefile").write_text(
-            "dos-l:\n\tsh .super-coder/scripts/dispatch.sh install\n"
-        )
+        # The operator command is a shell function that runs the checkout's
+        # ./sc — so it must inherit the same refusal, not bypass it.
+        launcher = self.root / "sc"
+        launcher.write_text("#!/bin/sh\nexec sh .super-coder/scripts/dispatch.sh \"$@\"\n")
+        launcher.chmod(launcher.stat().st_mode | stat.S_IXUSR)
+        (self.root / ".sc-state").mkdir(exist_ok=True)
         self.configure_host("Darwin")
-        make_result = subprocess.run(
-            ["make", "dos-l"],
+        function = subprocess.run(
+            [sys.executable, str(ENGINE / "scripts" / "shell_alias.py"), "--print", "bash"],
+            text=True,
+            capture_output=True,
+            check=True,
+        ).stdout
+        subfloor_result = subprocess.run(
+            ["bash", "-c", function + "\nsubfloor install"],
             cwd=self.root,
             env={
                 **os.environ,
@@ -367,8 +385,8 @@ class DispatcherRuntimeProbeTest(unittest.TestCase):
             capture_output=True,
             check=False,
         )
-        self.assertNotEqual(make_result.returncode, 0)
-        self.assertIn("no native compatibility path exists", make_result.stderr)
+        self.assertNotEqual(subfloor_result.returncode, 0)
+        self.assertIn("no native compatibility path exists", subfloor_result.stderr)
         self.assertFalse((self.root / "python-ran").exists())
 
     def test_platform_environment_cannot_override_test_host(self) -> None:

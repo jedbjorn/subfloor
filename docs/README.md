@@ -88,9 +88,8 @@ another installation's shells or memory.
 
 One-time Linux host setup — get this right and the rest is `./sc install`.
 subfloor runs the harness in a **docker sandbox**; the installer bootstraps
-everything else. Ubuntu LTS, stable Fedora, and Arch-compatible Linux
-(including CachyOS) are tested/recommended examples, not an exclusive
-permission list. The Linux host needs a container engine, a few base tools, and
+everything else. Arch Linux (including CachyOS) and Ubuntu LTS are the
+supported hosts. The Linux host needs a container engine, a few base tools, and
 one signed-in coding harness.
 
 | Need | Linux host |
@@ -126,12 +125,12 @@ git checkout super-coder/main -- .super-coder sc
 # 3. Commit the install before creating shell worktrees:
 git add -A && git commit --no-verify -m "chore: install subfloor"
 
-# 4. Use the normal launch alias:
-make dos-l
+# 4. Launch through the subfloor command (open a new terminal first, or `source ~/.bashrc`, so the function the installer just wrote is defined):
+subfloor launch
 
 # 5. Sign in to your harness once, in Linux (not inside the sandbox), then enter:
 claude                          # or:  opencode auth login  ·  codex login  ·  vibe --setup  ·  kimi login
-make dos-e
+subfloor enter
 ```
 
 That's the happy path. Each step is covered in depth below — installer internals,
@@ -185,8 +184,8 @@ checks the daemon is reachable and points you here if not — it never does setu
   ```
 
 The commands are the five steps in the Quick start above — pull the engine in
-via git (no history merge; subfloor never touches your repo's own
-`Makefile`), `./sc install`, sign in, launch, commit.
+via git (no history merge; subfloor never touches your repo's own build
+files), `./sc install`, sign in, launch, commit.
 
 `./sc install` does the rest: checks requirements, **installs the harness CLIs**
 (`claude` + `opencode` + `codex` + `vibe` + `kimi`, via their official native installers — no
@@ -625,7 +624,8 @@ dependency — code, schema, migrations, skills; your `.sc-state/`, DB, and
 live DB, **applies pending migrations in place** (never a rebuild-from-snapshot —
 your unsnapshotted in-session writes survive), syncs the skills catalogue
 (id-stable, so grants stay valid), re-grants any new common skills, refreshes the
-repo map, and re-snapshots the live state. Nothing under `.super-coder/` is
+repo map, re-installs the `subfloor` shell function for bash and fish, and
+re-snapshots the live state. Nothing under `.super-coder/` is
 committed — you commit only the bumped `.sc-state/engine.ref` and any
 deliberately authored project changes. Generated snapshots and `_sc` renders
 remain ignored. Then restart the session to boot onto the new floor.
@@ -661,6 +661,30 @@ only data lost is anything written between the update and the rollback.
 
 > [!class4]
 > **The contract:** every schema change *after* a fork exists ships as a `migrations/NNNN_*.sql` file, never an edit to `schema.sql` — the migration ledger is what carries a delta across to an existing fork. Additive where you can make it.
+
+### Retire the make aliases (one-time)
+
+The `make dos-*` aliases are retired in favour of the `subfloor` command. An
+existing fork migrates in one update:
+
+1. `make dos-u` (or `./sc update`). The update materializes the new engine and
+   installs the `subfloor` function into `~/.bashrc` and
+   `~/.config/fish/functions/subfloor.fish`.
+2. Open a new terminal, or `source ~/.bashrc`, then run `subfloor help` to
+   confirm the command resolves.
+3. `subfloor make-cleanup` — removes the `-include .super-coder/aliases.mk`
+   line the installer added to your `Makefile` (the `Makefile` itself is
+   deleted only when the installer wrote it), and removes the retired
+   `.super-coder/aliases.mk`. `--dry-run` previews without writing.
+4. Commit the update:
+
+```bash
+git add -u && git add .sc-state/engine.ref sc && git commit --no-verify -m "chore: update subfloor"
+```
+
+Until step 3 runs, the old aliases keep working from the lingering file; after
+it, `make dos-*` is gone and `subfloor <verb>` is the only surface. `./sc alias`
+re-installs the function on another machine or after a shell-config reset.
 
 ### Customize a fork vs diverge from it
 
@@ -764,17 +788,20 @@ per-launch and never written back — so two terminals can run the **same** shel
 different harnesses at once (one Claude Code, one OpenCode). A fork with a single
 harness on `PATH` skips the prompt.
 
-**`make`.** One prefix across the whole designs-OS family — `dos-` — so switching
-repos never changes the muscle memory. Every command has a `make dos-<name>`
-alias; the hot ones also get a letter — `dos-e` (enter), `dos-l` (launch),
-`dos-r` (restart), `dos-d` (down), `dos-u` (update), `dos-t` (test) — and
-`dos-h` / `dos-help` list / describe them. `make dos-e s=cc` boots one shell
-directly; `make dos ARGS=<cmd>` is the passthrough. The targets live in
-`.super-coder/aliases.mk`, which **travels with the engine** — install wires a
-fork to `include` it, and because **every target is `dos-`prefixed it can't
-collide** with the fork's own `test` / `build` / `install`. The source repo's
-thin root `Makefile` just includes the same file; the `./sc <cmd>` binary keeps
-its name and is always identical.
+**`subfloor`.** One command across every fork — `subfloor <verb> [args]` — so
+switching repos never changes the muscle memory. It is a shell function, not a
+binary: `./sc install` writes it into `~/.bashrc` (bash) and
+`~/.config/fish/functions/subfloor.fish` (fish), and every `./sc update`
+refreshes it. Only bash and fish are wired. The function walks up from your
+current directory to the enclosing checkout — the nearest ancestor holding `sc`
+alongside `.sc-state/` or `.super-coder/` — and runs `./sc <args>` there, so it
+works from any subdirectory of the fork and never needs a path. Every verb is
+the `./sc` verb: `subfloor enter`, `launch`, `restart`, `down`, `update`,
+`test`, `help`. `subfloor enter cc` boots one shell directly. Running
+`./sc <verb>` from the checkout root is always identical — the function is a
+convenience, never a second surface. `./sc alias` (re)installs it,
+`./sc alias --remove` drops it, and `./sc alias --status` reports what is
+installed where.
 
 ### Dev kit
 
@@ -817,7 +844,7 @@ with `dpkg-query` and no network, and writes one format-version-2 capability
 receipt. Package-specific validation/build/proof failure leaves a healthy
 sandbox untouched or selects the proven engine baseline. CLI and Flags then
 show `native_packages=advisory` / `fork_readiness=degraded`; this advisory never
-blocks core shell entry, roadmap completion, or runtime. Run `make dos-admin`
+blocks core shell entry, roadmap completion, or runtime. Run `subfloor admin`
 from the fork root to inspect evidence and prepare a reviewed tracked fix. The
 FnB retains downstream update and live restart approval.
 

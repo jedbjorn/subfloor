@@ -788,7 +788,7 @@ def _refuse_admin_browser_chat(shell) -> None:
         422,
         "ADMIN_SHELL_CLI_ONLY",
         f"shell {shell['shortname']!r} is admin-flavor and CLI-only; open a "
-        f"terminal and run: cd {root} && make dos-e s={shell['shortname']}",
+        f"terminal and run: cd {root} && subfloor enter {shell['shortname']}",
         {
             "shell_id": int(shell["shell_id"]),
             "shortname": shell["shortname"],

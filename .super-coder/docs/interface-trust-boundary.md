@@ -1,8 +1,8 @@
 ---
 title: Interface trust boundary & browser sign-in
-tags: [super-coder, interface, security, browser, auth]
+tags: [subfloor, interface, security, browser, auth]
 date: 2026-07-24
-project: super-coder
+project: subfloor
 purpose: What the Interface defends against, why the browser is signed in automatically, and who owns the running service
 ---
 

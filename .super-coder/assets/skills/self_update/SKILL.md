@@ -1,6 +1,6 @@
 ---
 name: self_update
-description: Update this fork's super-coder engine in place — fetch + materialize new code + migrations, all memory intact; sound rollback. The shell hands off to its own next boot. Use when a super-coder update is available.
+description: Update this fork's Subfloor engine in place — fetch + materialize new code + migrations, all memory intact; sound rollback. The shell hands off to its own next boot. Use when a Subfloor update is available.
 category: substrate
 command: sc update
 common: false

@@ -459,8 +459,7 @@ class TokenCommandTest(unittest.TestCase):
             self.run_token()
         msg = str(cm.exception)
         self.assertIn("sc token:", msg)            # refusal names this command
-        self.assertIn("./sc restart", msg)
-        self.assertIn("make dos-r", msg)
+        self.assertIn("subfloor restart", msg)
 
     def test_insecure_artifact_is_refused(self):
         self.write_artifact("TC", TOKEN, mode=0o644)
@@ -534,7 +533,7 @@ class TokenCommandTest(unittest.TestCase):
         proc = self.run_script()
         self.assertEqual(proc.returncode, mem.EXIT_UNAVAILABLE)
         self.assertEqual(proc.stdout, "")
-        self.assertIn("./sc restart", proc.stderr)
+        self.assertIn("subfloor restart", proc.stderr)
 
     def test_script_exit_status_unsafe_artifact(self):
         """An artifact that fails the trust boundary is a DIFFERENT nonzero
