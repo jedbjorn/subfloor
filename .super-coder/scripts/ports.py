@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Resolve this fork's localhost ports — deterministic per repo, never fixed.
 
-A super-coder fork runs *inside* a host repo that often has its own dev server,
+A Subfloor fork runs *inside* a host repo that often has its own dev server,
 and several forks may run at once. So the port can't be hardcoded. Each fork
 derives a stable per-repo offset from its absolute path (sha1 % 100) and lands
 in a distinctive band well clear of the neighbors:
@@ -84,7 +84,7 @@ def _resolve_offset(
         if port not in avoid and _free(port):
             return port
     raise RuntimeError(
-        f"no free super-coder port in {port_base}-{port_base + SPAN - 1}"
+        f"no free Subfloor port in {port_base}-{port_base + SPAN - 1}"
     )
 
 

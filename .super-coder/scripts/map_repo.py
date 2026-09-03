@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Map the shell work surface into the dr_* catalogue.
 
-Normally super-coder lives inside the project it maps. An external-work install
+Normally Subfloor lives inside the project it maps. An external-work install
 instead declares ``work_repo`` in ``instance.json``: this maps that project
 while retaining the map database and generated state in the home repo.
 

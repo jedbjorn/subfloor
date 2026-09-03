@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Apply pending system migrations to a super-coder DB.
+"""Apply pending system migrations to a Subfloor DB.
 
 Migrations live in `.super-coder/migrations/*.sql`, applied in filename order.
 Each applied file is recorded in the `schema_migrations` ledger so it never
-runs twice. This is the path a *fork* takes when it pulls super-coder updates:
+runs twice. This is the path a *fork* takes when it pulls Subfloor updates:
 new migration files appear, `migrate.py` applies only the unstamped ones.
 
 Contract: `schema.sql` is the full current baseline. Every schema change

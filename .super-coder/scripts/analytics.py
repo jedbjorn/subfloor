@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Token & session analytics collector — `sc analytics sweep` (spec doc #11).
 
-Pull-based capture: super-coder never calls a model, it launches external
+Pull-based capture: Subfloor never calls a model, it launches external
 harness CLIs — so the collector parses what each harness leaves on disk
 (scripts/token_parsers/*, one plugin per harness) and upserts one row per
 (harness session × model) into session_token_usage. Runs at run.py boot

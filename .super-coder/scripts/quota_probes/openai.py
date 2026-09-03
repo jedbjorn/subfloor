@@ -40,7 +40,7 @@ URL = "https://chatgpt.com/backend-api/codex/usage"
 # re-run here against the installed 0.145.0).
 #
 # THE VERSION COMES FROM THE INSTALLED CLI. This fork installs harnesses at
-# --latest on every dos-u, so a baked constant is stale by design — it would
+# --latest on every `subfloor update`, so a baked constant is stale by design — it would
 # start claiming a version this host has not run since the next update.
 #
 # The endpoint accepted a FABRICATED 0.20.0 during diagnosis while 0.145.0 was

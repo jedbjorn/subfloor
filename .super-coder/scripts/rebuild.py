@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Rebuild the super-coder DB from public system text + instance state.
+"""Rebuild the Subfloor DB from public system text + instance state.
 
   1. apply schema.sql            (the v1 baseline)
   2. apply migrations/*.sql      (ordered deltas, ledger-tracked)

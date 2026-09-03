@@ -236,6 +236,7 @@ class ScFixture:
         for script in (
             "dispatch.sh",
             "install.py",
+            "shell_alias.py",
             "engine_paths.py",
             "callable_floor.py",
             "engine_manifest.py",
@@ -510,7 +511,7 @@ class ScHarnessCommands(unittest.TestCase):
 
 
 class UpdateExpiresSandboxHarnesses(unittest.TestCase):
-    """`./sc update` (dos-u) must move the harnesses shells run, not just the
+    """`./sc update` (`subfloor update`) must move the harnesses shells run, not just the
     host's — the gap that let an update ship a new floor on frozen CLIs."""
 
     def setUp(self) -> None:

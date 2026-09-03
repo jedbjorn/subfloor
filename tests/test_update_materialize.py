@@ -1344,7 +1344,9 @@ class UpdateRefPublicationTest(unittest.TestCase):
             update.install_mod,
             ensure_gitignore=mock.Mock(return_value=False),
             ensure_harnesses=mock.Mock(),
-            wire_make_aliases=mock.Mock(return_value=()),
+        ))
+        stack.enter_context(mock.patch.object(
+            update.shell_alias, "install", return_value=[]
         ))
         stack.enter_context(contextlib.redirect_stdout(io.StringIO()))
         return stack, ref, scripts, events

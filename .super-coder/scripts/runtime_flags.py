@@ -23,7 +23,7 @@ TOKEN_HEADER = "X-SC-Runtime-Token"
 TOKEN_PATH = Path(".sc-state/local/runtime-flags.token")
 SOURCE_PREFIX = "sandbox-native-readiness"
 REMEDY = (
-    "Core sandbox remains available. Run make dos-admin from this fork root "
+    "Core sandbox remains available. Run `subfloor admin` from this fork root "
     "to inspect package evidence and the selected base, then submit reviewed "
     "remediation. Do not unpin, rename, or substitute a package silently."
 )

@@ -1,11 +1,11 @@
-# super-coder sandbox image — the *environment*, not the code.
+# Subfloor sandbox image — the *environment*, not the code.
 #
 # The repo is bind-mounted at runtime (see `./sc launch`); this image carries
 # what the harness needs to run: python3 + sqlite3, git/curl/ripgrep, gh, and the
 # harness CLIs (claude / opencode / codex / vibe / kimi) baked in via their official
 # native installers (the same ones install.py uses — keep the URLs in sync with
 # scripts/install.py HARNESS_INSTALL).
-# It also carries the dev-kit TOOLCHAIN super-coder develops against — node LTS for
+# It also carries the dev-kit TOOLCHAIN Subfloor develops against — node LTS for
 # Svelte/Vite, plus a baked Playwright+Chromium browser for E2E tests — but NOT the
 # fork's app deps: those install per-fork into the bind-mounted repo's own .venv /
 # node_modules via `./sc deps`, so versions track the fork's pins, not the image.
@@ -167,7 +167,7 @@ RUN printf '%s\n' \
 # REFERENCED inside each RUN so the bust is guaranteed, not merely implied by
 # docker's arg-cache heuristics.
 #
-# Who rolls it: every normal `./sc restart`, plus `./sc update` (dos-u),
+# Who rolls it: every normal `./sc restart`, plus `./sc update` (`subfloor update`),
 # `./sc update-harnesses`, and `./sc build --harnesses` — see sc's
 # harness_epoch()/harness_epoch_roll(). Each explicit refresh gets a unique UTC
 # token; routine launch/plain build reuse the stored value and stay cache-warm.

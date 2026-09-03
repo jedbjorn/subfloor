@@ -338,7 +338,7 @@ class UpdateServiceCutoverTest(unittest.TestCase):
             ), mock.patch.object(
                 update.rebuild_mod, "SNAPSHOT", legacy_snapshot
             ), mock.patch.object(
-                update.install_mod, "wire_make_aliases", return_value=()
+                update.shell_alias, "install", return_value=[]
             ), contextlib.redirect_stdout(io.StringIO()):
                 update.migrate_with_service_cutover(
                     reconcile=lambda: update.reconcile_under_cutover(

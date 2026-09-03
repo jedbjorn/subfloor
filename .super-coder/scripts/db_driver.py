@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Thin database accessor for super-coder — SQLite only.
+"""Thin database accessor for Subfloor — SQLite only.
 
 A fork needs only python3 + sqlite3, which the install already requires.
 Every script and route opens the engine DB through this one seam, so the

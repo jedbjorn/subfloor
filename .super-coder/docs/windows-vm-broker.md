@@ -1,8 +1,8 @@
 ---
 title: Windows VM Broker — Spec
-tags: [super-coder, design, testing, windows, broker]
+tags: [subfloor, design, testing, windows, broker]
 date: 2026-06-17
-project: super-coder
+project: subfloor
 purpose: Host-side broker so sandboxed forks can drive the test VM
 ---
 
@@ -15,7 +15,7 @@ purpose: Host-side broker so sandboxed forks can drive the test VM
 The [Windows Test VM](windows-test-vm.md) capability shipped the skills, the
 config, and a host-side **validation** path — but not a way for the shells that
 hold `windows_devkit` to actually *drive* the VM. Those shells run inside the
-super-coder **sandbox container**, and the test VM lives on the host's libvirt
+Subfloor **sandbox container**, and the test VM lives on the host's libvirt
 NAT network. A container cannot reach it, and cannot run `virsh`.
 
 This spec adds a **host-side VM broker**: one process that holds the SSH key and

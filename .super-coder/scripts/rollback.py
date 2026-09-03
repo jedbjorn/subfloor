@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Sound rollback of a bad super-coder update — restore the (DB + engine) PAIR.
+"""Sound rollback of a bad Subfloor update — restore the (DB + engine) PAIR.
 
 Engine code is read live every session, and a migration exists *because new code
 expects the new schema*. Restoring only the DB would leave new engine code
@@ -146,7 +146,7 @@ def restore_engine(prev_sha: str) -> None:
             engine_paths=previous_materialize_paths,
         )
     except SystemExit:
-        print("  ref not present locally — fetching super-coder, then retrying")
+        print("  ref not present locally — fetching Subfloor, then retrying")
         remote = update_mod.super_coder_remote()
         update_mod.git("fetch", remote)
         update_mod.materialize_engine(

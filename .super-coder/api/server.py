@@ -2473,7 +2473,7 @@ def _publish_content(out: list, state: dict) -> None:
     if not pr_url:
         cr = gh("pr", "create", "--base", BASE_BRANCH, "--head", PUBLISH_BRANCH,
                 "--title", "GUI content edits",
-                "--body", "Rolling PR for content edited via the super-coder "
+                "--body", "Rolling PR for content edited via the Subfloor "
                 "review GUI (roadmap, docs, flags, identity). Refreshed on each "
                 "publish; merge to land on main.")
         if cr.returncode != 0:
@@ -4901,7 +4901,7 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/shells":
                 # repo_root rides along for the browser chat rail: admin
                 # shells are CLI-only there, and the notice shows the exact
-                # `cd <repo_root> && make dos-e s=<shortname>` to run instead.
+                # `cd <repo_root> && subfloor enter <shortname>` to run instead.
                 return self._send(200, {"shells": get_shells(con),
                                         "repo_root": str(REPO_ROOT)})
             if path == "/api/shell-templates":
@@ -5790,7 +5790,7 @@ def _run_server(port: int) -> int:
             conversation_reaper.stop_service()
 
     print(
-        f"super-coder review layer starting on 127.0.0.1:{port} "
+        f"Subfloor review layer starting on 127.0.0.1:{port} "
         f"(bind {bind}, DB: {DB_PATH.name})"
     )
     try:

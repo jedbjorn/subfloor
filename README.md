@@ -114,7 +114,7 @@ harness already ships, nothing patched, nothing forked: [*Architecture*](docs/RE
 ## Install quickstart
 
 > [!class4]
-> **The bar: Linux, Python 3.14.x with `sqlite3`, a reachable docker daemon, and one signed-in harness CLI on PATH.** Set `SC_PYTHON=/absolute/path/to/python3` to select a specific interpreter. Ubuntu LTS, stable Fedora, and Arch-compatible Linux (including CachyOS) are tested examples, not an exclusive list. On macOS or Windows, create a Linux VM and run this flow inside the guest. No docker? `./sc install --runtime host` selects the host runtime: the same lifecycle (`make dos-l` / `dos-e` / `dos-r` / `dos-u`) with the review server as a supervised host process and shells booted on the host. Full Linux prerequisites, the guest-filesystem recommendation, docker modes, and the host runtime: [*Install*](docs/README.md#install).
+> **The bar: Linux, Python 3.14.x with `sqlite3`, a reachable docker daemon, and one signed-in harness CLI on PATH.** Set `SC_PYTHON=/absolute/path/to/python3` to select a specific interpreter. Arch Linux (including CachyOS) and Ubuntu LTS are the supported hosts. On macOS or Windows, create a Linux VM and run this flow inside the guest. No docker? `./sc install --runtime host` selects the host runtime: the same lifecycle (`subfloor launch` / `enter` / `restart` / `update`) with the review server as a supervised host process and shells booted on the host. Full Linux prerequisites, the guest-filesystem recommendation, docker modes, and the host runtime: [*Install*](docs/README.md#install).
 
 Drop subfloor into an existing git repo and boot a shell:
 
@@ -132,12 +132,12 @@ git checkout super-coder/main -- .super-coder sc
 # 3. Commit the install before creating shell worktrees:
 git add -A && git commit --no-verify -m "chore: install subfloor"
 
-# 4. Launch through the normal Make aliases:
-make dos-l
+# 4. Launch through the subfloor command (open a new terminal first, or `source ~/.bashrc`, so the function the installer just wrote is defined):
+subfloor launch
 
 # 5. Sign in to your harness once, in Linux (not inside the sandbox), then enter:
 claude                          # or:  opencode auth login  ·  codex login  ·  vibe --setup  ·  kimi login
-make dos-e
+subfloor enter
 ```
 
 That's the happy path — you're talking to a planner shell in your repo, with a
@@ -171,7 +171,7 @@ themed: [**open the docs in md-converter**](https://md-converter.designs-os.com/
 | [**Browser conversations**](docs/README.md#browser-conversations) | Durable Chat and Diff, exact resume, queues, Stop/Close, history and stars |
 | [**Messages, jobs & headless launch**](docs/README.md#messages-jobs--headless-launch) | Generic shell handoffs, detached jobs, model routes, and `sc run` |
 | [**Update a fork**](docs/README.md#update-a-fork) | `./sc update` / `rollback`; customize vs upstream vs eject |
-| [**CLI & dev kit**](docs/README.md#cli--dev-kit) | Every `./sc` command, the `make dos-` aliases, the sandbox toolchain |
+| [**CLI & dev kit**](docs/README.md#cli--dev-kit) | Every `./sc` command, the `subfloor` command, the sandbox toolchain |
 | [**Opt-in features**](docs/README.md#opt-in-features) | optional infrastructure plus the fork-local guidance boundary |
 | [**Review GUI**](docs/README.md#review-gui) | The localhost GUI's ten tabs + token & session analytics |
 

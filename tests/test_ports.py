@@ -86,7 +86,7 @@ class GlobalPortNamespaceTest(unittest.TestCase):
 
     def test_exhausted_global_namespace_fails_instead_of_colliding(self) -> None:
         with mock.patch.object(ports, "_free", return_value=False):
-            with self.assertRaisesRegex(RuntimeError, "no free super-coder port"):
+            with self.assertRaisesRegex(RuntimeError, "no free Subfloor port"):
                 ports._resolve_offset(0, set())
 
     def test_unknown_instance_key_is_inert_but_preserved_on_disk(self) -> None:

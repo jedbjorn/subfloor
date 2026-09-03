@@ -27,7 +27,7 @@ else — launch, enter, snapshot, render, the GUI — works unchanged, reading t
 same engine files from the same paths.
 
 What you give up: upstream fixes, migrations, and new skills stop flowing.
-Upstream-first is the strong default — PR the change to super-coder instead if
+Upstream-first is the strong default — PR the change to Subfloor instead if
 the next fork would want it too. Eject only when the divergence is genuinely
 yours. (README → 'Customize a fork vs diverge from it'.)
 
@@ -92,7 +92,7 @@ your DB/memory are untouched. Nothing is committed by this command — it stages
 the change and you review + commit.
 
 Is this the right move? Only if you need engine changes upstream would rightly
-not take. If the next fork would want your change too, PR it to super-coder
+not take. If the next fork would want your change too, PR it to Subfloor
 instead and stay on updates (the strong default).
 """
 
@@ -132,7 +132,7 @@ def main(argv: list[str]) -> int:
     keep_remote = "--keep-remote" in argv
 
     if update_mod.is_source_repo():
-        sys.exit("eject: this is the super-coder SOURCE repo — the engine is "
+        sys.exit("eject: this is the Subfloor SOURCE repo — the engine is "
                  "already tracked source here; there is nothing to eject.")
     if EJECTED_MARKER.exists():
         print("eject: already ejected — the engine is fork source "
@@ -192,7 +192,7 @@ def main(argv: list[str]) -> int:
 
     print("\neject: done — the engine is fork source. Review + commit:")
     print("    git status && git diff --cached --stat")
-    print(f"    git commit -m 'chore: eject super-coder engine (diverged at "
+    print(f"    git commit -m 'chore: eject Subfloor engine (diverged at "
           f"{pinned[:12] if pinned else 'unpinned'})'")
     print("  From here, edit .super-coder/ directly; update/rollback now refuse.")
     return 0

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# super-coder pre-commit — universal branch-guard backstop.
+# Subfloor pre-commit — universal branch-guard backstop.
 #
 # Fires for EVERY harness (and the FnB) via core.hooksPath, so it is the only
 # real enforcement for vibe (which has no pre-tool hook) and a defense-in-depth

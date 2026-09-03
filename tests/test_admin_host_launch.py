@@ -194,7 +194,10 @@ class AdminDispatcherTest(unittest.TestCase):
         completed = self.invoke("admin", sandbox=True)
         self.assertEqual(completed.returncode, 1)
         self.assertEqual(completed.stdout, "")
-        self.assertIn("run make dos-admin from a host terminal", completed.stderr)
+        self.assertRegex(
+            completed.stderr,
+            r"run `?subfloor admin`? from a host terminal",
+        )
         self.assertNotIn('["--host-admin"]', completed.stdout)
 
 
@@ -205,7 +208,7 @@ class AdminExecutionContextTest(unittest.TestCase):
 
         self.assertIn("inside the sandbox container", context)
         self.assertIn("0.0.0.0:$SC_DEV_PORT", context)
-        self.assertIn("running `make dos-admin` from a host terminal", context)
+        self.assertIn("running `subfloor admin` from a host terminal", context)
         self.assertNotIn("Host authority covers", context)
         self.assertIn("surface it to the FnB and stop", api_guidance)
         self.assertNotIn("host Admin boot remains valid", api_guidance)

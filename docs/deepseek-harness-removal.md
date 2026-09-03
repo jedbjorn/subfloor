@@ -264,12 +264,12 @@ backup to make a check pass, or substitute moving `main` for any exact ref.
 
 ## Ownership boundary
 
-Super-coder removes only state it can prove it owns. It never uninstalls an
+Subfloor removes only state it can prove it owns. It never uninstalls an
 external DSH package and never deletes a user-owned DSH profile, session,
 credential, package cache, or unmarked external cache. Those may remain on the
-host, unused by super-coder.
+host, unused by Subfloor.
 
-Historical DSH-bearing databases in super-coder-managed backup roots are
+Historical DSH-bearing databases in Subfloor-managed backup roots are
 non-current recovery inputs. They cannot make DSH selectable or invokable
 because normal model, API, UI, launch, and process paths read only the current
 live database; only an explicit rollback/restore selects a backup. Keep ordinary

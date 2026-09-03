@@ -1,18 +1,18 @@
 #!/usr/bin/env python3
-"""Install super-coder into a fork — first-launch bootstrap.
+"""Install Subfloor into a fork — first-launch bootstrap.
 
 Run once, in a host repo that has just pulled the engine
 (`git checkout super-coder/main -- .super-coder sc`). It takes that repo
 from "engine present" to "a team you can launch":
 
-    1. Guard   — refuse to run in the super-coder SOURCE repo, or on a fork that
+    1. Guard   — refuse to run in the Subfloor SOURCE repo, or on a fork that
                  is already installed (both would destroy content). --force skips.
     2. Require — python3 + sqlite3 (+ a heads-up if git/curl missing, and a
                  docker preflight for the sandbox run path — advisory, not fatal).
     3. Harness — ensure the managed harness CLIs are installed through their
                  official native installers. Pick the terminal launch default
                  → instance.json.
-    4. Strip   — super-coder's own per-instance content; a fork inherits the
+    4. Strip   — Subfloor's own per-instance content; a fork inherits the
                  SYSTEM (schema + skill catalogue + render chain), never the memory.
     5. Build   — the system DB (schema + migrations; no per-instance content yet).
     6. Seed    — the fork's first user + starting TEAM (delegates to init_fork:
@@ -175,56 +175,8 @@ from engine_paths import GENERATED_INSTALL_PATHS  # noqa: E402
 import global_pointer  # noqa: E402
 import instance_state  # noqa: E402
 import ports as ports_mod  # noqa: E402
+import shell_alias  # noqa: E402
 
-
-# --- make-alias wiring (shared by install + update) -------------------------
-ALIASES_INCLUDE = "-include .super-coder/aliases.mk"
-INSTALLER_MAKEFILE = (
-    "# Fork Makefile — super-coder convenience aliases (make dos-e / dos-enter).\n"
-    "# Every target is dos--prefixed; add your own targets below the include.\n"
-    f"{ALIASES_INCLUDE}\n"
-)
-APPENDED_ALIASES_BLOCK = (
-    "\n# super-coder convenience aliases (designs-OS 'dos-' command standard).\n"
-    "# Appended by ./sc; every target is dos--prefixed so it can't collide with\n"
-    "# this Makefile's own targets. Delete this line to opt out — `./sc <cmd>`\n"
-    "# stays equivalent.\n"
-    f"{ALIASES_INCLUDE}\n"
-)
-# Matches an existing include of the alias file in any form: hard `include` or
-# soft `-include`, with arbitrary surrounding whitespace.
-_ALIASES_RE = re.compile(r"^\s*-?include\s+\.super-coder/aliases\.mk\s*$", re.M)
-
-
-def wire_make_aliases(repo_root: Path | None = None) -> str:
-    """Ensure the fork's Makefile pulls in the engine's `dos-*` aliases.
-
-    The house `dos-` prefix is collision-proof by design — every alias target is
-    `dos-`prefixed — so wiring is safe to script rather than leave to the
-    operator. A fork almost always already has its own Makefile; #13 ("never
-    clobber a host Makefile") forbids *overwriting* it, not *appending* a single
-    additive, non-colliding `-include` line. So:
-
-      - no Makefile      → write a one-line one;
-      - Makefile present → append the include if missing, else leave it alone.
-
-    `-include` (not hard `include`) so a not-yet-materialized engine (fresh fork
-    clone before the first `./sc update`) is a silent no-op, never a fatal `make`
-    error. Idempotent — safe to call on every install AND every update. Returns a
-    one-line status for the caller to print.
-    """
-    mk = (repo_root or REPO_ROOT) / "Makefile"
-    if not mk.exists():
-        mk.write_text(INSTALLER_MAKEFILE)
-        return "wrote Makefile (-include .super-coder/aliases.mk) → `make dos-e` works"
-    text = mk.read_text()
-    if _ALIASES_RE.search(text):
-        return "Makefile already wired (-include .super-coder/aliases.mk) — left as-is"
-    sep = "" if text.endswith("\n") else "\n"
-    mk.write_text(
-        text + sep + APPENDED_ALIASES_BLOCK
-    )
-    return "appended -include .super-coder/aliases.mk to existing Makefile → `make dos-e` works"
 
 # super-coder's own per-instance content — present in a freshly-pulled fork
 # because the git checkout brought it along. A fork must not inherit it.
@@ -1077,7 +1029,7 @@ def main(argv: list[str]) -> int:
 
     # 1. Guards ---------------------------------------------------------------
     if is_source_repo() and not force:
-        sys.exit("install: this is the super-coder SOURCE repo — the installer is "
+        sys.exit("install: this is the Subfloor SOURCE repo — the installer is "
                  "for forks. (Run it in a host repo that pulled the engine.) "
                  "Use --force only if you really mean to re-init the source.")
     if already_installed() and not force:
@@ -1212,7 +1164,7 @@ def main(argv: list[str]) -> int:
         print("  (already present or source repo)")
 
     # 4. Strip super-coder's per-instance content -----------------------------
-    step("Stripping super-coder's per-instance content (a fork inherits the system, not the memory)")
+    step("Stripping Subfloor's per-instance content (a fork inherits the system, not the memory)")
     for p in STRIP:
         if p.exists():
             p.unlink()
@@ -1264,11 +1216,16 @@ def main(argv: list[str]) -> int:
         env=admin_env,
     )
 
-    # 8.5 Wire `make` aliases. The `dos-` prefix can't collide with the fork's own
-    # targets, so we append the include rather than leave it to the operator (#13
-    # forbids clobbering a host Makefile, not appending one non-colliding line).
-    step("Wiring make aliases")
-    print(f"  {wire_make_aliases()}")
+    # 8.5 Install the `subfloor` operator command — a bash + fish shell function
+    # shared by every checkout this host user owns (shell_alias.py). It replaces
+    # the retired make-alias surface; the fork's own Makefile is never touched.
+    step("Installing the subfloor command (bash + fish)")
+    try:
+        for line in shell_alias.install():
+            print(f"  {line}")
+    except shell_alias.AliasError as exc:
+        print(f"  ⚠ {exc}")
+        print("  re-run `./sc alias` after fixing it; `./sc <verb>` works meanwhile")
 
     # The user-local command is shared by every installed checkout. Register
     # only after all checkout setup phases have succeeded, and revalidate the
@@ -1310,12 +1267,14 @@ def main(argv: list[str]) -> int:
     print(f"  GUI port: {cfg['port']}  (http://127.0.0.1:{cfg['port']})")
     print("\nNext:")
     print("  git add -A && git commit --no-verify -m 'chore: install subfloor'")
+    print(f"  {shell_alias.activation_hint()}")
     if (stored.get(RUNTIME_KEY) or RUNTIME_SANDBOX) == RUNTIME_HOST:
-        print("  make dos-l          # starts the host review server + GUI")
-        print("  make dos-e          # boot your shell on the host")
+        print("  subfloor launch     # starts the host review server + GUI")
+        print("  subfloor enter      # boot your shell on the host")
     else:
-        print("  make dos-l          # starts the sandbox + GUI")
-        print("  make dos-e          # attach + boot your shell")
+        print("  subfloor launch     # starts the sandbox + GUI")
+        print("  subfloor enter      # attach + boot your shell")
+    print("  (`./sc launch` / `./sc enter` from this directory are the same commands)")
     return 0
 
 

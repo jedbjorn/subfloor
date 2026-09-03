@@ -71,7 +71,7 @@ operation with the runtime down.
 
 - API down, database healthy: use host Admin `sc health`, `sc logs`, and
   read-only `sc sql`, then restore the managed service with `sc restart` /
-  `make dos-r`.
+  `subfloor restart`.
 - Migration or rebuild work: load `engine_migrations` and require its backup,
   candidate, ledger, and restart receipts.
 - Snapshot or render repair: load `snapshot`; do not hand-edit serialized or

@@ -1,4 +1,4 @@
-# super-coder — the .db is rebuilt from git-tracked text (schema + migrations +
+# Subfloor — the .db is rebuilt from git-tracked text (schema + migrations +
 # snapshot). Never commit it: binary churn + merge hell, fatal with parallel shells.
 .super-coder/shell_db.db
 .super-coder/shell_db.db-wal

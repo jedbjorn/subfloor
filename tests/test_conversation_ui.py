@@ -61,7 +61,7 @@ def test_admin_shells_stay_on_the_rail_but_chat_is_cli_only():
     assert "repo_root: repoRoot" in interface
     assert '(shell?.flavor || "") === "admin"' in APP
     assert "cd ${repoRoot" in APP
-    assert "make dos-e s=${shell.shortname}" in APP
+    assert "subfloor enter ${shell.shortname}" in APP
     assert ".chat-admin-cli-only" in STYLE
     assert ".chat-admin-commands" in STYLE
 

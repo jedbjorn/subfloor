@@ -251,7 +251,7 @@ def render_execution_context(flavor: str | None, launch_mode: str) -> str:
             admin_note = (
                 "\n\nThis is the contained Admin seat. Host-only engine "
                 "recovery, root-checkout repair, and host process work require "
-                "exiting this session and running `make dos-admin` from a host "
+                "exiting this session and running `subfloor admin` from a host "
                 "terminal."
             )
         return (
@@ -301,14 +301,13 @@ def render_api_unreachable_guidance(
         return (
             "  If it reports \"API unreachable\", the host Admin boot remains "
             "valid. Diagnose with `sc health`, `sc logs`, and the read-only "
-            "`sc sql` lane; restore the managed engine with `sc restart` / "
-            "`make dos-r`. `sc mem` stays unavailable until the API returns — "
+            "`sc sql` lane; restore the managed engine with `subfloor restart`. "
+            "`sc mem` stays unavailable until the API returns — "
             "it never falls back to raw writes."
         )
     return (
         "  If it reports \"API unreachable\", the engine server is down — "
-        "surface it to the FnB and stop; they restart it with `sc restart` / "
-        "`make dos-r`."
+        "surface it to the FnB and stop; they restart it with `subfloor restart`."
     )
 
 

@@ -50,8 +50,7 @@ What that buys you in practice:
 > [!class4]
 > **The bar: Linux, Python 3.14.x with `sqlite3`, a reachable docker daemon, and one signed-in harness CLI on PATH.**
 > Set `SC_PYTHON=/absolute/path/to/python3` to select a specific interpreter.
-> Ubuntu LTS, stable Fedora, and Arch-compatible Linux (including CachyOS) are
-> tested examples, not an exclusive list.
+> Arch Linux (including CachyOS) and Ubuntu LTS are the supported hosts.
 > On macOS or Windows, create a Linux VM and run this flow inside the guest.
 > No docker? `./sc install --runtime host` keeps the same lifecycle with a
 > supervised host process instead of a container.
@@ -74,12 +73,15 @@ Four steps, from an existing git repo to a booted shell:
 
    What it does under the hood, and the flags to script it:
    [*Install → Installer internals*](README.md#install).
-3. **Launch.** `make dos-l` builds and starts the sandbox container and Review
-   GUI, published to `127.0.0.1` only.
+3. **Launch.** `subfloor launch` builds and starts the sandbox container and
+   Review GUI, published to `127.0.0.1` only. The `subfloor` command is the
+   shell function `./sc install` just wrote into `~/.bashrc` and
+   `~/.config/fish/functions/subfloor.fish` — open a new terminal, or
+   `source ~/.bashrc`, so it is defined.
 4. **Sign in and enter.** Each harness authenticates with your own
    account — `claude`, `opencode auth login`, `codex login`, `vibe --setup`,
    or `kimi login` — and the sandbox mounts the credentials in. Host, never
-   inside the sandbox. After signing in, `make dos-e` enters a shell:
+   inside the sandbox. After signing in, `subfloor enter` enters a shell:
    [*Install → Harness sign-in*](README.md#install).
 
 ## First boot
@@ -132,7 +134,7 @@ The step-by-step version, with each flavor's skills and GUI tab:
 - **Hand work to another shell.** Use the shell inbox for a durable task/result
   handoff, and use `./sc job` for a suite or build that must outlive the current
   session: [*Messages, jobs & headless launch*](README.md#messages-jobs--headless-launch).
-- **The command surface.** Every `./sc` command and the `make dos-` aliases:
+- **The command surface.** Every `./sc` command and the `subfloor` command:
   [*CLI & dev kit*](README.md#cli--dev-kit).
 - **Opt-in extras.** Optional Postgres, Windows VM, tailnet, PM2, and database
   broker infrastructure; Planner captures fork procedure as a local skill:

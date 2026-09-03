@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# super-coder branch guard — ONE branch-decision script, four consumers.
+# Subfloor branch guard — ONE branch-decision script, four consumers.
 #
 # Refuses an operation while the work would land on a protected (default) branch,
 # forcing a feature branch BEFORE work lands. This is the enforcement behind the

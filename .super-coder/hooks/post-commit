@@ -1,5 +1,5 @@
 #!/bin/sh
-# super-coder post-commit — surface this dev shell's live preview URL.
+# Subfloor post-commit — surface this dev shell's live preview URL.
 # Tracked hook, fired via core.hooksPath (wired by `./sc map-setup`). Best-effort,
 # never blocks: a commit always succeeds regardless of what this prints.
 #

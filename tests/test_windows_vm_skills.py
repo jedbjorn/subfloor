@@ -54,7 +54,7 @@ class WindowsCapabilityBoundaryTest(unittest.TestCase):
 
     def test_top_level_help_catalogues_public_guest_commands(self) -> None:
         completed = subprocess.run(
-            [str(ROOT / "sc"), "help"],
+            [str(ROOT / "sc"), "help", "--all"],
             cwd=ROOT,
             capture_output=True,
             text=True,

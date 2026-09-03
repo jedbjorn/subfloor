@@ -92,7 +92,7 @@ class JsonLineRpcProcess:
                 {
                     "clientInfo": {
                         "name": "super-coder",
-                        "title": "super-coder conversation broker",
+                        "title": "Subfloor conversation broker",
                         "version": "1",
                     },
                     "capabilities": {"experimentalApi": False},

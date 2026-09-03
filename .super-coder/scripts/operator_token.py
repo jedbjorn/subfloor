@@ -4,7 +4,7 @@
 `./sc token` prints the current Admin runtime credential — the token a browser
 operator pastes into the sign-in prompt — and ONLY that token, on stdout. It is
 now a recovery path rather than the everyday one: the browser attaches its own
-credential, so the paste-it-by-hand flow (and its `make dos-token` alias) is no
+credential, so the paste-it-by-hand flow (and its `subfloor token` alias) is no
 longer part of normal sign-in. It never rotates the credential, never puts it in
 command arguments, and never writes it to a log.
 
@@ -16,7 +16,7 @@ applies. Selection matches `sc mem` discovery — the unique artifact, or
 SC_MEM_AS=<shortname> when several Admin identities exist.
 
 A missing, unreadable, or insecurely permissioned artifact refuses on stderr
-with the supported service action (`./sc restart` / `make dos-r`, which
+with the supported service action (`subfloor restart`, which
 re-provisions it at boot), and the two classes carry distinct nonzero exit
 statuses: 1 = nothing to read (service not running / no artifact), 2 = an
 artifact is there but unsafe (symlink, wrong owner, group/world bits). stdout
@@ -52,7 +52,7 @@ def main(argv: "list[str] | None" = None) -> int:
     if not mem._discover_runtime_credential():
         mem.die(f"no Admin runtime credential in {mem._CRED_DIR} — the "
                 "supervised service provisions one per Admin shell at boot "
-                "(`./sc restart` / `make dos-r`).")
+                "(`subfloor restart`).")
     # Printing the operator token to stdout IS this command's spec'd function
     # (doc #30 req 23): stdout is the paste channel for the browser sign-in
     # prompt, never a log; nothing else is written anywhere.

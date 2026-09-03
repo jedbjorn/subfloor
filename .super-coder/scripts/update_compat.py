@@ -24,6 +24,7 @@ import subprocess
 from pathlib import Path
 
 import sc_wrapper
+import shell_alias
 
 ENGINE = Path(__file__).resolve().parents[1]
 REPO_ROOT = ENGINE.parent
@@ -74,6 +75,25 @@ def reconcile_host_wrapper() -> None:
     print(f"→ managed host sc wrapper: {result}")
 
 
+def reconcile_shell_alias() -> None:
+    """Install the `subfloor` command from the NEWLY materialized engine.
+
+    A legacy updater cannot know about the command; this bridge runs from the
+    new floor, so the first update onto it hands the operator `subfloor <verb>`
+    — the retired make dos-* aliases keep working from the lingering alias
+    file until `./sc make-cleanup` retires them (docs/README.md runbook).
+    """
+    if not _installed_repo():
+        return
+    try:
+        lines = shell_alias.install()
+    except shell_alias.AliasError as exc:
+        print(f"→ subfloor command: ⚠ {exc} — re-run `./sc alias` after fixing it")
+        return
+    for line in lines:
+        print(f"→ subfloor command: {line}")
+
+
 def _ref_contains_bridge(ref: str) -> bool:
     return subprocess.run(
         ["git", "-C", str(REPO_ROOT), "cat-file", "-e", f"{ref}:{BRIDGE_PATH}"],
@@ -98,6 +118,7 @@ def needs_legacy_bridge() -> tuple[bool, str | None]:
 
 def main() -> int:
     reconcile_host_wrapper()
+    reconcile_shell_alias()
     pending = _pending_update_ref()
     current = _current_update_ref()
     if current is not None:

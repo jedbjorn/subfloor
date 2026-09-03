@@ -1,6 +1,6 @@
 # .super-coder/ — the engine
 
-Everything super-coder owns. The host project's own code is untouched; this dir
+Everything Subfloor owns. The host project's own code is untouched; this dir
 is the substrate that runs it.
 
 ## The DB and generated artifacts stay local
@@ -45,7 +45,7 @@ matches disk is skipped, so an unchanged DB renders to nothing):
 
 The boot doc + SKILL.md are rebuilt every launch by `run.py` for the chosen
 shell — gitignored caches, like `.db`. The flat `_sc` files are a local
-visibility surface; `./sc render` (and `make dos-verify`) regenerate them.
+visibility surface; `./sc render` (and `subfloor verify`) regenerate them.
 Each rendered file carries the do-not-edit banner (spec
 §Content & Render); for bodies that already open with YAML frontmatter the
 banner keys are spliced into it rather than prepended, so the YAML stays valid.

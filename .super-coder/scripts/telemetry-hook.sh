@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# super-coder telemetry hook — claude SessionEnd → real-time token capture.
+# Subfloor telemetry hook — claude SessionEnd → real-time token capture.
 #
 # Wired by the claude adapter's merge_json (same seam as the branch-guard's
 # PreToolUse entry): when a claude session ends, claude invokes this with the
