@@ -244,6 +244,9 @@ console.log(JSON.stringify({
 
 def test_live_native_model_picker_ignores_global_stale_catalogue():
     helper = APP[
+        APP.index("const modelSearchFold"):
+        APP.index("// Unified list search box")
+    ] + APP[
         APP.index("function nativeOptionLabel"):
         APP.index("async function renderDefaultModels")
     ]

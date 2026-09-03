@@ -11,6 +11,10 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 APP = (ROOT / ".super-coder" / "ui" / "app.js").read_text()
+MODEL_SEARCH = APP[
+    APP.index("const modelSearchFold"):
+    APP.index("// Unified list search box")
+]
 INDEX = (ROOT / ".super-coder" / "ui" / "index.html").read_text()
 STYLE = (ROOT / ".super-coder" / "ui" / "style.css").read_text()
 POLL_BLOCK = APP[
@@ -303,7 +307,7 @@ def test_start_chat_has_default_and_configured_paths_without_terminal_controls()
 
 
 def test_model_picker_labels_do_not_expose_harness_support_confidence():
-    options = APP[
+    options = MODEL_SEARCH + APP[
         APP.index("function chatModelOptions"):
         APP.index("function chatCreateConversation")
     ]
@@ -327,8 +331,39 @@ console.log(JSON.stringify(select.options));
 
 
 @pytest.mark.skipif(shutil.which("node") is None, reason="node is required")
+def test_model_search_folds_punctuation_and_case_and_matches_every_term():
+    script = MODEL_SEARCH + r"""
+const fields = ["ollama-cloud/glm-5.3-flash", "GLM 5.3 Flash", "glm", "ollama-cloud"];
+console.log(JSON.stringify({
+  spaced: modelSearchHit("glm 5-3 flash", fields),
+  squashed: modelSearchHit("GLM5.3", fields),
+  reordered: modelSearchHit("flash glm", fields),
+  provider: modelSearchHit("ollama cloud", fields),
+  dotted: modelSearchHit("5.3", fields),
+  typo: modelSearchHit("glmm", fields),
+  otherModel: modelSearchHit("glm 5.1", fields),
+  spanning: modelSearchHit("flashglm", fields),
+  empty: modelSearchHit("   ", fields),
+  missing: modelSearchHit("", [null, undefined]),
+}));
+"""
+    assert run_js(script) == {
+        "spaced": True,
+        "squashed": True,
+        "reordered": True,
+        "provider": True,
+        "dotted": True,
+        "typo": False,
+        "otherModel": False,
+        "spanning": False,
+        "empty": True,
+        "missing": True,
+    }
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node is required")
 def test_model_picker_groups_by_family_and_filters_on_the_search_query():
-    options = APP[
+    options = MODEL_SEARCH + APP[
         APP.index("function chatModelOptions"):
         APP.index("function chatCreateConversation")
     ]
@@ -392,7 +427,7 @@ def test_start_chat_uses_the_searchable_dropdown_over_the_hidden_select():
 
 @pytest.mark.skipif(shutil.which("node") is None, reason="node is required")
 def test_model_dropdown_opens_with_search_on_top_and_picks_through_the_select():
-    source = APP[
+    source = MODEL_SEARCH + APP[
         APP.index("function chatModelDropdown"):
         APP.index("function chatCreateConversation")
     ]
