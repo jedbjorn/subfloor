@@ -1786,7 +1786,10 @@ class ConversationBroker(threading.Thread):
                 return self._finish_adapter_event(
                     active,
                     _with_exit_code(pending_terminal, returncode),
-                    process_exited=isinstance(returncode, int),
+                    process_exited=(
+                        isinstance(returncode, int)
+                        or bool(turn.metadata.get("process_exited"))
+                    ),
                 )
             if (
                 isinstance(stream_error, AdapterError)

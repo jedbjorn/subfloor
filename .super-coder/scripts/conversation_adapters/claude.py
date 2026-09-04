@@ -532,6 +532,10 @@ class ClaudeAdapter(ConversationAdapter):
                 break
             self.sleep(self.attach_poll_seconds)
         turn.metadata["transcript_offset"] = offset
+        # The identity check is the attach lane's process.wait(): the broker
+        # clears the run's process identity on this evidence exactly as it
+        # does on a returncode, so the reaper never has to record the exit.
+        turn.metadata["process_exited"] = True
         if last_text is None:
             yield NormalizedEvent(
                 "run.failed",

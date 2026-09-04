@@ -1,4 +1,4 @@
--- 0249 — durable native transcript adoption evidence.
+-- 0251 — durable native transcript adoption evidence.
 --
 -- The native session file is the channel the CLI writes regardless of the
 -- stdout pipe.  Recording its path and the byte offset at spawn lets a broker

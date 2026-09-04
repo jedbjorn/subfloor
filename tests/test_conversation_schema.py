@@ -19,7 +19,7 @@ FOUNDATION = MIGRATIONS / "0132_conversation_foundation.sql"
 GIT_TARGETS = MIGRATIONS / "0142_conversation_git_targets.sql"
 ACTIVE_REGISTRY = MIGRATIONS / "0162_active_chat_registry.sql"
 REAPER_IDENTITY = MIGRATIONS / "0163_conversation_run_process_identity.sql"
-TRANSCRIPT_OFFSET = MIGRATIONS / "0249_conversation_run_transcript_offset.sql"
+TRANSCRIPT_OFFSET = MIGRATIONS / "0251_conversation_run_transcript_offset.sql"
 TOPOLOGY_RETIREMENT = MIGRATIONS / "0168_retire_sprint_conversation_topology.sql"
 LIVE_NATIVE_ROUTES = MIGRATIONS / "0238_final_schema_rebaseline.sql"
 
