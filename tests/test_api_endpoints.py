@@ -1569,6 +1569,14 @@ class AuthenticatedCliCatalogueRouteTest(unittest.TestCase):
         self.assertEqual(
             skill["grant_scopes"], ["flavor:dev", "shell:custom"]
         )
+        # A Planner redrafting a skill over the API lane needs the row's
+        # existing metadata, not just its name.
+        self.assertIn("category", skill)
+        self.assertIn("description", skill)
+        # Origin and retire state are stamped host-side so a launched seat's
+        # `sc skill list` never reads the instance retire list itself.
+        self.assertEqual(skill["origin"], "local")
+        self.assertFalse(skill["retired"])
 
     def test_exact_route_read_is_a_durable_projection_not_a_host_probe(self) -> None:
         with (

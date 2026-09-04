@@ -16,9 +16,11 @@ the DB directly and enforces `require_planner` before `put`. A launched shell
 engine-state root) is detected by a failed direct-DB open and rerouted
 through authenticated `/_sc/skills/*` routes on the review API, which runs
 the same validation and persistence ladder server-side. Both lanes share
-`cmd_*_api`/`_put_spec`/`_grant_spec`/`_revoke_spec`/`_rm_spec`. Retire and
-unretire stay Admin-only in both lanes because they write the fork-tracked
-retire manifest on the host.
+`cmd_*_api` and the `_*_spec` helpers, and every verb rides the fallback —
+including retire/unretire, whose retire list is instance-local state the API
+host writes exactly as the local CLI would. Nothing here resolves the private
+DB path at import time: that resolution is what fails on a restricted seat,
+so it happens inside `connect()` where the fallback can catch it (#1493).
 
 Engine catalogue rows are authored as assets + `./sc seed-skills`. Fork-local
 rows are DB-canonical and enter through `put --file`; the input file remains a
@@ -58,15 +60,17 @@ import skill_projection
 import snapshot
 
 ENGINE = Path(__file__).resolve().parents[1]
-DB_PATH = instance_state.active_database_path(ENGINE)
+DB_PATH: Path | None = None  # resolved in connect(); tests pin it
 MAX_SKILL_FILE_BYTES = 128 * 1024
 LOCAL_FRONTMATTER_FIELDS = {"name", "description", "category", "command", "common"}
 
 
 def connect():
-    if not DB_PATH.exists() or not DB_PATH.stat().st_size:
+    """Open the live DB; raises InstanceStateError/OSError on a restricted seat."""
+    db_path = DB_PATH if DB_PATH is not None else instance_state.active_database_path(ENGINE)
+    if not db_path.exists() or not db_path.stat().st_size:
         sys.exit("sc skill: no live DB — run `./sc rebuild` (or `./sc launch`) first.")
-    return db_driver.connect(DB_PATH)
+    return db_driver.connect(db_path)
 
 
 def _shell_api_enabled() -> bool:
@@ -83,87 +87,30 @@ def _shell_api_enabled() -> bool:
     return True
 
 
-def _put_with_api_fallback(path: Path) -> int:
-    """Run `put` locally; fall back to the API lane when the DB is unreachable.
+def _with_api_fallback(local, remote):
+    """Run a verb on the local DB; reroute to the API lane when the seat cannot open it.
 
     The restricted execution view (launched non-Admin shells) masks the
-    private engine-state root, so a Planner calling `sc skill put` from its
-    seat hits a filesystem permission error before the flavor check. Retry
-    through the engine API, which runs unrestricted and reuses the same
-    validation + persistence ladder. Any other failure surfaces unchanged.
+    private engine-state root, so `connect()` raises an InstanceStateError or a
+    filesystem permission error before any verb runs. With a shell token
+    present, retry through the engine API, which runs unrestricted and reuses
+    the same validation + persistence ladder. A missing/empty DB on a host
+    seat ("no live DB") and any failure without a token surface unchanged.
     """
     try:
         con = connect()
     except SystemExit as exc:
-        if not mem.SC_API_TOKEN:
-            raise
-        if "no live DB" in str(exc):
-            raise
-        return cmd_put_api(path)
-    except (OSError, PermissionError):
-        if not mem.SC_API_TOKEN:
-            raise
-        return cmd_put_api(path)
-    try:
-        return cmd_put(con, path)
-    finally:
-        con.close()
-
-
-def _grant_with_api_fallback(name: str, shell_refs: list[str]) -> int:
-    try:
-        con = connect()
-    except SystemExit as exc:
         if not mem.SC_API_TOKEN or "no live DB" in str(exc):
             raise
-        return cmd_grant_api(name, shell_refs)
-    except (OSError, PermissionError):
+        return remote()
+    except (OSError, instance_state.InstanceStateError):
         if not mem.SC_API_TOKEN:
             raise
-        return cmd_grant_api(name, shell_refs)
+        return remote()
     try:
-        return cmd_grant(con, name, shell_refs)
+        return local(con)
     finally:
         con.close()
-
-
-def _revoke_with_api_fallback(name: str, shell_refs: list[str]) -> int:
-    try:
-        con = connect()
-    except SystemExit as exc:
-        if not mem.SC_API_TOKEN or "no live DB" in str(exc):
-            raise
-        return cmd_revoke_api(name, shell_refs)
-    except (OSError, PermissionError):
-        if not mem.SC_API_TOKEN:
-            raise
-        return cmd_revoke_api(name, shell_refs)
-    try:
-        return cmd_revoke(con, name, shell_refs)
-    finally:
-        con.close()
-
-
-def _rm_with_api_fallback(name: str) -> int:
-    try:
-        con = connect()
-    except SystemExit as exc:
-        if not mem.SC_API_TOKEN or "no live DB" in str(exc):
-            raise
-        return cmd_rm_api(name)
-    except (OSError, PermissionError):
-        if not mem.SC_API_TOKEN:
-            raise
-        return cmd_rm_api(name)
-    try:
-        return cmd_rm(con, name)
-    finally:
-        con.close()
-    if not mem.SC_API_TOKEN:
-        return False
-    mem._PROG = "skill"
-    mem._require_api()
-    return True
 
 
 def require_planner(con) -> int:
@@ -423,32 +370,47 @@ def parse_local_skill_file(path: Path) -> dict:
         sys.exit(f"sc skill: draft {path}: {exc}")
 
 
-def print_catalogue(rows: list[dict]) -> int:
+def annotate_catalogue(rows: list[dict]) -> list[dict]:
+    """Stamp each row with its engine/local origin and fork retire state.
+
+    Runs where the seed and the instance retire list are readable — the local
+    lane and the API host — so a launched seat's `list` never touches private
+    state itself (#1493).
+    """
     engine = set(seed_skills.seeded_skill_names())
     retired = set(seed_skills.retired_skill_names())
+    for row in rows:
+        row["origin"] = "engine" if row["name"] in engine else "local"
+        row["retired"] = bool(row["is_deleted"]) and row["name"] in retired
+    return rows
+
+
+def print_catalogue(rows: list[dict]) -> int:
     if not rows:
         print("(no skills)")
         return 0
     w = max(len(row["name"]) for row in rows)
+    cw = max(len(row.get("category") or "-") for row in rows)
     for row in rows:
         name = row["name"]
         common = row["common"]
         deleted = row["is_deleted"]
-        origin = "engine" if name in engine else "local "
+        origin = "engine" if row.get("origin") == "engine" else "local "
         tag = "common" if common else "opt-in"
-        dead = ("  [retired]" if name in retired else "  [deleted]") if deleted else ""
+        category = row.get("category") or "-"
+        dead = ("  [retired]" if row.get("retired") else "  [deleted]") if deleted else ""
         scopes = ", ".join(row.get("grant_scopes") or []) or "(ungranted)"
-        print(f"{name:<{w}}  {origin}  {tag}  → {scopes}{dead}")
+        print(f"{name:<{w}}  {origin}  {tag}  {category:<{cw}}  → {scopes}{dead}")
     return 0
 
 
 def cmd_list(con) -> int:
     rows = [dict(row) for row in con.execute(
-        "SELECT s.skill_id, s.name, s.common, s.is_deleted "
-        "FROM skills s ORDER BY s.is_deleted, s.name").fetchall()]
+        "SELECT s.skill_id, s.name, s.description, s.category, s.common, "
+        "s.is_deleted FROM skills s ORDER BY s.is_deleted, s.name").fetchall()]
     for row in rows:
         row["grant_scopes"] = grant_scopes(con, row["skill_id"])
-    return print_catalogue(rows)
+    return print_catalogue(annotate_catalogue(rows))
 
 
 def cmd_list_api() -> int:
@@ -516,6 +478,26 @@ def cmd_rm_api(name: str) -> int:
         f"rm: {result['name']} soft-deleted, {result['revoked_grants']} "
         f"grant(s) revoked.{suffix} (via engine API)"
     )
+    return 0
+
+
+def cmd_retire_api(name: str) -> int:
+    result = mem._api(
+        "POST", "/_sc/skills/retire", {"name": name}, idempotent=False
+    )
+    listed = "  (already listed)" if result.get("already_listed") else ""
+    print(f"retire: {result['name']}{listed} — retired fork-wide; "
+          f"{result['dormant_grants']} grant(s) kept dormant (restored on "
+          "unretire). (via engine API)")
+    return 0
+
+
+def cmd_unretire_api(name: str) -> int:
+    result = mem._api(
+        "POST", "/_sc/skills/unretire", {"name": name}, idempotent=False
+    )
+    print(f"unretire: {result['name']} — restored with {result['grants']} "
+          "grant(s) live again. (via engine API)")
     return 0
 
 
@@ -722,14 +704,17 @@ def _display_retire_file() -> Path:
         return seed_skills.RETIRED_FILE
 
 
-def cmd_retire(con, name: str) -> int:
+def _retire_spec(con, name: str) -> tuple[bool, int]:
+    """Retire one engine skill fork-wide. Returns (already_listed, dormant grants)."""
     if name not in set(seed_skills.seeded_skill_names()):
         if con.execute("SELECT 1 FROM skills WHERE name=?", (name,)).fetchone():
-            sys.exit(f"sc skill: '{name}' is a LOCAL skill — `./sc skill rm {name}` "
-                     "retires it (the retire list is for engine skills the seed "
-                     "would resurrect).")
-        sys.exit(f"sc skill: no engine skill '{name}' — `./sc skill list` shows the "
-                 "catalogue.")
+            raise SkillConflictError(
+                f"'{name}' is a LOCAL skill — `./sc skill rm {name}` retires it "
+                "(the retire list is for engine skills the seed would resurrect)."
+            )
+        raise SkillConflictError(
+            f"no engine skill '{name}' — `./sc skill list` shows the catalogue."
+        )
     names = seed_skills.retired_skill_names()
     already = name in names
     if not already:
@@ -742,33 +727,51 @@ def cmd_retire(con, name: str) -> int:
     dormant = grant_count(
         con, con.execute(
             "SELECT skill_id FROM skills WHERE name=?", (name,)).fetchone()[0])
-    rel = _display_retire_file()
-    print(f"retire: {name}" + ("  (already listed)" if already else "")
-          + f" — retired fork-wide; {dormant} grant(s) kept dormant "
-          "(restored on unretire).")
-    action = "commit" if artifact_policy.tracks_local_artifacts() else "kept local at"
-    print(f"→ {action} {rel} — the list rides `./sc update`.")
-    return 0
+    return already, dormant
 
 
-def cmd_unretire(con, name: str) -> int:
+def _unretire_spec(con, name: str) -> int:
+    """Restore one retired engine skill. Returns the grants live again."""
     names = seed_skills.retired_skill_names()
     if name not in names:
-        sys.exit(f"sc skill: '{name}' is not on the retire list "
-                 f"({seed_skills.RETIRED_FILE}).")
+        raise SkillConflictError(
+            f"'{name}' is not on the retire list ({seed_skills.RETIRED_FILE})."
+        )
     _write_retire_list([n for n in names if n != name])
     seed_skills.apply_retired(con)
     try:
         skill_projection.reconcile_existing_checkouts(con)
     except skill_projection.ProjectionError as exc:
         sys.exit(skill_projection.partial_failure_message(f"unretire {name}", exc))
-    grants = grant_count(
+    return grant_count(
         con, con.execute(
             "SELECT skill_id FROM skills WHERE name=?", (name,)).fetchone()[0])
-    rel = _display_retire_file()
-    print(f"unretire: {name} — restored with {grants} grant(s) live again.")
+
+
+def _retire_list_note() -> str:
     action = "commit" if artifact_policy.tracks_local_artifacts() else "kept local at"
-    print(f"→ {action} {rel}.")
+    return f"→ {action} {_display_retire_file()} — the list rides `./sc update`."
+
+
+def cmd_retire(con, name: str) -> int:
+    try:
+        already, dormant = _retire_spec(con, name)
+    except SkillConflictError as exc:
+        sys.exit(f"sc skill: {exc}")
+    print(f"retire: {name}" + ("  (already listed)" if already else "")
+          + f" — retired fork-wide; {dormant} grant(s) kept dormant "
+          "(restored on unretire).")
+    print(_retire_list_note())
+    return 0
+
+
+def cmd_unretire(con, name: str) -> int:
+    try:
+        grants = _unretire_spec(con, name)
+    except SkillConflictError as exc:
+        sys.exit(f"sc skill: {exc}")
+    print(f"unretire: {name} — restored with {grants} grant(s) live again.")
+    print(_retire_list_note())
     return 0
 
 
@@ -781,49 +784,33 @@ def main(argv: list[str]) -> int:
         print(usage)
         return 0
     cmd, args = argv[0], argv[1:]
-    if cmd == "list" and not args and _shell_api_enabled():
-        return cmd_list_api()
+    if cmd == "list" and not args:
+        if _shell_api_enabled():
+            return cmd_list_api()
+        return _with_api_fallback(cmd_list, cmd_list_api)
     if cmd == "put" and len(args) == 2 and args[0] == "--file":
-        # The restricted execution view masks the engine's private state root,
-        # so a launched Planner cannot open the DB directly; when that happens
-        # the API lane runs the same validation + persistence ladder remotely.
-        return _put_with_api_fallback(Path(args[1]))
+        path = Path(args[1])
+        return _with_api_fallback(
+            lambda con: cmd_put(con, path), lambda: cmd_put_api(path))
     if cmd == "grant" and len(args) >= 2:
-        return _grant_with_api_fallback(args[0], args[1:])
+        return _with_api_fallback(
+            lambda con: cmd_grant(con, args[0], args[1:]),
+            lambda: cmd_grant_api(args[0], args[1:]))
     if cmd == "revoke" and len(args) >= 2:
-        return _revoke_with_api_fallback(args[0], args[1:])
+        return _with_api_fallback(
+            lambda con: cmd_revoke(con, args[0], args[1:]),
+            lambda: cmd_revoke_api(args[0], args[1:]))
     if cmd == "rm" and len(args) == 1:
-        return _rm_with_api_fallback(args[0])
-    con = connect()
-    try:
-        if cmd == "list" and not args:
-            return cmd_list(con)
-        if cmd == "retire" and len(args) == 1:
-            return cmd_retire(con, args[0])
-        if cmd == "unretire" and len(args) == 1:
-            return cmd_unretire(con, args[0])
-        sys.exit(usage)
-    finally:
-        con.close()
-    con = connect()
-    try:
-        if cmd == "list" and not args:
-            return cmd_list(con)
-        if cmd == "put" and len(args) == 2 and args[0] == "--file":
-            return cmd_put(con, Path(args[1]))
-        if cmd == "grant" and len(args) >= 2:
-            return cmd_grant(con, args[0], args[1:])
-        if cmd == "revoke" and len(args) >= 2:
-            return cmd_revoke(con, args[0], args[1:])
-        if cmd == "rm" and len(args) == 1:
-            return cmd_rm(con, args[0])
-        if cmd == "retire" and len(args) == 1:
-            return cmd_retire(con, args[0])
-        if cmd == "unretire" and len(args) == 1:
-            return cmd_unretire(con, args[0])
-        sys.exit(usage)
-    finally:
-        con.close()
+        return _with_api_fallback(
+            lambda con: cmd_rm(con, args[0]), lambda: cmd_rm_api(args[0]))
+    if cmd == "retire" and len(args) == 1:
+        return _with_api_fallback(
+            lambda con: cmd_retire(con, args[0]), lambda: cmd_retire_api(args[0]))
+    if cmd == "unretire" and len(args) == 1:
+        return _with_api_fallback(
+            lambda con: cmd_unretire(con, args[0]),
+            lambda: cmd_unretire_api(args[0]))
+    sys.exit(usage)
 
 
 if __name__ == "__main__":

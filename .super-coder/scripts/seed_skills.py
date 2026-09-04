@@ -50,9 +50,12 @@ ENGINE = Path(__file__).resolve().parents[1]
 SKILLS_DIR = ENGINE / "assets" / "skills"
 SHELL_TEMPLATES = ENGINE / "templates" / "shells"
 OUT = ENGINE / "migrations" / "0001_seed_skills.sql"
+# Resolved on first use, never at import: a launched non-Admin seat cannot
+# read the private state root, and every `sc skill` verb imports this module
+# before its API fallback can run (#1493). Tests and relocation code pin it.
 # Update imports the seed helpers while recovering relocation publication.
 # The standalone command validates active_database_path in ``main``.
-DB_PATH = instance_state.maintenance_database_path(ENGINE)
+DB_PATH: Path | None = None
 RETIRED_FILE = artifact_policy.retired_skills_path()
 TOMBSTONES_FILE = ENGINE / "assets" / "skill_tombstones.json"
 SKILL_NAME_RE = re.compile(r"^[a-z][a-z0-9_-]*$")
@@ -507,16 +510,24 @@ def _fork_mode() -> bool:
     return not update.is_source_repo() and not update.EJECTED_MARKER.exists()
 
 
+def live_db_path() -> Path:
+    """The maintenance DB target, pinned or resolved at call time."""
+    if DB_PATH is not None:
+        return DB_PATH
+    return instance_state.maintenance_database_path(ENGINE)
+
+
 def _upsert_live(skills: list[dict]) -> None:
     """The documented half of seeding: put the parsed asset skills IN THE LIVE
     DB, so a grant right after (`./sc skill grant`) resolves instead of being a
     silent no-op (#253). Passing ALL asset specs (not just seed names) is what
     lets a freshly-authored fork-local skill land."""
-    if not DB_PATH.exists() or not DB_PATH.stat().st_size:
+    db_path = live_db_path()
+    if not db_path.exists() or not db_path.stat().st_size:
         print("seed_skills: no live DB yet — skills land on first rebuild/launch.")
         return
     import db_driver  # lazy — sibling module; keeps import surface unchanged
-    con = db_driver.connect(DB_PATH)
+    con = db_driver.connect(db_path)
     try:
         initialized = con.execute(
             "SELECT 1 FROM sqlite_master WHERE type='table' AND name='skills'"

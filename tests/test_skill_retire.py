@@ -27,9 +27,11 @@ from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / ".super-coder" / "scripts"))
+sys.path.insert(0, str(ROOT / ".super-coder" / "api"))
 import seed_skills
 import skill as skill_cli
 import render_check
+import server
 
 ENGINE_SKILLS = ("redline_review", "review", "git")
 
@@ -258,6 +260,54 @@ class RetireTest(unittest.TestCase):
     def test_cmd_unretire_unlisted_is_loud(self):
         with self.assertRaises(SystemExit):
             skill_cli.cmd_unretire(self.con, "review")
+
+    # ── the Planner API lane shares the spec helpers ─────────────────────────
+    def test_spec_helpers_raise_conflicts_instead_of_exiting(self):
+        with self.assertRaisesRegex(skill_cli.SkillConflictError, "LOCAL skill"):
+            skill_cli._retire_spec(self.con, "test_authoring_dosarch")
+        with self.assertRaisesRegex(skill_cli.SkillConflictError, "no engine skill"):
+            skill_cli._retire_spec(self.con, "no_such_skill")
+        with self.assertRaisesRegex(skill_cli.SkillConflictError, "not on the retire list"):
+            skill_cli._unretire_spec(self.con, "review")
+
+    def test_api_retire_and_unretire_round_trip(self):
+        status, body = server._skills_mutation_report(
+            server.api_skill_retire, self.con, "redline_review")
+        self.assertEqual((status, body), (200, {
+            "ok": True, "action": "retire", "name": "redline_review",
+            "already_listed": False, "dormant_grants": 1,
+        }))
+        self.assertEqual(json.loads(seed_skills.RETIRED_FILE.read_text()),
+                         ["redline_review"])
+        self.assertEqual(self._deleted("redline_review"), 1)
+        self.reconcile_existing.assert_called_once_with(self.con)
+
+        status, body = server._skills_mutation_report(
+            server.api_skill_retire, self.con, "redline_review")
+        self.assertEqual(status, 200)
+        self.assertTrue(body["already_listed"])
+
+        self.reconcile_existing.reset_mock()
+        status, body = server._skills_mutation_report(
+            server.api_skill_unretire, self.con, "redline_review")
+        self.assertEqual((status, body), (200, {
+            "ok": True, "action": "unretire", "name": "redline_review", "grants": 1,
+        }))
+        self.assertEqual(json.loads(seed_skills.RETIRED_FILE.read_text()), [])
+        self.assertEqual(self._deleted("redline_review"), 0)
+        self.reconcile_existing.assert_called_once_with(self.con)
+
+    def test_api_retire_refusals_are_structured(self):
+        status, body = server._skills_mutation_report(
+            server.api_skill_retire, self.con, "test_authoring_dosarch")
+        self.assertEqual(status, 409)
+        self.assertIn("LOCAL skill", body["error"])
+        status, body = server._skills_mutation_report(
+            server.api_skill_unretire, self.con, "review")
+        self.assertEqual(status, 409)
+        self.assertIn("not on the retire list", body["error"])
+        with self.assertRaises(server.SkillApiError):
+            server.api_skill_retire(self.con, "")
 
     def test_grant_of_retired_skill_is_loud(self):
         skill_cli.cmd_retire(self.con, "redline_review")
