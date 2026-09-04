@@ -174,6 +174,116 @@ class ConversationReaperTest(unittest.TestCase):
             )
         )
 
+    def finish_succeeded(self, run_id: int, ended_at: str) -> None:
+        """The lingering shape: the broker proved a terminal for the run while
+        its process kept working, so the run is finished and the pid identity
+        stays on the row."""
+        con = self.connect()
+        con.execute(
+            "UPDATE conversation_runs SET state='succeeded',ended_at=? "
+            "WHERE run_id=?",
+            (ended_at, run_id),
+        )
+        con.commit()
+        con.close()
+
+    def unlink_registry(self) -> None:
+        con = self.connect()
+        con.execute(
+            "UPDATE active_shell_chats SET process_pid=NULL,process_start_ticks=NULL"
+        )
+        con.commit()
+        con.close()
+
+    def test_lingering_run_is_reapable_only_once_the_chat_is_closed(self) -> None:
+        # The lockout: a finished run whose process is still alive holds the
+        # shell. While the chat is open the registry link protects it; closing
+        # the chat unlinks the row and the survivor becomes reapable.
+        _conversation, _message, run_id = self.add_run(protected=True)
+        self.finish_succeeded(run_id, "2026-08-02 11:59:30")
+        store = ReaperStore(self.db_path, clock=self.clock)
+
+        self.assertEqual([], [c.run_id for c in store.candidates()])
+
+        self.unlink_registry()
+
+        self.assertEqual([run_id], [c.run_id for c in store.candidates()])
+
+    def test_reaping_a_lingering_run_only_records_the_outcome(self) -> None:
+        conversation_id, message_id, run_id = self.add_run()
+        self.finish_succeeded(run_id, "2026-08-02 11:59:30")
+        reaper = self.build_reaper(None)          # the process is gone
+
+        self.assertEqual(reaper.sweep_once(), 1)
+        self.assertEqual(reaper.sweep_once(), 0)  # exactly once, never a loop
+
+        con = self.connect()
+        run = con.execute(
+            "SELECT state,ended_at,error_code FROM conversation_runs "
+            "WHERE run_id=?",
+            (run_id,),
+        ).fetchone()
+        message_state = con.execute(
+            "SELECT state FROM conversation_messages WHERE message_id=?",
+            (message_id,),
+        ).fetchone()[0]
+        conversation_state = con.execute(
+            "SELECT state FROM conversations WHERE conversation_id=?",
+            (conversation_id,),
+        ).fetchone()[0]
+        events = con.execute(
+            "SELECT event_type,payload FROM conversation_events WHERE run_id=? "
+            "ORDER BY sequence",
+            (run_id,),
+        ).fetchall()
+        con.close()
+        # The broker's terminal is the run's terminal — the reaper never
+        # overwrites a proven outcome with its own guess.
+        self.assertEqual(tuple(run), ("succeeded", "2026-08-02 11:59:30", None))
+        self.assertEqual(message_state, "running")
+        self.assertEqual(conversation_state, "running")
+        self.assertEqual([row["event_type"] for row in events], ["run.reaped"])
+        self.assertIn('"run_state":"succeeded"', events[0]["payload"])
+        self.assertIn(
+            '"reason":"recorded process exited before reaper signal"',
+            events[0]["payload"],
+        )
+
+    def test_lingering_candidate_climbs_the_same_ladder(self) -> None:
+        _conversation, _message, run_id = self.add_run()
+        self.finish_succeeded(run_id, "2026-08-02 11:59:30")
+        snapshot = ProcessSnapshot(4242, 9001, 4242)
+        interrupted: list[int] = []
+        signals: list[tuple[int, signal.Signals]] = []
+
+        def reaper() -> ConversationReaper:
+            return self.build_reaper(
+                snapshot,
+                native_interrupt=interrupted.append,
+                signal_group=lambda group, value: signals.append((group, value)),
+            )
+
+        self.assertEqual(reaper().sweep_once(), 1)
+        self.clock.advance(15)
+        self.assertEqual(reaper().sweep_once(), 1)
+        self.clock.advance(15)
+        self.assertEqual(reaper().sweep_once(), 1)
+        self.assertEqual(interrupted, [run_id])
+        self.assertEqual(signals, [(4242, signal.SIGTERM), (4242, signal.SIGKILL)])
+
+        con = self.connect()
+        run = con.execute(
+            "SELECT state,reaper_last_signal FROM conversation_runs WHERE run_id=?",
+            (run_id,),
+        ).fetchone()
+        events = con.execute(
+            "SELECT event_type FROM conversation_events WHERE run_id=?",
+            (run_id,),
+        ).fetchall()
+        con.close()
+        self.assertEqual(tuple(run), ("succeeded", "SIGKILL"))
+        self.assertEqual([row[0] for row in events], ["run.reaped"])
+
     def test_exact_registry_identity_is_the_only_protection(self) -> None:
         _conversation, _message, protected_run = self.add_run(protected=True)
         snapshot = ProcessSnapshot(4242, 9001, 4242)
@@ -306,7 +416,7 @@ class ConversationReaperTest(unittest.TestCase):
         self.assertEqual(conversation_state, "error")
         self.assertEqual(
             [row["event_type"] for row in events],
-            ["run.unknown", "run.interrupted"],
+            ["run.unknown", "run.reaped"],
         )
 
     def test_unknown_run_without_process_identity_is_untouched(self) -> None:

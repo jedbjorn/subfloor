@@ -13,6 +13,7 @@ from __future__ import annotations
 import io
 import json
 import os
+import sqlite3
 import sys
 import tempfile
 import unittest
@@ -22,6 +23,7 @@ from unittest import mock
 
 ENGINE = Path(__file__).resolve().parents[1] / ".super-coder"
 sys.path.insert(0, str(ENGINE / "scripts"))
+import run
 import shell_liveness  # noqa: E402
 
 
@@ -656,6 +658,182 @@ class ComputeWithClaimsTest(unittest.TestCase):
         snap = shell_liveness.compute()
         self.assertIsNone(shell_liveness.session_state("dev6", snap))
         self.assertIsNone(shell_liveness.record_state("dev6", snap))
+
+
+class BrowserSessionTest(unittest.TestCase):
+    """A browser turn is a harness child of the API server whose cwd is the
+    shell's worktree. Unnamed it reads as an anonymous CLI session and locks
+    the shell out with nothing to point at; joined against the registry and the
+    run rows by pid + start_ticks it is a NAMED hold."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.proc = self.root / "proc"
+        self.proc.mkdir()
+        self.worktree = self.root / ".sc-worktrees" / "dev6"
+        self.worktree.mkdir(parents=True)
+        self.db = self.root / "shell.db"
+        for patch in (
+            mock.patch.object(shell_liveness, "PROC", self.proc),
+            mock.patch.object(shell_liveness, "REPO_ROOT", self.root),
+            mock.patch.object(shell_liveness, "DB_PATH", self.db),
+            mock.patch.object(shell_liveness, "harness_binaries",
+                              return_value={"codex"}),
+            mock.patch.object(shell_liveness, "_shell_labels", return_value={}),
+            mock.patch.object(shell_liveness, "_launch_claims", return_value={}),
+            mock.patch.object(shell_liveness, "_self_harness_pid",
+                              return_value=None),
+        ):
+            patch.start()
+            self.addCleanup(patch.stop)
+
+    def _db(self, *, registry=(), runs=(), tables: bool = True) -> None:
+        """A DB carrying only the two tables the scan reads, best-effort style."""
+        con = sqlite3.connect(self.db)
+        if tables:
+            con.executescript(
+                "CREATE TABLE active_shell_chats (shell_id INTEGER,"
+                "chat_id TEXT,process_pid INTEGER,process_start_ticks INTEGER);"
+                "CREATE TABLE conversation_runs (run_id INTEGER PRIMARY KEY,"
+                "conversation_id TEXT,state TEXT,process_pid INTEGER,"
+                "process_start_ticks INTEGER);")
+            con.executemany(
+                "INSERT INTO active_shell_chats "
+                "(shell_id,chat_id,process_pid,process_start_ticks) "
+                "VALUES (1,?,?,?)", registry)
+            con.executemany(
+                "INSERT INTO conversation_runs "
+                "(conversation_id,state,process_pid,process_start_ticks) "
+                "VALUES (?,?,?,?)", runs)
+        else:
+            con.execute("CREATE TABLE unrelated (x INTEGER)")
+        con.commit()
+        con.close()
+
+    def test_registry_identity_names_the_conversation(self):
+        _proc_entry(self.proc, 700, cwd=self.worktree, start_ticks=5150)
+        self._db(registry=[("cv_abc", 700, 5150)],
+                 runs=[("cv_abc", "running", 700, 5150)])
+
+        snap = shell_liveness.compute()
+
+        self.assertEqual("cv_abc", snap["processes"][0]["browser_conversation"])
+        self.assertFalse(snap["processes"][0]["lingering"])
+        self.assertEqual(
+            {"dev6": [{"pid": 700, "conversation_id": "cv_abc",
+                       "lingering": False}]},
+            snap["browser_sessions"])
+
+    def test_terminal_run_identity_is_lingering(self):
+        # The incident's shape: the run finished, the process kept working.
+        _proc_entry(self.proc, 700, cwd=self.worktree, start_ticks=5150)
+        self._db(runs=[("cv_abc", "succeeded", 700, 5150)])
+
+        snap = shell_liveness.compute()
+
+        self.assertEqual("cv_abc", snap["processes"][0]["browser_conversation"])
+        self.assertTrue(snap["processes"][0]["lingering"])
+        self.assertTrue(snap["browser_sessions"]["dev6"][0]["lingering"])
+
+    def test_recycled_pid_is_not_tagged(self):
+        # Same pid number, a different process — identity is pid + start ticks,
+        # and tagging on the number alone would name a stranger's conversation.
+        _proc_entry(self.proc, 700, cwd=self.worktree, start_ticks=99999)
+        self._db(registry=[("cv_abc", 700, 5150)],
+                 runs=[("cv_abc", "running", 700, 5150)])
+
+        snap = shell_liveness.compute()
+
+        self.assertIsNone(snap["processes"][0]["browser_conversation"])
+        self.assertEqual({}, snap["browser_sessions"])
+
+    def test_absent_db_leaves_the_scan_untagged(self):
+        _proc_entry(self.proc, 700, cwd=self.worktree, start_ticks=5150)
+
+        snap = shell_liveness.compute()
+
+        self.assertIsNone(snap["processes"][0]["browser_conversation"])
+        self.assertEqual({}, snap["browser_sessions"])
+
+    def test_db_without_the_tables_is_not_fatal(self):
+        # An un-migrated fork, or a DB we cannot read: best-effort, exactly as
+        # _launch_claims degrades.
+        _proc_entry(self.proc, 700, cwd=self.worktree, start_ticks=5150)
+        self._db(tables=False)
+
+        snap = shell_liveness.compute()
+
+        self.assertIsNone(snap["processes"][0]["browser_conversation"])
+        self.assertEqual({}, snap["browser_sessions"])
+
+
+class BrowserSessionStateTest(unittest.TestCase):
+    """session_state's fourth answer: 'browser' when every live pid holding the
+    worktree is one the engine launched itself."""
+
+    def _snap(self, processes, browser) -> dict:
+        return {"supported": True, "processes": processes,
+                "browser_sessions": browser}
+
+    def test_all_browser_pids_are_a_browser_hold(self):
+        snap = self._snap(
+            [{"pid": 700, "shortname": "dev6", "orphaned": None}],
+            {"dev6": [{"pid": 700, "conversation_id": "cv_abc",
+                       "lingering": True}]})
+        self.assertEqual("browser", shell_liveness.session_state("DEV6", snap))
+
+    def test_a_plain_cli_pid_alongside_is_still_busy(self):
+        # One human session among browser turns → someone is working there.
+        snap = self._snap(
+            [{"pid": 700, "shortname": "dev6", "orphaned": None},
+             {"pid": 701, "shortname": "dev6", "orphaned": None}],
+            {"dev6": [{"pid": 700, "conversation_id": "cv_abc",
+                       "lingering": False}]})
+        self.assertEqual("busy", shell_liveness.session_state("dev6", snap))
+
+    def test_orphans_still_win_over_the_browser_verdict(self):
+        snap = self._snap(
+            [{"pid": 700, "shortname": "dev6", "orphaned": "detached"}],
+            {"dev6": [{"pid": 700, "conversation_id": "cv_abc",
+                       "lingering": False}]})
+        self.assertEqual("orphan", shell_liveness.session_state("dev6", snap))
+
+    def test_browser_sessions_lookup_is_case_insensitive(self):
+        snap = self._snap(
+            [], {"dev6": [{"pid": 700, "conversation_id": "cv_abc",
+                           "lingering": False}]})
+        self.assertEqual([700], [s["pid"] for s in
+                                 shell_liveness.browser_sessions("DEV6", snap)])
+        self.assertEqual([], shell_liveness.browser_sessions("ghost", snap))
+
+
+class BrowserRefusalTest(unittest.TestCase):
+    """The CLI still refuses a browser-held slot — but it names the turn and
+    the two ways out instead of leaving a pid to hunt by hand."""
+
+    def setUp(self):
+        self.snap = {
+            "supported": True,
+            "processes": [{"pid": 700, "shortname": "dev6", "orphaned": None}],
+            "browser_sessions": {
+                "dev6": [{"pid": 700, "conversation_id": "cv_abc",
+                          "lingering": True}]},
+        }
+
+    def test_refusal_names_the_conversation_the_pid_and_the_exits(self):
+        message = run.browser_refusal("dev6", self.snap)
+        self.assertIn("cv_abc", message)
+        self.assertIn("pid 700", message)
+        self.assertIn("lingering", message)
+        self.assertIn("interrupt the turn from that GUI chat", message)
+        self.assertIn("close that chat", message)
+
+    def test_the_picker_paints_a_browser_hold_rather_than_available(self):
+        shell = {"flavor": "dev", "shortname": "dev6", "display_name": "Dev",
+                 "browser_active": 0}
+        self.assertIn("BROWSER", run._shell_status(shell, self.snap))
 
 
 class ComputeSmokeTest(unittest.TestCase):

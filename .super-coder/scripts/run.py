@@ -1238,7 +1238,9 @@ def _shell_status(shell, snap: "dict | None") -> str:
         label, paint = "Unknown", style.dim
     else:
         state = shell_liveness.session_state(shell["shortname"] or "", snap)
-        if state == "busy":
+        if state == "browser":
+            label, paint = "BROWSER", style.red
+        elif state == "busy":
             label, paint = "Busy", style.amber
         elif state == "orphan":
             label, paint = "Orphaned", style.red
@@ -1247,6 +1249,21 @@ def _shell_status(shell, snap: "dict | None") -> str:
         else:
             label, paint = "Available", style.green
     return f"{paint(label)}{' ' * (12 - len(label))}"
+
+
+def browser_refusal(shortname: str, snap: dict) -> str:
+    """The refusal for a slot held by the engine's OWN browser turn.
+
+    It still refuses — one shell, one session — but a browser process is not
+    anonymous: the operator gets the conversation, the pid, and the two ways
+    out, instead of a dead end and a pid to hunt by hand."""
+    named = ", ".join(
+        f"conversation {s['conversation_id']} (pid {s['pid']}"
+        f"{', lingering' if s.get('lingering') else ''})"
+        for s in shell_liveness.browser_sessions(shortname, snap))
+    return (f"sc run: shell '{shortname}' slot is held by a BROWSER turn — "
+            f"{named}. Two ways out: interrupt the turn from that GUI chat, "
+            f"or close that chat. Then re-run.")
 
 
 def confirm_live(shell, snap: "dict | None") -> bool:
@@ -2215,6 +2232,8 @@ def main() -> None:
     if headless and chosen["shortname"] and chosen["flavor"] != "admin":
         snap = shell_liveness.compute()
         if snap.get("supported") and shell_liveness.is_active(chosen["shortname"], snap):
+            if shell_liveness.session_state(chosen["shortname"], snap) == "browser":
+                sys.exit(browser_refusal(chosen["shortname"], snap))
             pids, orphans = shell_liveness.orphan_split(chosen["shortname"], snap)
             if pids and len(orphans) == len(pids):
                 # The slot-holder outlived its terminal/parent — still refuse
