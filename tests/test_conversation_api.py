@@ -2209,6 +2209,175 @@ class ConversationResourceTest(ConversationApiCase):
             con.close()
         self.assertEqual(state, "closed")
 
+    def seed_lingering_process(
+        self,
+        conversation_id: str,
+        *,
+        pid: int = 4242,
+        start_ticks: int = 990,
+        process_group_id: int = 4200,
+    ) -> int:
+        """A finished run whose recorded process the registry still links."""
+        con = self.connect()
+        try:
+            con.execute(
+                "UPDATE active_shell_chats SET process_pid=?,"
+                "process_start_ticks=?,updated_at='2026-09-04 10:00:00' "
+                "WHERE chat_id=?",
+                (pid, start_ticks, conversation_id),
+            )
+            message_id = int(
+                con.execute(
+                    "INSERT INTO conversation_messages "
+                    "(conversation_id,sender_kind,sender_ref,message_kind,body,"
+                    "idempotency_key,request_hash,state,completed_at) "
+                    "VALUES (?,'user','1','prompt','done','linger','h',"
+                    "'completed',datetime('now'))",
+                    (conversation_id,),
+                ).lastrowid
+            )
+            run_id = int(
+                con.execute(
+                    "INSERT INTO conversation_runs "
+                    "(conversation_id,shell_id,trigger_message_id,lease_owner,"
+                    "lease_expires_at,state,started_at,ended_at,process_pid,"
+                    "process_start_ticks,process_group_id) "
+                    "VALUES (?,1,?,'fixture','2026-09-04 11:00:00','succeeded',"
+                    "'2026-09-04 10:00:00','2026-09-04 10:01:00',?,?,?)",
+                    (
+                        conversation_id,
+                        message_id,
+                        pid,
+                        start_ticks,
+                        process_group_id,
+                    ),
+                ).lastrowid
+            )
+            con.commit()
+        finally:
+            con.close()
+        return run_id
+
+    def test_projection_names_a_lingering_process_from_the_registry(self) -> None:
+        conversation_id = self.create(key="linger-projection")["conversation_id"]
+        self.seed_lingering_process(conversation_id)
+        with mock.patch.object(
+            conversation_routes.active_chat_registry,
+            "process_details",
+            return_value=conversation_routes.active_chat_registry.ProcessIdentity(
+                4242, 990, 4200
+            ),
+        ):
+            status, _, projection = self.request(
+                "GET", f"/api/conversations/{conversation_id}"
+            )
+        self.assertEqual(status, 200, projection)
+        self.assertEqual(
+            projection["process"],
+            {
+                "pid": 4242,
+                "start_ticks": 990,
+                "alive": True,
+                "lingering": True,
+                "since": "2026-09-04 10:00:00",
+            },
+        )
+
+    def test_projection_process_is_null_without_a_registry_row(self) -> None:
+        with closing(self.connect()) as con:
+            conversation_id = self.seed_conversation(con, number=61)
+            con.commit()
+        status, _, projection = self.request(
+            "GET", f"/api/conversations/{conversation_id}"
+        )
+        self.assertEqual(status, 200, projection)
+        self.assertEqual(
+            projection["process"],
+            {
+                "pid": None,
+                "start_ticks": None,
+                "alive": False,
+                "lingering": False,
+                "since": None,
+            },
+        )
+
+    def test_interrupting_a_lingering_turn_signals_its_process_group(self) -> None:
+        conversation_id = self.create(key="linger-stop")["conversation_id"]
+        run_id = self.seed_lingering_process(conversation_id)
+        with (
+            mock.patch.object(
+                conversation_routes.active_chat_registry,
+                "has_live_process",
+                return_value=True,
+            ),
+            mock.patch.object(
+                conversation_routes, "_SIGNAL_GROUP"
+            ) as signal_group,
+        ):
+            status, _, receipt = self.request(
+                "POST",
+                f"/api/conversations/{conversation_id}/interruptions",
+                body={},
+                key="linger-interrupt",
+            )
+        self.assertEqual(status, 202, receipt)
+        self.assertEqual(receipt["run_id"], run_id)
+        signal_group.assert_called_once_with(4200, conversation_routes.signal.SIGINT)
+        with closing(self.connect()) as con:
+            events = con.execute(
+                "SELECT payload FROM conversation_events "
+                "WHERE run_id=? AND event_type='run.interrupt.requested'",
+                (run_id,),
+            ).fetchall()
+        self.assertEqual(len(events), 1)
+        self.assertEqual(
+            json.loads(events[0]["payload"]), {"lingering": True, "pid": 4242}
+        )
+
+    def test_interrupting_an_idle_chat_without_a_process_stays_terminal(self) -> None:
+        conversation_id = self.create(key="linger-dead")["conversation_id"]
+        self.seed_lingering_process(conversation_id)
+        with mock.patch.object(
+            conversation_routes.active_chat_registry,
+            "has_live_process",
+            return_value=False,
+        ):
+            status, _, error = self.request(
+                "POST",
+                f"/api/conversations/{conversation_id}/interruptions",
+                body={},
+                key="linger-dead-interrupt",
+            )
+        self.assertEqual(status, 409, error)
+        self.assertEqual(error["error"]["code"], "RUN_ALREADY_TERMINAL")
+
+    def test_creating_a_chat_names_the_browser_session_holding_the_shell(self) -> None:
+        holder = "cv_" + "b" * 32
+        with (
+            mock.patch.object(
+                conversation_routes, "_wait_for_cli_release", return_value="browser"
+            ),
+            mock.patch.object(
+                conversation_routes,
+                "_browser_sessions",
+                return_value=[
+                    {"pid": 4242, "conversation_id": holder, "lingering": True}
+                ],
+            ),
+        ):
+            status, _, error = self.request(
+                "POST",
+                "/api/conversations",
+                body={"shell_id": 1, "harness": "codex"},
+                key="browser-owned-shell",
+            )
+        self.assertEqual(status, 409, error)
+        self.assertEqual(error["error"]["code"], "SHELL_BUSY")
+        self.assertEqual(error["error"]["details"]["conversation_id"], holder)
+        self.assertEqual(error["error"]["details"]["pid"], 4242)
+        self.assertIn(holder, error["error"]["message"])
+
     def test_closed_sprint_conversation_never_reopens(self) -> None:
         conversation_id = self.seed_sprint_conversation()
         con = self.connect()

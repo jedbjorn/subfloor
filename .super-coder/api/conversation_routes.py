@@ -15,7 +15,9 @@ import http.client
 import io
 import json
 import math
+import os
 import re
+import signal
 import sys
 import time
 import uuid
@@ -41,6 +43,10 @@ from conversation_adapters import ADAPTER_TYPES
 
 # Server startup owns the ordinary active_database_path gate before routing.
 DB_PATH = instance_state.maintenance_database_path(ENGINE)
+
+# Injection seam for the one signal this module sends: SIGINT to a lingering
+# turn's process group.  Mirrors the reaper's ``signal_group`` constructor arg.
+_SIGNAL_GROUP = os.killpg
 
 _ALLOWED_HOST_SET = frozenset(("127.0.0.1", "localhost", "::1"))
 _BROWSER_HARNESSES = tuple(sorted(ADAPTER_TYPES))
@@ -398,6 +404,20 @@ _SPRINT_MANAGED_COLUMN = (
     " AND sp.lifecycle IN ('armed','paused')) AS sprint_managed"
 )
 
+# The registry row is the authority for "a native process still holds this
+# chat".  Joining it into the conversation read keeps the process projection at
+# zero extra queries; only the /proc identity check costs anything.
+_REGISTRY_PROCESS_COLUMNS = (
+    "reg.process_pid AS registry_pid,"
+    "reg.process_start_ticks AS registry_start_ticks,"
+    "reg.updated_at AS registry_updated_at,"
+)
+
+_REGISTRY_PROCESS_JOIN = (
+    " LEFT JOIN active_shell_chats reg"
+    " ON reg.shell_id=c.shell_id AND reg.chat_id=c.conversation_id"
+)
+
 _CLOSE_REQUESTED_AFTER_REOPEN = (
     "requested.event_type='conversation.close.requested' "
     "AND requested.sequence>COALESCE("
@@ -429,12 +449,42 @@ def _conversation_row(con, conversation_id: str, owner_user_id: int):
         " WHERE active.conversation_id=c.conversation_id "
         " AND active.state IN ('leased','starting','running') "
         " ORDER BY active.run_id DESC LIMIT 1) AS active_run_id,"
+        + _REGISTRY_PROCESS_COLUMNS
         + _SPRINT_MANAGED_COLUMN
         + " FROM conversations c JOIN shells s ON s.shell_id=c.shell_id "
-        "WHERE c.conversation_id=? AND c.owner_user_id=? "
+        + _REGISTRY_PROCESS_JOIN
+        + " WHERE c.conversation_id=? AND c.owner_user_id=? "
         f"AND c.harness IN ({_BROWSER_HARNESS_SQL})",
         (conversation_id, owner_user_id, *_BROWSER_HARNESSES),
     ).fetchone()
+
+
+def _process_projection(row) -> dict:
+    """Name the native process the registry still links to this chat.
+
+    ``lingering`` is the incident this exists for: a process that outlived the
+    turn the GUI already shows as finished.  Nothing alive stays nameless.
+    """
+    pid = row["registry_pid"]
+    start_ticks = row["registry_start_ticks"]
+    alive = pid is not None and start_ticks is not None and (
+        active_chat_registry.has_live_process(
+            active_chat_registry.ActiveChat(
+                int(row["shell_id"]),
+                row["conversation_id"],
+                row["state"],
+                int(pid),
+                int(start_ticks),
+            )
+        )
+    )
+    return {
+        "pid": int(pid) if pid is not None else None,
+        "start_ticks": int(start_ticks) if start_ticks is not None else None,
+        "alive": alive,
+        "lingering": alive and row["state"] not in ("queued", "running"),
+        "since": row["registry_updated_at"],
+    }
 
 
 def _conversation_projection(row) -> dict:
@@ -491,6 +541,7 @@ def _conversation_projection(row) -> dict:
         "closed_at": row["closed_at"],
         "close_requested_at": row["close_requested_at"],
         "sprint_managed": bool(row["sprint_managed"]),
+        "process": _process_projection(row),
         "version": int(row["version"]),
     }
 
@@ -772,6 +823,37 @@ def _live_shell_session(shell) -> str | None:
     return run_mod.shell_liveness.session_state(
         shell["shortname"] or "",
         snapshot,
+    )
+
+
+def _browser_sessions(shell) -> list[dict]:
+    """The browser-owned processes liveness attributes to one shell."""
+    snapshot = run_mod.shell_liveness.compute()
+    sessions = snapshot.get("browser_sessions") or {}
+    return list(sessions.get(shell["shortname"] or "") or ())
+
+
+def _shell_busy_error(shell, shell_id: int, state: str, action: str) -> ApiError:
+    """Refuse an occupied shell by name: a bare SHELL_BUSY offers no way out."""
+    details = {"shell_id": shell_id, "state": state}
+    session = next(iter(_browser_sessions(shell)), None) if state == "browser" else None
+    if session is None:
+        return ApiError(
+            409,
+            "SHELL_BUSY",
+            f"shell {shell['shortname']!r} has a live CLI session; "
+            f"close it before {action}",
+            details,
+        )
+    details["conversation_id"] = session.get("conversation_id")
+    details["pid"] = session.get("pid")
+    return ApiError(
+        409,
+        "SHELL_BUSY",
+        f"shell {shell['shortname']!r} is held by browser chat "
+        f"{details['conversation_id']} (pid {details['pid']}); interrupt or "
+        f"close that chat before {action}",
+        details,
     )
 
 
@@ -1107,12 +1189,8 @@ def _create_conversation(con, operator: dict, headers, body: dict):
     if active_chat_registry.get(con, shell_id) is None:
         live_state = _wait_for_cli_release(shell)
         if live_state is not None:
-            raise ApiError(
-                409,
-                "SHELL_BUSY",
-                f"shell {shell['shortname']!r} has a live CLI session; "
-                "close it before opening a browser chat",
-                {"shell_id": shell_id, "state": live_state},
+            raise _shell_busy_error(
+                shell, shell_id, live_state, "opening a browser chat"
             )
 
     conversation_id = "cv_" + uuid.uuid4().hex
@@ -1156,12 +1234,8 @@ def _create_conversation(con, operator: dict, headers, body: dict):
         if active_chat_registry.get(con, shell_id) is None:
             live_state = _live_shell_session(current_shell)
             if live_state is not None:
-                raise ApiError(
-                    409,
-                    "SHELL_BUSY",
-                    f"shell {current_shell['shortname']!r} has a live CLI session; "
-                    "close it before opening a browser chat",
-                    {"shell_id": shell_id, "state": live_state},
+                raise _shell_busy_error(
+                    current_shell, shell_id, live_state, "opening a browser chat"
                 )
 
         active = active_chat_registry.get(con, shell_id)
@@ -1329,8 +1403,11 @@ def _list_conversations(con, operator: dict, query):
         " AND " + _CLOSE_REQUESTED_AFTER_REOPEN +
         " ORDER BY requested.sequence DESC LIMIT 1"
         ") END AS close_requested_at,"
+        + _REGISTRY_PROCESS_COLUMNS
         + _SPRINT_MANAGED_COLUMN
-        + " FROM conversations c JOIN shells s ON s.shell_id=c.shell_id WHERE "
+        + " FROM conversations c JOIN shells s ON s.shell_id=c.shell_id"
+        + _REGISTRY_PROCESS_JOIN
+        + " WHERE "
         + " AND ".join(clauses)
         + " ORDER BY c.last_activity_at DESC,c.conversation_id DESC LIMIT ?",
         (*params, limit + 1),
@@ -1672,6 +1749,31 @@ def _request_interrupt(run_id: int, *, replay: bool) -> None:
         raise ApiError(503, exc.code, exc.detail) from exc
 
 
+def _lingering_run(con, conversation, requested_run: int | None):
+    """The finished-looking run whose process the registry still names alive."""
+    process = _process_projection(conversation)
+    if not process["lingering"]:
+        return None
+    clauses = ["conversation_id=?", "process_pid=?", "process_start_ticks=?"]
+    params: list = [
+        conversation["conversation_id"],
+        process["pid"],
+        process["start_ticks"],
+    ]
+    if requested_run is not None:
+        clauses.append("run_id=?")
+        params.append(requested_run)
+    row = con.execute(
+        "SELECT run_id,process_group_id FROM conversation_runs WHERE "
+        + " AND ".join(clauses)
+        + " ORDER BY run_id DESC LIMIT 1",
+        params,
+    ).fetchone()
+    if row is None or row["process_group_id"] is None:
+        return None
+    return int(row["run_id"]), int(row["process_group_id"]), process["pid"]
+
+
 def _interrupt(con, operator: dict, conversation_id: str, headers, body: dict):
     _only_fields(body, {"run_id"})
     key = _idempotency_key(headers)
@@ -1680,8 +1782,11 @@ def _interrupt(con, operator: dict, conversation_id: str, headers, body: dict):
     request_hash = _request_hash(normalized)
 
     replay = False
+    lingering_group = None
     with db_driver.write_transaction(con, "conversation.interrupt.create"):
-        _require_conversation(con, conversation_id, operator["user_id"])
+        conversation = _require_conversation(
+            con, conversation_id, operator["user_id"]
+        )
         existing = con.execute(
             "SELECT message_id,request_hash,body FROM conversation_messages "
             "WHERE conversation_id=? AND idempotency_key=?",
@@ -1714,13 +1819,20 @@ def _interrupt(con, operator: dict, conversation_id: str, headers, body: dict):
                 + " ORDER BY run_id DESC LIMIT 1",
                 params,
             ).fetchone()
-            if active is None:
-                raise ApiError(
-                    409,
-                    "RUN_ALREADY_TERMINAL",
-                    "no matching active run can be interrupted",
-                )
-            run_id = int(active["run_id"])
+            lingering_pid = None
+            if active is not None:
+                run_id = int(active["run_id"])
+            else:
+                # A finished-looking turn whose child still runs is idle, not
+                # terminal: the process is the source of truth for "running".
+                lingering = _lingering_run(con, conversation, requested_run)
+                if lingering is None:
+                    raise ApiError(
+                        409,
+                        "RUN_ALREADY_TERMINAL",
+                        "no matching active run can be interrupted",
+                    )
+                run_id, lingering_group, lingering_pid = lingering
             audit_body = json.dumps(
                 {"kind": "interrupt", "run_id": run_id},
                 separators=(",", ":"),
@@ -1746,8 +1858,24 @@ def _interrupt(con, operator: dict, conversation_id: str, headers, body: dict):
                 "version=version+1 WHERE conversation_id=?",
                 (conversation_id,),
             )
+            if lingering_group is not None:
+                _append_event(
+                    con,
+                    conversation_id,
+                    "run.interrupt.requested",
+                    {"lingering": True, "pid": lingering_pid},
+                    run_id=run_id,
+                )
             audit = _message_projection(_message_row(con, message_id))
-    _request_interrupt(run_id, replay=replay)
+    if lingering_group is not None:
+        try:
+            _SIGNAL_GROUP(lingering_group, signal.SIGINT)
+        except ProcessLookupError:
+            # The group exited between the identity check and the signal —
+            # the requested end state, already reached.
+            pass
+    else:
+        _request_interrupt(run_id, replay=replay)
     return _json(
         202,
         {

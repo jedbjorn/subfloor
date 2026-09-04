@@ -397,6 +397,14 @@ body.interface-view main {
 .chat-state.state-error { color: #ef7d86; border-color: rgba(239,125,134,.45); }
 .chat-state.state-idle { color: var(--ok); border-color: rgba(76,175,125,.4); }
 .chat-state.state-closed { opacity: .6; }
+/* A lingering process outranks the chat's own state: it is the live fact. */
+.chat-state.lingering {
+  color: var(--warn); border-color: rgba(212,145,74,.45); text-transform: none;
+}
+.chat-busy-open {
+  background: none; border: 0; padding: 0; font: inherit; color: var(--accent);
+  text-decoration: underline; cursor: pointer;
+}
 .chat-pane {
   min-width: 0; min-height: 0; display: grid;
   grid-template-rows: auto minmax(0, 1fr) auto; background: var(--panel2);

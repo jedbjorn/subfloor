@@ -2888,6 +2888,27 @@ function chatHash(shortname, conversationId = "") {
     + (conversationId ? `/${encodeURIComponent(conversationId)}` : "");
 }
 
+// A bare SHELL_BUSY leaves the operator hunting for the pid by hand. When the
+// API names the chat holding the shell, the toast links straight to it.
+function chatBusyToast(error, shortname) {
+  const held = error.details || {};
+  if (error.code !== "SHELL_BUSY" || !held.conversation_id) {
+    toast(`${error.code}: ${error.message}`);
+    return;
+  }
+  const open = el("button", {
+    className: "chat-busy-open",
+    type: "button",
+    textContent: "open that chat",
+  });
+  open.onclick = () => {
+    location.hash = chatHash(shortname, held.conversation_id);
+  };
+  toast(el("span", {},
+    `${error.code}: ${held.conversation_id} (pid ${held.pid}) still holds this shell — `,
+    open));
+}
+
 function chatModeHash(shortname, conversationId, mode = "chat") {
   return chatHash(shortname, conversationId)
     + (mode === "diff" ? "/diff" : "");
@@ -3048,13 +3069,19 @@ function chatWorkingDots() {
     el("span", {}, "."));
 }
 
-function chatStatePill(state) {
-  const label = {
-    queued: "queued", running: "working", waiting: "waiting",
-    error: "failed", idle: "idle", closed: "closed",
-  }[state] || state;
+// `process` is the conversation projection's process block. A lingering child
+// outlived the turn the transcript already shows as finished — the pill names
+// its pid so nothing alive stays nameless.
+function chatStatePill(state, process) {
+  const lingering = Boolean(process?.lingering);
+  const label = lingering
+    ? `process still running · pid ${process.pid}`
+    : ({
+      queued: "queued", running: "working", waiting: "waiting",
+      error: "failed", idle: "idle", closed: "closed",
+    }[state] || state);
   const pill = el("span", {
-    className: `chat-state state-${state || "idle"}`,
+    className: `chat-state state-${state || "idle"}${lingering ? " lingering" : ""}`,
   });
   if (state !== "running") {
     pill.textContent = label;
@@ -3098,11 +3125,10 @@ function chatPaintHistoryItem(item, conversation) {
   item.context.textContent =
     `${chatStartedLabel(conversation)} | ${chatModelLabel(conversation)}`;
   item.name.textContent = chatConversationName(conversation);
-  const nextState = conversation.state || "idle";
-  if (!item.state.classList.contains(`state-${nextState}`)) {
-    const state = chatStatePill(nextState);
-    item.state.replaceWith(state);
-    item.state = state;
+  const next = chatStatePill(conversation.state || "idle", conversation.process);
+  if (item.state.className !== next.className) {
+    item.state.replaceWith(next);
+    item.state = next;
   }
   chatPaintStar(item.star, Boolean(conversation.starred));
 }
@@ -3242,7 +3268,7 @@ function chatOpenStream(
     "conversation.reopened",
     "message.accepted", "session.started", "run.started",
     "assistant.delta", "tool.started", "tool.completed", "permission.requested",
-    "input.requested", "usage", "run.completed", "run.failed",
+    "input.requested", "usage", "run.completed", "run.resumed", "run.failed",
     "run.interrupt.requested", "run.interrupted", "run.unknown",
   ];
   for (const type of types) {
@@ -4191,7 +4217,7 @@ async function chatRenderNew(host, shell, defaults, catalog) {
       const conversation = await chatCreateConversation(shell, body);
       location.hash = chatHash(shell.shortname, conversation.conversation_id);
     } catch (error) {
-      toast(`${error.code}: ${error.message}`);
+      chatBusyToast(error, shell.shortname);
       submit.disabled = false;
       submit.textContent = "Start chat";
     }
@@ -4854,7 +4880,11 @@ async function chatRenderOpen(
       || closing || (closed && !reopenable);
     send.disabled = Boolean(unavailableReason)
       || closing || (closed && !reopenable);
-    stop.disabled = conversation.state !== "running" || closing || Boolean(stopRequest);
+    // A lingering child is still working even though the turn reads finished,
+    // so Stop stays the way out of it.
+    const lingering = Boolean(conversation.process?.lingering);
+    stop.disabled = (conversation.state !== "running" && !lingering)
+      || closing || Boolean(stopRequest);
     stop.textContent = stopRequest ? "Stopping…" : "Stop";
     headerStop.disabled = stop.disabled;
     headerStop.textContent = stop.textContent;
@@ -4974,7 +5004,8 @@ async function chatRenderOpen(
   }
   send.onclick = submit;
   stop.onclick = async () => {
-    if (conversation.state !== "running") return;
+    if (conversation.state !== "running" && !conversation.process?.lingering)
+      return;
     if (!stopRequest) stopRequest = { key: requestKey() };
     paint();
     try {
@@ -5150,6 +5181,9 @@ async function chatRenderOpen(
     transcriptState.lastSequence = sequence;
     if (message && type === "run.started") message.state = "running";
     if (message && type === "run.completed") message.state = "completed";
+    // The lingering child kept working past its terminal: the broker opened a
+    // continuation run, so the finished-looking turn goes back to running.
+    if (message && type === "run.resumed") message.state = "running";
     if (message && ["run.failed", "run.unknown"].includes(type))
       message.state = "failed";
     if (message && type === "run.interrupted") message.state = "cancelled";
@@ -5169,6 +5203,10 @@ async function chatRenderOpen(
       if (event.run_id != null)
         transcriptState.assistantSegments.delete(event.run_id);
       if (onWakeDelivered) onWakeDelivered(conversation.shell.shell_id);
+    }
+    if (type === "run.resumed") {
+      conversation.state = "running";
+      conversation.active_run_id = event.run_id;
     }
     if (type === "conversation.updated" || type === "conversation.renamed")
       Object.assign(conversation, event.payload || {});
@@ -5390,7 +5428,7 @@ async function renderInterface(root) {
       const conversation = await chatCreateConversation(shell);
       location.hash = chatHash(shell.shortname, conversation.conversation_id);
     } catch (error) {
-      toast(`${error.code}: ${error.message}`);
+      chatBusyToast(error, shell.shortname);
       newChat.disabled = false;
       configure.disabled = false;
       newChat.textContent = "＋ Chat";
@@ -5473,7 +5511,7 @@ async function renderInterface(root) {
     });
     const context = el("span", { className: "chat-history-context" });
     const name = el("span", { className: "chat-history-name" });
-    const state = chatStatePill(conversation.state);
+    const state = chatStatePill(conversation.state, conversation.process);
     const star = el("button", {
       className: "chat-history-star",
       type: "button",
