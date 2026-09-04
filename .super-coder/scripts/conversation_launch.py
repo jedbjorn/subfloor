@@ -221,15 +221,20 @@ class ConversationLaunchPreparer:
             state = shell_liveness.session_state(shortname, snapshot)
             if state != "browser":
                 return state, None
-            sessions = (snapshot.get("browser_sessions") or {}).get(shortname) or ()
+            sessions = shell_liveness.browser_sessions(shortname, snapshot)
             foreign = [
                 session
                 for session in sessions
                 if session.get("conversation_id") != broker_run.conversation_id
             ]
-            if not foreign:
+            if foreign:
+                return state, foreign[0]
+            if not sessions:
                 return None, None
-            return state, foreign[0]
+            # This chat's own previous turn is still running. Two print-mode
+            # processes on one native session file is the hazard, so the
+            # follow-up waits for exit or Stop; it never dispatches over it.
+            return "lingering", sessions[0]
 
         def wait_for_free_slot() -> tuple[str | None, dict | None]:
             state, session = occupying_state()
@@ -240,16 +245,27 @@ class ConversationLaunchPreparer:
                 state, session = occupying_state()
             return state, session
 
-        def busy_detail(state: str, session: dict | None, tail: str) -> str:
+        def refusal(
+            state: str, session: dict | None, tail: str
+        ) -> ConversationLaunchError:
             if session is None:
-                return (
+                return ConversationLaunchError(
+                    "SHELL_BUSY",
                     f"shell {shortname!r} already has a live CLI session "
-                    f"({state}); {tail}"
+                    f"({state}); {tail}",
                 )
-            return (
+            if state == "lingering":
+                return ConversationLaunchError(
+                    "SHELL_LINGERING",
+                    f"this chat's previous turn is still running "
+                    f"(pid {session.get('pid')}); wait for it to finish or "
+                    f"press Stop, then send again",
+                )
+            return ConversationLaunchError(
+                "SHELL_BUSY",
                 f"shell {shortname!r} is held by browser chat "
                 f"{session.get('conversation_id')} (pid {session.get('pid')}); "
-                f"{tail}"
+                f"{tail}",
             )
 
         # Native harnesses can emit their terminal result just before their
@@ -257,13 +273,10 @@ class ConversationLaunchPreparer:
         # short drain window; a genuinely occupied CLI slot remains a refusal.
         state, session = wait_for_free_slot()
         if state is not None:
-            raise ConversationLaunchError(
-                "SHELL_BUSY",
-                busy_detail(
-                    state,
-                    session,
-                    "interrupt or close it before starting a browser turn",
-                ),
+            raise refusal(
+                state,
+                session,
+                "interrupt or close it before starting a browser turn",
             )
 
         try:
@@ -308,14 +321,11 @@ class ConversationLaunchPreparer:
         # before the adapter can send the prompt.
         state, session = wait_for_free_slot()
         if state is not None:
-            raise ConversationLaunchError(
-                "SHELL_BUSY",
-                busy_detail(
-                    state,
-                    session,
-                    "it was acquired during browser preparation, so no prompt "
-                    "was dispatched",
-                ),
+            raise refusal(
+                state,
+                session,
+                "it was acquired during browser preparation, so no prompt "
+                "was dispatched",
             )
 
         expected = broker_run.worktree.resolve()

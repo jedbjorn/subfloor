@@ -511,31 +511,37 @@ def browser_snapshot(*sessions: dict) -> dict:
     }
 
 
-def test_preparer_dispatches_over_its_own_lingering_browser_process(
+def test_preparer_waits_on_its_own_lingering_browser_process(
     launch_case, monkeypatch
 ):
+    """Two print-mode processes on one native session file is the hazard:
+    the chat's own lingering turn refuses with SHELL_LINGERING, never
+    SHELL_BUSY, and never dispatches over it."""
     db_path, worktree = launch_case
+    called = False
+
+    def prepare(**_kwargs):
+        nonlocal called
+        called = True
+
     monkeypatch.setattr(
         shell_liveness, "session_state", lambda shortname, snap: "browser"
     )
     preparer = ConversationLaunchPreparer(
         db_path,
-        prepare_launch=lambda **_: SimpleNamespace(
-            cwd=str(worktree),
-            archive_id=42,
-            harness="codex",
-            model="gpt-test",
-            effort="high",
-            env={},
-        ),
+        prepare_launch=prepare,
         liveness=lambda: browser_snapshot(
             {"pid": 4242, "conversation_id": "cv_" + "a" * 32, "lingering": True}
         ),
         liveness_retries=0,
     )
-    _context, archive_id = preparer(make_run(worktree))
+    with pytest.raises(ConversationLaunchError) as caught:
+        preparer(make_run(worktree))
 
-    assert archive_id == 42
+    assert caught.value.code == "SHELL_LINGERING"
+    assert "pid 4242" in caught.value.detail
+    assert "Stop" in caught.value.detail
+    assert not called
 
 
 def test_preparer_names_a_foreign_browser_chat_holding_the_shell(

@@ -621,15 +621,11 @@ def _reopen_conversation(con, operator: dict, conversation) -> list[str]:
     if active is None:
         live_state = _live_shell_session(shell)
         if live_state is not None:
-            raise ApiError(
-                409,
-                "SHELL_BUSY",
-                f"shell {shell['shortname']!r} has a live CLI session; "
-                "close it before reopening a browser chat",
-                {
-                    "shell_id": int(conversation["shell_id"]),
-                    "state": live_state,
-                },
+            raise _shell_busy_error(
+                shell,
+                int(conversation["shell_id"]),
+                live_state,
+                "reopening a browser chat",
             )
     try:
         closed = active_chat_registry.close_active(
@@ -829,8 +825,11 @@ def _live_shell_session(shell) -> str | None:
 def _browser_sessions(shell) -> list[dict]:
     """The browser-owned processes liveness attributes to one shell."""
     snapshot = run_mod.shell_liveness.compute()
-    sessions = snapshot.get("browser_sessions") or {}
-    return list(sessions.get(shell["shortname"] or "") or ())
+    # Liveness keys sessions by worktree directory; the accessor matches the
+    # shortname case-insensitively, the way orphan_split does.
+    return list(
+        run_mod.shell_liveness.browser_sessions(shell["shortname"] or "", snapshot)
+    )
 
 
 def _shell_busy_error(shell, shell_id: int, state: str, action: str) -> ApiError:
