@@ -62,6 +62,15 @@ claim whose process is gone is `expected_absent`, which is not `available`:
 the difference between "nobody launched anything here" and "a launch claimed
 this shell and its worker is missing".
 
+Browser turns: the engine launches its own harness process for a GUI
+conversation — a child of the API server, cwd in the shell's worktree, i.e.
+indistinguishable from a CLI session by cwd alone. Joined against
+`active_shell_chats` and `conversation_runs` by pid + start ticks it becomes a
+NAMED hold (`browser_conversation`, `browser_sessions`, and `session_state`'s
+'browser'), so a consumer can point at the conversation instead of refusing the
+shell with nothing to show. `lingering` marks the process whose run already
+finished — alive past its own terminal.
+
 Non-Linux: /proc is absent; compute() returns supported=False. Fall back to
 `lsof -a +D <worktree>` / `ps`. The substrate host is Linux.
 
@@ -86,6 +95,10 @@ DB_PATH = instance_state.active_database_path(ENGINE)
 PROC = Path("/proc")
 
 _FALLBACK_BINS = {"claude", "codex", "opencode", "vibe", "kimi"}
+
+# A conversation run in one of these states is finished; a process still holding
+# its identity is LINGERING — alive after its run's terminal.
+_TERMINAL_RUN_STATES = ("succeeded", "failed", "cancelled", "unknown")
 
 
 def harness_binaries() -> set[str]:
@@ -333,6 +346,55 @@ def _launch_claims() -> dict[str, dict]:
     return {r["shortname"].lower(): dict(r) for r in rows}
 
 
+def _browser_processes() -> dict[tuple[int, int], dict]:
+    """(pid, start_ticks) → {conversation_id, lingering} for every process the
+    engine itself launched for a browser conversation.
+
+    A GUI turn is a harness child of the API server whose cwd is the shell's
+    worktree, so the scan above counts it as an anonymous CLI session and every
+    consumer refuses the shell with nothing to name. The registry (the one
+    active chat per shell) and the run rows (any state — a LINGERING process
+    belongs to a run that already finished) both carry the pid + start_ticks
+    identity, which is what makes the answer safe against a recycled pid.
+
+    Best-effort exactly like _launch_claims: no DB, a locked DB, or a fork
+    without these tables all mean "nothing is browser-owned", and the scan
+    reads as it did before."""
+    if not DB_PATH.exists() or DB_PATH.stat().st_size == 0:
+        return {}
+    con = None
+    try:
+        con = sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True, timeout=2)
+        con.row_factory = sqlite3.Row
+        rows = con.execute(
+            "SELECT chat_id AS conversation_id, process_pid AS pid, "
+            "process_start_ticks AS start_ticks, NULL AS state "
+            "FROM active_shell_chats WHERE process_pid IS NOT NULL "
+            "UNION ALL "
+            "SELECT conversation_id, process_pid, process_start_ticks, state "
+            "FROM conversation_runs WHERE process_pid IS NOT NULL").fetchall()
+    except sqlite3.Error:
+        return {}
+    finally:
+        if con is not None:
+            con.close()
+    tagged: dict[tuple[int, int], dict] = {}
+    working: set[tuple[int, int]] = set()
+    for r in rows:
+        key = (int(r["pid"]), int(r["start_ticks"]))
+        entry = tagged.setdefault(key, {"conversation_id": str(r["conversation_id"]),
+                                        "lingering": False})
+        if r["state"] is None:
+            continue
+        if r["state"] in _TERMINAL_RUN_STATES:
+            entry["lingering"] = True
+        else:
+            working.add(key)         # a live run on this pid — not lingering
+    for key in working:
+        tagged[key]["lingering"] = False
+    return tagged
+
+
 def claim_live(claim: dict) -> bool:
     """Is the process a launch claim names still the one that was launched, and
     does it still hold that shell's worktree?
@@ -384,6 +446,7 @@ def compute() -> dict:
     labels = _shell_labels()
     claims = _launch_claims()
     live_claims = {name: c for name, c in claims.items() if claim_live(c)}
+    browser = _browser_processes()
 
     # First pass: every harness process and its raw pid/comm (cwd resolved next).
     harness_pids: set[int] = set()
@@ -404,6 +467,7 @@ def compute() -> dict:
 
     processes: list[dict] = []
     worktree_sessions: dict[str, list[int]] = {}
+    browser_sessions_by_shell: dict[str, list[dict]] = {}
     indeterminate_pids: list[int] = []
     admin_root_pids: list[int] = []
 
@@ -419,10 +483,14 @@ def compute() -> dict:
         except ValueError:
             continue                                          # another repo — ignore
         parts = rel.parts
+        tag = browser.get((pid, _start_ticks(pid))) if browser else None
         if len(parts) >= 2 and parts[0] == ".sc-worktrees":
             shortname = parts[1]                              # worktree dir = shortname.lower()
             region = "worktree"
             worktree_sessions.setdefault(shortname, []).append(pid)
+            if tag:
+                browser_sessions_by_shell.setdefault(shortname, []).append(
+                    {"pid": pid, **tag})
         else:
             shortname = None                                  # repo root (or a subdir of it)
             region = "root"
@@ -441,6 +509,9 @@ def compute() -> dict:
             "claimed": live_claims.get(shortname or "", {}).get("pid") == pid,
             "orphaned": (None if pid == self_pid
                          else _orphan_verdict(pid)),
+            # The engine's own browser turn, named rather than anonymous.
+            "browser_conversation": (tag or {}).get("conversation_id"),
+            "lingering": bool((tag or {}).get("lingering")),
         })
 
     active_other = sorted(worktree_sessions)
@@ -457,6 +528,7 @@ def compute() -> dict:
         "admin_presence": admin_presence,
         "processes": processes,
         "worktree_sessions": worktree_sessions,
+        "browser_sessions": browser_sessions_by_shell,
         "active_other_shells": active_other,
         "admin_root_pids": admin_root_pids,
         "indeterminate": indeterminate,
@@ -494,18 +566,38 @@ def orphan_split(shortname: str, snap: dict) -> "tuple[list[int], list[int]]":
              if p.get("orphaned") and not p.get("claimed")])
 
 
+def browser_sessions(shortname: str, snap: dict) -> list[dict]:
+    """This shell's browser-owned worktree processes —
+    [{pid, conversation_id, lingering}] — for a caller that must NAME them.
+    The snapshot keys these by worktree directory; shortnames are compared
+    case-insensitively, exactly as orphan_split does."""
+    for name, sessions in snap.get("browser_sessions", {}).items():
+        if name.lower() == shortname.lower():
+            return sessions
+    return []
+
+
 def session_state(shortname: str, snap: dict) -> "str | None":
     """One shell's slot verdict, the shape the picker annotation needs:
-    'busy' (a working session holds the worktree), 'orphan' (EVERY session pid
-    is an orphan — closed terminal / dead parent still holding the slot), or
-    None (dormant, or liveness unsupported). A single live session among
-    orphans wins: someone is working there → 'busy'."""
+    'busy' (a working CLI session holds the worktree), 'browser' (every live
+    session is a turn the engine itself launched for a GUI conversation),
+    'orphan' (EVERY session pid is an orphan — closed terminal / dead parent
+    still holding the slot), or None (dormant, or liveness unsupported). A
+    single live session among orphans wins: someone is working there.
+
+    'browser' is not an all-clear — the slot is still held — but it is a
+    NAMED hold: the caller can point at the conversation and the pid, and the
+    operator has a way out that does not involve hunting a pid by hand."""
     if not snap.get("supported"):
         return None
     pids, orphans = orphan_split(shortname, snap)
     if not pids:
         return None
-    return "orphan" if len(orphans) == len(pids) else "busy"
+    if len(orphans) == len(pids):
+        return "orphan"
+    live = set(pids) - set(orphans)
+    owned = {s["pid"] for s in browser_sessions(shortname, snap)}
+    return "browser" if live <= owned else "busy"
 
 
 def record_state(shortname: str, snap: dict) -> "str | None":

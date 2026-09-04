@@ -37,6 +37,7 @@ from conversation_adapters import (  # noqa: E402
     adapter_for,
 )
 from conversation_adapters import base as base_adapter
+from conversation_adapters import claude as claude_adapter
 from conversation_adapters import codex as codex_adapter
 from conversation_adapters import opencode as opencode_adapter
 from conversation_adapters.base import SubprocessRunner
@@ -1095,24 +1096,32 @@ class ConversationAdapterTest(unittest.TestCase):
                 "cwd": str(cwd_rows[0]),
             }
         ]
+        # A Claude session file records assistant/user turns, never a
+        # ``result``: a trailing tool call is a turn still working and a
+        # trailing text block is the reply that ended it.
         middle_cwds = cwd_rows[1:-1] if terminal else cwd_rows[1:]
         rows.extend(
             {
                 "type": "assistant",
                 "session_id": session_ref,
                 "cwd": str(stored_cwd),
-                "message": {"content": "working"},
+                "message": {
+                    "content": [
+                        {"type": "tool_use", "id": "tool-1", "name": "Bash"}
+                    ]
+                },
             }
             for stored_cwd in middle_cwds
         )
         if terminal:
             rows.append(
                 {
-                    "type": "result",
-                    "subtype": "success",
+                    "type": "assistant",
                     "session_id": session_ref,
                     "cwd": str(cwd_rows[-1]),
-                    "result": "done",
+                    "message": {
+                        "content": [{"type": "text", "text": "done"}]
+                    },
                 }
             )
         path.write_text("".join(json.dumps(row) + "\n" for row in rows))
@@ -1263,6 +1272,80 @@ class ConversationAdapterTest(unittest.TestCase):
         self.assertEqual(usage[0].payload["tokens"]["input_tokens"], 10)
         self.assertIn(
             "hello",
+            [
+                event.payload.get("text")
+                for event in events
+                if event.type == "assistant.delta"
+            ],
+        )
+
+    def test_claude_reads_past_a_result_and_the_last_one_wins(self) -> None:
+        """A result is the harness reporting a turn, not the process exiting.
+
+        The stream keeps reading; a later result supersedes the earlier one,
+        EOF waits for the child, and no 'stream ended' failure follows a
+        terminal that was observed.
+        """
+        adapter, _runner = self.build("claude")
+        session_ref = "22222222-3333-4444-8555-666666666666"
+        rows = [
+            {"type": "system", "subtype": "init", "session_id": session_ref},
+            {
+                "type": "result",
+                "subtype": "success",
+                "session_id": session_ref,
+                "result": "background task",
+                "num_turns": 1,
+                "stop_reason": "end_turn",
+            },
+            {
+                "type": "stream_event",
+                "session_id": session_ref,
+                "event": {
+                    "type": "content_block_delta",
+                    "delta": {"type": "text_delta", "text": "the real turn"},
+                },
+            },
+            {
+                "type": "result",
+                "subtype": "success",
+                "session_id": session_ref,
+                "result": "the real turn",
+                "num_turns": 3,
+                "stop_reason": "end_turn",
+            },
+        ]
+        process = FakeClaudeProcess(session_ref)
+        process.stdout = io.StringIO(
+            "".join(json.dumps(row) + "\n" for row in rows)
+        )
+        turn = NativeTurn(
+            harness="claude",
+            session_ref=session_ref,
+            run_ref="claude-test",
+            worktree=self.root,
+            process_ref=str(process.pid),
+            metadata={"resumed": True},
+            opaque=process,
+        )
+
+        events = list(adapter.stream(turn))
+
+        terminals = [
+            event for event in events if event.type in base_adapter.TERMINAL_EVENTS
+        ]
+        self.assertEqual([event.type for event in terminals], ["run.completed"] * 2)
+        self.assertIs(terminals[-1], events[-1])
+        self.assertEqual(events[-1].payload["result"], "the real turn")
+        self.assertEqual(turn.metadata["terminal"], "run.completed")
+        self.assertEqual(turn.metadata["returncode"], 0)
+        self.assertEqual(process.returncode, 0)
+        self.assertNotIn(
+            "stream ended without a terminal result",
+            [event.payload.get("error") for event in events],
+        )
+        self.assertIn(
+            "the real turn",
             [
                 event.payload.get("text")
                 for event in events
@@ -2381,6 +2464,237 @@ class ConversationAdapterTest(unittest.TestCase):
         self.assertEqual(cwd, self.root)
         self.assertEqual(argv[argv.index("--resume") + 1], session_ref)
         self.assertNotIn("--session-id", argv)
+
+    def claude_entry(self, session_ref: str, *blocks: dict) -> str:
+        kind = (
+            "user"
+            if blocks and blocks[0].get("type") == "tool_result"
+            else "assistant"
+        )
+        return json.dumps(
+            {
+                "type": kind,
+                "session_id": session_ref,
+                "cwd": str(self.root),
+                "message": {"content": list(blocks)},
+            }
+        )
+
+    def test_claude_launch_records_the_transcript_position_at_spawn(self) -> None:
+        adapter, _runner = self.build("claude")
+        started = adapter.start(self.context, "hello")
+        path = adapter._session_path(started.session_ref, self.root)
+
+        self.assertEqual(started.metadata["transcript_path"], str(path))
+        self.assertEqual(started.metadata["transcript_offset"], 0)
+
+        self.write_claude_session(adapter, started.session_ref)
+        resumed = adapter.resume(started.session_ref, self.context, "again")
+
+        self.assertEqual(
+            resumed.metadata["transcript_offset"],
+            path.stat().st_size,
+        )
+
+    def test_claude_attach_tails_a_growing_transcript_to_its_reply(self) -> None:
+        session_ref = "22222222-2222-4222-8222-222222222222"
+        adapter, _runner = self.build("claude")
+        adapter.attach_poll_seconds = 0.25
+        path = adapter._session_path(session_ref, self.root)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        # Everything before the offset belongs to an earlier turn.
+        path.write_text(
+            self.claude_entry(session_ref, {"type": "text", "text": "earlier"})
+            + "\n"
+        )
+        offset = path.stat().st_size
+        tool_use = self.claude_entry(
+            session_ref,
+            {"type": "tool_use", "id": "tool-9", "name": "Bash"},
+        )
+        tool_result = self.claude_entry(
+            session_ref,
+            {"type": "tool_result", "tool_use_id": "tool-9", "is_error": False},
+        )
+        reply = self.claude_entry(
+            session_ref,
+            {"type": "thinking", "thinking": "secret"},
+            {"type": "text", "text": "final answer"},
+        )
+        alive = [True]
+        # Each poll interval writes the next chunk; the last one ends the
+        # process. The middle chunk deliberately stops mid-line.
+        steps = [
+            lambda: path.write_text(
+                path.read_text() + tool_use + "\n" + tool_result[:20]
+            ),
+            lambda: path.write_text(
+                path.read_text() + tool_result[20:] + "\n" + reply + "\n"
+            ),
+            lambda: alive.clear(),
+        ]
+        adapter.sleep = lambda seconds: (
+            self.assertEqual(seconds, 0.25),
+            steps.pop(0)(),
+        )
+        turn = NativeTurn(
+            harness="claude",
+            session_ref=session_ref,
+            run_ref="claude-attach",
+            worktree=self.root,
+            metadata={
+                "transcript_path": str(path),
+                "transcript_offset": offset,
+                "process_pid": 4321,
+                "process_start_ticks": 99,
+                "process_group_id": 4321,
+            },
+        )
+
+        with mock.patch.object(
+            claude_adapter.active_chat_registry,
+            "process_identity",
+            side_effect=lambda ref: (4321, 99) if alive else (None, None),
+        ):
+            events = list(adapter.attach(turn))
+
+        self.assertEqual(
+            [(event.type, event.payload) for event in events],
+            [
+                (
+                    "session.started",
+                    {
+                        "session_ref": session_ref,
+                        "resumed": True,
+                        "attached": True,
+                    },
+                ),
+                ("run.started", {"status": "running"}),
+                ("tool.started", {"tool_ref": "tool-9", "name": "Bash"}),
+                ("tool.completed", {"tool_ref": "tool-9", "status": "completed"}),
+                ("assistant.delta", {"text": "final answer"}),
+                (
+                    "run.completed",
+                    {"status": "completed", "result": "final answer"},
+                ),
+            ],
+        )
+        self.assertEqual(steps, [])
+
+    def test_claude_attach_reports_an_exit_with_no_reply(self) -> None:
+        session_ref = "33333333-3333-4333-8333-333333333333"
+        adapter, _runner = self.build("claude")
+        path = adapter._session_path(session_ref, self.root)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("")
+        turn = NativeTurn(
+            harness="claude",
+            session_ref=session_ref,
+            run_ref="claude-attach",
+            worktree=self.root,
+            metadata={
+                "transcript_path": str(path),
+                "transcript_offset": 0,
+                "process_pid": 4321,
+                "process_start_ticks": 99,
+            },
+        )
+
+        with mock.patch.object(
+            claude_adapter.active_chat_registry,
+            "process_identity",
+            return_value=(None, None),
+        ), self.assertRaisesRegex(AdapterError, "HARNESS_ATTACH_UNSUPPORTED"):
+            next(iter(adapter.attach(turn)))
+
+        identities = iter([(4321, 99), (None, None)])
+        with mock.patch.object(
+            claude_adapter.active_chat_registry,
+            "process_identity",
+            side_effect=lambda ref: next(identities),
+        ):
+            events = list(adapter.attach(turn))
+
+        self.assertEqual(events[-1].type, "run.failed")
+        self.assertEqual(
+            events[-1].payload["error"],
+            "HARNESS_EXITED_WITHOUT_REPLY",
+        )
+
+    def test_claude_inspect_reads_the_last_assistant_entry(self) -> None:
+        adapter, _runner = self.build("claude")
+        cases = {
+            "reply": ([{"type": "text", "text": "done"}], "idle"),
+            "tool call": (
+                [{"type": "tool_use", "id": "tool-1", "name": "Bash"}],
+                "unknown",
+            ),
+            "reply then tool call": (
+                [
+                    {"type": "text", "text": "done"},
+                    {"type": "tool_use", "id": "tool-1", "name": "Bash"},
+                ],
+                "unknown",
+            ),
+            "tool result": (
+                [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "tool-1",
+                        "is_error": False,
+                    }
+                ],
+                "unknown",
+            ),
+        }
+        for index, (label, (blocks, state)) in enumerate(cases.items(), 1):
+            with self.subTest(last_entry=label):
+                session_ref = f"44444444-4444-4444-8444-{index:012d}"
+                path = adapter._session_path(session_ref, self.root)
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(
+                    self.claude_entry(session_ref, *blocks)
+                    + "\n"
+                    # A half-written entry is never the last complete one.
+                    + '{"type":"assis'
+                )
+
+                inspection = adapter.inspect(session_ref, self.context)
+
+                self.assertTrue(inspection.exists)
+                self.assertEqual(inspection.state, state)
+
+    def test_claude_interrupt_falls_back_to_the_recorded_process_group(
+        self,
+    ) -> None:
+        signalled: list[tuple[int, int]] = []
+        adapter, _runner = self.build("claude")
+        adapter.signal_group = lambda group, value: signalled.append(
+            (group, value)
+        )
+        turn = NativeTurn(
+            harness="claude",
+            session_ref="55555555-5555-4555-8555-555555555555",
+            run_ref="claude-attach",
+            worktree=self.root,
+            metadata={"process_pid": 4321, "process_start_ticks": 99,
+                      "process_group_id": 4321},
+        )
+
+        with mock.patch.object(
+            claude_adapter.active_chat_registry,
+            "process_identity",
+            return_value=(4321, 99),
+        ):
+            self.assertTrue(adapter.interrupt(turn).acknowledged)
+        with mock.patch.object(
+            claude_adapter.active_chat_registry,
+            "process_identity",
+            return_value=(None, None),
+        ):
+            self.assertFalse(adapter.interrupt(turn).acknowledged)
+
+        self.assertEqual(signalled, [(4321, signal.SIGINT)])
 
     def test_claude_resume_rejects_resolved_paths_outside_worktree(self) -> None:
         adapter, runner = self.build("claude")

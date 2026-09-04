@@ -137,6 +137,12 @@ def connect(path):
         con.row_factory = sqlite3.Row
         con.execute("PRAGMA foreign_keys=ON")
         _enable_wal(con)
+        # WAL + NORMAL never fsyncs on commit, so a stalled fsync cannot hold
+        # the write lock (host NVMe timeouts of 30 s were observed holding it
+        # through COMMIT under FULL and starving every daemon). The file stays
+        # intact on power loss; only the last commits before a crash can roll
+        # back (decision #314).
+        con.execute("PRAGMA synchronous=NORMAL")
         con.execute(f"PRAGMA busy_timeout={DEFAULT_BUSY_TIMEOUT_MS}")
         return con
     except BaseException:

@@ -553,7 +553,10 @@ def test_retained_unavailable_harness_keeps_controls_but_not_composer():
     assert "unavailable.textContent = unavailableReason || \"\"" in open_chat
     assert "composer.disabled = Boolean(unavailableReason)" in open_chat
     assert "send.disabled = Boolean(unavailableReason)" in open_chat
-    assert "stop.disabled = conversation.state !== \"running\"" in open_chat
+    assert (
+        'stop.disabled = (conversation.state !== "running" && !lingering)'
+        in open_chat
+    )
     assert "close.disabled = sprintManaged || closed || closing" in open_chat
     assert 'textContent: "Analytics"' in open_chat
     assert "chatReviewWorkspace(reviewHost, conversation)" in open_chat
@@ -870,8 +873,8 @@ def test_composer_is_retry_safe_and_has_turn_controls():
     assert '"POST", {}, stopRequest.key' in stop_handler
     assert "stopRequest = null" in stop_handler
     assert (
-        'stop.disabled = conversation.state !== "running" || closing '
-        "|| Boolean(stopRequest)"
+        'stop.disabled = (conversation.state !== "running" && !lingering)\n'
+        "      || closing || Boolean(stopRequest)"
         in interface
     )
     assert 'stop.textContent = stopRequest ? "Stopping…" : "Stop"' in interface
@@ -1394,3 +1397,110 @@ def test_layout_retains_shell_rail_chat_history_and_bubble_transcript():
     assert ".chat-working-dots" in STYLE
     assert "@keyframes chat-working-dot" in STYLE
     assert ".chat-queue-state" in STYLE
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node is required")
+def test_state_pill_names_a_lingering_process_by_pid():
+    pill = APP[APP.index("function chatWorkingDots"):
+               APP.index("function chatWorkingIndicator")]
+    script = r"""
+const el = (tag, props = {}, ...kids) => ({
+  tag, ...props, kids: [...kids],
+  append(...more) { this.kids.push(...more); },
+});
+""" + pill + r"""
+const shape = (pill) => [pill.className, pill.textContent ?? pill.kids[0]];
+console.log(JSON.stringify({
+  lingering: shape(chatStatePill("idle", {pid: 4242, lingering: true})),
+  idle: shape(chatStatePill("idle", {pid: 4242, lingering: false})),
+  noProcess: shape(chatStatePill("idle")),
+  running: shape(chatStatePill("running", {pid: 4242, lingering: false})),
+}));
+"""
+    assert run_js(script) == {
+        "lingering": [
+            "chat-state state-idle lingering",
+            "process still running · pid 4242",
+        ],
+        "idle": ["chat-state state-idle", "idle"],
+        "noProcess": ["chat-state state-idle", "idle"],
+        "running": ["chat-state state-running", "working"],
+    }
+
+
+def test_stop_stays_available_while_a_process_lingers():
+    interface = APP[APP.index("const CHAT_HARNESSES"):
+                    APP.index("// ── Tabs + boot")]
+    assert (
+        "const lingering = Boolean(conversation.process?.lingering)" in interface
+    )
+    stop_handler = interface[
+        interface.index("stop.onclick ="):
+        interface.index("composer.onkeydown", interface.index("stop.onclick ="))
+    ]
+    assert (
+        'if (conversation.state !== "running" && !conversation.process?.lingering)'
+        in stop_handler
+    )
+    assert "/interruptions`" in stop_handler
+    history = APP[APP.index("function chatPaintHistoryItem"):
+                  APP.index("function chatQueuedCount")]
+    assert (
+        'chatStatePill(conversation.state || "idle", conversation.process)'
+        in history
+    )
+    assert "item.state.className !== next.className" in history
+    assert ".chat-state.lingering" in STYLE
+
+
+def test_run_resumed_puts_the_message_and_chat_back_to_running():
+    interface = APP[APP.index("const CHAT_HARNESSES"):
+                    APP.index("// ── Tabs + boot")]
+    assert '"run.resumed"' in interface
+    assert (
+        'if (message && type === "run.resumed") message.state = "running"'
+        in interface
+    )
+    resumed = interface[
+        interface.index('if (type === "run.resumed") {'):
+        interface.index('if (type === "conversation.updated"')
+    ]
+    assert 'conversation.state = "running"' in resumed
+    assert "conversation.active_run_id = event.run_id" in resumed
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node is required")
+def test_shell_busy_toast_names_the_holding_chat_and_pid():
+    busy = APP[APP.index("function chatBusyToast"):
+               APP.index("function chatModeHash")]
+    script = r"""
+const toasted = [];
+const el = (tag, props = {}, ...kids) => ({
+  tag, ...props, kids: [...kids],
+  append(...more) { this.kids.push(...more); },
+});
+const toast = (msg) => toasted.push(msg);
+const location = { hash: "" };
+const chatHash = (shortname, id) => `interface/${shortname}/${id}`;
+""" + busy + r"""
+chatBusyToast({
+  code: "SHELL_BUSY",
+  message: "held",
+  details: {conversation_id: "cv_b", pid: 4242},
+}, "dev");
+const named = toasted[0];
+named.kids[1].onclick();
+chatBusyToast({code: "VALIDATION_ERROR", message: "bad", details: {}}, "dev");
+console.log(JSON.stringify({
+  text: named.kids[0],
+  link: named.kids[1].textContent,
+  hash: location.hash,
+  plain: toasted[1],
+}));
+"""
+    assert run_js(script) == {
+        "text": "SHELL_BUSY: cv_b (pid 4242) still holds this shell — ",
+        "link": "open that chat",
+        "hash": "interface/dev/cv_b",
+        "plain": "VALIDATION_ERROR: bad",
+    }

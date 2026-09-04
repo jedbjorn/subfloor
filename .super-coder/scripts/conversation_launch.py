@@ -208,32 +208,75 @@ class ConversationLaunchPreparer:
                 "unsupported stored conversation route contract",
             )
 
-        def occupying_state() -> str | None:
-            snapshot = self.liveness()
-            return (
-                "busy"
-                if flavor == "admin" and snapshot.get("admin_root_pids")
-                else shell_liveness.session_state(shortname, snapshot)
-            )
+        def occupying_state() -> tuple[str | None, dict | None]:
+            """The slot verdict, plus the foreign browser session that holds it.
 
-        def wait_for_free_slot() -> str | None:
-            state = occupying_state()
+            A browser-owned process of THIS conversation is this chat's own
+            lingering turn: the broker owns continuation and queueing, so it
+            never refuses its own follow-up.  Any other holder is named.
+            """
+            snapshot = self.liveness()
+            if flavor == "admin" and snapshot.get("admin_root_pids"):
+                return "busy", None
+            state = shell_liveness.session_state(shortname, snapshot)
+            if state != "browser":
+                return state, None
+            sessions = shell_liveness.browser_sessions(shortname, snapshot)
+            foreign = [
+                session
+                for session in sessions
+                if session.get("conversation_id") != broker_run.conversation_id
+            ]
+            if foreign:
+                return state, foreign[0]
+            if not sessions:
+                return None, None
+            # This chat's own previous turn is still running. Two print-mode
+            # processes on one native session file is the hazard, so the
+            # follow-up waits for exit or Stop; it never dispatches over it.
+            return "lingering", sessions[0]
+
+        def wait_for_free_slot() -> tuple[str | None, dict | None]:
+            state, session = occupying_state()
             for _ in range(self.liveness_retries):
                 if state is None:
-                    return None
+                    return None, None
                 self.sleep(self.liveness_delay)
-                state = occupying_state()
-            return state
+                state, session = occupying_state()
+            return state, session
+
+        def refusal(
+            state: str, session: dict | None, tail: str
+        ) -> ConversationLaunchError:
+            if session is None:
+                return ConversationLaunchError(
+                    "SHELL_BUSY",
+                    f"shell {shortname!r} already has a live CLI session "
+                    f"({state}); {tail}",
+                )
+            if state == "lingering":
+                return ConversationLaunchError(
+                    "SHELL_LINGERING",
+                    f"this chat's previous turn is still running "
+                    f"(pid {session.get('pid')}); wait for it to finish or "
+                    f"press Stop, then send again",
+                )
+            return ConversationLaunchError(
+                "SHELL_BUSY",
+                f"shell {shortname!r} is held by browser chat "
+                f"{session.get('conversation_id')} (pid {session.get('pid')}); "
+                f"{tail}",
+            )
 
         # Native harnesses can emit their terminal result just before their
         # process disappears from /proc. Give that browser-owned teardown a
         # short drain window; a genuinely occupied CLI slot remains a refusal.
-        state = wait_for_free_slot()
+        state, session = wait_for_free_slot()
         if state is not None:
-            raise ConversationLaunchError(
-                "SHELL_BUSY",
-                f"shell {shortname!r} already has a live CLI session "
-                f"({state}); close it before starting a browser turn",
+            raise refusal(
+                state,
+                session,
+                "interrupt or close it before starting a browser turn",
             )
 
         try:
@@ -276,12 +319,13 @@ class ConversationLaunchPreparer:
         # Preparation renders and may create/sync the worktree. Recheck at the
         # dispatch edge so a CLI launch that raced that work is still refused
         # before the adapter can send the prompt.
-        state = wait_for_free_slot()
+        state, session = wait_for_free_slot()
         if state is not None:
-            raise ConversationLaunchError(
-                "SHELL_BUSY",
-                f"shell {shortname!r} acquired a live CLI session during "
-                f"browser preparation ({state}); no prompt was dispatched",
+            raise refusal(
+                state,
+                session,
+                "it was acquired during browser preparation, so no prompt "
+                "was dispatched",
             )
 
         expected = broker_run.worktree.resolve()

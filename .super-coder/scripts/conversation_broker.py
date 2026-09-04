@@ -46,6 +46,9 @@ from conversation_state import require_transition
 
 LIVE_RUN_STATES = frozenset({"leased", "starting", "running"})
 TERMINAL_RUN_STATES = frozenset({"succeeded", "failed", "cancelled", "unknown"})
+TERMINAL_MESSAGE_STATES = frozenset({"completed", "failed", "cancelled"})
+# A lingering process that only reports usage or its session is not new work.
+QUIET_EVENTS = frozenset({"usage", "session.started"})
 DEFAULT_LEASE_SECONDS = 30
 DEFAULT_HEARTBEAT_SECONDS = 10
 DEFAULT_RECOVERY_SECONDS = 5
@@ -55,6 +58,8 @@ DEFAULT_EVENT_BATCH_SIZE = 64
 DEFAULT_EVENT_BACKLOG_SIZE = 1024
 DEFAULT_EVENT_FLUSH_SECONDS = 0.1
 DEFAULT_BUSY_RETRY_ATTEMPTS = 6
+DEFAULT_LINGER_GRACE_SECONDS = 3.0
+DEFAULT_MAX_DEFERRALS = 120
 _STREAM_END = object()
 
 
@@ -98,6 +103,11 @@ class BrokerRun:
     route_binding: Mapping[str, Any] | None = None
     binding_digest: str | None = None
     lifecycle_epoch: int = 1
+    process_pid: int | None = None
+    process_start_ticks: int | None = None
+    process_group_id: int | None = None
+    transcript_path: str | None = None
+    transcript_offset: int | None = None
 
     def context(self) -> ConversationContext:
         # Browser conversations run with worktree command access.
@@ -124,6 +134,24 @@ class _ActiveRun:
     turn: NativeTurn | None = None
     interrupt_requested: bool = False
     interrupt_sent: bool = False
+    continuation_run_id: int | None = None
+
+    @property
+    def run_id(self) -> int:
+        """The run this worker writes to: the continuation once one is open."""
+        return self.continuation_run_id or self.run.run_id
+
+
+def _with_exit_code(event: NormalizedEvent, exit_code: Any) -> NormalizedEvent:
+    """Stamp the verified process exit onto the terminal the stream carried."""
+    if not isinstance(exit_code, int) or "exit_code" in event.payload:
+        return event
+    return NormalizedEvent(
+        event.type,
+        {**dict(event.payload), "exit_code": exit_code},
+        event.native_type,
+        event.interrupt_evidence,
+    )
 
 
 def _utcnow() -> datetime:
@@ -273,6 +301,11 @@ class BrokerStore:
             route_binding=binding,
             binding_digest=binding_digest,
             lifecycle_epoch=int(row["lifecycle_epoch"]),
+            process_pid=row["process_pid"],
+            process_start_ticks=row["process_start_ticks"],
+            process_group_id=row["process_group_id"],
+            transcript_path=row["transcript_path"],
+            transcript_offset=row["transcript_offset"],
         )
 
     @staticmethod
@@ -280,6 +313,8 @@ class BrokerStore:
         return (
             "SELECT r.run_id,r.conversation_id,r.trigger_message_id,r.shell_id,"
             "r.harness_session_before,r.harness_session_after,r.runner_ref,"
+            "r.process_pid,r.process_start_ticks,r.process_group_id,"
+            "r.transcript_path,r.transcript_offset,"
             "r.state AS run_state,c.harness,c.provider,c.model,c.effort,"
             "c.route_contract_version,c.route_binding,"
             "c.worktree,c.title,m.body,"
@@ -615,11 +650,13 @@ class BrokerStore:
                         f"adapter returned {turn.session_ref}",
                     )
                 require_transition("run", row["state"], "running")
+                transcript_offset = turn.metadata.get("transcript_offset")
                 changed = con.execute(
                     "UPDATE conversation_runs SET state='running',"
                     "harness_session_after=?,runner_ref=?,heartbeat_at=?,"
                     "lease_expires_at=?,process_pid=?,process_start_ticks=?,"
-                    "process_group_id=? WHERE run_id=? AND lease_owner=? "
+                    "process_group_id=?,transcript_path=?,transcript_offset=? "
+                    "WHERE run_id=? AND lease_owner=? "
                     "AND state='starting'",
                     (
                         turn.session_ref,
@@ -629,6 +666,12 @@ class BrokerStore:
                         process_pid,
                         process_start_ticks,
                         process_group_id,
+                        turn.metadata.get("transcript_path"),
+                        (
+                            transcript_offset
+                            if isinstance(transcript_offset, int)
+                            else None
+                        ),
                         run_id,
                         owner,
                     ),
@@ -735,8 +778,18 @@ class BrokerStore:
         error_code: str | None = None,
         error_detail: str | None = None,
         exit_code: int | None = None,
+        keep_process_link: bool = False,
+        process_exited: bool = False,
     ) -> bool:
-        """Commit terminal event and release every durable lock atomically."""
+        """Commit terminal event and release every durable lock atomically.
+
+        ``keep_process_link`` finishes a run whose native process is still
+        alive (a lingering turn): the reply becomes visible, but the registry
+        keeps naming the process so nothing alive is invisible.
+        ``process_exited`` is the opposite evidence: the caller watched the
+        native process exit, so the run row stops naming a pid nothing can
+        find.  A finish without either claim leaves identity to the reaper.
+        """
         if outcome not in TERMINAL_RUN_STATES:
             raise BrokerError(
                 "CONVERSATION_OUTCOME_INVALID",
@@ -782,7 +835,12 @@ class BrokerStore:
                     "SELECT state FROM conversation_messages WHERE message_id=?",
                     (row["trigger_message_id"],),
                 ).fetchone()[0]
-                require_transition("message", message_current, message_state)
+                # A continuation finishes a message its lingering predecessor
+                # already closed. The message machine has no exit from a
+                # terminal state, so that first close stands for the turn.
+                message_closed = message_current in TERMINAL_MESSAGE_STATES
+                if not message_closed:
+                    require_transition("message", message_current, message_state)
                 close_after = bool(row["close_requested"])
                 if close_after:
                     queued_ids = [
@@ -836,7 +894,14 @@ class BrokerStore:
                     )
                 con.execute(
                     "UPDATE conversation_runs SET state=?,ended_at=?,"
-                    "exit_code=?,error_code=?,error_detail=? WHERE run_id=?",
+                    "exit_code=?,error_code=?,error_detail=?"
+                    + (
+                        ",process_pid=NULL,process_start_ticks=NULL,"
+                        "process_group_id=NULL"
+                        if process_exited
+                        else ""
+                    )
+                    + " WHERE run_id=?",
                     (
                         outcome,
                         now,
@@ -846,16 +911,18 @@ class BrokerStore:
                         run_id,
                     ),
                 )
-                active_chat_registry.clear_process(
-                    con,
-                    shell_id=int(row["shell_id"]),
-                    chat_id=str(row["conversation_id"]),
-                )
-                con.execute(
-                    "UPDATE conversation_messages SET state=?,completed_at=? "
-                    "WHERE message_id=?",
-                    (message_state, now, row["trigger_message_id"]),
-                )
+                if not keep_process_link:
+                    active_chat_registry.clear_process(
+                        con,
+                        shell_id=int(row["shell_id"]),
+                        chat_id=str(row["conversation_id"]),
+                    )
+                if not message_closed:
+                    con.execute(
+                        "UPDATE conversation_messages SET state=?,completed_at=? "
+                        "WHERE message_id=?",
+                        (message_state, now, row["trigger_message_id"]),
+                    )
                 if not already_closed:
                     con.execute(
                         "UPDATE conversations SET state=?,last_activity_at=?,"
@@ -902,6 +969,210 @@ class BrokerStore:
             self.db_path,
             str(conversation_id),
         )
+        return True
+
+    def open_continuation(self, run_id: int, owner: str) -> int | None:
+        """Reopen a lingering turn as the next attempt of the same message.
+
+        A lingering finish closed the run while its native process kept
+        working, so later output still belongs to that trigger message: the
+        continuation copies the finished run's native and process identity
+        under ``attempt+1``.  The conversation walks idle -> queued -> running
+        because neither this module's table nor migration 0132's trigger has a
+        direct idle -> running edge, and both steps are legal.  The trigger
+        message keeps the terminal state its lingering finish committed.
+        Returns None for a closed conversation, which takes no new work.
+        """
+        con = self.connect()
+        now, expires = self._times()
+        try:
+            with db_driver.write_transaction(
+                con,
+                "conversation.broker.open_continuation",
+            ):
+                row = con.execute(
+                    "SELECT r.conversation_id,r.shell_id,r.trigger_message_id,"
+                    "r.harness_session_before,r.harness_session_after,"
+                    "r.runner_ref,r.archive_id,r.process_pid,"
+                    "r.process_start_ticks,r.process_group_id,"
+                    "c.state AS conversation_state "
+                    "FROM conversation_runs r JOIN conversations c "
+                    "ON c.conversation_id=r.conversation_id WHERE r.run_id=?",
+                    (run_id,),
+                ).fetchone()
+                if row is None:
+                    raise BrokerError("CONVERSATION_RUN_NOT_FOUND", str(run_id))
+                if row["conversation_state"] == "closed":
+                    return None
+                attempt = con.execute(
+                    "SELECT MAX(attempt)+1 FROM conversation_runs "
+                    "WHERE trigger_message_id=?",
+                    (row["trigger_message_id"],),
+                ).fetchone()[0]
+                continuation_id = int(
+                    con.execute(
+                        "INSERT INTO conversation_runs "
+                        "(conversation_id,shell_id,trigger_message_id,attempt,"
+                        "harness_session_before,harness_session_after,"
+                        "runner_ref,archive_id,state,lease_owner,"
+                        "lease_expires_at,started_at,heartbeat_at,process_pid,"
+                        "process_start_ticks,process_group_id) "
+                        "VALUES (?,?,?,?,?,?,?,?,'running',?,?,?,?,?,?,?)",
+                        (
+                            row["conversation_id"],
+                            row["shell_id"],
+                            row["trigger_message_id"],
+                            attempt,
+                            row["harness_session_after"]
+                            or row["harness_session_before"],
+                            row["harness_session_after"],
+                            row["runner_ref"],
+                            row["archive_id"],
+                            owner,
+                            expires,
+                            now,
+                            now,
+                            row["process_pid"],
+                            row["process_start_ticks"],
+                            row["process_group_id"],
+                        ),
+                    ).lastrowid
+                )
+                self._append_event(
+                    con,
+                    conversation_id=row["conversation_id"],
+                    event_type="run.resumed",
+                    payload={"continues_run_id": run_id, "status": "running"},
+                    message_id=int(row["trigger_message_id"]),
+                    run_id=continuation_id,
+                )
+                if row["conversation_state"] != "running":
+                    require_transition(
+                        "conversation",
+                        row["conversation_state"],
+                        "queued",
+                    )
+                    con.execute(
+                        "UPDATE conversations SET state='queued' "
+                        "WHERE conversation_id=?",
+                        (row["conversation_id"],),
+                    )
+                    require_transition("conversation", "queued", "running")
+                    con.execute(
+                        "UPDATE conversations SET state='running',"
+                        "last_activity_at=?,version=version+1 "
+                        "WHERE conversation_id=?",
+                        (now, row["conversation_id"]),
+                    )
+                conversation_id = str(row["conversation_id"])
+        finally:
+            con.close()
+        conversation_events.notify(conversation_id)
+        return continuation_id
+
+    def release_process_link(self, run_id: int) -> bool:
+        """Clear the registry link a lingering finish deliberately kept.
+
+        The process is verifiably gone, so the whole turn — the lingering run
+        and every continuation of its trigger message — stops naming it.
+        """
+        con = self.connect()
+        try:
+            with db_driver.write_transaction(
+                con,
+                "conversation.broker.release_process_link",
+            ):
+                row = con.execute(
+                    "SELECT shell_id,conversation_id,trigger_message_id "
+                    "FROM conversation_runs WHERE run_id=?",
+                    (run_id,),
+                ).fetchone()
+                if row is None:
+                    raise BrokerError("CONVERSATION_RUN_NOT_FOUND", str(run_id))
+                con.execute(
+                    "UPDATE conversation_runs SET process_pid=NULL,"
+                    "process_start_ticks=NULL,process_group_id=NULL "
+                    "WHERE trigger_message_id=? AND process_pid IS NOT NULL",
+                    (row["trigger_message_id"],),
+                )
+                return active_chat_registry.clear_process(
+                    con,
+                    shell_id=int(row["shell_id"]),
+                    chat_id=str(row["conversation_id"]),
+                )
+        finally:
+            con.close()
+
+    def defer_run(
+        self,
+        run_id: int,
+        owner: str,
+        seconds: float,
+        *,
+        reason: str,
+        detail: str,
+    ) -> bool:
+        """Hold a leased run back without spending its outbox intent.
+
+        The shell's previous native process is still alive, which is not this
+        turn's failure: the run keeps its lease row and its queued message,
+        and the ordinary expiry/adoption path re-dispatches it once the lease
+        it is given here runs out.
+        """
+        con = self.connect()
+        now = self.clock()
+        try:
+            with db_driver.write_transaction(
+                con,
+                "conversation.broker.defer_run",
+            ):
+                row = con.execute(
+                    "SELECT conversation_id,trigger_message_id,state "
+                    "FROM conversation_runs WHERE run_id=?",
+                    (run_id,),
+                ).fetchone()
+                if row is None:
+                    raise BrokerError("CONVERSATION_RUN_NOT_FOUND", str(run_id))
+                if row["state"] != "leased":
+                    raise BrokerError(
+                        "CONVERSATION_RUN_NOT_LEASED",
+                        f"run {run_id} is {row['state']}",
+                    )
+                changed = con.execute(
+                    "UPDATE conversation_runs SET lease_owner=?,"
+                    "lease_expires_at=?,heartbeat_at=? "
+                    "WHERE run_id=? AND state='leased'",
+                    (
+                        owner,
+                        _stamp(now + timedelta(seconds=seconds)),
+                        _stamp(now),
+                        run_id,
+                    ),
+                ).rowcount
+                if changed != 1:
+                    return False
+                first = (
+                    con.execute(
+                        "SELECT 1 FROM conversation_events "
+                        "WHERE run_id=? AND event_type='run.deferred'",
+                        (run_id,),
+                    ).fetchone()
+                    is None
+                )
+                if first:
+                    self._append_event(
+                        con,
+                        conversation_id=row["conversation_id"],
+                        event_type="run.deferred",
+                        payload={"reason": reason, "detail": detail[:16384]},
+                        message_id=int(row["trigger_message_id"]),
+                        run_id=run_id,
+                    )
+                conversation_id = str(row["conversation_id"])
+        finally:
+            con.close()
+        if first:
+            conversation_events.notify(conversation_id)
         return True
 
     def renew_runs(self, owner: str, run_ids: list[int]) -> int:
@@ -1051,6 +1322,7 @@ class ConversationBroker(threading.Thread):
         event_backlog_size: int = DEFAULT_EVENT_BACKLOG_SIZE,
         event_flush_seconds: float = DEFAULT_EVENT_FLUSH_SECONDS,
         busy_retry_attempts: int = DEFAULT_BUSY_RETRY_ATTEMPTS,
+        linger_grace_seconds: float = DEFAULT_LINGER_GRACE_SECONDS,
     ) -> None:
         super().__init__(name="conversation-broker", daemon=True)
         self.store = store or BrokerStore(db_path)
@@ -1071,6 +1343,9 @@ class ConversationBroker(threading.Thread):
             raise ValueError("event_flush_seconds must be positive")
         if busy_retry_attempts <= 0:
             raise ValueError("busy_retry_attempts must be positive")
+        if linger_grace_seconds <= 0:
+            raise ValueError("linger_grace_seconds must be positive")
+        self.linger_grace_seconds = linger_grace_seconds
         self.event_batch_size = event_batch_size
         self.event_backlog_size = event_backlog_size
         self.event_flush_seconds = event_flush_seconds
@@ -1078,6 +1353,7 @@ class ConversationBroker(threading.Thread):
         self._wake = threading.Event()
         self._stop_event = threading.Event()
         self._active: dict[int, _ActiveRun] = {}
+        self._deferrals: dict[int, int] = {}
         self._active_lock = threading.Lock()
         self._started_once = threading.Event()
 
@@ -1091,7 +1367,7 @@ class ConversationBroker(threading.Thread):
 
     def active_run_ids(self) -> list[int]:
         with self._active_lock:
-            return sorted(self._active)
+            return sorted(active.run_id for active in self._active.values())
 
     def wait_started(self, timeout: float = 5.0) -> bool:
         return self._started_once.wait(timeout)
@@ -1106,11 +1382,26 @@ class ConversationBroker(threading.Thread):
 
     def interrupt(self, run_id: int) -> bool:
         """Persist and, when possible, immediately deliver an interrupt."""
-        self.store.request_interrupt(run_id)
         with self._active_lock:
-            active = self._active.get(run_id)
+            active = next(
+                (
+                    item
+                    for item in self._active.values()
+                    if run_id in {item.run.run_id, item.run_id}
+                ),
+                None,
+            )
             if active is not None:
                 active.interrupt_requested = True
+        try:
+            self.store.request_interrupt(
+                active.run_id if active is not None else run_id
+            )
+        except BrokerError as exc:
+            # A lingering finish closed the run row while its native process
+            # kept working; the live worker still owns that signal.
+            if active is None or exc.code != "CONVERSATION_RUN_NOT_ACTIVE":
+                raise
         if active is not None:
             self._deliver_interrupt(active)
         self.notify()
@@ -1243,21 +1534,25 @@ class ConversationBroker(threading.Thread):
 
     @staticmethod
     def _produce_stream(
-        adapter: ConversationAdapter,
-        turn: NativeTurn,
+        source: Callable[[], Any],
         items: queue.Queue[object],
         stopped: threading.Event,
     ) -> None:
-        """Drain one native stream into its bounded per-run queue."""
+        """Drain one native event source into its bounded per-run queue.
+
+        The iterator runs to exhaustion: a terminal line is the harness
+        reporting a result, not proof the process is gone, and abandoning the
+        iterator early leaves the child unobserved and unwaited.
+        """
         try:
-            for event in adapter.stream(turn):
+            for event in source():
                 while not stopped.is_set():
                     try:
                         items.put(event, timeout=0.1)
                         break
                     except queue.Full:
                         continue
-                if stopped.is_set() or event.type in TERMINAL_EVENTS:
+                if stopped.is_set():
                     break
         except Exception as exc:
             while not stopped.is_set():
@@ -1274,25 +1569,114 @@ class ConversationBroker(threading.Thread):
                 except queue.Full:
                     continue
 
+    def _flush_all(
+        self,
+        active: _ActiveRun,
+        pending: list[NormalizedEvent],
+    ) -> bool:
+        while pending:
+            if not self._flush_events(active.run_id, pending, wait=True):
+                return False
+        return True
+
+    def _lingers(self, turn: NativeTurn, silent_since: float) -> bool:
+        """True when the harness reported a result but its process runs on."""
+        if time.monotonic() - silent_since < self.linger_grace_seconds:
+            return False
+        process = turn.opaque
+        return process is not None and process.poll() is None
+
+    @staticmethod
+    def _attach_metadata(run: BrokerRun) -> dict[str, Any]:
+        """The recovery evidence for a turn whose process is still the same."""
+        if run.process_pid is None or run.process_start_ticks is None:
+            return {}
+        if active_chat_registry.process_identity(str(run.process_pid)) != (
+            run.process_pid,
+            run.process_start_ticks,
+        ):
+            return {}
+        return {
+            "process_pid": run.process_pid,
+            "process_start_ticks": run.process_start_ticks,
+            "process_group_id": run.process_group_id,
+            "transcript_path": run.transcript_path,
+            "transcript_offset": run.transcript_offset or 0,
+        }
+
+    def _open_continuation(self, active: _ActiveRun) -> int | None:
+        persisted, continuation_id = self._retry_busy(
+            partial(self.store.open_continuation, active.run_id, self.owner),
+            wait=True,
+        )
+        if not persisted or continuation_id is None:
+            return None
+        active.continuation_run_id = continuation_id
+        return continuation_id
+
+    def _defer_run(self, run: BrokerRun, exc: Exception) -> bool:
+        """Wait out this chat's own lingering process instead of failing.
+
+        The refusal describes the shell, not the turn, so the message stays
+        queued and its lease is re-armed for the ordinary adoption path.  The
+        bound keeps a permanently occupied shell from deferring forever.
+        """
+        with self._active_lock:
+            deferrals = self._deferrals.get(run.run_id, 0) + 1
+            self._deferrals[run.run_id] = deferrals
+            if deferrals > DEFAULT_MAX_DEFERRALS:
+                del self._deferrals[run.run_id]
+                return False
+        persisted, deferred = self._retry_busy(
+            partial(
+                self.store.defer_run,
+                run.run_id,
+                self.owner,
+                self.recovery_seconds,
+                reason="SHELL_LINGERING",
+                detail=str(getattr(exc, "detail", exc)),
+            ),
+            wait=True,
+        )
+        return bool(persisted and deferred)
+
+    def _release_process_link(self, active: _ActiveRun) -> None:
+        self._retry_busy(
+            partial(self.store.release_process_link, active.run_id),
+            wait=True,
+        )
+
     def _consume_stream(
         self,
         active: _ActiveRun,
         adapter: ConversationAdapter,
         turn: NativeTurn,
+        *,
+        source: Callable[[], Any] | None = None,
     ) -> bool:
-        """Persist one stream with real flush deadlines and bounded batches."""
+        """Persist one stream with real flush deadlines and bounded batches.
+
+        The native process, not the first terminal line, ends a run: a
+        terminal is held pending and superseded by any later one.  The run
+        finishes on stream end, or, once the process lingers silently past
+        the grace window, early while keeping its registry process link.
+        Output after a lingering finish opens a continuation run.
+        """
         items: queue.Queue[object] = queue.Queue(
             maxsize=self.event_backlog_size
         )
         stopped = threading.Event()
         threading.Thread(
             target=self._produce_stream,
-            args=(adapter, turn, items, stopped),
+            args=(source or partial(adapter.stream, turn), items, stopped),
             name=f"conversation-stream-{active.run.run_id}",
             daemon=True,
         ).start()
         pending: list[NormalizedEvent] = []
         pending_since: float | None = None
+        pending_terminal: NormalizedEvent | None = None
+        silent_since = time.monotonic()
+        lingering = False
         retry_after = 0.0
         stream_error: Exception | None = None
         try:
@@ -1318,23 +1702,44 @@ class ConversationBroker(threading.Thread):
                     item = None
 
                 if isinstance(item, NormalizedEvent):
+                    silent_since = time.monotonic()
                     if item.type in TERMINAL_EVENTS:
-                        while pending:
-                            if not self._flush_events(
-                                active.run.run_id,
-                                pending,
-                                wait=True,
-                            ):
-                                return False
-                        return self._finish_adapter_event(active, item)
-                    if not pending:
-                        pending_since = time.monotonic()
-                    pending.append(item)
+                        # The last result wins; the process ends the run.
+                        pending_terminal = item
+                        item = None
+                    else:
+                        if lingering and item.type not in QUIET_EVENTS:
+                            if self._open_continuation(active) is None:
+                                return True
+                            lingering = False
+                        if not pending:
+                            pending_since = time.monotonic()
+                        pending.append(item)
                 elif isinstance(item, Exception):
                     stream_error = item
                     break
                 elif item is _STREAM_END:
                     break
+
+                if lingering:
+                    # Nothing may be written until a continuation run exists.
+                    continue
+                if pending_terminal is not None and self._lingers(
+                    turn,
+                    silent_since,
+                ):
+                    if not self._flush_all(active, pending):
+                        return False
+                    if not self._finish_adapter_event(
+                        active,
+                        pending_terminal,
+                        keep_process_link=True,
+                    ):
+                        return False
+                    pending_since = None
+                    pending_terminal = None
+                    lingering = True
+                    continue
 
                 now = time.monotonic()
                 deadline_reached = (
@@ -1360,7 +1765,7 @@ class ConversationBroker(threading.Thread):
                 if now < retry_after and not force_backpressure:
                     continue
                 if self._flush_events(
-                    active.run.run_id,
+                    active.run_id,
                     pending,
                     wait=force_backpressure,
                 ):
@@ -1369,13 +1774,23 @@ class ConversationBroker(threading.Thread):
                 else:
                     retry_after = now + self.recovery_seconds
 
-            while pending:
-                if not self._flush_events(
-                    active.run.run_id,
-                    pending,
-                    wait=True,
-                ):
-                    return False
+            if lingering:
+                # Verified exit with no continuation: only quiet events can
+                # still be buffered, and the process no longer needs naming.
+                self._release_process_link(active)
+                return True
+            if not self._flush_all(active, pending):
+                return False
+            if pending_terminal is not None:
+                returncode = turn.metadata.get("returncode")
+                return self._finish_adapter_event(
+                    active,
+                    _with_exit_code(pending_terminal, returncode),
+                    process_exited=(
+                        isinstance(returncode, int)
+                        or bool(turn.metadata.get("process_exited"))
+                    ),
+                )
             if (
                 isinstance(stream_error, AdapterError)
                 and stream_error.code.startswith("HARNESS_SUBMISSION_")
@@ -1392,6 +1807,9 @@ class ConversationBroker(threading.Thread):
         self,
         active: _ActiveRun,
         event: NormalizedEvent,
+        *,
+        keep_process_link: bool = False,
+        process_exited: bool = False,
     ) -> bool:
         if event.type == "run.failed" and active.interrupt_requested:
             event = NormalizedEvent(
@@ -1411,7 +1829,7 @@ class ConversationBroker(threading.Thread):
         persisted, _result = self._retry_busy(
             partial(
                 self.store.finish_run,
-                active.run.run_id,
+                active.run_id,
                 outcome,
                 event_type=event.type,
                 payload={
@@ -1434,6 +1852,8 @@ class ConversationBroker(threading.Thread):
                     else str(error) if error else None
                 ),
                 exit_code=exit_code if isinstance(exit_code, int) else None,
+                keep_process_link=keep_process_link,
+                process_exited=process_exited,
             ),
             wait=True,
         )
@@ -1471,7 +1891,7 @@ class ConversationBroker(threading.Thread):
         turn = active.turn
         if adapter is None or turn is None:
             self._finish_error(
-                active.run.run_id,
+                active.run_id,
                 BrokerError(
                     "HARNESS_IDENTITY_NOT_CAPTURED",
                     "native dispatch crossed the starting boundary without "
@@ -1492,7 +1912,7 @@ class ConversationBroker(threading.Thread):
                 persisted, _result = self._retry_busy(
                     partial(
                         self.store.note_reconcile_error,
-                        active.run.run_id,
+                        active.run_id,
                         self.owner,
                         reconcile_detail,
                     ),
@@ -1501,7 +1921,7 @@ class ConversationBroker(threading.Thread):
                 if not persisted:
                     return
                 if failures >= self.reconcile_attempts:
-                    self._finish_error(active.run.run_id, exc, proven=False)
+                    self._finish_error(active.run_id, exc, proven=False)
                     return
                 self._stop_event.wait(self.recovery_seconds)
                 continue
@@ -1512,7 +1932,7 @@ class ConversationBroker(threading.Thread):
                     partial(
                         self.store.renew_runs,
                         self.owner,
-                        [active.run.run_id],
+                        [active.run_id],
                     ),
                     wait=True,
                 )
@@ -1540,7 +1960,7 @@ class ConversationBroker(threading.Thread):
             self._retry_busy(
                 partial(
                     self.store.finish_run,
-                    active.run.run_id,
+                    active.run_id,
                     outcome,
                     event_type=self._terminal_event(outcome),
                     payload=terminal_payload,
@@ -1570,8 +1990,16 @@ class ConversationBroker(threading.Thread):
                     adapter = self.adapter_factory(run.harness)
                     active.adapter = adapter
                 except Exception as exc:
+                    # A shell still running this chat's previous process has
+                    # not failed this turn; every other refusal here is proven.
+                    if getattr(
+                        exc, "code", None
+                    ) == "SHELL_LINGERING" and self._defer_run(run, exc):
+                        return
                     self._finish_error(run.run_id, exc, proven=True)
                     return
+                with self._active_lock:
+                    self._deferrals.pop(run.run_id, None)
 
                 self.store.mark_starting(run.run_id, self.owner)
                 try:
@@ -1609,22 +2037,38 @@ class ConversationBroker(threading.Thread):
                     proven=False,
                 )
                 return
+            attach = self._attach_metadata(run)
             active.turn = NativeTurn(
                 harness=run.harness,
                 session_ref=session_ref,
                 run_ref=run.runner_ref,
                 worktree=run.worktree.resolve(),
-                metadata={"recovered": True},
+                process_ref=str(run.process_pid) if attach else None,
+                metadata={"recovered": True, **attach},
             )
             self._deliver_interrupt(active)
             recovery = getattr(self.launch_preparer, "recovery", None)
             context = recovery(run) if callable(recovery) else run.context()
+            # The transcript is the durable channel the harness writes with or
+            # without a pipe. Adapters that cannot tail it raise
+            # HARNESS_ATTACH_UNSUPPORTED and reconcile as before.
+            if (
+                attach
+                and callable(getattr(adapter, "attach", None))
+                and self._consume_stream(
+                    active,
+                    adapter,
+                    active.turn,
+                    source=partial(adapter.attach, active.turn),
+                )
+            ):
+                return
             self._reconcile_loop(active, context)
         except Exception as exc:
             # Store failures are loud in service stderr, but try to close the
             # durable run if its state still permits a conservative terminal.
             try:
-                self._finish_error(run.run_id, exc, proven=False)
+                self._finish_error(active.run_id, exc, proven=False)
             except Exception as finish_exc:
                 print(
                     f"conversation-broker: run {run.run_id} failed: {exc}; "

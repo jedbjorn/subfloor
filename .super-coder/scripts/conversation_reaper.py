@@ -18,6 +18,7 @@ import db_driver
 from conversation_state import require_transition
 
 TERMINAL_MESSAGE_STATES = frozenset({"completed", "failed", "cancelled"})
+TERMINAL_RUN_STATES = frozenset({"succeeded", "failed", "cancelled", "unknown"})
 DEFAULT_HEARTBEAT_SECONDS = 60.0
 DEFAULT_TERM_GRACE_SECONDS = 15.0
 DEFAULT_KILL_GRACE_SECONDS = 15.0
@@ -163,11 +164,20 @@ class ReaperStore:
 
     @staticmethod
     def _sweepable_sql() -> str:
+        """A run this reaper may still act on.
+
+        A TERMINAL run with a live pid is the lingering case: the turn finished
+        (the GUI has its reply) while the process kept working, so the registry
+        link is deliberately held. The NOT-protected clause is what gates it —
+        the moment the FnB closes the chat, the link goes and the process
+        becomes reapable. The reaper's own outcome event ends the ladder: a run
+        it has already reaped or interrupted is never swept twice."""
+        terminal = ",".join(f"'{state}'" for state in sorted(TERMINAL_RUN_STATES))
         return (
-            "(r.state IN ('starting','running') OR (r.state='unknown' "
+            f"(r.state IN ('starting','running') OR (r.state IN ({terminal}) "
             "AND NOT EXISTS(SELECT 1 FROM conversation_events reaped "
             "WHERE reaped.run_id=r.run_id "
-            "AND reaped.event_type='run.interrupted')))"
+            "AND reaped.event_type IN ('run.interrupted','run.reaped'))))"
         )
 
     def candidates(self) -> list[ReaperCandidate]:
@@ -266,13 +276,41 @@ class ReaperStore:
             con.close()
 
     @staticmethod
-    def _append_interrupted_event(con, candidate: ReaperCandidate, reason: str) -> None:
+    def _append_event(
+        con,
+        candidate: ReaperCandidate,
+        event_type: str,
+        payload: dict[str, Any],
+    ) -> None:
         sequence = con.execute(
             "SELECT COALESCE(MAX(sequence),0)+1 FROM conversation_events "
             "WHERE conversation_id=?",
             (candidate.conversation_id,),
         ).fetchone()[0]
-        payload = json.dumps(
+        con.execute(
+            "INSERT INTO conversation_events "
+            "(conversation_id,sequence,event_type,payload,message_id,run_id) "
+            "VALUES (?,?,?,?,?,?)",
+            (
+                candidate.conversation_id,
+                sequence,
+                event_type,
+                json.dumps(payload, separators=(",", ":"), sort_keys=True),
+                candidate.message_id,
+                candidate.run_id,
+            ),
+        )
+
+    def _append_interrupted_event(
+        self,
+        con,
+        candidate: ReaperCandidate,
+        reason: str,
+    ) -> None:
+        self._append_event(
+            con,
+            candidate,
+            "run.interrupted",
             {
                 "interrupt_evidence": "operator",
                 "outcome": "cancelled",
@@ -281,24 +319,38 @@ class ReaperStore:
                     "reason": reason,
                 },
             },
-            separators=(",", ":"),
-            sort_keys=True,
         )
-        con.execute(
-            "INSERT INTO conversation_events "
-            "(conversation_id,sequence,event_type,payload,message_id,run_id) "
-            "VALUES (?,?,'run.interrupted',?,?,?)",
-            (
-                candidate.conversation_id,
-                sequence,
-                payload,
-                candidate.message_id,
-                candidate.run_id,
-            ),
+
+    def _append_reaped_event(
+        self,
+        con,
+        candidate: ReaperCandidate,
+        reason: str,
+        run_state: str,
+    ) -> None:
+        """The reaper's outcome on a run that is ALREADY finished — a record,
+        never a state change. Its terminal is the broker's; re-finishing it
+        here would overwrite a proven outcome with the reaper's guess."""
+        self._append_event(
+            con,
+            candidate,
+            "run.reaped",
+            {
+                "outcome": "reaped",
+                "run_state": run_state,
+                "reaper": {
+                    "process_group_id": candidate.process_group_id,
+                    "reason": reason,
+                },
+            },
         )
 
     def finish_interrupted(self, candidate: ReaperCandidate, reason: str) -> bool:
-        """Write the reaper-owned terminal state iff identity stays unprotected."""
+        """Write the reaper-owned terminal state iff identity stays unprotected.
+
+        An already-terminal run gets the outcome EVENT and nothing else: its
+        state, ended_at, message and conversation belong to whoever finished
+        it."""
         con = self.connect()
         now = _stamp(self.clock())
         try:
@@ -323,7 +375,14 @@ class ReaperStore:
                 if row is None:
                     return False
                 run_state = str(row["state"])
-                if run_state != "unknown":
+                # `unknown` keeps its pre-lingering record: state untouched,
+                # `run.interrupted` as the reaper's outcome. Only a run the
+                # broker proved finished gets the `run.reaped` record.
+                if run_state == "unknown":
+                    self._append_interrupted_event(con, candidate, reason)
+                elif run_state in TERMINAL_RUN_STATES:
+                    self._append_reaped_event(con, candidate, reason, run_state)
+                else:
                     require_transition("run", run_state, "cancelled")
                     con.execute(
                         "UPDATE conversation_runs SET state='cancelled',ended_at=?,"
@@ -357,7 +416,7 @@ class ReaperStore:
                             "version=version+1 WHERE conversation_id=?",
                             (target, now, candidate.conversation_id),
                         )
-                self._append_interrupted_event(con, candidate, reason)
+                    self._append_interrupted_event(con, candidate, reason)
         finally:
             con.close()
         conversation_events.notify(candidate.conversation_id)

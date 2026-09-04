@@ -20,6 +20,7 @@ sys.path.insert(0, str(ENGINE / "api"))
 import instance_state  # noqa: E402
 import route_bindings  # noqa: E402
 import run as run_mod  # noqa: E402
+import shell_liveness
 from conversation_boot import BootDirective  # noqa: E402
 from conversation_broker import BrokerRun  # noqa: E402
 from conversation_launch import (  # noqa: E402
@@ -488,6 +489,89 @@ def test_preparer_refuses_a_cli_process_holding_the_shell(launch_case):
         preparer(make_run(worktree))
 
     assert caught.value.code == "SHELL_BUSY"
+    assert not called
+
+
+def browser_snapshot(*sessions: dict) -> dict:
+    # Unit B's shape, built by hand: one browser-owned pid per entry.
+    return {
+        "supported": True,
+        "processes": [
+            {
+                "pid": session["pid"],
+                "shortname": "dev",
+                "orphaned": False,
+                "claimed": True,
+                "browser_conversation": session["conversation_id"],
+                "lingering": session.get("lingering", True),
+            }
+            for session in sessions
+        ],
+        "browser_sessions": {"dev": list(sessions)},
+    }
+
+
+def test_preparer_waits_on_its_own_lingering_browser_process(
+    launch_case, monkeypatch
+):
+    """Two print-mode processes on one native session file is the hazard:
+    the chat's own lingering turn refuses with SHELL_LINGERING, never
+    SHELL_BUSY, and never dispatches over it."""
+    db_path, worktree = launch_case
+    called = False
+
+    def prepare(**_kwargs):
+        nonlocal called
+        called = True
+
+    monkeypatch.setattr(
+        shell_liveness, "session_state", lambda shortname, snap: "browser"
+    )
+    preparer = ConversationLaunchPreparer(
+        db_path,
+        prepare_launch=prepare,
+        liveness=lambda: browser_snapshot(
+            {"pid": 4242, "conversation_id": "cv_" + "a" * 32, "lingering": True}
+        ),
+        liveness_retries=0,
+    )
+    with pytest.raises(ConversationLaunchError) as caught:
+        preparer(make_run(worktree))
+
+    assert caught.value.code == "SHELL_LINGERING"
+    assert "pid 4242" in caught.value.detail
+    assert "Stop" in caught.value.detail
+    assert not called
+
+
+def test_preparer_names_a_foreign_browser_chat_holding_the_shell(
+    launch_case, monkeypatch
+):
+    db_path, worktree = launch_case
+    called = False
+
+    def prepare(**_kwargs):
+        nonlocal called
+        called = True
+
+    monkeypatch.setattr(
+        shell_liveness, "session_state", lambda shortname, snap: "browser"
+    )
+    holder = "cv_" + "b" * 32
+    preparer = ConversationLaunchPreparer(
+        db_path,
+        prepare_launch=prepare,
+        liveness=lambda: browser_snapshot(
+            {"pid": 4242, "conversation_id": holder, "lingering": True}
+        ),
+        liveness_retries=0,
+    )
+    with pytest.raises(ConversationLaunchError) as caught:
+        preparer(make_run(worktree))
+
+    assert caught.value.code == "SHELL_BUSY"
+    assert holder in caught.value.detail
+    assert "pid 4242" in caught.value.detail
     assert not called
 
 

@@ -6,10 +6,13 @@ import json
 import os
 import re
 import signal
+import time
 import uuid
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any, Iterator, Mapping
 
+import active_chat_registry
 import route_transport
 
 from .base import (
@@ -45,10 +48,16 @@ class ClaudeAdapter(ConversationAdapter):
         runner: ProcessRunner | None = None,
         manifest: Mapping[str, Any] | None = None,
         config_dir: Path | None = None,
+        attach_poll_seconds: float = 0.5,
+        sleep: Callable[[float], None] = time.sleep,
+        signal_group: Callable[[int, signal.Signals], None] = os.killpg,
     ) -> None:
         super().__init__(manifest or load_manifest(self.harness))
         self.runner = runner or SubprocessRunner()
         self.config_dir = config_dir
+        self.attach_poll_seconds = attach_poll_seconds
+        self.sleep = sleep
+        self.signal_group = signal_group
 
     def probe(self) -> ProbeResult:
         launch = self.manifest["headless"]["launch"][0]
@@ -124,6 +133,12 @@ class ClaudeAdapter(ConversationAdapter):
             session_ref=session_ref,
             resume=resume,
         )
+        # The transcript position is read before the spawn: anything the child
+        # appends belongs to this turn and must survive a lost pipe.
+        transcript = self._session_path(session_ref, worktree)
+        transcript_offset = (
+            transcript.stat().st_size if transcript.is_file() else 0
+        )
         process = self.runner.spawn(
             context.execution_argv(command),
             cwd=worktree,
@@ -136,7 +151,12 @@ class ClaudeAdapter(ConversationAdapter):
             run_ref=f"claude-{uuid.uuid4()}",
             worktree=worktree,
             process_ref=str(pid) if pid is not None else None,
-            metadata={"command": command, "resumed": resume},
+            metadata={
+                "command": command,
+                "resumed": resume,
+                "transcript_path": str(transcript),
+                "transcript_offset": transcript_offset,
+            },
             opaque=process,
         )
 
@@ -390,9 +410,158 @@ class ClaudeAdapter(ConversationAdapter):
             turn.metadata["terminal"] = event.type
             yield event
 
+    @staticmethod
+    def _identity_alive(turn: NativeTurn) -> bool:
+        pid = turn.metadata.get("process_pid")
+        start_ticks = turn.metadata.get("process_start_ticks")
+        if not isinstance(pid, int) or not isinstance(start_ticks, int):
+            return False
+        return active_chat_registry.process_identity(str(pid)) == (
+            pid,
+            start_ticks,
+        )
+
+    def _transcript_events(
+        self,
+        raw: Mapping[str, Any],
+    ) -> tuple[list[NormalizedEvent], str | None]:
+        """Normalize one transcript entry; report its assistant text."""
+        message = raw.get("message")
+        if not isinstance(message, dict):
+            return [], None
+        if raw.get("type") == "user":
+            return self._normalize(raw), None
+        if raw.get("type") != "assistant":
+            return [], None
+        content = message.get("content")
+        if not isinstance(content, list):
+            return [], None
+        events: list[NormalizedEvent] = []
+        text: str | None = None
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            if block.get("type") == "text" and isinstance(
+                block.get("text"), str
+            ):
+                text = block["text"]
+                events.append(
+                    NormalizedEvent(
+                        "assistant.delta",
+                        {"text": text},
+                        "assistant.text",
+                    )
+                )
+            elif block.get("type") == "tool_use":
+                events.append(
+                    NormalizedEvent(
+                        "tool.started",
+                        {"tool_ref": block.get("id"), "name": block.get("name")},
+                        "assistant.tool_use",
+                    )
+                )
+        return events, text
+
+    def _drain_transcript(
+        self,
+        path: Path,
+        offset: int,
+    ) -> tuple[int, list[NormalizedEvent], str | None]:
+        """Consume only whole lines, so a half-written entry is read next."""
+        try:
+            with path.open("rb") as stream:
+                stream.seek(offset)
+                data = stream.read()
+        except FileNotFoundError:
+            return offset, [], None
+        except OSError as exc:
+            raise AdapterError(
+                "HARNESS_SESSION_INSPECTION_FAILED",
+                f"cannot tail Claude session: {exc}",
+                retryable=True,
+            ) from exc
+        end = data.rfind(b"\n")
+        if end < 0:
+            return offset, [], None
+        events: list[NormalizedEvent] = []
+        text: str | None = None
+        for line in data[: end + 1].decode("utf-8", "replace").splitlines():
+            if not line.strip():
+                continue
+            try:
+                raw = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(raw, dict):
+                continue
+            entry_events, entry_text = self._transcript_events(raw)
+            events.extend(entry_events)
+            if entry_text is not None:
+                text = entry_text
+        return offset + end + 1, events, text
+
+    def attach(self, turn: NativeTurn) -> Iterator[NormalizedEvent]:
+        """Re-observe a live turn through the session file it keeps writing."""
+        transcript = turn.metadata.get("transcript_path")
+        if not transcript or not self._identity_alive(turn):
+            raise AdapterError(
+                "HARNESS_ATTACH_UNSUPPORTED",
+                "Claude attach needs a transcript path and a live process",
+            )
+        path = Path(str(transcript))
+        offset = int(turn.metadata.get("transcript_offset") or 0)
+        yield NormalizedEvent(
+            "session.started",
+            {
+                "session_ref": turn.session_ref,
+                "resumed": True,
+                "attached": True,
+            },
+            "transcript-attach",
+        )
+        yield NormalizedEvent("run.started", {"status": "running"}, "transcript-attach")
+        last_text: str | None = None
+        while True:
+            # Liveness is read first so the final drain always follows exit.
+            alive = self._identity_alive(turn)
+            offset, events, text = self._drain_transcript(path, offset)
+            yield from events
+            if text is not None:
+                last_text = text
+            if not alive:
+                break
+            self.sleep(self.attach_poll_seconds)
+        turn.metadata["transcript_offset"] = offset
+        # The identity check is the attach lane's process.wait(): the broker
+        # clears the run's process identity on this evidence exactly as it
+        # does on a returncode, so the reaper never has to record the exit.
+        turn.metadata["process_exited"] = True
+        if last_text is None:
+            yield NormalizedEvent(
+                "run.failed",
+                {
+                    "error": "HARNESS_EXITED_WITHOUT_REPLY",
+                    "detail": "Claude exited without writing a reply",
+                },
+                "process.exit",
+            )
+            return
+        yield NormalizedEvent(
+            "run.completed",
+            {"status": "completed", "result": last_text},
+            "process.exit",
+        )
+
     def interrupt(self, turn: NativeTurn) -> InterruptResult:
         process = turn.opaque
-        if process is None or process.poll() is not None:
+        if process is None:
+            # An attached turn has no pipe; its recorded group is the handle.
+            group = turn.metadata.get("process_group_id")
+            if not isinstance(group, int) or not self._identity_alive(turn):
+                return InterruptResult(False, "Claude process is not running")
+            self.signal_group(group, signal.SIGINT)
+            return InterruptResult(True)
+        if process.poll() is not None:
             return InterruptResult(False, "Claude process is not running")
         signal_owned_process(process, signal.SIGINT)
         return InterruptResult(True)
@@ -449,14 +618,16 @@ class ClaudeAdapter(ConversationAdapter):
                 f"cannot inspect Claude session: {exc}",
                 retryable=True,
             ) from exc
+        # A Claude session file never contains a ``result`` entry; the reply
+        # that ends a turn is the last assistant text block with no tool call
+        # after it.
         terminal: str | None = None
-        if last and last.get("type") == "result":
-            events = self._normalize(last)
-            terminal_event = next(
-                (event.type for event in events if event.type in TERMINAL_EVENTS),
-                None,
-            )
-            terminal = terminal_event
+        if last is not None:
+            events, text = self._transcript_events(last)
+            if text is not None and not any(
+                event.type == "tool.started" for event in events
+            ):
+                terminal = "run.completed"
         return SessionInspection(
             session_ref,
             seen_session or path.is_file(),

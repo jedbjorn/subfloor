@@ -328,6 +328,17 @@ class ConversationAdapter(abc.ABC):
     def stream(self, turn: NativeTurn) -> Iterator[NormalizedEvent]:
         raise NotImplementedError
 
+    def attach(self, turn: NativeTurn) -> Iterator[NormalizedEvent]:
+        """Re-observe a live native turn that no longer has a pipe.
+
+        A harness that writes a durable native transcript can hand the broker
+        the same normalized stream after a restart; the rest reconcile.
+        """
+        raise AdapterError(
+            "HARNESS_ATTACH_UNSUPPORTED",
+            f"{self.harness} cannot attach to a running native turn",
+        )
+
     @abc.abstractmethod
     def interrupt(self, turn: NativeTurn) -> InterruptResult:
         raise NotImplementedError
