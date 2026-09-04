@@ -1744,10 +1744,17 @@ def patch_document(
             ).fetchone()
             if document is None:
                 return False, "no such document"
-            if document["frozen"]:
+            # A frozen row's content is immutable; its render_path is a
+            # location, not content. It stays editable so a frozen doc that
+            # collides with or violates the managed render layout can be
+            # moved without unfreezing (#629).
+            if document["frozen"] and cols != ["render_path"]:
                 return (
                     False,
-                    "document is frozen — open the next spec, don't edit this one",
+                    (
+                        "document is frozen — open the next spec, don't edit this "
+                        "one (only render_path may change on a frozen document)"
+                    ),
                 )
 
             candidate = dict(document)

@@ -225,10 +225,14 @@ it.
 
 Unfrozen -> edit in place: no new row, no seq bump. Pass any of `--title` /
 `--body-file` / `--render-path`; renders + snapshots like `add`. Frozen ->
-refused; open a new spec under the same feature instead:
+title + body refused; open a new spec under the same feature instead. A
+frozen doc's `--render-path` alone stays editable: it is a location, not
+content, so a retired or mis-pathed frozen row that collides in the render
+layer can be moved off the path without unfreezing it:
 ```
 sc mem doc edit <document_id> --body-file ./draft.md
 sc mem doc edit <document_id> --title "New title" --render-path specs_sc/….md
+sc mem doc edit <frozen_id> --render-path specs_sc/<slug>-retired.md   # frozen: path only
 ```
 
 ## Freeze + document on ship — the planner's handoff
@@ -242,9 +246,9 @@ Shipping is a two-shell act (keeps `shipped` honest):
   the paperwork:
 
 1. **Freeze the shipped spec** — immutable thereafter; the feature's other
-   specs stay unfrozen and unaffected. NEVER edit a frozen spec (open a new
-   spec under the same feature); the GUI and render layer both refuse edits
-   to frozen docs:
+   specs stay unfrozen and unaffected. NEVER edit a frozen spec's content
+   (open a new spec under the same feature); the GUI and render layer both
+   refuse title/body edits to frozen docs — only its render path may move:
    ```
    sc mem doc freeze <document_id>
    ```
