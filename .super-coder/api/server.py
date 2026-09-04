@@ -495,8 +495,8 @@ def get_delivery_audit(con) -> dict:
 def get_cli_skills(con) -> dict:
     """Exact read projection used by authenticated ``sc skill list`` calls."""
     skills = rows(con.execute(
-        "SELECT skill_id, name, common, is_deleted FROM skills "
-        "ORDER BY is_deleted, name"
+        "SELECT skill_id, name, description, category, common, is_deleted "
+        "FROM skills ORDER BY is_deleted, name"
     ))
     scopes: dict[int, list[str]] = {}
     for row in rows(con.execute(
@@ -511,7 +511,7 @@ def get_cli_skills(con) -> dict:
         scopes.setdefault(row["skill_id"], []).append(row["scope"])
     for skill in skills:
         skill["grant_scopes"] = scopes.get(skill["skill_id"], [])
-    return {"skills": skills}
+    return {"skills": skill_mod.annotate_catalogue(skills)}
 
 
 # ===========================================================================
@@ -525,8 +525,9 @@ def get_cli_skills(con) -> dict:
 # unrestrained on the host) can. These routes mirror the local CLI mutations:
 # they reuse skill.py's validation + persistence ladder and are planner-only —
 # the same check the CLI enforces via ``require_planner`` for local writes.
-# Retire/unretire stay Admin-only: they edit the fork-tracked retire manifest
-# and deliberately require a tracked file write on the host.
+# Retire/unretire ride the same lane: the retire list is instance-local
+# (never Git-tracked), and the API runs on the host with the same authority the
+# local CLI has, so a launched Planner owns every `sc skill` verb.
 
 
 class SkillApiError(ValueError):
@@ -647,6 +648,28 @@ def api_skill_rm(con, name: object) -> tuple[int, dict]:
         "revoked_grants": n,
         "already_removed": already,
     }
+
+
+def api_skill_retire(con, name: object) -> tuple[int, dict]:
+    """Retire one engine skill fork-wide via the instance retire list."""
+    if not isinstance(name, str) or not name.strip():
+        raise SkillApiError(400, "name must be a skill name")
+    already, dormant = skill_mod._retire_spec(con, name.strip())
+    return {
+        "ok": True,
+        "action": "retire",
+        "name": name.strip(),
+        "already_listed": already,
+        "dormant_grants": dormant,
+    }
+
+
+def api_skill_unretire(con, name: object) -> tuple[int, dict]:
+    """Restore one retired engine skill and its dormant grants."""
+    if not isinstance(name, str) or not name.strip():
+        raise SkillApiError(400, "name must be a skill name")
+    grants = skill_mod._unretire_spec(con, name.strip())
+    return {"ok": True, "action": "unretire", "name": name.strip(), "grants": grants}
 
 
 def get_model_routes(con, *, harness: str | None = None,
@@ -4214,6 +4237,14 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/_sc/skills/rm":
                 status, result = _skills_mutation_report(
                     api_skill_rm, con, body.get("name"))
+                return self._send(status, result)
+            if path == "/_sc/skills/retire":
+                status, result = _skills_mutation_report(
+                    api_skill_retire, con, body.get("name"))
+                return self._send(status, result)
+            if path == "/_sc/skills/unretire":
+                status, result = _skills_mutation_report(
+                    api_skill_unretire, con, body.get("name"))
                 return self._send(status, result)
             return self._send(404, {"error": "not found"})
         except Exception as e:

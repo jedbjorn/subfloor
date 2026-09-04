@@ -41,11 +41,14 @@ from _serialize_guard import require_admin
 
 ENGINE = Path(__file__).resolve().parents[1]
 REPO_ROOT = ENGINE.parent
-DB_PATH = instance_state.maintenance_database_path(ENGINE)
+# Both targets resolve when a snapshot opens them, never at import: `sc skill`
+# imports this module from launched seats that cannot read the private state
+# root (#1493). ``bind_state_targets`` and tests pin them.
+DB_PATH: Path | None = None
 # Generated instance state is always local and gitignored.
 # Recovery-safe equivalent of ``artifact_policy.content_path()``; ``main``
 # applies the ordinary selector before either target is opened.
-OUT_PATH = instance_state.maintenance_snapshot_path(REPO_ROOT)
+OUT_PATH: Path | None = None
 # One-release cleanup: if a not-yet-migrated fork still carries the old in-engine
 # copy, remove it once we write the new one so it can't shadow or drift.
 LEGACY_PATH = ENGINE / "snapshot" / "content.sql"
@@ -56,6 +59,18 @@ def bind_state_targets(*, database: Path, snapshot: Path) -> None:
     global DB_PATH, OUT_PATH
     DB_PATH = Path(database)
     OUT_PATH = Path(snapshot)
+
+
+def _db_path() -> Path:
+    if DB_PATH is not None:
+        return DB_PATH
+    return instance_state.maintenance_database_path(ENGINE)
+
+
+def _out_path() -> Path:
+    if OUT_PATH is not None:
+        return OUT_PATH
+    return instance_state.maintenance_snapshot_path(REPO_ROOT)
 
 
 # Every durable Sprints v2 table.  Keep this as the one snapshot authority for
@@ -548,8 +563,8 @@ def persist_instance(con) -> Path:
     """
     artifact_policy.prepare_local_state()
     content = serialize_instance(con)
-    artifact_policy.atomic_write_text(OUT_PATH, content)
-    return OUT_PATH
+    artifact_policy.atomic_write_text(_out_path(), content)
+    return _out_path()
 
 
 def _main_under_lease() -> int:
@@ -557,9 +572,10 @@ def _main_under_lease() -> int:
     copied = artifact_policy.prepare_local_state()
     if copied:
         print(f"snapshot: localized {len(copied)} existing artifact(s)")
-    if not DB_PATH.exists():
-        raise SystemExit(f"snapshot: no live DB at {DB_PATH} — run `./sc rebuild` first.")
-    con = db_driver.connect(DB_PATH)
+    db_path = _db_path()
+    if not db_path.exists():
+        raise SystemExit(f"snapshot: no live DB at {db_path} — run `./sc rebuild` first.")
+    con = db_driver.connect(db_path)
     try:
         reconciled = seed_skills.reconcile_tombstoned_skills(con)
         pack_changes = seed_skills.reconcile_standard_flavor_packs(con)
@@ -584,9 +600,9 @@ def _main_under_lease() -> int:
             pass
         print(f"snapshot: removed legacy {LEGACY_PATH.relative_to(REPO_ROOT)}")
     try:
-        displayed = OUT_PATH.relative_to(REPO_ROOT)
+        displayed = _out_path().relative_to(REPO_ROOT)
     except ValueError:
-        displayed = OUT_PATH
+        displayed = _out_path()
     print(f"snapshot: wrote {displayed}")
     snapshot_map()
     return 0
@@ -597,17 +613,18 @@ def _main_runtime_owned() -> int:
     copied = artifact_policy.prepare_local_state()
     if copied:
         print(f"snapshot: localized {len(copied)} existing artifact(s)")
-    if not DB_PATH.exists():
-        raise SystemExit(f"snapshot: no live DB at {DB_PATH} — run `./sc rebuild` first.")
-    con = db_driver.connect(DB_PATH)
+    db_path = _db_path()
+    if not db_path.exists():
+        raise SystemExit(f"snapshot: no live DB at {db_path} — run `./sc rebuild` first.")
+    con = db_driver.connect(db_path)
     try:
         persist_instance(con)
     finally:
         con.close()
     try:
-        displayed = OUT_PATH.relative_to(REPO_ROOT)
+        displayed = _out_path().relative_to(REPO_ROOT)
     except ValueError:
-        displayed = OUT_PATH
+        displayed = _out_path()
     print(f"snapshot: wrote {displayed}")
     snapshot_map()
     return 0
@@ -668,10 +685,10 @@ def main(*, lease_held: bool = False, runtime_owned: bool = False) -> int:
             return 0
     state = instance_state.maintenance_state(ENGINE)
     if lease_held:
-        state_relocation.refuse_live_database_owners(DB_PATH)
+        state_relocation.refuse_live_database_owners(_db_path())
         return _main_under_lease()
     with state_relocation.exclusive_maintenance(state, command="snapshot"):
-        state_relocation.refuse_live_database_owners(DB_PATH)
+        state_relocation.refuse_live_database_owners(_db_path())
         return _main_under_lease()
 
 

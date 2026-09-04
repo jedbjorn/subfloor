@@ -20,6 +20,7 @@ Run:
 """
 from __future__ import annotations
 
+import contextlib
 import sqlite3
 import sys
 import tempfile
@@ -706,6 +707,117 @@ class SkillApiLaneTest(unittest.TestCase):
             skill_mod, "connect", side_effect=PermissionError("masked root")
         ), self.assertRaises(PermissionError):
             skill_mod.main(["put", "--file", str(draft)])
+
+    # ── subfloor#1493: the restricted seat fails BEFORE connect() ────────────
+    RESTRICTED = "cannot read private state owner metadata: [Errno 13] Permission denied"
+
+    def _restricted_resolvers(self):
+        """Patch every resolver on every `instance_state` object in play.
+
+        test_instance_state.py swaps sys.modules["instance_state"] at
+        collection, so the module skill.py holds can differ from the one a
+        fresh `import instance_state` returns; patch both, and refuse any
+        local DB open outright so a missed patch can never reach a real DB.
+        """
+        modules = {id(m): m for m in (
+            skill_mod.instance_state, sys.modules.get("instance_state"),
+        ) if m is not None}
+
+        def refuse(engine, **_kwargs):
+            raise skill_mod.instance_state.InstanceStateError(self.RESTRICTED)
+
+        patches = [
+            mock.patch.object(module, name, refuse)
+            for module in modules.values()
+            for name in ("active_database_path", "maintenance_database_path",
+                         "maintenance_snapshot_path")
+        ]
+        patches.append(mock.patch.object(
+            skill_mod.db_driver, "connect",
+            side_effect=AssertionError("local lane opened a DB on a restricted seat"),
+        ))
+        return patches
+
+    def test_import_chain_never_resolves_private_state(self):
+        """Importing `skill` (→ render → flat → skill_projection → seed_skills,
+        and snapshot) on a seat that cannot read the private state root must
+        succeed; the resolution belongs inside connect(), where the API
+        fallback can catch it."""
+        import importlib
+        chain = ("skill", "render", "flat", "skill_projection", "seed_skills",
+                 "snapshot")
+        with contextlib.ExitStack() as stack:
+            for patch in self._restricted_resolvers():
+                stack.enter_context(patch)
+            stack.enter_context(mock.patch.dict(sys.modules))
+            for name in chain:
+                sys.modules.pop(name, None)
+            fresh = importlib.import_module("skill")
+            self.assertIsNone(fresh.DB_PATH)
+            self.assertIsNone(sys.modules["seed_skills"].DB_PATH)
+            self.assertIsNone(sys.modules["render"].DB_PATH)
+            self.assertIsNone(sys.modules["snapshot"].DB_PATH)
+            self.assertIsNone(sys.modules["snapshot"].OUT_PATH)
+            # `refuse` raises the class from the module skill.py holds; a
+            # fresh import may bind a different `instance_state` object.
+            with self.assertRaisesRegex(
+                skill_mod.instance_state.InstanceStateError, "owner metadata"
+            ):
+                fresh.connect()
+
+    def test_every_verb_reroutes_when_private_state_is_unreadable(self):
+        """With a token, every `sc skill` verb reaches its API route when the
+        seat cannot even resolve the DB path — retire/unretire included."""
+        draft = self.write_draft("loc_all")
+        calls: list[tuple[str, dict]] = []
+
+        def fake_api(method, path, payload=None, *, idempotent=None, **kwargs):
+            calls.append((path, payload))
+            return {
+                "/_sc/skills/put": {"name": "loc_all", "verb": "created"},
+                "/_sc/skills/grant": {"name": "loc_all", "results": []},
+                "/_sc/skills/revoke": {"name": "loc_all", "results": []},
+                "/_sc/skills/rm": {"name": "loc_all", "revoked_grants": 0},
+                "/_sc/skills/retire": {"name": "eng_a", "already_listed": False,
+                                       "dormant_grants": 2},
+                "/_sc/skills/unretire": {"name": "eng_a", "grants": 2},
+                "/_sc/skills": {"skills": []},
+            }[path]
+
+        skill_mod.DB_PATH = None
+        with contextlib.ExitStack() as stack:
+            for patch in self._restricted_resolvers():
+                stack.enter_context(patch)
+            stack.enter_context(
+                mock.patch.object(skill_mod.mem, "_api", side_effect=fake_api))
+            for argv in (
+                ["put", "--file", str(draft)],
+                ["grant", "loc_all", "PLN1"],
+                ["revoke", "loc_all", "PLN1"],
+                ["rm", "loc_all"],
+                ["retire", "eng_a"],
+                ["unretire", "eng_a"],
+                ["list"],
+            ):
+                self.assertEqual(skill_mod.main(argv), 0, argv)
+
+        self.assertEqual(
+            [path for path, _ in calls],
+            ["/_sc/skills/put", "/_sc/skills/grant", "/_sc/skills/revoke",
+             "/_sc/skills/rm", "/_sc/skills/retire", "/_sc/skills/unretire",
+             "/_sc/skills"],
+        )
+        self.assertEqual(calls[4][1], {"name": "eng_a"})
+        self.assertEqual(calls[5][1], {"name": "eng_a"})
+
+    def test_unreadable_private_state_without_token_stays_loud(self):
+        skill_mod.mem.SC_API_TOKEN = ""
+        skill_mod.DB_PATH = None
+        with contextlib.ExitStack() as stack:
+            for patch in self._restricted_resolvers():
+                stack.enter_context(patch)
+            with self.assertRaises(skill_mod.instance_state.InstanceStateError):
+                skill_mod.main(["retire", "eng_a"])
 
 
 if __name__ == "__main__":

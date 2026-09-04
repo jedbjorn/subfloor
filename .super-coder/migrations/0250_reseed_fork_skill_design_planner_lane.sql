@@ -1,11 +1,18 @@
----
-name: fork_skill_design
-description: Design and maintain DB-canonical fork-local skills that describe the fork's real systems, tools, testing seats, and core processes. Planner-only; use when a capability needs durable shell guidance without becoming global doctrine.
-category: substrate
-common: false
----
+-- 0250 — reseed fork_skill_design for the complete Planner skill lane.
+-- Every `sc skill` verb, retire/unretire included, now rides the engine API
+-- from a launched Planner seat; the retire list is instance-local state
+-- (subfloor#1493). No schema change: a full-body UPSERT converges upgraded
+-- installations on the same text a fresh seed produces.
 
-# fork_skill_design — describe fork capabilities
+BEGIN;
+
+INSERT INTO skills (name, description, category, command, common, content, is_deleted) VALUES (
+  'fork_skill_design',
+  'Design and maintain DB-canonical fork-local skills that describe the fork''s real systems, tools, testing seats, and core processes. Planner-only; use when a capability needs durable shell guidance without becoming global doctrine.',
+  'substrate',
+  NULL,
+  0,
+  '# fork_skill_design — describe fork capabilities
 
 Use a fork-local skill when shells need durable knowledge specific to this
 repository, stack, host, VM, deployment surface, database, or core fork
@@ -53,7 +60,7 @@ Describe locations, commands, states, boundaries, and receipts. A testing-seat
 skill identifies the runner, fixtures, reach, readiness, and evidence; it does
 not choose assertions. A VM or host skill identifies the supplied control
 surface and reset boundary; it does not invent a lifecycle. A deployment or
-database skill records the fork's tracked procedure and authority; it does not
+database skill records the fork''s tracked procedure and authority; it does not
 teach generic deployment or SQL technique.
 
 Persist and grant through the supported DB-canonical surface:
@@ -70,8 +77,8 @@ naming a Bespoke shell changes only that shell. Creation grants nothing.
 
 A launched Planner seat runs under the restricted execution view and cannot
 open the engine DB directly; every `sc skill` verb then falls back to the
-engine API's Planner-owned skill lane, which runs the identical validation and
-persistence server-side. `sc skill list` shows each row's category so a
+engine API''s Planner-owned skill lane, which runs the identical validation and
+persistence server-side. `sc skill list` shows each row''s category so a
 redraft can carry the existing metadata forward.
 
 ## Update, retire, and recover
@@ -93,4 +100,12 @@ state and rides `sc update`; it is never committed.
 
 Keep fork-local skill bodies on the supported `sc skill` surface; do not place
 them under engine assets, regenerate the engine seed for them, or set them
-common.
+common.',
+  0
+)
+ON CONFLICT(name) DO UPDATE SET
+  description=excluded.description, category=excluded.category,
+  command=excluded.command, common=excluded.common,
+  content=excluded.content, is_deleted=0;
+
+COMMIT;

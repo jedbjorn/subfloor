@@ -26,13 +26,23 @@ import skill_projection
 from _serialize_guard import require_admin
 from seed_skills import sync_engine_skills
 
-DB_PATH = instance_state.active_database_path(ENGINE)
+# Resolved when a render opens the DB, never at import: `sc skill` imports
+# this module from launched seats that cannot read the private state root
+# (#1493). Tests may pin it.
+DB_PATH: Path | None = None
+
+
+def _db_path() -> Path:
+    if DB_PATH is not None:
+        return DB_PATH
+    return instance_state.active_database_path(ENGINE)
 
 
 def _open():
-    if not DB_PATH.exists() or DB_PATH.stat().st_size == 0:
-        sys.exit(f"render: no usable DB at {DB_PATH} — run `./sc rebuild` first.")
-    return db_driver.connect(DB_PATH)
+    db_path = _db_path()
+    if not db_path.exists() or db_path.stat().st_size == 0:
+        sys.exit(f"render: no usable DB at {db_path} — run `./sc rebuild` first.")
+    return db_driver.connect(db_path)
 
 
 def _resolve_shell(con, shortname: str):
