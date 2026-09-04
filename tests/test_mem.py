@@ -1312,6 +1312,61 @@ class ApiMemTest(unittest.TestCase):
             "derived candidate",
         )
 
+    def test_frozen_doc_render_path_moves_off_a_collision(self):
+        # subfloor#629: a retired frozen duplicate sharing a render_path with
+        # its live successor stalls every flat render on the fork. The frozen
+        # row's path is the only thing that may change, and changing it must
+        # clear the collision.
+        body = self.tmp / "frozen-collision.md"
+        body.write_text("# sales site\n")
+        self.run_mem("roadmap", "add", "frozen collision feature")
+        feature_id = self.q(
+            "SELECT feature_id FROM roadmap WHERE title='frozen collision feature'"
+        )[0]
+        self.run_mem(
+            "doc", "add", "SC-099 Sales Site", "--kind", "spec",
+            "--body-file", str(body), "--render-path", "specs_sc/sc-099-sales-site.md",
+            "--feature", str(feature_id),
+        )
+        live = self.q(
+            "SELECT document_id FROM documents WHERE title='SC-099 Sales Site'"
+        )[0]
+        # Legacy rows predate the write-side duplicate check: seed the
+        # collision directly, the way such a row exists on a real fork.
+        retired = self.write(
+            "INSERT INTO documents (feature_id,kind,seq,title,body,render_path,frozen) "
+            "VALUES (?,'spec',2,'RETIRED (dupe)','# sales site\n',"
+            "'specs_sc/sc-099-sales-site.md',1)",
+            feature_id,
+        )
+        self.assertEqual(
+            self.q("SELECT COUNT(*) FROM documents WHERE render_path=?",
+                   "specs_sc/sc-099-sales-site.md")[0],
+            2,
+        )
+
+        with self.assertRaises(SystemExit) as caught:
+            self.run_mem("doc", "edit", str(retired), "--title", "RETIRED")
+        self.assertIn("frozen", str(caught.exception))
+        with self.assertRaises(SystemExit) as caught:
+            self.run_mem("doc", "edit", str(retired),
+                         "--render-path", "specs_sc/sc-099-sales-site.md")
+        self.assertIn("document IDs", str(caught.exception))
+
+        self.assertEqual(
+            self.run_mem("doc", "edit", str(retired),
+                         "--render-path", "specs_sc/sc-099-sales-site-retired.md"),
+            0,
+        )
+        row = self.q("SELECT title,render_path,frozen FROM documents WHERE document_id=?",
+                     retired)
+        self.assertEqual(tuple(row),
+                         ("RETIRED (dupe)", "specs_sc/sc-099-sales-site-retired.md", 1))
+        self.assertEqual(
+            self.q("SELECT render_path FROM documents WHERE document_id=?", live)[0],
+            "specs_sc/sc-099-sales-site.md",
+        )
+
     def test_concurrent_doc_adds_cannot_claim_one_render_path(self):
         self.run_mem("roadmap", "add", "concurrent render owners")
         feature_id = self.q(

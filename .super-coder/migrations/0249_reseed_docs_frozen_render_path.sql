@@ -1,11 +1,19 @@
----
-name: docs
-description: Author or review docs & specs in Subfloor. The DB owns the body (documents table); roadmap tracks specs (the dev cycle), the Docs tab holds docs. Use whenever asked for a doc, spec, report, design, RFC, ADR, runbook, or to edit existing ones.
-category: substrate
-common: false
----
+-- 0249 — reseed docs with the frozen render_path allowance.
+-- A frozen document's render_path is a location, not content: `sc mem doc
+-- edit <id> --render-path` now moves a frozen row off a colliding path
+-- (subfloor#629). The docs skill says so. No schema change: a full-body
+-- UPSERT converges upgraded installations on the same text a fresh seed
+-- produces.
 
-# docs — author & review documents
+BEGIN;
+
+INSERT INTO skills (name, description, category, command, common, content, is_deleted) VALUES (
+  'docs',
+  'Author or review docs & specs in Subfloor. The DB owns the body (documents table); roadmap tracks specs (the dev cycle), the Docs tab holds docs. Use whenever asked for a doc, spec, report, design, RFC, ADR, runbook, or to edit existing ones.',
+  'substrate',
+  NULL,
+  0,
+  '# docs — author & review documents
 
 The DB owns document bodies: a `documents` row is the source — NEVER author a
 loose `.md` file as the canonical body. `sc render` writes the read-only flat
@@ -22,11 +30,11 @@ copy to `specs_sc/` / `docs_sc/`; the GUI opens it rendered in md-converter.
 
 Feature = the `roadmap` row; exists from `brainstorm` onward, before any spec.
 Specs hang off the feature, not off each other: several unfrozen specs per
-feature, each a `documents (kind='spec')` row, ordered by `seq`. No
+feature, each a `documents (kind=''spec'')` row, ordered by `seq`. No
 feature-to-feature links; related work within one mental model is another spec
 under the same feature. A genuinely new era may split into a fresh feature by
 moving its unfrozen active spec through the guarded workflow below. Freeze =
-the ship-time record of what was built to; it never gates the feature's other
+the ship-time record of what was built to; it never gates the feature''s other
 specs.
 
 | state | test | meaning |
@@ -35,13 +43,13 @@ specs.
 | **active** | unfrozen + has rows in `spec_tasks` | the spec being built now |
 | **backlog** | unfrozen, no task plan | the pile, ordered by `seq` |
 
-The **doc** (`kind='doc'`) = the feature's readable face — write it when the
+The **doc** (`kind=''doc''`) = the feature''s readable face — write it when the
 first spec ships, under the same `feature_id`. Sibling of the specs, not a
 parent.
 
 ## Split an active era from feature history
 
-When accumulated history makes a feature's active context misleading or a new
+When accumulated history makes a feature''s active context misleading or a new
 era has become a separate mental model, preserve the old feature as history and
 move the existing unfrozen active spec intact:
 
@@ -49,11 +57,11 @@ move the existing unfrozen active spec intact:
 2. Run `sc mem doc move <document_id> --feature <target_feature_id>`.
 3. Re-read the document and task ledger under the target feature; the same ids,
    task states, and document-linked decisions must now project there.
-4. Edit the historical feature's title/summary to name the split, then set its
+4. Edit the historical feature''s title/summary to name the split, then set its
    truthful terminal status (`shipped` for delivered history, `retired` for
    abandoned history).
 
-The move assigns the spec's next target-feature sequence and is atomic across
+The move assigns the spec''s next target-feature sequence and is atomic across
 the document, its tasks, and document-linked decisions. It refuses frozen
 specs, ordinary docs, terminal targets, and any spec already bound to a Sprint.
 Do not duplicate the spec or cancel/recreate its tasks when this move applies.
@@ -67,7 +75,7 @@ work-stream in the same act:
 
 ```
 sc mem get projects   # existing work-streams — pick the fit
-sc mem get roadmap    # this feature's current project_id
+sc mem get roadmap    # this feature''s current project_id
 ```
 
 | case | action |
@@ -75,21 +83,21 @@ sc mem get roadmap    # this feature's current project_id
 | new feature | create pre-assigned: `sc mem roadmap add "<title>" --project <shortname>` |
 | existing + Ungrouped | `sc mem roadmap project <feature_id> <shortname>` |
 | no fitting stream | `sc mem project add <shortname> "<title>" --purpose "…"` -> then assign |
-| already correctly assigned | no-op — don't churn |
+| already correctly assigned | no-op — don''t churn |
 
 Auto-assign when only one plausible fit / it clearly belongs to an existing
 stream. Surface to the FnB only when ambiguous — several streams fit, or a
-new stream you're unsure how to name. Exempt (as with stages): work that
-isn't a feature/spec (a quick fix) needs no work-stream.
+new stream you''re unsure how to name. Exempt (as with stages): work that
+isn''t a feature/spec (a quick fix) needs no work-stream.
 
 ## Establish posture, then challenge
 
-Before writing — don't duplicate, don't re-litigate, and don't transcribe the
+Before writing — don''t duplicate, don''t re-litigate, and don''t transcribe the
 request uncritically:
 ```
 sc mem get documents      # every control-plane spec/doc (kind, seq, frozen, task_count)
 sc mem get decisions      # active-decision index (<id> = full row + rationale; --all incl. superseded)
-sc map-sql "SELECT path FROM dr_filepath WHERE role='doc';"   # repo's own docs (map db)
+sc map-sql "SELECT path FROM dr_filepath WHERE role=''doc'';"   # repo''s own docs (map db)
 ```
 
 Spec touches a recorded decision -> honor it, or supersede explicitly: say so
@@ -144,17 +152,17 @@ in-process API lock — sufficient because these artifacts only ever come from
 manual admin-shell or GUI actions (single writer by design; cross-process
 concurrency is out of scope for v1, decision #20 / roadmap #21).
 ```
-# a doc against a feature (kind='doc'); DB owns the body:
+# a doc against a feature (kind=''doc''); DB owns the body:
 sc mem doc add "…" --kind doc --feature <id> --body-file ./draft.md --render-path docs_sc/….md
 
-# a feature's next spec stage (kind='spec'); seq auto-advances:
+# a feature''s next spec stage (kind=''spec''); seq auto-advances:
 sc mem doc add "…" --kind spec --feature <id> --body-file ./draft.md --render-path specs_sc/….md
 ```
 
 ## Specs carry "Anticipated User Activity"
 
-Every spec (`kind='spec'`) ships an `## Anticipated User Activity` section —
-the feature's posture statement: who is expected to touch it, where it can be
+Every spec (`kind=''spec''`) ships an `## Anticipated User Activity` section —
+the feature''s posture statement: who is expected to touch it, where it can be
 reached, how much process guidance each surface needs, which safety controls its
 exposure and impact require, whose data it holds, and what it does not intend to
 allow. Soft vocabulary, hard invariants — the nouns stay gentle, every statement
@@ -197,7 +205,7 @@ the activity roles above and are not mutually exclusive:
 
 Separate **process curation** from **safety hardening**. Expertise can reduce
 explanation and hand-holding; it never waives correctness, input validation,
-authorization, tenancy, or safe failure. Derive hardening from the surface's
+authorization, tenancy, or safe failure. Derive hardening from the surface''s
 reach and consequence, not from a single audience ranking. An Unknown User
 demands the strongest unanticipated-input posture; an Administrator may demand
 the strongest authority and recovery controls. State concrete obligations, not
@@ -226,7 +234,7 @@ it.
 Unfrozen -> edit in place: no new row, no seq bump. Pass any of `--title` /
 `--body-file` / `--render-path`; renders + snapshots like `add`. Frozen ->
 title + body refused; open a new spec under the same feature instead. A
-frozen doc's `--render-path` alone stays editable: it is a location, not
+frozen doc''s `--render-path` alone stays editable: it is a location, not
 content, so a retired or mis-pathed frozen row that collides in the render
 layer can be moved off the path without unfreezing it:
 ```
@@ -235,18 +243,18 @@ sc mem doc edit <document_id> --title "New title" --render-path specs_sc/….md
 sc mem doc edit <frozen_id> --render-path specs_sc/<slug>-retired.md   # frozen: path only
 ```
 
-## Freeze + document on ship — the planner's handoff
+## Freeze + document on ship — the planner''s handoff
 
 Shipping is a two-shell act (keeps `shipped` honest):
 
 - **dev**: flips `roadmap_status = shipped` + opens a **docs-pending** flag
-  (`spec` skill, Step 5) — `shipped` never silently claims a doc that doesn't
+  (`spec` skill, Step 5) — `shipped` never silently claims a doc that doesn''t
   exist yet.
 - **planner**: on that flag (arrives in your inbox per the `flags` skill), do
   the paperwork:
 
-1. **Freeze the shipped spec** — immutable thereafter; the feature's other
-   specs stay unfrozen and unaffected. NEVER edit a frozen spec's content
+1. **Freeze the shipped spec** — immutable thereafter; the feature''s other
+   specs stay unfrozen and unaffected. NEVER edit a frozen spec''s content
    (open a new spec under the same feature); the GUI and render layer both
    refuse title/body edits to frozen docs — only its render path may move:
    ```
@@ -278,7 +286,7 @@ markdown to `body`; render + md-converter own presentation.
 # Authoring format (themed-markdown)
 
 The `body` you write IS themed-markdown — the format md-converter renders.
-Your job = structure; styling = the renderer's job. NEVER write visual
+Your job = structure; styling = the renderer''s job. NEVER write visual
 instructions (colors, fonts, sizes, themes) — apply the four semantic
 classes; the theme picks colors.
 
@@ -444,7 +452,15 @@ GitHub, dropped from the render by the preamble rule):
 [![Open in md-converter](https://img.shields.io/badge/Open%20in-md--converter-6b46c1?style=flat-square)](https://md-converter.designs-os.com/?url=https://github.com/<owner>/<repo>/blob/<branch>/<path>)
 ```
 
-Fill `<owner>/<repo>/<branch>/<path>` with the file's GitHub location (any
+Fill `<owner>/<repo>/<branch>/<path>` with the file''s GitHub location (any
 subdirectory depth). Public repos only — the badge fetches the raw file in
-the reader's browser (no server/auth). Destination unknown -> keep the
-placeholders and tell the user to fill them.
+the reader''s browser (no server/auth). Destination unknown -> keep the
+placeholders and tell the user to fill them.',
+  0
+)
+ON CONFLICT(name) DO UPDATE SET
+  description=excluded.description, category=excluded.category,
+  command=excluded.command, common=excluded.common,
+  content=excluded.content, is_deleted=0;
+
+COMMIT;

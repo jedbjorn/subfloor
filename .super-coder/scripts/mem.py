@@ -62,7 +62,7 @@ Run from the repo root, like every engine command:
     ./sc mem task edit <task_id>     [--title "…"] [--desc "…"]   # revise title/description
     ./sc mem oriented                # mark first-run complete (bootstrapped=1)
     ./sc mem doc add "<title>" --body-file PATH [--feature ID] [--kind spec|doc] [--seq N]
-    ./sc mem doc edit <document_id>  [--title "…"] [--body-file PATH] [--render-path …]   # unfrozen only
+    ./sc mem doc edit <document_id>  [--title "…"] [--body-file PATH] [--render-path …]   # frozen: --render-path only
     ./sc mem doc move <document_id>  --feature <target_feature_id>   # unfrozen spec + plan, atomic
     ./sc mem doc freeze <document_id>
     ./sc mem doc qaqc <spec_document_id> --verdict approved|changes_requested [--findings-doc ID]
@@ -1142,7 +1142,7 @@ def build_parser() -> argparse.ArgumentParser:
     da.add_argument("--kind", default="spec", choices=["spec", "doc"])
     da.add_argument("--seq", type=int)
     da.add_argument("--render-path", dest="render_path")
-    de = dsub.add_parser("edit", help="revise an unfrozen doc's title/body/render-path")
+    de = dsub.add_parser("edit", help="revise a doc's title/body/render-path (frozen: render-path only)")
     de.add_argument("document_id", type=int)
     de.add_argument("--title")
     de.add_argument("--body-file", dest="body_file")

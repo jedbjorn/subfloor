@@ -495,6 +495,49 @@ class GoverningRevisionCase(unittest.TestCase):
         self.assertEqual(0, self.con.execute("SELECT COUNT(*) FROM sprint_events").fetchone()[0])
         self.assertEqual(0, self.con.execute("SELECT COUNT(*) FROM wake_message").fetchone()[0])
 
+    def test_frozen_document_accepts_only_render_path(self) -> None:
+        # A frozen row's content is immutable, but its render_path is a
+        # location: it must stay movable so a frozen doc that collides in the
+        # render layer can be cleared without unfreezing (#629).
+        self.con.execute(
+            "UPDATE documents SET frozen=1 WHERE document_id=?", (self.document_id,)
+        )
+        self.con.commit()
+        for payload in (
+            {"body": "# rewritten\n"},
+            {"title": "Renamed"},
+            {"title": "Renamed", "render_path": "specs_sc/moved.md"},
+        ):
+            ok, err = server.patch_document(
+                self.con,
+                self.document_id,
+                payload,
+                editor_surface="shell_api",
+                editor_shell_id=2,
+            )
+            self.assertFalse(ok, payload)
+            self.assertIn("document is frozen", err)
+            self.assertIn("only render_path", err)
+        self.assertEqual(
+            (True, None),
+            server.patch_document(
+                self.con,
+                self.document_id,
+                {"render_path": "specs_sc/moved.md"},
+                editor_surface="shell_api",
+                editor_shell_id=2,
+            ),
+        )
+        row = self.con.execute(
+            "SELECT title,body,render_path,frozen FROM documents WHERE document_id=?",
+            (self.document_id,),
+        ).fetchone()
+        self.assertEqual(
+            ("Governing spec", self.original, "specs_sc/moved.md", 1), tuple(row)
+        )
+        self.assertEqual(0, self.con.execute("SELECT COUNT(*) FROM sprint_events").fetchone()[0])
+        self.assertEqual(0, self.con.execute("SELECT COUNT(*) FROM wake_message").fetchone()[0])
+
     def test_relay_failure_rolls_back_document_event_and_wake(self) -> None:
         with mock.patch.object(
             sprint_message_delivery.SprintMessageStore,
