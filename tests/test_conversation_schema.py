@@ -19,6 +19,7 @@ FOUNDATION = MIGRATIONS / "0132_conversation_foundation.sql"
 GIT_TARGETS = MIGRATIONS / "0142_conversation_git_targets.sql"
 ACTIVE_REGISTRY = MIGRATIONS / "0162_active_chat_registry.sql"
 REAPER_IDENTITY = MIGRATIONS / "0163_conversation_run_process_identity.sql"
+TRANSCRIPT_OFFSET = MIGRATIONS / "0249_conversation_run_transcript_offset.sql"
 TOPOLOGY_RETIREMENT = MIGRATIONS / "0168_retire_sprint_conversation_topology.sql"
 LIVE_NATIVE_ROUTES = MIGRATIONS / "0238_final_schema_rebaseline.sql"
 
@@ -451,6 +452,79 @@ class MigrationAndShapeTest(ConversationDbCase):
                 row,
                 ("running", None, None, None, None, None),
             )
+
+    def test_transcript_migration_frees_only_finished_run_identity(self) -> None:
+        with closing(sqlite3.connect(":memory:")) as con:
+            con.row_factory = sqlite3.Row
+            apply_schema(con, through="0248_reseed_sprint_pln_orientation.sql")
+            con.execute("INSERT INTO users (user_id,username) VALUES (7,'live')")
+            con.execute(
+                "INSERT INTO shells "
+                "(shell_id,display_name,shortname,flavor,system_prompt,user_id) "
+                "VALUES (7,'Live','live7','dev','prompt',7)"
+            )
+            con.execute(
+                "INSERT INTO conversations "
+                "(conversation_id,shell_id,owner_user_id,harness,worktree,state,"
+                "creation_idempotency_key,creation_request_hash) VALUES "
+                "('cv_transcript',7,7,'claude','/tmp/live','running',"
+                "'transcript','transcript-hash')"
+            )
+            message_id = con.execute(
+                "INSERT INTO conversation_messages "
+                "(conversation_id,sender_kind,sender_ref,message_kind,body,"
+                "idempotency_key,request_hash,state) VALUES "
+                "('cv_transcript','user','7','prompt','hello','m','h','running')"
+            ).lastrowid
+            for attempt, state in (
+                (1, "succeeded"),
+                (2, "unknown"),
+                (3, "running"),
+            ):
+                con.execute(
+                    "INSERT INTO conversation_runs "
+                    "(conversation_id,shell_id,trigger_message_id,attempt,state,"
+                    "lease_owner,lease_expires_at,started_at,ended_at,"
+                    "process_pid,process_start_ticks,process_group_id) VALUES "
+                    "('cv_transcript',7,?,?,?,'broker','2999-01-01 00:00:00',"
+                    "'2026-09-01 00:00:00',?,4321,99,4321)",
+                    (
+                        message_id,
+                        attempt,
+                        state,
+                        None if state == "running" else "2026-09-01 00:01:00",
+                    ),
+                )
+            con.commit()
+
+            migrate.apply(con, TRANSCRIPT_OFFSET)
+
+            columns = {
+                row["name"]: row["type"]
+                for row in con.execute("PRAGMA table_info(conversation_runs)")
+            }
+            self.assertEqual(columns.get("transcript_path"), "TEXT")
+            self.assertEqual(columns.get("transcript_offset"), "INTEGER")
+            self.assertEqual(
+                [
+                    tuple(row)
+                    for row in con.execute(
+                        "SELECT state,process_pid,process_start_ticks,"
+                        "process_group_id,transcript_path,transcript_offset "
+                        "FROM conversation_runs ORDER BY attempt"
+                    )
+                ],
+                [
+                    ("succeeded", None, None, None, None, None),
+                    ("unknown", 4321, 99, 4321, None, None),
+                    ("running", 4321, 99, 4321, None, None),
+                ],
+            )
+            with self.assertRaises(sqlite3.IntegrityError):
+                con.execute(
+                    "UPDATE conversation_runs SET transcript_offset=-1 "
+                    "WHERE attempt=3"
+                )
 
     def test_star_migration_defaults_legacy_rows_and_enforces_boolean_values(self) -> None:
         with closing(sqlite3.connect(":memory:")) as con:
