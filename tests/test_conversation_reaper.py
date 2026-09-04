@@ -416,7 +416,7 @@ class ConversationReaperTest(unittest.TestCase):
         self.assertEqual(conversation_state, "error")
         self.assertEqual(
             [row["event_type"] for row in events],
-            ["run.unknown", "run.reaped"],
+            ["run.unknown", "run.interrupted"],
         )
 
     def test_unknown_run_without_process_identity_is_untouched(self) -> None:

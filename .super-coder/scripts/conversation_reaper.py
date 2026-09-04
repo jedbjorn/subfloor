@@ -375,7 +375,12 @@ class ReaperStore:
                 if row is None:
                     return False
                 run_state = str(row["state"])
-                if run_state in TERMINAL_RUN_STATES:
+                # `unknown` keeps its pre-lingering record: state untouched,
+                # `run.interrupted` as the reaper's outcome. Only a run the
+                # broker proved finished gets the `run.reaped` record.
+                if run_state == "unknown":
+                    self._append_interrupted_event(con, candidate, reason)
+                elif run_state in TERMINAL_RUN_STATES:
                     self._append_reaped_event(con, candidate, reason, run_state)
                 else:
                     require_transition("run", run_state, "cancelled")
