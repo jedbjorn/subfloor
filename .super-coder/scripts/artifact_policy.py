@@ -69,6 +69,19 @@ def content_path() -> Path:
     return instance_state.active_snapshot_path(REPO_ROOT)
 
 
+def display_path(path: Path) -> str:
+    """Render a path for humans, repo-relative when it lives in the checkout.
+
+    Relocation moved the per-instance snapshot out of REPO_ROOT, so any
+    artifact path may now be absolute and outside it; `relative_to` would
+    raise. Report the absolute path in that case.
+    """
+    try:
+        return str(path.relative_to(REPO_ROOT))
+    except ValueError:
+        return str(path)
+
+
 def render_root() -> Path:
     return LOCAL_DIR / "renders"
 
@@ -186,8 +199,8 @@ def main(argv: list[str]) -> int:
     if command == "show":
         print(json.dumps({
             "artifact_mode": mode(),
-            "snapshot": str(content_path().relative_to(REPO_ROOT)),
-            "renders": str(render_root().relative_to(REPO_ROOT)),
+            "snapshot": display_path(content_path()),
+            "renders": display_path(render_root()),
             "git_publication": False,
         }, indent=2))
         return 0

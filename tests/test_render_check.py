@@ -2,10 +2,14 @@
 from __future__ import annotations
 
 import hashlib
+import io
+import shutil
 import sqlite3
 import sys
+import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS = ROOT / ".super-coder" / "scripts"
@@ -95,6 +99,35 @@ class RenderCheckDocumentDiagnosticsTest(unittest.TestCase):
             diagnostic,
         )
         self.assertNotIn("body_sha256", diagnostic)
+
+
+class RelocatedSnapshotReportTest(unittest.TestCase):
+    """Relocation put content.sql outside the checkout.
+
+    The drift branch names that path; an unguarded relative_to raised there,
+    so the crash replaced the very report the operator needed.
+    """
+
+    def test_drift_report_names_a_snapshot_outside_the_checkout(self):
+        relocated = Path("/var/lib/subfloor/instances/deadbeef/content.sql")
+        mirror = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, mirror, True)
+        (mirror / "roadmap_sc.md").write_text("stale")
+
+        with (
+            mock.patch.object(render_check, "CONTENT", relocated),
+            mock.patch.object(render_check, "ACTIVE_ROOT", mirror),
+            mock.patch.object(render_check, "LIVE_DB", mirror / "absent.db"),
+            mock.patch.object(render_check, "_build_tracked_db"),
+            mock.patch.object(render_check.flat, "render_visibility"),
+            mock.patch.object(render_check.artifact_policy, "prepare_local_state"),
+            mock.patch.object(sys, "stderr", io.StringIO()) as err,
+        ):
+            self.assertEqual(render_check.main(), 1)
+
+        report = err.getvalue()
+        self.assertIn(str(relocated), report)
+        self.assertIn("roadmap_sc.md", report)
 
 
 if __name__ == "__main__":

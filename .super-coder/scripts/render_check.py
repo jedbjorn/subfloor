@@ -202,8 +202,8 @@ def main() -> int:
             sys.stderr.write(
                 "✗ render drift: the active flat _sc mirror does not match the\n"
                 "  mirror rendered from the active sources (schema + migrations +\n"
-                f"  {CONTENT.relative_to(REPO_ROOT)}). A source edit was made without\n"
-                "  re-rendering the mirror.\n\n"
+                f"  {artifact_policy.display_path(CONTENT)}). A source edit was made\n"
+                "  without re-rendering the mirror.\n\n"
                 + "".join(f"{line}\n" for line in _target_lines())
                 + "\n  drifted:\n"
                 + "".join(f"    {p}\n" for p in drifted)

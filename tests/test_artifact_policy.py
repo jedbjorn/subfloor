@@ -109,6 +109,22 @@ class ArtifactPolicyTest(unittest.TestCase):
             self.assertEqual(artifact_policy.main(["path", "map-db"]), 0)
         output.assert_called_once_with(self.state / "local" / "map" / "map.db")
 
+    def test_show_reports_a_relocated_snapshot_outside_the_checkout(self):
+        """Relocation puts content.sql outside REPO_ROOT; `show` must not raise."""
+        relocated = self.tmp.parent / "relocated-instance" / "content.sql"
+        with mock.patch.object(artifact_policy, "content_path", return_value=relocated):
+            with mock.patch("builtins.print") as output:
+                self.assertEqual(artifact_policy.main(["show"]), 0)
+        payload = json.loads(output.call_args[0][0])
+        self.assertEqual(payload["snapshot"], str(relocated))
+        self.assertEqual(payload["renders"], ".sc-state/local/renders")
+
+    def test_display_path_is_repo_relative_inside_the_checkout(self):
+        self.assertEqual(
+            artifact_policy.display_path(self.tmp / ".sc-state" / "local" / "x.sql"),
+            ".sc-state/local/x.sql",
+        )
+
     def test_content_write_lock_uses_ignored_local_state(self):
         lock = self.state / "local" / ".content-write.lock"
         with artifact_policy.content_write_lock():
