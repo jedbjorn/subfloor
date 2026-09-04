@@ -48,9 +48,19 @@ import model_catalog  # noqa: E402
 
 # Copied engine minus caches and anything instance-owned: the fixture's live
 # state is the sentinel this module writes, never a real fork's.
+#
+# Two of these matter only once state is relocated out of the checkout:
+#   instance.json  binds an engine to a private state directory, so a fixture
+#                  that inherits the host's copy resolves the HOST's live DB
+#                  instead of its own sentinel — the isolation this module exists
+#                  to prove.
+#   run            holds the running engine's unix sockets (ts-broker.sock),
+#                  which copy2 cannot copy at all: "[Errno 6] No such device or
+#                  address", failing the whole copytree — and, because that
+#                  raises in setUpClass, orphaning the ~400MB fixture.
 IGNORE = shutil.ignore_patterns(
     "__pycache__", "*.pyc", "shell_db.db*", "backups", "node_modules",
-    "logs",
+    "logs", "run", "instance.json",
 )
 
 # A skill row in a migration only one checkout holds exercises that checkout's
@@ -196,6 +206,9 @@ class WorktreeFixture(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls._tmp = tempfile.mkdtemp(prefix="sc_wt_")
+        # Registered before anything can fail: unittest skips tearDownClass
+        # when setUpClass raises, and this fixture is a ~400MB engine copy.
+        cls.addClassCleanup(shutil.rmtree, cls._tmp, ignore_errors=True)
         tmp = Path(cls._tmp)
         cls.main = tmp / "main"
         cls.main.mkdir()
@@ -232,10 +245,6 @@ class WorktreeFixture(unittest.TestCase):
         cls.pristine = tmp / "pristine"
         cls.pristine.mkdir()
         shutil.copy2(cls.live_db, cls.pristine / "shell_db.db")
-
-    @classmethod
-    def tearDownClass(cls):
-        shutil.rmtree(cls._tmp, ignore_errors=True)
 
     def setUp(self):
         """Restore the live state so each test meets the same instance."""
