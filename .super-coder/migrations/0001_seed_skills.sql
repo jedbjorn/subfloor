@@ -56,7 +56,7 @@ gitignored. After `self_update` succeeds, stage only the durable public update:
 ```bash
 git add .sc-state/engine.ref
 git status --short
-SC_SHELL_FLAVOR=admin git commit -m "chore: update super-coder engine pin"
+SC_SHELL_FLAVOR=admin git commit -m "chore: update subfloor engine pin"
 ```
 
 Set the marker on this commit command even inside an Admin shell. The update
@@ -94,7 +94,7 @@ deleted.
 git ls-files --error-unmatch .super-coder/schema.sql
 ```
 
-Exit 0 means this repository authors super-coder itself: `.super-coder/` is
+Exit 0 means this repository authors Subfloor itself: `.super-coder/` is
 tracked source, not a dependency, and `.sc-state/engine.ref` is not the delivery
 unit. Engine implementation still arrives through a Developer branch and PR;
 Admin fast-forwards main and merges only the exact approved PR. Apply live
@@ -651,7 +651,7 @@ ON CONFLICT(name) DO UPDATE SET
 
 INSERT INTO skills (name, description, category, command, common, content, is_deleted) VALUES (
   'docs',
-  'Author or review docs & specs in super-coder. The DB owns the body (documents table); roadmap tracks specs (the dev cycle), the Docs tab holds docs. Use whenever asked for a doc, spec, report, design, RFC, ADR, runbook, or to edit existing ones.',
+  'Author or review docs & specs in Subfloor. The DB owns the body (documents table); roadmap tracks specs (the dev cycle), the Docs tab holds docs. Use whenever asked for a doc, spec, report, design, RFC, ADR, runbook, or to edit existing ones.',
   'substrate',
   NULL,
   0,
@@ -875,10 +875,14 @@ it.
 
 Unfrozen -> edit in place: no new row, no seq bump. Pass any of `--title` /
 `--body-file` / `--render-path`; renders + snapshots like `add`. Frozen ->
-refused; open a new spec under the same feature instead:
+title + body refused; open a new spec under the same feature instead. A
+frozen doc''s `--render-path` alone stays editable: it is a location, not
+content, so a retired or mis-pathed frozen row that collides in the render
+layer can be moved off the path without unfreezing it:
 ```
 sc mem doc edit <document_id> --body-file ./draft.md
 sc mem doc edit <document_id> --title "New title" --render-path specs_sc/….md
+sc mem doc edit <frozen_id> --render-path specs_sc/<slug>-retired.md   # frozen: path only
 ```
 
 ## Freeze + document on ship — the planner''s handoff
@@ -892,9 +896,9 @@ Shipping is a two-shell act (keeps `shipped` honest):
   the paperwork:
 
 1. **Freeze the shipped spec** — immutable thereafter; the feature''s other
-   specs stay unfrozen and unaffected. NEVER edit a frozen spec (open a new
-   spec under the same feature); the GUI and render layer both refuse edits
-   to frozen docs:
+   specs stay unfrozen and unaffected. NEVER edit a frozen spec''s content
+   (open a new spec under the same feature); the GUI and render layer both
+   refuse title/body edits to frozen docs — only its render path may move:
    ```
    sc mem doc freeze <document_id>
    ```
@@ -1173,7 +1177,7 @@ operation with the runtime down.
 
 - API down, database healthy: use host Admin `sc health`, `sc logs`, and
   read-only `sc sql`, then restore the managed service with `sc restart` /
-  `make dos-r`.
+  `subfloor restart`.
 - Migration or rebuild work: load `engine_migrations` and require its backup,
   candidate, ledger, and restart receipts.
 - Snapshot or render repair: load `snapshot`; do not hand-edit serialized or
@@ -1638,15 +1642,15 @@ ON CONFLICT(name) DO UPDATE SET
 
 INSERT INTO skills (name, description, category, command, common, content, is_deleted) VALUES (
   'git',
-  'Git conventions for a super-coder shell — one repo, one cwd. Sync the base before work, branch before committing, open PRs (never merge without the FnB''s OK), attribute commits per-shell. Use before any git work.',
+  'Git conventions for a Subfloor shell — one repo, one cwd. Sync the base before work, branch before committing, open PRs (never merge without the FnB''s OK), attribute commits per-shell. Use before any git work.',
   'substrate',
   NULL,
   0,
-  '# git — version control, the super-coder way
+  '# git — version control, the Subfloor way
 
 One repo at its root -> plain `git` (cwd = repo root) is safe.
 
-Project = this repo minus `.super-coder/`. Engine = `.super-coder/` — gitignored, materialized by `sc update`, authored upstream in super-coder. NEVER commit or edit anything under `.super-coder/`.
+Project = this repo minus `.super-coder/`. Engine = `.super-coder/` — gitignored, materialized by `sc update`, authored upstream in Subfloor. NEVER commit or edit anything under `.super-coder/`.
 
 ## GitHub capability boundary
 
@@ -1923,7 +1927,7 @@ ON CONFLICT(name) DO UPDATE SET
 
 INSERT INTO skills (name, description, category, command, common, content, is_deleted) VALUES (
   'issue_reporting',
-  'Report engine defects upstream — the moment a sc command fails or lies, a skill contradicts your reality, the API blocks a documented workflow, or you work around the engine to proceed. File a GitHub issue on super-coder; your repo''s app bugs stay in the fork.',
+  'Report engine defects upstream — the moment a sc command fails or lies, a skill contradicts your reality, the API blocks a documented workflow, or you work around the engine to proceed. File a GitHub issue on Subfloor; your repo''s app bugs stay in the fork.',
   'substrate',
   NULL,
   1,
@@ -2516,7 +2520,7 @@ ON CONFLICT(name) DO UPDATE SET
 
 INSERT INTO skills (name, description, category, command, common, content, is_deleted) VALUES (
   'self_update',
-  'Update this fork''s super-coder engine in place — fetch + materialize new code + migrations, all memory intact; sound rollback. The shell hands off to its own next boot. Use when a super-coder update is available.',
+  'Update this fork''s Subfloor engine in place — fetch + materialize new code + migrations, all memory intact; sound rollback. The shell hands off to its own next boot. Use when a Subfloor update is available.',
   'substrate',
   'sc update',
   0,
@@ -3232,6 +3236,52 @@ Use the simplest path supported by current durable state. Treat authority,
 lifecycle, writes, and handoffs as hard boundaries. Repeat a read only when
 later activity could have changed it or a command requires revalidation.
 
+## How a Sprint runs
+
+One Sprint binds one roadmap feature, exact governing spec revisions, a
+participant set (you, Developers, Reviewers) each on one harness/model/Thinking
+level (`effort`) route, and work units: editing lanes made of spec tasks, each
+with one Developer and one Reviewer, ordered by dependencies and planned waves.
+
+Lifecycle: `prepared` (editable, `sprint_prep`) → `armed` (the runtime
+dispatches every dependency-ready lane as a Force-new Developer wake) ⇄
+`paused` (relay is off; restructuring and rerouting happen here) →
+`completed` or `aborted` (terminal; nothing is deleted). One Sprint is armed at
+a time.
+
+A lane''s life: dispatched → Developer builds on a branch, registers the PR,
+requests review → Reviewer records a verdict → Developer authorizes the merge
+on live green → the merged-work handoff wakes you → you dispatch whatever
+became ready. After the last lane the conformance Reviewer records the
+whole-Sprint report; the engine closes the Sprint and cleans worktrees. The
+engine delivers every wake and watches every registered PR; you never poll or
+boot participants.
+
+Authority: Reviewers own verdicts, conformance, and re-enter/abort judgment.
+You own plan structure: lanes, dependencies, waves, assignment, routes, pause,
+resume, dispatch. The FnB can override any of it from the GUI Sprints tab,
+which renders the same projection `sc sprint show` returns.
+
+## What you can read
+
+| Need | Read |
+|---|---|
+| Whole Sprint: lifecycle, participants with current routes, units, dependencies, PRs, health | `sc sprint show --sprint <id>` |
+| Messages addressed to you | `sc sprint inbox --sprint <id>` |
+| Exact bound spec body | `sc sprint spec-revision --sprint <id> --document <id> [--body-only]` |
+| PR-watcher evidence behind a stalled gate | `sc sprint watcher-state --sprint <id>` |
+| Post-Sprint cleanup evidence | `sc sprint cleanup-status --sprint <id>` |
+| Bounded history packet: judgments, pauses, anomalies, follow-ups | `sc sprint compile-report --sprint <id> --limit 50` |
+| Candidate routes and what each supports | `sc models list [<harness>]`; preview one with `sc models resolve <harness> [<model>] [--effort <level>]` |
+| Shell roster, feature, spec tasks, settled decisions | `sc mem get shells`, `sc mem get roadmap`, `sc mem get tasks --feature <id>`, `sc mem get decisions` |
+
+`show` participants carry `shell_id`, `role`, `harness`, `model`, `effort`,
+`binding_status`, and `route_revision`; units carry `developer`, `reviewer`,
+`disposition`, `prerequisite_ids`, and `pull_requests`. A Thinking level
+applies only to controlled routes: `null` model + `null` effort is Harness
+default, and Vibe takes no effort. Nothing else is readable from a shell; the
+engine database is not a surface.
+
 ## Route the entry
 
 Load `sprint_pln` on every entry, then classify:
@@ -3472,8 +3522,9 @@ Paused-only; retires the lane''s open expectations, supersedes its PR links
 (registration kept for reconcile-pr), and wakes both seats. Recall+replan
 ships revised work; resolve only closes the lane.
 
-To change future assignment/review model, pause armed Sprint, clear released
-expectation, then validate + replace route:
+To change future assignment/review model, pause armed Sprint, take each
+participant''s `shell_id` and current route from `sc sprint show`, preview the
+replacement with `sc models resolve`, then replace the route and resume:
 
 ```text
 sc sprint reroute-participant --sprint <id> --participant-shell <id> \
