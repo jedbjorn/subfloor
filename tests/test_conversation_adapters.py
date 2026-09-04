@@ -1270,6 +1270,80 @@ class ConversationAdapterTest(unittest.TestCase):
             ],
         )
 
+    def test_claude_reads_past_a_result_and_the_last_one_wins(self) -> None:
+        """A result is the harness reporting a turn, not the process exiting.
+
+        The stream keeps reading; a later result supersedes the earlier one,
+        EOF waits for the child, and no 'stream ended' failure follows a
+        terminal that was observed.
+        """
+        adapter, _runner = self.build("claude")
+        session_ref = "22222222-3333-4444-8555-666666666666"
+        rows = [
+            {"type": "system", "subtype": "init", "session_id": session_ref},
+            {
+                "type": "result",
+                "subtype": "success",
+                "session_id": session_ref,
+                "result": "background task",
+                "num_turns": 1,
+                "stop_reason": "end_turn",
+            },
+            {
+                "type": "stream_event",
+                "session_id": session_ref,
+                "event": {
+                    "type": "content_block_delta",
+                    "delta": {"type": "text_delta", "text": "the real turn"},
+                },
+            },
+            {
+                "type": "result",
+                "subtype": "success",
+                "session_id": session_ref,
+                "result": "the real turn",
+                "num_turns": 3,
+                "stop_reason": "end_turn",
+            },
+        ]
+        process = FakeClaudeProcess(session_ref)
+        process.stdout = io.StringIO(
+            "".join(json.dumps(row) + "\n" for row in rows)
+        )
+        turn = NativeTurn(
+            harness="claude",
+            session_ref=session_ref,
+            run_ref="claude-test",
+            worktree=self.root,
+            process_ref=str(process.pid),
+            metadata={"resumed": True},
+            opaque=process,
+        )
+
+        events = list(adapter.stream(turn))
+
+        terminals = [
+            event for event in events if event.type in base_adapter.TERMINAL_EVENTS
+        ]
+        self.assertEqual([event.type for event in terminals], ["run.completed"] * 2)
+        self.assertIs(terminals[-1], events[-1])
+        self.assertEqual(events[-1].payload["result"], "the real turn")
+        self.assertEqual(turn.metadata["terminal"], "run.completed")
+        self.assertEqual(turn.metadata["returncode"], 0)
+        self.assertEqual(process.returncode, 0)
+        self.assertNotIn(
+            "stream ended without a terminal result",
+            [event.payload.get("error") for event in events],
+        )
+        self.assertIn(
+            "the real turn",
+            [
+                event.payload.get("text")
+                for event in events
+                if event.type == "assistant.delta"
+            ],
+        )
+
     def test_interrupted_events_require_structured_evidence(self) -> None:
         with self.assertRaisesRegex(ValueError, "structured native or operator"):
             NormalizedEvent("run.interrupted", {"status": "interrupted"})

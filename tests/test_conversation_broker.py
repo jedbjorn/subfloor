@@ -235,6 +235,67 @@ class SparseDeltaAdapter(FakeAdapter):
         yield NormalizedEvent("run.completed", {"status": "completed"})
 
 
+class LingeringProcess:
+    """A native child that outlives the result line it printed."""
+
+    def __init__(self, *, alive: bool = True) -> None:
+        self.returncode: int | None = None if alive else 0
+
+    def poll(self) -> int | None:
+        return self.returncode
+
+    def exit(self) -> None:
+        self.returncode = 0
+
+
+class LingeringAdapter(FakeAdapter):
+    """Report a result, then keep the same process and stream working.
+
+    ``tail`` chooses what follows the first result: ``second`` another reply,
+    ``none`` an immediate exit, ``interrupt`` a wait for the operator signal.
+    """
+
+    def __init__(self, *, alive: bool = True, tail: str = "second") -> None:
+        super().__init__()
+        self.process = LingeringProcess(alive=alive)
+        self.tail = tail
+        self.first_terminal = threading.Event()
+        self.release = threading.Event()
+
+    def start(
+        self,
+        context: ConversationContext,
+        message: str,
+    ) -> NativeTurn:
+        turn = super().start(context, message)
+        turn.process_ref = str(os.getpid())
+        turn.opaque = self.process
+        return turn
+
+    def stream(self, turn: NativeTurn) -> Iterator[NormalizedEvent]:
+        yield NormalizedEvent("session.started", {"session_ref": turn.session_ref})
+        yield NormalizedEvent("assistant.delta", {"text": "first"})
+        yield NormalizedEvent(
+            "run.completed",
+            {"status": "completed", "result": "first"},
+        )
+        self.first_terminal.set()
+        if self.tail == "none":
+            self.process.exit()
+            return
+        self.release.wait(5)
+        if self.tail == "interrupt":
+            self.interrupted.wait(5)
+            self.process.exit()
+            return
+        yield NormalizedEvent("assistant.delta", {"text": "second"})
+        yield NormalizedEvent(
+            "run.completed",
+            {"status": "completed", "result": "second"},
+        )
+        self.process.exit()
+
+
 class ReconcileSequenceAdapter(FakeAdapter):
     """End the stream uncertain, then prove running and terminal states."""
 
@@ -805,6 +866,45 @@ class ConversationBrokerCase(unittest.TestCase):
         broker.start()
         self.assertTrue(broker.wait_started())
         return broker
+
+    def wait_run_attempt(
+        self,
+        message_id: int,
+        attempt: int,
+        timeout: float = 3,
+    ) -> int:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            con = self.connect()
+            row = con.execute(
+                "SELECT run_id FROM conversation_runs "
+                "WHERE trigger_message_id=? AND attempt=?",
+                (message_id, attempt),
+            ).fetchone()
+            con.close()
+            if row is not None:
+                return int(row[0])
+            time.sleep(0.01)
+        self.fail(f"message {message_id} never reached attempt {attempt}")
+
+    def registry_pid(self, shell_id: int = 1) -> int | None:
+        con = self.connect()
+        row = con.execute(
+            "SELECT process_pid FROM active_shell_chats WHERE shell_id=?",
+            (shell_id,),
+        ).fetchone()
+        con.close()
+        return None if row is None else row["process_pid"]
+
+    def conversation_events(self, conversation_id: str) -> list[sqlite3.Row]:
+        con = self.connect()
+        rows = con.execute(
+            "SELECT event_type,payload,run_id FROM conversation_events "
+            "WHERE conversation_id=? ORDER BY sequence",
+            (conversation_id,),
+        ).fetchall()
+        con.close()
+        return rows
 
     def wait_run_state(self, run_id: int, state: str, timeout: float = 3) -> None:
         deadline = time.monotonic() + timeout
@@ -2158,6 +2258,167 @@ class ServiceContractTest(ConversationBrokerCase):
         payload = json.loads(terminal["payload"])
         self.assertEqual(payload["adapter_terminal"], "run.failed")
         self.assertEqual(payload["interrupt_evidence"], "operator")
+
+    def test_late_result_supersedes_an_early_one_in_a_single_run(self) -> None:
+        adapter = LingeringAdapter(alive=False)
+        adapter.release.set()
+        broker = self.start_broker(lambda _harness: adapter)
+        conversation_id = self.add_conversation()
+        message_id = self.add_message(conversation_id)
+        broker.notify()
+
+        run_id = self.wait_run_attempt(message_id, 1)
+        self.wait_run_state(run_id, "succeeded")
+        self.assertTrue(broker.wait_idle(3))
+
+        con = self.connect()
+        attempts = [
+            row["attempt"]
+            for row in con.execute(
+                "SELECT attempt FROM conversation_runs "
+                "WHERE trigger_message_id=?",
+                (message_id,),
+            )
+        ]
+        con.close()
+        self.assertEqual(attempts, [1])
+        events = self.conversation_events(conversation_id)
+        terminals = [
+            json.loads(row["payload"])
+            for row in events
+            if row["event_type"] == "run.completed"
+        ]
+        self.assertEqual(len(terminals), 1)
+        self.assertEqual(terminals[0]["result"], "second")
+        deltas = [
+            (json.loads(row["payload"])["text"], row["run_id"])
+            for row in events
+            if row["event_type"] == "assistant.delta"
+        ]
+        self.assertEqual(deltas, [("first", run_id), ("second", run_id)])
+
+    def test_lingering_process_keeps_its_link_and_continues_the_turn(
+        self,
+    ) -> None:
+        adapter = LingeringAdapter()
+        broker = self.start_broker(
+            lambda _harness: adapter,
+            linger_grace_seconds=0.05,
+        )
+        conversation_id = self.add_conversation()
+        message_id = self.add_message(conversation_id)
+        broker.notify()
+
+        first_run = self.wait_run_attempt(message_id, 1)
+        self.assertTrue(adapter.first_terminal.wait(3))
+        self.wait_run_state(first_run, "succeeded")
+        # The reply is visible, but the live process is still named.
+        self.assertEqual(self.registry_pid(), os.getpid())
+
+        adapter.release.set()
+        continuation = self.wait_run_attempt(message_id, 2)
+        self.wait_run_state(continuation, "succeeded")
+        self.assertTrue(broker.wait_idle(3))
+
+        events = self.conversation_events(conversation_id)
+        resumed = [row for row in events if row["event_type"] == "run.resumed"]
+        self.assertEqual(len(resumed), 1)
+        self.assertEqual(resumed[0]["run_id"], continuation)
+        self.assertEqual(
+            json.loads(resumed[0]["payload"])["continues_run_id"],
+            first_run,
+        )
+        deltas = [
+            (json.loads(row["payload"])["text"], row["run_id"])
+            for row in events
+            if row["event_type"] == "assistant.delta"
+        ]
+        self.assertEqual(
+            deltas,
+            [("first", first_run), ("second", continuation)],
+        )
+        self.assertIsNone(self.registry_pid())
+        con = self.connect()
+        message_state = con.execute(
+            "SELECT state FROM conversation_messages WHERE message_id=?",
+            (message_id,),
+        ).fetchone()[0]
+        conversation_state = con.execute(
+            "SELECT state FROM conversations WHERE conversation_id=?",
+            (conversation_id,),
+        ).fetchone()[0]
+        con.close()
+        # The message machine has no exit from a terminal state, so the
+        # lingering finish's close stands for the whole turn.
+        self.assertEqual(message_state, "completed")
+        self.assertEqual(conversation_state, "idle")
+
+    def test_exit_inside_the_grace_window_finishes_and_clears_the_link(
+        self,
+    ) -> None:
+        adapter = LingeringAdapter(tail="none")
+        broker = self.start_broker(
+            lambda _harness: adapter,
+            linger_grace_seconds=1.0,
+        )
+        conversation_id = self.add_conversation()
+        message_id = self.add_message(conversation_id)
+        broker.notify()
+
+        run_id = self.wait_run_attempt(message_id, 1)
+        self.wait_run_state(run_id, "succeeded")
+        self.assertTrue(broker.wait_idle(3))
+
+        con = self.connect()
+        attempts = [
+            row["attempt"]
+            for row in con.execute(
+                "SELECT attempt FROM conversation_runs "
+                "WHERE trigger_message_id=?",
+                (message_id,),
+            )
+        ]
+        con.close()
+        self.assertEqual(attempts, [1])
+        self.assertIsNone(self.registry_pid())
+        terminals = [
+            json.loads(row["payload"])
+            for row in self.conversation_events(conversation_id)
+            if row["event_type"] == "run.completed"
+        ]
+        self.assertEqual(len(terminals), 1)
+        self.assertEqual(terminals[0]["result"], "first")
+
+    def test_interrupt_while_lingering_reaches_the_adapter(self) -> None:
+        adapter = LingeringAdapter(tail="interrupt")
+        broker = self.start_broker(
+            lambda _harness: adapter,
+            linger_grace_seconds=0.05,
+        )
+        conversation_id = self.add_conversation()
+        message_id = self.add_message(conversation_id)
+        broker.notify()
+
+        run_id = self.wait_run_attempt(message_id, 1)
+        self.wait_run_state(run_id, "succeeded")
+
+        self.assertTrue(broker.interrupt(run_id))
+        self.assertTrue(adapter.interrupted.wait(3))
+
+        adapter.release.set()
+        self.assertTrue(broker.wait_idle(3))
+        con = self.connect()
+        attempts = [
+            row["attempt"]
+            for row in con.execute(
+                "SELECT attempt FROM conversation_runs "
+                "WHERE trigger_message_id=?",
+                (message_id,),
+            )
+        ]
+        con.close()
+        self.assertEqual(attempts, [1])
+        self.assertIsNone(self.registry_pid())
 
     def test_opencode_blocking_message_is_interruptible_after_identity(
         self,
