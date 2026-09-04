@@ -27,6 +27,7 @@ import http.client
 import io
 import ipaddress
 import json
+import logging
 import os
 import sqlite3
 import subprocess
@@ -81,6 +82,7 @@ import skill_projection  # noqa: E402  (exact bounded grant mirrors)
 import skill as skill_mod  # noqa: E402  (planner-owned fork-local catalogue)
 sys.path.insert(0, str(ENGINE / "api"))
 import conversation_routes  # noqa: E402  (Feature #24 browser conversations)
+import log_lines  # noqa: E402  (UTC line stamps for server.log)
 import review_routes  # noqa: E402  (Feature #26 browser Diff review)
 import map_db  # noqa: E402  (read-only handle to the dr_* catalogue in map.db)
 import ports as ports_mod  # noqa: E402
@@ -5867,6 +5869,15 @@ def _run_server(port: int) -> int:
 
 
 def main(argv):
+    # server.log is stdout+stderr as the dispatcher redirected them; stamp both
+    # before the first line is written. basicConfig carries no time of its own
+    # — the writer adds one per line, once.
+    log_lines.install()
+    logging.basicConfig(
+        level=logging.WARNING,
+        format="%(levelname)s %(name)s: %(message)s",
+        stream=sys.stderr,
+    )
     port = None
     if "--port" in argv:
         port = int(argv[argv.index("--port") + 1])
