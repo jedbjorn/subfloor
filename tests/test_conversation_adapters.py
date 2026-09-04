@@ -1185,6 +1185,91 @@ class ConversationAdapterTest(unittest.TestCase):
         self.assertEqual(events[-1].type, "run.completed")
         self.assertEqual(events[-1].payload["status"], "completed")
 
+    def test_claude_resume_preamble_result_is_not_terminal(self) -> None:
+        """#1497: on ``--resume`` Claude first flushes a pending background-task
+        notification as its own turn and emits a zero-turn ``result`` for it
+        before the prompt's turn. Only the prompt's ``result`` ends the run."""
+        adapter, _runner = self.build("claude")
+        preamble = {
+            "type": "result",
+            "subtype": "success",
+            "is_error": False,
+            "num_turns": 0,
+            "stop_reason": None,
+            "duration_api_ms": 0,
+            "result": None,
+            "usage": {"input_tokens": 0, "output_tokens": 0},
+        }
+        self.assertEqual(adapter._normalize(preamble), [])
+        failed = adapter._normalize(
+            {**preamble, "is_error": True, "subtype": "error_during_execution"}
+        )
+        self.assertEqual(failed[-1].type, "run.failed")
+
+        session_ref = "11111111-2222-4333-8444-555555555555"
+        rows = [
+            {
+                "type": "system",
+                "subtype": "task_notification",
+                "session_id": session_ref,
+                "status": "stopped",
+            },
+            {"type": "system", "subtype": "init", "session_id": session_ref},
+            {**preamble, "session_id": session_ref},
+            {"type": "system", "subtype": "init", "session_id": session_ref},
+            {
+                "type": "stream_event",
+                "session_id": session_ref,
+                "event": {
+                    "type": "content_block_delta",
+                    "delta": {"type": "text_delta", "text": "hello"},
+                },
+            },
+            {
+                "type": "result",
+                "subtype": "success",
+                "session_id": session_ref,
+                "result": "hello",
+                "num_turns": 1,
+                "stop_reason": "end_turn",
+                "usage": {"input_tokens": 10, "output_tokens": 2},
+            },
+        ]
+        process = FakeClaudeProcess(session_ref)
+        process.stdout = io.StringIO(
+            "".join(json.dumps(row) + "\n" for row in rows)
+        )
+        turn = NativeTurn(
+            harness="claude",
+            session_ref=session_ref,
+            run_ref="claude-test",
+            worktree=self.root,
+            process_ref=str(process.pid),
+            metadata={"resumed": True},
+            opaque=process,
+        )
+
+        events = list(adapter.stream(turn))
+
+        terminals = [
+            event for event in events if event.type in base_adapter.TERMINAL_EVENTS
+        ]
+        self.assertEqual(len(terminals), 1)
+        self.assertIs(terminals[0], events[-1])
+        self.assertEqual(events[-1].type, "run.completed")
+        self.assertEqual(events[-1].payload["result"], "hello")
+        usage = [event for event in events if event.type == "usage"]
+        self.assertEqual(len(usage), 1)
+        self.assertEqual(usage[0].payload["tokens"]["input_tokens"], 10)
+        self.assertIn(
+            "hello",
+            [
+                event.payload.get("text")
+                for event in events
+                if event.type == "assistant.delta"
+            ],
+        )
+
     def test_interrupted_events_require_structured_evidence(self) -> None:
         with self.assertRaisesRegex(ValueError, "structured native or operator"):
             NormalizedEvent("run.interrupted", {"status": "interrupted"})

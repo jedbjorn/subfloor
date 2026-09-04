@@ -185,6 +185,24 @@ class ClaudeAdapter(ConversationAdapter):
         return None
 
     @staticmethod
+    def _is_resume_preamble(raw: Mapping[str, Any]) -> bool:
+        """A ``result`` that closes no turn (#1497).
+
+        On ``--resume``, Claude Code (observed on 2.1.260) first flushes a
+        background-task notification left by the previous turn as its own
+        queued turn and emits a ``result`` for it — ``num_turns`` 0, no
+        ``stop_reason``, zero usage — before the prompt's turn begins. Treating
+        it as terminal completed the run with an empty reply and left the
+        child running the real turn unobserved. The prompt's own ``result``
+        follows in the same process and remains the terminal.
+        """
+        if raw.get("is_error"):
+            return False
+        if str(raw.get("subtype") or "").startswith("error"):
+            return False
+        return raw.get("num_turns") == 0 and raw.get("stop_reason") is None
+
+    @staticmethod
     def _usage(raw: Mapping[str, Any]) -> dict[str, int | float]:
         usage = raw.get("usage")
         if not isinstance(usage, dict):
@@ -277,6 +295,8 @@ class ClaudeAdapter(ConversationAdapter):
                     )
             return events
         if native_type == "result":
+            if self._is_resume_preamble(raw):
+                return []
             subtype = str(raw.get("subtype") or "")
             detail = str(raw.get("result") or raw.get("error") or "")
             interrupted = any(
