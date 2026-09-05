@@ -396,6 +396,13 @@ sc_devkit_cutover() {
     "$CALLER_ROOT" "$ENGINE" "$epoch" "$(id -un)" "$(id -u)" "$(id -g)"
 }
 
+sc_sandbox_resources_enforce() {
+  epoch="$(harness_epoch)"
+  "$PY" "$S/sandbox_devkit.py" enforce-resources \
+    "$CALLER_ROOT" "$ENGINE" "$epoch" "$(id -un)" "$(id -u)" "$(id -g)" \
+    "$CNAME"
+}
+
 # What the CURRENT image was actually built with, read back from the label the
 # Dockerfile stamps. Empty for an image built before this seam existed (or none
 # at all) — callers treat that as "unknown", never as "current".
@@ -1286,6 +1293,7 @@ case "$cmd" in
   test)         sc_devkit_hook test "$@" ;;
   lint)         sc_devkit_hook lint "$@" ;;
   typecheck)    sc_devkit_hook typecheck "$@" ;;
+  sandbox-memory) exec "$PY" "$S/sandbox_resources.py" "$@" ;;
   # ── docker sandbox (host-side; the default way to run) ──
   launch)
     no_build=""
@@ -1589,8 +1597,11 @@ case "$cmd" in
     fi
     cutover="$(sc_devkit_cutover)" || exit 1
     if [ "$cutover" = "unchanged" ] && drunning; then
-      echo "→ restart preserved healthy sandbox '$CNAME' — native package capability remains advisory"
-      exit 0
+      if sc_sandbox_resources_enforce; then
+        echo "→ restart preserved healthy sandbox '$CNAME' — native package capability remains advisory"
+        exit 0
+      fi
+      echo "→ sandbox resource policy needs recreation; continuing with the confirmed restart" >&2
     fi
     backup_dir="$(sc_db_backup_preflight)"
     sc_db_backup prerestart "$backup_dir"
@@ -1790,6 +1801,9 @@ Subfloor — forkable shell substrate — full command reference (./sc help for 
                              (review server as a supervised host process + shells booted on this host;
                              no docker anywhere). launch/enter/down/restart/logs/build/update-harnesses/
                              doctor/update follow the selection; ./sc install --runtime host sets it at install
+  ./sc sandbox-memory [SIZE|default]
+                           show or set the sandbox RAM ceiling; swap is bounded to the same total
+                             default targets 12 GiB while reserving 20% of Docker-visible RAM
   ./sc launch              build the exact base/fork image, start the sandbox, and run declared provisioning
                              (runtime host: start the host review server + configured brokers; no image)
                              states: absent · invalid · failed · stale · ready; failed setup retains container + evidence

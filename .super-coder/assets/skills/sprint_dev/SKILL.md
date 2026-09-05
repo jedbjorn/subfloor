@@ -38,7 +38,7 @@ name the defect next handoff. NEVER infer assignment ownership, review outcome,
 merge authorization, lifecycle/work-unit transition, governing revision, PR
 head/green state, or cleanup authority. An unproved postcondition stops.
 
-Assignments and review requests use Force-new delivery; verdicts and PR-event
+Assignments, review requests, and verdicts use Force-new delivery; PR-event
 wakes use Re-enter. Delivery waits for a natural boundary; the runtime owns
 bundling, rotation, and recovery. Stop after a successful typed handoff.
 
@@ -173,8 +173,10 @@ Complete each round in order:
    the PR URL, registered id, exact green head, and work-unit id into the
    Reviewer's canonical bare one-line locator. Create no readiness file. Send
    no scope narrative, verification evidence, rationale, or review-focus
-   steering. Put only the work-unit id and spec reference in the PR body; write
-   no PR comments or annotations.
+   steering in the request. The PR body carries the work-unit id and spec
+   reference plus your rationale (decisions, rejected trade-offs): each verdict
+   opens a fresh chat with only GitHub to read. Write no PR comments or
+   annotations.
 4. As the literal final action, run:
 
 ```text
@@ -186,24 +188,25 @@ sc sprint request-review \
 5. Require confirmation of the durable write + Reviewer wake; run no trailing
    command and stop and await the native verdict wake.
 
-Changes requested returns by Re-enter. Apply every blocking finding,
-re-establish green, and resubmit with a new review-round key. Do not narrate
-cleared findings; the Reviewer verifies the full diff at the engine-injected
-head. Record disagreements as judgment. Reviewer owns scope/severity; Planner
+Changes requested arrives as a fresh chat: orient from the PR body, diff, and
+verdict; do not re-litigate choices the rationale explains. Apply every
+blocking finding, re-establish green, and resubmit with a new review-round key.
+Do not narrate cleared findings; the Reviewer verifies the full diff. Record disagreements as judgment. Reviewer owns scope/severity; Planner
 executes resulting action.
 
 ## Merge boundary
 
-Approval is stale evidence. Immediately before merge, re-read live GitHub,
-grant, ownership, unit state, approved head, and checks through:
+Immediately before merge, re-read live GitHub, grant, ownership, unit state,
+and checks through:
 
 ```text
 sc sprint authorize-merge \
   --sprint <id> --registered-pr <registered-id>
 ```
 
-Merge only the returned repository, PR, and head SHA. A refusal means wait for
-the watcher or re-enter the appropriate loop; never bypass it.
+Merge only the returned repository, PR, and head SHA. A refusal means not
+green, not approved, or not yours; fix that, never bypass it. A rebase does not
+undo approval.
 
 ## Post-merge handoff
 

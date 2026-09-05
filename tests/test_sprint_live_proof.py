@@ -2272,8 +2272,10 @@ class SprintLiveProof(unittest.TestCase):
         self.assertEqual(2, event_types.count("review.approved"))
         self.assertEqual("lifecycle.completed", event_types[-1])
         self.assertEqual(2, packet["pr_outcomes"]["total"])
+        # One New chat per assignment plus one Force-new chat for the
+        # changes_requested verdict on the first unit.
         self.assertEqual(
-            2,
+            3,
             self.con.execute(
                 "SELECT COUNT(*) FROM sprint_participant_conversations link "
                 "JOIN sprint_participants p "

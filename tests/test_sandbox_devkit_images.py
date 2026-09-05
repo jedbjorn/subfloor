@@ -32,6 +32,7 @@ from sandbox_devkit import (  # noqa: E402
     build_images,
     cleanup_owned_resources,
     docker_run,
+    enforce_container_resources,
     image_plan,
     launch_container,
     preflight_image,
@@ -65,6 +66,7 @@ class FakeDocker:
         self.package_statuses: dict[str, str] = {}
         self.hook_status = 0
         self.hook_delay = 0.0
+        self.daemon_memory = 20 * 1024**3
 
     def __call__(
         self, command, *, check, text, capture_output=False, input=None, timeout=None
@@ -73,6 +75,10 @@ class FakeDocker:
         command = tuple(command)
         self.commands.append(command)
         self.inputs.append(input)
+        if command[:2] == ("docker", "info"):
+            return subprocess.CompletedProcess(
+                command, 0, f"{self.daemon_memory}\n", ""
+            )
         if command[:2] == ("docker", "pull"):
             return subprocess.CompletedProcess(command, 0, "pulled\n", "")
         if command[:2] == ("docker", "build"):
@@ -198,6 +204,8 @@ class FakeDocker:
                     raise AssertionError(f"run image missing from command: {command}")
                 self.containers[name] = image
             return subprocess.CompletedProcess(command, 0, "container-id\n", "")
+        if command[:2] == ("docker", "update"):
+            return subprocess.CompletedProcess(command, 0, command[-1] + "\n", "")
         if command[:3] == ("docker", "rm", "-f"):
             self.containers.pop(command[3], None)
             return subprocess.CompletedProcess(command, 0, command[3] + "\n", "")
@@ -987,6 +995,9 @@ class SandboxImagePlanTest(unittest.TestCase):
             for command in docker.commands
             if command[:2] == ("docker", "run") and "-d" in command
         )
+        expected_memory = str(12 * 1024**3)
+        self.assertEqual(run[run.index("--memory") + 1], expected_memory)
+        self.assertEqual(run[run.index("--memory-swap") + 1], expected_memory)
         mount = run[run.index("--mount") + 1]
         self.assertEqual(
             mount,
@@ -1015,6 +1026,32 @@ class SandboxImagePlanTest(unittest.TestCase):
                 for command in docker.commands
                 if command[:2] == ("docker", "run") and "-d" in command
             ]
+        )
+
+    def test_preserved_container_receives_current_memory_policy(self):
+        plan = ImageFixture(self.base, "fork").plan()
+        docker = FakeDocker()
+
+        policy = enforce_container_resources(plan, "sandbox", runner=docker)
+
+        expected = str(12 * 1024**3)
+        self.assertEqual(policy.bytes, 12 * 1024**3)
+        update = next(
+            command
+            for command in docker.commands
+            if command[:2] == ("docker", "update")
+        )
+        self.assertEqual(
+            update,
+            (
+                "docker",
+                "update",
+                "--memory",
+                expected,
+                "--memory-swap",
+                expected,
+                "sandbox",
+            ),
         )
 
     @staticmethod

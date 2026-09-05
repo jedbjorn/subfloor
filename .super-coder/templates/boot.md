@@ -118,8 +118,9 @@ delivery:
 | idle registry chat | any coalesced New rotates; all-Re-enter resumes the chat |
 | no registry row | create a chat and deliver as New |
 
-Sprint routing uses those literals: Planner→Developer and Developer→Reviewer
-are New; Developer/Reviewer→Planner and Reviewer→Developer are Re-enter. FnB
+Sprint routing uses those literals: Planner→Developer assignments,
+Developer→Reviewer requests, and Reviewer→Developer verdicts are Force-new;
+Developer/Reviewer→Planner results and PR-event wakes are Re-enter. FnB
 can close the Planner chat during an armed Sprint to set coordinate mode (idle
 Planner Re-enters become fresh ticket chats); FnB pause/resume returns to
 supervise, while automatic pauses preserve the dial. Developer-owned PR

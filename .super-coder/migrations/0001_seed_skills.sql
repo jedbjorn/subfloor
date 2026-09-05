@@ -2921,8 +2921,8 @@ changed it or the next command requires live revalidation.
 - **FnB directs a fallback or follow-up disposition.** Use the bounded surfaces
   below and name FnB authority in the evidence.
 
-Assignments and review requests use Force-new delivery; role results use
-Re-enter. Neither displaces a live turn; the runtime owns delivery, rotation,
+Assignments, review requests, and verdicts use Force-new delivery; Planner-bound
+results and PR events use Re-enter. Neither displaces a live turn; the runtime owns delivery, rotation,
 and recovery. A successful typed handoff is the last action of that role''s
 turn.
 
@@ -3062,7 +3062,7 @@ name the defect next handoff. NEVER infer assignment ownership, review outcome,
 merge authorization, lifecycle/work-unit transition, governing revision, PR
 head/green state, or cleanup authority. An unproved postcondition stops.
 
-Assignments and review requests use Force-new delivery; verdicts and PR-event
+Assignments, review requests, and verdicts use Force-new delivery; PR-event
 wakes use Re-enter. Delivery waits for a natural boundary; the runtime owns
 bundling, rotation, and recovery. Stop after a successful typed handoff.
 
@@ -3197,8 +3197,10 @@ Complete each round in order:
    the PR URL, registered id, exact green head, and work-unit id into the
    Reviewer''s canonical bare one-line locator. Create no readiness file. Send
    no scope narrative, verification evidence, rationale, or review-focus
-   steering. Put only the work-unit id and spec reference in the PR body; write
-   no PR comments or annotations.
+   steering in the request. The PR body carries the work-unit id and spec
+   reference plus your rationale (decisions, rejected trade-offs): each verdict
+   opens a fresh chat with only GitHub to read. Write no PR comments or
+   annotations.
 4. As the literal final action, run:
 
 ```text
@@ -3210,24 +3212,25 @@ sc sprint request-review \
 5. Require confirmation of the durable write + Reviewer wake; run no trailing
    command and stop and await the native verdict wake.
 
-Changes requested returns by Re-enter. Apply every blocking finding,
-re-establish green, and resubmit with a new review-round key. Do not narrate
-cleared findings; the Reviewer verifies the full diff at the engine-injected
-head. Record disagreements as judgment. Reviewer owns scope/severity; Planner
+Changes requested arrives as a fresh chat: orient from the PR body, diff, and
+verdict; do not re-litigate choices the rationale explains. Apply every
+blocking finding, re-establish green, and resubmit with a new review-round key.
+Do not narrate cleared findings; the Reviewer verifies the full diff. Record disagreements as judgment. Reviewer owns scope/severity; Planner
 executes resulting action.
 
 ## Merge boundary
 
-Approval is stale evidence. Immediately before merge, re-read live GitHub,
-grant, ownership, unit state, approved head, and checks through:
+Immediately before merge, re-read live GitHub, grant, ownership, unit state,
+and checks through:
 
 ```text
 sc sprint authorize-merge \
   --sprint <id> --registered-pr <registered-id>
 ```
 
-Merge only the returned repository, PR, and head SHA. A refusal means wait for
-the watcher or re-enter the appropriate loop; never bypass it.
+Merge only the returned repository, PR, and head SHA. A refusal means not
+green, not approved, or not yours; fix that, never bypass it. A rebase does not
+undo approval.
 
 ## Post-merge handoff
 
@@ -3337,8 +3340,8 @@ Do not poll. Armed runtime owns scheduled dispatch + unread wake recovery;
 registered-PR watcher owns subscription observation. Developer-owned subscriptions send
 red/green/closed/merged facts to Developers, never Planner.
 
-Assignments/review requests use Force-new delivery; Planner-bound results use
-Re-enter. Delivery waits for a natural boundary; runtime owns bundling,
+Assignments, review requests, and verdicts use Force-new delivery;
+Planner-bound results use Re-enter. Delivery waits for a natural boundary; runtime owns bundling,
 rotation, recovery, and coordinate mode. Stop after a successful typed handoff.
 
 ## Durable running loop
@@ -3944,7 +3947,7 @@ recovery to infer assignment ownership, review outcome, merge authorization,
 lifecycle/work-unit transition, governing revision, PR head/green state, or
 cleanup authority. An unproved postcondition stops.
 
-Review requests use Force-new delivery. Verdicts and Planner decisions use
+Review requests and verdicts use Force-new delivery. Planner decisions use
 Re-enter. Delivery waits for a natural boundary; the runtime owns bundling,
 rotation, and recovery. Stop after a successful typed handoff. Reviewers never
 receive PR-event wakes.
@@ -4041,8 +4044,9 @@ verification, rationale, or focus steering is a protocol defect. PR comments
 and annotations are forbidden; PR body contains only unit id + spec reference.
 
 Bind inspection/verdict to the accepted request''s message id, registered PR,
-work unit, and exact head. Review each request explicitly. Read the exact spec
-revision + full diff at that head, then checks, tests, relevant runtime facts,
+and work unit. Review the live PR head; a rebase since the locator''s head is
+not a defect. Read the exact spec revision + full diff, then checks, tests,
+relevant runtime facts,
 and ratified judgments. Each round is clean: no prior Developer evidence or
 prose; prior findings clear only when the new head proves it. Trace code paths,
 failure cases, and spec behavior rather than names or PR prose.
@@ -4080,11 +4084,11 @@ sc sprint record-review \
   --verdict changes_requested --body-file <path> --key <stable-key>
 ```
 
-5. Require durable judgment evidence + Developer Re-enter wake. Run no trailing command;
+5. Require durable judgment evidence + Developer Force-new wake. Run no trailing command;
    stop.
 
 Use `approved` only with no Critical/Major/Medium finding. Engine validation
-requires the accepted request and reviewed head. Do not message around the
+requires the accepted request. Do not message around the
 surface; an unrecorded verdict cannot unlock merge.
 
 ## Delivery-terminal closeout

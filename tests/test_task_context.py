@@ -727,7 +727,7 @@ class GuidanceTest(unittest.TestCase):
         self.assertNotIn("## Assignment", body)
 
     def test_reseed_migration_matches_the_assets(self):
-        path = ENGINE / "migrations" / "0253_reseed_task_context_projection.sql"
+        path = ENGINE / "migrations" / "0254_reseed_task_context_projection.sql"
         con = sqlite3.connect(":memory:")
         con.executescript(
             "CREATE TABLE skills (skill_id INTEGER PRIMARY KEY, name TEXT UNIQUE, "

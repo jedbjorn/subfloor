@@ -151,7 +151,8 @@
     ".super-coder/migrations/0249_reseed_docs_frozen_render_path.sql",
     ".super-coder/migrations/0250_reseed_fork_skill_design_planner_lane.sql",
     ".super-coder/migrations/0251_conversation_run_transcript_offset.sql",
-    ".super-coder/migrations/0252_reseed_universal_pr_owner_wakes.sql"
+    ".super-coder/migrations/0252_reseed_universal_pr_owner_wakes.sql",
+    ".super-coder/migrations/0253_reseed_sprint_review_flexibility.sql"
   ],
   "baseline_migration_ledger": {
     "count": 142,
@@ -260,7 +261,7 @@
     ".super-coder/migrations/0190_reseed_successful_sprint_chat_cleanup.sql",
     ".super-coder/migrations/0193_retire_sprint_liveness_acceptance.sql",
     ".super-coder/migrations/0241_global_skill_simplification.sql",
-    ".super-coder/migrations/0253_reseed_task_context_projection.sql",
+    ".super-coder/migrations/0254_reseed_task_context_projection.sql",
     ".super-coder/render/compose.py",
     ".super-coder/schema.sql",
     ".super-coder/scripts/activity_readers.py",
@@ -282,6 +283,7 @@
     ".super-coder/scripts/pr_poller.py",
     ".super-coder/scripts/rebuild.py",
     ".super-coder/scripts/run.py",
+    ".super-coder/scripts/sandbox_resources.py",
     ".super-coder/scripts/sentinel.py",
     ".super-coder/scripts/shell_factory.py",
     ".super-coder/scripts/shell_liveness.py",
@@ -359,6 +361,7 @@
     "tests/test_reconciler_tick.py",
     "tests/test_run_session.py",
     "tests/test_run_slots.py",
+    "tests/test_sandbox_resources.py",
     "tests/test_sentinel.py",
     "tests/test_server_schema_guard.py",
     "tests/test_snapshot_secrets.py",

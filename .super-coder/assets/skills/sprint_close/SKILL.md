@@ -38,8 +38,8 @@ changed it or the next command requires live revalidation.
 - **FnB directs a fallback or follow-up disposition.** Use the bounded surfaces
   below and name FnB authority in the evidence.
 
-Assignments and review requests use Force-new delivery; role results use
-Re-enter. Neither displaces a live turn; the runtime owns delivery, rotation,
+Assignments, review requests, and verdicts use Force-new delivery; Planner-bound
+results and PR events use Re-enter. Neither displaces a live turn; the runtime owns delivery, rotation,
 and recovery. A successful typed handoff is the last action of that role's
 turn.
 
