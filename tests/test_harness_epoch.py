@@ -247,6 +247,7 @@ class ScFixture:
             "harness_versions.py",
             "devkit.py",
             "runtime_flags.py",
+            "sandbox_resources.py",
             "sandbox_devkit.py",
             "cli_entry.py",
         ):
@@ -322,7 +323,11 @@ class ScFixture:
             printf ' %s' "$@" >> "$SC_TEST_LOG"
             printf '\\n' >> "$SC_TEST_LOG"
             case "$1" in
-              info) exit 0 ;;
+              info)
+                case " $* " in
+                  *" --format "*) printf '21474836480\\n' ;;
+                esac
+                exit 0 ;;
               build)
                 labels="$SC_TEST_IMAGE_STATE.labels"
                 : > "$labels"
