@@ -1258,6 +1258,35 @@ class ApiMemTest(unittest.TestCase):
         self.assertEqual(self.q("SELECT render_path FROM documents "
                                 "WHERE document_id=?", did)[0], "docs_sc/pathless.md")
 
+    def test_doc_invalid_writes_preserve_existing_document(self):
+        did = self.write(
+            "INSERT INTO documents (kind,seq,title,body,render_path) "
+            "VALUES ('doc',1,'validation original','original body','docs_sc/validation.md')"
+        )
+        for payload in ({"body": ""}, {"body": " \n\t"},
+                        {"body": None}, {"render_path": "README.md"},
+                        {"render_path": "/tmp/doc.md"}, {"render_path": "docs_sc"},
+                        {"render_path": "docs_sc/../README.md"}):
+            with self.subTest(payload=payload):
+                with self.assertRaises(SystemExit):
+                    mem._api("PATCH", f"/_sc/mem/docs/{did}",
+                             {"title": "must not commit", **payload})
+                self.assertEqual(tuple(self.q(
+                    "SELECT title,body,render_path FROM documents WHERE document_id=?", did
+                )), ("validation original", "original body", "docs_sc/validation.md"))
+
+    def test_doc_invalid_adds_leave_no_row(self):
+        for payload in ({"body": ""}, {"body": " \n"}, {"body": None},
+                        {"body": "content", "render_path": "README.md"},
+                        {"body": "content", "render_path": "specs_sc/wrong.md"}):
+            with self.subTest(payload=payload):
+                before = self.q("SELECT COUNT(*) FROM documents")[0]
+                with self.assertRaises(SystemExit):
+                    mem._api("POST", "/_sc/mem/docs", {
+                        "kind": "doc", "title": "invalid add", **payload,
+                    })
+                self.assertEqual(self.q("SELECT COUNT(*) FROM documents")[0], before)
+
     def test_doc_add_rejects_duplicate_render_path(self):
         body = self.tmp / "duplicate-add.md"
         body.write_text("# duplicate\n")
