@@ -1836,6 +1836,10 @@ Subfloor — forkable shell substrate — full command reference (./sc help for 
                            inspect, start+verify, or stop the managed MCP tunnel and relay
   ./sc vm reset --off [--json]
                            restore the testing snapshot and confirm the VM is powered off
+  ./sc vm test init local | ./sc vm test init ssh HOST
+                           select Halo-local or Dev-through-ForceCommand transport
+  ./sc vm test status|acquire|release|start|stop|exec|push|pull|snapshot|reset|baseline
+                           drive the fixed W10C-Testing controller; run --help for exact forms
   ./sc vm-broker           run the broker in the foreground (unix socket)
   ./sc vm-bake             HOST-side: graceful shutdown + (re)bake the clean snapshot after provisioning
                              (deliberately NOT a broker verb — the sandbox must never redefine 'clean')
