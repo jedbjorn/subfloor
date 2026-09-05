@@ -1724,9 +1724,14 @@ def document_render_path_conflict(
     exclude_document_id: int | None = None,
 ) -> str | None:
     """Return a stable ownership error when a populated document path collides."""
+    try:
+        rel = flat_render.document_rel_path(candidate)
+        flat_render._document_target(REPO_ROOT, rel, candidate["kind"])
+    except (TypeError, ValueError) as exc:
+        return str(exc)
     if not candidate.get("body"):
         return None
-    candidate_path = Path(flat_render.document_rel_path(candidate))
+    candidate_path = Path(rel)
     rows = con.execute(
         "SELECT document_id,feature_id,kind,seq,title,body,render_path "
         "FROM documents WHERE body IS NOT NULL AND body != '' "
@@ -1759,6 +1764,8 @@ def patch_document(
         return False, "no editable fields in payload"
     if "body" in body and not isinstance(body["body"], str):
         return False, "body must be a string"
+    if "body" in body and not body["body"].strip():
+        return False, "document body must not be empty"
     if editor_surface not in {"shell_api", "review_ui"}:
         raise ValueError("unknown document editor surface")
     try:
@@ -4502,6 +4509,8 @@ class Handler(BaseHTTPRequestHandler):
                 # of the contract: the docs/onboard skills and `sc mem doc add`
                 # document them, and forks carry them. The seq scope is per
                 # (feature, kind), with NULL its own scope (`IS ?` matches NULL).
+                if not isinstance(body.get("body"), str) or not body["body"].strip():
+                    return self._send(400, {"error": "document body must be a non-empty string"})
                 fid = body.get("feature_id")
                 fid = int(fid) if fid is not None else None
                 kind = body.get("kind") or "spec"
