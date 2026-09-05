@@ -76,11 +76,11 @@ def default_branch() -> str:
     return "main"
 
 
-def _porcelain_worktrees() -> list[dict]:
+def _porcelain_worktrees(cwd: Path = REPO_ROOT) -> list[dict]:
     """Parse `git worktree list --porcelain` into one dict per worktree."""
     blocks: list[dict] = []
     cur: dict = {}
-    for line in _out("worktree", "list", "--porcelain").splitlines():
+    for line in _out("worktree", "list", "--porcelain", cwd=cwd).splitlines():
         if not line.strip():
             if cur:
                 blocks.append(cur)

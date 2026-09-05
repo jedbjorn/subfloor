@@ -21,12 +21,14 @@ from pathlib import Path
 from typing import Any
 
 import db_driver
+import git_hygiene
 import sprint_liveness
 from github_pull_requests import (
     GITHUB_TIMEOUT_SECONDS,
     GitHubPullRequestReader,
     GitHubReadError,
     PullRequest,
+    newest_by_branch,
 )
 from sprint_domain import (
     LifecycleActor,
@@ -39,11 +41,31 @@ from sprint_message_delivery import SprintMessageStore
 from sprint_review_loop import SprintReviewLoopStore
 
 PULSE_SECONDS = 5.0
+DISCOVERY_SECONDS = 60.0
 HEARTBEAT_HISTORY_SECONDS = 60.0
 WATCHER_DAEMON_NAME = "sprint-pr-watcher"
 MAX_BACKOFF_SECONDS = 300.0
 RATE_BACKOFF_SECONDS = 60.0
 _REPOSITORY = re.compile(r"^[^/\s]+/[^/\s]+$")
+_PR_URL_REPOSITORY = re.compile(r"^https?://[^/]+/([^/\s]+/[^/\s]+)/pull/\d+/?$")
+
+
+def shell_worktree_branches(repo_root: str | Path) -> dict[str, str]:
+    """Lowercase shell shortname -> branch checked out in `.sc-worktrees/<n>`.
+
+    Detached worktrees and worktrees outside the managed directory are omitted.
+    """
+    root = Path(repo_root).resolve()
+    result: dict[str, str] = {}
+    for block in git_hygiene._porcelain_worktrees(cwd=root):
+        path = Path(block.get("abs", ""))
+        branch = block.get("branch")
+        if not branch or block.get("detached"):
+            continue
+        if path.parent != root / ".sc-worktrees":
+            continue
+        result[path.name.lower()] = str(branch)
+    return result
 
 
 def _parse_stamp(value: str) -> datetime:
@@ -881,8 +903,10 @@ class SprintPRWatcher:
         con: sqlite3.Connection,
         *,
         repo_root: str | Path,
-        reader_factory: Callable[[str], Any] | None = None,
+        reader_factory: Callable[[str | None], Any] | None = None,
         monotonic: Callable[[], float] = time.monotonic,
+        worktree_branches: Callable[[], dict[str, str]] | None = None,
+        discovery_seconds: float = DISCOVERY_SECONDS,
     ) -> None:
         self.con = con
         self.con.row_factory = sqlite3.Row
@@ -893,6 +917,11 @@ class SprintPRWatcher:
             )
         )
         self.monotonic = monotonic
+        self.worktree_branches = worktree_branches or (
+            lambda: shell_worktree_branches(self.repo_root)
+        )
+        self.discovery_seconds = discovery_seconds
+        self._next_discovery = 0.0
         self.registration = SprintPRRegistrationStore(con)
         self.subscriptions = PRSubscriptionStore(con)
         self.messages = SprintMessageStore(con)
@@ -924,6 +953,85 @@ class SprintPRWatcher:
             self._observe_rows((row,), "registration", ignore_backoff=True)
         notify_commit()
         return receipt
+
+    def discover_once(self, *, force: bool = False) -> int:
+        """Enrol Developer shells in PRs whose head is their worktree's branch.
+
+        The engine can see every managed worktree, so a shell never has to
+        remember to subscribe: the newest PR per checked-out feature branch is
+        subscribed to that worktree's Developer with the same receipt path as
+        `sc pr subscribe`. Lists GitHub at most once per discovery interval, and
+        only while some feature branch lacks a live subscription.
+        """
+        now = self.monotonic()
+        if not force and now < self._next_discovery:
+            return 0
+        self._next_discovery = now + self.discovery_seconds
+        candidates = self._discovery_candidates()
+        if not candidates:
+            return 0
+        try:
+            listed = newest_by_branch(self.reader_factory(None).list())
+        except GitHubReadError as exc:
+            print(f"sprint-pr-watcher: PR discovery failed ({exc})", flush=True)
+            return 0
+        discovered = 0
+        for branch, owner_shell_id in candidates.items():
+            pull_request = listed.get(branch)
+            if pull_request is None:
+                continue
+            match = _PR_URL_REPOSITORY.match(pull_request.url or "")
+            if match is None:
+                continue
+            repository = match.group(1).lower()
+            if self.con.execute(
+                "SELECT 1 FROM pr_subscriptions WHERE repository=? AND pr_number=?",
+                (repository, pull_request.number),
+            ).fetchone():
+                continue
+            try:
+                self.subscribe(
+                    owner_shell_id=owner_shell_id,
+                    repository=repository,
+                    pr_number=pull_request.number,
+                )
+            except (SprintInvariantError, ValueError) as exc:
+                print(
+                    f"sprint-pr-watcher: PR discovery skipped {repository}#"
+                    f"{pull_request.number} for shell {owner_shell_id} ({exc})",
+                    flush=True,
+                )
+                continue
+            discovered += 1
+        return discovered
+
+    def _discovery_candidates(self) -> dict[str, int]:
+        """Feature branch -> Developer shell id for worktrees still uncovered."""
+        developers = {
+            str(row["shortname"]).lower(): int(row["shell_id"])
+            for row in self.con.execute(
+                "SELECT shell_id,shortname FROM shells WHERE flavor='dev' "
+                "AND shortname IS NOT NULL AND COALESCE(is_deleted,0)=0"
+            )
+        }
+        covered = {
+            str(row[0])
+            for row in self.con.execute(
+                "SELECT json_extract(latest.evidence,'$.head_ref') "
+                "FROM pr_subscription_transitions latest "
+                "WHERE latest.transition_id IN ("
+                "SELECT MAX(transition_id) FROM pr_subscription_transitions "
+                "GROUP BY subscription_id) "
+                "AND latest.normalized_state NOT IN ('merged','closed')"
+            )
+        }
+        candidates: dict[str, int] = {}
+        for shortname, branch in self.worktree_branches().items():
+            shell_id = developers.get(shortname)
+            if shell_id is None or branch.startswith("shell/") or branch in covered:
+                continue
+            candidates[branch] = shell_id
+        return candidates
 
     def register(
         self,
@@ -1649,6 +1757,7 @@ class SprintPRWatcherService(threading.Thread):
         )
         if not observed and not startup:
             heartbeat.beat(0)
+        watcher.discover_once(force=startup)
         return observed
 
     def run(self) -> None:

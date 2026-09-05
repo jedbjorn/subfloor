@@ -45,17 +45,11 @@ The launcher auto-syncs at boot when provably nothing can be lost (on base branc
    ```
    Co-Authored-By: <shell display_name> (super-coder) <noreply@…>
    ```
-3. Push -> open a PR -> subscribe -> stop. Do NOT merge without an explicit FnB directive — opening is the default, merging is a separate gate.
+3. Push -> open a PR -> stop. Do NOT merge without an explicit FnB directive — opening is the default, merging is a separate gate.
 
-## Subscribe the PR — the engine watches it, you don't
+## The engine watches your PR — you don't
 
-Right after the PR exists, enrol it in the installation watcher:
-
-```
-sc pr subscribe --repository <owner/name> --pr <number>
-```
-
-The receipt (`created: true`, or `created: false` with the same subscription id on an exact retry) is part of the PR finish gate. From then on the engine wakes you with a self-describing Re-enter fact — inside or outside a Sprint — on red checks, merge, close-without-merge, and red-to-green recovery. Never poll GitHub, schedule a watcher, or ask another shell to relay. Subscribe fails -> keep the branch and PR, surface the exact error, and do not claim notification coverage. A Sprint lane runs `sc sprint register-pr` instead (it creates the same owner subscription); never run both on one PR.
+Nothing to enrol. The installation watcher sees which branch your worktree has checked out and subscribes you to the newest PR on it within about a minute of it existing. From then on it wakes you with a self-describing Re-enter fact — inside or outside a Sprint — on red checks, merge, close-without-merge, and red-to-green recovery. Never poll GitHub, schedule a watcher, or ask another shell to relay; stop on the pushed PR and let the fact come to you. Opened the PR from a branch that is not your worktree's checkout? Enrol it by hand: `sc pr subscribe --repository <owner/name> --pr <number>`. A Sprint lane runs `sc sprint register-pr` (same owner subscription; attaches if discovery got there first).
 
 ## Merging a stack (only when the FnB hands you one)
 

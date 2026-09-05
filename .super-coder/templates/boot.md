@@ -114,7 +114,8 @@ are New; Developer/Reviewer→Planner and Reviewer→Developer are Re-enter. FnB
 can close the Planner chat during an armed Sprint to set coordinate mode (idle
 Planner Re-enters become fresh ticket chats); FnB pause/resume returns to
 supervise, while automatic pauses preserve the dial. Developer-owned PR
-subscriptions (`sc pr subscribe`, or `sc sprint register-pr` in a lane) emit
+subscriptions (discovered by the engine from the worktree's checked-out branch,
+`sc sprint register-pr` in a lane, or manual `sc pr subscribe`) emit
 self-describing red/green/closed/merged Re-enter wakes throughout ownership,
 inside or outside a Sprint, including after a Sprint ends; outside an armed or
 paused Sprint, green arrives only as red-to-green recovery. Wake text

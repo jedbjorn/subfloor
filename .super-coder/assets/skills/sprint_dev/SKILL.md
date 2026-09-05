@@ -133,8 +133,8 @@ sc sprint register-pr --sprint <id> --repository <owner/name> \
 
 Register complete code even when a local gate is unavailable; registration
 obtains evidence, not review. After `register-pr` succeeds, retain ownership;
-Red/green/closed/merged Re-enter wakes continue (never add `sc pr subscribe`
-on top — it is the same owner subscription). Required checks: pending -> native
+Red/green/closed/merged Re-enter wakes continue (the engine may already have
+discovered the PR from your worktree branch; `register-pr` attaches it). Required checks: pending -> native
 wake; red -> fix/push; green -> judge/request review; none or untrustworthy
 watcher after one bounded read -> report + block. Follow context: armed -> fix
 red + judge/pass green + merged -> post-merge handoff; paused -> fix red now +
