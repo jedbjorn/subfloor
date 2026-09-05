@@ -157,6 +157,63 @@ class EnginePathsAtRefTest(unittest.TestCase):
         ):
             update.engine_manifest.write_manifest(paths)
 
+    def test_update_retires_owned_files_preserves_local_files_and_retries(self):
+        paths = ["sc", ".super-coder/scripts", ".super-coder/migrations",
+                 ".super-coder/assets/skills"]
+        (self.root / "sc").write_text("dispatcher\n")
+        self.write_manifest(paths)
+        retired = [".super-coder/scripts/retired.py",
+                   ".super-coder/migrations/0009_retired.sql",
+                   ".super-coder/assets/skills/retired/SKILL.md"]
+        for rel in retired:
+            path = self.root / rel
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("old engine file\n")
+        old_sha = self.commit("old engine files")
+        for rel in retired:
+            (self.root / rel).unlink()
+        (self.scripts / "new.py").write_text("new runtime\n")
+        target_sha = self.commit("retire old engine files")
+        _git(self.root, "checkout", old_sha)
+        local = self.root / ".super-coder/assets/skills/local/SKILL.md"
+        local.parent.mkdir(parents=True)
+        local.write_text("fork-local skill\n")
+        state_file = self.root / ".super-coder/instance.json"
+        state_file.write_text("local instance\n")
+        state = self.root / ".sc-state"
+        state.mkdir()
+        (state / "engine.ref").write_text(old_sha + "\n")
+        engine = self.root / ".super-coder"
+        with mock.patch.multiple(
+            update, REPO_ROOT=self.root, ENGINE=engine, STATE_DIR=state,
+            ENGINE_REF=state / "engine.ref", ENGINE_REF_PREV=state / "engine.ref.prev",
+        ), mock.patch.multiple(
+            update.engine_manifest, REPO_ROOT=self.root, ENGINE=engine,
+            MANIFEST=engine / "engine.manifest",
+        ):
+            update.engine_manifest.write_manifest(paths, files=update._engine_files_at(old_sha))
+            # A modified retired file is still protected by the local-edit guard.
+            (self.root / retired[0]).write_text("local modification\n")
+            with self.assertRaisesRegex(SystemExit, "local engine edits"):
+                update.materialize_fetched_engine(target_sha)
+            self.assertTrue(all((self.root / rel).exists() for rel in retired))
+            # Simulate a failure after extraction/pruning, before manifest and pin publication.
+            with mock.patch.object(update.callable_floor, "require_callable_floor", side_effect=SystemExit("late failure")):
+                with self.assertRaisesRegex(SystemExit, "late failure"):
+                    update.materialize_fetched_engine(target_sha, force=True)
+            self.assertEqual((state / "engine.ref").read_text().strip(), old_sha)
+            self.assertTrue(all(not (self.root / rel).exists() for rel in retired))
+            update.materialize_fetched_engine(target_sha)
+            # --ref may deliberately move backwards; remove newer-only runtime files.
+            update.materialize_fetched_engine(old_sha)
+            self.assertFalse((self.scripts / "new.py").exists())
+            self.assertTrue(all((self.root / rel).exists() for rel in retired))
+            update.materialize_fetched_engine(target_sha)
+        self.assertEqual((state / "engine.ref").read_text().strip(), target_sha)
+        self.assertEqual(local.read_text(), "fork-local skill\n")
+        self.assertEqual(state_file.read_text(), "local instance\n")
+        self.assertEqual((self.scripts / "new.py").read_text(), "new runtime\n")
+
     def test_added_path_resolves_from_target_ref_and_materializes(self):
         installed = ["sc", ".super-coder/scripts"]
         (self.root / "sc").write_text("old dispatcher\n")

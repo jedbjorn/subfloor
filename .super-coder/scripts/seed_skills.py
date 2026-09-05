@@ -35,6 +35,7 @@ Usage:
 """
 from __future__ import annotations
 
+import argparse
 import hashlib
 import json
 import re
@@ -548,7 +549,9 @@ def _upsert_live(skills: list[dict]) -> None:
         print("seed_skills: live DB already current.")
 
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(prog="sc seed-skills", description=__doc__.split("\n")[0])
+    parser.parse_args(argv)
     instance_state.active_database_path(ENGINE)
     if not SKILLS_DIR.exists():
         sys.exit(f"seed_skills: no {SKILLS_DIR}")
