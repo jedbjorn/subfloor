@@ -402,8 +402,9 @@ def render_connections(con) -> str:
 
     `con` is the MAP DB (.sc-state/map.db), or None when the repo isn't mapped
     yet — then only the standing pointer renders."""
-    lines = ["**Need to find something? Look here first** — read the `dr_*` map via "
-             "the `surface_catalogue` skill; don't grep the tree blind."]
+    lines = ["**Need to find something?** The `dr_*` map (the `surface_catalogue` "
+             "skill) is abbreviated source documentation — one option beside grep, "
+             "direct reads, and repository docs."]
     if con is None:
         return "\n".join(lines + ["", "_Repo not mapped yet — the cartographer maps it._"])
     repo = con.execute(

@@ -55,7 +55,9 @@ CONFORMANCE_OWNER_SKILLS = {
 
 SPEC_SKILL = ENGINE / "assets" / "skills" / "spec" / "SKILL.md"
 CONTEXT_EFFICIENT_SKILLS = ("sprint_dev", "sprint_rev", "sprint_pln", "spec")
-CONTEXT_EFFICIENT_SKILL_BYTE_CEILING = 47_414
+# Raised 47_414 -> 47_957 by spec #187's load-first directive (`sc context`)
+# in sprint_dev + spec; every other byte of the four bodies is unchanged.
+CONTEXT_EFFICIENT_SKILL_BYTE_CEILING = 47_957
 CONTEXT_EFFICIENT_RESEED = (
     ENGINE / "migrations" / "0202_reseed_context_efficient_skills.sql"
 )

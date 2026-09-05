@@ -68,11 +68,20 @@ is unclear, ask the FnB before choosing for them.
 
 ## ORIENTATION
 
-Find things through the repository catalogue, kept fresh by the cartographer
-shell. Inspect structure with `sc map-schema`; query `dr_*` data with
-`sc map-sql`. Table reference, query patterns, and the semantic
-layer (`dr_endpoint` / `dr_db_table` / `dr_route`): the `surface_catalogue`
-skill. Map first, grep second; lazy-load only what the catalogue points at.
+When an assignment names a task or work unit, load its exact projection first
+and treat it as the default planning context: `sc context --task <id>` or
+`sc context --work-unit <id>`. It returns Assignment, Goal, Authority,
+Blockers, Boundaries, and Resources from what the engine already holds. Read
+broader DB indexes (roadmap, decision log, every flag, full documents) only
+when an unresolved need remains, through their exact one-item commands.
+
+The repository catalogue (`dr_*`, kept fresh by the cartographer shell) is
+abbreviated source documentation: sections, one-line file behavior,
+dependencies, env names, and — when an extractor is wired — endpoints, app DB
+tables, and UI routes. Inspect structure with `sc map-schema`; query with
+`sc map-sql`; table reference and query patterns: the `surface_catalogue`
+skill. It is a resource, not a mandate: use it, grep, read files directly,
+read repository docs, or use your harness's own search as the work warrants.
 
 `dr_*` indexes the product's files, including the schema + migrations that
 define the app's own database; it describes the app DB but is not the app DB.

@@ -300,9 +300,32 @@ rows; root files remain queryable through `instr(path, ''/'') = 0`.
 
 ### Descriptions
 
-Set `dr_filepath.desc` to an adequate one-line description (<=100 chars): say
-what the file does/holds, not its kind or filename. Descriptions survive remap
-in the live DB but are not snapshot durability; refill after a fresh rebuild.
+`dr_filepath.desc` is abbreviated behavioral documentation: one line, soft
+200-character bound, that tells a shell why it would open the file — the
+responsibility the file owns, the mechanism it uses, its principal input, and
+its observable output, state change, or exposed surface. Omit a component that
+genuinely does not apply; never invent behavior to fill the template, and never
+merely repeat the filename, role, language, directory, or a symbol list.
+
+| File role | Emphasis |
+|---|---|
+| Code | owned behavior, mechanism, principal input, output or side effect |
+| Test | the contract, boundary, or failure mode it proves |
+| Configuration | controlled behavior, consumed keys, runtime consumer |
+| Migration | the durable state transition and affected surface |
+| Documentation | intended audience and the system or workflow explained |
+| Entrypoint | accepted invocation and where control is dispatched |
+
+Examples: `Boot renderer — composes each shell''s boot document from DB
+identity, memory, map header, and dev-kit inventory into CLAUDE.md/AGENTS.md`;
+`Proves the branch guard refuses commits on the default branch and admits
+shell/* bases`.
+
+Apply the standard incrementally: a new or changed file, a NULL description, a
+shape notice naming the region, or a working shell reporting an inadequate
+description. Existing adequate descriptions need no bulk rewrite. Descriptions
+survive remap in the live DB but are not snapshot durability; refill after a
+fresh rebuild.
 
 ```sql
 WITH f AS (
@@ -324,7 +347,7 @@ ORDER BY (desc IS NULL) DESC, role, path;
 ```
 
 Update only rows verified against the file. Pass = the worklist is empty +
-spot checks per section describe behavior that the path alone cannot reveal.
+spot checks per section state behavior the path alone cannot reveal.
 
 ### Product DB
 
@@ -1688,6 +1711,10 @@ The launcher auto-syncs at boot when provably nothing can be lost (on base branc
    ```
 3. Push -> open a PR -> stop. Do NOT merge without an explicit FnB directive — opening is the default, merging is a separate gate.
 
+## The engine watches your PR — you don''t
+
+Nothing to enrol. The installation watcher sees which branch your worktree has checked out and subscribes you to the newest PR on it within about a minute of it existing. From then on it wakes you with a self-describing Re-enter fact — inside or outside a Sprint — on red checks, merge, close-without-merge, and red-to-green recovery. Never poll GitHub, schedule a watcher, or ask another shell to relay; stop on the pushed PR and let the fact come to you. Opened the PR from a branch that is not your worktree''s checkout? Enrol it by hand: `sc pr subscribe --repository <owner/name> --pr <number>`. A Sprint lane runs `sc sprint register-pr` (same owner subscription; attaches if discovery got there first).
+
 ## Merging a stack (only when the FnB hands you one)
 
 Merge bottom-up, retargeting before each merge — never rely on GitHub''s auto-retarget:
@@ -1715,7 +1742,9 @@ Pass = tree clean, or on a pushed branch with a PR. A dirty/unpushed tree forces
 
 ## After a merge — clean up local
 
-Only after the PR is merged:
+Only after the PR is merged. The `event=merged` wake from your subscription is
+what starts this; confirm it on the remote (`gh pr view <n> --json state,mergedAt`)
+before deleting anything:
 
 A managed worktree whose Sprint is already `completed` is the exception: the
 Sprint cleanup service owns its reset after live turns exit. Do not race that
@@ -2718,8 +2747,16 @@ shell id.
 
 ## 1. Select the spec
 
-Never auto-pick the latest document. Read the complete selected body + task
-ledger:
+Never auto-pick the latest document. A named task -> load its projection
+first as the default planning context:
+
+```text
+sc context --task <task_id>
+```
+
+It carries task, feature, governing document id + hash, active linked
+decisions, feature-level flags, boundaries, and resources. Load the full body
+or broader indexes only for an unresolved need:
 
 ```text
 sc mem get documents --feature <id>
@@ -2783,7 +2820,7 @@ No task plan = no implementation.
 ## 4. Execute one task at a time
 
 ```text
-sc mem get tasks --doc <doc_id>
+sc context --task <task_id>
 sc mem task start <task_id>
 # work and verify only this task
 sc mem task done <task_id>
@@ -2796,7 +2833,7 @@ never marked done or left pending under a shipped feature:
 
 ```text
 sc mem task cancel <task_id> --notes "moved to F<id> as task #<n>"
-sc mem state "[<feature>] — last: <last_done>. next: <next_up>."
+sc mem state "[<feature>] — last: #<task_id> <last_done>. next: #<task_id> <next_up>."
 ```
 
 Intact spec move: `sc mem doc move <document_id> --feature <target_feature_id>`
@@ -3005,7 +3042,7 @@ Load `sprint_dev` on every entry, then classify it:
 
 | Trigger | First read / action |
 |---|---|
-| Assignment, verdict, question, blocker, relay | Inspect `sc sprint inbox --sprint <id>` once; accept or handle the relevant message. |
+| Assignment, verdict, question, blocker, relay | Inspect `sc sprint inbox --sprint <id>` once; accept or handle the relevant message. Accepted assignment -> `sc context --work-unit <id>` next. |
 | Self-describing engine-wide PR fact | Inspect the fact + registered PR directly. Do not manufacture a Sprint inbox item; check the inbox once immediately before the next typed handoff. |
 | Live FnB instruction | Preserve its authority; read only durable state needed for safe action. |
 
@@ -3031,9 +3068,11 @@ bundling, rotation, and recovery. Stop after a successful typed handoff.
 
 ## Bound the lane
 
-Read assignment, output, bound revision, dependencies, roles, worktree, grant,
-and judgments. Own one active unit; never start another lane or edit another
-shell''s worktree. Resolve ambiguity to shippable in-scope work + rationale. Ask
+`sc context --work-unit <id>` is the default planning context: assignment,
+expected output, linked tasks, bound revision id, active decisions,
+dependencies, unit blockers, roles, worktree, lifecycle walls, resources. Read
+the full bound revision or broader indexes only for an unresolved need. Own
+one active unit; never start another lane or edit another shell''s worktree. Resolve ambiguity to shippable in-scope work + rationale. Ask
 Planner before changing boundary, interface, deliverable, priority, or scope.
 
 Put one question, blocker, decision, answer, or useful context item in a short
@@ -3120,11 +3159,13 @@ sc sprint register-pr --sprint <id> --repository <owner/name> \
 
 Register complete code even when a local gate is unavailable; registration
 obtains evidence, not review. After `register-pr` succeeds, retain ownership;
-Red/green/closed Re-enter wakes continue. Required checks: pending -> native
+Red/green/closed/merged Re-enter wakes continue (the engine may already have
+discovered the PR from your worktree branch; `register-pr` attaches it). Required checks: pending -> native
 wake; red -> fix/push; green -> judge/request review; none or untrustworthy
 watcher after one bounded read -> report + block. Follow context: armed -> fix
-red + judge/pass green; paused -> fix red now + judge green, review after
-resume; no active Sprint -> fix red if needed + no action on green.
+red + judge/pass green + merged -> post-merge handoff; paused -> fix red now +
+judge green, review after resume; no active Sprint -> fix red if needed, green
+arrives only as red recovery, merged -> git skill after-merge cleanup.
 Planner/Reviewer get none.
 
 If the same registered PR was externally closed, then reopened, rebased, and
@@ -3294,7 +3335,7 @@ Load `sprint_pln` on every entry, then classify:
 
 Do not poll. Armed runtime owns scheduled dispatch + unread wake recovery;
 registered-PR watcher owns subscription observation. Developer-owned subscriptions send
-red/green/closed facts to Developers, never Planner.
+red/green/closed/merged facts to Developers, never Planner.
 
 Assignments/review requests use Force-new delivery; Planner-bound results use
 Re-enter. Delivery waits for a natural boundary; runtime owns bundling,
@@ -4151,16 +4192,17 @@ ON CONFLICT(name) DO UPDATE SET
 
 INSERT INTO skills (name, description, category, command, common, content, is_deleted) VALUES (
   'surface_catalogue',
-  'Read the host repo via the dr_* catalogue (files, languages, deps, env) BEFORE grepping or walking the tree. Query first, lazy-load the few files it points at. Use to orient in an unfamiliar repo fast.',
+  'Read the host repo''s dr_* catalogue (sections, file behavior, deps, env, semantic layer) as abbreviated source documentation — one navigation resource beside grep, direct reads, and docs. Use to orient in an unfamiliar repo fast.',
   'substrate',
   NULL,
   1,
-  '# surface_catalogue — read the repo from the map, not by grepping
+  '# surface_catalogue — the repo map as abbreviated documentation
 
-The `dr_*` catalogue is a scan of the host repo. Query it first to orient, not
-the tree. It is separate from Subfloor control-plane memory and from the
-product''s runtime database. Inspect structure with `sc map-schema`; query data
-with `sc map-sql "…"`.
+The `dr_*` catalogue is a scan of the host repo: a resource for orienting, not
+a required first step. Use it, grep, read files directly, read repository docs,
+or use harness-native search as the work warrants. It is separate from Subfloor
+control-plane memory and from the product''s runtime database. Inspect structure
+with `sc map-schema`; query data with `sc map-sql "…"`.
 
 NEVER map the repo yourself. The map stays fresh automatically (git hooks
 re-map on pull / branch-switch / rebase) and is owned by the **cartographer**
@@ -4170,7 +4212,7 @@ shell. Empty / stale / wrong map -> flag the cartographer, don''t re-map.
 |---|---|
 | `dr_repo` | the repo: name, root, remote, vcs, default_branch, file_count, mapped_at |
 | `dr_section` | the navigational index: `name`, `path_prefix`, `description` — "UI here / API here / docs here". Rendered in the boot `## CONNECTIONS` block; start here. |
-| `dr_filepath` | one row per file: `path`, `ext`, `lang`, `role` (code/doc/config/test/asset/env), `bytes`, `lines`, `desc` (cartographer one-liner, NULL until curated) |
+| `dr_filepath` | one row per file: `path`, `ext`, `lang`, `role` (code/doc/config/test/asset/env), `bytes`, `lines`, `desc` (cartographer one-line behavior: responsibility, mechanism, input, output; NULL until curated) |
 | `dr_dependency` | deps from the manifests: `manager` (npm/pip/poetry/go/cargo), `name`, `version`, `kind`, `source_file` |
 | `dr_env` | env-var names found in `.env.*` example files: `name`, `source_file` |
 | `dr_endpoint` | HTTP routes: `method`, `path`, `handler` (file:line), `framework`, `source_file` |
@@ -4185,10 +4227,9 @@ you need is missing.
 
 ## Orient fast
 
-Boot `## CONNECTIONS` already shows the section index. Flow: pick a section
-there -> query that section''s leaves (file names + descriptions) -> read the
-one or two files you need. Section-first, one cheap query deep — never a full
-preload.
+Boot `## CONNECTIONS` already shows the section index. Cheap flow: pick a
+section there -> query that section''s leaves (file names + descriptions) ->
+read the one or two files you need. One query deep beats a full preload.
 
 Run `sc map-schema` before the first structural query; pass = it lists the
 expected `dr_*` object. Run `sc map-schema <dr_table>` before using unfamiliar
@@ -4218,7 +4259,7 @@ WHERE lang IS NOT NULL GROUP BY lang ORDER BY n DESC;
 -- where the code lives (skip docs/config/assets):
 SELECT path, lang, lines FROM dr_filepath WHERE role=''code'' ORDER BY lines DESC;
 
--- find files by area (the map is the index; grep only what it points at):
+-- find files by area (grep or open them directly afterwards):
 SELECT path FROM dr_filepath WHERE path LIKE ''%auth%'';
 
 -- stack + config surface:
@@ -4238,15 +4279,16 @@ SELECT path, kind, file FROM dr_route ORDER BY path;                    -- UI ro
 
 ## Stance
 
-- **Map first, grep second.** Query `dr_filepath` for the handful of files
-  that matter, then read those — NEVER `grep -r` the whole tree.
-- **Lazy-load.** Pull a file''s contents only once the map points at it. Carry
-  the map, not the territory.
+- **Any method.** The catalogue is a resource, not a mandate. Its value is the
+  per-file behavioral `desc` and the semantic layer when wired; grep, direct
+  reads, docs, and harness-native search remain equally valid.
+- **Lazy-load.** Pull a file''s contents once you know you need it. Carry the
+  map, not the territory.
 - **Map looks wrong?** Empty, stale (repo changed since `mapped_at`),
   mis-classified, a nested file under "other / unsectioned", or a `desc IS
   NULL` where you needed one -> Cartographer worklist item. Root files belong
-  to `Repository Root`, not the unsectioned worklist. Flag the gap; don''t
-  author the map yourself.
+  to `Repository Root`, not the unsectioned worklist. Flag the gap and keep
+  working with another method; don''t author the map yourself.
 - **Semantic layer when wired.** Endpoints / DB schema / UI routes let you
   jump straight to the API surface or schema; a dimension is empty -> fall
   back to section + descriptions. Symbol-level semantics (functions/classes)

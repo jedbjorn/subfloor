@@ -1,16 +1,17 @@
 ---
 name: surface_catalogue
-description: Read the host repo via the dr_* catalogue (files, languages, deps, env) BEFORE grepping or walking the tree. Query first, lazy-load the few files it points at. Use to orient in an unfamiliar repo fast.
+description: Read the host repo's dr_* catalogue (sections, file behavior, deps, env, semantic layer) as abbreviated source documentation — one navigation resource beside grep, direct reads, and docs. Use to orient in an unfamiliar repo fast.
 category: substrate
 common: true
 ---
 
-# surface_catalogue — read the repo from the map, not by grepping
+# surface_catalogue — the repo map as abbreviated documentation
 
-The `dr_*` catalogue is a scan of the host repo. Query it first to orient, not
-the tree. It is separate from Subfloor control-plane memory and from the
-product's runtime database. Inspect structure with `sc map-schema`; query data
-with `sc map-sql "…"`.
+The `dr_*` catalogue is a scan of the host repo: a resource for orienting, not
+a required first step. Use it, grep, read files directly, read repository docs,
+or use harness-native search as the work warrants. It is separate from Subfloor
+control-plane memory and from the product's runtime database. Inspect structure
+with `sc map-schema`; query data with `sc map-sql "…"`.
 
 NEVER map the repo yourself. The map stays fresh automatically (git hooks
 re-map on pull / branch-switch / rebase) and is owned by the **cartographer**
@@ -20,7 +21,7 @@ shell. Empty / stale / wrong map -> flag the cartographer, don't re-map.
 |---|---|
 | `dr_repo` | the repo: name, root, remote, vcs, default_branch, file_count, mapped_at |
 | `dr_section` | the navigational index: `name`, `path_prefix`, `description` — "UI here / API here / docs here". Rendered in the boot `## CONNECTIONS` block; start here. |
-| `dr_filepath` | one row per file: `path`, `ext`, `lang`, `role` (code/doc/config/test/asset/env), `bytes`, `lines`, `desc` (cartographer one-liner, NULL until curated) |
+| `dr_filepath` | one row per file: `path`, `ext`, `lang`, `role` (code/doc/config/test/asset/env), `bytes`, `lines`, `desc` (cartographer one-line behavior: responsibility, mechanism, input, output; NULL until curated) |
 | `dr_dependency` | deps from the manifests: `manager` (npm/pip/poetry/go/cargo), `name`, `version`, `kind`, `source_file` |
 | `dr_env` | env-var names found in `.env.*` example files: `name`, `source_file` |
 | `dr_endpoint` | HTTP routes: `method`, `path`, `handler` (file:line), `framework`, `source_file` |
@@ -35,10 +36,9 @@ you need is missing.
 
 ## Orient fast
 
-Boot `## CONNECTIONS` already shows the section index. Flow: pick a section
-there -> query that section's leaves (file names + descriptions) -> read the
-one or two files you need. Section-first, one cheap query deep — never a full
-preload.
+Boot `## CONNECTIONS` already shows the section index. Cheap flow: pick a
+section there -> query that section's leaves (file names + descriptions) ->
+read the one or two files you need. One query deep beats a full preload.
 
 Run `sc map-schema` before the first structural query; pass = it lists the
 expected `dr_*` object. Run `sc map-schema <dr_table>` before using unfamiliar
@@ -68,7 +68,7 @@ WHERE lang IS NOT NULL GROUP BY lang ORDER BY n DESC;
 -- where the code lives (skip docs/config/assets):
 SELECT path, lang, lines FROM dr_filepath WHERE role='code' ORDER BY lines DESC;
 
--- find files by area (the map is the index; grep only what it points at):
+-- find files by area (grep or open them directly afterwards):
 SELECT path FROM dr_filepath WHERE path LIKE '%auth%';
 
 -- stack + config surface:
@@ -88,15 +88,16 @@ SELECT path, kind, file FROM dr_route ORDER BY path;                    -- UI ro
 
 ## Stance
 
-- **Map first, grep second.** Query `dr_filepath` for the handful of files
-  that matter, then read those — NEVER `grep -r` the whole tree.
-- **Lazy-load.** Pull a file's contents only once the map points at it. Carry
-  the map, not the territory.
+- **Any method.** The catalogue is a resource, not a mandate. Its value is the
+  per-file behavioral `desc` and the semantic layer when wired; grep, direct
+  reads, docs, and harness-native search remain equally valid.
+- **Lazy-load.** Pull a file's contents once you know you need it. Carry the
+  map, not the territory.
 - **Map looks wrong?** Empty, stale (repo changed since `mapped_at`),
   mis-classified, a nested file under "other / unsectioned", or a `desc IS
   NULL` where you needed one -> Cartographer worklist item. Root files belong
-  to `Repository Root`, not the unsectioned worklist. Flag the gap; don't
-  author the map yourself.
+  to `Repository Root`, not the unsectioned worklist. Flag the gap and keep
+  working with another method; don't author the map yourself.
 - **Semantic layer when wired.** Endpoints / DB schema / UI routes let you
   jump straight to the API surface or schema; a dimension is empty -> fall
   back to section + descriptions. Symbol-level semantics (functions/classes)
