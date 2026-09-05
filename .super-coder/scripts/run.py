@@ -507,13 +507,13 @@ def headless_command(
     adapter: dict,
     prompt: str,
     model: "str | None" = None,
-    sandbox_flags: "list[str] | None" = None,
+    launch_flags: "list[str] | None" = None,
     effort: "str | None" = None,
     transport: "route_transport.TransportProjection | None" = None,
     conversation_owned: bool = False,
 ) -> "list[str] | None":
     """The non-interactive exec argv from the adapter's `headless` block —
-    launch prefix + model flag + sandbox flags + the prompt as the final
+    launch prefix + model flag + launch-mode flags + the prompt as the final
     positional. None when the harness declares no headless block (e.g. vibe,
     which takes no model from the launch seam — see the spec's non-goals)."""
     hcfg = adapter.get("headless")
@@ -555,7 +555,7 @@ def headless_command(
         if transport is not None
         else _headless_effort_args(hcfg, effort, adapter.get("harness", "?"))
     )
-    cmd += list(sandbox_flags or [])
+    cmd += list(launch_flags or [])
     if hcfg.get("prompt_flag"):
         cmd += [hcfg["prompt_flag"], prompt]
     else:
@@ -757,13 +757,37 @@ def apply_sandbox(adapter: dict, root: Path = REPO_ROOT) -> list[str]:
     """Sandbox-only: elevate harness permissions to allow-all when booting
     INSIDE the docker sandbox (SC_SANDBOX, set by `sc launch`'s docker run). The
     container is the safety boundary, so permission prompts inside it are pure
-    friction; the no-docker host escape hatch (`./sc boot` with SC_SANDBOX
-    unset) keeps normal prompts. Each adapter declares sandbox.merge_json:
+    friction; on the host (SC_SANDBOX unset) only the adapter's always-on
+    launch flags apply (launch_mode_flags). Each adapter declares sandbox.merge_json:
     {repo-relative-path: patch}; we deep-merge the patch into that
     project-scoped file (preserving any keys the fork set)."""
     if not os.environ.get("SC_SANDBOX"):
         return []
     return _merge_json_spec((adapter.get("sandbox") or {}).get("merge_json") or {}, root)
+
+
+def launch_mode_flags(adapter: dict, headless: bool) -> list[str]:
+    """The permission flags for this launch mode: the adapter's always-on set
+    at its top level, then the sandbox-only set when booting inside the docker
+    sandbox (SC_SANDBOX). The two flag sets are disjoint by launch mode:
+    `launch_flags` for interactive, `headless_flags` for headless — a
+    non-interactive run can't answer a permission prompt (it auto-denies and
+    the worker silently stalls). They are NOT folded together because a
+    harness's interactive flag can be invalid headless — `kimi -p` hard-errors
+    on `--yolo`/`--auto` (prompt mode is always auto-permission, no flag
+    needed).
+
+    Always-on flags are the only elevation that still reaches Claude Code:
+    since 2.1.256 a project-scoped `permissions.defaultMode` of
+    `bypassPermissions` is ignored, so a settings merge cannot grant it. The
+    host route grants shells the same bypass browser chats already run with
+    (conversation_adapters/claude.py); the sandbox-only set stays for
+    harnesses whose bypass is safe only behind the container boundary."""
+    key = "headless_flags" if headless else "launch_flags"
+    flags = list(adapter.get(key) or [])
+    if os.environ.get("SC_SANDBOX"):
+        flags += list((adapter.get("sandbox") or {}).get(key) or [])
+    return flags
 
 
 def execution_mode() -> str:
@@ -1958,14 +1982,12 @@ def prepare_launch(*, shell_id: int, harness: "str | None" = None,
                 cfg[key] = session_model
                 atomic_write(mfile, json.dumps(cfg, indent=2) + "\n")
 
-    # Sandbox elevation, main()'s split kept: launch_flags for the TUI,
+    # Permission flags, main()'s split kept: launch_flags for the TUI,
     # headless_flags for a non-interactive plan, plus sandbox-only env.
-    sandbox_flags: list[str] = []
+    mode_flags = launch_mode_flags(adapter, headless)
     sandbox_env: dict[str, str] = {}
     if os.environ.get("SC_SANDBOX"):
         scfg = adapter.get("sandbox") or {}
-        key = "headless_flags" if headless else "launch_flags"
-        sandbox_flags = list(scfg.get(key) or [])
         sandbox_env = {k: str(v) for k, v in (scfg.get("env") or {}).items()}
 
     name_args: list[str] = []
@@ -1976,7 +1998,7 @@ def prepare_launch(*, shell_id: int, harness: "str | None" = None,
     if headless:
         argv = headless_command(
             adapter, headless_prompt, session_model,
-            sandbox_flags, session_effort, transport=route_projection,
+            mode_flags, session_effort, transport=route_projection,
             conversation_owned=conversation_owned,
         )
         if argv is None:
@@ -1986,7 +2008,7 @@ def prepare_launch(*, shell_id: int, harness: "str | None" = None,
         argv = (
             list(adapter.get("launch") or [harness])
             + list((managed or {}).get("launch_args") or [])
-            + name_args + model_args + sandbox_flags
+            + name_args + model_args + mode_flags
         )
 
     # Env injection, verbatim from main()'s exec block: adapter env, sandbox
@@ -2536,24 +2558,16 @@ def main() -> None:
     if sandboxed:
         print(f"→ sandbox: allow-all permissions → {', '.join(sandboxed)}")
 
-    # Sandbox-only launch flags — e.g. codex's approval/sandbox bypass, safe
-    # because the container is the safety boundary. The no-docker host path keeps
-    # the harness's normal prompts (SC_SANDBOX unset). The two flag sets are
-    # disjoint by launch mode: `launch_flags` for interactive, `headless_flags`
-    # for headless — a non-interactive run can't answer a permission prompt (it
-    # auto-denies and the worker silently stalls), so e.g. claude gets its bypass
-    # flag there; codex declares the same flag in both. They are NOT folded
-    # together because a harness's interactive flag can be invalid headless —
-    # `kimi -p` hard-errors on `--yolo`/`--auto` (prompt mode is always
-    # auto-permission, no flag needed).
-    sandbox_flags: list[str] = []
+    # Permission flags for this launch mode — always-on ones from the adapter
+    # top level (claude's bypass, which a settings merge can no longer grant)
+    # plus sandbox-only ones such as codex's approval/sandbox bypass, safe
+    # because the container is the safety boundary. See launch_mode_flags.
+    mode_flags = launch_mode_flags(adapter, headless)
+    if mode_flags:
+        print(f"→ launch flags → {' '.join(mode_flags)}")
     sandbox_env: dict[str, str] = {}
     if os.environ.get("SC_SANDBOX"):
         scfg = adapter.get("sandbox") or {}
-        key = "headless_flags" if headless else "launch_flags"
-        sandbox_flags = list(scfg.get(key) or [])
-        if sandbox_flags:
-            print(f"→ sandbox: launch flags → {' '.join(sandbox_flags)}")
         # Sandbox-only launch env — e.g. claude's IS_SANDBOX=1, required because
         # the rootless container runs the harness as uid 0 and claude refuses
         # bypass-permissions mode as root unless the env marks it as sandboxed.
@@ -2568,7 +2582,7 @@ def main() -> None:
         hmodel = session_model  # resolved up front (persisted on the archive row)
         effective_prompt = prompt or DEFAULT_HEADLESS_PROMPT
         headless_cmd = headless_command(
-            adapter, effective_prompt, hmodel, sandbox_flags,
+            adapter, effective_prompt, hmodel, mode_flags,
             session_effort)
         if headless_cmd is None:
             sys.exit(f"sc run: harness '{harness}' has no headless adapter — "
@@ -2605,7 +2619,7 @@ def main() -> None:
         else (
             (adapter.get("launch") or [harness])
             + list((managed or {}).get("launch_args") or [])
-            + name_args + model_args + sandbox_flags
+            + name_args + model_args + mode_flags
         )
     )
     effort_env = headless_effort_env(adapter, session_effort) if headless else {}

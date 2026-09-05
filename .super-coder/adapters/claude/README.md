@@ -15,7 +15,19 @@ the launch command. No extra config file to emit at v1.
 | `model` | `{ "flag": "--model" }` — run.py appends `--model <id>` for the flavor's claude model (alias: `sonnet`/`haiku`/`opus`) |
 | `headless.effort` | `{ "flag": "--effort" }` — applies an explicitly requested headless effort level |
 | `merge_json` | always-on: project-scoped JSON deep-merged every launch (preserves fork keys). Installs the branch-guard hook into `.claude/settings.local.json`. |
-| `sandbox` | `merge_json`: project-scoped config patched in-sandbox only (allow-all permissions) |
+| `launch_flags` / `headless_flags` | always-on argv appended to the interactive / headless launch — `--dangerously-skip-permissions` in both |
+| `sandbox` | `env`: `IS_SANDBOX=1`, required because the rootless container runs claude as uid 0 and it refuses bypass as root without it |
+
+## Permission stance
+
+Every launched shell runs with `--dangerously-skip-permissions`, on the host as
+well as in the sandbox — the same bypass browser chats already get from the
+conversation adapter. This is a launch flag, not a settings merge, because
+Claude Code 2.1.256 ignores a project-scoped `permissions.defaultMode` of
+`bypassPermissions` (in `.claude/settings.json` or `.claude/settings.local.json`);
+only user/managed settings or the CLI flag grant it, and the engine never edits
+the operator's user settings. The branch-guard hook fires in bypass mode too,
+so the default-branch protection is unchanged.
 
 ## Branch-guard hook
 
