@@ -151,7 +151,8 @@
     ".super-coder/migrations/0249_reseed_docs_frozen_render_path.sql",
     ".super-coder/migrations/0250_reseed_fork_skill_design_planner_lane.sql",
     ".super-coder/migrations/0251_conversation_run_transcript_offset.sql",
-    ".super-coder/migrations/0252_reseed_universal_pr_owner_wakes.sql"
+    ".super-coder/migrations/0252_reseed_universal_pr_owner_wakes.sql",
+    ".super-coder/migrations/0253_reseed_sprint_review_flexibility.sql"
   ],
   "baseline_migration_ledger": {
     "count": 142,

@@ -628,13 +628,14 @@ class ReviewOutcomeTest(SprintReviewLoopCase):
             idempotency_key="changes-1",
         )
         self.assertEqual(
-            "re-enter",
+            "force-new",
             self.con.execute(
                 "SELECT declared_type FROM wake_message WHERE message_id=?",
                 (changed.message_id,),
             ).fetchone()[0],
         )
         self.assertEqual("fixing", changed.disposition)
+        self.assertFalse(changed.sprint_paused)
         self.assertIsNone(changed.conversation_id)
         self.assertEqual(
             0,
@@ -644,6 +645,11 @@ class ReviewOutcomeTest(SprintReviewLoopCase):
                 "WHERE name IN ('purpose','parent_conversation_id')"
             ).fetchone()[0],
         )
+        with self.assertRaisesRegex(
+            sprint_domain.SprintInvariantError, "has not been delivered"
+        ):
+            self.messages.mark_read(changed.message_id, 1)
+        self.deliver_message(changed.message_id)
         self.assertEqual("accepted", self.messages.mark_read(changed.message_id, 1))
         changed_expectation = self.con.execute(
             "SELECT resolved_at,resolution,next_evaluation_at "
@@ -769,90 +775,45 @@ class ReviewOutcomeTest(SprintReviewLoopCase):
             ],
         )
 
-    def test_in_review_same_head_rejects_a_second_handoff_key(self):
+    def test_in_review_second_handoff_key_supersedes_the_first_request(self):
         first = self.request_review("first-review-key")
+        self.accept_review(first.message_id)
+        self.seed_historical_expectation(first.message_id)
 
-        with self.assertRaisesRegex(
-            sprint_domain.SprintInvariantError,
-            "review handoff already targets the current PR head",
-        ):
-            self.request_review("different-review-key")
+        second = self.request_review("second-review-key")
 
+        self.assertTrue(second.created)
         self.assertEqual(
-            [(first.message_id, "first-review-key")],
+            [
+                (first.message_id, "declined", "superseded by a newer review request"),
+                (second.message_id, "pending", None),
+            ],
             [
                 tuple(row)
                 for row in self.con.execute(
-                    "SELECT message_id,idempotency_key FROM wake_message "
-                    "WHERE work_unit_id=? AND message_kind='review_request'",
+                    "SELECT message_id,disposition,decline_reason FROM wake_message "
+                    "WHERE work_unit_id=? AND message_kind='review_request' "
+                    "ORDER BY message_id",
                     (self.unit_id,),
                 )
             ],
         )
         self.assertEqual(
-            1,
+            "in_review",
             self.con.execute(
-                "SELECT COUNT(*) FROM sprint_events "
-                "WHERE event_type='review.requested'"
+                "SELECT disposition FROM sprint_work_units WHERE work_unit_id=?",
+                (self.unit_id,),
             ).fetchone()[0],
         )
-
-    def test_request_review_repairs_a_pre_update_stale_in_review_lane(self):
-        stale = self.request_review("stale-review-key")
-        self.accept_review(stale.message_id)
-        self.seed_historical_expectation(stale.message_id)
-        self.con.execute(
-            "INSERT INTO sprint_pr_transitions "
-            "(registered_pr_id,normalized_state,transition_key,"
-            "observed_head_sha,evidence) VALUES (?,?,?,?,?)",
-            (
-                self.registered_pr_id,
-                "green",
-                "historical-head-change",
-                "b" * 40,
-                json.dumps(
-                    {
-                        "base_sha": "c" * 40,
-                        "checks": "SUCCESS",
-                        "checks_failed": False,
-                    },
-                    sort_keys=True,
-                ),
-            ),
-        )
-        self.con.commit()
-
-        refreshed = self.request_review("replacement-review-key")
-
-        self.assertTrue(refreshed.created)
         self.assertEqual(
-            (
-                "in_review",
-                (
-                    "Submitting PR for review: "
-                    "https://github.com/acme/repo/pull/42; registered Sprint PR "
-                    f"{self.registered_pr_id}; exact head {'b' * 40}; work unit "
-                    f"{self.unit_id}."
-                ),
-            ),
+            ("review request superseded by a newer request", None),
             tuple(
                 self.con.execute(
-                    "SELECT unit.disposition,message.body "
-                    "FROM sprint_work_units unit JOIN wake_message message "
-                    "ON message.work_unit_id=unit.work_unit_id "
-                    "WHERE unit.work_unit_id=? AND message.message_id=?",
-                    (self.unit_id, refreshed.message_id),
+                    "SELECT resolution,next_evaluation_at "
+                    "FROM sprint_liveness_expectations WHERE message_id=?",
+                    (first.message_id,),
                 ).fetchone()
             ),
-        )
-        stale_expectation = self.con.execute(
-            "SELECT resolution,next_evaluation_at "
-            "FROM sprint_liveness_expectations WHERE message_id=?",
-            (stale.message_id,),
-        ).fetchone()
-        self.assertEqual(
-            ("review request invalidated by PR head change", None),
-            tuple(stale_expectation),
         )
         invalidated = json.loads(
             self.con.execute(
@@ -860,14 +821,7 @@ class ReviewOutcomeTest(SprintReviewLoopCase):
                 "WHERE event_type='review.request_invalidated'"
             ).fetchone()[0]
         )
-        self.assertEqual(
-            (stale.message_id, "a" * 40, "b" * 40),
-            (
-                invalidated["invalidated_message_id"],
-                invalidated["previous_head_sha"],
-                invalidated["head_sha"],
-            ),
-        )
+        self.assertEqual(first.message_id, invalidated["invalidated_message_id"])
         with self.assertRaisesRegex(
             sprint_domain.SprintInvariantError, "accepted request"
         ):
@@ -876,16 +830,9 @@ class ReviewOutcomeTest(SprintReviewLoopCase):
                 self.registered_pr_id,
                 2,
                 verdict="approved",
-                body="The obsolete acceptance must not authorize this head.",
-                idempotency_key="premature-refreshed-approval",
+                body="The superseded acceptance must not authorize the new request.",
+                idempotency_key="premature-second-approval",
             )
-        self.assertEqual(
-            0,
-            self.con.execute(
-                "SELECT COUNT(*) FROM wake_message "
-                "WHERE idempotency_key='premature-refreshed-approval'"
-            ).fetchone()[0],
-        )
 
     def test_outcome_requires_assigned_reviewer_and_accepted_request(self):
         handoff = self.request_review()
@@ -936,6 +883,7 @@ class ReviewOutcomeTest(SprintReviewLoopCase):
             body="Medium: update the implementation.",
             idempotency_key="changes-before-new-request",
         )
+        self.deliver_message(changed.message_id)
         self.messages.mark_read(changed.message_id, 1)
         self.reader.current = pull_request(
             checks="FAILURE", checks_failed=True, head_sha="b" * 40
@@ -981,7 +929,7 @@ class ReviewOutcomeTest(SprintReviewLoopCase):
             ).fetchone()[0],
         )
 
-    def test_approval_rejects_a_head_that_changed_after_review_acceptance(self):
+    def test_head_change_after_acceptance_keeps_the_review_live(self):
         handoff = self.request_review()
         self.accept_review(handoff.message_id)
         self.reader.current = pull_request(
@@ -989,57 +937,118 @@ class ReviewOutcomeTest(SprintReviewLoopCase):
         )
         self.watcher.poll_once()
 
-        with self.assertRaisesRegex(
-            sprint_domain.SprintInvariantError,
-            "review verdict requires an accepted request",
-        ):
-            self.loop.record_review(
-                self.sprint_id,
-                self.registered_pr_id,
-                2,
-                verdict="approved",
-                body="must re-request on the changed head",
-                idempotency_key="stale-review-head",
-            )
-
         self.assertEqual(
-            0,
-            self.con.execute(
-                "SELECT COUNT(*) FROM wake_message "
-                "WHERE idempotency_key='stale-review-head'"
-            ).fetchone()[0],
-        )
-        self.assertEqual(
-            ("declined", "superseded by PR head change"),
+            ("in_review", "accepted"),
             tuple(
                 self.con.execute(
-                    "SELECT disposition,decline_reason FROM wake_message "
-                    "WHERE message_id=?",
-                    (handoff.message_id,),
+                    "SELECT unit.disposition,message.disposition "
+                    "FROM sprint_work_units unit JOIN wake_message message "
+                    "ON message.work_unit_id=unit.work_unit_id "
+                    "WHERE unit.work_unit_id=? AND message.message_id=?",
+                    (self.unit_id, handoff.message_id),
                 ).fetchone()
             ),
         )
+        outcome = self.loop.record_review(
+            self.sprint_id,
+            self.registered_pr_id,
+            2,
+            verdict="approved",
+            body="Approved on the live head after a rebase.",
+            idempotency_key="approved-after-head-move",
+        )
+        self.assertEqual("merge_ready", outcome.disposition)
         self.assertEqual(
-            "fixing",
+            0,
             self.con.execute(
-                "SELECT disposition FROM sprint_work_units WHERE work_unit_id=?",
-                (self.unit_id,),
+                "SELECT COUNT(*) FROM sprint_events "
+                "WHERE event_type='review.request_invalidated'"
             ).fetchone()[0],
         )
+
+
+class ReviewRoundCeilingTest(SprintReviewLoopCase):
+    def changes_round(self, index: int):
+        handoff = self.request_review(f"round-{index}:request")
+        self.accept_review(handoff.message_id)
+        changed = self.loop.record_review(
+            self.sprint_id,
+            self.registered_pr_id,
+            2,
+            verdict="changes_requested",
+            body=f"Medium: round {index} still has findings.",
+            idempotency_key=f"round-{index}",
+        )
+        self.deliver_message(changed.message_id)
+        self.messages.mark_read(changed.message_id, 1)
+        return changed
+
+    def sprint_lifecycle(self) -> str:
+        return self.con.execute(
+            "SELECT lifecycle FROM sprints WHERE sprint_id=?", (self.sprint_id,)
+        ).fetchone()[0]
+
+    def test_rounds_below_the_ceiling_leave_the_sprint_armed(self):
+        for index in range(1, sprint_review_loop.REVIEW_ROUND_CEILING):
+            changed = self.changes_round(index)
+            self.assertFalse(changed.sprint_paused)
+        self.assertEqual("armed", self.sprint_lifecycle())
         self.assertEqual(
-            self.developer_conversation_id,
+            0,
             self.con.execute(
-                "SELECT active.chat_id FROM sprint_participants participant "
-                "JOIN active_shell_chats active "
-                "ON active.shell_id=participant.shell_id "
-                "WHERE participant.participant_id=?",
-                (self.developer_id,),
+                "SELECT COUNT(*) FROM sprint_events WHERE event_type='lifecycle.paused'"
             ).fetchone()[0],
         )
+
+    def test_eighth_changes_requested_pauses_the_sprint_for_fnb(self):
+        for index in range(1, sprint_review_loop.REVIEW_ROUND_CEILING):
+            self.changes_round(index)
+
+        final = self.changes_round(sprint_review_loop.REVIEW_ROUND_CEILING)
+
+        self.assertTrue(final.sprint_paused)
+        self.assertEqual("fixing", final.disposition)
+        self.assertEqual("paused", self.sprint_lifecycle())
+        paused = json.loads(
+            self.con.execute(
+                "SELECT payload FROM sprint_events WHERE event_type='lifecycle.paused'"
+            ).fetchone()[0]
+        )
+        self.assertEqual(
+            (
+                sprint_review_loop.REVIEW_ROUNDS_EXHAUSTED,
+                self.unit_id,
+                self.registered_pr_id,
+                sprint_review_loop.REVIEW_ROUND_CEILING,
+            ),
+            (
+                paused["reason"],
+                paused["work_unit_id"],
+                paused["registered_pr_id"],
+                paused["review_rounds"],
+            ),
+        )
+        self.assertEqual(
+            1,
+            self.con.execute(
+                "SELECT COUNT(*) FROM sprint_reports "
+                "WHERE sprint_id=? AND report_kind='pause'",
+                (self.sprint_id,),
+            ).fetchone()[0],
+        )
+        notice = self.con.execute(
+            "SELECT body FROM wake_message "
+            "WHERE idempotency_key LIKE 'sprint-pause:%'"
+        ).fetchone()
+        self.assertIn("8 review rounds without approval", notice["body"])
+        with self.assertRaisesRegex(
+            sprint_domain.SprintInvariantError, "requires an armed Sprint"
+        ):
+            self.request_review("round-9:request")
 
 
 class MergeGateAndAdvanceTest(SprintReviewLoopCase):
-    def test_merge_gate_rechecks_live_green_and_exact_approved_head(self):
+    def test_merge_gate_rechecks_live_green_only(self):
         approved = self.approve()
         authorization = self.loop.authorize_merge(
             self.sprint_id, self.registered_pr_id, 1
@@ -1064,10 +1073,8 @@ class MergeGateAndAdvanceTest(SprintReviewLoopCase):
         self.reader.current = pull_request(
             checks="SUCCESS", checks_failed=False, head_sha="b" * 40
         )
-        with self.assertRaisesRegex(
-            sprint_domain.SprintInvariantError, "approval is stale"
-        ):
-            self.loop.authorize_merge(self.sprint_id, self.registered_pr_id, 1)
+        rebased = self.loop.authorize_merge(self.sprint_id, self.registered_pr_id, 1)
+        self.assertEqual("b" * 40, rebased.head_sha)
         self.assertEqual(
             "merge_ready",
             self.con.execute(
@@ -1076,7 +1083,7 @@ class MergeGateAndAdvanceTest(SprintReviewLoopCase):
             ).fetchone()[0],
         )
 
-    def test_moved_base_refuses_authorization_and_wakes_developer_once(self):
+    def test_moved_base_does_not_refuse_authorization(self):
         approved = self.approve()
         self.reader.current = pull_request(
             checks="SUCCESS",
@@ -1085,125 +1092,31 @@ class MergeGateAndAdvanceTest(SprintReviewLoopCase):
             base_sha="d" * 40,
         )
 
-        for _ in range(2):
-            with self.assertRaisesRegex(
-                sprint_domain.SprintInvariantError,
-                "approved base .* differs from live base",
-            ):
-                self.loop.authorize_merge(self.sprint_id, self.registered_pr_id, 1)
-
-        wake = self.con.execute(
-            "SELECT sprint_id,to_participant_id,work_unit_id,message_kind,body,"
-            "actionable,disposition,declared_type FROM wake_message "
-            "WHERE idempotency_key LIKE 'merge-base-stale:%'"
-        ).fetchall()
-        self.assertEqual(1, len(wake))
-        self.assertEqual(
-            (
-                self.sprint_id,
-                self.developer_id,
-                self.unit_id,
-                "notification",
-                "Merge authorization refused for PR #42: approved base "
-                + "c" * 40
-                + " differs from live base "
-                + "d" * 40
-                + "; sync with base and return through green review.",
-                1,
-                "pending",
-                "re-enter",
-            ),
-            tuple(wake[0]),
+        authorization = self.loop.authorize_merge(
+            self.sprint_id, self.registered_pr_id, 1
         )
+
+        self.assertEqual("a" * 40, authorization.head_sha)
+        authorized = json.loads(
+            self.con.execute(
+                "SELECT payload FROM sprint_events "
+                "WHERE event_type='merge.authorized'"
+            ).fetchone()[0]
+        )
+        self.assertEqual("d" * 40, authorized["base_sha"])
         self.assertEqual(
             ("merge_ready", 0),
             tuple(
                 self.con.execute(
-                    "SELECT disposition,(SELECT COUNT(*) FROM sprint_events "
-                    "WHERE event_type='merge.authorized') "
+                    "SELECT disposition,(SELECT COUNT(*) FROM wake_message "
+                    "WHERE idempotency_key LIKE 'merge-base-stale:%') "
                     "FROM sprint_work_units WHERE work_unit_id=?",
                     (approved.work_unit_id,),
                 ).fetchone()
             ),
         )
 
-    def test_legacy_missing_base_evidence_refuses_then_converges_after_rebase(self):
-        self.reader.current = pull_request(
-            checks="FAILURE", checks_failed=True, base_sha=None
-        )
-        self.assertTrue(self.watcher.poll_once())
-        self.reader.current = pull_request(
-            checks="SUCCESS", checks_failed=False, base_sha=None
-        )
-        self.assertTrue(self.watcher.poll_once())
-        self.approve()
-        self.reader.current = pull_request(checks="SUCCESS", checks_failed=False)
-
-        with self.assertRaisesRegex(
-            sprint_domain.SprintInvariantError, "approval predates base-tracking"
-        ):
-            self.loop.authorize_merge(self.sprint_id, self.registered_pr_id, 1)
-
-        legacy_wake = self.con.execute(
-            "SELECT message_id,body FROM wake_message "
-            "WHERE idempotency_key LIKE 'merge-base-stale:%:legacy:%'"
-        ).fetchone()
-        self.assertEqual(
-            "Merge authorization refused for PR #42: approval predates "
-            "base-tracking; sync with base to mint current evidence.",
-            legacy_wake["body"],
-        )
-        self.assertEqual("accepted", self.messages.mark_read(legacy_wake["message_id"], 1))
-
-        self.reader.current = pull_request(
-            checks="SUCCESS",
-            checks_failed=False,
-            head_sha="b" * 40,
-            base_sha="d" * 40,
-        )
-        self.assertTrue(self.watcher.poll_once())
-        self.assertEqual(
-            "fixing",
-            self.con.execute(
-                "SELECT disposition FROM sprint_work_units WHERE work_unit_id=?",
-                (self.unit_id,),
-            ).fetchone()[0],
-        )
-        invalidation = json.loads(
-            self.con.execute(
-                "SELECT payload FROM sprint_events "
-                "WHERE event_type='review.approval_invalidated'"
-            ).fetchone()[0]
-        )
-        self.assertEqual(("a" * 40, "b" * 40), (
-            invalidation["previous_head_sha"], invalidation["head_sha"]
-        ))
-
-        handoff = self.request_review("legacy-base-review")
-        self.accept_review(handoff.message_id)
-        outcome = self.loop.record_review(
-            self.sprint_id,
-            self.registered_pr_id,
-            2,
-            verdict="approved",
-            body="Rebased head and current base evidence are clean.",
-            idempotency_key="legacy-base-approved",
-        )
-        self.assertEqual("merge_ready", outcome.disposition)
-        authorization = self.loop.authorize_merge(
-            self.sprint_id, self.registered_pr_id, 1
-        )
-        self.assertEqual("b" * 40, authorization.head_sha)
-        evidence = json.loads(
-            self.con.execute(
-                "SELECT evidence FROM sprint_pr_transitions "
-                "WHERE registered_pr_id=? ORDER BY transition_id DESC LIMIT 1",
-                (self.registered_pr_id,),
-            ).fetchone()[0]
-        )
-        self.assertEqual("d" * 40, evidence["base_sha"])
-
-    def test_same_state_head_move_returns_readiness_judgment_to_developer(self):
+    def test_same_state_head_move_keeps_approval(self):
         approved = self.approve()
         self.reader.current = pull_request(
             checks="SUCCESS", checks_failed=False, head_sha="b" * 40
@@ -1222,7 +1135,7 @@ class MergeGateAndAdvanceTest(SprintReviewLoopCase):
             ],
         )
         self.assertEqual(
-            "fixing",
+            "merge_ready",
             self.con.execute(
                 "SELECT disposition FROM sprint_work_units WHERE work_unit_id=?",
                 (self.unit_id,),
@@ -1231,45 +1144,16 @@ class MergeGateAndAdvanceTest(SprintReviewLoopCase):
         self.assertEqual(
             0,
             self.con.execute(
-                "SELECT COUNT(*) FROM wake_message "
-                "WHERE idempotency_key LIKE 'pr-head-change:%:delta-review'"
+                "SELECT COUNT(*) FROM sprint_events "
+                "WHERE event_type='review.approval_invalidated'"
             ).fetchone()[0],
         )
-        owner_event = self.con.execute(
-            "SELECT receiver_shell_id,body FROM wake_message "
-            "WHERE idempotency_key LIKE 'pr-transition:%' "
-            "ORDER BY message_id DESC LIMIT 1"
-        ).fetchone()
-        self.assertEqual(1, owner_event["receiver_shell_id"])
-        self.assertIn("event=green", owner_event["body"])
-        self.assertIn("judge readiness", owner_event["body"])
-        invalidated = json.loads(
-            self.con.execute(
-                "SELECT payload FROM sprint_events "
-                "WHERE event_type='review.approval_invalidated'"
-            ).fetchone()[0]
-        )
-        self.assertEqual("a" * 40, invalidated["previous_head_sha"])
-        self.assertEqual("b" * 40, invalidated["head_sha"])
-        self.assertEqual(approved.message_id, invalidated["invalidated_message_id"])
-        self.assertIsNotNone(
+        self.assertIsNone(
             self.con.execute(
                 "SELECT read_at FROM wake_message WHERE message_id=?",
                 (approved.message_id,),
             ).fetchone()[0]
         )
-
-        handoff = self.request_review("review-after-head-move")
-        self.accept_review(handoff.message_id)
-        outcome = self.loop.record_review(
-            self.sprint_id,
-            self.registered_pr_id,
-            2,
-            verdict="approved",
-            body="Delta review is clean on the replacement head.",
-            idempotency_key="approved-after-head-move",
-        )
-        self.assertEqual("merge_ready", outcome.disposition)
         self.assertEqual(
             "b" * 40,
             self.loop.authorize_merge(
@@ -1277,8 +1161,8 @@ class MergeGateAndAdvanceTest(SprintReviewLoopCase):
             ).head_sha,
         )
 
-    def test_head_move_invalidates_an_active_review_request(self):
-        stale = self.request_review("review-before-head-move")
+    def test_head_move_keeps_an_active_review_request(self):
+        handoff = self.request_review("review-before-head-move")
         self.reader.current = pull_request(
             checks="SUCCESS", checks_failed=False, head_sha="b" * 40
         )
@@ -1286,87 +1170,42 @@ class MergeGateAndAdvanceTest(SprintReviewLoopCase):
         self.assertTrue(self.watcher.poll_once())
 
         self.assertEqual(
-            "fixing",
+            "in_review",
             self.con.execute(
                 "SELECT disposition FROM sprint_work_units WHERE work_unit_id=?",
                 (self.unit_id,),
             ).fetchone()[0],
         )
         self.assertEqual(
-            (1, "declined", "superseded by PR head change", "cancelled"),
+            ("pending", None, "pending"),
             tuple(
                 self.con.execute(
-                    "SELECT message.read_at IS NOT NULL,message.disposition,"
-                    "message.decline_reason,outbox.state "
+                    "SELECT message.disposition,message.decline_reason,outbox.state "
                     "FROM wake_message message "
                     "JOIN sprint_wake_messages link USING(message_id) "
                     "JOIN sprint_wake_outbox outbox USING(wake_id) "
                     "WHERE message.message_id=?",
-                    (stale.message_id,),
+                    (handoff.message_id,),
                 ).fetchone()
             ),
         )
-        invalidated = json.loads(
-            self.con.execute(
-                "SELECT payload FROM sprint_events "
-                "WHERE event_type='review.request_invalidated'"
-            ).fetchone()[0]
-        )
-        self.assertEqual(
-            (
-                stale.message_id,
-                self.registered_pr_id,
-                self.unit_id,
-                "a" * 40,
-                "b" * 40,
-            ),
-            (
-                invalidated["invalidated_message_id"],
-                invalidated["registered_pr_id"],
-                invalidated["work_unit_id"],
-                invalidated["previous_head_sha"],
-                invalidated["head_sha"],
-            ),
-        )
-        refreshed = self.request_review("review-after-active-head-move")
-        self.assertEqual(
-            (
-                "in_review",
-                (
-                    "Submitting PR for review: "
-                    "https://github.com/acme/repo/pull/42; registered Sprint PR "
-                    f"{self.registered_pr_id}; exact head {'b' * 40}; work unit "
-                    f"{self.unit_id}."
-                ),
-            ),
-            tuple(
-                self.con.execute(
-                    "SELECT unit.disposition,message.body "
-                    "FROM sprint_work_units unit JOIN wake_message message "
-                    "ON message.work_unit_id=unit.work_unit_id "
-                    "WHERE unit.work_unit_id=? AND message.message_id=?",
-                    (self.unit_id, refreshed.message_id),
-                ).fetchone()
-            ),
-        )
-        with self.assertRaisesRegex(
-            sprint_domain.SprintInvariantError, "accepted request"
-        ):
-            self.loop.record_review(
-                self.sprint_id,
-                self.registered_pr_id,
-                2,
-                verdict="approved",
-                body="The stale review acceptance cannot cross the head change.",
-                idempotency_key="stale-acceptance-after-head-move",
-            )
         self.assertEqual(
             0,
             self.con.execute(
-                "SELECT COUNT(*) FROM wake_message "
-                "WHERE idempotency_key='stale-acceptance-after-head-move'"
+                "SELECT COUNT(*) FROM sprint_events "
+                "WHERE event_type='review.request_invalidated'"
             ).fetchone()[0],
         )
+        self.accept_review(handoff.message_id)
+        outcome = self.loop.record_review(
+            self.sprint_id,
+            self.registered_pr_id,
+            2,
+            verdict="approved",
+            body="Approved on the moved head.",
+            idempotency_key="approved-after-active-head-move",
+        )
+        self.assertEqual("merge_ready", outcome.disposition)
 
     def test_merged_head_move_completes_without_requesting_dead_delta_review(self):
         self.approve()
@@ -1857,6 +1696,7 @@ class MergeGateAndAdvanceTest(SprintReviewLoopCase):
 
     def test_observed_merge_completes_board_and_assigns_next_in_fresh_active_lane(self):
         approved = self.approve()
+        self.deliver_message(approved.message_id)
         self.messages.mark_read(approved.message_id, 1)
         document = self.con.execute(
             "SELECT document_id FROM sprint_specs WHERE sprint_id=?",

@@ -217,16 +217,6 @@ _EVENT_FIELDS = {
             "previous_head_sha",
         }
     ),
-    "review.approval_invalidated": frozenset(
-        {
-            "work_unit_id",
-            "registered_pr_id",
-            "invalidated_message_id",
-            "head_sha",
-            "previous_head_sha",
-            "transition_key",
-        }
-    ),
     "merge.authorized": frozenset(
         {"work_unit_id", "registered_pr_id", "pr_number", "head_sha"}
     ),

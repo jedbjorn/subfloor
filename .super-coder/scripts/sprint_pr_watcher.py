@@ -1335,11 +1335,6 @@ class SprintPRWatcher:
             transition_key,
             state,
             pull_request,
-            previous_head_sha=(
-                str(latest["observed_head_sha"])
-                if latest is not None and latest["observed_head_sha"] is not None
-                else None
-            ),
             previous_state=(
                 str(latest["normalized_state"]) if latest is not None else None
             ),
@@ -1404,14 +1399,8 @@ class SprintPRWatcher:
         transition_key: str,
         state: str,
         pull_request: PullRequest,
-        previous_head_sha: str | None,
         previous_state: str | None,
     ) -> tuple[int, ...]:
-        sprint_id = (
-            int(registered["sprint_id"])
-            if registered["sprint_id"] is not None
-            else None
-        )
         registered_pr_id = registered["sprint_registered_pr_id"]
         unit_rows = self.con.execute(
             "SELECT l.work_unit_id,u.disposition "
@@ -1443,65 +1432,6 @@ class SprintPRWatcher:
                     "registered_pr.merged_grant_bypassed",
                 )
             )
-        head_changed = (
-            previous_head_sha is not None
-            and previous_head_sha != pull_request.head_sha
-        )
-        if (
-            head_changed
-            and pull_request.head_sha is not None
-            and state not in {"merged", "closed"}
-            and sprint_id is not None
-            and registered_pr_id is not None
-            and len(unit_rows) == 1
-            and unit_rows[0]["disposition"] == "in_review"
-        ):
-            invalidated_message_id = (
-                self.review_loop.invalidate_review_request_for_head_change_in_transaction(
-                    int(sprint_id),
-                    int(registered_pr_id),
-                    pull_request.head_sha,
-                )
-            )
-            if invalidated_message_id is not None:
-                resolved_review_message_ids = (invalidated_message_id,)
-        if (
-            head_changed
-            and state not in {"merged", "closed"}
-            and len(unit_rows) == 1
-            and unit_rows[0]["disposition"] == "merge_ready"
-        ):
-            work_unit_id = int(unit_rows[0]["work_unit_id"])
-            invalidated_message_id = self._invalidate_stale_approval(
-                sprint_id,
-                work_unit_id,
-            )
-            self.con.execute(
-                "UPDATE sprint_work_units SET disposition='fixing',"
-                "updated_at=datetime('now') WHERE work_unit_id=? "
-                "AND disposition='merge_ready'",
-                (work_unit_id,),
-            )
-            self.con.execute(
-                "INSERT INTO sprint_events "
-                "(sprint_id,event_type,actor_kind,payload) "
-                "VALUES (?,'review.approval_invalidated','system',?)",
-                (
-                    sprint_id,
-                    json.dumps(
-                        {
-                            "head_sha": pull_request.head_sha,
-                            "invalidated_message_id": invalidated_message_id,
-                            "previous_head_sha": previous_head_sha,
-                            "registered_pr_id": registered_pr_id,
-                            "transition_key": transition_key,
-                            "work_unit_id": work_unit_id,
-                        },
-                        sort_keys=True,
-                    ),
-                ),
-            )
-
         lifecycle = registered["lifecycle"]
         if lifecycle in {"armed", "paused"}:
             instructions = {
@@ -1583,26 +1513,6 @@ class SprintPRWatcher:
                 ),
             )
         return resolved_review_message_ids
-
-    def _invalidate_stale_approval(
-        self,
-        sprint_id: int,
-        work_unit_id: int,
-    ) -> int | None:
-        approval = self.con.execute(
-            "SELECT payload FROM sprint_events WHERE sprint_id=? "
-            "AND event_type='review.approved' "
-            "AND json_extract(payload,'$.work_unit_id')=? "
-            "ORDER BY event_id DESC LIMIT 1",
-            (sprint_id, work_unit_id),
-        ).fetchone()
-        if approval is None:
-            return None
-        message_id = json.loads(approval["payload"]).get("message_id")
-        if not isinstance(message_id, int):
-            return None
-        self.messages.resolve_in_transaction(message_id)
-        return message_id
 
     def _poll_failed(
         self,

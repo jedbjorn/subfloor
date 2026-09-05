@@ -74,8 +74,8 @@ Do not poll. Armed runtime owns scheduled dispatch + unread wake recovery;
 registered-PR watcher owns subscription observation. Developer-owned subscriptions send
 red/green/closed/merged facts to Developers, never Planner.
 
-Assignments/review requests use Force-new delivery; Planner-bound results use
-Re-enter. Delivery waits for a natural boundary; runtime owns bundling,
+Assignments, review requests, and verdicts use Force-new delivery;
+Planner-bound results use Re-enter. Delivery waits for a natural boundary; runtime owns bundling,
 rotation, recovery, and coordinate mode. Stop after a successful typed handoff.
 
 ## Durable running loop
