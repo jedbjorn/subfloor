@@ -641,8 +641,8 @@ def materialize_engine(
     git index — the engine is gitignored, so a `git checkout -- <paths>` (which
     stages) is wrong. `git archive | tar -x` copies the fetched tree over the
     top, leaving the gitignored per-instance files (shell_db.db*, instance.json)
-    in place. (Files deleted upstream linger until a future doctor sweep — same
-    gap the old checkout had; acceptable for a wholesale-overwrite dependency.)"""
+    in place. The update and rollback callers retire proven engine-owned files
+    absent from their target before running migrations."""
     paths = (
         engine_paths
         if engine_paths is not None
@@ -688,7 +688,11 @@ def check_local_edits(force: bool, *, target_ref: str | None = None) -> None:
     edits = engine_manifest.local_edits()
     if target_ref is not None and edits:
         already_target = {
-            rel for rel in edits if _path_matches_ref(rel, target_ref)
+            rel for rel, kind in edits.items()
+            if _path_matches_ref(rel, target_ref)
+            or (kind == "deleted" and not _engine_path_exists_at(
+                target_ref, rel, repo_root=REPO_ROOT
+            ))
         }
         if already_target:
             edits = {
@@ -878,6 +882,12 @@ def materialize_fetched_engine(
     """Lay an already-fetched ref onto the installed floor."""
 
     check_local_edits(force, target_ref=sha)
+    resolved_paths = _engine_paths_for(sha, repo_root=REPO_ROOT)
+    target_files = set(_engine_files_at(
+        sha, repo_root=REPO_ROOT, engine_paths=resolved_paths,
+    ))
+    current_ref = ENGINE_REF.read_text().strip() if ENGINE_REF.exists() else ""
+    current_files = set(_engine_files_at(current_ref, repo_root=REPO_ROOT)) if current_ref else set()
 
     # Restore point (engine half): remember where we were before overwriting.
     STATE_DIR.mkdir(parents=True, exist_ok=True)
@@ -888,8 +898,14 @@ def materialize_fetched_engine(
         # engine ref if discoverable; else leave prev absent (rollback will warn).
         ENGINE_REF_PREV.unlink(missing_ok=True)
 
-    resolved_paths = _engine_paths_for(sha, repo_root=REPO_ROOT)
     materialize_engine(sha, engine_paths=resolved_paths)
+    # Retire only paths whose ownership is proved by the installed pin. Do not
+    # sweep directories: they may also contain fork-local skills or state.
+    for rel in sorted(current_files - target_files):
+        path = REPO_ROOT / rel
+        if path.is_file() or path.is_symlink():
+            path.unlink()
+            print(f"  retired engine file: {rel}")
     materialized_paths = _materialized_engine_paths(REPO_ROOT)
     delta = [path for path in materialized_paths if path not in resolved_paths]
     materializable_delta = [

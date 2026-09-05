@@ -131,9 +131,8 @@ def restore_engine(prev_sha: str) -> None:
         if current_sha
         else set()
     )
-    # materialize_engine overlays an archive and deliberately leaves upstream-
-    # retired files alone during a forward update. Rollback is different: a
-    # target-only migration left behind would make the restored old server
+    # As in forward updates, retire engine-owned files absent from the target.
+    # A target-only migration left behind would make the restored old server
     # demand the new schema again. Remove only files proved upstream-owned by
     # the current pin and absent from the previous pin; fork-local files remain.
     for rel in sorted(current_files - previous_files):
