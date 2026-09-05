@@ -537,18 +537,25 @@ class SprintCliApiTest(unittest.TestCase):
                 "WHERE subscription_id=?",
                 (receipt["subscription_id"],),
             ).fetchone()
+            transitions = [
+                str(row[0])
+                for row in con.execute(
+                    "SELECT normalized_state FROM pr_subscription_transitions "
+                    "WHERE subscription_id=? ORDER BY transition_id",
+                    (receipt["subscription_id"],),
+                )
+            ]
             message = con.execute(
-                "SELECT receiver_shell_id,sprint_id,to_participant_id,"
-                "declared_type,body FROM wake_message "
-                "WHERE idempotency_key LIKE 'pr-transition:%:shell:1' "
-                "ORDER BY message_id DESC LIMIT 1"
+                "SELECT 1 FROM wake_message "
+                "WHERE idempotency_key LIKE 'pr-transition:%:shell:1'"
             ).fetchone()
         finally:
             con.close()
         self.assertEqual((1, "acme/outside", 85, None), subscription)
-        self.assertEqual((1, None, None, "re-enter"), message[:4])
-        self.assertIn("number=85", message[4])
-        self.assertIn("event=green", message[4])
+        # The initial snapshot is durable, but a first green outside a Sprint
+        # is not actionable and wakes nobody (spec #188).
+        self.assertEqual(["green"], transitions)
+        self.assertIsNone(message)
 
     def test_reconcile_pr_allows_originating_planner_and_projects_receipt(self):
         argv = (
