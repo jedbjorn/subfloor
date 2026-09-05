@@ -45,7 +45,17 @@ The launcher auto-syncs at boot when provably nothing can be lost (on base branc
    ```
    Co-Authored-By: <shell display_name> (super-coder) <noreply@…>
    ```
-3. Push -> open a PR -> stop. Do NOT merge without an explicit FnB directive — opening is the default, merging is a separate gate.
+3. Push -> open a PR -> subscribe -> stop. Do NOT merge without an explicit FnB directive — opening is the default, merging is a separate gate.
+
+## Subscribe the PR — the engine watches it, you don't
+
+Right after the PR exists, enrol it in the installation watcher:
+
+```
+sc pr subscribe --repository <owner/name> --pr <number>
+```
+
+The receipt (`created: true`, or `created: false` with the same subscription id on an exact retry) is part of the PR finish gate. From then on the engine wakes you with a self-describing Re-enter fact — inside or outside a Sprint — on red checks, merge, close-without-merge, and red-to-green recovery. Never poll GitHub, schedule a watcher, or ask another shell to relay. Subscribe fails -> keep the branch and PR, surface the exact error, and do not claim notification coverage. A Sprint lane runs `sc sprint register-pr` instead (it creates the same owner subscription); never run both on one PR.
 
 ## Merging a stack (only when the FnB hands you one)
 
@@ -74,7 +84,9 @@ Pass = tree clean, or on a pushed branch with a PR. A dirty/unpushed tree forces
 
 ## After a merge — clean up local
 
-Only after the PR is merged:
+Only after the PR is merged. The `event=merged` wake from your subscription is
+what starts this; confirm it on the remote (`gh pr view <n> --json state,mergedAt`)
+before deleting anything:
 
 A managed worktree whose Sprint is already `completed` is the exception: the
 Sprint cleanup service owns its reset after live turns exit. Do not race that

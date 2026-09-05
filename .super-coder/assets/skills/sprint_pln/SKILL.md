@@ -72,7 +72,7 @@ Load `sprint_pln` on every entry, then classify:
 
 Do not poll. Armed runtime owns scheduled dispatch + unread wake recovery;
 registered-PR watcher owns subscription observation. Developer-owned subscriptions send
-red/green/closed facts to Developers, never Planner.
+red/green/closed/merged facts to Developers, never Planner.
 
 Assignments/review requests use Force-new delivery; Planner-bound results use
 Re-enter. Delivery waits for a natural boundary; runtime owns bundling,

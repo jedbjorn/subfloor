@@ -1232,6 +1232,9 @@ class SprintPRWatcher:
                 if latest is not None and latest["observed_head_sha"] is not None
                 else None
             ),
+            previous_state=(
+                str(latest["normalized_state"]) if latest is not None else None
+            ),
         )
         if state == "merged" and registered_pr_id is not None:
             self.review_loop.observe_merge_in_transaction(
@@ -1294,6 +1297,7 @@ class SprintPRWatcher:
         state: str,
         pull_request: PullRequest,
         previous_head_sha: str | None,
+        previous_state: str | None,
     ) -> tuple[int, ...]:
         sprint_id = (
             int(registered["sprint_id"])
@@ -1402,6 +1406,11 @@ class SprintPRWatcher:
                     "Your active Sprint PR was closed without merge; tell the "
                     "Planner if this blocks the Sprint."
                 ),
+                "merged": (
+                    "Your active Sprint PR was merged; inspect the registered PR "
+                    "and follow the sprint_dev post-merge cleanup/handoff. Do not "
+                    "wait for another PR fact or ask the Planner to relay it."
+                ),
             }
             if lifecycle == "paused":
                 instructions["red"] = (
@@ -1425,15 +1434,36 @@ class SprintPRWatcher:
                     "Your PR was closed without merge outside an active Sprint; "
                     "no action is needed unless the closure was unexpected."
                 ),
+                "merged": (
+                    "Your PR was merged outside an active Sprint; verify the "
+                    "remote merged fact, follow the git skill's after-merge "
+                    "cleanup on the exact Active Session base, delete only the "
+                    "proven-merged local feature branch, and update current state."
+                ),
             }
+            if lifecycle == "completed":
+                instructions["merged"] = (
+                    "Your completed-Sprint PR was merged; do not manually reset "
+                    "the managed worktree. The successful-Sprint cleanup service "
+                    "owns that reset; use its status/retry authority through the "
+                    "originating Planner or FnB if needed."
+                )
+            # Outside an armed/paused Sprint green is only actionable as a
+            # red->green recovery; every other green would wake the owner to
+            # say "no action is needed".
+            if previous_state != "red":
+                instructions.pop("green")
         if state in instructions:
             head = pull_request.head_sha or "unknown"
             owner_shell_id = int(registered["owner_shell_id"])
+            evidence_fields = f"head_sha={head}, event={state}"
+            if state == "merged" and pull_request.merge_sha:
+                evidence_fields += f", merge_sha={pull_request.merge_sha}"
             body = (
                 "GitHub PR event: "
                 f"repository={registered['repository']}, "
                 f"number={registered['pr_number']}, "
-                f"head_sha={head}, event={state}. {instructions[state]}"
+                f"{evidence_fields}. {instructions[state]}"
             )
             self.messages.send_to_shell_in_transaction(
                 owner_shell_id,

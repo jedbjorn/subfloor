@@ -18,6 +18,7 @@ MIGRATIONS = (
     ENGINE / "migrations" / "0234_reseed_ci_fallback_authority.sql",
     ENGINE / "migrations" / "0240_reseed_sprint_spec_rebinding.sql",
     ENGINE / "migrations" / "0248_reseed_sprint_pln_orientation.sql",
+    ENGINE / "migrations" / "0252_reseed_universal_pr_owner_wakes.sql",
 )
 sys.path.insert(0, str(ENGINE / "scripts"))
 

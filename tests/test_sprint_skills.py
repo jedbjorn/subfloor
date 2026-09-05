@@ -55,7 +55,7 @@ CONFORMANCE_OWNER_SKILLS = {
 
 SPEC_SKILL = ENGINE / "assets" / "skills" / "spec" / "SKILL.md"
 CONTEXT_EFFICIENT_SKILLS = ("sprint_dev", "sprint_rev", "sprint_pln", "spec")
-CONTEXT_EFFICIENT_SKILL_BYTE_CEILING = 47_212
+CONTEXT_EFFICIENT_SKILL_BYTE_CEILING = 47_388
 CONTEXT_EFFICIENT_RESEED = (
     ENGINE / "migrations" / "0202_reseed_context_efficient_skills.sql"
 )
@@ -82,6 +82,9 @@ ROLE_AWARE_BOOT_RESEED = (
 )
 SUBFLOOR_COMMAND_RESEED = (
     ENGINE / "migrations" / "0247_reseed_subfloor_command.sql"
+)
+UNIVERSAL_PR_WAKES_RESEED = (
+    ENGINE / "migrations" / "0252_reseed_universal_pr_owner_wakes.sql"
 )
 
 
@@ -897,6 +900,7 @@ class SprintSkillTest(unittest.TestCase):
             con.executescript(DISPOSITION_VERBS_RESEED.read_text())
             con.executescript(ROLE_AWARE_BOOT_RESEED.read_text())
             con.executescript(SUBFLOOR_COMMAND_RESEED.read_text())
+            con.executescript(UNIVERSAL_PR_WAKES_RESEED.read_text())
 
             self.assertIsNotNone(
                 con.execute(
@@ -1685,8 +1689,9 @@ class SprintSkillTest(unittest.TestCase):
         planner = bodies["sprint_pln"]
         normalized_developer = " ".join(developer.split())
         self.assertIn(
-            "Red/green/closed Re-enter wakes continue", normalized_developer
+            "Red/green/closed/merged Re-enter wakes continue", normalized_developer
         )
+        self.assertIn("merged -> post-merge handoff", normalized_developer)
         self.assertIn("armed -> fix red + judge/pass green", normalized_developer)
         self.assertIn(
             "paused -> fix red now + judge green, review after resume",
@@ -1695,7 +1700,10 @@ class SprintSkillTest(unittest.TestCase):
         self.assertIn(
             "no active Sprint -> fix red if needed", normalized_developer
         )
-        self.assertIn("no action on green", normalized_developer)
+        self.assertIn("green arrives only as red recovery", normalized_developer)
+        self.assertIn(
+            "merged -> git skill after-merge cleanup", normalized_developer
+        )
         self.assertIn("Reviewer decides", developer)
         self.assertIn("recalling unreleased work", " ".join(reviewer.split()))
         self.assertIn("Compile the bounded evidence packet first", reviewer)

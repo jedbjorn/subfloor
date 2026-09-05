@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 import sys
 import unittest
@@ -1809,12 +1810,18 @@ class EngineWideSubscriptionTest(SprintPRWatcherCase):
 
         self.assertTrue(self.watcher.poll_once())
         self.assertEqual(calls + 2, len(self.reader.get_calls))
+        # Reopened green outside a Sprint is durable but not actionable: only
+        # the closed fact woke the owner.
         self.assertEqual(
-            2,
-            self.con.execute(
-                "SELECT COUNT(*) FROM wake_message "
-                "WHERE idempotency_key LIKE 'pr-transition:%'"
-            ).fetchone()[0],
+            ["closed"],
+            [
+                re.search(r"event=([a-z_]+)", str(row[0])).group(1)
+                for row in self.con.execute(
+                    "SELECT body FROM wake_message "
+                    "WHERE idempotency_key LIKE 'pr-transition:%' "
+                    "ORDER BY message_id"
+                )
+            ],
         )
 
     def test_merged_subscription_is_quiescent_on_pulse(self):
@@ -2085,6 +2092,199 @@ class BatchAndNormalizationTest(SprintPRWatcherCase):
         )
         self.assertEqual(5.0, service.pulse_seconds)
         self.assertEqual(60.0, service.history_seconds)
+
+
+class OwnerMergedAndGreenWakeTest(SprintPRWatcherCase):
+    """Spec #188: merged owner facts everywhere; non-Sprint green only after red."""
+
+    def _wake_events(self) -> list[str]:
+        events = []
+        for row in self.con.execute(
+            "SELECT body FROM wake_message "
+            "WHERE idempotency_key LIKE 'pr-transition:%' ORDER BY message_id"
+        ):
+            events.append(re.search(r"event=([a-z_]+)", str(row[0])).group(1))
+        return events
+
+    def _last_wake(self) -> sqlite3.Row:
+        return self.con.execute(
+            "SELECT receiver_shell_id,declared_type,idempotency_key,body "
+            "FROM wake_message WHERE idempotency_key LIKE 'pr-transition:%' "
+            "ORDER BY message_id DESC LIMIT 1"
+        ).fetchone()
+
+    def test_merged_outside_sprint_wakes_owner_with_merge_evidence(self):
+        receipt = self.watcher.subscribe(
+            owner_shell_id=1, repository="acme/repo", pr_number=42
+        )
+        self.assertEqual(["red"], self._wake_events())
+        self.reader.current = pull_request(
+            state="MERGED", checks="SUCCESS", checks_failed=False
+        )
+
+        self.assertTrue(self.watcher.poll_once())
+
+        self.assertEqual(["red", "merged"], self._wake_events())
+        wake = self._last_wake()
+        self.assertEqual((1, "re-enter"), tuple(wake)[:2])
+        transition_key = self.con.execute(
+            "SELECT transition_key FROM pr_subscription_transitions "
+            "WHERE normalized_state='merged'"
+        ).fetchone()[0]
+        self.assertEqual(
+            f"pr-transition:{transition_key}:shell:1", wake["idempotency_key"]
+        )
+        self.assertEqual(
+            "GitHub PR event: repository=acme/repo, number=42, head_sha="
+            + "a" * 40
+            + ", event=merged, merge_sha="
+            + "b" * 40
+            + ". Your PR was merged outside an active Sprint; verify the remote "
+            "merged fact, follow the git skill's after-merge cleanup on the exact "
+            "Active Session base, delete only the proven-merged local feature "
+            "branch, and update current state.",
+            wake["body"],
+        )
+        self.assertEqual(
+            0,
+            self.con.execute("SELECT COUNT(*) FROM sprint_pr_transitions").fetchone()[0],
+        )
+
+        # Terminal: the pulse no longer reads GitHub, and a registration replay
+        # re-observes the same merged state without a second fact.
+        calls = len(self.reader.get_calls)
+        self.assertFalse(self.watcher.poll_once())
+        self.assertEqual(calls, len(self.reader.get_calls))
+        replay = self.watcher.subscribe(
+            owner_shell_id=1, repository="acme/repo", pr_number=42
+        )
+        self.assertFalse(replay.created)
+        self.assertEqual(receipt.subscription_id, replay.subscription_id)
+        self.assertEqual(calls + 1, len(self.reader.get_calls))
+        self.assertEqual(["red", "merged"], self._wake_events())
+        self.assertEqual(
+            2,
+            self.con.execute(
+                "SELECT COUNT(*) FROM pr_subscription_transitions"
+            ).fetchone()[0],
+        )
+
+    def test_merged_in_armed_sprint_wakes_owner_with_handoff_instruction(self):
+        self.register()
+        self.con.execute(
+            "UPDATE sprint_work_units SET disposition='merge_ready' "
+            "WHERE work_unit_id=?",
+            (self.unit_id,),
+        )
+        self.con.commit()
+        self.reader.current = pull_request(
+            state="MERGED", checks="SUCCESS", checks_failed=False
+        )
+
+        self.assertTrue(self.watcher.poll_once())
+
+        self.assertEqual(["red", "merged"], self._wake_events())
+        wake = self._last_wake()
+        self.assertEqual(1, wake["receiver_shell_id"])
+        self.assertEqual(
+            "GitHub PR event: repository=acme/repo, number=42, head_sha="
+            + "a" * 40
+            + ", event=merged, merge_sha="
+            + "b" * 40
+            + ". Your active Sprint PR was merged; inspect the registered PR and "
+            "follow the sprint_dev post-merge cleanup/handoff. Do not wait for "
+            "another PR fact or ask the Planner to relay it.",
+            wake["body"],
+        )
+        # The existing Sprint merge projection is untouched by the owner fact.
+        self.assertEqual(
+            "completed",
+            self.con.execute(
+                "SELECT disposition FROM sprint_work_units WHERE work_unit_id=?",
+                (self.unit_id,),
+            ).fetchone()[0],
+        )
+        self.assertEqual(["red", "merged"], self._states())
+
+    def test_merged_in_completed_sprint_points_to_cleanup_service(self):
+        self.register()
+        self.con.execute(
+            "UPDATE sprint_work_units SET disposition='completed',"
+            "completed_at=datetime('now') WHERE sprint_id=?",
+            (self.sprint_id,),
+        )
+        self.con.commit()
+        sprint_domain.SprintLifecycleStore(self.con).transition(
+            self.sprint_id,
+            "completed",
+            sprint_domain.LifecycleActor("planner", 3),
+            terminal_outcome="delivered",
+        )
+        self.reader.current = pull_request(
+            state="MERGED", checks="SUCCESS", checks_failed=False
+        )
+
+        self.assertTrue(self.watcher.poll_once())
+
+        self.assertEqual(["red", "merged"], self._wake_events())
+        self.assertEqual(
+            "GitHub PR event: repository=acme/repo, number=42, head_sha="
+            + "a" * 40
+            + ", event=merged, merge_sha="
+            + "b" * 40
+            + ". Your completed-Sprint PR was merged; do not manually reset the "
+            "managed worktree. The successful-Sprint cleanup service owns that "
+            "reset; use its status/retry authority through the originating "
+            "Planner or FnB if needed.",
+            self._last_wake()["body"],
+        )
+
+    def test_green_outside_sprint_wakes_only_as_red_recovery(self):
+        self.reader.current = pull_request(checks="PENDING", checks_failed=False)
+        self.watcher.subscribe(owner_shell_id=1, repository="acme/repo", pr_number=42)
+        self.assertEqual([], self._wake_events())
+
+        self.reader.current = pull_request(checks="SUCCESS", checks_failed=False)
+        self.assertTrue(self.watcher.poll_once())
+        self.assertEqual([], self._wake_events())
+
+        self.reader.current = pull_request()
+        self.assertTrue(self.watcher.poll_once())
+        self.assertEqual(["red"], self._wake_events())
+
+        self.reader.current = pull_request(checks="SUCCESS", checks_failed=False)
+        self.assertTrue(self.watcher.poll_once())
+        self.assertEqual(["red", "green"], self._wake_events())
+        self.assertIn(
+            "event=green. Your PR is green outside an active Sprint",
+            self._last_wake()["body"],
+        )
+
+        # Every observation is still durable even when nobody is woken.
+        self.assertEqual(
+            ["pending", "green", "red", "green"],
+            [
+                str(row[0])
+                for row in self.con.execute(
+                    "SELECT normalized_state FROM pr_subscription_transitions "
+                    "ORDER BY transition_id"
+                )
+            ],
+        )
+
+    def test_green_in_armed_sprint_still_wakes_after_pending(self):
+        self.reader.current = pull_request(checks="PENDING", checks_failed=False)
+        self.register()
+        self.assertEqual([], self._wake_events())
+
+        self.reader.current = pull_request(checks="SUCCESS", checks_failed=False)
+        self.assertTrue(self.watcher.poll_once())
+
+        self.assertEqual(["green"], self._wake_events())
+        self.assertIn(
+            "Your active Sprint PR is green; judge readiness",
+            self._last_wake()["body"],
+        )
 
 
 if __name__ == "__main__":

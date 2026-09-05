@@ -114,10 +114,12 @@ are New; Developer/Reviewer→Planner and Reviewer→Developer are Re-enter. FnB
 can close the Planner chat during an armed Sprint to set coordinate mode (idle
 Planner Re-enters become fresh ticket chats); FnB pause/resume returns to
 supervise, while automatic pauses preserve the dial. Developer-owned PR
-subscriptions emit self-describing red/green/closed Re-enter wakes throughout
-ownership, including after a Sprint ends. Wake text distinguishes an
-armed Sprint, a paused Sprint, and no active Sprint; Planner and Reviewer
-receive no PR-event wakes. Arming validates all recorded role
+subscriptions (`sc pr subscribe`, or `sc sprint register-pr` in a lane) emit
+self-describing red/green/closed/merged Re-enter wakes throughout ownership,
+inside or outside a Sprint, including after a Sprint ends; outside an armed or
+paused Sprint, green arrives only as red-to-green recovery. Wake text
+distinguishes an armed Sprint, a paused Sprint, and no active Sprint; Planner
+and Reviewer receive no PR-event wakes. Arming validates all recorded role
 harness/model/effort selections before publishing work;
 defaults satisfy the gate.
 
