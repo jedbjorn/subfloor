@@ -1124,7 +1124,7 @@ class TransitionRoutingTest(SprintPRWatcherCase):
             ).fetchone()[0],
         )
 
-    def test_head_change_invalidates_approval_without_waking_reviewer(self):
+    def test_head_change_keeps_approval_and_merge_ready(self):
         self.reader.current = pull_request(checks="SUCCESS", checks_failed=False)
         self.register()
         green_message_id = self.con.execute(
@@ -1171,23 +1171,30 @@ class TransitionRoutingTest(SprintPRWatcherCase):
         self.assertTrue(self.watcher.poll_once())
 
         self.assertEqual(
-            "fixing",
+            "merge_ready",
             self.con.execute(
                 "SELECT disposition FROM sprint_work_units WHERE work_unit_id=?",
                 (self.unit_id,),
             ).fetchone()[0],
         )
-        self.assertIsNotNone(
+        self.assertIsNone(
             self.con.execute(
                 "SELECT read_at FROM wake_message WHERE message_id=?",
                 (approval_notice.message_id,),
             ).fetchone()[0]
         )
         self.assertEqual(
-            "cancelled",
+            "pending",
             self.con.execute(
                 "SELECT state FROM sprint_wake_outbox WHERE wake_id=?",
                 (approval_notice.wake_id,),
+            ).fetchone()[0],
+        )
+        self.assertEqual(
+            0,
+            self.con.execute(
+                "SELECT COUNT(*) FROM sprint_events "
+                "WHERE event_type='review.approval_invalidated'"
             ).fetchone()[0],
         )
         self.assertEqual(

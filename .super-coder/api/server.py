@@ -3792,6 +3792,7 @@ class Handler(BaseHTTPRequestHandler):
                     "wake_id": receipt.wake_id,
                     "disposition": receipt.disposition,
                     "created": receipt.created,
+                    "sprint_paused": receipt.sprint_paused,
                 })
             if path == "/_sc/sprint/merge-authorize":
                 authorization = sprint_review_loop.SprintReviewLoopStore(

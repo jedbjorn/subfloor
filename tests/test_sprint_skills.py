@@ -55,7 +55,9 @@ CONFORMANCE_OWNER_SKILLS = {
 
 SPEC_SKILL = ENGINE / "assets" / "skills" / "spec" / "SKILL.md"
 CONTEXT_EFFICIENT_SKILLS = ("sprint_dev", "sprint_rev", "sprint_pln", "spec")
-CONTEXT_EFFICIENT_SKILL_BYTE_CEILING = 47_414
+# Raised 47_414 -> 47_612 with 0253: verdicts open a fresh Developer chat, so
+# sprint_dev now tells the Developer to carry rationale in the PR body.
+CONTEXT_EFFICIENT_SKILL_BYTE_CEILING = 47_612
 CONTEXT_EFFICIENT_RESEED = (
     ENGINE / "migrations" / "0202_reseed_context_efficient_skills.sql"
 )
@@ -79,6 +81,9 @@ DISPOSITION_VERBS_RESEED = (
 )
 ROLE_AWARE_BOOT_RESEED = (
     ENGINE / "migrations" / "0243_role_aware_boot_contract.sql"
+)
+REVIEW_FLEXIBILITY_RESEED = (
+    ENGINE / "migrations" / "0253_reseed_sprint_review_flexibility.sql"
 )
 SUBFLOOR_COMMAND_RESEED = (
     ENGINE / "migrations" / "0247_reseed_subfloor_command.sql"
@@ -207,6 +212,7 @@ class SprintSkillTest(unittest.TestCase):
             con.executescript(INFORMATIONAL_RECEIPT_RESEED.read_text())
             con.executescript(BINDING_GUIDANCE_RESEED.read_text())
             con.executescript(DISPOSITION_VERBS_RESEED.read_text())
+            con.executescript(REVIEW_FLEXIBILITY_RESEED.read_text())
 
             for name in sorted(CONFORMANCE_OWNER_SKILLS):
                 with self.subTest(name=name):
@@ -262,6 +268,7 @@ class SprintSkillTest(unittest.TestCase):
             con.executescript(migration)
             con.executescript(migration)
             con.executescript(DISPOSITION_VERBS_RESEED.read_text())
+            con.executescript(REVIEW_FLEXIBILITY_RESEED.read_text())
 
             for name in sorted(HANDOFF_ROLE_SKILLS):
                 with self.subTest(name=name):
@@ -799,6 +806,39 @@ class SprintSkillTest(unittest.TestCase):
         finally:
             con.close()
 
+    def test_review_flexibility_reseed_matches_assets_and_replays_idempotently(self):
+        name = "0253_reseed_sprint_review_flexibility.sql"
+        con = sqlite3.connect(":memory:")
+        try:
+            con.executescript((ENGINE / "schema.sql").read_text())
+            for migration in sorted((ENGINE / "migrations").glob("*.sql")):
+                if migration.name >= name:
+                    break
+                con.executescript(migration.read_text())
+            placeholders = ",".join("?" for _ in POLISHED_SPRINT_SKILLS)
+            con.execute(
+                f"UPDATE skills SET content='verdicts re-enter; approval binds to head',"
+                f"is_deleted=1 WHERE name IN ({placeholders})",
+                tuple(sorted(POLISHED_SPRINT_SKILLS)),
+            )
+
+            migration = (ENGINE / "migrations" / name).read_text()
+            con.executescript(migration)
+            con.executescript(migration)
+
+            for skill in sorted(POLISHED_SPRINT_SKILLS):
+                with self.subTest(name=skill):
+                    parsed = seed_skills.parse_skill(ASSETS / skill / "SKILL.md")
+                    rows = con.execute(
+                        "SELECT content,is_deleted FROM skills WHERE name=?",
+                        (skill,),
+                    ).fetchall()
+                    self.assertEqual([(parsed["content"], 0)], [tuple(r) for r in rows])
+                    self.assertNotIn("approved head", parsed["content"])
+                    self.assertNotIn("Approval is stale evidence", parsed["content"])
+        finally:
+            con.close()
+
     def test_successful_chat_cleanup_reseed_matches_assets_and_is_idempotent(self):
         con = sqlite3.connect(":memory:")
         try:
@@ -901,6 +941,7 @@ class SprintSkillTest(unittest.TestCase):
             con.executescript(ROLE_AWARE_BOOT_RESEED.read_text())
             con.executescript(SUBFLOOR_COMMAND_RESEED.read_text())
             con.executescript(UNIVERSAL_PR_WAKES_RESEED.read_text())
+            con.executescript(REVIEW_FLEXIBILITY_RESEED.read_text())
 
             self.assertIsNotNone(
                 con.execute(
@@ -1570,7 +1611,7 @@ class SprintSkillTest(unittest.TestCase):
         reviewer = " ".join(bodies["sprint_rev"].split())
         self.assertIn("retain that exact message id", reviewer)
         self.assertIn(
-            "accepted request's message id, registered PR, work unit, and exact head",
+            "accepted request's message id, registered PR, and work unit",
             reviewer,
         )
         self.assertIn("exact notification message id", reviewer)
