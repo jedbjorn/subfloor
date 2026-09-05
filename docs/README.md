@@ -888,7 +888,7 @@ the FnB-facing review of a shell's UI changes, use
 ## Opt-in features
 
 > [!class2]
-> **UI** Scripts (VM wizard) · **Shells** see fork-local guidance when configured
+> **UI** Scripts (VM wizard · Web Search key) · **Shells** see fork-local guidance when configured
 
 Beyond the core loop, the engine ships **optional infrastructure**: a sidecar
 or host broker controlled by a config block in the gitignored
@@ -1238,6 +1238,39 @@ plus the host steps it prints are the whole setup. Full design:
 > verb (a systemd `--user` unit). `./sc persist` installs and enables every
 > broker linked to this fork, enables linger so they survive logout and reboot,
 > and skips the rest with a reason. Idempotent — re-run any time.
+
+### Web search (Tavily)
+
+> [!class2]
+> **UI** Scripts → **Web Search** (set · test · rotate · clear the key) · **Shells** every flavor that inherits common skills (`web_search`)
+
+Every shell gets one web search verb, on every harness:
+
+```bash
+./sc search "<query>"                    # 5 results + a short synthesized answer
+./sc search "<query>" --max 10 --depth advanced
+./sc search "<query>" --json             # answer, results[] (title, url, snippet, score)
+```
+
+The shell never holds the key. `./sc search` posts the query to the engine API
+with the shell's own bearer token; the **API process** calls Tavily with the
+instance's key and returns the results — so a sandboxed shell needs no egress
+and no credential beyond the one it already has. Nothing is persisted: no query
+log, no result cache.
+
+The key is held **host-side only**, in a mode-0600 `web_search.json` inside the
+private instance-state directory (legacy floors: `.sc-state/local/`). It is
+never written to `instance.json` (which is sandbox-readable), the engine DB,
+the snapshot, or any render, and no API response ever carries more than its
+last four characters. Set, test, rotate, and clear it from the Scripts tab:
+**Web Search → configure…**. *test* probes Tavily with the key in the field (or
+the stored one when the field is empty) before you save; *rotate* replaces the
+stored key at once, and the next `./sc search` uses it — revoking the old key
+at Tavily is yours to do. Shell credentials are refused on every config route.
+
+An unconfigured instance is not an error state: `./sc search` tells the shell
+exactly where the FnB sets the key, and the `web_search` skill tells the shell
+to say so rather than improvise a key of its own.
 
 ## Review GUI
 

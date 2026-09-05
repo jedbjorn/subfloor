@@ -1881,6 +1881,24 @@ async function renderScripts(root) {
   vmc.append(vmbtn);
   root.append(vmc);
 
+  // Web Search — opt-in. One Tavily API key, held host-side in a 0600 file
+  // under the private instance root (never instance.json, the DB, or a
+  // render). Shells search through `./sc search` → the engine API, so the key
+  // never reaches a shell. Write-only here: status shows a last-four hint.
+  const wsc = el("div", { className: "card" });
+  wsc.append(el("h2", {}, "Web Search",
+    el("span", { className: "pill", textContent: " opt-in" })));
+  const wsStatus = el("div", { className: "muted" }, "loading…");
+  wsc.append(el("div", { className: "muted" },
+    "Give every shell `./sc search` (Tavily). The API key is stored on the host only and is never shown again once saved — " +
+    "set it, test it, rotate it, or clear it here."));
+  wsc.append(wsStatus);
+  const wsbtn = el("button", { className: "act primary", textContent: "configure…" });
+  wsbtn.onclick = () => openWebSearchModal(() => refreshWebSearchStatus(wsStatus));
+  wsc.append(wsbtn);
+  root.append(wsc);
+  refreshWebSearchStatus(wsStatus);
+
   for (const s of scripts) {
     const c = el("div", { className: "card" });
     const h = el("h2", {}, s.name);
@@ -2001,6 +2019,83 @@ async function openWinVmModal() {
     } catch (e) { toast("error: " + e.message); save.disabled = false; }
   };
   cancel.onclick = close;
+}
+
+function webSearchStatusText(st) {
+  if (!st?.configured) return "not configured — shells get a clear 'ask the FnB' error from ./sc search";
+  return `configured (${st.provider}, key ${st.key_hint || "…"}, set ${st.updated_at || "?"})`;
+}
+
+async function refreshWebSearchStatus(node) {
+  try { node.textContent = webSearchStatusText(await api("/web-search")); }
+  catch (e) { node.textContent = "status unavailable: " + e.message; }
+}
+
+// Web Search modal — set / test / rotate / clear the Tavily key. The key field
+// is write-only: the server never echoes a stored key, only its last four
+// characters. "test" probes Tavily with the in-progress key (or the stored one
+// when the field is empty) via POST /api/web-search/validate before any save.
+async function openWebSearchModal(onChange) {
+  let st = null;
+  try { st = await api("/web-search"); } catch { /* status line says so */ }
+
+  const status = el("div", { className: "muted" }, webSearchStatusText(st));
+  const input = el("input", {
+    type: "password", placeholder: "tvly-…", autocomplete: "off",
+    title: "new Tavily API key — saving replaces the current key",
+  });
+  const form = el("div", { className: "modal-form" },
+    el("span", { className: "k" }, "api_key"), input);
+  const result = el("pre", { className: "doc-body", hidden: true });
+  const note = el("div", { className: "muted" },
+    "Saving rotates: the previous key is replaced at once and the next `./sc search` uses the new one. " +
+    "Revoke the old key at Tavily yourself. Keys are stored in a mode-0600 file under the private instance state, never in the repo.");
+
+  const test = el("button", { className: "act", textContent: "test" });
+  test.onclick = async () => {
+    test.disabled = true; result.hidden = false; result.textContent = "probing Tavily…";
+    try {
+      const body = input.value.trim() ? { api_key: input.value.trim() } : {};
+      const r = await api("/web-search/validate", "POST", body);
+      result.textContent = (r.ok ? "✓ " : "✗ ") + (r.output || "(no output)");
+    } catch (e) { result.textContent = "error: " + e.message; }
+    finally { test.disabled = false; }
+  };
+
+  const clear = el("button", { className: "act", textContent: "clear key" });
+  clear.hidden = !st?.configured;
+  clear.onclick = async () => {
+    if (!confirm("Remove the stored Tavily key? Shells lose ./sc search until a new key is saved.")) return;
+    clear.disabled = true; setStatus("clearing web search key…");
+    try {
+      st = await api("/web-search", "DELETE");
+      status.textContent = webSearchStatusText(st);
+      clear.hidden = true; setStatus("web search key cleared");
+      onChange?.();
+    } catch (e) { toast("error: " + e.message); clear.disabled = false; }
+  };
+
+  const save = el("button", { className: "act primary", textContent: st?.configured ? "rotate" : "save" });
+  const cancel = el("button", { className: "act", textContent: "close" });
+  const close = openActionModal({
+    title: "Web Search (Tavily)", width: 620, height: 460,
+    bodyNode: el("div", {}, status, form,
+      el("div", { className: "modal-form-foot" }, test, clear), note, result),
+    dismissNode: cancel, actionNode: save,
+  });
+  save.onclick = async () => {
+    const key = input.value.trim();
+    if (!key) { toast("enter a key first"); return; }
+    save.disabled = true; setStatus("saving web search key…");
+    try {
+      await api("/web-search", "PUT", { api_key: key });
+      setStatus("web search key saved");
+      onChange?.();
+      close();
+    } catch (e) { toast("error: " + e.message); save.disabled = false; }
+  };
+  cancel.onclick = close;
+  input.focus();
 }
 
 // ── Map (dr_* repo catalogue) ───────────────────────────────────────────────────
