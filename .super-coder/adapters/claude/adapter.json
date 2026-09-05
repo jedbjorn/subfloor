@@ -102,14 +102,9 @@
       }
     }
   },
+  "launch_flags": ["--dangerously-skip-permissions"],
+  "headless_flags": ["--dangerously-skip-permissions"],
   "sandbox": {
-    "env": { "IS_SANDBOX": "1" },
-    "merge_json": {
-      ".claude/settings.local.json": {
-        "permissions": { "defaultMode": "bypassPermissions" },
-        "skipDangerousModePermissionPrompt": true
-      }
-    },
-    "headless_flags": ["--dangerously-skip-permissions"]
+    "env": { "IS_SANDBOX": "1" }
   }
 }
