@@ -118,9 +118,32 @@ rows; root files remain queryable through `instr(path, '/') = 0`.
 
 ### Descriptions
 
-Set `dr_filepath.desc` to an adequate one-line description (<=100 chars): say
-what the file does/holds, not its kind or filename. Descriptions survive remap
-in the live DB but are not snapshot durability; refill after a fresh rebuild.
+`dr_filepath.desc` is abbreviated behavioral documentation: one line, soft
+200-character bound, that tells a shell why it would open the file — the
+responsibility the file owns, the mechanism it uses, its principal input, and
+its observable output, state change, or exposed surface. Omit a component that
+genuinely does not apply; never invent behavior to fill the template, and never
+merely repeat the filename, role, language, directory, or a symbol list.
+
+| File role | Emphasis |
+|---|---|
+| Code | owned behavior, mechanism, principal input, output or side effect |
+| Test | the contract, boundary, or failure mode it proves |
+| Configuration | controlled behavior, consumed keys, runtime consumer |
+| Migration | the durable state transition and affected surface |
+| Documentation | intended audience and the system or workflow explained |
+| Entrypoint | accepted invocation and where control is dispatched |
+
+Examples: `Boot renderer — composes each shell's boot document from DB
+identity, memory, map header, and dev-kit inventory into CLAUDE.md/AGENTS.md`;
+`Proves the branch guard refuses commits on the default branch and admits
+shell/* bases`.
+
+Apply the standard incrementally: a new or changed file, a NULL description, a
+shape notice naming the region, or a working shell reporting an inadequate
+description. Existing adequate descriptions need no bulk rewrite. Descriptions
+survive remap in the live DB but are not snapshot durability; refill after a
+fresh rebuild.
 
 ```sql
 WITH f AS (
@@ -142,7 +165,7 @@ ORDER BY (desc IS NULL) DESC, role, path;
 ```
 
 Update only rows verified against the file. Pass = the worklist is empty +
-spot checks per section describe behavior that the path alone cannot reveal.
+spot checks per section state behavior the path alone cannot reveal.
 
 ### Product DB
 

@@ -101,6 +101,7 @@ import vm as vm_mod  # noqa: E402  (Windows Test VM — config + live checks)
 import ts as ts_mod  # noqa: E402  (tailnet — config + live checks)
 import pm2 as pm2_mod  # noqa: E402  (host pm2 stack — config + live checks)
 import web_search as web_search_mod  # noqa: E402  (Tavily — key store + client, doc #215)
+import task_context  # noqa: E402  (six-part task/work-unit projection, doc #187)
 sys.path.insert(0, str(ENGINE / "render"))
 import flat as flat_render  # noqa: E402  (document render-path ownership)
 
@@ -3944,6 +3945,45 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(exc.status, {"error": exc.message, "code": exc.code})
         return self._send(200, out)
 
+    def _context_get(self):
+        """GET /_sc/context?task=<id>|work_unit=<id>[&worktree=&seat=&branch=]
+        (doc #187): one read-only six-part projection of a task or Sprint work
+        unit from existing relations. `--task` is the shared planning-read
+        posture; `--work-unit` is the assigned Developer or an Admin (FnB
+        recovery) shell. The optional runtime facts are what the launcher
+        exported into the calling shell; the server never discovers them.
+        No write, no event, no telemetry."""
+        sid = self._require_shell_auth()
+        if sid is None:
+            return
+        q = parse_qs(urlparse(self.path).query)
+        selectors = {}
+        for key in ("task", "work_unit"):
+            values = q.get(key, [])
+            if len(values) > 1 or (values and not values[0].isdigit()):
+                return self._send(400, {"error": f"{key} must be one positive integer",
+                                        "code": "bad_request"})
+            if values:
+                selectors[key] = int(values[0])
+        runtime = {k: q[k][0] for k in ("worktree", "seat", "branch") if q.get(k)}
+        con = db()
+        map_con = map_db.open_ro()
+        try:
+            out = task_context.project(
+                con, task_id=selectors.get("task"),
+                work_unit_id=selectors.get("work_unit"),
+                caller_shell_id=sid, map_con=map_con, repo_root=REPO_ROOT,
+                runtime=runtime)
+        except task_context.ContextError as exc:
+            return self._send(exc.status, {"error": exc.message, "code": exc.code})
+        except Exception as e:
+            return self._fail(e)
+        finally:
+            con.close()
+            if map_con is not None:
+                map_con.close()
+        return self._send(200, out)
+
     # -- /mem/* token-scoped shell memory endpoints --
 
     def _mem_get(self, path: str):
@@ -4972,6 +5012,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, text, ctype, headers=headers)
         if path in ("/_sc/model-routes", "/_sc/skills"):
             return self._shell_catalog_get(path)
+        if path == "/_sc/context":
+            return self._context_get()
         if path.startswith("/_sc/mem/"):
             return self._mem_get(path)
         if path.startswith("/_sc/sprint/"):

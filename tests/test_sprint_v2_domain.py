@@ -1061,13 +1061,15 @@ class LiveReplanningTest(SprintDomainCase):
         self.assertEqual(
             [
                 (
-                    "Foundation\n\nShip the durable foundation",
+                    "Foundation\n\nShip the durable foundation"
+                    f"\n\nsc context --work-unit {work_unit_id}",
                     sparse_key,
                     "accepted",
                 ),
                 (
                     "Corrective assignment\n\n"
-                    "Dispatch from a fresh durable generation",
+                    "Dispatch from a fresh durable generation"
+                    f"\n\nsc context --work-unit {work_unit_id}",
                     f"sprint:{sprint_id}:work-unit:{work_unit_id}:assignment:3",
                     "pending",
                 ),
@@ -1868,7 +1870,9 @@ class LifecycleTest(SprintDomainCase):
         self.assertEqual(1, message["actionable"])
         self.assertEqual("pending", message["disposition"])
         self.assertEqual(
-            "Foundation\n\nShip the durable foundation", message["body"]
+            "Foundation\n\nShip the durable foundation"
+            f"\n\nsc context --work-unit {first_unit}",
+            message["body"],
         )
         self.assertEqual(
             [(wake_ids[0], message["work_unit_id"])],

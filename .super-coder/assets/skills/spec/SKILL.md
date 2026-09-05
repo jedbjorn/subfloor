@@ -13,8 +13,16 @@ shell id.
 
 ## 1. Select the spec
 
-Never auto-pick the latest document. Read the complete selected body + task
-ledger:
+Never auto-pick the latest document. A named task -> load its projection
+first as the default planning context:
+
+```text
+sc context --task <task_id>
+```
+
+It carries task, feature, governing document id + hash, active linked
+decisions, feature-level flags, boundaries, and resources. Load the full body
+or broader indexes only for an unresolved need:
 
 ```text
 sc mem get documents --feature <id>
@@ -78,7 +86,7 @@ No task plan = no implementation.
 ## 4. Execute one task at a time
 
 ```text
-sc mem get tasks --doc <doc_id>
+sc context --task <task_id>
 sc mem task start <task_id>
 # work and verify only this task
 sc mem task done <task_id>
@@ -91,7 +99,7 @@ never marked done or left pending under a shipped feature:
 
 ```text
 sc mem task cancel <task_id> --notes "moved to F<id> as task #<n>"
-sc mem state "[<feature>] — last: <last_done>. next: <next_up>."
+sc mem state "[<feature>] — last: #<task_id> <last_done>. next: #<task_id> <next_up>."
 ```
 
 Intact spec move: `sc mem doc move <document_id> --feature <target_feature_id>`

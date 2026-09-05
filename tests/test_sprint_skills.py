@@ -55,9 +55,10 @@ CONFORMANCE_OWNER_SKILLS = {
 
 SPEC_SKILL = ENGINE / "assets" / "skills" / "spec" / "SKILL.md"
 CONTEXT_EFFICIENT_SKILLS = ("sprint_dev", "sprint_rev", "sprint_pln", "spec")
-# Raised 47_414 -> 47_612 with 0253: verdicts open a fresh Developer chat, so
-# sprint_dev now tells the Developer to carry rationale in the PR body.
-CONTEXT_EFFICIENT_SKILL_BYTE_CEILING = 47_612
+# Raised 47_414 -> 47_612 with 0253 (verdicts open a fresh Developer chat; the
+# Developer carries rationale in the PR body) -> 48_155 with 0254 (spec #187's
+# load-first `sc context` directive in sprint_dev + spec).
+CONTEXT_EFFICIENT_SKILL_BYTE_CEILING = 48_155
 CONTEXT_EFFICIENT_RESEED = (
     ENGINE / "migrations" / "0202_reseed_context_efficient_skills.sql"
 )
@@ -825,6 +826,13 @@ class SprintSkillTest(unittest.TestCase):
             migration = (ENGINE / "migrations" / name).read_text()
             con.executescript(migration)
             con.executescript(migration)
+            # 0254 (spec #187) re-owns sprint_dev after this reseed; the asset
+            # comparison holds once the later owner has replayed as well.
+            later = (
+                ENGINE / "migrations" / "0254_reseed_task_context_projection.sql"
+            ).read_text()
+            con.executescript(later)
+            con.executescript(later)
 
             for skill in sorted(POLISHED_SPRINT_SKILLS):
                 with self.subTest(name=skill):

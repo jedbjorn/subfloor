@@ -2492,7 +2492,7 @@ class ProductionPulseTest(SprintWorkDispatchCase):
             "that command. Do not re-check the inbox otherwise — new messages arrive "
             "as their own wakes.\n\n"
             f"## wake_message #{wake_message_id} (declared Force-New)\n\n"
-            "Unit 1\n\nOutput 1"
+            "Unit 1\n\nOutput 1\n\nsc context --work-unit 1"
         )
         self.assertEqual(expected_prompt, native["body"])
         self.assertEqual(wake_key, native["idempotency_key"])

@@ -18,7 +18,7 @@ Load `sprint_dev` on every entry, then classify it:
 
 | Trigger | First read / action |
 |---|---|
-| Assignment, verdict, question, blocker, relay | Inspect `sc sprint inbox --sprint <id>` once; accept or handle the relevant message. |
+| Assignment, verdict, question, blocker, relay | Inspect `sc sprint inbox --sprint <id>` once; accept or handle the relevant message. Accepted assignment -> `sc context --work-unit <id>` next. |
 | Self-describing engine-wide PR fact | Inspect the fact + registered PR directly. Do not manufacture a Sprint inbox item; check the inbox once immediately before the next typed handoff. |
 | Live FnB instruction | Preserve its authority; read only durable state needed for safe action. |
 
@@ -44,9 +44,11 @@ bundling, rotation, and recovery. Stop after a successful typed handoff.
 
 ## Bound the lane
 
-Read assignment, output, bound revision, dependencies, roles, worktree, grant,
-and judgments. Own one active unit; never start another lane or edit another
-shell's worktree. Resolve ambiguity to shippable in-scope work + rationale. Ask
+`sc context --work-unit <id>` is the default planning context: assignment,
+expected output, linked tasks, bound revision id, active decisions,
+dependencies, unit blockers, roles, worktree, lifecycle walls, resources. Read
+the full bound revision or broader indexes only for an unresolved need. Own
+one active unit; never start another lane or edit another shell's worktree. Resolve ambiguity to shippable in-scope work + rationale. Ask
 Planner before changing boundary, interface, deliverable, priority, or scope.
 
 Put one question, blocker, decision, answer, or useful context item in a short
