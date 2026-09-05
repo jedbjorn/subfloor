@@ -143,7 +143,7 @@ console.log(JSON.stringify({
 
 def test_all_modal_callers_use_semantic_action_or_named_viewer_slots():
     assert "footNodes" not in APP
-    assert APP.count("const close = openActionModal({") == 6
+    assert APP.count("const close = openActionModal({") == 7
     assert APP.count("footerStart:") == 5  # helper + four viewer callers
     assert APP.count("footerEnd:") == 5
     assert "if (overlay?.closeModal) overlay.closeModal();" in APP
