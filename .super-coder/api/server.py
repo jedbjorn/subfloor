@@ -70,6 +70,7 @@ import harness_surfaces  # noqa: E402  (authoritative per-harness surfaces)
 import instance_state  # noqa: E402
 import mem_credentials  # noqa: E402  (runtime Admin credential provisioning, spec #30 req 11)
 import runtime_flags  # noqa: E402  (system-managed non-blocking runtime advisories)
+import sandbox_resources  # noqa: E402  (Docker cgroup OOM diagnostics)
 import sprint_close  # noqa: E402  (Sprints v2 conformance + report evidence)
 import sprint_cleanup  # noqa: E402  (successful-close worktree cleanup recovery)
 import sprint_domain  # noqa: E402  (Sprints v2 work dispatch authority)
@@ -5916,6 +5917,9 @@ def _run_server(port: int) -> int:
             )
             sprint_pr_watcher.start_service(DB_PATH, repo_root=REPO_ROOT)
 
+        oom_watcher = sandbox_resources.OomKillWatcher()
+        if in_container():
+            oom_watcher.start()
         try:
             await transport.serve(
                 bind,
@@ -5926,6 +5930,7 @@ def _run_server(port: int) -> int:
                 stream_handler=conversation_routes.stream_events,
             )
         finally:
+            oom_watcher.stop()
             conversation_reaper.stop_service()
 
     print(
