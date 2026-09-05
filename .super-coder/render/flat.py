@@ -82,7 +82,7 @@ def _document_target(root: Path, rel: str, kind: str) -> Path:
     """Confine DB-authored render paths to their managed visibility folder."""
     path = Path(rel)
     expected = "specs_sc" if kind == "spec" else "docs_sc"
-    if path.is_absolute() or ".." in path.parts or not path.parts or path.parts[0] != expected:
+    if path.is_absolute() or ".." in path.parts or len(path.parts) < 2 or path.parts[0] != expected:
         raise ValueError(
             f"invalid {kind} render_path {rel!r}; expected a relative path under {expected}/"
         )

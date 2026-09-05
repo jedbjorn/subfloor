@@ -312,7 +312,7 @@ class ReservedAssetTest(unittest.TestCase):
         seed_skills._fork_mode = lambda: False
         try:
             with self.assertRaisesRegex(ValueError, "retired_name"):
-                seed_skills.main()
+                seed_skills.main([])
         finally:
             seed_skills.SKILLS_DIR = saved_skills_dir
             seed_skills._fork_mode = saved_fork_mode
