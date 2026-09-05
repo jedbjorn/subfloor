@@ -1061,7 +1061,7 @@ esac
 # migrate) probes first because it executes host Python. Container entry
 # deliberately remains a Docker handoff rather than a host-runtime gate.
 case "$cmd" in
-  install|ensure-harness|doctor|update|update-harnesses|harness-status|docker-cache-gc|rollback|feature|runtime|artifact-mode|eject|remove|init|rebuild|migrate|migration|snapshot|mem|pr|token|persist|job|visual-qa|sql|sql-rw|map-sql|map-sql-rw|map-schema|map-extractor|render|render-check|map|map-setup|analytics|models|seed-skills|skill|search|ports|url|preview|serve|vm|vm-broker|vm-bake|vm-broker-up|vm-broker-down|vm-broker-sock|vm-mcp-relay|vm-broker-install|vm-broker-uninstall|ts-broker|ts-broker-up|ts-broker-down|ts-broker-sock|ts-broker-install|ts-broker-uninstall|pm2-broker|pm2-broker-up|pm2-broker-down|pm2-broker-sock|pm2-broker-install|pm2-broker-uninstall|db-broker|db-broker-up|db-broker-down|db-broker-sock|db-broker-install|db-broker-uninstall|db-init|pg-init|pg-up|pg-down|admin|boot|boot-*|run|deps|test|lint|typecheck|launch|down|restart|build|verify|health|clean-db)
+  install|ensure-harness|doctor|update|update-harnesses|harness-status|docker-cache-gc|rollback|feature|runtime|artifact-mode|eject|remove|init|rebuild|migrate|migration|snapshot|mem|pr|token|persist|job|visual-qa|sql|sql-rw|map-sql|map-sql-rw|map-schema|map-extractor|context|render|render-check|map|map-setup|analytics|models|seed-skills|skill|search|ports|url|preview|serve|vm|vm-broker|vm-bake|vm-broker-up|vm-broker-down|vm-broker-sock|vm-mcp-relay|vm-broker-install|vm-broker-uninstall|ts-broker|ts-broker-up|ts-broker-down|ts-broker-sock|ts-broker-install|ts-broker-uninstall|pm2-broker|pm2-broker-up|pm2-broker-down|pm2-broker-sock|pm2-broker-install|pm2-broker-uninstall|db-broker|db-broker-up|db-broker-down|db-broker-sock|db-broker-install|db-broker-uninstall|db-init|pg-init|pg-up|pg-down|admin|boot|boot-*|run|deps|test|lint|typecheck|launch|down|restart|build|verify|health|clean-db)
     case "$cmd" in
       deps|test|lint|typecheck)
         sc_devkit_help_form "$@" || sc_python_probe ;;
@@ -1215,6 +1215,10 @@ case "$cmd" in
   # Web search through the engine API (doc #215): the Tavily key stays on
   # the host; the shell only carries its own bearer token.
   search)       exec "$PY" "$S/web_search.py" "$@" ;;
+  # Task context projection (doc #187): one read-only view of a task or
+  # Sprint work unit — Assignment, Goal, Authority, Blockers, Boundaries,
+  # Resources — through the same API lane as `sc mem`.
+  context)      exec "$PY" "$S/task_context.py" "$@" ;;
   ports)        exec "$PY" "$S/ports.py" show ;;
   url)          sc_urls ;;
   preview)      exec "$PY" "$S/preview.py" "$@" ;;
@@ -1688,7 +1692,7 @@ Subfloor — forkable shell substrate for one repository
 
   Install & upkeep      install · doctor · ensure-harness · update-harnesses · harness-status
                         rollback · runtime · feature · persist · alias · make-cleanup · remove · eject
-  Memory & catalogue    mem · map · map-sql · map-schema · sql · skill · search · models · job · pr · sprint · token
+  Memory & catalogue    mem · map · map-sql · map-schema · sql · skill · search · context · models · job · pr · sprint · token
   Engine (Admin)        rebuild · migrate · migration · snapshot · render · render-check · verify
                         seed-skills · engine-ref · clean-db
   Host brokers          vm · vm-broker-* · ts-broker-* · pm2-broker-* · db-broker-* · db-init · pg-*
@@ -1776,6 +1780,8 @@ Subfloor — forkable shell substrate — full command reference (./sc help for 
   ./sc seed-skills         upsert assets/skills/ into the live DB (+ regenerate the seed migration — source repo only)
   ./sc search "<query>" [--max N] [--depth basic|advanced] [--json]
                            web search via the engine API (Tavily; key set in GUI → Scripts → Web Search)
+  ./sc context --task <id> | --work-unit <id> [--json]
+                           one focused read of a task or Sprint work unit: Assignment · Goal · Authority · Blockers · Boundaries · Resources
   ./sc init                seed a fresh fork's first user + shell (run once after install)
 
   Sandbox (docker — the default way to run; allow-everything is safe because the

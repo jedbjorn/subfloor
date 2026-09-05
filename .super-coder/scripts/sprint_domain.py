@@ -376,6 +376,16 @@ def _participant_binding_candidate(
     )
 
 
+def assignment_body(unit) -> str:
+    """The Developer's assignment text: title, expected output, and the literal
+    context command (doc #187). The projection itself is never duplicated here —
+    `sc context --work-unit` computes it on demand from the same rows."""
+    return (
+        f"{unit['title']}\n\n{unit['expected_output']}\n\n"
+        f"sc context --work-unit {int(unit['work_unit_id'])}"
+    )
+
+
 def transition_allowed(current: str, target: str) -> bool:
     return (
         current in SPRINT_TRANSITIONS
@@ -4184,7 +4194,7 @@ class SprintParticipantStore:
                     to_participant_id=participant_id,
                     work_unit_id=unit_id,
                     message_kind="work_assignment",
-                    body=f"{row['title']}\n\n{row['expected_output']}",
+                    body=assignment_body(row),
                     actionable=True,
                     declared_type="force-new",
                     idempotency_key=_next_assignment_key(
@@ -5269,7 +5279,7 @@ class SprintWorkUnitStore:
             to_participant_id=int(unit["participant_id"]),
             work_unit_id=unit_id,
             message_kind="work_assignment",
-            body=f"{unit['title']}\n\n{unit['expected_output']}",
+            body=assignment_body(unit),
             actionable=True,
             declared_type="force-new",
             idempotency_key=key,
