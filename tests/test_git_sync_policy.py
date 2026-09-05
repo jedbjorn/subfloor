@@ -12,7 +12,7 @@ ROOT = Path(__file__).resolve().parents[1]
 ENGINE = ROOT / ".super-coder"
 BOOT = ENGINE / "templates" / "boot.md"
 ASSET = ENGINE / "assets" / "skills" / "git" / "SKILL.md"
-RESEED = ENGINE / "migrations" / "0247_reseed_subfloor_command.sql"
+RESEED = ENGINE / "migrations" / "0252_reseed_universal_pr_owner_wakes.sql"
 
 sys.path.insert(0, str(ENGINE / "scripts"))
 import seed_skills  # noqa: E402

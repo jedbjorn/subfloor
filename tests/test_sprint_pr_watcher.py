@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 import sys
 import unittest
@@ -30,10 +31,11 @@ def pull_request(
     checks_failed: bool = True,
     head_sha: str = "a" * 40,
     base_sha: str | None = "c" * 40,
+    head_ref: str | None = None,
 ) -> PullRequest:
     return PullRequest(
         number=number,
-        head_ref=f"feature/pr-{number}",
+        head_ref=head_ref or f"feature/pr-{number}",
         base_ref="main",
         head_sha=head_sha,
         state=state,
@@ -1809,12 +1811,18 @@ class EngineWideSubscriptionTest(SprintPRWatcherCase):
 
         self.assertTrue(self.watcher.poll_once())
         self.assertEqual(calls + 2, len(self.reader.get_calls))
+        # Reopened green outside a Sprint is durable but not actionable: only
+        # the closed fact woke the owner.
         self.assertEqual(
-            2,
-            self.con.execute(
-                "SELECT COUNT(*) FROM wake_message "
-                "WHERE idempotency_key LIKE 'pr-transition:%'"
-            ).fetchone()[0],
+            ["closed"],
+            [
+                re.search(r"event=([a-z_]+)", str(row[0])).group(1)
+                for row in self.con.execute(
+                    "SELECT body FROM wake_message "
+                    "WHERE idempotency_key LIKE 'pr-transition:%' "
+                    "ORDER BY message_id"
+                )
+            ],
         )
 
     def test_merged_subscription_is_quiescent_on_pulse(self):
@@ -2085,6 +2093,382 @@ class BatchAndNormalizationTest(SprintPRWatcherCase):
         )
         self.assertEqual(5.0, service.pulse_seconds)
         self.assertEqual(60.0, service.history_seconds)
+
+
+class OwnerMergedAndGreenWakeTest(SprintPRWatcherCase):
+    """Spec #188: merged owner facts everywhere; non-Sprint green only after red."""
+
+    def _wake_events(self) -> list[str]:
+        events = []
+        for row in self.con.execute(
+            "SELECT body FROM wake_message "
+            "WHERE idempotency_key LIKE 'pr-transition:%' ORDER BY message_id"
+        ):
+            events.append(re.search(r"event=([a-z_]+)", str(row[0])).group(1))
+        return events
+
+    def _last_wake(self) -> sqlite3.Row:
+        return self.con.execute(
+            "SELECT receiver_shell_id,declared_type,idempotency_key,body "
+            "FROM wake_message WHERE idempotency_key LIKE 'pr-transition:%' "
+            "ORDER BY message_id DESC LIMIT 1"
+        ).fetchone()
+
+    def test_merged_outside_sprint_wakes_owner_with_merge_evidence(self):
+        receipt = self.watcher.subscribe(
+            owner_shell_id=1, repository="acme/repo", pr_number=42
+        )
+        self.assertEqual(["red"], self._wake_events())
+        self.reader.current = pull_request(
+            state="MERGED", checks="SUCCESS", checks_failed=False
+        )
+
+        self.assertTrue(self.watcher.poll_once())
+
+        self.assertEqual(["red", "merged"], self._wake_events())
+        wake = self._last_wake()
+        self.assertEqual((1, "re-enter"), tuple(wake)[:2])
+        transition_key = self.con.execute(
+            "SELECT transition_key FROM pr_subscription_transitions "
+            "WHERE normalized_state='merged'"
+        ).fetchone()[0]
+        self.assertEqual(
+            f"pr-transition:{transition_key}:shell:1", wake["idempotency_key"]
+        )
+        self.assertEqual(
+            "GitHub PR event: repository=acme/repo, number=42, head_sha="
+            + "a" * 40
+            + ", event=merged, merge_sha="
+            + "b" * 40
+            + ". Your PR was merged outside an active Sprint; verify the remote "
+            "merged fact, follow the git skill's after-merge cleanup on the exact "
+            "Active Session base, delete only the proven-merged local feature "
+            "branch, and update current state.",
+            wake["body"],
+        )
+        self.assertEqual(
+            0,
+            self.con.execute("SELECT COUNT(*) FROM sprint_pr_transitions").fetchone()[0],
+        )
+
+        # Terminal: the pulse no longer reads GitHub, and a registration replay
+        # re-observes the same merged state without a second fact.
+        calls = len(self.reader.get_calls)
+        self.assertFalse(self.watcher.poll_once())
+        self.assertEqual(calls, len(self.reader.get_calls))
+        replay = self.watcher.subscribe(
+            owner_shell_id=1, repository="acme/repo", pr_number=42
+        )
+        self.assertFalse(replay.created)
+        self.assertEqual(receipt.subscription_id, replay.subscription_id)
+        self.assertEqual(calls + 1, len(self.reader.get_calls))
+        self.assertEqual(["red", "merged"], self._wake_events())
+        self.assertEqual(
+            2,
+            self.con.execute(
+                "SELECT COUNT(*) FROM pr_subscription_transitions"
+            ).fetchone()[0],
+        )
+
+    def test_merged_in_armed_sprint_wakes_owner_with_handoff_instruction(self):
+        self.register()
+        self.con.execute(
+            "UPDATE sprint_work_units SET disposition='merge_ready' "
+            "WHERE work_unit_id=?",
+            (self.unit_id,),
+        )
+        self.con.commit()
+        self.reader.current = pull_request(
+            state="MERGED", checks="SUCCESS", checks_failed=False
+        )
+
+        self.assertTrue(self.watcher.poll_once())
+
+        self.assertEqual(["red", "merged"], self._wake_events())
+        wake = self._last_wake()
+        self.assertEqual(1, wake["receiver_shell_id"])
+        self.assertEqual(
+            "GitHub PR event: repository=acme/repo, number=42, head_sha="
+            + "a" * 40
+            + ", event=merged, merge_sha="
+            + "b" * 40
+            + ". Your active Sprint PR was merged; inspect the registered PR and "
+            "follow the sprint_dev post-merge cleanup/handoff. Do not wait for "
+            "another PR fact or ask the Planner to relay it.",
+            wake["body"],
+        )
+        # The existing Sprint merge projection is untouched by the owner fact.
+        self.assertEqual(
+            "completed",
+            self.con.execute(
+                "SELECT disposition FROM sprint_work_units WHERE work_unit_id=?",
+                (self.unit_id,),
+            ).fetchone()[0],
+        )
+        self.assertEqual(["red", "merged"], self._states())
+
+    def test_merged_in_completed_sprint_points_to_cleanup_service(self):
+        self.register()
+        self.con.execute(
+            "UPDATE sprint_work_units SET disposition='completed',"
+            "completed_at=datetime('now') WHERE sprint_id=?",
+            (self.sprint_id,),
+        )
+        self.con.commit()
+        sprint_domain.SprintLifecycleStore(self.con).transition(
+            self.sprint_id,
+            "completed",
+            sprint_domain.LifecycleActor("planner", 3),
+            terminal_outcome="delivered",
+        )
+        self.reader.current = pull_request(
+            state="MERGED", checks="SUCCESS", checks_failed=False
+        )
+
+        self.assertTrue(self.watcher.poll_once())
+
+        self.assertEqual(["red", "merged"], self._wake_events())
+        self.assertEqual(
+            "GitHub PR event: repository=acme/repo, number=42, head_sha="
+            + "a" * 40
+            + ", event=merged, merge_sha="
+            + "b" * 40
+            + ". Your completed-Sprint PR was merged; do not manually reset the "
+            "managed worktree. The successful-Sprint cleanup service owns that "
+            "reset; use its status/retry authority through the originating "
+            "Planner or FnB if needed.",
+            self._last_wake()["body"],
+        )
+
+    def test_green_outside_sprint_wakes_only_as_red_recovery(self):
+        self.reader.current = pull_request(checks="PENDING", checks_failed=False)
+        self.watcher.subscribe(owner_shell_id=1, repository="acme/repo", pr_number=42)
+        self.assertEqual([], self._wake_events())
+
+        self.reader.current = pull_request(checks="SUCCESS", checks_failed=False)
+        self.assertTrue(self.watcher.poll_once())
+        self.assertEqual([], self._wake_events())
+
+        self.reader.current = pull_request()
+        self.assertTrue(self.watcher.poll_once())
+        self.assertEqual(["red"], self._wake_events())
+
+        self.reader.current = pull_request(checks="SUCCESS", checks_failed=False)
+        self.assertTrue(self.watcher.poll_once())
+        self.assertEqual(["red", "green"], self._wake_events())
+        self.assertIn(
+            "event=green. Your PR is green outside an active Sprint",
+            self._last_wake()["body"],
+        )
+
+        # Every observation is still durable even when nobody is woken.
+        self.assertEqual(
+            ["pending", "green", "red", "green"],
+            [
+                str(row[0])
+                for row in self.con.execute(
+                    "SELECT normalized_state FROM pr_subscription_transitions "
+                    "ORDER BY transition_id"
+                )
+            ],
+        )
+
+    def test_green_in_armed_sprint_still_wakes_after_pending(self):
+        self.reader.current = pull_request(checks="PENDING", checks_failed=False)
+        self.register()
+        self.assertEqual([], self._wake_events())
+
+        self.reader.current = pull_request(checks="SUCCESS", checks_failed=False)
+        self.assertTrue(self.watcher.poll_once())
+
+        self.assertEqual(["green"], self._wake_events())
+        self.assertIn(
+            "Your active Sprint PR is green; judge readiness",
+            self._last_wake()["body"],
+        )
+
+
+class WorktreeDiscoveryTest(SprintPRWatcherCase):
+    """The engine enrols a PR from the branch a Developer worktree has checked out."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.branches: dict[str, str] = {}
+        self.watcher = sprint_pr_watcher.SprintPRWatcher(
+            self.con,
+            repo_root=ROOT,
+            reader_factory=self.watcher.reader_factory,
+            monotonic=lambda: self.clock[0],
+            worktree_branches=lambda: dict(self.branches),
+            discovery_seconds=60.0,
+        )
+
+    def _subscriptions(self) -> list[tuple]:
+        return [
+            tuple(row)
+            for row in self.con.execute(
+                "SELECT owner_shell_id,repository,pr_number FROM pr_subscriptions "
+                "ORDER BY subscription_id"
+            )
+        ]
+
+    def test_open_pr_on_worktree_branch_is_subscribed_and_wakes_owner(self):
+        self.branches = {"dev1": "feat/thing"}
+        pr = pull_request(number=7, head_ref="feat/thing")
+        self.reader.listed_by_number = {7: pr}
+        self.reader.by_number = {7: pr}
+
+        self.assertEqual(1, self.watcher.discover_once(force=True))
+
+        self.assertEqual([(1, "acme/repo", 7)], self._subscriptions())
+        self.assertEqual([None], self.repositories[:1])
+        self.assertEqual(1, self.reader.list_calls)
+        wake = self.con.execute(
+            "SELECT receiver_shell_id,declared_type,body FROM wake_message "
+            "WHERE idempotency_key LIKE 'pr-transition:%'"
+        ).fetchone()
+        self.assertEqual((1, "re-enter"), tuple(wake)[:2])
+        self.assertIn("number=7", wake["body"])
+        self.assertIn("event=red", wake["body"])
+
+        # Covered branch: no further GitHub list while the PR is nonterminal.
+        self.assertEqual(0, self.watcher.discover_once(force=True))
+        self.assertEqual(1, self.reader.list_calls)
+        self.assertEqual([(1, "acme/repo", 7)], self._subscriptions())
+
+    def test_no_candidate_worktree_performs_zero_github_calls(self):
+        self.branches = {
+            "dev1": "shell/dev1",   # disposable base, never a PR head
+            "rev1": "feat/reviewer-branch",  # not a Developer shell
+            "ghost": "feat/unknown",  # no such shell
+        }
+        self.reader.listed_by_number = {
+            7: pull_request(number=7, head_ref="feat/reviewer-branch")
+        }
+
+        self.assertEqual(0, self.watcher.discover_once(force=True))
+
+        self.assertEqual(0, self.reader.list_calls)
+        self.assertEqual([], self._subscriptions())
+
+    def test_discovery_is_interval_bound_and_survives_read_failure(self):
+        self.branches = {"dev1": "feat/thing"}
+        self.reader.current = GitHubReadError("rate limit reached")
+
+        self.assertEqual(0, self.watcher.discover_once())
+        self.assertEqual(1, self.reader.list_calls)
+        self.assertEqual([], self._subscriptions())
+
+        pr = pull_request(number=7, head_ref="feat/thing")
+        self.reader.current = pr
+        self.reader.listed_by_number = {7: pr}
+        self.reader.by_number = {7: pr}
+        self.clock[0] = 30.0
+        self.assertEqual(0, self.watcher.discover_once())
+        self.assertEqual(1, self.reader.list_calls)
+
+        self.clock[0] = 61.0
+        self.assertEqual(1, self.watcher.discover_once())
+        self.assertEqual(2, self.reader.list_calls)
+        self.assertEqual([(1, "acme/repo", 7)], self._subscriptions())
+
+    def test_newest_pr_per_branch_wins_and_terminal_history_is_ignored(self):
+        self.branches = {"dev1": "feat/thing"}
+        old = pull_request(number=5, head_ref="feat/thing", state="MERGED",
+                           checks=None, checks_failed=False)
+        new = pull_request(number=9, head_ref="feat/thing")
+        self.reader.listed_by_number = {5: old, 9: new}
+        self.reader.by_number = {5: old, 9: new}
+
+        self.assertEqual(1, self.watcher.discover_once(force=True))
+
+        self.assertEqual([(1, "acme/repo", 9)], self._subscriptions())
+
+    def test_discovery_never_steals_an_existing_subscription(self):
+        self.con.execute(
+            "INSERT INTO shells "
+            "(shell_id,display_name,shortname,flavor,system_prompt,user_id) "
+            "VALUES (4,'Developer 2','DEV2','dev','prompt',1)"
+        )
+        self.con.commit()
+        self.reader.current = pull_request(number=7, head_ref="feat/thing")
+        self.watcher.subscribe(owner_shell_id=1, repository="acme/repo", pr_number=7)
+        self.branches = {"dev2": "feat/thing"}
+        self.reader.listed_by_number = {7: self.reader.current}
+
+        self.assertEqual(0, self.watcher.discover_once(force=True))
+
+        self.assertEqual([(1, "acme/repo", 7)], self._subscriptions())
+        self.assertEqual(
+            1,
+            self.con.execute(
+                "SELECT COUNT(*) FROM wake_message "
+                "WHERE idempotency_key LIKE 'pr-transition:%'"
+            ).fetchone()[0],
+        )
+
+    def test_reopened_branch_after_close_is_rediscovered(self):
+        self.branches = {"dev1": "feat/thing"}
+        closed = pull_request(number=7, head_ref="feat/thing", state="CLOSED",
+                              checks=None, checks_failed=False)
+        self.reader.listed_by_number = {7: closed}
+        self.reader.by_number = {7: closed}
+        self.assertEqual(1, self.watcher.discover_once(force=True))
+
+        # A terminal subscription does not cover the branch; a new PR from the
+        # same branch is discovered on the next interval.
+        follow_up = pull_request(number=8, head_ref="feat/thing")
+        self.reader.listed_by_number = {7: closed, 8: follow_up}
+        self.reader.by_number = {7: closed, 8: follow_up}
+        self.assertEqual(1, self.watcher.discover_once(force=True))
+        self.assertEqual([(1, "acme/repo", 7), (1, "acme/repo", 8)], self._subscriptions())
+
+    def test_service_pulse_runs_discovery(self):
+        self.branches = {"dev1": "feat/thing"}
+        pr = pull_request(number=7, head_ref="feat/thing")
+        self.reader.listed_by_number = {7: pr}
+        self.reader.by_number = {7: pr}
+        heartbeat = sprint_pr_watcher.WatcherHeartbeat(self.con, interval_seconds=5)
+        service = sprint_pr_watcher.SprintPRWatcherService(
+            ROOT / "unused.db", repo_root=ROOT
+        )
+
+        service._pulse(self.watcher, heartbeat, startup=True)
+
+        self.assertEqual([(1, "acme/repo", 7)], self._subscriptions())
+
+
+class ShellWorktreeBranchesTest(unittest.TestCase):
+    def test_reads_managed_worktrees_from_git(self):
+        import shutil
+        import subprocess
+        import tempfile
+
+        root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, root, True)
+        env = {
+            "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@x",
+            "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@x",
+            "HOME": str(root), "PATH": "/usr/bin:/bin",
+        }
+
+        def git(*args, cwd=root):
+            subprocess.run(["git", "-C", str(cwd), *args], check=True,
+                           capture_output=True, env=env)
+
+        git("init", "-q", "-b", "main")
+        (root / "f").write_text("x")
+        git("add", "f")
+        git("commit", "-q", "-m", "init")
+        git("worktree", "add", "-q", "-b", "shell/dev1", ".sc-worktrees/dev1")
+        git("worktree", "add", "-q", "-b", "feat/thing", ".sc-worktrees/dev2")
+        git("worktree", "add", "-q", "--detach", ".sc-worktrees/dev3")
+        git("worktree", "add", "-q", "-b", "feat/elsewhere", "elsewhere")
+
+        self.assertEqual(
+            {"dev1": "shell/dev1", "dev2": "feat/thing"},
+            sprint_pr_watcher.shell_worktree_branches(root),
+        )
 
 
 if __name__ == "__main__":
