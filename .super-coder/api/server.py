@@ -99,6 +99,7 @@ from quota_probes import dispatch as quota_dispatch  # noqa: E402  (account quot
 import vm as vm_mod  # noqa: E402  (Windows Test VM — config + live checks)
 import ts as ts_mod  # noqa: E402  (tailnet — config + live checks)
 import pm2 as pm2_mod  # noqa: E402  (host pm2 stack — config + live checks)
+import web_search as web_search_mod  # noqa: E402  (Tavily — key store + client, doc #215)
 sys.path.insert(0, str(ENGINE / "render"))
 import flat as flat_render  # noqa: E402  (document render-path ownership)
 
@@ -2687,7 +2688,7 @@ class Handler(BaseHTTPRequestHandler):
             return None
         return shell_id
 
-    def _require_browser_operator(self, con):
+    def _require_browser_operator(self, con, what: str = "the Sprint board"):
         """Accept the loopback browser operator and reject shell credentials."""
         token = self._bearer_token()
         if token:
@@ -2704,7 +2705,7 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 self._send(403, {"error": {
                     "code": "fnb_operator_required",
-                    "message": "the Sprint board is owned by the browser FnB operator",
+                    "message": f"{what} is owned by the browser FnB operator",
                     "details": {},
                 }})
             return False
@@ -2729,7 +2730,8 @@ class Handler(BaseHTTPRequestHandler):
             }})
         return self._fail(exc)
 
-    def _require_browser_mutation_origin(self) -> bool:
+    def _require_browser_mutation_origin(
+            self, what: str = "Sprint lifecycle actions") -> bool:
         origin = self.headers.get("Origin")
         host = self.headers.get("Host") or ""
         if origin:
@@ -2744,14 +2746,14 @@ class Handler(BaseHTTPRequestHandler):
             ):
                 self._send(403, {"error": {
                     "code": "same_origin_required",
-                    "message": "Sprint lifecycle actions require the browser origin",
+                    "message": f"{what} require the browser origin",
                     "details": {},
                 }})
                 return False
         if self.headers.get("Sec-Fetch-Site") not in {None, "same-origin", "none"}:
             self._send(403, {"error": {
                 "code": "same_origin_required",
-                "message": "Sprint lifecycle actions require the browser origin",
+                "message": f"{what} require the browser origin",
                 "details": {},
             }})
             return False
@@ -3912,6 +3914,26 @@ class Handler(BaseHTTPRequestHandler):
             return self._fail(exc)
         finally:
             con.close()
+
+    # -- /_sc/search — token-scoped web search (doc #215) --
+
+    def _search_post(self, body: dict):
+        """A shell searches through the host: the stored key never leaves this
+        process. Errors are {error: <secret-free message>, code} at the status
+        web_search picked, so `sc search` prints them verbatim."""
+        if self._require_shell_auth() is None:
+            return
+        max_results = body.get("max_results", web_search_mod.DEFAULT_MAX_RESULTS)
+        depth = body.get("depth", "basic")
+        try:
+            out = web_search_mod.search(
+                str(body.get("query") or ""),
+                max_results=max_results, depth=depth)
+        except ValueError as exc:
+            return self._send(400, {"error": str(exc), "code": "bad_request"})
+        except web_search_mod.WebSearchError as exc:
+            return self._send(exc.status, {"error": exc.message, "code": exc.code})
+        return self._send(200, out)
 
     # -- /mem/* token-scoped shell memory endpoints --
 
@@ -5139,6 +5161,12 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, {"scripts": script_list()})
             if path == "/api/vm":
                 return self._send(200, {"vm": vm_mod.read()})
+            if path == "/api/web-search":
+                # Status only — configured / provider / last-four hint / when.
+                # The key itself never crosses this boundary (doc #215).
+                if not self._require_browser_operator(con, "web search config"):
+                    return
+                return self._send(200, web_search_mod.status())
             if path == "/api/ts":
                 return self._send(200, {"ts": ts_mod.read()})
             if path == "/api/ts/status":
@@ -5188,8 +5216,20 @@ class Handler(BaseHTTPRequestHandler):
             return self._pr_post(path, self._body())
         if path.startswith("/_sc/sprint/"):
             return self._sprint_post(path, self._body())
+        if path == "/_sc/search":
+            return self._search_post(self._body())
         con = db()
         try:
+            if path == "/api/web-search/validate":
+                # Test-before-save: probe Tavily with the IN-PROGRESS key (or
+                # the stored one when none is supplied). A failed probe is a
+                # normal result the UI renders red — 200 with {ok:false}.
+                if not self._require_browser_operator(con, "web search config"):
+                    return
+                candidate = self._body().get("api_key")
+                if candidate is not None and not isinstance(candidate, str):
+                    return self._send(400, {"error": "api_key must be a string"})
+                return self._send(200, web_search_mod.validate(candidate))
             if path == "/api/flags":
                 fid, err = create_flag(con, self._body())
                 return self._send(400 if err else 201,
@@ -5539,6 +5579,21 @@ class Handler(BaseHTTPRequestHandler):
                 if pb is not None and not isinstance(pb, dict):
                     return self._send(400, {"error": "pm2 must be an object"})
                 return self._send(200, {"ok": True, "pm2": pm2_mod.write(pb)})
+            if path == "/api/web-search":
+                # Set or rotate: replaces the stored key atomically; the next
+                # /_sc/search reads the new one. Operator + same-origin only.
+                if not self._require_browser_operator(con, "web search config"):
+                    return
+                if not self._require_browser_mutation_origin("web search config changes"):
+                    return
+                api_key = self._body().get("api_key")
+                if not isinstance(api_key, str):
+                    return self._send(400, {"error": "api_key must be a string"})
+                try:
+                    st = web_search_mod.write(api_key)
+                except ValueError as exc:
+                    return self._send(400, {"error": str(exc)})
+                return self._send(200, {"ok": True, **st})
             # PUT /api/roadmap/{id}/blockers  {blocked_by: [ids]} — replace the
             # feature's blocker set (empty list clears it).
             if len(parts) == 4 and parts[1] == "roadmap" and parts[3] == "blockers":
@@ -5559,6 +5614,12 @@ class Handler(BaseHTTPRequestHandler):
         path = urlparse(self.path).path
         con = db()
         try:
+            if path == "/api/web-search":
+                if not self._require_browser_operator(con, "web search config"):
+                    return
+                if not self._require_browser_mutation_origin("web search config changes"):
+                    return
+                return self._send(200, {"ok": True, **web_search_mod.clear()})
             if path.startswith("/api/shells/") and path.count("/") == 3:
                 sid = int(path.rsplit("/", 1)[1])
                 cur = con.execute(
