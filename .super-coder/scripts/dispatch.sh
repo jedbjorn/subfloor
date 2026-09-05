@@ -1216,7 +1216,7 @@ case "$cmd" in
   # the host; the shell only carries its own bearer token.
   search)       exec "$PY" "$S/web_search.py" "$@" ;;
   # Task context projection (doc #187): one read-only view of a task or
-  # Sprint work unit — Assignment, Goal, Authority, Blockers, Boundaries,
+  # work unit — Assignment, Goal, Authority, Blockers, Boundaries,
   # Resources — through the same API lane as `sc mem`.
   context)      exec "$PY" "$S/task_context.py" "$@" ;;
   ports)        exec "$PY" "$S/ports.py" show ;;
@@ -1781,7 +1781,7 @@ Subfloor — forkable shell substrate — full command reference (./sc help for 
   ./sc search "<query>" [--max N] [--depth basic|advanced] [--json]
                            web search via the engine API (Tavily; key set in GUI → Scripts → Web Search)
   ./sc context --task <id> | --work-unit <id> [--json]
-                           one focused read of a task or Sprint work unit: Assignment · Goal · Authority · Blockers · Boundaries · Resources
+                           one focused read of a task or work unit: Assignment · Goal · Authority · Blockers · Boundaries · Resources
   ./sc init                seed a fresh fork's first user + shell (run once after install)
 
   Sandbox (docker — the default way to run; allow-everything is safe because the

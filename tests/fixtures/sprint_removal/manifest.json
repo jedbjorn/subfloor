@@ -260,6 +260,7 @@
     ".super-coder/migrations/0190_reseed_successful_sprint_chat_cleanup.sql",
     ".super-coder/migrations/0193_retire_sprint_liveness_acceptance.sql",
     ".super-coder/migrations/0241_global_skill_simplification.sql",
+    ".super-coder/migrations/0253_reseed_task_context_projection.sql",
     ".super-coder/render/compose.py",
     ".super-coder/schema.sql",
     ".super-coder/scripts/activity_readers.py",
@@ -291,6 +292,7 @@
     ".super-coder/scripts/sprint_lifecycle.py",
     ".super-coder/scripts/sprint_state.py",
     ".super-coder/scripts/sprint_units.py",
+    ".super-coder/scripts/task_context.py",
     ".super-coder/scripts/update.py",
     ".super-coder/scripts/watch.py",
     ".super-coder/templates/shells/conductor.json",
@@ -371,6 +373,7 @@
     "tests/test_sprints_ui_contract.py",
     "tests/test_style_spinner.py",
     "tests/test_supervision_sc.py",
+    "tests/test_task_context.py",
     "tests/test_ui_freshness.py",
     "tests/test_update_preflight.py",
     "tests/test_vendor_assets.py",
@@ -848,7 +851,7 @@
       ".super-coder/scripts/dispatch.sh": [
         "./sc sprint <cmd>        authenticated Sprints v2 actions (run without a command for the full verb list)",
         "sprint)       sc_python_probe; exec \"$PY\" \"$S/sprint_cli.py\" \"$@\" ;;",
-        "Memory & catalogue    mem · map · map-sql · map-schema · sql · skill · search · models · job · pr · sprint · token"
+        "Memory & catalogue    mem · map · map-sql · map-schema · sql · skill · search · context · models · job · pr · sprint · token"
       ]
     },
     "forbidden_pattern": "(?:\\bsprints?\\b|\\bconductor\\b|SC_SPRINT_|pr_event|watched_prs|watch-daemon|interface_(?:generations|sessions|writer_leases|input_state|idempotency_keys|recovery_observations)|planner_(?:wake_batches|wake_items|action_receipts|alerts))",
