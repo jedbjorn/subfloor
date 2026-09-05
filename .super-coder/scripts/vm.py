@@ -2183,11 +2183,19 @@ def _human_result(value: dict) -> str:
 
 
 def client_main(argv: list[str]) -> int:
+    if argv[:1] == ["test"]:
+        import windows_test_controller
+
+        return windows_test_controller.main(argv[1:])
     parser = argparse.ArgumentParser(
         prog="./sc vm",
         description="Observe and control the configured Windows test VM.",
     )
     commands = parser.add_subparsers(dest="operation", required=True)
+    commands.add_parser(
+        "test",
+        help="control the fixed W10C-Testing guest locally or through constrained SSH",
+    )
     status = commands.add_parser(
         "status",
         help="observe VM readiness without mutation",
