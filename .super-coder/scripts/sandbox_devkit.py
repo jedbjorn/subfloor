@@ -27,6 +27,7 @@ from pathlib import Path
 from typing import Any
 
 import runtime_flags
+import sandbox_resources
 from devkit import AptPackage, Declaration, DevkitConfigError, load_declaration
 
 IMAGE_PREFIX = "super-coder"
@@ -1758,6 +1759,7 @@ def docker_run(
     arguments: Sequence[str],
     *,
     runner: Runner = subprocess.run,
+    memory_policy: sandbox_resources.MemoryPolicy | None = None,
 ) -> None:
     if arguments.count(MOUNT_MARKER) != 1:
         raise SandboxImageError(
@@ -1776,16 +1778,61 @@ def docker_run(
                 ),
             )
         )
+    if memory_policy is None:
+        resource_arguments, memory_policy = sandbox_resources.docker_arguments(
+            plan.engine / "instance.json",
+            runner=runner,
+        )
+    else:
+        value = str(memory_policy.bytes)
+        resource_arguments = ("--memory", value, "--memory-swap", value)
     command = (
         "docker",
         "run",
         *arguments[:marker],
+        *resource_arguments,
         *mount_arguments,
         *arguments[marker + 1 :],
     )
     # `docker run -d` prints only the container ID.  Suppress that transport
     # detail here so callers can leave provisioning output visible.
     _run(command, runner=runner, capture=True)
+    print(
+        "sandbox resources: memory "
+        f"{sandbox_resources.human_size(memory_policy.bytes)} hard limit; swap disabled"
+    )
+
+
+def enforce_container_resources(
+    plan: ImagePlan,
+    container: str,
+    *,
+    runner: Runner = subprocess.run,
+) -> sandbox_resources.MemoryPolicy:
+    """Apply current policy to a preserved container without recreating it."""
+    policy = sandbox_resources.resolve_memory(
+        plan.engine / "instance.json",
+        runner=runner,
+    )
+    value = str(policy.bytes)
+    _run(
+        (
+            "docker",
+            "update",
+            "--memory",
+            value,
+            "--memory-swap",
+            value,
+            container,
+        ),
+        runner=runner,
+        capture=True,
+    )
+    print(
+        "sandbox resources: memory "
+        f"{sandbox_resources.human_size(policy.bytes)} hard limit; swap disabled"
+    )
+    return policy
 
 
 def _utc_now() -> str:
@@ -2434,12 +2481,20 @@ def launch_container(
     lock_timeout: float = 30.0,
     emit: bool = True,
 ) -> dict[str, Any]:
+    # Resolve and validate host capacity before any existing container is
+    # removed. A malformed or unsafe operator override must leave the healthy
+    # sandbox intact rather than failing halfway through the cutover.
+    memory_policy = sandbox_resources.resolve_memory(
+        plan.engine / "instance.json",
+        runner=runner,
+    )
     status = _read_status(plan)
     if status is not None and status.get("native_packages") == "advisory":
         if (
             status.get("selected_runtime") == "existing_unchanged"
             and _container_identity(container, runner=runner)
         ):
+            enforce_container_resources(plan, container, runner=runner)
             return {
                 "state": "advisory",
                 "preserved": True,
@@ -2453,7 +2508,12 @@ def launch_container(
             runtime_labels=plan.base_labels,
         )
         _remove_container(container, runner=runner)
-        docker_run(baseline, arguments, runner=runner)
+        docker_run(
+            baseline,
+            arguments,
+            runner=runner,
+            memory_policy=memory_policy,
+        )
         return {
             "state": "advisory",
             "preserved": False,
@@ -2467,11 +2527,21 @@ def launch_container(
         plan.declaration.provision is None and not plan.has_package_contract
     ):
         _remove_container(container, runner=runner)
-        docker_run(selected, arguments, runner=runner)
+        docker_run(
+            selected,
+            arguments,
+            runner=runner,
+            memory_policy=memory_policy,
+        )
         return {"state": "not_declared"}
     if plan.declaration.provision is None:
         _remove_container(container, runner=runner)
-        docker_run(selected, arguments, runner=runner)
+        docker_run(
+            selected,
+            arguments,
+            runner=runner,
+            memory_policy=memory_policy,
+        )
         return readiness(
             plan, container, runner=runner, git_runner=git_runner
         )
@@ -2480,7 +2550,12 @@ def launch_container(
     lock_descriptor = _acquire_lock(root / "provision.lock", lock_timeout)
     try:
         _remove_container(container, runner=runner)
-        docker_run(selected, arguments, runner=runner)
+        docker_run(
+            selected,
+            arguments,
+            runner=runner,
+            memory_policy=memory_policy,
+        )
         return provision_checkout(
             plan,
             container,
@@ -2627,13 +2702,14 @@ def _arguments(
         "build",
         "preflight",
         "docker-run",
+        "enforce-resources",
         "launch-container",
         "provision",
         "ready",
     }
     if len(argv) < 7 or argv[0] not in commands:
         raise SandboxImageError(
-            "usage: sandbox_devkit.py <image-name|cutover|build|preflight|docker-run|launch-container|provision|ready> "
+            "usage: sandbox_devkit.py <image-name|cutover|build|preflight|docker-run|enforce-resources|launch-container|provision|ready> "
             "<checkout> <engine> <harness-epoch> <user> <uid> <gid> [-- ARGS...]"
         )
     return (
@@ -2689,7 +2765,15 @@ def _emit_image_state(plan: ImagePlan, selected: str, action: str) -> None:
 def main(argv: Sequence[str]) -> int:
     command, checkout, engine, epoch, user, uid, gid, extra = _arguments(argv)
     plan = image_plan(checkout, engine, epoch, user=user, uid=uid, gid=gid)
-    if command not in {"build", "preflight", "docker-run", "launch-container", "provision", "ready"} and extra:
+    if command not in {
+        "build",
+        "preflight",
+        "docker-run",
+        "enforce-resources",
+        "launch-container",
+        "provision",
+        "ready",
+    } and extra:
         raise SandboxImageError(f"{command} does not accept trailing arguments")
     if command == "image-name":
         print(_selected_tag(plan))
@@ -2712,6 +2796,10 @@ def main(argv: Sequence[str]) -> int:
         if not extra or extra[0] != "--":
             raise SandboxImageError("docker-run requires -- before Docker arguments")
         docker_run(plan, extra[1:])
+    elif command == "enforce-resources":
+        if len(extra) != 1:
+            raise SandboxImageError("enforce-resources requires one container name")
+        enforce_container_resources(plan, extra[0])
     elif command == "launch-container":
         if len(extra) < 3 or extra[1] != "--":
             raise SandboxImageError(
@@ -2783,6 +2871,9 @@ def cli(argv: Sequence[str]) -> int:
         return 1
     except SandboxImageError as exc:
         print(f"dev-kit state: invalid — {exc}", file=sys.stderr)
+        return 1
+    except sandbox_resources.SandboxResourceError as exc:
+        print(f"dev-kit state: invalid — sandbox resources: {exc}", file=sys.stderr)
         return 1
 
 

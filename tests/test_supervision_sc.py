@@ -55,6 +55,7 @@ class SupervisionFixture:
             "github_auth.py",
             "sandbox_github_auth.py",
             "runtime_flags.py",
+            "sandbox_resources.py",
             "sandbox_devkit.py",
         ):
             shutil.copy2(
@@ -174,7 +175,11 @@ class SupervisionFixture:
             printf '\\n' >> "$SC_TEST_LOG"
             state_dir="$SC_TEST_DOCKER_STATE"
             if [ "$1" = info ]; then
-              [ "${SC_TEST_ROOTLESS:-}" != 1 ] || echo rootless
+              if [ "$2" = --format ] && [ "$3" = "{{.MemTotal}}" ]; then
+                echo "${SC_TEST_DOCKER_MEMORY:-21474836480}"
+              elif [ "${SC_TEST_ROOTLESS:-}" = 1 ]; then
+                echo rootless
+              fi
               exit 0
             fi
             if [ "$1" = image ] && [ "$2" = inspect ]; then
@@ -451,7 +456,28 @@ class RestrictedLaunchTests(unittest.TestCase):
             and f"--name sc-{self.fx.root.name}" in line
         )
         self.assertIn(" --init ", sandbox_run)
+        self.assertIn(" --memory 12884901888 ", sandbox_run)
+        self.assertIn(" --memory-swap 12884901888 ", sandbox_run)
         self.assertFalse(any(line.startswith("docker build ") for line in calls))
+
+    def test_unsafe_memory_override_refuses_before_container_removal(self):
+        (self.fx.engine / "instance.json").write_text(
+            json.dumps(
+                {
+                    "instance_id": "f" * 32,
+                    "sandbox_resources": {"memory": "17g"},
+                }
+            )
+            + "\n"
+        )
+
+        result = self.fx.run("launch", "--no-build")
+
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("exceeds the safe maximum 16 GiB", result.stderr)
+        self.assertFalse(
+            any(line.startswith("docker rm -f") for line in self.fx.calls())
+        )
 
     def test_launch_mounts_only_the_bound_private_instance_state(self):
         self.fx.env["XDG_STATE_HOME"] = str(Path(self.fx._tmp.name) / "xdg-state")
