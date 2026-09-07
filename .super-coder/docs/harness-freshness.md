@@ -10,16 +10,15 @@ purpose: Why a shell cannot reach a model that exists, and the commands that fix
 
 [![Open in md-converter](https://img.shields.io/badge/Open%20in-md--converter-6b46c1?style=flat-square)](https://md-converter.designs-os.com/?url=https://github.com/jedbjorn/subfloor/blob/main/.super-coder/docs/harness-freshness.md)
 
-## You are probably here because
+## Applicability
 
-A shell cannot select a model that exists — a new Opus, a new GPT — and the
-obvious commands did not fix it. That symptom is almost never the model, the
-account, or the picker. It is the **harness CLI version inside the sandbox**.
+**Posture: current operator runbook.** Applies to installed harness discovery,
+refresh and runtime compatibility. Sandbox executables belong to the image;
+under host runtime, inspect and refresh the host installation instead.
 
-Vendors ship new models in new CLI releases. Claude Code 2.1.218 had no idea
-Opus 5 existed; 2.1.219 did. A sandbox baked with 2.1.218 offers an `opus` alias
-that cannot resolve to Opus 5, and nothing in the picker says why — the picker
-shows aliases, never the build behind them.
+A missing model may reflect CLI version, stale discovery, account availability,
+or route compatibility. Start with `sc harness-status` and the model resolver.
+A vendor's latest CLI is not automatically a tested Subfloor baseline.
 
 ## Where harnesses actually live
 
@@ -32,7 +31,7 @@ sessions, goals, plugins, and other durable state survive container replacement.
 The launchers must still resolve image-owned executables from
 `.super-coder/Dockerfile`.
 
-Three reasons it must stay that way, each of which has already bitten someone:
+Reasons it must stay that way, each of which has already bitten someone:
 
 - **Host binaries are not portable into the Linux container.** Mounting a host
   install can shadow the baked executable with an incompatible binary. The
@@ -55,7 +54,7 @@ serves those installer layers from cache indefinitely. Hence the epoch.
 ## The harness epoch
 
 `SC_HARNESS_EPOCH` is the **cache key on the image's harness layers**. It is
-referenced inside both harness `RUN` instructions, so changing it re-runs the
+referenced in the harness installation layers, so changing it re-runs the
 vendor installers (which resolve "latest" themselves — the epoch is an expiry,
 never a version pin). It sits below the node/playwright/pip layers, so rolling
 it costs the harness downloads and nothing else.
@@ -63,7 +62,7 @@ it costs the harness downloads and nothing else.
 | | |
 |---|---|
 | Stored at | `${XDG_CONFIG_HOME:-~/.config}/super-coder/harness-epoch` |
-| Scope | **The machine**, not the repo — every fork shares the `super-coder-sandbox` image tag |
+| Scope | **The machine**; image identity also incorporates engine build inputs |
 | Value | A unique UTC token for every explicit refresh |
 | Unrolled | `0` — the Dockerfile default, so an untouched machine builds exactly what it always did |
 | Recorded in the image | `LABEL sc.harness_epoch`, which is how `harness-status` knows whether a build is owed |
@@ -108,12 +107,10 @@ This probes inside the container, which is the only answer that matters. Your
 host's own `claude --version` is irrelevant on the docker path — nothing mounts
 it in.
 
-**2. Confirm the CLI is the cause, not the catalogue.** Grep the binary for the
-model id. Zero hits is proof; it cannot offer what it has never heard of.
-
-```
-docker exec sc-<repo> sh -c 'grep -c "claude-opus-5" "$(readlink -f "$(command -v claude)")"'
-```
+**2. Inspect local route evidence.** Use `./sc models list <harness>` and
+`./sc models resolve --help`. Refresh the catalogue when needed. A string
+missing from a compiled binary is not proof that the model is unavailable.
+Read route status and compatibility evidence before choosing a recovery.
 
 **3. Refresh and bounce.**
 
@@ -153,10 +150,10 @@ CLI-probed routes `available` and models.dev-sourced ones `advisory`.
 
 ## Several forks on one machine
 
-They share the image tag, so harnesses are installed **once for all of them** —
-there is no per-container installation. Every normal restart deliberately
-requests a fresh image-wide harness build; all later containers use that shared
-image until another explicit refresh changes it.
+Image layers can be reused across forks with matching build inputs. Each
+container retains its original image until replaced; forks with different
+engine inputs may use different image identities. A normal restart requests
+fresh harness installation before replacing that fork's running container.
 
 To see the fleet's drift at a glance:
 

@@ -12,6 +12,12 @@ purpose: Exact-ref removal for existing forks
 
 ## Before you start
 
+**Posture: historical migration procedure.** Applies only to existing forks
+that ran the retired DeepSeek Harness. Fresh installations skip this procedure.
+Execute from the host Admin maintenance seat under operator authority; ordinary
+shells must not perform direct engine-state recovery. The certified refs and
+checkpoints below remain immutable, including their historical path spelling.
+
 This is the only supported removal path for an existing installation that has
 ever run the DeepSeek Harness (DSH). Use these three immutable commits, in this
 order:

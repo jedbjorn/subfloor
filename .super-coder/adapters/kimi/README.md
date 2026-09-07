@@ -1,15 +1,17 @@
 # adapters/kimi — Kimi Code CLI
 
+**Posture: current adapter reference.** The adjacent [manifest](adapter.json)
+is authoritative for supported surfaces, compatibility bounds and launch flags.
+Historical live-probe versions below are evidence, not the current support pin.
+
+
 Kimi Code (`kimi`, Moonshot AI's coding CLI — repo `MoonshotAI/kimi-code`, the
 TypeScript successor to the legacy Python `kimi-cli`) reads the boot artifact
 (`AGENTS.md`) natively — already emitted by the render chain — so the adapter
 carries only the launch command, a headless block, and a sandbox approval flag.
 
-**Why it exists:** the Kimi-models sibling of the claude/codex/vibe harnesses —
-a first-party CLI billed against a Kimi membership (Moderato / Allegretto /
-Allegro / Vivace) or a Moonshot platform API key. K-series coding models
-(k3, kimi-for-coding-highspeed). opencode stays the universal metered
-catch-all; kimi is the native Moonshot path.
+This adapter connects Subfloor to the kimi CLI. Account entitlement and
+billing are provider-owned; they are not part of the adapter contract.
 
 `adapter.json` fields (the harness seam contract):
 
@@ -90,3 +92,12 @@ deliberately bakes its own binary to `/usr/local/bin` (`KIMI_INSTALL_DIR=/usr/lo
 in the Dockerfile) — otherwise the mount would shadow the baked binary with an
 incompatible host binary inside the Linux container.
 Same reason `ensure_harness_path()` is a no-op under `SC_SANDBOX`.
+
+## Conversation capability
+
+The `kimi-print` driver records a native session-directory reference, streams
+normalized events from print mode, resumes with `-S`, and interrupts with
+`SIGINT`. Model and effort selections must resolve to supported local routes;
+`headless.effort.env` supplies `KIMI_MODEL_THINKING_EFFORT`. Session inspection
+uses native stored evidence. The manifest does not advertise interactive
+permission responses. See `scripts/conversation_adapters/kimi.py` in the engine.

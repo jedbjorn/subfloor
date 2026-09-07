@@ -347,7 +347,7 @@ installation, so this guide does not pin a table of preferred model versions.
 
 Five harness adapters ship: Claude Code, Codex, OpenCode, Mistral Vibe and Kimi
 Code. Browser and Sprint availability are separate from terminal support.
-Vibe supports terminal/one-shot work but does not advertise browser or Sprint
+Vibe supports terminal work but does not advertise browser or Sprint
 support. Each [adapter reference](../.super-coder/README.md#harness-adapters)
 explains its own launch and permission behavior.
 

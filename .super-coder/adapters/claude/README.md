@@ -1,8 +1,13 @@
 # adapters/claude — Claude Code
 
+**Posture: current adapter reference.** The adjacent [manifest](adapter.json)
+is authoritative for supported surfaces, compatibility bounds and launch flags.
+Historical live-probe versions below are evidence, not the current support pin.
+
+
 Claude Code reads the boot artifact (`CLAUDE.md`) and `.claude/skills/<name>/SKILL.md`
-natively — both already emitted by the render chain — so the adapter only carries
-the launch command. No extra config file to emit at v1.
+natively — both already emitted by the render chain — the adapter also declares model/effort routing, permission flags, the branch
+guard and the conversation contract.
 
 `adapter.json` fields (the harness seam contract):
 
@@ -53,8 +58,8 @@ This is the enforcement behind the `git` skill and the boot-template VERSION
 CONTROL rule — a skill loads too late to stop the first edit; the hook fires
 before it. Re-emitted (idempotently) each launch, so it survives `./sc update`.
 
-`scripts/branch-guard.sh` is the **one** branch-decision script shared by all four
-harnesses (claude + codex hooks, the opencode plugin, the git pre-commit backstop)
+`scripts/branch-guard.sh` is the **one** branch-decision script used by the Claude and Codex hooks, the OpenCode plugin, and the universal
+Git pre-commit backstop
 — so `SC_PROTECTED_BRANCHES` and the message stay identical everywhere.
 
 ## Conversation capability

@@ -85,7 +85,7 @@ exact syntax in tool help.
 Each [`adapters/`](adapters/) directory carries its own `adapter.json` and
 README. The manifest declares terminal, one-shot, browser and Sprint surfaces,
 launch flags, model/effort routing, conversation contract and capability bounds.
-Support is surface-specific: Vibe ships a terminal/one-shot adapter but does not
+Support is surface-specific: Vibe ships a terminal adapter but does not
 advertise browser or Sprint support. Consult each current manifest rather than
 assuming every harness implements every surface.
 

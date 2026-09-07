@@ -1,5 +1,12 @@
 # db broker
 
+**Posture: current operator runbook.** Applies to a fork with this optional
+host broker configured. Host setup and lifecycle belong to its authorized
+operator; Planner supplies fork-local shell guidance. Example names, ports and
+application tables below are illustrative and do not grant access to another
+fork. Exact CLI syntax remains in `sc help --all` and verb help.
+
+
 Read-only diagnostic access to the fork's **live app Postgres** for a sandboxed
 shell — without handing that shell a credential or a network route. The fourth
 sibling of the pm2, Windows-VM, and tailnet brokers: one host process holds the
@@ -7,7 +14,8 @@ capability so nothing downstream needs it.
 
 Code: `.super-coder/api/db_broker.py` (the HTTP-over-unix-socket server) +
 `.super-coder/scripts/dbq.py` (config, validation, the query verb, the socket
-client). The `db_query` skill curls the socket. Spec: `specs_sc/db-query.md`.
+client). Fork-local guidance uses the supplied socket client; no global `db_query`
+skill is implied.
 
 ## Why a broker, not the DSN in the container
 
@@ -98,13 +106,13 @@ export SC_RO_DSN=postgresql://sc_ro:…@<host>:5432/<db>
 already answers; `db-broker-down` only stops what it started (a systemd-managed
 broker is left alone — use `db-broker-uninstall`).
 
-## Deferred (not in v1)
+## Limits
 
 - **Any write path.** Read-only forever; a write broker is a different tool with
   a different threat model.
 - **Query builders / pagination beyond the row cap / result streaming.** The
   verb takes raw `SELECT` text and returns capped rows.
-- **A review-GUI panel.** The surface is the `db_query` skill (CLI over the
+- **A review-GUI panel.** The surface is the supplied query client with fork-local guidance (CLI over the
   socket); no `/api/db/*` route on the review server.
 - **Cross-fork / cross-host access.** One broker serves one fork's live DB on
   its own host.
