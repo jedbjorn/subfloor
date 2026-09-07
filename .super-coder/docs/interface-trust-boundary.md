@@ -44,8 +44,8 @@ container context. Setting `SC_SANDBOX` alone is insufficient. In a container,
 the server can bind its container interface; `sc launch` publishes the port on
 host `127.0.0.1`.
 
-Container detection does not verify the host's publish mapping or establish a
-separate network namespace. Use the supported launcher. A custom container
+Container detection does not verify the host's publish mapping or the
+container's network namespace. Use the supported launcher. A custom container
 with host networking or a wider published port does not inherit the documented
 loopback boundary. Remote access needs a separately authenticated transport.
 
