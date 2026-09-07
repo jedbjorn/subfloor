@@ -6,7 +6,6 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-import re
 import shutil
 import sqlite3
 import subprocess
@@ -16,14 +15,11 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from fcntl import LOCK_EX, LOCK_NB, LOCK_UN, flock
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 from typing import Any
 
-import active_chat_registry
 import git_freshness
-import git_prune
 import run
-import shell_liveness
 
 
 class SprintCleanupInvariantError(ValueError):
@@ -77,20 +73,16 @@ class SprintCleanupRequestError(RuntimeError):
 
 @dataclass(frozen=True)
 class CleanupTargetDraft:
-    shell_id: int | None
     target_kind: str
     canonical_path: str
     repository_root: str
     git_common_dir: str
-    expected_base_branch: str | None
 
 
 @dataclass(frozen=True)
 class CleanupProjection:
     aggregate_state: str | None
     target_count: int
-    worktree_count: int
-    artifact_count: int
     pending_count: int
     running_count: int
     succeeded_count: int
@@ -108,12 +100,10 @@ class CleanupScheduleReceipt:
 class CleanupClaim:
     cleanup_target_id: int
     sprint_id: int
-    shell_id: int | None
     target_kind: str
     canonical_path: str
     repository_root: str
     git_common_dir: str
-    expected_base_branch: str | None
     lease_owner: str
     claim_generation: int
     lease_expires_at: str
@@ -128,14 +118,6 @@ class CleanupExecutionReceipt:
     detail: str | None = None
     claim_generation: int | None = None
     attempt_count: int | None = None
-
-
-@dataclass(frozen=True)
-class DirectSubmodule:
-    name: str
-    declared_path: str
-    mount: Path
-    initialized: bool
 
 
 @dataclass(frozen=True)
@@ -160,8 +142,6 @@ class UnresolvedCleanupTarget:
 
 IdentityProvider = Callable[[], tuple[Path, Path]]
 Clock = Callable[[], datetime]
-LivenessProbe = Callable[[CleanupClaim], str]
-PruneBranches = Callable[[Path], dict[str, Any]]
 CLEANUP_WAIT_RETRY_SECONDS = 5
 
 
@@ -206,64 +186,16 @@ class SprintCleanupTargetStore:
         repository_root, git_common_dir = self.identity_provider()
         repository_root = repository_root.resolve()
         git_common_dir = git_common_dir.resolve()
-        participants = self.con.execute(
-            "SELECT participant.shell_id,shell.shortname,shell.flavor "
-            "FROM sprint_participants participant JOIN shells shell "
-            "ON shell.shell_id=participant.shell_id "
-            "WHERE participant.sprint_id=? "
-            "AND COALESCE(shell.flavor,'')<>'admin' "
-            "ORDER BY participant.shell_id",
-            (sprint_id,),
-        ).fetchall()
-        if not participants:
-            raise SprintCleanupInvariantError(
-                "successful Sprint has no managed non-Admin participants"
-            )
-
-        drafts_by_path: dict[str, CleanupTargetDraft] = {}
-        for participant in participants:
-            shortname = str(participant["shortname"] or "").strip()
-            if not shortname:
-                raise SprintCleanupInvariantError(
-                    f"Sprint participant shell {participant['shell_id']} has no shortname"
-                )
-            worktree = run.shell_work_dir(
-                shortname,
-                str(participant["flavor"] or ""),
-                root=repository_root,
-            )
-            canonical_path = self._lexical_absolute(worktree)
-            draft = CleanupTargetDraft(
-                shell_id=int(participant["shell_id"]),
-                target_kind="worktree",
-                canonical_path=canonical_path,
-                repository_root=str(repository_root),
-                git_common_dir=str(git_common_dir),
-                expected_base_branch=f"shell/{shortname.lower()}",
-            )
-            existing = drafts_by_path.get(canonical_path)
-            if existing is not None and existing.shell_id != draft.shell_id:
-                raise SprintCleanupInvariantError(
-                    "multiple Sprint participants resolve to one managed worktree"
-                )
-            drafts_by_path[canonical_path] = draft
-
         artifact_path = self._lexical_absolute(
             repository_root / "shared" / "sprints" / f"sprint-{sprint_id}"
         )
-        drafts_by_path[artifact_path] = CleanupTargetDraft(
-            shell_id=None,
-            target_kind="artifact_dir",
-            canonical_path=artifact_path,
-            repository_root=str(repository_root),
-            git_common_dir=str(git_common_dir),
-            expected_base_branch=None,
-        )
-        return tuple(
-            sorted(
-                drafts_by_path.values(),
-                key=lambda draft: (draft.target_kind, draft.canonical_path),
-            )
+        return (
+            CleanupTargetDraft(
+                target_kind="artifact_dir",
+                canonical_path=artifact_path,
+                repository_root=str(repository_root),
+                git_common_dir=str(git_common_dir),
+            ),
         )
 
     def schedule_in_transaction(
@@ -289,31 +221,22 @@ class SprintCleanupTargetStore:
             )
 
         target_ids: list[int] = []
-        worktree_target_ids: list[int] = []
-        artifact_target_ids: list[int] = []
         for target in targets:
             cursor = self.con.execute(
                 "INSERT INTO sprint_cleanup_targets "
-                "(sprint_id,shell_id,target_kind,canonical_path,repository_root,"
-                "git_common_dir,expected_base_branch) VALUES (?,?,?,?,?,?,?)",
+                "(sprint_id,target_kind,canonical_path,repository_root,"
+                "git_common_dir) VALUES (?,?,?,?,?)",
                 (
                     sprint_id,
-                    target.shell_id,
                     target.target_kind,
                     target.canonical_path,
                     target.repository_root,
                     target.git_common_dir,
-                    target.expected_base_branch,
                 ),
             )
             if cursor.lastrowid is None:
                 raise RuntimeError("cleanup target insert returned no durable identity")
-            target_id = cursor.lastrowid
-            target_ids.append(target_id)
-            if target.target_kind == "worktree":
-                worktree_target_ids.append(target_id)
-            else:
-                artifact_target_ids.append(target_id)
+            target_ids.append(cursor.lastrowid)
 
         projection = self.project(sprint_id)
         self.con.execute(
@@ -325,9 +248,8 @@ class SprintCleanupTargetStore:
                 json.dumps(
                     {
                         "aggregate_state": projection.aggregate_state,
-                        "artifact_target_ids": artifact_target_ids,
+                        "artifact_target_ids": target_ids,
                         "target_count": projection.target_count,
-                        "worktree_target_ids": worktree_target_ids,
                     },
                     sort_keys=True,
                 ),
@@ -336,22 +258,15 @@ class SprintCleanupTargetStore:
         return CleanupScheduleReceipt(True, tuple(target_ids), projection)
 
     def project(self, sprint_id: int) -> CleanupProjection:
+        """Project this engine's artifact targets; legacy worktree rows are inert."""
         counts = {state: 0 for state in ("pending", "running", "succeeded", "failed")}
-        worktree_count = 0
-        artifact_count = 0
         for row in self.con.execute(
-            "SELECT target_kind,state,COUNT(*) AS target_count "
-            "FROM sprint_cleanup_targets WHERE sprint_id=? "
-            "GROUP BY target_kind,state",
+            "SELECT state,COUNT(*) AS target_count FROM sprint_cleanup_targets "
+            "WHERE sprint_id=? AND target_kind='artifact_dir' GROUP BY state",
             (sprint_id,),
         ):
-            count = int(row["target_count"])
-            counts[str(row["state"])] += count
-            if row["target_kind"] == "worktree":
-                worktree_count += count
-            else:
-                artifact_count += count
-        target_count = worktree_count + artifact_count
+            counts[str(row["state"])] += int(row["target_count"])
+        target_count = sum(counts.values())
         aggregate_state: str | None = None
         if counts["failed"]:
             aggregate_state = "failed"
@@ -362,8 +277,6 @@ class SprintCleanupTargetStore:
         return CleanupProjection(
             aggregate_state=aggregate_state,
             target_count=target_count,
-            worktree_count=worktree_count,
-            artifact_count=artifact_count,
             pending_count=counts["pending"],
             running_count=counts["running"],
             succeeded_count=counts["succeeded"],
@@ -375,6 +288,7 @@ class SprintCleanupTargetStore:
         shell_ids: Iterable[int],
     ) -> UnresolvedCleanupTarget | None:
         """Return one unresolved completed-Sprint cleanup fencing shell reuse."""
+        # Removed at integration: sole caller deleted by lane A.
         normalized = tuple(sorted({int(shell_id) for shell_id in shell_ids}))
         if not normalized or not self._cleanup_table_exists():
             return None
@@ -414,10 +328,9 @@ class SprintCleanupTargetStore:
         self,
         owner: str,
         *,
-        shell_id: int | None = None,
         lease_seconds: int = 120,
     ) -> CleanupClaim | None:
-        """Claim one runnable target with a monotonically fenced generation."""
+        """Claim one runnable artifact target with a fenced generation."""
         if not owner.strip():
             raise ValueError("cleanup lease owner is required")
         if lease_seconds <= 0:
@@ -427,38 +340,27 @@ class SprintCleanupTargetStore:
         now = self.clock()
         now_stamp = _stamp(now)
         if self.con.execute(
-            "SELECT 1 FROM sprint_cleanup_targets WHERE "
-            "(state='pending' AND "
+            "SELECT 1 FROM sprint_cleanup_targets WHERE target_kind='artifact_dir' "
+            "AND ((state='pending' AND "
             " (lease_expires_at IS NULL OR lease_expires_at<=?)) "
-            "OR (state='running' AND lease_expires_at<=?) LIMIT 1",
+            "OR (state='running' AND lease_expires_at<=?)) LIMIT 1",
             (now_stamp, now_stamp),
         ).fetchone() is None:
             return None
         expires_at = _stamp(now + timedelta(seconds=lease_seconds))
         self._begin_write()
         try:
-            params: list[object] = [now_stamp, now_stamp]
-            shell_filter = ""
-            if shell_id is not None:
-                shell_filter = " AND target.shell_id=?"
-                params.append(shell_id)
             row = self.con.execute(
                 "SELECT target.* FROM sprint_cleanup_targets target "
                 "JOIN sprints sprint ON sprint.sprint_id=target.sprint_id "
-                "WHERE sprint.lifecycle='completed' AND ("
+                "WHERE sprint.lifecycle='completed' "
+                "AND target.target_kind='artifact_dir' AND ("
                 "(target.state='pending' AND "
                 " (target.lease_expires_at IS NULL OR target.lease_expires_at<=?)) "
-                "OR (target.state='running' AND target.lease_expires_at<=?))"
-                + shell_filter
-                + " AND (target.target_kind='worktree' OR NOT EXISTS ("
-                "SELECT 1 FROM sprint_cleanup_targets worktree "
-                "WHERE worktree.sprint_id=target.sprint_id "
-                "AND worktree.target_kind='worktree' "
-                "AND worktree.state<>'succeeded')) "
-                "ORDER BY CASE target.target_kind WHEN 'worktree' THEN 0 ELSE 1 END,"
-                "target.claim_generation,target.attempt_count DESC,"
+                "OR (target.state='running' AND target.lease_expires_at<=?)) "
+                "ORDER BY target.claim_generation,target.attempt_count DESC,"
                 "target.sprint_id,target.cleanup_target_id LIMIT 1",
-                params,
+                (now_stamp, now_stamp),
             ).fetchone()
             if row is None:
                 self.con.commit()
@@ -491,14 +393,10 @@ class SprintCleanupTargetStore:
             return CleanupClaim(
                 cleanup_target_id=int(row["cleanup_target_id"]),
                 sprint_id=int(row["sprint_id"]),
-                shell_id=(
-                    int(row["shell_id"]) if row["shell_id"] is not None else None
-                ),
                 target_kind=str(row["target_kind"]),
                 canonical_path=str(row["canonical_path"]),
                 repository_root=str(row["repository_root"]),
                 git_common_dir=str(row["git_common_dir"]),
-                expected_base_branch=row["expected_base_branch"],
                 lease_owner=owner,
                 claim_generation=generation,
                 lease_expires_at=expires_at,
@@ -692,9 +590,7 @@ class SprintCleanupTargetStore:
 
     def _publish_terminal_receipt_in_transaction(self, claim: CleanupClaim) -> None:
         row = self.con.execute(
-            "SELECT target.*,shell.shortname FROM sprint_cleanup_targets target "
-            "LEFT JOIN shells shell ON shell.shell_id=target.shell_id "
-            "WHERE target.cleanup_target_id=?",
+            "SELECT * FROM sprint_cleanup_targets WHERE cleanup_target_id=?",
             (claim.cleanup_target_id,),
         ).fetchone()
         if row is None:
@@ -735,8 +631,8 @@ class SprintCleanupTargetStore:
             self._send_terminal_receipt_in_transaction(
                 receiver_shell_id,
                 body=(
-                    f"Sprint {claim.sprint_id} cleanup failed for {path_label} "
-                    f"(error_code={code}).{fallback_note} Run "
+                    f"Sprint {claim.sprint_id} artifact cleanup failed for "
+                    f"{path_label} (error_code={code}).{fallback_note} Run "
                     f"`sc sprint cleanup-status --sprint "
                     f"{claim.sprint_id}`; after correcting the named condition, "
                     f"run `sc sprint cleanup --sprint {claim.sprint_id} --key "
@@ -759,33 +655,12 @@ class SprintCleanupTargetStore:
             "succeeded_count": projection.succeeded_count,
             "target_count": projection.target_count,
         }
+        # Success is recorded, never announced: only a failure needs the Planner.
         self.con.execute(
             "INSERT INTO sprint_events "
             "(sprint_id,event_type,actor_kind,payload) "
             "VALUES (?,'sprint.cleanup_completed','system',?)",
             (claim.sprint_id, json.dumps(payload, sort_keys=True)),
-        )
-        receiver_shell_id, fnb_fallback = self._terminal_receipt_receiver(
-            claim.sprint_id
-        )
-        if receiver_shell_id is None:
-            return
-        fallback_note = (
-            " Originating Planner is inactive; this is the FnB fallback receipt."
-            if fnb_fallback
-            else ""
-        )
-        self._send_terminal_receipt_in_transaction(
-            receiver_shell_id,
-            body=(
-                f"Sprint {claim.sprint_id} cleanup completed. "
-                f"cleanup_state=succeeded; target_count={projection.target_count}. "
-                f"Its managed participant worktrees are reusable.{fallback_note}"
-            ),
-            preferred_key=(
-                f"{SYSTEM_IDEMPOTENCY_KEY_PREFIX}"
-                f"sprint:{claim.sprint_id}:cleanup-completed"
-            ),
         )
 
     def _send_terminal_receipt_in_transaction(
@@ -843,10 +718,7 @@ class SprintCleanupTargetStore:
 
     @staticmethod
     def safe_path_label(row: sqlite3.Row) -> str:
-        if row["target_kind"] == "artifact_dir":
-            return f"shared/sprints/sprint-{int(row['sprint_id'])}"
-        shortname = str(row["shortname"] or "unknown").lower()
-        return f".sc-worktrees/{shortname}"
+        return f"shared/sprints/sprint-{int(row['sprint_id'])}"
 
     def _begin_write(self) -> None:
         if self.con.in_transaction:
@@ -889,83 +761,28 @@ class SprintCleanupTargetStore:
             raise SprintCleanupInvariantError(
                 "cleanup targets may be scheduled only for a completed Sprint"
             )
-        artifact_targets = [
-            target for target in targets if target.target_kind == "artifact_dir"
-        ]
-        worktree_targets = [
-            target for target in targets if target.target_kind == "worktree"
-        ]
-        if len(artifact_targets) != 1 or not worktree_targets:
+        if len(targets) != 1 or targets[0].target_kind != "artifact_dir":
             raise SprintCleanupInvariantError(
-                "cleanup schedule requires managed worktrees and one artifact target"
+                "cleanup schedule requires exactly one Sprint artifact target"
             )
-        if len({target.canonical_path for target in targets}) != len(targets):
-            raise SprintCleanupInvariantError("cleanup target paths are not distinct")
-        repositories = {
-            (target.repository_root, target.git_common_dir) for target in targets
-        }
-        if len(repositories) != 1:
-            raise SprintCleanupInvariantError(
-                "cleanup targets do not share one stored repository identity"
-            )
-        repository_root, git_common_dir = next(iter(repositories))
-        participants = self.con.execute(
-            "SELECT participant.shell_id,shell.shortname,shell.flavor "
-            "FROM sprint_participants participant JOIN shells shell "
-            "ON shell.shell_id=participant.shell_id "
-            "WHERE participant.sprint_id=? "
-            "AND COALESCE(shell.flavor,'')<>'admin' "
-            "ORDER BY participant.shell_id",
-            (sprint_id,),
-        ).fetchall()
-        expected_worktrees: dict[int, tuple[str, str]] = {}
-        for participant in participants:
-            shortname = str(participant["shortname"] or "").strip()
-            if not shortname:
-                raise SprintCleanupInvariantError(
-                    f"Sprint participant shell {participant['shell_id']} has no shortname"
-                )
-            expected_worktrees[int(participant["shell_id"])] = (
-                self._lexical_absolute(
-                    run.shell_work_dir(
-                        shortname,
-                        str(participant["flavor"] or ""),
-                        root=Path(repository_root),
-                    )
-                ),
-                f"shell/{shortname.lower()}",
-            )
-        proposed_worktrees = {
-            int(target.shell_id): (
-                target.canonical_path,
-                str(target.expected_base_branch),
-            )
-            for target in worktree_targets
-            if target.shell_id is not None
-        }
-        if proposed_worktrees != expected_worktrees:
-            raise SprintCleanupInvariantError(
-                "Sprint participant identities changed after cleanup preparation"
-            )
+        artifact = targets[0]
         expected_artifact = self._lexical_absolute(
-            Path(repository_root) / "shared" / "sprints" / f"sprint-{sprint_id}"
+            Path(artifact.repository_root)
+            / "shared"
+            / "sprints"
+            / f"sprint-{sprint_id}"
         )
-        artifact = artifact_targets[0]
-        if (
-            artifact.canonical_path != expected_artifact
-            or artifact.repository_root != repository_root
-            or artifact.git_common_dir != git_common_dir
-        ):
+        if artifact.canonical_path != expected_artifact:
             raise SprintCleanupInvariantError(
                 "Sprint artifact target changed after cleanup preparation"
             )
 
     def _target_rows(self, sprint_id: int) -> list[sqlite3.Row]:
         return self.con.execute(
-            "SELECT cleanup_target_id,shell_id,target_kind,canonical_path,"
-            "repository_root,git_common_dir,expected_base_branch "
-            "FROM sprint_cleanup_targets WHERE sprint_id=? "
-            "ORDER BY target_kind,canonical_path",
+            "SELECT cleanup_target_id,target_kind,canonical_path,"
+            "repository_root,git_common_dir FROM sprint_cleanup_targets "
+            "WHERE sprint_id=? AND target_kind='artifact_dir' "
+            "ORDER BY canonical_path",
             (sprint_id,),
         ).fetchall()
 
@@ -976,23 +793,19 @@ class SprintCleanupTargetStore:
     ) -> None:
         stored = [
             (
-                row["shell_id"],
                 row["target_kind"],
                 row["canonical_path"],
                 row["repository_root"],
                 row["git_common_dir"],
-                row["expected_base_branch"],
             )
             for row in existing
         ]
         proposed = [
             (
-                target.shell_id,
                 target.target_kind,
                 target.canonical_path,
                 target.repository_root,
                 target.git_common_dir,
-                target.expected_base_branch,
             )
             for target in targets
         ]
@@ -1011,17 +824,10 @@ class SprintCleanupRecoveryStore:
 
     _EVIDENCE_FIELDS = frozenset(
         {
-            "branch",
             "entry_count",
             "entry_count_truncated",
             "existed",
-            "final_origin_main_sha",
-            "head",
-            "prune_candidates",
-            "refreshed_main_sha",
             "removed_entry_count",
-            "status_count",
-            "status_sample_truncated",
         }
     )
 
@@ -1044,14 +850,6 @@ class SprintCleanupRecoveryStore:
                 {
                     "cleanup_target_id": int(row["cleanup_target_id"]),
                     "target_kind": str(row["target_kind"]),
-                    "shell": (
-                        {
-                            "shell_id": int(row["shell_id"]),
-                            "shortname": str(row["shortname"]),
-                        }
-                        if row["shell_id"] is not None
-                        else None
-                    ),
                     "path_label": SprintCleanupTargetStore.safe_path_label(row),
                     "state": str(row["state"]),
                     "attempt_count": int(row["attempt_count"]),
@@ -1188,8 +986,8 @@ class SprintCleanupRecoveryStore:
             else:
                 rows = self.con.execute(
                     "SELECT cleanup_target_id FROM sprint_cleanup_targets "
-                    "WHERE sprint_id=? AND state='failed' "
-                    "ORDER BY cleanup_target_id",
+                    "WHERE sprint_id=? AND target_kind='artifact_dir' "
+                    "AND state='failed' ORDER BY cleanup_target_id",
                     (sprint_id,),
                 ).fetchall()
                 if not rows:
@@ -1300,11 +1098,8 @@ class SprintCleanupRecoveryStore:
 
     def _target_rows(self, sprint_id: int) -> list[sqlite3.Row]:
         return self.con.execute(
-            "SELECT target.*,shell.shortname FROM sprint_cleanup_targets target "
-            "LEFT JOIN shells shell ON shell.shell_id=target.shell_id "
-            "WHERE target.sprint_id=? ORDER BY "
-            "CASE target.target_kind WHEN 'worktree' THEN 0 ELSE 1 END,"
-            "target.cleanup_target_id",
+            "SELECT * FROM sprint_cleanup_targets WHERE sprint_id=? "
+            "AND target_kind='artifact_dir' ORDER BY cleanup_target_id",
             (sprint_id,),
         ).fetchall()
 
@@ -1345,7 +1140,15 @@ class SprintCleanupRecoveryStore:
                 "cleanup idempotency key was reused with different input",
             )
         response = json.loads(row["response_json"])
-        projection = CleanupProjection(**response["projection"])
+        stored = response["projection"]
+        # A request recorded by an older engine also carries per-kind counts.
+        projection = CleanupProjection(
+            **{
+                field: stored[field]
+                for field in CleanupProjection.__dataclass_fields__
+                if field in stored
+            }
+        )
         return CleanupRecoveryReceipt(
             int(row["cleanup_request_id"]),
             False,
@@ -1367,13 +1170,13 @@ class SprintCleanupRecoveryStore:
         return {
             "aggregate_state": projection.aggregate_state,
             "target_count": projection.target_count,
-            "worktree_count": projection.worktree_count,
-            "artifact_count": projection.artifact_count,
             "pending_count": projection.pending_count,
             "running_count": projection.running_count,
             "succeeded_count": projection.succeeded_count,
             "failed_count": projection.failed_count,
         }
+
+
 
 
 class SprintCleanupExecutor:
@@ -1383,41 +1186,18 @@ class SprintCleanupExecutor:
         self,
         store: SprintCleanupTargetStore,
         *,
-        liveness_probe: LivenessProbe | None = None,
-        current_leased_run_id: int | None = None,
-        branch_pruner: PruneBranches | None = None,
-        fetch_timeout: int = 30,
-        command_timeout: int = 30,
         lock_timeout: float = 5.0,
         lease_seconds: int = 120,
         max_attempts: int = 3,
     ) -> None:
         self.store = store
         self.con = store.con
-        self.current_leased_run_id = current_leased_run_id
-        self.liveness_probe = liveness_probe or self._default_liveness
-        self.branch_pruner = branch_pruner or (
-            lambda repo: git_prune.prune(repo=repo, fetch=False)
-        )
-        self.fetch_timeout = fetch_timeout
-        self.command_timeout = command_timeout
         self.lock_timeout = lock_timeout
         self.lease_seconds = lease_seconds
         self.max_attempts = max_attempts
-        if lease_seconds <= max(fetch_timeout, command_timeout) + 5:
-            raise ValueError("cleanup lease must outlive every bounded command")
 
-    def run_next(
-        self,
-        owner: str,
-        *,
-        shell_id: int | None = None,
-    ) -> CleanupExecutionReceipt:
-        claim = self.store.claim_next(
-            owner,
-            shell_id=shell_id,
-            lease_seconds=self.lease_seconds,
-        )
+    def run_next(self, owner: str) -> CleanupExecutionReceipt:
+        claim = self.store.claim_next(owner, lease_seconds=self.lease_seconds)
         if claim is None:
             return CleanupExecutionReceipt(None, None, "idle")
         return self.execute(claim)
@@ -1426,9 +1206,7 @@ class SprintCleanupExecutor:
         try:
             with self._repository_lock(claim):
                 self._validate_under_lock(claim)
-                if claim.target_kind == "artifact_dir":
-                    return self._delete_artifacts(claim)
-                return self._reset_worktree(claim)
+                return self._delete_artifacts(claim)
         except SprintCleanupWaiting as exc:
             changed = self.store.release_waiting(
                 claim,
@@ -1465,120 +1243,6 @@ class SprintCleanupExecutor:
                 claim.claim_generation,
                 attempts,
             )
-
-    def _reset_worktree(self, claim: CleanupClaim) -> CleanupExecutionReceipt:
-        repository = Path(claim.repository_root)
-        target = Path(claim.canonical_path)
-        try:
-            git_freshness._refresh_remote(
-                repository,
-                "origin",
-                "main",
-                self.fetch_timeout,
-            )
-        except (OSError, subprocess.TimeoutExpired, TimeoutError, ValueError) as exc:
-            raise SprintCleanupMutationError("fetch_failed", str(exc)) from exc
-        if not self.store.renew(claim, lease_seconds=self.lease_seconds):
-            return self._receipt(claim, "stale", "claim_superseded", None)
-
-        refreshed_main = self._git_stdout(
-            repository,
-            "rev-parse",
-            "--verify",
-            "origin/main",
-            code="refreshed_main_missing",
-            mutation=True,
-        )
-        before = self._git_evidence(target)
-        before["refreshed_main_sha"] = refreshed_main
-        if not self.store.record_before(claim, before):
-            return self._receipt(claim, "stale", "claim_superseded", None)
-
-        # Fetch and evidence capture both take time. Re-read every authority and
-        # ownership fact immediately before the first destructive Git command.
-        self._validate_under_lock(claim)
-        self._renew_or_stale(claim)
-        attempt = self.store.begin_attempt(claim)
-        if attempt is None:
-            return self._receipt(claim, "stale", "claim_superseded", None)
-        self._git(target, "reset", "--hard", "HEAD", code="reset_current_failed")
-        self._renew_or_stale(claim)
-        self._git(target, "clean", "-ffd", code="clean_current_failed")
-        self._renew_or_stale(claim)
-        self._git(
-            target,
-            "checkout",
-            "--force",
-            str(claim.expected_base_branch),
-            code="base_checkout_failed",
-        )
-        self._renew_or_stale(claim)
-        self._git(
-            target,
-            "reset",
-            "--hard",
-            refreshed_main,
-            code="base_reset_failed",
-        )
-        self._renew_or_stale(claim)
-        self._git(target, "clean", "-ffd", code="clean_base_failed")
-        self._renew_or_stale(claim)
-        submodule_evidence = self._restore_submodules(target, claim)
-        self._renew_or_stale(claim)
-
-        try:
-            prune_result = self.branch_pruner(repository)
-        except Exception as exc:
-            raise SprintCleanupMutationError(
-                "branch_prune_failed",
-                f"proven-merged branch pruning failed: {exc}",
-            ) from exc
-        self._renew_or_stale(claim)
-        after = self._git_evidence(target)
-        final_main = self._git_stdout(
-            repository,
-            "rev-parse",
-            "--verify",
-            "origin/main",
-            code="final_main_unreadable",
-            mutation=True,
-        )
-        after.update(
-            {
-                "refreshed_main_sha": refreshed_main,
-                "final_origin_main_sha": final_main,
-                "prune_candidates": int(prune_result.get("candidates", 0)),
-                "prune_error": bool(prune_result.get("error")),
-                "pruned_branches": list(prune_result.get("deleted", []))[:25],
-                "prune_failures": list(prune_result.get("failed", []))[:25],
-                **submodule_evidence,
-            }
-        )
-        if after["branch"] != claim.expected_base_branch:
-            raise SprintCleanupMutationError(
-                "final_branch_mismatch",
-                "cleanup did not finish on the stored shell base",
-            )
-        if after["head"] != refreshed_main or final_main != refreshed_main:
-            raise SprintCleanupMutationError(
-                "final_head_mismatch",
-                "cleanup base does not equal refreshed origin/main",
-            )
-        if after["status_count"] != 0:
-            raise SprintCleanupMutationError(
-                "final_worktree_dirty",
-                "cleanup worktree is not clean after reset",
-            )
-        self._renew_or_stale(claim)
-        if not self.store.mark_succeeded(claim, after):
-            return self._receipt(claim, "stale", "claim_superseded", None)
-        return CleanupExecutionReceipt(
-            claim.cleanup_target_id,
-            claim.sprint_id,
-            "succeeded",
-            claim_generation=claim.claim_generation,
-            attempt_count=attempt,
-        )
 
     def _delete_artifacts(self, claim: CleanupClaim) -> CleanupExecutionReceipt:
         target = Path(claim.canonical_path)
@@ -1640,56 +1304,7 @@ class SprintCleanupExecutor:
                 "cleanup target no longer belongs to a completed Sprint",
             )
         self._validate_repository_identity(claim)
-        if claim.target_kind == "artifact_dir":
-            self._validate_artifact_identity(claim)
-            return
-        self._validate_worktree_identity(claim)
-        try:
-            liveness = self.liveness_probe(claim)
-        except Exception as exc:
-            raise SprintCleanupSafetyError(
-                "liveness_probe_failed",
-                f"target process liveness probe failed: {exc}",
-            ) from exc
-        if liveness == "live":
-            raise SprintCleanupWaiting(
-                "waiting_for_run_exit",
-                "a verified harness process or active conversation run holds the target",
-            )
-        if liveness != "dormant":
-            raise SprintCleanupSafetyError(
-                "liveness_indeterminate",
-                "target process liveness could not be proven dormant",
-            )
-        authority = self.con.execute(
-            "SELECT event_id FROM sprint_events WHERE sprint_id=? "
-            "AND event_type='lifecycle.completed' "
-            "ORDER BY event_id DESC LIMIT 1",
-            (claim.sprint_id,),
-        ).fetchone()
-        if authority is None:
-            raise SprintCleanupSafetyError(
-                "cleanup_authority_unverifiable",
-                "cleanup Sprint has no durable completion boundary",
-            )
-        subsequent = self.con.execute(
-            "SELECT sprint.sprint_id,usage.event_id FROM sprints sprint "
-            "JOIN sprint_participants participant "
-            "ON participant.sprint_id=sprint.sprint_id "
-            "JOIN sprint_events usage ON usage.sprint_id=sprint.sprint_id "
-            "AND usage.event_type IN ('lifecycle.armed','lifecycle.paused',"
-            "'lifecycle.completed','lifecycle.aborted') "
-            "WHERE participant.shell_id=? AND sprint.sprint_id<>? "
-            "AND sprint.lifecycle<>'prepared' AND usage.event_id>? "
-            "ORDER BY usage.event_id LIMIT 1",
-            (claim.shell_id, claim.sprint_id, authority["event_id"]),
-        ).fetchone()
-        if subsequent is not None:
-            raise SprintCleanupSafetyError(
-                "newer_sprint_owns_target",
-                f"Sprint {subsequent['sprint_id']} used the cleanup shell after "
-                "cleanup authority was created",
-            )
+        self._validate_artifact_identity(claim)
 
     def _validate_repository_identity(self, claim: CleanupClaim) -> None:
         repository = Path(claim.repository_root)
@@ -1718,79 +1333,6 @@ class SprintCleanupExecutor:
                 "stored repository root or Git common-directory identity changed",
             )
 
-    def _validate_worktree_identity(self, claim: CleanupClaim) -> None:
-        if claim.shell_id is None or claim.expected_base_branch is None:
-            raise SprintCleanupSafetyError(
-                "worktree_identity_invalid",
-                "worktree cleanup target lacks its stored shell identity",
-            )
-        shell = self.con.execute(
-            "SELECT shortname,flavor FROM shells WHERE shell_id=?",
-            (claim.shell_id,),
-        ).fetchone()
-        if shell is None or str(shell["flavor"] or "") == "admin":
-            raise SprintCleanupSafetyError(
-                "worktree_identity_invalid",
-                "stored shell is missing or resolves to the Admin checkout",
-            )
-        shortname = str(shell["shortname"] or "").strip()
-        expected = SprintCleanupTargetStore._lexical_absolute(
-            run.shell_work_dir(
-                shortname,
-                str(shell["flavor"] or ""),
-                root=Path(claim.repository_root),
-            )
-        )
-        target = Path(claim.canonical_path)
-        repository = Path(claim.repository_root)
-        expected_base = f"shell/{shortname.lower()}"
-        if (
-            claim.canonical_path != expected
-            or target.parent != repository / ".sc-worktrees"
-            or target.name != shortname.lower()
-            or claim.expected_base_branch != expected_base
-        ):
-            raise SprintCleanupSafetyError(
-                "managed_path_mismatch",
-                "stored worktree no longer equals the shell's exact managed path",
-            )
-        self._reject_symlink_components(target, repository)
-        if target == repository or self._is_relative_to(repository, target):
-            raise SprintCleanupSafetyError(
-                "main_checkout_targeted",
-                "cleanup target is the main checkout or one of its ancestors",
-            )
-        try:
-            top = git_freshness._canonical_root(target)
-            common = git_freshness._common_git_dir(target)
-        except (OSError, subprocess.TimeoutExpired, ValueError) as exc:
-            raise SprintCleanupSafetyError(
-                "worktree_identity_unreadable",
-                str(exc),
-            ) from exc
-        if top != target or common != Path(claim.git_common_dir):
-            raise SprintCleanupSafetyError(
-                "git_common_dir_mismatch",
-                "target is not the stored repository's exact registered worktree",
-            )
-        listed = self._git_stdout(
-            repository,
-            "worktree",
-            "list",
-            "--porcelain",
-            code="worktree_membership_unreadable",
-        )
-        worktrees = {
-            SprintCleanupTargetStore._lexical_absolute(Path(line[9:]))
-            for line in listed.splitlines()
-            if line.startswith("worktree ")
-        }
-        if claim.canonical_path not in worktrees:
-            raise SprintCleanupSafetyError(
-                "worktree_not_registered",
-                "stored target is absent from the repository worktree registry",
-            )
-
     def _validate_artifact_identity(self, claim: CleanupClaim) -> None:
         target = Path(claim.canonical_path)
         repository = Path(claim.repository_root)
@@ -1812,76 +1354,6 @@ class SprintCleanupExecutor:
                 "artifact_not_directory",
                 "exact Sprint artifact target exists but is not a directory",
             )
-        incomplete = self.con.execute(
-            "SELECT 1 FROM sprint_cleanup_targets WHERE sprint_id=? "
-            "AND target_kind='worktree' AND state<>'succeeded' LIMIT 1",
-            (claim.sprint_id,),
-        ).fetchone()
-        if incomplete is not None:
-            raise SprintCleanupWaiting(
-                "waiting_for_worktrees",
-                "artifact deletion waits for every worktree target to succeed",
-            )
-
-    def _default_liveness(self, claim: CleanupClaim) -> str:
-        if claim.shell_id is None:
-            return "dormant"
-        live_run_sql = (
-            "SELECT run.run_id FROM conversation_runs run "
-            "WHERE run.shell_id=? AND run.state IN ('leased','starting','running') "
-        )
-        live_run_params: list[int] = [claim.shell_id]
-        if self.current_leased_run_id is not None:
-            # Browser dispatch reserves this exact run before launcher
-            # preflight. Only that still-leased reservation is self-owned;
-            # every other live row, and this row after starting, still blocks.
-            live_run_sql += (
-                "AND NOT (run.run_id=? AND run.state='leased') "
-            )
-            live_run_params.append(self.current_leased_run_id)
-        live_run = self.con.execute(
-            live_run_sql + "LIMIT 1",
-            live_run_params,
-        ).fetchone()
-        if live_run is not None:
-            return "live"
-        active = active_chat_registry.get(self.con, claim.shell_id)
-        if active is not None and active.process_pid is not None:
-            if active_chat_registry.has_live_process(active):
-                return "live"
-            try:
-                os.kill(active.process_pid, 0)
-            except ProcessLookupError:
-                pass
-            except PermissionError:
-                return "indeterminate"
-            else:
-                # A live recycled pid does not inherit the stored identity.
-                pass
-        snapshot = shell_liveness.compute()
-        if not snapshot.get("supported"):
-            return "indeterminate"
-        snapshot_root = Path(str(snapshot.get("repo", {}).get("root", "")))
-        if not snapshot_root.is_absolute() or snapshot_root.resolve() != Path(
-            claim.repository_root
-        ):
-            return "indeterminate"
-        if snapshot.get("indeterminate"):
-            return "indeterminate"
-        shell = self.con.execute(
-            "SELECT shortname FROM shells WHERE shell_id=?",
-            (claim.shell_id,),
-        ).fetchone()
-        if shell is None:
-            return "indeterminate"
-        shortname = str(shell["shortname"] or "").lower()
-        active_names = {
-            str(value).lower() for value in snapshot.get("active_other_shells", [])
-        }
-        claimed_names = {
-            str(value).lower() for value in snapshot.get("claimed_pids", {})
-        }
-        return "live" if shortname in active_names | claimed_names else "dormant"
 
     @contextmanager
     def _repository_lock(self, claim: CleanupClaim) -> Iterator[None]:
@@ -1917,380 +1389,12 @@ class SprintCleanupExecutor:
             finally:
                 flock(handle.fileno(), LOCK_UN)
 
-    def _restore_submodules(
-        self, target: Path, claim: CleanupClaim
-    ) -> dict[str, Any]:
-        cleared: list[str] = []
-        seen_mounts: set[Path] = set()
-        declaration_count = 0
-
-        def restore_level(parent: Path, depth: int) -> None:
-            nonlocal declaration_count
-            direct = self._direct_submodules(parent, target)
-            if direct and depth >= 16:
-                raise SprintCleanupSafetyError(
-                    "submodule_traversal_limit",
-                    f"submodule depth limit exceeded at {parent.relative_to(target) or '.'}",
-                )
-            if declaration_count + len(direct) > 256:
-                raise SprintCleanupSafetyError(
-                    "submodule_traversal_limit",
-                    "submodule declaration limit exceeded",
-                )
-            declaration_count += len(direct)
-
-            for child in direct:
-                identity = child.mount.absolute()
-                if identity in seen_mounts:
-                    raise SprintCleanupSafetyError(
-                        "submodule_traversal_limit",
-                        f"repeated submodule mount: {child.mount.relative_to(target)}",
-                    )
-                seen_mounts.add(identity)
-
-            # Determine every removal candidate before deleting any sibling.
-            obstructed: list[DirectSubmodule] = []
-            for child in direct:
-                if child.initialized or not child.mount.exists():
-                    continue
-                if self._is_exact_git_worktree(child.mount):
-                    raise SprintCleanupSafetyError(
-                        "submodule_mount_invalid",
-                        f"uninitialized mount is an actual Git worktree: {child.mount.relative_to(target)}",
-                    )
-                if child.mount.is_dir() and not any(child.mount.iterdir()):
-                    continue
-                obstructed.append(child)
-
-            for child in obstructed:
-                self._renew_or_stale(claim)
-                try:
-                    if child.mount.is_dir():
-                        shutil.rmtree(child.mount)
-                    else:
-                        child.mount.unlink()
-                except OSError as exc:
-                    error_name = exc.strerror or type(exc).__name__
-                    error_number = f" errno={exc.errno}" if exc.errno is not None else ""
-                    raise SprintCleanupMutationError(
-                        "submodule_mount_remove_failed",
-                        f"could not clear submodule mount "
-                        f"{child.mount.relative_to(target)}:{error_number} {error_name}",
-                    ) from exc
-                cleared.append(child.mount.relative_to(target).as_posix())
-                self._renew_or_stale(claim)
-
-            if not direct:
-                return
-            paths = [child.declared_path for child in direct]
-            self._renew_or_stale(claim)
-            self._git(
-                parent,
-                "--literal-pathspecs",
-                "submodule",
-                "sync",
-                "--",
-                *paths,
-                code="submodule_sync_failed",
-            )
-            self._renew_or_stale(claim)
-            self._git(
-                parent,
-                "--literal-pathspecs",
-                "submodule",
-                "update",
-                "--init",
-                "--force",
-                "--",
-                *paths,
-                code="submodule_update_failed",
-                timeout=max(self.command_timeout, self.fetch_timeout),
-            )
-            self._renew_or_stale(claim)
-
-            for child in direct:
-                if not self._is_exact_git_worktree(child.mount):
-                    raise SprintCleanupSafetyError(
-                        "submodule_mount_invalid",
-                        f"initialized submodule identity mismatch: {child.mount.relative_to(target)}",
-                    )
-                self._git(
-                    child.mount,
-                    "reset",
-                    "--hard",
-                    "HEAD",
-                    code="submodule_reset_failed",
-                )
-                self._renew_or_stale(claim)
-                self._git(
-                    child.mount, "clean", "-ffd", code="submodule_clean_failed"
-                )
-                self._renew_or_stale(claim)
-                restore_level(child.mount, depth + 1)
-
-        restore_level(target, 0)
-        return {
-            "cleared_submodule_mount_count": len(cleared),
-            "cleared_submodule_mounts": cleared[:25],
-            "cleared_submodule_mounts_truncated": len(cleared) > 25,
-        }
-
-    def _direct_submodules(self, parent: Path, root: Path) -> list[DirectSubmodule]:
-        config = parent / ".gitmodules"
-        if not config.is_file():
-            return []
-        output = self._git_stdout(
-            parent,
-            "config",
-            "-z",
-            "--file",
-            ".gitmodules",
-            "--get-regexp",
-            r"^submodule\..*\.path$",
-            code="submodule_config_failed",
-            allowed=(0, 1),
-        )
-        records = output.split("\0") if output else []
-        if records and records[-1] == "":
-            records.pop()
-        declarations: list[tuple[str, str]] = []
-        names: set[str] = set()
-        paths: set[str] = set()
-        for record in records:
-            if "\n" not in record:
-                raise SprintCleanupSafetyError(
-                    "submodule_config_failed", "malformed NUL-delimited submodule declaration"
-                )
-            key, declared = record.split("\n", 1)
-            if not key.startswith("submodule.") or not key.endswith(".path"):
-                raise SprintCleanupSafetyError(
-                    "submodule_config_failed", "malformed submodule declaration key"
-                )
-            name = key[len("submodule.") : -len(".path")]
-            pure = PurePosixPath(declared)
-            invalid = (
-                not name
-                or not declared
-                or declared == "."
-                or pure.is_absolute()
-                or str(pure) != declared
-                or any(part in ("", ".", "..") for part in pure.parts)
-                or name in names
-                or declared in paths
-            )
-            if invalid:
-                raise SprintCleanupSafetyError(
-                    "submodule_mount_invalid",
-                    f"invalid submodule declaration: {declared or '<empty>'}",
-                )
-            names.add(name)
-            paths.add(declared)
-            declarations.append((name, declared))
-
-        direct: list[DirectSubmodule] = []
-        for name, declared in declarations:
-            mount = parent.joinpath(*PurePosixPath(declared).parts)
-            try:
-                mount.absolute().relative_to(root.absolute())
-            except ValueError as exc:
-                raise SprintCleanupSafetyError(
-                    "submodule_mount_invalid",
-                    f"submodule mount escapes worktree: {declared}",
-                ) from exc
-            self._reject_submodule_symlinks(mount, root)
-            index = self._git_stdout(
-                parent,
-                "--literal-pathspecs",
-                "ls-files",
-                "--stage",
-                "-z",
-                "--",
-                declared,
-                code="submodule_mount_invalid",
-            )
-            expected_suffix = f"\t{declared}\0"
-            entries = [entry for entry in index.split("\0") if entry]
-            if len(entries) != 1 or not entries[0].startswith("160000 ") or not (
-                entries[0] + "\0"
-            ).endswith(expected_suffix):
-                raise SprintCleanupSafetyError(
-                    "submodule_mount_invalid",
-                    f"submodule index entry mismatch: {declared}",
-                )
-            status = self._git_stdout(
-                parent,
-                "--literal-pathspecs",
-                "-c",
-                "core.quotePath=false",
-                "submodule",
-                "status",
-                "--",
-                declared,
-                code="submodule_mount_invalid",
-            )
-            lines = status.splitlines()
-            if len(lines) != 1 or not lines[0] or lines[0][0] not in "-+ U":
-                raise SprintCleanupSafetyError(
-                    "submodule_mount_invalid",
-                    f"submodule status malformed: {declared}",
-                )
-            rest = lines[0][1:].split(" ", 1)
-            if len(rest) != 2 or not (
-                rest[1] == declared or rest[1].startswith(f"{declared} (")
-            ):
-                raise SprintCleanupSafetyError(
-                    "submodule_mount_invalid",
-                    f"submodule status path mismatch: {declared}",
-                )
-            direct.append(DirectSubmodule(name, declared, mount, lines[0][0] != "-"))
-        return direct
-
-    def _is_exact_git_worktree(self, mount: Path) -> bool:
-        if not mount.is_dir():
-            return False
-        try:
-            result = self._run_git(mount, "rev-parse", "--show-toplevel")
-        except SprintCleanupMutationError as exc:
-            raise SprintCleanupSafetyError(
-                "submodule_worktree_probe_failed", exc.detail
-            ) from exc
-        if result.returncode != 0:
-            raise SprintCleanupSafetyError(
-                "submodule_worktree_probe_failed",
-                f"could not classify existing submodule mount: {mount.name}",
-            )
-        try:
-            actual = Path(result.stdout.strip()).resolve(strict=True)
-            expected = mount.resolve(strict=True)
-        except (OSError, RuntimeError) as exc:
-            raise SprintCleanupSafetyError(
-                "submodule_worktree_probe_failed",
-                f"could not resolve existing submodule mount: {mount.name}",
-            ) from exc
-        return actual == expected
-
-    @staticmethod
-    def _reject_submodule_symlinks(mount: Path, root: Path) -> None:
-        current = mount
-        while current != root:
-            if current.is_symlink():
-                raise SprintCleanupSafetyError(
-                    "submodule_mount_invalid",
-                    f"submodule mount has a symlink component: {mount.relative_to(root)}",
-                )
-            if current.exists() and not current.is_dir() and current != mount:
-                raise SprintCleanupSafetyError(
-                    "submodule_mount_invalid",
-                    f"submodule mount parent is not a directory: {mount.relative_to(root)}",
-                )
-            current = current.parent
-        if current != root:
-            raise SprintCleanupSafetyError(
-                "submodule_mount_invalid", "submodule mount escaped worktree"
-            )
-
-    def _git_evidence(self, repo: Path) -> dict[str, Any]:
-        branch_result = self._run_git(
-            repo, "symbolic-ref", "--quiet", "--short", "HEAD"
-        )
-        branch = branch_result.stdout.strip() if branch_result.returncode == 0 else None
-        head = self._git_stdout(
-            repo,
-            "rev-parse",
-            "--verify",
-            "HEAD",
-            code="head_unreadable",
-            mutation=True,
-        )
-        status = self._git_stdout(
-            repo,
-            "status",
-            "--porcelain=v1",
-            "--untracked-files=all",
-            code="status_unreadable",
-            mutation=True,
-        ).splitlines()
-        return {
-            "branch": branch,
-            "head": head,
-            "status_count": len(status),
-            "status_sample": [line[:300] for line in status[:25]],
-            "status_sample_truncated": len(status) > 25,
-        }
-
-    def _git(
-        self,
-        repo: Path,
-        *args: str,
-        code: str,
-        timeout: int | None = None,
-    ) -> subprocess.CompletedProcess[str]:
-        result = self._run_git(repo, *args, timeout=timeout)
-        if result.returncode != 0:
-            raise SprintCleanupMutationError(code, self._git_detail(result))
-        return result
-
-    def _git_stdout(
-        self,
-        repo: Path,
-        *args: str,
-        code: str,
-        allowed: tuple[int, ...] = (0,),
-        mutation: bool = False,
-    ) -> str:
-        try:
-            result = self._run_git(repo, *args)
-        except SprintCleanupMutationError as exc:
-            if mutation:
-                raise
-            raise SprintCleanupSafetyError(code, exc.detail) from exc
-        if result.returncode not in allowed:
-            error_type = (
-                SprintCleanupMutationError if mutation else SprintCleanupSafetyError
-            )
-            raise error_type(code, self._git_detail(result))
-        return result.stdout.rstrip("\n")
-
-    @staticmethod
-    def _git_detail(result: subprocess.CompletedProcess[str]) -> str:
-        detail = result.stderr if result.stderr.strip() else result.stdout
-        detail = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", detail)
-        detail = detail.replace("\r\n", "\n").replace("\r", "\n").strip()
-        if not detail:
-            return "Git command failed without detail"
-        if len(detail) <= 2000:
-            return detail
-        marker = "\n...[truncated]...\n"
-        remaining = 2000 - len(marker)
-        head = remaining // 2
-        return detail[:head] + marker + detail[-(remaining - head) :]
-
     def _renew_or_stale(self, claim: CleanupClaim) -> None:
         if not self.store.renew(claim, lease_seconds=self.lease_seconds):
             raise SprintCleanupSafetyError(
                 "claim_superseded",
                 "cleanup claim expired or lost its generation before mutation",
             )
-
-    def _run_git(
-        self,
-        repo: Path,
-        *args: str,
-        timeout: int | None = None,
-    ) -> subprocess.CompletedProcess[str]:
-        try:
-            return subprocess.run(
-                ["git", "-C", str(repo), *args],
-                capture_output=True,
-                text=True,
-                timeout=timeout or self.command_timeout,
-                check=False,
-            )
-        except (OSError, subprocess.TimeoutExpired) as exc:
-            raise SprintCleanupMutationError(
-                "git_command_unavailable",
-                str(exc),
-            ) from exc
 
     @staticmethod
     def _reject_symlink_components(path: Path, floor: Path) -> None:
@@ -2309,14 +1413,6 @@ class SprintCleanupExecutor:
                     "cleanup target is outside the stored repository",
                 )
             current = current.parent
-
-    @staticmethod
-    def _is_relative_to(path: Path, other: Path) -> bool:
-        try:
-            path.relative_to(other)
-        except ValueError:
-            return False
-        return True
 
     @staticmethod
     def _bounded_entry_count(path: Path, limit: int = 10000) -> tuple[int, bool]:

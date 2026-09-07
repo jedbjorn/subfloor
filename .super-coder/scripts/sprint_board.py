@@ -69,7 +69,6 @@ _EVENT_FIELDS = {
             "aggregate_state",
             "artifact_target_ids",
             "target_count",
-            "worktree_target_ids",
         }
     ),
     "sprint.cleanup_adopted": frozenset(
