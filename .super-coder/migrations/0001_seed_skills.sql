@@ -1532,6 +1532,11 @@ artifacts, interrupt intent, judgment, and evidence:
 sc sprint pause --sprint <id> --reason <decision-or-restructure-reason>
 ```
 
+Pause interrupts every live participant turn, and resume re-enters each
+interrupted participant automatically with one re-enter wake into their
+existing chat. Health is reporting-only: never send status-check messages on
+silence — read the board (`sc sprint show --sprint <id>`) instead.
+
 Resume only after recording recovery/restructure and reconciling native runs,
 unread messages, wakes, units, PRs, capacity, and spec drift:
 
@@ -1913,9 +1918,17 @@ Three literals name how a Sprint message reaches you:
 | `re-enter` | resumes the existing chat at its next boundary |
 
 Assignments, review requests, and verdicts arrive `force-new`; Planner-bound
-results, decisions, and PR facts arrive `re-enter`. You never choose a type,
-poll, boot a participant, or schedule a watcher; the engine delivers. Stop
-after a successful typed handoff and wait for the next wake.
+results, decisions, and PR facts arrive `re-enter`. One engine wake names its
+moment rather than a sender:
+
+| Wake | Meaning |
+|---|---|
+| resume re-enter | a pause interrupted your live turn; on resume the engine queues this `re-enter` notification into your chat — continue that lane from its current state, do not re-accept the assignment |
+
+You never choose a type, poll, boot a participant, or schedule a watcher; the
+engine delivers. Health is reporting-only: nobody — engine or Planner — pings
+a participant for silence; the board carries that signal. Stop after a
+successful typed handoff and wait for the next wake.
 
 ## Inbox, accept, decline
 

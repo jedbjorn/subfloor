@@ -38,6 +38,7 @@ RECONCILIATION = (
     ENGINE / "migrations" / "0257_guidance_reconciliation.sql",
     ENGINE / "migrations" / "0258_reseed_non_sprint_green_wake.sql",
     ENGINE / "migrations" / "0260_reseed_sprint_closeout_scope.sql",
+    ENGINE / "migrations" / "0262_reseed_sprint_resume_reentry.sql",
 )
 RETIRED = (
     "memory", "db_map", "bootstrap", "surface_catalogue", "messaging", "flags",
