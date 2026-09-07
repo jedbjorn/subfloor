@@ -24,6 +24,7 @@ MIGRATIONS = (
     ENGINE / "migrations" / "0257_guidance_reconciliation.sql",
     ENGINE / "migrations" / "0258_reseed_non_sprint_green_wake.sql",
     ENGINE / "migrations" / "0260_reseed_sprint_closeout_scope.sql",
+    ENGINE / "migrations" / "0261_dev_long_job_guidance.sql",
 )
 sys.path.insert(0, str(ENGINE / "scripts"))
 
@@ -32,6 +33,7 @@ import seed_skills
 POLICY_HEADING = "## TESTING POSTURE"
 FULL_SUITE_BOUNDARY = "do not run the repository-wide suite locally merely to duplicate"
 SHARED_HOST_BOUNDARY = "Never start a competing repository-wide suite on a shared host."
+LONG_JOB_BOUNDARY = "Use the engine's `./sc job` tools to watch checks"
 
 
 class FocusedDeveloperVerificationSourceTest(unittest.TestCase):
@@ -51,6 +53,8 @@ class FocusedDeveloperVerificationSourceTest(unittest.TestCase):
         self.assertIn("incomplete code is a failure", focus)
         self.assertIn("no trustworthy seat remains", focus)
         self.assertIn("browser-capability skip is informational and non-failing", focus)
+        self.assertIn(LONG_JOB_BOUNDARY, focus)
+        self.assertIn("Do not set up independent watchers.", focus)
         self.assertIn(FULL_SUITE_BOUNDARY, focus)
         self.assertIn(SHARED_HOST_BOUNDARY, focus)
 
