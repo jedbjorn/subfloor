@@ -58,7 +58,7 @@ class SprintCliDispatcherTest(unittest.TestCase):
         self.assertIn("watcher-state", completed.stdout)
         self.assertIn("reconcile-pr", completed.stdout)
 
-    def test_worktree_sprint_help_lists_cleanup_recovery_commands(self):
+    def test_sprint_help_lists_cleanup_recovery_commands(self):
         completed = subprocess.run(
             [sys.executable, str(ENGINE / "scripts" / "sprint.py"), "--help"],
             cwd=ROOT,
@@ -131,7 +131,7 @@ class SprintCliDispatcherTest(unittest.TestCase):
                         "cleanup_request_id": 7,
                         "created": True,
                         "action": "adopted_legacy",
-                        "target_ids": [1, 2],
+                        "target_ids": [1],
                     },
                 ),
             ) as api,
