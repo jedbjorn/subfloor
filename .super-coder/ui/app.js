@@ -1860,9 +1860,15 @@ function flagRow(f, features) {
 }
 
 // ── Scripts ─────────────────────────────────────────────────────────────────────
-async function renderScripts(root) {
+async function renderScripts(view) {
   const { scripts } = await api("/scripts");
-  root.replaceChildren();
+  view.replaceChildren();
+  // Two columns: the script + configuration cards, and the Services panel
+  // beside them (host brokers + the Postgres sidecar as toggles).
+  const root = el("div", { className: "scripts-main" });
+  const services = el("aside", { className: "services-panel" });
+  view.append(el("div", { className: "scripts-layout" }, root, services));
+  renderServicesPanel(services);
   root.append(el("div", { className: "muted" },
     "Run a maintenance script. Output appears below it. Per-instance DB edits → Save locally to refresh the ignored snapshot and flat renders."));
 
@@ -1936,6 +1942,110 @@ async function renderScripts(root) {
     c.append(run, out);
     root.append(c);
   }
+}
+
+// ── Services panel ────────────────────────────────────────────────────────────
+// Each row is one host-side service (a broker or the Postgres sidecar) with a
+// running toggle, and for brokers a "survive reboot" toggle (systemd --user
+// unit). Switching ON an unconfigured service shows its onboarding instead of
+// running anything; every action's output lands under the row.
+function serviceStateText(s, hostLifecycle) {
+  if (!s.configured) return "not configured";
+  if (s.running === null) return hostLifecycle ? "state unknown" : "state unknown (host only)";
+  if (!s.running) return s.persistent ? "stopped · systemd unit enabled" : "stopped";
+  return s.supervisor === "systemd" ? "running · systemd" : "running";
+}
+
+function switchEl(checked, onChange, opts = {}) {
+  const input = el("input", { type: "checkbox", checked, disabled: !!opts.disabled });
+  if (opts.title) input.title = opts.title;
+  input.onchange = () => onChange(input);
+  return el("label", { className: "switch" + (opts.small ? " small" : "") }, input, el("span", { className: "slider" }));
+}
+
+async function renderServicesPanel(aside) {
+  aside.replaceChildren(el("h2", {}, "Services"), el("div", { className: "muted" }, "loading…"));
+  let data;
+  try { data = await api("/services"); }
+  catch (e) { aside.replaceChildren(el("h2", {}, "Services"), el("div", { className: "muted" }, e.message)); return; }
+  const hostLifecycle = !!data.host_lifecycle;
+  aside.replaceChildren(el("h2", {}, "Services"));
+  aside.append(el("div", { className: "muted" },
+    hostLifecycle
+      ? "Host-side brokers and the Postgres sidecar. Switch one on to start it; a service with no configuration shows its setup steps instead."
+      : "Status only: this GUI runs in the sandbox, so start and stop each service on the host with the command shown."));
+  for (const s of data.services) aside.append(serviceRow(s, hostLifecycle));
+  const refresh = el("button", { className: "act", textContent: "refresh" });
+  refresh.onclick = () => renderServicesPanel(aside);
+  aside.append(refresh);
+}
+
+function serviceRow(s, hostLifecycle) {
+  const row = el("div", { className: "service-row" });
+  const state = el("div", { className: "service-state muted" });
+  const out = el("pre", { className: "doc-body service-out", hidden: true });
+  const onboarding = el("div", { className: "service-onboarding", hidden: true });
+  let runInput, persistInput;
+
+  // Re-apply a fresh status row in place, so the action's output stays visible.
+  const apply = (fresh) => {
+    s = fresh;
+    state.textContent = serviceStateText(s, hostLifecycle);
+    const systemdOwned = !!s.running && s.supervisor === "systemd";
+    runInput.checked = !!s.running;
+    runInput.disabled = !hostLifecycle || systemdOwned;
+    runInput.title = !hostLifecycle ? `on the host: ${s.host_command}`
+      : systemdOwned ? "managed by systemd — turn off \"survive reboot\" to stop it" : (s.running ? "stop" : "start");
+    if (persistInput) persistInput.checked = !!s.persistent;
+    if (s.configured) onboarding.hidden = true;
+  };
+
+  const act = async (action, body) => {
+    setStatus(`${s.name}: ${action}…`);
+    row.classList.add("busy");
+    try {
+      const r = await fetch(`/api/services/${s.key}/${action}`, {
+        method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body || {}) });
+      const data = await r.json();
+      out.hidden = false; out.textContent = data.output || "(done)";
+      setStatus(data.ok ? `${s.name} ${action} ✓` : `${s.name} ${action} failed`);
+      if (data.service) apply(data.service); else apply(s);
+    } catch (e) { out.hidden = false; out.textContent = "error: " + e.message; apply(s); }
+    finally { row.classList.remove("busy"); }
+  };
+
+  const showOnboarding = () => {
+    onboarding.replaceChildren(el("div", {}, s.onboarding));
+    if (s.key === "vm") {
+      const b = el("button", { className: "act primary", textContent: "configure…" });
+      b.onclick = openWinVmModal; onboarding.append(b);
+    }
+    if (s.key === "pg") {
+      const b = el("button", { className: "act primary", textContent: "enable & start" });
+      b.onclick = () => act("up", { init: true }); onboarding.append(b);
+    }
+    onboarding.hidden = false;
+  };
+
+  const runToggle = switchEl(!!s.running, (input) => {
+    if (input.checked && !s.configured) { input.checked = false; showOnboarding(); return; }
+    if (!input.checked && s.key === "pg" && !confirm("Stop the Postgres sidecar? The container is removed; its data volume is kept.")) { input.checked = true; return; }
+    act(input.checked ? "up" : "down");
+  });
+  runInput = runToggle.querySelector("input");
+
+  row.append(el("div", { className: "service-head" }, el("span", { className: "service-name" }, s.name), runToggle));
+  row.append(el("div", { className: "muted service-desc" }, s.desc), state);
+  if (!hostLifecycle) row.append(el("code", { className: "service-cmd" }, s.host_command));
+  if (s.kind === "broker" && s.configured && s.persistent !== null) {
+    const persist = switchEl(!!s.persistent, (input) => act(input.checked ? "install" : "uninstall"),
+      { small: true, disabled: !hostLifecycle, title: "install / remove the systemd --user unit" });
+    persistInput = persist.querySelector("input");
+    row.append(el("label", { className: "service-persist muted" }, persist, " survive reboot"));
+  }
+  row.append(onboarding, out);
+  apply(s);
+  return row;
 }
 
 function browserStatusText(st) {

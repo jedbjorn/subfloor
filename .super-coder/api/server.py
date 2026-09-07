@@ -101,6 +101,7 @@ import vm as vm_mod  # noqa: E402  (Windows Test VM — config + live checks)
 import ts as ts_mod  # noqa: E402  (tailnet — config + live checks)
 import pm2 as pm2_mod  # noqa: E402  (host pm2 stack — config + live checks)
 import browser as browser_mod
+import services as services_mod  # noqa: E402  (Scripts-page service toggles)
 import web_search as web_search_mod  # noqa: E402  (Tavily — key store + client, doc #215)
 import task_context  # noqa: E402  (six-part task/work-unit projection, doc #187)
 sys.path.insert(0, str(ENGINE / "render"))
@@ -5232,6 +5233,11 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, get_analytics_quota(con))
             if path == "/api/scripts":
                 return self._send(200, {"scripts": script_list()})
+            if path == "/api/services":
+                # The Scripts page's Services panel: configured / running /
+                # persistent per broker + sidecar. Status reads work from the
+                # host and the sandbox alike (bind-mounted sockets).
+                return self._send(200, services_mod.list_services())
             if path == "/api/vm":
                 return self._send(200, {"vm": vm_mod.read()})
             if path == "/api/browser":
@@ -5402,6 +5408,23 @@ class Handler(BaseHTTPRequestHandler):
                     r = run_script(script_key)
                 if r is None:
                     return self._send(404, {"error": "no such script"})
+                return self._send(200 if r["ok"] else 500, r)
+            if path.startswith("/api/services/"):
+                # /api/services/<key>/<up|down|install|uninstall> — one fixed
+                # dispatcher verb per (key, action); the body may carry
+                # {"init": true} for the sidecar's enable-and-start. Refused in
+                # the sandbox with the host command (brokers are host processes).
+                parts = path.split("/")
+                if len(parts) != 5:
+                    return self._send(404, {"error": "not found"})
+                r = services_mod.run(parts[3], parts[4],
+                                     init=bool(self._body().get("init")))
+                if r is None:
+                    return self._send(404, {"error": "no such service or action"})
+                if r["code"] == "host_required":
+                    return self._send(503, r)
+                if r["code"] == "not_configured":
+                    return self._send(409, r)
                 return self._send(200 if r["ok"] else 500, r)
             if path.startswith("/api/vm/validate/"):
                 # Run ONE live check against the candidate config in the body, so
