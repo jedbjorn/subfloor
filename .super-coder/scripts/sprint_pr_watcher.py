@@ -1480,13 +1480,6 @@ class SprintPRWatcher:
                     "proven-merged local feature branch, and update current state."
                 ),
             }
-            if lifecycle == "completed":
-                instructions["merged"] = (
-                    "Your completed-Sprint PR was merged; do not manually reset "
-                    "the managed worktree. The successful-Sprint cleanup service "
-                    "owns that reset; use its status/retry authority through the "
-                    "originating Planner or FnB if needed."
-                )
         if state in instructions:
             head = pull_request.head_sha or "unknown"
             owner_shell_id = int(registered["owner_shell_id"])

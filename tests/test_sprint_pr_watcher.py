@@ -2215,7 +2215,7 @@ class OwnerMergedAndGreenWakeTest(SprintPRWatcherCase):
         )
         self.assertEqual(["red", "merged"], self._states())
 
-    def test_merged_in_completed_sprint_points_to_cleanup_service(self):
+    def test_merged_in_completed_sprint_uses_the_outside_sprint_text(self):
         self.register()
         self.con.execute(
             "UPDATE sprint_work_units SET disposition='completed',"
@@ -2241,10 +2241,10 @@ class OwnerMergedAndGreenWakeTest(SprintPRWatcherCase):
             + "a" * 40
             + ", event=merged, merge_sha="
             + "b" * 40
-            + ". Your completed-Sprint PR was merged; do not manually reset the "
-            "managed worktree. The successful-Sprint cleanup service owns that "
-            "reset; use its status/retry authority through the originating "
-            "Planner or FnB if needed.",
+            + ". Your PR was merged outside an active Sprint; verify the remote "
+            "merged fact, follow the git skill's after-merge cleanup on the exact "
+            "Active Session base, delete only the proven-merged local feature "
+            "branch, and update current state.",
             self._last_wake()["body"],
         )
 
