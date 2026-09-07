@@ -130,16 +130,6 @@ class CleanupRecoveryReceipt:
     projection: CleanupProjection
 
 
-@dataclass(frozen=True)
-class UnresolvedCleanupTarget:
-    cleanup_target_id: int
-    sprint_id: int
-    shell_id: int
-    state: str
-    path_label: str
-    last_safe_fact: str
-
-
 IdentityProvider = Callable[[], tuple[Path, Path]]
 Clock = Callable[[], datetime]
 CLEANUP_WAIT_RETRY_SECONDS = 5
@@ -281,47 +271,6 @@ class SprintCleanupTargetStore:
             running_count=counts["running"],
             succeeded_count=counts["succeeded"],
             failed_count=counts["failed"],
-        )
-
-    def unresolved_worktree(
-        self,
-        shell_ids: Iterable[int],
-    ) -> UnresolvedCleanupTarget | None:
-        """Return one unresolved completed-Sprint cleanup fencing shell reuse."""
-        # Removed at integration: sole caller deleted by lane A.
-        normalized = tuple(sorted({int(shell_id) for shell_id in shell_ids}))
-        if not normalized or not self._cleanup_table_exists():
-            return None
-        placeholders = ",".join("?" for _ in normalized)
-        row = self.con.execute(
-            "SELECT target.cleanup_target_id,target.sprint_id,target.shell_id,"
-            "target.state,target.waiting_reason,target.last_error_code,"
-            "shell.shortname FROM sprint_cleanup_targets target "
-            "JOIN shells shell ON shell.shell_id=target.shell_id "
-            "WHERE target.target_kind='worktree' "
-            "AND target.state<>'succeeded' "
-            f"AND target.shell_id IN ({placeholders})"
-            " ORDER BY target.created_at,target.cleanup_target_id LIMIT 1",
-            normalized,
-        ).fetchone()
-        if row is None:
-            return None
-        last_safe_fact = str(
-            row["last_error_code"]
-            or row["waiting_reason"]
-            or (
-                "cleanup_claim_active"
-                if row["state"] == "running"
-                else "cleanup_pending"
-            )
-        )
-        return UnresolvedCleanupTarget(
-            cleanup_target_id=int(row["cleanup_target_id"]),
-            sprint_id=int(row["sprint_id"]),
-            shell_id=int(row["shell_id"]),
-            state=str(row["state"]),
-            path_label=f".sc-worktrees/{str(row['shortname']).lower()}",
-            last_safe_fact=last_safe_fact,
         )
 
     def claim_next(
@@ -1175,8 +1124,6 @@ class SprintCleanupRecoveryStore:
             "succeeded_count": projection.succeeded_count,
             "failed_count": projection.failed_count,
         }
-
-
 
 
 class SprintCleanupExecutor:

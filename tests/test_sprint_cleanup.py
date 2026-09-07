@@ -1054,7 +1054,6 @@ class SprintCleanupRecoveryTest(SprintDomainCase):
             cleanup_store=mock.Mock(
                 prepare_targets=mock.Mock(return_value=()),
                 schedule_in_transaction=mock.Mock(return_value=None),
-                unresolved_worktree=mock.Mock(return_value=None),
             ),
         )
         lifecycle.arm(legacy_sprint, 3)

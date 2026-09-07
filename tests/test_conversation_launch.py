@@ -201,7 +201,6 @@ def test_preparer_returns_canonical_environment_and_archive(launch_case):
         "effort": "high",
         "headless_prompt": "Do the work",
         "conversation_owned": True,
-        "current_leased_run_id": 7,
         "boot": BootDirective(
             conversation_id="cv_" + "a" * 32,
             phase="start",
