@@ -1,17 +1,18 @@
 # adapters/codex — OpenAI Codex CLI
 
+**Posture: current adapter reference.** The adjacent [manifest](adapter.json)
+is authoritative for supported surfaces, compatibility bounds and launch flags.
+Historical live-probe versions below are evidence, not the current support pin.
+
+
 Codex reads the boot artifact (`AGENTS.md`) and project `AGENTS.md` conventions
 natively. The render chain also emits each shell's exact grants to Codex's
 native `.agents/skills/<name>/SKILL.md` tree while retaining the cross-harness
 `.claude/skills/<name>/SKILL.md` mirror. The adapter carries those skill targets,
 the launch command, and how Codex takes a model and sandbox flag.
 
-**Why it exists:** the *subscription* path for OpenAI models. Signing into Codex
-with a ChatGPT plan bills against that plan (flat, capped) instead of per-token
-OpenAI API metering — which is the only way to run OpenAI models without an API
-bill. (opencode can run OpenAI too, but only via a metered API key.) This makes
-codex the OpenAI sibling of the claude harness: first-party CLI, subscription
-billing. opencode stays as the universal metered catch-all.
+This adapter connects Subfloor to the codex CLI. Account entitlement and
+billing are provider-owned; they are not part of the adapter contract.
 
 `adapter.json` fields (the harness seam contract):
 

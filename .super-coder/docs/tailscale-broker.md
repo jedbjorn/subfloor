@@ -1,5 +1,12 @@
 # Tailnet broker
 
+**Posture: current operator runbook.** Applies to a fork with this optional
+host broker configured. Host setup and lifecycle belong to its authorized
+operator; Planner supplies fork-local shell guidance. Example names, ports and
+application tables below are illustrative and do not grant access to another
+fork. Exact CLI syntax remains in `sc help --all` and verb help.
+
+
 The host-side authority that lets a sandboxed shell drive the tailnet without
 ever holding a tailnet credential. Sibling of the [Windows VM
 broker](windows-vm-broker.md); same shape, different backend.
@@ -23,8 +30,7 @@ to give it that:
 2. **A host-side broker over a unix socket.** Chosen. `tailscaled` + the tailnet
    identity stay on the **host** (already `tailscale up`, authenticated once).
    The broker exposes verbs over a unix socket in the bind-mounted engine dir;
-   the container `curl`s the socket and holds nothing. This is exactly how
-   `windows_devkit` (skill) sits on `vm-broker` (engine dep): one host process
+   the container `curl`s the socket and holds nothing. As with the typed VM client using `vm-broker`: one host process
    holds the credential so nothing downstream needs it.
 
 The socket transport is filesystem-namespace, not network-namespace, so it works
@@ -99,7 +105,7 @@ curl -s --unix-socket "$SOCK" http://ts/status
 curl -s --unix-socket "$SOCK" http://ts/exec -d '{"host":"build-box","command":"uptime"}'
 ```
 
-## Deferred (not in v1)
+## Limits
 
 - **GUI wizard** for the `ts` link — the `GET/PUT /api/ts` + `POST
   /api/ts/validate/{check}` endpoints already make it settable + testable; hand-edit

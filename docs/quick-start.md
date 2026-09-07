@@ -1,151 +1,126 @@
 ---
-title: subfloor — Quick start
-tags: [substrate, shells, agentic-coding, harness-agnostic, sqlite]
-date: 2026-07-20
+title: Subfloor — Quick start
+tags: [substrate, onboarding, agentic-coding]
+date: 2026-09-07
 project: subfloor
-purpose: Install, first boot, the daily loop
+purpose: First installation through the first reviewed PR
 ---
 
-# subfloor — Quick start
+# Subfloor — Quick start
 
-[![Open in md-converter](https://img.shields.io/badge/Open%20in-md--converter-6b46c1?style=flat-square)](https://md-converter.designs-os.com/?url=https://github.com/jedbjorn/subfloor/blob/main/docs/quick-start.md)
+## Overview
 
-The guided tour — what subfloor is, getting it running, your first boot,
-and the daily rhythm. This page walks; the [full documentation](README.md)
-specifies. Every flag, table, and option lives there, and each section below
-points at the tab that carries it.
+This walkthrough takes you from an existing Git repository to a reviewed
+change. The [user guide](README.md) owns concepts and ongoing workflows;
+`sc help --all` and each verb's `--help` own exact command syntax.
 
-## What it is
+## Install from your host terminal
 
-A **forkable shell substrate for a single code repository.** You install it
-into a project repo; it brings the shell system — DB-backed identity, memory,
-decisions, flags, a roadmap, and spec/doc content — and runs that repo through
-whatever coding harness you point at it: Claude Code, OpenCode, Codex, Mistral
-Vibe, or Kimi Code.
+Use Arch Linux (including CachyOS) or Ubuntu LTS with Git, curl, Python 3.14.x
+and its `sqlite3` module. The default sandbox needs a reachable Docker daemon.
+For a supervised host process instead, replace `./sc install` below with
+`./sc install --runtime host`. On macOS or Windows, do this inside a Linux VM,
+preferably on guest-owned storage. `SC_PYTHON` can select an absolute Python path.
 
-The bet: **we build the data layer, we rent the harness.** The agent loop, the
-tools, the model API are the harness's job. subfloor owns who is working —
-identity, memory, and content that survive every session — and renders a boot
-artifact the harness reads natively.
+```bash
+cd your-repo
+git remote add -t main super-coder https://github.com/jedbjorn/subfloor.git
+git fetch super-coder
+git checkout super-coder/main -- .super-coder sc
+./sc install
+git add -A && git commit --no-verify -m "chore: install subfloor"
+```
 
-What that buys you in practice:
+The installer asks for your operator username, installs missing harness CLIs,
+and creates ten shells: two Planners, four Developers, two Reviewers, one
+Admin and one Cartographer. Six flavors are available; DevOps can be added when
+needed. Optional primary-shell customization is described by `./sc install --help`.
 
-- **A standing team, not a session.** Shells — a planner, devs, a reviewer, a
-  cartographer, an admin — are DB rows that persist, remember, and can boot on
-  a different harness tomorrow.
-- **Parallel work without clobbering.** Every shell gets its own git worktree;
-  a branch-guard keeps everyone off `main`; merging stays yours.
-- **A localhost Review GUI** for reading and steering it all — shells,
-  roadmap, flags, docs, analytics — including a **Chats** tab for durable
-  browser conversations and read-only Diff review.
-- **Durable handoffs** through shell messages and session-surviving jobs,
-  with generic headless launches when a bounded non-interactive run is useful.
+The bootstrap commit is an operator-owned default-branch exception: installation
+has already enabled the branch guard. Commit before creating shell worktrees.
+Your project remains tracked; the installed engine is a dependency, and private
+memory and generated context do not enter Git.
 
-> [!class2]
-> The full model — the harness-overlay design, the engine/fork boundary, the
-> repo layout: [*Architecture*](README.md#architecture).
+## Launch and sign in
 
-## Install
+Open a new terminal to load the installed `subfloor` shell function, then run:
 
-> [!class4]
-> **The bar: Linux, Python 3.14.x with `sqlite3`, a reachable docker daemon, and one signed-in harness CLI on PATH.**
-> Set `SC_PYTHON=/absolute/path/to/python3` to select a specific interpreter.
-> Arch Linux (including CachyOS) and Ubuntu LTS are the supported hosts.
-> On macOS or Windows, create a Linux VM and run this flow inside the guest.
-> No docker? `./sc install --runtime host` keeps the same lifecycle with a
-> supervised host process instead of a container.
-> The Linux prerequisites, guest-filesystem recommendation, docker modes, and
-> the host runtime: [*Install*](README.md#install).
+```bash
+subfloor launch
+```
 
-Four steps, from an existing git repo to a booted shell:
+Launch prints the local Review GUI URL; `subfloor url` recalls it. Under the
+sandbox runtime, launch builds the image and starts the container. Under the
+host runtime, it starts the supervised server process.
 
-1. **Pull the engine in.** Add `jedbjorn/subfloor` as a git remote and check
-   out `.super-coder` + `sc` — files only, no history merge. The copy-paste
-   block lives on the [landing README](../README.md) and in
-   [*Install*](README.md#install).
-2. **Bootstrap the fork.** `./sc install` checks requirements, installs the
-   harness CLIs, wires your `.gitignore`, builds the DB, and seeds your
-   starting team. Commit the bootstrap:
+Sign in once to your chosen harness **on the host**, using your account:
 
-   ```bash
-   git add -A && git commit --no-verify -m "chore: install subfloor"
-   ```
+| Harness | Sign-in entry |
+|---|---|
+| Claude Code | `claude` |
+| Codex | `codex login` |
+| OpenCode | `opencode auth login` |
+| Mistral Vibe | `vibe --setup` |
+| Kimi Code | `kimi login` |
 
-   What it does under the hood, and the flags to script it:
-   [*Install → Installer internals*](README.md#install).
-3. **Launch.** `subfloor launch` builds and starts the sandbox container and
-   Review GUI, published to `127.0.0.1` only. The `subfloor` command is the
-   shell function `./sc install` just wrote into `~/.bashrc` and
-   `~/.config/fish/functions/subfloor.fish` — open a new terminal, or
-   `source ~/.bashrc`, so it is defined.
-4. **Sign in and enter.** Each harness authenticates with your own
-   account — `claude`, `opencode auth login`, `codex login`, `vibe --setup`,
-   or `kimi login` — and the sandbox mounts the credentials in. Host, never
-   inside the sandbox. After signing in, `subfloor enter` enters a shell:
-   [*Install → Harness sign-in*](README.md#install).
+The sandbox uses the host's configured harness credentials. See
+[installation](README.md#install) if a CLI, account or Docker prerequisite
+is unavailable. Use `subfloor admin` from the host checkout for engine
+maintenance or guarded recovery.
 
-## First boot
+## Orient with the Cartographer
 
-`./sc enter` — pick a shell, pick a harness (the picker pre-selects each
-flavor's default model), and you're in a session, talking to your **planner**
-in your own repo.
+Run `subfloor enter`, select the Cartographer, then choose an available harness
+and model. The picker shows route support and supported Thinking levels where
+available. Ask it to orient and map the repository. The **Repo Map** tab displays
+the resulting catalogue; other shells can read it without becoming map owners.
 
-- **Or start a browser conversation.** The GUI's **Chats** tab lists every
-  shell; **New chat** on an available one opens a durable conversation with
-  queued turns, explicit Stop/Close controls, history, stars, and a read-only
-  Diff mode. Browser chat and CLI ownership are mutually exclusive for a shell:
-  [*Browser conversations*](README.md#browser-conversations).
-- **Open the Review GUI.** `./sc launch` printed its URL (`./sc url` reprints
-  it once the harness TUI has painted over the boot summary); the Shells tab
-  is the landing view — each shell's role, mandate, current state, and
-  identity. The other tabs, the roadmap views, and the token analytics:
-  [*Review GUI*](README.md#review-gui).
-- **Meet the team.** The installer seeded two planners (one is your primary),
-  four devs, two reviewers, the admin that owns `main`, and the cartographer
-  that owns the repo map. Each boots into its own worktree; how they share one
-  repo without collisions: [*Shells & worktrees*](README.md#shells--worktrees).
-- **First acts.** Let the cartographer map the repo on its first boot, then
-  tell the planner what you're building — it authors the roadmap and the
-  first spec.
-- **Models.** Which model each role defaults to and why, and when to prefer a
-  subscription plan over an API key:
-  [*Harnesses & models*](README.md#harnesses--models).
+Alternatively, use **Chats → New chat** for a shell and a supported browser
+route. Browser and terminal sessions cannot own the same shell at once. Close
+a browser conversation before entering that shell from the terminal.
 
-## The daily loop
+## Plan one bounded change
 
-The rhythm a fork settles into — you move between seats with
-`./sc enter-<shortname>` or open a separate browser conversation in **Chats**, and
-every step is owned by a flavor:
+Open a Planner session with `subfloor enter PLN1`, or select an available
+Planner in Chats. Describe one outcome and its constraints. Ask for a feature
+and specification with clear scope, prerequisites and acceptance criteria.
+Read it in the Roadmap and approve the work when the intended result is clear.
+For complex work, ask for an independent review of the specification first.
 
-1. The **cartographer** keeps the repo map fresh; working shells read it
-   instead of grepping blind.
-2. The **planner** specs the next feature against the roadmap.
-3. A **dev** breaks the spec into tasks, builds on a feature branch in its
-   own worktree, opens a PR — and stops.
-4. The **reviewer** — deliberately a different model lineage than the code —
-   reads the diff, files flags; dev patches until clean.
-5. **You merge.** Merging is the operator's gate, always.
-6. The spec freezes, the feature doc is written, the admin verifies the trees
-   are clean, the map re-runs — and the loop turns.
+## Build and review the first PR
 
-The step-by-step version, with each flavor's skills and GUI tab:
-[*The loop*](README.md#the-loop).
+1. Ask the Planner to send the approved assignment to a Developer. Enter that
+   shell, for example `subfloor enter DEV1`, and ask it to read its inbox.
+2. The Developer loads the exact task context, follows the spec ledger, and
+   builds on a feature branch in `.sc-worktrees/dev1`. Its `shell/dev1` branch
+   is a disposable base pinned to `origin/main`.
+3. The Developer runs the project's declared checks, pushes the branch, and
+   opens a PR. Ask a Reviewer to check the diff against the specification.
+4. Have the Developer address findings and repeat affected checks until the
+   review and required CI checks pass.
+5. Give an explicit merge directive naming that PR. Outside an armed Sprint,
+   green checks and a review alone do not authorize a shell to merge.
+6. Ask the Planner to freeze the shipped specification and write the feature
+   documentation. The Developer closes cleared flags; the team reconciles its
+   worktrees and the Cartographer refreshes the affected map.
 
-- **Hand work to another shell.** Use the shell inbox for a durable task/result
-  handoff, and use `./sc job` for a suite or build that must outlive the current
-  session: [*Messages, jobs & headless launch*](README.md#messages-jobs--headless-launch).
-- **The command surface.** Every `./sc` command and the `subfloor` command:
-  [*CLI & dev kit*](README.md#cli--dev-kit).
-- **Opt-in extras.** Optional Postgres, Windows VM, tailnet, PM2, and database
-  broker infrastructure; Planner captures fork procedure as a local skill:
-  [*Opt-in features*](README.md#opt-in-features).
-- **Staying current.** `./sc update` pulls the new engine and migrates the DB
-  in place, memory intact. Commit that protected-default-branch update with the
-  exact operator command:
+The [development loop](README.md#the-loop) explains the role boundaries. In
+Chats, you can return to history and send a message to reopen an eligible
+closed conversation. Route and ownership checks still apply.
 
-  ```bash
-  ./sc update
-  git add .sc-state/engine.ref sc && git commit --no-verify -m "chore: update subfloor"
-  ```
+## Move to Sprints
 
-  Full details: [*Update a fork*](README.md#update-a-fork).
+Once the manual handoff is familiar, ask the Planner to prepare a Sprint for
+work with independent lanes. It binds exact specs, groups tasks, assigns a
+Developer and Reviewer per lane, and checks routes and capacity. Review that
+plan and **arm** it when ready: arming records your merge grant for the Sprint's
+registered PRs. Each owning Developer still needs live green and approved
+merge authorization.
+
+Monitor the **Sprints** Board instead of manually relaying every handoff.
+Follow the [Sprints workflow](README.md#sprints) for pickup, review,
+pause/recovery, conformance and cleanup.
+
+For daily operation, use [browser conversations](README.md#browser-conversations),
+[the command route map](README.md#cli--dev-kit), and
+[maintenance and removal](README.md#update-a-fork).

@@ -32,7 +32,7 @@ Feature #28 package-manager distribution stays excluded, as Spec #219 requires.
 The frozen tree has no package recipes or native release artifacts establishing
 that installation path. A roadmap status alone cannot supply that evidence.
 
-## Capture baseline and blocker
+## Capture baseline
 
 The operator-authorized dos-app checkout was clean on `main` at
 `c5851784070ff92e0ae36ed093b80915cd3cf114`, retaining its existing install
@@ -57,26 +57,120 @@ The installer raised `instance_state.InstanceStateError` with permission
 denied. No state-root override or permission change was attempted.
 See [issue #1541](https://github.com/jedbjorn/subfloor/issues/1541).
 
-**Task #795 remains in progress and blocked on Admin provisioning.** The clone
-is a recoverable preparation artifact, not a successfully installed or clean
-capture baseline. Admin must complete the supported install from its authorized
-seat and supply a usable disposable capture environment. Local artifact
-locations are held in the control-plane handoff, not public image assets.
+Admin provisioned the same clone at the frozen engine ref on 2026-09-07
+(handoff #1807). Installation exited 0, applied 201 migrations, seeded the
+10-shell Demo roster, and completed snapshot/render. Admin corrected an ambient
+API-routing defect separately (flag #615); cross-checkout operations must not
+inherit another instance's API environment. Flag #614 is closed.
 
-VHS, ttyd, ffmpeg, Docker, Node and Python 3.14.7 are available. Authentication,
-browser capture dependencies, sanitized demonstration state, and a successful
-sandbox launch and harness boot remain unverified. Do not substitute simulated
-terminal output or the existing running fork's private data.
+The clean disposable Git baseline is
+`09da493` (`docs/capture-baseline`), preserving the original dos-app commit
+and pinning the capture engine. The original checkout and runtime remain
+untouched. Recovery bundle and installation logs are retained in the local
+handoff evidence directory. Sandbox launch and authenticated visual acceptance
+belong to the capture/verification tasks; they are not implied by installation.
+
+## Real capture acceptance
+
+Admin handoff #1811 cleared flag #616 by preparing harness scratch directories
+inside the disposable container, preserving the private-state masks. Engine
+follow-up #617 tracks provisioning those directories at launch. Do not recreate
+that container before completing this verification. The real terminal capture
+reaches Claude's Cartographer prompt. Its cross-session socket and image-owned
+auto-update warnings remain visible; neither prevented boot or the normal
+Planner conversation. No harness output was fabricated or hidden by image edits.
+
+Capture prerequisites: VHS, ttyd, ffmpeg, Docker, Python 3.14.7, and an isolated
+Playwright 1.54.0 environment with Chromium. The existing Claude authentication
+was used without account changes. The clone's origin uses the original dos-app
+HTTPS transport so normal sandbox GitHub capability resolution works.
+
+Through the live browser Chats API, Planner PLN1 created the demonstration
+work-stream Reading list, three features (Reading list in progress, Search saved
+books next, Reading reminders near term), spec #1 with two independent tasks,
+and prepared Sprint #1 with DEV1/REV1 and DEV2/REV2 lanes. The conversation is
+real model output using granted commands. All routes use Claude Harness default
+(model and effort null). No Sprint was armed, no participants were dispatched,
+and no project implementation or external PR was created. The shortname Demo
+and book-list content are intentional public fixtures.
+
+To reproduce after provisioning the dedicated clone:
+
+1. Open a Planner chat with Harness default. Ask it to create the work-stream
+   and three features above through normal commands, one spec and tasks named
+   “Save a book” and “Track reading progress”; prohibit project edits and
+   external messages. Use the returned IDs.
+2. Ask it to prepare those two lanes with the assignments above and record the
+   merge grant, but explicitly prohibit arming, dispatch, PRs and merges.
+3. From this source checkout run `vhs docs/demo.tape`. The tape deliberately
+   enters `/tmp/subfloor-docs-f73-dos-app`, selects Demo, Cartographer and Claude.
+4. Run `python maintainer/capture_public_docs.py --port 8824 --output <gallery>`
+   using the isolated Playwright interpreter. The helper verifies the fixture's
+   health identity, waits for real page content, and expands the Board feature.
+5. Review the gallery and terminal frames before copying the five browser PNGs
+   into `docs/images`. Never substitute another running fork's private data.
+
+Accepted assets on 2026-09-07: the 1100×1000 terminal GIF (468 frames) and CLI
+picker; real Roadmap Board/Flow, Worktrees, Chats and Sprints PNGs at 1440-pixel
+width. Visual review confirmed legible content, no credentials or personal
+paths, a populated Board with spec/tasks, clean worktrees, and an explicitly
+prepared Sprint. Flow intentionally has no dependency edges. The guide captions
+now describe these actual states. Capture gallery reports five routes, zero
+failures. The original dos-app checkout and runtime remain preserved.
+
+## Whole-set verification
+
+The focused documentation, fresh-install, Windows-skill and Sprint-removal
+checks passed: 28 tests and 470 subtests at `c1eccd1f`. The expanded legacy-wording
+scan passed all five documentation tests and 484 subtests, and the combined
+affected checks passed after integrating the operator's main merge: 28 tests
+and 518 subtests. That rerun caught two new tracked Sprint reference files
+(the screenshot and drift test), now explicitly added to the removal inventory. Lint
+passed for the capture helper and drift checks. Required full-suite CI remains
+the authoritative integration gate; it is not duplicated on the shared host.
+
+The hosted md-converter rendered all 12 guide tabs and seven quick-start tabs
+without JavaScript or Mermaid errors. Guide images loaded successfully using
+the candidate commit in place of `main` in image URLs for this preview; new
+public image URLs become available on main only after merge. A separate URL-
+loaded preview at `c1eccd1f` confirmed that relative document links resolve
+against the GitHub source and section links retain their fragments. Visual
+inspection covered the architecture, Sprints and GUI sections.
+
+`sc help --all` and worktree-local `install.py --help` were checked; host runtime
+is explicitly a supervised host process without Docker. The first source comparison matched the frozen fact owners. The operator then
+merged snapshot-routing fix #1543 into main (`b09cfaac`) and into this PR
+(`9c127814`); it changes runtime identity verification during serialization,
+not the documented state ownership or workflows. The capture stays pinned to
+its original exact ref.
+
+The disposable quick-start walk has proved install, launch, existing account
+authentication, terminal Cartographer boot, browser Planner specification/tasks,
+and prepared Sprint lanes. A separate documentation-only manual handoff uses fixture feature #4/spec
+#2/task #3, preserving the captured Reading list state. DEV3 opened
+[dos-app draft PR #74](https://github.com/jedbjorn/dos-app/pull/74) at
+`651badd0e7d917effab48d90bc2eac06fabfa42e`: one Markdown file, 26 additions,
+and an independent REV2 PASS with no merge blockers. GitHub reported the
+visual-QA job successful, but its run comment says capture was unconfigured and
+skipped; that is not validation evidence. The file content, diff scope, base,
+privacy scan and merge boundary were independently verified. The review lives
+in the disposable control plane rather than an external PR comment. The test
+PR was closed without merging; its pushed branch preserves the evidence.
+This is acceptance work after capture, not part of the screenshots.
+
+Claude reported failed tool completions after successful commands because its
+Bash epilogue could not write `/tmp/claude-<id>-cwd`. Returned control-plane
+rows and the remote PR establish the completed work independently. No write
+was retried or exit code masked. This remaining temp-boundary defect is
+tracked by SC-617 and [issue #1541](https://github.com/jedbjorn/subfloor/issues/1541#issuecomment-5567866010).
 
 ## Remaining delivery gates
 
-Tasks #796–#800 remain pending. Once preparation passes, correct the four core
-surfaces, then refresh workflows, audit all five adapter READMEs and the seven
-top-level engine runbooks, and capture the settled GUI inventory. Preserve the
-immutable checkpoints in `docs/deepseek-harness-removal.md` when labeling it.
+Tasks #795–#799 are complete: preparation, core corrections, workflow rewrite,
+runbook audit, and real visuals. The DeepSeek document retains its exact-ref
+checkpoints beneath a historical/Admin applicability label.
 
-The visuals must cover the CLI picker, Roadmap Board and Flow, Worktrees, Chats,
-and Sprints. Review actual assets at rendered size for privacy and legibility.
-Finish with command/link/anchor/fact drift checks, a quick-start sandbox walk,
-themed rendering, configured CI, independent documentation review, and a final
-link/render pass after review fixes. None of those gates is certified here.
+Task #800 must finish configured CI, independent documentation review
+(REV1 handoff #1814), and a final link/render pass after review fixes. The manual
+walk reached an independently reviewed PR; actual merge, shipped-spec freeze
+and application implementation were intentionally not performed in the fixture. The completed checks above do not certify those remaining gates.

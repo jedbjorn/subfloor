@@ -1,5 +1,10 @@
 # adapters/opencode — OpenCode
 
+**Posture: current adapter reference.** The adjacent [manifest](adapter.json)
+is authoritative for supported surfaces, compatibility bounds and launch flags.
+Historical live-probe versions below are evidence, not the current support pin.
+
+
 OpenCode reads `AGENTS.md` at the repo root and discovers Agent Skills from its
 native `.opencode/skills/<name>/SKILL.md` tree. The render chain emits each
 shell's exact grants there for OpenCode while retaining the
@@ -9,8 +14,8 @@ The adapter adds the harness-specific config file and launch command.
 - **`opencode.json`** (emitted to the repo root at launch, gitignored like the
   boot artifact) — points `instructions` at `AGENTS.md`, sets default tool
   permissions (edit allow / webfetch allow / bash ask), and leaves an `mcp` slot.
-  Edit this **template** (tracked) to change a fork's OpenCode config; the live
-  file is regenerated each launch. Model is intentionally unset — the harness is
+  Source maintainers edit this tracked template through a PR; installed forks
+  receive it through update. The live file is regenerated each launch. Model is intentionally unset — the harness is
   rented; pick it in OpenCode (`-m provider/model`) or add `"model"` here.
 - **`"lsp": true`** — enabled by default. OpenCode's own default is LSP *off*; we
   turn it on so the model gets language-server diagnostics as a feedback loop
@@ -60,13 +65,6 @@ The adapter adds the harness-specific config file and launch command.
   surfaces the reason to the model. The git pre-commit backstop
   (`.super-coder/hooks/pre-commit`) catches shell-driven writes that route around
   the tool path.
-
-## Verify on live OpenCode (research flags from the spec)
-
-- native `.opencode/skills/` discovery
-- session-storage paths (doc 404'd at research time)
-
-None block the contract; confirm during real-repo testing.
 
 ## Conversation capability
 

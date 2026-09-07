@@ -1,14 +1,22 @@
 # adapters/vibe — Mistral Vibe CLI
 
+**Posture: current adapter reference.** The adjacent [manifest](adapter.json)
+is authoritative for supported surfaces, compatibility bounds and launch flags.
+Historical live-probe versions below are evidence, not the current support pin.
+
+
 Vibe reads the boot artifact (`AGENTS.md`) and project `AGENTS.md` conventions
 natively — already emitted by the render chain — so the adapter only carries the
 launch command plus a trust flag and a sandbox approval flag.
 
-**Why it exists:** the Mistral-models sibling of the claude/codex harnesses —
-a first-party, open-source (Apache-2.0) CLI billed against a Mistral plan
-(Free / Pro $14.99 / Team) or a self-managed API key. Devstral / Mistral-Medium
-coding models. opencode stays the universal metered catch-all; vibe is the
-native Mistral path.
+This adapter connects Subfloor to the vibe CLI. Account entitlement and
+billing are provider-owned; they are not part of the adapter contract.
+
+## Supported surface
+
+The manifest advertises terminal support only: `one_shot`, `browser` and
+`sprint` are false. No controlled effort or conversation-resume contract is
+provided. Use the configured native model for terminal work.
 
 ## Branch guard — no in-line block (by harness limitation)
 

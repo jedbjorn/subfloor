@@ -1,5 +1,12 @@
 # pm2 broker
 
+**Posture: current operator runbook.** Applies to a fork with this optional
+host broker configured. Host setup and lifecycle belong to its authorized
+operator; Planner supplies fork-local shell guidance. Example names, ports and
+application tables below are illustrative and do not grant access to another
+fork. Exact CLI syntax remains in `sc help --all` and verb help.
+
+
 The host-side authority that lets a sandboxed shell observe + manage the host's
 pm2-supervised app stack without holding any host access. Third sibling of the
 [Windows VM broker](windows-vm-broker.md) and the
@@ -27,8 +34,7 @@ stale code. Two ways to give it that:
 2. **A host-side broker over a unix socket.** Chosen. pm2 and the app stay on
    the **host**; the broker exposes whitelisted verbs over a unix socket in the
    bind-mounted engine dir; the container `curl`s the socket and holds nothing.
-   Exactly how `windows_devkit` sits on `vm-broker` and `tailscale` on
-   `ts-broker`: one host process holds the capability so nothing downstream
+   As with VM and tailnet clients using their host brokers: one host process holds the capability so nothing downstream
    needs it.
 
 The socket transport is filesystem-namespace, not network-namespace, so it works
@@ -117,13 +123,13 @@ curl -s --unix-socket "$SOCK" http://pm2/status
 curl -s --unix-socket "$SOCK" http://pm2/restart -d '{"proc":"myapp-api"}'
 ```
 
-## Deferred (not in v1)
+## Limits
 
 - **GUI wizard** for the `pm2` link — the `GET/PUT /api/pm2` + `POST
   /api/pm2/validate/{check}` endpoints already make it settable + testable;
   hand-edit the block for now (like the tailnet).
 - **`sc pm2 <verb>` CLI passthrough** — the skill curls the socket directly,
-  matching how `windows_devkit`/`tailscale` consume their brokers; a passthrough
+  matching how configured fork-local clients consume their brokers; a passthrough
   would be a second client for the same verbs.
 - **`delete` / ecosystem edits** — supervision topology stays host-side.
 - **Log streaming/follow** — verbs return; tails are capped. Re-poll instead.
