@@ -50,12 +50,13 @@ def _model_label(raw: "str | None", log) -> tuple:
     return mid, m.get("providerID")
 
 
-def sweep(repo_root, since_epoch, log, cache=None) -> list[dict]:
-    if not DB.exists():
+def sweep(repo_root, since_epoch, log, cache=None, *, source=None) -> list[dict]:
+    db = Path(source) if source is not None else DB
+    if not db.exists():
         return []
     rows: list[dict] = []
     try:
-        con = sqlite3.connect(f"file:{DB}?mode=ro", uri=True)
+        con = sqlite3.connect(db.resolve().as_uri() + "?mode=ro", uri=True)
         con.row_factory = sqlite3.Row
     except sqlite3.Error as e:
         log(f"opencode: cannot open {DB}: {e}")

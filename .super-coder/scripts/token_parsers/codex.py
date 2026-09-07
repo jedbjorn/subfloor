@@ -87,11 +87,12 @@ def _parse_file(path: Path, log, repo_root) -> "dict | None":
             "started_at": norm_iso(ts_first), "ended_at": norm_iso(ts_last)}
 
 
-def sweep(repo_root, since_epoch, log, cache=None) -> list[dict]:
-    if not DATA_DIR.is_dir():
+def sweep(repo_root, since_epoch, log, cache=None, *, source=None) -> list[dict]:
+    data_dir = Path(source) if source is not None else DATA_DIR
+    if not data_dir.is_dir():
         return []
     rows: list[dict] = []
-    for path in sorted(DATA_DIR.glob("*/*/*/rollout-*.jsonl")):
+    for path in sorted(data_dir.glob("*/*/*/rollout-*.jsonl")):
         last = since_epoch(str(path))
         if last is not None and path.stat().st_mtime <= last:
             continue

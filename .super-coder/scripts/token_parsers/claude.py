@@ -185,15 +185,16 @@ def _file_state(path: Path, fstate: dict, log) -> "dict | None":
     return state
 
 
-def sweep(repo_root, since_epoch, log, cache=None) -> list[dict]:
-    if not DATA_DIR.is_dir():
+def sweep(repo_root, since_epoch, log, cache=None, *, source=None) -> list[dict]:
+    data_dir = Path(source) if source is not None else DATA_DIR
+    if not data_dir.is_dir():
         return []
     cache = cache if isinstance(cache, dict) else {}
     fstate = cache.get("files") if isinstance(cache.get("files"), dict) else {}
     prefix = _encode(str(repo_root))
     rows: list[dict] = []
     alive: set[str] = set()
-    for proj in sorted(DATA_DIR.iterdir()):
+    for proj in sorted(data_dir.iterdir()):
         if not (proj.is_dir() and proj.name.startswith(prefix)):
             continue
         files = sorted(proj.rglob("*.jsonl"), key=lambda p: p.stat().st_mtime)
