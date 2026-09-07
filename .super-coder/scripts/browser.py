@@ -247,7 +247,9 @@ def profile_checks(config: dict) -> dict:
     # The host operator chooses this root; validate confines the profile name
     # to one component. These probes intentionally inspect that chosen profile.
     result = {
+        # codeql[py/path-injection]
         "profile": path.is_dir(),
+        # codeql[py/path-injection]
         "extension": (path / "Extensions" / EXTENSION_ID).is_dir(),
     }
     try:
@@ -271,6 +273,7 @@ def link(value: dict, *, save: bool = True) -> dict:
     # Host-operator setup accepts an arbitrary Chromium installation/profile
     # root. The API gates shell credentials and cross-origin requests before
     # this function. Never use it for paths supplied by MCP tools.
+    # codeql[py/path-injection]
     state = json.loads((directory / "Local State").read_text())
     display = value.get("profile_name", "Subfloor")
     if display != "Subfloor":
@@ -283,6 +286,7 @@ def link(value: dict, *, save: bool = True) -> dict:
     if len(matches) != 1:
         raise ValueError("create exactly one Chromium profile named Subfloor first")
     allocation = ports.ensure_browser_ports()
+    # codeql[py/path-injection]
     if not executable.is_file() or not os.access(executable, os.X_OK):
         raise ValueError("set the absolute path to the native Chromium executable")
     config = validate(
