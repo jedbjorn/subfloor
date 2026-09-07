@@ -412,15 +412,17 @@ class SprintBoardApiCase(unittest.TestCase):
                 "git_common_dir,expected_base_branch,state,last_error_code) "
                 "VALUES (?,?,?,?,?,?,?,?,?)",
                 (
+                    # A legacy worktree row from an older engine is inert: it
+                    # never reaches the browser projection.
                     (
                         self.ids["sprint_id"], 3, "worktree",
                         "/repo/.sc-worktrees/dev1", "/repo", "/repo/.git",
-                        "shell/dev1", "failed", "fixture_failed",
+                        "shell/dev1", "pending", None,
                     ),
                     (
                         self.ids["sprint_id"], None, "artifact_dir",
                         f"/repo/shared/sprints/sprint-{self.ids['sprint_id']}",
-                        "/repo", "/repo/.git", None, "pending", None,
+                        "/repo", "/repo/.git", None, "failed", "fixture_failed",
                     ),
                 ),
             )
@@ -430,7 +432,7 @@ class SprintBoardApiCase(unittest.TestCase):
         )
         self.assertEqual(200, status, board)
         self.assertEqual(
-            {"aggregate_state": "failed", "target_count": 2, "pending_count": 1,
+            {"aggregate_state": "failed", "target_count": 1, "pending_count": 0,
              "running_count": 0, "succeeded_count": 0, "failed_count": 1},
             board["cleanup"],
         )
@@ -457,19 +459,20 @@ class SprintBoardApiCase(unittest.TestCase):
             )
             con.execute(
                 "INSERT INTO sprint_cleanup_targets "
-                "(sprint_id,shell_id,target_kind,canonical_path,repository_root,"
-                "git_common_dir,expected_base_branch,state,attempt_count,"
+                "(sprint_id,target_kind,canonical_path,repository_root,"
+                "git_common_dir,state,attempt_count,"
                 "last_error_code,last_error_detail,before_evidence) "
-                "VALUES (?,3,'worktree','/repo/.sc-worktrees/dev1','/repo',"
-                "'/repo/.git','shell/dev1','failed',3,'fixture_failed',"
+                "VALUES (?,'artifact_dir',?,'/repo',"
+                "'/repo/.git','failed',3,'fixture_failed',"
                 "'bounded detail',?)",
                 (
                     self.ids["sprint_id"],
+                    f"/repo/shared/sprints/sprint-{self.ids['sprint_id']}",
                     json.dumps(
                         {
-                            "branch": "feat/disposable",
-                            "status_count": 1,
-                            "status_sample": ["?? private-name.txt"],
+                            "existed": True,
+                            "entry_count": 1,
+                            "private_sample": ["?? private-name.txt"],
                         }
                     ),
                 ),
@@ -482,7 +485,10 @@ class SprintBoardApiCase(unittest.TestCase):
         )
         self.assertEqual(200, status, body)
         self.assertEqual(("failed", 1), (body["aggregate_state"], body["target_count"]))
-        self.assertEqual(".sc-worktrees/dev1", body["targets"][0]["path_label"])
+        self.assertEqual(
+            f"shared/sprints/sprint-{self.ids['sprint_id']}",
+            body["targets"][0]["path_label"],
+        )
         self.assertNotIn("/repo", json.dumps(body))
         self.assertNotIn("private-name", json.dumps(body))
 
@@ -903,8 +909,7 @@ class SprintBoardApiCase(unittest.TestCase):
                 {
                     "aggregate_state": "pending",
                     "artifact_target_ids": [4],
-                    "target_count": 4,
-                    "worktree_target_ids": [1, 2, 3],
+                    "target_count": 1,
                     "secret": "hidden",
                 },
             ),
@@ -935,9 +940,9 @@ class SprintBoardApiCase(unittest.TestCase):
                     "attempt_count": 3,
                     "cleanup_target_id": 2,
                     "claim_generation": 4,
-                    "error_code": "fetch_failed",
-                    "path_label": ".sc-worktrees/dev1",
-                    "target_kind": "worktree",
+                    "error_code": "artifact_delete_failed",
+                    "path_label": "shared/sprints/sprint-1",
+                    "target_kind": "artifact_dir",
                     "secret": "hidden",
                 },
             ),

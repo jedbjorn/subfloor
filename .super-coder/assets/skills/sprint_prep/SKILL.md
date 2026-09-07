@@ -63,7 +63,6 @@ Refuse arming when any of these is true:
 - a dependency cycle exists;
 - a work unit lacks an assigned Developer or Reviewer;
 - participant routes or required capacity are unavailable;
-- a selected shell has an unresolved cleanup target from an earlier Sprint;
 - another Sprint is armed, or a selected shell already participates in an armed
   Sprint.
 
@@ -146,19 +145,9 @@ Sprint prepared while shaping the plan.
 Immediately before arming, select exactly one participating Reviewer as the
 whole-Sprint conformance owner. Then re-read the exact spec revision hashes,
 available QA/QC evidence, task coverage, participant routes and capacity,
-single-armed invariant, repository access, prior-Sprint cleanup state, and
-merge grant. Review evidence is summarized, never interpreted as authorization.
-
-If arming reports an unresolved cleanup target, inspect it once and act on its
-named recovery instead of manually changing that worktree:
-
-```text
-sc sprint cleanup-status --sprint <prior-sprint-id>
-sc sprint cleanup --sprint <prior-sprint-id> --key <stable-retry-key>
-```
-
-Only the originating Planner or FnB retries a failed scheduled cleanup. Only
-FnB may add `--adopt-legacy` for one completed Sprint that predates scheduling.
+single-armed invariant, repository access, and merge grant. Review evidence is
+summarized, never interpreted as authorization. A prior Sprint's cleanup never
+gates arming.
 
 ```text
 sc sprint arm --sprint <id> --conformance-reviewer-shell <shell-id>

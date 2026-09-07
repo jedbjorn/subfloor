@@ -54,12 +54,6 @@ PR already orphaned (base deleted under it) -> the head branch still holds the c
 
 Only after the PR is merged:
 
-A managed worktree whose Sprint is already `completed` is the exception: the
-Sprint cleanup service owns its reset after live turns exit. Do not race that
-service with manual Git cleanup. A pending or failed cleanup makes the slot
-unavailable until `sc sprint cleanup-status --sprint <id>` reports succeeded;
-the originating Planner or FnB uses the Sprint retry surface.
-
 1. Re-pin the base. In a worktree `git checkout main` fails (main is checked out at the repo root; git refuses a branch checked out elsewhere) -> `git checkout shell/<shortname> && git fetch origin && git reset --hard origin/main`. Admin at repo root: `git pull --ff-only` on main.
 2. `git branch -d <branch>`. Squash-merged -> `-d` refuses (commits aren't ancestors of main); confirm the PR shows *merged* on the remote -> `git branch -D <branch>`.
 3. `git fetch --prune`.

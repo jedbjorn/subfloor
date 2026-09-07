@@ -23,6 +23,7 @@ MIGRATIONS = (
     ENGINE / "migrations" / "0255_reseed_merge_gate_one_rule.sql",
     ENGINE / "migrations" / "0257_guidance_reconciliation.sql",
     ENGINE / "migrations" / "0258_reseed_non_sprint_green_wake.sql",
+    ENGINE / "migrations" / "0260_reseed_sprint_closeout_scope.sql",
 )
 sys.path.insert(0, str(ENGINE / "scripts"))
 

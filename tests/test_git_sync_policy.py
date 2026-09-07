@@ -15,6 +15,7 @@ ASSET = ENGINE / "assets" / "skills" / "git" / "SKILL.md"
 RESEED = ENGINE / "migrations" / "0252_reseed_universal_pr_owner_wakes.sql"
 LATER_RESEED = ENGINE / "migrations" / "0255_reseed_merge_gate_one_rule.sql"
 RECONCILIATION = ENGINE / "migrations" / "0257_guidance_reconciliation.sql"
+CLOSEOUT_SCOPE = ENGINE / "migrations" / "0260_reseed_sprint_closeout_scope.sql"
 
 sys.path.insert(0, str(ENGINE / "scripts"))
 import seed_skills  # noqa: E402
@@ -89,6 +90,11 @@ class GitSyncPolicyTest(unittest.TestCase):
             final = RECONCILIATION.read_text()
             con.executescript(final)
             con.executescript(final)
+            # 0260 re-owns it last, dropping the retired Sprint-cleanup
+            # exception; compare after the whole chain has replayed.
+            closeout = CLOSEOUT_SCOPE.read_text()
+            con.executescript(closeout)
+            con.executescript(closeout)
 
             parsed = seed_skills.parse_skill(ASSET)
             actual = con.execute(

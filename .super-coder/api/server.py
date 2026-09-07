@@ -2782,9 +2782,6 @@ class Handler(BaseHTTPRequestHandler):
         elif isinstance(exc, sprint_domain.SprintConflictError):
             status, code = 409, "lifecycle_conflict"
             details = exc.details
-        elif isinstance(exc, sprint_domain.SprintCleanupConflictError):
-            status, code = 409, "lifecycle_conflict"
-            details = exc.details
         elif isinstance(
             exc, (sprint_domain.SprintStateError, sprint_domain.SprintInvariantError)
         ):
@@ -2874,11 +2871,6 @@ class Handler(BaseHTTPRequestHandler):
         if isinstance(exc, sprint_domain.SprintAuthorityError):
             return self._send(403, {"error": str(exc)})
         if isinstance(exc, sprint_domain.SprintConflictError):
-            return self._send(
-                409,
-                {"error": str(exc), "details": exc.details},
-            )
-        if isinstance(exc, sprint_domain.SprintCleanupConflictError):
             return self._send(
                 409,
                 {"error": str(exc), "details": exc.details},

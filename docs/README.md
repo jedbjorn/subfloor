@@ -283,8 +283,8 @@ substituted. Vibe does not advertise Sprint support. Pre-Sprint QA/QC can be
 requested as evidence; it is not the arming authority.
 
 Preparation stays editable. Missing assignments, changed bound specs, task
-coverage gaps, dependency cycles, unavailable routes or unresolved earlier
-cleanup must be resolved before arming.
+coverage gaps, dependency cycles or unavailable routes must be resolved before
+arming.
 
 ### Arm and monitor the Board
 
@@ -323,13 +323,14 @@ launching replacement workers.
 The assigned conformance Reviewer compares the whole result with the bound
 specifications and records a final judgment. A clean conformance result closes
 the Sprint atomically. Follow-ups retain explicit dispositions and evidence.
-Cleanup then reconciles participant worktrees after live turns exit; a pending
-or failed cleanup means that slot is not ready for reuse.
+Closing also ends the Developer chats and deletes the artifact directory in the
+background; the Planner and every Reviewer keep their chats, and no worktree is
+reset. You only hear about cleanup again if that deletion fails.
 
 Use `sc sprint show`, `sc sprint watcher-state`, and
 `sc sprint cleanup-status` with their `--help` for focused inspection. The
 originating Planner or operator can use the supported cleanup retry surface.
-Abort, standalone completion and legacy cleanup adoption are recovery actions,
+Abort and standalone completion are recovery actions,
 not the normal successful close. See `sc sprint --help` for exact syntax and
 [the wake model](#wakes) for supervision and coordinate mode.
 

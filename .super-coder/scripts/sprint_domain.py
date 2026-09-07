@@ -110,33 +110,6 @@ class BoundRevisionUnavailable(SprintInvariantError):
         super().__init__("bound governing revision is unavailable for this legacy binding")
 
 
-class SprintCleanupConflictError(SprintInvariantError):
-    """An earlier successful Sprint still owns a participant worktree."""
-
-    def __init__(self, blocker: sprint_cleanup.UnresolvedCleanupTarget) -> None:
-        self.details = {
-            "code": "prior_cleanup_unresolved",
-            "prior_sprint_id": blocker.sprint_id,
-            "cleanup_target_id": blocker.cleanup_target_id,
-            "target_state": blocker.state,
-            "path_label": blocker.path_label,
-            "last_safe_fact": blocker.last_safe_fact,
-            "status_command": (
-                f"sc sprint cleanup-status --sprint {blocker.sprint_id}"
-            ),
-            "retry_command": (
-                f"sc sprint cleanup --sprint {blocker.sprint_id} "
-                "--key <stable-retry-key>"
-            ),
-        }
-        super().__init__(
-            f"prior Sprint {blocker.sprint_id} cleanup is {blocker.state} for "
-            f"{blocker.path_label} (last_safe_fact={blocker.last_safe_fact}); "
-            f"run `{self.details['status_command']}` and, after correcting a "
-            f"failure, `{self.details['retry_command']}`"
-        )
-
-
 @dataclass(frozen=True)
 class LifecycleActor:
     kind: str
@@ -825,7 +798,6 @@ class SprintLifecycleStore:
                 conformance_reviewer_shell_id,
                 allow_single_reviewer_default=True,
             )
-            self._require_prior_cleanup_resolved(sprint_id)
             current_fingerprint = self._participant_intent_fingerprint(sprint_id)
             if current_fingerprint != preflight.intent_fingerprint:
                 raise SprintInvariantError(
@@ -900,7 +872,6 @@ class SprintLifecycleStore:
             conformance_reviewer_shell_id,
             allow_single_reviewer_default=True,
         )
-        self._require_prior_cleanup_resolved(sprint_id)
         participants = self._participant_intent_rows(sprint_id)
         if not _route_binding_schema_available(self.con):
             try:
@@ -958,24 +929,6 @@ class SprintLifecycleStore:
         except AdapterError as exc:
             if exc.code != "HARNESS_VERSION_UNSUPPORTED":
                 raise SprintPreflightError(str(exc)) from exc
-
-    def _require_prior_cleanup_resolved(self, sprint_id: int) -> None:
-        shell_ids = [
-            int(row["shell_id"])
-            for row in self.con.execute(
-                "SELECT participant.shell_id FROM sprint_participants participant "
-                "JOIN shells shell ON shell.shell_id=participant.shell_id "
-                "WHERE participant.sprint_id=? "
-                "AND COALESCE(shell.flavor,'')<>'admin' "
-                "ORDER BY participant.shell_id",
-                (sprint_id,),
-            )
-        ]
-        blocker = self.cleanup_store.unresolved_worktree(
-            shell_ids,
-        )
-        if blocker is not None:
-            raise SprintCleanupConflictError(blocker)
 
     def _participant_intent_rows(self, sprint_id: int) -> list[sqlite3.Row]:
         return self.con.execute(
@@ -1224,10 +1177,7 @@ class SprintLifecycleStore:
             outcome=terminal_outcome,
         )
         closed_conversation_ids = (
-            self._close_completed_participant_chats_in_transaction(
-                sprint_id,
-                retained_reviewer_shell_id=reviewer_shell_id,
-            )
+            self._close_completed_participant_chats_in_transaction(sprint_id)
         )
         self.cleanup_store.schedule_in_transaction(sprint_id, cleanup_targets)
         self._event(
@@ -1318,7 +1268,6 @@ class SprintLifecycleStore:
                 )
             self._require_edge(current, "armed")
             self._authorize(sprint, "armed", actor)
-            self._require_prior_cleanup_resolved(sprint_id)
             selected_owner = self._resolve_resume_conformance_owner(
                 sprint,
                 conformance_reviewer_shell_id,
@@ -3543,12 +3492,31 @@ class SprintLifecycleStore:
             planner_participant_id=planner_participant_id,
         )
 
+    def linked_developer_chats_in_transaction(
+        self, sprint_id: int
+    ) -> list[sqlite3.Row]:
+        """Sprint-linked active chats owned only by Developer participants."""
+        return self.con.execute(
+            "SELECT DISTINCT participant.participant_id,participant.shell_id,"
+            "active.chat_id FROM sprint_participants participant "
+            "JOIN sprint_participant_conversations link "
+            "ON link.sprint_participant_id=participant.participant_id "
+            "JOIN active_shell_chats active "
+            "ON active.shell_id=participant.shell_id "
+            "AND active.chat_id=link.conversation_id "
+            "WHERE participant.sprint_id=? AND participant.role='developer' "
+            "AND participant.shell_id NOT IN ("
+            "SELECT shell_id FROM sprint_participants "
+            "WHERE sprint_id=? AND role<>'developer') "
+            "ORDER BY participant.participant_id",
+            (sprint_id, sprint_id),
+        ).fetchall()
+
     def _close_completed_participant_chats_in_transaction(
         self,
         sprint_id: int,
-        retained_reviewer_shell_id: int | None = None,
     ) -> tuple[str, ...]:
-        """Close active chats immutably linked to a successfully closed Sprint."""
+        """Close active chats of Developer participants in a closed Sprint."""
         if not self.con.in_transaction:
             raise RuntimeError("Sprint chat cleanup requires an active transaction")
         sprint = self.con.execute(
@@ -3568,52 +3536,17 @@ class SprintLifecycleStore:
                 "Sprint has no originating Planner participant"
             )
 
-        retained_shell_ids = {planner_shell_id}
-        if retained_reviewer_shell_id is not None:
-            reviewer = self.con.execute(
-                "SELECT 1 FROM sprint_participants WHERE sprint_id=? AND shell_id=? "
-                "AND role='reviewer'",
-                (sprint_id, retained_reviewer_shell_id),
-            ).fetchone()
-            if reviewer is None:
-                raise SprintAuthorityError(
-                    "retained report author must be a participating Reviewer"
-                )
-            retained_shell_ids.add(retained_reviewer_shell_id)
-        else:
-            final_report_authors = self.con.execute(
-                "SELECT DISTINCT report.author_shell_id FROM sprint_reports report "
-                "JOIN sprint_participants participant "
-                "ON participant.sprint_id=report.sprint_id "
-                "AND participant.shell_id=report.author_shell_id "
-                "AND participant.role='reviewer' "
-                "WHERE report.sprint_id=? AND report.report_kind='final' "
-                "ORDER BY report.author_shell_id",
+        retained = sorted(
+            int(row["shell_id"])
+            for row in self.con.execute(
+                "SELECT DISTINCT shell_id FROM sprint_participants "
+                "WHERE sprint_id=? AND role<>'developer'",
                 (sprint_id,),
-            ).fetchall()
-            if len(final_report_authors) == 1:
-                retained_shell_ids.add(
-                    int(final_report_authors[0]["author_shell_id"])
-                )
-
-        retained = sorted(retained_shell_ids)
-        linked_active_chats = self.con.execute(
-            "SELECT DISTINCT participant.participant_id,participant.shell_id,"
-            "active.chat_id FROM sprint_participants participant "
-            "JOIN sprint_participant_conversations link "
-            "ON link.sprint_participant_id=participant.participant_id "
-            "JOIN active_shell_chats active "
-            "ON active.shell_id=participant.shell_id "
-            "AND active.chat_id=link.conversation_id "
-            "WHERE participant.sprint_id=? "
-            "ORDER BY participant.participant_id",
-            (sprint_id,),
-        ).fetchall()
+            )
+        )
         closed_conversation_ids: list[str] = []
-        for linked in linked_active_chats:
+        for linked in self.linked_developer_chats_in_transaction(sprint_id):
             shell_id = int(linked["shell_id"])
-            if shell_id in retained_shell_ids:
-                continue
             expected_chat_id = str(linked["chat_id"])
             closed = active_chat_registry.close_for_displacement(
                 self.con,
