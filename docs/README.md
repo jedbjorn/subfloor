@@ -144,9 +144,9 @@ checks the daemon is reachable and points you here if not — it never does setu
   ./sc doctor                               # verify → "docker ✓ rootful"
   ```
 
-The commands are the five steps in the Quick start above — pull the engine in
-via git (no history merge; subfloor never touches your repo's own build
-files), `./sc install`, sign in, launch, commit.
+Follow the [Quick start](quick-start.md): fetch the engine without merging its
+history, install it, commit the bootstrap, launch, sign in, then enter a shell.
+Subfloor does not replace your project's build files.
 
 `./sc install` does the rest: checks requirements, **installs the harness CLIs**
 (`claude` + `opencode` + `codex` + `vibe` + `kimi`, via their official native installers — no
@@ -925,7 +925,11 @@ and ignored local flat renders. Generated artifacts are never committed or publi
 
 ![Review GUI, Roadmap tab — Board view: a feature expanded into its inline editor with title, status, summary, and spec-task checklist](https://raw.githubusercontent.com/jedbjorn/subfloor/main/docs/images/roadmap-tab.png)
 
-![Review GUI, Worktrees tab — live git-hygiene report: dirty worktrees, each branch ahead/behind its base, and prunable merged branches](https://raw.githubusercontent.com/jedbjorn/subfloor/main/docs/images/worktrees-tab.png)
+![Review GUI, Worktrees tab — live git-hygiene report for the clean demonstration checkout and its two shell worktrees](https://raw.githubusercontent.com/jedbjorn/subfloor/main/docs/images/worktrees-tab.png)
+
+![Review GUI, Chats tab — the real Planner conversation summarizing a prepared demonstration Sprint](https://raw.githubusercontent.com/jedbjorn/subfloor/main/docs/images/chats-tab.png)
+
+![Review GUI, Sprints tab — two independent demonstration lanes waiting in a prepared, unarmed Sprint](https://raw.githubusercontent.com/jedbjorn/subfloor/main/docs/images/sprints-tab.png)
 
 ### Roadmap views — Board & Flow
 
@@ -942,7 +946,7 @@ The Roadmap tab renders the same feature rows two ways, toggled top-centre:
   prerequisite must land before what it blocks. The graph is kept acyclic, so it
   reads cleanly stage by stage.
 
-![Review GUI, Roadmap tab — Flow view: features grouped by work-stream across the planning stages, with blocker dependencies wired between cards](https://raw.githubusercontent.com/jedbjorn/subfloor/main/docs/images/roadmap-flow.png)
+![Review GUI, Roadmap tab — Flow view: demonstration features grouped by work-stream across three planning stages](https://raw.githubusercontent.com/jedbjorn/subfloor/main/docs/images/roadmap-flow.png)
 
 > [!class2]
 > **Drive it from the shell, too.** `./sc mem roadmap project <feature_id> <work-stream>`

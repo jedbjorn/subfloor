@@ -896,7 +896,9 @@
         "Sprint skills and `sc sprint --help`.",
         "| Coordinate assignments and PRs | `sprint`, `pr`, `job`, `run` | [Sprints](#sprints), [messages and jobs](#messages-jobs--headless-launch) |",
         "> **UI** this IS the GUI \u2014 Chats \u00b7 Sprints \u00b7 Shells \u00b7 Roadmap \u00b7 Docs \u00b7 Flags \u00b7 Worktrees \u00b7 Map \u00b7 Analytics \u00b7 Scripts \u00b7 **Shells** reviewer (every shell reads it)",
-        "| **Sprints** | Preparation and orchestration views for coordinated Developer/Reviewer lanes, status, evidence and cleanup. |"
+        "| **Sprints** | Preparation and orchestration views for coordinated Developer/Reviewer lanes, status, evidence and cleanup. |",
+        "![Review GUI, Chats tab \u2014 the real Planner conversation summarizing a prepared demonstration Sprint](https://raw.githubusercontent.com/jedbjorn/subfloor/main/docs/images/chats-tab.png)",
+        "![Review GUI, Sprints tab \u2014 two independent demonstration lanes waiting in a prepared, unarmed Sprint](https://raw.githubusercontent.com/jedbjorn/subfloor/main/docs/images/sprints-tab.png)"
       ],
       "README.md": [
         "- **Sprints v2.** Have a Planner prepare independent work lanes, choose routes",

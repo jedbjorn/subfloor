@@ -1,6 +1,6 @@
 # Real terminal capture from the dedicated disposable dos-app installation.
 # Run from the Subfloor source checkout:
-# SC_DOCS_CAPTURE_REPO=/tmp/subfloor-docs-f73-dos-app vhs docs/demo.tape
+# vhs docs/demo.tape
 # Requires a running exact-ref sandbox, its fresh Demo roster, an available
 # CART1 shell, and existing Claude host authentication. See the capture record
 # in maintainer/public-documentation-refresh.md. Never simulate boot output.
@@ -14,7 +14,7 @@ Set Theme "Catppuccin Mocha"
 Set TypingSpeed 60ms
 
 Hide
-Type "source ~/.bashrc; cd \"${SC_DOCS_CAPTURE_REPO:?set the disposable capture checkout}\"; unset SC_API_BASE SC_API_TOKEN; export PS1='$ '; clear"
+Type "source ~/.bashrc; cd /tmp/subfloor-docs-f73-dos-app; unset SC_API_BASE SC_API_TOKEN; export PS1='$ '; clear"
 Enter
 Sleep 1s
 Show

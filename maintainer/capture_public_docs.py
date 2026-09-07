@@ -28,6 +28,10 @@ class DocumentationCapture(PlaywrightCapture):
             response = page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
             tab = url.split("#", 1)[1].split("-", 1)[0]
             page.locator(f'nav button[data-tab="{tab}"].active').wait_for(timeout=timeout_ms)
+            if tab == 'worktrees':
+                page.locator('.wt-summary').wait_for(timeout=timeout_ms)
+            elif url.endswith('#roadmap'):
+                page.locator('.feature-title').filter(has_text='Reading list').click()
             page.wait_for_timeout(settle_ms)
             output.parent.mkdir(parents=True, exist_ok=True)
             page.screenshot(path=str(output), full_page=True)

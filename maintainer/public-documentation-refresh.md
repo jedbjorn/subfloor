@@ -70,34 +70,61 @@ untouched. Recovery bundle and installation logs are retained in the local
 handoff evidence directory. Sandbox launch and authenticated visual acceptance
 belong to the capture/verification tasks; they are not implied by installation.
 
-VHS, ttyd, ffmpeg, Docker, Node and Python 3.14.7 are available. Browser capture
-dependencies, sanitized demonstration state and authenticated harness boot
-still require verification. Do not substitute simulated terminal output or the
-existing running fork's private data.
+## Real capture acceptance
+
+Admin handoff #1811 cleared flag #616 by preparing harness scratch directories
+inside the disposable container, preserving the private-state masks. Engine
+follow-up #617 tracks provisioning those directories at launch. Do not recreate
+that container before completing this verification. The real terminal capture
+reaches Claude's Cartographer prompt. Its cross-session socket and image-owned
+auto-update warnings remain visible; neither prevented boot or the normal
+Planner conversation. No harness output was fabricated or hidden by image edits.
+
+Capture prerequisites: VHS, ttyd, ffmpeg, Docker, Python 3.14.7, and an isolated
+Playwright 1.54.0 environment with Chromium. The existing Claude authentication
+was used without account changes. The clone's origin uses the original dos-app
+HTTPS transport so normal sandbox GitHub capability resolution works.
+
+Through the live browser Chats API, Planner PLN1 created the demonstration
+work-stream Reading list, three features (Reading list in progress, Search saved
+books next, Reading reminders near term), spec #1 with two independent tasks,
+and prepared Sprint #1 with DEV1/REV1 and DEV2/REV2 lanes. The conversation is
+real model output using granted commands. All routes use Claude Harness default
+(model and effort null). No Sprint was armed, no participants were dispatched,
+and no project implementation or external PR was created. The shortname Demo
+and book-list content are intentional public fixtures.
+
+To reproduce after provisioning the dedicated clone:
+
+1. Open a Planner chat with Harness default. Ask it to create the work-stream
+   and three features above through normal commands, one spec and tasks named
+   “Save a book” and “Track reading progress”; prohibit project edits and
+   external messages. Use the returned IDs.
+2. Ask it to prepare those two lanes with the assignments above and record the
+   merge grant, but explicitly prohibit arming, dispatch, PRs and merges.
+3. From this source checkout run `vhs docs/demo.tape`. The tape deliberately
+   enters `/tmp/subfloor-docs-f73-dos-app`, selects Demo, Cartographer and Claude.
+4. Run `python maintainer/capture_public_docs.py --port 8824 --output <gallery>`
+   using the isolated Playwright interpreter. The helper verifies the fixture's
+   health identity, waits for real page content, and expands the Board feature.
+5. Review the gallery and terminal frames before copying the five browser PNGs
+   into `docs/images`. Never substitute another running fork's private data.
+
+Accepted assets on 2026-09-07: the 1100×1000 terminal GIF (468 frames) and CLI
+picker; real Roadmap Board/Flow, Worktrees, Chats and Sprints PNGs at 1440-pixel
+width. Visual review confirmed legible content, no credentials or personal
+paths, a populated Board with spec/tasks, clean worktrees, and an explicitly
+prepared Sprint. Flow intentionally has no dependency edges. The guide captions
+now describe these actual states. Capture gallery reports five routes, zero
+failures. The original dos-app checkout and runtime remain preserved.
 
 ## Remaining delivery gates
 
-Tasks #795–#798 are complete: provisioned preparation, core correctness,
-public workflows, and the adapter/runbook audit. The DeepSeek removal document
-retains its exact-ref checkpoints beneath a historical/Admin applicability label.
+Tasks #795–#799 are complete: preparation, core corrections, workflow rewrite,
+runbook audit, and real visuals. The DeepSeek document retains its exact-ref
+checkpoints beneath a historical/Admin applicability label.
 
-Task #799 is in progress. Sandbox launch and health pass; all five harnesses
-are detected and Claude reports existing authentication. Real interactive boot
-reaches Claude but then fails creating its temporary directory under the
-restricted execution view. Admin handoff #1808 and flag #616 track that capture
-blocker. The independent clone's origin now uses the original dos-app HTTPS
-GitHub transport, and launch refreshed its GitHub capability boundary.
-
-`maintainer/capture_public_docs.py` uses the existing visual-QA gallery and
-Playwright session against the dedicated live instance. Its page-ready capture
-supports Chats' persistent SSE stream. Previews prove navigation/capture only;
-empty Roadmap/Sprint views are not accepted as the required seeded assets.
-The updated `docs/demo.tape` selects Demo, Cartographer #2 and Claude #1. Its
-old tracked GIF is deliberately retained until a successful real recording can
-replace it. Task #800 remains pending.
-
-The visuals must cover the CLI picker, Roadmap Board and Flow, Worktrees, Chats,
-and Sprints. Review actual assets at rendered size for privacy and legibility.
-Finish with command/link/anchor/fact drift checks, a quick-start sandbox walk,
-themed rendering, configured CI, independent documentation review, and a final
-link/render pass after review fixes. None of those gates is certified here.
+Task #800 must finish command/link/anchor/fact drift checks, the quick-start
+sandbox walk, themed rendering, configured CI, independent documentation review,
+and a final link/render pass after review fixes. Capture success does not certify
+those remaining gates.
