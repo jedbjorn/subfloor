@@ -37,6 +37,7 @@ SKILLS = {PROTOCOL: {"planner", "dev", "reviewer"}, **ROLE_SKILLS}
 RECONCILIATION = (
     ENGINE / "migrations" / "0257_guidance_reconciliation.sql",
     ENGINE / "migrations" / "0258_reseed_non_sprint_green_wake.sql",
+    ENGINE / "migrations" / "0260_reseed_sprint_closeout_scope.sql",
 )
 RETIRED = (
     "memory", "db_map", "bootstrap", "surface_catalogue", "messaging", "flags",

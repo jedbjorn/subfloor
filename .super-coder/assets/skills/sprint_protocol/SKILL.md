@@ -27,8 +27,9 @@ with one Developer and one Reviewer, ordered by dependencies and waves.
 verdict -> Developer merges under the Sprint grant once `authorize-merge`
 returns live green + approved -> the merged handoff wakes the Planner, who
 dispatches what became ready. After the last lane the conformance Reviewer
-records the whole-Sprint report; the engine closes the Sprint and cleans
-worktrees.
+records the whole-Sprint report; the engine closes the Sprint, closes the
+Developer chats, and deletes the Sprint artifact directory. Planner and
+Reviewer chats persist; no worktree is reset.
 
 ## Wake types
 

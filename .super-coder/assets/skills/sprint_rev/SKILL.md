@@ -181,11 +181,12 @@ sc sprint record-conformance \
 ```
 
 Require the receipt: conformance report id, final report id, follow-up ids,
-completed state, Planner message id, and Planner wake id. Require cleanup
-projection `pending`; cleanup runs after participant turns exit. Do not reset a
-worktree, poll cleanup, or wait before stopping. Do not manually close peer
-chats. Never reopen editing after recording; a re-enter defers reports until
-new scope is terminal and a fresh delivery-terminal wake arrives.
+completed state, Planner message id, and Planner wake id. Closing ends the
+Developer chats and schedules deletion of the Sprint artifact directory; your
+chat persists and no worktree is reset. Do not poll cleanup, wait before
+stopping, or manually close peer chats. Never reopen editing after recording;
+a re-enter defers reports until new scope is terminal and a fresh
+delivery-terminal wake arrives.
 
 ## Stop
 
@@ -196,8 +197,8 @@ For closeout, first re-run `sc sprint inbox --sprint <id>`, handle + `accept`
 new messages, then confirm every artifact/body is final and below 8,000.
 
 - Clean conclude -> run the atomic `record-conformance` command above as the
-  literal final action. When it confirms completed state, pending cleanup, and
-  all receipt identities, stop immediately; the Planner is notified.
+  literal final action. When it confirms completed state and all receipt
+  identities, stop immediately; the Planner is notified.
 - Re-enter/abort -> as literal final action send the Sprint-level `decision`
   to the Planner (relay form in `sprint_protocol`), require durable write +
   Planner wake, then stop immediately. Run no trailing command until another

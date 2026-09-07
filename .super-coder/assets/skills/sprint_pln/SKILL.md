@@ -218,11 +218,11 @@ informational receipt. On it, verify Sprint/reports/outcome/completed state.
 Do not run `complete`; do not author a second report; do not manually close
 peer chats.
 
-The initial completion receipt reports `cleanup_state=pending`: delivery is
-finished, but managed worktrees are not reusable yet. Stop for the engine-wide
-cleanup receipt; do not poll or manually reset participant trees. On
-`cleanup_state=succeeded`, treat the slots as reusable. On failure, inspect
-once and retry only after correcting the named condition:
+The completion receipt is the only success wake: it names the Developer chats
+the engine closed and the artifact directory it deletes. Your chat and every
+Reviewer's persist; no worktree is reset. Do not poll cleanup or reset
+participant trees. A second wake arrives only if artifact deletion failed —
+inspect once and retry only after correcting the named condition:
 
 ```text
 sc sprint cleanup-status --sprint <id>
@@ -249,6 +249,6 @@ wake is the only normal next-wave dispatch trigger. On it:
 5. Require durable assignments + wakes, then stop. Run no trailing command.
    Empty dispatch remains final; investigate only on a later durable wake.
 
-On an initial clean completion receipt, verify the named Sprint is terminal and
-record `cleanup_state=pending`; run no close command. Stop until the
-engine-authored cleanup success or failure receipt arrives.
+On a clean completion receipt, verify the named Sprint is terminal and record
+the closed Developer chats; run no close command. Then stop — a cleanup wake
+arrives only if artifact deletion failed.

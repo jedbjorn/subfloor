@@ -627,12 +627,6 @@ PR already orphaned (base deleted under it) -> the head branch still holds the c
 
 Only after the PR is merged:
 
-A managed worktree whose Sprint is already `completed` is the exception: the
-Sprint cleanup service owns its reset after live turns exit. Do not race that
-service with manual Git cleanup. A pending or failed cleanup makes the slot
-unavailable until `sc sprint cleanup-status --sprint <id>` reports succeeded;
-the originating Planner or FnB uses the Sprint retry surface.
-
 1. Re-pin the base. In a worktree `git checkout main` fails (main is checked out at the repo root; git refuses a branch checked out elsewhere) -> `git checkout shell/<shortname> && git fetch origin && git reset --hard origin/main`. Admin at repo root: `git pull --ff-only` on main.
 2. `git branch -d <branch>`. Squash-merged -> `-d` refuses (commits aren''t ancestors of main); confirm the PR shows *merged* on the remote -> `git branch -D <branch>`.
 3. `git fetch --prune`.
@@ -1657,11 +1651,11 @@ informational receipt. On it, verify Sprint/reports/outcome/completed state.
 Do not run `complete`; do not author a second report; do not manually close
 peer chats.
 
-The initial completion receipt reports `cleanup_state=pending`: delivery is
-finished, but managed worktrees are not reusable yet. Stop for the engine-wide
-cleanup receipt; do not poll or manually reset participant trees. On
-`cleanup_state=succeeded`, treat the slots as reusable. On failure, inspect
-once and retry only after correcting the named condition:
+The completion receipt is the only success wake: it names the Developer chats
+the engine closed and the artifact directory it deletes. Your chat and every
+Reviewer''s persist; no worktree is reset. Do not poll cleanup or reset
+participant trees. A second wake arrives only if artifact deletion failed —
+inspect once and retry only after correcting the named condition:
 
 ```text
 sc sprint cleanup-status --sprint <id>
@@ -1688,9 +1682,9 @@ wake is the only normal next-wave dispatch trigger. On it:
 5. Require durable assignments + wakes, then stop. Run no trailing command.
    Empty dispatch remains final; investigate only on a later durable wake.
 
-On an initial clean completion receipt, verify the named Sprint is terminal and
-record `cleanup_state=pending`; run no close command. Stop until the
-engine-authored cleanup success or failure receipt arrives.',
+On a clean completion receipt, verify the named Sprint is terminal and record
+the closed Developer chats; run no close command. Then stop — a cleanup wake
+arrives only if artifact deletion failed.',
   0
 )
 ON CONFLICT(name) DO UPDATE SET
@@ -1762,7 +1756,6 @@ Refuse arming when any of these is true:
 - a dependency cycle exists;
 - a work unit lacks an assigned Developer or Reviewer;
 - participant routes or required capacity are unavailable;
-- a selected shell has an unresolved cleanup target from an earlier Sprint;
 - another Sprint is armed, or a selected shell already participates in an armed
   Sprint.
 
@@ -1845,19 +1838,9 @@ Sprint prepared while shaping the plan.
 Immediately before arming, select exactly one participating Reviewer as the
 whole-Sprint conformance owner. Then re-read the exact spec revision hashes,
 available QA/QC evidence, task coverage, participant routes and capacity,
-single-armed invariant, repository access, prior-Sprint cleanup state, and
-merge grant. Review evidence is summarized, never interpreted as authorization.
-
-If arming reports an unresolved cleanup target, inspect it once and act on its
-named recovery instead of manually changing that worktree:
-
-```text
-sc sprint cleanup-status --sprint <prior-sprint-id>
-sc sprint cleanup --sprint <prior-sprint-id> --key <stable-retry-key>
-```
-
-Only the originating Planner or FnB retries a failed scheduled cleanup. Only
-FnB may add `--adopt-legacy` for one completed Sprint that predates scheduling.
+single-armed invariant, repository access, and merge grant. Review evidence is
+summarized, never interpreted as authorization. A prior Sprint''s cleanup never
+gates arming.
 
 ```text
 sc sprint arm --sprint <id> --conformance-reviewer-shell <shell-id>
@@ -1915,8 +1898,9 @@ with one Developer and one Reviewer, ordered by dependencies and waves.
 verdict -> Developer merges under the Sprint grant once `authorize-merge`
 returns live green + approved -> the merged handoff wakes the Planner, who
 dispatches what became ready. After the last lane the conformance Reviewer
-records the whole-Sprint report; the engine closes the Sprint and cleans
-worktrees.
+records the whole-Sprint report; the engine closes the Sprint, closes the
+Developer chats, and deletes the Sprint artifact directory. Planner and
+Reviewer chats persist; no worktree is reset.
 
 ## Wake types
 
@@ -2204,11 +2188,12 @@ sc sprint record-conformance \
 ```
 
 Require the receipt: conformance report id, final report id, follow-up ids,
-completed state, Planner message id, and Planner wake id. Require cleanup
-projection `pending`; cleanup runs after participant turns exit. Do not reset a
-worktree, poll cleanup, or wait before stopping. Do not manually close peer
-chats. Never reopen editing after recording; a re-enter defers reports until
-new scope is terminal and a fresh delivery-terminal wake arrives.
+completed state, Planner message id, and Planner wake id. Closing ends the
+Developer chats and schedules deletion of the Sprint artifact directory; your
+chat persists and no worktree is reset. Do not poll cleanup, wait before
+stopping, or manually close peer chats. Never reopen editing after recording;
+a re-enter defers reports until new scope is terminal and a fresh
+delivery-terminal wake arrives.
 
 ## Stop
 
@@ -2219,8 +2204,8 @@ For closeout, first re-run `sc sprint inbox --sprint <id>`, handle + `accept`
 new messages, then confirm every artifact/body is final and below 8,000.
 
 - Clean conclude -> run the atomic `record-conformance` command above as the
-  literal final action. When it confirms completed state, pending cleanup, and
-  all receipt identities, stop immediately; the Planner is notified.
+  literal final action. When it confirms completed state and all receipt
+  identities, stop immediately; the Planner is notified.
 - Re-enter/abort -> as literal final action send the Sprint-level `decision`
   to the Planner (relay form in `sprint_protocol`), require durable write +
   Planner wake, then stop immediately. Run no trailing command until another
