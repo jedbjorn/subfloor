@@ -50,22 +50,22 @@ REDLINES = frozenset((
 COMMON = ["tests_green", "scope_bounded", "commit_on_branch"]
 PRESETS: dict[str, dict[str, Any]] = {
     "T1": {
-        "text": "Move the {button_a} in {view_a} from {position_from} to {position_to}, and add a {button_b} beside it that {button_b_action}. Follow the house style. Run the tests and commit on a branch.",
+        "text": "Move the {button_a} in {view_a} from {position_from} to {position_to}, and add a {button_b} beside it that {button_b_action}. Follow the house style at {style_path}. Run the tests and commit on a branch.",
         "kinds": {"view_a": "ref", "button_a": "ref", "button_b": "new", "position_from": "text", "position_to": "text", "button_b_action": "text"},
         "redlines": ["style_trap", *COMMON],
     },
     "T2": {
-        "text": "Add a filter to {list_view} so a user can narrow the list by {filter_field}. The API must support the filter; the UI must use it. Follow the house style. Run the tests and commit on a branch.",
+        "text": "Add a filter to {list_view} so a user can narrow the list by {filter_field}. The API must support the filter; the UI must use it. Follow the house style at {style_path}. Run the tests and commit on a branch.",
         "kinds": {"list_view": "ref", "filter_field": "ref"},
         "redlines": ["endpoint_param", "endpoint_test_added", "ui_wired", "style_trap", *COMMON],
     },
     "T3": {
-        "text": "Add a {table_name} table with columns {columns}, the migration that creates it, and a read endpoint at {endpoint_path} that lists its rows. Add tests. Run the tests and commit on a branch.",
+        "text": "Add a {table_name} table with columns {columns}, the migration that creates it, and a read endpoint at {endpoint_path} that lists its rows. Follow the house style at {style_path}. Add tests. Run the tests and commit on a branch.",
         "kinds": {"table_name": "new", "endpoint_path": "new", "columns": "text"},
         "redlines": ["migration_present", "migration_applies", "endpoint_present", "endpoint_test_added", *COMMON],
     },
     "T4": {
-        "text": "Add a {table_name} table with columns {columns} and its migration, a read endpoint at {endpoint_path}, and a {view_b} view that lists the rows with a filter by {filter_field} and a {button_c} that {button_c_action}. Follow the house style. Add tests. Run the tests and commit on a branch.",
+        "text": "Add a {table_name} table with columns {columns} and its migration, a read endpoint at {endpoint_path}, and a {view_b} view that lists the rows with a filter by {filter_field} and a {button_c} that {button_c_action}. Follow the house style at {style_path}. Add tests. Run the tests and commit on a branch.",
         "kinds": {"table_name": "new", "endpoint_path": "new", "view_b": "new", "button_c": "new", "columns": "text", "filter_field": "text", "button_c_action": "text"},
         "redlines": sorted(REDLINES),
     },
@@ -324,36 +324,32 @@ def validate_recipes(config):
         argv(migrations["table_check_argv"])
 
 
-def freeze_style(config, base, runner, target):
-    style = object_keys(config["style"], ("kind", "source", "destination", "trap"), ("kind", "source"))
-    require(style["kind"] in ("skill", "doc", "file"), "unknown style kind")
-    source = style["source"]
-    if type(source) is int:
-        require(style["kind"] in ("doc", "skill") and source > 0, "numeric style source must be a document or skill id")
-        if style["kind"] == "doc":
-            payload = json.loads(runner.run([str(ROOT / "sc"), "mem", "get", "documents", "--doc", str(source), "--json"], cwd=ROOT).stdout)
-            content = payload["document"]["body"]
-        else:
-            # Admin's public read-only surface; never open the host DB here.
-            query = f"SELECT name,description,content FROM skills WHERE skill_id={source} AND is_deleted=0"
-            rows = json.loads(runner.run([str(ROOT / "sc"), "sql", "-json", query], cwd=ROOT).stdout)
-            require(isinstance(rows, list) and len(rows) == 1, "style skill id is unavailable")
-            row = rows[0]
-            content = f"---\nname: {row['name']}\ndescription: {row['description']}\n---\n\n{row['content']}\n"
+def freeze_style(config, base, snapshot, target):
+    style = object_keys(config["style"], ("kind", "source", "place_at", "trap"), ("kind", "source"))
+    require(style["kind"] in ("file", "repo"), "style kind must be file or repo")
+    source = line(style["source"], "style.source")
+    if style["kind"] == "repo":
+        require("place_at" not in style, "repo style does not accept place_at")
+        relative(source, "style.source")
+        style["source"] = str(PurePosixPath(source))
+        mode = snapshot.runner.git(snapshot.repo, "ls-tree", snapshot.sha, "--", style["source"]).stdout.split()
+        require(mode and mode[0] in ("100644", "100755"), "repo style must be a regular file at target.ref")
+        content = snapshot.read(style["source"])
+        style["path"] = style["source"]
     else:
-        path = Path(line(source, "style.source"))
+        require("place_at" in style, "file style needs place_at")
+        relative(style["place_at"], "style.place_at")
+        style["place_at"] = str(PurePosixPath(style["place_at"]))
+        require(style["place_at"] != ".", "style.place_at must name a file")
+        path = Path(source)
         if not path.is_absolute():
             path = (base / path).resolve()
             require(target is None or not inside(path, target), "relative style source is inside target")
             require(not inside(path, Path(config["copy"]["root"])), "relative style source is inside copy")
         content = path.read_text()
         style["source"] = str(path.resolve())
+        style["path"] = style["place_at"]
     require(isinstance(content, str) and 0 < len(content) <= 200000, "invalid style artifact")
-    if style["kind"] == "file":
-        require("destination" in style, "file style needs a declared destination")
-        relative(style["destination"], "style.destination")
-    else:
-        require("destination" not in style, "destination applies only to file style")
     if "trap" in style:
         trap = object_keys(style["trap"], ("forbidden", "required"), ("forbidden", "required"))
         for patterns in trap.values():
@@ -365,12 +361,11 @@ def freeze_style(config, base, runner, target):
                     raise BenchError("invalid trap regex") from exc
     style["content"] = content
     style["digest"] = digest(content)
-    if style["kind"] == "skill":
-        # Reuse the serving CLI's parser, not a second frontmatter grammar.
-        from skill import parse_local_skill_spec
-        style["name"] = parse_local_skill_spec(content)["name"]
-    else:
-        style["name"] = "bench_house_style"
+
+
+def path_allowed(path, patterns):
+    """Repo-root-relative glob matching, including zero-directory ** matches."""
+    return any(PurePosixPath(path).full_match(pattern) for pattern in patterns)
 
 
 def freeze_cards(config, snapshot):
@@ -397,8 +392,10 @@ def freeze_cards(config, snapshot):
                 fields.append(field)
         except ValueError as exc:
             raise BenchError("invalid slot syntax") from exc
-        require(isinstance(card["slots"], dict) and set(card["slots"]) == set(fields), "missing or unused slots")
-        values = {}
+        require(isinstance(card["slots"], dict), "slots must be an object")
+        require("style_path" not in card["slots"], "style_path is runner-filled")
+        require(set(card["slots"]) == set(fields) - {"style_path"}, "missing or unused slots")
+        values = {"style_path": config["style"]["path"]}
         for name, slot in card["slots"].items():
             object_keys(slot, ("value", "kind"), ("value", "kind"))
             kind, value = slot["kind"], line(slot["value"], "slot value")
@@ -427,12 +424,15 @@ def freeze_cards(config, snapshot):
         require(isinstance(card["allowed_paths"], list) and card["allowed_paths"], "allowed_paths required")
         for pattern in card["allowed_paths"]:
             relative(pattern, "allowed_paths", glob=True)
+        if config["style"]["kind"] == "file":
+            require(not path_allowed(config["style"]["place_at"], card["allowed_paths"]), "style.place_at overlaps card allowed_paths")
         if any(x.startswith("endpoint_") or x == "ui_wired" for x in checks):
             require("serve" in config, "endpoint redline requires serve")
         if any(x.startswith("migration_") for x in checks) or card.get("preset") in ("T3", "T4"):
             require("migrations" in config, "migration redline requires migrations")
         if "style_trap" in checks:
             require("trap" in config["style"], "style_trap requires trap")
+            require("style_path" in fields, "style_trap card must contain {style_path}")
 
 
 def freeze(config_path, runner=None):
@@ -495,7 +495,7 @@ def freeze(config_path, runner=None):
             require("dev_kit" in config, "target has no dev-kit or override")
             config["dev_kit_digest"] = digest(config["dev_kit"])
             config["dev_kit_declaration"] = None
-        freeze_style(config, config_path.parent, runner, target)
+        freeze_style(config, config_path.parent, snapshot, target)
         freeze_cards(config, snapshot)
     for route in [*config["routes"], config["judge"]]:
         prove_route(runner, ROOT, route)
@@ -613,7 +613,7 @@ class HostBackend:
         # Controller files/state are never offered to the Developer as changes.
         exclude = workspace / ".git/info/exclude"
         with exclude.open("a") as stream:
-            stream.write("\n/.bench-state/\n/.bench-style.md\n/.bench-engine.tar\n")
+            stream.write("\n/.bench-state/\n/.bench-engine.tar\n")
 
     def materialize(self, config, workspace):
         source, ref = Path(config["engine"]["source"]), config["engine"]["ref"]
@@ -692,7 +692,11 @@ class HostBackend:
         raise BenchError("copy health failed", "infra_failed")
 
     def verify(self, workspace):
-        self.sc(workspace, "render", "all", "DEV1")
+        # Install has already rendered the fresh instance. Compare that mirror
+        # against its sources; render/all needs SC_ADMIN and would mutate it.
+        mirror = confined(workspace, ".sc-state/local/renders/skills_sc/README.md")
+        require(mirror.is_file() and mirror.stat().st_size > 0, "installed render is missing")
+        self.sc(workspace, "render-check")
         # sc verify rebuilds the DB; use a read-only integrity proof instead.
         # This executes only in the disposable copy with its private XDG root.
         program = """import json, sqlite3, sys
@@ -719,20 +723,19 @@ print(json.dumps({'db_verified': True, 'developer_verified': True}))
         return prove_route(self.runner, workspace, route, env=self.environment(workspace))
 
     def place_style(self, workspace, style):
-        content = style["content"]
+        destination = confined(workspace, style["path"])
         if style["kind"] == "file":
-            destination = confined(workspace, style["destination"])
-            require(not destination.is_dir(), "style destination is a directory")
+            require(not destination.is_dir(), "style.place_at is a directory")
             destination.parent.mkdir(parents=True, exist_ok=True)
-            destination.write_text(content)
-            content = f"Read and follow the house style in `{style['destination']}` before editing."
-        if style["kind"] != "skill":
-            content = f"---\nname: {style['name']}\ndescription: Project house style to follow when editing this project.\n---\n\n{content}\n"
-        draft = confined(workspace, ".bench-style.md")
-        draft.write_text(content)
-        self.sc(workspace, "skill", "put", "--file", str(draft))
-        self.sc(workspace, "skill", "grant", style["name"], "DEV1")
-        self.sc(workspace, "render", "skills", "DEV1")
+            destination.write_text(style["content"])
+            # Even an ignored projected skill becomes a tracked fixture file.
+            self.runner.git(workspace, "add", "--force", "--", style["place_at"])
+        require(destination.is_file() and digest(destination.read_text()) == style["digest"], "copy style differs from frozen artifact")
+        self.runner.git(workspace, "add", "-A")
+        self.runner.git(workspace, "-c", "core.hooksPath=/dev/null", "-c", "user.name=Subfloor Bench",
+                        "-c", "user.email=noreply@subfloor.invalid", "-c", "commit.gpgsign=false",
+                        "commit", "--allow-empty", "-m", "chore: prepare frozen project fixture")
+        return {"base_sha": resolve_sha(self.runner, workspace, "HEAD"), "style_digest": style["digest"]}
 
     def hook(self, config, workspace, name):
         declaration = config["dev_kit_declaration"]
@@ -747,13 +750,10 @@ print(json.dumps({'db_verified': True, 'developer_verified': True}))
         return {"exit_status": result.returncode, "hook": declared or {"argv": config["dev_kit"][name], "cwd": "."}}
 
     def preamble(self, config, workspace, route):
-        # Installer/style/deps can legitimately change managed fixture files.
-        # Commit the fixture locally; model diffs start at this clean base and
-        # the original target SHA remains a separate immutable receipt field.
-        self.runner.git(workspace, "add", "-A")
-        self.runner.git(workspace, "-c", "core.hooksPath=/dev/null", "-c", "user.name=Subfloor Bench",
-                        "-c", "user.email=noreply@subfloor.invalid", "-c", "commit.gpgsign=false",
-                        "commit", "--allow-empty", "-m", "chore: prepare frozen project fixture")
+        # The fixture was committed before hooks; hooks must leave it intact.
+        style_path = confined(workspace, config["style"]["path"])
+        require(style_path.is_file() and digest(style_path.read_text()) == config["style"]["digest"], "baseline hook changed style")
+        require(self.runner.git(workspace, "branch", "--show-current").stdout.strip() == "bench-base", "baseline hook changed branch")
         status = self.runner.git(workspace, "status", "--porcelain").stdout.strip()
         require(not status, "baseline Git status is not clean")
         version = self.command(workspace, [route["harness"], "--version"]).stdout.strip()
@@ -896,13 +896,14 @@ class Controller:
                 self._stage(ledger_path, ledger, "verify")
                 ledger["route_proof"] = self.backend.route(workspace, route)
                 self._stage(ledger_path, ledger, "route")
-                self.backend.place_style(workspace, config["style"])
+                ledger["fixture"] = self.backend.place_style(workspace, config["style"])
                 self._stage(ledger_path, ledger, "style")
                 ledger["deps"] = self.backend.hook(config, workspace, "deps")
                 self._stage(ledger_path, ledger, "deps")
                 ledger["baseline_test"] = self.backend.hook(config, workspace, "test")
                 self._stage(ledger_path, ledger, "test")
                 ledger["preamble"] = self.backend.preamble(config, workspace, route)
+                require(ledger["preamble"]["base_sha"] == ledger["fixture"]["base_sha"], "baseline hook advanced fixture SHA")
                 self._stage(ledger_path, ledger, "preamble")
                 ledger["outcome"] = "gate_passed"
                 write_json(ledger_path, ledger)
@@ -955,4 +956,6 @@ def main(args=None):
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    from cli_entry import run_cli
+
+    raise SystemExit(run_cli(main, sys.argv[1:]))

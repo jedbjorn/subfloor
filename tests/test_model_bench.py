@@ -77,7 +77,7 @@ class BenchFixture(unittest.TestCase):
         self.config = {
             "target": {"repo": str(self.target), "ref": "main"},
             "engine": {"source": str(self.engine)},
-            "style": {"kind": "file", "source": str(self.style), "destination": ".subfloor/house-style.md",
+            "style": {"kind": "file", "source": str(self.style), "place_at": ".subfloor/house-style.md",
                       "trap": {"forbidden": ["<button"], "required": ["Button"]}},
             "dev_kit": {"deps": ["true"], "test": ["true"]},
             "routes": [{"harness": "codex", "model": "test-model", "effort": "medium"}],
@@ -215,7 +215,7 @@ class FreezeTests(BenchFixture):
             with self.subTest(preset=preset):
                 slots = {name: {"kind": kind, "value": "existing_view" if kind == "ref" else "fresh_name" if kind == "new" else "a description"}
                          for name, kind in data["kinds"].items()}
-                config["cards"] = [{"id": preset, "preset": preset, "slots": slots, "allowed_paths": ["**"]}]
+                config["cards"] = [{"id": preset, "preset": preset, "slots": slots, "allowed_paths": ["src/**", "app.txt"]}]
                 frozen = bench.load_campaign(self.freeze(config))
                 self.assertNotIn("{", frozen["config"]["cards"][0]["text"])
                 first = next(iter(slots))
@@ -312,6 +312,7 @@ class FakeBackend:
         self.stage("preflight")
 
     def clone(self, config, workspace):
+        self.base_sha = config["target"]["ref"]
         workspace.mkdir(parents=True)
         self.stage("clone")
 
@@ -337,6 +338,7 @@ class FakeBackend:
 
     def place_style(self, workspace, style):
         self.stage("style")
+        return {"base_sha": self.base_sha, "style_digest": style["digest"]}
 
     def hook(self, config, workspace, name):
         self.stage(name)
@@ -563,27 +565,36 @@ class HostBoundaryTests(BenchFixture):
         install_kwargs = next(kwargs for args, kwargs in calls if ".super-coder/scripts/install.py" in args)
         self.assertEqual(install_kwargs["env"]["XDG_STATE_HOME"], str(workspace / ".bench-state"))
 
-    def test_style_uses_serving_parser_and_public_grant_for_all_kinds(self):
-        from skill import parse_local_skill_spec
-        frozen = bench.load_campaign(self.freeze())
-        for kind in ("file", "doc", "skill"):
+    def test_style_is_committed_before_turn_without_any_skill_command(self):
+        for kind in ("file", "repo"):
             with self.subTest(kind=kind):
-                workspace = self.root / f"copy-{kind}"
-                workspace.mkdir()
-                style = copy.deepcopy(frozen["config"]["style"])
-                style["kind"] = kind
-                if kind == "skill":
-                    style["content"] = "---\nname: project_style\ndescription: Follow the project house style.\n---\nUse the Button component.\n"
-                    style["name"] = "project_style"
-                backend = bench.HostBackend()
-                with mock.patch.object(backend, "sc") as sc:
-                    backend.place_style(workspace, style)
-                parsed = parse_local_skill_spec((workspace / ".bench-style.md").read_text())
-                self.assertEqual(parsed["name"], style["name"])
-                self.assertIn(mock.call(workspace, "skill", "grant", style["name"], "DEV1"), sc.call_args_list)
-                self.assertIn(mock.call(workspace, "render", "skills", "DEV1"), sc.call_args_list)
+                config = copy.deepcopy(self.config)
                 if kind == "file":
-                    self.assertEqual((workspace / style["destination"]).read_text(), style["content"])
+                    (self.target / ".gitignore").write_text(".subfloor/\n")
+                    git(self.target, "add", ".")
+                    git(self.target, "commit", "-m", "ignored style destination")
+                if kind == "repo":
+                    (self.target / "house-style.md").write_text(self.style.read_text())
+                    git(self.target, "add", ".")
+                    git(self.target, "commit", "-m", "existing style")
+                    config["style"] = {"kind": "repo", "source": "house-style.md"}
+                frozen = bench.load_campaign(self.freeze(config))
+                style = frozen["config"]["style"]
+                workspace = self.root / f"copy-{kind}"
+                backend = bench.HostBackend()
+                backend.clone(frozen["config"], workspace)
+                git(workspace, "checkout", "-B", "bench-base")
+                with mock.patch.object(backend, "sc") as sc:
+                    fixture = backend.place_style(workspace, style)
+                sc.assert_not_called()
+                self.assertEqual(git(workspace, "show", f"HEAD:{style['path']}"), style["content"].strip())
+                self.assertEqual(git(workspace, "rev-parse", "HEAD"), fixture["base_sha"])
+                self.assertNotEqual(fixture["base_sha"], frozen["config"]["target"]["ref"])
+                self.assertEqual(git(workspace, "status", "--porcelain"), "")
+                self.assertEqual(git(workspace, "diff", "--name-only", fixture["base_sha"]), "")
+                (workspace / "app.txt").write_text("model change")
+                self.assertEqual(git(workspace, "diff", "--name-only", fixture["base_sha"]), "app.txt")
+                self.assertEqual(fixture["style_digest"], style["digest"])
 
     def test_style_symlink_escape_is_refused(self):
         config = bench.load_campaign(self.freeze())["config"]
@@ -678,7 +689,7 @@ class RegressionTests(BenchFixture):
             {"serve": {"argv": ["app"], "cwd": "../target", "port_env": "PORT", "health_path": "/health", "ready_timeout_s": 10}},
             {"serve": {"argv": ["app"], "cwd": ".", "port_env": "SC_API_TOKEN", "health_path": "/health", "ready_timeout_s": 10}},
             {"migrations": {"path": "../target", "apply_argv": ["true"], "table_check_argv": ["true"]}},
-            {"style": {**self.config["style"], "destination": "../target/style.md"}},
+            {"style": {**self.config["style"], "place_at": "../target/style.md"}},
             {"style": {**self.config["style"], "trap": {"required": ["["], "forbidden": ["Button"]}}},
         ]
         for overrides in variants:
@@ -731,10 +742,13 @@ class RegressionTests(BenchFixture):
         con.execute("CREATE TABLE shells(shortname TEXT, flavor TEXT, is_deleted INTEGER)")
         con.execute("INSERT INTO shells VALUES ('DEV1', 'dev', 0)")
         con.commit()
+        mirror = workspace / ".sc-state/local/renders/skills_sc/README.md"
+        mirror.parent.mkdir(parents=True)
+        mirror.write_text("installed rendered catalogue")
         backend = bench.HostBackend()
         with mock.patch.object(backend, "sc") as sc, mock.patch.dict(os.environ, {"PYTHONOPTIMIZE": "1"}):
             backend.verify(workspace)
-            sc.assert_called_once_with(workspace, "render", "all", "DEV1")
+            sc.assert_called_once_with(workspace, "render-check")
             con.execute("UPDATE shells SET flavor='reviewer'")
             con.commit()
             with self.assertRaises(bench.BenchError):
@@ -760,23 +774,102 @@ class RegressionTests(BenchFixture):
             result = bench.Controller(FakeBackend()).cleanup(path, "route-0-custom")
             self.assertTrue(result["cleanup"]["copy_deleted"])
 
-    def test_style_document_and_skill_ids_freeze_through_public_read_surfaces(self):
+    def test_db_style_kinds_and_ids_are_out_of_scope(self):
+        for kind, source in (("skill", 42), ("doc", 42), ("file", 42)):
+            with self.subTest(kind=kind), self.assertRaises(bench.BenchError):
+                self.freeze({**self.config, "style": {"kind": kind, "source": source}})
+
+    def test_file_style_is_outside_every_cards_scope(self):
+        for pattern in ("**", ".subfloor/**", "**/*.md", ".subfloor/**/house-style.md", "./.subfloor/house-style.md"):
+            with self.subTest(pattern=pattern):
+                config = copy.deepcopy(self.config)
+                config["cards"].append({**copy.deepcopy(config["cards"][0]), "id": "second", "allowed_paths": [pattern]})
+                with self.assertRaisesRegex(bench.BenchError, "style.place_at overlaps"):
+                    self.freeze(config)
+
+    def test_style_path_is_runner_filled_and_required_for_custom_style_trap(self):
         config = copy.deepcopy(self.config)
-        original_run = self.runner.run
+        card = config["cards"][0]
+        card["redlines"] = ["style_trap"]
+        with self.assertRaisesRegex(bench.BenchError, "must contain"):
+            self.freeze(config)
+        card["text"] += " Follow the house style at {style_path}."
+        frozen = bench.load_campaign(self.freeze(config))
+        self.assertIn(config["style"]["place_at"], frozen["config"]["cards"][0]["text"])
+        card["slots"]["style_path"] = {"kind": "text", "value": "fake-style.md"}
+        with self.assertRaisesRegex(bench.BenchError, "runner-filled"):
+            self.freeze(config)
 
-        def read_artifact(args, **kwargs):
-            if "mem" in args:
-                return subprocess.CompletedProcess(args, 0, json.dumps({"document": {"body": "Use the Button component."}}), "")
-            if "sql" in args:
-                return subprocess.CompletedProcess(args, 0, json.dumps([{"name": "project_style", "description": "Project house style", "content": "Use the Button component."}]), "")
-            return original_run(args, **kwargs)
+    def test_repo_style_reads_the_frozen_file_and_rejects_absence_or_symlink(self):
+        (self.target / "house-style.md").write_text("frozen style")
+        git(self.target, "add", ".")
+        git(self.target, "commit", "-m", "style")
+        ref = git(self.target, "rev-parse", "HEAD")
+        (self.target / "house-style.md").write_text("later style")
+        git(self.target, "add", ".")
+        git(self.target, "commit", "-m", "later")
+        config = copy.deepcopy(self.config)
+        config["target"]["ref"] = ref
+        config["style"] = {"kind": "repo", "source": "house-style.md"}
+        frozen = bench.load_campaign(self.freeze(config))
+        self.assertEqual(frozen["config"]["style"]["content"], "frozen style")
+        self.assertEqual(frozen["config"]["style"]["digest"], bench.digest("frozen style"))
+        for source in ("absent.md", "../house-style.md", str(self.style)):
+            config["style"]["source"] = source
+            with self.assertRaises(bench.BenchError):
+                self.freeze(config)
+        (self.target / "alias.md").symlink_to("house-style.md")
+        git(self.target, "add", ".")
+        git(self.target, "commit", "-m", "alias")
+        config["target"]["ref"] = "main"
+        config["style"]["source"] = "alias.md"
+        with self.assertRaisesRegex(bench.BenchError, "regular file"):
+            self.freeze(config)
 
-        for kind in ("doc", "skill"):
-            with self.subTest(kind=kind), mock.patch.object(self.runner, "run", side_effect=read_artifact):
-                config["style"] = {"kind": kind, "source": 42}
-                frozen = bench.load_campaign(self.freeze(config))
-                self.assertIn("Use the Button component.", frozen["config"]["style"]["content"])
-                self.assertEqual(frozen["config"]["style"]["source"], 42)
+    def test_fixture_preamble_proves_clean_style_and_branch_after_hooks(self):
+        config = bench.load_campaign(self.freeze())["config"]
+        workspace = self.root / "copy"
+
+        class VersionRunner(bench.CommandRunner):
+            def run(self, args, **kwargs):
+                if args == ["codex", "--version"]:
+                    return subprocess.CompletedProcess(args, 0, "codex-cli fixture-version", "")
+                return super().run(args, **kwargs)
+
+        backend = bench.HostBackend(VersionRunner())
+        backend.clone(config, workspace)
+        git(workspace, "checkout", "-B", "bench-base")
+        fixture = backend.place_style(workspace, config["style"])
+        preamble = backend.preamble(config, workspace, config["routes"][0])
+        self.assertEqual(preamble["base_sha"], fixture["base_sha"])
+        self.assertEqual(preamble["target_base_sha"], config["target"]["ref"])
+        (workspace / "app.txt").write_text("hook mutation")
+        with self.assertRaisesRegex(bench.BenchError, "not clean"):
+            backend.preamble(config, workspace, config["routes"][0])
+        git(workspace, "checkout", "--", "app.txt")
+        (workspace / config["style"]["path"]).write_text("hook changed style")
+        with self.assertRaisesRegex(bench.BenchError, "changed style"):
+            backend.preamble(config, workspace, config["routes"][0])
+
+    def test_missing_installer_render_cannot_pass_render_check_skip(self):
+        workspace = self.root / "copy"
+        workspace.mkdir()
+        backend = bench.HostBackend()
+        with mock.patch.object(backend, "sc") as sc, self.assertRaisesRegex(bench.BenchError, "render is missing"):
+            backend.verify(workspace)
+        sc.assert_not_called()
+
+    def test_hook_commit_cannot_advance_the_receipt_base(self):
+        path = self.freeze()
+        backend = FakeBackend()
+        original = backend.preamble
+
+        def changed_base(config, workspace, route):
+            return {**original(config, workspace, route), "base_sha": "f" * 40}
+
+        with mock.patch.object(backend, "preamble", side_effect=changed_base), self.assertRaisesRegex(bench.BenchError, "advanced fixture SHA"):
+            bench.Controller(backend).run(path, "custom")
+        self.assertEqual(backend.calls[-2:], ["stop", "remove"])
 
 
 if __name__ == "__main__":
