@@ -66,6 +66,7 @@ ENGINE_PATHS = [
     ".super-coder/render",
     ".super-coder/templates",
     ".super-coder/adapters",
+    ".super-coder/browser",
     ".super-coder/api",
     ".super-coder/ui",
     ".super-coder/assets/github_known_hosts",
