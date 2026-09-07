@@ -2142,6 +2142,12 @@ def health_payload() -> dict:
     return {
         "ok": True,
         "repo": cfg.get("repo"),
+        # Exact identity: a caller that resolved this port from its own repo
+        # must be able to tell "this runtime is mine" from "a stranger holds my
+        # port" before handing over a write command (snapshot.py). The name
+        # alone is ambiguous between same-named checkouts; /api/shells already
+        # publishes the root on this same loopback surface.
+        "repo_root": str(REPO_ROOT),
         "port": cfg.get("port"),
         "artifact_mode": artifact_policy.mode(),
         "git_publication": False,
