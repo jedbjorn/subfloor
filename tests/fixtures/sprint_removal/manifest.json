@@ -393,7 +393,9 @@
     "tests/test_role_aware_boot_contract.py",
     ".super-coder/README.md",
     ".super-coder/adapters/vibe/README.md",
-    ".super-coder/docs/interface-trust-boundary.md"
+    ".super-coder/docs/interface-trust-boundary.md",
+    "docs/images/sprints-tab.png",
+    "tests/test_public_documentation.py"
   ],
   "decision": 33,
   "generation_markers": {

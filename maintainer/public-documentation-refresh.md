@@ -118,13 +118,59 @@ prepared Sprint. Flow intentionally has no dependency edges. The guide captions
 now describe these actual states. Capture gallery reports five routes, zero
 failures. The original dos-app checkout and runtime remain preserved.
 
+## Whole-set verification
+
+The focused documentation, fresh-install, Windows-skill and Sprint-removal
+checks passed: 28 tests and 470 subtests at `c1eccd1f`. The expanded legacy-wording
+scan passed all five documentation tests and 484 subtests, and the combined
+affected checks passed after integrating the operator's main merge: 28 tests
+and 518 subtests. That rerun caught two new tracked Sprint reference files
+(the screenshot and drift test), now explicitly added to the removal inventory. Lint
+passed for the capture helper and drift checks. Required full-suite CI remains
+the authoritative integration gate; it is not duplicated on the shared host.
+
+The hosted md-converter rendered all 12 guide tabs and seven quick-start tabs
+without JavaScript or Mermaid errors. Guide images loaded successfully using
+the candidate commit in place of `main` in image URLs for this preview; new
+public image URLs become available on main only after merge. A separate URL-
+loaded preview at `c1eccd1f` confirmed that relative document links resolve
+against the GitHub source and section links retain their fragments. Visual
+inspection covered the architecture, Sprints and GUI sections.
+
+`sc help --all` and worktree-local `install.py --help` were checked; host runtime
+is explicitly a supervised host process without Docker. The first source comparison matched the frozen fact owners. The operator then
+merged snapshot-routing fix #1543 into main (`b09cfaac`) and into this PR
+(`9c127814`); it changes runtime identity verification during serialization,
+not the documented state ownership or workflows. The capture stays pinned to
+its original exact ref.
+
+The disposable quick-start walk has proved install, launch, existing account
+authentication, terminal Cartographer boot, browser Planner specification/tasks,
+and prepared Sprint lanes. A separate documentation-only manual handoff uses fixture feature #4/spec
+#2/task #3, preserving the captured Reading list state. DEV3 opened
+[dos-app draft PR #74](https://github.com/jedbjorn/dos-app/pull/74) at
+`651badd0e7d917effab48d90bc2eac06fabfa42e`: one Markdown file, 26 additions,
+and an independent REV2 PASS with no merge blockers. GitHub reported the
+visual-QA job successful, but its run comment says capture was unconfigured and
+skipped; that is not validation evidence. The file content, diff scope, base,
+privacy scan and merge boundary were independently verified. The review lives
+in the disposable control plane rather than an external PR comment. The test
+PR was closed without merging; its pushed branch preserves the evidence.
+This is acceptance work after capture, not part of the screenshots.
+
+Claude reported failed tool completions after successful commands because its
+Bash epilogue could not write `/tmp/claude-<id>-cwd`. Returned control-plane
+rows and the remote PR establish the completed work independently. No write
+was retried or exit code masked. This remaining temp-boundary defect is
+tracked by SC-617 and [issue #1541](https://github.com/jedbjorn/subfloor/issues/1541#issuecomment-5567866010).
+
 ## Remaining delivery gates
 
 Tasks #795–#799 are complete: preparation, core corrections, workflow rewrite,
 runbook audit, and real visuals. The DeepSeek document retains its exact-ref
 checkpoints beneath a historical/Admin applicability label.
 
-Task #800 must finish command/link/anchor/fact drift checks, the quick-start
-sandbox walk, themed rendering, configured CI, independent documentation review,
-and a final link/render pass after review fixes. Capture success does not certify
-those remaining gates.
+Task #800 must finish configured CI, independent documentation review
+(REV1 handoff #1814), and a final link/render pass after review fixes. The manual
+walk reached an independently reviewed PR; actual merge, shipped-spec freeze
+and application implementation were intentionally not performed in the fixture. The completed checks above do not certify those remaining gates.

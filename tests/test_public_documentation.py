@@ -104,7 +104,8 @@ class PublicDocumentationTest(unittest.TestCase):
 
     def test_current_docs_do_not_restore_retired_contracts(self):
         # Historical migration documents are deliberately outside this scan.
-        forbidden = [r'four harness(?:es)?', r'five flavors', r'six-shell (?:team|roster)',
+        forbidden = [r'four harness(?:es)?', r'five flavors', r'nine (?:GUI[- ]?)?tabs',
+                     r'six-shell (?:team|roster)', r'enter-dev\b', r'shell/dev\b',
                      r'\./sc enter dev\b', r'\.sc-worktrees/dev\b',
                      r'\.super-coder/memory\.db', r'/api/interface/(?:bootstrap|lease)',
                      r'conductor shell']
