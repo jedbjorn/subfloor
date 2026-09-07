@@ -12,7 +12,7 @@ import compose
 
 class FreshInstallShellContractTest(unittest.TestCase):
     def test_install_is_committed_before_first_shell_worktree(self) -> None:
-        for relative in ("README.md", "docs/README.md"):
+        for relative in ("README.md", "docs/quick-start.md"):
             text = (ROOT / relative).read_text()
             commit = text.index(
                 'git commit --no-verify -m "chore: install subfloor"'

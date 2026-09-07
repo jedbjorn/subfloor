@@ -874,6 +874,11 @@ feature` makes the supported block boundary visible and repeatable.
 
 ### Focused infrastructure runbooks
 
+For a configured Windows guest, use the typed `./sc vm` client. Supported
+adapters receive a managed `windows-mcp` definition; `./sc vm mcp up` starts
+and verifies that GUI connection. The VM runbook below owns setup and lifecycle
+details; Planner supplies the fork's actual scope through `fork_skill_design`.
+
 | Capability | Applicability and reference |
 |---|---|
 | Windows VM | Operator supplies the VM and clean snapshot; [architecture](../.super-coder/docs/windows-test-vm.md) and [broker runbook](../.super-coder/docs/windows-vm-broker.md) |

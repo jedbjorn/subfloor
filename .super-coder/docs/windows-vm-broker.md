@@ -12,8 +12,7 @@ purpose: Operate a configured VM through its broker
 
 **Posture: current operator runbook.** Applies to a fork with an already
 provisioned Windows VM linked in `instance.json.vm`. The host owns its SSH key,
-libvirt access and baseline preparation. A sandboxed shell uses typed `sc vm`
-commands; Planner supplies fork-local operating guidance and scope.
+libvirt access and baseline preparation. A sandboxed shell operates through typed `./sc vm` commands; Planner supplies fork-local operating guidance and scope.
 
 For the installation and target boundary, see
 [Windows test VM architecture](windows-test-vm.md). The separate `sc vm test`
@@ -70,7 +69,7 @@ its owner rather than starting a competing broker.
 ## Windows-MCP seam
 
 For adapters that advertise managed streamable-HTTP MCP support, the engine
-injects the `windows-mcp` endpoint. `sc vm mcp up` brings up the broker-owned
+provides the adapter-injected windows-mcp endpoint. **`./sc vm mcp up`** brings up the broker-owned
 SSH tunnel and local relay, then verifies the endpoint. The tunnel reaches the
 configured guest's loopback service; callers do not choose an arbitrary host
 or port. `sc vm mcp status` distinguishes tunnel, relay and endpoint state.
