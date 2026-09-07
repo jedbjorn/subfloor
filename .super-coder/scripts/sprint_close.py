@@ -114,7 +114,7 @@ class SprintCloseStore:
                     body=final_report,
                     idempotency_key=idempotency_key,
                 )
-                self._replay_completion(
+                replayed_closed = self._replay_completion(
                     sprint_id,
                     reviewer_shell_id=reviewer_shell_id,
                     reason=reason,
@@ -131,6 +131,7 @@ class SprintCloseStore:
                     reason=reason,
                     terminal_outcome=terminal_outcome,
                     idempotency_key=idempotency_key,
+                    closed_developer_chats=len(replayed_closed),
                 )
                 return ConformanceReceipt(
                     report_id,
@@ -185,6 +186,10 @@ class SprintCloseStore:
                 body=final_report,
                 idempotency_key=idempotency_key,
             )
+            lifecycle_store = SprintLifecycleStore(
+                self.con,
+                cleanup_store=self.cleanup_store,
+            )
             notification = self._send_planner_notification(
                 sprint_id,
                 reviewer_shell_id=reviewer_shell_id,
@@ -195,6 +200,11 @@ class SprintCloseStore:
                 reason=reason,
                 terminal_outcome=terminal_outcome,
                 idempotency_key=idempotency_key,
+                closed_developer_chats=len(
+                    lifecycle_store.linked_developer_chats_in_transaction(
+                        sprint_id
+                    )
+                ),
             )
             planner_wake_id = self._required_wake_id(notification.wake_id)
             self._event(
@@ -210,16 +220,15 @@ class SprintCloseStore:
                     "planner_wake_id": planner_wake_id,
                 },
             )
-            closed_conversation_ids = SprintLifecycleStore(
-                self.con,
-                cleanup_store=self.cleanup_store,
-            ).complete_from_conformance_in_transaction(
-                sprint_id,
-                reviewer_shell_id,
-                reason=reason,
-                terminal_outcome=terminal_outcome,
-                idempotency_key=idempotency_key,
-                cleanup_targets=cleanup_targets,
+            closed_conversation_ids = (
+                lifecycle_store.complete_from_conformance_in_transaction(
+                    sprint_id,
+                    reviewer_shell_id,
+                    reason=reason,
+                    terminal_outcome=terminal_outcome,
+                    idempotency_key=idempotency_key,
+                    cleanup_targets=cleanup_targets,
+                )
             )
         notification_error: Exception | None = None
         for conversation_id in closed_conversation_ids:
@@ -871,6 +880,7 @@ class SprintCloseStore:
         reason: str,
         terminal_outcome: str,
         idempotency_key: str,
+        closed_developer_chats: int,
     ) -> Any:
         from sprint_message_delivery import SprintMessageStore
 
@@ -879,8 +889,9 @@ class SprintCloseStore:
             f"Sprint {sprint_id} completed by Reviewer conformance. "
             f"conformance_report_id={report_id}; final_report_id={final_report_id}; "
             f"followup_ids={followups}; outcome={terminal_outcome}; "
-            "cleanup_state=pending. Managed participant worktrees are not reusable "
-            "until the engine-authored cleanup receipt reports succeeded.\n\n"
+            f"closed_developer_chats={closed_developer_chats}. Planner and Reviewer "
+            f"chats persist; the engine deletes shared/sprints/sprint-{sprint_id} "
+            "and reports only if that fails.\n\n"
             f"Reason: {reason}"
         )
         return SprintMessageStore(self.con).send_to_shell_in_transaction(
@@ -1010,7 +1021,7 @@ class SprintCloseStore:
         reason: str,
         terminal_outcome: str,
         idempotency_key: str,
-    ) -> None:
+    ) -> list[str]:
         sprint = self.con.execute(
             "SELECT lifecycle,terminal_outcome FROM sprints WHERE sprint_id=?",
             (sprint_id,),
@@ -1046,6 +1057,7 @@ class SprintCloseStore:
             raise SprintInvariantError(
                 "conformance idempotency key was reused with different completion"
             )
+        return closed_conversation_ids
 
     @classmethod
     def _normalize_finding(cls, finding: Any) -> dict[str, Any]:

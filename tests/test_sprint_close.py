@@ -25,14 +25,16 @@ def rendered_notification(
     report_id: int,
     final_report_id: int,
     followup_ids: tuple[int, ...],
+    closed_developer_chats: int,
 ) -> str:
     followups = ",".join(str(value) for value in followup_ids) or "none"
     return (
         f"Sprint {sprint_id} completed by Reviewer conformance. "
         f"conformance_report_id={report_id}; final_report_id={final_report_id}; "
         f"followup_ids={followups}; outcome={TERMINAL_OUTCOME}; "
-        "cleanup_state=pending. Managed participant worktrees are not reusable "
-        "until the engine-authored cleanup receipt reports succeeded.\n\n"
+        f"closed_developer_chats={closed_developer_chats}. Planner and Reviewer "
+        f"chats persist; the engine deletes shared/sprints/sprint-{sprint_id} "
+        "and reports only if that fails.\n\n"
         f"Reason: {COMPLETION_REASON}"
     )
 
@@ -685,6 +687,7 @@ class ConformanceFollowupTest(SprintCloseCase):
                     receipt.report_id,
                     receipt.final_report_id,
                     receipt.followup_ids,
+                    0,
                 ),
                 "re-enter",
                 0,
@@ -727,7 +730,7 @@ class ConformanceFollowupTest(SprintCloseCase):
             ],
         )
 
-    def test_conformance_closes_only_linked_nonretained_chats_and_replay_is_idle(
+    def test_conformance_closes_only_developer_chats_and_replay_is_idle(
         self,
     ):
         self.add_participant(5, "reviewer")
@@ -763,20 +766,20 @@ class ConformanceFollowupTest(SprintCloseCase):
             first = self.record_conformance(
                 self.sprint_id,
                 2,
-                body="Close only this Sprint's eligible chats.",
+                body="Close only this Sprint's Developer chats.",
                 findings=[],
                 final_report=FINAL_REPORT,
                 idempotency_key="chat-cleanup",
             )
 
         self.assertTrue(first.created)
-        self.assertEqual([developer_chat, other_reviewer_chat], notified)
+        self.assertEqual([developer_chat], notified)
         self.assertEqual(
             [
                 (developer_chat, "closed", 1),
                 (author_chat, "idle", 0),
                 (planner_chat, "idle", 0),
-                (other_reviewer_chat, "closed", 1),
+                (other_reviewer_chat, "idle", 0),
                 (unrelated_chat, "idle", 0),
             ],
             [
@@ -801,7 +804,12 @@ class ConformanceFollowupTest(SprintCloseCase):
             ],
         )
         self.assertEqual(
-            [(2, author_chat), (3, planner_chat), (6, unrelated_chat)],
+            [
+                (2, author_chat),
+                (3, planner_chat),
+                (5, other_reviewer_chat),
+                (6, unrelated_chat),
+            ],
             [
                 tuple(row)
                 for row in self.con.execute(
@@ -824,16 +832,7 @@ class ConformanceFollowupTest(SprintCloseCase):
                     developer_chat,
                     {
                         "reason": "sprint_completed",
-                        "retained_shell_ids": [2, 3],
-                        "sprint_id": self.sprint_id,
-                        "state": "closed",
-                    },
-                ),
-                (
-                    other_reviewer_chat,
-                    {
-                        "reason": "sprint_completed",
-                        "retained_shell_ids": [2, 3],
+                        "retained_shell_ids": [2, 3, 5],
                         "sprint_id": self.sprint_id,
                         "state": "closed",
                     },
@@ -849,16 +848,32 @@ class ConformanceFollowupTest(SprintCloseCase):
             ).fetchone()[0]
         )
         self.assertEqual(
-            [developer_chat, other_reviewer_chat],
+            [developer_chat],
             lifecycle_payload["closed_conversation_ids"],
         )
+        receipt_body = self.con.execute(
+            "SELECT body FROM wake_message WHERE message_id=?",
+            (first.planner_message_id,),
+        ).fetchone()[0]
+        self.assertEqual(
+            rendered_notification(
+                self.sprint_id,
+                first.report_id,
+                first.final_report_id,
+                first.followup_ids,
+                1,
+            ),
+            receipt_body,
+        )
+        self.assertIn("closed_developer_chats=1", receipt_body)
+        self.assertNotIn("cleanup_state=", receipt_body)
 
         later_chat = self.activate_chat(1, "post-completion-normal", linked=False)
         with mock.patch.object(sprint_close.conversation_events, "notify") as notify:
             replay = self.record_conformance(
                 self.sprint_id,
                 2,
-                body="Close only this Sprint's eligible chats.",
+                body="Close only this Sprint's Developer chats.",
                 findings=[],
                 final_report=FINAL_REPORT,
                 idempotency_key="chat-cleanup",
@@ -908,18 +923,115 @@ class ConformanceFollowupTest(SprintCloseCase):
             ),
         )
         self.assertEqual(
-            2,
+            1,
             self.con.execute(
                 "SELECT COUNT(*) FROM conversation_events "
                 "WHERE event_type='conversation.closed' "
                 "AND json_extract(payload,'$.reason')='sprint_completed'"
             ).fetchone()[0],
         )
+        self.assertEqual(
+            [("artifact_dir",)],
+            [
+                tuple(row)
+                for row in self.con.execute(
+                    "SELECT target_kind FROM sprint_cleanup_targets "
+                    "WHERE sprint_id=? ORDER BY cleanup_target_id",
+                    (self.sprint_id,),
+                )
+            ],
+        )
+
+    def test_fnb_completion_closes_every_developer_chat_and_keeps_the_rest(self):
+        self.add_participant(5, "reviewer")
+        self.add_participant(6, "developer")
+        developer_chat = self.activate_chat(1, "fnb-developer")
+        reviewer_chat = self.activate_chat(2, "fnb-reviewer")
+        planner_chat = self.activate_chat(3, "fnb-planner")
+        other_reviewer_chat = self.activate_chat(5, "fnb-other-reviewer")
+        other_developer_chat = self.activate_chat(6, "fnb-other-developer")
+        notified: list[str] = []
+
+        with mock.patch.object(
+            sprint_close.conversation_events,
+            "notify",
+            side_effect=lambda conversation_id: notified.append(conversation_id) or 1,
+        ):
+            receipt = self.close.complete(
+                self.sprint_id,
+                3,
+                reason="FnB closes the Sprint",
+                terminal_outcome="accepted",
+            )
+
+        self.assertTrue(receipt.changed)
+        self.assertEqual([developer_chat, other_developer_chat], notified)
+        self.assertEqual(
+            [
+                (developer_chat, "closed"),
+                (reviewer_chat, "idle"),
+                (planner_chat, "idle"),
+                (other_reviewer_chat, "idle"),
+                (other_developer_chat, "closed"),
+            ],
+            [
+                tuple(
+                    self.con.execute(
+                        "SELECT conversation_id,state FROM conversations "
+                        "WHERE conversation_id=?",
+                        (conversation_id,),
+                    ).fetchone()
+                )
+                for conversation_id in (
+                    developer_chat,
+                    reviewer_chat,
+                    planner_chat,
+                    other_reviewer_chat,
+                    other_developer_chat,
+                )
+            ],
+        )
+        self.assertEqual(
+            [
+                (2, reviewer_chat),
+                (3, planner_chat),
+                (5, other_reviewer_chat),
+            ],
+            [
+                tuple(row)
+                for row in self.con.execute(
+                    "SELECT shell_id,chat_id FROM active_shell_chats ORDER BY shell_id"
+                )
+            ],
+        )
+        self.assertEqual(
+            [[2, 3, 5], [2, 3, 5]],
+            [
+                json.loads(row[0])["retained_shell_ids"]
+                for row in self.con.execute(
+                    "SELECT payload FROM conversation_events "
+                    "WHERE event_type='conversation.closed' "
+                    "AND json_extract(payload,'$.reason')='sprint_completed' "
+                    "ORDER BY event_id"
+                )
+            ],
+        )
+        self.assertEqual(
+            [("artifact_dir",)],
+            [
+                tuple(row)
+                for row in self.con.execute(
+                    "SELECT target_kind FROM sprint_cleanup_targets "
+                    "WHERE sprint_id=? ORDER BY cleanup_target_id",
+                    (self.sprint_id,),
+                )
+            ],
+        )
 
     def test_conformance_close_failure_rolls_back_reports_lifecycle_and_chats(self):
-        self.add_participant(5, "reviewer")
+        self.add_participant(5, "developer")
         developer_chat = self.activate_chat(1, "rollback-developer")
-        other_reviewer_chat = self.activate_chat(5, "rollback-reviewer")
+        other_developer_chat = self.activate_chat(5, "rollback-second-developer")
         original_close = sprint_domain.active_chat_registry.close_for_displacement
         close_calls = 0
 
@@ -979,7 +1091,7 @@ class ConformanceFollowupTest(SprintCloseCase):
             ),
         )
         self.assertEqual(
-            [(1, developer_chat), (5, other_reviewer_chat)],
+            [(1, developer_chat), (5, other_developer_chat)],
             [
                 tuple(row)
                 for row in self.con.execute(
@@ -992,7 +1104,7 @@ class ConformanceFollowupTest(SprintCloseCase):
             sorted(
                 [
                     (developer_chat, "idle", 0),
-                    (other_reviewer_chat, "idle", 0),
+                    (other_developer_chat, "idle", 0),
                 ]
             ),
             [
@@ -1001,7 +1113,7 @@ class ConformanceFollowupTest(SprintCloseCase):
                     "SELECT conversation_id,state,closed_at IS NOT NULL "
                     "FROM conversations WHERE conversation_id IN (?,?) "
                     "ORDER BY conversation_id",
-                    tuple(sorted((developer_chat, other_reviewer_chat))),
+                    tuple(sorted((developer_chat, other_developer_chat))),
                 )
             ],
         )
