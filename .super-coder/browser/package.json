@@ -1,0 +1,7 @@
+{
+  "name": "subfloor-browser",
+  "private": true,
+  "version": "1.0.0",
+  "dependencies": {"@playwright/mcp": "0.0.80"},
+  "overrides": {"playwright": "1.63.0", "playwright-core": "1.63.0"}
+}

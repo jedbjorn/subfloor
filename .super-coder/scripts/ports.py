@@ -57,6 +57,9 @@ MANAGED_KEYS = frozenset({
     "ts",
     "pm2",
     "db",
+    "browser",
+    "browser_port",
+    "browser_proxy_port",
 })
 PORT_KEYS = frozenset({"repo", "port", "dev_port"})
 
@@ -117,7 +120,7 @@ def _sibling_ports() -> set[int]:
             sibling = json.loads(candidate.read_text())
         except (OSError, json.JSONDecodeError):
             continue
-        for key in ("port", "dev_port"):
+        for key in ("port", "dev_port", "browser_port", "browser_proxy_port"):
             value = sibling.get(key)
             if isinstance(value, int):
                 occupied.add(value)
@@ -181,6 +184,8 @@ def resolve(persist: bool = False) -> dict:
     cfg = None
     occupied = _sibling_ports()
     loaded = _load_config()
+    occupied.update(loaded[key] for key in ("browser_port", "browser_proxy_port")
+                    if type(loaded.get(key)) is int)
     if "port" in loaded:
         cfg = _runtime_view(loaded)
     if cfg is None:
@@ -207,6 +212,21 @@ def resolve(persist: bool = False) -> dict:
     if persist:
         _write_config(cfg)
     return cfg
+
+
+def ensure_browser_ports() -> dict:
+    """Allocate the opt-in server and gate without moving existing assignments."""
+    cfg = resolve()
+    occupied = _sibling_ports() | {cfg['port'], cfg['dev_port']}
+    changes = {}
+    for key, suffix in (('browser_port', ':browser'), ('browser_proxy_port', ':browser-proxy')):
+        value = cfg.get(key)
+        if type(value) is not int or not PORT_BASE <= value < PORT_BASE + SPAN or value in occupied:
+            value = _resolve_offset(_offset(str(REPO_ROOT) + suffix), occupied)
+        occupied.add(value)
+        changes[key] = value
+    update(changes)
+    return {**cfg, **changes}
 
 
 def main(argv: list[str]) -> int:

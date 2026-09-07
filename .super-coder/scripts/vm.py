@@ -1478,7 +1478,8 @@ def active_mcp_adapter() -> dict:
         }
     streamable = (adapter.get("mcp") or {}).get("streamable_http") or {}
     supported = streamable.get("supported") is True
-    managed = streamable.get("managed_server") or {}
+    managed = next((entry for entry in streamable.get("managed_servers", [])
+                    if entry.get("name") == "windows-mcp"), {})
     return {
         "harness": harness,
         "state": "supported" if supported else "unsupported",

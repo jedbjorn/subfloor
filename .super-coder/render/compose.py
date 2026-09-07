@@ -227,6 +227,7 @@ def render_dev_tools(flavor: str | None, inventory: dict | None) -> str:
             f"- **Sandbox extension:** {inventory.get('sandbox', 'absent')}",
             f"- **Provisioning:** {inventory.get('provision', 'absent')}",
             f"- **Dev server:** {inventory.get('dev_port', 'unavailable')}",
+            f"- **Browser seat:** {inventory.get('browser', 'absent')}",
             f"- **App database sidecar:** {inventory.get('app_database', 'unavailable')}",
             (
                 f"- **Evidence:** "

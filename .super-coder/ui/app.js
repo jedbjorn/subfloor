@@ -1881,6 +1881,22 @@ async function renderScripts(root) {
   vmc.append(vmbtn);
   root.append(vmc);
 
+  const bc = el("div", { className: "card" });
+  const bs = el("div", { className: "muted" }, "loading…");
+  const refreshBrowser = async () => {
+    try { bs.textContent = browserStatusText(await api("/browser")); }
+    catch (e) { bs.textContent = e.message; }
+  };
+  const configureBrowser = el("button", { className: "act primary", textContent: "configure…" });
+  configureBrowser.onclick = () => openBrowserModal(refreshBrowser);
+  const refreshBrowserButton = el("button", { className: "act", textContent: "refresh status" });
+  refreshBrowserButton.onclick = refreshBrowser;
+  bc.append(el("h2", {}, "Browser", el("span", { className: "pill" }, " opt-in")),
+    el("div", { className: "muted" }, "Drive your dedicated Chromium Subfloor profile. You open the profile and approve each new shell connection."),
+    bs, configureBrowser, refreshBrowserButton);
+  root.append(bc);
+  refreshBrowser();
+
   // Web Search — opt-in. One Tavily API key, held host-side in a 0600 file
   // under the private instance root (never instance.json, the DB, or a
   // render). Shells search through `./sc search` → the engine API, so the key
@@ -1920,6 +1936,65 @@ async function renderScripts(root) {
     c.append(run, out);
     root.append(c);
   }
+}
+
+function browserStatusText(st) {
+  return `${st.state} · server ${st.server ? "up" : "down"} · extension ${st.extension || "not connected"} · active shells: ${(st.active_shells || []).join(", ") || "none"}`;
+}
+
+async function openBrowserModal(onChange) {
+  const st = await api("/browser");
+  const cfg = st.config || st.defaults;
+  const profile = el("input", { value: "Subfloor", readOnly: true });
+  const directory = el("input", { value: cfg.user_data_dir });
+  const executable = el("input", { value: cfg.executable });
+  const result = el("pre", { className: "doc-body" }, browserStatusText(st));
+  const note = el("div", { className: "muted" },
+    "1. Create a Chromium profile named Subfloor. 2. Install the Playwright Extension in it. " +
+    "3. Sign in to the accounts you intend shells to use. 4. Check and link below. " +
+    "Keep Subfloor open for browser tasks and approve every new connection yourself.");
+  const extension = el("a", { href: "https://chromewebstore.google.com/detail/mmlmfjhmonkocbjadbfplnigmagldckm", target: "_blank", rel: "noopener noreferrer" }, "Playwright Extension");
+  const form = el("div", { className: "modal-form" },
+    el("span", { className: "k" }, "Profile display name"), profile,
+    el("span", { className: "k" }, "Chromium user data directory"), directory,
+    el("span", { className: "k" }, "Native Chromium executable"), executable);
+  const candidate = () => ({ profile_name: profile.value, user_data_dir: directory.value.trim(), executable: executable.value.trim() });
+  const action = async (verb, config) => {
+    result.textContent = "checking…";
+    try {
+      const receipt = await api("/browser", "POST", { action: verb, ...(config ? { config } : {}) });
+      result.textContent = JSON.stringify(receipt, null, 2);
+      onChange?.();
+      return receipt;
+    } catch (e) { result.textContent = e.message; return null; }
+  };
+  const check = el("button", { className: "act", textContent: "check setup" });
+  check.onclick = async () => { check.disabled = true; await action("validate", candidate()); check.disabled = false; };
+  const arm = el("button", { className: "act", textContent: st.armed ? "disarm" : "arm" });
+  arm.disabled = !st.config;
+  arm.onclick = async () => {
+    arm.disabled = true;
+    const receipt = await action(arm.textContent);
+    if (receipt) arm.textContent = receipt.armed ? "disarm" : "arm";
+    arm.disabled = false;
+  };
+  const disable = el("button", { className: "act", textContent: "disable browser" });
+  disable.onclick = async () => {
+    disable.disabled = true;
+    if (await action("disable")) arm.disabled = true;
+    disable.disabled = false;
+  };
+  const save = el("button", { className: "act primary", textContent: "link profile" });
+  const cancel = el("button", { className: "act", textContent: "close" });
+  const close = openActionModal({ title: "Browser", width: 680, height: 700,
+    bodyNode: el("div", {}, note, extension, form, check, arm, disable, result),
+    dismissNode: cancel, actionNode: save });
+  save.onclick = async () => {
+    save.disabled = true;
+    if (await action("link", candidate())) { arm.disabled = false; arm.textContent = "disarm"; }
+    save.disabled = false;
+  };
+  cancel.onclick = close;
 }
 
 // Windows Test VM wizard — a single link-only modal (the house openModal/el

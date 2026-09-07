@@ -19,6 +19,7 @@ Usage:
 from __future__ import annotations
 
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -30,6 +31,12 @@ INSTANCE = ENGINE / "instance.json"
 # `block_auto` is true only when enable needs no operator-supplied host config.
 # `link` describes the supported boundary for operator-linked infrastructure.
 FEATURES: dict[str, dict] = {
+    "browser": {
+        "title": "Browser driving (bare metal, approval per connection)",
+        "block": "browser", "block_auto": False,
+        "link": ["Create the Chromium Subfloor profile, install Playwright Extension, then link GUI → Scripts → Browser",
+                 "Open Subfloor and approve each shell connection; sc browser doctor --json checks setup"],
+    },
     "pg": {
         "title": "Postgres sidecar (app-only)",
         "block": "pg",
@@ -122,8 +129,26 @@ def _resolve(name: str) -> dict:
     return f
 
 
+def _browser_operator():
+    if os.environ.get('SC_API_TOKEN'):
+        raise SystemExit('browser feature changes belong to the FnB host terminal or Scripts → Browser')
+
+
+def _browser_grants(enabled):
+    _browser_operator()
+    import browser
+    import skill
+    con = skill.connect()
+    try:
+        browser.set_grants(con, enabled)
+    finally:
+        con.close()
+
+
 def cmd_enable(name: str) -> int:
     f = _resolve(name)
+    if name == "browser":
+        _browser_grants(True)
     print(f"→ enable {name} — {f['title']}")
 
     cfg = _instance()
@@ -150,6 +175,13 @@ def cmd_disable(name: str) -> int:
 
     cfg = _instance()
     blk = f["block"]
+    if name == "browser":
+        import browser
+        _browser_operator()
+        browser.operate("disable")
+        _browser_grants(False)
+        print("  browser processes stopped; browser block removed")
+        return 0
     if blk in cfg:
         _update_instance({}, remove=(blk,))
         print(f"  config `{blk}` removed from instance.json")

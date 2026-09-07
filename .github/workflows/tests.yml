@@ -57,10 +57,13 @@ jobs:
         run: pip install pytest -r requirements.txt
       - name: Install exact OpenCode compatibility binary
         run: npm install --global opencode-ai@1.18.9
+      - name: Install the locked browser MCP compatibility set
+        run: npm ci --prefix .super-coder/browser --ignore-scripts --no-audit --no-fund
       - name: Run the suite
         run: ./sc test tests/ -q
         env:
           SC_REQUIRE_OPENCODE_CANARY: '1'
+          SC_REQUIRE_BROWSER_PACKAGE_CANARY: '1'
 
   # The end-to-end proof `./sc verify` runs: rebuild the DB from committed text
   # (schema + migrations + content.sql), flat-render, then a render-only boot —
