@@ -1,44 +1,39 @@
-# Automated fallback for recording docs/demo.gif — the README demo of
-# `./sc enter`. A live screen capture from the dos-app test repo may replace
-# the generated GIF when the demo needs to show concurrent browser/CLI state.
-#
-# Re-record from the repo root:  vhs docs/demo.tape
-# Needs: vhs + ttyd + ffmpeg on PATH, the fork's sandbox container up on an
-# image built since the kimi bake (`./sc build`, then relaunch) so all five
-# harnesses detect, host ~/.kimi-code logged in (bind-mounted for creds),
-# and a warm analytics sweep (run any boot once first) so the hidden
-# wait below covers the pre-session sweep comfortably.
+# Real terminal capture from the dedicated disposable dos-app installation.
+# Run from the Subfloor source checkout:
+# SC_DOCS_CAPTURE_REPO=/tmp/subfloor-docs-f73-dos-app vhs docs/demo.tape
+# Requires a running exact-ref sandbox, its fresh Demo roster, an available
+# CART1 shell, and existing Claude host authentication. See the capture record
+# in maintainer/public-documentation-refresh.md. Never simulate boot output.
 Output "docs/demo.gif"
 Set Shell "bash"
 Set FontSize 16
-Set Width 1000
-Set Height 780
+Set Width 1100
+Set Height 1000
 Set Padding 16
 Set Theme "Catppuccin Mocha"
 Set TypingSpeed 60ms
 
-Type "./sc enter"
-Enter
-Sleep 3.5s
-
-# Username prompt
-Type "Jed"
-Enter
-Sleep 3s
-
-# Shell picker — Cartographer (flavored shells sort first, cartographer at #1)
-Type "1"
-Enter
-Sleep 2.5s
-
-# Harness picker — kimi (adapter-dir order: claude, codex, kimi, opencode, vibe)
-Type "3"
+Hide
+Type "source ~/.bashrc; cd \"${SC_DOCS_CAPTURE_REPO:?set the disposable capture checkout}\"; unset SC_API_BASE SC_API_TOKEN; export PS1='$ '; clear"
 Enter
 Sleep 1s
+Show
+Type "subfloor enter"
+Enter
+Sleep 4s
+Type "Demo"
+Enter
+Sleep 4s
+Screenshot docs/images/cli-picker.png
 
-# The pre-session analytics sweep + boot happen here; skip the wait and
-# land on the finished frame: boot summary, Review GUI panel, harness up.
+# Fresh roster: Admin is 1, Cartographer is 2.
+Type "2"
+Enter
+Sleep 3s
+# Harness menu: Claude is 1. Its installed account must already be signed in.
+Type "1"
+Enter
 Hide
-Sleep 30s
+Sleep 35s
 Show
 Sleep 8s

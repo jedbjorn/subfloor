@@ -77,10 +77,24 @@ existing running fork's private data.
 
 ## Remaining delivery gates
 
-Tasks #796–#800 remain pending. Once preparation passes, correct the four core
-surfaces, then refresh workflows, audit all five adapter READMEs and the seven
-top-level engine runbooks, and capture the settled GUI inventory. Preserve the
-immutable checkpoints in `docs/deepseek-harness-removal.md` when labeling it.
+Tasks #795–#798 are complete: provisioned preparation, core correctness,
+public workflows, and the adapter/runbook audit. The DeepSeek removal document
+retains its exact-ref checkpoints beneath a historical/Admin applicability label.
+
+Task #799 is in progress. Sandbox launch and health pass; all five harnesses
+are detected and Claude reports existing authentication. Real interactive boot
+reaches Claude but then fails creating its temporary directory under the
+restricted execution view. Admin handoff #1808 and flag #616 track that capture
+blocker. The independent clone's origin now uses the original dos-app HTTPS
+GitHub transport, and launch refreshed its GitHub capability boundary.
+
+`maintainer/capture_public_docs.py` uses the existing visual-QA gallery and
+Playwright session against the dedicated live instance. Its page-ready capture
+supports Chats' persistent SSE stream. Previews prove navigation/capture only;
+empty Roadmap/Sprint views are not accepted as the required seeded assets.
+The updated `docs/demo.tape` selects Demo, Cartographer #2 and Claude #1. Its
+old tracked GIF is deliberately retained until a successful real recording can
+replace it. Task #800 remains pending.
 
 The visuals must cover the CLI picker, Roadmap Board and Flow, Worktrees, Chats,
 and Sprints. Review actual assets at rendered size for privacy and legibility.
