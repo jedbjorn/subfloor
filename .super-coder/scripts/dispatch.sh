@@ -1221,6 +1221,7 @@ case "$cmd" in
   skill)        exec "$PY" "$S/skill.py" "$@" ;;
   # Web search through the engine API (doc #215): the Tavily key stays on
   # the host; the shell only carries its own bearer token.
+  browser)      exec "$PY" "$S/browser.py" "$@" ;;
   search)       exec "$PY" "$S/web_search.py" "$@" ;;
   # Task context projection (doc #187): one read-only view of a task or
   # work unit — Assignment, Goal, Authority, Blockers, Boundaries,
@@ -1316,6 +1317,9 @@ case "$cmd" in
       sc_host_server_up || exit 1
       echo "  dev server:    \$SC_DEV_PORT=$(devport) → http://127.0.0.1:$(devport)"
       echo "  boot a shell:  subfloor enter [shortname]   (./sc enter is the same)"
+      if "$PY" -c 'import sys; sys.path.insert(0, sys.argv[1]); import browser; c=browser.read(); sys.exit(0 if c and c["armed"] else 1)' "$S"; then
+        "$PY" "$S/browser.py" up || true
+      fi
       sc_vm_broker_up || true
       sc_ts_broker_up || true
       sc_pm2_broker_up || true
@@ -1719,7 +1723,7 @@ Subfloor — forkable shell substrate for one repository
   Memory & catalogue    mem · map · map-sql · map-schema · sql · skill · search · context · models · job · pr · sprint · token
   Engine (Admin)        rebuild · migrate · migration · snapshot · render · render-check · verify
                         seed-skills · engine-ref · clean-db
-  Host brokers          vm · vm-broker-* · ts-broker-* · pm2-broker-* · db-broker-* · db-init · pg-*
+  Host brokers          browser · vm · vm-broker-* · ts-broker-* · pm2-broker-* · db-broker-* · db-init · pg-*
   Primitives            serve · boot · run · deps · lint · typecheck · build · logs · health · ports · preview
 
   Full reference: ./sc help --all · docs: docs/README.md#cli--dev-kit
@@ -1770,6 +1774,7 @@ Subfloor — forkable shell substrate — full command reference (./sc help for 
                            subscribe the authenticated Developer shell to engine-wide PR event wakes
   ./sc sprint <cmd>        authenticated Sprints v2 actions (run without a command for the full verb list)
                              caller identity is resolved by the engine; report and review bodies use files, and mutating retries carry stable keys where required
+  ./sc browser <verb>      status/up/down/doctor/arm/disarm — opt-in Chromium profile driving
   ./sc token               print the browser sign-in operator token — an Admin/operator recovery capability;
                              stdout carries only the token and failure names the supported service action
   sc engine-ref            print the full engine pin from the canonical live checkout — safe from any shell

@@ -73,7 +73,7 @@ class ClaudeAdapter(ConversationAdapter):
     ) -> list[str]:
         hcfg = self.manifest["headless"]
         command = list(hcfg["launch"])
-        command.extend(managed_mcp_launch_args(self.manifest))
+        command.extend(managed_mcp_launch_args(self.manifest, context))
         prompt_flag = hcfg.get("prompt_flag", "-p")
         command.extend([prompt_flag, message])
         command.extend(self.manifest["conversation"]["start"]["stream_flags"])

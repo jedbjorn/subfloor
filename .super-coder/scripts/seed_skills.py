@@ -210,7 +210,8 @@ def reconcile_standard_flavor_packs(
         raise ValueError(f"unknown standard flavor: {unknown[0]}")
 
     upstream = set(seeded_skill_names())
-    managed = upstream | set(tombstoned_skill_names()) | {"dev_kit"}
+    managed = (upstream | set(tombstoned_skill_names()) | {"dev_kit"}) - {"drive_browser"}
+    # Browser grants are owned by feature enable/disable, not the default pack.
     common = {
         row[0]
         for row in con.execute(

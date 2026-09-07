@@ -100,6 +100,7 @@ from quota_probes import dispatch as quota_dispatch  # noqa: E402  (account quot
 import vm as vm_mod  # noqa: E402  (Windows Test VM — config + live checks)
 import ts as ts_mod  # noqa: E402  (tailnet — config + live checks)
 import pm2 as pm2_mod  # noqa: E402  (host pm2 stack — config + live checks)
+import browser as browser_mod
 import web_search as web_search_mod  # noqa: E402  (Tavily — key store + client, doc #215)
 import task_context  # noqa: E402  (six-part task/work-unit projection, doc #187)
 sys.path.insert(0, str(ENGINE / "render"))
@@ -3931,6 +3932,27 @@ class Handler(BaseHTTPRequestHandler):
         finally:
             con.close()
 
+    def _browser_shell_post(self, body):
+        sid = self._require_shell_auth()
+        if sid is None:
+            return
+        if body.get('action') != 'status':
+            return self._send(403, {'error': 'Browser lifecycle and arm are owned by the FnB; shells may read status only.'})
+        con = db()
+        try:
+            row = con.execute('SELECT shortname FROM shells WHERE shell_id=?', (sid,)).fetchone()
+            result = browser_mod.status(harness=body.get('harness'), sandbox=bool(body.get('sandbox')))
+            config = browser_mod.read()
+            if config and result.get('supported'):
+                result['proxy_url'] = f"http://127.0.0.1:{config['proxy_port']}/mcp/{row['shortname'].upper()}"
+                result['tab_group'] = f"Playwright · Subfloor {row['shortname'].upper()}"
+                result['output_dir'] = str(browser_mod.private() / 'sessions')
+            return self._send(200, result)
+        except (ValueError, OSError) as exc:
+            return self._send(503, {'state': 'failed', 'error': str(exc)})
+        finally:
+            con.close()
+
     # -- /_sc/search — token-scoped web search (doc #215) --
 
     def _search_post(self, body: dict):
@@ -5220,6 +5242,11 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, {"scripts": script_list()})
             if path == "/api/vm":
                 return self._send(200, {"vm": vm_mod.read()})
+            if path == "/api/browser":
+                if not self._require_browser_operator(con, "browser configuration"):
+                    return
+                return self._send(200, {**browser_mod.status(), "config": browser_mod.read(),
+                    "defaults": {"user_data_dir": str(Path.home() / ".config/chromium"), "executable": "/usr/lib/chromium/chromium"}})
             if path == "/api/web-search":
                 # Status only — configured / provider / last-four hint / when.
                 # The key itself never crosses this boundary (doc #215).
@@ -5275,10 +5302,34 @@ class Handler(BaseHTTPRequestHandler):
             return self._pr_post(path, self._body())
         if path.startswith("/_sc/sprint/"):
             return self._sprint_post(path, self._body())
+        if path == "/_sc/browser":
+            return self._browser_shell_post(self._body())
         if path == "/_sc/search":
             return self._search_post(self._body())
         con = db()
         try:
+            if path == "/api/browser":
+                if not self._require_browser_operator(con, "browser configuration"):
+                    return
+                if not self._require_browser_mutation_origin("browser configuration changes"):
+                    return
+                body = self._body()
+                action = body.get('action')
+                try:
+                    if action == 'validate':
+                        result = browser_mod.link(body.get('config', {}), save=False)
+                    elif action == 'link':
+                        result = browser_mod.link(body.get('config', {}))
+                        browser_mod.set_grants(con, True)
+                    elif action in ('doctor', 'arm', 'disarm', 'up', 'down', 'disable'):
+                        result = browser_mod.operate(action)
+                        if action == 'disable':
+                            browser_mod.set_grants(con, False)
+                    else:
+                        return self._send(400, {'error': 'unknown browser action'})
+                except (ValueError, OSError, subprocess.SubprocessError) as exc:
+                    return self._send(400, {'state': 'failed', 'error': str(exc)})
+                return self._send(200, result)
             if path == "/api/web-search/validate":
                 # Test-before-save: probe Tavily with the IN-PROGRESS key (or
                 # the stored one when none is supplied). A failed probe is a

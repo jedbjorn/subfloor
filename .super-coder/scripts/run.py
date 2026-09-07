@@ -35,6 +35,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import shutil
 import socket
 import sqlite3
@@ -168,7 +169,13 @@ def collect_dev_tools(
         app_database = "invalid (empty DATABASE_URL)"
     else:
         app_database = "configured (URL withheld)"
+    import browser
+    try:
+        browser_state = browser.status(sandbox=launch_mode == "container")["state"]
+    except (OSError, ValueError):
+        browser_state = "failed"
     common = {
+        "browser": browser_state,
         "checkout": str(checkout),
         "seat": launch_mode,
         "evidence": str(status_path if status_path.exists() else evidence_root),
@@ -511,6 +518,7 @@ def headless_command(
     effort: "str | None" = None,
     transport: "route_transport.TransportProjection | None" = None,
     conversation_owned: bool = False,
+    shortname: str | None = None,
 ) -> "list[str] | None":
     """The non-interactive exec argv from the adapter's `headless` block —
     launch prefix + model flag + launch-mode flags + the prompt as the final
@@ -545,7 +553,7 @@ def headless_command(
         cmd = [sys.executable, str(script_path)]
     else:
         cmd = list(hcfg["launch"])
-    managed_mcp = managed_mcp_injection(adapter)
+    managed_mcp = managed_mcp_injection(adapter, shortname)
     if managed_mcp:
         cmd += list(managed_mcp.get("launch_args") or [])
     if model:
@@ -597,34 +605,50 @@ def linked_vm_configured() -> bool:
     return bool(ports_mod.resolve(persist=False).get("vm"))
 
 
-def managed_mcp_injection(adapter: dict) -> dict | None:
-    """Return one adapter's validated managed streamable-HTTP MCP recipe.
-
-    The adapter owns the harness-specific representation. The launcher only
-    consumes optional argv and JSON-merge fragments, so adding a harness never
-    grows a harness-name switch here.
-    """
-    if not linked_vm_configured():
-        return None
+def managed_mcp_injection(adapter: dict, shortname: str | None = None, *, sandbox: bool | None = None) -> dict | None:
+    """Combine adapter-owned recipes enabled by their instance block."""
+    config = ports_mod.resolve(persist=False)
     streamable = (adapter.get("mcp") or {}).get("streamable_http") or {}
     if not streamable.get("supported"):
         return None
-    managed = streamable.get("managed_server")
-    if not isinstance(managed, dict):
-        raise ValueError(
-            f"harness '{adapter.get('harness', '?')}' declares streamable HTTP MCP "
-            "support without a managed_server recipe"
-        )
-    if not managed.get("name") or not managed.get("url"):
-        raise ValueError(
-            f"harness '{adapter.get('harness', '?')}' has an incomplete managed "
-            "streamable HTTP MCP recipe"
-        )
-    if not managed.get("launch_args") and not managed.get("merge_json"):
-        raise ValueError(
-            f"harness '{adapter.get('harness', '?')}' has no managed MCP injection"
-        )
-    return managed
+    recipes = streamable.get("managed_servers")
+    if not isinstance(recipes, list):
+        raise ValueError("supported adapter must declare managed_servers")
+    result = None
+    sandbox = bool(os.environ.get("SC_SANDBOX")) if sandbox is None else sandbox
+    for recipe in recipes:
+        required = recipe.get("requires")
+        enabled = linked_vm_configured() if required == "vm" else bool(config.get(required))
+        if not enabled:
+            continue
+        if required == "browser" and sandbox:
+            continue
+        if not recipe.get("name") or not recipe.get("url") or not (recipe.get("launch_args") or recipe.get("merge_json")):
+            raise ValueError("incomplete managed MCP recipe")
+        item = json.loads(json.dumps({key: value for key, value in recipe.items() if key != "requires"}))
+        if required == "browser":
+            identity = shortname or os.environ.get("SC_SHELL_SHORTNAME", "")
+            if not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", identity):
+                raise ValueError("browser MCP injection requires the launched shell shortname")
+            port = config['browser']['proxy_port']
+            def expand(value, port=port, identity=identity):
+                if isinstance(value, str):
+                    return value.replace("{port}", str(port)).replace("{shortname}", identity.upper())
+                if isinstance(value, list):
+                    return [expand(x) for x in value]
+                if isinstance(value, dict):
+                    return {key: expand(val) for key, val in value.items()}
+                return value
+            item = expand(item)
+        if result is None:
+            result = item
+            continue
+        result.setdefault('launch_args', []).extend(item.get('launch_args', []))
+        for filename, fragment in item.get('merge_json', {}).items():
+            merged = result.setdefault('merge_json', {}).setdefault(filename, {})
+            for key, value in fragment.items():
+                merged.setdefault(key, {}).update(value)
+    return result
 
 
 def emit_adapter(adapter: dict, root: Path = REPO_ROOT) -> list[str]:
@@ -747,9 +771,9 @@ def apply_merge_json(adapter: dict, root: Path = REPO_ROOT) -> list[str]:
     return _merge_json_spec(adapter.get("merge_json") or {}, root)
 
 
-def apply_managed_mcp(adapter: dict, root: Path = REPO_ROOT) -> list[str]:
+def apply_managed_mcp(adapter: dict, root: Path = REPO_ROOT, shortname: str | None = None) -> list[str]:
     """Apply the supported adapter's generated JSON MCP fragment, if any."""
-    managed = managed_mcp_injection(adapter)
+    managed = managed_mcp_injection(adapter, shortname)
     return _merge_json_spec((managed or {}).get("merge_json") or {}, root)
 
 
@@ -1944,7 +1968,7 @@ def prepare_launch(*, shell_id: int, harness: "str | None" = None,
     emit_adapter(adapter, work_dir)
     resolve_opencode_plugins(work_dir)
     apply_merge_json(adapter, work_dir)
-    apply_managed_mcp(adapter, work_dir)
+    apply_managed_mcp(adapter, work_dir, chosen["shortname"])
     apply_sandbox(adapter, work_dir)
 
     route_projection = None
@@ -2004,12 +2028,12 @@ def prepare_launch(*, shell_id: int, harness: "str | None" = None,
         argv = headless_command(
             adapter, headless_prompt, session_model,
             mode_flags, session_effort, transport=route_projection,
-            conversation_owned=conversation_owned,
+            conversation_owned=conversation_owned, shortname=chosen["shortname"],
         )
         if argv is None:
             raise LaunchError(f"harness '{harness}' has no headless adapter")
     else:
-        managed = managed_mcp_injection(adapter)
+        managed = managed_mcp_injection(adapter, chosen["shortname"])
         argv = (
             list(adapter.get("launch") or [harness])
             + list((managed or {}).get("launch_args") or [])
@@ -2558,7 +2582,7 @@ def main() -> None:
     merged = apply_merge_json(adapter, work_dir)
     if merged:
         print(f"→ harness config → {', '.join(merged)}")
-    managed_files = apply_managed_mcp(adapter, work_dir)
+    managed_files = apply_managed_mcp(adapter, work_dir, chosen["shortname"])
     if managed_files:
         print(f"→ managed MCP → {', '.join(managed_files)}")
     sandboxed = apply_sandbox(adapter, work_dir)
@@ -2590,7 +2614,7 @@ def main() -> None:
         effective_prompt = prompt or DEFAULT_HEADLESS_PROMPT
         headless_cmd = headless_command(
             adapter, effective_prompt, hmodel, mode_flags,
-            session_effort)
+            session_effort, shortname=chosen["shortname"])
         if headless_cmd is None:
             sys.exit(f"sc run: harness '{harness}' has no headless adapter — "
                      f"use claude, codex, opencode, or kimi")
@@ -2619,7 +2643,7 @@ def main() -> None:
     if not headless and ncfg.get("flag") and full["display_name"]:
         name_args = [ncfg["flag"], full["display_name"]]
 
-    managed = managed_mcp_injection(adapter)
+    managed = managed_mcp_injection(adapter, chosen["shortname"])
     cmd = (
         headless_cmd
         if headless

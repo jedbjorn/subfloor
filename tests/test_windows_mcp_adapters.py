@@ -33,7 +33,7 @@ class WindowsMcpAdapterContractTest(unittest.TestCase):
         for harness in ("claude", "codex", "opencode", "kimi", "vibe"):
             streamable = self.adapter(harness)["mcp"]["streamable_http"]
             if streamable["supported"]:
-                supported[harness] = streamable["managed_server"]["url"]
+                supported[harness] = streamable["managed_servers"][0]["url"]
             else:
                 unsupported[harness] = streamable["reason"]
 

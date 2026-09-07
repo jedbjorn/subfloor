@@ -752,11 +752,13 @@ def load_manifest(harness: str) -> dict[str, Any]:
     return manifest
 
 
-def managed_mcp_launch_args(manifest: Mapping[str, Any]) -> list[str]:
+def managed_mcp_launch_args(manifest: Mapping[str, Any], context: ConversationContext | None = None) -> list[str]:
     """Resolve browser-native argv through the canonical launch MCP seam."""
     from run import managed_mcp_injection
 
-    managed = managed_mcp_injection(dict(manifest))
+    managed = managed_mcp_injection(dict(manifest),
+        context.env.get("SC_SHELL_SHORTNAME") if context else None,
+        sandbox=bool(context.env.get("SC_SANDBOX")) if context else None)
     return list((managed or {}).get("launch_args") or [])
 
 

@@ -236,7 +236,7 @@ class CodexAdapter(ConversationAdapter):
             self._rpc = JsonLineRpcProcess(
                 argv=context.execution_argv([
                     launch,
-                    *managed_mcp_launch_args(self.manifest),
+                    *managed_mcp_launch_args(self.manifest, context),
                     "app-server",
                     "--stdio",
                 ]),

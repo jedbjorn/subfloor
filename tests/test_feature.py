@@ -15,7 +15,7 @@ import feature
 
 class RegistryIntegrityTest(unittest.TestCase):
     def test_registry_contains_only_infrastructure_features(self):
-        self.assertEqual(set(feature.FEATURES), {"pg", "windows", "tailnet", "pm2"})
+        self.assertEqual(set(feature.FEATURES), {"pg", "windows", "tailnet", "pm2", "browser"})
 
     def test_registry_shape(self):
         for name, f in feature.FEATURES.items():

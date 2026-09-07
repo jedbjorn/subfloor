@@ -55,7 +55,7 @@ COMPLETION_VERBS = (
     "install doctor rollback update-harnesses harness-status feature runtime "
     "remove eject persist mem map map-sql map-schema sql skill models job pr "
     "sprint token verify render render-check snapshot rebuild migrate migration "
-    "build logs serve health ports preview run boot deps lint typecheck"
+    "build logs serve health ports preview run boot deps lint typecheck browser"
 )
 
 _RESOLVE_COMMENT = (
