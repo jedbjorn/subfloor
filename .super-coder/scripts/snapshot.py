@@ -23,7 +23,6 @@ Usage:
 from __future__ import annotations
 
 import json
-import os
 import sqlite3  # kept for map.db (which stays SQLite)
 import sys
 import urllib.error
@@ -630,14 +629,56 @@ def _main_runtime_owned() -> int:
     return 0
 
 
+def _runtime_health(base: str) -> dict | None:
+    """Read the identity a runtime publishes, or None when none answers."""
+    try:
+        with urllib.request.urlopen(base + "/api/health", timeout=10) as response:
+            payload = json.loads(response.read())
+    except (urllib.error.URLError, OSError, ValueError, TypeError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _owns_this_checkout(health: dict) -> bool:
+    """True unless the runtime answering our port names a different repo.
+
+    An engine older than this field cannot be checked, so it is accepted: that
+    is exactly the pre-existing behaviour, and `./sc update` serializes through
+    the live runtime it is about to replace. Refusing there would break the
+    update it is meant to protect.
+    """
+    root = health.get("repo_root")
+    if not isinstance(root, str) or not root:
+        return True
+    return Path(root) == REPO_ROOT
+
+
 def _snapshot_via_runtime_api() -> str | None:
-    """Ask a healthy runtime to serialize; return None only when it is absent."""
-    base = os.environ.get("SC_API_BASE", "").rstrip("/")
-    if not base:
-        port = ports.resolve(persist=False).get("port")
-        if not isinstance(port, int):
-            return None
-        base = f"http://127.0.0.1:{port}"
+    """Ask this repo's healthy runtime to serialize; None when it is absent.
+
+    The target is always the port THIS repo resolves — never the ambient
+    ``SC_API_BASE``. Inside a launched shell that variable names the runtime of
+    the installation that booted the seat, so an install or update run from
+    such a seat handed its serialize command to a foreign instance: that
+    instance re-dumped its own DB and the new checkout was left with no
+    content.sql. The port is checked too, because a non-sibling fork with the
+    same derived offset is invisible to the sibling registry and can already be
+    answering on it.
+    """
+    port = ports.resolve(persist=False).get("port")
+    if not isinstance(port, int):
+        return None
+    base = f"http://127.0.0.1:{port}"
+    health = _runtime_health(base)
+    if health is None:
+        return None
+    if not _owns_this_checkout(health):
+        served = health.get("repo_root") or health.get("repo") or "unknown"
+        print(
+            f"snapshot: {base} is serving {served}, not {REPO_ROOT} — "
+            "serializing this checkout offline instead"
+        )
+        return None
     request = urllib.request.Request(
         base + "/api/scripts/snapshot", data=b"", method="POST"
     )

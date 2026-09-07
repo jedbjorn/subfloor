@@ -78,5 +78,86 @@ class SnapshotLiveRuntimeTest(unittest.TestCase):
         self.assertEqual(server._SCRIPTS["snapshot"][2][-1], "--runtime-owned")
 
 
+class SnapshotRuntimeTargetTest(unittest.TestCase):
+    """The serialize command may only ever reach THIS checkout's runtime."""
+
+    def test_ambient_api_base_never_redirects_the_serialize_command(self) -> None:
+        """An install/update run from a launched seat inherits SC_API_BASE
+        pointing at the runtime that booted the seat — a different
+        installation. Honouring it made that instance re-dump its own DB and
+        left this checkout with no content.sql."""
+        posted: list[str] = []
+
+        def urlopen(request, timeout=None):
+            posted.append(request.full_url)
+            response = mock.MagicMock()
+            response.__enter__.return_value.read.return_value = (
+                b'{"ok": true, "output": "snapshot: wrote live"}'
+            )
+            return response
+
+        with mock.patch.dict(
+            os.environ,
+            {"SC_API_BASE": "http://127.0.0.1:8801", "SC_API_TOKEN": "foreign"},
+            clear=False,
+        ), mock.patch.object(
+            snapshot.ports, "resolve", return_value={"port": 8842}
+        ), mock.patch.object(
+            snapshot,
+            "_runtime_health",
+            return_value={"ok": True, "repo_root": str(snapshot.REPO_ROOT)},
+        ), mock.patch.object(snapshot.urllib.request, "urlopen", urlopen):
+            self.assertEqual(
+                snapshot._snapshot_via_runtime_api(), "snapshot: wrote live"
+            )
+
+        self.assertEqual(posted, ["http://127.0.0.1:8842/api/scripts/snapshot"])
+
+    def test_health_probe_targets_this_repo_port(self) -> None:
+        with mock.patch.dict(
+            os.environ, {"SC_API_BASE": "http://127.0.0.1:8801"}, clear=False
+        ), mock.patch.object(
+            snapshot.ports, "resolve", return_value={"port": 8842}
+        ), mock.patch.object(
+            snapshot, "_runtime_health", return_value=None
+        ) as health:
+            self.assertIsNone(snapshot._snapshot_via_runtime_api())
+
+        health.assert_called_once_with("http://127.0.0.1:8842")
+
+    def test_foreign_runtime_on_our_port_falls_back_to_offline(self) -> None:
+        with mock.patch.object(
+            snapshot.ports, "resolve", return_value={"port": 8842}
+        ), mock.patch.object(
+            snapshot,
+            "_runtime_health",
+            return_value={"ok": True, "repo": "stranger", "repo_root": "/tmp/stranger"},
+        ), mock.patch.object(
+            snapshot.urllib.request,
+            "urlopen",
+            side_effect=AssertionError("wrote through a foreign runtime"),
+        ), contextlib.redirect_stdout(io.StringIO()) as output:
+            self.assertIsNone(snapshot._snapshot_via_runtime_api())
+
+        self.assertIn("/tmp/stranger", output.getvalue())
+
+    def test_ownership_accepts_an_engine_that_predates_repo_root(self) -> None:
+        """`./sc update` serializes through the live runtime it replaces; an
+        engine too old to publish its root must still be usable."""
+        self.assertTrue(snapshot._owns_this_checkout({"ok": True, "repo": "old"}))
+        self.assertTrue(
+            snapshot._owns_this_checkout({"repo_root": str(snapshot.REPO_ROOT)})
+        )
+        self.assertFalse(snapshot._owns_this_checkout({"repo_root": "/tmp/stranger"}))
+
+    def test_health_publishes_the_exact_repo_root(self) -> None:
+        with mock.patch.object(
+            server.ports_mod, "resolve", return_value={"repo": "fork", "port": 8842}
+        ):
+            payload = server.health_payload()
+
+        self.assertEqual(payload["repo_root"], str(server.REPO_ROOT))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
