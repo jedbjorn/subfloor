@@ -76,7 +76,7 @@ Free to use, open source, MIT License.
   automation without inventing a second conversation or memory system.
   ([*Messages, jobs & headless launch*](docs/README.md#messages-jobs--headless-launch))
 - **A standing team, not a session.** Shells are DB rows — identity, memory,
-  decisions, skills — that survive every session and boot on any of four
+  decisions, skills — that survive every session and boot on any of five
   harnesses; the same shell can run Claude Code today and OpenCode tomorrow.
   ([*The loop*](docs/README.md#the-loop) · [*Harnesses & models*](docs/README.md#harnesses--models))
 - **Sidecars + brokers: capability without credentials.** A sandboxed shell
@@ -87,7 +87,7 @@ Free to use, open source, MIT License.
   ([*Opt-in features*](docs/README.md#opt-in-features))
 - **Worktrees + guardrails.** Every shell boots into its own git worktree on
   a base pinned to `origin/main`; a branch-guard blocks work on `main` in
-  every harness; merging stays the operator's gate. Parallel shells, no
+  every harness; merging follows the operator directive or armed Sprint grant. Parallel shells, no
   clobbering, no surprise commits.
   ([*Shells & worktrees*](docs/README.md#shells--worktrees))
 - **Self-updating, in place.** `./sc update` pulls the new engine and
@@ -105,7 +105,7 @@ graph TD
   REN --> BOOT[CLAUDE.md / AGENTS.md]:::class2
   BOOT --> H[harness loop]:::class3
   H --> REPO[your repo]:::class4
-  DB -.local snapshot.-> SQL[.sc-state/local/content.sql]:::class2
+  DB -.local snapshot.-> SQL[Private instance snapshot]:::class2
 ```
 
 How the overlay works — every property injected through an extension point the

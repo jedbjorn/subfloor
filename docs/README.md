@@ -34,7 +34,7 @@ ships — nothing patched, nothing forked:
 The overlay makes the harness you rent behave like it has all of this built
 in — without touching its loop. Think **distro over kernel**: the kernel (the
 harness) runs the process; the distro (subfloor) gives it users, packages,
-init, and permissions. Four harnesses, one overlay, zero forks of anyone's
+init, and permissions. Five harnesses, one overlay, zero forks of anyone's
 loop — that is what harness-agnostic means in practice, and it's why a fork
 is cheap: same overlay, whichever kernel you rent underneath.
 
@@ -47,11 +47,11 @@ value: 5
 label: Coding harnesses
 description: Claude · Codex · OpenCode · Vibe · Kimi
 :::class3
-value: 5
+value: 6
 label: Shell flavors
-description: planner · reviewer · dev · cartographer · admin
+description: planner · reviewer · dev · cartographer · admin · devops
 :::class2
-value: 9
+value: 10
 label: Review-GUI tabs
 :::class2
 value: 88xx
@@ -65,7 +65,7 @@ label: Per-repo port band
                       fork (see .super-coder/README.md); tracked only in this
                       source repo, where the engine IS the project
 .sc-state/            fork-owned: tracked engine.ref (the upstream SHA pin)
-                      + ignored local/ (DB snapshot, map, flat renders)
+                       + ignored local/ (map and flat renders)
 .claude/skills/       per-shell skills, rendered at boot — gitignored
 .sc-worktrees/        one git worktree per shell — gitignored (admin excepted;
                       see "How shells share one repo")
@@ -76,6 +76,13 @@ A fork's git surfaces show **only its project** — the engine is a dependency,
 not committed source, exactly like `node_modules/`. Instance identity, memory,
 maps, and renders stay local. A fresh clone is a new instance; it does not clone
 another installation's shells or memory.
+
+The live engine DB, canonical snapshot and backups use private XDG instance
+state. Ordinary downstream shells cannot inspect that state or use general
+engine SQL: `sc mem` and other granted API commands provide their working
+surface. Admin owns maintenance and recovery. The repository catalogue
+(`sc map-schema`, `sc map-sql`) describes project source and is separate from
+engine memory and the application's own database.
 
 ## Install
 
@@ -202,19 +209,20 @@ your git surfaces show only your project — the engine no longer appears in
 `git status`. It refuses to run in the subfloor source repo or on an
 already-installed fork (guarding against content loss).
 
-Interactive by default (prompts for your **primary** shell's name/role/mandate —
-the rest of the team is auto-named); pass flags to script it. `--flavor` picks
+Interactive installation prompts for your **operator username**. The ten-shell
+roster is seeded automatically; optional flags customize the primary shell. `--flavor` picks
 which roster slot is your primary (default `planner`):
 
 ```bash
-python3 .super-coder/scripts/install.py \
+./sc install \
     --username Jed --name Lead --shortname lead \
     --role "Planning lead" --mandate "Scope and steer the work in this repo."
 ```
 
 After `./sc enter` you're talking to the shell, working your repo. Author
-memory, roadmap, and specs into the DB; `./sc snapshot` (+ `./sc render`)
-serializes back to the text git tracks.
+memory, roadmap, and specs through the API-backed shell commands. Admin
+snapshot and render operations preserve private state and refresh ignored
+local visibility files; those files do not enter Git.
 
 ### Harness sign-in
 
@@ -324,20 +332,20 @@ it owns:
    feature — viability, blockers, the done-condition — under the spec contract
    in its system prompt, formatted per `themed_markdown`.
    *(planner · system prompt, `themed_markdown` · UI: Roadmap)*
-4. **Switch to dev** — `./sc enter-dev` boots the **dev** shell into its own git
-   worktree on `shell/dev`, a base pinned to `origin/main`. A first boot shows
+4. **Switch to dev** — `subfloor enter DEV1` boots the **dev** shell into its own git
+   worktree on `shell/dev1`, a base pinned to `origin/main`. A first boot shows
    FIRST RUN: read the map, read yourself, skim the plan, set `current_state`,
    `sc mem oriented`. *(dev · boot · UI: Shells)*
 5. **Break it into tasks** — dev reads the spec and follows SPEC EXECUTION in
    its system prompt to decompose it into `spec_tasks` (Preparation → steps →
    Verification), then works one task per session. `current_state` ("last /
    next task") lets sessions resume cleanly. *(dev · system prompt · UI: Roadmap)*
-6. **Implement** — within each task, dev cuts a feature branch off `shell/dev`,
+6. **Implement** — within each task, dev cuts a feature branch off `shell/dev1`,
    writes code, schema, and tests, then uses the exact `## DEV TOOLS` boot
    inventory to run the fork's declared checks.
    *(dev · ambient DEV TOOLS, `redline_review` · UI: Shells)*
 7. **Send to review** — dev pushes and opens a PR (boot VERSION CONTROL:
-   branch → commit → push → **PR → stop**; commits carry the shell's trailer
+   branch → commit → push → **PR → stop**; commits are attributed to the shell
    automatically), then messages the reviewer with `sc mem message send`.
    *(dev · boot · UI: Flags)*
 8. **Review, send back** — the **reviewer** reads the diff against the spec
@@ -371,7 +379,7 @@ it owns:
 ## Harnesses & models
 
 > [!class2]
-> **UI** Shells (flavor model defaults) · **Shells** all five flavors
+> **UI** Shells (flavor model defaults) · **Shells** all six flavors
 
 ### Prefer a subscription plan over a raw API key
 
@@ -481,7 +489,7 @@ multi-fork case and why the regression was invisible:
 > [!class2]
 > **UI** Shells · Worktrees · **Shells** all flavors; admin is the only one on `main`
 
-A fork boots a **whole team** out of the box — `planner` · 2×`dev` · `reviewer`
+A fork boots a **ten-shell team** out of the box — 2×`planner` · 4×`dev` · 2×`reviewer`
 · `admin` · `cartographer` — and you add or retire shells from the GUI as
 needed. They all work the same repo without clobbering each other:
 
@@ -502,7 +510,7 @@ needed. They all work the same repo without clobbering each other:
   worktree is blocked (and an out-of-worktree edit to a feature branch warns).
 - **The admin shell is the one exception.** It boots in the **repo root** on
   `main` and maintains it directly — engine updates, rollbacks, migrations,
-  applying approved patches, fork-local skills. The branch-guard exempts it
+  applying approved maintenance. Planner owns fork-local skills. The branch-guard exempts it
   (and only it). Working shells consume the substrate; admin owns the floor.
 - **Reviewing a shell's UI work:** worktree edits never show on your main dev
   server. `./sc preview` serves every shell worktree's UI live (HMR) on the
@@ -690,7 +698,7 @@ given a bypass recipe.
 `./sc update` fetches the engine from the `super-coder` remote and
 **materializes** it into the gitignored `.super-coder/` dir (the engine is a
 dependency — code, schema, migrations, skills; your `.sc-state/`, DB, and
-`instance.json` are never touched), **pins** the new upstream SHA in
+`instance.json` are preserved as instance-owned inputs), **pins** the new upstream SHA in
 `.sc-state/engine.ref` (keeping the prior one as `engine.ref.prev`), backs up the
 live DB, **applies pending migrations in place** (never a rebuild-from-snapshot —
 your unsnapshotted in-session writes survive), syncs the skills catalogue
@@ -799,9 +807,9 @@ fits the **fork-owned extension points**, you never touch engine files, and
 |---|---|
 | **Local skills** | Planner-authored capability/process descriptions via `sc skill put` — DB-canonical, serialized in `content.sql`, explicitly granted, and preserved byte-for-byte across update/rebuild |
 | **Flavor overlays** | `.sc-state/flavors/<flavor>.json` — fork identity text (`role`, `mandate`, `focus`, `abbr`); skill assignments use `sc skill grant/revoke` instead |
-| **Skill retire list** | `.sc-state/skills_retired.json` (written by `./sc skill retire <name>`) — engine skills this fork has taken out of service, e.g. ones superseded by a fork-local skill. Retired skills leave every surface (boot doc, renders, grants) on ALL shells and stay retired across updates; `unretire` restores them, grants intact |
+| **Skill retire list** | `.sc-state/local/skills_retired.json` (written by `./sc skill retire <name>`) — engine skills this fork has taken out of service, e.g. ones superseded by a fork-local skill. Retired skills leave every surface (boot doc, renders, grants) on ALL shells and stay retired across updates; `unretire` restores them, grants intact |
 | **`instance.json`** | Per-fork config: ports, harness default, the `pg` / `vm` / `ts` opt-in blocks |
-| **`.sc-state/`** | Your memory (content.sql), map tuning, engine pin — the fork's one tracked artifact |
+| **`.sc-state/`** | Tracked engine provenance plus ignored local map and renders; memory stays in private instance state |
 | **Per-shell identity** | `current_state`, connections, decisions, seed — all DB rows, all yours |
 | **Your project** | Everything outside `.super-coder/` — the engine never touches it |
 
@@ -855,16 +863,16 @@ launch, enter, snapshot, render, and the GUI work unchanged.
                          #   completion lands in your inbox (wait/list/status/tail/kill complete the set)
 ./sc mem <cmd>           # a shell's own memory over the engine API (state · seed · lns · decision ·
                          #   flag · roadmap · doc · narrative) — identity is the shell's token
-sc sql "<query>"         # read-only passthrough to the engine DB; `sc map-sql` for the repo-map dr_*
+# General engine SQL is Admin-only; ordinary shells use sc mem and sc map-sql.
 ./sc down                # stop + remove the sandbox container
 ./sc restart             # confirm + refresh harnesses + build + DB backup, then down + launch
 ./sc restart --no-build  # confirm + DB backup, then bounce on the existing image
 ./sc persist             # reboot-proof the host daemons: install every applicable systemd --user unit
 ./sc logs                # tail the sandbox server logs
-./sc rebuild             # rebuild .super-coder/shell_db.db from schema + migrations + snapshot
+./sc rebuild             # Admin: rebuild private engine DB from schema + migrations + snapshot
 ./sc render              # regenerate ignored flat _sc files beneath .sc-state/local/
 ./sc render-check        # fail if the local _sc files drift from the DB render
-./sc snapshot            # serialize per-instance tables → .sc-state/local/content.sql
+./sc snapshot            # Admin: serialize per-instance tables to the private snapshot
 ./sc preview             # live worktree UI previews, one subdomain per shell
 ./sc update              # fetch + materialize the engine, reconcile in place (--ref <tag|sha> pins)
 ./sc rollback            # sound undo of a bad update (restore DB + engine)
@@ -881,8 +889,8 @@ sc sql "<query>"         # read-only passthrough to the engine DB; `sc map-sql` 
 can boot the same shell. At launch, after you pick a shell: `--harness <name>` or
 `HARNESS=<name>` forces one; otherwise, when more than one harness is on `PATH`,
 you're prompted (default = your fork's `instance.json` harness). The pick is
-per-launch and never written back — so two terminals can run the **same** shell on
-different harnesses at once (one Claude Code, one OpenCode). A fork with a single
+per-launch. Each shell has one owner at a time: use different shells for
+concurrent work, or close the current session before switching harnesses. A fork with a single
 harness on `PATH` skips the prompt.
 
 **`subfloor`.** One command across every fork — `subfloor <verb> [args]` — so
@@ -1346,28 +1354,28 @@ to say so rather than improvise a key of its own.
 ## Review GUI
 
 > [!class2]
-> **UI** this IS the GUI — Chats · Shells · Roadmap · Docs · Flags · Worktrees · Map · Analytics · Scripts · **Shells** reviewer (every shell reads it)
+> **UI** this IS the GUI — Chats · Sprints · Shells · Roadmap · Docs · Flags · Worktrees · Map · Analytics · Scripts · **Shells** reviewer (every shell reads it)
 
 A zero-dependency localhost GUI to review the substrate and hold normal browser
 conversations. One stdlib Python server serves the JSON API, static UI, and
-conversation event stream; no venv, no npm, no build step. Its nine tabs are
+conversation event stream; no venv, no npm, no build step. Its ten tabs are
 the windows the workflow above refers to:
 
 | Tab | What it shows |
 |---|---|
 | **Chats** | Durable normal conversations by shell: queued turns, streamed state, history, stars, Stop/Close recovery, and read-only Diff review. See [Browser conversations](#browser-conversations). |
 | **Shells** | Each shell's role, mandate, editable `current_state`, identity, decisions, and skill grants. The default landing tab. |
-| **Skills** | The skill catalogue (Repo · Substrate · Craft), with per-shell grant toggles and full content in a modal. |
+| **Sprints** | Preparation and orchestration views for coordinated Developer/Reviewer lanes, status, evidence and cleanup. |
 | **Roadmap** | Features in a planning funnel (Brainstorm → … → Shipped), each with its spec tasks, linked docs, and flag blockers. Two views — a **Board** for editing a feature inline, and a **Flow** that groups features by work-stream and wires their blocker dependencies (see below). |
 | **Docs** | Read-only `kind='doc'` documents; opens in md-converter for reading. |
 | **Flags** | The blocker / follow-up tracker, grouped by feature, filterable Open/Resolved/All. |
 | **Worktrees** | Live git-hygiene report — dirty worktrees, prunable merged branches, clean trees. |
-| **Map** | The repo catalogue — language mix, file roles, dependencies, env vars — with a re-map button. |
+| **Repo Map** | The repo catalogue — language mix, file roles, dependencies, env vars — with a re-map button. |
 | **Analytics** | Token & session analytics — per-class spend cards, a local-day graph, and the session history swept from each harness's on-disk usage data (see [Token & session analytics](#token--session-analytics)). |
 | **Scripts** | Run the maintenance chores (snapshot, render, seed-skills, migrate, rebuild) from a button. |
 
-The header's **save locally ⤓** button refreshes the ignored DB snapshot and
-flat renders. Generated artifacts are never committed or published.
+The header's **save locally ⤓** button refreshes the private canonical snapshot
+and ignored local flat renders. Generated artifacts are never committed or published.
 
 ![Review GUI, Roadmap tab — Board view: a feature expanded into its inline editor with title, status, summary, and spec-task checklist](https://raw.githubusercontent.com/jedbjorn/subfloor/main/docs/images/roadmap-tab.png)
 
@@ -1430,9 +1438,9 @@ migrate, rebuild) — each with a description and a **run** button, so the commo
 chores work from the GUI without dropping to a terminal (rebuild prompts first,
 since it discards un-snapshotted DB edits).
 
-The live `.super-coder/shell_db.db` is **gitignored** and rebuilt from authored
-schema/migrations plus the ignored local snapshot. See `.super-coder/README.md`
-for the full model.
+The live engine DB, canonical snapshot and backups live in the private XDG
+instance-state root. See the [engine reference](../.super-coder/README.md) for
+current state boundaries and Admin recovery ownership.
 
 > [!class2]
 > **Spec:** the founding design lives in the roadmap (`super-coder` feature row) and renders to `specs_sc/`.

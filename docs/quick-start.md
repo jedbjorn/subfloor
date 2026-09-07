@@ -124,7 +124,10 @@ every step is owned by a flavor:
    own worktree, opens a PR — and stops.
 4. The **reviewer** — deliberately a different model lineage than the code —
    reads the diff, files flags; dev patches until clean.
-5. **You merge.** Merging is the operator's gate, always.
+5. **Authorize the merge.** Outside an armed Sprint, give an explicit directive
+   naming the PR. In an armed Sprint, your recorded grant authorizes its owning
+   Developer to merge its registered PR only after live green and approved
+   authorization.
 6. The spec freezes, the feature doc is written, the admin verifies the trees
    are clean, the map re-runs — and the loop turns.
 

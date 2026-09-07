@@ -1,124 +1,120 @@
-# .super-coder/ — the engine
+# .super-coder/ — engine reference
 
-Everything Subfloor owns. The host project's own code is untouched; this dir
-is the substrate that runs it.
+**Posture: current architecture reference.** This page describes the engine for
+source maintainers and fork Administrators. Start with the
+[user guide](../docs/README.md) for installation and everyday work.
 
-## The DB and generated artifacts stay local
+## Source, dependency, and private state
 
-`shell_db.db` is **gitignored**. It reconstructs from public system text plus
-one gitignored local per-instance snapshot:
+In this source repository, `.super-coder/` is tracked project source. Changes
+land through branches and reviewed PRs. In an installed fork it is a gitignored
+materialized dependency, pinned by `.sc-state/engine.ref`; update it through the
+host Admin lifecycle instead of editing engine files in place.
 
-| Category | File(s) | Git? | Role |
-|---|---|---|---|
-| **System migrations** | `migrations/*.sql` | tracked | ordered; **propagate** to forks; schema + system content |
-| **Per-instance snapshot** | `.sc-state/local/content.sql` | ignored | idempotent dump of *this* repo's content + memory |
-| **Baseline schema** | `schema.sql` | tracked | full current schema; applied on fresh build |
-| **`.db`, boot artifact** | — | ignored | rebuilt at launch |
+System source propagates to forks. Instance identity, conversations, memory and
+local skill bodies do not. A fresh clone creates a new instance.
 
-The split that matters: **system content propagates, per-instance content does
-not.** Snapshot, map authorship, skill retirement, and flat renders always live
-under ignored `.sc-state/local/`. `./sc artifact-mode show` inspects these
-paths; mode switching and Git publication are retired.
+| Surface | Owner and location | Purpose |
+|---|---|---|
+| Engine schema and migrations | `schema.sql`, `migrations/` | Public system structure and ordered upgrades |
+| Live DB | Private XDG instance root, `shell_db.db` | Authoritative instance state |
+| Canonical snapshot | Same private root, `content.sql` | Serialized instance content used by recovery/rebuild |
+| Backups | Same private root, `db_backups/` | Lifecycle recovery evidence |
+| Instance configuration | Gitignored `instance.json` | Opaque instance identity, runtime and ports |
+| Fork provenance | `.sc-state/engine.ref`, `.sc-state/engine.source` | Tracked dependency pin and source |
+| Local visibility | Ignored `.sc-state/local/` | Map configuration, skill retirement and generated renders |
+| Boot and skill mirrors | Ignored harness-native files | Derived context for the selected shell |
 
-## Scripts
+[`scripts/instance_state.py`](scripts/instance_state.py) owns path resolution.
+The private namespace is beneath `${XDG_STATE_HOME:-$HOME/.local/state}` in
+`subfloor/instances/<instance_id>/`. Production consumers use its active-path
+selectors, including relocation receipt checks. Fresh bound installs select
+private state before building the first DB. Legacy copies and incomplete
+relocation require the named Admin recovery procedure; do not infer the active
+DB from whichever file happens to exist.
 
-| Script | Does |
+Ordinary downstream shells receive API-backed control-plane commands and a
+restricted execution view. General engine SQL and direct private-state
+inspection are Admin-only. Source maintainers can read tracked engine code,
+schema and migrations because those are the project; that does not grant a
+Dev shell direct live-state maintenance authority. See
+[`scripts/execution_view.py`](scripts/execution_view.py).
+
+The fork application's own data remains distinct from engine memory. The
+`dr_*` repository catalogue describes project files; it is neither engine
+memory nor the application's database.
+
+## Lifecycle owners
+
+| Source | Responsibility |
 |---|---|
-| `scripts/rebuild.py` | apply `schema.sql` → stamp/apply `migrations/` → load the active per-instance snapshot. Builds a fresh `.db`. |
-| `scripts/migrate.py` | apply pending `migrations/*.sql` to an existing `.db`; record in `schema_migrations`. |
-| `scripts/snapshot.py` | dump per-instance tables → the active artifact root (deterministic). |
-| `scripts/update.py` | fetch + materialize the engine (gitignored dep) at an upstream ref → pin `.sc-state/engine.ref` → migrate in place → sync skills → snapshot. |
-| `scripts/rollback.py` | sound undo of a bad update — restore the DB + engine (`engine.ref.prev`) pair. |
-| `scripts/run.py` | launcher: username-only auth → pick shell → render boot (`CLAUDE.md` + `AGENTS.md`) → exec harness. |
+| `scripts/install.py`, `scripts/init_fork.py` | Install the selected runtime and seed the ten-shell roster |
+| `scripts/update.py`, `scripts/state_relocation.py` | Materialize the engine, reconcile migrations and handle guarded relocation |
+| `scripts/rollback.py` | Restore a compatible engine and DB pair |
+| `scripts/remove.py`, `scripts/eject.py` | Guarded removal or deliberate ownership of engine source |
+| `scripts/rebuild.py`, `scripts/migrate.py` | Rebuild from system source and active snapshot, or apply pending migrations |
+| `scripts/snapshot.py` | Serialize instance content to the canonical private snapshot |
+| `scripts/run.py`, `scripts/shell_liveness.py` | Select a shell and route, render context, enforce ownership, launch the harness |
 
-## Render
+Use `subfloor admin` from the host checkout for maintenance. Exact command
+syntax belongs to `sc help --all` and each command's `--help`. An API failure is
+not permission for an ordinary shell to open the database directly.
 
-`render/` turns live DB state into three kinds of artifact, all one-way
-(DB → file, never read back) and incremental (an artifact whose content already
-matches disk is skipped, so an unchanged DB renders to nothing):
+## Render and skills
 
-| Artifact | Module | Git? | Consumer |
-|---|---|---|---|
-| Boot doc → `CLAUDE.md` + `AGENTS.md` | `compose.py` | ignored | the harness at launch |
-| Per-shell skills → `.claude/skills/<name>/SKILL.md` | `flat.render_skill_md` | ignored | the harness (Agent Skills) |
-| Flat `_sc` files → `renders/specs_sc/` `renders/docs_sc/` `renders/skills_sc/` `renders/roadmap_sc.md` | `flat.render_visibility` | ignored local render root | operator/browser visibility |
+The render pipeline is one-way: authoritative state becomes derived files.
+[`render/compose.py`](render/compose.py) builds boot context;
+[`render/flat.py`](render/flat.py) creates local visibility and skill mirrors.
+Unchanged outputs are skipped. Edit the owning API surface or tracked source,
+not generated boot files, `_sc` documents or skill mirrors.
 
-The boot doc + SKILL.md are rebuilt every launch by `run.py` for the chosen
-shell — gitignored caches, like `.db`. The flat `_sc` files are a local
-visibility surface; `./sc render` (and `subfloor verify`) regenerate them.
-Each rendered file carries the do-not-edit banner (spec
-§Content & Render); for bodies that already open with YAML frontmatter the
-banner keys are spliced into it rather than prepended, so the YAML stays valid.
+Boot context is written as `CLAUDE.md` and `AGENTS.md`; adapter-specific discovery
+selects the appropriate file and skill directory. All five adapters consume
+this common substrate. Flat documents and roadmap renders remain ignored
+local visibility, not a Git publication mechanism.
 
-`scripts/render.py` is the standalone CLI: `flat` (local `_sc`),
-`skills <shortname>` (one shell's `.claude/skills/`), or `all <shortname>`.
+Engine skill bodies are authored under `assets/skills/`; `scripts/seed_skills.py`
+maintains their distribution catalogue. Planner owns DB-canonical fork-local
+skill authoring and grants through `sc skill`. Local bodies and grants survive
+update/rebuild. Admin owns engine catalogue maintenance and guarded recovery.
+Every-session procedures live in boot, conditional procedures in skills, and
+exact syntax in tool help.
 
-## Skills
+## Harness adapters
 
-System content: a skill's body propagates to every fork. Authored at
-`assets/skills/<name>/SKILL.md` (frontmatter `name`/`description`/`category`/
-`command`/`common` + markdown body), compiled by `scripts/seed_skills.py`
-(`./sc seed-skills`) into `migrations/0001_seed_skills.sql`. The catalogue rides
-in a migration (propagates); the per-shell *grant* (`shell_skills`) rides in the
-snapshot (fork-local). `./sc rebuild` seeds the catalogue, then loads grants.
+Each [`adapters/`](adapters/) directory carries its own `adapter.json` and
+README. The manifest declares terminal, one-shot, browser and Sprint surfaces,
+launch flags, model/effort routing, conversation contract and capability bounds.
+Support is surface-specific: Vibe ships a terminal/one-shot adapter but does not
+advertise browser or Sprint support. Consult each current manifest rather than
+assuming every harness implements every surface.
 
-## Adapters
+- [Claude](adapters/claude/README.md)
+- [Codex](adapters/codex/README.md)
+- [OpenCode](adapters/opencode/README.md)
+- [Vibe](adapters/vibe/README.md)
+- [Kimi](adapters/kimi/README.md)
 
-`adapters/<harness>/` is the **only** harness-specific seam — everything above it
-is harness-blind. Each holds an `adapter.json`:
+The common launcher and `scripts/conversation_adapters/` implement those
+contracts. Branch protection combines harness-specific edit guards where
+available with the universal Git pre-commit backstop. Browser and CLI sessions
+cannot own the same shell concurrently.
 
-| field | meaning |
-|---|---|
-| `launch` | argv exec'd to start the harness |
-| `comm_aliases` | optional; extra `/proc/<pid>/comm` values a live harness presents when its runtime name differs from its launch binary (liveness scanning — see `scripts/shell_liveness.py`) |
-| `boot_artifact` | the context file this harness reads (informational) |
-| `emit` | files in the adapter dir copied to the repo root at launch (gitignored, regenerated each launch from the tracked template) |
-| `env` | extra env merged into the launch environment |
+## API, browser UI, and runbooks
 
-- **`claude/`** — reads `CLAUDE.md` + `.claude/skills/*/SKILL.md` natively; nothing
-  extra to emit.
-- **`opencode/`** — reads `AGENTS.md` + `.claude/skills/*/SKILL.md` natively, and
-  emits **`opencode.json`** (instructions → `AGENTS.md`, tool permissions, `mcp`
-  slot). `env.OPENCODE_DISABLE_CLAUDE_CODE=1` avoids double-loading `CLAUDE.md`
-  (we dual-write both). Edit the tracked `opencode.json` template to change a
-  fork's config.
-- **`codex/`** — reads `AGENTS.md` natively; emits **`.codex/hooks.json`**.
-  Launches `codex --dangerously-bypass-hook-trust` (and, inside the sandbox,
-  `--dangerously-bypass-approvals-and-sandbox`); model is selected via `--model`.
-- **`vibe/`** — reads `AGENTS.md` natively; nothing to emit. Launches `vibe
-  --trust` (sandbox adds `--agent auto-approve`).
-- **`kimi/`** — reads `AGENTS.md` natively; nothing to emit. Launches `kimi`
-  (sandbox adds `--yolo` — interactive only: `kimi -p` rejects permission-mode
-  flags and always runs auto-approve). Headless via `kimi -p`; takes no model
-  from the launch seam (kimi's `-m` wants a user-local alias from
-  `~/.kimi-code/config.toml`, not a portable model id).
+`api/server.py` serves the JSON API, static vanilla-JavaScript `ui/` and event
+stream on the instance's loopback port. The ten tabs include Chats and Sprints;
+Shells is the default landing tab. The sandbox lifecycle runs the server in its
+container; the host runtime supervises the same server as a host process.
 
-The boot render dual-writes `CLAUDE.md` + `AGENTS.md` and the skills, so both
-harnesses consume the same substrate unchanged — that's the harness-agnostic bet.
-`run.py` picks the harness (`HARNESS` env → `instance.json` → claude), loads its
-adapter, emits its files, and exec's its launch command. An unknown harness falls
-back to running its own name + reading `AGENTS.md`.
+Ordinary browser controls expose operational fields, roadmap, flags and
+unfrozen documents. Seed and L&S remain shell-owned; frozen documents reject
+edits. Saving locally writes the private snapshot and local renders, never a
+public Git snapshot. Browser authentication and API authority are described in
+[the interface trust boundary](docs/interface-trust-boundary.md).
 
-## Review layer (`api/` + `ui/`)
-
-A **zero-dependency** localhost GUI over the live DB — no FastAPI, no venv, no
-npm/build. `api/server.py` is a stdlib HTTP server that serves both the JSON API
-and the static `ui/` (one page, vanilla JS) on a single per-fork port.
-
-- **Read** shells, roadmap, flags. **Edit** a shell's operational fields
-  (`current_state`, `connections`) + skill grants, the roadmap, and
-  **non-frozen** documents. **Create / resolve** flags.
-- **Law enforcement is structural:** seed and L&S have *no write route* (Laws
-  2–4, 7) — not a disabled control, an absent endpoint. Frozen documents reject
-  edits server-side.
-- `POST /api/snapshot` runs `snapshot.py` + `render.py flat` — the local-only
-  serialize + render. `POST /api/publish` is a retired endpoint and returns
-  HTTP 410.
-
-`scripts/ports.py` derives this fork's port from its repo path (`8800 + sha1 %
-100`), bumping past anything occupied, and persists it to the gitignored
-`instance.json`. The server runs inside the docker sandbox (`Dockerfile` +
-`./sc launch`/`down`); the container is named `sc-<repo>` so forks never clash,
-and the port publishes to `127.0.0.1` only. `./sc serve` runs it on the host
-without docker (the escape hatch). `ecosystem.config.cjs` (pm2) is legacy from
-the pre-docker host model and no longer on the default path.
+Focused runbooks under [`docs/`](docs/) cover harness freshness and the optional
+Windows VM, tailnet, PM2 and app-DB brokers. Their applicability labels separate
+current operation from architecture and historical migration procedures. The
+[DeepSeek removal procedure](../docs/deepseek-harness-removal.md) retains its
+certified exact-ref checkpoints for Admin recovery.

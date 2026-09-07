@@ -32,7 +32,7 @@ Feature #28 package-manager distribution stays excluded, as Spec #219 requires.
 The frozen tree has no package recipes or native release artifacts establishing
 that installation path. A roadmap status alone cannot supply that evidence.
 
-## Capture baseline and blocker
+## Capture baseline
 
 The operator-authorized dos-app checkout was clean on `main` at
 `c5851784070ff92e0ae36ed093b80915cd3cf114`, retaining its existing install
@@ -57,16 +57,23 @@ The installer raised `instance_state.InstanceStateError` with permission
 denied. No state-root override or permission change was attempted.
 See [issue #1541](https://github.com/jedbjorn/subfloor/issues/1541).
 
-**Task #795 remains in progress and blocked on Admin provisioning.** The clone
-is a recoverable preparation artifact, not a successfully installed or clean
-capture baseline. Admin must complete the supported install from its authorized
-seat and supply a usable disposable capture environment. Local artifact
-locations are held in the control-plane handoff, not public image assets.
+Admin provisioned the same clone at the frozen engine ref on 2026-09-07
+(handoff #1807). Installation exited 0, applied 201 migrations, seeded the
+10-shell Demo roster, and completed snapshot/render. Admin corrected an ambient
+API-routing defect separately (flag #615); cross-checkout operations must not
+inherit another instance's API environment. Flag #614 is closed.
 
-VHS, ttyd, ffmpeg, Docker, Node and Python 3.14.7 are available. Authentication,
-browser capture dependencies, sanitized demonstration state, and a successful
-sandbox launch and harness boot remain unverified. Do not substitute simulated
-terminal output or the existing running fork's private data.
+The clean disposable Git baseline is
+`09da493` (`docs/capture-baseline`), preserving the original dos-app commit
+and pinning the capture engine. The original checkout and runtime remain
+untouched. Recovery bundle and installation logs are retained in the local
+handoff evidence directory. Sandbox launch and authenticated visual acceptance
+belong to the capture/verification tasks; they are not implied by installation.
+
+VHS, ttyd, ffmpeg, Docker, Node and Python 3.14.7 are available. Browser capture
+dependencies, sanitized demonstration state and authenticated harness boot
+still require verification. Do not substitute simulated terminal output or the
+existing running fork's private data.
 
 ## Remaining delivery gates
 
