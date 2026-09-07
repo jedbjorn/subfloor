@@ -205,11 +205,18 @@ class OperatorDocumentationTest(unittest.TestCase):
                  ROOT / "docs" / "quick-start.md")
 
     def test_public_install_and_update_docs_pin_operator_commands(self):
-        for path in self.DOC_PATHS:
-            with self.subTest(path=path.relative_to(ROOT)):
-                body = path.read_text()
+        # Spec #219 assigns installation to the landing page/quick start and
+        # maintenance to the guide. Preserve exact safe commands at their
+        # owning surfaces and require the cross-links instead of duplication.
+        landing = (ROOT / "README.md").read_text()
+        quick_start = (ROOT / "docs" / "quick-start.md").read_text()
+        guide = (ROOT / "docs" / "README.md").read_text()
+        for name, body in (("landing", landing), ("quick start", quick_start)):
+            with self.subTest(surface=name):
                 self.assertIn(INSTALL_COMMIT, body)
-                self.assertIn(UPDATE_COMMIT, body)
+                self.assertIn("README.md#update-a-fork", body)
+        self.assertIn(UPDATE_COMMIT, guide)
+        self.assertIn("quick-start.md#install-from-your-host-terminal", guide)
 
     def test_public_install_docs_pin_runtime_floor_and_override(self):
         for path in self.DOC_PATHS:

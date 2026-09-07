@@ -53,10 +53,10 @@ ongoing work and durable records.
 
 ## Install
 
-Use Linux: Arch Linux (including CachyOS) or Ubuntu LTS, Git, curl, Python
-3.14.x with `sqlite3`, and a reachable Docker daemon for the default sandbox.
+Use Linux: Arch Linux (including CachyOS) or Ubuntu LTS, Git, curl,
+Python 3.14.x with `sqlite3`, and a reachable Docker daemon for the default sandbox.
 Select `./sc install --runtime host` for the supervised host runtime without
-Docker. On macOS or Windows, use a Linux VM; keep the checkout on guest storage.
+Docker. On macOS or Windows, create a Linux VM; keep the checkout on guest storage.
 Set `SC_PYTHON` to an absolute interpreter path if needed.
 
 Run these commands from your own host terminal:
