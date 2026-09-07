@@ -719,8 +719,14 @@ print(json.dumps({'db_verified': True, 'developer_verified': True}))
         proof = json.loads(self.command(workspace, [sys.executable, "-c", program]).stdout)
         require(proof == {"db_verified": True, "developer_verified": True}, "DB verification missing")
 
+    def refresh_routes(self, workspace):
+        self.sc(workspace, "models", "refresh", timeout=300)
+
     def route(self, workspace, route):
-        return prove_route(self.runner, workspace, route, env=self.environment(workspace))
+        try:
+            return prove_route(self.runner, workspace, route, env=self.environment(workspace))
+        except BenchError as exc:
+            raise BenchError("copy route proof failed") from exc
 
     def place_style(self, workspace, style):
         destination = confined(workspace, style["path"])
@@ -772,6 +778,9 @@ print(json.dumps({'db_verified': True, 'developer_verified': True}))
             # remains on either assigned port before allowing deletion.
             for port in ledger["ports"].values():
                 with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+                    # Closed health connections can leave TIME_WAIT sockets.
+                    # Reuse permits those while still rejecting a live listener.
+                    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
                     try:
                         sock.bind(("127.0.0.1", port))
                     except OSError as exc:
@@ -894,6 +903,8 @@ class Controller:
                 self._stage(ledger_path, ledger, "health")
                 self.backend.verify(workspace)
                 self._stage(ledger_path, ledger, "verify")
+                self.backend.refresh_routes(workspace)
+                self._stage(ledger_path, ledger, "refresh_routes")
                 ledger["route_proof"] = self.backend.route(workspace, route)
                 self._stage(ledger_path, ledger, "route")
                 ledger["fixture"] = self.backend.place_style(workspace, config["style"])
@@ -911,6 +922,7 @@ class Controller:
                     operation(workspace, config, card, route, ledger)
             except BaseException as exc:
                 ledger["outcome"] = exc.outcome if isinstance(exc, BenchError) else "invalid"
+                ledger["error"] = str(exc) if isinstance(exc, BenchError) else type(exc).__name__
                 if ledger["stages"][-1:] == ["deps"] and ledger["outcome"] == "invalid":
                     ledger["baseline_invalid"] = True
                 write_json(ledger_path, ledger)

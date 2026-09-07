@@ -294,7 +294,7 @@ class FreezeTests(BenchFixture):
         self.assertEqual((destination / path).read_bytes(), (ROOT / path).read_bytes())
 
 
-STAGES = ["clone", "materialize", "install", "launch", "health", "verify", "route", "style", "deps", "test", "preamble"]
+STAGES = ["clone", "materialize", "install", "launch", "health", "verify", "refresh_routes", "route", "style", "deps", "test", "preamble"]
 
 
 class FakeBackend:
@@ -331,6 +331,9 @@ class FakeBackend:
 
     def verify(self, workspace):
         self.stage("verify")
+
+    def refresh_routes(self, workspace):
+        self.stage("refresh_routes")
 
     def route(self, workspace, route):
         self.stage("route")
@@ -406,6 +409,7 @@ class GateTests(BenchFixture):
                 result = json.loads((path.parent / failure / "gate.json").read_text())
                 self.assertTrue(result["cleanup"]["copy_deleted"])
                 self.assertEqual(result["outcome"], "invalid" if failure in ("route", "test") else "infra_failed")
+                self.assertEqual(result["error"], "deliberate gate failure")
 
     def test_cleanup_failure_fatal_retains_copy_and_blocks_next_cell_until_retry(self):
         path = self.freeze()
@@ -627,6 +631,7 @@ class HostBoundaryTests(BenchFixture):
         backend = bench.HostBackend()
         with socket.socket() as sock:
             sock.bind(("127.0.0.1", 0))
+            sock.listen()
             ledger = {"launch_attempted": True, "ports": {"api_port": sock.getsockname()[1]}}
             with mock.patch.object(backend, "sc") as sc:
                 with self.assertRaises(bench.CleanupError):
@@ -634,6 +639,74 @@ class HostBoundaryTests(BenchFixture):
                 sc.assert_called_once_with(workspace, "down", timeout=60)
         with mock.patch.object(backend, "sc"):
             backend.stop(workspace, ledger)
+
+    def test_cleanup_allows_http_time_wait_after_server_stops(self):
+        import http.client
+        import socket
+        import threading
+        from http.server import BaseHTTPRequestHandler, HTTPServer
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                self.send_response(200)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+
+            def log_message(self, *args):
+                pass
+
+        server = HTTPServer(("127.0.0.1", 0), Handler)
+        port = server.server_port
+        worker = threading.Thread(target=server.handle_request, daemon=True)
+        worker.start()
+        connection = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+        try:
+            connection.request("GET", "/")
+            response = connection.getresponse()
+            self.assertEqual(response.status, 200)
+            # Wait for the server to close first, leaving its end in TIME_WAIT.
+            worker.join(timeout=5)
+            self.assertFalse(worker.is_alive())
+            response.read()
+        finally:
+            connection.close()
+            server.server_close()
+        with socket.socket() as probe, self.assertRaises(OSError):
+            probe.bind(("127.0.0.1", port))
+        backend = bench.HostBackend()
+        with mock.patch.object(backend, "sc") as sc:
+            backend.stop(self.root / "copy", {"launch_attempted": True, "ports": {"api_port": port}})
+            sc.assert_called_once_with(self.root / "copy", "down", timeout=60)
+
+    def test_host_refresh_precedes_resolve_with_copy_environment(self):
+        path = self.freeze()
+        backend = FakeBackend()
+        host = bench.HostBackend()
+        backend.refresh_routes = host.refresh_routes
+        backend.route = host.route
+        route = self.config["routes"][0]
+        with mock.patch.object(host.runner, "run", side_effect=[
+            subprocess.CompletedProcess([], 0, "refreshed", ""),
+            subprocess.CompletedProcess([], 0, json.dumps(route_proof(route)), ""),
+        ]) as run:
+            result = bench.Controller(backend).run(path, "custom")
+        workspace = Path(result["workspace"])
+        self.assertEqual(result["stages"], STAGES)
+        self.assertEqual(run.call_args_list, [
+            mock.call([str(workspace / "sc"), "models", "refresh"], cwd=workspace,
+                      env=host.environment(workspace), timeout=300),
+            mock.call([str(workspace / "sc"), "models", "resolve", "codex", "test-model", "--json", "--effort", "medium"],
+                      cwd=workspace, env=host.environment(workspace)),
+        ])
+
+    def test_host_route_command_failure_is_invalid_route(self):
+        backend = bench.HostBackend()
+        with (
+            mock.patch.object(backend.runner, "run", side_effect=bench.BenchError("command failed (2): sc", "infra_failed")),
+            self.assertRaisesRegex(bench.BenchError, "copy route proof failed") as failure,
+        ):
+            backend.route(self.root / "copy", self.config["routes"][0])
+        self.assertEqual(failure.exception.outcome, "invalid")
 
     def test_health_requires_own_identity_and_never_uses_host_proxy(self):
         workspace = self.root / "copy"
