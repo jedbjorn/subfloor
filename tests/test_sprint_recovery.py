@@ -2818,7 +2818,14 @@ class SprintRecoveryCase(SprintPRWatcherCase):
             1,
             self.con.execute(
                 "SELECT COUNT(*) FROM wake_message "
-                "WHERE idempotency_key LIKE 'sprint-resume:%'",
+                "WHERE idempotency_key LIKE 'sprint-resume:%:v%'",
+            ).fetchone()[0],
+        )
+        self.assertEqual(
+            1,
+            self.con.execute(
+                "SELECT COUNT(*) FROM wake_message "
+                "WHERE idempotency_key LIKE 'sprint-resume:%:reentered:%'",
             ).fetchone()[0],
         )
 
