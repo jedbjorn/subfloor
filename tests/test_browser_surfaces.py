@@ -49,12 +49,24 @@ def api(tmp_path, monkeypatch):
     "action", ["arm", "disarm", "up", "down", "doctor", "link", "disable", "validate"]
 )
 def test_shell_cannot_mutate_browser(api, action):
-    with mock.patch.object(browser, "operate") as operation:
+    with (
+        mock.patch.object(browser, "operate") as operation,
+        mock.patch.object(browser, "link") as link,
+    ):
         status, _ = api(action, token="shell-token")
         assert status == 403
         status, _ = api(action, token="shell-token", route="/_sc/browser")
         assert status == 403
         operation.assert_not_called()
+        link.assert_not_called()
+
+
+@pytest.mark.parametrize("action", ["validate", "link"])
+def test_untrusted_setup_never_reaches_operator_paths(api, action):
+    with mock.patch.object(browser, "link") as link:
+        assert api(action, origin="https://attacker.test")[0] == 403
+        assert api(action, token="unknown-token")[0] == 401
+        link.assert_not_called()
 
 
 def test_operator_origin_gate_and_action(api):

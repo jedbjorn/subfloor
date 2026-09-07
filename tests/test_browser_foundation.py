@@ -99,6 +99,28 @@ def test_block_rejects_unsafe_fields(config, field, value):
         browser.validate(config)
 
 
+@pytest.mark.parametrize("field", ["executable", "user_data_dir"])
+@pytest.mark.parametrize("value", [None, 12, "", "relative/path", "/tmp/bad\0path"])
+def test_link_rejects_invalid_paths_before_filesystem_access(field, value, monkeypatch):
+    def unexpected_read(*args, **kwargs):
+        pytest.fail("invalid setup reached the filesystem")
+
+    monkeypatch.setattr(Path, "read_text", unexpected_read)
+    with pytest.raises(ValueError, match="absolute paths"):
+        browser.link({field: value}, save=False)
+
+
+def test_profile_probe_rejects_traversal_before_filesystem_access(config, monkeypatch):
+    config["profile_dir_name"] = "../other-profile"
+
+    def unexpected_probe(*args, **kwargs):
+        pytest.fail("invalid profile reached the filesystem")
+
+    monkeypatch.setattr(Path, "is_dir", unexpected_probe)
+    with pytest.raises(ValueError, match="one directory name"):
+        browser.profile_checks(config)
+
+
 def test_private_modes(tmp_path):
     p = tmp_path / "receipt"
     browser.write_private(p, {"pid": 123})

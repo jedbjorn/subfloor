@@ -56,11 +56,7 @@ def validate(value: dict) -> dict:
         )
     result = dict(value)
     for field in ("executable", "user_data_dir"):
-        if (
-            not isinstance(result.get(field), str)
-            or not Path(result[field]).is_absolute()
-        ):
-            raise ValueError(f"browser {field} must be an absolute path")
+        guard.operator_path(result.get(field))
     profile = result.get("profile_dir_name")
     if (
         not isinstance(profile, str)
@@ -246,9 +242,14 @@ console.log(JSON.stringify([mcp, pw, core, fromPw.resolve('playwright-core/packa
 
 
 def profile_checks(config: dict) -> dict:
+    config = validate(config)
     path = Path(config["user_data_dir"]) / config["profile_dir_name"]
+    # The host operator chooses this root; validate confines the profile name
+    # to one component. These probes intentionally inspect that chosen profile.
     result = {
+        # codeql[py/path-injection]
         "profile": path.is_dir(),
+        # codeql[py/path-injection]
         "extension": (path / "Extensions" / EXTENSION_ID).is_dir(),
     }
     try:
@@ -263,7 +264,16 @@ def link(value: dict, *, save: bool = True) -> dict:
     """Resolve the human display name; save only a validated, nonsecret block."""
     if set(value) - {"executable", "user_data_dir", "profile_name", "blocked_origins"}:
         raise ValueError("unknown browser link field")
-    directory = Path(value.get("user_data_dir") or Path.home() / ".config/chromium")
+    directory = guard.operator_path(
+        value.get("user_data_dir", str(Path.home() / ".config/chromium"))
+    )
+    executable = guard.operator_path(
+        value.get("executable", "/usr/lib/chromium/chromium")
+    )
+    # Host-operator setup accepts an arbitrary Chromium installation/profile
+    # root. The API gates shell credentials and cross-origin requests before
+    # this function. Never use it for paths supplied by MCP tools.
+    # codeql[py/path-injection]
     state = json.loads((directory / "Local State").read_text())
     display = value.get("profile_name", "Subfloor")
     if display != "Subfloor":
@@ -276,12 +286,12 @@ def link(value: dict, *, save: bool = True) -> dict:
     if len(matches) != 1:
         raise ValueError("create exactly one Chromium profile named Subfloor first")
     allocation = ports.ensure_browser_ports()
-    executable = value.get("executable") or "/usr/lib/chromium/chromium"
-    if not Path(executable).is_file() or not os.access(executable, os.X_OK):
+    # codeql[py/path-injection]
+    if not executable.is_file() or not os.access(executable, os.X_OK):
         raise ValueError("set the absolute path to the native Chromium executable")
     config = validate(
         {
-            "executable": executable,
+            "executable": str(executable),
             "channel": "chromium",
             "user_data_dir": str(directory),
             "profile_dir_name": matches[0],
