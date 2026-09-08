@@ -2049,6 +2049,7 @@ function serviceRow(s, hostLifecycle) {
 }
 
 function browserStatusText(st) {
+  if (st.supported === false) return st.detail || "unsupported seat";
   return `${st.state} · server ${st.server ? "up" : "down"} · extension ${st.extension || "not connected"} · active shells: ${(st.active_shells || []).join(", ") || "none"}`;
 }
 
@@ -2059,8 +2060,14 @@ async function openBrowserModal(onChange) {
   const directory = el("input", { value: cfg.user_data_dir });
   const executable = el("input", { value: cfg.executable });
   const result = el("pre", { className: "doc-body" }, browserStatusText(st));
-  const note = el("div", { className: "muted" },
-    "1. Create a Chromium profile named Subfloor. 2. Install the Playwright Extension in it. " +
+  // A container engine seat can reach neither the operator's Chromium profile
+  // nor its process table, so setup is refused there rather than failing on a
+  // host path it cannot see. Say so instead of offering the buttons.
+  const unsupported = st.supported === false;
+  const note = el("div", { className: "muted" }, unsupported
+    ? `${st.detail || "unsupported seat"} — browser driving needs the host runtime; `
+      + "re-run ./sc launch there before linking a profile."
+    : "1. Create a Chromium profile named Subfloor. 2. Install the Playwright Extension in it. " +
     "3. Sign in to the accounts you intend shells to use. 4. Check and link below. " +
     "Keep Subfloor open for browser tasks and approve every new connection yourself.");
   const extension = el("a", { href: "https://chromewebstore.google.com/detail/mmlmfjhmonkocbjadbfplnigmagldckm", target: "_blank", rel: "noopener noreferrer" }, "Playwright Extension");
@@ -2078,23 +2085,23 @@ async function openBrowserModal(onChange) {
       return receipt;
     } catch (e) { result.textContent = e.message; return null; }
   };
-  const check = el("button", { className: "act", textContent: "check setup" });
+  const check = el("button", { className: "act", textContent: "check setup", disabled: unsupported });
   check.onclick = async () => { check.disabled = true; await action("validate", candidate()); check.disabled = false; };
   const arm = el("button", { className: "act", textContent: st.armed ? "disarm" : "arm" });
-  arm.disabled = !st.config;
+  arm.disabled = unsupported || !st.config;
   arm.onclick = async () => {
     arm.disabled = true;
     const receipt = await action(arm.textContent);
     if (receipt) arm.textContent = receipt.armed ? "disarm" : "arm";
     arm.disabled = false;
   };
-  const disable = el("button", { className: "act", textContent: "disable browser" });
+  const disable = el("button", { className: "act", textContent: "disable browser", disabled: unsupported });
   disable.onclick = async () => {
     disable.disabled = true;
     if (await action("disable")) arm.disabled = true;
     disable.disabled = false;
   };
-  const save = el("button", { className: "act primary", textContent: "link profile" });
+  const save = el("button", { className: "act primary", textContent: "link profile", disabled: unsupported });
   const cancel = el("button", { className: "act", textContent: "close" });
   const close = openActionModal({ title: "Browser", width: 680, height: 700,
     bodyNode: el("div", {}, note, extension, form, check, arm, disable, result),

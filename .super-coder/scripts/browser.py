@@ -29,6 +29,7 @@ VERSIONS = {
 }
 EXTENSION_ID = "mmlmfjhmonkocbjadbfplnigmagldckm"
 TIMEOUT = 30
+UNSUPPORTED_SEAT = "unsupported seat: browser requires bare metal"
 SUPPORTED = ("claude", "codex", "opencode")
 FIELDS = {
     "executable",
@@ -42,6 +43,17 @@ FIELDS = {
     "blocked_origins",
     "armed",
 }
+
+
+def require_bare_metal() -> None:
+    """Setup and lifecycle need the host's Chromium profile and process table.
+
+    On the docker runtime the API server itself runs in `sc-<repo>`, which
+    mounts no browser profile and has its own PID namespace, so the profile and
+    window probes would read the container instead of the operator's host.
+    Refuse by seat rather than reporting a host path as missing (issue #1556)."""
+    if os.environ.get("SC_SANDBOX"):
+        raise ValueError(UNSUPPORTED_SEAT)
 
 
 def read() -> dict | None:
@@ -262,6 +274,7 @@ def profile_checks(config: dict) -> dict:
 
 def link(value: dict, *, save: bool = True) -> dict:
     """Resolve the human display name; save only a validated, nonsecret block."""
+    require_bare_metal()
     if set(value) - {"executable", "user_data_dir", "profile_name", "blocked_origins"}:
         raise ValueError("unknown browser link field")
     directory = guard.operator_path(
@@ -468,7 +481,7 @@ def status(*, harness: str | None = None, sandbox: bool = False) -> dict:
         return {
             "state": "failed",
             "supported": False,
-            "detail": "unsupported seat: browser requires bare metal",
+            "detail": UNSUPPORTED_SEAT,
         }
     if harness and harness not in SUPPORTED:
         return {
@@ -511,8 +524,7 @@ def status(*, harness: str | None = None, sandbox: bool = False) -> dict:
 
 
 def operate(action: str) -> dict:
-    if os.environ.get("SC_SANDBOX"):
-        raise ValueError("unsupported seat: browser requires bare metal")
+    require_bare_metal()
     if action == "status":
         return status()
     if action == "doctor":

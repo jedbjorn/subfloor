@@ -91,6 +91,16 @@ def test_status_requires_shell_auth_and_hides_configuration(api):
         assert body == {"state": "absent"}
 
 
+@pytest.mark.parametrize("action", ["validate", "link", "arm"])
+def test_container_seat_refuses_setup_with_the_seat_reason(api, monkeypatch, action):
+    """The docker runtime serves this GUI from `sc-<repo>`; issue #1556 saw the
+    operator's real profile reported as a missing file instead."""
+    monkeypatch.setenv("SC_SANDBOX", "1")
+    status, body = api(action)
+    assert status == 400
+    assert body == {"state": "failed", "error": browser.UNSUPPORTED_SEAT}
+
+
 def test_feature_grants_survive_reseed_and_reverse(tmp_path, monkeypatch):
     path = tmp_path / "engine.db"
     _build_file_db(path)
@@ -173,6 +183,53 @@ async function api(path, method, body) {
   await button('disable browser').onclick();
   assert.equal(calls.at(-1).body.action, 'disable');
   assert(!nodes.some(n => n.type === 'password'));
+})().catch(e => {console.error(e);process.exit(1)});
+"""
+    )
+    result = subprocess.run(
+        ["node"], input=script, text=True, capture_output=True, check=False
+    )
+    assert result.returncode == 0, result.stderr
+
+
+def test_browser_gui_offers_no_setup_on_an_unsupported_seat():
+    import subprocess
+
+    source = (ROOT / ".super-coder/ui/app.js").read_text()
+    functions = source[
+        source.index("function browserStatusText(") : source.index(
+            "// Windows Test VM wizard"
+        )
+    ]
+    script = (
+        r"""
+const assert = require('node:assert/strict');
+const calls = [];
+let modal;
+function el(tag, attrs, ...children) { return {tag, ...attrs, children, append(...xs) {this.children.push(...xs);}}; }
+function openActionModal(spec) { modal = spec; return () => {}; }
+async function api(path, method, body) {
+  calls.push({path, method, body});
+  return {state:'failed', supported:false,
+          detail:'unsupported seat: browser requires bare metal',
+          config:null, defaults:{executable:'/usr/lib/chromium/chromium',user_data_dir:'/home/op/.config/chromium'}};
+}
+"""
+        + functions
+        + r"""
+(async () => {
+  assert.equal(browserStatusText({state:'failed', supported:false, detail:'unsupported seat: x'}),
+               'unsupported seat: x');
+  await openBrowserModal(() => {});
+  function walk(node) { return [node, ...(node.children || []).flatMap(x => typeof x === 'object' ? walk(x) : [])]; }
+  const nodes = walk(modal.bodyNode);
+  const buttons = nodes.filter(n => n.tag === 'button');
+  for (const text of ['check setup', 'arm', 'disable browser'])
+    assert.equal(buttons.find(n => n.textContent === text).disabled, true, text);
+  assert.equal(modal.actionNode.disabled, true);
+  assert.equal(calls.length, 1, 'the modal only read status');
+  assert(nodes.some(n => typeof n.children?.[0] === 'string'
+                         && n.children[0].includes('needs the host runtime')));
 })().catch(e => {console.error(e);process.exit(1)});
 """
     )
