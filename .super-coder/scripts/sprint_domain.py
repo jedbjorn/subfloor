@@ -134,6 +134,7 @@ class PauseReceipt:
 class ResumeReceipt:
     changed: bool
     dispatched_wake_ids: tuple[int, ...]
+    reentered_wake_ids: tuple[int, ...]
     requeued_wake_ids: tuple[int, ...]
     projected_work_unit_ids: tuple[int, ...]
     resolved_review_message_ids: tuple[int, ...]
@@ -1247,6 +1248,7 @@ class SprintLifecycleStore:
         )
         all_anomalies = anomalies
         notice_conversations: tuple[str, ...] = ()
+        reentered: tuple[int, ...] = ()
         pause_receipt: PauseReceipt | None = None
         with db_driver.write_transaction(self.con, "sprint.resume"):
             sprint = self._sprint(sprint_id)
@@ -1261,7 +1263,7 @@ class SprintLifecycleStore:
                         "conformance ownership changes require a paused Sprint",
                         {"code": "conformance_owner_change_requires_pause"},
                     )
-                return ResumeReceipt(False, (), (), (), (), (), anomalies)
+                return ResumeReceipt(False, (), (), (), (), (), (), anomalies)
             if current == "prepared":
                 raise SprintInvariantError(
                     "prepared Sprints must use arm() so plan release is atomic"
@@ -1358,6 +1360,11 @@ class SprintLifecycleStore:
                             planner_participant_id=planner,
                         )
                     )
+                    reentered = (
+                        self._reenter_interrupted_participants_in_transaction(
+                            sprint_id
+                        )
+                    )
                     self._event(
                         sprint_id,
                         "lifecycle.armed",
@@ -1367,6 +1374,7 @@ class SprintLifecycleStore:
                             "reason": reason,
                             "reconciled": True,
                             "dispatched_wake_ids": list(dispatched),
+                            "reentered_wake_ids": list(reentered),
                         },
                     )
         if pause_receipt is not None:
@@ -1376,6 +1384,7 @@ class SprintLifecycleStore:
         return ResumeReceipt(
             pause_receipt is None,
             dispatched,
+            reentered,
             requeued,
             tuple(projected),
             tuple(resolved),
@@ -2091,6 +2100,90 @@ class SprintLifecycleStore:
                         )
                     )
         return tuple(sorted(set(projected))), tuple(sorted(set(resolved)))
+
+    def _reenter_interrupted_participants_in_transaction(
+        self,
+        sprint_id: int,
+    ) -> tuple[int, ...]:
+        """Queue one re-enter wake per participant the latest pause interrupted.
+
+        The pause report's active_turns name every run the pause interrupted.
+        Each distinct roster participant behind those runs receives one
+        notification wake keyed on its interrupted run, unless its lane is
+        already terminal or a wake is already pending or delivering.
+        """
+        if not self.con.in_transaction:
+            raise RuntimeError("resume re-entry requires an active transaction")
+        report = self.con.execute(
+            "SELECT body,created_at FROM sprint_reports WHERE sprint_id=? "
+            "AND report_kind='pause' ORDER BY report_id DESC LIMIT 1",
+            (sprint_id,),
+        ).fetchone()
+        if report is None:
+            return ()
+        active_turns = (
+            json.loads(str(report["body"]))
+            .get("deterministic", {})
+            .get("active_turns", [])
+        )
+        paused_at = str(report["created_at"])
+        from sprint_message_delivery import SprintMessageStore
+
+        messages = SprintMessageStore(self.con)
+        wake_ids: list[int] = []
+        seen_participants: set[int] = set()
+        for turn in active_turns:
+            participant = self.con.execute(
+                "SELECT p.participant_id,p.shell_id "
+                "FROM sprint_participant_conversations pc "
+                "JOIN sprint_participants p "
+                "ON p.participant_id=pc.sprint_participant_id "
+                "WHERE pc.conversation_id=? AND p.sprint_id=?",
+                (str(turn["conversation_id"]), sprint_id),
+            ).fetchone()
+            if participant is None:
+                continue
+            participant_id = int(participant["participant_id"])
+            if participant_id in seen_participants:
+                continue
+            seen_participants.add(participant_id)
+            shell_id = int(participant["shell_id"])
+            unit = self.con.execute(
+                "SELECT work_unit_id FROM sprint_work_units WHERE sprint_id=? "
+                "AND (assigned_shell_id=? OR reviewer_shell_id=?) "
+                "AND disposition NOT IN ('completed','cancelled') "
+                "ORDER BY work_unit_id LIMIT 1",
+                (sprint_id, shell_id, shell_id),
+            ).fetchone()
+            if unit is None:
+                continue
+            busy = self.con.execute(
+                "SELECT 1 FROM sprint_wake_outbox WHERE receiver_shell_id=? "
+                "AND state IN ('pending','delivering') LIMIT 1",
+                (shell_id,),
+            ).fetchone()
+            if busy is not None:
+                continue
+            work_unit_id = int(unit["work_unit_id"])
+            receipt = messages.send_in_transaction(
+                sprint_id,
+                to_participant_id=participant_id,
+                message_kind="notification",
+                body=(
+                    f"Sprint {sprint_id} resumed. Your turn on work unit "
+                    f"{work_unit_id} was interrupted by the pause at "
+                    f"{paused_at}. Continue that lane from its current state; "
+                    "do not re-accept the assignment."
+                ),
+                idempotency_key=(
+                    f"sprint-resume:{sprint_id}:reentered:{int(turn['run_id'])}"
+                ),
+                work_unit_id=work_unit_id,
+                declared_type="re-enter",
+            )
+            if receipt.wake_id is not None:
+                wake_ids.append(int(receipt.wake_id))
+        return tuple(sorted(wake_ids))
 
     def _reconcile_unread_wakes_in_transaction(
         self,

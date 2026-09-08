@@ -99,6 +99,7 @@ _EVENT_FIELDS = {
             "initial_wake_ids",
             "reconciled",
             "dispatched_wake_ids",
+            "reentered_wake_ids",
         }
     ),
     "lifecycle.paused": frozenset(

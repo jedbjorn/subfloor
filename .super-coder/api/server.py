@@ -3704,6 +3704,7 @@ class Handler(BaseHTTPRequestHandler):
                     "conformance_reviewer_shell_id": int(owner[0]),
                     "conformance_owner_generation": int(owner[1]),
                     "dispatched_wake_ids": list(receipt.dispatched_wake_ids),
+                    "reentered_wake_ids": list(receipt.reentered_wake_ids),
                     "requeued_wake_ids": list(receipt.requeued_wake_ids),
                     "projected_work_unit_ids": list(
                         receipt.projected_work_unit_ids

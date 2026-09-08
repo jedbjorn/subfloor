@@ -102,6 +102,7 @@
     ".super-coder/migrations/0259_seed_drive_browser.sql",
     ".super-coder/migrations/0260_reseed_sprint_closeout_scope.sql",
     ".super-coder/migrations/0261_dev_long_job_guidance.sql",
+    ".super-coder/migrations/0262_reseed_sprint_resume_reentry.sql",
     ".super-coder/scripts/activity_monitor.py",
     ".super-coder/scripts/harness_surfaces.py",
     ".super-coder/scripts/instance_state.py",

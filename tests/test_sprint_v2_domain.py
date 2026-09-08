@@ -1255,6 +1255,266 @@ class LiveReplanningTest(SprintDomainCase):
         self.assertEqual(5, fresh["receiver_shell_id"])
         self.assertTrue(str(fresh["idempotency_key"]).endswith(":assignment:2"))
 
+    def _live_turn(self, sprint_id: int, shell_id: int, label: str) -> int:
+        """Seed one running participant turn the next pause will interrupt."""
+        participant_id = int(
+            self.con.execute(
+                "SELECT participant_id FROM sprint_participants "
+                "WHERE sprint_id=? AND shell_id=?",
+                (sprint_id, shell_id),
+            ).fetchone()[0]
+        )
+        conversation_id = f"cv_{label}"
+        self.con.execute(
+            "INSERT INTO conversations "
+            "(conversation_id,shell_id,owner_user_id,harness,worktree,state,"
+            "title,creation_idempotency_key,creation_request_hash,"
+            "conversation_scope) "
+            "VALUES (?,?,1,'codex','/work','running',?,?,?,'sprint')",
+            (
+                conversation_id,
+                shell_id,
+                f"Lane {label}",
+                f"create-{label}",
+                f"hash-{label}",
+            ),
+        )
+        message_id = int(
+            self.con.execute(
+                "INSERT INTO conversation_messages "
+                "(conversation_id,sender_kind,sender_ref,message_kind,body,"
+                "idempotency_key,request_hash,state) "
+                "VALUES (?,'engine','sprint','prompt',?,?,?,'running')",
+                (
+                    conversation_id,
+                    f"work on lane {label}",
+                    f"prompt-{label}",
+                    f"request-{label}",
+                ),
+            ).lastrowid
+        )
+        run_id = int(
+            self.con.execute(
+                "INSERT INTO conversation_runs "
+                "(conversation_id,shell_id,trigger_message_id,lease_owner,"
+                "lease_expires_at,state,started_at) "
+                "VALUES (?,?,?,'fixture',datetime('now','+1 hour'),'running',"
+                "datetime('now'))",
+                (conversation_id, shell_id, message_id),
+            ).lastrowid
+        )
+        self.con.execute(
+            "INSERT INTO sprint_participant_conversations "
+            "(sprint_participant_id,conversation_id) VALUES (?,?)",
+            (participant_id, conversation_id),
+        )
+        return run_id
+
+    def test_resume_reenters_participants_whose_runs_the_pause_interrupted(
+        self,
+    ) -> None:
+        self.con.executemany(
+            "INSERT INTO shells "
+            "(shell_id,display_name,shortname,flavor,system_prompt,user_id) "
+            "VALUES (?,?,?,?,?,1)",
+            (
+                (5, "Developer 2", "DEV2", "dev", "prompt"),
+                (6, "Developer 3", "DEV3", "dev", "prompt"),
+                (7, "Developer 4", "DEV4", "dev", "prompt"),
+            ),
+        )
+        sprint_id, first_unit = self.create_sprint()
+        self.con.executemany(
+            "INSERT INTO sprint_participants "
+            "(sprint_id,shell_id,role,harness,model,effort) "
+            "VALUES (?,?,'developer','codex','dev-model','high')",
+            ((sprint_id, 5), (sprint_id, 6), (sprint_id, 7)),
+        )
+        second_unit = int(
+            self.con.execute(
+                "INSERT INTO sprint_work_units "
+                "(sprint_id,assigned_shell_id,reviewer_shell_id,title,"
+                "expected_output) VALUES (?,5,2,'Second','Ship the second lane')",
+                (sprint_id,),
+            ).lastrowid
+        )
+        self.con.execute(
+            "INSERT INTO sprint_work_units "
+            "(sprint_id,assigned_shell_id,reviewer_shell_id,title,"
+            "expected_output) VALUES (?,6,2,'Third','Ship the third lane')",
+            (sprint_id,),
+        )
+        terminal_unit = int(
+            self.con.execute(
+                "INSERT INTO sprint_work_units "
+                "(sprint_id,assigned_shell_id,reviewer_shell_id,title,"
+                "expected_output) VALUES (?,7,2,'Fourth','Ship the fourth lane')",
+                (sprint_id,),
+            ).lastrowid
+        )
+        self.con.commit()
+        store = sprint_domain.SprintLifecycleStore(
+            self.con,
+            probe_harness=lambda _harness: None,
+            interrupt_run=lambda _run_id: True,
+        )
+        store.arm(sprint_id, 3)
+        messages = sprint_message_delivery.SprintMessageStore(self.con)
+        assignments = self.con.execute(
+            "SELECT m.message_id,m.receiver_shell_id,wm.wake_id "
+            "FROM wake_message m JOIN sprint_wake_messages wm USING (message_id) "
+            "WHERE m.sprint_id=? AND m.message_kind='work_assignment'",
+            (sprint_id,),
+        ).fetchall()
+        self.assertEqual(4, len(assignments))
+        for assignment in assignments:
+            self.con.execute(
+                "UPDATE wake_message SET delivered_at=datetime('now') "
+                "WHERE message_id=?",
+                (assignment["message_id"],),
+            )
+            self.con.execute(
+                "UPDATE sprint_wake_outbox SET state='delivered',"
+                "delivered_at=datetime('now') WHERE wake_id=?",
+                (assignment["wake_id"],),
+            )
+            self.con.commit()
+            messages.mark_read(
+                int(assignment["message_id"]),
+                int(assignment["receiver_shell_id"]),
+                sprint_id=sprint_id,
+            )
+        # The first lane sits in review with the reviewer; the fourth is done.
+        self.con.execute(
+            "UPDATE sprint_work_units SET disposition='in_review' "
+            "WHERE work_unit_id=?",
+            (first_unit,),
+        )
+        self.con.execute(
+            "UPDATE sprint_work_units SET disposition='completed' "
+            "WHERE work_unit_id=?",
+            (terminal_unit,),
+        )
+        self.con.commit()
+        # The third developer already has a wake on the way.
+        messages.send(
+            sprint_id,
+            to_participant_id=int(
+                self.con.execute(
+                    "SELECT participant_id FROM sprint_participants "
+                    "WHERE sprint_id=? AND shell_id=6",
+                    (sprint_id,),
+                ).fetchone()[0]
+            ),
+            message_kind="notification",
+            body="A notice still waiting on delivery",
+            idempotency_key=f"test:{sprint_id}:pending-notice:6",
+        )
+        run_ids = {
+            shell_id: self._live_turn(sprint_id, shell_id, f"lane{shell_id}")
+            for shell_id in (1, 2, 5, 6, 7)
+        }
+        self.con.commit()
+
+        store.pause(
+            sprint_id,
+            sprint_domain.LifecycleActor("planner", 3),
+            reason="rebind the governing spec",
+        )
+        paused_at = str(
+            self.con.execute(
+                "SELECT created_at FROM sprint_reports WHERE sprint_id=? "
+                "AND report_kind='pause' ORDER BY report_id DESC LIMIT 1",
+                (sprint_id,),
+            ).fetchone()[0]
+        )
+
+        receipt = store.resume(
+            sprint_id,
+            sprint_domain.LifecycleActor("planner", 3),
+            reason="rebind complete",
+        )
+
+        self.assertTrue(receipt.changed)
+        self.assertEqual(3, len(receipt.reentered_wake_ids))
+        reentered = self.con.execute(
+            "SELECT receiver_shell_id,work_unit_id,message_kind,declared_type,"
+            "actionable,idempotency_key,body FROM wake_message "
+            "WHERE idempotency_key LIKE 'sprint-resume:%:reentered:%' "
+            "ORDER BY receiver_shell_id"
+        ).fetchall()
+        self.assertEqual(
+            [1, 2, 5], [int(row["receiver_shell_id"]) for row in reentered]
+        )
+        self.assertEqual(
+            [first_unit, first_unit, second_unit],
+            [int(row["work_unit_id"]) for row in reentered],
+        )
+        self.assertEqual(
+            [run_ids[1], run_ids[2], run_ids[5]],
+            [
+                int(str(row["idempotency_key"]).rsplit(":", 1)[1])
+                for row in reentered
+            ],
+        )
+        for row in reentered:
+            self.assertEqual("notification", row["message_kind"])
+            self.assertEqual("re-enter", row["declared_type"])
+            self.assertEqual(0, row["actionable"])
+        self.assertEqual(
+            f"Sprint {sprint_id} resumed. Your turn on work unit {first_unit} "
+            f"was interrupted by the pause at {paused_at}. Continue that lane "
+            "from its current state; do not re-accept the assignment.",
+            reentered[0]["body"],
+        )
+        wakes = self.con.execute(
+            "SELECT w.wake_id,w.receiver_shell_id,w.state "
+            "FROM sprint_wake_outbox w "
+            "JOIN sprint_wake_messages wm USING (wake_id) "
+            "JOIN wake_message m USING (message_id) "
+            "WHERE m.idempotency_key LIKE 'sprint-resume:%:reentered:%' "
+            "ORDER BY w.wake_id"
+        ).fetchall()
+        self.assertEqual(
+            list(receipt.reentered_wake_ids),
+            [int(wake["wake_id"]) for wake in wakes],
+        )
+        self.assertTrue(all(wake["state"] == "pending" for wake in wakes))
+        event = json.loads(
+            self.con.execute(
+                "SELECT payload FROM sprint_events WHERE sprint_id=? "
+                "AND event_type='lifecycle.armed' "
+                "ORDER BY event_id DESC LIMIT 1",
+                (sprint_id,),
+            ).fetchone()[0]
+        )
+        self.assertEqual(
+            sorted(receipt.reentered_wake_ids),
+            sorted(event["reentered_wake_ids"]),
+        )
+
+        # A second pause/resume cycle replays no wake: every interrupted
+        # participant now has a pending wake or a terminal lane.
+        store.pause(
+            sprint_id,
+            sprint_domain.LifecycleActor("planner", 3),
+            reason="rebind again",
+        )
+        replay = store.resume(
+            sprint_id,
+            sprint_domain.LifecycleActor("planner", 3),
+            reason="second rebind complete",
+        )
+        self.assertTrue(replay.changed)
+        self.assertEqual((), replay.reentered_wake_ids)
+        self.assertEqual(
+            3,
+            self.con.execute(
+                "SELECT COUNT(*) FROM wake_message "
+                "WHERE idempotency_key LIKE 'sprint-resume:%:reentered:%'"
+            ).fetchone()[0],
+        )
+
     def test_recall_rejects_armed_and_registered_pr_lanes(self) -> None:
         sprint_id, work_unit_id = self.create_sprint()
         self.store.arm(sprint_id, 3)
