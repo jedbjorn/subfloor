@@ -19,6 +19,11 @@ extension credential.
    the Chromium binary (on Arch, `/usr/lib/chromium/chromium`), not a shell
    wrapper. Adjust the absolute executable/user-data paths for your installation.
    The engine resolves `Subfloor` to its actual profile directory using Local State.
+   This step requires the host runtime. On the docker runtime the API server
+   itself runs inside `sc-<repo>`, which mounts no Chromium profile and has its
+   own PID namespace; check/link/arm refuse there with `unsupported seat:
+   browser requires bare metal`, and the GUI disables those controls rather than
+   reporting an existing host path as missing.
 4. Open Subfloor, give a shell a directive naming the site and actions, and
    approve that connection in the extension. Shells preflight with
    `sc browser status --json` and work in `Playwright · Subfloor <SHORTNAME>`.

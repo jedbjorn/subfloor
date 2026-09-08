@@ -105,9 +105,27 @@ def test_link_rejects_invalid_paths_before_filesystem_access(field, value, monke
     def unexpected_read(*args, **kwargs):
         pytest.fail("invalid setup reached the filesystem")
 
+    monkeypatch.delenv("SC_SANDBOX", raising=False)
     monkeypatch.setattr(Path, "read_text", unexpected_read)
     with pytest.raises(ValueError, match="absolute paths"):
         browser.link({field: value}, save=False)
+
+
+@pytest.mark.parametrize("save", [False, True])
+def test_link_refuses_container_seat_before_reading_host_paths(monkeypatch, save):
+    """A sandboxed API server sees neither the profile nor the browser process,
+    so setup names the seat instead of calling a live host path missing."""
+
+    def unexpected_read(*args, **kwargs):
+        pytest.fail("container seat reached the host profile")
+
+    monkeypatch.setenv("SC_SANDBOX", "1")
+    monkeypatch.setattr(Path, "read_text", unexpected_read)
+    with pytest.raises(ValueError, match="unsupported seat"):
+        browser.link(
+            {"executable": "/usr/bin/chromium", "user_data_dir": "/home/op/chromium"},
+            save=save,
+        )
 
 
 def test_profile_probe_rejects_traversal_before_filesystem_access(config, monkeypatch):
