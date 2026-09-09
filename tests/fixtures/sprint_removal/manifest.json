@@ -161,7 +161,8 @@
     "tests/test_sprint_spec_revisions.py",
     "tests/test_sprint_v2_domain.py",
     "tests/test_sprint_work_dispatch.py",
-    "tests/test_update_materialize.py"
+    "tests/test_update_materialize.py",
+    ".super-coder/migrations/0263_reseed_remote_seat_skills.sql"
   ],
   "baseline_migration_ledger": {
     "count": 142,
