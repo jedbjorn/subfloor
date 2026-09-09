@@ -1068,7 +1068,7 @@ esac
 # migrate) probes first because it executes host Python. Container entry
 # deliberately remains a Docker handoff rather than a host-runtime gate.
 case "$cmd" in
-  install|ensure-harness|doctor|update|update-harnesses|harness-status|docker-cache-gc|rollback|feature|runtime|artifact-mode|eject|remove|init|rebuild|migrate|migration|snapshot|mem|pr|token|persist|job|visual-qa|sql|sql-rw|map-sql|map-sql-rw|map-schema|map-extractor|context|render|render-check|map|map-setup|analytics|models|seed-skills|skill|search|ports|url|preview|serve|vm|remote|vm-broker|vm-bake|vm-broker-up|vm-broker-down|vm-broker-sock|vm-mcp-relay|vm-broker-install|vm-broker-uninstall|ts-broker|ts-broker-up|ts-broker-down|ts-broker-sock|ts-broker-install|ts-broker-uninstall|pm2-broker|pm2-broker-up|pm2-broker-down|pm2-broker-sock|pm2-broker-install|pm2-broker-uninstall|db-broker|db-broker-up|db-broker-down|db-broker-sock|db-broker-install|db-broker-uninstall|db-init|pg-init|pg-up|pg-down|admin|boot|boot-*|run|deps|test|lint|typecheck|launch|down|restart|build|verify|health|clean-db)
+  install|ensure-harness|doctor|update|update-harnesses|harness-status|docker-cache-gc|rollback|feature|runtime|artifact-mode|eject|remove|init|rebuild|migrate|migration|snapshot|mem|pr|token|persist|job|visual-qa|sql|sql-rw|map-sql|map-sql-rw|map-schema|map-extractor|context|render|render-check|map|map-setup|analytics|models|seed-skills|skill|search|ports|url|preview|serve|vm|remote|vm-broker|vm-bake|vm-broker-up|vm-broker-down|vm-broker-sock|vm-mcp-relay|vm-broker-install|vm-broker-uninstall|ts|ts-broker|ts-broker-up|ts-broker-down|ts-broker-sock|ts-broker-install|ts-broker-uninstall|pm2-broker|pm2-broker-up|pm2-broker-down|pm2-broker-sock|pm2-broker-install|pm2-broker-uninstall|db-broker|db-broker-up|db-broker-down|db-broker-sock|db-broker-install|db-broker-uninstall|db-init|pg-init|pg-up|pg-down|admin|boot|boot-*|run|deps|test|lint|typecheck|launch|down|restart|build|verify|health|clean-db)
     case "$cmd" in
       deps|test|lint|typecheck)
         sc_devkit_help_form "$@" || sc_python_probe ;;
@@ -1250,6 +1250,7 @@ case "$cmd" in
   vm-broker-install)   sc_vm_broker_install ;;
   vm-broker-uninstall) sc_vm_broker_uninstall ;;
   # ── Tailnet broker (HOST-side primitive — runs where the tailnet node lives) ──
+  ts)                exec "$PY" "$S/ts.py" client "$@" ;;
   ts-broker)         exec "$PY" "$ENGINE/api/ts_broker.py" "$@" ;;
   ts-broker-up)      sc_ts_broker_up ;;
   ts-broker-down)    sc_ts_broker_down ;;
@@ -1893,6 +1894,9 @@ Subfloor — forkable shell substrate — full command reference (./sc help for 
   Tailnet broker (run on the HOST — drives the tailnet for sandboxed forks; holds
   the already-`tailscale up` node so the fork never holds a tailnet credential.
   See .super-coder/docs/tailscale-broker.md). `launch` brings it up when a tailnet is linked:
+  ./sc ts status|exec HOST -- COMMAND
+                           observe the tailnet or run a policy-checked diagnostic command
+  ./sc ts init             write the ts block from flags and show broker health
   ./sc ts-broker           run the broker in the foreground (unix socket)
   ./sc ts-broker-up        start it in the background (nohup + pidfile); self-skips if unlinked/already up
   ./sc ts-broker-down      stop the backgrounded broker
