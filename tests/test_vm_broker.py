@@ -1054,6 +1054,17 @@ class SocketTransportTests(unittest.TestCase):
         r = vm.broker_call("GET", "/nope")
         self.assertFalse(r["ok"])
 
+    def test_snapshot_list_round_trips_over_the_socket(self):
+        expected = {
+            "ok": True,
+            "domain": "win-test",
+            "snapshots": [
+                {"name": "clean", "creation_time": "today", "current": True}
+            ],
+        }
+        with mock.patch.object(vm, "do_snapshot_list", return_value=expected):
+            self.assertEqual(vm.broker_call("GET", "/snapshot/list"), expected)
+
     def test_status_fault_returns_sanitized_json_instead_of_dropping_response(self):
         with mock.patch.object(vm, "do_status", side_effect=ValueError("SECRET")), \
              mock.patch.object(vm_broker.sys, "stderr", new_callable=io.StringIO) as log:

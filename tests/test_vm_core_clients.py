@@ -136,6 +136,132 @@ class BrokerReadinessTests(unittest.TestCase):
         self.assertEqual(result["last_readiness_error"], "No route to host")
         self.assertEqual(result["domain_state"], "running")
 
+    def test_stop_uses_graceful_shutdown_and_confirms_powered_off(self):
+        with mock.patch.object(vm, "read", return_value=SAVED), \
+             mock.patch.object(
+                 vm,
+                 "_domain_state",
+                 side_effect=[(True, "running"), (True, "powered_off")],
+             ), \
+             mock.patch.object(vm, "_run", return_value=(True, "shutdown")) as run:
+            result = vm.do_stop(wait=1)
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["domain_state"], "powered_off")
+        self.assertFalse(result["forced"])
+        run.assert_called_once_with(
+            ["virsh", "shutdown", "win-test"], timeout=vm.DOMAIN_STATE_TIMEOUT
+        )
+
+    def test_stop_force_is_the_only_path_to_virsh_destroy(self):
+        with mock.patch.object(vm, "read", return_value=SAVED), \
+             mock.patch.object(
+                 vm,
+                 "_domain_state",
+                 side_effect=[(True, "running"), (True, "powered_off")],
+             ), \
+             mock.patch.object(vm, "_run", return_value=(True, "destroyed")) as run:
+            result = vm.do_stop(force=True, wait=1)
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["forced"])
+        run.assert_called_once_with(
+            ["virsh", "destroy", "win-test"], timeout=vm.DOMAIN_STATE_TIMEOUT
+        )
+
+    def test_restart_stops_before_reusing_start_readiness(self):
+        events = []
+        with mock.patch.object(
+            vm,
+            "do_stop",
+            side_effect=lambda: events.append("stop") or {"ok": True},
+        ), mock.patch.object(
+            vm,
+            "do_start",
+            side_effect=lambda: events.append("start") or {
+                "ok": True,
+                "domain": "win-test",
+                "domain_state": "running",
+                "started": True,
+                "attempts": 2,
+                "last_readiness_error": None,
+            },
+        ):
+            result = vm.do_restart()
+        self.assertEqual(events, ["stop", "start"])
+        self.assertTrue(result["restarted"])
+
+    def test_snapshot_list_reports_creation_time_and_current_marker(self):
+        def fake_run(argv, timeout):
+            if "snapshot-list" in argv:
+                return True, "clean\ncheckpoint\n"
+            if "snapshot-current" in argv:
+                return True, "checkpoint\n"
+            name = argv[-1]
+            return True, f"Name: {name}\nCreation Time: 2026-09-09 12:00:00 +0200"
+
+        with mock.patch.object(vm, "read", return_value=SAVED), \
+             mock.patch.object(vm, "_run", side_effect=fake_run):
+            result = vm.do_snapshot_list()
+        self.assertEqual(result["snapshots"], [
+            {
+                "name": "clean",
+                "creation_time": "2026-09-09 12:00:00 +0200",
+                "current": False,
+            },
+            {
+                "name": "checkpoint",
+                "creation_time": "2026-09-09 12:00:00 +0200",
+                "current": True,
+            },
+        ])
+
+    def test_snapshot_create_requires_off_and_uses_validated_name(self):
+        with mock.patch.object(vm, "read", return_value=SAVED), \
+             mock.patch.object(vm, "_domain_state", return_value=(True, "powered_off")), \
+             mock.patch.object(vm, "_run", return_value=(True, "created")) as run:
+            result = vm.do_snapshot_create("checkpoint-1")
+        self.assertTrue(result["ok"])
+        run.assert_called_once_with(
+            ["virsh", "snapshot-create-as", "win-test", "checkpoint-1"],
+            timeout=vm.SNAPSHOT_COMMAND_TIMEOUT,
+        )
+        with mock.patch.object(vm, "read", return_value=SAVED), \
+             mock.patch.object(vm, "_domain_state", return_value=(True, "running")), \
+             mock.patch.object(vm, "_run") as run:
+            result = vm.do_snapshot_create("checkpoint-1")
+        self.assertEqual(result["error"], "snapshot_requires_off")
+        run.assert_not_called()
+
+    def test_snapshot_names_are_strict_and_configured_snapshot_is_protected(self):
+        for name in ("UPPER", "two words", "../escape", "x" * 33):
+            with self.subTest(name=name):
+                result = vm.do_snapshot_create(name)
+                self.assertEqual(result["error"], "snapshot_name_invalid")
+        with mock.patch.object(vm, "read", return_value=SAVED), \
+             mock.patch.object(vm, "_run") as run:
+            result = vm.do_snapshot_delete("clean")
+        self.assertEqual(result["error"], "snapshot_protected")
+        run.assert_not_called()
+
+    def test_snapshot_delete_and_named_reset_use_the_requested_snapshot(self):
+        with mock.patch.object(vm, "read", return_value=SAVED), \
+             mock.patch.object(vm, "_run", return_value=(True, "deleted")) as run:
+            deleted = vm.do_snapshot_delete("checkpoint")
+        self.assertTrue(deleted["ok"])
+        run.assert_called_once_with(
+            ["virsh", "snapshot-delete", "win-test", "--snapshotname", "checkpoint"],
+            timeout=vm.SNAPSHOT_COMMAND_TIMEOUT,
+        )
+        with mock.patch.object(vm, "read", return_value=SAVED), \
+             mock.patch.object(vm, "_run", return_value=(True, "reverted")) as run, \
+             mock.patch.object(vm, "_domain_state", return_value=(True, "powered_off")):
+            reset = vm.do_reset(running=False, snapshot="checkpoint")
+        self.assertTrue(reset["ok"])
+        self.assertEqual(reset["snapshot"], "checkpoint")
+        run.assert_called_once_with(
+            ["virsh", "snapshot-revert", "win-test", "--snapshotname", "checkpoint"],
+            timeout=vm.RESET_COMMAND_TIMEOUT,
+        )
+
     def test_powered_off_reset_confirms_observed_final_state(self):
         with mock.patch.object(vm, "read", return_value=SAVED), \
              mock.patch.object(vm, "_run", return_value=(True, "reverted")) as run, \
@@ -279,6 +405,18 @@ class SingleResponseTests(unittest.TestCase):
         self.assertIn("error=ValueError", log.getvalue())
         self.assertNotIn("SECRET", log.getvalue())
 
+    def test_snapshot_list_get_route_is_read_only(self):
+        handler = self._handler()
+        handler.command = "GET"
+        handler.path = "/snapshot/list"
+        handler._send = mock.Mock()
+        with mock.patch.object(
+            vm, "do_snapshot_list", return_value={"ok": True, "snapshots": []}
+        ) as snapshot_list:
+            handler.do_GET()
+        snapshot_list.assert_called_once_with()
+        handler._send.assert_called_once_with(200, {"ok": True, "snapshots": []})
+
     def test_put_exception_returns_sanitized_error_without_payload_log(self):
         handler = self._handler()
         handler.command = "PUT"
@@ -310,6 +448,10 @@ class SingleResponseTests(unittest.TestCase):
         cases = (
             ("/exec", "do_exec", {"command": "echo ok"}),
             ("/start", "do_start", {}),
+            ("/stop", "do_stop", {"force": False}),
+            ("/restart", "do_restart", {}),
+            ("/snapshot/create", "do_snapshot_create", {"name": "checkpoint"}),
+            ("/snapshot/delete", "do_snapshot_delete", {"name": "checkpoint"}),
             ("/reset", "do_reset", {"running": False}),
             ("/push", "do_push", {"src": "artifact", "dest": "staged"}),
             ("/capture", "do_capture", {"command": None}),
@@ -821,6 +963,148 @@ class PublicClientTests(unittest.TestCase):
             help_text = " ".join(output.getvalue().split())
             for field in expected:
                 self.assertIn(field, help_text)
+
+
+class LifecycleClientTests(unittest.TestCase):
+    def test_stop_force_and_restart_use_bounded_broker_routes(self):
+        with mock.patch.object(vm, "broker_call", return_value={
+            "ok": True,
+            "domain": "win-test",
+            "domain_state": "powered_off",
+            "stopped": True,
+            "forced": True,
+        }) as call:
+            stopped = vm.run_operation("stop", force=True)
+        self.assertTrue(stopped["ok"])
+        self.assertTrue(stopped["result"]["forced"])
+        call.assert_called_once_with(
+            "POST", "/stop", {"force": True}, timeout=vm.STOP_CLIENT_TIMEOUT
+        )
+
+        with mock.patch.object(vm, "broker_call", return_value={
+            "ok": True,
+            "domain": "win-test",
+            "domain_state": "running",
+            "restarted": True,
+            "attempts": 2,
+        }) as call:
+            restarted = vm.run_operation("restart")
+        self.assertTrue(restarted["result"]["restarted"])
+        call.assert_called_once_with(
+            "POST", "/restart", None, timeout=vm.RESTART_CLIENT_TIMEOUT
+        )
+
+    def test_snapshot_client_routes_and_named_reset(self):
+        cases = (
+            (
+                "snapshot_list",
+                None,
+                {"ok": True, "domain": "win-test", "snapshots": []},
+                ("GET", "/snapshot/list", None, vm.DEFAULT_CLIENT_TIMEOUT),
+            ),
+            (
+                "snapshot_create",
+                "checkpoint",
+                {"ok": True, "domain": "win-test", "snapshot": "checkpoint"},
+                (
+                    "POST",
+                    "/snapshot/create",
+                    {"name": "checkpoint"},
+                    vm.SNAPSHOT_COMMAND_TIMEOUT + vm.MUTATION_LOCK_TIMEOUT + 15,
+                ),
+            ),
+            (
+                "snapshot_delete",
+                "checkpoint",
+                {"ok": True, "domain": "win-test", "snapshot": "checkpoint"},
+                (
+                    "POST",
+                    "/snapshot/delete",
+                    {"name": "checkpoint"},
+                    vm.SNAPSHOT_COMMAND_TIMEOUT + vm.MUTATION_LOCK_TIMEOUT + 15,
+                ),
+            ),
+        )
+        for operation, name, response, expected in cases:
+            with self.subTest(operation=operation), mock.patch.object(
+                vm, "broker_call", return_value=response
+            ) as call:
+                result = vm.run_operation(operation, snapshot=name)
+                self.assertTrue(result["ok"])
+                call.assert_called_once_with(*expected[:3], timeout=expected[3])
+
+        with mock.patch.object(vm, "broker_call", return_value={
+            "ok": True,
+            "domain": "win-test",
+            "domain_state": "powered_off",
+            "snapshot": "checkpoint",
+        }) as call:
+            result = vm.run_operation("reset", snapshot="checkpoint")
+        self.assertTrue(result["ok"])
+        call.assert_called_once_with(
+            "POST",
+            "/reset",
+            {"running": False, "snapshot": "checkpoint"},
+            timeout=vm.RESET_CLIENT_TIMEOUT,
+        )
+
+    def test_init_writes_only_vm_block_and_reports_broker_health(self):
+        config = dict(SAVED)
+        with mock.patch.object(vm, "write") as write, mock.patch.object(
+            vm, "broker_call", return_value={"ok": True, "service": "vm-broker"}
+        ) as health:
+            result = vm.run_init(config)
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["result"]["broker"]["ready"])
+        write.assert_called_once_with(config)
+        health.assert_called_once_with("GET", "/health", None, timeout=5)
+
+    def test_init_cli_builds_vm_block_from_flags(self):
+        captured = {}
+
+        def fake_init(config):
+            captured.update(config)
+            return vm.operation_success(
+                "init", {"vm": config, "broker": {"ready": True, "start_command": None}}
+            )
+
+        with mock.patch.object(vm, "run_init", side_effect=fake_init), \
+             mock.patch.object(sys, "stdout", new_callable=io.StringIO):
+            code = vm.client_main([
+                "init",
+                "--domain", "win-test",
+                "--snapshot", "clean",
+                "--transfer-dir", "/srv/share",
+                "--ssh-host", "127.0.0.1",
+                "--ssh-user", "tester",
+                "--ssh-key-path", "/host/key",
+                "--libvirt-uri", "qemu:///system",
+                "--ssh-port", "2222",
+                "--mcp-port", "8001",
+            ])
+        self.assertEqual(code, 0)
+        self.assertEqual(captured, {
+            "domain": "win-test",
+            "snapshot": "clean",
+            "transfer_dir": "/srv/share",
+            "ssh_host": "127.0.0.1",
+            "ssh_user": "tester",
+            "ssh_key_path": "/host/key",
+            "libvirt_uri": "qemu:///system",
+            "ssh_port": 2222,
+            "mcp_port": 8001,
+        })
+
+    def test_reset_still_requires_off_with_optional_snapshot(self):
+        with mock.patch.object(vm, "run_operation") as run, \
+             mock.patch.object(sys, "stdout", new_callable=io.StringIO):
+            run.return_value = vm.operation_success("reset", {
+                "domain": {"name": "win-test", "state": "powered_off"},
+                "snapshot": "checkpoint",
+            })
+            code = vm.client_main(["reset", "checkpoint", "--off", "--json"])
+        self.assertEqual(code, 0)
+        run.assert_called_once_with("reset", snapshot="checkpoint")
 
 
 class PublicMcpClientTests(unittest.TestCase):

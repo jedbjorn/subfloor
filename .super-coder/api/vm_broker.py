@@ -18,7 +18,12 @@ Routes (all JSON `{ok, ...}`):
     PUT  /vm        {vm}        write the vm block
     POST /exec      {command}   ssh the guest -> {ok, exit, stdout, stderr}
     POST /start                 start only if off, then wait for SSH readiness
-    POST /reset                 virsh snapshot-revert <dom> <snap> --running
+    POST /stop       {force?}   shut down, or destroy only with force=true
+    POST /restart               graceful stop followed by start readiness
+    GET  /snapshot/list         list snapshots with current marker
+    POST /snapshot/create       create one offline snapshot
+    POST /snapshot/delete       delete one non-configured snapshot
+    POST /reset      {snapshot?} revert a named/default snapshot, powered off
     POST /push      {src,dest?} stage a host-visible artifact into transfer_dir
     POST /capture   {command?}  optional exec + a virsh screenshot (base64)
     POST /validate/{check}      one live setup check against the body's candidate cfg
@@ -134,6 +139,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, {"ok": True, "service": "vm-broker"})
         if self.path == "/status":
             return self._send(200, vm.do_status())
+        if self.path == "/snapshot/list":
+            return self._send(200, vm.do_snapshot_list())
         if self.path == "/vm":
             return self._send(200, {"vm": vm.read()})
         if self.path == "/mcp/status":
@@ -162,11 +169,42 @@ class Handler(BaseHTTPRequestHandler):
             )
         if self.path == "/start":
             return self._mutate(vm.do_start)
+        if self.path == "/stop":
+            force = self._body().get("force", False)
+            if not isinstance(force, bool):
+                return self._send(400, {"ok": False, "error": "force must be boolean"})
+            return self._mutate(lambda: vm.do_stop(force=force))
+        if self.path == "/restart":
+            return self._mutate(vm.do_restart)
+        if self.path == "/snapshot/create":
+            return self._mutate(
+                lambda: vm.do_snapshot_create(self._body().get("name", ""))
+            )
+        if self.path == "/snapshot/delete":
+            return self._mutate(
+                lambda: vm.do_snapshot_delete(self._body().get("name", ""))
+            )
+        if self.path == "/stop":
+            force = self._body().get("force", False)
+            if not isinstance(force, bool):
+                return self._send(400, {"ok": False, "error": "force must be boolean"})
+            return self._mutate(lambda: vm.do_stop(force=force))
+        if self.path == "/restart":
+            return self._mutate(vm.do_restart)
+        if self.path == "/snapshot/create":
+            name = self._body().get("name", "")
+            return self._mutate(lambda: vm.do_snapshot_create(name))
+        if self.path == "/snapshot/delete":
+            name = self._body().get("name", "")
+            return self._mutate(lambda: vm.do_snapshot_delete(name))
         if self.path == "/reset":
             # {"running": false} ends a run clean + powered OFF (frees host
             # RAM); default true boots a clean box to START a run.
-            running = self._body().get("running", True)
-            return self._mutate(lambda: vm.do_reset(running))
+            body = self._body()
+            running = body.get("running", True)
+            return self._mutate(
+                lambda: vm.do_reset(running=running, snapshot=body.get("snapshot"))
+            )
         if self.path == "/push":
             b = self._body()
             return self._mutate(

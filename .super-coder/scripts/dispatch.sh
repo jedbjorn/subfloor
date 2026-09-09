@@ -1848,9 +1848,18 @@ Subfloor — forkable shell substrate — full command reference (./sc help for 
   Windows VM broker (run on the HOST — drives the test VM for sandboxed forks;
   holds the ssh key + virsh so the fork never does).
   `launch` brings it up automatically when a VM is linked; `down` stops it:
+  ./sc vm init --domain DOMAIN --snapshot NAME --transfer-dir PATH
+       --ssh-host HOST --ssh-user USER --ssh-key-path PATH [OPTIONS]
+                           write only the vm block and report broker health
   ./sc vm status [--json] read broker, VM, SSH, and MCP-tunnel state without mutation;
                            includes relay, endpoint, and active-adapter state
   ./sc vm start [--json]  start only when off, then wait within a bounded SSH-readiness budget
+  ./sc vm stop [--force] [--json]
+                           gracefully stop; --force is required to use virsh destroy
+  ./sc vm restart [--json]
+                           gracefully stop, start, and wait for SSH readiness
+  ./sc vm snapshot list|create NAME|delete NAME [--json]
+                           inspect snapshots; create requires off; configured snapshot is protected
   ./sc vm push SRC [DEST] [--json]
                            stage a permitted local artifact through the configured transfer directory
   ./sc vm exec [--command-file FILE] [--json] -- COMMAND...
@@ -1859,8 +1868,8 @@ Subfloor — forkable shell substrate — full command reference (./sc help for 
                            save a validated screenshot artifact and return viewable metadata
   ./sc vm mcp status|up|down [--json]
                            inspect, start+verify, or stop the managed MCP tunnel and relay
-  ./sc vm reset --off [--json]
-                           restore the testing snapshot and confirm the VM is powered off
+  ./sc vm reset [NAME] --off [--json]
+                           restore the named or configured snapshot and confirm the VM is powered off
   ./sc vm-broker           run the broker in the foreground (unix socket)
   ./sc vm-bake             HOST-side: graceful shutdown + (re)bake the clean snapshot after provisioning
                              (deliberately NOT a broker verb — the sandbox must never redefine 'clean')
