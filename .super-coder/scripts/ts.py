@@ -14,6 +14,7 @@ the host. The block only configures *use*:
 
     ssh_user       remote user for `tailscale ssh` (user@host)
     allowed_hosts  the tailnet hosts this fork may exec against (scoping policy)
+    readonly_hosts implicitly allowed hosts restricted to diagnostic commands
     tailscale_bin  path/name of the tailscale CLI (default "tailscale")
 
 Unlike the Windows VM (one fixed target), a tailnet has N hosts — so the loop
@@ -26,7 +27,9 @@ sandbox names verbs over the broker's unix socket and holds nothing. The broker
 """
 from __future__ import annotations
 
+import argparse
 import json
+import shlex
 import socket
 import subprocess
 import sys
@@ -34,6 +37,46 @@ import sys
 import ports
 
 CHECKS = ("daemon", "auth", "peer", "ssh")
+
+# Read-only commands are prefixes: trailing operands remain available for
+# selecting a service, container, file, or other diagnostic target. Keeping the
+# policy as data makes additions reviewable and lets tests exercise every entry.
+READONLY_COMMANDS = (
+    ("systemctl", "status"),
+    ("systemctl", "is-active"),
+    ("systemctl", "list-units"),
+    ("systemctl", "list-timers"),
+    ("journalctl",),
+    ("pm2", "status"),
+    ("pm2", "list"),
+    ("pm2", "describe"),
+    ("pm2", "logs", "--nostream"),
+    ("docker", "ps"),
+    ("docker", "logs"),
+    ("docker", "inspect"),
+    ("docker", "stats", "--no-stream"),
+    ("docker", "images"),
+    ("df",),
+    ("free",),
+    ("uptime",),
+    ("ps",),
+    ("ss",),
+    ("ip",),
+    ("ls",),
+    ("stat",),
+    ("cat",),
+    ("head",),
+    ("tail",),
+    ("du",),
+    ("nproc",),
+    ("hostname",),
+    ("whoami",),
+    ("id",),
+)
+READONLY_FORBIDDEN_CHARACTERS = (
+    ";", "&", "|", ">", "<", "$", "`", "(", ")", "\n", "\r",
+)
+READONLY_TOKEN_DISPLAY = {"\n": r"\n", "\r": r"\r"}
 
 # The broker listens here — a unix socket inside the bind-mounted engine dir, so
 # the same absolute path resolves on the host (where the broker runs) and in the
@@ -90,17 +133,62 @@ def _ssh_argv(cfg: dict, host: str, remote: str) -> list[str]:
     return [_bin(cfg), "ssh", target, remote]
 
 
+def _declared_hosts(cfg: dict) -> list[str]:
+    """Allowed plus read-only hosts, in declaration order without duplicates."""
+    return list(dict.fromkeys(
+        [*(cfg.get("allowed_hosts") or []), *(cfg.get("readonly_hosts") or [])]
+    ))
+
+
 def _denied(cfg: dict, host: str) -> str | None:
-    """Fail-closed scoping. `allowed_hosts` is the set a fork may exec against;
-    empty/absent denies all, so a devops shell must declare its targets and a
-    compromised sandbox cannot reach arbitrary tailnet nodes."""
+    """Fail closed; readonly_hosts are implicitly allowed and win on overlap."""
     allowed = cfg.get("allowed_hosts") or []
-    if not allowed:
-        return ("no allowed_hosts in the `ts` block — exec is denied until you "
-                "declare the tailnet hosts this fork may reach.")
-    if host not in allowed:
-        return f"host '{host}' is not in allowed_hosts {allowed}"
+    readonly = cfg.get("readonly_hosts") or []
+    if not allowed and not readonly:
+        return ("no allowed_hosts or readonly_hosts in the `ts` block — exec is "
+                "denied until you declare the tailnet hosts this fork may reach.")
+    if host not in allowed and host not in readonly:
+        return f"host '{host}' is not in allowed_hosts or readonly_hosts"
     return None
+
+
+def readonly_refusal(command: str) -> str | None:
+    """Return the token that makes a read-only command unsafe, else None."""
+    for character in READONLY_FORBIDDEN_CHARACTERS:
+        if character in command:
+            return READONLY_TOKEN_DISPLAY.get(character, character)
+    try:
+        tokens = shlex.split(command)
+    except ValueError:
+        return command
+    if "sudo" in tokens:
+        return "sudo"
+    if not tokens:
+        return command
+    for prefix in READONLY_COMMANDS:
+        if tuple(tokens[:len(prefix)]) == prefix:
+            if prefix == ("journalctl",):
+                blocked = next(
+                    (token for token in tokens[1:]
+                     if token.startswith(("--vacuum", "--rotate"))),
+                    None,
+                )
+                if blocked:
+                    return blocked
+            return None
+    known_verbs = {prefix[0] for prefix in READONLY_COMMANDS}
+    return tokens[1] if tokens[0] in known_verbs and len(tokens) > 1 else tokens[0]
+
+
+def _readonly_refused(token: str) -> dict:
+    return {
+        "ok": False,
+        "error": "readonly_refused",
+        "token": token,
+        "exit": -1,
+        "stdout": "",
+        "stderr": f"read-only host refused token: {token}",
+    }
 
 
 def _status_json(cfg: dict, timeout: int = 15) -> tuple[bool, dict | str]:
@@ -148,25 +236,25 @@ def _check_auth(cfg: dict) -> tuple[bool, str]:
 
 
 def _check_peer(cfg: dict) -> tuple[bool, str]:
-    allowed = cfg.get("allowed_hosts") or []
-    if not allowed:
-        return False, "no allowed_hosts configured — nothing to resolve."
+    declared = _declared_hosts(cfg)
+    if not declared:
+        return False, "no allowed_hosts or readonly_hosts configured — nothing to resolve."
     ok, data = _status_json(cfg)
     if not ok:
         return False, str(data)
     names = _peer_names(data)
-    missing = [h for h in allowed if h not in names]
+    missing = [h for h in declared if h not in names]
     if missing:
-        return False, (f"allowed_hosts not found in the tailnet: {missing}. "
+        return False, (f"declared hosts not found in the tailnet: {missing}. "
                        f"Visible peers: {sorted(n for n in names if n)}")
-    return True, f"all allowed_hosts resolve as tailnet peers: {allowed}"
+    return True, f"all declared hosts resolve as tailnet peers: {declared}"
 
 
 def _check_ssh(cfg: dict) -> tuple[bool, str]:
-    allowed = cfg.get("allowed_hosts") or []
-    if not allowed:
-        return False, "no allowed_hosts configured — nothing to probe."
-    host = allowed[0]
+    declared = _declared_hosts(cfg)
+    if not declared:
+        return False, "no allowed_hosts or readonly_hosts configured — nothing to probe."
+    host = declared[0]
     ok, out = _run(_ssh_argv(cfg, host, "echo ok"), timeout=20)
     if ok:
         return True, f"tailscale ssh to '{host}' works: {out or 'ok'}"
@@ -233,6 +321,10 @@ def do_exec(host: str, command: str, timeout: int = 120) -> dict:
         return {"ok": False, "exit": -1, "stdout": "", "stderr": "exec: empty command"}
     if denied := _denied(cfg, host):
         return {"ok": False, "exit": -1, "stdout": "", "stderr": denied}
+    if host in (cfg.get("readonly_hosts") or []) and (
+        token := readonly_refusal(command)
+    ):
+        return _readonly_refused(token)
     try:
         p = subprocess.run(_ssh_argv(cfg, host, command), capture_output=True,
                            text=True, timeout=timeout)
@@ -281,10 +373,76 @@ def broker_call(method: str, path: str, body: dict | None = None,
                 "raw": raw_body[:200].decode("latin1")}
 
 
+# -- socket-backed public client ---------------------------------------------
+
+def _client_error(operation: str, message: str) -> dict:
+    return {"ok": False, "error": "broker_unreachable",
+            "operation": operation, "message": message}
+
+
+def _broker_health() -> dict:
+    try:
+        response = broker_call("GET", "/health")
+    except ConnectionError:
+        return {"ready": False, "start_command": "./sc ts-broker-up"}
+    return {"ready": response.get("ok") is True,
+            "start_command": "./sc ts-broker-up"}
+
+
+def client_main(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(
+        prog="./sc ts",
+        description="Observe and diagnose declared tailnet hosts through ts-broker.",
+    )
+    commands = parser.add_subparsers(dest="operation", required=True)
+    commands.add_parser("status", help="show tailnet node and peer status")
+    execute = commands.add_parser(
+        "exec", help="execute a permitted command on a declared tailnet host"
+    )
+    execute.add_argument("host")
+    execute.add_argument("command", nargs=argparse.REMAINDER, metavar="COMMAND")
+    init = commands.add_parser("init", help="write the ts block and show broker health")
+    init.add_argument("--ssh-user")
+    init.add_argument("--allowed-host", action="append", dest="allowed_hosts")
+    init.add_argument("--readonly-host", action="append", dest="readonly_hosts")
+    init.add_argument("--tailscale-bin")
+    args = parser.parse_args(argv)
+
+    if args.operation == "init":
+        current = read() or {}
+        block = {
+            "ssh_user": args.ssh_user if args.ssh_user is not None
+            else current.get("ssh_user", ""),
+            "allowed_hosts": args.allowed_hosts if args.allowed_hosts is not None
+            else current.get("allowed_hosts", []),
+            "readonly_hosts": args.readonly_hosts if args.readonly_hosts is not None
+            else current.get("readonly_hosts", []),
+            "tailscale_bin": args.tailscale_bin if args.tailscale_bin is not None
+            else current.get("tailscale_bin", "tailscale"),
+        }
+        write(block)
+        result = {"ok": True, "ts": block, "broker": _broker_health()}
+    else:
+        try:
+            if args.operation == "status":
+                result = broker_call("GET", "/status")
+            else:
+                command = args.command[1:] if args.command[:1] == ["--"] else args.command
+                result = broker_call(
+                    "POST", "/exec", {"host": args.host, "command": " ".join(command)}
+                )
+        except ConnectionError as exc:
+            result = _client_error(args.operation, str(exc))
+    print(json.dumps(result, separators=(",", ":")))
+    return 0 if result.get("ok") else 1
+
+
 # -- host CLI (path lookup for `sc`; verbs for manual no-broker testing) ------
 
 def main(argv: list[str]) -> int:
     mode = argv[0] if argv else "sock"
+    if mode == "client":
+        return client_main(argv[1:])
     if mode == "sock":
         print(SOCKET)
     elif mode == "configured":
@@ -299,7 +457,7 @@ def main(argv: list[str]) -> int:
     elif mode == "validate":
         print(json.dumps(validate(argv[1] if len(argv) > 1 else "", read() or {})))
     else:
-        sys.exit("usage: ts.py [sock|status|exec <host> <cmd>|validate <check>]")
+        sys.exit("usage: ts.py [client <status|exec|init>|sock|status|exec <host> <cmd>|validate <check>]")
     return 0
 
 

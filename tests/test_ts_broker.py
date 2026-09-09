@@ -14,10 +14,13 @@ Run:
 """
 from __future__ import annotations
 
+import io
 import json
 import sys
+import tempfile
 import threading
 import unittest
+from contextlib import redirect_stdout
 from pathlib import Path
 from unittest import mock
 
@@ -33,6 +36,8 @@ SAVED = {
     "allowed_hosts": ["build-box", "deploy-target"],
     "tailscale_bin": "tailscale",
 }
+
+READONLY_SAVED = dict(SAVED, readonly_hosts=["production"])
 
 # A minimal `tailscale status --json` payload.
 STATUS_JSON = json.dumps({
@@ -77,6 +82,86 @@ class VerbDispatchTests(unittest.TestCase):
         self.assertFalse(r["ok"])
         self.assertIn("no allowed_hosts", r["stderr"])
         run.assert_not_called()
+
+    def test_every_readonly_command_table_entry_passes(self):
+        fake = mock.Mock(returncode=0, stdout="ok\n", stderr="")
+        with mock.patch.object(ts, "read", return_value=READONLY_SAVED), \
+             mock.patch("subprocess.run", return_value=fake) as run:
+            for prefix in ts.READONLY_COMMANDS:
+                with self.subTest(prefix=prefix):
+                    command = " ".join((*prefix, "target"))
+                    r = ts.do_exec("production", command)
+                    self.assertTrue(r["ok"], r)
+        self.assertEqual(run.call_count, len(ts.READONLY_COMMANDS))
+
+    def test_each_forbidden_character_is_structurally_refused(self):
+        with mock.patch.object(ts, "read", return_value=READONLY_SAVED), \
+             mock.patch("subprocess.run") as run:
+            for character in ts.READONLY_FORBIDDEN_CHARACTERS:
+                with self.subTest(character=character):
+                    r = ts.do_exec("production", f"uptime {character} whoami")
+                    self.assertEqual(r["error"], "readonly_refused")
+                    self.assertEqual(
+                        r["token"], ts.READONLY_TOKEN_DISPLAY.get(character, character)
+                    )
+        run.assert_not_called()
+
+    def test_each_forbidden_character_remains_unrestricted_on_allowed_host(self):
+        fake = mock.Mock(returncode=0, stdout="", stderr="")
+        with mock.patch.object(ts, "read", return_value=SAVED), \
+             mock.patch("subprocess.run", return_value=fake) as run:
+            for character in ts.READONLY_FORBIDDEN_CHARACTERS:
+                with self.subTest(character=character):
+                    command = f"uptime {character} whoami"
+                    r = ts.do_exec("build-box", command)
+                    self.assertTrue(r["ok"])
+                    self.assertEqual(run.call_args[0][0][-1], command)
+        self.assertEqual(run.call_count, len(ts.READONLY_FORBIDDEN_CHARACTERS))
+
+    def test_sudo_and_off_table_verb_are_structurally_refused(self):
+        with mock.patch.object(ts, "read", return_value=READONLY_SAVED), \
+             mock.patch("subprocess.run") as run:
+            for command, token in (("sudo uptime", "sudo"), ("reboot", "reboot")):
+                with self.subTest(command=command):
+                    r = ts.do_exec("production", command)
+                    self.assertEqual(r["error"], "readonly_refused")
+                    self.assertEqual(r["token"], token)
+        run.assert_not_called()
+
+    def test_readonly_subcommand_restrictions_are_enforced(self):
+        cases = (
+            ("systemctl restart app", "restart"),
+            ("journalctl --vacuum-time=1d", "--vacuum-time=1d"),
+            ("journalctl --rotate", "--rotate"),
+            ("pm2 restart app", "restart"),
+            ("pm2 logs app", "logs"),
+            ("docker stats", "stats"),
+            ("docker restart app", "restart"),
+        )
+        with mock.patch.object(ts, "read", return_value=READONLY_SAVED), \
+             mock.patch("subprocess.run") as run:
+            for command, token in cases:
+                with self.subTest(command=command):
+                    r = ts.do_exec("production", command)
+                    self.assertEqual(r["error"], "readonly_refused")
+                    self.assertEqual(r["token"], token)
+        run.assert_not_called()
+
+    def test_allowed_hosts_only_entry_remains_unrestricted(self):
+        fake = mock.Mock(returncode=0, stdout="", stderr="")
+        with mock.patch.object(ts, "read", return_value=SAVED), \
+             mock.patch("subprocess.run", return_value=fake) as run:
+            r = ts.do_exec("build-box", "sudo reboot; now")
+        self.assertTrue(r["ok"])
+        run.assert_called_once()
+
+    def test_readonly_host_is_implicitly_allowed(self):
+        fake = mock.Mock(returncode=0, stdout="", stderr="")
+        cfg = {"readonly_hosts": ["production"]}
+        with mock.patch.object(ts, "read", return_value=cfg), \
+             mock.patch("subprocess.run", return_value=fake):
+            r = ts.do_exec("production", "uptime")
+        self.assertTrue(r["ok"])
 
     def test_exec_empty_command_is_a_clean_error(self):
         with mock.patch.object(ts, "read", return_value=SAVED):
@@ -126,6 +211,16 @@ class CheckTests(unittest.TestCase):
         self.assertFalse(r["ok"])
         self.assertIn("ghost", r["output"])
 
+    def test_peer_and_ssh_checks_include_implicitly_allowed_readonly_hosts(self):
+        cfg = {"readonly_hosts": ["build-box"], "ssh_user": "tester"}
+        with mock.patch.object(ts, "_run", return_value=(True, STATUS_JSON)):
+            peer = ts.validate("peer", cfg)
+        self.assertTrue(peer["ok"])
+        with mock.patch.object(ts, "_run", return_value=(True, "ok")) as run:
+            ssh = ts.validate("ssh", cfg)
+        self.assertTrue(ssh["ok"])
+        self.assertIn("tester@build-box", run.call_args[0][0])
+
     def test_unknown_check_is_none(self):
         self.assertIsNone(ts.validate("nope", SAVED))
 
@@ -172,6 +267,16 @@ class SocketTransportTests(unittest.TestCase):
         self.assertEqual(r["exit"], 2)
         self.assertEqual(r["stdout"], "out")
 
+    def test_readonly_refusal_round_trips_over_the_socket(self):
+        with mock.patch.object(ts, "read", return_value=READONLY_SAVED), \
+             mock.patch("subprocess.run") as run:
+            r = ts.broker_call(
+                "POST", "/exec", {"host": "production", "command": "uptime\nreboot"}
+            )
+        self.assertEqual(r["error"], "readonly_refused")
+        self.assertEqual(r["token"], r"\n")
+        run.assert_not_called()
+
     def test_status_round_trips_over_the_socket(self):
         with mock.patch.object(ts, "read", return_value=SAVED), \
              mock.patch.object(ts, "_run", return_value=(True, STATUS_JSON)):
@@ -183,6 +288,79 @@ class SocketTransportTests(unittest.TestCase):
         ts.SOCKET = self.sock.with_name("_absent.sock")
         with self.assertRaises(ConnectionError):
             ts.broker_call("GET", "/health")
+
+
+class ClientTests(unittest.TestCase):
+    def _run(self, argv):
+        output = io.StringIO()
+        with redirect_stdout(output):
+            code = ts.client_main(argv)
+        return code, json.loads(output.getvalue())
+
+    def test_status_calls_the_broker(self):
+        response = {"ok": True, "backend": "Running", "self": {}, "peers": []}
+        with mock.patch.object(ts, "broker_call", return_value=response) as call:
+            code, result = self._run(["status"])
+        self.assertEqual(code, 0)
+        self.assertEqual(result, response)
+        call.assert_called_once_with("GET", "/status")
+
+    def test_exec_calls_the_broker_with_command_after_separator(self):
+        response = {"ok": True, "exit": 0, "stdout": "up", "stderr": ""}
+        with mock.patch.object(ts, "broker_call", return_value=response) as call:
+            code, result = self._run(["exec", "production", "--", "uptime"])
+        self.assertEqual(code, 0)
+        self.assertEqual(result, response)
+        call.assert_called_once_with(
+            "POST", "/exec", {"host": "production", "command": "uptime"}
+        )
+
+    def test_init_preserves_unspecified_values_and_reports_broker_health(self):
+        current = {"ssh_user": "ops", "allowed_hosts": ["build-box"]}
+        with mock.patch.object(ts, "read", return_value=current), \
+             mock.patch.object(ts, "write") as write, \
+             mock.patch.object(ts, "broker_call", return_value={"ok": True}):
+            code, result = self._run(
+                ["init", "--readonly-host", "production", "--tailscale-bin", "/bin/ts"]
+            )
+        expected = {
+            "ssh_user": "ops",
+            "allowed_hosts": ["build-box"],
+            "readonly_hosts": ["production"],
+            "tailscale_bin": "/bin/ts",
+        }
+        self.assertEqual(code, 0)
+        write.assert_called_once_with(expected)
+        self.assertEqual(result["ts"], expected)
+        self.assertTrue(result["broker"]["ready"])
+        self.assertEqual(result["broker"]["start_command"], "./sc ts-broker-up")
+
+    def test_init_succeeds_and_reports_how_to_start_a_down_broker(self):
+        with mock.patch.object(ts, "read", return_value=None), \
+             mock.patch.object(ts, "write"), \
+             mock.patch.object(ts, "broker_call", side_effect=ConnectionError("down")):
+            code, result = self._run(["init"])
+        self.assertEqual(code, 0)
+        self.assertFalse(result["broker"]["ready"])
+        self.assertEqual(result["broker"]["start_command"], "./sc ts-broker-up")
+
+    def test_init_writes_only_ts_and_preserves_vm_and_ports(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = Path(directory) / "instance.json"
+            vm_block = {"domain": "dev-vm", "snapshot": "clean"}
+            initial = {"port": 8837, "dev_port": 4173, "vm": vm_block}
+            config.write_text(json.dumps(initial) + "\n")
+            with mock.patch.object(ts.ports, "CONFIG", config), \
+                 mock.patch.object(ts, "broker_call", side_effect=ConnectionError("down")):
+                code, result = self._run(
+                    ["init", "--ssh-user", "ops", "--readonly-host", "production"]
+                )
+            written = json.loads(config.read_text())
+        self.assertEqual(code, 0)
+        self.assertEqual(written["port"], initial["port"])
+        self.assertEqual(written["dev_port"], initial["dev_port"])
+        self.assertEqual(written["vm"], vm_block)
+        self.assertEqual(written["ts"], result["ts"])
 
 
 if __name__ == "__main__":
