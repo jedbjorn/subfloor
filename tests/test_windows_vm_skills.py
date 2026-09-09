@@ -14,7 +14,10 @@ ENGINE = ROOT / ".super-coder"
 SKILLS = ENGINE / "assets" / "skills"
 MIGRATION = ENGINE / "migrations" / "0241_global_skill_simplification.sql"
 README = ROOT / "docs" / "README.md"
-BROKER_DOC = ENGINE / "docs" / "windows-vm-broker.md"
+RETIRED_DOCS = (
+    ENGINE / "docs" / "windows-test-vm.md",
+    ENGINE / "docs" / "windows-vm-broker.md",
+)
 DISPATCH = ENGINE / "scripts" / "dispatch.sh"
 RELAY = ENGINE / "scripts" / "vm_mcp_relay.py"
 RETIRED = ("configure_winbox", "windows_devkit", "windows_vm_gui")
@@ -39,12 +42,10 @@ class WindowsCapabilityBoundaryTest(unittest.TestCase):
         for name in RETIRED:
             self.assertNotIn(name, readme)
 
-    def test_broker_design_keeps_adapter_injection_and_typed_lifecycle(self) -> None:
-        broker = BROKER_DOC.read_text()
-        self.assertNotIn("claude mcp add", broker.lower())
-        self.assertIn("adapter-injected windows-mcp", broker)
-        self.assertIn("**`./sc vm mcp up`**", broker)
-        self.assertIn("through typed `./sc vm` commands", broker)
+    def test_retired_controller_docs_are_absent(self) -> None:
+        for path in RETIRED_DOCS:
+            with self.subTest(path=path.name):
+                self.assertFalse(path.exists())
 
     def test_delivered_relay_uses_managed_adapter_injection(self) -> None:
         combined = f"{DISPATCH.read_text()}\n{RELAY.read_text()}".lower()

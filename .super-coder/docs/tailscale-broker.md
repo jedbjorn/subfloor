@@ -8,8 +8,8 @@ fork. Exact CLI syntax remains in `sc help --all` and verb help.
 
 
 The host-side authority that lets a sandboxed shell drive the tailnet without
-ever holding a tailnet credential. Sibling of the [Windows VM
-broker](windows-vm-broker.md); same shape, different backend.
+ever holding a tailnet credential. Sibling of the VM broker; same shape,
+different backend.
 
 > Canonical architecture decision: the host-side-broker-over-in-container choice
 > is recorded in CC's `shell_decisions` (the substrate's memory DB). This doc is

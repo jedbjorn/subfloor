@@ -1417,18 +1417,6 @@ case "$cmd" in
           fi ;;
       esac
     fi
-    # Windows-test SSH client seam. A sandbox shell holding `windows_testing`
-    # reaches the fixed Halo controller with `ssh <alias>`, but the sandbox has
-    # no per-user SSH material — and OpenSSH resolves `~` from the container
-    # process's uid (root), not $HOME, so a home-directory mount would not be
-    # read either. Bind ONLY the dedicated controller directory — restricted
-    # key, single alias, pinned host key — read-only at the same path; `sc vm
-    # test` points ssh at it with -F. The operator's general ~/.ssh is never
-    # mounted. Absent directory = no seam and no mount; the host path keeps
-    # using its own per-user config.
-    wintest_mount=""
-    wintest_dir="$HOME/.config/subfloor/windows-test-client"
-    [ -d "$wintest_dir" ] && wintest_mount="-v $wintest_dir:$wintest_dir:ro"
     # Docker's init shim is PID 1 so orphaned harness/worker subprocesses are
     # reaped. Without it the Python API server becomes PID 1, never wait()s on
     # reparented children, and long-running multi-shell work exhausts the
@@ -1454,7 +1442,6 @@ case "$cmd" in
         $state_namespace_mounts \
         $state_mount \
         $py_mount \
-        $wintest_mount \
         -v "$HOME/.claude:$HOME/.claude" \
         -v "$HOME/.claude.json:$HOME/.claude.json" \
         -v "$HOME/.config/opencode:$HOME/.config/opencode" \
@@ -1859,7 +1846,7 @@ Subfloor — forkable shell substrate — full command reference (./sc help for 
                              and never infer a manifest, tool, file set, or fallback
 
   Windows VM broker (run on the HOST — drives the test VM for sandboxed forks;
-  holds the ssh key + virsh so the fork never does. See .super-coder/docs/windows-vm-broker.md).
+  holds the ssh key + virsh so the fork never does).
   `launch` brings it up automatically when a VM is linked; `down` stops it:
   ./sc vm status [--json] read broker, VM, SSH, and MCP-tunnel state without mutation;
                            includes relay, endpoint, and active-adapter state
@@ -1874,12 +1861,6 @@ Subfloor — forkable shell substrate — full command reference (./sc help for 
                            inspect, start+verify, or stop the managed MCP tunnel and relay
   ./sc vm reset --off [--json]
                            restore the testing snapshot and confirm the VM is powered off
-  ./sc vm test init local | ./sc vm test init ssh HOST
-                           select Halo-local or Dev-through-ForceCommand transport
-  ./sc vm test status|acquire|release|start|stop|exec|push|pull|snapshot|reset|baseline
-                           drive the fixed W10C-Testing controller; run --help for exact forms
-  ./sc vm test release --force
-                           clear a lease whose token was lost, so no seat waits out the TTL
   ./sc vm-broker           run the broker in the foreground (unix socket)
   ./sc vm-bake             HOST-side: graceful shutdown + (re)bake the clean snapshot after provisioning
                              (deliberately NOT a broker verb — the sandbox must never redefine 'clean')

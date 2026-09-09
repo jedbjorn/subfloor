@@ -7,8 +7,8 @@ THE HOST, where the key + libvirt live, and exposes the loop verbs over a unix
 socket inside the bind-mounted engine dir (`.super-coder/run/vm-broker.sock`).
 `windows_devkit` curls that socket; the key never enters the fork and `virsh`
 runs where it works. It mirrors dos-arch's credential-broker precedent: one host
-process holds the secret so nothing downstream needs it. Spec:
-.super-coder/docs/windows-vm-broker.md.
+process holds the secret so nothing downstream needs it. The socket path is
+shared with sandboxes through the engine bind mount.
 
 Routes (all JSON `{ok, ...}`):
 
