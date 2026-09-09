@@ -541,7 +541,7 @@ sc_vm_broker_alive() {
 }
 sc_vm_broker_up() {
   if ! "$PY" "$S/vm.py" configured; then
-    echo "→ vm-broker: no VM linked (instance.json has no \`vm\` block) — nothing to serve"; return 0
+    echo "→ vm-broker: no VM or remotes linked — nothing to serve"; return 0
   fi
   if sc_vm_broker_alive; then echo "→ vm-broker already serving $("$PY" "$S/vm.py" sock)"; return 0; fi
   sc_broker_preflight vm-broker "$VM_BROKER_PID" "$ENGINE/run/vm-broker.log" "$("$PY" "$S/vm.py" sock)" || return 1
@@ -568,7 +568,7 @@ sc_vm_broker_install() {
   mkdir -p "$unit_dir"
   cat > "$unit_dir/$VM_BROKER_UNIT" <<UNIT
 [Unit]
-Description=super-coder vm-broker ($(basename "$here")) — host-side Windows VM broker
+Description=super-coder vm-broker ($(basename "$here")) — host-side VM and remote broker
 After=network.target libvirtd.service
 
 [Service]
@@ -1068,7 +1068,7 @@ esac
 # migrate) probes first because it executes host Python. Container entry
 # deliberately remains a Docker handoff rather than a host-runtime gate.
 case "$cmd" in
-  install|ensure-harness|doctor|update|update-harnesses|harness-status|docker-cache-gc|rollback|feature|runtime|artifact-mode|eject|remove|init|rebuild|migrate|migration|snapshot|mem|pr|token|persist|job|visual-qa|sql|sql-rw|map-sql|map-sql-rw|map-schema|map-extractor|context|render|render-check|map|map-setup|analytics|models|seed-skills|skill|search|ports|url|preview|serve|vm|vm-broker|vm-bake|vm-broker-up|vm-broker-down|vm-broker-sock|vm-mcp-relay|vm-broker-install|vm-broker-uninstall|ts-broker|ts-broker-up|ts-broker-down|ts-broker-sock|ts-broker-install|ts-broker-uninstall|pm2-broker|pm2-broker-up|pm2-broker-down|pm2-broker-sock|pm2-broker-install|pm2-broker-uninstall|db-broker|db-broker-up|db-broker-down|db-broker-sock|db-broker-install|db-broker-uninstall|db-init|pg-init|pg-up|pg-down|admin|boot|boot-*|run|deps|test|lint|typecheck|launch|down|restart|build|verify|health|clean-db)
+  install|ensure-harness|doctor|update|update-harnesses|harness-status|docker-cache-gc|rollback|feature|runtime|artifact-mode|eject|remove|init|rebuild|migrate|migration|snapshot|mem|pr|token|persist|job|visual-qa|sql|sql-rw|map-sql|map-sql-rw|map-schema|map-extractor|context|render|render-check|map|map-setup|analytics|models|seed-skills|skill|search|ports|url|preview|serve|vm|remote|vm-broker|vm-bake|vm-broker-up|vm-broker-down|vm-broker-sock|vm-mcp-relay|vm-broker-install|vm-broker-uninstall|ts-broker|ts-broker-up|ts-broker-down|ts-broker-sock|ts-broker-install|ts-broker-uninstall|pm2-broker|pm2-broker-up|pm2-broker-down|pm2-broker-sock|pm2-broker-install|pm2-broker-uninstall|db-broker|db-broker-up|db-broker-down|db-broker-sock|db-broker-install|db-broker-uninstall|db-init|pg-init|pg-up|pg-down|admin|boot|boot-*|run|deps|test|lint|typecheck|launch|down|restart|build|verify|health|clean-db)
     case "$cmd" in
       deps|test|lint|typecheck)
         sc_devkit_help_form "$@" || sc_python_probe ;;
@@ -1234,6 +1234,7 @@ case "$cmd" in
   serve)        exec "$PY" "$ENGINE/api/server.py" "$@" ;;
   # ── Windows VM broker (HOST-side primitive — runs where virsh + the key live) ──
   vm)                exec "$PY" "$S/vm.py" client "$@" ;;
+  remote)            exec "$PY" "$S/remote.py" "$@" ;;
   vm-broker)         exec "$PY" "$ENGINE/api/vm_broker.py" "$@" ;;
   # Bake/re-bake the clean snapshot — HOST-side, deliberately NOT a broker verb:
   # the snapshot is the trust anchor every test reverts to; a sandboxed shell may
@@ -1417,18 +1418,6 @@ case "$cmd" in
           fi ;;
       esac
     fi
-    # Windows-test SSH client seam. A sandbox shell holding `windows_testing`
-    # reaches the fixed Halo controller with `ssh <alias>`, but the sandbox has
-    # no per-user SSH material — and OpenSSH resolves `~` from the container
-    # process's uid (root), not $HOME, so a home-directory mount would not be
-    # read either. Bind ONLY the dedicated controller directory — restricted
-    # key, single alias, pinned host key — read-only at the same path; `sc vm
-    # test` points ssh at it with -F. The operator's general ~/.ssh is never
-    # mounted. Absent directory = no seam and no mount; the host path keeps
-    # using its own per-user config.
-    wintest_mount=""
-    wintest_dir="$HOME/.config/subfloor/windows-test-client"
-    [ -d "$wintest_dir" ] && wintest_mount="-v $wintest_dir:$wintest_dir:ro"
     # Docker's init shim is PID 1 so orphaned harness/worker subprocesses are
     # reaped. Without it the Python API server becomes PID 1, never wait()s on
     # reparented children, and long-running multi-shell work exhausts the
@@ -1454,7 +1443,6 @@ case "$cmd" in
         $state_namespace_mounts \
         $state_mount \
         $py_mount \
-        $wintest_mount \
         -v "$HOME/.claude:$HOME/.claude" \
         -v "$HOME/.claude.json:$HOME/.claude.json" \
         -v "$HOME/.config/opencode:$HOME/.config/opencode" \
@@ -1859,11 +1847,20 @@ Subfloor — forkable shell substrate — full command reference (./sc help for 
                              and never infer a manifest, tool, file set, or fallback
 
   Windows VM broker (run on the HOST — drives the test VM for sandboxed forks;
-  holds the ssh key + virsh so the fork never does. See .super-coder/docs/windows-vm-broker.md).
+  holds the ssh key + virsh so the fork never does).
   `launch` brings it up automatically when a VM is linked; `down` stops it:
+  ./sc vm init --domain DOMAIN --snapshot NAME --transfer-dir PATH
+       --ssh-host HOST --ssh-user USER --ssh-key-path PATH [OPTIONS]
+                           write only the vm block and report broker health
   ./sc vm status [--json] read broker, VM, SSH, and MCP-tunnel state without mutation;
                            includes relay, endpoint, and active-adapter state
   ./sc vm start [--json]  start only when off, then wait within a bounded SSH-readiness budget
+  ./sc vm stop [--force] [--json]
+                           gracefully stop; --force is required to use virsh destroy
+  ./sc vm restart [--json]
+                           gracefully stop, start, and wait for SSH readiness
+  ./sc vm snapshot list|create NAME|delete NAME [--json]
+                           inspect snapshots; create requires off; configured snapshot is protected
   ./sc vm push SRC [DEST] [--json]
                            stage a permitted local artifact through the configured transfer directory
   ./sc vm exec [--command-file FILE] [--json] -- COMMAND...
@@ -1872,14 +1869,8 @@ Subfloor — forkable shell substrate — full command reference (./sc help for 
                            save a validated screenshot artifact and return viewable metadata
   ./sc vm mcp status|up|down [--json]
                            inspect, start+verify, or stop the managed MCP tunnel and relay
-  ./sc vm reset --off [--json]
-                           restore the testing snapshot and confirm the VM is powered off
-  ./sc vm test init local | ./sc vm test init ssh HOST
-                           select Halo-local or Dev-through-ForceCommand transport
-  ./sc vm test status|acquire|release|start|stop|exec|push|pull|snapshot|reset|baseline
-                           drive the fixed W10C-Testing controller; run --help for exact forms
-  ./sc vm test release --force
-                           clear a lease whose token was lost, so no seat waits out the TTL
+  ./sc vm reset [NAME] --off [--json]
+                           restore the named or configured snapshot and confirm the VM is powered off
   ./sc vm-broker           run the broker in the foreground (unix socket)
   ./sc vm-bake             HOST-side: graceful shutdown + (re)bake the clean snapshot after provisioning
                              (deliberately NOT a broker verb — the sandbox must never redefine 'clean')
@@ -1892,6 +1883,12 @@ Subfloor — forkable shell substrate — full command reference (./sc help for 
                              TCP 127.0.0.1:18000 → the broker's vm-mcp.sock tunnel;
                              managed adapter injection supplies the harness definition and
                              `./sc vm mcp up` brings the endpoint online
+
+  Named remotes (SSH and key material stay behind the host vm-broker):
+  ./sc remote add NAME --host HOST --user USER --key-path ABSOLUTE [OPTIONS]
+  ./sc remote remove NAME | ./sc remote list | ./sc remote status NAME
+  ./sc remote exec NAME [--command-file FILE] [--json] -- COMMAND...
+  ./sc remote push NAME SRC DEST | ./sc remote pull NAME SRC DEST
 
   Tailnet broker (run on the HOST — drives the tailnet for sandboxed forks; holds
   the already-`tailscale up` node so the fork never holds a tailnet credential.

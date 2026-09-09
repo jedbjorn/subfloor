@@ -17,6 +17,7 @@ SCRIPTS = ROOT / ".super-coder" / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 
 import ports  # noqa: E402
+import remote  # noqa: E402
 import ts  # noqa: E402
 import vm  # noqa: E402
 
@@ -154,6 +155,29 @@ class GlobalPortNamespaceTest(unittest.TestCase):
                     self.assertNotIn("vm", persisted)
                     self.assertEqual(persisted["ts"], values["ts"])
                     self.assertEqual(persisted["instance_id"], "a" * 32)
+
+    def test_named_remotes_are_a_scoped_managed_block(self) -> None:
+        stored = {
+            "instance_id": "a" * 32,
+            "repo": "ami",
+            "port": 8812,
+            "dev_port": 8844,
+            "future_extension": {"opaque": True},
+        }
+        self.current_config.write_text(json.dumps(stored))
+        remotes = {
+            "devbox": {
+                "host": "remote.example",
+                "user": "tester",
+                "port": 22,
+                "key_path": "/host/key",
+            }
+        }
+        with mock.patch.object(ports, "CONFIG", self.current_config):
+            remote.write_all(remotes)
+        persisted = json.loads(self.current_config.read_text())
+        self.assertEqual(persisted["remotes"], remotes)
+        self.assertEqual(persisted["future_extension"], {"opaque": True})
 
 
 if __name__ == "__main__":

@@ -32,6 +32,7 @@ import fcntl
 import http.client
 import json
 import os
+import re
 import shutil
 import signal
 import socket
@@ -117,7 +118,7 @@ def _process_socket_inodes(pid: int) -> set[str]:
                 continue
             if target.startswith("socket:[") and target.endswith("]"):
                 inodes.add(target[8:-1])
-    except OSError:
+    except (OSError, RuntimeError, ValueError):
         return set()
     return inodes
 
@@ -385,7 +386,10 @@ def _unverified_process_error(
     )
 DOMAIN_STATE_TIMEOUT = 15
 DOMAIN_START_TIMEOUT = 30
+DOMAIN_STOP_TIMEOUT = 60
+DOMAIN_STOP_INTERVAL = 2
 RESET_COMMAND_TIMEOUT = 60
+SNAPSHOT_COMMAND_TIMEOUT = 120
 START_READINESS_TIMEOUT = 90
 START_READINESS_INTERVAL = 2
 MUTATION_LOCK_TIMEOUT = 5
@@ -400,6 +404,8 @@ START_BROKER_BUDGET = (
     + START_READINESS_TIMEOUT
 )
 START_CLIENT_TIMEOUT = START_BROKER_BUDGET + 15
+STOP_CLIENT_TIMEOUT = MUTATION_LOCK_TIMEOUT + DOMAIN_STOP_TIMEOUT + 30
+RESTART_CLIENT_TIMEOUT = STOP_CLIENT_TIMEOUT + START_CLIENT_TIMEOUT
 DEFAULT_CLIENT_TIMEOUT = 30
 EXEC_CLIENT_TIMEOUT = 130
 CAPTURE_CLIENT_TIMEOUT = 45
@@ -425,6 +431,7 @@ DOMAIN_STATES = {
     "running": "running",
     "shut off": "powered_off",
 }
+RESOURCE_NAME = re.compile(r"[a-z0-9][a-z0-9-]{0,31}\Z")
 
 
 # -- config (instance.json `vm` block) ---------------------------------------
@@ -746,7 +753,185 @@ def do_start(wait: int = START_READINESS_TIMEOUT) -> dict:
     }
 
 
-def do_reset(running: bool = True) -> dict:
+def do_stop(force: bool = False, wait: int = DOMAIN_STOP_TIMEOUT) -> dict:
+    """Stop the configured domain and confirm that it is powered off."""
+    cfg = read() or {}
+    if m := _missing(cfg, "domain"):
+        return {"ok": False, "output": m, "domain_state": "unknown"}
+    state_ok, state = _domain_state(cfg)
+    if not state_ok:
+        return {"ok": False, "output": state, "domain_state": "unknown"}
+    domain = str(cfg["domain"])
+    if state == "powered_off":
+        return {
+            "ok": True,
+            "output": f"domain '{domain}' is already powered off",
+            "domain": domain,
+            "domain_state": state,
+            "stopped": False,
+            "forced": False,
+        }
+    verb = "destroy" if force else "shutdown"
+    ok, output = _run(_virsh(cfg, verb, domain), timeout=DOMAIN_STATE_TIMEOUT)
+    if not ok:
+        return {
+            "ok": False,
+            "output": output or f"failed to {verb} the VM",
+            "domain": domain,
+            "domain_state": state,
+            "forced": force,
+        }
+    deadline = time.monotonic() + max(1, wait)
+    last_state = state
+    while time.monotonic() < deadline:
+        state_ok, last_state = _domain_state(cfg)
+        if state_ok and last_state == "powered_off":
+            return {
+                "ok": True,
+                "output": output or f"domain '{domain}' powered off",
+                "domain": domain,
+                "domain_state": last_state,
+                "stopped": True,
+                "forced": force,
+            }
+        time.sleep(min(DOMAIN_STOP_INTERVAL, max(0, deadline - time.monotonic())))
+    return {
+        "ok": False,
+        "error": "stop_timeout",
+        "output": f"domain did not power off within {wait}s",
+        "domain": domain,
+        "domain_state": last_state if state_ok else "unknown",
+        "forced": force,
+    }
+
+
+def do_restart() -> dict:
+    """Gracefully stop the configured domain, then reuse start readiness."""
+    stopped = do_stop()
+    if not stopped.get("ok"):
+        return stopped
+    started = do_start()
+    if not started.get("ok"):
+        return started
+    return {**started, "restarted": True}
+
+
+def _valid_resource_name(name: object) -> bool:
+    return isinstance(name, str) and bool(RESOURCE_NAME.fullmatch(name))
+
+
+def _snapshot_name_error(name: object) -> dict:
+    return {
+        "ok": False,
+        "error": "snapshot_name_invalid",
+        "output": (
+            "snapshot name must match [a-z0-9][a-z0-9-]{0,31}: "
+            f"{name!r}"
+        ),
+    }
+
+
+def _snapshot_creation_time(output: str) -> str | None:
+    for line in output.splitlines():
+        label, separator, value = line.partition(":")
+        if separator and label.strip().lower() == "creation time":
+            return value.strip() or None
+    return None
+
+
+def do_snapshot_list() -> dict:
+    cfg = read() or {}
+    if m := _missing(cfg, "domain"):
+        return {"ok": False, "output": m}
+    domain = str(cfg["domain"])
+    ok, output = _run(
+        _virsh(cfg, "snapshot-list", domain, "--name"),
+        timeout=DOMAIN_STATE_TIMEOUT,
+    )
+    if not ok:
+        return {"ok": False, "output": output or "snapshot list failed"}
+    names = [line.strip() for line in output.splitlines() if line.strip()]
+    current_ok, current_output = _run(
+        _virsh(cfg, "snapshot-current", domain, "--name"),
+        timeout=DOMAIN_STATE_TIMEOUT,
+    )
+    current = current_output.strip() if current_ok else None
+    snapshots = []
+    for name in names:
+        info_ok, info = _run(
+            _virsh(cfg, "snapshot-info", domain, "--snapshotname", name),
+            timeout=DOMAIN_STATE_TIMEOUT,
+        )
+        if not info_ok:
+            return {
+                "ok": False,
+                "output": info or f"could not inspect snapshot '{name}'",
+            }
+        snapshots.append({
+            "name": name,
+            "creation_time": _snapshot_creation_time(info),
+            "current": name == current,
+        })
+    return {"ok": True, "domain": domain, "snapshots": snapshots}
+
+
+def do_snapshot_create(name: str) -> dict:
+    if not _valid_resource_name(name):
+        return _snapshot_name_error(name)
+    cfg = read() or {}
+    if m := _missing(cfg, "domain"):
+        return {"ok": False, "output": m}
+    state_ok, state = _domain_state(cfg)
+    if not state_ok:
+        return {"ok": False, "output": state, "domain_state": "unknown"}
+    if state != "powered_off":
+        return {
+            "ok": False,
+            "error": "snapshot_requires_off",
+            "output": "snapshot create requires the domain to be powered off",
+            "domain_state": state,
+        }
+    domain = str(cfg["domain"])
+    ok, output = _run(
+        _virsh(cfg, "snapshot-create-as", domain, name),
+        timeout=SNAPSHOT_COMMAND_TIMEOUT,
+    )
+    return {
+        "ok": ok,
+        "output": output or (f"created snapshot '{name}'" if ok else "snapshot create failed"),
+        "domain": domain,
+        "domain_state": state,
+        "snapshot": name,
+    }
+
+
+def do_snapshot_delete(name: str) -> dict:
+    if not _valid_resource_name(name):
+        return _snapshot_name_error(name)
+    cfg = read() or {}
+    if m := _missing(cfg, "domain", "snapshot"):
+        return {"ok": False, "output": m}
+    if name == str(cfg["snapshot"]):
+        return {
+            "ok": False,
+            "error": "snapshot_protected",
+            "output": f"refusing to delete configured snapshot '{name}'",
+            "snapshot": name,
+        }
+    domain = str(cfg["domain"])
+    ok, output = _run(
+        _virsh(cfg, "snapshot-delete", domain, "--snapshotname", name),
+        timeout=SNAPSHOT_COMMAND_TIMEOUT,
+    )
+    return {
+        "ok": ok,
+        "output": output or (f"deleted snapshot '{name}'" if ok else "snapshot delete failed"),
+        "domain": domain,
+        "snapshot": name,
+    }
+
+
+def do_reset(running: bool = True, snapshot: str | None = None) -> dict:
     """Revert to the clean snapshot. The clean snapshot is OFFLINE (this CPU's
     non-migratable invtsc flag refuses a live snapshot), so a bare revert lands
     powered-off. `running=True` adds `--running` to boot it — START a run from a
@@ -755,8 +940,11 @@ def do_reset(running: bool = True) -> dict:
     cfg = read() or {}
     if m := _missing(cfg, "domain", "snapshot"):
         return {"ok": False, "output": m}
+    selected = snapshot or str(cfg["snapshot"])
+    if not _valid_resource_name(selected):
+        return _snapshot_name_error(selected)
     argv = _virsh(cfg, "snapshot-revert", str(cfg["domain"]),
-                  "--snapshotname", str(cfg["snapshot"]))
+                  "--snapshotname", selected)
     if running:
         argv.append("--running")
     ok, out = _run(argv, timeout=RESET_COMMAND_TIMEOUT)
@@ -774,7 +962,7 @@ def do_reset(running: bool = True) -> dict:
                 if timed_out else out or "the snapshot revert was rejected"
             ),
             "domain": str(cfg["domain"]),
-            "snapshot": str(cfg["snapshot"]),
+            "snapshot": selected,
             "domain_state": domain_state,
             "reset_outcome": "unknown" if timed_out else "rejected",
         }
@@ -786,7 +974,7 @@ def do_reset(running: bool = True) -> dict:
                 "the final domain state could not be observed"
             ),
             "domain": str(cfg["domain"]),
-            "snapshot": str(cfg["snapshot"]),
+            "snapshot": selected,
             "domain_state": "unknown",
             "reset_outcome": "unknown",
         }
@@ -798,16 +986,16 @@ def do_reset(running: bool = True) -> dict:
                 f"observed {observed}, expected {expected}"
             ),
             "domain": str(cfg["domain"]),
-            "snapshot": str(cfg["snapshot"]),
+            "snapshot": selected,
             "domain_state": observed,
             "reset_outcome": "state_mismatch",
         }
     state = "running" if running else "powered off"
     return {
         "ok": True,
-        "output": out or f"reverted '{cfg['domain']}' to '{cfg['snapshot']}' ({state})",
+        "output": out or f"reverted '{cfg['domain']}' to '{selected}' ({state})",
         "domain": str(cfg["domain"]),
-        "snapshot": str(cfg["snapshot"]),
+        "snapshot": selected,
         "domain_state": observed,
         "reset_outcome": "confirmed",
     }
@@ -1918,7 +2106,11 @@ def _broker_failure(operation: str, response: dict) -> dict:
             details[key] = response[key]
     return operation_error(
         operation,
-        f"{operation}_failed",
+        (
+            str(response["error"])
+            if isinstance(response.get("error"), str)
+            else f"{operation}_failed"
+        ),
         str(
             response.get("output")
             or response.get("screenshot_error")
@@ -1931,7 +2123,8 @@ def _broker_failure(operation: str, response: dict) -> dict:
 
 def run_operation(operation: str, *, command: str | None = None,
                   src: str | None = None, dest: str | None = None,
-                  output: str | None = None) -> dict:
+                  output: str | None = None, force: bool = False,
+                  snapshot: str | None = None) -> dict:
     """Call one core broker operation once and normalize its public result."""
     validated_target: Path | None = None
     if operation == "exec" and (not isinstance(command, str) or not command.strip()):
@@ -1950,7 +2143,24 @@ def run_operation(operation: str, *, command: str | None = None,
     calls = {
         "status": ("GET", "/status", None, DEFAULT_CLIENT_TIMEOUT),
         "start": ("POST", "/start", None, START_CLIENT_TIMEOUT),
-        "reset": ("POST", "/reset", {"running": False}, RESET_CLIENT_TIMEOUT),
+        "stop": ("POST", "/stop", {"force": force}, STOP_CLIENT_TIMEOUT),
+        "restart": ("POST", "/restart", None, RESTART_CLIENT_TIMEOUT),
+        "snapshot_list": (
+            "GET", "/snapshot/list", None, DEFAULT_CLIENT_TIMEOUT
+        ),
+        "snapshot_create": (
+            "POST", "/snapshot/create", {"name": snapshot},
+            SNAPSHOT_COMMAND_TIMEOUT + MUTATION_LOCK_TIMEOUT + 15,
+        ),
+        "snapshot_delete": (
+            "POST", "/snapshot/delete", {"name": snapshot},
+            SNAPSHOT_COMMAND_TIMEOUT + MUTATION_LOCK_TIMEOUT + 15,
+        ),
+        "reset": (
+            "POST", "/reset",
+            {"running": False, **({"snapshot": snapshot} if snapshot else {})},
+            RESET_CLIENT_TIMEOUT,
+        ),
         "exec": ("POST", "/exec", {"command": command}, EXEC_CLIENT_TIMEOUT),
         "push": (
             "POST", "/push", {"src": src, "dest": dest}, DEFAULT_CLIENT_TIMEOUT
@@ -2078,6 +2288,41 @@ def run_operation(operation: str, *, command: str | None = None,
                     "last_error": None,
                 },
             })
+        if operation == "stop":
+            return operation_success(operation, {
+                "domain": {
+                    "name": response["domain"],
+                    "state": response["domain_state"],
+                },
+                "stopped": bool(response["stopped"]),
+                "forced": bool(response["forced"]),
+            })
+        if operation == "restart":
+            return operation_success(operation, {
+                "domain": {
+                    "name": response["domain"],
+                    "state": response["domain_state"],
+                },
+                "restarted": bool(response["restarted"]),
+                "ssh": {
+                    "ready": True,
+                    "attempts": int(response["attempts"]),
+                    "last_error": None,
+                },
+            })
+        if operation == "snapshot_list":
+            snapshots = response["snapshots"]
+            if not isinstance(snapshots, list):
+                raise TypeError
+            return operation_success(operation, {
+                "domain": response["domain"],
+                "snapshots": snapshots,
+            })
+        if operation in {"snapshot_create", "snapshot_delete"}:
+            return operation_success(operation, {
+                "domain": response["domain"],
+                "snapshot": response["snapshot"],
+            })
         if operation == "push":
             source = response["source"]
             destination = response["destination"]
@@ -2110,6 +2355,29 @@ def run_operation(operation: str, *, command: str | None = None,
             "the VM broker did not return the required result fields",
             {},
         )
+
+
+def run_init(config: dict) -> dict:
+    """Persist only the vm block, then report broker health without requiring it."""
+    try:
+        write(config)
+    except OSError:
+        return operation_error(
+            "init", "init_write_failed", "the VM configuration could not be saved"
+        )
+    broker_ready = False
+    try:
+        health = broker_call("GET", "/health", None, timeout=5)
+        broker_ready = health.get("ok") is True
+    except (BrokerConnectionError, BrokerTimeoutError, BrokerResponseError):
+        pass
+    return operation_success("init", {
+        "vm": config,
+        "broker": {
+            "ready": broker_ready,
+            "start_command": "./sc vm-broker-up",
+        },
+    })
 
 
 def _human_result(value: dict) -> str:
@@ -2166,6 +2434,29 @@ def _human_result(value: dict) -> str:
     if operation == "start":
         action = "started" if result["started"] else "already running"
         return f"VM {action} · SSH ready after {result['ssh']['attempts']} attempt(s)"
+    if operation == "init":
+        if result["broker"]["ready"]:
+            return "VM configuration saved · broker ready"
+        return "VM configuration saved · broker not running; start: ./sc vm-broker-up"
+    if operation == "stop":
+        action = "force-stopped" if result["forced"] else (
+            "stopped" if result["stopped"] else "already powered off"
+        )
+        return f"VM {action}"
+    if operation == "restart":
+        return f"VM restarted · SSH ready after {result['ssh']['attempts']} attempt(s)"
+    if operation == "snapshot_list":
+        if not result["snapshots"]:
+            return "No VM snapshots"
+        return "\n".join(
+            f"{'*' if item['current'] else ' '} {item['name']}"
+            f" · {item.get('creation_time') or 'creation time unavailable'}"
+            for item in result["snapshots"]
+        )
+    if operation == "snapshot_create":
+        return f"Created VM snapshot '{result['snapshot']}'"
+    if operation == "snapshot_delete":
+        return f"Deleted VM snapshot '{result['snapshot']}'"
     if operation == "exec":
         lines = [f"Guest command exited {result['exit_code']}"]
         if result["stdout"]:
@@ -2184,19 +2475,24 @@ def _human_result(value: dict) -> str:
 
 
 def client_main(argv: list[str]) -> int:
-    if argv[:1] == ["test"]:
-        import windows_test_controller
-
-        return windows_test_controller.main(argv[1:])
     parser = argparse.ArgumentParser(
         prog="./sc vm",
         description="Observe and control the configured Windows test VM.",
     )
     commands = parser.add_subparsers(dest="operation", required=True)
-    commands.add_parser(
-        "test",
-        help="control the fixed W10C-Testing guest locally or through constrained SSH",
+    init = commands.add_parser(
+        "init", help="write the vm block from explicit flags and report broker health"
     )
+    init.add_argument("--domain")
+    init.add_argument("--snapshot")
+    init.add_argument("--transfer-dir")
+    init.add_argument("--ssh-host")
+    init.add_argument("--ssh-user")
+    init.add_argument("--ssh-key-path")
+    init.add_argument("--libvirt-uri")
+    init.add_argument("--ssh-port", type=int)
+    init.add_argument("--mcp-port", type=int)
+    init.add_argument("--json", action="store_true", help="print one JSON result object")
     status = commands.add_parser(
         "status",
         help="observe VM readiness without mutation",
@@ -2222,6 +2518,31 @@ def client_main(argv: list[str]) -> int:
     start.add_argument(
         "--json", action="store_true", help="print one JSON result object"
     )
+    stop = commands.add_parser(
+        "stop", help="power off the VM; --force permits virsh destroy"
+    )
+    stop.add_argument("--force", action="store_true")
+    stop.add_argument("--json", action="store_true", help="print one JSON result object")
+    restart = commands.add_parser(
+        "restart", help="gracefully stop, start, and wait for SSH"
+    )
+    restart.add_argument(
+        "--json", action="store_true", help="print one JSON result object"
+    )
+    snapshot = commands.add_parser("snapshot", help="list, create, or delete snapshots")
+    snapshot_commands = snapshot.add_subparsers(dest="snapshot_action", required=True)
+    snapshot_list = snapshot_commands.add_parser("list", help="list snapshots")
+    snapshot_list.add_argument(
+        "--json", action="store_true", help="print one JSON result object"
+    )
+    for action in ("create", "delete"):
+        command_parser = snapshot_commands.add_parser(
+            action, help=f"{action} a snapshot"
+        )
+        command_parser.add_argument("name")
+        command_parser.add_argument(
+            "--json", action="store_true", help="print one JSON result object"
+        )
     reset = commands.add_parser(
         "reset",
         help="restore the testing snapshot and leave the VM off",
@@ -2236,6 +2557,7 @@ def client_main(argv: list[str]) -> int:
         required=True,
         help="required: leave the restored VM powered off",
     )
+    reset.add_argument("snapshot", nargs="?", help="snapshot name; defaults to configured")
     reset.add_argument(
         "--json", action="store_true", help="print one JSON result object"
     )
@@ -2343,17 +2665,71 @@ def client_main(argv: list[str]) -> int:
             "endpoint.ready, endpoint.http_status, endpoint.error.",
         ),
     ):
-        command = mcp_commands.add_parser(
+        command_parser = mcp_commands.add_parser(
             action,
             help=help_text,
             description=description,
         )
-        command.add_argument(
+        command_parser.add_argument(
             "--json", action="store_true", help="print one JSON result object"
         )
     args = parser.parse_args(argv)
-    if args.operation == "mcp":
+    if args.operation == "init":
+        config = dict(read() or {})
+        for key, candidate in (
+            ("domain", args.domain),
+            ("snapshot", args.snapshot),
+            ("transfer_dir", args.transfer_dir),
+            ("ssh_host", args.ssh_host),
+            ("ssh_user", args.ssh_user),
+            ("ssh_key_path", args.ssh_key_path),
+            ("libvirt_uri", args.libvirt_uri),
+            ("ssh_port", args.ssh_port),
+            ("mcp_port", args.mcp_port),
+        ):
+            if candidate is not None:
+                config[key] = candidate
+        config.setdefault("ssh_port", 22)
+        config.setdefault("mcp_port", 8000)
+        missing = _missing(
+            config,
+            "domain",
+            "snapshot",
+            "transfer_dir",
+            "ssh_host",
+            "ssh_user",
+            "ssh_key_path",
+        )
+        if missing:
+            value = operation_error("init", "init_config_invalid", missing)
+        elif not _valid_resource_name(config["snapshot"]):
+            value = operation_error(
+                "init",
+                "init_config_invalid",
+                "snapshot name must match [a-z0-9][a-z0-9-]{0,31}",
+            )
+        elif any(
+            isinstance(config[field], bool)
+            or not isinstance(config[field], int)
+            or not 1 <= config[field] <= 65535
+            for field in ("ssh_port", "mcp_port")
+        ):
+            value = operation_error(
+                "init", "init_config_invalid", "ssh_port and mcp_port must be 1..65535"
+            )
+        else:
+            value = run_init(config)
+    elif args.operation == "mcp":
         value = run_mcp_operation(args.mcp_action)
+    elif args.operation == "stop":
+        value = run_operation("stop", force=args.force)
+    elif args.operation == "snapshot":
+        value = run_operation(
+            f"snapshot_{args.snapshot_action}",
+            snapshot=getattr(args, "name", None),
+        )
+    elif args.operation == "reset":
+        value = run_operation("reset", snapshot=args.snapshot)
     elif args.operation == "exec":
         command_parts = args.command
         if command_parts[:1] == ["--"]:
@@ -2366,7 +2742,7 @@ def client_main(argv: list[str]) -> int:
             )
         elif args.command_file:
             try:
-                command = Path(args.command_file).read_text(encoding="utf-8")
+                command_text = Path(args.command_file).read_text(encoding="utf-8")
             except (OSError, UnicodeError):
                 value = operation_error(
                     "exec",
@@ -2374,7 +2750,7 @@ def client_main(argv: list[str]) -> int:
                     "the command file could not be read as UTF-8",
                 )
             else:
-                value = run_operation("exec", command=command)
+                value = run_operation("exec", command=command_text)
         else:
             value = run_operation("exec", command=" ".join(command_parts))
     elif args.operation == "push":
@@ -2399,8 +2775,8 @@ def main(argv: list[str]) -> int:
     if mode == "sock":
         print(SOCKET)
     elif mode == "configured":
-        # exit 0 if this fork has linked a VM (so the launch hook can self-skip)
-        return 0 if read() else 1
+        # One broker serves both the configured VM and named remotes.
+        return 0 if read() or ports.resolve(persist=False).get("remotes") else 1
     elif mode == "exec":
         print(json.dumps(do_exec(" ".join(argv[1:]))))
     elif mode == "reset":
