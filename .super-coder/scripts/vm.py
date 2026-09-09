@@ -118,7 +118,7 @@ def _process_socket_inodes(pid: int) -> set[str]:
                 continue
             if target.startswith("socket:[") and target.endswith("]"):
                 inodes.add(target[8:-1])
-    except OSError:
+    except (OSError, RuntimeError, ValueError):
         return set()
     return inodes
 
@@ -2375,7 +2375,7 @@ def run_init(config: dict) -> dict:
         "vm": config,
         "broker": {
             "ready": broker_ready,
-            "start_command": None if broker_ready else "./sc vm-broker-up",
+            "start_command": "./sc vm-broker-up",
         },
     })
 
@@ -2483,15 +2483,15 @@ def client_main(argv: list[str]) -> int:
     init = commands.add_parser(
         "init", help="write the vm block from explicit flags and report broker health"
     )
-    init.add_argument("--domain", required=True)
-    init.add_argument("--snapshot", required=True)
-    init.add_argument("--transfer-dir", required=True)
-    init.add_argument("--ssh-host", required=True)
-    init.add_argument("--ssh-user", required=True)
-    init.add_argument("--ssh-key-path", required=True)
+    init.add_argument("--domain")
+    init.add_argument("--snapshot")
+    init.add_argument("--transfer-dir")
+    init.add_argument("--ssh-host")
+    init.add_argument("--ssh-user")
+    init.add_argument("--ssh-key-path")
     init.add_argument("--libvirt-uri")
-    init.add_argument("--ssh-port", type=int, default=22)
-    init.add_argument("--mcp-port", type=int, default=8000)
+    init.add_argument("--ssh-port", type=int)
+    init.add_argument("--mcp-port", type=int)
     init.add_argument("--json", action="store_true", help="print one JSON result object")
     status = commands.add_parser(
         "status",
@@ -2536,9 +2536,11 @@ def client_main(argv: list[str]) -> int:
         "--json", action="store_true", help="print one JSON result object"
     )
     for action in ("create", "delete"):
-        command = snapshot_commands.add_parser(action, help=f"{action} a snapshot")
-        command.add_argument("name")
-        command.add_argument(
+        command_parser = snapshot_commands.add_parser(
+            action, help=f"{action} a snapshot"
+        )
+        command_parser.add_argument("name")
+        command_parser.add_argument(
             "--json", action="store_true", help="print one JSON result object"
         )
     reset = commands.add_parser(
@@ -2663,29 +2665,60 @@ def client_main(argv: list[str]) -> int:
             "endpoint.ready, endpoint.http_status, endpoint.error.",
         ),
     ):
-        command = mcp_commands.add_parser(
+        command_parser = mcp_commands.add_parser(
             action,
             help=help_text,
             description=description,
         )
-        command.add_argument(
+        command_parser.add_argument(
             "--json", action="store_true", help="print one JSON result object"
         )
     args = parser.parse_args(argv)
     if args.operation == "init":
-        config = {
-            "domain": args.domain,
-            "snapshot": args.snapshot,
-            "transfer_dir": args.transfer_dir,
-            "ssh_host": args.ssh_host,
-            "ssh_user": args.ssh_user,
-            "ssh_key_path": args.ssh_key_path,
-            "ssh_port": args.ssh_port,
-            "mcp_port": args.mcp_port,
-        }
-        if args.libvirt_uri:
-            config["libvirt_uri"] = args.libvirt_uri
-        value = run_init(config)
+        config = dict(read() or {})
+        for key, candidate in (
+            ("domain", args.domain),
+            ("snapshot", args.snapshot),
+            ("transfer_dir", args.transfer_dir),
+            ("ssh_host", args.ssh_host),
+            ("ssh_user", args.ssh_user),
+            ("ssh_key_path", args.ssh_key_path),
+            ("libvirt_uri", args.libvirt_uri),
+            ("ssh_port", args.ssh_port),
+            ("mcp_port", args.mcp_port),
+        ):
+            if candidate is not None:
+                config[key] = candidate
+        config.setdefault("ssh_port", 22)
+        config.setdefault("mcp_port", 8000)
+        missing = _missing(
+            config,
+            "domain",
+            "snapshot",
+            "transfer_dir",
+            "ssh_host",
+            "ssh_user",
+            "ssh_key_path",
+        )
+        if missing:
+            value = operation_error("init", "init_config_invalid", missing)
+        elif not _valid_resource_name(config["snapshot"]):
+            value = operation_error(
+                "init",
+                "init_config_invalid",
+                "snapshot name must match [a-z0-9][a-z0-9-]{0,31}",
+            )
+        elif any(
+            isinstance(config[field], bool)
+            or not isinstance(config[field], int)
+            or not 1 <= config[field] <= 65535
+            for field in ("ssh_port", "mcp_port")
+        ):
+            value = operation_error(
+                "init", "init_config_invalid", "ssh_port and mcp_port must be 1..65535"
+            )
+        else:
+            value = run_init(config)
     elif args.operation == "mcp":
         value = run_mcp_operation(args.mcp_action)
     elif args.operation == "stop":
@@ -2709,7 +2742,7 @@ def client_main(argv: list[str]) -> int:
             )
         elif args.command_file:
             try:
-                command = Path(args.command_file).read_text(encoding="utf-8")
+                command_text = Path(args.command_file).read_text(encoding="utf-8")
             except (OSError, UnicodeError):
                 value = operation_error(
                     "exec",
@@ -2717,7 +2750,7 @@ def client_main(argv: list[str]) -> int:
                     "the command file could not be read as UTF-8",
                 )
             else:
-                value = run_operation("exec", command=command)
+                value = run_operation("exec", command=command_text)
         else:
             value = run_operation("exec", command=" ".join(command_parts))
     elif args.operation == "push":
@@ -2742,8 +2775,8 @@ def main(argv: list[str]) -> int:
     if mode == "sock":
         print(SOCKET)
     elif mode == "configured":
-        # exit 0 if this fork has linked a VM (so the launch hook can self-skip)
-        return 0 if read() else 1
+        # One broker serves both the configured VM and named remotes.
+        return 0 if read() or ports.resolve(persist=False).get("remotes") else 1
     elif mode == "exec":
         print(json.dumps(do_exec(" ".join(argv[1:]))))
     elif mode == "reset":

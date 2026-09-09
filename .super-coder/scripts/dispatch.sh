@@ -541,7 +541,7 @@ sc_vm_broker_alive() {
 }
 sc_vm_broker_up() {
   if ! "$PY" "$S/vm.py" configured; then
-    echo "→ vm-broker: no VM linked (instance.json has no \`vm\` block) — nothing to serve"; return 0
+    echo "→ vm-broker: no VM or remotes linked — nothing to serve"; return 0
   fi
   if sc_vm_broker_alive; then echo "→ vm-broker already serving $("$PY" "$S/vm.py" sock)"; return 0; fi
   sc_broker_preflight vm-broker "$VM_BROKER_PID" "$ENGINE/run/vm-broker.log" "$("$PY" "$S/vm.py" sock)" || return 1
@@ -568,7 +568,7 @@ sc_vm_broker_install() {
   mkdir -p "$unit_dir"
   cat > "$unit_dir/$VM_BROKER_UNIT" <<UNIT
 [Unit]
-Description=super-coder vm-broker ($(basename "$here")) — host-side Windows VM broker
+Description=super-coder vm-broker ($(basename "$here")) — host-side VM and remote broker
 After=network.target libvirtd.service
 
 [Service]
@@ -1068,7 +1068,7 @@ esac
 # migrate) probes first because it executes host Python. Container entry
 # deliberately remains a Docker handoff rather than a host-runtime gate.
 case "$cmd" in
-  install|ensure-harness|doctor|update|update-harnesses|harness-status|docker-cache-gc|rollback|feature|runtime|artifact-mode|eject|remove|init|rebuild|migrate|migration|snapshot|mem|pr|token|persist|job|visual-qa|sql|sql-rw|map-sql|map-sql-rw|map-schema|map-extractor|context|render|render-check|map|map-setup|analytics|models|seed-skills|skill|search|ports|url|preview|serve|vm|vm-broker|vm-bake|vm-broker-up|vm-broker-down|vm-broker-sock|vm-mcp-relay|vm-broker-install|vm-broker-uninstall|ts-broker|ts-broker-up|ts-broker-down|ts-broker-sock|ts-broker-install|ts-broker-uninstall|pm2-broker|pm2-broker-up|pm2-broker-down|pm2-broker-sock|pm2-broker-install|pm2-broker-uninstall|db-broker|db-broker-up|db-broker-down|db-broker-sock|db-broker-install|db-broker-uninstall|db-init|pg-init|pg-up|pg-down|admin|boot|boot-*|run|deps|test|lint|typecheck|launch|down|restart|build|verify|health|clean-db)
+  install|ensure-harness|doctor|update|update-harnesses|harness-status|docker-cache-gc|rollback|feature|runtime|artifact-mode|eject|remove|init|rebuild|migrate|migration|snapshot|mem|pr|token|persist|job|visual-qa|sql|sql-rw|map-sql|map-sql-rw|map-schema|map-extractor|context|render|render-check|map|map-setup|analytics|models|seed-skills|skill|search|ports|url|preview|serve|vm|remote|vm-broker|vm-bake|vm-broker-up|vm-broker-down|vm-broker-sock|vm-mcp-relay|vm-broker-install|vm-broker-uninstall|ts-broker|ts-broker-up|ts-broker-down|ts-broker-sock|ts-broker-install|ts-broker-uninstall|pm2-broker|pm2-broker-up|pm2-broker-down|pm2-broker-sock|pm2-broker-install|pm2-broker-uninstall|db-broker|db-broker-up|db-broker-down|db-broker-sock|db-broker-install|db-broker-uninstall|db-init|pg-init|pg-up|pg-down|admin|boot|boot-*|run|deps|test|lint|typecheck|launch|down|restart|build|verify|health|clean-db)
     case "$cmd" in
       deps|test|lint|typecheck)
         sc_devkit_help_form "$@" || sc_python_probe ;;
@@ -1234,6 +1234,7 @@ case "$cmd" in
   serve)        exec "$PY" "$ENGINE/api/server.py" "$@" ;;
   # ── Windows VM broker (HOST-side primitive — runs where virsh + the key live) ──
   vm)                exec "$PY" "$S/vm.py" client "$@" ;;
+  remote)            exec "$PY" "$S/remote.py" "$@" ;;
   vm-broker)         exec "$PY" "$ENGINE/api/vm_broker.py" "$@" ;;
   # Bake/re-bake the clean snapshot — HOST-side, deliberately NOT a broker verb:
   # the snapshot is the trust anchor every test reverts to; a sandboxed shell may
@@ -1882,6 +1883,12 @@ Subfloor — forkable shell substrate — full command reference (./sc help for 
                              TCP 127.0.0.1:18000 → the broker's vm-mcp.sock tunnel;
                              managed adapter injection supplies the harness definition and
                              `./sc vm mcp up` brings the endpoint online
+
+  Named remotes (SSH and key material stay behind the host vm-broker):
+  ./sc remote add NAME --host HOST --user USER --key-path ABSOLUTE [OPTIONS]
+  ./sc remote remove NAME | ./sc remote list | ./sc remote status NAME
+  ./sc remote exec NAME [--command-file FILE] [--json] -- COMMAND...
+  ./sc remote push NAME SRC DEST | ./sc remote pull NAME SRC DEST
 
   Tailnet broker (run on the HOST — drives the tailnet for sandboxed forks; holds
   the already-`tailscale up` node so the fork never holds a tailnet credential.

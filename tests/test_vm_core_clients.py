@@ -1056,6 +1056,9 @@ class LifecycleClientTests(unittest.TestCase):
             result = vm.run_init(config)
         self.assertTrue(result["ok"])
         self.assertTrue(result["result"]["broker"]["ready"])
+        self.assertEqual(
+            result["result"]["broker"]["start_command"], "./sc vm-broker-up"
+        )
         write.assert_called_once_with(config)
         health.assert_called_once_with("GET", "/health", None, timeout=5)
 
@@ -1065,10 +1068,18 @@ class LifecycleClientTests(unittest.TestCase):
         def fake_init(config):
             captured.update(config)
             return vm.operation_success(
-                "init", {"vm": config, "broker": {"ready": True, "start_command": None}}
+                "init",
+                {
+                    "vm": config,
+                    "broker": {
+                        "ready": True,
+                        "start_command": "./sc vm-broker-up",
+                    },
+                },
             )
 
-        with mock.patch.object(vm, "run_init", side_effect=fake_init), \
+        with mock.patch.object(vm, "read", return_value=None), \
+             mock.patch.object(vm, "run_init", side_effect=fake_init), \
              mock.patch.object(sys, "stdout", new_callable=io.StringIO):
             code = vm.client_main([
                 "init",
@@ -1094,6 +1105,30 @@ class LifecycleClientTests(unittest.TestCase):
             "ssh_port": 2222,
             "mcp_port": 8001,
         })
+
+    def test_init_preserves_existing_values_when_flags_are_omitted(self):
+        captured = {}
+        existing = dict(SAVED, mcp_port=9000)
+
+        def fake_init(config):
+            captured.update(config)
+            return vm.operation_success(
+                "init",
+                {
+                    "vm": config,
+                    "broker": {
+                        "ready": False,
+                        "start_command": "./sc vm-broker-up",
+                    },
+                },
+            )
+
+        with mock.patch.object(vm, "read", return_value=existing), \
+             mock.patch.object(vm, "run_init", side_effect=fake_init), \
+             mock.patch.object(sys, "stdout", new_callable=io.StringIO):
+            code = vm.client_main(["init", "--domain", "replacement"])
+        self.assertEqual(code, 0)
+        self.assertEqual(captured, {**existing, "domain": "replacement"})
 
     def test_reset_still_requires_off_with_optional_snapshot(self):
         with mock.patch.object(vm, "run_operation") as run, \

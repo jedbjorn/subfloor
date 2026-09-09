@@ -1,14 +1,13 @@
 #!/usr/bin/env python3
-"""Windows VM Broker — the host-side authority that drives the test VM.
+"""VM and remote broker — host-side authority for libvirt and named SSH targets.
 
 A fork's shells run in a sandbox container that cannot reach the VM (no route
 across libvirt NAT), holds no ssh key, and has no `virsh`. This broker runs ON
 THE HOST, where the key + libvirt live, and exposes the loop verbs over a unix
 socket inside the bind-mounted engine dir (`.super-coder/run/vm-broker.sock`).
-`windows_devkit` curls that socket; the key never enters the fork and `virsh`
-runs where it works. It mirrors dos-arch's credential-broker precedent: one host
-process holds the secret so nothing downstream needs it. The socket path is
-shared with sandboxes through the engine bind mount.
+Shell clients call that socket; keys never enter the sandbox and `virsh` runs
+where it works. One host process holds the secret so nothing downstream needs
+it. The socket path is shared with sandboxes through the engine bind mount.
 
 Routes (all JSON `{ok, ...}`):
 
@@ -31,6 +30,10 @@ Routes (all JSON `{ok, ...}`):
                                 to the guest's Windows-MCP port (idempotent)
     POST /mcp/down              close it (idempotent)
     GET  /mcp/status            {ok, running, pid, socket}
+    GET  /remote/<name>/status  broker-held-key SSH readiness
+    POST /remote/<name>/exec    execute one remote command
+    POST /remote/<name>/push    copy one repo-contained file to the remote
+    POST /remote/<name>/pull    copy into the repo or .sc-state/local
 
 Verbs act on the SAVED `vm` block; `/validate` tests the CANDIDATE block in the
 body (the wizard, before save). The socket is fs-perm gated (0600) — reachable
@@ -53,6 +56,7 @@ from http.server import BaseHTTPRequestHandler
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
+import remote  # noqa: E402  (named remote host verbs share this broker)
 import vm  # noqa: E402  (config + checks + loop verbs + socket path)
 
 
@@ -134,6 +138,12 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         self._guard(self._do_get)
 
+    def _remote_route(self) -> tuple[str, str] | None:
+        parts = self.path.split("/")
+        if len(parts) == 4 and parts[1] == "remote" and parts[2] and parts[3]:
+            return parts[2], parts[3]
+        return None
+
     def _do_get(self) -> None:
         if self.path == "/health":
             return self._send(200, {"ok": True, "service": "vm-broker"})
@@ -145,6 +155,9 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, {"vm": vm.read()})
         if self.path == "/mcp/status":
             return self._send(200, vm.mcp_status())
+        remote_route = self._remote_route()
+        if remote_route and remote_route[1] == "status":
+            return self._send(200, remote.do_status(remote_route[0]))
         return self._send(404, {"ok": False, "error": "no such route"})
 
     def do_PUT(self) -> None:
@@ -162,6 +175,21 @@ class Handler(BaseHTTPRequestHandler):
         self._guard(self._do_post)
 
     def _do_post(self) -> None:
+        remote_route = self._remote_route()
+        if remote_route and remote_route[1] in {"exec", "push", "pull"}:
+            name, operation = remote_route
+            body = self._body()
+            if operation == "exec":
+                return self._mutate(
+                    lambda: remote.do_exec(name, body.get("command", ""))
+                )
+            if operation == "push":
+                return self._mutate(
+                    lambda: remote.do_push(name, body.get("src"), body.get("dest"))
+                )
+            return self._mutate(
+                lambda: remote.do_pull(name, body.get("src"), body.get("dest"))
+            )
         if self.path == "/exec":
             b = self._body()
             return self._mutate(
@@ -169,21 +197,6 @@ class Handler(BaseHTTPRequestHandler):
             )
         if self.path == "/start":
             return self._mutate(vm.do_start)
-        if self.path == "/stop":
-            force = self._body().get("force", False)
-            if not isinstance(force, bool):
-                return self._send(400, {"ok": False, "error": "force must be boolean"})
-            return self._mutate(lambda: vm.do_stop(force=force))
-        if self.path == "/restart":
-            return self._mutate(vm.do_restart)
-        if self.path == "/snapshot/create":
-            return self._mutate(
-                lambda: vm.do_snapshot_create(self._body().get("name", ""))
-            )
-        if self.path == "/snapshot/delete":
-            return self._mutate(
-                lambda: vm.do_snapshot_delete(self._body().get("name", ""))
-            )
         if self.path == "/stop":
             force = self._body().get("force", False)
             if not isinstance(force, bool):
