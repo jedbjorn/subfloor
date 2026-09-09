@@ -1690,8 +1690,15 @@ def shell_git_identity(full: sqlite3.Row | dict) -> tuple[str, str]:
     already renders. Both parts are required; a shell without them cannot be
     attributed, so the boot refuses rather than commit as a stranger.
     """
-    name = (full["display_name"] or "").strip()
-    shortname = (full["shortname"] or "").strip()
+    def field(row: sqlite3.Row | dict, key: str) -> str:
+        try:
+            value = row[key]
+        except (KeyError, IndexError):
+            return ""
+        return str(value or "").strip()
+
+    name = field(full, "display_name")
+    shortname = field(full, "shortname")
     if not name or not shortname:
         raise LaunchError(
             "shell has no git identity (display_name and shortname are both "

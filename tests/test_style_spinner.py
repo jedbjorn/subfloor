@@ -224,7 +224,10 @@ class BootPhaseLabelTest(unittest.TestCase):
     ) -> tuple[list[str], int, int, str]:
         flavor = "admin" if admin else "dev"
         chosen = {"shell_id": 1, "shortname": "DEV1", "flavor": flavor}
-        full = {"shell_id": 1, "display_name": "Dev One", "api_key": None}
+        # display_name + shortname are both required: the launcher pins the
+        # git ident vars to this pair at the exec seam (issue #1494).
+        full = {"shell_id": 1, "display_name": "Dev One", "shortname": "DEV1",
+                "api_key": None}
         con = mock.Mock()
         con.execute.return_value.fetchone.return_value = full
         con.execute.return_value.fetchall.return_value = []
