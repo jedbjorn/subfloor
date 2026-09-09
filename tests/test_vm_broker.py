@@ -112,6 +112,15 @@ class VerbDispatchTests(unittest.TestCase):
         with mock.patch.object(vm, "read", return_value=None):
             self.assertEqual(vm.main(["configured"]), 1)
 
+    def test_configured_cli_also_reflects_remote_only_broker_use(self):
+        with mock.patch.object(vm, "read", return_value=None), \
+             mock.patch.object(
+                 vm.ports,
+                 "resolve",
+                 return_value={"remotes": {"devbox": {"host": "example"}}},
+             ):
+            self.assertEqual(vm.main(["configured"]), 0)
+
     def test_virsh_calls_honor_libvirt_uri(self):
         cfg = dict(SAVED, libvirt_uri="qemu:///system")
         with mock.patch.object(vm, "read", return_value=cfg), \
@@ -1053,6 +1062,17 @@ class SocketTransportTests(unittest.TestCase):
     def test_unknown_route_is_404_shaped(self):
         r = vm.broker_call("GET", "/nope")
         self.assertFalse(r["ok"])
+
+    def test_snapshot_list_round_trips_over_the_socket(self):
+        expected = {
+            "ok": True,
+            "domain": "win-test",
+            "snapshots": [
+                {"name": "clean", "creation_time": "today", "current": True}
+            ],
+        }
+        with mock.patch.object(vm, "do_snapshot_list", return_value=expected):
+            self.assertEqual(vm.broker_call("GET", "/snapshot/list"), expected)
 
     def test_status_fault_returns_sanitized_json_instead_of_dropping_response(self):
         with mock.patch.object(vm, "do_status", side_effect=ValueError("SECRET")), \

@@ -882,7 +882,7 @@ details; Planner supplies the fork's actual scope through `fork_skill_design`.
 
 | Capability | Applicability and reference |
 |---|---|
-| Windows VM | Operator supplies the VM and clean snapshot; [architecture](../.super-coder/docs/windows-test-vm.md) and [broker runbook](../.super-coder/docs/windows-vm-broker.md) |
+| Windows VM | Operator supplies the VM and clean snapshot; shells use the typed `./sc vm` broker client |
 | Tailnet | Host identity and configured routes remain broker-owned; [tailnet runbook](../.super-coder/docs/tailscale-broker.md) |
 | PM2 | Operate only configured host application processes; [PM2 runbook](../.super-coder/docs/pm2-broker.md) |
 | App database | Read-only diagnostics through a host broker, not access to engine memory; [DB broker runbook](../.super-coder/docs/db-broker.md) |

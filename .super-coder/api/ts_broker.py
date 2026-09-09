@@ -17,6 +17,8 @@ Routes (all JSON `{ok, ...}`):
     PUT  /ts        {ts}        write the ts block
     GET  /status               `tailscale status --json` -> self + peers summary
     POST /exec      {host,command,timeout?}  tailscale ssh -> {ok, exit, stdout, stderr}
+                    readonly_hosts are limited to ts.READONLY_COMMANDS and
+                    refuse unsafe input as {error: readonly_refused, token}
     POST /validate/{check}     one live setup check against the body's candidate cfg
 
 Verbs act on the SAVED `ts` block + a caller-named host; `/validate` tests the

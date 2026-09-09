@@ -54,6 +54,7 @@ MANAGED_KEYS = frozenset({
     "work_repo",
     "pg",
     "vm",
+    "remotes",
     "ts",
     "pm2",
     "db",
