@@ -54,11 +54,17 @@ FEATURES: dict[str, dict] = {
         "block_auto": False,
         "link": [
             (
-                "link your VM: GUI → Scripts → 'Windows Test VM' wizard "
-                "(live-checks each field), or hand-fill the `vm` block in "
-                ".super-coder/instance.json — see README → 'Windows Test VM'"
+                "./sc vm init --domain D --snapshot S --transfer-dir P "
+                "--ssh-host H --ssh-user U --ssh-key-path /abs/key   "
+                "# writes only the `vm` block and reports broker health "
+                "(or GUI → Scripts → 'Windows Test VM' wizard) — see "
+                ".super-coder/docs/remote-seats.md"
             ),
-            "./sc launch   # brings the vm-broker up once a VM is linked",
+            (
+                "./sc remote add NAME --host H --user U --key-path /abs/key   "
+                "# optional named remotes served by the same broker"
+            ),
+            "./sc launch   # brings the vm-broker up once a VM or remote is linked",
         ],
     },
     "tailnet": {
@@ -67,9 +73,11 @@ FEATURES: dict[str, dict] = {
         "block_auto": False,
         "link": [
             (
-                "hand-fill the `ts` block in .super-coder/instance.json "
-                "(allowed_hosts is the fail-closed scope) — see README → "
-                "'Tailnet broker'"
+                "./sc ts init --ssh-user U --allowed-host H [--readonly-host H]   "
+                "# writes only the `ts` block and reports broker health "
+                "(allowed_hosts is unrestricted, readonly_hosts is the "
+                "diagnostic verb table) — see "
+                ".super-coder/docs/tailscale-broker.md"
             ),
             "./sc launch   # brings the ts-broker up once a tailnet is linked",
         ],

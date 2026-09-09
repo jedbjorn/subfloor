@@ -857,8 +857,8 @@ DB-canonical local skill.
 | Feature | Config block | What it gives the fork |
 |---|---|---|
 | **`pg`** | `pg` (auto-created) | A `postgres:17` sidecar on `sc-net`, with `DATABASE_URL` forwarded for the fork's **app**; the engine memory DB remains SQLite. |
-| **`windows`** | `vm` (operator-linked) | The supplied Windows VM broker and its link boundary. |
-| **`tailnet`** | `ts` (operator-linked) | The tailnet broker for declared build/deploy hosts without sharing its credential with the sandbox. |
+| **`windows`** | `vm` (operator-linked) | The VM broker: host-owned lifecycle for one linked VM, plus broker-served SSH to named `remotes`. |
+| **`tailnet`** | `ts` (operator-linked) | The tailnet broker for declared build/deploy hosts, with a read-only diagnostics tier, without sharing its credential with the sandbox. |
 | **`pm2`** | `pm2` (operator-linked) | The PM2 broker for a fail-closed set of host application processes. |
 
 `enable pg` is complete in one step — the sidecar needs no host input, so the
@@ -875,15 +875,19 @@ feature` makes the supported block boundary visible and repeatable.
 
 ### Focused infrastructure runbooks
 
-For a configured Windows guest, use the typed `./sc vm` client. Supported
+For a linked VM, use the typed `./sc vm` client; for a named remote,
+`./sc remote`. Keys stay behind the host broker in both postures. Supported
 adapters receive a managed `windows-mcp` definition; `./sc vm mcp up` starts
-and verifies that GUI connection. The VM runbook below owns setup and lifecycle
-details; Planner supplies the fork's actual scope through `fork_skill_design`.
+and verifies that GUI connection. Three commands link a fork — `./sc vm init`,
+`./sc remote add`, `./sc ts init` — and the opt-in skills `remote_seats`,
+`windows_testing`, and `tailscale_diagnostics` carry the shell-side procedure.
+The runbooks below own setup and lifecycle details; Planner supplies the
+fork's actual scope through `fork_skill_design`.
 
 | Capability | Applicability and reference |
 |---|---|
-| Windows VM | Operator supplies the VM and clean snapshot; shells use the typed `./sc vm` broker client |
-| Tailnet | Host identity and configured routes remain broker-owned; [tailnet runbook](../.super-coder/docs/tailscale-broker.md) |
+| VM and named remotes | Operator supplies the VM, its baseline snapshot, and the remotes' keys; [remote seats runbook](../.super-coder/docs/remote-seats.md) |
+| Tailnet | Host identity and configured routes remain broker-owned; read-only hosts get the diagnostic verb table; [tailnet runbook](../.super-coder/docs/tailscale-broker.md) |
 | PM2 | Operate only configured host application processes; [PM2 runbook](../.super-coder/docs/pm2-broker.md) |
 | App database | Read-only diagnostics through a host broker, not access to engine memory; [DB broker runbook](../.super-coder/docs/db-broker.md) |
 
