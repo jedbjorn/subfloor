@@ -1676,6 +1676,48 @@ def _probe_worktree_venv(work_dir: Path) -> VenvEligibility:
     return VenvEligibility(project_bin, None)
 
 
+SHELL_GIT_EMAIL_DOMAIN = "subfloor.local"
+
+
+def shell_git_identity(full: sqlite3.Row | dict) -> tuple[str, str]:
+    """This shell's own git identity: display_name <shortname@subfloor.local>.
+
+    The launcher used to export one repo-wide identity (whatever the shared
+    .git/config last carried) into every shell, so commits were attributed to
+    whichever shell booted most recently — or failed outright when that value
+    was empty. The booted shell's DB row is the authority instead: the same
+    display_name/shortname pair `sc mem which` returns and the trailer hook
+    already renders. Both parts are required; a shell without them cannot be
+    attributed, so the boot refuses rather than commit as a stranger.
+    """
+    name = (full["display_name"] or "").strip()
+    shortname = (full["shortname"] or "").strip()
+    if not name or not shortname:
+        raise LaunchError(
+            "shell has no git identity (display_name and shortname are both "
+            "required); set them before this launch can commit"
+        )
+    return name, f"{shortname}@{SHELL_GIT_EMAIL_DOMAIN}"
+
+
+def shell_git_ident_env(full: sqlite3.Row | dict) -> dict[str, str]:
+    """Env mapping that pins every git ident variable to one shell.
+
+    Overrides inherited GIT_AUTHOR_*/GIT_COMMITTER_* unconditionally: the
+    sandbox launcher used to forward a shared repo-wide identity, and env
+    beats git config, so an uncorrected inherited value would keep
+    impersonating the wrong shell. Admin boots carry no shortname; git then
+    falls through to the operator's configured identity, as before.
+    """
+    name, email = shell_git_identity(full)
+    return {
+        "GIT_AUTHOR_NAME": name,
+        "GIT_AUTHOR_EMAIL": email,
+        "GIT_COMMITTER_NAME": name,
+        "GIT_COMMITTER_EMAIL": email,
+    }
+
+
 def _shell_path(work_dir: Path, inherited: str) -> str:
     """Put a proven project environment ahead of baseline tools."""
     entries = [str(REPO_ROOT)]
@@ -2008,6 +2050,11 @@ def prepare_launch(*, shell_id: int, harness: "str | None" = None,
     env["SC_SHELL_SHORTNAME"] = chosen["shortname"]
     # hooks/prepare-commit-msg reads both to append the shell's commit trailer.
     env["SC_SHELL_NAME"] = full["display_name"] or ""
+    # Commits attribute to THIS shell (issue #1494): pin the git ident vars to
+    # the booted shell's own identity so an inherited or repo-wide value can
+    # never speak for another shell. LaunchError when the row lacks a usable
+    # name + shortname — a refusal beats a misattributed or failed commit.
+    env.update(shell_git_ident_env(full))
     env["SC_HARNESS"] = harness
     env["SC_SHELL_WORKTREE"] = str(work_dir)
     if not shell_view.restricted:
@@ -2611,6 +2658,11 @@ def main() -> None:
     env["SC_SHELL_SHORTNAME"] = chosen["shortname"]
     # hooks/prepare-commit-msg reads both to append the shell's commit trailer.
     env["SC_SHELL_NAME"] = full["display_name"] or ""
+    # Commits attribute to THIS shell (issue #1494): pin the git ident vars to
+    # the booted shell's own identity so an inherited or repo-wide value can
+    # never speak for another shell. LaunchError when the row lacks a usable
+    # name + shortname — a refusal beats a misattributed or failed commit.
+    env.update(shell_git_ident_env(full))
     env["SC_API_TOKEN"] = full["api_key"] or ""
     env["SC_API_BASE"] = f"http://127.0.0.1:{api_port}" if api_port else ""
     # Admin keeps the engine-path fast path for maintenance hooks. Restricted

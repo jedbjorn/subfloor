@@ -2,7 +2,9 @@
 # Subfloor prepare-commit-msg — attribute the commit to the launched shell.
 #
 # Fires for every harness via core.hooksPath. The launcher exports the booted
-# shell's identity (SC_SHELL_NAME + SC_SHELL_SHORTNAME); when both are present
+# shell's identity (SC_SHELL_NAME + SC_SHELL_SHORTNAME, plus the matching
+# GIT_AUTHOR_*/GIT_COMMITTER_* ident so the commit itself attributes to the
+# shell — issue #1494); when both are present
 # the hook appends exactly one
 #   Co-Authored-By: <display_name> <shortname@subfloor.local>
 # trailer to the message being prepared. Absent variables (a bare operator, a
