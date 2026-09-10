@@ -1357,8 +1357,13 @@ case "$cmd" in
     # doesn't matter.
     pg_env=""
     sc_pg_configured && pg_env="-e DATABASE_URL=${SC_DATABASE_URL:-postgresql://sc:sc@$PGNAME:5432/sc}"
-    git_name="$(git -C "$here" config user.name 2>/dev/null || true)"
-    git_email="$(git -C "$here" config user.email 2>/dev/null || true)"
+    # No repo-wide git identity here (issue #1494). All worktrees share one
+    # .git, so exporting its [user] as GIT_*_NAME/EMAIL into the container let
+    # the most recent launch speak for EVERY shell — or, empty, kill commits
+    # with "empty ident name". The launcher (run.py) now exports each booted
+    # shell's own identity at the exec seam, so nothing inherited wins and a
+    # bare operator identity in the fork simply falls through to git's own
+    # resolution inside the container.
     # A private-state install keeps its engine DB outside the checkout.  The
     # repo bind below therefore cannot make that state visible to the sandbox,
     # and mounting the whole owner-local state collection would expose sibling
@@ -1437,8 +1442,6 @@ case "$cmd" in
         -e HOME="$HOME" -e SC_BIND=0.0.0.0 -e SC_PYTHON=python3 -e PYTHONUNBUFFERED=1 \
         -e SC_SANDBOX=1 -e SC_DEV_PORT="$dp" \
         $mistral_env $disabled_harnesses_env $pg_env \
-        -e GIT_AUTHOR_NAME="$git_name" -e GIT_AUTHOR_EMAIL="$git_email" \
-        -e GIT_COMMITTER_NAME="$git_name" -e GIT_COMMITTER_EMAIL="$git_email" \
         -w "$here" \
         -v "$here:$here" \
         $state_namespace_mounts \

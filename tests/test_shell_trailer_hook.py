@@ -88,7 +88,19 @@ class ShellTrailerHookTest(unittest.TestCase):
     def test_launcher_exports_the_identity_the_hook_reads(self):
         run_py = (ENGINE / "scripts" / "run.py").read_text()
         self.assertEqual(run_py.count('env["SC_SHELL_NAME"] = full["display_name"] or ""'), 2)
+        # Issue #1494: both exec seams pin the git ident vars to the booted
+        # shell's identity, overriding whatever the environment inherited.
+        self.assertEqual(run_py.count("env.update(shell_git_ident_env(full))"), 2)
         self.assertTrue(os.access(HOOK, os.X_OK))
+
+    def test_sandbox_launcher_exports_no_repo_wide_git_identity(self):
+        # Issue #1494: dispatch.sh must not forward a shared .git/config [user]
+        # block as GIT_*_NAME/EMAIL — that export let the most recent launch
+        # speak for every shell, or killed commits with an empty ident.
+        dispatch = (ENGINE / "scripts" / "dispatch.sh").read_text()
+        self.assertNotIn("GIT_AUTHOR_NAME", dispatch)
+        self.assertNotIn("GIT_COMMITTER_NAME", dispatch)
+        self.assertNotIn("git config user.name", dispatch)
 
 
 if __name__ == "__main__":
