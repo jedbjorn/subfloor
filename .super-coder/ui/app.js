@@ -3483,6 +3483,73 @@ function chatCollapseOtherReasoning(disclosure) {
   }
 }
 
+function chatLocalFileTarget(anchor) {
+  const href = anchor.getAttribute("href") || "";
+  if (!href.startsWith("/") || href.startsWith("//") || /[?#]/.test(href))
+    return null;
+  let decoded;
+  try { decoded = decodeURIComponent(href); } catch { return null; }
+  const cited = decoded.match(/^(.*?):([1-9]\d*)(?::([1-9]\d*))?$/);
+  const path = cited ? cited[1] : decoded;
+  return {
+    path,
+    line: cited ? Number(cited[2]) : null,
+    column: cited?.[3] ? Number(cited[3]) : null,
+  };
+}
+
+async function openChatSourceModal(conversation, target) {
+  try {
+    const source = await chatApi(
+      `/conversations/${conversation.conversation_id}/source?path=${encodeURIComponent(target.path)}`,
+    );
+    const viewer = el("div", { className: "chat-source-viewer" });
+    let selected = null;
+    source.content.split("\n").forEach((text, index) => {
+      const number = index + 1;
+      const row = el("div", {
+        className: "chat-source-line" + (number === target.line ? " selected" : ""),
+      },
+      el("span", { className: "chat-source-number" }, String(number)),
+      el("code", { className: "chat-source-code" }, text));
+      if (number === target.line) selected = row;
+      viewer.append(row);
+    });
+    const closeButton = el("button", {
+      className: "act", type: "button", textContent: "Close",
+    });
+    const location = target.line
+      ? `line ${target.line}${target.column ? `:${target.column}` : ""}`
+      : `${fmt(source.bytes)} bytes`;
+    const close = openModal({
+      title: source.relative_path,
+      headExtra: el("div", { className: "modal-count" }, location),
+      bodyNode: viewer,
+      footerEnd: closeButton,
+      width: 1000,
+      height: 750,
+    });
+    closeButton.onclick = close;
+    if (selected) requestAnimationFrame(() => selected.scrollIntoView({ block: "center" }));
+  } catch (error) {
+    toast(`${error.code}: ${error.message}`);
+  }
+}
+
+function chatWireLocalFileLinks(content, conversation) {
+  if (typeof content.querySelectorAll !== "function") return;
+  for (const anchor of content.querySelectorAll("a[href]")) {
+    const target = chatLocalFileTarget(anchor);
+    if (!target) continue;
+    anchor.classList.add("chat-local-file-link");
+    anchor.title = "Open local file";
+    anchor.onclick = (event) => {
+      event.preventDefault();
+      openChatSourceModal(conversation, target);
+    };
+  }
+}
+
 function chatBubble(
   kind, body, meta = "", conversation = null, createdAt = "", contextTokens = null,
   segment = "answer",
@@ -3503,6 +3570,7 @@ function chatBubble(
   const content = kind === "activity"
     ? el("div", { className: "chat-activity-text" }, body)
     : mdBlock(body);
+  if (kind !== "activity") chatWireLocalFileLinks(content, conversation);
   if (kind === "assistant") content.classList.add("chat-assistant-body");
   if (isReasoning) {
     const disclosure = el("details", { className: "chat-reasoning-disclosure" });
@@ -4687,11 +4755,12 @@ function chatTranscriptItemNode(item, conversation, retry) {
   return node;
 }
 
-function chatUpdateTranscriptNode(node, item, retry) {
+function chatUpdateTranscriptNode(node, item, retry, conversation) {
   if (item.kind === "assistant") {
     const body = node.querySelector(".chat-assistant-body");
     const rendered = mdBlock(item.text || "");
     body.replaceChildren(...rendered.childNodes);
+    chatWireLocalFileLinks(body, conversation);
     chatUpdateContextTokens(node, item.context_tokens);
     return;
   }
@@ -4852,7 +4921,7 @@ function chatFlushTranscript(
         const working = transcript.querySelector(".chat-working-indicator");
         transcript.insertBefore(node, next || working || null);
       } else {
-        chatUpdateTranscriptNode(node, item, retry);
+        chatUpdateTranscriptNode(node, item, retry, conversation);
       }
     }
     state.dirty.clear();

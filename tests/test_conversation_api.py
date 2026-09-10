@@ -14,6 +14,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
+from urllib.parse import quote
 
 ROOT = Path(__file__).resolve().parents[1]
 ENGINE = ROOT / ".super-coder"
@@ -1429,6 +1430,75 @@ class ConversationResourceTest(ConversationApiCase):
         con.close()
         self.assertEqual(count, 1)
         self.assertEqual(tuple(event), (1, "conversation.created"))
+
+    def test_source_reads_only_regular_utf8_files_inside_conversation_worktree(
+        self,
+    ) -> None:
+        conversation_id = self.create(key="source-reader")["conversation_id"]
+        worktree = self.root / ".sc-worktrees" / "dev"
+        source = worktree / "src" / "example.py"
+        source.parent.mkdir()
+        source.write_text("first\nsecond\n")
+
+        status, _, payload = self.request(
+            "GET",
+            f"/api/conversations/{conversation_id}/source?path="
+            f"{quote(str(source), safe='')}",
+        )
+        self.assertEqual(status, 200, payload)
+        self.assertEqual(payload["relative_path"], "src/example.py")
+        self.assertEqual(payload["content"], "first\nsecond\n")
+        self.assertEqual(payload["bytes"], len(b"first\nsecond\n"))
+
+        outside = self.root / "outside.txt"
+        outside.write_text("secret")
+        status, _, error = self.request(
+            "GET",
+            f"/api/conversations/{conversation_id}/source?path="
+            f"{quote(str(outside), safe='')}",
+        )
+        self.assertEqual(status, 403, error)
+        self.assertEqual(error["error"]["code"], "SOURCE_OUTSIDE_WORKTREE")
+
+        link = worktree / "outside-link"
+        link.symlink_to(outside)
+        status, _, error = self.request(
+            "GET",
+            f"/api/conversations/{conversation_id}/source?path="
+            f"{quote(str(link), safe='')}",
+        )
+        self.assertEqual(status, 403, error)
+        self.assertEqual(error["error"]["code"], "SOURCE_OUTSIDE_WORKTREE")
+
+    def test_source_rejects_invalid_binary_and_oversized_inputs(self) -> None:
+        conversation_id = self.create(key="source-validation")["conversation_id"]
+        worktree = self.root / ".sc-worktrees" / "dev"
+
+        status, _, error = self.request(
+            "GET", f"/api/conversations/{conversation_id}/source?path=relative.py"
+        )
+        self.assertEqual(status, 422, error)
+        self.assertEqual(error["error"]["code"], "SOURCE_PATH_INVALID")
+
+        binary = worktree / "binary.dat"
+        binary.write_bytes(b"text\0data")
+        status, _, error = self.request(
+            "GET",
+            f"/api/conversations/{conversation_id}/source?path="
+            f"{quote(str(binary), safe='')}",
+        )
+        self.assertEqual(status, 415, error)
+        self.assertEqual(error["error"]["code"], "SOURCE_NOT_TEXT")
+
+        large = worktree / "large.txt"
+        large.write_bytes(b"x" * (conversation_routes.SOURCE_MAX_BYTES + 1))
+        status, _, error = self.request(
+            "GET",
+            f"/api/conversations/{conversation_id}/source?path="
+            f"{quote(str(large), safe='')}",
+        )
+        self.assertEqual(status, 413, error)
+        self.assertEqual(error["error"]["code"], "SOURCE_TOO_LARGE")
 
     def test_controlled_replay_uses_stored_binding_after_catalogue_drift(self) -> None:
         first = self.create(key="controlled-replay")
