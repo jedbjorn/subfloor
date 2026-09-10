@@ -512,6 +512,20 @@ body.interface-view main {
 .chat-message-time { font-variant-numeric: tabular-nums; white-space: nowrap; }
 .chat-bubble .md > :first-child { margin-top: 0; }
 .chat-bubble .md > :last-child { margin-bottom: 0; }
+.chat-local-file-link::before { content: "↗ "; font-size: .82em; }
+.chat-source-viewer {
+  flex: 1; min-width: 0; min-height: 0; overflow: auto; padding: .35rem 0;
+  background: var(--panel2); border: 1px solid var(--line); border-radius: 6px;
+  font: 12px/1.55 ui-monospace, monospace;
+}
+.chat-source-line { display: flex; min-width: max-content; }
+.chat-source-line.selected { background: rgba(110,168,254,.18); }
+.chat-source-number {
+  position: sticky; left: 0; flex: none; width: 4.5rem; padding-right: .8rem;
+  color: var(--dim); background: var(--panel2); text-align: right; user-select: none;
+}
+.chat-source-line.selected .chat-source-number { background: #263246; color: var(--accent); }
+.chat-source-code { padding: 0 1rem; white-space: pre; color: rgba(255,255,255,.82); }
 .chat-meta { color: var(--dim); font-size: .64rem; margin-top: .35rem; }
 .chat-context-tokens {
   color: var(--dim); font-size: .64rem; margin-top: .35rem; text-align: right;

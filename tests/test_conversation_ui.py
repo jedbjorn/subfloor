@@ -50,6 +50,35 @@ def test_interface_is_a_first_class_reload_safe_view():
     assert "chatRouteConversation = decodeURIComponent(conversation)" in APP
 
 
+def test_chat_local_file_links_open_the_scoped_source_viewer():
+    parser = APP[
+        APP.index("function chatLocalFileTarget"):
+        APP.index("async function openChatSourceModal")
+    ]
+    script = parser + r"""
+const anchor = (href) => ({ getAttribute: () => href });
+console.log(JSON.stringify({
+  line: chatLocalFileTarget(anchor("/tmp/work/app.py:42")),
+  column: chatLocalFileTarget(anchor("/tmp/work/app.py:42:7")),
+  encoded: chatLocalFileTarget(anchor("/tmp/my%20work/app.py:9")),
+  external: chatLocalFileTarget(anchor("https://example.com/file.py:2")),
+  network: chatLocalFileTarget(anchor("//example.com/file.py:2")),
+}));
+"""
+    result = run_js(script)
+    assert result == {
+        "line": {"path": "/tmp/work/app.py", "line": 42, "column": None},
+        "column": {"path": "/tmp/work/app.py", "line": 42, "column": 7},
+        "encoded": {"path": "/tmp/my work/app.py", "line": 9, "column": None},
+        "external": None,
+        "network": None,
+    }
+    assert "/source?path=${encodeURIComponent(target.path)}" in APP
+    assert "event.preventDefault()" in APP
+    assert "chatWireLocalFileLinks(body, conversation)" in APP
+    assert ".chat-source-line.selected" in STYLE
+
+
 def test_admin_shells_stay_on_the_rail_but_chat_is_cli_only():
     interface = APP[APP.index("async function renderInterface"):
                     APP.index("// ── Tabs + boot")]
@@ -655,7 +684,7 @@ def test_transcript_installs_snapshot_then_coalesces_keyed_live_updates():
     assert "nodes: new Map()" in keyed
     assert "dirty: new Set(items.keys())" in keyed
     assert "transcript.replaceChildren(...nodes)" in keyed
-    assert "chatUpdateTranscriptNode(node, item, retry)" in keyed
+    assert "chatUpdateTranscriptNode(node, item, retry, conversation)" in keyed
     assert 'node.querySelector(".chat-assistant-body")' in keyed
     assert "body.replaceChildren(...rendered.childNodes)" in keyed
     assert "if (transcriptState.frame !== null) return" in keyed

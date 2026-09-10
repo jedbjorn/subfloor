@@ -18,6 +18,7 @@ import math
 import os
 import re
 import signal
+import stat
 import sys
 import time
 import uuid
@@ -60,6 +61,7 @@ _MESSAGES_PATH = re.compile(r"^/api/conversations/(cv_[0-9a-f]{32})/messages$")
 _TRANSCRIPT_PATH = re.compile(
     r"^/api/conversations/(cv_[0-9a-f]{32})/transcript$"
 )
+_SOURCE_PATH = re.compile(r"^/api/conversations/(cv_[0-9a-f]{32})/source$")
 _EVENTS_PATH = re.compile(r"^/api/conversations/(cv_[0-9a-f]{32})/events$")
 _INTERRUPTIONS_PATH = re.compile(
     r"^/api/conversations/(cv_[0-9a-f]{32})/interruptions$"
@@ -96,6 +98,7 @@ TRANSCRIPT_MAX_RESPONSE_BYTES = 4 * 1024 * 1024
 TRANSCRIPT_PROJECTION_VERSION = 3
 TRANSCRIPT_MAX_WARNINGS = 20
 TRANSCRIPT_MAX_ACTIVITY_LABEL_BYTES = 1024
+SOURCE_MAX_BYTES = 512 * 1024
 
 
 @dataclass(frozen=True)
@@ -431,7 +434,7 @@ def _conversation_row(con, conversation_id: str, owner_user_id: int):
     return con.execute(
         "SELECT c.conversation_id,c.shell_id,c.owner_user_id,c.harness,"
         "c.provider,c.model,c.effort,c.route_contract_version,c.route_binding,"
-        "c.state,c.title,c.starred,"
+        "c.worktree,c.state,c.title,c.starred,"
         "c.conversation_scope,c.created_at,"
         "c.last_activity_at,c.closed_at,c.version,c.harness_session_ref,"
         "s.display_name,s.shortname,"
@@ -575,6 +578,81 @@ def _require_conversation(con, conversation_id: str, owner_user_id: int):
     if row is None:
         raise ApiError(404, "CONVERSATION_NOT_FOUND", "conversation does not exist")
     return row
+
+
+def _source_projection(con, conversation_id: str, owner_user_id: int, query) -> dict:
+    conversation = _require_conversation(con, conversation_id, owner_user_id)
+    values = query.get("path")
+    if values is None or len(values) != 1 or not values[0]:
+        raise ApiError(422, "SOURCE_PATH_INVALID", "path must be provided once")
+
+    requested = Path(values[0])
+    if not requested.is_absolute():
+        raise ApiError(422, "SOURCE_PATH_INVALID", "path must be absolute")
+    worktree = Path(conversation["worktree"]).resolve(strict=False)
+    try:
+        requested.resolve(strict=False).relative_to(worktree)
+    except ValueError as exc:
+        raise ApiError(
+            403,
+            "SOURCE_OUTSIDE_WORKTREE",
+            "source path is outside this conversation's worktree",
+        ) from exc
+
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(requested, flags)
+    except OSError as exc:
+        raise ApiError(404, "SOURCE_UNAVAILABLE", "source file is unavailable") from exc
+    try:
+        info = os.fstat(descriptor)
+        if not stat.S_ISREG(info.st_mode):
+            raise ApiError(404, "SOURCE_UNAVAILABLE", "source file is unavailable")
+        try:
+            opened = Path(os.readlink(f"/proc/self/fd/{descriptor}")).resolve(strict=True)
+            relative = opened.relative_to(worktree)
+        except (OSError, RuntimeError, ValueError) as exc:
+            raise ApiError(
+                403,
+                "SOURCE_OUTSIDE_WORKTREE",
+                "source path is outside this conversation's worktree",
+            ) from exc
+        if info.st_size > SOURCE_MAX_BYTES:
+            raise ApiError(
+                413,
+                "SOURCE_TOO_LARGE",
+                f"source file exceeds {SOURCE_MAX_BYTES} bytes",
+                {"bytes": info.st_size, "maximum_bytes": SOURCE_MAX_BYTES},
+            )
+        chunks: list[bytes] = []
+        remaining = SOURCE_MAX_BYTES + 1
+        while remaining > 0:
+            chunk = os.read(descriptor, min(64 * 1024, remaining))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        raw = b"".join(chunks)
+    finally:
+        os.close(descriptor)
+    if len(raw) > SOURCE_MAX_BYTES:
+        raise ApiError(
+            413,
+            "SOURCE_TOO_LARGE",
+            f"source file exceeds {SOURCE_MAX_BYTES} bytes",
+            {"bytes": len(raw), "maximum_bytes": SOURCE_MAX_BYTES},
+        )
+    try:
+        content = raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ApiError(415, "SOURCE_NOT_TEXT", "source file is not UTF-8 text") from exc
+    if "\0" in content:
+        raise ApiError(415, "SOURCE_NOT_TEXT", "source file is not text")
+    return {
+        "relative_path": relative.as_posix(),
+        "bytes": len(raw),
+        "content": content,
+    }
 
 
 def _close_requested(con, conversation_id: str) -> bool:
@@ -2598,6 +2676,17 @@ def handle(method: str, path: str, headers_raw: str, raw_body: bytes) -> tuple:
                         transcript.group(1),
                         owner_user_id=operator["user_id"],
                         cursor=_single_cursor(query, "transcript"),
+                    ),
+                )
+            source = _SOURCE_PATH.fullmatch(parsed.path)
+            if source and method == "GET":
+                return _json(
+                    200,
+                    _source_projection(
+                        con,
+                        source.group(1),
+                        owner_user_id=operator["user_id"],
+                        query=query,
                     ),
                 )
             interruptions = _INTERRUPTIONS_PATH.fullmatch(parsed.path)
