@@ -161,6 +161,7 @@ class GitHubReaderTest(unittest.TestCase):
                 stderr=b'Unknown JSON field: "baseRefOid"\n',
             ),
             SimpleNamespace(returncode=0, stdout=payload, stderr=b""),
+            SimpleNamespace(returncode=0, stdout=b"[]", stderr=b""),
             SimpleNamespace(returncode=0, stdout=base_sha, stderr=b""),
         ]
         calls = []
@@ -187,7 +188,7 @@ class GitHubReaderTest(unittest.TestCase):
                 "--jq",
                 ".base.sha",
             ],
-            calls[2],
+            calls[3],
         )
 
     def test_explicit_repository_scopes_every_read(self) -> None:
@@ -196,7 +197,11 @@ class GitHubReaderTest(unittest.TestCase):
 
         def runner(args, **kwargs):
             calls.append(args)
-            return SimpleNamespace(returncode=0, stdout=payload, stderr=b"")
+            return SimpleNamespace(
+                returncode=0,
+                stdout=payload if args[1] == "pr" else b"[]",
+                stderr=b"",
+            )
 
         reader = GitHubPullRequestReader(
             "/tmp/repo", repository="acme/project", runner=runner
@@ -206,6 +211,86 @@ class GitHubReaderTest(unittest.TestCase):
             ["gh", "pr", "view", "821", "--json"], calls[0][:5]
         )
         self.assertEqual(["--repo", "acme/project"], calls[0][-2:])
+        self.assertEqual(["--repo", "acme/project"], calls[1][-2:])
+
+    def test_exact_head_workflow_blocks_partial_green_rollup(self) -> None:
+        pr = MockGitHub().pr(821)
+        sha = pr["headRefOid"]
+        workflow = {
+            "headSha": sha, "status": "pending", "conclusion": None,
+            "workflowDatabaseId": 12,
+        }
+        reads = []
+
+        def runner(args, **kwargs):
+            reads.append(args)
+            body = pr if args[1] == "pr" else [workflow]
+            return SimpleNamespace(
+                returncode=0, stdout=json.dumps(body).encode(), stderr=b""
+            )
+
+        reader = GitHubPullRequestReader(
+            "/tmp/repo", repository="acme/project", runner=runner
+        )
+        self.assertEqual("PENDING", reader.get(821).checks)
+        self.assertEqual(["gh", "run", "list", "--commit", sha], reads[1][:5])
+        workflow["conclusion"] = "success"
+        self.assertEqual("PENDING", reader.get(821).checks)
+        workflow.update(status="completed", conclusion="success")
+        self.assertEqual("SUCCESS", reader.get(821).checks)
+        workflow.update(conclusion="failure")
+        self.assertTrue(reader.get(821).checks_failed)
+        workflow.update(conclusion="cancelled")
+        replacement = dict(workflow, conclusion="success")
+
+        def replacement_runner(args, **kwargs):
+            body = pr if args[1] == "pr" else [workflow, replacement]
+            return SimpleNamespace(
+                returncode=0, stdout=json.dumps(body).encode(), stderr=b""
+            )
+
+        replacement_reader = GitHubPullRequestReader(
+            "/tmp/repo", runner=replacement_runner
+        )
+        self.assertEqual("SUCCESS", replacement_reader.get(821).checks)
+
+    def test_workflow_read_failure_does_not_publish_green(self) -> None:
+        pr = MockGitHub().pr(821)
+
+        def runner(args, **kwargs):
+            if args[1] == "run":
+                return SimpleNamespace(returncode=1, stdout=b"", stderr=b"unavailable")
+            return SimpleNamespace(
+                returncode=0, stdout=json.dumps(pr).encode(), stderr=b""
+            )
+
+        reader = GitHubPullRequestReader("/tmp/repo", runner=runner)
+        with self.assertRaises(GitHubReadError):
+            reader.get(821)
+
+    def test_workflow_inventory_must_match_head_and_be_complete(self) -> None:
+        pr = MockGitHub().pr(821)
+        sha = pr["headRefOid"]
+        workflows = []
+
+        def runner(args, **kwargs):
+            body = pr if args[1] == "pr" else workflows
+            return SimpleNamespace(
+                returncode=0, stdout=json.dumps(body).encode(), stderr=b""
+            )
+
+        reader = GitHubPullRequestReader("/tmp/repo", runner=runner)
+        self.assertEqual("SUCCESS", reader.get(821).checks)  # External checks only.
+        workflows[:] = [{"headSha": "b" * 40, "status": "pending"}]
+        with self.assertRaises(GitHubReadError):
+            reader.get(821)
+        workflows[:] = [{"headSha": sha}]
+        with self.assertRaises(GitHubReadError):
+            reader.get(821)
+        workflows[:] = [
+            {"headSha": sha, "status": "completed", "conclusion": "success"}
+        ] * 100
+        self.assertEqual("PENDING", reader.get(821).checks)
 
     def test_response_cap_fails_closed(self) -> None:
         def runner(args, **kwargs):

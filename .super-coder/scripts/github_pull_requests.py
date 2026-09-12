@@ -1,7 +1,7 @@
 """Bounded, read-only GitHub pull-request collection.
 
 This is the shared normalization seam for git hygiene, browser Diff review,
-and later PR-aware engine surfaces.  It invokes only ``gh pr`` read commands;
+and later PR-aware engine surfaces. It invokes bounded ``gh pr`` and ``gh run`` reads;
 callers decide whether branch-name discovery is sufficient or an exact PR
 number is required.
 """
@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Any
 
 LIST_LIMIT = 300
+WORKFLOW_LIMIT = 100
 MAX_RESPONSE_BYTES = 2 * 1024 * 1024
 GITHUB_TIMEOUT_SECONDS = 20.0
 _COMPAT_FIELDS = (
@@ -395,11 +396,56 @@ class GitHubPullRequestReader:
         if not isinstance(payload, dict):
             raise GitHubReadError("GitHub PR read returned an invalid payload")
         pull_request = normalize_pull_request(payload)
+        if (
+            pull_request.state == "OPEN"
+            and pull_request.checks == "SUCCESS"
+            and pull_request.head_sha
+        ):
+            workflows = self._read_workflows(pull_request.head_sha)
+            workflow_checks, workflow_failed = _check_state(workflows)
+            if workflow_failed:
+                pull_request = replace(
+                    pull_request, checks="FAILURE", checks_failed=True
+                )
+            elif workflow_checks == "PENDING" or len(workflows) == WORKFLOW_LIMIT:
+                # A full page cannot prove that every current-head run was seen.
+                pull_request = replace(pull_request, checks="PENDING")
         return (
             replace(pull_request, base_sha=self._read_base_sha(number))
             if restore_base_sha
             else pull_request
         )
+
+    def _read_workflows(self, head_sha: str) -> list[dict[str, Any]]:
+        raw = self._run(
+            [
+                "gh", "run", "list", "--commit", head_sha,
+                "--limit", str(WORKFLOW_LIMIT),
+                "--json", "headSha,status,conclusion,workflowDatabaseId",
+                *self._repo_args(),
+            ]
+        )
+        try:
+            payload = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise GitHubReadError("GitHub workflow list returned invalid JSON") from exc
+        if not isinstance(payload, list) or any(
+            not isinstance(item, dict) for item in payload
+        ):
+            raise GitHubReadError("GitHub workflow list returned an invalid payload")
+        if any(item.get("headSha") != head_sha for item in payload):
+            raise GitHubReadError("GitHub workflow list returned a different commit")
+        if any(not _item_state(item) for item in payload):
+            raise GitHubReadError("GitHub workflow list has an incomplete run")
+        return [
+            {
+                **item,
+                "name": str(item.get("workflowDatabaseId") or ""),
+                "conclusion": None if str(item.get("status", "")).upper()
+                in _PENDING_CHECKS else item.get("conclusion"),
+            }
+            for item in payload
+        ]
 
     def patch(self, number: int) -> str:
         if not isinstance(number, int) or number < 1:
