@@ -136,6 +136,7 @@ PRODUCTION_CONSUMERS = (
             ".super-coder/scripts/artifact_policy.py",
             ".super-coder/scripts/snapshot.py",
             ".super-coder/scripts/render.py",
+            ".super-coder/scripts/verify.py",
             ".super-coder/render/compose.py",
         ),
         "private snapshot and render inputs",

@@ -35,7 +35,7 @@ class DockerLifecycleWorkflowTest(unittest.TestCase):
         self.assertIn("SC_CI_SIDECAR: sc-pg-${{ github.event.repository.name }}", self.job)
 
     def test_job_uses_supported_bootstrap_and_real_launch(self) -> None:
-        bootstrap = self.job.index("run: ./sc verify")
+        bootstrap = self.job.index("run: ./sc rebuild && ./sc init --username verify")
         launch = self.job.index("run: ./sc launch")
 
         self.assertLess(bootstrap, launch)

@@ -65,9 +65,9 @@ jobs:
           SC_REQUIRE_OPENCODE_CANARY: '1'
           SC_REQUIRE_BROWSER_PACKAGE_CANARY: '1'
 
-  # The end-to-end proof `./sc verify` runs: rebuild the DB from committed text
-  # (schema + migrations + content.sql), flat-render, then a render-only boot —
-  # proving a fresh clone of this exact tree stands up. Complements
+  # The end-to-end proof `./sc verify` runs in a disposable candidate: rebuild
+  # from committed text, flat-render, then a render-only boot without changing
+  # the canonical database. Complements
   # render-check.yml (drift guard) with the boot half.
   verify:
     runs-on: ubuntu-26.04
@@ -97,7 +97,7 @@ jobs:
         with:
           python-version: '3.14'
       - name: Bootstrap the fresh checkout
-        run: ./sc verify
+        run: ./sc rebuild && ./sc init --username verify
       - name: Build and launch the default sandbox
         run: ./sc launch
       - name: Reach the sandbox health endpoint within 90 seconds

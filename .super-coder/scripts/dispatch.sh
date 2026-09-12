@@ -1664,39 +1664,7 @@ case "$cmd" in
     fi
     exec docker logs -f "$CNAME" ;;
   verify)
-    database="$(sc_engine_db)"
-    sc_refuse_linked verify "$database"
-    # Destructive by design: rebuild.py REPLACES the DB below. Say which DB and
-    # which source before that happens — a footer printed after the fact is a
-    # disclosure a crash can skip, and this is the command that eats unsnapshotted
-    # memory when it is pointed at an instance the caller did not mean.
-    echo "→ verify: about to REBUILD $database"
-    echo "          from engine source $ENGINE"
-    "$PY" "$S/rebuild.py"
-    # The engine source intentionally carries no per-instance snapshot in local
-    # artifact mode. Exercise the real fresh-fork initialization path before
-    # the headless boot when rebuild therefore produced an empty instance.
-    if "$PY" - "$database" <<'PY'
-import sqlite3
-import sys
-
-con = sqlite3.connect(sys.argv[1])
-try:
-    populated = con.execute(
-        "SELECT EXISTS(SELECT 1 FROM users WHERE is_active=1) "
-        "AND EXISTS(SELECT 1 FROM shells WHERE COALESCE(is_deleted,0)=0)"
-    ).fetchone()[0]
-finally:
-    con.close()
-raise SystemExit(0 if populated else 1)
-PY
-    then
-      :
-    else
-      "$PY" "$S/init_fork.py" --username verify
-    fi
-    SC_ADMIN=1 "$PY" "$S/render.py" flat
-    RENDER_ONLY=1 exec "$PY" "$S/run.py" --first ;;
+    exec "$PY" -B "$S/verify.py" ;;
   health)       curl -s "http://127.0.0.1:$(port)/api/health" && echo "" ;;
   clean-db)     database="$(sc_engine_db)"
                 sc_refuse_linked clean-db "$database"
@@ -1768,10 +1736,10 @@ Subfloor — forkable shell substrate — full command reference (./sc help for 
   ./sc migration new <slug>
                            allocate the next free migration number, write the standard skeleton, and update the source removal-test allowlist
   ./sc snapshot            Admin-only serialization of private instance content
-                             live-state commands (rebuild · migrate · verify · snapshot · render · clean-db) act on the SHARED live
+                             live-state commands (rebuild · migrate · snapshot · render · clean-db) act on the SHARED live
                              instance at the main checkout, so they REFUSE from a linked worktree rather than substitute it, naming
-                             the target declined (decision #81); -h/--help still answers from any checkout. render-check is the
-                             source-pure one: it verifies the CALLER's engine sources and local artifacts, and names the checkout it read.
+                             the target declined (decision #81); -h/--help still answers from any checkout. verify checks the
+                             installed engine source in a disposable candidate; render-check checks the CALLER's source and artifacts.
   ./sc mem <cmd> [args]    a shell's own memory, over the engine API (get/state/seed/lns/decision/flag/roadmap/doc/narrative);
                              already wired to this launched shell, identity resolved by the engine — no DB path, no direct-DB fallback. `./sc mem which` to orient
   ./sc pr subscribe --repository <owner/name> --pr <number>
@@ -1956,7 +1924,7 @@ Subfloor — forkable shell substrate — full command reference (./sc help for 
   ./sc pg-down             stop + remove the container (data volume retained)
                              (recreate via pg-down→pg-up to change --shm-size / SC_PG_SHM)
 
-  ./sc verify              rebuild + flat render + render-only boot (headless proof)
+  ./sc verify              candidate-only rebuild + flat render + render-only boot; live memory untouched
   ./sc health              curl the review layer's /api/health
   ./sc ports               show this fork's derived port
   ./sc url                 print this fork's review GUI + dev-server URLs (derived, never a fixed 8800)
