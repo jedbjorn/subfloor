@@ -1781,7 +1781,7 @@ def prepare_launch(*, shell_id: int, harness: "str | None" = None,
     callers must also treat SystemExit as a refusal."""
     headless = headless_prompt is not None
     if not os.environ.get("RENDER_ONLY"):
-        global_pointer.write_global_pointers()
+        global_pointer.reconcile()
     con = open_db()
     # Same best-effort skill heal as main() — compose's SKILLS block reads
     # what this repairs. RENDER_ONLY never mutates, here as there.
@@ -2137,7 +2137,7 @@ def main() -> None:
             "run subfloor admin from a host terminal"
         )
     if not os.environ.get("RENDER_ONLY") and not host_admin:
-        global_pointer.write_global_pointers()
+        global_pointer.reconcile()
     args = raw_args
     first = "--first" in args
     headless = "--headless" in args
@@ -2345,7 +2345,7 @@ def main() -> None:
             con.close()
             sys.exit(f"sc admin: {exc}")
         if not os.environ.get("RENDER_ONLY"):
-            global_pointer.write_global_pointers()
+            global_pointer.reconcile()
     controlled_opencode_route = None
     if headless:
         try:

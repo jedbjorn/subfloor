@@ -117,6 +117,10 @@ def needs_legacy_bridge() -> tuple[bool, str | None]:
 
 
 def main() -> int:
+    # Runs from the target release even when an older updater is still loaded.
+    import global_pointer
+
+    global_pointer.reconcile()
     reconcile_host_wrapper()
     reconcile_shell_alias()
     pending = _pending_update_ref()

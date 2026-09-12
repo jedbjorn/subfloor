@@ -87,7 +87,10 @@ class BoundaryRenderingTest(unittest.TestCase):
         self.assertIn("host Admin boot remains valid", boundary)
 
     def test_global_pointer_is_path_free_and_repair_is_admin_only(self):
-        pointer = (ENGINE / "templates" / "global_pointer.md").read_text()
+        import json
+
+        catalogue = json.loads((ENGINE / "assets/legacy-global-pointers.json").read_text())
+        pointer = catalogue["templates"][-1]["content"]
 
         self.assertIn("Admin-only repair mode", pointer)
         self.assertNotIn("shell_db.db", pointer)

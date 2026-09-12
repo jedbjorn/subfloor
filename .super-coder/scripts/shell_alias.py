@@ -52,7 +52,7 @@ _BASH_BLOCK_RE = re.compile(
 # else still runs — the function forwards every argument verbatim.
 COMPLETION_VERBS = (
     "enter admin launch restart down update test url help alias make-cleanup "
-    "install doctor rollback update-harnesses harness-status feature runtime "
+    "install doctor rollback update-harnesses harness-status harness-cleanup feature runtime "
     "remove eject persist mem map map-sql map-schema sql skill models job pr "
     "sprint token verify render render-check snapshot rebuild migrate migration "
     "build logs serve health ports preview run boot deps lint typecheck browser"

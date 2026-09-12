@@ -1,0 +1,21 @@
+{
+  "targets": {
+    "claude": ".claude/CLAUDE.md",
+    "codex": ".codex/AGENTS.md",
+    "opencode": ".config/opencode/AGENTS.md"
+  },
+  "templates": [
+    {
+      "ref": "dab98db077c785d595da93e300accef66b9360e2",
+      "content": "# super-coder — Universal Boot Pointer\n<!-- managed by super-coder — hand edits are overwritten -->\n\nThis file is loaded by the harness for every invocation. It deliberately\ncarries no operating content.\n\nShells boot via `make dos-e` (`make enter`) from a substrate clone. The\nlauncher reads live engine state and renders a per-shell boot document in\n`<substrate>/.sc-worktrees/<shortname>/`.\n\nIf no per-shell boot document was loaded alongside this file, the session was\nstarted without the launcher. Stop and run `make dos-e` from the substrate\nclone. There is no fallback path, with one exception:\n\n**Repair mode.** If the operator explicitly states that the engine is down for\nrepair (for example, a broken migration during update or a launcher failure),\nproceed without a boot document as a maintenance session, not a shell. The\nengine lives under `<substrate>/.super-coder/`. Its live `shell_db.db` is a\ngitignored cache rebuilt from `schema.sql`, `migrations/`, and\n`.sc-state/content.sql`; those tracked files are the source of truth. Do not\nwrite memory, seed, or identity. Fix only what the operator points at, then\nhand back to the normal boot path.\n"
+    },
+    {
+      "ref": "894967f34bdc95898494e2cb9998aa398f79b575",
+      "content": "# super-coder — Universal Boot Pointer\n<!-- managed by super-coder — hand edits are overwritten -->\n\nThis file is loaded by the harness for every invocation. It deliberately\ncarries no operating content.\n\nShells boot via `make dos-e` (`make enter`) from a substrate clone. The\nlauncher reads live engine state and renders a per-shell boot document in\n`<substrate>/.sc-worktrees/<shortname>/`.\n\nIf no per-shell boot document was loaded alongside this file, the session was\nstarted without the launcher. Stop and run `make dos-e` from the substrate\nclone. There is no fallback path, with one exception:\n\n**Admin-only repair mode.** Proceed without a boot document only when the\noperator explicitly assigns an engine-down repair to the Admin maintenance\nseat. Load the Admin maintenance skills, change only the named fault, and hand\nback to the normal boot path. Every non-Admin invocation stops here; missing\nAPI service never grants direct control-plane access.\n"
+    },
+    {
+      "ref": "52c8616832a58762a119ccffccc29972760c5ec0",
+      "content": "# Subfloor — Universal Boot Pointer\n<!-- managed by super-coder — hand edits are overwritten -->\n\nThis file is loaded by the harness for every invocation. It deliberately\ncarries no operating content.\n\nShells boot via `subfloor enter` from a substrate clone. The\nlauncher reads live engine state and renders a per-shell boot document in\n`<substrate>/.sc-worktrees/<shortname>/`.\n\nIf no per-shell boot document was loaded alongside this file, the session was\nstarted without the launcher. Stop and run `subfloor enter` from the substrate\nclone. There is no fallback path, with one exception:\n\n**Admin-only repair mode.** Proceed without a boot document only when the\noperator explicitly assigns an engine-down repair to the Admin maintenance\nseat. Load the Admin maintenance skills, change only the named fault, and hand\nback to the normal boot path. Every non-Admin invocation stops here; missing\nAPI service never grants direct control-plane access.\n"
+    }
+  ]
+}

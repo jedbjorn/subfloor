@@ -259,6 +259,13 @@ sc_host_server_down() {
   fi
   rm -f "$HOST_SERVER_PID"
 }
+sc_harness_cleanup() {
+  # Run on the host before handing off to Docker: a sandbox must not edit
+  # mounted host instructions. Cleanup failure remains visible and advisory.
+  "$PY" "$S/global_pointer.py" --apply ||
+    echo "harness-cleanup: incomplete; run ./sc harness-cleanup --check on the host" >&2
+}
+
 # Host-runtime entry: the shell boots on this host through run.py, the same
 # primitive the sandbox runs inside the container. $1 = shortname ("" = picker).
 sc_host_enter() {
@@ -1068,7 +1075,7 @@ esac
 # migrate) probes first because it executes host Python. Container entry
 # deliberately remains a Docker handoff rather than a host-runtime gate.
 case "$cmd" in
-  install|ensure-harness|doctor|update|update-harnesses|harness-status|docker-cache-gc|rollback|feature|runtime|artifact-mode|eject|remove|init|rebuild|migrate|migration|snapshot|mem|pr|token|persist|job|visual-qa|sql|sql-rw|map-sql|map-sql-rw|map-schema|map-extractor|context|render|render-check|map|map-setup|analytics|models|seed-skills|skill|search|ports|url|preview|serve|vm|remote|vm-broker|vm-bake|vm-broker-up|vm-broker-down|vm-broker-sock|vm-mcp-relay|vm-broker-install|vm-broker-uninstall|ts|ts-broker|ts-broker-up|ts-broker-down|ts-broker-sock|ts-broker-install|ts-broker-uninstall|pm2-broker|pm2-broker-up|pm2-broker-down|pm2-broker-sock|pm2-broker-install|pm2-broker-uninstall|db-broker|db-broker-up|db-broker-down|db-broker-sock|db-broker-install|db-broker-uninstall|db-init|pg-init|pg-up|pg-down|admin|boot|boot-*|run|deps|test|lint|typecheck|launch|down|restart|build|verify|health|clean-db)
+  install|ensure-harness|doctor|harness-cleanup|update|update-harnesses|harness-status|docker-cache-gc|rollback|feature|runtime|artifact-mode|eject|remove|init|rebuild|migrate|migration|snapshot|mem|pr|token|persist|job|visual-qa|sql|sql-rw|map-sql|map-sql-rw|map-schema|map-extractor|context|render|render-check|map|map-setup|analytics|models|seed-skills|skill|search|ports|url|preview|serve|vm|remote|vm-broker|vm-bake|vm-broker-up|vm-broker-down|vm-broker-sock|vm-mcp-relay|vm-broker-install|vm-broker-uninstall|ts|ts-broker|ts-broker-up|ts-broker-down|ts-broker-sock|ts-broker-install|ts-broker-uninstall|pm2-broker|pm2-broker-up|pm2-broker-down|pm2-broker-sock|pm2-broker-install|pm2-broker-uninstall|db-broker|db-broker-up|db-broker-down|db-broker-sock|db-broker-install|db-broker-uninstall|db-init|pg-init|pg-up|pg-down|admin|boot|boot-*|run|deps|test|lint|typecheck|launch|down|restart|build|verify|health|clean-db)
     case "$cmd" in
       deps|test|lint|typecheck)
         sc_devkit_help_form "$@" || sc_python_probe ;;
@@ -1080,6 +1087,7 @@ esac
 
 case "$cmd" in
   install)         exec "$PY" "$S/install.py" "$@" ;;
+  harness-cleanup) exec "$PY" "$S/global_pointer.py" "$@" ;;
   ensure-harness)  exec "$PY" "$S/install.py" --ensure-harness ;;
   doctor)          exec "$PY" "$S/install.py" --check-docker ;;
   update)            exec "$PY" "$S/update.py" "$@" ;;
@@ -1314,6 +1322,7 @@ case "$cmd" in
       esac
       shift
     done
+    sc_harness_cleanup
     if sc_host_runtime; then
       [ -z "$no_build" ] || echo "→ runtime host: --no-build is implied (there is no image)"
       sc_host_server_up || exit 1
@@ -1498,6 +1507,7 @@ case "$cmd" in
     # Start the PG sidecar when configured — self-skips otherwise.
     sc_pg_up || true ;;
   enter)
+    sc_help_form "$@" || sc_harness_cleanup
     if sc_host_runtime; then sc_host_enter "" "$@"; fi
     if [ "${1:-}" = "--devkit-repair" ]; then
       shift
@@ -1515,6 +1525,7 @@ case "$cmd" in
     sc_urls || true
     exec docker exec -it "$CNAME" ./sc boot "$@" ;;
   enter-*)
+    sc_help_form "$@" || sc_harness_cleanup
     if sc_host_runtime; then sc_host_enter "${cmd#enter-}" "$@"; fi
     if [ "${1:-}" = "--devkit-repair" ]; then
       echo "sc ${cmd}: repair posture is available only as ./sc enter --devkit-repair" >&2
@@ -1740,6 +1751,7 @@ Subfloor — forkable shell substrate — full command reference (./sc help for 
   ./sc update-harnesses    refresh the harness CLIs the SHELLS run: rolls the harness epoch + rebuilds the sandbox image
                              (they are image-owned — activate that exact build with ./sc restart --no-build)
                              without docker, updates this host's CLIs instead — there the host IS the runtime
+  ./sc harness-cleanup     check legacy global pointers (--apply to clean; API-independent)
   ./sc harness-status      report the harness CLI versions inside the sandbox + whether the image owes a harness rebuild
                              (a model the shells cannot reach is nearly always this — see .super-coder/docs/harness-freshness.md)
   ./sc docker-cache-gc     remove unused host-global Docker build cache older than seven days
