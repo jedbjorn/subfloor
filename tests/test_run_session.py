@@ -120,6 +120,15 @@ class ShellPathTest(unittest.TestCase):
         self.root_patch = mock.patch.object(run, "REPO_ROOT", self.root)
         self.root_patch.start()
         self.addCleanup(self.root_patch.stop)
+        self.wrapper = Path(self.tmp.name) / "home" / ".local" / "bin" / "sc"
+        self.wrapper.parent.mkdir(parents=True)
+        self.wrapper.write_bytes(run.sc_wrapper.WRAPPER_BYTES)
+        self.wrapper.chmod(0o755)
+        wrapper_patch = mock.patch.object(
+            run.sc_wrapper, "wrapper_path", return_value=self.wrapper
+        )
+        wrapper_patch.start()
+        self.addCleanup(wrapper_patch.stop)
 
     def _python(self, *, executable: bool = True) -> Path:
         project_bin = self.worktree / ".venv" / "bin"
@@ -174,7 +183,7 @@ class ShellPathTest(unittest.TestCase):
 
         self.assertEqual(
             path,
-            f"{self.root}:{python.parent}:/usr/local/bin:/usr/bin",
+            f"{self.wrapper.parent}:{python.parent}:/usr/local/bin:/usr/bin",
         )
         probe.assert_called_once_with(
             [
@@ -198,7 +207,7 @@ class ShellPathTest(unittest.TestCase):
 
         self.assertEqual(
             path,
-            f"{self.root}:{project_venv / 'bin'}:/usr/local/bin:/usr/bin",
+            f"{self.wrapper.parent}:{project_venv / 'bin'}:/usr/local/bin:/usr/bin",
         )
         self.assertEqual(warning, "")
 
@@ -223,7 +232,7 @@ class ShellPathTest(unittest.TestCase):
                 self.worktree, "/usr/local/bin:/usr/bin"
             )
 
-        self.assertEqual(path, f"{self.root}:/usr/local/bin:/usr/bin")
+        self.assertEqual(path, f"{self.wrapper.parent}:/usr/local/bin:/usr/bin")
         self.assertIn("symlinked .venv root", stderr.getvalue())
         self.assertIn("run `sc deps`", stderr.getvalue())
         probe.assert_not_called()
@@ -250,7 +259,7 @@ class ShellPathTest(unittest.TestCase):
                 self.worktree, "/usr/local/bin:/usr/bin"
             )
 
-        self.assertEqual(path, f"{self.root}:/usr/local/bin:/usr/bin")
+        self.assertEqual(path, f"{self.wrapper.parent}:/usr/local/bin:/usr/bin")
         warning = stderr.getvalue()
         self.assertIn(".venv/bin resolves outside assigned .venv", warning)
         self.assertIn("run `sc deps`", warning)
@@ -258,7 +267,7 @@ class ShellPathTest(unittest.TestCase):
 
     def test_absent_environment_is_omitted_without_warning(self) -> None:
         path, warning = self._path_and_warning()
-        self.assertEqual(path, f"{self.root}:/usr/local/bin:/usr/bin")
+        self.assertEqual(path, f"{self.wrapper.parent}:/usr/local/bin:/usr/bin")
         self.assertEqual(warning, "")
 
     def test_non_directory_bin_is_omitted_with_remedy(self) -> None:
@@ -266,7 +275,7 @@ class ShellPathTest(unittest.TestCase):
         project_bin.parent.mkdir(parents=True)
         project_bin.write_text("not a directory")
         path, warning = self._path_and_warning()
-        self.assertEqual(path, f"{self.root}:/usr/local/bin:/usr/bin")
+        self.assertEqual(path, f"{self.wrapper.parent}:/usr/local/bin:/usr/bin")
         self.assertIn(str(self.worktree), warning)
         self.assertIn(".venv/bin is not a directory", warning)
         self.assertIn("run `sc deps`", warning)
@@ -274,7 +283,7 @@ class ShellPathTest(unittest.TestCase):
     def test_missing_interpreter_is_omitted_with_remedy(self) -> None:
         (self.worktree / ".venv" / "bin").mkdir(parents=True)
         path, warning = self._path_and_warning()
-        self.assertEqual(path, f"{self.root}:/usr/local/bin:/usr/bin")
+        self.assertEqual(path, f"{self.wrapper.parent}:/usr/local/bin:/usr/bin")
         self.assertIn("missing .venv/bin/python", warning)
         self.assertIn("run `sc deps`", warning)
 
@@ -283,14 +292,14 @@ class ShellPathTest(unittest.TestCase):
         project_bin.mkdir(parents=True)
         (project_bin / "python").symlink_to(self.root / "missing-python")
         path, warning = self._path_and_warning()
-        self.assertEqual(path, f"{self.root}:/usr/local/bin:/usr/bin")
+        self.assertEqual(path, f"{self.wrapper.parent}:/usr/local/bin:/usr/bin")
         self.assertIn("dangling .venv/bin/python symlink", warning)
         self.assertTrue((project_bin / "python").is_symlink())
 
     def test_non_executable_interpreter_is_omitted_with_remedy(self) -> None:
         python = self._python(executable=False)
         path, warning = self._path_and_warning()
-        self.assertEqual(path, f"{self.root}:/usr/local/bin:/usr/bin")
+        self.assertEqual(path, f"{self.wrapper.parent}:/usr/local/bin:/usr/bin")
         self.assertIn("not an executable regular file", warning)
         self.assertEqual(python.stat().st_mode & 0o777, 0o644)
 
@@ -303,7 +312,7 @@ class ShellPathTest(unittest.TestCase):
             side_effect=subprocess.TimeoutExpired("python", 3),
         ), redirect_stderr(stderr):
             path = run._shell_path(self.worktree, "/usr/bin")
-        self.assertEqual(path, f"{self.root}:/usr/bin")
+        self.assertEqual(path, f"{self.wrapper.parent}:/usr/bin")
         self.assertIn("Python probe timed out after 3 seconds", stderr.getvalue())
 
     def test_foreign_prefix_is_omitted_with_remedy(self) -> None:
@@ -312,7 +321,7 @@ class ShellPathTest(unittest.TestCase):
         path, warning = self._path_and_warning(
             self._completed_probe(prefix=foreign)
         )
-        self.assertEqual(path, f"{self.root}:/usr/local/bin:/usr/bin")
+        self.assertEqual(path, f"{self.wrapper.parent}:/usr/local/bin:/usr/bin")
         self.assertIn(f"Python reported foreign prefix {foreign}", warning)
 
     def test_python_313_environment_is_omitted_with_remedy(self) -> None:
@@ -320,7 +329,7 @@ class ShellPathTest(unittest.TestCase):
         path, warning = self._path_and_warning(
             self._completed_probe(version=(3, 13))
         )
-        self.assertEqual(path, f"{self.root}:/usr/local/bin:/usr/bin")
+        self.assertEqual(path, f"{self.wrapper.parent}:/usr/local/bin:/usr/bin")
         self.assertIn("Python 3.14 is required; found 3.13", warning)
 
     def test_python_315_environment_is_omitted_with_remedy(self) -> None:
@@ -328,7 +337,7 @@ class ShellPathTest(unittest.TestCase):
         path, warning = self._path_and_warning(
             self._completed_probe(version=(3, 15))
         )
-        self.assertEqual(path, f"{self.root}:/usr/local/bin:/usr/bin")
+        self.assertEqual(path, f"{self.wrapper.parent}:/usr/local/bin:/usr/bin")
         self.assertIn("Python 3.14 is required; found 3.15", warning)
 
     def test_nonzero_probe_is_omitted_with_remedy(self) -> None:
@@ -336,7 +345,7 @@ class ShellPathTest(unittest.TestCase):
         path, warning = self._path_and_warning(
             self._completed_probe(returncode=9)
         )
-        self.assertEqual(path, f"{self.root}:/usr/local/bin:/usr/bin")
+        self.assertEqual(path, f"{self.wrapper.parent}:/usr/local/bin:/usr/bin")
         self.assertIn("Python probe exited 9", warning)
 
     def test_invalid_probe_report_is_omitted_with_remedy(self) -> None:
@@ -345,7 +354,7 @@ class ShellPathTest(unittest.TestCase):
             args=[], returncode=0, stdout="not-json", stderr=""
         )
         path, warning = self._path_and_warning(completed)
-        self.assertEqual(path, f"{self.root}:/usr/local/bin:/usr/bin")
+        self.assertEqual(path, f"{self.wrapper.parent}:/usr/local/bin:/usr/bin")
         self.assertIn("Python probe returned an invalid report", warning)
 
     def test_non_virtual_prefix_is_omitted_with_remedy(self) -> None:
@@ -354,13 +363,72 @@ class ShellPathTest(unittest.TestCase):
         path, warning = self._path_and_warning(
             self._completed_probe(prefix=prefix, base_prefix=prefix)
         )
-        self.assertEqual(path, f"{self.root}:/usr/local/bin:/usr/bin")
+        self.assertEqual(path, f"{self.wrapper.parent}:/usr/local/bin:/usr/bin")
         self.assertIn("Python reported no virtual environment", warning)
 
     def test_interactive_and_prepared_launches_share_the_path_builder(self) -> None:
         source = (SCRIPTS / "run.py").read_text()
         assignment = 'env["PATH"] = _shell_path(work_dir, env.get("PATH", ""))'
         self.assertEqual(source.count(assignment), 2)
+
+    def test_bare_sc_selects_linked_worktree_even_with_main_on_inherited_path(self) -> None:
+        subprocess.run(["git", "init", "-q", "-b", "main", str(self.root)], check=True)
+        launcher = self.root / "sc"
+        launcher.write_text("#!/bin/sh\nprintf 'main:%s\\n' \"$1\"\n")
+        launcher.chmod(0o755)
+        subprocess.run(["git", "-C", str(self.root), "add", "sc"], check=True)
+        subprocess.run(
+            ["git", "-C", str(self.root), "-c", "user.name=Fixture",
+             "-c", "user.email=fixture@example.invalid", "commit", "-qm", "fixture"],
+            check=True,
+        )
+        caller = Path(self.tmp.name) / "linked"
+        subprocess.run(
+            ["git", "-C", str(self.root), "worktree", "add", "-qb", "linked", str(caller)],
+            check=True,
+        )
+        (caller / "sc").write_text("#!/bin/sh\nprintf 'linked:%s\\n' \"$1\"\n")
+        (caller / "sc").chmod(0o755)
+        path = run._shell_path(caller, f"{self.root}:/usr/bin")
+        env = {**os.environ, "PATH": path}
+        resolved = subprocess.run(
+            ["sh", "-c", "command -v sc"], cwd=caller, env=env,
+            text=True, capture_output=True, check=True,
+        )
+        self.assertEqual(resolved.stdout.strip(), str(self.wrapper))
+        bare = subprocess.run(
+            ["sc", "test"], cwd=caller, env=env,
+            text=True, capture_output=True, check=True,
+        )
+        self.assertEqual(bare.stdout, "linked:test\n")
+        explicit = subprocess.run(
+            [str(launcher), "test"], cwd=caller, env=env,
+            text=True, capture_output=True, check=True,
+        )
+        self.assertEqual(explicit.stdout, "main:test\n")
+
+    def test_missing_wrapper_does_not_fall_back_to_main_launcher(self) -> None:
+        self.wrapper.unlink()
+        self.assertEqual(
+            run._shell_path(self.worktree, f"{self.root}:/usr/bin"), "/usr/bin"
+        )
+
+    def test_unset_home_does_not_abort_launch_path(self) -> None:
+        with mock.patch.object(
+            run.sc_wrapper, "wrapper_path",
+            side_effect=run.sc_wrapper.WrapperError("HOME is unset"),
+        ):
+            self.assertEqual(
+                run._shell_path(self.worktree, f"{self.root}:/usr/bin"),
+                "/usr/bin",
+            )
+
+    def test_docker_keeps_inherited_wrapper_without_host_path(self) -> None:
+        with mock.patch.dict(os.environ, {"SC_SANDBOX": "1"}):
+            self.assertEqual(
+                run._shell_path(self.worktree, f"{self.root}:/usr/local/bin:/usr/bin"),
+                "/usr/local/bin:/usr/bin",
+            )
 
 
 class _FailAfterArchive:
