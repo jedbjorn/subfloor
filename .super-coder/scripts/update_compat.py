@@ -120,6 +120,15 @@ def main() -> int:
     # Runs from the target release even when an older updater is still loaded.
     import global_pointer
 
+    # An older updater may have copied the retired Visual QA shim after the
+    # target floor was materialized. This fresh process owns the target policy.
+    if _pending_update_ref() is not None:
+        import update
+
+        action, changes = update.ensure_workflows()
+        if action == "retired":
+            print("→ update compatibility: retired managed Visual QA workflow")
+
     global_pointer.reconcile()
     reconcile_host_wrapper()
     reconcile_shell_alias()
