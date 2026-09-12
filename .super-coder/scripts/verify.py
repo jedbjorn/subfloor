@@ -26,7 +26,9 @@ def _copy_engine(source: str, names: list[str]) -> set[str]:
     }
 
 
-def main() -> int:
+def main(argv: list[str]) -> int:
+    if argv:
+        raise SystemExit("usage: ./sc verify")
     # Snapshot is the only per-instance input; verify must not open the live DB.
     snapshot = instance_state.active_snapshot_path(ROOT)
     if not snapshot.exists():
@@ -109,7 +111,8 @@ def main() -> int:
              str(candidate / ".super-coder")], cwd=candidate, env=env,
             capture_output=True, text=True, check=True,
         ).stdout.strip()
-        if Path(resolved).resolve() != (candidate / ".super-coder" / "shell_db.db").resolve():
+        candidate_db = instance_state.legacy_database_path(candidate / ".super-coder")
+        if Path(resolved).resolve() != candidate_db.resolve():
             raise SystemExit(f"verify: candidate database escaped disposable checkout: {resolved}")
         steps = [
             [python, str(scripts / "rebuild.py")],
@@ -121,7 +124,7 @@ def main() -> int:
         for index, command in enumerate(steps):
             if index == 1:
                 import sqlite3
-                db = candidate / ".super-coder" / "shell_db.db"
+                db = candidate_db
                 with sqlite3.connect(db) as con:
                     populated = con.execute(
                         "SELECT EXISTS(SELECT 1 FROM users WHERE is_active=1) "
@@ -135,7 +138,7 @@ def main() -> int:
             if index == 3:
                 step_env["RENDER_ONLY"] = "1"
                 import sqlite3
-                db = candidate / ".super-coder" / "shell_db.db"
+                db = candidate_db
                 with sqlite3.connect(db) as con:
                     selected = con.execute(
                         "SELECT shortname FROM shells WHERE flavor!='admin' "
@@ -151,4 +154,6 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    from cli_entry import run_cli
+
+    raise SystemExit(run_cli(main, sys.argv[1:]))

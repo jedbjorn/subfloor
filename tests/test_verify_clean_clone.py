@@ -15,7 +15,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class VerifyCleanCloneTest(unittest.TestCase):
-    def test_verify_boots_an_empty_candidate_without_initializing_the_source(self):
+    def test_verify_initializes_an_empty_source_instance(self):
         with tempfile.TemporaryDirectory() as td:
             checkout = Path(td) / "checkout"
             sha = subprocess.run(
