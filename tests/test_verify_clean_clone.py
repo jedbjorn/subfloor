@@ -15,7 +15,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class VerifyCleanCloneTest(unittest.TestCase):
-    def test_verify_initializes_an_empty_source_instance(self):
+    def test_verify_boots_an_empty_candidate_without_initializing_the_source(self):
         with tempfile.TemporaryDirectory() as td:
             checkout = Path(td) / "checkout"
             sha = subprocess.run(
@@ -32,6 +32,14 @@ class VerifyCleanCloneTest(unittest.TestCase):
             # Include locally edited launch-floor files when this regression
             # test is run before their fixes have been committed.
             shutil.copy2(ROOT / "sc", checkout / "sc")
+            shutil.copy2(
+                ROOT / ".super-coder" / "scripts" / "dispatch.sh",
+                checkout / ".super-coder" / "scripts" / "dispatch.sh",
+            )
+            shutil.copy2(
+                ROOT / ".super-coder" / "scripts" / "verify.py",
+                checkout / ".super-coder" / "scripts" / "verify.py",
+            )
             shutil.copy2(
                 ROOT / ".super-coder" / "scripts" / "pr_cli.py",
                 checkout / ".super-coder" / "scripts" / "pr_cli.py",
@@ -86,6 +94,8 @@ class VerifyCleanCloneTest(unittest.TestCase):
                 f"stdout:\n{stdout}\n\nstderr:\n{stderr}",
             )
             self.assertNotIn("Username:", stdout)
+            self.assertFalse((checkout / ".super-coder" / "shell_db.db").exists())
+            self.assertIn("candidate passed", stdout)
 
 
 if __name__ == "__main__":

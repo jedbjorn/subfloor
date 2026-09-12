@@ -261,8 +261,15 @@ class LinkedWorktreeRefusalTest(WorktreeFixture):
     """Requirements 2 and 3: the live-state commands refuse from a linked
     worktree, before they open or delete anything."""
 
-    LIVE_STATE_COMMANDS = ("rebuild", "migrate", "verify", "snapshot",
+    LIVE_STATE_COMMANDS = ("rebuild", "migrate", "snapshot",
                            "render", "clean-db")
+
+    def test_linked_verify_uses_disposable_candidate(self):
+        before = state_digest(self.main)
+        done = run_sc(self.wt, "verify")
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        self.assertIn("candidate passed", done.stdout)
+        self.assertEqual(state_digest(self.main), before)
 
     def test_live_state_commands_refuse_and_leave_the_instance_untouched(self):
         for cmd in self.LIVE_STATE_COMMANDS:
@@ -423,9 +430,9 @@ class RootCheckoutUnchangedTest(WorktreeFixture):
             done.stdout,
         )
 
-    def test_root_verify_discloses_its_target_before_the_rebuild_runs(self):
-        """The ordering IS the requirement, so both events are captured in ONE
-        stream: a disclosure printed after the destruction is no disclosure."""
+    def test_root_verify_runs_rebuild_only_in_disposable_candidate(self):
+        """A failing candidate rebuild leaves the canonical DB untouched."""
+        before = state_digest(self.main)
         script = self.main / ".super-coder" / "scripts" / "rebuild.py"
         original = script.read_bytes()
         script.write_text(
@@ -437,12 +444,8 @@ class RootCheckoutUnchangedTest(WorktreeFixture):
         finally:
             script.write_bytes(original)
         self.assertNotEqual(done.returncode, 0)
-        merged = done.stdout
-        self.assertIn(str(self.live_db), merged)
-        self.assertIn("REBUILD-RAN", merged)
-        self.assertLess(
-            merged.index(str(self.live_db)), merged.index("REBUILD-RAN"),
-            "verify disclosed its target only after rebuild had already run")
+        self.assertIn("REBUILD-RAN", done.stdout)
+        self.assertEqual(state_digest(self.main), before)
 
 
 class MigrationScaffoldRunsCallerSourceTest(WorktreeFixture):
