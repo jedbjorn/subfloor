@@ -1,0 +1,6 @@
+# managed-by: subfloor — visual-qa shim v4
+# Compatibility input for updater versions installed before workflow retirement.
+# The target update bridge removes any managed copy before the update completes.
+name: Retired Subfloor Visual QA compatibility shim
+on: {}
+jobs: {}

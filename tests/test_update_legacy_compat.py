@@ -6,11 +6,13 @@ import contextlib
 import io
 import json
 import os
+import runpy
 import shutil
 import sqlite3
 import subprocess
 import sys
 import tempfile
+import types
 import unittest
 from contextlib import closing
 from pathlib import Path
@@ -63,6 +65,65 @@ class LegacyUpdateCompatTest(unittest.TestCase):
         self.cleanup_mock = mock.patch("global_pointer.reconcile", return_value=[])
         self.cleanup_mock.start()
         self.addCleanup(self.cleanup_mock.stop)
+
+    def test_old_visual_qa_reader_can_cross_retirement(self) -> None:
+        """The old loaded updater still reads both templates after materialize."""
+        templates = ROOT / ".super-coder" / "templates" / "fork"
+        workflow_source = templates / "subfloor-visual-qa.yml"
+        example_source = templates / "visual-qa.example.json"
+        self.assertTrue(workflow_source.is_file())
+        self.assertTrue(example_source.is_file())
+        self.assertIn("# managed-by: subfloor — visual-qa shim v", workflow_source.read_text().splitlines()[0])
+
+        with tempfile.TemporaryDirectory() as td:
+            fork = Path(td)
+            workflow = fork / update.VISUAL_QA_WORKFLOW
+            old = runpy.run_path(str(ROOT / "tests" / "fixtures" / "update_8ff49ada_visual_qa.py"))
+            old["ensure_workflows"].__globals__.update(
+                ENGINE=ROOT / ".super-coder",
+                install_mod=types.SimpleNamespace(VISUAL_QA_TEMPLATE_TARGETS={
+                    "subfloor-visual-qa.yml": update.VISUAL_QA_WORKFLOW,
+                    "visual-qa.example.json": Path("visual-qa.example.json"),
+                }),
+            )
+            action, paths = old["ensure_workflows"](fork, source_repo=False)
+            self.assertEqual("seeded", action)
+            self.assertEqual(2, len(paths))
+            self.assertTrue(workflow.exists())
+            self.assertTrue((fork / "visual-qa.example.json").exists())
+            real_ensure = update.ensure_workflows
+            with mock.patch.object(update_compat, "_pending_update_ref", return_value="a" * 40), mock.patch.object(
+                update_compat, "reconcile_host_wrapper"
+            ), mock.patch.object(update_compat, "reconcile_shell_alias"), mock.patch.object(
+                update_compat, "_current_update_ref", return_value=None
+            ), mock.patch.object(update_compat, "needs_legacy_bridge", return_value=(False, None)), mock.patch.object(
+                update, "ensure_workflows", side_effect=lambda: real_ensure(fork, source_repo=False)
+            ):
+                self.assertEqual(0, update_compat.main())
+            self.assertFalse(workflow.exists())
+            self.assertEqual("{}\n", (fork / "visual-qa.example.json").read_text())
+
+            workflow.write_text("name: fork-owned workflow\n")
+            with mock.patch.object(update_compat, "_pending_update_ref", return_value="a" * 40), mock.patch.object(
+                update_compat, "reconcile_host_wrapper"
+            ), mock.patch.object(update_compat, "reconcile_shell_alias"), mock.patch.object(
+                update_compat, "_current_update_ref", return_value=None
+            ), mock.patch.object(update_compat, "needs_legacy_bridge", return_value=(False, None)), mock.patch.object(
+                update, "ensure_workflows", side_effect=lambda: real_ensure(fork, source_repo=False)
+            ):
+                self.assertEqual(0, update_compat.main())
+            self.assertEqual("name: fork-owned workflow\n", workflow.read_text())
+
+    def test_manual_bridge_does_not_retire_workflow(self) -> None:
+        with mock.patch.object(update_compat, "_pending_update_ref", return_value=None), mock.patch.object(
+            update_compat, "_current_update_ref", return_value=None
+        ), mock.patch.object(update_compat, "needs_legacy_bridge", return_value=(False, None)), mock.patch.object(
+            update_compat, "reconcile_host_wrapper"
+        ), mock.patch.object(update_compat, "reconcile_shell_alias"), mock.patch.object(
+            update, "ensure_workflows"
+        ) as ensure:
+            self.assertEqual(0, update_compat.main())
+            ensure.assert_not_called()
 
     def test_projection_and_render_inconsistencies_are_advisory(self) -> None:
         connection = sqlite3.connect(":memory:")
