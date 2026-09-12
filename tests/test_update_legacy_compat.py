@@ -1,10 +1,10 @@
-#!/usr/bin/env python3
 """First-adoption bridge for updater behavior absent from an old fork."""
 
 from __future__ import annotations
 
 import contextlib
 import io
+import json
 import os
 import shutil
 import sqlite3
@@ -20,9 +20,9 @@ ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS = ROOT / ".super-coder" / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 sys.path.insert(0, str(ROOT / "tests"))
-import update  # noqa: E402
-import update_compat  # noqa: E402
-from skill_convergence_fixtures import (  # noqa: E402
+import update
+import update_compat
+from skill_convergence_fixtures import (
     LOCAL_SKILL_DESCRIPTION,
     LOCAL_SKILL_NAME,
     TOMBSTONE_SKILLS,
@@ -58,6 +58,12 @@ def commit(root: Path, message: str) -> str:
 
 
 class LegacyUpdateCompatTest(unittest.TestCase):
+    def setUp(self):
+        # General bridge tests must never reconcile the operator's HOME.
+        self.cleanup_mock = mock.patch("global_pointer.reconcile", return_value=[])
+        self.cleanup_mock.start()
+        self.addCleanup(self.cleanup_mock.stop)
+
     def test_projection_and_render_inconsistencies_are_advisory(self) -> None:
         connection = sqlite3.connect(":memory:")
         output = io.StringIO()
@@ -260,6 +266,17 @@ class LegacyUpdateCompatTest(unittest.TestCase):
             shutil.copy2(
                 SCRIPTS / "update_compat.py", scripts / "update_compat.py"
             )
+            shutil.copy2(SCRIPTS / "global_pointer.py", scripts / "global_pointer.py")
+            assets = scripts.parent / "assets"
+            assets.mkdir()
+            catalogue = SCRIPTS.parent / "assets/legacy-global-pointers.json"
+            shutil.copy2(catalogue, assets / catalogue.name)
+            home = Path(td) / "home"
+            target = home / ".codex/AGENTS.md"
+            target.parent.mkdir(parents=True)
+            target.write_text(json.loads(catalogue.read_text())["templates"][0]["content"])
+            backup = target.with_name("AGENTS.md.pre-sc.bak")
+            backup.write_bytes(b"operator instructions")
             shutil.copy2(SCRIPTS / "sc_wrapper.py", scripts / "sc_wrapper.py")
             shutil.copy2(SCRIPTS / "shell_alias.py", scripts / "shell_alias.py")
             (scripts / "update.py").write_text(
@@ -288,7 +305,9 @@ class LegacyUpdateCompatTest(unittest.TestCase):
             (state / "engine.ref").write_text(current_ref + "\n")
             (state / "engine.ref.prev").write_text(old_ref + "\n")
             log = root / "compat.log"
-            env = {**os.environ, "SC_COMPAT_TEST_LOG": str(log)}
+            env = {**os.environ, "SC_COMPAT_TEST_LOG": str(log), "HOME": str(home)}
+            for key in ("CODEX_HOME", "CLAUDE_CONFIG_DIR", "OPENCODE_CONFIG_DIR", "XDG_CONFIG_HOME", "IS_SANDBOX", "SC_SANDBOX"):
+                env.pop(key, None)
 
             completed = subprocess.run(
                 [sys.executable, str(scripts / "map_setup.py")],
@@ -311,6 +330,9 @@ class LegacyUpdateCompatTest(unittest.TestCase):
                 (state / "local" / "update-compat-v1.done").read_text(),
             )
             self.assertIn("legacy update bridge", completed.stdout)
+            self.assertEqual(target.read_bytes(), b"operator instructions")
+            self.assertEqual(backup.read_bytes(), b"operator instructions")
+            self.assertIn("restored backup", completed.stdout)
 
     def test_pending_target_ref_drives_compat_before_pin_publication(self) -> None:
         pending = "b" * 40

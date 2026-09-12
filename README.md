@@ -84,6 +84,25 @@ Follow the **[quick start](docs/quick-start.md)** for harness sign-in, the first
 Cartographer and Planner sessions, and your first reviewed PR. Use
 `subfloor admin` from the host checkout for maintenance.
 
+## Native agent sessions
+
+Native `claude`, `codex`, `opencode`, `kimi` and `vibe` commands from a normal
+terminal in an unrelated directory remain independent of Subfloor. Inside an
+installed repository, its subdirectories or shell worktrees, native sessions
+can still load Subfloor's local instructions, skills, hooks and MCP settings,
+and appear in repository analytics. Sharing a Git remote or application name
+with an installed repository does not enroll an unrelated checkout.
+
+For an older installation, update every Subfloor installation sharing your OS
+user, then run `./sc harness-cleanup --check`, `--apply`, and `--check` again
+from an updated checkout on the host. No running API or shell identity is
+needed. Cleanup removes only complete recognized legacy global pointers,
+restores unambiguous user backups and preserves edited files for operator
+review. Add repeated `--config-root codex=/absolute/legacy-home` options for
+known nondefault roots (also supports `claude` and `opencode`). Start a fresh
+native conversation afterward; existing conversation context is retained.
+Old releases can recreate pointers, including after rollback.
+
 ## Documentation
 
 | Start here | Purpose |

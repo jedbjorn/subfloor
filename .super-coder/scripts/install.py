@@ -493,7 +493,7 @@ def update_harnesses() -> dict[str, str]:
         ok = rc == 0
         _report_install(name, ok, rc, out, elapsed, done, cmd)
         status[name] = done if ok else "failed"
-    global_pointer.write_global_pointers()
+    global_pointer.reconcile()
     return status
 
 
@@ -527,7 +527,7 @@ def ensure_harnesses() -> dict[str, str]:
         dirs = sorted({str(HARNESS_BIN[n].parent) for n in fresh})
         print(f"  ↪ new CLIs live in {', '.join(dirs)} — open a NEW shell (or update "
               f"PATH) before `./sc launch`, since this shell's PATH predates them.")
-    global_pointer.write_global_pointers()
+    global_pointer.reconcile()
     return status
 
 
@@ -1048,7 +1048,7 @@ def main(argv: list[str]) -> int:
         print("  --skip-harness-install set — detecting only, not installing")
         for n in HARNESS_INSTALL:
             print(f"  {n:9} {'✓ present' if _harness_installed(n) else 'absent'}")
-        global_pointer.write_global_pointers()
+        global_pointer.reconcile()
     else:
         ensure_harnesses()
     harness = detect_harness() or "claude"  # claude preferred; both should be present

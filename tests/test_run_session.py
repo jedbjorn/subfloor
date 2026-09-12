@@ -620,7 +620,7 @@ class HeadlessSessionFailureTest(unittest.TestCase):
     def test_host_admin_refuses_sandbox_before_boot_artifacts_or_database(self) -> None:
         with mock.patch.dict(run.os.environ, {"SC_SANDBOX": "1"}, clear=True), \
                 mock.patch.object(run.sys, "argv", ["run.py", "--host-admin"]), \
-                mock.patch.object(run.global_pointer, "write_global_pointers") as pointers, \
+                mock.patch.object(run.global_pointer, "reconcile") as pointers, \
                 mock.patch.object(run, "open_db") as open_db, \
                 self.assertRaises(SystemExit) as raised:
             run.main()
@@ -643,7 +643,7 @@ class HeadlessSessionFailureTest(unittest.TestCase):
                     run.sys, "argv", ["run.py", "--host-admin", "--harness", "codex"]
                 ), \
                 mock.patch.object(
-                    run.global_pointer, "write_global_pointers"
+                    run.global_pointer, "reconcile"
                 ) as pointers, \
                 mock.patch.object(run, "open_db", return_value=con), \
                 mock.patch.object(run.seed_skills, "sync_engine_skills", return_value=[]), \
@@ -692,7 +692,7 @@ class HeadlessSessionFailureTest(unittest.TestCase):
                 mock.patch.object(
                     run.sys, "argv", ["run.py", "--host-admin", "--harness", "codex"]
                 ), \
-                mock.patch.object(run.global_pointer, "write_global_pointers"), \
+                mock.patch.object(run.global_pointer, "reconcile"), \
                 mock.patch.object(run, "open_db", return_value=con), \
                 mock.patch.object(run.seed_skills, "sync_engine_skills", return_value=[]), \
                 mock.patch.object(run, "authenticate", return_value={"user_id": 1}), \
@@ -738,7 +738,7 @@ class HeadlessSessionFailureTest(unittest.TestCase):
                         "--model", "deepseek-v4-flash:cloud",
                     ],
                 ), \
-                mock.patch.object(run.global_pointer, "write_global_pointers"), \
+                mock.patch.object(run.global_pointer, "reconcile"), \
                 mock.patch.object(run, "open_db", return_value=con), \
                 mock.patch.object(run.seed_skills, "sync_engine_skills", return_value=[]), \
                 mock.patch.object(run, "authenticate", return_value={"user_id": 1}), \
@@ -791,7 +791,7 @@ class HeadlessSessionFailureTest(unittest.TestCase):
                         "--model", "deepseek-v4-flash:cloud",
                     ],
                 ), \
-                mock.patch.object(run.global_pointer, "write_global_pointers"), \
+                mock.patch.object(run.global_pointer, "reconcile"), \
                 mock.patch.object(run, "open_db", return_value=con), \
                 mock.patch.object(run.seed_skills, "sync_engine_skills", return_value=[]), \
                 mock.patch.object(run, "authenticate", return_value={"user_id": 1}), \
@@ -830,7 +830,7 @@ class HeadlessSessionFailureTest(unittest.TestCase):
         with mock.patch.dict(run.os.environ, {}, clear=True), \
                 mock.patch.object(run.sys, "argv", ["run.py", "--host-admin", "DEV1"]), \
                 mock.patch.object(
-                    run.global_pointer, "write_global_pointers", pointers
+                    run.global_pointer, "reconcile", pointers
                 ), \
                 mock.patch.object(run, "open_db", return_value=con), \
                 mock.patch.object(run.seed_skills, "sync_engine_skills", return_value=[]), \
@@ -858,7 +858,7 @@ class HeadlessSessionFailureTest(unittest.TestCase):
         with mock.patch.dict(run.os.environ, {}, clear=True), \
                 mock.patch.object(run.sys, "argv", ["run.py", "--host-admin"]), \
                 mock.patch.object(
-                    run.global_pointer, "write_global_pointers"
+                    run.global_pointer, "reconcile"
                 ) as pointers, \
                 mock.patch.object(run, "open_db", side_effect=failure), \
                 self.assertRaises(SystemExit) as raised:

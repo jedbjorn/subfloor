@@ -8,7 +8,6 @@
     "sprint": true
   },
   "boot_artifact": "AGENTS.md",
-  "global_pointer": ".config/opencode/AGENTS.md",
   "emit": ["opencode.json"],
   "skill_dirs": [".claude/skills", ".opencode/skills"],
   "env": { "OPENCODE_DISABLE_CLAUDE_CODE": "1" },
