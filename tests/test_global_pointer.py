@@ -133,6 +133,17 @@ class CleanupTest(unittest.TestCase):
         self.assertIn(legacy / 'AGENTS.md', paths)
         self.assertFalse(legacy.exists())
 
+    def test_legacy_effective_codex_home_expansion(self):
+        for raw, root in (('~/custom', self.home / 'custom'),
+                          ('relative-config', self.home / 'relative-config')):
+            root.mkdir()
+            target = root / 'AGENTS.md'
+            target.write_bytes(self.pointer)
+            with mock.patch.object(cleanup.Path, 'cwd', return_value=self.home):
+                results = cleanup.reconcile(home=self.home, environ={'CODEX_HOME': raw}, report=False)
+            self.assertEqual(next(r.status for r in results if r.path == target), 'clean')
+            self.assertFalse(target.exists())
+
     def test_invalid_roots_are_truthful_and_do_not_touch_targets(self):
         self.target.write_bytes(self.pointer)
         for root in ('codex=relative', 'bogus=/tmp', f'codex={self.home}/../bad'):

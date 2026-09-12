@@ -164,6 +164,17 @@ def _config_root(value: str) -> tuple[str, Path]:
     return harness, Path(raw)
 
 
+def _effective_root(raw: str, home: str) -> str:
+    # Legacy CODEX_HOME accepted expanduser and cwd-relative paths. Resolve
+    # lexically only; _parent still refuses symlinks and '..' is unresolved.
+    if raw == "~" or raw.startswith("~/"):
+        return str(Path(home) / raw[2:]) if raw != "~" else home
+    path = Path(raw)
+    if raw.startswith("~"):
+        return raw  # another user's home requires an explicit absolute root
+    return str(path if path.is_absolute() else Path.cwd() / path)
+
+
 def reconcile(*, apply: bool = True, home: Path | None = None,
               environ: Mapping[str, str] | None = None,
               config_roots: tuple[str, ...] = (), report: bool = True) -> list[Result]:
@@ -198,9 +209,9 @@ def _reconcile(apply, home, env, config_roots) -> list[Result]:
         roots = list(config_roots)
         for harness, variable in (("claude", "CLAUDE_CONFIG_DIR"), ("codex", "CODEX_HOME"), ("opencode", "OPENCODE_CONFIG_DIR")):
             if env.get(variable):
-                roots.append(f"{harness}={env[variable]}")
+                roots.append(f"{harness}={_effective_root(env[variable], raw_home)}")
         if env.get("XDG_CONFIG_HOME"):
-            roots.append(f"opencode={env['XDG_CONFIG_HOME']}/opencode")
+            roots.append(f"opencode={_effective_root(env['XDG_CONFIG_HOME'], raw_home)}/opencode")
     except (OSError, ValueError, KeyError) as exc:
         return [Result(Path(raw_home), "unresolved", str(exc))]
     invalid = []
