@@ -67,6 +67,7 @@ import instance_state  # noqa: E402
 import opencode_config  # noqa: E402  — one locked owner for opencode.json
 import ports as ports_mod  # noqa: E402  — derive the per-fork API base URL
 import sandbox_devkit  # noqa: E402  — readiness receipt identity contract
+import sc_wrapper  # noqa: E402  — verified host command wrapper
 import seed_skills  # noqa: E402  — boot-time self-heal of stale engine skills
 import shell_liveness  # noqa: E402  — headless boot's one-shell-one-session guard
 import skill_projection  # noqa: E402  — exact bounded harness skill mirrors
@@ -1726,8 +1727,18 @@ def shell_git_ident_env(full: sqlite3.Row | dict) -> dict[str, str]:
 
 
 def _shell_path(work_dir: Path, inherited: str) -> str:
-    """Put a proven project environment ahead of baseline tools."""
-    entries = [str(REPO_ROOT)]
+    """Put the managed checkout-selecting command ahead of project tools."""
+    entries = []
+    if not os.environ.get("SC_SANDBOX"):
+        try:
+            wrapper = sc_wrapper.wrapper_path()
+            if (
+                wrapper.read_bytes() == sc_wrapper.WRAPPER_BYTES
+                and os.access(wrapper, os.X_OK)
+            ):
+                entries.append(str(wrapper.parent))
+        except OSError:
+            pass
     eligibility = _probe_worktree_venv(work_dir)
     if eligibility.bin_dir is not None:
         entries.append(str(eligibility.bin_dir))
@@ -1738,8 +1749,12 @@ def _shell_path(work_dir: Path, inherited: str) -> str:
             "rebuild its fork-owned environment.",
             file=sys.stderr,
         )
-    if inherited:
-        entries.append(inherited)
+    # The live checkout's tracked launcher would shadow the managed wrapper
+    # and target main from every linked worktree. It is never a PATH fallback.
+    entries.extend(
+        part for part in inherited.split(os.pathsep)
+        if part and part != str(REPO_ROOT)
+    )
     return os.pathsep.join(entries)
 
 
