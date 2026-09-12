@@ -1737,7 +1737,7 @@ def _shell_path(work_dir: Path, inherited: str) -> str:
                 and os.access(wrapper, os.X_OK)
             ):
                 entries.append(str(wrapper.parent))
-        except OSError:
+        except (OSError, sc_wrapper.WrapperError):
             pass
     eligibility = _probe_worktree_venv(work_dir)
     if eligibility.bin_dir is not None:

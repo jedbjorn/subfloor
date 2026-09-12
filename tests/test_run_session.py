@@ -413,6 +413,16 @@ class ShellPathTest(unittest.TestCase):
             run._shell_path(self.worktree, f"{self.root}:/usr/bin"), "/usr/bin"
         )
 
+    def test_unset_home_does_not_abort_launch_path(self) -> None:
+        with mock.patch.object(
+            run.sc_wrapper, "wrapper_path",
+            side_effect=run.sc_wrapper.WrapperError("HOME is unset"),
+        ):
+            self.assertEqual(
+                run._shell_path(self.worktree, f"{self.root}:/usr/bin"),
+                "/usr/bin",
+            )
+
     def test_docker_keeps_inherited_wrapper_without_host_path(self) -> None:
         with mock.patch.dict(os.environ, {"SC_SANDBOX": "1"}):
             self.assertEqual(
