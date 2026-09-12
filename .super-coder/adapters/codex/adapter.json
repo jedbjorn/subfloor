@@ -1,6 +1,8 @@
 {
   "harness": "codex",
   "launch": ["codex", "--dangerously-bypass-hook-trust"],
+  "launch_flags": ["--sandbox", "danger-full-access", "--ask-for-approval", "never"],
+  "headless_flags": ["--sandbox", "danger-full-access"],
   "surfaces": {
     "terminal": true,
     "one_shot": true,
@@ -42,9 +44,6 @@
     "launch": ["codex", "exec"],
     "model_flag": "-m",
     "effort": { "config_flag": "-c", "config_key": "model_reasoning_effort" }
-  },
-  "host_admin": {
-    "launch_flags": ["--sandbox", "danger-full-access", "--ask-for-approval", "never"]
   },
   "conversation": {
     "contract_version": 1,
