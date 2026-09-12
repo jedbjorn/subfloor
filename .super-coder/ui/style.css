@@ -518,14 +518,21 @@ body.interface-view main {
   background: var(--panel2); border: 1px solid var(--line); border-radius: 6px;
   font: 12px/1.55 ui-monospace, monospace;
 }
-.chat-source-line { display: flex; min-width: max-content; }
+.chat-source-line { display: flex; }
 .chat-source-line.selected { background: rgba(110,168,254,.18); }
 .chat-source-number {
   position: sticky; left: 0; flex: none; width: 4.5rem; padding-right: .8rem;
   color: var(--dim); background: var(--panel2); text-align: right; user-select: none;
 }
 .chat-source-line.selected .chat-source-number { background: #263246; color: var(--accent); }
-.chat-source-code { padding: 0 1rem; white-space: pre; color: rgba(255,255,255,.82); }
+.chat-source-code {
+  flex: 1; min-width: 0; padding: 0 1rem; white-space: pre-wrap;
+  overflow-wrap: anywhere; color: rgba(255,255,255,.82);
+}
+.chat-source-markdown { padding: .8rem 1rem; font-family: inherit; }
+.chat-source-markdown .md { overflow-wrap: anywhere; }
+.chat-source-markdown .md table { display: table; table-layout: fixed; }
+.chat-source-markdown .md table th, .chat-source-markdown .md table td { white-space: normal; }
 .chat-meta { color: var(--dim); font-size: .64rem; margin-top: .35rem; }
 .chat-context-tokens {
   color: var(--dim); font-size: .64rem; margin-top: .35rem; text-align: right;

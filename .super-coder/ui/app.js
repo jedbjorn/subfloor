@@ -3505,16 +3505,21 @@ async function openChatSourceModal(conversation, target) {
     );
     const viewer = el("div", { className: "chat-source-viewer" });
     let selected = null;
-    source.content.split("\n").forEach((text, index) => {
-      const number = index + 1;
-      const row = el("div", {
-        className: "chat-source-line" + (number === target.line ? " selected" : ""),
-      },
-      el("span", { className: "chat-source-number" }, String(number)),
-      el("code", { className: "chat-source-code" }, text));
-      if (number === target.line) selected = row;
-      viewer.append(row);
-    });
+    if (/\.(md|markdown)$/i.test(source.relative_path)) {
+      viewer.classList.add("chat-source-markdown");
+      viewer.append(mdBlock(source.content));
+    } else {
+      source.content.split("\n").forEach((text, index) => {
+        const number = index + 1;
+        const row = el("div", {
+          className: "chat-source-line" + (number === target.line ? " selected" : ""),
+        },
+        el("span", { className: "chat-source-number" }, String(number)),
+        el("code", { className: "chat-source-code" }, text));
+        if (number === target.line) selected = row;
+        viewer.append(row);
+      });
+    }
     const closeButton = el("button", {
       className: "act", type: "button", textContent: "Close",
     });
