@@ -33,7 +33,6 @@ from pathlib import Path
 ENGINE = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ENGINE / "scripts"))
 import db_driver  # noqa: E402
-import install as install_mod  # noqa: E402
 import instance_state  # noqa: E402
 
 DB_PATH = instance_state.active_database_path(ENGINE)
@@ -91,11 +90,6 @@ def main(argv: list[str]) -> int:
         if already_seeded(con):
             sys.exit("init_fork: a shell already exists — this fork is already "
                      "initialised. Add more shells via the GUI.")
-
-        # Standalone init_fork runs get the same fork-facing files as the full
-        # installer. The helper is idempotent and guards the source repository.
-        for path in install_mod.seed_visual_qa_files():
-            print(f"init_fork: created {path}")
 
         repo = ENGINE.parent.name
         interactive = sys.stdin.isatty()

@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """Capture advisory viewport screenshots for fork applications.
 
+Subfloor ships no default CI workflow for this; a fork that wants Visual QA in
+CI writes its own workflow around ``./sc visual-qa ci``.
+
 The engine deliberately has no Playwright dependency. ``ci`` installs the
 pinned package and Chromium into the ephemeral workflow environment; ``run``
 expects the local dev kit to provide them. Everything outside the capture

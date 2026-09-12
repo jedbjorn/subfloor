@@ -49,10 +49,8 @@ ENGINE_REMOTE = "super-coder"
 MIN_GITHUB_REMAINING = 100
 MIN_FREE_BYTES = 2 * 1024 * 1024 * 1024
 FORK_PREPARATION_PATHS = {
-    ".github/workflows/subfloor-visual-qa.yml",
     ".gitignore",
     ".sc-state/engine.ref",
-    ".sc-state/visual-qa.example.json",
     "Makefile",
     "sc",
 }
