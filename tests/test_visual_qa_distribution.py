@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
-"""Hermetic tests for Visual QA's fork distribution surfaces."""
+"""Hermetic tests for Visual QA's fork distribution surfaces.
+
+Subfloor no longer ships a default Visual QA CI lane. Install and init seed
+nothing; update retires the managed shim that earlier engines seeded and
+leaves a fork-owned workflow alone.
+"""
 from __future__ import annotations
 
-import json
-import sqlite3
 import sys
 import tempfile
 import unittest
@@ -12,269 +15,74 @@ from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 ENGINE = ROOT / ".super-coder"
-TEMPLATES = ENGINE / "templates" / "fork"
 sys.path.insert(0, str(ENGINE / "scripts"))
 
 import engine_manifest  # noqa: E402
-import init_fork  # noqa: E402
 import install  # noqa: E402
 import update  # noqa: E402
 
-
-class VisualQaTemplateTest(unittest.TestCase):
-    def test_workflow_is_the_fixed_managed_shim(self):
-        text = (TEMPLATES / "subfloor-visual-qa.yml").read_text()
-
-        self.assertTrue(
-            text.startswith("# managed-by: subfloor — visual-qa shim v4\n")
-        )
-        self.assertIn("pull_request:\n", text)
-        self.assertIn("workflow_dispatch:\n", text)
-        self.assertIn("contents: read\n", text)
-        self.assertIn("pull-requests: write\n", text)
-        self.assertEqual(text.count('python-version: "3.14"'), 1)
-        self.assertNotIn('python-version: "3.12"', text)
-        self.assertIn("group: subfloor-visual-qa-${{ github.ref }}", text)
-        self.assertIn("test -s .sc-state/engine.ref", text)
-        self.assertIn('checkout "$engine_ref" -- .super-coder', text)
-        self.assertIn("hashFiles('.super-coder/scripts/visual_qa.py')", text)
-        self.assertNotIn("playwright==", text)
-        self.assertIn("GITHUB_TOKEN: ${{ github.token }}", text)
-        self.assertIn("if: always()\n        uses: actions/upload-artifact@v4", text)
-        self.assertIn("id: visual_qa\n        run: ./sc visual-qa ci", text)
-        self.assertIn("path: ${{ steps.visual_qa.outputs.output || 'gallery' }}/", text)
-
-    def test_example_config_is_valid_and_inactive(self):
-        config = json.loads((TEMPLATES / "visual-qa.example.json").read_text())
-        self.assertEqual(
-            config,
-            {
-                "cwd": ".",
-                "setup": ["npm ci", "npm run build"],
-                "serve": "npm run preview -- --port {port} --host 127.0.0.1",
-                "port": 4173,
-                "ready_path": "/",
-                "ready_timeout_s": 120,
-                "settle_ms": 500,
-                "routes": ["/", "/dashboard"],
-                "viewports": "default",
-                "paths": ["src/**", "static/**", "package.json"],
-                "services": [],
-                "output": "gallery",
-                "artifact_retention_days": 14,
-            },
-        )
-
-    def test_manifest_names_and_covers_both_fork_templates(self):
-        expected = (
-            ".super-coder/templates/fork/subfloor-visual-qa.yml",
-            ".super-coder/templates/fork/visual-qa.example.json",
-        )
-        self.assertEqual(engine_manifest.FORK_TEMPLATE_PATHS, expected)
-        for relative in expected:
-            self.assertTrue((ROOT / relative).is_file(), relative)
-            self.assertTrue(
-                any(relative == entry or relative.startswith(entry.rstrip("/") + "/")
-                    for entry in engine_manifest.ENGINE_PATHS),
-                f"{relative} is not covered by ENGINE_PATHS",
-            )
+WORKFLOW = Path(".github/workflows/subfloor-visual-qa.yml")
+MANAGED = "# managed-by: subfloor — visual-qa shim v4\nname: Subfloor Visual QA\n"
 
 
-class VisualQaSeedTest(unittest.TestCase):
+class VisualQaNoDefaultCiTest(unittest.TestCase):
+    def test_engine_ships_no_fork_workflow_templates(self):
+        fork_templates = ENGINE / "templates" / "fork"
+        self.assertFalse(fork_templates.exists(), sorted(fork_templates.glob("*")))
+        self.assertFalse(hasattr(engine_manifest, "FORK_TEMPLATE_PATHS"))
+        self.assertFalse(hasattr(install, "seed_visual_qa_files"))
+        self.assertFalse(hasattr(install, "VISUAL_QA_TEMPLATE_TARGETS"))
+
+    def test_install_source_never_mentions_the_shim(self):
+        for name in ("install.py", "init_fork.py"):
+            text = (ENGINE / "scripts" / name).read_text()
+            self.assertNotIn("subfloor-visual-qa", text, name)
+            self.assertNotIn("visual-qa.example", text, name)
+
+
+class VisualQaUpdateRetirementTest(unittest.TestCase):
     def setUp(self):
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
         self.repo = Path(temporary.name)
-
-    def test_seed_writes_exact_inactive_surfaces_and_preserves_them(self):
-        expected = [
-            Path(".github/workflows/subfloor-visual-qa.yml"),
-            Path(".sc-state/visual-qa.example.json"),
-        ]
-        written = install.seed_visual_qa_files(
-            self.repo, TEMPLATES, source_repo=False
-        )
-        self.assertEqual(written, expected)
-        self.assertEqual(
-            (self.repo / expected[0]).read_text(),
-            (TEMPLATES / "subfloor-visual-qa.yml").read_text(),
-        )
-        self.assertEqual(
-            (self.repo / expected[1]).read_text(),
-            (TEMPLATES / "visual-qa.example.json").read_text(),
-        )
-        self.assertFalse((self.repo / ".sc-state/visual-qa.json").exists())
-
-        (self.repo / expected[0]).write_text("fork-owned workflow\n")
-        self.assertEqual(
-            install.seed_visual_qa_files(self.repo, TEMPLATES, source_repo=False),
-            [],
-        )
-        self.assertEqual((self.repo / expected[0]).read_text(), "fork-owned workflow\n")
-        self.assertEqual(
-            (self.repo / expected[1]).read_text(),
-            (TEMPLATES / "visual-qa.example.json").read_text(),
-        )
-
-    def test_source_repo_guard_writes_nothing(self):
-        with mock.patch.object(install, "is_source_repo", return_value=True):
-            self.assertEqual(install.seed_visual_qa_files(self.repo, TEMPLATES), [])
-        self.assertFalse((self.repo / ".github").exists())
-        self.assertFalse((self.repo / ".sc-state").exists())
-
-    def test_init_fork_calls_the_shared_seed_path_for_a_fresh_database(self):
-        database = self.repo / "shell.db"
-        with sqlite3.connect(database) as con:
-            con.executescript(
-                "CREATE TABLE users(user_id INTEGER PRIMARY KEY, username TEXT, is_active INTEGER);"
-                "CREATE TABLE shells(shell_id INTEGER PRIMARY KEY, shortname TEXT, "
-                "flavor TEXT, is_deleted INTEGER DEFAULT 0);"
-                "CREATE TABLE shell_skills(shell_id INTEGER, skill_id INTEGER);"
-                "CREATE TABLE flavor_skills(flavor TEXT, skill_id INTEGER);"
-                "CREATE VIEW resolved_shell_skills AS "
-                "SELECT sh.shell_id, fs.skill_id FROM shells sh "
-                "JOIN flavor_skills fs ON fs.flavor=sh.flavor "
-                "WHERE sh.flavor IS NOT NULL "
-                "UNION ALL "
-                "SELECT ss.shell_id, ss.skill_id FROM shell_skills ss "
-                "JOIN shells sh ON sh.shell_id=ss.shell_id "
-                "WHERE sh.flavor IS NULL;"
-            )
-
-        next_shell_id = iter(range(1, 11))
-        identity_flags = []
-
-        def create_shell(con, *, flavor, **kwargs):
-            identity_flags.append(kwargs.get("seed_identity", False))
-            shell_id = next(next_shell_id)
-            con.execute(
-                "INSERT INTO shells(shell_id, shortname, flavor, is_deleted) "
-                "VALUES (?, ?, ?, 0)",
-                (shell_id, f"{flavor[:3].upper()}{shell_id}", flavor),
-            )
-            return shell_id
-
-        seeded = [Path(".github/workflows/subfloor-visual-qa.yml")]
-        with (
-            mock.patch.object(init_fork, "DB_PATH", database),
-            mock.patch.object(init_fork.install_mod, "seed_visual_qa_files", return_value=seeded) as seed,
-            mock.patch.object(init_fork, "create_shell", side_effect=create_shell),
-            mock.patch.object(
-                init_fork,
-                "flavors",
-                return_value=[{"flavor": name} for name in
-                              ("admin", "planner", "dev", "reviewer",
-                               "cartographer")],
-            ),
-        ):
-            self.assertEqual(init_fork.main(["--username", "Jed"]), 0)
-
-        seed.assert_called_once_with()
-        with sqlite3.connect(database) as con:
-            self.assertEqual(con.execute("SELECT username FROM users").fetchall(), [("Jed",)])
-            flavors = con.execute(
-                "SELECT flavor FROM shells ORDER BY shell_id"
-            ).fetchall()
-            self.assertEqual(
-                flavors,
-                [
-                    ("planner",),
-                    ("admin",),
-                    ("planner",),
-                    ("dev",),
-                    ("dev",),
-                    ("dev",),
-                    ("dev",),
-                    ("reviewer",),
-                    ("reviewer",),
-                    ("cartographer",),
-                ],
-            )
-            self.assertNotIn(("devops",), flavors)
-            self.assertNotIn(("conductor",), flavors)
-        self.assertEqual(identity_flags, [True] + [False] * 9)
-
-
-class VisualQaUpdateTest(unittest.TestCase):
-    def setUp(self):
-        temporary = tempfile.TemporaryDirectory()
-        self.addCleanup(temporary.cleanup)
-        self.repo = Path(temporary.name)
-        self.workflow = self.repo / ".github/workflows/subfloor-visual-qa.yml"
-        self.example = self.repo / ".sc-state/visual-qa.example.json"
+        self.workflow = self.repo / WORKFLOW
 
     def reconcile(self):
-        return update.ensure_workflows(self.repo, TEMPLATES, source_repo=False)
+        return update.ensure_workflows(self.repo, source_repo=False)
 
-    def test_absent_files_are_seeded_and_rerun_converges(self):
-        action, changed = self.reconcile()
-        self.assertEqual(action, "seeded")
-        self.assertEqual(
-            changed,
-            [Path(".github/workflows/subfloor-visual-qa.yml"),
-             Path(".sc-state/visual-qa.example.json")],
-        )
-        self.assertEqual(
-            self.workflow.read_text(),
-            (TEMPLATES / "subfloor-visual-qa.yml").read_text(),
-        )
-        self.assertEqual(
-            self.example.read_text(),
-            (TEMPLATES / "visual-qa.example.json").read_text(),
-        )
-        self.assertFalse((self.repo / ".sc-state/visual-qa.json").exists())
-
-        self.assertEqual(self.reconcile(), ("current", []))
-
-    def test_older_managed_workflow_is_refreshed_but_example_is_preserved(self):
+    def test_managed_shim_is_retired_and_rerun_converges(self):
         self.workflow.parent.mkdir(parents=True)
-        self.workflow.write_text("# managed-by: subfloor — visual-qa shim v3\nold\n")
-        self.example.parent.mkdir(parents=True)
-        self.example.write_text("fork note\n")
+        self.workflow.write_text(MANAGED)
 
-        action, changed = self.reconcile()
-        self.assertEqual(action, "updated")
-        self.assertEqual(changed, [Path(".github/workflows/subfloor-visual-qa.yml")])
-        self.assertEqual(
-            self.workflow.read_text(),
-            (TEMPLATES / "subfloor-visual-qa.yml").read_text(),
-        )
-        self.assertEqual(self.example.read_text(), "fork note\n")
+        self.assertEqual(self.reconcile(), ("retired", [WORKFLOW]))
+        self.assertFalse(self.workflow.exists())
+        self.assertEqual(self.reconcile(), ("absent", []))
 
-    def test_unmanaged_workflow_is_preserved_while_missing_example_is_seeded(self):
+    def test_older_managed_versions_are_retired_too(self):
+        self.workflow.parent.mkdir(parents=True)
+        self.workflow.write_text("# managed-by: subfloor — visual-qa shim v1\nold\n")
+
+        self.assertEqual(self.reconcile(), ("retired", [WORKFLOW]))
+        self.assertFalse(self.workflow.exists())
+
+    def test_fork_owned_workflow_is_preserved(self):
         self.workflow.parent.mkdir(parents=True)
         self.workflow.write_text("name: Fork-owned Visual QA\n")
 
-        action, changed = self.reconcile()
-        self.assertEqual(action, "unmanaged")
-        self.assertEqual(changed, [Path(".sc-state/visual-qa.example.json")])
+        self.assertEqual(self.reconcile(), ("unmanaged", []))
         self.assertEqual(self.workflow.read_text(), "name: Fork-owned Visual QA\n")
-        self.assertEqual(
-            self.example.read_text(),
-            (TEMPLATES / "visual-qa.example.json").read_text(),
-        )
 
-    def test_same_or_newer_managed_version_is_not_rewritten(self):
-        self.workflow.parent.mkdir(parents=True)
-        self.workflow.write_text("# managed-by: subfloor — visual-qa shim v4\nfuture\n")
-        self.example.parent.mkdir(parents=True)
-        self.example.write_text("existing\n")
-
-        self.assertEqual(self.reconcile(), ("current", []))
-        self.assertEqual(
-            self.workflow.read_text(),
-            "# managed-by: subfloor — visual-qa shim v4\nfuture\n",
-        )
-        self.assertEqual(self.example.read_text(), "existing\n")
+    def test_absent_workflow_is_never_seeded(self):
+        self.assertEqual(self.reconcile(), ("absent", []))
+        self.assertFalse((self.repo / ".github").exists())
+        self.assertFalse((self.repo / ".sc-state").exists())
 
     def test_source_repo_rule_is_a_total_no_op(self):
+        self.workflow.parent.mkdir(parents=True)
+        self.workflow.write_text(MANAGED)
         with mock.patch.object(update, "is_source_repo", return_value=True):
-            self.assertEqual(
-                update.ensure_workflows(self.repo, TEMPLATES),
-                ("source", []),
-            )
-        self.assertFalse(self.workflow.exists())
-        self.assertFalse(self.example.exists())
+            self.assertEqual(update.ensure_workflows(self.repo), ("source", []))
+        self.assertEqual(self.workflow.read_text(), MANAGED)
 
 
 if __name__ == "__main__":

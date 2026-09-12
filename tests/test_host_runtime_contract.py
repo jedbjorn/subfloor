@@ -548,10 +548,7 @@ class OptionalTomlTest(unittest.TestCase):
 
 class Python314SourceContractTest(unittest.TestCase):
     def test_every_maintained_setup_python_selector_is_exact(self) -> None:
-        workflow_roots = (
-            ROOT / ".github" / "workflows",
-            ENGINE / "templates" / "fork",
-        )
+        workflow_roots = (ROOT / ".github" / "workflows",)
         selectors: dict[str, list[str]] = {}
         for workflow_root in workflow_roots:
             for path in workflow_root.glob("*.yml"):
@@ -568,7 +565,6 @@ class Python314SourceContractTest(unittest.TestCase):
                 ".github/workflows/render-check.yml": ["3.14"],
                 ".github/workflows/tests.yml": ["3.14", "3.14", "3.14", "3.14"],
                 ".github/workflows/trusted-main.yml": ["3.14"],
-                ".super-coder/templates/fork/subfloor-visual-qa.yml": ["3.14"],
             },
         )
 

@@ -135,9 +135,13 @@ def render_update_report(*, only_if_any: bool = False) -> int:
         print(f"     follow-up: {action}")
     return len(_UPDATE_ADVISORIES)
 
+# Subfloor used to seed a managed Visual QA workflow into every fork. It no
+# longer ships a default CI lane; a fork that wants one builds its own. The
+# marker still identifies copies we seeded so update can retire them.
 _VISUAL_QA_MARKER_RE = re.compile(
     r"^# managed-by: subfloor — visual-qa shim v(?P<version>\d+)$"
 )
+VISUAL_QA_WORKFLOW = Path(".github/workflows/subfloor-visual-qa.yml")
 
 
 def git(
@@ -305,65 +309,33 @@ def is_source_repo() -> bool:
                           in install_mod.SOURCE_REPO_NAMES)
 
 
-def _workflow_version(text: str) -> int | None:
+def _is_managed_workflow(text: str) -> bool:
     first_line = text.splitlines()[0] if text else ""
-    match = _VISUAL_QA_MARKER_RE.fullmatch(first_line)
-    return int(match.group("version")) if match else None
+    return _VISUAL_QA_MARKER_RE.fullmatch(first_line) is not None
 
 
 def ensure_workflows(
     repo_root: Path = REPO_ROOT,
-    template_root: Path | None = None,
     *,
     source_repo: bool | None = None,
 ) -> tuple[str, list[Path]]:
-    """Reconcile the fork-tracked Visual QA shim and example config.
+    """Retire the Visual QA workflow shim that earlier engines seeded.
 
-    Returns ``(action, changed_paths)`` where action is one of ``source``,
-    ``seeded``, ``updated``, ``unmanaged``, or ``current``.
+    Only a copy carrying the managed marker is removed; a fork-owned workflow
+    (marker deleted) is left alone. Returns ``(action, changed_paths)`` where
+    action is one of ``source``, ``retired``, ``unmanaged``, or ``absent``.
     """
     source = source_repo if source_repo is not None else is_source_repo()
     if source:
         return "source", []
 
-    templates = template_root or ENGINE / "templates" / "fork"
-    workflow_template = templates / "subfloor-visual-qa.yml"
-    current = workflow_template.read_text()
-    current_version = _workflow_version(current)
-    if current_version is None:
-        raise ValueError(f"Visual QA workflow template has no managed marker: {workflow_template}")
-
-    changed: list[Path] = []
-    workflow_relative = install_mod.VISUAL_QA_TEMPLATE_TARGETS[
-        "subfloor-visual-qa.yml"
-    ]
-    workflow = repo_root / workflow_relative
+    workflow = repo_root / VISUAL_QA_WORKFLOW
     if not workflow.exists():
-        workflow.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(workflow_template, workflow)
-        changed.append(workflow_relative)
-        action = "seeded"
-    else:
-        installed_version = _workflow_version(workflow.read_text())
-        if installed_version is None:
-            action = "unmanaged"
-        elif installed_version < current_version:
-            shutil.copy2(workflow_template, workflow)
-            changed.append(workflow_relative)
-            action = "updated"
-        else:
-            action = "current"
-
-    example_relative = install_mod.VISUAL_QA_TEMPLATE_TARGETS[
-        "visual-qa.example.json"
-    ]
-    example = repo_root / example_relative
-    if not example.exists():
-        example.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(templates / "visual-qa.example.json", example)
-        changed.append(example_relative)
-
-    return action, changed
+        return "absent", []
+    if not _is_managed_workflow(workflow.read_text()):
+        return "unmanaged", []
+    workflow.unlink()
+    return "retired", [VISUAL_QA_WORKFLOW]
 
 
 def super_coder_remote() -> str:
@@ -1945,15 +1917,14 @@ def main(argv: list[str]) -> int:
         reload_materialized_seed_skills()
 
     workflow_action, workflow_changes = ensure_workflows(source_repo=source)
-    if workflow_action == "seeded":
-        print("→ visual QA: seeded the managed workflow shim")
-    elif workflow_action == "updated":
-        print("→ visual QA: refreshed the managed workflow shim")
+    if workflow_action == "retired":
+        print("→ visual QA: retired the managed workflow shim — Subfloor no longer "
+              "ships a default Visual QA CI lane; build your own if you want one")
     elif workflow_action == "unmanaged":
         print("→ visual QA: workflow has no managed marker — leaving fork-owned file unchanged")
     if workflow_changes:
         paths = " ".join(str(path) for path in workflow_changes)
-        print(f"  commit these fork-owned files: git add {paths}")
+        print(f"  commit the removal: git add {paths}")
 
     # Harnesses can be ADDED upstream between releases (e.g. codex landed after
     # dos-arch installed), so a fork that updates must pick up any newly-required

@@ -25,7 +25,7 @@ freshness.
 | Skill ownership | `.super-coder/scripts/skill.py`, API lane; decision #313 | Planner owns fork-local skill operations; Admin owns engine maintenance. |
 | CLI inventory | `.super-coder/scripts/dispatch.sh`; `sc help --all`; decision #326 | Prose is a workflow route map. Exact flags remain in command help. Validate commands without executing destructive verbs. |
 | Effort and reopened chats | `.super-coder/ui/app.js`, `thinkingLevelLabel`, supported-effort selection, `reopenable`, `conversation.reopened` | Explain supported route-specific effort choices and sending a message to reopen eligible closed chats; Sprint-scoped chats are excluded. |
-| Browser capture | `.super-coder/scripts/visual_qa.py`; `.super-coder/templates/fork/visual-qa.example.json` | Existing Playwright capture surface; local dev kit supplies Playwright and Chromium. Engine does not depend on Playwright. |
+| Browser capture | `.super-coder/scripts/visual_qa.py` | Existing Playwright capture surface; local dev kit supplies Playwright and Chromium. Engine does not depend on Playwright. |
 | Terminal capture | `docs/demo.tape` | VHS recipe needs current operator command, roster, picker and a real authenticated boot. Existing tape is not current acceptance evidence. |
 
 Feature #28 package-manager distribution stays excluded, as Spec #219 requires.
