@@ -26,9 +26,23 @@ MANAGED = "# managed-by: subfloor — visual-qa shim v4\nname: Subfloor Visual Q
 
 
 class VisualQaNoDefaultCiTest(unittest.TestCase):
-    def test_engine_ships_no_fork_workflow_templates(self):
+    def test_only_inert_old_updater_inputs_remain(self):
         fork_templates = ENGINE / "templates" / "fork"
-        self.assertFalse(fork_templates.exists(), sorted(fork_templates.glob("*")))
+        self.assertEqual(
+            {"subfloor-visual-qa.yml", "visual-qa.example.json"},
+            {path.name for path in fork_templates.iterdir()},
+        )
+        workflow = (fork_templates / "subfloor-visual-qa.yml").read_text()
+        self.assertEqual(
+            "# managed-by: subfloor — visual-qa shim v4\n"
+            "# Compatibility input for updater versions installed before workflow retirement.\n"
+            "# The target update bridge removes any managed copy before the update completes.\n"
+            "name: Retired Subfloor Visual QA compatibility shim\n"
+            "on: {}\n"
+            "jobs: {}\n",
+            workflow,
+        )
+        self.assertEqual("{}\n", (fork_templates / "visual-qa.example.json").read_text())
         self.assertFalse(hasattr(engine_manifest, "FORK_TEMPLATE_PATHS"))
         self.assertFalse(hasattr(install, "seed_visual_qa_files"))
         self.assertFalse(hasattr(install, "VISUAL_QA_TEMPLATE_TARGETS"))
