@@ -25,7 +25,7 @@ billing are provider-owned; they are not part of the adapter contract.
 | `env` | extra env merged into the launch environment |
 | `model` | `{ "flag": "--model" }` — run.py appends `--model <id>` for the flavor's codex model |
 | `headless.effort` | maps requested effort to `-c model_reasoning_effort="<level>"` |
-| `host_admin.launch_flags` | grants the direct-host Admin the unrestricted filesystem policy its maintenance mandate requires |
+| `launch_flags` / `headless_flags` | always-on argv appended to the interactive / headless launch — `--sandbox danger-full-access` (plus `--ask-for-approval never` interactively; `codex exec` has no approval flag and never prompts) |
 | `sandbox.launch_flags` | flags appended ONLY inside the docker sandbox (`SC_SANDBOX`) |
 
 ## Branch-guard hook
@@ -58,18 +58,53 @@ the cwd-branch check.
    the edit proceeds. So **in-sandbox, codex's edit-time branch-guard cannot block**;
    the git **pre-commit backstop** is the real guard there (it blocks
    protected-branch *commits* regardless of harness flags). On the no-docker host
-   path (`./sc boot`), the flag is absent, approvals are normal, and the exit-2 deny
-   IS honored — so the host edit-time guard blocks.
+   path (`./sc boot`), that flag is absent — the host set is `--sandbox
+   danger-full-access --ask-for-approval never`, which elevates the *sandbox
+   policy* without taking the bypass branch — and the exit-2 deny IS honored, so
+   the host edit-time guard blocks. Never swap the host set for the YOLO flag as
+   a shortcut; it is the bypass branch that loses the guard, not the policy.
 
 **Host setup (one-time):** the binary is baked into the sandbox image, but auth is
 mounted from the host — so `codex` must be installed + logged in on the host once:
 `curl -fsSL https://chatgpt.com/codex/install.sh | sh` then `codex` and sign in
 with ChatGPT. That writes `~/.codex/auth.json`, which `./sc launch` mounts in.
 
-The direct-host Admin launch adds `--sandbox danger-full-access` and
-`--ask-for-approval never`. This is scoped to `subfloor admin`: ordinary host
-shells retain Codex's default filesystem sandbox, while the Admin can update the
-owner-private engine state required by its maintenance mandate.
+## Permission stance
+
+Every launched shell runs with `--sandbox danger-full-access` (interactive
+launches add `--ask-for-approval never`), on the host as well as in the
+sandbox — the same policy the browser-chat lane has always sent through the
+app-server (`approvalPolicy=never`, `sandbox=danger-full-access`). It is an
+always-on launch flag rather than an Admin-only grant because:
+
+1. **Subfloor's host seat already grants host authority.** The rendered
+   EXECUTION CONTEXT tells every host shell that "the host toolchain, network,
+   creds, services, and files available to your user are in reach". Codex was
+   the only harness whose terminal launch contradicted that — Claude shells
+   have carried `--dangerously-skip-permissions` on the host since the
+   permission stance was set.
+2. **Codex's own Linux sandbox is not a portable safety boundary.** Since
+   codex-cli started shelling out to a bundled **bubblewrap** for
+   `read-only`/`workspace-write`, a host that denies unprivileged mount
+   propagation changes fails every single command before it starts:
+
+   ```
+   $ codex exec -s workspace-write 'run pwd'
+   bwrap: Failed to make / slave: Operation not permitted
+   ```
+
+   That is not a degraded seat, it is a dead one: `pwd` fails, so the shell can
+   read no file, run no `sc` command, and load no skill — and the subagents it
+   spawns inherit the same dead policy, which reads from inside the session as
+   "agents are broken". Verified on CachyOS (kernel 7.2.2) with codex-cli
+   0.153.4: `-s workspace-write` fails as above, `-s danger-full-access`
+   succeeds.
+
+The safety boundary is unchanged and is the same one every other harness
+relies on: the branch-guard `PreToolUse` hook at edit time on the host path,
+and the git **pre-commit** hook, which refuses protected-branch commits
+regardless of harness flags. Outside the container, elevating the sandbox
+policy does not elevate a shell past either guard.
 
 ## Conversation capability
 
