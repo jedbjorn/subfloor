@@ -246,7 +246,7 @@ class CleanupTest(unittest.TestCase):
         assets = scripts.parent / 'assets'
         assets.mkdir()
         shutil.copy2(ROOT / 'sc', checkout / 'sc')
-        for name in ('dispatch.sh', 'global_pointer.py'):
+        for name in ('dispatch.sh', 'global_pointer.py', 'cli_entry.py'):
             shutil.copy2(ROOT / '.super-coder/scripts' / name, scripts / name)
         shutil.copy2(cleanup.CATALOGUE, assets / cleanup.CATALOGUE.name)
         self.target.write_bytes(self.pointer)

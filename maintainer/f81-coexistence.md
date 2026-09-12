@@ -90,7 +90,11 @@ The initial affected regression run passed 307 tests and 163 subtests, with one
 failure: `test_recovery_view_masks_private_state_and_parent_root_alias` reports
 `restricted_shell_view_unavailable`. The same test fails on a disposable archive
 of unchanged origin/main `ec81eea5`, so the required execution-view proof needs
-CI/a qualified seat. The guard was not relaxed. Cleanup lint and type checking
+CI/a qualified seat. The first full CI run passed that execution-view test,
+plus Docker lifecycle, boot verification, host-contract and render checks. Its
+four failures identified missing manifest/CLI integration and dispatcher
+registration expectations; those are corrected in the follow-up commit. The
+guard was not relaxed. Cleanup lint and type checking
 pass. The subsequent lifecycle/MCP/config run passed 112 tests and 38 subtests;
 two branch-guard checks were invalidated by placing the disposable HOME under
 /tmp, which is deliberately guard-exempt. Re-running the branch-guard module
