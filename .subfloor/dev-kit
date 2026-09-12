@@ -126,7 +126,11 @@ PY
       exit 126
     }
     if [ "$#" -eq 0 ]; then set -- .; fi
-    exec "$tool" "$@"
+    # The engine keeps flat import roots while tests import those modules by
+    # name. Give mypy the same roots and a single stable package mapping.
+    MYPYPATH="$root/.super-coder/scripts:$root/.super-coder/api:$root/.super-coder/render${MYPYPATH:+:$MYPYPATH}"
+    export MYPYPATH
+    exec "$tool" --explicit-package-bases "$@"
     ;;
   *)
     echo "usage: .subfloor/dev-kit <deps|test|lint|typecheck> [args...]" >&2
