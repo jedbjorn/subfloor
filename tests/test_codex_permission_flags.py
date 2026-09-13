@@ -5,8 +5,9 @@ bubblewrap; on a host that denies unprivileged mount-propagation changes it
 fails before the first command runs (`bwrap: Failed to make / slave`), which
 kills the seat outright. Every launch therefore carries
 `--sandbox danger-full-access` — the same policy the browser-chat lane sends
-through the app-server — and never the YOLO bypass flag outside the container,
-so the branch-guard hook keeps its exit-2 deny.
+through the app-server — and never the YOLO bypass flag, which codex rejects
+alongside `--ask-for-approval` and which defeats the branch-guard hook's
+exit-2 deny.
 """
 from __future__ import annotations
 
@@ -59,12 +60,17 @@ class CodexPermissionFlagsTest(unittest.TestCase):
                 HEADLESS_FLAGS,
             )
 
-    def test_container_keeps_external_sandbox_bypass(self) -> None:
-        with mock.patch.dict(os.environ, {"SC_SANDBOX": "1"}, clear=True):
-            self.assertEqual(
-                run.launch_mode_flags(_codex(), headless=False),
-                INTERACTIVE_FLAGS + [BYPASS],
-            )
+    def test_container_gets_the_same_policy_without_bypass_flag(self) -> None:
+        # codex rejects the bypass flag alongside --ask-for-approval ("cannot
+        # be used with '--dangerously-bypass-approvals-and-sandbox'"), so a
+        # container launch that appended it never started; the always-on set
+        # already grants the same policy and keeps the hook's exit-2 deny.
+        for headless, expected in ((False, INTERACTIVE_FLAGS), (True, HEADLESS_FLAGS)):
+            with self.subTest(headless=headless):
+                with mock.patch.dict(os.environ, {"SC_SANDBOX": "1"}, clear=True):
+                    flags = run.launch_mode_flags(_codex(), headless=headless)
+                self.assertEqual(flags, expected)
+                self.assertNotIn(BYPASS, flags)
 
     def test_no_launch_mode_leaves_the_bwrap_backed_sandbox_selected(self) -> None:
         # The failure this guards: an empty/`workspace-write` policy makes

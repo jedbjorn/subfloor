@@ -26,7 +26,6 @@ billing are provider-owned; they are not part of the adapter contract.
 | `model` | `{ "flag": "--model" }` — run.py appends `--model <id>` for the flavor's codex model |
 | `headless.effort` | maps requested effort to `-c model_reasoning_effort="<level>"` |
 | `launch_flags` / `headless_flags` | always-on argv appended to the interactive / headless launch — `--sandbox danger-full-access` (plus `--ask-for-approval never` interactively; `codex exec` has no approval flag and never prompts) |
-| `sandbox.launch_flags` | flags appended ONLY inside the docker sandbox (`SC_SANDBOX`) |
 
 ## Branch-guard hook
 
@@ -52,17 +51,18 @@ the cwd-branch check.
    (`--dangerously-bypass-hook-trust` only skips the per-hook hash review, NOT this
    layer-load trust. And `codex exec` runs no hooks at all — interactive only.)
 
-2. **YOLO flag (ENFORCING).** `--dangerously-bypass-approvals-and-sandbox` is
-   appended only in the container (the container is the safety boundary). That flag
-   **ignores the hook's exit-2 deny** — verified: the hook fires and returns 2, but
-   the edit proceeds. So **in-sandbox, codex's edit-time branch-guard cannot block**;
-   the git **pre-commit backstop** is the real guard there (it blocks
-   protected-branch *commits* regardless of harness flags). On the no-docker host
-   path (`./sc boot`), that flag is absent — the host set is `--sandbox
-   danger-full-access --ask-for-approval never`, which elevates the *sandbox
-   policy* without taking the bypass branch — and the exit-2 deny IS honored, so
-   the host edit-time guard blocks. Never swap the host set for the YOLO flag as
-   a shortcut; it is the bypass branch that loses the guard, not the policy.
+2. **No YOLO flag (ENFORCING).** `--dangerously-bypass-approvals-and-sandbox`
+   **ignores the hook's exit-2 deny** — verified: the hook fires and returns 2,
+   but the edit proceeds. The always-on set `--sandbox danger-full-access
+   --ask-for-approval never` elevates the *sandbox policy* without taking the
+   bypass branch, so the exit-2 deny IS honored and the edit-time guard blocks —
+   on the host and in the container alike. The adapter carries no
+   container-only bypass: codex rejects it alongside `--ask-for-approval`
+   (`the argument '--ask-for-approval <APPROVAL_POLICY>' cannot be used with
+   '--dangerously-bypass-approvals-and-sandbox'`, codex-cli 0.154.0), and the
+   always-on set already grants everything it did. Never swap the set for the
+   YOLO flag as a shortcut; it is the bypass branch that loses the guard, not
+   the policy.
 
 **Host setup (one-time):** the binary is baked into the sandbox image, but auth is
 mounted from the host — so `codex` must be installed + logged in on the host once:
@@ -101,10 +101,10 @@ always-on launch flag rather than an Admin-only grant because:
    succeeds.
 
 The safety boundary is unchanged and is the same one every other harness
-relies on: the branch-guard `PreToolUse` hook at edit time on the host path,
-and the git **pre-commit** hook, which refuses protected-branch commits
-regardless of harness flags. Outside the container, elevating the sandbox
-policy does not elevate a shell past either guard.
+relies on: the branch-guard `PreToolUse` hook at edit time, and the git
+**pre-commit** hook, which refuses protected-branch commits regardless of
+harness flags. Elevating the sandbox policy does not elevate a shell past
+either guard.
 
 ## Conversation capability
 
