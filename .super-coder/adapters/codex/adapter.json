@@ -87,9 +87,5 @@
       "server_backed": true,
       "session_inspection": true
     }
-  },
-  "sandbox": {
-    "launch_flags": ["--dangerously-bypass-approvals-and-sandbox"],
-    "headless_flags": ["--dangerously-bypass-approvals-and-sandbox"]
   }
 }
