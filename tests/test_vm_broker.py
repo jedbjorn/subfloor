@@ -38,7 +38,7 @@ import vm_mcp_relay  # noqa: E402
 SAVED = {
     "domain": "win-test", "ssh_host": "127.0.0.1", "ssh_port": 22,
     "ssh_user": "tester", "ssh_key_path": "~/.ssh/sc_win_test",
-    "transfer_dir": "/tmp", "snapshot": "clean",
+    "snapshot": "clean", "workspace": "C:\\SubfloorTest",
 }
 
 
@@ -179,29 +179,28 @@ class VerbDispatchTests(unittest.TestCase):
         self.assertFalse(r["ok"])
         self.assertIn("inside the repo", r["output"])
 
-    def test_push_rejects_a_dest_that_escapes_transfer_dir(self):
-        # `dest` with .. must not walk out of transfer_dir and clobber host files.
-        share = tempfile.mkdtemp(prefix="sc_share_")
-        cfg = dict(SAVED, transfer_dir=share)
-        src = str(vm.ports.ENGINE / "scripts" / "vm.py")  # a real in-repo file
-        with mock.patch.object(vm, "read", return_value=cfg):
-            r = vm.do_push(src, "../../etc/sc_escape_probe")
-        self.assertFalse(r["ok"])
-        self.assertIn("escapes transfer_dir", r["output"])
-        self.assertFalse(Path("/etc/sc_escape_probe").exists())  # nothing written
-
-    def test_push_stages_a_legit_repo_file_into_the_share(self):
-        # The contained happy path still works: in-repo src → inside the share.
-        share = tempfile.mkdtemp(prefix="sc_share_")
-        cfg = dict(SAVED, transfer_dir=share)
+    def test_push_default_destination_is_the_guest_workspace(self):
+        # No DEST → <workspace>\<basename> in the guest, over scp.
         src = str(vm.ports.ENGINE / "scripts" / "vm.py")
-        with mock.patch.object(vm, "read", return_value=cfg):
-            r = vm.do_push(src, "staged.py")
+        with mock.patch.object(vm, "read", return_value=SAVED), \
+             mock.patch.object(vm, "_run", return_value=(True, "")) as run:
+            r = vm.do_push(src)
         self.assertTrue(r["ok"], r)
-        target = Path(share) / "staged.py"
-        self.assertTrue(target.is_file())
-        self.assertEqual(r["source"], str(Path(src).resolve()))
-        self.assertEqual(r["destination"], str(target.resolve()))
+        self.assertEqual(r["destination"], "C:\\SubfloorTest\\vm.py")
+        self.assertGreater(r["bytes"], 0)
+        argv = run.call_args[0][0]
+        self.assertEqual(argv[0], "scp")
+        self.assertEqual(argv[-1], "tester@127.0.0.1:C:\\SubfloorTest\\vm.py")
+        self.assertEqual(argv[-2], str(Path(src).resolve()))
+
+    def test_pull_rejects_a_destination_outside_the_repo(self):
+        with mock.patch.object(vm, "read", return_value=SAVED), \
+             mock.patch.object(vm, "_run") as run:
+            r = vm.do_pull("C:\\SubfloorTest\\out.txt", "/etc/sc_escape_probe")
+        self.assertFalse(r["ok"])
+        self.assertEqual(r["error"], "remote_path_not_allowed")
+        run.assert_not_called()
+        self.assertFalse(Path("/etc/sc_escape_probe").exists())
 
     def test_capture_missing_domain_is_a_failure_without_screenshot_data(self):
         with mock.patch.object(vm, "read", return_value={}):

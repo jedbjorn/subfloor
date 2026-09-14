@@ -22,7 +22,6 @@ SAVED = {
     "ssh_port": 22,
     "ssh_user": "tester",
     "ssh_key_path": "~/.ssh/sc_win_test",
-    "transfer_dir": "/tmp",
     "snapshot": "clean",
 }
 GOLDEN = json.loads(
@@ -214,7 +213,7 @@ class BrokerReadinessTests(unittest.TestCase):
             },
         ])
 
-    def test_snapshot_create_requires_off_and_uses_validated_name(self):
+    def test_snapshot_create_works_offline_and_live_with_a_validated_name(self):
         with mock.patch.object(vm, "read", return_value=SAVED), \
              mock.patch.object(vm, "_domain_state", return_value=(True, "powered_off")), \
              mock.patch.object(vm, "_run", return_value=(True, "created")) as run:
@@ -224,12 +223,41 @@ class BrokerReadinessTests(unittest.TestCase):
             ["virsh", "snapshot-create-as", "win-test", "checkpoint-1"],
             timeout=vm.SNAPSHOT_COMMAND_TIMEOUT,
         )
+        # Spec #232: a RUNNING domain gets a live internal snapshot — memory
+        # included, so no --disk-only, and no refusal.
         with mock.patch.object(vm, "read", return_value=SAVED), \
              mock.patch.object(vm, "_domain_state", return_value=(True, "running")), \
-             mock.patch.object(vm, "_run") as run:
+             mock.patch.object(vm, "_run", return_value=(True, "created")) as run:
             result = vm.do_snapshot_create("checkpoint-1")
-        self.assertEqual(result["error"], "snapshot_requires_off")
-        run.assert_not_called()
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["domain_state"], "running")
+        run.assert_called_once_with(
+            ["virsh", "snapshot-create-as", "win-test", "checkpoint-1"],
+            timeout=vm.SNAPSHOT_COMMAND_TIMEOUT,
+        )
+        self.assertNotIn("--disk-only", run.call_args[0][0])
+
+    def test_live_snapshot_refusal_is_reported_as_snapshot_live_unsupported(self):
+        refusal = (
+            "error: Operation not supported: internal snapshot for disk vda "
+            "unsupported for storage type raw"
+        )
+        with mock.patch.object(vm, "read", return_value=SAVED), \
+             mock.patch.object(vm, "_domain_state", return_value=(True, "running")), \
+             mock.patch.object(vm, "_run", return_value=(False, refusal)):
+            result = vm.do_snapshot_create("checkpoint-1")
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["error"], "snapshot_live_unsupported")
+        self.assertIn(refusal, result["output"])
+        self.assertIn("./sc vm stop", result["output"])
+
+    def test_offline_snapshot_failure_keeps_the_plain_error(self):
+        with mock.patch.object(vm, "read", return_value=SAVED), \
+             mock.patch.object(vm, "_domain_state", return_value=(True, "powered_off")), \
+             mock.patch.object(vm, "_run", return_value=(False, "disk is busy")):
+            result = vm.do_snapshot_create("checkpoint-1")
+        self.assertFalse(result["ok"])
+        self.assertNotIn("error", result)
 
     def test_snapshot_names_are_strict_and_configured_snapshot_is_protected(self):
         for name in ("UPPER", "two words", "../escape", "x" * 33):
@@ -893,7 +921,7 @@ class PublicClientTests(unittest.TestCase):
                 "adapter.supported",
             ),
             "start": ("started", "ssh.attempts", "ssh.last_error"),
-            "push": ("source", "destination"),
+            "push": ("source", "destination", "bytes", "<workspace>"),
             "exec": (
                 "--command-file",
                 "guest default shell, cmd.exe",
@@ -912,7 +940,9 @@ class PublicClientTests(unittest.TestCase):
                 "format",
                 "mime_type",
             ),
-            "reset": ("domain.state", "snapshot", "--off"),
+            "reset": ("domain.state", "snapshot", "--off", "--running"),
+            "pull": ("source", "destination", "bytes", ".sc-state/local"),
+            "bake": ("snapshot", "baseline_updated", "powered off"),
         }
         for command, expected in cases.items():
             with self.subTest(command=command), \
@@ -1085,8 +1115,10 @@ class LifecycleClientTests(unittest.TestCase):
                 "init",
                 "--domain", "win-test",
                 "--snapshot", "clean",
-                "--transfer-dir", "/srv/share",
+                "--transfer-dir", "/srv/share",  # retired: accepted, ignored
                 "--ssh-host", "127.0.0.1",
+                "--workspace", "C:\\SubfloorTest",
+                "--known-hosts-path", "/host/known_hosts",
                 "--ssh-user", "tester",
                 "--ssh-key-path", "/host/key",
                 "--libvirt-uri", "qemu:///system",
@@ -1097,14 +1129,54 @@ class LifecycleClientTests(unittest.TestCase):
         self.assertEqual(captured, {
             "domain": "win-test",
             "snapshot": "clean",
-            "transfer_dir": "/srv/share",
             "ssh_host": "127.0.0.1",
             "ssh_user": "tester",
             "ssh_key_path": "/host/key",
             "libvirt_uri": "qemu:///system",
             "ssh_port": 2222,
             "mcp_port": 8001,
+            "workspace": "C:\\SubfloorTest",
+            "known_hosts_path": "/host/known_hosts",
         })
+        self.assertNotIn("transfer_dir", captured)
+
+    def test_init_no_longer_requires_a_transfer_dir(self):
+        captured = {}
+
+        def fake_init(config):
+            captured.update(config)
+            return vm.operation_success("init", {
+                "vm": config,
+                "broker": {"ready": True, "start_command": "./sc vm-broker-up"},
+            })
+
+        with mock.patch.object(vm, "read", return_value=None), \
+             mock.patch.object(vm, "run_init", side_effect=fake_init), \
+             mock.patch.object(sys, "stdout", new_callable=io.StringIO):
+            code = vm.client_main([
+                "init",
+                "--domain", "win-test",
+                "--snapshot", "clean",
+                "--ssh-host", "127.0.0.1",
+                "--ssh-user", "tester",
+                "--ssh-key-path", "/host/key",
+            ])
+        self.assertEqual(code, 0)
+        self.assertEqual(captured, {
+            "domain": "win-test",
+            "snapshot": "clean",
+            "ssh_host": "127.0.0.1",
+            "ssh_user": "tester",
+            "ssh_key_path": "/host/key",
+            "ssh_port": 22,
+            "mcp_port": 8000,
+            "workspace": "C:\\SubfloorTest",
+        })
+
+    def test_a_retired_transfer_dir_never_reaches_the_saved_block(self):
+        with mock.patch.object(vm, "ports") as ports:
+            vm.write({"domain": "win-test", "transfer_dir": "/srv/share"})
+        ports.update.assert_called_once_with({"vm": {"domain": "win-test"}})
 
     def test_init_preserves_existing_values_when_flags_are_omitted(self):
         captured = {}
@@ -1128,7 +1200,11 @@ class LifecycleClientTests(unittest.TestCase):
              mock.patch.object(sys, "stdout", new_callable=io.StringIO):
             code = vm.client_main(["init", "--domain", "replacement"])
         self.assertEqual(code, 0)
-        self.assertEqual(captured, {**existing, "domain": "replacement"})
+        self.assertEqual(captured, {
+            **existing,
+            "domain": "replacement",
+            "workspace": "C:\\SubfloorTest",
+        })
 
     def test_reset_still_requires_off_with_optional_snapshot(self):
         with mock.patch.object(vm, "run_operation") as run, \
@@ -1139,7 +1215,42 @@ class LifecycleClientTests(unittest.TestCase):
             })
             code = vm.client_main(["reset", "checkpoint", "--off", "--json"])
         self.assertEqual(code, 0)
-        run.assert_called_once_with("reset", snapshot="checkpoint")
+        run.assert_called_once_with("reset", snapshot="checkpoint", running=False)
+
+    def test_reset_running_flag_asks_the_broker_for_a_running_domain(self):
+        with mock.patch.object(vm, "run_operation") as run, \
+             mock.patch.object(sys, "stdout", new_callable=io.StringIO):
+            run.return_value = vm.operation_success("reset", {
+                "domain": {"name": "win-test", "state": "running"},
+                "snapshot": "checkpoint",
+            })
+            code = vm.client_main(["reset", "checkpoint", "--running", "--json"])
+        self.assertEqual(code, 0)
+        run.assert_called_once_with("reset", snapshot="checkpoint", running=True)
+        with mock.patch.object(vm, "broker_call", return_value={
+            "ok": True,
+            "domain": "win-test",
+            "domain_state": "running",
+            "snapshot": "checkpoint",
+        }) as call:
+            result = vm.run_operation("reset", snapshot="checkpoint", running=True)
+        self.assertTrue(result["ok"])
+        call.assert_called_once_with(
+            "POST",
+            "/reset",
+            {"running": True, "snapshot": "checkpoint"},
+            timeout=vm.RESET_CLIENT_TIMEOUT,
+        )
+
+    def test_reset_refuses_both_off_and_running_and_refuses_neither(self):
+        for argv in (["reset", "--json"], ["reset", "--off", "--running"]):
+            with self.subTest(argv=argv), \
+                 mock.patch.object(vm, "run_operation") as run, \
+                 mock.patch.object(sys, "stderr", new_callable=io.StringIO), \
+                 self.assertRaises(SystemExit) as raised:
+                vm.client_main(argv)
+            self.assertEqual(raised.exception.code, 2)
+            run.assert_not_called()
 
 
 class PublicMcpClientTests(unittest.TestCase):
