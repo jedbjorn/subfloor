@@ -65,9 +65,19 @@ running `./sc vm adopt` again, or doing it by hand over `./sc vm exec` and then
 The guest is a disposable test box: it holds no real data and no real accounts,
 snapshots are free, and the FnB owns the physical host. So install software,
 change settings, schedule tasks, snapshot, bake and reset are all yours
-(decision #372). Snapshot before a risky change — `./sc vm snapshot create
-<name>` works while the domain is running — and reset to it when the change goes
-wrong. Redefine the baseline with `./sc vm bake [<name>]` rather than trying to
+(decision #372). Snapshot before a risky change and reset to it when the change
+goes wrong. `./sc vm snapshot create <name>` is allowed while the domain is
+running, but many hosts cannot checkpoint a live guest (a host-passthrough CPU
+with non-migratable flags, UEFI pflash) and answer `snapshot_live_unsupported`.
+That is the normal case, not a fault; take the snapshot offline instead:
+
+1. Finish or save any in-guest work — an offline snapshot does not keep memory.
+2. `./sc vm mcp down` if the tunnel is up, then `./sc vm stop`.
+3. `./sc vm snapshot create <name>` (now offline), then `./sc vm start`.
+4. Later, `./sc vm reset <name> --running` returns to that state booted, or
+   `--off` leaves it powered down.
+
+Redefine the baseline with `./sc vm bake [<name>]` rather than trying to
 delete it; the baseline is the one snapshot `reset` depends on and delete still
 refuses it. Leave the box in a state the next shell can either use or reset:
 finish with `./sc vm reset --off`, or say plainly what you changed and which

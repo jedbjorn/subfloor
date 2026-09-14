@@ -221,7 +221,7 @@ Act on the code.
 | `remote_path_not_allowed` | a push source or a pull destination resolved outside the repo and `.sc-state/local/` |
 | `remote_unreachable`, `remote_exec_failed` | SSH failed, or the command exited non-zero |
 | `snapshot_protected`, `snapshot_name_invalid` | a lifecycle guard tripped; the baseline is redefined with `bake`, not deleted |
-| `snapshot_live_unsupported` | libvirt refused a live internal snapshot (UEFI pflash, non-migratable CPU flags); `stop` first, then snapshot |
+| `snapshot_live_unsupported` | libvirt refused a live internal snapshot (UEFI pflash, non-migratable CPU flags); the normal case on many hosts. Checkpoint offline: `mcp down` if up, `stop`, `snapshot create <name>`, `start`; `reset <name> --running` restores it booted |
 | `stop_timeout`, `reset_result_unknown` | the final state was not confirmed; read `status` |
 | `adopt_guest_not_found` | no address resolved from the lease table, ARP or `--ssh-host` |
 | `adopt_ssh_timeout` | the guest never answered on TCP 22 inside the wait window — the bootstrap line has not run yet |
