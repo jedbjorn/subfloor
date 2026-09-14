@@ -3421,20 +3421,25 @@ function chatWorkingDots() {
 }
 
 // `process` is the conversation projection's process block. A lingering child
-// outlived the turn the transcript already shows as finished — the pill names
-// its pid so nothing alive stays nameless.
+// outlived the turn the transcript already shows as finished — typically a
+// harness still running its own background tasks. That is work, not a fault:
+// the pill says so, animates like a turn, and names the pid.
 function chatStatePill(state, process) {
   const lingering = Boolean(process?.lingering);
   const label = lingering
-    ? `process still running · pid ${process.pid}`
+    ? `working in background · pid ${process.pid}`
     : ({
       queued: "queued", running: "working", waiting: "waiting",
       error: "failed", idle: "idle", closed: "closed",
     }[state] || state);
   const pill = el("span", {
     className: `chat-state state-${state || "idle"}${lingering ? " lingering" : ""}`,
+    title: lingering
+      ? "The reply finished, but its process is still running background "
+        + "tasks. New messages wait until it exits; Stop ends it."
+      : "",
   });
-  if (state !== "running") {
+  if (state !== "running" && !lingering) {
     pill.textContent = label;
     return pill;
   }
@@ -5324,7 +5329,10 @@ async function chatRenderOpen(
       ? (reopenable
         ? "This conversation is closed — send a message to reopen it."
         : "This conversation is closed.")
-      : closing ? "Stopping work and closing…" : "Message this shell…";
+      : closing ? "Stopping work and closing…"
+      : lingering
+      ? "Working in background — a message sent now waits until it finishes, or press Stop."
+      : "Message this shell…";
     scheduleTranscript();
   };
   const refresh = () => chatRefreshConversation(
