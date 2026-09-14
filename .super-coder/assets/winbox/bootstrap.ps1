@@ -149,10 +149,10 @@ try {
     Write-StepResult -Name 'firewall-rule' -Status 'failed' -Detail $_.Exception.Message
 }
 
-# --- Step 3: sshd_config directives -----------------------------------------
-# The stock file ships both directives commented, which already means yes. We make
-# them explicit so `adopt` can flip PasswordAuthentication off later by rewriting a
-# real directive rather than guessing at a default. The default shell is left as
+# --- Step 3: sshd_config authentication settings ----------------------------
+# The stock file ships both settings commented out, which already means yes. We
+# make them explicit so `adopt` can flip PasswordAuthentication off later by
+# rewriting a real line rather than guessing at a default. The default shell is left as
 # cmd.exe on purpose: every `./sc vm exec` convention assumes it.
 
 try {
@@ -162,35 +162,35 @@ try {
     } else {
         $lines = @(Get-Content -LiteralPath $configPath)
         $wanted = @(
-            @{ directive = 'PubkeyAuthentication'; value = 'yes' },
-            @{ directive = 'PasswordAuthentication'; value = 'yes' }
+            @{ key = 'PubkeyAuthentication'; value = 'yes' },
+            @{ key = 'PasswordAuthentication'; value = 'yes' }
         )
-        $changedDirectives = @()
+        $changedKeys = @()
         foreach ($item in $wanted) {
-            $directive = [string]$item.directive
-            $target = "$directive $([string]$item.value)"
-            $pattern = '^\s*#?\s*' + $directive + '\s+\S+'
+            $key = [string]$item.key
+            $target = "$key $([string]$item.value)"
+            $pattern = '^\s*#?\s*' + $key + '\s+\S+'
             $matched = $false
             for ($i = 0; $i -lt $lines.Count; $i++) {
                 if ($lines[$i] -match $pattern) {
                     $matched = $true
                     if ($lines[$i] -ne $target) {
                         $lines[$i] = $target
-                        if ($changedDirectives -notcontains $directive) { $changedDirectives += $directive }
+                        if ($changedKeys -notcontains $key) { $changedKeys += $key }
                     }
                 }
             }
             if (-not $matched) {
                 $lines += $target
-                if ($changedDirectives -notcontains $directive) { $changedDirectives += $directive }
+                if ($changedKeys -notcontains $key) { $changedKeys += $key }
             }
         }
-        if ($changedDirectives.Count -eq 0) {
+        if ($changedKeys.Count -eq 0) {
             Write-StepResult -Name 'sshd-config' -Status 'skipped' -Detail 'PubkeyAuthentication yes and PasswordAuthentication yes already explicit'
         } else {
             Set-Content -LiteralPath $configPath -Value $lines -Encoding ASCII
             Restart-Service -Name 'sshd'
-            Write-StepResult -Name 'sshd-config' -Status 'done' -Detail ('set ' + ($changedDirectives -join ', ') + '; sshd restarted')
+            Write-StepResult -Name 'sshd-config' -Status 'done' -Detail ('set ' + ($changedKeys -join ', ') + '; sshd restarted')
         }
     }
 } catch {
