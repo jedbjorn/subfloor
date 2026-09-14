@@ -740,36 +740,44 @@ def _wait_exit(pidfds: list[int], grace: float) -> list[int]:
 
 def release(shortname: str, confirmed: list[dict], *,
             term_grace: float = 3.0, kill_grace: float = 1.0) -> list[int]:
-    """Kill one shell's CLI holders after an operator confirmed them — SIGTERM,
-    then SIGKILL for whatever outlives `term_grace`. Returns the pids still
-    alive afterwards (empty = released).
+    """Kill one shell's CLI holders after an operator confirmed them. Returns
+    the pids still alive afterwards (empty = released).
 
     `confirmed` carries the {pid, start_ticks} identities the operator was
     shown. A fresh scan must hold nothing outside that set, or HoldersChanged
     is raised and nothing is signalled: a session that started after the
     warning was never confirmed. A confirmed identity that already exited is
-    simply released; a recycled pid never matches its start ticks.
-
-    Each holder is bound to a pidfd (see _bind) before any signal, and its tool
-    children are reached through their own pidfds (see _group_members) rather
-    than killpg — so an exit and pid/pgid reuse at the signal boundary signals
-    nobody. The group is walked only when the harness leads it (a `docker
-    exec` or `./sc enter` session does), never a group it merely belongs to,
-    which could be the operator's own terminal shell."""
+    simply released; a recycled pid never matches its start ticks."""
     wanted = {(int(h["pid"]), int(h["start_ticks"])) for h in confirmed}
     current = cli_holders(shortname, compute())
     if any((h["pid"], h["start_ticks"]) not in wanted for h in current):
         raise HoldersChanged(current)
+    return terminate([(h["pid"], h["start_ticks"]) for h in current],
+                     term_grace=term_grace, kill_grace=kill_grace)
+
+
+def terminate(identities: list[tuple[int, int]], *,
+              term_grace: float = 3.0, kill_grace: float = 1.0) -> list[int]:
+    """SIGTERM each (pid, start_ticks) process, then SIGKILL whatever outlives
+    `term_grace`. Returns the pids still alive afterwards.
+
+    Each process is bound to a pidfd (see _bind) before any signal, and its tool
+    children are reached through their own pidfds (see _group_members) rather
+    than killpg — so an exit and pid/pgid reuse at the signal boundary signals
+    nobody. The group is walked only when the process leads it (a `docker
+    exec`, `./sc enter`, or browser-turn process does), never a group it merely
+    belongs to, which could be the operator's own terminal shell. An identity
+    that already exited is skipped."""
     opened: list[int] = []
     try:
         leaders: dict[int, tuple[int, int]] = {}     # pidfd -> (pid, start_ticks)
         known: set[int] = set()
-        for h in current:
-            fd = _bind(h["pid"], start_ticks=h["start_ticks"])
+        for pid, ticks in identities:
+            fd = _bind(pid, start_ticks=ticks)
             if fd is not None:
                 opened.append(fd)
-                leaders[fd] = (h["pid"], h["start_ticks"])
-                known.add(h["pid"])
+                leaders[fd] = (pid, ticks)
+                known.add(pid)
         members: list[int] = []
 
         def enroll() -> None:
