@@ -75,12 +75,29 @@ function Invoke-Native {
     # with no python installed throws CommandNotFoundException, whereas the
     # cmd.exe route this replaced simply returned 9009. Callers branch on the
     # exit code, so keep that shape.
-    $resolved = Get-Command -Name $Exe -ErrorAction SilentlyContinue | Select-Object -First 1
+    # Prefer a real file over the Store's app-execution-alias stubs: the stubs
+    # under %LOCALAPPDATA%\Microsoft\WindowsApps are zero-byte reparse points
+    # (python.exe there opens the Store and exits 9009).
+    $resolved = $null
+    foreach ($candidate in @(Get-Command -Name $Exe -All -ErrorAction SilentlyContinue)) {
+        $source = [string]$candidate.Source
+        if ($source -and (Test-Path -LiteralPath $source)) {
+            $item = Get-Item -LiteralPath $source -ErrorAction SilentlyContinue
+            if ($item -and $item.Length -eq 0) { continue }
+        }
+        $resolved = $candidate
+        break
+    }
+    if ($null -eq $resolved) {
+        $resolved = Get-Command -Name $Exe -ErrorAction SilentlyContinue | Select-Object -First 1
+    }
     if ($null -eq $resolved) {
         return @{ Output = "'$Exe' is not recognized as a command"; ExitCode = 9009 }
     }
+    $target = $Exe
+    if ($resolved.Source) { $target = [string]$resolved.Source }
     $global:LASTEXITCODE = 0
-    $output = & $Exe @Arguments 2>&1 | Out-String
+    $output = & $target @Arguments 2>&1 | Out-String
     $code = $LASTEXITCODE
     if ($null -eq $code) { $code = 0 }
     return @{ Output = $output; ExitCode = [int]$code }
@@ -118,11 +135,15 @@ function Update-PathFromRegistry {
     # (uv's tool bin dir being the one that bites).
     $machine = [Environment]::GetEnvironmentVariable('Path', 'Machine')
     $user = [Environment]::GetEnvironmentVariable('Path', 'User')
+    # Extras go AFTER the registry PATH. The per-user WindowsApps directory is
+    # one of them and it holds the Store's zero-byte python.exe alias stub;
+    # prepended, that stub shadowed a freshly installed Python 3.13 (observed
+    # on halo: winget reported success, the recheck ran the stub).
     $parts = @()
-    foreach ($extra in $script:PathExtras) { $parts += $extra }
     foreach ($chunk in @($machine, $user)) {
         if ($chunk) { $parts += $chunk.Split(';') }
     }
+    foreach ($extra in $script:PathExtras) { $parts += $extra }
     $seen = @{}
     $clean = @()
     foreach ($part in $parts) {
