@@ -13,9 +13,11 @@ from __future__ import annotations
 import io
 import json
 import os
+import signal
 import sqlite3
 import sys
 import tempfile
+import time
 import unittest
 from contextlib import redirect_stdout
 from pathlib import Path
@@ -550,17 +552,119 @@ class ReleaseTest(unittest.TestCase):
             self.assertEqual([], shell_liveness.release(
                 "dev1", [{"pid": 999999, "start_ticks": 1}]))
 
-    def test_group_is_signalled_only_when_the_harness_leads_it(self):
-        with mock.patch("os.getpgid", return_value=100), \
-                mock.patch("os.killpg") as killpg, mock.patch("os.kill") as kill:
-            shell_liveness._signal(4242, 15)
-        killpg.assert_not_called()
-        kill.assert_called_once_with(4242, 15)
-        with mock.patch("os.getpgid", return_value=4242), \
-                mock.patch("os.killpg") as killpg, mock.patch("os.kill") as kill:
-            shell_liveness._signal(4242, 15)
-        killpg.assert_called_once_with(4242, 15)
-        kill.assert_not_called()
+    def _no_numeric_signals(self):
+        """A signal by pid number is exactly the race: fail if one is sent."""
+        return mock.patch.multiple(
+            "os",
+            kill=mock.Mock(side_effect=AssertionError("os.kill by number")),
+            killpg=mock.Mock(side_effect=AssertionError("os.killpg by number")))
+
+    def test_exit_and_reap_at_the_signal_boundary_signals_nobody(self):
+        # The holder is verified and bound, then exits and is reaped just
+        # before the first signal — the moment its number is free to be
+        # reused. The signal goes to the pidfd, which names the dead process,
+        # so nothing is sent to whoever holds that number next.
+        proc, ticks = self._spawn()
+        real_send = shell_liveness._send
+
+        def exit_first(fd, sig):
+            if proc.poll() is None:
+                own = os.pidfd_open(proc.pid)    # the test's own kill, not by number
+                signal.pidfd_send_signal(own, signal.SIGKILL)
+                os.close(own)
+                proc.wait()
+            real_send(fd, sig)
+
+        with self._holding((proc.pid, ticks)), self._no_numeric_signals(), \
+                mock.patch.object(shell_liveness, "_send", side_effect=exit_first):
+            survivors = shell_liveness.release(
+                "dev1", [{"pid": proc.pid, "start_ticks": ticks}])
+        self.assertEqual([], survivors)
+
+    def test_bind_refuses_a_read_that_raced_an_exit(self):
+        # pidfd opened, then the process exits and is reaped before /proc is
+        # read — a read that could describe a process now wearing the same
+        # number, even one whose fields happen to match.
+        proc, ticks = self._spawn()
+        real_fields = shell_liveness._stat_fields(proc.pid)
+
+        def reused(pid):
+            proc.kill()
+            proc.wait()
+            return real_fields
+
+        with mock.patch.object(shell_liveness, "_stat_fields", side_effect=reused):
+            self.assertIsNone(shell_liveness._bind(proc.pid, start_ticks=ticks))
+
+    def test_stranger_in_a_reused_group_number_is_not_enrolled(self):
+        # The leader is gone, so its group number may be reused: a process
+        # reporting that pgrp is a stranger's group, not the harness's.
+        leader, ticks = self._spawn()
+        fd = shell_liveness._bind(leader.pid, start_ticks=ticks)
+        self.addCleanup(os.close, fd)
+        leader.kill()
+        leader.wait()
+        stranger, _ = self._spawn()
+        real_fields = shell_liveness._stat_fields
+
+        def in_leaders_group(pid):
+            rest = real_fields(pid)
+            if pid == stranger.pid:
+                rest[2] = str(leader.pid)
+            return rest
+
+        with mock.patch.object(shell_liveness, "_stat_fields",
+                               side_effect=in_leaders_group):
+            self.assertEqual([], shell_liveness._group_members(
+                fd, leader.pid, {leader.pid}))
+        self.assertIsNone(stranger.poll())
+
+    def test_tool_child_that_ignores_term_is_killed_through_its_pidfd(self):
+        import subprocess
+        code = ("import signal,subprocess,sys,time\n"
+                "child = subprocess.Popen([sys.executable, '-c', "
+                "'import signal,time; signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+                "print(1, flush=True); time.sleep(60)'], stdout=subprocess.PIPE)\n"
+                "child.stdout.readline()\n"
+                "print(child.pid, flush=True)\ntime.sleep(60)\n")
+        leader = subprocess.Popen([sys.executable, "-c", code],
+                                  stdout=subprocess.PIPE, start_new_session=True)
+        self.addCleanup(lambda: (leader.poll() is None and leader.kill(), leader.wait()))
+        child = int(leader.stdout.readline())
+        child_ticks = shell_liveness._start_ticks(child)
+        self.addCleanup(lambda: shell_liveness._start_ticks(child) == child_ticks
+                        and os.kill(child, 9))
+        ticks = shell_liveness._start_ticks(leader.pid)
+        with self._holding((leader.pid, ticks)), self._no_numeric_signals():
+            survivors = shell_liveness.release(
+                "dev1", [{"pid": leader.pid, "start_ticks": ticks}],
+                term_grace=0.5)
+        self.assertEqual([], survivors)
+        leader.wait(timeout=5)
+        deadline = time.monotonic() + 5
+        while (shell_liveness._start_ticks(child) == child_ticks
+               and not shell_liveness._is_zombie(child)
+               and time.monotonic() < deadline):
+            time.sleep(0.05)
+        self.assertTrue(shell_liveness._start_ticks(child) != child_ticks
+                        or shell_liveness._is_zombie(child))
+
+    def test_group_the_harness_does_not_lead_is_never_walked(self):
+        # Launched inside someone else's group (the test runner's here, the
+        # operator's terminal shell in life): only the harness is signalled.
+        import subprocess
+        proc = subprocess.Popen([sys.executable, "-c",
+                                 "print(1, flush=True); import time; time.sleep(60)"],
+                                stdout=subprocess.PIPE)
+        self.addCleanup(lambda: (proc.poll() is None and proc.kill(), proc.wait()))
+        proc.stdout.readline()
+        ticks = shell_liveness._start_ticks(proc.pid)
+        with self._holding((proc.pid, ticks)), self._no_numeric_signals(), \
+                mock.patch.object(shell_liveness, "_group_members") as walk:
+            self.assertEqual([], shell_liveness.release(
+                "dev1", [{"pid": proc.pid, "start_ticks": ticks}]))
+        walk.assert_not_called()
+        self.assertEqual(-15, proc.wait(timeout=5))
 
     def test_browser_turns_are_not_cli_holders(self):
         snap = {"processes": [

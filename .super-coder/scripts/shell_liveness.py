@@ -94,6 +94,7 @@ from __future__ import annotations
 import fcntl
 import json
 import os
+import select
 import signal
 import sqlite3
 import sys
@@ -653,27 +654,92 @@ class HoldersChanged(Exception):
         self.holders = holders
 
 
-def _gone(pid: int, start_ticks: int) -> bool:
-    return _is_zombie(pid) or _start_ticks(pid) != start_ticks
-
-
-def _signal(pid: int, sig: int) -> None:
-    """Signal the harness and, when it leads its own process group (a
-    `docker exec` or `./sc enter` session does), the tool children in that
-    group. Never a group it merely belongs to — that could be the operator's
-    own terminal shell."""
+def _exists(pidfd: int) -> bool:
+    """Does the process this pidfd names still own its pid number? True for a
+    live process or an unreaped zombie; a reaped one raises ESRCH, whatever
+    process the number now belongs to."""
     try:
-        if os.getpgid(pid) == pid:
-            os.killpg(pid, sig)
-        else:
-            os.kill(pid, sig)
+        signal.pidfd_send_signal(pidfd, 0)
     except ProcessLookupError:
-        pass
+        return False
+    return True
+
+
+def _bind(pid: int, *, start_ticks: int | None = None,
+          pgrp: int | None = None) -> int | None:
+    """A pidfd for `pid`, returned only if the process it pins matches.
+
+    The pidfd is opened FIRST and /proc read after, then the pidfd is asked
+    whether its process still exists: if it does, the pid number cannot have
+    been reused in between, so the read described the pinned process. Every
+    later signal goes through that pidfd — never the number (#954: a recycled
+    pid turned a group kill onto a stranger). None when the process is gone
+    or is not the one asked for. Other failures (no pidfd support, a foreign
+    user) propagate: release fails closed rather than signal by number."""
+    try:
+        fd = os.pidfd_open(pid)
+    except ProcessLookupError:
+        return None
+    rest = _stat_fields(pid)
+    try:
+        matches = ((start_ticks is None or int(rest[19]) == start_ticks)
+                   and (pgrp is None or int(rest[2]) == pgrp))
+    except (IndexError, ValueError):
+        matches = False
+    if matches and _exists(fd):
+        return fd
+    os.close(fd)
+    return None
+
+
+def _group_members(leader_fd: int, pgid: int, known: set[int]) -> list[int]:
+    """Pidfds for the other processes in the group a harness leads — its tool
+    children — excluding pids already pinned in `known`.
+
+    Group ids are pid numbers too, so membership is proven, not read: each
+    candidate is bound with pgrp == pgid, and only then is the LEADER checked.
+    A leader that still exists (even as a zombie) still holds number `pgid`,
+    so the group every bound read saw was the leader's group, not a later one
+    that reused the number. Once the leader is reaped, nothing new is enrolled."""
+    members: list[int] = []
+    for entry in PROC.iterdir():
+        if not entry.name.isdigit() or int(entry.name) in known:
+            continue
+        fd = _bind(int(entry.name), pgrp=pgid)
+        if fd is None:
+            continue
+        if not _exists(leader_fd):
+            os.close(fd)
+            break
+        members.append(fd)
+        known.add(int(entry.name))
+    return members
+
+
+def _send(pidfd: int, sig: int) -> None:
+    try:
+        signal.pidfd_send_signal(pidfd, sig)
+    except ProcessLookupError:
+        pass                             # exited (and maybe reaped) — nothing to do
+
+
+def _wait_exit(pidfds: list[int], grace: float) -> list[int]:
+    """The pidfds whose process has not exited within `grace` seconds. A pidfd
+    turns readable when its process exits, so this waits on the kernel rather
+    than polling a pid number."""
+    pending = list(pidfds)
+    deadline = time.monotonic() + grace
+    while pending:
+        ready = select.select(pending, [], [],
+                              max(0.0, deadline - time.monotonic()))[0]
+        pending = [fd for fd in pending if fd not in ready]
+        if not ready or time.monotonic() >= deadline:
+            break
+    return pending
 
 
 def release(shortname: str, confirmed: list[dict], *,
-            term_grace: float = 3.0, kill_grace: float = 1.0,
-            sleep=time.sleep) -> list[int]:
+            term_grace: float = 3.0, kill_grace: float = 1.0) -> list[int]:
     """Kill one shell's CLI holders after an operator confirmed them — SIGTERM,
     then SIGKILL for whatever outlives `term_grace`. Returns the pids still
     alive afterwards (empty = released).
@@ -682,27 +748,51 @@ def release(shortname: str, confirmed: list[dict], *,
     shown. A fresh scan must hold nothing outside that set, or HoldersChanged
     is raised and nothing is signalled: a session that started after the
     warning was never confirmed. A confirmed identity that already exited is
-    simply released; a recycled pid never matches its start ticks."""
+    simply released; a recycled pid never matches its start ticks.
+
+    Each holder is bound to a pidfd (see _bind) before any signal, and its tool
+    children are reached through their own pidfds (see _group_members) rather
+    than killpg — so an exit and pid/pgid reuse at the signal boundary signals
+    nobody. The group is walked only when the harness leads it (a `docker
+    exec` or `./sc enter` session does), never a group it merely belongs to,
+    which could be the operator's own terminal shell."""
     wanted = {(int(h["pid"]), int(h["start_ticks"])) for h in confirmed}
     current = cli_holders(shortname, compute())
-    unconfirmed = [h for h in current
-                   if (h["pid"], h["start_ticks"]) not in wanted]
-    if unconfirmed:
+    if any((h["pid"], h["start_ticks"]) not in wanted for h in current):
         raise HoldersChanged(current)
-    targets = [(h["pid"], h["start_ticks"]) for h in current]
-    for sig, grace in ((signal.SIGTERM, term_grace), (signal.SIGKILL, kill_grace)):
-        for pid, ticks in targets:
-            if not _gone(pid, ticks):
-                _signal(pid, sig)
-        deadline = time.monotonic() + grace
-        while any(not _gone(pid, ticks) for pid, ticks in targets):
-            if time.monotonic() >= deadline:
-                break
-            sleep(0.1)
-        targets = [(pid, ticks) for pid, ticks in targets if not _gone(pid, ticks)]
-        if not targets:
-            return []
-    return [pid for pid, _ in targets]
+    opened: list[int] = []
+    try:
+        leaders: dict[int, tuple[int, int]] = {}     # pidfd -> (pid, start_ticks)
+        known: set[int] = set()
+        for h in current:
+            fd = _bind(h["pid"], start_ticks=h["start_ticks"])
+            if fd is not None:
+                opened.append(fd)
+                leaders[fd] = (h["pid"], h["start_ticks"])
+                known.add(h["pid"])
+        members: list[int] = []
+
+        def enroll() -> None:
+            for fd, (pid, ticks) in leaders.items():
+                leads = _bind(pid, start_ticks=ticks, pgrp=pid)
+                if leads is None:
+                    continue
+                os.close(leads)
+                enrolled = _group_members(fd, pid, known)
+                opened.extend(enrolled)
+                members.extend(enrolled)
+
+        enroll()
+        for fd in (*members, *leaders):
+            _send(fd, signal.SIGTERM)
+        if _wait_exit([*members, *leaders], term_grace):
+            enroll()                     # children forked during the grace
+            for fd in _wait_exit([*members, *leaders], 0):
+                _send(fd, signal.SIGKILL)
+        return [leaders[fd][0] for fd in _wait_exit(list(leaders), kill_grace)]
+    finally:
+        for fd in opened:
+            os.close(fd)
 
 
 def browser_sessions(shortname: str, snap: dict) -> list[dict]:

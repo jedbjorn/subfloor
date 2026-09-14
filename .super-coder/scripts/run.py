@@ -1356,6 +1356,10 @@ def confirm_live(shell, snap: "dict | None") -> bool:
         print(style.yellow("  ✗ a session you were not shown now holds the "
                            "shell — nothing was killed; pick it again to review."))
         return False
+    except OSError as exc:
+        print(style.yellow(f"  ✗ cannot safely signal the holder "
+                           f"({exc.strerror or exc}) — nothing was killed."))
+        return False
     if survivors:
         print(style.yellow(f"  ✗ pid {', '.join(map(str, survivors))} survived "
                            f"SIGKILL — not booting."))

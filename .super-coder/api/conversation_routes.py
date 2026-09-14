@@ -995,11 +995,13 @@ def _release_shell(con, operator: dict, body: dict):
             f"not shown; review it before killing anything",
             {"shell_id": shell_id, "holders": exc.holders},
         ) from exc
-    except PermissionError as exc:
+    except OSError as exc:
+        # No pidfd support or a foreign user: fail closed, never kill by number.
         raise ApiError(
             409,
             "SHELL_RELEASE_FAILED",
-            f"not permitted to signal a holder of shell {shell['shortname']!r}",
+            f"cannot safely signal a holder of shell {shell['shortname']!r}: "
+            f"{exc.strerror or exc}",
             {"shell_id": shell_id},
         ) from exc
     if survivors:
