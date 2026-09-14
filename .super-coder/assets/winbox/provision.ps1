@@ -242,6 +242,17 @@ if (-not $mcp) {
             $mcpNotes += ('uv tool install windows-mcp failed: ' + [string]$tool.Output)
         } else {
             $mcpNotes += 'uv tool install windows-mcp ok'
+            # uv puts tool shims in its own bin dir (%USERPROFILE%\.local\bin),
+            # which an SSH session never has on PATH (observed on halo: the
+            # shim exists but 'windows-mcp' is not recognised). Prepend it.
+            $uvBin = Invoke-Capture -CommandLine 'uv tool dir --bin'
+            if ($uvBin.ExitCode -eq 0) {
+                $binDir = ([string]$uvBin.Output).Trim()
+                if ($binDir -and (Test-Path -LiteralPath $binDir)) {
+                    $env:Path = $binDir + ';' + $env:Path
+                    $mcpNotes += ('uv bin on PATH: ' + $binDir)
+                }
+            }
         }
     }
 
