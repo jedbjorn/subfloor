@@ -49,16 +49,23 @@ FEATURES: dict[str, dict] = {
         ],
     },
     "windows": {
-        "title": "Windows Test VM (link-only)",
+        "title": "Windows Test VM (bring your own licensed guest)",
         "block": "vm",
         "block_auto": False,
         "link": [
             (
-                "./sc vm init --domain D --snapshot S --transfer-dir P "
+                "./sc vm adopt --domain <domain> --ssh-user <account>   "
+                "# two-command adoption: run the bootstrap line it prints in an "
+                "elevated PowerShell in the guest, then this — it installs the "
+                "key, provisions, writes the `vm` block and takes the baseline "
+                "snapshot. See .super-coder/docs/remote-seats.md"
+            ),
+            (
+                "./sc vm init --domain D --snapshot S "
                 "--ssh-host H --ssh-user U --ssh-key-path /abs/key   "
-                "# writes only the `vm` block and reports broker health "
-                "(or GUI → Scripts → 'Windows Test VM' wizard) — see "
-                ".super-coder/docs/remote-seats.md"
+                "# hand-link a guest you already prepared; writes only the `vm` "
+                "block and reports broker health "
+                "(or GUI → Scripts → 'Windows Test VM' wizard)"
             ),
             (
                 "./sc remote add NAME --host H --user U --key-path /abs/key   "

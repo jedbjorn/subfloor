@@ -64,9 +64,16 @@ SERVICES: dict[str, dict] = {
         "kind": "broker", "block": "vm", "verb": "vm-broker", "module": vm,
         "unit": "sc-vm-broker-{repo}.service",
         "onboarding": (
-            "No Windows VM is linked. Use the Windows Test VM card's "
-            "\"configure…\" wizard on this page to link one (every field is "
-            "live-tested before it saves), then switch the broker on here."),
+            "No Windows VM is linked. Bring a booted, licensed Windows 10/11 "
+            "guest, then adopt it in two commands: run the bootstrap line "
+            "printed by adopt in an elevated PowerShell in the guest, then "
+            "`./sc vm adopt --domain <domain> --ssh-user <account>` on the "
+            "host — it installs the key, provisions the guest, writes the `vm` "
+            "block and takes the baseline snapshot. To hand-link a guest you "
+            "already prepared, use the Windows Test VM card's \"configure…\" "
+            "wizard on this page (every field is live-tested before it saves). "
+            "Then switch the broker on here. "
+            "See .super-coder/docs/remote-seats.md."),
     },
     "pm2": {
         "name": "PM2 broker",
