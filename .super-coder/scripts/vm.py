@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """Windows Test VM — config read/write + live connection checks.
 
-Link-only by design: the engine never creates the VM. The operator brings a
-ready Windows VM (OpenSSH enabled, a clean snapshot, a transfer dir, and — via
-the admin `configure_winbox` skill — a baked toolchain). These checks validate
-that the operator-supplied `vm` block actually reaches a reachable, provisioned
-box BEFORE it is saved to instance.json.
+Link-only by design for `init`: the engine never creates the VM. The operator
+brings a booted, licensed Windows guest; `vm adopt` (or a hand-written `vm
+init`) links it, and `.subfloor/winbox.json` declares what the guest needs.
+These checks validate that the `vm` block actually reaches a reachable,
+provisioned box BEFORE it is saved to instance.json.
 
 The config lives under the `vm` key of `.super-coder/instance.json` (so there is
 no schema migration — the VM is a host resource, not shell state). It holds a
@@ -16,12 +16,12 @@ api/server.py's run_script contract so the GUI can render it the same way.
 
     domain    virsh dominfo <domain>                 VM exists / visible to libvirt
     ssh       ssh ... echo ok                        auth + remote exec work
-    transfer  write+read+rm a probe in transfer_dir  host side of the share works
     snapshot  virsh snapshot-info <domain> <snap>    the named clean snapshot exists
-    toolchain ssh ... dotnet --version               box is provisioned (verify-only)
+    toolchain ssh ... <winbox.json checks>           the declared toolchain is present
 
-The `toolchain` check is verify-only — it confirms `configure_winbox` has run;
-it never installs anything.
+The `toolchain` check is verify-only — it runs the fork's declared `checks` and
+installs nothing. Provisioning is `./sc vm adopt`; a shell may also install
+through `exec` and redefine the baseline with `bake`.
 """
 from __future__ import annotations
 
@@ -44,8 +44,9 @@ from contextlib import contextmanager
 from pathlib import Path
 
 import ports
+import winbox
 
-CHECKS = ("domain", "ssh", "transfer", "snapshot", "toolchain")
+CHECKS = ("domain", "ssh", "snapshot", "toolchain")
 
 # The broker listens here — a unix socket inside the bind-mounted engine dir, so
 # the same absolute path resolves on the host (where the broker runs) and in the
@@ -393,6 +394,11 @@ SNAPSHOT_COMMAND_TIMEOUT = 120
 START_READINESS_TIMEOUT = 90
 START_READINESS_INTERVAL = 2
 MUTATION_LOCK_TIMEOUT = 5
+TOOLCHAIN_CHECK_TIMEOUT = 20
+# scp of a build artifact over a NAT link; generous but bounded.
+TRANSFER_COMMAND_TIMEOUT = 300
+BAKE_SHUTDOWN_TIMEOUT = 180
+BAKE_SNAPSHOT_TIMEOUT = 300
 RESET_BROKER_BUDGET = (
     MUTATION_LOCK_TIMEOUT + RESET_COMMAND_TIMEOUT + DOMAIN_STATE_TIMEOUT
 )
@@ -409,6 +415,16 @@ RESTART_CLIENT_TIMEOUT = STOP_CLIENT_TIMEOUT + START_CLIENT_TIMEOUT
 DEFAULT_CLIENT_TIMEOUT = 30
 EXEC_CLIENT_TIMEOUT = 130
 CAPTURE_CLIENT_TIMEOUT = 45
+TRANSFER_CLIENT_TIMEOUT = (
+    MUTATION_LOCK_TIMEOUT + TRANSFER_COMMAND_TIMEOUT + 30
+)
+BAKE_CLIENT_TIMEOUT = (
+    MUTATION_LOCK_TIMEOUT
+    + BAKE_SHUTDOWN_TIMEOUT
+    + SNAPSHOT_COMMAND_TIMEOUT
+    + BAKE_SNAPSHOT_TIMEOUT
+    + 30
+)
 RESULT_SCHEMA_VERSION = 1
 MAX_CAPTURE_BYTES = 16 * 1024 * 1024
 CAPTURE_ARTIFACT_ROOT = (
@@ -441,9 +457,18 @@ def read() -> dict | None:
     return ports.resolve(persist=False).get("vm")
 
 
+RETIRED_VM_FIELDS = ("transfer_dir",)
+
+
 def write(vm: dict | None) -> dict | None:
-    """Persist (or clear) the vm block, preserving every other config key."""
+    """Persist (or clear) the vm block, preserving every other config key.
+
+    Retired fields are dropped on the way through: the guest share is gone
+    (spec #232), so a block that still carries one is written without it and
+    the field never comes back.
+    """
     if vm:
+        vm = {k: v for k, v in vm.items() if k not in RETIRED_VM_FIELDS}
         ports.update({"vm": vm})
     else:
         ports.update({}, remove=("vm",))
@@ -479,18 +504,84 @@ def _virsh(cfg: dict, *args: str) -> list[str]:
     return ["virsh", *(["--connect", uri] if uri else []), *args]
 
 
-def _ssh_argv(cfg: dict, remote: str) -> list[str]:
-    """An ssh invocation against the configured guest. BatchMode keeps it
-    non-interactive (no password/passphrase prompt can hang the server)."""
+def repo_root() -> Path:
+    """The fork checkout that owns this engine — the containment root for
+    push/pull and the directory `.subfloor/winbox.json` is resolved against.
+    Same derivation instance.json uses (ports.ENGINE is `<repo>/.super-coder`)."""
+    return ports.ENGINE.parent.resolve()
+
+
+def _ssh_port(cfg: dict) -> int:
+    port = cfg.get("ssh_port", 22)
+    if isinstance(port, bool) or not isinstance(port, int) or not 1 <= port <= 65535:
+        return 22
+    return port
+
+
+def _ssh_base_opts(cfg: dict) -> list[str]:
+    """The ssh/scp options shared by every guest call.
+
+    BatchMode keeps it non-interactive (no password/passphrase prompt can hang
+    the broker). A pinned `known_hosts_path` (written by `adopt` after first
+    contact) upgrades host-key checking to strict; without one we keep
+    accept-new so a hand-linked guest still works on first use.
+    """
     key = os.path.expanduser(str(cfg.get("ssh_key_path", "")))
-    return [
-        "ssh", "-i", key,
-        "-p", str(cfg.get("ssh_port", 22)),
+    known_hosts = str(cfg.get("known_hosts_path", "") or "").strip()
+    options = [
+        "-i", key,
         "-o", "BatchMode=yes",
         "-o", "ConnectTimeout=10",
-        "-o", "StrictHostKeyChecking=accept-new",
+    ]
+    if known_hosts:
+        options += [
+            "-o", f"UserKnownHostsFile={os.path.expanduser(known_hosts)}",
+            "-o", "StrictHostKeyChecking=yes",
+        ]
+    else:
+        options += ["-o", "StrictHostKeyChecking=accept-new"]
+    return options
+
+
+def _ssh_argv(cfg: dict, remote: str) -> list[str]:
+    """An ssh invocation against the configured guest."""
+    return [
+        "ssh", *_ssh_base_opts(cfg),
+        "-p", str(_ssh_port(cfg)),
         f"{cfg.get('ssh_user')}@{cfg.get('ssh_host')}", remote,
     ]
+
+
+def _scp_argv(cfg: dict, *args: str) -> list[str]:
+    """An scp invocation against the configured guest, same auth as _ssh_argv.
+
+    `-s` forces the SFTP protocol explicitly. That choice is load-bearing for a
+    WINDOWS guest: the legacy scp protocol hands the remote path to the guest's
+    default shell (cmd.exe), so a path would need shell quoting and would be
+    re-decoded through the console code page — which mangles non-ASCII file
+    names. Under SFTP no shell runs, so the remote spec is
+    `user@host:<path>` with the path passed VERBATIM (unquoted): backslashes,
+    spaces and non-ASCII survive byte-exact. `--` ends option parsing so a path
+    beginning with `-` can never become a flag.
+    """
+    return [
+        "scp", *_ssh_base_opts(cfg),
+        "-s",
+        "-P", str(_ssh_port(cfg)),
+        "--", *args,
+    ]
+
+
+def _workspace(cfg: dict) -> str:
+    """The guest working directory: the vm block's value, else the fork's
+    winbox profile, else the engine default."""
+    declared = str(cfg.get("workspace", "") or "").strip()
+    if declared:
+        return declared.rstrip("\\") or declared
+    try:
+        return str(winbox.load(repo_root())["workspace"])
+    except winbox.WinboxConfigError:
+        return winbox.DEFAULT_WORKSPACE
 
 
 # -- the five checks ---------------------------------------------------------
@@ -507,24 +598,6 @@ def _check_ssh(cfg: dict) -> tuple[bool, str]:
     return _run(_ssh_argv(cfg, "echo ok"), timeout=20)
 
 
-def _check_transfer(cfg: dict) -> tuple[bool, str]:
-    if m := _missing(cfg, "transfer_dir"):
-        return False, m
-    d = Path(os.path.expanduser(str(cfg["transfer_dir"])))
-    if not d.is_dir():
-        return False, f"transfer_dir does not exist or is not a directory: {d}"
-    probe = d / ".sc_vm_probe"
-    try:
-        probe.write_text("ok")
-        back = probe.read_text()
-        probe.unlink()
-    except OSError as e:
-        return False, f"transfer_dir not writable host-side: {e}"
-    if back != "ok":
-        return False, "wrote a probe file but read back unexpected content"
-    return True, f"wrote + read back a probe in {d} (host side of the share OK)"
-
-
 def _check_snapshot(cfg: dict) -> tuple[bool, str]:
     if m := _missing(cfg, "domain", "snapshot"):
         return False, m
@@ -538,20 +611,38 @@ def _check_snapshot(cfg: dict) -> tuple[bool, str]:
 
 
 def _check_toolchain(cfg: dict) -> tuple[bool, str]:
+    """Run the fork's declared `checks` from .subfloor/winbox.json over ssh.
+
+    Verify-only: nothing is installed. A fork that declares no checks passes —
+    the profile, not the engine, decides what "provisioned" means.
+    """
     if m := _missing(cfg, "ssh_host", "ssh_user", "ssh_key_path"):
         return False, m
-    ok, out = _run(_ssh_argv(cfg, "dotnet --version"), timeout=20)
-    if ok:
-        return True, (f".NET SDK present: {out or '(version printed)'} — "
-                      "configure_winbox has run (verify-only; nothing installed).")
-    return False, ("toolchain probe failed — run the admin `configure_winbox` "
-                   f"skill to provision the box, then re-snapshot.\n{out}")
+    try:
+        profile = winbox.load(repo_root())
+    except winbox.WinboxConfigError as exc:
+        return False, f"[{exc.code}] {exc.message}"
+    checks = profile["checks"]
+    if not checks:
+        return True, "no checks declared"
+    passed = []
+    for check in checks:
+        ok, out = _run(_ssh_argv(cfg, check), timeout=TOOLCHAIN_CHECK_TIMEOUT)
+        if not ok:
+            return False, (
+                f"declared check failed: {check}\n{out}\n"
+                "provision the guest (./sc vm adopt) or install it over "
+                "./sc vm exec, then re-bake the snapshot."
+            )
+        passed.append(f"{check}: {out.splitlines()[0] if out.strip() else 'ok'}")
+    return True, (
+        f"{len(passed)} declared check(s) passed\n" + "\n".join(passed)
+    )
 
 
 _CHECKS = {
     "domain": _check_domain,
     "ssh": _check_ssh,
-    "transfer": _check_transfer,
     "snapshot": _check_snapshot,
     "toolchain": _check_toolchain,
 }
@@ -876,6 +967,14 @@ def do_snapshot_list() -> dict:
 
 
 def do_snapshot_create(name: str) -> dict:
+    """Snapshot the domain in whatever state it is in (spec #232).
+
+    A RUNNING domain gets a live internal snapshot — memory included, no
+    `--disk-only` — so a shell can checkpoint mid-session and come back to the
+    same desktop. Some hosts refuse that (UEFI pflash, non-migratable CPU
+    flags); libvirt's refusal is surfaced as `snapshot_live_unsupported` with
+    the virsh text, and the fix is to `stop` first and snapshot offline.
+    """
     if not _valid_resource_name(name):
         return _snapshot_name_error(name)
     cfg = read() or {}
@@ -884,18 +983,25 @@ def do_snapshot_create(name: str) -> dict:
     state_ok, state = _domain_state(cfg)
     if not state_ok:
         return {"ok": False, "output": state, "domain_state": "unknown"}
-    if state != "powered_off":
-        return {
-            "ok": False,
-            "error": "snapshot_requires_off",
-            "output": "snapshot create requires the domain to be powered off",
-            "domain_state": state,
-        }
     domain = str(cfg["domain"])
+    live = state == "running"
     ok, output = _run(
         _virsh(cfg, "snapshot-create-as", domain, name),
         timeout=SNAPSHOT_COMMAND_TIMEOUT,
     )
+    if not ok and live:
+        return {
+            "ok": False,
+            "error": "snapshot_live_unsupported",
+            "output": (
+                (output or "virsh refused the live snapshot") + "\n"
+                "this host cannot take a live internal snapshot of a running "
+                "domain — run `./sc vm stop` first, then snapshot offline."
+            ),
+            "domain": domain,
+            "domain_state": state,
+            "snapshot": name,
+        }
     return {
         "ok": ok,
         "output": output or (f"created snapshot '{name}'" if ok else "snapshot create failed"),
@@ -932,11 +1038,18 @@ def do_snapshot_delete(name: str) -> dict:
 
 
 def do_reset(running: bool = True, snapshot: str | None = None) -> dict:
-    """Revert to the clean snapshot. The clean snapshot is OFFLINE (this CPU's
-    non-migratable invtsc flag refuses a live snapshot), so a bare revert lands
-    powered-off. `running=True` adds `--running` to boot it — START a run from a
-    clean booted box. `running=False` leaves it OFF — END a run clean *and*
-    powered down in one op, so the 12 GB guest doesn't idle on the host."""
+    """Revert to a snapshot and confirm the domain reached the asked-for state.
+
+    `running=True` leaves the domain RUNNING after the revert — START a run
+    from a clean booted box, or come straight back to a live checkpoint.
+    `running=False` leaves it OFF — END a run clean *and* powered down in one
+    op, so the 12 GB guest doesn't idle on the host; the outcome is reported
+    as `reset_outcome`.
+
+    An OFFLINE snapshot reverts powered-off, so `--running` is what boots it.
+    A LIVE snapshot restores memory and the domain is already running, so
+    `--running` is redundant there but harmless; `running=False` performs the
+    bounded graceful stop after the revert."""
     cfg = read() or {}
     if m := _missing(cfg, "domain", "snapshot"):
         return {"ok": False, "output": m}
@@ -949,6 +1062,15 @@ def do_reset(running: bool = True, snapshot: str | None = None) -> dict:
         argv.append("--running")
     ok, out = _run(argv, timeout=RESET_COMMAND_TIMEOUT)
     state_ok, observed = _domain_state(cfg)
+    if ok and not running and state_ok and observed not in ("powered_off", "unknown"):
+        # A LIVE snapshot restores a running domain; `--off` still promises a
+        # powered-off box, so take the bounded graceful stop here and report
+        # the reset outcome from the state we actually observe afterwards.
+        stopped = do_stop()
+        observed = str(stopped.get("domain_state", "unknown"))
+        state_ok = observed != "unknown"
+        if not stopped.get("ok"):
+            out = str(stopped.get("output") or out)
     expected = "running" if running else "powered_off"
     domain_state = observed if state_ok else "unknown"
 
@@ -1001,106 +1123,219 @@ def do_reset(running: bool = True, snapshot: str | None = None) -> dict:
     }
 
 
-def do_bake(shutdown_timeout: int = 180) -> dict:
-    """(Re)bake the CLEAN snapshot: graceful shutdown → delete the old snapshot
-    → snapshot-create-as OFFLINE. The one-command form of the deploy doc's
-    'provision, then bake' step, run AFTER configure_winbox has provisioned +
-    verified the toolchain.
+def do_bake(name: str | None = None, shutdown_timeout: int = BAKE_SHUTDOWN_TIMEOUT) -> dict:
+    """(Re)bake the baseline snapshot: graceful shutdown -> delete the old
+    snapshot of the same name -> snapshot-create-as OFFLINE.
 
-    HOST-side only, and deliberately NOT a broker verb: the snapshot is the
-    fork's trust anchor — every test run reverts to it. A sandboxed shell may
-    exec/reset AGAINST the snapshot, but must never redefine it; if a
-    compromised sandbox could re-bake, it could persist tampering across every
-    future reset. So baking stays with the operator, where virsh lives."""
-    if os.environ.get("SC_SANDBOX"):
-        return {"ok": False, "output":
-                "bake refuses to run in the sandbox — the clean snapshot is the "
-                "trust anchor every test reverts to; only the HOST may redefine "
-                "it. Ask the operator to run: ./sc vm-bake"}
+    `name` redefines which snapshot is the baseline: the vm block's `snapshot`
+    is updated to it, so `reset` returns here from now on. Omit it to re-bake
+    the configured baseline in place.
+
+    A broker verb since spec #232 (decision #372): the guest is a disposable
+    test box holding no data, every shell can restore any snapshot in seconds,
+    and a shell that has just installed a toolchain needs to make it the
+    baseline without waiting for the operator.
+    """
     cfg = read() or {}
     if m := _missing(cfg, "domain", "snapshot"):
         return {"ok": False, "output": m}
-    dom, snap = str(cfg["domain"]), str(cfg["snapshot"])
+    if name is not None and not _valid_resource_name(name):
+        return _snapshot_name_error(name)
+    dom = str(cfg["domain"])
+    snap = str(name or cfg["snapshot"])
     steps = []
 
-    ok, state = _run(_virsh(cfg, "domstate", dom), timeout=15)
+    ok, state = _run(_virsh(cfg, "domstate", dom), timeout=DOMAIN_STATE_TIMEOUT)
     if not ok:
         return {"ok": False, "output": state}
     if "shut off" not in state:
-        ok, out = _run(_virsh(cfg, "shutdown", dom), timeout=15)
+        ok, out = _run(_virsh(cfg, "shutdown", dom), timeout=DOMAIN_STATE_TIMEOUT)
         if not ok:
             return {"ok": False, "output": out}
         steps.append("graceful shutdown sent")
         deadline = time.monotonic() + shutdown_timeout
         while time.monotonic() < deadline:
-            ok, state = _run(_virsh(cfg, "domstate", dom), timeout=15)
+            ok, state = _run(
+                _virsh(cfg, "domstate", dom), timeout=DOMAIN_STATE_TIMEOUT
+            )
             if ok and "shut off" in state:
                 break
             time.sleep(3)
         else:
             return {"ok": False, "output":
                     f"guest did not shut off within {shutdown_timeout}s (state: "
-                    f"{state.strip()}) — the clean snapshot must be OFFLINE. "
-                    f"Shut it down in the guest and re-run ./sc vm-bake"}
+                    f"{state.strip()}) — the baseline snapshot must be OFFLINE. "
+                    f"Shut it down in the guest and re-run ./sc vm bake"}
 
     ok, _out = _run(_virsh(cfg, "snapshot-info", dom, "--snapshotname", snap),
-                    timeout=15)
+                    timeout=DOMAIN_STATE_TIMEOUT)
     if ok:  # an old bake exists — replace, never stack
         ok, out = _run(_virsh(cfg, "snapshot-delete", dom,
-                              "--snapshotname", snap), timeout=120)
+                              "--snapshotname", snap),
+                       timeout=SNAPSHOT_COMMAND_TIMEOUT)
         if not ok:
             return {"ok": False, "output": out}
         steps.append(f"deleted old '{snap}'")
 
     ok, out = _run(_virsh(cfg, "snapshot-create-as", dom, snap, "--description",
-                          "pristine OS + toolchain (sc vm-bake)"), timeout=300)
+                          "pristine OS + toolchain (sc vm bake)"),
+                   timeout=BAKE_SNAPSHOT_TIMEOUT)
     if not ok:
         return {"ok": False, "output": out}
     steps.append(f"baked '{snap}' (offline)")
+    rebased = False
+    if snap != str(cfg["snapshot"]):
+        try:
+            write({**cfg, "snapshot": snap})
+        except OSError as exc:
+            return {"ok": False, "error": "bake_config_write_failed",
+                    "output": f"baked '{snap}' but the vm block could not be "
+                              f"updated to it: {exc}",
+                    "domain": dom, "snapshot": snap}
+        rebased = True
+        steps.append(f"vm block baseline is now '{snap}'")
     return {"ok": True,
-            "output": "; ".join(steps) + " — guest left powered off"}
+            "output": "; ".join(steps) + " — guest left powered off",
+            "domain": dom,
+            "domain_state": "powered_off",
+            "snapshot": snap,
+            "baseline_updated": rebased}
+
+
+def _transfer_roots() -> tuple[Path, Path]:
+    """The two local roots push/pull may read from or write into."""
+    root = repo_root()
+    return root, (root / ".sc-state" / "local").resolve()
+
+
+def _inside(path: Path, roots: tuple[Path, ...]) -> bool:
+    return any(path == root or path.is_relative_to(root) for root in roots)
+
+
+def _local_path(value: str, roots: tuple[Path, ...]) -> tuple[Path | None, dict | None]:
+    """Resolve a caller-supplied LOCAL path and contain it to `roots`.
+
+    The broker socket is reachable from the sandbox (same uid, socket in the
+    bind mount), so without this a caller could read host files (`~/.ssh/...`)
+    or write outside the repo as the host user. fs-perm (0600) gates other
+    users, not the sandbox.
+    """
+    root = roots[0]
+    path = Path(os.path.expanduser(str(value)))
+    if not path.is_absolute():
+        path = root / path
+    # Resolved, then proven inside a permitted root before any filesystem use.
+    # CodeQL does not model Path.is_relative_to as a guard.
+    path = path.resolve()  # codeql[py/path-injection]
+    if not _inside(path, roots):
+        return None, {
+            "ok": False,
+            "error": "remote_path_not_allowed",
+            "output": (
+                f"path must resolve inside the repo or .sc-state/local: {value}"
+            ),
+        }
+    return path, None
+
+
+def _guest_spec(cfg: dict, path: str) -> str:
+    """`user@host:<guest path>` for scp.
+
+    Passed VERBATIM — no shell quoting. `_scp_argv` forces the SFTP protocol,
+    under which the remote path never reaches the guest's cmd.exe, so
+    backslashes, spaces and non-ASCII characters arrive byte-exact. Quoting
+    here would put literal quote characters into the guest file name.
+    """
+    return f"{cfg.get('ssh_user')}@{cfg.get('ssh_host')}:{path}"
 
 
 def do_push(src: str, dest: str | None = None) -> dict:
-    """Stage a host-visible artifact into transfer_dir (the host side of the
-    guest's virtio-fs share). `src` is a path in the bind-mounted repo; the guest
-    sees the copy under its mapped share. The fast path — no scp, no guest auth.
+    """Copy a local artifact INTO the guest over scp.
 
-    Contained by design: `src` must resolve inside the repo and `dest` must stay
-    inside transfer_dir. The broker socket is reachable from the sandbox (same
-    uid, socket in the bind-mount), so without these an in-sandbox caller could
-    read host files (`src: ~/.ssh/...`) or write outside the share as the host
-    user (`dest: ../../..`) — a sandbox→host escape. fs-perm (0600) gates other
-    users, not the sandbox."""
+    `src` must resolve inside the repo or `.sc-state/local/`. `dest` is a guest
+    path; it defaults to `<workspace>\\<basename(src)>`.
+    """
     cfg = read() or {}
-    if m := _missing(cfg, "transfer_dir"):
+    if m := _missing(cfg, "ssh_host", "ssh_user", "ssh_key_path"):
         return {"ok": False, "output": m}
-    repo_root = ports.ENGINE.parent.resolve()
-    src_p = Path(os.path.expanduser(str(src)))
-    if not src_p.is_absolute():
-        src_p = repo_root / src_p
-    # The following filesystem operations use paths proven to remain within the
-    # repo/transfer roots. CodeQL does not model Path.is_relative_to as a guard.
-    src_p = src_p.resolve()  # codeql[py/path-injection]
-    if not src_p.is_relative_to(repo_root):
-        return {"ok": False, "output": f"push: src must be inside the repo: {src}"}
-    if not src_p.is_file():  # codeql[py/path-injection]
-        return {"ok": False, "output": f"push: source not found: {src_p}"}
-    d = Path(os.path.expanduser(str(cfg["transfer_dir"]))).resolve()
-    if not d.is_dir():
-        return {"ok": False, "output": f"transfer_dir does not exist: {d}"}
-    target = (d / (dest or src_p.name)).resolve()  # codeql[py/path-injection]
-    if not target.is_relative_to(d):
-        return {"ok": False, "output": f"push: dest escapes transfer_dir: {dest}"}
-    try:
-        shutil.copy2(src_p, target)  # codeql[py/path-injection]
-    except OSError as e:
-        return {"ok": False, "output": f"push failed: {e}"}
+    if not str(src or "").strip():
+        return {"ok": False, "output": "push: source is empty"}
+    roots = _transfer_roots()
+    source, error = _local_path(str(src), roots)
+    if error:
+        return error
+    assert source is not None
+    if not source.is_file():  # codeql[py/path-injection]
+        return {"ok": False, "output": f"push: source not found: {source}"}
+    target = str(dest).strip() if dest and str(dest).strip() else None
+    if target is None:
+        target = f"{_workspace(cfg)}\\{source.name}"
+    size = source.stat().st_size  # codeql[py/path-injection]
+    ok, output = _run(
+        _scp_argv(cfg, str(source), _guest_spec(cfg, target)),
+        timeout=TRANSFER_COMMAND_TIMEOUT,
+    )
+    if not ok:
+        return {
+            "ok": False,
+            "error": "push_failed",
+            "output": output or "scp to the guest failed",
+            "source": str(source),
+            "destination": target,
+        }
     return {
         "ok": True,
-        "output": f"staged {src_p.name} -> {target} (guest sees it via the share)",
-        "source": str(src_p),
-        "destination": str(target),
+        "output": f"copied {source.name} -> {target} ({size} bytes)",
+        "source": str(source),
+        "destination": target,
+        "bytes": size,
+    }
+
+
+def do_pull(src: str, dest: str) -> dict:
+    """Copy a guest file OUT over scp.
+
+    `src` is a guest path; `dest` must resolve inside the repo or
+    `.sc-state/local/`.
+    """
+    cfg = read() or {}
+    if m := _missing(cfg, "ssh_host", "ssh_user", "ssh_key_path"):
+        return {"ok": False, "output": m}
+    if not str(src or "").strip():
+        return {"ok": False, "output": "pull: guest source is empty"}
+    if not str(dest or "").strip():
+        return {"ok": False, "output": "pull: destination is empty"}
+    roots = _transfer_roots()
+    destination, error = _local_path(str(dest), roots)
+    if error:
+        return error
+    assert destination is not None
+    try:
+        destination.parent.mkdir(parents=True, exist_ok=True)  # codeql[py/path-injection]
+    except OSError as exc:
+        return {"ok": False, "output": f"pull: destination unusable: {exc}"}
+    ok, output = _run(
+        _scp_argv(cfg, _guest_spec(cfg, str(src)), str(destination)),
+        timeout=TRANSFER_COMMAND_TIMEOUT,
+    )
+    if not ok:
+        return {
+            "ok": False,
+            "error": "pull_failed",
+            "output": output or "scp from the guest failed",
+            "source": str(src),
+            "destination": str(destination),
+        }
+    try:
+        size = destination.stat().st_size  # codeql[py/path-injection]
+    except OSError:
+        size = 0
+    return {
+        "ok": True,
+        "output": f"copied {src} -> {destination} ({size} bytes)",
+        "source": str(src),
+        "destination": str(destination),
+        "bytes": size,
     }
 
 
@@ -1195,7 +1430,7 @@ def mcp_status() -> dict:
 def do_mcp_up(wait: float = 15) -> dict:
     """Open the MCP tunnel. Idempotent — an already-live tunnel is reported, not
     doubled. The forward target is the SAVED block's `mcp_port` (default 8000,
-    what `windows_vm_gui`'s guest prep bakes), never a caller-named port — same
+    what provisioning registers Windows-MCP on), never a caller-named port — same
     rule as every other verb: the sandbox names an action, not a destination."""
     cfg = read() or {}
     if m := _missing(cfg, "ssh_host", "ssh_user", "ssh_key_path"):
@@ -2124,7 +2359,7 @@ def _broker_failure(operation: str, response: dict) -> dict:
 def run_operation(operation: str, *, command: str | None = None,
                   src: str | None = None, dest: str | None = None,
                   output: str | None = None, force: bool = False,
-                  snapshot: str | None = None) -> dict:
+                  snapshot: str | None = None, running: bool = False) -> dict:
     """Call one core broker operation once and normalize its public result."""
     validated_target: Path | None = None
     if operation == "exec" and (not isinstance(command, str) or not command.strip()):
@@ -2134,6 +2369,14 @@ def run_operation(operation: str, *, command: str | None = None,
     if operation == "push" and (not isinstance(src, str) or not src):
         return operation_error(
             operation, "push_source_invalid", "the push source is empty"
+        )
+    if operation == "pull" and (not isinstance(src, str) or not src):
+        return operation_error(
+            operation, "pull_source_invalid", "the pull source is empty"
+        )
+    if operation == "pull" and (not isinstance(dest, str) or not dest):
+        return operation_error(
+            operation, "pull_destination_invalid", "the pull destination is empty"
         )
     if operation == "capture" and output is not None:
         try:
@@ -2158,12 +2401,20 @@ def run_operation(operation: str, *, command: str | None = None,
         ),
         "reset": (
             "POST", "/reset",
-            {"running": False, **({"snapshot": snapshot} if snapshot else {})},
+            {"running": bool(running),
+             **({"snapshot": snapshot} if snapshot else {})},
             RESET_CLIENT_TIMEOUT,
+        ),
+        "bake": (
+            "POST", "/bake", {**({"name": snapshot} if snapshot else {})},
+            BAKE_CLIENT_TIMEOUT,
         ),
         "exec": ("POST", "/exec", {"command": command}, EXEC_CLIENT_TIMEOUT),
         "push": (
-            "POST", "/push", {"src": src, "dest": dest}, DEFAULT_CLIENT_TIMEOUT
+            "POST", "/push", {"src": src, "dest": dest}, TRANSFER_CLIENT_TIMEOUT
+        ),
+        "pull": (
+            "POST", "/pull", {"src": src, "dest": dest}, TRANSFER_CLIENT_TIMEOUT
         ),
         "capture": ("POST", "/capture", {}, CAPTURE_CLIENT_TIMEOUT),
     }
@@ -2323,14 +2574,30 @@ def run_operation(operation: str, *, command: str | None = None,
                 "domain": response["domain"],
                 "snapshot": response["snapshot"],
             })
-        if operation == "push":
+        if operation in {"push", "pull"}:
             source = response["source"]
             destination = response["destination"]
-            if not isinstance(source, str) or not isinstance(destination, str):
+            transferred = response["bytes"]
+            if (
+                not isinstance(source, str)
+                or not isinstance(destination, str)
+                or isinstance(transferred, bool)
+                or not isinstance(transferred, int)
+            ):
                 raise TypeError
             return operation_success(operation, {
                 "source": source,
                 "destination": destination,
+                "bytes": transferred,
+            })
+        if operation == "bake":
+            return operation_success(operation, {
+                "domain": {
+                    "name": response["domain"],
+                    "state": response["domain_state"],
+                },
+                "snapshot": response["snapshot"],
+                "baseline_updated": bool(response["baseline_updated"]),
             })
         if operation == "capture":
             return _materialize_capture(response, output, validated_target)
@@ -2465,7 +2732,23 @@ def _human_result(value: dict) -> str:
             lines.append(f"stderr:\n{result['stderr'].rstrip()}")
         return "\n".join(lines)
     if operation == "push":
-        return f"Staged {result['source']} -> {result['destination']}"
+        return (
+            f"Pushed {result['source']} -> {result['destination']} "
+            f"({result['bytes']} bytes)"
+        )
+    if operation == "pull":
+        return (
+            f"Pulled {result['source']} -> {result['destination']} "
+            f"({result['bytes']} bytes)"
+        )
+    if operation == "bake":
+        baseline = (
+            " · vm block baseline updated" if result["baseline_updated"] else ""
+        )
+        return (
+            f"Baked VM snapshot '{result['snapshot']}' offline · "
+            f"{result['domain']['state']}{baseline}"
+        )
     if operation == "capture":
         return (
             f"Capture saved to {result['path']} "
@@ -2485,13 +2768,24 @@ def client_main(argv: list[str]) -> int:
     )
     init.add_argument("--domain")
     init.add_argument("--snapshot")
-    init.add_argument("--transfer-dir")
+    # retired-compat (spec #232): the guest share is gone. The flag is still
+    # PARSED so an operator's old note does not hard-fail; the value is dropped
+    # and never written to the vm block. Hidden from help. This is the one
+    # surface that may still spell the retired field name.
+    init.add_argument("--transfer-dir", help=argparse.SUPPRESS)
     init.add_argument("--ssh-host")
     init.add_argument("--ssh-user")
     init.add_argument("--ssh-key-path")
     init.add_argument("--libvirt-uri")
     init.add_argument("--ssh-port", type=int)
     init.add_argument("--mcp-port", type=int)
+    init.add_argument(
+        "--workspace", help="guest working directory, e.g. C:\\SubfloorTest"
+    )
+    init.add_argument(
+        "--known-hosts-path",
+        help="host-side known_hosts file pinning the guest host key",
+    )
     init.add_argument("--json", action="store_true", help="print one JSON result object")
     status = commands.add_parser(
         "status",
@@ -2545,17 +2839,22 @@ def client_main(argv: list[str]) -> int:
         )
     reset = commands.add_parser(
         "reset",
-        help="restore the testing snapshot and leave the VM off",
+        help="restore a snapshot, leaving the VM off or running",
         description=(
-            "Powered-off reset. JSON result fields: domain.name, domain.state; "
-            "snapshot."
+            "Snapshot reset. Exactly one of --off or --running is required. "
+            "JSON result fields: domain.name, domain.state; snapshot."
         ),
     )
-    reset.add_argument(
+    reset_state = reset.add_mutually_exclusive_group(required=True)
+    reset_state.add_argument(
         "--off",
         action="store_true",
-        required=True,
-        help="required: leave the restored VM powered off",
+        help="leave the restored VM powered off (bounded graceful stop)",
+    )
+    reset_state.add_argument(
+        "--running",
+        action="store_true",
+        help="leave the restored VM running",
     )
     reset.add_argument("snapshot", nargs="?", help="snapshot name; defaults to configured")
     reset.add_argument(
@@ -2563,15 +2862,47 @@ def client_main(argv: list[str]) -> int:
     )
     push = commands.add_parser(
         "push",
-        help="stage a permitted local artifact for the guest",
+        help="copy a permitted local file into the guest over scp",
         description=(
-            "Stage a file from this repo through the configured transfer area. "
-            "JSON result fields: source, destination."
+            "Copy a file from this repo or .sc-state/local into the guest over "
+            "scp. DEST is a guest path and defaults to "
+            "<workspace>\\<basename>. JSON result fields: source, "
+            "destination, bytes."
         ),
     )
-    push.add_argument("src", help="source file inside the repo")
-    push.add_argument("dest", nargs="?", help="optional path inside transfer_dir")
+    push.add_argument("src", help="source file inside the repo or .sc-state/local")
+    push.add_argument("dest", nargs="?", help="optional guest destination path")
     push.add_argument(
+        "--json", action="store_true", help="print one JSON result object"
+    )
+    pull = commands.add_parser(
+        "pull",
+        help="copy a guest file back into the repo over scp",
+        description=(
+            "Copy a file out of the guest over scp. DEST must resolve inside "
+            "this repo or .sc-state/local. JSON result fields: source, "
+            "destination, bytes."
+        ),
+    )
+    pull.add_argument("src", help="guest source path")
+    pull.add_argument("dest", help="local destination inside the repo or .sc-state/local")
+    pull.add_argument(
+        "--json", action="store_true", help="print one JSON result object"
+    )
+    bake = commands.add_parser(
+        "bake",
+        help="graceful shutdown, then replace the baseline snapshot offline",
+        description=(
+            "Re-bake the baseline: graceful shutdown, replace (never stack) the "
+            "snapshot offline, and leave the guest powered off. NAME redefines "
+            "the baseline and updates the vm block's snapshot. JSON result "
+            "fields: domain.name, domain.state; snapshot; baseline_updated."
+        ),
+    )
+    bake.add_argument(
+        "name", nargs="?", help="snapshot name; defaults to the configured baseline"
+    )
+    bake.add_argument(
         "--json", action="store_true", help="print one JSON result object"
     )
     execute = commands.add_parser(
@@ -2679,23 +3010,27 @@ def client_main(argv: list[str]) -> int:
         for key, candidate in (
             ("domain", args.domain),
             ("snapshot", args.snapshot),
-            ("transfer_dir", args.transfer_dir),
             ("ssh_host", args.ssh_host),
             ("ssh_user", args.ssh_user),
             ("ssh_key_path", args.ssh_key_path),
             ("libvirt_uri", args.libvirt_uri),
             ("ssh_port", args.ssh_port),
             ("mcp_port", args.mcp_port),
+            ("workspace", args.workspace),
+            ("known_hosts_path", args.known_hosts_path),
         ):
             if candidate is not None:
                 config[key] = candidate
+        # The guest share is retired (spec #232). Old operator notes still pass
+        # --transfer-dir, so accept it, drop it, and say so instead of failing.
+        config.pop("transfer_dir", None)
         config.setdefault("ssh_port", 22)
         config.setdefault("mcp_port", 8000)
+        config.setdefault("workspace", winbox.DEFAULT_WORKSPACE)
         missing = _missing(
             config,
             "domain",
             "snapshot",
-            "transfer_dir",
             "ssh_host",
             "ssh_user",
             "ssh_key_path",
@@ -2719,6 +3054,12 @@ def client_main(argv: list[str]) -> int:
             )
         else:
             value = run_init(config)
+            if args.transfer_dir is not None and not args.json:
+                print(
+                    "note: --transfer-dir is retired and was ignored — the "
+                    "guest share is gone; push/pull now run over scp.",
+                    file=sys.stderr,
+                )
     elif args.operation == "mcp":
         value = run_mcp_operation(args.mcp_action)
     elif args.operation == "stop":
@@ -2729,7 +3070,11 @@ def client_main(argv: list[str]) -> int:
             snapshot=getattr(args, "name", None),
         )
     elif args.operation == "reset":
-        value = run_operation("reset", snapshot=args.snapshot)
+        value = run_operation(
+            "reset", snapshot=args.snapshot, running=bool(args.running)
+        )
+    elif args.operation == "bake":
+        value = run_operation("bake", snapshot=args.name)
     elif args.operation == "exec":
         command_parts = args.command
         if command_parts[:1] == ["--"]:
@@ -2755,6 +3100,8 @@ def client_main(argv: list[str]) -> int:
             value = run_operation("exec", command=" ".join(command_parts))
     elif args.operation == "push":
         value = run_operation("push", src=args.src, dest=args.dest)
+    elif args.operation == "pull":
+        value = run_operation("pull", src=args.src, dest=args.dest)
     elif args.operation == "capture":
         value = run_operation("capture", output=args.output)
     else:
@@ -2785,10 +3132,15 @@ def main(argv: list[str]) -> int:
     elif mode == "push":
         print(json.dumps(do_push(argv[1] if len(argv) > 1 else "",
                                  argv[2] if len(argv) > 2 else None)))
+    elif mode == "pull":
+        print(json.dumps(do_pull(argv[1] if len(argv) > 1 else "",
+                                 argv[2] if len(argv) > 2 else "")))
     elif mode == "capture":
         print(json.dumps(do_capture(" ".join(argv[1:]) or None)))
     elif mode == "bake":
-        r = do_bake()
+        # `./sc vm-bake` alias — same code as the `bake` client verb, which
+        # reaches do_bake through the broker.
+        r = do_bake(argv[1] if len(argv) > 1 else None)
         print(json.dumps(r))
         return 0 if r["ok"] else 1
     elif mode == "mcp-sock":
@@ -2804,7 +3156,9 @@ def main(argv: list[str]) -> int:
     elif mode == "validate":
         print(json.dumps(validate(argv[1] if len(argv) > 1 else "", read() or {})))
     else:
-        sys.exit("usage: vm.py [client <status|start|push|exec|capture|reset --off>|sock|exec <cmd>|reset|bake|push <src> [dest]|capture [cmd]"
+        sys.exit("usage: vm.py [client <status|start|push|pull|exec|capture|bake|"
+                 "reset --off|--running>|sock|exec <cmd>|reset|bake [name]|"
+                 "push <src> [dest]|pull <src> <dest>|capture [cmd]"
                  "|mcp-sock|mcp-up|mcp-down|mcp-status|validate <check>]")
     return 0
 
