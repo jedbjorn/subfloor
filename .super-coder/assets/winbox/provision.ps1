@@ -181,6 +181,22 @@ if (-not $wingetPresent) {
     }
 }
 if ($wingetPresent) {
+    # Same per-user gap for the source index: Microsoft.Winget.Source is
+    # provisioned machine-wide but a first-time account has no registration,
+    # and winget then fails every search with 0x8a15000f ('Data required by
+    # the source is missing'). Register the machine copy for this user.
+    $srcPkg = Get-AppxPackage -Name 'Microsoft.Winget.Source' -ErrorAction SilentlyContinue | Select-Object -First 1
+    if (-not $srcPkg) {
+        $srcAll = Get-AppxPackage -AllUsers -Name 'Microsoft.Winget.Source' -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($srcAll -and $srcAll.InstallLocation) {
+            try {
+                Add-AppxPackage -DisableDevelopmentMode -Register (Join-Path $srcAll.InstallLocation 'AppxManifest.xml') -ErrorAction Stop
+                $wingetNotes += ('registered winget source index ' + $srcAll.Version + ' for ' + $env:USERNAME)
+            } catch {
+                $wingetNotes += ('winget source index register failed: ' + $_.Exception.Message)
+            }
+        }
+    }
     $wingetVersion = Invoke-Capture -CommandLine 'winget --version'
     $detail = 'present ' + (Get-Truncated -Text $wingetVersion.Output)
     if ($wingetNotes.Count -gt 0) { $detail = $detail + '; ' + ($wingetNotes -join '; ') }
