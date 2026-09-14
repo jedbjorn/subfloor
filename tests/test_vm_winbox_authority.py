@@ -16,6 +16,7 @@ Run:
 """
 from __future__ import annotations
 
+import shutil
 import sys
 import tempfile
 import unittest
@@ -184,13 +185,17 @@ class PushPullTests(unittest.TestCase):
         self.assertEqual(result["bytes"], 1234)
         argv = run.call_args[0][0]
         self.assertEqual(argv[-2], str(source))
+        # Forward slashes on the wire: scp -s speaks SFTP, where a backslash
+        # is an escape character, not a separator. The result still echoes the
+        # guest path the way the caller wrote it.
         self.assertEqual(
-            argv[-1], "tester@192.168.122.100:C:\\SubfloorTest\\app.msi"
+            argv[-1], "tester@192.168.122.100:C:/SubfloorTest/app.msi"
         )
 
     def test_push_keeps_non_ascii_names_verbatim_in_the_remote_spec(self):
         # Under SFTP the remote path never reaches cmd.exe, so it is passed
         # unquoted and byte-exact: no shell quoting, no code-page round trip.
+        # Only the SEPARATOR is normalised.
         self._artifact("build/Δ rapport ü.txt")
         with mock.patch.object(vm, "read", return_value=SAVED), \
              mock.patch.object(vm, "_run", return_value=(True, "")) as run:
@@ -201,7 +206,7 @@ class PushPullTests(unittest.TestCase):
         )
         remote = run.call_args[0][0][-1]
         self.assertEqual(
-            remote, "tester@192.168.122.100:C:\\SubfloorTest\\Δ rapport ü.txt"
+            remote, "tester@192.168.122.100:C:/SubfloorTest/Δ rapport ü.txt"
         )
         self.assertNotIn('"', remote)
 
@@ -215,7 +220,7 @@ class PushPullTests(unittest.TestCase):
         self.assertEqual(result["destination"], "C:\\ProgramData\\ssh\\probe.pub")
         self.assertEqual(
             run.call_args[0][0][-1],
-            "tester@192.168.122.100:C:\\ProgramData\\ssh\\probe.pub",
+            "tester@192.168.122.100:C:/ProgramData/ssh/probe.pub",
         )
 
     def test_push_refuses_a_source_outside_the_permitted_roots(self):
@@ -259,10 +264,87 @@ class PushPullTests(unittest.TestCase):
         self.assertEqual(result["destination"], str(target))
         self.assertEqual(result["bytes"], 17)
         argv = run.call_args[0][0]
+        # The halo run proved this one: a backslash guest SOURCE is glob-escaped
+        # by the scp client and the server never sees the path, so pull failed
+        # with "No such file or directory" while the identical push worked.
         self.assertEqual(
-            argv[-2], "tester@192.168.122.100:C:\\SubfloorTest\\Δ out.txt"
+            argv[-2], "tester@192.168.122.100:C:/SubfloorTest/Δ out.txt"
         )
         self.assertEqual(argv[-1], str(target))
+
+    def test_pull_accepts_either_separator_and_sends_forward_slashes(self):
+        target = self.repo / ".sc-state" / "local" / "guest" / "plain.bin"
+
+        def fake_run(argv, timeout=30):
+            Path(argv[-1]).write_bytes(b"bytes")
+            return True, ""
+
+        for written in ("C:\\SubfloorTest\\plain.bin", "C:/SubfloorTest/plain.bin"):
+            with self.subTest(guest_path=written), \
+                 mock.patch.object(vm, "read", return_value=SAVED), \
+                 mock.patch.object(vm, "_run", side_effect=fake_run) as run:
+                result = vm.do_pull(written, str(target))
+            self.assertTrue(result["ok"], result)
+            # The echo keeps the caller's spelling; only the wire is normalised.
+            self.assertEqual(result["source"], written)
+            self.assertEqual(
+                run.call_args[0][0][-2],
+                "tester@192.168.122.100:C:/SubfloorTest/plain.bin",
+            )
+
+    def test_push_refuses_the_adoption_key_directory(self):
+        """`.sc-state/local/vm/` holds the private key and the host-key pin."""
+        source = self.repo / ".sc-state" / "local" / "vm" / "w10c.key"
+        source.parent.mkdir(parents=True, exist_ok=True)
+        source.write_text("PRIVATE KEY")
+        with mock.patch.object(vm, "read", return_value=SAVED), \
+             mock.patch.object(vm, "_run") as run:
+            result = vm.do_push(str(source))
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["error"], "remote_path_not_allowed")
+        self.assertIn("vm", result["output"])
+        run.assert_not_called()
+
+    def test_pull_refuses_the_key_directory_the_engine_and_the_object_store(self):
+        for parts in ((".sc-state", "local", "vm", "w10c.key"),
+                      (".super-coder", "scripts", "vm.py"),
+                      (".git", "config")):
+            dest = self.repo.joinpath(*parts)
+            with self.subTest(dest=str(dest)), \
+                 mock.patch.object(vm, "read", return_value=SAVED), \
+                 mock.patch.object(vm, "_run") as run:
+                result = vm.do_pull("C:\\SubfloorTest\\out.txt", str(dest))
+            self.assertFalse(result["ok"], result)
+            self.assertEqual(result["error"], "remote_path_not_allowed")
+            run.assert_not_called()
+            self.assertFalse(dest.exists())
+
+    def test_a_symlink_cannot_smuggle_a_push_source_or_a_pull_destination(self):
+        """Containment runs on the RESOLVED path, both directions."""
+        outside = Path(tempfile.mkdtemp(prefix="sc_vm_outside_")).resolve()
+        self.addCleanup(shutil.rmtree, outside, True)
+        (outside / "secret.txt").write_text("not yours")
+        (self.repo / "link-out").symlink_to(outside / "secret.txt")
+        (self.repo / "link-dir").symlink_to(outside)
+        # Also a symlink aimed at a carved-out root inside the repo.
+        (self.repo / ".sc-state" / "local" / "vm").mkdir(parents=True, exist_ok=True)
+        (self.repo / ".sc-state" / "local" / "vm" / "w10c.key").write_text("K")
+        (self.repo / "link-key").symlink_to(
+            self.repo / ".sc-state" / "local" / "vm" / "w10c.key"
+        )
+
+        with mock.patch.object(vm, "read", return_value=SAVED), \
+             mock.patch.object(vm, "_run") as run:
+            escape = vm.do_push(str(self.repo / "link-out"))
+            key = vm.do_push(str(self.repo / "link-key"))
+            write_out = vm.do_pull(
+                "C:\\SubfloorTest\\out.txt", str(self.repo / "link-dir" / "x.txt")
+            )
+        for result in (escape, key, write_out):
+            self.assertFalse(result["ok"], result)
+            self.assertEqual(result["error"], "remote_path_not_allowed")
+        run.assert_not_called()
+        self.assertFalse((outside / "x.txt").exists())
 
     def test_pull_refuses_a_destination_outside_the_permitted_roots(self):
         for dest in ("/etc/sc_escape_probe", "~/escape.txt", "../escape.txt"):

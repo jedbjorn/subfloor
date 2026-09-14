@@ -391,6 +391,10 @@ DOMAIN_STOP_TIMEOUT = 60
 DOMAIN_STOP_INTERVAL = 2
 RESET_COMMAND_TIMEOUT = 60
 SNAPSHOT_COMMAND_TIMEOUT = 120
+# `scp -s` (force the SFTP protocol) arrived in OpenSSH 8.7. An older client
+# answers with a usage line naming the option, which is unreadable as a
+# diagnosis unless we translate it.
+SCP_SFTP_UNSUPPORTED = ("unknown option -- s", "illegal option -- s")
 START_READINESS_TIMEOUT = 90
 START_READINESS_INTERVAL = 2
 MUTATION_LOCK_TIMEOUT = 5
@@ -399,10 +403,18 @@ TOOLCHAIN_CHECK_TIMEOUT = 20
 TRANSFER_COMMAND_TIMEOUT = 300
 BAKE_SHUTDOWN_TIMEOUT = 180
 BAKE_SNAPSHOT_TIMEOUT = 300
+# `--off` against a LIVE snapshot does the revert AND a bounded graceful stop
+# inside the one broker call, so the client budget has to cover both; a flat
+# 130s expired mid-stop and reported `reset_result_unknown` for a reset that
+# was in fact still running.
 RESET_BROKER_BUDGET = (
-    MUTATION_LOCK_TIMEOUT + RESET_COMMAND_TIMEOUT + DOMAIN_STATE_TIMEOUT
+    MUTATION_LOCK_TIMEOUT
+    + RESET_COMMAND_TIMEOUT
+    + DOMAIN_STATE_TIMEOUT
+    + DOMAIN_STOP_TIMEOUT
+    + DOMAIN_STATE_TIMEOUT
 )
-RESET_CLIENT_TIMEOUT = 130
+RESET_CLIENT_TIMEOUT = RESET_BROKER_BUDGET + 30
 START_BROKER_BUDGET = (
     MUTATION_LOCK_TIMEOUT
     + DOMAIN_STATE_TIMEOUT
@@ -460,6 +472,10 @@ def read() -> dict | None:
 RETIRED_VM_FIELDS = ("transfer_dir",)  # retired-compat (spec #232)
 
 
+class BlockWriteError(Exception):
+    """The vm block was not durably saved, or did not read back as written."""
+
+
 def write(vm: dict | None) -> dict | None:
     """Persist (or clear) the vm block, preserving every other config key.
 
@@ -473,6 +489,48 @@ def write(vm: dict | None) -> dict | None:
     else:
         ports.update({}, remove=("vm",))
     return vm
+
+
+def write_block_and_confirm(block: dict) -> bool:
+    """Persist the vm block and PROVE it reads back. Returns True if unchanged.
+
+    Two things make a bare `write()` unsafe as the last word:
+
+    1. `ports.resolve()` only returns the stored instance view when
+       instance.json carries a persisted `port` key; without one it derives a
+       fresh view that has no `vm` key at all. An install whose `ports ensure`
+       never ran therefore accepts the write and then reads back NOTHING —
+       observed on a scratch clone, where `vm-broker-up` said "nothing to
+       serve" and `bake` said "missing required field(s)" against an
+       instance.json that plainly held the block. Persisting the managed ports
+       first closes that hole for every later reader.
+    2. A write nobody reads back is a claim, not a fact. The round-trip is
+       cheap and turns a silent half-write into a named failure.
+
+    Raises BlockWriteError; never returns on a failed write.
+    """
+    wanted = {k: v for k, v in dict(block).items() if k not in RETIRED_VM_FIELDS}
+    try:
+        ports.resolve(persist=True)
+    except Exception as exc:  # noqa: BLE001 - any failure here is the same failure
+        raise BlockWriteError(
+            f"the instance ports could not be persisted, so the vm block "
+            f"would not be readable: {exc}"
+        ) from exc
+    if (read() or {}) == wanted:
+        return True
+    try:
+        write(wanted)
+    except Exception as exc:  # noqa: BLE001 - the caller only needs "it did not save"
+        raise BlockWriteError(f"the vm block could not be saved: {exc}") from exc
+    durable = read() or {}
+    if durable != wanted:
+        raise BlockWriteError(
+            "the vm block did not read back as written (saved "
+            f"{sorted(wanted)}, read {sorted(durable)}) — check "
+            f"{ports.CONFIG}"
+        )
+    return False
 
 
 # -- check primitives --------------------------------------------------------
@@ -552,6 +610,22 @@ def _ssh_argv(cfg: dict, remote: str) -> list[str]:
     ]
 
 
+def _scp_unsupported(output: str) -> dict | None:
+    """The host's scp is older than 8.7, so `-s` does not exist. Say that."""
+    lowered = str(output or "").lower()
+    if not any(marker in lowered for marker in SCP_SFTP_UNSUPPORTED):
+        return None
+    return {
+        "ok": False,
+        "error": "scp_unsupported",
+        "output": (
+            "this host's scp does not accept -s (force SFTP), which push and "
+            "pull require for a Windows guest: OpenSSH 8.7 or newer is the "
+            f"floor. Install a newer OpenSSH client on the host.\n{output}"
+        ),
+    }
+
+
 def _scp_argv(cfg: dict, *args: str) -> list[str]:
     """An scp invocation against the configured guest, same auth as _ssh_argv.
 
@@ -572,19 +646,29 @@ def _scp_argv(cfg: dict, *args: str) -> list[str]:
     ]
 
 
+def _trim_workspace(value: str) -> str:
+    """Drop a trailing separator so `<workspace>\\<name>` never doubles it —
+    except at a drive root, where `C:\\` trimmed to `C:` would mean "whatever
+    directory that drive is currently on", not the root."""
+    trimmed = value.rstrip("\\")
+    if not trimmed or trimmed.endswith(":"):
+        return trimmed + "\\" if trimmed else value
+    return trimmed
+
+
 def _workspace(cfg: dict) -> str:
     """The guest working directory: the vm block's value, else the fork's
     winbox profile, else the engine default."""
     declared = str(cfg.get("workspace", "") or "").strip()
     if declared:
-        return declared.rstrip("\\") or declared
+        return _trim_workspace(declared)
     try:
         return str(winbox.load(repo_root())["workspace"])
     except winbox.WinboxConfigError:
         return winbox.DEFAULT_WORKSPACE
 
 
-# -- the five checks ---------------------------------------------------------
+# -- the four checks ---------------------------------------------------------
 
 def _check_domain(cfg: dict) -> tuple[bool, str]:
     if m := _missing(cfg, "domain"):
@@ -1072,6 +1156,15 @@ def do_reset(running: bool = True, snapshot: str | None = None) -> dict:
     if running:
         argv.append("--running")
     ok, out = _run(argv, timeout=RESET_COMMAND_TIMEOUT)
+    forced = False
+    if not ok and "requires --force" in out:
+        # Reverting to a snapshot libvirt considers risky (an inactive
+        # snapshot of a running domain, or one taken by an older libvirt)
+        # is refused with exactly this text and permitted with --force.
+        # The guest is a disposable test box and reset is the whole point
+        # of the verb (decision #372), so take the retry once and say so.
+        ok, out = _run([*argv, "--force"], timeout=RESET_COMMAND_TIMEOUT)
+        forced = ok
     state_ok, observed = _domain_state(cfg)
     if ok and not running and state_ok and observed not in ("powered_off", "unknown"):
         # A LIVE snapshot restores a running domain; `--off` still promises a
@@ -1124,9 +1217,11 @@ def do_reset(running: bool = True, snapshot: str | None = None) -> dict:
             "reset_outcome": "state_mismatch",
         }
     state = "running" if running else "powered off"
+    note = " (libvirt required --force; retried once)" if forced else ""
     return {
         "ok": True,
-        "output": out or f"reverted '{cfg['domain']}' to '{selected}' ({state})",
+        "output": (out or f"reverted '{cfg['domain']}' to '{selected}' ({state})")
+        + note,
         "domain": str(cfg["domain"]),
         "snapshot": selected,
         "domain_state": observed,
@@ -1134,7 +1229,8 @@ def do_reset(running: bool = True, snapshot: str | None = None) -> dict:
     }
 
 
-def do_bake(name: str | None = None, shutdown_timeout: int = BAKE_SHUTDOWN_TIMEOUT) -> dict:
+def do_bake(name: str | None = None, shutdown_timeout: int = BAKE_SHUTDOWN_TIMEOUT,
+            cfg: dict | None = None) -> dict:
     """(Re)bake the baseline snapshot: graceful shutdown -> delete the old
     snapshot of the same name -> snapshot-create-as OFFLINE.
 
@@ -1146,8 +1242,12 @@ def do_bake(name: str | None = None, shutdown_timeout: int = BAKE_SHUTDOWN_TIMEO
     test box holding no data, every shell can restore any snapshot in seconds,
     and a shell that has just installed a toolchain needs to make it the
     baseline without waiting for the operator.
+
+    `cfg` overrides the saved block. `adopt` passes the block it has just
+    written so the baseline is taken against THAT guest even if the saved
+    block cannot be read back for any reason.
     """
-    cfg = read() or {}
+    cfg = dict(cfg) if cfg else (read() or {})
     if m := _missing(cfg, "domain", "snapshot"):
         return {"ok": False, "output": m}
     if name is not None and not _valid_resource_name(name):
@@ -1219,17 +1319,55 @@ def _transfer_roots() -> tuple[Path, Path]:
     return root, (root / ".sc-state" / "local").resolve()
 
 
+# Carved OUT of the roots above.
+#
+# `.sc-state/local/vm/` holds the adoption private key and the pinned
+# known-hosts file. They sit inside `.sc-state/local`, so containment alone
+# would let a caller push the key into the guest or pull a guest file over
+# it - and the whole access model is that key material never leaves the host
+# (decision #353). The engine directory and the repository's own object store
+# are pull-side exclusions that matter as much: a pull destination in either
+# rewrites the running engine, or the repository itself, from guest bytes.
+_PUSH_EXCLUDED = ((".sc-state", "local", "vm"),)
+_PULL_EXCLUDED = (
+    (".sc-state", "local", "vm"),
+    (".super-coder",),
+    (".git",),
+)
+
+
 def _inside(path: Path, roots: tuple[Path, ...]) -> bool:
     return any(path == root or path.is_relative_to(root) for root in roots)
 
 
-def _local_path(value: str, roots: tuple[Path, ...]) -> tuple[Path | None, dict | None]:
+def _excluded(path: Path, excluded: tuple[tuple[str, ...], ...]) -> Path | None:
+    """The excluded root `path` sits in, or None."""
+    base = repo_root()
+    for parts in excluded:
+        root = base.joinpath(*parts)
+        try:
+            resolved = root.resolve()
+        except OSError:  # pragma: no cover - resolving a plain join
+            resolved = root
+        if path == resolved or path.is_relative_to(resolved):
+            return resolved
+    return None
+
+
+def _local_path(
+    value: str,
+    roots: tuple[Path, ...],
+    excluded: tuple[tuple[str, ...], ...] = (),
+) -> tuple[Path | None, dict | None]:
     """Resolve a caller-supplied LOCAL path and contain it to `roots`.
 
     The broker socket is reachable from the sandbox (same uid, socket in the
     bind mount), so without this a caller could read host files (`~/.ssh/...`)
     or write outside the repo as the host user. fs-perm (0600) gates other
     users, not the sandbox.
+
+    `excluded` carves sub-trees back OUT of the permitted roots. A symlink
+    aimed at one is caught too, because the check runs on the RESOLVED path.
     """
     root = roots[0]
     path = Path(os.path.expanduser(str(value)))
@@ -1246,18 +1384,46 @@ def _local_path(value: str, roots: tuple[Path, ...]) -> tuple[Path | None, dict 
                 f"path must resolve inside the repo or .sc-state/local: {value}"
             ),
         }
+    forbidden = _excluded(path, excluded)
+    if forbidden is not None:
+        return None, {
+            "ok": False,
+            "error": "remote_path_not_allowed",
+            "output": (
+                f"path resolves inside {forbidden}, which push and pull never "
+                f"read from or write into: {value}"
+            ),
+        }
     return path, None
+
+
+def _guest_path(path: str) -> str:
+    """A guest path in the only separator scp's SFTP mode reads correctly.
+
+    Under `scp -s` the REMOTE side is an SFTP path, and the client treats a
+    backslash as an ESCAPE character while glob-expanding a remote SOURCE. So
+    `C:\\SubfloorTest\\plain.bin` reaches the server as `C:SubfloorTestplain.bin`
+    and pulls fail with "No such file or directory", while the identical push
+    (remote DESTINATION, not globbed) succeeds - exactly what the halo runs
+    observed. Windows' sftp-server accepts forward slashes everywhere, drive
+    letter included, so normalising here fixes pull without changing push.
+
+    The caller's own spelling is what gets echoed back in the result; this is
+    the wire form only.
+    """
+    return str(path).replace("\\", "/")
 
 
 def _guest_spec(cfg: dict, path: str) -> str:
     """`user@host:<guest path>` for scp.
 
-    Passed VERBATIM — no shell quoting. `_scp_argv` forces the SFTP protocol,
-    under which the remote path never reaches the guest's cmd.exe, so
-    backslashes, spaces and non-ASCII characters arrive byte-exact. Quoting
-    here would put literal quote characters into the guest file name.
+    Passed VERBATIM apart from the separator normalisation above - no shell
+    quoting. `_scp_argv` forces the SFTP protocol, under which the remote path
+    never reaches the guest's cmd.exe, so spaces and non-ASCII characters
+    arrive byte-exact. Quoting here would put literal quote characters into
+    the guest file name.
     """
-    return f"{cfg.get('ssh_user')}@{cfg.get('ssh_host')}:{path}"
+    return f"{cfg.get('ssh_user')}@{cfg.get('ssh_host')}:{_guest_path(path)}"
 
 
 def do_push(src: str, dest: str | None = None) -> dict:
@@ -1272,7 +1438,7 @@ def do_push(src: str, dest: str | None = None) -> dict:
     if not str(src or "").strip():
         return {"ok": False, "output": "push: source is empty"}
     roots = _transfer_roots()
-    source, error = _local_path(str(src), roots)
+    source, error = _local_path(str(src), roots, _PUSH_EXCLUDED)
     if error:
         return error
     assert source is not None
@@ -1287,6 +1453,8 @@ def do_push(src: str, dest: str | None = None) -> dict:
         timeout=TRANSFER_COMMAND_TIMEOUT,
     )
     if not ok:
+        if unsupported := _scp_unsupported(output):
+            return {**unsupported, "source": str(source), "destination": target}
         return {
             "ok": False,
             "error": "push_failed",
@@ -1317,7 +1485,7 @@ def do_pull(src: str, dest: str) -> dict:
     if not str(dest or "").strip():
         return {"ok": False, "output": "pull: destination is empty"}
     roots = _transfer_roots()
-    destination, error = _local_path(str(dest), roots)
+    destination, error = _local_path(str(dest), roots, _PULL_EXCLUDED)
     if error:
         return error
     assert destination is not None
@@ -1330,6 +1498,12 @@ def do_pull(src: str, dest: str) -> dict:
         timeout=TRANSFER_COMMAND_TIMEOUT,
     )
     if not ok:
+        if unsupported := _scp_unsupported(output):
+            return {
+                **unsupported,
+                "source": str(src),
+                "destination": str(destination),
+            }
         return {
             "ok": False,
             "error": "pull_failed",
@@ -1490,13 +1664,15 @@ def do_mcp_up(wait: float = 15) -> dict:
         MCP_SOCKET.unlink(missing_ok=True)
 
         port = int(cfg.get("mcp_port", 8000))
-        key = os.path.expanduser(str(cfg.get("ssh_key_path", "")))
+        # `_ssh_base_opts`, never a hand-rolled option list: it carries the
+        # key AND the pinned `known_hosts_path`. A tunnel that fell back to
+        # the operator's own ~/.ssh/known_hosts refused to open on a guest
+        # that had been reimaged since ("REMOTE HOST IDENTIFICATION HAS
+        # CHANGED"), while every other verb worked - they were reading the
+        # pin and this one was not.
         argv = [
-            "ssh", "-i", key,
-            "-p", str(cfg.get("ssh_port", 22)),
-            "-o", "BatchMode=yes",
-            "-o", "ConnectTimeout=10",
-            "-o", "StrictHostKeyChecking=accept-new",
+            "ssh", *_ssh_base_opts(cfg),
+            "-p", str(_ssh_port(cfg)),
             "-o", "ExitOnForwardFailure=yes",
             "-o", "ServerAliveInterval=30",
             "-o", "StreamLocalBindUnlink=yes",
@@ -2636,13 +2812,16 @@ def run_operation(operation: str, *, command: str | None = None,
 
 
 def run_init(config: dict) -> dict:
-    """Persist only the vm block, then report broker health without requiring it."""
+    """Persist only the vm block, then report broker health without requiring it.
+
+    The write is confirmed by reading it back (see `write_block_and_confirm`):
+    a block that does not round-trip is an `init_write_failed`, not a success
+    that strands `bake` and the broker on an unreadable instance file.
+    """
     try:
-        write(config)
-    except OSError:
-        return operation_error(
-            "init", "init_write_failed", "the VM configuration could not be saved"
-        )
+        write_block_and_confirm(config)
+    except BlockWriteError as exc:
+        return operation_error("init", "init_write_failed", str(exc))
     broker_ready = False
     try:
         health = broker_call("GET", "/health", None, timeout=5)
