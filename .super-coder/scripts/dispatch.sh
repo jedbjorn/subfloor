@@ -1241,10 +1241,8 @@ case "$cmd" in
   # ── in-container primitives (no docker; also the host escape hatch) ──
   serve)        exec "$PY" "$ENGINE/api/server.py" "$@" ;;
   # ── Windows VM broker (HOST-side primitive — runs where virsh + the key live) ──
-  # Subcommands (init/status/start/stop/restart/snapshot/bake/reset/push/pull/
-  # exec/capture/mcp) are parsed by vm.py's client parser.
-  # TODO(spec #232, adopt unit): `./sc vm adopt` help lives in the vm block of
-  # the full reference above — add it directly beneath `./sc vm init`.
+  # Subcommands (adopt/init/status/start/stop/restart/snapshot/bake/reset/push/
+  # pull/exec/capture/mcp) are parsed by vm.py's client parser.
   vm)                exec "$PY" "$S/vm.py" client "$@" ;;
   remote)            exec "$PY" "$S/remote.py" "$@" ;;
   vm-broker)         exec "$PY" "$ENGINE/api/vm_broker.py" "$@" ;;
@@ -1836,6 +1834,16 @@ Subfloor — forkable shell substrate — full command reference (./sc help for 
   Windows VM broker (run on the HOST — drives the test VM for sandboxed forks;
   holds the ssh key + virsh so the fork never does).
   `launch` brings it up automatically when a VM is linked; `down` stops it:
+  ./sc vm adopt --domain DOMAIN [--ssh-user USER] [--ssh-host IP] [--snapshot NAME]
+       [--libvirt-uri URI] [--password-file PATH] [--bootstrap-url URL]
+       [--no-provision] [--wait SECONDS] [--json]
+                           HOST-ONLY two-command adoption of a booted, licensed
+                           Windows guest: locate it, wait for sshd, install a
+                           host-held key with one password prompt, harden and pin,
+                           provision from .subfloor/winbox.json, verify, write the
+                           vm block, bring the broker up, take the baseline
+                           snapshot. Every phase is idempotent — re-run it after a
+                           toolchain change. Prints the guest bootstrap line.
   ./sc vm init --domain DOMAIN --snapshot NAME
        --ssh-host HOST --ssh-user USER --ssh-key-path PATH
        [--libvirt-uri URI] [--ssh-port N] [--mcp-port N]
