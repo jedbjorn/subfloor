@@ -792,36 +792,47 @@ def do_status() -> dict:
     }
 
 
-def do_start(wait: int = START_READINESS_TIMEOUT) -> dict:
-    """Start only an off domain, then own the bounded SSH-readiness wait."""
-    cfg = read() or {}
-    if m := _missing(cfg, "domain", "ssh_host", "ssh_user", "ssh_key_path"):
-        return {"ok": False, "output": m, "domain_state": "unknown", "attempts": 0}
+def _start_domain(cfg: dict) -> tuple[bool, str, bool, str]:
+    """Bring `cfg`'s domain to `running` WITHOUT any SSH-readiness wait.
+
+    Returns (ok, state, started, output). Factored out of `do_start` because
+    `vm adopt` needs the same power-on but must not wait for ssh: on a bare
+    guest there is no key yet, so readiness is a TCP probe, not an `echo ok`.
+    """
+    if m := _missing(cfg, "domain"):
+        return False, "unknown", False, m
     state_ok, state = _domain_state(cfg)
     if not state_ok:
-        return {"ok": False, "output": state, "domain_state": "unknown", "attempts": 0}
-
-    started = False
+        return False, "unknown", False, state
     if state == "powered_off":
         ok, output = _run(
             _virsh(cfg, "start", str(cfg["domain"])), timeout=DOMAIN_START_TIMEOUT
         )
         if not ok:
+            return False, state, False, output or "failed to start the VM"
+        return True, "running", True, output
+    if state != "running":
+        return False, state, False, (
+            f"domain is {state}; start only handles powered_off or running"
+        )
+    return True, state, False, ""
+
+
+def do_start(wait: int = START_READINESS_TIMEOUT) -> dict:
+    """Start only an off domain, then own the bounded SSH-readiness wait."""
+    cfg = read() or {}
+    if m := _missing(cfg, "domain", "ssh_host", "ssh_user", "ssh_key_path"):
+        return {"ok": False, "output": m, "domain_state": "unknown", "attempts": 0}
+    ok, state, started, output = _start_domain(cfg)
+    if not ok:
+        if state == "unknown":
             return {
-                "ok": False,
-                "output": output or "failed to start the VM",
-                "domain": str(cfg["domain"]),
-                "domain_state": state,
-                "started": False,
-                "attempts": 0,
-                "last_readiness_error": None,
+                "ok": False, "output": output,
+                "domain_state": "unknown", "attempts": 0,
             }
-        started = True
-        state = "running"
-    elif state != "running":
         return {
             "ok": False,
-            "output": f"domain is {state}; start only handles powered_off or running",
+            "output": output,
             "domain": str(cfg["domain"]),
             "domain_state": state,
             "started": False,
@@ -2763,6 +2774,49 @@ def client_main(argv: list[str]) -> int:
         description="Observe and control the configured Windows test VM.",
     )
     commands = parser.add_subparsers(dest="operation", required=True)
+    adopt = commands.add_parser(
+        "adopt",
+        help="adopt a booted Windows guest: key, harden, provision, verify, baseline",
+        description=(
+            "Host-only two-command adoption (spec #232). Phases: locate, wait, "
+            "install_key, harden, provision, verify, write_block, broker, "
+            "baseline — each reported done, skipped or failed. Every phase is "
+            "idempotent, so re-running after a toolchain change skips what is "
+            "already satisfied. JSON result fields: domain; phases[].name, "
+            "phases[].status, phases[].detail; vm (the block written); "
+            "next_steps."
+        ),
+    )
+    adopt.add_argument("--domain", required=True, help="libvirt domain name")
+    adopt.add_argument(
+        "--ssh-user",
+        help="guest administrator account; defaults to the saved vm block's ssh_user",
+    )
+    adopt.add_argument(
+        "--ssh-host", help="guest address when DHCP and ARP cannot resolve it"
+    )
+    adopt.add_argument(
+        "--snapshot", default="baseline", help="baseline snapshot name (default baseline)"
+    )
+    adopt.add_argument(
+        "--libvirt-uri", default="qemu:///system", help="default qemu:///system"
+    )
+    adopt.add_argument(
+        "--password-file",
+        help="read the guest password from this file instead of the TTY",
+    )
+    adopt.add_argument(
+        "--bootstrap-url", help="override the bootstrap.ps1 URL printed for the guest"
+    )
+    adopt.add_argument(
+        "--no-provision", action="store_true",
+        help="skip provisioning and the declared checks; adopt the guest as it is",
+    )
+    adopt.add_argument(
+        "--wait", type=int, default=900,
+        help="seconds to wait for the guest's TCP 22 (default 900)",
+    )
+    adopt.add_argument("--json", action="store_true", help="print one JSON result object")
     init = commands.add_parser(
         "init", help="write the vm block from explicit flags and report broker health"
     )
@@ -3005,6 +3059,30 @@ def client_main(argv: list[str]) -> int:
             "--json", action="store_true", help="print one JSON result object"
         )
     args = parser.parse_args(argv)
+    if args.operation == "adopt":
+        # Deferred import: vm_adopt imports THIS module for its ssh/virsh
+        # primitives, so binding it at import time would be circular.
+        import vm_adopt
+
+        value = vm_adopt.run_adopt(
+            domain=args.domain,
+            ssh_user=args.ssh_user,
+            ssh_host=args.ssh_host,
+            snapshot=args.snapshot,
+            libvirt_uri=args.libvirt_uri,
+            password_file=args.password_file,
+            bootstrap_url=args.bootstrap_url,
+            provision=not args.no_provision,
+            wait=args.wait,
+        )
+        if args.json:
+            print(json.dumps(value, separators=(",", ":")))
+        else:
+            print(
+                vm_adopt.human_report(value),
+                file=sys.stdout if value["ok"] else sys.stderr,
+            )
+        return 0 if value["ok"] else 1
     if args.operation == "init":
         config = dict(read() or {})
         for key, candidate in (
@@ -3156,7 +3234,7 @@ def main(argv: list[str]) -> int:
     elif mode == "validate":
         print(json.dumps(validate(argv[1] if len(argv) > 1 else "", read() or {})))
     else:
-        sys.exit("usage: vm.py [client <status|start|push|pull|exec|capture|bake|"
+        sys.exit("usage: vm.py [client <adopt|status|start|push|pull|exec|capture|bake|"
                  "reset --off|--running>|sock|exec <cmd>|reset|bake [name]|"
                  "push <src> [dest]|pull <src> <dest>|capture [cmd]"
                  "|mcp-sock|mcp-up|mcp-down|mcp-status|validate <check>]")
