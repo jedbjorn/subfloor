@@ -64,7 +64,11 @@ class WindowsCapabilityBoundaryTest(unittest.TestCase):
         )
 
         self.assertEqual(completed.returncode, 0, completed.stderr)
-        for command in ("vm push", "vm exec", "vm capture"):
+        # AC8 (spec #232): adoption, bake and pull are public guest commands
+        # and must be catalogued beside the ones that were already public.
+        for command in (
+            "vm adopt", "vm bake", "vm pull", "vm push", "vm exec", "vm capture",
+        ):
             self.assertIn(f"./sc {command}", completed.stdout)
 
 
