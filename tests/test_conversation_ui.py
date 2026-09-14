@@ -1443,7 +1443,7 @@ const background = chatStatePill("idle", {pid: 4242, lingering: true});
 console.log(JSON.stringify({
   lingering: shape(background),
   animated: background.kids.length === 2,
-  explained: background.title.includes("background tasks"),
+  explained: background.title.startsWith("pid 4242"),
   idle: shape(chatStatePill("idle", {pid: 4242, lingering: false})),
   noProcess: shape(chatStatePill("idle")),
   running: shape(chatStatePill("running", {pid: 4242, lingering: false})),
@@ -1452,7 +1452,7 @@ console.log(JSON.stringify({
     assert run_js(script) == {
         "lingering": [
             "chat-state state-idle lingering",
-            "working in background · pid 4242",
+            "working in background",
         ],
         "animated": True,
         "explained": True,
