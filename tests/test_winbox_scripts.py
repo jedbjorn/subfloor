@@ -208,7 +208,7 @@ def test_provision_invokes_tools_natively_not_through_cmd(provision: str) -> Non
     with the quote characters still in it and the manifest is never found.
     Only the fork's own free-form `checks` go through cmd."""
     assert "function Invoke-Native" in provision
-    assert "& $Exe @Arguments 2>&1 | Out-String" in provision
+    assert "& $target @Arguments 2>&1 | Out-String" in provision
     # cmd is INVOKED exactly once, in the checks helper.
     assert provision.count("cmd.exe /c") == 1
     shell = provision.split("function Invoke-Shell", 1)[1].split("\n}", 1)[0]
