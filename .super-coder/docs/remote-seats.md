@@ -38,12 +38,13 @@ preserves keys it does not own, and neither block holds key material.
 "vm": {
   "domain": "w10c-testing",
   "snapshot": "baseline",
-  "transfer_dir": "/srv/vm-share",
   "libvirt_uri": "qemu:///system",
   "ssh_host": "192.168.122.50",
   "ssh_user": "tester",
   "ssh_key_path": "/home/op/.ssh/vm_tester",
   "ssh_port": 22,
+  "known_hosts_path": "/home/op/repo/.sc-state/local/vm/w10c-testing.known_hosts",
+  "workspace": "C:\\SubfloorTest",
   "mcp_port": 8000
 }
 ```
@@ -52,10 +53,14 @@ preserves keys it does not own, and neither block holds key material.
 |---|---|
 | `domain` | the one libvirt domain this broker controls |
 | `snapshot` | the protected baseline; `reset` defaults to it and `snapshot delete` refuses it |
-| `transfer_dir` | host side of the guest's share; `push` stages files here, contained inside it |
 | `libvirt_uri` | optional `virsh -c` target |
-| `ssh_host`, `ssh_user`, `ssh_key_path`, `ssh_port` | guest SSH for `exec`, readiness waits and the MCP tunnel |
+| `ssh_host`, `ssh_user`, `ssh_key_path`, `ssh_port` | guest SSH for `exec`, `push`, `pull`, readiness waits and the MCP tunnel |
+| `known_hosts_path` | host-owned known-hosts file the guest's key is pinned into during adoption; every later `ssh`/`scp` uses it |
+| `workspace` | guest-side working directory; `push` defaults its destination to `<workspace>\<basename>` (default `C:\SubfloorTest`) |
 | `mcp_port` | guest port the Windows-MCP tunnel forwards to (default 8000) |
+
+The host-share field older blocks carried is ignored and never written back;
+the guest share it named is retired in favour of `scp` over the guest's SSH.
 
 ### `remotes` — posture 2
 
@@ -78,15 +83,54 @@ preserves keys it does not own, and neither block holds key material.
 | `key_path` | absolute, host-owned, regular file with mode 0600, or every verb is refused with `remote_key_invalid` |
 | `known_hosts_path` | optional absolute path; absent means the broker pins the host key on first contact (`accept-new`) into `.sc-state/local/remotes/<name>.known_hosts` (directory mode 0700) |
 
-## Onboarding — three commands
+## Onboarding a Windows guest — two commands
 
-Each writes only its own block and reports whether its broker is up plus the
-command that starts it. None of them installs a guest, an SSH server, a key or
-a toolchain.
+Bring your own booted, licensed Windows 10 or 11 guest with a working network
+and a local administrator account. Adoption is then two commands and about five
+minutes.
+
+**1 — in the guest**, from an elevated PowerShell on the console:
+
+```powershell
+powershell -ExecutionPolicy Bypass -Command "[Net.ServicePointManager]::SecurityProtocol='Tls12'; irm https://raw.githubusercontent.com/jedbjorn/subfloor/<ref>/.super-coder/assets/winbox/bootstrap.ps1 | iex"
+```
+
+`<ref>` is the engine's pinned commit — the contents of `.super-coder/engine.ref`
+when that file is present, else `main`. `./sc vm adopt` prints the exact line for
+this install, and `--bootstrap-url <url>` overrides it for a branch under test.
+The repository is public, so the guest needs only outbound HTTPS; a guest with
+no internet can have the file copied in by any means and run it the same way.
+The script installs and starts OpenSSH server, opens its firewall rule, makes
+key and password authentication explicit, relaxes the execution policy, creates
+the workspace, and prints the account name, the guest's addresses and the next
+command.
+
+**2 — on the host**:
 
 ```bash
-./sc vm init --domain w10c-testing --snapshot baseline --transfer-dir /srv/vm-share \
+./sc vm adopt --domain w10c-testing --ssh-user tester
+```
+
+Adopt locates the guest, waits for `sshd`, generates a host-held key and
+installs it with one password prompt, turns password authentication off, pins
+the guest host key, provisions the guest from `.subfloor/winbox.json`, verifies
+the declared checks, writes the `vm` block, brings the broker up and takes the
+baseline snapshot. Every phase is idempotent: re-running it skips what is
+already satisfied, so a toolchain change is the same command again. The
+password is read from the TTY (or `--password-file`), never passed on argv and
+never written to disk. The engine never installs or licenses Windows itself.
+
+`./sc vm init` remains for hand-linking a guest you prepared yourself, and no
+longer takes `--transfer-dir`:
+
+```bash
+./sc vm init --domain w10c-testing --snapshot baseline \
   --ssh-host 192.168.122.50 --ssh-user tester --ssh-key-path /home/op/.ssh/vm_tester
+```
+
+The other two seats are one command each:
+
+```bash
 ./sc remote add halo --host halo.internal --user jedi --key-path /home/op/.ssh/halo_shell
 ./sc ts init --ssh-user ops --allowed-host build-box --readonly-host blade   # tailnet tier
 ```
@@ -108,10 +152,12 @@ candidate `vm` block passed in the body.
 | `POST` | `/stop` `{force?}` | `virsh shutdown`, waits for `shut off`; `virsh destroy` only with `force: true` |
 | `POST` | `/restart` | graceful stop followed by start readiness |
 | `GET` | `/snapshot/list` | names, creation time, current marker |
-| `POST` | `/snapshot/create` `{snapshot}` | `snapshot-create-as`; domain must be shut off |
-| `POST` | `/snapshot/delete` `{snapshot}` | `snapshot-delete`; refuses the configured baseline |
-| `POST` | `/reset` `{snapshot?}` | `snapshot-revert` to the named or default snapshot, left powered off |
-| `POST` | `/push` `{src, dest?}` | stage one repo file into `transfer_dir` |
+| `POST` | `/snapshot/create` `{snapshot}` | `snapshot-create-as`; allowed in any state — a running domain gets a live internal snapshot, and a hypervisor that refuses one answers `snapshot_live_unsupported` |
+| `POST` | `/snapshot/delete` `{snapshot}` | `snapshot-delete`; refuses the configured baseline — redefine that with `/bake` |
+| `POST` | `/bake` `{name?}` | graceful shutdown, then a replace-not-stack offline snapshot that becomes the new baseline; the `vm` block's `snapshot` is updated when `name` is given |
+| `POST` | `/reset` `{snapshot?, running}` | `snapshot-revert` to the named or default snapshot; `running` chooses whether the domain is left running or powered off |
+| `POST` | `/push` `{src, dest?}` | `scp` one file to the guest; `dest` is a guest path defaulting to `<workspace>\<basename>` |
+| `POST` | `/pull` `{src, dest}` | `scp` one file from the guest into the repo or `.sc-state/local/` |
 | `POST` | `/exec` `{command}` | ssh the guest → `{ok, exit, stdout, stderr}` |
 | `POST` | `/capture` `{command?}` | optional exec plus a `virsh screenshot` (base64) |
 | `POST` | `/mcp/up` · `/mcp/down` · `GET /mcp/status` | the Windows-MCP tunnel to the `vm` block's `mcp_port` |
@@ -121,11 +167,33 @@ candidate `vm` block passed in the body.
 | `POST` | `/remote/<name>/pull` `{src, dest}` | scp into the repo or `.sc-state/local/` |
 
 Guest-mutating routes share one mutation lock; a busy broker answers before
-attempting the operation. Push sources must resolve inside the repo; pull
-destinations inside the repo or `.sc-state/local/`; `push` destinations stay
-inside `transfer_dir`. An undeclared remote name, a malformed name, a key with
-the wrong mode, or a path outside those roots is refused with a structured
-error before any `ssh` or `scp` runs.
+attempting the operation. Push sources must resolve inside the repo or
+`.sc-state/local/`; pull destinations inside the repo or `.sc-state/local/`. An
+undeclared remote name, a malformed name, a key with the wrong mode, or a path
+outside those roots is refused with a structured error before any `ssh` or
+`scp` runs.
+
+## Structured errors
+
+Every verb and route answers `{ok: false, error: {code, message}}` on failure.
+Act on the code.
+
+| Code | Meaning |
+|---|---|
+| `broker_unreachable` | the vm-broker is not serving; the printed start command is the fix |
+| `remote_not_found`, `remote_name_invalid` | the named remote is undeclared or malformed |
+| `remote_key_invalid`, `remote_config_invalid` | key path, mode, or block fields are wrong on the host |
+| `remote_path_not_allowed` | a push source or a pull destination resolved outside the repo and `.sc-state/local/` |
+| `remote_unreachable`, `remote_exec_failed` | SSH failed, or the command exited non-zero |
+| `snapshot_protected`, `snapshot_name_invalid` | a lifecycle guard tripped; the baseline is redefined with `bake`, not deleted |
+| `snapshot_live_unsupported` | libvirt refused a live internal snapshot (UEFI pflash, non-migratable CPU flags); `stop` first, then snapshot |
+| `stop_timeout`, `reset_result_unknown` | the final state was not confirmed; read `status` |
+| `adopt_guest_not_found` | no address resolved from the lease table, ARP or `--ssh-host` |
+| `adopt_ssh_timeout` | the guest never answered on TCP 22 inside the wait window — the bootstrap line has not run yet |
+| `adopt_key_install_failed` | the password-authenticated key install did not take |
+| `adopt_provision_failed` | `provision.ps1` reported a failed step |
+| `adopt_verify_failed` | a declared `checks` entry or the MCP listener check failed |
+| `adopt_sandboxed` | `adopt` is host-only; it needs `virsh`, `ssh-keygen`, `scp` and the operator's TTY |
 
 ## Running it (on the HOST — never in the sandbox)
 
@@ -146,10 +214,14 @@ under `~/.config/subfloor` or `~/.ssh` is mounted.
 ## Client verbs
 
 ```
-./sc vm init|status|start|stop [--force]|restart|snapshot list|create NAME|delete NAME|reset [NAME] --off|push SRC [DEST]|exec -- CMD|capture|mcp status|up|down
+./sc vm adopt --domain D [--ssh-user U] [--ssh-host H] [--snapshot NAME] [--bootstrap-url URL] [--password-file P] [--no-provision]
+./sc vm init|status|start|stop [--force]|restart|snapshot list|create NAME|delete NAME|bake [NAME]|reset [NAME] (--off|--running)|push SRC [DEST]|pull SRC DEST|exec -- CMD|capture|mcp status|up|down
 ./sc remote add NAME --host H --user U --key-path /abs [--port N] [--known-hosts-path /abs] | remove NAME | list | status NAME | exec NAME -- CMD | push NAME SRC DEST | pull NAME SRC DEST
 ./sc vm-mcp-relay up|down|status      in-sandbox TCP 127.0.0.1:18000 → the broker's vm-mcp.sock (run by `./sc vm mcp up`)
 ```
+
+`./sc vm-bake [NAME]` stays as a dispatcher alias of `./sc vm bake [NAME]`, so
+existing operator notes keep working.
 
 Every verb takes `--json` for one result object; failures carry
 `{ok: false, error: {code, message}}`. `sc vm test` is gone: the fixed-target
@@ -163,8 +235,9 @@ opt-in (`common: false`).
 
 - `remote_seats` — both postures, the three setup commands, the sharing rule,
   structured-error handling. Linux targets need nothing more.
-- `windows_testing` — the Windows add-on: guest prerequisites, PowerShell exec
-  conventions, capture, Windows-MCP transport.
+- `windows_testing` — the Windows add-on: preparing a guest, the shell's
+  authority over it, PowerShell exec conventions, capture, Windows-MCP
+  transport.
 - `tailscale_diagnostics` — the read-only tailnet tier; see the
   [tailnet broker](tailscale-broker.md).
 
@@ -173,7 +246,12 @@ opt-in (`common: false`).
 - A GUI surface for `remotes` — hand-run `./sc remote add` for now.
 - Routing the Windows-MCP tunnel to a posture 2 remote — it stays bound to the
   `vm` block.
-- Guest provisioning, OpenSSH server setup and toolchains — the skills state
-  the prerequisites; the engine installs nothing.
+- Installing, licensing or activating Windows itself, unattended answer files,
+  virtio driver download and VM creation. This is a bring-your-own-licence
+  seat: the operator supplies a booted, licensed Windows 10 or 11 guest with a
+  working network and an admin account, and the engine takes it from there.
+  Guest provisioning above that line — OpenSSH, the key, the toolchain and
+  Windows-MCP — is `./sc vm adopt`'s job.
+- `adopt` for Linux guests — the bootstrap is PowerShell; use `./sc vm init`.
 - Multi-tenant scheduling or leases across shells — the mutation lock is the
   only concurrency control; the skill states the sharing rule.
