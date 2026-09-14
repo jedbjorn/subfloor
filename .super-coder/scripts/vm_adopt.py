@@ -923,6 +923,15 @@ else { Write-Output 'UNCHANGED' }
 
     def run(self) -> dict:
         try:
+            # Every phase that stages a file wants this directory; create it
+            # once so a skipped key phase cannot leave provisioning without it.
+            _state_dir().mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            return _error(
+                "adopt_config_invalid",
+                f"{_state_dir()} could not be created: {exc}", [],
+            )
+        try:
             self.phase_locate()
             self.phase_wait()
             self.phase_install_key()

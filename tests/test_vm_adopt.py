@@ -451,6 +451,16 @@ class ResumabilityTest(AdoptTestBase):
         "ssh_port": 22,
     }
 
+    def test_provision_still_stages_when_the_key_phase_was_skipped(self):
+        # The staging temp dir lives under .sc-state/local/vm, which the key
+        # phase would normally have created on its way past.
+        import shutil
+
+        shutil.rmtree(self.root / ".sc-state" / "local" / "vm")
+        harness = Harness(self.root)
+        value = self.adopt(harness, saved=self.SAVED)
+        self.assertTrue(value["ok"], json.dumps(value, indent=2))
+
     def test_key_phase_skips_when_the_saved_key_authenticates(self):
         harness = Harness(self.root)
         value = self.adopt(harness, saved=self.SAVED, ssh_user=None,
