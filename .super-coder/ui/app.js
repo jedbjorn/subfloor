@@ -58,7 +58,19 @@ function mdBlock(text) {
   const div = el("div", { className: "md" });
   if (text) div.innerHTML = DOMPurify.sanitize(
     marked.parse(String(text)), { USE_PROFILES: { html: true } });
+  div.querySelectorAll("pre").forEach(addCopyButton);
   return div;
+}
+// Copy-to-clipboard on every rendered code block. The copied text is the
+// <pre>'s content captured before the button joins it. Promise-wrapped so a
+// non-secure origin (no navigator.clipboard) still lands on "copy failed".
+function addCopyButton(pre) {
+  const text = pre.textContent;
+  const btn = el("button", { className: "md-copy", type: "button", title: "copy to clipboard" }, "⧉");
+  btn.onclick = () => Promise.resolve()
+    .then(() => navigator.clipboard.writeText(text))
+    .then(() => toast("copied"), () => toast("copy failed"));
+  pre.append(btn);
 }
 
 async function api(path, method = "GET", body, extraHeaders = {}) {

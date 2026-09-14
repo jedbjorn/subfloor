@@ -1376,6 +1376,14 @@ button.gmenu-name:hover { color: #fff; }
   margin: .6em 0; white-space: pre-wrap; overflow-wrap: anywhere;
 }
 .md pre code { background: transparent; border: 0; padding: 0; }
+.md pre { position: relative; padding-right: 2.4em; }
+.md-copy { position: absolute; top: .35em; right: .35em; background: var(--panel2);
+  border: 1px solid var(--line); border-radius: 4px; color: var(--dim);
+  font-size: .75rem; line-height: 1; padding: .2rem .35rem; cursor: pointer;
+  opacity: 0; transition: opacity .12s; }
+.md pre:hover .md-copy, .md-copy:focus-visible { opacity: 1; }
+.md-copy:hover { color: var(--ink); border-color: var(--accent); }
+@media (hover: none) { .md-copy { opacity: 1; } }
 .md blockquote {
   border-left: 2px solid rgba(255,255,255,.15); margin: .6em 0;
   padding: .1em .9em; color: rgba(255,255,255,.60);
