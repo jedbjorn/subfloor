@@ -1034,7 +1034,7 @@ class BlockRoundTripTest(unittest.TestCase):
     `bake` said "missing required field(s): domain, snapshot" against a file
     that plainly held the block."""
 
-    BLOCK = {
+    BLOCK: ClassVar[dict] = {
         "domain": "w10c-testing",
         "snapshot": "baseline",
         "ssh_host": ARP_IP,

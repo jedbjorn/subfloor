@@ -512,7 +512,7 @@ def write_block_and_confirm(block: dict) -> bool:
     wanted = {k: v for k, v in dict(block).items() if k not in RETIRED_VM_FIELDS}
     try:
         ports.resolve(persist=True)
-    except Exception as exc:  # noqa: BLE001 - any failure here is the same failure
+    except Exception as exc:  # every failure here is the same failure
         raise BlockWriteError(
             f"the instance ports could not be persisted, so the vm block "
             f"would not be readable: {exc}"
@@ -521,7 +521,7 @@ def write_block_and_confirm(block: dict) -> bool:
         return True
     try:
         write(wanted)
-    except Exception as exc:  # noqa: BLE001 - the caller only needs "it did not save"
+    except Exception as exc:  # the caller only needs "it did not save"
         raise BlockWriteError(f"the vm block could not be saved: {exc}") from exc
     durable = read() or {}
     if durable != wanted:
