@@ -293,6 +293,11 @@ try {
 }
 
 try {
+    # Hard-coded on purpose: the bootstrap runs BEFORE the host has said
+    # anything to this guest, so there is no winbox.json to read a workspace
+    # from. provision.ps1 reads the fork's declared workspace and creates that
+    # one; this is only the floor the operator starts from, and a fork that
+    # declares another path simply gets both.
     $workspace = 'C:\SubfloorTest'
     if (Test-Path -LiteralPath $workspace) {
         Write-StepResult -Name 'workspace' -Status 'skipped' -Detail "$workspace exists"

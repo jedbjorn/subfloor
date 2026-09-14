@@ -314,6 +314,10 @@ class HappyPathTest(AdoptTestBase):
             self.assertIn(phase["status"], ("done", "skipped", "failed"))
         self.assertEqual(harness.dispatched, ["vm-broker-up"])
         self.assertEqual(harness.baked, ["baseline"])
+        # The module's declared order is the order that actually ran.
+        self.assertEqual(
+            tuple(p["name"] for p in value["phases"]), vm_adopt.PHASES
+        )
 
     def test_written_block_has_no_transfer_dir_and_pins_the_host_key(self):
         harness = Harness(self.root)

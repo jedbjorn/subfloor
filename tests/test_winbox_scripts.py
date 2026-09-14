@@ -103,7 +103,7 @@ def test_bootstrap_waits_for_sshd_to_write_its_config(bootstrap: str) -> None:
     assert "seeded sshd_config from sshd_config_default" in bootstrap
 
 
-def test_bootstrap_places_directives_outside_the_match_block(bootstrap: str) -> None:
+def test_bootstrap_places_auth_settings_outside_the_match_block(bootstrap: str) -> None:
     """The stock Windows sshd_config ENDS with `Match Group administrators`,
     so an appended directive governs only that group."""
     assert "'^\\s*Match\\s'" in bootstrap

@@ -88,6 +88,10 @@ HOST_KEY_CHANGED = (
     "Host key verification failed",
 )
 
+# The declared order, in the order `run()` executes them, and the order every
+# result's `phases` list carries. tests/test_vm_adopt.py compares the two, so a
+# phase renamed in one place and not the other fails rather than quietly
+# changing the JSON contract.
 PHASES = (
     "locate", "wait", "install_key", "harden", "provision", "verify",
     "write_block", "broker", "baseline",
