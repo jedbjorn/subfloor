@@ -915,11 +915,31 @@ def _shell_busy_error(shell, shell_id: int, state: str, action: str) -> ApiError
     details = {"shell_id": shell_id, "state": state}
     session = next(iter(_browser_sessions(shell)), None) if state == "browser" else None
     if session is None:
+        # The holders' pid + start-ticks identities are what the operator
+        # confirms and POST /api/conversations/shell-release kills.
+        holders = run_mod.shell_liveness.cli_holders(
+            shell["shortname"] or "", run_mod.shell_liveness.compute()
+        )
+        details["holders"] = holders
+        named = ", ".join(
+            f"pid {h['pid']}" + (f" {h['orphaned']}" if h["orphaned"] else "")
+            for h in holders
+        )
+        if state == "orphan" and holders:
+            return ApiError(
+                409,
+                "SHELL_BUSY",
+                f"shell {shell['shortname']!r} is held by an orphaned CLI "
+                f"session ({named}) whose terminal or client is gone; confirm "
+                f"there is no running work to kill it before {action}",
+                details,
+            )
         return ApiError(
             409,
             "SHELL_BUSY",
-            f"shell {shell['shortname']!r} has a live CLI session; "
-            f"close it before {action}",
+            f"shell {shell['shortname']!r} has a live CLI session"
+            f"{f' ({named})' if named else ''}; close it, or confirm there is "
+            f"no running work to kill it, before {action}",
             details,
         )
     details["conversation_id"] = session.get("conversation_id")
@@ -932,6 +952,67 @@ def _shell_busy_error(shell, shell_id: int, state: str, action: str) -> ApiError
         f"close that chat before {action}",
         details,
     )
+
+
+def _release_shell(con, operator: dict, body: dict):
+    """Kill the CLI holders an operator was shown in SHELL_BUSY and confirmed
+    idle. Only those exact identities: a holder the operator never saw refuses
+    the whole release with SHELL_HOLDERS_CHANGED and the current list."""
+    _only_fields(body, {"shell_id", "holders"})
+    shell_id = _integer(body.get("shell_id"), "shell_id")
+    confirmed = body.get("holders")
+    if not isinstance(confirmed, list) or not confirmed or len(confirmed) > 32:
+        raise ApiError(422, "VALIDATION_ERROR", "holders must be a non-empty list")
+    identities = []
+    for holder in confirmed:
+        if not isinstance(holder, dict):
+            raise ApiError(422, "VALIDATION_ERROR", "each holder must be an object")
+        identities.append({
+            "pid": _integer(holder.get("pid"), "pid"),
+            "start_ticks": _integer(holder.get("start_ticks"), "start_ticks"),
+        })
+    shell = con.execute(
+        "SELECT shell_id,display_name,shortname,flavor FROM shells "
+        "WHERE shell_id=? AND (user_id=? OR is_shared=1) "
+        "AND COALESCE(is_deleted,0)=0",
+        (shell_id, operator["user_id"]),
+    ).fetchone()
+    if shell is None:
+        raise ApiError(
+            422,
+            "SHELL_NOT_LAUNCHABLE",
+            "shell is unknown, deleted, or unavailable to this operator",
+        )
+    _refuse_admin_browser_chat(shell)
+    liveness = run_mod.shell_liveness
+    try:
+        survivors = liveness.release(shell["shortname"] or "", identities)
+    except liveness.HoldersChanged as exc:
+        raise ApiError(
+            409,
+            "SHELL_HOLDERS_CHANGED",
+            f"shell {shell['shortname']!r} is now held by a session you were "
+            f"not shown; review it before killing anything",
+            {"shell_id": shell_id, "holders": exc.holders},
+        ) from exc
+    except OSError as exc:
+        # No pidfd support or a foreign user: fail closed, never kill by number.
+        raise ApiError(
+            409,
+            "SHELL_RELEASE_FAILED",
+            f"cannot safely signal a holder of shell {shell['shortname']!r}: "
+            f"{exc.strerror or exc}",
+            {"shell_id": shell_id},
+        ) from exc
+    if survivors:
+        raise ApiError(
+            409,
+            "SHELL_RELEASE_FAILED",
+            f"shell {shell['shortname']!r} holder(s) survived SIGKILL: "
+            f"pid {', '.join(map(str, survivors))}",
+            {"shell_id": shell_id, "pids": survivors},
+        )
+    return _json(200, {"shell_id": shell_id, "released": True})
 
 
 def _refuse_admin_browser_chat(shell) -> None:
@@ -2639,6 +2720,8 @@ def handle(method: str, path: str, headers_raw: str, raw_body: bytes) -> tuple:
                     403, "NOT_SAME_ORIGIN", "cross-site conversation mutation rejected"
                 )
             body = _body(raw_body)
+            if parsed.path == "/api/conversations/shell-release" and method == "POST":
+                return _release_shell(con, operator, body)
             if parsed.path == "/api/conversations":
                 if method == "GET":
                     return _list_conversations(con, operator, query)

@@ -308,7 +308,7 @@ def test_start_chat_has_default_and_configured_paths_without_terminal_controls()
     assert 'const CHAT_CONFIGURE_ROUTE = "configure"' in interface
     assert 'textContent: "＋ Chat"' in interface
     assert 'textContent: "Configure"' in interface
-    assert "const conversation = await chatCreateConversation(shell);" in interface
+    assert "() => chatCreateConversation(shell));" in interface
     assert "{ shell_id: shell.shell_id, ...fields }" in interface
     assert "chatRouteConversation === CHAT_CONFIGURE_ROUTE" in interface
     assert "await chatRenderNew(pane, shell, defaults, catalog)" in interface
@@ -1532,4 +1532,52 @@ console.log(JSON.stringify({
         "link": "open that chat",
         "hash": "interface/dev/cv_b",
         "plain": "VALIDATION_ERROR: bad",
+    }
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node is required")
+def test_cli_held_shell_is_killed_only_on_confirmation_then_retried():
+    flow = APP[APP.index("function chatShellReleaseWarning"):
+               APP.index("function chatModeHash")]
+    script = r"""
+const posted = [];
+let answer = true;
+const prompts = [];
+const confirm = (text) => { prompts.push(text); return answer; };
+const chatApi = async (path, method, body) => { posted.push({path, method, body}); };
+const busy = (details) => Object.assign(new Error("shell 'dev' has a live CLI session"),
+  {code: "SHELL_BUSY", details});
+const holders = [{pid: 4242, start_ticks: 990, orphaned: "client-gone", claimed: false}];
+""" + flow + r"""
+(async () => {
+  let calls = 0;
+  const action = async () => { calls += 1; if (calls === 1) throw busy({shell_id: 1, holders}); return "ok"; };
+  const result = await chatWithShellRelease(action);
+
+  answer = false;
+  let declined = null;
+  await chatWithShellRelease(async () => { throw busy({shell_id: 1, holders}); })
+    .catch((error) => { declined = error.code; });
+
+  let browser = null;
+  await chatWithShellRelease(async () => {
+    throw busy({shell_id: 1, conversation_id: "cv_b", pid: 7, holders});
+  }).catch((error) => { browser = error.code; });
+
+  console.log(JSON.stringify({result, calls, posted, declined, browser,
+    prompts: prompts.length, warned: prompts[0].includes("pid 4242 (orphaned — client-gone)")}));
+})();
+"""
+    assert run_js(script) == {
+        "result": "ok",
+        "calls": 2,
+        "posted": [{
+            "path": "/conversations/shell-release",
+            "method": "POST",
+            "body": {"shell_id": 1, "holders": [{"pid": 4242, "start_ticks": 990}]},
+        }],
+        "declined": "SHELL_BUSY",
+        "browser": "SHELL_BUSY",
+        "prompts": 2,
+        "warned": True,
     }

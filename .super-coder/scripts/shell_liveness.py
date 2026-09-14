@@ -11,8 +11,9 @@ pinned to the shell's worktree, leaving no exit hook to clear a bool. A persiste
 flag would go stale on `kill -9` or reboot. That same exec hands us a clean,
 self-cleaning signal instead: a live harness process is one whose cwd sits inside
 a worktree. The process dies → the signal vanishes. No cron, no persistence, no
-staleness window. Reporting only, by design — like git_hygiene.py, it surfaces
-state and never mutates.
+staleness window. The scan is reporting only, by design — like git_hygiene.py,
+it surfaces state and never mutates. The one mutating verb, `release`, kills
+the exact holders an operator has already been shown and confirmed.
 
 Mechanism (Linux): scan /proc/<pid>/{comm,cwd}. A process whose comm is one of the
 fork's harness comm values (adapters/*/adapter.json `launch[0]`,
@@ -40,15 +41,25 @@ host — the session survives, holds its shell's one-session slot, and blocks
 every headless boot of that shell until someone kills it by hand. Each process
 is therefore classified (`orphaned`): 'tty-gone' (had a controlling terminal;
 the pty vanished — the window closed under it), 'detached' (no controlling
-TTY and reparented to init — its spawning session is gone), or None (normal).
+TTY and reparented to init — its spawning session is gone), 'client-gone' (its
+enter lease was released — the `docker exec` client that attached it is gone),
+or None (normal).
 "Vanished" is asked in the PROCESS's mount namespace (/proc/<pid>/root<tty>),
 never the scanner's: a container-hosted session's pty lives in the container's
 devpts, so testing the bare path from the host answers about a different device
 and turns live work into a false orphan.
+'client-gone' exists because a sandbox `enter` session is invisible to both
+lineage signals (issue #1599): its parent is the containerd shim, never init,
+and the shim keeps the container's pty open after the `docker exec` client
+disconnects, so the device never vanishes. The host client therefore holds a
+flock on a lease file in the shared checkout (dispatch.sh sc_enter_lease) and
+names it in the session's SC_ENTER_LEASE; the kernel drops that lock the moment
+the client dies, from any vantage that shares the bind mount.
 Classification is reporting only — an orphan may still be mid-work (a merge,
-a suite), so nothing here kills anything. The consumer (`sc run`'s guard, the
-operator) verifies idleness first: `ps -o etime=,stat= -p <pid>`, no child
-processes doing work, then `kill <pid>`.
+a suite), so the scan never kills on a verdict. A busy slot is released only by
+an operator who was warned and confirmed there is no running work: the GUI's
+shell-release call and the interactive boot prompt both call `release` with
+the pid + start-ticks identities they displayed.
 
 Launch claims (spec #76 H-25): lineage cannot answer for a generic headless
 shell. It is detached from birth — no controlling TTY, launcher gone — so
@@ -80,10 +91,14 @@ Run standalone:
 """
 from __future__ import annotations
 
+import fcntl
 import json
 import os
+import select
+import signal
 import sqlite3
 import sys
+import time
 from pathlib import Path
 
 import instance_state
@@ -251,9 +266,51 @@ def _tty_exists(pid: int, tty_fd: "str | None") -> "bool | None":
     return True
 
 
+def _enter_lease(pid: int) -> str | None:
+    """The SC_ENTER_LEASE path this process was started with, from
+    /proc/<pid>/environ. None when absent or unreadable (foreign user)."""
+    try:
+        environ = (PROC / str(pid) / "environ").read_bytes()
+    except OSError:
+        return None
+    for item in environ.split(b"\0"):
+        if item.startswith(b"SC_ENTER_LEASE="):
+            return item.split(b"=", 1)[1].decode(errors="replace") or None
+    return None
+
+
+def _lease_held(lease: str | None) -> bool | None:
+    """Does the client that attached this session still hold its enter lease?
+
+    Probed with a non-blocking SHARED flock that is released on close: it
+    conflicts only with the client's exclusive lock, never with another probe.
+    A missing lease file inside a present lease directory was pruned by a later
+    enter, which prunes only a lease it could lock — its client is gone. Every
+    other failure is no verdict (None), never an orphan."""
+    if not lease:
+        return None
+    path = Path(lease)
+    try:
+        fd = os.open(path, os.O_RDONLY)
+    except FileNotFoundError:
+        return False if path.parent.is_dir() else None
+    except OSError:
+        return None
+    try:
+        fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+    except BlockingIOError:
+        return True
+    except OSError:
+        return None
+    finally:
+        os.close(fd)
+    return False
+
+
 def classify_orphan(tty_nr: "int | None", ppid: "int | None",
                     tty_fd: "str | None",
-                    tty_exists: "bool | None" = None) -> "str | None":
+                    tty_exists: "bool | None" = None,
+                    lease_held: "bool | None" = None) -> "str | None":
     """Orphan verdict for one harness process — pure, injectable for tests.
 
     'tty-gone'  — has (had) a controlling TTY but the pty device is gone: the
@@ -262,6 +319,10 @@ def classify_orphan(tty_nr: "int | None", ppid: "int | None",
                   it (a headless boot's parent, a dead terminal's shell) is
                   gone. A NORMAL headless session still has a live parent, so
                   ppid==1 is the discriminator.
+    'client-gone' — its enter lease was released: the `docker exec` client
+                  that attached it is gone, though the shim keeps its pty and
+                  parentage looking normal. Positive evidence, so it is asked
+                  first.
     None        — attached and normal, or not enough signal to say otherwise
                   (conservative: never call an orphan on missing data).
 
@@ -271,6 +332,8 @@ def classify_orphan(tty_nr: "int | None", ppid: "int | None",
     invitation to go and test the path in whatever namespace we happen to
     occupy, which is the bug this signature now forecloses.
     """
+    if lease_held is False:
+        return "client-gone"
     if tty_nr is None:
         return None
     if tty_nr == 0:
@@ -289,7 +352,8 @@ def _orphan_verdict(pid: int) -> "str | None":
     The seam that keeps classify_orphan pure and namespace-blind."""
     tty_fd = _tty_fd(pid)
     return classify_orphan(_tty_nr(pid), _ppid(pid), tty_fd,
-                           _tty_exists(pid, tty_fd))
+                           _tty_exists(pid, tty_fd),
+                           _lease_held(_enter_lease(pid)))
 
 
 def _self_harness_pid(harness_pids: set[int]) -> int | None:
@@ -497,6 +561,7 @@ def compute() -> dict:
             admin_root_pids.append(pid)
         processes.append({
             "pid": pid,
+            "start_ticks": _start_ticks(pid),
             "comm": comm,
             "cwd": str(cwdp),
             "region": region,
@@ -564,6 +629,170 @@ def orphan_split(shortname: str, snap: dict) -> "tuple[list[int], list[int]]":
     return ([p["pid"] for p in procs],
             [p["pid"] for p in procs
              if p.get("orphaned") and not p.get("claimed")])
+
+
+def cli_holders(shortname: str, snap: dict) -> list[dict]:
+    """[{pid, start_ticks, orphaned, claimed}] for every non-browser process
+    holding one shell's worktree — what a refusal must NAME and what `release`
+    may kill. `orphaned` is None for a claimed pid, exactly as orphan_split
+    reads it. Browser turns are excluded: they belong to a conversation, and
+    their way out is that chat's Stop or close."""
+    return [{"pid": p["pid"],
+             "start_ticks": p.get("start_ticks"),
+             "orphaned": None if p.get("claimed") else p.get("orphaned"),
+             "claimed": bool(p.get("claimed"))}
+            for p in snap.get("processes", [])
+            if (p.get("shortname") or "").lower() == shortname.lower()
+            and not p.get("browser_conversation")]
+
+
+class HoldersChanged(Exception):
+    """The slot is held by a process the operator was not shown."""
+
+    def __init__(self, holders: list[dict]):
+        super().__init__("shell holders changed since they were confirmed")
+        self.holders = holders
+
+
+def _exists(pidfd: int) -> bool:
+    """Does the process this pidfd names still own its pid number? True for a
+    live process or an unreaped zombie; a reaped one raises ESRCH, whatever
+    process the number now belongs to."""
+    try:
+        signal.pidfd_send_signal(pidfd, 0)
+    except ProcessLookupError:
+        return False
+    return True
+
+
+def _bind(pid: int, *, start_ticks: int | None = None,
+          pgrp: int | None = None) -> int | None:
+    """A pidfd for `pid`, returned only if the process it pins matches.
+
+    The pidfd is opened FIRST and /proc read after, then the pidfd is asked
+    whether its process still exists: if it does, the pid number cannot have
+    been reused in between, so the read described the pinned process. Every
+    later signal goes through that pidfd — never the number (#954: a recycled
+    pid turned a group kill onto a stranger). None when the process is gone
+    or is not the one asked for. Other failures (no pidfd support, a foreign
+    user) propagate: release fails closed rather than signal by number."""
+    try:
+        fd = os.pidfd_open(pid)
+    except ProcessLookupError:
+        return None
+    rest = _stat_fields(pid)
+    try:
+        matches = ((start_ticks is None or int(rest[19]) == start_ticks)
+                   and (pgrp is None or int(rest[2]) == pgrp))
+    except (IndexError, ValueError):
+        matches = False
+    if matches and _exists(fd):
+        return fd
+    os.close(fd)
+    return None
+
+
+def _group_members(leader_fd: int, pgid: int, known: set[int]) -> list[int]:
+    """Pidfds for the other processes in the group a harness leads — its tool
+    children — excluding pids already pinned in `known`.
+
+    Group ids are pid numbers too, so membership is proven, not read: each
+    candidate is bound with pgrp == pgid, and only then is the LEADER checked.
+    A leader that still exists (even as a zombie) still holds number `pgid`,
+    so the group every bound read saw was the leader's group, not a later one
+    that reused the number. Once the leader is reaped, nothing new is enrolled."""
+    members: list[int] = []
+    for entry in PROC.iterdir():
+        if not entry.name.isdigit() or int(entry.name) in known:
+            continue
+        fd = _bind(int(entry.name), pgrp=pgid)
+        if fd is None:
+            continue
+        if not _exists(leader_fd):
+            os.close(fd)
+            break
+        members.append(fd)
+        known.add(int(entry.name))
+    return members
+
+
+def _send(pidfd: int, sig: int) -> None:
+    try:
+        signal.pidfd_send_signal(pidfd, sig)
+    except ProcessLookupError:
+        pass                             # exited (and maybe reaped) — nothing to do
+
+
+def _wait_exit(pidfds: list[int], grace: float) -> list[int]:
+    """The pidfds whose process has not exited within `grace` seconds. A pidfd
+    turns readable when its process exits, so this waits on the kernel rather
+    than polling a pid number."""
+    pending = list(pidfds)
+    deadline = time.monotonic() + grace
+    while pending:
+        ready = select.select(pending, [], [],
+                              max(0.0, deadline - time.monotonic()))[0]
+        pending = [fd for fd in pending if fd not in ready]
+        if not ready or time.monotonic() >= deadline:
+            break
+    return pending
+
+
+def release(shortname: str, confirmed: list[dict], *,
+            term_grace: float = 3.0, kill_grace: float = 1.0) -> list[int]:
+    """Kill one shell's CLI holders after an operator confirmed them — SIGTERM,
+    then SIGKILL for whatever outlives `term_grace`. Returns the pids still
+    alive afterwards (empty = released).
+
+    `confirmed` carries the {pid, start_ticks} identities the operator was
+    shown. A fresh scan must hold nothing outside that set, or HoldersChanged
+    is raised and nothing is signalled: a session that started after the
+    warning was never confirmed. A confirmed identity that already exited is
+    simply released; a recycled pid never matches its start ticks.
+
+    Each holder is bound to a pidfd (see _bind) before any signal, and its tool
+    children are reached through their own pidfds (see _group_members) rather
+    than killpg — so an exit and pid/pgid reuse at the signal boundary signals
+    nobody. The group is walked only when the harness leads it (a `docker
+    exec` or `./sc enter` session does), never a group it merely belongs to,
+    which could be the operator's own terminal shell."""
+    wanted = {(int(h["pid"]), int(h["start_ticks"])) for h in confirmed}
+    current = cli_holders(shortname, compute())
+    if any((h["pid"], h["start_ticks"]) not in wanted for h in current):
+        raise HoldersChanged(current)
+    opened: list[int] = []
+    try:
+        leaders: dict[int, tuple[int, int]] = {}     # pidfd -> (pid, start_ticks)
+        known: set[int] = set()
+        for h in current:
+            fd = _bind(h["pid"], start_ticks=h["start_ticks"])
+            if fd is not None:
+                opened.append(fd)
+                leaders[fd] = (h["pid"], h["start_ticks"])
+                known.add(h["pid"])
+        members: list[int] = []
+
+        def enroll() -> None:
+            for fd, (pid, ticks) in leaders.items():
+                leads = _bind(pid, start_ticks=ticks, pgrp=pid)
+                if leads is None:
+                    continue
+                os.close(leads)
+                enrolled = _group_members(fd, pid, known)
+                opened.extend(enrolled)
+                members.extend(enrolled)
+
+        enroll()
+        for fd in (*members, *leaders):
+            _send(fd, signal.SIGTERM)
+        if _wait_exit([*members, *leaders], term_grace):
+            enroll()                     # children forked during the grace
+            for fd in _wait_exit([*members, *leaders], 0):
+                _send(fd, signal.SIGKILL)
+        return [leaders[fd][0] for fd in _wait_exit(list(leaders), kill_grace)]
+    finally:
+        for fd in opened:
+            os.close(fd)
 
 
 def browser_sessions(shortname: str, snap: dict) -> list[dict]:
@@ -652,7 +881,7 @@ def _print_text(d: dict) -> None:
               f"INDETERMINATE; do not assume all-clear.")
     if d.get("orphaned_pids"):
         print(f"\n⚠ {len(d['orphaned_pids'])} orphaned session(s): pids "
-              f"{d['orphaned_pids']} — terminal closed / parent gone. Each "
+              f"{d['orphaned_pids']} — terminal or client gone / parent gone. Each "
               f"holds its shell's one-session slot. Verify idle "
               f"(`ps -o etime=,stat= -p <pid>`; no busy children), then "
               f"`kill <pid>`. An orphan can still be mid-work — never kill "

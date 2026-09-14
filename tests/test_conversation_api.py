@@ -721,6 +721,93 @@ class ConversationResourceTest(ConversationApiCase):
         self.assertEqual(error["error"]["code"], "SHELL_BUSY")
         self.assertIn("live CLI session", error["error"]["message"])
 
+    def test_orphaned_cli_owner_refusal_names_the_holders_to_confirm(self) -> None:
+        # Issue #1599: a disconnected `enter` session held the slot and the
+        # refusal named nothing — no pid to verify, nothing the GUI could kill.
+        holder = {"pid": 4242, "start_ticks": 990, "orphaned": "client-gone",
+                  "claimed": False}
+        with mock.patch.object(
+            conversation_routes,
+            "_wait_for_cli_release",
+            return_value="orphan",
+        ), mock.patch.object(
+            conversation_routes.run_mod.shell_liveness,
+            "cli_holders",
+            return_value=[holder],
+        ):
+            status, _, error = self.request(
+                "POST",
+                "/api/conversations",
+                body={"shell_id": 1, "harness": "codex"},
+                key="orphan-owned-shell",
+            )
+        self.assertEqual(status, 409)
+        self.assertEqual(error["error"]["code"], "SHELL_BUSY")
+        self.assertIn("pid 4242 client-gone", error["error"]["message"])
+        self.assertEqual(error["error"]["details"]["holders"], [holder])
+        self.assertEqual(error["error"]["details"]["shell_id"], 1)
+
+    def release(self, body: dict):
+        return self.request(
+            "POST", "/api/conversations/shell-release", body=body
+        )
+
+    def test_shell_release_kills_exactly_the_confirmed_identities(self) -> None:
+        liveness = conversation_routes.run_mod.shell_liveness
+        with mock.patch.object(liveness, "release", return_value=[]) as release:
+            status, _, result = self.release({
+                "shell_id": 1,
+                "holders": [{"pid": 4242, "start_ticks": 990}],
+            })
+        self.assertEqual(status, 200, result)
+        self.assertEqual(result, {"shell_id": 1, "released": True})
+        release.assert_called_once_with(
+            "dev", [{"pid": 4242, "start_ticks": 990}]
+        )
+
+    def test_shell_release_refuses_holders_the_operator_was_not_shown(self) -> None:
+        liveness = conversation_routes.run_mod.shell_liveness
+        current = [{"pid": 5151, "start_ticks": 7, "orphaned": None,
+                    "claimed": False}]
+        with mock.patch.object(
+            liveness, "release", side_effect=liveness.HoldersChanged(current)
+        ):
+            status, _, error = self.release({
+                "shell_id": 1,
+                "holders": [{"pid": 4242, "start_ticks": 990}],
+            })
+        self.assertEqual(status, 409)
+        self.assertEqual(error["error"]["code"], "SHELL_HOLDERS_CHANGED")
+        self.assertEqual(error["error"]["details"]["holders"], current)
+
+    def test_shell_release_reports_a_survivor(self) -> None:
+        liveness = conversation_routes.run_mod.shell_liveness
+        with mock.patch.object(liveness, "release", return_value=[4242]):
+            status, _, error = self.release({
+                "shell_id": 1,
+                "holders": [{"pid": 4242, "start_ticks": 990}],
+            })
+        self.assertEqual(status, 409)
+        self.assertEqual(error["error"]["code"], "SHELL_RELEASE_FAILED")
+        self.assertEqual(error["error"]["details"]["pids"], [4242])
+
+    def test_shell_release_validates_before_signalling(self) -> None:
+        liveness = conversation_routes.run_mod.shell_liveness
+        with mock.patch.object(liveness, "release") as release:
+            for body, code in (
+                ({"shell_id": 1, "holders": []}, "VALIDATION_ERROR"),
+                ({"shell_id": 1, "holders": [{"pid": 1}]}, "VALIDATION_ERROR"),
+                ({"shell_id": 99, "holders": [{"pid": 1, "start_ticks": 1}]},
+                 "SHELL_NOT_LAUNCHABLE"),
+                ({"shell_id": 3, "holders": [{"pid": 1, "start_ticks": 1}]},
+                 "ADMIN_SHELL_CLI_ONLY"),
+            ):
+                with self.subTest(body=body):
+                    status, _, error = self.release(body)
+                    self.assertEqual(status, 422, error)
+                    self.assertEqual(error["error"]["code"], code)
+        release.assert_not_called()
+
     def test_admin_shell_create_is_cli_only_with_exact_commands(self) -> None:
         status, _, error = self.request(
             "POST",

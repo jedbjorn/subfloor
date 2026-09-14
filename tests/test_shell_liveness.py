@@ -13,9 +13,11 @@ from __future__ import annotations
 import io
 import json
 import os
+import signal
 import sqlite3
 import sys
 import tempfile
+import time
 import unittest
 from contextlib import redirect_stdout
 from pathlib import Path
@@ -385,6 +387,330 @@ class NamespaceAwareTtyTest(unittest.TestCase):
         snap = self._snapshot()
         self.assertEqual([None], [p["orphaned"] for p in snap["processes"]])
         self.assertEqual([], snap["orphaned_pids"])
+
+
+class EnterLeaseTest(unittest.TestCase):
+    """Issue #1599: a sandbox `enter` session outlives its `docker exec` client.
+    Its parent is the containerd shim and the shim keeps its pty alive, so
+    neither lineage signal can fire — only the released enter lease can."""
+
+    def _lease(self, td: str) -> Path:
+        lease = Path(td) / "enter-leases" / "abc123.lease"
+        lease.parent.mkdir()
+        lease.write_text("")
+        return lease
+
+    def test_released_lease_is_client_gone_despite_a_live_pty(self):
+        self.assertEqual("client-gone", shell_liveness.classify_orphan(
+            34816, 0, "/dev/pts/0", True, lease_held=False))
+
+    def test_held_lease_leaves_an_attached_session_alone(self):
+        self.assertIsNone(shell_liveness.classify_orphan(
+            34816, 0, "/dev/pts/0", True, lease_held=True))
+
+    def test_held_lock_reads_held(self):
+        import fcntl
+        with tempfile.TemporaryDirectory() as td:
+            lease = self._lease(td)
+            with open(lease, "w") as client:     # a distinct open file description
+                fcntl.flock(client, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                self.assertTrue(shell_liveness._lease_held(str(lease)))
+
+    def test_released_lock_reads_released(self):
+        with tempfile.TemporaryDirectory() as td:
+            self.assertFalse(shell_liveness._lease_held(str(self._lease(td))))
+
+    def test_probe_does_not_keep_the_lock(self):
+        import fcntl
+        with tempfile.TemporaryDirectory() as td:
+            lease = self._lease(td)
+            shell_liveness._lease_held(str(lease))
+            with open(lease, "w") as client:
+                fcntl.flock(client, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+    def test_pruned_lease_in_a_present_directory_is_released(self):
+        with tempfile.TemporaryDirectory() as td:
+            lease = self._lease(td)
+            lease.unlink()
+            self.assertFalse(shell_liveness._lease_held(str(lease)))
+
+    def test_unreachable_lease_directory_is_no_verdict(self):
+        with tempfile.TemporaryDirectory() as td:
+            missing = Path(td) / "not-mounted" / "abc123.lease"
+            self.assertIsNone(shell_liveness._lease_held(str(missing)))
+            self.assertIsNone(shell_liveness._lease_held(None))
+
+    def _proc(self, td: str, environ: bytes) -> Path:
+        """One harness pid shaped like the repro: parent outside the pid
+        namespace (ppid 0), a controlling pty that still exists."""
+        proc = Path(td) / "proc"
+        entry = proc / "4242"
+        (entry / "fd").mkdir(parents=True)
+        entry.joinpath("comm").write_text("claude\n")
+        entry.joinpath("stat").write_text("4242 (claude) S 0 4242 4242 34816 -1 0 0 0\n")
+        entry.joinpath("cwd").symlink_to(
+            shell_liveness.REPO_ROOT / ".sc-worktrees" / "rev1")
+        entry.joinpath("fd", "0").symlink_to("/dev/pts/0")
+        ns_root = Path(td) / "nsroot"
+        (ns_root / "dev" / "pts").mkdir(parents=True)
+        (ns_root / "dev" / "pts" / "0").write_text("")
+        entry.joinpath("root").symlink_to(ns_root)
+        entry.joinpath("environ").write_bytes(environ)
+        return proc
+
+    def _snapshot(self, proc: Path) -> dict:
+        with mock.patch.object(shell_liveness, "PROC", proc), \
+                mock.patch.object(shell_liveness, "harness_binaries",
+                                  return_value={"claude"}), \
+                mock.patch.object(shell_liveness, "_shell_labels",
+                                  return_value={}), \
+                mock.patch.object(shell_liveness, "_launch_claims",
+                                  return_value={}), \
+                mock.patch.object(shell_liveness, "_browser_processes",
+                                  return_value={}):
+            return shell_liveness.compute()
+
+    def test_compute_names_a_disconnected_enter_session(self):
+        with tempfile.TemporaryDirectory() as td:
+            lease = self._lease(td)
+            proc = self._proc(td, b"HOME=/x\0SC_ENTER_LEASE=" + str(lease).encode() + b"\0")
+            snap = self._snapshot(proc)
+        self.assertEqual([4242], snap["orphaned_pids"])
+        self.assertEqual("orphan", shell_liveness.session_state("REV1", snap))
+        self.assertEqual(
+            [{"pid": 4242, "start_ticks": None, "orphaned": "client-gone",
+              "claimed": False}],
+            shell_liveness.cli_holders("REV1", snap))
+
+    def test_compute_without_a_lease_keeps_the_old_verdict(self):
+        with tempfile.TemporaryDirectory() as td:
+            snap = self._snapshot(self._proc(td, b"HOME=/x\0"))
+        self.assertEqual([], snap["orphaned_pids"])
+        self.assertEqual("busy", shell_liveness.session_state("rev1", snap))
+
+
+class ReleaseTest(unittest.TestCase):
+    """`release` kills only the identities an operator confirmed — against real
+    processes, because the signal path is the part a mock cannot prove."""
+
+    def _spawn(self, ignore_term: bool = False) -> tuple[object, int]:
+        import subprocess
+        code = ("import signal,time\n"
+                + ("signal.signal(signal.SIGTERM, signal.SIG_IGN)\n" if ignore_term else "")
+                + "print('ready', flush=True)\ntime.sleep(60)\n")
+        proc = subprocess.Popen([sys.executable, "-c", code],
+                                stdout=subprocess.PIPE, start_new_session=True)
+        self.addCleanup(lambda: (proc.poll() is None and proc.kill(), proc.wait()))
+        proc.stdout.readline()
+        return proc, shell_liveness._start_ticks(proc.pid)
+
+    def _holding(self, *identities):
+        snap = {"supported": True, "processes": [
+            {"pid": pid, "start_ticks": ticks, "shortname": "dev1",
+             "orphaned": "client-gone", "claimed": False}
+            for pid, ticks in identities]}
+        return mock.patch.object(shell_liveness, "compute", return_value=snap)
+
+    def test_confirmed_holder_is_terminated(self):
+        proc, ticks = self._spawn()
+        with self._holding((proc.pid, ticks)):
+            survivors = shell_liveness.release(
+                "DEV1", [{"pid": proc.pid, "start_ticks": ticks}])
+        self.assertEqual([], survivors)
+        self.assertEqual(-15, proc.wait(timeout=5))
+
+    def test_term_ignoring_holder_is_killed(self):
+        proc, ticks = self._spawn(ignore_term=True)
+        with self._holding((proc.pid, ticks)):
+            survivors = shell_liveness.release(
+                "dev1", [{"pid": proc.pid, "start_ticks": ticks}],
+                term_grace=0.3)
+        self.assertEqual([], survivors)
+        self.assertEqual(-9, proc.wait(timeout=5))
+
+    def test_unconfirmed_holder_refuses_and_signals_nothing(self):
+        shown, shown_ticks = self._spawn()
+        new, new_ticks = self._spawn()
+        with self._holding((shown.pid, shown_ticks), (new.pid, new_ticks)), \
+                self.assertRaises(shell_liveness.HoldersChanged) as caught:
+            shell_liveness.release(
+                "dev1", [{"pid": shown.pid, "start_ticks": shown_ticks}])
+        self.assertEqual(2, len(caught.exception.holders))
+        self.assertIsNone(shown.poll())
+        self.assertIsNone(new.poll())
+
+    def test_recycled_pid_is_not_the_confirmed_identity(self):
+        proc, ticks = self._spawn()
+        with self._holding((proc.pid, ticks)), \
+                self.assertRaises(shell_liveness.HoldersChanged):
+            shell_liveness.release(
+                "dev1", [{"pid": proc.pid, "start_ticks": ticks - 1}])
+        self.assertIsNone(proc.poll())
+
+    def test_already_exited_holder_is_released(self):
+        with self._holding():
+            self.assertEqual([], shell_liveness.release(
+                "dev1", [{"pid": 999999, "start_ticks": 1}]))
+
+    def _no_numeric_signals(self):
+        """A signal by pid number is exactly the race: fail if one is sent."""
+        return mock.patch.multiple(
+            "os",
+            kill=mock.Mock(side_effect=AssertionError("os.kill by number")),
+            killpg=mock.Mock(side_effect=AssertionError("os.killpg by number")))
+
+    def test_exit_and_reap_at_the_signal_boundary_signals_nobody(self):
+        # The holder is verified and bound, then exits and is reaped just
+        # before the first signal — the moment its number is free to be
+        # reused. The signal goes to the pidfd, which names the dead process,
+        # so nothing is sent to whoever holds that number next.
+        proc, ticks = self._spawn()
+        real_send = shell_liveness._send
+
+        def exit_first(fd, sig):
+            if proc.poll() is None:
+                own = os.pidfd_open(proc.pid)    # the test's own kill, not by number
+                signal.pidfd_send_signal(own, signal.SIGKILL)
+                os.close(own)
+                proc.wait()
+            real_send(fd, sig)
+
+        with self._holding((proc.pid, ticks)), self._no_numeric_signals(), \
+                mock.patch.object(shell_liveness, "_send", side_effect=exit_first):
+            survivors = shell_liveness.release(
+                "dev1", [{"pid": proc.pid, "start_ticks": ticks}])
+        self.assertEqual([], survivors)
+
+    def test_bind_refuses_a_read_that_raced_an_exit(self):
+        # pidfd opened, then the process exits and is reaped before /proc is
+        # read — a read that could describe a process now wearing the same
+        # number, even one whose fields happen to match.
+        proc, ticks = self._spawn()
+        real_fields = shell_liveness._stat_fields(proc.pid)
+
+        def reused(pid):
+            proc.kill()
+            proc.wait()
+            return real_fields
+
+        with mock.patch.object(shell_liveness, "_stat_fields", side_effect=reused):
+            self.assertIsNone(shell_liveness._bind(proc.pid, start_ticks=ticks))
+
+    def test_stranger_in_a_reused_group_number_is_not_enrolled(self):
+        # The leader is gone, so its group number may be reused: a process
+        # reporting that pgrp is a stranger's group, not the harness's.
+        leader, ticks = self._spawn()
+        fd = shell_liveness._bind(leader.pid, start_ticks=ticks)
+        self.addCleanup(os.close, fd)
+        leader.kill()
+        leader.wait()
+        stranger, _ = self._spawn()
+        real_fields = shell_liveness._stat_fields
+
+        def in_leaders_group(pid):
+            rest = real_fields(pid)
+            if pid == stranger.pid:
+                rest[2] = str(leader.pid)
+            return rest
+
+        with mock.patch.object(shell_liveness, "_stat_fields",
+                               side_effect=in_leaders_group):
+            self.assertEqual([], shell_liveness._group_members(
+                fd, leader.pid, {leader.pid}))
+        self.assertIsNone(stranger.poll())
+
+    def test_tool_child_that_ignores_term_is_killed_through_its_pidfd(self):
+        import subprocess
+        code = ("import signal,subprocess,sys,time\n"
+                "child = subprocess.Popen([sys.executable, '-c', "
+                "'import signal,time; signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+                "print(1, flush=True); time.sleep(60)'], stdout=subprocess.PIPE)\n"
+                "child.stdout.readline()\n"
+                "print(child.pid, flush=True)\ntime.sleep(60)\n")
+        leader = subprocess.Popen([sys.executable, "-c", code],
+                                  stdout=subprocess.PIPE, start_new_session=True)
+        self.addCleanup(lambda: (leader.poll() is None and leader.kill(), leader.wait()))
+        child = int(leader.stdout.readline())
+        child_ticks = shell_liveness._start_ticks(child)
+        self.addCleanup(lambda: shell_liveness._start_ticks(child) == child_ticks
+                        and os.kill(child, 9))
+        ticks = shell_liveness._start_ticks(leader.pid)
+        with self._holding((leader.pid, ticks)), self._no_numeric_signals():
+            survivors = shell_liveness.release(
+                "dev1", [{"pid": leader.pid, "start_ticks": ticks}],
+                term_grace=0.5)
+        self.assertEqual([], survivors)
+        leader.wait(timeout=5)
+        deadline = time.monotonic() + 5
+        while (shell_liveness._start_ticks(child) == child_ticks
+               and not shell_liveness._is_zombie(child)
+               and time.monotonic() < deadline):
+            time.sleep(0.05)
+        self.assertTrue(shell_liveness._start_ticks(child) != child_ticks
+                        or shell_liveness._is_zombie(child))
+
+    def test_group_the_harness_does_not_lead_is_never_walked(self):
+        # Launched inside someone else's group (the test runner's here, the
+        # operator's terminal shell in life): only the harness is signalled.
+        import subprocess
+        proc = subprocess.Popen([sys.executable, "-c",
+                                 "print(1, flush=True); import time; time.sleep(60)"],
+                                stdout=subprocess.PIPE)
+        self.addCleanup(lambda: (proc.poll() is None and proc.kill(), proc.wait()))
+        proc.stdout.readline()
+        ticks = shell_liveness._start_ticks(proc.pid)
+        with self._holding((proc.pid, ticks)), self._no_numeric_signals(), \
+                mock.patch.object(shell_liveness, "_group_members") as walk:
+            self.assertEqual([], shell_liveness.release(
+                "dev1", [{"pid": proc.pid, "start_ticks": ticks}]))
+        walk.assert_not_called()
+        self.assertEqual(-15, proc.wait(timeout=5))
+
+    def test_browser_turns_are_not_cli_holders(self):
+        snap = {"processes": [
+            {"pid": 1, "start_ticks": 5, "shortname": "dev1", "orphaned": None,
+             "claimed": False, "browser_conversation": "cv_x"},
+            {"pid": 2, "start_ticks": 6, "shortname": "dev1", "orphaned": None,
+             "claimed": True, "browser_conversation": None}]}
+        self.assertEqual(
+            [{"pid": 2, "start_ticks": 6, "orphaned": None, "claimed": True}],
+            shell_liveness.cli_holders("DEV1", snap))
+
+
+class ConfirmLiveTest(unittest.TestCase):
+    """The interactive boot prompt kills on confirmation instead of booting a
+    second session beside the first."""
+
+    SHELL = {"flavor": "dev", "shortname": "dev1"}
+    HOLDER = {"pid": 4242, "start_ticks": 990, "orphaned": "client-gone",
+              "claimed": False}
+
+    def _confirm(self, answer: str, **release):
+        snap = {"supported": True, "processes": [
+            {**self.HOLDER, "shortname": "dev1", "browser_conversation": None}]}
+        with mock.patch.object(shell_liveness, "compute", return_value=snap), \
+                mock.patch.object(shell_liveness, "release", **release) as rel, \
+                mock.patch("builtins.input", return_value=answer), \
+                redirect_stdout(io.StringIO()) as out:
+            booted = run.confirm_live(self.SHELL, snap)
+        return booted, rel, out.getvalue()
+
+    def test_confirmation_kills_the_shown_holder_and_boots(self):
+        booted, release, out = self._confirm("y", return_value=[])
+        self.assertTrue(booted)
+        release.assert_called_once_with("dev1", [self.HOLDER])
+        self.assertIn("pid 4242 (orphaned — client-gone)", out)
+
+    def test_decline_kills_nothing(self):
+        booted, release, _ = self._confirm("n")
+        self.assertFalse(booted)
+        release.assert_not_called()
+
+    def test_changed_holders_do_not_boot(self):
+        booted, _, out = self._confirm(
+            "y", side_effect=shell_liveness.HoldersChanged([]))
+        self.assertFalse(booted)
+        self.assertIn("nothing was killed", out)
 
 
 class ZombieHarnessTest(unittest.TestCase):
@@ -850,7 +1176,8 @@ class ComputeSmokeTest(unittest.TestCase):
         self.assertIsInstance(snap["orphaned_pids"], list)
         for p in snap["processes"]:
             self.assertIn("orphaned", p)
-            self.assertIn(p["orphaned"], (None, "tty-gone", "detached"))
+            self.assertIn(p["orphaned"],
+                          (None, "tty-gone", "detached", "client-gone"))
             if p["is_self"]:
                 # The scanning session is by definition not an orphan.
                 self.assertIsNone(p["orphaned"])

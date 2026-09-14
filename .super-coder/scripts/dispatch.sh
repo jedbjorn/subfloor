@@ -266,6 +266,38 @@ sc_harness_cleanup() {
     echo "harness-cleanup: incomplete; run ./sc harness-cleanup --check on the host" >&2
 }
 
+# Enter lease (issue #1599): a `docker exec -it` session survives its client —
+# the shim keeps the pty open and parents the harness — so liveness cannot see
+# the terminal close. Hold an exclusive flock on fd 9, which the exec'd docker
+# client inherits; the kernel releases it when that client dies, and
+# shell_liveness reads a released lease as 'client-gone'. Exports
+# SC_ENTER_LEASE only after the container is proven to see the lock, so a
+# mount that does not share locks yields no lease, never a false orphan.
+sc_enter_lease() {
+  unset SC_ENTER_LEASE
+  command -v flock >/dev/null 2>&1 || return 0
+  lease_dir="$ENGINE/run/enter-leases"
+  mkdir -p "$lease_dir" 2>/dev/null || return 0
+  for stale in "$lease_dir"/*.lease; do
+    [ -e "$stale" ] || continue
+    flock -n "$stale" rm -f "$stale" 2>/dev/null || true
+  done
+  # Lock before the name is visible, so a pruner never sees a live lease unlocked.
+  lease_tmp="$(mktemp "$lease_dir/.pending.XXXXXX")" || return 0
+  # Empty, and readable by a uid-remapped container user (rootless Docker).
+  chmod 644 "$lease_tmp" || true
+  exec 9>"$lease_tmp"
+  lease="$lease_dir/${lease_tmp##*.}.lease"
+  if flock -x -n 9 && mv "$lease_tmp" "$lease" &&
+     { docker exec "$CNAME" flock -n -E 75 "$lease" true >/dev/null 2>&1; [ "$?" -eq 75 ]; }; then
+    SC_ENTER_LEASE="$lease"
+    export SC_ENTER_LEASE
+    return 0
+  fi
+  exec 9>&-
+  rm -f "$lease_tmp" "$lease"
+}
+
 # Host-runtime entry: the shell boots on this host through run.py, the same
 # primitive the sandbox runs inside the container. $1 = shortname ("" = picker).
 sc_host_enter() {
@@ -1517,7 +1549,8 @@ case "$cmd" in
       echo "! dev-kit state: repair — provisioning is not ready; no readiness claim is made." >&2
       echo "  inspect .sc-state/local/dev-kit/ and run the declared hook explicitly." >&2
       sc_urls || true
-      exec docker exec -it -e SC_DEVKIT_REPAIR=1 "$CNAME" ./sc boot "$@"
+      sc_enter_lease
+      exec docker exec -it -e SC_DEVKIT_REPAIR=1 ${SC_ENTER_LEASE:+-e SC_ENTER_LEASE} "$CNAME" ./sc boot "$@"
     fi
     sc_devkit_ready || {
       echo "✗ dev-kit state: stale — normal entry blocked until fork provisioning is ready." >&2
@@ -1526,7 +1559,8 @@ case "$cmd" in
       exit 1
     }
     sc_urls || true
-    exec docker exec -it "$CNAME" ./sc boot "$@" ;;
+    sc_enter_lease
+    exec docker exec -it ${SC_ENTER_LEASE:+-e SC_ENTER_LEASE} "$CNAME" ./sc boot "$@" ;;
   enter-*)
     sc_help_form "$@" || sc_harness_cleanup
     if sc_host_runtime; then sc_host_enter "${cmd#enter-}" "$@"; fi
@@ -1541,7 +1575,8 @@ case "$cmd" in
       exit 1
     }
     sc_urls || true
-    exec docker exec -it "$CNAME" ./sc boot "${cmd#enter-}" "$@" ;;
+    sc_enter_lease
+    exec docker exec -it ${SC_ENTER_LEASE:+-e SC_ENTER_LEASE} "$CNAME" ./sc boot "${cmd#enter-}" "$@" ;;
   down)         if sc_host_runtime; then
                   down_rc=0
                   sc_host_server_down || down_rc=1
