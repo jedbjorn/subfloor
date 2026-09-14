@@ -1,6 +1,6 @@
 ---
 name: windows_testing
-description: Windows-only add-on to remote_seats — PowerShell exec conventions, capture, the managed Windows-MCP GUI transport, and guest prerequisites for a posture 1 Windows VM. Opt-in; load with remote_seats.
+description: Windows-only add-on to remote_seats — two-command guest adoption, the shell's authority over the box, PowerShell exec conventions, capture, and the managed Windows-MCP GUI transport for a posture 1 Windows VM. Opt-in; load with remote_seats.
 category: substrate
 command: sc vm
 common: false
@@ -11,23 +11,67 @@ common: false
 `remote_seats` owns setup, the session shape, sharing, snapshots, and errors.
 This skill adds only what a Windows guest changes. Linux guests never need it.
 
-## Guest prerequisites (the FnB installs; the engine does not)
+## Preparing a Windows guest
 
-- Windows OpenSSH server with `ssh_user` in local Administrators; `ssh_key_path`
-  on the host is that account's key. The default SSH shell is `cmd.exe`.
-- PowerShell available on `PATH`. A stock `Restricted` execution policy
-  rejects `-File` scripts; a disposable test image may set
-  `Set-ExecutionPolicy -Scope LocalMachine -ExecutionPolicy Bypass -Force` and
-  verify with `Get-ExecutionPolicy -List`. Apply that only to a throwaway guest
-  holding no data, credentials, or logged-in sessions; a snapshot reset removes
-  later changes, not a secret baked into the baseline.
-- A writable workspace such as `C:\SubfloorTest`, the toolchain under test, and
-  the guest-side mount of the transfer share `./sc vm push` stages into.
-- For GUI work, Windows-MCP listening in the guest on the block's `mcp_port`
-  (default 8000).
+Bring-your-own-licence: the operator supplies a booted, licensed Windows 10 or
+11 guest with a working network and a local administrator account. Adoption is
+two commands. First, in an elevated PowerShell on the guest console:
 
-Confirm each item with `./sc vm status` and one `./sc vm exec`; never install
-or reconfigure a guest to repair a failing prerequisite. Report it.
+```powershell
+powershell -ExecutionPolicy Bypass -Command "[Net.ServicePointManager]::SecurityProtocol='Tls12'; irm https://raw.githubusercontent.com/jedbjorn/subfloor/<ref>/.super-coder/assets/winbox/bootstrap.ps1 | iex"
+```
+
+`<ref>` is the engine's pinned commit — `.super-coder/engine.ref` when that file
+exists, else `main`; `./sc vm adopt` prints the exact line. Then, on the host:
+
+```bash
+./sc vm adopt --domain <libvirt-domain> --ssh-user <account>
+```
+
+Adopt locates the guest, installs a host-held key behind one password prompt,
+turns password auth off, pins the host key, provisions, verifies, writes the
+`vm` block, brings the broker up and takes the baseline snapshot. The key is
+generated and kept on the host and never enters a shell (decision #353); the
+password is read from the operator's TTY, never on argv, never persisted. Every
+phase is idempotent, so re-running adopt after a toolchain change skips what is
+already satisfied. `./sc vm init` still hand-links a guest prepared by other
+means.
+
+Provisioning reads the fork-tracked `.subfloor/winbox.json`. Every key is
+optional:
+
+```json
+{
+  "winget_manifest": "winget-manifest.json",
+  "checks": ["dotnet --version", "git --version"],
+  "mcp": true,
+  "mcp_port": 8000,
+  "workspace": "C:\\SubfloorTest"
+}
+```
+
+Defaults: `winget_manifest` is `winget-manifest.json` at the repo root when that
+file exists, else none; `checks` empty; `mcp` true; `mcp_port` 8000; `workspace`
+`C:\SubfloorTest`. The declared `checks` are also what `./sc vm status` runs as
+the toolchain check — none declared means the check passes with "no checks
+declared". Changing the fork's toolchain means editing `winbox.json` and running
+`./sc vm adopt` again, or doing it by hand over `./sc vm exec` and then
+`./sc vm bake`.
+
+## Authority
+
+The guest is a disposable test box: it holds no real data and no real accounts,
+snapshots are free, and the FnB owns the physical host. So install software,
+change settings, schedule tasks, snapshot, bake and reset are all yours
+(decision #372). Snapshot before a risky change — `./sc vm snapshot create
+<name>` works while the domain is running — and reset to it when the change goes
+wrong. Redefine the baseline with `./sc vm bake [<name>]` rather than trying to
+delete it; the baseline is the one snapshot `reset` depends on and delete still
+refuses it. Leave the box in a state the next shell can either use or reset:
+finish with `./sc vm reset --off`, or say plainly what you changed and which
+snapshot returns the box to the state you found it in. The sharing rule in
+`remote_seats` still governs: read `status` first and do not reset or snapshot a
+VM another shell is visibly using.
 
 ## PowerShell exec conventions
 
@@ -41,11 +85,11 @@ prefer a command file for anything longer than one line:
 
 The command file holds the exact text the guest receives; a typical body is
 `powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File C:\SubfloorTest\run.ps1`
-after pushing `run.ps1` through the share. Use Windows paths on the guest side
-and `--json` when you need `exit_code`, `stdout`, and `stderr` separately.
-Guest console output is decoded lossily; base64-encode guest-side
+after `./sc vm push run.ps1` lands it in the guest workspace. Use Windows paths
+on the guest side and `--json` when you need `exit_code`, `stdout`, and `stderr`
+separately. Guest console output is decoded lossily; base64-encode guest-side
 (`[Convert]::ToBase64String(...)`) when a result must be byte-exact, and write
-large results to the share rather than stdout.
+large results to a file and `./sc vm pull` it rather than through stdout.
 
 ## Capture
 
@@ -66,7 +110,20 @@ Supported harnesses receive a managed `windows-mcp` adapter definition;
 `mcp up` is what brings that endpoint online (in a sandbox it also runs the
 in-container relay on 127.0.0.1:18000). Do not add an MCP server by hand or
 edit harness configuration. Drive the GUI through the MCP tools by element,
-verify each step with a capture, and `mcp down` before `reset --off`.
+verify each step with a capture, and `mcp down` before `reset`.
+
+Provisioning installs the guest side as the per-user login task
+`windows-mcp-server`, listening on the guest's loopback only; the tunnel is the
+only route in. When `./sc vm mcp up` reports no listener, the task has not run —
+usually no interactive desktop session. Log the adopting account in on the
+console, or re-run the install yourself over exec:
+
+```bash
+./sc vm exec -- windows-mcp install --transport streamable-http --host 127.0.0.1 --port <mcp_port>
+```
+
+That is a legitimate repair under Authority above, not a workaround. Report what
+you did.
 
 ## Session end
 
