@@ -1250,7 +1250,6 @@ case "$cmd" in
   # libvirt, with no broker in the path. `./sc vm bake` is the shell-legal
   # broker route; this one is the escape hatch for when the broker is down,
   # and the reason existing operator notes keep working.
-  # keep working; it runs the same client verb and therefore the same code.
   vm-bake)           exec "$PY" "$S/vm.py" bake "$@" ;;
   vm-broker-up)      sc_vm_broker_up ;;
   vm-broker-down)    sc_vm_broker_down ;;

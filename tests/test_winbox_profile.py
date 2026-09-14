@@ -135,14 +135,7 @@ class LoadTests(_Repo):
 
 class ParseReportTests(unittest.TestCase):
     def test_last_json_line_wins_over_chatty_output(self):
-        stdout = "\n".join([
-            "Installing...",
-            '{"steps": [], "ok": false}',
-            "winget noise {not json}",
-            '{"steps": [{"name": "workspace", "ok": true, "detail": "exists"}],'
-            ' "ok": true}',
-            "",
-        ])
+        stdout = 'Installing...\n{"steps": [], "ok": false}\nwinget noise {not json}\n{"steps": [{"name": "workspace", "ok": true, "detail": "exists"}], "ok": true}\n'
         self.assertEqual(winbox.parse_report(stdout), {
             "steps": [{"name": "workspace", "ok": True, "detail": "exists"}],
             "ok": True,
