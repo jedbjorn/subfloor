@@ -1872,15 +1872,17 @@ async function renderScripts(view) {
   root.append(el("div", { className: "muted" },
     "Run a maintenance script. Output appears below it. Per-instance DB edits → Save locally to refresh the ignored snapshot and flat renders."));
 
-  // Windows Test VM — opt-in, link-only. Links this fork to an operator-run
-  // Windows VM for installer/system-level testing. Config lives in instance.json
-  // (no secrets — a key PATH only); every field is live-tested before save.
+  // Windows Test VM — opt-in. Links this fork to an operator-run Windows VM
+  // for installer/system-level testing. Config lives in instance.json (no
+  // secrets — a key PATH only); every field is live-tested before save.
   const vmc = el("div", { className: "card" });
   vmc.append(el("h2", {}, "Windows Test VM",
     el("span", { className: "pill", textContent: " opt-in" })));
   vmc.append(el("div", { className: "muted" },
     "Link this fork to a Windows VM you already run, for high-fidelity installer/system-level testing. " +
-    "Link-only — the VM (OpenSSH, a clean snapshot, the transfer dir, the toolchain via the admin configure_winbox skill) is yours to set up. " +
+    "Bring your own booted, licensed Windows 10/11 guest; adoption is two commands — the bootstrap line in the " +
+    "guest console, then `./sc vm adopt --domain <domain> --ssh-user <account>` on the host, which provisions the " +
+    "guest and writes this block for you. This wizard hand-links a guest you already prepared (`./sc vm init`). " +
     "Every field is validated live before it saves."));
   const vmbtn = el("button", { className: "act primary", textContent: "configure…" });
   vmbtn.onclick = openWinVmModal;
@@ -2114,26 +2116,36 @@ async function openBrowserModal(onChange) {
   cancel.onclick = close;
 }
 
-// Windows Test VM wizard — a single link-only modal (the house openModal/el
-// pattern). The fields map 1:1 to the instance.json `vm` block; the five checks
-// each hit POST /api/vm/validate/{check} with the IN-PROGRESS form, so the
-// operator tests before saving. No secrets here — ssh_key_path is a PATH.
+// Windows Test VM wizard — a single hand-link modal (the house openModal/el
+// pattern). The four checks each hit POST /api/vm/validate/{check} with the
+// IN-PROGRESS form, so the operator tests before saving. No secrets here —
+// ssh_key_path is a PATH. `./sc vm adopt` writes the same block end to end;
+// this is the manual path.
+//
+// The fields below are a SUBSET of the `vm` block, and PUT /api/vm REPLACES
+// the block rather than merging into it. So `collect()` starts from the saved
+// block and overlays the form: without that, one save through this wizard
+// would silently drop `known_hosts_path` and `mcp_port` — the host-key pin and
+// the MCP tunnel target that `adopt` wrote and no field here shows.
 const VM_FIELDS = [
   ["domain", "win-test", "libvirt domain name (virsh target)"],
   ["ssh_host", "127.0.0.1", "guest OpenSSH host"],
   ["ssh_port", "22", "guest OpenSSH port"],
   ["ssh_user", "tester", "guest SSH user"],
   ["ssh_key_path", "~/.ssh/sc_win_test", "PATH to the private key — never the key itself"],
-  ["transfer_dir", "/var/sc/win-xfer", "host-side dir the guest sees (virtio-fs share / scp target)"],
-  ["snapshot", "clean", "named clean snapshot to revert to between runs"],
+  ["snapshot", "baseline", "named baseline snapshot to revert to between runs"],
+  ["workspace", "C:\\SubfloorTest", "OPTIONAL — guest-side working directory push/pull default to (default: C:\\SubfloorTest)"],
   ["libvirt_uri", "qemu:///system", "OPTIONAL — virsh connection; set for a system-scope domain (default: qemu:///session)"],
+  ["mcp_port", "8000", "OPTIONAL — guest loopback port the Windows-MCP tunnel forwards to (default: 8000)"],
+  ["known_hosts_path", "", "OPTIONAL — host-owned known-hosts file the guest key is pinned into; written by `./sc vm adopt`"],
 ];
+// Fields stored as numbers, not strings.
+const VM_NUMERIC_FIELDS = { ssh_port: 22, mcp_port: 8000 };
 const VM_CHECKS = [
   ["domain", "VM exists + visible to libvirt"],
   ["ssh", "SSH auth + remote exec work"],
-  ["transfer", "artifact transfer dir reachable"],
-  ["snapshot", "named clean snapshot exists"],
-  ["toolchain", "box is provisioned (configure_winbox ran)"],
+  ["snapshot", "named baseline snapshot exists"],
+  ["toolchain", "declared winbox.json checks pass in the guest"],
 ];
 
 async function openWinVmModal() {
@@ -2148,12 +2160,17 @@ async function openWinVmModal() {
     form.append(el("span", { className: "k", title: hint }, key), inp);
   }
 
+  // Start from what is SAVED and overlay the form, because PUT /api/vm
+  // replaces the whole block. An empty field clears that key rather than
+  // resurrecting the saved value, so clearing still works.
   const collect = () => {
-    const vm = {};
+    const vm = { ...saved };
     for (const [key] of VM_FIELDS) {
-      let v = inputs[key].value.trim();
-      if (key === "ssh_port") v = Number(v) || 22;
-      if (v !== "") vm[key] = v;
+      const raw = inputs[key].value.trim();
+      if (raw === "") { delete vm[key]; continue; }
+      vm[key] = key in VM_NUMERIC_FIELDS
+        ? (Number(raw) || VM_NUMERIC_FIELDS[key])
+        : raw;
     }
     return vm;
   };
@@ -2161,8 +2178,11 @@ async function openWinVmModal() {
   // results panel: one row per check (✓/✗ + output), like the Scripts run block
   const results = el("div", {});
   const note = el("div", { className: "muted" },
-    "Your VM must already have OpenSSH, a clean snapshot, the transfer dir, and the toolchain " +
-    "(admin's configure_winbox). The wizard validates the link — it does not set the VM up.");
+    "Two-command adoption is the short path: run the bootstrap line printed by `./sc vm adopt` in an elevated " +
+    "PowerShell in the guest, then `./sc vm adopt --domain <domain> --ssh-user <account>` on the host — it installs " +
+    "the key, provisions the guest, writes this block and takes the baseline snapshot. " +
+    "This wizard is the hand-link path (`./sc vm init`) for a guest you prepared yourself: it validates the link, " +
+    "it does not set the VM up.");
 
   const runAll = el("button", { className: "act", textContent: "run all checks" });
   runAll.onclick = async () => {

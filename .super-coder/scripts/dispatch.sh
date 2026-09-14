@@ -1241,13 +1241,16 @@ case "$cmd" in
   # ── in-container primitives (no docker; also the host escape hatch) ──
   serve)        exec "$PY" "$ENGINE/api/server.py" "$@" ;;
   # ── Windows VM broker (HOST-side primitive — runs where virsh + the key live) ──
+  # Subcommands (adopt/init/status/start/stop/restart/snapshot/bake/reset/push/
+  # pull/exec/capture/mcp) are parsed by vm.py's client parser.
   vm)                exec "$PY" "$S/vm.py" client "$@" ;;
   remote)            exec "$PY" "$S/remote.py" "$@" ;;
   vm-broker)         exec "$PY" "$ENGINE/api/vm_broker.py" "$@" ;;
-  # Bake/re-bake the clean snapshot — HOST-side, deliberately NOT a broker verb:
-  # the snapshot is the trust anchor every test reverts to; a sandboxed shell may
-  # run against it but must never redefine it. vm.py bake self-guards on SC_SANDBOX.
-  vm-bake)           exec "$PY" "$S/vm.py" bake ;;
+  # The HOST-DIRECT bake (spec #232): it runs vm.py in this process against
+  # libvirt, with no broker in the path. `./sc vm bake` is the shell-legal
+  # broker route; this one is the escape hatch for when the broker is down,
+  # and the reason existing operator notes keep working.
+  vm-bake)           exec "$PY" "$S/vm.py" bake "$@" ;;
   vm-broker-up)      sc_vm_broker_up ;;
   vm-broker-down)    sc_vm_broker_down ;;
   vm-broker-sock)    exec "$PY" "$S/vm.py" sock ;;
@@ -1833,9 +1836,22 @@ Subfloor — forkable shell substrate — full command reference (./sc help for 
   Windows VM broker (run on the HOST — drives the test VM for sandboxed forks;
   holds the ssh key + virsh so the fork never does).
   `launch` brings it up automatically when a VM is linked; `down` stops it:
-  ./sc vm init --domain DOMAIN --snapshot NAME --transfer-dir PATH
-       --ssh-host HOST --ssh-user USER --ssh-key-path PATH [OPTIONS]
-                           write only the vm block and report broker health
+  ./sc vm adopt --domain DOMAIN [--ssh-user USER] [--ssh-host IP] [--snapshot NAME]
+       [--libvirt-uri URI] [--password-file PATH] [--bootstrap-url URL]
+       [--no-provision] [--wait SECONDS] [--json]
+                           HOST-ONLY two-command adoption of a booted, licensed
+                           Windows guest: locate it, wait for sshd, install a
+                           host-held key with one password prompt, harden and pin,
+                           provision from .subfloor/winbox.json, verify, write the
+                           vm block, bring the broker up, take the baseline
+                           snapshot. Every phase is idempotent — re-run it after a
+                           toolchain change. Prints the guest bootstrap line.
+  ./sc vm init --domain DOMAIN --snapshot NAME
+       --ssh-host HOST --ssh-user USER --ssh-key-path PATH
+       [--libvirt-uri URI] [--ssh-port N] [--mcp-port N]
+       [--workspace 'C:\SubfloorTest'] [--known-hosts-path PATH]
+                           hand-link an already-prepared guest: write only the vm
+                           block and report broker health
   ./sc vm status [--json] read broker, VM, SSH, and MCP-tunnel state without mutation;
                            includes relay, endpoint, and active-adapter state
   ./sc vm start [--json]  start only when off, then wait within a bounded SSH-readiness budget
@@ -1844,20 +1860,35 @@ Subfloor — forkable shell substrate — full command reference (./sc help for 
   ./sc vm restart [--json]
                            gracefully stop, start, and wait for SSH readiness
   ./sc vm snapshot list|create NAME|delete NAME [--json]
-                           inspect snapshots; create requires off; configured snapshot is protected
+                           inspect snapshots; create works in any state (a running
+                           domain gets a live snapshot); the configured baseline is
+                           protected from delete — redefine it with `vm bake`
+  ./sc vm bake [NAME] [--json]
+                           graceful shutdown, then replace (never stack) the baseline
+                           snapshot offline; NAME redefines the baseline in the vm block.
+                           Goes through the broker; `./sc vm-bake` is the host-direct
+                           escape hatch for when the broker is down
   ./sc vm push SRC [DEST] [--json]
-                           stage a permitted local artifact through the configured transfer directory
+                           scp a file from this repo or .sc-state/local into the guest;
+                           DEST is a guest path, default <workspace>\<basename>
+  ./sc vm pull SRC DEST [--json]
+                           scp a guest file back; DEST must stay inside this repo or
+                           .sc-state/local
   ./sc vm exec [--command-file FILE] [--json] -- COMMAND...
                            execute one guest command through SSH without caller-built JSON
   ./sc vm capture [--output PATH] [--json]
                            save a validated screenshot artifact and return viewable metadata
   ./sc vm mcp status|up|down [--json]
                            inspect, start+verify, or stop the managed MCP tunnel and relay
-  ./sc vm reset [NAME] --off [--json]
-                           restore the named or configured snapshot and confirm the VM is powered off
+  ./sc vm reset [NAME] (--off | --running) [--json]
+                           restore the named or configured snapshot; exactly one of
+                           --off (bounded graceful stop after the revert) or --running
+                           (left running) is required
   ./sc vm-broker           run the broker in the foreground (unix socket)
-  ./sc vm-bake             HOST-side: graceful shutdown + (re)bake the clean snapshot after provisioning
-                             (deliberately NOT a broker verb — the sandbox must never redefine 'clean')
+  ./sc vm-bake [NAME]      HOST-DIRECT bake: same operation as `./sc vm bake` but run
+                             against libvirt in this process, with no broker in the path.
+                             Use `./sc vm bake` normally (broker route, shell-legal); use
+                             this when the broker is down. Host-only, never in the sandbox.
   ./sc vm-broker-up        start it in the background (nohup + pidfile); self-skips if unlinked/already up
   ./sc vm-broker-down      stop the backgrounded broker
   ./sc vm-broker-sock      print the broker's socket path

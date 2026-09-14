@@ -297,9 +297,10 @@ class PushClientTests(unittest.TestCase):
     def test_push_passes_unicode_paths_and_returns_structured_locations(self):
         response = {
             "ok": True,
-            "output": "staged",
+            "output": "copied",
             "source": "/repo/artifacts/Δ build.zip",
-            "destination": "/share/Builds/Δ build.zip",
+            "destination": "C:\\SubfloorTest\\Δ build.zip",
+            "bytes": 4096,
         }
         with (
             mock.patch.object(vm, "broker_call", return_value=response) as call,
@@ -309,7 +310,7 @@ class PushClientTests(unittest.TestCase):
                 [
                     "push",
                     "artifacts/Δ build.zip",
-                    "Builds/Δ build.zip",
+                    "C:\\SubfloorTest\\Δ build.zip",
                     "--json",
                 ]
             )
@@ -317,16 +318,54 @@ class PushClientTests(unittest.TestCase):
         call.assert_called_once_with(
             "POST",
             "/push",
-            {"src": "artifacts/Δ build.zip", "dest": "Builds/Δ build.zip"},
-            timeout=vm.DEFAULT_CLIENT_TIMEOUT,
+            {
+                "src": "artifacts/Δ build.zip",
+                "dest": "C:\\SubfloorTest\\Δ build.zip",
+            },
+            timeout=vm.TRANSFER_CLIENT_TIMEOUT,
         )
         self.assertEqual(
             json.loads(stdout.getvalue())["result"],
             {
                 "source": "/repo/artifacts/Δ build.zip",
-                "destination": "/share/Builds/Δ build.zip",
+                "destination": "C:\\SubfloorTest\\Δ build.zip",
+                "bytes": 4096,
             },
         )
+
+    def test_pull_client_routes_to_the_broker_with_both_paths(self):
+        response = {
+            "ok": True,
+            "output": "copied",
+            "source": "C:\\SubfloorTest\\Δ report.txt",
+            "destination": "/repo/.sc-state/local/Δ report.txt",
+            "bytes": 17,
+        }
+        with (
+            mock.patch.object(vm, "broker_call", return_value=response) as call,
+            mock.patch.object(sys, "stdout", new_callable=io.StringIO) as stdout,
+        ):
+            code = vm.client_main([
+                "pull",
+                "C:\\SubfloorTest\\Δ report.txt",
+                ".sc-state/local/Δ report.txt",
+                "--json",
+            ])
+        self.assertEqual(code, 0)
+        call.assert_called_once_with(
+            "POST",
+            "/pull",
+            {
+                "src": "C:\\SubfloorTest\\Δ report.txt",
+                "dest": ".sc-state/local/Δ report.txt",
+            },
+            timeout=vm.TRANSFER_CLIENT_TIMEOUT,
+        )
+        self.assertEqual(json.loads(stdout.getvalue())["result"], {
+            "source": "C:\\SubfloorTest\\Δ report.txt",
+            "destination": "/repo/.sc-state/local/Δ report.txt",
+            "bytes": 17,
+        })
 
 
 class CaptureClientTests(unittest.TestCase):

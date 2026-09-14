@@ -20,10 +20,12 @@ Routes (all JSON `{ok, ...}`):
     POST /stop       {force?}   shut down, or destroy only with force=true
     POST /restart               graceful stop followed by start readiness
     GET  /snapshot/list         list snapshots with current marker
-    POST /snapshot/create       create one offline snapshot
+    POST /snapshot/create       snapshot in any state (live when running)
     POST /snapshot/delete       delete one non-configured snapshot
-    POST /reset      {snapshot?} revert a named/default snapshot, powered off
-    POST /push      {src,dest?} stage a host-visible artifact into transfer_dir
+    POST /bake       {name?}     graceful shutdown + replace the baseline offline
+    POST /reset {snapshot?,running} revert a named/default snapshot
+    POST /push      {src,dest?} scp a repo-contained file into the guest
+    POST /pull      {src,dest}  scp a guest file into the repo or .sc-state/local
     POST /capture   {command?}  optional exec + a virsh screenshot (base64)
     POST /validate/{check}      one live setup check against the body's candidate cfg
     POST /mcp/up                open the GUI seam: ssh-forward run/vm-mcp.sock
@@ -210,11 +212,23 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/snapshot/delete":
             name = self._body().get("name", "")
             return self._mutate(lambda: vm.do_snapshot_delete(name))
+        if self.path == "/bake":
+            # A broker verb since spec #232 (decision #372): the guest is a
+            # disposable test box, so a shell that just provisioned it may
+            # redefine the baseline. {"name": ...} rebases the vm block.
+            name = self._body().get("name")
+            if name is not None and not isinstance(name, str):
+                return self._send(400, {"ok": False, "error": "name must be a string"})
+            return self._mutate(lambda: vm.do_bake(name))
         if self.path == "/reset":
             # {"running": false} ends a run clean + powered OFF (frees host
-            # RAM); default true boots a clean box to START a run.
+            # RAM); true leaves the restored domain running to START a run.
             body = self._body()
             running = body.get("running", True)
+            if not isinstance(running, bool):
+                return self._send(
+                    400, {"ok": False, "error": "running must be boolean"}
+                )
             return self._mutate(
                 lambda: vm.do_reset(running=running, snapshot=body.get("snapshot"))
             )
@@ -222,6 +236,11 @@ class Handler(BaseHTTPRequestHandler):
             b = self._body()
             return self._mutate(
                 lambda: vm.do_push(b.get("src", ""), b.get("dest"))
+            )
+        if self.path == "/pull":
+            b = self._body()
+            return self._mutate(
+                lambda: vm.do_pull(b.get("src", ""), b.get("dest", ""))
             )
         if self.path == "/capture":
             command = self._body().get("command")

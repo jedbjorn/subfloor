@@ -65,6 +65,7 @@ ENGINE_PATHS = [
     ".super-coder/assets/skill_tombstones.json",
     ".super-coder/assets/legacy-global-pointers.json",
     ".super-coder/assets/skills",
+    ".super-coder/assets/winbox",
     ".super-coder/hooks",
     ".super-coder/shadow",
 ]

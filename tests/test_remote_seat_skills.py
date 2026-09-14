@@ -16,7 +16,7 @@ ROOT = Path(__file__).resolve().parents[1]
 ENGINE = ROOT / ".super-coder"
 SKILLS = ENGINE / "assets" / "skills"
 SEED = ENGINE / "migrations" / "0001_seed_skills.sql"
-RESEED = ENGINE / "migrations" / "0263_reseed_remote_seat_skills.sql"
+RESEED = ENGINE / "migrations" / "0264_reseed_winbox_adoption_skills.sql"
 README = ROOT / "docs" / "README.md"
 REMOTE_SEATS_DOC = ENGINE / "docs" / "remote-seats.md"
 TAILNET_DOC = ENGINE / "docs" / "tailscale-broker.md"
@@ -26,6 +26,9 @@ RETIRED_DOCS = (
     ENGINE / "docs" / "skills",
 )
 NEW_SKILLS = ("remote_seats", "tailscale_diagnostics", "windows_testing")
+# The trailing reseed carries only the skills that spec #232 rewrote;
+# tailscale_diagnostics was last reseeded by 0263 and is unchanged.
+RESEED_SKILLS = ("remote_seats", "windows_testing")
 RETIRED_GUIDANCE = re.compile(
     r"lease|forcecommand|sc vm test|acquire|release --force|baseline promote"
     r"|windows-test-client|windows_test_controller",
@@ -35,6 +38,7 @@ RETIRED_GUIDANCE = re.compile(
 sys.path.insert(0, str(ENGINE / "scripts"))
 import feature
 import seed_skills
+import services
 import ts
 
 SKILL_SCHEMA = (
@@ -106,6 +110,51 @@ class SkillAssetTests(unittest.TestCase):
             self.assertIn(phrase, _flat(body))
         self.assertIsNone(RETIRED_GUIDANCE.search(body), RETIRED_GUIDANCE.search(body))
 
+    def test_remote_seats_carries_the_adoption_verbs_and_error_codes(self) -> None:
+        """Spec #232: the posture-1 verb list and structured errors grew."""
+        body = _flat(_specs()["remote_seats"]["content"])
+        for phrase in (
+            "./sc vm adopt", "bake", "./sc vm pull", "--running",
+            "snapshot_live_unsupported", "remote_path_not_allowed",
+            "adopt_guest_not_found", "adopt_ssh_timeout",
+            "adopt_key_install_failed", "adopt_provision_failed",
+            "adopt_verify_failed", "adopt_sandboxed",
+            "decision #372", "decision #101",
+        ):
+            with self.subTest(phrase=phrase):
+                self.assertIn(phrase, body)
+
+    def test_windows_testing_carries_adoption_authority_and_mcp_recovery(self) -> None:
+        """Spec #232: two-command adoption, winbox.json, authority, MCP repair."""
+        body = _flat(_specs()["windows_testing"]["content"])
+        for phrase in (
+            "./sc vm adopt", "bootstrap.ps1", ".subfloor/winbox.json",
+            "winget_manifest", "mcp_port", "C:\\SubfloorTest",
+            "## Authority", "decision #372", "decision #353",
+            "windows-mcp-server",
+            "windows-mcp install --transport streamable-http",
+            "./sc vm bake", "--command-file",
+            "[Convert]::ToBase64String(...)",
+            # The pin lives in .sc-state (callable_floor.read_engine_ref).
+            "`.sc-state/engine.ref`",
+            # A LOGIN task: no desktop session means no listener, and that is
+            # a warning on a fully adopted guest, not a broken one.
+            "LOGIN task",
+            # Guest paths take either separator; the key never reaches a shell.
+            "C:/SubfloorTest/out.bin",
+            "generated on the host and never handed to a shell",
+            # A declared check is a cmd.exe command line.
+            "must not contain a double quote",
+        ):
+            with self.subTest(phrase=phrase):
+                self.assertIn(phrase, body)
+        for retired in (
+            "the engine installs nothing",
+            "never install or reconfigure a guest",
+        ):
+            with self.subTest(retired=retired):
+                self.assertNotIn(retired, body.lower())
+
 
 class ReseedMigrationTests(unittest.TestCase):
     def test_generated_seed_lists_the_three_skills(self) -> None:
@@ -137,7 +186,9 @@ class ReseedMigrationTests(unittest.TestCase):
                 "FROM skills"
             )
         }
-        for name, spec in _specs().items():
+        specs = _specs()
+        for name in RESEED_SKILLS:
+            spec = specs[name]
             with self.subTest(skill=name):
                 self.assertEqual(
                     rows[name],
@@ -155,16 +206,67 @@ class ReseedMigrationTests(unittest.TestCase):
         )
 
     def test_seed_and_reseed_agree_with_assets(self) -> None:
-        for migration in (SEED, RESEED):
+        specs = _specs()
+        for migration, names in ((SEED, NEW_SKILLS), (RESEED, RESEED_SKILLS)):
             con = sqlite3.connect(":memory:")
             con.executescript(SKILL_SCHEMA + migration.read_text())
-            for name, spec in _specs().items():
+            for name in names:
+                spec = specs[name]
                 with self.subTest(migration=migration.name, skill=name):
                     row = con.execute(
                         "SELECT content, common FROM skills WHERE name=?", (name,)
                     ).fetchone()
                     self.assertEqual(row, (spec["content"], 0))
             con.close()
+
+
+# Every code the doc and the skill table must both carry. A code documented in
+# one place and not the other is how a shell ends up guessing.
+ADOPT_AND_TRANSFER_CODES = (
+    "adopt_sandboxed", "adopt_guest_not_found", "adopt_ssh_timeout",
+    "adopt_key_install_failed", "adopt_harden_failed", "adopt_host_key_changed",
+    "adopt_provision_failed", "adopt_verify_failed", "adopt_config_invalid",
+    "adopt_block_write_failed", "adopt_broker_failed", "adopt_baseline_failed",
+    "push_failed", "pull_failed", "pull_source_invalid",
+    "pull_destination_invalid", "push_source_invalid", "scp_unsupported",
+    "bake_config_write_failed", "<operation>_timeout",
+)
+
+
+class ErrorVocabularyTests(unittest.TestCase):
+    """Spec #232: the runbook and the shell-facing skill agree, and every code
+    they name is one the engine actually emits."""
+
+    def test_runbook_and_skill_document_the_same_codes(self) -> None:
+        doc = _flat(REMOTE_SEATS_DOC.read_text())
+        skill = _flat(_specs()["remote_seats"]["content"])
+        for code in ADOPT_AND_TRANSFER_CODES:
+            with self.subTest(code=code):
+                self.assertIn(code, doc, "missing from docs/remote-seats.md")
+                self.assertIn(code, skill, "missing from the remote_seats skill")
+
+    def test_every_documented_code_is_emitted_by_the_engine(self) -> None:
+        sources = "\n".join(
+            (ENGINE / "scripts" / name).read_text()
+            for name in ("vm.py", "vm_adopt.py")
+        )
+        for code in ADOPT_AND_TRANSFER_CODES:
+            if code == "<operation>_timeout":
+                # Generated per verb, so it is a format string in the source.
+                self.assertIn('f"{operation}_timeout"', sources)
+                continue
+            with self.subTest(code=code):
+                self.assertIn(f'"{code}"', sources)
+
+    def test_the_broker_resume_line_says_the_block_is_written(self) -> None:
+        """A shell that reads `adopt_broker_failed` must not re-run adoption
+        believing nothing was saved."""
+        for body in (
+            _flat(REMOTE_SEATS_DOC.read_text()),
+            _flat(_specs()["remote_seats"]["content"]),
+        ):
+            self.assertIn("./sc vm-broker-up", body)
+            self.assertRegex(body, r"block IS written")
 
 
 class DocumentationTests(unittest.TestCase):
@@ -186,6 +288,38 @@ class DocumentationTests(unittest.TestCase):
         self.assertIsNone(
             re.search(r"forcecommand|windows-test-client|acquire", body, re.IGNORECASE)
         )
+
+    def test_remote_seats_runbook_documents_two_command_adoption(self) -> None:
+        """Spec #232: onboarding, routes, block fields, limits, error codes."""
+        body = _flat(REMOTE_SEATS_DOC.read_text())
+        for needed in (
+            "./sc vm adopt", "bootstrap.ps1", "--bootstrap-url",
+            # The engine pin lives in .sc-state, not under .super-coder:
+            # callable_floor.read_engine_ref is the authority.
+            "`.sc-state/engine.ref`", "`main`",
+            "`/bake` `{name?}`", "`/pull` `{src, dest}`",
+            "`/push` `{src, dest?}`", "`{snapshot?, running}`",
+            "`/snapshot/create` `{name}`", "`/snapshot/delete` `{name}`",
+            "`/validate/<check>` `{vm}`",
+            "`workspace`", "`known_hosts_path`", "`ssh_port`", "`mcp_port`",
+            "./sc vm-bake", "snapshot_live_unsupported",
+            "remote_path_not_allowed", "adopt_guest_not_found",
+            "adopt_ssh_timeout", "adopt_key_install_failed",
+            "adopt_provision_failed", "adopt_verify_failed", "adopt_sandboxed",
+            "booted, licensed Windows 10 or 11 guest",
+            # Every flag `vm adopt` accepts, on the client-verb line.
+            "--libvirt-uri", "--wait SECONDS", "--json",
+            # The host floor push/pull depend on.
+            "OpenSSH client 8.7 or newer",
+        ):
+            with self.subTest(needed=needed):
+                self.assertIn(needed, body)
+        self.assertNotIn("the engine installs nothing", body)
+        # The one surviving mention is the retirement note on `vm init`.
+        self.assertEqual(body.count("--transfer-dir"), 1)
+        # `vm-bake` is the host-direct escape hatch, not a plain alias.
+        self.assertIn("HOST-DIRECT", body)
+        self.assertNotIn("stays as a dispatcher alias", body)
 
     def test_tailnet_runbook_describes_the_readonly_tier(self) -> None:
         body = TAILNET_DOC.read_text()
@@ -210,12 +344,21 @@ class OnboardingTests(unittest.TestCase):
     def test_feature_hints_name_the_setup_commands(self) -> None:
         windows = "\n".join(feature.FEATURES["windows"]["link"])
         tailnet = "\n".join(feature.FEATURES["tailnet"]["link"])
+        self.assertIn("./sc vm adopt", windows)
         self.assertIn("./sc vm init", windows)
         self.assertIn("./sc remote add", windows)
+        self.assertNotIn("--transfer-dir", windows)
         self.assertIn("remote-seats.md", windows)
         self.assertIn("./sc ts init", tailnet)
         self.assertIn("--readonly-host", tailnet)
         self.assertNotIn("hand-fill", windows + tailnet)
+
+    def test_vm_broker_onboarding_names_two_command_adoption(self) -> None:
+        onboarding = services.SERVICES["vm"]["onboarding"]
+        self.assertIn("./sc vm adopt --domain <domain> --ssh-user <account>",
+                      onboarding)
+        self.assertIn("remote-seats.md", onboarding)
+        self.assertNotIn("--transfer-dir", onboarding)
 
     def test_vm_test_is_an_unknown_verb(self) -> None:
         completed = subprocess.run(
