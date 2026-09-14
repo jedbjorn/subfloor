@@ -1429,7 +1429,7 @@ def test_layout_retains_shell_rail_chat_history_and_bubble_transcript():
 
 
 @pytest.mark.skipif(shutil.which("node") is None, reason="node is required")
-def test_state_pill_names_a_lingering_process_by_pid():
+def test_state_pill_shows_a_lingering_process_as_background_work():
     pill = APP[APP.index("function chatWorkingDots"):
                APP.index("function chatWorkingIndicator")]
     script = r"""
@@ -1439,8 +1439,11 @@ const el = (tag, props = {}, ...kids) => ({
 });
 """ + pill + r"""
 const shape = (pill) => [pill.className, pill.textContent ?? pill.kids[0]];
+const background = chatStatePill("idle", {pid: 4242, lingering: true});
 console.log(JSON.stringify({
-  lingering: shape(chatStatePill("idle", {pid: 4242, lingering: true})),
+  lingering: shape(background),
+  animated: background.kids.length === 2,
+  explained: background.title.startsWith("pid 4242"),
   idle: shape(chatStatePill("idle", {pid: 4242, lingering: false})),
   noProcess: shape(chatStatePill("idle")),
   running: shape(chatStatePill("running", {pid: 4242, lingering: false})),
@@ -1449,8 +1452,10 @@ console.log(JSON.stringify({
     assert run_js(script) == {
         "lingering": [
             "chat-state state-idle lingering",
-            "process still running · pid 4242",
+            "working in background",
         ],
+        "animated": True,
+        "explained": True,
         "idle": ["chat-state state-idle", "idle"],
         "noProcess": ["chat-state state-idle", "idle"],
         "running": ["chat-state state-running", "working"],
