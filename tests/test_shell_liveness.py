@@ -475,14 +475,138 @@ class EnterLeaseTest(unittest.TestCase):
             snap = self._snapshot(proc)
         self.assertEqual([4242], snap["orphaned_pids"])
         self.assertEqual("orphan", shell_liveness.session_state("REV1", snap))
-        self.assertEqual([{"pid": 4242, "orphaned": "client-gone"}],
-                         shell_liveness.holders("REV1", snap))
+        self.assertEqual(
+            [{"pid": 4242, "start_ticks": None, "orphaned": "client-gone",
+              "claimed": False}],
+            shell_liveness.cli_holders("REV1", snap))
 
     def test_compute_without_a_lease_keeps_the_old_verdict(self):
         with tempfile.TemporaryDirectory() as td:
             snap = self._snapshot(self._proc(td, b"HOME=/x\0"))
         self.assertEqual([], snap["orphaned_pids"])
         self.assertEqual("busy", shell_liveness.session_state("rev1", snap))
+
+
+class ReleaseTest(unittest.TestCase):
+    """`release` kills only the identities an operator confirmed — against real
+    processes, because the signal path is the part a mock cannot prove."""
+
+    def _spawn(self, ignore_term: bool = False) -> tuple[object, int]:
+        import subprocess
+        code = ("import signal,time\n"
+                + ("signal.signal(signal.SIGTERM, signal.SIG_IGN)\n" if ignore_term else "")
+                + "print('ready', flush=True)\ntime.sleep(60)\n")
+        proc = subprocess.Popen([sys.executable, "-c", code],
+                                stdout=subprocess.PIPE, start_new_session=True)
+        self.addCleanup(lambda: (proc.poll() is None and proc.kill(), proc.wait()))
+        proc.stdout.readline()
+        return proc, shell_liveness._start_ticks(proc.pid)
+
+    def _holding(self, *identities):
+        snap = {"supported": True, "processes": [
+            {"pid": pid, "start_ticks": ticks, "shortname": "dev1",
+             "orphaned": "client-gone", "claimed": False}
+            for pid, ticks in identities]}
+        return mock.patch.object(shell_liveness, "compute", return_value=snap)
+
+    def test_confirmed_holder_is_terminated(self):
+        proc, ticks = self._spawn()
+        with self._holding((proc.pid, ticks)):
+            survivors = shell_liveness.release(
+                "DEV1", [{"pid": proc.pid, "start_ticks": ticks}])
+        self.assertEqual([], survivors)
+        self.assertEqual(-15, proc.wait(timeout=5))
+
+    def test_term_ignoring_holder_is_killed(self):
+        proc, ticks = self._spawn(ignore_term=True)
+        with self._holding((proc.pid, ticks)):
+            survivors = shell_liveness.release(
+                "dev1", [{"pid": proc.pid, "start_ticks": ticks}],
+                term_grace=0.3)
+        self.assertEqual([], survivors)
+        self.assertEqual(-9, proc.wait(timeout=5))
+
+    def test_unconfirmed_holder_refuses_and_signals_nothing(self):
+        shown, shown_ticks = self._spawn()
+        new, new_ticks = self._spawn()
+        with self._holding((shown.pid, shown_ticks), (new.pid, new_ticks)), \
+                self.assertRaises(shell_liveness.HoldersChanged) as caught:
+            shell_liveness.release(
+                "dev1", [{"pid": shown.pid, "start_ticks": shown_ticks}])
+        self.assertEqual(2, len(caught.exception.holders))
+        self.assertIsNone(shown.poll())
+        self.assertIsNone(new.poll())
+
+    def test_recycled_pid_is_not_the_confirmed_identity(self):
+        proc, ticks = self._spawn()
+        with self._holding((proc.pid, ticks)), \
+                self.assertRaises(shell_liveness.HoldersChanged):
+            shell_liveness.release(
+                "dev1", [{"pid": proc.pid, "start_ticks": ticks - 1}])
+        self.assertIsNone(proc.poll())
+
+    def test_already_exited_holder_is_released(self):
+        with self._holding():
+            self.assertEqual([], shell_liveness.release(
+                "dev1", [{"pid": 999999, "start_ticks": 1}]))
+
+    def test_group_is_signalled_only_when_the_harness_leads_it(self):
+        with mock.patch("os.getpgid", return_value=100), \
+                mock.patch("os.killpg") as killpg, mock.patch("os.kill") as kill:
+            shell_liveness._signal(4242, 15)
+        killpg.assert_not_called()
+        kill.assert_called_once_with(4242, 15)
+        with mock.patch("os.getpgid", return_value=4242), \
+                mock.patch("os.killpg") as killpg, mock.patch("os.kill") as kill:
+            shell_liveness._signal(4242, 15)
+        killpg.assert_called_once_with(4242, 15)
+        kill.assert_not_called()
+
+    def test_browser_turns_are_not_cli_holders(self):
+        snap = {"processes": [
+            {"pid": 1, "start_ticks": 5, "shortname": "dev1", "orphaned": None,
+             "claimed": False, "browser_conversation": "cv_x"},
+            {"pid": 2, "start_ticks": 6, "shortname": "dev1", "orphaned": None,
+             "claimed": True, "browser_conversation": None}]}
+        self.assertEqual(
+            [{"pid": 2, "start_ticks": 6, "orphaned": None, "claimed": True}],
+            shell_liveness.cli_holders("DEV1", snap))
+
+
+class ConfirmLiveTest(unittest.TestCase):
+    """The interactive boot prompt kills on confirmation instead of booting a
+    second session beside the first."""
+
+    SHELL = {"flavor": "dev", "shortname": "dev1"}
+    HOLDER = {"pid": 4242, "start_ticks": 990, "orphaned": "client-gone",
+              "claimed": False}
+
+    def _confirm(self, answer: str, **release):
+        snap = {"supported": True, "processes": [
+            {**self.HOLDER, "shortname": "dev1", "browser_conversation": None}]}
+        with mock.patch.object(shell_liveness, "compute", return_value=snap), \
+                mock.patch.object(shell_liveness, "release", **release) as rel, \
+                mock.patch("builtins.input", return_value=answer), \
+                redirect_stdout(io.StringIO()) as out:
+            booted = run.confirm_live(self.SHELL, snap)
+        return booted, rel, out.getvalue()
+
+    def test_confirmation_kills_the_shown_holder_and_boots(self):
+        booted, release, out = self._confirm("y", return_value=[])
+        self.assertTrue(booted)
+        release.assert_called_once_with("dev1", [self.HOLDER])
+        self.assertIn("pid 4242 (orphaned — client-gone)", out)
+
+    def test_decline_kills_nothing(self):
+        booted, release, _ = self._confirm("n")
+        self.assertFalse(booted)
+        release.assert_not_called()
+
+    def test_changed_holders_do_not_boot(self):
+        booted, _, out = self._confirm(
+            "y", side_effect=shell_liveness.HoldersChanged([]))
+        self.assertFalse(booted)
+        self.assertIn("nothing was killed", out)
 
 
 class ZombieHarnessTest(unittest.TestCase):

@@ -3228,6 +3228,38 @@ function chatBusyToast(error, shortname) {
     open));
 }
 
+// A CLI session holding the shell is not a dead end either: warn with exactly
+// what holds it, and when the operator confirms nothing is running there, kill
+// those holders (by pid + start ticks) and retry the action once.
+function chatShellReleaseWarning(error, holders) {
+  const lines = holders.map((holder) => {
+    const kind = holder.orphaned ? `orphaned — ${holder.orphaned}`
+      : holder.claimed ? "headless worker"
+      : "live — someone may be using it right now";
+    return `  pid ${holder.pid} (${kind})`;
+  });
+  return `${error.message}\n\n${lines.join("\n")}\n\n`
+    + "Killing ends that session and any work it is running. Continue only if "
+    + "nothing is running there.\n\nKill it and continue?";
+}
+
+async function chatWithShellRelease(action) {
+  try {
+    return await action();
+  } catch (error) {
+    const held = error.details || {};
+    const holders = held.holders || [];
+    if (error.code !== "SHELL_BUSY" || held.conversation_id || !holders.length)
+      throw error;
+    if (!confirm(chatShellReleaseWarning(error, holders))) throw error;
+    await chatApi("/conversations/shell-release", "POST", {
+      shell_id: held.shell_id,
+      holders: holders.map(({ pid, start_ticks }) => ({ pid, start_ticks })),
+    });
+    return action();
+  }
+}
+
 function chatModeHash(shortname, conversationId, mode = "chat") {
   return chatHash(shortname, conversationId)
     + (mode === "diff" ? "/diff" : "");
@@ -4606,7 +4638,8 @@ async function chatRenderNew(host, shell, defaults, catalog) {
     else if (modelSelect.value) body.model = modelSelect.value;
     if (effortSelect.value) body.effort = effortSelect.value;
     try {
-      const conversation = await chatCreateConversation(shell, body);
+      const conversation = await chatWithShellRelease(
+        () => chatCreateConversation(shell, body));
       location.hash = chatHash(shell.shortname, conversation.conversation_id);
     } catch (error) {
       chatBusyToast(error, shell.shortname);
@@ -5359,9 +5392,9 @@ async function chatRenderOpen(
     pending.hidden = false;
     pending.textContent = "sending…";
     try {
-      const result = await chatApi(
+      const result = await chatWithShellRelease(() => chatApi(
         `/conversations/${conversation.conversation_id}/messages`,
-        "POST", { text }, chatPendingSend.key);
+        "POST", { text }, chatPendingSend.key));
       if (!messages.some((item) => item.message_id === result.message.message_id))
         messages.push(result.message);
       const userItemId = `message:${result.message.message_id}`;
@@ -5818,7 +5851,8 @@ async function renderInterface(root) {
     configure.disabled = true;
     newChat.textContent = "Starting…";
     try {
-      const conversation = await chatCreateConversation(shell);
+      const conversation = await chatWithShellRelease(
+        () => chatCreateConversation(shell));
       location.hash = chatHash(shell.shortname, conversation.conversation_id);
     } catch (error) {
       chatBusyToast(error, shell.shortname);

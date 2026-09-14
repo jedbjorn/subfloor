@@ -11,8 +11,9 @@ pinned to the shell's worktree, leaving no exit hook to clear a bool. A persiste
 flag would go stale on `kill -9` or reboot. That same exec hands us a clean,
 self-cleaning signal instead: a live harness process is one whose cwd sits inside
 a worktree. The process dies → the signal vanishes. No cron, no persistence, no
-staleness window. Reporting only, by design — like git_hygiene.py, it surfaces
-state and never mutates.
+staleness window. The scan is reporting only, by design — like git_hygiene.py,
+it surfaces state and never mutates. The one mutating verb, `release`, kills
+the exact holders an operator has already been shown and confirmed.
 
 Mechanism (Linux): scan /proc/<pid>/{comm,cwd}. A process whose comm is one of the
 fork's harness comm values (adapters/*/adapter.json `launch[0]`,
@@ -55,9 +56,10 @@ flock on a lease file in the shared checkout (dispatch.sh sc_enter_lease) and
 names it in the session's SC_ENTER_LEASE; the kernel drops that lock the moment
 the client dies, from any vantage that shares the bind mount.
 Classification is reporting only — an orphan may still be mid-work (a merge,
-a suite), so nothing here kills anything. The consumer (`sc run`'s guard, the
-operator) verifies idleness first: `ps -o etime=,stat= -p <pid>`, no child
-processes doing work, then `kill <pid>`.
+a suite), so the scan never kills on a verdict. A busy slot is released only by
+an operator who was warned and confirmed there is no running work: the GUI's
+shell-release call and the interactive boot prompt both call `release` with
+the pid + start-ticks identities they displayed.
 
 Launch claims (spec #76 H-25): lineage cannot answer for a generic headless
 shell. It is detached from birth — no controlling TTY, launcher gone — so
@@ -92,8 +94,10 @@ from __future__ import annotations
 import fcntl
 import json
 import os
+import signal
 import sqlite3
 import sys
+import time
 from pathlib import Path
 
 import instance_state
@@ -556,6 +560,7 @@ def compute() -> dict:
             admin_root_pids.append(pid)
         processes.append({
             "pid": pid,
+            "start_ticks": _start_ticks(pid),
             "comm": comm,
             "cwd": str(cwdp),
             "region": region,
@@ -625,14 +630,79 @@ def orphan_split(shortname: str, snap: dict) -> "tuple[list[int], list[int]]":
              if p.get("orphaned") and not p.get("claimed")])
 
 
-def holders(shortname: str, snap: dict) -> list[dict]:
-    """[{pid, orphaned}] for every process holding one shell's worktree, for a
-    refusal that must NAME what holds the slot. `orphaned` is None for a
-    claimed pid, exactly as orphan_split reads it."""
+def cli_holders(shortname: str, snap: dict) -> list[dict]:
+    """[{pid, start_ticks, orphaned, claimed}] for every non-browser process
+    holding one shell's worktree — what a refusal must NAME and what `release`
+    may kill. `orphaned` is None for a claimed pid, exactly as orphan_split
+    reads it. Browser turns are excluded: they belong to a conversation, and
+    their way out is that chat's Stop or close."""
     return [{"pid": p["pid"],
-             "orphaned": None if p.get("claimed") else p.get("orphaned")}
+             "start_ticks": p.get("start_ticks"),
+             "orphaned": None if p.get("claimed") else p.get("orphaned"),
+             "claimed": bool(p.get("claimed"))}
             for p in snap.get("processes", [])
-            if (p.get("shortname") or "").lower() == shortname.lower()]
+            if (p.get("shortname") or "").lower() == shortname.lower()
+            and not p.get("browser_conversation")]
+
+
+class HoldersChanged(Exception):
+    """The slot is held by a process the operator was not shown."""
+
+    def __init__(self, holders: list[dict]):
+        super().__init__("shell holders changed since they were confirmed")
+        self.holders = holders
+
+
+def _gone(pid: int, start_ticks: int) -> bool:
+    return _is_zombie(pid) or _start_ticks(pid) != start_ticks
+
+
+def _signal(pid: int, sig: int) -> None:
+    """Signal the harness and, when it leads its own process group (a
+    `docker exec` or `./sc enter` session does), the tool children in that
+    group. Never a group it merely belongs to — that could be the operator's
+    own terminal shell."""
+    try:
+        if os.getpgid(pid) == pid:
+            os.killpg(pid, sig)
+        else:
+            os.kill(pid, sig)
+    except ProcessLookupError:
+        pass
+
+
+def release(shortname: str, confirmed: list[dict], *,
+            term_grace: float = 3.0, kill_grace: float = 1.0,
+            sleep=time.sleep) -> list[int]:
+    """Kill one shell's CLI holders after an operator confirmed them — SIGTERM,
+    then SIGKILL for whatever outlives `term_grace`. Returns the pids still
+    alive afterwards (empty = released).
+
+    `confirmed` carries the {pid, start_ticks} identities the operator was
+    shown. A fresh scan must hold nothing outside that set, or HoldersChanged
+    is raised and nothing is signalled: a session that started after the
+    warning was never confirmed. A confirmed identity that already exited is
+    simply released; a recycled pid never matches its start ticks."""
+    wanted = {(int(h["pid"]), int(h["start_ticks"])) for h in confirmed}
+    current = cli_holders(shortname, compute())
+    unconfirmed = [h for h in current
+                   if (h["pid"], h["start_ticks"]) not in wanted]
+    if unconfirmed:
+        raise HoldersChanged(current)
+    targets = [(h["pid"], h["start_ticks"]) for h in current]
+    for sig, grace in ((signal.SIGTERM, term_grace), (signal.SIGKILL, kill_grace)):
+        for pid, ticks in targets:
+            if not _gone(pid, ticks):
+                _signal(pid, sig)
+        deadline = time.monotonic() + grace
+        while any(not _gone(pid, ticks) for pid, ticks in targets):
+            if time.monotonic() >= deadline:
+                break
+            sleep(0.1)
+        targets = [(pid, ticks) for pid, ticks in targets if not _gone(pid, ticks)]
+        if not targets:
+            return []
+    return [pid for pid, _ in targets]
 
 
 def browser_sessions(shortname: str, snap: dict) -> list[dict]:

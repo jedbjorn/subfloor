@@ -1323,28 +1323,44 @@ def browser_refusal(shortname: str, snap: dict) -> str:
 def confirm_live(shell, snap: "dict | None") -> bool:
     """Interactive twin of the headless liveness refusal: booting a shell whose
     worktree already hosts a live session runs two sessions against one tree +
-    one memory row set, so warn and put the call to the operator. True → boot
-    (dormant, admin-exempt, no snapshot, or the operator said yes)."""
+    one memory row set, so warn with exactly what holds it and, on the
+    operator's confirmation that nothing is running there, kill those holders
+    and boot. True → boot (dormant, admin-exempt, no snapshot, released, or
+    the operator chose to boot beside a browser turn)."""
     if not snap or shell["flavor"] == "admin" or not shell["shortname"]:
         return True
+    snap = shell_liveness.compute()      # the picker's scan may be minutes old
     state = shell_liveness.session_state(shell["shortname"], snap)
     if state is None:
         return True
-    pids, orphans = shell_liveness.orphan_split(shell["shortname"], snap)
-    if state == "orphan":
+    if state == "browser":
+        pids, _ = shell_liveness.orphan_split(shell["shortname"], snap)
         print(style.yellow(
-            f"\n  ⚠ {shell['shortname']} slot is held by an ORPHANED session "
-            f"(pid {', '.join(map(str, orphans))} — terminal closed / parent "
-            f"gone)."))
-        print(style.dim(
-            f"    Verify it is idle (`ps -o etime=,stat= -p {orphans[0]}`; no "
-            f"busy children), `kill` it, then boot. An orphan can still be "
-            f"mid-work — never kill unverified."))
-    else:
-        print(style.yellow(
-            f"\n  ⚠ {shell['shortname']} already has a live session "
+            f"\n  ⚠ {shell['shortname']} already has a live browser turn "
             f"(pid {', '.join(map(str, pids))}) — one shell, one session."))
-    return input("  Boot anyway? [y/N]: ").strip().lower() in ("y", "yes")
+        return input("  Boot anyway? [y/N]: ").strip().lower() in ("y", "yes")
+    holders = shell_liveness.cli_holders(shell["shortname"], snap)
+    print(style.yellow(f"\n  ⚠ {shell['shortname']} is held by:"))
+    for h in holders:
+        kind = (f"orphaned — {h['orphaned']}" if h["orphaned"]
+                else "headless worker" if h["claimed"]
+                else "live — someone may be using it right now")
+        print(style.yellow(f"    pid {h['pid']} ({kind})"))
+    print(style.dim("    Killing ends that session and any work it is running. "
+                    "Continue only if nothing is running there."))
+    if input("  Kill it and boot? [y/N]: ").strip().lower() not in ("y", "yes"):
+        return False
+    try:
+        survivors = shell_liveness.release(shell["shortname"], holders)
+    except shell_liveness.HoldersChanged:
+        print(style.yellow("  ✗ a session you were not shown now holds the "
+                           "shell — nothing was killed; pick it again to review."))
+        return False
+    if survivors:
+        print(style.yellow(f"  ✗ pid {', '.join(map(str, survivors))} survived "
+                           f"SIGKILL — not booting."))
+        return False
+    return True
 
 
 def pick_shell(shells: list, requested: str | None,
