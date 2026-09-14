@@ -457,7 +457,7 @@ def read() -> dict | None:
     return ports.resolve(persist=False).get("vm")
 
 
-RETIRED_VM_FIELDS = ("transfer_dir",)
+RETIRED_VM_FIELDS = ("transfer_dir",)  # retired-compat (spec #232)
 
 
 def write(vm: dict | None) -> dict | None:
@@ -2772,7 +2772,7 @@ def client_main(argv: list[str]) -> int:
     # PARSED so an operator's old note does not hard-fail; the value is dropped
     # and never written to the vm block. Hidden from help. This is the one
     # surface that may still spell the retired field name.
-    init.add_argument("--transfer-dir", help=argparse.SUPPRESS)
+    init.add_argument("--transfer-dir", help=argparse.SUPPRESS)  # retired-compat (spec #232)
     init.add_argument("--ssh-host")
     init.add_argument("--ssh-user")
     init.add_argument("--ssh-key-path")
@@ -3023,7 +3023,7 @@ def client_main(argv: list[str]) -> int:
                 config[key] = candidate
         # The guest share is retired (spec #232). Old operator notes still pass
         # --transfer-dir, so accept it, drop it, and say so instead of failing.
-        config.pop("transfer_dir", None)
+        config.pop("transfer_dir", None)  # retired-compat (spec #232)
         config.setdefault("ssh_port", 22)
         config.setdefault("mcp_port", 8000)
         config.setdefault("workspace", winbox.DEFAULT_WORKSPACE)
@@ -3054,9 +3054,9 @@ def client_main(argv: list[str]) -> int:
             )
         else:
             value = run_init(config)
-            if args.transfer_dir is not None and not args.json:
+            if args.transfer_dir is not None and not args.json:  # retired-compat (spec #232)
                 print(
-                    "note: --transfer-dir is retired and was ignored — the "
+                    "note: --transfer-dir is retired and was ignored — the "  # retired-compat (spec #232)
                     "guest share is gone; push/pull now run over scp.",
                     file=sys.stderr,
                 )

@@ -18,6 +18,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 ENGINE = ROOT / ".super-coder"
 
+COMPAT_MARKER = "retired-compat (spec #232)"
 RETIRED_TOKENS = ("configure_winbox", "windows_vm_gui", "transfer_dir")
 
 SEARCH_TREES = (
@@ -77,8 +78,14 @@ class WinboxRetirementGrepTest(unittest.TestCase):
                 text = path.read_text(encoding="utf-8")
             except (UnicodeDecodeError, OSError):
                 continue
+            # The vm block must still recognise the retired field name in
+            # order to strip it from old instance.json files; those lines
+            # carry the retired-compat marker and are the only exemption.
+            live = "\n".join(
+                line for line in text.splitlines() if COMPAT_MARKER not in line
+            )
             for token in RETIRED_TOKENS:
-                if token in text:
+                if token in live:
                     offenders[token].append(str(path.relative_to(ROOT)))
         for token, hits in offenders.items():
             with self.subTest(token=token):
