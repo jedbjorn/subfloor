@@ -878,15 +878,19 @@ feature` makes the supported block boundary visible and repeatable.
 For a linked VM, use the typed `./sc vm` client; for a named remote,
 `./sc remote`. Keys stay behind the host broker in both postures. Supported
 adapters receive a managed `windows-mcp` definition; `./sc vm mcp up` starts
-and verifies that GUI connection. Three commands link a fork — `./sc vm init`,
-`./sc remote add`, `./sc ts init` — and the opt-in skills `remote_seats`,
+and verifies that GUI connection. A Windows guest is adopted in two commands —
+one bootstrap line in the guest console, then `./sc vm adopt` on the host, which
+installs the key, provisions the guest, writes the block and takes the baseline
+snapshot; `./sc vm init` remains for hand-linking a guest prepared some other
+way. `./sc remote add` and `./sc ts init` link the other two seats, and the
+opt-in skills `remote_seats`,
 `windows_testing`, and `tailscale_diagnostics` carry the shell-side procedure.
 The runbooks below own setup and lifecycle details; Planner supplies the
 fork's actual scope through `fork_skill_design`.
 
 | Capability | Applicability and reference |
 |---|---|
-| VM and named remotes | Operator supplies the VM, its baseline snapshot, and the remotes' keys; [remote seats runbook](../.super-coder/docs/remote-seats.md) |
+| VM and named remotes | Operator supplies a booted, licensed Windows guest and the remotes' keys; `./sc vm adopt` provisions the guest and takes the baseline snapshot; [remote seats runbook](../.super-coder/docs/remote-seats.md) |
 | Tailnet | Host identity and configured routes remain broker-owned; read-only hosts get the diagnostic verb table; [tailnet runbook](../.super-coder/docs/tailscale-broker.md) |
 | PM2 | Operate only configured host application processes; [PM2 runbook](../.super-coder/docs/pm2-broker.md) |
 | App database | Read-only diagnostics through a host broker, not access to engine memory; [DB broker runbook](../.super-coder/docs/db-broker.md) |

@@ -1246,9 +1246,12 @@ case "$cmd" in
   vm)                exec "$PY" "$S/vm.py" client "$@" ;;
   remote)            exec "$PY" "$S/remote.py" "$@" ;;
   vm-broker)         exec "$PY" "$ENGINE/api/vm_broker.py" "$@" ;;
-  # Kept as an alias for `./sc vm bake` (spec #232) so existing operator notes
+  # The HOST-DIRECT bake (spec #232): it runs vm.py in this process against
+  # libvirt, with no broker in the path. `./sc vm bake` is the shell-legal
+  # broker route; this one is the escape hatch for when the broker is down,
+  # and the reason existing operator notes keep working.
   # keep working; it runs the same client verb and therefore the same code.
-  vm-bake)           exec "$PY" "$S/vm.py" client bake "$@" ;;
+  vm-bake)           exec "$PY" "$S/vm.py" bake "$@" ;;
   vm-broker-up)      sc_vm_broker_up ;;
   vm-broker-down)    sc_vm_broker_down ;;
   vm-broker-sock)    exec "$PY" "$S/vm.py" sock ;;
@@ -1863,7 +1866,9 @@ Subfloor — forkable shell substrate — full command reference (./sc help for 
                            protected from delete — redefine it with `vm bake`
   ./sc vm bake [NAME] [--json]
                            graceful shutdown, then replace (never stack) the baseline
-                           snapshot offline; NAME redefines the baseline in the vm block
+                           snapshot offline; NAME redefines the baseline in the vm block.
+                           Goes through the broker; `./sc vm-bake` is the host-direct
+                           escape hatch for when the broker is down
   ./sc vm push SRC [DEST] [--json]
                            scp a file from this repo or .sc-state/local into the guest;
                            DEST is a guest path, default <workspace>\<basename>
@@ -1881,7 +1886,10 @@ Subfloor — forkable shell substrate — full command reference (./sc help for 
                            --off (bounded graceful stop after the revert) or --running
                            (left running) is required
   ./sc vm-broker           run the broker in the foreground (unix socket)
-  ./sc vm-bake [NAME]      alias for `./sc vm bake` (kept so existing operator notes work)
+  ./sc vm-bake [NAME]      HOST-DIRECT bake: same operation as `./sc vm bake` but run
+                             against libvirt in this process, with no broker in the path.
+                             Use `./sc vm bake` normally (broker route, shell-legal); use
+                             this when the broker is down. Host-only, never in the sandbox.
   ./sc vm-broker-up        start it in the background (nohup + pidfile); self-skips if unlinked/already up
   ./sc vm-broker-down      stop the backgrounded broker
   ./sc vm-broker-sock      print the broker's socket path

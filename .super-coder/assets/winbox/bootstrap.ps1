@@ -101,16 +101,42 @@ Write-StepResult -Name 'os-gate' -Status 'done' -Detail $osDetail
 
 # --- Step 2: OpenSSH server capability, service, firewall -------------------
 
+$script:RebootRequired = $false
 try {
     $capability = Get-WindowsCapability -Online -Name 'OpenSSH.Server~~~~0.0.1.0'
     if ([string]$capability.State -eq 'Installed') {
         Write-StepResult -Name 'openssh-capability' -Status 'skipped' -Detail 'already installed'
     } else {
-        Add-WindowsCapability -Online -Name 'OpenSSH.Server~~~~0.0.1.0' | Out-Null
-        Write-StepResult -Name 'openssh-capability' -Status 'done' -Detail 'OpenSSH.Server~~~~0.0.1.0 installed'
+        # The result is not decoration: a capability install that sets
+        # RestartNeeded has NOT finished, and every step after this one
+        # (service, config, key install from the host) then fails in a way
+        # that does not name the reboot. Report it and stop.
+        $added = Add-WindowsCapability -Online -Name 'OpenSSH.Server~~~~0.0.1.0'
+        $restart = $false
+        if ($added -and ($added.PSObject.Properties.Name -contains 'RestartNeeded')) {
+            $restart = [bool]$added.RestartNeeded
+        }
+        if ($restart) {
+            $script:RebootRequired = $true
+            Write-StepResult -Name 'openssh-capability' -Status 'failed' -Detail 'OpenSSH.Server~~~~0.0.1.0 installed but a reboot is required - reboot the guest, then re-run this line'
+        } else {
+            Write-StepResult -Name 'openssh-capability' -Status 'done' -Detail 'OpenSSH.Server~~~~0.0.1.0 installed'
+        }
     }
 } catch {
     Write-StepResult -Name 'openssh-capability' -Status 'failed' -Detail $_.Exception.Message
+}
+
+if ($script:RebootRequired) {
+    Write-Host ''
+    Write-Host 'Report'
+    Write-Host '------'
+    foreach ($step in $script:Steps) {
+        Write-Host ('[' + $step.status + '] ' + $step.name + ' - ' + $step.detail)
+    }
+    Write-Host ''
+    Write-Host 'Reboot the guest, then run this line again. Nothing else was changed.'
+    exit 1
 }
 
 try {
@@ -123,6 +149,34 @@ try {
     if ((Get-Service -Name 'sshd').Status -ne 'Running') {
         Start-Service -Name 'sshd'
         $changed += 'started'
+    }
+    # A FRESH OpenSSH install has no C:\ProgramData\ssh\sshd_config: sshd
+    # generates it (and the host keys) on its first start, which happens
+    # AFTER Start-Service returns. Without this wait the next step reported
+    # the file missing and the whole bootstrap exited 1 on exactly the guest
+    # it was written for.
+    $configPath = Join-Path $env:ProgramData 'ssh\sshd_config'
+    if (-not (Test-Path -LiteralPath $configPath)) {
+        $deadline = (Get-Date).AddSeconds(60)
+        while (-not (Test-Path -LiteralPath $configPath) -and (Get-Date) -lt $deadline) {
+            Start-Sleep -Seconds 2
+        }
+        if (-not (Test-Path -LiteralPath $configPath)) {
+            # Still nothing: seed it from the shipped default, which is what
+            # sshd would have copied. Beats failing a guest that is otherwise
+            # ready.
+            $default = Join-Path $env:SystemRoot 'System32\OpenSSH\sshd_config_default'
+            if (Test-Path -LiteralPath $default) {
+                $parent = Split-Path -Path $configPath -Parent
+                if (-not (Test-Path -LiteralPath $parent)) {
+                    New-Item -ItemType Directory -Path $parent -Force | Out-Null
+                }
+                Copy-Item -LiteralPath $default -Destination $configPath -Force
+                $changed += 'seeded sshd_config from sshd_config_default'
+            }
+        } else {
+            $changed += 'waited for sshd to write sshd_config'
+        }
     }
     if ($changed.Count -eq 0) {
         Write-StepResult -Name 'sshd-service' -Status 'skipped' -Detail 'Automatic and running'
@@ -173,22 +227,49 @@ try {
             $matched = $false
             for ($i = 0; $i -lt $lines.Count; $i++) {
                 if ($lines[$i] -match $pattern) {
+                    # Only the FIRST occurrence: sshd honours the first
+                    # directive it reads, so rewriting later ones changes
+                    # nothing and can rewrite a Match-scoped override.
                     $matched = $true
                     if ($lines[$i] -ne $target) {
                         $lines[$i] = $target
                         if ($changedKeys -notcontains $key) { $changedKeys += $key }
                     }
+                    break
                 }
             }
             if (-not $matched) {
-                $lines += $target
+                # The stock Windows sshd_config ENDS with `Match Group
+                # administrators`, so a directive appended to the end lands
+                # inside that block and applies only to that group. Insert it
+                # before the first Match line instead; append only when the
+                # file has no Match block at all.
+                $rebuilt = @()
+                $placed = $false
+                foreach ($line in $lines) {
+                    if (-not $placed -and $line -match '^\s*Match\s') {
+                        $rebuilt += $target
+                        $placed = $true
+                    }
+                    $rebuilt += $line
+                }
+                if (-not $placed) { $rebuilt += $target }
+                $lines = $rebuilt
                 if ($changedKeys -notcontains $key) { $changedKeys += $key }
             }
         }
         if ($changedKeys.Count -eq 0) {
             Write-StepResult -Name 'sshd-config' -Status 'skipped' -Detail 'PubkeyAuthentication yes and PasswordAuthentication yes already explicit'
         } else {
-            Set-Content -LiteralPath $configPath -Value $lines -Encoding ASCII
+            # UTF-8 without a BOM, and the file's own CRLF endings. ASCII
+            # would replace any non-ASCII byte already in the file with `?`,
+            # and PowerShell 5.1's UTF8 encoding writes a BOM that sshd reads
+            # as part of the first directive.
+            [IO.File]::WriteAllText(
+                $configPath,
+                (($lines -join "`r`n") + "`r`n"),
+                (New-Object System.Text.UTF8Encoding($false))
+            )
             Restart-Service -Name 'sshd'
             Write-StepResult -Name 'sshd-config' -Status 'done' -Detail ('set ' + ($changedKeys -join ', ') + '; sshd restarted')
         }
@@ -212,6 +293,11 @@ try {
 }
 
 try {
+    # Hard-coded on purpose: the bootstrap runs BEFORE the host has said
+    # anything to this guest, so there is no winbox.json to read a workspace
+    # from. provision.ps1 reads the fork's declared workspace and creates that
+    # one; this is only the floor the operator starts from, and a fork that
+    # declares another path simply gets both.
     $workspace = 'C:\SubfloorTest'
     if (Test-Path -LiteralPath $workspace) {
         Write-StepResult -Name 'workspace' -Status 'skipped' -Detail "$workspace exists"
@@ -243,15 +329,29 @@ if (-not $wantAutoLogon) {
         $secure = Read-Host -Prompt 'Password' -AsSecureString
         $bstr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secure)
         try {
-            $plain = [Runtime.InteropServices.Marshal]::PtrToStringAuto($bstr)
+            # PtrToStringBSTR, not PtrToStringAuto: a BSTR carries its own
+            # length prefix, so it round-trips a password containing an
+            # embedded null or a lone surrogate. PtrToStringAuto stops at the
+            # first null and would silently store a TRUNCATED password, which
+            # then fails at logon with no sign of why.
+            $plain = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($bstr)
         } finally {
             [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr)
         }
-        Set-ItemProperty -Path $winlogon -Name 'AutoAdminLogon' -Value '1' -Type String
-        Set-ItemProperty -Path $winlogon -Name 'DefaultUserName' -Value $env:USERNAME -Type String
-        Set-ItemProperty -Path $winlogon -Name 'DefaultDomainName' -Value $env:COMPUTERNAME -Type String
-        Set-ItemProperty -Path $winlogon -Name 'DefaultPassword' -Value $plain -Type String
-        Write-StepResult -Name 'autologon' -Status 'done' -Detail "AutoAdminLogon=1 for $env:COMPUTERNAME\$env:USERNAME"
+        if ([string]::IsNullOrEmpty($plain)) {
+            # An empty DefaultPassword does not mean "no password"; it means
+            # AutoAdminLogon is armed and will fail at every boot.
+            Write-StepResult -Name 'autologon' -Status 'failed' -Detail 'no password entered; AutoAdminLogon left unchanged'
+        } else {
+            # The SAME value goes into the registry and into the report, so
+            # the operator can see what account the guest will log in as.
+            $logonDomain = $env:COMPUTERNAME
+            Set-ItemProperty -Path $winlogon -Name 'AutoAdminLogon' -Value '1' -Type String
+            Set-ItemProperty -Path $winlogon -Name 'DefaultUserName' -Value $env:USERNAME -Type String
+            Set-ItemProperty -Path $winlogon -Name 'DefaultDomainName' -Value $logonDomain -Type String
+            Set-ItemProperty -Path $winlogon -Name 'DefaultPassword' -Value $plain -Type String
+            Write-StepResult -Name 'autologon' -Status 'done' -Detail ("AutoAdminLogon=1 for " + $logonDomain + "\\" + $env:USERNAME)
+        }
     } catch {
         Write-StepResult -Name 'autologon' -Status 'failed' -Detail $_.Exception.Message
     } finally {
@@ -274,10 +374,34 @@ try {
     $addresses = @()
 }
 
+# The address `adopt` should be told about is the one on the interface that
+# carries the IPv4 default route - the NIC that actually talks to the world.
+# Sorting interface aliases and taking the first non-APIPA picked the Hyper-V
+# or loopback-adapter address on a guest with more than one NIC.
 $primary = '<guest-ip>'
-foreach ($address in $addresses) {
-    $ip = [string]$address.IPAddress
-    if ($ip -notlike '169.254.*') { $primary = $ip; break }
+$routed = ''
+try {
+    $route = Get-NetRoute -DestinationPrefix '0.0.0.0/0' -ErrorAction Stop |
+        Sort-Object -Property RouteMetric |
+        Select-Object -First 1
+    if ($route) {
+        foreach ($address in $addresses) {
+            if ([string]$address.InterfaceIndex -eq [string]$route.InterfaceIndex) {
+                $routed = [string]$address.IPAddress
+                break
+            }
+        }
+    }
+} catch {
+    $routed = ''
+}
+if ($routed -and $routed -notlike '169.254.*') {
+    $primary = $routed
+} else {
+    foreach ($address in $addresses) {
+        $ip = [string]$address.IPAddress
+        if ($ip -notlike '169.254.*') { $primary = $ip; break }
+    }
 }
 
 Write-Host ''

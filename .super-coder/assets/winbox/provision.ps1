@@ -11,14 +11,30 @@
 #
 #   {"steps":[{"name":"...","ok":true,"detail":"..."}],"ok":true}
 #
+# The report is emitted even when a step throws: everything between reading the
+# config and the last check runs inside one try/catch, and an escaped error
+# becomes a failed step named `script`. A host that got no report line cannot
+# tell "the guest is broken" from "the script died", so it always gets one.
+#
 # Exit code is 0 when every step is ok, 1 otherwise.
 # Windows PowerShell 5.1 compatible. No external modules. Idempotent.
 
 Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Continue'
+# Defined up front: under StrictMode, reading $LASTEXITCODE before any native
+# command has run is an error.
+$global:LASTEXITCODE = 0
 
 $script:Steps = @()
+# Directories a tool was installed into that the registry PATH does not name
+# (uv's tool bin dir is the standing example). Re-applied after every refresh.
+$script:PathExtras = @()
 $DetailLimit = 2000
+
+# winget's "no applicable upgrade / already installed" result. The exit code is
+# invariant; the English sentence it prints is not, so the code is the primary
+# signal and the text only a fallback for an older winget.
+$WingetNoApplicableUpgrade = -1978335131
 
 function Get-Truncated {
     param([string]$Text)
@@ -43,22 +59,67 @@ function Add-StepResult {
     Write-Host ("[$marker] $Name - $clean")
 }
 
-function Invoke-Capture {
-    # Runs a command line through cmd.exe, capturing stdout and stderr together.
-    # Returns a hashtable with Output and ExitCode.
-    param([string]$CommandLine)
-    $output = & cmd.exe /c "$CommandLine" 2>&1 | Out-String
+function Invoke-Native {
+    # Run one executable DIRECTLY with an argument ARRAY, capturing stdout and
+    # stderr together. Never through cmd.exe: cmd re-parses the line it is
+    # handed, so an argument carrying a quoted path (winget import
+    # --import-file "C:\dir\manifest.json") reaches the program with the quote
+    # characters still in it and the file is never found. Passing an array to
+    # the call operator hands each argument over intact - no quoting, no
+    # re-parsing, no escaping rules to get wrong.
+    param(
+        [string]$Exe,
+        [string[]]$Arguments = @()
+    )
+    # An absent executable is a RESULT here, not an exception: `& 'python'`
+    # with no python installed throws CommandNotFoundException, whereas the
+    # cmd.exe route this replaced simply returned 9009. Callers branch on the
+    # exit code, so keep that shape.
+    $resolved = Get-Command -Name $Exe -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($null -eq $resolved) {
+        return @{ Output = "'$Exe' is not recognized as a command"; ExitCode = 9009 }
+    }
+    $global:LASTEXITCODE = 0
+    $output = & $Exe @Arguments 2>&1 | Out-String
     $code = $LASTEXITCODE
     if ($null -eq $code) { $code = 0 }
     return @{ Output = $output; ExitCode = [int]$code }
 }
 
+function Invoke-Shell {
+    # A free-form command line through cmd.exe, for the fork's declared
+    # `checks` ONLY. Those are operator-written command lines meant to be
+    # interpreted (`dotnet --version`, `where git & git --version`), which is
+    # exactly what cmd is for. They must not contain a double quote: the line
+    # is re-parsed by cmd and quoting survives no better here than anywhere
+    # else. Write a .cmd file and name that instead.
+    param([string]$CommandLine)
+    $global:LASTEXITCODE = 0
+    $output = & cmd.exe /c $CommandLine 2>&1 | Out-String
+    $code = $LASTEXITCODE
+    if ($null -eq $code) { $code = 0 }
+    return @{ Output = $output; ExitCode = [int]$code }
+}
+
+function Add-PathExtra {
+    # Remember a directory that must stay on PATH across later refreshes.
+    param([string]$Directory)
+    if (-not $Directory) { return }
+    $known = @($script:PathExtras | Where-Object { $_ -eq $Directory })
+    if ($known.Count -eq 0) { $script:PathExtras += $Directory }
+    Update-PathFromRegistry
+}
+
 function Update-PathFromRegistry {
     # winget-installed tools land on PATH in the registry, not in this already
-    # running process. Refresh from Machine + User so later steps see them.
+    # running process. Refresh from Machine + User so later steps see them -
+    # and re-prepend every remembered extra, because a refresh built purely
+    # from the registry would otherwise drop a directory that is not in it
+    # (uv's tool bin dir being the one that bites).
     $machine = [Environment]::GetEnvironmentVariable('Path', 'Machine')
     $user = [Environment]::GetEnvironmentVariable('Path', 'User')
     $parts = @()
+    foreach ($extra in $script:PathExtras) { $parts += $extra }
     foreach ($chunk in @($machine, $user)) {
         if ($chunk) { $parts += $chunk.Split(';') }
     }
@@ -80,7 +141,22 @@ function Test-CommandPresent {
     return ($null -ne $found)
 }
 
+function Test-PythonVersionOk {
+    # True when the `python --version` text names 3.13 or newer. A NUMERIC
+    # comparison, never a version-shaped regex: `Python 3.130` and `Python 4.1`
+    # both have to answer correctly, and a pattern enumerating digits does not.
+    param([string]$Text)
+    if (-not $Text) { return $false }
+    if ($Text -notmatch 'Python\s+(\d+)\.(\d+)') { return $false }
+    $major = [int]$Matches[1]
+    $minor = [int]$Matches[2]
+    if ($major -gt 3) { return $true }
+    return ($major -eq 3 -and $minor -ge 13)
+}
+
 Write-Host 'Subfloor winbox provisioning'
+
+try {
 
 # --- Configuration ----------------------------------------------------------
 # The host resolves and validates .subfloor/winbox.json and ships the resolved
@@ -92,7 +168,7 @@ $config = $null
 $configDetail = ''
 if (Test-Path -LiteralPath $configPath) {
     try {
-        $config = Get-Content -LiteralPath $configPath -Raw | ConvertFrom-Json
+        $config = Get-Content -LiteralPath $configPath -Raw -ErrorAction Stop | ConvertFrom-Json
         $configDetail = "read $configPath"
     } catch {
         $config = $null
@@ -127,17 +203,17 @@ Write-Host "config: $configDetail"
 
 try {
     $notes = @()
-    $policy = [string](Get-ExecutionPolicy -Scope LocalMachine)
+    $policy = [string](Get-ExecutionPolicy -Scope LocalMachine -ErrorAction Stop)
     if ($policy -eq 'Bypass') {
         $notes += 'execution policy already Bypass'
     } else {
-        Set-ExecutionPolicy -Scope LocalMachine Bypass -Force
+        Set-ExecutionPolicy -Scope LocalMachine Bypass -Force -ErrorAction Stop
         $notes += "execution policy $policy -> Bypass"
     }
     if (Test-Path -LiteralPath $workspace) {
         $notes += "$workspace exists"
     } else {
-        New-Item -ItemType Directory -Path $workspace -Force | Out-Null
+        New-Item -ItemType Directory -Path $workspace -Force -ErrorAction Stop | Out-Null
         $notes += "$workspace created"
     }
     Add-StepResult -Name 'workspace' -Ok $true -Detail ($notes -join '; ')
@@ -170,11 +246,13 @@ if (-not $wingetPresent) {
             $wingetNotes += ('App Installer re-register failed: ' + $_.Exception.Message)
         }
         $aliasDir = Join-Path $env:LOCALAPPDATA 'Microsoft\WindowsApps'
-        if ($env:Path -notlike ('*' + $aliasDir + '*')) { $env:Path = $aliasDir + ';' + $env:Path }
+        Add-PathExtra -Directory $aliasDir
         for ($attempt = 1; $attempt -le 6; $attempt++) {
             if (Test-Path -LiteralPath (Join-Path $aliasDir 'winget.exe')) { break }
             Start-Sleep -Seconds 5
         }
+        # Resolve again AFTER the registration and the PATH change: the whole
+        # point of the block above is that `winget` was not resolvable before.
         $wingetPresent = Test-CommandPresent -Name 'winget'
     } else {
         $wingetNotes += 'App Installer package not present on this machine'
@@ -197,9 +275,16 @@ if ($wingetPresent) {
             }
         }
     }
-    $wingetVersion = Invoke-Capture -CommandLine 'winget --version'
+    $wingetVersion = Invoke-Native -Exe 'winget' -Arguments @('--version')
     $detail = 'present ' + (Get-Truncated -Text $wingetVersion.Output)
     if ($wingetNotes.Count -gt 0) { $detail = $detail + '; ' + ($wingetNotes -join '; ') }
+    Add-StepResult -Name 'winget' -Ok $true -Detail $detail
+} elseif ((-not $wingetManifest) -and (-not $mcp)) {
+    # Nothing declared in winbox.json needs winget, so its absence is not a
+    # failure - reporting one would fail an adoption that has everything the
+    # fork actually asked for.
+    $detail = 'not present; nothing declared needs it (no winget_manifest, mcp off)'
+    if ($wingetNotes.Count -gt 0) { $detail = $detail + ' (' + ($wingetNotes -join '; ') + ')' }
     Add-StepResult -Name 'winget' -Ok $true -Detail $detail
 } else {
     $detail = 'winget not found. Install App Installer from the Microsoft Store (https://aka.ms/getwinget); the engine does not install winget because it needs the Store or an MSIX bundle.'
@@ -219,11 +304,19 @@ if (-not $wingetManifest) {
         Add-StepResult -Name 'winget-import' -Ok $false -Detail "manifest not found at $manifestPath"
     } else {
         Write-Host "importing winget manifest $manifestPath ..."
-        $import = Invoke-Capture -CommandLine "winget import --import-file `"$manifestPath`" --accept-package-agreements --accept-source-agreements --disable-interactivity"
+        $import = Invoke-Native -Exe 'winget' -Arguments @(
+            'import', '--import-file', $manifestPath,
+            '--accept-package-agreements', '--accept-source-agreements',
+            '--disable-interactivity'
+        )
         # winget exits non-zero when every package is already installed; that is
-        # the idempotent case, not a failure.
+        # the idempotent case, not a failure. The EXIT CODE is the signal - the
+        # sentence winget prints is localized.
         $text = [string]$import.Output
-        $alreadyInstalled = ($text -match 'already installed')
+        $alreadyInstalled = (
+            $import.ExitCode -eq $WingetNoApplicableUpgrade -or
+            $text -match 'already installed'
+        )
         if ($import.ExitCode -eq 0 -or $alreadyInstalled) {
             Add-StepResult -Name 'winget-import' -Ok $true -Detail ("exit $($import.ExitCode): " + $text)
         } else {
@@ -241,24 +334,24 @@ if (-not $mcp) {
 } else {
     $mcpOk = $true
     $mcpNotes = @()
+    $listenerMissing = $false
 
     # Python 3.13+ (windows-mcp requires it).
-    $pythonOk = $false
-    $pythonVersion = Invoke-Capture -CommandLine 'python --version'
+    $pythonVersion = Invoke-Native -Exe 'python' -Arguments @('--version')
     $versionText = [string]$pythonVersion.Output
-    if ($pythonVersion.ExitCode -eq 0 -and $versionText -match 'Python\s+(\d+)\.(\d+)') {
-        $major = [int]$Matches[1]
-        $minor = [int]$Matches[2]
-        if ($major -gt 3 -or ($major -eq 3 -and $minor -ge 13)) { $pythonOk = $true }
-    }
+    $pythonOk = ($pythonVersion.ExitCode -eq 0 -and (Test-PythonVersionOk -Text $versionText))
     if ($pythonOk) {
         $mcpNotes += ('python ok: ' + $versionText.Trim())
     } else {
         Write-Host 'installing Python 3.13 ...'
-        $install = Invoke-Capture -CommandLine 'winget install --id Python.Python.3.13 -e --accept-package-agreements --accept-source-agreements --disable-interactivity'
+        $install = Invoke-Native -Exe 'winget' -Arguments @(
+            'install', '--id', 'Python.Python.3.13', '-e',
+            '--accept-package-agreements', '--accept-source-agreements',
+            '--disable-interactivity'
+        )
         Update-PathFromRegistry
-        $recheck = Invoke-Capture -CommandLine 'python --version'
-        if ($recheck.ExitCode -eq 0 -and ([string]$recheck.Output) -match 'Python\s+3\.(1[3-9]|[2-9][0-9])') {
+        $recheck = Invoke-Native -Exe 'python' -Arguments @('--version')
+        if ($recheck.ExitCode -eq 0 -and (Test-PythonVersionOk -Text ([string]$recheck.Output))) {
             $mcpNotes += ('python installed: ' + ([string]$recheck.Output).Trim())
         } else {
             $mcpOk = $false
@@ -272,7 +365,11 @@ if (-not $mcp) {
             $mcpNotes += 'uv present'
         } else {
             Write-Host 'installing uv ...'
-            $install = Invoke-Capture -CommandLine 'winget install --id astral-sh.uv -e --accept-package-agreements --accept-source-agreements --disable-interactivity'
+            $install = Invoke-Native -Exe 'winget' -Arguments @(
+                'install', '--id', 'astral-sh.uv', '-e',
+                '--accept-package-agreements', '--accept-source-agreements',
+                '--disable-interactivity'
+            )
             Update-PathFromRegistry
             if (Test-CommandPresent -Name 'uv') {
                 $mcpNotes += 'uv installed'
@@ -286,8 +383,7 @@ if (-not $mcp) {
     # windows-mcp tool
     if ($mcpOk) {
         Write-Host 'installing windows-mcp ...'
-        $tool = Invoke-Capture -CommandLine 'uv tool install --upgrade windows-mcp'
-        Update-PathFromRegistry
+        $tool = Invoke-Native -Exe 'uv' -Arguments @('tool', 'install', '--upgrade', 'windows-mcp')
         if ($tool.ExitCode -ne 0) {
             $mcpOk = $false
             $mcpNotes += ('uv tool install windows-mcp failed: ' + [string]$tool.Output)
@@ -295,12 +391,13 @@ if (-not $mcp) {
             $mcpNotes += 'uv tool install windows-mcp ok'
             # uv puts tool shims in its own bin dir (%USERPROFILE%\.local\bin),
             # which an SSH session never has on PATH (observed on halo: the
-            # shim exists but 'windows-mcp' is not recognised). Prepend it.
-            $uvBin = Invoke-Capture -CommandLine 'uv tool dir --bin'
+            # shim exists but 'windows-mcp' is not recognised). Remember it so
+            # a later registry refresh cannot drop it again.
+            $uvBin = Invoke-Native -Exe 'uv' -Arguments @('tool', 'dir', '--bin')
             if ($uvBin.ExitCode -eq 0) {
                 $binDir = ([string]$uvBin.Output).Trim()
                 if ($binDir -and (Test-Path -LiteralPath $binDir)) {
-                    $env:Path = $binDir + ';' + $env:Path
+                    Add-PathExtra -Directory $binDir
                     $mcpNotes += ('uv bin on PATH: ' + $binDir)
                 }
             }
@@ -310,7 +407,10 @@ if (-not $mcp) {
     # Register and start the per-user login task on the guest loopback only.
     if ($mcpOk) {
         Write-Host "registering windows-mcp on 127.0.0.1:$mcpPort ..."
-        $register = Invoke-Capture -CommandLine "windows-mcp install --transport streamable-http --host 127.0.0.1 --port $mcpPort"
+        $register = Invoke-Native -Exe 'windows-mcp' -Arguments @(
+            'install', '--transport', 'streamable-http',
+            '--host', '127.0.0.1', '--port', [string]$mcpPort
+        )
         if ($register.ExitCode -ne 0) {
             $mcpOk = $false
             $mcpNotes += ('windows-mcp install failed: ' + [string]$register.Output)
@@ -336,12 +436,19 @@ if (-not $mcp) {
         if ($listening) {
             $mcpNotes += "listener on 127.0.0.1:$mcpPort"
         } else {
-            $mcpOk = $false
-            $mcpNotes += 'installed but no listener yet; a desktop login session may be required'
+            # NOT a failure. `windows-mcp install` registers a per-user LOGON
+            # task, so on a guest with no interactive desktop session the tool
+            # is installed and correct and has simply never started. Adoption
+            # continues and the host reports this as a warning; the recovery
+            # is a console login, or re-running the install over `./sc vm exec`
+            # once a session exists.
+            $listenerMissing = $true
+            $mcpNotes += 'WARNING: installed but no listener yet; a desktop login session may be required'
         }
     }
 
     Add-StepResult -Name 'windows-mcp' -Ok $mcpOk -Detail ($mcpNotes -join '; ')
+    if ($listenerMissing) { Write-Host 'windows-mcp: no listener yet (see the warning above)' }
 }
 
 # --- Step 5: declared checks ------------------------------------------------
@@ -354,10 +461,16 @@ if ($checks.Count -eq 0) {
         $line = [string]$check
         if (-not $line) { continue }
         Write-Host "check: $line"
-        $result = Invoke-Capture -CommandLine $line
+        $result = Invoke-Shell -CommandLine $line
         $detail = "exit $($result.ExitCode): " + [string]$result.Output
         Add-StepResult -Name ("check: " + $line) -Ok ($result.ExitCode -eq 0) -Detail $detail
     }
+}
+
+} catch {
+    # Anything that escaped a step's own handling: the host still gets a report,
+    # and the failure is named rather than inferred from a missing line.
+    Add-StepResult -Name 'script' -Ok $false -Detail ('unhandled error: ' + $_.Exception.Message)
 }
 
 # --- Report -----------------------------------------------------------------

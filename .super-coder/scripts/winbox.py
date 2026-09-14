@@ -244,8 +244,13 @@ def _workspace(value: object, path: Path) -> str:
             f"{path}: 'workspace' must be an absolute Windows path "
             f"(C:\\... or \\\\server\\share): {workspace!r}",
         )
+    # A trailing separator is dropped so `<workspace>\\<name>` never doubles
+    # it — but not at a drive root: `C:\\` trimmed to `C:` names the drive's
+    # CURRENT directory, not its root, which is a different place.
     trimmed = workspace.rstrip("\\")
-    return trimmed if trimmed else workspace
+    if not trimmed:
+        return workspace
+    return trimmed + "\\" if trimmed.endswith(":") else trimmed
 
 
 def _manifest(value: object, root: Path, path: Path) -> str | None:

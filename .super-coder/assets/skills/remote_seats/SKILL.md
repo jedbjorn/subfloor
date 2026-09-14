@@ -72,7 +72,9 @@ configured baseline is refused; redefine it with `bake` instead), `bake [<name>]
 baseline; `./sc vm-bake` is an alias), and `reset [<name>] --off|--running` for a
 named snapshot. Exactly one of `--off` and `--running` is required on every
 reset. `push` sources and `pull` destinations must sit inside the repo or
-`.sc-state/local/`. Add `--json` to any verb for one result object.
+`.sc-state/local/`, and never inside `.sc-state/local/vm/` (the host's key and
+host-key pin live there); a pull destination inside `.super-coder/` or `.git/`
+is refused too. Add `--json` to any verb for one result object.
 
 Posture 1's VM is a disposable test box, so the lifecycle verbs above are
 genuinely yours to use — snapshot, bake and reset included (decision #372).
@@ -114,7 +116,17 @@ the code; never repair the transport yourself.
 | `adopt_guest_not_found` | no address resolved from DHCP, ARP or `--ssh-host` | report; the FnB passes `--ssh-host` |
 | `adopt_ssh_timeout` | the guest never answered on TCP 22 in the wait window | the bootstrap line has not run in the guest yet |
 | `adopt_key_install_failed` | the password-authenticated key install did not take | report; key material is the FnB's |
+| `adopt_harden_failed` | `PasswordAuthentication no` did not take, or sshd did not come back | report; the FnB owns the guest's sshd |
+| `adopt_host_key_changed` | the guest's host key differs from the pinned one | report the message verbatim: it names the pin file and the `rm` that clears it. Never delete it yourself |
 | `adopt_provision_failed`, `adopt_verify_failed` | a provisioning step or a declared check failed | read the named step; fix `.subfloor/winbox.json` or the guest, re-run adopt |
+| `adopt_config_invalid` | a flag or the saved block is unusable, or there is no TTY for the password prompt | report; adopt is the FnB's command |
+| `adopt_block_write_failed`, `adopt_baseline_failed` | the block did not save, or the baseline snapshot was not taken | report |
+| `adopt_broker_failed` | adopt could not bring the broker up. The `vm` block IS written | the resume is `./sc vm-broker-up` then adopt again; ask the FnB |
+| `push_failed`, `pull_failed` | `scp` itself failed | read the output; report, do not retry blindly |
+| `pull_source_invalid`, `pull_destination_invalid`, `push_source_invalid` | a transfer path was empty | pass both paths |
+| `scp_unsupported` | the host's `scp` predates OpenSSH 8.7 and rejects `-s` | report; the FnB upgrades the host's OpenSSH client |
+| `bake_config_write_failed` | the snapshot was baked, the block was not updated to name it | report; the snapshot exists, the baseline pointer does not |
+| `<operation>_timeout` | the broker call exceeded that verb's budget (`exec_timeout`, `push_timeout`, `bake_timeout`, …) | the work may still be running — read `status` before retrying |
 
 Never hand-install keys, aliases, or known-hosts entries anywhere, and never
 open a raw `ssh` to a target the broker serves — key material stays host-side

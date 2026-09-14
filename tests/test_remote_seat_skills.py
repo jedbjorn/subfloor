@@ -135,6 +135,16 @@ class SkillAssetTests(unittest.TestCase):
             "windows-mcp install --transport streamable-http",
             "./sc vm bake", "--command-file",
             "[Convert]::ToBase64String(...)",
+            # The pin lives in .sc-state (callable_floor.read_engine_ref).
+            "`.sc-state/engine.ref`",
+            # A LOGIN task: no desktop session means no listener, and that is
+            # a warning on a fully adopted guest, not a broken one.
+            "LOGIN task",
+            # Guest paths take either separator; the key never reaches a shell.
+            "C:/SubfloorTest/out.bin",
+            "generated on the host and never handed to a shell",
+            # A declared check is a cmd.exe command line.
+            "must not contain a double quote",
         ):
             with self.subTest(phrase=phrase):
                 self.assertIn(phrase, body)
@@ -210,6 +220,55 @@ class ReseedMigrationTests(unittest.TestCase):
             con.close()
 
 
+# Every code the doc and the skill table must both carry. A code documented in
+# one place and not the other is how a shell ends up guessing.
+ADOPT_AND_TRANSFER_CODES = (
+    "adopt_sandboxed", "adopt_guest_not_found", "adopt_ssh_timeout",
+    "adopt_key_install_failed", "adopt_harden_failed", "adopt_host_key_changed",
+    "adopt_provision_failed", "adopt_verify_failed", "adopt_config_invalid",
+    "adopt_block_write_failed", "adopt_broker_failed", "adopt_baseline_failed",
+    "push_failed", "pull_failed", "pull_source_invalid",
+    "pull_destination_invalid", "push_source_invalid", "scp_unsupported",
+    "bake_config_write_failed", "<operation>_timeout",
+)
+
+
+class ErrorVocabularyTests(unittest.TestCase):
+    """Spec #232: the runbook and the shell-facing skill agree, and every code
+    they name is one the engine actually emits."""
+
+    def test_runbook_and_skill_document_the_same_codes(self) -> None:
+        doc = _flat(REMOTE_SEATS_DOC.read_text())
+        skill = _flat(_specs()["remote_seats"]["content"])
+        for code in ADOPT_AND_TRANSFER_CODES:
+            with self.subTest(code=code):
+                self.assertIn(code, doc, "missing from docs/remote-seats.md")
+                self.assertIn(code, skill, "missing from the remote_seats skill")
+
+    def test_every_documented_code_is_emitted_by_the_engine(self) -> None:
+        sources = "\n".join(
+            (ENGINE / "scripts" / name).read_text()
+            for name in ("vm.py", "vm_adopt.py")
+        )
+        for code in ADOPT_AND_TRANSFER_CODES:
+            if code == "<operation>_timeout":
+                # Generated per verb, so it is a format string in the source.
+                self.assertIn('f"{operation}_timeout"', sources)
+                continue
+            with self.subTest(code=code):
+                self.assertIn(f'"{code}"', sources)
+
+    def test_the_broker_resume_line_says_the_block_is_written(self) -> None:
+        """A shell that reads `adopt_broker_failed` must not re-run adoption
+        believing nothing was saved."""
+        for body in (
+            _flat(REMOTE_SEATS_DOC.read_text()),
+            _flat(_specs()["remote_seats"]["content"]),
+        ):
+            self.assertIn("./sc vm-broker-up", body)
+            self.assertRegex(body, r"block IS written")
+
+
 class DocumentationTests(unittest.TestCase):
     def test_retired_docs_and_fork_import_copy_are_gone(self) -> None:
         for path in RETIRED_DOCS:
@@ -235,21 +294,32 @@ class DocumentationTests(unittest.TestCase):
         body = _flat(REMOTE_SEATS_DOC.read_text())
         for needed in (
             "./sc vm adopt", "bootstrap.ps1", "--bootstrap-url",
-            "`.super-coder/engine.ref`", "`main`",
+            # The engine pin lives in .sc-state, not under .super-coder:
+            # callable_floor.read_engine_ref is the authority.
+            "`.sc-state/engine.ref`", "`main`",
             "`/bake` `{name?}`", "`/pull` `{src, dest}`",
             "`/push` `{src, dest?}`", "`{snapshot?, running}`",
+            "`/snapshot/create` `{name}`", "`/snapshot/delete` `{name}`",
+            "`/validate/<check>` `{vm}`",
             "`workspace`", "`known_hosts_path`", "`ssh_port`", "`mcp_port`",
             "./sc vm-bake", "snapshot_live_unsupported",
             "remote_path_not_allowed", "adopt_guest_not_found",
             "adopt_ssh_timeout", "adopt_key_install_failed",
             "adopt_provision_failed", "adopt_verify_failed", "adopt_sandboxed",
             "booted, licensed Windows 10 or 11 guest",
+            # Every flag `vm adopt` accepts, on the client-verb line.
+            "--libvirt-uri", "--wait SECONDS", "--json",
+            # The host floor push/pull depend on.
+            "OpenSSH client 8.7 or newer",
         ):
             with self.subTest(needed=needed):
                 self.assertIn(needed, body)
         self.assertNotIn("the engine installs nothing", body)
         # The one surviving mention is the retirement note on `vm init`.
         self.assertEqual(body.count("--transfer-dir"), 1)
+        # `vm-bake` is the host-direct escape hatch, not a plain alias.
+        self.assertIn("HOST-DIRECT", body)
+        self.assertNotIn("stays as a dispatcher alias", body)
 
     def test_tailnet_runbook_describes_the_readonly_tier(self) -> None:
         body = TAILNET_DOC.read_text()

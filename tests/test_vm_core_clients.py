@@ -706,10 +706,23 @@ class PublicClientTests(unittest.TestCase):
             result = vm.run_operation("reset")
         self.assertEqual(result, GOLDEN["reset_success"])
         call.assert_called_once_with(
-            "POST", "/reset", {"running": False}, timeout=130
+            "POST", "/reset", {"running": False},
+            timeout=vm.RESET_CLIENT_TIMEOUT,
         )
-        self.assertEqual(vm.RESET_CLIENT_TIMEOUT, 130)
-        self.assertEqual(vm.RESET_BROKER_BUDGET, 80)
+        # The client budget is DERIVED from the broker's, never a bare number:
+        # `--off` against a live snapshot reverts AND performs the bounded
+        # graceful stop inside the one call, so the stop budget has to be in
+        # it. A flat 130 expired mid-stop and called a running reset unknown.
+        self.assertEqual(
+            vm.RESET_BROKER_BUDGET,
+            vm.MUTATION_LOCK_TIMEOUT
+            + vm.RESET_COMMAND_TIMEOUT
+            + vm.DOMAIN_STATE_TIMEOUT
+            + vm.DOMAIN_STOP_TIMEOUT
+            + vm.DOMAIN_STATE_TIMEOUT,
+        )
+        self.assertEqual(vm.RESET_CLIENT_TIMEOUT, vm.RESET_BROKER_BUDGET + 30)
+        self.assertGreater(vm.RESET_CLIENT_TIMEOUT, vm.RESET_BROKER_BUDGET)
         self.assertEqual(vm.RESET_COMMAND_TIMEOUT, 60)
 
     def test_busy_reset_is_distinct_and_known_not_to_have_run(self):
@@ -1080,7 +1093,9 @@ class LifecycleClientTests(unittest.TestCase):
 
     def test_init_writes_only_vm_block_and_reports_broker_health(self):
         config = dict(SAVED)
-        with mock.patch.object(vm, "write") as write, mock.patch.object(
+        with mock.patch.object(
+            vm, "write_block_and_confirm", return_value=False
+        ) as write, mock.patch.object(
             vm, "broker_call", return_value={"ok": True, "service": "vm-broker"}
         ) as health:
             result = vm.run_init(config)

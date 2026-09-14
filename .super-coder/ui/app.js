@@ -2117,10 +2117,16 @@ async function openBrowserModal(onChange) {
 }
 
 // Windows Test VM wizard — a single hand-link modal (the house openModal/el
-// pattern). The fields map 1:1 to the instance.json `vm` block; the four checks
-// each hit POST /api/vm/validate/{check} with the IN-PROGRESS form, so the
-// operator tests before saving. No secrets here — ssh_key_path is a PATH.
-// `./sc vm adopt` writes the same block end to end; this is the manual path.
+// pattern). The four checks each hit POST /api/vm/validate/{check} with the
+// IN-PROGRESS form, so the operator tests before saving. No secrets here —
+// ssh_key_path is a PATH. `./sc vm adopt` writes the same block end to end;
+// this is the manual path.
+//
+// The fields below are a SUBSET of the `vm` block, and PUT /api/vm REPLACES
+// the block rather than merging into it. So `collect()` starts from the saved
+// block and overlays the form: without that, one save through this wizard
+// would silently drop `known_hosts_path` and `mcp_port` — the host-key pin and
+// the MCP tunnel target that `adopt` wrote and no field here shows.
 const VM_FIELDS = [
   ["domain", "win-test", "libvirt domain name (virsh target)"],
   ["ssh_host", "127.0.0.1", "guest OpenSSH host"],
@@ -2130,7 +2136,11 @@ const VM_FIELDS = [
   ["snapshot", "baseline", "named baseline snapshot to revert to between runs"],
   ["workspace", "C:\\SubfloorTest", "OPTIONAL — guest-side working directory push/pull default to (default: C:\\SubfloorTest)"],
   ["libvirt_uri", "qemu:///system", "OPTIONAL — virsh connection; set for a system-scope domain (default: qemu:///session)"],
+  ["mcp_port", "8000", "OPTIONAL — guest loopback port the Windows-MCP tunnel forwards to (default: 8000)"],
+  ["known_hosts_path", "", "OPTIONAL — host-owned known-hosts file the guest key is pinned into; written by `./sc vm adopt`"],
 ];
+// Fields stored as numbers, not strings.
+const VM_NUMERIC_FIELDS = { ssh_port: 22, mcp_port: 8000 };
 const VM_CHECKS = [
   ["domain", "VM exists + visible to libvirt"],
   ["ssh", "SSH auth + remote exec work"],
@@ -2150,12 +2160,17 @@ async function openWinVmModal() {
     form.append(el("span", { className: "k", title: hint }, key), inp);
   }
 
+  // Start from what is SAVED and overlay the form, because PUT /api/vm
+  // replaces the whole block. An empty field clears that key rather than
+  // resurrecting the saved value, so clearing still works.
   const collect = () => {
-    const vm = {};
+    const vm = { ...saved };
     for (const [key] of VM_FIELDS) {
-      let v = inputs[key].value.trim();
-      if (key === "ssh_port") v = Number(v) || 22;
-      if (v !== "") vm[key] = v;
+      const raw = inputs[key].value.trim();
+      if (raw === "") { delete vm[key]; continue; }
+      vm[key] = key in VM_NUMERIC_FIELDS
+        ? (Number(raw) || VM_NUMERIC_FIELDS[key])
+        : raw;
     }
     return vm;
   };

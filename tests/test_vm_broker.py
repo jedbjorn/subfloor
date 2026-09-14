@@ -190,7 +190,9 @@ class VerbDispatchTests(unittest.TestCase):
         self.assertGreater(r["bytes"], 0)
         argv = run.call_args[0][0]
         self.assertEqual(argv[0], "scp")
-        self.assertEqual(argv[-1], "tester@127.0.0.1:C:\\SubfloorTest\\vm.py")
+        # Forward slashes on the wire (scp -s speaks SFTP); the reported
+        # destination keeps the Windows spelling.
+        self.assertEqual(argv[-1], "tester@127.0.0.1:C:/SubfloorTest/vm.py")
         self.assertEqual(argv[-2], str(Path(src).resolve()))
 
     def test_pull_rejects_a_destination_outside_the_repo(self):
@@ -322,6 +324,71 @@ class McpTunnelTests(unittest.TestCase):
         self.assertIn("StreamLocalBindUnlink=yes", argv)
         self.assertIn("StreamLocalBindMask=0177", argv)
         self.assertIn("tester@127.0.0.1", argv)
+
+    def test_mcp_tunnel_uses_the_pinned_known_hosts_like_every_other_verb(self):
+        """Observed on halo: `./sc vm mcp up` refused with "REMOTE HOST
+        IDENTIFICATION HAS CHANGED" on a reimaged guest while every other verb
+        worked — the tunnel was the one ssh that skipped `_ssh_base_opts` and
+        so read the OPERATOR'S ~/.ssh/known_hosts instead of the block's pin."""
+        def fake_popen(argv, **kw):
+            vm.MCP_SOCKET.touch()
+            return mock.Mock(pid=4242, poll=mock.Mock(return_value=None))
+        cfg = dict(SAVED, known_hosts_path="/host/state/w10c.known_hosts",
+                   ssh_port=2222)
+        with mock.patch.object(vm, "read", return_value=cfg), \
+             mock.patch("subprocess.Popen", side_effect=fake_popen) as popen, \
+             mock.patch.object(vm, "_tunnel_ready", side_effect=[False, True]), \
+             mock.patch.object(vm, "_process_record_matches", return_value=True), \
+             mock.patch.object(vm, "_process_owns_unix_listener", return_value=True), \
+             mock.patch.object(vm, "_new_process_state", return_value={
+                 "schema_version": 1, "kind": "vm-mcp-tunnel", "pid": 4242,
+                 "start_ticks": 123, "executable": "/usr/bin/ssh", "port": 8000,
+             }):
+            r = vm.do_mcp_up(wait=5)
+        self.assertTrue(r["ok"], r)
+        argv = popen.call_args[0][0]
+        self.assertIn(
+            "UserKnownHostsFile=/host/state/w10c.known_hosts", argv
+        )
+        self.assertIn("StrictHostKeyChecking=yes", argv)
+        self.assertNotIn("StrictHostKeyChecking=accept-new", argv)
+        self.assertIn("BatchMode=yes", argv)
+        # And the port comes from the same validated accessor.
+        self.assertEqual(argv[argv.index("-p") + 1], "2222")
+        # Every guest ssh/scp the engine builds shares the option list.
+        for builder in (vm._ssh_argv(cfg, "echo ok"), vm._scp_argv(cfg, "a", "b")):
+            self.assertIn(
+                "UserKnownHostsFile=/host/state/w10c.known_hosts", builder
+            )
+
+    def test_an_unpinned_block_still_gets_accept_new_on_the_tunnel(self):
+        def fake_popen(argv, **kw):
+            vm.MCP_SOCKET.touch()
+            return mock.Mock(pid=4242, poll=mock.Mock(return_value=None))
+        with mock.patch.object(vm, "read", return_value=SAVED), \
+             mock.patch("subprocess.Popen", side_effect=fake_popen) as popen, \
+             mock.patch.object(vm, "_tunnel_ready", side_effect=[False, True]), \
+             mock.patch.object(vm, "_process_record_matches", return_value=True), \
+             mock.patch.object(vm, "_process_owns_unix_listener", return_value=True), \
+             mock.patch.object(vm, "_new_process_state", return_value={
+                 "schema_version": 1, "kind": "vm-mcp-tunnel", "pid": 4242,
+                 "start_ticks": 123, "executable": "/usr/bin/ssh", "port": 8000,
+             }):
+            vm.do_mcp_up(wait=5)
+        self.assertIn("StrictHostKeyChecking=accept-new", popen.call_args[0][0])
+
+    def test_an_scp_too_old_for_dash_s_is_named_not_leaked(self):
+        """`scp -s` (force SFTP) is OpenSSH 8.7+; an older client answers with
+        a usage line that diagnoses nothing on its own."""
+        usage = "unknown option -- s\nusage: scp [-346ABCpqrTv] ..."
+        with mock.patch.object(vm, "read", return_value=SAVED), \
+             mock.patch.object(vm, "_run", return_value=(False, usage)):
+            pull = vm.do_pull("C:\\SubfloorTest\\out.txt", "out.txt")
+            push = vm.do_push(str(vm.ports.ENGINE / "scripts" / "vm.py"))
+        for result in (pull, push):
+            self.assertFalse(result["ok"], result)
+            self.assertEqual(result["error"], "scp_unsupported")
+            self.assertIn("OpenSSH 8.7", result["output"])
 
     def test_mcp_port_defaults_to_8000(self):
         def fake_popen(argv, **kw):

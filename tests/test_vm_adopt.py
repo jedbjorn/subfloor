@@ -33,7 +33,7 @@ import json
 import os
 import sys
 import unittest
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import ClassVar
@@ -184,6 +184,8 @@ class Harness:
             return 0, "ok\n", noise
         if "Get-NetTCPConnection" in remote:
             return (0, "True\n", noise) if self.mcp_listening else (0, "False\n", noise)
+        if remote.startswith("ssh-keyscan"):  # pragma: no cover - keyscan is argv[0]
+            return 0, self.keyscan, ""
         return self.check_rc, "1.2.3\n", noise
 
     def run_env(self, argv, env, timeout):
@@ -216,8 +218,11 @@ class Harness:
         }
 
     def write(self, block):
-        self.written = dict(block) if block else None
-        return self.written
+        """`vm.write_block_and_confirm`: returns True when nothing changed."""
+        block = dict(block) if block else None
+        unchanged = self.written == block
+        self.written = block
+        return unchanged
 
     # -- wiring --------------------------------------------------------------
 
@@ -225,7 +230,9 @@ class Harness:
         return (
             mock.patch.object(vm, "repo_root", return_value=self.root),
             mock.patch.object(vm, "read", return_value=saved),
-            mock.patch.object(vm, "write", side_effect=self.write),
+            mock.patch.object(
+                vm, "write_block_and_confirm", side_effect=self.write
+            ),
             mock.patch.object(vm, "_run", side_effect=self.run),
             mock.patch.object(vm, "_domain_state", side_effect=self.domain_state),
             mock.patch.object(vm, "_ssh_ready", side_effect=self.ssh_ready),
@@ -257,17 +264,21 @@ class AdoptTestBase(unittest.TestCase):
             "password_file": str(self._password_file()),
         }
         arguments.update(options)
-        stdout = io.StringIO()
+        stdout, stderr = io.StringIO(), io.StringIO()
         contexts = harness.patches(saved)
         for context in contexts:
             context.start()
         try:
-            with redirect_stdout(stdout):
+            with redirect_stdout(stdout), redirect_stderr(stderr):
                 value = vm_adopt.run_adopt(**arguments)
         finally:
             for context in contexts:
                 context.stop()
-        self.console = stdout.getvalue()
+        self.stdout = stdout.getvalue()
+        self.stderr = stderr.getvalue()
+        # Guidance is printed on stderr in both modes; `console` is what the
+        # operator sees in total.
+        self.console = self.stdout + self.stderr
         return value
 
     def _password_file(self) -> Path:
@@ -303,6 +314,10 @@ class HappyPathTest(AdoptTestBase):
             self.assertIn(phase["status"], ("done", "skipped", "failed"))
         self.assertEqual(harness.dispatched, ["vm-broker-up"])
         self.assertEqual(harness.baked, ["baseline"])
+        # The module's declared order is the order that actually ran.
+        self.assertEqual(
+            tuple(p["name"] for p in value["phases"]), vm_adopt.PHASES
+        )
 
     def test_written_block_has_no_transfer_dir_and_pins_the_host_key(self):
         harness = Harness(self.root)
@@ -363,8 +378,11 @@ class HappyPathTest(AdoptTestBase):
         self.assertIn(r"%USERPROFILE%\.ssh\authorized_keys", remote)
         self.assertIn("icacls", remote)
         self.assertIn("/inheritance:r", remote)
-        self.assertIn('/grant "Administrators:F"', remote)
-        self.assertIn('/grant "SYSTEM:F"', remote)
+        # SIDs, not localized display names: icacls fails with "No mapping
+        # between account names and security IDs" on a non-English Windows.
+        self.assertIn("/grant *S-1-5-32-544:F", remote)
+        self.assertIn("/grant *S-1-5-18:F", remote)
+        self.assertNotIn("Administrators:F", remote)
 
     def test_powered_off_domain_is_started_without_an_ssh_wait(self):
         harness = Harness(self.root, domstate="shut off")
@@ -427,7 +445,11 @@ class DiscoveryTest(AdoptTestBase):
         self.assertTrue(value["ok"])
         harden = next(p for p in value["phases"] if p["name"] == "harden")
         self.assertEqual(harden["status"], "done")
-        self.assertIn("WARNING", harden["detail"])
+        self.assertIn("warning:", harden["detail"])
+        self.assertTrue(
+            any("dhcp reservation" in w for w in value["warnings"]),
+            value["warnings"],
+        )
 
 
 class WaitTest(AdoptTestBase):
@@ -577,8 +599,10 @@ class ProvisionAndVerifyTest(AdoptTestBase):
         self.assertTrue(value["ok"], json.dumps(value, indent=2))
         scps = [argv for argv in harness.argvs if argv[0] == "scp"]
         targets = [argv[-1] for argv in scps]
-        self.assertTrue(any(t.endswith(r"C:\SubfloorTest\provision.ps1") for t in targets))
-        self.assertTrue(any(t.endswith(r"C:\SubfloorTest\winbox.json") for t in targets))
+        # Forward slashes on the wire: `scp -s` speaks SFTP, where backslash
+        # is an escape character.
+        self.assertTrue(any(t.endswith("C:/SubfloorTest/provision.ps1") for t in targets))
+        self.assertTrue(any(t.endswith("C:/SubfloorTest/winbox.json") for t in targets))
         shipped = next(
             argv[-2] for argv in scps if argv[-1].endswith("winbox.json")
         )
@@ -627,12 +651,40 @@ class ProvisionAndVerifyTest(AdoptTestBase):
         self.assertEqual(harness.dispatched, [])
         self.assertEqual(harness.baked, [])
 
-    def test_missing_mcp_listener_fails_verify(self):
+    def test_missing_mcp_listener_warns_and_adoption_continues(self):
+        """Windows-MCP registers a per-user LOGON task. On a guest with no
+        desktop session it is installed and correct but has never started, so
+        a missing listener is a warning, not a reason to abandon a guest that
+        is otherwise fully adopted."""
         harness = Harness(self.root, mcp_listening=False)
         value = self.adopt(harness)
-        self.assertFalse(value["ok"])
-        self.assertEqual(value["error"]["code"], "adopt_verify_failed")
-        self.assertIn("127.0.0.1:8000", value["error"]["message"])
+        self.assertTrue(value["ok"], json.dumps(value, indent=2))
+        verify = next(p for p in value["phases"] if p["name"] == "verify")
+        self.assertEqual(verify["status"], "done")
+        self.assertIn("warning:", verify["detail"])
+        self.assertIn("127.0.0.1:8000", verify["detail"])
+        self.assertEqual(len(value["warnings"]), 1)
+        self.assertIn("no Windows-MCP listener", value["warnings"][0])
+        self.assertIn("./sc vm exec", value["warnings"][0])
+        # The block IS written and the baseline IS taken.
+        self.assertIsNotNone(harness.written)
+        self.assertEqual(harness.baked, ["baseline"])
+        # And the operator sees it on the summary line.
+        text = vm_adopt.human_report(value)
+        self.assertIn("1 warning(s)", text)
+        self.assertIn("no Windows-MCP listener", text)
+
+    def test_the_mcp_probe_counts_listeners_instead_of_comparing_to_null(self):
+        """`(...) -ne $null` on an EMPTY array yields nothing at all under the
+        array-comparison rules, which prints as the empty string, not False."""
+        harness = Harness(self.root)
+        self.adopt(harness)
+        probe = next(
+            argv[-1] for argv in harness.argvs
+            if argv[0] == "ssh" and "Get-NetTCPConnection" in argv[-1]
+        )
+        self.assertIn(".Count -gt 0", probe)
+        self.assertNotIn("-ne $null", probe)
 
     def test_no_provision_skips_provisioning_and_its_checks(self):
         self._profile(checks=["dotnet --version"])
@@ -699,6 +751,364 @@ class GuardTest(AdoptTestBase):
         self.assertFalse(value["ok"])
         self.assertEqual(value["error"]["code"], "adopt_baseline_failed")
         self.assertEqual(value["phases"][-1]["name"], "baseline")
+
+
+class StdoutPurityTest(AdoptTestBase):
+    """`--json` promises stdout is exactly one JSON object."""
+
+    def _run_client(self, harness, argv):
+        stdout, stderr = io.StringIO(), io.StringIO()
+        contexts = harness.patches(None)
+        for context in contexts:
+            context.start()
+        try:
+            with redirect_stdout(stdout), redirect_stderr(stderr):
+                code = vm.client_main(argv)
+        finally:
+            for context in contexts:
+                context.stop()
+        return code, stdout.getvalue(), stderr.getvalue()
+
+    def test_json_stdout_is_exactly_one_object(self):
+        harness = Harness(self.root)
+        code, out, err = self._run_client(harness, [
+            "adopt", "--json", "--domain", "w10c-testing",
+            "--ssh-user", "sctest",
+            "--password-file", str(self._password_file()),
+        ])
+        self.assertEqual(code, 0)
+        value = json.loads(out)          # the whole of stdout, nothing else
+        self.assertTrue(value["ok"], out)
+        self.assertEqual(out.count("\n"), 1)
+        # The guidance the human mode prints went to stderr instead...
+        self.assertIn("ELEVATED PowerShell", err)
+        self.assertNotIn("ELEVATED PowerShell", out)
+        # ...and a --json caller still gets the line, in the result.
+        self.assertIn("bootstrap.ps1 | iex", value["bootstrap_line"])
+        self.assertEqual(
+            value["bootstrap_line"], value["result"]["bootstrap_line"]
+        )
+
+    def test_human_mode_also_keeps_the_guidance_off_the_result_stream(self):
+        harness = Harness(self.root)
+        code, out, err = self._run_client(harness, [
+            "adopt", "--domain", "w10c-testing", "--ssh-user", "sctest",
+            "--password-file", str(self._password_file()),
+        ])
+        self.assertEqual(code, 0)
+        self.assertIn("ELEVATED PowerShell", err)
+        self.assertIn("VM adopted", out)
+
+    def test_a_failed_run_still_carries_the_bootstrap_line_in_json(self):
+        harness = Harness(self.root, tcp_open=False)
+        value = self.adopt(harness, wait=1)
+        self.assertFalse(value["ok"])
+        self.assertIn("bootstrap.ps1 | iex", value["bootstrap_line"])
+        self.assertEqual(value["warnings"], [])
+
+
+class HostKeyChangedTest(AdoptTestBase):
+    CHANGED = (
+        "@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@\n"
+        "@    WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED!     @\n"
+        "IT IS POSSIBLE THAT SOMEONE IS DOING SOMETHING NASTY!\n"
+        "Host key verification failed.\n"
+    )
+
+    def test_a_changed_guest_host_key_names_itself_and_the_fix(self):
+        harness = Harness(self.root)
+        (self.root / ".sc-state" / "local" / "vm"
+         / "w10c-testing.known_hosts").write_text(HOST_KEY, encoding="utf-8")
+        real = harness.capture
+
+        def changed(argv, timeout):
+            if argv[0] == "ssh" and "sshd_config" in _decoded(argv[-1]):
+                return 255, "", self.CHANGED
+            return real(argv, timeout)
+
+        harness.capture = changed
+        value = self.adopt(harness)
+        self.assertFalse(value["ok"])
+        self.assertEqual(value["error"]["code"], "adopt_host_key_changed")
+        message = value["error"]["message"]
+        self.assertIn("w10c-testing.known_hosts", message)
+        self.assertIn("rm ", message)
+        self.assertEqual(value["phases"][-1]["name"], "harden")
+        self.assertIsNone(harness.written)
+
+    def test_the_same_guard_covers_the_key_install_phase(self):
+        harness = Harness(self.root)
+        harness.run_env = lambda argv, env, timeout: (255, "", self.CHANGED)
+        value = self.adopt(harness)
+        self.assertFalse(value["ok"])
+        self.assertEqual(value["error"]["code"], "adopt_host_key_changed")
+
+
+class HardenFailureTest(AdoptTestBase):
+    def test_a_harden_failure_has_its_own_code(self):
+        """Not `adopt_key_install_failed`: the key went in fine, and the
+        operator repair is a different one."""
+        harness = Harness(self.root)
+        real = harness.capture
+
+        def refuse(argv, timeout):
+            if argv[0] == "ssh" and "sshd_config" in _decoded(argv[-1]):
+                return 1, "MISSING", "sshd_config is not there"
+            return real(argv, timeout)
+
+        harness.capture = refuse
+        value = self.adopt(harness)
+        self.assertFalse(value["ok"])
+        self.assertEqual(value["error"]["code"], "adopt_harden_failed")
+        self.assertEqual(value["phases"][-1]["name"], "harden")
+        self.assertIsNone(harness.written)
+
+    def test_the_directive_is_placed_before_the_first_match_block(self):
+        """Appended to the end of the stock Windows sshd_config, the directive
+        lands inside `Match Group administrators` and governs only that
+        group — the file ends with that block."""
+        script = vm_adopt.Adoption.HARDEN_SCRIPT
+        self.assertIn("'^\\s*Match\\s'", script)
+        placement = script.index("$placed")
+        self.assertLess(placement, script.index("$new = ($out -join"))
+        # The FIRST existing directive is what gets replaced; sshd reads the
+        # first, so rewriting later ones would change nothing.
+        self.assertIn("if (-not $seen -and $line -match", script)
+
+
+class NoTtyTest(AdoptTestBase):
+    def test_adopt_refuses_up_front_with_no_tty_and_no_password_file(self):
+        """`getpass` falls back to reading stdin WITH ECHO without a terminal."""
+        with mock.patch.object(vm, "read", return_value=None), \
+             mock.patch.object(vm_adopt, "_stdin_is_tty", return_value=False):
+            value = vm_adopt.run_adopt(domain="w10c-testing", ssh_user="sctest")
+        self.assertFalse(value["ok"])
+        self.assertEqual(value["error"]["code"], "adopt_config_invalid")
+        self.assertIn("--password-file", value["error"]["message"])
+        self.assertEqual(value["phases"], [])
+
+    def test_a_saved_key_is_the_exemption_the_re_run_path_needs(self):
+        harness = Harness(self.root)
+        with mock.patch.object(vm_adopt, "_stdin_is_tty", return_value=False):
+            value = self.adopt(
+                harness, saved=ResumabilityTest.SAVED, password_file=None,
+                ssh_user=None,
+            )
+        self.assertTrue(value["ok"], json.dumps(value, indent=2))
+        self.assertEqual(harness.envs, [])
+
+    def test_a_saved_key_that_stopped_working_still_refuses_to_echo(self):
+        harness = Harness(self.root, key_auth=False)
+        with mock.patch.object(vm_adopt, "_stdin_is_tty", return_value=False):
+            value = self.adopt(
+                harness, saved=ResumabilityTest.SAVED, password_file=None,
+                ssh_user=None,
+            )
+        self.assertFalse(value["ok"])
+        self.assertEqual(value["error"]["code"], "adopt_config_invalid")
+        self.assertEqual(harness.envs, [])
+
+
+class AlreadyAdoptedTest(AdoptTestBase):
+    """AC2: a second run of adopt on an adopted guest is a no-op."""
+
+    def test_locate_and_write_block_both_skip_on_a_settled_guest(self):
+        harness = Harness(self.root)
+        saved = {
+            "domain": "w10c-testing",
+            "snapshot": "baseline",
+            "libvirt_uri": "qemu:///system",
+            "ssh_host": ARP_IP,
+            "ssh_user": "sctest",
+            "ssh_key_path": str(
+                self.root / ".sc-state" / "local" / "vm" / "w10c-testing.key"
+            ),
+            "ssh_port": 22,
+            "mcp_port": 8000,
+            "known_hosts_path": str(
+                self.root / ".sc-state" / "local" / "vm"
+                / "w10c-testing.known_hosts"
+            ),
+            "workspace": "C:\\SubfloorTest",
+        }
+        harness.written = dict(saved)   # the block already on disk
+        Path(saved["known_hosts_path"]).write_text(HOST_KEY, encoding="utf-8")
+        harness2 = Harness(self.root, harden="UNCHANGED")
+        harness2.written = dict(saved)
+        value = self.adopt(harness2, saved=saved, ssh_user=None,
+                           password_file=None)
+        self.assertTrue(value["ok"], json.dumps(value, indent=2))
+        statuses = dict(self.statuses(value))
+        self.assertEqual(statuses["locate"], "skipped")
+        self.assertEqual(statuses["install_key"], "skipped")
+        self.assertEqual(statuses["harden"], "skipped")
+        self.assertEqual(statuses["write_block"], "skipped")
+        # Discovery never ran: no virsh at all in the locate phase.
+        self.assertFalse([
+            argv for argv in harness2.argvs
+            if argv[0] == "virsh" and _virsh_op(argv) == "domiflist"
+        ])
+
+    def test_a_changed_block_is_still_written(self):
+        harness = Harness(self.root)
+        harness.written = {"domain": "w10c-testing", "snapshot": "old"}
+        value = self.adopt(harness)
+        self.assertTrue(value["ok"])
+        write_block = next(
+            p for p in value["phases"] if p["name"] == "write_block"
+        )
+        self.assertEqual(write_block["status"], "done")
+
+
+class BrokerReadinessTest(AdoptTestBase):
+    """`vm-broker-up` nohups the broker and returns; the socket lands after."""
+
+    def test_the_phase_waits_for_the_socket_before_reading_health(self):
+        harness = Harness(self.root)
+        answers = [
+            vm.BrokerConnectionError("no such file", request_sent=False),
+            vm.BrokerConnectionError("no such file", request_sent=False),
+            {"ok": True},
+        ]
+
+        def health(method, path, body=None, timeout=5):
+            answer = answers.pop(0)
+            if isinstance(answer, Exception):
+                raise answer
+            return answer
+
+        contexts = harness.patches(None)
+        for context in contexts:
+            context.start()
+        try:
+            with mock.patch.object(vm, "broker_call", side_effect=health), \
+                 redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+                value = vm_adopt.run_adopt(
+                    domain="w10c-testing", ssh_user="sctest",
+                    password_file=str(self._password_file()),
+                )
+        finally:
+            for context in contexts:
+                context.stop()
+        self.assertTrue(value["ok"], json.dumps(value, indent=2))
+        broker = next(p for p in value["phases"] if p["name"] == "broker")
+        self.assertEqual(broker["status"], "done")
+        self.assertIn("healthy", broker["detail"])
+        self.assertEqual(answers, [])
+
+    def test_a_broker_that_never_answers_fails_with_the_resume_line(self):
+        harness = Harness(self.root)
+
+        def never(method, path, body=None, timeout=5):
+            raise vm.BrokerConnectionError("no such file", request_sent=False)
+
+        contexts = harness.patches(None)
+        for context in contexts:
+            context.start()
+        try:
+            with mock.patch.object(vm, "broker_call", side_effect=never), \
+                 mock.patch.object(
+                     vm_adopt, "BROKER_READY_WAIT", 0
+                 ), \
+                 redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+                value = vm_adopt.run_adopt(
+                    domain="w10c-testing", ssh_user="sctest",
+                    password_file=str(self._password_file()),
+                )
+        finally:
+            for context in contexts:
+                context.stop()
+        self.assertFalse(value["ok"])
+        self.assertEqual(value["error"]["code"], "adopt_broker_failed")
+        self.assertIn("./sc vm-broker-up", value["error"]["message"])
+        self.assertIn("vm block IS written", value["error"]["message"])
+        self.assertIsNotNone(harness.written)
+        self.assertEqual(harness.baked, [])
+
+
+class BlockRoundTripTest(unittest.TestCase):
+    """Finding 47, from a real halo run: `ports.resolve()` only returns the
+    STORED view when instance.json carries a persisted `port`. A scratch clone
+    whose install died before `ports ensure` therefore accepted the vm block
+    and then read back nothing — `vm-broker-up` said "nothing to serve" and
+    `bake` said "missing required field(s): domain, snapshot" against a file
+    that plainly held the block."""
+
+    BLOCK: ClassVar[dict] = {
+        "domain": "w10c-testing",
+        "snapshot": "baseline",
+        "ssh_host": ARP_IP,
+        "ssh_user": "sctest",
+        "ssh_key_path": "/keys/w10c.key",
+        "ssh_port": 22,
+        "workspace": "C:\\SubfloorTest",
+    }
+
+    def setUp(self):
+        directory = TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.config = Path(directory.name) / "instance.json"
+        # An install bound to an instance but never through `ports ensure`.
+        self.instance_id = "0123456789abcdef0123456789abcdef"
+        self.config.write_text(
+            json.dumps({"instance_id": self.instance_id}) + "\n"
+        )
+        patcher = mock.patch.object(vm.ports, "CONFIG", self.config)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_the_block_round_trips_through_a_portless_instance_file(self):
+        self.assertIsNone(vm.read())
+        self.assertFalse(vm.write_block_and_confirm(dict(self.BLOCK)))
+        self.assertEqual(vm.read(), self.BLOCK)
+        stored = json.loads(self.config.read_text())
+        self.assertEqual(
+            stored["instance_id"], self.instance_id, "identity preserved"
+        )
+        self.assertIn("port", stored, "the managed ports are persisted too")
+
+    def test_bake_sees_the_block_adopt_just_wrote(self):
+        vm.write_block_and_confirm(dict(self.BLOCK))
+        calls = []
+
+        def fake_run(argv, timeout=30):
+            calls.append(argv)
+            if "domstate" in argv:
+                return True, "shut off"
+            if "snapshot-info" in argv:
+                return False, "Domain snapshot not found"
+            return True, "Domain snapshot baseline created"
+
+        with mock.patch.object(vm, "_run", side_effect=fake_run):
+            result = vm.do_bake("baseline")
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["snapshot"], "baseline")
+        self.assertTrue(any("w10c-testing" in argv for argv in calls))
+
+    def test_a_second_identical_write_reports_unchanged(self):
+        self.assertFalse(vm.write_block_and_confirm(dict(self.BLOCK)))
+        self.assertTrue(vm.write_block_and_confirm(dict(self.BLOCK)))
+
+    def test_a_block_that_does_not_read_back_is_a_named_failure(self):
+        with mock.patch.object(vm, "read", return_value={"domain": "other"}), \
+             self.assertRaises(vm.BlockWriteError) as raised:
+            vm.write_block_and_confirm(dict(self.BLOCK))
+        self.assertIn("did not read back", str(raised.exception))
+
+    def test_init_refuses_a_block_that_does_not_round_trip(self):
+        with mock.patch.object(vm, "read", return_value={}), \
+             mock.patch.object(vm, "broker_call", return_value={"ok": True}):
+            result = vm.run_init(dict(self.BLOCK))
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["error"]["code"], "init_write_failed")
+
+    def test_bake_prefers_an_explicitly_passed_block(self):
+        """What the baseline phase relies on: adopt already holds the truth."""
+        with mock.patch.object(vm, "read", return_value=None), \
+             mock.patch.object(vm, "_run", return_value=(True, "shut off")):
+            result = vm.do_bake("baseline", cfg=dict(self.BLOCK))
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["domain"], "w10c-testing")
 
 
 class ClientParserTest(unittest.TestCase):

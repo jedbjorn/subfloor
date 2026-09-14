@@ -3,11 +3,11 @@
 
 The operator runs ONE line in an elevated PowerShell inside the guest
 (`assets/winbox/bootstrap.ps1`, fetched from the public repository) and ONE
-line on the host: this verb. Adoption then runs eight phases, each of which
-reports `done`, `skipped` or `failed` with a reason:
+line on the host: this verb. Adoption then runs the phases in `PHASES`, each
+of which reports `done`, `skipped` or `failed` with a reason:
 
     locate -> wait -> install_key -> harden -> provision -> verify
-           -> write_block -> baseline
+           -> write_block -> broker -> baseline
 
 Every phase is idempotent and detects satisfaction by OBSERVATION, never by a
 stored "already adopted" flag: the saved key authenticating is what makes the
@@ -39,6 +39,7 @@ import re
 import shutil
 import socket
 import subprocess
+import sys
 import tempfile
 import time
 from pathlib import Path
@@ -62,13 +63,35 @@ SCP_TIMEOUT = 300
 PROVISION_TIMEOUT = 40 * 60     # the .NET SDK alone can take ten minutes
 CHECK_TIMEOUT = 120
 BROKER_TIMEOUT = 120
+# `./sc vm-broker-up` returns as soon as the nohup'd broker is spawned; the
+# unix socket appears a moment later. Poll for it rather than reading health
+# through a socket that does not exist yet.
+BROKER_READY_WAIT = 20
+BROKER_READY_INTERVAL = 1
 
+# The public repository the guest fetches `bootstrap.ps1` from. It is the
+# ENGINE's own source repo, not the fork's: one copy of the script serves
+# every fork, and a fork testing a branch passes `--bootstrap-url` instead of
+# editing this. Named here so the URL is not spelled twice.
+BOOTSTRAP_REPO = "jedbjorn/subfloor"
 BOOTSTRAP_URL_TEMPLATE = (
-    "https://raw.githubusercontent.com/jedbjorn/subfloor/{ref}"
+    "https://raw.githubusercontent.com/" + BOOTSTRAP_REPO + "/{ref}"
     "/.super-coder/assets/winbox/bootstrap.ps1"
 )
 BOOTSTRAP_DEFAULT_REF = "main"
 
+# Guest host key mismatch: ssh refuses and says so on stderr. The text is
+# stable across OpenSSH 7.x-10.x and is the only usable signal, because the
+# exit code (255) is shared with every other connection failure.
+HOST_KEY_CHANGED = (
+    "REMOTE HOST IDENTIFICATION HAS CHANGED",
+    "Host key verification failed",
+)
+
+# The declared order, in the order `run()` executes them, and the order every
+# result's `phases` list carries. tests/test_vm_adopt.py compares the two, so a
+# phase renamed in one place and not the other fails rather than quietly
+# changing the JSON contract.
 PHASES = (
     "locate", "wait", "install_key", "harden", "provision", "verify",
     "write_block", "broker", "baseline",
@@ -77,6 +100,13 @@ PHASES = (
 _SAFE_NAME = re.compile(r"[^A-Za-z0-9._-]+")
 _MAC = re.compile(r"\b([0-9a-fA-F]{2}(?::[0-9a-fA-F]{2}){5})\b")
 _IPV4 = re.compile(r"\b(\d{1,3}(?:\.\d{1,3}){3})\b")
+
+
+NO_TTY = (
+    "adopt has no terminal to read the guest password from, and `getpass` "
+    "would fall back to reading it from stdin WITH ECHO. Re-run adopt on a "
+    "TTY, or pass --password-file <path> (read once, never copied)."
+)
 
 
 class AdoptFailure(Exception):
@@ -166,6 +196,14 @@ def _sleep(seconds: float) -> None:
     time.sleep(seconds)
 
 
+def _stdin_is_tty() -> bool:
+    """A seam: whether there is a terminal to prompt for the password on."""
+    try:
+        return bool(sys.stdin.isatty())
+    except (AttributeError, ValueError):  # a closed or replaced stdin
+        return False
+
+
 # -- helpers -----------------------------------------------------------------
 
 def _safe(name: str) -> str:
@@ -177,8 +215,7 @@ def _safe(name: str) -> str:
 def engine_ref() -> str:
     """The engine commit this install is pinned to, else `main`.
 
-    NOTE the pin lives at `.sc-state/engine.ref` (callable_floor.read_engine_ref);
-    the spec and the winbox README both spell it `.super-coder/engine.ref`.
+    The pin lives at `.sc-state/engine.ref` (callable_floor.read_engine_ref).
     """
     try:
         import callable_floor
@@ -268,6 +305,10 @@ class Adoption:
         self.profile: dict | None = None
         self.vm_block: dict | None = None
         self.phases: list[dict] = []
+        # Non-fatal observations the operator must still see: an MCP listener
+        # that has not appeared yet, a DHCP reservation libvirt refused. They
+        # ride on the summary line and in the JSON, and never stop adoption.
+        self.warnings: list[str] = []
         self.console_line = bootstrap_line(self.bootstrap_url)
 
     # -- phase bookkeeping ---------------------------------------------------
@@ -278,6 +319,32 @@ class Adoption:
     def _fail(self, name: str, code: str, detail: str) -> AdoptFailure:
         self._report(name, "failed", detail)
         return AdoptFailure(code, detail)
+
+    def _warn(self, text: str) -> str:
+        """Record a non-fatal observation and return it prefixed for a detail."""
+        line = f"warning: {text}"
+        self.warnings.append(text)
+        return line
+
+    def _guard_host_key(self, phase: str, *streams: str) -> None:
+        """A CHANGED guest host key dead-ends every later ssh with the same
+        opaque 255. Name it, and name the one file to remove.
+
+        The pin is written by adoption itself, so the honest repair is to drop
+        it and re-pin — which is what a re-run does. Reinstalling the guest or
+        regenerating its host keys is the normal cause.
+        """
+        blob = "\n".join(str(stream or "") for stream in streams)
+        if not any(marker in blob for marker in HOST_KEY_CHANGED):
+            return
+        raise self._fail(
+            phase, "adopt_host_key_changed",
+            f"the guest at {self.ssh_host}:{self.ssh_port} presented a "
+            f"different host key than the one pinned in {self.known_hosts}. "
+            "If the guest was reinstalled or its host keys were regenerated "
+            "this is expected: remove the pin and re-run adopt —\n"
+            f"  rm {self.known_hosts}",
+        )
 
     # -- cfg shapes ----------------------------------------------------------
 
@@ -317,6 +384,19 @@ class Adoption:
     def phase_locate(self) -> None:
         cfg = self._virsh_cfg()
         notes: list[str] = []
+
+        # Already adopted and still answering: there is nothing to discover.
+        # Observation, not a stored flag — the guest has to actually answer.
+        saved_host = str(self.saved.get("ssh_host") or "").strip()
+        if saved_host and _tcp_open(saved_host, self.ssh_port):
+            self.ssh_host = saved_host
+            self.address_source = "the saved vm block"
+            self._report(
+                "locate", "skipped",
+                f"{saved_host}:{self.ssh_port} from the saved vm block is "
+                "already answering",
+            )
+            return
 
         ok, _state, started, output = vm._start_domain(cfg)
         if not ok:
@@ -395,10 +475,14 @@ class Adoption:
     # -- 2. wait -------------------------------------------------------------
 
     def phase_wait(self) -> None:
+        # stderr in BOTH modes: this is operator guidance, not a result, and
+        # `--json` promises that stdout holds exactly one JSON object. The
+        # same line is carried in the result as `bootstrap_line`.
         print(
             "Run this once in an ELEVATED PowerShell inside the guest "
             "(skip it if you already have):\n"
-            f"  {self.console_line}\n"
+            f"  {self.console_line}\n",
+            file=sys.stderr,
         )
         deadline = time.monotonic() + max(1, self.wait)
         attempts = 0
@@ -465,6 +549,7 @@ class Adoption:
             shutil.rmtree(temp_dir, ignore_errors=True)
 
         if code != 0:
+            self._guard_host_key("install_key", err)
             raise self._fail(
                 "install_key", "adopt_key_install_failed",
                 f"the password-authenticated ssh exited {code}: "
@@ -541,6 +626,8 @@ class Adoption:
             # Exactly one trailing newline is stripped: a password may end in
             # spaces, and `echo secret > file` is the normal way to make one.
             password = raw.removesuffix("\n").removesuffix("\r")
+        elif not _stdin_is_tty():
+            raise self._fail("install_key", "adopt_config_invalid", NO_TTY)
         else:
             try:
                 password = getpass.getpass(
@@ -588,28 +675,48 @@ class Adoption:
         SSH session runs with the elevated token, so both the write under
         `C:\\ProgramData\\ssh` and `icacls` succeed over ssh.
         """
+        # SIDs, never the localized display names: `Administrators` and
+        # `SYSTEM` are `Administradores` / `SISTEMA` on a Spanish Windows and
+        # icacls then fails with "No mapping between account names and
+        # security IDs". *S-1-5-32-544 and *S-1-5-18 are invariant.
         admin = r"C:\ProgramData\ssh\administrators_authorized_keys"
         user = r"%USERPROFILE%\.ssh\authorized_keys"
         return (
             rf'if not exist "%USERPROFILE%\.ssh" mkdir "%USERPROFILE%\.ssh" & '
             rf'findstr /C:"{public_key}" "{user}" >nul 2>&1 || echo {public_key}>>"{user}" & '
             rf'findstr /C:"{public_key}" "{admin}" >nul 2>&1 || echo {public_key}>>"{admin}" & '
-            rf'icacls "{admin}" /inheritance:r /grant "Administrators:F" /grant "SYSTEM:F"'
+            rf'icacls "{admin}" /inheritance:r /grant *S-1-5-32-544:F /grant *S-1-5-18:F'
         )
 
     # -- 4. harden and pin ---------------------------------------------------
 
+    # A directive appended to the END of sshd_config lands INSIDE whatever
+    # `Match` block the stock Windows file ends with (`Match Group
+    # administrators`), where it applies only to that group. So: replace the
+    # FIRST existing directive (later ones are dead anyway — sshd takes the
+    # first), and when there is none, insert before the first `Match` line so
+    # the directive sits in global scope. Only then append.
     HARDEN_SCRIPT = r"""
 $path = 'C:\ProgramData\ssh\sshd_config'
 if (-not (Test-Path -LiteralPath $path)) { Write-Output 'MISSING'; exit 1 }
 $old = [IO.File]::ReadAllText($path)
+$lines = @($old -split "`r?`n")
 $out = @(); $seen = $false
-foreach ($line in ($old -split "`r?`n")) {
-  if ($line -match '^\s*#?\s*PasswordAuthentication\s') {
-    if (-not $seen) { $out += 'PasswordAuthentication no'; $seen = $true }
+foreach ($line in $lines) {
+  if (-not $seen -and $line -match '^\s*#?\s*PasswordAuthentication\s') {
+    $out += 'PasswordAuthentication no'; $seen = $true
   } else { $out += $line }
 }
-if (-not $seen) { $out += 'PasswordAuthentication no' }
+if (-not $seen) {
+  $out = @(); $placed = $false
+  foreach ($line in $lines) {
+    if (-not $placed -and $line -match '^\s*Match\s') {
+      $out += 'PasswordAuthentication no'; $placed = $true
+    }
+    $out += $line
+  }
+  if (-not $placed) { $out += 'PasswordAuthentication no' }
+}
 $new = ($out -join "`r`n")
 if ($new -ne $old) { [IO.File]::WriteAllText($path, $new); Write-Output 'CHANGED' }
 else { Write-Output 'UNCHANGED' }
@@ -621,8 +728,9 @@ else { Write-Output 'UNCHANGED' }
             vm._ssh_argv(cfg, _ps(self.HARDEN_SCRIPT)), timeout=HARDEN_TIMEOUT
         )
         if code != 0:
+            self._guard_host_key("harden", out, err)
             raise self._fail(
-                "harden", "adopt_key_install_failed",
+                "harden", "adopt_harden_failed",
                 "could not set PasswordAuthentication no in sshd_config "
                 f"(exit {code}): {(out + err).strip()[:300]}",
             )
@@ -639,15 +747,16 @@ else { Write-Output 'UNCHANGED' }
             while not _tcp_open(self.ssh_host, self.ssh_port):
                 if time.monotonic() >= deadline:
                     raise self._fail(
-                        "harden", "adopt_key_install_failed",
+                        "harden", "adopt_harden_failed",
                         f"sshd did not come back on {self.ssh_host}:{self.ssh_port} "
                         f"within {RESTART_SETTLE_WAIT}s after the restart",
                     )
                 _sleep(2)
             ready, error = vm._ssh_ready(cfg, timeout=20)
             if not ready:
+                self._guard_host_key("harden", error or "")
                 raise self._fail(
-                    "harden", "adopt_key_install_failed",
+                    "harden", "adopt_harden_failed",
                     f"key auth stopped working after the sshd restart: {error}",
                 )
             notes.append("PasswordAuthentication no; sshd restarted; key auth confirmed")
@@ -679,8 +788,8 @@ else { Write-Output 'UNCHANGED' }
             timeout=30,
         )
         if not ok:
-            return (
-                f"WARNING: dhcp reservation for {self.mac} was refused "
+            return self._warn(
+                f"dhcp reservation for {self.mac} was refused "
                 f"({output.strip()[:160]}) — the address may change on reboot"
             )
         return f"reserved {self.ssh_host} for {self.mac} on '{self.network}'"
@@ -696,8 +805,8 @@ else { Write-Output 'UNCHANGED' }
             if line.strip() and not line.startswith("#")
         )
         if code != 0 or not keys:
-            note = (
-                "WARNING: ssh-keyscan produced no host key "
+            note = self._warn(
+                "ssh-keyscan produced no host key "
                 f"({(err or '').strip()[:160]}) — host-key checking stays accept-new"
             )
             return note, False
@@ -713,7 +822,7 @@ else { Write-Output 'UNCHANGED' }
             self.known_hosts.write_text(keys, encoding="utf-8")
             os.chmod(self.known_hosts, 0o600)
         except OSError as exc:
-            return f"WARNING: could not write {self.known_hosts}: {exc}", False
+            return self._warn(f"could not write {self.known_hosts}: {exc}"), False
         return f"host key pinned in {self.known_hosts}", True
 
     # -- 5. provision --------------------------------------------------------
@@ -815,6 +924,7 @@ else { Write-Output 'UNCHANGED' }
 
         code, out, err = _capture(vm._ssh_argv(cfg, "echo ok"), timeout=30)
         if code != 0 or "ok" not in out:
+            self._guard_host_key("verify", out, err)
             failures.append(f"echo ok exited {code}: {(out + err).strip()[:200]}")
         else:
             passed.append("echo ok")
@@ -837,19 +947,34 @@ else { Write-Output 'UNCHANGED' }
             else:
                 passed.append(f"check '{check}'")
 
+        warned: list[str] = []
         if profile.get("mcp"):
             port = int(profile.get("mcp_port") or winbox.DEFAULT_MCP_PORT)
+            # `@(...).Count -gt 0`, never `-ne $null`: a cmdlet that matches
+            # nothing returns an EMPTY ARRAY, and an empty array compared to
+            # $null under the array-comparison rules yields nothing at all,
+            # which PowerShell then prints as the empty string. The count is
+            # unambiguous for zero, one and many.
             probe = (
-                "powershell -NoProfile -Command \"(Get-NetTCPConnection -State "
+                "powershell -NoProfile -Command \"@(Get-NetTCPConnection -State "
                 f"Listen -LocalPort {port} -LocalAddress 127.0.0.1 "
-                "-ErrorAction SilentlyContinue) -ne $null\""
+                "-ErrorAction SilentlyContinue).Count -gt 0\""
             )
             code, out, err = _capture(vm._ssh_argv(cfg, probe), timeout=60)
             if code != 0 or "True" not in out:
-                failures.append(
-                    f"no Windows-MCP listener on 127.0.0.1:{port} "
-                    f"(exit {code}: {(out + err).strip()[:200]})"
-                )
+                # NOT a failure. Windows-MCP is registered as a per-user LOGON
+                # task, so on a guest with no interactive desktop session it is
+                # installed and correct but has never started. Adoption
+                # continues; `./sc vm mcp up` reports readiness, and
+                # `windows_testing` documents re-running the install over exec
+                # once a console session exists.
+                warned.append(self._warn(
+                    f"no Windows-MCP listener on 127.0.0.1:{port} yet — the "
+                    "per-user login task has not run (no desktop session). "
+                    "`./sc vm mcp up` reports readiness; re-run "
+                    "`windows-mcp install` over `./sc vm exec` once the "
+                    "adopting account is logged in on the console"
+                ))
             else:
                 passed.append(f"MCP listener on 127.0.0.1:{port}")
 
@@ -858,7 +983,8 @@ else { Write-Output 'UNCHANGED' }
                 "verify", "adopt_verify_failed",
                 "; ".join(failures) + " — the vm block was NOT written",
             )
-        self._report("verify", "done", ", ".join(passed) + " all passed")
+        detail = ", ".join(passed) + " all passed" if passed else "nothing to check"
+        self._report("verify", "done", "; ".join([detail, *warned]))
 
     # -- 7. write block and broker ------------------------------------------
 
@@ -876,38 +1002,74 @@ else { Write-Output 'UNCHANGED' }
             "workspace": self.workspace,
         }
         try:
-            self.vm_block = vm.write(block)
-        except OSError as exc:
+            unchanged = vm.write_block_and_confirm(block)
+        except vm.BlockWriteError as exc:
             raise self._fail(
-                "write_block", "adopt_block_write_failed",
-                f"the vm block could not be saved: {exc}",
+                "write_block", "adopt_block_write_failed", str(exc),
             ) from exc
+        self.vm_block = block
         self._report(
-            "write_block", "done",
-            f"vm block saved for '{self.domain}' at {self.ssh_user}@{self.ssh_host}"
-            f":{self.ssh_port} · workspace {self.workspace}",
+            "write_block", "skipped" if unchanged else "done",
+            (
+                f"the saved vm block already describes '{self.domain}' at "
+                f"{self.ssh_user}@{self.ssh_host}:{self.ssh_port}"
+                if unchanged else
+                f"vm block saved for '{self.domain}' at "
+                f"{self.ssh_user}@{self.ssh_host}:{self.ssh_port} · "
+                f"workspace {self.workspace}"
+            ),
         )
+        self._phase_broker()
 
+    RESUME_BROKER = (
+        "the vm block IS written — start the broker with ./sc vm-broker-up "
+        "and re-run adopt"
+    )
+
+    def _phase_broker(self) -> None:
         ok, output = _dispatch_verb("vm-broker-up")
         if not ok:
             raise self._fail(
                 "broker", "adopt_broker_failed",
-                f"./sc vm-broker-up failed: {output.strip()[:300]} — the vm block "
-                "IS written; start the broker by hand and re-run adopt",
+                f"./sc vm-broker-up failed: {output.strip()[:300]} — "
+                + self.RESUME_BROKER,
             )
-        health = "reported no health"
-        try:
-            response = vm.broker_call("GET", "/health", None, timeout=5)
-            health = "healthy" if response.get("ok") is True else "unhealthy"
-        except (vm.BrokerConnectionError, vm.BrokerTimeoutError,
-                vm.BrokerResponseError) as exc:
-            health = f"health unreadable ({exc})"
-        self._report("broker", "done", f"vm-broker up · {health}")
+        # `vm-broker-up` nohups the broker and returns immediately, so its
+        # exit status only says the process was SPAWNED. The socket appears
+        # afterwards; reading health before it does reported "health
+        # unreadable ... No such file or directory" on a real adoption run.
+        deadline = time.monotonic() + BROKER_READY_WAIT
+        last = "the broker socket never appeared"
+        while True:
+            try:
+                response = vm.broker_call("GET", "/health", None, timeout=5)
+            except (vm.BrokerConnectionError, vm.BrokerTimeoutError,
+                    vm.BrokerResponseError) as exc:
+                last = str(exc)
+            else:
+                if response.get("ok") is True:
+                    self._report(
+                        "broker", "done", "vm-broker up · healthy"
+                    )
+                    return
+                last = f"the broker answered unhealthy: {response}"
+            if time.monotonic() >= deadline:
+                break
+            _sleep(BROKER_READY_INTERVAL)
+        raise self._fail(
+            "broker", "adopt_broker_failed",
+            f"the vm-broker did not answer within {BROKER_READY_WAIT}s of "
+            f"./sc vm-broker-up ({last}) — " + self.RESUME_BROKER,
+        )
 
     # -- 8. baseline ---------------------------------------------------------
 
     def phase_baseline(self) -> None:
-        result = vm.do_bake(self.snapshot)
+        # The block we just wrote, passed explicitly: `bake` otherwise re-reads
+        # the saved config, and an install whose instance.json has never been
+        # through `ports ensure` reads back nothing at all (see
+        # vm.write_block_and_confirm). Adoption already holds the truth.
+        result = vm.do_bake(self.snapshot, cfg=self.vm_block or None)
         if not result.get("ok"):
             raise self._fail(
                 "baseline", "adopt_baseline_failed",
@@ -941,11 +1103,19 @@ else { Write-Output 'UNCHANGED' }
             self.phase_write_block()
             self.phase_baseline()
         except AdoptFailure as failure:
-            return _error(failure.code, failure.message, self.phases)
+            return _error(
+                failure.code, failure.message, self.phases,
+                warnings=self.warnings, bootstrap_line=self.console_line,
+            )
         result = {
             "domain": self.domain,
             "phases": self.phases,
             "vm": self.vm_block,
+            # The guest console line is guidance, so it is printed on stderr
+            # and never on stdout - but a `--json` caller still needs it, so
+            # it rides in the result instead.
+            "bootstrap_line": self.console_line,
+            "warnings": list(self.warnings),
             "next_steps": [
                 "./sc vm start",
                 "./sc vm status",
@@ -961,12 +1131,23 @@ else { Write-Output 'UNCHANGED' }
         # Both are present so neither contract is broken.
         value["phases"] = self.phases
         value["vm"] = self.vm_block
+        value["warnings"] = list(self.warnings)
+        value["bootstrap_line"] = self.console_line
         return value
 
 
-def _error(code: str, message: str, phases: list[dict]) -> dict:
-    value = vm.operation_error(OPERATION, code, message, {"phases": phases})
+def _error(code: str, message: str, phases: list[dict], *,
+           warnings: list[str] | None = None,
+           bootstrap_line: str | None = None) -> dict:
+    details = {
+        "phases": phases,
+        "warnings": list(warnings or []),
+        "bootstrap_line": bootstrap_line or "",
+    }
+    value = vm.operation_error(OPERATION, code, message, details)
     value["phases"] = phases
+    value["warnings"] = list(warnings or [])
+    value["bootstrap_line"] = bootstrap_line or ""
     return value
 
 
@@ -1004,6 +1185,19 @@ def run_adopt(*, domain: str, ssh_user: str | None = None,
             "snapshot name must match [a-z0-9][a-z0-9-]{0,31}",
             [],
         )
+    if (not password_file and not str(saved.get("ssh_key_path") or "").strip()
+            and not _stdin_is_tty()):
+        # `getpass` falls back to reading stdin WITH ECHO when there is no
+        # terminal, which would put the guest password in a CI log or a pipe.
+        # Refuse BEFORE locating and waiting rather than fifteen minutes in.
+        #
+        # A saved `ssh_key_path` is the exemption: that is the re-run path,
+        # where the key phase skips and no password is ever read. `_password`
+        # re-checks anyway, so a saved key that has stopped working still
+        # refuses rather than echoing.
+        return _error(
+            "adopt_config_invalid", NO_TTY, [],
+        )
     return Adoption(
         domain=domain, ssh_user=user, snapshot=snapshot, libvirt_uri=libvirt_uri,
         ssh_host=ssh_host, password_file=password_file,
@@ -1030,9 +1224,13 @@ def human_report(value: dict) -> str:
     result = value["result"]
     block = result.get("vm") or {}
     lines.append("")
+    warnings = result.get("warnings") or []
     lines.append(
         f"VM adopted: {result['domain']} · baseline '{block.get('snapshot')}' · "
         "guest powered off"
+        + (f" · {len(warnings)} warning(s)" if warnings else "")
     )
+    for warning in warnings:
+        lines.append(f"  warning: {warning}")
     lines.append("Next: " + " · ".join(result["next_steps"]))
     return "\n".join(lines)
