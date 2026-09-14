@@ -387,6 +387,104 @@ class NamespaceAwareTtyTest(unittest.TestCase):
         self.assertEqual([], snap["orphaned_pids"])
 
 
+class EnterLeaseTest(unittest.TestCase):
+    """Issue #1599: a sandbox `enter` session outlives its `docker exec` client.
+    Its parent is the containerd shim and the shim keeps its pty alive, so
+    neither lineage signal can fire — only the released enter lease can."""
+
+    def _lease(self, td: str) -> Path:
+        lease = Path(td) / "enter-leases" / "abc123.lease"
+        lease.parent.mkdir()
+        lease.write_text("")
+        return lease
+
+    def test_released_lease_is_client_gone_despite_a_live_pty(self):
+        self.assertEqual("client-gone", shell_liveness.classify_orphan(
+            34816, 0, "/dev/pts/0", True, lease_held=False))
+
+    def test_held_lease_leaves_an_attached_session_alone(self):
+        self.assertIsNone(shell_liveness.classify_orphan(
+            34816, 0, "/dev/pts/0", True, lease_held=True))
+
+    def test_held_lock_reads_held(self):
+        import fcntl
+        with tempfile.TemporaryDirectory() as td:
+            lease = self._lease(td)
+            with open(lease, "w") as client:     # a distinct open file description
+                fcntl.flock(client, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                self.assertTrue(shell_liveness._lease_held(str(lease)))
+
+    def test_released_lock_reads_released(self):
+        with tempfile.TemporaryDirectory() as td:
+            self.assertFalse(shell_liveness._lease_held(str(self._lease(td))))
+
+    def test_probe_does_not_keep_the_lock(self):
+        import fcntl
+        with tempfile.TemporaryDirectory() as td:
+            lease = self._lease(td)
+            shell_liveness._lease_held(str(lease))
+            with open(lease, "w") as client:
+                fcntl.flock(client, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+    def test_pruned_lease_in_a_present_directory_is_released(self):
+        with tempfile.TemporaryDirectory() as td:
+            lease = self._lease(td)
+            lease.unlink()
+            self.assertFalse(shell_liveness._lease_held(str(lease)))
+
+    def test_unreachable_lease_directory_is_no_verdict(self):
+        with tempfile.TemporaryDirectory() as td:
+            missing = Path(td) / "not-mounted" / "abc123.lease"
+            self.assertIsNone(shell_liveness._lease_held(str(missing)))
+            self.assertIsNone(shell_liveness._lease_held(None))
+
+    def _proc(self, td: str, environ: bytes) -> Path:
+        """One harness pid shaped like the repro: parent outside the pid
+        namespace (ppid 0), a controlling pty that still exists."""
+        proc = Path(td) / "proc"
+        entry = proc / "4242"
+        (entry / "fd").mkdir(parents=True)
+        entry.joinpath("comm").write_text("claude\n")
+        entry.joinpath("stat").write_text("4242 (claude) S 0 4242 4242 34816 -1 0 0 0\n")
+        entry.joinpath("cwd").symlink_to(
+            shell_liveness.REPO_ROOT / ".sc-worktrees" / "rev1")
+        entry.joinpath("fd", "0").symlink_to("/dev/pts/0")
+        ns_root = Path(td) / "nsroot"
+        (ns_root / "dev" / "pts").mkdir(parents=True)
+        (ns_root / "dev" / "pts" / "0").write_text("")
+        entry.joinpath("root").symlink_to(ns_root)
+        entry.joinpath("environ").write_bytes(environ)
+        return proc
+
+    def _snapshot(self, proc: Path) -> dict:
+        with mock.patch.object(shell_liveness, "PROC", proc), \
+                mock.patch.object(shell_liveness, "harness_binaries",
+                                  return_value={"claude"}), \
+                mock.patch.object(shell_liveness, "_shell_labels",
+                                  return_value={}), \
+                mock.patch.object(shell_liveness, "_launch_claims",
+                                  return_value={}), \
+                mock.patch.object(shell_liveness, "_browser_processes",
+                                  return_value={}):
+            return shell_liveness.compute()
+
+    def test_compute_names_a_disconnected_enter_session(self):
+        with tempfile.TemporaryDirectory() as td:
+            lease = self._lease(td)
+            proc = self._proc(td, b"HOME=/x\0SC_ENTER_LEASE=" + str(lease).encode() + b"\0")
+            snap = self._snapshot(proc)
+        self.assertEqual([4242], snap["orphaned_pids"])
+        self.assertEqual("orphan", shell_liveness.session_state("REV1", snap))
+        self.assertEqual([{"pid": 4242, "orphaned": "client-gone"}],
+                         shell_liveness.holders("REV1", snap))
+
+    def test_compute_without_a_lease_keeps_the_old_verdict(self):
+        with tempfile.TemporaryDirectory() as td:
+            snap = self._snapshot(self._proc(td, b"HOME=/x\0"))
+        self.assertEqual([], snap["orphaned_pids"])
+        self.assertEqual("busy", shell_liveness.session_state("rev1", snap))
+
+
 class ZombieHarnessTest(unittest.TestCase):
     """A zombie keeps its comm, so it still LOOKS like a harness — but it has
     exited, holds no worktree, and its cwd link is empty. Counting it files it
@@ -850,7 +948,8 @@ class ComputeSmokeTest(unittest.TestCase):
         self.assertIsInstance(snap["orphaned_pids"], list)
         for p in snap["processes"]:
             self.assertIn("orphaned", p)
-            self.assertIn(p["orphaned"], (None, "tty-gone", "detached"))
+            self.assertIn(p["orphaned"],
+                          (None, "tty-gone", "detached", "client-gone"))
             if p["is_self"]:
                 # The scanning session is by definition not an orphan.
                 self.assertIsNone(p["orphaned"])

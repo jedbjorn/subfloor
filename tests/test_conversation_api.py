@@ -721,6 +721,34 @@ class ConversationResourceTest(ConversationApiCase):
         self.assertEqual(error["error"]["code"], "SHELL_BUSY")
         self.assertIn("live CLI session", error["error"]["message"])
 
+    def test_orphaned_cli_owner_refusal_names_the_pid_and_the_way_out(self) -> None:
+        # Issue #1599: a disconnected `enter` session held the slot and the
+        # refusal named nothing, so the operator had no pid to verify or kill.
+        with mock.patch.object(
+            conversation_routes,
+            "_wait_for_cli_release",
+            return_value="orphan",
+        ), mock.patch.object(
+            conversation_routes.run_mod.shell_liveness,
+            "holders",
+            return_value=[{"pid": 4242, "orphaned": "client-gone"}],
+        ):
+            status, _, error = self.request(
+                "POST",
+                "/api/conversations",
+                body={"shell_id": 1, "harness": "codex"},
+                key="orphan-owned-shell",
+            )
+        self.assertEqual(status, 409)
+        self.assertEqual(error["error"]["code"], "SHELL_BUSY")
+        message = error["error"]["message"]
+        self.assertIn("pid 4242 client-gone", message)
+        self.assertIn("kill 4242", message)
+        self.assertEqual(
+            error["error"]["details"]["holders"],
+            [{"pid": 4242, "orphaned": "client-gone"}],
+        )
+
     def test_admin_shell_create_is_cli_only_with_exact_commands(self) -> None:
         status, _, error = self.request(
             "POST",

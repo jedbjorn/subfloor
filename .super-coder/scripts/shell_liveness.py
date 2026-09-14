@@ -40,11 +40,20 @@ host — the session survives, holds its shell's one-session slot, and blocks
 every headless boot of that shell until someone kills it by hand. Each process
 is therefore classified (`orphaned`): 'tty-gone' (had a controlling terminal;
 the pty vanished — the window closed under it), 'detached' (no controlling
-TTY and reparented to init — its spawning session is gone), or None (normal).
+TTY and reparented to init — its spawning session is gone), 'client-gone' (its
+enter lease was released — the `docker exec` client that attached it is gone),
+or None (normal).
 "Vanished" is asked in the PROCESS's mount namespace (/proc/<pid>/root<tty>),
 never the scanner's: a container-hosted session's pty lives in the container's
 devpts, so testing the bare path from the host answers about a different device
 and turns live work into a false orphan.
+'client-gone' exists because a sandbox `enter` session is invisible to both
+lineage signals (issue #1599): its parent is the containerd shim, never init,
+and the shim keeps the container's pty open after the `docker exec` client
+disconnects, so the device never vanishes. The host client therefore holds a
+flock on a lease file in the shared checkout (dispatch.sh sc_enter_lease) and
+names it in the session's SC_ENTER_LEASE; the kernel drops that lock the moment
+the client dies, from any vantage that shares the bind mount.
 Classification is reporting only — an orphan may still be mid-work (a merge,
 a suite), so nothing here kills anything. The consumer (`sc run`'s guard, the
 operator) verifies idleness first: `ps -o etime=,stat= -p <pid>`, no child
@@ -80,6 +89,7 @@ Run standalone:
 """
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 import sqlite3
@@ -251,9 +261,51 @@ def _tty_exists(pid: int, tty_fd: "str | None") -> "bool | None":
     return True
 
 
+def _enter_lease(pid: int) -> str | None:
+    """The SC_ENTER_LEASE path this process was started with, from
+    /proc/<pid>/environ. None when absent or unreadable (foreign user)."""
+    try:
+        environ = (PROC / str(pid) / "environ").read_bytes()
+    except OSError:
+        return None
+    for item in environ.split(b"\0"):
+        if item.startswith(b"SC_ENTER_LEASE="):
+            return item.split(b"=", 1)[1].decode(errors="replace") or None
+    return None
+
+
+def _lease_held(lease: str | None) -> bool | None:
+    """Does the client that attached this session still hold its enter lease?
+
+    Probed with a non-blocking SHARED flock that is released on close: it
+    conflicts only with the client's exclusive lock, never with another probe.
+    A missing lease file inside a present lease directory was pruned by a later
+    enter, which prunes only a lease it could lock — its client is gone. Every
+    other failure is no verdict (None), never an orphan."""
+    if not lease:
+        return None
+    path = Path(lease)
+    try:
+        fd = os.open(path, os.O_RDONLY)
+    except FileNotFoundError:
+        return False if path.parent.is_dir() else None
+    except OSError:
+        return None
+    try:
+        fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+    except BlockingIOError:
+        return True
+    except OSError:
+        return None
+    finally:
+        os.close(fd)
+    return False
+
+
 def classify_orphan(tty_nr: "int | None", ppid: "int | None",
                     tty_fd: "str | None",
-                    tty_exists: "bool | None" = None) -> "str | None":
+                    tty_exists: "bool | None" = None,
+                    lease_held: "bool | None" = None) -> "str | None":
     """Orphan verdict for one harness process — pure, injectable for tests.
 
     'tty-gone'  — has (had) a controlling TTY but the pty device is gone: the
@@ -262,6 +314,10 @@ def classify_orphan(tty_nr: "int | None", ppid: "int | None",
                   it (a headless boot's parent, a dead terminal's shell) is
                   gone. A NORMAL headless session still has a live parent, so
                   ppid==1 is the discriminator.
+    'client-gone' — its enter lease was released: the `docker exec` client
+                  that attached it is gone, though the shim keeps its pty and
+                  parentage looking normal. Positive evidence, so it is asked
+                  first.
     None        — attached and normal, or not enough signal to say otherwise
                   (conservative: never call an orphan on missing data).
 
@@ -271,6 +327,8 @@ def classify_orphan(tty_nr: "int | None", ppid: "int | None",
     invitation to go and test the path in whatever namespace we happen to
     occupy, which is the bug this signature now forecloses.
     """
+    if lease_held is False:
+        return "client-gone"
     if tty_nr is None:
         return None
     if tty_nr == 0:
@@ -289,7 +347,8 @@ def _orphan_verdict(pid: int) -> "str | None":
     The seam that keeps classify_orphan pure and namespace-blind."""
     tty_fd = _tty_fd(pid)
     return classify_orphan(_tty_nr(pid), _ppid(pid), tty_fd,
-                           _tty_exists(pid, tty_fd))
+                           _tty_exists(pid, tty_fd),
+                           _lease_held(_enter_lease(pid)))
 
 
 def _self_harness_pid(harness_pids: set[int]) -> int | None:
@@ -566,6 +625,16 @@ def orphan_split(shortname: str, snap: dict) -> "tuple[list[int], list[int]]":
              if p.get("orphaned") and not p.get("claimed")])
 
 
+def holders(shortname: str, snap: dict) -> list[dict]:
+    """[{pid, orphaned}] for every process holding one shell's worktree, for a
+    refusal that must NAME what holds the slot. `orphaned` is None for a
+    claimed pid, exactly as orphan_split reads it."""
+    return [{"pid": p["pid"],
+             "orphaned": None if p.get("claimed") else p.get("orphaned")}
+            for p in snap.get("processes", [])
+            if (p.get("shortname") or "").lower() == shortname.lower()]
+
+
 def browser_sessions(shortname: str, snap: dict) -> list[dict]:
     """This shell's browser-owned worktree processes —
     [{pid, conversation_id, lingering}] — for a caller that must NAME them.
@@ -652,7 +721,7 @@ def _print_text(d: dict) -> None:
               f"INDETERMINATE; do not assume all-clear.")
     if d.get("orphaned_pids"):
         print(f"\n⚠ {len(d['orphaned_pids'])} orphaned session(s): pids "
-              f"{d['orphaned_pids']} — terminal closed / parent gone. Each "
+              f"{d['orphaned_pids']} — terminal or client gone / parent gone. Each "
               f"holds its shell's one-session slot. Verify idle "
               f"(`ps -o etime=,stat= -p <pid>`; no busy children), then "
               f"`kill <pid>`. An orphan can still be mid-work — never kill "

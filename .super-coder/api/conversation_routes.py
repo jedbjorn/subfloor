@@ -915,11 +915,30 @@ def _shell_busy_error(shell, shell_id: int, state: str, action: str) -> ApiError
     details = {"shell_id": shell_id, "state": state}
     session = next(iter(_browser_sessions(shell)), None) if state == "browser" else None
     if session is None:
+        holders = run_mod.shell_liveness.holders(
+            shell["shortname"] or "", run_mod.shell_liveness.compute()
+        )
+        details["holders"] = holders
+        named = ", ".join(
+            f"pid {h['pid']}" + (f" {h['orphaned']}" if h["orphaned"] else "")
+            for h in holders
+        )
+        if state == "orphan" and holders:
+            first = holders[0]["pid"]
+            return ApiError(
+                409,
+                "SHELL_BUSY",
+                f"shell {shell['shortname']!r} is held by an orphaned CLI "
+                f"session ({named}) whose terminal or client is gone; verify "
+                f"it is idle (`ps -o etime=,stat= -p {first}`; no busy "
+                f"children), `kill {first}`, then retry {action}",
+                details,
+            )
         return ApiError(
             409,
             "SHELL_BUSY",
-            f"shell {shell['shortname']!r} has a live CLI session; "
-            f"close it before {action}",
+            f"shell {shell['shortname']!r} has a live CLI session"
+            f"{f' ({named})' if named else ''}; close it before {action}",
             details,
         )
     details["conversation_id"] = session.get("conversation_id")
