@@ -8,6 +8,12 @@ Excluded, deliberately: `assets/skill_tombstones.json` (the permanent name
 reservation registry, which must keep naming the retired skills), the
 migration ledger (historical SQL is never rewritten), and the tests
 themselves.
+
+The two exceptions to "the migration ledger is excluded" are the guest scripts
+under `assets/winbox/` - shipped surfaces like any other - and the trailing
+reseed `0264`, which carries the CURRENT skill bodies verbatim and would
+therefore reintroduce a retired name into every fork's database. The historical
+migrations before it stay out.
 """
 
 from __future__ import annotations
@@ -26,9 +32,15 @@ SEARCH_TREES = (
     ENGINE / "api",
     ENGINE / "ui",
     ENGINE / "assets" / "skills",
+    ENGINE / "assets" / "winbox",
     ENGINE / "docs",
 )
-SEARCH_FILES = (ENGINE / "scripts" / "dispatch.sh",)
+SEARCH_FILES = (
+    ENGINE / "scripts" / "dispatch.sh",
+    # Not historical SQL: 0264 carries the live skill bodies, so a retired
+    # name here reaches every fork's database on the next migrate.
+    ENGINE / "migrations" / "0264_reseed_winbox_adoption_skills.sql",
+)
 
 EXCLUDED = {
     (ENGINE / "assets" / "skill_tombstones.json").resolve(),

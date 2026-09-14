@@ -1135,7 +1135,9 @@ configured baseline is refused; redefine it with `bake` instead), `bake [<name>]
 baseline; `./sc vm-bake` is an alias), and `reset [<name>] --off|--running` for a
 named snapshot. Exactly one of `--off` and `--running` is required on every
 reset. `push` sources and `pull` destinations must sit inside the repo or
-`.sc-state/local/`. Add `--json` to any verb for one result object.
+`.sc-state/local/`, and never inside `.sc-state/local/vm/` (the host''s key and
+host-key pin live there); a pull destination inside `.super-coder/` or `.git/`
+is refused too. Add `--json` to any verb for one result object.
 
 Posture 1''s VM is a disposable test box, so the lifecycle verbs above are
 genuinely yours to use — snapshot, bake and reset included (decision #372).
@@ -1177,7 +1179,17 @@ the code; never repair the transport yourself.
 | `adopt_guest_not_found` | no address resolved from DHCP, ARP or `--ssh-host` | report; the FnB passes `--ssh-host` |
 | `adopt_ssh_timeout` | the guest never answered on TCP 22 in the wait window | the bootstrap line has not run in the guest yet |
 | `adopt_key_install_failed` | the password-authenticated key install did not take | report; key material is the FnB''s |
+| `adopt_harden_failed` | `PasswordAuthentication no` did not take, or sshd did not come back | report; the FnB owns the guest''s sshd |
+| `adopt_host_key_changed` | the guest''s host key differs from the pinned one | report the message verbatim: it names the pin file and the `rm` that clears it. Never delete it yourself |
 | `adopt_provision_failed`, `adopt_verify_failed` | a provisioning step or a declared check failed | read the named step; fix `.subfloor/winbox.json` or the guest, re-run adopt |
+| `adopt_config_invalid` | a flag or the saved block is unusable, or there is no TTY for the password prompt | report; adopt is the FnB''s command |
+| `adopt_block_write_failed`, `adopt_baseline_failed` | the block did not save, or the baseline snapshot was not taken | report |
+| `adopt_broker_failed` | adopt could not bring the broker up. The `vm` block IS written | the resume is `./sc vm-broker-up` then adopt again; ask the FnB |
+| `push_failed`, `pull_failed` | `scp` itself failed | read the output; report, do not retry blindly |
+| `pull_source_invalid`, `pull_destination_invalid`, `push_source_invalid` | a transfer path was empty | pass both paths |
+| `scp_unsupported` | the host''s `scp` predates OpenSSH 8.7 and rejects `-s` | report; the FnB upgrades the host''s OpenSSH client |
+| `bake_config_write_failed` | the snapshot was baked, the block was not updated to name it | report; the snapshot exists, the baseline pointer does not |
+| `<operation>_timeout` | the broker call exceeded that verb''s budget (`exec_timeout`, `push_timeout`, `bake_timeout`, …) | the work may still be running — read `status` before retrying |
 
 Never hand-install keys, aliases, or known-hosts entries anywhere, and never
 open a raw `ssh` to a target the broker serves — key material stays host-side
@@ -2691,7 +2703,7 @@ two commands. First, in an elevated PowerShell on the guest console:
 powershell -ExecutionPolicy Bypass -Command "[Net.ServicePointManager]::SecurityProtocol=''Tls12''; irm https://raw.githubusercontent.com/jedbjorn/subfloor/<ref>/.super-coder/assets/winbox/bootstrap.ps1 | iex"
 ```
 
-`<ref>` is the engine''s pinned commit — `.super-coder/engine.ref` when that file
+`<ref>` is the engine''s pinned commit — `.sc-state/engine.ref` when that file
 exists, else `main`; `./sc vm adopt` prints the exact line. Then, on the host:
 
 ```bash
@@ -2701,11 +2713,10 @@ exists, else `main`; `./sc vm adopt` prints the exact line. Then, on the host:
 Adopt locates the guest, installs a host-held key behind one password prompt,
 turns password auth off, pins the host key, provisions, verifies, writes the
 `vm` block, brings the broker up and takes the baseline snapshot. The key is
-generated and kept on the host and never enters a shell (decision #353); the
-password is read from the operator''s TTY, never on argv, never persisted. Every
-phase is idempotent, so re-running adopt after a toolchain change skips what is
-already satisfied. `./sc vm init` still hand-links a guest prepared by other
-means.
+generated on the host and never handed to a shell (decision #353); the password
+is read from the operator''s TTY, never on argv, never persisted. Every phase is
+idempotent, so re-running adopt after a toolchain change skips what is already
+satisfied. `./sc vm init` still hand-links a guest prepared by other means.
 
 Provisioning reads the fork-tracked `.subfloor/winbox.json`. Every key is
 optional:
@@ -2724,8 +2735,11 @@ Defaults: `winget_manifest` is `winget-manifest.json` at the repo root when that
 file exists, else none; `checks` empty; `mcp` true; `mcp_port` 8000; `workspace`
 `C:\SubfloorTest`. The declared `checks` are also what `./sc vm status` runs as
 the toolchain check — none declared means the check passes with "no checks
-declared". Changing the fork''s toolchain means editing `winbox.json` and running
-`./sc vm adopt` again, or doing it by hand over `./sc vm exec` and then
+declared". Each entry is a command line run through the guest''s `cmd.exe`, so it
+must not contain a double quote: cmd re-parses the line and the quotes arrive as
+literal characters. Anything needing quotes goes in a `.cmd` file you push and
+name instead. Changing the fork''s toolchain means editing `winbox.json` and
+running `./sc vm adopt` again, or doing it by hand over `./sc vm exec` and then
 `./sc vm bake`.
 
 ## Authority
@@ -2757,7 +2771,11 @@ The command file holds the exact text the guest receives; a typical body is
 `powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File C:\SubfloorTest\run.ps1`
 after `./sc vm push run.ps1` lands it in the guest workspace. Use Windows paths
 on the guest side and `--json` when you need `exit_code`, `stdout`, and `stderr`
-separately. Guest console output is decoded lossily; base64-encode guest-side
+separately. A guest path for `push` and `pull` may be written with either
+separator — `C:\SubfloorTest\out.bin` or `C:/SubfloorTest/out.bin` — because
+the engine normalises it for scp''s SFTP mode; `exec` command text is yours and
+is passed through untouched. `push` and `pull` will not read from or write into
+`.sc-state/local/vm/`, and will not write into `.super-coder/` or `.git/`. Guest console output is decoded lossily; base64-encode guest-side
 (`[Convert]::ToBase64String(...)`) when a result must be byte-exact, and write
 large results to a file and `./sc vm pull` it rather than through stdout.
 
@@ -2784,9 +2802,12 @@ verify each step with a capture, and `mcp down` before `reset`.
 
 Provisioning installs the guest side as the per-user login task
 `windows-mcp-server`, listening on the guest''s loopback only; the tunnel is the
-only route in. When `./sc vm mcp up` reports no listener, the task has not run —
-usually no interactive desktop session. Log the adopting account in on the
-console, or re-run the install yourself over exec:
+only route in. Because it is a LOGIN task, a guest with no interactive desktop
+session has it installed and correct and never started — adoption reports that
+as a warning and finishes, so a freshly adopted guest with no listener is
+expected, not broken. `./sc vm mcp up` is what reports readiness. When it finds
+no listener, log the adopting account in on the console, or re-run the install
+yourself over exec:
 
 ```bash
 ./sc vm exec -- windows-mcp install --transport streamable-http --host 127.0.0.1 --port <mcp_port>

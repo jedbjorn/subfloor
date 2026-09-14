@@ -21,7 +21,7 @@ two commands. First, in an elevated PowerShell on the guest console:
 powershell -ExecutionPolicy Bypass -Command "[Net.ServicePointManager]::SecurityProtocol='Tls12'; irm https://raw.githubusercontent.com/jedbjorn/subfloor/<ref>/.super-coder/assets/winbox/bootstrap.ps1 | iex"
 ```
 
-`<ref>` is the engine's pinned commit — `.super-coder/engine.ref` when that file
+`<ref>` is the engine's pinned commit — `.sc-state/engine.ref` when that file
 exists, else `main`; `./sc vm adopt` prints the exact line. Then, on the host:
 
 ```bash
@@ -31,11 +31,10 @@ exists, else `main`; `./sc vm adopt` prints the exact line. Then, on the host:
 Adopt locates the guest, installs a host-held key behind one password prompt,
 turns password auth off, pins the host key, provisions, verifies, writes the
 `vm` block, brings the broker up and takes the baseline snapshot. The key is
-generated and kept on the host and never enters a shell (decision #353); the
-password is read from the operator's TTY, never on argv, never persisted. Every
-phase is idempotent, so re-running adopt after a toolchain change skips what is
-already satisfied. `./sc vm init` still hand-links a guest prepared by other
-means.
+generated on the host and never handed to a shell (decision #353); the password
+is read from the operator's TTY, never on argv, never persisted. Every phase is
+idempotent, so re-running adopt after a toolchain change skips what is already
+satisfied. `./sc vm init` still hand-links a guest prepared by other means.
 
 Provisioning reads the fork-tracked `.subfloor/winbox.json`. Every key is
 optional:
@@ -54,8 +53,11 @@ Defaults: `winget_manifest` is `winget-manifest.json` at the repo root when that
 file exists, else none; `checks` empty; `mcp` true; `mcp_port` 8000; `workspace`
 `C:\SubfloorTest`. The declared `checks` are also what `./sc vm status` runs as
 the toolchain check — none declared means the check passes with "no checks
-declared". Changing the fork's toolchain means editing `winbox.json` and running
-`./sc vm adopt` again, or doing it by hand over `./sc vm exec` and then
+declared". Each entry is a command line run through the guest's `cmd.exe`, so it
+must not contain a double quote: cmd re-parses the line and the quotes arrive as
+literal characters. Anything needing quotes goes in a `.cmd` file you push and
+name instead. Changing the fork's toolchain means editing `winbox.json` and
+running `./sc vm adopt` again, or doing it by hand over `./sc vm exec` and then
 `./sc vm bake`.
 
 ## Authority
@@ -87,7 +89,11 @@ The command file holds the exact text the guest receives; a typical body is
 `powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File C:\SubfloorTest\run.ps1`
 after `./sc vm push run.ps1` lands it in the guest workspace. Use Windows paths
 on the guest side and `--json` when you need `exit_code`, `stdout`, and `stderr`
-separately. Guest console output is decoded lossily; base64-encode guest-side
+separately. A guest path for `push` and `pull` may be written with either
+separator — `C:\SubfloorTest\out.bin` or `C:/SubfloorTest/out.bin` — because
+the engine normalises it for scp's SFTP mode; `exec` command text is yours and
+is passed through untouched. `push` and `pull` will not read from or write into
+`.sc-state/local/vm/`, and will not write into `.super-coder/` or `.git/`. Guest console output is decoded lossily; base64-encode guest-side
 (`[Convert]::ToBase64String(...)`) when a result must be byte-exact, and write
 large results to a file and `./sc vm pull` it rather than through stdout.
 
@@ -114,9 +120,12 @@ verify each step with a capture, and `mcp down` before `reset`.
 
 Provisioning installs the guest side as the per-user login task
 `windows-mcp-server`, listening on the guest's loopback only; the tunnel is the
-only route in. When `./sc vm mcp up` reports no listener, the task has not run —
-usually no interactive desktop session. Log the adopting account in on the
-console, or re-run the install yourself over exec:
+only route in. Because it is a LOGIN task, a guest with no interactive desktop
+session has it installed and correct and never started — adoption reports that
+as a warning and finishes, so a freshly adopted guest with no listener is
+expected, not broken. `./sc vm mcp up` is what reports readiness. When it finds
+no listener, log the adopting account in on the console, or re-run the install
+yourself over exec:
 
 ```bash
 ./sc vm exec -- windows-mcp install --transport streamable-http --host 127.0.0.1 --port <mcp_port>

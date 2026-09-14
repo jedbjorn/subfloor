@@ -3395,8 +3395,10 @@ def main(argv: list[str]) -> int:
     elif mode == "capture":
         print(json.dumps(do_capture(" ".join(argv[1:]) or None)))
     elif mode == "bake":
-        # `./sc vm-bake` alias — same code as the `bake` client verb, which
-        # reaches do_bake through the broker.
+        # `./sc vm-bake` — the HOST-DIRECT bake. Same operation as the `bake`
+        # client verb, but reached in this process instead of through the
+        # broker, so it still works when the broker is down. The client verb
+        # is the shell-legal route and the one to use normally.
         r = do_bake(argv[1] if len(argv) > 1 else None)
         print(json.dumps(r))
         return 0 if r["ok"] else 1
