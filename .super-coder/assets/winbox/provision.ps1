@@ -148,12 +148,47 @@ try {
 # --- Step 2: winget presence ------------------------------------------------
 
 Update-PathFromRegistry
+$wingetNotes = @()
 $wingetPresent = Test-CommandPresent -Name 'winget'
+if (-not $wingetPresent) {
+    # App Installer is a per-user Store package. An account that has never
+    # signed in interactively (observed on halo: a freshly created local admin
+    # adopted over SSH) has the package provisioned on the machine but no
+    # winget.exe execution alias yet, so 'winget' is not recognised even though
+    # the package is installed. Re-registering the package for this user
+    # creates the alias without the Store or an MSIX download.
+    $pkg = Get-AppxPackage -Name 'Microsoft.DesktopAppInstaller' -ErrorAction SilentlyContinue | Select-Object -First 1
+    if (-not $pkg) {
+        $pkg = Get-AppxPackage -AllUsers -Name 'Microsoft.DesktopAppInstaller' -ErrorAction SilentlyContinue | Select-Object -First 1
+    }
+    if ($pkg -and $pkg.InstallLocation) {
+        $manifest = Join-Path $pkg.InstallLocation 'AppxManifest.xml'
+        try {
+            Add-AppxPackage -DisableDevelopmentMode -Register $manifest -ErrorAction Stop
+            $wingetNotes += ('re-registered App Installer ' + $pkg.Version + ' for ' + $env:USERNAME)
+        } catch {
+            $wingetNotes += ('App Installer re-register failed: ' + $_.Exception.Message)
+        }
+        $aliasDir = Join-Path $env:LOCALAPPDATA 'Microsoft\WindowsApps'
+        if ($env:Path -notlike ('*' + $aliasDir + '*')) { $env:Path = $aliasDir + ';' + $env:Path }
+        for ($attempt = 1; $attempt -le 6; $attempt++) {
+            if (Test-Path -LiteralPath (Join-Path $aliasDir 'winget.exe')) { break }
+            Start-Sleep -Seconds 5
+        }
+        $wingetPresent = Test-CommandPresent -Name 'winget'
+    } else {
+        $wingetNotes += 'App Installer package not present on this machine'
+    }
+}
 if ($wingetPresent) {
     $wingetVersion = Invoke-Capture -CommandLine 'winget --version'
-    Add-StepResult -Name 'winget' -Ok $true -Detail ("present " + (Get-Truncated -Text $wingetVersion.Output))
+    $detail = 'present ' + (Get-Truncated -Text $wingetVersion.Output)
+    if ($wingetNotes.Count -gt 0) { $detail = $detail + '; ' + ($wingetNotes -join '; ') }
+    Add-StepResult -Name 'winget' -Ok $true -Detail $detail
 } else {
-    Add-StepResult -Name 'winget' -Ok $false -Detail 'winget not found. Install App Installer from the Microsoft Store (https://aka.ms/getwinget); the engine does not install winget because it needs the Store or an MSIX bundle.'
+    $detail = 'winget not found. Install App Installer from the Microsoft Store (https://aka.ms/getwinget); the engine does not install winget because it needs the Store or an MSIX bundle.'
+    if ($wingetNotes.Count -gt 0) { $detail = $detail + ' (' + ($wingetNotes -join '; ') + ')' }
+    Add-StepResult -Name 'winget' -Ok $false -Detail $detail
 }
 
 # --- Step 3: winget manifest import -----------------------------------------
