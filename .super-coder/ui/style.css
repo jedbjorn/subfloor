@@ -397,9 +397,10 @@ body.interface-view main {
 .chat-state.state-error { color: #ef7d86; border-color: rgba(239,125,134,.45); }
 .chat-state.state-idle { color: var(--ok); border-color: rgba(76,175,125,.4); }
 .chat-state.state-closed { opacity: .6; }
-/* A lingering process outranks the chat's own state: it is the live fact. */
+/* A lingering process outranks the chat's own state: it is the live fact, and
+   it is work (background tasks), so it reads like a running turn. */
 .chat-state.lingering {
-  color: var(--warn); border-color: rgba(212,145,74,.45); text-transform: none;
+  color: var(--accent); border-color: rgba(110,168,254,.45); text-transform: none;
 }
 .chat-busy-open {
   background: none; border: 0; padding: 0; font: inherit; color: var(--accent);

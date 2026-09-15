@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 import asyncio
+import io
 import json
 import sqlite3
 import sys
 import tempfile
 import time
 import unittest
-from contextlib import closing
+from contextlib import closing, redirect_stdout
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -2491,6 +2492,87 @@ class ConversationResourceTest(ConversationApiCase):
         self.assertEqual(
             json.loads(events[0]["payload"]), {"lingering": True, "pid": 4242}
         )
+
+    def test_stop_reaches_the_lingering_process_past_a_deferred_run(self) -> None:
+        # halo DEV2: a wake queued run 3770, deferred SHELL_LINGERING behind
+        # pid 43329. Stop found that leased run first — no process of its own —
+        # and interrupted it, so the process holding the chat never heard Stop.
+        conversation_id = self.create(key="linger-deferred")["conversation_id"]
+        lingering_run = self.seed_lingering_process(conversation_id)
+        with closing(self.connect()) as con:
+            message_id = int(con.execute(
+                "INSERT INTO conversation_messages "
+                "(conversation_id,sender_kind,sender_ref,message_kind,body,"
+                "idempotency_key,request_hash,state) "
+                "VALUES (?,'engine','wake','prompt','wake','deferred','h2','running')",
+                (conversation_id,),
+            ).lastrowid)
+            deferred_run = int(con.execute(
+                "INSERT INTO conversation_runs "
+                "(conversation_id,shell_id,trigger_message_id,lease_owner,"
+                "lease_expires_at,state) "
+                "VALUES (?,1,?,'fixture','2026-09-04 11:00:00','leased')",
+                (conversation_id, message_id),
+            ).lastrowid)
+            con.commit()
+        with (
+            mock.patch.object(
+                conversation_routes.active_chat_registry,
+                "has_live_process",
+                return_value=True,
+            ),
+            mock.patch.object(conversation_routes, "_SIGNAL_GROUP") as signal_group,
+            mock.patch.object(conversation_routes, "_request_interrupt") as broker,
+        ):
+            status, _, receipt = self.request(
+                "POST",
+                f"/api/conversations/{conversation_id}/interruptions",
+                body={},
+                key="linger-deferred-stop",
+            )
+        self.assertEqual(status, 202, receipt)
+        self.assertNotEqual(receipt["run_id"], deferred_run)
+        self.assertEqual(receipt["run_id"], lingering_run)
+        signal_group.assert_called_once_with(4200, conversation_routes.signal.SIGINT)
+        broker.assert_not_called()
+
+    def close(self, conversation_id: str):
+        _, _, latest = self.request("GET", f"/api/conversations/{conversation_id}")
+        return self.request(
+            "PATCH",
+            f"/api/conversations/{conversation_id}",
+            body={"version": latest["version"], "state": "closed"},
+        )
+
+    def test_close_kills_the_lingering_process_it_unlinks(self) -> None:
+        conversation_id = self.create(key="linger-close")["conversation_id"]
+        self.seed_lingering_process(conversation_id)
+        liveness = conversation_routes.run_mod.shell_liveness
+        with mock.patch.object(liveness, "terminate", return_value=[]) as kill:
+            status, _, closed = self.close(conversation_id)
+        self.assertEqual(status, 200, closed)
+        self.assertEqual(closed["state"], "closed")
+        kill.assert_called_once_with([(4242, 990)])
+
+    def test_close_without_a_process_kills_nothing(self) -> None:
+        conversation_id = self.create(key="plain-close")["conversation_id"]
+        liveness = conversation_routes.run_mod.shell_liveness
+        with mock.patch.object(liveness, "terminate") as kill:
+            status, _, closed = self.close(conversation_id)
+        self.assertEqual(status, 200, closed)
+        kill.assert_not_called()
+
+    def test_close_still_closes_when_the_kill_cannot_signal(self) -> None:
+        conversation_id = self.create(key="linger-close-eperm")["conversation_id"]
+        self.seed_lingering_process(conversation_id)
+        liveness = conversation_routes.run_mod.shell_liveness
+        with mock.patch.object(
+            liveness, "terminate", side_effect=PermissionError(1, "Operation not permitted")
+        ), redirect_stdout(io.StringIO()) as out:
+            status, _, closed = self.close(conversation_id)
+        self.assertEqual(status, 200, closed)
+        self.assertEqual(closed["state"], "closed")
+        self.assertIn("left to the reaper", out.getvalue())
 
     def test_interrupting_an_idle_chat_without_a_process_stays_terminal(self) -> None:
         conversation_id = self.create(key="linger-dead")["conversation_id"]
