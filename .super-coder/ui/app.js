@@ -101,13 +101,15 @@ function requestKey() {
 }
 
 async function chatApi(path, method = "GET", body, idempotencyKey) {
-  const headers = body === undefined ? {} : { "Content-Type": "application/json" };
+  // A Blob (a dropped image) travels as raw bytes; everything else is JSON.
+  const raw = body instanceof Blob;
+  const headers = body === undefined || raw ? {} : { "Content-Type": "application/json" };
   if (idempotencyKey) headers["Idempotency-Key"] = idempotencyKey;
   let response;
   try {
     response = await fetch("/api" + path, {
       method, headers,
-      body: body === undefined ? undefined : JSON.stringify(body),
+      body: body === undefined || raw ? body : JSON.stringify(body),
     });
   } catch (cause) {
     const error = new Error("The conversation service could not be reached.");
@@ -125,6 +127,22 @@ async function chatApi(path, method = "GET", body, idempotencyKey) {
     throw error;
   }
   return data;
+}
+
+// The API refuses request bodies over 8 MiB; only an image above that is
+// re-encoded (downscaled JPEG), so ordinary screenshots arrive byte-exact.
+const CHAT_IMAGE_MAX_BYTES = 8 * 1024 * 1024;
+const CHAT_IMAGE_MAX_EDGE = 2400;
+async function chatFitImage(file) {
+  if (file.size <= CHAT_IMAGE_MAX_BYTES) return file;
+  const bitmap = await createImageBitmap(file);
+  const scale = Math.min(1, CHAT_IMAGE_MAX_EDGE / Math.max(bitmap.width, bitmap.height));
+  const canvas = el("canvas", {
+    width: Math.round(bitmap.width * scale),
+    height: Math.round(bitmap.height * scale),
+  });
+  canvas.getContext("2d").drawImage(bitmap, 0, 0, canvas.width, canvas.height);
+  return new Promise((resolve) => canvas.toBlob(resolve, "image/jpeg", 0.9));
 }
 
 function toast(msg) {
@@ -5040,6 +5058,7 @@ async function chatRenderOpen(
   };
   let streamStatus = "connecting";
   let stopRequest = null;
+  let uploading = 0;
   let reconcilePromise = null;
   let reconcileFailures = 0;
   let currentMode = CHAT_MODES.includes(chatRouteMode) ? chatRouteMode : "chat";
@@ -5309,7 +5328,7 @@ async function chatRenderOpen(
     composer.disabled = Boolean(unavailableReason)
       || closing || (closed && !reopenable);
     send.disabled = Boolean(unavailableReason)
-      || closing || (closed && !reopenable);
+      || closing || (closed && !reopenable) || uploading > 0;
     // A lingering child is still working even though the turn reads finished,
     // so Stop stays the way out of it.
     const lingering = Boolean(conversation.process?.lingering);
@@ -5453,6 +5472,57 @@ async function chatRenderOpen(
     }
   };
   headerStop.onclick = () => stop.click();
+  // Dropped or pasted images upload to the engine host's shared/chat-uploads
+  // and enter the message as a plain path, so every harness reads them alike
+  // and the bytes ride whatever origin serves this page (tunnel included).
+  async function uploadImages(files) {
+    const images = [...files].filter((file) => file.type.startsWith("image/"));
+    if (!images.length || composer.disabled) return;
+    uploading += 1;
+    pending.hidden = false;
+    pending.textContent = "uploading image…";
+    paint();
+    try {
+      for (const file of images) {
+        const { path } = await chatApi(
+          `/conversations/${conversation.conversation_id}/uploads`,
+          "POST", await chatFitImage(file));
+        const at = composer.selectionEnd ?? composer.value.length;
+        const before = composer.value.slice(0, at);
+        const gap = before && !/\s$/.test(before) ? " " : "";
+        composer.value = `${before}${gap}[image: ${path}] ${composer.value.slice(at)}`;
+      }
+      pending.hidden = true;
+    } catch (error) {
+      pending.textContent = `${error.code} — image not uploaded`;
+      toast(`${error.code}: ${error.message}`);
+    } finally {
+      uploading -= 1;
+      composer.focus();
+      paint();
+    }
+  }
+  const hasFiles = (event) => [...(event.dataTransfer?.types || [])].includes("Files");
+  composerRow.ondragover = (event) => {
+    if (!hasFiles(event)) return;
+    event.preventDefault();
+    composerRow.classList.add("drop-target");
+  };
+  composerRow.ondragleave = (event) => {
+    if (!composerRow.contains(event.relatedTarget)) composerRow.classList.remove("drop-target");
+  };
+  composerRow.ondrop = (event) => {
+    if (!hasFiles(event)) return;
+    event.preventDefault();
+    composerRow.classList.remove("drop-target");
+    uploadImages(event.dataTransfer.files);
+  };
+  composer.onpaste = (event) => {
+    const files = [...(event.clipboardData?.files || [])];
+    if (!files.some((file) => file.type.startsWith("image/"))) return;
+    event.preventDefault();
+    uploadImages(files);
+  };
   composer.onkeydown = (event) => {
     if (event.key === "Enter" && !event.shiftKey) {
       event.preventDefault();

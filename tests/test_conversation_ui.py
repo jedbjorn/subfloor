@@ -1586,3 +1586,51 @@ const holders = [{pid: 4242, start_ticks: 990, orphaned: "client-gone", claimed:
         "prompts": 2,
         "warned": True,
     }
+
+
+def test_dropped_images_upload_raw_and_enter_the_message_as_paths():
+    helpers = APP[
+        APP.index("async function chatApi("):
+        APP.index("function toast(msg)")
+    ]
+    script = helpers + r"""
+const el = () => { throw new Error("small images must not be re-encoded"); };
+const calls = [];
+globalThis.fetch = async (url, init) => {
+  calls.push({ url, headers: init.headers, body: init.body });
+  return { ok: true, json: async () => ({ path: "/repo/shared/chat-uploads/x.png" }) };
+};
+(async () => {
+  const file = new Blob([new Uint8Array([137, 80, 78, 71])], { type: "image/png" });
+  const fitted = await chatFitImage(file);
+  await chatApi("/conversations/cv_1/uploads", "POST", fitted);
+  await chatApi("/conversations/cv_1/messages", "POST", { text: "hi" }, "k");
+  console.log(JSON.stringify({
+    same: fitted === file,
+    rawBodyIsBlob: calls[0].body === file,
+    rawHeaders: calls[0].headers,
+    jsonBody: calls[1].body,
+    jsonHeaders: calls[1].headers,
+  }));
+})();
+"""
+    result = run_js(script)
+    assert result["same"] and result["rawBodyIsBlob"]
+    assert result["rawHeaders"] == {}
+    assert result["jsonBody"] == '{"text":"hi"}'
+    assert result["jsonHeaders"] == {
+        "Content-Type": "application/json", "Idempotency-Key": "k",
+    }
+
+    interface = APP[APP.index("const CHAT_HARNESSES"):
+                    APP.index("// ── Tabs + boot")]
+    attach = interface[
+        interface.index("async function uploadImages(files)"):
+        interface.index("composer.onkeydown", interface.index("async function uploadImages"))
+    ]
+    assert "/uploads`" in attach
+    assert "[image: ${path}]" in attach
+    assert "composerRow.ondrop =" in attach
+    assert "composer.onpaste =" in attach
+    assert "|| uploading > 0" in interface
+    assert ".chat-composer.drop-target .chat-composer-input" in STYLE
