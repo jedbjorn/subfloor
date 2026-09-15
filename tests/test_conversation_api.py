@@ -1588,6 +1588,95 @@ class ConversationResourceTest(ConversationApiCase):
         self.assertEqual(status, 413, error)
         self.assertEqual(error["error"]["code"], "SOURCE_TOO_LARGE")
 
+    def upload(self, conversation_id: str, raw: bytes):
+        return decoded(
+            conversation_routes.handle(
+                "POST",
+                f"/api/conversations/{conversation_id}/uploads",
+                self.headers(extra={"Content-Type": "image/png"}),
+                raw,
+            )
+        )
+
+    def request_upload_twice(self, conversation_id: str, raw: bytes):
+        first = self.upload(conversation_id, raw)
+        second = self.upload(conversation_id, raw)
+        self.assertEqual(first[2], second[2])
+        return second
+
+    def test_upload_stores_image_under_shared_and_returns_its_path(
+        self,
+    ) -> None:
+        conversation_id = self.create(key="upload")["conversation_id"]
+        png = b"\x89PNG\r\n\x1a\n" + b"pixels"
+
+        status, _, payload = self.request_upload_twice(conversation_id, png)
+        path = Path(payload["path"])
+        self.assertEqual(status, 201, payload)
+        self.assertEqual(
+            path.parent, self.root / "shared" / "chat-uploads" / conversation_id
+        )
+        self.assertEqual(path.suffix, ".png")
+        self.assertEqual(path.read_bytes(), png)
+        self.assertEqual(payload["bytes"], len(png))
+        self.assertEqual(list(path.parent.iterdir()), [path])
+
+        webp = b"RIFF\0\0\0\0WEBPVP8 "
+        status, _, payload = self.upload(conversation_id, webp)
+        self.assertEqual(status, 201, payload)
+        self.assertEqual(Path(payload["path"]).suffix, ".webp")
+
+    def test_upload_rejects_non_images_oversize_and_unknown_chats(self) -> None:
+        conversation_id = self.create(key="upload-validation")["conversation_id"]
+
+        status, _, error = self.upload(conversation_id, b"<svg></svg>")
+        self.assertEqual(status, 415, error)
+        self.assertEqual(error["error"]["code"], "UPLOAD_NOT_IMAGE")
+
+        with mock.patch.object(conversation_routes, "UPLOAD_MAX_BYTES", 8):
+            status, _, error = self.upload(conversation_id, b"\xff\xd8\xff" + b"x" * 8)
+        self.assertEqual(status, 413, error)
+        self.assertEqual(error["error"]["code"], "UPLOAD_TOO_LARGE")
+
+        status, _, error = self.upload("cv_" + "0" * 32, b"GIF89a")
+        self.assertEqual(status, 404, error)
+        self.assertFalse((self.root / "shared" / "chat-uploads").exists())
+
+        status, _, error = decoded(
+            conversation_routes.handle(
+                "POST",
+                f"/api/conversations/{conversation_id}/uploads",
+                self.headers(extra={"Origin": "https://evil.example"}),
+                b"GIF89a",
+            )
+        )
+        self.assertEqual(status, 403, error)
+        self.assertEqual(error["error"]["code"], "NOT_SAME_ORIGIN")
+
+    def test_closing_a_chat_removes_its_uploads(self) -> None:
+        first = self.create(key="upload-close-first")
+        _, _, kept = self.upload(first["conversation_id"], b"GIF89a-first")
+        stray = self.root / "shared" / "chat-uploads" / ("cv_" + "f" * 32)
+        stray.mkdir()
+
+        second = self.create(key="upload-close-second")
+        self.assertFalse(Path(kept["path"]).exists())
+        self.assertFalse(stray.exists())
+
+        _, _, uploaded = self.upload(second["conversation_id"], b"GIF89a-second")
+        status, _, closed = self.request(
+            "PATCH",
+            f"/api/conversations/{second['conversation_id']}",
+            body={"version": second["version"], "state": "closed"},
+        )
+        self.assertEqual(status, 200, closed)
+        self.assertFalse(Path(uploaded["path"]).parent.exists())
+
+        # A send to a closed chat reopens it, so uploading into one is kept.
+        status, _, reupload = self.upload(second["conversation_id"], b"GIF89a-again")
+        self.assertEqual(status, 201, reupload)
+        self.assertTrue(Path(reupload["path"]).exists())
+
     def test_controlled_replay_uses_stored_binding_after_catalogue_drift(self) -> None:
         first = self.create(key="controlled-replay")
         with self.connect() as con:

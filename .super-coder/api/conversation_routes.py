@@ -17,6 +17,7 @@ import json
 import math
 import os
 import re
+import shutil
 import signal
 import stat
 import sys
@@ -62,6 +63,9 @@ _TRANSCRIPT_PATH = re.compile(
     r"^/api/conversations/(cv_[0-9a-f]{32})/transcript$"
 )
 _SOURCE_PATH = re.compile(r"^/api/conversations/(cv_[0-9a-f]{32})/source$")
+_UPLOADS_PATH = re.compile(
+    r"^/api/conversations/(cv_[0-9a-f]{32})/uploads$"
+)
 _EVENTS_PATH = re.compile(r"^/api/conversations/(cv_[0-9a-f]{32})/events$")
 _INTERRUPTIONS_PATH = re.compile(
     r"^/api/conversations/(cv_[0-9a-f]{32})/interruptions$"
@@ -99,6 +103,7 @@ TRANSCRIPT_PROJECTION_VERSION = 3
 TRANSCRIPT_MAX_WARNINGS = 20
 TRANSCRIPT_MAX_ACTIVITY_LABEL_BYTES = 1024
 SOURCE_MAX_BYTES = 512 * 1024
+UPLOAD_MAX_BYTES = 8 * 1024 * 1024
 
 
 @dataclass(frozen=True)
@@ -653,6 +658,83 @@ def _source_projection(con, conversation_id: str, owner_user_id: int, query) -> 
         "bytes": len(raw),
         "content": content,
     }
+
+
+def _chat_uploads_root() -> Path:
+    # <repo_root>/shared is the engine's gitignored scratch/handoff dir, and no
+    # execution view masks it, so every harness can read an upload by path.
+    return run_mod.REPO_ROOT / "shared" / "chat-uploads"
+
+
+def _image_extension(raw: bytes) -> str | None:
+    """Classify by magic bytes; the request's Content-Type is never trusted."""
+    if raw.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "png"
+    if raw.startswith(b"\xff\xd8\xff"):
+        return "jpg"
+    if raw.startswith((b"GIF87a", b"GIF89a")):
+        return "gif"
+    if raw[:4] == b"RIFF" and raw[8:12] == b"WEBP":
+        return "webp"
+    return None
+
+
+def _create_upload(con, operator: dict, conversation_id: str, raw: bytes):
+    """Store one dropped image and return the absolute path the turn cites."""
+    _require_conversation(con, conversation_id, operator["user_id"])
+    if len(raw) > UPLOAD_MAX_BYTES:
+        raise ApiError(
+            413,
+            "UPLOAD_TOO_LARGE",
+            f"upload exceeds {UPLOAD_MAX_BYTES} bytes",
+            {"bytes": len(raw), "maximum_bytes": UPLOAD_MAX_BYTES},
+        )
+    extension = _image_extension(raw)
+    if extension is None:
+        raise ApiError(
+            415,
+            "UPLOAD_NOT_IMAGE",
+            "upload must be a PNG, JPEG, GIF, or WebP image",
+        )
+    _sweep_chat_uploads(con, keep=conversation_id)
+    directory = _chat_uploads_root() / conversation_id
+    directory.mkdir(parents=True, exist_ok=True)
+    # Content-addressed: dropping the same image twice yields one file.
+    target = directory / f"{hashlib.sha256(raw).hexdigest()[:32]}.{extension}"
+    if not target.exists():
+        partial = directory / f".{target.name}.{uuid.uuid4().hex}.part"
+        partial.write_bytes(raw)
+        os.replace(partial, target)
+    return _json(
+        201,
+        {"path": str(target), "bytes": len(raw), "extension": extension},
+    )
+
+
+def _sweep_chat_uploads(con, keep: str | None = None) -> None:
+    """Delete the upload dirs of closed or unknown conversations.
+
+    A sweep rather than a hook on each close path: chats close from the FnB's
+    Close, from a replacement chat, and from broker recovery, and one pass
+    over the state column covers all of them.  ``keep`` spares the chat being
+    uploaded into, since a send to a closed chat reopens it.
+    """
+    root = _chat_uploads_root()
+    if not root.is_dir():
+        return
+    for entry in root.iterdir():
+        if not entry.is_dir() or not _ID.fullmatch(entry.name) or entry.name == keep:
+            continue
+        row = con.execute(
+            "SELECT state FROM conversations WHERE conversation_id=?",
+            (entry.name,),
+        ).fetchone()
+        if row is not None and row["state"] != "closed":
+            continue
+        try:
+            shutil.rmtree(entry)
+        except OSError as exc:
+            print(f"chat uploads: cannot remove {entry} ({exc})", flush=True)
 
 
 def _close_requested(con, conversation_id: str) -> bool:
@@ -1523,6 +1605,7 @@ def _create_conversation(con, operator: dict, headers, body: dict):
         DB_PATH,
         conversation_id,
     )
+    _sweep_chat_uploads(con)
     row = _require_conversation(con, conversation_id, operator["user_id"])
     return _json(
         201,
@@ -1740,6 +1823,8 @@ def _patch_conversation(con, operator: dict, conversation_id: str, body: dict):
         _deliver_close_interrupt(active_run_id)
     if close_processes:
         _terminate_closed_processes(conversation_id, close_processes)
+    if body.get("state") == "closed":
+        _sweep_chat_uploads(con)
     return _json(
         200,
         _conversation_projection(
@@ -2766,6 +2851,12 @@ def handle(method: str, path: str, headers_raw: str, raw_body: bytes) -> tuple:
             ):
                 raise ApiError(
                     403, "NOT_SAME_ORIGIN", "cross-site conversation mutation rejected"
+                )
+            uploads = _UPLOADS_PATH.fullmatch(parsed.path)
+            if uploads and method == "POST":
+                # Raw image bytes, not JSON — routed before the body parse.
+                return _create_upload(
+                    con, operator, uploads.group(1), raw_body
                 )
             body = _body(raw_body)
             if parsed.path == "/api/conversations/shell-release" and method == "POST":

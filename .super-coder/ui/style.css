@@ -564,6 +564,9 @@ body.interface-view main {
   padding: .8rem clamp(1rem, 4vw, 4rem) 1rem; border-top: 1px solid var(--line);
   background: var(--bg);
 }
+.chat-composer.drop-target .chat-composer-input {
+  border-color: var(--accent); box-shadow: 0 0 0 2px var(--accent);
+}
 .chat-composer-input {
   min-height: 72px; max-height: 220px; resize: vertical;
   border-radius: 12px; padding: .7rem .8rem;
