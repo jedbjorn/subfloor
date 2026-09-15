@@ -345,12 +345,19 @@ class ReaperStore:
             },
         )
 
-    def finish_interrupted(self, candidate: ReaperCandidate, reason: str) -> bool:
+    def finish_interrupted(
+        self,
+        candidate: ReaperCandidate,
+        reason: str,
+        *,
+        process_exited: bool,
+    ) -> bool:
         """Write the reaper-owned terminal state iff identity stays unprotected.
 
         An already-terminal run gets the outcome EVENT and nothing else: its
         state, ended_at, message and conversation belong to whoever finished
-        it."""
+        it. A process proven gone also drops its identity from the run, as the
+        broker does on exit, so the row leaves every later sweep's scan."""
         con = self.connect()
         now = _stamp(self.clock())
         try:
@@ -417,6 +424,13 @@ class ReaperStore:
                             (target, now, candidate.conversation_id),
                         )
                     self._append_interrupted_event(con, candidate, reason)
+                if process_exited:
+                    con.execute(
+                        "UPDATE conversation_runs SET process_pid=NULL,"
+                        "process_start_ticks=NULL,process_group_id=NULL "
+                        "WHERE run_id=?",
+                        (candidate.run_id,),
+                    )
         finally:
             con.close()
         conversation_events.notify(candidate.conversation_id)
@@ -461,8 +475,18 @@ class ConversationReaper(threading.Thread):
             and snapshot.process_group_id == candidate.process_group_id
         )
 
-    def _finish_if_gone(self, candidate: ReaperCandidate, reason: str) -> bool:
-        return self.store.finish_interrupted(candidate, reason)
+    def _finish_if_gone(
+        self,
+        candidate: ReaperCandidate,
+        reason: str,
+        *,
+        process_exited: bool = True,
+    ) -> bool:
+        return self.store.finish_interrupted(
+            candidate,
+            reason,
+            process_exited=process_exited,
+        )
 
     def _native_step(self, candidate: ReaperCandidate) -> bool:
         if not self.store.eligible(candidate):
@@ -504,6 +528,7 @@ class ConversationReaper(threading.Thread):
             return self._finish_if_gone(
                 candidate,
                 "reaper SIGKILL delivered to unlinked process group",
+                process_exited=False,
             )
         return changed
 
@@ -565,6 +590,7 @@ class ConversationReaper(threading.Thread):
                         self._finish_if_gone(
                             candidate,
                             "reaper SIGKILL delivered to unlinked process group",
+                            process_exited=False,
                         )
                     )
             except Exception as exc:  # noqa: BLE001 - isolate one candidate

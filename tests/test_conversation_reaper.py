@@ -249,6 +249,55 @@ class ConversationReaperTest(unittest.TestCase):
             events[0]["payload"],
         )
 
+    def test_a_run_whose_process_is_gone_leaves_the_candidate_scan(self) -> None:
+        _conversation, _message, run_id = self.add_run()
+        self.finish_succeeded(run_id, "2026-08-02 11:59:30")
+        store = ReaperStore(self.db_path, clock=self.clock)
+        self.assertEqual([run_id], [c.run_id for c in store.candidates()])
+
+        self.assertEqual(self.build_reaper(None).sweep_once(), 1)
+
+        con = self.connect()
+        identity = con.execute(
+            "SELECT process_pid,process_start_ticks,process_group_id "
+            "FROM conversation_runs WHERE run_id=?",
+            (run_id,),
+        ).fetchone()
+        con.close()
+        # Like the broker on exit: a proven-gone process drops its identity,
+        # so the row is outside the reaper's process_pid IS NOT NULL scan.
+        self.assertEqual(tuple(identity), (None, None, None))
+        self.assertEqual([], store.candidates())
+
+    def test_outcome_probe_seeks_the_reaper_index(self) -> None:
+        # Every terminal run with an identity probes conversation_events for
+        # the reaper's own outcome; without the partial index each probe
+        # scanned the whole event log, pegging a core on long-lived engines.
+        statements: list[str] = []
+
+        def traced() -> sqlite3.Connection:
+            con = self.connect()
+            con.set_trace_callback(statements.append)
+            return con
+
+        _conversation, _message, run_id = self.add_run()
+        self.finish_succeeded(run_id, "2026-08-02 11:59:30")
+        ReaperStore(self.db_path, connect=traced).candidates()
+        (query,) = [s for s in statements if s.startswith("SELECT r.run_id")]
+
+        con = self.connect()
+        plan = [
+            row["detail"]
+            for row in con.execute(f"EXPLAIN QUERY PLAN {query}").fetchall()
+        ]
+        con.close()
+        probes = [d for d in plan if "reaped" in d]
+        self.assertTrue(probes, plan)
+        self.assertTrue(
+            all("idx_conversation_events_reaper" in d for d in probes),
+            plan,
+        )
+
     def test_lingering_candidate_climbs_the_same_ladder(self) -> None:
         _conversation, _message, run_id = self.add_run()
         self.finish_succeeded(run_id, "2026-08-02 11:59:30")
