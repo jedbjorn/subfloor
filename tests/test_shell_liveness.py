@@ -666,6 +666,13 @@ class ReleaseTest(unittest.TestCase):
         walk.assert_not_called()
         self.assertEqual(-15, proc.wait(timeout=5))
 
+    def test_terminate_skips_an_exited_identity_and_ends_a_live_one(self):
+        proc, ticks = self._spawn()
+        with self._no_numeric_signals():
+            self.assertEqual([], shell_liveness.terminate(
+                [(999999, 1), (proc.pid, ticks)]))
+        self.assertEqual(-15, proc.wait(timeout=5))
+
     def test_browser_turns_are_not_cli_holders(self):
         snap = {"processes": [
             {"pid": 1, "start_ticks": 5, "shortname": "dev1", "orphaned": None,

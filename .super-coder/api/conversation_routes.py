@@ -881,6 +881,44 @@ def _begin_close(con, conversation_id: str, current_state: str) -> None:
     )
 
 
+def _chat_processes(con, conversation_id: str) -> list[tuple[int, int]]:
+    """The (pid, start_ticks) identities a chat still links: its registry
+    process (a running or lingering turn) and any active run's process."""
+    rows = con.execute(
+        "SELECT process_pid,process_start_ticks FROM active_shell_chats "
+        "WHERE chat_id=? AND process_pid IS NOT NULL "
+        "AND process_start_ticks IS NOT NULL "
+        "UNION SELECT process_pid,process_start_ticks FROM conversation_runs "
+        "WHERE conversation_id=? AND state IN ('leased','starting','running') "
+        "AND process_pid IS NOT NULL AND process_start_ticks IS NOT NULL",
+        (conversation_id, conversation_id),
+    ).fetchall()
+    return [(int(r[0]), int(r[1])) for r in rows]
+
+
+def _terminate_closed_processes(
+    conversation_id: str, identities: list[tuple[int, int]]
+) -> None:
+    """Close is a kill: end the closed chat's process now rather than a reaper
+    ladder later. The close has already committed, so a failure here is
+    reported and left to the reaper, which still records the outcome."""
+    try:
+        survivors = run_mod.shell_liveness.terminate(identities)
+    except OSError as exc:
+        print(
+            f"conversation close: cannot signal {conversation_id} process "
+            f"({exc}); left to the reaper",
+            flush=True,
+        )
+        return
+    if survivors:
+        print(
+            f"conversation close: {conversation_id} pid "
+            f"{', '.join(map(str, survivors))} survived SIGKILL; left to the reaper",
+            flush=True,
+        )
+
+
 def _deliver_close_interrupt(run_id: int) -> None:
     try:
         conversation_broker.interrupt_run(run_id)
@@ -1613,6 +1651,7 @@ def _patch_conversation(con, operator: dict, conversation_id: str, body: dict):
         raise ApiError(422, "VALIDATION_ERROR", "state may only be changed to closed")
 
     active_run_id = None
+    close_processes: list[tuple[int, int]] = []
     with db_driver.write_transaction(con, "conversation.patch"):
         row = _require_conversation(con, conversation_id, operator["user_id"])
         if int(row["version"]) != version:
@@ -1657,6 +1696,7 @@ def _patch_conversation(con, operator: dict, conversation_id: str, body: dict):
                         ),
                     },
                 )
+            close_processes = _chat_processes(con, conversation_id)
             _begin_close(con, conversation_id, row["state"])
             _enable_planner_coordinate_mode(
                 con,
@@ -1698,6 +1738,8 @@ def _patch_conversation(con, operator: dict, conversation_id: str, body: dict):
     conversation_events.notify(conversation_id)
     if active_run_id is not None:
         _deliver_close_interrupt(active_run_id)
+    if close_processes:
+        _terminate_closed_processes(conversation_id, close_processes)
     return _json(
         200,
         _conversation_projection(
@@ -1972,25 +2014,31 @@ def _interrupt(con, operator: dict, conversation_id: str, headers, body: dict):
                 clauses.append("run_id=?")
                 params.append(requested_run)
             active = con.execute(
-                "SELECT run_id FROM conversation_runs WHERE "
+                "SELECT run_id,process_pid FROM conversation_runs WHERE "
                 + " AND ".join(clauses)
                 + " ORDER BY run_id DESC LIMIT 1",
                 params,
             ).fetchone()
             lingering_pid = None
-            if active is not None:
-                run_id = int(active["run_id"])
-            else:
+            lingering = None
+            if active is None or active["process_pid"] is None:
                 # A finished-looking turn whose child still runs is idle, not
                 # terminal: the process is the source of truth for "running".
-                lingering = _lingering_run(con, conversation, requested_run)
-                if lingering is None:
-                    raise ApiError(
-                        409,
-                        "RUN_ALREADY_TERMINAL",
-                        "no matching active run can be interrupted",
-                    )
+                # A run deferred behind that process has none of its own, so
+                # the lingering process is what Stop must reach.
+                lingering = _lingering_run(
+                    con, conversation, requested_run if active is None else None
+                )
+            if lingering is not None:
                 run_id, lingering_group, lingering_pid = lingering
+            elif active is not None:
+                run_id = int(active["run_id"])
+            else:
+                raise ApiError(
+                    409,
+                    "RUN_ALREADY_TERMINAL",
+                    "no matching active run can be interrupted",
+                )
             audit_body = json.dumps(
                 {"kind": "interrupt", "run_id": run_id},
                 separators=(",", ":"),
