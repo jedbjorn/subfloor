@@ -6,6 +6,13 @@ operator; Planner supplies fork-local shell guidance. Example names, ports and
 application tables below are illustrative and do not grant access to another
 fork. Exact CLI syntax remains in `sc help --all` and verb help.
 
+> [!NOTE]
+> Reading this because the file is missing? A fork pinned at a ref that
+> contains this runbook can still be short of it on disk — see
+> `engine-integrity.md` in this directory (also viewable upstream at
+> `jedbjorn/subfloor` under `.super-coder/docs/`) for the detect-and-recover
+> procedure.
+
 
 Read-only diagnostic access to the fork's **live app Postgres** for a sandboxed
 shell — without handing that shell a credential or a network route. The fourth

@@ -641,6 +641,27 @@ the run continues from where the first one stopped and advances the pin.
 Don't reach for `./sc rollback` here — that is the remedy for a *completed*
 update that turned out bad, not for one that stopped halfway.
 
+### Engine files missing though update reports success — re-lay the engine
+
+Help entries and verbs name engine files (`.super-coder/docs/*.md`, scripts,
+skills) that the engine materializes. A fork pinned at a ref that contains a
+file can still be short of it on disk: the materialize's completeness check
+and its hash manifest can both pass with a file absent, so nothing detects
+the shortfall — a `sc help --all` pointer lands on nothing (worked example:
+[#1609](https://github.com/jedbjorn/subfloor/issues/1609)). The remedy is the
+everyday command: `./sc update` (with network fetch) re-materializes the
+entire engine at the pin and rewrites the manifest, restoring what was
+missing; the local-edits gate variant (`--force` after confirming no
+deliberate edit) is covered too. The full procedure — symptom list,
+verification that the pin carries the file, bounds, and the upstream report —
+lives in the [engine integrity runbook](../.super-coder/docs/engine-integrity.md).
+
+> [!class4]
+> **This pointer survives the failure it describes.** The runbook itself
+> ships inside the engine and can be the file that's missing; the fork-owned
+> `docs/README.md` is tracked, so this entry is always on disk. The runbook is
+> also viewable upstream at `jedbjorn/subfloor` under `.super-coder/docs/`.
+
 > [!class4]
 > **Why a fix that is already upstream can still bite a fork once.** The
 > crossing is driven by the updater you *already have*: `update.py` is loaded
