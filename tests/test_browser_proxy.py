@@ -62,7 +62,7 @@ def gates(tmp_path, monkeypatch):
         ("127.0.0.1", 0),
         config,
         state=lambda: config,
-        window_check=lambda config: None,
+        profile_check=lambda config: None,
         timeout=0.15,
     )
     gate.slow_started = threading.Event()
@@ -158,7 +158,7 @@ def test_guard_refusal_does_not_reach_upstream(gates):
     def refuse(config):
         raise ValueError("extension not connected")
 
-    gate.window_check = refuse
+    gate.profile_check = refuse
     sid, _, _ = request(gate, "DEV5", "initialize")
     assert (
         "error"

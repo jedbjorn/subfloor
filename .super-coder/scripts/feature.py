@@ -35,7 +35,7 @@ FEATURES: dict[str, dict] = {
         "title": "Browser driving (bare metal, approval per connection)",
         "block": "browser", "block_auto": False,
         "link": ["Create the Chromium Subfloor profile, install Playwright Extension, then link GUI → Scripts → Browser",
-                 "Open Subfloor and approve each shell connection; sc browser doctor --json checks setup"],
+                 "Run sc browser setup to detect and link; agents can use sc browser open; approve each new extension connection"],
     },
     "pg": {
         "title": "Postgres sidecar (app-only)",

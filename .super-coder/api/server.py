@@ -3930,12 +3930,23 @@ class Handler(BaseHTTPRequestHandler):
         sid = self._require_shell_auth()
         if sid is None:
             return
-        if body.get('action') != 'status':
-            return self._send(403, {'error': 'Browser lifecycle and arm are owned by the FnB; shells may read status only.'})
+        if body.get('action') not in ('status', 'open'):
+            return self._send(403, {'error': 'Browser setup, lifecycle and arm are owned by the FnB; shells may use status and open.'})
         con = db()
         try:
             row = con.execute('SELECT shortname FROM shells WHERE shell_id=?', (sid,)).fetchone()
-            result = browser_mod.status(harness=body.get('harness'), sandbox=bool(body.get('sandbox')))
+            if body.get('action') == 'open':
+                if set(body) - {'action', 'harness', 'sandbox'}:
+                    return self._send(400, {'error': 'Browser open accepts no configuration overrides'})
+                granted = con.execute(
+                    "SELECT 1 FROM resolved_shell_skills ss JOIN skills s USING(skill_id) "
+                    "WHERE ss.shell_id=? AND s.name='drive_browser' AND s.is_deleted=0", (sid,)
+                ).fetchone()
+                if not granted:
+                    return self._send(403, {'error': 'Browser open requires the drive_browser grant'})
+                result = browser_mod.open_profile(harness=body.get('harness'), sandbox=bool(body.get('sandbox')))
+            else:
+                result = browser_mod.status(harness=body.get('harness'), sandbox=bool(body.get('sandbox')))
             config = browser_mod.read()
             if config and result.get('supported'):
                 result['proxy_url'] = f"http://127.0.0.1:{config['proxy_port']}/mcp/{row['shortname'].upper()}"
@@ -5245,7 +5256,7 @@ class Handler(BaseHTTPRequestHandler):
                 if not self._require_browser_operator(con, "browser configuration"):
                     return
                 return self._send(200, {**browser_mod.status(), "config": browser_mod.read(),
-                    "defaults": {"user_data_dir": str(Path.home() / ".config/chromium"), "executable": "/usr/lib/chromium/chromium"}})
+                    "defaults": browser_mod.defaults()})
             if path == "/api/web-search":
                 # Status only — configured / provider / last-four hint / when.
                 # The key itself never crosses this boundary (doc #215).
@@ -5320,7 +5331,7 @@ class Handler(BaseHTTPRequestHandler):
                     elif action == 'link':
                         result = browser_mod.link(body.get('config', {}))
                         browser_mod.set_grants(con, True)
-                    elif action in ('doctor', 'arm', 'disarm', 'up', 'down', 'disable'):
+                    elif action in ('doctor', 'open', 'arm', 'disarm', 'up', 'down', 'disable'):
                         result = browser_mod.operate(action)
                         if action == 'disable':
                             browser_mod.set_grants(con, False)

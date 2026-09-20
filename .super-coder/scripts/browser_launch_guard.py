@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
-"""Exec Chromium only when the operator's named profile is already active."""
+"""Launch only the operator-linked, existing Subfloor profile."""
 
 from __future__ import annotations
 
 import json
 import os
-import socket
 import sys
 from pathlib import Path
 
@@ -24,42 +23,63 @@ def operator_path(value: object) -> Path:
     return path
 
 
-def check(config: dict, *, proc: Path = Path("/proc")) -> None:
-    """A lock alone can be stale: verify its host, live owner and executable."""
+def check(config: dict) -> None:
+    """Local State identifies a profile, never a live window or connection."""
     try:
         directory = operator_path(config["user_data_dir"])
         executable = operator_path(config["executable"])
-        lock = directory / "SingletonLock"
-        # Paths are chosen by the host operator, not shell MCP input. The API
-        # rejects shell credentials and cross-origin setup before calling us.
-        # codeql[py/path-injection]
-        host, raw_pid = os.readlink(lock).rsplit("-", 1)
-        if host != socket.gethostname() or not raw_pid.isdecimal():
-            raise GuardRefusal("invalid Chromium SingletonLock")
-        process = proc / raw_pid
-        if process.stat().st_uid != os.geteuid():
-            raise GuardRefusal("Chromium lock belongs to another user")
-        # Compare the live PID with the operator's native executable.
-        # codeql[py/path-injection]
-        if (process / "exe").resolve(strict=True) != executable.resolve(strict=True):
-            raise GuardRefusal("stale Chromium SingletonLock: executable mismatch")
-        # Read only Chromium's fixed metadata filename under the chosen root.
-        # codeql[py/path-injection]
+        profile = config["profile_dir_name"]
+        if (
+            not isinstance(profile, str)
+            or profile in ("", ".", "..")
+            or "/" in profile
+            or "\\" in profile
+        ):
+            raise GuardRefusal("invalid profile directory")
+        if not executable.is_file() or not os.access(executable, os.X_OK):
+            raise GuardRefusal(
+                "Chromium executable is unavailable; relink in Scripts → Browser"
+            )
         state = json.loads((directory / "Local State").read_text())
-        active = state["profile"]["last_active_profiles"]
-        if not isinstance(active, list) or not all(isinstance(x, str) for x in active):
-            raise GuardRefusal("malformed Chromium active-profile list")
-        if config["profile_dir_name"] not in active:
-            raise GuardRefusal("Subfloor profile is not active")
-    except (OSError, ValueError, KeyError, TypeError) as exc:
+        if (
+            state.get("profile", {}).get("info_cache", {}).get(profile, {}).get("name")
+            != "Subfloor"
+        ):
+            raise GuardRefusal(
+                "linked profile is no longer named Subfloor; relink in Scripts → Browser"
+            )
+        if not (directory / profile).is_dir():
+            raise GuardRefusal(
+                "Subfloor profile directory is missing; create it and relink"
+            )
+    except (OSError, ValueError, KeyError, TypeError, AttributeError) as exc:
         reason = (
             str(exc)
             if isinstance(exc, GuardRefusal)
-            else "missing, malformed, or stale profile state"
+            else "cannot read the linked Subfloor profile; check setup in Scripts → Browser"
         )
-        raise GuardRefusal(
-            f"extension not connected: {reason}; ask the FnB to open Subfloor"
-        ) from exc
+        raise GuardRefusal(f"browser profile unavailable: {reason}") from exc
+
+
+def command(config: dict, argv: list[str]) -> list[str]:
+    # The configured profile wins even if an upstream release changes how it
+    # supplies Chromium flags. Never accept another profile through argv.
+    args = []
+    skip = False
+    for arg in argv:
+        if skip:
+            skip = False
+            continue
+        if arg in ("--user-data-dir", "--profile-directory"):
+            skip = True
+        elif not arg.startswith(("--user-data-dir=", "--profile-directory=")):
+            args.append(arg)
+    return [
+        config["executable"],
+        f"--user-data-dir={config['user_data_dir']}",
+        f"--profile-directory={config['profile_dir_name']}",
+        *args,
+    ]
 
 
 def main(argv: list[str]) -> int:
@@ -69,7 +89,7 @@ def main(argv: list[str]) -> int:
     except (OSError, ValueError, KeyError) as exc:
         print(str(exc), file=sys.stderr)
         return 1
-    os.execv(config["executable"], [config["executable"], *argv])
+    os.execv(config["executable"], command(config, argv))
     return 0
 
 

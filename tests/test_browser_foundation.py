@@ -2,7 +2,6 @@
 
 import json
 import os
-import socket
 import sys
 from pathlib import Path
 
@@ -31,41 +30,55 @@ def config(tmp_path):
     }
 
 
-def window(config, tmp_path, active=None):
-    (tmp_path / "SingletonLock").symlink_to(socket.gethostname() + "-123")
+def profile(config, tmp_path, active=None):
+    (tmp_path / "Profile 1").mkdir()
     (tmp_path / "Local State").write_text(
-        json.dumps({"profile": {"last_active_profiles": active or ["Profile 1"]}})
+        json.dumps(
+            {
+                "profile": {
+                    "info_cache": {"Profile 1": {"name": "Subfloor"}},
+                    "last_active_profiles": active or [],
+                    "last_used": "Default",
+                }
+            }
+        )
     )
-    proc = tmp_path / "proc"
-    (proc / "123").mkdir(parents=True)
-    (proc / "123/exe").symlink_to(config["executable"])
-    return proc
 
 
-def test_guard_active_profile(config, tmp_path):
-    guard.check(config, proc=window(config, tmp_path))
+@pytest.mark.parametrize("active", [[], ["Default"], ["Profile 1"]])
+def test_guard_existing_profile_needs_no_window_or_process_access(
+    config, tmp_path, active
+):
+    profile(config, tmp_path, active)
+    guard.check(config)
 
 
 @pytest.mark.parametrize(
     "failure",
-    ["missing-lock", "stale-lock", "missing-state", "malformed-state", "wrong-profile"],
+    [
+        "missing-profile",
+        "missing-executable",
+        "missing-state",
+        "malformed-state",
+        "wrong-profile",
+    ],
 )
 def test_guard_refuses(config, tmp_path, failure):
-    proc = window(config, tmp_path)
-    if failure == "missing-lock":
-        (tmp_path / "SingletonLock").unlink()
-    elif failure == "stale-lock":
-        (proc / "123/exe").unlink()
+    profile(config, tmp_path)
+    if failure == "missing-profile":
+        (tmp_path / "Profile 1").rmdir()
+    elif failure == "missing-executable":
+        Path(config["executable"]).unlink()
     elif failure == "missing-state":
         (tmp_path / "Local State").unlink()
     elif failure == "malformed-state":
         (tmp_path / "Local State").write_text("[]")
     else:
         (tmp_path / "Local State").write_text(
-            '{"profile":{"last_active_profiles":["Default"]}}'
+            '{"profile":{"info_cache":{"Profile 1":{"name":"Personal"}}}}'
         )
-    with pytest.raises(guard.GuardRefusal, match="extension not connected"):
-        guard.check(config, proc=proc)
+    with pytest.raises(guard.GuardRefusal, match="browser profile unavailable"):
+        guard.check(config)
 
 
 def test_guard_exec_preserves_argv(config, tmp_path, monkeypatch):
@@ -80,7 +93,12 @@ def test_guard_exec_preserves_argv(config, tmp_path, monkeypatch):
         "chrome-extension://extension/connect.html?a=b",
     ]
     assert guard.main(args) == 0
-    assert called == [(config["executable"], [config["executable"], *args])]
+    assert called == [
+        (
+            config["executable"],
+            [config["executable"], "--user-data-dir=" + config["user_data_dir"], *args],
+        )
+    ]
 
 
 @pytest.mark.parametrize(
@@ -89,7 +107,6 @@ def test_guard_exec_preserves_argv(config, tmp_path, monkeypatch):
         ("armed", "true"),
         ("profile_dir_name", "../Default"),
         ("proxy_port", 8870),
-        ("server_version", "latest"),
         ("extra", "value"),
     ],
 )
@@ -197,10 +214,209 @@ def test_drift_prevents_start(config, monkeypatch):
     monkeypatch.setattr(browser, "read", lambda: config)
     monkeypatch.setattr(browser, "lifecycle_lock", nullcontext)
     monkeypatch.setattr(
-        browser, "package_check", lambda: {"ok": False, "error": "drift"}
+        browser,
+        "package_check",
+        lambda **kwargs: {"ok": False, "error": "capability missing"},
     )
     monkeypatch.setattr(
         browser, "start_process", lambda *args: pytest.fail("must not start")
     )
-    with pytest.raises(ValueError, match="drift"):
+    with pytest.raises(ValueError, match="capability missing"):
         browser.operate("up")
+
+
+def test_legacy_version_receipts_do_not_pin(config):
+    config.update(server_version="old", playwright_version="old")
+    assert "server_version" not in browser.validate(config)
+
+
+def test_launcher_forces_linked_profile(config):
+    result = guard.command(
+        config,
+        [
+            "--profile-directory",
+            "Default",
+            "--user-data-dir=/wrong",
+            "https://example.org",
+        ],
+    )
+    assert result == [
+        config["executable"],
+        "--user-data-dir=" + config["user_data_dir"],
+        "--profile-directory=Profile 1",
+        "https://example.org",
+    ]
+
+
+def test_discovery_and_explicit_paths(config, tmp_path, monkeypatch):
+    profile(config, tmp_path)
+    monkeypatch.setattr(
+        browser,
+        "installations",
+        lambda: [{"user_data_dir": str(tmp_path), "executable": config["executable"]}],
+    )
+    assert browser.resolve_paths({}) == (tmp_path, Path(config["executable"]))
+    assert browser.resolve_paths({"user_data_dir": str(tmp_path)}) == (
+        tmp_path,
+        Path(config["executable"]),
+    )
+    assert browser.defaults()["user_data_dir"] == str(tmp_path)
+    monkeypatch.setattr(
+        browser,
+        "installations",
+        lambda: (
+            [{"user_data_dir": str(tmp_path), "executable": config["executable"]}] * 2
+        ),
+    )
+    with pytest.raises(ValueError, match="Could not select one"):
+        browser.resolve_paths({})
+
+
+def test_open_only_existing_armed_profile(config, tmp_path, monkeypatch):
+    from contextlib import nullcontext
+    from unittest.mock import Mock
+
+    profile(config, tmp_path)
+    monkeypatch.setattr(browser, "read", lambda: config)
+    monkeypatch.setattr(browser, "lifecycle_lock", nullcontext)
+    monkeypatch.setattr(browser, "status", lambda **kwargs: {"state": "declared"})
+    spawn = Mock(return_value=Mock(wait=Mock(return_value=0)))
+    monkeypatch.setattr(browser.subprocess, "Popen", spawn)
+    assert browser.open_profile()["launch_requested"] is True
+    assert spawn.call_args.args[0] == guard.command(config, [])
+    spawn.reset_mock()
+    config["armed"] = False
+    with pytest.raises(ValueError, match="disarmed"):
+        browser.open_profile()
+    config["armed"] = True
+    (tmp_path / "Profile 1").rmdir()
+    with pytest.raises(ValueError, match="missing"):
+        browser.open_profile()
+    spawn.assert_not_called()
+
+
+@pytest.mark.parametrize("sandbox,harness", [(True, "codex"), (False, "kimi")])
+def test_open_refuses_unsupported_seats(monkeypatch, sandbox, harness):
+    monkeypatch.setattr(
+        browser, "read", lambda: pytest.fail("unsupported open read profile")
+    )
+    with pytest.raises(ValueError, match="unsupported"):
+        browser.open_profile(sandbox=sandbox, harness=harness)
+
+
+def test_doctor_distinguishes_setup_and_connection(config, monkeypatch):
+    from contextlib import nullcontext
+
+    monkeypatch.setattr(browser, "lifecycle_lock", nullcontext)
+    monkeypatch.setattr(browser, "package_check", lambda **kwargs: {"ok": True})
+    monkeypatch.setattr(browser, "read", lambda: config)
+    st = {
+        "state": "ready",
+        "checks": {"profile": True, "extension": True},
+        "connection_ready": False,
+    }
+    monkeypatch.setattr(browser, "status", lambda: st)
+    receipt = browser.operate("doctor")
+    assert receipt["setup_ready"] is True
+    assert receipt["ok"] is False
+    st["connection_ready"] = True
+    assert browser.operate("doctor")["ok"] is True
+
+
+@pytest.mark.parametrize("name", ["Preferences", "Secure Preferences"])
+def test_extension_detected_from_preferences(config, tmp_path, name):
+    profile(config, tmp_path)
+    (tmp_path / "Profile 1" / name).write_text(
+        json.dumps(
+            {
+                "extensions": {
+                    "settings": {browser.EXTENSION_ID: {"path": "/operator/extension"}}
+                }
+            }
+        )
+    )
+    assert browser.profile_checks(config)["extension"] is True
+
+
+def test_default_discovery_pairs_xdg_root_and_path_launcher(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+    (tmp_path / "chromium").mkdir()
+    (tmp_path / "chromium/Local State").write_text("{}")
+    monkeypatch.setattr(
+        browser.shutil,
+        "which",
+        lambda name: "/bin/chromium" if name == "chromium" else None,
+    )
+    assert {
+        "user_data_dir": str(tmp_path / "chromium"),
+        "executable": "/bin/chromium",
+    } in browser.installations()
+
+
+def test_real_launcher_exec_targets_existing_profile(config, tmp_path):
+    import subprocess
+
+    profile(config, tmp_path)
+    receipt = tmp_path / "argv.json"
+    Path(config["executable"]).write_text(
+        "#!"
+        + sys.executable
+        + "\nimport json, sys\nfrom pathlib import Path\nPath("
+        + repr(str(receipt))
+        + ").write_text(json.dumps(sys.argv[1:]))\n"
+    )
+    path = tmp_path / "guard.json"
+    path.write_text(json.dumps(config))
+    env = dict(os.environ, SC_BROWSER_GUARD_CONFIG=str(path))
+    result = subprocess.run(
+        [sys.executable, guard.__file__, "chrome-extension://fixture/connect.html"],
+        env=env,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
+    assert json.loads(receipt.read_text()) == [
+        "--user-data-dir=" + str(tmp_path),
+        "--profile-directory=Profile 1",
+        "chrome-extension://fixture/connect.html",
+    ]
+
+
+def test_setup_detects_profile_and_bootstraps_without_extension(
+    config, tmp_path, monkeypatch
+):
+    from contextlib import nullcontext
+
+    profile(config, tmp_path)
+    monkeypatch.setattr(
+        browser,
+        "installations",
+        lambda: [{"user_data_dir": str(tmp_path), "executable": config["executable"]}],
+    )
+    monkeypatch.setattr(
+        browser.ports,
+        "ensure_browser_ports",
+        lambda: {"browser_port": 8870, "browser_proxy_port": 8871},
+    )
+    monkeypatch.setattr(browser, "lifecycle_lock", nullcontext)
+    saved = []
+    installed = []
+    monkeypatch.setattr(
+        browser,
+        "package_check",
+        lambda **kwargs: installed.append(kwargs) or {"ok": True},
+    )
+    monkeypatch.setattr(browser, "stop_process", lambda name: None)
+    monkeypatch.setattr(
+        browser.ports, "update", lambda changes: saved.append(changes["browser"])
+    )
+    monkeypatch.setattr(browser, "operate", lambda action: {"state": "declared"})
+    assert browser.link({}) == {"state": "declared"}
+    assert installed == [{"install": True}]
+    assert saved[0]["profile_dir_name"] == "Profile 1"
+    assert saved[0]["executable"] == config["executable"]
+    assert "server_version" not in saved[0]
+    assert browser.profile_checks(saved[0])["extension"] is False
+    # The operator can now open this linked profile to install the extension.
+    assert browser.profile_checks(saved[0])["profile"] is True
