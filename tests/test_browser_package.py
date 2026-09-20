@@ -174,7 +174,7 @@ def test_real_locked_server_discovery_through_gate_without_browser(
         )
         assert b"Listening on" in child.stderr.readline()
         gate = browser_proxy.Gate(
-            ("127.0.0.1", 0), config, state=lambda: config, timeout=2
+            ("127.0.0.1", 0), config, state=lambda: config
         )
         monkeypatch.setattr(
             browser, "process_receipt", lambda name: {"start": "fixture"}

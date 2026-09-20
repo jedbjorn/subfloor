@@ -40,7 +40,6 @@ REQUIRED_FLAGS = {
 }
 EXTENSION_ID = "mmlmfjhmonkocbjadbfplnigmagldckm"
 TIMEOUT = 30
-PROXY_TIMEOUT = TIMEOUT + 1
 UNSUPPORTED_SEAT = "unsupported seat: browser requires bare metal"
 SUPPORTED = ("claude", "codex", "opencode")
 FIELDS = {

@@ -7,9 +7,7 @@ import http.client
 import json
 import os
 import re
-import socket
 import threading
-import time
 import uuid
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -22,12 +20,6 @@ DISARMED = "Browser is disarmed; ask the FnB to arm it in Scripts → Browser."
 DISCONNECTED = (
     "extension not connected: run sc browser open and ask the FnB to approve this connection"
 )
-TIMED_OUT = (
-    "browser action timed out; the connection was preserved but the outcome is unknown. "
-    "Inspect current state before repeating the action"
-)
-
-
 def rpc_result(body: bytes) -> dict:
     """Extract the response from JSON or the finite SSE response to an RPC POST."""
     try:
@@ -45,20 +37,11 @@ def rpc_result(body: bytes) -> dict:
 class Gate(ThreadingHTTPServer):
     daemon_threads = True
 
-    def __init__(
-        self,
-        address,
-        config,
-        *,
-        state=None,
-        profile_check=None,
-        timeout=browser.PROXY_TIMEOUT,
-    ):
+    def __init__(self, address, config, *, state=None, profile_check=None):
         super().__init__(address, Handler)
         self.config = config
         self.state = state or browser.read
         self.profile_check = profile_check or browser.guard.check
-        self.timeout_seconds = timeout
         self.sessions = {}
         self.lock = threading.RLock()
         self.tools = []
@@ -179,7 +162,6 @@ class Handler(BaseHTTPRequestHandler):
             length = int(self.headers.get("Content-Length", "-1"))
             if length < 0 or length > MAX_BODY or self.headers.get("Transfer-Encoding"):
                 raise ValueError("invalid request length")
-            self.connection.settimeout(self.server.timeout_seconds)
             message = json.loads(self.rfile.read(length))
             if (
                 not isinstance(message, dict)
@@ -297,17 +279,11 @@ class Handler(BaseHTTPRequestHandler):
         )
         return connection, connection.getresponse()
 
-    def connect_session(self, session, deadline):
-        if not session["connection_lock"].acquire(
-            timeout=max(0.01, deadline - time.monotonic())
-        ):
-            raise TimeoutError("initialization is busy")
-        try:
-            self._connect_session(session, deadline)
-        finally:
-            session["connection_lock"].release()
+    def connect_session(self, session):
+        with session["connection_lock"]:
+            self._connect_session(session)
 
-    def _connect_session(self, session, deadline):
+    def _connect_session(self, session):
         # Backend restarts invalidate old transport sessions; never replay a tool.
         receipt = browser.process_receipt("server")
         generation = (receipt or {}).get("start")
@@ -318,7 +294,7 @@ class Handler(BaseHTTPRequestHandler):
             "POST",
             session,
             session["initialize"],
-            max(0.01, deadline - time.monotonic()),
+            None,
         )
         try:
             payload = response.read(MAX_BODY)
@@ -334,23 +310,20 @@ class Handler(BaseHTTPRequestHandler):
             "POST",
             session,
             {"jsonrpc": "2.0", "method": "notifications/initialized"},
-            max(0.01, deadline - time.monotonic()),
+            None,
         )
         response.close()
         connection.close()
 
     def forward(self, method, shell, sid, session, message):
-        deadline = time.monotonic() + self.server.timeout_seconds
         connection = None
         sent = False
         is_tool = bool(message and message.get("method") == "tools/call")
         outcome = "failed"
         try:
-            self.connect_session(session, deadline)
-            connection, response = self.upstream(
-                method, session, message, max(0.01, deadline - time.monotonic())
-            )
-            # Stream SSE without buffering page content or unbounded waits.
+            self.connect_session(session)
+            connection, response = self.upstream(method, session, message, None)
+            # Stream SSE without buffering page content.
             chunks = []
             self.send_response(response.status)
             content_type = response.getheader("Content-Type", "application/json")
@@ -361,11 +334,6 @@ class Handler(BaseHTTPRequestHandler):
             sent = True
             size = 0
             while True:
-                remaining = deadline - time.monotonic()
-                if method != "GET" and remaining <= 0:
-                    raise TimeoutError()
-                if connection.sock:
-                    connection.sock.settimeout(None if method == "GET" else remaining)
                 chunk = response.read1(65536)
                 if not chunk:
                     break
@@ -397,37 +365,27 @@ class Handler(BaseHTTPRequestHandler):
             if message and message.get("method") == "tools/list" and success:
                 self.server.tools = payload.get("result", {}).get("tools", [])
         except (OSError, ValueError, http.client.HTTPException) as exc:
-            timed_out = isinstance(exc, (TimeoutError, socket.timeout))
-            if timed_out:
-                # The action can have reached the browser even though its response
-                # missed our deadline. DELETE is terminal in Streamable HTTP: it
-                # disposes Playwright's backend, closes its tab group, and forces a
-                # fresh extension approval. Preserve the session and require the
-                # caller to inspect before attempting another mutation.
-                outcome = "timed out; session preserved"
-            else:
-                session["connected"] = False
-                if session.get("upstream"):
-                    try:
-                        cancel, canceled = self.upstream("DELETE", session, None, 1)
-                        canceled.close()
-                        cancel.close()
-                    except (OSError, http.client.HTTPException):
-                        pass
-                session["upstream"] = None
-                outcome = (
-                    "extension not connected"
-                    if isinstance(exc, ConnectionError)
-                    else "upstream error"
-                )
-            error_text = TIMED_OUT if timed_out else DISCONNECTED
+            session["connected"] = False
+            if session.get("upstream"):
+                try:
+                    cancel, canceled = self.upstream("DELETE", session, None, 1)
+                    canceled.close()
+                    cancel.close()
+                except (OSError, http.client.HTTPException):
+                    pass
+            session["upstream"] = None
+            outcome = (
+                "extension not connected"
+                if isinstance(exc, ConnectionError)
+                else "upstream error"
+            )
             if not sent:
-                self.error(message or {}, error_text)
+                self.error(message or {}, DISCONNECTED)
             elif method == "POST":
                 error = {
                     "jsonrpc": "2.0",
                     "id": (message or {}).get("id"),
-                    "error": {"code": -32000, "message": error_text},
+                    "error": {"code": -32000, "message": DISCONNECTED},
                 }
                 wire = json.dumps(error).encode()
                 if "text/event-stream" in content_type:
