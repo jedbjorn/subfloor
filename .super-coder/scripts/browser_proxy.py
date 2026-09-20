@@ -22,6 +22,10 @@ DISARMED = "Browser is disarmed; ask the FnB to arm it in Scripts → Browser."
 DISCONNECTED = (
     "extension not connected: run sc browser open and ask the FnB to approve this connection"
 )
+TIMED_OUT = (
+    "browser action timed out; the connection was preserved but the outcome is unknown. "
+    "Inspect current state before repeating the action"
+)
 
 
 def rpc_result(body: bytes) -> dict:
@@ -42,7 +46,13 @@ class Gate(ThreadingHTTPServer):
     daemon_threads = True
 
     def __init__(
-        self, address, config, *, state=None, profile_check=None, timeout=browser.TIMEOUT
+        self,
+        address,
+        config,
+        *,
+        state=None,
+        profile_check=None,
+        timeout=browser.PROXY_TIMEOUT,
     ):
         super().__init__(address, Handler)
         self.config = config
@@ -387,27 +397,37 @@ class Handler(BaseHTTPRequestHandler):
             if message and message.get("method") == "tools/list" and success:
                 self.server.tools = payload.get("result", {}).get("tools", [])
         except (OSError, ValueError, http.client.HTTPException) as exc:
-            session["connected"] = False
-            if session.get("upstream"):
-                try:
-                    cancel, canceled = self.upstream("DELETE", session, None, 1)
-                    canceled.close()
-                    cancel.close()
-                except (OSError, http.client.HTTPException):
-                    pass
-            session["upstream"] = None
-            outcome = (
-                "extension not connected"
-                if isinstance(exc, (TimeoutError, socket.timeout, ConnectionError))
-                else "upstream error"
-            )
+            timed_out = isinstance(exc, (TimeoutError, socket.timeout))
+            if timed_out:
+                # The action can have reached the browser even though its response
+                # missed our deadline. DELETE is terminal in Streamable HTTP: it
+                # disposes Playwright's backend, closes its tab group, and forces a
+                # fresh extension approval. Preserve the session and require the
+                # caller to inspect before attempting another mutation.
+                outcome = "timed out; session preserved"
+            else:
+                session["connected"] = False
+                if session.get("upstream"):
+                    try:
+                        cancel, canceled = self.upstream("DELETE", session, None, 1)
+                        canceled.close()
+                        cancel.close()
+                    except (OSError, http.client.HTTPException):
+                        pass
+                session["upstream"] = None
+                outcome = (
+                    "extension not connected"
+                    if isinstance(exc, ConnectionError)
+                    else "upstream error"
+                )
+            error_text = TIMED_OUT if timed_out else DISCONNECTED
             if not sent:
-                self.error(message or {}, DISCONNECTED)
+                self.error(message or {}, error_text)
             elif method == "POST":
                 error = {
                     "jsonrpc": "2.0",
                     "id": (message or {}).get("id"),
-                    "error": {"code": -32000, "message": DISCONNECTED},
+                    "error": {"code": -32000, "message": error_text},
                 }
                 wire = json.dumps(error).encode()
                 if "text/event-stream" in content_type:

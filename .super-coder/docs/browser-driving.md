@@ -95,9 +95,10 @@ a small environment allowlist without upstream token/config overrides.
 The proxy exposes `/mcp/<SHORTNAME>`, substitutes `Subfloor <SHORTNAME>` in
 clientInfo, and binds sessions to that path. Tool calls refuse while disarmed or
 when the linked profile becomes unavailable. An unapproved/disconnected extension
-fails within the 30-second request budget (plus at most one second for cleanup);
-actions are never retried. Overlapping requests for one session refuse rather
-than queue. Timeouts can have an unknown action outcome: obtain a new directive
+fails within the 30-second action budget plus at most one second for Playwright
+to return its structured result. Actions are never retried. Overlapping requests
+for one session refuse rather than queue. A proxy timeout preserves the approved
+upstream session and can have an unknown action outcome: obtain a new directive
 and inspect before repeating a mutation.
 
 SSE and JSON responses pass through. Each call records timestamp, shell, tool,

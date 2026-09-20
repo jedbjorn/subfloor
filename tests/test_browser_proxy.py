@@ -31,6 +31,9 @@ def gates(tmp_path, monkeypatch):
             if method == "tools/call" and msg["params"]["name"] == "slow":
                 gate.slow_started.set()
                 time.sleep(0.3)
+            if method == "tools/call" and msg["params"]["name"] == "disconnect":
+                self.close_connection = True
+                return
             result = (
                 {"tools": [{"name": "browser_snapshot"}]}
                 if method == "tools/list"
@@ -53,6 +56,12 @@ def gates(tmp_path, monkeypatch):
             except BrokenPipeError:
                 pass
 
+        def do_DELETE(self):
+            gate.deleted.set()
+            self.send_response(200)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+
     upstream = ThreadingHTTPServer(("127.0.0.1", 0), Upstream)
     threading.Thread(target=upstream.serve_forever, daemon=True).start()
     config = {"armed": True, "browser_port": upstream.server_port}
@@ -66,6 +75,7 @@ def gates(tmp_path, monkeypatch):
         timeout=0.15,
     )
     gate.slow_started = threading.Event()
+    gate.deleted = threading.Event()
     threading.Thread(target=gate.serve_forever, daemon=True).start()
     yield gate, config, calls
     gate.shutdown()
@@ -142,14 +152,43 @@ def test_disarmed_discovery_and_named_refusal(gates):
     assert not calls
 
 
-def test_timeout_is_named_and_not_replayed(gates):
+def test_timeout_preserves_upstream_session_and_is_not_replayed(gates):
     gate, _config, calls = gates
     sid, _, _ = request(gate, "DEV5", "initialize")
     started = time.monotonic()
     _, result, _ = request(gate, "DEV5", "tools/call", sid, {"name": "slow"})
-    assert "extension not connected" in result["error"]["message"]
+    assert "connection was preserved" in result["error"]["message"]
+    assert "outcome is unknown" in result["error"]["message"]
     assert time.monotonic() - started < 0.5
     assert sum(m["method"] == "tools/call" for m in calls) == 1
+    assert not gate.deleted.is_set()
+
+    time.sleep(0.2)
+    _, recovered, _ = request(
+        gate, "DEV5", "tools/call", sid, {"name": "browser_snapshot"}
+    )
+    assert "result" in recovered
+    assert sum(m["method"] == "initialize" for m in calls) == 1
+
+
+def test_transport_loss_terminates_and_recreates_upstream_session(gates):
+    gate, _config, calls = gates
+    sid, _, _ = request(gate, "DEV5", "initialize")
+    _, result, _ = request(
+        gate, "DEV5", "tools/call", sid, {"name": "disconnect"}
+    )
+    assert "extension not connected" in result["error"]["message"]
+    assert gate.deleted.wait(0.5)
+
+    _, recovered, _ = request(
+        gate, "DEV5", "tools/call", sid, {"name": "browser_snapshot"}
+    )
+    assert "result" in recovered
+    assert sum(m["method"] == "initialize" for m in calls) == 2
+
+
+def test_proxy_deadline_allows_playwright_to_report_action_timeout():
+    assert browser.PROXY_TIMEOUT == browser.TIMEOUT + 1
 
 
 def test_guard_refusal_does_not_reach_upstream(gates):
@@ -199,4 +238,4 @@ def test_concurrent_shells_and_no_same_session_queue(gates):
     _, busy, _ = request(gate, "DEV5", "tools/call", a, {"name": "browser_click"})
     assert "not queued" in busy["error"]["message"]
     worker.join(timeout=1)
-    assert results and "extension not connected" in results[0]["error"]["message"]
+    assert results and "connection was preserved" in results[0]["error"]["message"]
