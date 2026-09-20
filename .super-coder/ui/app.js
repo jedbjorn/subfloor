@@ -2089,8 +2089,8 @@ async function openBrowserModal(onChange) {
   const st = await api("/browser");
   const cfg = st.config || st.defaults;
   const profile = el("input", { value: "Subfloor", readOnly: true });
-  const directory = el("input", { value: cfg.user_data_dir });
-  const executable = el("input", { value: cfg.executable });
+  const directory = el("input", { value: cfg.user_data_dir, placeholder: "Auto-detect" });
+  const executable = el("input", { value: cfg.executable, placeholder: "Auto-detect" });
   const result = el("pre", { className: "doc-body" }, browserStatusText(st));
   // A container engine seat can reach neither the operator's Chromium profile
   // nor its process table, so setup is refused there rather than failing on a
@@ -2101,13 +2101,15 @@ async function openBrowserModal(onChange) {
       + "re-run ./sc launch there before linking a profile."
     : "1. Create a Chromium profile named Subfloor. 2. Install the Playwright Extension in it. " +
     "3. Sign in to the accounts you intend shells to use. 4. Check and link below. " +
-    "Keep Subfloor open for browser tasks and approve every new connection yourself.");
+    "Paths are detected automatically. Agents can open Subfloor; approve each new connection yourself.");
   const extension = el("a", { href: "https://chromewebstore.google.com/detail/mmlmfjhmonkocbjadbfplnigmagldckm", target: "_blank", rel: "noopener noreferrer" }, "Playwright Extension");
   const form = el("div", { className: "modal-form" },
     el("span", { className: "k" }, "Profile display name"), profile,
     el("span", { className: "k" }, "Chromium user data directory"), directory,
-    el("span", { className: "k" }, "Native Chromium executable"), executable);
-  const candidate = () => ({ profile_name: profile.value, user_data_dir: directory.value.trim(), executable: executable.value.trim() });
+    el("span", { className: "k" }, "Chromium executable or launcher"), executable);
+  const candidate = () => ({ profile_name: profile.value,
+    ...(directory.value.trim() ? { user_data_dir: directory.value.trim() } : {}),
+    ...(executable.value.trim() ? { executable: executable.value.trim() } : {}) });
   const action = async (verb, config) => {
     result.textContent = "checking…";
     try {
@@ -2127,20 +2129,24 @@ async function openBrowserModal(onChange) {
     if (receipt) arm.textContent = receipt.armed ? "disarm" : "arm";
     arm.disabled = false;
   };
+  const open = el("button", { className: "act", textContent: "open Subfloor", disabled: unsupported || !st.config });
+  open.onclick = () => action("open");
+  const doctor = el("button", { className: "act", textContent: "diagnose / repair", disabled: unsupported });
+  doctor.onclick = () => action("doctor");
   const disable = el("button", { className: "act", textContent: "disable browser", disabled: unsupported });
   disable.onclick = async () => {
     disable.disabled = true;
-    if (await action("disable")) arm.disabled = true;
+    if (await action("disable")) { arm.disabled = true; open.disabled = true; }
     disable.disabled = false;
   };
   const save = el("button", { className: "act primary", textContent: "link profile", disabled: unsupported });
   const cancel = el("button", { className: "act", textContent: "close" });
   const close = openActionModal({ title: "Browser", width: 680, height: 700,
-    bodyNode: el("div", {}, note, extension, form, check, arm, disable, result),
+    bodyNode: el("div", {}, note, extension, form, check, open, doctor, arm, disable, result),
     dismissNode: cancel, actionNode: save });
   save.onclick = async () => {
     save.disabled = true;
-    if (await action("link", candidate())) { arm.disabled = false; arm.textContent = "disarm"; }
+    if (await action("link", candidate())) { arm.disabled = false; open.disabled = false; arm.textContent = "disarm"; }
     save.disabled = false;
   };
   cancel.onclick = close;

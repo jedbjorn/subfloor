@@ -57,8 +57,8 @@ jobs:
         run: pip install pytest -r requirements.txt
       - name: Install exact OpenCode compatibility binary
         run: npm install --global opencode-ai@1.18.9
-      - name: Install the locked browser MCP compatibility set
-        run: npm ci --prefix .super-coder/browser --ignore-scripts --no-audit --no-fund
+      - name: Install and exercise the current browser MCP
+        run: npm install --prefix .super-coder/browser --ignore-scripts --no-audit --no-fund --package-lock=false
       - name: Run the suite
         run: ./sc test tests/ -q
         env:

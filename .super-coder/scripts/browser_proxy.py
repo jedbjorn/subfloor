@@ -20,7 +20,7 @@ import browser
 MAX_BODY = 4 * 1024 * 1024
 DISARMED = "Browser is disarmed; ask the FnB to arm it in Scripts → Browser."
 DISCONNECTED = (
-    "extension not connected: open Subfloor and ask the FnB to approve this connection"
+    "extension not connected: run sc browser open and ask the FnB to approve this connection"
 )
 
 
@@ -42,12 +42,12 @@ class Gate(ThreadingHTTPServer):
     daemon_threads = True
 
     def __init__(
-        self, address, config, *, state=None, window_check=None, timeout=browser.TIMEOUT
+        self, address, config, *, state=None, profile_check=None, timeout=browser.TIMEOUT
     ):
         super().__init__(address, Handler)
         self.config = config
         self.state = state or browser.read
-        self.window_check = window_check or browser.guard.check
+        self.profile_check = profile_check or browser.guard.check
         self.timeout_seconds = timeout
         self.sessions = {}
         self.lock = threading.RLock()
@@ -246,7 +246,7 @@ class Handler(BaseHTTPRequestHandler):
                 arguments = message.get("params", {}).get("arguments", {})
                 if not isinstance(arguments, dict):
                     raise TypeError("tool arguments must be an object")
-                self.server.window_check(config)
+                self.server.profile_check(config)
             except (ValueError, TypeError) as exc:
                 session["connected"] = False
                 self.server.audit(shell, message, "extension not connected")

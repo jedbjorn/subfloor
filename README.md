@@ -123,12 +123,14 @@ The guide is themed Markdown: read it on GitHub or
 
 Opt in with `./sc feature enable browser`, then use **Scripts → Browser** to
 link a dedicated Chromium profile named **Subfloor** with the Playwright
-Extension. You create the profile, sign in to the intended accounts, keep its
-window open, and approve each new shell connection. Claude, Codex, and OpenCode
+Extension. You create the profile, sign in to the intended accounts, and
+approve each new shell connection. Agents can launch it with `sc browser open`. Claude, Codex, and OpenCode
 on bare metal can then use `drive_browser` for a named task or logged-in preview
 check. Kimi, Vibe, and container seats are unsupported.
 
-`./sc browser doctor --json` verifies the locked package set and setup.
+`./sc browser setup --json` detects and links the existing profile.
+`./sc browser doctor --json` checks capabilities, repairs packages, and separates
+setup readiness from an observed extension connection.
 `./sc browser disarm` suspends access; `./sc feature disable browser` stops the
 services and removes the feature grants. See the
 [browser design and operator checklist](.super-coder/docs/browser-driving.md)

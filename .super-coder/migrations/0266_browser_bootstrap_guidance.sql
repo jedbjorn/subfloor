@@ -1,12 +1,6 @@
----
-name: drive_browser
-description: Drive the FnB's dedicated Chromium Subfloor profile through the managed Playwright extension for a named browser task or logged-in dev-preview check. Bare metal with Claude, Codex, or OpenCode only; Admin uses the same surface for diagnosis and repair.
-category: substrate
-command: sc browser
-common: false
----
-
-# drive_browser
+-- Replace obsolete window-gate and pinned-package guidance (issue #1617).
+BEGIN;
+UPDATE skills SET content='# drive_browser
 
 Use only under an FnB directive naming the task, site/app, and allowed actions.
 Restate that reach before the first browser call. If no directive exists, ask.
@@ -24,7 +18,7 @@ The returned `proxy_url` is yours and the tab group is
 Run `sc browser open --json` to launch the linked, existing Subfloor profile.
 No live window is required. The FnB still approves each new shell connection
 in the Playwright Extension; never click that approval control yourself. Work
-only in your tab group, without moving or touching other groups' tabs.
+only in your tab group, without moving or touching other groups'' tabs.
 
 Snapshot before acting, preferring accessibility snapshots over screenshots.
 Save screenshots/downloads only in the returned output directory. Close the
@@ -36,12 +30,13 @@ is unapproved; it does not prove the profile window is closed. Report and stop; 
 action has an unknown outcome: inspect only after a new directive to resume,
 rather than replaying a mutation. `disarmed` requires the FnB to arm it.
 
-Admin diagnosis/repair stays under the operator's named assignment. The FnB's
+Admin diagnosis/repair stays under the operator''s named assignment. The FnB''s
 host terminal can run `sc browser setup --json` to detect and link the existing
 profile, or `doctor`, `up`, `down`, `arm`, and `disarm`. Launched shell credentials
 permit `status` and (with this grant) `open`; they cannot set paths or arm. Doctor
 checks actual package capabilities and repairs missing or incompatible private
 packages without version pins. It reports `setup_ready` separately from
 `connection_ready`; `ok` requires both and running, armed services. Creating profiles, installing the extension, logins,
-and approval clicks remain human steps. See the engine's
-`.super-coder/docs/browser-driving.md` for the setup and live acceptance record.
+and approval clicks remain human steps. See the engine''s
+`.super-coder/docs/browser-driving.md` for the setup and live acceptance record.' WHERE name='drive_browser' AND is_deleted=0;
+COMMIT;

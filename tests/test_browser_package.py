@@ -1,4 +1,4 @@
-"""Exact installed package compatibility; mandatory in the PR test job."""
+"""Exercise installed upstream capabilities; mandatory in the PR test job."""
 
 import json
 import os
@@ -19,9 +19,9 @@ def package(tmp_path, monkeypatch):
     if not (source / "node_modules").exists():
         if os.environ.get("SC_REQUIRE_BROWSER_PACKAGE_CANARY"):
             pytest.fail(
-                "CI requires npm ci --prefix .super-coder/browser --ignore-scripts"
+                "CI requires npm install --prefix .super-coder/browser --ignore-scripts --package-lock=false"
             )
-        pytest.skip("locked browser package is not installed in this test seat")
+        pytest.skip("browser package is not installed in this test seat")
     shutil.copytree(source, tmp_path / "package", symlinks=True)
     monkeypatch.setattr(browser, "private", lambda: tmp_path)
     return tmp_path / "package"
@@ -30,34 +30,74 @@ def package(tmp_path, monkeypatch):
 def test_installed_resolution_and_profile_flag(package):
     receipt = browser.package_check()
     assert receipt["ok"], receipt
-    assert receipt["versions"] == browser.VERSIONS
+    assert set(receipt["versions"]) == set(browser.PACKAGES)
 
 
-@pytest.mark.parametrize("drift", ["manifest", "lock", "top-level", "nested"])
-def test_doctor_rejects_existing_drift_without_reinstall(package, drift):
-    if drift in ("manifest", "lock"):
-        file = package / (
-            "package.json" if drift == "manifest" else "package-lock.json"
-        )
+def test_package_versions_and_lock_are_not_admission_gates(package):
+    for name in browser.PACKAGES:
+        file = package / "node_modules" / name / "package.json"
         value = json.loads(file.read_text())
-        value.pop("overrides", None)
-        value["drift"] = True
+        value["version"] = "999.0.0"
         file.write_text(json.dumps(value))
-    elif drift == "top-level":
-        file = package / "node_modules/playwright-core/package.json"
-        value = json.loads(file.read_text())
-        value["version"] = "1.63.0-alpha-2026-08-31"
-        file.write_text(json.dumps(value))
-    else:
-        directory = (
-            package / "node_modules/@playwright/mcp/node_modules/playwright-core"
-        )
-        directory.mkdir(parents=True)
-        (directory / "package.json").write_text(
-            '{"name":"playwright-core","version":"1.63.0-alpha-2026-08-31"}'
-        )
-    receipt = browser.package_check(install=True)
+    (package / "package-lock.json").write_text("not a lock")
+    assert browser.package_check()["ok"]
+
+
+def test_missing_cli_capability_is_reported(package):
+    (package / "node_modules/@playwright/mcp/cli.js").write_text(
+        "console.log('--extension')"
+    )
+    receipt = browser.package_check()
     assert receipt["ok"] is False
+    assert "--profile-dir-name" in receipt["error"]
+
+
+def test_failed_repair_keeps_previous_tree(package, monkeypatch):
+    (package / "node_modules/@playwright/mcp/cli.js").write_text("process.exit(1)")
+    original = browser.subprocess.run
+
+    def run(args, **kwargs):
+        if "install" in args:
+            return browser.subprocess.CompletedProcess(
+                args, 1, "", "fixture registry offline"
+            )
+        return original(args, **kwargs)
+
+    monkeypatch.setattr(browser.subprocess, "run", run)
+    receipt = browser.package_check(install=True)
+    assert not receipt["ok"] and "registry offline" in receipt["error"]
+    assert (
+        package / "node_modules/@playwright/mcp/cli.js"
+    ).read_text() == "process.exit(1)"
+
+
+def test_repair_replaces_incomplete_tree_after_validation(package, monkeypatch):
+    original = browser.subprocess.run
+    events = []
+
+    def run(args, **kwargs):
+        if "install" in args:
+            candidate = Path(args[args.index("--prefix") + 1])
+            shutil.copytree(package / "node_modules", candidate / "node_modules")
+            return browser.subprocess.CompletedProcess(args, 0, "", "")
+        return original(args, **kwargs)
+
+    monkeypatch.setattr(browser.subprocess, "run", run)
+    inspect = browser.inspect_package
+    monkeypatch.setattr(
+        browser,
+        "inspect_package",
+        lambda node, target: (
+            {"ok": False, "error": "incomplete", "versions": {}}
+            if target == package
+            else inspect(node, target)
+        ),
+    )
+    monkeypatch.setattr(browser, "stop_process", lambda name: events.append(name))
+    receipt = browser.package_check(install=True)
+    assert receipt["ok"] and receipt["repaired"]
+    assert events == ["proxy", "server"]
+    assert inspect(shutil.which("node"), package)["ok"]
 
 
 def test_server_argv_and_environment_are_not_upstream_configurable(

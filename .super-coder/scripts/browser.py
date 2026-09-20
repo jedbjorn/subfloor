@@ -5,14 +5,15 @@ from __future__ import annotations
 
 import argparse
 import fcntl
-import hashlib
 import json
 import os
+import re
 import select
 import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import urllib.request
 from contextlib import contextmanager
 from pathlib import Path
@@ -22,10 +23,20 @@ import instance_state
 import ports
 
 ENGINE = Path(__file__).resolve().parents[1]
-VERSIONS = {
-    "@playwright/mcp": "0.0.80",
-    "playwright": "1.63.0",
-    "playwright-core": "1.63.0",
+PACKAGES = ("@playwright/mcp", "playwright", "playwright-core")
+REQUIRED_FLAGS = {
+    "--extension",
+    "--profile-dir-name",
+    "--user-data-dir",
+    "--executable-path",
+    "--host",
+    "--allowed-hosts",
+    "--port",
+    "--output-dir",
+    "--save-session",
+    "--timeout-action",
+    "--timeout-navigation",
+    "--blocked-origins",
 }
 EXTENSION_ID = "mmlmfjhmonkocbjadbfplnigmagldckm"
 TIMEOUT = 30
@@ -79,11 +90,9 @@ def validate(value: dict) -> dict:
         raise ValueError("browser profile_dir_name must be one directory name")
     if result.get("channel") != "chromium":
         raise ValueError("browser channel must be chromium")
-    if (
-        result.get("server_version") != VERSIONS["@playwright/mcp"]
-        or result.get("playwright_version") != VERSIONS["playwright"]
-    ):
-        raise ValueError("browser package versions differ from the engine lock")
+    # Old installations carry version receipts. They are not admission gates.
+    for field in ("server_version", "playwright_version"):
+        result.pop(field, None)
     for field in ("browser_port", "proxy_port"):
         if type(result.get(field)) is not int or not 8800 <= result[field] < 8900:
             raise ValueError(f"browser {field} must be in 8800..8899")
@@ -134,106 +143,31 @@ def lifecycle_lock():
         os.close(fd)
 
 
-def package_check(*, install: bool = False) -> dict:
-    node = shutil.which("node")
-    if not node:
-        return {
-            "ok": False,
-            "state": "unavailable",
-            "error": "Node >=20 is required",
-            "versions": {},
-        }
-    version = subprocess.run(
-        [node, "--version"], capture_output=True, text=True, timeout=5, check=True
-    ).stdout.strip()
-    if int(version.lstrip("v").split(".")[0]) < 20:
-        return {
-            "ok": False,
-            "state": "unavailable",
-            "error": "Node >=20 is required",
-            "node": version,
-            "versions": {},
-        }
-    source = ENGINE / "browser"
-    target = private() / "package"
-    expected = json.loads((source / "package.json").read_text())
-    if expected.get("dependencies") != {
-        "@playwright/mcp": VERSIONS["@playwright/mcp"]
-    } or expected.get("overrides") != {
-        k: VERSIONS[k] for k in ("playwright", "playwright-core")
-    }:
-        raise ValueError("engine browser manifest drift")
-    lock_bytes = (source / "package-lock.json").read_bytes()
-    lock = json.loads(lock_bytes)
-    for name, wanted in VERSIONS.items():
-        if lock["packages"].get("node_modules/" + name, {}).get("version") != wanted:
-            raise ValueError(f"engine browser lock drift: {name}")
-    if install and not (target / "node_modules").exists():
-        npm = shutil.which("npm")
-        if not npm:
-            raise ValueError("npm is required to install the locked browser package")
-        target.mkdir(mode=0o700, exist_ok=True)
-        for filename in ("package.json", "package-lock.json"):
-            shutil.copyfile(source / filename, target / filename)
-        completed = subprocess.run(
-            [
-                npm,
-                "ci",
-                "--prefix",
-                str(target),
-                "--ignore-scripts",
-                "--no-audit",
-                "--no-fund",
-            ],
-            capture_output=True,
-            text=True,
-            timeout=120,
-            check=False,
-        )
-        if completed.returncode:
-            raise ValueError(
-                "locked browser installation failed: " + completed.stderr[-2000:]
-            )
-    resolved = {}
-    for name in VERSIONS:
-        path = target / "node_modules" / name / "package.json"
-        resolved[name] = (
-            json.loads(path.read_text()).get("version") if path.is_file() else None
-        )
-    # Check the dependency resolution used by the CLI, including shadowing by
-    # nested node_modules (top-level package versions alone do not prove it).
-    resolution_ok = False
-    if resolved == VERSIONS:
-        script = """const { createRequire } = require('module');
+def inspect_package(node: str, target: Path) -> dict:
+    """Exercise the installed CLI and report its actual dependency resolution."""
+    script = """const { createRequire } = require('module');
 const root = createRequire(process.argv[1]);
 const mcp = root.resolve('@playwright/mcp/package.json');
 const fromMcp = createRequire(mcp);
 const pw = fromMcp.resolve('playwright/package.json');
 const core = fromMcp.resolve('playwright-core/package.json');
-const fromPw = createRequire(pw);
-console.log(JSON.stringify([mcp, pw, core, fromPw.resolve('playwright-core/package.json')]));"""
-        checked = subprocess.run(
+console.log(JSON.stringify(Object.fromEntries([mcp, pw, core].map(p => {
+  const v = require(p); return [v.name, v.version];
+}))));"""
+    resolved = {}
+    try:
+        probe = subprocess.run(
             [node, "-e", script, str(target / "package.json")],
             capture_output=True,
             text=True,
-            timeout=5,
+            timeout=10,
             check=False,
         )
-        expected_paths = [
-            str(target / "node_modules" / name / "package.json") for name in VERSIONS
-        ]
-        resolution_ok = checked.returncode == 0 and json.loads(checked.stdout) == [
-            *expected_paths,
-            expected_paths[-1],
-        ]
-    same_lock = (target / "package-lock.json").is_file() and (
-        target / "package-lock.json"
-    ).read_bytes() == lock_bytes
-    same_manifest = (target / "package.json").is_file() and json.loads(
-        (target / "package.json").read_text()
-    ) == expected
-    ok = resolved == VERSIONS and same_lock and same_manifest and resolution_ok
-    if ok:
+        if probe.returncode:
+            raise ValueError("browser package dependencies are missing or cannot load")
+        resolved = json.loads(probe.stdout)
+        if not all(resolved.get(name) for name in PACKAGES):
+            raise ValueError("browser package dependencies are incomplete")
         help_result = subprocess.run(
             [node, str(target / "node_modules/@playwright/mcp/cli.js"), "--help"],
             capture_output=True,
@@ -241,35 +175,249 @@ console.log(JSON.stringify([mcp, pw, core, fromPw.resolve('playwright-core/packa
             timeout=10,
             check=False,
         )
-        ok = help_result.returncode == 0 and "--profile-dir-name" in help_result.stdout
-    return {
-        "ok": ok,
-        "node": version,
-        "versions": resolved,
-        "lock_sha256": hashlib.sha256(lock_bytes).hexdigest(),
-        "error": None
-        if ok
-        else "browser packages missing or drifted; doctor installs only an absent package tree",
-    }
+        if help_result.returncode:
+            raise ValueError(
+                "browser MCP CLI cannot run: " + help_result.stderr[-1000:]
+            )
+        missing = sorted(
+            REQUIRED_FLAGS - set(re.findall(r"--[a-z][a-z-]*", help_result.stdout))
+        )
+        if missing:
+            raise ValueError(
+                "browser MCP lacks required capabilities: " + ", ".join(missing)
+            )
+    except (OSError, ValueError, subprocess.SubprocessError) as exc:
+        return {"ok": False, "versions": resolved, "error": str(exc)}
+    return {"ok": True, "versions": resolved, "error": None}
+
+
+def package_check(*, install: bool = False) -> dict:
+    node = shutil.which("node")
+    if not node:
+        return {"ok": False, "error": "Node >=20 and npm are required", "versions": {}}
+    version = subprocess.run(
+        [node, "--version"], capture_output=True, text=True, timeout=5, check=True
+    ).stdout.strip()
+    if int(version.lstrip("v").split(".")[0]) < 20:
+        return {
+            "ok": False,
+            "error": "Node >=20 is required",
+            "node": version,
+            "versions": {},
+        }
+    target = private() / "package"
+    receipt = inspect_package(node, target)
+    if receipt["ok"] or not install:
+        return {**receipt, "node": version}
+    npm = shutil.which("npm")
+    if not npm:
+        return {
+            **receipt,
+            "node": version,
+            "error": "npm is required to bootstrap browser packages",
+        }
+    # Prepare and verify a fresh tree before replacing anything. An interrupted
+    # or incompatible install never destroys the previous installation.
+    with tempfile.TemporaryDirectory(
+        prefix="package-install-", dir=private()
+    ) as staging:
+        candidate = Path(staging) / "package"
+        candidate.mkdir(mode=0o700)
+        shutil.copyfile(ENGINE / "browser/package.json", candidate / "package.json")
+        try:
+            completed = subprocess.run(
+                [
+                    npm,
+                    "install",
+                    "--prefix",
+                    str(candidate),
+                    "--ignore-scripts",
+                    "--no-audit",
+                    "--no-fund",
+                    "--package-lock=false",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=120,
+                check=False,
+            )
+            if completed.returncode:
+                raise ValueError(
+                    "browser package installation failed: " + completed.stderr[-2000:]
+                )
+            receipt = inspect_package(node, candidate)
+            if not receipt["ok"]:
+                return {**receipt, "node": version}
+        except (OSError, ValueError, subprocess.SubprocessError) as exc:
+            return {"ok": False, "node": version, "versions": {}, "error": str(exc)}
+        stop_process("proxy")
+        stop_process("server")
+        previous = Path(staging) / "previous"
+        if target.exists():
+            target.rename(previous)
+        try:
+            candidate.rename(target)
+        except OSError:
+            if previous.exists():
+                previous.rename(target)
+            raise
+    return {**receipt, "node": version, "repaired": True}
+
+
+def extension_installed(profile: Path) -> bool:
+    # Match upstream detection, including externally installed/unpacked
+    # extensions recorded in Preferences rather than the Extensions directory.
+    if (profile / "Extensions" / EXTENSION_ID).is_dir():
+        return True
+    for name in ("Preferences", "Secure Preferences"):
+        try:
+            prefs = json.loads((profile / name).read_text())
+            record = prefs.get("extensions", {}).get("settings", {}).get(EXTENSION_ID)
+            if isinstance(record, dict) and record:
+                return True
+        except (OSError, ValueError, AttributeError):
+            continue
+    return False
 
 
 def profile_checks(config: dict) -> dict:
     config = validate(config)
     path = Path(config["user_data_dir"]) / config["profile_dir_name"]
-    # The host operator chooses this root; validate confines the profile name
-    # to one component. These probes intentionally inspect that chosen profile.
-    result = {
-        # codeql[py/path-injection]
-        "profile": path.is_dir(),
-        # codeql[py/path-injection]
-        "extension": (path / "Extensions" / EXTENSION_ID).is_dir(),
+    result: dict = {
+        "profile": False,
+        "extension": extension_installed(path),
     }
     try:
         guard.check(config)
-        result["window"] = True
+        result["profile"] = True
     except guard.GuardRefusal as exc:
-        result.update(window=False, error=str(exc))
+        result["error"] = str(exc)
+    if result["profile"] and not result["extension"]:
+        result["error"] = (
+            "Open Subfloor and install the Playwright Extension there, then approve the connection"
+        )
     return result
+
+
+def installations() -> list[dict]:
+    """Standard Linux Chromium-family roots paired with their launchers."""
+    root = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
+    choices = [
+        (root / "chromium", ("chromium", "chromium-browser")),
+        (root / "google-chrome", ("google-chrome", "google-chrome-stable")),
+        (
+            Path.home() / "snap/chromium/common/chromium",
+            ("chromium", "chromium-browser"),
+        ),
+    ]
+    found = []
+    for directory, commands in choices:
+        executable = next(
+            (path for name in commands if (path := shutil.which(name))), None
+        )
+        if executable and (directory / "Local State").is_file():
+            found.append({"user_data_dir": str(directory), "executable": executable})
+    return found
+
+
+def named_profiles(directory: Path) -> list[str]:
+    try:
+        state = json.loads((directory / "Local State").read_text())
+        return [
+            key
+            for key, info in state.get("profile", {}).get("info_cache", {}).items()
+            if info.get("name") == "Subfloor"
+        ]
+    except (OSError, ValueError, AttributeError) as exc:
+        raise ValueError(
+            f"Cannot read Chromium profiles in {directory}; check its user data directory"
+        ) from exc
+
+
+def defaults() -> dict:
+    """Only suggest an unambiguous existing profile; blank fields mean detect."""
+    if os.environ.get("SC_SANDBOX"):
+        return {"user_data_dir": "", "executable": ""}
+    candidates = []
+    for item in installations():
+        try:
+            if named_profiles(Path(item["user_data_dir"])):
+                candidates.append(item)
+        except (OSError, ValueError, AttributeError):
+            continue
+    if len(candidates) == 1:
+        return candidates[0]
+    return {"user_data_dir": "", "executable": ""}
+
+
+def resolve_paths(value: dict) -> tuple[Path, Path]:
+    # Validate all explicit inputs before touching the filesystem.
+    explicit = {
+        key: guard.operator_path(value[key])
+        for key in ("user_data_dir", "executable")
+        if key in value
+    }
+    detected = defaults()
+    directory = explicit.get("user_data_dir")
+    if directory is None:
+        if not detected["user_data_dir"]:
+            raise ValueError(
+                "Could not select one Subfloor profile. Create it in Chromium, or set its user data directory in Scripts → Browser"
+            )
+        directory = Path(detected["user_data_dir"])
+    executable = explicit.get("executable")
+    if executable is None:
+        matching = [
+            item for item in installations() if Path(item["user_data_dir"]) == directory
+        ]
+        path = (
+            matching[0]["executable"]
+            if matching
+            else shutil.which("chromium") or shutil.which("chromium-browser")
+        )
+        if not path:
+            raise ValueError(
+                "Chromium was not found on PATH; install it or set its executable in Scripts → Browser"
+            )
+        executable = Path(path)
+    return directory, executable
+
+
+def open_profile(*, harness: str | None = None, sandbox: bool = False) -> dict:
+    require_bare_metal()
+    if sandbox or (harness and harness not in SUPPORTED):
+        raise ValueError("unsupported seat or harness for browser driving")
+    with lifecycle_lock():
+        config = read()
+        if not config:
+            raise ValueError(
+                "browser is absent; link the existing Subfloor profile in Scripts → Browser"
+            )
+        if not config["armed"]:
+            raise ValueError(
+                "Browser is disarmed; ask the FnB to arm it in Scripts → Browser"
+            )
+        guard.check(config)
+        child = subprocess.Popen(
+            guard.command(config, []),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        try:
+            code = child.wait(timeout=0.2)
+        except subprocess.TimeoutExpired:
+            code = None
+        if code not in (None, 0):
+            raise ValueError(
+                f"Chromium launch failed (exit {code}); check the host graphical session"
+            )
+    return {
+        **status(harness=harness, sandbox=sandbox),
+        "launch_requested": True,
+        "detail": "Subfloor launch requested; approve the Playwright Extension connection when prompted",
+    }
 
 
 def link(value: dict, *, save: bool = True) -> dict:
@@ -277,39 +425,23 @@ def link(value: dict, *, save: bool = True) -> dict:
     require_bare_metal()
     if set(value) - {"executable", "user_data_dir", "profile_name", "blocked_origins"}:
         raise ValueError("unknown browser link field")
-    directory = guard.operator_path(
-        value.get("user_data_dir", str(Path.home() / ".config/chromium"))
-    )
-    executable = guard.operator_path(
-        value.get("executable", "/usr/lib/chromium/chromium")
-    )
-    # Host-operator setup accepts an arbitrary Chromium installation/profile
-    # root. The API gates shell credentials and cross-origin requests before
-    # this function. Never use it for paths supplied by MCP tools.
-    # codeql[py/path-injection]
-    state = json.loads((directory / "Local State").read_text())
+    directory, executable = resolve_paths(value)
     display = value.get("profile_name", "Subfloor")
     if display != "Subfloor":
         raise ValueError("use the dedicated profile named Subfloor")
-    matches = [
-        key
-        for key, info in state.get("profile", {}).get("info_cache", {}).items()
-        if info.get("name") == display
-    ]
+    matches = named_profiles(directory)
     if len(matches) != 1:
         raise ValueError("create exactly one Chromium profile named Subfloor first")
     allocation = ports.ensure_browser_ports()
     # codeql[py/path-injection]
     if not executable.is_file() or not os.access(executable, os.X_OK):
-        raise ValueError("set the absolute path to the native Chromium executable")
+        raise ValueError("set the absolute path to the Chromium executable or launcher")
     config = validate(
         {
             "executable": str(executable),
             "channel": "chromium",
             "user_data_dir": str(directory),
             "profile_dir_name": matches[0],
-            "server_version": VERSIONS["@playwright/mcp"],
-            "playwright_version": VERSIONS["playwright"],
             "browser_port": allocation["browser_port"],
             "proxy_port": allocation["browser_proxy_port"],
             "armed": True,
@@ -317,16 +449,21 @@ def link(value: dict, *, save: bool = True) -> dict:
         }
     )
     checks = profile_checks(config)
-    if not checks["profile"] or not checks["extension"]:
-        raise ValueError(
-            "create the Subfloor profile and install the Playwright Extension first"
-        )
+    if not checks["profile"]:
+        raise ValueError(checks["error"])
     with lifecycle_lock():
-        packages = package_check(install=True)
+        packages = package_check(install=save)
     if not packages["ok"]:
-        raise ValueError(packages["error"])
+        raise ValueError(
+            packages["error"]
+            + "; use link profile / sc browser setup to bootstrap, or doctor to repair"
+        )
     if not save:
-        return {"ok": True, "checks": checks, "packages": packages}
+        return {
+            "ok": checks["profile"] and checks["extension"],
+            "checks": checks,
+            "packages": packages,
+        }
     with lifecycle_lock():
         stop_process("proxy")
         stop_process("server")
@@ -503,13 +640,17 @@ def status(*, harness: str | None = None, sandbox: bool = False) -> dict:
     state = (
         "disarmed"
         if not config["armed"]
-        else ("ready" if server and proxy and checks["window"] else "declared")
+        else (
+            "ready"
+            if server and proxy and checks["profile"] and checks["extension"]
+            else "declared"
+        )
     )
     if config["armed"] and not server and (private() / "server.json").exists():
         state = "failed"
     if live.get("protocol_errors"):
         state = "failed"
-    if not config["armed"] or not server or not checks["window"]:
+    if not config["armed"] or not server or not checks["profile"]:
         live = {"active_shells": [], "extension": "not connected"}
     return {
         "state": state,
@@ -518,6 +659,7 @@ def status(*, harness: str | None = None, sandbox: bool = False) -> dict:
         "server": server,
         "proxy": proxy,
         "checks": checks,
+        "connection_ready": bool(live.get("active_shells")),
         "approval": "FnB approval required for every new connection",
         **live,
     }
@@ -527,17 +669,25 @@ def operate(action: str) -> dict:
     require_bare_metal()
     if action == "status":
         return status()
+    if action == "open":
+        return open_profile()
     if action == "doctor":
         with lifecycle_lock():
             packages = package_check(install=True)
+        config = read()
+        if packages.get("repaired") and config and config["armed"]:
+            operate("up")
         st = status()
+        setup_ok = packages["ok"] and all(
+            st.get("checks", {}).get(key, False) for key in ("profile", "extension")
+        )
         return {
             **st,
             "packages": packages,
-            "ok": packages["ok"]
-            and not st.get("protocol_errors")
-            and st.get("checks", {}).get("profile", False)
-            and st.get("checks", {}).get("extension", False),
+            "setup_ready": setup_ok,
+            "ok": setup_ok
+            and st.get("state") == "ready"
+            and st.get("connection_ready", False),
         }
     with lifecycle_lock():
         config = read()
@@ -555,7 +705,7 @@ def operate(action: str) -> dict:
         if not config["armed"]:
             stop_process("server")
         elif action in ("up", "arm"):
-            packages = package_check()
+            packages = package_check(install=True)
             if not packages["ok"]:
                 raise ValueError(packages["error"])
             start_process("server", server_command(config), config)
@@ -604,11 +754,21 @@ def set_grants(con, enabled: bool) -> None:
 def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(prog="sc browser")
     parser.add_argument(
-        "action", choices=["status", "up", "down", "doctor", "arm", "disarm"]
+        "action",
+        choices=["status", "open", "up", "down", "doctor", "arm", "disarm", "setup"],
     )
     parser.add_argument("--json", action="store_true")
+    parser.add_argument("--executable")
+    parser.add_argument("--user-data-dir")
     args = parser.parse_args(argv)
     try:
+        config = {
+            key: value
+            for key in ("executable", "user_data_dir")
+            if (value := getattr(args, key)) is not None
+        }
+        if config and args.action != "setup":
+            raise ValueError("path options are only valid with browser setup")
         if os.environ.get("SC_API_TOKEN"):
             import mem
 
@@ -622,6 +782,8 @@ def main(argv: list[str]) -> int:
                     "harness": os.environ.get("SC_HARNESS"),
                 },
             )
+        elif args.action == "setup":
+            result = link(config)
         else:
             result = operate(args.action)
     except (ValueError, OSError, subprocess.SubprocessError) as exc:

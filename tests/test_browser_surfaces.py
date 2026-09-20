@@ -46,7 +46,8 @@ def api(tmp_path, monkeypatch):
 
 
 @pytest.mark.parametrize(
-    "action", ["arm", "disarm", "up", "down", "doctor", "link", "disable", "validate"]
+    "action",
+    ["arm", "disarm", "up", "down", "doctor", "link", "disable", "validate", "setup"],
 )
 def test_shell_cannot_mutate_browser(api, action):
     with (
@@ -176,6 +177,10 @@ async function api(path, method, body) {
   await button('check setup').onclick();
   assert.equal(calls.at(-1).body.action, 'validate');
   assert.equal(calls.at(-1).body.config.profile_name, 'Subfloor');
+  await button('open Subfloor').onclick();
+  assert.equal(calls.at(-1).body.action, 'open');
+  await button('diagnose / repair').onclick();
+  assert.equal(calls.at(-1).body.action, 'doctor');
   await button('disarm').onclick();
   assert.equal(calls.at(-1).body.action, 'disarm');
   await modal.actionNode.onclick();
@@ -224,7 +229,7 @@ async function api(path, method, body) {
   function walk(node) { return [node, ...(node.children || []).flatMap(x => typeof x === 'object' ? walk(x) : [])]; }
   const nodes = walk(modal.bodyNode);
   const buttons = nodes.filter(n => n.tag === 'button');
-  for (const text of ['check setup', 'arm', 'disable browser'])
+  for (const text of ['check setup', 'arm', 'disable browser', 'open Subfloor', 'diagnose / repair'])
     assert.equal(buttons.find(n => n.textContent === text).disabled, true, text);
   assert.equal(modal.actionNode.disabled, true);
   assert.equal(calls.length, 1, 'the modal only read status');
@@ -237,3 +242,57 @@ async function api(path, method, body) {
         ["node"], input=script, text=True, capture_output=True, check=False
     )
     assert result.returncode == 0, result.stderr
+
+
+def test_shell_open_requires_auth_and_grant(api):
+    with (
+        mock.patch.object(
+            browser, "open_profile", return_value={"launch_requested": True}
+        ) as opened,
+        mock.patch.object(browser, "read", return_value=None),
+    ):
+        assert api("open", route="/_sc/browser")[0] == 401
+        assert api("open", token="wrong", route="/_sc/browser")[0] == 401
+        assert api("open", token="shell-token", route="/_sc/browser")[0] == 403
+        opened.assert_not_called()
+        con = server.db()
+        con.execute(
+            "INSERT INTO flavor_skills(flavor, skill_id) SELECT 'dev', skill_id FROM skills WHERE name='drive_browser'"
+        )
+        con.commit()
+        con.close()
+        assert api("open", token="shell-token", route="/_sc/browser") == (
+            200,
+            {"launch_requested": True},
+        )
+        opened.assert_called_once_with(harness=None, sandbox=False)
+
+
+def test_shell_open_disarmed_refusal(api):
+    con = server.db()
+    con.execute(
+        "INSERT INTO flavor_skills(flavor, skill_id) SELECT 'dev', skill_id FROM skills WHERE name='drive_browser'"
+    )
+    con.commit()
+    con.close()
+    with mock.patch.object(
+        browser, "open_profile", side_effect=ValueError("Browser is disarmed")
+    ):
+        status, body = api("open", token="shell-token", route="/_sc/browser")
+        assert status == 503 and "disarmed" in body["error"]
+
+
+def test_shell_open_cannot_override_profile(api):
+    body = json.dumps(
+        {"action": "open", "config": {"user_data_dir": "/other"}}
+    ).encode()
+    with mock.patch.object(browser, "open_profile") as opened:
+        status, _, _ = server.dispatch_http(
+            "POST",
+            "/_sc/browser",
+            "Host: 127.0.0.1:8800\r\nAuthorization: Bearer shell-token\r\nContent-Length: "
+            + str(len(body)),
+            body,
+        )
+        assert status == 400
+        opened.assert_not_called()

@@ -1784,7 +1784,7 @@ Subfloor — forkable shell substrate — full command reference (./sc help for 
                            subscribe the authenticated Developer shell to engine-wide PR event wakes
   ./sc sprint <cmd>        authenticated Sprints v2 actions (run without a command for the full verb list)
                              caller identity is resolved by the engine; report and review bodies use files, and mutating retries carry stable keys where required
-  ./sc browser <verb>      status/up/down/doctor/arm/disarm — opt-in Chromium profile driving
+  ./sc browser <verb>      setup/status/open/up/down/doctor/arm/disarm — opt-in Chromium profile driving
   ./sc token               print the browser sign-in operator token — an Admin/operator recovery capability;
                              stdout carries only the token and failure names the supported service action
   sc engine-ref            print the full engine pin from the canonical live checkout — safe from any shell
