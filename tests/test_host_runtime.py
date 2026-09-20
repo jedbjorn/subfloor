@@ -82,6 +82,7 @@ class HostRuntimeFixture:
                 "SC_TEST_LOG": str(self.log),
                 "SC_TEST_PORT": str(self.port),
                 "SC_TEST_RUN_ARGV": str(self.run_argv),
+                "SC_TEST_SERVER_PID": str(self.engine / "run" / "server.pid"),
                 "NO_COLOR": "1",
             }
         )
@@ -178,6 +179,14 @@ class HostRuntimeFixture:
         )
         for name in ("vm", "ts", "pm2", "dbq"):
             (self.scripts / f"{name}.py").write_text(broker)
+        (self.scripts / "browser.py").write_text(textwrap.dedent(
+            """\
+            import os
+            import sys
+            with open(os.environ["SC_TEST_LOG"], "a") as log:
+                log.write("browser.py " + " ".join(sys.argv[1:]) + "\\n")
+            """
+        ))
 
     def _write_fake_commands(self) -> None:
         # docker exists but is unusable: the host path must never reach it,
@@ -188,6 +197,32 @@ class HostRuntimeFixture:
             #!/bin/sh
             printf 'docker %s\\n' "$*" >> "$SC_TEST_LOG"
             exit 1
+            """,
+        )
+        self._write_executable(
+            "systemctl",
+            """\
+            #!/bin/sh
+            printf 'systemctl %s\\n' "$*" >> "$SC_TEST_LOG"
+            case "$*" in
+              '--user show-environment') exit 0 ;;
+              '--user stop '*)
+                if [ -f "$SC_TEST_SERVER_PID" ]; then
+                  kill "$(sed -n '1p' "$SC_TEST_SERVER_PID")" 2>/dev/null || true
+                fi
+                exit 0 ;;
+            esac
+            exit 1
+            """,
+        )
+        self._write_executable(
+            "systemd-run",
+            """\
+            #!/bin/sh
+            printf 'systemd-run %s\\n' "$*" >> "$SC_TEST_LOG"
+            while [ "$#" -gt 0 ] && [ "$1" != '--' ]; do shift; done
+            [ "$#" -gt 0 ] && shift
+            nohup "$@" >/dev/null 2>&1 &
             """,
         )
 
@@ -255,6 +290,7 @@ class HostRuntimeLifecycleTest(unittest.TestCase):
         self.assertIsNotNone(pid)
         os.kill(pid, 0)  # alive
         self.assertTrue(self.fx.health())
+        self.assertTrue(any(line.startswith("systemd-run ") for line in self.fx.calls()))
         self.assert_no_docker()
 
         again = self.fx.run("launch", "--no-build")
@@ -337,6 +373,42 @@ class HostRuntimeLifecycleTest(unittest.TestCase):
         self.assertIn("runtime host", result.stdout)
         self.assertIn("install.py --update-harnesses", self.fx.calls())
         self.assert_no_docker()
+
+    def test_launch_does_not_mutate_browser_lifecycle(self):
+        result = self.fx.run("launch")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(
+            [line for line in self.fx.calls() if line.startswith("browser.py ")]
+        )
+
+    def test_launch_fails_instead_of_claiming_unsupervised_success(self):
+        self.fx._write_executable(
+            "systemctl",
+            """\
+            #!/bin/sh
+            exit 1
+            """,
+        )
+        result = self.fx.run("launch")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("working systemd user manager is required", result.stderr)
+        self.assertFalse(self.fx.pidfile().exists())
+        self.assertFalse(self.fx.health())
+
+    def test_persist_help_and_bad_arguments_do_not_touch_systemd(self):
+        help_result = self.fx.run("persist", "--help")
+        self.assertEqual(help_result.returncode, 0, help_result.stderr)
+        self.assertIn("usage: ./sc persist", help_result.stdout)
+        self.assertFalse(
+            [line for line in self.fx.calls() if line.startswith("systemctl ")]
+        )
+
+        bad = self.fx.run("persist", "surprise")
+        self.assertEqual(bad.returncode, 2)
+        self.assertIn("unknown argument 'surprise'", bad.stderr)
+        self.assertFalse(
+            [line for line in self.fx.calls() if line.startswith("systemctl ")]
+        )
 
     def test_runtime_verb_shows_and_switches_the_selection(self):
         shown = self.fx.run("runtime")

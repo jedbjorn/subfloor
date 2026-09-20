@@ -98,8 +98,8 @@ Supported hosts are Arch Linux (including CachyOS) and Ubuntu LTS with Python
 path. On macOS or Windows, use a Linux VM and prefer guest-owned storage.
 
 The default **sandbox** runtime requires a reachable Docker daemon.
-`./sc install --runtime host` selects a supervised host server and host shell
-processes instead. `./sc doctor` reports prerequisites and the selected runtime.
+`./sc install --runtime host` selects a systemd-user-supervised host server and
+host shell processes instead. `./sc doctor` reports prerequisites and the selected runtime.
 Both runtimes use `subfloor launch`, `enter`, `down`, `restart`, `logs` and
 `update`. `subfloor admin` is the host maintenance entry. The host runtime
 provides no container boundary; choose it with that execution reach in mind.
@@ -987,7 +987,7 @@ The Roadmap tab renders the same feature rows two ways, toggled top-centre:
 The server runs **inside the sandbox container** as its foreground process, so
 `./sc launch` brings it up (printing its URL) and `./sc down` stops it. Under
 the host runtime (`./sc runtime host`) the same two verbs start and stop it as
-a supervised host process instead, with its log at `.super-coder/run/server.log`
+a transient systemd user service instead, with its log at `.super-coder/run/server.log`
 (`./sc logs` tails it). `./sc enter` starts a CLI-owned shell session, while the Chats tab starts a
 separate browser-owned conversation through the same harness adapters. The two
 surfaces never own one shell concurrently. The port publishes to `127.0.0.1`

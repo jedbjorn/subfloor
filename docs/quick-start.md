@@ -18,8 +18,8 @@ change. The [user guide](README.md) owns concepts and ongoing workflows;
 
 Use Arch Linux (including CachyOS) or Ubuntu LTS with Git, curl, Python 3.14.x
 and its `sqlite3` module. The default sandbox needs a reachable Docker daemon.
-For a supervised host process instead, replace `./sc install` below with
-`./sc install --runtime host`. On macOS or Windows, do this inside a Linux VM,
+For a systemd-user-supervised host process instead, replace `./sc install` below
+with `./sc install --runtime host`. On macOS or Windows, do this inside a Linux VM,
 preferably on guest-owned storage. `SC_PYTHON` can select an absolute Python path.
 
 ```bash
@@ -51,7 +51,7 @@ subfloor launch
 
 Launch prints the local Review GUI URL; `subfloor url` recalls it. Under the
 sandbox runtime, launch builds the image and starts the container. Under the
-host runtime, it starts the supervised server process.
+host runtime, it starts a transient service under the systemd user manager.
 
 Sign in once to your chosen harness **on the host**, using your account:
 

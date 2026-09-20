@@ -131,7 +131,7 @@ Options:
   --force                     override source/already-installed safety guards
   --skip-harness-install      detect harnesses without installing them
   --runtime MODE              lifecycle runtime: sandbox (default — docker container)
-                              or host (supervised host process, no docker anywhere);
+                              or host (systemd-user-supervised process, no docker);
                               recorded in instance.json, later: ./sc runtime <mode>
   --username NAME             active operator username (required without a TTY)
   --name NAME                 override the primary shell display name
@@ -579,8 +579,8 @@ def report_docker() -> dict:
 
 def report_host_runtime_selected() -> None:
     """Print the runtime block for a host-runtime install (docker unused)."""
-    print("  runtime   ✓ host — the review server runs as a supervised host process")
-    print("            (nohup + pidfile under .super-coder/run/) and shells boot directly")
+    print("  runtime   ✓ host — the review server runs under the systemd user manager")
+    print("            (transient systemd user service + pidfile) and shells boot directly")
     print("            on this host with the harness's normal permission prompts.")
     print("            docker is not probed, built, or started. Switch: ./sc runtime sandbox")
 

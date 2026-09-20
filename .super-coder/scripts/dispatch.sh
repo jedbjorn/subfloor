@@ -172,9 +172,9 @@ devport() { "$PY" "$S/ports.py" devport; }
 
 # ── Runtime selection (sandbox | host) ───────────────────────────────────────
 # One instance.json key (`runtime`, scripts/runtime.py) decides which lifecycle
-# the docker verbs drive. `host` runs the review server as a supervised host
-# process (nohup + pidfile under .super-coder/run/) and boots shells directly
-# on this host — no daemon, image, or container anywhere in the path. An absent
+# the docker verbs drive. `host` runs the review server as a transient systemd
+# user service (with its pidfile under .super-coder/run/) and boots shells
+# directly on this host — no image or container anywhere in the path. An absent
 # key reads as `sandbox`, so every existing install keeps its behavior.
 # `./sc install --runtime host` or `./sc runtime host` selects it.
 sc_runtime() { "$PY" "$S/runtime.py" get 2>/dev/null || echo sandbox; }
@@ -182,6 +182,7 @@ sc_host_runtime() { [ "$(sc_runtime)" = host ]; }
 
 HOST_SERVER_PID="$ENGINE/run/server.pid"
 HOST_SERVER_LOG="$ENGINE/run/server.log"
+HOST_SERVER_UNIT="sc-review-$(basename "$here").service"
 
 sc_host_api_healthy() {
   curl -fsS "http://127.0.0.1:$(port)/api/health" >/dev/null 2>&1
@@ -216,22 +217,33 @@ sc_host_server_up() {
     return 1
   fi
   rm -f "$HOST_SERVER_PID"
-  nohup env SC_BIND=127.0.0.1 PYTHONUNBUFFERED=1 \
-    "$PY" "$ENGINE/api/server.py" --port "$host_port" >"$HOST_SERVER_LOG" 2>&1 &
-  host_pid=$!
-  printf '%s\n' "$host_pid" > "$HOST_SERVER_PID"
+  if ! command -v systemd-run >/dev/null 2>&1 || \
+      ! systemctl --user show-environment >/dev/null 2>&1; then
+    echo "✗ host-runtime: a working systemd user manager is required to supervise the review server" >&2
+    echo "  start a user session with systemd, then retry ./sc launch" >&2
+    return 1
+  fi
+  systemctl --user stop "$HOST_SERVER_UNIT" >/dev/null 2>&1 || true
+  : > "$HOST_SERVER_LOG"
+  if ! systemd-run --user --quiet --collect --unit "$HOST_SERVER_UNIT" -- \
+      /bin/sh -c 'printf "%s\n" "$$" > "$1"; exec env SC_BIND=127.0.0.1 PYTHONUNBUFFERED=1 "$2" "$3" --port "$4" >> "$5" 2>&1' \
+      sc-host-server "$HOST_SERVER_PID" "$PY" "$ENGINE/api/server.py" "$host_port" "$HOST_SERVER_LOG"; then
+    echo "✗ host-runtime: systemd could not start $HOST_SERVER_UNIT" >&2
+    return 1
+  fi
   attempts=0
   while [ "$attempts" -lt 40 ]; do
+    host_pid="$(sc_host_server_pid || true)"
     if sc_host_api_healthy; then
       echo "→ host review server up (pid $host_pid) · http://127.0.0.1:$host_port · log $HOST_SERVER_LOG"
       return 0
     fi
-    kill -0 "$host_pid" 2>/dev/null || break
+    [ -z "$host_pid" ] || kill -0 "$host_pid" 2>/dev/null || break
     attempts=$((attempts + 1))
     sleep 0.25
   done
   echo "✗ host review server did not become healthy; see $HOST_SERVER_LOG" >&2
-  kill "$host_pid" 2>/dev/null || true
+  systemctl --user stop "$HOST_SERVER_UNIT" >/dev/null 2>&1 || true
   rm -f "$HOST_SERVER_PID"
   return 1
 }
@@ -241,7 +253,8 @@ sc_host_server_up() {
 sc_host_server_down() {
   host_pid="$(sc_host_server_pid || true)"
   if [ -n "$host_pid" ]; then
-    kill "$host_pid" 2>/dev/null || true
+    systemctl --user stop "$HOST_SERVER_UNIT" >/dev/null 2>&1 || \
+      kill "$host_pid" 2>/dev/null || true
     attempts=0
     while kill -0 "$host_pid" 2>/dev/null && [ "$attempts" -lt 40 ]; do
       attempts=$((attempts + 1))
@@ -948,7 +961,7 @@ sc_pg_init() {
 # enabled by the installs, so units start at boot with no login.
 sc_persist() {
   command -v systemctl >/dev/null 2>&1 || {
-    echo "✗ persist: systemd (systemctl) not found — nohup + \`./sc launch\` is the only supervision on this host" >&2; return 1; }
+    echo "✗ persist: systemd (systemctl) not found — broker units cannot be installed" >&2; return 1; }
   if "$PY" "$S/vm.py" configured;  then sc_vm_broker_install;  else echo "→ persist: no VM linked — vm-broker skipped"; fi
   if "$PY" "$S/ts.py" configured;  then sc_ts_broker_install;  else echo "→ persist: no tailnet linked — ts-broker skipped"; fi
   if "$PY" "$S/pm2.py" configured; then sc_pm2_broker_install; else echo "→ persist: no pm2 stack linked — pm2-broker skipped"; fi
@@ -1113,6 +1126,7 @@ case "$cmd" in
         sc_devkit_help_form "$@" || sc_python_probe ;;
       launch|restart|admin|map)
         sc_help_form "$@" || sc_python_probe ;;
+      persist) : ;;
       *) sc_python_probe ;;
     esac ;;
 esac
@@ -1198,7 +1212,17 @@ case "$cmd" in
                 fi
                 printf '%s\n' "$sc_engine_ref" ;;
   # ── persist (HOST-side): reboot-proof all applicable daemons via systemd ──
-  persist)           sc_persist ;;
+  persist)           if sc_help_form "$@"; then
+                       echo "usage: ./sc persist"
+                       echo "  Install and start systemd user units for every configured host broker."
+                       exit 0
+                     fi
+                     if [ $# -ne 0 ]; then
+                       echo "sc persist: unknown argument '$1' (usage: ./sc persist)" >&2
+                       exit 2
+                     fi
+                     sc_python_probe
+                     sc_persist ;;
   # ── session-surviving local jobs: detached supervised one-shots whose
   # completion posts a result row to the starting shell's inbox ──
   job)               exec "$PY" "$S/job.py" "$@" ;;
@@ -1363,9 +1387,6 @@ case "$cmd" in
       sc_host_server_up || exit 1
       echo "  dev server:    \$SC_DEV_PORT=$(devport) → http://127.0.0.1:$(devport)"
       echo "  boot a shell:  subfloor enter [shortname]   (./sc enter is the same)"
-      if "$PY" -c 'import sys; sys.path.insert(0, sys.argv[1]); import browser; c=browser.read(); sys.exit(0 if c and c["armed"] else 1)' "$S"; then
-        "$PY" "$S/browser.py" up || true
-      fi
       sc_vm_broker_up || true
       sc_ts_broker_up || true
       sc_pm2_broker_up || true
@@ -1826,7 +1847,7 @@ Subfloor — forkable shell substrate — full command reference (./sc help for 
   Sandbox (docker — the default way to run; allow-everything is safe because the
   container only sees this repo + your harness creds):
   ./sc runtime [mode]      show or select the lifecycle runtime: sandbox (docker, the default) · host
-                             (review server as a supervised host process + shells booted on this host;
+                             (review server as a transient systemd user service + shells booted on this host;
                              no docker anywhere). launch/enter/down/restart/logs/build/update-harnesses/
                              doctor/update follow the selection; ./sc install --runtime host sets it at install
   ./sc sandbox-memory [SIZE|default]
