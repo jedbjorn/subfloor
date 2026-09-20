@@ -249,3 +249,109 @@ def test_masked_file_alias_fails_closed(tmp_path: Path) -> None:
         )
     assert str(caught.value) == execution_view.RESTRICTED_VIEW_ERROR
     assert str(private_root) not in str(caught.value)
+
+
+@pytest.mark.parametrize("source_mode", [False, True])
+@pytest.mark.parametrize("flavor", ["planner", "developer", "reviewer"])
+def test_private_npm_links_allow_launch_without_exposing_state(
+    tmp_path: Path, source_mode: bool, flavor: str,
+) -> None:
+    repo, engine, env, private_root = installation(tmp_path)
+    modules = private_root / "browser/package/node_modules"
+    bins = modules / ".bin"
+    bins.mkdir(parents=True)
+    for name, package in (
+        ("playwright", "playwright"),
+        ("playwright-core", "playwright-core"),
+        ("playwright-mcp", "@playwright/mcp"),
+    ):
+        cli = modules / package / "cli.js"
+        cli.parent.mkdir(parents=True)
+        cli.write_text("private package content")
+        (bins / name).symlink_to(f"../{package}/cli.js")
+    # A product-side alias cannot bypass the private directory mask either.
+    alias = repo / "package-alias"
+    alias.symlink_to(modules, target_is_directory=True)
+    view = execution_view.build(
+        engine=engine, repo_root=repo, flavor=flavor,
+        source_mode=source_mode, environ=env,
+    )
+    view.preflight()
+    probe = run_in(
+        view,
+        f"! cat {bins / 'playwright'} >/dev/null 2>&1 && "
+        f"! cat {alias / '.bin/playwright'} >/dev/null 2>&1 && "
+        f"! cat {private_root / 'shell_db.db'} >/dev/null 2>&1 && "
+        f"! cat /proc/{os.getpid()}/root{bins / 'playwright'} >/dev/null 2>&1 && "
+        f"echo usable > {repo / 'product-output'}",
+    )
+    assert probe.returncode == 0, probe.stderr
+    assert (repo / "product-output").read_text() == "usable\n"
+
+
+def test_internal_directory_and_chained_backup_links(tmp_path: Path) -> None:
+    repo, engine, env, _private_root = installation(tmp_path)
+    backups = repo / "backups"
+    backups.mkdir()
+    env["SC_DB_BACKUP_DIR"] = str(backups)
+    generation = backups / "generation"
+    generation.mkdir()
+    (generation / "snapshot.db").write_text("secret")
+    (backups / "latest").symlink_to("generation", target_is_directory=True)
+    (backups / "current").symlink_to("latest", target_is_directory=True)
+    view = execution_view.build(
+        engine=engine, repo_root=repo, flavor="planner",
+        source_mode=False, environ=env,
+    )
+    view.preflight()
+    assert run_in(
+        view, f"! cat {backups / 'current/snapshot.db'} >/dev/null 2>&1",
+    ).returncode == 0
+
+
+@pytest.mark.parametrize("kind", ["escape", "directory-escape", "dangling", "cycle", "root", "hardlink"])
+def test_unsafe_aliases_still_fail_closed(tmp_path: Path, kind: str) -> None:
+    repo, engine, env, private_root = installation(tmp_path)
+    link = private_root / "alias"
+    if kind == "escape":
+        target = repo / "exposed-secret"
+        target.write_text("secret")
+        link.symlink_to(target)
+    elif kind == "directory-escape":
+        link.symlink_to(repo, target_is_directory=True)
+    elif kind == "dangling":
+        link.symlink_to("missing")
+    elif kind == "cycle":
+        link.symlink_to("alias")
+    elif kind == "root":
+        (engine / "schema.sql").unlink()
+        (engine / "schema.sql").symlink_to(private_root / "shell_db.db")
+    else:
+        link.symlink_to("shell_db.db")
+        os.link(private_root / "shell_db.db", repo / "exposed-secret")
+    with pytest.raises(execution_view.ExecutionViewError) as caught:
+        execution_view.build(
+            engine=engine, repo_root=repo, flavor="planner",
+            source_mode=False, environ=env,
+        )
+    assert str(caught.value) == execution_view.RESTRICTED_VIEW_ERROR
+
+
+@pytest.mark.parametrize("directory", [False, True])
+def test_internal_mask_links_validate_without_following_aliases(
+    tmp_path: Path, directory: bool,
+) -> None:
+    masked = tmp_path / "masked"
+    masked.mkdir()
+    target = masked / "target"
+    if directory:
+        target.mkdir()
+        (target / "secret").write_text("secret")
+        # This resolves to an actual directory, not a cyclic symlink chain.
+        (target / "parent").symlink_to(masked, target_is_directory=True)
+    else:
+        target.write_text("secret")
+    (masked / "relative").symlink_to("target", target_is_directory=directory)
+    (masked / "absolute").symlink_to(target, target_is_directory=directory)
+    (masked / "chain").symlink_to("relative", target_is_directory=directory)
+    execution_view._validate_masks([masked])
