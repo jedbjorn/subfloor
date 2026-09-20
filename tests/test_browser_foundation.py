@@ -381,3 +381,42 @@ def test_real_launcher_exec_targets_existing_profile(config, tmp_path):
         "--profile-directory=Profile 1",
         "chrome-extension://fixture/connect.html",
     ]
+
+
+def test_setup_detects_profile_and_bootstraps_without_extension(
+    config, tmp_path, monkeypatch
+):
+    from contextlib import nullcontext
+
+    profile(config, tmp_path)
+    monkeypatch.setattr(
+        browser,
+        "installations",
+        lambda: [{"user_data_dir": str(tmp_path), "executable": config["executable"]}],
+    )
+    monkeypatch.setattr(
+        browser.ports,
+        "ensure_browser_ports",
+        lambda: {"browser_port": 8870, "browser_proxy_port": 8871},
+    )
+    monkeypatch.setattr(browser, "lifecycle_lock", nullcontext)
+    saved = []
+    installed = []
+    monkeypatch.setattr(
+        browser,
+        "package_check",
+        lambda **kwargs: installed.append(kwargs) or {"ok": True},
+    )
+    monkeypatch.setattr(browser, "stop_process", lambda name: None)
+    monkeypatch.setattr(
+        browser.ports, "update", lambda changes: saved.append(changes["browser"])
+    )
+    monkeypatch.setattr(browser, "operate", lambda action: {"state": "declared"})
+    assert browser.link({}) == {"state": "declared"}
+    assert installed == [{"install": True}]
+    assert saved[0]["profile_dir_name"] == "Profile 1"
+    assert saved[0]["executable"] == config["executable"]
+    assert "server_version" not in saved[0]
+    assert browser.profile_checks(saved[0])["extension"] is False
+    # The operator can now open this linked profile to install the extension.
+    assert browser.profile_checks(saved[0])["profile"] is True
