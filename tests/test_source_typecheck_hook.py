@@ -20,14 +20,21 @@ class SourceTypecheckHookTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             scratch = Path(td)
             (scratch / "caller_module.py").write_text("name: str = 'caller'\n")
+            (scratch / "imported_error.py").write_text("answer: int = 'wrong'\n")
             subject = scratch / "subject.py"
-            imports = "import update\nimport server\nimport flat\nimport caller_module\n"
+            imports = (
+                "import update\n"
+                "import server\n"
+                "import flat\n"
+                "import caller_module\n"
+                "import imported_error\n"
+            )
             env = {**os.environ, "SC_DEVKIT_ROOT": str(ROOT), "MYPYPATH": str(scratch)}
 
             def check(value: str) -> subprocess.CompletedProcess[str]:
                 subject.write_text(imports + f"answer: int = {value}\n")
                 return subprocess.run(
-                    [str(ROOT / ".subfloor/dev-kit"), "typecheck", "--follow-imports=silent", str(subject)],
+                    [str(ROOT / ".subfloor/dev-kit"), "typecheck", str(subject)],
                     cwd=ROOT,
                     env=env,
                     capture_output=True,
@@ -41,6 +48,21 @@ class SourceTypecheckHookTest(unittest.TestCase):
             self.assertEqual(1, bad.returncode, bad.stdout + bad.stderr)
             self.assertIn("[assignment]", bad.stdout)
             self.assertNotIn("[import-not-found]", bad.stdout)
+
+            imported = subprocess.run(
+                [
+                    str(ROOT / ".subfloor/dev-kit"),
+                    "typecheck",
+                    str(scratch / "imported_error.py"),
+                ],
+                cwd=ROOT,
+                env=env,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(1, imported.returncode, imported.stdout + imported.stderr)
+            self.assertIn("[assignment]", imported.stdout)
 
 
 if __name__ == "__main__":
