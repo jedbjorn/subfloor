@@ -272,6 +272,10 @@ def test_private_npm_links_allow_launch_without_exposing_state(
     # A product-side alias cannot bypass the private directory mask either.
     alias = repo / "package-alias"
     alias.symlink_to(modules, target_is_directory=True)
+    # Mask ancestors cannot grant recursive creation rights; product trees
+    # receive their own rule, as in the detached-descendant fixture above.
+    product = repo / "product"
+    product.mkdir()
     view = execution_view.build(
         engine=engine, repo_root=repo, flavor=flavor,
         source_mode=source_mode, environ=env,
@@ -283,10 +287,10 @@ def test_private_npm_links_allow_launch_without_exposing_state(
         f"! cat {alias / '.bin/playwright'} >/dev/null 2>&1 && "
         f"! cat {private_root / 'shell_db.db'} >/dev/null 2>&1 && "
         f"! cat /proc/{os.getpid()}/root{bins / 'playwright'} >/dev/null 2>&1 && "
-        f"echo usable > {repo / 'product-output'}",
+        f"echo usable > {product / 'output'}",
     )
     assert probe.returncode == 0, probe.stderr
-    assert (repo / "product-output").read_text() == "usable\n"
+    assert (product / "output").read_text() == "usable\n"
 
 
 def test_internal_directory_and_chained_backup_links(tmp_path: Path) -> None:
