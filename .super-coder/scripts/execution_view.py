@@ -98,7 +98,8 @@ def _private_state(engine: Path, environ: Mapping[str, str]) -> instance_state.I
 
 def _validate_masks(paths: Sequence[Path]) -> None:
     """Refuse aliases that could place a masked inode below an allowed tree."""
-    pending = [Path(path) for path in paths]
+    roots = {Path(path).absolute() for path in paths}
+    pending = list(roots)
     while pending:
         path = pending.pop()
         try:
@@ -107,9 +108,21 @@ def _validate_masks(paths: Sequence[Path]) -> None:
             continue
         except OSError as exc:
             raise ExecutionViewError(RESTRICTED_VIEW_ERROR) from exc
-        if stat.S_ISLNK(info.st_mode) or (
-            stat.S_ISREG(info.st_mode) and info.st_nlink != 1
-        ):
+        if stat.S_ISLNK(info.st_mode):
+            # npm's .bin links (and other internal aliases) do not expose an
+            # inode outside the denied trees. Keep mask roots literal, and
+            # reject dangling, cyclic, or escaping links. Do not traverse the
+            # link: the target is checked through its real masked tree below.
+            try:
+                target = path.resolve(strict=True)
+            except (OSError, RuntimeError) as exc:
+                raise ExecutionViewError(RESTRICTED_VIEW_ERROR) from exc
+            if path in roots or not any(
+                target == root or root in target.parents for root in roots
+            ):
+                raise ExecutionViewError(RESTRICTED_VIEW_ERROR)
+            continue
+        if stat.S_ISREG(info.st_mode) and info.st_nlink != 1:
             raise ExecutionViewError(RESTRICTED_VIEW_ERROR)
         if stat.S_ISDIR(info.st_mode):
             try:

@@ -268,3 +268,32 @@ def test_managed_lifecycle_two_processes_and_cleanup(package, tmp_path, monkeypa
     finally:
         browser.stop_process("proxy")
         browser.stop_process("server")
+
+
+@pytest.mark.parametrize("source_mode", [False, True])
+def test_installed_browser_package_allows_restricted_launch(
+    package, tmp_path, monkeypatch, source_mode,
+):
+    import execution_view
+
+    from tests.test_execution_view import installation, run_in
+
+    repo, engine, env, private_root = installation(tmp_path)
+    private = private_root / "browser"
+    private.mkdir()
+    installed = private / "package"
+    shutil.move(str(package), str(installed))
+    monkeypatch.setattr(browser, "private", lambda: private)
+    assert browser.package_check()["ok"]
+    assert (installed / "node_modules/.bin/playwright-mcp").is_symlink()
+    view = execution_view.build(
+        engine=engine, repo_root=repo, flavor="planner",
+        source_mode=source_mode, environ=env,
+    )
+    view.preflight()
+    result = run_in(
+        view,
+        f"! cat {installed / 'node_modules/.bin/playwright-mcp'} >/dev/null 2>&1 && "
+        f"! cat {private_root / 'shell_db.db'} >/dev/null 2>&1",
+    )
+    assert result.returncode == 0, result.stderr
