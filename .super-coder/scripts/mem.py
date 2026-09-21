@@ -64,7 +64,7 @@ Run from the repo root, like every engine command:
     ./sc mem task edit <task_id>     [--title "…"] [--desc "…"]   # revise title/description
     ./sc mem oriented                # mark first-run complete (bootstrapped=1)
     ./sc mem doc add "<title>" --body-file PATH [--feature ID] [--kind spec|doc] [--seq N]
-    ./sc mem doc edit <document_id>  [--title "…"] [--body-file PATH] [--render-path …]   # frozen: --render-path only
+    ./sc mem doc edit <document_id>  [--title "…"] [--body-file PATH] [--render-path …]   # frozen or retired: --render-path only
     ./sc mem doc move <document_id>  --feature <target_feature_id>   # unfrozen spec + plan, atomic
     ./sc mem doc freeze <document_id>
     ./sc mem doc retire <document_id>  [--superseded-by <document_id>] [--undo]   # metadata, never an edit
@@ -917,8 +917,15 @@ def cmd_doc(args) -> int:
     if args.doc_cmd == "retire":
         if args.undo and args.superseded_by is not None:
             die("--undo clears the retirement — it cannot take --superseded-by")
-        payload = {"undo": True} if args.undo else {
-            "superseded_by": args.superseded_by}
+        # Send the key ONLY when --superseded-by was given: a bare retire must
+        # never read as "drop the pointer", so a replay after an ambiguous
+        # timeout is the idempotent no-op. Clearing a pointer from the CLI is
+        # --undo followed by a bare retire.
+        payload: dict = {}
+        if args.undo:
+            payload["undo"] = True
+        elif args.superseded_by is not None:
+            payload["superseded_by"] = args.superseded_by
         r = _api("PATCH", f"/_sc/mem/docs/{args.document_id}/retire", payload,
                  timeout=_DOC_WRITE_TIMEOUT)
         if args.undo:
@@ -1217,7 +1224,7 @@ def build_parser() -> argparse.ArgumentParser:
     da.add_argument("--kind", default="spec", choices=["spec", "doc"])
     da.add_argument("--seq", type=int)
     da.add_argument("--render-path", dest="render_path")
-    de = dsub.add_parser("edit", help="revise a doc's title/body/render-path (frozen: render-path only)")
+    de = dsub.add_parser("edit", help="revise a doc's title/body/render-path (frozen or retired: render-path only)")
     de.add_argument("document_id", type=int)
     de.add_argument("--title")
     de.add_argument("--body-file", dest="body_file")

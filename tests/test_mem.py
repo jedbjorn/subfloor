@@ -1618,16 +1618,114 @@ class ApiMemTest(unittest.TestCase):
         self.assertIsNone(row["superseded_by"])
 
     def test_retire_never_touches_title_body_or_freeze_state(self):
-        # A3: retirement is metadata ABOUT a frozen document, never an edit.
+        # A3: retirement is metadata ABOUT a frozen document, never an edit —
+        # on the first retire, on a re-point, and on an undo alike.
         successor = self._doc("retire successor C")
+        other = self._doc("retire successor C2")
         frozen = self._doc(
             "retire frozen C", frozen=1, frozen_date="2026-01-02",
             body="# frozen C\nimmutable body\n")
         before = tuple(self._row(frozen))[:4]
+
         self._retire(frozen, superseded_by=successor)
         self.assertEqual(tuple(self._row(frozen))[:4], before)
-        # …and the retirement still landed.
         self.assertEqual(self._row(frozen)["retired"], 1)
+
+        self._retire(frozen, superseded_by=other)
+        self.assertEqual(tuple(self._row(frozen))[:4], before)
+        self.assertEqual(self._row(frozen)["superseded_by"], other)
+
+        self._retire(frozen, undo=True)
+        self.assertEqual(tuple(self._row(frozen))[:4], before)
+        self.assertEqual(self._row(frozen)["retired"], 0)
+
+    def test_a_replayed_bare_retire_never_drops_the_successor(self):
+        # The lost-receipt path: `sc mem doc retire 204` runs, the response is
+        # lost, the operator re-runs it. Naming no successor must read as the
+        # no-op it is, never as "clear the pointer the first call wrote".
+        successor = self._doc("retire replay successor O")
+        target = self._doc("retire replay target O")
+        self._retire(target, superseded_by=successor)
+
+        replay = self._retire(target)
+        self.assertTrue(replay["already_retired"])
+        self.assertNotIn("repointed", replay)
+        self.assertEqual(replay["superseded_by"], successor)
+        self.assertEqual(self._row(target)["superseded_by"], successor)
+
+        # Same for a body with no keys at all — a malformed or empty payload
+        # is not an instruction to clear anything.
+        empty = self._retire(target)
+        self.assertTrue(empty["already_retired"])
+        self.assertEqual(self._row(target)["superseded_by"], successor)
+
+        # The CLI sends the key only when --superseded-by was given.
+        self.assertEqual(self.run_mem("doc", "retire", str(target)), 0)
+        self.assertEqual(self._row(target)["superseded_by"], successor)
+
+        # An EXPLICIT null is still a request to clear it.
+        cleared = self._retire(target, superseded_by=None)
+        self.assertTrue(cleared["repointed"])
+        self.assertIsNone(cleared["superseded_by"])
+        self.assertIsNone(self._row(target)["superseded_by"])
+        self.assertEqual(self._row(target)["retired"], 1)
+
+    def test_undo_with_a_successor_key_is_refused_not_ignored(self):
+        target = self._doc("retire undo conflict P")
+        successor = self._doc("retire undo conflict successor P")
+        self._retire(target, superseded_by=successor)
+        for payload in ({"undo": True, "superseded_by": successor},
+                        {"undo": True, "superseded_by": None}):
+            with self.subTest(payload=payload):
+                with self.assertRaises(SystemExit) as caught:
+                    self._retire(target, **payload)
+                self.assertIn("400", str(caught.exception))
+                self.assertIn("it cannot also set a successor",
+                              str(caught.exception))
+        self.assertEqual(self._row(target)["retired"], 1)
+        self.assertEqual(self._row(target)["superseded_by"], successor)
+
+    def test_a_retired_document_is_read_only_for_content_everywhere(self):
+        # Planner ruling on spec #251: a reader following an old link must find
+        # what was retired, not a quietly revised version of it. render_path is
+        # a location, not content, so it still moves — the frozen rule's shape.
+        successor = self._doc("retire readonly successor Q")
+        target = self._doc("retire readonly target Q",
+                           render_path="docs_sc/retire-readonly-q.md")
+        self._retire(target, superseded_by=successor)
+        body = self.tmp / "retired-edit.md"
+        body.write_text("# rewritten\n")
+
+        for payload in ({"title": "rewritten"}, {"body": "# rewritten\n"}):
+            with self.subTest(payload=payload):
+                with self.assertRaises(SystemExit) as caught:
+                    mem._api("PATCH", f"/_sc/mem/docs/{target}", payload)
+                self.assertIn("409", str(caught.exception))
+                self.assertIn("document is retired", str(caught.exception))
+        with self.assertRaises(SystemExit):
+            self.run_mem("doc", "edit", str(target), "--body-file", str(body))
+        row = self._row(target)
+        self.assertEqual(row["title"], "retire readonly target Q")
+        self.assertEqual(row["body"], "# retire readonly target Q\n")
+
+        # render_path still moves, and the edit works again after an undo.
+        self.assertEqual(
+            self.run_mem("doc", "edit", str(target),
+                         "--render-path", "docs_sc/retire-readonly-q2.md"), 0)
+        self.assertEqual(self.run_mem("doc", "retire", str(target), "--undo"), 0)
+        self.assertEqual(
+            self.run_mem("doc", "edit", str(target), "--body-file", str(body)), 0)
+        self.assertEqual(self._row(target)["body"], "# rewritten\n")
+
+    def test_doc_edit_help_names_the_retired_rule(self):
+        self.assertIn("frozen or retired: --render-path only", mem.__doc__)
+        parser = mem.build_parser()
+        doc = next(
+            action for action in parser._actions
+            if isinstance(action, mem.argparse._SubParsersAction)
+        ).choices["doc"]
+        self.assertIn("frozen or retired: render-path only",
+                      " ".join(doc.format_help().split()))
 
     def test_retire_refuses_an_unfrozen_spec_with_an_open_plan(self):
         self.run_mem("roadmap", "add", "retire plan feature")

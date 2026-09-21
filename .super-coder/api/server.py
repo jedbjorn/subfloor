@@ -293,6 +293,9 @@ MESSAGE_KINDS = {"shell", "task", "result"}
 # a feature split/re-scope without lying that it was built. Validated here so
 # a typo'd status is a 400, not a raw CHECK-constraint 500.
 TASK_STATUSES = {"pending", "in_progress", "done", "cancelled"}
+# A plan is OPEN while any of its tasks is outside this set. Named once so a
+# reader of `retire` and a reader of the task lifecycle see the same rule.
+TERMINAL_TASK_STATUSES = {"done", "cancelled"}
 
 
 def db():
@@ -1778,6 +1781,17 @@ def document_render_path_conflict(
     return None
 
 
+DOCUMENT_RETIRED_EDIT_REFUSAL = (
+    "document is retired — undo the retirement first; only render_path may "
+    "change on a retired document"
+)
+
+
+def _document_patch_status(error: str) -> int:
+    """409 for a lifecycle refusal, 400 for a malformed payload."""
+    return 409 if error == DOCUMENT_RETIRED_EDIT_REFUSAL else 400
+
+
 def patch_document(
     con,
     doc_id,
@@ -1800,8 +1814,10 @@ def patch_document(
     try:
         with db_driver.write_transaction(con, "document.edit"):
             document = con.execute(
-                "SELECT document_id,feature_id,kind,seq,title,body,render_path,frozen "
-                "FROM documents WHERE document_id=?",
+                "SELECT d.document_id,d.feature_id,d.kind,d.seq,d.title,d.body,"
+                "d.render_path,d.frozen,"
+                + _retirement_projection(_document_columns(con)) +
+                " FROM documents d WHERE d.document_id=?",
                 (doc_id,),
             ).fetchone()
             if document is None:
@@ -1818,6 +1834,12 @@ def patch_document(
                         "one (only render_path may change on a frozen document)"
                     ),
                 )
+            # Retirement is read-only for content EVERYWHERE, not just in
+            # the GUI: a reader following an old link must find what was
+            # retired, not a quietly revised version of it. render_path
+            # still moves, on the same reasoning as the frozen rule above.
+            if document["retired"] and cols != ["render_path"]:
+                return False, DOCUMENT_RETIRED_EDIT_REFUSAL
 
             candidate = dict(document)
             candidate.update({column: body[column] for column in cols})
@@ -2026,6 +2048,13 @@ def move_spec_to_feature(con, document_id: int, target_feature_id: int):
 
 DOCUMENT_CHAIN_HOPS = 10   # bound on superseded_by chain resolution
 
+# "the caller named no successor" is NOT "the caller asked for no successor".
+# A bare `sc mem doc retire 204` replayed after an ambiguous timeout must read
+# as the idempotent no-op it is, never as a request to drop the pointer that
+# the first call wrote. The route passes this sentinel when the key is absent
+# from the body; an explicit JSON `"superseded_by": null` still clears.
+ABSENT = object()
+
 
 def _document_chain_rows(con) -> dict:
     return {
@@ -2039,7 +2068,7 @@ def _document_chain_rows(con) -> dict:
     }
 
 
-def _resolve_current(rows: dict, document_id):
+def _resolve_current(by_id: dict, document_id):
     """The first non-retired document reachable through superseded_by.
 
     Bounded to DOCUMENT_CHAIN_HOPS. A pointer at a row that no longer exists
@@ -2049,7 +2078,7 @@ def _resolve_current(rows: dict, document_id):
     seen = set()
     node = document_id
     for _ in range(DOCUMENT_CHAIN_HOPS):
-        row = rows.get(node)
+        row = by_id.get(node)
         if row is None or node in seen:
             return None
         if not row["retired"]:
@@ -2067,13 +2096,14 @@ def document_retirement_view(con) -> dict:
     Maps document_id -> {superseded_by_title, current_document_id,
     current_title}. Only retired rows appear; a current document has no entry.
     """
-    rows = _document_chain_rows(con)
+    by_id = _document_chain_rows(con)
     view: dict = {}
-    for document_id, row in rows.items():
+    for document_id, row in by_id.items():
         if not row["retired"]:
             continue
-        successor = rows.get(row["superseded_by"]) if row["superseded_by"] else None
-        current = _resolve_current(rows, row["superseded_by"]) if row["superseded_by"] else None
+        successor = by_id.get(row["superseded_by"]) if row["superseded_by"] else None
+        current = (_resolve_current(by_id, row["superseded_by"])
+                   if row["superseded_by"] else None)
         view[document_id] = {
             "superseded_by_title": successor["title"] if successor else None,
             "current_document_id": current["document_id"] if current else None,
@@ -2096,11 +2126,19 @@ def _decorate_retirement(con, records: list) -> list:
     return records
 
 
-def retire_document(con, document_id: int, superseded_by, undo: bool):
+def retire_document(con, document_id: int, superseded_by=ABSENT, undo: bool = False):
     """Retire, re-point, or un-retire one document.
 
-    Returns (result, status, error) like move_spec_to_feature.
+    `superseded_by` is ABSENT when the caller named no successor, None when it
+    explicitly asked for none. Returns (result, status, error) like
+    move_spec_to_feature.
     """
+    if undo and superseded_by is not ABSENT:
+        return (
+            None,
+            400,
+            "undo clears the retirement — it cannot also set a successor",
+        )
     try:
         with db_driver.write_transaction(con, "document.retire"):
             document = con.execute(
@@ -2140,10 +2178,11 @@ def retire_document(con, document_id: int, superseded_by, undo: bool):
             # before retiring. A frozen spec is shipped history and has no open
             # plan to protect, so the check is scoped to unfrozen specs.
             if not document["retired"] and document["kind"] == "spec" and not document["frozen"]:
+                terminal = sorted(TERMINAL_TASK_STATUSES)
                 open_tasks = con.execute(
                     "SELECT COUNT(*) FROM spec_tasks WHERE document_id=? "
-                    "AND status NOT IN ('done','cancelled')",
-                    (document_id,),
+                    "AND status NOT IN (" + ",".join("?" for _ in terminal) + ")",
+                    (document_id, *terminal),
                 ).fetchone()[0]
                 if open_tasks:
                     return (
@@ -2165,7 +2204,7 @@ def retire_document(con, document_id: int, superseded_by, undo: bool):
                         "be retired",
                     )
 
-            if superseded_by is not None:
+            if superseded_by is not ABSENT and superseded_by is not None:
                 try:
                     superseded_by = int(superseded_by)
                 except (TypeError, ValueError):
@@ -2187,14 +2226,17 @@ def retire_document(con, document_id: int, superseded_by, undo: bool):
                     )
 
             if document["retired"]:
-                # Idempotent: the same successor is the success it already is;
-                # a different one re-points without moving retired_date.
-                if document["superseded_by"] == superseded_by:
+                # Idempotent: a replay that names no successor, and one that
+                # names the successor already recorded, are both the success
+                # this already is. Only an explicit pointer — including an
+                # explicit null — re-points, and never moves retired_date.
+                if (superseded_by is ABSENT
+                        or document["superseded_by"] == superseded_by):
                     return {
                         "document_id": document_id,
                         "retired": True,
                         "already_retired": True,
-                        "superseded_by": superseded_by,
+                        "superseded_by": document["superseded_by"],
                         "retired_date": document["retired_date"],
                     }, 200, None
                 con.execute(
@@ -2211,6 +2253,8 @@ def retire_document(con, document_id: int, superseded_by, undo: bool):
                     "retired_date": document["retired_date"],
                 }, 200, None
 
+            if superseded_by is ABSENT:
+                superseded_by = None
             con.execute(
                 "UPDATE documents SET retired=1, retired_date=date('now'), "
                 "superseded_by=?, updated_at=datetime('now') WHERE document_id=?",
@@ -5159,8 +5203,13 @@ class Handler(BaseHTTPRequestHandler):
             # row's title/body/frozen/frozen_date are untouched.
             if len(parts) == 5 and parts[2] == "docs" and parts[4] == "retire":
                 did = int(parts[3])
+                # ABSENT when the key is missing, so a replayed bare retire —
+                # and a malformed or empty body — can never clear a pointer an
+                # earlier call wrote. An explicit null still clears.
                 result, status, error = retire_document(
-                    con, did, body.get("superseded_by"), bool(body.get("undo"))
+                    con, did,
+                    body["superseded_by"] if "superseded_by" in body else ABSENT,
+                    bool(body.get("undo")),
                 )
                 if error:
                     return self._send(status, {"ok": False, "error": error})
@@ -5208,7 +5257,8 @@ class Handler(BaseHTTPRequestHandler):
                     editor_shell_id=sid,
                 )
                 if not ok:
-                    return self._send(400, {"ok": ok, "error": err})
+                    return self._send(
+                        _document_patch_status(err), {"ok": ok, "error": err})
                 return self._send(200, {
                     "ok": ok,
                     "serialize": serialize_doc_write(),
@@ -5893,7 +5943,9 @@ class Handler(BaseHTTPRequestHandler):
                 ok, err = patch_document(
                     con, did, body, editor_surface="review_ui"
                 )
-                return self._send(200 if ok else 400, {"ok": ok, "error": err})
+                return self._send(
+                    200 if ok else _document_patch_status(err),
+                    {"ok": ok, "error": err})
             return self._send(404, {"error": "not found"})
         except Exception as e:
             return self._fail(e)

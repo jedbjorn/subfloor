@@ -267,6 +267,29 @@ class FlatRetirementBannerTest(unittest.TestCase):
                 (root / "docs_sc" / "old.md").read_text(),
             )
 
+    def test_a_bodyless_successor_is_cited_by_id_not_by_a_path_with_no_file(self):
+        with tempfile.TemporaryDirectory() as td, closing(
+            sqlite3.connect(":memory:")
+        ) as con:
+            root = Path(td)
+            self._fixture(con)
+            # A successor row with no body is never written, so its derived
+            # path names no file. The banner must not send a reader there.
+            con.execute("UPDATE documents SET body='' WHERE document_id=12")
+            con.execute(
+                "UPDATE documents SET retired=1, retired_date='2026-09-21', "
+                "superseded_by=12 WHERE document_id=11"
+            )
+            self._render(con, root)
+
+            self.assertFalse((root / "docs_sc" / "new.md").exists())
+            rendered = (root / "docs_sc" / "old.md").read_text()
+            self.assertIn(
+                "> **Retired 2026-09-21** — superseded by document #12.",
+                rendered,
+            )
+            self.assertNotIn("docs_sc/new.md", rendered)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

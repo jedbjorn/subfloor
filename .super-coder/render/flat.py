@@ -170,6 +170,11 @@ def _render_documents(con, written, skipped, root: Path) -> None:
     derive a stable path from kind + title. Files without a current source row
     are removed so both managed directories remain exact DB projections.
     """
+    # The retirement columns are read unguarded: a render only ever runs after
+    # `migrate` has brought the DB to the current baseline (rebuild applies
+    # schema.sql then every migration; update reconciles before the next boot),
+    # so unlike the API assemblers this path has no pre-migration caller to
+    # tolerate.
     rows = con.execute(
         "SELECT d.document_id, d.feature_id, d.kind, d.seq, d.title, d.body, d.render_path, "
         "d.frozen, d.retired, d.retired_date, d.superseded_by, "
@@ -181,12 +186,14 @@ def _render_documents(con, written, skipped, root: Path) -> None:
     if issues:
         raise ValueError(issues[0])
 
-    # Successor title + render path, for the retirement banner. Built from the
-    # same row set so a pointer at a row that no longer exists degrades to the
-    # bare id instead of failing the render.
+    # Successor title + render path, for the retirement banner. Only rows that
+    # are actually written count: a bodyless successor has no file, so citing
+    # its derived path would point a reader at something that does not exist.
+    # Those — and a pointer at a row that is gone — degrade to the bare id.
     successors = {
         row["document_id"]: (row["title"], document_rel_path(row))
         for row in rows
+        if row["body"]
     }
 
     expected: set[Path] = set()

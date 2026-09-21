@@ -1725,16 +1725,19 @@ async function renderDocs(root) {
   // of the list until a reader asks for them.
   const retiredCount = docs.filter((d) => d.retired).length;
   const bar = el("div", { className: "filters seg" });
-  const retiredChip = el("button", {
-    className: "chip" + (docsShowRetired ? " on" : ""),
-    textContent: `show retired (${retiredCount})`,
-  });
-  retiredChip.onclick = () => {
-    docsShowRetired = !docsShowRetired;
-    retiredChip.classList.toggle("on", docsShowRetired);
-    draw();
-  };
-  bar.append(retiredChip);
+  // No retired docs = nothing to reveal; an always-on "(0)" chip is noise.
+  if (retiredCount) {
+    const retiredChip = el("button", {
+      className: "chip" + (docsShowRetired ? " on" : ""),
+      textContent: `show retired (${retiredCount})`,
+    });
+    retiredChip.onclick = () => {
+      docsShowRetired = !docsShowRetired;
+      retiredChip.classList.toggle("on", docsShowRetired);
+      draw();
+    };
+    bar.append(retiredChip);
+  }
   const results = el("div", {});
   const draw = () => {
     const q = docsQuery.trim().toLowerCase();
