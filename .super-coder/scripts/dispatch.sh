@@ -523,6 +523,25 @@ sc_harness_status() {
   fi
 }
 
+# `models refresh` records harness versions as route evidence, and launch
+# rejects evidence whose version differs from the runtime that executes the
+# route. So a sandbox install refreshes INSIDE the sandbox, through the same
+# exec seam harness-status probes with — the host's own CLIs decide nothing on
+# the docker path. A shell token already reaches the engine API in that runtime,
+# and every other models verb only reads.
+sc_models() {
+  if [ "${1:-}" != refresh ] || [ -n "${SC_SANDBOX:-}" ] || [ -n "${SC_API_TOKEN:-}" ] || sc_host_runtime; then
+    exec "$PY" "$S/models.py" "$@"
+  fi
+  if ! command -v docker >/dev/null 2>&1 || ! docker info >/dev/null 2>&1 || ! drunning; then
+    echo "✗ ./sc models refresh: this install runs shells in the sandbox '$CNAME', which is not running." >&2
+    echo "  Route evidence must come from that runtime — ./sc launch, then ./sc models refresh." >&2
+    exit 2
+  fi
+  # python3 and $S, not $PY: see sc_harness_status.
+  exec docker exec "$CNAME" python3 "$S/models.py" "$@"
+}
+
 # ── fork-declared dev-kit hooks — exact current-seat execution ────────────────
 # Hooks run in the current host or Docker environment against the invoking Git
 # checkout. The engine owns validation and exact execution, never project policy.
@@ -1270,7 +1289,7 @@ case "$cmd" in
   # Token & session analytics — sweep each harness's on-disk usage data for
   # THIS repo into session_token_usage (incremental, idempotent; doc #11).
   analytics)    exec "$PY" "$S/analytics.py" "$@" ;;
-  models)       exec "$PY" "$S/models.py" "$@" ;;
+  models)       sc_models "$@" ;;
   # Like render-check, seed generation authors the CALLER's tracked engine
   # source. A linked source worktree must never regenerate the main checkout's
   # 0001 from a different branch's assets or upsert that shared live DB.

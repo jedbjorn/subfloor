@@ -494,6 +494,64 @@ class ScHarnessCommands(unittest.TestCase):
         )
         self.assertNotIn("9.9.9", result.stdout)
 
+    def _stub_models(self) -> None:
+        """A models.py that only records that the HOST interpreter ran it."""
+        (self.fx.scripts / "models.py").write_text(
+            "import os, sys\n"
+            "open(os.environ['SC_TEST_LOG'], 'a').write("
+            "'host-models ' + ' '.join(sys.argv[1:]) + '\\n')\n"
+        )
+
+    def test_models_refresh_runs_inside_the_sandbox(self):
+        """Refresh records harness versions as route evidence; the host's CLIs
+        are not the ones a sandbox install's shells launch."""
+        self._stub_models()
+        result = self.fx.run("models", "refresh", SC_API_TOKEN="")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            [call for call in self.fx.calls()
+             if call.startswith(("docker exec ", "host-models "))],
+            [f"docker exec sc-fork python3 "
+             f"{self.fx.scripts / 'models.py'} refresh"],
+        )
+
+    def test_models_refresh_refuses_when_the_sandbox_is_down(self):
+        self._stub_models()
+        result = self.fx.run(
+            "models", "refresh", SC_API_TOKEN="", SC_TEST_RUNNING=""
+        )
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("sandbox 'sc-fork', which is not running", result.stderr)
+        self.assertIn("./sc launch, then ./sc models refresh", result.stderr)
+        self.assertEqual(
+            [call for call in self.fx.calls()
+             if call.startswith(("docker exec ", "host-models "))],
+            [],
+        )
+
+    def test_models_refresh_stays_on_the_host_for_a_host_runtime_install(self):
+        self._stub_models()
+        shutil.copy2(ENGINE / "scripts" / "runtime.py",
+                     self.fx.scripts / "runtime.py")
+        (self.fx.engine / "instance.json").write_text('{"runtime": "host"}\n')
+        result = self.fx.run("models", "refresh", SC_API_TOKEN="")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            [call for call in self.fx.calls()
+             if call.startswith(("docker exec ", "host-models "))],
+            ["host-models refresh"],
+        )
+
+    def test_models_reads_and_token_refresh_stay_on_the_calling_seat(self):
+        self._stub_models()
+        self.fx.run("models", "list", SC_API_TOKEN="")
+        self.fx.run("models", "refresh", SC_API_TOKEN="shell-token")
+        self.assertEqual(
+            [call for call in self.fx.calls()
+             if call.startswith(("docker exec ", "host-models "))],
+            ["host-models list", "host-models refresh"],
+        )
+
     def test_harness_status_flags_an_image_that_owes_a_rebuild(self):
         self.fx.run("build", "--harnesses")
         result = self.fx.run("harness-status", SC_TEST_LABEL="2020-01-01")
