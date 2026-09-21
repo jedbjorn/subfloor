@@ -204,12 +204,11 @@ class _ChainRows:
             "FROM documents d WHERE d.document_id=?", (document_id,)).fetchone()
 
 
-def _retirement(con, document_id) -> dict:
+def _retirement(chain: _ChainRows, document_id) -> dict:
     """Retirement facts for one governing document (spec doc #251): the same
     chain rule as the API reads — first non-retired document through
     `superseded_by`; a missing row, a loop, or the hop bound ends the chain
     with no current document. A pre-0268 DB reads every document as current."""
-    chain = _ChainRows(con)
     row = chain.get(document_id)
     retired = bool(row["retired"]) if row is not None else False
     current = (document_retirement.resolve_current(chain, row["superseded_by"])
@@ -229,7 +228,7 @@ def _document(con, document_id) -> dict | None:
         "FROM documents WHERE document_id=?", (document_id,)).fetchone()
     if row is None:
         return None
-    retirement = _retirement(con, row["document_id"])
+    retirement = _retirement(_ChainRows(con), row["document_id"])
     return {
         "document_id": row["document_id"],
         "title": row["title"],
@@ -324,6 +323,7 @@ def _select_work_unit(con, work_unit_id: int, caller: dict) -> dict:
         "FROM sprint_specs ss JOIN documents d ON d.document_id=ss.document_id "
         f"WHERE ss.sprint_id=? AND ss.document_id IN ({marks}) ORDER BY ss.document_id",
         (sprint_id, *governing)).fetchall()
+    chain = _ChainRows(con)
     documents = [{
         "document_id": r["document_id"],
         "title": r["title"],
@@ -332,7 +332,7 @@ def _select_work_unit(con, work_unit_id: int, caller: dict) -> dict:
         "generation": r["generation"],
         "legacy": bool(r["bound_revision_legacy"]),
         "read": f"sc sprint spec-revision --sprint {sprint_id} --document {r['document_id']}",
-        **_retirement(con, r["document_id"]),
+        **_retirement(chain, r["document_id"]),
     } for r in revisions]
     dependencies = _rows(con.execute(
         "SELECT d.depends_on_work_unit_id AS work_unit_id, u.title, u.disposition "
@@ -573,11 +573,14 @@ def project(con, *, task_id: int | None = None, work_unit_id: int | None = None,
                 boundaries["walls"].append(
                     f"document #{d['document_id']} is frozen — immutable; revise through a new spec")
             if d.get("retired"):
-                boundaries["walls"].append(
-                    f"document #{d['document_id']} is retired — "
-                    + (f"current authority is #{d['current_document_id']} {d['current_title']}"
-                       if d.get("current_document_id") is not None
-                       else "no successor named; confirm the governing spec with the Planner"))
+                if d.get("current_document_id") is not None:
+                    state = f"current authority is #{d['current_document_id']} {d['current_title']}"
+                elif d.get("superseded_by") is not None:
+                    state = (f"successor #{d['superseded_by']} does not resolve to a current "
+                             "document; confirm the governing spec with the Planner")
+                else:
+                    state = "no successor named; confirm the governing spec with the Planner"
+                boundaries["walls"].append(f"document #{d['document_id']} is retired — {state}")
         if t.get("sprint_work_unit_id"):
             boundaries["walls"].append(
                 f"task is linked to Sprint {t['sprint_id']} work unit #{t['sprint_work_unit_id']} — "
@@ -673,9 +676,11 @@ def render(p: dict) -> str:
         frozen = " · frozen" if d.get("frozen") else ""
         retired = ""
         if d.get("retired"):
-            retired = " · retired" + (
-                f" → #{d['current_document_id']} {d['current_title']}"
-                if d.get("current_document_id") is not None else "")
+            retired = " · retired"
+            if d.get("current_document_id") is not None:
+                retired += f" → #{d['current_document_id']} {d['current_title']}"
+            elif d.get("superseded_by") is not None:
+                retired += f" → #{d['superseded_by']} (unresolved)"
         out.append(f"  doc #{d['document_id']} {d['title']} — {d['revision']}{gen}{legacy}{frozen}"
                    f"{retired}")
         out.append(f"    sha256 {d['sha256']}")

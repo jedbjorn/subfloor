@@ -496,6 +496,8 @@ class ProjectorTest(unittest.TestCase):
         ids = seed_feature(self.con)
         wall = (f"document #{ids['doc']} is retired — no successor named; "
                 "confirm the governing spec with the Planner")
+        unresolved = (f"document #{ids['doc']} is retired — successor #{{}} does not resolve "
+                      "to a current document; confirm the governing spec with the Planner")
         self.retire(ids["doc"])                                  # bare retire
         p = self.project(task_id=ids["tasks"][1])
         doc, = p["authority"]["documents"]
@@ -512,13 +514,40 @@ class ProjectorTest(unittest.TestCase):
         self.assertEqual(doc["superseded_by"], 9999)
         self.assertIsNone(doc["current_document_id"])
         self.assertIsNone(doc["current_title"])
-        self.assertIn(wall, p["boundaries"]["walls"])
+        self.assertNotIn(wall, p["boundaries"]["walls"])
+        self.assertIn(unresolved.format(9999), p["boundaries"]["walls"])
+        self.assertIn(f"  doc #{ids['doc']} Spec — retired · retired → #9999 (unresolved)\n",
+                      tc.render(p))
 
         second = self.add_spec(ids, "Second spec")               # a loop ends the chain
         self.retire(ids["doc"], second)
         self.retire(second, ids["doc"])
-        doc, = self.project(task_id=ids["tasks"][1])["authority"]["documents"]
+        p = self.project(task_id=ids["tasks"][1])
+        doc, = p["authority"]["documents"]
         self.assertIsNone(doc["current_document_id"])
+        self.assertIn(unresolved.format(second), p["boundaries"]["walls"])
+        self.assertIn(f" · retired → #{second} (unresolved)\n", tc.render(p))
+
+    def test_chain_resolution_is_bounded_like_the_api(self):
+        ids = seed_feature(self.con)
+        chain = [self.add_spec(ids, f"Spec {n}") for n in range(1, 12)]
+        self.retire(ids["doc"], chain[0])
+        for here, after in zip(chain[:9], chain[1:10]):          # 9 retired, the 10th current
+            self.retire(here, after)
+        doc, = self.project(task_id=ids["tasks"][1])["authority"]["documents"]
+        self.assertEqual((doc["current_document_id"], doc["current_title"]),
+                         (chain[9], "Spec 10"))
+        self.assertEqual(
+            server.document_retirement_view(self.con)[ids["doc"]]["current_document_id"],
+            chain[9])
+
+        self.retire(chain[9], chain[10])                         # one hop past the bound
+        p = self.project(task_id=ids["tasks"][1])
+        doc, = p["authority"]["documents"]
+        self.assertIsNone(doc["current_document_id"])
+        self.assertIsNone(
+            server.document_retirement_view(self.con)[ids["doc"]]["current_document_id"])
+        self.assertIn(f" · retired → #{chain[0]} (unresolved)\n", tc.render(p))
 
     def test_work_unit_keeps_the_bound_revision_beside_retirement(self):
         ids = seed_feature(self.con)
@@ -534,15 +563,26 @@ class ProjectorTest(unittest.TestCase):
                          (second, "Second spec"))
         self.assertIn(f"immutable Sprint revision · generation 2 · retired → #{second} Second spec",
                       tc.render(p))
+        self.retire(second, ids["doc"])                          # unresolved: suffix, no wall
+        p = self.project(work_unit_id=sp["unit"])
+        self.assertIn(f" · generation 2 · retired → #{second} (unresolved)\n", tc.render(p))
+        self.assertFalse(any("retired" in w for w in p["boundaries"]["walls"]))
 
     def test_pre_0268_database_reads_every_document_as_current(self):
         ids = seed_feature(self.con)
+        sp = seed_sprint(self.con, ids)
         before = self.project(task_id=ids["tasks"][1])
+        unit_before = self.project(work_unit_id=sp["unit"])
         self.con.execute("PRAGMA foreign_keys=OFF")
         for column in ("retired", "retired_date", "superseded_by"):
             self.con.execute(f"ALTER TABLE documents DROP COLUMN {column}")
         self.con.commit()
         self.assertEqual(self.project(task_id=ids["tasks"][1]), before)
+        self.assertEqual(self.project(work_unit_id=sp["unit"]), unit_before)
+        doc, = unit_before["authority"]["documents"]
+        self.assertEqual((doc["retired"], doc["retired_date"], doc["superseded_by"],
+                          doc["current_document_id"], doc["current_title"]),
+                         (False, None, None, None, None))
 
     # ── boundaries: an inherited worktree must belong to this repo ───────
     def test_foreign_worktree_and_its_branch_are_omitted(self):
