@@ -6,11 +6,12 @@ A fork's shells run in a sandbox that has an *empty* private pg sidecar (the
 dev/test target), no mounted host DSN, and no route to the host's live app DB.
 This broker runs ON THE HOST, where the DSN + route resolve, and exposes ONE
 narrow verb — a single SELECT, allowlisted + capped + timed — over a unix socket
-in the bind-mounted engine dir (`.super-coder/run/db-broker.sock`). The
-`db_query` skill curls that socket; the sandbox names a query and holds nothing.
-It is the fourth sibling of the pm2 / Windows-VM / tailnet brokers
+in the bind-mounted engine dir (`.super-coder/run/db-broker.sock`). A shell
+reaches that socket through the client in scripts/dbq.py (no global `db_query`
+skill exists); the sandbox names a query and holds nothing.
+It is the fourth sibling of the pm2 / VM-and-remotes / tailnet brokers
 (api/pm2_broker.py, api/vm_broker.py, api/ts_broker.py). Config + validation +
-the query verb live in scripts/dbq.py. Spec: specs_sc/db-query.md.
+the query verb live in scripts/dbq.py. Doc: .super-coder/docs/db-broker.md.
 
 Routes (all JSON `{ok, ...}`):
 

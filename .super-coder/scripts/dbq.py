@@ -10,13 +10,14 @@ loop for confirmation-grade reads — telemetry/ops tables a shell needs to
 confirm a diagnosis it has already reasoned out — without ever handing the
 sandbox a credential or a route.
 
-It is the fourth sibling of the pm2 / Windows-VM / tailnet brokers
+It is the fourth sibling of the pm2 / VM-and-remotes / tailnet brokers
 (api/pm2_broker.py, api/vm_broker.py, api/ts_broker.py): one host process holds
 the capability so nothing downstream needs it. The broker (api/db_broker.py)
 runs ON THE HOST, shells out to `psql` where the DSN + route resolve, and
 exposes one narrow verb over a unix socket in the bind-mounted engine dir
-(`.super-coder/run/db-broker.sock`). The `db_query` skill curls that socket.
-Spec: specs_sc/db-query.md · doc: .super-coder/docs/db-broker.md.
+(`.super-coder/run/db-broker.sock`). Callers use the socket client in this
+module (or curl the socket directly); no global `db_query` skill exists.
+Doc: .super-coder/docs/db-broker.md.
 
 The config lives under the `db` key of `.super-coder/instance.json`. Because the
 whole repo is bind-mounted into the sandbox (`-v $here:$here`), instance.json is
@@ -60,7 +61,7 @@ import ports
 
 # The broker listens here — a unix socket inside the bind-mounted engine dir, so
 # the same absolute path resolves on the host (where the broker runs) and in the
-# sandbox (where the db_query skill curls it). No network surface; fs-perm gated.
+# sandbox (where a shell's socket client reaches it). No network surface; fs-perm gated.
 # Distinct filename from the sibling brokers' sockets so all four coexist.
 RUN_DIR = ports.ENGINE / "run"
 SOCKET = RUN_DIR / "db-broker.sock"

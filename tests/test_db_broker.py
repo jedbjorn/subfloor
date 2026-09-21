@@ -5,9 +5,10 @@ Stdlib `unittest`, no pytest — matching the engine's no-dependency style and t
 sibling tests (test_pm2_broker.py, test_vm_broker.py). The broker shells out to
 `psql` against a live Postgres, which no CI box has; so we mock at the subprocess
 seam (`dbq._run`) and exercise the parts that DO run everywhere: the SELECT-only
-+ allowlist validator, the CSV parse + row-cap truncation, the JSON shapes the
-`db_query` skill depends on, and the real unix-socket HTTP transport end to end
-(a live broker on a temp socket, driven by the same `dbq.broker_call` client).
++ allowlist validator, the CSV parse + row-cap truncation, the JSON shapes a
+calling shell depends on (there is no global `db_query` skill), and the real
+unix-socket HTTP transport end to end (a live broker on a temp socket, driven
+by the same `dbq.broker_call` client).
 
 Run:
     python3 tests/test_db_broker.py

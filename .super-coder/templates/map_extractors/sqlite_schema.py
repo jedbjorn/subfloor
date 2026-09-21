@@ -6,7 +6,7 @@ body, skipping table-level constraints (PRIMARY KEY / FOREIGN KEY / UNIQUE /
 CHECK / CONSTRAINT). ORM-defined schemas (Django, SQLAlchemy models) are NOT
 covered — write a model extractor for those.
 
-Optional config in `.sc-state/map.config.json`:
+Optional config in `.sc-state/local/map/config.json`:
   "extractors": { "sqlite_schema": { "exclude_prefixes": ["vendor/", "test/"] } }
 """
 import re

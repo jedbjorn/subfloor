@@ -58,9 +58,9 @@ SERVICES: dict[str, dict] = {
             "See .super-coder/docs/tailscale-broker.md."),
     },
     "vm": {
-        "name": "Windows VM broker",
-        "desc": "Drives the linked Windows test VM (status, start, reset, push, "
-                "exec) for sandboxed shells.",
+        "name": "VM and remotes broker",
+        "desc": "Drives the linked test VM (status, start, reset, push, exec) "
+                "and SSH against named remotes for shells.",
         "kind": "broker", "block": "vm", "verb": "vm-broker", "module": vm,
         "unit": "sc-vm-broker-{repo}.service",
         "onboarding": (

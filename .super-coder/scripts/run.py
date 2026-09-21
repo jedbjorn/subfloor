@@ -1734,8 +1734,10 @@ def shell_git_ident_env(full: sqlite3.Row | dict) -> dict[str, str]:
     Overrides inherited GIT_AUTHOR_*/GIT_COMMITTER_* unconditionally: the
     sandbox launcher used to forward a shared repo-wide identity, and env
     beats git config, so an uncorrected inherited value would keep
-    impersonating the wrong shell. Admin boots carry no shortname; git then
-    falls through to the operator's configured identity, as before.
+    impersonating the wrong shell. There is no fall-through to the operator's
+    git config: every booted shell, Admin included, has its own display_name +
+    shortname, and a row missing either raises LaunchError (shell_git_identity)
+    rather than letting the boot commit as a stranger.
     """
     name, email = shell_git_identity(full)
     return {

@@ -358,8 +358,11 @@ def seeded_skill_names() -> list[str]:
 
 def retired_skill_names() -> list[str]:
     """The fork's retire list — engine skills this fork has taken out of
-    service (`.sc-state/skills_retired.json`, tracked, fork-owned; written by
-    `./sc skill retire`). The seed/sync resurrects engine rows on every update,
+    service (`.sc-state/local/skills_retired.json`, gitignored instance-local
+    state; written by `./sc skill retire`, and migrated up from the legacy
+    `.sc-state/skills_retired.json` by the
+    `artifact_policy.prepare_local_state()` call below).
+    The seed/sync resurrects engine rows on every update,
     so retirement must live OUTSIDE the DB and be re-applied after each sync —
     same shape as the flavor overlays (#247). Loud on a malformed file: a
     silently-ignored list means superseded skills quietly come back."""
