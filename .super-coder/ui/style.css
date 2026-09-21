@@ -977,6 +977,10 @@ a.act { text-decoration: none; display: inline-block; }
 .docrow-head { display: flex; align-items: center; gap: .8rem; flex-wrap: wrap; }
 .docrow-label { flex: 1; color: var(--ink); }
 .lock-note { font-size: .72rem; color: var(--lock); }
+/* Retired documents: dimmed row, read-only, banner pointing at the current one. */
+.docrow.retired .docrow-label { color: var(--dim); text-decoration: line-through; }
+.retired-note { color: var(--warn); margin-top: .3rem; }
+.retired-note a { color: var(--accent); }
 .seed-entry, .lns-entry { margin: .5rem 0; padding-left: .6rem; border-left: 1px solid var(--line); }
 .seed-entry .d { color: var(--dim); font-size: .78rem; }
 details summary { cursor: pointer; color: var(--accent); }
