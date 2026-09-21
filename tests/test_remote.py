@@ -223,29 +223,64 @@ class RemoteClientHelpTests(unittest.TestCase):
                 self.assertIn(operation, rendered)
         self.assertIn("forget a named remote", rendered)
 
+    # Per action: dest, option strings, nargs, required, default, type name.
+    # Help strings are deliberately excluded — they are what this change adds;
+    # everything else about the parser must survive the loop restructure.
+    HELP = ("help", ("-h", "--help"), 0, False, argparse.SUPPRESS, None)
+    NAME = ("name", (), None, True, None, None)
+    JSON = ("json", ("--json",), 0, False, False, None)
+    EXPECTED_SHAPES = {
+        "add": (
+            HELP,
+            NAME,
+            ("host", ("--host",), None, True, None, None),
+            ("user", ("--user",), None, True, None, None),
+            ("port", ("--port",), None, False, 22, "int"),
+            ("key_path", ("--key-path",), None, True, None, None),
+            ("known_hosts_path", ("--known-hosts-path",), None, False, None, None),
+            JSON,
+        ),
+        "remove": (HELP, NAME, JSON),
+        "status": (HELP, NAME, JSON),
+        "list": (HELP, JSON),
+        "exec": (
+            HELP,
+            NAME,
+            ("command_file", ("--command-file",), None, False, None, None),
+            JSON,
+            ("command", (), "*", False, None, None),
+        ),
+        "push": (
+            HELP,
+            NAME,
+            ("src", (), None, True, None, None),
+            ("dest", (), None, True, None, None),
+            JSON,
+        ),
+    }
+    EXPECTED_SHAPES["pull"] = EXPECTED_SHAPES["push"]
+
+    @staticmethod
+    def _action_shape(action):
+        return (
+            action.dest,
+            tuple(action.option_strings),
+            action.nargs,
+            action.required,
+            action.default,
+            getattr(action.type, "__name__", None),
+        )
+
     def test_argument_shapes_are_unchanged(self):
         action = self._subparser_action()
-        shapes = {
-            name: (
-                [option.dest for option in sub._actions if option.option_strings],  # noqa: SLF001
-                [option.dest for option in sub._actions if not option.option_strings],  # noqa: SLF001
-            )
+        observed = {
+            name: tuple(self._action_shape(item) for item in sub._actions)  # noqa: SLF001
             for name, sub in action.choices.items()
         }
-        self.assertEqual(shapes["add"], (
-            ["help", "host", "user", "port", "key_path", "known_hosts_path", "json"],
-            ["name"],
-        ))
-        self.assertEqual(shapes["remove"], (["help", "json"], ["name"]))
-        self.assertEqual(shapes["status"], (["help", "json"], ["name"]))
-        self.assertEqual(shapes["list"], (["help", "json"], []))
-        self.assertEqual(shapes["exec"], (
-            ["help", "command_file", "json"], ["name", "command"],
-        ))
-        for operation in ("push", "pull"):
-            self.assertEqual(
-                shapes[operation], (["help", "json"], ["name", "src", "dest"])
-            )
+        self.assertEqual(tuple(observed), self.EXPECTED)
+        for operation, shape in observed.items():
+            with self.subTest(operation=operation):
+                self.assertEqual(shape, self.EXPECTED_SHAPES[operation])
 
 
 class RemoteBrokerSocketTests(unittest.TestCase):
