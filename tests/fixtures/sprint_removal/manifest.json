@@ -403,7 +403,11 @@
     ".super-coder/adapters/vibe/README.md",
     ".super-coder/docs/interface-trust-boundary.md",
     "docs/images/sprints-tab.png",
-    "tests/test_public_documentation.py"
+    "tests/test_public_documentation.py",
+    ".super-coder/docs/conversation-runtime.md",
+    ".super-coder/docs/http-api.md",
+    ".super-coder/docs/sprint-pr-watcher.md",
+    "docs/environment.md"
   ],
   "decision": 33,
   "generation_markers": {
@@ -609,7 +613,7 @@
         "\"No Sprints yet\",",
         "\"Prepared Sprints appear here after declaration.\",",
         "\"Sprint unavailable\",",
-        "// \u2500\u2500 Sprints v2 FnB board \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500",
+        "// ── Sprints v2 FnB board ────────────────────────────────────────────────────",
         "// Managed = the owning sprint is still armed/paused; close stays engine-",
         ": el(\"div\", { className: \"muted sprint-feed-detail\" }, \"No display details.\"));",
         "? `Sprint ${sprintSelectedId}` : label;",
@@ -661,9 +665,9 @@
         "const viewLabel = tab === \"sprints\" && sprintSelectedId",
         "const wrap = el(\"div\", { className: \"sprint-feeds\" });",
         "detail.append(el(\"div\", { className: \"sprint-feed-detail\" },",
-        "el(\"div\", { className: \"muted sprint-feed-empty\" }, state.loading ? \"Loading\u2026\" : \"No entries.\"));",
+        "el(\"div\", { className: \"muted sprint-feed-empty\" }, state.loading ? \"Loading…\" : \"No entries.\"));",
         "el(\"div\", { className: \"sprint-audit-row\" },",
-        "el(\"div\", { className: \"sprint-cancelled-note\" }, \"Cancelled \u2014 not completed\"));",
+        "el(\"div\", { className: \"sprint-cancelled-note\" }, \"Cancelled — not completed\"));",
         "el(\"div\", { className: \"sprint-header-context\" },",
         "el(\"div\", { className: \"sprint-header-times\" },",
         "el(\"div\", { className: \"sprint-long-text\" }, item.body)));",
@@ -684,7 +688,7 @@
         "el(\"span\", { className: `pill sprint-${sprint.lifecycle}` }, sprint.lifecycle));",
         "el(\"span\", {}, `Elapsed: ${sprintElapsed(sprint)}`)),",
         "el(\"span\", {}, `Planner: ${sprint.planner.shortname}`), specs),",
-        "el(\"span\", {}, `Showing the last good Sprint snapshot \u2014 refresh failed: ${error.message}`),",
+        "el(\"span\", {}, `Showing the last good Sprint snapshot — refresh failed: ${error.message}`),",
         "}, `Sprint ${sprint.sprint_id}`);",
         "else if (activeTab === \"sprints\") load(\"sprints\");",
         "feature: board.sprint.feature,",
@@ -697,7 +701,7 @@
         "function sprintElapsed(sprint) {",
         "history.replaceState(null, \"\", `#sprints/${selectedId}`);",
         "href: `#roadmap-feature-${sprint.feature.feature_id}`,",
-        "if (!refresh || !root.firstChild) root.replaceChildren(el(\"div\", { className: \"muted\" }, \"Loading Sprints\u2026\"));",
+        "if (!refresh || !root.firstChild) root.replaceChildren(el(\"div\", { className: \"muted\" }, \"Loading Sprints…\"));",
         "if (!units.length) cards.append(el(\"div\", { className: \"sprint-column-empty\" }, \"No work units\"));",
         "if ([\"prepared\", \"armed\", \"paused\"].includes(sprint.lifecycle))",
         "if (activeTab !== \"sprints\" || document.hidden) return;",
@@ -730,11 +734,11 @@
         "sprints: [\"#view-sprints\", renderSprints],",
         "svg.setAttribute(\"class\", \"sprint-wires\");",
         "target === \"aborted\" ? el(\"div\", { className: \"sprint-abort-note\" },",
-        "const label = `Sprint ${item.sprint_id} \u00b7 ${item.lifecycle} \u00b7 ${item.feature.title}`;",
+        "const label = `Sprint ${item.sprint_id} · ${item.lifecycle} · ${item.feature.title}`;",
         "textContent: sprint.feature.title,",
         "title: \"Select Sprint\",",
-        "title: `${label} \u00b7 Sprint ${sprint.sprint_id}`,",
-        "title: `Sprint ${sprint.sprint_id} \u00b7 ${sprint.role} \u00b7 ${sprint.disposition}`,",
+        "title: `${label} · Sprint ${sprint.sprint_id}`,",
+        "title: `Sprint ${sprint.sprint_id} · ${sprint.role} · ${sprint.disposition}`,",
         "wrap.classList.toggle(\"sprint-wire-focus\", on);",
         ": message?.scope === \"sprint\" ? \"Sprint\" : \"Unavailable\";",
         "const body = el(\"div\", { className: \"sprint-unit-detail\" }, facts);",
@@ -869,7 +873,7 @@
       ".super-coder/scripts/dispatch.sh": [
         "./sc sprint <cmd>        authenticated Sprints v2 actions (run without a command for the full verb list)",
         "sprint)       sc_python_probe; exec \"$PY\" \"$S/sprint_cli.py\" \"$@\" ;;",
-        "Memory & catalogue    mem \u00b7 map \u00b7 map-sql \u00b7 map-schema \u00b7 sql \u00b7 skill \u00b7 search \u00b7 context \u00b7 models \u00b7 job \u00b7 pr \u00b7 sprint \u00b7 token"
+        "Memory & catalogue    mem · context · skill · search · models · job · pr · sprint · token · analytics"
       ],
       "docs/README.md": [
         "merge authority. Start with one manual handoff; use [Sprints](#sprints) when",
@@ -897,18 +901,26 @@
         "eligible ordinary conversation after route and ownership checks. Sprint-scoped",
         "Sprint work explicitly); the mechanics live here for the operator.",
         "opens a fresh one. Sprint assignments, review requests, and verdicts are",
-        "worktree's checked-out branch, `sc sprint register-pr` in a lane, or manual",
-        "owning Developer throughout ownership, inside or outside a Sprint; outside an",
-        "armed or paused Sprint a green wake names the FnB merge directive as the",
         "- **Coordinate mode.** Closing the Planner chat during an armed Sprint sets",
         "Sprint conformance, pause/recovery and cleanup are covered in the",
         "[Sprints workflow](#sprints). Participant command sequences remain in their",
         "Sprint skills and `sc sprint --help`.",
         "| Coordinate assignments and PRs | `sprint`, `pr`, `job`, `run` | [Sprints](#sprints), [messages and jobs](#messages-jobs--headless-launch) |",
-        "> **UI** this IS the GUI \u2014 Chats \u00b7 Sprints \u00b7 Shells \u00b7 Roadmap \u00b7 Docs \u00b7 Flags \u00b7 Worktrees \u00b7 Map \u00b7 Analytics \u00b7 Scripts \u00b7 **Shells** reviewer (every shell reads it)",
         "| **Sprints** | Preparation and orchestration views for coordinated Developer/Reviewer lanes, status, evidence and cleanup. |",
-        "![Review GUI, Chats tab \u2014 the real Planner conversation summarizing a prepared demonstration Sprint](https://raw.githubusercontent.com/jedbjorn/subfloor/main/docs/images/chats-tab.png)",
-        "![Review GUI, Sprints tab \u2014 two independent demonstration lanes waiting in a prepared, unarmed Sprint](https://raw.githubusercontent.com/jedbjorn/subfloor/main/docs/images/sprints-tab.png)"
+        "![Review GUI, Chats tab — the real Planner conversation summarizing a prepared demonstration Sprint](https://raw.githubusercontent.com/jedbjorn/subfloor/main/docs/images/chats-tab.png)",
+        "![Review GUI, Sprints tab — two independent demonstration lanes waiting in a prepared, unarmed Sprint](https://raw.githubusercontent.com/jedbjorn/subfloor/main/docs/images/sprints-tab.png)",
+        "An armed Board labels the Sprint and each work unit with one **condition**, and",
+        "The Sprint's own badge shows the worst non-terminal condition among its units,",
+        "the reason becomes part of the Sprint's durable history. Abort also reminds you",
+        "**Close** is hidden entirely on Sprint-managed chats; the Sprint owns their",
+        "shell never ends up with two — except Sprint-scoped chats, which are never",
+        "the owning Developer, inside or outside a Sprint — see",
+        "- **`sc sprint register-pr`** — inside a lane, adding the work-unit link on top",
+        "The instruction depends on the Sprint lifecycle. Inside an armed or paused",
+        "Sprint it points at the Sprint's own gate; outside one, a green wake says",
+        "[`.super-coder/docs/sprint-pr-watcher.md`](../.super-coder/docs/sprint-pr-watcher.md).",
+        "> **UI** this IS the GUI — Chats · Sprints · Shells · Roadmap · Docs · Flags · Worktrees · Repo Map · Analytics · Scripts · **Shells** reviewer (every shell reads it)",
+        "you mean: `#sprints/<id>`, `#roadmap-feature-<id>`, `#roadmap-flow`,"
       ],
       "README.md": [
         "- **Sprints v2.** Have a Planner prepare independent work lanes, choose routes",
@@ -925,6 +937,15 @@
         "plan and **arm** it when ready: arming records your merge grant for the Sprint's",
         "Monitor the **Sprints** Board instead of manually relaying every handoff.",
         "Follow the [Sprints workflow](README.md#sprints) for pickup, review,"
+      ],
+      ".super-coder/adapters/claude/README.md": [
+        "| `surfaces` | which lanes this harness may serve (`terminal`, `one_shot`, `browser`, `sprint` — all true). An explicit `false` is refused before launch setup. |"
+      ],
+      ".super-coder/adapters/codex/README.md": [
+        "| `surfaces` | which lanes this harness may serve (`terminal`, `one_shot`, `browser`, `sprint` — all true) |"
+      ],
+      ".super-coder/adapters/kimi/README.md": [
+        "| `surfaces` | which lanes this harness may serve (`terminal`, `one_shot`, `browser`, `sprint` — all true) |"
       ]
     },
     "forbidden_pattern": "(?:\\bsprints?\\b|\\bconductor\\b|SC_SPRINT_|pr_event|watched_prs|watch-daemon|interface_(?:generations|sessions|writer_leases|input_state|idempotency_keys|recovery_observations)|planner_(?:wake_batches|wake_items|action_receipts|alerts))",

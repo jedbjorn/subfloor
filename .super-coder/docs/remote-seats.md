@@ -144,7 +144,7 @@ in the workspace and name that file instead.
 
 `./sc vm init` remains for hand-linking a guest you prepared yourself.
 `--transfer-dir` is retired: an existing script may still pass it, but the flag
-is dropped with a note and the saved block never carries `transfer_dir`.
+is dropped with a note and the saved block never carries a transfer-directory key.
 
 ```bash
 ./sc vm init --domain w10c-testing --snapshot baseline \

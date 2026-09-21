@@ -51,7 +51,7 @@ Rules:
 - Files named `_*.py` are ignored (use for shared helpers), and `install`
   refuses them outright. The installer also requires a launched Cartographer,
   a regular non-symlink file that is a direct child of
-  `$SC_SHELL_WORKTREE/.sc-state/map_extractors/`, valid UTF-8, exactly one
+  the assigned worktree's `.sc-state/map_extractors/`, valid UTF-8, exactly one
   top-level synchronous `extract(con, repo_root, cfg)` (no `*args`/`**kwargs`/
   keyword-only params), and a filename matching `[A-Za-z][A-Za-z0-9_]*.py`.
 
