@@ -5985,6 +5985,9 @@ def sprint_monitor_response(
     )
     health = sprint_board.SprintBoardProjection(con).board(sprint_id).get("health", {})
     return {
+        # Always empty: decisions #126/#127/#130 retired the liveness
+        # evaluator this key used to carry outcomes from.  The key is kept so
+        # existing clients and skills keep reading a stable response shape.
         "outcomes": [],
         "pickup": sprint_board.pickup_projection(
             con,

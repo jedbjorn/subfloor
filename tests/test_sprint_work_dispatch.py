@@ -2307,12 +2307,12 @@ class ProductionPulseTest(SprintWorkDispatchCase):
             owner="no-liveness-runtime-test",
         )
 
-        with mock.patch.object(
-            sprint_liveness.SprintLivenessMonitor,
-            "evaluate",
-            side_effect=AssertionError("retired liveness evaluator called"),
-        ):
-            self.assertTrue(runtime.pulse_once(startup=True))
+        # Decisions #126/#127/#130 retired the evaluator outright; the monitor
+        # keeps only its resolution half, so there is nothing left to patch.
+        self.assertFalse(
+            hasattr(sprint_liveness.SprintLivenessMonitor, "evaluate")
+        )
+        self.assertTrue(runtime.pulse_once(startup=True))
 
         self.assertEqual(
             before,

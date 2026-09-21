@@ -28,10 +28,17 @@ _DYNAMIC_EVENT_CALLS = {
         "review.approved",
         "review.changes_requested",
     },
-    ("sprint_liveness.py", "event_type"): {
-        "liveness.escalated",
-        "liveness.escalation_delivery_unavailable",
-    },
+}
+
+# Retired by decisions #126/#127/#130 with the liveness evaluator: nothing
+# emits these any more, but the board keeps their field sets so historical
+# rows in existing databases still project a payload.
+_RETIRED_EVENT_TYPES = {
+    "liveness.nudged",
+    "liveness.sanctioned_quiet",
+    "liveness.ci_stalled",
+    "liveness.escalated",
+    "liveness.escalation_delivery_unavailable",
 }
 
 
@@ -883,7 +890,9 @@ class SprintBoardApiCase(unittest.TestCase):
         self.assertEqual(3, len(set(ids)))
 
     def test_event_projection_matches_emitters_and_projects_review_and_conformance_evidence(self):
-        self.assertEqual(emitted_sprint_event_types(), set(sprint_board._EVENT_FIELDS))
+        emitted = emitted_sprint_event_types()
+        self.assertEqual(set(), emitted & _RETIRED_EVENT_TYPES)
+        self.assertEqual(emitted | _RETIRED_EVENT_TYPES, set(sprint_board._EVENT_FIELDS))
         cases = (
             (
                 "sprint.declared",

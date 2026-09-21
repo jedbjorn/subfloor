@@ -267,6 +267,10 @@ _EVENT_FIELDS = {
         }
     ),
     "wake.requeued": frozenset({"failed_wake_id", "replacement_wake_id"}),
+    # No producer emits the five liveness.* types below any more — decisions
+    # #126/#127/#130 retired the evaluator that wrote them.  Their field sets
+    # stay so historical rows in existing databases keep projecting a payload
+    # instead of being sanitized down to nothing.
     "liveness.nudged": frozenset(
         {"expectation_message_id", "silence_episode", "nudge_message_id"}
     ),
