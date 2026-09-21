@@ -22,7 +22,7 @@ billing are provider-owned; they are not part of the adapter contract.
 | `surfaces` | which lanes this harness may serve (`terminal`, `one_shot`, `browser`, `sprint` — all true) |
 | `boot_artifact` | the context file this harness reads (`AGENTS.md`, informational) |
 | `emit` | files copied to the repo root at launch (`.codex/hooks.json` — the branch-guard hook) |
-| `skill_dirs` | exact shell grants rendered to `.claude/skills` and Codex-native `.agents/skills` |
+| `skill_dirs` | exact shell grants rendered to `.claude/skills` and the generic native `.agents/skills` (which Kimi Code also reads) |
 | `env` | extra env merged into the launch environment |
 | `mcp.streamable_http` | managed MCP recipes injected as `-c mcp_servers.<name>.url=…` launch args — `windows-mcp` (only with a linked VM) and `browser` (only with the browser port configured, and never inside the sandbox) |
 | `model` | `{ "flag": "--model" }` — run.py appends `--model <id>` for the flavor's codex model |
@@ -153,6 +153,13 @@ evidence, not from version arithmetic:
   published builds are alphas; raise the ceiling when a stable `0.156.x` has
   been probed the same way, not before.
 
+One receive-side branch is deliberately wider than the probe: the broker maps
+both `thread/tokenUsage/updated` and `turn/tokenUsage/updated` to `usage`, and
+only the former exists in 0.155.1's schema. The `turn/` spelling was kept for
+older builds still inside the window, so that one branch is carried by
+compatibility judgement rather than by this probe. Everything else the broker
+sends or consumes was exercised live.
+
 Release notes from `0.148.0` through `0.155.1` change no method the broker
 calls; the app-server work in that span is daemon lifecycle, Guardian approval
 review, plugin reconciliation and Windows sandbox provisioning. The one entry
@@ -163,7 +170,11 @@ The launch surface was re-checked against `codex --help` / `codex exec --help`
 on the same binary: `--dangerously-bypass-hook-trust`, `-s/--sandbox` (with
 `danger-full-access` still a valid value) and `-c` exist on both; top-level
 `-a/--ask-for-approval` still accepts `never`; `codex exec` still has no
-approval flag at all. `--dangerously-bypass-approvals-and-sandbox` is still
+`--ask-for-approval`, though it does carry `--approve-for-me`, which routes
+approval requests through automatic review **using the workspace-write
+sandbox** — deliberately unused here, because workspace-write is exactly the
+bwrap-backed policy that cannot start on this host (see Permission stance).
+`--dangerously-bypass-approvals-and-sandbox` is still
 refused alongside `--ask-for-approval`, verbatim on 0.155.1. `codex sandbox --
 pwd` still fails with `bwrap: Failed to make / slave: Operation not permitted`
 on this host, so `danger-full-access` remains the only runnable policy here.

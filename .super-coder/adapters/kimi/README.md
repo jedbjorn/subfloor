@@ -89,6 +89,23 @@ whose `.git` is a file — the exact shape of a shell seat at
 `PROJECT_BRAND_DIRS = [".kimi-code/skills"]`,
 `PROJECT_GENERIC_DIRS = [".agents/skills"]`.
 
+**That probe was run OUTSIDE the declared conversation window.** `conversation`
+still pins `[0.30.0, 0.34.0)` with `0.33.0` verified; 2.0.1 is far above it, and
+nothing here re-probes the `kimi-print` driver contract. Native skill delivery
+does not depend on that window — `skill_dirs` is not version-gated — and the
+failure mode is benign in both directions: an in-window `0.3x` build that does
+not read `.agents/skills` simply ignores a rendered directory, and the boot
+doc's `## SKILLS` block remains the backstop that actually carries the grants.
+Treat native delivery as proven on 2.0.1 and assumed elsewhere.
+
+**User-level roots are not ours.** kimi also reads `~/.kimi-code/skills` and
+`~/.agents/skills`. The engine never writes, prunes, or reconciles either one:
+they are the operator's, they are shared across every project on the host, and
+a skill living there will appear in a shell's session without being one of its
+grants. The only engine-managed roots are the two this adapter puts in the
+worktree — `.claude/skills` and `.agents/skills`; the project-level
+`.kimi-code/skills` is undeclared and therefore unmanaged too.
+
 Only the generic path is declared. `.kimi-code/skills` would be a second,
 kimi-only mirror of the same grants needing its own ignore and cleanup
 coverage, and it buys nothing kimi does not already read from `.agents/skills`.

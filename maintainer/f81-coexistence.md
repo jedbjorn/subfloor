@@ -81,7 +81,7 @@ an installed repository can still discover the retained project artifacts.
 Local host evidence on 2026-09-12: Claude `2.1.269 (Claude Code)`, Codex
 `codex-cli 0.153.4`, OpenCode `1.18.30`, Vibe `vibe 2.22.0`, Kimi `0.39.1`.
 These are installed-version observations, not smoke results. The source's
-verified versions are respectively 2.1.223, 0.147.0, 1.18.9, 2.22.0 and 0.33.0;
+verified versions were respectively 2.1.223, 0.147.0, 1.18.9, 2.22.0 and 0.33.0;
 installed Codex and Kimi exceed supported source ranges. (Codex's half of that
 gap closed on 2026-09-21: the adapter was re-probed live on `codex-cli 0.155.1`
 and now declares `[0.145.0, 0.156.0)`. Kimi's pin is unchanged and still

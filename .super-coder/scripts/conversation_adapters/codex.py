@@ -522,6 +522,11 @@ class CodexAdapter(ConversationAdapter):
                     method,
                 )
             ]
+        # Receive-side tolerance, deliberately wider than the newest CLI:
+        # 0.155.1's ServerNotification schema carries only
+        # `thread/tokenUsage/updated`, but older builds inside the supported
+        # window emit the `turn/` spelling, so both stay mapped. Usage is
+        # advisory, so an unmatched spelling costs a metric, not a turn.
         if method in {
             "thread/tokenUsage/updated",
             "turn/tokenUsage/updated",

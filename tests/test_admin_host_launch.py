@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib
+import inspect
 import json
 import os
 import shutil
@@ -13,6 +14,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 ENGINE = ROOT / ".super-coder"
@@ -231,6 +233,55 @@ class AdminExecutionContextTest(unittest.TestCase):
     def test_unknown_launch_mode_is_rejected_instead_of_misrendered(self):
         with self.assertRaisesRegex(ValueError, "unsupported launch mode: vm"):
             compose.render_execution_context("admin", "vm")
+
+
+class AdminLaunchFlagParityTest(unittest.TestCase):
+    """Decision #364: the direct-host Admin seat carries no extra permission
+    flags. Pinned behaviourally — the flags an Admin boot computes must equal
+    the ones an ordinary shell computes, for every adapter and both launch
+    modes. The launcher derives them from (adapter, headless) alone, so a
+    re-introduced Admin-only layer would have to change that signature, which
+    this test also refuses."""
+
+    def test_admin_boot_launch_flags_equal_the_non_admin_ones(self):
+        # The seat cannot be expressed at all: the launcher takes only
+        # (adapter, headless), so an Admin boot and an ordinary boot of the
+        # same harness reach the identical call. Re-introducing an Admin-only
+        # layer means re-introducing a parameter, which these two assertions
+        # refuse before any flag list is compared.
+        self.assertEqual(
+            set(inspect.signature(run.launch_mode_flags).parameters),
+            {"adapter", "headless"},
+        )
+        with self.assertRaises(TypeError):
+            run.launch_mode_flags(
+                {"launch_flags": []}, False, host_admin=True
+            )
+
+        adapters = ENGINE / "adapters"
+        codex = json.loads((adapters / "codex" / "adapter.json").read_text())
+        with mock.patch.dict(os.environ, {}, clear=True):
+            # `sc admin --harness codex` and `sc boot <shell> --harness codex`
+            # both land here and both get exactly this set.
+            self.assertEqual(
+                run.launch_mode_flags(codex, headless=False),
+                ["--sandbox", "danger-full-access",
+                 "--ask-for-approval", "never"],
+            )
+            self.assertEqual(
+                run.launch_mode_flags(codex, headless=True),
+                ["--sandbox", "danger-full-access"],
+            )
+
+        # No manifest may smuggle the layer back in through data, either.
+        for adapter_dir in sorted(adapters.iterdir()):
+            manifest = adapter_dir / "adapter.json"
+            if not manifest.is_file():
+                continue
+            with self.subTest(harness=adapter_dir.name):
+                self.assertNotIn(
+                    "host_admin", json.loads(manifest.read_text())
+                )
 
 
 class AdminFocusTest(unittest.TestCase):

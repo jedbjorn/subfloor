@@ -34,6 +34,7 @@ NORMALIZED_EVENTS = {
     "run.interrupted",
 }
 VERSION = re.compile(r"^\d+\.\d+\.\d+$")
+PROBE_DATE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
 
 class ConversationCapabilityContractTest(unittest.TestCase):
@@ -55,6 +56,10 @@ class ConversationCapabilityContractTest(unittest.TestCase):
             with self.subTest(harness=harness):
                 conversation = self.adapter(harness)["conversation"]
                 probe = self.probes["required_harnesses"][harness]
+                # Each harness carries its OWN probe date: they are re-probed
+                # independently, so a single shared date would go stale for
+                # three harnesses the moment one is re-probed.
+                self.assertRegex(probe["probe_date"], PROBE_DATE)
                 self.assertEqual(conversation["contract_version"], 1)
                 self.assertEqual(
                     set(conversation["normalized_events"]),

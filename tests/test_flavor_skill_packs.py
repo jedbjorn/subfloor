@@ -91,6 +91,7 @@ import shell_factory  # noqa: E402
 import snapshot  # noqa: E402
 
 sys.path.insert(0, str(ENGINE / "api"))
+import review_routes  # noqa: E402
 import server  # noqa: E402
 
 sys.path.insert(0, str(ENGINE / "render"))
@@ -745,6 +746,32 @@ class RenderAndSnapshotTest(unittest.TestCase):
             self.assertFalse(
                 (root / ".agents" / "skills" / "snapshot").exists()
             )
+
+    def test_review_skill_roots_match_what_the_renderer_writes(self) -> None:
+        # The review view and the renderer must name the SAME roots. The view
+        # used to REPLACE its default with the manifest's list, which agreed
+        # only because every adapter spelled `.claude/skills` out; the first
+        # manifest to declare just its native path (kimi) made the view claim
+        # a root the renderer never writes and hide one it does.
+        self.con.execute(
+            "INSERT INTO shell_skills (shell_id, skill_id) VALUES (?, ?)",
+            (self.custom, self.kid),
+        )
+        for adapter_dir in sorted((ENGINE / "adapters").iterdir()):
+            manifest = adapter_dir / "adapter.json"
+            if not manifest.is_file():
+                continue
+            with self.subTest(harness=adapter_dir.name):
+                adapter = json.loads(manifest.read_text())
+                with tempfile.TemporaryDirectory() as tmp:
+                    summary = run.render_harness_skills(
+                        self.con, self.custom, Path(tmp), adapter
+                    )
+                self.assertEqual(
+                    review_routes._skill_roots(adapter_dir.name),
+                    summary["dirs"],
+                )
+                self.assertEqual(summary["dirs"][0], ".claude/skills")
 
     def test_every_declared_skill_dir_is_ignored_and_removable(self) -> None:
         # A native skill root is a generated per-boot cache: it must never be
