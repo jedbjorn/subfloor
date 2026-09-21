@@ -550,8 +550,13 @@ class CspSourceListTest(unittest.TestCase):
         self.assertEqual(
             {s for s in sources if s != "'self'"},
             {"ws://127.0.0.1:8800", "wss://127.0.0.1:8800",
-             "ws://localhost:8800", "wss://localhost:8800",
-             "ws://[::1]:8800", "wss://[::1]:8800"})
+             "ws://localhost:8800", "wss://localhost:8800"})
+
+    def test_the_policy_names_no_bracketed_ipv6_source(self):
+        # A CSP host-source cannot express an IPv6 literal: `ws://[::1]:8800`
+        # is logged as an invalid source on every page load and ignored, so
+        # it is console noise that grants nothing.
+        self.assertNotIn("[", server._csp(8800))
 
     def test_the_rest_of_the_policy_stays_strict(self):
         csp = server._csp(8800)

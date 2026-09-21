@@ -181,8 +181,11 @@ def _resolve_vendor(rel: str) -> tuple:
         return None, "unresolvable path"
     return candidate, ctype
 
-# The localhost authorities for the socket sources in the CSP below.
-_CSP_HOSTS = ("127.0.0.1", "localhost", "[::1]")
+# The localhost authorities for the socket sources in the CSP below. No
+# `[::1]`: a CSP host-source has no grammar for a bracketed IPv6 literal, so
+# browsers log it as an invalid source on every page load and ignore it — it
+# never granted anything. A page served from `[::1]` still has `'self'`.
+_CSP_HOSTS = ("127.0.0.1", "localhost")
 
 
 def _csp(port: int) -> str:
