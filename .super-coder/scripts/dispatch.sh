@@ -384,7 +384,7 @@ SC_PG_SHM="${SC_PG_SHM:-1g}"
 dcheck() {
   if ! command -v docker >/dev/null 2>&1 || ! docker info >/dev/null 2>&1; then
     echo "✗ docker daemon not reachable — the sandbox needs it." >&2
-    echo "  Setup (one-time):  ./sc doctor      No docker:  ./sc boot" >&2
+    echo "  Setup (one-time):  ./sc doctor      No docker:  ./sc runtime host, then ./sc launch" >&2
     exit 1
   fi
 }

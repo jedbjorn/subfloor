@@ -119,7 +119,7 @@ inherits the **system** (schema + the skill catalogue + the render chain), never
 subfloor's own memory or roadmap.
 
 > [!class4]
-> **Requirements: Python 3.14.x with `sqlite3`, plus `docker`.** The default run mode is a sandbox container, so the harness's "allow everything" is safe — the kernel is the boundary, and the container sees only this repo + your harness creds. The image bakes the rest: `python3`, `sqlite3`, `git`, `curl`, and the harness CLIs. No docker? The `./sc serve` + `./sc boot` primitives run on the host with the selected Python 3.14.x interpreter, `sqlite3`, and a harness on `PATH`. Set `SC_PYTHON` to select that interpreter explicitly.
+> **Requirements: Python 3.14.x with `sqlite3`, plus `docker`.** The default run mode is a sandbox container, so the harness's "allow everything" is safe — the kernel is the boundary, and the container sees only this repo + your harness creds. The image bakes the rest: `python3`, `sqlite3`, `git`, `curl`, and the harness CLIs. No docker? Select the host runtime (`./sc install --runtime host`, or `./sc runtime host` on an existing install): `./sc launch` + `./sc enter` then run on the host with the selected Python 3.14.x interpreter, `sqlite3`, a systemd user manager, and a harness on `PATH`. Set `SC_PYTHON` to select that interpreter explicitly.
 
 **Docker mode — rootless is the default.** `./sc doctor` checks your docker.
 Both modes work (the launcher's `duser()` adapts), and **rootless is the chosen
