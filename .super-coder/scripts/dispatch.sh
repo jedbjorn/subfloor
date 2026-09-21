@@ -1748,13 +1748,17 @@ Subfloor — forkable shell substrate for one repository
     subfloor url                 print this fork's review GUI + dev-server URLs
     subfloor help                this chart · --all prints every verb with its flags
 
-  Install & upkeep      install · doctor · ensure-harness · update-harnesses · harness-status
-                        rollback · runtime · feature · persist · alias · make-cleanup · remove · eject
-  Memory & catalogue    mem · map · map-sql · map-schema · sql · skill · search · context · models · job · pr · sprint · token
+  Install & upkeep      install · init · doctor · ensure-harness · update-harnesses · harness-status
+                        harness-cleanup · docker-cache-gc · rollback · runtime · feature · sandbox-memory
+                        persist · alias · make-cleanup · remove · eject
+  Memory & catalogue    mem · context · skill · search · models · job · pr · sprint · token · analytics
+                        map · map-setup · map-sql · map-schema · map-extractor
   Engine (Admin)        rebuild · migrate · migration · snapshot · render · render-check · verify
-                        seed-skills · engine-ref · clean-db
-  Host brokers          browser · vm · vm-broker-* · ts-broker-* · pm2-broker-* · db-broker-* · db-init · pg-*
-  Primitives            serve · boot · run · deps · lint · typecheck · build · logs · health · ports · preview
+                        seed-skills · engine-ref · artifact-mode · clean-db
+  Host brokers          browser · vm · remote · ts · vm-broker-* · ts-broker-* · pm2-broker-* · db-broker-*
+                        db-init · pg-*
+  Primitives            serve · boot · run · deps · lint · typecheck · build · logs · health · ports
+                        preview · visual-qa
 
   Full reference: ./sc help --all · docs: docs/README.md#cli--dev-kit
 EOF
@@ -1771,7 +1775,8 @@ Subfloor — forkable shell substrate — full command reference (./sc help for 
   ./sc doctor              runtime readiness: docker (rootless/rootful) + harness login — or, under
                              runtime host, the host process contract + harness login
   ./sc update              fetch + materialize the engine (gitignored dep) + reconcile IN PLACE (migrate, sync skills, map);
-                             --no-fetch skips the fetch · --ref <tag|sha> pins a version · blocks on local engine edits (--force discards them)
+                             --no-fetch skips the fetch · --ref <tag|sha> pins a version · --branch <name> tracks a
+                             different upstream branch (default main) · blocks on local engine edits (--force discards them)
                              first runs git pull --ff-only for any tracked checkout; source repos then reconcile FROM that tree.
                              Advisory, never blocking: an unsafe/offline pull WARNS and engine update continues from the current
                              checkout. Update never merges, rebases or resets. --no-fetch skips checkout and engine network sync.
@@ -1785,7 +1790,7 @@ Subfloor — forkable shell substrate — full command reference (./sc help for 
                              --until <duration> changes the age · --all removes all unused cache
   ./sc rollback            Admin-only undo of a bad update — restore the paired control-plane + engine generation
                              --engine-only repairs a new-engine / unchanged-state half floor
-  ./sc feature             list optional infrastructure (pg · windows · tailnet · pm2) and its instance.json state
+  ./sc feature             list optional infrastructure (browser · pg · windows · tailnet · pm2) and its instance.json state
   ./sc feature enable <f>  create or point at one instance.json block (disable removes it)
   ./sc eject               ONE-WAY: stop tracking upstream and own the engine — un-gitignore + stage .super-coder/ as fork source (confirm-gated)
   ./sc remove              safely uninstall subfloor from this repo after a verified DB backup
@@ -1799,7 +1804,8 @@ Subfloor — forkable shell substrate — full command reference (./sc help for 
                              instance at the main checkout, so they REFUSE from a linked worktree rather than substitute it, naming
                              the target declined (decision #81); -h/--help still answers from any checkout. verify checks the
                              installed engine source in a disposable candidate; render-check checks the CALLER's source and artifacts.
-  ./sc mem <cmd> [args]    a shell's own memory, over the engine API (get/state/seed/lns/decision/flag/roadmap/doc/narrative);
+  ./sc mem <cmd> [args]    a shell's own memory, over the engine API (which/get/state/seed/lns/curated/retire/decision/
+                             flag/roadmap/project/task/doc/narrative/message/oriented/delivery-audit);
                              already wired to this launched shell, identity resolved by the engine — no DB path, no direct-DB fallback. `./sc mem which` to orient
   ./sc pr subscribe --repository <owner/name> --pr <number>
                            subscribe the authenticated Developer shell to engine-wide PR event wakes
@@ -1813,17 +1819,20 @@ Subfloor — forkable shell substrate — full command reference (./sc help for 
   ./sc job start -- <cmd>  run a long local command (suite/bench/build) detached + supervised — it
                              survives your session; completion lands in YOUR inbox as a result row
                              (--label <slug> names it, --timeout <s> kills the wedged process group)
-  ./sc job wait <id>       bounded foreground wait, ≤550s slice — exit 0 done · 2 still running
-                             (drain your inbox between slices); list/status/tail/kill complete the set
+  ./sc job wait <id>       bounded foreground wait — exit 0 done · 2 still running; --for <s> sets the
+                             slice (default 300, cap 550) and you drain your inbox between slices;
+                             list/status/tail/kill complete the set
   ./sc models refresh      refresh local model routes (same action as Shells → Refresh models)
-  ./sc models resolve <h> [<model>] [--effort <level>] [--shell <shortname>]
+  ./sc models resolve <h> [<model>] [--effort <level>] [--shell <shortname>] [--json]
                              print one exact, locally runnable high-effort call; list [harness] shows routes
   ./sc visual-qa <mode>    viewport screenshot QA: ci boots/captures · run captures a local app · init scaffolds config
   sc map-sql "<query>"     read-only query of the repository catalogue (`dr_*`)
   sc map-schema [dr_table] list live dr_* objects or stable column/index metadata — read-only, no arbitrary SQL
   sc map-sql-rw            Cartographer-only catalogue authoring when its skill names the exact procedure
-  ./sc skill <cmd>         skill catalogue surface: list · grant <name> <shell>... · revoke <name> <shell>... · rm <name> · retire <name> · unretire <name>
-                             shells by id or shortname; rm refuses engine skills — retire/unretire manages the fork retire
+  ./sc skill <cmd>         skill catalogue surface: list · put --file <SKILL.md> · grant <name> <shell>... ·
+                             revoke <name> <shell>... · rm <name> · retire <name> · unretire <name>
+                             put creates/updates a DB-canonical LOCAL skill; shells by id or shortname
+                             rm refuses engine skills — retire/unretire manages the fork retire
                              list (active tracked/local retire path, rides updates); snapshot after writes to persist
   ./sc artifact-mode       inspect the local-only artifact paths (mode switching is retired)
   ./sc render              render flat _sc files under the active artifact policy
