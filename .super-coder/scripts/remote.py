@@ -452,7 +452,9 @@ def _human_result(value: dict) -> str:
     return f"Remote {operation}: {result['source']} -> {result['destination']}"
 
 
-def client_main(argv: list[str]) -> int:
+def build_client_parser() -> argparse.ArgumentParser:
+    """The `./sc remote` parser. Every subcommand carries a one-line help so
+    `./sc remote --help` describes the verb list instead of only naming it."""
     parser = argparse.ArgumentParser(
         prog="./sc remote",
         description="Use broker-served SSH against named remotes.",
@@ -466,25 +468,37 @@ def client_main(argv: list[str]) -> int:
     add.add_argument("--key-path", required=True)
     add.add_argument("--known-hosts-path")
     add.add_argument("--json", action="store_true")
-    for operation in ("remove", "status"):
-        command_parser = commands.add_parser(operation)
+    for operation, description in (
+        ("remove", "forget a named remote"),
+        ("status", "check that a named remote answers over the broker"),
+    ):
+        command_parser = commands.add_parser(operation, help=description)
         command_parser.add_argument("name")
         command_parser.add_argument("--json", action="store_true")
-    list_parser = commands.add_parser("list")
+    list_parser = commands.add_parser("list", help="list the configured remotes")
     list_parser.add_argument("--json", action="store_true")
-    execute = commands.add_parser("exec")
+    execute = commands.add_parser(
+        "exec", help="run a command on a named remote over the broker"
+    )
     execute.add_argument("name")
     execute.add_argument("--command-file")
     execute.add_argument("--json", action="store_true")
     execute.add_argument("command", nargs="*")
-    for operation in ("push", "pull"):
-        command_parser = commands.add_parser(operation)
+    for operation, description in (
+        ("push", "copy a file from this repo to a named remote"),
+        ("pull", "copy a file from a named remote into this repo "
+                 "or .sc-state/local"),
+    ):
+        command_parser = commands.add_parser(operation, help=description)
         command_parser.add_argument("name")
         command_parser.add_argument("src")
         command_parser.add_argument("dest")
         command_parser.add_argument("--json", action="store_true")
+    return parser
 
-    args = parser.parse_args(argv)
+
+def client_main(argv: list[str]) -> int:
+    args = build_client_parser().parse_args(argv)
     if args.operation == "add":
         entry = {
             "host": args.host,

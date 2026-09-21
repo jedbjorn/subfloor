@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
-"""Smoke tests for the Windows VM broker (api/vm_broker.py + scripts/vm.py).
+"""Smoke tests for the VM and remotes broker (api/vm_broker.py + scripts/vm.py).
 
 Stdlib `unittest`, no pytest — matching the engine's no-dependency style and the
 sibling tests. The broker drives a real Windows VM via ssh/virsh, which no CI box
 has; so we mock at the subprocess seam (`vm._run` / `subprocess.run`) and exercise
 the parts that DO run everywhere: the verb dispatch + field validation, the JSON
-shapes windows_devkit depends on, and the real unix-socket HTTP transport end to
-end (a live broker on a temp socket, driven by the same `vm.broker_call` client
-the in-sandbox server proxies through).
+shapes the `windows_testing` skill depends on, and the real unix-socket HTTP
+transport end to end (a live broker on a temp socket, driven by the same
+`vm.broker_call` client the in-sandbox server proxies through).
 
 Run:
     python3 tests/test_vm_broker.py

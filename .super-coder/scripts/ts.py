@@ -17,13 +17,13 @@ the host. The block only configures *use*:
     readonly_hosts implicitly allowed hosts restricted to diagnostic commands
     tailscale_bin  path/name of the tailscale CLI (default "tailscale")
 
-Unlike the Windows VM (one fixed target), a tailnet has N hosts — so the loop
-verbs are parameterized by `{host, command}`, not a single saved target, and
+Unlike the VM seat (one fixed libvirt domain), a tailnet has N hosts — so the
+loop verbs are parameterized by `{host, command}`, not a single saved target, and
 `allowed_hosts` fail-closes exec to a declared set so a compromised sandbox can't
 reach arbitrary nodes. tailscaled + the tailnet identity stay on the HOST; the
 sandbox names verbs over the broker's unix socket and holds nothing. The broker
-(api/ts_broker.py) is the sibling of the Windows VM broker; see
-.super-coder/docs/tailscale-broker.md.
+(api/ts_broker.py) is the sibling of the VM and remotes broker
+(api/vm_broker.py); see .super-coder/docs/tailscale-broker.md.
 """
 from __future__ import annotations
 

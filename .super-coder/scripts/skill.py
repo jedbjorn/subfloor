@@ -28,8 +28,9 @@ draft and is never copied into managed engine assets.
 
 ENGINE skills can't be `rm`'d (the seed resurrects them on every update) —
 they retire via the fork retire list instead (#238): `retire` writes the
-name to `.sc-state/skills_retired.json` (tracked, fork-owned — commit it)
-and flips the row to is_deleted=1, which every surface already filters on.
+name to `.sc-state/local/skills_retired.json` (gitignored, instance-local —
+`sc artifact-mode path skills-retired` prints it) and flips the row to
+is_deleted=1, which every surface already filters on.
 The list is re-applied after every seed sync/heal/rebuild, so it rides
 `./sc update` the same way flavor overlays do. Grant rows stay in place
 (inert) so `unretire` restores who-had-what.

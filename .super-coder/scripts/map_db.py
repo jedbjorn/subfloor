@@ -1,10 +1,10 @@
 """Resolve, open, and seed the map DB — the repo catalogue (dr_*).
 
 The map is a derived cache of the host repo, owned by the cartographer. It lives
-in its OWN sqlite file (`.sc-state/local/map/map.db`), separate from the engine memory DB
-(`shell_db.db`), so an engine schema migration or a memory rebuild never touches
-it. This module is the single place that knows where the map DB is and how to
-bring a fresh one up to a usable state.
+in its OWN sqlite file (`.sc-state/local/map/map.db`), separate from the engine
+memory DB (`shell_db.db`), so an engine schema migration or a memory rebuild
+never touches it. This module is the single place that knows where the map DB
+is and how to bring a fresh one up to a usable state.
 
 Layers:
 - DERIVED  (dr_repo / dr_filepath / dr_dependency / dr_env) — repopulated by
@@ -14,9 +14,9 @@ Layers:
   reloaded here when a fresh map DB has no sections yet.
 
 Transition shim: a fork created before the split has its authored dr_section in
-`shell_db.db`. Until it re-snapshots (which moves that to map_content.sql), a
-fresh map DB with no map_content.sql falls back to copying dr_section out of the
-old engine DB. Harmless once map_content.sql exists.
+`shell_db.db`. Until it re-snapshots (which moves that to the content snapshot),
+a fresh map DB with no `.sc-state/local/map/content.sql` falls back to copying
+dr_section out of the old engine DB. Harmless once that snapshot exists.
 """
 from __future__ import annotations
 
@@ -52,7 +52,8 @@ def seed_authored(con: sqlite3.Connection) -> None:
     """Populate the authored layer of a fresh map DB. Only acts when dr_section is
     empty, so a curated set already in the live map DB is never overwritten.
 
-    Source of truth, in order: the tracked snapshot (`map_content.sql`); else the
+    Source of truth, in order: the local content snapshot
+    (`.sc-state/local/map/content.sql`, gitignored — MAP_CONTENT above); else the
     legacy pre-split engine DB (one-time transition). A genuinely fresh repo with
     neither falls through to map_repo's dir-seeding."""
     if con.execute("SELECT COUNT(*) FROM dr_section").fetchone()[0]:

@@ -121,7 +121,10 @@ def infer_role(path: str, ext: str, lang: str | None) -> str:
 
 
 def load_config() -> dict:
-    """Read the per-fork map.config.json, if any. Shape (all keys optional):
+    """Read the per-fork map config, if any — `.sc-state/local/map/config.json`,
+    falling back to the legacy `.sc-state/map.config.json` (gitignored too) and
+    then to the pre-split `.super-coder/map.config.json`. Shape (all keys
+    optional):
         {"skip_dirs": [...], "skip_files": [...],
          "role_overrides": [{"prefix": "cmd/", "role": "code"},
                             {"glob": "*.proto", "role": "code"}]}
@@ -285,8 +288,10 @@ def run_extractors(con: sqlite3.Connection, repo_root: Path, cfg: dict) -> list[
 
     The engine maps the generic 80% (files/deps/env). The semantic, per-repo
     dimensions — HTTP endpoints, the app DB schema, UI routes — vary by stack, so
-    a fork owns them as drop-in modules in `.sc-state/map_extractors/*.py` (kept
-    outside the gitignored engine dir, so `./sc update` never clobbers them). The
+    a fork owns them as modules in `.sc-state/map_extractors/*.py` (kept outside
+    the gitignored engine dir, so `./sc update` never clobbers them). They are
+    authored in the Cartographer's assigned worktree and land here only through
+    `sc map-extractor install` (map_extractor_install.py), never a hand copy. The
     cartographer adopts the right one for this repo's stack (reference extractors
     ship in the engine's `templates/map_extractors/`).
 
@@ -327,9 +332,10 @@ def run_extractors(con: sqlite3.Connection, repo_root: Path, cfg: dict) -> list[
 
 
 def refresh() -> MapRefreshResult:
-    # The map lives in its OWN db (.sc-state/map.db), not shell_db.db. connect()
-    # creates + schema-applies a fresh one and seeds its authored layer (sections
-    # from map_content.sql, or the pre-split engine DB on first run post-split).
+    # The map lives in its OWN db (.sc-state/local/map/map.db), not shell_db.db.
+    # connect() creates + schema-applies a fresh one and seeds its authored layer
+    # (sections from .sc-state/local/map/content.sql, or the pre-split engine DB
+    # on first run post-split).
     con = map_db.connect()
     cfg = load_config()
     # Config EXTENDS the defaults (never shrinks them); .super-coder stays mapped
