@@ -130,7 +130,10 @@ PY
     # name. Give mypy the same roots and a single stable package mapping.
     MYPYPATH="$root/.super-coder/scripts:$root/.super-coder/api:$root/.super-coder/render${MYPYPATH:+:$MYPYPATH}"
     export MYPYPATH
-    exec "$tool" --explicit-package-bases "$@"
+    # Keep diagnostics attributable to the requested roots. Imported modules
+    # still provide type information, but their existing errors are reported
+    # only when they are themselves included in the requested paths.
+    exec "$tool" --explicit-package-bases --follow-imports=silent "$@"
     ;;
   *)
     echo "usage: .subfloor/dev-kit <deps|test|lint|typecheck> [args...]" >&2
