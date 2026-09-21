@@ -219,9 +219,15 @@ def cli_main(argv: list[str]) -> int:
             f"migrate: refusing non-canonical target {target}; expected {active}"
         )
     state = instance_state.maintenance_state(ENGINE)
-    with state_relocation.exclusive_maintenance(state, command="migrate"):
-        state_relocation.refuse_live_database_owners(active)
-        return migrate(str(active), backup=True)
+    try:
+        with state_relocation.exclusive_maintenance(state, command="migrate"):
+            state_relocation.refuse_live_database_owners(active)
+            return migrate(str(active), backup=True)
+    except state_relocation.MaintenanceBusy as exc:
+        print(f"migrate: {exc}. Stop the managed runtime with ./sc down "
+              "or wait for other maintenance to finish, then retry ./sc migrate.",
+              file=sys.stderr)
+        return 1
 
 
 if __name__ == "__main__":

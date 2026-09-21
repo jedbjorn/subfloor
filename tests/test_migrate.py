@@ -12,6 +12,7 @@ Run:
 """
 from __future__ import annotations
 
+import io
 import os
 import shutil
 import sqlite3
@@ -30,6 +31,26 @@ import migrate  # noqa: E402
 
 
 class AtomicMigrateTests(unittest.TestCase):
+    def test_busy_maintenance_refuses_without_starting_migration(self):
+        active = Path(self.db)
+        for blocked_at in ("exclusive_maintenance", "refuse_live_database_owners"):
+            with (
+                self.subTest(blocked_at=blocked_at),
+                mock.patch.object(migrate.instance_state, "active_database_path", return_value=active),
+                mock.patch.object(migrate.instance_state, "maintenance_state"),
+                mock.patch.object(migrate.state_relocation, "exclusive_maintenance") as lease,
+                mock.patch.object(migrate.state_relocation, "refuse_live_database_owners") as owners,
+                mock.patch.object(migrate, "migrate") as run,
+                mock.patch.object(sys, "stderr", io.StringIO()) as err,
+            ):
+                blocked = lease if blocked_at == "exclusive_maintenance" else owners
+                blocked.side_effect = migrate.state_relocation.MaintenanceBusy("maintenance_busy: lease owned")
+                self.assertEqual(migrate.cli_main([self.db]), 1)
+                run.assert_not_called()
+                self.assertIn("maintenance_busy", err.getvalue())
+                self.assertIn("./sc down", err.getvalue())
+                self.assertNotIn("Traceback", err.getvalue())
+
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp(prefix="sc_mig_"))
         self.db = str(self.tmp / "t.db")
