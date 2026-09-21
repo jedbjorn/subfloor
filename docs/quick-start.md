@@ -68,6 +68,12 @@ The sandbox uses the host's configured harness credentials. See
 is unavailable. Use `subfloor admin` from the host checkout for engine
 maintenance or guarded recovery.
 
+Sign in to GitHub on the host as well, or step 3 of *Build and review the first
+PR* below has nothing to push with. For an HTTPS `origin`, run `gh auth login`
+or export `SC_GH_TOKEN`; for an SSH `origin`, load a GitHub identity into a
+running `ssh-agent` and set a token for the API besides. Launch discovers these
+each time and prints what it found — see [GitHub access](README.md#github-access).
+
 ## Orient with the Cartographer
 
 Run `subfloor enter`, select the Cartographer, then choose an available harness

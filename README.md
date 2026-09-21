@@ -126,6 +126,8 @@ for setup, boundaries, and the separate operator-run real-extension acceptance.
 |---|---|
 | [Quick start](docs/quick-start.md) | Installation through the first reviewed PR |
 | [User and operator guide](docs/README.md) | Everyday concepts, Sprints, browser conversations and lifecycle |
+| [Dev kit reference](docs/dev-kit.md) | The `.subfloor/dev-kit.json` schema: hooks, provisioning and sandbox extension |
+| [Environment variables](docs/environment.md) | Every variable the engine reads, by audience |
 | [Engine reference](.super-coder/README.md) | Source layout, private state, rendering and focused runbooks |
 | `sc help --all` and each verb's `--help` | Current command inventory and exact syntax |
 

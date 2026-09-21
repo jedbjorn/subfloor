@@ -222,6 +222,69 @@ exposes the `gpt-5.6` line (`gpt-5.6-sol`, `gpt-5.6-terra`) and `gpt-5.5` — th
 flavor defaults are set from those. Plain API-only ids return a 400 on a
 ChatGPT account.
 
+### GitHub access
+
+Harness sign-in lets a shell *think*; GitHub credentials let it **push a branch
+and open a PR**. Nothing about them is automatic — set them up on the host
+before the first Developer handoff.
+
+- **HTTPS `origin`** — export `SC_GH_TOKEN` (or `GH_TOKEN` / `GITHUB_TOKEN`), or
+  run `gh auth login` so `gh auth token` yields one. That single token serves
+  both the git push and the GitHub API.
+- **SSH `origin`** — run a live `ssh-agent` with a loaded GitHub identity
+  (`ssh-add`). SSH covers git transport only; the API and PR path still needs a
+  token, so in practice you want both.
+- `gh` must be on the host: it is what validates a token candidate.
+
+Every `./sc launch` (and `./sc restart`, which ends in one) re-discovers these.
+Discovery reads the literal `origin` remote — fetch and push must be the same
+standard `github.com` URL — tries the token candidates in order
+`SC_GH_TOKEN` → `GH_TOKEN` → `GITHUB_TOKEN` → stored `gh` OAuth, and proves each
+one against the actual repository before selecting it. It deliberately ignores
+your global git config, credential helpers and `~/.ssh/config`, so what it
+reports is what the sandbox will really have.
+
+The credential reaches the sandbox **without being copied**: the SSH agent
+socket is bind-mounted read-only at `/run/super-coder/ssh-agent`, and a token is
+passed through the Docker client's environment, never in argv or on disk. Agent
+forwarding additionally requires the image's pinned `known_hosts` to match the
+engine's. `gh` is installed in the image with a credential helper wired, but no
+account.
+
+Launch is never blocked by missing credentials — it prints what it found:
+
+```
+→ GitHub capabilities refreshed for this launch
+  Git transport: unavailable — no credential candidate; no readiness claim
+  GitHub API: unavailable — no credential candidate; no readiness claim
+  host remedy (API): set a working scoped SC_GH_TOKEN or repair the host gh
+  OAuth login, then run ./sc launch or ./sc restart
+```
+
+Credentials are fixed for the container's lifetime: fixing the host and
+re-running `./sc launch` or `./sc restart` is what changes them. Under
+`./sc runtime host` this discovery does not run at all — there is no container
+boundary, so shells use the host user's own `gh` config and `SSH_AUTH_SOCK`
+directly.
+
+### Git hooks the engine installs
+
+`./sc install` points the repository's `core.hooksPath` at an **absolute** path
+under `.super-coder/hooks/`, and every `./sc update` re-asserts it. It is local
+repo config, so it applies to the main checkout and every shell worktree alike.
+
+| Hook | What it does |
+|---|---|
+| `pre-commit` | the branch-guard backstop — refuses a commit on a protected default branch |
+| `prepare-commit-msg` | appends one `Co-Authored-By: <shell> <shortname@subfloor.local>` trailer when a shell is booted |
+| `post-commit` | prints the shell's `./sc preview` URL after a commit inside a worktree |
+| `post-checkout` · `post-merge` · `post-rewrite` | best-effort `./sc map` refresh of the `dr_*` catalogue |
+
+Only `pre-commit` can block; the rest never fail a git operation.
+
+> [!class4]
+> **`core.hooksPath` is exclusive, and the engine does not chain.** A repo already using husky, lefthook or the `pre-commit` framework has those hooks go dormant at `./sc install` — nothing calls through to `.git/hooks/` or to a previously configured directory. If you need them, invoke them from the matching file in `.super-coder/hooks/`, and re-apply that after an update, which overwrites the engine's own hook files. `./sc remove` unsets `core.hooksPath` again (and leaves a foreign value alone). `./sc map-setup` re-wires it if it is ever lost.
+
 ## The loop
 
 The operator (called **FnB** in shell guidance) decides the intended outcome and
@@ -308,6 +371,42 @@ The owning Developer calls `sc sprint authorize-merge` for live green and
 approved authorization before merging its registered PR. No second operator
 merge directive is needed under the armed grant.
 
+**Reading Board health**
+
+An armed Board labels the Sprint and each work unit with one **condition**, and
+tells you how long it has been in it. The vocabulary is fixed:
+
+| Condition | What it means | What it asks of you |
+|---|---|---|
+| **Staged** · **Paused** · **Terminal** | lifecycle, not progress — prepared, paused, or completed/aborted | nothing |
+| **Progressing** | a run is live for the unit's owner | nothing |
+| **Waiting on dependency** | planned, with prerequisites still open | nothing — watch the prerequisite |
+| **Waiting externally** | waiting on something outside the lane (CI pending, an unowned red PR, an idle merge or handoff) within its grace window | watch |
+| **Decision waiting** | a reply the recipient has read and not answered | usually you or the Planner |
+| **Needs attention** | the same waits, past their grace window | look now |
+| **Infrastructure failure** | pickup exhausted, a failed wake, a runtime or watcher failure | act — this will not resolve itself |
+
+The Sprint's own badge shows the worst non-terminal condition among its units,
+so it never reads healthier than the lane underneath it.
+
+Above the lanes, a **Health roots** strip names the conditions that are causing
+the rest. A unit merely *waiting on a dependency* is not a root — it inherits
+the roots of what it waits on, so the strip stays short even on a wide Board.
+Each root opens durable evidence: the raw cause, the owner, how long the
+episode has run, the message or record it rests on, and the next event that
+would clear it; referenced messages open their own view with delivery and read
+state. Hovering a unit card lights its dependency wires **and** the path back to
+its root causes.
+
+Two alerts sit in the header rather than on a card: a runtime alert when the
+watcher is not live (with the last successful beat), and a pickup-exhausted
+alert naming the role, shell, unit, message, wake and attempt count, followed by
+the recovery instruction verbatim.
+
+**Pause, Resume and Abort each require a typed reason.** That is deliberate —
+the reason becomes part of the Sprint's durable history. Abort also reminds you
+that it retains the full history and the Planner's abort-report request.
+
 ### Pause and recover
 
 Use the Planner and the Sprint controls to pause when scope, routes or failures
@@ -374,6 +473,24 @@ an exact requested level is rejected rather than quietly changed.
 Use `sc models resolve --help` to preview a route before headless or Sprint
 work. A native conversation keeps its exact harness session; choosing another
 harness does not transfer that session.
+
+### Choosing a route in the browser
+
+In **Chats**, the two buttons differ: **＋ Chat** starts immediately on the
+shell's stored default route, while **Configure** opens the form where you pick
+harness, model, Thinking level and a title.
+
+The model control is a searchable listbox grouped by model family, with the
+shell default and *Harness default* offered first. The search is forgiving —
+case and punctuation are folded and every term must match somewhere, so `GLM5.3`
+and `glm 5-3 flash` both reach the same route — and arrow keys move, Enter
+picks, Escape closes. A route that is stored but no longer available is marked
+`(stale)` in the fork-wide Default Models view, with the remedy in its tooltip.
+Whether a harness route is `tested` or `best-effort` is reported in the
+Thinking-level guidance rather than beside the model.
+
+Admin is **CLI-only in the browser**: both buttons are disabled and the pane
+prints the two terminal commands instead.
 
 ### Headless model routing
 
@@ -448,6 +565,40 @@ needed. They all work the same repo without clobbering each other:
   fork's dev port, routed by subdomain — `http://<shortname>.localhost:<port>/`
   — and the post-commit hook prints the shell's URL after each commit.
 
+### Commit attribution
+
+Every commit a launched shell makes is attributed to **that shell**, not to you
+and not to whichever shell booted last. The launcher pins
+`GIT_AUTHOR_*`/`GIT_COMMITTER_*` to the booted shell's own DB row —
+`<display_name> <shortname@subfloor.local>` — overriding any inherited value,
+because environment beats git config and an uncorrected inherited identity
+would keep speaking for the wrong shell. A shell row without both a display
+name and a shortname cannot be attributed, so the boot refuses rather than
+commit as a stranger.
+
+The `prepare-commit-msg` hook adds the matching
+`Co-Authored-By: <display_name> <shortname@subfloor.local>` trailer, once, in a
+way that survives an amend. This is set per **boot**, so your `git log` and any
+CI that keys on author identity see one identity per shell; rename a shell and
+its later commits carry the new name.
+
+### Map extractors
+
+`sc map` fills the generic 80% of the catalogue — files, languages, roles,
+dependencies, env vars. The semantic per-repo dimensions it cannot know
+generically — HTTP **endpoints**, the app **DB schema**, UI **routes** — come
+from an *extractor*: a small Python module the Cartographer authors for your
+repo and installs with `sc map-extractor install <file>`, which validates it and
+writes a SHA-256 receipt. That is why `dr_endpoint` (and the app-table and
+route tables) can be **empty on a fork that has never installed one** — empty
+means "no extractor wired", never "this repo has no endpoints".
+
+The engine ships reference plug-ins to adapt, not to run as-is —
+`fastapi_endpoints.py`, `sqlite_schema.py` and `sveltekit_routes.py` under
+[`.super-coder/templates/map_extractors/`](../.super-coder/templates/map_extractors/README.md),
+whose README carries the contract. If you want those columns populated, that is
+a Cartographer task.
+
 ## Browser conversations
 
 > [!class2]
@@ -486,6 +637,19 @@ booting a second session beside the first.
 - Browser refresh resumes from a bounded transcript snapshot plus the live event
   cursor; the harness transcript is evidence, never the message queue.
 
+A turn can *look* finished while its child process is still working. When that
+happens the state pill reads **working in background** and keeps animating, and
+its tooltip names the pid. You can still type and send — the message simply
+waits for that child to finish — and **Stop** stays available as the way to end
+it. If the child keeps producing output past its terminal, the broker opens a
+continuation run and the finished-looking turn goes back to running.
+
+**Close** is hidden entirely on Sprint-managed chats; the Sprint owns their
+lifecycle. Selecting a different chat closes the one you are leaving, so a
+shell never ends up with two — except Sprint-scoped chats, which are never
+auto-closed, and a chat mid-turn, which refuses and asks you to let the queue
+drain first.
+
 The broker owns dispatch and crash recovery. It leases an outbox item, creates
 one run, starts or exactly resumes the harness session, stores normalized
 events, and commits the terminal result before releasing the lease. Startup and
@@ -507,10 +671,37 @@ path, with no adapter difference. Only images over the request cap are
 downscaled in the browser. Upload directories of closed or unknown
 conversations are swept on Close, on chat creation, and on each upload.
 
+**Reading a transcript.** Enter sends, Shift+Enter makes a newline. Model
+reasoning is collapsed behind a **Reasoning** disclosure and only one stays open
+at a time, so a long chain never buries the reply. Assistant bubbles carry an
+`N tok` label — the whole context total reported for that run, not the reply
+alone. Long histories page: **Load earlier messages** walks backwards, a `↓`
+button jumps to the latest, and when the window is trimmed the view says so
+rather than pretending the history is gone — nothing durable is deleted. A
+failed prompt gets a **Retry** that refills the composer with the original
+text. Absolute file paths in output become links: clicking one opens the file
+read-only, with the cited line selected and centred, or rendered as Markdown for
+`.md` files.
+
 **Diff** is a read-only projection of the same conversation's live worktree,
 branch, or pull request. Switching to Diff does not stop the run or open a
 second conversation. The view preserves review after local branch cleanup by
 using the stored Git target and canonical merged-PR patch when available.
+
+Diff opens on **Changes**, which has three sections: **Dirty** (staged,
+unstaged, conflicted or untracked relative to `HEAD`), **Branch**
+(merge-base of `origin/main` and `HEAD` through `HEAD`), and **Commits** (the
+commits ahead of `origin/main`, with author and time). A summary line carries
+the branch, dirty/ahead/behind counts and a refresh button. Filter the file
+tree by path or by status, and step through a patch with
+*Next change* / *Previous change*. The other toggle, **Shell files**, shows
+that shell's own read-only boot document and granted `SKILL.md` files in the
+worktree — useful for checking what the shell was actually told.
+
+If the fetch failed, the view says so — *"this observation uses stale
+`origin/main`"* — instead of quietly comparing against an old base; when the
+remote base is unavailable altogether, only Dirty can be inspected. Binary files
+and over-limit patches are named as such; bytes are never transported.
 
 The browser receives normalized conversation and Git-review resources only. It
 never receives harness credentials or mutates a harness transcript directly.
@@ -557,12 +748,10 @@ Sprint work explicitly); the mechanics live here for the operator.
   waits for the live turn to end and a quiet gate, then closes the old chat and
   opens a fresh one. Sprint assignments, review requests, and verdicts are
   `force-new`; Planner-bound results, decisions, and PR facts are `re-enter`.
-- **PR facts.** Developer-owned PR subscriptions (discovered from the
-  worktree's checked-out branch, `sc sprint register-pr` in a lane, or manual
-  `sc pr subscribe`) emit self-describing red/green/closed/merged wakes to the
-  owning Developer throughout ownership, inside or outside a Sprint; outside an
-  armed or paused Sprint a green wake names the FnB merge directive as the
-  gate. Planner and Reviewer receive no PR-event wakes.
+- **PR facts.** Developer-owned PR subscriptions emit self-describing wakes to
+  the owning Developer, inside or outside a Sprint — see
+  [Pull-request wakes](#pull-request-wakes). Planner and Reviewer receive no
+  PR-event wakes.
 - **Coordinate mode.** Closing the Planner chat during an armed Sprint sets
   coordinate mode: idle Planner `re-enter` wakes open fresh ticket chats.
   Pause/resume from the GUI returns to supervise mode; automatic pauses
@@ -573,6 +762,38 @@ Sprint work explicitly); the mechanics live here for the operator.
 Sprint conformance, pause/recovery and cleanup are covered in the
 [Sprints workflow](#sprints). Participant command sequences remain in their
 Sprint skills and `sc sprint --help`.
+
+### Pull-request wakes
+
+Nobody polls GitHub. The API server runs a watcher process that pulses every few
+seconds and turns real PR state changes into durable wakes for the **Developer
+that owns the PR**. You start nothing, and neither does a shell.
+
+A subscription reaches the watcher three ways:
+
+- **Discovery** — the normal path. The engine reads which branch each
+  `.sc-worktrees/<shortname>` has checked out and subscribes that Developer to
+  the newest open PR whose head is that branch. Disposable `shell/*` bases are
+  never candidates.
+- **`sc sprint register-pr`** — inside a lane, adding the work-unit link on top
+  of the same subscription (and attaching to one discovery already made).
+- **`sc pr subscribe --repository <owner/name> --pr <number>`** — the manual
+  fallback for a PR whose head is not the worktree's checked-out branch. That is
+  the verb's only form.
+
+Ownership is taken from the caller's identity, not a flag, and must be a
+Developer shell; one subscription exists per PR, and a second shell claiming it
+is refused. Four states wake the owner — **red**, **green**, **closed**,
+**merged** — each carrying the repository, number, head SHA and an instruction.
+A state that has not changed (same state, same head SHA) produces no repeat
+wake.
+
+The instruction depends on the Sprint lifecycle. Inside an armed or paused
+Sprint it points at the Sprint's own gate; outside one, a green wake says
+plainly that green is not authorization — merge only under a standing FnB
+directive naming the PR — and a merged wake sends the Developer to the `git`
+skill's after-merge cleanup. Watcher internals, health and recovery:
+[`.super-coder/docs/sprint-pr-watcher.md`](../.super-coder/docs/sprint-pr-watcher.md).
 
 ### Session-surviving jobs
 
@@ -764,10 +985,12 @@ retain the recovery evidence reported by the operation.
 ### Sandbox resources
 
 `./sc sandbox-memory` shows the sandbox hard memory ceiling. A size argument
-sets an override; `default` restores the default policy. Apply configuration
+sets an override; `default` restores the default policy. The default targets
+**12 GiB while reserving 20% of the RAM Docker can see** — whichever is
+smaller — and an override must be at least 512 MiB. Apply configuration
 through the next supported launch/restart and inspect the resource summary.
-The Docker sandbox uses a hard memory limit with swap disabled; the host
-runtime does not provide this Docker memory control.
+The Docker sandbox uses a hard memory limit with swap bounded to the same
+total; the host runtime does not provide this Docker memory control.
 
 `./sc docker-cache-gc` removes unused **host-global Docker build cache** older
 than seven days by default. This is shared cache, not just the current fork's.
@@ -853,10 +1076,66 @@ for exact flags. This table is a route map, not a second full reference.
 | Read spend and reach the GUI | `analytics`, `url`, `ports`, `token` | [Analytics](#token--session-analytics), [Review GUI](#review-gui) |
 | Manage the operator command | `alias`, `make-cleanup` | [Retire the make aliases](#retire-the-make-aliases-one-time) |
 
-General engine SQL, rebuild and private-state recovery belong to Admin.
-Ordinary shells use granted API surfaces. `sc context --task <id>` and
-`sc context --work-unit <id>` provide exact assignment projections; `sc pr`
-provides PR registration/subscription rather than requiring a polling loop.
+General engine SQL, rebuild and private-state recovery belong to Admin — the
+`sc help` chart groups them as **Engine (Admin)**, and the next subsection
+describes them. Ordinary shells use granted API surfaces. `sc context --task <id>`
+and `sc context --work-unit <id>` provide exact assignment projections; `sc pr`
+provides PR registration/subscription rather than requiring a polling loop
+([pull-request wakes](#pull-request-wakes)).
+
+### Admin engine maintenance
+
+These are the operator's repair and proving tools. The Scripts tab runs the
+common ones from a button; reach for the CLI when you need flags or the GUI is
+what's broken. The live-state commands act on the **shared live instance at the
+main checkout**, so they refuse from a linked shell worktree rather than
+silently operating on a substitute — run them from the repo root, or through
+`subfloor admin`.
+
+**Read state**
+
+- `sc engine-ref` — print the 40-character upstream engine SHA this fork is
+  pinned to. Read-only and safe from any worktree.
+- `sc artifact-mode` — show where local artifacts live (snapshot, renders, map
+  DB) and confirm there is no Git publication path. Mode *switching* is retired;
+  this verb only inspects.
+
+**Serialize and rebuild**
+
+- `sc snapshot` — serialize the live instance content to
+  `.sc-state/local/content.sql`. This is what makes memory survivable; run it
+  after DB writes you care about.
+- `sc rebuild` — drop the engine DB and rebuild it from `schema.sql` → every
+  migration in order → that snapshot. **Anything never snapshotted is lost**,
+  so the GUI prompts before running it. It backs up the outgoing DB first and
+  refuses while live owners are running.
+- `sc clean-db` — delete the rebuilt `.db` (plus its `-wal`/`-shm`), leaving the
+  text serializations intact. The follow-up is always `sc rebuild`.
+- `sc init` — seed a fresh fork's operator and ten-shell roster. Runs once,
+  right after a rebuild on an empty fork, and refuses the moment any shell
+  exists.
+
+**Migrate**
+
+- `sc migrate` — apply the migration files not yet stamped in the ledger, in
+  filename order, after taking a pre-migration backup.
+- `sc migration new <slug>` — the authoring side: allocate the next free
+  migration number and write the standard skeleton. It applies nothing.
+
+**Render and prove**
+
+- `sc render` — write the ignored `_sc` flat mirror from the live DB;
+  `sc render skills <shortname>` projects one shell's skills.
+- `sc render-check` — rebuild a throwaway DB from *this checkout's* tracked
+  `schema.sql` + migrations + `content.sql`, render from it, and byte-diff
+  against the active mirror. Non-zero on drift; it never writes your tree. This
+  is the hermetic-reconstruction proof, and it is what CI runs.
+- `sc verify` — copy the engine source into a disposable tempdir and run the
+  whole chain there (rebuild → init → render → a render-only boot). Live memory
+  and artifacts are untouched; the run says so when it finishes.
+- `sc seed-skills` — upsert `.super-coder/assets/skills/` into the live DB. In
+  the engine source repo it also regenerates the seed migration; a tracking fork
+  only upserts. It never retires a name that is merely absent from assets.
 
 ![Subfloor CLI picker showing the available demonstration shells](https://raw.githubusercontent.com/jedbjorn/subfloor/main/docs/images/cli-picker.png)
 
@@ -892,6 +1171,10 @@ the envelope names that recovery line itself. In Docker, a
 fork-owned dependency hook should treat an out-of-repo interpreter as a
 host-managed shared tree: verify it, but never pip-install into it.
 
+The full declaration schema — every key, the hook contract, provisioning, and
+the sandbox extension points — is the [dev kit reference](dev-kit.md); the
+variables named above and the rest are in [environment variables](environment.md).
+
 A fork may also declare exact native Debian packages without maintaining an
 extension Dockerfile:
 
@@ -909,6 +1192,19 @@ show `native_packages=advisory` / `fork_readiness=degraded`; this advisory never
 blocks core shell entry, roadmap completion, or runtime. Run `subfloor admin`
 from the fork root to inspect evidence and prepare a reviewed tracked fix. The
 FnB retains downstream update and live restart approval.
+
+`./sc visual-qa` is the fifth check, and the only one the engine implements
+itself: it drives headless Chromium over your configured routes at your
+configured viewports and writes full-page PNGs into a gallery with an HTML
+index. `visual-qa init` scaffolds `.sc-state/visual-qa.json` (detecting your
+`package.json` scripts where it can, and refusing to overwrite an existing
+config); `visual-qa run` captures an app you already have running;
+`visual-qa ci` boots the configured app itself, captures, and can post or
+update one marked comment on the PR. Unconfigured, `ci` is a **neutral pass**,
+not a failure.
+
+> [!class2]
+> **The CI lane was retired; the command was not.** Subfloor used to seed a managed Visual QA workflow into every fork. It no longer does — the fork workflow template is a no-op shim kept only so `./sc update` can recognize and remove copies it seeded, and the example config template is an empty `{}`. A fork that wants visual QA in CI authors its own workflow calling `./sc visual-qa ci`.
 
 One boundary trips people up: **you work inside the sandbox container**, and the
 app the FnB watches in their browser is a *separate*, host-supervised instance. To
@@ -1014,7 +1310,20 @@ only to what you intend to make available. Then link it:
 ```
 
 `setup`, `status`, `open`, `up`, `down`, `doctor`, `arm` and `disarm` are the
-verbs; the Scripts tab's **Browser** card runs the same operations. A shell
+verbs; the Scripts tab's **Browser** card runs the same operations.
+`enable browser` is safe to re-run: the `drive_browser` grants for dev,
+reviewer, planner and admin are added idempotently, so nothing is duplicated or
+disturbed, and `disable browser` removes exactly those flavor grants again.
+
+`doctor` is the one to run when something is off. It is not purely diagnostic —
+it checks the required packages and **installs or repairs them**, restarting the
+service if it had to. It then reports the overall `state` (`absent` ·
+`declared` · `disarmed` · `ready` · `failed`), whether the feature is armed,
+whether the server and proxy processes are up, whether the linked profile
+resolves and carries the Playwright extension (with the remedy line when it does
+not), and whether a shell connection is actually live — plus a single
+`setup_ready` and an overall `ok` that is true only when all of that holds.
+`--json` returns the same fields. A shell
 given a directive can `./sc browser open` and work through the managed MCP
 connection, which you approve in the extension once per shell. Closing a window
 does not suspend access — **disarm** does. The engine never creates profiles,
@@ -1025,14 +1334,32 @@ package and diagnostic detail:
 ### Web search
 
 The optional Tavily integration keeps its key on the host and gives shells the
-API-backed `sc search` surface. Configure and test the key through the Scripts
-tab. Follow `sc search --help` for query options; no key belongs in a prompt,
-public screenshot or repository file.
+API-backed `sc search` surface. The host makes the outbound call, so a
+sandboxed shell needs no egress of its own — and never sees the key.
+
+Configure it in the Scripts tab's **Web Search** card. The key field is
+write-only: once stored, the card shows only the provider, the last four
+characters and when it was set, because the key itself never crosses back over
+the API. **Test before you save** — the card probes Tavily with the candidate
+key and reports a failure as a red result rather than an error, so you find out
+before shells depend on it. Saving again rotates in place, atomically; the next
+search reads the new key, nothing is cached, and revoking the old key at Tavily
+remains yours to do. The key is stored `0600` in private host instance state,
+never in `instance.json`, the engine DB, a snapshot or a render. Clearing the
+card removes the file, and `sc search` then refuses with a message naming
+Scripts → Web Search.
+
+Shells query with `sc search "<query>" [--max N] [--depth basic|advanced]
+[--json]` — up to 20 results, and results carry a synthesized answer plus
+title, URL and snippet per hit. Failures are named rather than generic (key
+rejected, rate limited, plan usage limit, unreachable), with the key redacted
+from every message. No key belongs in a prompt, public screenshot or repository
+file.
 
 ## Review GUI
 
 > [!class2]
-> **UI** this IS the GUI — Chats · Sprints · Shells · Roadmap · Docs · Flags · Worktrees · Map · Analytics · Scripts · **Shells** reviewer (every shell reads it)
+> **UI** this IS the GUI — Chats · Sprints · Shells · Roadmap · Docs · Flags · Worktrees · Repo Map · Analytics · Scripts · **Shells** reviewer (every shell reads it)
 
 A zero-dependency localhost GUI to review the substrate and hold normal browser
 conversations. One stdlib Python server serves the JSON API, static UI, and
@@ -1134,6 +1461,39 @@ current state boundaries and Admin recovery ownership.
 
 > [!class2]
 > **Spec:** the founding design lives in the roadmap (`super-coder` feature row) and renders to `specs_sc/`.
+
+### Shells tab
+
+The landing tab has four sub-views. **Harness** and **Skills** are scoped to the
+selected shell; the other two are fork-wide, and the shell selector greys out on
+them.
+
+- **Skills** — read a granted skill's content with an inline grant toggle beside
+  each entry. The viewer shows rendered Markdown with a **raw** toggle, plus a
+  character count and token estimate. It says whether you are editing a shared
+  flavor pack or one bespoke shell's pack.
+- **Skill Assignments** — the fork-wide grant matrix: a switch per standard
+  flavor (every shell of that flavor inherits the pack), and a separate group
+  for bespoke shells, which stay individually assignable.
+- **Default Models** — the fork-wide `flavor_defaults` launch matrix: one card
+  per flavor, one row per harness, with a star for the default harness, an exact
+  model override and a Thinking level. *Harness default* clears an override.
+  **↻ Refresh & verify** re-reads the local catalogues and then reports, per
+  harness, the observed version and whether support is `tested` or
+  `best-effort`, followed by a summary of how many harnesses are ready and how
+  many configured defaults are actually runnable — each non-runnable default
+  named with its reason. If it finds any of that, it says *review verification
+  warnings* rather than claiming success.
+
+### Links and keys
+
+Every view is addressable, so you can bookmark or paste a link to exactly what
+you mean: `#sprints/<id>`, `#roadmap-feature-<id>`, `#roadmap-flow`,
+`#analytics-quota`, `#shells-skill-assignments`, `#shells-default-models`, and
+`#interface/<shell>/<conversation>` — with `/diff` appended for Diff mode.
+Bare `#docs`, `#flags`, `#worktrees`, `#map` and `#scripts` work too; anything
+unrecognised lands on Shells. Esc closes the topmost modal, and the Analytics
+chart moves point to point with ← and →.
 
 ### Token & session analytics
 
