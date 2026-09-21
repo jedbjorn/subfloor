@@ -1,6 +1,7 @@
 """Named remotes keep SSH authority behind the host vm-broker."""
 from __future__ import annotations
 
+import argparse
 import json
 import shutil
 import subprocess
@@ -190,6 +191,61 @@ class RemoteConfigClientTests(unittest.TestCase):
             {"command": "echo ok"},
             timeout=remote.SSH_TIMEOUT + 15,
         )
+
+
+class RemoteClientHelpTests(unittest.TestCase):
+    """`./sc remote --help` must describe its verbs, not merely name them."""
+
+    EXPECTED = ("add", "remove", "status", "list", "exec", "push", "pull")
+
+    def _subparser_action(self):
+        parser = remote.build_client_parser()
+        actions = [
+            action for action in parser._actions  # noqa: SLF001 — argparse has no public reader
+            if isinstance(action, argparse._SubParsersAction)  # noqa: SLF001
+        ]
+        self.assertEqual(len(actions), 1)
+        return actions[0]
+
+    def test_every_subcommand_carries_non_empty_help(self):
+        action = self._subparser_action()
+        named = {choice.dest: choice.help for choice in action._choices_actions}  # noqa: SLF001
+        self.assertEqual(tuple(named), self.EXPECTED)
+        for operation, text in named.items():
+            with self.subTest(operation=operation):
+                self.assertIsNotNone(text)
+                self.assertTrue(text.strip())
+
+    def test_help_output_lists_each_verb_with_its_description(self):
+        rendered = remote.build_client_parser().format_help()
+        for operation in self.EXPECTED:
+            with self.subTest(operation=operation):
+                self.assertIn(operation, rendered)
+        self.assertIn("forget a named remote", rendered)
+
+    def test_argument_shapes_are_unchanged(self):
+        action = self._subparser_action()
+        shapes = {
+            name: (
+                [option.dest for option in sub._actions if option.option_strings],  # noqa: SLF001
+                [option.dest for option in sub._actions if not option.option_strings],  # noqa: SLF001
+            )
+            for name, sub in action.choices.items()
+        }
+        self.assertEqual(shapes["add"], (
+            ["help", "host", "user", "port", "key_path", "known_hosts_path", "json"],
+            ["name"],
+        ))
+        self.assertEqual(shapes["remove"], (["help", "json"], ["name"]))
+        self.assertEqual(shapes["status"], (["help", "json"], ["name"]))
+        self.assertEqual(shapes["list"], (["help", "json"], []))
+        self.assertEqual(shapes["exec"], (
+            ["help", "command_file", "json"], ["name", "command"],
+        ))
+        for operation in ("push", "pull"):
+            self.assertEqual(
+                shapes[operation], (["help", "json"], ["name", "src", "dest"])
+            )
 
 
 class RemoteBrokerSocketTests(unittest.TestCase):
