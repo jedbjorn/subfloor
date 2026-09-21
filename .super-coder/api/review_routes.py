@@ -1043,7 +1043,12 @@ def _skill_roots(harness: str) -> list[str]:
         return roots
     declared = payload.get("skill_dirs")
     if isinstance(declared, list) and all(isinstance(item, str) for item in declared):
-        roots = declared
+        # PREPEND, never replace: run.render_harness_skills always puts
+        # `.claude/skills` in front of the adapter's declared roots, so a
+        # manifest that declares only its native path (kimi) still gets the
+        # cross-harness mirror rendered. Replacing here made this view
+        # disagree with what the renderer actually writes.
+        roots = [*roots, *declared]
     return list(dict.fromkeys(roots))
 
 

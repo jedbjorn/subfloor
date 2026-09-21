@@ -37,7 +37,7 @@ SEMVER_TOKEN = re.compile(
 # not promote an arbitrary wrapper or custom build to the tested assurance.
 MAINTAINED_OBSERVED_VERSIONS = {
     "claude": "2.1.223 (Claude Code)",
-    "codex": "codex-cli 0.147.0",
+    "codex": "codex-cli 0.155.1",
     "opencode": "1.18.9",
     "vibe": "vibe 2.22.0",
     "kimi": "0.33.0",

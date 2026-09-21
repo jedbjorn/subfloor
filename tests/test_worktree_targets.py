@@ -690,8 +690,8 @@ class LiveSurfacesStillResolveTest(WorktreeFixture):
             "version": "0.145.0", "observed_version": "codex-cli 0.145.0",
             "compatibility": "supported",
             "minimum_version": "0.145.0",
-            "maximum_version_exclusive": "0.148.0",
-            "verified_version": "0.147.0", "error": None,
+            "maximum_version_exclusive": "0.156.0",
+            "verified_version": "0.155.1", "error": None,
         }
         entry = model_catalog._entry(
             "wt-live-model", name="Worktree Live", source="codex-cache",
