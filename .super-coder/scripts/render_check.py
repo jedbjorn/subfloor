@@ -208,7 +208,9 @@ def main() -> int:
                 + "\n  drifted:\n"
                 + "".join(f"    {p}\n" for p in drifted)
                 + (f"\n{diagnostics}\n" if diagnostics else "")
-                + "\n  fix:  ./sc rebuild && ./sc render flat\n"
+                + "\n  fix (Admin, from the main checkout):\n"
+                + "    SC_ADMIN=1 ./sc snapshot && SC_ADMIN=1 ./sc render flat\n"
+                + "  then rerun ./sc render-check.\n"
             )
             return 1
     print("✓ render-check: flat _sc mirror matches the render of the active sources")

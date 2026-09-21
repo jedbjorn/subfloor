@@ -1310,7 +1310,8 @@ Serializing is an admin/GUI operation, NOT a per-write shell step: it writes
 the shared instance''s gitignored local cache. `sc snapshot` and `sc render`
 run from the main checkout; the dispatcher refuses them from a linked shell
 worktree. The GUI **Save locally** button, `install`, `update`, and
-`render-check` run them for you. A working shell does not run them; its writes
+the authorized maintenance flows run them for you. `render-check` only checks
+for drift; it does not refresh the snapshot or mirror. A working shell does not run them; its writes
 are captured when admin saves locally before a rebuild. The rest of this skill
 = the admin/GUI path.
 
@@ -1332,23 +1333,24 @@ to local; mode switching and Git publication are retired.
 
 ## When admin serializes
 
-All commands run from the main checkout.
+All commands run from the main checkout. Admin must explicitly set `SC_ADMIN=1`
+for snapshot and render; the Admin shell identity alone does not satisfy the gate.
 
-1. `sc snapshot` -> dumps the per-instance tables to the active
+1. `SC_ADMIN=1 ./sc snapshot` -> dumps the per-instance tables to the active
    local snapshot path. Deterministic DELETE-then-INSERT in PK order makes
    re-running byte-identical.
 
-2. `sc render` -> regenerates the flat `_sc` files
+2. `SC_ADMIN=1 ./sc render flat` -> regenerates the flat `_sc` files
    (`renders/specs_sc/`, `renders/docs_sc/`, `renders/skills_sc/`,
    `renders/roadmap_sc.md`) beneath `.sc-state/local/`. Run
    after changing a document body, the roadmap, or skills. Incremental —
    unchanged files not rewritten. (`.claude/skills/` rebuilds at boot and is
    gitignored — not rendered here.)
 
-3. Verify reproducibility: `sc rebuild && sc verify` -> DB rebuilds from local text
-   alone, byte-for-byte.
+3. Verify reproducibility: `./sc verify` -> rebuilds from local text in an
+   isolated disposable checkout without replacing the live DB.
    `sc render-check` rebuilds the DB hermetically from text and fails if the
-   local mirror drifts from that render. A plain `sc render` reads the *live* DB,
+   local mirror drifts from that render. `SC_ADMIN=1 ./sc render flat` reads the *live* DB,
    which can lag the source just edited (skill-catalogue trap below);
    `render-check`''s rebuild-first catches the stale mirror the live-DB render
    silently passed.
@@ -1359,13 +1361,13 @@ All commands run from the main checkout.
 ## Authoring vs. snapshotting
 
 - **Per-instance content** (your memory, this repo''s roadmap/docs): edit the
-  DB -> `sc snapshot`. The local DB is primary; the ignored snapshot is its
+  DB -> `SC_ADMIN=1 ./sc snapshot`. The local DB is primary; the ignored snapshot is its
   rebuild source.
 - **Skill catalogue** (system, propagates): edit
   `assets/skills/<name>/SKILL.md` -> `sc seed-skills` — upserts the live DB
   *and* (source repo only) regenerates the seed migration. Not the snapshot.
   See `seed_skills.py`.
-  - Sequence: `sc seed-skills && sc render`, then `sc render-check`. Commit the
+  - Sequence: `sc seed-skills && SC_ADMIN=1 ./sc render flat`, then `sc render-check`. Commit the
     regenerated `migrations/0001_seed_skills.sql`; the mirror stays ignored.
 
 Steps 1–3 are the local durability path. There is no generated-artifact

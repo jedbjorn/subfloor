@@ -1,12 +1,9 @@
----
-name: snapshot
-description: Refresh the gitignored local DB snapshot and flat renders. Generated instance state never enters Git.
-category: substrate
-command: sc snapshot
-common: false
----
+-- 0270 — snapshot admin guidance.
+-- Reconcile the snapshot skill after historical catalogue migrations.
 
-# snapshot — serialize the DB back to text
+BEGIN;
+
+UPDATE skills SET content = '# snapshot — serialize the DB back to text
 
 Live `shell_db.db` = the single source of truth shared by every shell; a
 `sc mem` write is durable + visible to all shells the instant it commits. The
@@ -15,7 +12,7 @@ Live `shell_db.db` = the single source of truth shared by every shell; a
 an edit not yet serialized is discarded by a rebuild.
 
 Serializing is an admin/GUI operation, NOT a per-write shell step: it writes
-the shared instance's gitignored local cache. `sc snapshot` and `sc render`
+the shared instance''s gitignored local cache. `sc snapshot` and `sc render`
 run from the main checkout; the dispatcher refuses them from a linked shell
 worktree. The GUI **Save locally** button, `install`, `update`, and
 the authorized maintenance flows run them for you. `render-check` only checks
@@ -29,7 +26,7 @@ are captured when admin saves locally before a rebuild. The rest of this skill
 |---|---|---|---|
 | `schema.sql` | the v1 baseline schema | yes (forks) | hand, rarely |
 | `migrations/*.sql` | ordered schema + **system content** deltas (e.g. the skills catalogue) | yes (forks) | author / `sc seed-skills` |
-| `.sc-state/local/content.sql` | **this repo's** per-instance content + memory — shells, seed/L&S, decisions, roadmap, documents, flags, projects, skill grants | no (instance-only, gitignored) | `sc snapshot` |
+| `.sc-state/local/content.sql` | **this repo''s** per-instance content + memory — shells, seed/L&S, decisions, roadmap, documents, flags, projects, skill grants | no (instance-only, gitignored) | `sc snapshot` |
 
 The split: system content propagates via migrations; per-instance content stays
 in the snapshot. Skill *bodies* = system (migration); which shell is *granted*
@@ -60,7 +57,7 @@ for snapshot and render; the Admin shell identity alone does not satisfy the gat
    `sc render-check` rebuilds the DB hermetically from text and fails if the
    local mirror drifts from that render. `SC_ADMIN=1 ./sc render flat` reads the *live* DB,
    which can lag the source just edited (skill-catalogue trap below);
-   `render-check`'s rebuild-first catches the stale mirror the live-DB render
+   `render-check`''s rebuild-first catches the stale mirror the live-DB render
    silently passed.
 
 4. Do not stage the output. Generated snapshots and renders are gitignored.
@@ -68,7 +65,7 @@ for snapshot and render; the Admin shell identity alone does not satisfy the gat
 
 ## Authoring vs. snapshotting
 
-- **Per-instance content** (your memory, this repo's roadmap/docs): edit the
+- **Per-instance content** (your memory, this repo''s roadmap/docs): edit the
   DB -> `SC_ADMIN=1 ./sc snapshot`. The local DB is primary; the ignored snapshot is its
   rebuild source.
 - **Skill catalogue** (system, propagates): edit
@@ -91,4 +88,6 @@ This skill owns the render/snapshot pipeline + the `render-check` guard:
 - `engine_migrations` — a **content-seed** migration (skills, flavor defaults)
   changes what renders; rebuild + render + `render-check` after.
 - Document bodies live in the DB, render to `docs_sc/` / `specs_sc/`;
-  authored via `sc mem doc`, serialized here.
+  authored via `sc mem doc`, serialized here.' WHERE name = 'snapshot';
+
+COMMIT;

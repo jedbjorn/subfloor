@@ -225,8 +225,9 @@ sc_host_server_up() {
   fi
   systemctl --user stop "$HOST_SERVER_UNIT" >/dev/null 2>&1 || true
   : > "$HOST_SERVER_LOG"
+  # systemd consumes one dollar-escape layer; the shell must receive $$.
   if ! systemd-run --user --quiet --collect --unit "$HOST_SERVER_UNIT" -- \
-      /bin/sh -c 'printf "%s\n" "$$" > "$1"; exec env SC_BIND=127.0.0.1 PYTHONUNBUFFERED=1 "$2" "$3" --port "$4" >> "$5" 2>&1' \
+      /bin/sh -c 'printf "%s\n" "$$$$" > "$1"; exec env SC_BIND=127.0.0.1 PYTHONUNBUFFERED=1 "$2" "$3" --port "$4" >> "$5" 2>&1' \
       sc-host-server "$HOST_SERVER_PID" "$PY" "$ENGINE/api/server.py" "$host_port" "$HOST_SERVER_LOG"; then
     echo "✗ host-runtime: systemd could not start $HOST_SERVER_UNIT" >&2
     return 1

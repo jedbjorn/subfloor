@@ -218,11 +218,17 @@ class HostRuntimeFixture:
         self._write_executable(
             "systemd-run",
             """\
-            #!/bin/sh
-            printf 'systemd-run %s\\n' "$*" >> "$SC_TEST_LOG"
-            while [ "$#" -gt 0 ] && [ "$1" != '--' ]; do shift; done
-            [ "$#" -gt 0 ] && shift
-            nohup "$@" >/dev/null 2>&1 &
+            #!/usr/bin/env python3
+            import os
+            import subprocess
+            import sys
+
+            with open(os.environ["SC_TEST_LOG"], "a") as log:
+                log.write("systemd-run " + " ".join(sys.argv[1:]) + "\\n")
+            # systemd unescapes doubled dollars before executing the command.
+            argv = [arg.replace("$$", "$") for arg in sys.argv[sys.argv.index("--") + 1:]]
+            subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL, start_new_session=True)
             """,
         )
 
@@ -356,6 +362,11 @@ class HostRuntimeLifecycleTest(unittest.TestCase):
         backups = [line for line in self.fx.calls() if line.startswith("db_backup backup")]
         self.assertEqual(len(backups), 1)
         self.assertIn("prerestart", backups[0])
+        down = self.fx.run("down")
+        self.assertEqual(down.returncode, 0, down.stderr)
+        self.assertIn("host review server stopped", down.stdout)
+        self.assertFalse(self.fx.pidfile().exists())
+        self.assertFalse(self.fx.health())
         self.assert_no_docker()
 
     def test_build_is_refused_and_logs_needs_a_launch(self):
