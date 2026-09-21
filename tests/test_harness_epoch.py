@@ -567,6 +567,40 @@ class ScHarnessCommands(unittest.TestCase):
             [],
         )
 
+    def _path_without_docker(self) -> str:
+        """PATH with every `docker` hidden and nothing else lost: a directory
+        that holds one is mirrored as symlinks minus that entry, so the
+        dispatcher's own `command -v docker` is what gets exercised."""
+        mirror_root = Path(self.fx._tmp.name) / "nodocker"
+        entries = []
+        for index, entry in enumerate(os.environ["PATH"].split(os.pathsep)):
+            source = Path(entry)
+            if not (source / "docker").exists():
+                entries.append(entry)
+                continue
+            mirror = mirror_root / str(index)
+            mirror.mkdir(parents=True)
+            for tool in source.iterdir():
+                if tool.name != "docker":
+                    (mirror / tool.name).symlink_to(tool)
+            entries.append(str(mirror))
+        return os.pathsep.join(entries)
+
+    def test_models_refuses_when_docker_is_not_installed(self):
+        self._stub_models()
+        path = self._path_without_docker()
+        for argv in (("refresh",), self.RESOLVE):
+            with self.subTest(argv=argv):
+                result = self.fx.run("models", *argv, SC_API_TOKEN="", PATH=path)
+                self.assertEqual(result.returncode, 3)
+                self.assertIn("docker is not installed here", result.stderr)
+                self.assertIn("./sc runtime host", result.stderr)
+        self.assertEqual(
+            [call for call in self.fx.calls()
+             if call.startswith(("docker ", "host-models "))],
+            [],
+        )
+
     def test_models_stays_on_the_host_for_a_host_runtime_install(self):
         self._stub_models()
         shutil.copy2(ENGINE / "scripts" / "runtime.py",

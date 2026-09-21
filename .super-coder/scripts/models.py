@@ -59,7 +59,7 @@ def _api_routes(*, harness: str | None = None,
     ) or []
 
 
-def _require_launch_seat(command: str) -> None:
+def _require_launch_seat(command: str, *, as_json: bool = False) -> None:
     """Refresh records this process's harness versions as route evidence, and
     resolve judges stored evidence against the version this process probes.
 
@@ -74,12 +74,19 @@ def _require_launch_seat(command: str) -> None:
         return
     if model_catalog.harness_versions.runtime_scope()["runtime"] == "sandbox":
         return
-    print(
-        f"models: this install runs shells in the sandbox — {command} from "
-        f"that runtime (`./sc models {command}` with the sandbox running); "
-        "host harness versions were neither recorded nor compared",
-        file=sys.stderr,
+    error = (
+        f"this install runs shells in the sandbox — {command} from that "
+        f"runtime (`./sc models {command}` with the sandbox running); host "
+        "harness versions were neither recorded nor compared"
     )
+    if as_json:
+        print(json.dumps(
+            {"ok": False, "code": "runtime_seat_unavailable", "error": error,
+             "details": {"runtime": runtime.SANDBOX, "seat": "host"}},
+            indent=2,
+        ))
+    else:
+        print(f"models: {error}", file=sys.stderr)
     raise SystemExit(3)
 
 
@@ -338,7 +345,9 @@ def main(argv: list[str] | None = None) -> int:
         return _print_resolved(data, as_json)
 
     if command in ("refresh", "resolve"):
-        _require_launch_seat(command)
+        _require_launch_seat(
+            command, as_json=command == "resolve" and "--json" in args
+        )
     con = _open_db()
     try:
         if args[0] == "refresh":

@@ -1801,6 +1801,22 @@ class RouteCliConnectionTest(unittest.TestCase):
                 self.assertIn(f"./sc models {argv[0]}", errors.getvalue())
                 self.assertIn("neither recorded nor compared", errors.getvalue())
 
+            # --json keeps resolve's failure envelope on stdout, still exit 3.
+            output = io.StringIO()
+            with (
+                contextlib.redirect_stdout(output),
+                self.assertRaises(SystemExit) as refused,
+            ):
+                routes_cli.main(["resolve", "codex", "api-model", "--json"])
+            self.assertEqual(refused.exception.code, 3)
+            payload = json.loads(output.getvalue())
+            self.assertEqual(
+                set(payload), {"ok", "code", "error", "details"}
+            )
+            self.assertIs(payload["ok"], False)
+            self.assertEqual(payload["code"], "runtime_seat_unavailable")
+            self.assertIn("./sc models resolve", payload["error"])
+
     def test_sandbox_seat_refresh_records_for_a_sandbox_install(self):
         con = mock.Mock()
         payload = {"stale": False, "sources": ["test-source"]}
