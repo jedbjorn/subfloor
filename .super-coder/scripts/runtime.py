@@ -3,10 +3,11 @@
 
 Two runtimes exist. `sandbox` (the default) runs the review server inside the
 docker container that `./sc launch` builds and starts; shells enter it with
-`docker exec`. `host` runs the same review server as a transient `systemd-run --user` service
-(with its pidfile and log under .super-coder/run/) and boots shells directly on
-the host — no docker daemon, image, or container anywhere in the lifecycle. A
-working systemd user manager is required; `./sc launch` refuses without one.
+`docker exec`. `host` runs the same review server as a transient
+`systemd-run --user` service (pidfile and log under .super-coder/run/) and boots
+shells directly on the host — no docker daemon, image, or container anywhere in
+the lifecycle. A working systemd user manager is required; `./sc launch`
+refuses without one.
 
 The selection is one `instance.json` key, `runtime`, written by
 `./sc install --runtime host` or `./sc runtime host` and read by the

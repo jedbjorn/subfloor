@@ -122,8 +122,9 @@ def infer_role(path: str, ext: str, lang: str | None) -> str:
 
 def load_config() -> dict:
     """Read the per-fork map config, if any — `.sc-state/local/map/config.json`,
-    falling back to the older tracked `.sc-state/map.config.json` and then to the
-    pre-split `.super-coder/map.config.json`. Shape (all keys optional):
+    falling back to the legacy `.sc-state/map.config.json` (gitignored too) and
+    then to the pre-split `.super-coder/map.config.json`. Shape (all keys
+    optional):
         {"skip_dirs": [...], "skip_files": [...],
          "role_overrides": [{"prefix": "cmd/", "role": "code"},
                             {"glob": "*.proto", "role": "code"}]}

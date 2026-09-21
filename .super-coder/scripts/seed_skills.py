@@ -359,8 +359,8 @@ def seeded_skill_names() -> list[str]:
 def retired_skill_names() -> list[str]:
     """The fork's retire list — engine skills this fork has taken out of
     service (`.sc-state/local/skills_retired.json`, gitignored instance-local
-    state; written by `./sc skill retire`, and migrated up from the older
-    tracked `.sc-state/skills_retired.json` by the
+    state; written by `./sc skill retire`, and migrated up from the legacy
+    `.sc-state/skills_retired.json` by the
     `artifact_policy.prepare_local_state()` call below).
     The seed/sync resurrects engine rows on every update,
     so retirement must live OUTSIDE the DB and be re-applied after each sync —
