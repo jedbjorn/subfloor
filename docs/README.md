@@ -119,7 +119,7 @@ inherits the **system** (schema + the skill catalogue + the render chain), never
 subfloor's own memory or roadmap.
 
 > [!class4]
-> **Requirements: Python 3.14.x with `sqlite3`, plus `docker`.** The default run mode is a sandbox container, so the harness's "allow everything" is safe — the kernel is the boundary, and the container sees only this repo + your harness creds. The image bakes the rest: `python3`, `sqlite3`, `git`, `curl`, and the harness CLIs. No docker? The `./sc serve` + `./sc boot` primitives run on the host with the selected Python 3.14.x interpreter, `sqlite3`, and a harness on `PATH`. Set `SC_PYTHON` to select that interpreter explicitly.
+> **Requirements: Python 3.14.x with `sqlite3`, plus `docker`.** The default run mode is a sandbox container, so the harness's "allow everything" is safe — the kernel is the boundary, and the container sees only this repo + your harness creds. The image bakes the rest: `python3`, `sqlite3`, `git`, `curl`, and the harness CLIs. No docker? Select the host runtime (`./sc install --runtime host`, or `./sc runtime host` on an existing install): `./sc launch` + `./sc enter` then run on the host with the selected Python 3.14.x interpreter, `sqlite3`, a systemd user manager, and a harness on `PATH`. Set `SC_PYTHON` to select that interpreter explicitly.
 
 **Docker mode — rootless is the default.** `./sc doctor` checks your docker.
 Both modes work (the launcher's `duser()` adapts), and **rootless is the chosen
@@ -495,7 +495,9 @@ prints the two terminal commands instead.
 ### Headless model routing
 
 `flavor_defaults` and the picker cover interactive boots. Generic headless
-launches have no picker, so resolve the exact local route before automation:
+launches have no picker, so resolve the exact local route before automation.
+On a sandbox install the container must be running (`./sc launch`): `refresh`
+and `resolve` run inside it, against the harness CLIs shells actually launch:
 
 ```bash
 ./sc models refresh
@@ -822,8 +824,10 @@ builds, and benchmarks that would otherwise die with the harness process.
 `./sc run` renders the same shell identity and skills as an interactive boot,
 executes one non-interactive harness turn, records its archive, and exits.
 Model resolution is exact: unsupported aliases, headless adapters, or effort
-levels fail before launch. The caller owns the task contract and any follow-up
-message; the launcher does not invent workflow or merge authority.
+levels fail before launch. On a sandbox install `refresh` and `resolve` run
+inside the running container, so `./sc launch` comes first. The caller owns the
+task contract and any follow-up message; the launcher does not invent workflow
+or merge authority.
 
 ## Update a fork
 

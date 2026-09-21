@@ -534,8 +534,8 @@ def ensure_harnesses() -> dict[str, str]:
 # ── Docker preflight (the default run mode is a sandbox container) ────────────
 # Advisory only: real docker setup needs root + a re-login, so install GUIDES with
 # the right commands for the state it finds, never mutates. Mirrors the git/curl
-# warnings — a missing/under-configured docker is not fatal, because the no-docker
-# escape hatch (`./sc serve` + `./sc boot`) still runs the shell on the host.
+# warnings — a missing/under-configured docker is not fatal, because the host
+# runtime (`./sc runtime host`) runs the server and shells with no docker at all.
 
 def docker_status() -> dict:
     """Docker availability + mode. 'absent' (no CLI) · 'no-daemon' (CLI but no
@@ -573,7 +573,8 @@ def report_docker() -> dict:
         print("  docker    ⚠ not found — the default run mode is a sandbox container.")
         print("            Install it with your Linux package manager (e.g. Arch: sudo pacman -S docker),")
         print("            then `./sc doctor`.")
-        print("            Or run without docker via the escape hatch: ./sc serve + ./sc boot")
+        print("            Or run without docker: ./sc runtime host, then ./sc launch + ./sc enter")
+        print("            (needs a systemd user manager; records the host as this install's runtime).")
     return st
 
 

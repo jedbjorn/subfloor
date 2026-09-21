@@ -384,7 +384,7 @@ SC_PG_SHM="${SC_PG_SHM:-1g}"
 dcheck() {
   if ! command -v docker >/dev/null 2>&1 || ! docker info >/dev/null 2>&1; then
     echo "✗ docker daemon not reachable — the sandbox needs it." >&2
-    echo "  Setup (one-time):  ./sc doctor      No docker:  ./sc boot" >&2
+    echo "  Setup (one-time):  ./sc doctor      No docker:  ./sc runtime host, then ./sc launch" >&2
     exit 1
   fi
 }
@@ -521,6 +521,43 @@ sc_harness_status() {
   if [ "$stored" != "0" ] && [ "$stored" != "$built" ]; then
     echo "  ! the image predates the stored epoch — ./sc restart (or ./sc build) to bake fresh harnesses"
   fi
+}
+
+# `models refresh` records harness versions as route evidence, and `models
+# resolve` judges that evidence against the harness version it probes — as
+# launch does, in the runtime that executes the route. So on a sandbox install
+# both run INSIDE the sandbox, through the exec seam harness-status probes with;
+# the host's own CLIs decide nothing on the docker path. Stricter than
+# sc_harness_status on purpose: status is advisory and may fall back to a local
+# probe, while these write or judge evidence and must never do so from a seat
+# no shell runs in — an unreachable runtime refuses with exit 3, distinct from
+# models.py's 2 for a refresh or resolve that ran and failed. A shell token
+# already reaches the engine API in that runtime, and `list` only reads rows.
+sc_models() {
+  case "${1:-}" in
+    refresh|resolve) : ;;
+    *) exec "$PY" "$S/models.py" "$@" ;;
+  esac
+  if [ -n "${SC_SANDBOX:-}" ] || [ -n "${SC_API_TOKEN:-}" ] || sc_host_runtime; then
+    exec "$PY" "$S/models.py" "$@"
+  fi
+  if ! command -v docker >/dev/null 2>&1; then
+    echo "✗ ./sc models $1: this install runs shells in the sandbox, and docker is not installed here." >&2
+    echo "  Setup (one-time):  ./sc doctor      Shells on this host instead:  ./sc runtime host" >&2
+    exit 3
+  fi
+  if ! docker info >/dev/null 2>&1; then
+    echo "✗ ./sc models $1: this install runs shells in the sandbox, and the docker daemon is not reachable." >&2
+    echo "  Start the daemon (./sc doctor checks it), then ./sc launch and ./sc models $1." >&2
+    exit 3
+  fi
+  if ! drunning; then
+    echo "✗ ./sc models $1: this install runs shells in the sandbox '$CNAME', which is not running." >&2
+    echo "  Route evidence belongs to that runtime — ./sc launch, then ./sc models $1." >&2
+    exit 3
+  fi
+  # python3 and $S, not $PY: see sc_harness_status.
+  exec docker exec "$CNAME" python3 "$S/models.py" "$@"
 }
 
 # ── fork-declared dev-kit hooks — exact current-seat execution ────────────────
@@ -1270,7 +1307,7 @@ case "$cmd" in
   # Token & session analytics — sweep each harness's on-disk usage data for
   # THIS repo into session_token_usage (incremental, idempotent; doc #11).
   analytics)    exec "$PY" "$S/analytics.py" "$@" ;;
-  models)       exec "$PY" "$S/models.py" "$@" ;;
+  models)       sc_models "$@" ;;
   # Like render-check, seed generation authors the CALLER's tracked engine
   # source. A linked source worktree must never regenerate the main checkout's
   # 0001 from a different branch's assets or upsert that shared live DB.

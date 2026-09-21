@@ -122,7 +122,9 @@ subfloor harness-status     # verify the new build is what shells got
 **4. If the CLI is current and the model still is not offered**, it is no longer
 a freshness problem — look at the model catalogue (`./sc models list claude`,
 `./sc models refresh`) and then at account entitlements. `model_routes` marks
-CLI-probed routes `available` and models.dev-sourced ones `advisory`.
+CLI-probed routes `available` and models.dev-sourced ones `advisory`. On a
+sandbox install `./sc models refresh` and `resolve` run inside the running
+container — route evidence is bound to the runtime shells launch in.
 
 ## Gotchas
 

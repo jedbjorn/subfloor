@@ -22,6 +22,7 @@ import route_bindings  # noqa: E402
 import db_driver  # noqa: E402
 import instance_state  # noqa: E402
 import mem  # noqa: E402
+import runtime  # noqa: E402
 
 
 def _open_db():
@@ -56,6 +57,37 @@ def _api_routes(*, harness: str | None = None,
     return _api_route_projection(harness=harness, selector=selector).get(
         "routes"
     ) or []
+
+
+def _require_launch_seat(command: str, *, as_json: bool = False) -> None:
+    """Refresh records this process's harness versions as route evidence, and
+    resolve judges stored evidence against the version this process probes.
+
+    Launch binds that evidence to the runtime that executes the route, so a
+    host seat on a sandbox install would record or compare versions no shell
+    runs, and the stale verdict's `sc models refresh` remedy could never clear
+    it. `./sc models refresh|resolve` execs into the sandbox; this refuses the
+    seats that bypass it, before anything is probed or written. Exit 3 —
+    nothing ran — stays distinct from 2, a refresh or resolve that failed.
+    """
+    if runtime.read_mode() != runtime.SANDBOX:
+        return
+    if model_catalog.harness_versions.runtime_scope()["runtime"] == "sandbox":
+        return
+    error = (
+        f"this install runs shells in the sandbox — {command} from that "
+        f"runtime (`./sc models {command}` with the sandbox running); host "
+        "harness versions were neither recorded nor compared"
+    )
+    if as_json:
+        print(json.dumps(
+            {"ok": False, "code": "runtime_seat_unavailable", "error": error,
+             "details": {"runtime": runtime.SANDBOX, "seat": "host"}},
+            indent=2,
+        ))
+    else:
+        print(f"models: {error}", file=sys.stderr)
+    raise SystemExit(3)
 
 
 def _refresh(payload: dict) -> int:
@@ -312,6 +344,10 @@ def main(argv: list[str] | None = None) -> int:
         )
         return _print_resolved(data, as_json)
 
+    if command in ("refresh", "resolve"):
+        _require_launch_seat(
+            command, as_json=command == "resolve" and "--json" in args
+        )
     con = _open_db()
     try:
         if args[0] == "refresh":
