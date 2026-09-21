@@ -1631,11 +1631,34 @@ function featureCard(f, candidates = [], projects = []) {
   return c;
 }
 
+// The retired-document banner: when it was retired and what is current now.
+// current_document_id is the server's chain resolution (first non-retired
+// document, bounded) — a pointer whose target is gone degrades to its bare id.
+function retirementBanner(d) {
+  const when = d.retired_date || "date unknown";
+  const note = el("div", { className: "lock-note retired-note" });
+  if (!d.superseded_by) {
+    note.append(`retired ${when} — withdrawn, no successor. Read-only.`);
+    return note;
+  }
+  const targetId = d.current_document_id ?? d.superseded_by;
+  const targetTitle = d.current_document_id
+    ? (d.current_title || `document #${targetId}`)
+    : `document #${targetId}`;
+  note.append(`retired ${when} — superseded. Current: `);
+  note.append(el("a", {
+    href: "/api/documents/" + targetId + "/open",
+    target: "_blank", rel: "noopener", textContent: targetTitle,
+  }));
+  note.append(` #${targetId}. Read-only.`);
+  return note;
+}
+
 // A document row: the primary action OPENS it rendered in md-converter (the
 // markdown rides in the URL via /open → ?c=). No inline raw-markdown expand.
 // Non-frozen docs get an explicit "edit" toggle; frozen ones are read-only.
 function docBlock(d, { readOnly = false } = {}) {
-  const wrap = el("div", { className: "docrow" });
+  const wrap = el("div", { className: "docrow" + (d.retired ? " retired" : "") });
   const label = d.kind === "doc"
     ? `Doc - ${d.title || "(untitled)"}`
     : `${d.kind} v${d.seq}${d.frozen ? " · frozen " + (d.frozen_date || "") : ""}: ${d.title || ""}`;
@@ -1647,6 +1670,14 @@ function docBlock(d, { readOnly = false } = {}) {
     el("span", { className: "docrow-label" }, label,
       el("span", { className: "idnum" }, " #" + d.document_id)), open);
   wrap.append(head);
+
+  // A retired document opens read-only behind a banner naming what is current
+  // now — the successor resolved through the chain, as a link. A reader who
+  // landed here from an old link leaves with the current document.
+  if (d.retired) {
+    wrap.append(retirementBanner(d));
+    return wrap;
+  }
 
   if (readOnly) return wrap;   // open-link only — no edit toggle, no lock-note
 
@@ -1677,6 +1708,7 @@ function docBlock(d, { readOnly = false } = {}) {
 
 // ── Docs ──────────────────────────────────────────────────────────────────────
 let docsQuery = "";   // persists across re-renders so the search box keeps its value
+let docsShowRetired = false;   // retired docs are history — hidden until asked for
 
 async function renderDocs(root) {
   const { docs } = await api("/docs");
@@ -1689,14 +1721,32 @@ async function renderDocs(root) {
 
   // unified search bar — first under the header; filters by doc title or feature
   const search = searchBar("search docs…", docsQuery, (v) => { docsQuery = v; draw(); });
+  // show-retired toggle: retired docs are superseded history, so they stay out
+  // of the list until a reader asks for them.
+  const retiredCount = docs.filter((d) => d.retired).length;
+  const bar = el("div", { className: "filters seg" });
+  // No retired docs = nothing to reveal; an always-on "(0)" chip is noise.
+  if (retiredCount) {
+    const retiredChip = el("button", {
+      className: "chip" + (docsShowRetired ? " on" : ""),
+      textContent: `show retired (${retiredCount})`,
+    });
+    retiredChip.onclick = () => {
+      docsShowRetired = !docsShowRetired;
+      retiredChip.classList.toggle("on", docsShowRetired);
+      draw();
+    };
+    bar.append(retiredChip);
+  }
   const results = el("div", {});
   const draw = () => {
     const q = docsQuery.trim().toLowerCase();
+    const visible = docsShowRetired ? docs : docs.filter((d) => !d.retired);
     const matched = q
-      ? docs.filter((d) =>
+      ? visible.filter((d) =>
           `${d.title || ""} #${d.document_id} ${d.feature_title || ""} #${d.feature_id ?? ""}`
             .toLowerCase().includes(q))
-      : docs;
+      : visible;
     results.replaceChildren();
     if (!matched.length) { results.append(el("div", { className: "muted" }, "No docs match.")); return; }
     const byFeat = {};
@@ -1709,7 +1759,7 @@ async function renderDocs(root) {
       results.append(c);
     }
   };
-  root.append(search, results);
+  root.append(search, bar, results);
   draw();
 }
 

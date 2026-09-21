@@ -441,6 +441,16 @@ class SkillCommandTest(unittest.TestCase):
 class LocalSkillPersistenceIntegrationTest(unittest.TestCase):
     """Exercise real snapshot + flat-render persistence on a full schema."""
 
+    # schema.sql is the partial core baseline; these columns arrive with the
+    # migrations this fixture does not run (api_key from 0027, the retirement
+    # trio from 0268). Add them by hand so the fixture matches a migrated DB.
+    MIGRATED_COLUMNS = (
+        "ALTER TABLE shells ADD COLUMN api_key TEXT",
+        "ALTER TABLE documents ADD COLUMN retired INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE documents ADD COLUMN retired_date TEXT",
+        "ALTER TABLE documents ADD COLUMN superseded_by INTEGER",
+    )
+
     def setUp(self):
         self.tmp_dir = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp_dir.cleanup)
@@ -451,7 +461,8 @@ class LocalSkillPersistenceIntegrationTest(unittest.TestCase):
         schema = (ENGINE / "schema.sql").read_text()
         con = sqlite3.connect(self.db)
         con.executescript(schema)
-        con.execute("ALTER TABLE shells ADD COLUMN api_key TEXT")
+        for statement in self.MIGRATED_COLUMNS:
+            con.execute(statement)
         con.execute("INSERT INTO users (user_id, username) VALUES (1, 'operator')")
         con.execute(
             "INSERT INTO shells (shell_id, display_name, shortname, role, "
@@ -513,7 +524,8 @@ class LocalSkillPersistenceIntegrationTest(unittest.TestCase):
         rebuilt = sqlite3.connect(":memory:")
         try:
             rebuilt.executescript((ENGINE / "schema.sql").read_text())
-            rebuilt.execute("ALTER TABLE shells ADD COLUMN api_key TEXT")
+            for statement in self.MIGRATED_COLUMNS:
+                rebuilt.execute(statement)
             rebuilt.executescript(self.snapshot.read_text())
             return rebuilt.execute(
                 "SELECT s.description, s.category, s.common, s.content, "

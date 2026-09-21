@@ -30,7 +30,10 @@ CREATE TABLE documents (
     title TEXT,
     body TEXT,
     render_path TEXT,
-    frozen INTEGER
+    frozen INTEGER,
+    retired INTEGER NOT NULL DEFAULT 0,
+    retired_date TEXT,
+    superseded_by INTEGER
 );
 """
 
@@ -45,7 +48,8 @@ class FlatDocumentReconciliationTest(unittest.TestCase):
             con.executescript(SCHEMA)
             con.execute("INSERT INTO roadmap VALUES (7, 'Gateway', 'next')")
             con.execute(
-                "INSERT INTO documents VALUES "
+                "INSERT INTO documents (document_id, feature_id, kind, seq, "
+                "title, body, render_path, frozen) VALUES "
                 "(11, 7, 'spec', 1, 'Gateway', 'Current body', "
                 "'specs_sc/current.md', 0)"
             )
@@ -118,12 +122,14 @@ class FlatDocumentReconciliationTest(unittest.TestCase):
             con.executescript(SCHEMA)
             con.execute("INSERT INTO roadmap VALUES (7, 'Gateway', 'next')")
             con.execute(
-                "INSERT INTO documents VALUES "
+                "INSERT INTO documents (document_id, feature_id, kind, seq, "
+                "title, body, render_path, frozen) VALUES "
                 "(11, 7, 'spec', 1, 'First', 'First body', "
                 "'specs_sc/shared.md', 0)"
             )
             con.execute(
-                "INSERT INTO documents VALUES "
+                "INSERT INTO documents (document_id, feature_id, kind, seq, "
+                "title, body, render_path, frozen) VALUES "
                 "(12, 7, 'spec', 2, 'Second', 'Second body', "
                 "'specs_sc//shared.md', 0)"
             )
@@ -151,6 +157,138 @@ class FlatDocumentReconciliationTest(unittest.TestCase):
             self.assertEqual(target.read_text(), "preserved\n")
             self.assertEqual(written, [])
             self.assertEqual(skipped, [])
+
+
+class FlatRetirementBannerTest(unittest.TestCase):
+    """A retired document's flat file carries one generated banner line."""
+
+    def banner(self, frozen: bool) -> str:
+        return (
+            "---\n"
+            "rendered_by: super-coder\n"
+            "source: db\n"
+            "edit: changes here are overwritten — author via the shell or "
+            "localhost GUI\n"
+            "feature: Gateway\n"
+            "roadmap_status: next\n"
+            f"frozen: {'true' if frozen else 'false'}\n"
+            "---\n"
+        )
+
+    def _render(self, con, root):
+        written: list[Path] = []
+        skipped: list[Path] = []
+        flat._render_documents(con, written, skipped, root)
+        return written, skipped
+
+    def _fixture(self, con):
+        con.row_factory = sqlite3.Row
+        con.executescript(SCHEMA)
+        con.execute("INSERT INTO roadmap VALUES (7, 'Gateway', 'next')")
+        con.execute(
+            "INSERT INTO documents (document_id, feature_id, kind, seq, title, "
+            "body, render_path, frozen) VALUES "
+            "(11, 7, 'doc', 1, 'Old gateway', 'Old body', "
+            "'docs_sc/old.md', 1)"
+        )
+        con.execute(
+            "INSERT INTO documents (document_id, feature_id, kind, seq, title, "
+            "body, render_path, frozen) VALUES "
+            "(12, 7, 'doc', 2, 'New gateway', 'New body', "
+            "'docs_sc/new.md', 0)"
+        )
+
+    def test_unretired_render_is_byte_identical_to_the_banner_only_form(self):
+        with tempfile.TemporaryDirectory() as td, closing(
+            sqlite3.connect(":memory:")
+        ) as con:
+            root = Path(td)
+            self._fixture(con)
+            self._render(con, root)
+            self.assertEqual(
+                self.banner(True) + "\nOld body\n",
+                (root / "docs_sc" / "old.md").read_text(),
+            )
+
+    def test_retired_render_gains_one_line_under_the_frontmatter(self):
+        with tempfile.TemporaryDirectory() as td, closing(
+            sqlite3.connect(":memory:")
+        ) as con:
+            root = Path(td)
+            self._fixture(con)
+            self._render(con, root)
+            before = (root / "docs_sc" / "new.md").read_text()
+
+            con.execute(
+                "UPDATE documents SET retired=1, retired_date='2026-09-21', "
+                "superseded_by=12 WHERE document_id=11"
+            )
+            written, _ = self._render(con, root)
+
+            self.assertEqual(
+                self.banner(True)
+                + "\n> **Retired 2026-09-21** — superseded by "
+                  '"New gateway" (docs_sc/new.md).\n'
+                  "\nOld body\n",
+                (root / "docs_sc" / "old.md").read_text(),
+            )
+            # The successor's own file is untouched, and the DB body never moved.
+            self.assertEqual(before, (root / "docs_sc" / "new.md").read_text())
+            self.assertEqual([root / "docs_sc" / "old.md"], written)
+            self.assertEqual(
+                "Old body",
+                con.execute(
+                    "SELECT body FROM documents WHERE document_id=11"
+                ).fetchone()[0],
+            )
+
+    def test_bare_and_dangling_retirements_still_render(self):
+        with tempfile.TemporaryDirectory() as td, closing(
+            sqlite3.connect(":memory:")
+        ) as con:
+            root = Path(td)
+            self._fixture(con)
+            con.execute(
+                "UPDATE documents SET retired=1, retired_date='2026-09-21' "
+                "WHERE document_id=11"
+            )
+            self._render(con, root)
+            self.assertIn(
+                "> **Retired 2026-09-21** — withdrawn, no successor.",
+                (root / "docs_sc" / "old.md").read_text(),
+            )
+
+            con.execute(
+                "UPDATE documents SET superseded_by=999 WHERE document_id=11"
+            )
+            self._render(con, root)
+            self.assertIn(
+                "> **Retired 2026-09-21** — superseded by document #999.",
+                (root / "docs_sc" / "old.md").read_text(),
+            )
+
+    def test_a_bodyless_successor_is_cited_by_id_not_by_a_path_with_no_file(self):
+        with tempfile.TemporaryDirectory() as td, closing(
+            sqlite3.connect(":memory:")
+        ) as con:
+            root = Path(td)
+            self._fixture(con)
+            # A successor row with no body is never written, so its derived
+            # path names no file. The banner must not send a reader there.
+            con.execute("UPDATE documents SET body='' WHERE document_id=12")
+            con.execute(
+                "UPDATE documents SET retired=1, retired_date='2026-09-21', "
+                "superseded_by=12 WHERE document_id=11"
+            )
+            self._render(con, root)
+
+            self.assertFalse((root / "docs_sc" / "new.md").exists())
+            rendered = (root / "docs_sc" / "old.md").read_text()
+            self.assertIn(
+                "> **Retired 2026-09-21** — superseded by document #12.",
+                rendered,
+            )
+            self.assertNotIn("docs_sc/new.md", rendered)
 
 
 if __name__ == "__main__":

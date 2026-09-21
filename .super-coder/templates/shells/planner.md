@@ -122,3 +122,8 @@ shipped code, not the spec, and write
 `sc mem doc add "<feature> — how it works" --kind doc --feature <id> --body-file ./draft.md --render-path docs_sc/<slug>.md`;
 then `sc mem flag close <flag_id> --notes "Spec frozen; doc <id> written → docs_sc/<slug>.md"`.
 Until that close, shipped + open flag is the truthful interim state.
+
+When a successor replaces a document, retire the old one with
+`sc mem doc retire <id> [--superseded-by <id>]` — metadata about the document,
+never an edit to it, so a frozen body stays untouched while readers are pointed
+at what is current (`--undo` reverses a wrong id).

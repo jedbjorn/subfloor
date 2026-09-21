@@ -24,6 +24,7 @@ import threading
 import time
 import unittest
 import urllib.request
+from datetime import date
 from http.server import ThreadingHTTPServer
 from pathlib import Path
 from unittest import mock
@@ -1558,6 +1559,370 @@ class ApiMemTest(unittest.TestCase):
     def test_get_document_404(self):
         with self.assertRaises(SystemExit):
             self.run_mem("get", "documents", "--doc", "999999")
+
+    # ── document retirement + supersession (spec #251) ────────────────────────
+    # One row of the spec's Behavior table per assertion block.
+
+    def _retirement_feature(self):
+        """One shared feature for retirement fixtures.
+
+        These rows must not land in the NULL-feature seq scope: the class DB is
+        shared, and `doc add` without --feature auto-advances seq within it.
+        """
+        row = self.q("SELECT feature_id FROM roadmap "
+                     "WHERE title='retirement fixtures'")
+        if row is not None:
+            return row[0]
+        return self.write(
+            "INSERT INTO roadmap (title,roadmap_status,sort_order,owning_shell) "
+            "VALUES ('retirement fixtures','in_progress',950,4)")
+
+    def _doc(self, title, **columns):
+        """A throwaway document row; every column not named takes its default."""
+        columns.setdefault("kind", "doc")
+        columns.setdefault("feature_id", self._retirement_feature())
+        columns.setdefault("body", f"# {title}\n")
+        columns.setdefault("seq", self.q(
+            "SELECT COALESCE(MAX(seq),0)+1 FROM documents "
+            "WHERE feature_id=? AND kind=?",
+            columns["feature_id"], columns["kind"])[0])
+        names = ["title", *columns]
+        sql = (f"INSERT INTO documents ({','.join(names)}) "
+               f"VALUES ({','.join('?' for _ in names)})")
+        return self.write(sql, title, *columns.values())
+
+    def _retire(self, document_id, **payload):
+        return mem._api("PATCH", f"/_sc/mem/docs/{document_id}/retire", payload)
+
+    def _row(self, document_id):
+        return self.q(
+            "SELECT title,body,frozen,frozen_date,retired,retired_date,"
+            "superseded_by FROM documents WHERE document_id=?", document_id)
+
+    def test_retire_targets_any_document_and_records_the_date(self):
+        successor = self._doc("retire successor A")
+        target = self._doc("retire target A")
+        result = self._retire(target, superseded_by=successor)
+        self.assertTrue(result["ok"])
+        self.assertFalse(result["already_retired"])
+        row = self._row(target)
+        self.assertEqual(row["retired"], 1)
+        self.assertEqual(row["superseded_by"], successor)
+        self.assertEqual(row["retired_date"], str(date.today()))
+
+    def test_bare_retire_is_legal_and_leaves_no_successor(self):
+        target = self._doc("retire bare B")
+        self.assertTrue(self._retire(target)["ok"])
+        row = self._row(target)
+        self.assertEqual(row["retired"], 1)
+        self.assertIsNone(row["superseded_by"])
+
+    def test_retire_never_touches_title_body_or_freeze_state(self):
+        # A3: retirement is metadata ABOUT a frozen document, never an edit —
+        # on the first retire, on a re-point, and on an undo alike.
+        successor = self._doc("retire successor C")
+        other = self._doc("retire successor C2")
+        frozen = self._doc(
+            "retire frozen C", frozen=1, frozen_date="2026-01-02",
+            body="# frozen C\nimmutable body\n")
+        before = tuple(self._row(frozen))[:4]
+
+        self._retire(frozen, superseded_by=successor)
+        self.assertEqual(tuple(self._row(frozen))[:4], before)
+        self.assertEqual(self._row(frozen)["retired"], 1)
+
+        self._retire(frozen, superseded_by=other)
+        self.assertEqual(tuple(self._row(frozen))[:4], before)
+        self.assertEqual(self._row(frozen)["superseded_by"], other)
+
+        self._retire(frozen, undo=True)
+        self.assertEqual(tuple(self._row(frozen))[:4], before)
+        self.assertEqual(self._row(frozen)["retired"], 0)
+
+    def test_a_replayed_bare_retire_never_drops_the_successor(self):
+        # The lost-receipt path: `sc mem doc retire 204` runs, the response is
+        # lost, the operator re-runs it. Naming no successor must read as the
+        # no-op it is, never as "clear the pointer the first call wrote".
+        successor = self._doc("retire replay successor O")
+        target = self._doc("retire replay target O")
+        self._retire(target, superseded_by=successor)
+
+        replay = self._retire(target)
+        self.assertTrue(replay["already_retired"])
+        self.assertNotIn("repointed", replay)
+        self.assertEqual(replay["superseded_by"], successor)
+        self.assertEqual(self._row(target)["superseded_by"], successor)
+
+        # Same for a body with no keys at all — a malformed or empty payload
+        # is not an instruction to clear anything.
+        empty = self._retire(target)
+        self.assertTrue(empty["already_retired"])
+        self.assertEqual(self._row(target)["superseded_by"], successor)
+
+        # The CLI sends the key only when --superseded-by was given.
+        self.assertEqual(self.run_mem("doc", "retire", str(target)), 0)
+        self.assertEqual(self._row(target)["superseded_by"], successor)
+
+        # An EXPLICIT null is still a request to clear it.
+        cleared = self._retire(target, superseded_by=None)
+        self.assertTrue(cleared["repointed"])
+        self.assertIsNone(cleared["superseded_by"])
+        self.assertIsNone(self._row(target)["superseded_by"])
+        self.assertEqual(self._row(target)["retired"], 1)
+
+    def test_undo_with_a_successor_key_is_refused_not_ignored(self):
+        target = self._doc("retire undo conflict P")
+        successor = self._doc("retire undo conflict successor P")
+        self._retire(target, superseded_by=successor)
+        for payload in ({"undo": True, "superseded_by": successor},
+                        {"undo": True, "superseded_by": None}):
+            with self.subTest(payload=payload):
+                with self.assertRaises(SystemExit) as caught:
+                    self._retire(target, **payload)
+                self.assertIn("400", str(caught.exception))
+                self.assertIn("it cannot also set a successor",
+                              str(caught.exception))
+        self.assertEqual(self._row(target)["retired"], 1)
+        self.assertEqual(self._row(target)["superseded_by"], successor)
+
+    def test_a_retired_document_is_read_only_for_content_everywhere(self):
+        # Planner ruling on spec #251: a reader following an old link must find
+        # what was retired, not a quietly revised version of it. render_path is
+        # a location, not content, so it still moves — the frozen rule's shape.
+        successor = self._doc("retire readonly successor Q")
+        target = self._doc("retire readonly target Q",
+                           render_path="docs_sc/retire-readonly-q.md")
+        self._retire(target, superseded_by=successor)
+        body = self.tmp / "retired-edit.md"
+        body.write_text("# rewritten\n")
+
+        for payload in ({"title": "rewritten"}, {"body": "# rewritten\n"}):
+            with self.subTest(payload=payload):
+                with self.assertRaises(SystemExit) as caught:
+                    mem._api("PATCH", f"/_sc/mem/docs/{target}", payload)
+                self.assertIn("409", str(caught.exception))
+                self.assertIn("document is retired", str(caught.exception))
+        with self.assertRaises(SystemExit):
+            self.run_mem("doc", "edit", str(target), "--body-file", str(body))
+        row = self._row(target)
+        self.assertEqual(row["title"], "retire readonly target Q")
+        self.assertEqual(row["body"], "# retire readonly target Q\n")
+
+        # render_path still moves, and the edit works again after an undo.
+        self.assertEqual(
+            self.run_mem("doc", "edit", str(target),
+                         "--render-path", "docs_sc/retire-readonly-q2.md"), 0)
+        self.assertEqual(self.run_mem("doc", "retire", str(target), "--undo"), 0)
+        self.assertEqual(
+            self.run_mem("doc", "edit", str(target), "--body-file", str(body)), 0)
+        self.assertEqual(self._row(target)["body"], "# rewritten\n")
+
+    def test_doc_edit_help_names_the_retired_rule(self):
+        self.assertIn("frozen or retired: --render-path only", mem.__doc__)
+        parser = mem.build_parser()
+        doc = next(
+            action for action in parser._actions
+            if isinstance(action, mem.argparse._SubParsersAction)
+        ).choices["doc"]
+        self.assertIn("frozen or retired: render-path only",
+                      " ".join(doc.format_help().split()))
+
+    def test_retire_refuses_an_unfrozen_spec_with_an_open_plan(self):
+        self.run_mem("roadmap", "add", "retire plan feature")
+        feature = self.q(
+            "SELECT feature_id FROM roadmap WHERE title='retire plan feature'")[0]
+        spec = self._doc("retire open plan D", kind="spec", feature_id=feature)
+        self.write(
+            "INSERT INTO spec_tasks (shell_id,feature_id,document_id,seq,title,status) "
+            "VALUES (1,?,?,1,'unfinished','in_progress')", feature, spec)
+        with self.assertRaises(SystemExit) as caught:
+            self._retire(spec)
+        self.assertIn("409", str(caught.exception))
+        self.assertIn("unfinished task", str(caught.exception))
+        self.assertEqual(self._row(spec)["retired"], 0)
+
+        # A plan that is entirely terminal is no longer open.
+        self.write("UPDATE spec_tasks SET status='cancelled' WHERE document_id=?",
+                   spec)
+        self.assertTrue(self._retire(spec)["ok"])
+
+    def test_retire_refuses_a_spec_bound_to_a_sprint(self):
+        self.run_mem("roadmap", "add", "retire bound feature")
+        feature = self.q(
+            "SELECT feature_id FROM roadmap WHERE title='retire bound feature'")[0]
+        spec = self._doc("retire bound spec E", kind="spec", feature_id=feature)
+        sprint_id = self.write(
+            "INSERT INTO sprints (feature_id,originating_planner_shell_id) "
+            "VALUES (?,4)", feature)
+        self.write(
+            "INSERT INTO sprint_specs "
+            "(sprint_id,document_id,bound_revision_sha256) VALUES (?,?,?)",
+            sprint_id, spec, "b" * 64)
+        with self.assertRaises(SystemExit) as caught:
+            self._retire(spec)
+        self.assertIn("409", str(caught.exception))
+        self.assertIn(f"Sprint #{sprint_id}", str(caught.exception))
+        self.assertEqual(self._row(spec)["retired"], 0)
+
+    def test_retire_refuses_a_missing_self_or_retired_successor(self):
+        target = self._doc("retire successor checks F")
+        already = self._doc("retire retired successor F")
+        self._retire(already)
+        refusals = (
+            ({"superseded_by": 999999}, "no such successor"),
+            ({"superseded_by": target}, "cannot supersede itself"),
+            ({"superseded_by": already}, "is itself retired"),
+        )
+        for payload, message in refusals:
+            with self.subTest(message=message):
+                with self.assertRaises(SystemExit) as caught:
+                    self._retire(target, **payload)
+                self.assertIn("409", str(caught.exception))
+                self.assertIn(message, str(caught.exception))
+                self.assertEqual(self._row(target)["retired"], 0)
+
+    def test_retire_accepts_a_successor_under_another_feature(self):
+        self.run_mem("roadmap", "add", "retire era old")
+        self.run_mem("roadmap", "add", "retire era new")
+        old = self.q("SELECT feature_id FROM roadmap WHERE title='retire era old'")[0]
+        new = self.q("SELECT feature_id FROM roadmap WHERE title='retire era new'")[0]
+        successor = self._doc("retire cross successor G", feature_id=new)
+        target = self._doc("retire cross target G", feature_id=old)
+        self.assertTrue(self._retire(target, superseded_by=successor)["ok"])
+        self.assertEqual(self._row(target)["superseded_by"], successor)
+
+    def test_retire_is_idempotent_and_repoints_without_moving_the_date(self):
+        first = self._doc("retire successor H1")
+        second = self._doc("retire successor H2")
+        target = self._doc("retire target H")
+        self._retire(target, superseded_by=first)
+        self.write("UPDATE documents SET retired_date='2020-01-01' "
+                   "WHERE document_id=?", target)
+
+        repeat = self._retire(target, superseded_by=first)
+        self.assertTrue(repeat["already_retired"])
+        self.assertNotIn("repointed", repeat)
+        self.assertEqual(self._row(target)["retired_date"], "2020-01-01")
+
+        moved = self._retire(target, superseded_by=second)
+        self.assertTrue(moved["already_retired"])
+        self.assertTrue(moved["repointed"])
+        row = self._row(target)
+        self.assertEqual(row["superseded_by"], second)
+        self.assertEqual(row["retired_date"], "2020-01-01")
+
+    def test_undo_clears_every_column_and_is_a_noop_when_current(self):
+        successor = self._doc("retire successor I")
+        target = self._doc("retire target I")
+        self._retire(target, superseded_by=successor)
+        undone = self._retire(target, undo=True)
+        self.assertFalse(undone["already_current"])
+        row = self._row(target)
+        self.assertEqual(row["retired"], 0)
+        self.assertIsNone(row["retired_date"])
+        self.assertIsNone(row["superseded_by"])
+        # Dependency-free by design: the successor is still retirable, and a
+        # second undo is a no-op rather than a refusal.
+        self.assertTrue(self._retire(target, undo=True)["already_current"])
+
+    def test_a_retired_successor_resolves_through_the_chain(self):
+        head = self._doc("retire chain head J")
+        middle = self._doc("retire chain middle J")
+        tail = self._doc("retire chain tail J")
+        # Tail points at middle while middle is still current; middle is then
+        # retired in turn. Readers follow the chain to the head.
+        self._retire(tail, superseded_by=middle)
+        self._retire(middle, superseded_by=head)
+        one = mem._api("GET", f"/_sc/mem/documents/{tail}")["document"]
+        self.assertEqual(one["superseded_by"], middle)
+        self.assertEqual(one["current_document_id"], head)
+        self.assertEqual(one["current_title"], "retire chain head J")
+
+    def test_reads_expose_frozen_date_and_every_retirement_field(self):
+        successor = self._doc("retire read successor K")
+        target = self._doc("retire read target K", frozen=1,
+                           frozen_date="2026-03-04")
+        self._retire(target, superseded_by=successor)
+        listed = {d["document_id"]: d for d in
+                  mem._api("GET", "/_sc/mem/documents")["documents"]}[target]
+        one = mem._api("GET", f"/_sc/mem/documents/{target}")["document"]
+        for payload in (listed, one):
+            self.assertEqual(payload["frozen_date"], "2026-03-04")
+            self.assertEqual(payload["retired"], 1)
+            self.assertEqual(payload["retired_date"], str(date.today()))
+            self.assertEqual(payload["superseded_by"], successor)
+            self.assertEqual(payload["superseded_by_title"],
+                             "retire read successor K")
+
+    def test_get_documents_hides_retired_rows_until_asked(self):
+        successor = self._doc("retire listing successor L")
+        pointed = self._doc("retire listing pointed L")
+        bare = self._doc("retire listing bare L")
+        self._retire(pointed, superseded_by=successor)
+        self._retire(bare)
+
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(self.run_mem("get", "documents"), 0)
+        hidden = out.getvalue()
+        self.assertNotIn("retire listing pointed L", hidden)
+        self.assertNotIn("retire listing bare L", hidden)
+        self.assertIn("retired hidden — --retired to show", hidden)
+        self.assertIn("retire listing successor L", hidden)
+
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(self.run_mem("get", "documents", "--retired"), 0)
+        shown = out.getvalue()
+        self.assertIn(f"[retired → #{successor}] — retire listing pointed L", shown)
+        self.assertIn("[retired] — retire listing bare L", shown)
+        self.assertNotIn("retired hidden", shown)
+
+    def test_one_document_read_always_works_and_names_the_successor(self):
+        successor = self._doc("retire single successor M")
+        target = self._doc("retire single target M", body="# target M\nbody\n")
+        self.run_mem("doc", "retire", str(target),
+                     "--superseded-by", str(successor))
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(self.run_mem("get", "documents", "--doc",
+                                          str(target)), 0)
+        text = out.getvalue()
+        self.assertIn(f"[retired → #{successor}]", text)
+        self.assertIn(f"retired {date.today()} — superseded by "
+                      f"#{successor} retire single successor M", text)
+        self.assertIn("# target M", text)   # the body still reads
+
+    def test_retire_cli_undo_and_flag_conflict(self):
+        successor = self._doc("retire cli successor N")
+        target = self._doc("retire cli target N")
+        self.assertEqual(
+            self.run_mem("doc", "retire", str(target),
+                         "--superseded-by", str(successor)), 0)
+        self.assertEqual(self._row(target)["retired"], 1)
+        self.assertEqual(self.run_mem("doc", "retire", str(target), "--undo"), 0)
+        self.assertEqual(self._row(target)["retired"], 0)
+        with self.assertRaises(SystemExit) as caught:
+            self.run_mem("doc", "retire", str(target), "--undo",
+                         "--superseded-by", str(successor))
+        self.assertIn("--undo", str(caught.exception))
+
+    def test_retire_unknown_document_is_404(self):
+        with self.assertRaises(SystemExit) as caught:
+            self._retire(999999)
+        self.assertIn("404", str(caught.exception))
+
+    def test_get_retired_flag_is_documents_only(self):
+        with self.assertRaises(SystemExit) as caught:
+            self.run_mem("get", "flags", "--retired")
+        self.assertIn("--retired is only valid with get documents",
+                      str(caught.exception))
+
+    def test_retirement_guidance_is_rendered_for_the_planner(self):
+        planner = (ENGINE / "templates" / "shells" / "planner.md").read_text()
+        self.assertIn("## REVISE, FREEZE, DOCUMENT", planner)
+        self.assertIn("sc mem doc retire <id> [--superseded-by <id>]", planner)
+        self.assertIn("sc mem doc retire", mem.__doc__)
 
 
 if __name__ == "__main__":
