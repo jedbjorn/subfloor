@@ -32,6 +32,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import document_retirement
+
 ENGINE = Path(__file__).resolve().parents[1]
 
 ONE_LINE = 240            # the same bound `sc mem get flags` renders with
@@ -185,21 +187,59 @@ def _feature_flags(con, feature_id) -> list[dict]:
     } for r in rows]
 
 
+class _ChainRows:
+    """The `by_id` the shared chain rule walks, read one row per hop — the
+    projection never loads the whole documents table to follow one pointer."""
+
+    def __init__(self, con):
+        self.con = con
+        self.projection = document_retirement.retirement_projection(
+            document_retirement.document_columns(con))
+
+    def get(self, document_id):
+        if document_id is None:
+            return None
+        return self.con.execute(
+            f"SELECT d.document_id, d.title, {self.projection} "
+            "FROM documents d WHERE d.document_id=?", (document_id,)).fetchone()
+
+
+def _retirement(con, document_id) -> dict:
+    """Retirement facts for one governing document (spec doc #251): the same
+    chain rule as the API reads — first non-retired document through
+    `superseded_by`; a missing row, a loop, or the hop bound ends the chain
+    with no current document. A pre-0268 DB reads every document as current."""
+    chain = _ChainRows(con)
+    row = chain.get(document_id)
+    retired = bool(row["retired"]) if row is not None else False
+    current = (document_retirement.resolve_current(chain, row["superseded_by"])
+               if retired and row["superseded_by"] else None)
+    return {
+        "retired": retired,
+        "retired_date": row["retired_date"] if row is not None else None,
+        "superseded_by": row["superseded_by"] if row is not None else None,
+        "current_document_id": current["document_id"] if current else None,
+        "current_title": current["title"] if current else None,
+    }
+
+
 def _document(con, document_id) -> dict | None:
     row = con.execute(
         "SELECT document_id, feature_id, kind, seq, title, frozen, body "
         "FROM documents WHERE document_id=?", (document_id,)).fetchone()
     if row is None:
         return None
+    retirement = _retirement(con, row["document_id"])
     return {
         "document_id": row["document_id"],
         "title": row["title"],
         "kind": row["kind"],
         "seq": row["seq"],
         "frozen": bool(row["frozen"]),
-        "revision": "current",
+        "revision": "retired" if retirement["retired"] else "current",
         "sha256": _sha256(row["body"]),
         "read": f"sc mem get documents --doc {row['document_id']}",
+        **retirement,
     }
 
 
@@ -292,6 +332,7 @@ def _select_work_unit(con, work_unit_id: int, caller: dict) -> dict:
         "generation": r["generation"],
         "legacy": bool(r["bound_revision_legacy"]),
         "read": f"sc sprint spec-revision --sprint {sprint_id} --document {r['document_id']}",
+        **_retirement(con, r["document_id"]),
     } for r in revisions]
     dependencies = _rows(con.execute(
         "SELECT d.depends_on_work_unit_id AS work_unit_id, u.title, u.disposition "
@@ -345,6 +386,25 @@ def _select_work_unit(con, work_unit_id: int, caller: dict) -> dict:
 
 
 # -- runtime and resources ----------------------------------------------------
+
+def _own_runtime(runtime: dict, repo_root: Path | None) -> dict:
+    """Runtime facts are caller-supplied: an inherited `SC_SHELL_WORKTREE` can
+    name another install's checkout (flag #653). The worktree — and the branch
+    read from it — is reported only when the path is this repo's root or sits
+    under it, where every boot path puts a shell's worktree. Anything else is
+    omitted, never corrected: `_worktree` falls back to what the engine holds."""
+    worktree = runtime.get("worktree")
+    if not worktree:
+        return runtime
+    if repo_root is not None:
+        try:
+            path, root = Path(worktree).resolve(), Path(repo_root).resolve()
+            if path == root or root in path.parents:
+                return runtime
+        except (OSError, RuntimeError):
+            pass
+    return {k: v for k, v in runtime.items() if k not in ("worktree", "branch")}
+
 
 def _worktree(con, caller: dict, runtime: dict, repo_root: Path | None) -> str | None:
     """The launcher's exported worktree first; then the engine's own launch
@@ -431,8 +491,8 @@ def project(con, *, task_id: int | None = None, work_unit_id: int | None = None,
     if (task_id is None) == (work_unit_id is None):
         raise ContextError(400, "one_selector",
                            "exactly one of --task <id> / --work-unit <id> is required")
-    runtime = dict(runtime or {})
     repo_root = Path(repo_root) if repo_root else None
+    runtime = _own_runtime(dict(runtime or {}), repo_root)
     caller = _shell(con, caller_shell_id)
     sel = (_select_task(con, int(task_id)) if task_id is not None
            else _select_work_unit(con, int(work_unit_id), caller))
@@ -512,6 +572,12 @@ def project(con, *, task_id: int | None = None, work_unit_id: int | None = None,
             if d.get("frozen"):
                 boundaries["walls"].append(
                     f"document #{d['document_id']} is frozen — immutable; revise through a new spec")
+            if d.get("retired"):
+                boundaries["walls"].append(
+                    f"document #{d['document_id']} is retired — "
+                    + (f"current authority is #{d['current_document_id']} {d['current_title']}"
+                       if d.get("current_document_id") is not None
+                       else "no successor named; confirm the governing spec with the Planner"))
         if t.get("sprint_work_unit_id"):
             boundaries["walls"].append(
                 f"task is linked to Sprint {t['sprint_id']} work unit #{t['sprint_work_unit_id']} — "
@@ -605,7 +671,13 @@ def render(p: dict) -> str:
         gen = f" · generation {d['generation']}" if d.get("generation") is not None else ""
         legacy = " · legacy binding" if d.get("legacy") else ""
         frozen = " · frozen" if d.get("frozen") else ""
-        out.append(f"  doc #{d['document_id']} {d['title']} — {d['revision']}{gen}{legacy}{frozen}")
+        retired = ""
+        if d.get("retired"):
+            retired = " · retired" + (
+                f" → #{d['current_document_id']} {d['current_title']}"
+                if d.get("current_document_id") is not None else "")
+        out.append(f"  doc #{d['document_id']} {d['title']} — {d['revision']}{gen}{legacy}{frozen}"
+                   f"{retired}")
         out.append(f"    sha256 {d['sha256']}")
         out.append(f"    read: {d['read']}")
     if not au["documents"]:
