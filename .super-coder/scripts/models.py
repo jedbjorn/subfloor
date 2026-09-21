@@ -59,23 +59,28 @@ def _api_routes(*, harness: str | None = None,
     ) or []
 
 
-def _require_launch_seat() -> None:
-    """Refresh records this process's harness versions as route evidence.
+def _require_launch_seat(command: str) -> None:
+    """Refresh records this process's harness versions as route evidence, and
+    resolve judges stored evidence against the version this process probes.
 
     Launch binds that evidence to the runtime that executes the route, so a
-    host seat on a sandbox install would record versions no shell runs and the
-    next launch rejects them as stale. `./sc models refresh` execs into the
-    sandbox; this refuses the seats that bypass it and records nothing.
+    host seat on a sandbox install would record or compare versions no shell
+    runs, and the stale verdict's `sc models refresh` remedy could never clear
+    it. `./sc models refresh|resolve` execs into the sandbox; this refuses the
+    seats that bypass it, before anything is probed or written. Exit 3 —
+    nothing ran — stays distinct from 2, a refresh or resolve that failed.
     """
     if runtime.read_mode() != runtime.SANDBOX:
         return
     if model_catalog.harness_versions.runtime_scope()["runtime"] == "sandbox":
         return
-    raise SystemExit(
-        "models: this install runs shells in the sandbox — refresh from that "
-        "runtime (`./sc models refresh` with the sandbox running, or Shells → "
-        "Default Models → Refresh); host harness versions were not recorded"
+    print(
+        f"models: this install runs shells in the sandbox — {command} from "
+        f"that runtime (`./sc models {command}` with the sandbox running); "
+        "host harness versions were neither recorded nor compared",
+        file=sys.stderr,
     )
+    raise SystemExit(3)
 
 
 def _refresh(payload: dict) -> int:
@@ -332,8 +337,8 @@ def main(argv: list[str] | None = None) -> int:
         )
         return _print_resolved(data, as_json)
 
-    if command == "refresh":
-        _require_launch_seat()
+    if command in ("refresh", "resolve"):
+        _require_launch_seat(command)
     con = _open_db()
     try:
         if args[0] == "refresh":

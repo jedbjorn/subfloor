@@ -523,20 +523,38 @@ sc_harness_status() {
   fi
 }
 
-# `models refresh` records harness versions as route evidence, and launch
-# rejects evidence whose version differs from the runtime that executes the
-# route. So a sandbox install refreshes INSIDE the sandbox, through the same
-# exec seam harness-status probes with — the host's own CLIs decide nothing on
-# the docker path. A shell token already reaches the engine API in that runtime,
-# and every other models verb only reads.
+# `models refresh` records harness versions as route evidence, and `models
+# resolve` judges that evidence against the harness version it probes — as
+# launch does, in the runtime that executes the route. So on a sandbox install
+# both run INSIDE the sandbox, through the exec seam harness-status probes with;
+# the host's own CLIs decide nothing on the docker path. Stricter than
+# sc_harness_status on purpose: status is advisory and may fall back to a local
+# probe, while these write or judge evidence and must never do so from a seat
+# no shell runs in — an unreachable runtime refuses with exit 3, distinct from
+# models.py's 2 for a refresh or resolve that ran and failed. A shell token
+# already reaches the engine API in that runtime, and `list` only reads rows.
 sc_models() {
-  if [ "${1:-}" != refresh ] || [ -n "${SC_SANDBOX:-}" ] || [ -n "${SC_API_TOKEN:-}" ] || sc_host_runtime; then
+  case "${1:-}" in
+    refresh|resolve) : ;;
+    *) exec "$PY" "$S/models.py" "$@" ;;
+  esac
+  if [ -n "${SC_SANDBOX:-}" ] || [ -n "${SC_API_TOKEN:-}" ] || sc_host_runtime; then
     exec "$PY" "$S/models.py" "$@"
   fi
-  if ! command -v docker >/dev/null 2>&1 || ! docker info >/dev/null 2>&1 || ! drunning; then
-    echo "✗ ./sc models refresh: this install runs shells in the sandbox '$CNAME', which is not running." >&2
-    echo "  Route evidence must come from that runtime — ./sc launch, then ./sc models refresh." >&2
-    exit 2
+  if ! command -v docker >/dev/null 2>&1; then
+    echo "✗ ./sc models $1: this install runs shells in the sandbox, and docker is not installed here." >&2
+    echo "  Setup (one-time):  ./sc doctor      Shells on this host instead:  ./sc runtime host" >&2
+    exit 3
+  fi
+  if ! docker info >/dev/null 2>&1; then
+    echo "✗ ./sc models $1: this install runs shells in the sandbox, and the docker daemon is not reachable." >&2
+    echo "  Start the daemon (./sc doctor checks it), then ./sc launch and ./sc models $1." >&2
+    exit 3
+  fi
+  if ! drunning; then
+    echo "✗ ./sc models $1: this install runs shells in the sandbox '$CNAME', which is not running." >&2
+    echo "  Route evidence belongs to that runtime — ./sc launch, then ./sc models $1." >&2
+    exit 3
   fi
   # python3 and $S, not $PY: see sc_harness_status.
   exec docker exec "$CNAME" python3 "$S/models.py" "$@"

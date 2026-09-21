@@ -1232,6 +1232,15 @@ class RouteCliConnectionTest(unittest.TestCase):
         "adapter_metadata": "{}",
     }
 
+    def setUp(self):
+        # A source checkout has no instance.json, which reads as a sandbox
+        # install; pin host so direct-DB refresh/resolve run on this seat.
+        patcher = mock.patch.object(
+            routes_cli.runtime, "read_mode", return_value="host"
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def test_import_does_not_resolve_private_database(self):
         spec = importlib.util.spec_from_file_location(
             "models_import_probe",
@@ -1753,16 +1762,16 @@ class RouteCliConnectionTest(unittest.TestCase):
         payload = {"stale": False, "sources": ["test-source"]}
         with (
             mock.patch.object(routes_cli.mem, "SC_API_TOKEN", ""),
-            mock.patch.object(routes_cli.runtime, "read_mode", return_value="host"),
             mock.patch.object(routes_cli, "_open_db", return_value=con) as opened,
             mock.patch.object(routes_cli.model_catalog, "catalog", return_value=payload),
         ):
             self.assertEqual(routes_cli.main(["refresh"]), 0)
         opened.assert_called_once_with()
 
-    def test_host_seat_refresh_records_nothing_for_a_sandbox_install(self):
-        """Host CLI versions are not what a sandbox install's shells run;
-        recording them makes the next launch reject the evidence as stale."""
+    def test_host_seat_records_and_judges_nothing_for_a_sandbox_install(self):
+        """Host CLI versions are not what a sandbox install's shells run:
+        recorded, the next launch rejects them as stale; compared, resolve
+        rejects sound evidence — and names a refresh that cannot clear it."""
         with (
             mock.patch.object(routes_cli.mem, "SC_API_TOKEN", ""),
             mock.patch.object(routes_cli.runtime, "read_mode", return_value="sandbox"),
@@ -1774,11 +1783,23 @@ class RouteCliConnectionTest(unittest.TestCase):
                 routes_cli.model_catalog, "catalog",
                 side_effect=AssertionError("probed the host"),
             ),
+            mock.patch.object(
+                routes_cli.model_catalog, "harness_runtime_status",
+                side_effect=AssertionError("probed the host"),
+            ),
         ):
-            with self.assertRaises(SystemExit) as refused:
-                routes_cli.main(["refresh"])
-        self.assertIn("./sc models refresh", str(refused.exception.code))
-        self.assertIn("not recorded", str(refused.exception.code))
+            for argv in (["refresh"], ["resolve", "codex", "api-model"]):
+                errors = io.StringIO()
+                with (
+                    self.subTest(argv=argv),
+                    contextlib.redirect_stderr(errors),
+                    self.assertRaises(SystemExit) as refused,
+                ):
+                    routes_cli.main(argv)
+                # 3 = nothing ran; 2 stays "ran and came back stale/unresolved".
+                self.assertEqual(refused.exception.code, 3)
+                self.assertIn(f"./sc models {argv[0]}", errors.getvalue())
+                self.assertIn("neither recorded nor compared", errors.getvalue())
 
     def test_sandbox_seat_refresh_records_for_a_sandbox_install(self):
         con = mock.Mock()
