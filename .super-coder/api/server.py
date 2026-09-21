@@ -65,6 +65,7 @@ import conversation_broker  # noqa: E402  (Feature #24 durable turn service)
 import conversation_launch  # noqa: E402  (canonical shell launch preparation)
 import conversation_reaper  # noqa: E402  (Feature #31 orphan process ladder)
 import db_driver  # noqa: E402
+import document_retirement  # noqa: E402  (shared retirement projection + chain rule, doc #251)
 import git_hygiene  # noqa: E402  (live repo dirty/stale/clean snapshot)
 import harness_surfaces  # noqa: E402  (authoritative per-harness surfaces)
 import instance_state  # noqa: E402
@@ -181,8 +182,11 @@ def _resolve_vendor(rel: str) -> tuple:
         return None, "unresolvable path"
     return candidate, ctype
 
-# The localhost authorities for the socket sources in the CSP below.
-_CSP_HOSTS = ("127.0.0.1", "localhost", "[::1]")
+# The localhost authorities for the socket sources in the CSP below. No
+# `[::1]`: a CSP host-source has no grammar for a bracketed IPv6 literal, so
+# browsers log it as an invalid source on every page load and ignore it — it
+# never granted anything. A page served from `[::1]` still has `'self'`.
+_CSP_HOSTS = ("127.0.0.1", "localhost")
 
 
 def _csp(port: int) -> str:
@@ -1091,25 +1095,10 @@ def _flag_columns(con) -> set[str]:
 
 # Retirement (migration 0268). Same tolerance contract as the runtime-advisory
 # flag columns above: the GUI assemblers must still assemble against a DB that
-# predates the migration, reading every document as current.
-_RETIREMENT_DEFAULTS = {
-    "retired": "0",
-    "retired_date": "NULL",
-    "superseded_by": "NULL",
-}
-
-
-def _document_columns(con) -> set[str]:
-    return {row[1] for row in con.execute("PRAGMA table_info(documents)")}
-
-
-def _retirement_projection(columns: set[str], *, alias: str = "d") -> str:
-    return ", ".join(
-        f"{alias}.{name}"
-        if name in columns
-        else f"{_RETIREMENT_DEFAULTS[name]} AS {name}"
-        for name in _RETIREMENT_DEFAULTS
-    )
+# predates the migration, reading every document as current. The projection
+# lives in `document_retirement` — `sc context` reads through the same one.
+_document_columns = document_retirement.document_columns
+_retirement_projection = document_retirement.retirement_projection
 
 
 def _runtime_flag_projection(
@@ -2046,7 +2035,9 @@ def move_spec_to_feature(con, document_id: int, target_feature_id: int):
 # `retired_date`, `superseded_by` and `updated_at` and NOTHING else, so frozen
 # immutability (title/body/frozen/frozen_date) is untouched by construction.
 
-DOCUMENT_CHAIN_HOPS = 10   # bound on superseded_by chain resolution
+# The chain rule is shared with `sc context` (scripts/document_retirement.py).
+DOCUMENT_CHAIN_HOPS = document_retirement.DOCUMENT_CHAIN_HOPS
+_resolve_current = document_retirement.resolve_current
 
 # "the caller named no successor" is NOT "the caller asked for no successor".
 # A bare `sc mem doc retire 204` replayed after an ambiguous timeout must read
@@ -2066,28 +2057,6 @@ def _document_chain_rows(con) -> dict:
             " FROM documents d"
         ).fetchall()
     }
-
-
-def _resolve_current(by_id: dict, document_id):
-    """The first non-retired document reachable through superseded_by.
-
-    Bounded to DOCUMENT_CHAIN_HOPS. A pointer at a row that no longer exists
-    is the end of the chain, not a failure: callers still show the raw
-    pointer id, just without a title.
-    """
-    seen = set()
-    node = document_id
-    for _ in range(DOCUMENT_CHAIN_HOPS):
-        row = by_id.get(node)
-        if row is None or node in seen:
-            return None
-        if not row["retired"]:
-            return row
-        seen.add(node)
-        node = row["superseded_by"]
-        if node is None:
-            return None
-    return None
 
 
 def document_retirement_view(con) -> dict:

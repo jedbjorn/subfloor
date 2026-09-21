@@ -1683,19 +1683,30 @@ function docBlock(d, { readOnly = false } = {}) {
 
   if (!d.frozen) {
     const box = el("div", { hidden: true });
-    const ta = el("textarea", { rows: 14 });
-    const save = el("button", { className: "act primary", textContent: "save doc" });
+    // The textarea and save stay disabled until THIS document's body GET has
+    // resolved: an editor revealed early lets a fast edit + save PATCH a body
+    // it never loaded, and the late GET then overwrites what was typed.
+    const ta = el("textarea", { rows: 14, disabled: true, placeholder: "loading…" });
+    const save = el("button", { className: "act primary", textContent: "save doc", disabled: true });
     save.onclick = async () => {
+      if (!ta.dataset.loaded) return;   // never submit a body the editor did not load
       try { await api("/documents/" + d.document_id, "PATCH", { body: ta.value }); setStatus("doc saved"); }
       catch (e) { toast("error: " + e.message); }
     };
     const edit = el("button", { className: "act", textContent: "edit" });
+    let loading = false;   // one body GET at a time — a re-toggle never races a second one
     edit.onclick = async () => {
       box.hidden = !box.hidden;
-      if (!box.hidden && !ta.dataset.loaded) {
+      if (box.hidden || ta.dataset.loaded || loading) return;
+      loading = true;
+      try {
         const full = await api("/documents/" + d.document_id);
         ta.value = full.body || ""; ta.dataset.loaded = "1";
-      }
+        ta.placeholder = ""; ta.disabled = false; save.disabled = false;
+      } catch (e) {
+        // A failed load closes the editor; the next "edit" click retries.
+        box.hidden = true; toast("error: " + e.message);
+      } finally { loading = false; }
     };
     head.append(edit);
     box.append(ta, save);
