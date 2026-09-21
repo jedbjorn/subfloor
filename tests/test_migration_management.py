@@ -246,5 +246,52 @@ class MigrationManagementReseedTest(unittest.TestCase):
         self.assertIn("nothing pending", actual[5])
 
 
+class DocumentRetirementSchemaTest(unittest.TestCase):
+    """0268 puts the retirement columns on `documents`, exactly once.
+
+    schema.sql is the partial core baseline and every rebuild applies it and
+    THEN every migration, so declaring these in both places would fail the
+    fresh build with "duplicate column name". This pins the single-owner rule
+    as well as the columns themselves.
+    """
+
+    def _columns(self):
+        con = sqlite3.connect(":memory:")
+        try:
+            con.executescript((ENGINE / "schema.sql").read_text())
+            for path in sorted((ENGINE / "migrations").glob("*.sql")):
+                con.executescript(path.read_text())
+            return {
+                row[1]: {"type": row[2], "notnull": row[3], "default": row[4]}
+                for row in con.execute("PRAGMA table_info(documents)")
+            }
+        finally:
+            con.close()
+
+    def test_baseline_plus_migrations_converge_on_the_three_columns(self):
+        columns = self._columns()
+        self.assertEqual(
+            columns["retired"],
+            {"type": "INTEGER", "notnull": 1, "default": "0"},
+        )
+        self.assertEqual(
+            columns["retired_date"],
+            {"type": "TEXT", "notnull": 0, "default": None},
+        )
+        self.assertEqual(
+            columns["superseded_by"],
+            {"type": "INTEGER", "notnull": 0, "default": None},
+        )
+
+    def test_the_baseline_does_not_redeclare_the_migrated_columns(self):
+        baseline = (ENGINE / "schema.sql").read_text()
+        migration_sql = (
+            ENGINE / "migrations/0268_document_retirement.sql"
+        ).read_text()
+        for column in ("retired", "retired_date", "superseded_by"):
+            self.assertIn(f"ADD COLUMN {column}", migration_sql)
+        self.assertNotIn("superseded_by INTEGER", baseline)
+
+
 if __name__ == "__main__":
     unittest.main()

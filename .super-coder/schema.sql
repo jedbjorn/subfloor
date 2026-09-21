@@ -215,6 +215,11 @@ CREATE TABLE documents (
     updated_at   TEXT    NOT NULL DEFAULT (datetime('now')),
     UNIQUE(feature_id, kind, seq)
 );
+-- Lifecycle columns added by migrations, NOT repeated here: a rebuild applies
+-- this baseline and then every migration, so a column declared in both places
+-- fails the fresh build with "duplicate column name".
+--   0268 — retired / retired_date / superseded_by (retirement + supersession;
+--          metadata about a document, never an edit to a frozen body).
 
 -- ── Flags (substrate task tracking; link to a feature) ──────────────────────
 
