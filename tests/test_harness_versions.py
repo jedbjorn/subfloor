@@ -23,11 +23,11 @@ import model_catalog  # noqa: E402
 
 STATUS = {
     "codex": {
-        "version": "0.147.0",
+        "version": "0.155.1",
         "compatibility": "verified",
         "minimum_version": "0.145.0",
-        "maximum_version_exclusive": "0.148.0",
-        "verified_version": "0.147.0",
+        "maximum_version_exclusive": "0.156.0",
+        "verified_version": "0.155.1",
         "error": None,
     }
 }
@@ -63,19 +63,19 @@ def test_newer_runtime_is_reported_without_becoming_an_error() -> None:
         mock.patch.object(
             harness_versions,
             "probe",
-            return_value="codex-cli 0.148.0",
+            return_value="codex-cli 0.156.0",
         ),
     ):
         assert harness_versions.compatibility_status() == {
             "codex": {
                 "harness": "codex",
                 **harness_versions.runtime_scope(),
-                "version": "0.148.0",
-                "observed_version": "codex-cli 0.148.0",
+                "version": "0.156.0",
+                "observed_version": "codex-cli 0.156.0",
                 "compatibility": "newer-unverified",
                 "minimum_version": "0.145.0",
-                "maximum_version_exclusive": "0.148.0",
-                "verified_version": "0.147.0",
+                "maximum_version_exclusive": "0.156.0",
+                "verified_version": "0.155.1",
                 "error": None,
             }
         }
@@ -98,8 +98,8 @@ def test_older_runtime_is_reported_as_best_effort_not_an_error() -> None:
                 "observed_version": "codex-cli 0.144.0",
                 "compatibility": "older-unverified",
                 "minimum_version": "0.145.0",
-                "maximum_version_exclusive": "0.148.0",
-                "verified_version": "0.147.0",
+                "maximum_version_exclusive": "0.156.0",
+                "verified_version": "0.155.1",
                 "error": None,
             }
         }
@@ -108,7 +108,7 @@ def test_older_runtime_is_reported_as_best_effort_not_an_error() -> None:
 def test_spec_current_harness_versions_all_report_tested() -> None:
     observed = {
         "claude": "2.1.223 (Claude Code)",
-        "codex": "codex-cli 0.147.0",
+        "codex": "codex-cli 0.155.1",
         "opencode": "1.18.9",
         "vibe": "vibe 2.22.0",
         "kimi": "0.33.0",
@@ -132,20 +132,20 @@ def test_spec_current_harness_versions_all_report_tested() -> None:
 
 def test_current_core_prerelease_is_best_effort_not_tested() -> None:
     with mock.patch.object(
-        harness_versions, "probe", return_value="codex-cli 0.147.0-dev"
+        harness_versions, "probe", return_value="codex-cli 0.155.1-dev"
     ):
         status = harness_versions.compatibility_status(("codex",))["codex"]
 
-    assert status["version"] == "0.147.0-dev"
+    assert status["version"] == "0.155.1-dev"
     assert status["compatibility"] == "prerelease-unverified"
     assert status["error"] is None
 
 
 def test_same_core_non_tokens_are_best_effort_not_tested() -> None:
     for observed in (
-        "codex-cli 0.147.0dev", "codex-cli 0.147.0.1",
-        "codex-cli 0.147.0_dev", "codex-cli 0.147.0~dev",
-        "codex-cli 0.147.0/dev", "codex-cli 0.147.0:dev",
+        "codex-cli 0.155.1dev", "codex-cli 0.155.1.1",
+        "codex-cli 0.155.1_dev", "codex-cli 0.155.1~dev",
+        "codex-cli 0.155.1/dev", "codex-cli 0.155.1:dev",
     ):
         with mock.patch.object(harness_versions, "probe", return_value=observed):
             status = harness_versions.compatibility_status(("codex",))["codex"]
@@ -159,14 +159,14 @@ def test_same_core_non_tokens_are_best_effort_not_tested() -> None:
 
 def test_custom_current_core_is_best_effort_not_tested() -> None:
     for observed in (
-        "codex-cli 0.147.0(dev)",
-        "codex-cli 0.147.0 custom-build",
-        "wrapper 0.147.0 (not-the-canary)",
+        "codex-cli 0.155.1(dev)",
+        "codex-cli 0.155.1 custom-build",
+        "wrapper 0.155.1 (not-the-canary)",
     ):
         with mock.patch.object(harness_versions, "probe", return_value=observed):
             status = harness_versions.compatibility_status(("codex",))["codex"]
 
-        assert status["version"] == "0.147.0"
+        assert status["version"] == "0.155.1"
         assert status["observed_version"] == observed
         assert status["compatibility"] == "custom-unverified"
         assert status["error"] is None
@@ -267,7 +267,7 @@ def test_text_status_couples_host_provenance_and_compatibility() -> None:
 
     assert output.getvalue().splitlines() == [
         "  runtime:   host",
-        "  codex     0.147.0 · verified · tested [0.145.0, 0.148.0)",
+        "  codex     0.155.1 · verified · tested [0.145.0, 0.156.0)",
     ]
 
 
@@ -275,7 +275,7 @@ def test_text_status_marks_newer_runtime_as_unverified() -> None:
     status = {
         "codex": {
             **STATUS["codex"],
-            "version": "0.148.0",
+            "version": "0.156.0",
             "compatibility": "newer-unverified",
         }
     }
@@ -289,7 +289,7 @@ def test_text_status_marks_newer_runtime_as_unverified() -> None:
 
     assert output.getvalue().splitlines() == [
         "  runtime:   host",
-        "  codex     0.148.0 · newer-unverified · best-effort",
+        "  codex     0.156.0 · newer-unverified · best-effort",
     ]
 
 

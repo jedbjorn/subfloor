@@ -791,13 +791,12 @@ def apply_sandbox(adapter: dict, root: Path = REPO_ROOT) -> list[str]:
     return _merge_json_spec((adapter.get("sandbox") or {}).get("merge_json") or {}, root)
 
 
-def launch_mode_flags(
-    adapter: dict, headless: bool, *, host_admin: bool = False
-) -> list[str]:
+def launch_mode_flags(adapter: dict, headless: bool) -> list[str]:
     """The permission flags for this launch mode: the adapter's always-on set
-    at its top level, the direct-host Admin set when requested, then the
-    sandbox-only set when booting inside the docker sandbox (SC_SANDBOX). The
-    flag sets are disjoint by launch mode:
+    at its top level, then the sandbox-only set when booting inside the docker
+    sandbox (SC_SANDBOX). Every seat — host shell, direct-host Admin,
+    container — gets the same always-on set; there is no Admin-only flag
+    layer. The flag sets are disjoint by launch mode:
     `launch_flags` for interactive, `headless_flags` for headless — a
     non-interactive run can't answer a permission prompt (it auto-denies and
     the worker silently stalls). They are NOT folded together because a
@@ -813,8 +812,6 @@ def launch_mode_flags(
     harnesses whose bypass is safe only behind the container boundary."""
     key = "headless_flags" if headless else "launch_flags"
     flags = list(adapter.get(key) or [])
-    if host_admin:
-        flags += list((adapter.get("host_admin") or {}).get(key) or [])
     if os.environ.get("SC_SANDBOX"):
         flags += list((adapter.get("sandbox") or {}).get(key) or [])
     return flags
@@ -2627,7 +2624,7 @@ def main() -> None:
     # top level (claude's bypass, which a settings merge can no longer grant)
     # plus sandbox-only ones such as codex's approval/sandbox bypass, safe
     # because the container is the safety boundary. See launch_mode_flags.
-    mode_flags = launch_mode_flags(adapter, headless, host_admin=host_admin)
+    mode_flags = launch_mode_flags(adapter, headless)
     if mode_flags:
         print(f"→ launch flags → {' '.join(mode_flags)}")
     sandbox_env: dict[str, str] = {}

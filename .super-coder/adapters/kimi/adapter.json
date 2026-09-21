@@ -10,6 +10,7 @@
   "comm_aliases": ["kimi-code"],
   "boot_artifact": "AGENTS.md",
   "emit": [],
+  "skill_dirs": [".agents/skills"],
   "env": {},
   "mcp": {
     "streamable_http": {

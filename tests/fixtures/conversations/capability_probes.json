@@ -44,8 +44,9 @@
       }
     },
     "codex": {
-      "verified_cli_version": "0.147.0",
-      "maximum_cli_version_exclusive": "0.148.0",
+      "probe_date": "2026-09-21",
+      "verified_cli_version": "0.155.1",
+      "maximum_cli_version_exclusive": "0.156.0",
       "driver": "codex-app-server",
       "native_ref_shape": "uuid",
       "observed_events": [
@@ -53,6 +54,7 @@
         "turn.started",
         "item.started",
         "item.agentMessage.delta",
+        "item.completed",
         "turn.completed"
       ],
       "proof": {

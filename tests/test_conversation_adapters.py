@@ -952,13 +952,13 @@ class ConversationAdapterTest(unittest.TestCase):
     def test_declared_compatibility_ranges_enforce_floor_and_flag_newer(self) -> None:
         cases = {
             "claude": ("2.1.219", "2.1.220", "2.1.223", "2.2.0"),
-            "codex": ("0.144.999", "0.145.0", "0.147.0", "0.148.0"),
+            "codex": ("0.144.999", "0.145.0", "0.155.1", "0.156.0"),
             "opencode": ("1.18.8", "1.18.9", "1.18.13", "1.19.0"),
             "kimi": ("0.29.999", "0.30.0", "0.33.0", "0.34.0"),
         }
         current_observed = {
             "claude": "2.1.223 (Claude Code)",
-            "codex": "codex-cli 0.147.0",
+            "codex": "codex-cli 0.155.1",
             "opencode": "1.18.13",
             "kimi": "0.33.0",
         }
@@ -992,28 +992,28 @@ class ConversationAdapterTest(unittest.TestCase):
     def test_same_core_non_tokens_are_not_verified(self) -> None:
         adapter, _native = self.build("codex")
         for observed in (
-            "codex-cli 0.147.0dev", "codex-cli 0.147.0.1",
-            "codex-cli 0.147.0_dev", "codex-cli 0.147.0~dev",
-            "codex-cli 0.147.0/dev", "codex-cli 0.147.0:dev",
+            "codex-cli 0.155.1dev", "codex-cli 0.155.1.1",
+            "codex-cli 0.155.1_dev", "codex-cli 0.155.1~dev",
+            "codex-cli 0.155.1/dev", "codex-cli 0.155.1:dev",
         ):
             with self.subTest(observed=observed):
                 result = adapter._probe_result(observed)
                 self.assertEqual(result.version, observed)
                 self.assertEqual(result.compatibility, "non-semver")
-                self.assertEqual(result.verified_version, "0.147.0")
+                self.assertEqual(result.verified_version, "0.155.1")
 
     def test_custom_current_core_is_not_verified(self) -> None:
         adapter, _native = self.build("codex")
         for observed in (
-            "codex-cli 0.147.0(dev)",
-            "codex-cli 0.147.0 custom-build",
-            "wrapper 0.147.0 (not-the-canary)",
+            "codex-cli 0.155.1(dev)",
+            "codex-cli 0.155.1 custom-build",
+            "wrapper 0.155.1 (not-the-canary)",
         ):
             with self.subTest(observed=observed):
                 result = adapter._probe_result(observed)
                 self.assertEqual(result.version, observed)
                 self.assertEqual(result.compatibility, "custom-unverified")
-                self.assertEqual(result.verified_version, "0.147.0")
+                self.assertEqual(result.verified_version, "0.155.1")
 
     def test_verified_probe_result_names_missing_manifest_keys(self) -> None:
         adapter, _native = self.build("claude")
@@ -1075,7 +1075,7 @@ class ConversationAdapterTest(unittest.TestCase):
 
         self.assertEqual(result.version, "codex dev-build")
         self.assertEqual(result.compatibility, "non-semver")
-        self.assertEqual(result.verified_version, "0.147.0")
+        self.assertEqual(result.verified_version, "0.155.1")
 
     def write_claude_session(
         self,

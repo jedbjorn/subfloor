@@ -84,6 +84,7 @@ RATIFIED_OPT_INS_AT_0241 = {
 }
 
 sys.path.insert(0, str(ENGINE / "scripts"))
+import engine_paths  # noqa: E402
 import run  # noqa: E402
 import seed_skills  # noqa: E402
 import shell_factory  # noqa: E402
@@ -706,6 +707,60 @@ class RenderAndSnapshotTest(unittest.TestCase):
                 self.assertFalse(
                     (root / skill_root / "skills" / "snapshot").exists()
                 )
+
+    def test_kimi_adapter_renders_and_prunes_native_skill_mirror(self) -> None:
+        # Kimi Code discovers project skills under `.agents/skills` (its
+        # generic project root, alongside the `.kimi-code/skills` brand root),
+        # resolved from the project root it finds by walking up for `.git` —
+        # so a shell's linked worktree counts. Declaring the generic path
+        # reuses codex's existing ignore/cleanup coverage; the brand path is
+        # deliberately not declared.
+        self.con.execute(
+            "INSERT INTO shell_skills (shell_id, skill_id) VALUES (?, ?)",
+            (self.custom, self.kid),
+        )
+        adapter = json.loads(
+            (ENGINE / "adapters" / "kimi" / "adapter.json").read_text()
+        )
+        self.assertEqual(adapter["skill_dirs"], [".agents/skills"])
+        self.assertNotIn(".kimi-code/skills", adapter["skill_dirs"])
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            summary = run.render_harness_skills(
+                self.con, self.custom, root, adapter
+            )
+            self.assertEqual(
+                summary["dirs"], [".claude/skills", ".agents/skills"]
+            )
+            rendered = root / ".agents" / "skills" / "snapshot" / "SKILL.md"
+            self.assertTrue(rendered.exists())
+            self.assertIn("name: snapshot", rendered.read_text())
+
+            self.con.execute(
+                "DELETE FROM shell_skills WHERE shell_id=? AND skill_id=?",
+                (self.custom, self.kid),
+            )
+            run.render_harness_skills(self.con, self.custom, root, adapter)
+            self.assertFalse(
+                (root / ".agents" / "skills" / "snapshot").exists()
+            )
+
+    def test_every_declared_skill_dir_is_ignored_and_removable(self) -> None:
+        # A native skill root is a generated per-boot cache: it must never be
+        # committed, and `./sc remove` must take it away again.
+        ignore = (ROOT / ".gitignore").read_text()
+        for harness in sorted(p.name for p in (ENGINE / "adapters").iterdir()):
+            manifest = ENGINE / "adapters" / harness / "adapter.json"
+            if not manifest.is_file():
+                continue
+            for declared in json.loads(manifest.read_text()).get(
+                    "skill_dirs") or []:
+                with self.subTest(harness=harness, skill_dir=declared):
+                    self.assertIn(f"/{declared}/", ignore)
+                    self.assertIn(
+                        Path(declared), engine_paths.GENERATED_INSTALL_DIRS
+                    )
 
     def test_native_only_adapter_also_renders_boot_advertised_skill_mirror(self) -> None:
         self.con.execute(

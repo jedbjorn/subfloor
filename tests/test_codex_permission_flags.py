@@ -45,12 +45,20 @@ class CodexPermissionFlagsTest(unittest.TestCase):
         self.assertEqual(flags, INTERACTIVE_FLAGS)
         self.assertNotIn(BYPASS, flags)
 
-    def test_host_admin_gets_the_same_policy_and_no_duplicate_flags(self) -> None:
-        with mock.patch.dict(os.environ, {}, clear=True):
-            self.assertEqual(
-                run.launch_mode_flags(_codex(), headless=False, host_admin=True),
-                INTERACTIVE_FLAGS,
-            )
+    def test_no_adapter_declares_an_admin_only_permission_flag_layer(self) -> None:
+        # Every seat gets the same always-on set: PR #1582 removed codex's
+        # `host_admin` block when the direct-host Admin policy became identical
+        # to the ordinary one, and no manifest has declared the key since. The
+        # launcher no longer reads it, so re-introducing one here would be a
+        # silently ignored elevation.
+        for adapter_dir in sorted(run.ADAPTERS.iterdir()):
+            manifest = adapter_dir / "adapter.json"
+            if not manifest.is_file():
+                continue
+            with self.subTest(harness=adapter_dir.name):
+                self.assertNotIn(
+                    "host_admin", json.loads(manifest.read_text())
+                )
 
     def test_headless_gets_the_policy_without_the_approval_flag(self) -> None:
         # `codex exec` has no --ask-for-approval; it never prompts.

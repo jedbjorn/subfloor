@@ -82,7 +82,10 @@ Local host evidence on 2026-09-12: Claude `2.1.269 (Claude Code)`, Codex
 `codex-cli 0.153.4`, OpenCode `1.18.30`, Vibe `vibe 2.22.0`, Kimi `0.39.1`.
 These are installed-version observations, not smoke results. The source's
 verified versions are respectively 2.1.223, 0.147.0, 1.18.9, 2.22.0 and 0.33.0;
-installed Codex and Kimi exceed supported source ranges. Flag #639 blocks native
+installed Codex and Kimi exceed supported source ranges. (Codex's half of that
+gap closed on 2026-09-21: the adapter was re-probed live on `codex-cli 0.155.1`
+and now declares `[0.145.0, 0.156.0)`. Kimi's pin is unchanged and still
+behind its installed build.) Flag #639 blocks native
 acceptance until a qualified isolated seat is supplied. No harness was updated,
 provider session started, service stopped or operator HOME cleaned for this work.
 
