@@ -504,6 +504,20 @@ class AssemblerSmokeTest(unittest.TestCase):
                 [row["display_name"] for row in feature["open_flags"]],
                 ["CC-001"],
             )
+            # Pre-0268 too: every document reads as current, with the
+            # retirement fields projected as their defaults.
+            document = next(
+                row for row in feature["documents"] if row["title"] == "Doc A"
+            )
+            self.assertEqual(document["retired"], 0)
+            self.assertIsNone(document["retired_date"])
+            self.assertIsNone(document["superseded_by"])
+            self.assertIsNone(document["current_document_id"])
+            self.assertEqual(server.document_retirement_view(legacy), {})
+            self.assertEqual(
+                [row["retired"] for row in server.get_docs(legacy)["docs"]],
+                [0],
+            )
         finally:
             legacy.close()
 

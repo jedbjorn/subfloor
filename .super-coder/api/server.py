@@ -1086,6 +1086,29 @@ def _flag_columns(con) -> set[str]:
     return {row[1] for row in con.execute("PRAGMA table_info(flags)")}
 
 
+# Retirement (migration 0268). Same tolerance contract as the runtime-advisory
+# flag columns above: the GUI assemblers must still assemble against a DB that
+# predates the migration, reading every document as current.
+_RETIREMENT_DEFAULTS = {
+    "retired": "0",
+    "retired_date": "NULL",
+    "superseded_by": "NULL",
+}
+
+
+def _document_columns(con) -> set[str]:
+    return {row[1] for row in con.execute("PRAGMA table_info(documents)")}
+
+
+def _retirement_projection(columns: set[str], *, alias: str = "d") -> str:
+    return ", ".join(
+        f"{alias}.{name}"
+        if name in columns
+        else f"{_RETIREMENT_DEFAULTS[name]} AS {name}"
+        for name in _RETIREMENT_DEFAULTS
+    )
+
+
 def _runtime_flag_projection(
     columns: set[str], *, alias: str = "f", include_payload: bool = False
 ) -> str:
@@ -1114,10 +1137,10 @@ def get_roadmap(con) -> dict:
     # kind DESC orders 'spec' before 'doc' within a feature.
     docs_by: dict[int, list] = {}
     for d in _decorate_retirement(con, rows(con.execute(
-            "SELECT document_id, feature_id, kind, seq, title, frozen, frozen_date, "
-            "retired, retired_date, superseded_by, "
-            "render_path FROM documents WHERE kind IN ('spec','doc') "
-            "ORDER BY feature_id, kind DESC, seq"))):
+            "SELECT d.document_id, d.feature_id, d.kind, d.seq, d.title, d.frozen, "
+            "d.frozen_date, " + _retirement_projection(_document_columns(con)) + ", "
+            "d.render_path FROM documents d WHERE d.kind IN ('spec','doc') "
+            "ORDER BY d.feature_id, d.kind DESC, d.seq"))):
         docs_by.setdefault(d["feature_id"], []).append(d)
     flags_by: dict[int, list] = {}
     runtime_filter = (
@@ -1166,7 +1189,7 @@ def get_docs(con) -> dict:
     the spec dev-cycle the roadmap tracks."""
     return {"docs": _decorate_retirement(con, rows(con.execute(
         "SELECT d.document_id, d.feature_id, d.kind, d.seq, d.title, d.frozen, "
-        "d.frozen_date, d.retired, d.retired_date, d.superseded_by, "
+        "d.frozen_date, " + _retirement_projection(_document_columns(con)) + ", "
         "r.title AS feature_title FROM documents d "
         "LEFT JOIN roadmap r ON r.feature_id = d.feature_id "
         "WHERE d.kind='doc' ORDER BY d.feature_id, d.seq")))}
@@ -2008,8 +2031,10 @@ def _document_chain_rows(con) -> dict:
     return {
         row["document_id"]: dict(row)
         for row in con.execute(
-            "SELECT document_id, title, kind, seq, feature_id, render_path, "
-            "retired, superseded_by FROM documents"
+            "SELECT d.document_id, d.title, d.kind, d.seq, d.feature_id, "
+            "d.render_path, "
+            + _retirement_projection(_document_columns(con)) +
+            " FROM documents d"
         ).fetchall()
     }
 
@@ -4478,8 +4503,9 @@ class Handler(BaseHTTPRequestHandler):
                 q = parse_qs(urlparse(self.path).query)
                 feat = q.get("feature", [None])[0]
                 sql = ("SELECT d.document_id, d.feature_id, d.kind, d.seq, d.title, "
-                       "d.frozen, d.frozen_date, d.retired, d.retired_date, "
-                       "d.superseded_by, (SELECT COUNT(*) FROM spec_tasks t "
+                       "d.frozen, d.frozen_date, "
+                       + _retirement_projection(_document_columns(con)) +
+                       ", (SELECT COUNT(*) FROM spec_tasks t "
                        "WHERE t.document_id=d.document_id) AS task_count FROM documents d")
                 params: tuple = ()
                 if feat is not None:
@@ -4498,9 +4524,11 @@ class Handler(BaseHTTPRequestHandler):
                 # content plus a pointer at what is current now.
                 did = int(parts[3])
                 r = con.execute(
-                    "SELECT document_id, feature_id, kind, seq, title, body, frozen, "
-                    "frozen_date, retired, retired_date, superseded_by, render_path "
-                    "FROM documents WHERE document_id=?", (did,)).fetchone()
+                    "SELECT d.document_id, d.feature_id, d.kind, d.seq, d.title, "
+                    "d.body, d.frozen, d.frozen_date, "
+                    + _retirement_projection(_document_columns(con)) +
+                    ", d.render_path FROM documents d WHERE d.document_id=?",
+                    (did,)).fetchone()
                 if r is None:
                     return self._send(404, {"error": "no such document"})
                 return self._send(200, {
