@@ -569,7 +569,7 @@ sc_broker_preflight() {  # $1 = label, $2 = pidfile, $3 = logfile, $4 = sock
   fi
 }
 
-# ── Windows VM broker (HOST-side; drives the test VM for sandboxed forks) ──────
+# ── VM and remotes broker (HOST-side; drives the test VM and named remotes) ───
 # A separate host process — the sandbox server can't hold the ssh key or reach
 # libvirt. It listens on a unix socket in the bind-mounted engine dir so
 # the typed client (in the container) can curl it without a route or key. Refuses
@@ -799,8 +799,9 @@ sc_pm2_broker_uninstall() {
 # ── db broker (HOST-side; read-only diagnostic access to the LIVE app DB) ─────
 # A host-side broker that shells out to `psql` where the live DSN + route
 # resolve, exposing ONE narrow verb (a single allowlisted, capped, read-only
-# SELECT) over a unix socket in the bind-mounted engine dir so the `db_query`
-# skill (in the container) can curl it. The sandbox holds no DSN and no route.
+# SELECT) over a unix socket in the bind-mounted engine dir so a shell (in the
+# container) can reach it through dbq.py's socket client — there is no global
+# `db_query` skill. The sandbox holds no DSN and no route.
 # Read-only twice: the DSN must point at a read-only PG role AND dbq.py rejects
 # any non-SELECT before psql runs. Refuses to run in the sandbox (db_broker.py
 # guards on SC_SANDBOX). Same lifecycle model as its siblings: `up` no-ops when
@@ -1296,7 +1297,7 @@ case "$cmd" in
   preview)      exec "$PY" "$S/preview.py" "$@" ;;
   # ── in-container primitives (no docker; also the host escape hatch) ──
   serve)        exec "$PY" "$ENGINE/api/server.py" "$@" ;;
-  # ── Windows VM broker (HOST-side primitive — runs where virsh + the key live) ──
+  # ── VM and remotes broker (HOST-side primitive — runs where virsh + the key live) ──
   # Subcommands (adopt/init/status/start/stop/restart/snapshot/bake/reset/push/
   # pull/exec/capture/mcp) are parsed by vm.py's client parser.
   vm)                exec "$PY" "$S/vm.py" client "$@" ;;
@@ -1898,8 +1899,8 @@ Subfloor — forkable shell substrate — full command reference (./sc help for 
                              all four validate .subfloor/dev-kit.json, preserve child output/status,
                              and never infer a manifest, tool, file set, or fallback
 
-  Windows VM broker (run on the HOST — drives the test VM for sandboxed forks;
-  holds the ssh key + virsh so the fork never does).
+  VM and remotes broker (run on the HOST — drives the test VM and the named
+  remotes below; holds the ssh key + virsh so the fork never does).
   `launch` brings it up automatically when a VM is linked; `down` stops it:
   ./sc vm adopt --domain DOMAIN [--ssh-user USER] [--ssh-host IP] [--snapshot NAME]
        [--libvirt-uri URI] [--password-file PATH] [--bootstrap-url URL]
