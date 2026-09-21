@@ -1113,10 +1113,11 @@ def get_roadmap(con) -> dict:
     # read-only here (open-link only); the Docs tab is where they're edited.
     # kind DESC orders 'spec' before 'doc' within a feature.
     docs_by: dict[int, list] = {}
-    for d in rows(con.execute(
+    for d in _decorate_retirement(con, rows(con.execute(
             "SELECT document_id, feature_id, kind, seq, title, frozen, frozen_date, "
+            "retired, retired_date, superseded_by, "
             "render_path FROM documents WHERE kind IN ('spec','doc') "
-            "ORDER BY feature_id, kind DESC, seq")):
+            "ORDER BY feature_id, kind DESC, seq"))):
         docs_by.setdefault(d["feature_id"], []).append(d)
     flags_by: dict[int, list] = {}
     runtime_filter = (
@@ -1163,11 +1164,12 @@ def get_roadmap(con) -> dict:
 def get_docs(con) -> dict:
     """Documentation (kind='doc'), grouped client-side by feature. Distinct from
     the spec dev-cycle the roadmap tracks."""
-    return {"docs": rows(con.execute(
+    return {"docs": _decorate_retirement(con, rows(con.execute(
         "SELECT d.document_id, d.feature_id, d.kind, d.seq, d.title, d.frozen, "
-        "d.frozen_date, r.title AS feature_title FROM documents d "
+        "d.frozen_date, d.retired, d.retired_date, d.superseded_by, "
+        "r.title AS feature_title FROM documents d "
         "LEFT JOIN roadmap r ON r.feature_id = d.feature_id "
-        "WHERE d.kind='doc' ORDER BY d.feature_id, d.seq"))}
+        "WHERE d.kind='doc' ORDER BY d.feature_id, d.seq")))}
 
 
 _EMPTY_MAP = {"repo": None, "total_files": 0, "by_lang": [],
@@ -1989,6 +1991,216 @@ def move_spec_to_feature(con, document_id: int, target_feature_id: int):
                 "target_seq": target_seq,
                 "tasks_moved": tasks,
                 "decisions_moved": decisions,
+            }, 200, None
+    except db_driver.IntegrityError as exc:
+        return None, 409, str(exc)
+
+
+# ── Document retirement (spec #251) ─────────────────────────────────────────
+# Retirement is metadata ABOUT a document. The retire surface writes `retired`,
+# `retired_date`, `superseded_by` and `updated_at` and NOTHING else, so frozen
+# immutability (title/body/frozen/frozen_date) is untouched by construction.
+
+DOCUMENT_CHAIN_HOPS = 10   # bound on superseded_by chain resolution
+
+
+def _document_chain_rows(con) -> dict:
+    return {
+        row["document_id"]: dict(row)
+        for row in con.execute(
+            "SELECT document_id, title, kind, seq, feature_id, render_path, "
+            "retired, superseded_by FROM documents"
+        ).fetchall()
+    }
+
+
+def _resolve_current(rows: dict, document_id):
+    """The first non-retired document reachable through superseded_by.
+
+    Bounded to DOCUMENT_CHAIN_HOPS. A pointer at a row that no longer exists
+    is the end of the chain, not a failure: callers still show the raw
+    pointer id, just without a title.
+    """
+    seen = set()
+    node = document_id
+    for _ in range(DOCUMENT_CHAIN_HOPS):
+        row = rows.get(node)
+        if row is None or node in seen:
+            return None
+        if not row["retired"]:
+            return row
+        seen.add(node)
+        node = row["superseded_by"]
+        if node is None:
+            return None
+    return None
+
+
+def document_retirement_view(con) -> dict:
+    """Per-document retirement projection for every read surface.
+
+    Maps document_id -> {superseded_by_title, current_document_id,
+    current_title}. Only retired rows appear; a current document has no entry.
+    """
+    rows = _document_chain_rows(con)
+    view: dict = {}
+    for document_id, row in rows.items():
+        if not row["retired"]:
+            continue
+        successor = rows.get(row["superseded_by"]) if row["superseded_by"] else None
+        current = _resolve_current(rows, row["superseded_by"]) if row["superseded_by"] else None
+        view[document_id] = {
+            "superseded_by_title": successor["title"] if successor else None,
+            "current_document_id": current["document_id"] if current else None,
+            "current_title": current["title"] if current else None,
+            "current_render_path": current["render_path"] if current else None,
+        }
+    return view
+
+
+def _decorate_retirement(con, records: list) -> list:
+    """Attach the retirement projection to already-serialized document rows."""
+    view = document_retirement_view(con)
+    for record in records:
+        record.update(view.get(record.get("document_id"), {
+            "superseded_by_title": None,
+            "current_document_id": None,
+            "current_title": None,
+            "current_render_path": None,
+        }))
+    return records
+
+
+def retire_document(con, document_id: int, superseded_by, undo: bool):
+    """Retire, re-point, or un-retire one document.
+
+    Returns (result, status, error) like move_spec_to_feature.
+    """
+    try:
+        with db_driver.write_transaction(con, "document.retire"):
+            document = con.execute(
+                "SELECT document_id,kind,frozen,retired,retired_date,superseded_by "
+                "FROM documents WHERE document_id=?",
+                (document_id,),
+            ).fetchone()
+            if document is None:
+                return None, 404, "no such document"
+
+            if undo:
+                # No dependency check by design: a document still pointing at
+                # this one simply resolves to it as current again.
+                if not document["retired"]:
+                    return {
+                        "document_id": document_id,
+                        "retired": False,
+                        "already_current": True,
+                        "superseded_by": None,
+                        "retired_date": None,
+                    }, 200, None
+                con.execute(
+                    "UPDATE documents SET retired=0, retired_date=NULL, "
+                    "superseded_by=NULL, updated_at=datetime('now') "
+                    "WHERE document_id=?",
+                    (document_id,),
+                )
+                return {
+                    "document_id": document_id,
+                    "retired": False,
+                    "already_current": False,
+                    "superseded_by": None,
+                    "retired_date": None,
+                }, 200, None
+
+            # An open plan still owns this document: finish, move, or close it
+            # before retiring. A frozen spec is shipped history and has no open
+            # plan to protect, so the check is scoped to unfrozen specs.
+            if not document["retired"] and document["kind"] == "spec" and not document["frozen"]:
+                open_tasks = con.execute(
+                    "SELECT COUNT(*) FROM spec_tasks WHERE document_id=? "
+                    "AND status NOT IN ('done','cancelled')",
+                    (document_id,),
+                ).fetchone()[0]
+                if open_tasks:
+                    return (
+                        None,
+                        409,
+                        f"spec has {open_tasks} unfinished task(s) — finish, move, "
+                        "or cancel the plan before retiring it",
+                    )
+                sprint = con.execute(
+                    "SELECT sprint_id FROM sprint_specs WHERE document_id=? "
+                    "ORDER BY sprint_id LIMIT 1",
+                    (document_id,),
+                ).fetchone()
+                if sprint is not None:
+                    return (
+                        None,
+                        409,
+                        f"spec is bound to Sprint #{sprint['sprint_id']} and cannot "
+                        "be retired",
+                    )
+
+            if superseded_by is not None:
+                try:
+                    superseded_by = int(superseded_by)
+                except (TypeError, ValueError):
+                    return None, 400, "superseded_by must be an integer document id"
+                if superseded_by == document_id:
+                    return None, 409, "a document cannot supersede itself"
+                successor = con.execute(
+                    "SELECT document_id,retired FROM documents WHERE document_id=?",
+                    (superseded_by,),
+                ).fetchone()
+                if successor is None:
+                    return None, 409, f"no such successor document #{superseded_by}"
+                if successor["retired"]:
+                    return (
+                        None,
+                        409,
+                        f"successor document #{superseded_by} is itself retired — "
+                        "point at the current document",
+                    )
+
+            if document["retired"]:
+                # Idempotent: the same successor is the success it already is;
+                # a different one re-points without moving retired_date.
+                if document["superseded_by"] == superseded_by:
+                    return {
+                        "document_id": document_id,
+                        "retired": True,
+                        "already_retired": True,
+                        "superseded_by": superseded_by,
+                        "retired_date": document["retired_date"],
+                    }, 200, None
+                con.execute(
+                    "UPDATE documents SET superseded_by=?, updated_at=datetime('now') "
+                    "WHERE document_id=?",
+                    (superseded_by, document_id),
+                )
+                return {
+                    "document_id": document_id,
+                    "retired": True,
+                    "already_retired": True,
+                    "repointed": True,
+                    "superseded_by": superseded_by,
+                    "retired_date": document["retired_date"],
+                }, 200, None
+
+            con.execute(
+                "UPDATE documents SET retired=1, retired_date=date('now'), "
+                "superseded_by=?, updated_at=datetime('now') WHERE document_id=?",
+                (superseded_by, document_id),
+            )
+            retired_date = con.execute(
+                "SELECT retired_date FROM documents WHERE document_id=?",
+                (document_id,),
+            ).fetchone()[0]
+            return {
+                "document_id": document_id,
+                "retired": True,
+                "already_retired": False,
+                "superseded_by": superseded_by,
+                "retired_date": retired_date,
             }, 200, None
     except db_driver.IntegrityError as exc:
         return None, 409, str(exc)
@@ -4266,24 +4478,33 @@ class Handler(BaseHTTPRequestHandler):
                 q = parse_qs(urlparse(self.path).query)
                 feat = q.get("feature", [None])[0]
                 sql = ("SELECT d.document_id, d.feature_id, d.kind, d.seq, d.title, "
-                       "d.frozen, (SELECT COUNT(*) FROM spec_tasks t "
+                       "d.frozen, d.frozen_date, d.retired, d.retired_date, "
+                       "d.superseded_by, (SELECT COUNT(*) FROM spec_tasks t "
                        "WHERE t.document_id=d.document_id) AS task_count FROM documents d")
                 params: tuple = ()
                 if feat is not None:
                     sql += " WHERE d.feature_id=?"
                     params = (int(feat),)
                 sql += " ORDER BY d.feature_id, d.kind, d.seq"
-                return self._send(200, {"documents": rows(con.execute(sql, params))})
+                # Retired rows stay in the payload — hiding is a reader's
+                # choice (`sc mem get documents` hides by default, --retired
+                # shows), never a truth the API withholds.
+                return self._send(200, {"documents": _decorate_retirement(
+                    con, rows(con.execute(sql, params)))})
 
             if len(parts) == 4 and parts[2] == "documents":
                 # Single document WITH body — the spec skill loads this to read.
+                # A retired document ALWAYS reads: an old link must land on the
+                # content plus a pointer at what is current now.
                 did = int(parts[3])
                 r = con.execute(
                     "SELECT document_id, feature_id, kind, seq, title, body, frozen, "
-                    "render_path FROM documents WHERE document_id=?", (did,)).fetchone()
+                    "frozen_date, retired, retired_date, superseded_by, render_path "
+                    "FROM documents WHERE document_id=?", (did,)).fetchone()
                 if r is None:
                     return self._send(404, {"error": "no such document"})
-                return self._send(200, {"document": dict(r)})
+                return self._send(200, {
+                    "document": _decorate_retirement(con, [dict(r)])[0]})
 
             if path == "/_sc/mem/tasks":
                 # A spec's task plan, by ?doc=<id> (the spec skill) or ?feature=<id>.
@@ -4896,6 +5117,23 @@ class Handler(BaseHTTPRequestHandler):
                 except (TypeError, ValueError):
                     return self._send(400, {"error": "feature_id must be an integer"})
                 result, status, error = move_spec_to_feature(con, did, target)
+                if error:
+                    return self._send(status, {"ok": False, "error": error})
+                return self._send(200, {
+                    "ok": True,
+                    **result,
+                    "serialize": serialize_doc_write(),
+                })
+
+            # PATCH /_sc/mem/docs/{id}/retire — must precede the bare /docs/{id}
+            # check. Shared authority, exactly like freeze: any shell may retire
+            # any document. Writes only the three retirement columns, so a frozen
+            # row's title/body/frozen/frozen_date are untouched.
+            if len(parts) == 5 and parts[2] == "docs" and parts[4] == "retire":
+                did = int(parts[3])
+                result, status, error = retire_document(
+                    con, did, body.get("superseded_by"), bool(body.get("undo"))
+                )
                 if error:
                     return self._send(status, {"ok": False, "error": error})
                 return self._send(200, {

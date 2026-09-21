@@ -35,6 +35,8 @@ Run from the repo root, like every engine command:
     ./sc mem which                                 # confirm the memory API is reachable + which shell this session resolves as
     ./sc mem get <surface>           [--json]      # read: state|seed|lns|decisions|flags|roadmap|narrative|messages
     ./sc mem get decisions [<id>|--all]            # default: active index (no rationale); <id> = full row; --all incl. superseded
+    ./sc mem get documents [--doc ID] [--feature ID] [--retired]
+                                                   # retired rows hidden by default; --doc always reads, retired or not
     ./sc mem get flags [<id>] [--feature ID --resolved]
                                                    # default: open; <id>: exact incl. resolved; history: feature-scoped only
                                                    # decisions read FLEET-WIDE (author tagged @shortname); writes stay your own
@@ -65,6 +67,7 @@ Run from the repo root, like every engine command:
     ./sc mem doc edit <document_id>  [--title "…"] [--body-file PATH] [--render-path …]   # frozen: --render-path only
     ./sc mem doc move <document_id>  --feature <target_feature_id>   # unfrozen spec + plan, atomic
     ./sc mem doc freeze <document_id>
+    ./sc mem doc retire <document_id>  [--superseded-by <document_id>] [--undo]   # metadata, never an edit
     ./sc mem doc qaqc <spec_document_id> --verdict pass|fail [--findings-doc ID]   # Reviewer signs the spec's current body
     ./sc mem narrative "<line>"
     ./sc mem delivery-audit          [--json]      # Planner-only bounded delivery reconciliation
@@ -382,7 +385,33 @@ GET_SURFACES = ("state", "seed", "lns", "decisions", "flags",
 GET_SURFACE_ALIASES = {"doc": "documents", "docs": "documents"}
 
 
-def _render_get(surface: str, data: dict) -> int:
+def _retired_tag(d: dict) -> str:
+    """The inline list marker: `[retired → #<id>]`, or `[retired]` when bare."""
+    if not d.get("retired"):
+        return ""
+    successor = d.get("superseded_by")
+    return f" [retired → #{successor}]" if successor else " [retired]"
+
+
+def _retirement_lines(d: dict) -> list:
+    """The one-document retirement block: when, by what, what is current."""
+    if not d.get("retired"):
+        return []
+    when = d.get("retired_date") or "(date unknown)"
+    successor = d.get("superseded_by")
+    if not successor:
+        return [f"  retired {when} — no successor"]
+    title = d.get("superseded_by_title")
+    named = f"#{successor} {title}" if title else f"#{successor} (no such document)"
+    lines = [f"  retired {when} — superseded by {named}"]
+    current = d.get("current_document_id")
+    if current is not None and current != successor:
+        # The successor was retired in turn; name the head of the chain.
+        lines.append(f"  current: #{current} {d.get('current_title') or ''}".rstrip())
+    return lines
+
+
+def _render_get(surface: str, data: dict, args=None) -> int:
     if surface == "state":
         print(data.get("current_state") or "(current_state empty)")
         return 0
@@ -498,7 +527,12 @@ def _render_get(surface: str, data: dict) -> int:
             d = data["document"]
             fz = " [frozen]" if d.get("frozen") else ""
             print(f"#{d['document_id']} {d.get('kind')} seq {d.get('seq')} · "
-                  f"feature {d.get('feature_id')}{fz} — {d.get('title') or ''}")
+                  f"feature {d.get('feature_id')}{fz}{_retired_tag(d)} — "
+                  f"{d.get('title') or ''}")
+            # A retired document always reads — the retirement line is how an
+            # old link tells the reader what is current now.
+            for line in _retirement_lines(d):
+                print(line)
             print()
             print(d.get("body") or "(empty body)")
             return 0
@@ -506,12 +540,20 @@ def _render_get(surface: str, data: dict) -> int:
         if not ds:
             print("mem: no documents")
             return 0
+        show_retired = bool(getattr(args, "retired", False))
+        hidden = 0
         for d in ds:
+            if d.get("retired") and not show_retired:
+                hidden += 1
+                continue
             fz = " [frozen]" if d.get("frozen") else ""
             tc = d.get("task_count")
             tcs = f" · {tc} task(s)" if tc else ""
             print(f"#{d['document_id']} {d.get('kind')} seq {d.get('seq')} · "
-                  f"feature {d.get('feature_id')}{fz}{tcs} — {d.get('title') or ''}")
+                  f"feature {d.get('feature_id')}{fz}{tcs}{_retired_tag(d)} — "
+                  f"{d.get('title') or ''}")
+        if hidden:
+            print(f"{hidden} retired hidden — --retired to show")
         return 0
     if surface == "tasks":
         ts = data.get("tasks", [])
@@ -562,6 +604,8 @@ def cmd_get(args) -> int:
     surface = args.surface
     if args.resolved and surface != "flags":
         die("--resolved is only valid with get flags --feature <id>")
+    if getattr(args, "retired", False) and surface != "documents":
+        die("--retired is only valid with get documents")
     path = f"/_sc/mem/{surface}"
     if surface == "decisions":
         if args.id is not None:                   # single decision, with rationale
@@ -601,7 +645,7 @@ def cmd_get(args) -> int:
     if args.json:
         print(json.dumps(data, indent=2, default=str))
         return 0
-    return _render_get(surface, data)
+    return _render_get(surface, data, args)
 
 
 def cmd_state(args) -> int:
@@ -870,6 +914,31 @@ def cmd_doc(args) -> int:
             f"mem: QAQC approval #{review['approval_id']} → {review['verdict']} "
             f"for spec #{args.document_id} at {review['revision_sha256']}"
         )
+    if args.doc_cmd == "retire":
+        if args.undo and args.superseded_by is not None:
+            die("--undo clears the retirement — it cannot take --superseded-by")
+        payload = {"undo": True} if args.undo else {
+            "superseded_by": args.superseded_by}
+        r = _api("PATCH", f"/_sc/mem/docs/{args.document_id}/retire", payload,
+                 timeout=_DOC_WRITE_TIMEOUT)
+        if args.undo:
+            note = (" (was not retired — undo is a no-op)"
+                    if r.get("already_current") else "")
+            rc = _finish_api(
+                f"mem: document #{args.document_id} un-retired{note}")
+            return _note_serialize(r) or rc
+        successor = r.get("superseded_by")
+        pointer = f" → superseded by #{successor}" if successor else " (no successor)"
+        if r.get("repointed"):
+            head = f"mem: document #{args.document_id} successor updated"
+        elif r.get("already_retired"):
+            head = (f"mem: document #{args.document_id} was already retired "
+                    f"(retire is idempotent)")
+        else:
+            head = (f"mem: document #{args.document_id} retired "
+                    f"{r.get('retired_date') or ''}".rstrip())
+        rc = _finish_api(head + pointer)
+        return _note_serialize(r) or rc
     if args.doc_cmd == "freeze":
         r = _api("PATCH", f"/_sc/mem/docs/{args.document_id}/freeze",
                  timeout=_DOC_WRITE_TIMEOUT)
@@ -1010,6 +1079,8 @@ def build_parser() -> argparse.ArgumentParser:
                     help="flags: resolved rows for one --feature (unscoped history refused)")
     sp.add_argument("--doc", type=int,
                     help="documents: one doc WITH body; tasks: that doc's plan")
+    sp.add_argument("--retired", action="store_true",
+                    help="documents: include retired rows (hidden by default)")
     sp.set_defaults(fn=cmd_get)
 
     sp = sub.add_parser("state", help="set current_state")
@@ -1137,7 +1208,7 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("oriented", help="mark this shell oriented (bootstrapped=1)") \
        .set_defaults(fn=cmd_oriented)
 
-    sp = sub.add_parser("doc", help="add, edit, move, or freeze a spec/doc document")
+    sp = sub.add_parser("doc", help="add, edit, move, freeze, or retire a spec/doc document")
     dsub = sp.add_subparsers(dest="doc_cmd", required=True)
     da = dsub.add_parser("add", help="author a spec or doc from a body file (--seq auto-advances)")
     da.add_argument("title")
@@ -1159,6 +1230,16 @@ def build_parser() -> argparse.ArgumentParser:
     dm.add_argument("--feature", type=int, required=True, help="target feature id")
     df = dsub.add_parser("freeze", help="ship a spec: title and body become immutable")
     df.add_argument("document_id", type=int)
+    dr = dsub.add_parser(
+        "retire",
+        help="retire a document (optionally naming its successor); --undo reverses it",
+    )
+    dr.add_argument("document_id", type=int)
+    dr.add_argument("--superseded-by", dest="superseded_by", type=int,
+                    help="the document that replaced this one (must exist, "
+                         "differ, and not itself be retired)")
+    dr.add_argument("--undo", action="store_true",
+                    help="clear the retirement and its successor pointer")
     dq = dsub.add_parser(
         "qaqc",
         help="record an append-only review of the spec's current canonical body",
