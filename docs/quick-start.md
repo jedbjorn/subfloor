@@ -68,6 +68,12 @@ The sandbox uses the host's configured harness credentials. See
 is unavailable. Use `subfloor admin` from the host checkout for engine
 maintenance or guarded recovery.
 
+Sign in to GitHub on the host as well, or step 3 of *Build and review the first
+PR* below has nothing to push with. For an HTTPS `origin`, run `gh auth login`
+or export `SC_GH_TOKEN`; for an SSH `origin`, load a GitHub identity into a
+running `ssh-agent` and set a token for the API besides. Launch discovers these
+each time and prints what it found — see [GitHub access](README.md#github-access).
+
 ## Orient with the Cartographer
 
 Run `subfloor enter`, select the Cartographer, then choose an available harness
@@ -75,7 +81,7 @@ and model. The picker shows route support and supported Thinking levels where
 available. Ask it to orient and map the repository. The **Repo Map** tab displays
 the resulting catalogue; other shells can read it without becoming map owners.
 
-Alternatively, use **Chats → New chat** for a shell and a supported browser
+Alternatively, use **Chats → ＋ Chat** for a shell and a supported browser
 route. Browser and terminal sessions cannot own the same shell at once. Close
 a browser conversation before entering that shell from the terminal.
 

@@ -16,8 +16,9 @@ fork. Exact CLI syntax remains in `sc help --all` and verb help.
 
 Read-only diagnostic access to the fork's **live app Postgres** for a sandboxed
 shell — without handing that shell a credential or a network route. The fourth
-sibling of the pm2, Windows-VM, and tailnet brokers: one host process holds the
-capability so nothing downstream needs it.
+sibling of the [pm2](pm2-broker.md), [VM and remotes](remote-seats.md), and
+[tailnet](tailscale-broker.md) brokers: one host process holds the capability
+so nothing downstream needs it.
 
 Code: `.super-coder/api/db_broker.py` (the HTTP-over-unix-socket server) +
 `.super-coder/scripts/dbq.py` (config, validation, the query verb, the socket
@@ -104,9 +105,15 @@ export SC_RO_DSN=postgresql://sc_ro:…@<host>:5432/<db>
 ./sc db-broker           foreground (unix socket)
 ./sc db-broker-up        background (nohup + pidfile); self-skips if unlinked/up
 ./sc db-broker-down      stop the backgrounded broker
+./sc db-broker-sock      print the socket path
 ./sc db-broker-install   supervise via a systemd --user unit (EnvironmentFile
                          carries SC_RO_DSN — a unit has no login shell)
+./sc db-broker-uninstall remove the systemd unit
 ```
+
+The unit's env file is `~/.config/<fork>/db-broker.env` (`SC_RO_ENVFILE`
+overrides it); `db-broker-install` prints the path and the operator creates it
+host-side with `SC_RO_DSN=postgresql://…`.
 
 `db_broker.py` guards on `SC_SANDBOX` and refuses to start inside the container.
 `db-broker-up` self-skips when no `db` block is linked and no-ops when the socket

@@ -14,12 +14,15 @@ guard and the conversation contract.
 | field | meaning |
 |---|---|
 | `launch` | argv exec'd to start the harness |
+| `surfaces` | which lanes this harness may serve (`terminal`, `one_shot`, `browser`, `sprint` — all true). An explicit `false` is refused before launch setup. |
 | `boot_artifact` | the context file this harness reads (informational) |
 | `emit` | files in this dir copied to the repo root at launch (none for Claude) |
 | `env` | extra env merged into the launch environment |
+| `mcp.streamable_http` | managed MCP recipes injected as `--mcp-config` launch args — `windows-mcp` (only with a linked VM) and `browser` (only with the browser port configured, and never inside the sandbox) |
 | `model` | `{ "flag": "--model" }` — run.py appends `--model <id>` for the flavor's claude model (alias: `sonnet`/`haiku`/`opus`) |
+| `name` | `{ "flag": "--name" }` — interactive launches append `--name <display_name>` so the session is labelled in the prompt box, resume picker and terminal title. Claude is the only adapter that declares it. |
 | `headless.effort` | `{ "flag": "--effort" }` — applies an explicitly requested headless effort level |
-| `merge_json` | always-on: project-scoped JSON deep-merged every launch (preserves fork keys). Installs the branch-guard hook into `.claude/settings.local.json`. |
+| `merge_json` | always-on: project-scoped JSON deep-merged every launch (preserves fork keys). Installs the branch-guard `PreToolUse` hook and the `SessionEnd` telemetry hook (`scripts/telemetry-hook.sh`) into `.claude/settings.local.json`. |
 | `launch_flags` / `headless_flags` | always-on argv appended to the interactive / headless launch — `--dangerously-skip-permissions` in both |
 | `sandbox` | `env`: `IS_SANDBOX=1`, required because the rootless container runs claude as uid 0 and it refuses bypass as root without it |
 
@@ -61,6 +64,13 @@ before it. Re-emitted (idempotently) each launch, so it survives `./sc update`.
 `scripts/branch-guard.sh` is the **one** branch-decision script used by the Claude and Codex hooks, the OpenCode plugin, and the universal
 Git pre-commit backstop
 — so `SC_PROTECTED_BRANCHES` and the message stay identical everywhere.
+
+**Host setup (one-time):** the binary is baked into the sandbox image, but auth is
+mounted from the host — so `claude` must be installed + logged in on the host once:
+`curl -fsSL https://claude.ai/install.sh | bash` (binary → `~/.local/bin/claude`),
+then run `claude` and `/login`. That writes `~/.claude.json`, which `./sc launch`
+mounts in. `./sc install` / `./sc update` / `./sc ensure-harness` install the
+binary automatically; auth stays manual.
 
 ## Conversation capability
 

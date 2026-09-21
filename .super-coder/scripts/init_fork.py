@@ -76,7 +76,7 @@ def main(argv: list[str]) -> int:
     ap.add_argument("--username")
     ap.add_argument("--name", help="shell display name")
     ap.add_argument("--shortname")
-    ap.add_argument("--flavor", help="planner | dev | reviewer")
+    ap.add_argument("--flavor", help="a shipped flavor (default planner); an unknown name lists the valid ones")
     ap.add_argument("--role", help="override the flavor's role")
     ap.add_argument("--mandate", help="override the flavor's mandate")
     ap.add_argument("--partner")

@@ -19,10 +19,12 @@ billing are provider-owned; they are not part of the adapter contract.
 | field | meaning |
 |---|---|
 | `launch` | argv exec'd to start the harness (`codex --dangerously-bypass-hook-trust`) |
+| `surfaces` | which lanes this harness may serve (`terminal`, `one_shot`, `browser`, `sprint` — all true) |
 | `boot_artifact` | the context file this harness reads (`AGENTS.md`, informational) |
 | `emit` | files copied to the repo root at launch (`.codex/hooks.json` — the branch-guard hook) |
 | `skill_dirs` | exact shell grants rendered to `.claude/skills` and Codex-native `.agents/skills` |
 | `env` | extra env merged into the launch environment |
+| `mcp.streamable_http` | managed MCP recipes injected as `-c mcp_servers.<name>.url=…` launch args — `windows-mcp` (only with a linked VM) and `browser` (only with the browser port configured, and never inside the sandbox) |
 | `model` | `{ "flag": "--model" }` — run.py appends `--model <id>` for the flavor's codex model |
 | `headless.effort` | maps requested effort to `-c model_reasoning_effort="<level>"` |
 | `launch_flags` / `headless_flags` | always-on argv appended to the interactive / headless launch — `--sandbox danger-full-access` (plus `--ask-for-approval never` interactively; `codex exec` has no approval flag and never prompts) |

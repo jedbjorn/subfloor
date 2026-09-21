@@ -142,8 +142,9 @@ so it must not contain a double quote — cmd re-parses the line and the quotes
 arrive as literal characters. Put anything that needs quoting in a `.cmd` file
 in the workspace and name that file instead.
 
-`./sc vm init` remains for hand-linking a guest you prepared yourself, and no
-longer takes `--transfer-dir`:
+`./sc vm init` remains for hand-linking a guest you prepared yourself.
+`--transfer-dir` is retired: an existing script may still pass it, but the flag
+is dropped with a note and the saved block never carries a transfer-directory key.
 
 ```bash
 ./sc vm init --domain w10c-testing --snapshot baseline \
@@ -220,6 +221,8 @@ Act on the code.
 | `remote_key_invalid`, `remote_config_invalid` | key path, mode, or block fields are wrong on the host |
 | `remote_path_not_allowed` | a push source or a pull destination resolved outside the repo and `.sc-state/local/` |
 | `remote_unreachable`, `remote_exec_failed` | SSH failed, or the command exited non-zero |
+| `exec_failed`, `exec_validation_failed`, `exec_unavailable` | posture 1 `exec`: the guest command exited non-zero; the `vm` block is missing `ssh_host`/`ssh_user`/`ssh_key_path` or the command was empty; `ssh` itself is not installed on the host |
+| `vm_busy` | another guest-mutating call holds the broker's single mutation lock; the reply names the wait budget and nothing was attempted |
 | `snapshot_protected`, `snapshot_name_invalid` | a lifecycle guard tripped; the baseline is redefined with `bake`, not deleted |
 | `snapshot_live_unsupported` | libvirt refused a live internal snapshot (UEFI pflash, non-migratable CPU flags); the normal case on many hosts. Checkpoint offline: `mcp down` if up, `stop`, `snapshot create <name>`, `start`; `reset <name> --running` restores it booted |
 | `stop_timeout`, `reset_result_unknown` | the final state was not confirmed; read `status` |
