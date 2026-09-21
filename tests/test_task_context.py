@@ -234,11 +234,12 @@ class ProjectorTest(unittest.TestCase):
     def setUp(self):
         self.con = build_engine_db(":memory:")
         self.addCleanup(self.con.close)
-        self.runtime = {"worktree": "/abs/worktrees/dev1", "seat": "host",
-                        "branch": "feat/projection"}
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
-        self.root = Path(tmp.name)          # a real, empty checkout: no dev-kit
+        self.root = Path(tmp.name).resolve()  # a real, empty checkout: no dev-kit
+        self.worktree = str(self.root / ".sc-worktrees" / "dev1")
+        self.runtime = {"worktree": self.worktree, "seat": "host",
+                        "branch": "feat/projection"}
 
     def project(self, **kw):
         kw.setdefault("caller_shell_id", 1)
@@ -291,7 +292,7 @@ class ProjectorTest(unittest.TestCase):
         ids = seed_feature(self.con)
         bo = self.project(task_id=ids["tasks"][1])["boundaries"]
         self.assertEqual(bo["locations"], {
-            "worktree": "/abs/worktrees/dev1", "repo_root": str(self.root),
+            "worktree": self.worktree, "repo_root": str(self.root),
             "shared": f"{self.root}/shared"})
         self.assertEqual(bo["seat"], "host")
         self.assertEqual(bo["role"], "dev")
@@ -433,6 +434,184 @@ class ProjectorTest(unittest.TestCase):
         self.assertEqual(p["assignment"]["tasks"][0]["sprint_work_unit_id"], sp["unit"])
         self.assertEqual(p["authority"]["documents"][0]["revision"], "current")
         self.assertIn(f"sc context --work-unit {sp['unit']}", " ".join(p["boundaries"]["walls"]))
+
+    # ── retired governing documents (spec doc #251, A8) ──────────────────
+    def retire(self, document_id, superseded_by=None):
+        self.con.execute(
+            "UPDATE documents SET retired=1, retired_date='2026-09-21', superseded_by=? "
+            "WHERE document_id=?", (superseded_by, document_id))
+        self.con.commit()
+
+    def add_spec(self, ids, title):
+        return self.con.execute(
+            "INSERT INTO documents (feature_id,kind,seq,title,body) "
+            "VALUES (?,'spec',(SELECT MAX(seq)+1 FROM documents WHERE feature_id=?),?,'b')",
+            (ids["feature"], ids["feature"], title)).lastrowid
+
+    def test_unretired_document_projects_as_before_plus_additive_keys(self):
+        ids = seed_feature(self.con)
+        p = self.project(task_id=ids["tasks"][1])
+        doc, = p["authority"]["documents"]
+        self.assertEqual({k: doc[k] for k in (
+            "document_id", "title", "kind", "seq", "frozen", "revision", "sha256", "read")}, {
+            "document_id": ids["doc"], "title": "Spec", "kind": "spec", "seq": 1,
+            "frozen": False, "revision": "current",
+            "sha256": hashlib.sha256(SPEC_BODY.encode()).hexdigest(),
+            "read": f"sc mem get documents --doc {ids['doc']}"})
+        self.assertEqual({k: doc[k] for k in (
+            "retired", "retired_date", "superseded_by", "current_document_id",
+            "current_title")}, {
+            "retired": False, "retired_date": None, "superseded_by": None,
+            "current_document_id": None, "current_title": None})
+        self.assertIn(f"  doc #{ids['doc']} Spec — current\n", tc.render(p))
+        self.assertNotIn("retired", tc.render(p))
+        self.assertFalse(any("retired" in w for w in p["boundaries"]["walls"]))
+
+    def test_retired_document_names_the_current_authority(self):
+        ids = seed_feature(self.con)
+        second = self.add_spec(ids, "Second spec")
+        self.retire(ids["doc"], second)
+        p = self.project(task_id=ids["tasks"][1])
+        doc, = p["authority"]["documents"]
+        self.assertEqual(doc["revision"], "retired")
+        self.assertTrue(doc["retired"])
+        self.assertEqual(doc["retired_date"], "2026-09-21")
+        self.assertEqual(doc["superseded_by"], second)
+        self.assertEqual((doc["current_document_id"], doc["current_title"]),
+                         (second, "Second spec"))
+        self.assertIn(f"  doc #{ids['doc']} Spec — retired · retired → #{second} Second spec",
+                      tc.render(p))
+        self.assertIn(f"document #{ids['doc']} is retired — current authority is "
+                      f"#{second} Second spec", p["boundaries"]["walls"])
+
+        # two hops: the named successor is itself retired
+        third = self.add_spec(ids, "Third spec")
+        self.retire(second, third)
+        doc, = self.project(task_id=ids["tasks"][1])["authority"]["documents"]
+        self.assertEqual(doc["superseded_by"], second)
+        self.assertEqual((doc["current_document_id"], doc["current_title"]),
+                         (third, "Third spec"))
+
+    def test_retired_document_without_a_resolvable_successor(self):
+        ids = seed_feature(self.con)
+        wall = (f"document #{ids['doc']} is retired — no successor named; "
+                "confirm the governing spec with the Planner")
+        unresolved = (f"document #{ids['doc']} is retired — successor #{{}} does not resolve "
+                      "to a current document; confirm the governing spec with the Planner")
+        self.retire(ids["doc"])                                  # bare retire
+        p = self.project(task_id=ids["tasks"][1])
+        doc, = p["authority"]["documents"]
+        self.assertEqual(doc["revision"], "retired")
+        self.assertIsNone(doc["superseded_by"])
+        self.assertIsNone(doc["current_document_id"])
+        self.assertIn(f"  doc #{ids['doc']} Spec — retired · retired\n", tc.render(p))
+        self.assertIn(wall, p["boundaries"]["walls"])
+
+        self.con.execute("PRAGMA foreign_keys=OFF")
+        self.retire(ids["doc"], 9999)                            # pointer at a missing row
+        p = self.project(task_id=ids["tasks"][1])
+        doc, = p["authority"]["documents"]
+        self.assertEqual(doc["superseded_by"], 9999)
+        self.assertIsNone(doc["current_document_id"])
+        self.assertIsNone(doc["current_title"])
+        self.assertNotIn(wall, p["boundaries"]["walls"])
+        self.assertIn(unresolved.format(9999), p["boundaries"]["walls"])
+        self.assertIn(f"  doc #{ids['doc']} Spec — retired · retired → #9999 (unresolved)\n",
+                      tc.render(p))
+
+        second = self.add_spec(ids, "Second spec")               # a loop ends the chain
+        self.retire(ids["doc"], second)
+        self.retire(second, ids["doc"])
+        p = self.project(task_id=ids["tasks"][1])
+        doc, = p["authority"]["documents"]
+        self.assertIsNone(doc["current_document_id"])
+        self.assertIn(unresolved.format(second), p["boundaries"]["walls"])
+        self.assertIn(f" · retired → #{second} (unresolved)\n", tc.render(p))
+
+    def test_chain_resolution_is_bounded_like_the_api(self):
+        ids = seed_feature(self.con)
+        chain = [self.add_spec(ids, f"Spec {n}") for n in range(1, 12)]
+        self.retire(ids["doc"], chain[0])
+        for here, after in zip(chain[:9], chain[1:10]):          # 9 retired, the 10th current
+            self.retire(here, after)
+        doc, = self.project(task_id=ids["tasks"][1])["authority"]["documents"]
+        self.assertEqual((doc["current_document_id"], doc["current_title"]),
+                         (chain[9], "Spec 10"))
+        self.assertEqual(
+            server.document_retirement_view(self.con)[ids["doc"]]["current_document_id"],
+            chain[9])
+
+        self.retire(chain[9], chain[10])                         # one hop past the bound
+        p = self.project(task_id=ids["tasks"][1])
+        doc, = p["authority"]["documents"]
+        self.assertIsNone(doc["current_document_id"])
+        self.assertIsNone(
+            server.document_retirement_view(self.con)[ids["doc"]]["current_document_id"])
+        self.assertIn(f" · retired → #{chain[0]} (unresolved)\n", tc.render(p))
+
+    def test_work_unit_keeps_the_bound_revision_beside_retirement(self):
+        ids = seed_feature(self.con)
+        sp = seed_sprint(self.con, ids)
+        second = self.add_spec(ids, "Second spec")
+        self.retire(ids["doc"], second)
+        p = self.project(work_unit_id=sp["unit"])
+        doc, = p["authority"]["documents"]
+        self.assertEqual(doc["revision"], "immutable Sprint revision")
+        self.assertEqual(doc["sha256"], sp["revision"])
+        self.assertTrue(doc["retired"])
+        self.assertEqual((doc["current_document_id"], doc["current_title"]),
+                         (second, "Second spec"))
+        self.assertIn(f"immutable Sprint revision · generation 2 · retired → #{second} Second spec",
+                      tc.render(p))
+        self.retire(second, ids["doc"])                          # unresolved: suffix, no wall
+        p = self.project(work_unit_id=sp["unit"])
+        self.assertIn(f" · generation 2 · retired → #{second} (unresolved)\n", tc.render(p))
+        self.assertFalse(any("retired" in w for w in p["boundaries"]["walls"]))
+
+    def test_pre_0268_database_reads_every_document_as_current(self):
+        ids = seed_feature(self.con)
+        sp = seed_sprint(self.con, ids)
+        before = self.project(task_id=ids["tasks"][1])
+        unit_before = self.project(work_unit_id=sp["unit"])
+        self.con.execute("PRAGMA foreign_keys=OFF")
+        for column in ("retired", "retired_date", "superseded_by"):
+            self.con.execute(f"ALTER TABLE documents DROP COLUMN {column}")
+        self.con.commit()
+        self.assertEqual(self.project(task_id=ids["tasks"][1]), before)
+        self.assertEqual(self.project(work_unit_id=sp["unit"]), unit_before)
+        doc, = unit_before["authority"]["documents"]
+        self.assertEqual((doc["retired"], doc["retired_date"], doc["superseded_by"],
+                          doc["current_document_id"], doc["current_title"]),
+                         (False, None, None, None, None))
+
+    # ── boundaries: an inherited worktree must belong to this repo ───────
+    def test_foreign_worktree_and_its_branch_are_omitted(self):
+        ids = seed_feature(self.con, decisions=False, flags=False)
+        with tempfile.TemporaryDirectory() as other:
+            foreign = {"worktree": f"{other}/.sc-worktrees/dev1", "seat": "host",
+                       "branch": "feat/other-install"}
+            p = self.project(task_id=ids["tasks"][1], runtime=foreign)
+        bo = p["boundaries"]
+        # omitted, then the engine's own rule — never the foreign path
+        self.assertEqual(bo["locations"]["worktree"], f"{self.root}/.sc-worktrees/dev1")
+        self.assertIsNone(bo["git"]["branch"])
+        self.assertEqual(bo["seat"], "host")
+        self.assertNotIn("feat/other-install", tc.render(p))
+        lookalike = self.project(task_id=ids["tasks"][1], runtime={
+            "worktree": f"{self.root}-other/.sc-worktrees/dev1", "branch": "feat/z"})
+        self.assertIsNone(lookalike["boundaries"]["git"]["branch"])
+        unknown = self.project(task_id=ids["tasks"][1], repo_root=None, map_con=None,
+                               runtime={"worktree": self.worktree, "branch": "feat/z"})
+        self.assertIsNone(unknown["boundaries"]["locations"]["worktree"])
+        self.assertIsNone(unknown["boundaries"]["git"]["branch"])
+
+    def test_worktree_inside_this_repo_is_reported(self):
+        ids = seed_feature(self.con, decisions=False, flags=False)
+        for path in (self.worktree, str(self.root), f"{self.root}/.claude/worktrees/agent-1"):
+            bo = self.project(task_id=ids["tasks"][1], runtime={
+                "worktree": path, "seat": "host", "branch": "feat/mine"})["boundaries"]
+            self.assertEqual(bo["locations"]["worktree"], path)
+            self.assertEqual(bo["git"]["branch"], "feat/mine")
 
     # ── boundaries: absent facts stay absent ─────────────────────────────
     def test_unavailable_boundary_data_is_absent_not_invented(self):
@@ -578,12 +757,14 @@ class ApiRouteTest(unittest.TestCase):
         tid = self.ids["tasks"][1]
         for token in (DEV_TOKEN, REV_TOKEN, PLN_TOKEN, OTHER_TOKEN):
             status, body = self.request(
-                f"/_sc/context?task={tid}&worktree=/w/x&seat=container&branch=feat/y",
+                f"/_sc/context?task={tid}&worktree={self.root}/.sc-worktrees/x"
+                "&seat=container&branch=feat/y",
                 token=token)
             self.assertEqual(status, 200, body)
             self.assertEqual(tuple(body), tc.SECTIONS)
             self.assertEqual(body["boundaries"]["locations"],
-                             {"worktree": "/w/x", "repo_root": str(self.root),
+                             {"worktree": f"{self.root}/.sc-worktrees/x",
+                              "repo_root": str(self.root),
                               "shared": f"{self.root}/shared"})
             self.assertEqual(body["boundaries"]["seat"], "container")
             self.assertEqual(body["boundaries"]["git"]["branch"], "feat/y")
