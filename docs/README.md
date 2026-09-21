@@ -495,7 +495,9 @@ prints the two terminal commands instead.
 ### Headless model routing
 
 `flavor_defaults` and the picker cover interactive boots. Generic headless
-launches have no picker, so resolve the exact local route before automation:
+launches have no picker, so resolve the exact local route before automation.
+On a sandbox install the container must be running (`./sc launch`): `refresh`
+and `resolve` run inside it, against the harness CLIs shells actually launch:
 
 ```bash
 ./sc models refresh
@@ -822,8 +824,10 @@ builds, and benchmarks that would otherwise die with the harness process.
 `./sc run` renders the same shell identity and skills as an interactive boot,
 executes one non-interactive harness turn, records its archive, and exits.
 Model resolution is exact: unsupported aliases, headless adapters, or effort
-levels fail before launch. The caller owns the task contract and any follow-up
-message; the launcher does not invent workflow or merge authority.
+levels fail before launch. On a sandbox install `refresh` and `resolve` run
+inside the running container, so `./sc launch` comes first. The caller owns the
+task contract and any follow-up message; the launcher does not invent workflow
+or merge authority.
 
 ## Update a fork
 
