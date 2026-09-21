@@ -65,6 +65,40 @@ def with_banner(body: str, extra: list[str] | None = None) -> str:
     return "\n".join(["---", *keys, "---", "", body])
 
 
+def retirement_note(row, successor) -> str | None:
+    """One generated banner line for a retired document, or None.
+
+    Names the retirement date and, when there is a successor, its title and
+    render path so a reader who landed here from an old link can walk to the
+    current document. Generated at render time from the retirement columns —
+    the DB body is never touched.
+    """
+    if not row["retired"]:
+        return None
+    when = row["retired_date"] or "date unknown"
+    if row["superseded_by"] is None:
+        return f"> **Retired {when}** — withdrawn, no successor."
+    if successor is None:
+        # The pointer outlived its target: say what it points at rather than
+        # failing the render.
+        return (f"> **Retired {when}** — superseded by document "
+                f"#{row['superseded_by']}.")
+    title, rel = successor
+    return (f"> **Retired {when}** — superseded by "
+            f"\"{title or 'untitled'}\" ({rel}).")
+
+
+def with_retirement_note(text: str, note: str) -> str:
+    """Splice one generated line in directly under the frontmatter block."""
+    lines = text.split("\n")
+    if lines and lines[0].strip() == "---":
+        for index in range(1, len(lines)):
+            if lines[index].strip() == "---":
+                return "\n".join(
+                    [*lines[:index + 1], "", note, *lines[index + 1:]])
+    return "\n".join([note, "", *lines])
+
+
 # ── Incremental writer ──────────────────────────────────────────────────────
 
 def _write_if_changed(path: Path, content: str, written: list, skipped: list) -> None:
@@ -138,13 +172,22 @@ def _render_documents(con, written, skipped, root: Path) -> None:
     """
     rows = con.execute(
         "SELECT d.document_id, d.feature_id, d.kind, d.seq, d.title, d.body, d.render_path, "
-        "d.frozen, r.roadmap_status, r.title AS feature_title FROM documents d "
+        "d.frozen, d.retired, d.retired_date, d.superseded_by, "
+        "r.roadmap_status, r.title AS feature_title FROM documents d "
         "LEFT JOIN roadmap r ON r.feature_id = d.feature_id "
         "ORDER BY d.feature_id, d.kind, d.seq"
     ).fetchall()
     issues = document_render_issues(con)
     if issues:
         raise ValueError(issues[0])
+
+    # Successor title + render path, for the retirement banner. Built from the
+    # same row set so a pointer at a row that no longer exists degrades to the
+    # bare id instead of failing the render.
+    successors = {
+        row["document_id"]: (row["title"], document_rel_path(row))
+        for row in rows
+    }
 
     expected: set[Path] = set()
     for r in rows:
@@ -160,7 +203,11 @@ def _render_documents(con, written, skipped, root: Path) -> None:
             f"roadmap_status: {r['roadmap_status'] or ''}",
             f"frozen: {'true' if r['frozen'] else 'false'}",
         ]
-        _write_if_changed(target, with_banner(r["body"], extra), written, skipped)
+        content = with_banner(r["body"], extra)
+        note = retirement_note(r, successors.get(r["superseded_by"]))
+        if note:
+            content = with_retirement_note(content, note)
+        _write_if_changed(target, content, written, skipped)
 
     for dirname in ("specs_sc", "docs_sc"):
         managed_root = root / dirname
