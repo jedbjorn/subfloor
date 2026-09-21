@@ -21,6 +21,7 @@ import contextlib
 import importlib.util
 import io
 import json
+import os
 import sqlite3
 import sys
 import tempfile
@@ -1752,11 +1753,62 @@ class RouteCliConnectionTest(unittest.TestCase):
         payload = {"stale": False, "sources": ["test-source"]}
         with (
             mock.patch.object(routes_cli.mem, "SC_API_TOKEN", ""),
+            mock.patch.object(routes_cli.runtime, "read_mode", return_value="host"),
             mock.patch.object(routes_cli, "_open_db", return_value=con) as opened,
             mock.patch.object(routes_cli.model_catalog, "catalog", return_value=payload),
         ):
             self.assertEqual(routes_cli.main(["refresh"]), 0)
         opened.assert_called_once_with()
+
+    def test_host_seat_refresh_records_nothing_for_a_sandbox_install(self):
+        """Host CLI versions are not what a sandbox install's shells run;
+        recording them makes the next launch reject the evidence as stale."""
+        with (
+            mock.patch.object(routes_cli.mem, "SC_API_TOKEN", ""),
+            mock.patch.object(routes_cli.runtime, "read_mode", return_value="sandbox"),
+            mock.patch.dict(os.environ, {"SC_SANDBOX": ""}),
+            mock.patch.object(
+                routes_cli, "_open_db", side_effect=AssertionError("opened DB")
+            ),
+            mock.patch.object(
+                routes_cli.model_catalog, "catalog",
+                side_effect=AssertionError("probed the host"),
+            ),
+        ):
+            with self.assertRaises(SystemExit) as refused:
+                routes_cli.main(["refresh"])
+        self.assertIn("./sc models refresh", str(refused.exception.code))
+        self.assertIn("not recorded", str(refused.exception.code))
+
+    def test_sandbox_seat_refresh_records_for_a_sandbox_install(self):
+        con = mock.Mock()
+        payload = {"stale": False, "sources": ["test-source"]}
+        with (
+            mock.patch.object(routes_cli.mem, "SC_API_TOKEN", ""),
+            mock.patch.object(routes_cli.runtime, "read_mode", return_value="sandbox"),
+            mock.patch.dict(os.environ, {"SC_SANDBOX": "1"}),
+            mock.patch.object(routes_cli, "_open_db", return_value=con),
+            mock.patch.object(
+                routes_cli.model_catalog, "catalog", return_value=payload
+            ) as catalog,
+        ):
+            self.assertEqual(routes_cli.main(["refresh"]), 0)
+        catalog.assert_called_once_with(refresh=True, con=con)
+
+    def test_host_install_refresh_ignores_the_seat(self):
+        con = mock.Mock()
+        payload = {"stale": False, "sources": ["test-source"]}
+        with (
+            mock.patch.object(routes_cli.mem, "SC_API_TOKEN", ""),
+            mock.patch.object(routes_cli.runtime, "read_mode", return_value="host"),
+            mock.patch.dict(os.environ, {"SC_SANDBOX": ""}),
+            mock.patch.object(routes_cli, "_open_db", return_value=con),
+            mock.patch.object(
+                routes_cli.model_catalog, "catalog", return_value=payload
+            ) as catalog,
+        ):
+            self.assertEqual(routes_cli.main(["refresh"]), 0)
+        catalog.assert_called_once_with(refresh=True, con=con)
 
     def test_authenticated_refresh_uses_api_without_opening_database(self):
         payload = {"stale": False, "sources": ["test-source"]}

@@ -22,6 +22,7 @@ import route_bindings  # noqa: E402
 import db_driver  # noqa: E402
 import instance_state  # noqa: E402
 import mem  # noqa: E402
+import runtime  # noqa: E402
 
 
 def _open_db():
@@ -56,6 +57,25 @@ def _api_routes(*, harness: str | None = None,
     return _api_route_projection(harness=harness, selector=selector).get(
         "routes"
     ) or []
+
+
+def _require_launch_seat() -> None:
+    """Refresh records this process's harness versions as route evidence.
+
+    Launch binds that evidence to the runtime that executes the route, so a
+    host seat on a sandbox install would record versions no shell runs and the
+    next launch rejects them as stale. `./sc models refresh` execs into the
+    sandbox; this refuses the seats that bypass it and records nothing.
+    """
+    if runtime.read_mode() != runtime.SANDBOX:
+        return
+    if model_catalog.harness_versions.runtime_scope()["runtime"] == "sandbox":
+        return
+    raise SystemExit(
+        "models: this install runs shells in the sandbox — refresh from that "
+        "runtime (`./sc models refresh` with the sandbox running, or Shells → "
+        "Default Models → Refresh); host harness versions were not recorded"
+    )
 
 
 def _refresh(payload: dict) -> int:
@@ -312,6 +332,8 @@ def main(argv: list[str] | None = None) -> int:
         )
         return _print_resolved(data, as_json)
 
+    if command == "refresh":
+        _require_launch_seat()
     con = _open_db()
     try:
         if args[0] == "refresh":
