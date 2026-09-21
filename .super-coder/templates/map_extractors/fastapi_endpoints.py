@@ -5,8 +5,10 @@ Covers FastAPI (`@app.get("/x")`, `@router.post("/x")`) and Flask-style
 computed methods, or registered via `add_api_route()` / `add_url_rule()` are NOT
 caught — by design (most, not 100%).
 
-Adopt by copying into `.sc-state/map_extractors/`; change FRAMEWORK / the file
-filter if your routers live somewhere specific.
+Adopt by authoring the adapted source at `.sc-state/map_extractors/<name>.py` in
+the Cartographer's assigned worktree, then installing it with
+`sc map-extractor install` — never by copying into another checkout. Change
+FRAMEWORK / the file filter if your routers live somewhere specific.
 """
 import re
 
