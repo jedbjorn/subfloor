@@ -66,7 +66,7 @@ NEVER auto-delete: a `merged: null` branch, an `is_base` branch (`main` or any `
 Any other shell's worktree: `is_main: false` + `dirty > 0`.
 
 1. **Liveness gate.** Committing files is non-destructive, but re-branching a worktree under a mid-session shell stomps that live session. Read the `shell_liveness` verdict:
-   - `safe_to_clean_all: true` -> every worktree dormant -> act on all.
+   - `safe_to_clean_all: true` -> admin presence confirmed, every other worktree dormant, nothing indeterminate -> act on all.
    - shortname in `active_other_shells` -> that shell is LIVE -> surface only, do NOT touch its tree. The others remain safe.
    - `indeterminate > 0` -> a harness process whose cwd was unreadable (another OS user, say) -> do NOT assume all-clear -> surface.
 2. **Attribution.** The commit carries THAT shell's trailer, never the admin's. Read the display name for `shell/<shortname>` from `sc mem get shells`, then export the identity on the commit so the tracked `prepare-commit-msg` hook writes the trailer for you:

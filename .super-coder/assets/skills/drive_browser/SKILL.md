@@ -32,9 +32,11 @@ tabs you opened unless directed to leave them. Report the result, tab group,
 the session path returned by Playwright, and anything left open.
 
 `extension not connected` means the extension is unavailable or the connection
-is unapproved; it does not prove the profile window is closed. Report and stop; never retry in a loop. A timed-out
-action has an unknown outcome: inspect only after a new directive to resume,
-rather than replaying a mutation. `disarmed` requires the FnB to arm it.
+is unapproved; it does not prove the profile window is closed. Report and stop; never retry in a loop. The proxy
+sets no action deadline — it waits for Playwright's own action or navigation
+result and keeps the approved session alive, so a slow action is still running:
+wait for its result rather than replaying it. Confirmed transport loss ends the
+connection and is reported as such. `disarmed` requires the FnB to arm it.
 
 Admin diagnosis/repair stays under the operator's named assignment. The FnB's
 host terminal can run `sc browser setup --json` to detect and link the existing

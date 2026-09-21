@@ -38,7 +38,7 @@ device-side enforcement is deferred, not a gap you are free to use.
 
 The broker accepts a command on a `readonly_hosts` entry only when its first
 tokens match this table, the string contains none of `; & | > < $ \` ( )` or a
-newline, and `sudo` appears nowhere. The table lives as data in `ts.py`
+newline or carriage return, and `sudo` appears nowhere. The table lives as data in `ts.py`
 (`READONLY_COMMANDS`); trailing operands select a unit, container, or file.
 
 | Verb | Permitted forms |

@@ -16,6 +16,7 @@ RESEED = ENGINE / "migrations" / "0252_reseed_universal_pr_owner_wakes.sql"
 LATER_RESEED = ENGINE / "migrations" / "0255_reseed_merge_gate_one_rule.sql"
 RECONCILIATION = ENGINE / "migrations" / "0257_guidance_reconciliation.sql"
 CLOSEOUT_SCOPE = ENGINE / "migrations" / "0260_reseed_sprint_closeout_scope.sql"
+DOCS_PASS = ENGINE / "migrations" / "0267_reseed_docs_pass_skills.sql"
 
 sys.path.insert(0, str(ENGINE / "scripts"))
 import seed_skills  # noqa: E402
@@ -95,6 +96,11 @@ class GitSyncPolicyTest(unittest.TestCase):
             closeout = CLOSEOUT_SCOPE.read_text()
             con.executescript(closeout)
             con.executescript(closeout)
+            # 0267 re-owns it last, completing the gitignored-artifact list;
+            # compare after the whole chain has replayed.
+            docs_pass = DOCS_PASS.read_text()
+            con.executescript(docs_pass)
+            con.executescript(docs_pass)
 
             parsed = seed_skills.parse_skill(ASSET)
             actual = con.execute(

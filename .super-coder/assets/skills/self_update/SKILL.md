@@ -66,9 +66,12 @@ new code on the old schema, so rollback restores both:
 
 1. backs up the current (post-bad-update) DB first — rollback is itself
    reversible;
-2. restores the DB from the most recent pre-update backup in
-   `~/db_backups/<repo-name>/` (keyed by this fork's repo dir name — distinct
-   from any `db_backups/` dir the fork's app keeps at its repo root);
+2. restores the DB from the most recent pre-update backup in the resolved
+   backup directory — ordered and fail-closed: `$SC_DB_BACKUP_DIR` when set and
+   writable, else `~/db_backups/<repo-name>/` (keyed by this fork's repo dir
+   name — distinct from any `db_backups/` dir the fork's app keeps at its repo
+   root), else the gitignored repo-local `.sc-state/db_backups/`. The five most
+   recent backups are kept;
 3. re-materializes the engine at `.sc-state/engine.ref.prev` + restores
    `engine.ref`.
 
