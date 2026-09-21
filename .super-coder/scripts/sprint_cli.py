@@ -787,7 +787,10 @@ def build_parser() -> argparse.ArgumentParser:
     dispatch.add_argument("--sprint", type=int, required=True)
     dispatch.set_defaults(fn=cmd_dispatch)
 
-    monitor = sub.add_parser("monitor", help="Planner evaluates due liveness evidence")
+    monitor = sub.add_parser(
+        "monitor",
+        help="Reconcile unread pickup once, then read pickup/runtime/health",
+    )
     monitor.add_argument("--sprint", type=int, required=True)
     monitor.set_defaults(fn=cmd_monitor)
 

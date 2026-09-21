@@ -2794,8 +2794,11 @@ class SprintLiveProof(unittest.TestCase):
     def test_adversarial_acceptance_manifest_references_real_gates(self) -> None:
         manifest = json.loads(ACCEPTANCE.read_text())
         self.assertEqual(46, manifest["spec_document_id"])
-        self.assertEqual(18, len(manifest["scenarios"]))
+        self.assertEqual(14, len(manifest["scenarios"]))
         self.assertEqual(6, len(manifest["invariant_sweep"]))
+        # Four liveness scenarios were retired with the evaluator itself
+        # (decisions #126/#127/#130); they are recorded, not referenced.
+        self.assertEqual(4, len(manifest["retired_scenarios"]))
         entries = manifest["scenarios"] + manifest["invariant_sweep"]
         identities = {(entry["file"], entry["test"]) for entry in entries}
         self.assertEqual(len(entries), len(identities))

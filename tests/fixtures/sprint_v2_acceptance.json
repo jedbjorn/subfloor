@@ -37,26 +37,6 @@
       "test": "test_paused_change_is_observed_immediately_and_deduplicated"
     },
     {
-      "scenario": "Quota exhaustion after acceptance escalates immediately",
-      "file": "tests/test_sprint_liveness.py",
-      "test": "test_fresh_exhausted_worker_quota_escalates_on_first_evaluation"
-    },
-    {
-      "scenario": "Healthy long-running process permits one nudge without escalation",
-      "file": "tests/test_sprint_liveness.py",
-      "test": "test_supporting_process_health_allows_one_nudge_but_defers_escalation"
-    },
-    {
-      "scenario": "Continued silence after a nudge emits exactly one Planner escalation",
-      "file": "tests/test_sprint_liveness.py",
-      "test": "test_grace_nudge_escalation_and_restart_dedup"
-    },
-    {
-      "scenario": "Missing process or expired lease escalates as proven failure",
-      "file": "tests/test_sprint_liveness.py",
-      "test": "test_proven_failure_escalates_immediately_without_nudging_worker"
-    },
-    {
       "scenario": "Pause during an active Developer turn persists interrupt intent",
       "file": "tests/test_sprint_recovery.py",
       "test": "test_participant_pause_atomically_persists_report_interrupt_and_notice"
@@ -122,6 +102,28 @@
       "invariant": "closed without merge resolves review liveness",
       "file": "tests/test_sprint_recovery.py",
       "test": "test_closed_without_merge_resolves_every_review_expectation"
+    }
+  ],
+  "retired_scenarios": [
+    {
+      "scenario": "Quota exhaustion after acceptance escalates immediately",
+      "retired_by": "decisions #126/#127/#130",
+      "note": "Liveness nudges, Planner escalation and the waking stuck-CI backstop were retired; the evaluator and its gate were deleted."
+    },
+    {
+      "scenario": "Healthy long-running process permits one nudge without escalation",
+      "retired_by": "decisions #126/#127/#130",
+      "note": "Liveness nudges, Planner escalation and the waking stuck-CI backstop were retired; the evaluator and its gate were deleted."
+    },
+    {
+      "scenario": "Continued silence after a nudge emits exactly one Planner escalation",
+      "retired_by": "decisions #126/#127/#130",
+      "note": "Liveness nudges, Planner escalation and the waking stuck-CI backstop were retired; the evaluator and its gate were deleted."
+    },
+    {
+      "scenario": "Missing process or expired lease escalates as proven failure",
+      "retired_by": "decisions #126/#127/#130",
+      "note": "Liveness nudges, Planner escalation and the waking stuck-CI backstop were retired; the evaluator and its gate were deleted."
     }
   ]
 }
