@@ -186,11 +186,16 @@ class SprintLivenessCase(unittest.TestCase):
         """Decisions #126/#127/#130 retired nudges, escalation and the backstop."""
         for retired in (
             "evaluate",
+            "_apply",
             "_escalate",
             "_send_ci_stalled_backstops",
             "_send_ci_stalled_backstop",
             "_record_strong_evidence",
             "_update_observation",
+            "_receiver_has_pending_force_new",
+            "_fresh_strong",
+            "_armed",
+            "_event",
         ):
             with self.subTest(attribute=retired):
                 self.assertFalse(
@@ -199,11 +204,19 @@ class SprintLivenessCase(unittest.TestCase):
         for retired in (
             "SprintEvidenceCollector",
             "PlannerEscalationRouter",
+            "Evidence",
+            "EvidenceSnapshot",
             "EvaluationOutcome",
+            "QuotaState",
             "GRACE_WINDOW",
             "ESCALATION_WINDOW",
             "EVALUATION_INTERVAL",
             "CI_STALLED_BACKSTOP",
+            "_NATIVE_EVIDENCE_EVENTS",
+            "_PROVIDER_ALIASES",
+            "_parse",
+            "_json",
+            "_provider",
         ):
             with self.subTest(attribute=retired):
                 self.assertFalse(hasattr(sprint_liveness, retired))
@@ -317,7 +330,7 @@ class DeliveryAndActivationTest(SprintLivenessCase):
         self.assertIsNone(former["resolution"])
         self.assertIsNotNone(former["next_evaluation_at"])
 
-    def test_in_review_resolves_assignment_before_liveness_nudge(self) -> None:
+    def test_in_review_resolves_assignment_expectation(self) -> None:
         self.con.execute(
             "UPDATE sprint_work_units SET disposition='in_review',"
             "updated_at=datetime('now') WHERE work_unit_id=?",

@@ -1,9 +1,13 @@
-"""Durable Sprint work expectations and their resolution.
+"""Resolution of historical Sprint work expectations.
 
-A database trigger creates one expectation row the moment an actionable Sprint
-message is read and accepted.  This module resolves those rows when the work
-they cover reaches a terminal state — a review verdict, a superseded request, a
-closed or grant-bypassed merged PR, a recalled or retired lane.
+Nothing creates an expectation any more.  Migration 0149 added a trigger that
+wrote one row per accepted actionable Sprint message; migration 0193 dropped
+it, and no migration or code path inserts into sprint_liveness_expectations
+now.  This module resolves the rows an install still holds from before 0193
+when the work they cover reaches a terminal state — a review verdict, a
+superseded request, a closed or grant-bypassed merged PR, a recalled or
+retired lane.  On a database created after 0193 the table has no writer and
+these calls are no-ops.
 
 There is no automatic evaluation half.  Decisions #126, #127 and #130 retired
 the liveness nudge, the Planner escalation and the waking ninety-minute

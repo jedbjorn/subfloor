@@ -105,17 +105,25 @@ observation, whose pause receipts are signalled after the commit.
 
 ## Liveness expectations (`scripts/sprint_liveness.py`)
 
-An expectation row is created by a database trigger the moment an actionable
-Sprint message is read and accepted (migration 0149). The module around those
-rows does one thing: it resolves them.
+**Nothing creates an expectation any more.** Migration 0149 added a trigger,
+`trg_sprint_liveness_acceptance`, that wrote one row the moment an actionable
+Sprint message was read and accepted. Migration
+`0193_retire_sprint_liveness_acceptance.sql` dropped it, no later migration
+recreates it, and nothing in `scripts/` or `api/` inserts into
+`sprint_liveness_expectations`. Accepting Sprint work creates no expectation,
+and a database built from `schema.sql` plus every migration carries the table
+with no writer at all.
 
-**Resolution is all that remains.** The watcher holds a
+**Resolution is all that remains, and only over history.** The watcher holds a
 `SprintLivenessMonitor` and resolves a lane's live review expectations on the
 `closed` and grant-bypassed `merged` transitions above; the review loop, the
-message store and the Sprint domain use the same entry points
-(`resolve`, `resolve_in_transaction`,
-`resolve_review_requests_for_work_unit_in_transaction`). That is what keeps a
-finished lane from carrying a stale expectation.
+message store and the Sprint domain call the same in-transaction entry points
+(`resolve_in_transaction`,
+`resolve_review_requests_for_work_unit_in_transaction`; `resolve` is a
+standalone-transaction wrapper around the first, which no caller currently
+uses). Those paths can only act on pre-0193 rows that an install still holds —
+they keep a finished lane from carrying a stale historical expectation, and do
+nothing at all on a database created after 0193.
 
 **There is no evaluation half.** Decisions #126, #127 and #130 retired the
 evaluator, and this delivery deleted its code: no liveness nudge, no Planner
@@ -193,6 +201,5 @@ the message goes to the subscription owner and nobody else.
   than an error anyone is told about directly.
 - **`./sc sprint monitor` does not evaluate liveness.** It reconciles unread
   wake pickup once and returns the pickup, runtime and health projections with
-  an empty `outcomes` list; its `--help` line still describes the retired
-  evaluation behavior. Nothing else evaluates liveness either — see the
+  an empty `outcomes` list. Nothing else evaluates liveness either — see the
   liveness section above.
