@@ -64,14 +64,19 @@ you.
 exists because new code expects the new schema — restoring only the DB strands
 new code on the old schema, so rollback restores both:
 
-1. backs up the current (post-bad-update) DB first — rollback is itself
-   reversible;
-2. restores the DB from the most recent pre-update backup in the resolved
-   backup directory — ordered and fail-closed: `$SC_DB_BACKUP_DIR` when set and
-   writable, else `~/db_backups/<repo-name>/` (keyed by this fork's repo dir
-   name — distinct from any `db_backups/` dir the fork's app keeps at its repo
-   root), else the gitignored repo-local `.sc-state/db_backups/`. The five most
-   recent backups are kept;
+1. backs up the current (post-bad-update) DB first, under its own
+   `prerollback` prefix so it is never mistaken for a pre-update restore point
+   — rollback is itself reversible. Where that copy is *written* is an ordered,
+   fail-closed choice: `$SC_DB_BACKUP_DIR` when set and writable, else
+   `~/db_backups/<repo-name>/` (keyed by this fork's repo dir name — distinct
+   from any `db_backups/` dir the fork's app keeps at its repo root), else the
+   gitignored repo-local `.sc-state/db_backups/`. Pruning keeps the five newest
+   backups per lifecycle prefix per directory, so classes never evict each
+   other;
+2. restores the DB from the newest pre-update backup found across *every*
+   candidate directory, not just the currently writable one — the writable
+   destination can change between update and rollback, and discovery must not
+   hide a restore point behind it;
 3. re-materializes the engine at `.sc-state/engine.ref.prev` + restores
    `engine.ref`.
 

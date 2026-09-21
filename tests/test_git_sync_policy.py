@@ -91,8 +91,8 @@ class GitSyncPolicyTest(unittest.TestCase):
             final = RECONCILIATION.read_text()
             con.executescript(final)
             con.executescript(final)
-            # 0260 re-owns it last, dropping the retired Sprint-cleanup
-            # exception; compare after the whole chain has replayed.
+            # 0260 re-owns it next, dropping the retired Sprint-cleanup
+            # exception.
             closeout = CLOSEOUT_SCOPE.read_text()
             con.executescript(closeout)
             con.executescript(closeout)

@@ -70,11 +70,11 @@ refuses one answers `snapshot_live_unsupported`), `snapshot delete <name>` (the
 configured baseline is refused; redefine it with `bake` instead), `bake [<name>]`
 (graceful shutdown, then a replace-not-stack offline snapshot that becomes the
 baseline; `./sc vm-bake` is the host-direct escape hatch that runs the same
-operation against libvirt in-process with no broker in the path — use `vm bake`
-normally and `vm-bake` only when the broker is down), and
-`reset [<name>] --off|--running` for a
-named snapshot. Exactly one of `--off` and `--running` is required on every
-reset. `push` sources and `pull` destinations must sit inside the repo or
+operation against libvirt in-process with no broker in the path — host-only,
+never in the sandbox, and only when the broker is down; `vm bake` is the
+normal route), and `reset [<name>] --off|--running` for a named snapshot.
+Exactly one of `--off` and `--running` is required on every reset.
+`push` sources and `pull` destinations must sit inside the repo or
 `.sc-state/local/`, and never inside `.sc-state/local/vm/` (the host's key and
 host-key pin live there); a pull destination inside `.super-coder/` or `.git/`
 is refused too. Add `--json` to any verb for one result object.

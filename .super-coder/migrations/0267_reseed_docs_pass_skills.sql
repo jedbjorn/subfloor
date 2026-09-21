@@ -2,11 +2,16 @@
 -- drive_browser: the proxy no longer sets an action deadline (PR #1624), so the
 --   stop-and-escalate rule for a timed-out action taught a condition the proxy
 --   cannot produce; it now says to wait for Playwright's own result.
--- self_update: the pre-update backup directory is an ordered, fail-closed
---   selection ($SC_DB_BACKUP_DIR, else ~/db_backups/<repo>, else the
---   repo-local .sc-state/db_backups), keeping the five most recent backups.
--- remote_seats: `./sc vm-bake` is the host-direct escape hatch with no broker
---   in the path, not an alias for the brokered `vm bake`.
+-- self_update: rollback's write and restore paths are distinct. The backup of
+--   the current DB is WRITTEN to an ordered, fail-closed destination
+--   ($SC_DB_BACKUP_DIR, else ~/db_backups/<repo>, else the repo-local
+--   .sc-state/db_backups) and pruned to the five newest per lifecycle prefix
+--   per directory; the restore point is DISCOVERED across every candidate
+--   directory, so a changed writable destination cannot hide it
+--   (db_backup.select_backup_dir vs db_backup.latest_backup).
+-- remote_seats: `./sc vm-bake` is the host-only, never-in-the-sandbox
+--   host-direct escape hatch with no broker in the path, not an alias for the
+--   brokered `vm bake`.
 -- tailscale_diagnostics: the forbidden-character set also holds a carriage
 --   return.
 -- git / git_cleanup: complete the gitignored-artifact list and state the real
@@ -49,11 +54,13 @@ tabs you opened unless directed to leave them. Report the result, tab group,
 the session path returned by Playwright, and anything left open.
 
 `extension not connected` means the extension is unavailable or the connection
-is unapproved; it does not prove the profile window is closed. Report and stop; never retry in a loop. The proxy
-sets no action deadline — it waits for Playwright''s own action or navigation
-result and keeps the approved session alive, so a slow action is still running:
-wait for its result rather than replaying it. Confirmed transport loss ends the
-connection and is reported as such. `disarmed` requires the FnB to arm it.
+is unapproved; it does not prove the profile window is closed. Report and stop;
+never retry in a loop. The proxy sets no action deadline — it waits for
+Playwright''s own action or navigation result and keeps the approved session
+alive, so a slow action is still running: wait for its result rather than
+replaying it. Actions are never retried, and overlapping requests on one
+session refuse rather than queue. Confirmed transport loss ends the connection
+and is reported as such. `disarmed` requires the FnB to arm it.
 
 Admin diagnosis/repair stays under the operator''s named assignment. The FnB''s
 host terminal can run `sc browser setup --json` to detect and link the existing
@@ -331,11 +338,11 @@ refuses one answers `snapshot_live_unsupported`), `snapshot delete <name>` (the
 configured baseline is refused; redefine it with `bake` instead), `bake [<name>]`
 (graceful shutdown, then a replace-not-stack offline snapshot that becomes the
 baseline; `./sc vm-bake` is the host-direct escape hatch that runs the same
-operation against libvirt in-process with no broker in the path — use `vm bake`
-normally and `vm-bake` only when the broker is down), and
-`reset [<name>] --off|--running` for a
-named snapshot. Exactly one of `--off` and `--running` is required on every
-reset. `push` sources and `pull` destinations must sit inside the repo or
+operation against libvirt in-process with no broker in the path — host-only,
+never in the sandbox, and only when the broker is down; `vm bake` is the
+normal route), and `reset [<name>] --off|--running` for a named snapshot.
+Exactly one of `--off` and `--running` is required on every reset.
+`push` sources and `pull` destinations must sit inside the repo or
 `.sc-state/local/`, and never inside `.sc-state/local/vm/` (the host''s key and
 host-key pin live there); a pull destination inside `.super-coder/` or `.git/`
 is refused too. Add `--json` to any verb for one result object.
@@ -467,14 +474,19 @@ you.
 exists because new code expects the new schema — restoring only the DB strands
 new code on the old schema, so rollback restores both:
 
-1. backs up the current (post-bad-update) DB first — rollback is itself
-   reversible;
-2. restores the DB from the most recent pre-update backup in the resolved
-   backup directory — ordered and fail-closed: `$SC_DB_BACKUP_DIR` when set and
-   writable, else `~/db_backups/<repo-name>/` (keyed by this fork''s repo dir
-   name — distinct from any `db_backups/` dir the fork''s app keeps at its repo
-   root), else the gitignored repo-local `.sc-state/db_backups/`. The five most
-   recent backups are kept;
+1. backs up the current (post-bad-update) DB first, under its own
+   `prerollback` prefix so it is never mistaken for a pre-update restore point
+   — rollback is itself reversible. Where that copy is *written* is an ordered,
+   fail-closed choice: `$SC_DB_BACKUP_DIR` when set and writable, else
+   `~/db_backups/<repo-name>/` (keyed by this fork''s repo dir name — distinct
+   from any `db_backups/` dir the fork''s app keeps at its repo root), else the
+   gitignored repo-local `.sc-state/db_backups/`. Pruning keeps the five newest
+   backups per lifecycle prefix per directory, so classes never evict each
+   other;
+2. restores the DB from the newest pre-update backup found across *every*
+   candidate directory, not just the currently writable one — the writable
+   destination can change between update and rollback, and discovery must not
+   hide a restore point behind it;
 3. re-materializes the engine at `.sc-state/engine.ref.prev` + restores
    `engine.ref`.
 
@@ -534,8 +546,9 @@ device-side enforcement is deferred, not a gap you are free to use.
 
 The broker accepts a command on a `readonly_hosts` entry only when its first
 tokens match this table, the string contains none of `; & | > < $ \` ( )` or a
-newline or carriage return, and `sudo` appears nowhere. The table lives as data in `ts.py`
-(`READONLY_COMMANDS`); trailing operands select a unit, container, or file.
+newline or carriage return, and `sudo` appears nowhere. The table lives as data
+in `ts.py` (`READONLY_COMMANDS`); trailing operands select a unit, container,
+or file.
 
 | Verb | Permitted forms |
 |---|---|
