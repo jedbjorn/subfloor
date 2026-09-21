@@ -113,8 +113,9 @@ edits. Saving locally writes the private snapshot and local renders, never a
 public Git snapshot. Browser authentication and API authority are described in
 [the interface trust boundary](docs/interface-trust-boundary.md).
 
-Focused runbooks under [`docs/`](docs/) cover harness freshness and the optional
-Windows VM, tailnet, PM2 and app-DB brokers. Their applicability labels separate
-current operation from architecture and historical migration procedures. The
+Focused runbooks under [`docs/`](docs/) cover harness freshness, engine
+integrity, opt-in browser driving, remote seats (host-owned VM and named
+remotes) and the optional tailnet, PM2 and app-DB brokers. Their applicability
+labels separate current operation from architecture reference. The
 [DeepSeek removal procedure](../docs/deepseek-harness-removal.md) retains its
 certified exact-ref checkpoints for Admin recovery.

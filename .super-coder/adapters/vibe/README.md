@@ -35,9 +35,12 @@ pre-tool hook later, wire it here to match the others.
 | field | meaning |
 |---|---|
 | `launch` | argv exec'd to start the harness (`vibe --trust`) |
+| `surfaces` | which lanes this harness may serve — `terminal` only; `one_shot`, `browser` and `sprint` are declared false and refused before launch setup |
 | `boot_artifact` | the context file this harness reads (`AGENTS.md`, informational) |
 | `emit` | files copied to the repo root at launch (none — vibe reads `~/.vibe` + `AGENTS.md`) |
 | `env` | extra env merged into the launch environment (none) |
+| `runtime_compatibility` | the version range `./sc harness-status` checks the installed `vibe` against. Vibe has no `conversation` block, so this is where its pin lives; the conversation harnesses carry the same keys inside `conversation`. |
+| `mcp.streamable_http` | `supported: false` — no managed streamable-HTTP MCP injection |
 | `sandbox.launch_flags` | flags appended ONLY inside the docker sandbox (`SC_SANDBOX`) |
 
 **`--trust` (base launch):** the launcher writes the `AGENTS.md` it wants Vibe to

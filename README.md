@@ -103,23 +103,7 @@ known nondefault roots (also supports `claude` and `opencode`). Start a fresh
 native conversation afterward; existing conversation context is retained.
 Old releases can recreate pointers, including after rollback.
 
-## Documentation
-
-| Start here | Purpose |
-|---|---|
-| [Quick start](docs/quick-start.md) | Installation through the first reviewed PR |
-| [User and operator guide](docs/README.md) | Everyday concepts, Sprints, browser conversations and lifecycle |
-| [Engine reference](.super-coder/README.md) | Source layout, private state, rendering and focused runbooks |
-| `sc help --all` and each verb's `--help` | Current command inventory and exact syntax |
-
-The guide is themed Markdown: read it on GitHub or
-[open its tabbed presentation](https://md-converter.designs-os.com/?url=https://github.com/jedbjorn/subfloor/blob/main/docs/README.md).
-
-## License
-
-[MIT](LICENSE) © 2026 jedbjorn.
-
-### Browser driving
+## Browser driving
 
 Opt in with `./sc feature enable browser`, then use **Scripts → Browser** to
 link a dedicated Chromium profile named **Subfloor** with the Playwright
@@ -135,3 +119,19 @@ setup readiness from an observed extension connection.
 services and removes the feature grants. See the
 [browser design and operator checklist](.super-coder/docs/browser-driving.md)
 for setup, boundaries, and the separate operator-run real-extension acceptance.
+
+## Documentation
+
+| Start here | Purpose |
+|---|---|
+| [Quick start](docs/quick-start.md) | Installation through the first reviewed PR |
+| [User and operator guide](docs/README.md) | Everyday concepts, Sprints, browser conversations and lifecycle |
+| [Engine reference](.super-coder/README.md) | Source layout, private state, rendering and focused runbooks |
+| `sc help --all` and each verb's `--help` | Current command inventory and exact syntax |
+
+The guide is themed Markdown: read it on GitHub or
+[open its tabbed presentation](https://md-converter.designs-os.com/?url=https://github.com/jedbjorn/subfloor/blob/main/docs/README.md).
+
+## License
+
+[MIT](LICENSE) © 2026 jedbjorn.

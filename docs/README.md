@@ -100,9 +100,13 @@ path. On macOS or Windows, use a Linux VM and prefer guest-owned storage.
 The default **sandbox** runtime requires a reachable Docker daemon.
 `./sc install --runtime host` selects a systemd-user-supervised host server and
 host shell processes instead. `./sc doctor` reports prerequisites and the selected runtime.
-Both runtimes use `subfloor launch`, `enter`, `down`, `restart`, `logs` and
-`update`. `subfloor admin` is the host maintenance entry. The host runtime
-provides no container boundary; choose it with that execution reach in mind.
+Both runtimes drive the same lifecycle verbs — `launch`, `enter`, `down`,
+`restart`, `logs`, `build`, `update-harnesses`, `harness-status`, `doctor` and
+`update` all follow the selection, and `./sc runtime [mode]` shows or changes it
+for the next launch. `subfloor admin` is the host maintenance entry. The host
+runtime supervises the review server as a transient systemd user service, so it
+requires a working systemd user manager; it provides no container boundary,
+so choose it with that execution reach in mind.
 
 ### Installer internals
 
@@ -308,7 +312,10 @@ merge directive is needed under the armed grant.
 
 Use the Planner and the Sprint controls to pause when scope, routes or failures
 need reconciliation. Pausing preserves history and work; it does not turn a
-failed check into a pass. Before resuming, reconcile active runs, assignments,
+failed check into a pass. The engine pauses on its own when one lane's PR has
+burned eight review rounds without approval: that lane is not converging, and
+the notice asks for your judgment — often a stronger coding model — rather than
+a ninth round. Before resuming, reconcile active runs, assignments,
 unread messages, PRs, capacity and any spec changes. The Planner applies
 Reviewer decisions and records operator overrides explicitly.
 
@@ -437,7 +444,7 @@ needed. They all work the same repo without clobbering each other:
   applying approved maintenance. Planner owns fork-local skills. The branch-guard exempts it
   (and only it). Working shells consume the substrate; admin owns the floor.
 - **Reviewing a shell's UI work:** worktree edits never show on your main dev
-  server. `./sc preview` serves every shell worktree's UI live (HMR) on the
+  server. `./sc preview` serves every dev shell's worktree UI live (HMR) on the
   fork's dev port, routed by subdomain — `http://<shortname>.localhost:<port>/`
   — and the post-commit hook prints the shell's URL after each commit.
 
@@ -456,9 +463,17 @@ are mutually exclusive: a CLI launch refuses while browser chat is open, and a
 browser conversation refuses while a CLI session owns the shell. **Close** is
 the explicit browser-to-CLI handoff.
 
+A shell held by a CLI session that has since disconnected is not a dead end.
+The engine holds a kernel lease for each `enter` session, so a departed client
+is detected rather than read as busy forever, and the refusal names each
+holding process and whether it is orphaned. The GUI shows that warning and,
+once you confirm nothing is running there, releases the holders and retries the
+create or send; the interactive boot prompt asks the same question instead of
+booting a second session beside the first.
+
 ### Chat lifecycle
 
-- **New chat** creates a distinct durable conversation and closes only an idle,
+- **＋ Chat** creates a distinct durable conversation and closes only an idle,
   waiting, or failed prior chat for that shell.
 - Messages submitted during an active turn remain ordered in the queue; they do
   not interrupt the running turn.
@@ -480,7 +495,17 @@ lease-expiry scans are bounded recovery, not scheduled work discovery.
 
 **Chat** renders user prompts, assistant output, durable activity, queue state,
 and recovery controls. Large histories load in bounded pages and transcript
-snapshots; omitted display history remains durable.
+snapshots; omitted display history remains durable. Rendered code blocks carry
+a copy-to-clipboard button.
+
+Images can be dropped onto the composer or pasted into it. The browser posts
+the raw bytes over the page's own origin, the API accepts only sniffed
+PNG/JPEG/GIF/WebP, stores the file content-addressed under
+`shared/chat-uploads/<conversation>/`, and the composer inserts
+`[image: <absolute path>]` into the message — so every harness reads it by
+path, with no adapter difference. Only images over the request cap are
+downscaled in the browser. Upload directories of closed or unknown
+conversations are swept on Close, on chat creation, and on each upload.
 
 **Diff** is a read-only projection of the same conversation's live worktree,
 branch, or pull request. Switching to Diff does not stop the run or open a
@@ -599,7 +624,10 @@ The update commit is another deliberate operator-owned commit on the protected
 default branch. Launched shells still create a feature branch first and are not
 given a bypass recipe.
 
-`./sc update` fetches the engine from the `super-coder` remote and
+`./sc update` first runs a `git pull --ff-only` for the tracked checkout itself
+— advisory, never blocking: an unsafe or offline pull warns and the engine
+update continues from the current tree, and update never merges, rebases or
+resets. It then fetches the engine from the `super-coder` remote and
 **materializes** it into the gitignored `.super-coder/` dir (the engine is a
 dependency — code, schema, migrations, skills; your `.sc-state/`, DB, and
 `instance.json` are preserved as instance-owned inputs), **pins** the new upstream SHA in
@@ -614,7 +642,8 @@ deliberately authored project changes. Generated snapshots and `_sc` renders
 remain ignored. Then restart the session to boot onto the new floor.
 
 - `./sc update --no-fetch` reconciles against the current working tree (offline /
-  dev) — engine + `engine.ref` unchanged. `--branch <name>` to track a non-`main`
+  dev) — engine + `engine.ref` unchanged, and the checkout pull is skipped too.
+  `--branch <name>` to track a non-`main`
   engine branch. `--ref <tag|sha>` pins the materialize to a specific upstream
   version instead of the branch head — hold a fork at a known-good engine and
   move deliberately.
@@ -680,6 +709,7 @@ lives in the [engine integrity runbook](../.super-coder/docs/engine-integrity.md
 
 ```bash
 ./sc rollback                   # restore the DB + engine together, then reboot
+./sc rollback --engine-only     # repair a new-engine / unchanged-state half floor
 ```
 
 `./sc rollback` is a **sound pair-restore**: because engine code is read live and
@@ -688,9 +718,35 @@ it backs up the current DB first (rollback is itself reversible), restores the D
 from the most recent pre-update backup, and re-materializes the engine at
 `.sc-state/engine.ref.prev`. Whole-restore, not a per-step schema reversal; the
 only data lost is anything written between the update and the rollback.
+`--engine-only` is the narrower repair for the half floor where the new engine
+is on disk but the control plane never moved: it re-materializes the engine at
+`engine.ref.prev` and leaves the DB alone, and refuses unless it can prove the
+DB still holds exactly the pre-update migration floor.
 
 > [!class4]
 > **The contract:** every schema change *after* a fork exists ships as a `migrations/NNNN_*.sql` file, never an edit to `schema.sql` — the migration ledger is what carries a delta across to an existing fork. Additive where you can make it.
+
+### Retire the make aliases (one-time)
+
+Before the `subfloor` command existed, install and every update wired a fork's
+Makefile to the engine's alias file — a one-line Makefile when the fork had
+none, otherwise an appended `-include .super-coder/aliases.mk` block. That alias
+file is retired and no longer materialized, but an update never deletes files
+the engine dropped upstream, so an updated fork keeps the include on disk until
+you clear it:
+
+```bash
+./sc make-cleanup --dry-run     # print the plan, change nothing
+./sc make-cleanup               # apply
+```
+
+It deletes the Makefile only when the file is byte-for-byte the installer's
+one-liner; otherwise it removes just the appended block or the include line and
+leaves the rest of your own Makefile intact, then deletes the materialized
+`.super-coder/aliases.mk`. Nothing else is touched, and a second run reports
+nothing to do. `./sc <cmd>` and `subfloor <cmd>` stay equivalent afterwards;
+`./sc alias` re-installs or refreshes the `subfloor` function itself
+(`--status` reports, `--remove` drops it).
 
 ### Host Admin and safe removal
 
@@ -792,7 +848,10 @@ for exact flags. This table is a route map, not a second full reference.
 | Control sandbox resources | `sandbox-memory`, `docker-cache-gc` | [Resources](#sandbox-resources) |
 | Run project checks | `deps`, `test`, `lint`, `typecheck`, `visual-qa` | [Dev kit](#dev-kit) |
 | Inspect project source | `map-schema`, `map-sql`, `preview` | [Worktrees](#shells--worktrees) |
-| Use configured infrastructure | `feature`, `vm`, `pg`, host broker families | [Opt-in features](#opt-in-features) |
+| Use configured infrastructure | `feature`, `browser`, `vm`, `remote`, `pg-init` · `pg-up` · `pg-down`, host broker families, `persist` | [Opt-in features](#opt-in-features) |
+| Curate skills and search | `skill`, `search` | [Customize a fork](#customize-a-fork-vs-diverge-from-it), [Web search](#web-search) |
+| Read spend and reach the GUI | `analytics`, `url`, `ports`, `token` | [Analytics](#token--session-analytics), [Review GUI](#review-gui) |
+| Manage the operator command | `alias`, `make-cleanup` | [Retire the make aliases](#retire-the-make-aliases-one-time) |
 
 General engine SQL, rebuild and private-state recovery belong to Admin.
 Ordinary shells use granted API surfaces. `sc context --task <id>` and
@@ -824,7 +883,12 @@ Boot reports `no fork dev kit declared` when the file is absent. An absent
 declaration or missing named hook returns exit `78` with no fallback; invalid
 policy exits `64`, an unavailable executable exits `126`, and a started child
 keeps its shell-observable status. `SC_DEVKIT_ROOT`, `SC_DEVKIT_SEAT`, and
-`SC_DEVKIT_HOOK` provide neutral context to the fork script. In Docker, a
+`SC_DEVKIT_HOOK` provide neutral context to the fork script. A hook's full
+output is written to a log under the ignored `.sc-state/local/devkit-logs/`,
+and the command prints a bounded envelope — the argv, cwd, exit status,
+duration, output size, log path and hook state, plus an excerpt — instead of
+the whole stream; `SC_DEVKIT_OUTPUT=full` restores the unbounded output, and
+the envelope names that recovery line itself. In Docker, a
 fork-owned dependency hook should treat an out-of-repo interpreter as a
 host-managed shared tree: verify it, but never pip-install into it.
 
@@ -860,7 +924,7 @@ the FnB-facing review of a shell's UI changes, use
 ## Opt-in features
 
 > [!class2]
-> **UI** Scripts (VM wizard · Web Search key) · **Shells** see fork-local guidance when configured
+> **UI** Scripts (VM wizard · Browser · Web Search key · Services panel) · **Shells** see fork-local guidance when configured
 
 Beyond the core loop, the engine ships **optional infrastructure**: a sidecar
 or host broker controlled by a config block in the gitignored
@@ -881,12 +945,14 @@ DB-canonical local skill.
 | **`windows`** | `vm` (operator-linked) | The VM broker: host-owned lifecycle for one linked VM, plus broker-served SSH to named `remotes`. |
 | **`tailnet`** | `ts` (operator-linked) | The tailnet broker for declared build/deploy hosts, with a read-only diagnostics tier, without sharing its credential with the sandbox. |
 | **`pm2`** | `pm2` (operator-linked) | The PM2 broker for a fail-closed set of host application processes. |
+| **`browser`** | `browser` (operator-linked) | Bare-metal driving of a dedicated Chromium profile through the Playwright extension, plus the `drive_browser` grant for dev, reviewer, planner and admin. |
 
 `enable pg` is complete in one step — the sidecar needs no host input, so the
 block is auto-created and the next `./sc launch` starts it (data persists in a
-named volume; `./sc pg-down` stops it, volume retained). `windows`, `tailnet`, and
-`pm2` are **link-only**: their blocks carry host-specific, operator-verified
-config (a ready VM, a tailnet scope), so `enable` prints exactly how to link.
+named volume; `./sc pg-down` stops it, volume retained). `windows`, `tailnet`,
+`pm2`, and `browser` are **link-only**: their blocks carry host-specific,
+operator-verified config (a ready VM, a tailnet scope, a linked Chromium
+profile), so `enable` prints exactly how to link.
 The sections below describe the supplied mechanisms. A fork-specific test,
 deployment, VM, database, or host procedure belongs in a differently named
 local skill so engine updates preserve its body and grants.
@@ -916,9 +982,45 @@ fork's actual scope through `fork_skill_design`.
 | PM2 | Operate only configured host application processes; [PM2 runbook](../.super-coder/docs/pm2-broker.md) |
 | App database | Read-only diagnostics through a host broker, not access to engine memory; [DB broker runbook](../.super-coder/docs/db-broker.md) |
 
+The app-DB broker is linked with its own one-time `./sc db-init` rather than
+through `./sc feature`. Every host broker is started by `./sc launch` once its
+block exists and stopped by `./sc down`; `./sc persist` installs and enables the
+systemd user unit for each applicable broker, so they survive a reboot, and
+skips the rest with a reason. The Scripts tab's **Services** panel shows the
+same set — each broker and the Postgres sidecar with its state, a running
+toggle, and a "survive reboot" toggle; a service with no configuration shows
+its setup steps instead of running anything. From a sandbox GUI the panel is
+status-only and prints the host command to run.
+
 Planner records each fork's actual tools, scope and operating procedure as a
 local skill. Infrastructure configuration does not grant arbitrary host access.
 Operate an existing supervised stack through its declared supervisor.
+
+### Browser driving
+
+Shells can drive a real browser instead of only reading pages. This is
+**bare-metal only** — the API server must run on the host, so setup, open and
+arm refuse under the Docker runtime — and it is supported for Claude, Codex and
+OpenCode; Kimi and Vibe are not.
+
+The operator owns everything that involves an account: create a Chromium
+profile named **Subfloor**, install the Playwright extension in it, and sign in
+only to what you intend to make available. Then link it:
+
+```bash
+./sc feature enable browser   # grants drive_browser to dev, reviewer, planner, admin
+./sc browser setup --json     # discover and link the Subfloor profile, start the service
+./sc browser doctor           # what is linked, installed and reachable
+```
+
+`setup`, `status`, `open`, `up`, `down`, `doctor`, `arm` and `disarm` are the
+verbs; the Scripts tab's **Browser** card runs the same operations. A shell
+given a directive can `./sc browser open` and work through the managed MCP
+connection, which you approve in the extension once per shell. Closing a window
+does not suspend access — **disarm** does. The engine never creates profiles,
+signs in, approves connections, or stores an extension credential. Full setup,
+package and diagnostic detail:
+[`.super-coder/docs/browser-driving.md`](../.super-coder/docs/browser-driving.md).
 
 ### Web search
 
@@ -947,8 +1049,8 @@ the windows the workflow above refers to:
 | **Flags** | The blocker / follow-up tracker, grouped by feature, filterable Open/Resolved/All. |
 | **Worktrees** | Live git-hygiene report — dirty worktrees, prunable merged branches, clean trees. |
 | **Repo Map** | The repo catalogue — language mix, file roles, dependencies, env vars — with a re-map button. |
-| **Analytics** | Token & session analytics — per-class spend cards, a local-day graph, and the session history swept from each harness's on-disk usage data (see [Token & session analytics](#token--session-analytics)). |
-| **Scripts** | Run the maintenance chores (snapshot, render, seed-skills, migrate, rebuild) from a button. |
+| **Analytics** | Two sub-views: **Token Analytics** — per-class spend cards, a local-day graph, and the session history swept from each harness's on-disk usage data — and **Provider Quota**, one card per provider showing how much of each window is left (see [Token & session analytics](#token--session-analytics)). |
+| **Scripts** | Run the maintenance chores (snapshot, render, seed-skills, migrate, rebuild) from a button, configure the VM, Browser and Web Search integrations, and start/stop host services from the Services panel. |
 
 The header's **save locally ⤓** button refreshes the private canonical snapshot
 and ignored local flat renders. Generated artifacts are never committed or published.
@@ -1016,7 +1118,15 @@ instance state.
 The **Scripts** tab lists the maintenance scripts (snapshot, render, seed-skills,
 migrate, rebuild) — each with a description and a **run** button, so the common
 chores work from the GUI without dropping to a terminal (rebuild prompts first,
-since it discards un-snapshotted DB edits).
+since it discards un-snapshotted DB edits). Beside them sit the configuration
+cards — Windows Test VM, Browser, Web Search — and the **Services** panel
+described under [Opt-in features](#opt-in-features).
+
+Browser sign-in normally attaches its own credential. `./sc token` prints the
+current operator token for the paste-it-by-hand recovery path and nothing else
+on stdout; it never rotates the credential, and a missing or insecurely
+permissioned artifact refuses with the supported service action rather than
+printing anything.
 
 The live engine DB, canonical snapshot and backups live in the private XDG
 instance-state root. See the [engine reference](../.super-coder/README.md) for
@@ -1046,7 +1156,8 @@ and runs from four triggers:
   is current and the previous session's end time gets backfilled;
 - **claude SessionEnd hook** — real-time capture the moment a session ends;
 - **Analytics tab load** — the GUI sweeps on open;
-- **manual** — `./sc analytics sweep [--harness <name>]`.
+- **manual** — `./sc analytics sweep [--harness <name>] [--quiet] [--full]`
+  (`--full` re-parses everything instead of continuing incrementally).
 
 Sessions attribute to shells by cwd (a worktree maps to the shell whose
 shortname names it) and archive time-window; anything ambiguous stays visibly
@@ -1058,3 +1169,13 @@ token rollups.
 
 The same reads are served as JSON at `/api/analytics/*` (session window +
 cursor, token totals and series, filters) for anything outside the GUI.
+
+**Provider Quota** is the tab's other sub-view, and answers the opposite
+question: not what was spent, but how much is left. One card per provider
+(Claude, Codex, Kimi) shows that provider's most recent reading per window —
+session, 5-hour, weekly — with the age of the reading, a countdown to reset,
+and a link to the provider's own usage page. Colour comes from the used
+percentage alone, never from a provider's own severity vocabulary. A percentage
+that could not be derived renders `n/a` with no bar rather than a reassuring
+0%, and a failed probe leaves the last-known figures standing with their age
+instead of claiming anything about your account.

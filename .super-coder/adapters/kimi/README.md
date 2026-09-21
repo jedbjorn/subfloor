@@ -19,8 +19,10 @@ billing are provider-owned; they are not part of the adapter contract.
 |---|---|
 | `launch` | argv exec'd to start the harness (`kimi` — cwd is the workspace; no dir flag exists) |
 | `comm_aliases` | extra `/proc/<pid>/comm` values a live kimi presents (`kimi-code` — see below) |
+| `surfaces` | which lanes this harness may serve (`terminal`, `one_shot`, `browser`, `sprint` — all true) |
 | `boot_artifact` | the context file this harness reads (`AGENTS.md`, informational) |
 | `emit` | files copied to the repo root at launch (none — kimi reads `~/.kimi-code` + `AGENTS.md`) |
+| `mcp.streamable_http` | `supported: false` — no managed streamable-HTTP MCP injection, so the browser and windows-mcp servers claude/codex/opencode get are not wired here |
 | `headless.launch` | non-interactive base argv (`kimi`) |
 | `headless.prompt_flag` | `-p`; run.py emits it immediately before the prompt value |
 | `headless.model_flag` | `-m`; the selector must be an alias discovered from `~/.kimi-code/config.toml` |
@@ -62,8 +64,11 @@ kimi keeps `comm=kimi-code` while its `cwd` link becomes unreadable, so it lands
 in the scan's existing `indeterminate` bucket rather than holding a shell.
 
 **Skills:** kimi does not read `.claude/skills/` (its discovery dirs are
-`.kimi-code/skills/` + `.agents/skills/`), so like codex/vibe it loads skills
-through the canonical harness-agnostic path — the boot doc's `## SKILLS` block.
+`.kimi-code/skills/` + `.agents/skills/`), and the adapter declares no
+`skill_dirs`, so the render chain writes only the `.claude/skills` default that
+kimi never reads. Like vibe, it therefore loads skills through the canonical
+harness-agnostic path — the boot doc's `## SKILLS` block. (Codex is no longer in
+that group: it declares `.agents/skills` and gets native delivery.)
 
 ## Branch guard — no in-line block (v1)
 

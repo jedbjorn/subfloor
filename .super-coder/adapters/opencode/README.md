@@ -15,8 +15,12 @@ The adapter adds the harness-specific config file and launch command.
   boot artifact) — points `instructions` at `AGENTS.md`, sets default tool
   permissions (edit allow / webfetch allow / bash ask), and leaves an `mcp` slot.
   Source maintainers edit this tracked template through a PR; installed forks
-  receive it through update. The live file is regenerated each launch. Model is intentionally unset — the harness is
-  rented; pick it in OpenCode (`-m provider/model`) or add `"model"` here.
+  receive it through update. The live file is regenerated each launch. The
+  template leaves `model` unset, but the launch is not: the manifest declares
+  `"model": { "file": "opencode.json", "key": "model" }`, so when the booting
+  shell's flavor names an opencode model, `run.py` merges it into the emitted
+  file before exec. With no flavor model the key stays absent and the harness is
+  rented — pick it in OpenCode (`-m provider/model`) or add `"model"` here.
 - **`"lsp": true`** — enabled by default. OpenCode's own default is LSP *off*; we
   turn it on so the model gets language-server diagnostics as a feedback loop
   (it sees the type error / unresolved import it just introduced and fixes it
@@ -65,6 +69,32 @@ The adapter adds the harness-specific config file and launch command.
   surfaces the reason to the model. The git pre-commit backstop
   (`.super-coder/hooks/pre-commit`) catches shell-driven writes that route around
   the tool path.
+- **`enforce-model-route.js`** + its entry in `opencode.json` `plugin` — a
+  `chat.params` hook that refuses a mismatched model route *before* provider
+  dispatch. `run.py` sets `SC_OPENCODE_ENFORCED_MODEL` (a `{requested, selector}`
+  JSON contract) only for an interactive **host Admin** launch that asked for an
+  explicit OpenCode model; the hook compares the resolved runtime
+  `providerID/modelID` against that selector and throws when they differ, so the
+  harness never responds or requests a tool on the wrong route. Absent the env
+  var the hook is a no-op, so an ordinary shell launch is unaffected. The same
+  `plugin`-path rewrite to an absolute engine path applies. The selector is also
+  preflighted (`opencode models <provider>`) before any durable launch state is
+  created.
+- **`mcp.streamable_http`** — managed MCP servers arrive as an `opencode.json`
+  `mcp` merge (type `remote`), not launch args: `windows-mcp` only with a linked
+  VM, `browser` only with the browser port configured and never inside the
+  sandbox.
+- **`sandbox.merge_json`** — inside the docker sandbox only (`SC_SANDBOX`),
+  `permission.bash` is merged to `allow`, where the container is the safety
+  boundary. On the no-docker host path the template's `bash: ask` stands.
+
+**Host setup (one-time):** the binary is baked into the sandbox image, but auth
+is mounted from the host — so `opencode` must be installed + logged in on the
+host once: `curl -fsSL https://opencode.ai/install | bash` (binary →
+`~/.opencode/bin/opencode`), then `opencode auth login`. That writes
+`~/.local/share/opencode/auth.json`, which `./sc launch` mounts in.
+`./sc install` / `./sc update` / `./sc ensure-harness` install the binary
+automatically; auth stays manual.
 
 ## Conversation capability
 

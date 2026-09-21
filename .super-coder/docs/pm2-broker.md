@@ -9,7 +9,7 @@ fork. Exact CLI syntax remains in `sc help --all` and verb help.
 
 The host-side authority that lets a sandboxed shell observe + manage the host's
 pm2-supervised app stack without holding any host access. Third sibling of the
-VM broker and the
+[VM and remotes broker](remote-seats.md) and the
 [tailnet broker](tailscale-broker.md); same shape, different backend.
 
 Upstreamed from a fork's deploy-confirmation gap

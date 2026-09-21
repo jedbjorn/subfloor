@@ -75,7 +75,7 @@ and model. The picker shows route support and supported Thinking levels where
 available. Ask it to orient and map the repository. The **Repo Map** tab displays
 the resulting catalogue; other shells can read it without becoming map owners.
 
-Alternatively, use **Chats → New chat** for a shell and a supported browser
+Alternatively, use **Chats → ＋ Chat** for a shell and a supported browser
 route. Browser and terminal sessions cannot own the same shell at once. Close
 a browser conversation before entering that shell from the terminal.
 

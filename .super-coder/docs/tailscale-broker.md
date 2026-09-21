@@ -83,8 +83,8 @@ starts it.
 
 For a host in `readonly_hosts` the broker accepts a command only when its first
 tokens match `READONLY_COMMANDS` in `ts.py` (kept as data so a test can
-enumerate it), the string contains none of `; & | > < $ \` ( )` or a newline,
-and `sudo` appears nowhere:
+enumerate it), the string contains none of `; & | > < $ \` ( )`, a newline or a
+carriage return, and `sudo` appears nowhere:
 
 | Verb | Permitted forms |
 |---|---|
