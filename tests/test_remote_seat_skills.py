@@ -16,7 +16,7 @@ ROOT = Path(__file__).resolve().parents[1]
 ENGINE = ROOT / ".super-coder"
 SKILLS = ENGINE / "assets" / "skills"
 SEED = ENGINE / "migrations" / "0001_seed_skills.sql"
-RESEED = ENGINE / "migrations" / "0264_reseed_winbox_adoption_skills.sql"
+RESEED = ENGINE / "migrations" / "0267_reseed_docs_pass_skills.sql"
 README = ROOT / "docs" / "README.md"
 REMOTE_SEATS_DOC = ENGINE / "docs" / "remote-seats.md"
 TAILNET_DOC = ENGINE / "docs" / "tailscale-broker.md"
@@ -26,9 +26,13 @@ RETIRED_DOCS = (
     ENGINE / "docs" / "skills",
 )
 NEW_SKILLS = ("remote_seats", "tailscale_diagnostics", "windows_testing")
-# The trailing reseed carries only the skills that spec #232 rewrote;
-# tailscale_diagnostics was last reseeded by 0263 and is unchanged.
-RESEED_SKILLS = ("remote_seats", "windows_testing")
+# The trailing reseed carries only the skills the latest reseed rewrote.
+RESEED_SKILLS = ("remote_seats", "tailscale_diagnostics")
+# `0001_seed_skills.sql` is regenerated only when the skill *set* changes, so a
+# body-only edit deliberately leaves 0001 carrying the previous text and the
+# trailing reseed carries the current one. Only skills no later reseed has
+# rewritten can be compared against the assets at 0001.
+SEED_SKILLS = tuple(name for name in NEW_SKILLS if name not in RESEED_SKILLS)
 RETIRED_GUIDANCE = re.compile(
     r"lease|forcecommand|sc vm test|acquire|release --force|baseline promote"
     r"|windows-test-client|windows_test_controller",
@@ -199,15 +203,15 @@ class ReseedMigrationTests(unittest.TestCase):
                 )
         self.assertEqual(rows["fork_windows_lab"][4], "bespoke body")
         self.assertEqual(
-            con.execute("SELECT skill_id FROM skills WHERE name='windows_testing'")
+            con.execute("SELECT skill_id FROM skills WHERE name='remote_seats'")
             .fetchone()[0],
-            40,
+            41,
             "UPSERT keeps the row identity so grants survive",
         )
 
     def test_seed_and_reseed_agree_with_assets(self) -> None:
         specs = _specs()
-        for migration, names in ((SEED, NEW_SKILLS), (RESEED, RESEED_SKILLS)):
+        for migration, names in ((SEED, SEED_SKILLS), (RESEED, RESEED_SKILLS)):
             con = sqlite3.connect(":memory:")
             con.executescript(SKILL_SCHEMA + migration.read_text())
             for name in names:
