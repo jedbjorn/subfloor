@@ -8,7 +8,8 @@ Historical live-probe versions below are evidence, not the current support pin.
 Kimi Code (`kimi`, Moonshot AI's coding CLI — repo `MoonshotAI/kimi-code`, the
 TypeScript successor to the legacy Python `kimi-cli`) reads the boot artifact
 (`AGENTS.md`) natively — already emitted by the render chain — so the adapter
-carries only the launch command, a headless block, and a sandbox approval flag.
+carries the launch command, its native skill root, a headless block, and a
+sandbox approval flag.
 
 This adapter connects Subfloor to the kimi CLI. Account entitlement and
 billing are provider-owned; they are not part of the adapter contract.
@@ -22,6 +23,7 @@ billing are provider-owned; they are not part of the adapter contract.
 | `surfaces` | which lanes this harness may serve (`terminal`, `one_shot`, `browser`, `sprint` — all true) |
 | `boot_artifact` | the context file this harness reads (`AGENTS.md`, informational) |
 | `emit` | files copied to the repo root at launch (none — kimi reads `~/.kimi-code` + `AGENTS.md`) |
+| `skill_dirs` | extra skill roots this harness reads natively (`.agents/skills` — see Skills); `.claude/skills` is always rendered as the cross-harness default |
 | `mcp.streamable_http` | `supported: false` — no managed streamable-HTTP MCP injection, so the browser and windows-mcp servers claude/codex/opencode get are not wired here |
 | `headless.launch` | non-interactive base argv (`kimi`) |
 | `headless.prompt_flag` | `-p`; run.py emits it immediately before the prompt value |
@@ -63,12 +65,33 @@ a 0.7s false-available for a permanent false-busy. And a finished-but-unreaped
 kimi keeps `comm=kimi-code` while its `cwd` link becomes unreadable, so it lands
 in the scan's existing `indeterminate` bucket rather than holding a shell.
 
-**Skills:** kimi does not read `.claude/skills/` (its discovery dirs are
-`.kimi-code/skills/` + `.agents/skills/`), and the adapter declares no
-`skill_dirs`, so the render chain writes only the `.claude/skills` default that
-kimi never reads. Like vibe, it therefore loads skills through the canonical
-harness-agnostic path — the boot doc's `## SKILLS` block. (Codex is no longer in
-that group: it declares `.agents/skills` and gets native delivery.)
+**Skills:** kimi does not read `.claude/skills/`. Its project skill roots are
+`.kimi-code/skills/` (brand) and `.agents/skills/` (the generic cross-harness
+path), both resolved against the project root it finds by walking up for
+`.git`. The adapter therefore declares `skill_dirs: [".agents/skills"]` and,
+like codex, gets the booting shell's exact grants delivered natively; the boot
+doc's `## SKILLS` block remains the harness-agnostic backstop rather than the
+only channel. `.claude/skills` is still rendered because `render_harness_skills`
+always prepends it — harmless here, since kimi ignores it.
+
+`.agents/skills` needed no new plumbing: it is already the codex-native path,
+already gitignored (`/.agents/skills/`, written by the installer and kept by
+the gitignore sync), already listed in `engine_paths` as a generated install
+path so `./sc remove` deletes it, and already pruned per boot by
+`skill_projection` so a retired grant's folder does not survive into the next
+session.
+
+Verified live on the installed CLI (`kimi 2.0.1`, 2026-09-21): a skill dropped
+at `<root>/.agents/skills/<name>/SKILL.md` is listed by `kimi -p` as an
+available session skill, both in an ordinary clone and in a linked git worktree
+whose `.git` is a file — the exact shape of a shell seat at
+`.sc-worktrees/<shortname>`. The binary's own root table confirms it:
+`PROJECT_BRAND_DIRS = [".kimi-code/skills"]`,
+`PROJECT_GENERIC_DIRS = [".agents/skills"]`.
+
+Only the generic path is declared. `.kimi-code/skills` would be a second,
+kimi-only mirror of the same grants needing its own ignore and cleanup
+coverage, and it buys nothing kimi does not already read from `.agents/skills`.
 
 ## Branch guard — no in-line block (v1)
 

@@ -61,7 +61,8 @@ the cwd-branch check.
    on the host and in the container alike. The adapter carries no
    container-only bypass: codex rejects it alongside `--ask-for-approval`
    (`the argument '--ask-for-approval <APPROVAL_POLICY>' cannot be used with
-   '--dangerously-bypass-approvals-and-sandbox'`, codex-cli 0.154.0), and the
+   '--dangerously-bypass-approvals-and-sandbox'`, first seen on codex-cli
+   0.154.0, still verbatim on 0.155.1), and the
    always-on set already grants everything it did. Never swap the set for the
    YOLO flag as a shortcut; it is the bypass branch that loses the guard, not
    the policy.
@@ -100,7 +101,8 @@ always-on launch flag rather than an Admin-only grant because:
    spawns inherit the same dead policy, which reads from inside the session as
    "agents are broken". Verified on CachyOS (kernel 7.2.2) with codex-cli
    0.153.4: `-s workspace-write` fails as above, `-s danger-full-access`
-   succeeds.
+   succeeds. Still true on 0.155.1, where `codex sandbox -- pwd` (the
+   model-free sandbox runner) reproduces the same `bwrap` refusal.
 
 The safety boundary is unchanged and is the same one every other harness
 relies on: the branch-guard `PreToolUse` hook at edit time, and the git
@@ -122,5 +124,46 @@ kept two same-cwd conversations isolated. The app-server probe ran with
 harmless command, observed terminal status `interrupted`, stopped the server,
 started a new server, resumed the exact thread, and recovered the original
 nonce. Permission policy is the requirement; `--sandbox` is not part of the
-shared contract. This CLI version expects kebab-case `danger-full-access` in
-the app-server payload.
+shared contract. The app-server payload takes kebab-case `danger-full-access`.
+
+### Supported range (re-probed 2026-09-21 on 0.155.1)
+
+`conversation.verified_cli_version` is `0.155.1` and
+`maximum_cli_version_exclusive` is `0.156.0`. The window is authored from
+evidence, not from version arithmetic:
+
+- **`0.155.1` is what was probed.** It is the installed host binary and, at the
+  time of the probe, the newest stable `rust-v0.155.1` release — everything
+  above it on the release list is a `0.156.0-alpha.*` pre-release.
+- **The probe replayed the whole contract live** against `codex app-server
+  --stdio`: `thread/start` with `approvalPolicy=never` +
+  `sandbox=danger-full-access`, a streamed turn (`item/agentMessage/delta`), a
+  second thread in the same cwd that neither shared nor leaked the first
+  thread's nonce, a `sleep 60` command execution actually started under the
+  unrestricted policy and then ended by `turn/interrupt` with terminal status
+  `interrupted`, a full server stop/restart followed by `thread/resume` on the
+  exact thread id that recovered the original nonce, and `thread/read
+  includeTurns` reporting the same id with both turns.
+- **`codex app-server generate-json-schema` corroborates the shapes.**
+  `thread/start`, `thread/resume`, `thread/read`, `turn/start` and
+  `turn/interrupt` all exist with the params the broker sends, `SandboxMode`
+  is still the kebab-case enum, and `TurnStatus` still carries
+  `completed | interrupted | failed | inProgress`.
+- **`0.156.0` is excluded because nothing was probed there.** Its only
+  published builds are alphas; raise the ceiling when a stable `0.156.x` has
+  been probed the same way, not before.
+
+Release notes from `0.148.0` through `0.155.1` change no method the broker
+calls; the app-server work in that span is daemon lifecycle, Guardian approval
+review, plugin reconciliation and Windows sandbox provisioning. The one entry
+worth naming is `0.149.0`'s "Reject obsolete app-server permission profile
+fields" — the probe confirms the fields this adapter sends are not among them.
+
+The launch surface was re-checked against `codex --help` / `codex exec --help`
+on the same binary: `--dangerously-bypass-hook-trust`, `-s/--sandbox` (with
+`danger-full-access` still a valid value) and `-c` exist on both; top-level
+`-a/--ask-for-approval` still accepts `never`; `codex exec` still has no
+approval flag at all. `--dangerously-bypass-approvals-and-sandbox` is still
+refused alongside `--ask-for-approval`, verbatim on 0.155.1. `codex sandbox --
+pwd` still fails with `bwrap: Failed to make / slave: Operation not permitted`
+on this host, so `danger-full-access` remains the only runnable policy here.
