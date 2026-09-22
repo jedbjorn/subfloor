@@ -105,8 +105,6 @@ def test_open_chat_restore_matches_the_flat_shell_projection():
 
 
 def test_sprint_badge_enters_the_current_conversation_without_a_wake():
-    interface = APP[APP.index("async function renderInterface"):
-                    APP.index("// ── Tabs + boot")]
     badge = APP[APP.index("function chatSprintBadge"):
                 APP.index("function chatPaintShellStatus")]
     assert "sprint.current_conversation_id" in badge
@@ -1206,6 +1204,65 @@ def test_interface_arrival_defers_configuration_and_phases_history_requests():
     assert "await loadStars()" not in interface
     assert 'textContent: "Retry"' in interface
     assert "chatRenderNew(pane, shell, defaults, catalog)" in interface
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node is required")
+def test_chat_configuration_refresh_reports_only_new_available_models():
+    loader = APP[APP.index("let chatConfigurationPromise = null;"):
+                 APP.index("function chatStopStream")]
+    script = loader + r"""
+const calls = [];
+const notices = [];
+let previous = { harnesses: {
+  codex: { models: [{ id: "old", availability: "available" }] },
+} };
+let current = { stale: false, harnesses: {
+  codex: { models: [
+    { id: "old", availability: "available" },
+    { id: "new", availability: "available" },
+    { id: "hidden", availability: "advisory" },
+  ] },
+} };
+function api(path) {
+  calls.push(path);
+  if (path === "/models") return Promise.resolve(previous);
+  if (path === "/models?refresh=1") return Promise.resolve(current);
+  return Promise.resolve({ flavors: {} });
+}
+function toast(message) { notices.push(message); }
+(async () => {
+  const [first, shared] = await Promise.all([
+    chatLoadConfiguration(), chatLoadConfiguration(),
+  ]);
+  previous = current;
+  await chatLoadConfiguration();
+  current = { ...current, harnesses: { codex: { models: [
+    ...current.harnesses.codex.models,
+    { id: "newer", availability: "available" },
+  ] } } };
+  await chatLoadConfiguration();
+  console.log(JSON.stringify({ calls, notices, shared: first === shared }));
+})();
+"""
+    result = run_js(script)
+    assert result["shared"] is True
+    assert result["calls"].count("/models?refresh=1") == 3
+    assert result["notices"] == [
+        "New models available!\ncodex: new",
+        "New models available!\ncodex: newer",
+    ]
+
+
+def test_chat_entry_actions_refresh_before_opening():
+    interface = APP[APP.index("async function renderInterface"):
+                    APP.index("// ── Tabs + boot")]
+    new_chat = interface[interface.index("newChat.onclick = async"):
+                         interface.index("configure.onclick = async")]
+    assert new_chat.index("await chatLoadConfiguration()") < new_chat.index(
+        "chatCreateConversation(shell)")
+    configure = interface[interface.index("configure.onclick = async"):
+                          interface.index("side.append(")]
+    assert "renderInterface(root)" in configure
 
 
 def test_history_more_and_deep_links_are_keyed_and_failure_isolated():

@@ -3259,10 +3259,21 @@ let chatConfigurationPromise = null;
 
 function chatLoadConfiguration() {
   if (chatConfigurationPromise) return chatConfigurationPromise;
-  const request = Promise.all([
-    api("/flavor-defaults"),
-    api("/models"),
-  ]).then(([defaults, catalog]) => ({ defaults, catalog }));
+  const request = (async () => {
+    const previous = await api("/models");
+    const catalog = await api("/models?refresh=1");
+    const known = new Set(Object.entries(previous.harnesses || {}).flatMap(
+      ([harness, block]) => (block.models || []).map((model) => `${harness}/${model.id}`)));
+    const added = Object.entries(catalog.harnesses || {}).flatMap(
+      ([harness, block]) => (block.models || [])
+        .filter((model) => model.availability === "available"
+          && !known.has(`${harness}/${model.id}`))
+        .map((model) => `${harness}: ${model.id}`));
+    if (!catalog.stale && added.length)
+      toast(`New models available!\n${added.join("\n")}`);
+    const defaults = await api("/flavor-defaults");
+    return { defaults, catalog };
+  })();
   chatConfigurationPromise = request;
   const clear = () => {
     if (chatConfigurationPromise === request) chatConfigurationPromise = null;
@@ -3297,7 +3308,7 @@ function chatHash(shortname, conversationId = "") {
 function chatBusyToast(error, shortname) {
   const held = error.details || {};
   if (error.code !== "SHELL_BUSY" || !held.conversation_id) {
-    toast(`${error.code}: ${error.message}`);
+    toast(`${error.code ? `${error.code}: ` : ""}${error.message}`);
     return;
   }
   const open = el("button", {
@@ -5995,6 +6006,7 @@ async function renderInterface(root) {
     configure.disabled = true;
     newChat.textContent = "Starting…";
     try {
+      await chatLoadConfiguration();
       const conversation = await chatWithShellRelease(
         () => chatCreateConversation(shell));
       location.hash = chatHash(shell.shortname, conversation.conversation_id);
@@ -6011,7 +6023,9 @@ async function renderInterface(root) {
       configure.disabled = false;
       return;
     }
-    location.hash = chatHash(shell.shortname, CHAT_CONFIGURE_ROUTE);
+    if (chatRouteConversation === CHAT_CONFIGURE_ROUTE)
+      renderInterface(root);
+    else location.hash = chatHash(shell.shortname, CHAT_CONFIGURE_ROUTE);
   };
   side.append(el("div", { className: "chat-history-head" },
     el("div", { className: "chat-history-shell" },
