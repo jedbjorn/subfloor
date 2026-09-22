@@ -808,8 +808,6 @@ class RunnerTest(unittest.TestCase):
             devkit.subprocess, "Popen", side_effect=InterruptedProcess
         ), mock.patch.object(
             devkit, "invoking_checkout", return_value=self.root.resolve()
-        ), mock.patch.object(
-            devkit, "_main_checkout", return_value=self.root.resolve()
         ), self.assertRaises(KeyboardInterrupt):
             devkit.run_hook(self.root, "test", ())
 
@@ -891,23 +889,29 @@ class RunnerTest(unittest.TestCase):
 
         compact_environment = dict(os.environ)
         compact_environment.pop("SC_DEVKIT_OUTPUT", None)
-        compact = subprocess.run(
-            (sys.executable, str(RUNNER), "run", str(linked), "test"),
-            cwd=main,
-            env=compact_environment,
-            text=True,
-            capture_output=True,
-            check=False,
-        )
+        main_local = main / ".sc-state" / "local"
+        main_local.mkdir(parents=True)
+        main_local.chmod(0o000)
+        try:
+            compact = subprocess.run(
+                (sys.executable, str(RUNNER), "run", str(linked), "test"),
+                cwd=main,
+                env=compact_environment,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+        finally:
+            main_local.chmod(0o700)
         self.assertEqual(compact.returncode, 0, compact.stdout + compact.stderr)
         log_line = next(
             line
             for line in compact.stderr.splitlines()
             if line.startswith("dev-kit log: ")
         )
-        log = main / log_line.removeprefix("dev-kit log: ")
+        log = linked / log_line.removeprefix("dev-kit log: ")
         self.assertEqual(log.read_text(), f"{linked.resolve()}\n")
-        self.assertFalse((linked / ".sc-state").exists())
+        self.assertFalse((main_local / "devkit-logs").exists())
 
     def test_dispatcher_routes_every_lifecycle_verb_through_one_adapter(self):
         dispatch = (ROOT / ".super-coder" / "scripts" / "dispatch.sh").read_text()
