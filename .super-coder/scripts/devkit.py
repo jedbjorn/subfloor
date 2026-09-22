@@ -510,21 +510,6 @@ def _resolve_executable(hook: Hook, environment: Mapping[str, str]) -> Path:
     return executable
 
 
-def _main_checkout(checkout: Path) -> Path:
-    result = subprocess.run(
-        ("git", "-C", str(checkout), "rev-parse", "--git-common-dir"),
-        check=False,
-        capture_output=True,
-        text=True,
-    )
-    if result.returncode != 0 or not result.stdout.strip():
-        raise _error("$checkout", "cannot resolve Git common directory")
-    common = Path(result.stdout.strip())
-    if not common.is_absolute():
-        common = checkout / common
-    return common.resolve().parent
-
-
 def _shell_status(returncode: int) -> int:
     return 128 - returncode if returncode < 0 else returncode
 
@@ -724,8 +709,8 @@ def _run_compact(
     child_environment: Mapping[str, str],
     seat: str,
 ) -> int:
-    main_checkout = _main_checkout(checkout)
-    directory = devkit_log_root(main_checkout) / hook.name
+    # A linked worktree can run its hook without access to the main checkout's state.
+    directory = devkit_log_root(checkout) / hook.name
     directory.mkdir(parents=True, exist_ok=True)
     stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
     name = f"{stamp}-{os.getpid()}-{uuid.uuid4().hex}.running"
@@ -749,7 +734,7 @@ def _run_compact(
             _terminate_and_reap(process)
             log.flush()
             os.fsync(log.fileno())
-            relative = running.relative_to(main_checkout)
+            relative = running.relative_to(checkout)
             print(f"dev-kit log interrupted: {relative}", file=sys.stderr)
             raise
         log.flush()
@@ -761,7 +746,7 @@ def _run_compact(
     status = _shell_status(returncode)
     failed = status != 0
     scan = _scan_log(finalized, failed=failed)
-    relative = finalized.relative_to(main_checkout)
+    relative = finalized.relative_to(checkout)
     recovery_args = shlex.join(("./sc", hook.name, *arguments))
     prefix = [
         f"dev-kit checkout: {checkout}",
