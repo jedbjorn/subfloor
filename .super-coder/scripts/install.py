@@ -443,7 +443,7 @@ def _run_harness_install(name: str, cmd: str, label: str) -> tuple[int, str, int
     t0 = time.monotonic()
     if not tty:
         print(f"  · {name:9} {label}…  ($ {cmd})", flush=True)
-    proc = subprocess.Popen(["bash", "-c", cmd], stdout=subprocess.PIPE,
+    proc = subprocess.Popen(["bash", "-o", "pipefail", "-c", cmd], stdout=subprocess.PIPE,
                             stderr=subprocess.STDOUT, text=True)
     stop = threading.Event()
     spinner = None
@@ -490,7 +490,7 @@ def update_harnesses() -> dict[str, str]:
         label = "updating" if present else "installing"
         done = "updated" if present else "installed"
         rc, out, elapsed = _run_harness_install(name, cmd, label)
-        ok = rc == 0
+        ok = rc == 0 and _harness_installed(name)
         _report_install(name, ok, rc, out, elapsed, done, cmd)
         status[name] = done if ok else "failed"
     global_pointer.reconcile()
@@ -967,7 +967,10 @@ def main(argv: list[str]) -> int:
     # Standalone: refresh every harness through its managed distribution.
     if "--update-harnesses" in argv:
         step("Updating managed harness CLIs")
-        update_harnesses()
+        status = update_harnesses()
+        if any(result not in ("updated", "installed") for result in status.values()):
+            print("install: one or more harness updates failed; see results above", file=sys.stderr)
+            return 1
         return 0
 
     # Standalone: just ensure the harness CLIs and exit (for an already-installed

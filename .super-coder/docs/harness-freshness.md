@@ -74,7 +74,7 @@ it costs the harness downloads and nothing else.
 | `./sc harness-status` / `subfloor harness-status` | Versions **inside the sandbox** + whether the image owes a rebuild |
 | `./sc restart` / `subfloor restart` | Roll a fresh epoch, rebuild the image, then bounce into it |
 | `./sc restart --no-build` | Deliberately reuse the existing image; no refresh and no build |
-| `./sc update-harnesses` / `subfloor update-harnesses` | Roll and rebuild without bouncing; activate that exact build with `restart --no-build` |
+| `./sc update-harnesses` / `subfloor update-harnesses` | Sandbox: roll and rebuild without bouncing; activate that exact build with `restart --no-build`. Host runtime: run the vendor installers and fail if any update fails. |
 | `./sc build --harnesses` | Same staged refresh without the rest of `update-harnesses`' output |
 | `./sc build` | Ordinary rebuild — passes the **stored** epoch, so it stays cache-warm |
 | `./sc update` / `subfloor update` | Marks harness layers stale as part of the update; the normal restart refreshes and activates them |
@@ -141,9 +141,10 @@ container — route evidence is bound to the runtime shells launch in.
   before teardown. If that build fails, the healthy container remains running
   and the stored epoch records that a build is still owed. Use `--no-build`
   only when deliberately pinning/reusing the existing image.
-- **`update-harnesses` without docker does something different, on purpose.**
-  There the host *is* the runtime, so it runs the vendor installers against
-  `$HOME` as it always did.
+- **Host runtime updates the host CLIs.** There the host *is* the runtime, so
+  `update-harnesses` runs the vendor installers against `$HOME`. A sandbox
+  runtime with Docker unavailable fails the preflight instead of updating
+  binaries that its shells cannot use.
 - **An unlabelled image means unknown, not current.** Images built before this
   seam carry no `sc.harness_epoch`, and `harness-status` reports a rebuild owed
   rather than assuming the best.
