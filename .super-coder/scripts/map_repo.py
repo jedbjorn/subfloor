@@ -10,6 +10,11 @@ snapshotted. Re-run any time the repo changes:
 
     ./sc map          # or: python3 .super-coder/scripts/map_repo.py
 
+Paths git ignores (`.gitignore`, `.git/info/exclude`, global excludes) are never
+mapped: scratch trees such as `shared/` are not the product. A scan that finds
+zero files refuses to write — an unreadable root would otherwise prune every
+authored row.
+
 Idempotent. dr_repo / dr_dependency / dr_env are wiped + repopulated; dr_filepath
 is UPSERTed by path so cartographer-authored `desc` survives the auto-remap hook,
 with vanished paths pruned. dr_section (authored) is left untouched, and seeded
@@ -24,6 +29,7 @@ import json
 import re
 import sqlite3
 import subprocess
+import sys
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path, PurePosixPath
@@ -102,6 +108,40 @@ def path_is_skipped(
         or any(part in skip_dirs for part in rel_parts)
         or (bool(rel_parts) and rel_parts[-1] in skip_files)
     )
+
+
+class MapRootEmptyError(RuntimeError):
+    """The scan found no files: the root is unreadable from this seat, or every
+    path is skipped. Writing would prune the whole authored catalogue, so the
+    refresh refuses and leaves dr_* untouched."""
+
+
+def git_ignored_paths() -> tuple[set[str], set[str]]:
+    """(dirs, files) git ignores under MAP_ROOT, POSIX-relative. A fully ignored
+    directory comes back collapsed as `name/` (--directory); ignored files inside
+    a partly tracked directory come back one by one. Both sets are empty when the
+    root is not a git checkout — the static SKIP_DIRS still apply then."""
+    out = git("ls-files", "--others", "--ignored", "--exclude-standard",
+              "--directory", "-z")
+    dirs: set[str] = set()
+    files: set[str] = set()
+    for entry in (out or "").split("\0"):
+        if entry:
+            (dirs if entry.endswith("/") else files).add(entry)
+    return dirs, files
+
+
+def is_git_ignored(
+    rel_parts: tuple[str, ...],
+    ignored_dirs: set[str],
+    ignored_files: set[str],
+) -> bool:
+    if not ignored_dirs and not ignored_files:
+        return False
+    if "/".join(rel_parts) in ignored_files:
+        return True
+    return any("/".join(rel_parts[:i]) + "/" in ignored_dirs
+               for i in range(1, len(rel_parts)))
 
 
 def infer_role(path: str, ext: str, lang: str | None) -> str:
@@ -344,6 +384,7 @@ def refresh() -> MapRefreshResult:
         {".super-coder"} if is_source_repo() else set())
     skip_files = SKIP_FILES | set(cfg.get("skip_files") or [])
     overrides = cfg.get("role_overrides") or []
+    ignored_dirs, ignored_files = git_ignored_paths()
     try:
         # Derived tables with no authored content — wiped + repopulated each run.
         for t in ("dr_repo", "dr_dependency", "dr_env"):
@@ -358,7 +399,9 @@ def refresh() -> MapRefreshResult:
         truncated = False
         for p in sorted(MAP_ROOT.rglob("*")):
             rel_parts = p.relative_to(MAP_ROOT).parts
-            if path_is_skipped(rel_parts, skip, skip_files) or not p.is_file():
+            if path_is_skipped(rel_parts, skip, skip_files) \
+                    or is_git_ignored(rel_parts, ignored_dirs, ignored_files) \
+                    or not p.is_file():
                 continue
             if files >= MAX_FILES:
                 truncated = True
@@ -397,6 +440,14 @@ def refresh() -> MapRefreshResult:
                                     (m.group(1), rel))
                         envs += 1
 
+        if files == 0:
+            # Nothing enumerated: unreadable root (sandboxed seat, dead bind
+            # mount) or every path skipped. Pruning now would empty the
+            # catalogue and lose every authored desc — refuse instead.
+            con.rollback()
+            raise MapRootEmptyError(
+                f"map_repo: scanned 0 files under {MAP_ROOT} — root unreadable "
+                "from this seat or fully skipped; dr_* left untouched")
         # Prune paths that vanished from the repo (their authored desc goes with
         # them — correct). Surviving paths kept their desc via the UPSERT above.
         con.execute("DELETE FROM dr_filepath WHERE path NOT IN (SELECT path FROM _seen)")
@@ -446,7 +497,11 @@ def refresh() -> MapRefreshResult:
 
 
 def main() -> int:
-    result = refresh()
+    try:
+        result = refresh()
+    except MapRootEmptyError as exc:
+        print(exc, file=sys.stderr)
+        return 1
     msg = (
         f"map_repo: {result.files} files, {result.dependencies} deps, "
         f"{result.env_vars} env vars → dr_* ({result.map_root.name})"

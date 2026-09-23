@@ -12,10 +12,13 @@ Nothing here touches the harness; nothing here writes the DB.
 from __future__ import annotations
 
 import sqlite3
+import sys
 from pathlib import Path
 
 ENGINE = Path(__file__).resolve().parents[1]
 TEMPLATE_PATH = ENGINE / "templates" / "boot.md"
+sys.path.insert(0, str(ENGINE / "scripts"))
+import artifact_policy  # noqa: E402
 
 # Rendered into ORIENTATION for every shell EXCEPT the cartographer (who owns the
 # map and heals discrepancies directly — telling it to report them to itself is
@@ -314,7 +317,10 @@ def render_api_unreachable_guidance(
 
 
 # The repo catalogue (dr_*) lives in its OWN db, separate from shell_db.db.
-MAP_DB_PATH = ENGINE.parent / ".sc-state" / "map.db"
+# Resolve it through artifact_policy — the same file `sc map` writes. The old
+# hand-built `.sc-state/map.db` only resolved where a legacy symlink survived,
+# so forks without one rendered 'not mapped' against a populated catalogue.
+MAP_DB_PATH = artifact_policy.map_db_path()
 
 def open_map_ro() -> "sqlite3.Connection | None":
     """Read-only handle to the map DB, or None if the repo isn't mapped yet

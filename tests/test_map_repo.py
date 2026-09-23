@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sqlite3
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -12,6 +13,7 @@ from unittest import mock
 ENGINE = Path(__file__).resolve().parents[1] / ".super-coder"
 sys.path.insert(0, str(ENGINE / "scripts"))
 sys.path.insert(0, str(ENGINE / "render"))
+import artifact_policy  # noqa: E402
 import compose  # noqa: E402
 import engine_paths  # noqa: E402
 import map_repo  # noqa: E402
@@ -265,3 +267,109 @@ class ExternalWorkProjectTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class GitIgnoreAndEmptyScanTest(unittest.TestCase):
+    """The catalogue never carries git-ignored scratch, and a scan that finds
+    nothing never prunes the authored rows (dos-arch: 17,040 `shared/` rows
+    flooded in via the post-merge hook; an unreadable root wiped every desc)."""
+
+    def _patches(self, root: Path, db_path: Path):
+        def connect() -> sqlite3.Connection:
+            return sqlite3.connect(db_path)
+
+        return (
+            mock.patch.object(map_repo, "REPO_ROOT", root),
+            mock.patch.object(map_repo, "MAP_ROOT", root),
+            mock.patch.object(map_repo, "CONFIG_PATH", root / ".sc-state" / "config.json"),
+            mock.patch.object(map_repo, "CONFIG_PATH_LEGACY", root / "legacy.json"),
+            mock.patch.object(map_repo, "is_source_repo", return_value=False),
+            mock.patch.object(map_repo.artifact_policy, "prepare_local_state"),
+            mock.patch.object(map_repo.artifact_policy, "atomic_write_text"),
+            mock.patch.object(map_repo.map_db, "connect", side_effect=connect),
+        )
+
+    def test_is_git_ignored_matches_collapsed_dirs_and_single_files(self):
+        dirs, files = {"shared/", "build/out/"}, {"secret.env"}
+        self.assertTrue(map_repo.is_git_ignored(("shared", "x", "y.py"), dirs, files))
+        self.assertTrue(map_repo.is_git_ignored(("build", "out", "a.js"), dirs, files))
+        self.assertTrue(map_repo.is_git_ignored(("secret.env",), dirs, files))
+        self.assertFalse(map_repo.is_git_ignored(("build", "src.py"), dirs, files))
+        self.assertFalse(map_repo.is_git_ignored(("app.py",), dirs, files))
+        self.assertFalse(map_repo.is_git_ignored(("shared", "x.py"), set(), set()))
+
+    def test_refresh_skips_git_ignored_paths(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "repo"
+            root.mkdir()
+            subprocess.run(["git", "init", "-q", str(root)], check=True)
+            (root / ".gitignore").write_text("shared/\nsecret.env\n")
+            (root / "app.py").write_text("print('app')\n")
+            (root / "secret.env").write_text("TOKEN=1\n")
+            scratch = root / "shared" / "handoff"
+            scratch.mkdir(parents=True)
+            (scratch / "notes.py").write_text("print('scratch')\n")
+            (scratch / ".env").write_text("SCRATCH_ONLY=1\n")
+            db_path = Path(td) / "map.db"
+            con = sqlite3.connect(db_path)
+            con.executescript(SCHEMA)
+            con.close()
+
+            patches = self._patches(root, db_path)
+            for patch in patches:
+                patch.start()
+            try:
+                self.assertEqual(0, map_repo.main())
+            finally:
+                for patch in patches:
+                    patch.stop()
+
+            con = sqlite3.connect(db_path)
+            paths = [r[0] for r in con.execute("SELECT path FROM dr_filepath ORDER BY path")]
+            env_names = [r[0] for r in con.execute("SELECT name FROM dr_env")]
+            con.close()
+
+        self.assertEqual([".gitignore", "app.py"], paths)
+        self.assertEqual([], env_names)
+
+    def test_empty_scan_refuses_and_keeps_authored_rows(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "repo"
+            (root / "node_modules").mkdir(parents=True)
+            (root / "node_modules" / "x.js").write_text("// skipped\n")
+            db_path = Path(td) / "map.db"
+            con = sqlite3.connect(db_path)
+            con.executescript(SCHEMA)
+            con.execute(
+                "INSERT INTO dr_filepath (path, ext, lang, role, desc) "
+                "VALUES ('keep.py', '.py', 'Python', 'code', 'authored line')")
+            con.execute(
+                "INSERT INTO dr_repo (repo_id, name, file_count, mapped_at) "
+                "VALUES (1, 'repo', 1, '2026-09-22T20:25:09')")
+            con.commit()
+            con.close()
+
+            patches = self._patches(root, db_path) + (
+                mock.patch.object(map_repo, "git", return_value=""),)
+            for patch in patches:
+                patch.start()
+            try:
+                with mock.patch("sys.stderr") as err:
+                    self.assertEqual(1, map_repo.main())
+                    self.assertTrue(err.write.called)
+            finally:
+                for patch in patches:
+                    patch.stop()
+
+            con = sqlite3.connect(db_path)
+            rows = con.execute("SELECT path, desc FROM dr_filepath").fetchall()
+            repo = con.execute("SELECT file_count, mapped_at FROM dr_repo").fetchall()
+            con.close()
+
+        self.assertEqual([("keep.py", "authored line")], rows)
+        self.assertEqual([(1, "2026-09-22T20:25:09")], repo)
+
+
+class ComposeMapPathTest(unittest.TestCase):
+    def test_boot_render_reads_the_mapper_db_path(self):
+        self.assertEqual(artifact_policy.map_db_path(), compose.MAP_DB_PATH)
