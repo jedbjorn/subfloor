@@ -19,8 +19,8 @@ fact it says so or omits the line — it never goes looking.
 
 Selectors:
   --task       any authenticated shell (the shared planning-read posture).
-  --work-unit  only the unit's assigned Developer or an Admin (FnB recovery)
-               shell; anyone else gets a bounded refusal without lane details.
+  --work-unit  the unit's assigned Developer, named Reviewer, or an Admin
+               (FnB recovery) shell; anyone else gets a bounded refusal.
 """
 from __future__ import annotations
 
@@ -302,7 +302,9 @@ def _select_work_unit(con, work_unit_id: int, caller: dict) -> dict:
         "WHERE u.work_unit_id=?", (work_unit_id,)).fetchone()
     if u is None:
         raise ContextError(404, "unknown_work_unit", f"no such work unit: {work_unit_id}")
-    if int(u["assigned_shell_id"]) != int(caller["shell_id"]) and caller["flavor"] != "admin":
+    if (int(caller["shell_id"]) not in
+            (int(u["assigned_shell_id"]), int(u["reviewer_shell_id"]))
+            and caller["flavor"] != "admin"):
         raise ContextError(403, "work_unit_not_owned",
                            f"work unit {work_unit_id} is not assigned to this shell")
     sprint_id = int(u["sprint_id"])
@@ -378,6 +380,7 @@ def _select_work_unit(con, work_unit_id: int, caller: dict) -> dict:
             "disposition": u["disposition"], "planned_wave": u["planned_wave"],
             "assigned": u["assigned_shortname"], "reviewer": u["reviewer_shortname"],
             "assigned_shell_id": int(u["assigned_shell_id"]),
+            "reviewer_shell_id": int(u["reviewer_shell_id"]),
             "dependencies": dependencies,
             "unit_blockers": blockers,
             "pending_assignment_message_id": int(pending["message_id"]) if pending else None,
@@ -599,9 +602,12 @@ def project(con, *, task_id: int | None = None, work_unit_id: int | None = None,
             "rule": "one active lane; edit only your own worktree",
         }
         boundaries["walls"].append(SPRINT_WALLS.get(sprint["lifecycle"], sprint["lifecycle"]))
+        is_developer = caller["shell_id"] == unit["assigned_shell_id"]
+        is_reviewer = caller["shell_id"] == unit["reviewer_shell_id"] and not is_developer
         boundaries["walls"].append(
             f"unit #{uid} is {unit['disposition']}: "
-            + LANE_WALLS.get(unit["disposition"], unit["disposition"]))
+            + (LANE_WALLS.get(unit["disposition"], unit["disposition"])
+               if is_developer else "read the current unit state"))
         if unit["output_kind"] != "code":
             boundaries["walls"].append(
                 f"output kind {unit['output_kind']} — may complete without a PR")
@@ -609,14 +615,20 @@ def project(con, *, task_id: int | None = None, work_unit_id: int | None = None,
             if d["disposition"] not in ("completed",):
                 boundaries["walls"].append(
                     f"direct dependency #{d['work_unit_id']} is {d['disposition']}")
-        if unit["pending_assignment_message_id"] is not None:
+        if is_developer and unit["pending_assignment_message_id"] is not None:
             boundaries["actions"].append(
                 f"sc sprint accept --sprint {sid} --message {unit['pending_assignment_message_id']}")
-        if sprint["lifecycle"] == "armed":
+        if is_developer and sprint["lifecycle"] == "armed":
             boundaries["actions"].extend(
                 a.format(sprint=sid, unit=uid) for a in LANE_ACTIONS.get(unit["disposition"], ()))
+        if is_reviewer and sprint["lifecycle"] == "armed" and unit["disposition"] == "in_review":
+            boundaries["actions"].append(
+                f"sc sprint record-review --sprint {sid} --registered-pr <id> "
+                "--verdict approved|changes_requested --body-file <path> --key <stable-key>")
         boundaries["actions"].append(f"sc sprint inbox --sprint {sid}")
-        boundaries["reserved"].extend(RESERVED_TO_OTHERS)
+        boundaries["reserved"].extend(
+            item for item in RESERVED_TO_OTHERS
+            if not is_reviewer or not item.startswith("review verdicts:"))
 
     # Resources — the catalogue as abbreviated documentation, never a mandate.
     resources = {
