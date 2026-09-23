@@ -186,6 +186,7 @@ RUN echo "harness epoch: ${SC_HARNESS_EPOCH}" \
  && timeout --signal=TERM --kill-after=10s 180s \
       env KIMI_INSTALL_DIR=/usr/local KIMI_NO_MODIFY_PATH=1 \
       bash /tmp/kimi-install.sh \
+ && /usr/local/bin/kimi --version \
  && rm -f /tmp/kimi-install.sh
 
 # A user matching the host uid/gid so bind-mounted files aren't root-owned.
@@ -223,9 +224,14 @@ ENV PATH=/home/${SC_USER}/.local/bin:/home/${SC_USER}/.opencode/bin:${PATH}
 # SC_HARNESS_EPOCH is referenced so a rolled epoch re-runs these installers; they
 # resolve "latest" themselves, so the epoch is an expiry, not a version pin.
 RUN echo "harness epoch: ${SC_HARNESS_EPOCH}" \
- && curl -fsSL https://claude.ai/install.sh | bash \
- && curl -fsSL https://opencode.ai/install | bash \
- && curl -fsSL https://chatgpt.com/codex/install.sh | sh \
+ && curl -fsSL -o /tmp/claude-install.sh https://claude.ai/install.sh \
+ && bash /tmp/claude-install.sh \
+ && claude --version \
+ && curl -fsSL -o /tmp/opencode-install.sh https://opencode.ai/install \
+ && bash /tmp/opencode-install.sh \
+ && opencode --version \
+ && curl -fsSL -o /tmp/codex-install.sh https://chatgpt.com/codex/install.sh \
+ && sh /tmp/codex-install.sh \
  && codex_installed="$(readlink -f "$HOME/.local/bin/codex")" \
  && codex_code_mode_host="$(dirname "$codex_installed")/codex-code-mode-host" \
  && test -x "$codex_installed" \
@@ -235,7 +241,11 @@ RUN echo "harness epoch: ${SC_HARNESS_EPOCH}" \
  && install -m 0755 "$codex_code_mode_host" "$HOME/.local/libexec/codex-code-mode-host" \
  && ln -sfn "$HOME/.local/libexec/codex" "$HOME/.local/bin/codex" \
  && "$HOME/.local/bin/codex" --version \
- && curl -LsSf https://mistral.ai/vibe/install.sh | bash
+ && curl -LsSf -o /tmp/vibe-install.sh https://mistral.ai/vibe/install.sh \
+ && bash /tmp/vibe-install.sh \
+ && vibe --version \
+ && rm -f /tmp/claude-install.sh /tmp/opencode-install.sh \
+          /tmp/codex-install.sh /tmp/vibe-install.sh
 
 # Stamp the epoch the harness layers were built with, so an image can be asked
 # what it is rather than guessed at: `./sc harness-status` reads this label and

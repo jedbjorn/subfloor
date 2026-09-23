@@ -184,6 +184,14 @@ class HarnessEpochDockerfile(unittest.TestCase):
             "durable Codex state stays mounted; isolate its executable",
         )
 
+    def test_harness_downloads_fail_before_installer_execution(self):
+        """A failed curl piped into bash exits zero on an empty script."""
+        for run in self.harness_runs():
+            with self.subTest(run=run[:60]):
+                self.assertNotRegex(run, r"curl [^|]+\| (?:ba)?sh")
+                self.assertIn("curl ", run)
+                self.assertIn(" -o /tmp/", run)
+
 class RetainedHarnessInstall(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
@@ -212,6 +220,25 @@ class RetainedHarnessInstall(unittest.TestCase):
             status = self.install.ensure_harnesses()
 
         self.assertEqual(status, {name: "no-curl" for name in self.install.HARNESS_INSTALL})
+
+    def test_failed_pipeline_download_is_not_reported_as_success(self):
+        rc, _, _ = self.install._run_harness_install("test", "false | true", "updating")
+        self.assertNotEqual(rc, 0)
+
+    def test_update_requires_a_binary_after_successful_installer_exit(self):
+        with mock.patch.dict(self.install.HARNESS_INSTALL, {"test": "true"}, clear=True), \
+                mock.patch.object(self.install.shutil, "which", return_value="/bin/curl"), \
+                mock.patch.object(self.install, "_harness_installed", return_value=False), \
+                mock.patch.object(self.install, "_run_harness_install", return_value=(0, "", 0)), \
+                mock.patch.object(self.install.global_pointer, "reconcile"):
+            self.assertEqual(self.install.update_harnesses(), {"test": "failed"})
+
+    def test_update_command_exits_nonzero_on_partial_failure(self):
+        with mock.patch.object(self.install, "report_host_runtime"), \
+                mock.patch.object(self.install, "update_harnesses", return_value={
+                    "claude": "updated", "codex": "failed",
+                }):
+            self.assertEqual(self.install.main(["--update-harnesses"]), 1)
 
 
 class ScFixture:
@@ -449,6 +476,14 @@ class ScHarnessCommands(unittest.TestCase):
         self.assertFalse(
             [c for c in self.fx.calls() if c.startswith("docker build")]
         )
+
+    def test_update_harnesses_refuses_unreachable_sandbox_runtime(self):
+        result = self.fx.run("update-harnesses", SC_TEST_DAEMON_DOWN="1")
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("docker daemon not reachable", result.stderr)
+        self.assertFalse(self.fx.epoch_file.exists())
+        self.assertEqual([c for c in self.fx.calls() if c.startswith("curl ")], [])
 
     def test_update_harnesses_does_not_install_onto_the_host_when_docker_runs(self):
         """The old behavior: run the installers here, report success, change

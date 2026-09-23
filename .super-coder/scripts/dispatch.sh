@@ -1188,16 +1188,14 @@ case "$cmd" in
     if sc_host_runtime; then
       echo "→ runtime host — updating this host's harness CLIs (the host IS the runtime)"
       "$PY" "$S/install.py" --update-harnesses
-    elif command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
+    else
+      dcheck
       epoch="$(harness_epoch_roll)"
       echo "→ harness epoch rolled to $epoch"
       dbuild
       echo "→ image rebuilt with fresh harness CLIs"
       sc_harness_status || true
       echo "  running sandboxes keep the OLD image until they restart: ./sc restart --no-build"
-    else
-      echo "→ no docker — updating this host's harness CLIs (the no-docker runtime)"
-      "$PY" "$S/install.py" --update-harnesses
     fi ;;
   harness-status)  sc_harness_status ;;
   docker-cache-gc) exec "$PY" "$S/docker_cache.py" "$@" ;;
@@ -1819,9 +1817,8 @@ Subfloor — forkable shell substrate — full command reference (./sc help for 
                              first runs git pull --ff-only for any tracked checkout; source repos then reconcile FROM that tree.
                              Advisory, never blocking: an unsafe/offline pull WARNS and engine update continues from the current
                              checkout. Update never merges, rebases or resets. --no-fetch skips checkout and engine network sync.
-  ./sc update-harnesses    refresh the harness CLIs the SHELLS run: rolls the harness epoch + rebuilds the sandbox image
-                             (they are image-owned — activate that exact build with ./sc restart --no-build)
-                             without docker, updates this host's CLIs instead — there the host IS the runtime
+  ./sc update-harnesses    refresh shell CLIs: rebuild the sandbox image or run host installers, per selected runtime
+                             sandbox: activate the image with ./sc restart --no-build; host: installer failures are fatal
   ./sc harness-cleanup     check legacy global pointers (--apply to clean; API-independent)
   ./sc harness-status      report the harness CLI versions inside the sandbox + whether the image owes a harness rebuild
                              (a model the shells cannot reach is nearly always this — see .super-coder/docs/harness-freshness.md)
