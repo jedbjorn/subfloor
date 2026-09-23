@@ -10,6 +10,7 @@ import sys
 import tempfile
 import time
 import unittest
+import zipfile
 from contextlib import closing, redirect_stdout
 from datetime import datetime, timezone
 from pathlib import Path
@@ -1588,11 +1589,12 @@ class ConversationResourceTest(ConversationApiCase):
         self.assertEqual(status, 413, error)
         self.assertEqual(error["error"]["code"], "SOURCE_TOO_LARGE")
 
-    def upload(self, conversation_id: str, raw: bytes):
+    def upload(self, conversation_id: str, raw: bytes, name: str = ""):
         return decoded(
             conversation_routes.handle(
                 "POST",
-                f"/api/conversations/{conversation_id}/uploads",
+                f"/api/conversations/{conversation_id}/uploads"
+                + (f"?name={quote(name)}" if name else ""),
                 self.headers(extra={"Content-Type": "image/png"}),
                 raw,
             )
@@ -1625,13 +1627,73 @@ class ConversationResourceTest(ConversationApiCase):
         status, _, payload = self.upload(conversation_id, webp)
         self.assertEqual(status, 201, payload)
         self.assertEqual(Path(payload["path"]).suffix, ".webp")
+        self.assertEqual(payload["kind"], "image")
+
+    def test_upload_stores_documents_under_their_sanitized_names(self) -> None:
+        conversation_id = self.create(key="upload-docs")["conversation_id"]
+        pdf = b"%PDF-1.7\n%body"
+
+        status, _, payload = self.upload(conversation_id, pdf, "Q3 budget (v2).PDF")
+        path = Path(payload["path"])
+        self.assertEqual(status, 201, payload)
+        self.assertEqual(payload["kind"], "document")
+        self.assertEqual(path.parent.name, conversation_id)
+        self.assertTrue(path.name.endswith("-Q3-budget-v2.pdf"), path.name)
+        self.assertEqual(path.read_bytes(), pdf)
+
+        for extension, part in (
+            ("docx", "word/document.xml"),
+            ("xlsx", "xl/workbook.xml"),
+            ("pptx", "ppt/presentation.xml"),
+        ):
+            buffer = io.BytesIO()
+            with zipfile.ZipFile(buffer, "w") as package:
+                package.writestr("[Content_Types].xml", "<Types/>")
+                package.writestr(part, "<x/>")
+            status, _, payload = self.upload(
+                conversation_id, buffer.getvalue(), f"report.{extension}"
+            )
+            self.assertEqual(status, 201, payload)
+            self.assertEqual(payload["extension"], extension)
+
+        status, _, payload = self.upload(conversation_id, b"a,b\n1,2\n", "data.csv")
+        self.assertEqual(status, 201, payload)
+        self.assertEqual(Path(payload["path"]).suffix, ".csv")
+
+        # A name the sanitizer empties still stores, under the hash alone.
+        status, _, payload = self.upload(conversation_id, b"notes", "../???.txt")
+        self.assertEqual(status, 201, payload)
+        self.assertEqual(Path(payload["path"]).parent.name, conversation_id)
+
+    def test_upload_rejects_documents_whose_content_contradicts_the_name(
+        self,
+    ) -> None:
+        conversation_id = self.create(key="upload-doc-mismatch")["conversation_id"]
+        buffer = io.BytesIO()
+        with zipfile.ZipFile(buffer, "w") as package:
+            package.writestr("xl/workbook.xml", "<x/>")
+        workbook = buffer.getvalue()
+
+        for raw, name in (
+            (b"MZ\x90\x00", "tool.exe"),
+            (b"MZ\x90\x00", "renamed.pdf"),
+            (workbook, "not-a-word-doc.docx"),
+            (b"PK\x03\x04broken", "broken.xlsx"),
+            (b"text\0with-nul", "binary.txt"),
+            (b"\xff\xfe\x00bad", "latin.csv"),
+            (b"<svg></svg>", ""),
+        ):
+            status, _, error = self.upload(conversation_id, raw, name)
+            self.assertEqual(status, 415, (name, error))
+            self.assertEqual(error["error"]["code"], "UPLOAD_UNSUPPORTED_TYPE")
+        self.assertIn("pdf", error["error"]["details"]["allowed_extensions"])
 
     def test_upload_rejects_non_images_oversize_and_unknown_chats(self) -> None:
         conversation_id = self.create(key="upload-validation")["conversation_id"]
 
         status, _, error = self.upload(conversation_id, b"<svg></svg>")
         self.assertEqual(status, 415, error)
-        self.assertEqual(error["error"]["code"], "UPLOAD_NOT_IMAGE")
+        self.assertEqual(error["error"]["code"], "UPLOAD_UNSUPPORTED_TYPE")
 
         with mock.patch.object(conversation_routes, "UPLOAD_MAX_BYTES", 8):
             status, _, error = self.upload(conversation_id, b"\xff\xd8\xff" + b"x" * 8)

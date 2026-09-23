@@ -23,6 +23,7 @@ import stat
 import sys
 import time
 import uuid
+import zipfile
 from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
@@ -679,8 +680,57 @@ def _image_extension(raw: bytes) -> str | None:
     return None
 
 
-def _create_upload(con, operator: dict, conversation_id: str, raw: bytes):
-    """Store one dropped image and return the absolute path the turn cites."""
+# Office Open XML packages are zips; the part each format must contain is
+# what tells a .docx from any other zip renamed to one.
+_OOXML_PARTS = {
+    "docx": "word/document.xml",
+    "xlsx": "xl/workbook.xml",
+    "pptx": "ppt/presentation.xml",
+}
+_TEXT_EXTENSIONS = frozenset(
+    {"txt", "md", "csv", "tsv", "json", "yaml", "yml", "log"}
+)
+UPLOAD_EXTENSIONS = ("pdf", *_OOXML_PARTS, *sorted(_TEXT_EXTENSIONS))
+
+
+def _document_extension(raw: bytes, name: str) -> str | None:
+    """Admit a document by its name's extension, then verify the bytes match.
+
+    Documents carry no single signature, so the name picks the claim and the
+    content must back it: a PDF header, an OOXML package holding its main
+    part (listed, never extracted), or UTF-8 text without NUL bytes.
+    """
+    extension = Path(name).suffix.lower().removeprefix(".")
+    if extension == "pdf":
+        return extension if raw.startswith(b"%PDF-") else None
+    if extension in _OOXML_PARTS:
+        try:
+            with zipfile.ZipFile(io.BytesIO(raw)) as package:
+                names = set(package.namelist())
+        except zipfile.BadZipFile:
+            return None
+        return extension if _OOXML_PARTS[extension] in names else None
+    if extension in _TEXT_EXTENSIONS:
+        if b"\0" in raw:
+            return None
+        try:
+            raw.decode("utf-8")
+        except UnicodeDecodeError:
+            return None
+        return extension
+    return None
+
+
+def _upload_stem(name: str) -> str:
+    """The original file name, reduced to a path-safe stem the agent can read."""
+    stem = re.sub(r"[^A-Za-z0-9._-]+", "-", Path(name).stem).strip(".-")
+    return stem[:64]
+
+
+def _create_upload(
+    con, operator: dict, conversation_id: str, raw: bytes, name: str = ""
+):
+    """Store one dropped image or document; return the absolute path the turn cites."""
     _require_conversation(con, conversation_id, operator["user_id"])
     if len(raw) > UPLOAD_MAX_BYTES:
         raise ApiError(
@@ -689,25 +739,41 @@ def _create_upload(con, operator: dict, conversation_id: str, raw: bytes):
             f"upload exceeds {UPLOAD_MAX_BYTES} bytes",
             {"bytes": len(raw), "maximum_bytes": UPLOAD_MAX_BYTES},
         )
+    kind = "image"
     extension = _image_extension(raw)
+    if extension is None:
+        kind = "document"
+        extension = _document_extension(raw, name)
     if extension is None:
         raise ApiError(
             415,
-            "UPLOAD_NOT_IMAGE",
-            "upload must be a PNG, JPEG, GIF, or WebP image",
+            "UPLOAD_UNSUPPORTED_TYPE",
+            "upload must be a PNG, JPEG, GIF, or WebP image, or a "
+            + ", ".join(UPLOAD_EXTENSIONS)
+            + " file whose content matches its extension",
+            {"allowed_extensions": list(UPLOAD_EXTENSIONS)},
         )
     _sweep_chat_uploads(con, keep=conversation_id)
     directory = _chat_uploads_root() / conversation_id
     directory.mkdir(parents=True, exist_ok=True)
-    # Content-addressed: dropping the same image twice yields one file.
-    target = directory / f"{hashlib.sha256(raw).hexdigest()[:32]}.{extension}"
+    # Content-addressed: dropping the same file twice yields one file.  A
+    # document keeps its name after the hash so the agent sees what it is.
+    digest = hashlib.sha256(raw).hexdigest()[:32]
+    stem = _upload_stem(name) if kind == "document" else ""
+    basename = f"{digest}-{stem}" if stem else digest
+    target = directory / f"{basename}.{extension}"
     if not target.exists():
         partial = directory / f".{target.name}.{uuid.uuid4().hex}.part"
         partial.write_bytes(raw)
         os.replace(partial, target)
     return _json(
         201,
-        {"path": str(target), "bytes": len(raw), "extension": extension},
+        {
+            "path": str(target),
+            "bytes": len(raw),
+            "extension": extension,
+            "kind": kind,
+        },
     )
 
 
@@ -2854,9 +2920,13 @@ def handle(method: str, path: str, headers_raw: str, raw_body: bytes) -> tuple:
                 )
             uploads = _UPLOADS_PATH.fullmatch(parsed.path)
             if uploads and method == "POST":
-                # Raw image bytes, not JSON — routed before the body parse.
+                # Raw file bytes, not JSON — routed before the body parse.
                 return _create_upload(
-                    con, operator, uploads.group(1), raw_body
+                    con,
+                    operator,
+                    uploads.group(1),
+                    raw_body,
+                    (query.get("name") or [""])[0],
                 )
             body = _body(raw_body)
             if parsed.path == "/api/conversations/shell-release" and method == "POST":

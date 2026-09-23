@@ -664,14 +664,18 @@ and recovery controls. Large histories load in bounded pages and transcript
 snapshots; omitted display history remains durable. Rendered code blocks carry
 a copy-to-clipboard button.
 
-Images can be dropped onto the composer or pasted into it. The browser posts
-the raw bytes over the page's own origin, the API accepts only sniffed
-PNG/JPEG/GIF/WebP, stores the file content-addressed under
-`shared/chat-uploads/<conversation>/`, and the composer inserts
-`[image: <absolute path>]` into the message — so every harness reads it by
-path, with no adapter difference. Only images over the request cap are
-downscaled in the browser. Upload directories of closed or unknown
-conversations are swept on Close, on chat creation, and on each upload.
+Images and documents can be dropped onto the composer or pasted into it. The
+browser posts the raw bytes and file name over the page's own origin. The API
+accepts sniffed PNG/JPEG/GIF/WebP images, plus PDF, Word (`.docx`), Excel
+(`.xlsx`), PowerPoint (`.pptx`), and UTF-8 text files (`.txt`, `.md`, `.csv`,
+`.tsv`, `.json`, `.yaml`, `.yml`, `.log`) whose content matches their
+extension. It stores each file content-addressed under
+`shared/chat-uploads/<conversation>/` (documents keep a sanitized copy of
+their name), and the composer inserts `[image: <absolute path>]` or
+`[file: <absolute path>]` into the message — so every harness reads it by
+path, with no adapter difference. Uploads are capped at 8 MiB; only images
+over the cap are downscaled in the browser. Upload directories of closed or
+unknown conversations are swept on Close, on chat creation, and on each upload.
 
 **Reading a transcript.** Enter sends, Shift+Enter makes a newline. Model
 reasoning is collapsed behind a **Reasoning** disclosure and only one stays open

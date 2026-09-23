@@ -101,7 +101,7 @@ function requestKey() {
 }
 
 async function chatApi(path, method = "GET", body, idempotencyKey) {
-  // A Blob (a dropped image) travels as raw bytes; everything else is JSON.
+  // A Blob (a dropped file) travels as raw bytes; everything else is JSON.
   const raw = body instanceof Blob;
   const headers = body === undefined || raw ? {} : { "Content-Type": "application/json" };
   if (idempotencyKey) headers["Idempotency-Key"] = idempotencyKey;
@@ -5550,29 +5550,35 @@ async function chatRenderOpen(
     }
   };
   headerStop.onclick = () => stop.click();
-  // Dropped or pasted images upload to the engine host's shared/chat-uploads
+  // Dropped or pasted files upload to the engine host's shared/chat-uploads
   // and enter the message as a plain path, so every harness reads them alike
   // and the bytes ride whatever origin serves this page (tunnel included).
-  async function uploadImages(files) {
-    const images = [...files].filter((file) => file.type.startsWith("image/"));
-    if (!images.length || composer.disabled) return;
+  // The API decides what is accepted; only images are resized here.
+  async function uploadFiles(files) {
+    const picked = [...files];
+    if (!picked.length || composer.disabled) return;
     uploading += 1;
     pending.hidden = false;
-    pending.textContent = "uploading image…";
+    pending.textContent = "uploading file…";
     paint();
+    let current = picked[0];
     try {
-      for (const file of images) {
-        const { path } = await chatApi(
-          `/conversations/${conversation.conversation_id}/uploads`,
-          "POST", await chatFitImage(file));
+      for (const file of picked) {
+        current = file;
+        const body = file.type.startsWith("image/") ? await chatFitImage(file) : file;
+        const { path, kind } = await chatApi(
+          `/conversations/${conversation.conversation_id}/uploads`
+            + `?name=${encodeURIComponent(file.name || "")}`,
+          "POST", body);
+        const tag = kind === "image" ? "image" : "file";
         const at = composer.selectionEnd ?? composer.value.length;
         const before = composer.value.slice(0, at);
         const gap = before && !/\s$/.test(before) ? " " : "";
-        composer.value = `${before}${gap}[image: ${path}] ${composer.value.slice(at)}`;
+        composer.value = `${before}${gap}[${tag}: ${path}] ${composer.value.slice(at)}`;
       }
       pending.hidden = true;
     } catch (error) {
-      pending.textContent = `${error.code} — image not uploaded`;
+      pending.textContent = `${error.code} — ${current.name || "file"} not uploaded`;
       toast(`${error.code}: ${error.message}`);
     } finally {
       uploading -= 1;
@@ -5593,13 +5599,13 @@ async function chatRenderOpen(
     if (!hasFiles(event)) return;
     event.preventDefault();
     composerRow.classList.remove("drop-target");
-    uploadImages(event.dataTransfer.files);
+    uploadFiles(event.dataTransfer.files);
   };
   composer.onpaste = (event) => {
     const files = [...(event.clipboardData?.files || [])];
-    if (!files.some((file) => file.type.startsWith("image/"))) return;
+    if (!files.length) return;
     event.preventDefault();
-    uploadImages(files);
+    uploadFiles(files);
   };
   composer.onkeydown = (event) => {
     if (event.key === "Enter" && !event.shiftKey) {

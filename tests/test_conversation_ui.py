@@ -1682,11 +1682,13 @@ globalThis.fetch = async (url, init) => {
     interface = APP[APP.index("const CHAT_HARNESSES"):
                     APP.index("// ── Tabs + boot")]
     attach = interface[
-        interface.index("async function uploadImages(files)"):
-        interface.index("composer.onkeydown", interface.index("async function uploadImages"))
+        interface.index("async function uploadFiles(files)"):
+        interface.index("composer.onkeydown", interface.index("async function uploadFiles"))
     ]
     assert "/uploads`" in attach
-    assert "[image: ${path}]" in attach
+    assert "?name=${encodeURIComponent(file.name" in attach
+    assert 'const tag = kind === "image" ? "image" : "file";' in attach
+    assert "[${tag}: ${path}]" in attach
     assert "composerRow.ondrop =" in attach
     assert "composer.onpaste =" in attach
     assert "|| uploading > 0" in interface
