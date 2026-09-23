@@ -68,7 +68,10 @@ class WakeLease:
     receiver_shell_id: int
     message_ids: tuple[int, ...]
     declared_types: tuple[str, ...]
-    prompt: str
+    # One prompt per message, aligned with message_ids: each message is its
+    # own queued turn, so a procedure that ends its turn cannot strand a
+    # message that arrived in the same wake.
+    prompts: tuple[str, ...]
     idempotency_key: str
     attempt_number: int
     claim_owner: str
@@ -1218,7 +1221,10 @@ class SprintWakeDeliveryService:
                 declared_types=tuple(
                     str(message["declared_type"]) for message in messages
                 ),
-                prompt=self._delivery_prompt(route_sprint_id, route_role, messages),
+                prompts=tuple(
+                    self._delivery_prompt(route_sprint_id, route_role, [message])
+                    for message in messages
+                ),
                 idempotency_key=str(row["idempotency_key"]),
                 attempt_number=int(row["attempt_count"]) + 1,
                 claim_owner=owner,
@@ -1399,11 +1405,20 @@ class SprintWakeDeliveryService:
         target_conversation_id = None
         try:
             target_conversation_id = self._resolve_conversation(lease)
-            native_run_ref = deliver(
-                target_conversation_id,
-                lease.prompt,
-                lease.idempotency_key,
-            )
+            # The last turn carries the wake's own key so turn evidence and
+            # health, which resolve the wake by that key and its run ref,
+            # track the final queued turn.
+            last = len(lease.prompts) - 1
+            for index, (message_id, prompt) in enumerate(
+                zip(lease.message_ids, lease.prompts, strict=True)
+            ):
+                native_run_ref = deliver(
+                    target_conversation_id,
+                    prompt,
+                    lease.idempotency_key
+                    if index == last
+                    else f"{lease.idempotency_key}:message:{message_id}",
+                )
         except ForceNewDeferred:
             self._defer_force_new(lease)
             return DeliveryOutcome(
