@@ -449,7 +449,7 @@ def test_start_chat_uses_the_searchable_dropdown_over_the_hidden_select():
     assert "const modelDropdown = chatModelDropdown(modelSelect, describeModel);" in new_chat
     assert "modelDropdown.refresh();" in new_chat
     assert '"Model"), modelDropdown.root,' in new_chat
-    assert "modelSelect.onchange = paintEfforts;" in new_chat
+    assert "modelSelect.onchange = () => paintEfforts();" in new_chat
 
 
 @pytest.mark.skipif(shutil.which("node") is None, reason="node is required")

@@ -4714,7 +4714,7 @@ async function chatRenderNew(host, shell, defaults, catalog) {
     paintEfforts();
   };
   harnessSelect.onchange = paintModels;
-  modelSelect.onchange = paintEfforts;
+  modelSelect.onchange = () => paintEfforts();
   effortSelect.onchange = () => paintEfforts(effortSelect.value);
   paintModels();
   form.append(
