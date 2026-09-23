@@ -451,6 +451,32 @@ def _fresh(cached: dict) -> bool:
         return False
 
 
+def _local_model_sources_changed(cached: dict, env) -> bool:
+    """Expire the public catalog when a signed-in CLI changes its model list."""
+    try:
+        fetched_at = datetime.fromisoformat(cached["fetched_at"]).timestamp()
+    except (KeyError, TypeError, ValueError):
+        return False  # _fresh already rejects this cache
+    for binary, home_var, default_home, filename, source in (
+        ("codex", "CODEX_HOME", ".codex", "models_cache.json", "codex-cache"),
+        ("kimi", "KIMI_CODE_HOME", ".kimi-code", "config.toml", "kimi-config"),
+    ):
+        if not shutil.which(binary):
+            continue
+        root = Path(env.get(home_var) or (Path.home() / default_home))
+        try:
+            changed_at = (root / filename).stat().st_mtime
+        except FileNotFoundError:
+            if source in (cached.get("sources") or []):
+                return True
+            continue
+        except OSError:
+            continue  # the live refresh reports unreadable evidence on its own
+        if changed_at > fetched_at:
+            return True
+    return False
+
+
 _FLOOR_FAMILY = {"fable": "claude-fable", "opus": "claude-opus",
                  "sonnet": "claude-sonnet", "haiku": "claude-haiku"}
 
@@ -1294,6 +1320,7 @@ def catalog(refresh: bool = False, fetch=_http_json, env=os.environ,
         refresh_required = not refresh and con is not None and authority is None
         serve_cached = bool(
             cached and not refresh and not refresh_required and _fresh(cached)
+            and (cached.get("stale") or not _local_model_sources_changed(cached, env))
             and (
                 authority is _GENERATION_TABLE_UNAVAILABLE
                 or cached.get("catalogue_generation") == authority
