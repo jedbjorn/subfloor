@@ -6,8 +6,8 @@ The contract under test:
     identity + hash (current outside a Sprint, immutable bound revision inside),
     active linked decisions once, feature-level flags labeled as such, direct
     dependencies, unit-scoped blockers by pointer;
-  • access: `--task` for any authenticated shell, `--work-unit` only for the
-    assigned Developer or an Admin, bounded refusal otherwise; unknown ids 404;
+  • access: `--task` for any authenticated shell, `--work-unit` for the
+    assigned Developer, named Reviewer, or an Admin; bounded refusal otherwise;
   • boundaries render usable absolute paths and known walls, never shorthand or
     invented permissions; unavailable facts are absent, not fabricated;
   • resources describe the map + declared hooks without preloading rows;
@@ -418,7 +418,17 @@ class ProjectorTest(unittest.TestCase):
     def test_work_unit_access(self):
         ids = seed_feature(self.con)
         sp = seed_sprint(self.con, ids)
-        for shell_id in (2, 3, 5):
+        reviewer = self.project(work_unit_id=sp["unit"], caller_shell_id=2)
+        self.assertEqual(reviewer["boundaries"]["role"],
+                         f"reviewer · Sprint {sp['sprint']} reviewer")
+        self.assertEqual(reviewer["assignment"]["work_unit"]["title"], "Projector lane")
+        self.assertNotIn("register-pr", " ".join(reviewer["boundaries"]["actions"]))
+        self.assertFalse(any("sc sprint accept" in action
+                             for action in reviewer["boundaries"]["actions"]))
+        self.con.execute(
+            "INSERT INTO shells (shell_id,display_name,shortname,flavor,system_prompt,user_id) "
+            "VALUES (6,'Other reviewer','REV2','reviewer','p',1)")
+        for shell_id in (3, 5, 6):
             with self.assertRaises(tc.ContextError) as ctx:
                 self.project(work_unit_id=sp["unit"], caller_shell_id=shell_id)
             self.assertEqual(ctx.exception.status, 403)
@@ -426,6 +436,15 @@ class ProjectorTest(unittest.TestCase):
         admin = self.project(work_unit_id=sp["unit"], caller_shell_id=4)
         self.assertEqual(admin["boundaries"]["role"], "admin · FnB recovery read (not a participant)")
         self.assertEqual(admin["assignment"]["work_unit"]["title"], "Projector lane")
+
+    def test_reviewer_projection_uses_reviewer_actions_during_review(self):
+        ids = seed_feature(self.con)
+        sp = seed_sprint(self.con, ids, disposition="in_review")
+        boundaries = self.project(work_unit_id=sp["unit"], caller_shell_id=2)["boundaries"]
+        self.assertTrue(any("record-review" in action for action in boundaries["actions"]))
+        self.assertFalse(any("sc sprint accept" in action for action in boundaries["actions"]))
+        self.assertFalse(any("register-pr" in action for action in boundaries["actions"]))
+        self.assertNotIn("review verdicts: Reviewer", boundaries["reserved"])
 
     def test_task_linked_to_a_unit_points_at_the_work_unit_selector(self):
         ids = seed_feature(self.con)
@@ -769,7 +788,7 @@ class ApiRouteTest(unittest.TestCase):
             self.assertEqual(body["boundaries"]["seat"], "container")
             self.assertEqual(body["boundaries"]["git"]["branch"], "feat/y")
 
-    def test_work_unit_read_enforces_owner_or_admin(self):
+    def test_work_unit_read_enforces_assigned_roles_or_admin(self):
         uid = self.sp["unit"]
         status, owner = self.request(f"/_sc/context?work_unit={uid}", token=DEV_TOKEN)
         self.assertEqual(status, 200)
@@ -777,7 +796,11 @@ class ApiRouteTest(unittest.TestCase):
                          "immutable Sprint revision")
         status, _ = self.request(f"/_sc/context?work_unit={uid}", token=ADM_TOKEN)
         self.assertEqual(status, 200)
-        for token in (OTHER_TOKEN, REV_TOKEN, PLN_TOKEN):
+        status, reviewer = self.request(f"/_sc/context?work_unit={uid}", token=REV_TOKEN)
+        self.assertEqual(status, 200)
+        self.assertEqual(reviewer["boundaries"]["role"],
+                         f"reviewer · Sprint {self.sp['sprint']} reviewer")
+        for token in (OTHER_TOKEN, PLN_TOKEN):
             status, refusal = self.request(f"/_sc/context?work_unit={uid}", token=token)
             self.assertEqual(status, 403)
             self.assertEqual(refusal["code"], "work_unit_not_owned")
