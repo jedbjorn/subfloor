@@ -1897,6 +1897,27 @@ class CatalogCacheTest(NoCLI):
             first["harnesses"]["opencode"]["observed_at"],
         )
 
+    def test_changed_codex_model_cache_refreshes_an_otherwise_fresh_catalog(self):
+        home = Path(self.tmp.name) / "codex"
+        home.mkdir()
+        source = home / "models_cache.json"
+        source.write_text(json.dumps({"models": [{"slug": "gpt-old",
+            "supported_reasoning_levels": [{"effort": "high"}]}]}))
+        env = {"CODEX_HOME": str(home)}
+        run = mock.Mock(return_value=SimpleNamespace(
+            returncode=0, stdout="codex-cli 0.156.0\n", stderr=""))
+        with mock.patch.object(mc.shutil, "which", side_effect=lambda name:
+                               "/bin/codex" if name == "codex" else None):
+            first = mc.catalog(fetch=fetch_ok, env=env, run=run)
+            self.assertIn("gpt-old", ids(first["harnesses"]["codex"]))
+            source.write_text(json.dumps({"models": [{"slug": "gpt-new",
+                "supported_reasoning_levels": [{"effort": "high"}]}]}))
+            refreshed_at = datetime.fromisoformat(first["fetched_at"]).timestamp() + 1
+            os.utime(source, (refreshed_at, refreshed_at))
+            second = mc.catalog(fetch=fetch_ok, env=env, run=run)
+        self.assertIn("gpt-new", ids(second["harnesses"]["codex"]))
+        self.assertNotIn("gpt-old", ids(second["harnesses"]["codex"]))
+
     def test_global_stale_cache_cannot_replace_successful_live_blocks(self):
         mc.catalog(
             fetch=fetch_ok,

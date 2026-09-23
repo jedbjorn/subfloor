@@ -449,7 +449,77 @@ def test_start_chat_uses_the_searchable_dropdown_over_the_hidden_select():
     assert "const modelDropdown = chatModelDropdown(modelSelect, describeModel);" in new_chat
     assert "modelDropdown.refresh();" in new_chat
     assert '"Model"), modelDropdown.root,' in new_chat
-    assert "modelSelect.onchange = paintEfforts;" in new_chat
+    assert "modelSelect.onchange = () => paintEfforts();" in new_chat
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node is required")
+def test_configure_keeps_a_chosen_thinking_level_until_the_model_changes():
+    renderer = APP[APP.index("function nativeOptionLabel"):
+                   APP.index("function dmModelPicker")]
+    configure = APP[APP.index("async function chatRenderNew"):
+                    APP.index("function chatTranscriptPageItems")]
+    script = r"""
+const CHAT_HARNESS_DEFAULT_VALUE = "__sc_harness_default__";
+class Node {
+  constructor(tag, props = {}) {
+    this.tag = tag; this.children = []; this._value = undefined;
+    Object.assign(this, props);
+  }
+  append(...children) { this.children.push(...children); }
+  replaceChildren(...children) { this.children = [...children]; this._value = undefined; }
+  get value() { return this._value === undefined
+    ? (this.children.find((child) => child.selected)
+      || this.children.find((child) => child.tag === "option"))?.value || ""
+    : this._value; }
+  set value(value) { this._value = value; }
+}
+const el = (tag, props = {}, ...children) => {
+  const node = new Node(tag, props); node.append(...children); return node;
+};
+function chatModelDropdown(select) { return {root: el("div", {}, select), refresh() {}}; }
+function chatModelOptions(select, catalog, harness, defaultModel) {
+  select.replaceChildren(el("option", {value: ""}));
+  for (const model of catalog.harnesses[harness].models)
+    select.append(el("option", {value: model.id}));
+}
+function chatHarnessUnavailableReason() { return null; }
+function CHAT_HARNESSES_FROM_SERVER() { return ["codex"]; }
+function chatBusyToast() {}
+function chatWithShellRelease(action) { return action(); }
+function chatCreateConversation(_shell, body) { submitted = body; return Promise.resolve({conversation_id: "1"}); }
+function chatHash() { return "chat/1"; }
+let submitted = null;
+const location = {hash: ""};
+""" + renderer + configure + r"""
+(async () => {
+  const host = el("div");
+  const defaults = {flavors: {dev: [{harness: "codex", model: "gpt-a",
+    effort: "medium", is_default: true}]}, harness_status: {}};
+  const catalog = {stale: false, harnesses: {codex: {models: [
+    {id: "gpt-a", availability: "available", supported_efforts: ["low", "medium", "high"]},
+    {id: "gpt-b", availability: "available", supported_efforts: ["low", "high"]},
+  ]}}};
+  await chatRenderNew(host, {flavor: "dev", display_name: "Dev"}, defaults, catalog);
+  const form = host.children[0];
+  const model = form.children.find((node) => node.tag === "div"
+    && node.children.some((child) => child.tag === "select"))?.children[0];
+  const effort = form.children.find((node) => node.ariaLabel === "Thinking level");
+  const initial = effort.value;
+  effort.value = "low"; effort.onchange();
+  const chosen = effort.value;
+  model.value = "gpt-b"; model.onchange();
+  const switched = effort.value;
+  effort.value = "low"; effort.onchange();
+  await form.onsubmit({preventDefault() {}});
+  console.log(JSON.stringify({initial, chosen, switched, submitted}));
+})();
+"""
+    result = run_js(script)
+    assert result["initial"] == "medium"
+    assert result["chosen"] == "low"
+    assert result["switched"] == "high"
+    assert result["submitted"]["model"] == "gpt-b"
+    assert result["submitted"]["effort"] == "low"
 
 
 @pytest.mark.skipif(shutil.which("node") is None, reason="node is required")

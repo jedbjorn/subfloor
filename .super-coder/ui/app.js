@@ -4682,16 +4682,20 @@ async function chatRenderNew(host, shell, defaults, catalog) {
   });
   const routeNote = el("div", { className: "chat-route-note" });
   let effortState;
-  const paintEfforts = () => {
+  const paintEfforts = (selectedEffort) => {
     const row = byHarness[harness] || {};
     const unavailable = chatHarnessUnavailableReason(
       defaults.harness_status?.[harness],
     );
     const harnessDefault = modelSelect.value === CHAT_HARNESS_DEFAULT_VALUE;
     const model = harnessDefault ? null : modelSelect.value || row.model || null;
-    const preferred = modelSelect.value && !harnessDefault
-      ? effortSelect.value || null
-      : row.effort ?? row.effective_effort;
+    // A new model starts with its own supported default. Only an actual
+    // Thinking level change carries the current selection into the repaint.
+    const preferred = selectedEffort !== undefined
+      ? selectedEffort
+      : modelSelect.value && !harnessDefault
+        ? null
+        : row.effort ?? row.effective_effort;
     effortState = renderNativeOptionControl(
       effortSelect, harness, catalog, model, preferred);
     submit.disabled = Boolean(
@@ -4710,8 +4714,8 @@ async function chatRenderNew(host, shell, defaults, catalog) {
     paintEfforts();
   };
   harnessSelect.onchange = paintModels;
-  modelSelect.onchange = paintEfforts;
-  effortSelect.onchange = paintEfforts;
+  modelSelect.onchange = () => paintEfforts();
+  effortSelect.onchange = () => paintEfforts(effortSelect.value);
   paintModels();
   form.append(
     el("div", { className: "chat-new-copy" },
