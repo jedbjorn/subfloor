@@ -1560,7 +1560,10 @@ class SprintBoundRouteDispatchProof(unittest.TestCase):
         self.assertIsNotNone(outcome)
         self.assertEqual(receipt.wake_id, outcome.wake_id)
         self.assertEqual(("delivered", 1), (outcome.state, outcome.attempt_number))
-        self.assertEqual(len(deliveries), 1)
+        # The undelivered assignment and the follow-up each queue their own
+        # turn in the same chat.
+        self.assertEqual(len(deliveries), 2)
+        self.assertEqual(deliveries[0][0], deliveries[1][0])
         self.assertEqual(before, (1, 1, 1, 1))
         self.assertEqual(
             tuple(self.con.execute(

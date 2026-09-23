@@ -1178,8 +1178,11 @@ class ForceNewDeliveryTest(SprintMessageCase):
 
         self.assertEqual(force.wake_id, outcome.wake_id)
         self.assertNotEqual(self.developer_conversation_id, observed[0][0])
+        self.assertEqual(2, len(observed))
+        self.assertEqual(observed[0][0], observed[1][0])
         self.assertIn(f"wake_message #{force.message_id}", observed[0][1])
-        self.assertIn(f"wake_message #{plain.message_id}", observed[0][1])
+        self.assertNotIn(f"wake_message #{plain.message_id}", observed[0][1])
+        self.assertIn(f"wake_message #{plain.message_id}", observed[1][1])
         self.assertEqual(
             ("closed", observed[0][0]),
             (
@@ -1415,7 +1418,8 @@ class ForceNewDeliveryTest(SprintMessageCase):
             self.con.commit()
             return f"conversation-run:{run_id}"
 
-        first_run = native(first_target, lease.prompt, lease.idempotency_key)
+        (prompt,) = lease.prompts
+        first_run = native(first_target, prompt, lease.idempotency_key)
         pid, start_ticks = active_chat_registry.process_identity(str(os.getpid()))
         self.con.execute(
             "UPDATE active_shell_chats SET process_pid=?,process_start_ticks=? "
@@ -1495,18 +1499,24 @@ class WakeDeliveryTest(SprintMessageCase):
         first = self.send("mixed-reenter", declared_type="re-enter")
         second = self.send("mixed-new", declared_type="new")
         self.assertEqual(first.wake_id, second.wake_id)
-        observed: list[tuple[str, str]] = []
+        observed: list[tuple[str, str, str]] = []
 
         outcome = delivery.SprintWakeDeliveryService(self.con).deliver_once(
             "mixed-worker",
-            lambda conversation, prompt, _key: (
-                observed.append((conversation, prompt)) or "mixed-run"
+            lambda conversation, prompt, key: (
+                observed.append((conversation, prompt, key)) or f"run:{key}"
             ),
         )
 
-        conversation_id, prompt = observed[0]
+        wake_key = self._wake_key(first.wake_id)
+        (conversation_id, first_prompt, first_key), (
+            second_conversation_id,
+            second_prompt,
+            second_key,
+        ) = observed
         self.assertEqual(first.wake_id, outcome.wake_id)
         self.assertNotEqual(self.developer_conversation_id, conversation_id)
+        self.assertEqual(conversation_id, second_conversation_id)
         self.assertEqual(
             "closed",
             self.con.execute(
@@ -1514,8 +1524,20 @@ class WakeDeliveryTest(SprintMessageCase):
                 (self.developer_conversation_id,),
             ).fetchone()[0],
         )
-        self.assertLess(
-            prompt.index("body for mixed-reenter"), prompt.index("body for mixed-new")
+        self.assertIn("body for mixed-reenter", first_prompt)
+        self.assertNotIn("body for mixed-new", first_prompt)
+        self.assertIn("body for mixed-new", second_prompt)
+        self.assertNotIn("body for mixed-reenter", second_prompt)
+        # Turn evidence and health resolve the wake by its own key and the
+        # recorded run ref, so both belong to the final queued turn.
+        self.assertEqual(f"{wake_key}:message:{first.message_id}", first_key)
+        self.assertEqual(wake_key, second_key)
+        self.assertEqual(
+            f"run:{wake_key}",
+            self.con.execute(
+                "SELECT native_run_ref FROM sprint_wake_attempts WHERE wake_id=?",
+                (first.wake_id,),
+            ).fetchone()[0],
         )
         self.assertEqual(
             [(first.message_id, 1), (second.message_id, 1)],
@@ -1527,6 +1549,42 @@ class WakeDeliveryTest(SprintMessageCase):
                     (first.message_id, second.message_id),
                 )
             ],
+        )
+
+    def test_partial_enqueue_retry_replays_same_turn_keys(self) -> None:
+        first = self.send("partial-first", declared_type="re-enter")
+        second = self.send("partial-second", declared_type="re-enter")
+        self.assertEqual(first.wake_id, second.wake_id)
+        queued: dict[tuple[str, str], str] = {}
+        calls: list[str] = []
+        fail_second = [True]
+
+        def native(conversation: str, prompt: str, key: str) -> str:
+            calls.append(key)
+            if fail_second[0] and len(calls) == 2:
+                raise RuntimeError("provider unavailable")
+            queued.setdefault((conversation, key), prompt)
+            return f"run:{key}"
+
+        service = delivery.SprintWakeDeliveryService(self.con)
+        failed = service.deliver_once("partial-worker", native)
+        self.assertEqual("pending", failed.state)
+        self.con.execute(
+            "UPDATE sprint_wake_outbox SET available_at=datetime('now') "
+            "WHERE wake_id=?",
+            (first.wake_id,),
+        )
+        self.con.commit()
+        fail_second[0] = False
+
+        delivered = service.deliver_once("partial-worker", native)
+
+        wake_key = self._wake_key(first.wake_id)
+        first_key = f"{wake_key}:message:{first.message_id}"
+        self.assertEqual("delivered", delivered.state)
+        self.assertEqual([first_key, wake_key, first_key, wake_key], calls)
+        self.assertEqual(
+            [first_key, wake_key], [key for _conversation, key in queued]
         )
 
     def test_stale_registry_pid_counts_as_idle_for_new(self) -> None:
@@ -1639,11 +1697,12 @@ class WakeDeliveryTest(SprintMessageCase):
         self.assertEqual(armed_planner_id, lease.participant_id)
         self.assertEqual("planner", lease.participant_role)
         self.assertEqual((paused.message_id, armed.message_id), lease.message_ids)
-        self.assertTrue(
-            lease.prompt.startswith(delivery.wake_prompt(armed_sprint_id, "planner"))
-        )
-        self.assertIn("paused sprint backlog", lease.prompt)
-        self.assertIn("armed sprint work", lease.prompt)
+        lead = delivery.wake_prompt(armed_sprint_id, "planner")
+        backlog_prompt, armed_prompt = lease.prompts
+        self.assertTrue(backlog_prompt.startswith(lead))
+        self.assertTrue(armed_prompt.startswith(lead))
+        self.assertIn("paused sprint backlog", backlog_prompt)
+        self.assertIn("armed sprint work", armed_prompt)
         conversation_id = service._resolve_conversation(lease)
         self.assertEqual(
             self.planner_id,
@@ -2301,7 +2360,7 @@ class WakeDeliveryTest(SprintMessageCase):
         pause_notice = service.claim_next("worker-a")
         self.assertIsNotNone(pause_notice)
         self.assertIsNone(pause_notice.sprint_id)
-        self.assertIn("wake_delivery_exhausted", pause_notice.prompt)
+        self.assertIn("wake_delivery_exhausted", "".join(pause_notice.prompts))
         self.assertEqual(
             ("paused", "failed", 3, None),
             tuple(
