@@ -299,6 +299,49 @@ class SkillCommandTest(unittest.TestCase):
             con.close()
         self.assertEqual(self.grants(), [(1, "loc_new")])
 
+    def test_put_of_rendered_projection_keeps_category_and_command(self):
+        draft = self.tmp / "loc_meta.md"
+        draft.write_text(
+            "---\nname: loc_meta\ndescription: local workflow\n"
+            "category: substrate\ncommand: /loc\n---\n\nFirst procedure\n"
+        )
+        self.assertEqual(skill_mod.main(["put", "--file", str(draft)]), 0)
+
+        # Round-trip the managed projection, which renders name + description.
+        draft.write_text(skill_mod.skill_projection._skill_body({
+            "name": "loc_meta",
+            "description": "updated workflow",
+            "content": "Second procedure",
+        }))
+        self.assertEqual(skill_mod.main(["put", "--file", str(draft)]), 0)
+        con = sqlite3.connect(self.db)
+        try:
+            self.assertEqual(
+                con.execute(
+                    "SELECT description, category, command, content "
+                    "FROM skills WHERE name='loc_meta'"
+                ).fetchone(),
+                ("updated workflow", "substrate", "/loc", "Second procedure"),
+            )
+        finally:
+            con.close()
+
+        draft.write_text(
+            "---\nname: loc_meta\ndescription: updated workflow\n"
+            "category:\ncommand:\n---\n\nSecond procedure\n"
+        )
+        self.assertEqual(skill_mod.main(["put", "--file", str(draft)]), 0)
+        con = sqlite3.connect(self.db)
+        try:
+            self.assertEqual(
+                con.execute(
+                    "SELECT category, command FROM skills WHERE name='loc_meta'"
+                ).fetchone(),
+                (None, None),
+            )
+        finally:
+            con.close()
+
     def test_put_refuses_engine_name_and_implicit_common_grant(self):
         with self.assertRaisesRegex(SystemExit, "ENGINE-owned"):
             skill_mod.main(

@@ -340,14 +340,19 @@ def parse_local_skill_spec(text: str) -> dict:
     body = "\n".join(lines[boundary + 1:]).strip()
     if not body:
         raise DraftValidationError("draft must include a non-empty procedure body")
-    return {
+    spec = {
         "name": name,
         "description": description,
-        "category": meta.get("category") or None,
-        "command": meta.get("command") or None,
         "common": 0,
         "content": body,
     }
+    # The managed projection renders name + description only, so an omitted
+    # `category`/`command` means "keep the stored value" rather than clear it
+    # (#1655); an explicit empty value still clears.
+    for key in ("category", "command"):
+        if key in meta:
+            spec[key] = meta[key] or None
+    return spec
 
 
 def parse_local_skill_file(path: Path) -> dict:
@@ -557,7 +562,8 @@ def _put_spec(con, spec: dict) -> str:
         )
 
     existing = con.execute(
-        "SELECT skill_id, is_deleted FROM skills WHERE name=?", (name,)
+        "SELECT skill_id, is_deleted, category, command FROM skills WHERE name=?",
+        (name,),
     ).fetchone()
     if existing is None:
         con.execute(
@@ -566,8 +572,8 @@ def _put_spec(con, spec: dict) -> str:
             (
                 name,
                 spec["description"],
-                spec["category"],
-                spec["command"],
+                spec.get("category"),
+                spec.get("command"),
                 spec["content"],
             ),
         )
@@ -578,8 +584,8 @@ def _put_spec(con, spec: dict) -> str:
             "content=?, is_deleted=0 WHERE skill_id=?",
             (
                 spec["description"],
-                spec["category"],
-                spec["command"],
+                spec.get("category", existing[2]),
+                spec.get("command", existing[3]),
                 spec["content"],
                 existing[0],
             ),
