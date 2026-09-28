@@ -1718,7 +1718,7 @@ function docBlock(d, { readOnly = false } = {}) {
   return wrap;
 }
 
-// ── Documents ─────────────────────────────────────────────────────────────────
+// ── Docs ──────────────────────────────────────────────────────────────────────
 let docsQuery = "";   // persists across re-renders so the search box keeps its value
 let docsShowRetired = false;   // retired docs are history — hidden until asked for
 const docsExpanded = new Set();   // work-streams opened by the reader
