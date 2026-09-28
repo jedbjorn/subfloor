@@ -1125,7 +1125,7 @@ def get_roadmap(con) -> dict:
         "ORDER BY r.sort_order, r.feature_id"))
     # Roadmap tracks the development cycle = the SPECS, with each feature's DOCS
     # (kind='doc') listed underneath so specs and docs sit together. Docs are
-    # read-only here (open-link only); the Docs tab is where they're edited.
+    # read-only here (open-link only); the Documents tab is where they're edited.
     # kind DESC orders 'spec' before 'doc' within a feature.
     docs_by: dict[int, list] = {}
     for d in _decorate_retirement(con, rows(con.execute(
@@ -1177,14 +1177,16 @@ def get_roadmap(con) -> dict:
 
 
 def get_docs(con) -> dict:
-    """Documentation (kind='doc'), grouped client-side by feature. Distinct from
-    the spec dev-cycle the roadmap tracks."""
+    """Specs and docs for the Documents tab, with their feature and work-stream."""
     return {"docs": _decorate_retirement(con, rows(con.execute(
         "SELECT d.document_id, d.feature_id, d.kind, d.seq, d.title, d.frozen, "
         "d.frozen_date, " + _retirement_projection(_document_columns(con)) + ", "
-        "r.title AS feature_title FROM documents d "
+        "r.title AS feature_title, r.project_id, p.title AS project_title "
+        "FROM documents d "
         "LEFT JOIN roadmap r ON r.feature_id = d.feature_id "
-        "WHERE d.kind='doc' ORDER BY d.feature_id, d.seq")))}
+        "LEFT JOIN projects p ON p.project_id = r.project_id "
+        "WHERE d.kind IN ('spec', 'doc') "
+        "ORDER BY p.title, r.title, d.kind DESC, d.seq, d.document_id")))}
 
 
 _EMPTY_MAP = {"repo": None, "total_files": 0, "by_lang": [],
