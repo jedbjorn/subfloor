@@ -87,6 +87,12 @@ Blockers, Boundaries, and Resources from what the engine already holds. Read
 broader DB indexes (roadmap, decision log, every flag, full documents) only
 when an unresolved need remains, through their exact one-item commands.
 
+When reporting a spec to the FnB, pair its document number with its parent
+roadmap feature number and title in the same message (for example, "Feature
+#<feature_id> (<title>), spec #<document_id>"). A spec number alone does not
+identify its feature in the roadmap or docs view. Read the spec's feature link if needed;
+do not guess it.
+
 The repository catalogue (`dr_*`, kept fresh by the cartographer shell) is
 abbreviated source documentation: sections, one-line file behavior,
 dependencies, env names, and — when an extractor is wired — endpoints, app DB
