@@ -290,6 +290,7 @@ class Handler(BaseHTTPRequestHandler):
         if session.get("upstream") and session.get("generation") == generation:
             return
         session["upstream"] = None
+        session["connected"] = False
         connection, response = self.upstream(
             "POST",
             session,
@@ -351,7 +352,11 @@ class Handler(BaseHTTPRequestHandler):
             )
             outcome = "ok" if success else "upstream error"
             if is_tool:
-                session["connected"] = success
+                # Action failure alone says nothing about extension connectivity.
+                if success:
+                    session["connected"] = True
+                elif response.status >= 400:
+                    session["connected"] = False
                 session.pop("protocol_error", None)
                 texts = [payload.get("error", {}).get("message", "")]
                 texts.extend(
@@ -360,8 +365,17 @@ class Handler(BaseHTTPRequestHandler):
                     if isinstance(item, dict)
                 )
                 for text in texts:
-                    if "unsupported protocol version" in text.lower():
+                    if not success and "unsupported protocol version" in text.lower():
                         session["protocol_error"] = text
+                        session["connected"] = False
+                    if not success and re.search(
+                        r"^(?:Error: )?(?:Extension not connected\b|"
+                        r"Extension disconnected\b|"
+                        r"Playwright extension did not connect within\b)",
+                        text,
+                        re.IGNORECASE | re.MULTILINE,
+                    ):
+                        session["connected"] = False
             if message and message.get("method") == "tools/list" and success:
                 self.server.tools = payload.get("result", {}).get("tools", [])
         except (OSError, ValueError, http.client.HTTPException) as exc:
