@@ -920,7 +920,7 @@
         "The instruction depends on the Sprint lifecycle. Inside an armed or paused",
         "Sprint it points at the Sprint's own gate; outside one, a green wake says",
         "[`.super-coder/docs/sprint-pr-watcher.md`](../.super-coder/docs/sprint-pr-watcher.md).",
-        "> **UI** this IS the GUI — Chats · Sprints · Shells · Roadmap · Docs · Flags · Worktrees · Repo Map · Analytics · Scripts · **Shells** reviewer (every shell reads it)",
+        "> **UI** this IS the GUI — Chats · Sprints · Shells · Roadmap · Documents · Flags · Worktrees · Repo Map · Analytics · Scripts · **Shells** reviewer (every shell reads it)",
         "you mean: `#sprints/<id>`, `#roadmap-feature-<id>`, `#roadmap-flow`,"
       ],
       "README.md": [

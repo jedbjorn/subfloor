@@ -183,7 +183,7 @@ column.
 | `/api/models?refresh=1` | none | model catalogue |
 | `/api/skills`, `/api/skills/{id}` | none | skill catalogue with origin tags |
 | `/api/roadmap` | none | `#view-roadmap` |
-| `/api/docs` | none | `#view-docs` |
+| `/api/docs` | none | specs and docs with feature/work-stream metadata for `#view-docs` |
 | `/api/documents/{id}` | none | full document row |
 | `/api/documents/{id}/open` | none | `302` to a rendered-markdown URL |
 | `/api/flags` | none | `#view-flags` |

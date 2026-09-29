@@ -1534,7 +1534,7 @@ function featureForm(f, candidates = [], projects = []) {
   }
 
   // documents — specs (editable/frozen per state) and docs (read-only here; the
-  // Docs tab is where docs are edited) shown in their own labelled sections.
+  // Documents tab is where docs are edited) shown in their own labelled sections.
   const docs = f.documents || [];
   const specs = docs.filter((d) => d.kind !== "doc");
   const reads = docs.filter((d) => d.kind === "doc");
@@ -1660,13 +1660,14 @@ function retirementBanner(d) {
 function docBlock(d, { readOnly = false } = {}) {
   const wrap = el("div", { className: "docrow" + (d.retired ? " retired" : "") });
   const label = d.kind === "doc"
-    ? `Doc - ${d.title || "(untitled)"}`
-    : `${d.kind} v${d.seq}${d.frozen ? " · frozen " + (d.frozen_date || "") : ""}: ${d.title || ""}`;
+    ? d.title || "(untitled)"
+    : `v${d.seq}${d.frozen ? " · frozen " + (d.frozen_date || "") : ""}: ${d.title || "(untitled)"}`;
   const open = el("a", {
     className: "act primary", href: "/api/documents/" + d.document_id + "/open",
     target: "_blank", rel: "noopener", textContent: "open in md-converter ↗",
   });
   const head = el("div", { className: "docrow-head" },
+    el("span", { className: "pill doc-kind", textContent: d.kind === "spec" ? "Spec" : "Doc" }),
     el("span", { className: "docrow-label" }, label,
       el("span", { className: "idnum" }, " #" + d.document_id)), open);
   wrap.append(head);
@@ -1720,18 +1721,20 @@ function docBlock(d, { readOnly = false } = {}) {
 // ── Docs ──────────────────────────────────────────────────────────────────────
 let docsQuery = "";   // persists across re-renders so the search box keeps its value
 let docsShowRetired = false;   // retired docs are history — hidden until asked for
+const docsExpanded = new Set();   // work-streams opened by the reader
 
 async function renderDocs(root) {
   const { docs } = await api("/docs");
   root.replaceChildren();
   if (!docs.length) {
     root.append(el("div", { className: "card muted" },
-      "No docs yet. A doc is a kind='doc' document against a feature — authored by the shell, viewable here."));
+      "No specs or docs yet."));
     return;
   }
 
-  // unified search bar — first under the header; filters by doc title or feature
-  const search = searchBar("search docs…", docsQuery, (v) => { docsQuery = v; draw(); });
+  // Search by document number, type, title, feature, or work-stream. Matching
+  // sections open while searching without changing the reader's saved toggles.
+  const search = searchBar("search specs and docs…", docsQuery, (v) => { docsQuery = v; draw(); });
   // show-retired toggle: retired docs are superseded history, so they stay out
   // of the list until a reader asks for them.
   const retiredCount = docs.filter((d) => d.retired).length;
@@ -1753,21 +1756,56 @@ async function renderDocs(root) {
   const draw = () => {
     const q = docsQuery.trim().toLowerCase();
     const visible = docsShowRetired ? docs : docs.filter((d) => !d.retired);
-    const matched = q
-      ? visible.filter((d) =>
-          `${d.title || ""} #${d.document_id} ${d.feature_title || ""} #${d.feature_id ?? ""}`
-            .toLowerCase().includes(q))
-      : visible;
+    const matched = q ? visible.filter((d) => (
+      `${d.kind} #${d.document_id} ${d.title || ""} ${d.feature_title || ""} ` +
+      `#${d.feature_id ?? ""} ${d.project_title || ""}`
+    ).toLowerCase().includes(q)) : visible;
     results.replaceChildren();
-    if (!matched.length) { results.append(el("div", { className: "muted" }, "No docs match.")); return; }
-    const byFeat = {};
-    for (const d of matched)
-      (byFeat[d.feature_title ? `${d.feature_title} #${d.feature_id}` : UNLINKED] ||= []).push(d);
-    for (const [title, list] of unlinkedLast(Object.entries(byFeat))) {
-      const c = el("div", { className: "card" });
-      c.append(el("h2", {}, title));
-      for (const d of list) c.append(docBlock(d));
-      results.append(c);
+    if (!matched.length) {
+      results.append(el("div", { className: "muted" }, "No specs or docs match."));
+      return;
+    }
+    const streams = new Map();
+    for (const d of matched) {
+      const id = d.project_id ?? null;
+      if (!streams.has(id)) streams.set(id, { title: d.project_title || "Unassigned", features: new Map() });
+      const features = streams.get(id).features;
+      const featureId = d.feature_id ?? null;
+      if (!features.has(featureId)) features.set(featureId, { title: d.feature_title, docs: [] });
+      features.get(featureId).docs.push(d);
+    }
+    const ordered = [...streams.entries()].sort((a, b) => {
+      if (a[0] === null) return b[0] === null ? 0 : 1;
+      if (b[0] === null) return -1;
+      return a[1].title.localeCompare(b[1].title);
+    });
+    for (const [id, stream] of ordered) {
+      const key = String(id);
+      const count = [...stream.features.values()].reduce((n, f) => n + f.docs.length, 0);
+      const section = el("details", { className: "docs-stream", open: Boolean(q) || docsExpanded.has(key) });
+      const summary = el("summary", {}, stream.title,
+        el("span", { className: "count", textContent: String(count) }));
+      summary.onclick = () => {
+        if (docsQuery.trim()) return;
+        if (section.open) docsExpanded.delete(key);
+        else docsExpanded.add(key);
+      };
+      section.append(summary);
+      const body = el("div", { className: "docs-stream-body" });
+      const features = [...stream.features.entries()].sort((a, b) => {
+        if (a[0] === null) return b[0] === null ? 0 : 1;
+        if (b[0] === null) return -1;
+        return (a[1].title || "").localeCompare(b[1].title || "");
+      });
+      for (const [featureId, feature] of features) {
+        const card = el("div", { className: "card" });
+        card.append(el("h2", {}, featureId === null
+          ? UNLINKED : `${feature.title || "Feature"} #${featureId}`));
+        for (const d of feature.docs) card.append(docBlock(d));
+        body.append(card);
+      }
+      section.append(body);
+      results.append(section);
     }
   };
   root.append(search, bar, results);

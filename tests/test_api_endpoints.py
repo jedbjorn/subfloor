@@ -464,9 +464,19 @@ class AssemblerSmokeTest(unittest.TestCase):
         self.assertTrue(len(feat["documents"]) >= 1)
 
     def test_get_docs(self) -> None:
+        project_id = self.con.execute(
+            "INSERT INTO projects (shortname, title) VALUES ('review', 'Review')"
+        ).lastrowid
+        self.con.execute(
+            "UPDATE roadmap SET project_id=? WHERE feature_id=?",
+            (project_id, self.ids["feature_id"]),
+        )
         out = server.get_docs(self.con)
-        self.assertTrue(any(d["feature_id"] == self.ids["feature_id"]
-                            for d in out["docs"]))
+        linked = [d for d in out["docs"]
+                  if d["feature_id"] == self.ids["feature_id"]]
+        self.assertEqual({d["kind"] for d in linked}, {"spec", "doc"})
+        self.assertEqual({d["project_title"] for d in linked}, {"Review"})
+        self.assertEqual({d["project_id"] for d in linked}, {project_id})
 
     def test_get_flags(self) -> None:
         out = server.get_flags(self.con)
@@ -516,7 +526,7 @@ class AssemblerSmokeTest(unittest.TestCase):
             self.assertEqual(server.document_retirement_view(legacy), {})
             self.assertEqual(
                 [row["retired"] for row in server.get_docs(legacy)["docs"]],
-                [0],
+                [0, 0],
             )
         finally:
             legacy.close()

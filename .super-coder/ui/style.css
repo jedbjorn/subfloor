@@ -1006,6 +1006,15 @@ a.act { text-decoration: none; display: inline-block; }
 .docrow.retired .docrow-label { color: var(--dim); text-decoration: line-through; }
 .retired-note { color: var(--warn); margin-top: .3rem; }
 .retired-note a { color: var(--accent); }
+.doc-kind { flex: none; text-transform: uppercase; letter-spacing: .04em; }
+.docs-stream { border: 1px solid var(--line); border-radius: var(--r); }
+.docs-stream + .docs-stream { margin-top: 5px; }
+.docs-stream > summary {
+  padding: .75rem 1.1rem; color: var(--ink); font-weight: 600;
+}
+.docs-stream > summary:hover { background: var(--accent2); }
+.docs-stream .count { margin-left: .5rem; color: var(--dim); font-size: .8rem; font-weight: 400; }
+.docs-stream-body { padding: 0 .6rem .6rem; }
 .seed-entry, .lns-entry { margin: .5rem 0; padding-left: .6rem; border-left: 1px solid var(--line); }
 .seed-entry .d { color: var(--dim); font-size: .78rem; }
 details summary { cursor: pointer; color: var(--accent); }

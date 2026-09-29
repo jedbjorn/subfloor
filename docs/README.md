@@ -1367,7 +1367,7 @@ file.
 ## Review GUI
 
 > [!class2]
-> **UI** this IS the GUI — Chats · Sprints · Shells · Roadmap · Docs · Flags · Worktrees · Repo Map · Analytics · Scripts · **Shells** reviewer (every shell reads it)
+> **UI** this IS the GUI — Chats · Sprints · Shells · Roadmap · Documents · Flags · Worktrees · Repo Map · Analytics · Scripts · **Shells** reviewer (every shell reads it)
 
 A zero-dependency localhost GUI to review the substrate and hold normal browser
 conversations. One stdlib Python server serves the JSON API, static UI, and
@@ -1380,7 +1380,7 @@ the windows the workflow above refers to:
 | **Shells** | Each shell's role, mandate, editable `current_state`, identity, decisions, and skill grants. The default landing tab. |
 | **Sprints** | Preparation and orchestration views for coordinated Developer/Reviewer lanes, status, evidence and cleanup. |
 | **Roadmap** | Features in a planning funnel (Brainstorm → … → Shipped), each with its spec tasks, linked docs, and flag blockers. Two views — a **Board** for editing a feature inline, and a **Flow** that groups features by work-stream and wires their blocker dependencies (see below). |
-| **Docs** | Read-only `kind='doc'` documents; opens in md-converter for reading. |
+| **Documents** | Specs and docs, marked by kind and grouped in collapsible work-stream sections. Search by document number, title, feature or work-stream; open in md-converter to read. Unfrozen documents can be edited here. |
 | **Flags** | The blocker / follow-up tracker, grouped by feature, filterable Open/Resolved/All. |
 | **Worktrees** | Live git-hygiene report — dirty worktrees, prunable merged branches, clean trees. |
 | **Repo Map** | The repo catalogue — language mix, file roles, dependencies, env vars — with a re-map button. |
