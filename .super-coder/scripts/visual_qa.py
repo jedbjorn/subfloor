@@ -25,12 +25,14 @@ import sys
 import time
 import urllib.error
 import urllib.request
-from contextlib import contextmanager
+from collections.abc import Callable, Iterator
+from contextlib import AbstractContextManager, contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Callable, Iterator, TextIO
+from typing import Any, TextIO
 
+import visual_qa_evidence as evidence
 
 ENGINE = Path(__file__).resolve().parents[1]
 REPO_ROOT = ENGINE.parent
@@ -87,7 +89,7 @@ def _relative_output(value: object, key: str = "output") -> str:
     return output.as_posix()
 
 
-def _validate_viewports(value: object) -> list[dict[str, object]]:
+def _validate_viewports(value: object) -> list[dict[str, Any]]:
     if value == "default":
         return [dict(viewport) for viewport in DEFAULT_VIEWPORTS]
     if not isinstance(value, list) or not value:
@@ -95,7 +97,7 @@ def _validate_viewports(value: object) -> list[dict[str, object]]:
             "config key 'viewports' must be 'default' or a non-empty list"
         )
 
-    normalized: list[dict[str, object]] = []
+    normalized: list[dict[str, Any]] = []
     names: set[str] = set()
     for index, viewport in enumerate(value):
         if not isinstance(viewport, dict):
@@ -131,7 +133,7 @@ def _validate_viewports(value: object) -> list[dict[str, object]]:
     return normalized
 
 
-def validate_config(raw: object) -> dict[str, object]:
+def validate_config(raw: object) -> dict[str, Any]:
     """Validate and normalize the fork-owned configuration."""
     if not isinstance(raw, dict):
         raise VisualQaError("visual-qa config must contain a JSON object")
@@ -150,6 +152,8 @@ def validate_config(raw: object) -> dict[str, object]:
         "services",
         "artifact_retention_days",
         "output",
+        "capture_command",
+        "capture_timeout_s",
     }
     unknown = set(raw) - known
     if unknown:
@@ -159,7 +163,10 @@ def validate_config(raw: object) -> dict[str, object]:
     if not isinstance(serve, str) or not serve.strip():
         raise VisualQaError("config key 'serve' is required and must be a string")
 
-    routes = _string_list(raw.get("routes"), "routes", allow_empty=False)
+    capture_command = raw.get("capture_command")
+    if capture_command is not None and (not isinstance(capture_command, str) or not capture_command.strip()):
+        raise VisualQaError("capture_command must be a nonempty command string")
+    routes = _string_list(raw.get("routes", [] if capture_command else None), "routes", allow_empty=bool(capture_command))
     for route in routes:
         if not route.startswith("/"):
             raise VisualQaError(f"route '{route}' must start with '/'")
@@ -210,10 +217,12 @@ def validate_config(raw: object) -> dict[str, object]:
             maximum=90,
         ),
         "output": _relative_output(raw.get("output", DEFAULT_GALLERY.as_posix())),
+        "capture_command": capture_command,
+        "capture_timeout_s": _integer(raw.get("capture_timeout_s", 300), "capture_timeout_s", minimum=1, maximum=1800),
     }
 
 
-def load_config(repo: Path = REPO_ROOT) -> dict[str, object] | None:
+def load_config(repo: Path = REPO_ROOT) -> dict[str, Any] | None:
     path = repo / CONFIG_RELATIVE
     if not path.exists():
         return None
@@ -296,7 +305,7 @@ def _run_shell(command: str, *, cwd: Path, env: dict[str, str], log: TextIO) -> 
 
 
 def run_setup(
-    config: dict[str, object], repo: Path, env: dict[str, str], log: TextIO
+    config: dict[str, Any], repo: Path, env: dict[str, str], log: TextIO
 ) -> None:
     cwd = repo / str(config["cwd"])
     if not cwd.is_dir():
@@ -377,7 +386,7 @@ def start_postgres(env: dict[str, str], log: TextIO) -> ServiceHandle:
 
 
 def start_services(
-    config: dict[str, object], env: dict[str, str], log: TextIO
+    config: dict[str, Any], env: dict[str, str], log: TextIO
 ) -> list[ServiceHandle]:
     handles: list[ServiceHandle] = []
     if config["services"] == ["postgres"]:
@@ -386,7 +395,7 @@ def start_services(
 
 
 def start_server(
-    config: dict[str, object], repo: Path, env: dict[str, str], log: TextIO
+    config: dict[str, Any], repo: Path, env: dict[str, str], log: TextIO
 ) -> subprocess.Popen[str]:
     cwd = repo / str(config["cwd"])
     command = str(config["serve"]).replace("{port}", str(config["port"]))
@@ -450,7 +459,7 @@ def wait_until_ready(
 
 @contextmanager
 def ci_app(
-    config: dict[str, object], repo: Path, log: TextIO
+    config: dict[str, Any], repo: Path, log: TextIO
 ) -> Iterator[tuple[str, dict[str, str]]]:
     env = dict(os.environ)
     services: list[ServiceHandle] = []
@@ -513,12 +522,15 @@ class PlaywrightCapture:
     """Lazy Playwright adapter; imported only in real capture runs."""
 
     def __init__(self) -> None:
-        self._playwright = None
-        self._browser = None
+        self._playwright: Any = None
+        self._browser: Any = None
 
     def __enter__(self) -> "PlaywrightCapture":
         try:
-            from playwright.sync_api import sync_playwright
+            # Playwright is installed only in the capture seat, not the engine.
+            from playwright.sync_api import (  # type: ignore[import-not-found]
+                sync_playwright,
+            )
         except ImportError as exc:
             raise VisualQaError(
                 "Playwright is not installed; run `pip install "
@@ -543,12 +555,12 @@ class PlaywrightCapture:
     def capture(
         self,
         url: str,
-        viewport: dict[str, object],
+        viewport: dict[str, Any],
         output: Path,
         *,
         settle_ms: int,
         timeout_ms: int,
-    ) -> dict[str, object]:
+    ) -> dict[str, Any]:
         if self._browser is None:
             raise VisualQaError("Playwright capture session was not started")
         page = self._browser.new_page(
@@ -611,15 +623,15 @@ def _target_url(base_url: str, route: str) -> str:
 
 
 def capture_gallery(
-    config: dict[str, object],
+    config: dict[str, Any],
     base_url: str,
     gallery: Path,
     *,
     capture_factory: Callable[[], object] = PlaywrightCapture,
-) -> dict[str, object]:
+) -> dict[str, Any]:
     """Capture route × viewport results and assemble the artifact gallery."""
     gallery.mkdir(parents=True, exist_ok=True)
-    route_rows: list[dict[str, object]] = []
+    route_rows: list[dict[str, Any]] = []
     used_slugs: set[str] = set()
 
     with capture_factory() as capture:  # type: ignore[attr-defined]
@@ -633,7 +645,7 @@ def capture_gallery(
                 suffix += 1
             used_slugs.add(slug)
 
-            captures: list[dict[str, object]] = []
+            captures: list[dict[str, Any]] = []
             for viewport in config["viewports"]:
                 viewport = dict(viewport)
                 image = Path(slug) / f"{_slug(str(viewport['name']), 'viewport')}.png"
@@ -673,7 +685,7 @@ def capture_gallery(
             )
 
     failed_routes = sum(not bool(route["ok"]) for route in route_rows)
-    summary: dict[str, object] = {
+    summary: dict[str, Any] = {
         "generated_at": _utc_now(),
         "outcome": "failed" if failed_routes == len(route_rows) else "passed",
         "base_url": base_url,
@@ -685,13 +697,86 @@ def capture_gallery(
     return summary
 
 
-def write_gallery(gallery: Path, summary: dict[str, object]) -> None:
+def capture_scenarios(config: dict, base_url: str, gallery: Path, repo: Path, env: dict) -> dict:
+    """Run fork-owned Playwright code; preserve completed checkpoints on failure."""
+    capture_env = dict(env)
+    capture_env.update(SC_VISUAL_QA_URL=base_url, SC_VISUAL_QA_OUTPUT=str(gallery.resolve()),
+                       SC_VISUAL_QA_VIEWPORTS=json.dumps(config["viewports"]),
+                       SC_VISUAL_QA_ROUTES=json.dumps(config["routes"]))
+    error = None
+    with (gallery / "capture.log").open("w") as log:
+        process = subprocess.Popen(config["capture_command"], shell=True, cwd=repo / config["cwd"],
+                                   env=capture_env, stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
+        try:
+            code = process.wait(timeout=config["capture_timeout_s"])
+            if code:
+                error = f"Scenario capture command failed (exit {code})"
+        except subprocess.TimeoutExpired:
+            os.killpg(process.pid, signal.SIGTERM)
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                os.killpg(process.pid, signal.SIGKILL)
+                process.wait()
+            error = f"Scenario capture timed out after {config['capture_timeout_s']}s"
+    try:
+        summary = evidence.scenario_summary(evidence.read_manifest(gallery / "states.json"), gallery)
+    except (OSError, ValueError) as exc:
+        summary = result_summary(gallery, "failed", error=f"{error + '; ' if error else ''}Scenario manifest: {exc}")
+    summary.update(mode="scenarios", generated_at=_utc_now())
+    if error:
+        summary.update(outcome="failed", error=error)
+    write_gallery(gallery, summary)
+    return summary
+
+
+def finish_ci(summary: dict, gallery: Path, args: argparse.Namespace, repo: Path, env: dict) -> None:
+    """Persist the portable report even when capture skipped or failed to boot."""
+    report_path = getattr(args, "report", None)
+    if report_path:
+        event_path = env.get("GITHUB_EVENT_PATH")
+        event = json.loads(Path(event_path).read_text()) if event_path else {}
+        pr = event.get("pull_request", {})
+        tested = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo, text=True,
+                                capture_output=True, check=True).stdout.strip()
+        summary.update(version=1, metadata={
+            "source_head_sha": pr.get("head", {}).get("sha", env.get("GITHUB_SHA", tested)),
+            "tested_sha": tested, "pr_number": pr.get("number", event.get("number", 0)),
+            "run_id": int(env.get("GITHUB_RUN_ID", "0")),
+            "run_attempt": int(env.get("GITHUB_RUN_ATTEMPT", "1")),
+        })
+        target = repo / _relative_output(str(report_path), "--report")
+        if (target.resolve().is_relative_to(gallery.resolve())
+                or gallery.resolve().is_relative_to(target.resolve())):
+            raise VisualQaError("--report must be separate from the capture gallery")
+        if not target.resolve().is_relative_to(repo.resolve()) or any(
+                p.is_symlink() for p in (target, *target.parents) if p.is_relative_to(repo)):
+            raise VisualQaError("--report cannot follow symlinks")
+        prepare_gallery(target, output_hint="--report directory")
+        # Export only validated screenshots, never fixture files or boot logs.
+        rows = evidence.validate_rows(summary["routes"], gallery)
+        for row in rows:
+            for capture in row["captures"]:
+                if not capture["image_written"]:
+                    continue
+                destination = target / capture["image"]
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                destination.write_bytes(evidence.png_file(gallery, capture["image"])[0])
+        summary["routes"] = rows
+        (target / "summary.json").write_text(json.dumps(summary, indent=2) + "\n")
+    if getattr(args, "no_publish", False):
+        write_step_summary(build_comment(summary, environ=env), environ=env)
+    else:
+        publish_result(summary, environ=env)
+
+
+def write_gallery(gallery: Path, summary: dict[str, Any]) -> None:
     gallery.mkdir(parents=True, exist_ok=True)
     (gallery / "summary.json").write_text(json.dumps(summary, indent=2) + "\n")
     (gallery / "index.html").write_text(build_gallery_html(summary))
 
 
-def build_gallery_html(summary: dict[str, object]) -> str:
+def build_gallery_html(summary: dict[str, Any]) -> str:
     outcome = html.escape(str(summary.get("outcome", "unknown")))
     reason = html.escape(str(summary.get("reason") or summary.get("error") or ""))
     sections: list[str] = []
@@ -737,8 +822,8 @@ def result_summary(
     reason: str | None = None,
     error: str | None = None,
     write: bool = True,
-) -> dict[str, object]:
-    summary: dict[str, object] = {
+) -> dict[str, Any]:
+    summary: dict[str, Any] = {
         "generated_at": _utc_now(),
         "outcome": outcome,
         "routes_total": 0,
@@ -765,7 +850,7 @@ def _github_links(environ: dict[str, str]) -> tuple[str | None, str | None]:
 
 
 def build_comment(
-    summary: dict[str, object], *, environ: dict[str, str] | None = None
+    summary: dict[str, Any], *, environ: dict[str, str] | None = None
 ) -> str:
     env = dict(os.environ) if environ is None else environ
     lines = ["<!-- subfloor-visual-qa -->"]
@@ -795,7 +880,8 @@ def build_comment(
         failed = int(summary.get("routes_failed", 0))
         total = int(summary.get("routes_total", 0))
         if outcome == "failed":
-            lines.append(f"### ✗ Visual QA: all {total} routes failed")
+            lines.append(f"### ✗ Visual QA: all {total} routes failed" if failed == total
+                         else "### ✗ Visual QA failed · see evidence below")
         elif failed:
             lines.append(
                 f"### ✓ Visual QA captured · {failed}/{total} routes need review"
@@ -805,24 +891,45 @@ def build_comment(
 
         routes = list(summary.get("routes", []))
         if routes:
-            names = [str(item["name"]) for item in routes[0]["captures"]]
+            names = list(dict.fromkeys(str(c["name"]) for row in routes for c in row["captures"]))
+            def md(value):
+                return html.escape(str(value)).replace("|", "&#124;").replace("`", "&#96;").replace("\n", " ").replace("\r", " ")
             lines.extend(
                 [
                     "",
-                    "| Route | " + " | ".join(names) + " |",
+                    "| " + ("State" if summary.get("mode") == "scenarios" else "Route") + " | " + " | ".join(md(n) for n in names) + " |",
                     "| --- | " + " | ".join("---" for _ in names) + " |",
                 ]
             )
             for route in routes:
                 cells = []
-                for capture in route["captures"]:
+                variants = {str(c["name"]): c for c in route["captures"]}
+                for name in names:
+                    capture = variants.get(name)
+                    if capture is None:
+                        cells.append("—")
+                        continue
                     mark = "✓" if capture["ok"] else "✗"
                     if capture.get("image_written"):
                         size = f"{capture['image_width']}×{capture['image_height']}"
                     else:
                         size = "no image"
-                    cells.append(f"{mark} {size}")
-                lines.append(f"| `{route['route']}` | " + " | ".join(cells) + " |")
+                    picture = ""
+                    if capture.get("image_url"):
+                        url = html.escape(capture["image_url"], quote=True)
+                        picture = f'<a href="{url}"><img src="{url}" width="420" alt="{md(route["route"])} · {md(name)}"></a><br>'
+                    viewport = (f" · viewport {capture['viewport_width']}×{capture['viewport_height']}"
+                                if "viewport_width" in capture else "")
+                    detail = f"<br>{md(capture['error'])}" if capture.get("error") else ""
+                    cells.append(f"{picture}{mark} {size}{viewport}{detail}")
+                lines.append(f"| `{md(route['route'])}` | " + " | ".join(cells) + " |")
+
+    if summary.get("error") and summary.get("routes"):
+        lines.extend(["", html.escape(str(summary["error"]))])
+    metadata = summary.get("metadata")
+    if metadata:
+        lines.extend(["", f"PR head: `{metadata['source_head_sha']}` · tested checkout: `{metadata['tested_sha']}`",
+                      f"Data: **{summary.get('data_mode', 'unspecified')}** · capture run {metadata['run_id']}, attempt {metadata['run_attempt']}."])
 
     run_url, artifact_url = _github_links(env)
     links = []
@@ -835,14 +942,18 @@ def build_comment(
     lines.extend(
         [
             "",
-            "This capture-only check is advisory for visual content. Screenshots are in the artifact; inline thumbnails are not available in v1.",
+            ("Visual appearance requires reviewer judgment. Scenario assertions are checked by CI."
+             if summary.get("mode") == "scenarios" else "This capture-only check is advisory for visual content.")
+            + (" Full-size screenshots are linked above and included in the artifact."
+               if any(c.get("image_url") for row in summary.get("routes", []) for c in row["captures"])
+               else " Screenshots are in the artifact; inline thumbnails are not available in v1."),
         ]
     )
     return "\n".join(lines).rstrip() + "\n"
 
 
 def _github_request(
-    method: str, url: str, token: str, payload: dict[str, object] | None = None
+    method: str, url: str, token: str, payload: dict[str, Any] | None = None
 ) -> object:
     data = json.dumps(payload).encode() if payload is not None else None
     headers = {
@@ -875,12 +986,14 @@ def post_sticky_comment(
     *,
     environ: dict[str, str] | None = None,
     requester: Callable[..., object] = _github_request,
+    pr_number: int | None = None,
+    author_login: str | None = None,
 ) -> bool:
     """Create or update the one PR comment; all failures are non-fatal."""
     env = dict(os.environ) if environ is None else environ
     token = env.get("GITHUB_TOKEN", "")
     repo = env.get("GITHUB_REPOSITORY", "")
-    number = _pull_request_number(env)
+    number = pr_number or _pull_request_number(env)
     if not token or not repo or number is None:
         print("visual-qa: no writable pull-request context; sticky comment skipped")
         return False
@@ -896,7 +1009,8 @@ def post_sticky_comment(
             if not isinstance(comments, list):
                 raise VisualQaError("GitHub comments response was not a list")
             for comment in comments:
-                if "<!-- subfloor-visual-qa -->" in str(comment.get("body", "")):
+                if ("<!-- subfloor-visual-qa -->" in str(comment.get("body", ""))
+                        and (author_login is None or comment.get("user", {}).get("login") == author_login)):
                     existing_id = comment.get("id")
                     break
             if existing_id is not None or len(comments) < 100:
@@ -947,7 +1061,7 @@ def write_workflow_output(
 
 
 def publish_result(
-    summary: dict[str, object], *, environ: dict[str, str] | None = None
+    summary: dict[str, Any], *, environ: dict[str, str] | None = None
 ) -> str:
     body = build_comment(summary, environ=environ)
     write_step_summary(body, environ=environ)
@@ -981,9 +1095,9 @@ def _package_candidates(repo: Path) -> list[Path]:
     ]
 
 
-def detect_init_config(repo: Path = REPO_ROOT) -> dict[str, object]:
+def detect_init_config(repo: Path = REPO_ROOT) -> dict[str, Any]:
     package_path = None
-    package: dict[str, object] = {}
+    package: dict[str, Any] = {}
     for candidate in _package_candidates(repo):
         try:
             value = json.loads(candidate.read_text())
@@ -1011,7 +1125,9 @@ def detect_init_config(repo: Path = REPO_ROOT) -> dict[str, object]:
 
     cwd_path = package_path.parent.relative_to(repo)
     cwd = cwd_path.as_posix() or "."
-    scripts = package.get("scripts") if isinstance(package.get("scripts"), dict) else {}
+    scripts = package.get("scripts")
+    if not isinstance(scripts, dict):
+        scripts = {}
     package_dir = package_path.parent
     install = (
         "npm ci" if (package_dir / "package-lock.json").exists() else "npm install"
@@ -1058,6 +1174,25 @@ def cmd_init(_args: argparse.Namespace, *, repo: Path = REPO_ROOT) -> int:
     return 0
 
 
+def cmd_setup_ci(_args: argparse.Namespace, *, repo: Path = REPO_ROOT) -> int:
+    if load_config(repo) is None:
+        raise VisualQaError("Visual QA must be configured before setup-ci; run `sc visual-qa init`")
+    workflows = repo / ".github/workflows"
+    targets = {"capture.yml": workflows / "subfloor-visual-qa-capture.yml",
+               "publish.yml": workflows / "subfloor-visual-qa-publish.yml"}
+    if any(path.exists() for path in targets.values()):
+        raise VisualQaError("Visual QA evidence workflows already exist; review them in place")
+    for path in workflows.glob("*.y*ml"):
+        if "visual-qa ci" in path.read_text():
+            raise VisualQaError(f"Existing Visual QA workflow {path.relative_to(repo)}; adapt it using .super-coder/templates/visual-qa instead of adding a competing capture job")
+    workflows.mkdir(parents=True, exist_ok=True)
+    for template, target in targets.items():
+        target.write_text((ENGINE / "templates/visual-qa" / template).read_text())
+        print(f"visual-qa: wrote {target.relative_to(repo)}")
+    print("  Review and commit both fork-owned workflows. The publisher must land on the default branch before it can handle PR captures.")
+    return 0
+
+
 def _default_local_url(environ: dict[str, str]) -> str:
     port = environ.get("SC_DEV_PORT", "").strip()
     if not port:
@@ -1090,9 +1225,9 @@ def cmd_run(
         raise VisualQaError("--output must be a non-root path within the fork checkout")
     gallery = repo / output
     prepare_gallery(gallery, output_hint="--output directory")
-    summary = capture_gallery(
-        config, base_url, gallery, capture_factory=capture_factory
-    )
+    summary = (capture_scenarios(config, base_url, gallery, repo, env)
+               if config["capture_command"] else capture_gallery(
+                   config, base_url, gallery, capture_factory=capture_factory))
     failed = int(summary["routes_failed"])
     total = int(summary["routes_total"])
     print(
@@ -1116,7 +1251,7 @@ def cmd_ci(
     environ: dict[str, str] | None = None,
     changed_paths: Callable[..., list[str] | None] = pr_changed_paths,
     installer: Callable[[], None] = install_playwright,
-    app_context: Callable[..., object] = ci_app,
+    app_context: Callable[..., AbstractContextManager] = ci_app,
     capture_factory: Callable[[], object] = PlaywrightCapture,
 ) -> int:
     env = dict(os.environ) if environ is None else environ
@@ -1133,12 +1268,14 @@ def cmd_ci(
             write_summary = False
             error = f"{exc}; gallery preparation also failed: {prepare_exc}"
         summary = result_summary(gallery, "failed", error=error, write=write_summary)
-        publish_result(summary, environ=env)
+        finish_ci(summary, gallery, _args, repo, env)
         print(f"visual-qa: {error}", file=sys.stderr)
         return 1
 
     if config is not None:
         gallery = repo / Path(str(config["output"]))
+        if getattr(_args, "report", None):
+            write_workflow_output("retention", str(config["artifact_retention_days"]), environ=env)
     write_workflow_output("output", gallery.relative_to(repo).as_posix(), environ=env)
 
     if config is None:
@@ -1148,19 +1285,19 @@ def cmd_ci(
             reason="Visual QA is not configured — run `./sc visual-qa init`.",
             write=False,
         )
-        publish_result(summary, environ=env)
+        finish_ci(summary, gallery, _args, repo, env)
         print("visual-qa: not configured — neutral pass")
         return 0
 
     changed = changed_paths(repo, environ=env)
-    if should_skip(config["paths"], changed):
+    if changed is not None and CONFIG_RELATIVE.as_posix() not in changed and should_skip(config["paths"], changed):
         summary = result_summary(
             gallery,
             "neutral",
             reason="No configured app paths changed.",
             write=False,
         )
-        publish_result(summary, environ=env)
+        finish_ci(summary, gallery, _args, repo, env)
         print("visual-qa: no app paths changed — neutral pass")
         return 0
 
@@ -1171,21 +1308,19 @@ def cmd_ci(
             str(exc) if isinstance(exc, VisualQaError) else f"unexpected error: {exc}"
         )
         summary = result_summary(gallery, "failed", error=error, write=False)
-        publish_result(summary, environ=env)
+        finish_ci(summary, gallery, _args, repo, env)
         print(f"visual-qa: {error}", file=sys.stderr)
         return 1
 
     boot_log = gallery / "boot.log"
     try:
-        installer()
+        if not config["capture_command"]:
+            installer()
         with boot_log.open("w") as log:
-            with app_context(config, repo, log) as (base_url, _app_env):
-                summary = capture_gallery(
-                    config,
-                    base_url,
-                    gallery,
-                    capture_factory=capture_factory,
-                )
+            with app_context(config, repo, log) as (base_url, app_env):
+                summary = (capture_scenarios(config, base_url, gallery, repo, app_env)
+                           if config["capture_command"] else capture_gallery(
+                               config, base_url, gallery, capture_factory=capture_factory))
     except Exception as exc:
         error = (
             str(exc) if isinstance(exc, VisualQaError) else f"unexpected error: {exc}"
@@ -1195,11 +1330,11 @@ def cmd_ci(
         if tail:
             summary["boot_log_tail"] = tail
             write_gallery(gallery, summary)
-        publish_result(summary, environ=env)
+        finish_ci(summary, gallery, _args, repo, env)
         print(f"visual-qa: {error}", file=sys.stderr)
         return 1
 
-    publish_result(summary, environ=env)
+    finish_ci(summary, gallery, _args, repo, env)
     failed = int(summary["routes_failed"])
     total = int(summary["routes_total"])
     print(f"visual-qa: captured {total - failed}/{total} serving routes")
@@ -1213,6 +1348,8 @@ def parser() -> argparse.ArgumentParser:
     )
     commands = root.add_subparsers(dest="command", required=True)
     ci = commands.add_parser("ci", help="boot the configured app and capture it in CI")
+    ci.add_argument("--no-publish", action="store_true", help="capture with no GitHub writes (separate publisher)")
+    ci.add_argument("--report", help="export a portable report bundle to a relative directory")
     ci.set_defaults(func=cmd_ci)
     run = commands.add_parser("run", help="capture an already-running local app")
     run.add_argument(
@@ -1227,7 +1364,23 @@ def parser() -> argparse.ArgumentParser:
     run.set_defaults(func=cmd_run)
     init = commands.add_parser("init", help="scaffold .sc-state/visual-qa.json")
     init.set_defaults(func=cmd_init)
+    setup = commands.add_parser("setup-ci", help="explicitly scaffold fork-owned capture and trusted-publisher workflows")
+    setup.set_defaults(func=cmd_setup_ci)
+    publish = commands.add_parser("publish", help="publish a validated capture bundle from a trusted workflow_run job")
+    publish.add_argument("--input", type=Path, required=True, help="downloaded report bundle")
+    publish.set_defaults(func=cmd_publish)
     return root
+
+
+def cmd_publish(args: argparse.Namespace) -> int:
+    try:
+        event = json.loads(Path(os.environ["GITHUB_EVENT_PATH"]).read_text())
+        evidence.publish_report(args.input, event, dict(os.environ))
+    except (OSError, ValueError, KeyError) as exc:
+        print(f"visual-qa: inline publication failed: {exc}; capture artifact remains available", file=sys.stderr)
+        write_step_summary(f"Visual QA inline publication failed: {exc}. Capture artifact remains available.\n")
+        return 1
+    return 0
 
 
 def main(argv: list[str] | None = None) -> int:

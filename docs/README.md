@@ -1214,6 +1214,16 @@ not a failure.
 > [!class2]
 > **The CI lane was retired; the command was not.** Subfloor used to seed a managed Visual QA workflow into every fork. It no longer does — the fork workflow template is a no-op shim kept only so `./sc update` can recognize and remove copies it seeded, and the example config template is an empty `{}`. A fork that wants visual QA in CI authors its own workflow calling `./sc visual-qa ci`.
 
+Configured Visual QA can publish inline screenshot tables on PRs. Explicit
+`./sc visual-qa setup-ci` scaffolds fork-owned capture and trusted-publisher
+workflows; it refuses overwrites and competing capture lanes. An optional
+`capture_command` lets ordinary Playwright scenarios capture named UI states
+and theme/viewport variants. CI runs the scenarios, generates the gallery,
+stores images on evidence-only branches, and updates one commit-pinned PR
+report. See [Visual QA evidence](../.super-coder/docs/visual-qa.md) for setup,
+the manifest contract, permissions and retention. Install/update does not
+automatically enable the pipeline.
+
 One boundary trips people up: **you work inside the sandbox container**, and the
 app the FnB watches in their browser is a *separate*, host-supervised instance. To
 see your own changes, start a dev server **inside** the container on

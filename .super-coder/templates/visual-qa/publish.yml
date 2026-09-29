@@ -1,0 +1,56 @@
+# Fork-owned. This workflow must be on the default branch before PR capture runs.
+name: Subfloor Visual QA Evidence Publish
+
+on:
+  workflow_run:
+    workflows: ['Subfloor Visual QA Evidence Capture']
+    types: [completed]
+
+permissions:
+  contents: read
+
+# Do not cancel an uploader halfway through a branch/comment update.
+concurrency:
+  group: subfloor-visual-qa-publish-${{ github.event.workflow_run.head_branch }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    if: >-
+      github.event.workflow_run.event == 'pull_request' &&
+      github.event.workflow_run.head_repository.full_name == github.repository
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      actions: read
+      contents: write
+      pull-requests: write
+    steps:
+      # Never check out or run source from the PR in this privileged job.
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.14'
+      - name: Materialize the trusted default-branch engine pin
+        shell: bash
+        run: |
+          if [ ! -f .super-coder/scripts/visual_qa.py ]; then
+            engine_ref="$(tr -d '[:space:]' < .sc-state/engine.ref)"
+            [[ "$engine_ref" =~ ^[0-9a-f]{40}$ ]] || { echo 'Invalid engine.ref'; exit 1; }
+            git clone --filter=blob:none --no-checkout https://github.com/jedbjorn/subfloor.git .subfloor-qa-source
+            git -C .subfloor-qa-source checkout "$engine_ref" -- .super-coder
+            mv .subfloor-qa-source/.super-coder .super-coder
+          fi
+      - uses: actions/download-artifact@v4
+        with:
+          name: visual-qa-report
+          path: .sc-state/local/downloaded-visual-qa-report
+          github-token: ${{ github.token }}
+          run-id: ${{ github.event.workflow_run.id }}
+      - name: Publish inline PR evidence
+        run: python3 .super-coder/scripts/visual_qa.py publish --input .sc-state/local/downloaded-visual-qa-report
+        env:
+          GITHUB_TOKEN: ${{ github.token }}

@@ -1,0 +1,57 @@
+# Fork-owned. Created only by explicit `sc visual-qa setup-ci`; updates leave it alone.
+name: Subfloor Visual QA Evidence Capture
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: subfloor-visual-qa-capture-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  capture:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.14'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Materialize the fork-pinned engine
+        shell: bash
+        run: |
+          if [ ! -f .super-coder/scripts/visual_qa.py ]; then
+            engine_ref="$(tr -d '[:space:]' < .sc-state/engine.ref)"
+            [[ "$engine_ref" =~ ^[0-9a-f]{40}$ ]] || { echo 'Invalid engine.ref'; exit 1; }
+            git clone --filter=blob:none --no-checkout https://github.com/jedbjorn/subfloor.git .subfloor-qa-source
+            git -C .subfloor-qa-source checkout "$engine_ref" -- .super-coder
+            mv .subfloor-qa-source/.super-coder .super-coder
+          fi
+      - name: Capture configured Visual QA
+        id: qa
+        run: python3 .super-coder/scripts/visual_qa.py ci --no-publish --report .sc-state/local/visual-qa-report
+      - name: Upload publisher input
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: visual-qa-report
+          path: .sc-state/local/visual-qa-report/
+          if-no-files-found: warn
+          retention-days: 14
+      - name: Upload full gallery and diagnostic logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: visual-qa-gallery
+          path: ${{ steps.qa.outputs.output || 'gallery' }}/
+          if-no-files-found: warn
+          retention-days: ${{ steps.qa.outputs.retention || 14 }}
