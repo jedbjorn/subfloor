@@ -1083,6 +1083,7 @@ for exact flags. This table is a route map, not a second full reference.
 | Curate skills and search | `skill`, `search` | [Customize a fork](#customize-a-fork-vs-diverge-from-it), [Web search](#web-search) |
 | Read spend and reach the GUI | `analytics`, `url`, `ports`, `token` | [Analytics](#token--session-analytics), [Review GUI](#review-gui) |
 | Manage the operator command | `alias`, `make-cleanup` | [Retire the make aliases](#retire-the-make-aliases-one-time) |
+| Keep Actions artifact storage bounded | `actions-artifacts cleanup`, `actions-artifacts setup-ci` | [Actions artifact cleanup](#actions-artifact-cleanup) |
 
 General engine SQL, rebuild and private-state recovery belong to Admin — the
 `sc help` chart groups them as **Engine (Admin)**, and the next subsection
@@ -1200,6 +1201,55 @@ show `native_packages=advisory` / `fork_readiness=degraded`; this advisory never
 blocks core shell entry, roadmap completion, or runtime. Run `subfloor admin`
 from the fork root to inspect evidence and prepare a reviewed tracked fix. The
 FnB retains downstream update and live restart approval.
+
+### Actions artifact cleanup
+
+GitHub Actions artifacts are stored separately from Git history and consume the
+repository owner's artifact allowance. Use seven days for routine CI reports:
+set `retention-days: 7` on `actions/upload-artifact` steps. Changing upload
+retention affects new uploads; it does not shorten old artifacts' expiry dates.
+
+Inspect a repository before deleting its old artifacts:
+
+```bash
+./sc actions-artifacts cleanup                       # read-only dry run; caller's origin
+./sc actions-artifacts cleanup --repo OWNER/REPO      # inspect another repository
+./sc actions-artifacts cleanup --repo OWNER/REPO --apply
+./sc actions-artifacts cleanup --older-than-days 14   # use a longer grace period
+```
+
+The default cutoff is seven days. Cleanup first reads the complete paginated
+inventory, then selects artifacts older than the cutoff whose producing runs
+are completed and have not been updated within that grace period. Runs without
+usable identities are kept; API failures stop cleanup with a nonzero exit.
+Before each deletion it rechecks the producing run to protect active or recent
+reruns. JSON lines identify individual deletions and summarize counts and bytes.
+Dry runs require Actions read access; deletion requires Actions write access.
+Authentication uses the existing `gh` login or `SC_GH_TOKEN`/`GH_TOKEN`.
+
+Enable the daily sweep explicitly from a fork's root, on a feature branch:
+
+```bash
+./sc actions-artifacts setup-ci                      # seven days
+./sc actions-artifacts setup-ci --older-than-days 14  # match longer upload retention
+```
+
+Review and commit `.github/workflows/subfloor-artifact-cleanup.yml`, then merge
+it into the default branch. It runs daily at 04:23 UTC and supports manual
+dispatch, which defaults to a dry run; check **apply** to delete. GitHub can
+delay scheduled runs. The job runs only on the default branch, has only
+`actions: write` permission, and embeds the same standalone cleanup code without
+checking out the repository or installing the engine. Install/update do not
+seed or overwrite this fork-owned workflow; rerunning setup refuses an existing
+file. Keep its retention setting aligned with longer-lived upload policies.
+
+This sweep applies to all Actions artifacts in the selected repository,
+including reports for open PRs after the grace period. It does not delete
+workflow runs, logs, caches, release assets, GitHub Packages, or Git branches;
+published Visual QA evidence on its independent branches remains available.
+Deleting artifacts cannot erase storage charges already accrued. GitHub may
+take 6–12 hours to update usage, and other private repositories or Packages can
+still exhaust the owner's shared allowance. See [GitHub Actions billing](https://docs.github.com/en/billing/concepts/product-billing/github-actions).
 
 `./sc visual-qa` is the fifth check, and the only one the engine implements
 itself: it drives headless Chromium over your configured routes at your
