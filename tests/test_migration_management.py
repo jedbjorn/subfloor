@@ -246,6 +246,54 @@ class MigrationManagementReseedTest(unittest.TestCase):
         self.assertIn("nothing pending", actual[5])
 
 
+class ConversationHotQueryMigrationTest(unittest.TestCase):
+    MIGRATION = "0272_conversation_hot_query_indexes.sql"
+
+    def test_hot_query_migration_is_allowlisted(self):
+        manifest = json.loads(
+            (ROOT / "tests/fixtures/sprint_removal/manifest.json").read_text()
+        )
+        self.assertIn(
+            f".super-coder/migrations/{self.MIGRATION}",
+            manifest["allowed_reference_files"],
+        )
+
+    def test_upgrade_adds_only_four_indexes_drops_duplicate_and_is_idempotent(self):
+        con = sqlite3.connect(":memory:")
+        try:
+            con.executescript((ENGINE / "schema.sql").read_text())
+            for path in sorted((ENGINE / "migrations").glob("*.sql")):
+                if path.name >= self.MIGRATION:
+                    break
+                con.executescript(path.read_text())
+            before = set(con.execute("SELECT name FROM sqlite_master WHERE type='index'"))
+            sql = (ENGINE / "migrations" / self.MIGRATION).read_text()
+            con.executescript(sql)
+            after = set(con.execute("SELECT name FROM sqlite_master WHERE type='index'"))
+            expected = {
+                "idx_conversation_events_conversation_type_sequence":
+                    ["conversation_id", "event_type", "sequence"],
+                "idx_conversation_messages_conversation_message":
+                    ["conversation_id", "message_id"],
+                "idx_conversation_runs_conversation_run": ["conversation_id", "run_id"],
+                "idx_conversation_events_message_type_sequence":
+                    ["message_id", "event_type", "sequence"],
+            }
+            self.assertEqual(after - before, {(name,) for name in expected})
+            self.assertEqual(before - after, {("idx_conversation_events_replay",)})
+            for name, columns in expected.items():
+                self.assertEqual(
+                    [row[2] for row in con.execute(f"PRAGMA index_info({name})")], columns,
+                )
+            self.assertIn(("sqlite_autoindex_conversation_events_1",), after)
+            con.executescript(sql)
+            self.assertEqual(after, set(con.execute(
+                "SELECT name FROM sqlite_master WHERE type='index'",
+            )))
+        finally:
+            con.close()
+
+
 class DocumentRetirementSchemaTest(unittest.TestCase):
     """0268 puts the retirement columns on `documents`, exactly once.
 

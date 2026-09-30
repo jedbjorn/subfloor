@@ -385,7 +385,7 @@ def _append_event(
         (
             conversation_id,
             sequence,
-            event_type,
+            conversation_events.require_event_type(event_type),
             json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
             message_id,
             run_id,
@@ -1460,47 +1460,48 @@ def _create_conversation(con, operator: dict, headers, body: dict):
     else:
         selected_effort = None
 
-    runtime_status = None
-    runtime_scope = None
-    if (
-        selected_model is None
-        or harness not in route_bindings.LIVE_NATIVE_HARNESSES
-    ):
-        runtime_status = model_catalog.harness_runtime_status(harness)
-        runtime_scope = model_catalog.harness_versions.runtime_scope()
-    try:
+    with model_catalog.harness_versions.probe_observation(harness):
+        runtime_status = None
+        runtime_scope = None
         if (
-            selected_model is not None
-            and harness in route_bindings.LIVE_NATIVE_HARNESSES
+            selected_model is None
+            or harness not in route_bindings.LIVE_NATIVE_HARNESSES
         ):
-            binding, binding_digest = route_bindings.resolve_live_native(
-                harness, selected_model, selected_effort
-            )
-        elif selected_model is not None and harness != "vibe":
-            route = con.execute(
-                "SELECT * FROM model_routes WHERE harness=? AND selector=?",
-                (harness, selected_model),
-            ).fetchone()
-            binding, binding_digest = route_bindings.resolve_persisted_v2(
-                con,
-                dict(route) if route is not None else None,
-                harness,
-                selected_model,
-                selected_effort,
-                runtime_status=runtime_status,
-                runtime_scope=runtime_scope,
-            )
-        else:
-            binding, binding_digest = route_bindings.resolve_v2(
-                None,
-                harness,
-                selected_model,
-                selected_effort,
-                runtime_status=runtime_status,
-                runtime_scope=runtime_scope,
-            )
-    except route_bindings.RouteResolutionError as exc:
-        raise ApiError(422, exc.code, exc.message, exc.details) from exc
+            runtime_status = model_catalog.harness_runtime_status(harness)
+            runtime_scope = model_catalog.harness_versions.runtime_scope()
+        try:
+            if (
+                selected_model is not None
+                and harness in route_bindings.LIVE_NATIVE_HARNESSES
+            ):
+                binding, binding_digest = route_bindings.resolve_live_native(
+                    harness, selected_model, selected_effort
+                )
+            elif selected_model is not None and harness != "vibe":
+                route = con.execute(
+                    "SELECT * FROM model_routes WHERE harness=? AND selector=?",
+                    (harness, selected_model),
+                ).fetchone()
+                binding, binding_digest = route_bindings.resolve_persisted_v2(
+                    con,
+                    dict(route) if route is not None else None,
+                    harness,
+                    selected_model,
+                    selected_effort,
+                    runtime_status=runtime_status,
+                    runtime_scope=runtime_scope,
+                )
+            else:
+                binding, binding_digest = route_bindings.resolve_v2(
+                    None,
+                    harness,
+                    selected_model,
+                    selected_effort,
+                    runtime_status=runtime_status,
+                    runtime_scope=runtime_scope,
+                )
+        except route_bindings.RouteResolutionError as exc:
+            raise ApiError(422, exc.code, exc.message, exc.details) from exc
     harness = binding["harness"]
     model = binding["requested_model"]
     effort = binding["requested_effort"]
@@ -2041,23 +2042,36 @@ def _accepted_queue_position(con, message_id: int) -> int:
 def _list_messages(con, operator: dict, conversation_id: str, query):
     _require_conversation(con, conversation_id, operator["user_id"])
     limit = _limit(query)
-    after = 0
-    cursor = query.get("cursor", [None])[0]
+    orders = query.get("order", ["asc"])
+    if len(orders) != 1 or orders[0] not in ("asc", "desc"):
+        raise ApiError(
+            422, "VALIDATION_ERROR", "order must be exactly one asc or desc value",
+        )
+    order = orders[0]
+    position_clause = ""
+    params = [conversation_id]
+    cursor = _single_cursor(query, "message")
     if cursor:
         decoded = _cursor_decode(cursor, "message")
         after = _integer(decoded.get("id"), "cursor message id")
-        if after < 0:
+        # Pre-order cursors were ascending; continue accepting them in that order.
+        if after < 0 or decoded.get("order", "asc") != order:
             raise ApiError(422, "CURSOR_INVALID", "invalid message cursor")
+        comparison = ">" if order == "asc" else "<"
+        position_clause = f" AND message_id{comparison}?"
+        params.append(after)
+    params.append(limit + 1)
     rows = con.execute(
         "SELECT message_id,conversation_id,sender_kind,sender_ref,message_kind,"
         "body,caused_by_message_id,state,created_at,completed_at "
-        "FROM conversation_messages WHERE conversation_id=? AND message_id>? "
-        "ORDER BY message_id LIMIT ?",
-        (conversation_id, after, limit + 1),
+        "FROM conversation_messages WHERE conversation_id=?"
+        + position_clause
+        + f" ORDER BY message_id {order.upper()} LIMIT ?",
+        params,
     ).fetchall()
     page = rows[:limit]
     next_cursor = (
-        _cursor_encode({"v": 1, "id": int(page[-1]["message_id"])})
+        _cursor_encode({"v": 1, "id": int(page[-1]["message_id"]), "order": order})
         if len(rows) > limit
         else None
     )
@@ -2443,7 +2457,8 @@ def _transcript_projection(
             "WITH ranked AS ("
             " SELECT message_id,body,state,created_at,completed_at,"
             "ROW_NUMBER() OVER (ORDER BY message_id DESC) AS source_rank,"
-            "COUNT(*) OVER() AS total_messages,"
+            "COUNT(*) OVER (ORDER BY message_id DESC ROWS BETWEEN "
+            "UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) AS total_messages,"
             "SUM(length(CAST(body AS BLOB))) OVER ("
             " ORDER BY message_id DESC ROWS UNBOUNDED PRECEDING"
             ") AS message_source_bytes "
@@ -2451,10 +2466,11 @@ def _transcript_projection(
             " WHERE conversation_id=? AND message_kind='prompt'"
             + message_boundary
             + ") SELECT * FROM ranked WHERE source_rank<=? "
-            "AND (message_source_bytes<=? OR source_rank=1) "
-            "ORDER BY message_id",
+            "AND (message_source_bytes<=? OR source_rank=1)",
             (*message_params, limits.max_turns, limits.max_source_bytes),
         ).fetchall()
+        # Keep the windows in index order; sort only the bounded prompt page.
+        message_rows.sort(key=lambda row: int(row["message_id"]))
         total_messages = (
             int(message_rows[0]["total_messages"]) if message_rows else 0
         )
@@ -3161,11 +3177,11 @@ def _event_batch(conversation_id: str, after: int) -> list[dict]:
             for row in con.execute(
                 "SELECT harness_session_ref FROM conversations "
                 "WHERE conversation_id=? AND harness_session_ref IS NOT NULL "
-                "UNION SELECT harness_session_before FROM conversation_runs "
+                "UNION ALL SELECT harness_session_before FROM conversation_runs "
                 "WHERE conversation_id=? AND harness_session_before IS NOT NULL "
-                "UNION SELECT harness_session_after FROM conversation_runs "
+                "UNION ALL SELECT harness_session_after FROM conversation_runs "
                 "WHERE conversation_id=? AND harness_session_after IS NOT NULL "
-                "UNION SELECT runner_ref FROM conversation_runs "
+                "UNION ALL SELECT runner_ref FROM conversation_runs "
                 "WHERE conversation_id=? AND runner_ref IS NOT NULL",
                 (conversation_id,) * 4,
             )

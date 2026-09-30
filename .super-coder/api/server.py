@@ -5358,6 +5358,14 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/logs":
             return self._send(200, {"events": list(reversed(read_log())),
                                     "max": LOG_MAX_EVENTS})
+        if path == "/api/models":
+            q = parse_qs(urlparse(self.path).query)
+            try:
+                return self._send(200, model_catalog.catalog(
+                    refresh=q.get("refresh", ["0"])[0] in ("1", "true"),
+                    connection_factory=db))
+            except Exception as e:
+                return self._fail(e)
         con = db()
         try:
             if path == "/api/health":
@@ -5372,11 +5380,6 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, {"templates": shell_factory.flavors()})
             if path == "/api/flavor-defaults":
                 return self._send(200, get_flavor_defaults(con))
-            if path == "/api/models":
-                q = parse_qs(urlparse(self.path).query)
-                return self._send(200, model_catalog.catalog(
-                    refresh=q.get("refresh", ["0"])[0] in ("1", "true"),
-                    con=con))
             if path.startswith("/api/shells/"):
                 sid = int(path.rsplit("/", 1)[1])
                 shell = get_shell(con, sid)

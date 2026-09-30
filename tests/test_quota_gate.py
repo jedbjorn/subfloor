@@ -495,7 +495,7 @@ QUOTA = APP[
     APP.index("// ── Provider Quota"):
     APP.index("// ── Interface / browser-native conversations")
 ]
-_ROUTER_AT = APP.index("function routeFromHash()")
+_ROUTER_AT = APP.index("let lastRoutedHash")
 # U4's slice stops at the nav-button line; this one deliberately runs PAST it,
 # through `window.addEventListener("hashchange", routeFromHash)` — the wiring
 # is exactly what checkbox 8 is about and what that slice leaves out.

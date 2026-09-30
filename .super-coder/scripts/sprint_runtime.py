@@ -164,10 +164,11 @@ def enqueue_conversation_turn(
                 con.execute(
                     "INSERT INTO conversation_events "
                     "(conversation_id,sequence,event_type,payload,message_id) "
-                    "VALUES (?,?,'message.accepted',?,?)",
+                    "VALUES (?,?,?,?,?)",
                     (
                         conversation_id,
                         sequence,
+                        conversation_events.require_event_type("message.accepted"),
                         json.dumps(
                             {
                                 "message_id": message_id,

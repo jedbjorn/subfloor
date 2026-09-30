@@ -24,6 +24,8 @@ import shutil
 import socket
 import subprocess
 import sys
+from contextlib import contextmanager
+from contextvars import ContextVar
 
 # Probe order = the order the harness picker lists them.
 HARNESSES = ("claude", "codex", "opencode", "vibe", "kimi")
@@ -43,6 +45,32 @@ MAINTAINED_OBSERVED_VERSIONS = {
     "kimi": "0.33.0",
 }
 PROBE_COMMANDS = {}
+_PROBE_OBSERVATION: ContextVar[dict | None] = ContextVar(
+    "harness_probe_observation", default=None
+)
+
+
+@contextmanager
+def probe_observation(harness: str):
+    """Share one selected-harness observation within one create operation.
+
+    The observation retains the raw observed_version and full runtime_status;
+    route proofs remain owned by their resolver. No observation survives the
+    operation, including failed creates.
+    """
+    observation = {"harness": harness}
+    token = _PROBE_OBSERVATION.set(observation)
+    try:
+        yield observation
+    finally:
+        _PROBE_OBSERVATION.reset(token)
+
+
+def current_probe_observation(harness: str) -> dict | None:
+    observation = _PROBE_OBSERVATION.get()
+    if observation is not None and observation["harness"] == harness:
+        return observation
+    return None
 
 
 def runtime_scope(*, env=None, hostname: str | None = None) -> dict[str, str]:
@@ -60,6 +88,15 @@ def probe(name: str) -> str | None:
     """First line of `<harness> --version`, or None when absent/unusable.
     Absent, hung, and crashed all collapse to None on purpose: the caller is a
     status line, and every one of those means "cannot tell you a version"."""
+    observation = current_probe_observation(name)
+    if observation is None:
+        return _probe(name)
+    if "observed_version" not in observation:
+        observation["observed_version"] = _probe(name)
+    return observation["observed_version"]
+
+
+def _probe(name: str) -> str | None:
     command = PROBE_COMMANDS.get(name, name)
     if not shutil.which(command):
         return None
