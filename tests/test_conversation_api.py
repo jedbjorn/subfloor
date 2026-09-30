@@ -11,7 +11,7 @@ import tempfile
 import time
 import unittest
 import zipfile
-from contextlib import closing, redirect_stdout
+from contextlib import ExitStack, closing, redirect_stdout
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -30,6 +30,7 @@ import conversation_launch
 import conversation_routes
 import sprint_participant_chats
 from conversation_adapters import NativeTurn, NormalizedEvent
+from conversation_adapters import opencode as opencode_adapter
 from segmented_response_traces import (
     HISTORICAL_SEGMENT_TRACES,
     PENDING_BOUNDARY_TRACE,
@@ -604,6 +605,236 @@ class ConversationApiCase(unittest.TestCase):
 
 
 class ConversationResourceTest(ConversationApiCase):
+    _real_runtime_status = staticmethod(
+        conversation_routes.model_catalog.harness_runtime_status
+    )
+    _real_controlled_evidence = staticmethod(
+        conversation_routes.model_catalog.controlled_route_evidence
+    )
+    _probe_selectors = {
+        "claude": "sonnet",
+        "codex": "gpt-probe",
+        "kimi": "configured-alias",
+        "opencode": "openai/gpt-probe",
+        "vibe": "devstral-latest",
+    }
+
+    def inject_create_probe_counter(self, stack: ExitStack):
+        """Use real version admission and source readers with fake CLI output."""
+        catalog = conversation_routes.model_catalog
+        versions = catalog.harness_versions.MAINTAINED_OBSERVED_VERSIONS
+        calls = []
+        observations = []
+
+        def run(command, **_kwargs):
+            self.assertEqual(command[1:], ["--version"])
+            calls.append(command[0])
+            return SimpleNamespace(
+                returncode=0, stdout=versions[command[0]], stderr=""
+            )
+
+        def evidence(harness, selector):
+            observation = self._real_controlled_evidence(harness, selector)
+            observations.append(observation)
+            return observation
+
+        codex_home = self.root / "codex-probe"
+        codex_home.mkdir()
+        (codex_home / "models_cache.json").write_text(json.dumps({
+            "models": [{
+                "slug": self._probe_selectors["codex"],
+                "supported_reasoning_levels": [{"effort": "high"}],
+                "default_reasoning_level": "high",
+            }],
+        }))
+        kimi_home = self.root / "kimi-probe"
+        kimi_home.mkdir()
+        (kimi_home / "config.toml").write_text(
+            '[models.configured-alias]\nprovider = "moonshot"\n'
+            'model = "kimi-k2"\nsupport_efforts = ["high"]\n'
+            'default_effort = "high"\n'
+        )
+        patches = (
+            mock.patch.dict(catalog.os.environ, {
+                "CODEX_HOME": str(codex_home),
+                "KIMI_CODE_HOME": str(kimi_home),
+            }),
+            mock.patch.object(catalog.shutil, "which", side_effect=lambda name: name),
+            mock.patch.object(catalog.subprocess, "run", side_effect=run),
+            mock.patch.object(
+                catalog, "harness_runtime_status", side_effect=self._real_runtime_status
+            ),
+            mock.patch.object(catalog, "controlled_route_evidence", side_effect=evidence),
+            mock.patch.object(catalog, "opencode_connected_models", return_value=[{
+                "id": self._probe_selectors["opencode"],
+                "provider": "openai", "provider_model": "gpt-probe",
+                "cli_version": versions["opencode"],
+                "native_variant_ids": {"high": "high"},
+            }]),
+            mock.patch.object(
+                conversation_routes.conversation_git_targets,
+                "observe_and_persist", return_value=None,
+            ),
+        )
+        for patch in patches:
+            stack.enter_context(patch)
+
+        # Persist the same local source evidence a catalog refresh would write.
+        # Creation must retain the existing freshness and fingerprint checks.
+        statuses = catalog.harness_versions.compatibility_status(("claude", "codex", "kimi"))
+        with self.connect() as con:
+            catalog.persist_routes(con, {
+                "fetched_at": datetime.now(timezone.utc).isoformat(),
+                "stale": False,
+                "verification": {"harnesses": statuses},
+                "harnesses": {
+                    "claude": {"models": catalog._from_claude_cli(run)},
+                    "codex": {"models": catalog._from_codex_cache(catalog.os.environ, run)},
+                    "kimi": {"models": catalog._from_kimi_config(catalog.os.environ, run)},
+                },
+            }, publication_locked=True)
+        calls.clear()
+        compatibility = stack.enter_context(mock.patch.object(
+            catalog.harness_versions, "compatibility_status",
+            wraps=catalog.harness_versions.compatibility_status,
+        ))
+        return calls, compatibility, observations
+
+    @staticmethod
+    def admit_vibe_for_probe_test(stack: ExitStack) -> None:
+        # Vibe has no shipped browser adapter. Admit it only in these tests to
+        # exercise the generic create probe path without adding support.
+        harnesses = (*conversation_routes._BROWSER_HARNESSES, "vibe")
+        stack.enter_context(mock.patch.multiple(
+            conversation_routes,
+            ADAPTER_TYPES={**conversation_routes.ADAPTER_TYPES, "vibe": object()},
+            _BROWSER_HARNESSES=harnesses,
+            _BROWSER_HARNESS_SQL=",".join("?" for _ in harnesses),
+        ))
+
+    def test_create_probes_selected_harness_once(self) -> None:
+        with ExitStack() as stack:
+            calls, compatibility, observations = self.inject_create_probe_counter(stack)
+            self.admit_vibe_for_probe_test(stack)
+            for harness, selector in self._probe_selectors.items():
+                for model in (None, selector):
+                    with self.subTest(harness=harness, model=model):
+                        calls.clear()
+                        compatibility.reset_mock()
+                        observations.clear()
+                        status, _, created = self.request(
+                            "POST", "/api/conversations",
+                            body={"shell_id": 1, "harness": harness, "model": model},
+                            key=f"probe-{harness}-{model}",
+                        )
+                        self.assertEqual(status, 201, created)
+                        self.assertEqual(calls, [harness])
+                        compatibility.assert_called_once_with((harness,))
+                        if model is not None and harness != "vibe":
+                            self.assertEqual(len(observations), 1)
+                            self.assertEqual(
+                                observations[0]["runtime_status"]["observed_version"],
+                                conversation_routes.model_catalog.harness_versions
+                                .MAINTAINED_OBSERVED_VERSIONS[harness],
+                            )
+
+    def test_consecutive_creates_each_probe_selected_harness(self) -> None:
+        with ExitStack() as stack:
+            calls, compatibility, _ = self.inject_create_probe_counter(stack)
+            self.admit_vibe_for_probe_test(stack)
+            for harness, selector in self._probe_selectors.items():
+                with self.subTest(harness=harness):
+                    calls.clear()
+                    compatibility.reset_mock()
+                    for request_number in (1, 2):
+                        status, _, created = self.request(
+                            "POST", "/api/conversations",
+                            body={"shell_id": 1, "harness": harness, "model": selector},
+                            key=f"probe-consecutive-{harness}-{request_number}",
+                        )
+                        self.assertEqual(status, 201, created)
+                        self.assertEqual(calls, [harness] * request_number)
+                    self.assertEqual(
+                        compatibility.call_args_list,
+                        [mock.call((harness,)), mock.call((harness,))],
+                    )
+
+    def test_failed_create_discards_harness_probe_observation(self) -> None:
+        with ExitStack() as stack:
+            calls, compatibility, _ = self.inject_create_probe_counter(stack)
+            status, _, refused = self.request(
+                "POST", "/api/conversations",
+                body={"shell_id": 1, "harness": "claude", "model": "missing-alias"},
+                key="probe-failed",
+            )
+            self.assertEqual(status, 422, refused)
+            self.assertEqual(calls, ["claude"])
+            status, _, created = self.request(
+                "POST", "/api/conversations",
+                body={"shell_id": 1, "harness": "claude", "model": "sonnet"},
+                key="probe-after-failure",
+            )
+            self.assertEqual(status, 201, created)
+            self.assertEqual(calls, ["claude", "claude"])
+            self.assertEqual(
+                compatibility.call_args_list,
+                [mock.call(("claude",)), mock.call(("claude",))],
+            )
+
+    def test_unregistered_vibe_create_is_rejected_without_probing(self) -> None:
+        with ExitStack() as stack:
+            calls, compatibility, _ = self.inject_create_probe_counter(stack)
+            status, _, refused = self.request(
+                "POST", "/api/conversations",
+                body={"shell_id": 1, "harness": "vibe", "model": None},
+                key="probe-unregistered-vibe",
+            )
+            self.assertEqual(status, 422, refused)
+            self.assertEqual(refused["error"]["code"], "HARNESS_CONVERSATION_UNSUPPORTED")
+            self.assertEqual(calls, [])
+            compatibility.assert_not_called()
+
+    def test_opencode_orphan_adoption_reuses_create_version_probe(self) -> None:
+        with ExitStack() as stack:
+            calls, compatibility, _ = self.inject_create_probe_counter(stack)
+            version = conversation_routes.model_catalog.harness_versions.MAINTAINED_OBSERVED_VERSIONS["opencode"]
+            transport = mock.Mock()
+            transport.request.side_effect = lambda method, path: (
+                {"healthy": True, "version": version}
+                if path == "/global/health" else {
+                    "connected": ["openai"],
+                    "all": [{"id": "openai", "models": {
+                        "gpt-probe": {"variants": {"high": {}}},
+                    }}],
+                }
+            )
+            for patch in (
+                mock.patch.object(
+                    conversation_routes.model_catalog, "opencode_connected_models",
+                    side_effect=opencode_adapter.connected_models,
+                ),
+                mock.patch.object(opencode_adapter, "_SERVER_PROCESS", None),
+                mock.patch.object(opencode_adapter, "_SERVER_ENDPOINT", "http://127.0.0.1:4096"),
+                mock.patch.object(opencode_adapter, "_SERVER_PASSWORD", None),
+                mock.patch.object(opencode_adapter, "_read_server_state", return_value={
+                    "pid": 12345, "port": 4096, "password": "orphan-password",
+                }),
+                mock.patch.object(opencode_adapter, "_server_healthy", side_effect=(
+                    lambda endpoint, password: password == "orphan-password"
+                )),
+                mock.patch.object(opencode_adapter, "UrlHttpTransport", return_value=transport),
+            ):
+                stack.enter_context(patch)
+            status, _, created = self.request(
+                "POST", "/api/conversations",
+                body={"shell_id": 1, "harness": "opencode", "model": "openai/gpt-probe"},
+                key="probe-opencode-adoption",
+            )
+            self.assertEqual(status, 201, created)
+            self.assertEqual(opencode_adapter._SERVER_PASSWORD, "orphan-password")
+            self.assertEqual(calls, ["opencode"])
+            compatibility.assert_called_once_with(("opencode",))
+
     def test_unknown_harness_new_chat_is_rejected_without_a_row(self) -> None:
         status, _, error = self.request(
             "POST",
@@ -3043,6 +3274,216 @@ class ConversationMessageOrderTest(ConversationApiCase):
 
 
 class ConversationPerformanceFixtureTest(ConversationApiCase):
+    def seed_index_fixture(self, con):
+        conversation_id = self.seed_conversation(con, number=720)
+        message_ids, sequence = self.seed_transcript(
+            con, conversation_id=conversation_id, turns=45, deltas_per_turn=10,
+        )
+        other = self.seed_conversation(con, number=721)
+        self.seed_transcript(
+            con, conversation_id=other, turns=5, deltas_per_turn=2000,
+        )
+        con.commit()
+        return conversation_id, message_ids, sequence
+
+    def assert_index_plan(self, con, statement, indexes):
+        details = [row[3] for row in con.execute(
+            "EXPLAIN QUERY PLAN " + statement,
+        )]
+        self.assertFalse(any("USE TEMP B-TREE" in detail for detail in details), details)
+        for table, index in indexes.items():
+            self.assertFalse(any(
+                detail.split()[:2] == ["SCAN", table] for detail in details
+            ), details)
+            self.assertTrue(any(
+                detail.startswith(f"SEARCH {table} USING ") and index in detail
+                for detail in details
+            ), details)
+        return details
+
+    def test_close_and_reopen_probes_seek_by_conversation_and_event_type(self) -> None:
+        with closing(self.connect()) as con:
+            conversation_id, _, sequence = self.seed_index_fixture(con)
+            con.execute(
+                "UPDATE conversations SET state='idle',closed_at=NULL "
+                "WHERE conversation_id=?", (conversation_id,),
+            )
+            # Cover no request, a request outscoped by reopen, and a fresh request.
+            for event_types, expected in (
+                ((), None),
+                (("conversation.close.requested", "conversation.reopened"), None),
+                (("conversation.close.requested",), "2026-07-30 15:00:00"),
+            ):
+                with self.subTest(event_types=event_types):
+                    for event_type in event_types:
+                        sequence += 1
+                        con.execute(
+                            "INSERT INTO conversation_events "
+                            "(conversation_id,sequence,event_type,payload,created_at) "
+                            "VALUES (?,?,?,'{}','2026-07-30 15:00:00')",
+                            (conversation_id, sequence, event_type),
+                        )
+                    con.commit()
+                    statements = []
+                    con.set_trace_callback(statements.append)
+                    row = conversation_routes._conversation_row(con, conversation_id, 1)
+                    _, _, page = decoded(conversation_routes._list_conversations(
+                        con, {"user_id": 1}, {"shell_id": ["1"], "open": ["true"]},
+                    ))
+                    con.set_trace_callback(None)
+                    self.assertEqual(row["close_requested_at"], expected)
+                    self.assertEqual(page["items"][0]["close_requested_at"], expected)
+                    self.assertEqual(len(statements), 2)
+                    for statement in statements:
+                        details = self.assert_index_plan(con, statement, {
+                            alias: "idx_conversation_events_conversation_type_sequence"
+                            for alias in ("requested", "reopened")
+                        })
+                        for alias in ("requested", "reopened"):
+                            self.assertTrue(any(
+                                detail.startswith(f"SEARCH {alias} ")
+                                and "conversation_id=? AND event_type=?" in detail
+                                for detail in details
+                            ), details)
+
+    def test_message_pages_seek_in_message_id_order(self) -> None:
+        with closing(self.connect()) as con:
+            conversation_id, message_ids, _ = self.seed_index_fixture(con)
+            cursor = None
+            for expected in (message_ids[:2], message_ids[2:4]):
+                query = {"limit": ["2"]}
+                if cursor:
+                    query["cursor"] = [cursor]
+                statements = []
+                con.set_trace_callback(statements.append)
+                _, _, page = decoded(conversation_routes._list_messages(
+                    con, {"user_id": 1}, conversation_id, query,
+                ))
+                con.set_trace_callback(None)
+                self.assertEqual([item["message_id"] for item in page["items"]], expected)
+                self.assert_index_plan(con, next(
+                    q for q in statements if q.startswith("SELECT message_id,")
+                ), {"conversation_messages": "idx_conversation_messages_conversation_message"})
+                cursor = page["next_cursor"]
+
+    def test_transcript_prompt_windows_share_message_page_index_without_sorts(self) -> None:
+        with closing(self.connect()) as con:
+            conversation_id, message_ids, _ = self.seed_index_fixture(con)
+            con.execute(
+                "INSERT INTO conversation_messages "
+                "(conversation_id,sender_kind,sender_ref,message_kind,body,"
+                "idempotency_key,request_hash,state,completed_at) "
+                "VALUES (?,'engine','fixture','notice','not a prompt',"
+                "'notice','notice','completed',datetime('now'))", (conversation_id,),
+            )
+            con.commit()
+            cursor = None
+            for expected in (message_ids[25:], message_ids[5:25], message_ids[:5]):
+                statements = []
+                con.set_trace_callback(statements.append)
+                page = conversation_routes._transcript_projection(
+                    con, conversation_id, owner_user_id=1, cursor=cursor,
+                )
+                con.set_trace_callback(None)
+                self.assertEqual([
+                    item["message_id"] for item in page["items"] if item["kind"] == "user"
+                ], expected)
+                self.assert_index_plan(con, next(
+                    q for q in statements if q.startswith("WITH ranked AS ( SELECT message_id,")
+                ), {"conversation_messages": "idx_conversation_messages_conversation_message"})
+                cursor = page["older_cursor"]
+            self.assertIsNone(cursor)
+
+    def test_accepted_queue_receipt_seeks_earliest_sequence_without_sort(self) -> None:
+        with closing(self.connect()) as con:
+            conversation_id, message_ids, sequence = self.seed_index_fixture(con)
+            con.execute(
+                "INSERT INTO conversation_events "
+                "(conversation_id,sequence,event_type,payload,message_id) "
+                "VALUES (?,?,'message.accepted','{\"queue_position\":99}',?)",
+                (conversation_id, sequence + 1, message_ids[0]),
+            )
+            con.commit()
+            statements = []
+            con.set_trace_callback(statements.append)
+            position = conversation_routes._accepted_queue_position(con, message_ids[0])
+            con.set_trace_callback(None)
+            self.assertEqual(position, 0)  # The original receipt predates position 99.
+            self.assertEqual(len(statements), 1)
+            self.assert_index_plan(con, statements[0], {
+                "conversation_events": "idx_conversation_events_message_type_sequence",
+            })
+
+    def test_stream_secrets_seek_runs_without_sort_and_preserve_redaction(self) -> None:
+        with closing(self.connect()) as con:
+            conversation_id, _, sequence = self.seed_index_fixture(con)
+            con.execute(
+                "UPDATE conversations SET harness_session_ref='native-before' "
+                "WHERE conversation_id=?", (conversation_id,),
+            )
+            con.execute(
+                "UPDATE conversation_runs SET harness_session_before='native-before',"
+                "harness_session_after='native-after',runner_ref='native-runner' "
+                "WHERE conversation_id=?", (conversation_id,),
+            )
+            con.execute(
+                "UPDATE conversation_runs SET runner_ref='other-runner' "
+                "WHERE conversation_id!=?", (conversation_id,),
+            )
+            con.execute(
+                "INSERT INTO conversation_events "
+                "(conversation_id,sequence,event_type,payload) VALUES "
+                "(?,?,'run.unknown',?)",
+                (conversation_id, sequence + 1, json.dumps({
+                    "detail": "native-before native-after native-runner other-runner",
+                })),
+            )
+            con.commit()
+        statements = []
+        reader = self.connect()
+        reader.set_trace_callback(statements.append)
+        with mock.patch.object(conversation_routes, "_db", return_value=reader):
+            events = conversation_routes._event_batch(conversation_id, sequence)
+        self.assertEqual(events[0]["payload"]["detail"],
+                         "[redacted] [redacted] [redacted] other-runner")
+        with closing(self.connect()) as con:
+            details = self.assert_index_plan(con, next(
+                q for q in statements if q.startswith("SELECT harness_session_ref")
+            ), {"conversation_runs": "idx_conversation_runs_conversation_run"})
+            self.assertEqual(sum(
+                detail.startswith("SEARCH conversation_runs ") for detail in details
+            ), 3)
+
+    def test_replay_and_watermarks_use_unique_autoindex_after_replay_index_drop(self) -> None:
+        with closing(self.connect()) as con:
+            conversation_id, _, sequence = self.seed_index_fixture(con)
+            self.assertIsNone(con.execute(
+                "SELECT 1 FROM sqlite_master WHERE name='idx_conversation_events_replay'",
+            ).fetchone())
+            statements = []
+            con.set_trace_callback(statements.append)
+            page = conversation_routes._transcript_projection(
+                con, conversation_id, owner_user_id=1,
+            )
+            conversation_routes._append_event(con, conversation_id, "run.unknown", {})
+            con.set_trace_callback(None)
+            self.assertEqual(page["through_sequence"], sequence)
+            con.commit()
+        reader = self.connect()
+        reader.set_trace_callback(statements.append)
+        with mock.patch.object(conversation_routes, "_db", return_value=reader):
+            events = conversation_routes._event_batch(conversation_id, sequence)
+        self.assertEqual([event["sequence"] for event in events], [sequence + 1])
+        queries = [q for q in statements if q.startswith((
+            "SELECT COALESCE(MAX(sequence)", "SELECT sequence,event_type,",
+        ))]
+        self.assertEqual(len(queries), 3)
+        with closing(self.connect()) as con:
+            for statement in queries:
+                self.assert_index_plan(con, statement, {
+                    "conversation_events": "sqlite_autoindex_conversation_events_1",
+                })
+
     def test_filtered_history_pages_bind_scope_and_exclude_other_owners(self) -> None:
         with closing(self.connect()) as con:
             recent = [
