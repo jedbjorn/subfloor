@@ -1,5 +1,7 @@
 import http.client
 import json
+import socket
+import struct
 import sys
 import threading
 import time
@@ -63,6 +65,25 @@ def gates(tmp_path, monkeypatch):
             self.send_header("Content-Length", "0")
             self.end_headers()
 
+        def do_GET(self):
+            gate.stream_requests.append(dict(self.headers))
+            if gate.stream_disconnect:
+                self.close_connection = True
+                return
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.close_connection = True
+            try:
+                self.wfile.write(b": connected\n\n")
+                self.wfile.flush()
+                if gate.stream_release.wait(2):
+                    self.wfile.write(b"id: 1\ndata: {}\n\n")
+                    self.wfile.flush()
+            except OSError:
+                pass
+
     upstream = ThreadingHTTPServer(("127.0.0.1", 0), Upstream)
     threading.Thread(target=upstream.serve_forever, daemon=True).start()
     config = {"armed": True, "browser_port": upstream.server_port}
@@ -76,11 +97,15 @@ def gates(tmp_path, monkeypatch):
     )
     gate.slow_started = threading.Event()
     gate.deleted = threading.Event()
+    gate.stream_requests = []
+    gate.stream_disconnect = False
+    gate.stream_release = threading.Event()
     gate.tool_response = None
     gate.response_status = 200
     gate.response_format = "text/event-stream"
     threading.Thread(target=gate.serve_forever, daemon=True).start()
     yield gate, config, calls
+    gate.stream_release.set()
     gate.shutdown()
     gate.server_close()
     upstream.shutdown()
@@ -313,6 +338,139 @@ def test_transport_loss_terminates_and_recreates_upstream_session(gates):
     assert "result" in recovered
     assert sum(m["method"] == "initialize" for m in calls) == 2
     assert status(gate)["extension"] == "connected"
+
+
+def test_dropped_get_subscriber_preserves_approval_and_can_reconnect(gates, monkeypatch):
+    gate, _, calls = gates
+    sid, _, _ = request(gate, "DEV5", "initialize")
+    request(gate, "DEV5", "tools/call", sid, {"name": "browser_snapshot"})
+    upstream = gate.sessions[sid]["upstream"]
+    finished = threading.Event()
+    forward = proxy.Handler.forward
+
+    def observe_forward(self, method, *args):
+        try:
+            return forward(self, method, *args)
+        finally:
+            if method == "GET":
+                finished.set()
+
+    monkeypatch.setattr(proxy.Handler, "forward", observe_forward)
+    client = socket.create_connection(("127.0.0.1", gate.server_port), timeout=2)
+    client.sendall(
+        f"GET /mcp/DEV5 HTTP/1.1\r\nHost: localhost\r\nMcp-Session-Id: {sid}\r\n\r\n".encode()
+    )
+    body = b""
+    while b": connected\n\n" not in body:
+        chunk = client.recv(65536)
+        assert chunk
+        body += chunk
+    # Reset only the downstream subscriber before the next upstream event.
+    client.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+    client.close()
+    gate.stream_release.set()
+    assert finished.wait(2)
+    assert not gate.deleted.is_set()
+    assert gate.sessions[sid]["upstream"] == upstream
+    assert status(gate)["active_shells"] == ["DEV5"]
+
+    client = http.client.HTTPConnection("127.0.0.1", gate.server_port, timeout=2)
+    client.request(
+        "GET", "/mcp/DEV5", headers={"Mcp-Session-Id": sid, "Last-Event-ID": "1"}
+    )
+    response = client.getresponse()
+    assert response.status == 200
+    assert b"data: {}" in response.read()
+    assert gate.stream_requests[-1]["Last-Event-ID"] == "1"
+    assert all(r["Mcp-Session-Id"] == upstream for r in gate.stream_requests)
+    request(gate, "DEV5", "tools/call", sid, {"name": "browser_snapshot"})
+    assert sum(m["method"] == "initialize" for m in calls) == 1
+    assert sum(m["method"] == "tools/call" for m in calls) == 2
+    assert not gate.deleted.is_set()
+
+    # Explicit session termination remains distinct from closing a GET stream.
+    client.request("DELETE", "/mcp/DEV5", headers={"Mcp-Session-Id": sid})
+    assert client.getresponse().read() == b""
+    client.close()
+    assert gate.deleted.is_set()
+    assert sid not in gate.sessions
+    assert status(gate)["active_shells"] == []
+
+
+@pytest.mark.parametrize("method", ["GET", "POST"])
+@pytest.mark.parametrize("phase", ["headers", "body"])
+def test_downstream_write_failure_preserves_approved_session(
+    gates, monkeypatch, method, phase
+):
+    gate, _, calls = gates
+    sid, _, _ = request(gate, "DEV5", "initialize")
+    request(gate, "DEV5", "tools/call", sid, {"name": "browser_snapshot"})
+    upstream = gate.sessions[sid]["upstream"]
+    gate.stream_release.set()
+    finished = threading.Event()
+    end_headers = proxy.Handler.end_headers
+    forward = proxy.Handler.forward
+
+    def fail_write(_data):
+        raise ConnectionResetError("downstream client gone")
+
+    def fail_headers(self):
+        if self.path != "/mcp/DEV5":
+            return end_headers(self)
+        if phase == "headers":
+            return fail_write(None)
+        end_headers(self)
+        self.wfile.write = fail_write
+
+    def observe_forward(self, *args):
+        try:
+            return forward(self, *args)
+        finally:
+            finished.set()
+
+    with monkeypatch.context() as patch:
+        patch.setattr(proxy.Handler, "end_headers", fail_headers)
+        patch.setattr(proxy.Handler, "forward", observe_forward)
+        client = http.client.HTTPConnection("127.0.0.1", gate.server_port, timeout=2)
+        message = {
+            "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+            "params": {"name": "browser_click"},
+        }
+        client.request(
+            method, "/mcp/DEV5", body=json.dumps(message) if method == "POST" else None,
+            headers={"Mcp-Session-Id": sid},
+        )
+        if phase == "headers":
+            with pytest.raises(http.client.RemoteDisconnected):
+                client.getresponse()
+        else:
+            assert client.getresponse().read() == b""
+        client.close()
+        assert finished.wait(2)
+    assert not gate.deleted.is_set()
+    assert gate.sessions[sid]["upstream"] == upstream
+    assert status(gate)["active_shells"] == ["DEV5"]
+    assert sum(m["method"] == "initialize" for m in calls) == 1
+    assert sum(m["method"] == "tools/call" for m in calls) == (2 if method == "POST" else 1)
+    if method == "POST":
+        rows = [json.loads(x) for x in gate.audit_path.read_text().splitlines()]
+        assert rows[-1]["tool"] == "browser_click"
+        assert rows[-1]["result"] == "ok"
+
+
+def test_upstream_get_transport_failure_still_terminates_session(gates):
+    gate, _, _ = gates
+    sid, _, _ = request(gate, "DEV5", "initialize")
+    request(gate, "DEV5", "tools/call", sid, {"name": "browser_snapshot"})
+    gate.stream_disconnect = True
+    client = http.client.HTTPConnection("127.0.0.1", gate.server_port, timeout=2)
+    client.request("GET", "/mcp/DEV5", headers={"Mcp-Session-Id": sid})
+    result = json.loads(client.getresponse().read())
+    client.close()
+    assert "extension not connected" in result["error"]["message"]
+    assert gate.deleted.is_set()
+    assert gate.sessions[sid]["upstream"] is None
+    assert status(gate)["active_shells"] == []
 
 
 def test_proxy_adds_no_production_action_deadline(tmp_path, monkeypatch):

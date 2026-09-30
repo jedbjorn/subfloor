@@ -102,8 +102,12 @@ clientInfo, and binds sessions to that path. Tool calls refuse while disarmed or
 when the linked profile becomes unavailable. The proxy adds no action deadline;
 it waits for Playwright to return its own action or navigation result and keeps
 the approved upstream session alive. Actions are never retried. Overlapping
-requests for one session refuse rather than queue. Confirmed transport loss
-ends that connection; slow actions do not.
+requests for one session refuse rather than queue. Confirmed upstream transport
+loss ends that connection; slow actions do not. Closing or dropping a client's
+GET event stream preserves the approved session, and the client can reconnect
+with the same session identity and `Last-Event-ID`. An explicit DELETE still
+terminates the session. If a client drops during an action response, the proxy
+finishes reading and auditing the upstream result without replaying the action.
 
 SSE and JSON responses pass through. Each call records timestamp, shell, tool,
 target, and outcome in private `browser/audit.jsonl` (0600). URL queries,

@@ -140,7 +140,7 @@ class Handler(BaseHTTPRequestHandler):
         sid, session = self.session(shell)
         if not session:
             return self.send_json({"error": "unknown shell session"}, 404)
-        # A GET event stream is long lived; only RPC actions have a deadline.
+        # Clients may close this event stream without terminating the session.
         self.forward("GET", shell, sid, session, None)
 
     def do_DELETE(self):
@@ -319,6 +319,7 @@ class Handler(BaseHTTPRequestHandler):
     def forward(self, method, shell, sid, session, message):
         connection = None
         sent = False
+        downstream_open = True
         is_tool = bool(message and message.get("method") == "tools/call")
         outcome = "failed"
         try:
@@ -326,23 +327,37 @@ class Handler(BaseHTTPRequestHandler):
             connection, response = self.upstream(method, session, message, None)
             # Stream SSE without buffering page content.
             chunks = []
-            self.send_response(response.status)
             content_type = response.getheader("Content-Type", "application/json")
-            self.send_header("Content-Type", content_type)
-            self.send_header("Connection", "close")
-            self.end_headers()
             self.close_connection = True
-            sent = True
+            try:
+                self.send_response(response.status)
+                self.send_header("Content-Type", content_type)
+                self.send_header("Connection", "close")
+                self.end_headers()
+                sent = True
+            except OSError:
+                if method == "GET":
+                    return
+                downstream_open = False
             size = 0
             while True:
                 chunk = response.read1(65536)
                 if not chunk:
                     break
-                self.wfile.write(chunk)
-                self.wfile.flush()
                 size += len(chunk)
                 if size <= MAX_BODY:
                     chunks.append(chunk)
+                if not downstream_open:
+                    continue
+                try:
+                    self.wfile.write(chunk)
+                    self.wfile.flush()
+                except OSError:
+                    # Only this subscriber is gone, not the approved session.
+                    if method == "GET":
+                        return
+                    # Finish an in-flight action and audit it; never replay it.
+                    downstream_open = False
             payload = rpc_result(b"".join(chunks))
             success = (
                 response.status < 400
@@ -393,6 +408,8 @@ class Handler(BaseHTTPRequestHandler):
                 if isinstance(exc, ConnectionError)
                 else "upstream error"
             )
+            if not downstream_open:
+                return
             if not sent:
                 self.error(message or {}, DISCONNECTED)
             elif method == "POST":
