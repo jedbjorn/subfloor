@@ -764,17 +764,30 @@ function dmModelPicker(harness, cat, row, save, onRouteChanged = () => {}) {
 }
 
 let modelCatalogue = null;
-let modelCatalogueRequest = 0;
-let modelCatalogueAppliedRequest = 0;
+const supersededModelCatalogueGenerations = new Set();
 
 async function loadModelCatalogue(refresh = false) {
-  const request = ++modelCatalogueRequest;
   const catalog = await api(refresh ? "/models?refresh=1" : "/models");
-  // Generation IDs are opaque. Ignore overlapping responses superseded by a
-  // later accepted read before diffing generations or replacing the baseline.
-  if (request < modelCatalogueAppliedRequest) return catalog;
-  const generationChanged = catalog.catalogue_generation
-    && catalog.catalogue_generation !== modelCatalogue?.catalogue_generation;
+  const generation = catalog.catalogue_generation;
+  const baselineGeneration = modelCatalogue?.catalogue_generation;
+  // Reads of an unchanged generation cannot supersede an in-flight refresh.
+  // IDs are opaque: remember replaced generations and use publication times
+  // to recognize older generations that this page has not seen before.
+  if (generation && modelCatalogue) {
+    if (generation === baselineGeneration
+        || supersededModelCatalogueGenerations.has(generation)) return catalog;
+    // Match the backend's UTC ISO timestamp ordering without losing microseconds
+    // to Date.parse; the generation ID breaks ties only at identical timestamps.
+    const completedAt = catalog.refresh_completed_at || catalog.fetched_at;
+    const baselineCompletedAt = modelCatalogue.refresh_completed_at || modelCatalogue.fetched_at;
+    if (completedAt && baselineCompletedAt && (completedAt < baselineCompletedAt
+        || (completedAt === baselineCompletedAt && baselineGeneration
+          && generation < baselineGeneration))) {
+      supersededModelCatalogueGenerations.add(generation);
+      return catalog;
+    }
+  }
+  const generationChanged = generation && generation !== baselineGeneration;
   if (modelCatalogue && !catalog.stale && (refresh || generationChanged)) {
     const known = new Set(Object.entries(modelCatalogue.harnesses || {}).flatMap(
       ([harness, block]) => (block.models || []).map((model) => `${harness}/${model.id}`)));
@@ -787,8 +800,9 @@ async function loadModelCatalogue(refresh = false) {
   }
   // A failed refresh must not consume the baseline for the next successful read.
   if (!catalog.stale || !modelCatalogue) {
+    if (baselineGeneration && generationChanged)
+      supersededModelCatalogueGenerations.add(baselineGeneration);
     modelCatalogue = catalog;
-    modelCatalogueAppliedRequest = request;
   }
   return catalog;
 }

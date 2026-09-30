@@ -679,8 +679,7 @@ function all(root, predicate, found = []) {
   await renderDefaultModels(root, {});
   const initialNotices = [...notices];
   const button = all(root, (node) => node.tagName === "button")[0];
-  // The explicit action also diffs responses without a changed generation.
-  catalog = {...catalog, harnesses: {codex: {models: [
+  catalog = {...catalog, catalogue_generation: "generation-b", harnesses: {codex: {models: [
     ...catalog.harnesses.codex.models,
     {id: "new", availability: "available"},
     {id: "hidden", availability: "advisory"},
