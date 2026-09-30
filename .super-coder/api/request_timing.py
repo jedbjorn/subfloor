@@ -86,21 +86,25 @@ def handle(method: str, headers_raw: str, *, recorder=None) -> tuple:
     """Use the conversation API's exact loopback/operator admission checks."""
     import conversation_routes as routes
 
-    headers = routes._parse_headers(headers_raw)
-    if not routes._host_ok(headers):
-        return routes._err(
-            403, "HOST_NOT_ALLOWED",
-            "conversation API serves 127.0.0.1/localhost only",
-        )
-    con = routes._db()
     try:
+        headers = routes._parse_headers(headers_raw)
+        if not routes._host_ok(headers):
+            return routes._err(
+                403, "HOST_NOT_ALLOWED",
+                "conversation API serves 127.0.0.1/localhost only",
+            )
+        con = routes._db()
         try:
             routes._operator(con, headers)
-        except routes.ApiError as exc:
-            return routes._api_error(exc)
-        if method != "GET":
-            return routes._err(405, "METHOD_NOT_ALLOWED", "use GET")
-        recorder = recorder if recorder is not None else RECORDER
-        return routes._json(200, recorder.snapshot())
-    finally:
-        con.close()
+            if method != "GET":
+                return routes._err(405, "METHOD_NOT_ALLOWED", "use GET")
+            recorder = recorder if recorder is not None else RECORDER
+            return routes._json(200, recorder.snapshot())
+        finally:
+            con.close()
+    except routes.ApiError as exc:
+        return routes._api_error(exc)
+    except Exception:  # noqa: BLE001 — endpoint errors must also be no-store
+        return routes._err(
+            500, "INTERNAL_ERROR", "request timing diagnostics failed",
+        )

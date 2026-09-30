@@ -31,6 +31,7 @@ browsers and fetch() transparently open the next).
 from __future__ import annotations
 
 import asyncio
+import threading
 import time
 
 import db_driver
@@ -81,9 +82,16 @@ class Transport:
         self.ws_handler = ws_handler
         self.stream_handler = stream_handler
         self._log = log
+        self._log_lock = threading.Lock()
         self.recorder = recorder if recorder is not None else request_timing.RECORDER
         self._clock = clock
         self._tcp: asyncio.AbstractServer | None = None
+
+    def _write_log(self, message: str) -> None:
+        # print emits text and its newline separately; hold the lock across
+        # the complete call so executor threads cannot merge stamped lines.
+        with self._log_lock:
+            self._log(message)
 
     async def start(self) -> None:
         self._tcp = await asyncio.start_server(
@@ -125,7 +133,7 @@ class Transport:
         except (ConnectionError, asyncio.IncompleteReadError):
             pass
         except Exception as exc:  # noqa: BLE001 — one bad connection must not kill the server
-            self._log(f"transport: connection error: {exc!r}")
+            self._write_log(f"transport: connection error: {exc!r}")
             try:
                 writer.close()
             except Exception:
@@ -186,7 +194,7 @@ class Transport:
                     method, path, headers_raw, body)
             except Exception:  # noqa: BLE001 — defense in depth
                 # Request paths and exception text may contain credentials.
-                self._log("transport: buffered handler failed")
+                self._write_log("transport: buffered handler failed")
                 status = 500
                 headers = [("Content-Type", "application/json")]
                 response = (
@@ -205,7 +213,7 @@ class Transport:
             f"queue;dur={queue:.3f}, app;dur={app:.3f}, db;dur={db.milliseconds:.3f}",
         ))
         if queue + app >= 500:
-            self._log(
+            self._write_log(
                 f"request timing method={normalized.split(' ', 1)[0]} "
                 f"template={template} status={status} queue_ms={queue:.3f} "
                 f"app_ms={app:.3f} db_ms={db.milliseconds:.3f}"

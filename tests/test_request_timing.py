@@ -215,6 +215,66 @@ class RequestTimingTransportTest(RequestTimingCase):
         for secret in ("sk-secret-shaped-value", "header-secret", "body-secret", "private", "a" * 32, path):
             self.assertNotIn(secret, output.getvalue())
 
+    def test_concurrent_slow_requests_each_get_a_complete_timestamped_line(self):
+        contended = threading.Event()
+        barrier = threading.Barrier(2)
+        local = threading.local()
+
+        def clock():
+            local.calls = getattr(local, "calls", 0) + 1
+            return 0 if local.calls == 1 else 0.5
+
+        def handler(*args):
+            barrier.wait(timeout=10)
+            return 200, [], b"{}"
+
+        class SchedulingStream(io.StringIO):
+            def write(self, value):
+                written = super().write(value)
+                if "request timing" in value:
+                    # Pause between print's text and newline until the other
+                    # executor thread attempts to acquire the emission lock.
+                    if not contended.wait(timeout=10):
+                        raise AssertionError("second log did not contend")
+                return written
+
+        class ObservedLock:
+            def __init__(self, lock):
+                self.lock = lock
+
+            def __enter__(self):
+                if not self.lock.acquire(blocking=False):
+                    contended.set()
+                    self.lock.acquire()
+
+            def __exit__(self, *args):
+                self.lock.release()
+
+        output = SchedulingStream()
+        writer = log_lines.TimestampedWriter(
+            output, clock=lambda: datetime(2026, 9, 30, 12, tzinfo=timezone.utc),
+        )
+        instance = transport.Transport(
+            "127.0.0.1", 0, handler, None,
+            recorder=self.recorder, clock=clock,
+        )
+        instance._log_lock = ObservedLock(instance._log_lock)
+        with mock.patch.object(sys, "stdout", writer):
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                futures = [executor.submit(
+                    instance._timed_handler, "GET", path, "", b"", 0,
+                ) for path in ("/api/first", "/api/second")]
+                responses = [future.result(timeout=10) for future in futures]
+        self.assertEqual([response[0] for response in responses], [200, 200])
+        lines = output.getvalue().splitlines()
+        self.assertEqual(len(lines), 2)
+        self.assertCountEqual(lines, [
+            "2026-09-30T12:00:00Z request timing method=GET "
+            f"template=GET /api/{route} status=200 queue_ms=0.000 "
+            "app_ms=500.000 db_ms=0.000"
+            for route in ("first", "second")
+        ])
+
 
 class RequestTimingRecorderTest(unittest.TestCase):
     def test_templates_collapse_ids_and_preserve_only_refresh_flag(self):
@@ -295,6 +355,45 @@ class RequestTimingApiTest(RequestTimingCase):
         ):
             patch.start()
             self.addCleanup(patch.stop)
+
+    async def test_endpoint_database_open_failure_keeps_no_store(self):
+        with mock.patch.object(
+            conversation_routes, "_db",
+            side_effect=sqlite3.OperationalError("secret-shaped-db-path unavailable"),
+        ) as connect:
+            status, headers, body = await self.request(
+                server.dispatch_http, "/api/diagnostics/request-timing",
+            )
+        connect.assert_called_once_with()
+        self.assertEqual(status, 500)
+        self.assertEqual(headers["Content-Type"], "application/json")
+        self.assertEqual(headers["Cache-Control"], "no-store")
+        self.assertEqual(timing_values(headers), (0, 0, 0))
+        self.assertEqual(json.loads(body), {"error": {
+            "code": "INTERNAL_ERROR",
+            "message": "request timing diagnostics failed", "details": {},
+        }})
+
+    async def test_endpoint_database_query_failure_keeps_no_store_and_closes(self):
+        for auth in ("", "\r\nAuthorization: Bearer shell-token"):
+            with self.subTest(auth=auth):
+                con = mock.Mock()
+                con.execute.side_effect = sqlite3.OperationalError("secret-shaped-query failed")
+                with mock.patch.object(conversation_routes, "_db", return_value=con):
+                    status, headers, body = await self.request(
+                        server.dispatch_http, "/api/diagnostics/request-timing",
+                        headers="Host: localhost" + auth,
+                    )
+                con.execute.assert_called_once()
+                con.close.assert_called_once_with()
+                self.assertEqual(status, 500)
+                self.assertEqual(headers["Content-Type"], "application/json")
+                self.assertEqual(headers["Cache-Control"], "no-store")
+                self.assertEqual(timing_values(headers), (0, 0, 0))
+                self.assertEqual(json.loads(body), {"error": {
+                    "code": "INTERNAL_ERROR",
+                    "message": "request timing diagnostics failed", "details": {},
+                }})
 
     async def test_endpoint_operator_only_and_loopback_host(self):
         endpoint = "/api/diagnostics/request-timing"
