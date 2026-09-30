@@ -86,10 +86,11 @@ class ActivityMonitor:
         con.execute(
             "INSERT INTO conversation_events "
             "(conversation_id,sequence,event_type,payload,run_id) "
-            "VALUES (?,?,'conversation.closed',?,?)",
+            "VALUES (?,?,?,?,?)",
             (
                 chat_id,
                 sequence,
+                conversation_events.require_event_type("conversation.closed"),
                 json.dumps(
                     {
                         "inactivity_ceiling_seconds": ceiling_seconds,

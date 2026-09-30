@@ -294,7 +294,7 @@ class ReaperStore:
             (
                 candidate.conversation_id,
                 sequence,
-                event_type,
+                conversation_events.require_event_type(event_type),
                 json.dumps(payload, separators=(",", ":"), sort_keys=True),
                 candidate.message_id,
                 candidate.run_id,

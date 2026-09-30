@@ -41,7 +41,11 @@ from conversation_adapters import (
     NormalizedEvent,
     adapter_for,
 )
-from conversation_adapters.base import TERMINAL_EVENTS, terminal_outcome
+from conversation_adapters.base import (
+    TERMINAL_EVENTS,
+    terminal_outcome,
+)
+from conversation_events import CONVERSATION_EVENT_TYPES
 from conversation_state import require_transition
 
 LIVE_RUN_STATES = frozenset({"leased", "starting", "running"})
@@ -226,7 +230,7 @@ class BrokerStore:
             (
                 conversation_id,
                 sequence,
-                event_type,
+                conversation_events.require_event_type(event_type),
                 BrokerStore._payload(payload),
                 message_id,
                 run_id,

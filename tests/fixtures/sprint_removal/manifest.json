@@ -165,7 +165,8 @@
     ".super-coder/migrations/0263_reseed_remote_seat_skills.sql",
     ".super-coder/migrations/0266_browser_bootstrap_guidance.sql",
     ".super-coder/migrations/0270_snapshot_admin_guidance.sql",
-    ".super-coder/migrations/0271_transcript_run_event_index.sql"
+    ".super-coder/migrations/0271_transcript_run_event_index.sql",
+    ".super-coder/migrations/0272_conversation_hot_query_indexes.sql"
   ],
   "baseline_migration_ledger": {
     "count": 142,
