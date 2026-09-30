@@ -1675,6 +1675,71 @@ function toast(message) { notices.push(message); }
     ]
 
 
+@pytest.mark.skipif(shutil.which("node") is None, reason="node is required")
+@pytest.mark.parametrize("newer_refresh", [False, True])
+def test_superseded_catalogue_response_preserves_newer_toast_baseline(newer_refresh):
+    api_helpers = APP[APP.index("async function api("):
+                      APP.index("function requestKey()")]
+    catalogue = APP[APP.index("let modelCatalogue = null;"):
+                    APP.index("async function renderDefaultModels")]
+    script = api_helpers + catalogue + r"""
+const calls = [], notices = [], responses = [];
+const oldCatalog = {catalogue_generation: "generation-a", stale: false, harnesses: {
+  codex: {models: [
+    {id: "old", availability: "available"},
+    {id: "retired", availability: "available"},
+  ]},
+}};
+const newCatalog = {catalogue_generation: "generation-b", stale: false, harnesses: {
+  codex: {models: [
+    {id: "old", availability: "available"},
+    {id: "new", availability: "available"},
+  ]},
+}};
+globalThis.fetch = (url) => {
+  calls.push(url);
+  return new Promise((resolve) => responses.push((catalog) => resolve({
+    ok: true, json: async () => catalog,
+  })));
+};
+function toast(message) { notices.push(message); }
+function snapshot() {
+  return {notices: [...notices], generation: modelCatalogue.catalogue_generation};
+}
+(async () => {
+  const initial = loadModelCatalogue();
+  responses[0](oldCatalog);
+  await initial;
+  const initialNotices = [...notices];
+  const olderRead = loadModelCatalogue();
+  const newerRead = loadModelCatalogue(NEWER_REFRESH);
+  const beforeResponses = {calls: [...calls], notices: [...notices]};
+  responses[2](newCatalog);
+  await newerRead;
+  const afterNewerRead = snapshot();
+  responses[1](oldCatalog);
+  await olderRead;
+  const afterOlderRead = snapshot();
+  const repeatedRead = loadModelCatalogue();
+  responses[3](newCatalog);
+  await repeatedRead;
+  console.log(JSON.stringify({calls, initialNotices, beforeResponses,
+    afterNewerRead, afterOlderRead, afterRepeatedRead: snapshot()}));
+})().catch((error) => { console.error(error); process.exitCode = 1; });
+"""
+    result = run_js(script.replace("NEWER_REFRESH", json.dumps(newer_refresh)))
+    requests = ["/api/models", "/api/models",
+                "/api/models?refresh=1" if newer_refresh else "/api/models"]
+    expected = {"notices": ["New models available!\ncodex: new"],
+                "generation": "generation-b"}
+    assert result["initialNotices"] == []
+    assert result["beforeResponses"] == {"calls": requests, "notices": []}
+    assert result["afterNewerRead"] == expected
+    assert result["afterOlderRead"] == expected
+    assert result["afterRepeatedRead"] == expected
+    assert result["calls"] == requests + ["/api/models"]
+
+
 def test_history_more_and_deep_links_are_keyed_and_failure_isolated():
     interface = APP[APP.index("async function renderInterface"):
                     APP.index("// ── Tabs + boot")]

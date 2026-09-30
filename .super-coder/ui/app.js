@@ -764,11 +764,15 @@ function dmModelPicker(harness, cat, row, save, onRouteChanged = () => {}) {
 }
 
 let modelCatalogue = null;
+let modelCatalogueRequest = 0;
+let modelCatalogueAppliedRequest = 0;
 
 async function loadModelCatalogue(refresh = false) {
+  const request = ++modelCatalogueRequest;
   const catalog = await api(refresh ? "/models?refresh=1" : "/models");
-  // Generation IDs are opaque: a changed ID on the ordinary authoritative
-  // response signals a catalogue published since this page last read it.
+  // Generation IDs are opaque. Ignore overlapping responses superseded by a
+  // later accepted read before diffing generations or replacing the baseline.
+  if (request < modelCatalogueAppliedRequest) return catalog;
   const generationChanged = catalog.catalogue_generation
     && catalog.catalogue_generation !== modelCatalogue?.catalogue_generation;
   if (modelCatalogue && !catalog.stale && (refresh || generationChanged)) {
@@ -782,7 +786,10 @@ async function loadModelCatalogue(refresh = false) {
     if (added.length) toast(`New models available!\n${added.join("\n")}`);
   }
   // A failed refresh must not consume the baseline for the next successful read.
-  if (!catalog.stale || !modelCatalogue) modelCatalogue = catalog;
+  if (!catalog.stale || !modelCatalogue) {
+    modelCatalogue = catalog;
+    modelCatalogueAppliedRequest = request;
+  }
   return catalog;
 }
 
