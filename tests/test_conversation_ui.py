@@ -2,14 +2,20 @@
 
 from __future__ import annotations
 
+import ast
 import json
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / ".super-coder" / "scripts"))
+
+from conversation_broker import CONVERSATION_EVENT_TYPES
+
 APP = (ROOT / ".super-coder" / "ui" / "app.js").read_text()
 MODEL_SEARCH = APP[
     APP.index("const modelSearchFold"):
@@ -39,6 +45,179 @@ def run_js(script: str) -> dict:
     )
     assert proc.returncode == 0, proc.stderr
     return json.loads(proc.stdout.strip().splitlines()[-1])
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node is required")
+@pytest.mark.parametrize("events", [
+    ["popstate", "hashchange"], ["hashchange", "popstate"],
+])
+def test_hash_navigation_renders_interface_once(events):
+    routing = APP[APP.index("function show(tab)"):
+                  APP.index('document.addEventListener("visibilitychange"')]
+    script = """
+const window = new EventTarget();
+const location = {hash: ""};
+const document = {querySelectorAll: () => [], body: {classList: {toggle() {}}}};
+const VIEWS = {shells: ["shells"], interface: ["interface"]};
+const SHELL_TAB_HASH = {harness: "shells"};
+const $ = () => ({});
+const chatStopReads = () => {}, chatStopStream = () => {};
+const chatStopHistoryPoll = () => {}, chatStopReview = () => {};
+const sprintStopPolling = () => {}, setDocumentTitle = () => {};
+let activeTab, shellTab, chatRouteShell, chatRouteConversation, chatRouteMode;
+let chatModeController = null, renders = 0;
+const renderInterface = () => { renders++; };
+const load = (tab) => { if (tab === "interface") renderInterface(); };
+""" + routing + """
+routeFromHash();
+location.hash = "#interface/dev/cv_1";
+""" + "\n".join(
+        f'window.dispatchEvent(new Event("{event}"));' for event in events
+    ) + """
+const first = renders;
+window.dispatchEvent(new Event("popstate"));
+const sameHash = renders;
+location.hash = "#interface/dev/cv_2";
+window.dispatchEvent(new Event("popstate"));
+window.dispatchEvent(new Event("hashchange"));
+console.log(JSON.stringify({first, sameHash, second: renders}));
+"""
+    assert run_js(script) == {"first": 1, "sameHash": 1, "second": 2}
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node is required")
+def test_diff_pushstate_and_back_forward_route_changed_hash_once():
+    routing = APP[APP.index("let lastRoutedHash"):
+                  APP.index('document.addEventListener("visibilitychange"')]
+    select_mode = APP[APP.index("  const selectMode = (mode) =>"):
+                      APP.index("  chatModeButton.onclick =")]
+    script = """
+const window = new EventTarget();
+const document = {querySelectorAll: () => []};
+const location = {hash: "#interface/dev/cv_1"};
+let chatRouteShell, chatRouteConversation, chatRouteMode, currentMode = "chat";
+let renders = 0;
+const modes = [];
+const show = () => { renders++; };
+let chatModeController = null;
+const conversation = {shell: {shortname: "dev"}, conversation_id: "cv_1"};
+const chatModeHash = (shell, id, mode) =>
+  `interface/${shell}/${id}${mode === "diff" ? "/diff" : ""}`;
+const history = {pushState: (_, __, hash) => { location.hash = hash; }};
+""" + routing + select_mode + """
+routeFromHash();
+chatModeController = {shell: "dev", conversationId: "cv_1", setMode(mode) {
+  currentMode = mode;
+  modes.push(mode);
+}};
+selectMode("diff");
+window.dispatchEvent(new Event("popstate"));
+location.hash = "#interface/dev/cv_1";
+window.dispatchEvent(new Event("popstate"));
+window.dispatchEvent(new Event("hashchange"));
+location.hash = "#interface/dev/cv_1/diff";
+window.dispatchEvent(new Event("popstate"));
+window.dispatchEvent(new Event("hashchange"));
+console.log(JSON.stringify({renders, modes, currentMode}));
+"""
+    assert run_js(script) == {
+        "renders": 1, "modes": ["diff", "chat", "diff"], "currentMode": "diff",
+    }
+
+
+def test_server_event_writers_use_canonical_conversation_type_set():
+    # Literal writer calls must join the canonical set as well as normalized
+    # adapter events (which the canonical set incorporates directly).
+    for directory in ("scripts", "api"):
+        for path in (ROOT / ".super-coder" / directory).rglob("*.py"):
+            for node in ast.walk(ast.parse(path.read_text())):
+                if not isinstance(node, ast.Call):
+                    continue
+                name = getattr(node.func, "attr", getattr(node.func, "id", ""))
+                if name not in ("_append_event", "finish_run"):
+                    continue
+                arguments = list(node.args) + [
+                    kw.value for kw in node.keywords if kw.arg == "event_type"
+                ]
+                for argument in arguments:
+                    if (isinstance(argument, ast.Constant)
+                            and isinstance(argument.value, str)):
+                        assert argument.value in CONVERSATION_EVENT_TYPES, path
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node is required")
+def test_stream_listeners_bind_server_types_and_non_display_events_advance_sequence():
+    stream = APP[APP.index("function chatOpenStream("):
+                 APP.index("function chatModelOptions(")]
+    reducer = APP[APP.index("  const reduceEvent = (event) =>"):
+                  APP.index("  chatOpenStream(\n", APP.index("  const reduceEvent = (event) =>"))]
+    script = """
+let chatSource, chatRenderGeneration = 7;
+const chatStopStream = () => {};
+class EventSource {
+  constructor() { this.listeners = {}; }
+  addEventListener(type, handler) { this.listeners[type] = handler; }
+  emit(type, sequence) {
+    this.listeners[type]({data: JSON.stringify({event_type: type, sequence,
+      message_id: 1, run_id: 2, payload: {}})});
+  }
+}
+const requests = [];
+const chatApi = (url) => { requests.push(url); };
+const reconcileTranscript = () => chatApi("/transcript");
+const refresh = () => chatApi("/messages");
+const paint = () => {};
+const user = {item_id: "message:1", state: "queued"};
+const transcriptState = {lastSequence: 40, items: new Map([[user.item_id, user]]),
+  order: [user.item_id], dirty: new Set()};
+const messages = [{message_id: 1, state: "queued"}];
+const conversation = {state: "queued", active_run_id: null};
+""" + stream + reducer + """
+const source = chatOpenStream("cv_1", 7, 40, reduceEvent, () => {});
+const sequences = [];
+for (const [type, sequence] of [["run.deferred", 41], ["run.reaped", 42],
+                               ["session.started", 43]]) {
+  source.emit(type, sequence);
+  sequences.push(transcriptState.lastSequence);
+}
+console.log(JSON.stringify({types: Object.keys(source.listeners), sequences,
+  requests, itemCount: transcriptState.items.size, state: conversation.state,
+  messageState: messages[0].state, userState: user.state}));
+"""
+    result = run_js(script)
+    assert set(result.pop("types")) == CONVERSATION_EVENT_TYPES
+    assert result == {
+        "sequences": [41, 42, 43], "requests": [], "itemCount": 1,
+        "state": "queued", "messageState": "queued", "userState": "queued",
+    }
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node is required")
+def test_message_state_refresh_requests_newest_hundred_messages():
+    refresh = APP[APP.index("async function chatRefreshConversation("):
+                  APP.index("function chatOpenStream(")]
+    script = """
+let chatRenderGeneration = 7;
+const urls = [];
+const chatApi = async (url) => {
+  urls.push(url);
+  return url.includes("/messages?")
+    ? {items: [{message_id: 105, state: "completed"}]} : {conversation_id: "cv_1"};
+};
+""" + refresh + """
+(async () => {
+  let updated;
+  await chatRefreshConversation("cv_1", 7, (conversation, messages) => {
+    updated = {conversation, messages};
+  });
+  console.log(JSON.stringify({urls, updated}));
+})();
+"""
+    assert run_js(script) == {
+        "urls": ["/conversations/cv_1", "/conversations/cv_1/messages?order=desc&limit=100"],
+        "updated": {"conversation": {"conversation_id": "cv_1"},
+                    "messages": [{"message_id": 105, "state": "completed"}]},
+    }
 
 
 @pytest.mark.skipif(shutil.which("node") is None, reason="node is required")
