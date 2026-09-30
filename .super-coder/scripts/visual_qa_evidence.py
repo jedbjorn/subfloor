@@ -227,6 +227,13 @@ def publish_report(gallery: Path, event: dict, env: dict, requester=None) -> boo
     if (meta["run_id"], meta["run_attempt"], meta["source_head_sha"]) != (
             run.get("id"), run.get("run_attempt", 1), run.get("head_sha")):
         raise EvidenceError("QA report does not match the originating workflow run")
+    associations = run.get("pull_requests")
+    if not isinstance(associations, list):
+        raise EvidenceError("Originating workflow run PR association is unavailable")
+    matches = [pr for pr in associations if isinstance(pr, dict) and pr.get("number") == meta["pr_number"]]
+    if len(matches) != 1 or not matches[0].get("base", {}).get("ref"):
+        raise EvidenceError("QA target PR is not bound to the originating workflow run")
+    base_ref = matches[0]["base"]["ref"]
     token = env.get("GITHUB_TOKEN", "")
     if not token:
         raise EvidenceError("QA publication requires GITHUB_TOKEN")
@@ -235,6 +242,8 @@ def publish_report(gallery: Path, event: dict, env: dict, requester=None) -> boo
 
     def current_head():
         pr = requester("GET", pr_url, token)
+        if pr.get("base", {}).get("ref") != base_ref:
+            raise EvidenceError("QA target PR base differs from the originating workflow run")
         return (pr.get("state") == "open" and pr.get("head", {}).get("sha") == meta["source_head_sha"]
                 and pr.get("head", {}).get("ref") == run.get("head_branch")
                 and pr.get("head", {}).get("repo", {}).get("full_name") == repo
@@ -256,8 +265,9 @@ def publish_report(gallery: Path, event: dict, env: dict, requester=None) -> boo
 
     if run.get("conclusion") != "success" and report["outcome"] == "passed":
         report.update(outcome="failed", error="Capture workflow did not complete successfully")
+    # Persist every outcome so a newer skip also prevents older captures.
+    commit = publish_branch(report, gallery, repo_url, token, requester)
     if report["outcome"] != "neutral":
-        commit = publish_branch(report, gallery, repo_url, token, requester)
         root = f"{env.get('GITHUB_SERVER_URL', 'https://github.com').rstrip('/')}/{repo}/blob/{commit}"
         for row in report["routes"]:
             for capture in row["captures"]:

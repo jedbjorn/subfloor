@@ -28,13 +28,16 @@ class PublisherTest(unittest.TestCase):
                                                "run_id": 42, "run_attempt": 1, "pr_number": 7})
         self.event = {"workflow_run": {"id": 42, "run_attempt": 1, "head_sha": "a" * 40,
                                       "head_branch": "feat/ui", "event": "pull_request",
+                                      "pull_requests": [{"number": 7, "base": {"ref": "main"}}],
                                       "conclusion": "success", "head_repository": {"full_name": "acme/app"}}}
         self.env = {"GITHUB_REPOSITORY": "acme/app", "GITHUB_TOKEN": "token"}
         self.calls = []
         self.old_meta = None
         self.pr = {"state": "open", "head": {"sha": "a" * 40, "ref": "feat/ui", "repo": {"full_name": "acme/app"}},
-                   "base": {"repo": {"full_name": "acme/app"}}}
+                   "base": {"ref": "main", "repo": {"full_name": "acme/app"}}}
         self.existing = []
+        self.branch_sha = None
+        self.pending_meta = None
 
     def requester(self, method, url, token, payload=None):
         self.calls.append((method, url, payload))
@@ -45,9 +48,17 @@ class PublisherTest(unittest.TestCase):
                 return {"content": base64.b64encode(json.dumps({"metadata": self.old_meta}).encode()).decode()}
             raise HTTPError(url, 404, "not found", {}, None)
         if method == "GET" and "/git/ref/" in url:
+            if self.branch_sha:
+                return {"object": {"sha": self.branch_sha}}
             raise HTTPError(url, 404, "not found", {}, None)
         if method == "GET" and "/comments" in url:
             return self.existing
+        if method == "POST" and url.endswith("/git/trees"):
+            summary = next(item for item in payload["tree"] if item["path"] == "summary.json")
+            self.pending_meta = json.loads(summary["content"])["metadata"]
+        if method in {"POST", "PATCH"} and "/git/refs" in url:
+            self.old_meta = self.pending_meta
+            self.branch_sha = payload["sha"]
         return {"sha": "c" * 40}
 
     def publish(self):
@@ -102,6 +113,29 @@ class PublisherTest(unittest.TestCase):
         self.publish()
         self.assertFalse(any(m != "GET" for m, u, p in self.calls))
 
+    def test_target_pr_must_match_originating_run_even_with_same_head(self):
+        self.report["metadata"]["pr_number"] = 8
+        self.pr["base"]["ref"] = "release"
+        with self.assertRaisesRegex(evidence.EvidenceError, "originating workflow run"):
+            self.publish()
+        self.assertFalse(any(m != "GET" for m, u, p in self.calls))
+
+    def test_unresolved_or_ambiguous_run_pr_association_fails_closed(self):
+        for associations in (None, [], [{"number": 8, "base": {"ref": "main"}}],
+                             [{"number": 7}], self.event["workflow_run"]["pull_requests"] * 2):
+            with self.subTest(associations=associations):
+                self.calls.clear()
+                self.event["workflow_run"]["pull_requests"] = associations
+                with self.assertRaises(evidence.EvidenceError):
+                    self.publish()
+                self.assertFalse(any(m != "GET" for m, u, p in self.calls))
+
+    def test_changed_pr_base_fails_before_mutation(self):
+        self.pr["base"]["ref"] = "release"
+        with self.assertRaisesRegex(evidence.EvidenceError, "base differs"):
+            self.publish()
+        self.assertFalse(any(m != "GET" for m, u, p in self.calls))
+
     def test_failed_workflow_cannot_claim_passed_evidence(self):
         self.event["workflow_run"]["conclusion"] = "failure"
         self.publish()
@@ -112,10 +146,37 @@ class PublisherTest(unittest.TestCase):
     def test_neutral_replaces_gallery_with_skip_without_publishing_images(self):
         self.report.update(outcome="neutral", routes=[], reason="No configured app paths changed.")
         self.publish()
-        self.assertFalse(any("/git/" in u for m, u, p in self.calls))
+        tree = next(p for m, u, p in self.calls if u.endswith("/git/trees"))
+        self.assertEqual({item["path"] for item in tree["tree"]}, {"summary.json"})
+        self.assertFalse(any(u.endswith("/git/blobs") for m, u, p in self.calls))
         body = next(p["body"] for m, u, p in self.calls if u.endswith("/comments") and m == "POST")
         self.assertIn("skipped", body)
         self.assertNotIn("<img", body)
+
+    def test_newer_neutral_blocks_older_capture_and_old_attempt(self):
+        captured = copy.deepcopy(self.report)
+        self.report.update(outcome="neutral", routes=[], reason="No configured app paths changed.")
+        self.report["metadata"].update(run_id=43, run_attempt=2)
+        self.event["workflow_run"].update(id=43, run_attempt=2)
+        self.publish()
+        self.assertEqual(self.old_meta["run_id"], 43)
+        self.assertEqual(self.old_meta["run_attempt"], 2)
+        for run_id, attempt in ((42, 1), (43, 1)):
+            with self.subTest(run_id=run_id, attempt=attempt):
+                self.calls.clear()
+                self.report = copy.deepcopy(captured)
+                self.report["metadata"].update(run_id=run_id, run_attempt=attempt)
+                self.event["workflow_run"].update(id=run_id, run_attempt=attempt)
+                self.publish()
+                self.assertFalse(any(m != "GET" for m, u, p in self.calls))
+        # A newer attempt can still publish, appending to the summary-only commit.
+        self.calls.clear()
+        self.report["metadata"]["run_attempt"] = 3
+        self.event["workflow_run"]["run_attempt"] = 3
+        self.publish()
+        commit = next(p for m, u, p in self.calls if u.endswith("/git/commits"))
+        self.assertEqual(commit["parents"], ["c" * 40])
+        self.assertTrue(any(m == "POST" and u.endswith("/comments") for m, u, p in self.calls))
 
     def test_head_change_during_upload_does_not_post_report(self):
         original = self.requester
