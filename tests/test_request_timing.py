@@ -275,6 +275,97 @@ class RequestTimingTransportTest(RequestTimingCase):
             for route in ("first", "second")
         ])
 
+    def test_conversation_log_cannot_insert_query_into_slow_record(self):
+        self._check_conversation_log_interleaving(conversation_first=False)
+
+    def test_conversation_log_cannot_take_slow_records_timestamp(self):
+        self._check_conversation_log_interleaving(conversation_first=True)
+
+    def _check_conversation_log_interleaving(self, *, conversation_first):
+        partial_written = threading.Event()
+        competing_print_done = threading.Event()
+        local = threading.local()
+        case = self
+        secret = "secret-shaped-value"
+        conversation_id = "cv_" + "a" * 32
+        path = "/api/second?token=" + secret
+
+        class SchedulingWriter(log_lines.TimestampedWriter):
+            def write(self, value):
+                written = super().write(value)
+                # Pause print between its text and newline. The other thread
+                # must finish a whole print while this fragment is pending.
+                if "conversation close:" in value:
+                    if conversation_first:
+                        partial_written.set()
+                        case.assertTrue(competing_print_done.wait(timeout=10))
+                elif "template=GET /api/first " in value:
+                    if conversation_first:
+                        local.first_timing = True
+                    else:
+                        partial_written.set()
+                        case.assertTrue(competing_print_done.wait(timeout=10))
+                elif value == "\n" and getattr(local, "first_timing", False):
+                    competing_print_done.set()
+                return written
+
+        def clock():
+            local.calls = getattr(local, "calls", 0) + 1
+            return 0 if local.calls == 1 else 0.5
+
+        def handler(method, request_path, headers, body):
+            if request_path == path:
+                if not conversation_first:
+                    self.assertTrue(partial_written.wait(timeout=10))
+                conversation_routes._terminate_closed_processes(conversation_id, [])
+                if not conversation_first:
+                    competing_print_done.set()
+            elif conversation_first:
+                self.assertTrue(partial_written.wait(timeout=10))
+            return 200, [], b"{}"
+
+        output = io.StringIO()
+        writer = SchedulingWriter(
+            output, clock=lambda: datetime(2026, 9, 30, 12, tzinfo=timezone.utc),
+        )
+        instance = transport.Transport(
+            "127.0.0.1", 0, handler, None,
+            recorder=self.recorder, clock=clock,
+        )
+        with (
+            mock.patch.object(sys, "stdout", writer),
+            mock.patch.object(
+                conversation_routes.run_mod.shell_liveness, "terminate",
+                side_effect=None if conversation_first else OSError(path),
+                return_value=[123],
+            ),
+            ThreadPoolExecutor(max_workers=2) as executor,
+        ):
+            futures = [executor.submit(
+                instance._timed_handler, "GET", request_path, "", b"", 0,
+            ) for request_path in ("/api/first", path)]
+            self.assertEqual([future.result(timeout=10)[0] for future in futures], [200, 200])
+
+        lines = output.getvalue().splitlines()
+        self.assertEqual(len(lines), 3)
+        timing_lines = [line for line in lines if "request timing" in line]
+        self.assertCountEqual(timing_lines, [
+            "2026-09-30T12:00:00Z request timing method=GET "
+            f"template=GET /api/{route} status=200 queue_ms=0.000 "
+            "app_ms=500.000 db_ms=0.000"
+            for route in ("first", "second")
+        ])
+        for line in timing_lines:
+            for content in ("conversation close:", secret, conversation_id, path):
+                self.assertNotIn(content, line)
+        conversation_lines = [line for line in lines if "conversation close:" in line]
+        self.assertEqual(len(conversation_lines), 1)
+        self.assertTrue(conversation_lines[0].startswith("2026-09-30T12:00:00Z conversation close:"))
+        if conversation_first:
+            self.assertIn("123 survived SIGKILL", conversation_lines[0])
+        else:
+            self.assertIn(secret, conversation_lines[0])
+
 
 class RequestTimingRecorderTest(unittest.TestCase):
     def test_templates_collapse_ids_and_preserve_only_refresh_flag(self):

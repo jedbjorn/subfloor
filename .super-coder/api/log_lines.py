@@ -3,15 +3,18 @@
 
 The dispatcher redirects both streams to one file, and the server writes with
 bare `print` plus `logging` warnings from the scripts, so nothing in that file
-was attributable to a moment in time. The wrapper stamps each *line* once, at
-the point the line starts, so a partial write keeps a single prefix.
+was attributable to a moment in time. The wrapper buffers partial writes per
+thread and emits complete, stamped lines under a shared stdout/stderr lock.
 """
 from __future__ import annotations
 
 import sys
+import threading
 from datetime import datetime, timezone
 
 STAMP_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
+# stdout and stderr are separate streams redirected to the same server.log.
+_EMIT_LOCK = threading.Lock()
 
 
 def _utc_now() -> datetime:
@@ -19,32 +22,38 @@ def _utc_now() -> datetime:
 
 
 class TimestampedWriter:
-    """Wrap a text stream, prefixing every line with a UTC timestamp."""
+    """Emit complete lines with a UTC timestamp, keeping fragments per thread."""
 
     def __init__(self, stream, clock=_utc_now):
         self._stream = stream
         self._clock = clock
-        self._at_line_start = True
+        self._pending = threading.local()
 
     def write(self, text: str) -> int:
         if not text:
             return 0
         stamp = self._clock().strftime(STAMP_FORMAT) + " "
-        out = []
+        pending = getattr(self._pending, "text", "")
+        lines = []
         segments = text.split("\n")
         for index, segment in enumerate(segments):
-            if segment and self._at_line_start:
-                out.append(stamp)
-                self._at_line_start = False
-            out.append(segment)
+            if not pending and (segment or index < len(segments) - 1):
+                pending = stamp
+            pending += segment
             if index < len(segments) - 1:
-                out.append("\n")
-                self._at_line_start = True
-        self._stream.write("".join(out))
+                lines.append(pending + "\n")
+                pending = ""
+        self._pending.text = pending
+        if lines:
+            with _EMIT_LOCK:
+                for line in lines:
+                    self._stream.write(line)
         return len(text)
 
     def flush(self) -> None:
-        self._stream.flush()
+        # Flushing must not expose an incomplete record from any thread.
+        with _EMIT_LOCK:
+            self._stream.flush()
 
     def __getattr__(self, name):
         # fileno / isatty / encoding and friends belong to the real stream.
