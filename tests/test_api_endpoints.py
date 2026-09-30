@@ -1410,6 +1410,82 @@ class AuthenticatedCliCatalogueRouteTest(unittest.TestCase):
         self.assertIs(catalogue.call_args.kwargs["connection_factory"], opened)
         self.assertNotIn("con", catalogue.call_args.kwargs)
 
+    def test_models_api_resolves_execution_evidence_after_catalogue_discovery(self) -> None:
+        entry = server.model_catalog._entry(
+            "api-model", source="codex-cache", availability="available",
+            supported_efforts=["high"], cli_version="codex-cli 0.145.0",
+        )
+        payload = {
+            "v": server.model_catalog.PAYLOAD_VERSION,
+            "fetched_at": "2026-01-01T00:00:00+00:00",
+            "stale": False,
+            "harnesses": {"codex": {"models": [entry]}},
+            "verification": {"runtime": "host", "harnesses": {
+                "codex": compatible_runtime("0.145.0", harness="codex"),
+            }},
+        }
+        with self.connect() as con:
+            server.model_catalog.persist_routes(con, payload)
+            con.execute("UPDATE model_routes SET stale=1,last_error='aged evidence'")
+        cached = {**payload, "stale": True}
+        for path, version in (
+            ("/api/models", "0.145.0"),
+            ("/api/models?refresh=1", "0.145.0"),
+            ("/api/models", "0.146.0"),
+        ):
+            with self.subTest(path=path, version=version):
+                connections = []
+
+                def connect():
+                    connection = self.connect()
+                    connections.append(connection)
+                    return connection
+
+                def catalog(**kwargs):
+                    self.assertEqual(connections, [])
+                    self.assertIs(kwargs["connection_factory"], opened)
+                    self.assertNotIn("con", kwargs)
+                    self.assertEqual(kwargs["refresh"], "refresh=1" in path)
+                    return cached
+
+                live = {**entry, "supported_efforts": ["low"],
+                        "cli_version": f"codex-cli {version}"}
+                with (
+                    mock.patch.object(server, "db", side_effect=connect) as opened,
+                    mock.patch.object(server.model_catalog, "catalog", side_effect=catalog)
+                    as catalogue,
+                    mock.patch.object(server.model_catalog, "harness_runtime_status",
+                                      return_value=compatible_runtime(version, harness="codex")),
+                    mock.patch.object(server.model_catalog, "_from_codex_cache",
+                                      return_value=[live]),
+                ):
+                    status, _headers, raw = server.dispatch_http(
+                        "GET", path, "Host: 127.0.0.1", b""
+                    )
+                body = json.loads(raw)
+                self.assertEqual(status, 200, body)
+                catalogue.assert_called_once()
+                self.assertEqual(len(connections), 1)
+                with self.assertRaises(sqlite3.ProgrammingError):
+                    connections[0].execute("SELECT 1")
+                route = body["harnesses"]["codex"]["models"][0]
+                if version == "0.145.0":
+                    self.assertTrue(route["execution_evidence"]["accepted"])
+                    self.assertEqual(route["supported_efforts"], ["low"])
+                    with self.connect() as con:
+                        stored = con.execute(
+                            "SELECT supported_efforts,stale FROM model_routes "
+                            "WHERE harness='codex' AND selector='api-model'"
+                        ).fetchone()
+                    self.assertEqual(json.loads(stored["supported_efforts"]), ["low"])
+                    self.assertEqual(stored["stale"], 0)
+                else:
+                    self.assertFalse(route["execution_evidence"]["accepted"])
+                    self.assertEqual(route["execution_evidence"]["code"],
+                                     "thinking_evidence_stale")
+                    self.assertEqual(route["supported_efforts"], [])
+                self.assertEqual(entry["supported_efforts"], ["high"])
+
     def test_model_routes_require_shell_auth_and_apply_exact_filters(self) -> None:
         self.assertEqual(self.request("/_sc/model-routes", None)[0], 401)
         self.assertEqual(self.request("/_sc/model-routes", "wrong")[0], 401)
