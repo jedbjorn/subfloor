@@ -212,6 +212,9 @@ def _from_provider_apis(fetch, env) -> dict[str, list[dict]]:
 
 
 def _cli_version(binary: str, run) -> str | None:
+    observation = harness_versions.current_probe_observation(binary)
+    if observation is not None:
+        return _observed_version(harness_runtime_status(binary))
     try:
         r = run([binary, "--version"], capture_output=True, text=True,
                 timeout=5)
@@ -501,6 +504,15 @@ def _headless_supported(harness: str) -> bool:
 
 def harness_runtime_status(harness: str) -> dict:
     """Return exact version-bounded runtime evidence for one shipped harness."""
+    observation = harness_versions.current_probe_observation(harness)
+    if observation is None:
+        return _probe_harness_runtime_status(harness)
+    if observation.get("runtime_status") is None:
+        observation["runtime_status"] = _probe_harness_runtime_status(harness)
+    return dict(observation["runtime_status"])
+
+
+def _probe_harness_runtime_status(harness: str) -> dict:
     if harness not in harness_versions.HARNESSES:
         return {
             "harness": harness,
@@ -1209,18 +1221,17 @@ def controlled_route_evidence(
         opencode_connected_models if opencode_provider is None
         else opencode_provider
     )
-    harness_probe = (
-        harness_versions.compatibility_status
-        if harness_probe is None else harness_probe
-    )
     harness = (harness or "").strip().lower()
     scope = harness_versions.runtime_scope()
     entries: list[dict]
     status: dict = {}
     fingerprint = None
     try:
-        statuses = _runtime_statuses(harness_probe)
-        status = dict(statuses.get(harness) or {})
+        if harness_probe is None:
+            status = harness_runtime_status(harness)
+        else:
+            statuses = _runtime_statuses(harness_probe)
+            status = dict(statuses.get(harness) or {})
         if harness == "claude":
             entries = _from_claude_cli(run)
         elif harness == "codex":

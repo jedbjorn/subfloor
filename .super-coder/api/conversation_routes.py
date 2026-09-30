@@ -1460,47 +1460,48 @@ def _create_conversation(con, operator: dict, headers, body: dict):
     else:
         selected_effort = None
 
-    runtime_status = None
-    runtime_scope = None
-    if (
-        selected_model is None
-        or harness not in route_bindings.LIVE_NATIVE_HARNESSES
-    ):
-        runtime_status = model_catalog.harness_runtime_status(harness)
-        runtime_scope = model_catalog.harness_versions.runtime_scope()
-    try:
+    with model_catalog.harness_versions.probe_observation(harness):
+        runtime_status = None
+        runtime_scope = None
         if (
-            selected_model is not None
-            and harness in route_bindings.LIVE_NATIVE_HARNESSES
+            selected_model is None
+            or harness not in route_bindings.LIVE_NATIVE_HARNESSES
         ):
-            binding, binding_digest = route_bindings.resolve_live_native(
-                harness, selected_model, selected_effort
-            )
-        elif selected_model is not None and harness != "vibe":
-            route = con.execute(
-                "SELECT * FROM model_routes WHERE harness=? AND selector=?",
-                (harness, selected_model),
-            ).fetchone()
-            binding, binding_digest = route_bindings.resolve_persisted_v2(
-                con,
-                dict(route) if route is not None else None,
-                harness,
-                selected_model,
-                selected_effort,
-                runtime_status=runtime_status,
-                runtime_scope=runtime_scope,
-            )
-        else:
-            binding, binding_digest = route_bindings.resolve_v2(
-                None,
-                harness,
-                selected_model,
-                selected_effort,
-                runtime_status=runtime_status,
-                runtime_scope=runtime_scope,
-            )
-    except route_bindings.RouteResolutionError as exc:
-        raise ApiError(422, exc.code, exc.message, exc.details) from exc
+            runtime_status = model_catalog.harness_runtime_status(harness)
+            runtime_scope = model_catalog.harness_versions.runtime_scope()
+        try:
+            if (
+                selected_model is not None
+                and harness in route_bindings.LIVE_NATIVE_HARNESSES
+            ):
+                binding, binding_digest = route_bindings.resolve_live_native(
+                    harness, selected_model, selected_effort
+                )
+            elif selected_model is not None and harness != "vibe":
+                route = con.execute(
+                    "SELECT * FROM model_routes WHERE harness=? AND selector=?",
+                    (harness, selected_model),
+                ).fetchone()
+                binding, binding_digest = route_bindings.resolve_persisted_v2(
+                    con,
+                    dict(route) if route is not None else None,
+                    harness,
+                    selected_model,
+                    selected_effort,
+                    runtime_status=runtime_status,
+                    runtime_scope=runtime_scope,
+                )
+            else:
+                binding, binding_digest = route_bindings.resolve_v2(
+                    None,
+                    harness,
+                    selected_model,
+                    selected_effort,
+                    runtime_status=runtime_status,
+                    runtime_scope=runtime_scope,
+                )
+        except route_bindings.RouteResolutionError as exc:
+            raise ApiError(422, exc.code, exc.message, exc.details) from exc
     harness = binding["harness"]
     model = binding["requested_model"]
     effort = binding["requested_effort"]
