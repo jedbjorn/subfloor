@@ -1970,6 +1970,22 @@ class ConversationResourceTest(ConversationApiCase):
         self.assertEqual(status, 201, reupload)
         self.assertTrue(Path(reupload["path"]).exists())
 
+    def test_browser_create_accepts_aged_stale_route_without_refresh(self) -> None:
+        with self.connect() as con:
+            con.execute(
+                "UPDATE model_routes SET stale=1,last_error='older than 7 days',"
+                "last_seen_at='2026-01-01T00:00:00+00:00'"
+            )
+            con.execute(
+                "UPDATE model_catalog_generations SET completed_at='2026-01-01T00:00:00+00:00'"
+            )
+        created = self.create(key="aged-stale-create")
+        self.assertEqual(created["route"]["effort"], "high")
+        with self.connect() as con:
+            self.assertEqual(tuple(con.execute(
+                "SELECT stale,last_error FROM model_routes WHERE harness='codex'"
+            ).fetchone()), (0, None))
+
     def test_controlled_replay_uses_stored_binding_after_catalogue_drift(self) -> None:
         first = self.create(key="controlled-replay")
         with self.connect() as con:

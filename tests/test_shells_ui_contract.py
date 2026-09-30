@@ -85,8 +85,23 @@ console.log(JSON.stringify({
     assert result["harnessDefault"]["disabled"] is True
     assert result["harnessDefault"]["supported"] == []
     assert result["vibe"]["label"] == "Thinking control unavailable"
-    assert result["stale"]["disabled"] is True
-    assert "Refresh & verify" in result["stale"]["guidance"]
+    assert result["stale"]["disabled"] is False
+    assert result["stale"]["selected"] == "high"
+
+
+def test_configure_preview_accepts_historical_stale_evidence_for_version_keyed_harnesses():
+    helper = APP[APP.index("function nativeOptionLabel"):APP.index("function dmModelPicker")]
+    result = run_js(helper + r"""
+const harnesses = Object.fromEntries(["claude", "codex", "kimi"].map(harness =>
+  [harness, {models: [{id: "aged", availability: "available", stale: true,
+    last_seen_at: "2026-01-01", generation_id: "older", supported_efforts: ["high"]}]}]));
+const catalog = {stale: true, harnesses};
+console.log(JSON.stringify(Object.fromEntries(Object.keys(harnesses).map(harness =>
+  [harness, thinkingLevelState(harness, catalog, "aged", "high")]))));
+""")
+    for state in result.values():
+        assert state["disabled"] is False
+        assert state["selected"] == "high"
 
 
 def test_live_native_option_renderer_preserves_five_model_projection_exactly():

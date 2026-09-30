@@ -780,7 +780,8 @@ def get_flavor_defaults(con) -> dict:
                 supported = []
             effective_effort = (
                 "high"
-                if route.get("generation_id") == latest_generation_id
+                if (harness in route_bindings.VERSION_KEYED_HARNESSES
+                    or route.get("generation_id") == latest_generation_id)
                 and "high" in supported
                 else None
             )
@@ -810,8 +811,10 @@ def _model_route_available_in_transaction(
 ) -> bool:
     if (
         observed_route is None
-        or observed_route["availability"] != "available"
-        or observed_route["stale"]
+        or (observed_route["availability"] != "available"
+            and harness not in route_bindings.VERSION_KEYED_HARNESSES)
+        or (observed_route["stale"]
+            and harness not in route_bindings.VERSION_KEYED_HARNESSES)
     ):
         return False
     if harness == "vibe":
@@ -994,7 +997,8 @@ def set_flavor_default(con, body) -> tuple[bool, dict | None]:
             and (model_supplied or effort_supplied)
         ):
             if observed_route is None or (
-                    observed_route.get("availability") != "available"):
+                    harness not in route_bindings.VERSION_KEYED_HARNESSES
+                    and observed_route.get("availability") != "available"):
                 return False, _flavor_default_error(
                     "invalid_model_route",
                     f"{model!r} is not an exact currently available route "
@@ -5672,6 +5676,7 @@ class Handler(BaseHTTPRequestHandler):
                     "unsupported_thinking_level",
                     "thinking_evidence_missing",
                     "thinking_evidence_stale",
+                    "route_unavailable",
                 } else 400
                 return self._send(status, {"error": err})
             if path == "/api/analytics/sweep":

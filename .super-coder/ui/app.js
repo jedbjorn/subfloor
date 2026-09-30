@@ -549,7 +549,8 @@ function thinkingLevelState(harness, catalog, model, preferred = null) {
     ...(route?.supported_efforts || []).filter((effort) => effort !== "default"),
   ];
   const fresh = Boolean(
-    route && route.availability === "available" && !catalog.stale);
+    route && route.availability === "available"
+    && (["claude", "codex", "kimi"].includes(harness) || !catalog.stale));
   // Decision #223: preselect the bind-time fallback chain — a stored effort
   // (manual override) wins, then high where advertised, then the reserved
   // Model default; no selection only when nothing is advertised.  Options

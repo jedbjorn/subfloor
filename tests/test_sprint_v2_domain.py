@@ -25,11 +25,14 @@ CONFORMANCE_OWNER_MIGRATION = (
 )
 
 sys.path.insert(0, str(ENGINE / "scripts"))
+import model_catalog  # noqa: E402
 import db_driver  # noqa: E402
 import migrate  # noqa: E402
 import sprint_domain  # noqa: E402
 import sprint_message_delivery  # noqa: E402
 from sprint_route_binding_support import candidate as route_candidate  # noqa: E402
+
+REAL_PARTICIPANT_CANDIDATE = sprint_domain._participant_binding_candidate
 
 
 def apply_schema(con: sqlite3.Connection, *, through: str | None = None) -> None:
@@ -1915,6 +1918,64 @@ class LifecycleTest(SprintDomainCase):
                 "VALUES (1,1,'codex','/normal-2','Other normal chat',"
                 "'normal-2','hash')"
             )
+
+    def test_arm_preflight_accepts_mixed_aged_stale_generations(self) -> None:
+        sprint_id, _ = self.create_sprint()
+        participants = list(self.con.execute(
+            "SELECT * FROM sprint_participants WHERE sprint_id=?", (sprint_id,)
+        ))
+        for index, participant in enumerate(participants):
+            harness, selector = participant["harness"], participant["model"]
+            version = "0.145.0" if harness == "codex" else "0.33.0"
+            scope = model_catalog.harness_versions.runtime_scope()
+            status = {"harness": harness, **scope, "version": version,
+                      "compatibility": "verified", "verified_version": version, "error": None}
+            entry = model_catalog._entry(
+                selector, source="codex-cache" if harness == "codex" else "kimi-config",
+                availability="available", supported_efforts=["high"], cli_version=version,
+            )
+            model_catalog.persist_routes(self.con, {
+                "v": model_catalog.PAYLOAD_VERSION,
+                "fetched_at": f"2026-01-0{index + 1}T00:00:00+00:00", "stale": False,
+                "harnesses": {harness: {"models": [entry]}},
+                "verification": {"runtime": scope["runtime"], "harnesses": {harness: status}},
+            })
+        self.con.execute("UPDATE model_routes SET stale=1,last_error='older generation'")
+        self.con.commit()
+
+        def observation(harness, selector):
+            row = dict(self.con.execute(
+                "SELECT * FROM model_routes WHERE harness=? AND selector=?", (harness, selector)
+            ).fetchone())
+            scope = model_catalog.harness_versions.runtime_scope()
+            status = {"harness": harness, **scope, "version": row["harness_version"],
+                      "compatibility": "verified", "verified_version": row["harness_version"],
+                      "error": None}
+            entry = model_catalog._entry(
+                selector, source="codex-cache" if harness == "codex" else "kimi-config",
+                availability="available", supported_efforts=["high"],
+                cli_version=row["harness_version"], provider_model="live-provider-model",
+            )
+            evidence = model_catalog._entry_evidence(harness, entry, status)
+            return {"runtime_scope": scope, "source_fingerprint": evidence["source_fingerprint"],
+                    "runtime_status": status,
+                    "route_evidence": {**evidence, "provider_model": "live-provider-model"}}
+
+        # Override the fixture's candidate stub to prove the real persisted checks pass.
+        with mock.patch.object(sprint_domain, "_participant_binding_candidate",
+                               side_effect=REAL_PARTICIPANT_CANDIDATE), \
+             mock.patch.object(model_catalog, "controlled_route_evidence", side_effect=observation):
+            self.store.arm(sprint_id, 3)
+        generations = {row[0] for row in self.con.execute(
+            "SELECT catalogue_generation FROM sprint_participant_route_bindings"
+        )}
+        self.assertEqual(len(generations), 3)
+        self.assertEqual({row[0] for row in self.con.execute(
+            "SELECT provider_model FROM sprint_participant_route_bindings"
+        )}, {"live-provider-model"})
+        self.assertEqual(self.con.execute("SELECT lifecycle FROM sprints WHERE sprint_id=?",
+                                         (sprint_id,)).fetchone()[0], "armed")
+        self.assertEqual(self.con.execute("SELECT sum(stale) FROM model_routes").fetchone()[0], 0)
 
     def test_arm_persists_model_default_binding_with_stable_digest(self) -> None:
         # Spec #160: a participant that selected 'default' arms into a

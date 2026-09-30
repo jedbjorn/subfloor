@@ -902,18 +902,6 @@ class SprintLifecycleStore:
                     code=exc.code,
                     details=exc.details,
                 ) from exc
-        controlled_generations = {
-            candidate.binding["catalogue_generation"]
-            for candidate in candidates
-            if candidate.binding["control_state"] == "controlled"
-            and candidate.binding["catalogue_generation"] is not None
-        }
-        if len(controlled_generations) > 1:
-            raise SprintPreflightError(
-                "controlled participant routes do not share one catalogue generation",
-                code="thinking_evidence_stale",
-                details={"catalogue_generations": sorted(controlled_generations)},
-            )
         for harness in dict.fromkeys(
             candidate.binding["harness"] for candidate in candidates
         ):

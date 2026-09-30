@@ -9,6 +9,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+from contextlib import nullcontext
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -23,6 +24,7 @@ LIVE_NATIVE_CONTRACT_VERSION = 3
 # live-native rollout is harness-scoped, so there is no single replacement
 # version for Claude, Codex, Kimi, or Vibe.
 CONTRACT_VERSION = V2_CONTRACT_VERSION
+VERSION_KEYED_HARNESSES = frozenset({"claude", "codex", "kimi"})
 FRESH_HOURS = 7 * 24
 HARNESS_SUPPORT_STATES = frozenset({"tested", "best-effort"})
 LEGACY_HARNESS_EVIDENCE_FORMAT = "legacy-semver"
@@ -131,7 +133,7 @@ class _ControlledRouteProof:
     __slots__ = (
         "_harness", "_selector", "_runtime_status", "_runtime",
         "_runtime_identity", "_source_fingerprint",
-        "_advertised_options_by_model", "_issuer",
+        "_advertised_options_by_model", "_route_evidence", "_issuer",
     )
 
     def __init__(
@@ -144,6 +146,7 @@ class _ControlledRouteProof:
         runtime_scope: dict,
         source_fingerprint: str | None,
         advertised_options_by_model: dict[str, list[str]] | None,
+        route_evidence: dict | None = None,
     ) -> None:
         if issuer is not _CONTROLLED_PROOF_ISSUER:
             raise TypeError(
@@ -162,6 +165,7 @@ class _ControlledRouteProof:
             "_advertised_options_by_model",
             advertised_options_by_model,
         )
+        object.__setattr__(self, "_route_evidence", route_evidence)
         object.__setattr__(self, "_issuer", issuer)
 
     def __setattr__(self, _name, _value) -> None:
@@ -605,12 +609,25 @@ def _require_controlled_runtime(
     """Bind controlled evidence to the runtime that will execute the route."""
     status = _require_runtime(
         harness, model, runtime_status, runtime_scope,
-        error_code=error_code,
+        error_code=("thinking_evidence_missing"
+                    if harness in VERSION_KEYED_HARNESSES else error_code),
     )
-    if not _matches_captured_version(row.get("harness_version"), status):
+    captured_scope = {
+        **(row.get("runtime_scope") or {}),
+        **(_json_object(row.get("effort_metadata"), field="effort_metadata")
+           .get("runtime_scope") or {}),
+    }
+    runtime_changed = harness in VERSION_KEYED_HARNESSES and any(
+        captured_scope.get(key) is not None
+        and captured_scope[key] != getattr(status, key)
+        for key in ("runtime", "runtime_identity")
+    )
+    if (runtime_changed
+            or not _matches_captured_version(row.get("harness_version"), status)):
         raise RouteResolutionError(
             error_code,
-            "Installed harness version changed after refresh",
+            ("Execution runtime changed after refresh" if runtime_changed
+             else "Installed harness version changed after refresh"),
             {
                 "harness": harness,
                 "model": model,
@@ -641,7 +658,12 @@ def _probe_controlled_route(harness: str, model: str) -> _ControlledRouteProof:
         )
     import model_catalog  # noqa: PLC0415
 
-    observation = model_catalog.controlled_route_evidence(harness, model)
+    observation_scope = (
+        nullcontext() if harness_versions.current_probe_observation(harness) is not None
+        else harness_versions.probe_observation(harness)
+    )
+    with observation_scope:
+        observation = model_catalog.controlled_route_evidence(harness, model)
     status = RuntimeEvidence.from_value(observation.get("runtime_status"))
     scope = observation.get("runtime_scope")
     if not isinstance(scope, dict):
@@ -656,6 +678,7 @@ def _probe_controlled_route(harness: str, model: str) -> _ControlledRouteProof:
         advertised_options_by_model=observation.get(
             "advertised_options_by_model"
         ),
+        route_evidence=observation.get("route_evidence"),
     )
 
 
@@ -675,7 +698,8 @@ def _controlled_proof(
         or proof._selector != model
     ):
         raise RouteResolutionError(
-            "thinking_evidence_stale",
+            ("thinking_evidence_missing" if harness in VERSION_KEYED_HARNESSES
+             else "thinking_evidence_stale"),
             "Route proof was not collected by the canonical execution-seat probe",
             {
                 "harness": harness,
@@ -695,8 +719,8 @@ def _require_controlled_source(
     proof: _ControlledRouteProof,
     *,
     error_code: str = "thinking_evidence_stale",
-) -> None:
-    """Require the canonical probe's source to match its runtime and the row."""
+) -> dict:
+    """Bind version-keyed routes to the source from this operation's probe."""
     coherent = (
         proof._harness == harness
         and proof._selector == model
@@ -706,7 +730,8 @@ def _require_controlled_source(
     )
     if not coherent:
         raise RouteResolutionError(
-            error_code,
+            ("thinking_evidence_missing" if harness in VERSION_KEYED_HARNESSES
+             else error_code),
             "Route source evidence does not match the execution runtime",
             {
                 "harness": harness,
@@ -723,6 +748,22 @@ def _require_controlled_source(
                 "remediation": "re-probe the route in the execution runtime",
             },
         )
+    if harness in VERSION_KEYED_HARNESSES:
+        if not proof._source_fingerprint:
+            raise RouteResolutionError(
+                "route_unavailable",
+                "The execution harness no longer advertises this route",
+                {"harness": harness, "model": model},
+            )
+        if proof._route_evidence is not None:
+            return {**row, **proof._route_evidence, "stale": 0, "last_error": None}
+        if proof._source_fingerprint != row.get("source_fingerprint"):
+            raise RouteResolutionError(
+                "thinking_evidence_missing",
+                "Live route source has no binding evidence",
+                {"harness": harness, "model": model},
+            )
+        return {**row, "stale": 0, "last_error": None}
     stored_fingerprint = row.get("source_fingerprint")
     if not stored_fingerprint:
         raise RouteResolutionError(
@@ -738,6 +779,8 @@ def _require_controlled_source(
             {"harness": harness, "model": model,
              "remediation": "sc models refresh"},
         )
+
+    return row
 
 
 def _uncontrolled_binding(harness: str, model: str | None, effort: str | None) -> dict:
@@ -886,7 +929,7 @@ def _validate_route_freshness(
     *,
     now: datetime,
 ) -> None:
-    if row.get("stale"):
+    if row.get("stale") and harness not in VERSION_KEYED_HARNESSES:
         raise RouteResolutionError(
             "thinking_evidence_stale",
             row.get("last_error") or "Route evidence is stale",
@@ -906,8 +949,9 @@ def _validate_route_freshness(
             },
         )
     if (
-        row.get("availability") != "available"
-        or not row.get("headless_supported")
+        harness not in VERSION_KEYED_HARNESSES
+        and (row.get("availability") != "available"
+             or not row.get("headless_supported"))
     ):
         raise RouteResolutionError(
             "thinking_evidence_missing",
@@ -920,7 +964,8 @@ def _validate_route_freshness(
             "Route has no successful catalogue generation",
             {"harness": harness, "model": model, "remediation": "sc models refresh"},
         )
-    if _age_hours(row.get("last_seen_at"), now) > FRESH_HOURS:
+    if (harness not in VERSION_KEYED_HARNESSES
+            and _age_hours(row.get("last_seen_at"), now) > FRESH_HOURS):
         raise RouteResolutionError(
             "thinking_evidence_stale",
             "Route evidence is older than 7 days",
@@ -958,7 +1003,8 @@ def _require_fresh_route(
 
     def changed() -> RouteResolutionError:
         return RouteResolutionError(
-            "thinking_evidence_stale",
+            ("route_unavailable" if harness in VERSION_KEYED_HARNESSES
+             else "thinking_evidence_stale"),
             "Route evidence changed during resolution; retry",
             {"harness": harness, "model": model,
              "remediation": "retry route resolution"},
@@ -976,9 +1022,21 @@ def _require_fresh_route(
              "remediation": "sc models refresh"},
         )
     authoritative = dict(authoritative)
-    if identity(authoritative) != identity(row):
+    if (harness not in VERSION_KEYED_HARNESSES
+            and identity(authoritative) != identity(row)):
         raise changed()
     row = authoritative
+    if harness in VERSION_KEYED_HARNESSES:
+        captured = con.execute(
+            "SELECT runtime,harness_versions FROM model_catalog_generations "
+            "WHERE generation_id=?", (row.get("generation_id"),),
+        ).fetchone()
+        if captured is not None:
+            status = json.loads(captured["harness_versions"]).get(harness) or {}
+            row["runtime_scope"] = {
+                "runtime": status.get("runtime") or captured["runtime"],
+                "runtime_identity": status.get("runtime_identity"),
+            }
 
     check_time = now or datetime.now(timezone.utc)
     try:
@@ -994,7 +1052,28 @@ def _require_fresh_route(
             {"runtime": proof._runtime,
              "runtime_identity": proof._runtime_identity},
         )
-        _require_controlled_source(row, harness, model, runtime, proof)
+        live_row = _require_controlled_source(row, harness, model, runtime, proof)
+        if harness in VERSION_KEYED_HARNESSES:
+            json_fields = {"supported_efforts", "selector_binding",
+                           "effort_metadata", "adapter_metadata"}
+            fields = list(proof._route_evidence or {})
+            if live_row.get("harness_compatibility") not in {"verified", "supported"}:
+                live_row["harness_compatibility"] = None
+            fields += ["stale", "last_error"]
+            values = [
+                canonical_json(live_row[key]) if key in json_fields
+                else live_row[key] for key in fields
+            ]
+            con.execute(
+                "UPDATE model_routes SET "
+                + ",".join(f"{key}=?" for key in fields)
+                + " WHERE harness=? AND selector=?",
+                (*values, harness, model),
+            )
+            return dict(con.execute(
+                "SELECT * FROM model_routes WHERE harness=? AND selector=?",
+                (harness, model),
+            ).fetchone())
         latest = con.execute(
             "SELECT generation_id,completed_at FROM model_catalog_generations "
             "WHERE state='successful' "
@@ -1091,7 +1170,11 @@ def resolve_persisted_v2(
     runtime_status: dict | None = None,
     runtime_scope: dict | None = None,
 ) -> tuple[dict, str]:
-    """Probe and resolve through one transaction-owned freshness operation."""
+    """Resolve and publish live evidence in one owned write transaction.
+
+    On success, update the caller's row snapshot to the accepted projection so
+    downstream provenance checks retain exactly the evidence used to bind.
+    """
     harness = normalize_harness(harness)
     model = _normalize_model(model)
     if con.in_transaction:
@@ -1125,6 +1208,9 @@ def resolve_persisted_v2(
     if resolution_error is not None:
         raise resolution_error
     assert result is not None
+    if row is not None and fresh_row is not None:
+        row.clear()
+        row.update(fresh_row)
     return result
 
 
@@ -1229,7 +1315,7 @@ def _resolve_v2(
         {"runtime": proof._runtime,
          "runtime_identity": proof._runtime_identity},
     )
-    _require_controlled_source(row, harness, model, runtime, proof)
+    row = _require_controlled_source(row, harness, model, runtime, proof)
 
     supported, effort_metadata = _supported_efforts(row)
     if requested is None:
@@ -1306,6 +1392,13 @@ def _resolve_v2(
             )
         adapter_metadata = selected_metadata
 
+    selector_binding = _json_object(
+        row.get("selector_binding"), field="selector_binding"
+    )
+    captured_scope = effort_metadata.get("runtime_scope")
+    if harness in VERSION_KEYED_HARNESSES and captured_scope:
+        selector_binding = {**selector_binding, "runtime_scope": captured_scope}
+
     binding = {
         "contract_version": CONTRACT_VERSION,
         "control_state": "controlled",
@@ -1318,9 +1411,7 @@ def _resolve_v2(
         "transport": TRANSPORTS[harness],
         "catalogue_generation": generation,
         "evidence_digest": evidence_digest,
-        "selector_binding": _json_object(
-            row.get("selector_binding"), field="selector_binding"
-        ),
+        "selector_binding": selector_binding,
         "adapter_metadata": adapter_metadata,
     }
     if tuple(binding) != BINDING_KEYS:
@@ -1526,12 +1617,20 @@ def verify_stored_v2_before_first_turn(
         {"runtime": proof._runtime, "runtime_identity": proof._runtime_identity},
         error_code="route_evidence_stale",
     )
+    captured_scope = (binding.get("selector_binding") or {}).get("runtime_scope") or {}
+    runtime_changed = any(
+        captured_scope.get(key) is not None
+        and captured_scope[key] != getattr(runtime, key)
+        for key in ("runtime", "runtime_identity")
+    )
     if (
-        not _matches_captured_version(
+        runtime_changed
+        or not _matches_captured_version(
             harness_version, runtime,
             evidence_format=harness_evidence_format,
         )
-        or proof._source_fingerprint != source_fingerprint
+        or (harness not in VERSION_KEYED_HARNESSES
+            and proof._source_fingerprint != source_fingerprint)
     ):
         raise RouteResolutionError(
             "route_evidence_stale",
@@ -1544,6 +1643,19 @@ def verify_stored_v2_before_first_turn(
                 "remediation": "pause and reroute",
             },
         )
+    if harness in VERSION_KEYED_HARNESSES:
+        advertised = proof._advertised_options_by_model or {}
+        if (model not in advertised or (
+            binding["requested_effort"] != DEFAULT_EFFORT
+            and binding["requested_effort"] not in advertised[model]
+        )):
+            raise RouteResolutionError(
+                "route_unavailable",
+                "The execution harness no longer advertises the stored route or effort",
+                {"harness": harness, "model": model,
+                 "requested_effort": binding["requested_effort"]},
+            )
+
 
 
 class ParticipantRouteBindingStore:
