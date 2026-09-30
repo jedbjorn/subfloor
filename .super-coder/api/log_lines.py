@@ -46,10 +46,12 @@ class TimestampedWriter:
             _WRITERS.add(self)
 
     def write(self, text: str) -> int:
-        if not text:
-            return 0
-        stamp = self._clock().strftime(STAMP_FORMAT) + " "
         with _EMIT_LOCK:
+            if getattr(self._stream, "closed", False):
+                raise ValueError("I/O operation on closed file.")
+            if not text:
+                return 0
+            stamp = self._clock().strftime(STAMP_FORMAT) + " "
             self._write_locked(text, stamp, threading.current_thread())
         return len(text)
 
@@ -63,6 +65,7 @@ class TimestampedWriter:
             if index < len(segments) - 1:
                 self._stream.write(pending + "\n")
                 pending = ""
+                self._pending.pop(thread, None)
         if pending:
             self._pending[thread] = pending
         else:

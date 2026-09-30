@@ -120,6 +120,41 @@ class TimestampedWriterTest(unittest.TestCase):
         self.assertEqual(output.at_close, f"{STAMP}worker fragment\n{STAMP}main fragment\n")
         self.assertEqual(writer._pending, {})
 
+    def test_write_after_close_rejects_text(self) -> None:
+        for text in ("late fragment", "late terminated\n", ""):
+            with self.subTest(text=text):
+                output = io.StringIO()
+                writer = log_lines.TimestampedWriter(output, clock=fixed_clock)
+                writer.close()
+                with self.assertRaisesRegex(ValueError, "closed"):
+                    writer.write(text)
+                self.assertEqual(writer._pending, {})
+                writer.close()
+
+    def test_multiline_failure_does_not_replay_already_emitted_fragment(self) -> None:
+        class FailSecond(io.StringIO):
+            calls = 0
+
+            def write(self, text):
+                self.calls += 1
+                if self.calls == 2:
+                    raise OSError("injected failure on second line, before accepting bytes")
+                return super().write(text)
+
+        output = FailSecond()
+        writer = log_lines.TimestampedWriter(output, clock=fixed_clock)
+        writer.write("prior fragment")
+        with self.assertRaises(OSError):
+            writer.write(" completed\nsecond diagnostic\n")
+        self.assertEqual(output.getvalue(), f"{STAMP}prior fragment completed\n")
+        self.assertTrue(log_lines._EMIT_LOCK.acquire(blocking=False), "lock leaked after exception")
+        log_lines._EMIT_LOCK.release()
+        writer.write_record("next record")
+        self.assertEqual(output.getvalue(), (
+            f"{STAMP}prior fragment completed\n{STAMP}next record\n"
+        ))
+        self.assertEqual(writer._pending, {})
+
     def test_process_exit_drains_main_and_dead_worker_fragments(self) -> None:
         code = (
             f"import sys; sys.path.insert(0, {str(ROOT / '.super-coder' / 'api')!r})\n"
