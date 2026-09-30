@@ -3526,15 +3526,70 @@ function chatShellLabel(conversation) {
   return [shell.display_name, shell.shortname].filter(Boolean).join(" | ") || "Shell";
 }
 
-function chatUnreadBadge(shell) {
+// Hover or focus swaps 📩 for a red ✕; the click opens the drain confirm.
+// Its own button beside the row's, so it never opens the shell's chat.
+function chatUnreadBadge(shell, onDrained) {
   const count = Number(shell.unread_message_count) || 0;
   if (count < 1) return null;
   const label = `${count} unread ${count === 1 ? "message" : "messages"}`;
-  return el("span", {
+  const badge = el("button", {
     className: "chat-shell-mail",
-    title: label,
-    ariaLabel: label,
-  }, "📩");
+    type: "button",
+    title: `${label} — click to mark all read`,
+    ariaLabel: `${label} — mark all read`,
+  }, el("span", { className: "mail-idle", ariaHidden: "true" }, "📩"),
+    el("span", { className: "mail-drain", ariaHidden: "true" }, "✕"));
+  badge.onclick = () => chatConfirmDrain(shell, count, onDrained);
+  return badge;
+}
+
+// Slide-out confirm: a panel entering from the right edge. Enter confirms,
+// Esc or a backdrop click cancels (the global Esc handler closes overlays).
+function chatConfirmDrain(shell, count, onDrained) {
+  const priorFocus = document.activeElement;
+  const overlay = el("div", { className: "modal-overlay slide-confirm-overlay" });
+  const noun = count === 1 ? "message" : "messages";
+  const cancel = el("button", { className: "act", type: "button" }, "Cancel");
+  const confirm = el("button", { className: "act primary danger", type: "button" }, "Mark read");
+  const titleId = `modal-title-${++modalSequence}`;
+  const panel = el("div", { className: "slide-confirm" },
+    el("div", { className: "modal-title", id: titleId },
+      `Drain ${shell.shortname || shell.display_name}'s inbox?`),
+    el("p", { className: "slide-confirm-body" },
+      `Mark ${count} unread ${noun} read. They stay in history; the shell will not see them in its check.`),
+    el("div", { className: "slide-confirm-actions" }, cancel, confirm));
+  panel.setAttribute("role", "alertdialog");
+  panel.setAttribute("aria-modal", "true");
+  panel.setAttribute("aria-labelledby", titleId);
+  let closed = false;
+  const close = () => {
+    if (closed) return;
+    closed = true;
+    overlay.remove();
+    if (priorFocus?.isConnected) priorFocus.focus();
+  };
+  overlay.closeModal = close;
+  overlay.onmousedown = (e) => { if (e.target === overlay) close(); };
+  cancel.onclick = close;
+  confirm.onclick = async () => {
+    confirm.disabled = cancel.disabled = true;
+    try {
+      const r = await api(`/shells/${shell.shell_id}/inbox/drain`, "POST",
+        { through_message_id: shell.max_unread_message_id });
+      toast(`${shell.shortname || shell.display_name}: ${r.drained} marked read`);
+      close();
+      onDrained?.(r);
+    } catch (e) {
+      toast("drain failed: " + e.message);
+      confirm.disabled = cancel.disabled = false;
+    }
+  };
+  panel.onkeydown = (e) => {
+    if (e.key === "Enter" && e.target !== cancel) { e.preventDefault(); confirm.click(); }
+  };
+  overlay.append(panel);
+  document.body.append(overlay);
+  confirm.focus();
 }
 
 function chatWakePendingIndicator(shell, now = Date.now()) {
@@ -3583,7 +3638,8 @@ function chatPaintShellStatus(status, ...items) {
 }
 
 function chatPaintShellIndicators(target, shell) {
-  const mail = chatUnreadBadge(shell);
+  const mail = chatUnreadBadge(shell, (left) => chatPaintShellIndicators(
+    target, { ...shell, ...left }));
   const badge = chatSprintBadge(shell);
   const wake = chatWakePendingIndicator(shell);
   target.row.classList.toggle("has-assignment", Boolean(badge));
