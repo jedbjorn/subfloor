@@ -269,9 +269,9 @@ class ConversationReaperTest(unittest.TestCase):
         self.assertEqual(tuple(identity), (None, None, None))
         self.assertEqual([], store.candidates())
 
-    def test_outcome_probe_seeks_the_reaper_index(self) -> None:
+    def test_outcome_probe_seeks_by_run_and_event_type(self) -> None:
         # Every terminal run with an identity probes conversation_events for
-        # the reaper's own outcome; without the partial index each probe
+        # the reaper's own outcome; without a suitable index each probe
         # scanned the whole event log, pegging a core on long-lived engines.
         statements: list[str] = []
 
@@ -294,7 +294,11 @@ class ConversationReaperTest(unittest.TestCase):
         probes = [d for d in plan if "reaped" in d]
         self.assertTrue(probes, plan)
         self.assertTrue(
-            all("idx_conversation_events_reaper" in d for d in probes),
+            all(
+                "SEARCH reaped USING" in detail
+                and "(run_id=? AND event_type=?)" in detail
+                for detail in probes
+            ),
             plan,
         )
 
