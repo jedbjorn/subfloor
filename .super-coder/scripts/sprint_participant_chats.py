@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any
 
 import active_chat_registry
+import conversation_events
 import run as run_mod
 from conversation_adapters import ADAPTER_TYPES
 
@@ -154,7 +155,7 @@ def _append_created_event(
         "(conversation_id,sequence,event_type,payload) VALUES (?,1,?,?)",
         (
             conversation_id,
-            "conversation.created",
+            conversation_events.require_event_type("conversation.created"),
             _canonical_json(
                 {
                     "scope": "sprint",
@@ -188,7 +189,7 @@ def _append_event(
         (
             conversation_id,
             sequence,
-            event_type,
+            conversation_events.require_event_type(event_type),
             _canonical_json(payload),
             run_id,
         ),

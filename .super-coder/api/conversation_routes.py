@@ -385,7 +385,7 @@ def _append_event(
         (
             conversation_id,
             sequence,
-            event_type,
+            conversation_events.require_event_type(event_type),
             json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
             message_id,
             run_id,

@@ -4,17 +4,22 @@ from __future__ import annotations
 
 import ast
 import json
+import re
 import shutil
+import sqlite3
 import subprocess
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / ".super-coder" / "scripts"))
 
-from conversation_broker import CONVERSATION_EVENT_TYPES
+import activity_monitor
+import conversation_events
+from conversation_events import CONVERSATION_EVENT_TYPES
 
 APP = (ROOT / ".super-coder" / "ui" / "app.js").read_text()
 MODEL_SEARCH = APP[
@@ -125,12 +130,67 @@ console.log(JSON.stringify({renders, modes, currentMode}));
     }
 
 
-def test_server_event_writers_use_canonical_conversation_type_set():
-    # Literal writer calls must join the canonical set as well as normalized
-    # adapter events (which the canonical set incorporates directly).
+def assert_conversation_event_writers_bound():
+    writers = set()
     for directory in ("scripts", "api"):
         for path in (ROOT / ".super-coder" / directory).rglob("*.py"):
-            for node in ast.walk(ast.parse(path.read_text())):
+            tree = ast.parse(path.read_text())
+            parents = {
+                child: parent for parent in ast.walk(tree)
+                for child in ast.iter_child_nodes(parent)
+            }
+            for node in ast.walk(tree):
+                # Discover SQL inserts independently of helper names. Require
+                # validation on the actual bound value, including dynamic types.
+                if (isinstance(node, ast.Constant)
+                        and isinstance(node.value, str)
+                        and re.search(
+                            r"\b(?:INSERT(?:\s+OR\s+\w+)?\s+INTO|"
+                            r"REPLACE\s+INTO|UPDATE)\s+conversation_events\b",
+                            node.value, re.IGNORECASE,
+                        )):
+                    function = parents[node]
+                    while not isinstance(function, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                        assert function in parents, path
+                        function = parents[function]
+                    writer = (str(path.relative_to(ROOT / ".super-coder")), function.name)
+                    writers.add(writer)
+                    call = parents[node]
+                    assert (isinstance(call, ast.Call)
+                            and getattr(call.func, "attr", "") == "execute"
+                            and call.args[0] is node), writer
+                    insert = re.fullmatch(
+                        r"\s*INSERT INTO conversation_events\s*\(([^)]+)\)"
+                        r"\s*VALUES\s*\(([^)]+)\)\s*",
+                        node.value, re.IGNORECASE,
+                    )
+                    assert insert, writer
+                    columns, values = [
+                        [part.strip() for part in group.split(",")]
+                        for group in insert.groups()
+                    ]
+                    event_index = columns.index("event_type")
+                    assert values[event_index] == "?", (
+                        writer, "event_type must be a validated bound parameter",
+                    )
+                    parameters = call.args[1]
+                    assert isinstance(parameters, (ast.Tuple, ast.List)), writer
+                    event_type = parameters.elts[values[:event_index].count("?")]
+                    assert (isinstance(event_type, ast.Call)
+                            and ast.unparse(event_type.func)
+                            == "conversation_events.require_event_type"
+                            and len(event_type.args) == 1), (
+                        writer, "event_type must use canonical validation",
+                    )
+                    argument = event_type.args[0]
+                    if isinstance(argument, ast.Constant):
+                        assert argument.value in CONVERSATION_EVENT_TYPES, (
+                            writer, argument.value,
+                        )
+
+                # Also catch unlisted literals passed to generic writers before
+                # they reach the runtime guard. Adapter/dynamic values pass
+                # through the same validated SQL parameter checked above.
                 if not isinstance(node, ast.Call):
                     continue
                 name = getattr(node.func, "attr", getattr(node.func, "id", ""))
@@ -143,6 +203,105 @@ def test_server_event_writers_use_canonical_conversation_type_set():
                     if (isinstance(argument, ast.Constant)
                             and isinstance(argument.value, str)):
                         assert argument.value in CONVERSATION_EVENT_TYPES, path
+    return writers
+
+
+def test_server_event_writers_use_canonical_conversation_type_set():
+    assert assert_conversation_event_writers_bound() == {
+        ("api/conversation_routes.py", "_append_event"),
+        ("scripts/activity_monitor.py", "_append_closed_event"),
+        ("scripts/conversation_broker.py", "_append_event"),
+        ("scripts/conversation_reaper.py", "_append_event"),
+        ("scripts/sprint_participant_chats.py", "_append_created_event"),
+        ("scripts/sprint_participant_chats.py", "_append_event"),
+        ("scripts/sprint_runtime.py", "enqueue_conversation_turn"),
+    }
+
+
+@pytest.mark.parametrize("writer,old,new", [
+    ("activity_monitor.py", 'require_event_type("conversation.closed")',
+     'require_event_type("conversation.archived")'),
+    ("sprint_runtime.py", 'require_event_type("message.accepted")',
+     'require_event_type("conversation.archived")'),
+    ("sprint_participant_chats.py", 'require_event_type("conversation.created")',
+     'require_event_type("conversation.archived")'),
+    ("activity_monitor.py", 'conversation_events.require_event_type("conversation.closed")',
+     '"conversation.archived"'),
+    ("activity_monitor.py", '"VALUES (?,?,?,?,?)"',
+     '"VALUES (?, ?, \'conversation.archived\', ?, ?)"'),
+    ("conversation_broker.py", "conversation_events.require_event_type(event_type)",
+     "event_type"),
+])
+def test_event_writer_binding_rejects_unlisted_direct_sql_and_unvalidated_dynamic_types(
+    monkeypatch, writer, old, new,
+):
+    path = ROOT / ".super-coder" / "scripts" / writer
+    read_text = Path.read_text
+    original = read_text(path)
+    assert old in original
+    mutated = original.replace(old, new, 1)
+
+    def read_mutated(self, *args, **kwargs):
+        return mutated if self == path else read_text(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", read_mutated)
+    with pytest.raises(AssertionError, match=writer):
+        test_server_event_writers_use_canonical_conversation_type_set()
+
+
+def load_event_writer(path, name, source):
+    tree = ast.parse(source)
+    function = next(node for node in ast.walk(tree)
+                    if isinstance(node, ast.FunctionDef) and node.name == name)
+    function.decorator_list = []
+    namespace = {"conversation_events": conversation_events, "json": json}
+    exec(compile(ast.Module(body=[function], type_ignores=[]), str(path), "exec"), namespace)
+    return namespace[name]
+
+
+def test_direct_sql_writer_rejects_unlisted_type_before_insert():
+    path = ROOT / ".super-coder" / "scripts" / "activity_monitor.py"
+    source = path.read_text().replace('"conversation.closed"', '"conversation.archived"')
+    writer = load_event_writer(path, "_append_closed_event", source)
+    with sqlite3.connect(":memory:") as con:
+        con.execute(
+            "CREATE TABLE conversation_events (conversation_id TEXT, sequence INTEGER, "
+            "event_type TEXT, payload TEXT, run_id INTEGER)"
+        )
+        with pytest.raises(ValueError, match="conversation.archived"):
+            writer(
+                con, chat_id="cv_probe", run_id=1, ceiling_seconds=3600,
+            )
+        assert con.execute("SELECT COUNT(*) FROM conversation_events").fetchone()[0] == 0
+        activity_monitor.ActivityMonitor._append_closed_event(
+            con, chat_id="cv_probe", run_id=1, ceiling_seconds=3600,
+        )
+        assert con.execute("SELECT event_type FROM conversation_events").fetchone()[0] == (
+            "conversation.closed"
+        )
+
+
+@pytest.mark.parametrize("relative_path,arguments", [
+    ("api/conversation_routes.py", {"conversation_id": "cv_probe"}),
+    ("scripts/conversation_broker.py", {
+        "conversation_id": "cv_probe", "message_id": None, "run_id": None,
+    }),
+    ("scripts/conversation_reaper.py", {"candidate": SimpleNamespace(
+        conversation_id="cv_probe", message_id=None, run_id=None,
+    )}),
+    ("scripts/sprint_participant_chats.py", {"conversation_id": "cv_probe"}),
+])
+def test_dynamic_sql_writers_reject_unlisted_type_before_insert(relative_path, arguments):
+    path = ROOT / ".super-coder" / relative_path
+    writer = load_event_writer(path, "_append_event", path.read_text())
+    with sqlite3.connect(":memory:") as con:
+        con.execute(
+            "CREATE TABLE conversation_events (conversation_id TEXT, sequence INTEGER, "
+            "event_type TEXT, payload TEXT, message_id INTEGER, run_id INTEGER)"
+        )
+        with pytest.raises(ValueError, match="conversation.archived"):
+            writer(con, event_type="conversation.archived", payload={}, **arguments)
+        assert con.execute("SELECT COUNT(*) FROM conversation_events").fetchone()[0] == 0
 
 
 @pytest.mark.skipif(shutil.which("node") is None, reason="node is required")

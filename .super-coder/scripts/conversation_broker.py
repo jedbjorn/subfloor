@@ -42,31 +42,11 @@ from conversation_adapters import (
     adapter_for,
 )
 from conversation_adapters.base import (
-    NORMALIZED_EVENTS,
     TERMINAL_EVENTS,
     terminal_outcome,
 )
+from conversation_events import CONVERSATION_EVENT_TYPES
 from conversation_state import require_transition
-
-# Canonical vocabulary stored on conversation_events, including events emitted
-# by the API, Sprint runtime, activity monitor, and reaper. The UI listener
-# contract is bound to this set so adding a type requires a matching listener.
-CONVERSATION_EVENT_TYPES = NORMALIZED_EVENTS | frozenset(
-    {
-        "conversation.created",
-        "conversation.updated",
-        "conversation.renamed",
-        "conversation.close.requested",
-        "conversation.closed",
-        "conversation.reopened",
-        "message.accepted",
-        "run.resumed",
-        "run.interrupt.requested",
-        "run.unknown",
-        "run.deferred",
-        "run.reaped",
-    }
-)
 
 LIVE_RUN_STATES = frozenset({"leased", "starting", "running"})
 TERMINAL_RUN_STATES = frozenset({"succeeded", "failed", "cancelled", "unknown"})
@@ -250,7 +230,7 @@ class BrokerStore:
             (
                 conversation_id,
                 sequence,
-                event_type,
+                conversation_events.require_event_type(event_type),
                 BrokerStore._payload(payload),
                 message_id,
                 run_id,
