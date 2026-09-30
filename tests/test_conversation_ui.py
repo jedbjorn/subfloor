@@ -39,7 +39,7 @@ WAKE_INDICATOR = APP[
     APP.index("function chatPaintShellStatus")
 ]
 SHELL_INDICATORS = APP[
-    APP.index("function chatUnreadBadge(shell)"):
+    APP.index("function chatUnreadBadge(shell, onDrained)"):
     APP.index("function chatHeaderLabel(conversation)")
 ]
 
@@ -1665,7 +1665,7 @@ console.log(JSON.stringify({
 
 def test_shell_rail_mail_badge_only_renders_for_unread_messages():
     helper = APP[
-        APP.index("function chatUnreadBadge(shell)"):
+        APP.index("function chatUnreadBadge(shell, onDrained)"):
         APP.index("function chatHeaderLabel(conversation)")
     ]
     script = r"""
@@ -1690,30 +1690,133 @@ console.log(JSON.stringify({
   none,
   badge: {
     tag: badge.tag,
+    type: badge.type,
     className: badge.className,
     title: badge.title,
     ariaLabel: badge.ariaLabel,
-    text: badge.children[0].textContent,
+    faces: badge.children.map((face) => [face.className, face.children[0].textContent]),
+    clickable: typeof badge.onclick,
   },
 }));
 """
     assert run_js(script) == {
         "none": None,
         "badge": {
-            "tag": "span",
+            "tag": "button",
+            "type": "button",
             "className": "chat-shell-mail",
-            "title": "3 unread messages",
-            "ariaLabel": "3 unread messages",
-            "text": "📩",
+            "title": "3 unread messages — click to mark all read",
+            "ariaLabel": "3 unread messages — mark all read",
+            "faces": [["mail-idle", "📩"], ["mail-drain", "✕"]],
+            "clickable": "function",
         },
     }
     interface = APP[
         APP.index("async function renderInterface"):
         APP.index("// ── Tabs + boot")
     ]
-    assert "const mail = chatUnreadBadge(shell)" in SHELL_INDICATORS
+    assert "const mail = chatUnreadBadge(shell, (left) =>" in SHELL_INDICATORS
     assert "chatPaintShellIndicators(statusItem, item)" in interface
     assert ".chat-shell-mail" in STYLE
+    assert ".chat-shell-mail:hover .mail-drain" in STYLE
+    assert "pointer-events: auto" in STYLE[STYLE.index(".chat-shell-mail {"):]
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node is required")
+def test_mail_badge_drain_confirm_posts_seen_id_and_repaints():
+    script = r"""
+class FakeElement {
+  constructor(tag) {
+    this.tag = tag;
+    this.nodeType = 1;
+    this.children = [];
+    this.className = "";
+    this.attrs = {};
+    this.classList = { toggle: (name, on) => {
+      const names = new Set(this.className.split(" ").filter(Boolean));
+      if (on) names.add(name); else names.delete(name);
+      this.className = [...names].join(" ");
+    } };
+  }
+  append(...nodes) { this.children.push(...nodes); }
+  replaceChildren(...nodes) { this.children = [...nodes]; }
+  setAttribute(k, v) { this.attrs[k] = v; }
+  remove() { document.body.children = document.body.children.filter((n) => n !== this); }
+  focus() { document.activeElement = this; }
+  click() { return this.onclick?.(); }
+  get isConnected() { return true; }
+  get textContent() {
+    return this.children.map((c) => typeof c === "string" ? c : c.textContent).join("");
+  }
+}
+const document = { body: new FakeElement("body"), activeElement: null };
+const el = (tag, props = {}, ...children) => {
+  const node = Object.assign(new FakeElement(tag), props);
+  node.append(...children);
+  return node;
+};
+let modalSequence = 0;
+const calls = [];
+const toasts = [];
+const api = async (path, method, body) => {
+  calls.push({ path, method, body });
+  return { drained: 30, unread_message_count: 1, max_unread_message_id: 91 };
+};
+const toast = (msg) => toasts.push(msg);
+const chatHash = () => "";
+""" + SHELL_INDICATORS + r"""
+const target = { row: new FakeElement("div"), status: new FakeElement("span") };
+chatPaintShellIndicators(target, {
+  shell_id: 7, shortname: "DEV2", unread_message_count: 30, max_unread_message_id: 88,
+});
+target.status.children[0].onclick();
+const overlay = document.body.children[0];
+const panel = overlay.children[0];
+const [cancel, confirm] = panel.children[2].children;
+const opened = {
+  overlay: overlay.className,
+  role: panel.attrs.role,
+  title: panel.children[0].textContent,
+  body: panel.children[1].textContent,
+  focused: document.activeElement === confirm,
+};
+panel.onkeydown({ key: "Enter", target: confirm, preventDefault() {} });
+(async () => {
+  await new Promise((r) => setTimeout(r, 0));
+  console.log(JSON.stringify({
+    opened,
+    calls,
+    toasts,
+    closed: document.body.children.length === 0,
+    status: target.status.textContent,
+    hasMail: target.row.className,
+    cancelLabel: cancel.textContent,
+  }));
+})();
+"""
+    assert run_js(script) == {
+        "opened": {
+            "overlay": "modal-overlay slide-confirm-overlay",
+            "role": "alertdialog",
+            "title": "Drain DEV2's inbox?",
+            "body": (
+                "Mark 30 unread messages read. They stay in history; "
+                "the shell will not see them in its check."
+            ),
+            "focused": True,
+        },
+        "calls": [{
+            "path": "/shells/7/inbox/drain",
+            "method": "POST",
+            "body": {"through_message_id": 88},
+        }],
+        "toasts": ["DEV2: 30 marked read"],
+        "closed": True,
+        "status": "📩✕",
+        "hasMail": "has-mail",
+        "cancelLabel": "Cancel",
+    }
+    assert ".modal-overlay.slide-confirm-overlay { justify-content: flex-end; }" in STYLE
 
 
 def test_interface_owns_scroll_with_fixed_history_and_conversation_controls():

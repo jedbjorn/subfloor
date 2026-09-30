@@ -304,7 +304,13 @@ body.interface-view main {
 .chat-shell-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; }
 .chat-shell-mail {
   color: var(--accent); flex: none; font: .8rem/1 ui-sans-serif, sans-serif;
+  background: none; border: 0; padding: 0; cursor: pointer; pointer-events: auto;
+  display: inline-grid; place-items: center; min-width: 1.1rem;
 }
+.chat-shell-mail > span { grid-area: 1 / 1; }
+.chat-shell-mail .mail-drain { visibility: hidden; color: #ef545f; font-weight: 700; }
+.chat-shell-mail:hover .mail-idle, .chat-shell-mail:focus-visible .mail-idle { visibility: hidden; }
+.chat-shell-mail:hover .mail-drain, .chat-shell-mail:focus-visible .mail-drain { visibility: visible; }
 .chat-shell-wake {
   color: #ef545f; flex: none; font: 1rem/1 ui-sans-serif, sans-serif;
 }
@@ -1391,6 +1397,19 @@ button.gmenu-name:hover { color: #fff; }
 .modal-foot-start, .modal-foot-end { display: flex; align-items: center; gap: .6rem; }
 .modal-foot-end { margin-left: auto; }
 .modal-foot .act { margin-top: 0; }
+/* slide-out confirm — enters from the right edge, compact, action last/right */
+.modal-overlay.slide-confirm-overlay { justify-content: flex-end; }
+.slide-confirm {
+  width: 360px; max-width: 92vw; margin-right: 1.2rem; padding: 1.1rem 1.2rem .9rem;
+  border-radius: 14px; border: 1px solid rgba(255,255,255,.10);
+  background: var(--menu-bg); box-shadow: var(--menu-shadow);
+  animation: slide-confirm-in .18s ease-out;
+}
+.slide-confirm-body { color: var(--dim); font-size: .85rem; margin: .6rem 0 .4rem; }
+.slide-confirm-actions { display: flex; justify-content: space-between; }
+button.act.primary.danger { background: #ef545f; border-color: #ef545f; color: #fff; }
+@keyframes slide-confirm-in { from { transform: translateX(110%); opacity: 0; } }
+@media (prefers-reduced-motion: reduce) { .slide-confirm { animation: none; } }
 
 /* ── Markdown surfaces (vendored marked + DOMPurify; dos-arch ramp on flat
       grey) — headings step down to micro-labels, code reads as inset wells. */

@@ -374,11 +374,35 @@ def get_shells(con) -> list[dict]:
         "(SELECT COUNT(*) FROM shell_messages m "
         " WHERE m.to_shell_id=s.shell_id AND m.read_at IS NULL "
         " AND m.kind IN ('shell','task','result')) AS unread_message_count, "
+        "(SELECT MAX(m.message_id) FROM shell_messages m "
+        " WHERE m.to_shell_id=s.shell_id AND m.read_at IS NULL "
+        " AND m.kind IN ('shell','task','result')) AS max_unread_message_id, "
         "(SELECT w.available_at FROM sprint_wake_outbox w "
         " WHERE w.receiver_shell_id=s.shell_id AND w.state='pending' "
         " AND w.available_at>datetime('now')) AS pending_wake_available_at "
         "FROM shells s WHERE COALESCE(s.is_deleted,0)=0 ORDER BY s.shell_id"))
     return sprint_participant_chats.attach_live_participations(con, shells)
+
+
+def drain_shell_inbox(con, sid: int, through_message_id: int) -> dict:
+    """Mark a shell's unread inbox read up to the id the operator saw.
+
+    Same kinds as `unread_message_count`, so Sprint relay rows are never
+    touched; the id ceiling leaves a message that landed while the confirm
+    was open unread, and the result re-projects what is still unread."""
+    drained = con.execute(
+        "UPDATE shell_messages SET read_at=datetime('now') "
+        "WHERE to_shell_id=? AND read_at IS NULL AND message_id<=? "
+        "AND kind IN ('shell','task','result')",
+        (sid, through_message_id)).rowcount
+    con.commit()
+    left = con.execute(
+        "SELECT COUNT(*), MAX(message_id) FROM shell_messages "
+        "WHERE to_shell_id=? AND read_at IS NULL "
+        "AND kind IN ('shell','task','result')",
+        (sid,)).fetchone()
+    return {"drained": drained, "unread_message_count": left[0],
+            "max_unread_message_id": left[1]}
 
 
 def get_shell(con, sid: int) -> dict | None:
@@ -5716,6 +5740,23 @@ class Handler(BaseHTTPRequestHandler):
                 proj, err = create_project(con, self._body())
                 return self._send(400 if err else 201,
                                   {"error": err} if err else proj)
+            # POST /api/shells/{id}/inbox/drain  {through_message_id}
+            parts = path.split("/")
+            if (len(parts) == 6 and parts[1:3] == ["api", "shells"]
+                    and parts[3].isdigit() and parts[4:] == ["inbox", "drain"]):
+                if not self._require_browser_operator(con, "inbox drain"):
+                    return
+                if not self._require_browser_mutation_origin("inbox drains"):
+                    return
+                sid = int(parts[3])
+                through = self._body().get("through_message_id")
+                if isinstance(through, bool) or not isinstance(through, int):
+                    return self._send(400, {"error": "through_message_id must be an integer"})
+                if not con.execute(
+                        "SELECT 1 FROM shells WHERE shell_id=? "
+                        "AND COALESCE(is_deleted,0)=0", (sid,)).fetchone():
+                    return self._send(404, {"error": "no such shell"})
+                return self._send(200, drain_shell_inbox(con, sid, through))
             if path == "/api/shells":
                 body = self._body()
                 if not body.get("name") or "flavor" not in body:
