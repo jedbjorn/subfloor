@@ -85,7 +85,7 @@ def v2_context(
             "opencode": "opencode-route-agent",
         }[harness],
         "catalogue_generation": "1" * 32,
-        "evidence_digest": "2" * 64,
+        "evidence_digest": None if effort == "default" else "2" * 64,
         "selector_binding": {"kind": "exact-test-route"},
         "adapter_metadata": adapter_metadata,
     }
@@ -946,7 +946,7 @@ class ConversationAdapterTest(unittest.TestCase):
         self.kimi_runner_serial = 0
         # Transport tests supply a deterministic canonical execution-seat source.
         import model_catalog
-        self.live_efforts = ["high", "default"]
+        self.live_efforts = ["high"]
         self.live_route_available = True
 
         def live_evidence(harness, selector):
@@ -1567,6 +1567,51 @@ class ConversationAdapterTest(unittest.TestCase):
         self.assertEqual(kimi_env["KIMI_MODEL_THINKING_EFFORT"], "high")
         self.assertEqual(kimi_argv.count("-m"), 1)
         self.assertEqual(kimi_argv[kimi_argv.index("-m") + 1], "test-model")
+
+    def test_model_default_and_named_effort_transport_on_start_and_resume(self):
+        for harness in ("claude", "codex", "kimi"):
+            for effort in ("default", "high"):
+                for bound in (False, True):
+                    with self.subTest(harness=harness, effort=effort, bound=bound):
+                        context = v2_context(
+                            self.root, harness, effort=effort,
+                            env={"KIMI_MODEL_THINKING_EFFORT": "default"},
+                        )
+                        if not bound:
+                            context = replace(context, route_binding=None, binding_digest=None)
+                        adapter, native = self.build(harness)
+                        first = adapter.start(context, "first turn")
+                        if harness == "claude":
+                            self.write_claude_session(adapter, first.session_ref)
+                        resumed = adapter.resume(first.session_ref, context, "second turn")
+                        self.assertEqual(resumed.session_ref, first.session_ref)
+                        if bound:
+                            self.assertEqual(context.route_binding["requested_effort"], effort)
+                            self.assertEqual(context.route_binding["effective_effort"], effort)
+                        if harness == "codex":
+                            turns = [params for method, params in native.requests
+                                     if method == "turn/start"]
+                            self.assertEqual(len(turns), 2)
+                            for params in turns:
+                                if effort == "default":
+                                    self.assertNotIn("effort", params)
+                                    self.assertNotIn('"default"', json.dumps(params))
+                                else:
+                                    self.assertEqual(params["effort"], effort)
+                        else:
+                            self.assertEqual(len(native.calls), 2)
+                            for argv, _cwd, env in native.calls:
+                                self.assertNotIn("default", argv)
+                                if harness == "claude":
+                                    if effort == "default":
+                                        self.assertNotIn("--effort", argv)
+                                    else:
+                                        self.assertEqual(argv.count("--effort"), 1)
+                                        self.assertEqual(argv[argv.index("--effort") + 1], effort)
+                                elif effort == "default":
+                                    self.assertNotIn("KIMI_MODEL_THINKING_EFFORT", tuple(env))
+                                else:
+                                    self.assertEqual(env["KIMI_MODEL_THINKING_EFFORT"], effort)
 
     def test_every_bound_start_and_resume_rejects_removed_live_route_or_effort(self):
         for harness in ("claude", "codex", "kimi"):

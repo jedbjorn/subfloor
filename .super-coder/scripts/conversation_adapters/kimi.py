@@ -96,7 +96,11 @@ class KimiAdapter(ConversationAdapter):
         env = merged_env(self.manifest, context)
         effort_env = self.manifest["headless"].get("effort", {}).get("env")
         if effort_env:
-            if effort_value:
+            # Clear inherited overrides when the binding selects Model default.
+            if (
+                effort_value
+                and effort_value != route_transport.route_bindings.DEFAULT_EFFORT
+            ):
                 env[effort_env] = effort_value
             else:
                 env.pop(effort_env, None)
