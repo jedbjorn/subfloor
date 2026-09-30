@@ -572,6 +572,169 @@ class SprintBoundRouteDispatchProof(unittest.TestCase):
         self.assertEqual(len(prepared), 1)
         return context, prepared[0]
 
+    def test_sprint_first_and_subsequent_dispatch_reject_removed_live_effort(self) -> None:
+        from conversation_adapters import AdapterError, CodexAdapter
+
+        scope = model_catalog.harness_versions.runtime_scope()
+        status = {"harness": "codex", **scope, "version": "0.145.0", "error": None}
+        selector = "sprint-live-codex"
+        entry = model_catalog._entry(
+            selector, source="codex-cache", availability="available",
+            supported_efforts=["low", "high"], cli_version=status["version"],
+        )
+        with mock.patch.object(model_catalog, "_headless_supported", return_value=True):
+            model_catalog.persist_routes(self.con, {
+                "v": model_catalog.PAYLOAD_VERSION,
+                "fetched_at": datetime.now(timezone.utc).isoformat(), "stale": False,
+                "harnesses": {"codex": {"models": [entry]}},
+                "verification": {"runtime": scope["runtime"], "harnesses": {"codex": status}},
+            })
+        sprint_id = self._seed_sprint(harness="codex", model=selector, effort="high")
+        with mock.patch.object(model_catalog, "harness_runtime_status", return_value=status), \
+             mock.patch.object(model_catalog, "_from_codex_cache", return_value=[entry]):
+            wake_id = self._arm(sprint_id)
+            participant_id = self.con.execute(
+                "SELECT participant_id FROM sprint_wake_outbox WHERE wake_id=?", (wake_id,)
+            ).fetchone()[0]
+            entry["supported_efforts"] = ["low"]
+            with self.assertRaisesRegex(sprint_participant_chats.SprintConversationError, "route_unavailable"):
+                sprint_participant_chats.prepare_wake_conversation(
+                    self.con, sprint_id=sprint_id, participant_id=participant_id,
+                )
+            self.assertEqual(self.con.execute("SELECT count(*) FROM conversations").fetchone()[0], 0)
+            entry["supported_efforts"] = ["low", "high"]
+            run = self._deliver_and_claim(wake_id)
+            context, _ = self._prepare(run)
+            rpc = mock.Mock()
+            rpc.request.side_effect = [
+                {"thread": {"id": "sprint-thread", "cwd": str(context.worktree)}},
+                {"turn": {"id": "sprint-turn"}},
+            ]
+            adapter = CodexAdapter(rpc=rpc)
+            first = adapter.start(context, "first advertised Sprint turn")
+            broker = BrokerStore(self.db_path)
+            broker.mark_starting(run.run_id, "bound-route-broker")
+            broker.mark_native_started(run.run_id, "bound-route-broker", first)
+            self.assertEqual(rpc.request.call_args.args[1]["effort"], "high")
+
+            entry["supported_efforts"] = ["low"]
+            # A prior native turn bypasses the historical first-turn provenance check.
+            with mock.patch.object(route_bindings, "verify_stored_v2_before_first_turn") as first_check:
+                prepared = sprint_participant_chats.prepare_wake_conversation(
+                    self.con, sprint_id=sprint_id, participant_id=participant_id,
+                )
+            first_check.assert_not_called()
+            self.assertEqual(prepared.binding, context.route_binding)
+            before = rpc.request.call_count
+            with self.assertRaises(AdapterError) as raised:
+                adapter.resume(first.session_ref, context, "effort removed before subsequent dispatch")
+            self.assertEqual(raised.exception.code, "route_unavailable")
+            self.assertEqual(rpc.request.call_count, before)
+
+    def _assert_same_version_drift_default_dispatch(self, harness: str) -> None:
+        from conversation_adapters import ClaudeAdapter, CodexAdapter, KimiAdapter
+        from test_conversation_adapters import FakeClaudeRunner, FakeCodexRpc, FakeKimiRunner
+
+        source, reader, version = {
+            "claude": ("claude-cli", "_from_claude_cli", "2.1.222"),
+            "codex": ("codex-cache", "_from_codex_cache", "0.145.0"),
+            "kimi": ("kimi-config", "_from_kimi_config", "0.33.0"),
+        }[harness]
+        scope = model_catalog.harness_versions.runtime_scope()
+        status = {"harness": harness, **scope, "version": version, "error": None}
+        selector = "sprint-default-drift"
+        entry = model_catalog._entry(
+            selector, source=source, availability="available",
+            supported_efforts=["high"], cli_version=version,
+        )
+        with mock.patch.object(model_catalog, "_headless_supported", return_value=True):
+            model_catalog.persist_routes(self.con, {
+                "v": model_catalog.PAYLOAD_VERSION,
+                "fetched_at": datetime.now(timezone.utc).isoformat(), "stale": False,
+                "harnesses": {harness: {"models": [entry]}},
+                "verification": {"runtime": scope["runtime"], "harnesses": {harness: status}},
+            })
+        captured = self.con.execute(
+            "SELECT source_fingerprint,harness_version FROM model_routes "
+            "WHERE harness=? AND selector=?", (harness, selector),
+        ).fetchone()
+        sprint_id = self._seed_sprint(harness=harness, model=selector, effort=None)
+        entry["supported_efforts"] = ["low"]
+        with (
+            mock.patch.object(model_catalog, "harness_runtime_status", return_value=status),
+            mock.patch.object(model_catalog, reader, return_value=[entry]),
+        ):
+            wake_id = self._arm(sprint_id)
+            run = self._deliver_and_claim(wake_id)
+            context, launch = self._prepare(run)
+            self.assertEqual(run.effort, "default")
+            self.assertEqual(launch["effort"], "default")
+            self.assertEqual(context.effort, "default")
+            self.assertEqual(run.route_binding["requested_effort"], "default")
+            self.assertEqual(run.route_binding["effective_effort"], "default")
+            self.assertEqual(context.route_binding, run.route_binding)
+            stored_bindings = self.con.execute(
+                "SELECT binding_json FROM sprint_participant_route_bindings binding "
+                "JOIN sprint_participants participant USING (participant_id) "
+                "WHERE participant.sprint_id=?", (sprint_id,),
+            ).fetchall()
+            self.assertEqual(len(stored_bindings), 3)
+            for row in stored_bindings:
+                self.assertEqual(json.loads(row[0])["requested_effort"], "default")
+                self.assertEqual(json.loads(row[0])["effective_effort"], "default")
+            live_row = self.con.execute(
+                "SELECT supported_efforts,source_fingerprint,harness_version FROM model_routes "
+                "WHERE harness=? AND selector=?", (harness, selector),
+            ).fetchone()
+            self.assertEqual(json.loads(live_row["supported_efforts"]), ["low"])
+            self.assertNotEqual(live_row["source_fingerprint"], captured["source_fingerprint"])
+            self.assertEqual(live_row["harness_version"], captured["harness_version"])
+
+            if harness == "codex":
+                native = FakeCodexRpc()
+                adapter = CodexAdapter(rpc=native)
+            elif harness == "claude":
+                native = FakeClaudeRunner()
+                adapter = ClaudeAdapter(runner=native, config_dir=self.root / "claude-config")
+            else:
+                sessions = self.root / "kimi-sessions"
+                native = FakeKimiRunner(sessions, context.worktree)
+                adapter = KimiAdapter(runner=native, sessions_root=sessions, identity_timeout=0.1)
+            context.env["KIMI_MODEL_THINKING_EFFORT"] = "default"
+            first = adapter.start(context, "first Sprint turn")
+            if harness == "claude":
+                transcript = adapter._session_path(first.session_ref, context.worktree)
+                transcript.parent.mkdir(parents=True, exist_ok=True)
+                transcript.write_text(json.dumps({
+                    "type": "system", "subtype": "init",
+                    "session_id": first.session_ref, "cwd": str(context.worktree),
+                }) + "\n")
+            resumed = adapter.resume(first.session_ref, context, "second Sprint turn")
+            self.assertEqual(resumed.session_ref, first.session_ref)
+            if harness == "codex":
+                turns = [params for method, params in native.requests if method == "turn/start"]
+                self.assertEqual(len(turns), 2)
+                for params in turns:
+                    self.assertNotIn("effort", params)
+                    self.assertNotIn('"default"', json.dumps(params))
+            else:
+                self.assertEqual(len(native.calls), 2)
+                for argv, _cwd, env in native.calls:
+                    self.assertNotIn("default", argv)
+                    if harness == "claude":
+                        self.assertNotIn("--effort", argv)
+                    else:
+                        self.assertNotIn("KIMI_MODEL_THINKING_EFFORT", tuple(env))
+
+    def test_claude_same_version_drift_to_default_on_start_and_resume(self) -> None:
+        self._assert_same_version_drift_default_dispatch("claude")
+
+    def test_codex_same_version_drift_to_default_on_start_and_resume(self) -> None:
+        self._assert_same_version_drift_default_dispatch("codex")
+
+    def test_kimi_same_version_drift_to_default_on_start_and_resume(self) -> None:
+        self._assert_same_version_drift_default_dispatch("kimi")
+
     def test_harness_default_survives_arm_queue_broker_and_launch(self) -> None:
         status, _scope = self._runtime("kimi")
         self.con.execute(

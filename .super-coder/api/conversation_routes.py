@@ -1469,6 +1469,7 @@ def _create_conversation(con, operator: dict, headers, body: dict):
         ):
             runtime_status = model_catalog.harness_runtime_status(harness)
             runtime_scope = model_catalog.harness_versions.runtime_scope()
+        evidence_observation = None
         try:
             if (
                 selected_model is not None
@@ -1482,7 +1483,7 @@ def _create_conversation(con, operator: dict, headers, body: dict):
                     "SELECT * FROM model_routes WHERE harness=? AND selector=?",
                     (harness, selected_model),
                 ).fetchone()
-                binding, binding_digest = route_bindings.resolve_persisted_v2(
+                binding, binding_digest, evidence_observation = route_bindings.observe_persisted_v2(
                     con,
                     dict(route) if route is not None else None,
                     harness,
@@ -1629,6 +1630,11 @@ def _create_conversation(con, operator: dict, headers, body: dict):
                 "another chat became active while the replacement was prepared; retry",
                 {"shell_id": shell_id},
             )
+        if evidence_observation is not None:
+            try:
+                route_bindings.persist_route_evidence(con, evidence_observation)
+            except route_bindings.RouteResolutionError as exc:
+                raise ApiError(422, exc.code, exc.message, exc.details) from exc
         con.execute(
             "INSERT INTO conversations "
             "(conversation_id,shell_id,owner_user_id,harness,provider,model,"

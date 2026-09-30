@@ -1970,6 +1970,86 @@ class ConversationResourceTest(ConversationApiCase):
         self.assertEqual(status, 201, reupload)
         self.assertTrue(Path(reupload["path"]).exists())
 
+    def test_browser_create_accepts_aged_stale_route_without_refresh(self) -> None:
+        with self.connect() as con:
+            con.execute(
+                "UPDATE model_routes SET stale=1,last_error='older than 7 days',"
+                "last_seen_at='2026-01-01T00:00:00+00:00'"
+            )
+            con.execute(
+                "UPDATE model_catalog_generations SET completed_at='2026-01-01T00:00:00+00:00'"
+            )
+        created = self.create(key="aged-stale-create")
+        self.assertEqual(created["route"]["effort"], "high")
+        with self.connect() as con:
+            self.assertEqual(tuple(con.execute(
+                "SELECT stale,last_error FROM model_routes WHERE harness='codex'"
+            ).fetchone()), (0, None))
+
+    def test_browser_dispatch_rejects_effort_removed_after_creation(self) -> None:
+        from conversation_adapters import AdapterError, CodexAdapter, ConversationContext
+        from route_bindings import digest_json
+        created = self.create(key="removed-effort-dispatch")
+        with self.connect() as con:
+            row = con.execute("SELECT * FROM conversations WHERE conversation_id=?",
+                              (created["conversation_id"],)).fetchone()
+            binding = json.loads(row["route_binding"])
+            context = ConversationContext(
+                worktree=Path(row["worktree"]), model=row["model"], effort=row["effort"],
+                route_binding=binding, binding_digest=digest_json(binding),
+            )
+        self.assertEqual(binding["requested_effort"], "high")
+        live = {**self.controlled_evidence("codex", binding["requested_model"]),
+                "advertised_options_by_model": {binding["requested_model"]: ["low"]}}
+        rpc = mock.Mock()
+        with mock.patch.object(conversation_routes.model_catalog, "controlled_route_evidence",
+                               return_value=live), self.assertRaises(AdapterError) as raised:
+            CodexAdapter(rpc=rpc).start(context, "do not dispatch high")
+        self.assertEqual(raised.exception.code, "route_unavailable")
+        rpc.request.assert_not_called()
+
+    def test_browser_registration_rollback_discards_live_evidence(self) -> None:
+        catalog = conversation_routes.model_catalog
+        with self.connect() as con:
+            before = dict(con.execute(
+                "SELECT * FROM model_routes WHERE harness='codex'"
+            ).fetchone())
+        status = self.runtime_status("codex")
+        entry = catalog._entry(
+            before["selector"], source="codex-cache", availability="available",
+            supported_efforts=["low"], cli_version=status["version"],
+        )
+        evidence = catalog._entry_evidence("codex", entry, status)
+        live = {**self.controlled_evidence("codex", before["selector"]),
+                "source_fingerprint": evidence["source_fingerprint"],
+                "route_evidence": evidence}
+
+        staged = []
+
+        def fail_registration(con, *_args):
+            staged.append((con.in_transaction, dict(con.execute(
+                "SELECT * FROM model_routes WHERE harness='codex'"
+            ).fetchone())))
+            raise RuntimeError("registration failed after evidence staging")
+
+        with mock.patch.object(catalog, "controlled_route_evidence", return_value=live), \
+             mock.patch.object(conversation_routes.active_chat_registry, "register",
+                               side_effect=fail_registration) as register:
+            code, _, result = self.request(
+                "POST", "/api/conversations", key="evidence-rollback",
+                body={"shell_id": 1, "harness": "codex", "effort": "low"},
+            )
+        register.assert_called_once()
+        self.assertEqual(code, 500, result)
+        self.assertTrue(staged[0][0])
+        self.assertEqual(staged[0][1]["source_fingerprint"], evidence["source_fingerprint"])
+        self.assertEqual(json.loads(staged[0][1]["supported_efforts"]), ["low"])
+        with self.connect() as con:
+            self.assertEqual(dict(con.execute(
+                "SELECT * FROM model_routes WHERE harness='codex'"
+            ).fetchone()), before)
+            self.assertEqual(con.execute("SELECT count(*) FROM conversations").fetchone()[0], 0)
+
     def test_controlled_replay_uses_stored_binding_after_catalogue_drift(self) -> None:
         first = self.create(key="controlled-replay")
         with self.connect() as con:

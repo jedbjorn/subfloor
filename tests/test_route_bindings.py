@@ -350,14 +350,12 @@ class BindingIdentityTest(unittest.TestCase):
         )
         self.assertNotEqual(digest, named_digest)
 
-        # Freshness, exact-model evidence, and transport gates are unchanged.
-        with self.assertRaises(route_bindings.RouteResolutionError) as raised:
-            resolve_controlled_v2(
-                {**row, "stale": 1, "last_error": "network down"},
-                "codex", "gpt-test", "default", now=self.NOW,
-                runtime_status=runtime,
-            )
-        self.assertEqual(raised.exception.code, "thinking_evidence_stale")
+        stale_binding, _ = resolve_controlled_v2(
+            {**row, "stale": 1, "last_error": "network down"},
+            "codex", "gpt-test", "default", now=self.NOW,
+            runtime_status=runtime,
+        )
+        self.assertEqual(stale_binding["requested_effort"], "default")
         with self.assertRaises(route_bindings.RouteResolutionError) as raised:
             resolve_controlled_v2(
                 row, "codex", "gpt-test", "high", now=self.NOW,
@@ -791,11 +789,11 @@ class BindingIdentityTest(unittest.TestCase):
                     )
                 self.assertEqual(raised.exception.code, "unsupported_thinking_level")
 
-    def test_stale_unsupported_and_source_drift_fail_with_distinct_codes(self):
+    def test_unavailable_unsupported_and_incomplete_source_have_distinct_codes(self):
         cases = (
-            ({"stale": 1}, "high", None, "thinking_evidence_stale"),
+            ({"stale": 1}, "high", None, "route_unavailable"),
             ({}, "medium", "2" * 64, "unsupported_thinking_level"),
-            ({}, "high", "9" * 64, "thinking_evidence_stale"),
+            ({}, "high", "9" * 64, "thinking_evidence_missing"),
         )
         for overrides, effort, fingerprint, code in cases:
             with self.subTest(code=code, overrides=overrides):
@@ -850,7 +848,7 @@ class BindingIdentityTest(unittest.TestCase):
                 self.controlled_row(), "codex", "gpt-test", now=self.NOW
             )
         collector.assert_called_once_with("codex", "gpt-test")
-        self.assertEqual(raised.exception.code, "thinking_evidence_stale")
+        self.assertEqual(raised.exception.code, "route_unavailable")
 
     def test_controlled_route_requires_exact_execution_runtime_evidence(self):
         scope = {"runtime": "sandbox", "runtime_identity": "sandbox:image-a"}
@@ -902,7 +900,9 @@ class BindingIdentityTest(unittest.TestCase):
                 )
             collector.assert_called_once_with("codex", "gpt-test")
             self.assertEqual(
-                raised.exception.code, "thinking_evidence_stale"
+                raised.exception.code,
+                "thinking_evidence_stale" if name == "version-drift"
+                else "thinking_evidence_missing"
             )
 
     def test_public_resolver_does_not_accept_caller_supplied_route_proof(self):
@@ -942,10 +942,10 @@ class BindingIdentityTest(unittest.TestCase):
             current_collector.call_args_list,
             [mock.call("codex", "gpt-test"), mock.call("codex", "gpt-test")],
         )
-        self.assertEqual(raised.exception.code, "thinking_evidence_stale")
+        self.assertEqual(raised.exception.code, "route_unavailable")
         self.assertIsNone(binding)
         self.assertIsNone(digest)
-        self.assertEqual(preview["code"], "thinking_evidence_stale")
+        self.assertEqual(preview["code"], "route_unavailable")
         self.assertNotIn("binding", preview)
         self.assertNotIn("binding_digest", preview)
         self.assertNotIn("command", preview)
@@ -1457,56 +1457,245 @@ class GenerationPersistenceTest(unittest.TestCase):
             )
         self.assertRegex(fingerprint, r"^[0-9a-f]{64}$")
 
-    def test_authoritative_resolution_durably_stales_drift_and_expiry(self):
-        cases = (
-            (
-                "fingerprint-drift",
-                datetime.now(timezone.utc).isoformat(),
-                "wrong-fingerprint",
-                "Installed route source changed after refresh",
-            ),
-            (
-                "age-expired",
-                (datetime.now(timezone.utc) - timedelta(days=7, hours=1)).isoformat(),
-                None,
-                "Route evidence is older than 7 days",
-            ),
-        )
-        for name, fetched_at, supplied_fingerprint, message in cases:
-            with self.subTest(name=name):
+    def test_authoritative_resolution_accepts_expired_and_previously_stale_rows(self):
+        now = datetime(2026, 9, 30, tzinfo=timezone.utc)
+        for stale in (0, 1):
+            with self.subTest(stale=stale):
                 con = route_schema()
                 self.addCleanup(con.close)
-                payload = self.payload(name)
-                payload["fetched_at"] = fetched_at
+                payload = self.payload("aged")
+                payload["fetched_at"] = (now - timedelta(days=8)).isoformat()
                 model_catalog.persist_routes(con, payload)
-                row = dict(con.execute(
-                    "SELECT * FROM model_routes WHERE selector=?", (name,)
-                ).fetchone())
-                fingerprint = supplied_fingerprint or row["source_fingerprint"]
-
+                con.execute(
+                    "UPDATE model_routes SET stale=?,last_error='older than 7 days'",
+                    (stale,),
+                )
+                con.commit()
+                row = dict(con.execute("SELECT * FROM model_routes").fetchone())
                 got = resolve_controlled(
-                    con, "Codex", name, fingerprint=fingerprint,
-                    now=datetime.now(timezone.utc),
+                    con, "codex", "aged", fingerprint=row["source_fingerprint"],
+                    now=now,
                 )
-                stored = con.execute(
-                    "SELECT stale,last_error FROM model_routes WHERE selector=?",
-                    (name,),
-                ).fetchone()
+                self.assertTrue(got["ok"], got)
+                self.assertEqual(tuple(con.execute(
+                    "SELECT stale,last_error FROM model_routes"
+                ).fetchone()), (0, None))
 
-                self.assertFalse(got["ok"])
+    def live_codex_resolution(self, selector, *, efforts=("low", "high"),
+                              version="0.145.0", scope=None, available=True,
+                              operation=None):
+        status = compatible_runtime(version, harness="codex", scope=scope)
+        entry = model_catalog._entry(
+            selector, source="codex-cache", availability="available",
+            provider="openai", provider_model="live-provider-model",
+            supported_efforts=list(efforts), default_effort=efforts[-1] if efforts else None,
+            cli_version=f"codex-cli {version}",
+        )
+        with (
+            mock.patch.object(model_catalog, "harness_runtime_status", return_value=status),
+            mock.patch.object(model_catalog.harness_versions, "runtime_scope", return_value={
+                key: status[key] for key in ("runtime", "runtime_identity")
+            }),
+            mock.patch.object(model_catalog, "_from_codex_cache",
+                              return_value=[entry] if available else []) as source,
+        ):
+            result = (operation() if operation else
+                      routes_cli.resolve(self.con, "codex", selector))
+        source.assert_called_once()
+        return result
+
+    def test_same_version_drift_binds_and_persists_live_evidence(self):
+        model_catalog.persist_routes(self.con, self.payload("drifting"))
+        before = dict(self.con.execute("SELECT * FROM model_routes").fetchone())
+        self.con.execute("UPDATE model_routes SET availability='advisory',headless_supported=0")
+        self.con.commit()
+        got = self.live_codex_resolution("drifting", efforts=("low",))
+        after = dict(self.con.execute("SELECT * FROM model_routes").fetchone())
+        self.assertTrue(got["ok"], got)
+        self.assertEqual(got["binding"]["requested_effort"], "default")
+        self.assertEqual(got["binding"]["provider_model"], "live-provider-model")
+        self.assertNotEqual(before["source_fingerprint"], after["source_fingerprint"])
+        self.assertEqual(after["generation_id"], before["generation_id"])
+        self.assertEqual(json.loads(after["supported_efforts"]), ["low"])
+        self.assertEqual(after["provider_model"], "live-provider-model")
+        self.assertEqual((after["availability"], after["headless_supported"]), ("available", 1))
+        self.assertEqual(json.loads(after["effort_metadata"])["runtime_scope"],
+                         harness_versions.runtime_scope())
+        selected = self.live_codex_resolution(
+            "drifting", efforts=("low",),
+            operation=lambda: routes_cli.resolve(self.con, "codex", "drifting", effort="low"),
+        )
+        self.assertEqual(selected["binding"]["evidence_digest"],
+                         json.loads(after["effort_metadata"])["digests"]["low"])
+        removed = self.live_codex_resolution(
+            "drifting", efforts=("low",),
+            operation=lambda: routes_cli.resolve(self.con, "codex", "drifting", effort="high"),
+        )
+        self.assertEqual(removed["code"], "unsupported_thinking_level")
+        missing = self.live_codex_resolution("drifting", available=False)
+        self.assertEqual(missing["code"], "route_unavailable")
+        self.assertEqual(self.con.execute("SELECT stale FROM model_routes").fetchone()[0], 0)
+
+    def test_only_version_or_captured_runtime_changes_stale_evidence(self):
+        for case in ("version", "runtime"):
+            with self.subTest(case=case):
+                payload = self.payload(case, status={
+                    **self.status(), **harness_versions.runtime_scope(), "harness": "codex",
+                })
+                model_catalog.persist_routes(self.con, payload)
+                if case == "runtime":
+                    # Pre-R9 rows retain execution identity in their generation.
+                    row = self.con.execute(
+                        "SELECT effort_metadata FROM model_routes WHERE selector=?", (case,)
+                    ).fetchone()
+                    metadata = json.loads(row[0])
+                    metadata.pop("runtime_scope")
+                    self.con.execute(
+                        "UPDATE model_routes SET effort_metadata=? WHERE selector=?",
+                        (json.dumps(metadata), case),
+                    )
+                    self.con.commit()
+                got = self.live_codex_resolution(
+                    case, version="0.146.0" if case == "version" else "0.145.0",
+                    scope={"runtime": "host", "runtime_identity": "host:other-seat"}
+                    if case == "runtime" else None,
+                )
                 self.assertEqual(got["code"], "thinking_evidence_stale")
-                self.assertEqual(stored["stale"], 1)
-                self.assertEqual(
-                    stored["last_error"],
-                    f"thinking_evidence_stale: {message}; "
-                    "remediation: sc models refresh",
+                self.assertEqual(got["details"]["remediation"], "sc models refresh")
+                row = self.con.execute("SELECT stale FROM model_routes WHERE selector=?", (case,)).fetchone()
+                self.assertEqual(row[0], 1)
+
+    def test_version_keyed_rules_apply_to_claude_codex_and_kimi(self):
+        fixtures = (
+            ("claude", "claude-cli", "_from_claude_cli", "2.1.222", "2.1.223"),
+            ("codex", "codex-cache", "_from_codex_cache", "0.145.0", "0.146.0"),
+            ("kimi", "kimi-config", "_from_kimi_config", "0.33.0", "0.33.1"),
+        )
+        scope = {"runtime": "host", "runtime_identity": "host:captured-seat"}
+        for harness, source_name, source_method, version, bumped in fixtures:
+            for case in ("aged-stale", "drift", "version", "runtime", "removed"):
+                with self.subTest(harness=harness, case=case):
+                    con = route_schema()
+                    self.addCleanup(con.close)
+                    status = compatible_runtime(version, harness=harness, scope=scope)
+                    entry = model_catalog._entry(
+                        "exact", source=source_name, availability="available",
+                        supported_efforts=["high"], cli_version=version,
+                    )
+                    model_catalog.persist_routes(con, {
+                        "v": model_catalog.PAYLOAD_VERSION,
+                        "fetched_at": "2026-01-01T00:00:00+00:00", "stale": False,
+                        "harnesses": {harness: {"models": [entry]}},
+                        "verification": {"runtime": "host", "harnesses": {harness: status}},
+                    })
+                    con.execute("UPDATE model_routes SET stale=1,last_error='age'")
+                    con.commit()
+                    live_scope = {**scope, "runtime_identity": "host:changed-seat"} if case == "runtime" else scope
+                    live_version = bumped if case == "version" else version
+                    live = {**entry, "cli_version": live_version}
+                    if case == "drift":
+                        live["supported_efforts"] = ["low"]
+                    with (
+                        mock.patch.object(model_catalog, "harness_runtime_status", return_value=
+                                          compatible_runtime(live_version, harness=harness, scope=live_scope)),
+                        mock.patch.object(harness_versions, "runtime_scope", return_value=live_scope),
+                        mock.patch.object(model_catalog, source_method,
+                                          return_value=[] if case == "removed" else [live]),
+                    ):
+                        got = routes_cli.resolve(con, harness, "exact")
+                    if case in {"version", "runtime"}:
+                        self.assertEqual(got["code"], "thinking_evidence_stale")
+                    elif case == "removed":
+                        self.assertEqual(got["code"], "route_unavailable")
+                    else:
+                        self.assertTrue(got["ok"], got)
+                        self.assertEqual(got["binding"]["requested_effort"],
+                                         "default" if case == "drift" else "high")
+                        self.assertEqual(con.execute("SELECT stale FROM model_routes").fetchone()[0], 0)
+                        if case == "drift":
+                            self.assertEqual(json.loads(con.execute(
+                                "SELECT supported_efforts FROM model_routes").fetchone()[0]), ["low"])
+
+    def test_configure_preview_uses_live_efforts_and_rejects_version_or_runtime_drift(self):
+        payload = self.payload("preview", status=compatible_runtime("0.145.0", harness="codex"))
+        payload["fetched_at"] = "2026-01-01T00:00:00+00:00"
+        model_catalog.persist_routes(self.con, payload)
+        self.con.execute("UPDATE model_routes SET stale=1,last_error='age'")
+        self.con.commit()
+        before = dict(self.con.execute("SELECT * FROM model_routes").fetchone())
+        for case in ("age-and-source", "version", "runtime", "removed"):
+            with self.subTest(case=case):
+                result = self.live_codex_resolution(
+                    "preview", efforts=("low",),
+                    version="0.146.0" if case == "version" else "0.145.0",
+                    scope={"runtime": "host", "runtime_identity": "host:other-seat"}
+                    if case == "runtime" else None,
+                    available=case != "removed",
+                    operation=lambda: api_server.model_route_previews(self.con, payload),
                 )
-                refused_again = resolve_controlled(
-                    con, "codex", name,
-                    fingerprint=row["source_fingerprint"],
+                route = result["harnesses"]["codex"]["models"][0]
+                if case == "age-and-source":
+                    self.assertEqual(route["supported_efforts"], ["low"])
+                    self.assertTrue(route["execution_evidence"]["accepted"])
+                else:
+                    self.assertFalse(route["execution_evidence"]["accepted"])
+                    self.assertEqual(route["supported_efforts"], [])
+                    self.assertEqual(route["execution_evidence"]["code"],
+                                     "route_unavailable" if case == "removed" else "thinking_evidence_stale")
+                after = dict(self.con.execute("SELECT * FROM model_routes").fetchone())
+                if case == "age-and-source":
+                    self.assertNotEqual(after["source_fingerprint"], before["source_fingerprint"])
+                    self.assertEqual(json.loads(after["supported_efforts"]), ["low"])
+                    self.assertEqual(after["stale"], 0)
+                    before = after
+                else:
+                    self.assertEqual(after, before)
+
+    def test_first_dispatch_accepts_same_version_drift_and_rejects_removed_effort(self):
+        model_catalog.persist_routes(self.con, self.payload("dispatch-live"))
+        resolved = self.live_codex_resolution("dispatch-live")
+        binding = resolved["binding"]
+        original_binding = route_bindings.canonical_json(binding)
+        row = dict(self.con.execute("SELECT * FROM model_routes").fetchone())
+        self.live_codex_resolution(
+            "dispatch-live", efforts=("high",),
+            operation=lambda: route_bindings.verify_stored_v2_before_first_turn(
+                self.con, binding, source_fingerprint=row["source_fingerprint"],
+                harness_version=row["harness_version"],
+            ),
+        )
+        for case in ("effort", "route", "runtime", "version"):
+            with self.subTest(case=case), self.assertRaises(route_bindings.RouteResolutionError) as raised:
+                self.live_codex_resolution(
+                    "dispatch-live", efforts=("low",) if case == "effort" else ("high",),
+                    available=case != "route", version="0.146.0" if case == "version" else "0.145.0",
+                    scope={"runtime": "host", "runtime_identity": "host:other-seat"}
+                    if case == "runtime" else None,
+                    operation=lambda: route_bindings.verify_stored_v2_before_first_turn(
+                        self.con, binding, source_fingerprint=row["source_fingerprint"],
+                        harness_version=row["harness_version"],
+                    ),
                 )
-                self.assertFalse(refused_again["ok"])
-                self.assertEqual(refused_again["code"], "thinking_evidence_stale")
+            self.assertEqual(raised.exception.code, "route_evidence_stale"
+                             if case in {"runtime", "version"} else "route_unavailable")
+        self.assertEqual(route_bindings.canonical_json(binding), original_binding)
+
+    def test_live_evidence_update_rolls_back_with_caller_transaction(self):
+        model_catalog.persist_routes(self.con, self.payload("rollback-live"))
+        row = dict(self.con.execute("SELECT * FROM model_routes").fetchone())
+        self.con.execute("INSERT INTO sprints VALUES (99,'prepared')")
+        projected = self.live_codex_resolution(
+            "rollback-live", efforts=("low",),
+            operation=lambda: route_bindings.require_fresh_route(
+                self.con, row, "codex", "rollback-live",
+            ),
+        )
+        self.assertEqual(json.loads(projected["supported_efforts"]), ["low"])
+        self.assertNotEqual(self.con.execute("SELECT source_fingerprint FROM model_routes").fetchone()[0],
+                            row["source_fingerprint"])
+        self.con.rollback()
+        self.assertEqual(self.con.execute("SELECT source_fingerprint FROM model_routes").fetchone()[0],
+                         row["source_fingerprint"])
 
     def test_authoritative_resolution_accepts_evidence_older_than_one_day(self):
         now = datetime.now(timezone.utc)
@@ -1560,7 +1749,7 @@ class GenerationPersistenceTest(unittest.TestCase):
             "WHERE selector='seat-bound'"
         ).fetchone()
 
-        self.assertEqual(got["code"], "thinking_evidence_stale")
+        self.assertEqual(got["code"], "thinking_evidence_missing")
         self.assertNotIn("binding", got)
         self.assertNotIn("binding_digest", got)
         self.assertNotIn("command", got)
@@ -1584,7 +1773,7 @@ class GenerationPersistenceTest(unittest.TestCase):
         )
         self.assertTrue(got["ok"])
 
-    def test_authoritative_resolution_requires_latest_successful_generation(self):
+    def test_authoritative_resolution_accepts_older_successful_generation(self):
         payload = self.payload("superseded")
         model_catalog.persist_routes(self.con, payload)
         row = dict(self.con.execute(
@@ -1609,14 +1798,10 @@ class GenerationPersistenceTest(unittest.TestCase):
             "SELECT stale,last_error FROM model_routes WHERE selector='superseded'"
         ).fetchone()
 
-        self.assertEqual(got["code"], "thinking_evidence_stale")
-        self.assertEqual(tuple(stored), (
-            1,
-            "thinking_evidence_stale: Route does not belong to the latest "
-            "successful generation; remediation: sc models refresh",
-        ))
+        self.assertTrue(got["ok"], got)
+        self.assertEqual(tuple(stored), (0, None))
 
-    def test_direct_resolve_retains_pre_probe_generation_identity(self):
+    def test_direct_resolve_checks_authoritative_version_after_concurrent_refresh(self):
         resolver, refresher = self.shared_connections()
         first = self.payload("generation-race")
         first["fetched_at"] = "2026-08-17T00:00:00+00:00"
@@ -1666,13 +1851,13 @@ class GenerationPersistenceTest(unittest.TestCase):
         self.assertEqual(got["code"], "thinking_evidence_stale")
         self.assertEqual(
             got["error"],
-            "Route evidence changed during resolution; retry",
+            "Installed harness version changed after refresh",
         )
         self.assertNotEqual(observed["generation_id"], stored["generation_id"])
         self.assertNotEqual(observed["source_fingerprint"],
                             stored["source_fingerprint"])
-        self.assertEqual(stored["stale"], 0)
-        self.assertIsNone(stored["last_error"])
+        self.assertEqual(stored["stale"], 1)
+        self.assertIn("Installed harness version changed", stored["last_error"])
         self.assertTrue(retried["ok"])
         self.assertEqual(
             retried["binding"]["catalogue_generation"],
@@ -2052,7 +2237,7 @@ class GenerationPersistenceTest(unittest.TestCase):
             mock.patch.object(
                 model_catalog, "controlled_route_evidence",
                 return_value=controlled_observation(
-                    "wrong-fingerprint"
+                    version="0.146.0"
                 ),
             ) as collector,
             self.assertRaises(route_bindings.RouteResolutionError) as raised,
@@ -2069,7 +2254,7 @@ class GenerationPersistenceTest(unittest.TestCase):
         self.assertEqual(staged["stale"], 1)
         self.assertEqual(
             staged["last_error"],
-            "thinking_evidence_stale: Installed route source changed after "
+            "thinking_evidence_stale: Installed harness version changed after "
             "refresh; remediation: sc models refresh",
         )
 

@@ -97,7 +97,11 @@ class ClaudeAdapter(ConversationAdapter):
                     "Claude adapter cannot apply a model",
                 )
             command.extend([model_flag, model])
-        if effort_value:
+        # Model default is a reserved binding value, not a native effort name.
+        if (
+            effort_value
+            and effort_value != route_transport.route_bindings.DEFAULT_EFFORT
+        ):
             effort = hcfg.get("effort") or {}
             if not effort.get("flag"):
                 raise AdapterError(

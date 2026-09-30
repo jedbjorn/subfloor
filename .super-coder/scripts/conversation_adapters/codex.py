@@ -301,7 +301,8 @@ class CodexAdapter(ConversationAdapter):
         }
         if model:
             params["model"] = model
-        if effort:
+        # Model default is a reserved binding value, not a native effort name.
+        if effort and effort != route_transport.route_bindings.DEFAULT_EFFORT:
             params["effort"] = effort
         if context.permission_mode == "unrestricted":
             params["approvalPolicy"] = "never"

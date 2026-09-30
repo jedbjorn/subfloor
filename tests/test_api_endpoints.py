@@ -1181,69 +1181,52 @@ class FlavorDefaultsTest(unittest.TestCase):
         self.assertNotEqual(self._row("planner", "claude")["model"],
                             "gpt-5.6-sol")
 
-    def test_stale_route_is_not_settable(self) -> None:
-        self._route("claude", "opus-next", stale=1)
+    def test_historical_stale_route_is_settable_without_refresh(self) -> None:
+        self._route("claude", "opus-next", stale=1,
+                    seen_at="2026-01-01T00:00:00+00:00")
         ok, err = server.set_flavor_default(
-            self.con, {"flavor": "planner", "harness": "claude",
-                       "model": "opus-next"})
-        self.assertFalse(ok)
-        self.assertEqual(err["code"], "thinking_evidence_stale")
+            self.con, {"flavor": "planner", "harness": "claude", "model": "opus-next"})
+        self.assertTrue(ok, err)
+        self.assertEqual(self._row("planner", "claude")["model"], "opus-next")
+        self.assertTrue(server.model_route_available(self.con, "claude", "opus-next"))
 
-    def test_fingerprint_drift_stales_route_and_refuses_selection(self) -> None:
+    def test_same_version_drift_saves_live_effort_and_persists_evidence(self) -> None:
         self._route("codex", "gpt-drift")
-        with mock.patch.object(
-            server.model_catalog, "controlled_route_evidence",
-            return_value=controlled_bundle(
-                "codex", "gpt-drift", "changed-fingerprint"
-            ),
-        ):
+        status = controlled_bundle("codex", "gpt-drift", "f" * 64)["runtime_status"]
+        entry = server.model_catalog._entry(
+            "gpt-drift", source="codex-cache", availability="available",
+            supported_efforts=["low"], provider_model="live-model",
+            cli_version="codex-cli 0.145.0",
+        )
+        evidence = server.model_catalog._entry_evidence("codex", entry, status)
+        observation = {
+            **controlled_bundle("codex", "gpt-drift", evidence["source_fingerprint"]),
+            "route_evidence": {**evidence, "provider_model": "live-model"},
+            "advertised_options_by_model": {"gpt-drift": ["low"]},
+        }
+        with mock.patch.object(server.model_catalog, "controlled_route_evidence",
+                               return_value=observation):
             ok, err = server.set_flavor_default(
-                self.con,
-                {"flavor": "planner", "harness": "codex", "model": "gpt-drift"},
-            )
-
+                self.con, {"flavor": "planner", "harness": "codex", "model": "gpt-drift"})
+            self.assertTrue(ok, err)
+            self.assertEqual(self._row("planner", "codex")["effort"], "default")
+            ok, err = server.set_flavor_default(
+                self.con, {"flavor": "planner", "harness": "codex",
+                           "model": "gpt-drift", "effort": "high"})
+            self.assertFalse(ok)
+            self.assertEqual(err["code"], "unsupported_thinking_level")
         route = self.con.execute(
-            "SELECT stale,last_error FROM model_routes "
-            "WHERE harness='codex' AND selector='gpt-drift'"
+            "SELECT supported_efforts,provider_model,source_fingerprint,stale,last_error "
+            "FROM model_routes WHERE selector='gpt-drift'"
         ).fetchone()
-        self.assertFalse(ok)
-        self.assertEqual(err["code"], "thinking_evidence_stale")
-        self.assertEqual(route["stale"], 1)
-        self.assertEqual(
-            route["last_error"],
-            "thinking_evidence_stale: Installed route source changed after "
-            "refresh; remediation: sc models refresh",
-        )
-        self.assertFalse(server.model_route_available(
-            self.con, "codex", "gpt-drift"
-        ))
-        self.assertNotEqual(self._row("planner", "codex")["model"], "gpt-drift")
+        self.assertEqual(tuple(route), ('["low"]', "live-model", evidence["source_fingerprint"], 0, None))
 
-    def test_age_expiry_stales_route_and_refuses_selection(self) -> None:
-        old = (datetime.now(timezone.utc) - timedelta(days=7, hours=1)).isoformat()
-        self._route("claude", "old-opus", seen_at=old)
-
+    def test_age_expiry_does_not_refuse_flavor_selection(self) -> None:
+        self._route("claude", "old-opus", seen_at="2026-01-01T00:00:00+00:00")
         ok, err = server.set_flavor_default(
-            self.con,
-            {"flavor": "planner", "harness": "claude", "model": "old-opus"},
-        )
-
-        route = self.con.execute(
-            "SELECT stale,last_error FROM model_routes "
-            "WHERE harness='claude' AND selector='old-opus'"
-        ).fetchone()
-        self.assertFalse(ok)
-        self.assertEqual(err["code"], "thinking_evidence_stale")
-        self.assertEqual(route["stale"], 1)
-        self.assertEqual(
-            route["last_error"],
-            "thinking_evidence_stale: Route evidence is older than 7 days; "
-            "remediation: sc models refresh",
-        )
-        self.assertFalse(server.model_route_available(
-            self.con, "claude", "old-opus"
-        ))
-        self.assertNotEqual(self._row("planner", "claude")["model"], "old-opus")
+            self.con, {"flavor": "planner", "harness": "claude", "model": "old-opus"})
+        self.assertTrue(ok, err)
+        self.assertEqual(self._row("planner", "claude")["model"], "old-opus")
 
     def test_unknown_names_and_empty_writes_are_loud(self) -> None:
         self.assertFalse(server.set_flavor_default(
@@ -1534,6 +1517,82 @@ class AuthenticatedCliCatalogueRouteTest(unittest.TestCase):
         self.assertIs(catalogue.call_args.kwargs["connection_factory"], opened)
         self.assertNotIn("con", catalogue.call_args.kwargs)
 
+    def test_models_api_resolves_execution_evidence_after_catalogue_discovery(self) -> None:
+        entry = server.model_catalog._entry(
+            "api-model", source="codex-cache", availability="available",
+            supported_efforts=["high"], cli_version="codex-cli 0.145.0",
+        )
+        payload = {
+            "v": server.model_catalog.PAYLOAD_VERSION,
+            "fetched_at": "2026-01-01T00:00:00+00:00",
+            "stale": False,
+            "harnesses": {"codex": {"models": [entry]}},
+            "verification": {"runtime": "host", "harnesses": {
+                "codex": compatible_runtime("0.145.0", harness="codex"),
+            }},
+        }
+        with self.connect() as con:
+            server.model_catalog.persist_routes(con, payload)
+            con.execute("UPDATE model_routes SET stale=1,last_error='aged evidence'")
+        cached = {**payload, "stale": True}
+        for path, version in (
+            ("/api/models", "0.145.0"),
+            ("/api/models?refresh=1", "0.145.0"),
+            ("/api/models", "0.146.0"),
+        ):
+            with self.subTest(path=path, version=version):
+                connections = []
+
+                def connect():
+                    connection = self.connect()
+                    connections.append(connection)
+                    return connection
+
+                def catalog(**kwargs):
+                    self.assertEqual(connections, [])
+                    self.assertIs(kwargs["connection_factory"], opened)
+                    self.assertNotIn("con", kwargs)
+                    self.assertEqual(kwargs["refresh"], "refresh=1" in path)
+                    return cached
+
+                live = {**entry, "supported_efforts": ["low"],
+                        "cli_version": f"codex-cli {version}"}
+                with (
+                    mock.patch.object(server, "db", side_effect=connect) as opened,
+                    mock.patch.object(server.model_catalog, "catalog", side_effect=catalog)
+                    as catalogue,
+                    mock.patch.object(server.model_catalog, "harness_runtime_status",
+                                      return_value=compatible_runtime(version, harness="codex")),
+                    mock.patch.object(server.model_catalog, "_from_codex_cache",
+                                      return_value=[live]),
+                ):
+                    status, _headers, raw = server.dispatch_http(
+                        "GET", path, "Host: 127.0.0.1", b""
+                    )
+                body = json.loads(raw)
+                self.assertEqual(status, 200, body)
+                catalogue.assert_called_once()
+                self.assertEqual(len(connections), 1)
+                with self.assertRaises(sqlite3.ProgrammingError):
+                    connections[0].execute("SELECT 1")
+                route = body["harnesses"]["codex"]["models"][0]
+                if version == "0.145.0":
+                    self.assertTrue(route["execution_evidence"]["accepted"])
+                    self.assertEqual(route["supported_efforts"], ["low"])
+                    with self.connect() as con:
+                        stored = con.execute(
+                            "SELECT supported_efforts,stale FROM model_routes "
+                            "WHERE harness='codex' AND selector='api-model'"
+                        ).fetchone()
+                    self.assertEqual(json.loads(stored["supported_efforts"]), ["low"])
+                    self.assertEqual(stored["stale"], 0)
+                else:
+                    self.assertFalse(route["execution_evidence"]["accepted"])
+                    self.assertEqual(route["execution_evidence"]["code"],
+                                     "thinking_evidence_stale")
+                    self.assertEqual(route["supported_efforts"], [])
+                self.assertEqual(entry["supported_efforts"], ["high"])
+
     def test_model_routes_require_shell_auth_and_apply_exact_filters(self) -> None:
         self.assertEqual(self.request("/_sc/model-routes", None)[0], 401)
         self.assertEqual(self.request("/_sc/model-routes", "wrong")[0], 401)
@@ -1787,27 +1846,30 @@ class AuthenticatedCliCatalogueRouteTest(unittest.TestCase):
             ).fetchone()
 
         self.assertEqual(exit_code, 2)
-        self.assertEqual(result["code"], "thinking_evidence_stale")
+        self.assertEqual(result["code"], "thinking_evidence_missing")
         self.assertNotIn("binding", result)
         self.assertNotIn("binding_digest", result)
         self.assertNotIn("command", result)
         self.assertEqual(tuple(stored), (0, None))
 
-    def test_flavor_route_check_retains_pre_probe_identity(self) -> None:
+    def test_flavor_route_check_accepts_same_version_generation_publication(self) -> None:
         con = self.connect()
         self.addCleanup(con.close)
-        before = con.execute(
-            "SELECT model FROM flavor_defaults "
-            "WHERE flavor='planner' AND harness='codex'"
-        ).fetchone()[0]
-        successor = None
 
         def publish_after_probe(*_args, **_kwargs):
-            nonlocal successor
-            successor = self.publish_successor()
-            return controlled_bundle(
-                "codex", "api-model", "current-fingerprint"
-            )
+            self.publish_successor()
+            evidence = dict(con.execute(
+                "SELECT * FROM model_routes WHERE selector='api-model'"
+            ).fetchone())
+            evidence["source_fingerprint"] = "current-fingerprint"
+            for field in ("effort_metadata", "supported_efforts"):
+                evidence[field] = json.loads(evidence[field])
+            return {
+                **controlled_bundle("codex", "api-model", "current-fingerprint"),
+                "route_evidence": {key: evidence[key] for key in (
+                    "source_fingerprint", "effort_metadata", "supported_efforts",
+                )},
+            }
 
         with (
             mock.patch.object(
@@ -1823,20 +1885,19 @@ class AuthenticatedCliCatalogueRouteTest(unittest.TestCase):
             "SELECT generation_id,source_fingerprint,stale,last_error "
             "FROM model_routes WHERE harness='codex' AND selector='api-model'"
         ).fetchone()
-        unchanged = con.execute(
+        selected_after_publication = con.execute(
             "SELECT model FROM flavor_defaults "
             "WHERE flavor='planner' AND harness='codex'"
         ).fetchone()[0]
-        self.assertFalse(ok)
-        self.assertEqual(err["code"], "thinking_evidence_stale")
-        self.assertEqual(tuple(stored), ("f" * 32, successor, 0, None))
-        self.assertEqual(unchanged, before)
+        self.assertTrue(ok, err)
+        self.assertEqual(tuple(stored), ("f" * 32, "current-fingerprint", 0, None))
+        self.assertEqual(selected_after_publication, "api-model")
 
         with (
             mock.patch.object(
                 server.model_catalog, "controlled_route_evidence",
                 return_value=controlled_bundle(
-                    "codex", "api-model", successor
+                    "codex", "api-model", "current-fingerprint"
                 ),
             ),
         ):

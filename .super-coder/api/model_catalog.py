@@ -793,6 +793,12 @@ def _entry_evidence(harness: str, entry: dict,
             effort: binding_adapter_metadata(effort) for effort in metadata_efforts
         },
     }
+    if harness in route_bindings.VERSION_KEYED_HARNESSES:
+        effort_metadata["runtime_scope"] = {
+            key: (status or {}).get(key)
+            for key in ("runtime", "runtime_identity")
+            if (status or {}).get(key) is not None
+        }
     return {
         "evidence_kind": _evidence_kind(harness, source),
         "evidence_digest": route_bindings.digest_json({
@@ -1324,6 +1330,7 @@ def controlled_route_evidence(
     entries: list[dict]
     status: dict = {}
     fingerprint = None
+    route_evidence = None
     try:
         if harness_probe is None:
             status = harness_runtime_status(harness)
@@ -1363,7 +1370,7 @@ def controlled_route_evidence(
                 ]
         else:
             entries = []
-    except Exception:  # noqa: BLE001 (unreadable live evidence is stale)
+    except Exception:  # noqa: BLE001 (unreadable live routes are unavailable)
         entries = []
     entry = next((item for item in entries if item["id"] == selector), None)
     route_advertised = bool(
@@ -1373,9 +1380,18 @@ def controlled_route_evidence(
     )
     if route_advertised:
         assert entry is not None
-        fingerprint = _entry_evidence(
-            harness, entry, status
-        )["source_fingerprint"]
+        evidence = _entry_evidence(harness, entry, status)
+        fingerprint = evidence["source_fingerprint"]
+        route_evidence = {
+            **evidence,
+            **{key: entry.get(key) for key in (
+                "provider", "provider_model", "source", "cli_version",
+                "default_effort",
+            )},
+            "availability": "available",
+            "headless_supported": 1,
+            "high_effort_supported": int("high" in evidence["supported_efforts"]),
+        }
     advertised_options_by_model = None
     if route_advertised:
         assert entry is not None
@@ -1394,6 +1410,7 @@ def controlled_route_evidence(
         "runtime_status": status,
         "runtime_scope": scope,
         "source_fingerprint": fingerprint,
+        "route_evidence": route_evidence,
         "advertised_options_by_model": advertised_options_by_model,
     }
 

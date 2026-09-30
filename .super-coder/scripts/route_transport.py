@@ -185,4 +185,5 @@ def context_projection(
             "Stored effort does not match the immutable route binding",
             {"harness": harness},
         )
+    route_bindings.require_advertised_route_before_dispatch(dict(binding))
     return projection

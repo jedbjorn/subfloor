@@ -1356,7 +1356,7 @@ class RouteCliConnectionTest(unittest.TestCase):
                     self.assertIsNone(result["binding"]["native_option_id"])
                 else:
                     self.assertEqual(exit_code, 2)
-                    self.assertEqual(result["code"], "thinking_evidence_stale")
+                    self.assertEqual(result["code"], "thinking_evidence_missing")
                     self.assertNotIn("binding", result)
                     self.assertNotIn("binding_digest", result)
                     self.assertNotIn("command", result)
@@ -1377,7 +1377,9 @@ class RouteCliConnectionTest(unittest.TestCase):
                     "codex", codex, status=status, fingerprint="3" * 64,
                 )
                 self.assertEqual(exit_code, 2)
-                self.assertEqual(result["code"], "thinking_evidence_stale")
+                self.assertEqual(result["code"], "thinking_evidence_stale"
+                                 if name == "container-version-mismatch"
+                                 else "thinking_evidence_missing")
                 self.assertNotIn("binding", result)
                 self.assertNotIn("binding_digest", result)
                 self.assertNotIn("command", result)

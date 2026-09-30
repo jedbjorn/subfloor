@@ -205,6 +205,7 @@ class ParticipantBindingCandidate:
     source_fingerprint: str | None
     harness_version: str | None
     harness_support_state: str | None
+    evidence_observation: route_bindings.RouteEvidenceObservation | None = None
 
 
 @dataclass(frozen=True)
@@ -295,6 +296,7 @@ def _participant_binding_candidate(
     runtime_status = None
     runtime_scope = None
     evidence_snapshot = None
+    evidence_observation = None
     source_fingerprint = None
     harness_support_state = None
     if model is None or harness == "vibe":
@@ -323,7 +325,7 @@ def _participant_binding_candidate(
             (harness, model),
         ).fetchone()
         evidence_dict = dict(evidence) if evidence is not None else None
-        binding, binding_digest = route_bindings.resolve_persisted_v2(
+        binding, binding_digest, evidence_observation = route_bindings.observe_persisted_v2(
             con,
             evidence_dict,
             harness,
@@ -332,6 +334,7 @@ def _participant_binding_candidate(
         )
         if evidence_dict is not None:
             evidence_snapshot = _route_evidence_snapshot(evidence_dict)
+            evidence_dict = evidence_observation.accepted_row
             source_fingerprint = evidence_dict.get("source_fingerprint")
             harness_version = evidence_dict.get("harness_version")
             harness_support_state = evidence_dict.get("harness_support_state")
@@ -347,6 +350,7 @@ def _participant_binding_candidate(
         source_fingerprint=source_fingerprint,
         harness_version=harness_version,
         harness_support_state=harness_support_state,
+        evidence_observation=evidence_observation,
     )
 
 
@@ -902,18 +906,6 @@ class SprintLifecycleStore:
                     code=exc.code,
                     details=exc.details,
                 ) from exc
-        controlled_generations = {
-            candidate.binding["catalogue_generation"]
-            for candidate in candidates
-            if candidate.binding["control_state"] == "controlled"
-            and candidate.binding["catalogue_generation"] is not None
-        }
-        if len(controlled_generations) > 1:
-            raise SprintPreflightError(
-                "controlled participant routes do not share one catalogue generation",
-                code="thinking_evidence_stale",
-                details={"catalogue_generations": sorted(controlled_generations)},
-            )
         for harness in dict.fromkeys(
             candidate.binding["harness"] for candidate in candidates
         ):
@@ -991,6 +983,8 @@ class SprintLifecycleStore:
         store = route_bindings.ParticipantRouteBindingStore(self.con)
         receipts = []
         for candidate in candidates:
+            if candidate.evidence_observation is not None:
+                route_bindings.persist_route_evidence(self.con, candidate.evidence_observation)
             receipt = store.bind(
                 candidate.participant_id,
                 candidate.binding,
@@ -3899,6 +3893,8 @@ class SprintParticipantStore:
                             "participant route evidence changed during reroute "
                             "preflight; retry reroute"
                         )
+                if candidate.evidence_observation is not None:
+                    route_bindings.persist_route_evidence(self.con, candidate.evidence_observation)
                 binding_receipt = route_bindings.ParticipantRouteBindingStore(
                     self.con
                 ).bind(

@@ -805,7 +805,8 @@ def get_flavor_defaults(con) -> dict:
                 supported = []
             effective_effort = (
                 "high"
-                if route.get("generation_id") == latest_generation_id
+                if (harness in route_bindings.VERSION_KEYED_HARNESSES
+                    or route.get("generation_id") == latest_generation_id)
                 and "high" in supported
                 else None
             )
@@ -829,14 +830,69 @@ def get_flavor_defaults(con) -> dict:
     }
 
 
+def model_route_previews(con, catalog: dict) -> dict:
+    """Project Configure choices through canonical execution-seat resolution."""
+    result = {**catalog, "harnesses": dict(catalog.get("harnesses") or {})}
+    observations = []
+    for harness in route_bindings.VERSION_KEYED_HARNESSES:
+        block = result["harnesses"].get(harness)
+        if block is None:
+            continue
+        models = []
+        with model_catalog.harness_versions.probe_observation(harness):
+            for model in block.get("models") or []:
+                preview = {**model}
+                row = con.execute(
+                    "SELECT * FROM model_routes WHERE harness=? AND selector=?",
+                    (harness, model["id"]),
+                ).fetchone()
+                try:
+                    _, _, observation = route_bindings.observe_persisted_v2(
+                        con, dict(row) if row is not None else None,
+                        harness, model["id"],
+                    )
+                except route_bindings.RouteResolutionError as exc:
+                    preview["execution_evidence"] = {
+                        "accepted": False, "code": exc.code,
+                        "message": exc.message, "details": exc.details,
+                    }
+                    preview["supported_efforts"] = []
+                else:
+                    observations.append((preview, observation))
+                    accepted = observation.accepted_row
+                    preview.update({
+                        "availability": accepted["availability"],
+                        "supported_efforts": json.loads(accepted["supported_efforts"]),
+                        "harness_version": accepted["harness_version"],
+                        "harness_support_state": accepted["harness_support_state"],
+                        "execution_evidence": {"accepted": True},
+                    })
+                models.append(preview)
+        result["harnesses"][harness] = {**block, "models": models}
+    if observations:
+        with db_driver.write_transaction(con, "model_route.preview"):
+            for preview, observation in observations:
+                try:
+                    route_bindings.persist_route_evidence(con, observation)
+                except route_bindings.RouteResolutionError as exc:
+                    preview["execution_evidence"] = {
+                        "accepted": False, "code": exc.code,
+                        "message": exc.message, "details": exc.details,
+                    }
+                    preview["supported_efforts"] = []
+    return result
+
+
 def _model_route_available_in_transaction(
     con, observed_route: dict | None, harness: str, selector: str,
     route_proof,
 ) -> bool:
     if (
         observed_route is None
-        or observed_route["availability"] != "available"
-        or observed_route["stale"]
+        or (observed_route["availability"] != "available"
+            and harness not in route_bindings.VERSION_KEYED_HARNESSES)
+        or (observed_route["stale"]
+            and harness not in route_bindings.VERSION_KEYED_HARNESSES)
     ):
         return False
     if harness == "vibe":
@@ -1019,7 +1075,8 @@ def set_flavor_default(con, body) -> tuple[bool, dict | None]:
             and (model_supplied or effort_supplied)
         ):
             if observed_route is None or (
-                    observed_route.get("availability") != "available"):
+                    harness not in route_bindings.VERSION_KEYED_HARNESSES
+                    and observed_route.get("availability") != "available"):
                 return False, _flavor_default_error(
                     "invalid_model_route",
                     f"{model!r} is not an exact currently available route "
@@ -5385,9 +5442,19 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/models":
             q = parse_qs(urlparse(self.path).query)
             try:
-                return self._send(200, model_catalog.catalog(
+                catalog = model_catalog.catalog(
                     refresh=q.get("refresh", ["0"])[0] in ("1", "true"),
-                    connection_factory=db))
+                    connection_factory=db)
+                if any(
+                    (catalog.get("harnesses", {}).get(harness) or {}).get("models")
+                    for harness in route_bindings.VERSION_KEYED_HARNESSES
+                ):
+                    con = db()
+                    try:
+                        catalog = model_route_previews(con, catalog)
+                    finally:
+                        con.close()
+                return self._send(200, catalog)
             except Exception as e:
                 return self._fail(e)
         con = db()
@@ -5714,6 +5781,7 @@ class Handler(BaseHTTPRequestHandler):
                     "unsupported_thinking_level",
                     "thinking_evidence_missing",
                     "thinking_evidence_stale",
+                    "route_unavailable",
                 } else 400
                 return self._send(status, {"error": err})
             if path == "/api/analytics/sweep":
