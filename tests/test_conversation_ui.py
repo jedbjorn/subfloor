@@ -41,6 +41,193 @@ def run_js(script: str) -> dict:
     return json.loads(proc.stdout.strip().splitlines()[-1])
 
 
+@pytest.mark.skipif(shutil.which("node") is None, reason="node is required")
+@pytest.mark.parametrize("phase", ["headers", "body"])
+def test_chat_reads_timeout_cancel_and_retry_without_timing_out_mutations(phase):
+    helpers = APP[APP.index("async function chatApi("):
+                  APP.index("// The API refuses request bodies")]
+    script = helpers + r"""
+const phase = PHASE;
+const timers = new Map();
+let timerId = 0;
+globalThis.setTimeout = (callback, delay) => {
+  if (delay !== CHAT_READ_TIMEOUT_MS) throw new Error("unexpected timer");
+  timers.set(++timerId, callback);
+  return timerId;
+};
+globalThis.clearTimeout = (id) => timers.delete(id);
+const requests = [];
+let stall = true;
+globalThis.fetch = async (url, options) => {
+  requests.push({url, method: options.method, cancellable: !!options.signal});
+  const pending = () => new Promise((resolve, reject) => {
+    const abort = () => reject(new DOMException("aborted", "AbortError"));
+    if (options.signal.aborted) abort();
+    else options.signal.addEventListener("abort", abort, {once: true});
+  });
+  if (stall && phase === "headers") return pending();
+  return {ok: true, json: () => stall ? pending() : Promise.resolve({items: []})};
+};
+(async () => {
+  const controller = new AbortController();
+  const timeout = chatRead("/conversations/fixture/transcript", controller.signal);
+  await new Promise(setImmediate);
+  [...timers.values()][0]();
+  let timeoutCode;
+  try { await timeout; } catch (error) { timeoutCode = error.code; }
+  const afterTimeout = timers.size;
+  const cancelled = chatRead("/conversations/fixture/transcript", controller.signal);
+  await new Promise(setImmediate);
+  controller.abort();
+  let cancelName;
+  try { await cancelled; } catch (error) { cancelName = error.name; }
+  const afterCancel = timers.size;
+  let preCancelled;
+  try { await chatRead("/conversations/fixture/transcript", controller.signal); }
+  catch (error) { preCancelled = error.name; }
+  stall = false;
+  const retry = await chatRead("/conversations/fixture/transcript", new AbortController().signal);
+  const mutation = await chatApi("/conversations/fixture/messages", "POST", {text: "send"}, "key");
+  console.log(JSON.stringify({
+    timeoutCode, afterTimeout, cancelName, afterCancel, preCancelled,
+    retry, mutation, remainingTimers: timers.size, requests,
+  }));
+})().catch((error) => { console.error(error); process.exitCode = 1; });
+"""
+    result = run_js(script.replace("PHASE", json.dumps(phase)))
+    assert result == {
+        "timeoutCode": "READ_TIMEOUT",
+        "afterTimeout": 0,
+        "cancelName": "AbortError",
+        "afterCancel": 0,
+        "preCancelled": "AbortError",
+        "retry": {"items": []},
+        "mutation": {"items": []},
+        "remainingTimers": 0,
+        "requests": [
+            {"url": "/api/conversations/fixture/transcript", "method": "GET",
+             "cancellable": True}
+        ] * 4 + [
+            {"url": "/api/conversations/fixture/messages", "method": "POST",
+             "cancellable": False}
+        ],
+    }
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node is required")
+@pytest.mark.parametrize("cancel_availability", [False, True])
+def test_transcript_paints_before_availability_and_keeps_safe_retry_controls(cancel_availability):
+    state_helpers = APP[APP.index("function chatTranscriptPageItems"):
+                        APP.index("function chatTranscriptEvictPage")]
+    availability = APP[APP.index("function chatHarnessUnavailableReason"):
+                       APP.index("function chatStartedLabel")]
+    render_open = APP[APP.index("async function chatRenderOpen"):
+                      APP.index("async function renderInterface")]
+    stop_reads = APP[APP.index("function chatStopReads"):
+                     APP.index("function chatStopHistoryPoll")]
+    load_start = APP.index("  const loadTranscript = async () => {")
+    load_transcript = APP[load_start:APP.index("  await loadTranscript();", load_start)]
+    script = r"""
+class Element {
+  constructor(tag, props) {
+    Object.assign(this, {tag, children: [], hidden: false}, props);
+    this.classList = {toggle() {}, add() {}, remove() {}};
+  }
+  append(...children) { this.children.push(...children); }
+  replaceChildren(...children) { this.children = children; }
+  insertBefore(child, next) { this.children.splice(this.children.indexOf(next), 0, child); }
+  setAttribute() {}
+}
+const el = (tag, props, ...children) => {
+  const node = new Element(tag, props); node.append(...children); return node;
+};
+const all = (node) => node instanceof Element
+  ? [node, ...node.children.flatMap(all)] : [];
+const host = el("section", {}), pane = host;
+const readController = new AbortController(), readSignal = readController.signal;
+let chatReadController = readController;
+const generation = 1, selectedId = "cv_fixture";
+let chatRenderGeneration = 1, chatRouteMode = "chat", chatModeController = null;
+const CHAT_MODES = ["chat", "diff"];
+const document = {body: el("body", {})};
+const frames = [];
+const requestAnimationFrame = (callback) => { frames.push(callback); return frames.length; };
+const cancelAnimationFrame = () => {};
+const flush = () => { while (frames.length) frames.shift()(); };
+const chatReviewWorkspace = () => ({setMode() {}});
+const chatQueuedCount = () => 0;
+const chatStartedLabel = () => "started";
+const chatHeaderLabel = () => "header";
+const chatConversationName = () => "fixture";
+const chatTranscriptAtBottom = () => true;
+const chatFlushTranscript = (node, state) => {
+  node.textContent = [...state.items.values()].map((item) => item.text).join("\n");
+};
+const streams = [];
+const chatOpenStream = (id) => streams.push(id);
+const refreshWakeIndicators = () => {};
+const conversation = {conversation_id: selectedId, route: {harness: "codex"},
+  shell: {shortname: "dev", display_name: "Dev"}};
+const snapshot = {conversation_id: selectedId, projection_version: 3, through_sequence: 10,
+  controls: {conversation_state: "running", conversation_version: 1, active_run_id: null},
+  items: [{item_id: "message:1", kind: "user", message_id: 1, text: "long chat content"}]};
+const requests = [], checks = [];
+let failTranscript = true;
+const chatRead = (path) => {
+  requests.push(path);
+  if (path.endsWith("/transcript")) {
+    if (failTranscript) return Promise.reject(new Error("Loading took too long. Please retry."));
+    return Promise.resolve(snapshot);
+  }
+  if (path !== "/flavor-defaults") throw new Error("unexpected read " + path);
+  return new Promise((resolve, reject) => checks.push({resolve, reject}));
+};
+""" + state_helpers + availability + stop_reads + render_open + load_transcript + r"""
+(async () => {
+  await loadTranscript();
+  const retry = all(host).find((node) => node.textContent === "Retry");
+  if (!retry || streams.length) throw new Error("missing safe transcript Retry");
+  failTranscript = false;
+  await retry.onclick();
+  flush();
+  const transcript = all(host).find((node) => node.className === "chat-transcript");
+  const send = all(host).find((node) => node.textContent === "Send");
+  const stop = all(host).find((node) => node.className === "act danger chat-stop");
+  const whilePending = {text: transcript.textContent, sendDisabled: send.disabled,
+    stopDisabled: stop.disabled, streams: [...streams]};
+  if (CANCEL_AVAILABILITY) {
+    chatStopReads();
+    checks[0].resolve({harness_status: {codex: {installed: true, enabled: true,
+      healthy: true, surfaces: {browser: true}}}});
+    await new Promise(setImmediate);
+    console.log(JSON.stringify({whilePending, sendDisabled: send.disabled, requests}));
+    return;
+  }
+  checks[0].reject(new Error("availability timed out"));
+  await new Promise(setImmediate);
+  const availabilityRetry = all(host).find((node) => node.textContent === "Retry availability check");
+  const failed = {sendDisabled: send.disabled, retryHidden: availabilityRetry.hidden};
+  const retryCheck = availabilityRetry.onclick();
+  checks[1].resolve({harness_status: {codex: {installed: true, enabled: true,
+    healthy: true, surfaces: {browser: true}}}});
+  await retryCheck;
+  console.log(JSON.stringify({whilePending, failed, sendDisabled: send.disabled,
+    retryHidden: availabilityRetry.hidden, requests}));
+})().catch((error) => { console.error(error); process.exitCode = 1; });
+"""
+    result = run_js(script.replace("CANCEL_AVAILABILITY", json.dumps(cancel_availability)))
+    expected = {
+        "whilePending": {"text": "long chat content", "sendDisabled": True,
+                         "stopDisabled": False, "streams": ["cv_fixture"]},
+        "sendDisabled": cancel_availability,
+        "requests": ["/conversations/cv_fixture/transcript"] * 2 + ["/flavor-defaults"],
+    }
+    if not cancel_availability:
+        expected.update(failed={"sendDisabled": True, "retryHidden": False}, retryHidden=True)
+        expected["requests"].append("/flavor-defaults")
+    assert result == expected
+
+
 def test_interface_is_a_first_class_reload_safe_view():
     assert '<button data-tab="interface">Chats</button>' in INDEX
     assert 'id="view-interface"' in INDEX
@@ -644,8 +831,9 @@ def test_retained_unavailable_harness_keeps_controls_but_not_composer():
         interface.index("async function chatRenderOpen"):
         interface.index("async function renderInterface")
     ]
-    assert 'api("/flavor-defaults").catch(() => null)' in interface
-    assert 'api("/models").catch(() => null)' in interface
+    assert 'chatRead("/flavor-defaults", readSignal)' in open_chat
+    assert "Checking harness availability…" in open_chat
+    assert "Retry availability check" in open_chat
     assert "history remains readable" not in open_chat
     assert "unavailable.textContent = unavailableReason || \"\"" in open_chat
     assert "composer.disabled = Boolean(unavailableReason)" in open_chat
@@ -1257,8 +1445,8 @@ def test_interface_arrival_defers_configuration_and_phases_history_requests():
     open_chat = interface[interface.index("const loadTranscript = async"):
                           interface.index("await loadTranscript()")]
 
-    assert 'api("/models").catch(() => null)' in open_chat
-    assert 'api("/flavor-defaults").catch(() => null)' in open_chat
+    assert "/models" not in open_chat
+    assert "/flavor-defaults" not in open_chat
     assert 'api("/flavor-defaults")' in loader
     assert 'api("/models")' in loader
     assert "if (chatConfigurationPromise) return chatConfigurationPromise" in loader

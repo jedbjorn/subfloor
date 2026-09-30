@@ -100,7 +100,7 @@ function requestKey() {
     || `${Date.now()}-${Math.random().toString(16).slice(2)}`;
 }
 
-async function chatApi(path, method = "GET", body, idempotencyKey) {
+async function chatApi(path, method = "GET", body, idempotencyKey, signal) {
   // A Blob (a dropped file) travels as raw bytes; everything else is JSON.
   const raw = body instanceof Blob;
   const headers = body === undefined || raw ? {} : { "Content-Type": "application/json" };
@@ -108,16 +108,20 @@ async function chatApi(path, method = "GET", body, idempotencyKey) {
   let response;
   try {
     response = await fetch("/api" + path, {
-      method, headers,
+      method, headers, signal,
       body: body === undefined || raw ? body : JSON.stringify(body),
     });
   } catch (cause) {
+    if (signal?.aborted) throw cause;
     const error = new Error("The conversation service could not be reached.");
     error.code = "NETWORK_ERROR";
     error.cause = cause;
     throw error;
   }
-  const data = await response.json().catch(() => ({}));
+  const data = await response.json().catch((cause) => {
+    if (signal?.aborted) throw cause;
+    return {};
+  });
   if (!response.ok) {
     const detail = data.error || {};
     const error = new Error(detail.message || response.statusText);
@@ -127,6 +131,31 @@ async function chatApi(path, method = "GET", body, idempotencyKey) {
     throw error;
   }
   return data;
+}
+
+// Bound reads only: a timed-out mutation may already have reached the server.
+const CHAT_READ_TIMEOUT_MS = 30_000;
+async function chatRead(path, signal) {
+  const request = new AbortController();
+  const cancel = () => request.abort();
+  signal?.addEventListener("abort", cancel, { once: true });
+  if (signal?.aborted) cancel();
+  let timedOut = false;
+  const timer = setTimeout(() => {
+    timedOut = true;
+    request.abort();
+  }, CHAT_READ_TIMEOUT_MS);
+  try {
+    return await chatApi(path, "GET", undefined, undefined, request.signal);
+  } catch (cause) {
+    if (!timedOut || signal?.aborted) throw cause;
+    const error = new Error("Loading took too long. Please retry.");
+    error.code = "READ_TIMEOUT";
+    throw error;
+  } finally {
+    clearTimeout(timer);
+    signal?.removeEventListener("abort", cancel);
+  }
 }
 
 // The API refuses request bodies over 8 MiB; only an image above that is
@@ -3288,6 +3317,7 @@ let chatRouteShell = "";
 let chatRouteConversation = "";
 let chatRouteMode = "chat";
 let chatSource = null;
+let chatReadController = null;
 let chatHistoryPollTimer = null;
 let chatRenderGeneration = 0;
 let chatPendingSend = null;
@@ -3323,6 +3353,12 @@ function chatLoadConfiguration() {
 function chatStopStream() {
   if (chatSource) chatSource.close();
   chatSource = null;
+}
+
+function chatStopReads() {
+  chatReadController?.abort();
+  chatReadController = null;
+  chatRenderGeneration += 1;
 }
 
 function chatStopHistoryPoll() {
@@ -5153,10 +5189,13 @@ function chatFlushTranscript(
 }
 
 async function chatRenderOpen(
-  host, initialConversation, initialSnapshot, harnessStatus = null,
-  modelCatalog = null, onWakeDelivered = null,
+  host, initialConversation, initialSnapshot, readSignal,
+  onWakeDelivered = null,
 ) {
   const generation = chatRenderGeneration;
+  let harnessStatus = null;
+  let availabilityPending = true;
+  let availabilityError = null;
   let conversation = initialConversation;
   let transcriptState = chatCreateTranscriptState(initialSnapshot);
   let messages = [...transcriptState.items.values()]
@@ -5257,8 +5296,14 @@ async function chatRenderOpen(
     className: "chat-harness-unavailable",
     hidden: true,
   });
+  const availabilityRetry = el("button", {
+    className: "act",
+    type: "button",
+    textContent: "Retry availability check",
+    hidden: true,
+  });
   const composerRow = el("div", { className: "chat-composer" },
-    unavailable, composer,
+    unavailable, availabilityRetry, composer,
     el("div", { className: "chat-compose-actions" }, pending, send, stop));
   const reviewWorkspace = chatReviewWorkspace(reviewHost, conversation);
   const updateStreamStatus = () => {
@@ -5287,16 +5332,17 @@ async function chatRenderOpen(
     pageState.olderError = null;
     scheduleTranscript();
     try {
-      const snapshot = await chatApi(
+      const snapshot = await chatRead(
         `/conversations/${conversation.conversation_id}/transcript`
           + `?cursor=${encodeURIComponent(cursor)}`,
+        readSignal,
       );
-      if (generation !== chatRenderGeneration
+      if (readSignal.aborted || generation !== chatRenderGeneration
           || transcriptState !== pageState
           || pageState.olderCursor !== cursor) return;
       chatMergeOlderTranscriptPage(pageState, snapshot);
     } catch (error) {
-      if (generation === chatRenderGeneration
+      if (!readSignal.aborted && generation === chatRenderGeneration
           && transcriptState === pageState
           && pageState.olderCursor === cursor)
         pageState.olderError = error;
@@ -5304,7 +5350,7 @@ async function chatRenderOpen(
       if (generation === chatRenderGeneration
           && transcriptState === pageState)
         pageState.olderLoading = false;
-      scheduleTranscript();
+      if (!readSignal.aborted) scheduleTranscript();
     }
   }
   const flushTranscript = () => chatFlushTranscript(
@@ -5318,6 +5364,7 @@ async function chatRenderOpen(
     updateTranscriptFollow,
   );
   const scheduleTranscript = () => {
+    if (readSignal.aborted || generation !== chatRenderGeneration) return;
     if (currentMode !== "chat") {
       transcriptState.hiddenDirty = true;
       return;
@@ -5325,6 +5372,7 @@ async function chatRenderOpen(
     if (transcriptState.frame !== null) return;
     transcriptState.frame = requestAnimationFrame(() => {
       transcriptState.frame = null;
+      if (readSignal.aborted || generation !== chatRenderGeneration) return;
       transcriptState.hiddenDirty = false;
       flushTranscript();
     });
@@ -5354,18 +5402,20 @@ async function chatRenderOpen(
     if (manual) reconcileFailures = 0;
     if (reconcilePromise || (!manual && reconcileFailures >= 2))
       return reconcilePromise;
-    const request = chatApi(
+    const request = chatRead(
       `/conversations/${conversation.conversation_id}/transcript`,
+      readSignal,
     );
     reconcilePromise = request;
     try {
       const snapshot = await request;
-      if (generation !== chatRenderGeneration) return;
+      if (readSignal.aborted || generation !== chatRenderGeneration) return;
       installSnapshot(snapshot);
       reconcileFailures = 0;
       transcriptState.reconcileError = null;
       paint();
     } catch (error) {
+      if (readSignal.aborted || generation !== chatRenderGeneration) return;
       reconcileFailures += 1;
       transcriptState.reconcileError = error;
       transcriptState.fullBuild = true;
@@ -5440,11 +5490,15 @@ async function chatRenderOpen(
     // owned only for that window. Reopen is scope-blocked server-side forever.
     const sprintManaged = Boolean(conversation.sprint_managed);
     const reopenable = closed && !sprintScoped;
-    const unavailableReason = chatOpenHarnessUnavailableReason(
-      conversation, harnessStatus,
-    );
+    const unavailableReason = availabilityPending
+      ? "Checking harness availability…"
+      : availabilityError ? "Harness availability could not be checked."
+      : chatOpenHarnessUnavailableReason(conversation, harnessStatus);
     unavailable.hidden = !unavailableReason;
     unavailable.textContent = unavailableReason || "";
+    availabilityRetry.hidden = !availabilityError;
+    availabilityRetry.disabled = availabilityPending;
+    availabilityRetry.title = availabilityError?.message || "";
     composer.disabled = Boolean(unavailableReason)
       || closing || (closed && !reopenable);
     send.disabled = Boolean(unavailableReason)
@@ -5473,6 +5527,24 @@ async function chatRenderOpen(
       : "Message this shell…";
     scheduleTranscript();
   };
+  const checkHarnessAvailability = async () => {
+    availabilityPending = true;
+    availabilityError = null;
+    paint();
+    try {
+      const defaults = await chatRead("/flavor-defaults", readSignal);
+      if (readSignal.aborted || generation !== chatRenderGeneration) return;
+      harnessStatus = defaults.harness_status?.[conversation.route?.harness];
+      if (!harnessStatus)
+        throw new Error("Harness availability could not be confirmed.");
+    } catch (error) {
+      if (readSignal.aborted || generation !== chatRenderGeneration) return;
+      availabilityError = error;
+    }
+    availabilityPending = false;
+    paint();
+  };
+  availabilityRetry.onclick = checkHarnessAvailability;
   const refresh = () => chatRefreshConversation(
     conversation.conversation_id,
     generation,
@@ -5885,9 +5957,14 @@ async function chatRenderOpen(
       updateStreamStatus();
     },
   );
+  checkHarnessAvailability();
 }
 
 async function renderInterface(root) {
+  chatStopReads();
+  const readController = new AbortController();
+  chatReadController = readController;
+  const readSignal = readController.signal;
   chatStopStream();
   chatStopHistoryPoll();
   chatStopReview();
@@ -6412,22 +6489,18 @@ async function renderInterface(root) {
     pane.replaceChildren(
       el("div", { className: "chat-loading" }, "Loading transcript…"));
     try {
-      const [snapshot, defaults, catalog] = await Promise.all([
-        chatApi(`/conversations/${selectedId}/transcript`),
-        api("/flavor-defaults").catch(() => null),
-        api("/models").catch(() => null),
-      ]);
-      if (generation !== chatRenderGeneration) return;
+      const snapshot = await chatRead(
+        `/conversations/${selectedId}/transcript`, readSignal);
+      if (readSignal.aborted || generation !== chatRenderGeneration) return;
       await chatRenderOpen(
         pane,
         conversation,
         snapshot,
-        defaults?.harness_status?.[conversation.route?.harness] || null,
-        catalog,
+        readSignal,
         refreshWakeIndicators,
       );
     } catch (error) {
-      if (generation !== chatRenderGeneration) return;
+      if (readSignal.aborted || generation !== chatRenderGeneration) return;
       const retry = el("button", {
         className: "act",
         type: "button",
@@ -7498,6 +7571,7 @@ function show(tab) {
   for (const k of Object.keys(VIEWS)) $(VIEWS[k][0]).hidden = k !== tab;
   document.body.classList.toggle("interface-view", tab === "interface");
   if (tab !== "interface") {
+    chatStopReads();
     chatStopStream();
     chatStopHistoryPoll();
     chatStopReview();

@@ -3819,6 +3819,37 @@ class ConversationPerformanceFixtureTest(ConversationApiCase):
             ],
         )
 
+    def test_transcript_run_probes_seek_instead_of_scanning_other_chats(self) -> None:
+        with closing(self.connect()) as con:
+            conversation_id = self.seed_conversation(con, number=710, state="closed")
+            self.seed_transcript(
+                con, conversation_id=conversation_id, turns=20, deltas_per_turn=10,
+            )
+            con.commit()
+            original = conversation_routes._transcript_projection(
+                con, conversation_id, owner_user_id=1,
+            )
+            other = self.seed_conversation(con, number=711, state="closed")
+            self.seed_transcript(
+                con, conversation_id=other, turns=5, deltas_per_turn=2000,
+            )
+            con.commit()
+            statements = []
+            con.set_trace_callback(statements.append)
+            projected = conversation_routes._transcript_projection(
+                con, conversation_id, owner_user_id=1,
+            )
+            con.set_trace_callback(None)
+            self.assertEqual(projected, original)
+            run_query = next(q for q in statements if q.startswith("SELECT r.run_id"))
+            plan = [row[3] for row in con.execute("EXPLAIN QUERY PLAN " + run_query)]
+            for alias in ("evidence_count", "boundary"):
+                self.assertTrue(any(
+                    f"SEARCH {alias} USING COVERING INDEX "
+                    "idx_conversation_events_run_type_sequence" in detail
+                    for detail in plan
+                ), plan)
+
     def test_snapshot_projection_uses_one_fixed_five_read_view(self) -> None:
         with closing(self.connect()) as con:
             conversation_id = self.seed_conversation(

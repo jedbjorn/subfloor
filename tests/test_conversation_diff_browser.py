@@ -1293,7 +1293,7 @@ def test_chat_performance_uses_bounded_requests_and_keyed_frames(static_ui):
         assert sorted(
             path for path, _query in requests
             if path in {"/api/models", "/api/flavor-defaults"}
-        ) == ["/api/flavor-defaults", "/api/models"]
+        ) == ["/api/flavor-defaults"]
         assert sum(
             path.endswith("/transcript") for path, _query in requests
         ) == 1
