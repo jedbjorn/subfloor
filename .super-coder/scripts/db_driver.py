@@ -13,6 +13,7 @@ import sqlite3
 import time
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -28,6 +29,28 @@ SLOW_WRITE_WAIT_MS = 250.0
 SLOW_WRITE_HOLD_MS = 100.0
 
 _LOG = logging.getLogger("super_coder.db")
+
+
+@dataclass
+class ConnectionTiming:
+    clock: Callable[[], float]
+    milliseconds: float = 0.0
+
+
+_CONNECTION_TIMING: ContextVar[ConnectionTiming | None] = ContextVar(
+    "engine_connection_timing", default=None
+)
+
+
+@contextmanager
+def connection_timing(clock: Callable[[], float] = time.perf_counter):
+    """Accumulate connection opening time in this request's executor context."""
+    timing = ConnectionTiming(clock)
+    token = _CONNECTION_TIMING.set(timing)
+    try:
+        yield timing
+    finally:
+        _CONNECTION_TIMING.reset(token)
 
 
 def engine_database_path(engine: Path) -> Path:
@@ -132,6 +155,17 @@ def _enable_wal(
 
 def connect(path):
     """Open the engine SQLite DB at `path` with the standard PRAGMAs."""
+    timing = _CONNECTION_TIMING.get()
+    if timing is None:
+        return _connect(path)
+    started = timing.clock()
+    try:
+        return _connect(path)
+    finally:
+        timing.milliseconds += (timing.clock() - started) * 1000
+
+
+def _connect(path):
     con = sqlite3.connect(str(path), timeout=DEFAULT_BUSY_TIMEOUT_MS / 1000)
     try:
         con.row_factory = sqlite3.Row
