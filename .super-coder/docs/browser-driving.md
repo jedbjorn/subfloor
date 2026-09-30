@@ -70,7 +70,12 @@ No globally installed Node packages or browser state are changed.
   observed. Setup alone does not mean the extension has approved a connection.
 
 Connection status is an observation, not a heartbeat. The next request detects
-a disconnect. Doctor never opens Chromium or approves a connection, and returns
+a reported disconnect. Once a successful tool call establishes the observation,
+ordinary action errors (such as locator timeouts or invalid arguments) preserve
+it and the approved session; the action still records an error in the audit.
+Reported extension loss, protocol rejection, HTTP failure, or transport loss
+clears the observation. A new backend session needs its own successful tool call.
+Doctor never opens Chromium or approves a connection, and returns
 nonzero until end-to-end readiness has been observed. An extension directory or Preferences registration
 proves installation evidence exists, not that Chrome has enabled the extension.
 
