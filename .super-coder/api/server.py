@@ -85,6 +85,7 @@ import skill as skill_mod  # noqa: E402  (planner-owned fork-local catalogue)
 sys.path.insert(0, str(ENGINE / "api"))
 import conversation_routes  # noqa: E402  (Feature #24 browser conversations)
 import log_lines  # noqa: E402  (UTC line stamps for server.log)
+import request_timing  # noqa: E402  (process-local buffered request diagnostics)
 import review_routes  # noqa: E402  (Feature #26 browser Diff review)
 import map_db  # noqa: E402  (read-only handle to the dr_* catalogue in map.db)
 import ports as ports_mod  # noqa: E402
@@ -6187,6 +6188,8 @@ def dispatch_http(method: str, path: str, headers_raw: str,
     (status, [(header, value)], body bytes). Focused retained routes go to
     their own modules; everything else runs through the shimmed Handler."""
     parsed = urlparse(path)
+    if parsed.path == "/api/diagnostics/request-timing":
+        return request_timing.handle(method, headers_raw)
     if (
         parsed.path.startswith("/api/review-targets/")
         or parsed.path.startswith("/api/review-observations/")

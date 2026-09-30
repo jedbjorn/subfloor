@@ -31,6 +31,12 @@ browsers and fetch() transparently open the next).
 from __future__ import annotations
 
 import asyncio
+import sys
+import threading
+import time
+
+import db_driver
+import request_timing
 
 MAX_HEAD = 65536
 MAX_BODY = 8 * 1024 * 1024
@@ -69,14 +75,27 @@ async def _read_head(reader: asyncio.StreamReader):
 
 class Transport:
     def __init__(self, host: str, port: int, http_handler, ws_handler,
-                 log=print, stream_handler=None):
+                 log=print, stream_handler=None, *, recorder=None,
+                 clock=time.perf_counter):
         self.host = host
         self.port = port
         self.http_handler = http_handler
         self.ws_handler = ws_handler
         self.stream_handler = stream_handler
         self._log = log
+        self._log_lock = threading.Lock()
+        self.recorder = recorder if recorder is not None else request_timing.RECORDER
+        self._clock = clock
         self._tcp: asyncio.AbstractServer | None = None
+
+    def _write_log(self, message: str) -> None:
+        with self._log_lock:
+            # The shared writer must separate this record from a fragment
+            # left by an ordinary print on the same executor worker.
+            if self._log is print and hasattr(sys.stdout, "write_record"):
+                sys.stdout.write_record(message)
+            else:
+                self._log(message)
 
     async def start(self) -> None:
         self._tcp = await asyncio.start_server(
@@ -118,7 +137,7 @@ class Transport:
         except (ConnectionError, asyncio.IncompleteReadError):
             pass
         except Exception as exc:  # noqa: BLE001 — one bad connection must not kill the server
-            self._log(f"transport: connection error: {exc!r}")
+            self._write_log(f"transport: connection error: {exc!r}")
             try:
                 writer.close()
             except Exception:
@@ -165,19 +184,45 @@ class Transport:
             if not chunk:
                 break
             body += chunk
+        ready = self._clock()
         loop = asyncio.get_running_loop()
-        try:
-            status, resp_headers, resp_body = await loop.run_in_executor(
-                None, self.http_handler, method, path, headers_raw, body)
-        except Exception as exc:  # noqa: BLE001 — defense in depth; handlers catch their own
-            self._log(f"transport: handler error {method} {path}: {exc!r}")
-            status = 500
-            resp_headers = [("Content-Type", "application/json")]
-            resp_body = (
-                b'{"error":{"code":"INTERNAL_ERROR",'
-                b'"message":"request handler failed","details":{}}}'
-            )
+        status, resp_headers, resp_body = await loop.run_in_executor(
+            None, self._timed_handler, method, path, headers_raw, body, ready)
         await self._respond(writer, status, resp_headers, resp_body)
+
+    def _timed_handler(self, method, path, headers_raw, body, ready):
+        started = self._clock()
+        with db_driver.connection_timing(self._clock) as db:
+            try:
+                status, headers, response = self.http_handler(
+                    method, path, headers_raw, body)
+            except Exception:  # noqa: BLE001 — defense in depth
+                # Request paths and exception text may contain credentials.
+                self._write_log("transport: buffered handler failed")
+                status = 500
+                headers = [("Content-Type", "application/json")]
+                response = (
+                    b'{"error":{"code":"INTERNAL_ERROR",'
+                    b'"message":"request handler failed","details":{}}}'
+                )
+            finished = self._clock()
+        queue = (started - ready) * 1000
+        app = (finished - started) * 1000
+        normalized = request_timing.route_template(method, path)
+        template = self.recorder.record(normalized, queue, app)
+        headers = [(key, value) for key, value in headers
+                   if key.lower() != "server-timing"]
+        headers.append((
+            "Server-Timing",
+            f"queue;dur={queue:.3f}, app;dur={app:.3f}, db;dur={db.milliseconds:.3f}",
+        ))
+        if queue + app >= 500:
+            self._write_log(
+                f"request timing method={normalized.split(' ', 1)[0]} "
+                f"template={template} status={status} queue_ms={queue:.3f} "
+                f"app_ms={app:.3f} db_ms={db.milliseconds:.3f}"
+            )
+        return status, headers, response
 
     async def _respond(self, writer, status: int,
                        headers: list, body: bytes) -> None:
