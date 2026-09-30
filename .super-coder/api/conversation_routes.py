@@ -2444,7 +2444,8 @@ def _transcript_projection(
             "WITH ranked AS ("
             " SELECT message_id,body,state,created_at,completed_at,"
             "ROW_NUMBER() OVER (ORDER BY message_id DESC) AS source_rank,"
-            "COUNT(*) OVER() AS total_messages,"
+            "COUNT(*) OVER (ORDER BY message_id DESC ROWS BETWEEN "
+            "UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) AS total_messages,"
             "SUM(length(CAST(body AS BLOB))) OVER ("
             " ORDER BY message_id DESC ROWS UNBOUNDED PRECEDING"
             ") AS message_source_bytes "
@@ -2452,10 +2453,11 @@ def _transcript_projection(
             " WHERE conversation_id=? AND message_kind='prompt'"
             + message_boundary
             + ") SELECT * FROM ranked WHERE source_rank<=? "
-            "AND (message_source_bytes<=? OR source_rank=1) "
-            "ORDER BY message_id",
+            "AND (message_source_bytes<=? OR source_rank=1)",
             (*message_params, limits.max_turns, limits.max_source_bytes),
         ).fetchall()
+        # Keep the windows in index order; sort only the bounded prompt page.
+        message_rows.sort(key=lambda row: int(row["message_id"]))
         total_messages = (
             int(message_rows[0]["total_messages"]) if message_rows else 0
         )
@@ -3162,11 +3164,11 @@ def _event_batch(conversation_id: str, after: int) -> list[dict]:
             for row in con.execute(
                 "SELECT harness_session_ref FROM conversations "
                 "WHERE conversation_id=? AND harness_session_ref IS NOT NULL "
-                "UNION SELECT harness_session_before FROM conversation_runs "
+                "UNION ALL SELECT harness_session_before FROM conversation_runs "
                 "WHERE conversation_id=? AND harness_session_before IS NOT NULL "
-                "UNION SELECT harness_session_after FROM conversation_runs "
+                "UNION ALL SELECT harness_session_after FROM conversation_runs "
                 "WHERE conversation_id=? AND harness_session_after IS NOT NULL "
-                "UNION SELECT runner_ref FROM conversation_runs "
+                "UNION ALL SELECT runner_ref FROM conversation_runs "
                 "WHERE conversation_id=? AND runner_ref IS NOT NULL",
                 (conversation_id,) * 4,
             )
