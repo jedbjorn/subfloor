@@ -2935,6 +2935,216 @@ class ConversationResourceTest(ConversationApiCase):
 
 
 class ConversationPerformanceFixtureTest(ConversationApiCase):
+    def seed_index_fixture(self, con):
+        conversation_id = self.seed_conversation(con, number=720)
+        message_ids, sequence = self.seed_transcript(
+            con, conversation_id=conversation_id, turns=45, deltas_per_turn=10,
+        )
+        other = self.seed_conversation(con, number=721)
+        self.seed_transcript(
+            con, conversation_id=other, turns=5, deltas_per_turn=2000,
+        )
+        con.commit()
+        return conversation_id, message_ids, sequence
+
+    def assert_index_plan(self, con, statement, indexes):
+        details = [row[3] for row in con.execute(
+            "EXPLAIN QUERY PLAN " + statement,
+        )]
+        self.assertFalse(any("USE TEMP B-TREE" in detail for detail in details), details)
+        for table, index in indexes.items():
+            self.assertFalse(any(
+                detail.split()[:2] == ["SCAN", table] for detail in details
+            ), details)
+            self.assertTrue(any(
+                detail.startswith(f"SEARCH {table} USING ") and index in detail
+                for detail in details
+            ), details)
+        return details
+
+    def test_close_and_reopen_probes_seek_by_conversation_and_event_type(self) -> None:
+        with closing(self.connect()) as con:
+            conversation_id, _, sequence = self.seed_index_fixture(con)
+            con.execute(
+                "UPDATE conversations SET state='idle',closed_at=NULL "
+                "WHERE conversation_id=?", (conversation_id,),
+            )
+            # Cover no request, a request outscoped by reopen, and a fresh request.
+            for event_types, expected in (
+                ((), None),
+                (("conversation.close.requested", "conversation.reopened"), None),
+                (("conversation.close.requested",), "2026-07-30 15:00:00"),
+            ):
+                with self.subTest(event_types=event_types):
+                    for event_type in event_types:
+                        sequence += 1
+                        con.execute(
+                            "INSERT INTO conversation_events "
+                            "(conversation_id,sequence,event_type,payload,created_at) "
+                            "VALUES (?,?,?,'{}','2026-07-30 15:00:00')",
+                            (conversation_id, sequence, event_type),
+                        )
+                    con.commit()
+                    statements = []
+                    con.set_trace_callback(statements.append)
+                    row = conversation_routes._conversation_row(con, conversation_id, 1)
+                    _, _, page = decoded(conversation_routes._list_conversations(
+                        con, {"user_id": 1}, {"shell_id": ["1"], "open": ["true"]},
+                    ))
+                    con.set_trace_callback(None)
+                    self.assertEqual(row["close_requested_at"], expected)
+                    self.assertEqual(page["items"][0]["close_requested_at"], expected)
+                    self.assertEqual(len(statements), 2)
+                    for statement in statements:
+                        details = self.assert_index_plan(con, statement, {
+                            alias: "idx_conversation_events_conversation_type_sequence"
+                            for alias in ("requested", "reopened")
+                        })
+                        for alias in ("requested", "reopened"):
+                            self.assertTrue(any(
+                                detail.startswith(f"SEARCH {alias} ")
+                                and "conversation_id=? AND event_type=?" in detail
+                                for detail in details
+                            ), details)
+
+    def test_message_pages_seek_in_message_id_order(self) -> None:
+        with closing(self.connect()) as con:
+            conversation_id, message_ids, _ = self.seed_index_fixture(con)
+            cursor = None
+            for expected in (message_ids[:2], message_ids[2:4]):
+                query = {"limit": ["2"]}
+                if cursor:
+                    query["cursor"] = [cursor]
+                statements = []
+                con.set_trace_callback(statements.append)
+                _, _, page = decoded(conversation_routes._list_messages(
+                    con, {"user_id": 1}, conversation_id, query,
+                ))
+                con.set_trace_callback(None)
+                self.assertEqual([item["message_id"] for item in page["items"]], expected)
+                self.assert_index_plan(con, next(
+                    q for q in statements if q.startswith("SELECT message_id,")
+                ), {"conversation_messages": "idx_conversation_messages_conversation_message"})
+                cursor = page["next_cursor"]
+
+    def test_transcript_prompt_windows_share_message_page_index_without_sorts(self) -> None:
+        with closing(self.connect()) as con:
+            conversation_id, message_ids, _ = self.seed_index_fixture(con)
+            con.execute(
+                "INSERT INTO conversation_messages "
+                "(conversation_id,sender_kind,sender_ref,message_kind,body,"
+                "idempotency_key,request_hash,state,completed_at) "
+                "VALUES (?,'engine','fixture','notice','not a prompt',"
+                "'notice','notice','completed',datetime('now'))", (conversation_id,),
+            )
+            con.commit()
+            cursor = None
+            for expected in (message_ids[25:], message_ids[5:25], message_ids[:5]):
+                statements = []
+                con.set_trace_callback(statements.append)
+                page = conversation_routes._transcript_projection(
+                    con, conversation_id, owner_user_id=1, cursor=cursor,
+                )
+                con.set_trace_callback(None)
+                self.assertEqual([
+                    item["message_id"] for item in page["items"] if item["kind"] == "user"
+                ], expected)
+                self.assert_index_plan(con, next(
+                    q for q in statements if q.startswith("WITH ranked AS ( SELECT message_id,")
+                ), {"conversation_messages": "idx_conversation_messages_conversation_message"})
+                cursor = page["older_cursor"]
+            self.assertIsNone(cursor)
+
+    def test_accepted_queue_receipt_seeks_earliest_sequence_without_sort(self) -> None:
+        with closing(self.connect()) as con:
+            conversation_id, message_ids, sequence = self.seed_index_fixture(con)
+            con.execute(
+                "INSERT INTO conversation_events "
+                "(conversation_id,sequence,event_type,payload,message_id) "
+                "VALUES (?,?,'message.accepted','{\"queue_position\":99}',?)",
+                (conversation_id, sequence + 1, message_ids[0]),
+            )
+            con.commit()
+            statements = []
+            con.set_trace_callback(statements.append)
+            position = conversation_routes._accepted_queue_position(con, message_ids[0])
+            con.set_trace_callback(None)
+            self.assertEqual(position, 0)  # The original receipt predates position 99.
+            self.assertEqual(len(statements), 1)
+            self.assert_index_plan(con, statements[0], {
+                "conversation_events": "idx_conversation_events_message_type_sequence",
+            })
+
+    def test_stream_secrets_seek_runs_without_sort_and_preserve_redaction(self) -> None:
+        with closing(self.connect()) as con:
+            conversation_id, _, sequence = self.seed_index_fixture(con)
+            con.execute(
+                "UPDATE conversations SET harness_session_ref='native-before' "
+                "WHERE conversation_id=?", (conversation_id,),
+            )
+            con.execute(
+                "UPDATE conversation_runs SET harness_session_before='native-before',"
+                "harness_session_after='native-after',runner_ref='native-runner' "
+                "WHERE conversation_id=?", (conversation_id,),
+            )
+            con.execute(
+                "UPDATE conversation_runs SET runner_ref='other-runner' "
+                "WHERE conversation_id!=?", (conversation_id,),
+            )
+            con.execute(
+                "INSERT INTO conversation_events "
+                "(conversation_id,sequence,event_type,payload) VALUES "
+                "(?,?,'run.unknown',?)",
+                (conversation_id, sequence + 1, json.dumps({
+                    "detail": "native-before native-after native-runner other-runner",
+                })),
+            )
+            con.commit()
+        statements = []
+        reader = self.connect()
+        reader.set_trace_callback(statements.append)
+        with mock.patch.object(conversation_routes, "_db", return_value=reader):
+            events = conversation_routes._event_batch(conversation_id, sequence)
+        self.assertEqual(events[0]["payload"]["detail"],
+                         "[redacted] [redacted] [redacted] other-runner")
+        with closing(self.connect()) as con:
+            details = self.assert_index_plan(con, next(
+                q for q in statements if q.startswith("SELECT harness_session_ref")
+            ), {"conversation_runs": "idx_conversation_runs_conversation_run"})
+            self.assertEqual(sum(
+                detail.startswith("SEARCH conversation_runs ") for detail in details
+            ), 3)
+
+    def test_replay_and_watermarks_use_unique_autoindex_after_replay_index_drop(self) -> None:
+        with closing(self.connect()) as con:
+            conversation_id, _, sequence = self.seed_index_fixture(con)
+            self.assertIsNone(con.execute(
+                "SELECT 1 FROM sqlite_master WHERE name='idx_conversation_events_replay'",
+            ).fetchone())
+            statements = []
+            con.set_trace_callback(statements.append)
+            page = conversation_routes._transcript_projection(
+                con, conversation_id, owner_user_id=1,
+            )
+            conversation_routes._append_event(con, conversation_id, "run.unknown", {})
+            con.set_trace_callback(None)
+            self.assertEqual(page["through_sequence"], sequence)
+            con.commit()
+        reader = self.connect()
+        reader.set_trace_callback(statements.append)
+        with mock.patch.object(conversation_routes, "_db", return_value=reader):
+            events = conversation_routes._event_batch(conversation_id, sequence)
+        self.assertEqual([event["sequence"] for event in events], [sequence + 1])
+        queries = [q for q in statements if q.startswith((
+            "SELECT COALESCE(MAX(sequence)", "SELECT sequence,event_type,",
+        ))]
+        self.assertEqual(len(queries), 3)
+        with closing(self.connect()) as con:
+            for statement in queries:
+                self.assert_index_plan(con, statement, {
+                    "conversation_events": "sqlite_autoindex_conversation_events_1",
+                })
+
     def test_filtered_history_pages_bind_scope_and_exclude_other_owners(self) -> None:
         with closing(self.connect()) as con:
             recent = [
