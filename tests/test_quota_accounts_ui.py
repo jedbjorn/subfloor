@@ -60,7 +60,7 @@ QUOTA = APP[
     APP.index("// ── Provider Quota"):
     APP.index("// ── Interface / browser-native conversations")
 ]
-_ROUTER_AT = APP.index("function routeFromHash()")
+_ROUTER_AT = APP.index("let lastRoutedHash")
 ROUTER = APP[_ROUTER_AT:
              APP.index('document.querySelectorAll("nav button").forEach', _ROUTER_AT)]
 

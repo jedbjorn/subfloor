@@ -385,7 +385,7 @@ def _append_event(
         (
             conversation_id,
             sequence,
-            event_type,
+            conversation_events.require_event_type(event_type),
             json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
             message_id,
             run_id,
@@ -2042,23 +2042,36 @@ def _accepted_queue_position(con, message_id: int) -> int:
 def _list_messages(con, operator: dict, conversation_id: str, query):
     _require_conversation(con, conversation_id, operator["user_id"])
     limit = _limit(query)
-    after = 0
-    cursor = query.get("cursor", [None])[0]
+    orders = query.get("order", ["asc"])
+    if len(orders) != 1 or orders[0] not in ("asc", "desc"):
+        raise ApiError(
+            422, "VALIDATION_ERROR", "order must be exactly one asc or desc value",
+        )
+    order = orders[0]
+    position_clause = ""
+    params = [conversation_id]
+    cursor = _single_cursor(query, "message")
     if cursor:
         decoded = _cursor_decode(cursor, "message")
         after = _integer(decoded.get("id"), "cursor message id")
-        if after < 0:
+        # Pre-order cursors were ascending; continue accepting them in that order.
+        if after < 0 or decoded.get("order", "asc") != order:
             raise ApiError(422, "CURSOR_INVALID", "invalid message cursor")
+        comparison = ">" if order == "asc" else "<"
+        position_clause = f" AND message_id{comparison}?"
+        params.append(after)
+    params.append(limit + 1)
     rows = con.execute(
         "SELECT message_id,conversation_id,sender_kind,sender_ref,message_kind,"
         "body,caused_by_message_id,state,created_at,completed_at "
-        "FROM conversation_messages WHERE conversation_id=? AND message_id>? "
-        "ORDER BY message_id LIMIT ?",
-        (conversation_id, after, limit + 1),
+        "FROM conversation_messages WHERE conversation_id=?"
+        + position_clause
+        + f" ORDER BY message_id {order.upper()} LIMIT ?",
+        params,
     ).fetchall()
     page = rows[:limit]
     next_cursor = (
-        _cursor_encode({"v": 1, "id": int(page[-1]["message_id"])})
+        _cursor_encode({"v": 1, "id": int(page[-1]["message_id"]), "order": order})
         if len(rows) > limit
         else None
     )

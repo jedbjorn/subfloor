@@ -3165,6 +3165,114 @@ class ConversationResourceTest(ConversationApiCase):
         self.assertEqual(event["event_type"], "run.interrupt.requested")
 
 
+class ConversationMessageOrderTest(ConversationApiCase):
+    def seed_messages(self, count: int = 105) -> tuple[str, list[int]]:
+        with closing(self.connect()) as con:
+            conversation_id = self.seed_conversation(con, number=880)
+            message_ids = []
+            for number in range(count):
+                cursor = con.execute(
+                    "INSERT INTO conversation_messages "
+                    "(conversation_id,sender_kind,sender_ref,message_kind,body,"
+                    "idempotency_key,request_hash,state,completed_at) "
+                    "VALUES (?,'user','operator','prompt',?,?,?,'completed',"
+                    "'2026-09-30 12:00:00')",
+                    (conversation_id, f"message {number}", f"key-{number}", f"hash-{number}"),
+                )
+                message_ids.append(int(cursor.lastrowid))
+            con.commit()
+        return conversation_id, message_ids
+
+    def test_message_order_defaults_ascending_and_descending_pages_read_newest_states(self) -> None:
+        conversation_id, message_ids = self.seed_messages()
+        path = f"/api/conversations/{conversation_id}/messages"
+        for query in ("?limit=100", "?order=asc&limit=100"):
+            with self.subTest(query=query):
+                status, _, page = self.request("GET", path + query)
+                self.assertEqual(status, 200, page)
+                self.assertEqual([item["message_id"] for item in page["items"]], message_ids[:100])
+
+        status, _, first = self.request("GET", path + "?order=desc&limit=100")
+        self.assertEqual(status, 200, first)
+        self.assertEqual(
+            [item["message_id"] for item in first["items"]], list(reversed(message_ids[5:])),
+        )
+        self.assertEqual(first["items"][0]["body"], "message 104")
+        self.assertEqual(first["items"][0]["state"], "completed")
+        self.assertEqual(
+            conversation_routes._cursor_decode(first["next_cursor"], "message")["order"],
+            "desc",
+        )
+        status, _, second = self.request(
+            "GET", path + f"?order=desc&limit=100&cursor={first['next_cursor']}",
+        )
+        self.assertEqual(status, 200, second)
+        self.assertEqual(
+            [item["message_id"] for item in second["items"]], list(reversed(message_ids[:5])),
+        )
+        self.assertIsNone(second["next_cursor"])
+        self.assertEqual(
+            len({item["message_id"] for item in first["items"] + second["items"]}),
+            105,
+        )
+
+        empty_id = self.create()["conversation_id"]
+        status, _, empty = self.request(
+            "GET", f"/api/conversations/{empty_id}/messages?order=desc",
+        )
+        self.assertEqual(status, 200, empty)
+        self.assertEqual(empty, {"items": [], "next_cursor": None})
+
+    def test_message_cursors_bind_order_and_preserve_legacy_ascending_cursors(self) -> None:
+        conversation_id, message_ids = self.seed_messages(count=3)
+        path = f"/api/conversations/{conversation_id}/messages"
+        for order, other in (("asc", "desc"), ("desc", "asc")):
+            status, _, first = self.request("GET", path + f"?order={order}&limit=2")
+            self.assertEqual(status, 200, first)
+            queries = [f"?order={other}"]
+            if order == "desc":
+                queries.append("")
+            for query in queries:
+                with self.subTest(order=order, query=query):
+                    separator = "&" if query else "?"
+                    status, _, error = self.request(
+                        "GET", path + f"{query}{separator}cursor={first['next_cursor']}",
+                    )
+                    self.assertEqual(status, 422, error)
+                    self.assertEqual(error["error"]["code"], "CURSOR_INVALID")
+
+        legacy = conversation_routes._cursor_encode({"v": 1, "id": message_ids[1]})
+        status, _, page = self.request("GET", path + f"?cursor={legacy}")
+        self.assertEqual(status, 200, page)
+        self.assertEqual([item["message_id"] for item in page["items"]], message_ids[2:])
+        status, _, error = self.request("GET", path + f"?order=desc&cursor={legacy}")
+        self.assertEqual(status, 422, error)
+        self.assertEqual(error["error"]["code"], "CURSOR_INVALID")
+
+    def test_message_order_rejects_malformed_repeated_values_and_keeps_owner_isolation(self) -> None:
+        conversation_id, _ = self.seed_messages(count=1)
+        path = f"/api/conversations/{conversation_id}/messages"
+        for query in (
+            "order=", "order", "order=DESC", "order=sideways", "order=%20desc",
+            "order=asc&order=desc", "order=desc&order=desc", "order=&order=asc",
+        ):
+            with self.subTest(query=query):
+                status, _, error = self.request("GET", path + "?" + query)
+                self.assertEqual(status, 422, error)
+                self.assertEqual(error["error"]["code"], "VALIDATION_ERROR")
+
+        with closing(self.connect()) as con:
+            foreign_id = self.seed_conversation(con, number=881, owner_user_id=2)
+            con.commit()
+        for query in ("order=asc", "order=desc", "order=invalid"):
+            with self.subTest(foreign_query=query):
+                status, _, error = self.request(
+                    "GET", f"/api/conversations/{foreign_id}/messages?{query}",
+                )
+                self.assertEqual(status, 404, error)
+                self.assertEqual(error["error"]["code"], "CONVERSATION_NOT_FOUND")
+
+
 class ConversationPerformanceFixtureTest(ConversationApiCase):
     def seed_index_fixture(self, con):
         conversation_id = self.seed_conversation(con, number=720)
