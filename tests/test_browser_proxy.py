@@ -39,16 +39,17 @@ def gates(tmp_path, monkeypatch):
                 if method == "tools/list"
                 else {"content": []}
             )
-            data = (
-                b"data: "
-                + json.dumps(
-                    {"jsonrpc": "2.0", "id": msg.get("id"), "result": result}
-                ).encode()
-                + b"\n\n"
-            )
-            self.send_response(200)
+            payload = {"result": result}
+            if method == "tools/call" and gate.tool_response is not None:
+                payload = gate.tool_response
+            data = json.dumps(
+                {"jsonrpc": "2.0", "id": msg.get("id"), **payload}
+            ).encode()
+            if gate.response_format == "text/event-stream":
+                data = b"data: " + data + b"\n\n"
+            self.send_response(gate.response_status)
             self.send_header("Content-Length", str(len(data)))
-            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Content-Type", gate.response_format)
             self.send_header("Mcp-Session-Id", "upstream-" + str(len(calls)))
             self.end_headers()
             try:
@@ -75,6 +76,9 @@ def gates(tmp_path, monkeypatch):
     )
     gate.slow_started = threading.Event()
     gate.deleted = threading.Event()
+    gate.tool_response = None
+    gate.response_status = 200
+    gate.response_format = "text/event-stream"
     threading.Thread(target=gate.serve_forever, daemon=True).start()
     yield gate, config, calls
     gate.shutdown()
@@ -101,6 +105,131 @@ def request(gate, shell, method, session=None, params=None):
     body = response.read()
     client.close()
     return sid, proxy.rpc_result(body), body
+
+
+def status(gate):
+    client = http.client.HTTPConnection("127.0.0.1", gate.server_port, timeout=2)
+    client.request("GET", "/status")
+    response = client.getresponse()
+    body = json.loads(response.read())
+    client.close()
+    return body
+
+
+@pytest.mark.parametrize("response_format", ["application/json", "text/event-stream"])
+def test_action_errors_preserve_observed_connection_and_approved_session(
+    gates, response_format
+):
+    gate, _, calls = gates
+    gate.response_format = response_format
+    sid, _, _ = request(gate, "DEV5", "initialize")
+    request(gate, "DEV5", "tools/call", sid, {"name": "browser_snapshot"})
+    upstream = gate.sessions[sid]["upstream"]
+    for failure in [
+        {
+            "result": {
+                "isError": True,
+                "content": [
+                    {
+                        "type": "text",
+                        "text": "### Error\nTimeoutError: locator.click: Timeout 5000ms exceeded.",
+                    }
+                ],
+            }
+        },
+        {"error": {"code": -32602, "message": "Invalid tool arguments"}},
+        {
+            "result": {
+                "isError": True,
+                "content": [
+                    {
+                        "type": "text",
+                        "text": "### Error\nTimeoutError: locator.click: waiting for getByText('Extension not connected')",
+                    }
+                ],
+            }
+        },
+    ]:
+        gate.tool_response = failure
+        _, result, _ = request(
+            gate, "DEV5", "tools/call", sid, {"name": "browser_click"}
+        )
+        assert all(result[key] == value for key, value in failure.items())
+        assert status(gate) == {
+            "active_shells": ["DEV5"],
+            "extension": "connected",
+            "protocol_errors": [],
+        }
+        assert gate.sessions[sid]["upstream"] == upstream
+    gate.tool_response = None
+    assert (
+        "result"
+        in request(gate, "DEV5", "tools/call", sid, {"name": "browser_snapshot"})[1]
+    )
+    assert sum(m["method"] == "initialize" for m in calls) == 1
+    assert sum(m["method"] == "tools/call" for m in calls) == 5
+    assert not gate.deleted.is_set()
+    rows = [json.loads(x) for x in gate.audit_path.read_text().splitlines()]
+    assert [row["result"] for row in rows] == [
+        "ok",
+        "upstream error",
+        "upstream error",
+        "upstream error",
+        "ok",
+    ]
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "### Error\nError: Extension not connected",
+        "### Error\nError: Extension disconnected before initialization: closed",
+        "### Error\nError: Playwright extension did not connect within 30s after opening the connect page.",
+        "Bad Request: Unsupported protocol version: old",
+    ],
+)
+def test_explicit_connection_errors_clear_observed_status(gates, text):
+    gate, _, _ = gates
+    sid, _, _ = request(gate, "DEV5", "initialize")
+    request(gate, "DEV5", "tools/call", sid, {"name": "browser_snapshot"})
+    gate.tool_response = {
+        "result": {"isError": True, "content": [{"type": "text", "text": text}]}
+    }
+    request(gate, "DEV5", "tools/call", sid, {"name": "browser_snapshot"})
+    observed = status(gate)
+    assert observed["active_shells"] == []
+    assert observed["extension"] == "not connected"
+    assert observed["protocol_errors"] == ([text] if "protocol version" in text else [])
+    assert not gate.deleted.is_set()
+
+
+@pytest.mark.parametrize("backend_restarted", [False, True])
+def test_unobserved_session_error_does_not_claim_approval(
+    gates, monkeypatch, backend_restarted
+):
+    gate, _, calls = gates
+    sid, _, _ = request(gate, "DEV5", "initialize")
+    if backend_restarted:
+        request(gate, "DEV5", "tools/call", sid, {"name": "browser_snapshot"})
+        monkeypatch.setattr(browser, "process_receipt", lambda name: {"start": "2"})
+        request(gate, "DEV5", "tools/list", sid)
+        assert status(gate)["extension"] == "not connected"
+    gate.tool_response = {"result": {"isError": True, "content": []}}
+    request(gate, "DEV5", "tools/call", sid, {"name": "browser_click"})
+    assert status(gate)["extension"] == "not connected"
+    assert sum(m["method"] == "initialize" for m in calls) == (
+        2 if backend_restarted else 1
+    )
+
+
+def test_http_session_error_clears_observed_status(gates):
+    gate, _, _ = gates
+    sid, _, _ = request(gate, "DEV5", "initialize")
+    request(gate, "DEV5", "tools/call", sid, {"name": "browser_snapshot"})
+    gate.response_status = 404
+    gate.tool_response = {"error": {"code": -32000, "message": "Session not found"}}
+    request(gate, "DEV5", "tools/call", sid, {"name": "browser_snapshot"})
+    assert status(gate)["extension"] == "not connected"
 
 
 def test_shell_identity_sse_audit_and_cross_session_refusal(gates):
@@ -171,17 +300,19 @@ def test_slow_action_waits_and_preserves_upstream_session(gates):
 def test_transport_loss_terminates_and_recreates_upstream_session(gates):
     gate, _config, calls = gates
     sid, _, _ = request(gate, "DEV5", "initialize")
-    _, result, _ = request(
-        gate, "DEV5", "tools/call", sid, {"name": "disconnect"}
-    )
+    request(gate, "DEV5", "tools/call", sid, {"name": "browser_snapshot"})
+    assert status(gate)["extension"] == "connected"
+    _, result, _ = request(gate, "DEV5", "tools/call", sid, {"name": "disconnect"})
     assert "extension not connected" in result["error"]["message"]
     assert gate.deleted.wait(0.5)
+    assert status(gate)["extension"] == "not connected"
 
     _, recovered, _ = request(
         gate, "DEV5", "tools/call", sid, {"name": "browser_snapshot"}
     )
     assert "result" in recovered
     assert sum(m["method"] == "initialize" for m in calls) == 2
+    assert status(gate)["extension"] == "connected"
 
 
 def test_proxy_adds_no_production_action_deadline(tmp_path, monkeypatch):
