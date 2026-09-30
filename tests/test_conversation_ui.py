@@ -2,14 +2,25 @@
 
 from __future__ import annotations
 
+import ast
 import json
+import re
 import shutil
+import sqlite3
 import subprocess
+import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / ".super-coder" / "scripts"))
+
+import activity_monitor
+import conversation_events
+from conversation_events import CONVERSATION_EVENT_TYPES
+
 APP = (ROOT / ".super-coder" / "ui" / "app.js").read_text()
 MODEL_SEARCH = APP[
     APP.index("const modelSearchFold"):
@@ -39,6 +50,333 @@ def run_js(script: str) -> dict:
     )
     assert proc.returncode == 0, proc.stderr
     return json.loads(proc.stdout.strip().splitlines()[-1])
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node is required")
+@pytest.mark.parametrize("events", [
+    ["popstate", "hashchange"], ["hashchange", "popstate"],
+])
+def test_hash_navigation_renders_interface_once(events):
+    routing = APP[APP.index("function show(tab)"):
+                  APP.index('document.addEventListener("visibilitychange"')]
+    script = """
+const window = new EventTarget();
+const location = {hash: ""};
+const document = {querySelectorAll: () => [], body: {classList: {toggle() {}}}};
+const VIEWS = {shells: ["shells"], interface: ["interface"]};
+const SHELL_TAB_HASH = {harness: "shells"};
+const $ = () => ({});
+const chatStopReads = () => {}, chatStopStream = () => {};
+const chatStopHistoryPoll = () => {}, chatStopReview = () => {};
+const sprintStopPolling = () => {}, setDocumentTitle = () => {};
+let activeTab, shellTab, chatRouteShell, chatRouteConversation, chatRouteMode;
+let chatModeController = null, renders = 0;
+const renderInterface = () => { renders++; };
+const load = (tab) => { if (tab === "interface") renderInterface(); };
+""" + routing + """
+routeFromHash();
+location.hash = "#interface/dev/cv_1";
+""" + "\n".join(
+        f'window.dispatchEvent(new Event("{event}"));' for event in events
+    ) + """
+const first = renders;
+window.dispatchEvent(new Event("popstate"));
+const sameHash = renders;
+location.hash = "#interface/dev/cv_2";
+window.dispatchEvent(new Event("popstate"));
+window.dispatchEvent(new Event("hashchange"));
+console.log(JSON.stringify({first, sameHash, second: renders}));
+"""
+    assert run_js(script) == {"first": 1, "sameHash": 1, "second": 2}
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node is required")
+def test_diff_pushstate_and_back_forward_route_changed_hash_once():
+    routing = APP[APP.index("let lastRoutedHash"):
+                  APP.index('document.addEventListener("visibilitychange"')]
+    select_mode = APP[APP.index("  const selectMode = (mode) =>"):
+                      APP.index("  chatModeButton.onclick =")]
+    script = """
+const window = new EventTarget();
+const document = {querySelectorAll: () => []};
+const location = {hash: "#interface/dev/cv_1"};
+let chatRouteShell, chatRouteConversation, chatRouteMode, currentMode = "chat";
+let renders = 0;
+const modes = [];
+const show = () => { renders++; };
+let chatModeController = null;
+const conversation = {shell: {shortname: "dev"}, conversation_id: "cv_1"};
+const chatModeHash = (shell, id, mode) =>
+  `interface/${shell}/${id}${mode === "diff" ? "/diff" : ""}`;
+const history = {pushState: (_, __, hash) => { location.hash = hash; }};
+""" + routing + select_mode + """
+routeFromHash();
+chatModeController = {shell: "dev", conversationId: "cv_1", setMode(mode) {
+  currentMode = mode;
+  modes.push(mode);
+}};
+selectMode("diff");
+window.dispatchEvent(new Event("popstate"));
+location.hash = "#interface/dev/cv_1";
+window.dispatchEvent(new Event("popstate"));
+window.dispatchEvent(new Event("hashchange"));
+location.hash = "#interface/dev/cv_1/diff";
+window.dispatchEvent(new Event("popstate"));
+window.dispatchEvent(new Event("hashchange"));
+console.log(JSON.stringify({renders, modes, currentMode}));
+"""
+    assert run_js(script) == {
+        "renders": 1, "modes": ["diff", "chat", "diff"], "currentMode": "diff",
+    }
+
+
+def assert_conversation_event_writers_bound():
+    writers = set()
+    for directory in ("scripts", "api"):
+        for path in (ROOT / ".super-coder" / directory).rglob("*.py"):
+            tree = ast.parse(path.read_text())
+            parents = {
+                child: parent for parent in ast.walk(tree)
+                for child in ast.iter_child_nodes(parent)
+            }
+            for node in ast.walk(tree):
+                # Discover SQL inserts independently of helper names. Require
+                # validation on the actual bound value, including dynamic types.
+                if (isinstance(node, ast.Constant)
+                        and isinstance(node.value, str)
+                        and re.search(
+                            r"\b(?:INSERT(?:\s+OR\s+\w+)?\s+INTO|"
+                            r"REPLACE\s+INTO|UPDATE)\s+conversation_events\b",
+                            node.value, re.IGNORECASE,
+                        )):
+                    function = parents[node]
+                    while not isinstance(function, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                        assert function in parents, path
+                        function = parents[function]
+                    writer = (str(path.relative_to(ROOT / ".super-coder")), function.name)
+                    writers.add(writer)
+                    call = parents[node]
+                    assert (isinstance(call, ast.Call)
+                            and getattr(call.func, "attr", "") == "execute"
+                            and call.args[0] is node), writer
+                    insert = re.fullmatch(
+                        r"\s*INSERT INTO conversation_events\s*\(([^)]+)\)"
+                        r"\s*VALUES\s*\(([^)]+)\)\s*",
+                        node.value, re.IGNORECASE,
+                    )
+                    assert insert, writer
+                    columns, values = [
+                        [part.strip() for part in group.split(",")]
+                        for group in insert.groups()
+                    ]
+                    event_index = columns.index("event_type")
+                    assert values[event_index] == "?", (
+                        writer, "event_type must be a validated bound parameter",
+                    )
+                    parameters = call.args[1]
+                    assert isinstance(parameters, (ast.Tuple, ast.List)), writer
+                    event_type = parameters.elts[values[:event_index].count("?")]
+                    assert (isinstance(event_type, ast.Call)
+                            and ast.unparse(event_type.func)
+                            == "conversation_events.require_event_type"
+                            and len(event_type.args) == 1), (
+                        writer, "event_type must use canonical validation",
+                    )
+                    argument = event_type.args[0]
+                    if isinstance(argument, ast.Constant):
+                        assert argument.value in CONVERSATION_EVENT_TYPES, (
+                            writer, argument.value,
+                        )
+
+                # Also catch unlisted literals passed to generic writers before
+                # they reach the runtime guard. Adapter/dynamic values pass
+                # through the same validated SQL parameter checked above.
+                if not isinstance(node, ast.Call):
+                    continue
+                name = getattr(node.func, "attr", getattr(node.func, "id", ""))
+                if name not in ("_append_event", "finish_run"):
+                    continue
+                arguments = list(node.args) + [
+                    kw.value for kw in node.keywords if kw.arg == "event_type"
+                ]
+                for argument in arguments:
+                    if (isinstance(argument, ast.Constant)
+                            and isinstance(argument.value, str)):
+                        assert argument.value in CONVERSATION_EVENT_TYPES, path
+    return writers
+
+
+def test_server_event_writers_use_canonical_conversation_type_set():
+    assert assert_conversation_event_writers_bound() == {
+        ("api/conversation_routes.py", "_append_event"),
+        ("scripts/activity_monitor.py", "_append_closed_event"),
+        ("scripts/conversation_broker.py", "_append_event"),
+        ("scripts/conversation_reaper.py", "_append_event"),
+        ("scripts/sprint_participant_chats.py", "_append_created_event"),
+        ("scripts/sprint_participant_chats.py", "_append_event"),
+        ("scripts/sprint_runtime.py", "enqueue_conversation_turn"),
+    }
+
+
+@pytest.mark.parametrize("writer,old,new", [
+    ("activity_monitor.py", 'require_event_type("conversation.closed")',
+     'require_event_type("conversation.archived")'),
+    ("sprint_runtime.py", 'require_event_type("message.accepted")',
+     'require_event_type("conversation.archived")'),
+    ("sprint_participant_chats.py", 'require_event_type("conversation.created")',
+     'require_event_type("conversation.archived")'),
+    ("activity_monitor.py", 'conversation_events.require_event_type("conversation.closed")',
+     '"conversation.archived"'),
+    ("activity_monitor.py", '"VALUES (?,?,?,?,?)"',
+     '"VALUES (?, ?, \'conversation.archived\', ?, ?)"'),
+    ("conversation_broker.py", "conversation_events.require_event_type(event_type)",
+     "event_type"),
+])
+def test_event_writer_binding_rejects_unlisted_direct_sql_and_unvalidated_dynamic_types(
+    monkeypatch, writer, old, new,
+):
+    path = ROOT / ".super-coder" / "scripts" / writer
+    read_text = Path.read_text
+    original = read_text(path)
+    assert old in original
+    mutated = original.replace(old, new, 1)
+
+    def read_mutated(self, *args, **kwargs):
+        return mutated if self == path else read_text(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", read_mutated)
+    with pytest.raises(AssertionError, match=writer):
+        test_server_event_writers_use_canonical_conversation_type_set()
+
+
+def load_event_writer(path, name, source):
+    tree = ast.parse(source)
+    function = next(node for node in ast.walk(tree)
+                    if isinstance(node, ast.FunctionDef) and node.name == name)
+    function.decorator_list = []
+    namespace = {"conversation_events": conversation_events, "json": json}
+    exec(compile(ast.Module(body=[function], type_ignores=[]), str(path), "exec"), namespace)
+    return namespace[name]
+
+
+def test_direct_sql_writer_rejects_unlisted_type_before_insert():
+    path = ROOT / ".super-coder" / "scripts" / "activity_monitor.py"
+    source = path.read_text().replace('"conversation.closed"', '"conversation.archived"')
+    writer = load_event_writer(path, "_append_closed_event", source)
+    with sqlite3.connect(":memory:") as con:
+        con.execute(
+            "CREATE TABLE conversation_events (conversation_id TEXT, sequence INTEGER, "
+            "event_type TEXT, payload TEXT, run_id INTEGER)"
+        )
+        with pytest.raises(ValueError, match="conversation.archived"):
+            writer(
+                con, chat_id="cv_probe", run_id=1, ceiling_seconds=3600,
+            )
+        assert con.execute("SELECT COUNT(*) FROM conversation_events").fetchone()[0] == 0
+        activity_monitor.ActivityMonitor._append_closed_event(
+            con, chat_id="cv_probe", run_id=1, ceiling_seconds=3600,
+        )
+        assert con.execute("SELECT event_type FROM conversation_events").fetchone()[0] == (
+            "conversation.closed"
+        )
+
+
+@pytest.mark.parametrize("relative_path,arguments", [
+    ("api/conversation_routes.py", {"conversation_id": "cv_probe"}),
+    ("scripts/conversation_broker.py", {
+        "conversation_id": "cv_probe", "message_id": None, "run_id": None,
+    }),
+    ("scripts/conversation_reaper.py", {"candidate": SimpleNamespace(
+        conversation_id="cv_probe", message_id=None, run_id=None,
+    )}),
+    ("scripts/sprint_participant_chats.py", {"conversation_id": "cv_probe"}),
+])
+def test_dynamic_sql_writers_reject_unlisted_type_before_insert(relative_path, arguments):
+    path = ROOT / ".super-coder" / relative_path
+    writer = load_event_writer(path, "_append_event", path.read_text())
+    with sqlite3.connect(":memory:") as con:
+        con.execute(
+            "CREATE TABLE conversation_events (conversation_id TEXT, sequence INTEGER, "
+            "event_type TEXT, payload TEXT, message_id INTEGER, run_id INTEGER)"
+        )
+        with pytest.raises(ValueError, match="conversation.archived"):
+            writer(con, event_type="conversation.archived", payload={}, **arguments)
+        assert con.execute("SELECT COUNT(*) FROM conversation_events").fetchone()[0] == 0
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node is required")
+def test_stream_listeners_bind_server_types_and_non_display_events_advance_sequence():
+    stream = APP[APP.index("function chatOpenStream("):
+                 APP.index("function chatModelOptions(")]
+    reducer = APP[APP.index("  const reduceEvent = (event) =>"):
+                  APP.index("  chatOpenStream(\n", APP.index("  const reduceEvent = (event) =>"))]
+    script = """
+let chatSource, chatRenderGeneration = 7;
+const chatStopStream = () => {};
+class EventSource {
+  constructor() { this.listeners = {}; }
+  addEventListener(type, handler) { this.listeners[type] = handler; }
+  emit(type, sequence) {
+    this.listeners[type]({data: JSON.stringify({event_type: type, sequence,
+      message_id: 1, run_id: 2, payload: {}})});
+  }
+}
+const requests = [];
+const chatApi = (url) => { requests.push(url); };
+const reconcileTranscript = () => chatApi("/transcript");
+const refresh = () => chatApi("/messages");
+const paint = () => {};
+const user = {item_id: "message:1", state: "queued"};
+const transcriptState = {lastSequence: 40, items: new Map([[user.item_id, user]]),
+  order: [user.item_id], dirty: new Set()};
+const messages = [{message_id: 1, state: "queued"}];
+const conversation = {state: "queued", active_run_id: null};
+""" + stream + reducer + """
+const source = chatOpenStream("cv_1", 7, 40, reduceEvent, () => {});
+const sequences = [];
+for (const [type, sequence] of [["run.deferred", 41], ["run.reaped", 42],
+                               ["session.started", 43]]) {
+  source.emit(type, sequence);
+  sequences.push(transcriptState.lastSequence);
+}
+console.log(JSON.stringify({types: Object.keys(source.listeners), sequences,
+  requests, itemCount: transcriptState.items.size, state: conversation.state,
+  messageState: messages[0].state, userState: user.state}));
+"""
+    result = run_js(script)
+    assert set(result.pop("types")) == CONVERSATION_EVENT_TYPES
+    assert result == {
+        "sequences": [41, 42, 43], "requests": [], "itemCount": 1,
+        "state": "queued", "messageState": "queued", "userState": "queued",
+    }
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node is required")
+def test_message_state_refresh_requests_newest_hundred_messages():
+    refresh = APP[APP.index("async function chatRefreshConversation("):
+                  APP.index("function chatOpenStream(")]
+    script = """
+let chatRenderGeneration = 7;
+const urls = [];
+const chatApi = async (url) => {
+  urls.push(url);
+  return url.includes("/messages?")
+    ? {items: [{message_id: 105, state: "completed"}]} : {conversation_id: "cv_1"};
+};
+""" + refresh + """
+(async () => {
+  let updated;
+  await chatRefreshConversation("cv_1", 7, (conversation, messages) => {
+    updated = {conversation, messages};
+  });
+  console.log(JSON.stringify({urls, updated}));
+})();
+"""
+    assert run_js(script) == {
+        "urls": ["/conversations/cv_1", "/conversations/cv_1/messages?order=desc&limit=100"],
+        "updated": {"conversation": {"conversation_id": "cv_1"},
+                    "messages": [{"message_id": 105, "state": "completed"}]},
+    }
 
 
 @pytest.mark.skipif(shutil.which("node") is None, reason="node is required")

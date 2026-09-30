@@ -20,7 +20,7 @@ NATIVE_OPTION_LABEL = APP[
     APP.index("function nativeOptionLabel"):
     APP.index("function liveNativeHarnessBlock")
 ]
-ROUTER_AT = APP.index("function routeFromHash()")
+ROUTER_AT = APP.index("let lastRoutedHash")
 ROUTER = APP[
     ROUTER_AT:
     APP.index('document.querySelectorAll("nav button").forEach', ROUTER_AT)

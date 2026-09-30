@@ -3880,7 +3880,7 @@ async function chatRefreshConversation(conversationId, generation, onUpdate) {
   try {
     const [next, messagePage] = await Promise.all([
       chatApi(`/conversations/${conversationId}`),
-      chatApi(`/conversations/${conversationId}/messages?limit=100`),
+      chatApi(`/conversations/${conversationId}/messages?order=desc&limit=100`),
     ]);
     if (generation === chatRenderGeneration) onUpdate(next, messagePage.items);
   } catch { /* SSE remains authoritative enough to keep the open view usable. */ }
@@ -3903,6 +3903,7 @@ function chatOpenStream(
     "assistant.delta", "tool.started", "tool.completed", "permission.requested",
     "input.requested", "usage", "run.completed", "run.resumed", "run.failed",
     "run.interrupt.requested", "run.interrupted", "run.unknown",
+    "run.deferred", "run.reaped",
   ];
   for (const type of types) {
     source.addEventListener(type, (raw) => {
@@ -5486,8 +5487,7 @@ async function chatRenderOpen(
         mode,
       )}`,
     );
-    setMode(mode);
-    paint();
+    routeFromHash();
   };
   chatModeButton.onclick = () => selectMode("chat");
   diffModeButton.onclick = () => selectMode("diff");
@@ -7622,8 +7622,12 @@ function show(tab) {
 // The analytics tab does the same: #analytics (token) | #analytics-quota.
 // Shells: #shells (Harness) | #shells-skills | #shells-skill-assignments |
 // #shells-default-models.
+let lastRoutedHash = null;
 function routeFromHash() {
-  const raw = location.hash.slice(1);
+  const hash = location.hash;
+  if (hash === lastRoutedHash) return;
+  lastRoutedHash = hash;
+  const raw = hash.slice(1);
   if (raw === "interface" || raw.startsWith("interface/")) {
     const [, shell = "", conversation = "", requestedMode = ""] = raw.split("/");
     const nextMode = requestedMode === "diff" ? "diff" : "chat";

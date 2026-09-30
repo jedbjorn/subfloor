@@ -23,7 +23,7 @@ SHELL_RENDER = APP[APP.index("async function renderShells(root)"):
                    APP.index("// Default Models — the flavor_defaults")]
 DEFAULT_MODELS = APP[APP.index("function thinkingLevelState"):
                      APP.index("// Harness — the shell's surfaces")]
-ROUTER_AT = APP.index("function routeFromHash()")
+ROUTER_AT = APP.index("let lastRoutedHash")
 ROUTER = APP[ROUTER_AT:
              APP.index('document.querySelectorAll("nav button").forEach',
                        ROUTER_AT)]
