@@ -1410,7 +1410,7 @@ class AuthenticatedCliCatalogueRouteTest(unittest.TestCase):
             },
         }
         with (
-            mock.patch.object(server, "db", side_effect=self.connect),
+            mock.patch.object(server, "db", side_effect=self.connect) as opened,
             mock.patch.object(
                 server.model_catalog, "catalog", return_value=payload
             ) as catalogue,
@@ -1422,8 +1422,10 @@ class AuthenticatedCliCatalogueRouteTest(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(json.loads(raw), payload)
         catalogue.assert_called_once()
+        opened.assert_not_called()
         self.assertFalse(catalogue.call_args.kwargs["refresh"])
-        self.assertIn("con", catalogue.call_args.kwargs)
+        self.assertIs(catalogue.call_args.kwargs["connection_factory"], opened)
+        self.assertNotIn("con", catalogue.call_args.kwargs)
 
     def test_model_routes_require_shell_auth_and_apply_exact_filters(self) -> None:
         self.assertEqual(self.request("/_sc/model-routes", None)[0], 401)
