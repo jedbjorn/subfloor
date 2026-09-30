@@ -1616,6 +1616,41 @@ class GenerationPersistenceTest(unittest.TestCase):
                             self.assertEqual(json.loads(con.execute(
                                 "SELECT supported_efforts FROM model_routes").fetchone()[0]), ["low"])
 
+    def test_configure_preview_uses_live_efforts_and_rejects_version_or_runtime_drift(self):
+        payload = self.payload("preview", status=compatible_runtime("0.145.0", harness="codex"))
+        payload["fetched_at"] = "2026-01-01T00:00:00+00:00"
+        model_catalog.persist_routes(self.con, payload)
+        self.con.execute("UPDATE model_routes SET stale=1,last_error='age'")
+        self.con.commit()
+        before = dict(self.con.execute("SELECT * FROM model_routes").fetchone())
+        for case in ("age-and-source", "version", "runtime", "removed"):
+            with self.subTest(case=case):
+                result = self.live_codex_resolution(
+                    "preview", efforts=("low",),
+                    version="0.146.0" if case == "version" else "0.145.0",
+                    scope={"runtime": "host", "runtime_identity": "host:other-seat"}
+                    if case == "runtime" else None,
+                    available=case != "removed",
+                    operation=lambda: api_server.model_route_previews(self.con, payload),
+                )
+                route = result["harnesses"]["codex"]["models"][0]
+                if case == "age-and-source":
+                    self.assertEqual(route["supported_efforts"], ["low"])
+                    self.assertTrue(route["execution_evidence"]["accepted"])
+                else:
+                    self.assertFalse(route["execution_evidence"]["accepted"])
+                    self.assertEqual(route["supported_efforts"], [])
+                    self.assertEqual(route["execution_evidence"]["code"],
+                                     "route_unavailable" if case == "removed" else "thinking_evidence_stale")
+                after = dict(self.con.execute("SELECT * FROM model_routes").fetchone())
+                if case == "age-and-source":
+                    self.assertNotEqual(after["source_fingerprint"], before["source_fingerprint"])
+                    self.assertEqual(json.loads(after["supported_efforts"]), ["low"])
+                    self.assertEqual(after["stale"], 0)
+                    before = after
+                else:
+                    self.assertEqual(after, before)
+
     def test_first_dispatch_accepts_same_version_drift_and_rejects_removed_effort(self):
         model_catalog.persist_routes(self.con, self.payload("dispatch-live"))
         resolved = self.live_codex_resolution("dispatch-live")

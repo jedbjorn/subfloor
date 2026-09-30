@@ -53,6 +53,7 @@ const catalog = {stale: false, harnesses: {codex: {models: [
   {id: "gpt-explicit", availability: "available", supported_efforts: ["low", "medium"]},
   {id: "gpt-plain", availability: "available", supported_efforts: []},
 ]}}};
+for (const model of catalog.harnesses.codex.models) model.execution_evidence = {accepted: true};
 console.log(JSON.stringify({
   controlled: thinkingLevelState("codex", catalog, "gpt-high", "low"),
   defaulted: thinkingLevelState("codex", catalog, "gpt-high", null),
@@ -94,7 +95,8 @@ def test_configure_preview_accepts_historical_stale_evidence_for_version_keyed_h
     result = run_js(helper + r"""
 const harnesses = Object.fromEntries(["claude", "codex", "kimi"].map(harness =>
   [harness, {models: [{id: "aged", availability: "available", stale: true,
-    last_seen_at: "2026-01-01", generation_id: "older", supported_efforts: ["high"]}]}]));
+    last_seen_at: "2026-01-01", generation_id: "older", supported_efforts: ["high"],
+    execution_evidence: {accepted: true}}]}]));
 const catalog = {stale: true, harnesses};
 console.log(JSON.stringify(Object.fromEntries(Object.keys(harnesses).map(harness =>
   [harness, thinkingLevelState(harness, catalog, "aged", "high")]))));
@@ -102,6 +104,42 @@ console.log(JSON.stringify(Object.fromEntries(Object.keys(harnesses).map(harness
     for state in result.values():
         assert state["disabled"] is False
         assert state["selected"] == "high"
+
+
+def test_configure_preview_renders_execution_rejection_and_only_live_efforts():
+    helper = APP[APP.index("function nativeOptionLabel"):APP.index("function dmModelPicker")]
+    result = run_js(helper + r"""
+const results = {};
+for (const harness of ["claude", "codex", "kimi"]) {
+  const route = {id: "exact", availability: "available", supported_efforts: ["high"],
+    harness_version: "captured-version"};
+  const state = evidence => thinkingLevelState(harness, {stale: false, harnesses: {
+    [harness]: {models: [{...route, execution_evidence: evidence}]},
+  }}, "exact", "high");
+  results[harness] = {
+    version: state({accepted: false, code: "thinking_evidence_stale", message: "Harness version changed"}),
+    runtime: state({accepted: false, code: "thinking_evidence_stale", message: "Runtime identity changed"}),
+    removed: state({accepted: false, code: "route_unavailable", message: "Route disappeared"}),
+    missing: state(undefined),
+    drift: thinkingLevelState(harness, {stale: true, harnesses: {
+      [harness]: {models: [{...route, supported_efforts: ["low"], execution_evidence: {accepted: true}}]},
+    }}, "exact", "high"),
+  };
+}
+console.log(JSON.stringify(results));
+""")
+    for cases in result.values():
+        for case in ("version", "runtime", "removed", "missing"):
+            state = cases[case]
+            assert state["disabled"] is True
+            assert state["supported"] == []
+            assert state["selected"] == ""
+            assert "proven" not in state["guidance"]
+        assert cases["version"]["rejectionCode"] == "thinking_evidence_stale"
+        assert cases["removed"]["rejectionCode"] == "route_unavailable"
+        assert cases["drift"]["disabled"] is False
+        assert cases["drift"]["supported"] == ["default", "low"]
+        assert cases["drift"]["selected"] == "default"
 
 
 def test_live_native_option_renderer_preserves_five_model_projection_exactly():

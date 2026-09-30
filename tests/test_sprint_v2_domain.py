@@ -24,6 +24,7 @@ CONFORMANCE_OWNER_MIGRATION = (
     MIGRATIONS / "0205_sprint_conformance_ownership.sql"
 )
 
+sys.path.insert(0, str(ENGINE / "api"))
 sys.path.insert(0, str(ENGINE / "scripts"))
 import model_catalog  # noqa: E402
 import db_driver  # noqa: E402
@@ -1919,7 +1920,7 @@ class LifecycleTest(SprintDomainCase):
                 "'normal-2','hash')"
             )
 
-    def test_arm_preflight_accepts_mixed_aged_stale_generations(self) -> None:
+    def seed_mixed_generation_live_evidence(self):
         sprint_id, _ = self.create_sprint()
         participants = list(self.con.execute(
             "SELECT * FROM sprint_participants WHERE sprint_id=?", (sprint_id,)
@@ -1961,6 +1962,33 @@ class LifecycleTest(SprintDomainCase):
                     "runtime_status": status,
                     "route_evidence": {**evidence, "provider_model": "live-provider-model"}}
 
+        return sprint_id, observation
+
+    def test_arm_live_evidence_rolls_back_with_lifecycle(self) -> None:
+        sprint_id, observation = self.seed_mixed_generation_live_evidence()
+        before = [dict(row) for row in self.con.execute("SELECT * FROM model_routes ORDER BY harness,selector")]
+
+        def fail_lifecycle(*_args, **_kwargs):
+            staged = [dict(row) for row in self.con.execute("SELECT * FROM model_routes ORDER BY harness,selector")]
+            self.assertTrue(self.con.in_transaction)
+            self.assertNotEqual(staged, before)
+            self.assertEqual({row["stale"] for row in staged}, {0})
+            raise RuntimeError("arm failed after evidence staging")
+
+        with mock.patch.object(sprint_domain, "_participant_binding_candidate",
+                               side_effect=REAL_PARTICIPANT_CANDIDATE), \
+             mock.patch.object(model_catalog, "controlled_route_evidence", side_effect=observation), \
+             mock.patch.object(self.store, "_update_lifecycle", side_effect=fail_lifecycle), \
+             self.assertRaisesRegex(RuntimeError, "arm failed"):
+            self.store.arm(sprint_id, 3)
+        self.assertEqual([dict(row) for row in self.con.execute(
+            "SELECT * FROM model_routes ORDER BY harness,selector")], before)
+        self.assertEqual(self.con.execute("SELECT lifecycle FROM sprints WHERE sprint_id=?",
+                                         (sprint_id,)).fetchone()[0], "prepared")
+        self.assertEqual(self.con.execute("SELECT count(*) FROM sprint_participant_route_bindings").fetchone()[0], 0)
+
+    def test_arm_preflight_accepts_mixed_aged_stale_generations(self) -> None:
+        sprint_id, observation = self.seed_mixed_generation_live_evidence()
         # Override the fixture's candidate stub to prove the real persisted checks pass.
         with mock.patch.object(sprint_domain, "_participant_binding_candidate",
                                side_effect=REAL_PARTICIPANT_CANDIDATE), \

@@ -1021,8 +1021,10 @@ const location = {hash: ""};
   const defaults = {flavors: {dev: [{harness: "codex", model: "gpt-a",
     effort: "medium", is_default: true}]}, harness_status: {}};
   const catalog = {stale: false, harnesses: {codex: {models: [
-    {id: "gpt-a", availability: "available", supported_efforts: ["low", "medium", "high"]},
-    {id: "gpt-b", availability: "available", supported_efforts: ["low", "high"]},
+    {id: "gpt-a", availability: "available", supported_efforts: ["low", "medium", "high"],
+     execution_evidence: {accepted: true}},
+    {id: "gpt-b", availability: "available", supported_efforts: ["low", "high"],
+     execution_evidence: {accepted: true}},
   ]}}};
   await chatRenderNew(host, {flavor: "dev", display_name: "Dev"}, defaults, catalog);
   const form = host.children[0];

@@ -981,6 +981,7 @@ def _require_fresh_route(
     *,
     now: datetime | None = None,
     route_proof: _ControlledRouteProof | None,
+    persist: bool = True,
 ) -> dict | None:
     """Validate and stage one exact route's freshness in the caller's write."""
     harness = normalize_harness(harness)
@@ -993,7 +994,7 @@ def _require_fresh_route(
             f"No local route evidence for {harness}/{model}",
             {"harness": harness, "model": model, "remediation": "sc models refresh"},
         )
-    if not con.in_transaction:
+    if persist and not con.in_transaction:
         raise RuntimeError(
             "require_fresh_route requires a caller-owned write transaction"
         )
@@ -1064,6 +1065,8 @@ def _require_fresh_route(
                 canonical_json(live_row[key]) if key in json_fields
                 else live_row[key] for key in fields
             ]
+            if not persist:
+                return {**live_row, **dict(zip(fields, values))}
             con.execute(
                 "UPDATE model_routes SET "
                 + ",".join(f"{key}=?" for key in fields)
@@ -1102,7 +1105,8 @@ def _require_fresh_route(
             )
     except RouteResolutionError as exc:
         if (
-            exc.code == "thinking_evidence_stale"
+            persist
+            and exc.code == "thinking_evidence_stale"
             and exc.details.get("persist_route_stale", True)
             and not row.get("stale")
         ):
@@ -1157,6 +1161,74 @@ def require_fresh_route(
         con, row, normalized_harness, normalized_model, now=now,
         route_proof=proof,
     )
+
+
+@dataclass(frozen=True)
+class RouteEvidenceObservation:
+    captured_row: dict
+    accepted_row: dict
+    fields: tuple[str, ...]
+
+
+def observe_persisted_v2(
+    con,
+    row: dict | None,
+    harness: str,
+    model: str,
+    effort: str | None = None,
+    *,
+    now: datetime | None = None,
+    runtime_status: dict | None = None,
+    runtime_scope: dict | None = None,
+) -> tuple[dict, str, RouteEvidenceObservation]:
+    """Resolve live evidence without writing; the caller stages it on success."""
+    harness = normalize_harness(harness)
+    model = _normalize_model(model)
+    proof = _probe_controlled_route(harness, model)
+    fresh_row = _require_fresh_route(
+        con, row, harness, model, route_proof=proof,
+        now=now, persist=False,
+    )
+    binding, digest = _resolve_v2(
+        fresh_row, harness, model, effort, route_proof=proof, now=now,
+        runtime_status=runtime_status, runtime_scope=runtime_scope,
+    )
+    assert row is not None and fresh_row is not None
+    observation = RouteEvidenceObservation(
+        captured_row=dict(row), accepted_row=fresh_row,
+        fields=tuple(proof._route_evidence or {}) + ("stale", "last_error")
+        if harness in VERSION_KEYED_HARNESSES else (),
+    )
+    return binding, digest, observation
+
+
+def persist_route_evidence(con, observation: RouteEvidenceObservation) -> None:
+    """Stage an accepted observation in the caller's write transaction."""
+    if not con.in_transaction:
+        raise RuntimeError(
+            "persist_route_evidence requires a caller-owned write transaction"
+        )
+    captured = observation.captured_row
+    current = con.execute(
+        "SELECT * FROM model_routes WHERE harness=? AND selector=?",
+        (captured["harness"], captured["selector"]),
+    ).fetchone()
+    if (current is not None and observation.fields
+            and dict(current) == {key: observation.accepted_row[key] for key in captured}):
+        return
+    if current is None or dict(current) != captured:
+        raise RouteResolutionError(
+            "route_unavailable", "Route evidence changed during resolution; retry",
+            {"harness": captured["harness"], "model": captured["selector"]},
+        )
+    if observation.fields:
+        con.execute(
+            "UPDATE model_routes SET "
+            + ",".join(f"{key}=?" for key in observation.fields)
+            + " WHERE harness=? AND selector=?",
+            (*[observation.accepted_row[key] for key in observation.fields],
+             captured["harness"], captured["selector"]),
+        )
 
 
 def resolve_persisted_v2(
@@ -1644,17 +1716,36 @@ def verify_stored_v2_before_first_turn(
             },
         )
     if harness in VERSION_KEYED_HARNESSES:
-        advertised = proof._advertised_options_by_model or {}
-        if (model not in advertised or (
-            binding["requested_effort"] != DEFAULT_EFFORT
-            and binding["requested_effort"] not in advertised[model]
-        )):
-            raise RouteResolutionError(
-                "route_unavailable",
-                "The execution harness no longer advertises the stored route or effort",
-                {"harness": harness, "model": model,
-                 "requested_effort": binding["requested_effort"]},
-            )
+        _require_advertised_route(binding, proof)
+
+
+def _require_advertised_route(binding: dict, proof: _ControlledRouteProof) -> None:
+    model = binding["requested_model"]
+    advertised = proof._advertised_options_by_model or {}
+    if (model not in advertised or (
+        binding["requested_effort"] != DEFAULT_EFFORT
+        and binding["requested_effort"] not in advertised[model]
+    )):
+        raise RouteResolutionError(
+            "route_unavailable",
+            "The execution harness no longer advertises the stored route or effort",
+            {"harness": binding["harness"], "model": model,
+             "requested_effort": binding["requested_effort"]},
+        )
+
+
+def require_advertised_route_before_dispatch(binding: dict) -> None:
+    """Check every controlled version-keyed turn against its execution seat."""
+    if (binding["harness"] not in VERSION_KEYED_HARNESSES
+            or binding["control_state"] != "controlled"):
+        return
+    proof = _probe_controlled_route(binding["harness"], binding["requested_model"])
+    _require_runtime(
+        binding["harness"], binding["requested_model"], proof._runtime_status,
+        {"runtime": proof._runtime, "runtime_identity": proof._runtime_identity},
+        error_code="route_unavailable",
+    )
+    _require_advertised_route(binding, proof)
 
 
 

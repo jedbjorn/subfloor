@@ -542,6 +542,17 @@ function thinkingLevelState(harness, catalog, model, preferred = null) {
           : `${model} uses the harness's current default.${support}`,
     };
   }
+  const versionKeyed = ["claude", "codex", "kimi"].includes(harness);
+  const evidence = route?.execution_evidence;
+  if (versionKeyed && !evidence?.accepted) return {
+    disabled: true, selected: "", supported: [], native: false,
+    requiresConfirmation: false,
+    rejectionCode: evidence?.code || "thinking_evidence_missing",
+    label: evidence?.code === "thinking_evidence_stale" ? "Refresh required" : "Route unavailable",
+    guidance: evidence?.message
+      ? `${evidence.code}: ${evidence.message}`
+      : "Execution-seat evidence is unavailable. Refresh models before saving this route.",
+  };
   // Spec #160: the reserved Model default is always offered for a controlled
   // exact route, alongside its freshly proven named values.
   const supported = [
@@ -550,7 +561,7 @@ function thinkingLevelState(harness, catalog, model, preferred = null) {
   ];
   const fresh = Boolean(
     route && route.availability === "available"
-    && (["claude", "codex", "kimi"].includes(harness) || !catalog.stale));
+    && (versionKeyed ? evidence?.accepted : !catalog.stale));
   // Decision #223: preselect the bind-time fallback chain — a stored effort
   // (manual override) wins, then high where advertised, then the reserved
   // Model default; no selection only when nothing is advertised.  Options
@@ -630,7 +641,8 @@ function dmModelPicker(harness, cat, row, save, onRouteChanged = () => {}) {
   const liveBlock = liveNativeHarnessBlock(harness, cat);
   const currentAvailable = !row.model || (
     currentRoute && currentRoute.availability === "available"
-      && (!cat.stale || Boolean(liveBlock)));
+      && (currentRoute.execution_evidence?.accepted || !cat.stale || Boolean(liveBlock))
+      && currentRoute.execution_evidence?.accepted !== false);
   const current = el("span", {
     className: "dm-current" + (row.model ? "" : " dm-unset") +
       (currentAvailable ? "" : " dm-stale"),
@@ -699,8 +711,10 @@ function dmModelPicker(harness, cat, row, save, onRouteChanged = () => {}) {
     if (!open) { results.hidden = true; return; }
     const q = input.value.trim();
     const hit = (m) => modelSearchHit(q, [m.id, m.name, m.family]);
-    const models = cat.stale && !liveBlock ? [] : (data.models || []).filter(
-      (m) => m.availability === "available" && hit(m));
+    const models = (data.models || []).filter(
+      (m) => m.availability === "available" && hit(m)
+        && (m.execution_evidence?.accepted || !cat.stale || Boolean(liveBlock))
+        && m.execution_evidence?.accepted !== false);
     choices = [
       ...(modelSearchHit(q, ["harness default"])
         ? [{ value: null, label: "Harness default", sub: "clear the model override" }]

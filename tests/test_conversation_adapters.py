@@ -944,6 +944,25 @@ class ConversationAdapterTest(unittest.TestCase):
         self.claude_config = self.root / "claude-config"
         self.kimi_sessions = self.root / "kimi-sessions"
         self.kimi_runner_serial = 0
+        # Transport tests supply a deterministic canonical execution-seat source.
+        import model_catalog
+        self.live_efforts = ["high", "default"]
+        self.live_route_available = True
+
+        def live_evidence(harness, selector):
+            scope = model_catalog.harness_versions.runtime_scope()
+            version = {"claude": "2.1.222", "codex": "0.145.0", "kimi": "0.33.0"}[harness]
+            return {
+                "runtime_scope": scope,
+                "runtime_status": {"harness": harness, **scope, "version": version, "error": None},
+                "source_fingerprint": "f" * 64 if self.live_route_available else None,
+                "advertised_options_by_model": {selector: list(self.live_efforts)}
+                if self.live_route_available else {},
+            }
+
+        patch = mock.patch.object(model_catalog, "controlled_route_evidence", side_effect=live_evidence)
+        patch.start()
+        self.addCleanup(patch.stop)
 
     def tearDown(self) -> None:
         self.linked_vm.stop()
@@ -1548,6 +1567,29 @@ class ConversationAdapterTest(unittest.TestCase):
         self.assertEqual(kimi_env["KIMI_MODEL_THINKING_EFFORT"], "high")
         self.assertEqual(kimi_argv.count("-m"), 1)
         self.assertEqual(kimi_argv[kimi_argv.index("-m") + 1], "test-model")
+
+    def test_every_bound_start_and_resume_rejects_removed_live_route_or_effort(self):
+        for harness in ("claude", "codex", "kimi"):
+            for removed in ("effort", "route"):
+                for resumed in (False, True):
+                    with self.subTest(harness=harness, removed=removed, resumed=resumed):
+                        self.live_efforts = ["high"]
+                        self.live_route_available = True
+                        context = v2_context(self.root, harness)
+                        adapter, native = self.build(harness)
+                        first = adapter.start(context, "advertised first turn")
+                        if harness == "claude":
+                            self.write_claude_session(adapter, first.session_ref)
+                        before = len(native.requests if harness == "codex" else native.calls)
+                        self.live_efforts = ["low"] if removed == "effort" else ["high"]
+                        self.live_route_available = removed != "route"
+                        with self.assertRaises(AdapterError) as raised:
+                            if resumed:
+                                adapter.resume(first.session_ref, context, "subsequent turn")
+                            else:
+                                adapter.start(context, "browser first dispatch")
+                        self.assertEqual(raised.exception.code, "route_unavailable")
+                        self.assertEqual(len(native.requests if harness == "codex" else native.calls), before)
 
     def test_opencode_v2_binding_uses_full_agent_on_start_resume_and_prompt(self):
         native = FakeOpenCode()
