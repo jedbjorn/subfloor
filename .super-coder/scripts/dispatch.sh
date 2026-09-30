@@ -1862,7 +1862,7 @@ Subfloor — forkable shell substrate — full command reference (./sc help for 
   ./sc models refresh      refresh local model routes (same action as Shells → Refresh models)
   ./sc models resolve <h> [<model>] [--effort <level>] [--shell <shortname>] [--json]
                              print one exact, locally runnable high-effort call; list [harness] shows routes
-  ./sc visual-qa <mode>    viewport screenshot QA: ci boots/captures · run captures a local app · init scaffolds config
+  ./sc visual-qa <mode>    screenshot QA: ci/run capture routes or states · publish posts inline evidence · init/setup-ci configure
   sc map-sql "<query>"     read-only query of the repository catalogue (`dr_*`)
   sc map-schema [dr_table] list live dr_* objects or stable column/index metadata — read-only, no arbitrary SQL
   sc map-sql-rw            Cartographer-only catalogue authoring when its skill names the exact procedure
