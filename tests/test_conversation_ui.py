@@ -1889,7 +1889,7 @@ def test_interface_arrival_defers_configuration_and_phases_history_requests():
     assert "/models" not in open_chat
     assert "/flavor-defaults" not in open_chat
     assert 'api("/flavor-defaults")' in loader
-    assert 'api("/models")' in loader
+    assert "loadModelCatalogue()" in loader
     assert "if (chatConfigurationPromise) return chatConfigurationPromise" in loader
     assert "chatConfigurationPromise = null" in loader
     assert "request.then(clear, clear)" in loader
@@ -1906,62 +1906,409 @@ def test_interface_arrival_defers_configuration_and_phases_history_requests():
 
 
 @pytest.mark.skipif(shutil.which("node") is None, reason="node is required")
-def test_chat_configuration_refresh_reports_only_new_available_models():
+@pytest.mark.parametrize("state", [None, "idle", "closed", "running", "sprint"])
+def test_new_chat_request_log_skips_configuration_and_closes_before_create(state):
+    api_helpers = APP[APP.index("async function api("):
+                      APP.index("// Bound reads only:")]
+    catalogue = APP[APP.index("let modelCatalogue = null;"):
+                    APP.index("async function renderDefaultModels")]
     loader = APP[APP.index("let chatConfigurationPromise = null;"):
                  APP.index("function chatStopStream")]
-    script = loader + r"""
-const calls = [];
-const notices = [];
-let previous = { harnesses: {
-  codex: { models: [{ id: "old", availability: "available" }] },
-} };
-let current = { stale: false, harnesses: {
-  codex: { models: [
-    { id: "old", availability: "available" },
-    { id: "new", availability: "available" },
-    { id: "hidden", availability: "advisory" },
-  ] },
-} };
-function api(path) {
-  calls.push(path);
-  if (path === "/models") return Promise.resolve(previous);
-  if (path === "/models?refresh=1") return Promise.resolve(current);
-  return Promise.resolve({ flavors: {} });
+    close = APP[APP.index("async function chatCloseForSwitch"):
+                APP.index("function chatContextTokenLabel")]
+    create = APP[APP.index("function chatCreateConversation"):
+                 APP.index("async function reviewObservationApi")]
+    release = APP[APP.index("async function chatWithShellRelease"):
+                  APP.index("function chatModeHash")]
+    handler = APP[APP.index("  newChat.onclick = async"):
+                  APP.index("  configure.onclick = async")]
+    script = api_helpers + catalogue + loader + close + create + release + r"""
+const state = STATE;
+const requests = [], notices = [];
+const shell = {shell_id: "sh_dev", shortname: "DEV1"};
+const selectedConversation = state === null ? null : {
+  conversation_id: "cv_old", state: state === "sprint" ? "running" : state,
+  scope: state === "sprint" ? "sprint" : "interactive", version: 1,
+};
+const newChat = {}, configure = {};
+globalThis.location = {hash: ""};
+const chatHash = (shortname, id) => `${shortname}/${id}`;
+function toast(message) { notices.push(message); }
+function chatBusyToast(error) { throw error; }
+let finishClose;
+globalThis.fetch = async (url, options) => {
+  requests.push({url, method: options.method,
+    body: options.body ? JSON.parse(options.body) : null});
+  if (url === "/api/conversations/cv_old") {
+    if (options.method === "PATCH")
+      return new Promise((resolve) => { finishClose = () => resolve({
+        ok: true, json: async () => ({...selectedConversation, state: "closed", version: 3}),
+      }); });
+    return {ok: true, json: async () => ({...selectedConversation, version: 2})};
+  }
+  if (url === "/api/conversations" && options.method === "POST")
+    return {ok: true, json: async () => ({conversation_id: "cv_new"})};
+  throw new Error("unexpected request " + url);
+};
+""" + handler + r"""
+(async () => {
+  const pending = newChat.onclick();
+  await new Promise(setImmediate);
+  const beforeClose = {requests: [...requests], hash: location.hash};
+  if (finishClose) finishClose();
+  await pending;
+  console.log(JSON.stringify({requests, beforeClose, notices, hash: location.hash}));
+})().catch((error) => { console.error(error); process.exitCode = 1; });
+"""
+    result = run_js(script.replace("STATE", json.dumps(state)))
+    read = {"url": "/api/conversations/cv_old", "method": "GET", "body": None}
+    close_request = {
+        "url": "/api/conversations/cv_old", "method": "PATCH",
+        "body": {"version": 2, "state": "closed"},
+    }
+    create_request = {
+        "url": "/api/conversations", "method": "POST",
+        "body": {"shell_id": "sh_dev"},
+    }
+    expected = [] if state in (None, "sprint") else [read]
+    if state == "idle":
+        expected.append(close_request)
+        assert result["beforeClose"] == {"requests": expected, "hash": ""}
+    if state != "running":
+        expected.append(create_request)
+    assert result["requests"] == expected
+    assert result["hash"] == ("" if state == "running" else "DEV1/cv_new")
+    assert bool(result["notices"]) is (state == "running")
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node is required")
+@pytest.mark.parametrize("first_response", ["/api/models", "/api/flavor-defaults"])
+@pytest.mark.parametrize("already_configuring", [False, True])
+def test_configure_open_requests_cached_catalogue_and_defaults_concurrently(
+    first_response, already_configuring,
+):
+    api_helpers = APP[APP.index("async function api("):
+                      APP.index("function requestKey()")]
+    catalogue = APP[APP.index("let modelCatalogue = null;"):
+                    APP.index("async function renderDefaultModels")]
+    loader = APP[APP.index("let chatConfigurationPromise = null;"):
+                 APP.index("function chatStopStream")]
+    handler = APP[APP.index("  configure.onclick = async"):
+                  APP.index("  side.append(", APP.index("  configure.onclick = async"))]
+    start = APP.index("  if (configuring) {", APP.index("async function renderInterface"))
+    configuring = APP[start:APP.index("  if (!selectedId) {", start)]
+    script = api_helpers + catalogue + loader + r"""
+const configure = {}, root = {}, shell = {shortname: "DEV1"};
+const CHAT_CONFIGURE_ROUTE = "configure";
+const chatRouteConversation = ALREADY_CONFIGURING ? CHAT_CONFIGURE_ROUTE : "";
+const selectedConversation = null;
+const chatCloseForSwitch = async () => true;
+const chatHash = (shortname, id) => `${shortname}/${id}`;
+globalThis.location = {hash: ""};
+const pane = {replaceChildren() {}};
+const el = () => ({});
+const generation = 1, chatRenderGeneration = 1;
+const requests = [], rendered = [], notices = [];
+const pendingResponses = new Map();
+globalThis.fetch = (url, options) => {
+  requests.push({url, method: options.method});
+  return new Promise((resolve) => pendingResponses.set(url, resolve));
+};
+function respond(url) {
+  const data = url === "/api/models"
+    ? {catalogue_generation: "generation-a", stale: false, harnesses: {}}
+    : {flavors: {}};
+  pendingResponses.get(url)({ok: true, json: async () => data});
 }
 function toast(message) { notices.push(message); }
+async function chatRenderNew(pane, shell, defaults, catalog) {
+  rendered.push({defaults, catalog});
+}
+let rendering;
+function renderInterface(root) {
+  rendering = (async () => {
+    const configuring = true;
+""" + configuring + r"""
+  })();
+}
+""" + handler + r"""
 (async () => {
-  const [first, shared] = await Promise.all([
-    chatLoadConfiguration(), chatLoadConfiguration(),
-  ]);
-  previous = current;
+  await configure.onclick();
+  if (!ALREADY_CONFIGURING) renderInterface(root);
+  const shared = chatLoadConfiguration();
+  await new Promise(setImmediate);
+  const beforeResponses = {requests: [...requests], rendered: rendered.length};
+  respond(FIRST_RESPONSE);
+  await new Promise(setImmediate);
+  const afterFirst = {requests: [...requests], rendered: rendered.length};
+  respond(FIRST_RESPONSE === "/api/models" ? "/api/flavor-defaults" : "/api/models");
+  await Promise.all([rendering, shared]);
+  console.log(JSON.stringify({beforeResponses, afterFirst, requests, rendered, notices,
+    hash: location.hash}));
+})().catch((error) => { console.error(error); process.exitCode = 1; });
+"""
+    result = run_js(script.replace("ALREADY_CONFIGURING", json.dumps(already_configuring))
+                    .replace("FIRST_RESPONSE", json.dumps(first_response)))
+    requests = [
+        {"url": "/api/models", "method": "GET"},
+        {"url": "/api/flavor-defaults", "method": "GET"},
+    ]
+    assert result["beforeResponses"] == {"requests": requests, "rendered": 0}
+    assert result["afterFirst"] == {"requests": requests, "rendered": 0}
+    assert result["requests"] == requests
+    assert result["rendered"] == [{
+        "defaults": {"flavors": {}},
+        "catalog": {"catalogue_generation": "generation-a", "stale": False,
+                    "harnesses": {}},
+    }]
+    assert result["notices"] == []
+    assert result["hash"] == ("" if already_configuring else "DEV1/configure")
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node is required")
+def test_ordinary_catalogue_generation_reports_only_new_available_models_once():
+    api_helpers = APP[APP.index("async function api("):
+                      APP.index("function requestKey()")]
+    catalogue = APP[APP.index("let modelCatalogue = null;"):
+                    APP.index("async function renderDefaultModels")]
+    loader = APP[APP.index("let chatConfigurationPromise = null;"):
+                 APP.index("function chatStopStream")]
+    script = api_helpers + catalogue + loader + r"""
+const calls = [], notices = [];
+let current = {catalogue_generation: "generation-a", stale: false, harnesses: {
+  codex: {models: [{id: "old", availability: "available"}]},
+}};
+globalThis.fetch = async (url) => {
+  calls.push(url);
+  if (url !== "/api/models" && url !== "/api/flavor-defaults")
+    throw new Error("unexpected request " + url);
+  return {ok: true, json: async () => url === "/api/models" ? current : {flavors: {}}};
+};
+function toast(message) { notices.push(message); }
+(async () => {
+  const [first, shared] = await Promise.all([chatLoadConfiguration(), chatLoadConfiguration()]);
+  const initialNotices = [...notices];
   await chatLoadConfiguration();
-  current = { ...current, harnesses: { codex: { models: [
+  current = {...current, catalogue_generation: "generation-b", harnesses: {codex: {models: [
     ...current.harnesses.codex.models,
-    { id: "newer", availability: "available" },
-  ] } } };
+    {id: "new", availability: "available"},
+    {id: "hidden", availability: "advisory"},
+  ]}}};
   await chatLoadConfiguration();
-  console.log(JSON.stringify({ calls, notices, shared: first === shared }));
-})();
+  await chatLoadConfiguration();
+  current = {...current, catalogue_generation: "generation-c", stale: true,
+    harnesses: {...current.harnesses, claude: {models: [{id: "newer", availability: "available"}]}}};
+  await chatLoadConfiguration();
+  const staleNotices = [...notices];
+  current = {...current, stale: false};
+  await chatLoadConfiguration();
+  console.log(JSON.stringify({calls, notices, initialNotices, staleNotices, shared: first === shared}));
+})().catch((error) => { console.error(error); process.exitCode = 1; });
 """
     result = run_js(script)
     assert result["shared"] is True
-    assert result["calls"].count("/models?refresh=1") == 3
+    assert result["calls"] == ["/api/models", "/api/flavor-defaults"] * 6
+    assert result["initialNotices"] == []
+    assert result["staleNotices"] == ["New models available!\ncodex: new"]
     assert result["notices"] == [
         "New models available!\ncodex: new",
-        "New models available!\ncodex: newer",
+        "New models available!\nclaude: newer",
     ]
 
 
-def test_chat_entry_actions_refresh_before_opening():
-    interface = APP[APP.index("async function renderInterface"):
-                    APP.index("// ── Tabs + boot")]
-    new_chat = interface[interface.index("newChat.onclick = async"):
-                         interface.index("configure.onclick = async")]
-    assert new_chat.index("await chatLoadConfiguration()") < new_chat.index(
-        "chatCreateConversation(shell)")
-    configure = interface[interface.index("configure.onclick = async"):
-                          interface.index("side.append(")]
-    assert "renderInterface(root)" in configure
+@pytest.mark.skipif(shutil.which("node") is None, reason="node is required")
+@pytest.mark.parametrize("newer_refresh", [False, True])
+@pytest.mark.parametrize("older_starts_first", [False, True])
+def test_superseded_catalogue_response_preserves_newer_toast_baseline(
+    newer_refresh, older_starts_first,
+):
+    api_helpers = APP[APP.index("async function api("):
+                      APP.index("function requestKey()")]
+    catalogue = APP[APP.index("let modelCatalogue = null;"):
+                    APP.index("async function renderDefaultModels")]
+    script = api_helpers + catalogue + r"""
+const calls = [], notices = [], responses = [];
+const oldCatalog = {catalogue_generation: "generation-a", stale: false, harnesses: {
+  codex: {models: [
+    {id: "old", availability: "available"},
+    {id: "retired", availability: "available"},
+  ]},
+}};
+const newCatalog = {catalogue_generation: "generation-b", stale: false, harnesses: {
+  codex: {models: [
+    {id: "old", availability: "available"},
+    {id: "new", availability: "available"},
+  ]},
+}};
+globalThis.fetch = (url) => {
+  calls.push(url);
+  return new Promise((resolve) => responses.push((catalog) => resolve({
+    ok: true, json: async () => catalog,
+  })));
+};
+function toast(message) { notices.push(message); }
+function snapshot() {
+  return {notices: [...notices], generation: modelCatalogue.catalogue_generation};
+}
+(async () => {
+  const initial = loadModelCatalogue();
+  responses[0](oldCatalog);
+  await initial;
+  const initialNotices = [...notices];
+  const firstRead = loadModelCatalogue(OLDER_STARTS_FIRST ? false : NEWER_REFRESH);
+  const secondRead = loadModelCatalogue(OLDER_STARTS_FIRST ? NEWER_REFRESH : false);
+  const olderRead = OLDER_STARTS_FIRST ? firstRead : secondRead;
+  const newerRead = OLDER_STARTS_FIRST ? secondRead : firstRead;
+  const beforeResponses = {calls: [...calls], notices: [...notices]};
+  responses[OLDER_STARTS_FIRST ? 2 : 1](newCatalog);
+  await newerRead;
+  const afterNewerRead = snapshot();
+  responses[OLDER_STARTS_FIRST ? 1 : 2](oldCatalog);
+  await olderRead;
+  const afterOlderRead = snapshot();
+  const repeatedRead = loadModelCatalogue();
+  responses[3](newCatalog);
+  await repeatedRead;
+  console.log(JSON.stringify({calls, initialNotices, beforeResponses,
+    afterNewerRead, afterOlderRead, afterRepeatedRead: snapshot()}));
+})().catch((error) => { console.error(error); process.exitCode = 1; });
+"""
+    result = run_js(script.replace("NEWER_REFRESH", json.dumps(newer_refresh))
+                    .replace("OLDER_STARTS_FIRST", json.dumps(older_starts_first)))
+    newer_request = "/api/models?refresh=1" if newer_refresh else "/api/models"
+    requests = ["/api/models"] + (["/api/models", newer_request] if older_starts_first
+                                  else [newer_request, "/api/models"])
+    expected = {"notices": ["New models available!\ncodex: new"],
+                "generation": "generation-b"}
+    assert result["initialNotices"] == []
+    assert result["beforeResponses"] == {"calls": requests, "notices": []}
+    assert result["afterNewerRead"] == expected
+    assert result["afterOlderRead"] == expected
+    assert result["afterRepeatedRead"] == expected
+    assert result["calls"] == requests + ["/api/models"]
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node is required")
+def test_cached_catalogue_read_does_not_supersede_deferred_refresh():
+    api_helpers = APP[APP.index("async function api("):
+                      APP.index("function requestKey()")]
+    catalogue = APP[APP.index("let modelCatalogue = null;"):
+                    APP.index("async function renderDefaultModels")]
+    script = api_helpers + catalogue + r"""
+const calls = [], notices = [], responses = [];
+const oldCatalog = {catalogue_generation: "generation-a", stale: false, harnesses: {
+  codex: {models: [{id: "old", availability: "available"}]},
+}};
+const newCatalog = {...oldCatalog, catalogue_generation: "generation-b", harnesses: {
+  codex: {models: [...oldCatalog.harnesses.codex.models,
+    {id: "new", availability: "available"}]},
+}};
+globalThis.fetch = (url) => {
+  calls.push(url);
+  return new Promise((resolve) => responses.push((catalog) => resolve({
+    ok: true, json: async () => catalog,
+  })));
+};
+function toast(message) { notices.push(message); }
+function snapshot() {
+  return {notices: [...notices], generation: modelCatalogue.catalogue_generation};
+}
+(async () => {
+  const initial = loadModelCatalogue();
+  responses[0](oldCatalog);
+  await initial;
+  const refresh = loadModelCatalogue(true);
+  const cachedRead = loadModelCatalogue();
+  const beforeResponses = {calls: [...calls], ...snapshot()};
+  responses[2](oldCatalog);
+  await cachedRead;
+  const afterCachedRead = snapshot();
+  responses[1](newCatalog);
+  await refresh;
+  const afterRefresh = snapshot();
+  const repeatedRefresh = loadModelCatalogue(true);
+  // Even an explicit refresh cannot diff or replace the same generation.
+  responses[3]({...newCatalog, harnesses: {codex: {models: [
+    ...newCatalog.harnesses.codex.models,
+    {id: "same-generation", availability: "available"},
+  ]}}});
+  await repeatedRefresh;
+  console.log(JSON.stringify({calls, beforeResponses, afterCachedRead, afterRefresh,
+    afterRepeatedRefresh: snapshot(), baseline: modelCatalogue}));
+})().catch((error) => { console.error(error); process.exitCode = 1; });
+"""
+    result = run_js(script)
+    requests = ["/api/models", "/api/models?refresh=1", "/api/models"]
+    assert result["beforeResponses"] == {
+        "calls": requests, "notices": [], "generation": "generation-a",
+    }
+    assert result["afterCachedRead"] == {"notices": [], "generation": "generation-a"}
+    expected = {"notices": ["New models available!\ncodex: new"],
+                "generation": "generation-b"}
+    assert result["afterRefresh"] == expected
+    assert result["afterRepeatedRefresh"] == expected
+    assert result["baseline"]["harnesses"]["codex"]["models"] == [
+        {"id": "old", "availability": "available"},
+        {"id": "new", "availability": "available"},
+    ]
+    assert result["calls"] == requests + ["/api/models?refresh=1"]
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node is required")
+@pytest.mark.parametrize("generation_time", ["refresh_completed_at", "fetched_at"])
+def test_unseen_older_catalogue_generation_preserves_baseline(generation_time):
+    api_helpers = APP[APP.index("async function api("):
+                      APP.index("function requestKey()")]
+    catalogue = APP[APP.index("let modelCatalogue = null;"):
+                    APP.index("async function renderDefaultModels")]
+    script = api_helpers + catalogue + r"""
+const calls = [], notices = [], responses = [];
+const baseline = {catalogue_generation: "generation-m", stale: false,
+  fetched_at: "2026-09-30T12:00:00+00:00",
+  [GENERATION_TIME]: "2026-09-30T13:00:00.000002+00:00",
+  harnesses: {codex: {models: [{id: "old", availability: "available"}]}},
+};
+const older = {...baseline, catalogue_generation: "generation-z",
+  fetched_at: "2026-09-30T14:00:00+00:00",
+  [GENERATION_TIME]: "2026-09-30T13:00:00.000001+00:00",
+  harnesses: {codex: {models: [{id: "retired", availability: "available"}]}},
+};
+const newer = {...baseline, catalogue_generation: "generation-a",
+  [GENERATION_TIME]: "2026-09-30T13:00:00.000003+00:00",
+  harnesses: {codex: {models: [...baseline.harnesses.codex.models,
+    {id: "new", availability: "available"}]}},
+};
+globalThis.fetch = (url) => {
+  calls.push(url);
+  return new Promise((resolve) => responses.push((catalog) => resolve({
+    ok: true, json: async () => catalog,
+  })));
+};
+function toast(message) { notices.push(message); }
+(async () => {
+  const initial = loadModelCatalogue();
+  const olderRead = loadModelCatalogue();
+  responses[0](baseline);
+  await initial;
+  responses[1](older);
+  await olderRead;
+  const afterOlderRead = {notices: [...notices], baseline: modelCatalogue};
+  const newerRead = loadModelCatalogue();
+  responses[2](newer);
+  await newerRead;
+  console.log(JSON.stringify({calls, afterOlderRead, notices,
+    generation: modelCatalogue.catalogue_generation}));
+})().catch((error) => { console.error(error); process.exitCode = 1; });
+"""
+    result = run_js(script.replace("GENERATION_TIME", json.dumps(generation_time)))
+    assert result["afterOlderRead"]["notices"] == []
+    assert result["afterOlderRead"]["baseline"]["catalogue_generation"] == "generation-m"
+    assert result["afterOlderRead"]["baseline"]["harnesses"]["codex"]["models"] == [
+        {"id": "old", "availability": "available"},
+    ]
+    assert result["notices"] == ["New models available!\ncodex: new"]
+    assert result["generation"] == "generation-a"
+    assert result["calls"] == ["/api/models"] * 3
 
 
 def test_history_more_and_deep_links_are_keyed_and_failure_isolated():
