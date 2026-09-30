@@ -258,6 +258,41 @@ class AssemblerSmokeTest(unittest.TestCase):
         by_id = {row["shell_id"]: row for row in server.get_shells(self.con)}
         self.assertIsNone(by_id[target]["pending_wake_available_at"])
 
+    def _message(self, to_shell: int, body: str, *, read: bool = False) -> int:
+        return self.con.execute(
+            "INSERT INTO shell_messages (from_shell_id,to_shell_id,kind,body,read_at) "
+            "VALUES (?,?,'shell',?,?)",
+            (self.ids["bespoke_shell_id"], to_shell, body,
+             "2026-01-01 00:00:00" if read else None),
+        ).lastrowid
+
+    def test_drain_shell_inbox_marks_read_through_the_seen_id_only(self) -> None:
+        target = self.ids["shell_id"]
+        other = self.ids["bespoke_shell_id"]
+        old = self._message(target, "stale one")
+        seen = self._message(target, "stale two")
+        read = self._message(target, "already read", read=True)
+        late = self._message(target, "landed while confirming")
+        elsewhere = self._message(other, "someone else's")
+        self.con.commit()
+        by_id = {r["shell_id"]: r for r in server.get_shells(self.con)}
+        self.assertEqual(late, by_id[target]["max_unread_message_id"])
+
+        out = server.drain_shell_inbox(self.con, target, seen)
+
+        self.assertEqual(out, {"drained": 2, "unread_message_count": 1,
+                               "max_unread_message_id": late})
+        read_at = {r["message_id"]: r["read_at"] for r in self.con.execute(
+            "SELECT message_id, read_at FROM shell_messages")}
+        self.assertIsNotNone(read_at[old])
+        self.assertIsNotNone(read_at[seen])
+        self.assertEqual(read_at[read], "2026-01-01 00:00:00")
+        self.assertIsNone(read_at[late])
+        self.assertIsNone(read_at[elsewhere])
+        self.assertEqual(4, self.con.execute(
+            "SELECT COUNT(*) FROM shell_messages WHERE to_shell_id=?",
+            (target,)).fetchone()[0], "drain marks read; it never deletes")
+
     def test_get_shells_projects_only_live_current_sprint_conversation(self) -> None:
         shell_id = self.ids["shell_id"]
         self.con.execute(
@@ -1217,6 +1252,78 @@ class FlavorDefaultsTest(unittest.TestCase):
             self.con, {"flavor": "nope", "harness": "claude", "model": "x"})[0])
         self.assertFalse(server.set_flavor_default(
             self.con, {"flavor": "planner", "harness": "claude"})[0])
+
+
+class InboxDrainRouteTest(unittest.TestCase):
+    """POST /api/shells/{id}/inbox/drain — browser operator only."""
+
+    SAME = "http://127.0.0.1:8800"
+
+    def setUp(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.db_path = Path(tmp.name) / "engine.db"
+        con = build_db()
+        con.execute("INSERT INTO users (user_id,username,is_active) VALUES (1,'operator',1)")
+        self.ids = seed(con)
+        con.execute("UPDATE shells SET api_key='shell-token' WHERE shell_id=?",
+                    (self.ids["shell_id"],))
+        self.message_id = con.execute(
+            "INSERT INTO shell_messages (from_shell_id,to_shell_id,kind,body) "
+            "VALUES (?,?,'task','stale')",
+            (self.ids["bespoke_shell_id"], self.ids["shell_id"])).lastrowid
+        con.commit()
+        target = sqlite3.connect(self.db_path)
+        con.backup(target)
+        target.close()
+        con.close()
+        patcher = mock.patch.object(server, "DB_PATH", self.db_path)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def post(self, path, body, *, token=None, origin=SAME):
+        raw = json.dumps(body).encode()
+        lines = ["Host: 127.0.0.1:8800", f"Content-Length: {len(raw)}",
+                 "Content-Type: application/json"]
+        if token:
+            lines.append(f"Authorization: Bearer {token}")
+        if origin:
+            lines += [f"Origin: {origin}", "Sec-Fetch-Site: same-origin"]
+        status, _headers, out = server.dispatch_http(
+            "POST", path, "\r\n".join(lines), raw)
+        return status, json.loads(out)
+
+    def unread(self) -> int:
+        con = sqlite3.connect(self.db_path)
+        try:
+            return con.execute(
+                "SELECT COUNT(*) FROM shell_messages WHERE read_at IS NULL"
+            ).fetchone()[0]
+        finally:
+            con.close()
+
+    def test_operator_drains_the_named_shell(self) -> None:
+        status, out = self.post(
+            f"/api/shells/{self.ids['shell_id']}/inbox/drain",
+            {"through_message_id": self.message_id})
+        self.assertEqual(status, 200, out)
+        self.assertEqual(out, {"drained": 1, "unread_message_count": 0,
+                               "max_unread_message_id": None})
+        self.assertEqual(self.unread(), 0)
+
+    def test_refusals_leave_the_inbox_unread(self) -> None:
+        path = f"/api/shells/{self.ids['shell_id']}/inbox/drain"
+        body = {"through_message_id": self.message_id}
+        cases = [
+            (403, self.post(path, body, token="shell-token")),
+            (403, self.post(path, body, origin="http://evil.example")),
+            (400, self.post(path, {"through_message_id": "7"})),
+            (400, self.post(path, {"through_message_id": True})),
+            (404, self.post("/api/shells/999999/inbox/drain", body)),
+        ]
+        for expected, (status, out) in cases:
+            self.assertEqual(status, expected, out)
+        self.assertEqual(self.unread(), 1)
 
 
 class PatchShellTest(unittest.TestCase):
