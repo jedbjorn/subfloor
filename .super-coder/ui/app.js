@@ -763,6 +763,29 @@ function dmModelPicker(harness, cat, row, save, onRouteChanged = () => {}) {
   return { current, input, results };
 }
 
+let modelCatalogue = null;
+
+async function loadModelCatalogue(refresh = false) {
+  const catalog = await api(refresh ? "/models?refresh=1" : "/models");
+  // Generation IDs are opaque: a changed ID on the ordinary authoritative
+  // response signals a catalogue published since this page last read it.
+  const generationChanged = catalog.catalogue_generation
+    && catalog.catalogue_generation !== modelCatalogue?.catalogue_generation;
+  if (modelCatalogue && !catalog.stale && (refresh || generationChanged)) {
+    const known = new Set(Object.entries(modelCatalogue.harnesses || {}).flatMap(
+      ([harness, block]) => (block.models || []).map((model) => `${harness}/${model.id}`)));
+    const added = Object.entries(catalog.harnesses || {}).flatMap(
+      ([harness, block]) => (block.models || [])
+        .filter((model) => model.availability === "available"
+          && !known.has(`${harness}/${model.id}`))
+        .map((model) => `${harness}: ${model.id}`));
+    if (added.length) toast(`New models available!\n${added.join("\n")}`);
+  }
+  // A failed refresh must not consume the baseline for the next successful read.
+  if (!catalog.stale || !modelCatalogue) modelCatalogue = catalog;
+  return catalog;
+}
+
 async function renderDefaultModels(root, s, catalogOverride = null) {
   root.textContent = "";
   let fd;
@@ -770,7 +793,7 @@ async function renderDefaultModels(root, s, catalogOverride = null) {
   catch (e) { root.append(el("div", { className: "vpanel" }, "flavor-defaults error: " + e.message)); return; }
   let cat = { harnesses: {}, sources: [], fetched_at: null, stale: true };
   if (catalogOverride) cat = catalogOverride;
-  else try { cat = await api("/models"); } catch { /* picker shows Harness default only */ }
+  else try { cat = await loadModelCatalogue(); } catch { /* picker shows Harness default only */ }
 
   const head = el("div", { className: "viewer-head" }, microlabel("Default Models"));
   const refresh = el("button", { className: "act", type: "button", textContent: "↻ Refresh & verify" });
@@ -779,7 +802,7 @@ async function renderDefaultModels(root, s, catalogOverride = null) {
     setStatus("refreshing model catalog and harnesses…");
     let refreshed = null;
     try {
-      refreshed = await api("/models?refresh=1");
+      refreshed = await loadModelCatalogue(true);
       const verification = refreshed.verification || {};
       const warnings = refreshed.stale || verification.error || verification.route_error
         || Object.values(verification.harnesses || {}).some(
@@ -3328,18 +3351,9 @@ let chatConfigurationPromise = null;
 function chatLoadConfiguration() {
   if (chatConfigurationPromise) return chatConfigurationPromise;
   const request = (async () => {
-    const previous = await api("/models");
-    const catalog = await api("/models?refresh=1");
-    const known = new Set(Object.entries(previous.harnesses || {}).flatMap(
-      ([harness, block]) => (block.models || []).map((model) => `${harness}/${model.id}`)));
-    const added = Object.entries(catalog.harnesses || {}).flatMap(
-      ([harness, block]) => (block.models || [])
-        .filter((model) => model.availability === "available"
-          && !known.has(`${harness}/${model.id}`))
-        .map((model) => `${harness}: ${model.id}`));
-    if (!catalog.stale && added.length)
-      toast(`New models available!\n${added.join("\n")}`);
-    const defaults = await api("/flavor-defaults");
+    const [catalog, defaults] = await Promise.all([
+      loadModelCatalogue(), api("/flavor-defaults"),
+    ]);
     return { defaults, catalog };
   })();
   chatConfigurationPromise = request;
@@ -6131,7 +6145,6 @@ async function renderInterface(root) {
     configure.disabled = true;
     newChat.textContent = "Starting…";
     try {
-      await chatLoadConfiguration();
       const conversation = await chatWithShellRelease(
         () => chatCreateConversation(shell));
       location.hash = chatHash(shell.shortname, conversation.conversation_id);

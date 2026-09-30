@@ -602,7 +602,7 @@ const tick = () => new Promise((resolve) => setImmediate(resolve));
     assert "first role" not in result["text"]
 
 
-def test_model_refresh_verifies_and_renders_fork_local_harness_evidence():
+def test_explicit_model_refresh_verifies_renders_evidence_and_toasts_new_models():
     script = r"""
 class FakeElement {
   constructor(tag) {
@@ -631,8 +631,10 @@ const el = (tag, props = {}, ...kids) => {
     node.append(kid?.nodeType ? kid : document.createTextNode(kid ?? ""));
   return node;
 };
-const catalog = {
-  harnesses: {}, sources: ["models.dev", "codex-cache"],
+let catalog = {
+  catalogue_generation: "generation-a",
+  harnesses: {codex: {models: [{id: "old", availability: "available"}]}},
+  sources: ["models.dev", "codex-cache"],
   fetched_at: "2026-08-09T18:00:00+00:00", stale: false,
   verification: {
     checked_at: "2026-08-09T18:01:00+00:00", runtime: "sandbox",
@@ -662,7 +664,8 @@ async function api(path) {
 }
 const statuses = [];
 function setStatus(value) { statuses.push(value); }
-function toast() {}
+const notices = [];
+function toast(message) { notices.push(message); }
 const microlabel = (text) => el("span", {}, text);
 function all(root, predicate, found = []) {
   if (predicate(root)) found.push(root);
@@ -674,9 +677,16 @@ function all(root, predicate, found = []) {
 (async () => {
   const root = new FakeElement("div");
   await renderDefaultModels(root, {});
+  const initialNotices = [...notices];
   const button = all(root, (node) => node.tagName === "button")[0];
+  // The explicit action also diffs responses without a changed generation.
+  catalog = {...catalog, harnesses: {codex: {models: [
+    ...catalog.harnesses.codex.models,
+    {id: "new", availability: "available"},
+    {id: "hidden", availability: "advisory"},
+  ]}}};
   await button.onclick();
-  console.log(JSON.stringify({ text: root.textContent, requests, statuses }));
+  console.log(JSON.stringify({ text: root.textContent, requests, statuses, initialNotices, notices }));
 })().catch((error) => {
   console.error(error.stack || error);
   process.exit(1);
@@ -691,6 +701,8 @@ function all(root, predicate, found = []) {
         "refreshing model catalog and harnesses…",
         "refresh complete — review verification warnings",
     ]
+    assert result["initialNotices"] == []
+    assert result["notices"] == ["New models available!\ncodex: new"]
     assert "Refresh & verify" in result["text"]
     assert "Fork verification" in result["text"]
     assert "codex0.147.0newer-unverified" in result["text"]
