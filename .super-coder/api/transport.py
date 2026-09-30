@@ -31,6 +31,7 @@ browsers and fetch() transparently open the next).
 from __future__ import annotations
 
 import asyncio
+import sys
 import threading
 import time
 
@@ -88,10 +89,13 @@ class Transport:
         self._tcp: asyncio.AbstractServer | None = None
 
     def _write_log(self, message: str) -> None:
-        # print emits text and its newline separately; hold the lock across
-        # the complete call so executor threads cannot merge stamped lines.
         with self._log_lock:
-            self._log(message)
+            # The shared writer must separate this record from a fragment
+            # left by an ordinary print on the same executor worker.
+            if self._log is print and hasattr(sys.stdout, "write_record"):
+                sys.stdout.write_record(message)
+            else:
+                self._log(message)
 
     async def start(self) -> None:
         self._tcp = await asyncio.start_server(

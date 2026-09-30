@@ -204,7 +204,7 @@ class RequestTimingTransportTest(RequestTimingCase):
                 lambda *args: (201, [], b"ok"), path, method="POST",
                 headers="Host: localhost\r\nAuthorization: Bearer header-secret",
                 body=b"body-secret", clock=lambda: next(ticks),
-                log=lambda line: print(line, file=writer),
+                log=writer.write_record,
             )
         lines = output.getvalue().splitlines()
         self.assertEqual(lines, [
@@ -214,6 +214,48 @@ class RequestTimingTransportTest(RequestTimingCase):
         ])
         for secret in ("sk-secret-shaped-value", "header-secret", "body-secret", "private", "a" * 32, path):
             self.assertNotIn(secret, output.getvalue())
+
+    def test_reused_worker_fragment_cannot_contaminate_slow_record(self):
+        for flush in (False, True):
+            with self.subTest(flush=flush):
+                output = io.StringIO()
+                writer = log_lines.TimestampedWriter(
+                    output, clock=lambda: datetime(2026, 9, 30, 12, tzinfo=timezone.utc),
+                )
+                path = "/api/first?token=secret-shaped-value"
+                workers = []
+                ticks = iter((0, 0.1, 0.1, 0.6))
+
+                def handler(method, request_path, headers, body):
+                    workers.append(threading.current_thread())
+                    if request_path == path:
+                        sys.stdout.write("conversation warning " + request_path + " ")
+                        if flush:
+                            sys.stdout.flush()
+                    return 200, [], b"{}"
+
+                instance = transport.Transport(
+                    "127.0.0.1", 0, handler, None,
+                    recorder=self.recorder, clock=lambda: next(ticks),
+                )
+                with mock.patch.object(sys, "stdout", writer), ThreadPoolExecutor(max_workers=1) as executor:
+                    first = executor.submit(
+                        instance._timed_handler, "GET", path, "", b"", 0,
+                    ).result(timeout=10)
+                    second = executor.submit(
+                        instance._timed_handler, "GET", "/api/items/42", "", b"", 0.1,
+                    ).result(timeout=10)
+                self.assertEqual([first[0], second[0]], [200, 200])
+                self.assertIs(workers[0], workers[1])
+                lines = output.getvalue().splitlines()
+                self.assertEqual(lines, [
+                    "2026-09-30T12:00:00Z conversation warning " + path + " ",
+                    "2026-09-30T12:00:00Z request timing method=GET "
+                    "template=GET /api/items/{id} status=200 queue_ms=0.000 "
+                    "app_ms=500.000 db_ms=0.000",
+                ])
+                for content in (path, "secret-shaped-value", "/api/items/42"):
+                    self.assertNotIn(content, lines[1])
 
     def test_concurrent_slow_requests_each_get_a_complete_timestamped_line(self):
         contended = threading.Event()
@@ -232,8 +274,8 @@ class RequestTimingTransportTest(RequestTimingCase):
             def write(self, value):
                 written = super().write(value)
                 if "request timing" in value:
-                    # Pause between print's text and newline until the other
-                    # executor thread attempts to acquire the emission lock.
+                    # Hold complete-record emission until the other executor
+                    # thread attempts to acquire the transport log lock.
                     if not contended.wait(timeout=10):
                         raise AssertionError("second log did not contend")
                 return written
@@ -299,14 +341,16 @@ class RequestTimingTransportTest(RequestTimingCase):
                     if conversation_first:
                         partial_written.set()
                         case.assertTrue(competing_print_done.wait(timeout=10))
-                elif "template=GET /api/first " in value:
+                return written
+
+            def write_record(self, value):
+                written = super().write_record(value)
+                if "template=GET /api/first " in value:
                     if conversation_first:
-                        local.first_timing = True
+                        competing_print_done.set()
                     else:
                         partial_written.set()
                         case.assertTrue(competing_print_done.wait(timeout=10))
-                elif value == "\n" and getattr(local, "first_timing", False):
-                    competing_print_done.set()
                 return written
 
         def clock():

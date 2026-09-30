@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import io
 import logging
+import subprocess
 import sys
 import tempfile
 import threading
@@ -60,12 +61,112 @@ class TimestampedWriterTest(unittest.TestCase):
             f"{STAMP}Subfloor review layer starting\n{STAMP}next\n",
         )
 
-    def test_flush_keeps_partial_line_buffered_until_newline(self) -> None:
+    def test_flush_emits_partial_line_as_separate_record(self) -> None:
         self.writer.write("pending")
         self.writer.flush()
-        self.assertEqual(self.buf.getvalue(), "")
+        self.assertEqual(self.buf.getvalue(), f"{STAMP}pending\n")
+        self.writer.flush()
         self.writer.write(" record\n")
-        self.assertEqual(self.buf.getvalue(), f"{STAMP}pending record\n")
+        self.assertEqual(self.buf.getvalue(), f"{STAMP}pending\n{STAMP} record\n")
+
+    def test_write_record_terminates_only_current_threads_fragment(self) -> None:
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            executor.submit(self.writer.write, "worker pending").result(timeout=10)
+        self.writer.write("current pending")
+        self.assertEqual(self.writer.write_record("record"), 6)
+        self.writer.write_record("already terminated\n")
+        self.assertEqual(self.buf.getvalue(), (
+            f"{STAMP}current pending\n{STAMP}record\n{STAMP}already terminated\n"
+        ))
+        self.writer.drain_all()
+        self.assertTrue(self.buf.getvalue().endswith(f"{STAMP}worker pending\n"))
+
+    def test_worker_flush_preserves_fragment_before_exit(self) -> None:
+        def worker():
+            self.writer.write("worker diagnostic without newline")
+            self.writer.flush()
+
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            executor.submit(worker).result(timeout=10)
+        self.assertEqual(self.buf.getvalue(), f"{STAMP}worker diagnostic without newline\n")
+
+    def test_drain_all_retains_dead_workers_fragments(self) -> None:
+        for message in ("first worker", "second worker"):
+            with ThreadPoolExecutor(max_workers=1) as executor:
+                executor.submit(self.writer.write, message).result(timeout=10)
+        self.writer.write("main thread")
+        self.writer.flush()
+        self.assertEqual(self.buf.getvalue(), f"{STAMP}main thread\n")
+        self.writer.drain_all()
+        self.writer.drain_all()
+        self.assertEqual(self.buf.getvalue(), (
+            f"{STAMP}main thread\n{STAMP}first worker\n{STAMP}second worker\n"
+        ))
+        self.assertEqual(self.writer._pending, {})
+
+    def test_close_drains_every_thread_before_closing_destination(self) -> None:
+        class ClosingStream(io.StringIO):
+            def close(self):
+                self.at_close = self.getvalue()
+                super().close()
+
+        output = ClosingStream()
+        writer = log_lines.TimestampedWriter(output, clock=fixed_clock)
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            executor.submit(writer.write, "worker fragment").result(timeout=10)
+        writer.write("main fragment")
+        writer.close()
+        self.assertTrue(output.closed)
+        self.assertEqual(output.at_close, f"{STAMP}worker fragment\n{STAMP}main fragment\n")
+        self.assertEqual(writer._pending, {})
+
+    def test_process_exit_drains_main_and_dead_worker_fragments(self) -> None:
+        code = (
+            f"import sys; sys.path.insert(0, {str(ROOT / '.super-coder' / 'api')!r})\n"
+            "import log_lines\n"
+            "from concurrent.futures import ThreadPoolExecutor\n"
+            "from datetime import datetime, timezone\n"
+            "log_lines.install(clock=lambda: datetime(2026, 9, 4, 12, tzinfo=timezone.utc))\n"
+            "def worker():\n"
+            "    sys.stdout.write('worker stdout fragment')\n"
+            "    sys.stderr.write('worker stderr fragment')\n"
+            "with ThreadPoolExecutor(max_workers=1) as executor:\n"
+            "    executor.submit(worker).result()\n"
+            "sys.stdout.write('last process diagnostic')\n"
+        )
+        result = subprocess.run(
+            [sys.executable, "-u", "-c", code], capture_output=True, text=True, timeout=10,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertCountEqual(result.stdout.splitlines(), [
+            f"{STAMP}worker stdout fragment", f"{STAMP}last process diagnostic",
+        ])
+        self.assertEqual(result.stderr, f"{STAMP}worker stderr fragment\n")
+
+    def test_partial_stdout_and_complete_stderr_remain_distinct(self) -> None:
+        out = self.writer
+        err = log_lines.TimestampedWriter(self.buf, clock=fixed_clock)
+        partial = threading.Event()
+        completed = threading.Event()
+
+        def first():
+            out.write("stdout fragment ")
+            partial.set()
+            self.assertTrue(completed.wait(timeout=10))
+            out.write("finished\n")
+
+        def second():
+            self.assertTrue(partial.wait(timeout=10))
+            print("stderr complete", file=err, flush=True)
+            completed.set()
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            futures = [executor.submit(worker) for worker in (first, second)]
+            for future in futures:
+                future.result(timeout=10)
+        self.assertEqual(self.buf.getvalue(), (
+            f"{STAMP}stderr complete\n{STAMP}stdout fragment finished\n"
+        ))
 
     def test_partial_line_keeps_its_start_timestamp(self) -> None:
         ticks = iter((fixed_clock(), datetime(2026, 9, 4, 13, tzinfo=timezone.utc)))
