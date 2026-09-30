@@ -25,7 +25,9 @@ import os
 import sqlite3
 import sys
 import tempfile
+import threading
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -1875,6 +1877,14 @@ class CatalogCacheTest(NoCLI):
         mc.CACHE = Path(self.tmp.name) / "model_catalog.json"
         self.addCleanup(self.tmp.cleanup)
         self.addCleanup(lambda: setattr(mc, "CACHE", self._orig))
+        self.addCleanup(self.wait_for_refresh)
+
+    @staticmethod
+    def wait_for_refresh():
+        worker = mc._refresh_thread
+        if worker is not None:
+            worker.join(10)
+            assert not worker.is_alive(), "background catalogue refresh did not finish"
 
     def test_writes_cache_and_serves_it_without_refetch(self):
         first = mc.catalog(fetch=fetch_ok, env={}, run=None)
@@ -1914,9 +1924,15 @@ class CatalogCacheTest(NoCLI):
                 "supported_reasoning_levels": [{"effort": "high"}]}]}))
             refreshed_at = datetime.fromisoformat(first["fetched_at"]).timestamp() + 1
             os.utime(source, (refreshed_at, refreshed_at))
-            second = mc.catalog(fetch=fetch_ok, env=env, run=run)
-        self.assertIn("gpt-new", ids(second["harnesses"]["codex"]))
-        self.assertNotIn("gpt-old", ids(second["harnesses"]["codex"]))
+            with mock.patch.object(mc, "_start_background_refresh") as started:
+                second = mc.catalog(fetch=fetch_ok, env=env, run=run)
+            self.assertTrue(second["stale"])
+            self.assertEqual(second["stale_reason"], "local_source_changed")
+            self.assertIn("gpt-old", ids(second["harnesses"]["codex"]))
+            started.assert_called_once()
+            refreshed = mc.catalog(refresh=True, fetch=fetch_ok, env=env, run=run)
+        self.assertIn("gpt-new", ids(refreshed["harnesses"]["codex"]))
+        self.assertNotIn("gpt-old", ids(refreshed["harnesses"]["codex"]))
 
     def test_global_stale_cache_cannot_replace_successful_live_blocks(self):
         mc.catalog(
@@ -2119,6 +2135,448 @@ class CatalogCacheTest(NoCLI):
                          "floor retains alias family compatibility metadata")
         self.assertEqual(floor_fams.get("fable"), "fable",
                          "fable ships in the floor with its self-tracking alias")
+
+
+class BackgroundCatalogRefreshTest(NoCLI):
+    def setUp(self):
+        super().setUp()
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        root = Path(self.tmp.name)
+        cache = mock.patch.object(mc, "CACHE", root / "catalog.json")
+        cache.start()
+        self.addCleanup(cache.stop)
+        self.source = root / "models_cache.json"
+        self.env = {"CODEX_HOME": str(root), "KIMI_CODE_HOME": str(root)}
+        self.write_models("gpt-old")
+        which = mock.patch.object(
+            mc.shutil, "which",
+            side_effect=lambda name: "/bin/codex" if name == "codex" else None,
+        )
+        which.start()
+        self.addCleanup(which.stop)
+        self.path = root / "engine.db"
+        with contextlib.closing(sqlite3.connect(self.path)) as con:
+            con.executescript((ROOT / ".super-coder/migrations/0075_model_routes.sql").read_text())
+            con.executescript(
+                "CREATE TABLE sprints (sprint_id INTEGER PRIMARY KEY,lifecycle TEXT);"
+                "CREATE TABLE sprint_participants (participant_id INTEGER PRIMARY KEY,sprint_id INTEGER);"
+                "CREATE TABLE flavor_defaults (flavor TEXT,harness TEXT,model TEXT,is_default INTEGER);"
+            )
+            for filename in ("0212_route_binding_foundation.sql", "0217_harness_support_metadata.sql"):
+                con.executescript((ROOT / ".super-coder/migrations" / filename).read_text())
+        self.connection_lock = threading.Lock()
+        self.open_connections = {}
+        self.worker_started = threading.Event()
+        self.allow_refresh = threading.Event()
+        self.block_fetch = False
+        self.fetch = mock.Mock(side_effect=self.fetch_models)
+        self.run = mock.Mock(side_effect=self.run_cli)
+        self.probe = mock.Mock(side_effect=self.probe_harnesses)
+        self.provider = mock.Mock(side_effect=self.provider_models)
+        self.first = self.catalog(refresh=True)
+        for injected in (self.fetch, self.run, self.probe, self.provider):
+            injected.reset_mock()
+        self.addCleanup(self.finish_worker)
+
+    def connect(self):
+        case = self
+        thread_id = threading.get_ident()
+
+        class Connection(sqlite3.Connection):
+            def close(self):
+                super().close()
+                with case.connection_lock:
+                    case.open_connections[thread_id] -= 1
+
+        con = sqlite3.connect(self.path, factory=Connection)
+        con.row_factory = sqlite3.Row
+        with self.connection_lock:
+            self.open_connections[thread_id] = self.open_connections.get(thread_id, 0) + 1
+        return con
+
+    def assert_no_connection(self):
+        with self.connection_lock:
+            self.assertEqual(self.open_connections.get(threading.get_ident(), 0), 0)
+
+    def fetch_models(self, url, headers=None):
+        self.assert_no_connection()
+        if self.block_fetch:
+            self.worker_started.set()
+            self.assertTrue(self.allow_refresh.wait(10), "test did not release refresh")
+        return fetch_ok(url, headers)
+
+    def run_cli(self, *args, **kwargs):
+        self.assert_no_connection()
+        return SimpleNamespace(returncode=0, stdout="codex-cli 0.145.0\n", stderr="")
+
+    def probe_harnesses(self):
+        self.assert_no_connection()
+        return {"codex": runtime_status("0.145.0", harness="codex")}
+
+    def provider_models(self):
+        self.assert_no_connection()
+        return []
+
+    def catalog(self, **kwargs):
+        return mc.catalog(
+            fetch=self.fetch, env=self.env, run=self.run,
+            connection_factory=self.connect, opencode_provider=self.provider,
+            harness_probe=self.probe, **kwargs,
+        )
+
+    def write_models(self, model, **bookkeeping):
+        previous_mtime = self.source.stat().st_mtime_ns if self.source.exists() else 0
+        self.source.write_text(json.dumps({
+            **bookkeeping,
+            "models": [{"slug": model, "supported_reasoning_levels": [{"effort": "high"}]}],
+        }))
+        # Advance even on filesystems with coarse timestamp resolution.
+        changed_at = max(self.source.stat().st_mtime_ns, previous_mtime + 1_000_000_000)
+        os.utime(self.source, ns=(changed_at, changed_at))
+
+    def finish_worker(self):
+        worker = mc._refresh_thread
+        self.allow_refresh.set()
+        if worker is not None:
+            worker.join(10)
+            self.assertFalse(worker.is_alive())
+        self.assertIsNone(mc._refresh_thread)
+
+    def test_twenty_expired_requests_single_refresh_and_no_discard_loop(self):
+        self.write_models("gpt-new")
+        self.block_fetch = True
+        main_thread = threading.get_ident()
+        build_threads = []
+        original_build = mc.build
+
+        def build(fetch, env, run):
+            self.assert_no_connection()
+            build_threads.append(threading.get_ident())
+            self.assertEqual(threading.current_thread().name, "model-catalog-refresh")
+            return original_build(fetch, env, run)
+
+        barrier = threading.Barrier(20)
+
+        def request():
+            barrier.wait(timeout=10)
+            return self.catalog()
+
+        with mock.patch.object(mc, "build", side_effect=build) as builds:
+            with ThreadPoolExecutor(max_workers=20) as pool:
+                futures = [pool.submit(request) for _ in range(20)]
+                responses = [future.result(timeout=10) for future in futures]
+            self.assertTrue(self.worker_started.wait(10))
+            self.assertEqual(builds.call_count, 1)
+            self.assertEqual(len(build_threads), 1)
+            self.assertNotIn(main_thread, build_threads)
+            self.assertEqual(self.fetch.call_count, 1)
+            self.assertEqual(self.probe.call_count, 0)
+            for response in responses:
+                self.assertTrue(response["stale"])
+                self.assertEqual(response["stale_reason"], "local_source_changed")
+                self.assertEqual(response["catalogue_generation"], self.first["catalogue_generation"])
+                self.assertIn("gpt-old", ids(response["harnesses"]["codex"]))
+            # All requests returned while the network sweep remained blocked.
+            self.assertTrue(all(count == 0 for count in self.open_connections.values()))
+            self.finish_worker()
+            next_response = self.catalog()
+            self.assertFalse(next_response["stale"])
+            self.assertNotIn("stale_reason", next_response)
+            self.assertNotEqual(next_response["catalogue_generation"], self.first["catalogue_generation"])
+            self.assertIn("gpt-new", ids(next_response["harnesses"]["codex"]))
+            self.assertEqual(builds.call_count, 1)
+            self.assertEqual(self.probe.call_count, 1)
+            self.assertEqual(next_response["verification"]["summary"]["harnesses_checked"], 1)
+            self.assertGreater(self.run.call_count, 0)
+        with contextlib.closing(self.connect()) as con:
+            self.assertEqual(con.execute("SELECT COUNT(*) FROM model_catalog_generations").fetchone()[0], 2)
+            route = con.execute("SELECT generation_id,stale FROM model_routes WHERE selector='gpt-new'").fetchone()
+            self.assertEqual(tuple(route), (next_response["catalogue_generation"], 0))
+
+    def test_codex_bookkeeping_rewrite_does_not_expire_and_hash_is_memoized(self):
+        self.write_models("gpt-old", fetched_at="later", etag="new-etag", client_version="new")
+        original_read = Path.read_text
+        reads = []
+
+        def read(path, *args, **kwargs):
+            if path == self.source:
+                reads.append(path)
+            return original_read(path, *args, **kwargs)
+
+        with mock.patch.object(Path, "read_text", read), mock.patch.object(
+            mc, "build", wraps=mc.build
+        ) as builds:
+            for _ in range(3):
+                response = self.catalog()
+                self.assertFalse(response["stale"])
+            self.assertEqual(reads, [self.source])
+            self.assertIsNone(mc._refresh_thread)
+            builds.assert_not_called()
+            self.fetch.assert_not_called()
+            self.write_models("gpt-new", fetched_at="later-again", etag="another-etag")
+            self.block_fetch = True
+            response = self.catalog()
+            self.assertEqual(response["stale_reason"], "local_source_changed")
+            self.assertTrue(self.worker_started.wait(10))
+            self.assertEqual(builds.call_count, 1)
+            self.finish_worker()
+            self.assertFalse(self.catalog()["stale"])
+            self.assertEqual(builds.call_count, 1)
+
+    def test_legacy_cache_ignores_codex_bookkeeping_rewrite(self):
+        cached = json.loads(mc.CACHE.read_text())
+        del cached["local_source_hashes"]
+        mc.CACHE.write_text(json.dumps(cached))
+        self.write_models("gpt-old", fetched_at="later", etag="new-etag")
+        with mock.patch.object(mc, "build", wraps=mc.build) as builds:
+            self.assertFalse(self.catalog()["stale"])
+            builds.assert_not_called()
+            self.fetch.assert_not_called()
+            self.assertIsNone(mc._refresh_thread)
+            self.write_models("gpt-new")
+            self.block_fetch = True
+            self.assertEqual(self.catalog()["stale_reason"], "local_source_changed")
+            self.assertTrue(self.worker_started.wait(10))
+            self.finish_worker()
+            self.assertEqual(builds.call_count, 1)
+            self.assertFalse(self.catalog()["stale"])
+
+    def test_legacy_cache_survives_malformed_codex_source(self):
+        cached = json.loads(mc.CACHE.read_text())
+        del cached["local_source_hashes"]
+        mc.CACHE.write_text(json.dumps(cached))
+        self.source.write_text(json.dumps({"models": [None]}))
+        changed_at = self.source.stat().st_mtime_ns + 1_000_000_000
+        os.utime(self.source, ns=(changed_at, changed_at))
+        with mock.patch.object(mc, "_start_background_refresh") as started, mock.patch.object(
+            mc, "build", side_effect=AssertionError("request thread built catalogue")
+        ) as builds:
+            response = self.catalog()
+        self.assertTrue(response["stale"])
+        self.assertEqual(response["stale_reason"], "local_source_changed")
+        self.assertIn("gpt-old", ids(response["harnesses"]["codex"]))
+        self.assertEqual(response["catalogue_generation"], self.first["catalogue_generation"])
+        builds.assert_not_called()
+        started.assert_called_once()
+
+    def test_source_change_during_fetch_publishes_matching_hash_and_models(self):
+        self.write_models("gpt-intermediate")
+        self.block_fetch = True
+        self.assertTrue(self.catalog()["stale"])
+        self.assertTrue(self.worker_started.wait(10))
+        self.write_models("gpt-final")
+        expected_hash = route_bindings.digest_json(json.loads(self.source.read_text())["models"])
+        self.finish_worker()
+        saved = json.loads(mc.CACHE.read_text())
+        self.assertIn("gpt-final", ids(saved["harnesses"]["codex"]))
+        self.assertEqual(saved["local_source_hashes"]["codex-cache"], expected_hash)
+        with mock.patch.object(mc, "_start_background_refresh") as retry, mock.patch.object(
+            mc, "build", side_effect=AssertionError("request thread built catalogue")
+        ) as builds:
+            after = self.catalog()
+        self.assertFalse(after["stale"])
+        self.assertNotIn("stale_reason", after)
+        self.assertEqual(after["catalogue_generation"], saved["catalogue_generation"])
+        retry.assert_not_called()
+        builds.assert_not_called()
+
+    def test_source_change_during_cli_probe_keeps_snapshot_hash_and_models(self):
+        self.write_models("gpt-intermediate")
+        expected_hash = route_bindings.digest_json(json.loads(self.source.read_text())["models"])
+        self.block_fetch = True
+
+        def run(*args, **kwargs):
+            self.write_models("gpt-final")
+            return self.run_cli(*args, **kwargs)
+
+        with mock.patch.object(self, "run", mock.Mock(side_effect=run)):
+            self.assertTrue(self.catalog()["stale"])
+            self.assertTrue(self.worker_started.wait(10))
+            self.finish_worker()
+        saved = json.loads(mc.CACHE.read_text())
+        self.assertIn("gpt-intermediate", ids(saved["harnesses"]["codex"]))
+        self.assertNotIn("gpt-final", ids(saved["harnesses"]["codex"]))
+        self.assertEqual(saved["local_source_hashes"]["codex-cache"], expected_hash)
+        with mock.patch.object(mc, "_start_background_refresh") as retry:
+            self.assertEqual(self.catalog()["stale_reason"], "local_source_changed")
+        retry.assert_called_once()
+
+    @unittest.skipUnless(mc.toml_compat.AVAILABLE, "TOML parser unavailable")
+    def test_kimi_bookkeeping_rewrite_and_model_change(self):
+        source = Path(self.tmp.name) / "config.toml"
+        which = lambda name: "/bin/" + name if name in ("codex", "kimi") else None
+        with mock.patch.object(mc.shutil, "which", side_effect=which):
+            source.write_text('fetched_at = "old"\n[models.alias]\nmodel = "k3"\n')
+            self.catalog(refresh=True)
+            self.fetch.reset_mock()
+            source.write_text('fetched_at = "new"\netag = "new"\n[models.alias]\nmodel = "k3"\n')
+            changed_at = source.stat().st_mtime_ns + 1_000_000_000
+            os.utime(source, ns=(changed_at, changed_at))
+            self.assertFalse(self.catalog()["stale"])
+            self.fetch.assert_not_called()
+            source.write_text('[models.alias]\nmodel = "k4"\n')
+            os.utime(source, ns=(changed_at + 1_000_000_000, changed_at + 1_000_000_000))
+            self.block_fetch = True
+            self.assertEqual(self.catalog()["stale_reason"], "local_source_changed")
+            self.assertTrue(self.worker_started.wait(10))
+            self.assertEqual(self.fetch.call_count, 1)
+            self.finish_worker()
+            self.assertFalse(self.catalog()["stale"])
+
+    def test_ttl_expiry_serves_cache_and_refreshes_in_background(self):
+        cached = json.loads(mc.CACHE.read_text())
+        cached["fetched_at"] = "2020-01-01T00:00:00+00:00"
+        mc.CACHE.write_text(json.dumps(cached))
+        self.block_fetch = True
+        response = self.catalog()
+        self.assertTrue(response["stale"])
+        self.assertEqual(response["stale_reason"], "ttl")
+        self.assertTrue(self.worker_started.wait(10))
+        self.finish_worker()
+        self.assertFalse(self.catalog()["stale"])
+        self.assertEqual(self.fetch.call_count, 1)
+
+    def test_generation_mismatch_serves_cache_and_refreshes_in_background(self):
+        cached = json.loads(mc.CACHE.read_text())
+        cached["catalogue_generation"] = "wrong-generation"
+        mc.CACHE.write_text(json.dumps(cached))
+        self.block_fetch = True
+        response = self.catalog()
+        self.assertTrue(response["stale"])
+        self.assertEqual(response["stale_reason"], "generation_mismatch")
+        self.assertTrue(self.worker_started.wait(10))
+        self.finish_worker()
+        self.assertFalse(self.catalog()["stale"])
+        self.assertEqual(self.fetch.call_count, 1)
+
+    def test_failed_generation_mismatch_refresh_preserves_expiry_and_retries(self):
+        cached = json.loads(mc.CACHE.read_text())
+        cached["catalogue_generation"] = "wrong-generation"
+        mc.CACHE.write_text(json.dumps(cached))
+
+        def probe():
+            self.worker_started.set()
+            self.assertTrue(self.allow_refresh.wait(10))
+            return self.probe_harnesses()
+
+        with mock.patch.object(mc, "build", side_effect=RuntimeError("network down")), mock.patch.object(
+            self, "probe", mock.Mock(side_effect=probe)
+        ):
+            self.assertEqual(self.catalog()["stale_reason"], "generation_mismatch")
+            self.assertTrue(self.worker_started.wait(10))
+            self.finish_worker()
+        saved = json.loads(mc.CACHE.read_text())
+        self.assertEqual(saved["generation_state"], "failed")
+        self.assertTrue(saved["stale"])
+        self.assertEqual(saved["stale_reason"], "generation_mismatch")
+        self.assertIn("gpt-old", ids(saved["harnesses"]["codex"]))
+        with contextlib.closing(self.connect()) as con:
+            self.assertEqual(mc._authoritative_generation(con), saved["catalogue_generation"])
+        self.worker_started.clear()
+        self.allow_refresh.clear()
+        self.block_fetch = True
+        response = self.catalog()
+        self.assertTrue(response["stale"])
+        self.assertEqual(response["stale_reason"], "generation_mismatch")
+        self.assertTrue(self.worker_started.wait(10))
+        self.finish_worker()
+        with mock.patch.object(mc, "build") as builds:
+            self.assertFalse(self.catalog()["stale"])
+        builds.assert_not_called()
+        self.assertEqual(self.fetch.call_count, 1)
+
+    def test_harness_probe_failure_saves_stale_cache_and_retries(self):
+        self.write_models("gpt-new")
+        self.block_fetch = True
+        with mock.patch.object(self, "probe", mock.Mock(side_effect=RuntimeError("verification down"))):
+            self.assertEqual(self.catalog()["stale_reason"], "local_source_changed")
+            self.assertTrue(self.worker_started.wait(10))
+            self.finish_worker()
+        saved = json.loads(mc.CACHE.read_text())
+        self.assertEqual(saved["generation_state"], "failed")
+        self.assertTrue(saved["stale"])
+        self.assertEqual(saved["stale_reason"], "local_source_changed")
+        self.assertIn("harness verification: verification down", saved["errors"])
+        self.assertEqual(saved["local_source_hashes"], mc._local_model_source_hashes(self.env))
+        self.worker_started.clear()
+        self.allow_refresh.clear()
+        response = self.catalog()
+        self.assertTrue(response["stale"])
+        self.assertEqual(response["stale_reason"], "local_source_changed")
+        self.assertTrue(self.worker_started.wait(10))
+        self.finish_worker()
+        after = self.catalog()
+        self.assertFalse(after["stale"], after)
+        self.assertNotIn("stale_reason", after)
+        self.assertEqual(after["generation_state"], "successful")
+        self.assertIn("gpt-new", ids(after["harnesses"]["codex"]))
+        self.assertEqual(self.fetch.call_count, 2)
+
+    def test_background_exception_clears_inflight_and_next_request_retries(self):
+        self.write_models("gpt-new")
+        self.block_fetch = True
+        with mock.patch.object(mc, "_publish_cache_locked", side_effect=RuntimeError("publication failed")):
+            with self.assertLogs(mc.__name__, level="ERROR") as logs:
+                self.assertTrue(self.catalog()["stale"])
+                self.assertTrue(self.worker_started.wait(10))
+                self.finish_worker()
+            self.assertIn("publication failed", "\n".join(logs.output))
+        self.assertIsNone(mc._refresh_thread)
+        self.worker_started.clear()
+        self.allow_refresh.clear()
+        response = self.catalog()
+        self.assertTrue(response["stale"])
+        self.assertTrue(self.worker_started.wait(10))
+        self.finish_worker()
+        self.assertEqual(self.fetch.call_count, 2)
+        self.assertFalse(self.catalog()["stale"])
+
+    def test_failed_sweep_clears_inflight_and_keeps_serving_cache(self):
+        cached = json.loads(mc.CACHE.read_text())
+        cached["fetched_at"] = "2020-01-01T00:00:00+00:00"
+        mc.CACHE.write_text(json.dumps(cached))
+        self.block_fetch = True
+        with mock.patch.object(mc, "build", side_effect=RuntimeError("network down")):
+            # Block verification so the failing worker cannot finish before
+            # the test captures its handle.
+            original_probe = self.probe_harnesses
+
+            def probe():
+                self.worker_started.set()
+                self.assertTrue(self.allow_refresh.wait(10))
+                return original_probe()
+
+            with mock.patch.object(self.probe, "side_effect", probe):
+                self.assertTrue(self.catalog()["stale"])
+                self.assertTrue(self.worker_started.wait(10))
+                self.finish_worker()
+        failed = json.loads(mc.CACHE.read_text())
+        self.assertTrue(failed["stale"])
+        self.assertEqual(failed["error"], "network down")
+        self.assertIn("gpt-old", ids(failed["harnesses"]["codex"]))
+        self.worker_started.clear()
+        self.allow_refresh.clear()
+        self.assertEqual(self.catalog()["stale_reason"], "ttl")
+        self.assertTrue(self.worker_started.wait(10))
+        self.finish_worker()
+        self.assertFalse(self.catalog()["stale"])
+
+    def test_worker_start_failure_serves_cache_and_allows_retry(self):
+        self.write_models("gpt-new")
+        with mock.patch.object(
+            mc.threading.Thread, "start", side_effect=RuntimeError("cannot start thread")
+        ), self.assertLogs(mc.__name__, level="ERROR"):
+            response = self.catalog()
+        self.assertTrue(response["stale"])
+        self.assertEqual(response["stale_reason"], "local_source_changed")
+        self.assertIsNone(mc._refresh_thread)
+        self.fetch.assert_not_called()
+        self.block_fetch = True
+        self.assertTrue(self.catalog()["stale"])
+        self.assertTrue(self.worker_started.wait(10))
+        self.finish_worker()
+        self.assertFalse(self.catalog()["stale"])
 
 
 if __name__ == "__main__":

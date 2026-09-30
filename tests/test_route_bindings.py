@@ -1140,9 +1140,7 @@ class GenerationPersistenceTest(unittest.TestCase):
             "generation_state": "successful",
             "generation_published": True,
         })
-        ordinary_payload = self.payload("ordinary-advisory")
         explicit_payload = self.payload("explicit-route")
-        ordinary_payload.pop("verification")
         explicit_payload.pop("verification")
         statuses = {"codex": self.status()}
 
@@ -1150,8 +1148,10 @@ class GenerationPersistenceTest(unittest.TestCase):
             model_catalog, "CACHE", Path(tmp) / "model_catalog.json"
         ), mock.patch.object(
             model_catalog, "build",
-            side_effect=[ordinary_payload, explicit_payload],
-        ) as build:
+            return_value=explicit_payload,
+        ) as build, mock.patch.object(
+            model_catalog, "_start_background_refresh"
+        ) as background:
             model_catalog.CACHE.write_text(json.dumps(cached))
             ordinary = model_catalog.catalog(
                 con=self.con, opencode_provider=lambda: [],
@@ -1177,19 +1177,18 @@ class GenerationPersistenceTest(unittest.TestCase):
         route = self.con.execute(
             "SELECT selector,generation_id,stale,last_error FROM model_routes"
         ).fetchone()
-        self.assertEqual(build.call_count, 2)
+        self.assertEqual(build.call_count, 1)
+        background.assert_called_once()
         self.assertTrue(ordinary["stale"])
         self.assertEqual(
-            ordinary["error"],
-            "Catalogue refresh required after runtime evidence rebuild",
+            ordinary["stale_reason"], "generation_mismatch",
         )
         self.assertEqual(
             ordinary["harnesses"]["codex"]["models"][0]["id"],
-            "ordinary-advisory",
+            "cached-only",
         )
-        self.assertNotIn("catalogue_generation", ordinary)
-        self.assertTrue(ordinary_cache["stale"])
-        self.assertNotIn("catalogue_generation", ordinary_cache)
+        self.assertEqual(ordinary["catalogue_generation"], cached["catalogue_generation"])
+        self.assertEqual(ordinary_cache, cached)
         self.assertEqual(ordinary_generations, 0)
         self.assertEqual(ordinary_routes, 0)
         self.assertFalse(explicit["stale"])

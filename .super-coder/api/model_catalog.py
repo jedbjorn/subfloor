@@ -32,11 +32,13 @@ from __future__ import annotations
 
 import fcntl
 import json
+import logging
 import os
 import re
 import shutil
 import sqlite3
 import subprocess
+import threading
 import urllib.request
 import uuid
 from contextlib import contextmanager
@@ -85,6 +87,10 @@ CLAUDE_ALIASES = ["fable", "opus", "sonnet", "haiku"]
 # client that expects the new shape.
 PAYLOAD_VERSION = 8
 _GENERATION_TABLE_UNAVAILABLE = object()
+_SOURCE_HASH_LOCK = threading.Lock()
+_SOURCE_HASHES: dict[Path, tuple[int, str | None, object]] = {}
+_REFRESH_LOCK = threading.Lock()
+_refresh_thread: threading.Thread | None = None
 
 # provider APIs, keyed by harness: (env var, url, header builder). Responses
 # are the OpenAI-style {"data": [{"id": ...}, ...]} shape on all three.
@@ -245,7 +251,7 @@ def _from_claude_cli(run) -> list[dict]:
     ]
 
 
-def _from_codex_cache(env, run) -> list[dict]:
+def _from_codex_cache(env, run, *, snapshot=None) -> list[dict]:
     """Read the signed-in Codex CLI's own model cache.
 
     This is stronger evidence than the public OpenAI model list: it describes
@@ -254,14 +260,24 @@ def _from_codex_cache(env, run) -> list[dict]:
     """
     if not shutil.which("codex"):
         return []
-    root = Path(env.get("CODEX_HOME") or (Path.home() / ".codex"))
-    try:
-        data = json.loads((root / "models_cache.json").read_text())
-    except Exception:  # noqa: BLE001  (missing/corrupt = no local evidence)
+    if snapshot is None:
+        root = Path(env.get("CODEX_HOME") or (Path.home() / ".codex"))
+        try:
+            data = json.loads((root / "models_cache.json").read_text())
+            models = data.get("models") or []
+        except Exception:  # noqa: BLE001  (missing/corrupt = no local evidence)
+            return []
+    else:
+        _, models = snapshot
+    if models is None:
         return []
     version = _cli_version("codex", run)
+    return _codex_cache_entries(models, version)
+
+
+def _codex_cache_entries(models, version=None) -> list[dict]:
     entries = []
-    for m in data.get("models") or []:
+    for m in models:
         mid = m.get("slug")
         if not mid or m.get("visibility") == "hide":
             continue
@@ -275,18 +291,28 @@ def _from_codex_cache(env, run) -> list[dict]:
     return entries
 
 
-def _from_kimi_config(env, run) -> list[dict]:
+def _from_kimi_config(env, run, *, snapshot=None) -> list[dict]:
     """Read Kimi's exact user-defined aliases without touching credentials."""
     if not shutil.which("kimi") or not toml_compat.AVAILABLE:
         return []
-    root = Path(env.get("KIMI_CODE_HOME") or (Path.home() / ".kimi-code"))
-    try:
-        data = toml_compat.loads((root / "config.toml").read_text())
-    except Exception:  # noqa: BLE001
+    if snapshot is None:
+        root = Path(env.get("KIMI_CODE_HOME") or (Path.home() / ".kimi-code"))
+        try:
+            data = toml_compat.loads((root / "config.toml").read_text())
+            models = data.get("models") or {}
+        except Exception:  # noqa: BLE001
+            return []
+    else:
+        _, models = snapshot
+    if models is None:
         return []
     version = _cli_version("kimi", run)
+    return _kimi_config_entries(models, version)
+
+
+def _kimi_config_entries(models, version=None) -> list[dict]:
     entries = []
-    for alias, cfg in (data.get("models") or {}).items():
+    for alias, cfg in models.items():
         if not isinstance(cfg, dict) or not cfg.get("model"):
             continue
         effective = {**cfg, **(cfg.get("overrides") or {})}
@@ -325,10 +351,18 @@ def build(fetch=_http_json, env=os.environ, run=subprocess.run) -> dict:
     for harness, extra in _from_provider_apis(fetch, env).items():
         harnesses[harness] = _merge(harnesses.get(harness, []), extra)
         sources.append(f"{HARNESS_PROVIDER[harness]}-api")
+    # Capture after network work, and project the exact content we hashed.
+    snapshots = {
+        source: _local_model_source_snapshot(
+            binary, home_var, default_home, filename, env
+        )
+        for binary, home_var, default_home, filename, source in _LOCAL_MODEL_SOURCES
+    }
+    source_hashes = {source: snapshot[0] for source, snapshot in snapshots.items()}
     local = {
         "claude": _from_claude_cli(run),
-        "codex": _from_codex_cache(env, run),
-        "kimi": _from_kimi_config(env, run),
+        "codex": _from_codex_cache(env, run, snapshot=snapshots["codex-cache"]),
+        "kimi": _from_kimi_config(env, run, snapshot=snapshots["kimi-config"]),
     }
     for harness, entries in local.items():
         if not entries:
@@ -340,6 +374,7 @@ def build(fetch=_http_json, env=os.environ, run=subprocess.run) -> dict:
     result = {"v": PAYLOAD_VERSION,
             "fetched_at": datetime.now(timezone.utc).isoformat(),
             "sources": sources,
+            "local_source_hashes": source_hashes,
             "partial": bool(errors),
             **({"errors": errors} if errors else {}),
             "harnesses": {h: {"families": _families(h, entries),
@@ -355,7 +390,7 @@ def _load_cache() -> dict | None:
         return None
     # A cache written by another payload version would hand the client a
     # shape it can't render — ignore it entirely.
-    return cached if cached.get("v") == PAYLOAD_VERSION else None
+    return cached if isinstance(cached, dict) and cached.get("v") == PAYLOAD_VERSION else None
 
 
 def _authoritative_generation(con):
@@ -421,7 +456,7 @@ def _publish_cache(payload: dict, con=None) -> bool:
 
 
 def _finish_cache_publication(
-    candidate: dict, response: dict, con, opencode_provider, *,
+    candidate: dict, response: dict, con, *,
     publication_locked: bool = False,
 ) -> dict:
     for field in (
@@ -438,10 +473,8 @@ def _finish_cache_publication(
         response["generation_published"] = False
     winner = _load_cache()
     if winner and _cache_matches_authority(winner, con):
-        return _served(_with_live_opencode(
-            {**winner, "stale": bool(winner.get("stale"))},
-            opencode_provider,
-        ), con)
+        # The caller restores the live overlay after closing its connection.
+        return _served({**winner, "stale": bool(winner.get("stale"))}, con)
     return {**response, "stale": True,
             "error": "Catalogue changed during refresh; retry"}
 
@@ -454,30 +487,95 @@ def _fresh(cached: dict) -> bool:
         return False
 
 
-def _local_model_sources_changed(cached: dict, env) -> bool:
-    """Expire the public catalog when a signed-in CLI changes its model list."""
-    try:
-        fetched_at = datetime.fromisoformat(cached["fetched_at"]).timestamp()
-    except (KeyError, TypeError, ValueError):
-        return False  # _fresh already rejects this cache
-    for binary, home_var, default_home, filename, source in (
-        ("codex", "CODEX_HOME", ".codex", "models_cache.json", "codex-cache"),
-        ("kimi", "KIMI_CODE_HOME", ".kimi-code", "config.toml", "kimi-config"),
-    ):
-        if not shutil.which(binary):
-            continue
-        root = Path(env.get(home_var) or (Path.home() / default_home))
+_LOCAL_MODEL_SOURCES = (
+    ("codex", "CODEX_HOME", ".codex", "models_cache.json", "codex-cache"),
+    ("kimi", "KIMI_CODE_HOME", ".kimi-code", "config.toml", "kimi-config"),
+)
+
+
+def _local_model_source_snapshot(binary, home_var, default_home, filename, env):
+    if not shutil.which(binary):
+        return None, None
+    root = Path(env.get(home_var) or (Path.home() / default_home))
+    path = root / filename
+    with _SOURCE_HASH_LOCK:
         try:
-            changed_at = (root / filename).stat().st_mtime
-        except FileNotFoundError:
-            if source in (cached.get("sources") or []):
+            mtime = path.stat().st_mtime_ns
+        except OSError:
+            _SOURCE_HASHES.pop(path, None)
+            return None, None
+        try:
+            previous = _SOURCE_HASHES.get(path)
+            if previous is not None and previous[0] == mtime:
+                return previous[1:]
+            text = path.read_text()
+            data = json.loads(text) if binary == "codex" else toml_compat.loads(text)
+            models = data.get("models") or ([] if binary == "codex" else {})
+            digest = route_bindings.digest_json(models)
+        except Exception:  # noqa: BLE001  (unreadable/corrupt = no local evidence)
+            # Missing/corrupt local evidence is a source change too.
+            _SOURCE_HASHES[path] = (mtime, None, None)
+            return None, None
+        _SOURCE_HASHES[path] = (mtime, digest, models)
+        return digest, models
+
+
+def _local_model_source_hashes(env) -> dict:
+    return {
+        source: _local_model_source_snapshot(
+            binary, home_var, default_home, filename, env
+        )[0]
+        for binary, home_var, default_home, filename, source in _LOCAL_MODEL_SOURCES
+    }
+
+
+def _local_model_sources_changed(cached: dict, env) -> bool:
+    """Compare model content, memoizing each source by its file mtime."""
+    recorded = cached.get("local_source_hashes")
+    for binary, home_var, default_home, filename, source in _LOCAL_MODEL_SOURCES:
+        digest, models = _local_model_source_snapshot(
+            binary, home_var, default_home, filename, env
+        )
+        if recorded is not None:
+            if recorded.get(source) != digest:
                 return True
             continue
-        except OSError:
-            continue  # the live refresh reports unreadable evidence on its own
-        if changed_at > fetched_at:
+        # Caches from before content hashing still describe their local model
+        # entries. Compare that projection without probing the CLI version.
+        old = [
+            {key: value for key, value in entry.items()
+             if key not in {"cli_version", "harness_version", "harness_support_state"}}
+            for entry in (cached.get("harnesses", {}).get(binary, {}).get("models") or [])
+            if entry.get("source") == source
+        ]
+        project = _codex_cache_entries if binary == "codex" else _kimi_config_entries
+        try:
+            current = project(models) if models is not None else []
+        except Exception:  # noqa: BLE001  (malformed source must not break cache reads)
+            return True
+        current = [
+            {key: value for key, value in entry.items() if key != "cli_version"}
+            for entry in current
+        ]
+        if current != old:
             return True
     return False
+
+
+def _cache_expiry_reason(cached, authority, env):
+    if authority is not _GENERATION_TABLE_UNAVAILABLE and (
+        authority is None or cached.get("catalogue_generation") != authority
+    ):
+        return "generation_mismatch"
+    if not _fresh(cached):
+        return "ttl"
+    if _local_model_sources_changed(cached, env):
+        return "local_source_changed"
+    # A failed refresh can publish matching hashes and a matching generation;
+    # its pending expiry still needs a successful refresh before it clears.
+    if cached.get("stale"):
+        return cached.get("stale_reason") or "generation_mismatch"
+    return None
 
 
 _FLOOR_FAMILY = {"fable": "claude-fable", "opus": "claude-opus",
@@ -1313,165 +1411,185 @@ def current_source_fingerprint(harness: str, selector: str, *, env=os.environ,
     return evidence["source_fingerprint"]
 
 
+@contextmanager
+def _catalog_connection(con, connection_factory):
+    if connection_factory is None:
+        yield con
+        return
+    connection = connection_factory()
+    try:
+        yield connection
+    finally:
+        connection.close()
+
+
+def _start_background_refresh(cached, *, fetch, env, run, con,
+                              connection_factory, opencode_provider, harness_probe):
+    """One worker per process; never move a request's SQLite handle to it."""
+    global _refresh_thread
+    with _REFRESH_LOCK:
+        if _refresh_thread is not None or _load_cache() != cached:
+            return
+        if connection_factory is None and con is not None:
+            database = con.execute("PRAGMA database_list").fetchone()[2]
+
+            def connection_factory():
+                if not database:
+                    raise RuntimeError("Background refresh needs a connection factory "
+                                       "for an in-memory database")
+                import db_driver
+                return db_driver.connect(database)
+
+        def refresh_in_background():
+            global _refresh_thread
+            try:
+                catalog(
+                    refresh=True, fetch=fetch, env=env, run=run,
+                    connection_factory=connection_factory,
+                    opencode_provider=opencode_provider, harness_probe=harness_probe,
+                )
+            except Exception:  # noqa: BLE001
+                logging.getLogger(__name__).exception("Background catalogue refresh failed")
+            finally:
+                with _REFRESH_LOCK:
+                    _refresh_thread = None
+
+        _refresh_thread = threading.Thread(
+            target=refresh_in_background, name="model-catalog-refresh", daemon=True,
+        )
+        try:
+            _refresh_thread.start()
+        except Exception:
+            _refresh_thread = None
+            logging.getLogger(__name__).exception("Could not start catalogue refresh")
+
+
 def catalog(refresh: bool = False, fetch=_http_json, env=os.environ,
             run=subprocess.run, con=None,
             opencode_provider=opencode_connected_models,
-            harness_probe=harness_versions.compatibility_status) -> dict:
-    """The cached-with-fallbacks entry point the API serves.
+            harness_probe=harness_versions.compatibility_status,
+            connection_factory=None) -> dict:
+    """Serve any loadable cache immediately; refresh expired caches in one worker.
 
-    fresh cache → serve it; miss/stale/refresh → live sweep, cache the result;
-    sweep failed → stale cache if any, else the static floor. Every response
-    carries `stale` + `fetched_at` so the GUI can say how current it is."""
+    Explicit refresh and first-run sweeps are synchronous. Connections created
+    by the API's factory cover only authority reads and generation publication.
+    """
     with _publication_lock():
         cached = _load_cache()
-        authority = (
-            _GENERATION_TABLE_UNAVAILABLE
-            if refresh else _authoritative_generation(con)
-        )
-        refresh_required = not refresh and con is not None and authority is None
-        serve_cached = bool(
-            cached and not refresh and not refresh_required and _fresh(cached)
-            and (cached.get("stale") or not _local_model_sources_changed(cached, env))
-            and (
-                authority is _GENERATION_TABLE_UNAVAILABLE
-                or cached.get("catalogue_generation") == authority
+        with _catalog_connection(con, connection_factory) as connection:
+            authority = (
+                _GENERATION_TABLE_UNAVAILABLE if refresh
+                else _authoritative_generation(connection)
             )
-        )
-    if serve_cached:
-        assert cached is not None
-        return _served(_with_live_opencode(
-            {**cached, "stale": bool(cached.get("stale"))},
-            opencode_provider), con)
-    refresh_started_at = datetime.now(timezone.utc).isoformat()
-    try:
-        fresh = build(fetch, env, run)
-    except Exception as e:  # noqa: BLE001
-        refresh_completed_at = datetime.now(timezone.utc).isoformat()
-        if cached:
-            response = _with_live_opencode(
-                {
-                    **cached,
-                    "stale": True,
-                    "error": str(e),
-                    "refresh_started_at": refresh_started_at,
-                    "refresh_completed_at": refresh_completed_at,
-                },
-                opencode_provider,
+    reason = _cache_expiry_reason(cached, authority, env) if cached else None
+    if cached and not refresh:
+        response = {**cached, "stale": bool(reason or cached.get("stale"))}
+        if reason:
+            response["stale_reason"] = reason
+            _start_background_refresh(
+                cached, fetch=fetch, env=env, run=run, con=con,
+                connection_factory=connection_factory,
+                opencode_provider=opencode_provider, harness_probe=harness_probe,
             )
-            if refresh and con is not None:
-                verification = runtime_verification(
-                    con, env=env, harness_probe=harness_probe
-                )
-                response["verification"] = verification
-            if not refresh:
-                return _served(response, con)
-            cached_failure = {
-                **cached,
-                "stale": True,
-                "error": str(e),
-                "refresh_started_at": refresh_started_at,
-                "refresh_completed_at": refresh_completed_at,
-            }
-            if "verification" in response:
-                cached_failure["verification"] = response["verification"]
-            if con is not None:
-                with _publication_lock():
-                    response = _served(
-                        response, con, publish=True, publication_locked=True
-                    )
-                    return _finish_cache_publication(
-                        cached_failure, response, con, opencode_provider,
-                        publication_locked=True,
-                    )
-            return _finish_cache_publication(
-                cached_failure, response, con, opencode_provider,
-            )
-        fallback = {
-            "v": PAYLOAD_VERSION, "fetched_at": None,
-            "sources": ["static"], "stale": True,
-            "error": str(e), "harnesses": _floor(),
-            "refresh_started_at": refresh_started_at,
-            "refresh_completed_at": refresh_completed_at,
-        }
-        response = _with_live_opencode(fallback, opencode_provider)
-        if refresh and con is not None:
-            verification = runtime_verification(
-                con, env=env, harness_probe=harness_probe
-            )
-            fallback["verification"] = verification
-            response["verification"] = verification
-        if not refresh:
-            return _served(response, con)
-        if con is not None:
-            with _publication_lock():
-                response = _served(
-                    response, con, publish=True, publication_locked=True
-                )
-                return _finish_cache_publication(
-                    fallback, response, con, opencode_provider,
-                    publication_locked=True,
-                )
-        response = _served(response, con)
-        return _finish_cache_publication(
-            fallback, response, con, opencode_provider,
-        )
-    response = _with_live_opencode(
-        {**fresh, "stale": False}, opencode_provider
+        return _served(_with_live_opencode(response, opencode_provider))
+    return _refresh_catalog(
+        cached, refresh=refresh, fetch=fetch, env=env, run=run, con=con,
+        connection_factory=connection_factory, opencode_provider=opencode_provider,
+        harness_probe=harness_probe,
+        refresh_required=authority is None,
+        expiry_reason=reason,
     )
-    response["refresh_started_at"] = refresh_started_at
-    response["refresh_completed_at"] = datetime.now(timezone.utc).isoformat()
-    if refresh_required and not refresh:
+
+
+def _refresh_catalog(cached, *, refresh, fetch, env, run, con, connection_factory,
+                     opencode_provider, harness_probe, refresh_required=False,
+                     expiry_reason=None):
+    started_at = datetime.now(timezone.utc).isoformat()
+    failed = False
+    try:
+        candidate = build(fetch, env, run)
+        if "local_source_hashes" not in candidate:
+            candidate["local_source_hashes"] = _local_model_source_hashes(env)
+        candidate["stale"] = False
+        candidate.pop("stale_reason", None)
+    except Exception as exc:  # noqa: BLE001
+        failed = True
+        candidate = {
+            **(cached or {
+                "v": PAYLOAD_VERSION, "fetched_at": None,
+                "sources": ["static"], "harnesses": _floor(),
+            }),
+            "stale": True, "error": str(exc),
+            "stale_reason": expiry_reason or "generation_mismatch",
+        }
+    candidate["refresh_started_at"] = started_at
+    candidate["refresh_completed_at"] = datetime.now(timezone.utc).isoformat()
+    response = _with_live_opencode(candidate, opencode_provider)
+    if not failed:
+        completed_at = datetime.now(timezone.utc).isoformat()
+        candidate["refresh_completed_at"] = completed_at
+        response["refresh_completed_at"] = completed_at
+    if not refresh and refresh_required and not failed:
         message = "Catalogue refresh required after runtime evidence rebuild"
-        response["stale"] = True
-        response["error"] = message
-        fresh["stale"] = True
-        fresh["error"] = message
-    if refresh and con is not None:
-        probe_error = None
+        candidate.update(stale=True, error=message)
+        response.update(stale=True, error=message)
+    if failed and not refresh:
+        return _served(response)
+
+    publish_routes = refresh and (con is not None or connection_factory is not None)
+    probe_error = None
+    if publish_routes:
+        # Subprocess/network probes happen before a publication connection opens.
         try:
             harnesses = _runtime_statuses(harness_probe)
         except Exception as exc:  # noqa: BLE001
             harnesses = {}
             probe_error = str(exc)
-            response["partial"] = True
-            response["stale"] = True
-            response["errors"] = [*(response.get("errors") or []),
-                                  f"harness verification: {probe_error}"]
+            if not failed:
+                for payload in (candidate, response):
+                    payload["partial"] = True
+                    payload["stale"] = True
+                    payload["stale_reason"] = expiry_reason or "generation_mismatch"
+                    payload["errors"] = [*(payload.get("errors") or []),
+                                         f"harness verification: {probe_error}"]
+
+        def captured_probe():
+            if probe_error is not None:
+                raise RuntimeError(probe_error)
+            return harnesses
+
         response["verification"] = {
             "runtime": "sandbox" if env.get("SC_SANDBOX") else "host",
             "harnesses": harnesses,
         }
-        _project_route_support(response, harnesses)
-        _project_route_support(fresh, harnesses)
-        with _publication_lock():
-            response = _served(
-                response, con, publish=True, publication_locked=True
-            )
+        if not failed:
+            _project_route_support(response, harnesses)
+            _project_route_support(candidate, harnesses)
 
-            def captured_probe():
-                if probe_error is not None:
-                    raise RuntimeError(probe_error)
-                return harnesses
-
-            verification = runtime_verification(
-                con, env=env, harness_probe=captured_probe
-            )
-            fresh["verification"] = verification
-            response["verification"] = verification
-            if response.get("partial"):
-                fresh["partial"] = True
-                fresh["errors"] = (
-                    response.get("errors") or fresh.get("errors") or []
+    with _publication_lock():
+        with _catalog_connection(con, connection_factory) as connection:
+            if publish_routes and failed:
+                verification = runtime_verification(
+                    connection, env=env, harness_probe=captured_probe,
                 )
-            return _finish_cache_publication(
-                fresh, response, con, opencode_provider,
+                candidate["verification"] = verification
+                response["verification"] = verification
+            response = _served(
+                response, connection, publish=publish_routes, publication_locked=True,
+            )
+            if publish_routes and not failed:
+                verification = runtime_verification(
+                    connection, env=env, harness_probe=captured_probe,
+                )
+                candidate["verification"] = verification
+                response["verification"] = verification
+            if response.get("partial"):
+                candidate["partial"] = True
+                candidate["errors"] = response.get("errors") or candidate.get("errors") or []
+            result = _finish_cache_publication(
+                candidate, response, connection,
                 publication_locked=True,
             )
-    else:
-        response = _served(response, con)
-    if response.get("partial"):
-        fresh["partial"] = True
-        fresh["errors"] = response.get("errors") or fresh.get("errors") or []
-    return _finish_cache_publication(
-        fresh, response, con, opencode_provider,
-    )
+    if result.get("catalogue_generation") != response.get("catalogue_generation"):
+        return _served(_with_live_opencode(result, opencode_provider))
+    return result
