@@ -248,7 +248,7 @@ def _from_claude_cli(run) -> list[dict]:
     ]
 
 
-def _from_codex_cache(env, run) -> list[dict]:
+def _from_codex_cache(env, run, *, snapshot=None) -> list[dict]:
     """Read the signed-in Codex CLI's own model cache.
 
     This is stronger evidence than the public OpenAI model list: it describes
@@ -257,13 +257,19 @@ def _from_codex_cache(env, run) -> list[dict]:
     """
     if not shutil.which("codex"):
         return []
-    root = Path(env.get("CODEX_HOME") or (Path.home() / ".codex"))
-    try:
-        data = json.loads((root / "models_cache.json").read_text())
-    except Exception:  # noqa: BLE001  (missing/corrupt = no local evidence)
+    if snapshot is None:
+        root = Path(env.get("CODEX_HOME") or (Path.home() / ".codex"))
+        try:
+            data = json.loads((root / "models_cache.json").read_text())
+            models = data.get("models") or []
+        except Exception:  # noqa: BLE001  (missing/corrupt = no local evidence)
+            return []
+    else:
+        _, models = snapshot
+    if models is None:
         return []
     version = _cli_version("codex", run)
-    return _codex_cache_entries(data.get("models") or [], version)
+    return _codex_cache_entries(models, version)
 
 
 def _codex_cache_entries(models, version=None) -> list[dict]:
@@ -282,17 +288,23 @@ def _codex_cache_entries(models, version=None) -> list[dict]:
     return entries
 
 
-def _from_kimi_config(env, run) -> list[dict]:
+def _from_kimi_config(env, run, *, snapshot=None) -> list[dict]:
     """Read Kimi's exact user-defined aliases without touching credentials."""
     if not shutil.which("kimi") or not toml_compat.AVAILABLE:
         return []
-    root = Path(env.get("KIMI_CODE_HOME") or (Path.home() / ".kimi-code"))
-    try:
-        data = toml_compat.loads((root / "config.toml").read_text())
-    except Exception:  # noqa: BLE001
+    if snapshot is None:
+        root = Path(env.get("KIMI_CODE_HOME") or (Path.home() / ".kimi-code"))
+        try:
+            data = toml_compat.loads((root / "config.toml").read_text())
+            models = data.get("models") or {}
+        except Exception:  # noqa: BLE001
+            return []
+    else:
+        _, models = snapshot
+    if models is None:
         return []
     version = _cli_version("kimi", run)
-    return _kimi_config_entries(data.get("models") or {}, version)
+    return _kimi_config_entries(models, version)
 
 
 def _kimi_config_entries(models, version=None) -> list[dict]:
@@ -325,7 +337,6 @@ def _prefer(preferred: list[dict], advisory: list[dict]) -> list[dict]:
 def build(fetch=_http_json, env=os.environ, run=subprocess.run) -> dict:
     """One live sweep across all sources. Raises only if EVERY source fails —
     partial results (e.g. models.dev down but a keyed API up) still count."""
-    source_hashes = _local_model_source_hashes(env)
     harnesses: dict[str, list[dict]] = {}
     sources: list[str] = []
     errors: list[str] = []
@@ -337,10 +348,18 @@ def build(fetch=_http_json, env=os.environ, run=subprocess.run) -> dict:
     for harness, extra in _from_provider_apis(fetch, env).items():
         harnesses[harness] = _merge(harnesses.get(harness, []), extra)
         sources.append(f"{HARNESS_PROVIDER[harness]}-api")
+    # Capture after network work, and project the exact content we hashed.
+    snapshots = {
+        source: _local_model_source_snapshot(
+            binary, home_var, default_home, filename, env
+        )
+        for binary, home_var, default_home, filename, source in _LOCAL_MODEL_SOURCES
+    }
+    source_hashes = {source: snapshot[0] for source, snapshot in snapshots.items()}
     local = {
         "claude": _from_claude_cli(run),
-        "codex": _from_codex_cache(env, run),
-        "kimi": _from_kimi_config(env, run),
+        "codex": _from_codex_cache(env, run, snapshot=snapshots["codex-cache"]),
+        "kimi": _from_kimi_config(env, run, snapshot=snapshots["kimi-config"]),
     }
     for harness, entries in local.items():
         if not entries:
@@ -527,7 +546,10 @@ def _local_model_sources_changed(cached: dict, env) -> bool:
             if entry.get("source") == source
         ]
         project = _codex_cache_entries if binary == "codex" else _kimi_config_entries
-        current = project(models) if models is not None else []
+        try:
+            current = project(models) if models is not None else []
+        except Exception:  # noqa: BLE001  (malformed source must not break cache reads)
+            return True
         current = [
             {key: value for key, value in entry.items() if key != "cli_version"}
             for entry in current
@@ -535,6 +557,22 @@ def _local_model_sources_changed(cached: dict, env) -> bool:
         if current != old:
             return True
     return False
+
+
+def _cache_expiry_reason(cached, authority, env):
+    if authority is not _GENERATION_TABLE_UNAVAILABLE and (
+        authority is None or cached.get("catalogue_generation") != authority
+    ):
+        return "generation_mismatch"
+    if not _fresh(cached):
+        return "ttl"
+    if _local_model_sources_changed(cached, env):
+        return "local_source_changed"
+    # A failed refresh can publish matching hashes and a matching generation;
+    # its pending expiry still needs a successful refresh before it clears.
+    if cached.get("stale"):
+        return cached.get("stale_reason") or "generation_mismatch"
+    return None
 
 
 _FLOOR_FAMILY = {"fable": "claude-fable", "opus": "claude-opus",
@@ -1432,16 +1470,8 @@ def catalog(refresh: bool = False, fetch=_http_json, env=os.environ,
                 _GENERATION_TABLE_UNAVAILABLE if refresh
                 else _authoritative_generation(connection)
             )
+    reason = _cache_expiry_reason(cached, authority, env) if cached else None
     if cached and not refresh:
-        reason = None
-        if authority is not _GENERATION_TABLE_UNAVAILABLE and (
-            authority is None or cached.get("catalogue_generation") != authority
-        ):
-            reason = "generation_mismatch"
-        elif not _fresh(cached):
-            reason = "ttl"
-        elif _local_model_sources_changed(cached, env):
-            reason = "local_source_changed"
         response = {**cached, "stale": bool(reason or cached.get("stale"))}
         if reason:
             response["stale_reason"] = reason
@@ -1456,18 +1486,21 @@ def catalog(refresh: bool = False, fetch=_http_json, env=os.environ,
         connection_factory=connection_factory, opencode_provider=opencode_provider,
         harness_probe=harness_probe,
         refresh_required=authority is None,
+        expiry_reason=reason,
     )
 
 
 def _refresh_catalog(cached, *, refresh, fetch, env, run, con, connection_factory,
-                     opencode_provider, harness_probe, refresh_required=False):
+                     opencode_provider, harness_probe, refresh_required=False,
+                     expiry_reason=None):
     started_at = datetime.now(timezone.utc).isoformat()
-    source_hashes = _local_model_source_hashes(env)
     failed = False
     try:
         candidate = build(fetch, env, run)
-        candidate.setdefault("local_source_hashes", source_hashes)
+        if "local_source_hashes" not in candidate:
+            candidate["local_source_hashes"] = _local_model_source_hashes(env)
         candidate["stale"] = False
+        candidate.pop("stale_reason", None)
     except Exception as exc:  # noqa: BLE001
         failed = True
         candidate = {
@@ -1476,8 +1509,8 @@ def _refresh_catalog(cached, *, refresh, fetch, env, run, con, connection_factor
                 "sources": ["static"], "harnesses": _floor(),
             }),
             "stale": True, "error": str(exc),
+            "stale_reason": expiry_reason or "generation_mismatch",
         }
-    candidate.pop("stale_reason", None)
     candidate["refresh_started_at"] = started_at
     candidate["refresh_completed_at"] = datetime.now(timezone.utc).isoformat()
     response = _with_live_opencode(candidate, opencode_provider)
@@ -1502,10 +1535,12 @@ def _refresh_catalog(cached, *, refresh, fetch, env, run, con, connection_factor
             harnesses = {}
             probe_error = str(exc)
             if not failed:
-                response["partial"] = True
-                response["stale"] = True
-                response["errors"] = [*(response.get("errors") or []),
-                                      f"harness verification: {probe_error}"]
+                for payload in (candidate, response):
+                    payload["partial"] = True
+                    payload["stale"] = True
+                    payload["stale_reason"] = expiry_reason or "generation_mismatch"
+                    payload["errors"] = [*(payload.get("errors") or []),
+                                         f"harness verification: {probe_error}"]
 
         def captured_probe():
             if probe_error is not None:

@@ -2342,6 +2342,66 @@ class BackgroundCatalogRefreshTest(NoCLI):
             self.assertEqual(builds.call_count, 1)
             self.assertFalse(self.catalog()["stale"])
 
+    def test_legacy_cache_survives_malformed_codex_source(self):
+        cached = json.loads(mc.CACHE.read_text())
+        del cached["local_source_hashes"]
+        mc.CACHE.write_text(json.dumps(cached))
+        self.source.write_text(json.dumps({"models": [None]}))
+        changed_at = self.source.stat().st_mtime_ns + 1_000_000_000
+        os.utime(self.source, ns=(changed_at, changed_at))
+        with mock.patch.object(mc, "_start_background_refresh") as started, mock.patch.object(
+            mc, "build", side_effect=AssertionError("request thread built catalogue")
+        ) as builds:
+            response = self.catalog()
+        self.assertTrue(response["stale"])
+        self.assertEqual(response["stale_reason"], "local_source_changed")
+        self.assertIn("gpt-old", ids(response["harnesses"]["codex"]))
+        self.assertEqual(response["catalogue_generation"], self.first["catalogue_generation"])
+        builds.assert_not_called()
+        started.assert_called_once()
+
+    def test_source_change_during_fetch_publishes_matching_hash_and_models(self):
+        self.write_models("gpt-intermediate")
+        self.block_fetch = True
+        self.assertTrue(self.catalog()["stale"])
+        self.assertTrue(self.worker_started.wait(10))
+        self.write_models("gpt-final")
+        expected_hash = route_bindings.digest_json(json.loads(self.source.read_text())["models"])
+        self.finish_worker()
+        saved = json.loads(mc.CACHE.read_text())
+        self.assertIn("gpt-final", ids(saved["harnesses"]["codex"]))
+        self.assertEqual(saved["local_source_hashes"]["codex-cache"], expected_hash)
+        with mock.patch.object(mc, "_start_background_refresh") as retry, mock.patch.object(
+            mc, "build", side_effect=AssertionError("request thread built catalogue")
+        ) as builds:
+            after = self.catalog()
+        self.assertFalse(after["stale"])
+        self.assertNotIn("stale_reason", after)
+        self.assertEqual(after["catalogue_generation"], saved["catalogue_generation"])
+        retry.assert_not_called()
+        builds.assert_not_called()
+
+    def test_source_change_during_cli_probe_keeps_snapshot_hash_and_models(self):
+        self.write_models("gpt-intermediate")
+        expected_hash = route_bindings.digest_json(json.loads(self.source.read_text())["models"])
+        self.block_fetch = True
+
+        def run(*args, **kwargs):
+            self.write_models("gpt-final")
+            return self.run_cli(*args, **kwargs)
+
+        with mock.patch.object(self, "run", mock.Mock(side_effect=run)):
+            self.assertTrue(self.catalog()["stale"])
+            self.assertTrue(self.worker_started.wait(10))
+            self.finish_worker()
+        saved = json.loads(mc.CACHE.read_text())
+        self.assertIn("gpt-intermediate", ids(saved["harnesses"]["codex"]))
+        self.assertNotIn("gpt-final", ids(saved["harnesses"]["codex"]))
+        self.assertEqual(saved["local_source_hashes"]["codex-cache"], expected_hash)
+        with mock.patch.object(mc, "_start_background_refresh") as retry:
+            self.assertEqual(self.catalog()["stale_reason"], "local_source_changed")
+        retry.assert_called_once()
+
     @unittest.skipUnless(mc.toml_compat.AVAILABLE, "TOML parser unavailable")
     def test_kimi_bookkeeping_rewrite_and_model_change(self):
         source = Path(self.tmp.name) / "config.toml"
@@ -2389,6 +2449,69 @@ class BackgroundCatalogRefreshTest(NoCLI):
         self.finish_worker()
         self.assertFalse(self.catalog()["stale"])
         self.assertEqual(self.fetch.call_count, 1)
+
+    def test_failed_generation_mismatch_refresh_preserves_expiry_and_retries(self):
+        cached = json.loads(mc.CACHE.read_text())
+        cached["catalogue_generation"] = "wrong-generation"
+        mc.CACHE.write_text(json.dumps(cached))
+
+        def probe():
+            self.worker_started.set()
+            self.assertTrue(self.allow_refresh.wait(10))
+            return self.probe_harnesses()
+
+        with mock.patch.object(mc, "build", side_effect=RuntimeError("network down")), mock.patch.object(
+            self, "probe", mock.Mock(side_effect=probe)
+        ):
+            self.assertEqual(self.catalog()["stale_reason"], "generation_mismatch")
+            self.assertTrue(self.worker_started.wait(10))
+            self.finish_worker()
+        saved = json.loads(mc.CACHE.read_text())
+        self.assertEqual(saved["generation_state"], "failed")
+        self.assertTrue(saved["stale"])
+        self.assertEqual(saved["stale_reason"], "generation_mismatch")
+        self.assertIn("gpt-old", ids(saved["harnesses"]["codex"]))
+        with contextlib.closing(self.connect()) as con:
+            self.assertEqual(mc._authoritative_generation(con), saved["catalogue_generation"])
+        self.worker_started.clear()
+        self.allow_refresh.clear()
+        self.block_fetch = True
+        response = self.catalog()
+        self.assertTrue(response["stale"])
+        self.assertEqual(response["stale_reason"], "generation_mismatch")
+        self.assertTrue(self.worker_started.wait(10))
+        self.finish_worker()
+        with mock.patch.object(mc, "build") as builds:
+            self.assertFalse(self.catalog()["stale"])
+        builds.assert_not_called()
+        self.assertEqual(self.fetch.call_count, 1)
+
+    def test_harness_probe_failure_saves_stale_cache_and_retries(self):
+        self.write_models("gpt-new")
+        self.block_fetch = True
+        with mock.patch.object(self, "probe", mock.Mock(side_effect=RuntimeError("verification down"))):
+            self.assertEqual(self.catalog()["stale_reason"], "local_source_changed")
+            self.assertTrue(self.worker_started.wait(10))
+            self.finish_worker()
+        saved = json.loads(mc.CACHE.read_text())
+        self.assertEqual(saved["generation_state"], "failed")
+        self.assertTrue(saved["stale"])
+        self.assertEqual(saved["stale_reason"], "local_source_changed")
+        self.assertIn("harness verification: verification down", saved["errors"])
+        self.assertEqual(saved["local_source_hashes"], mc._local_model_source_hashes(self.env))
+        self.worker_started.clear()
+        self.allow_refresh.clear()
+        response = self.catalog()
+        self.assertTrue(response["stale"])
+        self.assertEqual(response["stale_reason"], "local_source_changed")
+        self.assertTrue(self.worker_started.wait(10))
+        self.finish_worker()
+        after = self.catalog()
+        self.assertFalse(after["stale"], after)
+        self.assertNotIn("stale_reason", after)
+        self.assertEqual(after["generation_state"], "successful")
+        self.assertIn("gpt-new", ids(after["harnesses"]["codex"]))
+        self.assertEqual(self.fetch.call_count, 2)
 
     def test_background_exception_clears_inflight_and_next_request_retries(self):
         self.write_models("gpt-new")
