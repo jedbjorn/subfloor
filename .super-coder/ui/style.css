@@ -1397,10 +1397,10 @@ button.gmenu-name:hover { color: #fff; }
 .modal-foot-start, .modal-foot-end { display: flex; align-items: center; gap: .6rem; }
 .modal-foot-end { margin-left: auto; }
 .modal-foot .act { margin-top: 0; }
-/* slide-out confirm — enters from the right edge, compact, action last/right */
-.modal-overlay.slide-confirm-overlay { justify-content: flex-end; }
+/* slide-out confirm — under the shell's rail row, entering from the left */
+.modal-overlay.slide-confirm-overlay { background: rgba(0,0,0,.35); }
 .slide-confirm {
-  width: 360px; max-width: 92vw; margin-right: 1.2rem; padding: 1.1rem 1.2rem .9rem;
+  position: absolute; width: 380px; max-width: 92vw; padding: 1.1rem 1.2rem .9rem;
   border-radius: 14px; border: 1px solid rgba(255,255,255,.10);
   background: var(--menu-bg); box-shadow: var(--menu-shadow);
   animation: slide-confirm-in .18s ease-out;
@@ -1408,7 +1408,7 @@ button.gmenu-name:hover { color: #fff; }
 .slide-confirm-body { color: var(--dim); font-size: .85rem; margin: .6rem 0 .4rem; }
 .slide-confirm-actions { display: flex; justify-content: space-between; }
 button.act.primary.danger { background: #ef545f; border-color: #ef545f; color: #fff; }
-@keyframes slide-confirm-in { from { transform: translateX(110%); opacity: 0; } }
+@keyframes slide-confirm-in { from { transform: translateX(-110%); opacity: 0; } }
 @media (prefers-reduced-motion: reduce) { .slide-confirm { animation: none; } }
 
 /* ── Markdown surfaces (vendored marked + DOMPurify; dos-arch ramp on flat
