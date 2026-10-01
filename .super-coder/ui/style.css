@@ -595,12 +595,33 @@ body.interface-view main {
   padding: .8rem clamp(1rem, 4vw, 4rem) 1rem; border-top: 1px solid var(--line);
   background: var(--bg);
 }
-.chat-composer.drop-target .chat-composer-input {
+.chat-composer.drop-target .chat-composer-field {
   border-color: var(--accent); box-shadow: 0 0 0 2px var(--accent);
 }
-.chat-composer-input {
-  min-height: 72px; max-height: 220px; resize: vertical;
-  border-radius: 12px; padding: .7rem .8rem;
+.chat-composer-field {
+  border: 1px solid var(--line); border-radius: 12px; background: var(--panel2);
+}
+.chat-composer-field:focus-within { border-color: rgba(255,255,255,.25); }
+.chat-composer-field .chat-composer-input {
+  display: block; min-height: 72px; max-height: 220px; resize: vertical;
+  border: 0; border-radius: 12px; padding: .7rem .8rem;
+}
+.chat-attachment-chips { display: flex; flex-wrap: wrap; gap: .4rem; padding: 0 .8rem .7rem; }
+.chat-attachment-chips[hidden] { display: none; }
+.chat-attachment-chip {
+  display: inline-flex; align-items: center; gap: .35rem; min-width: 0; max-width: 100%;
+  padding: .2rem .35rem .2rem .6rem; border: 1px solid var(--line); border-radius: 7px;
+  background: var(--panel); font-size: .78rem;
+}
+.chat-attachment-name { white-space: nowrap; }
+.chat-attachment-remove {
+  flex: none; width: 20px; height: 20px; opacity: 0;
+  border: 0; padding: 0; background: none; color: #ef545f; cursor: pointer; font: inherit;
+}
+.chat-attachment-chip:focus-within .chat-attachment-remove,
+.chat-attachment-chip:hover .chat-attachment-remove { opacity: 1; }
+@media (hover: none) {
+  .chat-attachment-remove { opacity: 1; }
 }
 .chat-compose-actions {
   display: flex; align-items: center; justify-content: flex-end; gap: .7rem;

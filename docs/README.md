@@ -671,7 +671,9 @@ accepts sniffed PNG/JPEG/GIF/WebP images, plus PDF, Word (`.docx`), Excel
 `.tsv`, `.json`, `.yaml`, `.yml`, `.log`) whose content matches their
 extension. It stores each file content-addressed under
 `shared/chat-uploads/<conversation>/` (documents keep a sanitized copy of
-their name), and the composer inserts `[image: <absolute path>]` or
+their name). Images appear as compact `image 1`, `image 2` chips in the
+composer. Hover or focus a chip to reveal its X and remove it before sending.
+Sending inserts `[image: <absolute path>]`; documents insert
 `[file: <absolute path>]` into the message — so every harness reads it by
 path, with no adapter difference. Uploads are capped at 8 MiB; only images
 over the cap are downscaled in the browser. Upload directories of closed or
