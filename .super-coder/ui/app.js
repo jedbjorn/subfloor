@@ -3554,13 +3554,16 @@ function chatUnreadBadge(shell, onDrained) {
     ariaLabel: `${label} — mark all read`,
   }, el("span", { className: "mail-idle", ariaHidden: "true" }, "📩"),
     el("span", { className: "mail-drain", ariaHidden: "true" }, "✕"));
-  badge.onclick = () => chatConfirmDrain(shell, count, onDrained);
+  badge.onclick = () => chatConfirmDrain(
+    shell, count, onDrained, badge.closest(".chat-shell-row"));
   return badge;
 }
 
-// Slide-out confirm: a panel entering from the right edge. Enter confirms,
-// Esc or a backdrop click cancels (the global Esc handler closes overlays).
-function chatConfirmDrain(shell, count, onDrained) {
+// Slide-out confirm: tucked under the shell's rail row, sliding in from the
+// left and overlapping into the history column; flips above the row when the
+// row sits too low. Enter confirms, Esc or a backdrop click cancels (the
+// global Esc handler closes overlays).
+function chatConfirmDrain(shell, count, onDrained, row) {
   const priorFocus = document.activeElement;
   const overlay = el("div", { className: "modal-overlay slide-confirm-overlay" });
   const noun = count === 1 ? "message" : "messages";
@@ -3604,6 +3607,11 @@ function chatConfirmDrain(shell, count, onDrained) {
   };
   overlay.append(panel);
   document.body.append(overlay);
+  const at = row.getBoundingClientRect();
+  const height = panel.getBoundingClientRect().height;
+  const below = at.bottom + 6;
+  panel.style.left = `${at.left}px`;
+  panel.style.top = `${below + height > innerHeight - 8 ? at.top - height - 6 : below}px`;
   confirm.focus();
 }
 

@@ -1741,6 +1741,8 @@ class FakeElement {
   append(...nodes) { this.children.push(...nodes); }
   replaceChildren(...nodes) { this.children = [...nodes]; }
   setAttribute(k, v) { this.attrs[k] = v; }
+  closest(selector) { return selector === ".chat-shell-row" ? target.row : null; }
+  getBoundingClientRect() { return this.rect || { left: 0, top: 0, bottom: 0, height: 120 }; }
   remove() { document.body.children = document.body.children.filter((n) => n !== this); }
   focus() { document.activeElement = this; }
   click() { return this.onclick?.(); }
@@ -1752,9 +1754,11 @@ class FakeElement {
 const document = { body: new FakeElement("body"), activeElement: null };
 const el = (tag, props = {}, ...children) => {
   const node = Object.assign(new FakeElement(tag), props);
+  node.style = {};
   node.append(...children);
   return node;
 };
+const innerHeight = 800;
 let modalSequence = 0;
 const calls = [];
 const toasts = [];
@@ -1766,9 +1770,15 @@ const toast = (msg) => toasts.push(msg);
 const chatHash = () => "";
 """ + SHELL_INDICATORS + r"""
 const target = { row: new FakeElement("div"), status: new FakeElement("span") };
-chatPaintShellIndicators(target, {
+const shell = {
   shell_id: 7, shortname: "DEV2", unread_message_count: 30, max_unread_message_id: 88,
-});
+};
+target.row.rect = { left: 10, top: 700, bottom: 740 };
+chatPaintShellIndicators(target, shell);
+target.status.children[0].onclick();
+const lowRow = { ...document.body.children[0].children[0].style };
+document.body.children[0].closeModal();
+target.row.rect = { left: 10, top: 300, bottom: 340 };
 target.status.children[0].onclick();
 const overlay = document.body.children[0];
 const panel = overlay.children[0];
@@ -1779,6 +1789,8 @@ const opened = {
   title: panel.children[0].textContent,
   body: panel.children[1].textContent,
   focused: document.activeElement === confirm,
+  underRow: { ...panel.style },
+  lowRow,
 };
 panel.onkeydown({ key: "Enter", target: confirm, preventDefault() {} });
 (async () => {
@@ -1804,6 +1816,8 @@ panel.onkeydown({ key: "Enter", target: confirm, preventDefault() {} });
                 "the shell will not see them in its check."
             ),
             "focused": True,
+            "underRow": {"left": "10px", "top": "346px"},
+            "lowRow": {"left": "10px", "top": "574px"},
         },
         "calls": [{
             "path": "/shells/7/inbox/drain",
@@ -1816,7 +1830,7 @@ panel.onkeydown({ key: "Enter", target: confirm, preventDefault() {} });
         "hasMail": "has-mail",
         "cancelLabel": "Cancel",
     }
-    assert ".modal-overlay.slide-confirm-overlay { justify-content: flex-end; }" in STYLE
+    assert "from { transform: translateX(-110%); opacity: 0; }" in STYLE
 
 
 def test_interface_owns_scroll_with_fixed_history_and_conversation_controls():
