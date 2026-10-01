@@ -97,7 +97,7 @@ def seed_authored(con: sqlite3.Connection) -> None:
 def connect(*, seed: bool = True) -> sqlite3.Connection:
     """Open the map DB (creating + schema-applying if absent), row_factory set.
     When `seed`, also load the authored layer into a fresh DB."""
-    artifact_policy.prepare_local_state()
+    artifact_policy.prepare_map_state()
     MAP_DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     con = sqlite3.connect(MAP_DB_PATH)
     con.row_factory = sqlite3.Row

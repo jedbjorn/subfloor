@@ -170,7 +170,7 @@ def load_config() -> dict:
                             {"glob": "*.proto", "role": "code"}]}
     Malformed config is a warning, not a failure — fall back to defaults so a
     bad edit never breaks the auto-remap hooks."""
-    artifact_policy.prepare_local_state()
+    artifact_policy.prepare_map_state()
     tracked = REPO_ROOT / ".sc-state" / "map.config.json"
     path = CONFIG_PATH if CONFIG_PATH.exists() else (
         tracked if tracked.exists() else CONFIG_PATH_LEGACY

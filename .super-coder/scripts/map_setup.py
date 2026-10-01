@@ -54,7 +54,13 @@ def run_update_compat() -> None:
     materialized. Legacy updaters already launch ``map_setup.py`` as a fresh
     process near the end of every update, making this the compatibility seam
     where newly materialized code can finish that first adoption run.
+
+    Updates run on the host, never in a sandbox seat, and the bridge's host
+    reconciliation (wrapper registry, aliases) cannot write from one. A
+    sandboxed Cartographer's map-setup therefore skips it.
     """
+    if os.environ.get("SC_SANDBOX"):
+        return
     script = ENGINE / "scripts" / "update_compat.py"
     if not script.is_file():
         return
@@ -91,7 +97,17 @@ def wire_hooks() -> bool:
     return True
 
 
-def main() -> int:
+USAGE = "usage: ./sc map-setup — wire the auto-remap git hooks (core.hooksPath) + map"
+
+
+def main(argv: list[str]) -> int:
+    # Decide help and typos before any setup phase is reachable (issue #1659).
+    if argv in (["-h"], ["--help"]):
+        print(USAGE)
+        return 0
+    if argv:
+        print(f"map-setup: unknown argument '{argv[0]}' (-h for usage)", file=sys.stderr)
+        return 2
     run_update_compat()
     wire_hooks()
     print("map-setup: mapping the repo")
@@ -101,4 +117,4 @@ def main() -> int:
 if __name__ == "__main__":
     from cli_entry import run_cli
 
-    raise SystemExit(run_cli(main))
+    raise SystemExit(run_cli(main, sys.argv[1:]))

@@ -238,7 +238,7 @@ class ExternalWorkProjectTest(unittest.TestCase):
                     mock.patch.object(map_repo, "CONFIG_PATH_LEGACY", home / "legacy.json"), \
                     mock.patch.object(map_repo, "is_source_repo", return_value=False), \
                     mock.patch.object(map_repo, "git", return_value=""), \
-                    mock.patch.object(map_repo.artifact_policy, "prepare_local_state"), \
+                    mock.patch.object(map_repo.artifact_policy, "prepare_map_state"), \
                     mock.patch.object(map_repo.map_db, "connect", side_effect=connect):
                 self.assertEqual(0, map_repo.main())
 
@@ -284,7 +284,7 @@ class GitIgnoreAndEmptyScanTest(unittest.TestCase):
             mock.patch.object(map_repo, "CONFIG_PATH", root / ".sc-state" / "config.json"),
             mock.patch.object(map_repo, "CONFIG_PATH_LEGACY", root / "legacy.json"),
             mock.patch.object(map_repo, "is_source_repo", return_value=False),
-            mock.patch.object(map_repo.artifact_policy, "prepare_local_state"),
+            mock.patch.object(map_repo.artifact_policy, "prepare_map_state"),
             mock.patch.object(map_repo.artifact_policy, "atomic_write_text"),
             mock.patch.object(map_repo.map_db, "connect", side_effect=connect),
         )

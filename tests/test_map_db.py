@@ -124,6 +124,29 @@ class PrivateStateIndependenceTests(unittest.TestCase):
             ("Tests", "tests/"),
         )
 
+    def test_connect_opens_map_when_private_state_is_unreadable(self) -> None:
+        # The sandbox-seat wall from issue #1454: every private-state resolver
+        # raises, and the map DB still opens.
+        denied = map_db.instance_state.InstanceStateError(
+            "cannot read private state owner metadata: [Errno 13] Permission denied"
+        )
+        policy = map_db.artifact_policy
+        with tempfile.TemporaryDirectory() as td, \
+                mock.patch.object(policy, "STATE_DIR", Path(td) / ".sc-state"), \
+                mock.patch.object(policy, "LOCAL_DIR", Path(td) / ".sc-state" / "local"), \
+                mock.patch.object(map_db, "MAP_DB_PATH", Path(td) / "map.db"), \
+                mock.patch.object(map_db, "MAP_CONTENT", Path(td) / "missing.sql"), \
+                mock.patch.object(map_db.instance_state, "active_snapshot_path",
+                                  side_effect=denied), \
+                mock.patch.object(map_db.instance_state, "active_database_path",
+                                  side_effect=denied), \
+                mock.patch("sys.stdout"):
+            con = map_db.connect()
+            self.addCleanup(con.close)
+            self.assertEqual(
+                con.execute("SELECT COUNT(*) FROM dr_section").fetchone()[0], 0
+            )
+
 
 if __name__ == "__main__":
     unittest.main()
