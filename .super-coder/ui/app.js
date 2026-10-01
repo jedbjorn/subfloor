@@ -5392,6 +5392,34 @@ async function chatRenderOpen(
     placeholder: "Message this shell…",
     rows: 3,
   });
+  const imageAttachments = [];
+  let nextImageNumber = 1;
+  const attachmentChips = el("div", {
+    className: "chat-attachment-chips", hidden: true,
+    role: "group", ariaLabel: "Attached images",
+  });
+  const renderAttachmentChips = () => {
+    attachmentChips.hidden = imageAttachments.length === 0;
+    attachmentChips.replaceChildren(...imageAttachments.map((attachment) => {
+      const remove = el("button", {
+        className: "chat-attachment-remove", type: "button",
+        title: `Remove ${attachment.name}`,
+        ariaLabel: `Remove ${attachment.name}`, textContent: "✕",
+      });
+      remove.onclick = () => {
+        imageAttachments.splice(imageAttachments.indexOf(attachment), 1);
+        renderAttachmentChips();
+        composer.focus();
+      };
+      return el("span", { className: "chat-attachment-chip" },
+        el("span", { className: "chat-attachment-name" }, attachment.name), remove);
+    }));
+  };
+  const clearImageAttachments = () => {
+    imageAttachments.length = 0;
+    nextImageNumber = 1;
+    renderAttachmentChips();
+  };
   const send = el("button", { className: "act primary", type: "button", textContent: "Send" });
   const stop = el("button", {
     className: "act danger chat-stop",
@@ -5418,7 +5446,8 @@ async function chatRenderOpen(
     hidden: true,
   });
   const composerRow = el("div", { className: "chat-composer" },
-    unavailable, availabilityRetry, composer,
+    unavailable, availabilityRetry,
+    el("div", { className: "chat-composer-field" }, composer, attachmentChips),
     el("div", { className: "chat-compose-actions" }, pending, send, stop));
   const reviewWorkspace = chatReviewWorkspace(reviewHost, conversation);
   const updateStreamStatus = () => {
@@ -5435,6 +5464,7 @@ async function chatRenderOpen(
   };
 
   const retry = async (text) => {
+    clearImageAttachments();
     composer.value = text;
     composer.focus();
     await submit();
@@ -5696,11 +5726,13 @@ async function chatRenderOpen(
         `/conversations/${conversation.conversation_id}`);
       if (latest.state === "closed") {
         conversation = latest;
+        clearImageAttachments();
         paint();
         return;
       }
       conversation = await chatApi(`/conversations/${conversation.conversation_id}`,
         "PATCH", { version: latest.version, state: "closed" });
+      clearImageAttachments();
       paint();
     } catch (error) { toast(`${error.code}: ${error.message}`); refresh(); }
   };
@@ -5710,7 +5742,9 @@ async function chatRenderOpen(
   header.insertBefore(modeSwitch, queueState);
 
   async function submit() {
-    const text = composer.value.trim();
+    const text = [composer.value.trim(),
+      ...imageAttachments.map(({ path }) => `[image: ${path}]`)]
+      .filter(Boolean).join(" ");
     if (!text || send.disabled) return;
     if (!chatPendingSend || chatPendingSend.text !== text
         || chatPendingSend.conversationId !== conversation.conversation_id) {
@@ -5748,6 +5782,7 @@ async function chatRenderOpen(
       }
       chatPendingSend = null;
       composer.value = "";
+      clearImageAttachments();
       pending.hidden = true;
       if (conversation.state !== "running") conversation.state = "queued";
       conversation.closed_at = null;
@@ -5779,7 +5814,7 @@ async function chatRenderOpen(
   };
   headerStop.onclick = () => stop.click();
   // Dropped or pasted files upload to the engine host's shared/chat-uploads
-  // and enter the message as a plain path, so every harness reads them alike
+  // and enter the sent message as a plain path, so every harness reads them alike
   // and the bytes ride whatever origin serves this page (tunnel included).
   // The API decides what is accepted; only images are resized here.
   async function uploadFiles(files) {
@@ -5798,11 +5833,15 @@ async function chatRenderOpen(
           `/conversations/${conversation.conversation_id}/uploads`
             + `?name=${encodeURIComponent(file.name || "")}`,
           "POST", body);
-        const tag = kind === "image" ? "image" : "file";
+        if (kind === "image") {
+          imageAttachments.push({ path, name: `image ${nextImageNumber++}` });
+          renderAttachmentChips();
+          continue;
+        }
         const at = composer.selectionEnd ?? composer.value.length;
         const before = composer.value.slice(0, at);
         const gap = before && !/\s$/.test(before) ? " " : "";
-        composer.value = `${before}${gap}[${tag}: ${path}] ${composer.value.slice(at)}`;
+        composer.value = `${before}${gap}[file: ${path}] ${composer.value.slice(at)}`;
       }
       pending.hidden = true;
     } catch (error) {
@@ -6033,7 +6072,10 @@ async function chatRenderOpen(
       conversation.state = chatQueuedCount(messages) ? "queued" : "idle";
     if (["run.failed", "run.unknown"].includes(type))
       conversation.state = "error";
-    if (type === "conversation.closed") conversation.state = "closed";
+    if (type === "conversation.closed") {
+      conversation.state = "closed";
+      clearImageAttachments();
+    }
     if (type === "conversation.reopened") {
       conversation.state = "idle";
       conversation.closed_at = null;

@@ -855,7 +855,7 @@ def test_start_chat_has_default_and_configured_paths_without_terminal_controls()
     assert "if (effortSelect.value) body.effort = effortSelect.value" in interface
     assert "xterm" not in interface.lower()
     assert "tmux" not in interface.lower()
-    assert "attach" not in interface.lower()
+    assert 'textContent: "Attach"' not in interface
 
 
 def test_model_picker_labels_do_not_expose_harness_support_confidence():
@@ -2749,9 +2749,102 @@ globalThis.fetch = async (url, init) => {
     ]
     assert "/uploads`" in attach
     assert "?name=${encodeURIComponent(file.name" in attach
-    assert 'const tag = kind === "image" ? "image" : "file";' in attach
-    assert "[${tag}: ${path}]" in attach
+    assert 'if (kind === "image")' in attach
+    assert "imageAttachments.push" in attach
+    assert "[file: ${path}]" in attach
     assert "composerRow.ondrop =" in attach
     assert "composer.onpaste =" in attach
     assert "|| uploading > 0" in interface
-    assert ".chat-composer.drop-target .chat-composer-input" in STYLE
+    assert ".chat-composer.drop-target .chat-composer-field" in STYLE
+
+
+@pytest.mark.parametrize("source", ["paste", "drop"])
+def test_image_chips_remove_only_selected_image_and_survive_send_failure(source):
+    composer = APP[APP.index('  const composer = el("textarea", {'):
+                   APP.index('  const send = el("button",')]
+    upload = APP[APP.index("  async function uploadFiles(files)"):
+                 APP.index("  composer.onkeydown")]
+    submit = APP[APP.index("  async function submit() {"):
+                 APP.index("  send.onclick = submit;")]
+    close = APP[APP.index("  close.onclick = async () => {"):
+                APP.index("  actions.append(analytics, close);")]
+    script = r"""
+function el(tag, props = {}, ...children) {
+  return Object.assign({tag, children, value: "", disabled: false,
+    focus() {}, replaceChildren(...nodes) { this.children = nodes; }}, props);
+}
+const composerRow = {classList: {add() {}, remove() {}}};
+let conversation = {conversation_id: "cv_1", state: "idle"};
+const send = {disabled: false};
+const close = {disabled: false};
+const pending = {};
+const messages = [];
+const transcriptState = {items: new Map(), dirty: new Set(), lastSequence: 0};
+const chatTrackLiveTranscriptItem = () => {};
+let uploading = 0;
+let chatPendingSend = null;
+const requestKey = () => "send-key";
+const paint = () => { send.disabled = uploading > 0; };
+const refresh = () => {};
+const toast = () => {};
+const chatFitImage = async (file) => file;
+const chatWithShellRelease = (action) => action();
+const posted = [];
+let failSend = true;
+const chatApi = async (url, method, body, key) => {
+  if (url.includes("/uploads")) return {path: `/uploads/${body.name}`,
+    kind: body.type.startsWith("image/") ? "image" : "file"};
+  if (!url.endsWith("/messages")) return {...conversation, version: 1,
+    state: method === "PATCH" ? "closed" : conversation.state};
+  posted.push({text: body.text, key});
+  if (failSend) throw {code: "OFFLINE", message: "offline"};
+  return {message: {message_id: 1, text: body.text, state: "queued"}};
+};
+""" + composer + upload + submit + close + r"""
+(async () => {
+  composer.value = "Look at these";
+  const files = [
+    {name: "first.png", type: "image/png"},
+    {name: "second.png", type: "image/png"},
+  ];
+  let prevented = false;
+  const event = {preventDefault() { prevented = true; },
+    clipboardData: {files}, dataTransfer: {files, types: ["Files"]}};
+  if (SOURCE === "paste") composer.onpaste(event);
+  else composerRow.ondrop(event);
+  await new Promise((resolve) => setImmediate(resolve));
+  const labels = () => attachmentChips.children.map((chip) => chip.children[0].textContent
+    || chip.children[0].children[0]);
+  const initial = {labels: labels(), text: composer.value, prevented};
+  attachmentChips.children[0].children[1].onclick();
+  const removed = {labels: labels(), text: composer.value};
+  await submit();
+  const failed = {labels: labels(), text: composer.value, hidden: attachmentChips.hidden};
+  failSend = false;
+  await submit();
+  const sent = {labels: labels(), text: composer.value, hidden: attachmentChips.hidden};
+  await uploadFiles(files.slice(0, 1));
+  await submit();
+  const imageOnly = posted.pop().text;
+  await uploadFiles([{name: "notes.txt", type: "text/plain"}, ...files.slice(0, 1)]);
+  const next = {labels: labels(), text: composer.value};
+  await close.onclick();
+  console.log(JSON.stringify({initial, removed, failed, sent, imageOnly, posted, next,
+    closed: {labels: labels(), hidden: attachmentChips.hidden, state: conversation.state}}));
+})();
+"""
+    script = script.replace("SOURCE", json.dumps(source))
+    result = run_js(script)
+    assert result == {
+        "initial": {"labels": ["image 1", "image 2"], "text": "Look at these", "prevented": True},
+        "removed": {"labels": ["image 2"], "text": "Look at these"},
+        "failed": {"labels": ["image 2"], "text": "Look at these", "hidden": False},
+        "sent": {"labels": [], "text": "", "hidden": True},
+        "imageOnly": "[image: /uploads/first.png]",
+        "posted": [{"text": "Look at these [image: /uploads/second.png]", "key": "send-key"}] * 2,
+        "next": {"labels": ["image 1"], "text": "[file: /uploads/notes.txt] "},
+        "closed": {"labels": [], "hidden": True, "state": "closed"},
+    }
+
+    assert ".chat-attachment-chip:hover .chat-attachment-remove" in STYLE
+    assert ".chat-attachment-chip:focus-within .chat-attachment-remove" in STYLE
