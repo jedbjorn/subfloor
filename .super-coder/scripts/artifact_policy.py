@@ -175,15 +175,31 @@ def prepare_local_state() -> list[Path]:
     copied: list[Path] = []
     pairs = [
         (STATE_DIR / "content.sql", content_path()),
-        (STATE_DIR / "map_content.sql", LOCAL_DIR / "map" / "content.sql"),
-        (STATE_DIR / "map.config.json", LOCAL_DIR / "map" / "config.json"),
         (STATE_DIR / "skills_retired.json", LOCAL_DIR / "skills_retired.json"),
     ]
     for source, destination in pairs:
         if _copy_file_once(source, destination):
             copied.append(destination)
-    if _backup_sqlite_once(STATE_DIR / "map.db", LOCAL_DIR / "map" / "map.db"):
-        copied.append(LOCAL_DIR / "map" / "map.db")
+    return copied + prepare_map_state()
+
+
+def prepare_map_state() -> list[Path]:
+    """Localize only the derived map artifacts.
+
+    The map never needs the engine snapshot, whose path resolves through the
+    owner-private instance namespace — intentionally unreadable from sandbox
+    seats. Map callers use this so that boundary cannot block a refresh.
+    """
+    copied: list[Path] = []
+    pairs = [
+        (STATE_DIR / "map_content.sql", map_content_path()),
+        (STATE_DIR / "map.config.json", map_config_path()),
+    ]
+    for source, destination in pairs:
+        if _copy_file_once(source, destination):
+            copied.append(destination)
+    if _backup_sqlite_once(STATE_DIR / "map.db", map_db_path()):
+        copied.append(map_db_path())
     return copied
 
 

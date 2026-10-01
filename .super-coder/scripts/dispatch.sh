@@ -1303,7 +1303,7 @@ case "$cmd" in
                              exit 2 ;;
                 esac
                 exec "$PY" "$S/map_repo.py" ;;
-  map-setup)    exec "$PY" "$S/map_setup.py" ;;
+  map-setup)    exec "$PY" "$S/map_setup.py" "$@" ;;
   # Token & session analytics — sweep each harness's on-disk usage data for
   # THIS repo into session_token_usage (incremental, idempotent; doc #11).
   analytics)    exec "$PY" "$S/analytics.py" "$@" ;;

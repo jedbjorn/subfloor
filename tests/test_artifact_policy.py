@@ -153,6 +153,25 @@ class ArtifactPolicyTest(unittest.TestCase):
         self.assertEqual(artifact_policy.prepare_local_state(), [])
         self.assertEqual((self.state / "local" / "content.sql").read_text(), "content-v1")
 
+    def test_map_localization_never_resolves_private_engine_state(self):
+        # Sandbox seats cannot read the owner-private namespace; the map's
+        # localizer must not touch it (issue #1454).
+        (self.state / "content.sql").write_text("content-v1")
+        (self.state / "map_content.sql").write_text("map-v1")
+        (self.state / "map.config.json").write_text("{}")
+        denied = artifact_policy.instance_state.InstanceStateError(
+            "cannot read private state owner metadata: [Errno 13] Permission denied")
+        with mock.patch.object(
+                artifact_policy.instance_state, "active_snapshot_path",
+                side_effect=denied) as resolver:
+            copied = artifact_policy.prepare_map_state()
+        resolver.assert_not_called()
+        self.assertEqual(
+            sorted(copied),
+            sorted([self.state / "local" / "map" / "content.sql",
+                    self.state / "local" / "map" / "config.json"]))
+        self.assertFalse((self.state / "local" / "content.sql").exists())
+
 
 class RenderPathContainmentTest(unittest.TestCase):
     def test_managed_paths_stay_beneath_kind_root(self):

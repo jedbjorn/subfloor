@@ -34,5 +34,36 @@ class HomeHookWiringTest(unittest.TestCase):
         )
 
 
+class ArgumentPreflightTest(unittest.TestCase):
+    """Help and typos must answer before any setup phase runs (issue #1659)."""
+
+    def test_help_and_typos_reach_no_setup_phase(self):
+        tripwire = mock.Mock(side_effect=AssertionError("setup phase ran"))
+        for argv, code in ((["--help"], 0), (["-h"], 0), (["--wat"], 2)):
+            with self.subTest(argv=argv), \
+                    mock.patch.object(map_setup, "run_update_compat", tripwire), \
+                    mock.patch.object(map_setup, "wire_hooks", tripwire), \
+                    mock.patch.object(map_setup.map_repo, "main", tripwire), \
+                    mock.patch("sys.stdout"), mock.patch("sys.stderr"):
+                self.assertEqual(code, map_setup.main(argv))
+        tripwire.assert_not_called()
+
+
+class SandboxUpdateBridgeTest(unittest.TestCase):
+    def test_sandbox_seat_skips_host_update_bridge(self):
+        with mock.patch.dict(map_setup.os.environ, {"SC_SANDBOX": "1"}), \
+                mock.patch.object(map_setup.subprocess, "run") as run:
+            map_setup.run_update_compat()
+        run.assert_not_called()
+
+    def test_host_seat_runs_update_bridge(self):
+        with mock.patch.dict(map_setup.os.environ, {}, clear=False), \
+                mock.patch.object(map_setup.subprocess, "run") as run:
+            map_setup.os.environ.pop("SC_SANDBOX", None)
+            run.return_value.returncode = 0
+            map_setup.run_update_compat()
+        run.assert_called_once()
+
+
 if __name__ == "__main__":
     unittest.main()
