@@ -17,6 +17,7 @@ from conversation_runtime_checks import (
     EvidenceCache,
     Fingerprint,
 )
+from conversation_runtime_codex_schema import NativeSchemaObservation
 from conversation_runtime_contract import ExecutableBinding
 from test_native_chat_ownership import database  # noqa: F401
 
@@ -34,7 +35,7 @@ def operation(request,monkeypatch):
     fp=Fingerprint('codex',ExecutableBinding(Path('/bin/true'),'a'*64,'test'),'test','b'*64,
                    'openai','gpt-6.1-sol','high','b'*64,'c'*64)
     calls=[]
-    supervisor=SimpleNamespace(preparation_identity=lambda:calls.append('owned-api'),inventory=list)
+    supervisor=SimpleNamespace(preparation_identity=lambda **kwargs:calls.append('owned-api'),inventory=list)
     class Seat:
         def __init__(self,**kwargs):
             self.database,self.root=kwargs['database'],kwargs['root']
@@ -42,6 +43,11 @@ def operation(request,monkeypatch):
         def candidate_fingerprint(self,*args):
             assert args==('codex','gpt-6.1-sol','high')
             calls.append('candidate');return fp
+        def observe_native_schema(self,fingerprint,deadline):
+            calls.append('schema')
+            return NativeSchemaObservation(fingerprint.executable,{'native':True},
+                {cap:{'native':True} for cap in ('submission','stop_reply','stop_work')},generation_completed=True),{
+                key:True for key in ('cleanup_complete','child_registered','gate_released','child_reaped','process_group_exited','files_removed')}
     monkeypatch.setattr(runtime,'NativeFixtureSeat',Seat)
     value=runtime.FixtureNativeCheck(database=path,root=root,fixture_id='test',
                                     supervisor=supervisor,native_bindings={})
@@ -111,7 +117,7 @@ def test_fixed_check_singleflight_and_completed_empty_evidence_does_not_admit(op
     value.checker=SimpleNamespace(request=request)
     assert value.begin()['state']=='running'
     assert value.begin()['state']=='running' and len(requests)==1
-    assert requests[0][1]['seconds']==177
+    assert 176<requests[0][1]['seconds']<=177
     assert requests[0][1]['factory'] is value.factory
     future.set_result(CheckResult(fp,{},CleanupProof(True,'complete')))
     report=value.status()
@@ -239,3 +245,89 @@ def test_get_status_and_fixed_post_use_named_operator(operation,monkeypatch):
     con.execute('UPDATE users SET is_active=0 WHERE user_id=1')
     con.execute('UPDATE users SET is_active=1 WHERE user_id=2');con.commit()
     assert runtime.handle_check('POST','Host: 127.0.0.1\r\n',b'{}')[0]==403
+
+
+def test_schema_operation_is_separate_singleflight_and_does_not_dispatch_behavior(operation,monkeypatch):
+    import threading
+    value,_fp,_,calls=operation
+    entered,released=threading.Event(),threading.Event()
+    original=value.seat.observe_native_schema
+    def observe(*args):
+        entered.set();assert released.wait(2);return original(*args)
+    monkeypatch.setattr(value.seat,'observe_native_schema',observe)
+    monkeypatch.setattr(value.checker,'request',lambda *a,**k:pytest.fail('schema does not dispatch behavior'))
+    monkeypatch.setattr(runtime,'_FIXTURE',value)
+    try:
+        assert runtime.handle_check('POST','Host: 127.0.0.1\r\n',b'{"action":"schema"}')[0]==202
+        assert entered.wait(1)
+        assert value.status()['native_schema']['state']=='running'
+        assert value.begin_schema()['native_schema']['state']=='running'
+        from conversation_runtime_contract import RuntimeContractError
+        with pytest.raises(RuntimeContractError,match='schema observation is active'):value.begin()
+    finally:released.set()
+    value.schema_future.result(timeout=2)
+    report=value.status()
+    assert report['native_schema']['state']=='complete' and report['grades']=={}
+    assert report['native_schema']['behavior_admitted'] is False
+    assert calls.count('schema')==1 and value.future is None
+    value.begin_schema();value.schema_future.result(timeout=2)
+    assert calls.count('schema')==1 # Exact current identity, completed cleanup RAM reuse.
+
+
+@pytest.mark.parametrize('body',[{'action':'schema','model':'other'},{'action':'schema','argv':[]},
+                                {'action':'schema','path':'/tmp/foreign'}, {'action':'schema','env':{}}])
+def test_schema_http_rejects_any_selector_without_dispatch(operation,monkeypatch,body):
+    value,_,_,calls=operation
+    monkeypatch.setattr(runtime,'_FIXTURE',value)
+    assert runtime.handle_check('POST','Host: 127.0.0.1\r\n',json.dumps(body).encode())[0]==422
+    assert calls==['owned-api','seat']
+
+
+def test_schema_reuse_refuses_replaced_identity_and_unproved_cleanup(operation,monkeypatch):
+    import dataclasses
+    import time
+
+    from conversation_runtime_contract import RuntimeContractError
+    value,fp,_,calls=operation
+    value.native_schema(fp,time.monotonic()+20)
+    monkeypatch.setattr(value.seat,'candidate_fingerprint',lambda *a:dataclasses.replace(fp,implementation_digest='d'*64))
+    with pytest.raises(RuntimeContractError):value.native_schema(fp,time.monotonic()+20)
+    assert calls.count('schema')==1
+    monkeypatch.setattr(value.seat,'candidate_fingerprint',lambda *a:fp)
+    value.schema_observation=None
+    observation=NativeSchemaObservation(fp.executable,generation_completed=True)
+    monkeypatch.setattr(value.seat,'observe_native_schema',lambda *a:(observation,{'cleanup_complete':True,'child_reaped':False}))
+    with pytest.raises(RuntimeContractError):value.native_schema(fp,time.monotonic()+20)
+    assert value.schema_observation is None and value.schema_fingerprint is None
+
+
+def test_native_schema_summary_drops_unknown_raw_and_identity_fields(operation):
+    from conversation_runtime_checks import Diagnostic
+    _value,fp,_,_=operation
+    observation=NativeSchemaObservation(fp.executable,{'raw':'private'},diagnostics=(
+        Diagnostic('submission','inconclusive','NATIVE_SCHEMA_UNAVAILABLE'),
+        Diagnostic('submission','inconclusive','private')),schema_files_sha256={
+            'ClientRequest.json':'a'*64,'/private/schema.json':'b'*64,'ServerNotification.json':'secret'},generation_completed=True)
+    report=runtime.schema_summary(fp,observation,{'child_reaped':True,'cleanup_complete':1,'inference_count':False,
+            'wrapper_sha256':'c'*64,'pid':123,'ownership_nonce':'private','env':{'TOKEN':'private'}})
+    assert report['schema_files_sha256']=={'ClientRequest.json':'a'*64}
+    assert report['owned_codegen']=={'child_reaped':True,'wrapper_sha256':'c'*64}
+    assert len(report['diagnostics'])==1 and 'private' not in json.dumps(report)
+
+
+def test_behavior_budget_includes_schema_and_preserves_twenty_second_cleanup_reserve(operation,monkeypatch):
+    value,_,_,_=operation
+    clock=[100.0]
+    monkeypatch.setattr(runtime.time,'monotonic',lambda:clock[0])
+    original=value.seat.observe_native_schema
+    def observe(fp,deadline):
+        assert deadline==257 # 177 total less checker cleanup reserve.
+        clock[0]+=18
+        return original(fp,deadline)
+    value.seat.observe_native_schema=observe
+    captured={}
+    future=Future()
+    value.checker.request=lambda fp,**kw:captured.update(kw) or future
+    value.begin()
+    assert captured['seconds']==159 and captured['observed_interface']=={'native':True}
+    assert 'adapter_methods' not in captured['observed_interface']

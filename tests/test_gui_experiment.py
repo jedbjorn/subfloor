@@ -477,3 +477,49 @@ def test_native_cleanup_removes_only_retained_socket_after_unit_exit(seat,monkey
         fixture.stop_native_unit(record,native)
     assert endpoint.is_symlink() and sentinel.read_text()=='retain' and root.exists()
     endpoint.unlink()
+
+
+def test_codegen_child_receipt_is_durable_before_gate_and_requires_matching_api_group(seat,monkeypatch):
+    from types import SimpleNamespace
+    record,root,receipt=marked(seat)
+    record.update(runtime='experimental',status='serving')
+    fixture.write_json(root/fixture.MARKER,fixture.identity(record));fixture.save(record,receipt)
+    supervisor=fixture.NativeSupervisor(receipt)
+    owner={'pid':os.getpid(),'start_ticks':456,'unit':record['unit'],'control_group':'/owned-api'}
+    monkeypatch.setattr(supervisor,'preparation_identity',lambda **kwargs:owner)
+    original=Path.read_text
+    fields=['S','1','123',*['0']*16,'789']
+    def read(path,*args,**kwargs):
+        if str(path)=='/proc/123/stat':return '123 (inert wrapper) '+ ' '.join(fields)
+        if str(path)=='/proc/123/cgroup':return '0::/owned-api\n'
+        return original(path,*args,**kwargs)
+    monkeypatch.setattr(Path,'read_text',read)
+    deadline=fixture.time.monotonic()+2
+    assert not supervisor.record_codegen_child(SimpleNamespace(pid=123,start_ticks=788),'/owned-api',deadline=deadline)
+    assert not supervisor.record_codegen_child(SimpleNamespace(pid=123,start_ticks=789),'/foreign',deadline=deadline)
+    assert not fixture.read_json(receipt).get('codegen_children')
+    assert supervisor.record_codegen_child(SimpleNamespace(pid=123,start_ticks=789),'/owned-api',deadline=deadline)
+    saved=fixture.verify_receipt(receipt)['codegen_children']
+    assert saved==fixture.read_json(receipt)['codegen_children']
+    assert saved[0]['purpose']=='codex_schema' and saved[0]['api_owner']==owner
+
+
+def test_deadline_bounded_ownership_lock_does_not_wait_for_held_lock(seat):
+    fid='e'*32
+    with fixture.ownership_lock(fid), pytest.raises(fixture.FixtureError,match='expired'): # noqa: SIM117 - ordered exception boundary
+        with fixture.ownership_lock(fid,deadline=fixture.time.monotonic()+.02):
+            pytest.fail('held ownership lock cannot be acquired')
+
+
+def test_preparation_identity_propagates_remaining_unit_budget_and_refuses_late_guard(seat,monkeypatch):
+    record,_,receipt=marked(seat)
+    supervisor=fixture.NativeSupervisor(receipt)
+    clock=[10.0];seen=[]
+    monkeypatch.setattr(fixture.time,'monotonic',lambda:clock[0])
+    monkeypatch.setattr(fixture,'process_start_ticks',lambda pid:456)
+    def state(row,*,timeout):
+        seen.append(timeout);clock[0]=12.0
+        return {'LoadState':'loaded','Description':fixture.description(record),'MainPID':str(os.getpid()),'ControlGroup':'/owned-api'}
+    monkeypatch.setattr(fixture,'unit_state',state)
+    with pytest.raises(fixture.FixtureError):supervisor.preparation_identity(deadline=11)
+    assert seen==[1.0]
