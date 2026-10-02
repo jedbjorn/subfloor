@@ -330,6 +330,28 @@ class NativeSupervisor:
         verify_root(record)
         return record.get("native_units", [])
 
+    def preparation_identity(self) -> dict:
+        """Capture only the current marked API's canonical preparation owner."""
+        record=verify_receipt(self.receipt)
+        verify_root(record)
+        state=unit_state(record)
+        if (not owned_unit(record,state) or int(state.get('MainPID','0'))!=os.getpid()
+                or process_start_ticks(os.getpid()) is None or not state.get('ControlGroup')):
+            raise FixtureError('OWNERSHIP_INVALID','canonical preparation requires the marked API unit')
+        return {'pid':os.getpid(),'start_ticks':process_start_ticks(os.getpid()),
+                'unit':record['unit'],'control_group':state['ControlGroup']}
+
+    def preparation_exited(self, identity: dict) -> bool:
+        """PID death alone cannot release helpers left in the old API cgroup."""
+        record=verify_receipt(self.receipt)
+        verify_root(record)
+        if identity.get('unit')!=record['unit']:
+            return False
+        if process_start_ticks(identity.get('pid',0))==identity.get('start_ticks'):
+            return False
+        return any(proof.get('identity')==identity and proof.get('cgroup_empty') is True
+                   for proof in record.get('api_exit_proofs',[]))
+
     def register(self, generation_id: str, harness: str, *, test_transport: bool=False) -> dict:
         initial = read_json(self.receipt)
         with ownership_lock(initial["fixture_id"]):
@@ -574,6 +596,14 @@ def restart_api(receipt: Path) -> dict:
         if state.get("ActiveState") not in {"inactive","failed"} or state.get("MainPID","0")!="0" or (
                 record.get("main_pid",0)>0 and process_start_ticks(record["main_pid"])==record.get("main_pid_start_ticks")):
             raise FixtureError("STATE_CONFLICT","existing API must be stopped before recovery")
+        old_group=state.get('ControlGroup','') or record.get('control_group','')
+        if cgroup_pids(old_group):
+            raise FixtureError('CLEANUP_UNVERIFIED','API preparation helpers remain; recovery retains ownership')
+        if record.get('main_pid') and record.get('main_pid_start_ticks') and old_group:
+            proof={'identity':{'pid':record['main_pid'],'start_ticks':record['main_pid_start_ticks'],
+                              'unit':record['unit'],'control_group':old_group},'cgroup_empty':True,'verified_at':time.time()}
+            record['api_exit_proofs']=(record.get('api_exit_proofs',[])+[proof])[-32:]
+            save(record,receipt)  # verified before any replacement unit launch
         select_port(record["port"])
         launch_api(record,root,resume=True)
         deadline=time.monotonic()+15

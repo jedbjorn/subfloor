@@ -7,7 +7,6 @@ scope is retained in every projected observation and control request.
 from __future__ import annotations
 
 import json
-import os
 import threading
 import time
 import uuid
@@ -23,7 +22,7 @@ from conversation_runtime_contract import (
     payload_digest,
     public_payload,
 )
-from conversation_runtime_controller import encoded, start_ticks
+from conversation_runtime_controller import encoded
 
 _SERVICE: NativeChatsService | None = None
 
@@ -158,13 +157,15 @@ class NativeChatsService:
                         self.recover_preparation(cid,runtime)
                         continue
                     generation=runtime.get('generation_id') or uuid.uuid4().hex
+                    preparation_owner=self.supervisor.preparation_identity()
                     with db_driver.write_transaction(con,'native_chat.start_intent'):
                         current=con.execute("SELECT state,runtime_projection FROM conversations WHERE conversation_id=?",(cid,)).fetchone()
-                        if current['state']=='closed':
+                        if (current['state']=='closed' or current['runtime_projection']!=chat['runtime_projection']
+                                or con.execute('SELECT 1 FROM conversation_runtime_generations WHERE conversation_id=?',(cid,)).fetchone()):
                             continue
                         runtime=json.loads(current['runtime_projection'])
                         runtime.update(generation_id=generation,state='preparing',capabilities={},setup=None,partial=True,freshness='unknown',
-                                       preparation_owner={'pid':os.getpid(),'start_ticks':start_ticks(os.getpid())},preparation_cleanup=None)
+                                       preparation_owner=preparation_owner,preparation_cleanup=None)
                         con.execute('UPDATE conversations SET runtime_projection=?,version=version+1 WHERE conversation_id=?',(encoded(runtime),cid))
                         append_event(con,cid,'capability.observed',{'generation_id':generation,'grade':'inconclusive','phase':'canonical preparation pending'})
                     self.starting.add(cid)
@@ -259,12 +260,7 @@ class NativeChatsService:
 
     def recover_preparation(self,cid: str,runtime: dict) -> None:
         """No new preparation after API death; verify the old worker exited."""
-        identity=runtime['preparation_owner']
-        try:
-            alive=start_ticks(identity['pid'])==identity['start_ticks']
-        except (OSError,ValueError,KeyError):
-            alive=False
-        if not alive:
+        if self.supervisor.preparation_exited(runtime['preparation_owner']):
             self.finish_preparation(cid,runtime['generation_id'])
 
     def finish_preparation(self,cid: str,generation: str) -> None:
