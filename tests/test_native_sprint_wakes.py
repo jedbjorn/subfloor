@@ -712,3 +712,33 @@ def test_actual_codex_unclassified_root_inventory_keeps_quiet_unknown(
     snapshot = owner.handle(wire("snapshot"))
     assert snapshot["partial"] is True and snapshot["primary_state"] == "unknown"
     assert not owner.status()["quiet"]["idle"]
+
+
+@pytest.mark.parametrize("kind", ["activity.started", "activity.processed"])
+def test_idle_inventory_cannot_erase_later_root_evidence(controller, kind):
+    owner, driver = controller
+    driver.inventory = lambda **fields: NativeSnapshot(
+        owner.identity, None, freshness="current", partial=False, primary_state="idle"
+    )
+    original = owner.call
+
+    def raced_call(*args, **kwargs):
+        result = original(*args, **kwargs)
+        owner.emit(
+            RuntimeEvent(
+                kind,
+                NativeReference("root", thread_id="root", activity_id="new-after-read"),
+            )
+        )
+        return result
+
+    owner.call = raced_call
+    owner.handle(wire("snapshot"))
+    assert (
+        owner.status()["primary"] == "new-after-read"
+        and not owner.status()["quiet"]["idle"]
+    )
+    assert (
+        owner.handle(wire("close", command=conditional(owner)))["state"]
+        == "not_written"
+    )
