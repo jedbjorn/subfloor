@@ -92,6 +92,8 @@ class Client:
                             child_ref=NativeReference('root','child','root','child-turn',work_id='child')
                             self.work.append({'reference':dataclasses.asdict(child_ref),'kind':'child','state':'active','provenance':'fixture','observed_at':time.time()})
                     self.event('output.final',replace(ref,item_id='reply'),request,text=output)
+                elif 'remembered nonce' in text:
+                    self.event('output.final',replace(ref,item_id='reply'),request,text=self.marker or 'unknown')
                 if '1000 numbered' not in text:
                     self.event('activity.terminal',ref,request,status='completed');self.primary=None
                 if self.lost_submit: raise OSError('lost after owned native write')
@@ -109,6 +111,10 @@ class Client:
                     self.work=[w for w in self.work if w['reference']['thread_id']!='child'];self.pids.pop(201,None)
                     self.event('activity.terminal',ref,status='interrupted')
                     if self.break_child:self.pids.pop(77,None)
+                self.event('control.acknowledged',ref,action=command['action'])
+                self.events[-1]['event']['control_id']=command['control_id']
+                self.event('control.outcome',ref,outcome='complete')
+                self.events[-1]['event']['control_id']=command['control_id']
                 return {'state':'written','acknowledged':True}
             if op=='close':
                 self.pids.clear();self.work.clear()
@@ -403,3 +409,91 @@ def test_claude_invented_disabled_flag_cannot_admit_inference_before_evidence_ch
     assert result['submission'].grade == 'inconclusive'
     assert not any(c[0] == 'submit' for c in scope.client.calls)
     driver.cleanup(deadline=time.monotonic()+1)
+
+
+@pytest.mark.parametrize('missing', ['processing', 'reply', 'failed', 'wrong_nonce', 'partial_reply', 'wrong_activity', 'tool_reply'])
+def test_submission_requires_successful_correlated_processing_and_nonce_recall(owned, missing):
+    event = owned.client.event
+    def observed(kind, ref, request=None, **data):
+        if missing == 'processing' and kind == 'activity.processed': return
+        if missing == 'reply' and kind.startswith('output.'): return
+        if missing == 'failed' and kind == 'activity.terminal': data['status'] = 'failed'
+        if missing == 'wrong_nonce' and kind == 'output.final' and not data.get('text', '').startswith('READY'):
+            data['text'] = 'not the prior nonce'
+        if missing == 'wrong_activity' and kind == 'output.final': ref = replace(ref, activity_id='other-turn')
+        if missing == 'tool_reply' and kind == 'output.final': ref = replace(ref, work_id='native-command-item')
+        event(kind, ref, request, **data)
+        if missing == 'partial_reply' and kind == 'output.final': owned.client.events[-1]['event']['partial'] = True
+    owned.client.event = observed
+    driver = start(owned)
+    result = NativeProbeFactory._exercise(driver, frozenset({'submission'}), time.monotonic()+.6)
+    assert result['submission'].grade == 'inconclusive' and not result['submission'].coverage
+    driver.cleanup(deadline=time.monotonic()+1)
+
+
+@pytest.mark.parametrize('break_root', ['os_exit', 'native_identity'])
+def test_terminal_stop_cannot_certify_after_losing_captured_root(owned, break_root):
+    scope = replace(owned, context=replace(owned.context,
+        probe_capabilities=('submission', 'stop_work', 'stop_work_terminal')))
+    request = scope.client.request
+    stopped = False
+    def collateral(op, *, timeout, **fields):
+        nonlocal stopped
+        result = request(op, timeout=timeout, **fields)
+        if op == 'control' and fields['command']['action'] == 'stop_work':
+            stopped = True
+            if break_root == 'os_exit': scope.client.pids.pop(77, None)
+        if op == 'snapshot' and stopped and break_root == 'native_identity':
+            result['identity']['root_id'] = 'replacement-root'
+        return result
+    scope.client.request = collateral
+    driver = start(scope)
+    result = NativeProbeFactory._exercise(driver, frozenset({'stop_work'}), time.monotonic()+2)
+    evidence = result['stop_work']
+    assert 'target:terminal' not in evidence.coverage
+    assert any(d.capability == 'stop_work_terminal' and d.grade == 'incompatible' for d in evidence.diagnostics)
+    assert 201 in scope.client.pids
+    driver.cleanup(deadline=time.monotonic()+1)
+
+
+@pytest.mark.parametrize('missing', ['absent', 'pending', 'partial', 'wrong_control'])
+def test_physical_exit_and_snapshot_absence_require_matched_native_control_success(owned, missing):
+    scope = replace(owned, context=replace(owned.context,
+        probe_capabilities=('submission', 'stop_work', 'stop_work_terminal')))
+    request = scope.client.request
+    def unconfirmed(op, *, timeout, **fields):
+        result = request(op, timeout=timeout, **fields)
+        if op == 'control' and fields['command']['action'] == 'stop_work':
+            if missing == 'absent': scope.client.events = [e for e in scope.client.events if not e['event']['kind'].startswith('control.')]
+            else:
+                event = scope.client.events[-1]['event']
+                if missing == 'pending': event['data']['outcome'] = 'pending'
+                if missing == 'partial': event['partial'] = True
+                if missing == 'wrong_control': event['control_id'] = 'unrelated-control'
+            return {'state': 'written', 'acknowledged': True, 'detail': 'unconfirmed opaque native result'}
+        return result
+    scope.client.request = unconfirmed
+    driver = start(scope)
+    result = NativeProbeFactory._exercise(driver, frozenset({'stop_work'}), time.monotonic()+.6)
+    assert result['stop_work'].grade == 'inconclusive' and 'target:terminal' not in result['stop_work'].coverage
+    assert 200 not in scope.client.pids and 77 in scope.client.pids and 201 in scope.client.pids
+    driver.cleanup(deadline=time.monotonic()+1)
+
+
+@pytest.mark.parametrize('outcome', ['complete', 'inconclusive'])
+def test_composite_unresolved_native_cleanup_retains_factory_allocation(owned, outcome):
+    request = owned.client.request
+    def unresolved(op, *, timeout, **fields):
+        result = request(op, timeout=timeout, **fields)
+        if op == 'close': return {'outcome': outcome, 'unresolved_definitions': ['owned-definition']}
+        return result
+    owned.client.request = unresolved
+    factory = NativeProbeFactory(lambda fp, caps, end: owned, lambda fp, end: CleanupProof(True, 'complete'))
+    fp = fingerprint(owned)
+    session = factory.reserve(fp, frozenset({'submission'}), deadline=time.monotonic()+2)
+    session.driver.start(owned.context, lambda _: None, deadline=time.monotonic()+2)
+    proof = factory.cleanup(fp, deadline=time.monotonic()+1)
+    assert not proof.complete and proof.unresolved_definitions == ('owned-definition',)
+    with pytest.raises(RuntimeContractError) as error:
+        factory.reserve(fp, frozenset({'submission'}), deadline=time.monotonic()+2)
+    assert error.value.code == 'PROBE_ALLOCATION_RETAINED'
