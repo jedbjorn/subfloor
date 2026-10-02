@@ -17,6 +17,7 @@ from conversation_runtime_contract import (
     ExecutableBinding,
     RuntimeContext,
     RuntimeContractError,
+    RuntimeIdentity,
 )
 from gui_experiment_probe_owner import NativeProbeOwner
 from test_native_chat_ownership import database  # noqa: F401
@@ -119,6 +120,33 @@ def test_unresolved_startup_or_route_prerequisite_cannot_allocate_or_infer(owner
     with pytest.raises(RuntimeContractError):
         value.allocate(dataclasses.replace(fingerprint,**change),frozenset({'submission'}),time.monotonic()+30)
     assert not events and con.execute('SELECT COUNT(*) FROM conversation_runtime_probe_jobs').fetchone()[0]==0
+
+
+def test_claude_probe_captures_pending_prerequisite_then_qualified_owned_hook(owner):
+    value,fp,con,events=owner
+    fp=dataclasses.replace(fp,harness='claude',provider='anthropic')
+    prerequisite={'state':'configured_pending_owned_hook','evidence_level':'configuration_source_flag_inference',
+                  'effective_telemetry':False,'source_condition_sha256':'c'*64}
+    value.seat.claude_startup_prerequisite=lambda candidate,end:prerequisite if candidate==fp else pytest.fail('foreign candidate')
+    prepare=value.seat.prepare
+    def claude_prepare(*args,**kwargs):
+        context,_,native=prepare(*args,**kwargs)
+        return dataclasses.replace(context,harness='claude',provider='anthropic'),fp,native
+    value.seat.prepare=claude_prepare
+    probe=value.allocate(fp,frozenset({'submission','stop_work'}),time.monotonic()+10)
+    assert probe.context.probe_capabilities==('stop_work','stop_work_terminal','submission')
+    runtime=json.loads(con.execute('SELECT runtime_projection FROM conversations WHERE conversation_id=?',(probe.context.conversation_id,)).fetchone()[0])
+    assert runtime['startup_prerequisite']==prerequisite and 'memory_policy' not in runtime and runtime['capabilities']=={}
+    policy={'evidence_level':'configuration_source_flag_inference',
+            'observation_origin':'claude:documented-settings+captured-executable+owned-SessionStart-hook',
+            'auto_memory_disabled':True,'effective_telemetry':False,'generation_id':probe.context.generation_id,
+            'executable_sha256':fp.executable.sha256,'configuration_sha256':'e'*64,'hook_sha256':'f'*64,
+            'source_condition_sha256':'c'*64,'inherited_disable_flag':'1','auto_memory_enabled_setting':False}
+    with pytest.raises(RuntimeContractError):probe.on_identity(RuntimeIdentity('root',protocol={'memory_policy':policy}))
+    probe.on_identity(RuntimeIdentity('root',protocol={'configuration_sha256':'e'*64,'memory_policy':policy}))
+    runtime=json.loads(con.execute('SELECT runtime_projection FROM conversations WHERE conversation_id=?',(probe.context.conversation_id,)).fetchone()[0])
+    assert runtime['memory_policy']==policy and runtime['capabilities']=={}
+    assert events==['git','prepare','launch']
 
 
 def test_close_during_canonical_prepare_fences_generation_and_launch(owner):
