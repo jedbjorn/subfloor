@@ -66,9 +66,15 @@ def project_event(con, cid: str, sequence: int, event: dict, *, primary: dict | 
         eligible = event['freshness']=='current' and not event['partial'] and event['grade']!='inconclusive'
         projection.update(state='needs_consent' if eligible else 'setup_inconclusive',setup=event['data'] if eligible else None)
     elif kind == 'runtime.ready' and current['state'] not in {'closed','lost'}:
-        projection.update(state='ready',setup=None)
-        if ref:
-            projection['root_id'] = ref['root_id']
+        eligible=(current['state']=='ready' and root_activity and event['freshness']=='current'
+                  and not event['partial'] and event['grade'] in {'compatible','unverified'})
+        observed={key:event['data'][key] for key in ('native_route','memory_policy','readiness_diagnostic') if key in event['data']}
+        projection['latest_startup_observation']={'grade':event['grade'],'freshness':event['freshness'],
+                                                 'partial':event['partial'],'data':observed}
+        if eligible:
+            projection.update(state='ready',setup=None,root_id=ref['root_id'],startup_evidence=observed)
+        elif projection.get('state')!='ready':
+            projection.update(state='setup_inconclusive',setup=None)
     elif kind in {'runtime.lost','ownership.failed'}:
         projection.update(state='lost',freshness='unknown',partial=True,setup=None)
     elif kind == 'capability.observed':
