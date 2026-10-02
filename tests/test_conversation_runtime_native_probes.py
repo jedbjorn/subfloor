@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import dataclasses
 import hashlib
+import json
 import re
 import sys
 import threading
@@ -146,12 +147,124 @@ def test_unknown_write_retains_intent_never_replayed_and_close_fences_later_inpu
     late=driver.submit(NativeSubmission('later',2,'digest','finite'),deadline=time.monotonic()+1)
     assert late.state=='not_written' and 'later' not in owned.store.commands
 
+
+@pytest.mark.parametrize('owner_still_verified',[True,False])
+def test_repeated_cleanup_retains_native_close_and_rechecks_owner_os_proof(owned,owner_still_verified):
+    owner_calls=[]
+    def cleanup(fp,end):
+        owner_calls.append(fp.key)
+        return CleanupProof(True if len(owner_calls)==1 else owner_still_verified,'complete')
+    factory=NativeProbeFactory(lambda *args:owned,cleanup);fp=fingerprint(owned)
+    session=factory.reserve(fp,frozenset({'submission'}),deadline=time.monotonic()+2)
+    session.driver.start(owned.context,lambda e:None,deadline=time.monotonic()+2)
+    assert factory.cleanup(fp,deadline=time.monotonic()+1).complete
+    original=owned.client.request
+    def exited(op,**fields):
+        if op=='close':raise OSError('owned controller already exited')
+        return original(op,**fields)
+    owned.client.request=exited
+    second=factory.cleanup(fp,deadline=time.monotonic()+1)
+    assert second.complete is owner_still_verified and second.native_outcome=='complete'
+    assert len(owner_calls)==2 and sum(op=='close' for op,_,_ in owned.client.calls)==1
+
+
+def test_concurrent_cleanup_uses_single_proved_native_close(owned):
+    driver=start(owned);entered,release=threading.Event(),threading.Event()
+    original=owned.client.request;close_calls=[];results=[]
+    def blocked(op,**fields):
+        if op=='close':
+            close_calls.append(op);entered.set();assert release.wait(1)
+        return original(op,**fields)
+    owned.client.request=blocked
+    first=threading.Thread(target=lambda:results.append(driver.cleanup(deadline=time.monotonic()+2)))
+    second=threading.Thread(target=lambda:results.append(driver.cleanup(deadline=time.monotonic()+2)))
+    first.start();assert entered.wait(1);second.start();release.set();first.join(2);second.join(2)
+    assert len(close_calls)==1 and len(results)==2 and all(r.outcome=='complete' for r in results)
+
+
 @pytest.mark.parametrize('missing',['memory','marker'])
 def test_native_prompts_require_actual_memory_and_physical_marker_observation(owned,missing):
     if missing=='memory': owned.client.memory=False
     else:owned=replace(owned,observe_marker=None)
     driver=start(owned);result=NativeProbeFactory._exercise(driver,frozenset({'submission'}),time.monotonic()+1)
     assert result['submission'].grade=='inconclusive' and not any(c[0]=='submit' for c in owned.client.calls)
+    driver.cleanup(deadline=time.monotonic()+1)
+
+
+@pytest.mark.parametrize('change',[
+    None, {'evidence_level':'effective_telemetry'}, {'effective_telemetry':True},
+    {'auto_memory_disabled':1}, {'auto_memory_enabled_setting':0},
+    {'inherited_disable_flag':None}, {'generation_id':'other'},
+    {'executable_sha256':'e'*64}, {'configuration_sha256':'e'*64},
+    {'hook_sha256':None}, {'source_condition_sha256':'unknown'},
+    {'observation_origin':'model narration'}, {'missing_policy':True},
+])
+def test_claude_probe_input_requires_qualified_captured_memory_inference(owned,change):
+    context=replace(owned.context,harness='claude',provider='anthropic',model='actual-selected-model')
+    owned.client.context=context
+    policy={'evidence_level':'configuration_source_flag_inference',
+        'observation_origin':'claude:documented-settings+captured-executable+owned-SessionStart-hook',
+        'auto_memory_disabled':True,'effective_telemetry':False,'generation_id':context.generation_id,
+        'executable_sha256':context.executable.sha256,'configuration_sha256':'b'*64,
+        'hook_sha256':'c'*64,'source_condition_sha256':'d'*64,'inherited_disable_flag':'1',
+        'auto_memory_enabled_setting':False}
+    if change is not None:policy.update(change)
+    def identity():
+        return {'root_id':'root','process':{'pid':77,'start_ticks':100},'protocol':{
+            'configuration_sha256':'b'*64,'native_route':{'account_type':'claude.ai',
+            'model':context.model,'efforts':['high']},
+            'memory_policy':{} if policy.get('missing_policy') else policy}}
+    owned.client.identity=identity
+    actual=replace(owned,context=context)
+    driver=start(actual)
+    result=NativeProbeFactory._exercise(driver,frozenset({'submission'}),time.monotonic()+2)
+    assert result['submission'].grade==('compatible' if change is None else 'inconclusive')
+    assert sum(op=='submit' for op,_,_ in owned.client.calls)==(2 if change is None else 0)
+    assert ('memory_disabled' in result['submission'].coverage)==(change is None)
+    if change is None:
+        assert driver.identity.protocol['memory_policy']['effective_telemetry'] is False
+    driver.cleanup(deadline=time.monotonic()+1)
+
+
+def test_factory_witness_exports_only_correlated_semantic_counts_and_cleanup(owned):
+    factory=NativeProbeFactory(lambda *args:owned,lambda *args:CleanupProof(True,'complete'))
+    fp=fingerprint(owned)
+    assert factory.witness(fp)=={'waiting_stage':'allocation','first_close_observed':False}
+    session=factory.reserve(fp,frozenset({'submission'}),deadline=time.monotonic()+2)
+    session.driver.start(owned.context,lambda e:None,deadline=time.monotonic()+2)
+    session.exercise(session.driver,time.monotonic()+2)
+    witness=factory.witness(fp)
+    assert witness['waiting_stage']=='finished' and witness['first_root_processed']
+    assert witness['first_root_terminal_counts']=={'completed':1,'failed':0,'interrupted':0,'other':0}
+    assert witness['first_successful_reply'] and witness['second_final_nonce_matches']
+    private=owned.client.marker
+    assert private and private not in json.dumps(witness) and 'root' not in witness
+    assert factory.cleanup(fp,deadline=time.monotonic()+1).complete
+    witness=factory.witness(fp)
+    assert witness['first_close_outcome']=='complete' and witness['native_complete_retained']
+    assert witness['cleanup_fenced'] and witness['first_close_unresolved_work']==0
+
+
+def test_factory_witness_does_not_promote_partial_foreign_or_unknown_terminal_data(owned):
+    factory=NativeProbeFactory(lambda *args:owned,lambda *args:CleanupProof(True,'complete'))
+    fp=fingerprint(owned)
+    session=factory.reserve(fp,frozenset({'submission'}),deadline=time.monotonic()+2)
+    driver=session.driver;driver.start(owned.context,lambda e:None,deadline=time.monotonic()+2)
+    session.exercise(driver,time.monotonic()+2)
+    scenario=driver._scenario
+    ref=NativeReference('root','root',activity_id=scenario.first_activity)
+    with driver._lock:
+        driver.events.append(RuntimeEvent('activity.terminal',ref,request_id=scenario.first_request,
+                            data={'status':'private arbitrary native data'}))
+        driver.events.append(RuntimeEvent('activity.terminal',ref,request_id='foreign',data={'status':'failed'}))
+        driver.events.append(RuntimeEvent('activity.terminal',ref,request_id=scenario.first_request,
+                            partial=True,data={'status':'failed'}))
+        driver.events.append(RuntimeEvent('activity.terminal',NativeReference('root','child','root',activity_id='child-turn'),
+                            data={'status':'completed'}))
+    witness=factory.witness(fp)
+    assert witness['first_root_terminal_counts']=={'completed':1,'failed':0,'interrupted':0,'other':1}
+    assert witness['child_terminal_counts']['completed']==1
+    assert 'private arbitrary native data' not in json.dumps(witness)
     driver.cleanup(deadline=time.monotonic()+1)
 
 def test_finite_scenario_earns_observed_targets_without_early_os_cleanup_pass(owned):

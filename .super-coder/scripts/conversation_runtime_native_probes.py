@@ -51,6 +51,7 @@ from conversation_runtime_contract import (
     WriteReceipt,
     payload_digest,
 )
+from conversation_runtime_controller import observed_claude_memory
 
 
 @dataclass(frozen=True)
@@ -127,6 +128,10 @@ class ControllerProbeDriver(RuntimeDriver):
         self._ready = False
         self._started = False
         self._setup: StartupConsent | None = None
+        self._cleanup_lock = threading.Lock()
+        self._native_cleanup: NativeCleanup | None = None
+        self._first_native_cleanup: NativeCleanup | None = None
+        self._scenario: _Scenarios | None = None
 
     def _capture_identity(self, value: Mapping[str, Any]) -> None:
         identity = _identity(value)
@@ -306,20 +311,35 @@ class ControllerProbeDriver(RuntimeDriver):
             self._ready = False
             self._stop.set()
             self._publish_setup(None)
-        result = self._dispatch("probe-close", "close", {"action": "close"}, deadline)
-        self._stop.set()
-        if self._reader is not None:
-            self._reader.join(timeout=min(1, max(0, deadline-time.monotonic())))
-        unresolved = []
-        for value in result.get("unresolved_work", ()):
-            if not isinstance(value, dict):
-                return NativeCleanup("inconclusive")
-            ref = _reference(value)
-            if ref is None:
-                return NativeCleanup("inconclusive")
-            unresolved.append(ref)
-        return NativeCleanup(result.get("outcome", "inconclusive"), tuple(unresolved),
-                             tuple(result.get("unresolved_definitions", ())))
+        if not self._cleanup_lock.acquire(timeout=max(0, deadline-time.monotonic())):
+            return NativeCleanup("inconclusive")
+        try:
+            # The owner may already have stopped the controller after an
+            # explicit Close. Preserve its proved native result; the factory
+            # still asks the owner for fresh scoped OS evidence on every call.
+            if self._native_cleanup is not None:
+                return self._native_cleanup
+            result = self._dispatch("probe-close", "close", {"action": "close"}, deadline)
+            if self._reader is not None:
+                self._reader.join(timeout=min(1, max(0, deadline-time.monotonic())))
+            unresolved = []
+            for value in result.get("unresolved_work", ()):
+                if not isinstance(value, dict):
+                    return NativeCleanup("inconclusive")
+                ref = _reference(value)
+                if ref is None:
+                    return NativeCleanup("inconclusive")
+                unresolved.append(ref)
+            native = NativeCleanup(result.get("outcome", "inconclusive"), tuple(unresolved),
+                                   tuple(result.get("unresolved_definitions", ())))
+            with self._lock:
+                if self._first_native_cleanup is None:
+                    self._first_native_cleanup = native
+            if native.outcome == "complete" and not native.unresolved_work and not native.unresolved_definitions:
+                self._native_cleanup = native
+            return native
+        finally:
+            self._cleanup_lock.release()
 
 
 @dataclass
@@ -386,6 +406,26 @@ class NativeProbeFactory:
                 entry.cleaned = composite.complete
             return composite
 
+    def witness(self, fingerprint: Fingerprint) -> dict[str, Any]:
+        """Fixed semantic diagnostics only; never native payloads or intent IDs."""
+        with self._lock:
+            entry = self._allocations.get(fingerprint.key)
+            driver = entry.driver if entry else None
+        if driver is None:
+            return {"waiting_stage": "allocation", "first_close_observed": False}
+        with driver._lock:
+            scenario, closing = driver._scenario, driver._closing
+            cleanup = driver._first_native_cleanup
+            retained = driver._native_cleanup is not None
+        result: dict[str, Any] = scenario.witness() if scenario else {"waiting_stage": "startup"}
+        result.update(first_close_observed=cleanup is not None,
+            first_close_outcome=cleanup.outcome if cleanup and cleanup.outcome in {
+                "complete", "pending", "failed", "inconclusive"} else "inconclusive",
+            first_close_unresolved_work=len(cleanup.unresolved_work) if cleanup else 0,
+            first_close_unresolved_definitions=len(cleanup.unresolved_definitions) if cleanup else 0,
+            native_complete_retained=retained, cleanup_fenced=closing)
+        return result
+
     @staticmethod
     def _exercise(native: RuntimeDriver, capabilities: frozenset[str], deadline: float) -> Mapping[str, CapabilityEvidence]:
         if not isinstance(native, ControllerProbeDriver):
@@ -402,6 +442,50 @@ class _Scenarios:
         self.coverage: dict[str, set[str]] = {cap: set() for cap in capabilities}
         self.failures: list[Diagnostic] = []
         self.stage = CAP_SUBMISSION
+        self.waiting_stage = "startup"
+        self.first_request: str | None = None
+        self.first_activity: str | None = None
+        self.second_request: str | None = None
+        with driver._lock:
+            driver._scenario = self
+
+    def _phase(self, stage: str) -> None:
+        with self.driver._lock:
+            self.waiting_stage = stage
+
+    def witness(self) -> dict[str, Any]:
+        with self.driver._lock:
+            request, activity, second = self.first_request, self.first_activity, self.second_request
+            stage, root, events = self.waiting_stage, self.driver.identity, tuple(self.driver.events)
+        matched = [e for e in events if request and activity and self._root_event(e, request, activity)]
+        statuses = ("completed", "failed", "interrupted", "other")
+        root_terminals = dict.fromkeys(statuses, 0)
+        child_terminals = dict.fromkeys(statuses, 0)
+        for event in events:
+            if event.kind != "activity.terminal":
+                continue
+            status = event.data.get("status")
+            key = status if isinstance(status, str) and status in statuses else "other"
+            if event in matched:
+                root_terminals[key] += 1
+            ref = event.reference
+            if (root and ref and ref.root_id == root.root_id and ref.thread_id not in {None, root.root_id}
+                    and event.freshness == "current" and not event.partial
+                    and event.grade not in {"incompatible", "inconclusive"}):
+                child_terminals[key] += 1
+        def text(items: list[RuntimeEvent]) -> str:
+            return "".join(e.data["text"] for e in items if e.kind == "output.final" and e.reference
+                and e.reference.work_id is None and e.reference.native_process_id is None
+                and isinstance(e.data.get("text"), str))
+        reply = "READY "+self.nonce in text(matched)
+        recalled = [e for e in events if second and e.reference and e.reference.activity_id
+                    and self._root_event(e, second, e.reference.activity_id)]
+        processed = any(e.kind == "activity.processed" for e in matched)
+        return {"waiting_stage": stage, "first_root_processed": processed,
+                "first_root_terminal_counts": root_terminals, "child_terminal_counts": child_terminals,
+                "first_final_nonce_matches": reply, "first_successful_reply": bool(
+                    processed and root_terminals["completed"] and reply),
+                "second_final_nonce_matches": self.nonce in text(recalled)}
 
     def _wait(self, predicate: Callable[[], Any]) -> Any:
         while time.monotonic() < self.deadline:
@@ -443,6 +527,11 @@ class _Scenarios:
     def _submit(self, text: str) -> tuple[str, WriteReceipt]:
         self.ordinal += 1
         request = "probe-"+self.nonce+"-"+str(self.ordinal)
+        with self.driver._lock:
+            if self.ordinal == 1:
+                self.first_request = request
+            elif self.ordinal == 2:
+                self.second_request = request
         receipt = self.driver.submit(NativeSubmission(request, self.ordinal,
             payload_digest({"text": text}), text), deadline=self.deadline)
         if receipt.state not in {"written", "unknown"}:
@@ -454,6 +543,9 @@ class _Scenarios:
             and event.reference.activity_id and self._root_event(event, request, event.reference.activity_id)
             and (receipt.native_activity_id is None or receipt.native_activity_id == event.reference.activity_id)), None))
         receipt = dataclasses.replace(receipt, native_activity_id=processed.reference.activity_id)
+        if self.ordinal == 1:
+            with self.driver._lock:
+                self.first_activity = processed.reference.activity_id
         return request, receipt
 
     def _control(self, action: Literal["stop_reply", "stop_work"], ref: NativeReference, expected: str | None = None) -> str:
@@ -510,11 +602,15 @@ class _Scenarios:
         policy = root.protocol.get("memory_policy", {}) if root else {}
         if not isinstance(policy, dict):
             policy = {}
-        memory = (policy.get("generate_memories") is False and policy.get("use_memories") is False
-                  and policy.get("feature_enabled") is False and policy.get("root_mode") == "disabled"
-                  if self.driver.harness == "codex" else False)
-        # Claude has no observed public effective-memory field. Its evidence
-        # level remains unresolved; a made-up disabled flag cannot admit input.
+        if self.driver.harness == "codex":
+            memory = (policy.get("generate_memories") is False and policy.get("use_memories") is False
+                      and policy.get("feature_enabled") is False and policy.get("root_mode") == "disabled")
+        elif self.driver.harness == "claude":
+            # D413 accepts this explicitly labelled configuration/source/owned
+            # hook inference. It does not assert native effective telemetry.
+            _, memory = observed_claude_memory(policy, self.owned.context, root)
+        else:
+            memory = False
         route = root.protocol.get("native_route", {}) if root else {}
         route_observed = (isinstance(route, dict) and route.get("model") == self.owned.context.model
                           and route.get("account_type") == "chatgpt"
@@ -551,10 +647,13 @@ class _Scenarios:
             prompt += f"Start one additional sibling background terminal running {child_command}, yield 1000ms. "
         prompt += "Immediately reply READY plus the nonce and any observed tagged process IDs. No other tools/resources."
         try:
+            self._phase("first_processing")
             first, first_receipt = self._submit(prompt)
+            self._phase("first_reply")
             self._wait(lambda: self._successful_reply(first, first_receipt, "READY "+self.nonce))
             if not self.owned.observe_marker(self.nonce, self.deadline):
                 raise RuntimeContractError("PROBE_BOOT_FIXTURE_UNPROVED", "physical managed marker not observed")
+            self._phase("initial_work_inventory")
             initial = self._inventory()
             root_work = next((w for w in initial.work if w.kind == "terminal" and w.reference.thread_id == root.root_id), None)
             child = next((w for w in initial.work if w.kind == "child" and w.reference.parent_thread_id == root.root_id), None)
@@ -569,6 +668,7 @@ class _Scenarios:
                 child_pid = self._wait(lambda: self._pid(child_label))
             elif background:
                 child_pid = self._wait(lambda: self._pid(child_label))
+            self._phase("nonce_recall")
             second, second_receipt = self._submit("Reply only with the remembered nonce from the previous message. No tools or resources.")
             self._wait(lambda: self._successful_reply(second, second_receipt, self.nonce))
             if not self._retained_root(root, self._inventory()):
@@ -577,6 +677,7 @@ class _Scenarios:
                 self.coverage[CAP_SUBMISSION].update({"repeated_input", "root_identity", "processing_terminal", "boot_fixture", "memory_disabled"})
             if CAP_STOP_REPLY in self.caps:
                 self.stage = CAP_STOP_REPLY
+                self._phase("stop_reply")
                 if CAP_STOP_REPLY not in grants or root_work is None or root_pid is None:
                     raise RuntimeContractError("PROBE_STOP_REPLY_GRANT_UNPROVED", "background isolation/grant required")
                 stopped, receipt = self._submit("Write 1000 numbered finite fixture lines. No tools/resources.")
@@ -593,6 +694,7 @@ class _Scenarios:
                 self.coverage[CAP_STOP_REPLY].update({"expected_activity", "terminal", "background_isolation"})
             if work_enabled and root_work is not None and root_pid is not None:
                 self.stage = "stop_work_terminal"
+                self._phase("stop_terminal")
                 terminal_control = self._control("stop_work", root_work.reference)
                 self._wait(lambda: self._control_completed(terminal_control, root_work.reference))
                 self._wait(lambda: not self._alive(root_pid))
@@ -612,6 +714,7 @@ class _Scenarios:
                     "target:terminal", "terminal_identity"})
             if child_enabled and child is not None and child_terminal is not None and child_pid is not None:
                 self.stage = "stop_work_child"
+                self._phase("stop_child")
                 fresh = next(w for w in self._inventory().work if w.kind == "child" and w.reference.thread_id == child.reference.thread_id)
                 child_control = self._control("stop_work", fresh.reference, fresh.reference.activity_id)
                 self._wait(lambda: self._control_completed(child_control, fresh.reference))
@@ -628,6 +731,7 @@ class _Scenarios:
             code = exc.code if isinstance(exc, RuntimeContractError) else "NATIVE_BEHAVIOR_UNPROVED"
             failure_grade: Grade = "incompatible" if code in {"PROBE_SIBLING_ISOLATION_BROKEN", "PROBE_BACKGROUND_ISOLATION_BROKEN"} else "inconclusive"
             self.failures.append(Diagnostic(self.stage, failure_grade, code))
+        self._phase("finished")
         result = {}
         for cap in self.caps:
             diagnostics = tuple(d for d in (*self.driver.diagnostics, *self.failures) if d.capability in {cap, "stop_work_terminal", "stop_work_child"}
