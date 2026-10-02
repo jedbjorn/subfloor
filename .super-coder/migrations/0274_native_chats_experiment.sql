@@ -3,6 +3,7 @@
 BEGIN;
 ALTER TABLE conversations ADD COLUMN runtime_mode TEXT NOT NULL DEFAULT 'ephemeral'
  CHECK(runtime_mode IN ('ephemeral','native_experiment'));
+ALTER TABLE conversations ADD COLUMN runtime_projection TEXT NOT NULL DEFAULT '{}';
 CREATE TABLE IF NOT EXISTS conversation_runtime_capability_cache (
  cache_key TEXT PRIMARY KEY,
  evidence_json TEXT NOT NULL,

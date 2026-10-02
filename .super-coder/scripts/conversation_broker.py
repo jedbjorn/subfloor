@@ -331,6 +331,7 @@ class BrokerStore:
             "AS interrupt_requested "
             "FROM conversation_runs r "
             "JOIN conversations c ON c.conversation_id=r.conversation_id "
+            "AND c.runtime_mode='ephemeral' "
             "JOIN conversation_messages m "
             " ON m.message_id=r.trigger_message_id "
         )

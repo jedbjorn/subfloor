@@ -12,10 +12,11 @@ import threading
 import time
 
 from conversation_adapters.base import NORMALIZED_EVENTS
+from conversation_runtime_contract import EVENT_KINDS
 
 # Every conversation_events writer validates against this vocabulary. The UI
 # listener contract is bound to it so adding a type requires a listener.
-CONVERSATION_EVENT_TYPES = NORMALIZED_EVENTS | frozenset(
+CONVERSATION_EVENT_TYPES = NORMALIZED_EVENTS | EVENT_KINDS | frozenset(
     {
         "conversation.created",
         "conversation.updated",
