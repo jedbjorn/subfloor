@@ -763,7 +763,7 @@ def test_checker_submission_proof_survives_optional_target_gap_only_after_full_c
     assert not result.evidence['stop_work'].coverage
 
 
-@pytest.mark.parametrize('boundary', ['activity', 'item', 'digest', 'contiguous', 'replay', 'conflicting', 'missing_part'])
+@pytest.mark.parametrize('boundary', ['activity', 'item', 'digest', 'contiguous', 'replay', 'conflicting', 'missing_part', 'missing_tail', 'conflicting_last'])
 def test_pid_candidates_preserve_observed_text_record_and_part_boundaries(owned, boundary):
     from conversation_runtime_native_probes import _Scenarios
     driver = start(owned)
@@ -778,9 +778,11 @@ def test_pid_candidates_preserve_observed_text_record_and_part_boundaries(owned,
         if boundary == 'replay': rows.insert(1, rows[0])
         if boundary == 'conflicting': rows.append(replace(rows[0], data=rows[0].data | {'text': 'TAG=3'}))
         if boundary == 'missing_part': rows = [replace(rows[1], data=rows[1].data | {'text': 'TAG=200'})]
+    if boundary == 'missing_tail': rows = [replace(rows[0], data=rows[0].data | {'last': False})]
+    if boundary == 'conflicting_last': rows.append(replace(rows[0], data=rows[0].data | {'last': False}))
     with driver._lock: driver.events = rows
     scenario = _Scenarios(driver, frozenset({'submission'}), time.monotonic()+1)
     try:
-        assert scenario._pid('TAG') == (None if boundary in {'conflicting', 'missing_part'} else ProcessIdentity(200, 2000))
+        assert scenario._pid('TAG') == (None if boundary in {'conflicting', 'missing_part', 'missing_tail', 'conflicting_last'} else ProcessIdentity(200, 2000))
     finally:
         driver.cleanup(deadline=time.monotonic()+1)

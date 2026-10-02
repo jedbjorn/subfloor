@@ -602,7 +602,7 @@ class _Scenarios:
 
     def _pid(self, label: str) -> ProcessIdentity | None:
         outputs: dict[tuple[Any, ...], list[str]] = {}
-        parts: dict[tuple[Any, ...], dict[int, str]] = {}
+        parts: dict[tuple[Any, ...], dict[int, tuple[str, bool]]] = {}
         ambiguous: set[tuple[Any, ...]] = set()
         for event in self._events():
             ref = event.reference
@@ -611,16 +611,22 @@ class _Scenarios:
                 digest, part = event.data.get("text_digest"), event.data.get("part")
                 output_key = (ref.thread_id, ref.activity_id, ref.item_id, event.kind,
                               digest if isinstance(digest, str) else None)
-                if isinstance(digest, str) and type(part) is int and 0 <= part < 128:
-                    rows = parts.setdefault(output_key, {})
-                    if part in rows and rows[part] != value:
+                if isinstance(digest, str):
+                    last = event.data.get("last")
+                    if type(part) is not int or not 0 <= part < 128 or type(last) is not bool:
                         ambiguous.add(output_key)
-                    rows[part] = value
+                        continue
+                    rows = parts.setdefault(output_key, {})
+                    if part in rows and rows[part] != (value, last):
+                        ambiguous.add(output_key)
+                    rows[part] = (value, last)
                 else:
                     outputs.setdefault(output_key, []).append(value)
         for output_key, rows in parts.items():
-            if output_key not in ambiguous and sorted(rows) == list(range(len(rows))):
-                outputs[output_key] = [rows[part] for part in sorted(rows)]
+            last_parts = [part for part, (_, last) in rows.items() if last]
+            if (output_key not in ambiguous and last_parts == [len(rows)-1]
+                    and sorted(rows) == list(range(len(rows)))):
+                outputs[output_key] = [rows[part][0] for part in sorted(rows)]
         # Distinct full-text records/turns/items cannot append digits to PIDs;
         # contiguous complete-record chunks reassemble and replay parts dedup.
         text = "\n".join("".join(chunks) for chunks in outputs.values())
