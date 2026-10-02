@@ -29,6 +29,13 @@ EVENT_KINDS = frozenset({
 # Only ephemeral output may be truncated; identity/intents/outcomes require
 # reserved journal capacity and must never become silent success.
 OUTPUT_KINDS = frozenset({"output.delta"})
+CAP_SUBMISSION = "submission"
+CAP_STOP_REPLY = "stop_reply"
+CAP_STOP_WORK = "stop_work"
+CAP_AUTOMATION = "automation"
+# Shared GUI/checker operation names; diagnostics may retain additional native
+# capability names, but repeated input must never be keyed as 'conversation'.
+GUI_CAPABILITIES = frozenset({CAP_SUBMISSION,CAP_STOP_REPLY,CAP_STOP_WORK,CAP_AUTOMATION})
 # Private socket wire: one UTF-8 JSON object + newline per connection, <=256KiB.
 # Request generation/contract/op; reply {ok:true,result:{...}} or
 # {ok:false,error:<stable code>,detail:<redacted detail>}. No auth env/token
@@ -149,6 +156,8 @@ class RuntimeContext:
         if any(grade not in {"compatible","incompatible","inconclusive","unverified"}
                for grade in self.capability_evidence.values()):
             raise RuntimeContractError("CAPABILITY_INVALID", "unknown capability evidence grade")
+        if "conversation" in self.capability_evidence or "conversation" in self.probe_capabilities:
+            raise RuntimeContractError("CAPABILITY_INVALID", "repeated input uses the shared submission capability key")
 
     def execution_argv(self, argv: list[str]) -> list[str]:
         return [*self.execution_prefix, *argv]
