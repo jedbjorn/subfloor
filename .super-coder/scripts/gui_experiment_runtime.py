@@ -114,7 +114,9 @@ class FixtureNativeCheck:
                     or chat['runtime_mode']!='native_experiment' or runtime.get('role')!='probe'
                     or runtime.get('generation_id')!=generation):
                 raise RuntimeContractError('PROBE_INVALID','probe reconciliation is outside captured tenancy')
-            captured=con.execute('SELECT state,cleanup_json FROM conversation_runtime_generations WHERE generation_id=? AND conversation_id=? AND owner_user_id=1 AND shell_id=?',(generation,cid,chat['shell_id'])).fetchone()
+            captured=con.execute('SELECT conversation_id,owner_user_id,shell_id,state,cleanup_json FROM conversation_runtime_generations WHERE generation_id=?',(generation,)).fetchone()
+            if captured and (captured['conversation_id']!=cid or captured['owner_user_id']!=1 or captured['shell_id']!=chat['shell_id']):
+                raise RuntimeContractError('PROBE_INVALID','captured generation conflicts with the retained probe owner')
         finally:
             con.close()
         with self.lock:

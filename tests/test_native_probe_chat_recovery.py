@@ -101,3 +101,19 @@ def test_restart_cleanup_readback_allows_new_check_without_restoring_grades(requ
     result=restarted.get(1,request_key='original')
     assert result['state']=='complete' and result['retry_allowed'] and not result['admissible']
     assert result['grades']=={} and calls==['begin']
+
+
+def test_conflicting_captured_generation_cannot_certify_never_launched(request):
+    from conversation_runtime_contract import RuntimeContractError
+    value,_,con,_=request.getfixturevalue('operation')
+    runtime=probe_projection(con,state='closed')
+    runtime['preparation_cleanup']={'unit_verified_exited':True,'never_launched':True}
+    con.execute("UPDATE conversations SET state='closed',closed_at=datetime('now'),runtime_projection=?",(json.dumps(runtime),))
+    con.execute('UPDATE conversation_runtime_generations SET owner_user_id=2');con.commit()
+    try:
+        value.consume_probe('cv','g')
+    except RuntimeContractError as exc:
+        assert exc.code=='PROBE_INVALID'
+    else:
+        raise AssertionError('conflicting generation was accepted as absent')
+    assert con.execute('SELECT status FROM conversation_runtime_probe_jobs').fetchone()[0]=='preparing'
