@@ -4831,6 +4831,351 @@ function chatReviewWorkspace(host, conversation) {
   return { setMode, cleanup };
 }
 
+// Native experiment: consume stored server identities, never invent target keys.
+const chatNativeRequests = new Map();
+const CHAT_NATIVE_EVENTS = new Set([
+  "runtime.ready", "runtime.setup", "runtime.lost", "ownership.failed",
+  "activity.started", "activity.processed", "activity.terminal",
+  "work.observed", "work.terminal", "snapshot.observed",
+  "control.acknowledged", "control.outcome", "capability.observed",
+]);
+
+function chatNativeControlBody(conversation, action, target = {}) {
+  const runtime = conversation.runtime;
+  if (!runtime?.generation_id || !Number.isInteger(conversation.version)) return null;
+  const body = { version: conversation.version, generation_id: runtime.generation_id, action };
+  if (action === "enable_local_channel") {
+    if (runtime.state !== "needs_consent" || !runtime.setup?.setup_id
+        || runtime.setup.generation_id !== runtime.generation_id
+        || runtime.setup.phase !== "local_channel_development_consent") return null;
+    body.setup_id = runtime.setup.setup_id;
+  } else if (action === "stop_reply") {
+    if (runtime.state !== "ready" || !runtime.primary?.activity_id || runtime.capabilities?.stop_reply !== "compatible") return null;
+    body.expected_activity_id = runtime.primary.activity_id;
+  } else {
+    const kind = target.data?.kind;
+    if (runtime.state !== "ready" || !target.work_key || target.partial !== false || target.freshness !== "current"
+        || target.kind === "work.terminal"
+        || ["completed", "stopped", "failed", "deleted"].includes(target.data?.status)) return null;
+    if (action === "stop_automation") {
+      if (kind !== "automation" || runtime.capabilities?.automation !== "compatible") return null;
+    } else if (action === "stop_work") {
+      if (!["terminal", "child"].includes(kind)
+          || runtime.capabilities?.stop_work !== "compatible"
+          || runtime.capabilities?.[`stop_work_${kind}`] !== "compatible") return null;
+      if (kind === "child") {
+        if (!target.reference?.activity_id) return null;
+        body.expected_activity_id = target.reference.activity_id;
+      }
+    } else return null;
+    body.work_key = target.work_key;
+  }
+  if (conversation.state === "closed" || conversation.close_requested_at
+      || ["closing", "closed", "lost"].includes(runtime.state)) return null;
+  return body;
+}
+
+function chatNativeRequestSlot(conversation, body) {
+  return JSON.stringify([conversation.conversation_id, body.generation_id,
+    body.action, body.work_key || null, body.expected_activity_id || null, body.setup_id || null]);
+}
+
+function chatNativeRequestRead(slot) {
+  if (!chatNativeRequests.has(slot)) {
+    try {
+      const stored = JSON.parse(sessionStorage.getItem("native-control:" + slot));
+      if (stored?.key && stored?.body) chatNativeRequests.set(slot, stored);
+    } catch { /* A missing storage surface never authorizes replay. */ }
+  }
+  return chatNativeRequests.get(slot);
+}
+
+function chatNativeRequestWrite(slot, request) {
+  chatNativeRequests.set(slot, request);
+  try { sessionStorage.setItem("native-control:" + slot, JSON.stringify(request)); } catch { /* Current view still fences. */ }
+}
+
+function chatNativeSendSlot(conversation) {
+  return JSON.stringify(["send", conversation.conversation_id, conversation.runtime?.generation_id]);
+}
+
+function chatNativeRequestClear(slot) {
+  chatNativeRequests.delete(slot);
+  try { sessionStorage.removeItem("native-control:" + slot); } catch { /* Current view cleared. */ }
+}
+
+function chatNativeObservedTime(value) {
+  if (value == null) return "Timestamp unavailable";
+  const date = new Date(typeof value === "number" ? value * 1000 : value);
+  return Number.isNaN(date.getTime()) ? "Timestamp unavailable" : date.toLocaleString();
+}
+
+function chatNativeRuntimePanel(host, conversation, { control, refresh, connection = "connecting" }) {
+  host.hidden = conversation.runtime_mode !== "native_experiment";
+  if (host.hidden) return;
+  const runtime = conversation.runtime || {};
+  const claude = conversation.route?.harness === "claude";
+  const panel = el("section", { className: "chat-native-panel", ariaLabel: "Native runtime" });
+  panel.append(el("div", { className: "chat-native-heading" },
+    el("strong", {}, runtime.role === "probe" ? "Finite compatibility probe" : "Native runtime · experiment"),
+    el("span", { className: "chat-native-connection" }, connection === "connected" ? "Connected" : "Reconnecting / observing")),
+  el("div", { className: "chat-native-states" },
+    el("span", {}, `Runtime: ${runtime.state || "unknown"}`),
+    el("span", {}, runtime.primary?.activity_id
+      ? `Foreground: active · ${runtime.primary.activity_id}` : "Foreground: no activity recorded"),
+    el("span", {}, `Inventory: ${runtime.freshness || "unknown"} · ${chatNativeObservedTime(runtime.observed_at)}`)));
+  panel.append(el("p", { className: "muted" },
+    "This runtime stays open while idle or disconnected. Close requests cleanup of its owned work."));
+  if (runtime.partial !== false || runtime.work_partial) panel.append(el("p", { className: "chat-native-partial" },
+    "Partial inventory. Missing items do not prove that work completed."));
+  if (runtime.onboarding?.canonical_main_root) panel.append(el("details", { className: "chat-native-onboarding" },
+    el("summary", {}, "Native setup"), el("p", {},
+      "First-time sign-in and workspace trust use the native terminal. Trust this canonical main repository; its linked worktrees share that scope."),
+    el("code", {}, runtime.onboarding.canonical_main_root)));
+  const addControl = (parent, action, label, target) => {
+    const body = chatNativeControlBody(conversation, action, target);
+    const slot = body && chatNativeRequestSlot(conversation, body);
+    const previous = slot && chatNativeRequestRead(slot);
+    const observed = previous?.control_id && (runtime.controls || []).find((row) => row.control_id === previous.control_id);
+    const final = observed?.state === "terminal"
+      || ["complete", "failed", "unsupported", "rejected"].includes(observed?.receipt?.outcome);
+    const pending = previous && previous.state !== "not_written" && !final;
+    const button = el("button", { type: "button", className: "act chat-native-control",
+      disabled: !body || Boolean(pending), textContent: previous?.state === "not_written" ? "Retry request (not written)" : label });
+    parent.append(button);
+    if (pending) parent.append(el("span", { className: "chat-native-control-state", role: "status" },
+      previous.state === "unknown" ? "Outcome unknown. Refresh evidence or Close." : "Request pending native verification."));
+    button.onclick = async () => {
+      if (button.disabled || !body) return;
+      // Only proved not-written may retry the same exact stable intent.
+      const request = previous?.state === "not_written" ? previous : { key: requestKey(), body, state: "pending" };
+      chatNativeRequestWrite(slot, { ...request, state: "pending" });
+      button.disabled = true;
+      try {
+        const result = await control(request.body, request.key);
+        chatNativeRequestWrite(slot, { ...request, control_id: result.control_id, state: result.state || "unknown" });
+      } catch (error) {
+        chatNativeRequestWrite(slot, { ...request, state: "unknown" });
+        toast(`${error.code || "CONTROL_UNKNOWN"}: ${error.message}`);
+      }
+      refresh(); // A read, never an automatic mutation retry.
+    };
+  };
+  const primary = el("div", { className: "chat-native-primary" });
+  addControl(primary, "stop_reply", "Stop reply");
+  if (runtime.state === "needs_consent") {
+    primary.append(el("span", {}, "This runtime requests local development-channel consent. This does not grant workspace trust or tool permissions."));
+    addControl(primary, "enable_local_channel", "Enable local channel");
+  } else if (["setup_inconclusive", "preparing", "starting", "candidate"].includes(runtime.state)) {
+    primary.append(el("span", {}, "Startup is not ready. Complete any required native sign-in/workspace setup; Close remains available."));
+  }
+  const reconcile = el("button", { type: "button", className: "act", textContent: "Refresh evidence" });
+  reconcile.onclick = refresh;
+  primary.append(reconcile);
+  panel.append(primary);
+  const capabilities = el("details", { className: "chat-native-capabilities" },
+    el("summary", {}, "Capability evidence"));
+  for (const [name, grade] of Object.entries(runtime.capabilities || {}))
+    capabilities.append(el("div", {}, `${name}: ${grade}`));
+  panel.append(capabilities);
+  const list = el("div", { className: "chat-native-work", ariaLabel: "Native work inventory" });
+  const work = Array.isArray(runtime.work) ? runtime.work : [];
+  if (!work.length) list.append(el("p", { className: "muted" }, "No work items recorded in this snapshot."));
+  for (const row of work) {
+    const kind = row.data?.kind || "unknown";
+    const item = el("div", { className: "chat-native-work-item" });
+    item.append(el("strong", {}, kind), el("span", {}, row.data?.status || row.kind || "unknown"),
+      el("span", {}, `${row.freshness || "unknown"}${row.partial ? " · partial" : ""} · ${chatNativeObservedTime(row.observed_at)}`));
+    const id = row.reference?.work_id || row.reference?.thread_id || row.reference?.native_process_id;
+    if (id) item.append(el("code", {}, String(id)));
+    if (row.provenance) item.append(el("small", {}, `Observed via ${row.provenance}`));
+    const action = kind === "automation" ? "stop_automation" : "stop_work";
+    addControl(item, action, claude ? "Request stop" : "Stop work", row);
+    if (claude) item.append(el("small", {}, "A model request; success requires an actual native result and fresh evidence."));
+    list.append(item);
+  }
+  panel.append(list);
+  const activity = Array.isArray(runtime.activity) ? runtime.activity : [];
+  const output = el("div", { className: "chat-native-activity", ariaLabel: "Native activity and output" });
+  if (runtime.activity_partial) output.append(el("p", { className: "muted" }, "Native activity history is partial."));
+  for (const event of activity) {
+    if (event.engine_run_id != null || event.generation_id !== runtime.generation_id) continue;
+    const item = el("div", { className: "chat-native-activity-item" });
+    item.dataset.activityKey = `${event.generation_id}:${event.controller_sequence}`;
+    item.append(el("small", {}, `${event.source === "system" ? "System / setup" : event.source === "automation" ? "Native automation" : event.source === "native_completion" ? "Native completion" : "Native activity"} · ${event.kind} · ${event.freshness || "unknown"}${event.partial ? " · partial" : ""} · ${chatNativeObservedTime(event.observed_at)}`));
+    if (typeof event.data?.text === "string") item.append(el("div", { className: "chat-native-output" }, event.data.text));
+    else if (event.data?.status) item.append(el("span", {}, event.data.status));
+    if (event.provenance) item.append(el("small", {}, `Observed via ${event.provenance}`));
+    output.append(item);
+  }
+  panel.append(output);
+  if (runtime.controls_partial) panel.append(el("p", { className: "muted" }, "Control history is partial. Missing receipts do not prove completion."));
+  const controls = Array.isArray(runtime.controls) ? runtime.controls : [];
+  for (const row of controls) panel.append(el("div", { className: "chat-native-receipt" },
+    `${row.action || "Control"}: ${row.receipt?.native_outcome || row.receipt?.outcome || row.state || "unknown"}`));
+  if (runtime.cleanup) {
+    const cleanup = runtime.cleanup;
+    panel.append(el("div", { className: "chat-native-cleanup", role: "status" },
+      `Cleanup: ${cleanup.outcome || "pending"} · owned unit ${cleanup.unit_verified_exited === true ? "exit verified" : "exit unverified"}`,
+      el("span", {}, `Unresolved work: ${(cleanup.unresolved_work || []).length}; definitions: ${(cleanup.unresolved_definitions || []).length}`)));
+  }
+  host.replaceChildren(panel);
+}
+
+async function chatNativeNewForm(host, shell, config) {
+  const form = el("div", { className: "chat-native-check" });
+  const choice = el("select", { ariaLabel: "Native route to check" });
+  const candidates = Array.isArray(config.candidates) ? config.candidates : [];
+  for (const [index, candidate] of candidates.entries()) choice.append(el("option", {
+    value: String(index), textContent: candidate.label
+      || [candidate.harness, candidate.model, candidate.effort].filter(Boolean).join(" · "),
+  }));
+  const status = el("div", { role: "status", className: "chat-native-check-status" });
+  const check = el("button", { type: "button", className: "act", textContent: "Check native compatibility", disabled: !candidates.length });
+  const readback = el("button", { type: "button", className: "act", textContent: "Refresh check", hidden: true });
+  const probe = el("button", { type: "button", className: "act", textContent: "Open finite probe setup / Close", hidden: true });
+  const created = el("button", { type: "button", className: "act", textContent: "Open created chat / Close", hidden: true });
+  const title = el("input", { placeholder: "Optional chat title", maxlength: 200, ariaLabel: "Native chat title" });
+  const start = el("button", { type: "button", className: "act primary", textContent: "Start native chat", disabled: true });
+  let selection = null, intent = null, result = null, checking = false, creating = false, observer = null, readInFlight = null;
+  const alive = () => host.isConnected && !chatReadController?.signal.aborted;
+  const storageKey = () => "native-check:" + JSON.stringify([shell.shell_id, selection]);
+  const save = () => { try { sessionStorage.setItem(storageKey(), JSON.stringify(intent)); } catch { /* Retain current intent. */ } };
+  const paint = () => {
+    check.disabled = !selection || checking || Boolean(intent?.create) || Boolean(intent) && result?.retry_allowed !== true;
+    readback.hidden = !intent;
+    probe.hidden = !result?.probe?.conversation_id;
+    created.hidden = !intent?.create?.conversation_id;
+    start.disabled = checking || creating || result?.admissible !== true || Boolean(intent?.create);
+    const grades = result?.grades ? Object.entries(result.grades).map(([name, grade]) => `${name}: ${grade}`).join(" · ") : "";
+    status.textContent = intent?.create
+      ? (creating ? "Creating native chat…" : intent.create.state === "accepted" ? "Chat created. Open it or use shell history."
+        : "Chat creation outcome unknown. Inspect shell history; this creation was not replayed.")
+      : result
+      ? `${result.state || "unknown"}${grades ? " · " + grades : ""}${result.diagnostics ? " · " + (Array.isArray(result.diagnostics) ? result.diagnostics.join("; ") : String(result.diagnostics)) : ""}`
+      : intent ? "Check recorded locally; read back its server outcome. No automatic retry." : "Check this requested route before starting. A candidate is not proof of availability.";
+  };
+  const observeProbe = () => {
+    observer?.close(); observer = null;
+    const id = result?.probe?.conversation_id;
+    if (!id || !alive()) return;
+    observer = new EventSource(`/api/conversations/${encodeURIComponent(id)}/events?after=0`);
+    const changed = () => { if (alive()) refreshCheck(); else observer?.close(); };
+    for (const event of [...CHAT_NATIVE_EVENTS, "conversation.closed"]) observer.addEventListener(event, changed);
+    observer.onopen = changed;
+    observer.onerror = () => { status.textContent = "Probe connection interrupted. Refresh check or open its saved setup / Close."; };
+    chatReadController?.signal.addEventListener("abort", () => observer?.close(), { once: true });
+  };
+  const accept = (value) => {
+    result = value;
+    if (value?.check_id) { intent.check_id = value.check_id; save(); }
+    paint();
+  };
+  const refreshCheck = () => {
+    if (!intent || readInFlight) return readInFlight;
+    const captured = intent;
+    const path = captured.check_id ? `/conversations/native-checks/${encodeURIComponent(captured.check_id)}`
+      : `/conversations/native-checks?request_key=${encodeURIComponent(captured.key)}`;
+    readInFlight = chatRead(path, chatReadController?.signal).then(async (value) => {
+      if (intent !== captured || !alive()) return;
+      const oldProbe = result?.probe?.conversation_id;
+      accept(value);
+      if (value.probe?.conversation_id !== oldProbe) observeProbe();
+      await reconcileCreate();
+    }).catch((error) => {
+      if (intent === captured && alive()) status.textContent = `${error.code || "CHECK_UNKNOWN"}: ${error.message}. The check was not replayed.`;
+    }).finally(() => { readInFlight = null; });
+    return readInFlight;
+  };
+  const reconcileCreate = async () => {
+    const captured = intent, prior = captured?.create;
+    if (!prior || creating) return;
+    try {
+      let id = prior.conversation_id;
+      if (!id) {
+        const page = await chatRead(`/conversations?request_key=${encodeURIComponent(prior.key)}`, chatReadController?.signal);
+        if (intent !== captured || !alive()) return;
+        const match = page.items?.find((row) => row.request_key === prior.key && row.shell?.shell_id === shell.shell_id);
+        if (!match) return;
+        id = prior.conversation_id = match.conversation_id;
+        prior.state = "accepted"; save(); paint();
+      }
+      const chat = await chatRead(`/conversations/${encodeURIComponent(id)}`, chatReadController?.signal);
+      if (intent !== captured || !alive()) return;
+      const cleanup = chat.runtime?.cleanup;
+      if (chat.state === "closed" && cleanup?.outcome === "complete"
+          && cleanup.unit_verified_exited === true
+          && Array.isArray(cleanup.unresolved_work) && cleanup.unresolved_work.length === 0
+          && Array.isArray(cleanup.unresolved_definitions) && cleanup.unresolved_definitions.length === 0) {
+        delete intent.create; save(); paint();
+      }
+    } catch { /* Retain ambiguous creation or cleanup; no mutation replay. */ }
+  };
+  choice.onchange = () => {
+    observer?.close(); observer = null;
+    const candidate = candidates[Number(choice.value)];
+    selection = candidate && { harness: candidate.harness, model: candidate.model, effort: candidate.effort };
+    result = null; intent = null;
+    try {
+      const stored = JSON.parse(sessionStorage.getItem(storageKey()));
+      if (stored?.key && JSON.stringify(stored.selection) === JSON.stringify(selection)) intent = stored;
+    } catch { /* A new selection has no presumed check. */ }
+    paint();
+    if (intent) {
+      refreshCheck();
+
+    }
+  };
+  check.onclick = async () => {
+    if (check.disabled || !selection) return;
+    observer?.close(); observer = null; result = null;
+    const captured = intent = { key: requestKey(), selection: { ...selection } };
+    save(); checking = true; choice.disabled = true; paint();
+    try {
+      const value = await chatApi("/conversations/native-checks", "POST", captured.selection, captured.key);
+      if (!alive() || intent !== captured) return;
+      accept(value); observeProbe();
+    } catch (error) {
+      if (alive() && intent === captured) status.textContent = `${error.code || "CHECK_UNKNOWN"}: ${error.message}. Use Refresh check; this check was not replayed.`;
+    } finally {
+      checking = false; choice.disabled = false;
+      if (alive()) { check.disabled = Boolean(intent?.create) || result?.retry_allowed !== true; readback.hidden = false; start.disabled = result?.admissible !== true || Boolean(intent?.create); }
+    }
+  };
+  readback.onclick = refreshCheck;
+  probe.onclick = async () => {
+    if (!result?.probe?.conversation_id) return;
+    try {
+      const chat = await chatRead(`/conversations/${encodeURIComponent(result.probe.conversation_id)}`, chatReadController?.signal);
+      if (alive()) location.hash = chatHash(chat.shell.shortname, chat.conversation_id);
+    } catch (error) { toast(`${error.code}: ${error.message}`); }
+  };
+  created.onclick = () => { if (intent?.create?.conversation_id) location.hash = chatHash(shell.shortname, intent.create.conversation_id); };
+  start.onclick = async () => {
+    if (start.disabled || !selection) return;
+    start.disabled = true; choice.disabled = true; creating = true;
+    intent.create = { key: requestKey(), body: { shell_id: shell.shell_id, ...selection,
+      title: title.value.trim() || null, runtime_mode: "native_experiment" }, state: "pending" };
+    save();
+    try {
+      const chat = await chatApi("/conversations", "POST", intent.create.body, intent.create.key);
+      intent.create = { ...intent.create, state: "accepted", conversation_id: chat.conversation_id }; save();
+      if (alive()) location.hash = chatHash(shell.shortname, chat.conversation_id);
+    } catch (error) {
+      intent.create.state = "unknown"; save();
+      chatBusyToast(error, shell.shortname);
+      status.textContent = "Chat creation outcome unknown. Inspect shell history; this creation was not replayed.";
+    } finally { choice.disabled = false; creating = false; }
+  };
+  const main = config.onboarding?.canonical_main_root;
+  form.append(el("h2", {}, "Keep a native runtime open"),
+    el("p", { className: "muted" }, "Initial sign-in and workspace trust may require the native terminal. After setup, use the GUI for chats and background work."));
+  if (main) form.append(el("p", {}, "Trust the validated canonical main repository. Its linked worktrees share workspace trust; each runtime requests local-channel consent separately."), el("code", {}, main));
+  form.append(choice, status, check, readback, probe, created, title, start);
+  host.replaceChildren(form);
+  choice.onchange();
+}
+
 async function chatRenderNew(host, shell, defaults, catalog) {
   const rows = defaults.flavors?.[shell.flavor] || [];
   const byHarness = Object.fromEntries(rows.map((row) => [row.harness, row]));
@@ -4945,7 +5290,22 @@ async function chatRenderNew(host, shell, defaults, catalog) {
       submit.textContent = "Start chat";
     }
   };
-  host.replaceChildren(form);
+  const mode = el("input", { type: "checkbox", disabled: true });
+  const modeChoice = el("div", { className: "chat-runtime-choice", hidden: true },
+    el("label", {}, mode, "Keep native runtime open (experiment)"));
+  const native = el("div", { hidden: true });
+  host.replaceChildren(form, modeChoice, native);
+  try {
+    const config = await chatRead("/conversations/native-config", chatReadController?.signal);
+    if (!host.isConnected || config.enabled !== true) return;
+    mode.disabled = false;
+    modeChoice.hidden = false;
+    mode.onchange = () => {
+      form.hidden = mode.checked;
+      native.hidden = !mode.checked;
+      if (mode.checked && !native.childNodes.length) chatNativeNewForm(native, shell, config);
+    };
+  } catch { modeChoice.title = "Native experiment is not enabled or could not be checked on this server."; }
 }
 
 function chatTranscriptPageItems(snapshot) {
@@ -5337,6 +5697,8 @@ async function chatRenderOpen(
   };
   let streamStatus = "connecting";
   let stopRequest = null;
+  let nativeSendInFlight = false;
+  const nativeHost = el("div", { className: "chat-native-host", hidden: true });
   let uploading = 0;
   let reconcilePromise = null;
   let reconcileFailures = 0;
@@ -5638,8 +6000,18 @@ async function chatRenderOpen(
     // Managed = the owning sprint is still armed/paused; close stays engine-
     // owned only for that window. Reopen is scope-blocked server-side forever.
     const sprintManaged = Boolean(conversation.sprint_managed);
-    const reopenable = closed && !sprintScoped;
-    const unavailableReason = availabilityPending
+    const reopenable = closed && !sprintScoped && conversation.runtime_mode !== "native_experiment";
+    const native = conversation.runtime_mode === "native_experiment";
+    const runtime = conversation.runtime || {};
+    const nativeSend = native && chatNativeRequestRead(chatNativeSendSlot(conversation));
+    if (nativeSend) {
+      pending.hidden = false;
+      pending.textContent = nativeSendInFlight ? "Sending…" : "Send outcome unknown. Refresh evidence or Close; this send was not replayed.";
+    }
+    const nativeUnavailable = runtime.role === "probe" ? "Finite probe: ordinary messages are disabled."
+      : runtime.state !== "ready" ? "Native runtime is not ready; inspect startup and cleanup evidence."
+      : runtime.capabilities?.submission !== "compatible" ? "Native repeated input is not proven for this route." : "";
+    const unavailableReason = native ? nativeUnavailable : availabilityPending
       ? "Checking harness availability…"
       : availabilityError ? "Harness availability could not be checked."
       : chatOpenHarnessUnavailableReason(conversation, harnessStatus);
@@ -5651,16 +6023,19 @@ async function chatRenderOpen(
     composer.disabled = Boolean(unavailableReason)
       || closing || (closed && !reopenable);
     send.disabled = Boolean(unavailableReason)
-      || closing || (closed && !reopenable) || uploading > 0;
+      || closing || (closed && !reopenable) || uploading > 0 || Boolean(nativeSend);
     // A lingering child is still working even though the turn reads finished,
     // so Stop stays the way out of it.
     const lingering = Boolean(conversation.process?.lingering);
+    stop.hidden = native;
     stop.disabled = (conversation.state !== "running" && !lingering)
       || closing || Boolean(stopRequest);
+    if (native) stop.disabled = true;
     stop.textContent = stopRequest ? "Stopping…" : "Stop";
     headerStop.disabled = stop.disabled;
     headerStop.textContent = stop.textContent;
     headerStop.hidden = currentMode !== "diff";
+    if (native) headerStop.hidden = true;
     close.hidden = sprintManaged;
     close.disabled = sprintManaged || closed || closing;
     close.textContent = closing ? "Closing…" : "Close";
@@ -5674,9 +6049,18 @@ async function chatRenderOpen(
       : lingering
       ? "Working in background"
       : "Message this shell…";
+    if (native) chatNativeRuntimePanel(nativeHost, conversation, {
+      connection: streamStatus, refresh, control: (body, key) => chatApi(
+        `/conversations/${conversation.conversation_id}/runtime-controls`, "POST", body, key),
+    });
     scheduleTranscript();
   };
   const checkHarnessAvailability = async () => {
+    if (conversation.runtime_mode === "native_experiment") {
+      availabilityPending = false;
+      paint();
+      return;
+    }
     availabilityPending = true;
     availabilityError = null;
     paint();
@@ -5694,7 +6078,29 @@ async function chatRenderOpen(
     paint();
   };
   availabilityRetry.onclick = checkHarnessAvailability;
-  const refresh = () => chatRefreshConversation(
+  let nativeRefreshTimer = null;
+  let nativeRefreshFlight = null;
+  let nativeRefreshAgain = false;
+  const reconcileNativeSend = async () => {
+    if (conversation.runtime_mode !== "native_experiment") return;
+    const slot = chatNativeSendSlot(conversation);
+    const request = chatNativeRequestRead(slot);
+    if (!request || nativeSendInFlight) return;
+    try {
+      const page = await chatRead(`/conversations/${conversation.conversation_id}/messages?request_key=${encodeURIComponent(request.key)}`, readSignal);
+      if (readSignal.aborted || generation !== chatRenderGeneration
+          || chatNativeRequestRead(slot) !== request) return;
+      const match = page.items?.find((row) => row.request_key === request.key
+        && row.conversation_id === conversation.conversation_id);
+      if (!match) return;
+      chatNativeRequestClear(slot);
+      if (composer.value.trim() === request.text) composer.value = "";
+      if (chatPendingSend?.key === request.key) chatPendingSend = null;
+      clearImageAttachments(); pending.hidden = true;
+      reconcileTranscript(); paint();
+    } catch { /* An absent readback remains unknown; no text matching or retry. */ }
+  };
+  const refreshNow = () => chatRefreshConversation(
     conversation.conversation_id,
     generation,
     (next, nextMessages) => {
@@ -5709,7 +6115,22 @@ async function chatRenderOpen(
         transcriptState.dirty.add(item.item_id);
       }
       paint();
-    });
+    }).then(reconcileNativeSend);
+  const refresh = () => {
+    if (conversation.runtime_mode !== "native_experiment") return refreshNow();
+    if (readSignal.aborted || generation !== chatRenderGeneration) return;
+    if (nativeRefreshFlight) { nativeRefreshAgain = true; return nativeRefreshFlight; }
+    if (nativeRefreshTimer) return;
+    nativeRefreshTimer = setTimeout(() => {
+      nativeRefreshTimer = null;
+      if (readSignal.aborted || generation !== chatRenderGeneration) return;
+      nativeRefreshFlight = refreshNow().finally(() => {
+        nativeRefreshFlight = null;
+        if (nativeRefreshAgain) { nativeRefreshAgain = false; refresh(); }
+      });
+    }, 150);
+  };
+  readSignal.addEventListener("abort", () => clearTimeout(nativeRefreshTimer), { once: true });
 
   const analytics = el("button", { className: "act", type: "button", textContent: "Analytics" });
   analytics.onclick = () => {
@@ -5759,13 +6180,21 @@ async function chatRenderOpen(
         key: requestKey(),
       };
     }
+    const sendRequest = chatPendingSend;
+    const native = conversation.runtime_mode === "native_experiment";
+    const sendSlot = native && chatNativeSendSlot(conversation);
+    if (native && chatNativeRequestRead(sendSlot)) return;
+    if (native) {
+      nativeSendInFlight = true;
+      chatNativeRequestWrite(sendSlot, { key: sendRequest.key, body: { text }, text, state: "pending" });
+    }
     send.disabled = true;
     pending.hidden = false;
     pending.textContent = "sending…";
     try {
-      const result = await chatWithShellRelease(() => chatApi(
-        `/conversations/${conversation.conversation_id}/messages`,
-        "POST", { text }, chatPendingSend.key));
+      const write = () => chatApi(`/conversations/${conversation.conversation_id}/messages`, "POST", { text }, sendRequest.key);
+      const result = await (native ? write() : chatWithShellRelease(write));
+      if (native) chatNativeRequestClear(sendSlot);
       if (!messages.some((item) => item.message_id === result.message.message_id))
         messages.push(result.message);
       const userItemId = `message:${result.message.message_id}`;
@@ -5785,7 +6214,7 @@ async function chatRenderOpen(
         chatTrackLiveTranscriptItem(transcriptState, userItemId, true);
         transcriptState.dirty.add(userItemId);
       }
-      chatPendingSend = null;
+      if (chatPendingSend === sendRequest) chatPendingSend = null;
       composer.value = "";
       clearImageAttachments();
       pending.hidden = true;
@@ -5796,9 +6225,13 @@ async function chatRenderOpen(
       refresh();
     } catch (error) {
       pending.hidden = false;
-      pending.textContent = `${error.code} — retry keeps this exact send`;
+      if (native) {
+        chatNativeRequestWrite(sendSlot, { key: sendRequest.key, body: { text }, text, state: "unknown" });
+        pending.textContent = "Send outcome unknown. Refresh evidence or Close; this send was not replayed.";
+        refresh();
+      } else pending.textContent = `${error.code} — retry keeps this exact send`;
       toast(`${error.code}: ${error.message}`);
-    } finally { paint(); }
+    } finally { nativeSendInFlight = false; paint(); }
   }
   send.onclick = submit;
   stop.onclick = async () => {
@@ -5886,6 +6319,7 @@ async function chatRenderOpen(
     }
   };
   host.replaceChildren(header, transcriptHost, reviewHost, composerRow);
+  if (conversation.runtime_mode === "native_experiment") host.insertBefore(nativeHost, transcriptHost);
   chatModeController = {
     shell: conversation.shell.shortname,
     conversationId: conversation.conversation_id,
@@ -6096,6 +6530,8 @@ async function chatRenderOpen(
         transcriptState.assistantSegments.delete(event.run_id);
     }
 
+    if (conversation.runtime_mode === "native_experiment" && CHAT_NATIVE_EVENTS.has(type))
+      refresh();
     if (type === "assistant.delta") {
       scheduleTranscript();
       return;
@@ -6116,6 +6552,10 @@ async function chatRenderOpen(
     (value) => {
       streamStatus = value;
       updateStreamStatus();
+      if (conversation.runtime_mode === "native_experiment") {
+        paint();
+        if (value === "connected") refresh();
+      }
     },
   );
   checkHarnessAvailability();
