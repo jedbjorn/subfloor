@@ -173,7 +173,8 @@ class JsonlRpc:
             with selectors.DefaultSelector() as selector:
                 selector.register(self.process.stdin, selectors.EVENT_WRITE)
                 while written < len(encoded):
-                    if not selector.select(_remaining(deadline)):
+                    remaining = _remaining(deadline)
+                    if remaining <= 0 or not selector.select(remaining):
                         raise RpcError("NATIVE_TIMEOUT", "native write deadline expired",
                                        state="unknown" if written else "not_written")
                     try:
@@ -183,7 +184,14 @@ class JsonlRpc:
                     if count <= 0:
                         raise OSError("native write failed")
                     written += count
+        except RpcError:
+            if written:
+                # JSONL cannot recover an unfinished frame by appending a new
+                # request. Retain unknown intent and fence this transport.
+                self._loss("native partial frame write failed; owner cleanup required")
+            raise
         except OSError as exc:
+            self._loss("native write stream failed; owner cleanup required")
             raise RpcError("NATIVE_STREAM_LOST", "native write failed", state="unknown") from exc
         finally:
             self._write_lock.release()
