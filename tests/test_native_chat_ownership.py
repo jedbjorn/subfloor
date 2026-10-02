@@ -81,9 +81,10 @@ def test_legacy_broker_and_reaper_do_not_take_native_turns(database):
     assert ReaperStore(str(path)).candidates() == []
 
 
-@pytest.mark.parametrize('root_thread', ['root', None])
-def test_replay_projects_root_turn_once_and_child_terminal_does_not_finish_it(database,root_thread):
+@pytest.mark.parametrize('harness,root_thread', [('codex','root'),('claude',None)])
+def test_replay_projects_root_turn_once_and_child_terminal_does_not_finish_it(database,harness,root_thread):
     path, con = database
+    con.execute('UPDATE conversation_runtime_generations SET harness=?',(harness,))
     con.execute("UPDATE conversations SET runtime_mode='native_experiment',state='queued',runtime_projection=?",(json.dumps({'generation_id':'g','state':'ready'}),))
     mid = con.execute("INSERT INTO conversation_messages(conversation_id,sender_kind,sender_ref,message_kind,body,idempotency_key,request_hash,state) VALUES('cv','user','1','prompt','hello','m','h','queued')").lastrowid
     rid = con.execute("INSERT INTO conversation_runs(conversation_id,shell_id,trigger_message_id,state,lease_owner,lease_expires_at,heartbeat_at,started_at) VALUES('cv',1,?,'starting','fixture','2030-01-01','2030-01-01','2030-01-01')",(mid,)).lastrowid
@@ -129,12 +130,13 @@ def test_close_fence_survives_api_death_and_only_verified_cleanup_releases_slot(
     service.request_close(con,'cv',1,1)
     assert con.execute('SELECT close_intent FROM conversation_runtime_generations').fetchone()[0]==1
     assert con.execute('SELECT state FROM conversations').fetchone()[0]=='idle'
-    lease=service.store.attach('g',1,1,'api')
+    lease=service.store.attach('g',1,1,service.consumer)
     with pytest.raises(RuntimeContractError,match='blocks later commands'):
         service.store.intent('g',1,1,lease,'late','submit',{'text':'late'})
     # Simulate a verified native response persisted before API death/OS stop.
     # Recovery uses its original control intent, never starts a new native one.
     service.store.receipt('g',1,1,'close:g',{'state':'written','native_cleanup':{'outcome':native_outcome}})
+    con.execute('UPDATE conversation_runtime_generations SET consumer_expires=0');con.commit()
     replacement=NativeChatsService(path,path.parent,supervisor)
     replacement.recover_close('g','cv',1,1)
     assert supervisor.stopped==['g']
@@ -190,3 +192,34 @@ def test_old_verified_closed_generation_repairs_unfinished_chat_without_attach(d
     assert con.execute('SELECT state FROM conversations').fetchone()[0]=='closed'
     assert json.loads(con.execute('SELECT runtime_projection FROM conversations').fetchone()[0])['state']=='closed'
     assert con.execute('SELECT COUNT(*) FROM conversation_runtime_commands').fetchone()[0]==0
+
+
+def test_late_pending_cleanup_cannot_regress_verified_terminal_ownership(database):
+    path,con=database
+    con.execute("UPDATE conversations SET runtime_mode='native_experiment',runtime_projection=?",(json.dumps({'generation_id':'g','state':'closing'}),));con.commit()
+    class Supervisor:
+        def stop(self,generation): return {'os_cleanup':{'complete':True}}
+    service=NativeChatsService(path,path.parent,Supervisor())
+    service.finish_cleanup('g','cv',1,1,{'outcome':'complete'})
+    service.finish_cleanup('g','cv',1,1,{'outcome':'inconclusive','unresolved_work':['unknown-child']})
+    assert con.execute('SELECT state FROM conversation_runtime_generations').fetchone()[0]=='closed'
+    assert json.loads(con.execute('SELECT runtime_projection FROM conversations').fetchone()[0])['state']=='closed'
+    assert not run.browser_conversation_active(con,1)
+
+
+def test_replacement_consumer_fences_old_cleanup_completion(database):
+    path,con=database
+    con.execute("UPDATE conversations SET runtime_mode='native_experiment',runtime_projection=?",(json.dumps({'generation_id':'g','state':'closing'}),));con.commit()
+    class Supervisor:
+        def stop(self,generation):
+            con.execute('UPDATE conversation_runtime_generations SET consumer_expires=0');con.commit()
+            RuntimeStore(path).attach('g',1,1,'replacement')
+            return {'os_cleanup':{'complete':True}}
+    service=NativeChatsService(path,path.parent,Supervisor())
+    service.store.attach('g',1,1,service.consumer)
+    with pytest.raises(RuntimeContractError) as raised:
+        service.finish_cleanup('g','cv',1,1,{'outcome':'complete'})
+    assert raised.value.code=='LEASE_FENCED'
+    assert con.execute('SELECT state FROM conversation_runtime_generations').fetchone()[0]=='ready'
+    assert json.loads(con.execute('SELECT runtime_projection FROM conversations').fetchone()[0])['state']=='closing'
+    assert run.browser_conversation_active(con,1)
