@@ -83,6 +83,26 @@ def selected_route_matches(route: dict,context: RuntimeContext) -> bool:
             and route['model']==context.model and context.effort in route['efforts'])
 
 
+def observed_claude_memory(value: Any,context: RuntimeContext,identity: RuntimeIdentity | None) -> tuple[dict,bool]:
+    """Retain D413's qualified configuration inference, never effective telemetry."""
+    fixed={'evidence_level':'configuration_source_flag_inference',
+           'observation_origin':'claude:documented-settings+captured-executable+owned-SessionStart-hook',
+           'auto_memory_disabled':True,'effective_telemetry':False,
+           'inherited_disable_flag':'1','auto_memory_enabled_setting':False}
+    hashes=('executable_sha256','configuration_sha256','hook_sha256','source_condition_sha256')
+    keys=set(fixed)|set(hashes)|{'generation_id'}
+    if not isinstance(value,dict):
+        return {},False
+    clean={key:item for key,item in value.items() if key in keys}
+    valid=(set(clean)==keys and all(type(clean[key]) is type(item) and clean[key]==item for key,item in fixed.items())
+           and clean['generation_id']==context.generation_id
+           and all(isinstance(clean[key],str) and len(clean[key])==64 and all(c in '0123456789abcdef' for c in clean[key]) for key in hashes)
+           and clean['executable_sha256']==context.executable.sha256)
+    if not valid:
+        return {},False
+    return clean,bool(identity and identity.protocol.get('configuration_sha256')==clean['configuration_sha256'])
+
+
 def private_directory(root: Path) -> None:
     info = root.lstat()
     if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.geteuid() or stat.S_IMODE(info.st_mode) != 0o700:
@@ -358,6 +378,8 @@ class Controller:
                 raise RuntimeContractError("OWNERSHIP_INVALID", "event is outside captured native root")
             route = None
             route_matches = True
+            memory = None
+            memory_matches = True
             if event.kind == 'runtime.ready' and 'native_route' in event.data:
                 route = observed_native_route(event.data['native_route'])
                 if self.context:
@@ -368,6 +390,14 @@ class Controller:
                 if not route_matches:
                     event=dataclasses.replace(event,grade='inconclusive',data={
                         **event.data,'readiness_diagnostic':'NATIVE_ROUTE_INCONCLUSIVE'})
+            if event.kind=='runtime.ready' and self.context and self.context.harness=='claude' and 'memory_policy' in event.data:
+                memory,memory_matches=observed_claude_memory(event.data['memory_policy'],self.context,self.identity)
+                data={key:item for key,item in event.data.items() if key!='memory_policy'}
+                if memory:
+                    data['memory_policy']=memory
+                if not memory_matches:
+                    data['readiness_diagnostic']='MEMORY_POLICY_INCONCLUSIVE'
+                event=dataclasses.replace(event,data=data,grade=event.grade if memory_matches else 'inconclusive')
             if (event.kind=='runtime.ready' and self.identity and event.reference
                     and event.reference.thread_id!=self.identity.root_id
                     and not (self.context and self.context.harness=='claude' and event.reference.thread_id is None)):
@@ -388,10 +418,13 @@ class Controller:
                   and (event.reference.thread_id==self.identity.root_id or
                        (self.context and self.context.harness=='claude' and event.reference.thread_id is None))
                   and event.freshness=='current' and not event.partial and event.grade in {'compatible','unverified'}
-                  and route_matches):
+                  and route_matches and memory_matches):
                 if route is not None:
                     self.identity=dataclasses.replace(self.identity,protocol={
                         **self.identity.protocol,'native_route':public_payload(route,sensitive_values=self.journal.secrets)})
+                if memory is not None:
+                    self.identity=dataclasses.replace(self.identity,protocol={
+                        **self.identity.protocol,'memory_policy':public_payload(memory,sensitive_values=self.journal.secrets)})
                 self.ready=True
                 self.journal.set('setup',None)
         except RuntimeContractError:
@@ -454,10 +487,21 @@ class Controller:
                     if started.state=='ready' and not selected_route_matches(route,context):
                         started=dataclasses.replace(started,state='unknown',detail='NATIVE_ROUTE_INCONCLUSIVE',
                                                     capabilities={**started.capabilities,'submission':'inconclusive'})
+                if context.harness=='claude' and started.identity and 'memory_policy' in started.identity.protocol:
+                    memory,matched=observed_claude_memory(started.identity.protocol['memory_policy'],context,started.identity)
+                    protocol={key:item for key,item in started.identity.protocol.items() if key!='memory_policy'}
+                    if memory:
+                        protocol['memory_policy']=memory
+                    started=dataclasses.replace(started,identity=dataclasses.replace(started.identity,protocol=protocol))
+                    if started.state=='ready' and not matched:
+                        started=dataclasses.replace(started,state='unknown',detail='MEMORY_POLICY_INCONCLUSIVE',
+                                                    capabilities={**started.capabilities,'submission':'inconclusive'})
                 self.identity = started.identity
                 self.ready = started.state == "ready" and self.identity is not None and not self.journal.get('close')
                 if self.ready:
                     route_data={'native_route':self.identity.protocol['native_route']} if 'native_route' in self.identity.protocol else {}
+                    if context.harness=='claude' and 'memory_policy' in self.identity.protocol:
+                        route_data['memory_policy']=self.identity.protocol['memory_policy']
                     self.emit(RuntimeEvent('runtime.ready',NativeReference(self.identity.root_id,thread_id=self.identity.root_id),
                                            provenance='controller:validated DriverStart ready',data=route_data))
                 if started.setup is not None and not self.journal.get('close'):
