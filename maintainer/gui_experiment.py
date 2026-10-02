@@ -33,6 +33,7 @@ import tempfile
 import time
 import urllib.error
 import urllib.request
+import uuid
 from pathlib import Path
 from typing import Any
 from unittest import mock
@@ -367,7 +368,9 @@ def start_serialized(source_repo: Path, ref: str, receipt: Path, *,
     if sys.version_info[:2] != (3, 14):
         raise FixtureError("SEAT_UNAVAILABLE", "fixture requires Python 3.14")
     command(["systemctl", "--user", "show-environment"])
-    fid = secrets.token_hex(16)
+    # Public resource identity is not an authentication secret. Keep actual
+    # shell credentials and the independent ownership nonce on secrets below.
+    fid = uuid.uuid4().hex
     with ownership_lock(fid):
         return start_locked(source_repo, sha, raw, receipt, temp_parent=temp_parent,
                             port=selected_port, runtime=runtime, limits=limits, fixture_id=fid)
