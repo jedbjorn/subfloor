@@ -577,12 +577,14 @@ class Controller:
             return {"acknowledged":value["sequence"]}
         if op == "snapshot":
             deadline=min(deadline,time.monotonic()+5)
+            with self.journal.lock:
+                occupancy_epoch=self.journal.get('quiet_epoch')
             try:
                 snapshot=self.call(lambda:self.driver.inventory(deadline=deadline),deadline=deadline)
             except (OSError,RuntimeContractError):
                 self.observe_root_occupancy()
                 raise
-            self.observe_root_occupancy(snapshot)
+            self.observe_root_occupancy(snapshot,expected_epoch=occupancy_epoch)
             return public_payload(dataclasses.asdict(snapshot),sensitive_values=self.journal.secrets)
         if op not in {"submit","control","close"}:
             raise RuntimeContractError("OP_INVALID", "unknown private controller operation")
@@ -712,7 +714,7 @@ class Controller:
             self.journal.receipt(cid,result)
             return public_payload(dataclasses.asdict(result),sensitive_values=self.journal.secrets)
 
-    def observe_root_occupancy(self,snapshot=None) -> None:
+    def observe_root_occupancy(self,snapshot=None, *, expected_epoch: int | None = None) -> None:
         """Only attributable root occupancy can reconcile an unknown quiet edge.
 
         Snapshot.partial also describes background inventory. The driver's
@@ -732,6 +734,8 @@ class Controller:
                           and primary.root_id==captured.root_id
                           and primary.thread_id in {None,primary.root_id} and bool(primary.activity_id))
             unknown=not (valid_idle or valid_active)
+            if not unknown and expected_epoch is not None and expected_epoch!=self.journal.get('quiet_epoch'):
+                return # Inventory cannot erase newer activity or submission evidence.
             changed=self.journal.get('root_occupancy_unknown')!=unknown
             self.journal.set('root_occupancy_unknown',unknown)
             if valid_idle:
