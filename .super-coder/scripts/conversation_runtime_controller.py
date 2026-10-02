@@ -558,6 +558,13 @@ class PrivateServer:
             result = {"ok":True,"result":self.controller.handle(value,peer=peer)}
         except RuntimeContractError as exc:
             result = {"ok":False,"error":exc.code,"detail":str(exc)}
+        except TimeoutError:
+            # A native future may have crossed its write edge. This is not
+            # the pre-dispatch DEADLINE_EXPIRED/no-write admission refusal.
+            # Preserve captured ownership and Close; callers retain unknown
+            # delivery until attributable native evidence reconciles it.
+            result = {"ok":False,"error":"NATIVE_DEADLINE_INCONCLUSIVE",
+                      "detail":"operation deadline expired; native outcome is inconclusive and scoped cleanup remains required"}
         except (ValueError, TypeError, KeyError, OSError):
             result = {"ok":False,"error":"REQUEST_INVALID","detail":"invalid private request"}
         try:
