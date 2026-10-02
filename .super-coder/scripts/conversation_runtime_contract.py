@@ -104,11 +104,22 @@ class RuntimeContext:
     boot_digest: str
     policy_digest: str
     permission_mode: str
+    provider: str | None = None
     model: str | None = None
     effort: str | None = None
     boot_content: str = field(default="", repr=False)
     execution_prefix: tuple[str, ...] = ()
     managed_mcp_files: tuple[Path, ...] = ()
+    # Canonical managed MCP injection only, never general launch/policy args.
+    # Codex uses paired '-c', 'mcp_servers.<name>.<field>=...' arguments.
+    managed_mcp_args: tuple[str, ...] = ()
+    # Owner attaches grades only after matching checker evidence fingerprint
+    # (executable/driver/contract/policy/route) and required coverage. Full
+    # evidence/provenance remains in the owner cache; empty means unverified.
+    capability_evidence: Mapping[str, Grade] = field(default_factory=dict)
+    # Only an owner-scoped finite compatibility probe may exercise these
+    # operations before certification. GUI context always leaves this empty.
+    probe_capabilities: tuple[str, ...] = ()
     # Ephemeral handoff only: never serialize these values in receipts/journal.
     env: Mapping[str, str] = field(default_factory=dict, repr=False)
     # Hooks/channel assets use the controller's already-owned private socket.
@@ -120,6 +131,16 @@ class RuntimeContext:
             raise RuntimeContractError("POLICY_MISSING", "explicit prepared boot and policy are required")
         # The harness driver must reject unsupported modes; never substitute a
         # probe-friendly policy for this canonical prepared value.
+        if len(self.managed_mcp_args) % 2 or any(
+            self.managed_mcp_args[index] != "-c" or
+            not self.managed_mcp_args[index+1].startswith("mcp_servers.") or
+            "=" not in self.managed_mcp_args[index+1]
+            for index in range(0, len(self.managed_mcp_args), 2)
+        ):
+            raise RuntimeContractError("MCP_INVALID", "only canonical MCP config arguments are accepted")
+        if any(grade not in {"compatible","incompatible","inconclusive","unverified"}
+               for grade in self.capability_evidence.values()):
+            raise RuntimeContractError("CAPABILITY_INVALID", "unknown capability evidence grade")
 
     def execution_argv(self, argv: list[str]) -> list[str]:
         return [*self.execution_prefix, *argv]
