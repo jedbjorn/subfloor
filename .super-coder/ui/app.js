@@ -3983,6 +3983,11 @@ function chatOpenStream(
     "input.requested", "usage", "run.completed", "run.resumed", "run.failed",
     "run.interrupt.requested", "run.interrupted", "run.unknown",
     "run.deferred", "run.reaped",
+    "runtime.ready", "runtime.setup", "runtime.lost", "ownership.failed",
+    "activity.started", "activity.processed", "activity.terminal",
+    "output.delta", "output.final", "work.observed", "work.terminal",
+    "snapshot.observed", "control.acknowledged", "control.outcome",
+    "capability.observed",
   ];
   for (const type of types) {
     source.addEventListener(type, (raw) => {

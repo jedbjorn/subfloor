@@ -37,12 +37,14 @@ import active_chat_registry
 import conversation_broker
 import conversation_events
 import conversation_git_targets
+import conversation_native_chats
 import db_driver
 import instance_state
 import model_catalog
 import route_bindings
 import run as run_mod
 from conversation_adapters import ADAPTER_TYPES
+from conversation_runtime_contract import RuntimeContractError
 
 # Server startup owns the ordinary active_database_path gate before routing.
 DB_PATH = instance_state.maintenance_database_path(ENGINE)
@@ -71,6 +73,7 @@ _EVENTS_PATH = re.compile(r"^/api/conversations/(cv_[0-9a-f]{32})/events$")
 _INTERRUPTIONS_PATH = re.compile(
     r"^/api/conversations/(cv_[0-9a-f]{32})/interruptions$"
 )
+_RUNTIME_CONTROLS_PATH = re.compile(r'^/api/conversations/(cv_[0-9a-f]{32})/runtime-controls$')
 _SENSITIVE_EVENT_KEYS = frozenset(
     (
         "api_key",
@@ -440,7 +443,7 @@ def _conversation_row(con, conversation_id: str, owner_user_id: int):
     return con.execute(
         "SELECT c.conversation_id,c.shell_id,c.owner_user_id,c.harness,"
         "c.provider,c.model,c.effort,c.route_contract_version,c.route_binding,"
-        "c.worktree,c.state,c.title,c.starred,"
+        "c.worktree,c.state,c.title,c.starred,c.runtime_mode,c.runtime_projection,"
         "c.conversation_scope,c.created_at,"
         "c.last_activity_at,c.closed_at,c.version,c.harness_session_ref,"
         "s.display_name,s.shortname,"
@@ -543,6 +546,8 @@ def _conversation_projection(row) -> dict:
         },
         "scope": row["conversation_scope"],
         "state": row["state"],
+        "runtime_mode": row["runtime_mode"],
+        "runtime": conversation_native_chats.projection(row),
         "title": row["title"],
         "starred": bool(row["starred"]),
         "created_at": row["created_at"],
@@ -1254,7 +1259,8 @@ def _conversation_creation_replay(
     *, shell_id: int, title: str | None,
 ):
     row = _require_conversation(con, conversation_id, operator["user_id"])
-    matches = int(row["shell_id"]) == shell_id and row["title"] == title
+    matches = (int(row["shell_id"]) == shell_id and row["title"] == title
+               and row['runtime_mode'] == body.get('runtime_mode','ephemeral'))
     if "harness" in body:
         matches = matches and _nonblank(
             body.get("harness"), "harness", maximum=64
@@ -1350,7 +1356,10 @@ def _conversation_creation_replay(
 
 
 def _create_conversation(con, operator: dict, headers, body: dict):
-    _only_fields(body, {"shell_id", "title", "harness", "model", "effort"})
+    _only_fields(body, {"shell_id", "title", "harness", "model", "effort", "runtime_mode"})
+    runtime_mode = body.get('runtime_mode','ephemeral')
+    if not isinstance(runtime_mode,str) or runtime_mode not in {'ephemeral','native_experiment'}:
+        raise ApiError(422,'RUNTIME_MODE_INVALID','unknown conversation runtime mode')
     key = _idempotency_key(headers)
     shell_id = _integer(body.get("shell_id"), "shell_id")
     title = _nonblank(body.get("title"), "title", maximum=200, optional=True)
@@ -1463,7 +1472,7 @@ def _create_conversation(con, operator: dict, headers, body: dict):
     with model_catalog.harness_versions.probe_observation(harness):
         runtime_status = None
         runtime_scope = None
-        if (
+        if runtime_mode == 'ephemeral' and (
             selected_model is None
             or harness not in route_bindings.LIVE_NATIVE_HARNESSES
         ):
@@ -1471,7 +1480,15 @@ def _create_conversation(con, operator: dict, headers, body: dict):
             runtime_scope = model_catalog.harness_versions.runtime_scope()
         evidence_observation = None
         try:
-            if (
+            if runtime_mode == 'native_experiment':
+                service = conversation_native_chats._SERVICE
+                if service is None:
+                    raise ApiError(409,'NATIVE_EXPERIMENT_UNAVAILABLE','native experiment requires the owned experimental fixture')
+                try:
+                    binding,binding_digest = service.resolve_route(harness,selected_model,selected_effort)
+                except RuntimeContractError as exc:
+                    raise ApiError(409,exc.code,str(exc)) from exc
+            elif (
                 selected_model is not None
                 and harness in route_bindings.LIVE_NATIVE_HARNESSES
             ):
@@ -1529,6 +1546,7 @@ def _create_conversation(con, operator: dict, headers, body: dict):
             "route_contract_version": route_contract_version,
             "binding_digest": binding_digest,
             "worktree": str(worktree),
+            **({'runtime_mode':runtime_mode} if runtime_mode!='ephemeral' else {}),
         }
     )
 
@@ -1591,7 +1609,7 @@ def _create_conversation(con, operator: dict, headers, body: dict):
             raise ApiError(
                 409,
                 "BROWSER_CHAT_BUSY",
-                "the active chat has a turn in progress",
+                str(exc),
                 {
                     "conversation_id": (
                         active.chat_id if active is not None else None
@@ -1639,8 +1657,8 @@ def _create_conversation(con, operator: dict, headers, body: dict):
             "INSERT INTO conversations "
             "(conversation_id,shell_id,owner_user_id,harness,provider,model,"
             "effort,route_contract_version,route_binding,worktree,title,"
-            "creation_idempotency_key,creation_request_hash) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "creation_idempotency_key,creation_request_hash,runtime_mode) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (
                 conversation_id,
                 shell_id,
@@ -1655,6 +1673,7 @@ def _create_conversation(con, operator: dict, headers, body: dict):
                 title,
                 key,
                 request_hash,
+                runtime_mode,
             ),
         )
         _append_event(
@@ -1679,6 +1698,8 @@ def _create_conversation(con, operator: dict, headers, body: dict):
         conversation_id,
     )
     _sweep_chat_uploads(con)
+    if runtime_mode == 'native_experiment':
+        conversation_native_chats._SERVICE.notify()
     row = _require_conversation(con, conversation_id, operator["user_id"])
     return _json(
         201,
@@ -1746,7 +1767,7 @@ def _list_conversations(con, operator: dict, query):
     rows = con.execute(
         "SELECT c.conversation_id,c.shell_id,c.owner_user_id,c.harness,"
         "c.provider,c.model,c.effort,c.route_contract_version,c.route_binding,"
-        "c.state,c.title,c.starred,"
+        "c.state,c.title,c.starred,c.runtime_mode,c.runtime_projection,"
         "c.conversation_scope,c.created_at,"
         "c.last_activity_at,c.closed_at,c.version,s.display_name,s.shortname,"
         "CASE WHEN c.state!='closed' THEN ("
@@ -1805,6 +1826,21 @@ def _patch_conversation(con, operator: dict, conversation_id: str, body: dict):
         raise ApiError(422, "VALIDATION_ERROR", "starred must be a boolean")
     if "state" in body and body["state"] != "closed":
         raise ApiError(422, "VALIDATION_ERROR", "state may only be changed to closed")
+
+    native_row = _require_conversation(con,conversation_id,operator['user_id'])
+    if body.get('state')=='closed' and native_row['runtime_mode']=='native_experiment':
+        if set(body)!={'version','state'}:
+            raise ApiError(422,'VALIDATION_ERROR','native Close cannot be combined with metadata edits')
+        service = conversation_native_chats._SERVICE
+        if service is None:
+            raise ApiError(409,'CLEANUP_PENDING','owned experimental service is unavailable; native ownership remains retained')
+        try:
+            service.request_close(con,conversation_id,operator['user_id'],version)
+        except RuntimeContractError as exc:
+            raise ApiError(409,exc.code,str(exc)) from exc
+        conversation_events.notify(conversation_id)
+        service.notify()
+        return _json(202,_conversation_projection(_require_conversation(con,conversation_id,operator['user_id'])))
 
     active_run_id = None
     close_processes: list[tuple[int, int]] = []
@@ -1947,6 +1983,13 @@ def _create_message(con, operator: dict, conversation_id: str, headers, body: di
                 },
                 [("Location", f"/api/conversations/{conversation_id}/messages")],
             )
+        if conversation['runtime_mode']=='native_experiment':
+            if conversation['state']=='closed':
+                raise ApiError(409,'NATIVE_CHAT_CLOSED','closed native history cannot start a replacement generation')
+            runtime = conversation_native_chats.projection(conversation)
+            if (conversation_native_chats._SERVICE is None or runtime.get('state')!='ready'
+                    or runtime.get('capabilities',{}).get('submission')!='compatible'):
+                raise ApiError(409,'NATIVE_INPUT_UNAVAILABLE','native startup and checked submission coverage are required before input')
         if conversation["state"] == "closed":
             auto_closed = _reopen_conversation(con, operator, conversation)
             reopened = True
@@ -2007,6 +2050,8 @@ def _create_message(con, operator: dict, conversation_id: str, headers, body: di
             conversation_id,
         )
     conversation_broker.notify_commit()
+    if conversation['runtime_mode']=='native_experiment':
+        conversation_native_chats._SERVICE.notify()
     return _json(
         202,
         {

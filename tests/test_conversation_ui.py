@@ -212,6 +212,7 @@ def test_server_event_writers_use_canonical_conversation_type_set():
         ("scripts/activity_monitor.py", "_append_closed_event"),
         ("scripts/conversation_broker.py", "_append_event"),
         ("scripts/conversation_reaper.py", "_append_event"),
+        ("scripts/conversation_native_chats.py", "append_event"),
         ("scripts/sprint_participant_chats.py", "_append_created_event"),
         ("scripts/sprint_participant_chats.py", "_append_event"),
         ("scripts/sprint_runtime.py", "enqueue_conversation_turn"),

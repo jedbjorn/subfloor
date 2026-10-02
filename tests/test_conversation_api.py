@@ -262,6 +262,22 @@ class ConversationApiCase(unittest.TestCase):
         self.assertEqual(status, 201, obj)
         return obj
 
+    def test_native_mode_is_explicit_unavailable_in_ordinary_api_and_invalid_shapes_refuse(self):
+        import conversation_native_chats
+        with mock.patch.object(conversation_native_chats,'_SERVICE',None):
+            status,_,body=self.request('POST','/api/conversations',body={'shell_id':1,'harness':'codex','runtime_mode':'native_experiment'},key='native')
+            self.assertEqual(status,409,body)
+            self.assertEqual(body['error']['code'],'NATIVE_EXPERIMENT_UNAVAILABLE')
+            status,_,body=self.request('POST','/api/conversations',body={'shell_id':1,'runtime_mode':{}},key='invalid-mode')
+            self.assertEqual(status,422,body)
+            self.assertEqual(body['error']['code'],'RUNTIME_MODE_INVALID')
+        created=self.create()
+        self.assertEqual(created['runtime_mode'],'ephemeral')
+        self.assertIsNone(created['runtime'])
+        status,_,body=self.request('POST','/api/conversations',body={'shell_id':1,'harness':'codex','runtime_mode':'native_experiment'},key='create-1')
+        self.assertEqual(status,409,body)
+        self.assertEqual(body['error']['code'],'CONVERSATION_IDEMPOTENCY_CONFLICT')
+
     def seed_sprint_conversation(self) -> str:
         with self.connect() as con:
             con.execute(
