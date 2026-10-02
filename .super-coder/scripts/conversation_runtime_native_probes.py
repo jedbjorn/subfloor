@@ -521,8 +521,18 @@ class _Scenarios:
         with self.driver._lock:
             return tuple(self.driver.events)
 
-    def _terminal(self, request: str) -> bool:
-        return any(e.kind == "activity.terminal" and e.request_id == request for e in self._events())
+    def _interrupted(self, target: NativeReference, request: str | None = None) -> bool:
+        # A successful interrupt RPC is separate from native turn truth. A
+        # completed/failed turn may have won the race before the control; only
+        # the consumed native interrupted status proves this finite action.
+        return any(e.kind == "activity.terminal" and e.reference is not None
+            and e.data.get("status") == "interrupted"
+            and e.freshness == "current" and not e.partial
+            and e.grade not in {"inconclusive", "incompatible"}
+            and (request is None or e.request_id == request)
+            and all(getattr(e.reference, key) == getattr(target, key)
+                for key in ("root_id", "thread_id", "parent_thread_id", "activity_id"))
+            for e in self._events())
 
     def _root_event(self, event: RuntimeEvent, request: str, activity: str) -> bool:
         ref, root = event.reference, self.driver.identity
@@ -611,7 +621,9 @@ class _Scenarios:
             with self.driver._lock:
                 self.work_observation.update({key+"_tagged_pid_candidates": 0, key+"_owned_pid_matches": 0,
                     key+"_rejected_pid_output_records": 0, key+"_pid_observation": "missing_terminal_output"})
-        outputs: dict[tuple[Any, ...], list[str]] = {}
+        outputs: list[str] = []
+        offsets: dict[tuple[Any, ...], dict[int, tuple[str, bool]]] = {}
+        invalid_offsets: set[tuple[Any, ...]] = set()
         parts: dict[tuple[Any, ...], dict[int, tuple[str, bool]]] = {}
         ambiguous: set[tuple[Any, ...]] = set()
         rejected = 0
@@ -639,9 +651,10 @@ class _Scenarios:
                 digest, part = event.data.get("text_digest"), event.data.get("part")
                 output_key = (ref.thread_id, ref.activity_id, ref.item_id, event.kind,
                               digest if isinstance(digest, str) else None)
-                if isinstance(digest, str):
+                if "text_digest" in event.data:
                     last = event.data.get("last")
-                    if type(part) is not int or not 0 <= part < 128 or type(last) is not bool:
+                    if (not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest)
+                            or type(part) is not int or not 0 <= part < 128 or type(last) is not bool):
                         ambiguous.add(output_key)
                         continue
                     rows = parts.setdefault(output_key, {})
@@ -649,17 +662,40 @@ class _Scenarios:
                         ambiguous.add(output_key)
                     rows[part] = (value, last)
                 else:
-                    outputs.setdefault(output_key, []).append(value)
+                    offset, complete = event.data.get("offset"), event.data.get("complete")
+                    if type(offset) is not int or not 0 <= offset < 512 * 1024 or type(complete) is not bool:
+                        invalid_offsets.add(output_key)
+                        continue
+                    # Codex offsets are local to each normalized native output
+                    # record, not a cumulative item stream. Every offset zero
+                    # begins another record; finals and delta packets may reset.
+                    if offset == 0:
+                        offsets[output_key] = {}
+                        invalid_offsets.discard(output_key)
+                    rows = offsets.setdefault(output_key, {})
+                    if offset in rows:
+                        if rows[offset] != (value, complete):
+                            invalid_offsets.add(output_key)
+                        # Exact repeated chunks do not append another copy.
+                        continue
+                    if offset != sum(len(text) for text, _ in rows.values()):
+                        invalid_offsets.add(output_key)
+                    rows[offset] = (value, complete)
+                    if complete:
+                        if output_key not in invalid_offsets:
+                            outputs.append("".join(text for text, _ in rows.values()))
+                        offsets.pop(output_key, None)
+                        invalid_offsets.discard(output_key)
         for output_key, rows in parts.items():
             last_parts = [part for part, (_, last) in rows.items() if last]
             if (output_key not in ambiguous and last_parts == [len(rows)-1]
                     and sorted(rows) == list(range(len(rows)))):
-                outputs[output_key] = [rows[part][0] for part in sorted(rows)]
+                outputs.append("".join(rows[part][0] for part in sorted(rows)))
         # The fixed command prints a complete newline-terminated PID line.
         # An unfinished delta cannot qualify before later digits arrive.
         # Distinct full-text records/turns/items cannot append digits to PIDs;
         # contiguous complete-record chunks reassemble and replay parts dedup.
-        text = "\n".join("".join(chunks) for chunks in outputs.values())
+        text = "\n".join(outputs)
         matches = list(dict.fromkeys(re.findall(re.escape(label)+r"=([1-9]\d*)\r?\n", text)))[:128]
         callback = self.owned.process_identity
         identities = []
@@ -815,7 +851,7 @@ class _Scenarios:
                 target = NativeReference(root.root_id, root.root_id, activity_id=receipt.native_activity_id)
                 reply_control = self._control("stop_reply", target, receipt.native_activity_id)
                 self._wait(lambda: self._control_completed(reply_control, target))
-                self._wait(lambda: self._terminal(stopped))
+                self._wait(lambda: self._interrupted(target, stopped))
                 after = self._inventory()
                 if (not self._retained_root(root, after) or not self._alive(root_pid)
                         or not self._terminal_present(after, root_work)
@@ -865,8 +901,7 @@ class _Scenarios:
                 child_control = self._control("stop_work", fresh.reference, fresh.reference.activity_id)
                 self._wait(lambda: self._control_completed(child_control, fresh.reference))
                 self._wait(lambda: not self._alive(child_pid))
-                self._wait(lambda: any(e.kind == "activity.terminal" and e.reference is not None
-                    and e.reference.thread_id == child.reference.thread_id and e.reference.activity_id == fresh.reference.activity_id for e in self._events()))
+                self._wait(lambda: self._interrupted(fresh.reference))
                 self._wait(lambda: not any(w.kind == "terminal" and w.reference.thread_id == child.reference.thread_id
                     and w.reference.native_process_id == child_terminal.reference.native_process_id for w in self._inventory().work))
                 after = self._inventory()

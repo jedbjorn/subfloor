@@ -83,6 +83,55 @@ def test_pid_uses_actual_parsed_current_terminal_item_not_assistant_echo(owned, 
         driver.cleanup(deadline=time.monotonic()+1)
 
 
+@pytest.mark.parametrize('mutation', ['positive', 'gap', 'conflict', 'missing_complete', 'false_tail'])
+def test_pid_requires_complete_contiguous_actual_codex_output_record(owned, mutation):
+    driver = start(owned)
+    parser = CodexRuntimeDriver()
+    parser._identity = RuntimeIdentity('root')
+    parser._parents = {'root': None}
+    events = []
+    parser._emit = events.append
+    # The real normalizer splits one native packet at 4096 characters. The
+    # fixed PID line crosses that split and must remain attributable as a whole.
+    parser._message({'method': 'item/commandExecution/outputDelta', 'params': {
+        'threadId': 'root', 'turnId': 'turn', 'itemId': 'terminal',
+        'delta': 'x'*4092+'TAG=200\n'}})
+    assert len(events) == 2 and events[0].data['complete'] is False
+    if mutation == 'gap': events[1] = replace(events[1], data=events[1].data | {'offset': 4100})
+    if mutation == 'conflict': events.insert(1, replace(events[0], data=events[0].data | {'text': 'different'}))
+    if mutation == 'missing_complete': events[1] = replace(events[1], data={k:v for k,v in events[1].data.items() if k != 'complete'})
+    if mutation == 'false_tail': events[1] = replace(events[1], data=events[1].data | {'complete': False})
+    ref = NativeReference('root', 'root', activity_id='turn', item_id='terminal')
+    target = NativeWork(ref, 'terminal', 'running', 'fixture', time.time(), freshness='current')
+    owned.client.pids[200] = ProcessIdentity(200, 2000)
+    with driver._lock: driver.events = events
+    scenario = _Scenarios(driver, frozenset({'stop_work'}), time.monotonic()+1)
+    try:
+        assert (scenario._pid('TAG', target) is not None) == (mutation == 'positive')
+    finally: driver.cleanup(deadline=time.monotonic()+1)
+
+
+@pytest.mark.parametrize('child', [False, True])
+@pytest.mark.parametrize('mutation', ['positive', 'completed', 'failed', 'unknown', 'partial', 'stale',
+                                    'activity', 'root', 'parent'])
+def test_interrupt_terminal_proof_is_exact_current_activity_not_rpc_race(owned, child, mutation):
+    driver = start(owned)
+    target = NativeReference('root', 'child' if child else 'root', 'root' if child else None, 'turn')
+    event = RuntimeEvent('activity.terminal', target, request_id='request', data={'status':'interrupted'})
+    if mutation in {'completed', 'failed', 'unknown'}: event = replace(event, data={'status':mutation})
+    if mutation == 'partial': event = replace(event, partial=True)
+    if mutation == 'stale': event = replace(event, freshness='stale')
+    if mutation == 'activity': event = replace(event, reference=replace(target, activity_id='other'))
+    if mutation == 'root': event = replace(event, reference=replace(target, root_id='other'))
+    if mutation == 'parent': event = replace(event, reference=replace(target, parent_thread_id='other'))
+    with driver._lock: driver.events = [event]
+    scenario = _Scenarios(driver, frozenset({'stop_reply'}), time.monotonic()+1)
+    try:
+        assert scenario._interrupted(target, None if child else 'request') == (mutation == 'positive')
+        if not child: assert not scenario._interrupted(target, 'unrelated-request')
+    finally: driver.cleanup(deadline=time.monotonic()+1)
+
+
 @pytest.mark.parametrize('child_gap', ['missing_ancestry', 'missing_output', 'no_owned_match'])
 @pytest.mark.parametrize('cleanup', ['complete', 'native_unknown', 'os_unknown'])
 def test_independent_controls_survive_child_gap_only_after_matching_full_cleanup(owned, child_gap, cleanup):
