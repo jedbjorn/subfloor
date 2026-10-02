@@ -140,6 +140,7 @@ class ExecutableObserver:
         self.path, self.version_reader = installed_path, version_reader
         self._metadata: tuple[Any, ...] | None = None
         self._binding: ExecutableBinding | None = None
+        self._available: bool | None = None
         self._lock = threading.Lock()
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
@@ -155,20 +156,26 @@ class ExecutableObserver:
                 target = self.path.resolve(strict=True)
                 metadata = self._stat(target)
                 if metadata == self._metadata and not force:
-                    return InstalledObservation(self._binding, False, "compatible")
+                    recovered = self._available is not True
+                    self._available = True
+                    return InstalledObservation(self._binding, recovered, "compatible")
                 digest = hashlib.sha256()
                 with target.open("rb") as binary:
                     for chunk in iter(lambda: binary.read(1024*1024), b""):
                         digest.update(chunk)
                 version = self.version_reader(target, time.monotonic()+3)
                 if self.path.resolve(strict=True) != target or self._stat(target) != metadata:
-                    return InstalledObservation(None, True, "inconclusive", "EXECUTABLE_CHANGED_DURING_READ")
+                    changed = self._available is not False
+                    self._available = False
+                    return InstalledObservation(None, changed, "inconclusive", "EXECUTABLE_CHANGED_DURING_READ")
                 binding = ExecutableBinding(target, digest.hexdigest(), version)
-                changed = binding != self._binding
-                self._metadata, self._binding = metadata, binding
+                changed = binding != self._binding or self._available is not True
+                self._metadata, self._binding, self._available = metadata, binding, True
                 return InstalledObservation(binding, changed, "compatible")
             except (OSError, ValueError, subprocess.TimeoutExpired):
-                return InstalledObservation(None, True, "inconclusive", "INSTALLED_IDENTITY_UNAVAILABLE")
+                changed = self._available is not False
+                self._available = False
+                return InstalledObservation(None, changed, "inconclusive", "INSTALLED_IDENTITY_UNAVAILABLE")
 
     def start(self, on_change: Callable[[InstalledObservation], None], *, interval: float = 30) -> None:
         if self._thread is not None or interval < .01:
@@ -345,6 +352,8 @@ class RuntimeValidator:
             return tuple(Diagnostic(cap, "incompatible", "FOREIGN_NATIVE_ROOT") for cap in GUI_CAPABILITIES)
         if event.kind in {"runtime.lost", "ownership.failed"}:
             return tuple(Diagnostic(cap, "inconclusive", "NATIVE_EVIDENCE_LOST") for cap in GUI_CAPABILITIES)
+        if event.kind.startswith("output.") and not isinstance(event.data.get("text"), str):
+            return (Diagnostic(CAP_SUBMISSION, "incompatible", "OUTPUT_TEXT_INVALID"),)
         if event.kind.startswith("output.") and ref and (not ref.activity_id or self.harness == "codex" and (not ref.thread_id or not ref.item_id)):
             return (Diagnostic(CAP_SUBMISSION, "inconclusive", "OUTPUT_BINDING_PARTIAL"),)
         if event.kind.startswith("activity.") and (not ref or not ref.activity_id or self.harness == "codex" and not ref.thread_id):
