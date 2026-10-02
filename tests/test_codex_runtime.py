@@ -13,6 +13,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / ".super-coder/scripts"))
 from conversation_adapters.codex_runtime import CodexRuntimeDriver, JsonlRpc, RpcError
 from conversation_runtime_contract import (
+    CAP_AUTOMATION,
     ExecutableBinding,
     NativeControl,
     NativeReference,
@@ -212,6 +213,44 @@ def test_acknowledgement_without_processing_event_does_not_manufacture_processed
     driver, _, events, _ = seat
     assert driver.submit(submission(), deadline=deadline()).acknowledged
     assert not any(event.kind == "activity.processed" for event in events)
+
+
+def test_late_start_cannot_reopen_terminal_primary_but_final_output_is_retained(seat):
+    driver, rpc, events, _ = seat
+    turn = driver.submit(submission(), deadline=deadline()).native_activity_id
+    rpc.frame("turn/started", turn={"id": turn, "status": "inProgress"})
+    rpc.turns["root"][-1]["status"] = "completed"
+    rpc.frame("turn/completed", turn={"id": turn, "status": "completed"})
+    before = len(events)
+    rpc.frame("turn/started", turn={"id": turn, "status": "inProgress"})
+    assert len(events) == before and driver._active["root"] is None
+    rpc.frame("item/completed", turn=turn, item={"type": "agentMessage", "id": "late-final", "text": "late output"})
+    assert events[-1].kind == "output.final" and events[-1].request_id == "request"
+    snapshot = driver.inventory(deadline=deadline())
+    assert snapshot.primary_state == "idle"
+    assert snapshot.capabilities[CAP_AUTOMATION] == "unverified"
+
+
+@pytest.mark.parametrize("event", ["started", "completed"])
+def test_inventory_cannot_replace_activity_event_received_during_native_read(seat, event):
+    driver, rpc, _, _ = seat
+    turn = driver.submit(submission(), deadline=deadline()).native_activity_id
+    original = rpc.request
+
+    def racing_read(method, params, *, deadline):
+        result = original(method, params, deadline=deadline)
+        if method == "thread/read" and params["threadId"] == "root":
+            if event == "started":
+                result["thread"]["turns"] = []  # older idle read races newer start
+                rpc.frame("turn/started", turn={"id": turn, "status": "inProgress"})
+            else:
+                rpc.frame("turn/completed", turn={"id": turn, "status": "completed"})
+        return result
+
+    rpc.request = racing_read
+    snapshot = driver.inventory(deadline=deadline())
+    assert snapshot.partial and snapshot.primary_state == "unknown"
+    assert driver._active["root"] == (turn if event == "started" else None)
 
 
 def test_unknown_submission_retains_reservation_and_never_replays(seat):

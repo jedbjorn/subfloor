@@ -19,6 +19,8 @@ from pathlib import Path
 from typing import Any, Literal, Protocol
 
 from conversation_runtime_contract import (
+    CAP_AUTOMATION,
+    CAP_SUBMISSION,
     MAX_FRAME_BYTES,
     DriverStart,
     EventSink,
@@ -263,6 +265,7 @@ class CodexRuntimeDriver(RuntimeDriver):
         self._submit_lock = threading.Lock()
         self._parents: dict[str, str | None] = {}
         self._active: dict[str, str | None] = {}
+        self._activity_revision: dict[str, int] = {}
         self._turn_status: dict[tuple[str, str], str] = {}
         self._requests: dict[str, NativeSubmission] = {}
         self._pending_submission: NativeSubmission | None = None
@@ -372,13 +375,13 @@ class CodexRuntimeDriver(RuntimeDriver):
             self._reconciler.start()
             self._event("runtime.ready", provenance="codex:thread/start", data={"root_id": root})
             return DriverStart("ready", self._identity, capabilities={
-                **context.capability_evidence, "scheduling": "unverified"})
+                **context.capability_evidence, CAP_AUTOMATION: "unverified"})
         except (OSError, RuntimeContractError, ValueError) as exc:
             self._loss("native start failed; owner must verify scoped cleanup")
             return DriverStart("unavailable", self._identity, detail=getattr(exc, "code", "NATIVE_START_FAILED"))
 
     def submit(self, command: NativeSubmission, *, deadline: float) -> WriteReceipt:
-        if not self._allowed("submission"):
+        if not self._allowed(CAP_SUBMISSION):
             return WriteReceipt("unsupported", detail="subscription submission capability is not evidenced")
         if not command.text.strip() or self._rpc is None or not self._root or self._lost or self._closing:
             return WriteReceipt("rejected", detail="native runtime/input unavailable")
@@ -405,6 +408,7 @@ class CodexRuntimeDriver(RuntimeDriver):
                 with self._lock:
                     self._requests[turn_id] = command
                     self._active[self._root] = turn_id
+                    self._activity_revision[self._root] = self._activity_revision.get(self._root, 0) + 1
                     self._pending_submission = None
                     pending, self._unbound = self._unbound, []
                     for raw in pending:
@@ -465,13 +469,19 @@ class CodexRuntimeDriver(RuntimeDriver):
             ref = self._reference(thread, turn)
             provenance = "codex:" + method
             if method == "turn/started" and turn:
+                # Native final output may arrive after completion. An old
+                # start must not reopen the completed turn/primary slot.
+                if self._turn_status.get((thread, turn)) in TURN_TERMINALS:
+                    return
                 self._active[thread] = turn
+                self._activity_revision[thread] = self._activity_revision.get(thread, 0) + 1
                 self._turn_status[(thread, turn)] = "inProgress"
                 self._event("activity.started", ref, provenance=provenance, data={"status": "inProgress"})
                 self._event("activity.processed", ref, provenance=provenance)
             elif method == "turn/completed" and turn and isinstance(nested, dict):
                 status = _string(nested.get("status")) or "unknown"
                 self._turn_status[(thread, turn)] = status
+                self._activity_revision[thread] = self._activity_revision.get(thread, 0) + 1
                 if status in TURN_TERMINALS and self._active.get(thread) == turn:
                     self._active[thread] = None
                 self._event("activity.terminal" if status in TURN_TERMINALS else "snapshot.observed", ref,
@@ -597,6 +607,8 @@ class CodexRuntimeDriver(RuntimeDriver):
                         self._message(raw)
                 threads = tuple(self._parents)
             for thread in threads:
+                with self._lock:
+                    read_revision = self._activity_revision.get(thread, 0)
                 result = _object(self._rpc.request("thread/read", {"threadId": thread, "includeTurns": True}, deadline=deadline))
                 native = _object(result.get("thread"))
                 if native.get("id") != thread:
@@ -615,14 +627,16 @@ class CodexRuntimeDriver(RuntimeDriver):
                 with self._lock:
                     # A terminal event received during this read is newer than
                     # the snapshot; do not resurrect its completed activity.
-                    if turn_id and self._turn_status.get((thread, turn_id)) in TURN_TERMINALS:
+                    if (self._activity_revision.get(thread, 0) != read_revision
+                            or (turn_id and self._turn_status.get((thread, turn_id)) in TURN_TERMINALS)):
                         partial = True
                     else:
                         self._active[thread] = turn_id
-                    for native_turn in turns:
-                        tid, status = _string(native_turn.get("id")), _string(native_turn.get("status"))
-                        if tid and status in TURN_TERMINALS:
-                            self._turn_status[(thread, tid)] = status
+                        self._activity_revision[thread] = read_revision + 1
+                        for native_turn in turns:
+                            tid, status = _string(native_turn.get("id")), _string(native_turn.get("status"))
+                            if tid and status in TURN_TERMINALS:
+                                self._turn_status[(thread, tid)] = status
                 if thread != self._root:
                     child_status = native.get("status")
                     status = _string(child_status.get("type")) if isinstance(child_status, dict) else None
@@ -648,7 +662,7 @@ class CodexRuntimeDriver(RuntimeDriver):
                 primary_state: Literal["idle", "active", "unknown"] = (
                     "unknown" if self._pending_submission is not None or partial else ("active" if primary_id else "idle"))
                 return NativeSnapshot(self._identity, primary, tuple(observed), freshness="current", partial=partial,
-                                      capabilities={"scheduling": "unverified"}, primary_state=primary_state,
+                                      capabilities={CAP_AUTOMATION: "unverified"}, primary_state=primary_state,
                                       provenance="codex:owned-inventory")
         except (OSError, RuntimeContractError, ValueError):
             with self._lock:
