@@ -96,3 +96,17 @@ const runtime={generation_id:'gen',activity:[
 console.log(JSON.stringify(chatNativeVisibleActivity(runtime).map(row=>row.controller_sequence)));
 ''')
     assert result == [3, 4, 5, 6, 8, 9]
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="Node required")
+def test_itemless_final_dedup_uses_only_exact_server_output_key_and_retains_partial():
+    result = run_js('''
+const final=(sequence,key,extra={})=>({generation_id:'gen',controller_sequence:sequence,
+ kind:'output.final',partial:false,freshness:'current',reference:{root_id:'root',activity_id:'turn'},
+ engine_output_key:key,data:{text:'Same text does not establish identity'},...extra});
+const runtime={generation_id:'gen',activity:[final(1,'stored-part-A'),final(2,'stored-part-A'),
+ final(3,'stored-part-B'),final(4,'stored-part-A',{partial:true}),final(5,null),final(6,null),
+ final(7,'stored-mirrored',{engine_mirrored:true}),final(8,'stored-part-C',{freshness:'stale'})]};
+console.log(JSON.stringify(chatNativeVisibleActivity(runtime).map(row=>row.controller_sequence)));
+''')
+    assert result == [1, 3, 4, 5, 6, 8]

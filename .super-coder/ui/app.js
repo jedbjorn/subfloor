@@ -4924,10 +4924,21 @@ function chatNativeVisibleActivity(runtime) {
   // Run attribution alone does not mean child or terminal output was mirrored.
   const mirrored = new Set(activity.filter(event => event.engine_mirrored === true)
     .map(outputItem).filter(key => key !== null));
+  const seenOutputKeys = new Set();
   return activity.filter(event => {
     const key = outputItem(event);
-    return !["output.delta", "output.final"].includes(event.kind)
-      || (event.engine_mirrored !== true && (event.kind !== "output.delta" || key === null || !mirrored.has(key)));
+    if (!["output.delta", "output.final"].includes(event.kind)) return true;
+    if (event.engine_mirrored === true
+        || (event.kind === "output.delta" && key !== null && mirrored.has(key))) return false;
+    // The server supplies complete final identity even when the native item
+    // reference is absent. Preserve uncertain rows and distinct chunk keys.
+    const outputKey = event.engine_output_key;
+    if (event.kind === "output.final" && event.partial === false && event.freshness === "current"
+        && typeof outputKey === "string" && outputKey) {
+      if (seenOutputKeys.has(outputKey)) return false;
+      seenOutputKeys.add(outputKey);
+    }
+    return true;
   });
 }
 

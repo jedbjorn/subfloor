@@ -23,6 +23,7 @@ const cv = {conversation_id:cid,state:'idle',version:7,title:'Native UI source f
       {generation_id:'root-gen',controller_sequence:10,kind:'output.final',source:'system',freshness:'current',partial:false,data:{text:'Setup nonce belongs to system activity'}},
       {generation_id:'root-gen',controller_sequence:12,engine_run_id:1,engine_mirrored:false,kind:'output.final',reference:{root_id:'root',thread_id:'child',item_id:'child-output'},data:{kind:'assistant',text:'Child output with engine run survives'}},
       {generation_id:'root-gen',controller_sequence:13,engine_run_id:1,engine_mirrored:false,kind:'output.final',reference:{root_id:'root',thread_id:'root',item_id:'command-output'},data:{kind:'terminal',text:'Terminal output with engine run survives'}},
+      ...[16,17].map(controller_sequence=>({generation_id:'root-gen',controller_sequence,engine_run_id:1,engine_output_key:'stored-itemless-final',engine_mirrored:false,kind:'output.final',freshness:'current',partial:false,reference:{root_id:'root',activity_id:'turn-A'},data:{text:'Itemless final appears once'}})),
       {generation_id:'old-gen',controller_sequence:11,kind:'output.final',source:'native_completion',data:{text:'Foreign generation must not display'}},
       {generation_id:'root-gen',controller_sequence:9,engine_run_id:1,engine_mirrored:true,kind:'output.final',reference:{root_id:'root',thread_id:'root',item_id:'mirrored'},data:{text:'Legacy duplicate must not display'}}]}};
 const probe = {...cv,conversation_id:probeId,runtime:{...cv.runtime,generation_id:'probe-gen',role:'probe',state:'needs_consent',primary:null,
@@ -100,6 +101,7 @@ const server = http.createServer((req,res) => {
     assert.match(await page.locator('.chat-native-panel').innerText(),/Autonomous native completion/);
     assert.doesNotMatch(await page.locator('.chat-native-panel').innerText(),/Legacy duplicate|Foreign generation/);
     assert.match(await page.locator('.chat-native-activity-item').filter({hasText:'Setup nonce'}).innerText(),/System \/ setup/);
+    assert.equal(await page.locator('.chat-native-output').filter({hasText:'Itemless final appears once'}).count(),1);
     assert.match(await page.locator('.chat-native-panel').innerText(),/Child output with engine run survives/);
     assert.match(await page.locator('.chat-native-panel').innerText(),/Terminal output with engine run survives/);
     cv.runtime.activity.push({generation_id:'root-gen',controller_sequence:14,engine_run_id:1,engine_mirrored:false,
