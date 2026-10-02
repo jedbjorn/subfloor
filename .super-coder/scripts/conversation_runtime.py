@@ -186,7 +186,7 @@ class RuntimeStore:
                             or setup['executable_sha256']!=captured['executable']['sha256']
                             or setup['driver_revision']!=captured['driver_revision']):
                         raise RuntimeContractError('SETUP_INVALID','startup event differs from captured Claude generation')
-                    phase='needs_consent' if event['freshness']=='current' and not event['partial'] else 'setup_inconclusive'
+                    phase='needs_consent' if event['freshness']=='current' and not event['partial'] and event['grade']!='inconclusive' else 'setup_inconclusive'
                     con.execute("UPDATE conversation_runtime_generations SET state=? WHERE generation_id=? AND close_intent=0 AND state NOT IN ('closed','lost','ready')",(phase,generation))
                 elif event['kind']=='runtime.ready':
                     con.execute("UPDATE conversation_runtime_generations SET state='ready' WHERE generation_id=? AND close_intent=0 AND state NOT IN ('closed','lost')",(generation,))
@@ -233,7 +233,7 @@ class RuntimeStore:
             con.close()
 
     def state(self,generation: str,owner: int,shell: int,state: str,cleanup: Mapping[str,Any] | None=None) -> None:
-        if state not in {"reserved","starting","ready","closing","closed","lost"}:
+        if state not in {"reserved","starting","needs_consent","setup_inconclusive","ready","closing","closed","lost"}:
             raise RuntimeContractError("STATE_INVALID", "unknown generation state")
         con=db_driver.connect(self.database)
         try:

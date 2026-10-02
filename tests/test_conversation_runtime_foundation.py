@@ -387,6 +387,9 @@ def test_withdrawn_startup_phase_blocks_choice_and_late_setup_cannot_regress_rea
     assert owner.handle(wire('control',command=action))['state']=='rejected' and not driver.controls
     owner.emit(RuntimeEvent('runtime.setup',data=data|{'setup_id':'current-epoch'}))
     assert owner.status()['setup']['setup_id']=='current-epoch'
+    owner.emit(RuntimeEvent('runtime.setup',data=data,grade='inconclusive'))
+    assert owner.status()['setup'] is None
+    owner.emit(RuntimeEvent('runtime.setup',data=data|{'setup_id':'current-epoch'}))
     owner.emit(RuntimeEvent('runtime.ready',NativeReference('root')))
     owner.emit(RuntimeEvent('runtime.setup',data=data,freshness='stale',partial=True,grade='inconclusive'))
     assert owner.ready and owner.status()['setup'] is None
@@ -410,11 +413,14 @@ def test_startup_projection_binds_generation_binary_driver_and_preserves_close(t
     assert store.status('g',1,1)['state']=='needs_consent'
     event(2,RuntimeEvent('runtime.setup',data=dataclasses.asdict(setup),freshness='stale',partial=True,grade='inconclusive'))
     assert store.status('g',1,1)['state']=='setup_inconclusive'
-    event(3,RuntimeEvent('runtime.setup',data=dataclasses.asdict(setup)))
+    event(3,RuntimeEvent('runtime.setup',data=dataclasses.asdict(setup),grade='inconclusive'))
+    assert store.status('g',1,1)['state']=='setup_inconclusive'
+    event(4,RuntimeEvent('runtime.setup',data=dataclasses.asdict(setup)))
     assert store.status('g',1,1)['state']=='needs_consent'
+    store.state('g',1,1,'needs_consent')
     store.intent('g',1,1,lease,'close','close',{'action':'close'})
     store.state('g',1,1,'closing')
-    event(4,RuntimeEvent('runtime.ready',NativeReference('root')))
+    event(5,RuntimeEvent('runtime.ready',NativeReference('root')))
     assert store.status('g',1,1)['state']=='closing'
 
 
