@@ -532,7 +532,20 @@ def launch_api(record: dict,root: Path, *, resume: bool=False) -> None:
         raise FixtureError("RESOURCE_LIMIT","fixture deadline reached before API launch")
     limits=record["limits"]
     bootstrap=root/"fixture_bootstrap.py"
-    argv=["systemd-run", "--user", "--quiet", "--collect", "--unit", record["unit"],
+    # Only the explicit experimental seat carries these noncredential paths
+    # into its transient API process. Ordinary catalogue reads remain masked;
+    # no host account/configuration data is copied into the fixture or ledger.
+    native_environment=[]
+    if record['runtime']=='experimental':
+        import pwd
+        native_environment += ['--setenv=SC_FIXTURE_NATIVE_HOME='+pwd.getpwuid(os.geteuid()).pw_dir]
+        for harness in ('codex','claude'):
+            executable=shutil.which(harness)
+            if executable:
+                native_environment += ['--setenv=SC_FIXTURE_NATIVE_'+harness.upper()+'='+str(Path(executable).absolute())]
+        if os.environ.get('CODEX_HOME'):
+            native_environment += ['--setenv=SC_FIXTURE_NATIVE_CODEX_HOME='+str(Path(os.environ['CODEX_HOME']).resolve())]
+    argv=["systemd-run", "--user", "--quiet", "--collect", *native_environment, "--unit", record["unit"],
                  "--description", description(record), "-p", "Type=exec",
                  "-p", "KillMode=control-group", "-p", "SendSIGKILL=yes",
                  "-p", "TimeoutStopSec=5s", "-p", f"RuntimeMaxSec={remaining}s",
@@ -760,6 +773,10 @@ def bootstrap_repository(root: Path) -> str:
 def serve(root: Path, *, resume: bool=False) -> int:
     """Internal test-only bootstrap, executed from the marked archive."""
     root, trusted = verified_bootstrap_root(root, Path(__file__).absolute())
+    # Capture fixed owner-issued native path bindings before erasing inherited
+    # locators and masking normal GUI inventory. These stay ephemeral/private.
+    native_bindings={name:os.environ.get('SC_FIXTURE_NATIVE_'+name,'')
+                     for name in ('HOME','CODEX','CLAUDE','CODEX_HOME')}
     sanitized = clean_environment()
     os.environ.clear()
     os.environ.update(sanitized)
@@ -836,7 +853,7 @@ def serve(root: Path, *, resume: bool=False) -> int:
         gui_experiment_runtime = importlib.import_module("gui_experiment_runtime")
         runtime_stop = gui_experiment_runtime.start_fixture(
             database=db, root=root, fixture_id=trusted["fixture_id"],
-            supervisor=NativeSupervisor(Path(trusted["receipt"])))
+            supervisor=NativeSupervisor(Path(trusted["receipt"])),native_bindings=native_bindings)
         if not callable(runtime_stop):
             raise FixtureError("RUNTIME_UNAVAILABLE", "experimental start_fixture must return a shutdown callable")
 
