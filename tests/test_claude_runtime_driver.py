@@ -135,7 +135,7 @@ def test_finite_startup_returns_early_and_explicit_confirmation_is_not_readiness
     assert driver.control(replace(enable_command(setup), control_id="another"), deadline=DEADLINE()).state == "rejected"
 
 
-@pytest.mark.parametrize("mutation", ["stale_id", "wrong_digest", "changed_phase", "wrong_root", "changed_configuration", "changed_binary", "expired"])
+@pytest.mark.parametrize("mutation", ["stale_id", "wrong_digest", "changed_phase", "wrong_root", "changed_configuration", "changed_binary", "changed_boot", "expired"])
 def test_startup_confirmation_revalidates_only_captured_phase_and_writes_nothing(startup_seat, monkeypatch, mutation):
     driver, context, events, setup = startup_seat
     command = enable_command(setup)
@@ -153,6 +153,8 @@ def test_startup_confirmation_revalidates_only_captured_phase_and_writes_nothing
         (context.state_root / "claude-runtime-settings.json").write_text("different settings")
     elif mutation == "changed_binary":
         context.executable.path.write_text("changed native executable")
+    elif mutation == "changed_boot":
+        (context.worktree / "CLAUDE.md").write_text("different canonical boot")
     writes = []
     monkeypatch.setattr(runtime.os, "write", lambda fd, data: writes.append(data) or len(data))
     result = driver.control(command, deadline=time.monotonic() - 1 if mutation == "expired" else DEADLINE())
