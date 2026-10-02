@@ -73,7 +73,7 @@ def test_fixed_context_registers_before_canonical_boot_and_never_unmasks_server_
     assert fingerprint.implementation_digest==value.implementation_digest('codex')
 
 
-@pytest.mark.parametrize('source',['conversation_adapters/codex_runtime.py','gui_experiment_readiness.py','conversation_boot.py','run.py'])
+@pytest.mark.parametrize('source',['conversation_adapters/codex_runtime.py','gui_experiment_readiness.py','conversation_boot.py','run.py','execution_view.py','execution_view_exec.py'])
 def test_source_change_invalidates_fingerprint_without_dynamic_owner_ids(seat,source):
     value,_,_=seat
     initial=value.implementation_digest('codex')
