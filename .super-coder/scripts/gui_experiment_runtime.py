@@ -82,6 +82,13 @@ class FixtureNativeCheck:
                 raise RuntimeContractError('FIXTURE_STOPPED','API consumer is stopping')
             if self.future is not None and not self.future.done():
                 return self.status()
+            con=db_driver.connect(str(self.database))
+            try:
+                retained=con.execute("SELECT 1 FROM conversation_runtime_probe_jobs WHERE status!='complete' LIMIT 1").fetchone()
+            finally:
+                con.close()
+            if retained:
+                raise RuntimeContractError('CLEANUP_PENDING','retained finite probe must finish owned cleanup before new checking')
             fp=self.seat.candidate_fingerprint('codex','gpt-6.1-sol','high')
             from conversation_adapters.codex_runtime import create_driver
             shape,requirements=adapter_interface(create_driver())
@@ -94,18 +101,35 @@ class FixtureNativeCheck:
     def finished(self,future) -> None:
         try:
             future.result()
-            payload=json.dumps(self.cache.export(),separators=(',',':'))
             con=db_driver.connect(str(self.database))
             try:
                 with db_driver.write_transaction(con,'native_check.persist_cache'):
+                    # Snapshot at the committed write edge. Merge persisted
+                    # records so a delayed old callback cannot overwrite newer
+                    # fingerprint/capability evidence from another completion.
+                    row=con.execute("SELECT evidence_json FROM conversation_runtime_capability_cache WHERE cache_key='fixture-native'").fetchone()
+                    previous=EvidenceCache.restore(json.loads(row[0])).export() if row else {'records':[]}
+                    payload=self.cache.export()
+                    records={record['key']:record for record in previous['records']}
+                    for record in payload['records']:
+                        prior=records.get(record['key'])
+                        if prior:
+                            for cap,item in prior['evidence'].items():
+                                if cap not in record['evidence'] or record['evidence'][cap]['observed_at']<item['observed_at']:
+                                    record['evidence'][cap]=item
+                        records[record['key']]=record
+                    payload['records']=sorted(records.values(),key=lambda record:max((item['observed_at'] for item in record['evidence'].values()),default=0))[-128:]
                     con.execute('INSERT OR REPLACE INTO conversation_runtime_capability_cache VALUES(?,?,?)',
-                                ('fixture-native',payload,time.time()))
+                                ('fixture-native',json.dumps(payload,separators=(',',':')),time.time()))
             finally:
                 con.close()
             with self.lock:
-                self.persisted=True
+                if self.future is future:
+                    self.persisted=True
         except Exception: # noqa: BLE001 - private transport errors never become diagnostics
-            self.failure='CHECK_RESULT_INCONCLUSIVE'
+            with self.lock:
+                if self.future is future:
+                    self.failure='CHECK_RESULT_INCONCLUSIVE'
 
     def cancel(self) -> dict:
         with self.lock:

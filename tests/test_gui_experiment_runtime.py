@@ -85,6 +85,9 @@ def test_restart_retains_incomplete_probe_reference_without_start_or_grade(opera
     assert report['state']=='retained' and report['probe']['generation_id']=='generation'
     assert report['probe']['phase']=='closing' and report['grades']=={}
     assert calls==['owned-api','seat']
+    from conversation_runtime_contract import RuntimeContractError
+    with pytest.raises(RuntimeContractError) as exc:value.begin()
+    assert exc.value.code=='CLEANUP_PENDING' and calls==['owned-api','seat']
 
 
 def test_explicit_close_uses_only_current_fixed_fingerprint_and_bounded_cleanup(operation,monkeypatch):
@@ -128,6 +131,39 @@ def test_public_witness_counts_native_identity_without_output_or_private_receipt
     assert 'never-export-this' not in json.dumps(report)
     value.owner.allocating.add(fp.key)
     assert not value.status()['resources']['owned_capacity_released']
+
+
+def test_delayed_old_completion_merges_current_persisted_fingerprint_evidence(operation,monkeypatch):
+    import dataclasses
+    import threading
+    from conversation_runtime_checks import CapabilityEvidence
+    value,fp,con,_=operation
+    first,second=Future(),Future();futures=iter((first,second))
+    value.checker.request=lambda *args,**kwargs:next(futures)
+    value.begin()
+    entered,release=threading.Event(),threading.Event()
+    connect=runtime.db_driver.connect
+    def delayed(*args,**kwargs):
+        if threading.current_thread().name=='delayed-persist':
+            entered.set();assert release.wait(3)
+        return connect(*args,**kwargs)
+    monkeypatch.setattr(runtime.db_driver,'connect',delayed)
+    worker=threading.Thread(target=lambda:first.set_result(CheckResult(fp,{},CleanupProof(True,'complete'))),name='delayed-persist')
+    worker.start()
+    try:
+        assert entered.wait(1)
+        newer=dataclasses.replace(fp,implementation_digest='e'*64)
+        value.seat.candidate_fingerprint=lambda *args:newer
+        value.begin()
+        item=CapabilityEvidence('submission','inconclusive')
+        value.cache.put(newer,item)
+        second.set_result(CheckResult(newer,{'submission':item},CleanupProof(True,'complete')))
+        release.set();worker.join(2)
+        assert value.status()['cache_persisted']
+        raw=con.execute("SELECT evidence_json FROM conversation_runtime_capability_cache WHERE cache_key='fixture-native'").fetchone()[0]
+        assert EvidenceCache.restore(json.loads(raw)).get(newer,'submission') is not None
+    finally:
+        release.set();worker.join(2)
 
 
 @pytest.mark.parametrize('method,headers,body,code',[
