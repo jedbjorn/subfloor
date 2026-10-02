@@ -38,6 +38,7 @@ from conversation_adapters.claude_runtime import _memory_disable_source
 from conversation_runtime_contract import RuntimeContext, RuntimeContractError
 
 MAX_FRAME = 256 * 1024
+MAX_TRANSCRIPT = 2 * 1024 * 1024
 
 def fixture_module():
     # A copied fixture has the hash-bound maintainer bootstrap, never a host
@@ -159,7 +160,7 @@ def fixed_launch(context: RuntimeContext, main_root: Path, deadline: float) -> t
         discovered[str(path)]=digest(path) if present else None
         if present:files.append(path)
     binding: dict[str, Any] = {'generation_id': context.generation_id, 'session_id': str(uuid.UUID(hex=context.generation_id)),
-               'worktree': str(main_root), 'receipt':context.env['SC_F89_SETUP_RECEIPT'], 'executable': str(context.executable.path),
+               'worktree': str(main_root), 'native_home':context.env['HOME'], 'receipt':context.env['SC_F89_SETUP_RECEIPT'], 'executable': str(context.executable.path),
                'executable_sha256': context.executable.sha256, 'source_condition_sha256': source,
                'files': {str(p): digest(p) for p in files},'discovered_settings':discovered}
     binding['configuration_sha256']=hashlib.sha256(json.dumps(
@@ -217,6 +218,15 @@ def observe_hook(state: Path, raw: bytes) -> dict[str, Any]:
         raise RuntimeContractError('SETUP_INCONCLUSIVE', 'hook is not an owned setup descendant')
     if Path(f'/proc/{pid}/exe').resolve() != Path(binding['executable']):
         raise RuntimeContractError('SETUP_INCONCLUSIVE', 'actual native executable differs')
+    # This pointer is private evidence from the already verified owned hook.
+    # It is never searched for, exported, or treated as evidence of zero turns.
+    path=event.get('transcript_path')
+    if isinstance(path,str):
+        try:
+            pointer=transcript_pointer(binding,Path(path))
+            write_private(state/'claude-setup-transcript.json',pointer)
+        except (OSError,ValueError,RuntimeContractError):
+            pass # Memory evidence is independent; unavailable turn evidence stays inconclusive.
     result = {'state': 'owned_startup_observed', 'generation_id':binding['generation_id'],'observed_at':time.time(),
               'configuration_sha256':binding['configuration_sha256'],
               'auto_memory_enabled_setting':False, 'evidence_level': 'configuration_source_flag_inference',
@@ -225,6 +235,93 @@ def observe_hook(state: Path, raw: bytes) -> dict[str, Any]:
               'hook_sha256': digest(Path(__file__).resolve())}
     write_private(state / 'claude-setup-observation.json', result)
     return result
+
+
+def _owned_file_identity(path: Path, *, directory: bool=False) -> list[int]:
+    # lstat every component, including the captured native-home namespace.
+    if not path.is_absolute() or path.resolve()!=path:
+        raise RuntimeContractError('SETUP_INCONCLUSIVE','transcript identity unavailable')
+    for component in (*reversed(path.parents),path):
+        if component.is_symlink():
+            raise RuntimeContractError('SETUP_INCONCLUSIVE','transcript alias unavailable')
+    info=path.lstat()
+    if info.st_uid!=os.getuid() or not (stat.S_ISDIR(info.st_mode) if directory else stat.S_ISREG(info.st_mode)):
+        raise RuntimeContractError('SETUP_INCONCLUSIVE','transcript ownership unavailable')
+    return [info.st_dev,info.st_ino]
+
+
+def transcript_pointer(binding: Mapping[str,Any], path: Path) -> dict[str,Any]:
+    """Accept only the exact hook-supplied session in its native namespace."""
+    projects=Path(binding['native_home'])/'.claude/projects'
+    if (path.name!=binding['session_id']+'.jsonl' or path.parent.parent!=projects
+            or path.resolve()!=path or path.parent.name in {'','subagents'}):
+        raise RuntimeContractError('SETUP_INCONCLUSIVE','owned transcript namespace differs')
+    parent=_owned_file_identity(path.parent,directory=True)
+    file_identity=_owned_file_identity(path) if path.exists() or path.is_symlink() else None
+    return {'path':str(path),'parent_identity':parent,'file_identity':file_identity,
+            'minimum_size':path.stat().st_size if file_identity is not None else 0,
+            'session_id':binding['session_id'],'generation_id':binding['generation_id'],
+            'worktree':binding['worktree']}
+
+
+def transcript_turn_evidence(state: Path, *, deadline: float) -> dict[str,Any]:
+    """Fixed post-exit reader, bounded exact-session evidence, no telemetry claim.
+
+    Its only caller runs after supervisor-verified whole-unit exit. A missing,
+    empty, unfamiliar or changed file cannot establish zero native turns.
+    """
+    failure={'state':'inconclusive','evidence':'exact_session_transcript_turn_records'}
+    try:
+        budget(deadline)
+        binding=json.loads((state/'claude-setup-binding.json').read_text())
+        pointer=json.loads((state/'claude-setup-transcript.json').read_text())
+        path=Path(pointer['path'])
+        current=transcript_pointer(binding,path)
+        if any(current[key]!=pointer[key] for key in ('parent_identity','session_id','generation_id','worktree')):
+            return failure
+        if pointer['file_identity'] is not None and current['file_identity']!=pointer['file_identity']:
+            return failure
+        if current['file_identity'] is None:return failure
+        fd=os.open(path,os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK)
+        with os.fdopen(fd,'rb') as stream:
+            before=os.fstat(stream.fileno())
+            if ([before.st_dev,before.st_ino]!=current['file_identity'] or not stat.S_ISREG(before.st_mode)
+                    or not max(1,pointer['minimum_size'])<=before.st_size<=MAX_TRANSCRIPT):return failure
+            chunks=[];remaining=before.st_size
+            while remaining:
+                budget(deadline)
+                chunk=stream.read(min(65536,remaining))
+                if not chunk:return failure
+                chunks.append(chunk);remaining-=len(chunk)
+            after=os.fstat(stream.fileno())
+        data=b''.join(chunks)
+        final=path.lstat()
+        if ((before.st_size,before.st_mtime_ns,before.st_ctime_ns)!=(after.st_size,after.st_mtime_ns,after.st_ctime_ns)
+                or (after.st_size,after.st_mtime_ns,after.st_ctime_ns)!=(final.st_size,final.st_mtime_ns,final.st_ctime_ns)
+                or _owned_file_identity(path)!=current['file_identity'] or not data.endswith(b'\n')):return failure
+        user=assistant=records=attributable=0
+        known={'user','assistant','system','file-history-snapshot'}
+        for line in data.splitlines():
+            budget(deadline)
+            if not line or len(line)>MAX_FRAME:return failure
+            row=json.loads(line)
+            if not isinstance(row,dict) or row.get('type') not in known:return failure
+            if row['type']=='system' and row.get('subtype') not in {'init','local_command','turn_duration'}:return failure
+            if row.get('sessionId') is not None and row['sessionId']!=binding['session_id']:return failure
+            if row.get('cwd') is not None and row['cwd']!=binding['worktree']:return failure
+            if row.get('isSidechain') is True:return failure
+            bound=row.get('sessionId')==binding['session_id'] and row.get('cwd')==binding['worktree']
+            if row['type'] in {'user','assistant'}:
+                if not bound or not isinstance(row.get('message'),dict):return failure
+                user+=row['type']=='user';assistant+=row['type']=='assistant'
+            if row['type']=='system' and row.get('subtype')=='turn_duration' and not (user or assistant):return failure
+            records+=1;attributable+=bound
+        if not attributable:return failure
+        return {'state':'observed','evidence':'exact_session_transcript_turn_records','effective_telemetry':False,
+                'user_records':user,'assistant_records':assistant,'record_count':records,
+                'zero_turn_records':user==assistant==0,'transcript_sha256':hashlib.sha256(data).hexdigest()}
+    except (OSError,ValueError,KeyError,TypeError,RecursionError,RuntimeContractError):
+        return failure
 
 
 

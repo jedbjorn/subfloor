@@ -632,6 +632,8 @@ class NativeSupervisor:
                     try:
                         stop_native_unit(record,native,deadline=deadline)
                         native['status']='stopped'
+                        native['setup_transcript_evidence']=setup.transcript_turn_evidence(
+                            Path(native['root']),deadline=deadline)
                         # The unit may have been killed during preparation.
                         # Finalize only its scoped synthetic setup row after
                         # whole-unit exit, retaining failures for review.

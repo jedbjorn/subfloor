@@ -478,3 +478,103 @@ def test_blocking_owner_observation_cannot_fork_after_deadline(context,monkeypat
                 deadline=deadline,input_fd=terminal,output_fd=terminal)
         assert len(observations)==2 and calls==[]
     finally:os.close(outer);os.close(terminal)
+
+
+@pytest.fixture
+def transcript(context,tmp_path):
+    home=tmp_path/'native-home';project=home/'.claude/projects/exact-main';project.mkdir(parents=True)
+    context=dataclasses.replace(context,env=dict(context.env)|{'HOME':str(home)})
+    _,_,binding=setup.fixed_launch(context,context.worktree,time.monotonic()+3)
+    path=project/(binding['session_id']+'.jsonl')
+    row={'type':'system','subtype':'init','sessionId':binding['session_id'],'cwd':str(context.worktree)}
+    path.write_text(json.dumps(row)+'\n')
+    setup.write_private(context.state_root/'claude-setup-transcript.json',setup.transcript_pointer(binding,path))
+    return context,binding,path,row
+
+
+def test_exact_transcript_zero_is_observed_records_not_missing_file(transcript):
+    context,_binding,path,_row=transcript
+    value=setup.transcript_turn_evidence(context.state_root,deadline=time.monotonic()+2)
+    assert value['state']=='observed' and value['zero_turn_records'] is True
+    assert value['record_count']==1 and value['user_records']==value['assistant_records']==0
+    assert value['effective_telemetry'] is False
+    assert not {'path','session_id','generation_id','cwd','message'}&value.keys()
+    assert json.loads((context.state_root/'claude-setup-transcript.json').read_text())['path']==str(path)
+    assert (context.state_root/'claude-setup-transcript.json').stat().st_mode&0o777==0o600
+
+
+def test_actual_user_assistant_records_prevent_zero(transcript):
+    context,_binding,path,row=transcript
+    with path.open('a') as out:
+        for kind in ('user','assistant'):
+            out.write(json.dumps(row|{'type':kind,'message':{'content':'private never exported'}})+'\n')
+    value=setup.transcript_turn_evidence(context.state_root,deadline=time.monotonic()+2)
+    assert value['state']=='observed' and value['zero_turn_records'] is False
+    assert value['user_records']==value['assistant_records']==1
+    assert 'private' not in json.dumps(value)
+
+
+@pytest.mark.parametrize('change',['missing','empty','tail','unknown','foreign_session','foreign_cwd','sidechain','oversize','replace','truncate','expired','orphan_terminal'])
+def test_unknown_changed_incomplete_transcript_never_means_zero(transcript,change):
+    context,_binding,path,row=transcript
+    deadline=time.monotonic()+2
+    if change=='missing':path.unlink()
+    elif change=='empty':path.write_text('')
+    elif change=='tail':path.write_text(json.dumps(row))
+    elif change=='unknown':path.write_text(json.dumps(row|{'type':'unknown-native-record'})+'\n')
+    elif change=='foreign_session':path.write_text(json.dumps(row|{'sessionId':'other'})+'\n')
+    elif change=='foreign_cwd':path.write_text(json.dumps(row|{'cwd':'/other'})+'\n')
+    elif change=='sidechain':path.write_text(json.dumps(row|{'isSidechain':True})+'\n')
+    elif change=='oversize':path.write_bytes(b'x'*(setup.MAX_TRANSCRIPT+1))
+    elif change=='replace':
+        previous=path.with_suffix('.previous');path.rename(previous);path.write_text(previous.read_text())
+    elif change=='truncate':path.write_text('{}\n')
+    elif change=='expired':deadline=time.monotonic()-1
+    elif change=='orphan_terminal':path.write_text(json.dumps(row|{'subtype':'turn_duration'})+'\n')
+    value=setup.transcript_turn_evidence(context.state_root,deadline=deadline)
+    assert value['state']=='inconclusive' and 'zero_turn_records' not in value
+
+
+@pytest.mark.parametrize('change',['uuid','namespace','subagents','symlink_file','symlink_parent'])
+def test_hook_pointer_rejects_other_namespace_or_alias(transcript,change,tmp_path):
+    _context,binding,path,_row=transcript
+    if change=='uuid':path=path.with_name('other.jsonl')
+    elif change=='namespace':path=tmp_path/path.name
+    elif change=='subagents':path=path.parent/'subagents'/path.name
+    elif change=='symlink_file':
+        original=path.with_suffix('.private');path.rename(original);path.symlink_to(original)
+    else:
+        parent=path.parent;original=parent.with_name('original');parent.rename(original);parent.symlink_to(original,target_is_directory=True)
+    with pytest.raises(RuntimeContractError):setup.transcript_pointer(binding,path)
+
+
+def test_pointer_before_native_creates_file_still_needs_attributable_records(transcript):
+    context,binding,path,row=transcript
+    (context.state_root/'claude-setup-transcript.json').unlink();path.unlink()
+    setup.write_private(context.state_root/'claude-setup-transcript.json',setup.transcript_pointer(binding,path))
+    assert setup.transcript_turn_evidence(context.state_root,deadline=time.monotonic()+2)['state']=='inconclusive'
+    path.write_text(json.dumps(row)+'\n')
+    assert setup.transcript_turn_evidence(context.state_root,deadline=time.monotonic()+2)['zero_turn_records'] is True
+
+
+def test_owned_synthetic_hook_captures_pointer_privately_only(context,tmp_path,monkeypatch):
+    # Actual pytest OS identity, synthetic hook fields; no native account/CLI.
+    binary=Path(sys.executable).resolve();home=tmp_path/'native-home'
+    project=home/'.claude/projects/captured-main';project.mkdir(parents=True)
+    context=dataclasses.replace(context,executable=ExecutableBinding(binary,setup.digest(binary),'synthetic-python'),
+        env=dict(context.env)|{'HOME':str(home)})
+    monkeypatch.setattr(setup,'_memory_disable_source',lambda *args,**kwargs:'d'*64)
+    _,_,binding=setup.fixed_launch(context,context.worktree,time.monotonic()+3)
+    setup.write_private(context.state_root/'claude-setup-child.json',{'pid':os.getpid(),
+        'start_ticks':setup.process(os.getpid())[0],'cgroup':setup.process(os.getpid())[1]})
+    monkeypatch.setenv('SC_F89_SETUP_GENERATION',context.generation_id)
+    monkeypatch.setenv('CLAUDE_CODE_DISABLE_AUTO_MEMORY','1')
+    path=project/(binding['session_id']+'.jsonl')
+    event={'hook_event_name':'SessionStart','source':'startup','session_id':binding['session_id'],
+        'cwd':str(context.worktree),'transcript_path':str(path),'private':'discard'}
+    value=setup.observe_hook(context.state_root,json.dumps(event).encode())
+    assert value['state']=='owned_startup_observed'
+    assert 'transcript_path' not in value and 'private' not in json.dumps(value)
+    assert json.loads((context.state_root/'claude-setup-transcript.json').read_text())['path']==str(path)
+    # Missing exact file remains inconclusive, despite actual owned hook.
+    assert setup.transcript_turn_evidence(context.state_root,deadline=time.monotonic()+2)['state']=='inconclusive'
