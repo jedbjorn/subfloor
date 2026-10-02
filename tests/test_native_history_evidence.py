@@ -239,3 +239,70 @@ def test_history_eligibility_does_not_attach_to_ordinary_submission(context):
     with pytest.raises(ValueError):
         replace(complete_evidence(),history_eligibility=(qualifier(fp),))
     assert asdict(source())['source_binding_digest']
+
+
+@pytest.mark.parametrize('mismatch',['fingerprint','provider','model','effort'])
+def test_measured_history_binding_refused_before_acceptance_and_future_finalizes(context,mismatch):
+    fp=fingerprint(context)
+    wrong=(qualifier(replace(fp,implementation_digest='different')) if mismatch=='fingerprint'
+           else qualifier(fp,source(**{mismatch:'different'})))
+    class WrongBoundFactory(Factory):
+        def reserve(self,*args,**kwargs):
+            session=super().reserve(*args,**kwargs)
+            return replace(session,exercise=lambda *_:{CAP_HISTORY_RESUME:evidence(fp,history_eligibility=(wrong,))})
+    checker=CompatibilityChecker()
+    future=checker.request(fp,observed_interface=INTERFACE,requirements={CAP_HISTORY_RESUME:REQUIREMENT},
+        factory=WrongBoundFactory(context),seconds=.5)
+    result=future.result(timeout=1)
+    assert result.evidence[CAP_HISTORY_RESUME].grade=='inconclusive'
+    assert result.evidence[CAP_HISTORY_RESUME].diagnostics[0].code=='HISTORY_ELIGIBILITY_MISMATCH'
+    assert result.cleanup.complete
+    assert fp.key not in checker._flights
+    assert checker.cache.history_evidence(fp,source()) is None
+
+
+@pytest.mark.parametrize('partial_publication',[False,True])
+def test_failed_cache_publication_resolves_preserves_cleanup_and_other_grade(context,partial_publication):
+    fp=fingerprint(context)
+    class FailingCache(EvidenceCache):
+        failing=True
+        def put(self,fp,item):
+            if self.failing and item.capability==CAP_HISTORY_RESUME:
+                if partial_publication:super().put(fp,item)
+                raise ValueError('private publication diagnostic')
+            super().put(fp,item)
+    class MeasuredFactory(Factory):
+        def reserve(self,*args,**kwargs):
+            session=super().reserve(*args,**kwargs)
+            return replace(session,exercise=lambda *_:{CAP_HISTORY_RESUME:evidence(fp),CAP_SUBMISSION:complete_evidence()})
+    cache=FailingCache();checker=CompatibilityChecker(cache=cache);factory=MeasuredFactory(context)
+    args={'observed_interface': INTERFACE,'requirements': {CAP_HISTORY_RESUME:REQUIREMENT,CAP_SUBMISSION:REQUIREMENT},'factory': factory,'seconds': .5}
+    future=checker.request(fp,**args);result=future.result(timeout=1)
+    assert result.cleanup.complete
+    assert result.evidence[CAP_HISTORY_RESUME].grade=='inconclusive'
+    assert result.evidence[CAP_HISTORY_RESUME].diagnostics[0].code=='CHECK_CACHE_PUBLICATION_FAILED'
+    assert result.evidence[CAP_SUBMISSION].grade=='compatible'
+    assert cache.get(fp,CAP_SUBMISSION).grade=='compatible'
+    assert cache.history_evidence(fp,source()) is None
+    assert fp.key not in checker._flights
+    assert 'private publication' not in str(result)
+    cache.failing=False
+    retry=checker.request(fp,**args)
+    assert retry is not future and retry.result(timeout=1).cleanup.complete
+    assert retry.result().evidence[CAP_HISTORY_RESUME].grade=='compatible'
+
+
+def test_final_normalization_failure_still_resolves_with_cleanup(context):
+    fp=fingerprint(context)
+    class FullProvenanceFactory(Factory):
+        def reserve(self,*args,**kwargs):
+            session=super().reserve(*args,**kwargs)
+            # Adding the final cleanup provenance exceeds the bounded record.
+            return replace(session,exercise=lambda *_:{CAP_HISTORY_RESUME:evidence(fp,provenance=tuple(str(i) for i in range(64)))})
+    checker=CompatibilityChecker()
+    result=checker.request(fp,observed_interface=INTERFACE,requirements={CAP_HISTORY_RESUME:REQUIREMENT},
+        factory=FullProvenanceFactory(context),seconds=.5).result(timeout=1)
+    assert result.cleanup.complete
+    assert result.evidence[CAP_HISTORY_RESUME].grade=='inconclusive'
+    assert result.evidence[CAP_HISTORY_RESUME].diagnostics[0].code=='CHECK_FINALIZATION_INCONCLUSIVE'
+    assert fp.key not in checker._flights
