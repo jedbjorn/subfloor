@@ -339,6 +339,7 @@ def test_expired_admission_never_reserves_or_writes_and_ingress_bounds_deadline(
 
 def test_claude_setup_choice_is_pre_ready_captured_once_and_never_implies_readiness(controller):
     owner,driver=controller
+    owner.ready=False
     owner.context=dataclasses.replace(owner.context,harness='claude');driver.harness='claude'
     setup=StartupConsent('g','epoch','a'*64,'test-only','b'*64,time.time())
     owner.emit(RuntimeEvent('runtime.setup',data=dataclasses.asdict(setup)))
@@ -359,6 +360,7 @@ def test_claude_setup_choice_is_pre_ready_captured_once_and_never_implies_readin
 
 def test_setup_partial_choice_retains_fence_and_close_remains_available(controller):
     owner,driver=controller
+    owner.ready=False
     owner.context=dataclasses.replace(owner.context,harness='claude');driver.harness='claude'
     owner.emit(RuntimeEvent('runtime.setup',data=dataclasses.asdict(StartupConsent('g','epoch','a'*64,'test-only','b'*64,time.time()))))
     def partial(command,**kwargs):
@@ -371,6 +373,23 @@ def test_setup_partial_choice_retains_fence_and_close_remains_available(controll
     assert owner.handle(wire('close',command=control('close',2,action='close')))['outcome']=='complete'
     owner.emit(RuntimeEvent('runtime.ready',NativeReference('root')))
     assert not owner.ready and owner.journal.get('close')
+
+
+def test_withdrawn_startup_phase_blocks_choice_and_late_setup_cannot_regress_ready(controller):
+    owner,driver=controller
+    owner.context=dataclasses.replace(owner.context,harness='claude');driver.harness='claude'
+    data=dataclasses.asdict(StartupConsent('g','epoch','a'*64,'test-only','b'*64,time.time()))
+    owner.ready=False
+    owner.emit(RuntimeEvent('runtime.setup',data=data))
+    owner.emit(RuntimeEvent('runtime.setup',data=data,freshness='stale',partial=True,grade='inconclusive'))
+    assert owner.status()['setup'] is None and not owner.ready
+    action=control('stale-choice',1,action='enable_local_channel',options={'setup_id':'epoch','configuration_sha256':'b'*64})
+    assert owner.handle(wire('control',command=action))['state']=='rejected' and not driver.controls
+    owner.emit(RuntimeEvent('runtime.setup',data=data|{'setup_id':'current-epoch'}))
+    assert owner.status()['setup']['setup_id']=='current-epoch'
+    owner.emit(RuntimeEvent('runtime.ready',NativeReference('root')))
+    owner.emit(RuntimeEvent('runtime.setup',data=data,freshness='stale',partial=True,grade='inconclusive'))
+    assert owner.ready and owner.status()['setup'] is None
 
 
 def test_startup_projection_binds_generation_binary_driver_and_preserves_close(tmp_path):
@@ -389,9 +408,13 @@ def test_startup_projection_binds_generation_binary_driver_and_preserves_close(t
     assert store.status('g',1,1)['last_sequence']==0
     event(1,RuntimeEvent('runtime.setup',data=dataclasses.asdict(setup)))
     assert store.status('g',1,1)['state']=='needs_consent'
+    event(2,RuntimeEvent('runtime.setup',data=dataclasses.asdict(setup),freshness='stale',partial=True,grade='inconclusive'))
+    assert store.status('g',1,1)['state']=='setup_inconclusive'
+    event(3,RuntimeEvent('runtime.setup',data=dataclasses.asdict(setup)))
+    assert store.status('g',1,1)['state']=='needs_consent'
     store.intent('g',1,1,lease,'close','close',{'action':'close'})
     store.state('g',1,1,'closing')
-    event(2,RuntimeEvent('runtime.ready',NativeReference('root')))
+    event(4,RuntimeEvent('runtime.ready',NativeReference('root')))
     assert store.status('g',1,1)['state']=='closing'
 
 

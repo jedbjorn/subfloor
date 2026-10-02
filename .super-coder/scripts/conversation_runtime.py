@@ -186,7 +186,8 @@ class RuntimeStore:
                             or setup['executable_sha256']!=captured['executable']['sha256']
                             or setup['driver_revision']!=captured['driver_revision']):
                         raise RuntimeContractError('SETUP_INVALID','startup event differs from captured Claude generation')
-                    con.execute("UPDATE conversation_runtime_generations SET state='needs_consent' WHERE generation_id=? AND close_intent=0 AND state NOT IN ('closed','lost')",(generation,))
+                    phase='needs_consent' if event['freshness']=='current' and not event['partial'] else 'setup_inconclusive'
+                    con.execute("UPDATE conversation_runtime_generations SET state=? WHERE generation_id=? AND close_intent=0 AND state NOT IN ('closed','lost','ready')",(phase,generation))
                 elif event['kind']=='runtime.ready':
                     con.execute("UPDATE conversation_runtime_generations SET state='ready' WHERE generation_id=? AND close_intent=0 AND state NOT IN ('closed','lost')",(generation,))
                 con.execute("INSERT INTO conversation_runtime_events VALUES(?,?,?)",(generation,sequence,encoded(event)))
