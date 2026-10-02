@@ -482,16 +482,20 @@ def start_locked(source_repo: Path, sha: str, raw: bytes, receipt: Path, *,
 
 
 def verified_bootstrap_root(root: Path, bootstrap: Path) -> tuple[Path, dict[str, Any]]:
+    caller_root = root.absolute()
     marker = read_json(root / MARKER)
     trusted = read_json(ledger_path(marker.get("fixture_id", "")))
     retained_root = Path(trusted["root"])
-    if root.absolute() != retained_root:
+    if caller_root != retained_root:
         raise FixtureError("OWNERSHIP_INVALID", "bootstrap caller root differs from the retained fixture")
-    verified = verify_root(trusted)
-    if (bootstrap.absolute() != verified / "fixture_bootstrap.py" or bootstrap.is_symlink()
+    verify_root(trusted)
+    if (bootstrap.absolute() != caller_root / "fixture_bootstrap.py" or bootstrap.is_symlink()
             or hashlib.sha256(bootstrap.read_bytes()).hexdigest() != trusted["bootstrap_sha256"]):
         raise FixtureError("OWNERSHIP_INVALID", "bootstrap file differs from the retained helper identity")
-    return verified, trusted
+    # Preserve the caller's public path after the independent identity proof.
+    # Do not propagate a path read from a secret-bearing ownership container
+    # into public migration diagnostics.
+    return caller_root, trusted
 
 
 def serve(root: Path) -> int:
