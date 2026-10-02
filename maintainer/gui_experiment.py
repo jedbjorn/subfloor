@@ -297,22 +297,31 @@ def native_unit_state(native: dict) -> dict[str, str]:
     return unit_state({"unit":native["unit"]})
 
 
-def stop_native_unit(record: dict, native: dict) -> None:
+def stop_native_unit(record: dict, native: dict, *, deadline: float | None = None) -> None:
     verify_native(record, native)
-    state = native_unit_state(native)
+    bounded = deadline is not None
+    limit=deadline if deadline is not None else time.monotonic()+25
+    if bounded and (not math.isfinite(limit) or limit <= time.monotonic()):
+        raise FixtureError("CLEANUP_UNVERIFIED", "setup cleanup deadline expired")
+    def observe():
+        return unit_state(native, timeout=max(.001, min(1, limit-time.monotonic()))) if bounded else native_unit_state(native)
+    state = observe()
     if state["LoadState"] != "not-found":
         if state.get("Description") != native_description(record, native):
             raise FixtureError("OWNERSHIP_INVALID", "native unit description differs")
-        command(["systemctl", "--user", "stop", native["unit"]], timeout=15)
+        command(["systemctl", "--user", "stop", native["unit"]],
+                timeout=max(.001,min(2,limit-time.monotonic())) if bounded else 15)
     cgroup = state.get("ControlGroup", "") or native.get("control_group", "")
-    deadline = time.monotonic() + 10
+    limit = limit if bounded else time.monotonic() + 10
     while True:
-        state = native_unit_state(native)
+        state = observe()
         if state["LoadState"] != "not-found" and state.get("Description") != native_description(record, native):
             raise FixtureError("OWNERSHIP_INVALID", "native unit identity changed during cleanup")
         pids = cgroup_pids(cgroup)
         live = native.get("main_pid", 0) > 0 and process_start_ticks(native["main_pid"]) == native.get("main_pid_start_ticks")
-        if state.get("ActiveState") in {"inactive", "failed"} and state.get("MainPID", "0") == "0" and not pids and not live:
+        child=native.get("setup_child",{})
+        child_live=child.get("pid",0)>0 and process_start_ticks(child["pid"])==child.get("start_ticks")
+        if state.get("ActiveState") in {"inactive", "failed"} and state.get("MainPID", "0") == "0" and not pids and not live and not child_live:
             endpoint=Path(native['endpoint'])
             if endpoint.exists() or endpoint.is_symlink():
                 info=endpoint.lstat()
@@ -322,10 +331,10 @@ def stop_native_unit(record: dict, native: dict) -> None:
                 endpoint.unlink()
             native["os_cleanup"] = {"complete":True,"cgroup_empty":True,"recorded_process_exited":True}
             return
-        if time.monotonic() >= deadline:
+        if time.monotonic() >= limit:
             native["os_cleanup"] = {"complete":False,"surviving_pids":pids}
             raise FixtureError("CLEANUP_UNVERIFIED", "native unit survivors retain fixture state")
-        time.sleep(.1)
+        time.sleep(min(.1,max(0,limit-time.monotonic())))
 
 
 class NativeSupervisor:
@@ -450,20 +459,24 @@ class NativeSupervisor:
         return any(proof.get('identity')==identity and proof.get('cgroup_empty') is True
                    for proof in record.get('api_exit_proofs',[]))
 
-    def register(self, generation_id: str, harness: str, *, test_transport: bool=False) -> dict:
+    def register(self, generation_id: str, harness: str, *, test_transport: bool=False, purpose: str="native",
+                 deadline: float | None=None) -> dict:
         initial = read_json(self.receipt)
-        with ownership_lock(initial["fixture_id"]):
+        with ownership_lock(initial["fixture_id"],deadline=deadline):
             record = verify_receipt(self.receipt)
             root = verify_root(record)
             if record["runtime"] != "experimental" or record["status"] not in {"preparing", "serving"}:
                 raise FixtureError("RUNTIME_UNAVAILABLE", "native units require an active experimental fixture")
-            if not ID_RE.fullmatch(generation_id) or harness not in {"codex", "claude"}:
+            if (not ID_RE.fullmatch(generation_id) or harness not in {"codex", "claude"}
+                    or purpose not in {"native","claude_setup"}
+                    or (purpose=="claude_setup" and (harness!="claude" or test_transport))):
                 raise FixtureError("INPUT_INVALID", "native generation/harness invalid")
             units = record.setdefault("native_units", [])
             for native in units:
                 if native["generation_id"] == generation_id:
                     verify_native(record, native)
-                    if native["harness"] != harness or native.get("test_transport",False) != test_transport:
+                    if (native["harness"] != harness or native.get("test_transport",False) != test_transport
+                            or native.get("purpose","native") != purpose):
                         raise FixtureError("OWNERSHIP_INVALID", "generation harness changed")
                     return native
             if sum(item["harness"] == harness and not item.get("os_cleanup", {}).get("complete") for item in units) >= 2:
@@ -483,6 +496,7 @@ class NativeSupervisor:
                       "limits":{"memory_mib":2048,"tasks":128,"term_grace_seconds":5},
                       "registered_at":time.time(),"status":"registered"}
             native["test_transport"] = test_transport
+            native["purpose"] = purpose
             units.append(native)
             save(record,self.receipt)  # durable before systemd-run or native writes
             return native
@@ -496,7 +510,8 @@ class NativeSupervisor:
             if native is None:
                 raise FixtureError("OWNERSHIP_INVALID", "native unit was not registered before launch")
             verify_native(record,native)
-            if native["status"] != "registered" or native_unit_state(native)["LoadState"] != "not-found":
+            if (native.get("purpose","native")!="native" or native["status"] != "registered"
+                    or native_unit_state(native)["LoadState"] != "not-found"):
                 raise FixtureError("GENERATION_TERMINAL", "native launch never restarts an existing generation")
             script = root / ".super-coder/scripts/conversation_runtime_controller.py"
             if not script.is_file() or script.is_symlink():
@@ -539,6 +554,102 @@ class NativeSupervisor:
                     break
                 time.sleep(.1)
             raise FixtureError("STARTUP_FAILED", "native controller did not become ready; ledger retains cleanup")
+
+    def launch_claude_setup(self, generation_id: str, *, deadline: float) -> dict:
+        """Fixed local operator TUI; registered ownership before preparation.
+
+        No arbitrary argv/environment/main-root input and no model prompt.
+        Its qualified observation is diagnostic, never ordinary admission.
+        """
+        setup=importlib.import_module("claude_setup")
+        budget,digest=setup.budget,setup.digest
+        budget(deadline)
+        if not os.isatty(0) or not os.isatty(1):
+            raise FixtureError("SETUP_INCONCLUSIVE","native operator terminal required")
+        # Reusing a generation is forbidden even if its previous unit exited.
+        initial=verify_receipt(self.receipt)
+        if any(n['generation_id']==generation_id for n in initial.get('native_units',[])):
+            raise FixtureError("GENERATION_TERMINAL","setup never replays an existing generation")
+        native=self.register(generation_id,'claude',purpose='claude_setup',deadline=deadline-3)
+        launcher=None
+        try:
+            with ownership_lock(initial['fixture_id'],deadline=deadline-3):
+                record=verify_receipt(self.receipt)
+                root=verify_root(record)
+                native=next(n for n in record['native_units'] if n['generation_id']==generation_id)
+                verify_native(record,native)
+                helper=root/'maintainer/claude_setup.py'
+                executable=shutil.which('claude')
+                if not executable or not helper.is_file() or helper.is_symlink():
+                    raise FixtureError("SETUP_INCONCLUSIVE","captured setup source or native executable unavailable")
+                path=Path(executable).resolve()
+                if root.resolve()!=root or not (root/'.git').is_dir() or (root/'.git').is_symlink():
+                    raise FixtureError("SETUP_INCONCLUSIVE","validated canonical Git MAIN root required")
+                native.update(status='starting',setup_helper_sha256=digest(helper),
+                              setup_executable_sha256=digest(path),setup_deadline=deadline)
+                save(record,self.receipt)
+                budget(deadline)
+                remaining=min(27, math.floor(deadline-time.monotonic()-3))
+                if remaining<=0:
+                    raise FixtureError("SETUP_INCONCLUSIVE","setup preparation budget expired")
+                argv=['systemd-run','--user','--quiet','--collect','--wait','--pty',
+                      '--unit',native['unit'],'--description',native_description(record,native),
+                      '-p','Type=exec','-p','KillMode=control-group','-p','SendSIGKILL=yes',
+                      '-p','TimeoutStopSec=1s','-p',f'RuntimeMaxSec={remaining}s',
+                      '-p','MemoryMax=2048M','-p','TasksMax=128','-p',f'WorkingDirectory={root}',
+                      '/usr/bin/env','-i','PATH='+os.defpath,sys.executable,'-I',str(helper),'_setup','--receipt',str(self.receipt),
+                      '--generation',generation_id,'--executable',str(path),
+                      '--sha256',native['setup_executable_sha256'],'--deadline',str(deadline-3)]
+                launcher=subprocess.Popen(argv,env=clean_environment())
+            # Unit wrapper cannot prepare until exact OS ownership is durable.
+            while time.monotonic()<deadline-3:
+                with ownership_lock(initial['fixture_id'],deadline=deadline-3):
+                    record=verify_receipt(self.receipt)
+                    verify_root(record)
+                    native=next(n for n in record['native_units'] if n['generation_id']==generation_id)
+                    verify_native(record,native)
+                    if record['status'] not in {'preparing','serving'} or native['status']!='starting':
+                        raise FixtureError('SETUP_INCONCLUSIVE','setup owner changed before preparation')
+                    state=unit_state(native,timeout=min(1,max(.001,deadline-time.monotonic())))
+                    if state.get('Description')!=native_description(record,native):
+                        raise FixtureError('OWNERSHIP_INVALID','setup unit identity differs')
+                    pid=int(state.get('MainPID','0'));ticks=process_start_ticks(pid)
+                    if state.get('ActiveState')=='active' and ticks is not None:
+                        native.update(status='active',main_pid=pid,main_pid_start_ticks=ticks,control_group=state['ControlGroup'])
+                        save(record,self.receipt)
+                        break
+                if launcher.poll() is not None:
+                    raise FixtureError('SETUP_INCONCLUSIVE','setup unit exited before recorded ownership')
+                time.sleep(.02)
+            else:
+                raise FixtureError('SETUP_INCONCLUSIVE','setup start deadline expired')
+            launcher.wait(timeout=max(.001,deadline-time.monotonic()-3))
+        finally:
+            try:
+                with ownership_lock(initial['fixture_id'],deadline=deadline):
+                    record=verify_receipt(self.receipt)
+                    native=next(n for n in record['native_units'] if n['generation_id']==generation_id)
+                    try:
+                        stop_native_unit(record,native,deadline=deadline)
+                        native['status']='stopped'
+                        # The unit may have been killed during preparation.
+                        # Finalize only its scoped synthetic setup row after
+                        # whole-unit exit, retaining failures for review.
+                        database=Path(record['root'])/'.super-coder/shell_db.db'
+                        if database.is_file():
+                            setup.close_setup_conversation(database,'cv_fixture_setup_'+generation_id,
+                                                           Path(record['root']),generation_id)
+                    finally:
+                        native['setup_state']='setup_inconclusive'
+                        save(record,self.receipt)
+            finally:
+                if launcher is not None and launcher.poll() is None:
+                    launcher.terminate()
+                    try:launcher.wait(timeout=max(.001,min(.2,deadline-time.monotonic())))
+                    except subprocess.TimeoutExpired:
+                        launcher.kill()
+                        launcher.wait(timeout=.2)
+        return native
 
     def stop(self, generation_id: str) -> dict:
         initial = read_json(self.receipt)
@@ -639,7 +750,11 @@ def archive(source_repo: Path, ref: str) -> tuple[str, bytes]:
                    f"{ref}^{{commit}}"], check=False).stdout.strip()
     if not SHA_RE.fullmatch(sha):
         raise FixtureError("REF_INVALID", "requested ref does not resolve to a full commit")
-    result = subprocess.run(["git", "-C", str(source_repo), "archive", sha, ".super-coder", "sc"],
+    paths=[".super-coder", "sc"]
+    setup='maintainer/claude_setup.py'
+    present=command(["git","-C",str(source_repo),"cat-file","-e",f"{sha}:{setup}"],check=False)
+    if present.returncode==0:paths.append(setup)
+    result = subprocess.run(["git", "-C", str(source_repo), "archive", sha, *paths],
                             capture_output=True, env=clean_environment(), timeout=20, check=False)
     if result.returncode:
         raise FixtureError("SOURCE_INVALID", "committed engine archive is unavailable")
@@ -1055,6 +1170,8 @@ def main(argv: list[str] | None = None) -> int:
     cleanup.add_argument("--receipt", type=Path, required=True)
     recovery=sub.add_parser("restart-api",help="recover only a stopped marked fixture API; native units remain")
     recovery.add_argument("--receipt",type=Path,required=True)
+    setup = sub.add_parser("claude-setup", help="fixed 30-second MAIN-root native initial trust TUI")
+    setup.add_argument("--receipt", type=Path, required=True)
     internal = sub.add_parser("_serve", help=argparse.SUPPRESS)
     internal.add_argument("--root", type=Path, required=True)
     internal.add_argument("--resume",action="store_true")
@@ -1062,6 +1179,10 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if args.action == "_serve":
             return serve(args.root.absolute(),resume=args.resume)
+        if args.action == "claude-setup":
+            native=NativeSupervisor(canonical_receipt(args.receipt)).launch_claude_setup(uuid.uuid4().hex,deadline=time.monotonic()+30)
+            print(json.dumps({"state":"setup_inconclusive","cleanup_complete":native.get("os_cleanup",{}).get("complete") is True,"native_inference_verified":False}))
+            return 0
         if args.action == "restart-api":
             record=restart_api(args.receipt.absolute())
         elif args.action == "stop":
