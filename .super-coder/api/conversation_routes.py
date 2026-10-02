@@ -499,7 +499,7 @@ def _process_projection(row) -> dict:
     }
 
 
-def _conversation_projection(row) -> dict:
+def _conversation_projection(row, *, con=None) -> dict:
     contract_version = int(row["route_contract_version"])
     binding = None
     binding_digest = None
@@ -547,7 +547,7 @@ def _conversation_projection(row) -> dict:
         "scope": row["conversation_scope"],
         "state": row["state"],
         "runtime_mode": row["runtime_mode"],
-        "runtime": conversation_native_chats.projection(row),
+        "runtime": conversation_native_chats.projection(row,con=con),
         "title": row["title"],
         "starred": bool(row["starred"]),
         "created_at": row["created_at"],
@@ -1767,7 +1767,7 @@ def _list_conversations(con, operator: dict, query):
     rows = con.execute(
         "SELECT c.conversation_id,c.shell_id,c.owner_user_id,c.harness,"
         "c.provider,c.model,c.effort,c.route_contract_version,c.route_binding,"
-        "c.state,c.title,c.starred,c.runtime_mode,c.runtime_projection,"
+        "c.state,c.title,c.starred,c.runtime_mode,c.runtime_projection,c.worktree,"
         "c.conversation_scope,c.created_at,"
         "c.last_activity_at,c.closed_at,c.version,s.display_name,s.shortname,"
         "CASE WHEN c.state!='closed' THEN ("
@@ -1800,7 +1800,7 @@ def _list_conversations(con, operator: dict, query):
     return _json(
         200,
         {
-            "items": [_conversation_projection(row) for row in page],
+            "items": [_conversation_projection(row,con=con) for row in page],
             "next_cursor": next_cursor,
         },
     )
@@ -3014,7 +3014,7 @@ def handle(method: str, path: str, headers_raw: str, raw_body: bytes) -> tuple:
                         _conversation_projection(
                             _require_conversation(
                                 con, conversation_id, operator["user_id"]
-                            )
+                            ),con=con
                         ),
                     )
                 if method == "PATCH":
