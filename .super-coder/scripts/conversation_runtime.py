@@ -143,6 +143,17 @@ class RuntimeStore:
         finally:
             con.close()
 
+    def command_status(self,generation: str,owner: int,shell: int,cid: str) -> dict:
+        con=db_driver.connect(self.database)
+        try:
+            self._owned(con,generation,owner,shell)
+            row=con.execute("SELECT state,receipt_json FROM conversation_runtime_commands WHERE generation_id=? AND command_id=?",(generation,cid)).fetchone()
+            if row is None:
+                raise RuntimeContractError("COMMAND_UNKNOWN","canonical intent is missing")
+            return {"state":row["state"],"receipt":json.loads(row["receipt_json"])}
+        finally:
+            con.close()
+
     def ingest(self,generation: str,owner: int,shell: int,lease: Mapping[str,Any],replay: Mapping[str,Any], *, project: Callable | None=None) -> int:
         """Commit event/projection/watermark together; optional Chats emitter
         receives this same transaction, never emits a second replay event.
@@ -262,7 +273,14 @@ class RuntimeClient:
         command=store.intent(self.generation,owner,shell,self.lease,cid,"submit",payload)
         try:
             result=self.request("submit",command=command)
-        except (OSError,RuntimeContractError):
+        except RuntimeContractError as exc:
+            if exc.code=="COMMAND_COMPACTED":
+                result=store.command_status(self.generation,owner,shell,cid)|{"duplicate":True,"compacted":True}
+            elif exc.code in {"BACKPRESSURE","LEASE_FENCED","RUNTIME_CLOSING","NATIVE_BUSY"}:
+                result={"state":"not_written","code":exc.code,"detail":"controller proved refusal before native dispatch"}
+            else:
+                result={"state":"unknown","code":exc.code,"detail":"controller outcome unavailable; retain stable intent"}
+        except OSError:
             result={"state":"unknown","detail":"controller response unavailable; stable intent must never be replayed as new"}
         store.receipt(self.generation,owner,shell,cid,result)
         return result
