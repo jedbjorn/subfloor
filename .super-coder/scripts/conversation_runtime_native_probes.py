@@ -47,6 +47,7 @@ from conversation_runtime_contract import (
     RuntimeDriver,
     RuntimeEvent,
     RuntimeIdentity,
+    StartupConsent,
     WriteReceipt,
     payload_digest,
 )
@@ -66,6 +67,9 @@ class OwnedProbe:
     observe_marker: Callable[[str, float], bool] | None = None
     process_identity: Callable[[int], ProcessIdentity | None] | None = None
     on_identity: Callable[[RuntimeIdentity], None] | None = None
+    # The owner presents this exact finite probe generation to the operator.
+    # This notification neither confirms consent nor transfers it to a chat.
+    on_setup: Callable[[StartupConsent | None], None] | None = None
 
 
 def _timeout(deadline: float, limit: float = 5) -> float:
@@ -109,6 +113,39 @@ class ControllerProbeDriver(RuntimeDriver):
         self._deadline = 0.0
         self._sequence = 0
         self._validator: RuntimeValidator | None = None
+        self._ready = False
+        self._started = False
+        self._setup: StartupConsent | None = None
+
+    def _capture_identity(self, value: Mapping[str, Any]) -> None:
+        fields = _known(RuntimeIdentity, value)
+        if fields.get("process") is not None:
+            fields["process"] = ProcessIdentity(**_known(ProcessIdentity, fields["process"]))
+        identity = RuntimeIdentity(**fields)
+        if not isinstance(identity.root_id, str) or not 1 <= len(identity.root_id) <= 255:
+            raise RuntimeContractError("PROBE_IDENTITY_INVALID", "captured native root required")
+        with self._lock:
+            if self.identity is not None and (identity.root_id != self.identity.root_id
+                    or identity.process != self.identity.process):
+                raise RuntimeContractError("PROBE_IDENTITY_INVALID", "captured root/process changed")
+            self.identity = identity
+            if self._validator is None:
+                self._validator = RuntimeValidator(identity.root_id, harness=self.harness)
+
+    def _publish_setup(self, value: Mapping[str, Any] | None) -> None:
+        setup = StartupConsent(**_known(StartupConsent, value)) if value is not None else None
+        context = self.owned.context
+        if setup is not None and (self.harness != "claude" or setup.generation_id != context.generation_id
+                or setup.executable_sha256 != context.executable.sha256
+                or setup.driver_revision != context.driver_revision):
+            raise RuntimeContractError("PROBE_SETUP_INVALID", "setup differs from captured probe generation")
+        with self._lock:
+            if self._closing:
+                setup = None
+            if setup != self._setup:
+                self._setup = setup
+                if self.owned.on_setup is not None:
+                    self.owned.on_setup(setup)
 
     def _attach(self, deadline: float) -> None:
         owned = self.owned
@@ -119,8 +156,9 @@ class ControllerProbeDriver(RuntimeDriver):
 
     def start(self, context: RuntimeContext, emit: EventSink, *, deadline: float) -> DriverStart:
         with self._lock:
-            if self._closing or context != self.owned.context or self._reader is not None:
+            if self._closing or context != self.owned.context or self._started:
                 return DriverStart("unavailable", detail="owned probe binding/start gate differs")
+            self._started = True
             self._emit, self._deadline = emit, deadline
         self._attach(deadline)
         data = dataclasses.asdict(context)
@@ -128,23 +166,52 @@ class ControllerProbeDriver(RuntimeDriver):
             data[key] = str(data[key]) if data[key] is not None else None
         data["executable"]["path"] = str(data["executable"]["path"])
         data["managed_mcp_files"] = [str(path) for path in data["managed_mcp_files"]]
+        with self._lock:
+            if self._closing:
+                return DriverStart("unknown", detail="owned cleanup fenced Open")
         result = self.owned.client.request("open", timeout=_timeout(deadline, 120), context=data)
-        identity = result.get("identity")
-        if identity is not None:
-            fields = _known(RuntimeIdentity, identity)
-            if fields.get("process") is not None:
-                fields["process"] = ProcessIdentity(**_known(ProcessIdentity, fields["process"]))
-            self.identity = RuntimeIdentity(**fields)
-            self._validator = RuntimeValidator(self.identity.root_id, harness=self.harness)
+        if result.get("identity") is not None:
+            self._capture_identity(result["identity"])
         with self._lock:
             if self._closing:
                 return DriverStart("unknown", self.identity, detail="owned cleanup fenced startup")
             self._reader = threading.Thread(target=self._drain, name="owned-native-probe-events", daemon=True)
             self._reader.start()
-        if result.get("state") == "ready" and self.identity is not None and self.owned.on_identity is not None:
-            self.owned.on_identity(dataclasses.replace(self.identity, protocol=copy.deepcopy(self.identity.protocol)))
-        return DriverStart(result.get("state", "unknown"), self.identity,
-                           result.get("detail", ""), result.get("capabilities", {}))
+        # Open is submitted once. A consent acknowledgement is never readiness:
+        # wait only on this already-owned controller's actual ready observation.
+        try:
+            while True:
+                with self._lock:
+                    if self._closing:
+                        return DriverStart("unknown", self.identity, detail="owned cleanup fenced startup")
+                if result.get("identity") is not None:
+                    self._capture_identity(result["identity"])
+                ready = result.get("state") == "ready" or result.get("ready") is True
+                if result.get("lost") is True:
+                    return DriverStart("unavailable", self.identity, detail="owned native readiness lost")
+                if ready and self.identity is not None:
+                    self._publish_setup(None)
+                    with self._lock:
+                        if self._closing:
+                            return DriverStart("unknown", self.identity, detail="owned cleanup fenced readiness")
+                        self._ready = True
+                        if self.owned.on_identity is not None:
+                            self.owned.on_identity(dataclasses.replace(self.identity, protocol=copy.deepcopy(self.identity.protocol)))
+                        if self._closing:
+                            return DriverStart("unknown", self.identity, detail="owned cleanup fenced readiness")
+                    return DriverStart("ready", self.identity, capabilities=result.get("capabilities", {}))
+                if result.get("state") == "unavailable":
+                    return DriverStart("unavailable", self.identity, detail="owned native readiness unavailable")
+                self._publish_setup(result.get("setup"))
+                if self._stop.wait(min(.1, _timeout(deadline, .1))):
+                    return DriverStart("unknown", self.identity, detail="owned cleanup withdrew startup")
+                result = self.owned.client.request("status", timeout=_timeout(deadline))
+                if result.get("generation") != context.generation_id:
+                    raise RuntimeContractError("PROBE_SETUP_INVALID", "private status generation changed")
+        except TimeoutError:
+            return DriverStart("unknown", self.identity, detail="finite account/consent readiness expired")
+        finally:
+            self._publish_setup(None)
 
     def _drain(self) -> None:
         while not self._stop.is_set() and time.monotonic() < self._deadline:
@@ -187,7 +254,7 @@ class ControllerProbeDriver(RuntimeDriver):
 
     def _dispatch(self, cid: str, kind: str, payload: Mapping[str, Any], deadline: float) -> dict:
         with self._lock:
-            if self._closing and kind != "close":
+            if (self._closing or not self._ready) and kind != "close":
                 return {"state": "not_written", "detail": "owned cleanup fenced new intent"}
             _timeout(deadline)
             command = self.owned.store.intent(self.owned.context.generation_id, self.owned.owner_user_id,
@@ -230,6 +297,9 @@ class ControllerProbeDriver(RuntimeDriver):
     def cleanup(self, *, deadline: float) -> NativeCleanup:
         with self._lock:
             self._closing = True
+            self._ready = False
+            self._stop.set()
+            self._publish_setup(None)
         result = self._dispatch("probe-close", "close", {"action": "close"}, deadline)
         self._stop.set()
         if self._reader is not None:
@@ -387,7 +457,9 @@ class _Scenarios:
             policy = {}
         memory = (policy.get("generate_memories") is False and policy.get("use_memories") is False
                   and policy.get("feature_enabled") is False and policy.get("root_mode") == "disabled"
-                  if self.driver.harness == "codex" else policy.get("disabled") is True)
+                  if self.driver.harness == "codex" else False)
+        # Claude has no observed public effective-memory field. Its evidence
+        # level remains unresolved; a made-up disabled flag cannot admit input.
         route = root.protocol.get("native_route", {}) if root else {}
         route_observed = (isinstance(route, dict) and route.get("model") == self.owned.context.model
                           and route.get("account_type") == "chatgpt"
@@ -395,7 +467,9 @@ class _Scenarios:
                           and (self.owned.context.effort in {None, "default"} or self.owned.context.effort in route["efforts"])
                           if self.driver.harness == "codex" else isinstance(route, dict)
                           and route.get("model") == self.owned.context.model
-                          and route.get("account_type") == "subscription")
+                          and route.get("account_type") == "claude.ai"
+                          and isinstance(route.get("efforts"), list)
+                          and self.owned.context.effort in route["efforts"])
         grants = self.owned.context.probe_capabilities
         if (not memory or not route_observed or root is None or self.owned.observe_marker is None
                 or CAP_SUBMISSION not in grants):
