@@ -288,6 +288,17 @@ def test_account_observation_consumes_only_bounded_public_route_enums():
             runtime._parse_auth_status(raw, 0)
 
 
+def test_account_spawn_failure_preserves_only_static_diagnostic(seat, monkeypatch):
+    _, context, _ = seat
+    def spawn(*args, **kwargs):
+        raise OSError("private account/path sentinel")
+    monkeypatch.setattr(runtime.subprocess, "Popen", spawn)
+    with pytest.raises(RuntimeContractError) as caught:
+        runtime._auth_status(context, {}, DEADLINE())
+    assert caught.value.code == "NATIVE_ACCOUNT_INCONCLUSIVE"
+    assert str(caught.value) == "native account observation unavailable"
+
+
 @pytest.mark.parametrize("failure", ["oversized", "deadline"])
 def test_fixed_auth_process_output_and_deadline_are_bounded_and_owned_child_is_reaped(seat, monkeypatch, failure):
     _, context, _ = seat
