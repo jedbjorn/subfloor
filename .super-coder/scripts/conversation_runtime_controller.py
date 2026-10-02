@@ -325,7 +325,7 @@ class Controller:
                 raise RuntimeContractError("OWNERSHIP_INVALID", "event is outside captured native root")
             self.journal.emit(event)
             if event.kind=='runtime.setup' and not self.journal.get('close') and not self.ready:
-                if event.freshness=='current' and not event.partial:
+                if event.freshness=='current' and not event.partial and event.grade!='inconclusive':
                     self.capture_setup(StartupConsent(**event.data))
                 else:
                     self.journal.set('setup',None)
