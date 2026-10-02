@@ -20,6 +20,7 @@ from conversation_native_chats import NativeChatsService
 from conversation_runtime import RuntimeClient
 from conversation_runtime_contract import (
     NativeReference,
+    NativeSnapshot,
     RuntimeContractError,
     RuntimeEvent,
 )
@@ -74,6 +75,17 @@ def native(database, controller, monkeypatch):
         def request(self, op, **fields):
             return ctl.handle(wire(op, **fields))
 
+    driver.inventory = lambda **fields: NativeSnapshot(
+        ctl.identity,
+        NativeReference(
+            "root", thread_id="root", activity_id=ctl.journal.get("primary")
+        )
+        if ctl.journal.get("primary")
+        else None,
+        freshness="current",
+        partial=False,
+        primary_state="active" if ctl.journal.get("primary") else "idle",
+    )
     client = Client()
     service.attach = lambda generation: (client, 1, 1)
     monkeypatch.setattr(conversation_native_chats, "_SERVICE", service)
@@ -560,3 +572,63 @@ def test_lost_controller_no_write_does_not_restore_false_ready(native):
         == "lost"
     )
     assert not n.cleanups and not sprint_native_wakes.released(n.con, "cv")
+
+
+@pytest.mark.parametrize(
+    "kind", ["activity.started", "activity.processed", "activity.terminal"]
+)
+def test_missing_root_activity_identity_is_not_quiet(controller, kind):
+    owner, _ = controller
+    owner.emit(
+        RuntimeEvent(
+            kind,
+            NativeReference("root", thread_id="root"),
+            partial=True,
+            grade="inconclusive",
+        )
+    )
+    assert owner.status()["quiet"]["idle"] is False
+    assert (
+        owner.handle(wire("close", command=conditional(owner)))["state"]
+        == "not_written"
+    )
+
+
+def test_root_snapshot_uncertainty_requires_fresh_attributable_reconciliation(
+    controller,
+):
+    owner, driver = controller
+    driver.inventory = lambda **fields: NativeSnapshot(
+        owner.identity, None, freshness="current", partial=True, primary_state="unknown"
+    )
+    owner.handle(wire("snapshot"))
+    assert not owner.status()["quiet"]["idle"]
+    old_epoch = owner.status()["quiet"]["epoch"]
+    driver.inventory = lambda **fields: NativeSnapshot(
+        owner.identity, None, freshness="stale", partial=False, primary_state="idle"
+    )
+    owner.handle(wire("snapshot"))
+    assert not owner.status()["quiet"]["idle"]
+    driver.inventory = lambda **fields: NativeSnapshot(
+        owner.identity, None, freshness="current", partial=True, primary_state="idle"
+    )
+    owner.handle(wire("snapshot"))
+    # Explicit current root idle can coexist with partial background inventory.
+    quiet = owner.status()["quiet"]
+    assert quiet["idle"] and quiet["epoch"] > old_epoch
+    assert (
+        owner.handle(wire("close", command=conditional(owner, seconds=10)))["state"]
+        == "not_written"
+    )
+
+
+def test_foreign_or_active_missing_identity_snapshot_cannot_clear_unknown(controller):
+    owner, driver = controller
+    for identity, state in [(None, "idle"), (owner.identity, "active")]:
+        driver.inventory = lambda identity=identity, state=state, **fields: (
+            NativeSnapshot(
+                identity, None, freshness="current", partial=False, primary_state=state
+            )
+        )
+        owner.handle(wire("snapshot"))
+        assert not owner.status()["quiet"]["idle"]
