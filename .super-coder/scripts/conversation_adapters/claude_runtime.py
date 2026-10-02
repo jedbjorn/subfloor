@@ -102,9 +102,12 @@ def _auth_status(context: RuntimeContext, env: Mapping[str, str], deadline: floa
     limit = min(deadline, time.monotonic() + 3)
     if time.monotonic() >= limit:
         raise RuntimeContractError("NATIVE_ACCOUNT_INCONCLUSIVE", "native account observation deadline expired")
-    process = subprocess.Popen(context.execution_argv([str(context.executable.path), "auth", "status", "--json"]),
-        cwd=context.worktree, env=dict(env), stdin=subprocess.DEVNULL,
-        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    try:
+        process = subprocess.Popen(context.execution_argv([str(context.executable.path), "auth", "status", "--json"]),
+            cwd=context.worktree, env=dict(env), stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    except OSError as exc:
+        raise RuntimeContractError("NATIVE_ACCOUNT_INCONCLUSIVE", "native account observation unavailable") from exc
     data = bytearray()
     try:
         assert process.stdout is not None
