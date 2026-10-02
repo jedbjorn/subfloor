@@ -91,6 +91,7 @@ class FixtureNativeCheck:
         self.service=conversation_native_chats.NativeChatsService(database,root,supervisor)
         self.owner=NativeProbeOwner(self.seat,self.service)
         self.factory=NativeProbeFactory(self.owner.allocate,self.owner.cleanup)
+        self.service.probe_delegate=self.consume_probe
         self.checker=CompatibilityChecker(cache=self.cache)
         self.lock=threading.RLock()
         self.future: Future[CheckResult] | None=None
@@ -101,6 +102,41 @@ class FixtureNativeCheck:
         self.cancelling=False
         from conversation_native_checks import NativeChecks
         self.workflow=NativeChecks(self)
+
+    def consume_probe(self,cid: str,generation: str) -> bool:
+        """The current factory retains its reader; restart only reconciles ownership."""
+        con=db_driver.connect(str(self.database))
+        try:
+            job=con.execute('SELECT * FROM conversation_runtime_probe_jobs WHERE conversation_id=? AND generation_id=?',(cid,generation)).fetchone()
+            chat=con.execute('SELECT c.*,s.user_id AS shell_owner FROM conversations c JOIN shells s USING(shell_id) WHERE conversation_id=?',(cid,)).fetchone()
+            runtime=json.loads(chat['runtime_projection']) if chat else {}
+            if (job is None or chat is None or chat['owner_user_id']!=1 or chat['shell_owner']!=1
+                    or chat['runtime_mode']!='native_experiment' or runtime.get('role')!='probe'
+                    or runtime.get('generation_id')!=generation):
+                raise RuntimeContractError('PROBE_INVALID','probe reconciliation is outside captured tenancy')
+            captured=con.execute('SELECT state,cleanup_json FROM conversation_runtime_generations WHERE generation_id=? AND conversation_id=? AND owner_user_id=1 AND shell_id=?',(generation,cid,chat['shell_id'])).fetchone()
+        finally:
+            con.close()
+        with self.lock:
+            active=(self.fingerprint is not None and self.fingerprint.key==job['fingerprint_key']
+                    and (self.future is not None and not self.future.done() or self.cancelling))
+            if active:
+                if runtime.get('state')=='closing':
+                    self.cancel()
+                return True
+        if runtime.get('state')=='closing' and captured is None and runtime.get('preparation_owner'):
+            self.service.recover_preparation(cid,runtime)
+            return True
+        native_cleanup=json.loads(captured['cleanup_json']) if captured else {}
+        preparation=runtime.get('preparation_cleanup') or {}
+        complete=(runtime.get('state')=='closed' and chat['state']=='closed'
+                  and (captured is not None and captured['state']=='closed'
+                       and native_cleanup.get('outcome')=='complete' and native_cleanup.get('unit_verified_exited') is True
+                       and not native_cleanup.get('unresolved_work') and not native_cleanup.get('unresolved_definitions')
+                       or captured is None and preparation.get('unit_verified_exited') is True and preparation.get('never_launched') is True))
+        if complete:
+            self.owner.completed_key(job['fingerprint_key'],cid,generation)
+        return False
 
     def begin(self, *, on_candidate=None) -> dict:
         with self.lock:

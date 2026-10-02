@@ -177,11 +177,12 @@ class NativeChatsService:
     executable endpoint. A restart attaches captured live generations instead
     of reconstructing their context or replaying ambiguous submissions.
     """
-    def __init__(self, database: Path, root: Path, supervisor, *, prepare_context=None, resolve_route=None):
+    def __init__(self, database: Path, root: Path, supervisor, *, prepare_context=None, resolve_route=None, probe_delegate=None):
         self.database, self.root, self.supervisor = database, root, supervisor
         self.store = RuntimeStore(database)
         self.prepare_context = prepare_context
         self.route_resolver = resolve_route
+        self.probe_delegate = probe_delegate
         self.consumer = uuid.uuid4().hex
         self.clients: dict[str,tuple[RuntimeClient,int,int]] = {}
         self.lock = threading.RLock()
@@ -446,6 +447,8 @@ class NativeChatsService:
                 generation = runtime.get('generation_id')
                 if not generation or generation!=body['generation_id'] or runtime.get('state') in {'closing','closed','lost'}:
                     raise RuntimeContractError('GENERATION_INVALID','control is stale or outside the current native generation')
+                if runtime.get('role')=='probe' and runtime.get('check_deadline',0)<=time.time():
+                    raise RuntimeContractError('PROBE_EXPIRED','finite probe action expired; Close remains available')
                 generation_row = con.execute('SELECT * FROM conversation_runtime_generations WHERE generation_id=? AND conversation_id=? AND owner_user_id=?',(generation,cid,owner)).fetchone()
                 if generation_row is None or generation_row['close_intent']:
                     raise RuntimeContractError('RUNTIME_CLOSING','Close fences subsequent controls')
@@ -494,6 +497,10 @@ class NativeChatsService:
                 con.execute('UPDATE conversation_runtime_generations SET next_command_sequence=next_command_sequence+1 WHERE generation_id=?',(generation,))
                 con.execute('INSERT INTO conversation_runtime_http_requests VALUES(?,?,?,?,?)',(cid,key,request_hash,generation,command_id))
                 command_row = con.execute('SELECT * FROM conversation_runtime_commands WHERE generation_id=? AND command_id=?',(generation,command_id)).fetchone()
+        edge=con.execute('SELECT runtime_projection FROM conversations WHERE conversation_id=? AND owner_user_id=?',(cid,owner)).fetchone()
+        edge_runtime=json.loads(edge[0]) if edge else {}
+        if edge_runtime.get('role')=='probe' and edge_runtime.get('check_deadline',0)<=time.time():
+            raise RuntimeContractError('PROBE_EXPIRED','finite probe action expired before dispatch; Close remains available')
         client,actual_owner,shell = self.attach(generation)
         if actual_owner!=owner:
             raise RuntimeContractError('RUNTIME_NOT_OWNED','controller consumer differs from operator tenancy')
@@ -536,17 +543,35 @@ class NativeChatsService:
                 self._finish_chat(con,cid)
                 return
             gid = generation['generation_id']
-            control_id = 'close:'+gid
+            projection=json.loads(chat['runtime_projection'])
+            if projection.get('generation_id')!=gid:
+                raise RuntimeContractError('GENERATION_INVALID','Close must match the retained chat generation')
+            probe=projection.get('role')=='probe'
+            control_id = 'probe-close' if probe else 'close:'+gid
             existing = con.execute('SELECT 1 FROM conversation_runtime_commands WHERE generation_id=? AND command_id=?',(gid,control_id)).fetchone()
             if existing is None:
-                command = {'control_id':control_id,'request_sequence':generation['next_command_sequence'],'action':'close','target':None,'expected_activity_id':None,'options':{}}
+                command = {'control_id':control_id,'request_sequence':generation['next_command_sequence'],'action':'close'}
+                if not probe:
+                    command.update(target=None,expected_activity_id=None,options={})
                 digest = payload_digest(command)
                 con.execute("INSERT INTO conversation_runtime_commands(generation_id,command_id,command_sequence,kind,payload_digest,intent_json) VALUES(?,?,?,'control',?,?)",(gid,control_id,command['request_sequence'],digest,encoded(command)))
-                con.execute("UPDATE conversation_runtime_generations SET close_intent=1,state='closing',next_command_sequence=next_command_sequence+1,updated_at=? WHERE generation_id=?",(time.time(),gid))
-                projection = json.loads(chat['runtime_projection'])
+                con.execute("UPDATE conversation_runtime_generations SET next_command_sequence=next_command_sequence+1 WHERE generation_id=?",(gid,))
+            if generation['state']!='closed':
+                con.execute("UPDATE conversation_runtime_generations SET close_intent=1,state='closing',updated_at=? WHERE generation_id=?",(time.time(),gid))
                 projection.update(state='closing',setup=None)
                 con.execute('UPDATE conversations SET runtime_projection=?,version=version+1 WHERE conversation_id=?',(encoded(projection),cid))
                 append_event(con,cid,'conversation.close.requested',{'generation_id':gid,'scope':'owned native generation','cleanup':'pending'})
+
+    def close_id(self,generation: str,cid: str) -> str:
+        con=db_driver.connect(str(self.database))
+        try:
+            row=con.execute('SELECT runtime_projection FROM conversations WHERE conversation_id=?',(cid,)).fetchone()
+            runtime=json.loads(row[0]) if row else {}
+            if runtime.get('generation_id')!=generation:
+                raise RuntimeContractError('GENERATION_INVALID','Close is outside the retained chat generation')
+            return 'probe-close' if runtime.get('role')=='probe' else 'close:'+generation
+        finally:
+            con.close()
 
     @staticmethod
     def _finish_chat(con,cid: str) -> None:
@@ -565,9 +590,10 @@ class NativeChatsService:
             append_event(con,cid,'conversation.closed',{'status':'closed','reason':'native generation cleanup verified'})
 
     def close_generation(self,generation: str,cid: str,client: RuntimeClient,owner: int,shell: int) -> None:
+        control_id=self.close_id(generation,cid)
         con = db_driver.connect(str(self.database))
         try:
-            row = con.execute("SELECT * FROM conversation_runtime_commands WHERE generation_id=? AND command_id=?",(generation,'close:'+generation)).fetchone()
+            row = con.execute("SELECT * FROM conversation_runtime_commands WHERE generation_id=? AND command_id=?",(generation,control_id)).fetchone()
         finally:
             con.close()
         if row is None or row['state']!='accepted':
@@ -579,12 +605,12 @@ class NativeChatsService:
             native_cleanup = {'outcome':'inconclusive','delivery_unknown':True,'detail':'native cleanup deadline/transport inconclusive'}
         # Record ambiguity before any OS fallback. Never rerun an unknown
         # control under a fresh identity after API death or a lost reply.
-        self.store.receipt(generation,owner,shell,'close:'+generation,{'state':'unknown' if native_cleanup.get('delivery_unknown') else 'written','native_cleanup':native_cleanup})
+        self.store.receipt(generation,owner,shell,control_id,{'state':'unknown' if native_cleanup.get('delivery_unknown') else 'written','native_cleanup':native_cleanup})
         try:
             client.subscribe(self.store,owner,shell,project=project_event)
         except (OSError,RuntimeContractError):
             pass
-        retained = self.store.command_status(generation,owner,shell,'close:'+generation)['receipt']
+        retained = self.store.command_status(generation,owner,shell,control_id)['receipt']
         if retained.get('state')=='terminal' and retained.get('outcome'):
             native_cleanup = retained
         self.finish_cleanup(generation,cid,owner,shell,native_cleanup)
@@ -596,7 +622,7 @@ class NativeChatsService:
         absent native proof remains pending even when the unit is now gone.
         """
         try:
-            retained = self.store.command_status(generation,owner,shell,'close:'+generation)['receipt']
+            retained = self.store.command_status(generation,owner,shell,self.close_id(generation,cid))['receipt']
         except RuntimeContractError:
             retained = {}
         native_cleanup = retained if retained.get('state')=='terminal' else retained.get('native_cleanup',{})
@@ -648,7 +674,7 @@ class NativeChatsService:
                 con.execute('UPDATE conversation_runtime_generations SET state=?,cleanup_json=?,updated_at=? WHERE generation_id=?',('closed' if complete else 'lost',encoded(cleanup),time.time(),generation))
                 projection.update(state='closed' if complete else 'lost',cleanup=cleanup,setup=None,primary=None)
                 con.execute('UPDATE conversations SET runtime_projection=?,version=version+1 WHERE conversation_id=?',(encoded(projection),cid))
-                append_event(con,cid,'control.outcome',{'generation_id':generation,'control_id':'close:'+generation,**cleanup})
+                append_event(con,cid,'control.outcome',{'generation_id':generation,'control_id':'probe-close' if projection.get('role')=='probe' else 'close:'+generation,**cleanup})
                 if complete:
                     self._finish_chat(con,cid)
         finally:
@@ -687,13 +713,23 @@ class NativeChatsService:
             self.schedule_starts()
             con = db_driver.connect(str(self.database))
             try:
-                rows = con.execute("SELECT g.generation_id,g.conversation_id,g.state,g.cleanup_json,g.owner_user_id,g.shell_id FROM conversation_runtime_generations g JOIN conversations c USING(conversation_id) WHERE c.runtime_mode='native_experiment' AND (g.state!='closed' OR c.state!='closed') ORDER BY g.created_at LIMIT 4").fetchall()
+                provisional=con.execute("SELECT c.conversation_id,j.generation_id FROM conversation_runtime_probe_jobs j JOIN conversations c USING(conversation_id) WHERE j.status!='complete' AND c.runtime_mode='native_experiment' AND json_extract(c.runtime_projection,'$.role')='probe'").fetchall()
+                rows = con.execute("SELECT g.generation_id,g.conversation_id,g.state,g.cleanup_json,g.owner_user_id,g.shell_id,c.runtime_projection FROM conversation_runtime_generations g JOIN conversations c USING(conversation_id) WHERE c.runtime_mode='native_experiment' AND (g.state!='closed' OR c.state!='closed') ORDER BY g.created_at LIMIT 4").fetchall()
             finally:
                 con.close()
+            if self.probe_delegate:
+                for row in provisional:
+                    try:
+                        self.probe_delegate(row['conversation_id'],row['generation_id'])
+                    except (RuntimeContractError,OSError):
+                        pass # Retain ownership when reconciliation is unavailable.
             for row in rows:
                 if self.stopped.is_set():
                     break
                 try:
+                    if (json.loads(row['runtime_projection']).get('role')=='probe' and self.probe_delegate
+                            and self.probe_delegate(row['conversation_id'],row['generation_id'])):
+                        continue # One factory owns its continuous reader/ack.
                     if row['state']=='closed':
                         # Retained verified evidence also repairs a chat from
                         # older interrupted finalization; no controller attach
@@ -705,7 +741,7 @@ class NativeChatsService:
                     client,owner,shell = self.attach(row['generation_id'])
                     generation_state = self.store.status(row['generation_id'],owner,shell)
                     if generation_state['close_intent']:
-                        command_state = self.store.command_status(row['generation_id'],owner,shell,'close:'+row['generation_id'])['state']
+                        command_state = self.store.command_status(row['generation_id'],owner,shell,self.close_id(row['generation_id'],row['conversation_id']))['state']
                         if command_state=='accepted':
                             self.close_generation(row['generation_id'],row['conversation_id'],client,owner,shell)
                         else:

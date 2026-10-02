@@ -219,7 +219,24 @@ class NativeChecks:
                     if con.execute("SELECT 1 FROM conversation_runtime_check_requests WHERE check_id!=? AND status!='complete' LIMIT 1",(target,)).fetchone() or con.execute("SELECT 1 FROM conversation_runtime_probe_jobs WHERE status!='complete' LIMIT 1").fetchone():
                         result['retry_allowed']=False
                 if self.current!=target and row['status']!='complete':
-                    result['probe'],_=self._owned_probe(con,row,json.loads(row['result_json']))
+                    result['probe'],binding=self._owned_probe(con,row,json.loads(row['result_json']))
+                    probe=result['probe']
+                    cleanup=probe.get('cleanup') or {} if probe else {}
+                    with self.operation.owner.lock:
+                        released=(result.get('fingerprint') not in self.operation.owner.allocating
+                                  and result.get('fingerprint') not in self.operation.owner.closing)
+                    if (probe and probe['status']=='complete' and probe['phase']=='closed' and released
+                            and cleanup.get('unit_verified_exited') is True
+                            and (cleanup.get('native_outcome')=='complete' or cleanup.get('never_launched') is True)
+                            and not cleanup.get('unresolved_work') and not cleanup.get('unresolved_definitions')):
+                        # Cleanup recovery is not a recovered behavior pass.
+                        # No prompt, check, or ordinary admission is replayed.
+                        result.update(state='complete',admissible=False,retry_allowed=True,grades={},
+                            diagnostics=[{'code':'CHECK_CLEANUP_RECONCILED','grade':'inconclusive'}])
+                        persisted={key:item for key,item in result.items() if key not in {'check_id','request_key','selection','state'}}
+                        persisted['probe_binding']=binding
+                        self._save(target,'complete',persisted)
+                        return result
                     result.update(state='retained',admissible=False,retry_allowed=False,
                                   diagnostics=[{'code':'CHECK_CONSUMER_RESTARTED','grade':'inconclusive'}])
                 return result
