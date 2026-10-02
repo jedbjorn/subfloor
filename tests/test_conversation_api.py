@@ -291,6 +291,36 @@ class ConversationApiCase(unittest.TestCase):
             status,_,invalid=self.request('GET','/api/conversations?'+query)
             self.assertEqual(status,422,invalid)
 
+    def test_native_check_config_is_unavailable_without_fixture_and_owned_readback_is_get_only(self):
+        import gui_experiment_runtime
+        with mock.patch.object(gui_experiment_runtime,'_FIXTURE',None):
+            status,_,config=self.request('GET','/api/conversations/native-config')
+            self.assertEqual(status,200,config)
+            self.assertFalse(config['enabled'])
+            status,_,missing=self.request('GET','/api/conversations/native-checks?request_key=key')
+            self.assertEqual(status,409,missing)
+        check_id='nc_'+'a'*32
+        calls=[]
+        class Workflow:
+            def config(self):return {'enabled':True,'candidates':[]}
+            def create(self,owner,key,body):
+                calls.append((owner,key,body));return {'check_id':check_id,'admissible':False}
+            def get(self,owner,**lookup):
+                calls.append((owner,lookup));return {'check_id':check_id,'admissible':False}
+        with mock.patch.object(gui_experiment_runtime,'_FIXTURE',SimpleNamespace(workflow=Workflow())):
+            status,_,accepted=self.request('POST','/api/conversations/native-checks',
+                body={'harness':'codex','model':'gpt-6.1-sol','effort':'high'},key='stable')
+            self.assertEqual(status,202,accepted)
+            status,_,readback=self.request('GET','/api/conversations/native-checks?request_key=stable')
+            self.assertEqual(status,200,readback)
+            status,_,detail=self.request('GET','/api/conversations/native-checks/'+check_id)
+            self.assertEqual(status,200,detail)
+            self.assertEqual(calls[1],(1,{'request_key':'stable'}))
+            self.assertEqual(calls[2],(1,{'check_id':check_id}))
+            status,_,invalid=self.request('GET','/api/conversations/native-checks?request_key=one&request_key=two')
+            self.assertEqual(status,422,invalid)
+            self.assertEqual(len(calls),3)
+
     def test_native_control_shapes_are_finite_and_validate_before_service_dispatch(self):
         import conversation_native_chats
         cid=self.create()['conversation_id']
