@@ -578,3 +578,17 @@ def test_owned_synthetic_hook_captures_pointer_privately_only(context,tmp_path,m
     assert json.loads((context.state_root/'claude-setup-transcript.json').read_text())['path']==str(path)
     # Missing exact file remains inconclusive, despite actual owned hook.
     assert setup.transcript_turn_evidence(context.state_root,deadline=time.monotonic()+2)['state']=='inconclusive'
+
+
+@pytest.mark.parametrize('field,value',[('isSidechain','true'),('isSidechain',1),('isSidechain',None),('sessionId',None),('cwd',None)])
+def test_malformed_consumed_transcript_attribution_stays_inconclusive(transcript,field,value):
+    context,_binding,path,row=transcript
+    with path.open('a') as out:out.write(json.dumps(row|{field:value})+'\n')
+    result=setup.transcript_turn_evidence(context.state_root,deadline=time.monotonic()+2)
+    assert result['state']=='inconclusive' and 'zero_turn_records' not in result
+
+
+def test_explicit_root_false_transcript_attribution_is_observed(transcript):
+    context,_binding,path,row=transcript
+    path.write_text(json.dumps(row|{'isSidechain':False})+'\n')
+    assert setup.transcript_turn_evidence(context.state_root,deadline=time.monotonic()+2)['zero_turn_records'] is True

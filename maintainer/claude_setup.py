@@ -307,9 +307,9 @@ def transcript_turn_evidence(state: Path, *, deadline: float) -> dict[str,Any]:
             row=json.loads(line)
             if not isinstance(row,dict) or row.get('type') not in known:return failure
             if row['type']=='system' and row.get('subtype') not in {'init','local_command','turn_duration'}:return failure
-            if row.get('sessionId') is not None and row['sessionId']!=binding['session_id']:return failure
-            if row.get('cwd') is not None and row['cwd']!=binding['worktree']:return failure
-            if row.get('isSidechain') is True:return failure
+            if 'sessionId' in row and row['sessionId']!=binding['session_id']:return failure
+            if 'cwd' in row and row['cwd']!=binding['worktree']:return failure
+            if 'isSidechain' in row and (type(row['isSidechain']) is not bool or row['isSidechain']):return failure
             bound=row.get('sessionId')==binding['session_id'] and row.get('cwd')==binding['worktree']
             if row['type'] in {'user','assistant'}:
                 if not bound or not isinstance(row.get('message'),dict):return failure
