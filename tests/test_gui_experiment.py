@@ -76,6 +76,35 @@ def missing_state():
     return {"LoadState": "not-found", "ActiveState": "inactive", "MainPID": "0"}
 
 
+def test_api_recovery_refuses_surviving_preparation_helpers_before_replacement(seat,monkeypatch):
+    record,_,receipt=marked(seat)
+    record.update(status='serving',main_pid=123,main_pid_start_ticks=456,control_group='/owned-api-group')
+    fixture.save(record,receipt)
+    monkeypatch.setattr(fixture,'unit_state',lambda record:missing_state())
+    monkeypatch.setattr(fixture,'process_start_ticks',lambda pid:None)
+    monkeypatch.setattr(fixture,'cgroup_pids',lambda group:[789])
+    monkeypatch.setattr(fixture,'launch_api',lambda *args,**kwargs:pytest.fail('surviving preparation helper must block replacement'))
+    with pytest.raises(fixture.FixtureError,match='helpers remain'):
+        fixture.restart_api(receipt)
+    assert not fixture.read_json(receipt).get('api_exit_proofs')
+
+
+def test_preparation_release_requires_trusted_matching_api_exit_proof(seat,monkeypatch):
+    record,_,receipt=marked(seat)
+    identity={'pid':123,'start_ticks':456,'unit':record['unit'],'control_group':'/owned-api-group'}
+    supervisor=fixture.NativeSupervisor(receipt)
+    monkeypatch.setattr(fixture,'process_start_ticks',lambda pid:None)
+    assert not supervisor.preparation_exited(identity)
+    record['api_exit_proofs']=[{'identity':identity,'cgroup_empty':False}]
+    fixture.save(record,receipt)
+    assert not supervisor.preparation_exited(identity)
+    record['api_exit_proofs'][0]['cgroup_empty']=True;fixture.save(record,receipt)
+    assert supervisor.preparation_exited(identity)
+    assert not supervisor.preparation_exited(identity|{'unit':'unrelated.service'})
+    monkeypatch.setattr(fixture,'process_start_ticks',lambda pid:456)
+    assert not supervisor.preparation_exited(identity)
+
+
 def test_archive_excludes_dirty_edits_and_moving_ref(seat):
     repo = source_repo(seat)
     sha, archive = fixture.archive(repo, "HEAD")

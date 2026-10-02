@@ -1,5 +1,6 @@
 """Native ownership outlives foreground/API/registry projection state."""
 import dataclasses
+import contextlib
 import json
 import sqlite3
 import sys
@@ -91,6 +92,7 @@ def test_preparation_returns_persisted_identity_and_close_fences_late_start(data
     entered,release,cleaned=threading.Event(),threading.Event(),threading.Event()
     class Supervisor:
         units=[]
+        def preparation_identity(self): return {'pid':123,'start_ticks':456,'unit':'owned-api','control_group':'owned-cgroup'}
         def inventory(self): return self.units
         def stop(self,generation):
             assert generation==self.units[0]['generation_id']
@@ -132,21 +134,46 @@ def test_restart_reconciles_never_launched_preparation_only_after_owner_exit(dat
     con.execute("UPDATE conversations SET runtime_mode='native_experiment',runtime_projection=?",(json.dumps(runtime),));con.commit()
     class Supervisor:
         stopped=[]
+        exited=False
+        def preparation_exited(self,identity): return self.exited
         def inventory(self): return [{'generation_id':'provisional','status':'registered'}]
         def stop(self,generation):
             self.stopped.append(generation)
             return {'os_cleanup':{'complete':True}}
     supervisor=Supervisor()
     service=NativeChatsService(path,path.parent,supervisor)
-    monkeypatch.setattr('conversation_native_chats.start_ticks',lambda pid:456)
     service.recover_preparation('cv',runtime)
     assert not supervisor.stopped and run.browser_conversation_active(con,1)
-    monkeypatch.setattr('conversation_native_chats.start_ticks',lambda pid:457)
+    supervisor.exited=True
     service.recover_preparation('cv',runtime)
     assert supervisor.stopped==['provisional']
     assert con.execute('SELECT state FROM conversations').fetchone()[0]=='closed'
     assert not run.browser_conversation_active(con,1)
     service.shutdown()
+
+
+def test_start_admission_cannot_overwrite_concurrent_provisional_close(database,monkeypatch):
+    import db_driver
+    path,con=database
+    con.execute('DELETE FROM conversation_runtime_generations')
+    con.execute("UPDATE conversations SET runtime_mode='native_experiment'");con.commit()
+    original=db_driver.write_transaction
+    retained={'generation_id':'retained','state':'closing','preparation_owner':{'pid':123,'start_ticks':456}}
+    @contextlib.contextmanager
+    def inject_close(connection,operation,**kwargs):
+        if operation=='native_chat.start_intent':
+            con.execute('UPDATE conversations SET runtime_projection=?',(json.dumps(retained),));con.commit()
+        with original(connection,operation,**kwargs):
+            yield connection
+    monkeypatch.setattr(db_driver,'write_transaction',inject_close)
+    supervisor=SimpleNamespace(preparation_identity=lambda:{'pid':123,'start_ticks':456})
+    service=NativeChatsService(path,path.parent,supervisor,prepare_context=lambda *args:pytest.fail('concurrent Close must prevent preparation'))
+    try:
+        service.schedule_starts()
+        assert json.loads(con.execute('SELECT runtime_projection FROM conversations').fetchone()[0])==retained
+        assert not service.starting
+    finally:
+        service.shutdown()
 
 
 @pytest.mark.parametrize('database,root_thread', [('codex','root'),('claude',None)],indirect=['database'])
