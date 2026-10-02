@@ -664,7 +664,7 @@ class ClaudeRuntimeDriver(RuntimeDriver):
                     "claude:SubagentStop-agent_id", time.time(), grade="unverified", data=work.data)
                 self._send_event(RuntimeEvent("work.observed", reference=work.reference,
                     provenance="claude:SubagentStop-agent_id", grade="unverified",
-                    data={"state": "stop_hook_observed", "terminal": "unverified"}))
+                    data={"kind": "child", "state": "stop_hook_observed", "terminal": "unverified"}))
             if name == "Stop" and prompt_id in self._activities:
                 self._activities[prompt_id].stop_seen = True
                 # Stop is pre-terminal and may be blocked by another hook.
@@ -792,8 +792,14 @@ class ClaudeRuntimeDriver(RuntimeDriver):
                 partial = True
                 continue
             seen.add(work_id)
-            kind: Any = "automation" if "schedule" in row else "terminal" if row.get("type") == "shell" else "task"
             existing = self._work.get(work_id)
+            kind: Any = "automation" if "schedule" in row else "terminal" if row.get("type") == "shell" else "task"
+            kind_partial = bool(kind == "task" and existing and existing.kind in {"terminal", "automation"})
+            if kind_partial and existing is not None:
+                # An incomplete/unsupported snapshot row cannot erase a kind
+                # established by an attributable native tool result.
+                kind = existing.kind
+                partial = True
             data = _metadata({k: row[k] for k in ("description", "command", "schedule", "prompt", "recurring") if k in row})
             partial = partial or data.get("metadata_truncated") is True
             if kind == "automation":
@@ -803,7 +809,8 @@ class ClaudeRuntimeDriver(RuntimeDriver):
             self._work[work_id] = NativeWork(self._reference(work=work_id), kind, state,
                 "claude:Stop-snapshot", observed, durable=self._definitions.get(work_id), data=data)
             self._send_event(RuntimeEvent("work.observed", reference=self._reference(work=work_id),
-                provenance="claude:Stop-snapshot", freshness="last_observed", grade="compatible", data=data | {"state": self._work[work_id].state}))
+                provenance="claude:Stop-snapshot", freshness="last_observed", partial=kind_partial,
+                grade="compatible", data=data | {"kind": kind, "state": self._work[work_id].state}))
             if conflicting:
                 partial = True  # Conflicting late snapshot never silently revives a terminal.
         for work_id, work in list(self._work.items()):
@@ -867,7 +874,8 @@ class ClaudeRuntimeDriver(RuntimeDriver):
                 "claude:Bash-PostToolUse", time.time(), grade="compatible", data=_metadata({
                     "command": args.get("command"), "description": args.get("description"), "tool_use_id": tool_id}))
             self._send_event(RuntimeEvent("work.observed", reference=self._work[work_id].reference,
-                provenance="claude:Bash-PostToolUse", grade="compatible", data=dict(self._work[work_id].data) | {"state": "running"}))
+                provenance="claude:Bash-PostToolUse", grade="compatible",
+                data=dict(self._work[work_id].data) | {"kind": "terminal", "state": "running"}))
         elif tool == "CronCreate" and _string(response.get("id")):
             work_id = response["id"]
             durable = response.get("durable")
@@ -912,7 +920,7 @@ class ClaudeRuntimeDriver(RuntimeDriver):
         self._work[work_id] = NativeWork(work.reference, work.kind, state, provenance, time.time(),
             grade="compatible", durable=work.durable, data=work.data)
         self._send_event(RuntimeEvent("work.terminal", reference=work.reference, provenance=provenance,
-            grade="compatible", data={"state": state, "os_verified": False}))
+            grade="compatible", data={"kind": work.kind, "state": state, "os_verified": False}))
 
     def _terminal(self, prompt_id: str, status: str, provenance: str) -> None:
         activity = self._activities.get(prompt_id)
