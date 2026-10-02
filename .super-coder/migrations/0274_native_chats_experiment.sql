@@ -27,4 +27,18 @@ CREATE TABLE IF NOT EXISTS conversation_runtime_probe_jobs (
  deadline REAL NOT NULL,
  updated_at REAL NOT NULL
 );
+-- Durable HTTP intent precedes discovery/allocation. Unknown acknowledgement
+-- is reconciled by its operator/request key, never by a second check.
+CREATE TABLE IF NOT EXISTS conversation_runtime_check_requests (
+ check_id TEXT PRIMARY KEY,
+ owner_user_id INTEGER NOT NULL REFERENCES users(user_id),
+ request_key TEXT NOT NULL,
+ request_hash TEXT NOT NULL,
+ selection_json TEXT NOT NULL,
+ status TEXT NOT NULL CHECK(status IN ('accepted','running','complete','retained')),
+ result_json TEXT NOT NULL DEFAULT '{}',
+ created_at REAL NOT NULL,
+ updated_at REAL NOT NULL,
+ UNIQUE(owner_user_id,request_key)
+);
 COMMIT;

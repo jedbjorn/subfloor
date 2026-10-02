@@ -75,8 +75,10 @@ class FixtureNativeCheck:
         self.stopped=False
         self.persisted=False
         self.cancelling=False
+        from conversation_native_checks import NativeChecks
+        self.workflow=NativeChecks(self)
 
-    def begin(self) -> dict:
+    def begin(self, *, on_candidate=None) -> dict:
         with self.lock:
             if self.stopped:
                 raise RuntimeContractError('FIXTURE_STOPPED','API consumer is stopping')
@@ -93,6 +95,8 @@ class FixtureNativeCheck:
             from conversation_adapters.codex_runtime import create_driver
             shape,requirements=adapter_interface(create_driver())
             self.fingerprint,self.failure,self.persisted=fp,None,False
+            if on_candidate is not None:
+                on_candidate(fp.key) # Commit HTTP binding before dispatch.
             self.future=self.checker.request(fp,observed_interface=shape,requirements=requirements,
                                              factory=self.factory,seconds=177)
             self.future.add_done_callback(self.finished)

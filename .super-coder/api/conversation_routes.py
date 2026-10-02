@@ -3016,6 +3016,29 @@ def handle(method: str, path: str, headers_raw: str, raw_body: bytes) -> tuple:
                     (query.get("name") or [""])[0],
                 )
             body = _body(raw_body)
+            if parsed.path in {'/api/conversations/native-config','/api/conversations/native-checks'} or parsed.path.startswith('/api/conversations/native-checks/'):
+                import gui_experiment_runtime
+                fixture=gui_experiment_runtime._FIXTURE
+                if parsed.path=='/api/conversations/native-config' and method=='GET':
+                    return _json(200,fixture.workflow.config() if fixture else {'enabled':False,'candidates':[],'onboarding':None})
+                if fixture is None or operator['user_id']!=1:
+                    raise ApiError(409,'NATIVE_EXPERIMENT_UNAVAILABLE','native checks require the owned experimental fixture')
+                try:
+                    if parsed.path=='/api/conversations/native-checks' and method=='POST':
+                        return _json(202,fixture.workflow.create(operator['user_id'],_idempotency_key(headers),body))
+                    if method=='GET':
+                        if parsed.path=='/api/conversations/native-checks':
+                            values=query.get('request_key',[])
+                            if len(values)!=1 or not values[0] or len(values[0])>255:
+                                raise ApiError(422,'CHECK_REQUEST_INVALID','one bounded request_key required')
+                            return _json(200,fixture.workflow.get(operator['user_id'],request_key=values[0]))
+                        check_id=parsed.path.removeprefix('/api/conversations/native-checks/')
+                        if not re.fullmatch('nc_[0-9a-f]{32}',check_id):
+                            raise ApiError(422,'CHECK_REQUEST_INVALID','one exact check id required')
+                        return _json(200,fixture.workflow.get(operator['user_id'],check_id=check_id))
+                    raise ApiError(405,'METHOD_NOT_ALLOWED','unsupported native check operation')
+                except RuntimeContractError as exc:
+                    raise ApiError(404 if exc.code=='CHECK_NOT_FOUND' else 409,exc.code,str(exc)) from exc
             if parsed.path == "/api/conversations/shell-release" and method == "POST":
                 return _release_shell(con, operator, body)
             if parsed.path == "/api/conversations":
