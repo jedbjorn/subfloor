@@ -33,6 +33,16 @@ def _fail(code: str, detail: str) -> NoReturn:
     raise RuntimeContractError(code, detail)
 
 
+def _cleanup_complete(cleanup) -> bool:
+    # Absence, scalars and malformed collections never prove native definition
+    # or work resolution. Persisted NativeCleanup collections are JSON arrays.
+    return (isinstance(cleanup,dict) and cleanup.get('outcome')=='complete'
+            and cleanup.get('native_outcome')=='complete'
+            and cleanup.get('unit_verified_exited') is True
+            and type(cleanup.get('unresolved_work')) is list and cleanup['unresolved_work']==[]
+            and type(cleanup.get('unresolved_definitions')) is list and cleanup['unresolved_definitions']==[])
+
+
 def source_history(con, cid: str, owner: int) -> tuple[Any, NativeHistory, str]:
     # Read without tenancy filtering first. Conflicting canonical rows must not
     # become absence/never-launched proof.
@@ -58,10 +68,7 @@ def source_history(con, cid: str, owner: int) -> tuple[Any, NativeHistory, str]:
         if ((generation['owner_user_id'], generation['shell_id'], generation['harness'])
                 != (owner, row['shell_id'], row['harness'])):
             _fail('HISTORY_NOT_OWNED', 'conflicting retained generation ownership')
-        if (generation['state'] != 'closed' or cleanup.get('outcome') != 'complete'
-                or cleanup.get('unit_verified_exited') is not True
-                or cleanup.get('native_outcome') != 'complete'
-                or cleanup.get('unresolved_work') or cleanup.get('unresolved_definitions')):
+        if generation['state'] != 'closed' or not _cleanup_complete(cleanup):
             _fail('CLEANUP_PENDING', 'every predecessor generation needs native, OS and definition cleanup')
         binding = json.loads(generation['binding_json'])
         context = binding.get('context', {})
@@ -114,10 +121,7 @@ def require_slot(con, shell: int, *, destination: str | None = None) -> None:
         if generation['conversation_id'] == destination:
             continue
         cleanup = json.loads(generation['cleanup_json'])
-        if (generation['state'] != 'closed' or cleanup.get('outcome') != 'complete'
-                or cleanup.get('unit_verified_exited') is not True
-                or cleanup.get('native_outcome') != 'complete'
-                or cleanup.get('unresolved_work') or cleanup.get('unresolved_definitions')):
+        if generation['state'] != 'closed' or not _cleanup_complete(cleanup):
             _fail('CLEANUP_PENDING', 'retained native ownership still occupies the canonical shell slot')
 
 
@@ -147,6 +151,11 @@ def association(con, cid: str, owner: int):
 
 
 def prepared_history(con, row, generation: str, proof: dict) -> NativeHistory | None:
+    # The owner may have observed a row before a blocking proof callback. Read
+    # current canonical state again rather than treating that snapshot as a CAS.
+    row=con.execute('SELECT * FROM conversations WHERE conversation_id=?',(row['conversation_id'],)).fetchone()
+    if row is None:
+        _fail('HISTORY_NOT_OWNED','continuation disappeared before preparation')
     link = association(con, row['conversation_id'], row['owner_user_id'])
     if link is None:
         return None

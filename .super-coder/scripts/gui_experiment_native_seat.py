@@ -380,6 +380,30 @@ class NativeFixtureSeat:
             initial=con.execute('SELECT 1 FROM conversation_boot_snapshots WHERE conversation_id=?',(conversation_id,)).fetchone() is None
         finally:
             con.close()
+        def recheck_history(con, *, observe_proof=True):
+            if history is None:
+                return
+            if history_proof is None or history_service is None:
+                raise RuntimeContractError('HISTORY_UNAVAILABLE','captured history owner/proof is required')
+            # The proof owner can block. It cannot authorize writes using the
+            # conversation or shell snapshot from before that callback.
+            if observe_proof and history_service.history_admission(history)!=history_proof:
+                raise RuntimeContractError('HISTORY_CHANGED','current history proof changed before preparation')
+            fresh=con.execute('SELECT c.*,s.shortname,s.flavor,s.user_id AS shell_owner,s.is_deleted AS shell_deleted FROM conversations c JOIN shells s USING(shell_id) WHERE conversation_id=?',(conversation_id,)).fetchone()
+            runtime=json.loads(fresh['runtime_projection']) if fresh else {}
+            if (fresh is None or fresh['owner_user_id']!=1 or fresh['shell_owner']!=1 or fresh['shell_deleted']
+                    or fresh['state']=='closed' or fresh['runtime_mode']!='native_experiment'
+                    or runtime.get('generation_id')!=generation_id or runtime.get('state')!='preparing'
+                    or runtime.get('role')!='ordinary'
+                    or runtime.get('preparation_owner')!=json.loads(row['runtime_projection']).get('preparation_owner')
+                    or any(fresh[key]!=row[key] for key in ('shell_id','harness','provider','model','effort','worktree','route_binding','shortname','flavor'))):
+                raise RuntimeContractError('HISTORY_CHANGED','history preparing owner changed after proof observation')
+            self.selected_worktree(fresh,allow_missing=True)
+            if conversation_native_history.prepared_history(con,fresh,generation_id,history_proof)!=history:
+                raise RuntimeContractError('HISTORY_CHANGED','owned continuation association changed at the mutation edge')
+            if (conversation_native_chats._SERVICE is not history_service or history_service.stopped.is_set()
+                    or Path(history_service.database).resolve()!=self.database.resolve()):
+                raise RuntimeContractError('HISTORY_CHANGED','current history service changed at the mutation edge')
         harness=row['harness']
         observer=self.observers.get(harness)
         if observer is None:
@@ -415,12 +439,7 @@ class NativeFixtureSeat:
                 raise RuntimeContractError('RUNTIME_CLOSING','preparing generation was closed/replaced before canonical writes')
             self.selected_worktree(fresh,allow_missing=history is not None)
             if history is not None:
-                if history_proof is None or history_service is None:
-                    raise RuntimeContractError('HISTORY_UNAVAILABLE','captured history owner/proof is required')
-                conversation_native_history.prepared_history(con,fresh,generation_id,history_proof)
-                if (conversation_native_chats._SERVICE is not history_service or history_service.stopped.is_set()
-                        or history_service.history_admission(history)!=history_proof):
-                    raise RuntimeContractError('HISTORY_CHANGED','current history owner/proof changed before canonical writes')
+                recheck_history(con)
             if binding['selector_binding'].get('proof_state')=='pending_finite_probe':
                 job=con.execute('SELECT status,deadline,fingerprint_key FROM conversation_runtime_probe_jobs WHERE conversation_id=? AND generation_id=?',(conversation_id,generation_id)).fetchone()
                 if (runtime.get('role')!='probe' or not probe_capabilities or job is None
@@ -432,15 +451,9 @@ class NativeFixtureSeat:
         # Durable fixture resources precede canonical archive/boot/DB mutations.
         native=self.supervisor.register(generation_id,harness)
         if history is not None:
-            if history_proof is None or history_service is None:
-                raise RuntimeContractError('HISTORY_UNAVAILABLE','captured history owner/proof is required')
             con=db_driver.connect(str(self.database))
             try:
-                fresh=con.execute('SELECT * FROM conversations WHERE conversation_id=?',(conversation_id,)).fetchone()
-                conversation_native_history.prepared_history(con,fresh,generation_id,history_proof)
-                if (conversation_native_chats._SERVICE is not history_service or history_service.stopped.is_set()
-                        or history_service.history_admission(history)!=history_proof):
-                    raise RuntimeContractError('HISTORY_CHANGED','history admission changed after resource registration')
+                recheck_history(con)
             finally:
                 con.close()
         if initial:
@@ -489,12 +502,11 @@ class NativeFixtureSeat:
             workspace=conversation_native_history.observe_workspace(Path(plan.cwd),self.root)
             con=db_driver.connect(str(self.database))
             try:
+                # Observe outside the writer transaction, then CAS the fresh
+                # state inside it without another blocking owner callback.
+                recheck_history(con)
                 with db_driver.write_transaction(con,'native_history.workspace'):
-                    current=con.execute('SELECT * FROM conversations WHERE conversation_id=?',(conversation_id,)).fetchone()
-                    conversation_native_history.prepared_history(con,current,generation_id,history_proof)
-                    if (conversation_native_chats._SERVICE is not history_service or history_service.stopped.is_set()
-                            or history_service.history_admission(history)!=history_proof):
-                        raise RuntimeContractError('HISTORY_CHANGED','history owner/proof changed during canonical preparation')
+                    recheck_history(con,observe_proof=False)
                     con.execute('UPDATE conversation_native_history SET workspace_json=? WHERE conversation_id=? AND generation_id=?',
                         (json.dumps(dataclasses.asdict(workspace)|{'cwd':str(workspace.cwd),'git_common_dir':str(workspace.git_common_dir)}),conversation_id,generation_id))
             finally:
