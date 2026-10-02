@@ -304,6 +304,7 @@ def canonical_seat(seat,monkeypatch):
     events=[]
     class Supervisor:
         def codegen_clean(self):return True
+        def inventory(self):return []
         def register(self,generation,harness):
             events.append('register')
             state=seat.root/'runtime'/generation;state.mkdir(parents=True)
@@ -328,6 +329,7 @@ def canonical_seat(seat,monkeypatch):
     monkeypatch.setattr(value,'candidate_fingerprint',lambda *args:seat.fp)
     monkeypatch.setattr(value,'settings_digest',lambda harness:seat.fp.policy_digest)
     monkeypatch.setattr(value,'implementation_digest',lambda harness:seat.fp.implementation_digest)
+    value.loaded_implementations['codex']=seat.fp.implementation_digest
     return value,events
 
 

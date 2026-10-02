@@ -40,16 +40,233 @@ class NativeChecks:
         self.current: str | None=None
         self.beginning=False
         self.failed: str | None=None
+        self.consumer_token=uuid.uuid4().hex
 
     def config(self) -> dict:
         import conversation_native_chats
         return {'enabled':conversation_native_chats._SERVICE is self.operation.service,
                 'candidates':[{'harness':harness,'model':model,'effort':effort,'label':label,
-                'proof_state':'requested_candidate','grades':{},'diagnostics':[]}
+                'proof_state':'requested_candidate','grades':{},'diagnostics':[],
+                'automatic_check':self.automatic_reference({'harness':harness,'model':model,'effort':effort}),
+                **self.retained_references({'harness':harness,'model':model,'effort':effort})}
                 for harness,model,effort,label in REQUESTED_CANDIDATES],
                 'onboarding':{'canonical_main_root':str(self.operation.seat.root.resolve()),
                               'scope':'linked_worktrees','initial_setup':'native_tui',
                               'local_channel_setup':'scoped_gui_action'}}
+
+    def _current_owner(self) -> bool:
+        import conversation_native_chats
+        service=self.operation.service
+        return (service is not None and conversation_native_chats._SERVICE is service
+                and not service.stopped.is_set()
+                and service.database.resolve()==self.database.resolve())
+
+    @staticmethod
+    def _automatic(row) -> dict | None:
+        value=json.loads(row['result_json']).get('_automatic')
+        if not isinstance(value,dict) or set(value)!={'origin','expected_fingerprint','phase','attempt','consumer','unavailable'}:
+            return None
+        if (value['origin']!='installed_change' or value['phase'] not in {'queued','claimed','settled'}
+                or type(value['attempt']) is not int or not 0<=value['attempt']<=32
+                or type(value['unavailable']) is not bool
+                or not isinstance(value['expected_fingerprint'],str) or len(value['expected_fingerprint'])!=64
+                or any(c not in '0123456789abcdef' for c in value['expected_fingerprint'])
+                or not isinstance(value['consumer'],str) or len(value['consumer']) not in {0,32}
+                or any(c not in '0123456789abcdef' for c in value['consumer'])):
+            return None
+        if (json.loads(row['result_json']).get('fingerprint')!=value['expected_fingerprint']
+                or value['phase']=='queued' and value['consumer']!=''
+                or value['phase']=='claimed' and len(value['consumer'])!=32):return None
+        return value
+
+    def automatic_reference(self,selection: dict, *, fingerprint: str | None=None) -> dict | None:
+        if not self._current_owner():return None
+        try:
+            selection=configured_selection(selection)
+        except (RuntimeContractError,OSError,ValueError):return None
+        con=db_driver.connect(str(self.database))
+        try:
+            rows=con.execute('SELECT * FROM conversation_runtime_check_requests WHERE owner_user_id=1 ORDER BY created_at DESC,check_id DESC').fetchall()
+            rows=[row for row in rows if json.loads(row['selection_json'])==selection]
+            if not rows:return None
+            try:fingerprint=fingerprint or self.operation.seat.candidate_fingerprint(**selection).key
+            except (RuntimeContractError,OSError,ValueError):return None
+            if not self._current_owner():return None
+            for row in rows:
+                if json.loads(row['selection_json'])!=selection:continue
+                result=json.loads(row['result_json'])
+                if result.get('fingerprint')!=fingerprint:continue
+                if len(row['check_id'])!=35 or not row['check_id'].startswith('nc_') or any(c not in '0123456789abcdef' for c in row['check_id'][3:]):continue
+                auto=self._automatic(row)
+                if '_automatic' in result and auto is None:continue
+                # Exact GET owns all probe/cleanup/admission details. A ref
+                # alone never supplies a capability or a consent descriptor.
+                code=result.get('diagnostics') or []
+                diagnostic=code[0].get('code') if code and isinstance(code[0],dict) else None
+                if not isinstance(diagnostic,str) or not 1<=len(diagnostic)<=128 or any(c not in 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_' for c in diagnostic):diagnostic=None
+                return {'check_id':row['check_id'],'origin':'installed_change' if auto else 'operator',
+                        'state':row['status'],'diagnostic':diagnostic}
+        finally:con.close()
+        return None
+
+    def retained_references(self,selection: dict) -> dict:
+        """Old captured probes remain discoverable while a new identity waits."""
+        refs: list[dict]=[]
+        answer: dict={'retained_checks':refs,'retained_checks_partial':False}
+        if not self._current_owner():return answer
+        con=db_driver.connect(str(self.database))
+        try:
+            rows=con.execute("SELECT * FROM conversation_runtime_check_requests WHERE owner_user_id=1 AND status!='complete' ORDER BY created_at,check_id").fetchall()
+            for row in rows:
+                if json.loads(row['selection_json'])!=selection:continue
+                cid=row['check_id']
+                if not isinstance(cid,str) or len(cid)!=35 or not cid.startswith('nc_') or any(c not in '0123456789abcdef' for c in cid[3:]):continue
+                if len(refs)==16:
+                    answer['retained_checks_partial']=True;break
+                meta=self._automatic(row)
+                refs.append({'check_id':cid,'origin':'installed_change' if meta else 'operator',
+                    'state':row['status'],'scope':'retained_check'})
+        finally:con.close()
+        return answer
+
+    def note_unavailable(self,harness: str) -> None:
+        """An observed availability transition allows one later safe retry."""
+        if not self._current_owner():return
+        con=db_driver.connect(str(self.database))
+        try:
+            with db_driver.write_transaction(con,'native_check.unavailable'):
+                for row in con.execute("SELECT * FROM conversation_runtime_check_requests WHERE owner_user_id=1 AND status='complete'").fetchall():
+                    meta=self._automatic(row)
+                    if meta and json.loads(row['selection_json']).get('harness')==harness and not meta['unavailable']:
+                        result=json.loads(row['result_json']);meta['unavailable']=True;result['_automatic']=meta
+                        con.execute('UPDATE conversation_runtime_check_requests SET result_json=? WHERE check_id=?',(json.dumps(result),row['check_id']))
+        finally:con.close()
+
+    def enqueue_automatic(self,selection: dict,fingerprint: str) -> dict | None:
+        selection=configured_selection(selection)
+        if not self._current_owner():return None
+        if not isinstance(fingerprint,str) or len(fingerprint)!=64 or any(c not in '0123456789abcdef' for c in fingerprint):
+            raise RuntimeContractError('CHECK_CANDIDATE_CHANGED','exact automatic fingerprint required')
+        with self.lock:
+            con=db_driver.connect(str(self.database))
+            try:
+                with db_driver.write_transaction(con,'native_check.automatic_intent'):
+                    if not self._current_owner():return None
+                    if self.operation.seat.candidate_fingerprint(**selection).key!=fingerprint:
+                        raise RuntimeContractError('CHECK_CANDIDATE_CHANGED','automatic observation is no longer current')
+                    if not self._current_owner():return None
+                    rows=con.execute('SELECT * FROM conversation_runtime_check_requests WHERE owner_user_id=1 ORDER BY created_at DESC,check_id DESC').fetchall()
+                    attempt=0
+                    # A later observation supersedes only positively queued
+                    # work. Claimed/unknown ownership is retained for Close.
+                    for prior in rows:
+                        old=self._automatic(prior)
+                        if (old and prior['status']=='accepted' and old['phase']=='queued'
+                                and json.loads(prior['selection_json'])==selection
+                                and old['expected_fingerprint']!=fingerprint):
+                            result=json.loads(prior['result_json']);result['_automatic']=dict(old,phase='settled')
+                            result.update(admissible=False,retry_allowed=True,
+                                diagnostics=[{'code':'CHECK_CANDIDATE_CHANGED','grade':'inconclusive'}])
+                            con.execute("UPDATE conversation_runtime_check_requests SET status='complete',result_json=?,updated_at=? WHERE check_id=? AND status='accepted'",
+                                        (json.dumps(result),time.time(),prior['check_id']))
+                    for row in rows:
+                        result=json.loads(row['result_json'])
+                        if json.loads(row['selection_json'])!=selection or result.get('fingerprint')!=fingerprint:continue
+                        meta=self._automatic(row)
+                        if '_automatic' in result and meta is None:
+                            raise RuntimeContractError('CHECK_INTENT_INVALID','automatic metadata is inconclusive')
+                        if (meta and row['status']=='complete' and meta['unavailable']
+                                and result.get('retry_allowed') is True and meta['attempt']<32):
+                            attempt=meta['attempt']+1
+                            break
+                        return self._projection(row)
+                    key='auto_'+payload_digest({'owner':1,'selection':selection,'fingerprint':fingerprint,'attempt':attempt})
+                    previous=con.execute('SELECT * FROM conversation_runtime_check_requests WHERE owner_user_id=1 AND request_key=?',(key,)).fetchone()
+                    if previous:return self._projection(previous)
+                    meta={'origin':'installed_change','expected_fingerprint':fingerprint,'phase':'queued',
+                          'attempt':attempt,'consumer':'','unavailable':False}
+                    result={'fingerprint':fingerprint,'_automatic':meta,'admissible':False,'retry_allowed':False,
+                            'diagnostics':[{'code':'AUTOMATIC_CHECK_QUEUED','grade':'inconclusive'}]}
+                    cid='nc_'+uuid.uuid4().hex;now=time.time()
+                    con.execute('INSERT INTO conversation_runtime_check_requests VALUES(?,?,?,?,?,?,?,?,?)',
+                        (cid,1,key,payload_digest(selection),json.dumps(selection),'accepted',json.dumps(result),now,now))
+                    return {'check_id':cid,'state':'accepted'}
+            finally:con.close()
+
+    def _automatic_edge(self,check_id: str,fp: str,deadline: float) -> None:
+        if time.monotonic()>=deadline or not self._current_owner():
+            raise RuntimeContractError('CHECK_OWNER_CHANGED','automatic dispatch owner/deadline changed')
+        self.operation.supervisor.preparation_identity(deadline=deadline)
+        if time.monotonic()>=deadline or not self._current_owner():
+            raise RuntimeContractError('CHECK_OWNER_CHANGED','marked API owner changed during observation')
+        con=db_driver.connect(str(self.database))
+        try:
+            row=con.execute('SELECT * FROM conversation_runtime_check_requests WHERE check_id=?',(check_id,)).fetchone()
+            meta=self._automatic(row) if row else None
+            if (row is None or row['owner_user_id']!=1 or row['status'] not in {'accepted','running'}
+                    or meta is None or meta['phase']!='claimed' or meta['consumer']!=self.consumer_token
+                    or meta['expected_fingerprint']!=fp or json.loads(row['result_json']).get('fingerprint')!=fp):
+                raise RuntimeContractError('CHECK_INTENT_INVALID','automatic dispatch no longer owns its captured intent')
+        finally:con.close()
+
+    def dispatch_automatic(self) -> None:
+        """Claim at most one durable queued intent; never restart a claim."""
+        with self.lock:
+            if not self._current_owner() or self.beginning:return
+            if self.current is not None:self.refresh(self.current)
+            if self.operation.future is not None and not self.operation.future.done():return
+            con=db_driver.connect(str(self.database))
+            try:
+                rows=con.execute("SELECT * FROM conversation_runtime_check_requests WHERE status!='complete' ORDER BY created_at,check_id").fetchall()
+                # Conflicting/manual/claimed records require readback and owned
+                # cleanup first. Accepted alone is not never-dispatched proof.
+                queued=[]
+                for row in rows:
+                    meta=self._automatic(row)
+                    if row['owner_user_id']!=1 or row['status']!='accepted' or meta is None or meta['phase']!='queued':return
+                    queued.append(row)
+                if not queued:return
+                row=queued[0];meta=self._automatic(row)
+                assert meta is not None
+                selection=configured_selection(json.loads(row['selection_json']))
+                if con.execute("SELECT 1 FROM conversation_runtime_probe_jobs WHERE status!='complete' LIMIT 1").fetchone():return
+            finally:con.close()
+            try:
+                self.operation.retained_guard()
+                fp=self.operation.seat.candidate_fingerprint(**selection)
+                if fp.key!=meta['expected_fingerprint']:
+                    self._save(row['check_id'],'complete',{'admissible':False,'retry_allowed':True,
+                        'diagnostics':[{'code':'CHECK_CANDIDATE_CHANGED','grade':'inconclusive'}]})
+                    return
+                self.operation.seat.require_loaded_source(fp)
+                if self.operation.seat.probe_capacity(fp.harness)<1:return
+            except RuntimeContractError as exc:
+                if exc.code in {'CLEANUP_PENDING','PROBE_CAPACITY_PENDING'}:return
+                if exc.code=='LOADED_SOURCE_CHANGED':
+                    self._save(row['check_id'],'accepted',{'admissible':False,'retry_allowed':False,
+                        'diagnostics':[{'code':'LOADED_SOURCE_CHANGED','grade':'inconclusive'}]})
+                    return # No attempt began; a matching new API may claim it.
+                self._save(row['check_id'],'complete',{'admissible':False,'retry_allowed':True,
+                    'diagnostics':[{'code':'AUTOMATIC_SOURCE_INCONCLUSIVE','grade':'inconclusive'}]})
+                return
+            deadline=time.monotonic()+177
+            con=db_driver.connect(str(self.database))
+            try:
+                with db_driver.write_transaction(con,'native_check.automatic_claim'):
+                    fresh=con.execute('SELECT * FROM conversation_runtime_check_requests WHERE check_id=?',(row['check_id'],)).fetchone()
+                    current=self._automatic(fresh) if fresh else None
+                    if (not self._current_owner() or current!=meta or fresh['status']!='accepted'
+                            or self.operation.seat.candidate_fingerprint(**selection)!=fp):return
+                    # Observation callbacks can replace this consumer; recheck
+                    # after them, immediately before durable claim publication.
+                    if not self._current_owner():return
+                    result=json.loads(fresh['result_json']);meta=dict(meta,phase='claimed',consumer=self.consumer_token)
+                    result['_automatic']=meta
+                    con.execute("UPDATE conversation_runtime_check_requests SET result_json=?,updated_at=? WHERE check_id=? AND status='accepted'",
+                                (json.dumps(result),time.time(),row['check_id']))
+            finally:con.close()
+            self.current,self.beginning,self.failed=row['check_id'],True,None
+            threading.Thread(target=self._begin,args=(row['check_id'],deadline),name='native-check-intent',daemon=True).start()
 
     def create(self,owner: int,key: str,body: dict) -> dict:
         if owner!=1:
@@ -81,17 +298,23 @@ class NativeChecks:
             threading.Thread(target=self._begin,args=(check_id,),name='native-check-intent',daemon=True).start()
         return self.get(owner,check_id=check_id)
 
-    def _begin(self,check_id: str) -> None:
+    def _begin(self,check_id: str,deadline: float | None=None) -> None:
         try:
             con=db_driver.connect(str(self.database))
             try:
-                row=con.execute("SELECT selection_json FROM conversation_runtime_check_requests WHERE check_id=? AND owner_user_id=1 AND status='accepted'",(check_id,)).fetchone()
+                row=con.execute("SELECT * FROM conversation_runtime_check_requests WHERE check_id=? AND owner_user_id=1 AND status='accepted'",(check_id,)).fetchone()
                 if row is None:
                     raise RuntimeContractError('CHECK_INTENT_INVALID','captured selected intent is unavailable')
                 selection=configured_selection(json.loads(row['selection_json']))
             finally:
                 con.close()
-            self.operation.begin(selection=selection,on_candidate=lambda key:self._bind(check_id,key))
+            meta=self._automatic(row)
+            options={}
+            if meta is not None:
+                if deadline is None:raise RuntimeContractError('CHECK_INTENT_INVALID','claimed check has no current deadline')
+                options={'deadline':deadline,'expected_fingerprint':meta['expected_fingerprint'],
+                         'validate_intent':lambda:self._automatic_edge(check_id,meta['expected_fingerprint'],deadline)}
+            self.operation.begin(selection=selection,on_candidate=lambda key:self._bind(check_id,key),**options)
             with self.lock:
                 self.beginning=False
             future=self.operation.future
@@ -129,6 +352,9 @@ class NativeChecks:
                     return # Old consumers cannot regress retained terminal cleanup truth.
                 if bound is not None:
                     result['fingerprint']=bound
+                meta=self._automatic(row)
+                if meta is not None:
+                    result['_automatic']=dict(meta,phase='settled' if state=='complete' else meta['phase'])
                 if previous.get('probe_binding'):
                     if result.get('probe_binding',previous['probe_binding'])!=previous['probe_binding']:
                         raise RuntimeContractError('CHECK_PROBE_CHANGED','check result belongs to another probe generation')
@@ -145,6 +371,13 @@ class NativeChecks:
         con=db_driver.connect(str(self.database))
         try:
             with db_driver.write_transaction(con,'native_check.http_binding'):
+                row=con.execute('SELECT * FROM conversation_runtime_check_requests WHERE check_id=?',(check_id,)).fetchone()
+                meta=self._automatic(row) if row else None
+                if meta is not None:
+                    if (row['status']!='accepted' or meta['phase']!='claimed' or meta['consumer']!=self.consumer_token
+                            or meta['expected_fingerprint']!=fingerprint_key or not self._current_owner()):
+                        raise RuntimeContractError('CHECK_INTENT_INVALID','automatic candidate differs from durable dispatch')
+                    return
                 updated=con.execute("UPDATE conversation_runtime_check_requests SET result_json=?,updated_at=? WHERE check_id=? AND status='accepted' AND json_extract(result_json,'$.fingerprint') IS NULL",
                                     (json.dumps({'fingerprint':fingerprint_key}),time.time(),check_id))
                 if updated.rowcount!=1:
@@ -174,6 +407,11 @@ class NativeChecks:
                 bound=original.get('fingerprint')
             finally:
                 con.close()
+            meta=self._automatic(row)
+            if meta is not None and (not self._current_owner() or meta['consumer']!=self.consumer_token):
+                self._save(check_id,'retained',{'fingerprint':bound,'admissible':False,'retry_allowed':False,
+                    'diagnostics':[{'code':'CHECK_CONSUMER_RESTARTED','grade':'inconclusive'}]})
+                return
             observed=self.operation.status()
             if not bound or observed.get('fingerprint')!=bound:
                 # A newer operation/cache cannot satisfy an older durable
@@ -215,6 +453,8 @@ class NativeChecks:
     def _projection(row) -> dict:
         result=json.loads(row['result_json'])
         result.pop('probe_binding',None)
+        meta=result.pop('_automatic',None)
+        if meta is not None:result['origin']='installed_change'
         return {'check_id':row['check_id'],'request_key':row['request_key'],'state':row['status'],
                 'selection':json.loads(row['selection_json']),'admissible':False,'retry_allowed':False,
                 'grades':{},'diagnostics':[],'probe':None,**result}
@@ -243,6 +483,10 @@ class NativeChecks:
                     result['admissible']=bool(result.get('admissible') and self._admissible(result,json.loads(row['selection_json'])))
                     if con.execute("SELECT 1 FROM conversation_runtime_check_requests WHERE check_id!=? AND status!='complete' LIMIT 1",(target,)).fetchone() or con.execute("SELECT 1 FROM conversation_runtime_probe_jobs WHERE status!='complete' LIMIT 1").fetchone():
                         result['retry_allowed']=False
+                meta=self._automatic(row)
+                if meta is not None and meta['phase']=='queued' and row['status']=='accepted':
+                    result.update(state='accepted',admissible=False,retry_allowed=False,probe=None)
+                    return result
                 if self.current!=target and row['status']!='complete':
                     result['probe'],binding=self._owned_probe(con,row,json.loads(row['result_json']))
                     probe=result['probe']

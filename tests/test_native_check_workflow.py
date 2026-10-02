@@ -33,7 +33,7 @@ def workflow(request,monkeypatch):
         calls.append('begin')
     operation.begin=begin
     class InlineThread:
-        def __init__(self,*,target,args,**_):self.target,self.args=target,args
+        def __init__(self,*,target,args=(),**_):self.target,self.args=target,args
         def start(self):self.target(*self.args)
     monkeypatch.setattr(checks.threading,'Thread',InlineThread)
     value=checks.NativeChecks(operation)
