@@ -47,7 +47,7 @@ def project_event(con, cid: str, sequence: int, event: dict, *, primary: dict | 
     if not generation:
         raise RuntimeContractError('GENERATION_INVALID','native projection has no captured generation')
     kind, ref = event['kind'], event.get('reference') or {}
-    current = con.execute('SELECT state,close_intent FROM conversation_runtime_generations WHERE generation_id=? AND conversation_id=?',(generation,cid)).fetchone()
+    current = con.execute('SELECT state,close_intent,harness FROM conversation_runtime_generations WHERE generation_id=? AND conversation_id=?',(generation,cid)).fetchone()
     if current is None:
         raise RuntimeContractError('GENERATION_INVALID','generation is outside chat projection')
     command = None
@@ -56,7 +56,7 @@ def project_event(con, cid: str, sequence: int, event: dict, *, primary: dict | 
                               (generation,event['request_id'])).fetchone()
     intent = json.loads(command['intent_json']) if command else {}
     mid, rid = intent.get('message_id'), intent.get('run_id')
-    root_activity = bool(ref.get('root_id') and ref.get('thread_id') in {None, ref['root_id']})
+    root_activity = bool(ref.get('root_id') and (ref.get('thread_id')==ref['root_id'] or current['harness']=='claude' and ref.get('thread_id') is None))
     projection.update(controller_sequence=sequence,observed_at=event['observed_at'],
                       freshness=event['freshness'],partial=bool(projection.get('partial') or event['partial']))
     if current['close_intent']:
@@ -219,6 +219,10 @@ class NativeChatsService:
         self.finish_cleanup(generation,cid,owner,shell,native_cleanup)
 
     def finish_cleanup(self,generation: str,cid: str,owner: int,shell: int,native_cleanup: dict) -> None:
+        retained = self.store.status(generation,owner,shell)
+        if retained['consumer_id'] not in {None,self.consumer} and retained['consumer_expires']>time.time():
+            raise RuntimeContractError('LEASE_FENCED','a replacement consumer owns cleanup')
+        fence = retained['consumer_fence']
         try:
             stopped = self.supervisor.stop(generation)
             os_exited = stopped.get('os_cleanup',{}).get('complete') is True
@@ -231,9 +235,9 @@ class NativeChatsService:
                    'unresolved_work':native_cleanup.get('unresolved_work',[]),
                    'unresolved_definitions':native_cleanup.get('unresolved_definitions',[]),
                    'detail':native_cleanup.get('detail','')}
-        self._commit_cleanup(generation,cid,owner,shell,cleanup)
+        self._commit_cleanup(generation,cid,owner,shell,cleanup,expected_fence=fence)
 
-    def _commit_cleanup(self,generation: str,cid: str,owner: int,shell: int,cleanup: dict) -> None:
+    def _commit_cleanup(self,generation: str,cid: str,owner: int,shell: int,cleanup: dict, *, expected_fence: int | None = None) -> None:
         # Generation truth and chat finalization share a transaction. API
         # interruption can leave both pending, never a released generation
         # whose chat cannot be selected for completion after restart.
@@ -242,10 +246,17 @@ class NativeChatsService:
         con = db_driver.connect(str(self.database))
         try:
             with db_driver.write_transaction(con,'native_chat.cleanup_projection'):
-                owned = con.execute('SELECT 1 FROM conversation_runtime_generations WHERE generation_id=? AND conversation_id=? AND owner_user_id=? AND shell_id=?',(generation,cid,owner,shell)).fetchone()
+                owned = con.execute('SELECT * FROM conversation_runtime_generations WHERE generation_id=? AND conversation_id=? AND owner_user_id=? AND shell_id=?',(generation,cid,owner,shell)).fetchone()
                 chat = con.execute('SELECT runtime_projection FROM conversations WHERE conversation_id=? AND owner_user_id=?',(cid,owner)).fetchone()
                 if owned is None or chat is None:
                     raise RuntimeContractError('RUNTIME_NOT_OWNED','cleanup is outside operator tenancy')
+                if expected_fence is not None and owned['consumer_fence']!=expected_fence:
+                    raise RuntimeContractError('LEASE_FENCED','cleanup consumer changed before finalization')
+                previous = json.loads(owned['cleanup_json'])
+                if previous.get('outcome')=='complete' and previous.get('unit_verified_exited') is True and not previous.get('unresolved_work') and not previous.get('unresolved_definitions'):
+                    # Verified terminal cleanup cannot regress when an older
+                    # API worker later returns an ambiguous/pending result.
+                    cleanup,complete = previous,True
                 projection = json.loads(chat['runtime_projection'])
                 if projection.get('generation_id')!=generation:
                     raise RuntimeContractError('GENERATION_INVALID','cleanup is outside the captured chat generation')
