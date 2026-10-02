@@ -33,7 +33,8 @@ class FixtureChats:
         fp=self.seat.candidate_fingerprint(harness,model,effort)
         evidence=self.operation.cache.get(fp,'submission')
         if evidence is None or evidence.grade!='compatible':
-            raise RuntimeContractError('CAPABILITY_INCONCLUSIVE','selected installed identity has no cleanup-bound submission coverage')
+            code='CAPABILITY_INCOMPATIBLE' if evidence and evidence.grade=='incompatible' else 'CAPABILITY_INCONCLUSIVE'
+            raise RuntimeContractError(code,'selected installed identity has no cleanup-bound submission coverage')
         con=db_driver.connect(str(self.database))
         try:
             row=con.execute("SELECT c.*,s.user_id AS shell_owner,j.status AS job_status,j.generation_id AS job_generation,g.state AS generation_state,g.cleanup_json,g.binding_json FROM conversation_runtime_probe_jobs j JOIN conversations c USING(conversation_id) JOIN shells s USING(shell_id) JOIN conversation_runtime_generations g ON g.generation_id=j.generation_id AND g.conversation_id=c.conversation_id AND g.owner_user_id=c.owner_user_id AND g.shell_id=c.shell_id WHERE j.fingerprint_key=?",(fp.key,)).fetchone()
@@ -42,6 +43,11 @@ class FixtureChats:
         runtime=json.loads(row['runtime_projection']) if row else {}
         cleanup=json.loads(row['cleanup_json']) if row else {}
         captured=json.loads(row['binding_json']) if row else {}
+        context=captured.get('context',{})
+        selected={'harness':fp.harness,'provider':fp.provider,'model':fp.model,'effort':fp.effort,
+                  'driver_revision':fp.driver_revision,'contract_revision':fp.contract_revision,
+                  'policy_digest':fp.policy_digest,'permission_mode':'unrestricted',
+                  'executable':{'path':str(fp.executable.path),'sha256':fp.executable.sha256,'version':fp.executable.version}}
         if (row is None or row['owner_user_id']!=1 or row['shell_owner']!=1
                 or row['runtime_mode']!='native_experiment' or runtime.get('role')!='probe'
                 or row['job_status']!='complete' or row['generation_state']!='closed'
@@ -49,6 +55,12 @@ class FixtureChats:
                 or row['creation_request_hash']!=fp.key
                 or captured.get('supervision',{}).get('fingerprint')!=fp.key
                 or captured.get('supervision',{}).get('implementation_digest')!=fp.implementation_digest
+                or any(context.get(key)!=value for key,value in selected.items())
+                or context.get('generation_id')!=row['job_generation']
+                or context.get('conversation_id')!=row['conversation_id']
+                or context.get('owner_user_id')!=row['owner_user_id'] or context.get('shell_id')!=row['shell_id']
+                or context.get('worktree')!=row['worktree']
+                or (row['harness'],row['provider'],row['model'],row['effort'])!=(fp.harness,fp.provider,fp.model,fp.effort)
                 or cleanup.get('unit_verified_exited') is not True or cleanup.get('outcome')!='complete'
                 or cleanup.get('native_outcome')!='complete'
                 or cleanup.get('unresolved_work') or cleanup.get('unresolved_definitions')):
@@ -79,7 +91,10 @@ class FixtureChats:
         expected,digest=self.resolve_route(row['harness'],row['model'],row['effort'])
         if binding!=expected or route_bindings.digest_json(binding)!=digest:
             raise RuntimeContractError('NATIVE_ROUTE_CHANGED','installed route/evidence changed before canonical preparation')
-        context,fp,native=self.seat.prepare(cid,generation)
+        checked=self.seat.candidate_fingerprint(row['harness'],row['model'],row['effort'])
+        if binding['catalogue_generation']!=checked.key[:32]:
+            raise RuntimeContractError('NATIVE_ROUTE_CHANGED','checked candidate changed before canonical preparation')
+        context,fp,native=self.seat.prepare(cid,generation,checked_fingerprint=checked)
         self.service.require_capability(context.capability_evidence,'submission')
         return context,fp,native
 
