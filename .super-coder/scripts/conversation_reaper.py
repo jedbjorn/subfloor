@@ -174,6 +174,9 @@ class ReaperStore:
         it has already reaped or interrupted is never swept twice."""
         terminal = ",".join(f"'{state}'" for state in sorted(TERMINAL_RUN_STATES))
         return (
+            "EXISTS(SELECT 1 FROM conversations native_owner "
+            "WHERE native_owner.conversation_id=r.conversation_id "
+            "AND native_owner.runtime_mode='ephemeral') AND "
             f"(r.state IN ('starting','running') OR (r.state IN ({terminal}) "
             "AND NOT EXISTS(SELECT 1 FROM conversation_events reaped "
             "WHERE reaped.run_id=r.run_id "
