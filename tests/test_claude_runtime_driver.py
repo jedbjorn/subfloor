@@ -132,6 +132,9 @@ def test_native_initialization_does_not_equal_consent_or_ready(seat):
     nonce = driver._readiness_nonce
     hook(seat, "UserPromptSubmit", prompt_id="ready-prompt",
          prompt=channel_prompt(seat, nonce, readiness_nonce=nonce))
+    driver._transcript_record({"sessionId": driver._identity.root_id, "type": "assistant",
+        "promptId": "ready-prompt", "message": {"id": "observed-native-message",
+        "content": [{"type": "text", "text": nonce}]}})
     hook(seat, "Stop", prompt_id="ready-prompt", background_tasks=[], session_crons=[])
     assert not driver._ready  # Pre-terminal Stop can be blocked by another hook.
     driver._transcript_record({"sessionId": driver._identity.root_id, "type": "system",
@@ -139,7 +142,66 @@ def test_native_initialization_does_not_equal_consent_or_ready(seat):
     assert driver._ready
     ready = [event for event in events if event.kind == "runtime.ready"]
     assert ready[0].data["inference_turns"] == 1
+    assert ready[0].data["observed_model_message_ids"] == 1
     assert not [event for event in events if event.kind == "output.final"]
+
+
+@pytest.mark.parametrize("failure", ["StopFailure", "failed_terminal", "missing_reply", "wrong_reply", "wrong_terminal_source"])
+def test_failed_or_unanswered_challenge_never_certifies_readiness(seat, failure):
+    driver, context, events = seat
+    driver._context = replace(context, capability_evidence={"submission": "compatible"})
+    transcript = Path(context.env["HOME"]) / ".claude/projects/exact" / (driver._identity.root_id + ".jsonl")
+    hook(seat, "SessionStart", transcript_path=str(transcript))
+    driver.asset({"kind": "channel.ready"}, peer=ProcessIdentity(999999999, 10), deadline=DEADLINE())
+    nonce = driver._readiness_nonce
+    hook(seat, "UserPromptSubmit", prompt_id="challenge", prompt=channel_prompt(seat, nonce, readiness_nonce=nonce))
+    if failure != "missing_reply":
+        driver._transcript_record({"sessionId": driver._identity.root_id, "type": "assistant", "promptId": "challenge",
+            "message": {"id": "observed-message", "content": [{"type": "text", "text": "different" if failure == "wrong_reply" else nonce}]}})
+    if failure == "StopFailure":
+        hook(seat, "StopFailure", prompt_id="challenge")
+    elif failure == "failed_terminal":
+        driver._terminal("challenge", "failed", "claude:owned-transcript-turn_duration")
+    elif failure == "wrong_terminal_source":
+        driver._terminal("challenge", "completed", "unattributed-terminal")
+    else:
+        driver._transcript_record({"sessionId": driver._identity.root_id, "type": "system",
+            "promptId": "challenge", "subtype": "turn_duration"})
+    assert not driver._ready and not [event for event in events if event.kind == "runtime.ready"]
+    assert driver.submit(request(), deadline=DEADLINE()).state == "not_written"
+    assert driver.cleanup(deadline=DEADLINE()).outcome in {"complete", "pending"}
+
+
+@pytest.mark.parametrize("invalid", [None, [None], [{"unexpected": "unparseable"}]])
+@pytest.mark.parametrize("native_tool", ["TaskStop", "CronDelete"])
+def test_partial_inventory_cannot_complete_native_stop_or_delete(seat, invalid, native_tool):
+    driver, context, events = seat
+    make_ready(seat)
+    driver._context = replace(context, capability_evidence={"stop_work": "compatible", "automation": "compatible"})
+    if native_tool == "TaskStop":
+        hook(seat, "PostToolUse", tool_name="Bash", tool_use_id="launch", tool_input={},
+            tool_response={"backgroundTaskId": "owned"})
+        action, args, response = "stop_work", {"task_id": "owned"}, {"task_id": "owned", "task_type": "local_bash"}
+    else:
+        hook(seat, "PostToolUse", tool_name="CronCreate", tool_use_id="launch",
+            tool_input={"durable": False}, tool_response={"id": "owned", "durable": False, "recurring": True})
+        action, args, response = "stop_automation", {"id": "owned"}, {"id": "owned"}
+    driver.control(NativeControl("control", 1, "sha", action,
+        NativeReference(root_id=driver._identity.root_id, work_id="owned")), deadline=DEADLINE())
+    hook(seat, "UserPromptSubmit", prompt_id="current", prompt=channel_prompt(seat, "none", control_id="control"))
+    hook(seat, "PostToolUse", prompt_id="current", tool_name=native_tool, tool_use_id="stop-tool",
+        tool_input=args, tool_response=response)
+    hook(seat, "Stop", prompt_id="current", background_tasks=invalid, session_crons=[])
+    assert driver.inventory(deadline=DEADLINE()).partial
+    assert not [event for event in events if event.kind in {"work.terminal", "control.outcome"}]
+    assert "control" in driver._pending_results and driver._work["owned"].state in {"running", "scheduled"}
+    if native_tool == "CronDelete":
+        assert "owned" in driver._definitions
+    hook(seat, "Stop", prompt_id="current", background_tasks=[], session_crons=[])
+    assert [event for event in events if event.kind == "control.outcome"][-1].data["outcome"] == "complete"
+    assert "control" not in driver._pending_results
+    if native_tool == "CronDelete":
+        assert "owned" not in driver._definitions
 
 
 def test_acks_are_not_processing_busy_queue_is_retained_and_no_blind_replay(seat):
@@ -191,7 +253,7 @@ def test_user_narration_and_stale_snapshot_cannot_prove_task_stop(seat):
     assert not [event for event in events if event.kind == "control.outcome"]
     hook(seat, "Stop", prompt_id="control-prompt", background_tasks=[], session_crons=[])
     outcome = [event for event in events if event.kind == "control.outcome"][-1]
-    assert outcome.data == {"outcome": "native_stopped", "os_verified": False}
+    assert outcome.data == {"outcome": "complete", "native_outcome": "native_stopped", "os_verified": False}
     hook(seat, "SubagentStop", background_tasks=[{"id": "task-1", "type": "shell", "status": "running"}], session_crons=[])
     assert driver.inventory(deadline=DEADLINE()).partial
     assert driver._work["task-1"].state == "unknown_conflicting_snapshot"

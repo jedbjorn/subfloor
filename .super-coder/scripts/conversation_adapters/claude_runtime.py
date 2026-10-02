@@ -112,6 +112,7 @@ class Activity:
     displays: dict[str, tuple[int, str]] = field(default_factory=dict)
     automation_id: str | None = None
     model_messages: set[str] = field(default_factory=set)
+    readiness_reply: bool = False
 
 
 class ClaudeRuntimeDriver(RuntimeDriver):
@@ -623,6 +624,7 @@ class ClaudeRuntimeDriver(RuntimeDriver):
         if not activity:
             return
         if prompt_id == self._readiness_prompt:
+            activity.readiness_reply |= text.strip() == self._readiness_nonce
             return  # Initialization is not a synthetic GUI user exchange.
         digest = hashlib.sha256(text.encode()).hexdigest()
         if digest in activity.texts:
@@ -695,12 +697,12 @@ class ClaudeRuntimeDriver(RuntimeDriver):
         for work_id, work in list(self._work.items()):
             if work.kind == "child":
                 continue  # Stop's arrays are not a complete native agent registry.
-            if work_id not in seen and work.state not in {"completed", "stopped", "failed", "deleted"}:
+            if not partial and work_id not in seen and work.state not in {"completed", "stopped", "failed", "deleted"}:
                 self._work[work_id] = NativeWork(work.reference, work.kind, "absent_from_snapshot",
                     "claude:Stop-snapshot", observed, durable=work.durable, data=work.data)
         self._snapshot_at, self._snapshot_partial = observed, partial
         for control_id, (work_id, success, result_prompt) in list(self._pending_results.items()):
-            if success and result_prompt and event.get("prompt_id") == result_prompt and work_id not in seen:
+            if not partial and success and result_prompt and event.get("prompt_id") == result_prompt and work_id not in seen:
                 self._work_terminal(work_id, "stopped", "claude:native-result+later-snapshot")
                 is_automation = self._controls.get(control_id, (None, None))[0] == "CronDelete"
                 if is_automation:
@@ -708,12 +710,12 @@ class ClaudeRuntimeDriver(RuntimeDriver):
                     self._work_terminal(work_id, "deleted", "claude:CronDelete+later-snapshot")
                 self._send_event(RuntimeEvent("control.outcome", reference=self._reference(work=work_id),
                     control_id=control_id, provenance="claude:native-result+later-snapshot", grade="compatible",
-                    data={"outcome": "native_deleted" if is_automation else "native_stopped", "os_verified": False}))
+                    data={"outcome": "complete", "native_outcome": "native_deleted" if is_automation else "native_stopped", "os_verified": False}))
                 del self._pending_results[control_id]
         for activity in self._activities.values():
             work_id = activity.automation_id
             scheduled_work = self._work.get(work_id or "")
-            if work_id and scheduled_work and activity.terminal and work_id not in seen and scheduled_work.durable is False and scheduled_work.data.get("recurring") is False:
+            if not partial and work_id and scheduled_work and activity.terminal and work_id not in seen and scheduled_work.durable is False and scheduled_work.data.get("recurring") is False:
                 self._definitions.pop(work_id, None)
                 self._work_terminal(work_id, "completed", "claude:oneshot-native-turn+later-snapshot")
         self._send_event(RuntimeEvent("snapshot.observed", reference=self._reference(),
@@ -811,10 +813,12 @@ class ClaudeRuntimeDriver(RuntimeDriver):
         if self._primary == prompt_id:
             self._primary, self._primary_state = None, "idle"
         scheduled = self._work.get(activity.automation_id or "")
-        if activity.automation_id and scheduled and scheduled.state == "absent_from_snapshot" and scheduled.durable is False and scheduled.data.get("recurring") is False:
+        if not self._snapshot_partial and activity.automation_id and scheduled and scheduled.state == "absent_from_snapshot" and scheduled.durable is False and scheduled.data.get("recurring") is False:
             self._definitions.pop(activity.automation_id, None)
             self._work_terminal(activity.automation_id, "completed", "claude:oneshot-snapshot+native-terminal")
-        if prompt_id == self._readiness_prompt and not self._ready and not self._lost:
+        if (prompt_id == self._readiness_prompt and not self._ready and not self._lost
+                and status == "completed" and activity.readiness_reply
+                and provenance == "claude:owned-transcript-turn_duration"):
             self._ready = True
             self._send_event(RuntimeEvent("runtime.ready", reference=self._reference(prompt_id),
                 provenance="claude:processed-readiness+owned-transcript-terminal", grade="compatible",
@@ -827,7 +831,7 @@ class ClaudeRuntimeDriver(RuntimeDriver):
             if action == "stop_reply" and target == prompt_id:
                 self._send_event(RuntimeEvent("control.outcome", reference=self._reference(prompt_id),
                     control_id=control_id, provenance=provenance, grade="compatible",
-                    data={"outcome": "primary_terminal_observed", "interrupt_reason": "unverified"}))
+                    data={"outcome": "complete", "native_outcome": "primary_terminal_observed", "interrupt_reason": "unverified"}))
         self._condition.notify_all()
 
     def _drain_transcript(self) -> None:
