@@ -538,7 +538,10 @@ def main(argv: list[str] | None = None) -> int:
         module=importlib.import_module("gui_experiment_test_driver")
     else:
         module=importlib.import_module(f"conversation_adapters.{args.harness}_runtime")
-    controller=Controller(args.generation,args.root,module.create_driver())
+    driver=module.create_driver()
+    if args.test_transport:
+        driver.harness=args.harness
+    controller=Controller(args.generation,args.root,driver)
     PrivateServer(controller,args.endpoint or args.root/"controller.sock").serve()
     return 0
 

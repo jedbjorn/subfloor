@@ -51,9 +51,11 @@ class RuntimeStore:
         con=db_driver.connect(self.database)
         try:
             con.execute("BEGIN IMMEDIATE")
-            row=con.execute("SELECT shell_id,owner_user_id,state FROM conversations WHERE conversation_id=?",(context.conversation_id,)).fetchone()
+            row=con.execute("SELECT shell_id,owner_user_id,state,harness,provider,model,effort,worktree FROM conversations WHERE conversation_id=?",(context.conversation_id,)).fetchone()
             if row is None or (row["shell_id"],row["owner_user_id"]) != (context.shell_id,context.owner_user_id) or row["state"]=="closed":
                 raise RuntimeContractError("RUNTIME_NOT_OWNED", "open conversation ownership required")
+            if any(row[key]!=getattr(context,key) for key in ("harness","provider","model","effort")) or Path(row["worktree"]).resolve()!=context.worktree.resolve():
+                raise RuntimeContractError("GENERATION_CONFLICT","prepared route/worktree differs from immutable conversation")
             for previous in con.execute("SELECT cleanup_json FROM conversation_runtime_generations WHERE conversation_id=?",(context.conversation_id,)).fetchall():
                 cleanup=json.loads(previous["cleanup_json"])
                 if cleanup.get("unit_verified_exited") is not True or cleanup.get("outcome")!="complete" or cleanup.get("unresolved_definitions") or cleanup.get("unresolved_work"):
