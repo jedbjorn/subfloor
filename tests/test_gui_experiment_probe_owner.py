@@ -211,6 +211,29 @@ def test_probe_role_refuses_ordinary_input_even_with_cached_submission(owner,mon
     assert con.execute('SELECT COUNT(*) FROM conversation_messages').fetchone()[0]==0
 
 
+def test_stale_cleanup_cannot_complete_replacement_job_or_release_its_fence(owner,monkeypatch):
+    value,fingerprint,con,_=owner
+    def failed_git(*args,**kwargs):raise OSError('synthetic Git failure')
+    monkeypatch.setattr('gui_experiment_probe_owner.subprocess.run',failed_git)
+    with pytest.raises(OSError):value.allocate(fingerprint,frozenset({'submission'}),time.monotonic()+30)
+    old=con.execute('SELECT generation_id FROM conversation_runtime_probe_jobs').fetchone()[0]
+    original=value.service.finish_preparation
+    replaced=[]
+    def finish(cid,generation):
+        value.service.finish_preparation=original
+        assert value.cleanup(fingerprint,time.monotonic()+10).complete
+        monkeypatch.setattr('gui_experiment_probe_owner.subprocess.run',lambda *args,**kwargs:None)
+        replacement=value.allocate(fingerprint,frozenset({'submission'}),time.monotonic()+30)
+        replaced.append(replacement)
+        value.closing.add(fingerprint.key) # current-generation cleanup fence
+        original(cid,generation)
+    value.service.finish_preparation=finish
+    assert not value.cleanup(fingerprint,time.monotonic()+10).complete
+    job=con.execute('SELECT generation_id,status FROM conversation_runtime_probe_jobs').fetchone()
+    assert job[0]!=old and job[0]==replaced[0].context.generation_id and job[1]=='preparing'
+    assert fingerprint.key in value.closing
+
+
 def test_real_checker_factory_entry_accepts_owned_common_fixture_boundary(owner,monkeypatch):
     from conversation_runtime_checks import CompatibilityChecker
     from conversation_runtime_contract import DriverStart, NativeCleanup
