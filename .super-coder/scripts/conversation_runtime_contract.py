@@ -20,6 +20,8 @@ from typing import Any, Literal
 CONTRACT_REVISION = "f89-native-runtime-v1"
 MAX_FRAME_BYTES = 256 * 1024
 MAX_EVENT_BYTES = 64 * 1024
+MAX_HISTORY_BASELINE_BYTES = 64 * 1024
+HISTORY_BASELINE_REVISION = "f89-private-history-baseline-v1"
 EVENT_KINDS = frozenset({
     "runtime.ready", "runtime.setup", "runtime.lost", "ownership.failed",
     "activity.started", "activity.processed", "activity.terminal",
@@ -60,6 +62,7 @@ WriteState = Literal["not_written", "written", "unknown", "unsupported", "reject
 _SENSITIVE_KEYS = frozenset({
     "token", "api_key", "authorization", "credentials", "credential", "password",
     "secret", "env", "environment", "thinking", "reasoning", "analysis",
+    "history_baseline",
 })
 _IDENTITY_KEYS = frozenset({"generation_id","conversation_id","root_id","thread_id",
                           "parent_thread_id","activity_id","native_activity_id","item_id",
@@ -91,6 +94,8 @@ def public_payload(value: Any, *, sensitive_values: tuple[str, ...] = ()) -> Any
     event data. Key filtering alone cannot redact secrets embedded in strings.
     Private reasoning must be excluded by driver normalization before emission.
     """
+    if isinstance(value, HistoryBaseline) or (isinstance(value, Mapping) and value.get("revision")==HISTORY_BASELINE_REVISION):
+        raise RuntimeContractError("HISTORY_BASELINE_PRIVATE", "private history baseline cannot enter public data")
     if isinstance(value, Mapping):
         for key,item in value.items():
             if key in _IDENTITY_KEYS and isinstance(item,str) and any(secret and secret in item for secret in sensitive_values):
@@ -221,6 +226,154 @@ class NativeHistory:
                 raise RuntimeContractError('HISTORY_INVALID','history requires exact source and cleanup digests')
 
 
+def _baseline_failure() -> RuntimeContractError:
+    # Never interpolate private paths, native IDs or malformed input.
+    return RuntimeContractError('HISTORY_BASELINE_INVALID','bounded private history baseline required')
+
+
+def _baseline_id(value: Any) -> None:
+    if (not isinstance(value,str) or not 1<=len(value)<=255
+            or any(not (c.isascii() and (c.isalnum() or c in '._:/-')) for c in value)):
+        raise _baseline_failure()
+
+
+def _baseline_sha(value: Any) -> None:
+    if not isinstance(value,str) or len(value)!=64 or any(c not in '0123456789abcdef' for c in value):
+        raise _baseline_failure()
+
+
+def _baseline_count(value: Any) -> None:
+    if type(value) is not int or not 0<=value<2**63:
+        raise _baseline_failure()
+
+
+@dataclass(frozen=True)
+class HistoryRecordBoundary:
+    """Historical exclusion identities only, never current control targets/text."""
+    kind: str
+    native_id: str
+    parent_id: str | None = None
+    state: str = 'unknown'
+    content_sha256: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.kind not in {'turn','item','child','record','prompt','goal','definition'} or self.state not in {
+                'unknown','completed','failed','interrupted','absent','cleared','achieved','deleted'}:
+            raise _baseline_failure()
+        _baseline_id(self.native_id)
+        if self.parent_id is not None:
+            _baseline_id(self.parent_id)
+        if self.content_sha256 is not None:
+            _baseline_sha(self.content_sha256)
+
+
+@dataclass(frozen=True)
+class ClaudeFileBoundary:
+    """Private hook-attributed file operand; validity does not authorize reading it.
+
+    Only a future provider/owner capture may attest this namespace. This shared
+    type/helper never opens native transcripts or discovers a native HOME.
+    """
+    namespace: str
+    transcript: str
+    parent_device: int
+    parent_inode: int
+    file_device: int
+    file_inode: int
+    eof_bytes: int
+    prefix_sha256: str
+    record_count: int
+
+    def __post_init__(self) -> None:
+        for value in (self.namespace,self.transcript):
+            if (not isinstance(value,str) or len(value)>4096 or not Path(value).is_absolute()
+                    or '..' in Path(value).parts or any(c in value for c in '\x00\r\n')):
+                raise _baseline_failure()
+        if not Path(self.transcript).is_relative_to(Path(self.namespace)) or self.transcript==self.namespace:
+            raise _baseline_failure()
+        for key in ('parent_device','parent_inode','file_device','file_inode','eof_bytes','record_count'):
+            _baseline_count(getattr(self,key))
+        if not self.parent_inode or not self.file_inode:
+            raise _baseline_failure()
+        _baseline_sha(self.prefix_sha256)
+
+
+@dataclass(frozen=True,repr=False)
+class HistoryBaseline:
+    """Private bounded transfer, NOT eligibility or effective native policy.
+
+    Capture and owner seal/cleanup qualification are separate future operations.
+    No raw prompts/output/goals/environment are fields. All provider records are
+    frozen ID/hash-only boundaries; malformed/partial transfer refuses history.
+    """
+    source_conversation_id: str
+    source_generation_id: str
+    native_root_id: str
+    native_session_id: str
+    harness: str
+    source_boot_digest: str
+    source_policy_digest: str
+    executable_sha256: str
+    configuration_sha256: str
+    capture_sequence: int
+    records: tuple[HistoryRecordBoundary, ...]
+    claude_file: ClaudeFileBoundary | None = field(default=None,repr=False)
+    revision: str = HISTORY_BASELINE_REVISION
+    complete: bool = True
+
+    def __post_init__(self) -> None:
+        for key in ('source_conversation_id','source_generation_id','native_root_id','native_session_id'):
+            _baseline_id(getattr(self,key))
+        for key in ('source_boot_digest','source_policy_digest','executable_sha256','configuration_sha256'):
+            _baseline_sha(getattr(self,key))
+        _baseline_count(self.capture_sequence)
+        if (self.revision!=HISTORY_BASELINE_REVISION or self.complete is not True
+                or self.harness not in {'claude','codex'} or not isinstance(self.records,tuple)
+                or len(self.records)>512 or any(not isinstance(record,HistoryRecordBoundary) for record in self.records)
+                or (self.harness=='claude' and not isinstance(self.claude_file,ClaudeFileBoundary))
+                or (self.harness=='codex' and self.claude_file is not None)):
+            raise _baseline_failure()
+        if len({(r.kind,r.native_id) for r in self.records})!=len(self.records):
+            raise _baseline_failure()
+        if len(self.private_bytes())>MAX_HISTORY_BASELINE_BYTES:
+            raise _baseline_failure()
+
+    def private_bytes(self) -> bytes:
+        import dataclasses
+        return json.dumps(dataclasses.asdict(self),sort_keys=True,separators=(',',':'),
+                          ensure_ascii=False,allow_nan=False).encode()
+
+    def matches(self, history: NativeHistory) -> bool:
+        return (self.source_conversation_id,self.source_generation_id,self.native_root_id,self.harness,
+                self.source_boot_digest,self.source_policy_digest)==(
+                history.source_conversation_id,history.source_generation_id,history.native_root_id,history.harness,
+                history.source_boot_digest,history.source_policy_digest)
+
+    @classmethod
+    def from_private_wire(cls, value: Any) -> HistoryBaseline:
+        import dataclasses
+        try:
+            if not isinstance(value,dict) or set(value)!={f.name for f in dataclasses.fields(cls)}:
+                raise _baseline_failure()
+            if len(json.dumps(value,allow_nan=False,separators=(',',':'),ensure_ascii=False).encode())>MAX_HISTORY_BASELINE_BYTES:
+                raise _baseline_failure()
+            data=dict(value)
+            if not isinstance(data['records'],list) or len(data['records'])>512:
+                raise _baseline_failure()
+            fields={f.name for f in dataclasses.fields(HistoryRecordBoundary)}
+            if any(not isinstance(row,dict) or set(row)!=fields for row in data['records']):
+                raise _baseline_failure()
+            data['records']=tuple(HistoryRecordBoundary(**row) for row in data['records'])
+            file=data['claude_file']
+            if file is not None:
+                if not isinstance(file,dict) or set(file)!={f.name for f in dataclasses.fields(ClaudeFileBoundary)}:
+                    raise _baseline_failure()
+                data['claude_file']=ClaudeFileBoundary(**file)
+            return cls(**data)
+        except (TypeError,ValueError,OverflowError,RecursionError):
+            raise _baseline_failure() from None
+
+
 @dataclass(frozen=True)
 class RuntimeContext:
     generation_id: str
@@ -258,6 +411,7 @@ class RuntimeContext:
     controller_endpoint: Path | None = None
     history: NativeHistory | None = None
     workspace: WorkspaceIdentity | None = None
+    history_baseline: HistoryBaseline | None = field(default=None,repr=False)
 
     def __post_init__(self) -> None:
         if not self.permission_mode or not self.policy_digest or not self.boot_digest:
@@ -270,6 +424,10 @@ class RuntimeContext:
                     or (history.harness,history.model,history.effort,history.source_worktree)
                     !=(self.harness,self.model,self.effort,self.worktree)):
                 raise RuntimeContractError('HISTORY_INVALID','history requires a distinct conversation/generation and unchanged owned route/worktree')
+        if self.history_baseline is not None and (
+                not isinstance(self.history_baseline,HistoryBaseline) or self.history is None
+                or not self.history_baseline.matches(self.history)):
+            raise _baseline_failure()
         if self.workspace is not None and (not isinstance(self.workspace,WorkspaceIdentity) or self.workspace.cwd!=self.worktree):
             raise RuntimeContractError('HISTORY_WORKSPACE_INVALID','prepared workspace differs from captured canonical cwd')
         # The harness driver must reject unsupported modes; never substitute a
@@ -308,6 +466,32 @@ class NativeReference:
             value=getattr(self,key)
             if (key=="root_id" and value is None) or (value is not None and (not isinstance(value,str) or not 1<=len(value)<=255)):
                 raise RuntimeContractError("REFERENCE_INVALID","bounded opaque native identities required")
+
+
+def runtime_context_wire(context: RuntimeContext) -> dict[str, Any]:
+    """Only private Open may encode baseline, never a public context projection."""
+    import dataclasses
+    # Explicit existing wire fields; do not blindly asdict future private fields.
+    data={key:getattr(context,key) for key in (
+        'generation_id','conversation_id','shell_id','owner_user_id','harness',
+        'driver_revision','boot_digest','policy_digest','permission_mode','provider',
+        'model','effort','boot_content','execution_prefix','managed_mcp_args',
+        'capability_evidence','probe_capabilities','env')}
+    data.update(state_root=str(context.state_root),worktree=str(context.worktree),
+                executable={**dataclasses.asdict(context.executable),'path':str(context.executable.path)},
+                controller_endpoint=str(context.controller_endpoint) if context.controller_endpoint else None,
+                managed_mcp_files=[str(path) for path in context.managed_mcp_files])
+    if context.history is not None:
+        data['history']={**dataclasses.asdict(context.history),'source_worktree':str(context.history.source_worktree)}
+    if context.workspace is not None:
+        data['workspace']={**dataclasses.asdict(context.workspace),'cwd':str(context.workspace.cwd),
+                           'git_common_dir':str(context.workspace.git_common_dir)}
+    if context.history_baseline is not None:
+        data['history_baseline']=json.loads(context.history_baseline.private_bytes())
+    # Baseline bound alone cannot authorize an oversized whole Open frame.
+    if len(json.dumps(data,allow_nan=False).encode())>MAX_FRAME_BYTES:
+        raise RuntimeContractError('FRAME_TOO_LARGE','private context exceeds frame bound')
+    return data
 
 
 @dataclass(frozen=True)

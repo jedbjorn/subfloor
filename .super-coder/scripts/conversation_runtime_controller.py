@@ -31,6 +31,7 @@ from conversation_runtime_contract import (
     MAX_FRAME_BYTES,
     OUTPUT_KINDS,
     ExecutableBinding,
+    HistoryBaseline,
     NativeControl,
     NativeHistory,
     NativeReference,
@@ -384,6 +385,9 @@ def runtime_context(value: dict) -> RuntimeContext:
             data['history']=NativeHistory(**(history | {'source_worktree':Path(history['source_worktree'])}))
         except (TypeError,ValueError) as exc:
             raise RuntimeContractError('HISTORY_INVALID','invalid predecessor selection') from exc
+    baseline=data.get('history_baseline')
+    if baseline is not None:
+        data['history_baseline']=HistoryBaseline.from_private_wire(baseline)
     workspace=data.get('workspace')
     if workspace is not None:
         if not isinstance(workspace,dict) or set(workspace)!={'cwd','git_common_dir','branch','head'}:
@@ -797,7 +801,7 @@ class Controller:
 
     def status(self) -> dict:
         return {"generation":self.generation,"contract":CONTRACT_REVISION,"ready":self.ready,
-                "lost":self.lost,"identity":dataclasses.asdict(self.identity) if self.identity else None,
+                "lost":self.lost,"identity":public_payload(dataclasses.asdict(self.identity),sensitive_values=self.journal.secrets) if self.identity else None,
                 "setup":self.journal.get('setup'),"setup_confirmation":self.journal.get('setup_confirmation'),
                 'quiet':self.journal.quiet(),**self.journal.replay(self.journal.get("sequence"))}
 

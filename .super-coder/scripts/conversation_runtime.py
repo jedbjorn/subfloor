@@ -27,6 +27,7 @@ from conversation_runtime_contract import (
     RuntimeEvent,
     payload_digest,
     public_payload,
+    runtime_context_wire,
 )
 from conversation_runtime_controller import encoded, reference, start_ticks
 
@@ -300,20 +301,7 @@ class RuntimeClient:
         return self.request("attach",**self.lease)
 
     def open(self,context: RuntimeContext) -> dict:
-        data=dataclasses.asdict(context)
-        data["state_root"],data["worktree"]=str(context.state_root),str(context.worktree)
-        data["controller_endpoint"]=str(context.controller_endpoint) if context.controller_endpoint else None
-        data["executable"]["path"]=str(context.executable.path)
-        data["managed_mcp_files"]=[str(p) for p in context.managed_mcp_files]
-        if context.history is not None:
-            data["history"]["source_worktree"]=str(context.history.source_worktree)
-        else:
-            data.pop("history",None)
-        if context.workspace is not None:
-            data['workspace']['cwd']=str(context.workspace.cwd)
-            data['workspace']['git_common_dir']=str(context.workspace.git_common_dir)
-        else:
-            data.pop('workspace',None)
+        data=runtime_context_wire(context)
         return self.request("open",context=data,timeout=120)
 
     def submit(self,store: RuntimeStore,owner: int,shell: int,cid: str,**payload) -> dict:
