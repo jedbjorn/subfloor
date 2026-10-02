@@ -761,3 +761,26 @@ def test_checker_submission_proof_survives_optional_target_gap_only_after_full_c
     assert ('owned_unit_cleanup' in result.evidence['submission'].coverage) == (cleanup == 'complete')
     assert checker.cache.admission(fp)['submission'] == ('compatible' if cleanup == 'complete' else 'inconclusive')
     assert not result.evidence['stop_work'].coverage
+
+
+@pytest.mark.parametrize('boundary', ['activity', 'item', 'digest', 'contiguous', 'replay', 'conflicting', 'missing_part'])
+def test_pid_candidates_preserve_observed_text_record_and_part_boundaries(owned, boundary):
+    from conversation_runtime_native_probes import _Scenarios
+    driver = start(owned)
+    ref = NativeReference('root', 'root', activity_id='turn')
+    owned.client.pids[200] = ProcessIdentity(200, 2000)
+    other = replace(ref, activity_id='other') if boundary == 'activity' else replace(ref, item_id='other') if boundary == 'item' else ref
+    rows = [RuntimeEvent('output.final', ref, data={'text': 'TAG=200', 'text_digest': 'a'*64, 'part': 0, 'last': True}),
+            RuntimeEvent('output.final', other, data={'text': '123', 'text_digest': 'b'*64, 'part': 0, 'last': True})]
+    if boundary in {'contiguous', 'replay', 'conflicting', 'missing_part'}:
+        rows = [RuntimeEvent('output.final', ref, data={'text': text, 'text_digest': 'a'*64, 'part': part, 'last': part == 1})
+                for part, text in enumerate(['TAG=2', '00'])]
+        if boundary == 'replay': rows.insert(1, rows[0])
+        if boundary == 'conflicting': rows.append(replace(rows[0], data=rows[0].data | {'text': 'TAG=3'}))
+        if boundary == 'missing_part': rows = [replace(rows[1], data=rows[1].data | {'text': 'TAG=200'})]
+    with driver._lock: driver.events = rows
+    scenario = _Scenarios(driver, frozenset({'submission'}), time.monotonic()+1)
+    try:
+        assert scenario._pid('TAG') == (None if boundary in {'conflicting', 'missing_part'} else ProcessIdentity(200, 2000))
+    finally:
+        driver.cleanup(deadline=time.monotonic()+1)
