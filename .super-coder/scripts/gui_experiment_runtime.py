@@ -253,22 +253,36 @@ class FixtureNativeCheck:
             threading.Thread(target=observe,name='fixture-native-schema',daemon=True).start()
             return self.status()
 
-    def begin(self, *, on_candidate=None) -> dict:
+    def begin(self, *, selection=None,on_candidate=None) -> dict:
+        from conversation_native_checks import CODEX_SELECTION, configured_selection
+        selection=configured_selection(CODEX_SELECTION if selection is None else selection)
         with self.lock:
             if self.stopped:
                 raise RuntimeContractError('FIXTURE_STOPPED','API consumer is stopping')
             if self.future is not None and not self.future.done():
+                if self.fingerprint and selection!={'harness':self.fingerprint.harness,'model':self.fingerprint.model,'effort':self.fingerprint.effort}:
+                    raise RuntimeContractError('CHECK_BUSY','another selected native check is active')
                 return self.status()
             if self.schema_future is not None and not self.schema_future.done():
                 raise RuntimeContractError('CHECK_BUSY','native schema observation is active')
             self.retained_guard()
             deadline=time.monotonic()+177
-            fp=self.seat.candidate_fingerprint('codex','gpt-6.1-sol','high')
-            observation=self.native_schema(fp,deadline-20)
-            if observation.structural_grades['submission']!='compatible' or not observation.generation_completed:
-                raise RuntimeContractError('NATIVE_SCHEMA_INCONCLUSIVE','required native submission interface is unavailable')
-            shape=observation.observed_interface
-            requirements={cap:observation.requirements[cap] for cap in ('submission','stop_reply','stop_work')}
+            fp=self.seat.candidate_fingerprint(**selection)
+            if (selection!={'harness':fp.harness,'model':fp.model,'effort':fp.effort}
+                    or fp.provider!=('openai' if fp.harness=='codex' else 'anthropic')):
+                raise RuntimeContractError('CHECK_CANDIDATE_CHANGED','captured fingerprint does not match the selected native request')
+            if fp.harness=='codex':
+                observation=self.native_schema(fp,deadline-20)
+                if observation.structural_grades['submission']!='compatible' or not observation.generation_completed:
+                    raise RuntimeContractError('NATIVE_SCHEMA_INCONCLUSIVE','required native submission interface is unavailable')
+                shape=observation.observed_interface
+                requirements={cap:observation.requirements[cap] for cap in ('submission','stop_reply','stop_work')}
+            else:
+                from conversation_adapters.claude_runtime import create_driver
+                # This is source signature checking only. Native hook/channel,
+                # route and qualified memory observations are required by the
+                # owned driver/factory before useful inference and cache proof.
+                shape,requirements=adapter_interface(create_driver())
             remaining=deadline-time.monotonic()
             if remaining<60:
                 raise RuntimeContractError('CHECK_DEADLINE','source preparation consumed the finite check budget')
@@ -341,16 +355,20 @@ class FixtureNativeCheck:
                     # Restart exposes retained ownership; never replacement
                     # allocation, inferred grades, or replay of a lost probe.
                     job=con.execute("SELECT * FROM conversation_runtime_probe_jobs WHERE status!='complete' ORDER BY updated_at DESC LIMIT 1").fetchone()
-                chat=con.execute('SELECT runtime_projection FROM conversations WHERE conversation_id=?',(job['conversation_id'],)).fetchone() if job else None
+                chat=con.execute('SELECT runtime_projection,harness,model,effort FROM conversations WHERE conversation_id=?',(job['conversation_id'],)).fetchone() if job else None
                 events=con.execute('SELECT event_json FROM conversation_runtime_events WHERE generation_id=? ORDER BY sequence',(job['generation_id'],)).fetchall() if job else []
             finally:
                 con.close()
-            result: dict[str,Any]={'fixture_id':self.fixture_id,'operation':'finite-native-check','harness':'codex',
-                    'model':'gpt-6.1-sol','effort':'high','state':'running' if self.future and not self.future.done() else 'retained' if job and job['status']!='complete' else 'idle',
+            selected={'harness':fp.harness,'model':fp.model,'effort':fp.effort} if fp else {
+                'harness':chat['harness'],'model':chat['model'],'effort':chat['effort']} if chat else {
+                'harness':'codex','model':'gpt-6.1-sol','effort':'high'}
+            result: dict[str,Any]={'fixture_id':self.fixture_id,'operation':'finite-native-check',**selected,
+                    'state':'running' if self.future and not self.future.done() else 'retained' if job and job['status']!='complete' else 'idle',
                     'fingerprint':fp.key if fp else None,'probe':None,'grades':{},'evidence':{},
-                    'diagnostic':self.failure,'ordinary_chats_admitted':False,'structural_observation':'installed-native-generated-schema',
+                    'diagnostic':self.failure,'ordinary_chats_admitted':False,'structural_observation':
+                    'installed-native-generated-schema' if selected['harness']=='codex' else 'source-adapter-signatures-plus-native-runtime-validators',
                     'cache_persisted':self.persisted,'close_pending':self.cancelling}
-            if self.schema_public is not None:
+            if self.schema_public is not None and selected['harness']=='codex':
                 result['native_schema']=self.schema_public
             if self.schema_cleanup_pending:
                 result['native_schema']={'state':'cleanup_pending','behavior_admitted':False,
