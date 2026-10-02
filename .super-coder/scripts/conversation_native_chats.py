@@ -33,6 +33,16 @@ def append_event(con, cid: str, kind: str, payload: dict, *, message_id=None, ru
                 (cid,sequence,conversation_events.require_event_type(kind),json.dumps(payload),message_id,run_id))
 
 
+def mirrored_output(con,cid: str,rid: Any,event: dict,harness: str) -> bool:
+    ref=event.get('reference') or {}
+    if (rid is None or event['kind'] not in {'output.delta','output.final'} or not ref.get('item_id')
+            or not (ref.get('thread_id')==ref.get('root_id') or harness=='claude' and ref.get('thread_id') is None)
+            or not (harness=='claude' or event['data'].get('kind')=='assistant')):
+        return False
+    return con.execute("SELECT 1 FROM conversation_events WHERE conversation_id=? AND run_id=? AND event_type='assistant.delta' AND json_extract(payload,'$.native_final')=1 AND json_extract(payload,'$.native_reference.item_id')=? LIMIT 1",
+                       (cid,rid,ref['item_id'])).fetchone() is not None
+
+
 def project_event(con, cid: str, sequence: int, event: dict, *, primary: dict | None = None) -> None:
     """Same transaction as the controller watermark; replay never duplicates.
 
@@ -57,6 +67,10 @@ def project_event(con, cid: str, sequence: int, event: dict, *, primary: dict | 
                               (generation,event['request_id'])).fetchone()
     intent = json.loads(command['intent_json']) if command else {}
     mid, rid = intent.get('message_id'), intent.get('run_id')
+    if mid is not None or rid is not None:
+        if not all(str(value).isdecimal() and int(str(value))>0 for value in (mid,rid)):
+            raise RuntimeContractError('COMMAND_INVALID','GUI intent has no attributable engine message/run')
+        mid,rid=int(str(mid)),int(str(rid))
     root_activity = bool(ref.get('root_id') and (ref.get('thread_id')==ref['root_id'] or current['harness']=='claude' and ref.get('thread_id') is None))
     projection.update(controller_sequence=sequence,observed_at=event['observed_at'],
                       freshness=event['freshness'],partial=bool(projection.get('partial') or event['partial']))
@@ -90,9 +104,9 @@ def project_event(con, cid: str, sequence: int, event: dict, *, primary: dict | 
     # this individual event (which may be child, stale, late or replayed).
     projection['primary'] = None if closed else primary
     con.execute('UPDATE conversations SET runtime_projection=?,version=version+1 WHERE conversation_id=?',(json.dumps(projection),cid))
-    envelope = {'generation_id':generation,'controller_sequence':sequence,**event}
-    append_event(con,cid,kind,envelope,message_id=mid,run_id=rid)
-    if root_activity and mid is not None and rid is not None:
+    if (root_activity and mid is not None and rid is not None
+            and event['freshness']=='current' and not event['partial']
+            and event['grade'] not in {'inconclusive','incompatible'}):
         run = con.execute('SELECT state FROM conversation_runs WHERE run_id=? AND conversation_id=? AND trigger_message_id=?',(rid,cid,mid)).fetchone()
         if run is None:
             raise RuntimeContractError('COMMAND_INVALID','command run is outside chat')
@@ -101,12 +115,24 @@ def project_event(con, cid: str, sequence: int, event: dict, *, primary: dict | 
             con.execute("UPDATE conversation_messages SET state='running' WHERE message_id=? AND state IN ('accepted','queued')",(mid,))
             con.execute("UPDATE conversations SET state='running' WHERE conversation_id=? AND state='queued'",(cid,))
             append_event(con,cid,'run.started',{'native_activity_id':ref.get('activity_id')},message_id=mid,run_id=rid)
-        elif kind == 'output.delta' and run['state'] in {'starting','running'}:
-            append_event(con,cid,'assistant.delta',
-                         {'text':event['data'].get('text',''),'native_reference':ref},message_id=mid,run_id=rid)
+        elif (kind == 'output.final' and run['state'] in {'starting','running'}
+              and (current['harness']=='claude' or event['data'].get('kind')=='assistant')
+              and ref.get('item_id')):
+            part=event['data'].get('part',event['data'].get('offset',0))
+            prior=con.execute("SELECT 1 FROM conversation_events WHERE conversation_id=? AND run_id=? AND event_type='assistant.delta' AND json_extract(payload,'$.native_final')=1 AND json_extract(payload,'$.native_reference.item_id')=? AND json_extract(payload,'$.native_part')=?",
+                              (cid,rid,ref['item_id'],part)).fetchone()
+            if prior is None:
+                append_event(con,cid,'assistant.delta',
+                             {'text':event['data'].get('text',''),'native_reference':ref,'native_final':True,'native_part':part,
+                              'native_controller_sequence':sequence},message_id=mid,run_id=rid)
         elif kind=='activity.terminal' and run['state'] in {'starting','running'}:
             status = event['data'].get('status')
             target = 'succeeded' if status in {'completed','complete','succeeded'} else 'cancelled' if status in {'interrupted','cancelled'} else 'failed' if status in {'failed','errored'} else 'unknown'
+            if run['state']=='starting' and target=='succeeded':
+                # A qualified terminal can be retained after a lost start
+                # observation; success itself proves that input was processed.
+                con.execute("UPDATE conversation_runs SET state='running' WHERE run_id=?",(rid,))
+                con.execute("UPDATE conversation_messages SET state='running' WHERE message_id=? AND state IN ('accepted','queued')",(mid,))
             con.execute("UPDATE conversation_runs SET state=?,ended_at=datetime('now') WHERE run_id=?",(target,rid))
             message_state = 'completed' if target=='succeeded' else 'cancelled' if target=='cancelled' else 'failed'
             con.execute("UPDATE conversation_messages SET state=?,completed_at=datetime('now') WHERE message_id=?",(message_state,mid))
@@ -114,6 +140,10 @@ def project_event(con, cid: str, sequence: int, event: dict, *, primary: dict | 
             con.execute("UPDATE conversations SET state=?,last_activity_at=datetime('now') WHERE conversation_id=? AND state IN ('queued','running')",('queued' if queued else 'idle',cid))
             append_event(con,cid,'run.completed' if target=='succeeded' else 'run.interrupted' if target=='cancelled' else 'run.failed' if target=='failed' else 'run.unknown',
                          {'status':status,'runtime_alive':True},message_id=mid,run_id=rid)
+    envelope = {'generation_id':generation,'controller_sequence':sequence,
+                'engine_message_id':mid,'engine_run_id':rid,
+                'engine_mirrored':mirrored_output(con,cid,rid,event,current['harness']),**event}
+    append_event(con,cid,kind,envelope,message_id=mid,run_id=rid)
 
 
 class NativeChatsService:
@@ -142,6 +172,62 @@ class NativeChatsService:
 
     def notify(self) -> None:
         self.wake.set()
+
+    def dispatch_queued(self,generation: str,cid: str,client: RuntimeClient,owner: int,shell: int) -> None:
+        """One FIFO intent per GUI message; only proved no-write can retry.
+
+        Run and outbox claim precede the durable native intent. A restart may
+        reconcile that same accepted command with the controller journal;
+        written, unknown and terminal commands are never submitted again.
+        Native autonomous activity may win after this idle observation: its
+        pre-edge busy refusal retains the original GUI intent and run.
+        """
+        con=db_driver.connect(str(self.database))
+        try:
+            with db_driver.write_transaction(con,'native_chat.dispatch_intent'):
+                chat=con.execute('SELECT * FROM conversations WHERE conversation_id=? AND owner_user_id=? AND shell_id=?',(cid,owner,shell)).fetchone()
+                runtime=json.loads(chat['runtime_projection']) if chat else {}
+                captured=con.execute('SELECT * FROM conversation_runtime_generations WHERE generation_id=? AND conversation_id=?',(generation,cid)).fetchone()
+                if (chat is None or chat['state']=='closed' or runtime.get('role')=='probe'
+                        or runtime.get('generation_id')!=generation or runtime.get('state')!='ready'
+                        or runtime.get('primary') or captured is None or captured['state']!='ready' or captured['close_intent']):
+                    return
+                self.require_capability(runtime.get('capabilities',{}),'submission')
+                message=con.execute("SELECT m.*,o.outbox_id FROM conversation_outbox o JOIN conversation_messages m USING(message_id) WHERE o.conversation_id=? AND o.state IN ('pending','claimed') ORDER BY o.outbox_id LIMIT 1",(cid,)).fetchone()
+                if message is None:
+                    return
+                command_id='gui-message:'+str(message['message_id'])
+                retained=con.execute('SELECT state FROM conversation_runtime_commands WHERE generation_id=? AND command_id=?',(generation,command_id)).fetchone()
+                if retained and retained['state'] not in {'accepted','not_written'}:
+                    return # Ambiguous/known native write is never replayed.
+                if con.execute("SELECT 1 FROM conversation_runtime_commands WHERE generation_id=? AND kind='submit' AND command_id!=? AND state IN ('accepted','written','processed','unknown') LIMIT 1",(generation,command_id)).fetchone():
+                    return
+                if con.execute("SELECT 1 FROM conversation_runs WHERE conversation_id=? AND trigger_message_id!=? AND state IN ('leased','starting','running') LIMIT 1",(cid,message['message_id'])).fetchone():
+                    return
+                prior=con.execute('SELECT * FROM conversation_runs WHERE trigger_message_id=? ORDER BY attempt DESC LIMIT 1',(message['message_id'],)).fetchone()
+                if prior and prior['state'] not in {'starting','running'}:
+                    return
+                rid=prior['run_id'] if prior else con.execute("INSERT INTO conversation_runs(conversation_id,shell_id,trigger_message_id,state,lease_owner,lease_expires_at,started_at,heartbeat_at) VALUES(?,?,?,'starting',?,datetime('now','+60 seconds'),datetime('now'),datetime('now'))",
+                    (cid,shell,message['message_id'],self.consumer)).lastrowid
+                con.execute("UPDATE conversation_outbox SET state='claimed',claim_owner=?,claimed_at=datetime('now'),lease_expires_at=datetime('now','+60 seconds') WHERE outbox_id=? AND state IN ('pending','claimed')",(self.consumer,message['outbox_id']))
+                con.execute("UPDATE conversation_messages SET state='queued' WHERE message_id=? AND state='accepted'",(message['message_id'],))
+                con.execute("UPDATE conversations SET state='queued' WHERE conversation_id=? AND state='idle'",(cid,))
+            result=client.submit(self.store,owner,shell,command_id,text=message['body'],
+                                 message_id=str(message['message_id']),run_id=str(rid),source='user')
+            with db_driver.write_transaction(con,'native_chat.dispatch_receipt'):
+                # Close can cancel this outbox while native dispatch returns.
+                # Late receipts cannot restore a cancelled/dispatched slot.
+                if result.get('state') in {'written','processed','terminal','unknown'}:
+                    con.execute("UPDATE conversation_outbox SET state='dispatched',run_id=?,dispatched_at=datetime('now') WHERE outbox_id=? AND state='claimed'",(rid,message['outbox_id']))
+                elif result.get('state') in {'rejected','unsupported'}:
+                    con.execute("UPDATE conversation_outbox SET state='cancelled',claim_owner=NULL,claimed_at=NULL,lease_expires_at=NULL WHERE outbox_id=? AND state='claimed'",(message['outbox_id'],))
+                    con.execute("UPDATE conversation_runs SET state='failed',ended_at=datetime('now'),error_code='NATIVE_SUBMISSION_REFUSED' WHERE run_id=? AND state='starting'",(rid,))
+                    con.execute("UPDATE conversation_messages SET state='failed',completed_at=datetime('now') WHERE message_id=? AND state IN ('accepted','queued')",(message['message_id'],))
+                    queued=con.execute("SELECT 1 FROM conversation_outbox WHERE conversation_id=? AND state='pending'",(cid,)).fetchone()
+                    con.execute("UPDATE conversations SET state=? WHERE conversation_id=? AND state='queued'",('queued' if queued else 'idle',cid))
+            conversation_events.notify(cid)
+        finally:
+            con.close()
 
     def resolve_route(self,harness,model,effort):
         if self.route_resolver is None:
@@ -612,6 +698,8 @@ class NativeChatsService:
                         conversation_events.notify(row['conversation_id'])
                     if self.store.status(row['generation_id'],owner,shell)['close_intent']:
                         self.close_generation(row['generation_id'],row['conversation_id'],client,owner,shell)
+                    else:
+                        self.dispatch_queued(row['generation_id'],row['conversation_id'],client,owner,shell)
                 except (RuntimeContractError,OSError):
                     # Lease/reconnection failure is not verified native exit.
                     # Keep canonical unresolved ownership and stable commands.
@@ -653,7 +741,8 @@ def projection(conversation: Any, *, con=None) -> dict | None:
         intent=con.execute("SELECT intent_json FROM conversation_runtime_commands WHERE generation_id=? AND command_id=? AND kind='submit'",(generation,request)).fetchone() if request else None
         engine=json.loads(intent[0]) if intent else {}
         runtime['activity'].append({'generation_id':generation,'controller_sequence':row['sequence'],
-            'engine_run_id':engine.get('run_id'),'engine_message_id':engine.get('message_id'),**event})
+            'engine_run_id':engine.get('run_id'),'engine_message_id':engine.get('message_id'),
+            'engine_mirrored':mirrored_output(con,conversation['conversation_id'],engine.get('run_id'),event,conversation['harness']),**event})
     runtime['activity_partial']=len(events)>128
     if _SERVICE is not None:
         runtime['onboarding']={'canonical_main_root':str(_SERVICE.root.resolve()),
