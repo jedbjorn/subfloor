@@ -24,7 +24,7 @@ import time
 import uuid
 from collections import deque
 from collections.abc import Callable, Mapping
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Any, Literal
 
@@ -50,12 +50,13 @@ from conversation_runtime_contract import (
 )
 
 CHANNEL = "subfloor_runtime"
-REVISION = "f89-claude-foreground-v2"
+REVISION = "f89-claude-foreground-v3"
 ASSETS = Path(__file__).resolve().parents[2] / "assets/runtime/claude"
 MAX_RECORDS = 4096
 MAX_NOTIFICATIONS = 64
 TEXT_CHUNK = 4000
 STARTUP_BYTES = 8192
+AUTH_STATUS_BYTES = 16384
 STARTUP_TITLE = "WARNING: Loading development channels"
 # Installed 2.1.287 --ax-screen-reader ConfirmCancel emits this finite choice.
 # This recognizes one pre-ready dialog, not a terminal/screen model.
@@ -78,6 +79,60 @@ HOOKS = (
     "PostToolUseFailure", "MessageDisplay", "Stop", "StopFailure", "SessionEnd",
     "SubagentStart", "SubagentStop", "ConfigChange",
 )
+
+
+def _parse_auth_status(raw: bytes, returncode: int) -> dict[str, str]:
+    """Consume only native route enums; account identifiers never leave here."""
+    try:
+        value = json.loads(raw) if len(raw) <= AUTH_STATUS_BYTES else None
+    except (ValueError, UnicodeError):
+        value = None
+    if (returncode != 0 or not isinstance(value, dict) or value.get("loggedIn") is not True
+            or value.get("authMethod") != "claude.ai" or value.get("apiProvider") != "firstParty"):
+        raise RuntimeContractError("NATIVE_ACCOUNT_INCONCLUSIVE", "native subscription route was not observed")
+    auth = {"method": "claude.ai", "provider": "firstParty"}
+    subscription = value.get("subscriptionType")
+    if isinstance(subscription, str) and re.fullmatch(r"[a-zA-Z0-9_-]{1,64}", subscription):
+        auth["subscription_type"] = subscription
+    return auth
+
+
+def _auth_status(context: RuntimeContext, env: Mapping[str, str], deadline: float) -> dict[str, str]:
+    """Fixed zero-inference observation inside the already-owned native unit."""
+    limit = min(deadline, time.monotonic() + 3)
+    if time.monotonic() >= limit:
+        raise RuntimeContractError("NATIVE_ACCOUNT_INCONCLUSIVE", "native account observation deadline expired")
+    process = subprocess.Popen(context.execution_argv([str(context.executable.path), "auth", "status", "--json"]),
+        cwd=context.worktree, env=dict(env), stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    data = bytearray()
+    try:
+        assert process.stdout is not None
+        fd = process.stdout.fileno()
+        os.set_blocking(fd, False)
+        while True:
+            remaining = limit - time.monotonic()
+            if remaining <= 0 or not select.select([fd], [], [], remaining)[0]:
+                raise RuntimeContractError("NATIVE_ACCOUNT_INCONCLUSIVE", "native account observation deadline expired")
+            chunk = os.read(fd, min(4096, AUTH_STATUS_BYTES + 1 - len(data)))
+            if not chunk:
+                break
+            data.extend(chunk)
+            if len(data) > AUTH_STATUS_BYTES:
+                raise RuntimeContractError("NATIVE_ACCOUNT_INCONCLUSIVE", "native account observation exceeded its bound")
+        return _parse_auth_status(bytes(data), process.wait(timeout=max(.001, limit - time.monotonic())))
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise RuntimeContractError("NATIVE_ACCOUNT_INCONCLUSIVE", "native account observation unavailable") from exc
+    finally:
+        if process.poll() is None:
+            process.terminate()
+            try:
+                process.wait(timeout=.2)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=.2)
+        if process.stdout is not None:
+            process.stdout.close()
 
 
 def process_identity(pid: int) -> ProcessIdentity | None:
@@ -127,6 +182,8 @@ class Activity:
     automation_id: str | None = None
     model_messages: set[str] = field(default_factory=set)
     readiness_reply: bool = False
+    terminal_status: str | None = None
+    terminal_provenance: str | None = None
 
 
 class ClaudeRuntimeDriver(RuntimeDriver):
@@ -152,6 +209,10 @@ class ClaudeRuntimeDriver(RuntimeDriver):
         self._readiness_prompt: str | None = None
         self._readiness_queued = False
         self._readiness_tool_count = 0
+        self._native_auth: dict[str, str] = {}
+        self._native_model: str | None = None
+        self._native_effort: str | None = None
+        self._route_inconclusive = False
         self._lost = False
         self._primary: str | None = None
         self._primary_state: Literal["idle", "active", "unknown"] = "unknown"
@@ -186,13 +247,13 @@ class ClaudeRuntimeDriver(RuntimeDriver):
 
     def _capabilities(self) -> dict[str, Grade]:
         evidence = self._context.capability_evidence if self._context else {}
-        return {name: "inconclusive" if self._policy_changed else evidence.get(name, "unverified") for name in (
+        return {name: "inconclusive" if self._policy_changed or self._route_inconclusive else evidence.get(name, "unverified") for name in (
             "submission", "background_tasks", "stop_work", "stop_reply", "automation",
         )} | {"direct_task_control": "incompatible", "continuous_inventory": "incompatible"}
 
     def _allowed(self, capability: str) -> bool:
         context = self._context
-        return bool(context and not self._policy_changed and (
+        return bool(context and not self._policy_changed and not self._route_inconclusive and (
             context.capability_evidence.get(capability) == "compatible"
             or capability in context.probe_capabilities
         ))
@@ -307,13 +368,14 @@ class ClaudeRuntimeDriver(RuntimeDriver):
 
     def start(self, context: RuntimeContext, emit: EventSink, *, deadline: float) -> DriverStart:
         with self._condition:
-            if self._context is not None:
+            if self._context is not None or self._closing:
                 return DriverStart("unavailable", self._identity, "generation already started")
             self._context, self._emit = context, emit
             root = str(uuid.uuid4())
             self._identity = RuntimeIdentity(root_id=root, session_id=root)
             try:
                 argv, env = self._prepare(context)
+                self._native_auth = _auth_status(context, env, deadline)
                 master, slave = pty.openpty()
                 os.set_blocking(master, False)
                 self._master = master
@@ -327,10 +389,12 @@ class ClaudeRuntimeDriver(RuntimeDriver):
                     os.close(slave)
                 self._identity = RuntimeIdentity(root_id=root, session_id=root,
                     process=process_identity(self._process.pid),
-                    protocol={"transport": "foreground-pty-channel", "revision": REVISION})
+                    protocol={"transport": "foreground-pty-channel", "revision": REVISION,
+                              "auth_observation": dict(self._native_auth)})
                 self._reader = threading.Thread(target=self._read_loop, name="claude-runtime-reader", daemon=True)
                 self._reader.start()
             except (OSError, RuntimeContractError) as exc:
+                self._route_inconclusive = True
                 if self._master is not None:
                     os.close(self._master)
                     self._master = None
@@ -600,6 +664,7 @@ class ClaudeRuntimeDriver(RuntimeDriver):
 
     def _maybe_ready(self) -> None:
         if (not self._closing and not self._lost and self._session_started and self._channel_peer
+                and self._native_auth and self._context and self._native_model == self._context.model
                 and not self._readiness_queued and self._allowed("submission")):
             # A generation-specific processed native challenge establishes the
             # route after controlled consent. Cached grades/descriptors do not.
@@ -637,6 +702,10 @@ class ClaudeRuntimeDriver(RuntimeDriver):
                 self._fail_observation("transcript outside exact owned native session", ownership=True)
                 return
             self._transcript = candidate
+            model = event.get("model")
+            self._native_model = model if isinstance(model, str) and re.fullmatch(r"[a-zA-Z0-9._:-]{1,255}", model) else None
+            if self._native_model != self._context.model:
+                self._route_observation_inconclusive(mismatch=self._native_model is not None)
             self._session_started = True
             self._maybe_ready()
             return
@@ -667,6 +736,11 @@ class ClaudeRuntimeDriver(RuntimeDriver):
                     data={"kind": "child", "state": "stop_hook_observed", "terminal": "unverified"}))
             if name == "Stop" and prompt_id in self._activities:
                 self._activities[prompt_id].stop_seen = True
+                if prompt_id == self._readiness_prompt:
+                    effort = event.get("effort")
+                    level = effort.get("level") if isinstance(effort, Mapping) else None
+                    self._native_effort = level if isinstance(level, str) and re.fullmatch(r"[a-zA-Z0-9_-]{1,64}", level) else None
+                    self._complete_readiness()
                 # Stop is pre-terminal and may be blocked by another hook.
                 self._drain_transcript()
         elif name == "StopFailure" and prompt_id in self._activities:
@@ -927,6 +1001,7 @@ class ClaudeRuntimeDriver(RuntimeDriver):
         if not activity or activity.terminal:
             return
         activity.terminal = True
+        activity.terminal_status, activity.terminal_provenance = status, provenance
         self._send_event(RuntimeEvent("activity.terminal", reference=self._reference(prompt_id),
             request_id=activity.request_id, source=activity.source, provenance=provenance,
             grade="compatible", data={"status": status}))
@@ -936,9 +1011,43 @@ class ClaudeRuntimeDriver(RuntimeDriver):
         if not self._snapshot_partial and activity.automation_id and scheduled and scheduled.state == "absent_from_snapshot" and scheduled.durable is False and scheduled.data.get("recurring") is False:
             self._definitions.pop(activity.automation_id, None)
             self._work_terminal(activity.automation_id, "completed", "claude:oneshot-snapshot+native-terminal")
-        if (prompt_id == self._readiness_prompt and not self._ready and not self._lost and not self._closing and not self._policy_changed
-                and status == "completed" and activity.readiness_reply
-                and provenance == "claude:owned-transcript-turn_duration"):
+        self._complete_readiness()
+        for control_id, (action, target) in self._controls.items():
+            if action == "stop_reply" and target == prompt_id:
+                self._send_event(RuntimeEvent("control.outcome", reference=self._reference(prompt_id),
+                    control_id=control_id, provenance=provenance, grade="compatible",
+                    data={"outcome": "complete", "native_outcome": "primary_terminal_observed", "interrupt_reason": "unverified"}))
+        self._condition.notify_all()
+
+    def _route_observation_inconclusive(self, *, mismatch: bool = False) -> None:
+        assert self._context
+        self._route_inconclusive = self._route_inconclusive or mismatch
+        self._send_event(RuntimeEvent("capability.observed", reference=self._reference(self._readiness_prompt),
+            provenance="claude:observed-selected-route", grade="inconclusive", partial=True,
+            data={"capability": "submission", "code": "NATIVE_ROUTE_INCONCLUSIVE",
+                  "requested_model": self._context.model, "observed_model": self._native_model,
+                  "requested_effort": self._context.effort, "observed_effort": self._native_effort}))
+
+    def _complete_readiness(self) -> None:
+        prompt_id = self._readiness_prompt
+        activity = self._activities.get(prompt_id or "")
+        if (activity and activity.terminal and not self._ready and not self._lost and not self._closing
+                and not self._policy_changed and not self._route_inconclusive
+                and activity.terminal_status == "completed" and activity.readiness_reply
+                and activity.terminal_provenance == "claude:owned-transcript-turn_duration"):
+            assert self._context and self._identity
+            if (not self._native_auth or not self._native_model or not self._native_effort
+                    or self._native_model != self._context.model or self._native_effort != self._context.effort):
+                self._route_observation_inconclusive(mismatch=bool(
+                    self._native_effort and self._native_effort != self._context.effort))
+                self._condition.notify_all()
+                return
+            route = {"account_type": self._native_auth["method"], "model": self._native_model,
+                     "efforts": [self._native_effort], "auth": dict(self._native_auth),
+                     "observation_origin": "claude:auth-status+SessionStart+readiness-Stop",
+                     "model_evidence": "active_selected_model", "effort_evidence": "effective_selected_level",
+                     "catalogue_observed": False}
+            self._identity = replace(self._identity, protocol=dict(self._identity.protocol) | {"native_route": route})
             self._ready = True
             self._send_event(RuntimeEvent("runtime.ready", reference=self._reference(prompt_id),
                 provenance="claude:processed-readiness+owned-transcript-terminal", grade="compatible",
@@ -946,12 +1055,8 @@ class ClaudeRuntimeDriver(RuntimeDriver):
                       "observed_model_message_ids": len(activity.model_messages),
                       "observed_tool_calls": self._readiness_tool_count,
                       "tool_coverage": "configured-hooks; native coverage requires owner evidence",
+                      "native_route": route,
                       "capabilities": self._capabilities()}))
-        for control_id, (action, target) in self._controls.items():
-            if action == "stop_reply" and target == prompt_id:
-                self._send_event(RuntimeEvent("control.outcome", reference=self._reference(prompt_id),
-                    control_id=control_id, provenance=provenance, grade="compatible",
-                    data={"outcome": "complete", "native_outcome": "primary_terminal_observed", "interrupt_reason": "unverified"}))
         self._condition.notify_all()
 
     def _drain_transcript(self) -> None:
