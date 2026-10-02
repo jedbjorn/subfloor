@@ -84,14 +84,14 @@ class Client:
                     if labels:
                         self.pids[200]=ProcessIdentity(200,2000);output+=' '+labels[0]+'=200'
                         root_terminal=NativeReference('root','root',activity_id=turn,item_id='root-item',work_id='root-item',native_process_id='opaque-root')
-                        self.work.append({'reference':dataclasses.asdict(root_terminal),'kind':'terminal','state':'running','provenance':'fixture','observed_at':time.time()})
+                        self.work.append({'reference':dataclasses.asdict(root_terminal),'kind':'terminal','state':'running','provenance':'fixture','observed_at':time.time(),'freshness':'current'})
                         self.pids[201]=ProcessIdentity(201,2001);output+=' '+labels[-1]+'=201'
                         child='Spawn exactly one native child' in text
                         sibling=NativeReference('root','child' if child else 'root','root' if child else None,'child-turn' if child else turn,'sibling-item','sibling-item','opaque-sibling')
-                        self.work.append({'reference':dataclasses.asdict(sibling),'kind':'terminal','state':'running','provenance':'fixture','observed_at':time.time()})
+                        self.work.append({'reference':dataclasses.asdict(sibling),'kind':'terminal','state':'running','provenance':'fixture','observed_at':time.time(),'freshness':'current'})
                         if child:
                             child_ref=NativeReference('root','child','root','child-turn',work_id='child')
-                            self.work.append({'reference':dataclasses.asdict(child_ref),'kind':'child','state':'active','provenance':'fixture','observed_at':time.time()})
+                            self.work.append({'reference':dataclasses.asdict(child_ref),'kind':'child','state':'active','provenance':'fixture','observed_at':time.time(),'freshness':'current'})
                     self.event('output.final',replace(ref,item_id='reply'),request,text=output)
                 elif 'remembered nonce' in text:
                     self.event('output.final',replace(ref,item_id='reply'),request,text=self.marker or 'unknown')
