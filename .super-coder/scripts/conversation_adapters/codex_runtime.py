@@ -642,9 +642,13 @@ class CodexRuntimeDriver(RuntimeDriver):
         return rows, True
 
     def inventory(self, *, deadline: float) -> NativeSnapshot:
-        if self._rpc is None or not self._root or self._lost:
+        if (self._rpc is None or not self._root or self._lost or self._identity is None
+                or self._identity.root_id != self._root or self._root not in self._parents):
             return NativeSnapshot(self._identity, None, freshness="stale", provenance="codex:transport")
         partial = self._partial
+        root_uncertain = self._partial
+        root_read_current = False
+        root_read_revision = None
         observed: list[NativeWork] = []
         try:
             descendants, truncated = self._pages("thread/list", {
@@ -686,6 +690,8 @@ class CodexRuntimeDriver(RuntimeDriver):
                     raise RuntimeContractError("NATIVE_SHAPE_INVALID", "native turn inventory is invalid")
                 unknown_status = any(turn.get("status") not in {*TURN_TERMINALS, "inProgress"} for turn in turns)
                 partial |= unknown_status
+                if thread == self._root:
+                    root_uncertain |= unknown_status
                 active = [turn for turn in turns if turn.get("status") == "inProgress"]
                 if len(active) > 1:
                     raise RuntimeContractError("NATIVE_SHAPE_INVALID", "native thread has multiple active turns")
@@ -698,6 +704,8 @@ class CodexRuntimeDriver(RuntimeDriver):
                     if (self._activity_revision.get(thread, 0) != read_revision
                             or (turn_id and self._turn_status.get((thread, turn_id)) in TURN_TERMINALS)):
                         partial = True
+                        if thread == self._root:
+                            root_uncertain = True
                     else:
                         previous = self._active.get(thread)
                         by_id = {native_turn.get("id"): native_turn for native_turn in turns
@@ -708,6 +716,9 @@ class CodexRuntimeDriver(RuntimeDriver):
                                                    and self._turn_status.get((thread, previous)) not in TURN_TERMINALS)
                         uncertain = unknown_status or bool(unresolved_previous and turn_id != previous)
                         partial |= uncertain
+                        if thread == self._root:
+                            root_read_current = True
+                            root_uncertain |= uncertain
                         if uncertain:
                             self._uncertain_activity[thread] = {
                                 _string(native_turn.get("id")) for native_turn in turns
@@ -718,6 +729,8 @@ class CodexRuntimeDriver(RuntimeDriver):
                             self._uncertain_activity.pop(thread, None)
                         self._active[thread] = previous if unresolved_previous and not turn_id else turn_id
                         self._activity_revision[thread] = read_revision + 1
+                        if thread == self._root:
+                            root_read_revision = read_revision + 1
                         for native_turn in turns:
                             tid, status = _string(native_turn.get("id")), _string(native_turn.get("status"))
                             if tid and status in TURN_TERMINALS:
@@ -743,14 +756,20 @@ class CodexRuntimeDriver(RuntimeDriver):
                                                "terminal", "inProgress", "codex:thread/backgroundTerminals/list", time.time(),
                                                freshness="current", data={"command": terminal.get("command"), "cwd": terminal.get("cwd")}))
             with self._lock:
+                root_uncertain |= self._activity_revision.get(self._root) != root_read_revision
+                partial |= root_uncertain
                 for work in observed:
                     self._event("work.observed", work.reference, provenance=work.provenance,
                                 data={"kind": work.kind, "state": work.state, **work.data}, partial=partial)
                 primary_id = self._active.get(self._root)
                 primary = self._reference(self._root, primary_id) if primary_id else None
-                # An unknown submitted write is not made retryable by an idle snapshot.
+                # Root occupancy comes from its attributable current read, not
+                # aggregate child/terminal completeness. Work controls still
+                # require the full nonpartial inventory.
                 primary_state: Literal["idle", "active", "unknown"] = (
-                    "unknown" if self._pending_submission is not None or partial else ("active" if primary_id else "idle"))
+                    "unknown" if (self._pending_submission is not None or root_uncertain
+                                  or not root_read_current or self._root in self._uncertain_activity)
+                    else ("active" if primary_id else "idle"))
                 return NativeSnapshot(self._identity, primary, tuple(observed), freshness="current", partial=partial,
                                       capabilities={CAP_AUTOMATION: "unverified"}, primary_state=primary_state,
                                       provenance="codex:owned-inventory")

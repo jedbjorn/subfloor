@@ -366,6 +366,82 @@ def test_child_with_foreign_parent_cannot_become_control_target(seat):
     assert receipt.state == "rejected" and len(rpc.calls) == count
 
 
+@pytest.mark.parametrize("root_active", [False, True])
+@pytest.mark.parametrize("background_gap", ["unknown_child_turn", "truncated_terminals", "foreign_child"])
+def test_current_root_occupancy_is_separate_from_incomplete_background_inventory(seat, root_active, background_gap):
+    driver, rpc, _, _ = seat
+    if root_active:
+        driver.submit(submission(), deadline=deadline())
+    if background_gap == "unknown_child_turn":
+        rpc.child()
+        rpc.turns["child"] = [{"id": "unclassified-child", "status": "newUnknownStatus"}]
+    elif background_gap == "foreign_child":
+        rpc.child(parent="foreign-root")
+    else:
+        original = driver._pages
+
+        def truncated(method, params, *, deadline):
+            rows, partial = original(method, params, deadline=deadline)
+            return rows, partial or method == "thread/backgroundTerminals/list"
+
+        driver._pages = truncated
+    snapshot = driver.inventory(deadline=deadline())
+    assert snapshot.partial is True
+    assert snapshot.freshness == "current"
+    assert snapshot.primary_state == ("active" if root_active else "idle")
+    if not root_active:
+        assert snapshot.primary is None
+
+
+@pytest.mark.parametrize("root_gap", ["unknown_turn", "missing_active_id", "missing_ack", "wrong_read_root",
+                                      "wrong_captured_root", "missing_owned_root", "global_partial", "global_loss"])
+def test_root_occupancy_never_inferred_from_missing_or_uncertain_root_proof(seat, root_gap):
+    driver, rpc, _, _ = seat
+    if root_gap == "unknown_turn":
+        rpc.turns["root"] = [{"id": "unknown-root", "status": "newUnknownStatus"}]
+    elif root_gap == "missing_active_id":
+        rpc.turns["root"] = [{"status": "inProgress"}]
+    elif root_gap == "missing_ack":
+        driver.submit(submission(), deadline=deadline())
+        rpc.turns["root"] = []
+    elif root_gap == "wrong_read_root":
+        original = rpc.request
+
+        def foreign(method, params, *, deadline):
+            result = original(method, params, deadline=deadline)
+            if method == "thread/read":
+                result["thread"]["id"] = "foreign-root"
+            return result
+
+        rpc.request = foreign
+    elif root_gap == "wrong_captured_root":
+        driver._identity = replace(driver._identity, root_id="foreign-root")
+    elif root_gap == "missing_owned_root":
+        driver._parents.pop("root")
+    elif root_gap == "global_partial":
+        driver._partial = True
+    else:
+        driver._lost = True
+    assert driver.inventory(deadline=deadline()).primary_state == "unknown"
+
+
+def test_root_event_during_child_read_invalidates_earlier_idle_root_read(seat):
+    driver, rpc, _, _ = seat
+    rpc.child()
+    original = rpc.request
+
+    def racing_child(method, params, *, deadline):
+        result = original(method, params, deadline=deadline)
+        if method == "thread/read" and params["threadId"] == "child":
+            rpc.frame("turn/started", turn={"id": "new-root-turn", "status": "inProgress"})
+        return result
+
+    rpc.request = racing_child
+    snapshot = driver.inventory(deadline=deadline())
+    assert snapshot.primary_state == "unknown"
+    assert snapshot.primary.activity_id == "new-root-turn"
+
+
 def test_root_interrupt_preserves_child_and_both_background_terminals(seat):
     driver, rpc, events, _ = seat
     turn = driver.submit(submission(), deadline=deadline()).native_activity_id
@@ -478,7 +554,7 @@ def test_stale_interrupt_unknown_does_not_retry_or_clean_background_work(seat):
     assert driver.inventory(deadline=deadline()).primary_state == "active"
 
 
-def test_pagination_bound_is_partial_and_cannot_report_empty_idle_success(seat):
+def test_child_pagination_bound_is_partial_but_does_not_replace_root_idle_proof(seat):
     driver, rpc, _, _ = seat
     real_request = rpc.request
 
@@ -490,8 +566,19 @@ def test_pagination_bound_is_partial_and_cannot_report_empty_idle_success(seat):
 
     rpc.request = pages
     snapshot = driver.inventory(deadline=deadline())
-    assert snapshot.partial and snapshot.primary_state == "unknown"
+    assert snapshot.partial and snapshot.primary_state == "idle"
     assert sum(method == "thread/list" for method, _ in rpc.calls) == 8
+
+
+def test_root_idle_with_incomplete_background_still_refuses_target_stop(seat):
+    driver, rpc, _, _ = seat
+    rpc.child(parent="foreign-root")
+    rpc.terminal("target")
+    target = NativeReference("root", "root", item_id="item-target", work_id="target", native_process_id="target")
+    snapshot = driver.inventory(deadline=deadline())
+    assert snapshot.primary_state == "idle" and snapshot.partial
+    assert driver.control(control("stop_work", target), deadline=deadline()).state == "rejected"
+    assert not any(method == "thread/backgroundTerminals/terminate" for method, _ in rpc.calls)
 
 
 @pytest.mark.parametrize('native_kind,output_kind',[('agentMessage','assistant'),('commandExecution','terminal')])
