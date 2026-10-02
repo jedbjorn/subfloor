@@ -9,7 +9,7 @@ from __future__ import annotations
 from pathlib import Path
 
 
-def start_fixture(*,database: Path,root: Path,fixture_id: str,supervisor):
+def start_fixture(*,database: Path,root: Path,fixture_id: str,supervisor,native_bindings=None):
     if database.resolve()!=root/'.super-coder/shell_db.db' or not fixture_id:
         raise ValueError('synthetic fixture identity required')
     def shutdown():

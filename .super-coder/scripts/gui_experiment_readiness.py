@@ -29,8 +29,7 @@ def prepared_plan(*, database: Path, root: Path, conversation_id: str,
     inputs; neither belongs in public evidence. This does not launch a driver
     or grant native startup consent or capability evidence.
     """
-    if (harness not in {'codex','claude'} or shell_id not in {1,2}
-            or not conversation_id.startswith('cv_fixture_')
+    if (harness not in {'codex','claude'} or not isinstance(shell_id,int) or shell_id<1
             or run.ENGINE.resolve()!=root.resolve()/'.super-coder'
             or database.resolve()!=root.resolve()/'.super-coder/shell_db.db'
             or Path(run.DB_PATH).resolve()!=database.resolve()):
@@ -41,16 +40,22 @@ def prepared_plan(*, database: Path, root: Path, conversation_id: str,
                         (conversation_id,)).fetchone()
     finally:
         con.close()
-    if (row is None or row['shell_id']!=shell_id or row['owner_user_id']!=1
+    if (row is None or (not conversation_id.startswith('cv_fixture_') and row['runtime_mode']!='native_experiment') or row['shell_id']!=shell_id or row['owner_user_id']!=1
             or row['shell_owner']!=1 or row['harness']!=harness or row['state']=='closed'
             or row['provider']!=run.session_provider(harness,row['model'])):
         raise ValueError('synthetic conversation route or ownership differs')
     worktree=Path(row['worktree']).resolve()
     if root.resolve() not in worktree.parents:
         raise ValueError('synthetic conversation worktree escaped fixture')
+    route = {}
+    if row['runtime_mode']=='native_experiment':
+        import route_bindings
+        binding=json.loads(row['route_binding'])
+        route_bindings.validate_v2_binding(binding)
+        route={'route_binding':binding,'binding_digest':route_bindings.digest_json(binding)}
     plan=run.prepare_launch(shell_id=shell_id,harness=harness,model=row['model'],effort=row['effort'],
                             headless_prompt='fixture readiness; never dispatch',conversation_owned=True,
-                            boot=BootDirective(conversation_id,'resume'))
+                            boot=BootDirective(conversation_id,'resume'),**route)
     if (plan.argv or Path(plan.cwd).resolve()!=worktree or plan.harness!=harness
             or plan.model!=row['model'] or plan.effort!=row['effort']
             or plan.env.get('SC_SHELL_ID')!=str(shell_id)):
