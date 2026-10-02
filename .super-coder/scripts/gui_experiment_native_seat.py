@@ -34,6 +34,41 @@ from conversation_runtime_contract import (
 from gui_experiment_readiness import prepared_plan
 
 
+def _dependency_process(pid: int) -> tuple[int,str,int]:
+    fields=Path(f'/proc/{pid}/stat').read_text().rsplit(')',1)[1].split()
+    return int(fields[19]),fields[0],int(fields[2])
+
+
+def _dependency_cgroup(pid: int) -> str:
+    return next(line[3:] for line in Path(f'/proc/{pid}/cgroup').read_text().splitlines() if line.startswith('0::/'))
+
+
+def _dependency_group_live(group: int,cgroup: str) -> bool:
+    payload=(Path('/sys/fs/cgroup')/cgroup.lstrip('/')/'cgroup.procs').read_bytes()
+    if len(payload)>65536 or len(payload.split())>128:
+        raise ValueError('owned dependency process observation exceeded bounds')
+    for raw in payload.split():
+        try:_,state,pgrp=_dependency_process(int(raw))
+        except FileNotFoundError:continue
+        if pgrp==group and state!='Z':return True
+    return False
+
+
+def _reap_dependency_group(process,ticks: int,cgroup: str,deadline: float) -> None:
+    """Keep the unreaped root as the PID/group identity anchor through stop."""
+    current,_,group=_dependency_process(process.pid)
+    if current!=ticks or group!=process.pid or _dependency_cgroup(process.pid)!=cgroup:
+        raise ValueError('owned dependency group identity changed')
+    for sig,window in ((signal.SIGTERM,.3),(signal.SIGKILL,.4)):
+        if not _dependency_group_live(process.pid,cgroup):break
+        os.killpg(process.pid,sig)
+        until=min(deadline,time.monotonic()+window)
+        while time.monotonic()<until and _dependency_group_live(process.pid,cgroup):time.sleep(.01)
+    if _dependency_group_live(process.pid,cgroup):
+        raise ValueError('owned dependency group remains live')
+    process.wait(timeout=max(.001,deadline-time.monotonic()))
+
+
 class NativeFixtureSeat:
     def __init__(self, *, database: Path, root: Path, supervisor,
                  native_bindings: Mapping[str,str], cache: EvidenceCache):
@@ -163,6 +198,8 @@ class NativeFixtureSeat:
 
     def prepare_claude_assets(self,deadline: float) -> None:
         """One fixed pinned dependency operation inside the marked API unit."""
+        if time.monotonic()+1>=deadline:
+            raise RuntimeContractError('CHANNEL_UNAVAILABLE','dependency deadline has no cleanup reserve')
         if not self.assets_lock.acquire(timeout=max(0,min(30,deadline-time.monotonic()))):
             raise RuntimeContractError('CHANNEL_UNAVAILABLE','pinned dependency preparation is busy')
         try:
@@ -185,39 +222,52 @@ class NativeFixtureSeat:
             env={'HOME':str(home),'PATH':os.defpath,'npm_config_cache':str(home/'.npm-cache'),
                  'npm_config_userconfig':str(home/'no-npm-user-config'),
                  'npm_config_globalconfig':str(home/'no-npm-global-config')}
+            if self.supervisor.preparation_identity()!=owner or time.monotonic()+1>=deadline:
+                raise RuntimeContractError('CHANNEL_UNAVAILABLE','owned dependency deadline/identity expired')
             version=subprocess.run([node,'--version'],env=env,capture_output=True,text=True,check=False,
-                timeout=max(.001,min(3,deadline-time.monotonic())))
+                timeout=min(3,deadline-time.monotonic()-1))
             if version.returncode or len(version.stdout)>64 or int(version.stdout.strip().removeprefix('v').split('.')[0])<22:
                 raise RuntimeContractError('CHANNEL_UNAVAILABLE','pinned channel requires Node 22 or newer')
             installed=assets/'node_modules/@modelcontextprotocol/sdk/package.json'
             if any(path.is_symlink() for path in (installed,*installed.parents) if path!=assets and assets in path.parents):
                 raise RuntimeContractError('CHANNEL_UNAVAILABLE','copied dependencies are aliased')
+            if self.supervisor.preparation_identity()!=owner or time.monotonic()+1>=deadline:
+                raise RuntimeContractError('CHANNEL_UNAVAILABLE','owned dependency deadline/identity expired')
             if self.claude_assets_ready and installed.is_file() and not installed.is_symlink() and json.loads(installed.read_text()).get('version')=='1.31.0':
+                if self.supervisor.preparation_identity()!=owner or time.monotonic()+1>=deadline:
+                    raise RuntimeContractError('CHANNEL_UNAVAILABLE','cached dependency ownership/deadline expired')
                 return
             if (assets/'node_modules').is_symlink():
                 raise RuntimeContractError('CHANNEL_UNAVAILABLE','copied dependency root is aliased')
             # No lifecycle scripts, host npm configuration, credential values,
             # or global install. The child remains in this registered API unit.
             before=hashlib.sha256((assets/'package-lock.json').read_bytes()).hexdigest()
-            if time.monotonic()>=deadline or self.supervisor.preparation_identity()!=owner:
+            if self.supervisor.preparation_identity()!=owner or time.monotonic()+1>=deadline:
                 raise RuntimeContractError('CHANNEL_UNAVAILABLE','owned dependency deadline/identity expired')
             process=subprocess.Popen([npm,'ci','--omit=dev','--ignore-scripts','--no-audit','--no-fund'],cwd=assets,env=env,
                 stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,start_new_session=True)
+            ticks,_,group=_dependency_process(process.pid)
+            cgroup=_dependency_cgroup(process.pid)
+            status=None
+            stop_deadline=min(deadline,time.monotonic()+30)
             try:
-                status=process.wait(timeout=max(.001,min(30,deadline-time.monotonic())))
+                if group!=process.pid or cgroup!=owner['control_group']:
+                    raise ValueError('dependency child escaped the owned API unit')
+                while time.monotonic()+1<stop_deadline:
+                    exited=os.waitid(os.P_PID,process.pid,os.WEXITED|os.WNOHANG|os.WNOWAIT)
+                    if exited is not None:
+                        status=exited.si_status if exited.si_code==os.CLD_EXITED else -1
+                        break
+                    time.sleep(.01)
             finally:
-                if process.poll() is None:
-                    os.killpg(process.pid,signal.SIGTERM)
-                    try:process.wait(timeout=1)
-                    except subprocess.TimeoutExpired:
-                        os.killpg(process.pid,signal.SIGKILL);process.wait(timeout=1)
-            if (status or self.supervisor.preparation_identity()!=owner
+                _reap_dependency_group(process,ticks,cgroup,stop_deadline)
+            if (status!=0 or time.monotonic()>=deadline or self.supervisor.preparation_identity()!=owner
                     or hashlib.sha256((assets/'package-lock.json').read_bytes()).hexdigest()!=before
                     or not installed.is_file() or installed.is_symlink()
                     or json.loads(installed.read_text()).get('version')!='1.31.0'):
                 raise RuntimeContractError('CHANNEL_UNAVAILABLE','fixed pinned dependency preparation did not complete')
             self.claude_assets_ready=True
-        except (OSError,ValueError,subprocess.TimeoutExpired) as exc:
+        except (OSError,ValueError,IndexError,StopIteration,subprocess.TimeoutExpired) as exc:
             raise RuntimeContractError('CHANNEL_UNAVAILABLE','bounded copied dependency prerequisite unavailable') from exc
         finally:
             self.assets_lock.release()
@@ -264,7 +314,10 @@ class NativeFixtureSeat:
         if observed.binding is None:
             raise RuntimeContractError('NATIVE_EXECUTABLE_INCONCLUSIVE','installed native identity observation is unavailable')
         if harness=='claude':
-            self.claude_startup_prerequisite(self.candidate_fingerprint(harness,row['model'],row['effort']),time.monotonic()+30)
+            startup_deadline=time.monotonic()+30
+            if binding['selector_binding'].get('proof_state')=='pending_finite_probe':
+                startup_deadline=min(startup_deadline,time.monotonic()+max(0,job['deadline']-time.time()))
+            self.claude_startup_prerequisite(self.candidate_fingerprint(harness,row['model'],row['effort']),startup_deadline)
         if checked_fingerprint is not None:
             current_fingerprint=self.candidate_fingerprint(harness,row['model'],row['effort'])
             if (current_fingerprint!=checked_fingerprint or current_fingerprint.executable!=observed.binding

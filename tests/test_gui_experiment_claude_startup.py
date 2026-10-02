@@ -29,7 +29,9 @@ def configured(seat,monkeypatch,source=MEMORY_SOURCE):
     binary=value.root/'native-binary';binary.write_text(source)
     fp=dataclasses.replace(value.candidate_fingerprint('codex','selected','high'),
         harness='claude',provider='anthropic',executable=ExecutableBinding(binary,hashlib.sha256(binary.read_bytes()).hexdigest(),'synthetic'))
-    value.supervisor.preparation_identity=lambda:{'pid':123,'start_ticks':456,'unit':'fixed-api','control_group':'/fixed-api'}
+    owner={'pid':os.getpid(),'start_ticks':runtime._dependency_process(os.getpid())[0],
+           'unit':'fixed-api','control_group':runtime._dependency_cgroup(os.getpid())}
+    value.supervisor.preparation_identity=lambda:owner
     value.candidate_fingerprint=lambda *args:fp
     monkeypatch.setattr(runtime.run,'load_adapter',lambda name:{'launch_flags':['--dangerously-skip-permissions']})
     return value,fp,events
@@ -68,7 +70,9 @@ def asset_seat(seat,monkeypatch):
     assets.parent.mkdir(parents=True)
     shutil.copytree(ROOT/'.super-coder/assets/runtime/claude',assets,ignore=shutil.ignore_patterns('node_modules'))
     (value.root/'home').mkdir()
-    value.supervisor.preparation_identity=lambda:{'pid':123,'start_ticks':456,'unit':'fixed-api','control_group':'/fixed-api'}
+    owner={'pid':os.getpid(),'start_ticks':runtime._dependency_process(os.getpid())[0],
+           'unit':'fixed-api','control_group':runtime._dependency_cgroup(os.getpid())}
+    value.supervisor.preparation_identity=lambda:owner
     monkeypatch.setattr(runtime.shutil,'which',lambda name,**kwargs:'/usr/bin/'+name)
     monkeypatch.setattr(runtime.subprocess,'run',lambda argv,**kwargs:SimpleNamespace(returncode=0,stdout='v22.1.0'))
     return value,assets
@@ -86,6 +90,10 @@ def test_dependency_install_is_fixed_pinned_owned_and_child_environment_only(sea
         def wait(self,**kwargs):return 0
         def poll(self):return 0
     monkeypatch.setattr(runtime.subprocess,'Popen',Process)
+    monkeypatch.setattr(runtime,'_dependency_process',lambda pid:(42,'Z',pid))
+    monkeypatch.setattr(runtime,'_dependency_group_live',lambda group,cgroup:False)
+    monkeypatch.setattr(runtime,'_dependency_cgroup',lambda pid:value.supervisor.preparation_identity()['control_group'])
+    monkeypatch.setattr(runtime.os,'waitid',lambda *args:SimpleNamespace(si_code=os.CLD_EXITED,si_status=0))
     value.prepare_claude_assets(time.monotonic()+10)
     value.prepare_claude_assets(time.monotonic()+10)
     assert len(calls)==1
@@ -102,18 +110,51 @@ def test_dependency_timeout_reaps_only_owned_child_and_stays_inconclusive(seat,m
     signals=[]
     class Process:
         pid=987
-        waits=0
         def __init__(self,*args,**kwargs):pass
-        def wait(self,**kwargs):
-            self.waits+=1
-            if self.waits==1:raise subprocess.TimeoutExpired('fixed npm',1)
-            return -15
-        def poll(self):return None
+        def wait(self,**kwargs):return -15
     monkeypatch.setattr(runtime.subprocess,'Popen',Process)
+    monkeypatch.setattr(runtime,'_dependency_process',lambda pid:(42,'R',pid))
+    monkeypatch.setattr(runtime,'_dependency_cgroup',lambda pid:value.supervisor.preparation_identity()['control_group'])
+    monkeypatch.setattr(runtime,'_dependency_group_live',lambda group,cgroup:not signals)
+    def expired(*args):raise subprocess.TimeoutExpired('fixed npm',1)
+    monkeypatch.setattr(runtime.os,'waitid',expired)
     monkeypatch.setattr(runtime.os,'killpg',lambda pid,sig:signals.append((pid,sig)))
     with pytest.raises(RuntimeContractError) as exc:value.prepare_claude_assets(time.monotonic()+10)
     assert exc.value.code=='CHANNEL_UNAVAILABLE' and signals==[(987,runtime.signal.SIGTERM)]
     assert not value.claude_assets_ready and not value.assets_lock.locked()
+
+
+def test_expired_and_cached_deadlines_never_start_another_helper(seat,monkeypatch):
+    value,_=asset_seat(seat,monkeypatch)
+    calls=[]
+    monkeypatch.setattr(runtime.subprocess,'run',lambda *args,**kwargs:calls.append(args))
+    for cached in (False,True):
+        value.claude_assets_ready=cached
+        with pytest.raises(RuntimeContractError):value.prepare_claude_assets(time.monotonic()-1)
+    assert calls==[]
+
+
+def test_completed_dependency_parent_reconciles_child_and_preserves_sentinel(seat,monkeypatch):
+    value,assets=asset_seat(seat,monkeypatch)
+    installed=assets/'node_modules/@modelcontextprotocol/sdk/package.json'
+    installed.parent.mkdir(parents=True);installed.write_text('{"version":"1.31.0"}')
+    pidfile=value.root/'dependency-child-pid'
+    popen=subprocess.Popen
+    sentinel=popen([sys.executable,'-c','import time;time.sleep(10)'],start_new_session=True)
+    def owned_fake(*args,**kwargs):
+        body=('import subprocess,sys;from pathlib import Path;'
+              'child=subprocess.Popen([sys.executable,"-c","import time;time.sleep(10)"]);'
+              f'Path({str(pidfile)!r}).write_text(str(child.pid))')
+        return popen([sys.executable,'-c',body],**kwargs)
+    monkeypatch.setattr(runtime.subprocess,'Popen',owned_fake)
+    try:
+        value.prepare_claude_assets(time.monotonic()+3)
+        child=int(pidfile.read_text())
+        try:assert runtime._dependency_process(child)[1]=='Z'
+        except FileNotFoundError:pass
+        assert sentinel.poll() is None and value.claude_assets_ready
+    finally:
+        sentinel.terminate();sentinel.wait(timeout=2)
 
 
 def test_cached_dependency_parent_alias_never_selects_external_sdk(seat,monkeypatch,tmp_path):
