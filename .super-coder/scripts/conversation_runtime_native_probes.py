@@ -452,6 +452,14 @@ class _Scenarios:
         self.first_request: str | None = None
         self.first_activity: str | None = None
         self.second_request: str | None = None
+        self.work_observation: dict[str, Any] = {"initial_snapshot_observed": False,
+            "initial_snapshot_current": False, "initial_snapshot_partial": False,
+            "initial_root_terminal_current": False, "initial_child_ancestry_current": False,
+            "initial_child_active_turn_present": False, "observed_child_terminal_current": False,
+            "root_tagged_pid_candidates": 0, "root_owned_pid_matches": 0,
+            "child_tagged_pid_candidates": 0, "child_owned_pid_matches": 0}
+        self._root_label: str | None = None
+        self._child_label: str | None = None
         with driver._lock:
             driver._scenario = self
 
@@ -463,6 +471,7 @@ class _Scenarios:
         with self.driver._lock:
             request, activity, second = self.first_request, self.first_activity, self.second_request
             stage, root, events = self.waiting_stage, self.driver.identity, tuple(self.driver.events)
+            work = dict(self.work_observation)
         matched = [e for e in events if request and activity and self._root_event(e, request, activity)]
         statuses = ("completed", "failed", "interrupted", "other")
         root_terminals = dict.fromkeys(statuses, 0)
@@ -491,7 +500,7 @@ class _Scenarios:
                 "first_root_terminal_counts": root_terminals, "child_terminal_counts": child_terminals,
                 "first_final_nonce_matches": reply, "first_successful_reply": bool(
                     processed and root_terminals["completed"] and reply),
-                "second_final_nonce_matches": self.nonce in text(recalled)}
+                "second_final_nonce_matches": self.nonce in text(recalled), **work}
 
     def _wait(self, predicate: Callable[[], Any]) -> Any:
         while time.monotonic() < self.deadline:
@@ -581,20 +590,30 @@ class _Scenarios:
 
     def _inventory(self) -> NativeSnapshot:
         result = self.driver.inventory(deadline=self.deadline)
+        if self.waiting_stage == "initial_snapshot":
+            with self.driver._lock:
+                self.work_observation.update(initial_snapshot_observed=True,
+                    initial_snapshot_current=result.freshness == "current", initial_snapshot_partial=result.partial)
         if result.partial or result.freshness != "current":
             raise RuntimeContractError("PROBE_INVENTORY_PARTIAL", "complete owned snapshot required")
         return result
 
     def _pid(self, label: str) -> ProcessIdentity | None:
         text = "".join(str(e.data.get("text", "")) for e in self._events() if e.kind.startswith("output."))
-        matches = re.findall(re.escape(label)+r"=(\d+)\b", text)
+        matches = list(dict.fromkeys(re.findall(re.escape(label)+r"=(\d+)\b", text)))[:128]
         callback = self.owned.process_identity
+        identities = []
         if callback is not None:
             for match in matches:
                 identity = callback(int(match))
                 if identity is not None and identity.pid == int(match):
-                    return identity
-        return None
+                    identities.append(identity)
+        key = "root" if label == self._root_label else "child" if label == self._child_label else None
+        if key:
+            with self.driver._lock:
+                self.work_observation[key+"_tagged_pid_candidates"] = min(len(matches), 2048)
+                self.work_observation[key+"_owned_pid_matches"] = min(len(identities), 2048)
+        return identities[0] if identities else None
 
     def _alive(self, process: ProcessIdentity) -> bool:
         callback = self.owned.process_identity
@@ -638,6 +657,7 @@ class _Scenarios:
         work_enabled = CAP_STOP_WORK in self.caps and "stop_work_terminal" in grants
         background = work_enabled or CAP_STOP_REPLY in self.caps
         root_label, child_label = "F89_ROOT_"+self.nonce, "F89_CHILD_"+self.nonce
+        self._root_label, self._child_label = root_label, child_label
         root_command = f"python -u -c 'import os,time;print(\"{root_label}=\"+str(os.getpid()),flush=True);time.sleep(105)'"
         child_command = f"python -u -c 'import os,time;print(\"{child_label}=\"+str(os.getpid()),flush=True);time.sleep(110)'"
         prompt = ("Authorized finite synthetic compatibility probe. Obey the no-memory boot. Never inspect "
@@ -659,20 +679,31 @@ class _Scenarios:
             self._wait(lambda: self._successful_reply(first, first_receipt, "READY "+self.nonce))
             if not self.owned.observe_marker(self.nonce, self.deadline):
                 raise RuntimeContractError("PROBE_BOOT_FIXTURE_UNPROVED", "physical managed marker not observed")
-            self._phase("initial_work_inventory")
+            self._phase("initial_snapshot")
             initial = self._inventory()
             root_work = next((w for w in initial.work if w.kind == "terminal" and w.reference.thread_id == root.root_id), None)
             child = next((w for w in initial.work if w.kind == "child" and w.reference.parent_thread_id == root.root_id), None)
+            with self.driver._lock:
+                self.work_observation.update(initial_root_terminal_current=root_work is not None,
+                    initial_child_ancestry_current=child is not None,
+                    initial_child_active_turn_present=bool(child and child.reference.activity_id))
+            self._phase("root_tagged_pid")
             root_pid = self._wait(lambda: self._pid(root_label)) if background else None
             child_terminal = None
             child_pid = None
             if child_enabled:
+                self._phase("child_ancestry")
                 if child is None or not child.reference.activity_id:
                     raise RuntimeContractError("PROBE_CHILD_UNPROVED", "owned child ancestry/current turn required")
+                self._phase("child_terminal")
                 child_terminal = self._wait(lambda: next((w for w in self._inventory().work if w.kind == "terminal"
                     and w.reference.thread_id == child.reference.thread_id), None))
+                with self.driver._lock:
+                    self.work_observation["observed_child_terminal_current"] = True
+                self._phase("child_tagged_pid")
                 child_pid = self._wait(lambda: self._pid(child_label))
             elif background:
+                self._phase("child_tagged_pid")
                 child_pid = self._wait(lambda: self._pid(child_label))
             self._phase("nonce_recall")
             second, second_receipt = self._submit("Reply only with the remembered nonce from the previous message. No tools or resources.")
