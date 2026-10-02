@@ -19,6 +19,7 @@ import hashlib
 import importlib
 import io
 import json
+import math
 import os
 import re
 import secrets
@@ -375,10 +376,13 @@ class NativeSupervisor:
                 raise FixtureError("SOURCE_INVALID", "copied controller is unavailable")
             native["status"] = "starting"
             save(record,self.receipt)
+            remaining=math.ceil(record["expires_at"]-time.time())
+            if remaining<=0:
+                raise FixtureError("RESOURCE_LIMIT","fixture deadline reached before native launch")
             argv=["systemd-run","--user","--quiet","--collect","--unit",native["unit"],
                      "--description",native_description(record,native),"-p","Type=exec",
                      "-p","KillMode=control-group","-p","SendSIGKILL=yes","-p","TimeoutStopSec=5s",
-                     "-p",f"RuntimeMaxSec={record['limits']['lifetime_seconds']}s",
+                     "-p",f"RuntimeMaxSec={remaining}s",
                      "-p","MemoryMax=2048M","-p","TasksMax=128","-p",f"WorkingDirectory={root}",
                      "-p",f"StandardOutput=append:{native['root']}/controller.log",
                      "-p",f"StandardError=append:{native['root']}/controller.log",
@@ -510,6 +514,64 @@ def archive(source_repo: Path, ref: str) -> tuple[str, bytes]:
     return sha, result.stdout
 
 
+def launch_api(record: dict,root: Path, *, resume: bool=False) -> None:
+    remaining=math.ceil(record["expires_at"]-time.time())
+    if remaining<=0:
+        raise FixtureError("RESOURCE_LIMIT","fixture deadline reached before API launch")
+    limits=record["limits"]
+    bootstrap=root/"fixture_bootstrap.py"
+    argv=["systemd-run", "--user", "--quiet", "--collect", "--unit", record["unit"],
+                 "--description", description(record), "-p", "Type=exec",
+                 "-p", "KillMode=control-group", "-p", "SendSIGKILL=yes",
+                 "-p", "TimeoutStopSec=5s", "-p", f"RuntimeMaxSec={remaining}s",
+                 "-p", f"MemoryMax={limits['memory_mib']}M", "-p", f"TasksMax={limits['tasks']}",
+                 "-p", f"WorkingDirectory={root}",
+                 "-p", f"StandardOutput=append:{root / 'server.log'}",
+                 "-p", f"StandardError=append:{root / 'server.log'}",
+                 sys.executable, "-I", str(bootstrap), "_serve", "--root", str(root)]
+    if resume:
+        argv.append("--resume")
+    command(argv)
+
+
+def restart_api(receipt: Path) -> dict:
+    receipt=canonical_receipt(receipt)
+    initial=read_json(receipt)
+    with ownership_lock(initial["fixture_id"]):
+        record=verify_receipt(receipt)
+        root=verify_root(record)
+        if record["status"]!="serving":
+            raise FixtureError("STATE_CONFLICT","API recovery requires a serving retained fixture")
+        for native in record.get("native_units",[]):
+            verify_native(record,native)
+        state=unit_state(record)
+        owned_unit(record,state)
+        if state.get("ActiveState") not in {"inactive","failed"} or state.get("MainPID","0")!="0" or (
+                record.get("main_pid",0)>0 and process_start_ticks(record["main_pid"])==record.get("main_pid_start_ticks")):
+            raise FixtureError("STATE_CONFLICT","existing API must be stopped before recovery")
+        select_port(record["port"])
+        launch_api(record,root,resume=True)
+        deadline=time.monotonic()+15
+        while time.monotonic()<deadline:
+            try:
+                with urllib.request.urlopen(record["url"]+"/api/experiment-fixture",timeout=.5) as response:
+                    observed=json.load(response)
+                if observed.get("fixture_id")!=record["fixture_id"] or observed.get("source_sha")!=record["source_sha"]:
+                    raise FixtureError("OWNERSHIP_INVALID","recovered API identity differs")
+                state=unit_state(record)
+                if not owned_unit(record,state):
+                    raise FixtureError("STARTUP_FAILED","recovered API unit disappeared")
+                pid=int(state.get("MainPID","0"));ticks=process_start_ticks(pid)
+                if state.get("ActiveState")=="active" and ticks is not None:
+                    record.update(main_pid=pid,main_pid_start_ticks=ticks,control_group=state.get("ControlGroup",""))
+                    record["api_recoveries"]=record.get("api_recoveries",0)+1
+                    save(record,receipt)
+                    return record
+            except (OSError,ValueError,urllib.error.HTTPError):
+                time.sleep(.1)
+        raise FixtureError("STARTUP_FAILED","API recovery failed; fixture ownership retained")
+
+
 def start(source_repo: Path, ref: str, receipt: Path, *, temp_parent: Path | None = None,
           port: int | None = None, runtime: str = "none", lifetime: int = MAX_LIFETIME,
           memory_mib: int = MAX_MEMORY_MIB, tasks: int = MAX_TASKS) -> dict[str, Any]:
@@ -564,6 +626,7 @@ def start_locked(source_repo: Path, sha: str, raw: bytes, receipt: Path, *,
         "runtime": runtime, "port": port, "limits": limits,
         "bootstrap_sha256": hashlib.sha256(Path(__file__).resolve().read_bytes()).hexdigest(),
         "receipt": str(receipt), "status": "preparing", "cleanup": {"complete": False},
+        "expires_at":time.time()+limits["lifetime_seconds"],
     }
     try:
         write_json(root / MARKER, identity(record))
@@ -592,15 +655,7 @@ def start_locked(source_repo: Path, sha: str, raw: bytes, receipt: Path, *,
         save(record, receipt)
         if unit_state(record)["LoadState"] != "not-found":
             raise FixtureError("UNIT_CONFLICT", "generated fixture unit already exists")
-        command(["systemd-run", "--user", "--quiet", "--collect", "--unit", record["unit"],
-                 "--description", description(record), "-p", "Type=exec",
-                 "-p", "KillMode=control-group", "-p", "SendSIGKILL=yes",
-                 "-p", "TimeoutStopSec=5s", "-p", f"RuntimeMaxSec={limits['lifetime_seconds']}s",
-                 "-p", f"MemoryMax={limits['memory_mib']}M", "-p", f"TasksMax={limits['tasks']}",
-                 "-p", f"WorkingDirectory={root}",
-                 "-p", f"StandardOutput=append:{root / 'server.log'}",
-                 "-p", f"StandardError=append:{root / 'server.log'}",
-                 sys.executable, "-I", str(bootstrap), "_serve", "--root", str(root)])
+        launch_api(record,root)
         deadline = time.monotonic() + 15
         url = f"http://127.0.0.1:{port}"
         while time.monotonic() < deadline:
@@ -690,7 +745,7 @@ def bootstrap_repository(root: Path) -> str:
     return command(["git","-C",str(root),"rev-parse","HEAD"]).stdout.strip()
 
 
-def serve(root: Path) -> int:
+def serve(root: Path, *, resume: bool=False) -> int:
     """Internal test-only bootstrap, executed from the marked archive."""
     root, trusted = verified_bootstrap_root(root, Path(__file__).absolute())
     sanitized = clean_environment()
@@ -708,7 +763,7 @@ def serve(root: Path) -> int:
     # Keep those reads inside the synthetic seat without changing host HOME,
     # CODEX_HOME, account files, or the production modules.
     fixture_home = root / "home"
-    fixture_home.mkdir()
+    fixture_home.mkdir(exist_ok=resume)
     mock.patch.object(Path, "home", return_value=fixture_home).start()
     original_expanduser = os.path.expanduser
     mock.patch.object(os.path, "expanduser", side_effect=lambda value: (
@@ -719,34 +774,39 @@ def serve(root: Path) -> int:
     import sqlite3
 
     import migrate
-    synthetic_git_sha = bootstrap_repository(root)
+    synthetic_git_sha = (command(["git","-C",str(root),"rev-parse","HEAD"]).stdout.strip()
+                         if resume else bootstrap_repository(root))
     db = engine / "shell_db.db"
-    if db.exists():
+    if db.exists() and not resume:
         raise FixtureError("STATE_CONFLICT", "fixture database already exists")
-    con = sqlite3.connect(db)
-    con.executescript((engine / "schema.sql").read_text())
-    con.commit()
-    con.close()
-    migrate.migrate(str(db))
-    con = sqlite3.connect(db)
-    con.execute("INSERT INTO users(user_id,username,is_active) VALUES(1,'fixture-operator',1),(2,'fixture-other',0)")
-    shell_prefix = "fx" + trusted["fixture_id"][:10]
-    for sid, short, owner in ((1, shell_prefix + "a", 1), (2, shell_prefix + "b", 1),
-                              (3, shell_prefix + "other", 2)):
-        con.execute("INSERT INTO shells(shell_id,display_name,shortname,flavor,system_prompt,user_id,api_key) "
-                    "VALUES(?,?,?,'dev','Isolated GUI fixture',?,?)",
-                    (sid, short, short, owner, secrets.token_hex(32)))
-        command(["git","-C",str(root),"worktree","add","--quiet","-b",f"shell/{short}",
-                 str(root / ".sc-worktrees" / short)])
-    con.commit()
-    con.close()
+    if resume and not db.is_file():
+        raise FixtureError("STATE_CONFLICT","fixture recovery database is missing")
+    if not resume:
+        con = sqlite3.connect(db)
+        con.executescript((engine / "schema.sql").read_text())
+        con.commit()
+        con.close()
+        migrate.migrate(str(db))
+        con = sqlite3.connect(db)
+        con.execute("INSERT INTO users(user_id,username,is_active) VALUES(1,'fixture-operator',1),(2,'fixture-other',0)")
+        shell_prefix = "fx" + trusted["fixture_id"][:10]
+        for sid, short, owner in ((1, shell_prefix + "a", 1), (2, shell_prefix + "b", 1),
+                                  (3, shell_prefix + "other", 2)):
+            con.execute("INSERT INTO shells(shell_id,display_name,shortname,flavor,system_prompt,user_id,api_key) "
+                        "VALUES(?,?,?,'dev','Isolated GUI fixture',?,?)",
+                        (sid, short, short, owner, secrets.token_hex(32)))
+            command(["git","-C",str(root),"worktree","add","--quiet","-b",f"shell/{short}",
+                     str(root / ".sc-worktrees" / short)])
+        con.commit()
+        con.close()
     # Only this synthetic installation owns these ports/state. No installed
     # profile, credentials, wrapper, or live instance is reconciled.
-    write_json(engine / "instance.json", {"repo":root.name,"port":trusted["port"],
+    if not resume:
+        write_json(engine / "instance.json", {"repo":root.name,"port":trusted["port"],
                "dev_port":trusted["port"]+1 if trusted["port"]<65535 else 65534,
-               "browser":{"proxy_port":trusted["port"],"fixture_test_transport":True}})
+                   "browser":{"proxy_port":trusted["port"],"fixture_test_transport":True}})
     import instance_state
-    instance_state.resolve(instance_config=engine / "instance.json",create=True)
+    instance_state.resolve(instance_config=engine / "instance.json",create=not resume)
     import server
     import transport
     actual = Path(server.__file__).resolve()
@@ -833,13 +893,18 @@ def main(argv: list[str] | None = None) -> int:
     launch.add_argument("--tasks", type=int, default=MAX_TASKS)
     cleanup = sub.add_parser("stop")
     cleanup.add_argument("--receipt", type=Path, required=True)
+    recovery=sub.add_parser("restart-api",help="recover only a stopped marked fixture API; native units remain")
+    recovery.add_argument("--receipt",type=Path,required=True)
     internal = sub.add_parser("_serve", help=argparse.SUPPRESS)
     internal.add_argument("--root", type=Path, required=True)
+    internal.add_argument("--resume",action="store_true")
     args = parser.parse_args(argv)
     try:
         if args.action == "_serve":
-            return serve(args.root.absolute())
-        if args.action == "stop":
+            return serve(args.root.absolute(),resume=args.resume)
+        if args.action == "restart-api":
+            record=restart_api(args.receipt.absolute())
+        elif args.action == "stop":
             record = stop(args.receipt.absolute())
         else:
             record = start(args.source_repo.absolute(), args.ref, args.receipt,
