@@ -50,6 +50,39 @@ def encoded(value: Any) -> str:
     return json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False)
 
 
+def observed_native_route(value: Any) -> dict:
+    """Bound only selected, sanitized native observations; never an account dump."""
+    required={'account_type','model','efforts'}
+    optional={'observation_origin','model_evidence','effort_evidence','catalogue_observed','auth'}
+    def text(item):
+        return isinstance(item,str) and 0<len(item)<=255 and not any(ord(c)<32 for c in item)
+    if not isinstance(value,dict):
+        raise RuntimeContractError('NATIVE_ROUTE_INVALID','bounded selected native route observations required')
+    value={key:item for key,item in value.items() if key in required|optional}
+    if (not required<=value.keys()
+            or not text(value['account_type']) or not text(value['model'])
+            or not isinstance(value['efforts'],list) or not 1<=len(value['efforts'])<=16
+            or not all(text(item) for item in value['efforts'])
+            or any(not text(value[key]) for key in ('observation_origin','model_evidence','effort_evidence') if key in value)
+            or ('catalogue_observed' in value and not isinstance(value['catalogue_observed'],bool))):
+        raise RuntimeContractError('NATIVE_ROUTE_INVALID','bounded selected native route observations required')
+    if 'auth' in value:
+        auth=value['auth']
+        if not isinstance(auth,dict):
+            raise RuntimeContractError('NATIVE_ROUTE_INVALID','sanitized native auth enums required')
+        auth={key:item for key,item in auth.items() if key in {'method','provider','subscription_type'}}
+        if (not {'method','provider'}<=auth.keys()
+                or not all(text(item) for item in auth.values())):
+            raise RuntimeContractError('NATIVE_ROUTE_INVALID','sanitized native auth enums required')
+        value['auth']=auth
+    return value
+
+
+def selected_route_matches(route: dict,context: RuntimeContext) -> bool:
+    return (route['account_type']==('chatgpt' if context.harness=='codex' else 'claude.ai')
+            and route['model']==context.model and context.effort in route['efforts'])
+
+
 def private_directory(root: Path) -> None:
     info = root.lstat()
     if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.geteuid() or stat.S_IMODE(info.st_mode) != 0o700:
@@ -323,6 +356,27 @@ class Controller:
         try:
             if self.identity and event.reference and event.reference.root_id != self.identity.root_id:
                 raise RuntimeContractError("OWNERSHIP_INVALID", "event is outside captured native root")
+            route = None
+            route_matches = True
+            if event.kind == 'runtime.ready' and 'native_route' in event.data:
+                route = observed_native_route(event.data['native_route'])
+                if self.context:
+                    route_matches=selected_route_matches(route,self.context)
+                # Unknown future observation fields are omitted before journal
+                # persistence; they cannot invalidate demonstrated required data.
+                event=dataclasses.replace(event,data={**event.data,'native_route':route})
+                if not route_matches:
+                    event=dataclasses.replace(event,grade='inconclusive',data={
+                        **event.data,'readiness_diagnostic':'NATIVE_ROUTE_INCONCLUSIVE'})
+            if (event.kind=='runtime.ready' and self.identity and event.reference
+                    and event.reference.thread_id!=self.identity.root_id
+                    and not (self.context and self.context.harness=='claude' and event.reference.thread_id is None)):
+                event=dataclasses.replace(event,grade='inconclusive')
+            if event.kind=='runtime.ready' and self.identity is None:
+                # A driver callback can precede its final DriverStart result.
+                # Retain the observation, but it cannot admit the generation
+                # before the captured identity and selected route are checked.
+                event=dataclasses.replace(event,grade='inconclusive')
             self.journal.emit(event)
             if event.kind=='runtime.setup' and not self.journal.get('close') and not self.ready:
                 if event.freshness=='current' and not event.partial and event.grade!='inconclusive':
@@ -330,7 +384,14 @@ class Controller:
                 else:
                     self.journal.set('setup',None)
             elif (event.kind=='runtime.ready' and not self.journal.get('close') and not self.lost
-                  and self.identity and event.reference and event.reference.root_id==self.identity.root_id):
+                  and self.identity and event.reference and event.reference.root_id==self.identity.root_id
+                  and (event.reference.thread_id==self.identity.root_id or
+                       (self.context and self.context.harness=='claude' and event.reference.thread_id is None))
+                  and event.freshness=='current' and not event.partial and event.grade in {'compatible','unverified'}
+                  and route_matches):
+                if route is not None:
+                    self.identity=dataclasses.replace(self.identity,protocol={
+                        **self.identity.protocol,'native_route':public_payload(route,sensitive_values=self.journal.secrets)})
                 self.ready=True
                 self.journal.set('setup',None)
         except RuntimeContractError:
@@ -386,8 +447,19 @@ class Controller:
                         raise RuntimeContractError('RUNTIME_CLOSING' if self.journal.get('close') else 'DEADLINE_EXPIRED','native startup was fenced before its edge')
                     return self.driver.start(context,self.emit,deadline=deadline)
                 started = self.call(start_edge,deadline=deadline)
+                if started.identity and 'native_route' in started.identity.protocol:
+                    route=observed_native_route(started.identity.protocol['native_route'])
+                    identity=dataclasses.replace(started.identity,protocol={**started.identity.protocol,'native_route':route})
+                    started=dataclasses.replace(started,identity=identity)
+                    if started.state=='ready' and not selected_route_matches(route,context):
+                        started=dataclasses.replace(started,state='unknown',detail='NATIVE_ROUTE_INCONCLUSIVE',
+                                                    capabilities={**started.capabilities,'submission':'inconclusive'})
                 self.identity = started.identity
                 self.ready = started.state == "ready" and self.identity is not None and not self.journal.get('close')
+                if self.ready:
+                    route_data={'native_route':self.identity.protocol['native_route']} if 'native_route' in self.identity.protocol else {}
+                    self.emit(RuntimeEvent('runtime.ready',NativeReference(self.identity.root_id,thread_id=self.identity.root_id),
+                                           provenance='controller:validated DriverStart ready',data=route_data))
                 if started.setup is not None and not self.journal.get('close'):
                     self.capture_setup(started.setup)
                     self.emit(RuntimeEvent('runtime.setup',data=dataclasses.asdict(started.setup)))
