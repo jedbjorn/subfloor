@@ -53,6 +53,7 @@ SOURCE_FILES = (
 IDENTITY_KEYS = (
     "fixture_id", "source_sha", "archive_sha256", "root", "root_device",
     "root_inode", "unit", "ownership_nonce", "runtime", "port", "limits",
+    "bootstrap_sha256",
 )
 MAX_LIFETIME = 1800
 MAX_MEMORY_MIB = 512
@@ -162,6 +163,17 @@ def save(record: dict[str, Any], receipt: Path) -> None:
     write_json(receipt, record)
 
 
+def canonical_receipt(receipt: Path) -> Path:
+    """Aliases of an existing parent must share one lock and receipt identity."""
+    try:
+        parent = receipt.absolute().parent.resolve(strict=True)
+    except OSError as exc:
+        raise FixtureError("INPUT_INVALID", "receipt parent must already exist") from exc
+    if not parent.is_dir():
+        raise FixtureError("INPUT_INVALID", "receipt parent must be a directory")
+    return parent / receipt.name
+
+
 def verify_receipt(receipt: Path) -> dict[str, Any]:
     public = read_json(receipt)
     trusted = read_json(ledger_path(public.get("fixture_id", "")))
@@ -240,6 +252,7 @@ def process_start_ticks(pid: int) -> int | None:
 
 
 def stop(receipt: Path) -> dict[str, Any]:
+    receipt = canonical_receipt(receipt)
     initial = read_json(receipt)
     with ownership_lock(initial.get("fixture_id", "")):
         return stop_locked(receipt)
@@ -332,7 +345,8 @@ def start(source_repo: Path, ref: str, receipt: Path, *, temp_parent: Path | Non
     if runtime not in {"none", "experimental"}:
         raise FixtureError("RUNTIME_UNAVAILABLE", "unknown fixture runtime mode")
     validate_limits(lifetime, memory_mib, tasks)
-    receipt_key = hashlib.sha256(str(receipt.absolute()).encode()).hexdigest()[:32]
+    receipt = canonical_receipt(receipt)
+    receipt_key = hashlib.sha256(str(receipt).encode()).hexdigest()[:32]
     with ownership_lock(receipt_key):
         return start_serialized(source_repo, ref, receipt, temp_parent=temp_parent,
                                 port=port, runtime=runtime, lifetime=lifetime,
@@ -373,6 +387,7 @@ def start_locked(source_repo: Path, sha: str, raw: bytes, receipt: Path, *,
         "root_device": info.st_dev, "root_inode": info.st_ino,
         "unit": f"{PREFIX}{fid}.service", "ownership_nonce": secrets.token_hex(32),
         "runtime": runtime, "port": port, "limits": limits,
+        "bootstrap_sha256": hashlib.sha256(Path(__file__).resolve().read_bytes()).hexdigest(),
         "receipt": str(receipt), "status": "preparing", "cleanup": {"complete": False},
     }
     try:
@@ -463,8 +478,22 @@ def start_locked(source_repo: Path, sha: str, raw: bytes, receipt: Path, *,
         raise FixtureError("PREPARATION_FAILED", "fixture preparation failed; see retained receipt") from exc
 
 
+def verified_bootstrap_root(root: Path, bootstrap: Path) -> tuple[Path, dict[str, Any]]:
+    marker = read_json(root / MARKER)
+    trusted = read_json(ledger_path(marker.get("fixture_id", "")))
+    retained_root = Path(trusted["root"])
+    if root.absolute() != retained_root:
+        raise FixtureError("OWNERSHIP_INVALID", "bootstrap caller root differs from the retained fixture")
+    verified = verify_root(trusted)
+    if (bootstrap.absolute() != verified / "fixture_bootstrap.py" or bootstrap.is_symlink()
+            or hashlib.sha256(bootstrap.read_bytes()).hexdigest() != trusted["bootstrap_sha256"]):
+        raise FixtureError("OWNERSHIP_INVALID", "bootstrap file differs from the retained helper identity")
+    return verified, trusted
+
+
 def serve(root: Path) -> int:
     """Internal test-only bootstrap, executed from the marked archive."""
+    root, trusted = verified_bootstrap_root(root, Path(__file__).absolute())
     sanitized = clean_environment()
     os.environ.clear()
     os.environ.update(sanitized)
@@ -475,9 +504,6 @@ def serve(root: Path) -> int:
                        "PYTHONUNBUFFERED": "1"})
     sys.path[:] = [item for item in sys.path if item and (
         "site-packages" in item or item.startswith(sys.base_prefix))]
-    marker = read_json(root / MARKER)
-    trusted = read_json(ledger_path(marker.get("fixture_id", "")))
-    verify_root(trusted)
     engine = root / ".super-coder"
     # Some copied read APIs use Path.home/expanduser for harness inventory.
     # Keep those reads inside the synthetic seat without changing host HOME,
@@ -542,6 +568,7 @@ def serve(root: Path) -> int:
                                      "sprint_runtime", "sprint_pr_watcher")}
             return (200, [("Content-Type", "application/json")], json.dumps({
                 "fixture_id": trusted["fixture_id"], "source_sha": trusted["source_sha"],
+                "bootstrap_sha256": trusted["bootstrap_sha256"],
                 "server_file": str(actual), "transport_file": str(Path(transport.__file__).resolve()),
                 "database": str(db), "source_files": hashes, "runtime": trusted["runtime"],
                 "production_services_started": any(services.values()),

@@ -5,6 +5,7 @@ by these tests. Real Linux/browser acceptance is separately retained host eviden
 """
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import io
 import os
@@ -61,9 +62,11 @@ def marked(seat):
         "root": str(root), "root_device": info.st_dev, "root_inode": info.st_ino,
         "unit": f"{fixture.PREFIX}{fid}.service", "ownership_nonce": "d" * 64,
         "runtime": "none", "port": 8800, "limits": fixture.validate_limits(10, 64, 8),
+        "bootstrap_sha256": hashlib.sha256(b"fixture bootstrap").hexdigest(),
         "receipt": str(receipt), "status": "preparing", "cleanup": {"complete": False},
     }
     fixture.write_json(root / fixture.MARKER, fixture.identity(record))
+    (root / "fixture_bootstrap.py").write_bytes(b"fixture bootstrap")
     fixture.save(record, receipt)
     return record, root, receipt
 
@@ -188,6 +191,67 @@ def test_symlink_root_and_traversal_identity_cannot_select_other_state(seat):
     with pytest.raises(fixture.FixtureError, match="invalid fixture identity"):
         fixture.stop(receipt)
     assert (seat / "saved-root").exists()
+
+
+def test_copied_valid_marker_cannot_bootstrap_another_root(seat):
+    _, root, _ = marked(seat)
+    other = seat / "adjacent-root"
+    other.mkdir(mode=0o700)
+    fixture.write_json(other / fixture.MARKER, fixture.read_json(root / fixture.MARKER))
+    with pytest.raises(fixture.FixtureError, match="caller root differs"):
+        fixture.verified_bootstrap_root(other, other / "fixture_bootstrap.py")
+    assert not (other / ".super-coder").exists()
+
+
+def test_bootstrap_bytes_and_retained_root_are_bound(seat):
+    _, root, _ = marked(seat)
+    script = root / "fixture_bootstrap.py"
+    verified, _ = fixture.verified_bootstrap_root(root, script)
+    assert verified == root
+    script.write_text("changed helper")
+    with pytest.raises(fixture.FixtureError, match="helper identity"):
+        fixture.verified_bootstrap_root(root, script)
+
+
+def test_receipt_parent_alias_has_same_canonical_identity(seat):
+    alias = seat / "alias"
+    alias.symlink_to(seat, target_is_directory=True)
+    assert fixture.canonical_receipt(alias / "new.json") == seat / "new.json"
+
+
+def test_concurrent_starts_through_parent_alias_cannot_replace_receipt(seat):
+    repo = source_repo(seat)
+    alias = seat / "alias"
+    alias.symlink_to(seat, target_is_directory=True)
+    script = """
+import importlib.util, pathlib, subprocess, sys
+spec=importlib.util.spec_from_file_location('gui_fixture',sys.argv[1])
+m=importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+m.REGISTRY=pathlib.Path(sys.argv[2])
+actual=m.command
+m.command=lambda argv,**kwargs: (subprocess.CompletedProcess(argv,0,'','')
+    if argv[0]=='systemctl' else actual(argv,**kwargs))
+m.unit_state=lambda _: {'LoadState':'not-found','ActiveState':'inactive','MainPID':'0'}
+try:
+    m.start(pathlib.Path(sys.argv[3]),'HEAD',pathlib.Path(sys.argv[4]),
+            temp_parent=pathlib.Path(sys.argv[5]),runtime='experimental')
+except m.FixtureError as exc:
+    print(exc.code)
+"""
+    children = [subprocess.Popen([sys.executable, "-c", script,
+                                 str(ROOT / "maintainer/gui_experiment.py"),
+                                 str(fixture.REGISTRY), str(repo), str(receipt), str(seat)],
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                for receipt in (seat / "same.json", alias / "same.json")]
+    outcomes = []
+    for child in children:
+        stdout, stderr = child.communicate(timeout=10)
+        assert child.returncode == 0, stderr.decode()
+        outcomes.append(stdout.decode().strip())
+    assert sorted(outcomes) == ["INPUT_INVALID", "RUNTIME_UNAVAILABLE"]
+    record = fixture.read_json(seat / "same.json")
+    assert record["cleanup"]["complete"]
+    assert len(list(fixture.REGISTRY.glob("*.json"))) == 1
 
 
 def test_concurrent_stops_serialize_real_root_cleanup(seat):
