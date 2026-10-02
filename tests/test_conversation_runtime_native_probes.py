@@ -299,6 +299,51 @@ def test_factory_witness_does_not_label_missing_native_close_outcome_observed(ow
     assert not witness['first_close_observed'] and not witness['native_complete_retained']
     assert witness['first_close_outcome']=='inconclusive' and 'arbitrary native data' not in json.dumps(witness)
 
+
+@pytest.mark.parametrize('case',['missing_tag','unowned_candidate'])
+def test_inventory_witness_distinguishes_missing_tag_from_failed_owned_identity_match(owned,case):
+    original=owned.client.event
+    def output(kind,ref,request=None,**data):
+        if case=='missing_tag' and isinstance(data.get('text'),str):
+            data['text']=re.sub(r'F89_ROOT_[a-z0-9]+=200','untagged root output',data['text'])
+        return original(kind,ref,request,**data)
+    owned.client.event=output
+    actual=replace(owned,process_identity=lambda pid:None if pid==200 else owned.client.pids.get(pid))
+    factory=NativeProbeFactory(lambda *args:actual,lambda *args:CleanupProof(True,'complete'))
+    fp=fingerprint(actual);session=factory.reserve(fp,frozenset({'submission','stop_work'}),deadline=time.monotonic()+3)
+    session.driver.start(actual.context,lambda e:None,deadline=time.monotonic()+3)
+    result=session.exercise(session.driver,time.monotonic()+1)
+    assert result['submission'].grade=='inconclusive'
+    witness=factory.witness(fp)
+    assert witness['waiting_stage']=='root_tagged_pid' and witness['first_successful_reply']
+    assert witness['initial_snapshot_observed'] and witness['initial_snapshot_current']
+    assert not witness['initial_snapshot_partial'] and witness['initial_root_terminal_current']
+    assert witness['initial_child_ancestry_current'] and witness['initial_child_active_turn_present']
+    assert witness['root_tagged_pid_candidates']==(0 if case=='missing_tag' else 1)
+    assert witness['root_owned_pid_matches']==0 and witness['child_owned_pid_matches']==0
+    assert actual.client.marker not in json.dumps(witness) and '200' not in json.dumps(witness)
+    session.driver.cleanup(deadline=time.monotonic()+1)
+
+
+@pytest.mark.parametrize('change',[{'partial':True},{'freshness':'last_observed'}])
+def test_inventory_witness_preserves_partial_and_stale_snapshot_failure(owned,change):
+    original=owned.client.request
+    def snapshot(op,**fields):
+        result=original(op,**fields)
+        return result|change if op=='snapshot' else result
+    owned.client.request=snapshot
+    factory=NativeProbeFactory(lambda *args:owned,lambda *args:CleanupProof(True,'complete'))
+    fp=fingerprint(owned);session=factory.reserve(fp,frozenset({'submission','stop_work'}),deadline=time.monotonic()+3)
+    session.driver.start(owned.context,lambda e:None,deadline=time.monotonic()+3)
+    result=session.exercise(session.driver,time.monotonic()+2)
+    assert result['submission'].grade=='inconclusive' and len([c for c in owned.client.calls if c[0]=='submit'])==1
+    witness=factory.witness(fp)
+    assert witness['waiting_stage']=='initial_snapshot' and witness['initial_snapshot_observed']
+    assert witness['initial_snapshot_partial']==change.get('partial',False)
+    assert witness['initial_snapshot_current']==(change.get('freshness','current')=='current')
+    assert not witness['initial_root_terminal_current'] and witness['root_tagged_pid_candidates']==0
+    session.driver.cleanup(deadline=time.monotonic()+1)
+
 def test_finite_scenario_earns_observed_targets_without_early_os_cleanup_pass(owned):
     driver=start(owned);result=NativeProbeFactory._exercise(driver,frozenset({'submission','stop_reply','stop_work'}),time.monotonic()+3)
     assert all(item.grade=='compatible' for item in result.values())
@@ -306,6 +351,10 @@ def test_finite_scenario_earns_observed_targets_without_early_os_cleanup_pass(ow
     assert 'owned_unit_cleanup' not in result['stop_work'].coverage
     assert 200 not in owned.client.pids and 201 not in owned.client.pids and 77 in owned.client.pids
     assert len([c for c in owned.client.calls if c[0]=='submit'])==3
+    witness=driver._scenario.witness()
+    assert witness['initial_root_terminal_current'] and witness['observed_child_terminal_current']
+    assert witness['root_tagged_pid_candidates']==witness['root_owned_pid_matches']==1
+    assert witness['child_tagged_pid_candidates']==witness['child_owned_pid_matches']==1
     driver.cleanup(deadline=time.monotonic()+1)
 
 def test_terminal_only_grant_does_not_certify_child(owned):
