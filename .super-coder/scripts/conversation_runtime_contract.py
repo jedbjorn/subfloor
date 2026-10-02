@@ -10,6 +10,7 @@ from __future__ import annotations
 import abc
 import hashlib
 import json
+import math
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
@@ -52,6 +53,10 @@ _SENSITIVE_KEYS = frozenset({
     "token", "api_key", "authorization", "credentials", "credential", "password",
     "secret", "env", "environment", "thinking", "reasoning", "analysis",
 })
+_IDENTITY_KEYS = frozenset({"generation_id","conversation_id","root_id","thread_id",
+                          "parent_thread_id","activity_id","native_activity_id","item_id",
+                          "work_id","native_process_id","request_id","control_id",
+                          "boot_digest","policy_digest","payload_digest","sha256"})
 
 
 class RuntimeContractError(RuntimeError):
@@ -74,6 +79,9 @@ def public_payload(value: Any, *, sensitive_values: tuple[str, ...] = ()) -> Any
     Private reasoning must be excluded by driver normalization before emission.
     """
     if isinstance(value, Mapping):
+        for key,item in value.items():
+            if key in _IDENTITY_KEYS and isinstance(item,str) and any(secret and secret in item for secret in sensitive_values):
+                raise RuntimeContractError("IDENTITY_PRIVATE", "identity contains private material; refusing persistence without rewriting its target")
         return {str(key): public_payload(item, sensitive_values=sensitive_values) for key, item in value.items()
                 if str(key).lower() not in _SENSITIVE_KEYS}
     if isinstance(value, (list, tuple)):
@@ -175,6 +183,12 @@ class NativeReference:
     native_process_id: str | None = None
     os_process: ProcessIdentity | None = None
 
+    def __post_init__(self) -> None:
+        for key in ("root_id","thread_id","parent_thread_id","activity_id","item_id","work_id","native_process_id"):
+            value=getattr(self,key)
+            if (key=="root_id" and value is None) or (value is not None and (not isinstance(value,str) or not 1<=len(value)<=255)):
+                raise RuntimeContractError("REFERENCE_INVALID","bounded opaque native identities required")
+
 
 @dataclass(frozen=True)
 class RuntimeIdentity:
@@ -224,6 +238,9 @@ class WriteReceipt:
     acknowledged: bool = False
     native_activity_id: str | None = None
     detail: str = ""
+    def __post_init__(self) -> None:
+        if self.state not in {"not_written","written","unknown","unsupported","rejected"} or type(self.acknowledged) is not bool:
+            raise RuntimeContractError("RECEIPT_INVALID","invalid bounded native write receipt")
     # A transport ack or native RPC result is not a processing/terminal/cleanup
     # promise. Those require attributable events or an explicit snapshot.
 
@@ -245,6 +262,10 @@ class RuntimeEvent:
     def __post_init__(self) -> None:
         if self.kind not in EVENT_KINDS:
             raise RuntimeContractError("EVENT_INVALID", "unknown driver event kind")
+        if self.source not in {"gui","native_completion","automation","reconciliation","system"} or self.freshness not in {"current","last_observed","stale","unknown"} or self.grade not in {"compatible","incompatible","inconclusive","unverified"}:
+            raise RuntimeContractError("EVENT_INVALID","invalid event source/freshness/grade")
+        if not isinstance(self.observed_at,(int,float)) or not math.isfinite(self.observed_at):
+            raise RuntimeContractError("EVENT_INVALID","finite native observation time required")
         if self.kind.startswith(("activity.", "work.", "output.")) and self.reference is None:
             raise RuntimeContractError("EVENT_INVALID", "native activity/work/output needs an attributable reference")
         clean = public_payload(self.data)

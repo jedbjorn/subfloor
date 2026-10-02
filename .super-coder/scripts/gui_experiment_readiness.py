@@ -20,7 +20,8 @@ from conversation_boot import BootDirective, content_digest
 _LOCK=threading.Lock()
 
 
-def prepare(*,database: Path,root: Path,fixture_id: str,harness: str,shell_id: int=1) -> dict:
+def prepare(*,database: Path,root: Path,fixture_id: str,harness: str,shell_id: int | None=None) -> dict:
+    shell_id = shell_id if shell_id is not None else (1 if harness=='codex' else 2)
     if harness not in {'codex','claude'} or shell_id not in {1,2}:
         raise ValueError('synthetic harness/shell required')
     if run.ENGINE.resolve()!=root/'.super-coder' or Path(run.DB_PATH).resolve()!=database.resolve():
@@ -130,14 +131,23 @@ def mcp_response(*,method: str,path: str,body: bytes,database: Path,fixture_id: 
         if name=='fixture_state' and (not isinstance(marker,str) or not 1<=len(marker)<=200):
             raise ValueError('bounded marker required')
         api_path='/_sc/mem/whoami' if name=='fixture_identity' else '/_sc/mem/state'
+        api_body=b'' if name=='fixture_identity' else json.dumps({'body':marker}).encode()
         status,_,raw=dispatch('GET' if name=='fixture_identity' else 'POST',api_path,
-                              'Authorization: Bearer '+row['api_key']+'\r\nContent-Type: application/json\r\n',
-                              b'' if name=='fixture_identity' else json.dumps({'body':marker}).encode())
+                              'Authorization: Bearer '+row['api_key']+'\r\nContent-Type: application/json\r\nContent-Length: '+str(len(api_body))+'\r\n',
+                              api_body)
         if status!=200:
             raise ValueError('synthetic MCP auth routing refused')
         actual=json.loads(raw)
         if name=='fixture_identity' and actual.get('shell_id')!=row['shell_id']:
             raise ValueError('MCP identity differs from synthetic shell')
+        if name=='fixture_state':
+            con=db_driver.connect(str(database))
+            try:
+                observed=con.execute('SELECT current_state FROM shells WHERE shell_id=?',(row['shell_id'],)).fetchone()[0]
+            finally:
+                con.close()
+            if observed!=marker:
+                raise ValueError('MCP write did not reach the synthetic row')
         result={'content':[{'type':'text','text':json.dumps({'fixture_id':fixture_id,'shell_id':row['shell_id'],'ok':True})}]}
     else:
         return 200,headers,json.dumps({'jsonrpc':'2.0','id':mid,'error':{'code':-32601,'message':'fixture method unavailable'}}).encode()

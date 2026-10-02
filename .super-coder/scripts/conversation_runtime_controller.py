@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import dataclasses
 import importlib
+import importlib.util
 import json
 import os
 import queue
@@ -82,8 +83,9 @@ class Journal:
         self.lock = threading.RLock()
         self.max_events, self.max_commands, self.max_bytes, self.reserve = max_events, max_commands, max_bytes, reserve
         self.secrets = sensitive_values
-        for key, value in {"sequence":0,"floor":0,"acked":0,"partial":False,
-                           "primary":None,"close":False,"lease":None}.items():
+        defaults: dict[str,Any] = {"sequence":0,"floor":0,"acked":0,"partial":False,
+                           "primary":None,"close":False,"lease":None,"root_activities":{}}
+        for key,value in defaults.items():
             self.db.execute("INSERT OR IGNORE INTO meta VALUES(?,?)", (key, encoded(value)))
 
     def get(self, key: str) -> Any:
@@ -133,6 +135,8 @@ class Journal:
                     raise RuntimeContractError("BACKPRESSURE", "journal retains live or unacknowledged evidence; dispatch refused")
                 if self.get("close") and not closing:
                     raise RuntimeContractError("RUNTIME_CLOSING", "close intent blocks new native commands")
+                if not closing and len(self.get("root_activities")) >= self.max_commands-self.reserve:
+                    raise RuntimeContractError("BACKPRESSURE", "retained native activity identities exhausted dispatch capacity")
                 self.db.execute("INSERT INTO commands(id,ordinal,digest,kind,state) VALUES(?,?,?,?,'accepted')", (cid, ordinal, digest, kind))
                 if closing:
                     self.set("close", True)
@@ -169,9 +173,17 @@ class Journal:
                 self.db.execute("INSERT INTO events VALUES(?,?,?)", (seq, event.kind, payload))
                 self.set("sequence", seq)
                 ref = event.reference
-                if event.kind == "activity.started" and ref and ref.activity_id:
+                root_activity = ref is not None and ref.thread_id in {None,ref.root_id}
+                activities=self.get("root_activities")
+                already_terminal=bool(ref and activities.get(ref.activity_id)=="terminal")
+                if root_activity and ref and ref.activity_id and event.kind in {"activity.started","activity.terminal"}:
+                    if ref.activity_id not in activities and len(activities)>=self.max_commands:
+                        raise RuntimeContractError("JOURNAL_EXHAUSTED", "bounded native activity identity retention exhausted")
+                    activities[ref.activity_id]="terminal" if event.kind=="activity.terminal" or already_terminal else "active"
+                    self.set("root_activities",activities)
+                if event.kind == "activity.started" and root_activity and ref and ref.activity_id and not already_terminal:
                     self.set("primary", ref.activity_id)
-                if event.kind == "activity.terminal" and ref and (
+                if event.kind == "activity.terminal" and root_activity and ref and (
                         ref.activity_id == self.get("primary") or
                         (event.request_id and self.get("primary") == "request:"+event.request_id)):
                     self.set("primary", None)
@@ -324,7 +336,8 @@ class Controller:
                 self.context_digest = payload_digest(value["context"])
                 # Only ephemeral known auth/private env values; never persist
                 # this set or the full environment in the journal/receipt.
-                self.journal.secrets = tuple(v for k,v in context.env.items() if v and (k.startswith("SC_API_") or any(s in k.upper() for s in ("TOKEN","SECRET","KEY","PASSWORD","AUTH"))))
+                self.journal.secrets = tuple(v for k,v in context.env.items() if v and any(
+                    s in k.upper() for s in ("TOKEN","SECRET","API_KEY","PASSWORD","CREDENTIAL","AUTHORIZATION")))
                 deadline=time.monotonic()+min(float(value.get("timeout",30)),120)
                 started = self.call(lambda:self.driver.start(context,self.emit,deadline=deadline),deadline=deadline)
                 self.identity = started.identity
@@ -367,6 +380,7 @@ class Controller:
         # Close is independent of the regular dispatch lock/native RPC future.
         lock = threading.Lock() if closing else self.dispatch_lock
         with lock:
+            self.journal.check_lease(str(value.get("consumer","")),int(value.get("fence",0)))
             duplicate = self.journal.reserve_command(cid,ordinal,digest,"submit" if op=="submit" else "control",closing=closing)
             if duplicate:
                 return duplicate
@@ -396,7 +410,10 @@ class Controller:
                     # request placeholder with attributable native activity.
                     self.journal.set("primary","request:"+cid)
                     try:
-                        result = self.call(lambda:WriteReceipt("not_written",detail="Close fenced pending native write") if self.journal.get("close") else self.driver.submit(submission,deadline=deadline),deadline=deadline)
+                        def submit_edge():
+                            self.journal.check_lease(str(value.get("consumer","")),int(value.get("fence",0)))
+                            return WriteReceipt("not_written",detail="Close fenced pending native write") if self.journal.get("close") else self.driver.submit(submission,deadline=deadline)
+                        result = self.call(submit_edge,deadline=deadline)
                     except (RuntimeError, OSError, TimeoutError):
                         result = WriteReceipt("unknown",detail="native write outcome ambiguous; no replay")
                     if result.state in {"not_written","rejected","unsupported"} and self.journal.get("primary")=="request:"+cid:
@@ -411,7 +428,10 @@ class Controller:
                     result = WriteReceipt("rejected",detail="primary activity changed; stale stop refused")
                 else:
                     try:
-                        result = self.call(lambda:self.driver.control(native_control,deadline=deadline),deadline=deadline)
+                        def control_edge():
+                            self.journal.check_lease(str(value.get("consumer","")),int(value.get("fence",0)))
+                            return self.driver.control(native_control,deadline=deadline)
+                        result = self.call(control_edge,deadline=deadline)
                     except (RuntimeError, OSError, TimeoutError):
                         result = WriteReceipt("unknown",detail="native control outcome ambiguous")
             self.journal.receipt(cid,result)
@@ -471,6 +491,7 @@ class PrivateServer:
         with socket.socket(socket.AF_UNIX,socket.SOCK_STREAM) as sock:
             sock.bind(str(self.endpoint))
             os.chmod(self.endpoint,0o600)
+            endpoint_identity=self.endpoint.lstat()
             sock.listen(16)
             sock.settimeout(.5)
             try:
@@ -484,19 +505,41 @@ class PrivateServer:
                         continue
                     threading.Thread(target=self.connection,args=(conn,),daemon=True).start()
             finally:
-                self.endpoint.unlink(missing_ok=True)
+                if self.endpoint.exists():
+                    current=self.endpoint.lstat()
+                    if (current.st_dev,current.st_ino)==(endpoint_identity.st_dev,endpoint_identity.st_ino):
+                        self.endpoint.unlink()
 
 
 def main(argv: list[str] | None = None) -> int:
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--generation",required=True)
     parser.add_argument("--root",type=Path,required=True)
+    parser.add_argument("--endpoint",type=Path)
     parser.add_argument("--harness",choices=("codex","claude"),required=True)
+    parser.add_argument("--test-transport",action="store_true")
     args=parser.parse_args(argv)
     private_directory(args.root)
-    module=importlib.import_module(f"conversation_adapters.{args.harness}_runtime")
+    if args.test_transport:
+        # No test transport outside an independently marked fixture state.
+        fixture_root=args.root.parent.parent
+        bootstrap=fixture_root/"fixture_bootstrap.py"
+        spec=importlib.util.spec_from_file_location("fixture_supervisor",bootstrap)
+        if not spec or not spec.loader:
+            raise RuntimeContractError("OWNERSHIP_INVALID","fixture bootstrap missing")
+        fixture=importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(fixture)
+        fixture.verified_bootstrap_root(fixture_root,bootstrap)
+        record=fixture.read_json(fixture.ledger_path(fixture.read_json(fixture_root/fixture.MARKER)["fixture_id"]))
+        native=next((n for n in record.get("native_units",[]) if n["generation_id"]==args.generation),None)
+        if not native or not native.get("test_transport") or native["root"]!=str(args.root) or native["harness"]!=args.harness or native["endpoint"]!=str(args.endpoint):
+            raise RuntimeContractError("OWNERSHIP_INVALID","test transport was not pre-registered")
+        fixture.verify_native(record,native)
+        module=importlib.import_module("gui_experiment_test_driver")
+    else:
+        module=importlib.import_module(f"conversation_adapters.{args.harness}_runtime")
     controller=Controller(args.generation,args.root,module.create_driver())
-    PrivateServer(controller,args.root/"controller.sock").serve()
+    PrivateServer(controller,args.endpoint or args.root/"controller.sock").serve()
     return 0
 
 

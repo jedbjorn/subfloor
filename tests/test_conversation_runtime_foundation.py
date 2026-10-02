@@ -249,3 +249,71 @@ def test_native_primary_busy_retries_proved_no_write_same_intent_in_order(contro
     assert owner.handle(wire('submit',command=second))['state']=='written'
     assert driver.writes==['first','second']
     assert owner.handle(wire('submit',command=second))['duplicate']
+
+
+def test_child_activity_does_not_replace_or_clear_root_primary(controller):
+    owner,_=controller
+    owner.emit(RuntimeEvent('activity.started',NativeReference('root',thread_id='root',activity_id='root-turn')))
+    child=NativeReference('root',thread_id='child',parent_thread_id='root',activity_id='child-turn')
+    owner.emit(RuntimeEvent('activity.started',child))
+    owner.emit(RuntimeEvent('activity.terminal',child))
+    assert owner.journal.get('primary')=='root-turn'
+
+
+def test_waiting_dispatch_consumer_is_fenced_before_native_edge(controller):
+    owner,driver=controller
+    errors=[]
+    owner.dispatch_lock.acquire()
+    def old_request():
+        try:owner.handle(wire('submit',command=command('stale',1,text='old')))
+        except RuntimeContractError as exc:errors.append(exc.code)
+    thread=threading.Thread(target=old_request);thread.start()
+    time.sleep(.03)
+    owner.handle(wire('attach',consumer='replacement',fence=2,expires=time.time()+30))
+    owner.dispatch_lock.release();thread.join(1)
+    assert errors==['LEASE_FENCED'] and not driver.writes
+
+
+def test_projection_preserves_scoped_opaque_handles_and_terminal_monotonicity(tmp_path):
+    database=tmp_path/'fixture.sqlite';con=sqlite3.connect(database)
+    con.executescript('CREATE TABLE users(user_id INTEGER PRIMARY KEY); CREATE TABLE shells(shell_id INTEGER PRIMARY KEY); CREATE TABLE conversations(conversation_id TEXT PRIMARY KEY,shell_id INTEGER,owner_user_id INTEGER,state TEXT); INSERT INTO users VALUES(1); INSERT INTO shells VALUES(1); INSERT INTO conversations VALUES("cv",1,1,"idle");')
+    con.executescript((SCRIPTS.parent/'migrations/0273_conversation_native_runtime.sql').read_text());con.close()
+    store=RuntimeStore(database);store.reserve(context(tmp_path),{})
+    lease=store.attach('g',1,1,'api')
+    store.intent('g',1,1,lease,'request','submit',{'text':'hi'})
+    events=[]
+    for thread in ['root','child']:
+        events.append(RuntimeEvent('work.observed',NativeReference('root',thread_id=thread,native_process_id='same-opaque'),data={'kind':'terminal'}))
+    events.extend([RuntimeEvent('activity.terminal',NativeReference('root',activity_id='A'),request_id='request'),
+                   RuntimeEvent('activity.processed',NativeReference('root',activity_id='A'),request_id='request')])
+    store.ingest('g',1,1,lease,{'events':[{'sequence':i+1,'event':dataclasses.asdict(e)} for i,e in enumerate(events)]})
+    con=sqlite3.connect(database)
+    assert con.execute('SELECT COUNT(*) FROM conversation_runtime_work').fetchone()[0]==2
+    assert con.execute('SELECT state FROM conversation_runtime_commands').fetchone()[0]=='terminal'
+    con.close()
+
+
+def test_late_start_or_processing_cannot_resurrect_terminal_root(controller):
+    owner,_=controller
+    ref=NativeReference('root',thread_id='root',activity_id='A')
+    owner.emit(RuntimeEvent('activity.started',ref))
+    owner.emit(RuntimeEvent('activity.terminal',ref))
+    owner.emit(RuntimeEvent('activity.processed',ref))
+    owner.emit(RuntimeEvent('activity.started',ref))
+    assert owner.journal.get('primary') is None
+
+
+def test_lost_generation_replacement_waits_for_os_and_definition_cleanup(tmp_path):
+    database=tmp_path/'fixture.sqlite';con=sqlite3.connect(database)
+    con.executescript('CREATE TABLE users(user_id INTEGER PRIMARY KEY); CREATE TABLE shells(shell_id INTEGER PRIMARY KEY); CREATE TABLE conversations(conversation_id TEXT PRIMARY KEY,shell_id INTEGER,owner_user_id INTEGER,state TEXT); INSERT INTO users VALUES(1); INSERT INTO shells VALUES(1); INSERT INTO conversations VALUES("cv",1,1,"idle");')
+    con.executescript((SCRIPTS.parent/'migrations/0273_conversation_native_runtime.sql').read_text());con.close()
+    store=RuntimeStore(database);first=context(tmp_path);store.reserve(first,{})
+    store.state('g',1,1,'lost',{'outcome':'pending','unit_verified_exited':False})
+    replacement=dataclasses.replace(first,generation_id='new')
+    with pytest.raises(RuntimeContractError,match='ownership remains'):
+        store.reserve(replacement,{})
+    store.state('g',1,1,'lost',{'outcome':'complete','unit_verified_exited':True,'unresolved_definitions':['owned-definition']})
+    with pytest.raises(RuntimeContractError,match='ownership remains'):
+        store.reserve(replacement,{})
+    store.state('g',1,1,'lost',{'outcome':'complete','unit_verified_exited':True})
+    assert store.reserve(replacement,{})=='new'

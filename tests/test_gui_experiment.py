@@ -362,3 +362,67 @@ def test_missing_experimental_runtime_cleans_partial_preparation(seat, monkeypat
     assert record["error_code"] == "RUNTIME_UNAVAILABLE" and record["cleanup"]["complete"]
     assert uuid.UUID(record["fixture_id"]).version == 4
     assert not Path(record["root"]).exists()
+
+
+def test_native_registration_is_durable_before_launch_and_derived_only(seat,monkeypatch):
+    record,root,receipt=marked(seat)
+    record['runtime']='experimental'
+    fixture.write_json(root/fixture.MARKER,fixture.identity(record));fixture.save(record,receipt)
+    supervisor=fixture.NativeSupervisor(receipt)
+    native=supervisor.register('e'*32,'codex')
+    retained=fixture.verify_receipt(receipt)
+    assert retained['native_units']==[native]
+    assert native['status']=='registered'
+    assert native['root']==str(root/'runtime'/('e'*32))
+    assert native['unit'].endswith('-native-'+('e'*32)+'.service')
+    with pytest.raises(fixture.FixtureError,match='not registered'):
+        supervisor.launch('f'*32)
+    with pytest.raises(fixture.FixtureError,match='invalid'):
+        supervisor.register('../../elsewhere','codex')
+
+
+def test_native_foreign_unit_or_replaced_root_retains_fixture_state(seat,monkeypatch):
+    record,root,receipt=marked(seat)
+    record['runtime']='experimental'
+    fixture.write_json(root/fixture.MARKER,fixture.identity(record));fixture.save(record,receipt)
+    native=fixture.NativeSupervisor(receipt).register('e'*32,'claude')
+    monkeypatch.setattr(fixture,'native_unit_state',lambda _:missing_state()|{'LoadState':'loaded','Description':'unrelated unit'})
+    with pytest.raises(fixture.FixtureError,match='description differs'):
+        fixture.stop(receipt)
+    assert root.exists() and not fixture.verify_receipt(receipt)['cleanup']['complete']
+    state_root=Path(native['root']);state_root.rmdir();state_root.symlink_to(seat,target_is_directory=True)
+    with pytest.raises(fixture.FixtureError,match='replaced'):
+        fixture.stop(receipt)
+    assert root.exists()
+
+
+def test_all_registered_native_units_stop_before_api_or_root_removal(seat,monkeypatch):
+    record,root,receipt=marked(seat)
+    record['runtime']='experimental'
+    fixture.write_json(root/fixture.MARKER,fixture.identity(record));fixture.save(record,receipt)
+    supervisor=fixture.NativeSupervisor(receipt)
+    supervisor.register('e'*32,'codex');supervisor.register('f'*32,'claude')
+    events=[]
+    def stop_native(record,native):
+        assert root.exists()
+        events.append(native['harness'])
+        native['os_cleanup']={'complete':True}
+    monkeypatch.setattr(fixture,'stop_native_unit',stop_native)
+    monkeypatch.setattr(fixture,'unit_state',lambda _:missing_state())
+    result=fixture.stop(receipt)
+    assert events==['codex','claude'] and result['cleanup']['root_removed']
+    assert all(n['os_cleanup']['complete'] for n in result['native_units'])
+
+
+def test_native_root_count_bound_and_symlink_parent_refused(seat):
+    record,root,receipt=marked(seat)
+    record['runtime']='experimental'
+    fixture.write_json(root/fixture.MARKER,fixture.identity(record));fixture.save(record,receipt)
+    supervisor=fixture.NativeSupervisor(receipt)
+    supervisor.register('e'*32,'codex');supervisor.register('f'*32,'codex')
+    with pytest.raises(fixture.FixtureError,match='two roots'):
+        supervisor.register('1'*32,'codex')
+    (root/'runtime').rename(root/'retained-runtime')
+    (root/'runtime').symlink_to(seat,target_is_directory=True)
+    with pytest.raises(fixture.FixtureError,match='parent is unsafe'):
+        supervisor.register('1'*32,'claude')

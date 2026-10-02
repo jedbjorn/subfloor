@@ -23,10 +23,11 @@ from conversation_runtime_contract import (
     MAX_FRAME_BYTES,
     RuntimeContext,
     RuntimeContractError,
+    RuntimeEvent,
     payload_digest,
     public_payload,
 )
-from conversation_runtime_controller import encoded, start_ticks
+from conversation_runtime_controller import encoded, reference, start_ticks
 
 
 class RuntimeStore:
@@ -53,6 +54,10 @@ class RuntimeStore:
             row=con.execute("SELECT shell_id,owner_user_id,state FROM conversations WHERE conversation_id=?",(context.conversation_id,)).fetchone()
             if row is None or (row["shell_id"],row["owner_user_id"]) != (context.shell_id,context.owner_user_id) or row["state"]=="closed":
                 raise RuntimeContractError("RUNTIME_NOT_OWNED", "open conversation ownership required")
+            for previous in con.execute("SELECT cleanup_json FROM conversation_runtime_generations WHERE conversation_id=?",(context.conversation_id,)).fetchall():
+                cleanup=json.loads(previous["cleanup_json"])
+                if cleanup.get("unit_verified_exited") is not True or cleanup.get("outcome")!="complete" or cleanup.get("unresolved_definitions") or cleanup.get("unresolved_work"):
+                    raise RuntimeContractError("CLEANUP_PENDING","previous generation ownership remains until unit and native definition cleanup are proved")
             captured={"context":{
                 "generation_id":context.generation_id,"conversation_id":context.conversation_id,
                 "shell_id":context.shell_id,"owner_user_id":context.owner_user_id,
@@ -158,18 +163,22 @@ class RuntimeStore:
                 if sequence!=last+1 and not replay.get("partial"):
                     raise RuntimeContractError("EVENT_GAP", "unexplained journal sequence gap")
                 event=public_payload(item["event"],sensitive_values=self.secrets)
+                normalized=RuntimeEvent(**(event|{"reference":reference(event.get("reference"))}))
+                event=dataclasses.asdict(normalized)
                 con.execute("INSERT INTO conversation_runtime_events VALUES(?,?,?)",(generation,sequence,encoded(event)))
                 ref=event.get("reference") or {}
                 if event["kind"].startswith("work."):
-                    key=ref.get("work_id") or ref.get("native_process_id") or ref.get("thread_id")
-                    if not key:
+                    native_id=ref.get("work_id") or ref.get("native_process_id") or ref.get("thread_id")
+                    if not native_id:
                         raise RuntimeContractError("EVENT_INVALID", "work projection lacks opaque key")
+                    kind=event.get("data",{}).get("kind") or ("terminal" if ref.get("native_process_id") else "task" if ref.get("work_id") else "child")
+                    key=encoded([ref.get("root_id"),ref.get("thread_id"),kind,native_id])
                     con.execute("INSERT INTO conversation_runtime_work VALUES(?,?,?,?) ON CONFLICT(generation_id,work_key) DO UPDATE SET projection_json=excluded.projection_json,last_sequence=excluded.last_sequence",(generation,key,encoded(event),sequence))
                 cid=event.get("request_id") or event.get("control_id")
                 if cid:
                     state="terminal" if event["kind"]=="activity.terminal" else "processed" if event["kind"]=="activity.processed" else None
                     if state:
-                        con.execute("UPDATE conversation_runtime_commands SET state=? WHERE generation_id=? AND command_id=?",(state,generation,cid))
+                        con.execute("UPDATE conversation_runtime_commands SET state=? WHERE generation_id=? AND command_id=? AND (state<>'terminal' OR ?='terminal')",(state,generation,cid,state))
                 if project is not None:
                     project(con,row["conversation_id"],sequence,event)
                 last=sequence
