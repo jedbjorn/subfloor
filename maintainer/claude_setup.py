@@ -152,14 +152,18 @@ def fixed_launch(context: RuntimeContext, main_root: Path, deadline: float) -> t
              main_root / '.super-coder/adapters/claude/adapter.json', *context.managed_mcp_files]
     # Canonical permission and shell hooks remain discovered. Their bytes are
     # bound alongside the extra observer instead of replacing that discovery.
+    discovered: dict[str,str|None]={}
     for name in ('.claude/settings.local.json','.claude/settings.json'):
         path=main_root/name
-        if path.exists() or path.is_symlink():files.append(path)
+        present=path.exists() or path.is_symlink()
+        discovered[str(path)]=digest(path) if present else None
+        if present:files.append(path)
     binding: dict[str, Any] = {'generation_id': context.generation_id, 'session_id': str(uuid.UUID(hex=context.generation_id)),
                'worktree': str(main_root), 'receipt':context.env['SC_F89_SETUP_RECEIPT'], 'executable': str(context.executable.path),
                'executable_sha256': context.executable.sha256, 'source_condition_sha256': source,
-               'files': {str(p): digest(p) for p in files}}
-    binding['configuration_sha256']=hashlib.sha256(json.dumps(binding['files'],sort_keys=True).encode()).hexdigest()
+               'files': {str(p): digest(p) for p in files},'discovered_settings':discovered}
+    binding['configuration_sha256']=hashlib.sha256(json.dumps(
+        {'files':binding['files'],'discovered_settings':discovered},sort_keys=True).encode()).hexdigest()
     write_private(context.state_root / 'claude-setup-binding.json', binding)
     env = {k: v for k, v in context.env.items() if not k.startswith(('ANTHROPIC_', 'CLAUDE_', 'SC_F89_'))}
     env.update({'CLAUDE_CODE_DISABLE_AUTO_MEMORY': '1', 'CLAUDE_CODE_DISABLE_CRON': '1',
@@ -176,6 +180,11 @@ def fixed_launch(context: RuntimeContext, main_root: Path, deadline: float) -> t
 
 def revalidate(binding: Mapping[str, Any], deadline: float) -> None:
     budget(deadline)
+    for name,expected in binding.get('discovered_settings',{}).items():
+        path=Path(name)
+        current=digest(path) if path.exists() or path.is_symlink() else None
+        if current!=expected:
+            raise RuntimeContractError('SETUP_INCONCLUSIVE','discovered project settings changed')
     if digest(Path(binding['executable'])) != binding['executable_sha256'] or any(
             digest(Path(path)) != expected for path, expected in binding['files'].items()):
         raise RuntimeContractError('SETUP_INCONCLUSIVE', 'captured setup configuration changed')
@@ -271,12 +280,16 @@ def run_setup(context: RuntimeContext, main_root: Path, *, verify_owned: Callabl
     revalidate(binding, deadline)
     if not verify_owned():
         raise RuntimeContractError('SETUP_INCONCLUSIVE', 'setup owner changed')
+    # Owner observation may block. Its earlier true result cannot authorize
+    # a new PTY or child after the shared budget has expired.
+    budget(deadline)
     master, slave = pty.openpty()
     read_fd, write_fd = os.pipe()
     child = None
     previous = termios.tcgetattr(input_fd)
     descriptor_flags: dict[int,int]={}
     try:
+        budget(deadline)
         child = subprocess.Popen([sys.executable, '-I', str(Path(__file__).resolve()), '_child', '--gate-fd', str(read_fd)],
                                  stdin=slave, stdout=slave, stderr=slave, pass_fds=(read_fd,),
                                  env={'PATH': os.defpath}, start_new_session=True)
@@ -285,10 +298,12 @@ def run_setup(context: RuntimeContext, main_root: Path, *, verify_owned: Callabl
         ticks, group = process(child.pid)
         if not verify_owned() or not record_child(child.pid, ticks, group):
             raise RuntimeContractError('SETUP_INCONCLUSIVE', 'setup child not durably registered')
+        budget(deadline)
         write_private(context.state_root / 'claude-setup-child.json', {'pid': child.pid, 'start_ticks': ticks, 'cgroup': group})
         revalidate(binding, deadline)
         if not verify_owned():
             raise RuntimeContractError('SETUP_INCONCLUSIVE', 'setup owner changed before exec')
+        budget(deadline)
         frame = json.dumps({'argv': argv, 'env': env, 'binding': binding, 'deadline': deadline}).encode()
         if len(frame) > MAX_FRAME:
             raise RuntimeContractError('SETUP_INCONCLUSIVE', 'private exec frame exceeded bounds')
@@ -302,6 +317,7 @@ def run_setup(context: RuntimeContext, main_root: Path, *, verify_owned: Callabl
                 budget(deadline)
                 if not verify_owned():
                     raise RuntimeContractError('SETUP_INCONCLUSIVE','setup owner withdrawn before exec release')
+                budget(deadline)
                 if gate.select(min(.05,deadline-time.monotonic())):
                     offset+=os.write(write_fd,frame[offset:])
         os.close(write_fd);write_fd=-1

@@ -450,3 +450,31 @@ def test_exact_archive_includes_committed_setup_not_dirty_overlay(tmp_path):
     with tarfile.open(fileobj=io.BytesIO(raw)) as tar:
         assert tar.extractfile('maintainer/claude_setup.py').read()==b'committed fixed setup'
         assert 'maintainer/gui_experiment.py' not in tar.getnames()
+
+
+@pytest.mark.parametrize('name',['settings.local.json','settings.json'])
+def test_new_discovered_project_settings_after_binding_refuse_setup(context,name):
+    _,_,binding=setup.fixed_launch(context,context.worktree,time.monotonic()+3)
+    path=context.worktree/'.claude'/name
+    assert binding['discovered_settings'][str(path)] is None
+    path.parent.mkdir(exist_ok=True);path.write_text('{"permissions":{"deny":[]}}')
+    with pytest.raises(RuntimeContractError,match='discovered project settings changed'):
+        setup.revalidate(binding,time.monotonic()+3)
+
+
+def test_blocking_owner_observation_cannot_fork_after_deadline(context,monkeypatch):
+    outer,terminal=pty.openpty();calls=[];observations=[]
+    deadline=time.monotonic()+.04
+    monkeypatch.setattr(setup,'fixed_launch',lambda *args:([],{},{}))
+    monkeypatch.setattr(setup,'revalidate',lambda *args:None)
+    monkeypatch.setattr(setup.subprocess,'Popen',lambda *args,**kwargs:calls.append(args))
+    def owned():
+        observations.append(True)
+        if len(observations)==2:time.sleep(max(0,deadline-time.monotonic())+.01)
+        return True
+    try:
+        with pytest.raises(RuntimeContractError,match='setup budget unavailable'):
+            setup.run_setup(context,context.worktree,verify_owned=owned,record_child=lambda *args:True,
+                deadline=deadline,input_fd=terminal,output_fd=terminal)
+        assert len(observations)==2 and calls==[]
+    finally:os.close(outer);os.close(terminal)
