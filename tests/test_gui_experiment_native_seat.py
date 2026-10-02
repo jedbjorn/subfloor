@@ -19,7 +19,7 @@ from conversation_runtime_contract import ExecutableBinding, RuntimeContractErro
 
 
 @pytest.fixture
-def seat(tmp_path,monkeypatch):
+def seat(tmp_path,monkeypatch,request):
     engine=tmp_path/'.super-coder';engine.mkdir()
     database=engine/'shell_db.db'
     con=sqlite3.connect(database)
@@ -28,6 +28,8 @@ def seat(tmp_path,monkeypatch):
     con.execute("INSERT INTO users(user_id,username) VALUES(1,'fixture')")
     con.execute("INSERT INTO shells(shell_id,shortname,display_name,flavor,system_prompt,user_id) VALUES(1,'FX','Fixture','dev','synthetic',1)")
     binding={'contract_version':2,'control_state':'controlled','harness':'codex','requested_model':'gpt-6.1-sol','provider_model':'gpt-6.1-sol','requested_effort':'high','effective_effort':'high','native_variant_id':None,'transport':'codex-reasoning-config','catalogue_generation':'a'*32,'evidence_digest':'b'*64,'selector_binding':{'experimental_native':True},'adapter_metadata':{}}
+    if getattr(request,'param',None)=='pending':
+        binding['selector_binding']['proof_state']='pending_finite_probe'
     worktree=tmp_path/'.sc-worktrees/fx';worktree.mkdir(parents=True)
     con.execute("INSERT INTO conversations(conversation_id,shell_id,owner_user_id,harness,provider,model,effort,worktree,creation_idempotency_key,creation_request_hash,runtime_mode,route_contract_version,route_binding) VALUES('cv',1,1,'codex','openai','gpt-6.1-sol','high',?,'key','hash','native_experiment',2,?)",(str(worktree),json.dumps(binding)));con.commit();con.close()
     shutil.copytree(ROOT/'.super-coder/scripts',engine/'scripts',ignore=shutil.ignore_patterns('__pycache__'))
@@ -91,16 +93,28 @@ def test_changed_canonical_policy_stays_inconclusive_without_native_launch(seat,
     assert raised.value.code=='PERMISSION_INCONCLUSIVE'
 
 
+@pytest.mark.parametrize('seat',['pending'],indirect=True)
 def test_pending_route_cannot_prepare_an_ordinary_chat_or_unregistered_probe(seat):
     value,events,_=seat
-    con=sqlite3.connect(value.database)
-    binding=json.loads(con.execute('SELECT route_binding FROM conversations').fetchone()[0])
-    binding['selector_binding']['proof_state']='pending_finite_probe'
-    con.execute('UPDATE conversations SET route_binding=?',(json.dumps(binding),));con.commit();con.close()
     for grants in [(),('submission',)]:
         with pytest.raises(RuntimeContractError) as raised:value.prepare('cv','generation',probe_capabilities=grants)
         assert raised.value.code=='PROBE_ROUTE_ONLY'
     assert events==[]
+
+
+@pytest.mark.parametrize('seat',['pending'],indirect=True)
+@pytest.mark.parametrize('wrong',['expired','foreign_generation','foreign_fingerprint','closing'])
+def test_pending_candidate_job_must_match_unexpired_open_generation(seat,wrong):
+    import time
+    value,events,_=seat
+    con=sqlite3.connect(value.database)
+    projection={'role':'probe','state':'closing' if wrong=='closing' else 'preparing','generation_id':'generation'}
+    con.execute('UPDATE conversations SET runtime_projection=?',(json.dumps(projection),))
+    con.execute('INSERT INTO conversation_runtime_probe_jobs VALUES(?,?,?,\'preparing\',?,?)',
+                ('c'*64 if wrong=='foreign_fingerprint' else 'b'*64,'cv','other' if wrong=='foreign_generation' else 'generation',time.time()+(-1 if wrong=='expired' else 30),time.time()))
+    con.commit();con.close()
+    with pytest.raises(RuntimeContractError) as raised:value.prepare('cv','generation',probe_capabilities=('submission',))
+    assert raised.value.code=='PROBE_ROUTE_ONLY' and events==[]
 
 
 @pytest.mark.parametrize('alias',['leaf','parent'])

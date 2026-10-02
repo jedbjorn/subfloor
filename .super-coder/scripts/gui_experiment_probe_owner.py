@@ -104,8 +104,33 @@ class NativeProbeOwner:
         with self.lock:
             if fingerprint.key in self.closing or time.monotonic()>=deadline or actual!=fingerprint:
                 raise RuntimeContractError('PROBE_ALLOCATION_FENCED','cleanup/deadline/installed identity fenced captured preparation')
+            con=db_driver.connect(str(self.database))
+            try:
+                job=con.execute('SELECT * FROM conversation_runtime_probe_jobs WHERE fingerprint_key=?',(fingerprint.key,)).fetchone()
+                chat=con.execute('SELECT state,runtime_projection FROM conversations WHERE conversation_id=?',(cid,)).fetchone()
+                projection=json.loads(chat['runtime_projection'])
+                if (job is None or job['generation_id']!=generation or job['conversation_id']!=cid
+                        or job['status']!='preparing' or job['deadline']<=time.time()
+                        or chat['state']=='closed' or projection.get('generation_id')!=generation
+                        or projection.get('state')!='preparing' or projection.get('role')!='probe'):
+                    raise RuntimeContractError('PROBE_ALLOCATION_FENCED','Close/stale job fenced prepared allocation')
+            finally:
+                con.close()
             self.service.store.reserve(context,native|{'fingerprint':fingerprint.key,'implementation_digest':fingerprint.implementation_digest,'purpose':'finite_probe'})
             self._update(cid,generation,state='starting',preparation_owner=None,partial=False)
+            con=db_driver.connect(str(self.database))
+            try:
+                runtime=json.loads(con.execute('SELECT runtime_projection FROM conversations WHERE conversation_id=?',(cid,)).fetchone()[0])
+                if runtime.get('state')=='closing':
+                    # Transfer a Close accepted immediately before reserve to
+                    # the now-canonical generation; no launch follows.
+                    version=con.execute('SELECT version FROM conversations WHERE conversation_id=?',(cid,)).fetchone()[0]
+                    self.service.request_close(con,cid,1,version)
+                    raise RuntimeContractError('PROBE_ALLOCATION_FENCED','Close fenced reserved probe before launch')
+                if self.service.store.status(generation,1,shell)['close_intent']:
+                    raise RuntimeContractError('PROBE_ALLOCATION_FENCED','Close fenced probe before launch')
+            finally:
+                con.close()
             self.seat.supervisor.launch(generation)
         client,owner,shell_id=self.service.attach(generation)
         return OwnedProbe(context,client,self.service.store,owner,shell_id,native['unit'],context.state_root,True,

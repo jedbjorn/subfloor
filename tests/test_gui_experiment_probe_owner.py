@@ -95,3 +95,35 @@ def test_unresolved_startup_or_route_prerequisite_cannot_allocate_or_infer(owner
     with pytest.raises(RuntimeContractError):
         value.allocate(dataclasses.replace(fingerprint,**change),frozenset({'submission'}),time.monotonic()+30)
     assert not events and con.execute('SELECT COUNT(*) FROM conversation_runtime_probe_jobs').fetchone()[0]==0
+
+
+def test_close_during_canonical_prepare_fences_generation_and_launch(owner):
+    value,fingerprint,con,events=owner
+    prepare=value.seat.prepare
+    def closing_prepare(cid,generation,**kwargs):
+        captured=prepare(cid,generation,**kwargs)
+        version=con.execute('SELECT version FROM conversations WHERE conversation_id=?',(cid,)).fetchone()[0]
+        value.service.request_close(con,cid,1,version)
+        return captured
+    value.seat.prepare=closing_prepare
+    with pytest.raises(RuntimeContractError,match='Close/stale job'):
+        value.allocate(fingerprint,frozenset({'submission'}),time.monotonic()+30)
+    assert events==['git','prepare']
+    assert con.execute('SELECT COUNT(*) FROM conversation_runtime_generations').fetchone()[0]==1 # unrelated retained g only
+    probe=con.execute('SELECT runtime_projection FROM conversations WHERE conversation_id!=\'cv\'').fetchone()
+    assert json.loads(probe[0])['state']=='closing'
+
+
+def test_probe_role_refuses_ordinary_input_even_with_cached_submission(owner,monkeypatch):
+    import conversation_native_chats
+    import conversation_routes
+    value,fingerprint,con,_=owner
+    probe=value.allocate(fingerprint,frozenset({'submission'}),time.monotonic()+30)
+    con.execute('UPDATE conversations SET runtime_projection=? WHERE conversation_id=?',
+        (json.dumps({'role':'probe','state':'ready','capabilities':{'submission':'compatible'}}),probe.context.conversation_id));con.commit()
+    monkeypatch.setattr(conversation_native_chats,'_SERVICE',value.service)
+    with pytest.raises(conversation_routes.ApiError) as error:
+        conversation_routes._create_message(con,{'user_id':1},probe.context.conversation_id,
+            {'Idempotency-Key':'attempted-probe-input'},{'text':'ordinary prompt'})
+    assert error.value.code=='PROBE_INPUT_UNAVAILABLE'
+    assert con.execute('SELECT COUNT(*) FROM conversation_messages').fetchone()[0]==0
