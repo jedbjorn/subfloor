@@ -91,6 +91,18 @@ def test_changed_canonical_policy_stays_inconclusive_without_native_launch(seat,
     assert raised.value.code=='PERMISSION_INCONCLUSIVE'
 
 
+def test_pending_route_cannot_prepare_an_ordinary_chat_or_unregistered_probe(seat):
+    value,events,_=seat
+    con=sqlite3.connect(value.database)
+    binding=json.loads(con.execute('SELECT route_binding FROM conversations').fetchone()[0])
+    binding['selector_binding']['proof_state']='pending_finite_probe'
+    con.execute('UPDATE conversations SET route_binding=?',(json.dumps(binding),));con.commit();con.close()
+    for grants in [(),('submission',)]:
+        with pytest.raises(RuntimeContractError) as raised:value.prepare('cv','generation',probe_capabilities=grants)
+        assert raised.value.code=='PROBE_ROUTE_ONLY'
+    assert events==[]
+
+
 @pytest.mark.parametrize('alias',['leaf','parent'])
 def test_external_worktree_alias_is_rejected_before_registration_or_boot_writes(seat,tmp_path,alias):
     value,events,_=seat

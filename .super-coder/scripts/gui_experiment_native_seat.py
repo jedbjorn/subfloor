@@ -79,6 +79,7 @@ class NativeFixtureSeat:
         scripts=self.root/'.super-coder/scripts'
         paths=[scripts/name for name in ('conversation_runtime_contract.py','conversation_runtime_controller.py',
                'conversation_runtime.py','conversation_runtime_checks.py','gui_experiment_native_seat.py',
+               'gui_experiment_probe_owner.py','conversation_runtime_native_probes.py','conversation_native_chats.py',
                'gui_experiment_readiness.py','conversation_boot.py','run.py','route_transport.py',
                'execution_view.py','execution_view_exec.py')]
         paths.extend([scripts/'conversation_adapters'/f'{harness}_runtime.py',
@@ -124,6 +125,14 @@ class NativeFixtureSeat:
                 raise RuntimeContractError('WORKTREE_INVALID','canonical worktree has stale or aliased containment')
             binding=json.loads(row['route_binding'])
             route_bindings.validate_v2_binding(binding)
+            if binding['selector_binding'].get('proof_state')=='pending_finite_probe':
+                job=con.execute('SELECT * FROM conversation_runtime_probe_jobs WHERE conversation_id=? AND generation_id=?',
+                                (conversation_id,generation_id)).fetchone()
+                if (not probe_capabilities or 'submission' not in probe_capabilities
+                        or json.loads(row['runtime_projection']).get('role')!='probe'
+                        or job is None or job['status']!='preparing' or job['deadline']<=time.time()
+                        or job['fingerprint_key']!=binding['evidence_digest']):
+                    raise RuntimeContractError('PROBE_ROUTE_ONLY','pending native selection is exclusive to its registered finite probe')
             digest=route_bindings.digest_json(binding)
             if (binding['harness'],binding['requested_model'],binding['requested_effort'])!=(row['harness'],row['model'],row['effort']):
                 raise RuntimeContractError('ROUTE_INVALID','stored native route differs from captured chat')
