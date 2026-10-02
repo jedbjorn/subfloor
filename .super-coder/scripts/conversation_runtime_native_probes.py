@@ -127,6 +127,8 @@ class ControllerProbeDriver(RuntimeDriver):
         self._ready = False
         self._started = False
         self._setup: StartupConsent | None = None
+        self._cleanup_lock = threading.Lock()
+        self._native_cleanup: NativeCleanup | None = None
 
     def _capture_identity(self, value: Mapping[str, Any]) -> None:
         identity = _identity(value)
@@ -306,20 +308,32 @@ class ControllerProbeDriver(RuntimeDriver):
             self._ready = False
             self._stop.set()
             self._publish_setup(None)
-        result = self._dispatch("probe-close", "close", {"action": "close"}, deadline)
-        self._stop.set()
-        if self._reader is not None:
-            self._reader.join(timeout=min(1, max(0, deadline-time.monotonic())))
-        unresolved = []
-        for value in result.get("unresolved_work", ()):
-            if not isinstance(value, dict):
-                return NativeCleanup("inconclusive")
-            ref = _reference(value)
-            if ref is None:
-                return NativeCleanup("inconclusive")
-            unresolved.append(ref)
-        return NativeCleanup(result.get("outcome", "inconclusive"), tuple(unresolved),
-                             tuple(result.get("unresolved_definitions", ())))
+        if not self._cleanup_lock.acquire(timeout=max(0, deadline-time.monotonic())):
+            return NativeCleanup("inconclusive")
+        try:
+            # The owner may already have stopped the controller after an
+            # explicit Close. Preserve its proved native result; the factory
+            # still asks the owner for fresh scoped OS evidence on every call.
+            if self._native_cleanup is not None:
+                return self._native_cleanup
+            result = self._dispatch("probe-close", "close", {"action": "close"}, deadline)
+            if self._reader is not None:
+                self._reader.join(timeout=min(1, max(0, deadline-time.monotonic())))
+            unresolved = []
+            for value in result.get("unresolved_work", ()):
+                if not isinstance(value, dict):
+                    return NativeCleanup("inconclusive")
+                ref = _reference(value)
+                if ref is None:
+                    return NativeCleanup("inconclusive")
+                unresolved.append(ref)
+            native = NativeCleanup(result.get("outcome", "inconclusive"), tuple(unresolved),
+                                   tuple(result.get("unresolved_definitions", ())))
+            if native.outcome == "complete" and not native.unresolved_work and not native.unresolved_definitions:
+                self._native_cleanup = native
+            return native
+        finally:
+            self._cleanup_lock.release()
 
 
 @dataclass
