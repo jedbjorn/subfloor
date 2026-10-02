@@ -1,12 +1,12 @@
 """Native ownership outlives foreground/API/registry projection state."""
-import dataclasses
 import contextlib
+import dataclasses
 import json
 import sqlite3
 import sys
 import threading
-from types import SimpleNamespace
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -18,7 +18,13 @@ from conversation_broker import BrokerStore
 from conversation_native_chats import NativeChatsService, project_event
 from conversation_reaper import ReaperStore
 from conversation_runtime import RuntimeStore
-from conversation_runtime_contract import ExecutableBinding, NativeReference, RuntimeContext, RuntimeContractError, RuntimeEvent
+from conversation_runtime_contract import (
+    ExecutableBinding,
+    NativeReference,
+    RuntimeContext,
+    RuntimeContractError,
+    RuntimeEvent,
+)
 
 
 @pytest.fixture
@@ -91,7 +97,7 @@ def test_preparation_returns_persisted_identity_and_close_fences_late_start(data
     con.execute("UPDATE conversations SET runtime_mode='native_experiment'");con.commit()
     entered,release,cleaned=threading.Event(),threading.Event(),threading.Event()
     class Supervisor:
-        units=[]
+        def __init__(self): self.units=[]
         def preparation_identity(self): return {'pid':123,'start_ticks':456,'unit':'owned-api','control_group':'owned-cgroup'}
         def inventory(self): return self.units
         def stop(self,generation):
@@ -133,7 +139,7 @@ def test_restart_reconciles_never_launched_preparation_only_after_owner_exit(dat
     runtime={'generation_id':'provisional','state':'closing','preparation_owner':{'pid':123,'start_ticks':456}}
     con.execute("UPDATE conversations SET runtime_mode='native_experiment',runtime_projection=?",(json.dumps(runtime),));con.commit()
     class Supervisor:
-        stopped=[]
+        def __init__(self): self.stopped=[]
         exited=False
         def preparation_exited(self,identity): return self.exited
         def inventory(self): return [{'generation_id':'provisional','status':'registered'}]
@@ -295,7 +301,7 @@ def test_native_control_stable_request_never_rewrites_ambiguous_or_written_deliv
     con.execute("UPDATE conversations SET runtime_mode='native_experiment',runtime_projection=?",(json.dumps(runtime),));con.commit()
     service=NativeChatsService(path,path.parent,None)
     class Client:
-        writes=[]
+        def __init__(self): self.writes=[]
         def request(self,op,**fields):
             self.writes.append((op,fields))
             if delivery=='unknown': raise OSError('lost response after possible native write')
@@ -445,3 +451,21 @@ def test_runtime_snapshot_preserves_stored_work_control_and_autonomous_event_ide
     assert result['activity'][0]['engine_run_id'] is None
     foreign=dict(row);foreign['conversation_id']='not-the-owned-chat'
     assert projection(foreign,con=con)['work']==[]
+
+
+@pytest.mark.parametrize('grade,partial',[('incompatible',False),('inconclusive',False),('unverified',True),('unverified',False)])
+def test_native_ready_gui_projection_preserves_store_admission_and_qualified_memory_evidence(database,grade,partial):
+    from conversation_native_chats import project_event
+    from conversation_runtime_contract import NativeReference, RuntimeEvent
+    path,con=database
+    con.execute("UPDATE conversation_runtime_generations SET state='starting'")
+    con.execute("UPDATE conversations SET runtime_mode='native_experiment',runtime_projection=?",(json.dumps({'generation_id':'g','state':'starting'}),));con.commit()
+    service=NativeChatsService(path,path.parent,None)
+    lease=service.store.attach('g',1,1,service.consumer)
+    memory={'evidence_level':'configuration_source_flag_inference','effective_telemetry':False}
+    event=RuntimeEvent('runtime.ready',NativeReference('root',thread_id='root'),grade=grade,partial=partial,data={'memory_policy':memory})
+    service.store.ingest('g',1,1,lease,{'events':[{'sequence':1,'event':dataclasses.asdict(event)}]},project=project_event)
+    runtime=json.loads(con.execute('SELECT runtime_projection FROM conversations').fetchone()[0])
+    assert runtime['state']==('ready' if grade=='unverified' and not partial else 'setup_inconclusive')
+    assert runtime['latest_startup_observation']['data']['memory_policy']==memory
+    assert ('startup_evidence' in runtime)==(grade=='unverified' and not partial)
