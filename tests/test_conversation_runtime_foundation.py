@@ -268,9 +268,10 @@ def test_native_open_deadline_is_inconclusive_and_close_remains_available(contro
 def test_schema_reapplication_store_tenancy_fencing_and_replay_transaction(tmp_path):
     database=tmp_path/'fixture.sqlite'
     con=sqlite3.connect(database)
-    con.executescript('CREATE TABLE users(user_id INTEGER PRIMARY KEY); CREATE TABLE shells(shell_id INTEGER PRIMARY KEY); CREATE TABLE conversations(conversation_id TEXT PRIMARY KEY,shell_id INTEGER,owner_user_id INTEGER,state TEXT,harness TEXT DEFAULT "codex",provider TEXT,model TEXT,effort TEXT,worktree TEXT); INSERT INTO users VALUES(1); INSERT INTO shells VALUES(1); INSERT INTO conversations(conversation_id,shell_id,owner_user_id,state) VALUES("cv",1,1,"idle");')
+    con.executescript('CREATE TABLE users(user_id INTEGER PRIMARY KEY); CREATE TABLE shells(shell_id INTEGER PRIMARY KEY); CREATE TABLE conversations(conversation_id TEXT PRIMARY KEY,shell_id INTEGER,owner_user_id INTEGER,state TEXT,harness TEXT DEFAULT "codex",provider TEXT,model TEXT,effort TEXT,worktree TEXT,runtime_projection TEXT DEFAULT "{}"); INSERT INTO users VALUES(1); INSERT INTO shells VALUES(1); INSERT INTO conversations(conversation_id,shell_id,owner_user_id,state) VALUES("cv",1,1,"idle");')
     migration=(SCRIPTS.parent/'migrations/0273_conversation_native_runtime.sql').read_text()
     con.executescript(migration);con.executescript(migration)
+    con.executescript((SCRIPTS.parent/'migrations/0278_native_history_continuations.sql').read_text())
     con.execute('UPDATE conversations SET worktree=?',(str(tmp_path),));con.commit();con.close()
     store=RuntimeStore(database)
     store.reserve(context(tmp_path),{'unit':'own.service'})
@@ -333,8 +334,9 @@ def test_waiting_dispatch_consumer_is_fenced_before_native_edge(controller):
 
 def test_projection_preserves_scoped_opaque_handles_and_terminal_monotonicity(tmp_path):
     database=tmp_path/'fixture.sqlite';con=sqlite3.connect(database)
-    con.executescript('CREATE TABLE users(user_id INTEGER PRIMARY KEY); CREATE TABLE shells(shell_id INTEGER PRIMARY KEY); CREATE TABLE conversations(conversation_id TEXT PRIMARY KEY,shell_id INTEGER,owner_user_id INTEGER,state TEXT,harness TEXT DEFAULT "codex",provider TEXT,model TEXT,effort TEXT,worktree TEXT); INSERT INTO users VALUES(1); INSERT INTO shells VALUES(1); INSERT INTO conversations(conversation_id,shell_id,owner_user_id,state) VALUES("cv",1,1,"idle");')
+    con.executescript('CREATE TABLE users(user_id INTEGER PRIMARY KEY); CREATE TABLE shells(shell_id INTEGER PRIMARY KEY); CREATE TABLE conversations(conversation_id TEXT PRIMARY KEY,shell_id INTEGER,owner_user_id INTEGER,state TEXT,harness TEXT DEFAULT "codex",provider TEXT,model TEXT,effort TEXT,worktree TEXT,runtime_projection TEXT DEFAULT "{}"); INSERT INTO users VALUES(1); INSERT INTO shells VALUES(1); INSERT INTO conversations(conversation_id,shell_id,owner_user_id,state) VALUES("cv",1,1,"idle");')
     con.executescript((SCRIPTS.parent/'migrations/0273_conversation_native_runtime.sql').read_text())
+    con.executescript((SCRIPTS.parent/'migrations/0278_native_history_continuations.sql').read_text())
     con.execute('UPDATE conversations SET worktree=?',(str(tmp_path),));con.commit();con.close()
     store=RuntimeStore(database);store.reserve(context(tmp_path),{})
     lease=store.attach('g',1,1,'api')
@@ -577,8 +579,9 @@ def test_initial_driver_ready_observation_uses_same_selected_route_gate(controll
 
 def test_startup_projection_binds_generation_binary_driver_and_preserves_close(tmp_path):
     database=tmp_path/'fixture.sqlite';con=sqlite3.connect(database)
-    con.executescript('CREATE TABLE users(user_id INTEGER PRIMARY KEY); CREATE TABLE shells(shell_id INTEGER PRIMARY KEY); CREATE TABLE conversations(conversation_id TEXT PRIMARY KEY,shell_id INTEGER,owner_user_id INTEGER,state TEXT,harness TEXT,provider TEXT,model TEXT,effort TEXT,worktree TEXT); INSERT INTO users VALUES(1); INSERT INTO shells VALUES(1); INSERT INTO conversations(conversation_id,shell_id,owner_user_id,state,harness) VALUES("cv",1,1,"idle","claude");')
+    con.executescript('CREATE TABLE users(user_id INTEGER PRIMARY KEY); CREATE TABLE shells(shell_id INTEGER PRIMARY KEY); CREATE TABLE conversations(conversation_id TEXT PRIMARY KEY,shell_id INTEGER,owner_user_id INTEGER,state TEXT,harness TEXT,provider TEXT,model TEXT,effort TEXT,worktree TEXT,runtime_projection TEXT DEFAULT "{}"); INSERT INTO users VALUES(1); INSERT INTO shells VALUES(1); INSERT INTO conversations(conversation_id,shell_id,owner_user_id,state,harness) VALUES("cv",1,1,"idle","claude");')
     con.executescript((SCRIPTS.parent/'migrations/0273_conversation_native_runtime.sql').read_text())
+    con.executescript((SCRIPTS.parent/'migrations/0278_native_history_continuations.sql').read_text())
     con.execute('UPDATE conversations SET worktree=?',(str(tmp_path),));con.commit();con.close()
     store=RuntimeStore(database);store.reserve(dataclasses.replace(context(tmp_path),harness='claude'),{})
     lease=store.attach('g',1,1,'api')
@@ -620,8 +623,9 @@ def test_late_start_or_processing_cannot_resurrect_terminal_root(controller):
 
 def test_lost_generation_replacement_waits_for_os_and_definition_cleanup(tmp_path):
     database=tmp_path/'fixture.sqlite';con=sqlite3.connect(database)
-    con.executescript('CREATE TABLE users(user_id INTEGER PRIMARY KEY); CREATE TABLE shells(shell_id INTEGER PRIMARY KEY); CREATE TABLE conversations(conversation_id TEXT PRIMARY KEY,shell_id INTEGER,owner_user_id INTEGER,state TEXT,harness TEXT DEFAULT "codex",provider TEXT,model TEXT,effort TEXT,worktree TEXT); INSERT INTO users VALUES(1); INSERT INTO shells VALUES(1); INSERT INTO conversations(conversation_id,shell_id,owner_user_id,state) VALUES("cv",1,1,"idle");')
+    con.executescript('CREATE TABLE users(user_id INTEGER PRIMARY KEY); CREATE TABLE shells(shell_id INTEGER PRIMARY KEY); CREATE TABLE conversations(conversation_id TEXT PRIMARY KEY,shell_id INTEGER,owner_user_id INTEGER,state TEXT,harness TEXT DEFAULT "codex",provider TEXT,model TEXT,effort TEXT,worktree TEXT,runtime_projection TEXT DEFAULT "{}"); INSERT INTO users VALUES(1); INSERT INTO shells VALUES(1); INSERT INTO conversations(conversation_id,shell_id,owner_user_id,state) VALUES("cv",1,1,"idle");')
     con.executescript((SCRIPTS.parent/'migrations/0273_conversation_native_runtime.sql').read_text())
+    con.executescript((SCRIPTS.parent/'migrations/0278_native_history_continuations.sql').read_text())
     con.execute('UPDATE conversations SET worktree=?',(str(tmp_path),));con.commit();con.close()
     store=RuntimeStore(database);first=context(tmp_path);store.reserve(first,{})
     store.state('g',1,1,'lost',{'outcome':'pending','unit_verified_exited':False})

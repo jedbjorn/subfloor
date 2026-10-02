@@ -52,6 +52,10 @@ class RuntimeStore:
         con=db_driver.connect(self.database)
         try:
             con.execute("BEGIN IMMEDIATE")
+            from conversation_native_history import association
+            link=association(con,context.conversation_id,context.owner_user_id)
+            if link is not None and context.history is None:
+                raise RuntimeContractError('HISTORY_NOT_OWNED','issued continuation cannot reserve an ordinary fresh context')
             if context.history is not None:
                 from conversation_native_history import validate_context
                 validate_context(con,context,binding)

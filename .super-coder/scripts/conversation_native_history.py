@@ -14,7 +14,6 @@ from pathlib import Path
 from typing import Any, NoReturn
 
 import active_chat_registry
-import route_bindings
 from conversation_runtime_contract import (
     NativeHistory,
     RuntimeContractError,
@@ -126,6 +125,7 @@ def require_slot(con, shell: int, *, destination: str | None = None) -> None:
 
 
 def checked_proof(proof: dict, history: NativeHistory) -> dict:
+    import route_bindings
     binding = proof.get('binding')
     if not isinstance(binding, dict):
         _fail('HISTORY_UNAVAILABLE', 'history-specific current admission is unavailable')
@@ -147,10 +147,15 @@ def association(con, cid: str, owner: int):
     row = con.execute('SELECT * FROM conversation_native_history WHERE conversation_id=?', (cid,)).fetchone()
     if row is not None and row['owner_user_id'] != owner:
         _fail('HISTORY_NOT_OWNED', 'continuation association is outside operator ownership')
+    if row is None:
+        chat=con.execute('SELECT runtime_projection FROM conversations WHERE conversation_id=?',(cid,)).fetchone()
+        if chat is not None and json.loads(chat['runtime_projection']).get('history') is not None:
+            _fail('HISTORY_NOT_OWNED','persisted continuation intent has no canonical history association')
     return row
 
 
 def prepared_history(con, row, generation: str, proof: dict) -> NativeHistory | None:
+    import route_bindings
     # The owner may have observed a row before a blocking proof callback. Read
     # current canonical state again rather than treating that snapshot as a CAS.
     row=con.execute('SELECT * FROM conversations WHERE conversation_id=?',(row['conversation_id'],)).fetchone()
