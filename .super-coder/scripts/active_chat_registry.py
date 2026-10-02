@@ -49,6 +49,22 @@ def native_cleanup_pending(con, shell_id: int) -> str | None:
                 or cleanup.get('unresolved_work')
                 or cleanup.get('unresolved_definitions')):
             return str(row['generation_id'])
+    # The copied API persists a provisional identity before canonical boot
+    # preparation. Close cannot release its shell while that worker may still
+    # own a registered root, even before a native generation can be reserved.
+    try:
+        preparations=con.execute("SELECT runtime_projection FROM conversations WHERE shell_id=? AND runtime_mode='native_experiment'",(shell_id,)).fetchall()
+    except db_driver.OperationalError as exc:
+        if 'no such column: runtime_' in str(exc):
+            return None
+        raise
+    for row in preparations:
+        try:
+            projection=json.loads(row['runtime_projection'])
+        except (ValueError,TypeError):
+            return 'unresolved-preparation'
+        if projection.get('preparation_owner') and projection.get('generation_id'):
+            return str(projection['generation_id'])
     return None
 
 

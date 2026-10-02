@@ -3,6 +3,8 @@ import dataclasses
 import json
 import sqlite3
 import sys
+import threading
+from types import SimpleNamespace
 from pathlib import Path
 
 import pytest
@@ -15,7 +17,7 @@ from conversation_broker import BrokerStore
 from conversation_native_chats import NativeChatsService, project_event
 from conversation_reaper import ReaperStore
 from conversation_runtime import RuntimeStore
-from conversation_runtime_contract import NativeReference, RuntimeContractError, RuntimeEvent
+from conversation_runtime_contract import ExecutableBinding, NativeReference, RuntimeContext, RuntimeContractError, RuntimeEvent
 
 
 @pytest.fixture
@@ -80,6 +82,71 @@ def test_legacy_broker_and_reaper_do_not_take_native_turns(database):
     con.execute('DELETE FROM active_shell_chats')
     con.commit()
     assert ReaperStore(str(path)).candidates() == []
+
+
+def test_preparation_returns_persisted_identity_and_close_fences_late_start(database):
+    path,con=database
+    con.execute('DELETE FROM conversation_runtime_generations')
+    con.execute("UPDATE conversations SET runtime_mode='native_experiment'");con.commit()
+    entered,release,cleaned=threading.Event(),threading.Event(),threading.Event()
+    class Supervisor:
+        units=[]
+        def inventory(self): return self.units
+        def stop(self,generation):
+            assert generation==self.units[0]['generation_id']
+            cleaned.set()
+            return {'os_cleanup':{'complete':True}}
+        def launch(self,generation): pytest.fail('Close must fence the native launch')
+    supervisor=Supervisor()
+    def prepare(cid,generation):
+        supervisor.units=[{'generation_id':generation,'status':'registered'}]
+        entered.set();assert release.wait(3)
+        return (RuntimeContext(generation,cid,1,1,'codex',path.parent,path.parent,
+            ExecutableBinding(Path('/bin/true'),'a'*64,'test'),'test','b'*64,'c'*64,'unrestricted',
+            capability_evidence={'submission':'compatible'}),SimpleNamespace(implementation_digest='d'*64,key='fp'),{})
+    service=NativeChatsService(path,path.parent,supervisor,prepare_context=prepare)
+    try:
+        service.schedule_starts();assert entered.wait(2)
+        chat=con.execute('SELECT version,runtime_projection FROM conversations').fetchone()
+        runtime=json.loads(chat['runtime_projection'])
+        assert runtime['state']=='preparing' and runtime['generation_id'] and runtime['preparation_owner']
+        assert run.browser_conversation_active(con,1)
+        with pytest.raises(active_chat_registry.ActiveChatBusy,match='pending cleanup'):
+            active_chat_registry.close_active(con,1)
+        service.request_close(con,'cv',1,chat['version'])
+        assert con.execute('SELECT state FROM conversations').fetchone()[0]!='closed'
+        assert json.loads(con.execute('SELECT runtime_projection FROM conversations').fetchone()[0])['state']=='closing'
+        release.set();assert cleaned.wait(2)
+        service.starts.shutdown(wait=True)
+        assert con.execute('SELECT COUNT(*) FROM conversation_runtime_generations').fetchone()[0]==0
+        assert con.execute('SELECT state FROM conversations').fetchone()[0]=='closed'
+        assert not run.browser_conversation_active(con,1)
+    finally:
+        release.set();service.shutdown()
+
+
+def test_restart_reconciles_never_launched_preparation_only_after_owner_exit(database,monkeypatch):
+    path,con=database
+    con.execute('DELETE FROM conversation_runtime_generations')
+    runtime={'generation_id':'provisional','state':'closing','preparation_owner':{'pid':123,'start_ticks':456}}
+    con.execute("UPDATE conversations SET runtime_mode='native_experiment',runtime_projection=?",(json.dumps(runtime),));con.commit()
+    class Supervisor:
+        stopped=[]
+        def inventory(self): return [{'generation_id':'provisional','status':'registered'}]
+        def stop(self,generation):
+            self.stopped.append(generation)
+            return {'os_cleanup':{'complete':True}}
+    supervisor=Supervisor()
+    service=NativeChatsService(path,path.parent,supervisor)
+    monkeypatch.setattr('conversation_native_chats.start_ticks',lambda pid:456)
+    service.recover_preparation('cv',runtime)
+    assert not supervisor.stopped and run.browser_conversation_active(con,1)
+    monkeypatch.setattr('conversation_native_chats.start_ticks',lambda pid:457)
+    service.recover_preparation('cv',runtime)
+    assert supervisor.stopped==['provisional']
+    assert con.execute('SELECT state FROM conversations').fetchone()[0]=='closed'
+    assert not run.browser_conversation_active(con,1)
+    service.shutdown()
 
 
 @pytest.mark.parametrize('database,root_thread', [('codex','root'),('claude',None)],indirect=['database'])

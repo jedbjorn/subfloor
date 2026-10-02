@@ -7,9 +7,11 @@ scope is retained in every projected observation and control request.
 from __future__ import annotations
 
 import json
+import os
 import threading
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
@@ -21,7 +23,7 @@ from conversation_runtime_contract import (
     payload_digest,
     public_payload,
 )
-from conversation_runtime_controller import encoded
+from conversation_runtime_controller import encoded, start_ticks
 
 _SERVICE: NativeChatsService | None = None
 
@@ -121,6 +123,8 @@ class NativeChatsService:
         self.lock = threading.RLock()
         self.stopped = threading.Event()
         self.wake = threading.Event()
+        self.starting: set[str] = set()
+        self.starts=ThreadPoolExecutor(max_workers=2,thread_name_prefix='native-chat-start')
         self.thread = threading.Thread(target=self.run,name='native-chats-consumer',daemon=True)
 
     def start(self) -> None:
@@ -133,6 +137,165 @@ class NativeChatsService:
         if self.route_resolver is None:
             raise RuntimeContractError('NATIVE_ROUTE_INCONCLUSIVE','owned native account/options observation is not ready')
         return self.route_resolver(harness,model,effort)
+
+    def schedule_starts(self) -> None:
+        if self.prepare_context is None or self.stopped.is_set():
+            return
+        con=db_driver.connect(str(self.database))
+        try:
+            candidates=con.execute("SELECT conversation_id,runtime_projection FROM conversations c WHERE runtime_mode='native_experiment' AND state!='closed' AND NOT EXISTS(SELECT 1 FROM conversation_runtime_generations g WHERE g.conversation_id=c.conversation_id) ORDER BY created_at LIMIT 4").fetchall()
+            for chat in candidates:
+                with self.lock:
+                    cid=chat['conversation_id']
+                    if cid in self.starting or len(self.starting)>=2:
+                        continue
+                    runtime=json.loads(chat['runtime_projection'])
+                    if runtime.get('state') in {'preparation_inconclusive','lost','closing'}:
+                        if runtime.get('state')=='closing' and runtime.get('preparation_owner'):
+                            self.recover_preparation(cid,runtime)
+                        continue
+                    if runtime.get('preparation_owner'):
+                        self.recover_preparation(cid,runtime)
+                        continue
+                    generation=runtime.get('generation_id') or uuid.uuid4().hex
+                    with db_driver.write_transaction(con,'native_chat.start_intent'):
+                        current=con.execute("SELECT state,runtime_projection FROM conversations WHERE conversation_id=?",(cid,)).fetchone()
+                        if current['state']=='closed':
+                            continue
+                        runtime=json.loads(current['runtime_projection'])
+                        runtime.update(generation_id=generation,state='preparing',capabilities={},setup=None,partial=True,freshness='unknown',
+                                       preparation_owner={'pid':os.getpid(),'start_ticks':start_ticks(os.getpid())},preparation_cleanup=None)
+                        con.execute('UPDATE conversations SET runtime_projection=?,version=version+1 WHERE conversation_id=?',(encoded(runtime),cid))
+                        append_event(con,cid,'capability.observed',{'generation_id':generation,'grade':'inconclusive','phase':'canonical preparation pending'})
+                    self.starting.add(cid)
+                    self.starts.submit(self.open_generation,cid,generation)
+                    conversation_events.notify(cid)
+        finally:
+            con.close()
+
+    def open_generation(self,cid: str,generation: str) -> None:
+        """Prepare/open outside the consumer loop so setup and Close stay usable.
+
+        The normal context receives only fingerprint-bound cache admission;
+        named probe grants belong to the independent finite checker factory.
+        Existing captured generations are attached, never prepared again.
+        """
+        reserved=False
+        try:
+            context,fingerprint,native=self.prepare_context(cid,generation)
+            if self.stopped.is_set():
+                raise RuntimeContractError('API_STOPPING','API release fences new native allocation')
+            self.require_capability(context.capability_evidence,'submission')
+            con=db_driver.connect(str(self.database))
+            try:
+                chat=con.execute('SELECT state,runtime_projection FROM conversations WHERE conversation_id=?',(cid,)).fetchone()
+                runtime=json.loads(chat['runtime_projection'])
+                if chat['state']=='closed' or runtime.get('state')=='closing' or runtime.get('generation_id')!=generation:
+                    raise RuntimeContractError('RUNTIME_CLOSING','Close fences completion of canonical preparation')
+            finally:
+                con.close()
+            binding=native|{'implementation_digest':fingerprint.implementation_digest,'fingerprint':fingerprint.key,
+                            'captured_capabilities':dict(context.capability_evidence)}
+            self.store.reserve(context,binding)
+            reserved=True
+            closing=False
+            con=db_driver.connect(str(self.database))
+            try:
+                with db_driver.write_transaction(con,'native_chat.captured_projection'):
+                    chat=con.execute('SELECT runtime_projection,state,version FROM conversations WHERE conversation_id=?',(cid,)).fetchone()
+                    if chat['state']=='closed':
+                        raise RuntimeContractError('RUNTIME_CLOSING','chat closed during canonical preparation')
+                    runtime=json.loads(chat['runtime_projection'])
+                    if runtime.get('generation_id')!=generation:
+                        raise RuntimeContractError('GENERATION_INVALID','startup was replaced before captured launch')
+                    closing=runtime.get('state')=='closing'
+                    runtime.update(state='closing' if closing else 'starting',capabilities=dict(context.capability_evidence),partial=False,
+                                   preparation_owner=None,
+                                   captured_identity={'executable':{'path':str(context.executable.path),'sha256':context.executable.sha256,'version':context.executable.version},'implementation_digest':fingerprint.implementation_digest,'fingerprint':fingerprint.key})
+                    con.execute('UPDATE conversations SET runtime_projection=?,version=version+1 WHERE conversation_id=?',(encoded(runtime),cid))
+                if closing:
+                    self.request_close(con,cid,context.owner_user_id,chat['version']+1)
+            finally:
+                con.close()
+            # reserve() precedes launch. The unit persists independently of API
+            # release and the consumer ingests setup while this call is pending.
+            if self.store.status(generation,context.owner_user_id,context.shell_id)['close_intent']:
+                # The fixed supervisor has not launched this registered unit.
+                # No native process/definition existed; record that limited
+                # fact, then independently verify OS cleanup before release.
+                cleanup={'outcome':'complete','never_started':True}
+                self.store.receipt(generation,context.owner_user_id,context.shell_id,'close:'+generation,
+                                   {'state':'rejected','native_cleanup':cleanup})
+                self.finish_cleanup(generation,cid,context.owner_user_id,context.shell_id,cleanup)
+                return
+            self.supervisor.launch(generation)
+            client,_,_=self.attach(generation)
+            started=client.open(context)
+            if started.get('state') not in {'ready','needs_consent'}:
+                raise RuntimeContractError('NATIVE_START_INCONCLUSIVE','native readiness remains inconclusive; Close retains ownership')
+            self.notify()
+        except (RuntimeContractError,OSError,ValueError,RuntimeError,SystemExit) as exc:
+            con=db_driver.connect(str(self.database))
+            try:
+                with db_driver.write_transaction(con,'native_chat.start_inconclusive'):
+                    chat=con.execute('SELECT runtime_projection,state FROM conversations WHERE conversation_id=?',(cid,)).fetchone()
+                    if chat and chat['state']!='closed':
+                        runtime=json.loads(chat['runtime_projection'])
+                        if runtime.get('generation_id')==generation and runtime.get('state')!='closing':
+                            runtime.update(state='setup_inconclusive' if reserved else 'preparation_inconclusive',partial=True,freshness='unknown',setup=None,
+                                           diagnostic=getattr(exc,'code','PREPARATION_INCONCLUSIVE'))
+                            con.execute('UPDATE conversations SET runtime_projection=?,version=version+1 WHERE conversation_id=?',(encoded(runtime),cid))
+                            append_event(con,cid,'capability.observed',{'generation_id':generation,'grade':'inconclusive','detail':runtime['diagnostic']})
+            finally:
+                con.close()
+            if not reserved:
+                # No native process may launch without canonical reservation.
+                # A registered preparation root still counts until verified stop.
+                self.finish_preparation(cid,generation)
+        finally:
+            with self.lock:
+                self.starting.discard(cid)
+            conversation_events.notify(cid)
+
+    def recover_preparation(self,cid: str,runtime: dict) -> None:
+        """No new preparation after API death; verify the old worker exited."""
+        identity=runtime['preparation_owner']
+        try:
+            alive=start_ticks(identity['pid'])==identity['start_ticks']
+        except (OSError,ValueError,KeyError):
+            alive=False
+        if not alive:
+            self.finish_preparation(cid,runtime['generation_id'])
+
+    def finish_preparation(self,cid: str,generation: str) -> None:
+        """Only a never-launched generation can release provisional ownership."""
+        try:
+            owned=next((n for n in self.supervisor.inventory() if n['generation_id']==generation),None)
+            if owned is not None:
+                if owned['status'] not in {'registered','stopped'}:
+                    return  # Any possible launch requires canonical Close/cleanup.
+                stopped=self.supervisor.stop(generation)
+                if stopped.get('os_cleanup',{}).get('complete') is not True:
+                    return
+            con=db_driver.connect(str(self.database))
+            try:
+                with db_driver.write_transaction(con,'native_chat.preparation_cleanup'):
+                    if con.execute('SELECT 1 FROM conversation_runtime_generations WHERE generation_id=?',(generation,)).fetchone():
+                        return
+                    chat=con.execute('SELECT state,runtime_projection FROM conversations WHERE conversation_id=?',(cid,)).fetchone()
+                    runtime=json.loads(chat['runtime_projection'])
+                    if runtime.get('generation_id')!=generation:
+                        return
+                    closing=runtime.get('state')=='closing'
+                    runtime.update(preparation_owner=None,preparation_cleanup={'unit_verified_exited':True,'never_launched':True},
+                                   state='closed' if closing else 'preparation_inconclusive',setup=None,partial=True)
+                    con.execute('UPDATE conversations SET runtime_projection=?,version=version+1 WHERE conversation_id=?',(encoded(runtime),cid))
+                    if closing:
+                        self._finish_chat(con,cid)
+            finally:
+                con.close()
+        except (OSError,RuntimeError):
+            return  # Unverified ownership remains retained for explicit cleanup.
 
     def control(self,con,cid: str,owner: int,key: str,body: dict) -> dict:
         """Operator-authorized finite actions against stored native targets.
@@ -245,6 +408,12 @@ class NativeChatsService:
                 raise RuntimeContractError('CONVERSATION_VERSION_CONFLICT','conversation version changed before Close')
             generation = con.execute('SELECT * FROM conversation_runtime_generations WHERE conversation_id=? ORDER BY created_at DESC LIMIT 1',(cid,)).fetchone()
             if generation is None:
+                runtime=json.loads(chat['runtime_projection'])
+                if runtime.get('preparation_owner'):
+                    runtime.update(state='closing',setup=None)
+                    con.execute('UPDATE conversations SET runtime_projection=?,version=version+1 WHERE conversation_id=?',(encoded(runtime),cid))
+                    append_event(con,cid,'conversation.close.requested',{'generation_id':runtime['generation_id'],'phase':'preparation cleanup pending'})
+                    return
                 self._finish_chat(con,cid)
                 return
             gid = generation['generation_id']
@@ -370,7 +539,9 @@ class NativeChatsService:
     def shutdown(self) -> None:
         self.stopped.set()
         self.wake.set()
-        self.thread.join(6)
+        if self.thread.is_alive():
+            self.thread.join(6)
+        self.starts.shutdown(wait=False,cancel_futures=True)
         # Native descriptors/controllers remain owned by their finite units.
 
     def attach(self, generation: str) -> tuple[RuntimeClient,int,int]:
@@ -394,6 +565,7 @@ class NativeChatsService:
 
     def run(self) -> None:
         while not self.stopped.is_set():
+            self.schedule_starts()
             con = db_driver.connect(str(self.database))
             try:
                 rows = con.execute("SELECT g.generation_id,g.conversation_id,g.state,g.cleanup_json,g.owner_user_id,g.shell_id FROM conversation_runtime_generations g JOIN conversations c USING(conversation_id) WHERE c.runtime_mode='native_experiment' AND (g.state!='closed' OR c.state!='closed') ORDER BY g.created_at LIMIT 4").fetchall()
