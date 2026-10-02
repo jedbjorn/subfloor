@@ -188,3 +188,12 @@ console.log(JSON.stringify(data.map(fields=>{const row={...base,data:{...base.da
     assert result[8]['control']['work_key'] == 'key'
     assert 'el("span", {}, workState.state)' in NATIVE
     assert '${workState.partial ? " · partial"' in NATIVE
+
+
+def test_only_explicit_false_partial_can_display_complete_work():
+    result = run_js("""
+const rows=[{partial:false},{partial:true},{partial:'false'},{partial:null},{}];
+console.log(JSON.stringify(rows.map(row=>chatNativeWorkState({...row,data:{kind:'terminal',state:'inProgress'}}))));
+""")
+    assert result[0] == {'state':'inProgress','terminal':False,'partial':False}
+    assert all(row == {'state':'inProgress','terminal':False,'partial':True} for row in result[1:])

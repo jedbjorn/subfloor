@@ -4850,7 +4850,7 @@ function chatNativeWorkState(row) {
   const contradictory = hasState && Object.prototype.hasOwnProperty.call(data, "status") && data.status !== value;
   const known = typeof value === "string" && [...active, ...terminal].includes(value) && !contradictory;
   return { state: known ? value : "unknown", terminal: known && terminal.includes(value),
-    partial: row.partial === true || !known };
+    partial: row.partial !== false || !known };
 }
 
 function chatNativeControlBody(conversation, action, target = {}) {
