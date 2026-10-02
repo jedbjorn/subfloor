@@ -534,6 +534,7 @@ class NativeChatsService:
         client,owner,shell=self.attach(generation)
         if owner!=chat['owner_user_id'] or shell!=chat['shell_id']:
             raise RuntimeContractError('RUNTIME_NOT_OWNED','wake controller differs from chat owner')
+        client.request('snapshot',timeout=1) # Root occupancy reconciliation precedes quiet placement.
         status=client.request('status',timeout=1)
         return {'conversation_id':cid,'generation_id':generation,'owner_user_id':owner,'shell_id':shell,
                 'observed_at':time.time(),'consumer_fence':client.lease['fence'],

@@ -141,7 +141,7 @@ class Journal:
         self.secrets = sensitive_values
         defaults: dict[str,Any] = {"sequence":0,"floor":0,"acked":0,"partial":False,
                            "primary":None,"close":False,"lease":None,"root_activities":{},
-                           "setup":None,"setup_confirmation":None,"quiet_epoch":0,"idle_since":None,"quiet_unknown":False,"uncertain_activities":{}}
+                           "setup":None,"setup_confirmation":None,"quiet_epoch":0,"idle_since":None,"quiet_unknown":False,"uncertain_activities":{},"root_occupancy_unknown":False}
         for key,value in defaults.items():
             self.db.execute("INSERT OR IGNORE INTO meta VALUES(?,?)", (key, encoded(value)))
 
@@ -164,7 +164,7 @@ class Journal:
     def quiet(self) -> dict:
         with self.lock:
             pending = self.db.execute("SELECT 1 FROM commands WHERE kind='submit' AND state IN ('accepted','written','processed','unknown') LIMIT 1").fetchone() is not None
-            idle = self.get('primary') is None and not pending and not self.get('partial') and not self.get('close') and not self.get('quiet_unknown') and not self.get('uncertain_activities')
+            idle = self.get('primary') is None and not pending and not self.get('partial') and not self.get('close') and not self.get('quiet_unknown') and not self.get('uncertain_activities') and not self.get('root_occupancy_unknown')
             if not idle:
                 self.set('idle_since',None)
             elif self.get('idle_since') is None:
@@ -268,9 +268,14 @@ class Journal:
                     self.set('quiet_unknown',False)
                 ref = event.reference
                 root_activity = ref is not None and ref.thread_id in {None,ref.root_id}
+                if root_activity and event.kind in {'activity.started','activity.processed','activity.terminal'} and ref and not ref.activity_id:
+                    if not self.get('root_occupancy_unknown'):
+                        self.set('quiet_epoch',self.get('quiet_epoch')+1)
+                        self.set('idle_since',None)
+                    self.set('root_occupancy_unknown',True)
                 activities=self.get("root_activities")
                 already_terminal=bool(ref and activities.get(ref.activity_id)=="terminal")
-                if root_activity and ref and ref.activity_id and event.kind in {"activity.started","activity.terminal"}:
+                if root_activity and ref and ref.activity_id and event.kind in {"activity.started","activity.processed","activity.terminal"}:
                     if ref.activity_id not in activities and len(activities)>=self.max_commands:
                         raise RuntimeContractError("JOURNAL_EXHAUSTED", "bounded native activity identity retention exhausted")
                     activity_state="terminal" if event.kind=="activity.terminal" or already_terminal else "active"
@@ -289,7 +294,7 @@ class Journal:
                         self.set('quiet_epoch',self.get('quiet_epoch')+1)
                         self.set('idle_since',None)
                     self.set('uncertain_activities',uncertain)
-                if event.kind == "activity.started" and root_activity and ref and ref.activity_id and not already_terminal:
+                if event.kind in {"activity.started","activity.processed"} and root_activity and ref and ref.activity_id and not already_terminal:
                     self.set("primary", ref.activity_id)
                 if event.kind == "activity.terminal" and root_activity and ref and (
                         ref.activity_id == self.get("primary") or
@@ -572,7 +577,12 @@ class Controller:
             return {"acknowledged":value["sequence"]}
         if op == "snapshot":
             deadline=min(deadline,time.monotonic()+5)
-            snapshot=self.call(lambda:self.driver.inventory(deadline=deadline),deadline=deadline)
+            try:
+                snapshot=self.call(lambda:self.driver.inventory(deadline=deadline),deadline=deadline)
+            except (OSError,RuntimeContractError):
+                self.observe_root_occupancy()
+                raise
+            self.observe_root_occupancy(snapshot)
             return public_payload(dataclasses.asdict(snapshot),sensitive_values=self.journal.secrets)
         if op not in {"submit","control","close"}:
             raise RuntimeContractError("OP_INVALID", "unknown private controller operation")
@@ -701,6 +711,39 @@ class Controller:
                         result = WriteReceipt("unknown",detail="native control outcome ambiguous")
             self.journal.receipt(cid,result)
             return public_payload(dataclasses.asdict(result),sensitive_values=self.journal.secrets)
+
+    def observe_root_occupancy(self,snapshot=None) -> None:
+        """Only attributable root occupancy can reconcile an unknown quiet edge.
+
+        Snapshot.partial also describes background inventory. The driver's
+        explicit primary_state must qualify root occupancy independently.
+        """
+        with self.journal.lock:
+            captured=self.identity
+            identity=getattr(snapshot,'identity',None)
+            primary=getattr(snapshot,'primary',None)
+            state=getattr(snapshot,'primary_state','unknown')
+            current=(snapshot is not None and snapshot.freshness=='current'
+                     and identity is not None and captured is not None
+                     and identity.root_id==captured.root_id
+                     and identity.session_id==captured.session_id and identity.process==captured.process)
+            valid_idle=current and state=='idle' and primary is None
+            valid_active=(current and captured is not None and state=='active' and primary is not None
+                          and primary.root_id==captured.root_id
+                          and primary.thread_id in {None,primary.root_id} and bool(primary.activity_id))
+            unknown=not (valid_idle or valid_active)
+            changed=self.journal.get('root_occupancy_unknown')!=unknown
+            self.journal.set('root_occupancy_unknown',unknown)
+            if valid_idle:
+                changed=changed or self.journal.get('primary') is not None or bool(self.journal.get('uncertain_activities'))
+                self.journal.set('primary',None)
+                self.journal.set('uncertain_activities',{})
+            elif valid_active and primary is not None:
+                changed=changed or self.journal.get('primary')!=primary.activity_id
+                self.journal.set('primary',primary.activity_id)
+            if changed:
+                self.journal.set('quiet_epoch',self.journal.get('quiet_epoch')+1)
+                self.journal.set('idle_since',None)
 
     def status(self) -> dict:
         return {"generation":self.generation,"contract":CONTRACT_REVISION,"ready":self.ready,
