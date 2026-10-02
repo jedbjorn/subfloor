@@ -14,6 +14,7 @@ sys.path.insert(0, str(ROOT / ".super-coder/scripts"))
 import conversation_native_chats
 import sprint_message_delivery
 import sprint_native_wakes
+import test_codex_runtime as codex_runtime_tests
 import test_conversation_runtime_foundation as foundation
 import test_native_chat_ownership as ownership
 from conversation_native_chats import NativeChatsService
@@ -32,6 +33,7 @@ controller, control, wire, command = (
     foundation.command,
 )
 database = ownership.database
+codex_seat = codex_runtime_tests.seat
 
 
 @pytest.fixture
@@ -632,3 +634,81 @@ def test_foreign_or_active_missing_identity_snapshot_cannot_clear_unknown(contro
         )
         owner.handle(wire("snapshot"))
         assert not owner.status()["quiet"]["idle"]
+
+
+@pytest.mark.parametrize("replacement", [False, True])
+def test_wake_path_callback_cannot_withdraw_installed_owner_before_insert(
+    native, monkeypatch, replacement
+):
+    import sprint_participant_chats
+    from sprint_route_binding_support import candidate
+
+    n = native
+
+    def resolve(harness, model, effort):
+        binding = candidate(
+            n.con,
+            {"participant_id": 1, "harness": harness, "model": model, "effort": effort},
+        ).binding
+        binding["selector_binding"].update(
+            proof_state="checked_native_selection",
+            native_fingerprint="a" * 64,
+            native_executable_version="fixture",
+        )
+        return binding, sprint_participant_chats.route_bindings.digest_json(binding)
+
+    n.service.route_resolver = resolve
+    monkeypatch.setattr(
+        sprint_participant_chats.run_mod, "shell_work_dir", lambda *_: n.service.root
+    )
+    route = sprint_participant_chats.prepare_shell_wake_conversation(n.con, 1)
+    _, observation = sprint_native_wakes.observe(n.con, "cv")
+    n.service.request_close(n.con, "cv", 1, 1, wake_id=10, observation=observation)
+    n.service.close_generation("g", "cv", n.client, 1, 1)
+    other = (
+        conversation_native_chats.NativeChatsService(
+            n.service.database, n.service.root, n.service.supervisor
+        )
+        if replacement
+        else None
+    )
+
+    def switch(*_):
+        monkeypatch.setattr(conversation_native_chats, "_SERVICE", other)
+        return n.service.root
+
+    monkeypatch.setattr(sprint_participant_chats.run_mod, "shell_work_dir", switch)
+    try:
+        with n.con:
+            n.con.execute("BEGIN IMMEDIATE")
+            with pytest.raises(
+                (RuntimeContractError, sprint_participant_chats.SprintConversationError)
+            ):
+                sprint_participant_chats.create_shell_wake_conversation(
+                    n.con, wake_id=10, route=route
+                )
+    finally:
+        assert n.con.execute("SELECT COUNT(*) FROM conversations").fetchone()[0] == 1
+        assert (
+            n.con.execute(
+                "SELECT COUNT(*) FROM conversation_runtime_generations"
+            ).fetchone()[0]
+            == 1
+        )
+        if other:
+            other.starts.shutdown(wait=False, cancel_futures=True)
+
+
+def test_actual_codex_unclassified_root_inventory_keeps_quiet_unknown(
+    controller, codex_seat
+):
+    owner, _ = controller
+    driver, rpc, _events, _context = codex_seat
+    owner.driver = driver
+    driver._emit = owner.emit
+    rpc.turns["root"] = [
+        {"id": "unclassified-autonomous", "status": "newUnknownStatus"}
+    ]
+    snapshot = owner.handle(wire("snapshot"))
+    assert snapshot["partial"] is True and snapshot["primary_state"] == "unknown"
+    assert not owner.status()["quiet"]["idle"]
