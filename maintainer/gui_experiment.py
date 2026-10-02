@@ -377,13 +377,67 @@ class NativeSupervisor:
                     or record['status']!='serving' or record['runtime']!='experimental'):
                 return False
             children=record.setdefault('codegen_children',[])
-            if len(children)>=32 or time.monotonic()>=deadline:
+            allocation=record.get('codegen_pending')
+            if (not allocation or allocation.get('api_owner')!=owner
+                    or len(children)>=32 or time.monotonic()>=deadline):
                 return False
             children.append({'purpose':'codex_schema','api_owner':owner,
+                             'allocation_id':allocation['allocation_id'],
                              'pid':process.pid,'start_ticks':process.start_ticks,
                              'control_group':control_group,'registered_at':time.time()})
             save(record,self.receipt)
             return time.monotonic()<deadline
+
+    def codegen_clean(self) -> bool:
+        record=verify_receipt(self.receipt)
+        verify_root(record)
+        return not record.get('codegen_pending')
+
+    def begin_codegen(self, allocation_id: str, *, deadline: float) -> None:
+        owner=self.preparation_identity(deadline=deadline)
+        if not ID_RE.fullmatch(allocation_id):
+            raise FixtureError('INPUT_INVALID','fixed schema allocation identity required')
+        initial=read_json(self.receipt)
+        with ownership_lock(initial['fixture_id'],deadline=deadline):
+            record=verify_receipt(self.receipt)
+            verify_root(record)
+            if (record.get('codegen_pending') or record['runtime']!='experimental'
+                    or record['status']!='serving' or time.monotonic()>=deadline):
+                raise FixtureError('CLEANUP_PENDING','previous schema ownership remains unresolved')
+            record['codegen_pending']={'allocation_id':allocation_id,'api_owner':owner}
+            save(record,self.receipt) # Before any output-directory allocation/fork.
+
+    def finish_codegen(self, allocation_id: str, receipt: dict, *, deadline: float) -> bool:
+        owner=self.preparation_identity(deadline=deadline)
+        initial=read_json(self.receipt)
+        with ownership_lock(initial['fixture_id'],deadline=deadline):
+            record=verify_receipt(self.receipt)
+            verify_root(record)
+            if (record.get('codegen_pending')!={'allocation_id':allocation_id,'api_owner':owner}
+                    or receipt.get('cleanup_complete') is not True or receipt.get('files_removed') is not True):
+                return False
+            children=[item for item in record.get('codegen_children',[]) if item.get('allocation_id')==allocation_id]
+            if receipt.get('child_started') is True:
+                if (len(children)!=1 or not all(receipt.get(name) is True for name in
+                        ('child_reaped','process_group_exited','child_registered'))):
+                    return False
+                child=children[0]
+                if (type(child.get('pid')) is not int or child['pid']<=0
+                        or type(child.get('start_ticks')) is not int or child['start_ticks']<=0
+                        or child['api_owner']!=owner or child['control_group']!=owner['control_group']
+                        or process_start_ticks(child['pid'])==child['start_ticks']):
+                    return False
+                for pid in cgroup_pids(owner['control_group']):
+                    try:fields=Path(f'/proc/{pid}/stat').read_text().rsplit(')',1)[1].split()
+                    except FileNotFoundError:continue
+                    if int(fields[2])==child['pid'] and fields[0]!='Z':return False
+            elif receipt.get('child_started') is not False or children:
+                return False
+            if self.preparation_identity(deadline=deadline)!=owner or time.monotonic()>=deadline:
+                return False
+            record['codegen_pending']=None
+            save(record,self.receipt)
+            return True
 
     def preparation_exited(self, identity: dict) -> bool:
         """PID death alone cannot release helpers left in the old API cgroup."""

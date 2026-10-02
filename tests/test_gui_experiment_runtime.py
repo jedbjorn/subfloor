@@ -40,6 +40,7 @@ def operation(request,monkeypatch):
         def __init__(self,**kwargs):
             self.database,self.root=kwargs['database'],kwargs['root']
             calls.append('seat')
+        def ensure_codegen_clean(self):pass
         def candidate_fingerprint(self,*args):
             assert args==('codex','gpt-6.1-sol','high')
             calls.append('candidate');return fp
@@ -331,3 +332,32 @@ def test_behavior_budget_includes_schema_and_preserves_twenty_second_cleanup_res
     value.begin()
     assert captured['seconds']==159 and captured['observed_interface']=={'native':True}
     assert 'adapter_methods' not in captured['observed_interface']
+
+
+def test_unknown_schema_cleanup_fences_next_operation_and_behavior_before_candidate(operation,monkeypatch):
+    import time
+
+    from conversation_runtime_contract import RuntimeContractError
+    value,fp,_,calls=operation
+    def unknown(*args):raise RuntimeContractError('NATIVE_SCHEMA_INCONCLUSIVE','owned cleanup unknown')
+    monkeypatch.setattr(value.seat,'observe_native_schema',unknown)
+    with pytest.raises(RuntimeContractError):value.native_schema(fp,time.monotonic()+20)
+    before=list(calls)
+    for action in (value.begin_schema,value.begin):
+        with pytest.raises(RuntimeContractError) as exc:action()
+        assert exc.value.code=='CLEANUP_PENDING'
+    assert calls==before and value.status()['native_schema']['state']=='cleanup_pending'
+
+
+def test_known_preallocation_schema_failure_is_retryable_without_fabricated_cleanup(operation,monkeypatch):
+    import time
+
+    from conversation_runtime_contract import RuntimeContractError
+    value,fp,_,_=operation
+    original=value.seat.observe_native_schema
+    def unallocated(*args):raise RuntimeContractError('NATIVE_SCHEMA_UNALLOCATED','no allocation made')
+    monkeypatch.setattr(value.seat,'observe_native_schema',unallocated)
+    with pytest.raises(RuntimeContractError):value.native_schema(fp,time.monotonic()+20)
+    assert not value.schema_cleanup_pending
+    monkeypatch.setattr(value.seat,'observe_native_schema',original)
+    assert value.native_schema(fp,time.monotonic()+20).generation_completed

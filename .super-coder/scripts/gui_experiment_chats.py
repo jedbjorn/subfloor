@@ -30,6 +30,7 @@ class FixtureChats:
         self.thread=threading.Thread(target=self.publish_changes,name='fixture-native-installation',daemon=True)
 
     def resolve_route(self,harness,model,effort):
+        self.seat.ensure_codegen_clean()
         fp=self.seat.candidate_fingerprint(harness,model,effort)
         evidence=self.operation.cache.get(fp,'submission')
         if evidence is None or evidence.grade!='compatible':

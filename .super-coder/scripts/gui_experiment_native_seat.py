@@ -84,6 +84,7 @@ class NativeFixtureSeat:
         self.native_bindings=dict(native_bindings)
         self.assets_lock=threading.Lock()
         self.claude_assets_ready=False
+        self.schema_cleanup_pending=False
         for value in self.native_bindings.values():
             if value and (not Path(value).is_absolute() or any(c in value for c in '\n\r\0')):
                 raise RuntimeContractError('CONTEXT_INVALID','absolute finite native paths required')
@@ -165,26 +166,33 @@ class NativeFixtureSeat:
         from conversation_runtime_codex_codegen import make_owned_codegen_runner
         from conversation_runtime_codex_schema import observe_codex_schema
         deadline=min(deadline,time.monotonic()+20)
+        self.ensure_codegen_clean()
         if (fingerprint.harness!='codex' or not isinstance(fingerprint.model,str)
                 or not isinstance(fingerprint.effort,str) or time.monotonic()+2>=deadline):
-            raise RuntimeContractError('NATIVE_SCHEMA_INCONCLUSIVE','bounded schema prerequisite unavailable')
+            raise RuntimeContractError('NATIVE_SCHEMA_UNALLOCATED','bounded schema prerequisite unavailable before allocation')
         def guard():
             return self.supervisor.preparation_identity(deadline=deadline)
-        owner=guard()
-        if self.candidate_fingerprint('codex',fingerprint.model,fingerprint.effort)!=fingerprint or time.monotonic()+2>=deadline:
-            raise RuntimeContractError('NATIVE_SCHEMA_INCONCLUSIVE','captured schema identity changed')
-        parent=self.root/'runtime'
-        guard()
-        parent.mkdir(mode=0o700,exist_ok=True)
-        info=parent.lstat()
-        if (parent.resolve()!=parent or not stat.S_ISDIR(info.st_mode)
-                or info.st_uid!=os.getuid() or stat.S_IMODE(info.st_mode)!=0o700
-                or time.monotonic()+2>=deadline):
-            raise RuntimeContractError('NATIVE_SCHEMA_INCONCLUSIVE','private schema boundary unavailable')
-        root=parent/f'codegen-{uuid.uuid4().hex}'
-        guard()
-        if time.monotonic()+2>=deadline:
-            raise RuntimeContractError('NATIVE_SCHEMA_INCONCLUSIVE','schema budget expired before allocation')
+        try:
+            owner=guard()
+            if self.candidate_fingerprint('codex',fingerprint.model,fingerprint.effort)!=fingerprint or time.monotonic()+2>=deadline:
+                raise RuntimeContractError('NATIVE_SCHEMA_UNALLOCATED','captured schema identity changed before allocation')
+            parent=self.root/'runtime'
+            guard()
+            parent.mkdir(mode=0o700,exist_ok=True)
+            info=parent.lstat()
+            if (parent.resolve()!=parent or not stat.S_ISDIR(info.st_mode)
+                    or info.st_uid!=os.getuid() or stat.S_IMODE(info.st_mode)!=0o700
+                    or time.monotonic()+2>=deadline):
+                raise RuntimeContractError('NATIVE_SCHEMA_UNALLOCATED','private schema boundary unavailable before allocation')
+            allocation=uuid.uuid4().hex
+            root=parent/f'codegen-{allocation}'
+            guard()
+            if time.monotonic()+2>=deadline:
+                raise RuntimeContractError('NATIVE_SCHEMA_UNALLOCATED','schema budget expired before allocation')
+        except (OSError,RuntimeError,ValueError) as exc:
+            raise RuntimeContractError('NATIVE_SCHEMA_UNALLOCATED','schema prerequisite failed before allocation') from exc
+        self.schema_cleanup_pending=True
+        self.supervisor.begin_codegen(allocation,deadline=deadline)
         root.mkdir(mode=0o700)
         runner=make_owned_codegen_runner(fingerprint.executable,root,guard,
             record_child=lambda process,cgroup:self.supervisor.record_codegen_child(process,cgroup,deadline=deadline-2))
@@ -196,10 +204,16 @@ class NativeFixtureSeat:
             clean=runner.cleanup(deadline)
         receipt=dict(runner.receipt)
         receipt['cleanup_complete']=clean
-        if (not clean or guard()!=owner or time.monotonic()>=deadline
+        if (not clean or not self.supervisor.finish_codegen(allocation,receipt,deadline=deadline)
+                or guard()!=owner or time.monotonic()>=deadline
                 or self.candidate_fingerprint('codex',fingerprint.model,fingerprint.effort)!=fingerprint):
             raise RuntimeContractError('NATIVE_SCHEMA_INCONCLUSIVE','schema ownership or cleanup remains inconclusive')
+        self.schema_cleanup_pending=False
         return observed,receipt
+
+    def ensure_codegen_clean(self) -> None:
+        if self.schema_cleanup_pending or not self.supervisor.codegen_clean():
+            raise RuntimeContractError('CLEANUP_PENDING','previous codegen ownership requires verified cleanup or fixture teardown')
 
     def selected_worktree(self,row) -> Path:
         expected=run.shell_work_dir(row['shortname'],row['flavor'],root=self.root).absolute()
@@ -318,6 +332,7 @@ class NativeFixtureSeat:
 
     def prepare(self,conversation_id: str,generation_id: str, *, probe_capabilities: tuple[str,...]=(),
                 checked_fingerprint: Fingerprint|None=None) -> tuple[RuntimeContext,Fingerprint,dict]:
+        self.ensure_codegen_clean()
         con=db_driver.connect(str(self.database))
         try:
             row=con.execute('SELECT c.*,s.shortname,s.flavor,s.user_id AS shell_owner FROM conversations c JOIN shells s USING(shell_id) WHERE conversation_id=?',(conversation_id,)).fetchone()
