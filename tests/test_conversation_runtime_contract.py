@@ -55,3 +55,8 @@ def test_known_values_scrub_all_nested_strings_before_persistence():
     assert public_payload({'detail':'failed auth abc-secret', 'output':['abc-secret']},
                           sensitive_values=('abc-secret',)) == {
                               'detail':'failed auth [redacted]', 'output':['[redacted]']}
+
+
+def test_redaction_cannot_silently_rewrite_native_identity_targets():
+    with pytest.raises(RuntimeContractError,match='without rewriting'):
+        public_payload({'root_id':'root-real-secret'},sensitive_values=('real-secret',))

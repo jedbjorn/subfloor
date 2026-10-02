@@ -261,7 +261,8 @@ def verify_native(record: dict, native: dict) -> None:
     gid = native.get("generation_id", "")
     if (not ID_RE.fullmatch(gid) or native.get("harness") not in {"codex", "claude"}
             or native.get("unit") != f"{PREFIX}{record['fixture_id']}-native-{gid}.service"
-            or native.get("root") != str(Path(record["root"]) / "runtime" / gid)):
+            or native.get("root") != str(Path(record["root"]) / "runtime" / gid)
+            or native.get("endpoint") != str(native_endpoint(record["fixture_id"],gid))):
         raise FixtureError("OWNERSHIP_INVALID", "native resource identity is not fixture-derived")
     root = Path(native["root"])
     if root.exists() or root.is_symlink():
@@ -270,6 +271,13 @@ def verify_native(record: dict, native: dict) -> None:
                 or stat.S_IMODE(info.st_mode) != 0o700
                 or (info.st_dev, info.st_ino) != (native["root_device"], native["root_inode"])):
             raise FixtureError("OWNERSHIP_INVALID", "native state root was replaced")
+
+
+def native_endpoint(fixture_id: str,generation_id: str) -> Path:
+    # Linux pathname sockets have a 108-byte address cap. Keep their endpoint
+    # in the fixed private registry, independent of a long fixture temp-parent.
+    key=hashlib.sha256((fixture_id+":"+generation_id).encode()).hexdigest()[:32]
+    return registry()/f"{key}.sock"
 
 
 def native_unit_state(native: dict) -> dict[str, str]:
@@ -309,7 +317,12 @@ class NativeSupervisor:
     def __init__(self, receipt: Path):
         self.receipt = canonical_receipt(receipt)
 
-    def register(self, generation_id: str, harness: str) -> dict:
+    def inventory(self) -> list[dict]:
+        record = verify_receipt(self.receipt)
+        verify_root(record)
+        return record.get("native_units", [])
+
+    def register(self, generation_id: str, harness: str, *, test_transport: bool=False) -> dict:
         initial = read_json(self.receipt)
         with ownership_lock(initial["fixture_id"]):
             record = verify_receipt(self.receipt)
@@ -322,7 +335,7 @@ class NativeSupervisor:
             for native in units:
                 if native["generation_id"] == generation_id:
                     verify_native(record, native)
-                    if native["harness"] != harness:
+                    if native["harness"] != harness or native.get("test_transport",False) != test_transport:
                         raise FixtureError("OWNERSHIP_INVALID", "generation harness changed")
                     return native
             if sum(item["harness"] == harness and not item.get("os_cleanup", {}).get("complete") for item in units) >= 2:
@@ -336,10 +349,12 @@ class NativeSupervisor:
             state_root.mkdir(mode=0o700)
             info = state_root.lstat()
             native = {"generation_id":generation_id,"harness":harness,"root":str(state_root),
+                      "endpoint":str(native_endpoint(record["fixture_id"],generation_id)),
                       "root_device":info.st_dev,"root_inode":info.st_ino,
                       "unit":f"{PREFIX}{record['fixture_id']}-native-{generation_id}.service",
                       "limits":{"memory_mib":2048,"tasks":128,"term_grace_seconds":5},
                       "registered_at":time.time(),"status":"registered"}
+            native["test_transport"] = test_transport
             units.append(native)
             save(record,self.receipt)  # durable before systemd-run or native writes
             return native
@@ -360,7 +375,7 @@ class NativeSupervisor:
                 raise FixtureError("SOURCE_INVALID", "copied controller is unavailable")
             native["status"] = "starting"
             save(record,self.receipt)
-            command(["systemd-run","--user","--quiet","--collect","--unit",native["unit"],
+            argv=["systemd-run","--user","--quiet","--collect","--unit",native["unit"],
                      "--description",native_description(record,native),"-p","Type=exec",
                      "-p","KillMode=control-group","-p","SendSIGKILL=yes","-p","TimeoutStopSec=5s",
                      "-p",f"RuntimeMaxSec={record['limits']['lifetime_seconds']}s",
@@ -368,7 +383,11 @@ class NativeSupervisor:
                      "-p",f"StandardOutput=append:{native['root']}/controller.log",
                      "-p",f"StandardError=append:{native['root']}/controller.log",
                      sys.executable,str(script),"--generation",generation_id,"--root",native["root"],
-                     "--harness",native["harness"]])
+                     "--endpoint",native["endpoint"],
+                     "--harness",native["harness"]]
+            if native.get("test_transport"):
+                argv.append("--test-transport")
+            command(argv)
             deadline = time.monotonic()+10
             while time.monotonic()<deadline:
                 state = native_unit_state(native)
@@ -376,7 +395,7 @@ class NativeSupervisor:
                     raise FixtureError("OWNERSHIP_INVALID", "launched native unit identity differs")
                 pid = int(state.get("MainPID", "0"))
                 ticks = process_start_ticks(pid)
-                if state.get("ActiveState") == "active" and ticks is not None and (Path(native["root"])/"controller.sock").is_socket():
+                if state.get("ActiveState") == "active" and ticks is not None and Path(native["endpoint"]).is_socket():
                     native.update(status="active",main_pid=pid,main_pid_start_ticks=ticks,control_group=state.get("ControlGroup",""))
                     save(record,self.receipt)
                     return native
@@ -762,7 +781,7 @@ def serve(root: Path) -> int:
             try:
                 report = gui_experiment_readiness.prepare(database=db,root=root,
                          fixture_id=trusted["fixture_id"],harness=args["harness"],
-                         shell_id=args.get("shell_id",1))
+                         shell_id=args.get("shell_id"))
                 return 200, [("Content-Type","application/json")], json.dumps(report).encode()
             except (ValueError,OSError,RuntimeError,SystemExit):
                 return 422, [("Content-Type","application/json")], b'{"error":"FIXTURE_READINESS_FAILED"}'
