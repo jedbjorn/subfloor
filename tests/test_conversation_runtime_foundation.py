@@ -442,6 +442,39 @@ def test_withdrawn_startup_phase_blocks_choice_and_late_setup_cannot_regress_rea
     assert owner.ready and owner.status()['setup'] is None
 
 
+def test_async_readiness_retains_selected_observations_without_changing_native_identity(controller):
+    owner,driver=controller
+    owner.context=dataclasses.replace(owner.context,harness='claude');driver.harness='claude'
+    owner.identity=RuntimeIdentity('root','native-session',protocol={'auth_observation':{'method':'claude.ai'}})
+    owner.ready=False
+    route={'account_type':'claude.ai','model':'observed-model','efforts':['high'],
+           'observation_origin':'claude:auth-status+SessionStart+readiness-Stop',
+           'model_evidence':'active_selected_model','effort_evidence':'effective_selected_level',
+           'catalogue_observed':False,'auth':{'method':'claude.ai','provider':'firstParty'}}
+    owner.emit(RuntimeEvent('runtime.ready',NativeReference('root',thread_id='child'),data={'native_route':route}))
+    assert not owner.ready and 'native_route' not in owner.identity.protocol
+    owner.emit(RuntimeEvent('runtime.ready',NativeReference('root'),data={'native_route':route},partial=True))
+    assert not owner.ready
+    owner.emit(RuntimeEvent('runtime.ready',NativeReference('root'),data={'native_route':route}))
+    identity=owner.status()['identity']
+    assert owner.ready and identity['root_id']=='root' and identity['session_id']=='native-session'
+    assert identity['protocol']['native_route']==route
+    assert identity['protocol']['auth_observation']=={'method':'claude.ai'}
+    owner.handle(wire('close',command=control('close',1,action='close')))
+    owner.emit(RuntimeEvent('runtime.ready',NativeReference('root'),data={'native_route':route|{'model':'late'}}))
+    assert not owner.ready and owner.identity.protocol['native_route']['model']=='observed-model'
+
+
+@pytest.mark.parametrize('change',[{'email':'private@example.invalid'},{'efforts':[]},{'auth':{'method':'claude.ai','provider':'firstParty','access_token':'private'}}])
+def test_readiness_rejects_unbounded_or_unsanitized_route_before_journal(controller,change):
+    owner,_=controller
+    before=owner.journal.get('sequence')
+    with pytest.raises(RuntimeContractError,match='native'):
+        owner.emit(RuntimeEvent('runtime.ready',NativeReference('root',thread_id='root'),data={
+            'native_route':{'account_type':'chatgpt','model':'observed','efforts':['high']}|change}))
+    assert owner.journal.get('sequence')==before
+
+
 def test_startup_projection_binds_generation_binary_driver_and_preserves_close(tmp_path):
     database=tmp_path/'fixture.sqlite';con=sqlite3.connect(database)
     con.executescript('CREATE TABLE users(user_id INTEGER PRIMARY KEY); CREATE TABLE shells(shell_id INTEGER PRIMARY KEY); CREATE TABLE conversations(conversation_id TEXT PRIMARY KEY,shell_id INTEGER,owner_user_id INTEGER,state TEXT,harness TEXT,provider TEXT,model TEXT,effort TEXT,worktree TEXT); INSERT INTO users VALUES(1); INSERT INTO shells VALUES(1); INSERT INTO conversations(conversation_id,shell_id,owner_user_id,state,harness) VALUES("cv",1,1,"idle","claude");')

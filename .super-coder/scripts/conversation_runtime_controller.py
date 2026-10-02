@@ -50,6 +50,28 @@ def encoded(value: Any) -> str:
     return json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False)
 
 
+def observed_native_route(value: Any) -> dict:
+    """Bound only selected, sanitized native observations; never an account dump."""
+    required={'account_type','model','efforts'}
+    optional={'observation_origin','model_evidence','effort_evidence','catalogue_observed','auth'}
+    def text(item):
+        return isinstance(item,str) and 0<len(item)<=255 and not any(ord(c)<32 for c in item)
+    if (not isinstance(value,dict) or not required<=value.keys() or value.keys()-required-optional
+            or not text(value['account_type']) or not text(value['model'])
+            or not isinstance(value['efforts'],list) or not 1<=len(value['efforts'])<=16
+            or not all(text(item) for item in value['efforts'])
+            or any(not text(value[key]) for key in ('observation_origin','model_evidence','effort_evidence') if key in value)
+            or ('catalogue_observed' in value and not isinstance(value['catalogue_observed'],bool))):
+        raise RuntimeContractError('NATIVE_ROUTE_INVALID','bounded selected native route observations required')
+    if 'auth' in value:
+        auth=value['auth']
+        if (not isinstance(auth,dict) or not {'method','provider'}<=auth.keys()
+                or auth.keys()-{'method','provider','subscription_type'}
+                or not all(text(item) for item in auth.values())):
+            raise RuntimeContractError('NATIVE_ROUTE_INVALID','sanitized native auth enums required')
+    return value
+
+
 def private_directory(root: Path) -> None:
     info = root.lstat()
     if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.geteuid() or stat.S_IMODE(info.st_mode) != 0o700:
@@ -323,6 +345,9 @@ class Controller:
         try:
             if self.identity and event.reference and event.reference.root_id != self.identity.root_id:
                 raise RuntimeContractError("OWNERSHIP_INVALID", "event is outside captured native root")
+            route = None
+            if event.kind == 'runtime.ready' and 'native_route' in event.data:
+                route = observed_native_route(event.data['native_route'])
             self.journal.emit(event)
             if event.kind=='runtime.setup' and not self.journal.get('close') and not self.ready:
                 if event.freshness=='current' and not event.partial and event.grade!='inconclusive':
@@ -330,7 +355,13 @@ class Controller:
                 else:
                     self.journal.set('setup',None)
             elif (event.kind=='runtime.ready' and not self.journal.get('close') and not self.lost
-                  and self.identity and event.reference and event.reference.root_id==self.identity.root_id):
+                  and self.identity and event.reference and event.reference.root_id==self.identity.root_id
+                  and (event.reference.thread_id==self.identity.root_id or
+                       (self.context and self.context.harness=='claude' and event.reference.thread_id is None))
+                  and event.freshness=='current' and not event.partial and event.grade!='inconclusive'):
+                if route is not None:
+                    self.identity=dataclasses.replace(self.identity,protocol={
+                        **self.identity.protocol,'native_route':public_payload(route,sensitive_values=self.journal.secrets)})
                 self.ready=True
                 self.journal.set('setup',None)
         except RuntimeContractError:
