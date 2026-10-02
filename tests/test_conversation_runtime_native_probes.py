@@ -691,3 +691,27 @@ def test_composite_unresolved_native_cleanup_retains_factory_allocation(owned, o
     with pytest.raises(RuntimeContractError) as error:
         factory.reserve(fp, frozenset({'submission'}), deadline=time.monotonic()+2)
     assert error.value.code == 'PROBE_ALLOCATION_RETAINED'
+
+
+@pytest.mark.parametrize('freshness', ['stale', 'unknown'])
+def test_current_snapshot_does_not_upgrade_work_witness_freshness(owned, freshness):
+    original = owned.client.request
+    def request(op, **fields):
+        value = original(op, **fields)
+        if op == 'snapshot':
+            for row in value['work']: row['freshness'] = freshness
+        return value
+    owned.client.request = request
+    factory = NativeProbeFactory(lambda *args: owned, lambda *args: CleanupProof(True, 'complete'))
+    fp = fingerprint(owned)
+    session = factory.reserve(fp, frozenset({'submission', 'stop_work'}), deadline=time.monotonic()+3)
+    session.driver.start(owned.context, lambda _: None, deadline=time.monotonic()+3)
+    try:
+        session.exercise(session.driver, time.monotonic()+2)
+        witness = factory.witness(fp)
+        assert witness['initial_snapshot_current']
+        assert not witness['initial_root_terminal_current']
+        assert not witness['initial_child_ancestry_current']
+        assert not witness['observed_child_terminal_current']
+    finally:
+        session.driver.cleanup(deadline=time.monotonic()+1)

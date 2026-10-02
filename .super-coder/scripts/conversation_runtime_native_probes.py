@@ -684,8 +684,8 @@ class _Scenarios:
             root_work = next((w for w in initial.work if w.kind == "terminal" and w.reference.thread_id == root.root_id), None)
             child = next((w for w in initial.work if w.kind == "child" and w.reference.parent_thread_id == root.root_id), None)
             with self.driver._lock:
-                self.work_observation.update(initial_root_terminal_current=root_work is not None,
-                    initial_child_ancestry_current=child is not None,
+                self.work_observation.update(initial_root_terminal_current=bool(root_work and root_work.freshness == "current"),
+                    initial_child_ancestry_current=bool(child and child.freshness == "current"),
                     initial_child_active_turn_present=bool(child and child.reference.activity_id))
             self._phase("root_tagged_pid")
             root_pid = self._wait(lambda: self._pid(root_label)) if background else None
@@ -699,7 +699,7 @@ class _Scenarios:
                 child_terminal = self._wait(lambda: next((w for w in self._inventory().work if w.kind == "terminal"
                     and w.reference.thread_id == child.reference.thread_id), None))
                 with self.driver._lock:
-                    self.work_observation["observed_child_terminal_current"] = True
+                    self.work_observation["observed_child_terminal_current"] = child_terminal.freshness == "current"
                 self._phase("child_tagged_pid")
                 child_pid = self._wait(lambda: self._pid(child_label))
             elif background:
