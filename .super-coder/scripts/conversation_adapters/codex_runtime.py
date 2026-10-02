@@ -363,6 +363,34 @@ class CodexRuntimeDriver(RuntimeDriver):
             native_account = account.get("account")
             if not isinstance(native_account, dict) or native_account.get("type") != "chatgpt":
                 raise RuntimeContractError("SUBSCRIPTION_UNAVAILABLE", "native ChatGPT login is required")
+            # Observe only the immutable prepared route, never export account PII
+            # or synthesize support from a static catalogue/version range.
+            native_route = {"account_type": "chatgpt", "model": context.model, "efforts": []}
+            cursor = None
+            selected = None
+            for _ in range(2):
+                page = _object(rpc.request("model/list", {
+                    "limit": 100, "includeHidden": True, "cursor": cursor}, deadline=deadline))
+                models = page.get("data")
+                if not isinstance(models, list) or len(models) > 100:
+                    raise RuntimeContractError("NATIVE_ROUTE_UNVERIFIED", "bounded native model list unavailable")
+                selected = next((model for model in models if isinstance(model, dict)
+                                 and model.get("model") == context.model), None)
+                if selected is not None:
+                    break
+                cursor = _string(page.get("nextCursor"))
+                if not cursor:
+                    break
+            if selected is None:
+                raise RuntimeContractError("NATIVE_ROUTE_UNAVAILABLE", "selected native model was not advertised")
+            supported = selected.get("supportedReasoningEfforts")
+            if (not isinstance(supported, list) or len(supported) > 32
+                    or any(not isinstance(item, dict) or not isinstance(item.get("reasoningEffort"), str)
+                           or not 1 <= len(item["reasoningEffort"]) <= 64 for item in supported)):
+                raise RuntimeContractError("NATIVE_ROUTE_UNVERIFIED", "native effort advertisement malformed")
+            native_route["efforts"] = sorted({item["reasoningEffort"] for item in supported})
+            if context.effort and context.effort != "default" and context.effort not in native_route["efforts"]:
+                raise RuntimeContractError("NATIVE_ROUTE_UNAVAILABLE", "selected native effort was not advertised")
             started = _object(rpc.request("thread/start", {
                 "model": context.model, "modelProvider": "openai", "allowProviderModelFallback": False,
                 "cwd": str(context.worktree), "developerInstructions": context.boot_content,
@@ -378,7 +406,8 @@ class CodexRuntimeDriver(RuntimeDriver):
                 self._identity = RuntimeIdentity(root, _string(thread.get("sessionId")), process,
                                                  {"experimentalApi": True,
                                                   "userAgent": initialized.get("userAgent"),
-                                                  "driver_revision": self.revision})
+                                                  "driver_revision": self.revision,
+                                                  "native_route": native_route})
                 self._parents[root] = None
                 self._active[root] = None
             rpc.request("thread/memoryMode/set", {"threadId": root, "mode": "disabled"}, deadline=deadline)
@@ -390,7 +419,8 @@ class CodexRuntimeDriver(RuntimeDriver):
                 **context.capability_evidence, CAP_AUTOMATION: "unverified"})
         except (OSError, RuntimeContractError, ValueError) as exc:
             self._loss("native start failed; owner must verify scoped cleanup")
-            return DriverStart("unavailable", self._identity, detail=getattr(exc, "code", "NATIVE_START_FAILED"))
+            return DriverStart("unavailable", self._identity, detail=getattr(exc, "code", "NATIVE_START_FAILED"),
+                               capabilities={CAP_SUBMISSION: "inconclusive"})
 
     def submit(self, command: NativeSubmission, *, deadline: float) -> WriteReceipt:
         if not self._allowed(CAP_SUBMISSION):
