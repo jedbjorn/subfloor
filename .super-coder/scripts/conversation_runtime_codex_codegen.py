@@ -165,11 +165,13 @@ class OwnedCodegenRunner:
         return group_exited
 
     def __call__(self, argv: tuple[str, ...], deadline: float) -> bool:
-        with self._lock:
+        deadline = min(deadline, time.monotonic()+MAX_SECONDS)
+        if not self._lock.acquire(timeout=max(0, deadline-time.monotonic())):
+            return False
+        try:
             if self._used:
                 return False
             self._used = True
-            deadline = min(deadline, time.monotonic()+MAX_SECONDS)
             child: subprocess.Popen[bytes] | None = None
             ticks: int | None = None
             cgroup = ''
@@ -183,6 +185,8 @@ class OwnedCodegenRunner:
                 # The ownership callback precedes every filesystem mutation.
                 for path in (home, output):
                     self._owner()
+                    if self._cancel.is_set() or time.monotonic()+CLEANUP_RESERVE >= deadline:
+                        raise ValueError('cleanup reserve unavailable')
                     path.mkdir(mode=0o700)
                     self._created[path] = _inode(path)
                 self._owner()
@@ -205,6 +209,8 @@ class OwnedCodegenRunner:
                 # Inert gate belongs to the registered API cgroup before any
                 # native codegen. PID/ticks stay unchanged across execve.
                 self._owner()
+                if self._cancel.is_set() or time.monotonic()+CLEANUP_RESERVE >= deadline:
+                    raise ValueError('cleanup reserve unavailable')
                 if self.record_child is None or self.record_child(ProcessIdentity(child.pid, ticks), cgroup) is not True:
                     raise ValueError('durable child receipt unavailable')
                 self._receipt['child_registered'] = True
@@ -255,6 +261,8 @@ class OwnedCodegenRunner:
                 if not success and self._receipt['code'] == 'GENERATED':
                     self._receipt['code'] = 'OWNED_CODEGEN_UNAVAILABLE'
             return success and time.monotonic() < deadline
+        finally:
+            self._lock.release()
 
     def cleanup(self, deadline: float) -> bool:
         self._cancel.set()

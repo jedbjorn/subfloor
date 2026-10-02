@@ -228,3 +228,24 @@ def test_observer_consumes_generated_files_before_explicit_cleanup(seat):
     assert set(observed.structural_grades.values()) == {'compatible'}
     assert (seat[0]/'schema/ClientRequest.json').exists()
     assert owned.cleanup(time.monotonic()+2)
+
+
+def test_timed_run_admission_and_expiry_after_owner_guard(seat):
+    owned = runner(seat); owned._lock.acquire()
+    results = []
+    worker = threading.Thread(target=lambda: results.append(owned(argv(seat), time.monotonic()+.03)))
+    try:
+        worker.start(); worker.join(.15)
+        assert not worker.is_alive() and results == [False]
+    finally:
+        owned._lock.release(); worker.join(1)
+    calls = 0
+    def delayed():
+        nonlocal calls
+        calls += 1
+        if calls == 2: time.sleep(.08)
+        return seat[2]
+    expiring = codegen.make_owned_codegen_runner(seat[1], seat[0], delayed)
+    assert not expiring(argv(seat), time.monotonic()+1.02)
+    assert not list(seat[0].iterdir())
+    assert not expiring.receipt['child_started']
