@@ -36,6 +36,7 @@ class NativeProbeOwner:
         self.database,self.root=seat.database,seat.root
         self.lock=threading.RLock()
         self.closing: set[str]=set()
+        self.allocating: set[str]=set()
 
     @staticmethod
     def candidate_binding(fingerprint: Fingerprint) -> dict:
@@ -58,6 +59,17 @@ class NativeProbeOwner:
         return binding
 
     def allocate(self,fingerprint: Fingerprint,capabilities: frozenset[str],deadline: float) -> OwnedProbe:
+        with self.lock:
+            if fingerprint.key in self.allocating or fingerprint.key in self.closing:
+                raise RuntimeContractError('PROBE_ALLOCATION_FENCED','earlier allocation/cleanup remains in progress')
+            self.allocating.add(fingerprint.key)
+        try:
+            return self._allocate(fingerprint,capabilities,deadline)
+        finally:
+            with self.lock:
+                self.allocating.discard(fingerprint.key)
+
+    def _allocate(self,fingerprint: Fingerprint,capabilities: frozenset[str],deadline: float) -> OwnedProbe:
         # Claude's readiness challenge itself performs inference. Pending
         # workspace/no-memory authority is enforced before Driver.start, not
         # by the factory's later post-ready observation check.
@@ -207,7 +219,11 @@ class NativeProbeOwner:
             finally:
                 con.close()
         if row is None:
-            return CleanupProof(True,'complete')  # Allocation never created a synthetic owner.
+            with self.lock:
+                if fingerprint.key in self.allocating:
+                    return CleanupProof(False,'inconclusive')
+                self.closing.discard(fingerprint.key)
+            return CleanupProof(True,'complete')  # Allocation finished without creating a synthetic owner.
         generation,cid=row['generation_id'],row['conversation_id']
         con=db_driver.connect(str(self.database))
         try:
@@ -216,8 +232,19 @@ class NativeProbeOwner:
         finally:
             con.close()
         if captured is None:
+            self._update(cid,generation,state='closing',setup=None)
             self.service.finish_preparation(cid,generation)
-            return CleanupProof(False,'inconclusive')
+            con=db_driver.connect(str(self.database))
+            try:
+                projection=json.loads(con.execute('SELECT runtime_projection FROM conversations WHERE conversation_id=?',(cid,)).fetchone()[0])
+            finally:
+                con.close()
+            cleanup=projection.get('preparation_cleanup') or {}
+            proof=CleanupProof(cleanup.get('unit_verified_exited') is True,
+                'complete' if cleanup.get('never_launched') is True else 'inconclusive')
+            if proof.complete:
+                self.completed(fingerprint)
+            return proof
         try:
             receipt=self.service.store.command_status(generation,owner['owner_user_id'],owner['shell_id'],'probe-close')['receipt']
         except RuntimeContractError:
@@ -227,12 +254,15 @@ class NativeProbeOwner:
         proof=CleanupProof(cleanup.get('unit_verified_exited') is True,cleanup.get('native_outcome','inconclusive'),
                            tuple(cleanup.get('unresolved_work',())),tuple(cleanup.get('unresolved_definitions',())))
         if proof.complete:
-            con=db_driver.connect(str(self.database))
-            try:
-                with db_driver.write_transaction(con,'native_probe.completed'):
-                    con.execute("UPDATE conversation_runtime_probe_jobs SET status='complete',updated_at=? WHERE fingerprint_key=?",(time.time(),fingerprint.key))
-            finally:
-                con.close()
-            with self.lock:
-                self.closing.discard(fingerprint.key)
+            self.completed(fingerprint)
         return proof
+
+    def completed(self,fingerprint: Fingerprint) -> None:
+        con=db_driver.connect(str(self.database))
+        try:
+            with db_driver.write_transaction(con,'native_probe.completed'):
+                con.execute("UPDATE conversation_runtime_probe_jobs SET status='complete',updated_at=? WHERE fingerprint_key=?",(time.time(),fingerprint.key))
+        finally:
+            con.close()
+        with self.lock:
+            self.closing.discard(fingerprint.key)
