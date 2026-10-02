@@ -169,6 +169,33 @@ def test_empty_cleanup_cannot_release_inflight_allocation(owner,monkeypatch):
         release.set();worker.join(3)
 
 
+def test_existing_job_cleanup_retains_fence_until_late_allocation_finishes(owner,monkeypatch):
+    import threading
+    value,fingerprint,con,events=owner
+    entered,release=threading.Event(),threading.Event()
+    def blocked_git(*args,**kwargs):
+        entered.set();assert release.wait(3)
+    monkeypatch.setattr('gui_experiment_probe_owner.subprocess.run',blocked_git)
+    errors=[]
+    def allocate():
+        try:value.allocate(fingerprint,frozenset({'submission'}),time.monotonic()+30)
+        except RuntimeContractError as exc:errors.append(exc.code)
+    worker=threading.Thread(target=allocate);worker.start()
+    try:
+        assert entered.wait(2)
+        assert not value.cleanup(fingerprint,time.monotonic()+10).complete
+        assert con.execute('SELECT status FROM conversation_runtime_probe_jobs').fetchone()[0]=='preparing'
+        assert fingerprint.key in value.closing and fingerprint.key in value.allocating
+        release.set();worker.join(3)
+        assert errors==['PROBE_ALLOCATION_FENCED'] and events==['prepare']
+        assert 'launch' not in events
+        assert value.cleanup(fingerprint,time.monotonic()+10).complete
+        assert con.execute('SELECT status FROM conversation_runtime_probe_jobs').fetchone()[0]=='complete'
+        assert fingerprint.key not in value.closing
+    finally:
+        release.set();worker.join(3)
+
+
 def test_probe_role_refuses_ordinary_input_even_with_cached_submission(owner,monkeypatch):
     import conversation_native_chats
     import conversation_routes

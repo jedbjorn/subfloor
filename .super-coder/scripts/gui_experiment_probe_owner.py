@@ -233,6 +233,12 @@ class NativeProbeOwner:
             con.close()
         if captured is None:
             self._update(cid,generation,state='closing',setup=None)
+            with self.lock:
+                if fingerprint.key in self.allocating:
+                    # Registration/boot may still finish after this Close.
+                    # Only a completed allocation plus scoped cleanup can
+                    # certify never-launched resources or release the job.
+                    return CleanupProof(False,'inconclusive')
             self.service.finish_preparation(cid,generation)
             con=db_driver.connect(str(self.database))
             try:
