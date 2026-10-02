@@ -189,7 +189,11 @@ class RuntimeStore:
                     phase='needs_consent' if event['freshness']=='current' and not event['partial'] and event['grade']!='inconclusive' else 'setup_inconclusive'
                     con.execute("UPDATE conversation_runtime_generations SET state=? WHERE generation_id=? AND close_intent=0 AND state NOT IN ('closed','lost','ready')",(phase,generation))
                 elif event['kind']=='runtime.ready':
-                    con.execute("UPDATE conversation_runtime_generations SET state='ready' WHERE generation_id=? AND close_intent=0 AND state NOT IN ('closed','lost')",(generation,))
+                    eligible=event['freshness']=='current' and not event['partial'] and event['grade'] in {'compatible','unverified'}
+                    if eligible:
+                        con.execute("UPDATE conversation_runtime_generations SET state='ready' WHERE generation_id=? AND close_intent=0 AND state NOT IN ('closed','lost')",(generation,))
+                    else:
+                        con.execute("UPDATE conversation_runtime_generations SET state='setup_inconclusive' WHERE generation_id=? AND close_intent=0 AND state NOT IN ('closed','lost','ready')",(generation,))
                 con.execute("INSERT INTO conversation_runtime_events VALUES(?,?,?)",(generation,sequence,encoded(event)))
                 ref=event.get("reference") or {}
                 if event["kind"].startswith("work."):

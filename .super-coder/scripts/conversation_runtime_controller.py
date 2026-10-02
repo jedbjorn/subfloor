@@ -56,7 +56,10 @@ def observed_native_route(value: Any) -> dict:
     optional={'observation_origin','model_evidence','effort_evidence','catalogue_observed','auth'}
     def text(item):
         return isinstance(item,str) and 0<len(item)<=255 and not any(ord(c)<32 for c in item)
-    if (not isinstance(value,dict) or not required<=value.keys() or value.keys()-required-optional
+    if not isinstance(value,dict):
+        raise RuntimeContractError('NATIVE_ROUTE_INVALID','bounded selected native route observations required')
+    value={key:item for key,item in value.items() if key in required|optional}
+    if (not required<=value.keys()
             or not text(value['account_type']) or not text(value['model'])
             or not isinstance(value['efforts'],list) or not 1<=len(value['efforts'])<=16
             or not all(text(item) for item in value['efforts'])
@@ -65,10 +68,13 @@ def observed_native_route(value: Any) -> dict:
         raise RuntimeContractError('NATIVE_ROUTE_INVALID','bounded selected native route observations required')
     if 'auth' in value:
         auth=value['auth']
-        if (not isinstance(auth,dict) or not {'method','provider'}<=auth.keys()
-                or auth.keys()-{'method','provider','subscription_type'}
+        if not isinstance(auth,dict):
+            raise RuntimeContractError('NATIVE_ROUTE_INVALID','sanitized native auth enums required')
+        auth={key:item for key,item in auth.items() if key in {'method','provider','subscription_type'}}
+        if (not {'method','provider'}<=auth.keys()
                 or not all(text(item) for item in auth.values())):
             raise RuntimeContractError('NATIVE_ROUTE_INVALID','sanitized native auth enums required')
+        value['auth']=auth
     return value
 
 
@@ -346,8 +352,22 @@ class Controller:
             if self.identity and event.reference and event.reference.root_id != self.identity.root_id:
                 raise RuntimeContractError("OWNERSHIP_INVALID", "event is outside captured native root")
             route = None
+            route_matches = True
             if event.kind == 'runtime.ready' and 'native_route' in event.data:
                 route = observed_native_route(event.data['native_route'])
+                if self.context:
+                    route_matches=(route['account_type']==('chatgpt' if self.context.harness=='codex' else 'claude.ai')
+                                   and route['model']==self.context.model and self.context.effort in route['efforts'])
+                # Unknown future observation fields are omitted before journal
+                # persistence; they cannot invalidate demonstrated required data.
+                event=dataclasses.replace(event,data={**event.data,'native_route':route})
+                if not route_matches:
+                    event=dataclasses.replace(event,grade='inconclusive',data={
+                        **event.data,'readiness_diagnostic':'NATIVE_ROUTE_INCONCLUSIVE'})
+            if (event.kind=='runtime.ready' and self.identity and event.reference
+                    and event.reference.thread_id!=self.identity.root_id
+                    and not (self.context and self.context.harness=='claude' and event.reference.thread_id is None)):
+                event=dataclasses.replace(event,grade='inconclusive')
             self.journal.emit(event)
             if event.kind=='runtime.setup' and not self.journal.get('close') and not self.ready:
                 if event.freshness=='current' and not event.partial and event.grade!='inconclusive':
@@ -358,7 +378,8 @@ class Controller:
                   and self.identity and event.reference and event.reference.root_id==self.identity.root_id
                   and (event.reference.thread_id==self.identity.root_id or
                        (self.context and self.context.harness=='claude' and event.reference.thread_id is None))
-                  and event.freshness=='current' and not event.partial and event.grade!='inconclusive'):
+                  and event.freshness=='current' and not event.partial and event.grade in {'compatible','unverified'}
+                  and route_matches):
                 if route is not None:
                     self.identity=dataclasses.replace(self.identity,protocol={
                         **self.identity.protocol,'native_route':public_payload(route,sensitive_values=self.journal.secrets)})
