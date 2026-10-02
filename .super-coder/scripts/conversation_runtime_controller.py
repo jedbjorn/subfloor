@@ -26,11 +26,13 @@ from pathlib import Path
 from typing import Any
 
 from conversation_runtime_contract import (
+    CAP_HISTORY_RESUME,
     CONTRACT_REVISION,
     MAX_FRAME_BYTES,
     OUTPUT_KINDS,
     ExecutableBinding,
     NativeControl,
+    NativeHistory,
     NativeReference,
     NativeSubmission,
     ProcessIdentity,
@@ -372,6 +374,15 @@ def runtime_context(value: dict) -> RuntimeContext:
     data["execution_prefix"] = tuple(data.get("execution_prefix",[]))
     data["managed_mcp_args"] = tuple(data.get("managed_mcp_args",[]))
     data["probe_capabilities"] = tuple(data.get("probe_capabilities",[]))
+    history=data.get('history')
+    if history is not None:
+        fields={f.name for f in dataclasses.fields(NativeHistory)}
+        if not isinstance(history,dict) or set(history)!=fields:
+            raise RuntimeContractError('HISTORY_INVALID','exact typed predecessor selection required')
+        try:
+            data['history']=NativeHistory(**(history | {'source_worktree':Path(history['source_worktree'])}))
+        except (TypeError,ValueError) as exc:
+            raise RuntimeContractError('HISTORY_INVALID','invalid predecessor selection') from exc
     return RuntimeContext(**data)
 
 
@@ -467,6 +478,10 @@ class Controller:
                 # Retain the observation, but it cannot admit the generation
                 # before the captured identity and selected route are checked.
                 event=dataclasses.replace(event,grade='inconclusive')
+            if (event.kind=='runtime.ready' and self.context and self.context.history
+                    and event.reference and event.reference.root_id!=self.context.history.native_root_id):
+                event=dataclasses.replace(event,grade='inconclusive',data={**event.data,
+                    'readiness_diagnostic':'NATIVE_HISTORY_IDENTITY_INCONCLUSIVE'})
             self.journal.emit(event)
             if event.kind=='runtime.setup' and not self.journal.get('close') and not self.ready:
                 if event.freshness=='current' and not event.partial and event.grade!='inconclusive':
@@ -478,7 +493,9 @@ class Controller:
                   and (event.reference.thread_id==self.identity.root_id or
                        (self.context and self.context.harness=='claude' and event.reference.thread_id is None))
                   and event.freshness=='current' and not event.partial and event.grade in {'compatible','unverified'}
-                  and route_matches and memory_matches):
+                  and route_matches and memory_matches
+                  and (self.context is None or self.context.history is None
+                       or self.identity.root_id==self.context.history.native_root_id)):
                 if route is not None:
                     self.identity=dataclasses.replace(self.identity,protocol={
                         **self.identity.protocol,'native_route':public_payload(route,sensitive_values=self.journal.secrets)})
@@ -538,6 +555,11 @@ class Controller:
                     self.journal.check_lease(str(value.get('consumer','')),int(value.get('fence',0)))
                     if self.journal.get('close') or time.monotonic()>=deadline:
                         raise RuntimeContractError('RUNTIME_CLOSING' if self.journal.get('close') else 'DEADLINE_EXPIRED','native startup was fenced before its edge')
+                    if context.history is not None:
+                        if (context.capability_evidence.get(CAP_HISTORY_RESUME)!='compatible'
+                                and CAP_HISTORY_RESUME not in context.probe_capabilities):
+                            raise RuntimeContractError('NATIVE_HISTORY_UNAVAILABLE','matching history-specific behavior and cleanup coverage is required')
+                        return self.driver.resume_history(context,self.emit,deadline=deadline)
                     return self.driver.start(context,self.emit,deadline=deadline)
                 started = self.call(start_edge,deadline=deadline)
                 if started.identity and 'native_route' in started.identity.protocol:
@@ -556,6 +578,12 @@ class Controller:
                     if started.state=='ready' and not matched:
                         started=dataclasses.replace(started,state='unknown',detail='MEMORY_POLICY_INCONCLUSIVE',
                                                     capabilities={**started.capabilities,'submission':'inconclusive'})
+                if (context.history is not None and started.identity is not None
+                        and started.identity.root_id!=context.history.native_root_id):
+                    # Preserve even an unexpected new native root for Close;
+                    # it cannot substitute a fresh session for owned history.
+                    started=dataclasses.replace(started,state='unknown',setup=None,detail='NATIVE_HISTORY_IDENTITY_INCONCLUSIVE',
+                                                capabilities={**started.capabilities,CAP_HISTORY_RESUME:'inconclusive'})
                 self.identity = started.identity
                 self.ready = started.state == "ready" and self.identity is not None and not self.journal.get('close')
                 if self.ready:

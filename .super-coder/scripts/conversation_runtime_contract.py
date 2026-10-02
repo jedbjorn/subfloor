@@ -34,6 +34,9 @@ CAP_SUBMISSION = "submission"
 CAP_STOP_REPLY = "stop_reply"
 CAP_STOP_WORK = "stop_work"
 CAP_AUTOMATION = "automation"
+# A separately checked operation, not a grant inherited from submission.
+# Checker/provider resume coverage is registered in its own delivery unit.
+CAP_HISTORY_RESUME = "history_resume"
 # Shared GUI/checker operation names; diagnostics may retain additional native
 # capability names, but repeated input must never be keyed as 'conversation'.
 GUI_CAPABILITIES = frozenset({CAP_SUBMISSION,CAP_STOP_REPLY,CAP_STOP_WORK,CAP_AUTOMATION})
@@ -57,7 +60,9 @@ _IDENTITY_KEYS = frozenset({"generation_id","conversation_id","root_id","thread_
                           "parent_thread_id","activity_id","native_activity_id","item_id",
                           "work_id","native_process_id","request_id","control_id",
                           "boot_digest","policy_digest","payload_digest","sha256",
-                          "setup_id","configuration_sha256","executable_sha256"})
+                          "setup_id","configuration_sha256","executable_sha256",
+                          "source_conversation_id","source_generation_id","native_root_id",
+                          "source_boot_digest","source_policy_digest","cleanup_digest"})
 
 
 class RuntimeContractError(RuntimeError):
@@ -115,6 +120,43 @@ class ExecutableBinding:
 
 
 @dataclass(frozen=True)
+class NativeHistory:
+    """Server-issued predecessor selection; never a client native operand.
+
+    The owner positively validates retained source tenancy, immutable route,
+    canonical worktree and all-generation composite cleanup before issuing
+    this value and again before mutation/start. Digests bind that proof; they
+    are not compatibility grades. Drivers capture their provider-specific
+    historical transcript/item baseline before exposing any current event.
+    Initial continuation reuses the exact native root (Claude direct resume,
+    not fork) in a new engine conversation/generation and private journal.
+    """
+    source_conversation_id: str
+    source_generation_id: str
+    native_root_id: str
+    harness: str
+    model: str
+    effort: str
+    source_worktree: Path
+    source_boot_digest: str
+    source_policy_digest: str
+    cleanup_digest: str
+
+    def __post_init__(self) -> None:
+        for key in ('source_conversation_id','source_generation_id','native_root_id','model','effort'):
+            value=getattr(self,key)
+            if not isinstance(value,str) or not 1<=len(value)<=255 or any(c in value for c in ('\x00','\n','\r')):
+                raise RuntimeContractError('HISTORY_INVALID','bounded owned history identities required')
+        if (not isinstance(self.harness,str) or self.harness not in {'codex','claude'} or not isinstance(self.source_worktree,Path)
+                or not self.source_worktree.is_absolute() or '..' in self.source_worktree.parts):
+            raise RuntimeContractError('HISTORY_INVALID','history requires captured provider and canonical worktree')
+        for key in ('source_boot_digest','source_policy_digest','cleanup_digest'):
+            value=getattr(self,key)
+            if not isinstance(value,str) or len(value)!=64 or any(c not in '0123456789abcdef' for c in value):
+                raise RuntimeContractError('HISTORY_INVALID','history requires exact source and cleanup digests')
+
+
+@dataclass(frozen=True)
 class RuntimeContext:
     generation_id: str
     conversation_id: str
@@ -149,10 +191,19 @@ class RuntimeContext:
     # Hooks/channel assets use the controller's already-owned private socket.
     # No independent public HTTP server or extra API owner is permitted.
     controller_endpoint: Path | None = None
+    history: NativeHistory | None = None
 
     def __post_init__(self) -> None:
         if not self.permission_mode or not self.policy_digest or not self.boot_digest:
             raise RuntimeContractError("POLICY_MISSING", "explicit prepared boot and policy are required")
+        if self.history is not None:
+            history=self.history
+            if (not isinstance(history,NativeHistory)
+                    or history.source_conversation_id==self.conversation_id
+                    or history.source_generation_id==self.generation_id
+                    or (history.harness,history.model,history.effort,history.source_worktree)
+                    !=(self.harness,self.model,self.effort,self.worktree)):
+                raise RuntimeContractError('HISTORY_INVALID','history requires a distinct conversation/generation and unchanged owned route/worktree')
         # The harness driver must reject unsupported modes; never substitute a
         # probe-friendly policy for this canonical prepared value.
         if len(self.managed_mcp_args) % 2 or any(
@@ -390,6 +441,18 @@ class RuntimeDriver(abc.ABC):
     @abc.abstractmethod
     def start(self, context: RuntimeContext, emit: EventSink, *, deadline: float) -> DriverStart:
         raise NotImplementedError
+
+    def resume_history(self, context: RuntimeContext, emit: EventSink, *, deadline: float) -> DriverStart:
+        """Explicit native history operation; old adapters never fresh-start it.
+
+        Provider implementation must validate the captured predecessor root,
+        establish a historical baseline before current event harvesting, and
+        prepare fresh policy/hooks/MCP plus generation-bound setup. Readiness
+        cannot be inferred from old messages/terminals or old consent. Native
+        and OS cleanup obligations remain identical to an ordinary generation.
+        """
+        return DriverStart('unavailable',detail='NATIVE_HISTORY_UNAVAILABLE',
+                           capabilities={CAP_HISTORY_RESUME:'inconclusive'})
 
     @abc.abstractmethod
     def submit(self, command: NativeSubmission, *, deadline: float) -> WriteReceipt:

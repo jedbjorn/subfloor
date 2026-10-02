@@ -11,6 +11,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / '.super-coder/scrip
 from conversation_runtime_contract import (
     DriverStart,
     NativeControl,
+    NativeHistory,
     NativeReference,
     ProcessIdentity,
     RuntimeContractError,
@@ -88,3 +89,25 @@ def test_enable_local_channel_control_has_only_captured_phase_binding():
         dataclasses.replace(control,options=dict(control.options)|{'text':'arbitrary terminal input'})
     with pytest.raises(RuntimeContractError,match='exact finite startup choice'):
         dataclasses.replace(control,options={'setup_id':'epoch','configuration_sha256':'wrong'})
+
+
+
+def test_history_selection_is_frozen_bounded_and_does_not_contain_prompt_or_consent():
+    history=NativeHistory('old-cv','old-g','opaque-old-root','claude','selected-model','high',Path('/owned/worktree'),
+                          'a'*64,'b'*64,'c'*64)
+    assert set(dataclasses.asdict(history))=={'source_conversation_id','source_generation_id','native_root_id',
+        'harness','model','effort','source_worktree','source_boot_digest','source_policy_digest','cleanup_digest'}
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        history.native_root_id='replacement'
+
+
+@pytest.mark.parametrize('field,value', [
+    ('native_root_id',''),('source_generation_id',True),('source_conversation_id','unsafe\noperand'),
+    ('model','x'*256),('source_worktree',Path('relative')),('source_worktree',Path('/owned/../outside')),
+    ('harness','unsupported'),('cleanup_digest','c'*63),('source_boot_digest','z'*64),
+])
+def test_history_selection_refuses_invalid_source_identity(field,value):
+    history=NativeHistory('old-cv','old-g','opaque-old-root','codex','selected-model','high',Path('/owned/worktree'),
+                          'a'*64,'b'*64,'c'*64)
+    with pytest.raises(RuntimeContractError,match='history'):
+        dataclasses.replace(history,**{field:value})
