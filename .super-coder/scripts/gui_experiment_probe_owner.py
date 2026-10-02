@@ -81,7 +81,7 @@ class NativeProbeOwner:
         preparation_owner=self.seat.supervisor.preparation_identity()
         binding=self.candidate_binding(fingerprint)
         generation=uuid.uuid4().hex
-        cid='probe_'+generation
+        cid='cv_'+generation
         short='fxp'+generation[:20]
         worktree=self.root/'.sc-worktrees'/short
         with self.lock:
