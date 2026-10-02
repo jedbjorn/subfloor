@@ -86,7 +86,7 @@ class NativeChecks:
                 with self.operation.owner.lock:
                     empty=((self.operation.future is None or self.operation.future.done()) and not retained
                            and not self.operation.owner.allocating and not self.operation.owner.closing)
-                result={'diagnostics':[{'code':'NATIVE_CHECK_INCONCLUSIVE','grade':'inconclusive'}],
+                result: dict={'diagnostics':[{'code':'NATIVE_CHECK_INCONCLUSIVE','grade':'inconclusive'}],
                         'admissible':False,'retry_allowed':empty,'probe':None,'grades':{}}
                 self._save(check_id,'complete' if empty else 'retained',result)
 
@@ -94,6 +94,21 @@ class NativeChecks:
         con=db_driver.connect(str(self.database))
         try:
             with db_driver.write_transaction(con,'native_check.http_result'):
+                row=con.execute('SELECT result_json,status FROM conversation_runtime_check_requests WHERE check_id=?',(check_id,)).fetchone()
+                if row is None:
+                    raise RuntimeContractError('CHECK_INTENT_INVALID','check intent no longer exists')
+                previous=json.loads(row[0])
+                bound=previous.get('fingerprint')
+                if bound is not None and result.get('fingerprint',bound)!=bound:
+                    raise RuntimeContractError('CHECK_CANDIDATE_CHANGED','check result belongs to another captured candidate')
+                if row['status']=='complete':
+                    return # Old consumers cannot regress retained terminal cleanup truth.
+                if bound is not None:
+                    result['fingerprint']=bound
+                if previous.get('probe_binding'):
+                    if result.get('probe_binding',previous['probe_binding'])!=previous['probe_binding']:
+                        raise RuntimeContractError('CHECK_PROBE_CHANGED','check result belongs to another probe generation')
+                    result['probe_binding']=previous['probe_binding']
                 con.execute('UPDATE conversation_runtime_check_requests SET status=?,result_json=?,updated_at=? WHERE check_id=?',
                             (state,json.dumps(result),time.time(),check_id))
         finally:
@@ -106,7 +121,7 @@ class NativeChecks:
         con=db_driver.connect(str(self.database))
         try:
             with db_driver.write_transaction(con,'native_check.http_binding'):
-                updated=con.execute("UPDATE conversation_runtime_check_requests SET result_json=?,updated_at=? WHERE check_id=? AND status='accepted'",
+                updated=con.execute("UPDATE conversation_runtime_check_requests SET result_json=?,updated_at=? WHERE check_id=? AND status='accepted' AND json_extract(result_json,'$.fingerprint') IS NULL",
                                     (json.dumps({'fingerprint':fingerprint_key}),time.time(),check_id))
                 if updated.rowcount!=1:
                     raise RuntimeContractError('CHECK_INTENT_INVALID','candidate no longer matches retained check intent')
@@ -127,7 +142,21 @@ class NativeChecks:
         with self.lock:
             if self.current!=check_id or self.beginning or self.failed==check_id:
                 return
+            con=db_driver.connect(str(self.database))
+            try:
+                row=con.execute('SELECT * FROM conversation_runtime_check_requests WHERE check_id=?',(check_id,)).fetchone()
+                original=json.loads(row['result_json'])
+                bound=original.get('fingerprint')
+            finally:
+                con.close()
             observed=self.operation.status()
+            if not bound or observed.get('fingerprint')!=bound:
+                # A newer operation/cache cannot satisfy an older durable
+                # intent. Reconcile the captured ownership before a new check.
+                self._save(check_id,'retained',{'fingerprint':bound,'probe':None,'grades':{},
+                    'admissible':False,'retry_allowed':False,
+                    'diagnostics':[{'code':'CHECK_CANDIDATE_CHANGED','grade':'inconclusive'}]})
+                return
             resources=observed.get('resources') or {}
             cleanup=observed.get('cleanup') or {}
             # Owner capacity and native cleanup are independent from OS exit.
@@ -139,6 +168,20 @@ class NativeChecks:
             terminal=observed.get('state')=='complete'
             admissible=bool(terminal and cleaned and self._admissible(observed))
             result={name:observed.get(name) for name in ('probe','fingerprint','grades','evidence','cleanup','observations','resources')}
+            con=db_driver.connect(str(self.database))
+            try:
+                probe,binding=self._owned_probe(con,row,original)
+            finally:
+                con.close()
+            if observed.get('probe') is not None and (probe is None or any(observed['probe'].get(key)!=probe[key] for key in ('conversation_id','generation_id'))):
+                result={name:None for name in ('probe','evidence','cleanup','observations','resources')}
+                result.update(fingerprint=bound,grades={})
+                admissible=False
+                cleaned=False
+            else:
+                result['probe']=probe
+            if binding:
+                result['probe_binding']=binding
             result.update(admissible=admissible,retry_allowed=bool(terminal and cleaned),
                           diagnostics=[{'code':observed['diagnostic'],'grade':'inconclusive'}] if observed.get('diagnostic') else [])
             self._save(check_id,'complete' if terminal and cleaned else 'retained' if terminal else 'running',result)
@@ -146,6 +189,7 @@ class NativeChecks:
     @staticmethod
     def _projection(row) -> dict:
         result=json.loads(row['result_json'])
+        result.pop('probe_binding',None)
         return {'check_id':row['check_id'],'request_key':row['request_key'],'state':row['status'],
                 'selection':json.loads(row['selection_json']),'admissible':False,'retry_allowed':False,
                 'grades':{},'diagnostics':[],'probe':None,**result}
@@ -172,18 +216,36 @@ class NativeChecks:
                     # A retained historical pass is not a claim about the
                     # latest installed source/binary or ordinary resolver.
                     result['admissible']=bool(result.get('admissible') and self._admissible(result))
+                    if con.execute("SELECT 1 FROM conversation_runtime_check_requests WHERE check_id!=? AND status!='complete' LIMIT 1",(target,)).fetchone() or con.execute("SELECT 1 FROM conversation_runtime_probe_jobs WHERE status!='complete' LIMIT 1").fetchone():
+                        result['retry_allowed']=False
                 if self.current!=target and row['status']!='complete':
-                    key=result.get('fingerprint')
-                    job=con.execute('SELECT * FROM conversation_runtime_probe_jobs WHERE fingerprint_key=?',(key,)).fetchone() if key else None
-                    chat=con.execute('SELECT runtime_projection FROM conversations WHERE conversation_id=?',(job['conversation_id'],)).fetchone() if job else None
-                    if chat and job:
-                        runtime=json.loads(chat[0])
-                        if runtime.get('generation_id')==job['generation_id']:
-                            result['probe']={'conversation_id':job['conversation_id'],'generation_id':job['generation_id'],
-                                'status':job['status'],'deadline':job['deadline'],'phase':runtime.get('state'),
-                                'setup':runtime.get('setup'),'cleanup':runtime.get('cleanup') or runtime.get('preparation_cleanup')}
+                    result['probe'],_=self._owned_probe(con,row,json.loads(row['result_json']))
                     result.update(state='retained',admissible=False,retry_allowed=False,
                                   diagnostics=[{'code':'CHECK_CONSUMER_RESTARTED','grade':'inconclusive'}])
                 return result
             finally:
                 con.close()
+
+    @staticmethod
+    def _owned_probe(con,row,result: dict) -> tuple[dict|None,dict|None]:
+        key=result.get('fingerprint')
+        job=con.execute('SELECT * FROM conversation_runtime_probe_jobs WHERE fingerprint_key=?',(key,)).fetchone() if key else None
+        chat=con.execute('SELECT c.*,s.user_id AS shell_owner FROM conversations c JOIN shells s USING(shell_id) WHERE conversation_id=?',(job['conversation_id'],)).fetchone() if job else None
+        if chat is None or job is None:
+            return None,None
+        runtime=json.loads(chat['runtime_projection'])
+        selection=json.loads(row['selection_json'])
+        binding={'conversation_id':job['conversation_id'],'generation_id':job['generation_id'],'shell_id':chat['shell_id']}
+        if (chat['owner_user_id']!=row['owner_user_id'] or chat['shell_owner']!=row['owner_user_id']
+                or chat['runtime_mode']!='native_experiment' or runtime.get('role')!='probe'
+                or runtime.get('check_id')!=row['check_id']
+                or runtime.get('generation_id')!=job['generation_id'] or chat['creation_request_hash']!=key
+                or any(chat[field]!=selection[field] for field in ('harness','model','effort'))
+                or result.get('probe_binding',binding)!=binding):
+            return None,None
+        captured=con.execute('SELECT conversation_id,owner_user_id,shell_id FROM conversation_runtime_generations WHERE generation_id=?',(job['generation_id'],)).fetchone()
+        if captured and (captured['conversation_id']!=job['conversation_id'] or captured['owner_user_id']!=row['owner_user_id'] or captured['shell_id']!=chat['shell_id']):
+            return None,None
+        return {'conversation_id':job['conversation_id'],'generation_id':job['generation_id'],
+            'status':job['status'],'deadline':job['deadline'],'phase':runtime.get('state'),
+            'setup':runtime.get('setup'),'cleanup':runtime.get('cleanup') or runtime.get('preparation_cleanup')},binding

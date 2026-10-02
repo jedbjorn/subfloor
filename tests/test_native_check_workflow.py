@@ -68,9 +68,10 @@ def test_restart_retained_request_never_discovers_or_replaces(workflow):
 def test_restart_can_read_exact_bound_probe_after_http_ack_is_lost(workflow):
     value,operation,_,calls,con=workflow
     first=value.create(1,'stable',checks.CODEX_SELECTION)
-    runtime={'role':'probe','generation_id':'owned-generation','state':'needs_consent','setup':{'setup_id':'owned-phase'}}
-    con.execute('UPDATE conversations SET runtime_projection=? WHERE conversation_id=\'cv\'',(json.dumps(runtime),))
-    con.execute("INSERT INTO conversation_runtime_probe_jobs VALUES('fp','cv','owned-generation','preparing',100,1)")
+    runtime={'role':'probe','check_id':first['check_id'],'generation_id':'owned-generation','state':'needs_consent','setup':{'setup_id':'owned-phase'}}
+    con.execute("INSERT INTO shells(shell_id,shortname,display_name,flavor,system_prompt,user_id) VALUES(2,'PROBE','Probe','dev','synthetic',1)")
+    con.execute("INSERT INTO conversations(conversation_id,shell_id,owner_user_id,harness,model,effort,worktree,creation_idempotency_key,creation_request_hash,runtime_mode,runtime_projection) VALUES('probe-cv',2,1,'codex','gpt-6.1-sol','high','/synthetic/probe','probe-key','fp','native_experiment',?)",(json.dumps(runtime),))
+    con.execute("INSERT INTO conversation_runtime_probe_jobs VALUES('fp','probe-cv','owned-generation','preparing',100,1)")
     con.commit()
     result=checks.NativeChecks(operation).get(1,request_key='stable')
     assert result['check_id']==first['check_id']
@@ -137,3 +138,59 @@ def test_failed_discovery_only_releases_intent_after_empty_completed_begin(workf
     operation.owner.allocating.add('pending')
     second=value.create(1,'second',checks.CODEX_SELECTION)
     assert second['state']=='retained' and not second['retry_allowed']
+
+
+def test_replacement_operation_cannot_rebind_original_check_or_admit_it(workflow):
+    value,operation,report,_,con=workflow
+    first=value.create(1,'first',checks.CODEX_SELECTION)
+    report.update(state='complete',fingerprint='replacement',grades={'submission':'compatible'},
+        cleanup={'unit_verified_exited':True,'native_outcome':'complete'},
+        resources={'owned_capacity_released':True,'owner_allocating':False,'owner_closing':False})
+    operation.seat.candidate_fingerprint=lambda **_:SimpleNamespace(key='replacement')
+    result=value.get(1,check_id=first['check_id'])
+    assert result['fingerprint']=='fp' and not result['admissible'] and not result['retry_allowed']
+    with pytest.raises(RuntimeContractError) as exc:
+        value._save(first['check_id'],'complete',{'fingerprint':'replacement','admissible':True})
+    assert exc.value.code=='CHECK_CANDIDATE_CHANGED'
+    assert json.loads(con.execute('SELECT result_json FROM conversation_runtime_check_requests').fetchone()[0])['fingerprint']=='fp'
+
+
+@pytest.mark.parametrize('change',['owner','shell_owner','mode','role','generation','check','candidate'])
+def test_restart_refuses_unbound_or_foreign_probe_descriptor(workflow,change):
+    value,operation,_,_,con=workflow
+    first=value.create(1,'first',checks.CODEX_SELECTION)
+    con.execute("INSERT INTO users(user_id,username) VALUES(2,'foreign')")
+    con.execute("INSERT INTO shells(shell_id,shortname,display_name,flavor,system_prompt,user_id) VALUES(2,'P','Probe','dev','synthetic',?)",(2 if change=='shell_owner' else 1,))
+    runtime={'role':'probe','check_id':first['check_id'],'generation_id':'probe-gen','state':'needs_consent','setup':{'setup_id':'scoped'}}
+    if change=='role':runtime['role']='chat'
+    if change=='generation':runtime['generation_id']='replacement'
+    if change=='check':runtime['check_id']='another-check'
+    con.execute("INSERT INTO conversations(conversation_id,shell_id,owner_user_id,harness,model,effort,worktree,creation_idempotency_key,creation_request_hash,runtime_mode,runtime_projection) VALUES('probe-cv',2,?,'codex','gpt-6.1-sol','high','/synthetic/probe','probe-key',?,?,?)",
+        (2 if change=='owner' else 1,'other' if change=='candidate' else 'fp','ephemeral' if change=='mode' else 'native_experiment',json.dumps(runtime)))
+    con.execute("INSERT INTO conversation_runtime_probe_jobs VALUES('fp','probe-cv','probe-gen','preparing',100,1)");con.commit()
+    result=checks.NativeChecks(operation).get(1,request_key='first')
+    assert result['probe'] is None and not result['admissible'] and not result['retry_allowed']
+
+
+def test_historical_retry_waits_for_newer_check_to_finish(workflow):
+    value,_,report,_,_=workflow
+    first=value.create(1,'first',checks.CODEX_SELECTION)
+    report.update(state='complete',fingerprint='fp',grades={'submission':'compatible'},
+        cleanup={'unit_verified_exited':True,'native_outcome':'complete'},
+        resources={'owned_capacity_released':True,'owner_allocating':False,'owner_closing':False})
+    assert value.get(1,check_id=first['check_id'])['retry_allowed']
+    report.update(state='running',grades={},cleanup={},resources={})
+    value.create(1,'second',checks.CODEX_SELECTION)
+    assert not value.get(1,check_id=first['check_id'])['retry_allowed']
+
+
+def test_old_consumer_cannot_regress_completed_check_cleanup(workflow):
+    value,_,report,_,con=workflow
+    first=value.create(1,'first',checks.CODEX_SELECTION)
+    report.update(state='complete',fingerprint='fp',grades={'submission':'compatible'},
+        cleanup={'unit_verified_exited':True,'native_outcome':'complete'},
+        resources={'owned_capacity_released':True,'owner_allocating':False,'owner_closing':False})
+    value.get(1,check_id=first['check_id'])
+    saved=con.execute('SELECT status,result_json FROM conversation_runtime_check_requests').fetchone()
+    value._save(first['check_id'],'retained',{'fingerprint':'fp','probe':None,'retry_allowed':False})
+    assert tuple(con.execute('SELECT status,result_json FROM conversation_runtime_check_requests').fetchone())==tuple(saved)

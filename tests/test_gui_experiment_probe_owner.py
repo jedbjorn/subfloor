@@ -11,17 +11,20 @@ import pytest
 
 ROOT=Path(__file__).resolve().parents[1]
 sys.path[:0]=[str(ROOT/'.super-coder/scripts'),str(ROOT/'.super-coder/api')]
-from test_native_chat_ownership import database  # noqa: F401
-
 from conversation_native_chats import NativeChatsService
 from conversation_runtime_checks import Fingerprint
-from conversation_runtime_contract import ExecutableBinding, RuntimeContext, RuntimeContractError
+from conversation_runtime_contract import (
+    ExecutableBinding,
+    RuntimeContext,
+    RuntimeContractError,
+)
 from gui_experiment_probe_owner import NativeProbeOwner
+from test_native_chat_ownership import database  # noqa: F401
 
 
 @pytest.fixture
-def owner(database,monkeypatch):
-    path,con=database
+def owner(request,monkeypatch):
+    path,con=request.getfixturevalue('database')
     executable=ExecutableBinding(Path('/bin/true'),'a'*64,'test')
     fingerprint=Fingerprint('codex',executable,'test','b'*64,'openai','selected','high','b'*64,'c'*64)
     events=[]
@@ -31,7 +34,7 @@ def owner(database,monkeypatch):
         try:return connection.execute(sql,values).fetchone()
         finally:connection.close()
     class Supervisor:
-        units=[]
+        def __init__(self):self.units=[]
         def preparation_identity(self): return {'pid':123,'start_ticks':456,'unit':'fixed-api','control_group':'/fixed-api'}
         def launch(self,generation):
             assert query('SELECT generation_id FROM conversation_runtime_generations WHERE generation_id=?',(generation,))
@@ -81,6 +84,21 @@ def test_owned_probe_is_distinct_and_only_finite_grants_allow_start(owner):
     con.execute("UPDATE shells SET current_state='nonce' WHERE shell_id=?",(probe.shell_id,));con.commit()
     assert probe.observe_marker('nonce',time.monotonic()+2)
     assert not probe.observe_marker('nonce',time.monotonic()-1)
+
+
+def test_http_check_intent_is_bound_before_probe_preparation(owner):
+    value,fingerprint,con,_=owner
+    selection={'harness':fingerprint.harness,'model':fingerprint.model,'effort':fingerprint.effort}
+    con.execute("INSERT INTO conversation_runtime_check_requests VALUES('check',1,'key','hash',?,'accepted',?,1,1)",
+        (json.dumps(selection),json.dumps({'fingerprint':fingerprint.key})));con.commit()
+    prepare=value.seat.prepare
+    def bound_prepare(cid,generation,**kwargs):
+        runtime=json.loads(con.execute('SELECT runtime_projection FROM conversations WHERE conversation_id=?',(cid,)).fetchone()[0])
+        assert runtime['check_id']=='check'
+        return prepare(cid,generation,**kwargs)
+    value.seat.prepare=bound_prepare
+    probe=value.allocate(fingerprint,frozenset({'submission'}),time.monotonic()+30)
+    assert probe.context.conversation_id!='cv'
 
 
 def test_native_probe_cleanup_requires_retained_native_result_and_owned_os_exit(owner):
@@ -237,7 +255,10 @@ def test_stale_cleanup_cannot_complete_replacement_job_or_release_its_fence(owne
 def test_real_checker_factory_entry_accepts_owned_common_fixture_boundary(owner,monkeypatch):
     from conversation_runtime_checks import CompatibilityChecker
     from conversation_runtime_contract import DriverStart, NativeCleanup
-    from conversation_runtime_native_probes import ControllerProbeDriver, NativeProbeFactory
+    from conversation_runtime_native_probes import (
+        ControllerProbeDriver,
+        NativeProbeFactory,
+    )
     value,fingerprint,_,_=owner
     reached=[]
     def unavailable(driver,context,emit,*,deadline):

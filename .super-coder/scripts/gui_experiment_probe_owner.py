@@ -97,6 +97,12 @@ class NativeProbeOwner:
                     projection={'role':'probe','generation_id':generation,'state':'preparing','capabilities':{},
                                 'setup':None,'partial':True,'freshness':'unknown','preparation_owner':preparation_owner,
                                 'check_deadline':time.time()+max(0,deadline-time.monotonic())}
+                    requests=con.execute("SELECT check_id,owner_user_id,selection_json FROM conversation_runtime_check_requests WHERE status IN ('accepted','running') AND json_extract(result_json,'$.fingerprint')=?",(fingerprint.key,)).fetchall()
+                    if requests:
+                        if (len(requests)!=1 or requests[0]['owner_user_id']!=1
+                                or json.loads(requests[0]['selection_json'])!={'harness':fingerprint.harness,'model':fingerprint.model,'effort':fingerprint.effort}):
+                            raise RuntimeContractError('CHECK_INTENT_INVALID','probe does not match exactly one owned check intent')
+                        projection['check_id']=requests[0]['check_id']
                     con.execute("INSERT INTO conversations(conversation_id,shell_id,owner_user_id,harness,provider,model,effort,worktree,creation_idempotency_key,creation_request_hash,runtime_mode,route_contract_version,route_binding,runtime_projection) VALUES(?,?,1,?,?,?,?,?,?,?,'native_experiment',2,?,?)",
                         (cid,shell,fingerprint.harness,fingerprint.provider,fingerprint.model,fingerprint.effort,str(worktree),cid,fingerprint.key,encoded(binding),encoded(projection)))
                     con.execute('INSERT OR REPLACE INTO conversation_runtime_probe_jobs VALUES(?,?,?,\'preparing\',?,?)',
