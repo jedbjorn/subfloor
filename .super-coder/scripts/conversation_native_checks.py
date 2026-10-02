@@ -199,12 +199,23 @@ class NativeChecks:
             finally:
                 con.close()
             if observed.get('probe') is not None and (probe is None or any(observed['probe'].get(key)!=probe[key] for key in ('conversation_id','generation_id'))):
-                result={name:None for name in ('probe','evidence','cleanup','observations','resources')}
+                result={name:None for name in ('probe','evidence','cleanup','observations','resources','behavior_witness')}
                 result.update(fingerprint=bound,grades={})
                 admissible=False
                 cleaned=False
             else:
                 result['probe']=probe
+            # Optional diagnostic evidence is scoped to the same captured
+            # candidate/check/probe. It never contributes to grades/admission.
+            witness=observed.get('behavior_witness')
+            observed_probe=observed.get('probe')
+            if (binding and probe and isinstance(observed_probe,dict)
+                    and all(observed_probe.get(key)==probe[key] for key in ('conversation_id','generation_id'))
+                    and isinstance(witness,dict)):
+                from gui_experiment_runtime import semantic_witness
+                result['behavior_witness']=semantic_witness(witness)
+            else:
+                result['behavior_witness']=None
             if binding:
                 result['probe_binding']=binding
             result.update(admissible=admissible,retry_allowed=bool(terminal and cleaned),
@@ -215,6 +226,14 @@ class NativeChecks:
     def _projection(row) -> dict:
         result=json.loads(row['result_json'])
         result.pop('probe_binding',None)
+        if isinstance(result.get('behavior_witness'),dict):
+            from gui_experiment_runtime import semantic_witness
+            result['behavior_witness']=semantic_witness(result['behavior_witness'])
+            result['behavior_witness_observation']='historical_check' if row['status']=='complete' else 'recorded_check'
+        else:
+            if 'behavior_witness' in result:
+                result['behavior_witness']=None
+            result.pop('behavior_witness_observation',None)
         return {'check_id':row['check_id'],'request_key':row['request_key'],'state':row['status'],
                 'selection':json.loads(row['selection_json']),'admissible':False,'retry_allowed':False,
                 'grades':{},'diagnostics':[],'probe':None,**result}
@@ -237,6 +256,11 @@ class NativeChecks:
             try:
                 row=con.execute('SELECT * FROM conversation_runtime_check_requests WHERE check_id=?',(target,)).fetchone()
                 result=self._projection(row)
+                if result.get('behavior_witness') is not None:
+                    observed_probe,binding=self._owned_probe(con,row,json.loads(row['result_json']))
+                    if observed_probe is None or not binding:
+                        result['behavior_witness']=None
+                        result['behavior_witness_observation']='unavailable'
                 if row['status']=='complete':
                     # A retained historical pass is not a claim about the
                     # latest installed source/binary or ordinary resolver.
