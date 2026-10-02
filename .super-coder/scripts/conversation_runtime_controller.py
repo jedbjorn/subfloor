@@ -7,10 +7,12 @@ The enclosing owned user-systemd unit is the independent final cleanup backstop.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import dataclasses
 import importlib
 import importlib.util
 import json
+import math
 import os
 import queue
 import socket
@@ -288,6 +290,8 @@ class Controller:
         results: queue.Queue = queue.Queue(maxsize=1)
         def run():
             try:
+                if time.monotonic()>=deadline:
+                    raise RuntimeContractError('DEADLINE_EXPIRED','native operation expired before dispatch')
                 results.put((True,operation()))
             except (RuntimeError,OSError,ValueError,TypeError) as exc:
                 results.put((False,exc))
@@ -302,6 +306,17 @@ class Controller:
             raise result
         return result
 
+    @contextlib.contextmanager
+    def admission(self,lock,deadline):
+        if not lock.acquire(timeout=max(0,deadline-time.monotonic())):
+            raise RuntimeContractError('DEADLINE_EXPIRED','command expired waiting for dispatch admission')
+        try:
+            if time.monotonic()>=deadline:
+                raise RuntimeContractError('DEADLINE_EXPIRED','command expired before dispatch admission')
+            yield
+        finally:
+            lock.release()
+
     def emit(self, event: RuntimeEvent) -> None:
         try:
             if self.identity and event.reference and event.reference.root_id != self.identity.root_id:
@@ -315,6 +330,10 @@ class Controller:
         if value.get("generation") != self.generation or value.get("contract") != CONTRACT_REVISION:
             raise RuntimeContractError("GENERATION_INVALID", "private protocol generation/contract mismatch")
         op = value.get("op")
+        timeout=value.get('timeout',30 if op=='open' else 5)
+        if isinstance(timeout,bool) or not isinstance(timeout,(int,float)) or not math.isfinite(timeout) or not 0<timeout<=120:
+            raise RuntimeContractError('DEADLINE_INVALID','positive finite timeout at most 120 seconds required')
+        deadline=time.monotonic()+timeout
         if op == "attach":
             self.journal.lease(str(value["consumer"]),int(value["fence"]),float(value["expires"]))
             return self.status()
@@ -324,7 +343,8 @@ class Controller:
             return dict(self.driver.asset(value["payload"],peer=peer,deadline=time.monotonic()+min(float(value.get("timeout",1)),5)))
         self.journal.check_lease(str(value.get("consumer","")),int(value.get("fence",0)))
         if op == "open":
-            with self.dispatch_lock:
+            with self.admission(self.dispatch_lock,deadline):
+                self.journal.check_lease(str(value.get("consumer","")),int(value.get("fence",0)))
                 if self.context is not None:
                     if payload_digest(value["context"]) != self.context_digest:
                         raise RuntimeContractError("GENERATION_CONFLICT", "prepared generation binding changed")
@@ -338,7 +358,6 @@ class Controller:
                 # this set or the full environment in the journal/receipt.
                 self.journal.secrets = tuple(v for k,v in context.env.items() if v and any(
                     s in k.upper() for s in ("TOKEN","SECRET","API_KEY","PASSWORD","CREDENTIAL","AUTHORIZATION")))
-                deadline=time.monotonic()+min(float(value.get("timeout",30)),120)
                 started = self.call(lambda:self.driver.start(context,self.emit,deadline=deadline),deadline=deadline)
                 self.identity = started.identity
                 self.ready = started.state == "ready" and self.identity is not None
@@ -351,7 +370,7 @@ class Controller:
             self.journal.ack(int(value["sequence"]))
             return {"acknowledged":value["sequence"]}
         if op == "snapshot":
-            deadline=time.monotonic()+5
+            deadline=min(deadline,time.monotonic()+5)
             snapshot=self.call(lambda:self.driver.inventory(deadline=deadline),deadline=deadline)
             return public_payload(dataclasses.asdict(snapshot),sensitive_values=self.journal.secrets)
         if op not in {"submit","control","close"}:
@@ -379,12 +398,11 @@ class Controller:
             native_control = NativeControl(**(command|{"target":reference(command.get("target"))}))
         # Close is independent of the regular dispatch lock/native RPC future.
         lock = threading.Lock() if closing else self.dispatch_lock
-        with lock:
+        with self.admission(lock,deadline):
             self.journal.check_lease(str(value.get("consumer","")),int(value.get("fence",0)))
             duplicate = self.journal.reserve_command(cid,ordinal,digest,"submit" if op=="submit" else "control",closing=closing)
             if duplicate:
                 return duplicate
-            deadline = time.monotonic()+min(float(value.get("timeout",5)),120)
             if closing:
                 cleanup_deadline=min(deadline,time.monotonic()+5)
                 try:
@@ -412,8 +430,14 @@ class Controller:
                     try:
                         def submit_edge():
                             self.journal.check_lease(str(value.get("consumer","")),int(value.get("fence",0)))
-                            return WriteReceipt("not_written",detail="Close fenced pending native write") if self.journal.get("close") else self.driver.submit(submission,deadline=deadline)
+                            if self.journal.get('close') or time.monotonic()>=deadline:
+                                return WriteReceipt('not_written',detail='Close or deadline fenced pending native write')
+                            return self.driver.submit(submission,deadline=deadline)
                         result = self.call(submit_edge,deadline=deadline)
+                    except RuntimeContractError as exc:
+                        if exc.code not in {'DEADLINE_EXPIRED','NATIVE_BUSY','LEASE_FENCED'}:
+                            raise
+                        result=WriteReceipt('not_written',detail='controller refused before native dispatch: '+exc.code)
                     except (RuntimeError, OSError, TimeoutError):
                         result = WriteReceipt("unknown",detail="native write outcome ambiguous; no replay")
                     if result.state in {"not_written","rejected","unsupported"} and self.journal.get("primary")=="request:"+cid:
@@ -430,8 +454,14 @@ class Controller:
                     try:
                         def control_edge():
                             self.journal.check_lease(str(value.get("consumer","")),int(value.get("fence",0)))
+                            if self.journal.get('close') or time.monotonic()>=deadline:
+                                return WriteReceipt('not_written',detail='Close or deadline fenced pending native control')
                             return self.driver.control(native_control,deadline=deadline)
                         result = self.call(control_edge,deadline=deadline)
+                    except RuntimeContractError as exc:
+                        if exc.code not in {'DEADLINE_EXPIRED','NATIVE_BUSY','LEASE_FENCED'}:
+                            raise
+                        result=WriteReceipt('not_written',detail='controller refused before native dispatch: '+exc.code)
                     except (RuntimeError, OSError, TimeoutError):
                         result = WriteReceipt("unknown",detail="native control outcome ambiguous")
             self.journal.receipt(cid,result)

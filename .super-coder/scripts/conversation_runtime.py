@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import math
 import os
 import socket
 import struct
@@ -140,7 +141,7 @@ class RuntimeStore:
             state=result.get("state","unknown")
             if state not in {"accepted","written","processed","terminal","unknown","not_written","unsupported","rejected"}:
                 state="unknown"
-            con.execute("UPDATE conversation_runtime_commands SET receipt_json=?,state=CASE WHEN state IN ('terminal','processed') THEN state ELSE ? END WHERE generation_id=? AND command_id=?",(encoded(public_payload(result,sensitive_values=self.secrets)),state,generation,cid))
+            con.execute("UPDATE conversation_runtime_commands SET receipt_json=CASE WHEN state IN ('terminal','processed') THEN receipt_json ELSE ? END,state=CASE WHEN state IN ('terminal','processed') THEN state ELSE ? END WHERE generation_id=? AND command_id=?",(encoded(public_payload(result,sensitive_values=self.secrets)),state,generation,cid))
             con.commit()
         finally:
             con.close()
@@ -189,9 +190,14 @@ class RuntimeStore:
                     con.execute("INSERT INTO conversation_runtime_work VALUES(?,?,?,?) ON CONFLICT(generation_id,work_key) DO UPDATE SET projection_json=excluded.projection_json,last_sequence=excluded.last_sequence",(generation,key,encoded(event),sequence))
                 cid=event.get("request_id") or event.get("control_id")
                 if cid:
-                    state="terminal" if event["kind"]=="activity.terminal" else "processed" if event["kind"]=="activity.processed" else None
+                    final_control=event['kind']=='control.outcome' and event['data'].get('outcome') in {'complete','failed','unsupported','rejected'}
+                    state="terminal" if event["kind"]=="activity.terminal" or final_control else "processed" if event["kind"]=="activity.processed" else None
                     if state:
-                        con.execute("UPDATE conversation_runtime_commands SET state=? WHERE generation_id=? AND command_id=? AND (state<>'terminal' OR ?='terminal')",(state,generation,cid,state))
+                        if final_control:
+                            con.execute("UPDATE conversation_runtime_commands SET state='terminal',receipt_json=? WHERE generation_id=? AND command_id=? AND state<>'terminal'",
+                                        (encoded({'state':'terminal',**event['data']}),generation,cid))
+                        else:
+                            con.execute("UPDATE conversation_runtime_commands SET state=? WHERE generation_id=? AND command_id=? AND (state<>'terminal' OR ?='terminal')",(state,generation,cid,state))
                 if project is not None:
                     project(con,row["conversation_id"],sequence,event)
                 last=sequence
@@ -237,7 +243,9 @@ class RuntimeClient:
         self.lease: dict[str,Any]={}
 
     def request(self,op: str, *, timeout: float=10,**fields) -> dict:
-        value={"op":op,"generation":self.generation,"contract":CONTRACT_REVISION,**self.lease,**fields}
+        if isinstance(timeout,bool) or not isinstance(timeout,(int,float)) or not math.isfinite(timeout) or not 0<timeout<=120:
+            raise RuntimeContractError('DEADLINE_INVALID','positive finite timeout at most 120 seconds required')
+        value={"op":op,"generation":self.generation,"contract":CONTRACT_REVISION,**self.lease,**fields,"timeout":timeout}
         raw=(encoded(value)+"\n").encode()
         if len(raw)>MAX_FRAME_BYTES:
             raise RuntimeContractError("FRAME_TOO_LARGE", "private command exceeds frame bound")
@@ -278,19 +286,26 @@ class RuntimeClient:
         except RuntimeContractError as exc:
             if exc.code=="COMMAND_COMPACTED":
                 result=store.command_status(self.generation,owner,shell,cid)|{"duplicate":True,"compacted":True}
-            elif exc.code in {"BACKPRESSURE","LEASE_FENCED","RUNTIME_CLOSING","NATIVE_BUSY"}:
+            elif exc.code in {"BACKPRESSURE","LEASE_FENCED","RUNTIME_CLOSING","NATIVE_BUSY","DEADLINE_EXPIRED"}:
                 result={"state":"not_written","code":exc.code,"detail":"controller proved refusal before native dispatch"}
             else:
                 result={"state":"unknown","code":exc.code,"detail":"controller outcome unavailable; retain stable intent"}
         except OSError:
             result={"state":"unknown","detail":"controller response unavailable; stable intent must never be replayed as new"}
-        store.receipt(self.generation,owner,shell,cid,result)
+        if not result.get('compacted'):
+            store.receipt(self.generation,owner,shell,cid,result)
         return result
 
     def control(self,store: RuntimeStore,owner: int,shell: int,cid: str, *, closing: bool=False,**payload) -> dict:
         command=store.intent(self.generation,owner,shell,self.lease,cid,"close" if closing else "control",payload)
-        result=self.request("close" if closing else "control",command=command)
-        store.receipt(self.generation,owner,shell,cid,result)
+        try:
+            result=self.request("close" if closing else "control",command=command)
+        except RuntimeContractError as exc:
+            if exc.code!='COMMAND_COMPACTED':
+                raise
+            result=store.command_status(self.generation,owner,shell,cid)|{"duplicate":True,"compacted":True}
+        if not result.get('compacted'):
+            store.receipt(self.generation,owner,shell,cid,result)
         return result
 
     def subscribe(self,store: RuntimeStore,owner: int,shell: int, *, project: Callable | None=None) -> dict:
