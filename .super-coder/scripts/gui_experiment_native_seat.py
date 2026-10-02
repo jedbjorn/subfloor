@@ -101,6 +101,21 @@ class NativeFixtureSeat:
         # canonical policy and fixed fixture tool schema remain part of identity.
         return payload_digest({'adapter':adapter,'fixture_mcp':{'revision':1,'tools':['fixture_identity','fixture_state']}})
 
+    def candidate_fingerprint(self,harness: str,model: str,effort: str) -> Fingerprint:
+        """Capture requested transport identity, without claiming availability."""
+        if (harness not in {'codex','claude'} or not isinstance(model,str) or not 1<=len(model)<=255
+                or not isinstance(effort,str) or not 1<=len(effort)<=255):
+            raise RuntimeContractError('NATIVE_ROUTE_INCONCLUSIVE','bounded selected candidate required')
+        observer=self.observers.get(harness)
+        observed=observer.observe() if observer else None
+        if observed is None or observed.binding is None:
+            raise RuntimeContractError('NATIVE_EXECUTABLE_INCONCLUSIVE','candidate installed identity unavailable')
+        driver=importlib.import_module(f'conversation_adapters.{harness}_runtime')
+        revision=driver.DRIVER_REVISION if harness=='codex' else driver.REVISION
+        policy=self.settings_digest(harness)
+        return Fingerprint(harness,observed.binding,revision,policy,'openai' if harness=='codex' else 'anthropic',
+                           model,effort,policy,self.implementation_digest(harness))
+
     def prepare(self,conversation_id: str,generation_id: str, *, probe_capabilities: tuple[str,...]=()) -> tuple[RuntimeContext,Fingerprint,dict]:
         con=db_driver.connect(str(self.database))
         try:
@@ -130,6 +145,7 @@ class NativeFixtureSeat:
                                 (conversation_id,generation_id)).fetchone()
                 if (not probe_capabilities or 'submission' not in probe_capabilities
                         or json.loads(row['runtime_projection']).get('role')!='probe'
+                        or json.loads(row['runtime_projection']).get('state') in {'closing','closed','preparation_inconclusive'}
                         or job is None or job['status']!='preparing' or job['deadline']<=time.time()
                         or job['fingerprint_key']!=binding['evidence_digest']):
                     raise RuntimeContractError('PROBE_ROUTE_ONLY','pending native selection is exclusive to its registered finite probe')

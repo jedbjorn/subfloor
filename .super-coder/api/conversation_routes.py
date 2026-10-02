@@ -1987,6 +1987,8 @@ def _create_message(con, operator: dict, conversation_id: str, headers, body: di
             if conversation['state']=='closed':
                 raise ApiError(409,'NATIVE_CHAT_CLOSED','closed native history cannot start a replacement generation')
             runtime = conversation_native_chats.projection(conversation) or {}
+            if runtime.get('role')=='probe':
+                raise ApiError(409,'PROBE_INPUT_UNAVAILABLE','finite compatibility probe accepts only scoped setup and Close')
             if (conversation_native_chats._SERVICE is None or runtime.get('state')!='ready'
                     or runtime.get('capabilities',{}).get('submission')!='compatible'):
                 raise ApiError(409,'NATIVE_INPUT_UNAVAILABLE','native startup and checked submission coverage are required before input')
