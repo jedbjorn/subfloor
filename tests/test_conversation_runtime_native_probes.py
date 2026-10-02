@@ -146,6 +146,41 @@ def test_unknown_write_retains_intent_never_replayed_and_close_fences_later_inpu
     late=driver.submit(NativeSubmission('later',2,'digest','finite'),deadline=time.monotonic()+1)
     assert late.state=='not_written' and 'later' not in owned.store.commands
 
+
+@pytest.mark.parametrize('owner_still_verified',[True,False])
+def test_repeated_cleanup_retains_native_close_and_rechecks_owner_os_proof(owned,owner_still_verified):
+    owner_calls=[]
+    def cleanup(fp,end):
+        owner_calls.append(fp.key)
+        return CleanupProof(True if len(owner_calls)==1 else owner_still_verified,'complete')
+    factory=NativeProbeFactory(lambda *args:owned,cleanup);fp=fingerprint(owned)
+    session=factory.reserve(fp,frozenset({'submission'}),deadline=time.monotonic()+2)
+    session.driver.start(owned.context,lambda e:None,deadline=time.monotonic()+2)
+    assert factory.cleanup(fp,deadline=time.monotonic()+1).complete
+    original=owned.client.request
+    def exited(op,**fields):
+        if op=='close':raise OSError('owned controller already exited')
+        return original(op,**fields)
+    owned.client.request=exited
+    second=factory.cleanup(fp,deadline=time.monotonic()+1)
+    assert second.complete is owner_still_verified and second.native_outcome=='complete'
+    assert len(owner_calls)==2 and sum(op=='close' for op,_,_ in owned.client.calls)==1
+
+
+def test_concurrent_cleanup_uses_single_proved_native_close(owned):
+    driver=start(owned);entered,release=threading.Event(),threading.Event()
+    original=owned.client.request;close_calls=[];results=[]
+    def blocked(op,**fields):
+        if op=='close':
+            close_calls.append(op);entered.set();assert release.wait(1)
+        return original(op,**fields)
+    owned.client.request=blocked
+    first=threading.Thread(target=lambda:results.append(driver.cleanup(deadline=time.monotonic()+2)))
+    second=threading.Thread(target=lambda:results.append(driver.cleanup(deadline=time.monotonic()+2)))
+    first.start();assert entered.wait(1);second.start();release.set();first.join(2);second.join(2)
+    assert len(close_calls)==1 and len(results)==2 and all(r.outcome=='complete' for r in results)
+
+
 @pytest.mark.parametrize('missing',['memory','marker'])
 def test_native_prompts_require_actual_memory_and_physical_marker_observation(owned,missing):
     if missing=='memory': owned.client.memory=False
