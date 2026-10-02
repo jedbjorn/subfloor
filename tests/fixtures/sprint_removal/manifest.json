@@ -176,7 +176,10 @@
     ".super-coder/migrations/0276_native_wake_quiet.sql",
     ".super-coder/scripts/conversation_native_chats.py",
     ".super-coder/scripts/sprint_native_wakes.py",
-    "tests/test_native_sprint_wakes.py"
+    "tests/test_native_sprint_wakes.py",
+    ".super-coder/migrations/0277_native_sprint_lifecycle.sql",
+    ".super-coder/scripts/sprint_native_lifecycle.py",
+    "tests/test_native_sprint_lifecycle.py"
   ],
   "baseline_migration_ledger": {
     "count": 142,
@@ -423,7 +426,10 @@
     "docs/environment.md",
     ".super-coder/scripts/conversation_native_chats.py",
     ".super-coder/scripts/sprint_native_wakes.py",
-    "tests/test_native_sprint_wakes.py"
+    "tests/test_native_sprint_wakes.py",
+    ".super-coder/scripts/sprint_native_lifecycle.py",
+    "tests/test_native_sprint_lifecycle.py",
+    ".super-coder/scripts/active_chat_registry.py"
   ],
   "decision": 33,
   "generation_markers": {

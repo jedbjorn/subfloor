@@ -1250,6 +1250,9 @@ class SprintCleanupExecutor:
                 "sprint_not_completed",
                 "cleanup target no longer belongs to a completed Sprint",
             )
+        import sprint_native_lifecycle
+        if not sprint_native_lifecycle.developer_cleanup_complete(self.con,claim.sprint_id):
+            raise SprintCleanupSafetyError('native_cleanup_pending','Developer native ownership/definitions or preparation remain unresolved')
         self._validate_repository_identity(claim)
         self._validate_artifact_identity(claim)
 

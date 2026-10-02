@@ -65,6 +65,11 @@ def native_cleanup_pending(con, shell_id: int) -> str | None:
             return 'unresolved-preparation'
         if projection.get('preparation_owner') and projection.get('generation_id'):
             return str(projection['generation_id'])
+    table=con.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='sprint_native_lifecycle_intents'").fetchone()
+    if table:
+        obligation=con.execute("SELECT intent_id FROM sprint_native_lifecycle_intents WHERE shell_id=? AND action='close' AND state!='terminal' LIMIT 1",(shell_id,)).fetchone()
+        if obligation:
+            return str(obligation['intent_id'])
     return None
 
 

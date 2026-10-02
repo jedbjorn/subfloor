@@ -15,6 +15,7 @@ from typing import Any
 
 import sprint_cleanup
 import sprint_health
+import sprint_native_lifecycle
 import sprint_native_selection
 import sprint_runtime
 
@@ -1071,6 +1072,7 @@ class SprintBoardProjection:
             "column_counts": counts,
             "runtime": runtime,
             "pickup": pickup,
+            "native_lifecycle":sprint_native_lifecycle.projection(self.con,sprint_id),
             "health": health["health"],
             "health_messages": health_messages,
             "cleanup": {
