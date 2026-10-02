@@ -251,6 +251,19 @@ def test_dataclass_history_is_not_positive_owner_issuance_at_reservation(seat):
     assert seat.con.execute('SELECT COUNT(*) FROM conversation_runtime_generations').fetchone()[0]==1
 
 
+@pytest.mark.parametrize('deleted',[False,True])
+def test_issued_history_intent_cannot_reserve_fresh_context(seat,deleted):
+    _,result=request();cid=result['conversation']['conversation_id'];generation=result['conversation']['runtime']['generation_id']
+    if deleted:
+        seat.con.execute('DELETE FROM conversation_native_history WHERE conversation_id=?',(cid,));seat.con.commit()
+    context=RuntimeContext(generation,cid,1,1,'codex',seat.root/'state',seat.worktree,
+        seat.fp.executable,seat.fp.driver_revision,'f'*64,seat.fp.policy_digest,'unrestricted',
+        provider='openai',model='selected-model',effort='high',capability_evidence={'submission':'compatible'})
+    with pytest.raises(RuntimeContractError,match='continuation'):
+        RuntimeStore(seat.path).reserve(context,{'fingerprint':seat.fp.key})
+    assert seat.con.execute('SELECT COUNT(*) FROM conversation_runtime_generations').fetchone()[0]==1
+
+
 def test_immediate_close_releases_issued_but_never_allocated_continuation(seat):
     _,result=request()
     destination=result['conversation'];cid=destination['conversation_id']
