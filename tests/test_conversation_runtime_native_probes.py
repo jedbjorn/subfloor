@@ -22,6 +22,7 @@ from conversation_runtime_contract import (
     RuntimeContext,
     RuntimeContractError,
     RuntimeEvent,
+    StartupConsent,
     payload_digest,
 )
 from conversation_runtime_native_probes import (
@@ -250,4 +251,155 @@ def test_root_interrupt_break_preserves_finished_submission_grade(owned):
     result = NativeProbeFactory._exercise(driver, frozenset({"submission", "stop_reply"}), time.monotonic()+3)
     assert result["submission"].grade == "compatible"
     assert result["stop_reply"].grade == "incompatible"
+    driver.cleanup(deadline=time.monotonic()+1)
+
+
+class SetupClient(Client):
+    def __init__(self, context):
+        super().__init__(context)
+        self.confirmed = threading.Event()
+        self.setup = dataclasses.asdict(StartupConsent(context.generation_id, 'observed-phase',
+            context.executable.sha256, context.driver_revision, 'a'*64, time.time()))
+        self.status_generation = context.generation_id
+        self.closed = False
+
+    def request(self, op, *, timeout, **fields):
+        if op in {'open', 'status'}:
+            self.calls.append((op, fields, timeout))
+            identity = self.identity()
+            if op == 'open':
+                return {'state': 'needs_consent', 'identity': identity, 'setup': self.setup}
+            identity['protocol']['native_route'] = {'account_type': 'claude.ai',
+                'model': self.context.model, 'efforts': [self.context.effort], 'catalogue_observed': False}
+            return {'generation': self.status_generation, 'ready': self.confirmed.is_set(),
+                'lost': False, 'identity': identity,
+                'setup': None if self.confirmed.is_set() else self.setup,
+                # Acknowledged confirmation alone must not admit inference.
+                'setup_confirmation': {'setup_id': self.setup['setup_id'], 'control_id': 'external-owner'}}
+        if op == 'close':
+            self.closed = True
+        return super().request(op, timeout=timeout, **fields)
+
+
+def setup_owned(owned, **callbacks):
+    context = replace(owned.context, harness='claude', model='selected-native', provider='anthropic')
+    return replace(owned, context=context, client=SetupClient(context), **callbacks)
+
+
+def test_setup_wait_drains_journal_without_input_and_reports_actual_ready_metadata(owned):
+    updates, identities, result = [], [], []
+    scope = setup_owned(owned, on_setup=updates.append, on_identity=identities.append)
+    driver = ControllerProbeDriver(scope)
+    thread = threading.Thread(target=lambda: result.append(driver.start(scope.context, lambda _: None,
+        deadline=time.monotonic()+2)))
+    thread.start()
+    until = time.monotonic()+1
+    while not updates and time.monotonic()<until: time.sleep(.01)
+    assert updates and updates[0].generation_id == scope.context.generation_id
+    scope.client.event('output.final', NativeReference('root', 'root', activity_id='setup-turn', item_id='reply'), text='observed')
+    while not driver.events and time.monotonic()<until: time.sleep(.01)
+    assert driver.events and driver._reader.is_alive()
+    assert driver.submit(NativeSubmission('too-early', 1, 'digest', 'ordinary input'),
+        deadline=time.monotonic()+1).state == 'not_written'
+    assert not scope.store.commands and not any(c[0] == 'control' for c in scope.client.calls)
+    scope.client.confirmed.set()  # Owner's independently scoped operator action.
+    thread.join(1)
+    assert result[0].state == 'ready' and updates[-1] is None
+    assert identities[0].protocol['native_route']['account_type'] == 'claude.ai'
+    assert len([c for c in scope.client.calls if c[0] == 'open']) == 1
+    driver.cleanup(deadline=time.monotonic()+1)
+
+
+def test_setup_confirmation_without_readiness_expires_and_withdraws_without_reopen(owned):
+    updates = []
+    scope = setup_owned(owned, on_setup=updates.append)
+    driver = ControllerProbeDriver(scope)
+    result = driver.start(scope.context, lambda _: None, deadline=time.monotonic()+.25)
+    assert result.state == 'unknown' and updates[0] is not None and updates[-1] is None
+    assert driver.start(scope.context, lambda _: None, deadline=time.monotonic()+1).state == 'unavailable'
+    assert len([c for c in scope.client.calls if c[0] == 'open']) == 1
+    assert not any(c[0] in {'submit', 'control'} for c in scope.client.calls)
+    driver.cleanup(deadline=time.monotonic()+1)
+
+
+@pytest.mark.parametrize('field,value', [('generation_id', 'other'), ('executable_sha256', 'b'*64),
+    ('driver_revision', 'other'), ('phase', 'trust_workspace')])
+def test_setup_wrong_binding_or_unsupported_phase_never_published(owned, field, value):
+    updates = []
+    scope = setup_owned(owned, on_setup=updates.append)
+    scope.client.setup[field] = value
+    driver = ControllerProbeDriver(scope)
+    with pytest.raises(RuntimeContractError):
+        driver.start(scope.context, lambda _: None, deadline=time.monotonic()+1)
+    assert not updates and not any(c[0] in {'submit', 'control'} for c in scope.client.calls)
+    driver.cleanup(deadline=time.monotonic()+1)
+
+
+def test_close_withdraws_setup_wakes_startup_and_blocks_late_ready(owned):
+    updates, identities, result = [], [], []
+    scope = setup_owned(owned, on_setup=updates.append, on_identity=identities.append)
+    driver = ControllerProbeDriver(scope)
+    thread = threading.Thread(target=lambda: result.append(driver.start(scope.context, lambda _: None,
+        deadline=time.monotonic()+2)))
+    thread.start()
+    until = time.monotonic()+1
+    while not updates and time.monotonic()<until: time.sleep(.01)
+    driver.cleanup(deadline=time.monotonic()+1)
+    scope.client.confirmed.set()
+    thread.join(1)
+    assert result[0].state == 'unknown' and updates[-1] is None and not identities
+    assert scope.client.closed and not any(c[0] in {'submit', 'control'} for c in scope.client.calls)
+
+
+def test_close_before_open_prevents_native_start_and_intent(owned):
+    driver = ControllerProbeDriver(owned)
+    driver.cleanup(deadline=time.monotonic()+1)
+    assert driver.start(owned.context, lambda _: None, deadline=time.monotonic()+1).state == 'unavailable'
+    assert not any(c[0] == 'open' for c in owned.client.calls)
+
+
+def test_wrong_generation_status_cannot_publish_ready_identity(owned):
+    identities = []
+    scope = setup_owned(owned, on_identity=identities.append)
+    scope.client.status_generation = 'unrelated-generation'
+    scope.client.confirmed.set()
+    driver = ControllerProbeDriver(scope)
+    with pytest.raises(RuntimeContractError, match='private status generation changed'):
+        driver.start(scope.context, lambda _: None, deadline=time.monotonic()+1)
+    assert not identities
+    driver.cleanup(deadline=time.monotonic()+1)
+
+
+def test_close_during_open_fences_late_return_without_setup_or_ready_publication(owned):
+    updates, identities, result = [], [], []
+    scope = setup_owned(owned, on_setup=updates.append, on_identity=identities.append)
+    entered, release = threading.Event(), threading.Event()
+    request = scope.client.request
+    def blocked_open(op, *, timeout, **fields):
+        if op == 'open':
+            entered.set()
+            assert release.wait(1)
+        return request(op, timeout=timeout, **fields)
+    scope.client.request = blocked_open
+    driver = ControllerProbeDriver(scope)
+    thread = threading.Thread(target=lambda: result.append(driver.start(scope.context, lambda _: None,
+        deadline=time.monotonic()+2)))
+    thread.start()
+    assert entered.wait(1)
+    driver.cleanup(deadline=time.monotonic()+1)
+    release.set()
+    thread.join(1)
+    assert result[0].state == 'unknown' and not updates and not identities
+    assert driver._reader is None
+
+
+def test_claude_invented_disabled_flag_cannot_admit_inference_before_evidence_choice(owned):
+    scope = setup_owned(owned)
+    scope.client.confirmed.set()
+    scope.client.identity = lambda: {'root_id': 'root', 'process': {'pid': 77, 'start_ticks': 100},
+        'protocol': {'memory_policy': {'disabled': True}}}
+    driver = start(scope)
+    result = NativeProbeFactory._exercise(driver, frozenset({'submission'}), time.monotonic()+1)
+    assert result['submission'].grade == 'inconclusive'
+    assert not any(c[0] == 'submit' for c in scope.client.calls)
     driver.cleanup(deadline=time.monotonic()+1)
