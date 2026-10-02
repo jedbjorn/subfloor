@@ -572,13 +572,14 @@ def _message_projection(row) -> dict:
         "state": row["state"],
         "created_at": row["created_at"],
         "completed_at": row["completed_at"],
+        "request_key": row["idempotency_key"],
     }
 
 
 def _message_row(con, message_id: int):
     return con.execute(
         "SELECT message_id,conversation_id,sender_kind,sender_ref,message_kind,"
-        "body,caused_by_message_id,state,created_at,completed_at "
+        "body,caused_by_message_id,state,created_at,completed_at,idempotency_key "
         "FROM conversation_messages WHERE message_id=?",
         (message_id,),
     ).fetchone()
@@ -2103,6 +2104,13 @@ def _list_messages(con, operator: dict, conversation_id: str, query):
     order = orders[0]
     position_clause = ""
     params = [conversation_id]
+    request_clause = ""
+    if "request_key" in query:
+        keys = query["request_key"]
+        if len(keys) != 1 or not isinstance(keys[0], str) or not keys[0] or len(keys[0]) > 255:
+            raise ApiError(422, "VALIDATION_ERROR", "request_key must be one nonempty value of at most 255 characters")
+        request_clause = " AND idempotency_key=?"
+        params.append(keys[0])
     cursor = _single_cursor(query, "message")
     if cursor:
         decoded = _cursor_decode(cursor, "message")
@@ -2116,9 +2124,9 @@ def _list_messages(con, operator: dict, conversation_id: str, query):
     params.append(limit + 1)
     rows = con.execute(
         "SELECT message_id,conversation_id,sender_kind,sender_ref,message_kind,"
-        "body,caused_by_message_id,state,created_at,completed_at "
+        "body,caused_by_message_id,state,created_at,completed_at,idempotency_key "
         "FROM conversation_messages WHERE conversation_id=?"
-        + position_clause
+        + request_clause + position_clause
         + f" ORDER BY message_id {order.upper()} LIMIT ?",
         params,
     ).fetchall()
