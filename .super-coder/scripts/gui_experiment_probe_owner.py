@@ -274,17 +274,20 @@ class NativeProbeOwner:
         return proof
 
     def completed(self,fingerprint: Fingerprint,cid: str,generation: str) -> bool:
+        return self.completed_key(fingerprint.key,cid,generation)
+
+    def completed_key(self,key: str,cid: str,generation: str) -> bool:
         with self.lock:
-            if fingerprint.key in self.allocating:
+            if key in self.allocating:
                 return False
             con=db_driver.connect(str(self.database))
             try:
                 with db_driver.write_transaction(con,'native_probe.completed'):
                     updated=con.execute("UPDATE conversation_runtime_probe_jobs SET status='complete',updated_at=? WHERE fingerprint_key=? AND conversation_id=? AND generation_id=?",
-                                        (time.time(),fingerprint.key,cid,generation))
+                                        (time.time(),key,cid,generation))
                     if updated.rowcount!=1:
                         return False
             finally:
                 con.close()
-            self.closing.discard(fingerprint.key)
+            self.closing.discard(key)
             return True
