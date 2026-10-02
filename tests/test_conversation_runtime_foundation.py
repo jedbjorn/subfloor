@@ -465,6 +465,58 @@ def test_async_readiness_retains_selected_observations_without_changing_native_i
     assert not owner.ready and owner.identity.protocol['native_route']['model']=='observed-model'
 
 
+@pytest.mark.parametrize('case',['matched','foreign_generation','foreign_executable','changed_configuration','effective_telemetry','child','partial','after_close'])
+def test_claude_memory_inference_retains_qualified_binding_only_at_current_ready_edge(controller,case):
+    owner,driver=controller
+    owner.context=dataclasses.replace(owner.context,harness='claude');driver.harness='claude'
+    owner.identity=RuntimeIdentity('root','session',protocol={'configuration_sha256':'b'*64})
+    owner.ready=False
+    policy={'evidence_level':'configuration_source_flag_inference',
+            'observation_origin':'claude:documented-settings+captured-executable+owned-SessionStart-hook',
+            'auto_memory_disabled':True,'effective_telemetry':False,'generation_id':owner.context.generation_id,
+            'executable_sha256':owner.context.executable.sha256,'configuration_sha256':'b'*64,
+            'hook_sha256':'c'*64,'source_condition_sha256':'d'*64,'inherited_disable_flag':'1',
+            'auto_memory_enabled_setting':False,'unused_future_field':'discard-me'}
+    if case=='foreign_generation':policy['generation_id']='other'
+    if case=='foreign_executable':policy['executable_sha256']='e'*64
+    if case=='changed_configuration':policy['configuration_sha256']='e'*64
+    if case=='effective_telemetry':policy['effective_telemetry']=True
+    if case=='after_close':owner.handle(wire('close',command=control('close',1,action='close')))
+    owner.emit(RuntimeEvent('runtime.ready',NativeReference('root',thread_id='child' if case=='child' else 'root'),
+               data={'memory_policy':policy},partial=case=='partial'))
+    assert not owner.lost
+    if case=='matched':
+        record=owner.status()['identity']['protocol']['memory_policy']
+        assert owner.ready and record['evidence_level']=='configuration_source_flag_inference'
+        assert record['effective_telemetry'] is False and record['configuration_sha256']=='b'*64
+        assert 'unused_future_field' not in record
+    else:
+        assert not owner.ready and 'memory_policy' not in owner.identity.protocol
+
+
+@pytest.mark.parametrize('configuration,state',[('b'*64,'ready'),('e'*64,'unknown')])
+def test_initial_claude_memory_record_uses_the_same_captured_configuration_gate(controller,configuration,state):
+    owner,driver=controller
+    owner.context=None;owner.identity=None;owner.ready=False;driver.harness='claude'
+    def start(context,emit,*,deadline):
+        policy={'evidence_level':'configuration_source_flag_inference',
+                'observation_origin':'claude:documented-settings+captured-executable+owned-SessionStart-hook',
+                'auto_memory_disabled':True,'effective_telemetry':False,'generation_id':context.generation_id,
+                'executable_sha256':context.executable.sha256,'configuration_sha256':configuration,
+                'hook_sha256':'c'*64,'source_condition_sha256':'d'*64,'inherited_disable_flag':'1','auto_memory_enabled_setting':False}
+        return DriverStart('ready',RuntimeIdentity('root','session',protocol={
+            'configuration_sha256':'b'*64,'memory_policy':policy}))
+    driver.start=start
+    prepared=json.loads(json.dumps(dataclasses.asdict(dataclasses.replace(context(owner.root),harness='claude')),default=str))
+    result=owner.handle(wire('open',context=prepared))
+    assert result['state']==state and owner.ready==(state=='ready')
+    assert owner.identity.root_id=='root' and owner.identity.session_id=='session'
+    if state=='ready':
+        record=owner.journal.replay(0)['events'][-1]['event']['data']['memory_policy']
+        assert record['evidence_level']=='configuration_source_flag_inference' and record['effective_telemetry'] is False
+    assert owner.handle(wire('close',command=control('close',1,action='close')))['outcome']=='complete'
+
+
 @pytest.mark.parametrize('change',[{'efforts':[]},{'auth':{'method':'claude.ai'}},{'model':'bad\nmodel'}])
 def test_readiness_rejects_unbounded_or_unsanitized_route_before_journal(controller,change):
     owner,_=controller
