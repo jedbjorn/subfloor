@@ -383,6 +383,28 @@ def test_auth_completion_after_deadline_cannot_launch_foreground(seat, tmp_path,
     driver.cleanup(deadline=DEADLINE())
 
 
+def test_auth_spawn_waiting_for_start_condition_rechecks_deadline(seat, monkeypatch):
+    _, context, _ = seat
+    driver = runtime.ClaudeRuntimeDriver()
+    launches, errors = [], []
+    monkeypatch.setattr(runtime.subprocess, "Popen", lambda *args, **kwargs: launches.append(args))
+    entered = threading.Event()
+    deadline = time.monotonic()+.03
+    def spawn():
+        entered.set()
+        try:
+            driver._spawn_auth(deadline, [str(context.executable.path), "auth", "status", "--json"])
+        except RuntimeContractError as exc:
+            errors.append(exc.code)
+    with driver._condition:
+        child = threading.Thread(target=spawn)
+        child.start()
+        assert entered.wait(1)
+        time.sleep(.05)
+    child.join(1)
+    assert errors == ["NATIVE_ACCOUNT_INCONCLUSIVE"] and not launches and not child.is_alive()
+
+
 @pytest.mark.parametrize("observed_model", [None, "another-model", "sonnet"])
 def test_missing_or_different_active_model_prevents_readiness_inference_and_alias_guessing(seat, observed_model):
     driver, context, events = seat
