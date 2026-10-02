@@ -1,6 +1,7 @@
 """Finite synthetic owner allocation, immutable binding and cleanup boundaries."""
 import dataclasses
 import json
+import sqlite3
 import sys
 import time
 from pathlib import Path
@@ -24,11 +25,16 @@ def owner(database,monkeypatch):
     executable=ExecutableBinding(Path('/bin/true'),'a'*64,'test')
     fingerprint=Fingerprint('codex',executable,'test','b'*64,'openai','selected','high','b'*64,'c'*64)
     events=[]
+    def query(sql,values):
+        connection=sqlite3.connect(path)
+        connection.row_factory=sqlite3.Row
+        try:return connection.execute(sql,values).fetchone()
+        finally:connection.close()
     class Supervisor:
         units=[]
         def preparation_identity(self): return {'pid':123,'start_ticks':456,'unit':'fixed-api','control_group':'/fixed-api'}
         def launch(self,generation):
-            assert con.execute('SELECT generation_id FROM conversation_runtime_generations WHERE generation_id=?',(generation,)).fetchone()
+            assert query('SELECT generation_id FROM conversation_runtime_generations WHERE generation_id=?',(generation,))
             events.append('launch')
         def inventory(self): return self.units
         def stop(self,generation):
@@ -36,7 +42,7 @@ def owner(database,monkeypatch):
             return {'os_cleanup':{'complete':True}}
     supervisor=Supervisor()
     def prepare(cid,generation,*,probe_capabilities):
-        chat=con.execute('SELECT * FROM conversations WHERE conversation_id=?',(cid,)).fetchone()
+        chat=query('SELECT * FROM conversations WHERE conversation_id=?',(cid,))
         events.append('prepare')
         assert json.loads(chat['runtime_projection'])['role']=='probe'
         native={'generation_id':generation,'root':str(path.parent/'runtime'/generation),'unit':'fixed-native','status':'registered','control_group':'/fixed-native'}
@@ -48,7 +54,7 @@ def owner(database,monkeypatch):
     seat=SimpleNamespace(database=path,root=path.parent,supervisor=supervisor,prepare=prepare)
     service=NativeChatsService(path,path.parent,supervisor)
     service.attach=lambda gen:(SimpleNamespace(consumer='test'),1,
-        con.execute('SELECT shell_id FROM conversation_runtime_generations WHERE generation_id=?',(gen,)).fetchone()[0])
+        query('SELECT shell_id FROM conversation_runtime_generations WHERE generation_id=?',(gen,))[0])
     value=NativeProbeOwner(seat,service)
     def git(argv,**kwargs):
         assert argv[:3]==['git','-C',str(path.parent)] and argv[3]=='worktree'
