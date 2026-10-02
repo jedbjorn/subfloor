@@ -33,14 +33,37 @@ def append_event(con, cid: str, kind: str, payload: dict, *, message_id=None, ru
                 (cid,sequence,conversation_events.require_event_type(kind),json.dumps(payload),message_id,run_id))
 
 
-def mirrored_output(con,cid: str,rid: Any,event: dict,harness: str) -> bool:
+def output_key(event: dict,harness: str) -> str | None:
+    """Engine identity for one observed complete chunk; native refs stay opaque."""
     ref=event.get('reference') or {}
-    if (rid is None or event['kind'] not in {'output.delta','output.final'} or not ref.get('item_id')
+    data=event['data']
+    if (event['kind']!='output.final' or event['freshness']!='current' or event['partial']
+            or event['grade'] in {'inconclusive','incompatible'}
+            or not ref.get('root_id') or not ref.get('activity_id') or not event.get('request_id')
             or not (ref.get('thread_id')==ref.get('root_id') or harness=='claude' and ref.get('thread_id') is None)
-            or not (harness=='claude' or event['data'].get('kind')=='assistant')):
-        return False
-    return con.execute("SELECT 1 FROM conversation_events WHERE conversation_id=? AND run_id=? AND event_type='assistant.delta' AND json_extract(payload,'$.native_final')=1 AND json_extract(payload,'$.native_reference.item_id')=? LIMIT 1",
-                       (cid,rid,ref['item_id'])).fetchone() is not None
+            or not isinstance(data.get('text'),str) or len(data['text'])>4096):
+        return None
+    if harness=='claude':
+        digest=data.get('text_digest')
+        part=data.get('part')
+        if (event['provenance'] not in {'claude:channel-reply','claude:owned-transcript-text','claude:MessageDisplay'}
+                or not isinstance(digest,str) or len(digest)!=64 or any(c not in '0123456789abcdef' for c in digest)
+                or type(part) is not int or not 0<=part<128 or type(data.get('last')) is not bool):
+            return None
+        identity={'full_text_digest':digest,'part':part}
+    else:
+        offset=data.get('offset',0)
+        if data.get('kind')!='assistant' or not ref.get('item_id') or type(offset) is not int or offset<0:
+            return None
+        identity={'native_item_id':ref['item_id'],'offset':offset}
+    return payload_digest({'root_id':ref['root_id'],'activity_id':ref['activity_id'],
+                           'request_id':event['request_id'],**identity})
+
+
+def mirrored_output(con,cid: str,rid: Any,event: dict,harness: str) -> bool:
+    key=output_key(event,harness)
+    return bool(rid is not None and key and con.execute("SELECT 1 FROM conversation_events WHERE conversation_id=? AND run_id=? AND event_type='assistant.delta' AND json_extract(payload,'$.engine_output_key')=? LIMIT 1",
+                        (cid,rid,key)).fetchone())
 
 
 def project_event(con, cid: str, sequence: int, event: dict, *, primary: dict | None = None) -> None:
@@ -115,15 +138,15 @@ def project_event(con, cid: str, sequence: int, event: dict, *, primary: dict | 
             con.execute("UPDATE conversation_messages SET state='running' WHERE message_id=? AND state IN ('accepted','queued')",(mid,))
             con.execute("UPDATE conversations SET state='running' WHERE conversation_id=? AND state='queued'",(cid,))
             append_event(con,cid,'run.started',{'native_activity_id':ref.get('activity_id')},message_id=mid,run_id=rid)
-        elif (kind == 'output.final' and run['state'] in {'starting','running'}
-              and (current['harness']=='claude' or event['data'].get('kind')=='assistant')
-              and ref.get('item_id')):
+        elif kind == 'output.final' and run['state'] in {'starting','running'} and output_key(event,current['harness']):
             part=event['data'].get('part',event['data'].get('offset',0))
-            prior=con.execute("SELECT 1 FROM conversation_events WHERE conversation_id=? AND run_id=? AND event_type='assistant.delta' AND json_extract(payload,'$.native_final')=1 AND json_extract(payload,'$.native_reference.item_id')=? AND json_extract(payload,'$.native_part')=?",
-                              (cid,rid,ref['item_id'],part)).fetchone()
+            key=output_key(event,current['harness'])
+            prior=con.execute("SELECT 1 FROM conversation_events WHERE conversation_id=? AND run_id=? AND event_type='assistant.delta' AND json_extract(payload,'$.engine_output_key')=?",
+                              (cid,rid,key)).fetchone()
             if prior is None:
                 append_event(con,cid,'assistant.delta',
                              {'text':event['data'].get('text',''),'native_reference':ref,'native_final':True,'native_part':part,
+                              'engine_output_key':key,
                               'native_controller_sequence':sequence},message_id=mid,run_id=rid)
         elif kind=='activity.terminal' and run['state'] in {'starting','running'}:
             status = event['data'].get('status')
@@ -142,6 +165,7 @@ def project_event(con, cid: str, sequence: int, event: dict, *, primary: dict | 
                          {'status':status,'runtime_alive':True},message_id=mid,run_id=rid)
     envelope = {'generation_id':generation,'controller_sequence':sequence,
                 'engine_message_id':mid,'engine_run_id':rid,
+                'engine_output_key':output_key(event,current['harness']),
                 'engine_mirrored':mirrored_output(con,cid,rid,event,current['harness']),**event}
     append_event(con,cid,kind,envelope,message_id=mid,run_id=rid)
 
@@ -742,6 +766,7 @@ def projection(conversation: Any, *, con=None) -> dict | None:
         engine=json.loads(intent[0]) if intent else {}
         runtime['activity'].append({'generation_id':generation,'controller_sequence':row['sequence'],
             'engine_run_id':engine.get('run_id'),'engine_message_id':engine.get('message_id'),
+            'engine_output_key':output_key(event,conversation['harness']),
             'engine_mirrored':mirrored_output(con,conversation['conversation_id'],engine.get('run_id'),event,conversation['harness']),**event})
     runtime['activity_partial']=len(events)>128
     if _SERVICE is not None:

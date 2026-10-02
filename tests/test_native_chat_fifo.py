@@ -1,5 +1,6 @@
 """Ordinary Chats intent survives autonomous busy, API loss and Close."""
 import dataclasses
+import hashlib
 import json
 import sys
 from pathlib import Path
@@ -139,7 +140,38 @@ def test_final_assistant_chunks_mirror_once_but_child_and_terminal_outputs_remai
     row=con.execute('SELECT * FROM conversations').fetchone()
     public=projection(row,con=con)['activity']
     outputs=[item for item in public if item['kind'].startswith('output.')]
-    assert all(item['engine_mirrored'] for item in outputs[:4])
+    assert [item['engine_mirrored'] for item in outputs[:4]]==[False,True,True,True]
     assert all(not item['engine_mirrored'] for item in outputs[4:])
     native=[json.loads(row[0]) for row in con.execute("SELECT payload FROM conversation_events WHERE event_type='output.final' ORDER BY sequence")]
     assert native[0]['engine_mirrored'] is True and native[-1]['engine_mirrored'] is False
+
+
+def test_itemless_claude_complete_chunks_use_engine_identity_and_cross_source_dedup(fifo):
+    from conversation_native_chats import mirrored_output
+    service,client,con,_=fifo
+    con.execute("UPDATE conversation_runtime_generations SET harness='claude'");con.commit()
+    client.results=[{'state':'written'}]
+    service.dispatch_queued('g','cv',client,1,1)
+    request=client.calls[0]['request_id']
+    text='x'*4096+'y'
+    digest=hashlib.sha256(text.encode()).hexdigest()
+    ref=NativeReference('root',activity_id='turn')
+    events=[RuntimeEvent('activity.processed',ref,request_id=request)]
+    for part,chunk in enumerate((text[:4096],text[4096:])):
+        events.append(RuntimeEvent('output.final',ref,request_id=request,provenance='claude:channel-reply',grade='compatible',
+            data={'text':chunk,'text_digest':digest,'part':part,'last':part==1}))
+    transcript=dataclasses.replace(events[-1],reference=dataclasses.replace(ref,item_id='native-transcript-item'),provenance='claude:owned-transcript-text')
+    events.append(transcript)
+    service.store.ingest('g',1,1,client.lease,{'events':[{'sequence':n,'event':dataclasses.asdict(event)} for n,event in enumerate(events,1)]},project=project_event)
+    rows=[json.loads(row[0]) for row in con.execute("SELECT payload FROM conversation_events WHERE event_type='assistant.delta' ORDER BY sequence")]
+    assert ''.join(row['text'] for row in rows)==text and len(rows)==2
+    assert rows[0]['native_reference']['item_id'] is None
+    assert rows[0]['engine_output_key']!=rows[1]['engine_output_key']
+    rid=client.calls[0]['run_id']
+    assert mirrored_output(con,'cv',rid,dataclasses.asdict(transcript),'claude')
+    unmirrored=dataclasses.replace(transcript,data=transcript.data|{'part':2})
+    assert not mirrored_output(con,'cv',rid,dataclasses.asdict(unmirrored),'claude')
+    partial=dataclasses.replace(events[1],partial=True)
+    assert not mirrored_output(con,'cv',rid,dataclasses.asdict(partial),'claude')
+    unknown=dataclasses.replace(events[1],provenance='unknown:output')
+    assert not mirrored_output(con,'cv',rid,dataclasses.asdict(unknown),'claude')
