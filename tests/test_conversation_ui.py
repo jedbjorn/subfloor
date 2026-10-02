@@ -1470,7 +1470,8 @@ def test_transcript_follow_pauses_for_reading_and_offers_jump_to_latest():
 def test_composer_is_retry_safe_and_has_turn_controls():
     interface = APP[APP.index("const CHAT_HARNESSES"):
                     APP.index("// ── Tabs + boot")]
-    assert "chatPendingSend.key" in interface
+    assert "const sendRequest = chatPendingSend;" in interface
+    assert "sendRequest.key" in interface
     assert "retry keeps this exact send" in interface
     assert 'event.key === "Enter" && !event.shiftKey' in interface
     assert "function chatQueuedCount(messages)" in interface
