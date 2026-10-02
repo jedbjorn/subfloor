@@ -134,6 +134,102 @@ class NativeChatsService:
             raise RuntimeContractError('NATIVE_ROUTE_INCONCLUSIVE','owned native account/options observation is not ready')
         return self.route_resolver(harness,model,effort)
 
+    def control(self,con,cid: str,owner: int,key: str,body: dict) -> dict:
+        """Operator-authorized finite actions against stored native targets.
+
+        HTTP idempotency binds the whole requested version/scope. Replays of
+        written/unknown controls return retained truth without another write.
+        Neither a client-provided native reference nor a broad capability
+        grade can select an unproved target kind.
+        """
+        if body.get('action') not in {'enable_local_channel','stop_reply','stop_work','stop_automation'}:
+            raise RuntimeContractError('CONTROL_INVALID','unknown finite native action')
+        request_hash = payload_digest(body)
+        with db_driver.write_transaction(con,'native_chat.control_intent'):
+            chat = con.execute("SELECT * FROM conversations WHERE conversation_id=? AND owner_user_id=? AND runtime_mode='native_experiment'",(cid,owner)).fetchone()
+            if chat is None:
+                raise RuntimeContractError('RUNTIME_NOT_OWNED','native chat is outside operator tenancy')
+            prior = con.execute('SELECT * FROM conversation_runtime_http_requests WHERE conversation_id=? AND request_key=?',(cid,key)).fetchone()
+            if prior:
+                if prior['request_hash']!=request_hash:
+                    raise RuntimeContractError('CONTROL_IDEMPOTENCY_CONFLICT','control key was reused with a different request')
+                command_id, generation = prior['command_id'], prior['generation_id']
+                command_row = con.execute('SELECT * FROM conversation_runtime_commands WHERE generation_id=? AND command_id=?',(generation,command_id)).fetchone()
+                if command_row['state'] not in {'accepted','not_written'}:
+                    return {'control_id':command_id,'state':command_row['state'],'receipt':json.loads(command_row['receipt_json']),'duplicate':True}
+            else:
+                if chat['version']!=body['version']:
+                    raise RuntimeContractError('CONVERSATION_VERSION_CONFLICT','conversation changed before control')
+                runtime = json.loads(chat['runtime_projection'])
+                generation = runtime.get('generation_id')
+                if not generation or generation!=body['generation_id'] or runtime.get('state') in {'closing','closed','lost'}:
+                    raise RuntimeContractError('GENERATION_INVALID','control is stale or outside the current native generation')
+                generation_row = con.execute('SELECT * FROM conversation_runtime_generations WHERE generation_id=? AND conversation_id=? AND owner_user_id=?',(generation,cid,owner)).fetchone()
+                if generation_row is None or generation_row['close_intent']:
+                    raise RuntimeContractError('RUNTIME_CLOSING','Close fences subsequent controls')
+                action = body['action']
+                caps = runtime.get('capabilities',{})
+                options: dict[str,Any] = {}
+                expected = None
+                target = None
+                if action=='enable_local_channel':
+                    setup = runtime.get('setup')
+                    if runtime.get('state')!='needs_consent' or not setup or setup['setup_id']!=body.get('setup_id'):
+                        raise RuntimeContractError('SETUP_INVALID','documented startup choice is no longer current')
+                    options = {name:setup[name] for name in ('setup_id','configuration_sha256')}
+                elif action=='stop_reply':
+                    target = runtime.get('primary')
+                    expected = body.get('expected_activity_id')
+                    if not target or target.get('activity_id')!=expected:
+                        raise RuntimeContractError('CONTROL_STALE','foreground activity changed before control')
+                    self.require_capability(caps,'stop_reply')
+                else:
+                    work = con.execute('SELECT projection_json FROM conversation_runtime_work WHERE generation_id=? AND work_key=?',(generation,body.get('work_key'))).fetchone()
+                    if work is None:
+                        raise RuntimeContractError('WORK_NOT_OWNED','work target is outside this generation')
+                    observed = json.loads(work['projection_json'])
+                    target = observed['reference']
+                    kind = observed['data'].get('kind') or ('terminal' if target.get('native_process_id') else 'task' if target.get('work_id') else 'child')
+                    if observed['partial'] or observed['freshness'] in {'unknown','stale'}:
+                        raise RuntimeContractError('WORK_INCONCLUSIVE','target inventory requires current attributable reconciliation')
+                    if action=='stop_automation':
+                        if kind!='automation':
+                            raise RuntimeContractError('WORK_NOT_OWNED','automation control requires a native definition target')
+                        self.require_capability(caps,'automation')
+                    else:
+                        if kind not in {'terminal','child'}:
+                            raise RuntimeContractError('CAPABILITY_INCONCLUSIVE','this native work kind has no demonstrated stop coverage')
+                        self.require_capability(caps,'stop_work')
+                        self.require_capability(caps,'stop_work_'+kind)
+                        expected = body.get('expected_activity_id')
+                        if kind=='child' and (not expected or target.get('activity_id')!=expected):
+                            raise RuntimeContractError('CONTROL_STALE','child activity changed before control')
+                command_id = 'gui-control:'+payload_digest({'conversation':cid,'key':key})
+                command = {'control_id':command_id,'request_sequence':generation_row['next_command_sequence'],
+                           'action':action,'target':target,'expected_activity_id':expected,'options':options}
+                digest = payload_digest(command)
+                con.execute("INSERT INTO conversation_runtime_commands(generation_id,command_id,command_sequence,kind,payload_digest,intent_json) VALUES(?,?,?,'control',?,?)",(generation,command_id,command['request_sequence'],digest,encoded(command)))
+                con.execute('UPDATE conversation_runtime_generations SET next_command_sequence=next_command_sequence+1 WHERE generation_id=?',(generation,))
+                con.execute('INSERT INTO conversation_runtime_http_requests VALUES(?,?,?,?,?)',(cid,key,request_hash,generation,command_id))
+                command_row = con.execute('SELECT * FROM conversation_runtime_commands WHERE generation_id=? AND command_id=?',(generation,command_id)).fetchone()
+        client,actual_owner,shell = self.attach(generation)
+        if actual_owner!=owner:
+            raise RuntimeContractError('RUNTIME_NOT_OWNED','controller consumer differs from operator tenancy')
+        command = json.loads(command_row['intent_json'])|{'payload_digest':command_row['payload_digest']}
+        try:
+            result = client.request('control',command=command,timeout=5)
+        except (OSError,RuntimeContractError) as exc:
+            result = {'state':'unknown','detail':getattr(exc,'code','CONTROLLER_UNAVAILABLE')}
+        self.store.receipt(generation,owner,shell,command_id,result)
+        self.notify()
+        return {'control_id':command_id,**result}
+
+    @staticmethod
+    def require_capability(caps: dict,capability: str) -> None:
+        if caps.get(capability)!='compatible':
+            verdict = 'CAPABILITY_INCOMPATIBLE' if caps.get(capability)=='incompatible' else 'CAPABILITY_INCONCLUSIVE'
+            raise RuntimeContractError(verdict,f'{capability} has no matching compatible native proof coverage')
+
     def request_close(self,con,cid: str,owner: int,version: int) -> None:
         """Persist the Close fence atomically with the operator/version check.
 
