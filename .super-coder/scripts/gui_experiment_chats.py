@@ -12,6 +12,7 @@ import time
 
 import conversation_events
 import conversation_native_chats
+import conversation_native_history
 import db_driver
 import route_bindings
 from conversation_runtime_contract import RuntimeContractError, payload_digest
@@ -96,9 +97,32 @@ class FixtureChats:
         checked=self.seat.candidate_fingerprint(row['harness'],row['model'],row['effort'])
         if binding['catalogue_generation']!=checked.key[:32]:
             raise RuntimeContractError('NATIVE_ROUTE_CHANGED','checked candidate changed before canonical preparation')
-        context,fp,native=self.seat.prepare(cid,generation,checked_fingerprint=checked)
+        history_proof=None
+        con=db_driver.connect(str(self.database))
+        try:
+            link=conversation_native_history.association(con,cid,row['owner_user_id'])
+            if link is not None:
+                _,history,_=conversation_native_history.source_history(con,link['source_conversation_id'],row['owner_user_id'])
+                history_proof=self.history_admission(history)
+                conversation_native_history.prepared_history(con,row,generation,history_proof)
+        finally:
+            con.close()
+        if history_proof is not None and conversation_native_chats._SERVICE is not self.service:
+            raise RuntimeContractError('NATIVE_HISTORY_UNAVAILABLE','current experimental owner was withdrawn before preparation')
+        options={'history_proof':history_proof} if history_proof is not None else {}
+        context,fp,native=self.seat.prepare(cid,generation,checked_fingerprint=checked,**options)
         self.service.require_capability(context.capability_evidence,'submission')
         return context,fp,native
+
+    def history_admission(self,history):
+        binding,digest=self.resolve_route(history.harness,history.model,history.effort)
+        fp=self.seat.candidate_fingerprint(history.harness,history.model,history.effort)
+        evidence=self.operation.cache.get(fp,'history_resume')
+        if evidence is None:
+            raise RuntimeContractError('NATIVE_HISTORY_UNAVAILABLE','history-specific consumed interface and native behavior have not been proved')
+        return conversation_native_history.checked_proof({
+            'grade':evidence.grade,'coverage':sorted(evidence.coverage),'fingerprint':fp.key,
+            'binding':binding,'binding_digest':digest},history)
 
     def changed(self,harness,observation):
         # The observer callback only enqueues; publication has no native launch
@@ -139,6 +163,7 @@ class FixtureChats:
         if conversation_native_chats._SERVICE is not None:
             raise RuntimeContractError('FIXTURE_INVALID','another experimental consumer is installed')
         self.service.prepare_context,self.service.route_resolver=self.prepare,self.resolve_route
+        self.service.history_resolver=self.history_admission
         conversation_native_chats._SERVICE=self.service
         try:
             self.thread.start()

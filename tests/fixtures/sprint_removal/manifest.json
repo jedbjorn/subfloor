@@ -179,7 +179,8 @@
     "tests/test_native_sprint_wakes.py",
     ".super-coder/migrations/0277_native_sprint_lifecycle.sql",
     ".super-coder/scripts/sprint_native_lifecycle.py",
-    "tests/test_native_sprint_lifecycle.py"
+    "tests/test_native_sprint_lifecycle.py",
+    ".super-coder/migrations/0278_native_history_continuations.sql"
   ],
   "baseline_migration_ledger": {
     "count": 142,

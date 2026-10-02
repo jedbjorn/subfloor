@@ -336,12 +336,13 @@ class NativeChatsService:
     executable endpoint. A restart attaches captured live generations instead
     of reconstructing their context or replaying ambiguous submissions.
     """
-    def __init__(self, database: Path, root: Path, supervisor, *, prepare_context=None, resolve_route=None, probe_delegate=None):
+    def __init__(self, database: Path, root: Path, supervisor, *, prepare_context=None, resolve_route=None, probe_delegate=None, history_admission=None):
         self.database, self.root, self.supervisor = database, root, supervisor
         self.store = RuntimeStore(database)
         self.prepare_context = prepare_context
         self.route_resolver = resolve_route
         self.probe_delegate = probe_delegate
+        self.history_resolver = history_admission
         self.consumer = uuid.uuid4().hex
         self.clients: dict[str,tuple[RuntimeClient,int,int]] = {}
         self.lock = threading.RLock()
@@ -424,6 +425,12 @@ class NativeChatsService:
             raise RuntimeContractError('NATIVE_ROUTE_INCONCLUSIVE','owned native account/options observation is not ready')
         return self.route_resolver(harness,model,effort)
 
+    def history_admission(self,history):
+        if self.history_resolver is None:
+            raise RuntimeContractError('NATIVE_HISTORY_UNAVAILABLE','owned history interface and behavior coverage is not ready')
+        from conversation_native_history import checked_proof
+        return checked_proof(self.history_resolver(history),history)
+
     def schedule_starts(self) -> None:
         if self.prepare_context is None or self.stopped.is_set():
             return
@@ -476,6 +483,8 @@ class NativeChatsService:
             if self.stopped.is_set():
                 raise RuntimeContractError('API_STOPPING','API release fences new native allocation')
             self.require_capability(context.capability_evidence,'submission')
+            if context.history is not None:
+                self.require_capability(context.capability_evidence,'history_resume')
             con=db_driver.connect(str(self.database))
             try:
                 chat=con.execute('SELECT state,runtime_projection FROM conversations WHERE conversation_id=?',(cid,)).fetchone()

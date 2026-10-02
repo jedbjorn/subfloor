@@ -120,6 +120,25 @@ class ExecutableBinding:
 
 
 @dataclass(frozen=True)
+class WorkspaceIdentity:
+    """Fresh canonical checkout observed by the owner; not old Git restoration.
+
+    Providers must re-observe this identity after native resume, before the
+    first current nonce/input. It does not certify vendor workspace behavior.
+    """
+    cwd: Path
+    git_common_dir: Path
+    branch: str
+    head: str
+
+    def __post_init__(self) -> None:
+        if (any(not isinstance(path,Path) or not path.is_absolute() or '..' in path.parts for path in (self.cwd,self.git_common_dir))
+                or not isinstance(self.branch,str) or not 1<=len(self.branch)<=255 or any(c in self.branch for c in '\x00\r\n')
+                or not isinstance(self.head,str) or len(self.head) not in {40,64} or any(c not in '0123456789abcdef' for c in self.head)):
+            raise RuntimeContractError('HISTORY_WORKSPACE_INVALID','bounded canonical Git workspace identity required')
+
+
+@dataclass(frozen=True)
 class NativeHistory:
     """Server-issued predecessor selection; never a client native operand.
 
@@ -192,6 +211,7 @@ class RuntimeContext:
     # No independent public HTTP server or extra API owner is permitted.
     controller_endpoint: Path | None = None
     history: NativeHistory | None = None
+    workspace: WorkspaceIdentity | None = None
 
     def __post_init__(self) -> None:
         if not self.permission_mode or not self.policy_digest or not self.boot_digest:
@@ -204,6 +224,8 @@ class RuntimeContext:
                     or (history.harness,history.model,history.effort,history.source_worktree)
                     !=(self.harness,self.model,self.effort,self.worktree)):
                 raise RuntimeContractError('HISTORY_INVALID','history requires a distinct conversation/generation and unchanged owned route/worktree')
+        if self.workspace is not None and (not isinstance(self.workspace,WorkspaceIdentity) or self.workspace.cwd!=self.worktree):
+            raise RuntimeContractError('HISTORY_WORKSPACE_INVALID','prepared workspace differs from captured canonical cwd')
         # The harness driver must reject unsupported modes; never substitute a
         # probe-friendly policy for this canonical prepared value.
         if len(self.managed_mcp_args) % 2 or any(

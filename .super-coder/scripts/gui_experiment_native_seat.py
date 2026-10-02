@@ -23,6 +23,8 @@ import uuid
 from collections.abc import Mapping
 from pathlib import Path
 
+import conversation_native_chats
+import conversation_native_history
 import db_driver
 import route_bindings
 import run
@@ -124,7 +126,7 @@ class NativeFixtureSeat:
                'conversation_runtime.py','conversation_runtime_checks.py','gui_experiment_native_seat.py',
                'gui_experiment_probe_owner.py','gui_experiment_runtime.py','gui_experiment_chats.py','conversation_runtime_native_probes.py','conversation_native_chats.py','conversation_native_checks.py',
                'gui_experiment_readiness.py','conversation_boot.py','run.py','route_transport.py',
-               'execution_view.py','execution_view_exec.py')]
+               'execution_view.py','execution_view_exec.py','conversation_native_history.py')]
         if harness=='codex':paths.extend(scripts/name for name in (
             'conversation_runtime_codex_schema.py','conversation_runtime_codex_codegen.py'))
         paths.extend([scripts/'conversation_adapters'/f'{harness}_runtime.py',
@@ -215,10 +217,10 @@ class NativeFixtureSeat:
         if self.schema_cleanup_pending or not self.supervisor.codegen_clean():
             raise RuntimeContractError('CLEANUP_PENDING','previous codegen ownership requires verified cleanup or fixture teardown')
 
-    def selected_worktree(self,row) -> Path:
+    def selected_worktree(self,row, *, allow_missing: bool=False) -> Path:
         expected=run.shell_work_dir(row['shortname'],row['flavor'],root=self.root).absolute()
         selected=Path(row['worktree']).absolute()
-        if selected!=expected or self.root.resolve() not in selected.resolve().parents or not selected.is_dir():
+        if selected!=expected or self.root.resolve() not in selected.resolve().parents or (not selected.is_dir() and not (allow_missing and not selected.exists())):
             raise RuntimeContractError('WORKTREE_INVALID','canonical selected worktree escaped the fixture')
         current=selected
         while current!=self.root.absolute():
@@ -331,7 +333,7 @@ class NativeFixtureSeat:
             self.assets_lock.release()
 
     def prepare(self,conversation_id: str,generation_id: str, *, probe_capabilities: tuple[str,...]=(),
-                checked_fingerprint: Fingerprint|None=None) -> tuple[RuntimeContext,Fingerprint,dict]:
+                checked_fingerprint: Fingerprint|None=None,history_proof: dict|None=None) -> tuple[RuntimeContext,Fingerprint,dict]:
         self.ensure_codegen_clean()
         con=db_driver.connect(str(self.database))
         try:
@@ -342,7 +344,20 @@ class NativeFixtureSeat:
                 raise RuntimeContractError('RUNTIME_NOT_OWNED','opted-in synthetic chat required')
             # Check every component before the canonical start can repair Git
             # links, emit boot/configuration, or mutate the session archive.
-            self.selected_worktree(row)
+            link=conversation_native_history.association(con,conversation_id,row['owner_user_id'])
+            history=None
+            history_service=conversation_native_chats._SERVICE
+            if link is not None:
+                if history_proof is None or probe_capabilities or checked_fingerprint is None:
+                    raise RuntimeContractError('HISTORY_UNAVAILABLE','current history-specific ordinary admission is required before preparation')
+                history=conversation_native_history.prepared_history(con,row,generation_id,history_proof)
+                if (history_service is None or history_service.stopped.is_set()
+                        or Path(history_service.database).resolve()!=self.database.resolve()
+                        or history_service.history_admission(history)!=history_proof):
+                    raise RuntimeContractError('HISTORY_UNAVAILABLE','current owned history preparation service is unavailable')
+            elif history_proof is not None:
+                raise RuntimeContractError('HISTORY_NOT_OWNED','history proof has no canonical continuation association')
+            self.selected_worktree(row,allow_missing=history is not None)
             binding=json.loads(row['route_binding'])
             route_bindings.validate_v2_binding(binding)
             if binding['selector_binding'].get('proof_state')=='pending_finite_probe':
@@ -398,7 +413,14 @@ class NativeFixtureSeat:
                     or runtime.get('preparation_owner')!=json.loads(row['runtime_projection']).get('preparation_owner')
                     or any(fresh[key]!=row[key] for key in ('shell_id','harness','provider','model','effort','worktree','route_binding'))):
                 raise RuntimeContractError('RUNTIME_CLOSING','preparing generation was closed/replaced before canonical writes')
-            self.selected_worktree(fresh)
+            self.selected_worktree(fresh,allow_missing=history is not None)
+            if history is not None:
+                if history_proof is None or history_service is None:
+                    raise RuntimeContractError('HISTORY_UNAVAILABLE','captured history owner/proof is required')
+                conversation_native_history.prepared_history(con,fresh,generation_id,history_proof)
+                if (conversation_native_chats._SERVICE is not history_service or history_service.stopped.is_set()
+                        or history_service.history_admission(history)!=history_proof):
+                    raise RuntimeContractError('HISTORY_CHANGED','current history owner/proof changed before canonical writes')
             if binding['selector_binding'].get('proof_state')=='pending_finite_probe':
                 job=con.execute('SELECT status,deadline,fingerprint_key FROM conversation_runtime_probe_jobs WHERE conversation_id=? AND generation_id=?',(conversation_id,generation_id)).fetchone()
                 if (runtime.get('role')!='probe' or not probe_capabilities or job is None
@@ -409,6 +431,18 @@ class NativeFixtureSeat:
             con.close()
         # Durable fixture resources precede canonical archive/boot/DB mutations.
         native=self.supervisor.register(generation_id,harness)
+        if history is not None:
+            if history_proof is None or history_service is None:
+                raise RuntimeContractError('HISTORY_UNAVAILABLE','captured history owner/proof is required')
+            con=db_driver.connect(str(self.database))
+            try:
+                fresh=con.execute('SELECT * FROM conversations WHERE conversation_id=?',(conversation_id,)).fetchone()
+                conversation_native_history.prepared_history(con,fresh,generation_id,history_proof)
+                if (conversation_native_chats._SERVICE is not history_service or history_service.stopped.is_set()
+                        or history_service.history_admission(history)!=history_proof):
+                    raise RuntimeContractError('HISTORY_CHANGED','history admission changed after resource registration')
+            finally:
+                con.close()
         if initial:
             run.prepare_launch(shell_id=row['shell_id'],harness=harness,model=row['model'],effort=row['effort'],
                 headless_prompt='native owned preparation; never dispatch',conversation_owned=True,
@@ -446,5 +480,26 @@ class NativeFixtureSeat:
             env=plan.env|native_env,probe_capabilities=probe_capabilities,
             controller_endpoint=Path(native['endpoint']))
         fingerprint=Fingerprint.capture(context,settings_digest=policy,implementation_digest=self.implementation_digest(harness))
-        context=dataclasses.replace(context,capability_evidence=self.cache.admission(fingerprint))
+        caps=self.cache.admission(fingerprint)
+        if history is not None:
+            if history_proof is None or history_service is None:
+                raise RuntimeContractError('HISTORY_UNAVAILABLE','captured history owner/proof is required')
+            if fingerprint.key!=history_proof['fingerprint']:
+                raise RuntimeContractError('HISTORY_CHANGED','prepared installed history identity changed')
+            workspace=conversation_native_history.observe_workspace(Path(plan.cwd),self.root)
+            con=db_driver.connect(str(self.database))
+            try:
+                with db_driver.write_transaction(con,'native_history.workspace'):
+                    current=con.execute('SELECT * FROM conversations WHERE conversation_id=?',(conversation_id,)).fetchone()
+                    conversation_native_history.prepared_history(con,current,generation_id,history_proof)
+                    if (conversation_native_chats._SERVICE is not history_service or history_service.stopped.is_set()
+                            or history_service.history_admission(history)!=history_proof):
+                        raise RuntimeContractError('HISTORY_CHANGED','history owner/proof changed during canonical preparation')
+                    con.execute('UPDATE conversation_native_history SET workspace_json=? WHERE conversation_id=? AND generation_id=?',
+                        (json.dumps(dataclasses.asdict(workspace)|{'cwd':str(workspace.cwd),'git_common_dir':str(workspace.git_common_dir)}),conversation_id,generation_id))
+            finally:
+                con.close()
+            caps=dict(caps)|{'history_resume':'compatible'}
+            context=dataclasses.replace(context,history=history,workspace=workspace)
+        context=dataclasses.replace(context,capability_evidence=caps)
         return context,fingerprint,native
