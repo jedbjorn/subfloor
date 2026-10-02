@@ -39,6 +39,7 @@ from conversation_runtime_contract import (
     RuntimeDriver,
     RuntimeEvent,
     RuntimeIdentity,
+    StartupConsent,
     WriteReceipt,
     payload_digest,
     public_payload,
@@ -86,7 +87,8 @@ class Journal:
         self.max_events, self.max_commands, self.max_bytes, self.reserve = max_events, max_commands, max_bytes, reserve
         self.secrets = sensitive_values
         defaults: dict[str,Any] = {"sequence":0,"floor":0,"acked":0,"partial":False,
-                           "primary":None,"close":False,"lease":None,"root_activities":{}}
+                           "primary":None,"close":False,"lease":None,"root_activities":{},
+                           "setup":None,"setup_confirmation":None}
         for key,value in defaults.items():
             self.db.execute("INSERT OR IGNORE INTO meta VALUES(?,?)", (key, encoded(value)))
 
@@ -322,9 +324,24 @@ class Controller:
             if self.identity and event.reference and event.reference.root_id != self.identity.root_id:
                 raise RuntimeContractError("OWNERSHIP_INVALID", "event is outside captured native root")
             self.journal.emit(event)
+            if event.kind=='runtime.setup' and not self.journal.get('close'):
+                self.capture_setup(StartupConsent(**event.data))
+            elif (event.kind=='runtime.ready' and not self.journal.get('close') and not self.lost
+                  and self.identity and event.reference and event.reference.root_id==self.identity.root_id):
+                self.ready=True
+                self.journal.set('setup',None)
         except RuntimeContractError:
             self.lost = True
             raise
+
+    def capture_setup(self,setup: StartupConsent) -> None:
+        if (self.context is None or self.context.harness!='claude'
+                or setup.generation_id!=self.generation
+                or setup.executable_sha256!=self.context.executable.sha256
+                or setup.driver_revision!=self.context.driver_revision):
+            raise RuntimeContractError('SETUP_INVALID','startup descriptor differs from captured Claude generation')
+        self.journal.set('setup',public_payload(dataclasses.asdict(setup),sensitive_values=self.journal.secrets))
+        self.ready=False
 
     def handle(self, value: Mapping[str, Any], *, peer: ProcessIdentity | None = None) -> dict:
         if value.get("generation") != self.generation or value.get("contract") != CONTRACT_REVISION:
@@ -360,7 +377,10 @@ class Controller:
                     s in k.upper() for s in ("TOKEN","SECRET","API_KEY","PASSWORD","CREDENTIAL","AUTHORIZATION")))
                 started = self.call(lambda:self.driver.start(context,self.emit,deadline=deadline),deadline=deadline)
                 self.identity = started.identity
-                self.ready = started.state == "ready" and self.identity is not None
+                self.ready = started.state == "ready" and self.identity is not None and not self.journal.get('close')
+                if started.setup is not None and not self.journal.get('close'):
+                    self.capture_setup(started.setup)
+                    self.emit(RuntimeEvent('runtime.setup',data=dataclasses.asdict(started.setup)))
                 return public_payload(dataclasses.asdict(started),sensitive_values=self.journal.secrets)
         if op == "status":
             return self.status()
@@ -393,7 +413,7 @@ class Controller:
                 raise RuntimeContractError("COMMAND_INVALID", "bounded user text and valid source required")
             submission = NativeSubmission(**command)
         else:
-            if command.get("action") not in {"stop_reply","stop_work","stop_automation","close"} or (not closing and command["action"]=="close"):
+            if command.get("action") not in {"stop_reply","stop_work","stop_automation","close","enable_local_channel"} or (not closing and command["action"]=="close"):
                 raise RuntimeContractError("COMMAND_INVALID", "invalid scoped native control")
             native_control = NativeControl(**(command|{"target":reference(command.get("target"))}))
         # Close is independent of the regular dispatch lock/native RPC future.
@@ -404,6 +424,7 @@ class Controller:
             if duplicate:
                 return duplicate
             if closing:
+                self.ready=False
                 cleanup_deadline=min(deadline,time.monotonic()+5)
                 try:
                     cleanup=self.call(lambda:self.driver.cleanup(deadline=cleanup_deadline),deadline=cleanup_deadline,closing=True)
@@ -415,8 +436,37 @@ class Controller:
                 result = public_payload(dataclasses.asdict(cleanup),sensitive_values=self.journal.secrets)
                 self.emit(RuntimeEvent("control.outcome",control_id=cid,data=result))
                 return result
-            if self.lost or not self.ready:
+            setup_action=op=='control' and command['action']=='enable_local_channel'
+            if self.lost or (not self.ready and not setup_action):
                 result = WriteReceipt("not_written",detail="native ownership/readiness unavailable")
+            elif setup_action:
+                setup=self.journal.get('setup')
+                confirmation=self.journal.get('setup_confirmation')
+                if (self.ready or self.context is None or self.context.harness!='claude' or not setup
+                        or command['options']['setup_id']!=setup['setup_id']
+                        or command['options']['configuration_sha256']!=setup['configuration_sha256']
+                        or confirmation is not None
+                        or (native_control.target is not None and (self.identity is None or native_control.target.root_id!=self.identity.root_id))):
+                    result=WriteReceipt('rejected',detail='startup choice is stale, duplicated, or outside captured Claude phase')
+                else:
+                    # Retain before the finite choice write. Ambiguous/partial
+                    # confirmation cannot be replayed under another control ID.
+                    self.journal.set('setup_confirmation',{'setup_id':setup['setup_id'],'control_id':cid})
+                    try:
+                        def setup_edge():
+                            self.journal.check_lease(str(value.get('consumer','')),int(value.get('fence',0)))
+                            if self.journal.get('close') or time.monotonic()>=deadline or self.journal.get('setup')!=setup:
+                                return WriteReceipt('not_written',detail='Close, deadline, or phase change fenced setup choice')
+                            return self.driver.control(native_control,deadline=deadline)
+                        result=self.call(setup_edge,deadline=deadline)
+                    except RuntimeContractError as exc:
+                        if exc.code not in {'DEADLINE_EXPIRED','NATIVE_BUSY','LEASE_FENCED'}:
+                            raise
+                        result=WriteReceipt('not_written',detail='controller refused before startup choice: '+exc.code)
+                    except (RuntimeError,OSError,TimeoutError):
+                        result=WriteReceipt('unknown',detail='finite startup confirmation outcome ambiguous; no replay')
+                    if result.state in {'not_written','rejected','unsupported'}:
+                        self.journal.set('setup_confirmation',None)
             elif op == "submit":
                 if command.get("source","gui") not in {"gui","native_completion","automation","reconciliation","system"}:
                     raise RuntimeContractError("COMMAND_INVALID", "unknown activity source")
@@ -470,6 +520,7 @@ class Controller:
     def status(self) -> dict:
         return {"generation":self.generation,"contract":CONTRACT_REVISION,"ready":self.ready,
                 "lost":self.lost,"identity":dataclasses.asdict(self.identity) if self.identity else None,
+                "setup":self.journal.get('setup'),"setup_confirmation":self.journal.get('setup_confirmation'),
                 **self.journal.replay(self.journal.get("sequence"))}
 
 
