@@ -81,7 +81,8 @@ def test_legacy_broker_and_reaper_do_not_take_native_turns(database):
     assert ReaperStore(str(path)).candidates() == []
 
 
-def test_replay_projects_root_turn_once_and_child_terminal_does_not_finish_it(database):
+@pytest.mark.parametrize('root_thread', ['root', None])
+def test_replay_projects_root_turn_once_and_child_terminal_does_not_finish_it(database,root_thread):
     path, con = database
     con.execute("UPDATE conversations SET runtime_mode='native_experiment',state='queued',runtime_projection=?",(json.dumps({'generation_id':'g','state':'ready'}),))
     mid = con.execute("INSERT INTO conversation_messages(conversation_id,sender_kind,sender_ref,message_kind,body,idempotency_key,request_hash,state) VALUES('cv','user','1','prompt','hello','m','h','queued')").lastrowid
@@ -90,8 +91,8 @@ def test_replay_projects_root_turn_once_and_child_terminal_does_not_finish_it(da
     store = RuntimeStore(path)
     lease = store.attach('g',1,1,'api')
     store.intent('g',1,1,lease,'send','submit',{'text':'hello','message_id':mid,'run_id':rid})
-    def event(n,kind,thread='root',data=None):
-        value = RuntimeEvent(kind,NativeReference('root',thread_id=thread,activity_id='turn'),request_id='send' if thread=='root' else None,data=data or {})
+    def event(n,kind,thread=root_thread,data=None):
+        value = RuntimeEvent(kind,NativeReference('root',thread_id=thread,activity_id='turn'),request_id='send' if thread in {None,'root'} else None,data=data or {})
         return {'sequence':n,'event':dataclasses.asdict(value)}
     frames = [event(1,'activity.processed'),event(2,'output.delta',data={'text':'one'}),event(3,'activity.terminal','child',{'status':'completed'})]
     replay = {'events':frames,'partial':False}
@@ -147,3 +148,45 @@ def test_close_fence_survives_api_death_and_only_verified_cleanup_releases_slot(
         assert con.execute('SELECT state FROM conversations').fetchone()[0]=='idle'
         assert run.browser_conversation_active(con,1)
         assert cleanup['outcome']=='pending'
+
+
+def test_cleanup_chat_failure_rolls_back_generation_and_restart_finalizes_without_native_write(database,monkeypatch):
+    path,con=database
+    con.execute("UPDATE conversations SET runtime_mode='native_experiment',runtime_projection=?",(json.dumps({'generation_id':'g','state':'ready'}),))
+    con.commit()
+    class OwnedSupervisor:
+        def stop(self,generation): return {'os_cleanup':{'complete':True}}
+    service=NativeChatsService(path,path.parent,OwnedSupervisor())
+    service.request_close(con,'cv',1,1)
+    service.store.receipt('g',1,1,'close:g',{'state':'written','native_cleanup':{'outcome':'complete'}})
+    def crash(con,cid): raise RuntimeError('simulated API death during finalization')
+    monkeypatch.setattr(service,'_finish_chat',crash)
+    with pytest.raises(RuntimeError,match='API death'):
+        service.recover_close('g','cv',1,1)
+    assert con.execute('SELECT state FROM conversation_runtime_generations').fetchone()[0]=='closing'
+    assert json.loads(con.execute('SELECT runtime_projection FROM conversations').fetchone()[0])['state']=='closing'
+    assert run.browser_conversation_active(con,1)
+    replacement=NativeChatsService(path,path.parent,OwnedSupervisor())
+    replacement.recover_close('g','cv',1,1)
+    assert con.execute('SELECT state FROM conversations').fetchone()[0]=='closed'
+    assert con.execute('SELECT state FROM conversation_runtime_generations').fetchone()[0]=='closed'
+    assert con.execute('SELECT COUNT(*) FROM conversation_runtime_commands').fetchone()[0]==1
+    assert not run.browser_conversation_active(con,1)
+
+
+def test_old_verified_closed_generation_repairs_unfinished_chat_without_attach(database,monkeypatch):
+    path,con=database
+    cleanup={'outcome':'complete','unit_verified_exited':True}
+    con.execute("UPDATE conversations SET runtime_mode='native_experiment',runtime_projection=?",(json.dumps({'generation_id':'g','state':'closing'}),))
+    con.execute("UPDATE conversation_runtime_generations SET state='closed',close_intent=1,cleanup_json=?",(json.dumps(cleanup),))
+    con.commit()
+    class NoNativeAccess:
+        def stop(self,generation): raise AssertionError('already verified exited')
+    service=NativeChatsService(path,path.parent,NoNativeAccess())
+    monkeypatch.setattr(service,'attach',lambda generation: pytest.fail('closed generation must not attach'))
+    # Run one consumer iteration without spawning an unbounded worker.
+    monkeypatch.setattr(service.wake,'wait',lambda seconds: service.stopped.set())
+    service.run()
+    assert con.execute('SELECT state FROM conversations').fetchone()[0]=='closed'
+    assert json.loads(con.execute('SELECT runtime_projection FROM conversations').fetchone()[0])['state']=='closed'
+    assert con.execute('SELECT COUNT(*) FROM conversation_runtime_commands').fetchone()[0]==0

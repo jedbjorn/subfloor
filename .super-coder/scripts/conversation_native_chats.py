@@ -56,7 +56,7 @@ def project_event(con, cid: str, sequence: int, event: dict, *, primary: dict | 
                               (generation,event['request_id'])).fetchone()
     intent = json.loads(command['intent_json']) if command else {}
     mid, rid = intent.get('message_id'), intent.get('run_id')
-    root_activity = bool(ref.get('root_id') and ref.get('thread_id') == ref.get('root_id'))
+    root_activity = bool(ref.get('root_id') and ref.get('thread_id') in {None, ref['root_id']})
     projection.update(controller_sequence=sequence,observed_at=event['observed_at'],
                       freshness=event['freshness'],partial=bool(projection.get('partial') or event['partial']))
     if current['close_intent']:
@@ -231,12 +231,26 @@ class NativeChatsService:
                    'unresolved_work':native_cleanup.get('unresolved_work',[]),
                    'unresolved_definitions':native_cleanup.get('unresolved_definitions',[]),
                    'detail':native_cleanup.get('detail','')}
-        self.store.state(generation,owner,shell,'closed' if complete else 'lost',cleanup)
+        self._commit_cleanup(generation,cid,owner,shell,cleanup)
+
+    def _commit_cleanup(self,generation: str,cid: str,owner: int,shell: int,cleanup: dict) -> None:
+        # Generation truth and chat finalization share a transaction. API
+        # interruption can leave both pending, never a released generation
+        # whose chat cannot be selected for completion after restart.
+        complete = bool(cleanup.get('outcome')=='complete' and cleanup.get('unit_verified_exited') is True
+                        and not cleanup.get('unresolved_work') and not cleanup.get('unresolved_definitions'))
         con = db_driver.connect(str(self.database))
         try:
             with db_driver.write_transaction(con,'native_chat.cleanup_projection'):
-                chat = con.execute('SELECT runtime_projection FROM conversations WHERE conversation_id=?',(cid,)).fetchone()
+                owned = con.execute('SELECT 1 FROM conversation_runtime_generations WHERE generation_id=? AND conversation_id=? AND owner_user_id=? AND shell_id=?',(generation,cid,owner,shell)).fetchone()
+                chat = con.execute('SELECT runtime_projection FROM conversations WHERE conversation_id=? AND owner_user_id=?',(cid,owner)).fetchone()
+                if owned is None or chat is None:
+                    raise RuntimeContractError('RUNTIME_NOT_OWNED','cleanup is outside operator tenancy')
                 projection = json.loads(chat['runtime_projection'])
+                if projection.get('generation_id')!=generation:
+                    raise RuntimeContractError('GENERATION_INVALID','cleanup is outside the captured chat generation')
+                cleanup = public_payload(cleanup,sensitive_values=self.store.secrets)
+                con.execute('UPDATE conversation_runtime_generations SET state=?,cleanup_json=?,updated_at=? WHERE generation_id=?',('closed' if complete else 'lost',encoded(cleanup),time.time(),generation))
                 projection.update(state='closed' if complete else 'lost',cleanup=cleanup,setup=None,primary=None)
                 con.execute('UPDATE conversations SET runtime_projection=?,version=version+1 WHERE conversation_id=?',(encoded(projection),cid))
                 append_event(con,cid,'control.outcome',{'generation_id':generation,'control_id':'close:'+generation,**cleanup})
@@ -275,13 +289,21 @@ class NativeChatsService:
         while not self.stopped.is_set():
             con = db_driver.connect(str(self.database))
             try:
-                rows = con.execute("SELECT g.generation_id,g.conversation_id FROM conversation_runtime_generations g JOIN conversations c USING(conversation_id) WHERE c.runtime_mode='native_experiment' AND g.state NOT IN ('closed') ORDER BY g.created_at LIMIT 4").fetchall()
+                rows = con.execute("SELECT g.generation_id,g.conversation_id,g.state,g.cleanup_json,g.owner_user_id,g.shell_id FROM conversation_runtime_generations g JOIN conversations c USING(conversation_id) WHERE c.runtime_mode='native_experiment' AND (g.state!='closed' OR c.state!='closed') ORDER BY g.created_at LIMIT 4").fetchall()
             finally:
                 con.close()
             for row in rows:
                 if self.stopped.is_set():
                     break
                 try:
+                    if row['state']=='closed':
+                        # Retained verified evidence also repairs a chat from
+                        # older interrupted finalization; no controller attach
+                        # or native write is needed for an exited generation.
+                        cleanup = json.loads(row['cleanup_json'])
+                        if cleanup.get('outcome')=='complete' and cleanup.get('unit_verified_exited') is True and not cleanup.get('unresolved_work') and not cleanup.get('unresolved_definitions'):
+                            self._commit_cleanup(row['generation_id'],row['conversation_id'],row['owner_user_id'],row['shell_id'],cleanup)
+                        continue
                     client,owner,shell = self.attach(row['generation_id'])
                     generation_state = self.store.status(row['generation_id'],owner,shell)
                     if generation_state['close_intent']:
