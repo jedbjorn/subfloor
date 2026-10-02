@@ -372,6 +372,11 @@ class Controller:
                     and event.reference.thread_id!=self.identity.root_id
                     and not (self.context and self.context.harness=='claude' and event.reference.thread_id is None)):
                 event=dataclasses.replace(event,grade='inconclusive')
+            if event.kind=='runtime.ready' and self.identity is None:
+                # A driver callback can precede its final DriverStart result.
+                # Retain the observation, but it cannot admit the generation
+                # before the captured identity and selected route are checked.
+                event=dataclasses.replace(event,grade='inconclusive')
             self.journal.emit(event)
             if event.kind=='runtime.setup' and not self.journal.get('close') and not self.ready:
                 if event.freshness=='current' and not event.partial and event.grade!='inconclusive':
@@ -451,6 +456,10 @@ class Controller:
                                                     capabilities={**started.capabilities,'submission':'inconclusive'})
                 self.identity = started.identity
                 self.ready = started.state == "ready" and self.identity is not None and not self.journal.get('close')
+                if self.ready:
+                    route_data={'native_route':self.identity.protocol['native_route']} if 'native_route' in self.identity.protocol else {}
+                    self.emit(RuntimeEvent('runtime.ready',NativeReference(self.identity.root_id,thread_id=self.identity.root_id),
+                                           provenance='controller:validated DriverStart ready',data=route_data))
                 if started.setup is not None and not self.journal.get('close'):
                     self.capture_setup(started.setup)
                     self.emit(RuntimeEvent('runtime.setup',data=dataclasses.asdict(started.setup)))

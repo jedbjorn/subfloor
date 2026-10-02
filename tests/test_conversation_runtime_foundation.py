@@ -504,13 +504,19 @@ def test_async_readiness_cannot_admit_mismatched_or_failed_native_observation(co
 def test_initial_driver_ready_observation_uses_same_selected_route_gate(controller,model,state):
     owner,driver=controller
     owner.context=None;owner.identity=None;owner.ready=False
-    driver.start=lambda context,emit,deadline: DriverStart('ready',RuntimeIdentity('root','session',protocol={
-        'native_route':{'account_type':'chatgpt','model':model,'efforts':['high'],'additional':'unused'}}))
+    def start(context,emit,*,deadline):
+        emit(RuntimeEvent('runtime.ready',NativeReference('root'),provenance='native callback before final start'))
+        return DriverStart('ready',RuntimeIdentity('root','session',protocol={
+            'native_route':{'account_type':'chatgpt','model':model,'efforts':['high'],'additional':'unused'}}))
+    driver.start=start
     prepared=json.loads(json.dumps(dataclasses.asdict(dataclasses.replace(context(owner.root),model='selected',effort='high')),default=str))
     result=owner.handle(wire('open',context=prepared))
     assert result['state']==state and owner.ready==(state=='ready')
     assert owner.identity.root_id=='root' and owner.identity.session_id=='session'
     assert 'additional' not in owner.identity.protocol['native_route']
+    ready_events=[frame['event'] for frame in owner.journal.replay(0)['events'] if frame['event']['kind']=='runtime.ready']
+    assert ready_events[0]['grade']=='inconclusive'
+    assert sum(event['grade'] in {'compatible','unverified'} for event in ready_events)==(state=='ready')
     assert owner.handle(wire('close',command=control('close',1,action='close')))['outcome']=='complete'
 
 
