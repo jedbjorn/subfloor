@@ -35,11 +35,15 @@ CHECK_PATH = '/api/experiment-native-check'
 def semantic_witness(raw: dict) -> dict:
     """Fixed diagnostic scalars only; never journal/native unknown fields."""
     stages={'allocation','startup','first_processing','first_reply','initial_work_inventory',
+            'initial_snapshot','root_tagged_pid','child_ancestry','child_terminal','child_tagged_pid',
             'nonce_recall','stop_reply','stop_terminal','stop_child','finished'}
     stage=raw.get('waiting_stage')
     result: dict[str,Any]={'waiting_stage':stage if isinstance(stage,str) and stage in stages else 'unknown'}
     for name in ('first_root_processed','first_final_nonce_matches','first_successful_reply',
-                 'second_final_nonce_matches','first_close_observed','native_complete_retained','cleanup_fenced'):
+                 'second_final_nonce_matches','first_close_observed','native_complete_retained','cleanup_fenced',
+                 'initial_snapshot_observed','initial_snapshot_current','initial_snapshot_partial',
+                 'initial_root_terminal_current','initial_child_ancestry_current',
+                 'initial_child_active_turn_present','observed_child_terminal_current'):
         if type(raw.get(name)) is bool:
             result[name]=raw[name]
     outcome=raw.get('first_close_outcome')
@@ -47,6 +51,10 @@ def semantic_witness(raw: dict) -> dict:
         result['first_close_outcome']=outcome
     for name in ('first_close_unresolved_work','first_close_unresolved_definitions'):
         if type(raw.get(name)) is int and 0<=raw[name]<=4096:
+            result[name]=raw[name]
+    for name in ('root_tagged_pid_candidates','child_tagged_pid_candidates',
+                 'root_owned_pid_matches','child_owned_pid_matches'):
+        if type(raw.get(name)) is int and 0<=raw[name]<=128:
             result[name]=raw[name]
     for name in ('first_root_terminal_counts','child_terminal_counts'):
         values=raw.get(name)

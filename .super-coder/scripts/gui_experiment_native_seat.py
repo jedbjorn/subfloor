@@ -87,6 +87,7 @@ class NativeFixtureSeat:
                'gui_experiment_probe_owner.py','gui_experiment_runtime.py','gui_experiment_chats.py','conversation_runtime_native_probes.py','conversation_native_chats.py','conversation_native_checks.py',
                'gui_experiment_readiness.py','conversation_boot.py','run.py','route_transport.py',
                'execution_view.py','execution_view_exec.py')]
+        if harness=='codex':paths.append(scripts/'conversation_runtime_codex_schema.py')
         paths.extend([scripts/'conversation_adapters'/f'{harness}_runtime.py',
                       self.root/'.super-coder/api/route_bindings.py',self.root/'fixture_bootstrap.py',
                       self.root/'.super-coder/adapters'/harness/'adapter.json'])
