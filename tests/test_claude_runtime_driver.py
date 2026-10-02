@@ -45,12 +45,14 @@ def seat(tmp_path):
     context = RuntimeContext("gen", "chat", 1, 1, "claude", state, worktree,
         ExecutableBinding(executable, hashlib.sha256(executable.read_bytes()).hexdigest(), "test-version"),
         runtime.REVISION, hashlib.sha256(boot.encode()).hexdigest(), "canonical-policy", "unrestricted",
+        model="claude-sonnet-5-5", effort="high",
         boot_content=boot, env={"HOME": str(tmp_path), "PATH": os.environ["PATH"]},
         controller_endpoint=tmp_path / "controller.sock")
     driver = runtime.ClaudeRuntimeDriver()
     events = []
     driver._context, driver._emit = context, events.append
     driver._identity = RuntimeIdentity("00000000-0000-4000-a000-000000000000")
+    driver._native_auth = {"method": "claude.ai", "provider": "firstParty"}  # Synthetic source fixture.
     with driver._condition:
         yield driver, context, events
 
@@ -104,7 +106,9 @@ def startup_dialog():
 def startup_seat(seat, tmp_path, monkeypatch):
     _, context, _ = seat
     prepared_assets(tmp_path, monkeypatch)
-    context.executable.path.write_text("#!/usr/bin/python3\nimport sys,time\n"
+    context.executable.path.write_text("#!/usr/bin/python3\nimport sys,time,json\n"
+        + "if sys.argv[1:]==['auth','status','--json']:\n"
+        + " print(json.dumps({'loggedIn':True,'authMethod':'claude.ai','apiProvider':'firstParty'}));sys.exit(0)\n"
         + f"print({startup_dialog()!r},end='',flush=True)\n"
         + "sys.stdin.readline()\nprint('fixture confirmation consumed',flush=True)\ntime.sleep(5)\n")
     context.executable.path.chmod(0o700)
@@ -237,7 +241,7 @@ def test_native_initialization_does_not_equal_consent_or_ready(seat):
     driver, context, events = seat
     driver._context = replace(context, capability_evidence={"submission": "compatible"})
     transcript = Path(context.env["HOME"]) / ".claude/projects/exact" / (driver._identity.root_id + ".jsonl")
-    hook(seat, "SessionStart", transcript_path=str(transcript))
+    hook(seat, "SessionStart", transcript_path=str(transcript), model=context.model)
     driver.asset({"kind": "channel.ready"}, peer=ProcessIdentity(999999999, 10), deadline=DEADLINE())
     assert not driver._ready
     assert driver.submit(request(), deadline=DEADLINE()).state == "not_written"
@@ -248,7 +252,7 @@ def test_native_initialization_does_not_equal_consent_or_ready(seat):
     driver._transcript_record({"sessionId": driver._identity.root_id, "type": "assistant",
         "promptId": "ready-prompt", "message": {"id": "observed-native-message",
         "content": [{"type": "text", "text": nonce}]}})
-    hook(seat, "Stop", prompt_id="ready-prompt", background_tasks=[], session_crons=[])
+    hook(seat, "Stop", prompt_id="ready-prompt", background_tasks=[], session_crons=[], effort={"level": "high"})
     assert not driver._ready  # Pre-terminal Stop can be blocked by another hook.
     driver._transcript_record({"sessionId": driver._identity.root_id, "type": "system",
         "promptId": "ready-prompt", "subtype": "turn_duration"})
@@ -256,7 +260,92 @@ def test_native_initialization_does_not_equal_consent_or_ready(seat):
     ready = [event for event in events if event.kind == "runtime.ready"]
     assert ready[0].data["inference_turns"] == 1
     assert ready[0].data["observed_model_message_ids"] == 1
+    assert ready[0].data["native_route"]["model"] == "claude-sonnet-5-5"
+    assert ready[0].data["native_route"]["efforts"] == ["high"]
+    assert ready[0].data["native_route"]["catalogue_observed"] is False
+    assert "memory_policy" not in driver._identity.protocol
     assert not [event for event in events if event.kind == "output.final"]
+
+
+@pytest.mark.parametrize("mutation", [{"loggedIn": False}, {"loggedIn": 1},
+    {"authMethod": "api_key"}, {"authMethod": "oauth_token"}, {"apiProvider": "gateway"}])
+def test_account_route_refuses_absent_or_alternate_auth_without_copying_private_fields(mutation):
+    status = {"loggedIn": True, "authMethod": "claude.ai", "apiProvider": "firstParty",
+              "email": "private@example.invalid", "orgId": "private-id", "unknown": "private"}
+    with pytest.raises(RuntimeContractError) as caught:
+        runtime._parse_auth_status(json.dumps(status | mutation).encode(), 0)
+    assert caught.value.code == "NATIVE_ACCOUNT_INCONCLUSIVE"
+    assert "private" not in str(caught.value)
+
+
+def test_account_observation_consumes_only_bounded_public_route_enums():
+    value = runtime._parse_auth_status(json.dumps({"loggedIn": True, "authMethod": "claude.ai",
+        "apiProvider": "firstParty", "subscriptionType": "max", "email": "private@example.invalid",
+        "orgId": "private", "configDirectory": "/private", "new": {"token": "private"}}).encode(), 0)
+    assert value == {"method": "claude.ai", "provider": "firstParty", "subscription_type": "max"}
+    for raw in (b"", b"not-json", b"null", b"[]", b"x" * (runtime.AUTH_STATUS_BYTES + 1)):
+        with pytest.raises(RuntimeContractError):
+            runtime._parse_auth_status(raw, 0)
+
+
+@pytest.mark.parametrize("failure", ["oversized", "deadline"])
+def test_fixed_auth_process_output_and_deadline_are_bounded_and_owned_child_is_reaped(seat, monkeypatch, failure):
+    _, context, _ = seat
+    context.executable.path.write_text("#!/usr/bin/python3\nimport sys,time\n"
+        + ("sys.stdout.write('x'*20000);sys.stdout.flush();time.sleep(5)\n" if failure == "oversized" else "time.sleep(5)\n"))
+    context.executable.path.chmod(0o700)
+    original, children = subprocess.Popen, []
+    def spawn(*args, **kwargs):
+        assert args[0] == [str(context.executable.path), "auth", "status", "--json"]
+        assert kwargs["env"] == {"HOME": "explicit-native-home"}
+        children.append(original(*args, **kwargs))
+        return children[-1]
+    monkeypatch.setattr(runtime.subprocess, "Popen", spawn)
+    started = time.monotonic()
+    with pytest.raises(RuntimeContractError) as caught:
+        runtime._auth_status(context, {"HOME": "explicit-native-home"}, started + .05)
+    assert caught.value.code == "NATIVE_ACCOUNT_INCONCLUSIVE"
+    assert time.monotonic() - started < 1 and children[0].poll() is not None
+    assert children[0].stdout.closed
+
+
+@pytest.mark.parametrize("observed_model", [None, "another-model", "sonnet"])
+def test_missing_or_different_active_model_prevents_readiness_inference_and_alias_guessing(seat, observed_model):
+    driver, context, events = seat
+    driver._context = replace(context, capability_evidence={"submission": "compatible"})
+    transcript = Path(context.env["HOME"]) / ".claude/projects/exact" / (driver._identity.root_id + ".jsonl")
+    hook(seat, "SessionStart", transcript_path=str(transcript), model=observed_model)
+    driver.asset({"kind": "channel.ready"}, peer=ProcessIdentity(999999999, 10), deadline=DEADLINE())
+    assert not driver._notifications and not driver._ready
+    assert not [event for event in events if event.kind == "runtime.ready"]
+    assert [event for event in events if event.kind == "capability.observed"][-1].grade == "inconclusive"
+
+
+@pytest.mark.parametrize("observed_effort", [None, "low", "high"])
+def test_effective_effort_is_correlated_to_readiness_turn_and_late_stop_can_complete_proof(seat, observed_effort):
+    driver, context, events = seat
+    driver._context = replace(context, capability_evidence={"submission": "compatible"})
+    transcript = Path(context.env["HOME"]) / ".claude/projects/exact" / (driver._identity.root_id + ".jsonl")
+    hook(seat, "SessionStart", transcript_path=str(transcript), model=context.model)
+    driver.asset({"kind": "channel.ready"}, peer=ProcessIdentity(999999999, 10), deadline=DEADLINE())
+    nonce = driver._readiness_nonce
+    hook(seat, "UserPromptSubmit", prompt_id="proof", prompt=channel_prompt(seat, nonce, readiness_nonce=nonce))
+    driver._transcript_record({"sessionId": driver._identity.root_id, "type": "assistant",
+        "promptId": "proof", "message": {"id": "message", "content": [{"type": "text", "text": nonce}]}})
+    driver._transcript_record({"sessionId": driver._identity.root_id, "type": "system",
+        "promptId": "proof", "subtype": "turn_duration"})
+    assert not driver._ready  # Exact terminal alone has no effective effort.
+    hook(seat, "Stop", prompt_id="unrelated", effort={"level": "high"}, background_tasks=[], session_crons=[])
+    assert not driver._ready
+    hook(seat, "Stop", prompt_id="proof", effort={} if observed_effort is None else {"level": observed_effort},
+        background_tasks=[], session_crons=[])
+    assert driver._ready == (observed_effort == "high")
+    ready = [event for event in events if event.kind == "runtime.ready"]
+    assert len(ready) == int(observed_effort == "high")
+    assert "memory_policy" not in driver._identity.protocol
+    if observed_effort == "low":
+        assert driver._capabilities()["submission"] == "inconclusive"
+        assert driver.submit(request(), deadline=DEADLINE()).state == "not_written"
 
 
 @pytest.mark.parametrize("failure", ["StopFailure", "failed_terminal", "missing_reply", "wrong_reply", "wrong_terminal_source"])
@@ -264,7 +353,7 @@ def test_failed_or_unanswered_challenge_never_certifies_readiness(seat, failure)
     driver, context, events = seat
     driver._context = replace(context, capability_evidence={"submission": "compatible"})
     transcript = Path(context.env["HOME"]) / ".claude/projects/exact" / (driver._identity.root_id + ".jsonl")
-    hook(seat, "SessionStart", transcript_path=str(transcript))
+    hook(seat, "SessionStart", transcript_path=str(transcript), model=context.model)
     driver.asset({"kind": "channel.ready"}, peer=ProcessIdentity(999999999, 10), deadline=DEADLINE())
     nonce = driver._readiness_nonce
     hook(seat, "UserPromptSubmit", prompt_id="challenge", prompt=channel_prompt(seat, nonce, readiness_nonce=nonce))
