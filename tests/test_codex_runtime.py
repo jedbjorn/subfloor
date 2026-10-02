@@ -40,6 +40,9 @@ class NativeFixture:
         self.on_submit = None
         self.closed = False
         self.fail_method = None
+        self.account = {"type": "chatgpt", "email": "not-exported@example.invalid"}
+        self.models = [{"id": "gpt-6.1-sol", "model": "gpt-6.1-sol",
+                        "supportedReasoningEfforts": [{"reasoningEffort": "high"}]}]
 
     def frame(self, method, thread="root", turn=None, **params):
         payload = {"threadId": thread, **params}
@@ -64,7 +67,9 @@ class NativeFixture:
         if method == "initialize":
             return {"userAgent": "fixture"}
         if method == "account/read":
-            return {"account": {"type": "chatgpt", "email": "not-exported@example.invalid"}}
+            return {"account": self.account}
+        if method == "model/list":
+            return {"data": self.models, "nextCursor": None}
         if method == "thread/start":
             return {"thread": {"id": "root", "sessionId": "different-metadata", "cwd": str(self.settings["cwd"])}}
         if method == "thread/memoryMode/set":
@@ -649,3 +654,79 @@ def test_managed_mcp_config_targets_app_server_subcommand_with_execution_view(se
     assert argv[:3] == ["prepared-execution-view", "--", str(context.executable.path)]
     assert argv[3:7] == ["app-server", "--stdio", *managed]
     assert 'forced_login_method="chatgpt"' in argv and "--disable" in argv
+
+
+def test_selected_route_observation_is_native_bounded_and_excludes_account_pii(seat):
+    driver, rpc, _, context = seat
+    assert driver._identity.protocol["native_route"] == {
+        "account_type": "chatgpt", "model": context.model, "efforts": ["high"]}
+    assert "email" not in str(driver._identity.protocol)
+    methods = [method for method, _ in rpc.calls]
+    assert methods.index("account/read") < methods.index("model/list") < methods.index("thread/start")
+
+
+@pytest.mark.parametrize("models", [[], [{"model": "gpt-6.1-sol", "supportedReasoningEfforts": []}],
+                                       [{"model": "gpt-6.1-sol", "supportedReasoningEfforts": [42]}]])
+def test_unobserved_selected_native_route_refuses_thread_creation(seat, models):
+    _, _, _, context = seat
+    transports = []
+    def factory(**kwargs):
+        rpc = NativeFixture(**kwargs)
+        rpc.models = models
+        transports.append(rpc)
+        return rpc
+    driver = CodexRuntimeDriver(rpc_factory=factory)
+    result = driver.start(context, lambda _: None, deadline=deadline())
+    assert result.state == "unavailable"
+    assert result.capabilities["submission"] == "inconclusive"
+    assert not any(method == "thread/start" for method, _ in transports[0].calls)
+    driver.cleanup(deadline=deadline())
+
+
+def test_additional_native_efforts_are_observed_without_breaking_selected_high(seat):
+    _, _, _, context = seat
+    def factory(**kwargs):
+        rpc = NativeFixture(**kwargs)
+        rpc.models[0]["supportedReasoningEfforts"].append({"reasoningEffort": "future-effort", "extra": True})
+        rpc.models[0]["harmless"] = True
+        return rpc
+    driver = CodexRuntimeDriver(rpc_factory=factory)
+    result = driver.start(context, lambda _: None, deadline=deadline())
+    assert result.state == "ready"
+    assert result.identity.protocol["native_route"]["efforts"] == ["future-effort", "high"]
+    driver.cleanup(deadline=deadline())
+
+
+def test_native_account_mismatch_is_inconclusive_before_model_or_thread(seat):
+    _, _, _, context = seat
+    transports = []
+    def factory(**kwargs):
+        rpc = NativeFixture(**kwargs)
+        rpc.account = {"type": "apiKey"}
+        transports.append(rpc)
+        return rpc
+    driver = CodexRuntimeDriver(rpc_factory=factory)
+    result = driver.start(context, lambda _: None, deadline=deadline())
+    assert result.state == "unavailable" and result.capabilities["submission"] == "inconclusive"
+    assert not any(method in {"model/list", "thread/start"} for method, _ in transports[0].calls)
+    driver.cleanup(deadline=deadline())
+
+
+def test_selected_model_observation_follows_bounded_native_pagination(seat):
+    _, _, _, context = seat
+    class Paginated(NativeFixture):
+        def request(self, method, params, *, deadline):
+            if method == "model/list" and params["cursor"] is None:
+                self.calls.append((method, dict(params)))
+                return {"data": [{"model": "other"}], "nextCursor": "second-page"}
+            return super().request(method, params, deadline=deadline)
+    transport = []
+    def factory(**kwargs):
+        rpc = Paginated(**kwargs)
+        transport.append(rpc)
+        return rpc
+    driver = CodexRuntimeDriver(rpc_factory=factory)
+    result = driver.start(context, lambda _: None, deadline=deadline())
+    assert result.state == "ready"
+    assert [p["cursor"] for m, p in transport[0].calls if m == "model/list"] == [None, "second-page"]
+    driver.cleanup(deadline=deadline())
