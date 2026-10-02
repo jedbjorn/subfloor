@@ -343,7 +343,7 @@ class CodexRuntimeDriver(RuntimeDriver):
             if context.managed_mcp_files:
                 raise RuntimeContractError("MCP_NOT_READY", "prepared Codex MCP injection shape is not released")
             argv = context.execution_argv([
-                str(executable), *context.managed_mcp_args, "app-server", "--stdio", "--disable", "memories",
+                str(executable), "app-server", "--stdio", *context.managed_mcp_args, "--disable", "memories",
                 "--disable", "external_agent_memory_import",
                 "-c", 'forced_login_method="chatgpt"', "-c", 'model_provider="openai"',
                 "-c", "memories.generate_memories=false", "-c", "memories.use_memories=false",
