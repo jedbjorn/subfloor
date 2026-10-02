@@ -193,9 +193,9 @@ def test_replay_projects_root_turn_once_and_child_terminal_does_not_finish_it(da
     lease = store.attach('g',1,1,'api')
     store.intent('g',1,1,lease,'send','submit',{'text':'hello','message_id':mid,'run_id':rid})
     def event(n,kind,thread=root_thread,data=None):
-        value = RuntimeEvent(kind,NativeReference('root',thread_id=thread,activity_id='turn'),request_id='send' if thread in {None,'root'} else None,data=data or {})
+        value = RuntimeEvent(kind,NativeReference('root',thread_id=thread,activity_id='turn',item_id='reply'),request_id='send' if thread in {None,'root'} else None,data=data or {})
         return {'sequence':n,'event':dataclasses.asdict(value)}
-    frames = [event(1,'activity.processed'),event(2,'output.delta',data={'text':'one'}),event(3,'activity.terminal','child',{'status':'completed'})]
+    frames = [event(1,'activity.processed'),event(2,'output.final',data={'text':'one','kind':'assistant'}),event(3,'activity.terminal','child',{'status':'completed'})]
     replay = {'events':frames,'partial':False}
     assert store.ingest('g',1,1,lease,replay,project=project_event) == 3
     assert con.execute('SELECT state FROM conversation_runs').fetchone()[0] == 'running'
