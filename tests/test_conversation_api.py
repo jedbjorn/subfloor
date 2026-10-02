@@ -3297,6 +3297,26 @@ class ConversationMessageOrderTest(ConversationApiCase):
             con.commit()
         return conversation_id, message_ids
 
+    def test_message_unknown_response_reconciles_exact_owned_request_key(self) -> None:
+        conversation_id, message_ids = self.seed_messages(count=3)
+        path = f"/api/conversations/{conversation_id}/messages"
+        status, _, result = self.request("GET", path + "?request_key=key-1")
+        self.assertEqual(status, 200, result)
+        self.assertEqual([item["message_id"] for item in result["items"]], [message_ids[1]])
+        self.assertEqual(result["items"][0]["request_key"], "key-1")
+        self.assertIsNone(result["next_cursor"])
+        status, _, missing = self.request("GET", path + "?request_key=absent")
+        self.assertEqual(status, 200, missing)
+        self.assertEqual(missing["items"], [])
+        for query in ("?request_key=", "?request_key=key-1&request_key=key-2"):
+            status, _, invalid = self.request("GET", path + query)
+            self.assertEqual(status, 422, invalid)
+        with closing(self.connect()) as con:
+            foreign_id = self.seed_conversation(con, number=881, owner_user_id=2)
+            con.commit()
+        status, _, foreign = self.request("GET", f"/api/conversations/{foreign_id}/messages?request_key=key-1")
+        self.assertEqual(status, 404, foreign)
+
     def test_message_order_defaults_ascending_and_descending_pages_read_newest_states(self) -> None:
         conversation_id, message_ids = self.seed_messages()
         path = f"/api/conversations/{conversation_id}/messages"
