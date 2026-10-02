@@ -57,6 +57,32 @@ def test_actual_source_signatures_are_required_subset_without_native_certificate
     assert required_subset(observed,required['stop_reply']) is not None
 
 
+def test_semantic_witness_drops_unknown_payloads_and_validates_scalar_types():
+    safe=runtime.semantic_witness({'waiting_stage':'first_reply','first_root_processed':True,
+        'first_root_terminal_counts':{'completed':1,'failed':0,'interrupted':0,'other':2,'private_payload':'secret'},
+        'child_terminal_counts':{'completed':True,'failed':-1,'other':5000},
+        'first_final_nonce_matches':True,'first_successful_reply':'yes',
+        'first_close_observed':False,'first_close_outcome':'unknown-native-secret',
+        'first_close_unresolved_work':True,'first_close_unresolved_definitions':2,
+        'raw_output':'secret','request_id':'secret','auth':'secret'})
+    assert safe=={'waiting_stage':'first_reply','first_root_processed':True,
+        'first_root_terminal_counts':{'completed':1,'failed':0,'interrupted':0,'other':2},
+        'child_terminal_counts':{},'first_final_nonce_matches':True,'first_close_observed':False,
+        'first_close_unresolved_definitions':2}
+    assert runtime.semantic_witness({'waiting_stage':'unknown raw prompt'})=={'waiting_stage':'unknown'}
+    assert runtime.semantic_witness({'waiting_stage':[],'first_close_outcome':{}})=={'waiting_stage':'unknown'}
+
+
+def test_fixed_api_reads_witness_without_exporting_intents_or_native_unknown_payload(operation,monkeypatch):
+    value,fp,_,_=operation
+    value.fingerprint=fp
+    monkeypatch.setattr(value.factory,'witness',lambda bound:{'waiting_stage':'first_reply',
+        'first_root_processed':True,'first_final_nonce_matches':True,'raw_nonce':'secret'} if bound==fp else {})
+    report=value.status()
+    assert report['behavior_witness']=={'waiting_stage':'first_reply','first_root_processed':True,'first_final_nonce_matches':True}
+    assert 'secret' not in json.dumps(report)
+
+
 def test_fixed_check_singleflight_and_completed_empty_evidence_does_not_admit(operation):
     value,fp,con,calls=operation
     future=Future();requests=[]
