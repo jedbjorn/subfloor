@@ -1698,7 +1698,7 @@ def _create_conversation(con, operator: dict, headers, body: dict):
         conversation_id,
     )
     _sweep_chat_uploads(con)
-    if runtime_mode == 'native_experiment':
+    if runtime_mode == 'native_experiment' and conversation_native_chats._SERVICE is not None:
         conversation_native_chats._SERVICE.notify()
     row = _require_conversation(con, conversation_id, operator["user_id"])
     return _json(
@@ -1986,7 +1986,7 @@ def _create_message(con, operator: dict, conversation_id: str, headers, body: di
         if conversation['runtime_mode']=='native_experiment':
             if conversation['state']=='closed':
                 raise ApiError(409,'NATIVE_CHAT_CLOSED','closed native history cannot start a replacement generation')
-            runtime = conversation_native_chats.projection(conversation)
+            runtime = conversation_native_chats.projection(conversation) or {}
             if (conversation_native_chats._SERVICE is None or runtime.get('state')!='ready'
                     or runtime.get('capabilities',{}).get('submission')!='compatible'):
                 raise ApiError(409,'NATIVE_INPUT_UNAVAILABLE','native startup and checked submission coverage are required before input')
@@ -2050,7 +2050,7 @@ def _create_message(con, operator: dict, conversation_id: str, headers, body: di
             conversation_id,
         )
     conversation_broker.notify_commit()
-    if conversation['runtime_mode']=='native_experiment':
+    if conversation['runtime_mode']=='native_experiment' and conversation_native_chats._SERVICE is not None:
         conversation_native_chats._SERVICE.notify()
     return _json(
         202,
@@ -3051,6 +3051,32 @@ def handle(method: str, path: str, headers_raw: str, raw_body: bytes) -> tuple:
             interruptions = _INTERRUPTIONS_PATH.fullmatch(parsed.path)
             if interruptions and method == "POST":
                 return _interrupt(con, operator, interruptions.group(1), headers, body)
+            native_control = _RUNTIME_CONTROLS_PATH.fullmatch(parsed.path)
+            if native_control and method=='POST':
+                _only_fields(body,{'version','generation_id','action','expected_activity_id','work_key','setup_id'})
+                body['version'] = _integer(body.get('version'),'version')
+                if body['version']<1:
+                    raise ApiError(422,'CONTROL_INVALID','positive conversation version required')
+                for field in ('generation_id','action'):
+                    body[field] = _nonblank(body.get(field),field,maximum=255)
+                if body['action'] not in {'enable_local_channel','stop_reply','stop_work','stop_automation'}:
+                    raise ApiError(422,'CONTROL_INVALID','unknown native control action')
+                for field in ('expected_activity_id','work_key','setup_id'):
+                    if field in body:
+                        body[field] = _nonblank(body[field],field,maximum=2048 if field=='work_key' else 255)
+                required = {'enable_local_channel':{'setup_id'},'stop_reply':{'expected_activity_id'},'stop_work':{'work_key'},'stop_automation':{'work_key'}}[body['action']]
+                allowed = required|({'expected_activity_id'} if body['action']=='stop_work' else set())
+                scope = set(body)&{'expected_activity_id','work_key','setup_id'}
+                if not required<=scope or not scope<=allowed:
+                    raise ApiError(422,'CONTROL_INVALID','native control fields do not match the finite action')
+                service = conversation_native_chats._SERVICE
+                if service is None:
+                    raise ApiError(409,'NATIVE_EXPERIMENT_UNAVAILABLE','owned experimental service is unavailable')
+                try:
+                    result = service.control(con,native_control.group(1),operator['user_id'],_idempotency_key(headers),body)
+                except RuntimeContractError as exc:
+                    raise ApiError(409,exc.code,str(exc)) from exc
+                return _json(202,result)
             if _EVENTS_PATH.fullmatch(parsed.path) and method == "GET":
                 return _err(
                     406,

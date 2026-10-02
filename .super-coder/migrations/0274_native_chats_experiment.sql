@@ -9,4 +9,12 @@ CREATE TABLE IF NOT EXISTS conversation_runtime_capability_cache (
  evidence_json TEXT NOT NULL,
  updated_at REAL NOT NULL
 );
+CREATE TABLE IF NOT EXISTS conversation_runtime_http_requests (
+ conversation_id TEXT NOT NULL REFERENCES conversations(conversation_id),
+ request_key TEXT NOT NULL,
+ request_hash TEXT NOT NULL,
+ generation_id TEXT NOT NULL REFERENCES conversation_runtime_generations(generation_id),
+ command_id TEXT NOT NULL,
+ PRIMARY KEY(conversation_id,request_key)
+);
 COMMIT;

@@ -194,6 +194,78 @@ def test_old_verified_closed_generation_repairs_unfinished_chat_without_attach(d
     assert con.execute('SELECT COUNT(*) FROM conversation_runtime_commands').fetchone()[0]==0
 
 
+@pytest.mark.parametrize('delivery',['written','unknown'])
+def test_native_control_stable_request_never_rewrites_ambiguous_or_written_delivery(database,monkeypatch,delivery):
+    path,con=database
+    runtime={'generation_id':'g','state':'ready','primary':{'root_id':'root','thread_id':'root','activity_id':'turn'},'capabilities':{'stop_reply':'compatible'}}
+    con.execute("UPDATE conversations SET runtime_mode='native_experiment',runtime_projection=?",(json.dumps(runtime),));con.commit()
+    service=NativeChatsService(path,path.parent,None)
+    class Client:
+        writes=[]
+        def request(self,op,**fields):
+            self.writes.append((op,fields))
+            if delivery=='unknown': raise OSError('lost response after possible native write')
+            return {'state':'written','native_ack':True}
+    client=Client();monkeypatch.setattr(service,'attach',lambda generation:(client,1,1))
+    body={'version':1,'generation_id':'g','action':'stop_reply','expected_activity_id':'turn'}
+    first=service.control(con,'cv',1,'stable',body)
+    assert first['state']==delivery
+    duplicate=service.control(con,'cv',1,'stable',body)
+    assert duplicate['duplicate'] is True and duplicate['state']==delivery
+    assert len(client.writes)==1
+    with pytest.raises(RuntimeContractError,match='different request'):
+        service.control(con,'cv',1,'stable',body|{'expected_activity_id':'new-turn'})
+    assert len(client.writes)==1
+    command=client.writes[0][1]['command']
+    assert command['target']==runtime['primary']
+    assert con.execute('SELECT COUNT(*) FROM conversation_runtime_commands').fetchone()[0]==1
+
+
+@pytest.mark.parametrize('variant,verdict', [('terminal','compatible'),('child','inconclusive')])
+def test_stop_work_admits_only_matching_direct_target_coverage(database,monkeypatch,variant,verdict):
+    path,con=database
+    runtime={'generation_id':'g','state':'ready','capabilities':{'stop_work':'compatible','stop_work_terminal':'compatible','stop_work_child':'inconclusive'}}
+    con.execute("UPDATE conversations SET runtime_mode='native_experiment',runtime_projection=?",(json.dumps(runtime),))
+    work=dataclasses.asdict(RuntimeEvent('work.observed',NativeReference('root',thread_id='root' if variant=='terminal' else 'child',activity_id='child-turn',native_process_id='opaque-process' if variant=='terminal' else None),data={'kind':variant}))
+    con.execute("INSERT INTO conversation_runtime_work(generation_id,work_key,projection_json,last_sequence) VALUES('g','stored-target',?,1)",(json.dumps(work),));con.commit()
+    service=NativeChatsService(path,path.parent,None)
+    calls=[]
+    class Client:
+        def request(self,op,**fields): calls.append(fields);return {'state':'written'}
+    monkeypatch.setattr(service,'attach',lambda generation:(Client(),1,1))
+    body={'version':1,'generation_id':'g','action':'stop_work','work_key':'stored-target','expected_activity_id':'child-turn'}
+    if verdict=='compatible':
+        assert service.control(con,'cv',1,'key',body)['state']=='written'
+        assert calls[0]['command']['target']==work['reference']
+    else:
+        with pytest.raises(RuntimeContractError) as raised: service.control(con,'cv',1,'key',body)
+        assert raised.value.code=='CAPABILITY_INCONCLUSIVE'
+        assert calls==[]
+        assert con.execute('SELECT COUNT(*) FROM conversation_runtime_commands').fetchone()[0]==0
+
+
+def test_startup_control_uses_exact_stored_phase_and_close_fences_new_action(database,monkeypatch):
+    path,con=database
+    runtime={'generation_id':'g','state':'needs_consent','setup':{'setup_id':'phase','configuration_sha256':'a'*64}}
+    con.execute("UPDATE conversations SET runtime_mode='native_experiment',runtime_projection=?",(json.dumps(runtime),));con.commit()
+    service=NativeChatsService(path,path.parent,None)
+    writes=[]
+    class Client:
+        def request(self,op,**fields): writes.append(fields);return {'state':'written'}
+    monkeypatch.setattr(service,'attach',lambda generation:(Client(),1,1))
+    body={'version':1,'generation_id':'g','action':'enable_local_channel','setup_id':'phase'}
+    with pytest.raises(RuntimeContractError): service.control(con,'cv',2,'other-owner',body)
+    with pytest.raises(RuntimeContractError): service.control(con,'cv',1,'stale',body|{'setup_id':'withdrawn'})
+    assert writes==[]
+    service.control(con,'cv',1,'choice',body)
+    assert writes[0]['command']['options']==runtime['setup']
+    assert writes[0]['command']['target'] is None
+    service.request_close(con,'cv',1,1)
+    version=con.execute('SELECT version FROM conversations').fetchone()[0]
+    with pytest.raises(RuntimeContractError): service.control(con,'cv',1,'new-choice',body|{'version':version})
+    assert len(writes)==1
+
+
 def test_late_pending_cleanup_cannot_regress_verified_terminal_ownership(database):
     path,con=database
     con.execute("UPDATE conversations SET runtime_mode='native_experiment',runtime_projection=?",(json.dumps({'generation_id':'g','state':'closing'}),));con.commit()

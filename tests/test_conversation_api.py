@@ -278,6 +278,24 @@ class ConversationApiCase(unittest.TestCase):
         self.assertEqual(status,409,body)
         self.assertEqual(body['error']['code'],'CONVERSATION_IDEMPOTENCY_CONFLICT')
 
+    def test_native_control_shapes_are_finite_and_validate_before_service_dispatch(self):
+        import conversation_native_chats
+        cid=self.create()['conversation_id']
+        base={'version':1,'generation_id':'g','action':'stop_work','work_key':'stored'}
+        service=mock.Mock()
+        service.control.return_value={'state':'written','control_id':'stable'}
+        with mock.patch.object(conversation_native_chats,'_SERVICE',service):
+            invalid=[base|{'work_key':{}},base|{'version':0},base|{'setup_id':'extra'},
+                     base|{'action':'terminal_input'},base|{'action':'stop_reply'},
+                     {'version':1,'generation_id':'g','action':'enable_local_channel','setup_id':[]}]
+            for body in invalid:
+                status,_,obj=self.request('POST',f'/api/conversations/{cid}/runtime-controls',body=body,key='control')
+                self.assertEqual(status,422,obj)
+            service.control.assert_not_called()
+            status,_,obj=self.request('POST',f'/api/conversations/{cid}/runtime-controls',body=base,key='control')
+            self.assertEqual(status,202,obj)
+            self.assertEqual(service.control.call_args.args[1:4],(cid,1,'control'))
+
     def seed_sprint_conversation(self) -> str:
         with self.connect() as con:
             con.execute(
