@@ -703,6 +703,13 @@ class Controller:
                             self.journal.check_lease(str(value.get("consumer","")),int(value.get("fence",0)))
                             if self.journal.get('close') or time.monotonic()>=deadline:
                                 return WriteReceipt('not_written',detail='Close or deadline fenced pending native control')
+                            if native_control.action=='stop_reply':
+                                with self.journal.lock:
+                                    activity=command.get('expected_activity_id')
+                                    if (activity!=self.journal.get('primary') or self.journal.get('quiet_unknown')
+                                            or self.journal.get('root_occupancy_unknown')
+                                            or activity in self.journal.get('uncertain_activities')):
+                                        return WriteReceipt('not_written',detail='primary changed or root observation inconclusive before native control')
                             return self.driver.control(native_control,deadline=deadline)
                         result = self.call(control_edge,deadline=deadline)
                     except RuntimeContractError as exc:

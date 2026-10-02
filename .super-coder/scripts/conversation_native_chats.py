@@ -97,6 +97,19 @@ def project_event(con, cid: str, sequence: int, event: dict, *, primary: dict | 
     root_activity = bool(ref.get('root_id') and (ref.get('thread_id')==ref['root_id'] or current['harness']=='claude' and ref.get('thread_id') is None))
     projection.update(controller_sequence=sequence,observed_at=event['observed_at'],
                       freshness=event['freshness'],partial=bool(projection.get('partial') or event['partial']))
+    # Foreground evidence is independent of sticky aggregate work uncertainty.
+    # Retain the exact observed root activity; the journal's current primary
+    # must still match it at lifecycle admission and at the native control edge.
+    if root_activity and kind in {'activity.started','activity.processed','activity.terminal'}:
+        if kind!='activity.terminal' or not primary or ref.get('activity_id')==primary.get('activity_id'):
+            projection['primary_observation']={
+                'root_id':ref.get('root_id'),'activity_id':ref.get('activity_id'),
+                'freshness':event['freshness'],'partial':event['partial'],
+                'grade':event['grade'],'observed_at':event['observed_at'],
+                'active':kind in {'activity.started','activity.processed'},
+            }
+    elif kind in {'runtime.lost','ownership.failed'}:
+        projection['primary_observation']=None
     cleanup=json.loads(current['cleanup_json'])
     closed=(current['state']=='closed' and cleanup.get('outcome')=='complete'
             and cleanup.get('unit_verified_exited') is True and not cleanup.get('unresolved_work') and not cleanup.get('unresolved_definitions'))

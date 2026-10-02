@@ -81,6 +81,8 @@ def sprint(native):
         "state": "ready",
         "generation_id": "g",
         "primary": ref,
+        "primary_observation": {"root_id":"root","activity_id":"A","freshness":"current",
+                                "partial":False,"grade":"compatible","active":True,"observed_at":time.time()},
         "freshness": "current",
         "partial": False,
         "observed_at": time.time(),
@@ -202,8 +204,8 @@ def test_replaced_native_primary_refuses_old_pause_without_close(sprint):
     "change",
     [
         {"primary": None},
-        {"freshness": "stale"},
-        {"partial": True},
+        {"primary_observation": {"freshness": "stale"}},
+        {"primary_observation": {"partial": True}},
         {"capabilities": {}},
     ],
 )
@@ -221,6 +223,61 @@ def test_missing_or_unqualified_primary_is_named_pending(sprint, change):
     lifecycle.consume(s.n.service, "g")
     assert intents(s)[0]["state"] == "pending" and intents(s)[0]["detail"]
     assert not s.n.driver.controls and not s.n.cleanups
+
+
+def ingest_events(s):
+    import conversation_native_chats as chats
+
+    replay = s.n.client.request("subscribe", after=0)
+    activity = replay.get("primary")
+    primary = {"root_id":"root","thread_id":"root","activity_id":activity} if activity else None
+    s.n.service.store.ingest("g",1,1,s.n.client.lease,replay,
+        project=lambda con,cid,seq,event: chats.project_event(con,cid,seq,event,primary=primary))
+    return json.loads(s.con.execute("SELECT runtime_projection FROM conversations WHERE conversation_id='cv'").fetchone()[0])
+
+
+def test_actual_root_processing_after_partial_child_keeps_pause_eligible(sprint):
+    s = sprint
+    s.n.ctl.emit(RuntimeEvent("work.observed", NativeReference("root",thread_id="child",parent_thread_id="root",work_id="bg"),
+        data={"kind":"task","state":"unknown"},partial=True))
+    s.n.ctl.emit(RuntimeEvent("activity.processed",NativeReference("root",thread_id="root",activity_id="A")))
+    runtime = ingest_events(s)
+    assert runtime["partial"] is True  # Work controls still see uncertainty.
+    pause(s)
+    assert intents(s)[0]["command_id"] is not None
+    lifecycle.consume(s.n.service,"g")
+    assert s.n.driver.controls == [intents(s)[0]["command_id"]]
+    assert not s.n.cleanups
+
+
+@pytest.mark.parametrize("fields", [
+    {"partial":True}, {"freshness":"stale"}, {"grade":"inconclusive"},
+])
+def test_actual_unqualified_root_remains_pending_despite_prior_known_primary(sprint, fields):
+    s = sprint
+    s.n.ctl.emit(RuntimeEvent("activity.processed",NativeReference("root",thread_id="root",activity_id="A"),**fields))
+    ingest_events(s)
+    pause(s)
+    assert intents(s)[0]["command_id"] is None
+    assert not s.n.driver.controls
+
+
+def test_missing_root_activity_does_not_borrow_prior_primary_evidence(sprint):
+    s = sprint
+    s.n.ctl.emit(RuntimeEvent("activity.processed",NativeReference("root",thread_id="root")))
+    ingest_events(s)
+    pause(s)
+    assert intents(s)[0]["command_id"] is None
+
+
+def test_primary_observation_must_match_current_journal_primary(sprint):
+    s = sprint
+    runtime = json.loads(s.con.execute("SELECT runtime_projection FROM conversations").fetchone()[0])
+    runtime["primary"]["activity_id"]="B"
+    s.con.execute("UPDATE conversations SET runtime_projection=?",(json.dumps(runtime),))
+    s.con.commit()
+    pause(s)
+    assert intents(s)[0]["command_id"] is None
 
 
 def test_postcommit_transport_crash_retains_unknown_without_another_write(sprint):
@@ -507,3 +564,41 @@ def test_missing_link_cannot_complete_retained_developer_intent(sprint):
     assert not lifecycle.developer_cleanup_complete(
         sprint.con, sprint.sprint, conversation_id="unbound"
     )
+
+
+@pytest.mark.parametrize("fields", [{"partial":True},{"freshness":"stale"}])
+def test_root_uncertainty_after_pause_intent_is_refused_at_actual_control_edge(sprint, fields):
+    s=sprint
+    pause(s)
+    original=s.n.ctl.call
+    def race(function, *, deadline):
+        s.n.ctl.emit(RuntimeEvent("activity.processed",NativeReference("root",thread_id="root",activity_id="A"),**fields))
+        return original(function,deadline=deadline)
+    s.n.ctl.call=race
+    lifecycle.consume(s.n.service,"g")
+    assert not s.n.driver.controls and not s.n.cleanups
+    assert intents(s)[0]["state"]=="not_written"
+    assert "inconclusive" in intents(s)[0]["detail"]
+
+
+
+def test_later_uncertain_child_does_not_withdraw_known_root_eligibility(sprint):
+    s=sprint
+    s.n.ctl.emit(RuntimeEvent("activity.processed",NativeReference("root",thread_id="root",activity_id="A")))
+    s.n.ctl.emit(RuntimeEvent("work.observed",NativeReference("root",thread_id="child",parent_thread_id="root",work_id="bg"),
+        data={"kind":"task","state":"unknown"},partial=True,freshness="stale"))
+    runtime=ingest_events(s)
+    assert runtime["partial"] is True and runtime["freshness"]=="stale"
+    pause(s)
+    assert intents(s)[0]["command_id"] is not None
+    lifecycle.consume(s.n.service,"g")
+    assert s.n.driver.controls==[intents(s)[0]["command_id"]]
+
+
+def test_unknown_root_occupancy_after_pause_never_dispatches_interrupt(sprint):
+    s=sprint
+    pause(s)
+    s.n.ctl.observe_root_occupancy()
+    lifecycle.consume(s.n.service,"g")
+    assert not s.n.driver.controls and not s.n.cleanups
+    assert intents(s)[0]["state"]=="not_written"

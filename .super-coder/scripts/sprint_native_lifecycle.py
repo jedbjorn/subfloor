@@ -124,18 +124,23 @@ def persist_interrupts(con, sprint_id: int, lifecycle: str) -> tuple[str, ...]:
             primary=primary,
             detail="PRIMARY_INCONCLUSIVE",
         )
+        observed = runtime.get("primary_observation") or {}
         current = (
             runtime.get("role") == "ordinary"
             and runtime.get("state") == "ready"
-            and runtime.get("freshness") == "current"
-            and runtime.get("partial") is False
-            and 0 <= time.time() - runtime.get("observed_at", 0) <= 2
+            and observed.get("freshness") == "current"
+            and observed.get("partial") is False
+            and observed.get("grade") in {"compatible", "unverified"}
+            and observed.get("active") is True
+            and 0 <= time.time() - observed.get("observed_at", 0) <= 2
             and generation is not None
             and generation["state"] == "ready"
             and not generation["close_intent"]
             and isinstance(primary, dict)
             and bool(primary.get("root_id"))
             and bool(primary.get("activity_id"))
+            and observed.get("root_id") == primary["root_id"]
+            and observed.get("activity_id") == primary["activity_id"]
             and (
                 primary.get("thread_id") == primary["root_id"]
                 or chat["harness"] == "claude"
