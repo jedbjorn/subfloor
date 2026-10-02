@@ -278,6 +278,19 @@ class ConversationApiCase(unittest.TestCase):
         self.assertEqual(status,409,body)
         self.assertEqual(body['error']['code'],'CONVERSATION_IDEMPOTENCY_CONFLICT')
 
+    def test_created_chat_unknown_response_readback_matches_owned_request_key(self):
+        first=self.create(key='accepted-key')
+        status,_,result=self.request('GET','/api/conversations?request_key=accepted-key')
+        self.assertEqual(status,200,result)
+        self.assertEqual([row['conversation_id'] for row in result['items']],[first['conversation_id']])
+        self.assertEqual(result['items'][0]['request_key'],'accepted-key')
+        status,_,missing=self.request('GET','/api/conversations?request_key=absent')
+        self.assertEqual(status,200,missing)
+        self.assertEqual(missing['items'],[])
+        for query in ('request_key=','request_key=one&request_key=two'):
+            status,_,invalid=self.request('GET','/api/conversations?'+query)
+            self.assertEqual(status,422,invalid)
+
     def test_native_control_shapes_are_finite_and_validate_before_service_dispatch(self):
         import conversation_native_chats
         cid=self.create()['conversation_id']
