@@ -172,7 +172,11 @@
     ".super-coder/migrations/0275_native_sprint_selection.sql",
     ".super-coder/scripts/sprint_native_selection.py",
     "tests/test_native_sprint_selection.py",
-    "tests/test_native_chat_fifo.py"
+    "tests/test_native_chat_fifo.py",
+    ".super-coder/migrations/0276_native_wake_quiet.sql",
+    ".super-coder/scripts/conversation_native_chats.py",
+    ".super-coder/scripts/sprint_native_wakes.py",
+    "tests/test_native_sprint_wakes.py"
   ],
   "baseline_migration_ledger": {
     "count": 142,
@@ -416,7 +420,10 @@
     ".super-coder/docs/conversation-runtime.md",
     ".super-coder/docs/http-api.md",
     ".super-coder/docs/sprint-pr-watcher.md",
-    "docs/environment.md"
+    "docs/environment.md",
+    ".super-coder/scripts/conversation_native_chats.py",
+    ".super-coder/scripts/sprint_native_wakes.py",
+    "tests/test_native_sprint_wakes.py"
   ],
   "decision": 33,
   "generation_markers": {

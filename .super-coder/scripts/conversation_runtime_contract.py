@@ -271,6 +271,11 @@ class NativeControl:
     options: Mapping[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
+        if (self.action=='close' and self.options and
+                (set(self.options)!={'wake_quiet_epoch','wake_quiet_seconds'}
+                 or any(type(v) is not int or v<0 for v in self.options.values())
+                 or self.target is not None or self.expected_activity_id is not None)):
+            raise RuntimeContractError('COMMAND_INVALID','conditional wake Close requires exact nonnegative quiet epoch/seconds')
         if self.action=='enable_local_channel':
             sid=self.options.get('setup_id')
             digest=self.options.get('configuration_sha256')

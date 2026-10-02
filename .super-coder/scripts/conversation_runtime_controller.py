@@ -141,7 +141,7 @@ class Journal:
         self.secrets = sensitive_values
         defaults: dict[str,Any] = {"sequence":0,"floor":0,"acked":0,"partial":False,
                            "primary":None,"close":False,"lease":None,"root_activities":{},
-                           "setup":None,"setup_confirmation":None}
+                           "setup":None,"setup_confirmation":None,"quiet_epoch":0,"idle_since":None,"quiet_unknown":False,"uncertain_activities":{}}
         for key,value in defaults.items():
             self.db.execute("INSERT OR IGNORE INTO meta VALUES(?,?)", (key, encoded(value)))
 
@@ -161,7 +161,18 @@ class Journal:
         self.db.execute("DELETE FROM commands WHERE ordinal<=?", (floor,))
         self.db.execute("DELETE FROM events WHERE sequence<=?", (self.get("acked"),))
 
-    def reserve_command(self, cid: str, ordinal: int, digest: str, kind: str, *, closing: bool = False) -> dict | None:
+    def quiet(self) -> dict:
+        with self.lock:
+            pending = self.db.execute("SELECT 1 FROM commands WHERE kind='submit' AND state IN ('accepted','written','processed','unknown') LIMIT 1").fetchone() is not None
+            idle = self.get('primary') is None and not pending and not self.get('partial') and not self.get('close') and not self.get('quiet_unknown') and not self.get('uncertain_activities')
+            if not idle:
+                self.set('idle_since',None)
+            elif self.get('idle_since') is None:
+                self.set('idle_since',time.time())
+            return {'epoch':self.get('quiet_epoch'),'idle_since':self.get('idle_since'),
+                    'idle':idle,'pending_submission':pending}
+
+    def reserve_command(self, cid: str, ordinal: int, digest: str, kind: str, *, closing: bool = False, quiet: dict | None = None, quiet_ready: bool = True) -> dict | None:
         with self.lock:
             self.db.execute("BEGIN IMMEDIATE")
             try:
@@ -172,6 +183,17 @@ class Journal:
                     if row["state"] != "not_written":
                         self.db.execute("COMMIT")
                         return {"state": row["state"], "receipt": json.loads(row["receipt"]), "duplicate":True}
+                quiet_refused=False
+                if quiet is not None:
+                    observed=self.quiet()
+                    quiet_refused=(not quiet_ready or self.get('close') or not observed['idle'] or observed['epoch']!=quiet['wake_quiet_epoch']
+                                   or time.time()-observed['idle_since']<quiet['wake_quiet_seconds'])
+                if row:
+                    if quiet_refused:
+                        receipt={'state':'not_written','detail':'WAKE_NOT_QUIET'}
+                        self.db.execute("UPDATE commands SET state='not_written',receipt=? WHERE id=?",(encoded(receipt),cid))
+                        self.db.execute('COMMIT')
+                        return receipt
                     if self.get("close") and not closing:
                         raise RuntimeContractError("RUNTIME_CLOSING", "close intent blocks retry of proved no-write")
                     count,size=self.db.execute("SELECT COUNT(*),COALESCE(SUM(length(payload)),0) FROM events").fetchone()
@@ -180,6 +202,8 @@ class Journal:
                     # Explicit no-write may retry the SAME intent/ordinal.
                     # Unknown/written/processed never enter this path.
                     self.db.execute("UPDATE commands SET state='accepted' WHERE id=?",(cid,))
+                    if closing:
+                        self.set('close',True)
                     self.db.execute("COMMIT")
                     return None
                 if ordinal <= self.get("floor"):
@@ -187,16 +211,25 @@ class Journal:
                 self._compact()
                 count = self.db.execute("SELECT COUNT(*) FROM commands").fetchone()[0]
                 events, size = self.db.execute("SELECT COUNT(*),COALESCE(SUM(length(payload)),0) FROM events").fetchone()
-                limit = self.max_commands if closing else self.max_commands - self.reserve
-                if count >= limit or (not closing and (events >= self.max_events - self.reserve or size >= self.max_bytes - MAX_FRAME_BYTES)):
+                unconditional_close=closing and quiet is None
+                limit = self.max_commands if unconditional_close else self.max_commands - self.reserve
+                if count >= limit or (not unconditional_close and (events >= self.max_events - self.reserve or size >= self.max_bytes - MAX_FRAME_BYTES)):
                     raise RuntimeContractError("BACKPRESSURE", "journal retains live or unacknowledged evidence; dispatch refused")
                 if self.get("close") and not closing:
                     raise RuntimeContractError("RUNTIME_CLOSING", "close intent blocks new native commands")
                 if not closing and len(self.get("root_activities")) >= self.max_commands-self.reserve:
                     raise RuntimeContractError("BACKPRESSURE", "retained native activity identities exhausted dispatch capacity")
+                if quiet_refused:
+                    receipt={'state':'not_written','detail':'WAKE_NOT_QUIET'}
+                    self.db.execute("INSERT INTO commands(id,ordinal,digest,kind,state,receipt) VALUES(?,?,?,?,'not_written',?)",(cid,ordinal,digest,kind,encoded(receipt)))
+                    self.db.execute('COMMIT')
+                    return receipt
                 self.db.execute("INSERT INTO commands(id,ordinal,digest,kind,state) VALUES(?,?,?,?,'accepted')", (cid, ordinal, digest, kind))
                 if closing:
                     self.set("close", True)
+                elif kind=='submit':
+                    self.set('quiet_epoch',self.get('quiet_epoch')+1)
+                    self.set('idle_since',None)
                 self.db.execute("COMMIT")
                 return None
             except Exception:
@@ -229,6 +262,10 @@ class Journal:
                 seq = self.get("sequence")+1
                 self.db.execute("INSERT INTO events VALUES(?,?,?)", (seq, event.kind, payload))
                 self.set("sequence", seq)
+                if event.kind in {'runtime.lost','ownership.failed'}:
+                    self.set('quiet_unknown',True)
+                elif event.kind=='runtime.ready' and event.freshness=='current' and not event.partial and event.grade in {'compatible','unverified'}:
+                    self.set('quiet_unknown',False)
                 ref = event.reference
                 root_activity = ref is not None and ref.thread_id in {None,ref.root_id}
                 activities=self.get("root_activities")
@@ -236,8 +273,22 @@ class Journal:
                 if root_activity and ref and ref.activity_id and event.kind in {"activity.started","activity.terminal"}:
                     if ref.activity_id not in activities and len(activities)>=self.max_commands:
                         raise RuntimeContractError("JOURNAL_EXHAUSTED", "bounded native activity identity retention exhausted")
-                    activities[ref.activity_id]="terminal" if event.kind=="activity.terminal" or already_terminal else "active"
+                    activity_state="terminal" if event.kind=="activity.terminal" or already_terminal else "active"
+                    if activities.get(ref.activity_id)!=activity_state:
+                        self.set('quiet_epoch',self.get('quiet_epoch')+1)
+                        self.set('idle_since',None)
+                    activities[ref.activity_id]=activity_state
                     self.set("root_activities",activities)
+                    uncertain=self.get('uncertain_activities')
+                    was_uncertain=ref.activity_id in uncertain
+                    if event.freshness!='current' or event.partial or event.grade in {'inconclusive','incompatible'}:
+                        uncertain[ref.activity_id]=True
+                    else:
+                        uncertain.pop(ref.activity_id,None)
+                    if was_uncertain!=(ref.activity_id in uncertain):
+                        self.set('quiet_epoch',self.get('quiet_epoch')+1)
+                        self.set('idle_since',None)
+                    self.set('uncertain_activities',uncertain)
                 if event.kind == "activity.started" and root_activity and ref and ref.activity_id and not already_terminal:
                     self.set("primary", ref.activity_id)
                 if event.kind == "activity.terminal" and root_activity and ref and (
@@ -373,6 +424,10 @@ class Controller:
             lock.release()
 
     def emit(self, event: RuntimeEvent) -> None:
+        with self.journal.lock:
+            self._emit_locked(event)
+
+    def _emit_locked(self, event: RuntimeEvent) -> None:
         try:
             if self.identity and event.reference and event.reference.root_id != self.identity.root_id:
                 raise RuntimeContractError("OWNERSHIP_INVALID", "event is outside captured native root")
@@ -546,8 +601,12 @@ class Controller:
         lock = threading.Lock() if closing else self.dispatch_lock
         with self.admission(lock,deadline):
             self.journal.check_lease(str(value.get("consumer","")),int(value.get("fence",0)))
-            duplicate = self.journal.reserve_command(cid,ordinal,digest,"submit" if op=="submit" else "control",closing=closing)
+            quiet_options = dict(native_control.options) if closing and native_control.options else None
+            with self.journal.lock:
+                duplicate = self.journal.reserve_command(cid,ordinal,digest,"submit" if op=="submit" else "control",closing=closing,quiet=quiet_options,quiet_ready=self.ready and not self.lost)
             if duplicate:
+                if closing and quiet_options is not None and duplicate.get('state')=='not_written':
+                    duplicate={**duplicate,'runtime_ready':self.ready and not self.lost and not self.journal.get('quiet_unknown')}
                 return duplicate
             if closing:
                 self.ready=False
@@ -647,7 +706,7 @@ class Controller:
         return {"generation":self.generation,"contract":CONTRACT_REVISION,"ready":self.ready,
                 "lost":self.lost,"identity":dataclasses.asdict(self.identity) if self.identity else None,
                 "setup":self.journal.get('setup'),"setup_confirmation":self.journal.get('setup_confirmation'),
-                **self.journal.replay(self.journal.get("sequence"))}
+                'quiet':self.journal.quiet(),**self.journal.replay(self.journal.get("sequence"))}
 
 
 def owned_peer(peer: ProcessIdentity) -> bool:
