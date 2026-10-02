@@ -19,7 +19,8 @@ from conversation_runtime_contract import NativeReference, RuntimeContractError,
 
 
 @pytest.fixture
-def database(tmp_path):
+def database(tmp_path,request):
+    harness=getattr(request,'param','codex')
     path = tmp_path / 'synthetic.db'
     con = sqlite3.connect(path)
     con.row_factory = sqlite3.Row
@@ -28,9 +29,9 @@ def database(tmp_path):
         con.executescript(migration.read_text())
     con.execute("INSERT INTO users(user_id,username) VALUES(1,'fixture')")
     con.execute("INSERT INTO shells(shell_id,shortname,display_name,flavor,system_prompt,user_id) VALUES(1,'FX','Fixture','dev','synthetic',1)")
-    con.execute("INSERT INTO conversations(conversation_id,shell_id,owner_user_id,harness,worktree,creation_idempotency_key,creation_request_hash) VALUES('cv',1,1,'codex',?,'key','hash')", (str(tmp_path),))
+    con.execute("INSERT INTO conversations(conversation_id,shell_id,owner_user_id,harness,worktree,creation_idempotency_key,creation_request_hash) VALUES('cv',1,1,?,?,'key','hash')", (harness,str(tmp_path)))
     con.execute("INSERT INTO active_shell_chats(shell_id,chat_id) VALUES(1,'cv')")
-    con.execute("INSERT INTO conversation_runtime_generations(generation_id,conversation_id,shell_id,owner_user_id,harness,binding_json,state,created_at,updated_at) VALUES('g','cv',1,1,'codex','{}','ready',1,1)")
+    con.execute("INSERT INTO conversation_runtime_generations(generation_id,conversation_id,shell_id,owner_user_id,harness,binding_json,state,created_at,updated_at) VALUES('g','cv',1,1,?,'{}','ready',1,1)",(harness,))
     con.commit()
     yield path, con
     con.close()
@@ -81,10 +82,9 @@ def test_legacy_broker_and_reaper_do_not_take_native_turns(database):
     assert ReaperStore(str(path)).candidates() == []
 
 
-@pytest.mark.parametrize('harness,root_thread', [('codex','root'),('claude',None)])
-def test_replay_projects_root_turn_once_and_child_terminal_does_not_finish_it(database,harness,root_thread):
+@pytest.mark.parametrize('database,root_thread', [('codex','root'),('claude',None)],indirect=['database'])
+def test_replay_projects_root_turn_once_and_child_terminal_does_not_finish_it(database,root_thread):
     path, con = database
-    con.execute('UPDATE conversation_runtime_generations SET harness=?',(harness,))
     con.execute("UPDATE conversations SET runtime_mode='native_experiment',state='queued',runtime_projection=?",(json.dumps({'generation_id':'g','state':'ready'}),))
     mid = con.execute("INSERT INTO conversation_messages(conversation_id,sender_kind,sender_ref,message_kind,body,idempotency_key,request_hash,state) VALUES('cv','user','1','prompt','hello','m','h','queued')").lastrowid
     rid = con.execute("INSERT INTO conversation_runs(conversation_id,shell_id,trigger_message_id,state,lease_owner,lease_expires_at,heartbeat_at,started_at) VALUES('cv',1,?,'starting','fixture','2030-01-01','2030-01-01','2030-01-01')",(mid,)).lastrowid
@@ -295,3 +295,38 @@ def test_replacement_consumer_fences_old_cleanup_completion(database):
     assert con.execute('SELECT state FROM conversation_runtime_generations').fetchone()[0]=='ready'
     assert json.loads(con.execute('SELECT runtime_projection FROM conversations').fetchone()[0])['state']=='closing'
     assert run.browser_conversation_active(con,1)
+
+
+@pytest.mark.parametrize('database',['claude'],indirect=True)
+@pytest.mark.parametrize('observation',['bash','partial','unknown-task'])
+def test_actual_claude_work_events_survive_store_and_admit_only_proved_scoped_terminal(database,monkeypatch,observation):
+    from conversation_adapters.claude_runtime import ClaudeRuntimeDriver
+    from conversation_runtime_contract import RuntimeIdentity
+    path,con=database
+    runtime={'generation_id':'g','state':'ready','capabilities':{'stop_work':'compatible','stop_work_terminal':'compatible','stop_work_child':'inconclusive'}}
+    con.execute("UPDATE conversations SET runtime_mode='native_experiment',runtime_projection=?",(json.dumps(runtime),))
+    con.commit()
+    events=[];driver=ClaudeRuntimeDriver();driver._identity=RuntimeIdentity('root');driver._emit=events.append
+    if observation!='unknown-task':
+        driver._tool({'hook_event_name':'PostToolUse','tool_name':'Bash','tool_use_id':'tool','tool_input':{},'tool_response':{'backgroundTaskId':'native-bash-id'}},None)
+    if observation!='bash':
+        driver._snapshot({'background_tasks':[{'id':'native-bash-id'}],'session_crons':[]})
+    service=NativeChatsService(path,path.parent,None)
+    lease=service.store.attach('g',1,1,service.consumer)
+    service.store.ingest('g',1,1,lease,{'events':[{'sequence':n,'event':dataclasses.asdict(event)} for n,event in enumerate(events,1)],'partial':False})
+    rows=con.execute('SELECT work_key,projection_json FROM conversation_runtime_work').fetchall()
+    assert len(rows)==1
+    selected=json.loads(rows[0]['projection_json'])
+    assert selected['data']['kind']==('task' if observation=='unknown-task' else 'terminal')
+    writes=[]
+    class Client:
+        def request(self,op,**fields):writes.append(fields);return {'state':'written'}
+    monkeypatch.setattr(service,'attach',lambda generation:(Client(),1,1))
+    body={'version':1,'generation_id':'g','action':'stop_work','work_key':rows[0]['work_key']}
+    if observation=='bash':
+        assert service.control(con,'cv',1,'stop',body)['state']=='written'
+        assert writes[0]['command']['target']['work_id']=='native-bash-id'
+    else:
+        with pytest.raises(RuntimeContractError) as raised:service.control(con,'cv',1,'stop',body)
+        assert raised.value.code==('WORK_INCONCLUSIVE' if observation=='partial' else 'CAPABILITY_INCONCLUSIVE')
+        assert writes==[]
