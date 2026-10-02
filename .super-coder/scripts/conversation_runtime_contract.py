@@ -1,0 +1,304 @@
+"""F89 experimental native driver contract; production adapters are unchanged.
+
+A session controller owns one driver for its entire generation. Drivers own
+continuous native readers/descriptors, never an API lifetime or submission
+ledger. Native writes return bounded receipts; processing, terminal, work and
+control outcomes arrive independently through emit(). No native ID is an OS PID.
+"""
+from __future__ import annotations
+
+import abc
+import hashlib
+import json
+import time
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Literal
+
+CONTRACT_REVISION = "f89-native-runtime-v1"
+MAX_FRAME_BYTES = 256 * 1024
+MAX_EVENT_BYTES = 64 * 1024
+EVENT_KINDS = frozenset({
+    "runtime.ready", "runtime.lost", "ownership.failed",
+    "activity.started", "activity.processed", "activity.terminal",
+    "output.delta", "output.final", "work.observed", "work.terminal",
+    "snapshot.observed", "control.acknowledged", "control.outcome",
+    "capability.observed",
+})
+# Only ephemeral output may be truncated; identity/intents/outcomes require
+# reserved journal capacity and must never become silent success.
+OUTPUT_KINDS = frozenset({"output.delta"})
+Grade = Literal["compatible", "incompatible", "inconclusive", "unverified"]
+Freshness = Literal["current", "last_observed", "stale", "unknown"]
+ActivitySource = Literal["gui", "native_completion", "automation", "reconciliation", "system"]
+WriteState = Literal["not_written", "written", "unknown", "unsupported", "rejected"]
+_SENSITIVE_KEYS = frozenset({
+    "token", "api_key", "authorization", "credentials", "credential", "password",
+    "secret", "env", "environment", "thinking", "reasoning", "analysis",
+})
+
+
+class RuntimeContractError(RuntimeError):
+    def __init__(self, code: str, detail: str):
+        super().__init__(detail)
+        self.code = code
+
+
+def payload_digest(payload: Mapping[str, Any]) -> str:
+    return hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":"),
+                                     ensure_ascii=False, allow_nan=False).encode()).hexdigest()
+
+
+def public_payload(value: Any, *, sensitive_values: tuple[str, ...] = ()) -> Any:
+    """Scrub structured keys AND known credential/environment values.
+
+    The controller persistence boundary must pass its ephemeral known sensitive
+    values for every field (including receipt detail/provenance/output), not just
+    event data. Key filtering alone cannot redact secrets embedded in strings.
+    Private reasoning must be excluded by driver normalization before emission.
+    """
+    if isinstance(value, Mapping):
+        return {str(key): public_payload(item, sensitive_values=sensitive_values) for key, item in value.items()
+                if str(key).lower() not in _SENSITIVE_KEYS}
+    if isinstance(value, (list, tuple)):
+        return [public_payload(item, sensitive_values=sensitive_values) for item in value]
+    if isinstance(value, str):
+        for secret in sorted(set(sensitive_values), key=len, reverse=True):
+            if secret:
+                value = value.replace(secret, "[redacted]")
+        return value
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    raise RuntimeContractError("EVENT_INVALID", "event payload is not JSON data")
+
+
+@dataclass(frozen=True)
+class ProcessIdentity:
+    pid: int
+    start_ticks: int
+
+    def __post_init__(self) -> None:
+        if self.pid <= 0 or self.start_ticks < 0:
+            raise RuntimeContractError("PROCESS_INVALID", "invalid OS process identity")
+
+
+@dataclass(frozen=True)
+class ExecutableBinding:
+    path: Path
+    sha256: str
+    version: str
+
+
+@dataclass(frozen=True)
+class RuntimeContext:
+    generation_id: str
+    conversation_id: str
+    shell_id: int
+    owner_user_id: int
+    harness: str
+    state_root: Path
+    worktree: Path
+    executable: ExecutableBinding
+    driver_revision: str
+    boot_digest: str
+    policy_digest: str
+    permission_mode: str
+    model: str | None = None
+    effort: str | None = None
+    boot_content: str = field(default="", repr=False)
+    execution_prefix: tuple[str, ...] = ()
+    managed_mcp_files: tuple[Path, ...] = ()
+    # Ephemeral handoff only: never serialize these values in receipts/journal.
+    env: Mapping[str, str] = field(default_factory=dict, repr=False)
+    # Hooks/channel assets use the controller's already-owned private socket.
+    # No independent public HTTP server or extra API owner is permitted.
+    controller_endpoint: Path | None = None
+
+    def __post_init__(self) -> None:
+        if not self.permission_mode or not self.policy_digest or not self.boot_digest:
+            raise RuntimeContractError("POLICY_MISSING", "explicit prepared boot and policy are required")
+        # The harness driver must reject unsupported modes; never substitute a
+        # probe-friendly policy for this canonical prepared value.
+
+    def execution_argv(self, argv: list[str]) -> list[str]:
+        return [*self.execution_prefix, *argv]
+
+
+@dataclass(frozen=True)
+class NativeReference:
+    root_id: str
+    thread_id: str | None = None
+    parent_thread_id: str | None = None
+    activity_id: str | None = None
+    item_id: str | None = None
+    work_id: str | None = None
+    # Opaque app-server processId/task handle; never convert to an OS PID.
+    native_process_id: str | None = None
+    os_process: ProcessIdentity | None = None
+
+
+@dataclass(frozen=True)
+class RuntimeIdentity:
+    root_id: str
+    # Metadata only: ancestry/parent links, not session_id, authorize children.
+    session_id: str | None = None
+    process: ProcessIdentity | None = None
+    protocol: Mapping[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class DriverStart:
+    state: Literal["ready", "unavailable", "unknown"]
+    identity: RuntimeIdentity | None = None
+    detail: str = ""
+    capabilities: Mapping[str, Grade] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class NativeSubmission:
+    request_id: str
+    # Stable per-generation ordinal allocated with durable engine intent.
+    # The journal retains a rejection floor when resolved IDs are compacted.
+    request_sequence: int
+    payload_digest: str
+    text: str
+    message_id: str | None = None
+    run_id: str | None = None
+    source: ActivitySource = "gui"
+
+
+@dataclass(frozen=True)
+class NativeControl:
+    control_id: str
+    request_sequence: int
+    payload_digest: str
+    action: Literal["stop_reply", "stop_work", "stop_automation", "close"]
+    target: NativeReference | None = None
+    expected_activity_id: str | None = None
+    # No arbitrary child text/input. Driver-defined bounded fields only.
+    options: Mapping[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class WriteReceipt:
+    state: WriteState
+    acknowledged: bool = False
+    native_activity_id: str | None = None
+    detail: str = ""
+    # A transport ack or native RPC result is not a processing/terminal/cleanup
+    # promise. Those require attributable events or an explicit snapshot.
+
+
+@dataclass(frozen=True)
+class RuntimeEvent:
+    kind: str
+    reference: NativeReference | None = None
+    request_id: str | None = None
+    control_id: str | None = None
+    source: ActivitySource = "system"
+    provenance: str = ""
+    observed_at: float = field(default_factory=time.time)
+    freshness: Freshness = "current"
+    partial: bool = False
+    grade: Grade = "unverified"
+    data: Mapping[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if self.kind not in EVENT_KINDS:
+            raise RuntimeContractError("EVENT_INVALID", "unknown driver event kind")
+        if self.kind.startswith(("activity.", "work.", "output.")) and self.reference is None:
+            raise RuntimeContractError("EVENT_INVALID", "native activity/work/output needs an attributable reference")
+        clean = public_payload(self.data)
+        if len(json.dumps(clean, allow_nan=False).encode()) > MAX_EVENT_BYTES:
+            raise RuntimeContractError("EVENT_TOO_LARGE", "driver event exceeds bounded payload size")
+        object.__setattr__(self, "data", clean)
+
+
+EventSink = Callable[[RuntimeEvent], None]
+
+
+@dataclass(frozen=True)
+class NativeWork:
+    reference: NativeReference
+    kind: Literal["terminal", "child", "automation", "task"]
+    state: str
+    provenance: str
+    observed_at: float
+    freshness: Freshness = "last_observed"
+    grade: Grade = "unverified"
+    # Scheduling must prove non-durable at pre-execution, not infer it here.
+    durable: bool | None = None
+    data: Mapping[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class NativeSnapshot:
+    identity: RuntimeIdentity | None
+    primary: NativeReference | None
+    work: tuple[NativeWork, ...] = ()
+    observed_at: float = field(default_factory=time.time)
+    freshness: Freshness = "unknown"
+    partial: bool = True
+    capabilities: Mapping[str, Grade] = field(default_factory=dict)
+    # Empty/last Stop is not idle proof. Drivers must state the evidence.
+    primary_state: Literal["idle", "active", "unknown"] = "unknown"
+    provenance: str = ""
+
+
+@dataclass(frozen=True)
+class NativeCleanup:
+    outcome: Literal["complete", "pending", "failed", "inconclusive"]
+    unresolved_work: tuple[NativeReference, ...] = ()
+    unresolved_definitions: tuple[str, ...] = ()
+    detail: str = ""
+    # OS-unit/PID/cgroup exit is independently verified by the owner. Unit
+    # absence cannot discharge unresolved native definition obligations.
+
+
+class RuntimeDriver(abc.ABC):
+    """One generation, continuously drained; no DB ledger or API worker owned pipe.
+
+    All deadlines are absolute time.monotonic() values. Emit does bounded local
+    journal work only, never calls a GUI/API or waits for another native RPC.
+    Submit/control futures must not stall the reader or Close. Drivers expose
+    only operations proven on their installed route; unsupported stays explicit.
+    Factory in each harness module: create_driver() -> RuntimeDriver.
+    """
+    harness: str
+    revision: str
+
+    @abc.abstractmethod
+    def start(self, context: RuntimeContext, emit: EventSink, *, deadline: float) -> DriverStart:
+        raise NotImplementedError
+
+    @abc.abstractmethod
+    def submit(self, command: NativeSubmission, *, deadline: float) -> WriteReceipt:
+        raise NotImplementedError
+
+    @abc.abstractmethod
+    def inventory(self, *, deadline: float) -> NativeSnapshot:
+        raise NotImplementedError
+
+    @abc.abstractmethod
+    def control(self, command: NativeControl, *, deadline: float) -> WriteReceipt:
+        raise NotImplementedError
+
+    @abc.abstractmethod
+    def cleanup(self, *, deadline: float) -> NativeCleanup:
+        raise NotImplementedError
+
+    def asset(self, payload: Mapping[str, Any], *, peer: ProcessIdentity,
+              deadline: float) -> Mapping[str, Any]:
+        """Private Claude hook/channel ingress and bounded notification pull.
+
+        Controller verifies generation, SO_PEERCRED and peer membership in its
+        owned unit before routing. Driver owns the asset operations/normalizer:
+        e.g. {kind:'hook',event:{...}}, {kind:'channel.ready'},
+        {kind:'channel.pull',after:0}, {kind:'channel.reply',...}.
+        Raw asset payloads are not journaled; emit only scoped normalized data.
+        A channel pull may wait to deadline, without holding dispatch/Close locks.
+        No asset message may invent an engine user request or claim a model
+        processed it merely because a write/optional reply tool was acknowledged.
+        """
+        raise RuntimeContractError("ASSET_UNAVAILABLE", "driver has no private asset ingress")
