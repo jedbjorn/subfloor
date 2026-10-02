@@ -36,8 +36,9 @@ def prepare(*,database: Path,root: Path,fixture_id: str,harness: str,shell_id: i
             worktree=run.shell_work_dir(shell['shortname'],'dev')
             model='gpt-6.1' if harness=='codex' else 'claude-sonnet-4-6'
             effort='high'
-            con.execute('INSERT INTO conversations(conversation_id,shell_id,owner_user_id,harness,model,effort,worktree,creation_idempotency_key,creation_request_hash) VALUES(?,?,1,?,?,?,?,?,?)',
-                        (cid,shell_id,harness,model,effort,str(worktree),cid,hashlib.sha256(cid.encode()).hexdigest()))
+            provider=run.session_provider(harness,model)
+            con.execute('INSERT INTO conversations(conversation_id,shell_id,owner_user_id,harness,provider,model,effort,worktree,creation_idempotency_key,creation_request_hash) VALUES(?,?,1,?,?,?,?,?,?,?)',
+                        (cid,shell_id,harness,provider,model,effort,str(worktree),cid,hashlib.sha256(cid.encode()).hexdigest()))
             con.commit()
         finally:
             con.close()
@@ -86,7 +87,7 @@ def prepare(*,database: Path,root: Path,fixture_id: str,harness: str,shell_id: i
         report={'fixture_id':fixture_id,'conversation_id':cid,'harness':harness,'shell_id':shell_id,
                 'worktree':str(selected),'shell_branch':subprocess.check_output(['git','-C',str(selected),'branch','--show-current'],text=True).strip(),
                 'boot_sha256':first_digest,'snapshot_sha256':snapshot,'boot_discovery_files_match':True,
-                'no_memory_boot_instruction':True,'model':plan.model,'effort':plan.effort,
+                'no_memory_boot_instruction':True,'model':plan.model,'effort':plan.effort,'provider':provider,
                 'execution_view':plan.execution_view.mode,'policy_source':'canonical adapter unrestricted',
                 'api_base':plan.env['SC_API_BASE'],'engine_token_fixture_row_verified':True,
                 'cli':commands,'mcp_transport':'fixture-test-only','managed_mcp':mcp,
