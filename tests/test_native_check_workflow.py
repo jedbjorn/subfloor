@@ -26,7 +26,8 @@ def workflow(request,monkeypatch):
         cache=SimpleNamespace(admission=lambda _: {'submission':'compatible'}),
         owner=SimpleNamespace(lock=threading.RLock(),allocating=set(),closing=set()),
         status=lambda:dict(report))
-    def begin(*,on_candidate):
+    def begin(*,selection,on_candidate):
+        assert checks.configured_selection(selection)==selection
         assert con.execute("SELECT COUNT(*) FROM conversation_runtime_check_requests WHERE status='accepted'").fetchone()[0]==1
         on_candidate('fp')
         calls.append('begin')
@@ -65,16 +66,18 @@ def test_restart_retained_request_never_discovers_or_replaces(workflow):
     assert exc.value.code=='CLEANUP_PENDING' and calls==['begin']
 
 
-def test_restart_can_read_exact_bound_probe_after_http_ack_is_lost(workflow):
+@pytest.mark.parametrize('selection',[checks.CODEX_SELECTION,checks.CLAUDE_SELECTION])
+def test_restart_can_read_exact_bound_probe_after_http_ack_is_lost(workflow,selection):
     value,operation,_,calls,con=workflow
-    first=value.create(1,'stable',checks.CODEX_SELECTION)
+    first=value.create(1,'stable',selection)
     runtime={'role':'probe','check_id':first['check_id'],'generation_id':'owned-generation','state':'needs_consent','setup':{'setup_id':'owned-phase'}}
     con.execute("INSERT INTO shells(shell_id,shortname,display_name,flavor,system_prompt,user_id) VALUES(2,'PROBE','Probe','dev','synthetic',1)")
-    con.execute("INSERT INTO conversations(conversation_id,shell_id,owner_user_id,harness,model,effort,worktree,creation_idempotency_key,creation_request_hash,runtime_mode,runtime_projection) VALUES('probe-cv',2,1,'codex','gpt-6.1-sol','high','/synthetic/probe','probe-key','fp','native_experiment',?)",(json.dumps(runtime),))
+    con.execute("INSERT INTO conversations(conversation_id,shell_id,owner_user_id,harness,model,effort,worktree,creation_idempotency_key,creation_request_hash,runtime_mode,runtime_projection) VALUES('probe-cv',2,1,?,?,?,'/synthetic/probe','probe-key','fp','native_experiment',?)",(selection['harness'],selection['model'],selection['effort'],json.dumps(runtime)))
     con.execute("INSERT INTO conversation_runtime_probe_jobs VALUES('fp','probe-cv','owned-generation','preparing',100,1)")
     con.commit()
     result=checks.NativeChecks(operation).get(1,request_key='stable')
     assert result['check_id']==first['check_id']
+    assert result['selection']==selection
     assert result['probe']['generation_id']=='owned-generation' and result['probe']['setup']['setup_id']=='owned-phase'
     assert not result['admissible'] and calls==['begin']
 
@@ -194,3 +197,58 @@ def test_old_consumer_cannot_regress_completed_check_cleanup(workflow):
     saved=con.execute('SELECT status,result_json FROM conversation_runtime_check_requests').fetchone()
     value._save(first['check_id'],'retained',{'fingerprint':'fp','probe':None,'retry_allowed':False})
     assert tuple(con.execute('SELECT status,result_json FROM conversation_runtime_check_requests').fetchone())==tuple(saved)
+
+
+def test_claude_requested_candidate_has_no_availability_or_grade(workflow):
+    value,_,_,_,_=workflow
+    candidates=value.config()['candidates']
+    assert [row['harness'] for row in candidates]==['codex','claude']
+    assert all(row['proof_state']=='requested_candidate' and row['grades']=={} for row in candidates)
+    assert checks.configured_selection(checks.CLAUDE_SELECTION)==checks.CLAUDE_SELECTION
+    assert checks.configured_selection(checks.CLAUDE_SELECTION) is not checks.CLAUDE_SELECTION
+
+
+@pytest.mark.parametrize('body',[
+    {'harness':'claude','model':'claude-sonnet-5-5','effort':'low'},
+    {'harness':'claude','model':'other','effort':'high'},
+    {**checks.CLAUDE_SELECTION,'provider':'anthropic'},
+    {**checks.CLAUDE_SELECTION,'argv':[]},
+    {**checks.CLAUDE_SELECTION,'setup_id':'borrowed'},
+])
+def test_unconfigured_claude_request_refuses_before_dispatch(workflow,body):
+    value,_,_,calls,con=workflow
+    with pytest.raises(RuntimeContractError) as exc:value.create(1,'key',body)
+    assert exc.value.code=='CHECK_SELECTION_INVALID'
+    assert calls==[] and con.execute('SELECT COUNT(*) FROM conversation_runtime_check_requests').fetchone()[0]==0
+
+
+def test_claude_selection_is_durable_and_never_rebound_to_codex(workflow):
+    value,operation,_,calls,con=workflow
+    dispatched=[]
+    original=operation.begin
+    def begin(*,selection,on_candidate):
+        dispatched.append(dict(selection));original(selection=selection,on_candidate=on_candidate)
+    operation.begin=begin
+    first=value.create(1,'claude-key',checks.CLAUDE_SELECTION)
+    assert first['selection']==checks.CLAUDE_SELECTION and dispatched==[checks.CLAUDE_SELECTION]
+    assert json.loads(con.execute('SELECT selection_json FROM conversation_runtime_check_requests').fetchone()[0])==checks.CLAUDE_SELECTION
+    with pytest.raises(RuntimeContractError) as exc:value.create(1,'claude-key',checks.CODEX_SELECTION)
+    assert exc.value.code=='CHECK_IDEMPOTENCY_CONFLICT' and dispatched==[checks.CLAUDE_SELECTION]
+    restarted=checks.NativeChecks(operation)
+    assert restarted.get(1,request_key='claude-key')['selection']==checks.CLAUDE_SELECTION
+    assert calls==['begin']
+
+
+def test_claude_start_rechecks_selected_fingerprint_and_resolver(workflow):
+    value,operation,report,_,_=workflow
+    first=value.create(1,'claude-key',checks.CLAUDE_SELECTION)
+    selections=[]
+    operation.seat.candidate_fingerprint=lambda **selection:selections.append(selection) or SimpleNamespace(key='fp')
+    operation.service.resolve_route=lambda **selection:selections.append(selection)
+    report.update(state='complete',fingerprint='fp',grades={'submission':'compatible'},
+        cleanup={'unit_verified_exited':True,'native_outcome':'complete'},
+        resources={'owned_capacity_released':True,'owner_allocating':False,'owner_closing':False})
+    assert value.get(1,check_id=first['check_id'])['admissible']
+    assert selections and all(selection==checks.CLAUDE_SELECTION for selection in selections)
+    operation.seat.candidate_fingerprint=lambda **_:SimpleNamespace(key='codex-or-replacement')
+    assert not value.get(1,check_id=first['check_id'])['admissible']

@@ -16,6 +16,20 @@ from conversation_runtime_contract import RuntimeContractError, payload_digest
 
 # Requested candidates are not claims of native availability or catalogue.
 CODEX_SELECTION = {'harness':'codex','model':'gpt-6.1-sol','effort':'high'}
+CLAUDE_SELECTION = {'harness':'claude','model':'claude-sonnet-5-5','effort':'high'}
+REQUESTED_CANDIDATES = (
+    ('codex','gpt-6.1-sol','high','Codex · gpt-6.1-sol · high'),
+    ('claude','claude-sonnet-5-5','high','Claude · claude-sonnet-5-5 · high'),
+)
+
+
+def configured_selection(body: dict) -> dict:
+    """Exact configured request only; never observed native availability."""
+    for harness,model,effort,_label in REQUESTED_CANDIDATES:
+        candidate={'harness':harness,'model':model,'effort':effort}
+        if body==candidate:
+            return candidate
+    raise RuntimeContractError('CHECK_SELECTION_INVALID','exact configured native candidate required')
 
 
 class NativeChecks:
@@ -30,15 +44,17 @@ class NativeChecks:
     def config(self) -> dict:
         import conversation_native_chats
         return {'enabled':conversation_native_chats._SERVICE is self.operation.service,
-                'candidates':[CODEX_SELECTION|{'label':'Codex · gpt-6.1-sol · high',
-                'proof_state':'requested_candidate','grades':{},'diagnostics':[]}],
+                'candidates':[{'harness':harness,'model':model,'effort':effort,'label':label,
+                'proof_state':'requested_candidate','grades':{},'diagnostics':[]}
+                for harness,model,effort,label in REQUESTED_CANDIDATES],
                 'onboarding':{'canonical_main_root':str(self.operation.seat.root.resolve()),
                               'scope':'linked_worktrees','initial_setup':'native_tui',
                               'local_channel_setup':'scoped_gui_action'}}
 
     def create(self,owner: int,key: str,body: dict) -> dict:
-        if owner!=1 or body!=CODEX_SELECTION:
+        if owner!=1:
             raise RuntimeContractError('CHECK_SELECTION_INVALID','named operator and exact configured native candidate required')
+        body=configured_selection(body)
         request_hash=payload_digest(body)
         with self.lock:
             con=db_driver.connect(str(self.database))
@@ -67,7 +83,15 @@ class NativeChecks:
 
     def _begin(self,check_id: str) -> None:
         try:
-            self.operation.begin(on_candidate=lambda key:self._bind(check_id,key))
+            con=db_driver.connect(str(self.database))
+            try:
+                row=con.execute("SELECT selection_json FROM conversation_runtime_check_requests WHERE check_id=? AND owner_user_id=1 AND status='accepted'",(check_id,)).fetchone()
+                if row is None:
+                    raise RuntimeContractError('CHECK_INTENT_INVALID','captured selected intent is unavailable')
+                selection=configured_selection(json.loads(row['selection_json']))
+            finally:
+                con.close()
+            self.operation.begin(selection=selection,on_candidate=lambda key:self._bind(check_id,key))
             with self.lock:
                 self.beginning=False
             future=self.operation.future
@@ -128,12 +152,13 @@ class NativeChecks:
         finally:
             con.close()
 
-    def _admissible(self,result: dict) -> bool:
+    def _admissible(self,result: dict,selection: dict) -> bool:
         if result.get('grades',{}).get('submission')!='compatible':
             return False
         try:
-            fp=self.operation.seat.candidate_fingerprint(**CODEX_SELECTION)
-            self.operation.service.resolve_route(**CODEX_SELECTION)
+            selection=configured_selection(selection)
+            fp=self.operation.seat.candidate_fingerprint(**selection)
+            self.operation.service.resolve_route(**selection)
             return fp.key==result.get('fingerprint') and self.operation.cache.admission(fp).get('submission')=='compatible'
         except (RuntimeContractError,OSError,ValueError):
             return False
@@ -166,7 +191,7 @@ class NativeChecks:
                      and resources.get('owned_capacity_released') is True
                      and resources.get('owner_allocating') is False and resources.get('owner_closing') is False)
             terminal=observed.get('state')=='complete'
-            admissible=bool(terminal and cleaned and self._admissible(observed))
+            admissible=bool(terminal and cleaned and self._admissible(observed,json.loads(row['selection_json'])))
             result={name:observed.get(name) for name in ('probe','fingerprint','grades','evidence','cleanup','observations','resources')}
             con=db_driver.connect(str(self.database))
             try:
@@ -215,7 +240,7 @@ class NativeChecks:
                 if row['status']=='complete':
                     # A retained historical pass is not a claim about the
                     # latest installed source/binary or ordinary resolver.
-                    result['admissible']=bool(result.get('admissible') and self._admissible(result))
+                    result['admissible']=bool(result.get('admissible') and self._admissible(result,json.loads(row['selection_json'])))
                     if con.execute("SELECT 1 FROM conversation_runtime_check_requests WHERE check_id!=? AND status!='complete' LIMIT 1",(target,)).fetchone() or con.execute("SELECT 1 FROM conversation_runtime_probe_jobs WHERE status!='complete' LIMIT 1").fetchone():
                         result['retry_allowed']=False
                 if self.current!=target and row['status']!='complete':

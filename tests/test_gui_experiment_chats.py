@@ -28,11 +28,11 @@ def completed_probe(value,fp,con):
     con.execute("INSERT INTO shells(shell_id,shortname,display_name,flavor,system_prompt,user_id) VALUES(2,'P','Probe','dev','synthetic',1)")
     cleanup={'outcome':'complete','native_outcome':'complete','unit_verified_exited':True}
     projection={'role':'probe','generation_id':'proof-gen','state':'closed',
-        'native_route':{'account_type':'chatgpt','model':fp.model,'efforts':[fp.effort]},'cleanup':cleanup}
-    con.execute("INSERT INTO conversations(conversation_id,shell_id,owner_user_id,harness,provider,model,effort,worktree,creation_idempotency_key,creation_request_hash,runtime_mode,runtime_projection) VALUES('proof-cv',2,1,'codex','openai',?,?,'/synthetic/probe','probe-key',?,'native_experiment',?)",
-        (fp.model,fp.effort,fp.key,json.dumps(projection)))
+        'native_route':{'account_type':'chatgpt' if fp.harness=='codex' else 'claude.ai','model':fp.model,'efforts':[fp.effort],'catalogue_observed':False},'cleanup':cleanup}
+    con.execute("INSERT INTO conversations(conversation_id,shell_id,owner_user_id,harness,provider,model,effort,worktree,creation_idempotency_key,creation_request_hash,runtime_mode,runtime_projection) VALUES('proof-cv',2,1,?,?,?,?,'/synthetic/probe','probe-key',?,'native_experiment',?)",
+        (fp.harness,fp.provider,fp.model,fp.effort,fp.key,json.dumps(projection)))
     con.execute("INSERT INTO conversation_runtime_probe_jobs VALUES(?,'proof-cv','proof-gen','complete',100,1)",(fp.key,));con.commit()
-    context=RuntimeContext('proof-gen','proof-cv',2,1,'codex',value.seat.root/'runtime',Path('/synthetic/probe'),
+    context=RuntimeContext('proof-gen','proof-cv',2,1,fp.harness,value.seat.root/'runtime',Path('/synthetic/probe'),
         fp.executable,fp.driver_revision,'d'*64,fp.policy_digest,'unrestricted',provider=fp.provider,model=fp.model,effort=fp.effort)
     value.service.store.reserve(context,{'fingerprint':fp.key,'implementation_digest':fp.implementation_digest,'purpose':'finite_probe'})
     con.execute("UPDATE conversation_runtime_generations SET state='closed',cleanup_json=? WHERE generation_id='proof-gen'",(json.dumps(cleanup),));con.commit()
@@ -132,3 +132,38 @@ def test_replaced_generation_is_refused_before_normal_preparation(request):
     value.seat.prepare=lambda *args:calls.append(args)
     with pytest.raises(RuntimeContractError):FixtureChats(value).prepare('cv','g')
     assert not calls
+
+
+@pytest.mark.parametrize('gap',['none','grade','coverage','account','effort','model','source','cleanup'])
+def test_claude_normal_admission_requires_selected_native_proof_not_codex_cache(request,gap):
+    import dataclasses
+
+    from conversation_native_checks import CLAUDE_SELECTION
+    value,codex,con,_=request.getfixturevalue('operation')
+    fp=dataclasses.replace(codex,harness='claude',provider='anthropic',model=CLAUDE_SELECTION['model'])
+    def candidate(harness,model,effort):
+        assert (harness,model,effort)==('claude',fp.model,fp.effort)
+        return fp
+    value.seat.candidate_fingerprint=candidate
+    projection=completed_probe(value,fp,con)
+    coverage=REQUIRED_COVERAGE['submission']|{'owned_unit_cleanup'}
+    value.cache.put(codex,CapabilityEvidence('submission','compatible',coverage,('synthetic Codex source proof',)))
+    if gap!='grade':
+        value.cache.put(fp,CapabilityEvidence('submission','compatible',coverage-({'memory_disabled'} if gap=='coverage' else set()),('synthetic Claude source proof',)))
+    if gap in {'account','effort','model'}:
+        projection['native_route'][{'account':'account_type','effort':'efforts','model':'model'}[gap]]=['low'] if gap=='effort' else 'other'
+        con.execute("UPDATE conversations SET runtime_projection=? WHERE conversation_id='proof-cv'",(json.dumps(projection),))
+    elif gap=='source':
+        binding=json.loads(con.execute("SELECT binding_json FROM conversation_runtime_generations WHERE generation_id='proof-gen'").fetchone()[0])
+        binding['supervision']['implementation_digest']='other'
+        con.execute("UPDATE conversation_runtime_generations SET binding_json=? WHERE generation_id='proof-gen'",(json.dumps(binding),))
+    elif gap=='cleanup':con.execute("UPDATE conversation_runtime_generations SET cleanup_json='{}' WHERE generation_id='proof-gen'")
+    con.commit()
+    if gap=='none':
+        binding,_=FixtureChats(value).resolve_route('claude',fp.model,fp.effort)
+        assert binding['harness']=='claude' and binding['transport']=='claude-effort-argument'
+        assert binding['selector_binding']['proof_state']=='checked_native_selection'
+        assert binding['selector_binding']['model_observed'] and binding['selector_binding']['effort_observed']
+        assert binding['selector_binding']['catalogue_observed'] is False
+    else:
+        with pytest.raises(RuntimeContractError):FixtureChats(value).resolve_route('claude',fp.model,fp.effort)
