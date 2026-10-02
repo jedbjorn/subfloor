@@ -10,6 +10,7 @@ import io
 import os
 import socket
 import subprocess
+import sys
 import tarfile
 from pathlib import Path
 from unittest import mock
@@ -175,6 +176,41 @@ def test_replaced_root_inode_refuses_cleanup(seat):
     assert root.exists()
 
 
+def test_symlink_root_and_traversal_identity_cannot_select_other_state(seat):
+    _, root, receipt = marked(seat)
+    root.rename(seat / "saved-root")
+    root.symlink_to(seat / "saved-root", target_is_directory=True)
+    with pytest.raises(fixture.FixtureError, match="root was replaced"):
+        fixture.stop(receipt)
+    public = fixture.read_json(receipt)
+    public["fixture_id"] = "../../unrelated"
+    fixture.write_json(receipt, public)
+    with pytest.raises(fixture.FixtureError, match="invalid fixture identity"):
+        fixture.stop(receipt)
+    assert (seat / "saved-root").exists()
+
+
+def test_concurrent_stops_serialize_real_root_cleanup(seat):
+    _, root, receipt = marked(seat)
+    script = """
+import importlib.util, pathlib, sys
+spec=importlib.util.spec_from_file_location('gui_fixture',sys.argv[1])
+m=importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+m.REGISTRY=pathlib.Path(sys.argv[2])
+m.unit_state=lambda _: {'LoadState':'not-found','ActiveState':'inactive','MainPID':'0'}
+assert m.stop(pathlib.Path(sys.argv[3]))['cleanup']['complete']
+"""
+    children = [subprocess.Popen([sys.executable, "-c", script,
+                                 str(ROOT / "maintainer/gui_experiment.py"),
+                                 str(fixture.REGISTRY), str(receipt)],
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                for _ in range(2)]
+    for child in children:
+        _, stderr = child.communicate(timeout=10)
+        assert child.returncode == 0, stderr.decode()
+    assert not root.exists() and fixture.read_json(receipt)["cleanup"]["complete"]
+
+
 def test_foreign_unit_refuses_before_systemctl_stop(seat, monkeypatch):
     _, root, receipt = marked(seat)
     monkeypatch.setattr(fixture, "unit_state", lambda _: {
@@ -207,6 +243,7 @@ def test_surviving_process_keeps_state_and_failure_evidence(seat, monkeypatch):
         fixture.stop(receipt)
     assert root.exists()
     assert not fixture.read_json(receipt)["cleanup"]["complete"]
+    assert not fixture.read_json(receipt)["cleanup"]["recorded_process_exited"]
 
 
 def test_bind_conflict_never_creates_resources(seat):
