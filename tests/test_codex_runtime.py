@@ -225,7 +225,7 @@ def test_missing_or_unknown_acknowledged_turn_retains_occupancy_until_exact_term
     snapshot = driver.inventory(deadline=deadline())
     assert snapshot.primary_state == "unknown" and snapshot.partial
     assert snapshot.primary.activity_id == turn
-    assert driver.submit(submission("second"), deadline=deadline()).state == "rejected"
+    assert driver.submit(submission("second"), deadline=deadline()).state == "not_written"
     assert sum(method == "turn/start" for method, _ in rpc.calls) == 1
     assert not any(event.kind == "activity.terminal" for event in events)
     rpc.turns["root"] = [{"id": turn, "status": "completed"}]
@@ -247,6 +247,28 @@ def test_child_turn_alias_does_not_borrow_gui_request_or_source(seat):
               item={"type": "agentMessage", "id": "child-output", "text": "child output"})
     assert events[-1].reference.thread_id == "child"
     assert events[-1].request_id is None and events[-1].source == "system"
+
+
+def test_inventory_and_late_native_event_emit_one_exact_terminal(seat):
+    driver, rpc, events, _ = seat
+    turn = driver.submit(submission(), deadline=deadline()).native_activity_id
+    rpc.turns["root"][0]["status"] = "completed"
+    driver.inventory(deadline=deadline())
+    rpc.frame("turn/completed", turn={"id": turn, "status": "completed"})
+    assert sum(event.kind == "activity.terminal" for event in events) == 1
+    assert driver.submit(submission("second"), deadline=deadline()).state == "written"
+
+
+@pytest.mark.parametrize("other_unknown", [False, True])
+def test_exact_late_terminal_resolves_only_matching_readback_uncertainty(seat, other_unknown):
+    driver, rpc, events, _ = seat
+    turn = driver.submit(submission(), deadline=deadline()).native_activity_id
+    rpc.turns["root"] = [{"id": "other", "status": "unknown"}] if other_unknown else []
+    assert driver.inventory(deadline=deadline()).primary_state == "unknown"
+    rpc.frame("turn/completed", turn={"id": turn, "status": "completed"})
+    receipt = driver.submit(submission("second"), deadline=deadline())
+    assert receipt.state == ("not_written" if other_unknown else "written")
+    assert sum(event.kind == "activity.terminal" for event in events) == 1
 
 
 @pytest.mark.parametrize("params", [{"delta": "unbound"}, {"turnId": "turn", "delta": "unbound"},
@@ -305,7 +327,7 @@ def test_unknown_submission_retains_reservation_and_never_replays(seat):
     assert driver.submit(submission(), deadline=deadline()).state == "unknown"
     rpc.fail_method = None
     assert driver.inventory(deadline=deadline()).primary_state == "unknown"
-    assert driver.submit(submission("new-request"), deadline=deadline()).state == "rejected"
+    assert driver.submit(submission("new-request"), deadline=deadline()).state == "not_written"
     assert sum(method == "turn/start" for method, _ in rpc.calls) == 1
 
 
