@@ -13,7 +13,7 @@ import subprocess
 import threading
 import time
 from collections.abc import Callable, Mapping
-from concurrent.futures import Future
+from concurrent.futures import Future, InvalidStateError
 from dataclasses import asdict, dataclass, field, fields, replace
 from pathlib import Path
 from typing import Any, Protocol
@@ -73,6 +73,13 @@ def _covered(fingerprint: Fingerprint, evidence: CapabilityEvidence, *, cleanup:
             and (evidence.capability != CAP_STOP_WORK or any(
                 target <= evidence.coverage and not any(d.capability == variant and d.grade != "compatible" for d in evidence.diagnostics)
                 for variant, target in TARGET_COVERAGE.get(fingerprint.harness, {}).items())))
+
+
+def _history_binding_matches(fingerprint: Fingerprint, evidence: CapabilityEvidence) -> bool:
+    return all(item.fingerprint_key == fingerprint.key
+               and (item.source.harness,item.source.provider,item.source.model,item.source.effort)
+               == (fingerprint.harness,fingerprint.provider,fingerprint.model,fingerprint.effort)
+               for item in evidence.history_eligibility)
 
 
 @dataclass(frozen=True)
@@ -298,10 +305,7 @@ class EvidenceCache:
     def put(self, fingerprint: Fingerprint, evidence: CapabilityEvidence) -> None:
         if evidence.capability not in GUI_CAPABILITIES or evidence.grade not in {"compatible", "incompatible", "inconclusive", "unverified"}:
             raise ValueError("supported capability evidence required")
-        if any(item.fingerprint_key != fingerprint.key
-               or (item.source.harness,item.source.provider,item.source.model,item.source.effort)
-               != (fingerprint.harness,fingerprint.provider,fingerprint.model,fingerprint.effort)
-               for item in evidence.history_eligibility):
+        if not _history_binding_matches(fingerprint,evidence):
             raise ValueError('history eligibility fingerprint or selected route changed')
         with self._lock:
             self._items.setdefault(fingerprint.key, {})[evidence.capability] = evidence
@@ -319,6 +323,12 @@ class EvidenceCache:
         if evidence.grade in {"unverified", "inconclusive"} and time.time()-evidence.observed_at > 60:
             return None
         return evidence
+
+    def _discard_publication(self, fingerprint: Fingerprint, evidence: CapabilityEvidence) -> None:
+        with self._lock:
+            items = self._items.get(fingerprint.key,{})
+            if items.get(evidence.capability) is evidence:
+                items.pop(evidence.capability)
 
     def get(self, fingerprint: Fingerprint, capability: str) -> CapabilityEvidence | None:
         evidence = self._reusable(fingerprint,capability)
@@ -620,7 +630,9 @@ class CompatibilityChecker:
                     measured = _bounded(lambda: session.exercise(session.driver, work_deadline), work_deadline)
                     for cap in remaining:
                         item = measured.get(cap)
-                        if (item is None or item.capability != cap or item.grade == "compatible" and (
+                        if isinstance(item,CapabilityEvidence) and not _history_binding_matches(fingerprint,item):
+                            item = CapabilityEvidence(cap, "inconclusive", diagnostics=(Diagnostic(cap, "inconclusive", "HISTORY_ELIGIBILITY_MISMATCH"),))
+                        elif (not isinstance(item,CapabilityEvidence) or item.capability != cap or item.grade == "compatible" and (
                                 not _covered(fingerprint, item, cleanup=False))):
                             item = CapabilityEvidence(cap, "inconclusive", diagnostics=(Diagnostic(cap, "inconclusive", "BEHAVIOR_COVERAGE_MISSING"),))
                         evidence[cap] = item
@@ -629,40 +641,57 @@ class CompatibilityChecker:
                 for cap in remaining:
                     evidence[cap] = CapabilityEvidence(cap, "inconclusive", diagnostics=(Diagnostic(cap, "inconclusive", code),))
             finally:
-                if acquired:
+                try:
+                    if acquired:
+                        try:
+                            cleanup = _bounded(lambda: factory.cleanup(fingerprint, deadline=deadline), deadline)
+                        except Exception:  # noqa: BLE001 - cleanup proof fails closed without exposing private diagnostics
+                            cleanup = CleanupProof(False, "inconclusive")
+                        if not isinstance(cleanup,CleanupProof):
+                            cleanup = CleanupProof(False,"inconclusive")
+                        if cleanup.complete:
+                            slot.release()
+                            for cap in remaining:
+                                item = evidence.get(cap)
+                                if item and item.grade == "compatible":
+                                    evidence[cap] = replace(item, coverage=item.coverage | {"owned_unit_cleanup"},
+                                                            provenance=(*item.provenance, "owner:unit_cleanup_verified"))
+                        else:
+                            with self._lock:
+                                self._retained[fingerprint.key] = fingerprint
+                            for cap in remaining:
+                                item = evidence.get(cap)
+                                if item is None or item.grade != "incompatible":
+                                    evidence[cap] = CapabilityEvidence(cap, "inconclusive", diagnostics=(Diagnostic(cap, "inconclusive", "OWNED_CLEANUP_UNPROVED"),))
+                    with event_lock:
+                        final_diagnostics = tuple(diagnostics.values())
+                    for diagnostic in final_diagnostics:
+                        if diagnostic.capability in {"stop_work_child", "stop_work_terminal"} and CAP_STOP_WORK in remaining:
+                            item = evidence[CAP_STOP_WORK]
+                            evidence[CAP_STOP_WORK] = replace(item, diagnostics=(*item.diagnostics, diagnostic))
+                        elif diagnostic.capability in remaining:
+                            cap = diagnostic.capability
+                            if evidence[cap].grade != "incompatible":
+                                evidence[cap] = CapabilityEvidence(cap, diagnostic.grade, diagnostics=(diagnostic,))
+                except Exception:  # noqa: BLE001 - final normalization cannot strand an owned check
+                    for cap in remaining:
+                        evidence[cap] = CapabilityEvidence(cap, "inconclusive", diagnostics=(
+                            Diagnostic(cap, "inconclusive", "CHECK_FINALIZATION_INCONCLUSIVE"),))
+                finally:
+                    for cap,item in tuple(evidence.items()):
+                        try:
+                            self.cache.put(fingerprint,item)
+                        except Exception:  # noqa: BLE001 - publication failure never grants or strands a capability
+                            self.cache._discard_publication(fingerprint,item)
+                            evidence[cap] = CapabilityEvidence(cap, "inconclusive", diagnostics=(
+                                Diagnostic(cap, "inconclusive", "CHECK_CACHE_PUBLICATION_FAILED"),))
+                    with self._lock:
+                        if self._flights.get(fingerprint.key) is future:
+                            self._flights.pop(fingerprint.key)
                     try:
-                        cleanup = _bounded(lambda: factory.cleanup(fingerprint, deadline=deadline), deadline)
-                    except Exception:  # noqa: BLE001 - cleanup proof fails closed without exposing private diagnostics
-                        cleanup = CleanupProof(False, "inconclusive")
-                    if cleanup.complete:
-                        slot.release()
-                        for cap in remaining:
-                            item = evidence.get(cap)
-                            if item and item.grade == "compatible":
-                                evidence[cap] = replace(item, coverage=item.coverage | {"owned_unit_cleanup"},
-                                                        provenance=(*item.provenance, "owner:unit_cleanup_verified"))
-                    else:
-                        with self._lock:
-                            self._retained[fingerprint.key] = fingerprint
-                        for cap in remaining:
-                            item = evidence.get(cap)
-                            if item is None or item.grade != "incompatible":
-                                evidence[cap] = CapabilityEvidence(cap, "inconclusive", diagnostics=(Diagnostic(cap, "inconclusive", "OWNED_CLEANUP_UNPROVED"),))
-                with event_lock:
-                    final_diagnostics = tuple(diagnostics.values())
-                for diagnostic in final_diagnostics:
-                    if diagnostic.capability in {"stop_work_child", "stop_work_terminal"} and CAP_STOP_WORK in remaining:
-                        item = evidence[CAP_STOP_WORK]
-                        evidence[CAP_STOP_WORK] = replace(item, diagnostics=(*item.diagnostics, diagnostic))
-                    elif diagnostic.capability in remaining:
-                        cap = diagnostic.capability
-                        if evidence[cap].grade != "incompatible":
-                            evidence[cap] = CapabilityEvidence(cap, diagnostic.grade, diagnostics=(diagnostic,))
-                for item in evidence.values():
-                    self.cache.put(fingerprint, item)
-                future.set_result(CheckResult(fingerprint, evidence, cleanup))
-                with self._lock:
-                    self._flights.pop(fingerprint.key, None)
+                        future.set_result(CheckResult(fingerprint,evidence,cleanup))
+                    except InvalidStateError:
+                        pass  # Caller cancellation does not cancel owned cleanup or retain a finished flight.
 
         threading.Thread(target=run, name="native-compatibility-check", daemon=True).start()
         return future
