@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import dataclasses
 import hashlib
+import json
 import re
 import sys
 import threading
@@ -222,6 +223,48 @@ def test_claude_probe_input_requires_qualified_captured_memory_inference(owned,c
     assert ('memory_disabled' in result['submission'].coverage)==(change is None)
     if change is None:
         assert driver.identity.protocol['memory_policy']['effective_telemetry'] is False
+    driver.cleanup(deadline=time.monotonic()+1)
+
+
+def test_factory_witness_exports_only_correlated_semantic_counts_and_cleanup(owned):
+    factory=NativeProbeFactory(lambda *args:owned,lambda *args:CleanupProof(True,'complete'))
+    fp=fingerprint(owned)
+    assert factory.witness(fp)=={'waiting_stage':'allocation','first_close_observed':False}
+    session=factory.reserve(fp,frozenset({'submission'}),deadline=time.monotonic()+2)
+    session.driver.start(owned.context,lambda e:None,deadline=time.monotonic()+2)
+    session.exercise(session.driver,time.monotonic()+2)
+    witness=factory.witness(fp)
+    assert witness['waiting_stage']=='finished' and witness['first_root_processed']
+    assert witness['first_root_terminal_counts']=={'completed':1,'failed':0,'interrupted':0,'other':0}
+    assert witness['first_successful_reply'] and witness['second_final_nonce_matches']
+    private=owned.client.marker
+    assert private and private not in json.dumps(witness) and 'root' not in witness
+    assert factory.cleanup(fp,deadline=time.monotonic()+1).complete
+    witness=factory.witness(fp)
+    assert witness['first_close_outcome']=='complete' and witness['native_complete_retained']
+    assert witness['cleanup_fenced'] and witness['first_close_unresolved_work']==0
+
+
+def test_factory_witness_does_not_promote_partial_foreign_or_unknown_terminal_data(owned):
+    factory=NativeProbeFactory(lambda *args:owned,lambda *args:CleanupProof(True,'complete'))
+    fp=fingerprint(owned)
+    session=factory.reserve(fp,frozenset({'submission'}),deadline=time.monotonic()+2)
+    driver=session.driver;driver.start(owned.context,lambda e:None,deadline=time.monotonic()+2)
+    session.exercise(driver,time.monotonic()+2)
+    scenario=driver._scenario
+    ref=NativeReference('root','root',activity_id=scenario.first_activity)
+    with driver._lock:
+        driver.events.append(RuntimeEvent('activity.terminal',ref,request_id=scenario.first_request,
+                            data={'status':'private arbitrary native data'}))
+        driver.events.append(RuntimeEvent('activity.terminal',ref,request_id='foreign',data={'status':'failed'}))
+        driver.events.append(RuntimeEvent('activity.terminal',ref,request_id=scenario.first_request,
+                            partial=True,data={'status':'failed'}))
+        driver.events.append(RuntimeEvent('activity.terminal',NativeReference('root','child','root',activity_id='child-turn'),
+                            data={'status':'completed'}))
+    witness=factory.witness(fp)
+    assert witness['first_root_terminal_counts']=={'completed':1,'failed':0,'interrupted':0,'other':1}
+    assert witness['child_terminal_counts']['completed']==1
+    assert 'private arbitrary native data' not in json.dumps(witness)
     driver.cleanup(deadline=time.monotonic()+1)
 
 def test_finite_scenario_earns_observed_targets_without_early_os_cleanup_pass(owned):
