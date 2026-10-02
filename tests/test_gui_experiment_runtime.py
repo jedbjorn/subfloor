@@ -10,16 +10,20 @@ import pytest
 
 ROOT=Path(__file__).resolve().parents[1]
 sys.path[:0]=[str(ROOT/'.super-coder/scripts'),str(ROOT/'.super-coder/api')]
-from test_native_chat_ownership import database  # noqa: F401
-
 import gui_experiment_runtime as runtime
-from conversation_runtime_checks import CheckResult, CleanupProof, EvidenceCache, Fingerprint
+from conversation_runtime_checks import (
+    CheckResult,
+    CleanupProof,
+    EvidenceCache,
+    Fingerprint,
+)
 from conversation_runtime_contract import ExecutableBinding
+from test_native_chat_ownership import database  # noqa: F401
 
 
 @pytest.fixture
-def operation(database,monkeypatch):
-    original,original_con=database
+def operation(request,monkeypatch):
+    original,original_con=request.getfixturevalue('database')
     root=original.parent
     (root/'.super-coder').mkdir()
     path=root/'.super-coder/shell_db.db'
@@ -30,7 +34,7 @@ def operation(database,monkeypatch):
     fp=Fingerprint('codex',ExecutableBinding(Path('/bin/true'),'a'*64,'test'),'test','b'*64,
                    'openai','gpt-6.1-sol','high','b'*64,'c'*64)
     calls=[]
-    supervisor=SimpleNamespace(preparation_identity=lambda:calls.append('owned-api'),inventory=lambda:[])
+    supervisor=SimpleNamespace(preparation_identity=lambda:calls.append('owned-api'),inventory=list)
     class Seat:
         def __init__(self,**kwargs):
             self.database,self.root=kwargs['database'],kwargs['root']
@@ -55,6 +59,22 @@ def test_actual_source_signatures_are_required_subset_without_native_certificate
     del observed['adapter_methods']['control']['deadline']
     assert required_subset(observed,required['submission']) is None
     assert required_subset(observed,required['stop_reply']) is not None
+
+
+@pytest.mark.parametrize('stage',['initial_snapshot','root_tagged_pid','child_ancestry','child_terminal','child_tagged_pid'])
+def test_split_native_work_witness_keeps_only_current_bounded_evidence(stage):
+    raw={'waiting_stage':stage,'initial_snapshot_observed':True,'initial_snapshot_current':False,
+         'initial_snapshot_partial':True,'initial_root_terminal_current':False,
+         'initial_child_ancestry_current':True,'initial_child_active_turn_present':False,
+         'observed_child_terminal_current':True,'root_tagged_pid_candidates':128,
+         'child_tagged_pid_candidates':0,'root_owned_pid_matches':1,'child_owned_pid_matches':2,
+         'raw_pid':'private','tagged_label':'private','ancestry':'private'}
+    safe=runtime.semantic_witness(raw)
+    assert safe=={key:value for key,value in raw.items() if key not in {'raw_pid','tagged_label','ancestry'}}
+    for field in ('root_tagged_pid_candidates','child_tagged_pid_candidates','root_owned_pid_matches','child_owned_pid_matches'):
+        for invalid in (True,-1,129,1.0,'1',None):
+            assert field not in runtime.semantic_witness({field:invalid})
+    assert 'initial_snapshot_current' not in runtime.semantic_witness({'initial_snapshot_current':1})
 
 
 def test_semantic_witness_drops_unknown_payloads_and_validates_scalar_types():
@@ -162,6 +182,7 @@ def test_public_witness_counts_native_identity_without_output_or_private_receipt
 def test_delayed_old_completion_merges_current_persisted_fingerprint_evidence(operation,monkeypatch):
     import dataclasses
     import threading
+
     from conversation_runtime_checks import CapabilityEvidence
     value,fp,con,_=operation
     first,second=Future(),Future();futures=iter((first,second))
