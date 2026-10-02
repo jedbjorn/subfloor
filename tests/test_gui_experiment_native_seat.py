@@ -163,3 +163,76 @@ def test_worktree_alias_created_during_observation_has_no_canonical_writes(seat,
     value.observers['codex'].observe=interrupted_observe
     with pytest.raises(RuntimeContractError) as raised:value.prepare('cv','generation')
     assert raised.value.code=='WORKTREE_INVALID' and events==[] and not list(external.iterdir())
+
+
+def test_schema_generation_records_inert_child_before_use_and_reaps_before_return(seat,monkeypatch):
+    import time
+
+    import conversation_runtime_codex_codegen as codegen
+    import conversation_runtime_codex_schema as schema
+    from conversation_runtime_contract import ProcessIdentity
+    value,events,_=seat
+    fingerprint=value.candidate_fingerprint('codex','gpt-6.1-sol','high')
+    owner={'pid':1,'start_ticks':2,'unit':'marked-api.service','control_group':'/marked-api'}
+    value.supervisor.preparation_identity=lambda **kwargs:owner
+    def record(process,cgroup,*,deadline):
+        assert process==ProcessIdentity(123,456) and cgroup==owner['control_group']
+        assert deadline>time.monotonic();events.append('record-child');return True
+    value.supervisor.record_codegen_child=record
+    class Runner:
+        def __init__(self):
+            self.receipt={'child_registered':True,'gate_released':True,'child_reaped':True,'process_group_exited':True,'files_removed':True}
+        def __call__(self,argv,deadline):
+            assert argv==(str(fingerprint.executable.path),'app-server','generate-json-schema','--experimental','--out',str(self.root/'schema'))
+            assert self.guard()==owner
+            assert self.register(ProcessIdentity(123,456),owner['control_group'])
+            events.append('codegen');return True
+        def cleanup(self,deadline):events.append('cleanup');return True
+    def make(binding,root,guard,*,record_child):
+        assert binding==fingerprint.executable and root.stat().st_mode&0o777==0o700
+        result=Runner();result.root,result.guard,result.register=root,guard,record_child;return result
+    def observe(binding,path,*,effort,run_owned,deadline):
+        assert effort=='high' and deadline<time.monotonic()+20
+        assert run_owned((str(binding.path),'app-server','generate-json-schema','--experimental','--out',str(path)),deadline)
+        return schema.NativeSchemaObservation(binding,generation_completed=True)
+    monkeypatch.setattr(codegen,'make_owned_codegen_runner',make)
+    monkeypatch.setattr(schema,'observe_codex_schema',observe)
+    result,receipt=value.observe_native_schema(fingerprint,time.monotonic()+177)
+    assert result.generation_completed and receipt['cleanup_complete'] is True
+    assert events==['record-child','codegen','cleanup']
+
+
+def test_schema_expiry_or_changed_source_refuses_before_owned_root_mutation(seat,monkeypatch):
+    import dataclasses
+    import time
+    value,events,_=seat
+    fingerprint=value.candidate_fingerprint('codex','gpt-6.1-sol','high')
+    value.supervisor.preparation_identity=lambda **kwargs:{}
+    with pytest.raises(RuntimeContractError):value.observe_native_schema(fingerprint,time.monotonic()-1)
+    monkeypatch.setattr(value,'candidate_fingerprint',lambda *args:dataclasses.replace(fingerprint,implementation_digest='d'*64))
+    with pytest.raises(RuntimeContractError):value.observe_native_schema(fingerprint,time.monotonic()+20)
+    assert not (value.root/'runtime').exists() and events==[]
+
+
+def test_schema_cleanup_failure_retains_owned_root_and_refuses_reuse(seat,monkeypatch):
+    import time
+
+    import conversation_runtime_codex_codegen as codegen
+    import conversation_runtime_codex_schema as schema
+    value,_,_=seat
+    fingerprint=value.candidate_fingerprint('codex','gpt-6.1-sol','high')
+    value.supervisor.preparation_identity=lambda **kwargs:{}
+    value.supervisor.record_codegen_child=lambda *args,**kwargs:True
+    runner=SimpleNamespace(cleanup=lambda deadline:False,receipt={})
+    monkeypatch.setattr(codegen,'make_owned_codegen_runner',lambda *args,**kwargs:runner)
+    monkeypatch.setattr(schema,'observe_codex_schema',lambda *args,**kwargs:schema.NativeSchemaObservation(fingerprint.executable,generation_completed=True))
+    with pytest.raises(RuntimeContractError):value.observe_native_schema(fingerprint,time.monotonic()+20)
+    assert len(list((value.root/'runtime').iterdir()))==1
+
+
+def test_actual_codegen_runner_content_participates_in_captured_fingerprint(seat):
+    value,_,_=seat
+    initial=value.implementation_digest('codex')
+    path=value.root/'.super-coder/scripts/conversation_runtime_codex_codegen.py'
+    path.write_text(path.read_text()+'\n# different consumed runner content\n')
+    assert value.implementation_digest('codex')!=initial

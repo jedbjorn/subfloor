@@ -143,12 +143,24 @@ def ledger_path(fixture_id: str) -> Path:
 
 
 @contextlib.contextmanager
-def ownership_lock(fixture_id: str):
+def ownership_lock(fixture_id: str, *, deadline: float | None = None):
+    if deadline is not None and time.monotonic()>=deadline:
+        raise FixtureError('OWNERSHIP_DEADLINE','fixture ownership observation expired')
     path = ledger_path(fixture_id).with_suffix(".lock")
     fd = os.open(path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
     try:
         private_file(path)
-        fcntl.flock(fd, fcntl.LOCK_EX)
+        if deadline is None:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+        else:
+            while True:
+                if time.monotonic() >= deadline:
+                    raise FixtureError('OWNERSHIP_DEADLINE','fixture ownership observation expired')
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    time.sleep(min(.01,max(0,deadline-time.monotonic())))
         yield
     finally:
         os.close(fd)
@@ -206,11 +218,11 @@ def description(record: dict[str, Any]) -> str:
     return f"Subfloor GUI experiment {record['fixture_id']} {record['ownership_nonce']}"
 
 
-def unit_state(record: dict[str, Any]) -> dict[str, str]:
+def unit_state(record: dict[str, Any], *, timeout: float = 20) -> dict[str, str]:
     result = command(["systemctl", "--user", "show", record["unit"],
                       "-p", "LoadState", "-p", "ActiveState", "-p", "SubState",
                       "-p", "Description", "-p", "ControlGroup", "-p", "MainPID"],
-                     check=False)
+                     check=False, timeout=timeout)
     values = dict(line.split("=", 1) for line in result.stdout.splitlines() if "=" in line)
     if not values.get("LoadState"):
         raise FixtureError("SUPERVISOR_UNAVAILABLE", "systemd unit state could not be verified")
@@ -330,16 +342,48 @@ class NativeSupervisor:
         verify_root(record)
         return record.get("native_units", [])
 
-    def preparation_identity(self) -> dict:
+    def preparation_identity(self, *, deadline: float | None = None) -> dict:
         """Capture only the current marked API's canonical preparation owner."""
         record=verify_receipt(self.receipt)
         verify_root(record)
-        state=unit_state(record)
+        if deadline is not None and time.monotonic() >= deadline:
+            raise FixtureError('OWNERSHIP_DEADLINE','preparation ownership observation expired')
+        state=unit_state(record,timeout=min(3,deadline-time.monotonic())) if deadline is not None else unit_state(record)
         if (not owned_unit(record,state) or int(state.get('MainPID','0'))!=os.getpid()
-                or process_start_ticks(os.getpid()) is None or not state.get('ControlGroup')):
+                or process_start_ticks(os.getpid()) is None or not state.get('ControlGroup')
+                or deadline is not None and time.monotonic() >= deadline):
             raise FixtureError('OWNERSHIP_INVALID','canonical preparation requires the marked API unit')
         return {'pid':os.getpid(),'start_ticks':process_start_ticks(os.getpid()),
                 'unit':record['unit'],'control_group':state['ControlGroup']}
+
+    def record_codegen_child(self, process, control_group: str, *, deadline: float) -> bool:
+        """Persist an inert child's identity before its fixed codegen gate opens.
+
+        The registered API unit owns all descendants. This record cannot name
+        a cleanup target or grant arbitrary process/unit operations.
+        """
+        owner=self.preparation_identity(deadline=deadline)
+        if type(process.pid) is not int or process.pid<=0 or type(process.start_ticks) is not int:
+            return False
+        initial=read_json(self.receipt)
+        with ownership_lock(initial['fixture_id'],deadline=deadline):
+            record=verify_receipt(self.receipt)
+            verify_root(record)
+            fields=Path(f'/proc/{process.pid}/stat').read_text().rsplit(')',1)[1].split()
+            groups=Path(f'/proc/{process.pid}/cgroup').read_text().splitlines()
+            if (int(fields[19])!=process.start_ticks or int(fields[2])!=process.pid
+                    or control_group!=owner['control_group'] or f'0::{control_group}' not in groups
+                    or self.preparation_identity(deadline=deadline)!=owner
+                    or record['status']!='serving' or record['runtime']!='experimental'):
+                return False
+            children=record.setdefault('codegen_children',[])
+            if len(children)>=32 or time.monotonic()>=deadline:
+                return False
+            children.append({'purpose':'codex_schema','api_owner':owner,
+                             'pid':process.pid,'start_ticks':process.start_ticks,
+                             'control_group':control_group,'registered_at':time.time()})
+            save(record,self.receipt)
+            return time.monotonic()<deadline
 
     def preparation_exited(self, identity: dict) -> bool:
         """PID death alone cannot release helpers left in the old API cgroup."""

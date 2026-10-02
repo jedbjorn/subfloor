@@ -14,10 +14,12 @@ import json
 import os
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import threading
 import time
+import uuid
 from collections.abc import Mapping
 from pathlib import Path
 
@@ -122,7 +124,8 @@ class NativeFixtureSeat:
                'gui_experiment_probe_owner.py','gui_experiment_runtime.py','gui_experiment_chats.py','conversation_runtime_native_probes.py','conversation_native_chats.py','conversation_native_checks.py',
                'gui_experiment_readiness.py','conversation_boot.py','run.py','route_transport.py',
                'execution_view.py','execution_view_exec.py')]
-        if harness=='codex':paths.append(scripts/'conversation_runtime_codex_schema.py')
+        if harness=='codex':paths.extend(scripts/name for name in (
+            'conversation_runtime_codex_schema.py','conversation_runtime_codex_codegen.py'))
         paths.extend([scripts/'conversation_adapters'/f'{harness}_runtime.py',
                       self.root/'.super-coder/api/route_bindings.py',self.root/'fixture_bootstrap.py',
                       self.root/'.super-coder/adapters'/harness/'adapter.json'])
@@ -156,6 +159,47 @@ class NativeFixtureSeat:
         policy=self.settings_digest(harness)
         return Fingerprint(harness,observed.binding,revision,policy,'openai' if harness=='codex' else 'anthropic',
                            model,effort,policy,self.implementation_digest(harness))
+
+    def observe_native_schema(self,fingerprint: Fingerprint,deadline: float):
+        """Fixed zero-account codegen, within the marked API's remaining budget."""
+        from conversation_runtime_codex_codegen import make_owned_codegen_runner
+        from conversation_runtime_codex_schema import observe_codex_schema
+        deadline=min(deadline,time.monotonic()+20)
+        if (fingerprint.harness!='codex' or not isinstance(fingerprint.model,str)
+                or not isinstance(fingerprint.effort,str) or time.monotonic()+2>=deadline):
+            raise RuntimeContractError('NATIVE_SCHEMA_INCONCLUSIVE','bounded schema prerequisite unavailable')
+        def guard():
+            return self.supervisor.preparation_identity(deadline=deadline)
+        owner=guard()
+        if self.candidate_fingerprint('codex',fingerprint.model,fingerprint.effort)!=fingerprint or time.monotonic()+2>=deadline:
+            raise RuntimeContractError('NATIVE_SCHEMA_INCONCLUSIVE','captured schema identity changed')
+        parent=self.root/'runtime'
+        guard()
+        parent.mkdir(mode=0o700,exist_ok=True)
+        info=parent.lstat()
+        if (parent.resolve()!=parent or not stat.S_ISDIR(info.st_mode)
+                or info.st_uid!=os.getuid() or stat.S_IMODE(info.st_mode)!=0o700
+                or time.monotonic()+2>=deadline):
+            raise RuntimeContractError('NATIVE_SCHEMA_INCONCLUSIVE','private schema boundary unavailable')
+        root=parent/f'codegen-{uuid.uuid4().hex}'
+        guard()
+        if time.monotonic()+2>=deadline:
+            raise RuntimeContractError('NATIVE_SCHEMA_INCONCLUSIVE','schema budget expired before allocation')
+        root.mkdir(mode=0o700)
+        runner=make_owned_codegen_runner(fingerprint.executable,root,guard,
+            record_child=lambda process,cgroup:self.supervisor.record_codegen_child(process,cgroup,deadline=deadline-2))
+        clean=False
+        try:
+            observed=observe_codex_schema(fingerprint.executable,root/'schema',effort=fingerprint.effort,
+                                         run_owned=runner,deadline=deadline-2)
+        finally:
+            clean=runner.cleanup(deadline)
+        receipt=dict(runner.receipt)
+        receipt['cleanup_complete']=clean
+        if (not clean or guard()!=owner or time.monotonic()>=deadline
+                or self.candidate_fingerprint('codex',fingerprint.model,fingerprint.effort)!=fingerprint):
+            raise RuntimeContractError('NATIVE_SCHEMA_INCONCLUSIVE','schema ownership or cleanup remains inconclusive')
+        return observed,receipt
 
     def selected_worktree(self,row) -> Path:
         expected=run.shell_work_dir(row['shortname'],row['flavor'],root=self.root).absolute()

@@ -32,6 +32,33 @@ _FIXTURE = None
 CHECK_PATH = '/api/experiment-native-check'
 
 
+def schema_summary(fingerprint,observation,receipt) -> dict:
+    """Structural evidence only, with no generated documents or private ledger."""
+    from conversation_runtime_codex_schema import CAPABILITIES, RESPONSE_FILES
+    names={'ClientRequest.json','ServerNotification.json',*RESPONSE_FILES.values()}
+    valid_hash=lambda value:isinstance(value,str) and len(value)==64 and all(c in '0123456789abcdef' for c in value)
+    result={'fingerprint':fingerprint.key,'observation':'installed-native-generated-schema',
+            'generation_completed':observation.generation_completed is True,
+            'behavior_admitted':False,'structural_grades':{},'diagnostics':[],
+            'schema_files_sha256':{},'owned_codegen':{}}
+    result['structural_grades']={cap:grade for cap,grade in observation.structural_grades.items()
+                                if cap in CAPABILITIES and grade in {'compatible','incompatible','inconclusive'}}
+    result['diagnostics']=[{'capability':item.capability,'grade':item.grade,'code':item.code}
+                           for item in observation.diagnostics if item.capability in CAPABILITIES
+                           and item.grade in {'incompatible','inconclusive'}
+                           and item.code in {'NATIVE_SCHEMA_UNAVAILABLE','REQUIRED_NATIVE_INTERFACE_MISMATCH'}]
+    result['schema_files_sha256']={name:value for name,value in observation.schema_files_sha256.items()
+                                  if name in names and valid_hash(value)}
+    for name in ('account_access','child_started','child_reaped','process_group_exited',
+                 'files_removed','gate_released','child_registered','cleanup_complete'):
+        if type(receipt.get(name)) is bool:result['owned_codegen'][name]=receipt[name]
+    if receipt.get('inference_count')==0 and type(receipt.get('inference_count')) is int:
+        result['owned_codegen']['inference_count']=0
+    if valid_hash(receipt.get('wrapper_sha256')):
+        result['owned_codegen']['wrapper_sha256']=receipt['wrapper_sha256']
+    return result
+
+
 def semantic_witness(raw: dict) -> dict:
     """Fixed diagnostic scalars only; never journal/native unknown fields."""
     stages={'allocation','startup','first_processing','first_reply','initial_work_inventory',
@@ -108,6 +135,10 @@ class FixtureNativeCheck:
         self.stopped=False
         self.persisted=False
         self.cancelling=False
+        self.schema_future: Future | None=None
+        self.schema_fingerprint: Fingerprint | None=None
+        self.schema_observation=None
+        self.schema_public: dict | None=None
         from conversation_native_checks import NativeChecks
         self.workflow=NativeChecks(self)
         self.chats: Any=None
@@ -149,27 +180,90 @@ class FixtureNativeCheck:
             self.owner.completed_key(job['fingerprint_key'],cid,generation)
         return False
 
+    def retained_guard(self) -> None:
+        con=db_driver.connect(str(self.database))
+        try:
+            retained=con.execute("SELECT 1 FROM conversation_runtime_probe_jobs WHERE status!='complete' LIMIT 1").fetchone()
+        finally:
+            con.close()
+        if retained:
+            raise RuntimeContractError('CLEANUP_PENDING','retained finite probe must finish owned cleanup before new checking')
+
+    def native_schema(self,fp,deadline):
+        # RAM reuse is exact captured identity + completed child cleanup only.
+        # Re-capturing is required even when the previous operation succeeded.
+        if self.seat.candidate_fingerprint('codex','gpt-6.1-sol','high')!=fp or time.monotonic()>=deadline:
+            raise RuntimeContractError('NATIVE_SCHEMA_INCONCLUSIVE','schema identity changed')
+        if (self.schema_fingerprint==fp and self.schema_observation is not None
+                and self.schema_public is not None
+                and self.schema_public['owned_codegen'].get('cleanup_complete') is True):
+            return self.schema_observation
+        observation,receipt=self.seat.observe_native_schema(fp,deadline)
+        self.schema_public=schema_summary(fp,observation,receipt)
+        if not all(receipt.get(name) is True for name in ('cleanup_complete','child_registered',
+                    'gate_released','child_reaped','process_group_exited','files_removed')):
+            self.schema_observation=None
+            self.schema_fingerprint=None
+            raise RuntimeContractError('NATIVE_SCHEMA_INCONCLUSIVE','schema child cleanup is not proved')
+        self.schema_fingerprint=fp
+        self.schema_observation=observation if receipt.get('cleanup_complete') is True and observation.generation_completed else None
+        return observation
+
+    def begin_schema(self) -> dict:
+        with self.lock:
+            if self.stopped:
+                raise RuntimeContractError('FIXTURE_STOPPED','API consumer is stopping')
+            if self.future is not None and not self.future.done():
+                raise RuntimeContractError('CHECK_BUSY','native behavior check is active')
+            if self.schema_future is not None and not self.schema_future.done():
+                return self.status()
+            self.retained_guard() # Before candidate observation or codegen.
+            deadline=time.monotonic()+23
+            future: Future=Future()
+            self.schema_future=future
+            self.schema_public={'state':'running','observation':'installed-native-generated-schema','behavior_admitted':False}
+            def observe():
+                try:
+                    fp=self.seat.candidate_fingerprint('codex','gpt-6.1-sol','high')
+                    with self.lock:
+                        if self.stopped:raise RuntimeContractError('FIXTURE_STOPPED','API consumer is stopping')
+                    self.native_schema(fp,deadline)
+                    with self.lock:
+                        self.schema_public['state']='complete' if self.schema_observation is not None else 'inconclusive'
+                    future.set_result(None)
+                except Exception: # noqa: BLE001 - unknown native payload never becomes a public diagnostic
+                    with self.lock:
+                        self.schema_observation=None
+                        self.schema_public={'state':'inconclusive','observation':'installed-native-generated-schema',
+                                            'behavior_admitted':False,'diagnostic':'NATIVE_SCHEMA_INCONCLUSIVE'}
+                    future.set_result(None)
+            threading.Thread(target=observe,name='fixture-native-schema',daemon=True).start()
+            return self.status()
+
     def begin(self, *, on_candidate=None) -> dict:
         with self.lock:
             if self.stopped:
                 raise RuntimeContractError('FIXTURE_STOPPED','API consumer is stopping')
             if self.future is not None and not self.future.done():
                 return self.status()
-            con=db_driver.connect(str(self.database))
-            try:
-                retained=con.execute("SELECT 1 FROM conversation_runtime_probe_jobs WHERE status!='complete' LIMIT 1").fetchone()
-            finally:
-                con.close()
-            if retained:
-                raise RuntimeContractError('CLEANUP_PENDING','retained finite probe must finish owned cleanup before new checking')
+            if self.schema_future is not None and not self.schema_future.done():
+                raise RuntimeContractError('CHECK_BUSY','native schema observation is active')
+            self.retained_guard()
+            deadline=time.monotonic()+177
             fp=self.seat.candidate_fingerprint('codex','gpt-6.1-sol','high')
-            from conversation_adapters.codex_runtime import create_driver
-            shape,requirements=adapter_interface(create_driver())
+            observation=self.native_schema(fp,deadline-20)
+            if observation.structural_grades['submission']!='compatible' or not observation.generation_completed:
+                raise RuntimeContractError('NATIVE_SCHEMA_INCONCLUSIVE','required native submission interface is unavailable')
+            shape=observation.observed_interface
+            requirements={cap:observation.requirements[cap] for cap in ('submission','stop_reply','stop_work')}
+            remaining=deadline-time.monotonic()
+            if remaining<60:
+                raise RuntimeContractError('CHECK_DEADLINE','source preparation consumed the finite check budget')
             self.fingerprint,self.failure,self.persisted=fp,None,False
             if on_candidate is not None:
                 on_candidate(fp.key) # Commit HTTP binding before dispatch.
             self.future=self.checker.request(fp,observed_interface=shape,requirements=requirements,
-                                             factory=self.factory,seconds=177)
+                                             factory=self.factory,seconds=min(177,remaining))
             self.future.add_done_callback(self.finished)
             return self.status()
 
@@ -241,8 +335,10 @@ class FixtureNativeCheck:
             result: dict[str,Any]={'fixture_id':self.fixture_id,'operation':'finite-native-check','harness':'codex',
                     'model':'gpt-6.1-sol','effort':'high','state':'running' if self.future and not self.future.done() else 'retained' if job and job['status']!='complete' else 'idle',
                     'fingerprint':fp.key if fp else None,'probe':None,'grades':{},'evidence':{},
-                    'diagnostic':self.failure,'ordinary_chats_admitted':False,'structural_observation':'python-adapter-signatures',
+                    'diagnostic':self.failure,'ordinary_chats_admitted':False,'structural_observation':'installed-native-generated-schema',
                     'cache_persisted':self.persisted,'close_pending':self.cancelling}
+            if self.schema_public is not None:
+                result['native_schema']=self.schema_public
             if fp:
                 result['behavior_witness']=semantic_witness(self.factory.witness(fp))
             if job:
@@ -311,6 +407,8 @@ def handle_check(method: str,headers_raw: str,body: bytes) -> tuple:
             if not routes._mutation_site_ok(headers):
                 raise routes.ApiError(403,'NOT_SAME_ORIGIN','cross-site fixture mutation rejected')
             request=routes._body(body)
+            if request=={'action':'schema'}:
+                return routes._json(202,_FIXTURE.begin_schema())
             if request=={'action':'close'}:
                 return routes._json(202,_FIXTURE.cancel())
             if request!={}:
