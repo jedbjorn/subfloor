@@ -270,7 +270,8 @@ def stop_locked(receipt: Path) -> dict[str, Any]:
             break
         if time.monotonic() >= deadline:
             record["cleanup"] = {"complete": False, "unit_state": state.get("ActiveState"),
-                                 "surviving_pids": pids, "root_removed": False}
+                                 "surviving_pids": pids, "root_removed": False,
+                                 "recorded_process_exited": not recorded_live}
             save(record, receipt)
             raise FixtureError("CLEANUP_UNVERIFIED", "owned process/unit did not become inactive")
         time.sleep(.1)
@@ -303,6 +304,7 @@ def select_port(port: int | None) -> int:
     if port is not None and not 1 <= port <= 65535:
         raise FixtureError("INPUT_INVALID", "port must be 1..65535")
     with socket.socket() as sock:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         try:
             sock.bind(("127.0.0.1", port or 0))
         except OSError as exc:
