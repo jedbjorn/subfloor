@@ -189,6 +189,41 @@ def test_native_prompts_require_actual_memory_and_physical_marker_observation(ow
     assert result['submission'].grade=='inconclusive' and not any(c[0]=='submit' for c in owned.client.calls)
     driver.cleanup(deadline=time.monotonic()+1)
 
+
+@pytest.mark.parametrize('change',[
+    None, {'evidence_level':'effective_telemetry'}, {'effective_telemetry':True},
+    {'auto_memory_disabled':1}, {'auto_memory_enabled_setting':0},
+    {'inherited_disable_flag':None}, {'generation_id':'other'},
+    {'executable_sha256':'e'*64}, {'configuration_sha256':'e'*64},
+    {'hook_sha256':None}, {'source_condition_sha256':'unknown'},
+    {'observation_origin':'model narration'}, {'missing_policy':True},
+])
+def test_claude_probe_input_requires_qualified_captured_memory_inference(owned,change):
+    context=replace(owned.context,harness='claude',provider='anthropic',model='actual-selected-model')
+    owned.client.context=context
+    policy={'evidence_level':'configuration_source_flag_inference',
+        'observation_origin':'claude:documented-settings+captured-executable+owned-SessionStart-hook',
+        'auto_memory_disabled':True,'effective_telemetry':False,'generation_id':context.generation_id,
+        'executable_sha256':context.executable.sha256,'configuration_sha256':'b'*64,
+        'hook_sha256':'c'*64,'source_condition_sha256':'d'*64,'inherited_disable_flag':'1',
+        'auto_memory_enabled_setting':False}
+    if change is not None:policy.update(change)
+    def identity():
+        return {'root_id':'root','process':{'pid':77,'start_ticks':100},'protocol':{
+            'configuration_sha256':'b'*64,'native_route':{'account_type':'claude.ai',
+            'model':context.model,'efforts':['high']},
+            'memory_policy':{} if policy.get('missing_policy') else policy}}
+    owned.client.identity=identity
+    actual=replace(owned,context=context)
+    driver=start(actual)
+    result=NativeProbeFactory._exercise(driver,frozenset({'submission'}),time.monotonic()+2)
+    assert result['submission'].grade==('compatible' if change is None else 'inconclusive')
+    assert sum(op=='submit' for op,_,_ in owned.client.calls)==(2 if change is None else 0)
+    assert ('memory_disabled' in result['submission'].coverage)==(change is None)
+    if change is None:
+        assert driver.identity.protocol['memory_policy']['effective_telemetry'] is False
+    driver.cleanup(deadline=time.monotonic()+1)
+
 def test_finite_scenario_earns_observed_targets_without_early_os_cleanup_pass(owned):
     driver=start(owned);result=NativeProbeFactory._exercise(driver,frozenset({'submission','stop_reply','stop_work'}),time.monotonic()+3)
     assert all(item.grade=='compatible' for item in result.values())
