@@ -64,7 +64,13 @@ class NativeChecks:
                     if previous:
                         if previous['request_hash']!=request_hash:
                             raise RuntimeContractError('CHECK_IDEMPOTENCY_CONFLICT','check key was reused with different selection')
-                        return self._projection(previous)
+                        replay=self._projection(previous)
+                        if replay.get('behavior_witness') is not None:
+                            probe,binding=self._owned_probe(con,previous,json.loads(previous['result_json']))
+                            if probe is None or not binding:
+                                replay['behavior_witness']=None
+                                replay['behavior_witness_observation']='unavailable'
+                        return replay
                     if con.execute("SELECT 1 FROM conversation_runtime_check_requests WHERE status!='complete' LIMIT 1").fetchone():
                         raise RuntimeContractError('CLEANUP_PENDING','retained check must reconcile before another check')
                     if con.execute("SELECT 1 FROM conversation_runtime_probe_jobs WHERE status!='complete' LIMIT 1").fetchone():

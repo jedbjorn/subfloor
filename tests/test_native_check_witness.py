@@ -89,3 +89,15 @@ def test_retained_malformed_witness_never_exposes_unknown_data(invalid):
     projected=checks.NativeChecks._projection(row)
     assert projected['behavior_witness'] is None and 'behavior_witness_observation' not in projected
     assert 'private' not in json.dumps(projected)
+
+
+def test_duplicate_post_retains_intent_but_clears_displaced_witness(request):
+    value,_operation,_report,con,first,runtime=bind_probe(request.getfixturevalue("workflow"))
+    value.get(1,check_id=first['check_id'])
+    assert value.create(1,'witness-key',checks.CODEX_SELECTION)['behavior_witness'] is not None
+    runtime['generation_id']='replacement'
+    con.execute("UPDATE conversations SET runtime_projection=? WHERE conversation_id='probe-cv'",(json.dumps(runtime),));con.commit()
+    replay=value.create(1,'witness-key',checks.CODEX_SELECTION)
+    assert replay['check_id']==first['check_id']
+    assert replay['behavior_witness'] is None and replay['behavior_witness_observation']=='unavailable'
+    assert con.execute('SELECT COUNT(*) FROM conversation_runtime_check_requests').fetchone()[0]==1
