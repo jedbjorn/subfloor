@@ -31,40 +31,53 @@ from conversation_runtime_contract import (
 
 ASSETS = SCRIPTS.parent / "assets/runtime/claude"
 DEADLINE = lambda: time.monotonic() + 1
+# Deliberately synthetic source fixture for the accepted consumed predicate.
+MEMORY_SOURCE = ('function truth(e){if(!e)return!1;if(typeof e==="boolean")return e;'
+    'let n=String(e).toLowerCase().trim();return["1","true","yes","on"].includes(n)}'
+    'function enabled(){switch(gate()){case"off":return!1;case"forced_on":return!0;}}'
+    'function gate(){let e=process.env.CLAUDE_CODE_DISABLE_AUTO_MEMORY;if(truth(e))return"off";}')
 
 
 @pytest.fixture
-def seat(tmp_path):
+def seat(tmp_path, monkeypatch):
     worktree = tmp_path / "work"
     worktree.mkdir()
     boot = "Canonical instructions; no auto-memory."
     (worktree / "CLAUDE.md").write_text(boot)
     executable = tmp_path / "native"
-    executable.write_text("captured test executable; never executed")
+    executable.write_text("captured test executable; never executed\n" + MEMORY_SOURCE)
     state = tmp_path / "generation"
     context = RuntimeContext("gen", "chat", 1, 1, "claude", state, worktree,
         ExecutableBinding(executable, hashlib.sha256(executable.read_bytes()).hexdigest(), "test-version"),
         runtime.REVISION, hashlib.sha256(boot.encode()).hexdigest(), "canonical-policy", "unrestricted",
+        model="claude-sonnet-5-5", effort="high",
         boot_content=boot, env={"HOME": str(tmp_path), "PATH": os.environ["PATH"]},
         controller_endpoint=tmp_path / "controller.sock")
     driver = runtime.ClaudeRuntimeDriver()
     events = []
     driver._context, driver._emit = context, events.append
     driver._identity = RuntimeIdentity("00000000-0000-4000-a000-000000000000")
+    driver._native_auth = {"method": "claude.ai", "provider": "firstParty"}  # Synthetic source fixture.
+    prepared_assets(tmp_path, monkeypatch)
     with driver._condition:
         yield driver, context, events
 
 
 def hook(seat, name, **fields):
     driver, context, _ = seat
-    driver.asset({"kind": "hook", "event": {"hook_event_name": name,
-        "session_id": driver._identity.root_id, "cwd": str(context.worktree), **fields}},
-        peer=ProcessIdentity(999999999, 10), deadline=DEADLINE())
+    payload = {"kind": "hook", "event": {"hook_event_name": name,
+        "session_id": driver._identity.root_id, "cwd": str(context.worktree), **fields}}
+    if name == "SessionStart":
+        if not driver._configuration_files:
+            driver._prepare(context)
+        payload["startup_observation"] = {"generation_id": context.generation_id,
+            "inherited_disable_flag": "1", "hook_sha256": hashlib.sha256((runtime.ASSETS / "hook.py").read_bytes()).hexdigest()}
+    driver.asset(payload, peer=ProcessIdentity(999999999, 10), deadline=DEADLINE())
 
 
 def prepared_assets(tmp_path, monkeypatch):
     assets = tmp_path / "assets"
-    (assets / "node_modules/@modelcontextprotocol/sdk").mkdir(parents=True)
+    (assets / "node_modules/@modelcontextprotocol/sdk").mkdir(parents=True, exist_ok=True)
     for original in runtime.ASSETS.iterdir():
         if original.is_file():
             (assets / original.name).write_bytes(original.read_bytes())
@@ -104,9 +117,11 @@ def startup_dialog():
 def startup_seat(seat, tmp_path, monkeypatch):
     _, context, _ = seat
     prepared_assets(tmp_path, monkeypatch)
-    context.executable.path.write_text("#!/usr/bin/python3\nimport sys,time\n"
+    context.executable.path.write_text("#!/usr/bin/python3\nimport sys,time,json\n"
+        + "if sys.argv[1:]==['auth','status','--json']:\n"
+        + " print(json.dumps({'loggedIn':True,'authMethod':'claude.ai','apiProvider':'firstParty'}));sys.exit(0)\n"
         + f"print({startup_dialog()!r},end='',flush=True)\n"
-        + "sys.stdin.readline()\nprint('fixture confirmation consumed',flush=True)\ntime.sleep(5)\n")
+        + "sys.stdin.readline()\nprint('fixture confirmation consumed',flush=True)\ntime.sleep(5)\n# " + MEMORY_SOURCE + "\n")
     context.executable.path.chmod(0o700)
     context = replace(context, executable=replace(context.executable,
         sha256=hashlib.sha256(context.executable.path.read_bytes()).hexdigest()))
@@ -237,7 +252,7 @@ def test_native_initialization_does_not_equal_consent_or_ready(seat):
     driver, context, events = seat
     driver._context = replace(context, capability_evidence={"submission": "compatible"})
     transcript = Path(context.env["HOME"]) / ".claude/projects/exact" / (driver._identity.root_id + ".jsonl")
-    hook(seat, "SessionStart", transcript_path=str(transcript))
+    hook(seat, "SessionStart", transcript_path=str(transcript), model=context.model)
     driver.asset({"kind": "channel.ready"}, peer=ProcessIdentity(999999999, 10), deadline=DEADLINE())
     assert not driver._ready
     assert driver.submit(request(), deadline=DEADLINE()).state == "not_written"
@@ -248,7 +263,7 @@ def test_native_initialization_does_not_equal_consent_or_ready(seat):
     driver._transcript_record({"sessionId": driver._identity.root_id, "type": "assistant",
         "promptId": "ready-prompt", "message": {"id": "observed-native-message",
         "content": [{"type": "text", "text": nonce}]}})
-    hook(seat, "Stop", prompt_id="ready-prompt", background_tasks=[], session_crons=[])
+    hook(seat, "Stop", prompt_id="ready-prompt", background_tasks=[], session_crons=[], effort={"level": "high"})
     assert not driver._ready  # Pre-terminal Stop can be blocked by another hook.
     driver._transcript_record({"sessionId": driver._identity.root_id, "type": "system",
         "promptId": "ready-prompt", "subtype": "turn_duration"})
@@ -256,7 +271,188 @@ def test_native_initialization_does_not_equal_consent_or_ready(seat):
     ready = [event for event in events if event.kind == "runtime.ready"]
     assert ready[0].data["inference_turns"] == 1
     assert ready[0].data["observed_model_message_ids"] == 1
+    assert ready[0].data["native_route"]["model"] == "claude-sonnet-5-5"
+    assert ready[0].data["native_route"]["efforts"] == ["high"]
+    assert ready[0].data["native_route"]["catalogue_observed"] is False
+    assert driver._identity.protocol["memory_policy"]["effective_telemetry"] is False
     assert not [event for event in events if event.kind == "output.final"]
+
+
+@pytest.mark.parametrize("mutation", [{"loggedIn": False}, {"loggedIn": 1},
+    {"authMethod": "api_key"}, {"authMethod": "oauth_token"}, {"apiProvider": "gateway"}])
+def test_account_route_refuses_absent_or_alternate_auth_without_copying_private_fields(mutation):
+    status = {"loggedIn": True, "authMethod": "claude.ai", "apiProvider": "firstParty",
+              "email": "private@example.invalid", "orgId": "private-id", "unknown": "private"}
+    with pytest.raises(RuntimeContractError) as caught:
+        runtime._parse_auth_status(json.dumps(status | mutation).encode(), 0)
+    assert caught.value.code == "NATIVE_ACCOUNT_INCONCLUSIVE"
+    assert "private" not in str(caught.value)
+
+
+def test_account_observation_consumes_only_bounded_public_route_enums():
+    value = runtime._parse_auth_status(json.dumps({"loggedIn": True, "authMethod": "claude.ai",
+        "apiProvider": "firstParty", "subscriptionType": "max", "email": "private@example.invalid",
+        "orgId": "private", "configDirectory": "/private", "new": {"token": "private"}}).encode(), 0)
+    assert value == {"method": "claude.ai", "provider": "firstParty", "subscription_type": "max"}
+    for raw in (b"", b"not-json", b"null", b"[]", b"x" * (runtime.AUTH_STATUS_BYTES + 1)):
+        with pytest.raises(RuntimeContractError):
+            runtime._parse_auth_status(raw, 0)
+
+
+def test_account_spawn_failure_preserves_only_static_diagnostic(seat, monkeypatch):
+    _, context, _ = seat
+    def spawn(*args, **kwargs):
+        raise OSError("private account/path sentinel")
+    monkeypatch.setattr(runtime.subprocess, "Popen", spawn)
+    with pytest.raises(RuntimeContractError) as caught:
+        runtime._auth_status(context, {}, DEADLINE())
+    assert caught.value.code == "NATIVE_ACCOUNT_INCONCLUSIVE"
+    assert str(caught.value) == "native account observation unavailable"
+
+
+@pytest.mark.parametrize("failure", ["oversized", "deadline"])
+def test_fixed_auth_process_output_and_deadline_are_bounded_and_owned_child_is_reaped(seat, monkeypatch, failure):
+    _, context, _ = seat
+    context.executable.path.write_text("#!/usr/bin/python3\nimport sys,time\n"
+        + ("sys.stdout.write('x'*20000);sys.stdout.flush();time.sleep(5)\n" if failure == "oversized" else "time.sleep(5)\n"))
+    context.executable.path.chmod(0o700)
+    original, children = subprocess.Popen, []
+    def spawn(*args, **kwargs):
+        assert args[0] == [str(context.executable.path), "auth", "status", "--json"]
+        assert kwargs["env"] == {"HOME": "explicit-native-home"}
+        children.append(original(*args, **kwargs))
+        return children[-1]
+    monkeypatch.setattr(runtime.subprocess, "Popen", spawn)
+    started = time.monotonic()
+    with pytest.raises(RuntimeContractError) as caught:
+        runtime._auth_status(context, {"HOME": "explicit-native-home"}, started + .05)
+    assert caught.value.code == "NATIVE_ACCOUNT_INCONCLUSIVE"
+    assert time.monotonic() - started < 1 and children[0].poll() is not None
+    assert children[0].stdout.closed
+
+
+def test_close_cancels_pending_owned_auth_child_before_foreground_launch(seat, tmp_path, monkeypatch):
+    _, context, _ = seat
+    prepared_assets(tmp_path, monkeypatch)
+    context.executable.path.write_text("#!/usr/bin/python3\nimport time;time.sleep(5)\n# " + MEMORY_SOURCE + "\n")
+    context.executable.path.chmod(0o700)
+    context = replace(context, executable=replace(context.executable,
+        sha256=hashlib.sha256(context.executable.path.read_bytes()).hexdigest()))
+    children, launches, results = [], [], []
+    entered = threading.Event()
+    original = subprocess.Popen
+    def spawn(*args, **kwargs):
+        assert args[0] == [str(context.executable.path), "auth", "status", "--json"]
+        children.append(original(*args, **kwargs))
+        entered.set()
+        return children[-1]
+    monkeypatch.setattr(runtime.subprocess, "Popen", spawn)
+    driver = runtime.ClaudeRuntimeDriver(popen=lambda *args, **kwargs: launches.append(args))
+    start = threading.Thread(target=lambda: results.append(driver.start(context, lambda _: None,
+        deadline=time.monotonic()+2)))
+    start.start()
+    assert entered.wait(1)
+    begun = time.monotonic()
+    driver.cleanup(deadline=begun+1)
+    start.join(1)
+    assert not start.is_alive() and time.monotonic()-begun < 1
+    assert driver._closing and not launches and children[0].poll() is not None
+    assert children[0].stdout.closed and results[0].state == "unavailable"
+
+
+@pytest.mark.parametrize("changed", ["executable", "boot", "managed_mcp", "channel_asset"])
+def test_auth_observation_cannot_launch_changed_captured_binary_or_configuration(seat, tmp_path, monkeypatch, changed):
+    _, context, _ = seat
+    prepared_assets(tmp_path, monkeypatch)
+    mcp = tmp_path / "managed.json"
+    mcp.write_text('{"mcpServers":{}}')
+    context = replace(context, managed_mcp_files=(mcp,))
+    launches = []
+    driver = runtime.ClaudeRuntimeDriver(popen=lambda *args, **kwargs: launches.append(args))
+    def auth(ctx, env, deadline, **kwargs):
+        path = {"executable": context.executable.path, "boot": context.worktree / "CLAUDE.md",
+            "managed_mcp": mcp, "channel_asset": runtime.ASSETS / "channel.mjs"}[changed]
+        path.write_text("changed while account helper ran")
+        return {"method": "claude.ai", "provider": "firstParty"}
+    monkeypatch.setattr(runtime, "_auth_status", auth)
+    result = driver.start(context, lambda _: None, deadline=DEADLINE())
+    assert result.state == "unavailable" and not launches and driver._master is None
+    driver.cleanup(deadline=DEADLINE())
+
+
+def test_auth_completion_after_deadline_cannot_launch_foreground(seat, tmp_path, monkeypatch):
+    _, context, _ = seat
+    prepared_assets(tmp_path, monkeypatch)
+    launches = []
+    driver = runtime.ClaudeRuntimeDriver(popen=lambda *args, **kwargs: launches.append(args))
+    def auth(ctx, env, deadline, **kwargs):
+        time.sleep(.03)
+        return {"method": "claude.ai", "provider": "firstParty"}
+    monkeypatch.setattr(runtime, "_auth_status", auth)
+    result = driver.start(context, lambda _: None, deadline=time.monotonic()+.01)
+    assert result.state == "unavailable" and not launches
+    driver.cleanup(deadline=DEADLINE())
+
+
+def test_auth_spawn_waiting_for_start_condition_rechecks_deadline(seat, monkeypatch):
+    _, context, _ = seat
+    driver = runtime.ClaudeRuntimeDriver()
+    launches, errors = [], []
+    monkeypatch.setattr(runtime.subprocess, "Popen", lambda *args, **kwargs: launches.append(args))
+    entered = threading.Event()
+    deadline = time.monotonic()+.03
+    def spawn():
+        entered.set()
+        try:
+            driver._spawn_auth(deadline, [str(context.executable.path), "auth", "status", "--json"])
+        except RuntimeContractError as exc:
+            errors.append(exc.code)
+    with driver._condition:
+        child = threading.Thread(target=spawn)
+        child.start()
+        assert entered.wait(1)
+        time.sleep(.05)
+    child.join(1)
+    assert errors == ["NATIVE_ACCOUNT_INCONCLUSIVE"] and not launches and not child.is_alive()
+
+
+@pytest.mark.parametrize("observed_model", [None, "another-model", "sonnet"])
+def test_missing_or_different_active_model_prevents_readiness_inference_and_alias_guessing(seat, observed_model):
+    driver, context, events = seat
+    driver._context = replace(context, capability_evidence={"submission": "compatible"})
+    transcript = Path(context.env["HOME"]) / ".claude/projects/exact" / (driver._identity.root_id + ".jsonl")
+    hook(seat, "SessionStart", transcript_path=str(transcript), model=observed_model)
+    driver.asset({"kind": "channel.ready"}, peer=ProcessIdentity(999999999, 10), deadline=DEADLINE())
+    assert not driver._notifications and not driver._ready
+    assert not [event for event in events if event.kind == "runtime.ready"]
+    assert [event for event in events if event.kind == "capability.observed"][-1].grade == "inconclusive"
+
+
+@pytest.mark.parametrize("observed_effort", [None, "low", "high"])
+def test_effective_effort_is_correlated_to_readiness_turn_and_late_stop_can_complete_proof(seat, observed_effort):
+    driver, context, events = seat
+    driver._context = replace(context, capability_evidence={"submission": "compatible"})
+    transcript = Path(context.env["HOME"]) / ".claude/projects/exact" / (driver._identity.root_id + ".jsonl")
+    hook(seat, "SessionStart", transcript_path=str(transcript), model=context.model)
+    driver.asset({"kind": "channel.ready"}, peer=ProcessIdentity(999999999, 10), deadline=DEADLINE())
+    nonce = driver._readiness_nonce
+    hook(seat, "UserPromptSubmit", prompt_id="proof", prompt=channel_prompt(seat, nonce, readiness_nonce=nonce))
+    driver._transcript_record({"sessionId": driver._identity.root_id, "type": "assistant",
+        "promptId": "proof", "message": {"id": "message", "content": [{"type": "text", "text": nonce}]}})
+    driver._transcript_record({"sessionId": driver._identity.root_id, "type": "system",
+        "promptId": "proof", "subtype": "turn_duration"})
+    assert not driver._ready  # Exact terminal alone has no effective effort.
+    hook(seat, "Stop", prompt_id="unrelated", effort={"level": "high"}, background_tasks=[], session_crons=[])
+    assert not driver._ready
+    hook(seat, "Stop", prompt_id="proof", effort={} if observed_effort is None else {"level": observed_effort},
+        background_tasks=[], session_crons=[])
+    assert driver._ready == (observed_effort == "high")
+    ready = [event for event in events if event.kind == "runtime.ready"]
+    assert len(ready) == int(observed_effort == "high")
+    assert driver._identity.protocol["memory_policy"]["effective_telemetry"] is False
+    if observed_effort == "low":
+        assert driver._capabilities()["submission"] == "inconclusive"
+        assert driver.submit(request(), deadline=DEADLINE()).state == "not_written"
 
 
 @pytest.mark.parametrize("failure", ["StopFailure", "failed_terminal", "missing_reply", "wrong_reply", "wrong_terminal_source"])
@@ -264,7 +460,7 @@ def test_failed_or_unanswered_challenge_never_certifies_readiness(seat, failure)
     driver, context, events = seat
     driver._context = replace(context, capability_evidence={"submission": "compatible"})
     transcript = Path(context.env["HOME"]) / ".claude/projects/exact" / (driver._identity.root_id + ".jsonl")
-    hook(seat, "SessionStart", transcript_path=str(transcript))
+    hook(seat, "SessionStart", transcript_path=str(transcript), model=context.model)
     driver.asset({"kind": "channel.ready"}, peer=ProcessIdentity(999999999, 10), deadline=DEADLINE())
     nonce = driver._readiness_nonce
     hook(seat, "UserPromptSubmit", prompt_id="challenge", prompt=channel_prompt(seat, nonce, readiness_nonce=nonce))
@@ -484,7 +680,8 @@ def test_guard_ingress_failure_blocks_pretool_and_does_not_print_raw_event(tmp_p
     assert "private input sentinel" not in result.stderr + result.stdout
 
 
-def test_hook_private_wire_carries_owned_record_without_api_or_credentials(tmp_path):
+@pytest.mark.parametrize("event_name,flag", [("Stop", "1"), ("SessionStart", "1"), ("SessionStart", "0"), ("SessionStart", None)])
+def test_hook_private_wire_carries_owned_record_without_api_or_credentials(tmp_path, event_name, flag):
     path = tmp_path / "controller.sock"
     server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     server.bind(str(path))
@@ -500,14 +697,22 @@ def test_hook_private_wire_carries_owned_record_without_api_or_credentials(tmp_p
     thread = threading.Thread(target=receive)
     thread.start()
     try:
-        result = subprocess.run([sys.executable, str(ASSETS / "hook.py"), "--event", "Stop"],
-            input='{"hook_event_name":"Stop","session_id":"root"}', capture_output=True, text=True, timeout=3, check=False,
-            env={"SC_F89_CONTROLLER_ENDPOINT": str(path), "SC_F89_GENERATION_ID": "gen"})
+        result = subprocess.run([sys.executable, str(ASSETS / "hook.py"), "--event", event_name],
+            input=json.dumps({"hook_event_name":event_name,"session_id":"root"}), capture_output=True, text=True, timeout=3, check=False,
+            env={"SC_F89_CONTROLLER_ENDPOINT": str(path), "SC_F89_GENERATION_ID": "gen",
+                 "PRIVATE_UNUSED":"must-not-export", **({"CLAUDE_CODE_DISABLE_AUTO_MEMORY":flag} if flag is not None else {})})
         assert result.returncode == 0
         thread.join(timeout=1)
         assert frames[0]["contract"] == "f89-native-runtime-v1"
         assert frames[0]["op"] == "asset" and "env" not in frames[0]
         assert frames[0]["payload"]["event"]["session_id"] == "root"
+        assert "must-not-export" not in json.dumps(frames)
+        observation=frames[0]["payload"].get("startup_observation")
+        if event_name=="SessionStart":
+            assert observation=={"generation_id":"gen","inherited_disable_flag":"1" if flag=="1" else None,
+                "hook_sha256":hashlib.sha256((ASSETS/"hook.py").read_bytes()).hexdigest()}
+        else:
+            assert observation is None
     finally:
         server.close()
 
@@ -574,3 +779,119 @@ def test_close_never_signals_reused_channel_pid(seat, monkeypatch):
     monkeypatch.setattr(runtime.os, "kill", lambda *args: calls.append(args))
     driver.cleanup(deadline=DEADLINE())
     assert calls == []
+
+
+@pytest.mark.parametrize("variant", ["plain_unknown", "true_on_off", "zero_is_true", "wrong_hash", "oversized"])
+def test_memory_source_is_consumed_not_a_version_or_disable_string_certificate(tmp_path, monkeypatch, variant):
+    executable = tmp_path / "source-only"
+    source = MEMORY_SOURCE
+    if variant == "plain_unknown":
+        source = "CLAUDE_CODE_DISABLE_AUTO_MEMORY autoMemoryEnabled"
+    elif variant == "true_on_off":
+        source = source.replace('case"off":return!1', 'case"off":return!0')
+    elif variant == "zero_is_true":
+        source = source.replace('["1","true","yes","on"]', '["0","false","no","off"]')
+    executable.write_text(source)
+    digest = hashlib.sha256(executable.read_bytes()).hexdigest()
+    if variant == "oversized":
+        monkeypatch.setattr(runtime, "MEMORY_SOURCE_BYTES", 16)
+    with pytest.raises(RuntimeContractError) as caught:
+        runtime._memory_disable_source(executable, "a"*64 if variant == "wrong_hash" else digest)
+    assert caught.value.code in {"NATIVE_MEMORY_INCONCLUSIVE", "EXECUTABLE_CHANGED"}
+
+
+def test_memory_source_accepts_renamed_consumed_symbols_and_bounds_cross_chunk_inspection(tmp_path):
+    executable = tmp_path / "source-only"
+    # Function names/offset/version are irrelevant; bind actual three conditions.
+    source = MEMORY_SOURCE.replace('truth', 'env_truth').replace('gate', 'native_gate')
+    executable.write_bytes(b"x" * (1024*1024-30) + source.encode())
+    result = runtime._memory_disable_source(executable, hashlib.sha256(executable.read_bytes()).hexdigest())
+    assert len(result) == 64
+
+
+@pytest.mark.parametrize("cached", [False, True])
+@pytest.mark.parametrize("mutation", ["missing", "flag", "generation", "hook"])
+def test_owned_startup_memory_observation_is_required_before_first_challenge(seat, cached, mutation):
+    driver, context, events = seat
+    driver._context = replace(context, capability_evidence={"submission": "compatible"} if cached else {},
+        probe_capabilities=() if cached else ("submission",))
+    driver._prepare(driver._context)
+    value = {"generation_id": "gen", "inherited_disable_flag": "1",
+        "hook_sha256": hashlib.sha256((runtime.ASSETS / "hook.py").read_bytes()).hexdigest()}
+    if mutation != "missing":
+        value[{"flag":"inherited_disable_flag","generation":"generation_id","hook":"hook_sha256"}[mutation]] = "changed"
+    driver.asset({"kind":"channel.ready"},peer=ProcessIdentity(999999999,10),deadline=DEADLINE())
+    driver.asset({"kind":"hook", "event":{"hook_event_name":"SessionStart",
+        "session_id":driver._identity.root_id,"cwd":str(context.worktree),"model":context.model,
+        "transcript_path":str(Path(context.env["HOME"])/".claude/projects/exact"/(driver._identity.root_id+".jsonl"))},
+        **({} if mutation=="missing" else {"startup_observation":value})},
+        peer=ProcessIdentity(999999999,10),deadline=DEADLINE())
+    assert not driver._notifications and not driver._readiness_queued and not driver._ready
+    assert driver._capabilities()["submission"] == "inconclusive"
+    assert "memory_policy" not in driver._identity.protocol
+    assert any(e.data.get("code")=="NATIVE_MEMORY_INCONCLUSIVE" for e in events)
+    # Missing/contradictory evidence never disables Close.
+    assert driver.cleanup(deadline=DEADLINE()).outcome in {"complete", "inconclusive"}
+
+
+@pytest.mark.parametrize("stage", ["before_queue", "before_grant"])
+@pytest.mark.parametrize("changed", ["executable", "settings", "hook", "boot"])
+def test_memory_dependencies_revalidate_before_first_challenge_and_channel_grant(seat, changed, stage):
+    driver, context, _ = seat
+    driver._context = replace(context, capability_evidence={"submission":"compatible"})
+    transcript = Path(context.env["HOME"])/".claude/projects/exact"/(driver._identity.root_id+".jsonl")
+    hook(seat,"SessionStart",transcript_path=str(transcript),model=context.model)
+    assert driver._identity.protocol["memory_policy"]["evidence_level"] == "configuration_source_flag_inference"
+    hook_hash = hashlib.sha256((runtime.ASSETS / "hook.py").read_bytes()).hexdigest()
+    assert driver._identity.protocol["memory_policy"]["hook_sha256"] == hook_hash
+    # Queue was not yet granted. A later change also fences the actual pull.
+    if stage=="before_grant":
+        driver.asset({"kind":"channel.ready"},peer=ProcessIdentity(999999999,10),deadline=DEADLINE())
+        assert driver._readiness_queued
+    path={"executable":context.executable.path,"settings":context.state_root/"claude-runtime-settings.json",
+          "hook":runtime.ASSETS/"hook.py","boot":context.worktree/"CLAUDE.md"}[changed]
+    path.write_text("changed dependency")
+    if stage=="before_queue":
+        driver.asset({"kind":"channel.ready"},peer=ProcessIdentity(999999999,10),deadline=DEADLINE())
+        assert not driver._readiness_queued and not driver._notifications
+    result=driver.asset({"kind":"channel.pull","after":0},peer=ProcessIdentity(999999999,10),deadline=DEADLINE())
+    assert result["notifications"] == [] and not driver._ready
+    assert driver._capabilities()["submission"] == "inconclusive"
+
+
+def test_unknown_native_memory_source_stops_before_account_helper_or_foreground(seat, monkeypatch):
+    _, context, _ = seat
+    context.executable.path.write_text("new unknown native implementation")
+    context=replace(context,executable=replace(context.executable,sha256=hashlib.sha256(context.executable.path.read_bytes()).hexdigest()))
+    calls=[]
+    monkeypatch.setattr(runtime,"_auth_status",lambda *a,**k:calls.append("account"))
+    driver=runtime.ClaudeRuntimeDriver(popen=lambda *a,**k:calls.append("foreground"))
+    result=driver.start(context,lambda _:None,deadline=DEADLINE())
+    assert result.state=="unavailable" and calls==[] and not driver._readiness_queued
+
+
+
+def test_memory_predicate_observation_deadline_is_bounded(tmp_path, monkeypatch):
+    p=tmp_path/"synthetic-executable"
+    p.write_text(MEMORY_SOURCE)
+    ticks=iter([0,4])
+    monkeypatch.setattr(runtime.time,"monotonic",lambda:next(ticks))
+    with pytest.raises(RuntimeContractError) as caught:
+        runtime._memory_disable_source(p,hashlib.sha256(p.read_bytes()).hexdigest())
+    assert caught.value.code=="NATIVE_MEMORY_INCONCLUSIVE"
+
+
+def test_setting_false_is_observed_not_assumed_from_written_configuration(seat):
+    driver,context,_=seat
+    driver._context=replace(context,capability_evidence={"submission":"compatible"})
+    driver._prepare(driver._context)
+    settings=context.state_root/"claude-runtime-settings.json"
+    value=json.loads(settings.read_text());value["autoMemoryEnabled"]=True
+    settings.write_text(json.dumps(value))
+    # Even a same captured digest must not turn contradictory actual setting
+    # bytes into the false setting metadata.
+    driver._configuration_sha256=driver._configuration_digest(driver._context)
+    hook(seat,"SessionStart",model=context.model,
+        transcript_path=str(Path(context.env["HOME"])/".claude/projects/exact"/(driver._identity.root_id+".jsonl")))
+    driver.asset({"kind":"channel.ready"},peer=ProcessIdentity(999999999,10),deadline=DEADLINE())
+    assert not driver._readiness_queued and not driver._memory_policy
