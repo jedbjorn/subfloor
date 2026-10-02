@@ -424,3 +424,24 @@ def test_actual_claude_work_events_survive_store_and_admit_only_proved_scoped_te
         with pytest.raises(RuntimeContractError) as raised:service.control(con,'cv',1,'stop',body)
         assert raised.value.code==('WORK_INCONCLUSIVE' if observation=='partial' else 'CAPABILITY_INCONCLUSIVE')
         assert writes==[]
+
+
+def test_runtime_snapshot_preserves_stored_work_control_and_autonomous_event_identity(database):
+    from conversation_native_chats import projection
+    _,con=database
+    con.execute("UPDATE conversations SET runtime_mode='native_experiment',runtime_projection=?",(json.dumps({'generation_id':'g','state':'ready'}),))
+    event={'kind':'output.final','reference':{'root_id':'root','thread_id':'child','activity_id':'child-turn'},
+           'data':{'text':'late child output'},'observed_at':20,'freshness':'last_observed','partial':True,'provenance':'native-test','grade':'unverified'}
+    con.execute('INSERT INTO conversation_runtime_work VALUES(?,?,?,?)',('g','server-stored-key',json.dumps(event),1))
+    con.execute("INSERT INTO conversation_runtime_commands(generation_id,command_id,command_sequence,kind,payload_digest,intent_json,state,receipt_json) VALUES('g','cancel',1,'control','hash',?,'unknown',?)",
+                (json.dumps({'action':'stop_work'}),json.dumps({'state':'unknown','detail':'native outcome pending'})))
+    con.execute('INSERT INTO conversation_runtime_events VALUES(?,?,?)',('g',1,json.dumps(event)));con.commit()
+    row=con.execute('SELECT * FROM conversations').fetchone()
+    result=projection(row,con=con)
+    assert result['work'][0]['work_key']=='server-stored-key'
+    assert result['work'][0]['partial'] and result['work'][0]['freshness']=='last_observed'
+    assert result['controls']==[{'control_id':'cancel','state':'unknown','action':'stop_work','receipt':{'state':'unknown','detail':'native outcome pending'}}]
+    assert result['activity'][0]['controller_sequence']==1 and result['activity'][0]['generation_id']=='g'
+    assert result['activity'][0]['engine_run_id'] is None
+    foreign=dict(row);foreign['conversation_id']='not-the-owned-chat'
+    assert projection(foreign,con=con)['work']==[]

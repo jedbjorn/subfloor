@@ -616,7 +616,36 @@ class NativeChatsService:
             self.wake.clear()
 
 
-def projection(conversation: Any) -> dict | None:
+def projection(conversation: Any, *, con=None) -> dict | None:
     if conversation['runtime_mode']!='native_experiment':
         return None
-    return public_payload(json.loads(conversation['runtime_projection']))
+    runtime=public_payload(json.loads(conversation['runtime_projection']))
+    runtime.update(work=[],controls=[],activity=[],work_partial=False,controls_partial=False,activity_partial=False)
+    if con is None or not runtime.get('generation_id'):
+        return runtime
+    generation=runtime['generation_id']
+    owned=con.execute('SELECT 1 FROM conversation_runtime_generations WHERE generation_id=? AND conversation_id=? AND owner_user_id=? AND shell_id=?',
+                      (generation,conversation['conversation_id'],conversation['owner_user_id'],conversation['shell_id'])).fetchone()
+    if owned is None:
+        return runtime # Provisional preparation has no native work to expose.
+    work=con.execute('SELECT work_key,projection_json FROM conversation_runtime_work WHERE generation_id=? ORDER BY last_sequence DESC LIMIT 257',(generation,)).fetchall()
+    runtime['work']=[{'work_key':row['work_key'],**json.loads(row['projection_json'])} for row in work[:256]]
+    runtime['work_partial']=len(work)>256
+    controls=con.execute("SELECT command_id,state,intent_json,receipt_json FROM conversation_runtime_commands WHERE generation_id=? AND kind='control' ORDER BY command_sequence DESC LIMIT 65",(generation,)).fetchall()
+    runtime['controls']=[{'control_id':row['command_id'],'state':row['state'],'action':json.loads(row['intent_json']).get('action'),
+                         'receipt':json.loads(row['receipt_json'])} for row in reversed(controls[:64])]
+    runtime['controls_partial']=len(controls)>64
+    events=con.execute('SELECT sequence,event_json FROM conversation_runtime_events WHERE generation_id=? ORDER BY sequence DESC LIMIT 129',(generation,)).fetchall()
+    for row in reversed(events[:128]):
+        event=json.loads(row['event_json'])
+        request=event.get('request_id')
+        intent=con.execute("SELECT intent_json FROM conversation_runtime_commands WHERE generation_id=? AND command_id=? AND kind='submit'",(generation,request)).fetchone() if request else None
+        engine=json.loads(intent[0]) if intent else {}
+        runtime['activity'].append({'generation_id':generation,'controller_sequence':row['sequence'],
+            'engine_run_id':engine.get('run_id'),'engine_message_id':engine.get('message_id'),**event})
+    runtime['activity_partial']=len(events)>128
+    if _SERVICE is not None:
+        runtime['onboarding']={'canonical_main_root':str(_SERVICE.root.resolve()),
+                               'worktree':conversation['worktree'],'scope':'linked_worktrees',
+                               'initial_setup':'native_tui','local_channel_setup':'scoped_gui_action'}
+    return public_payload(runtime)
