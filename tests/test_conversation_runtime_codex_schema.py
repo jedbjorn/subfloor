@@ -119,7 +119,12 @@ def test_generation_layout_unavailable_is_inconclusive(recorded, failure):
     elif failure == 'symlink':
         moved = directory / 'private.json'; file.rename(moved); file.symlink_to(moved)
     else: edit(directory, 'ClientRequest.json', lambda d: params(d, 'turn/start').update(allOf=[{}, {}]))
-    assert set(observe(recorded).structural_grades.values()) == {'inconclusive'}
+    grades = observe(recorded).structural_grades
+    if failure == 'composition':
+        assert grades['submission'] == 'inconclusive'
+        assert grades['stop_reply'] == 'compatible'
+    else:
+        assert set(grades.values()) == {'inconclusive'}
 
 
 def test_selected_effort_enum_addition_vs_removal(recorded):
@@ -183,3 +188,34 @@ def test_symlinked_schema_parent_is_unavailable(recorded):
     target = directory / 'v2-private'; (directory / 'v2').rename(target)
     (directory / 'v2').symlink_to(target, target_is_directory=True)
     assert set(observe(recorded).structural_grades.values()) == {'inconclusive'}
+
+
+@pytest.mark.parametrize('change', ['nested_client_required', 'nested_text_required', 'policy_enum', 'sandbox_enum'])
+def test_new_required_nested_fields_and_supplied_constants_are_checked(recorded, change):
+    def mutate(d):
+        if change == 'nested_client_required':
+            node = d['definitions']['ClientInfo']
+            node['properties']['new_required'] = {'type': 'string'}
+            node['required'].append('new_required')
+        elif change == 'nested_text_required':
+            node = next(v for v in d['definitions']['UserInput']['oneOf']
+                        if 'text' in v['properties']['type']['enum'])
+            node['required'].append('new_required')
+        elif change == 'policy_enum':
+            d['definitions']['AskForApproval']['oneOf'][0]['enum'].remove('never')
+        else:
+            d['definitions']['SandboxMode']['enum'].remove('danger-full-access')
+    edit(recorded[0], 'ClientRequest.json', mutate)
+    grades = observe(recorded).structural_grades
+    assert grades['submission'] == 'incompatible'
+    if change == 'nested_text_required':
+        assert grades['stop_reply'] == 'compatible'
+
+
+def test_new_required_unused_input_variant_does_not_break_text_submission(recorded):
+    def mutate(d):
+        node = next(v for v in d['definitions']['UserInput']['oneOf']
+                    if 'text' not in v['properties']['type']['enum'])
+        node['required'].append('new_required')
+    edit(recorded[0], 'ClientRequest.json', mutate)
+    assert set(observe(recorded).structural_grades.values()) == {'compatible'}
