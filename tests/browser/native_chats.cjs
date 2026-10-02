@@ -28,7 +28,7 @@ const cv = {conversation_id:cid,state:'idle',version:7,title:'Native UI source f
       {generation_id:'root-gen',controller_sequence:9,engine_run_id:1,engine_mirrored:true,kind:'output.final',reference:{root_id:'root',thread_id:'root',item_id:'mirrored'},data:{text:'Legacy duplicate must not display'}}]}};
 const probe = {...cv,conversation_id:probeId,runtime:{...cv.runtime,generation_id:'probe-gen',role:'probe',state:'needs_consent',primary:null,
   setup:{generation_id:'probe-gen',setup_id:'stored-setup',phase:'local_channel_development_consent'},work:[],activity:[]}};
-const check = {check_id:'nc_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',state:'needs_consent',admissible:false,grades:{submission:'inconclusive'},probe:{conversation_id:probeId,generation_id:'probe-gen'}};
+const check = {check_id:'nc_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',state:'running',selection:{harness:'claude',model:'selected-model',effort:'high'},admissible:false,grades:{submission:'inconclusive'},probe:{conversation_id:probeId,generation_id:'probe-gen'}};
 const requests = [], errors = [];
 let checkPosts = 0, createPosts = 0, controlPosts = 0, messagePosts = 0, enabled = true, message = null, messageReadback = false, creationKey = null;
 const server = http.createServer((req,res) => {
@@ -174,7 +174,7 @@ const server = http.createServer((req,res) => {
     await page.getByLabel('Keep native runtime open (experiment)').check();
     await page.waitForFunction(()=>!document.querySelector('.chat-native-check .primary').disabled);
     assert.equal(createPosts,1); // A known cleaned-up creation permits a distinct New Chat.
-    check.admissible=false;check.retry_allowed=true;check.state='expired';
+    check.admissible=false;check.retry_allowed=true;check.state='complete';
     await page.getByRole('button',{name:'Refresh check'}).click();
     await page.waitForFunction(()=>document.querySelector('.chat-native-check .primary').disabled);
     assert.equal(await page.getByRole('button',{name:'Check native compatibility'}).isEnabled(),true);

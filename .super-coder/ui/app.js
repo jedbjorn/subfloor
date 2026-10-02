@@ -5067,6 +5067,9 @@ function chatNativeRuntimePanel(host, conversation, { control, refresh, connecti
   host.replaceChildren(panel);
 }
 
+const CHAT_CHECK_DISCOVERY_MS = 179_000; // finite177s check plus bounded readback
+const CHAT_CHECK_DISCOVERY_INTERVAL_MS = 1_000;
+
 async function chatNativeNewForm(host, shell, config) {
   const form = el("div", { className: "chat-native-check" });
   const choice = el("select", { ariaLabel: "Native route to check" });
@@ -5082,8 +5085,19 @@ async function chatNativeNewForm(host, shell, config) {
   const created = el("button", { type: "button", className: "act", textContent: "Open created chat / Close", hidden: true });
   const title = el("input", { placeholder: "Optional chat title", maxlength: 200, ariaLabel: "Native chat title" });
   const start = el("button", { type: "button", className: "act primary", textContent: "Start native chat", disabled: true });
-  let selection = null, intent = null, result = null, checking = false, creating = false, observer = null, readInFlight = null;
-  const alive = () => host.isConnected && !chatReadController?.signal.aborted;
+  let selection = null, intent = null, result = null, checking = false, creating = false, observer = null, readInFlight = null, probeRefreshPending = false;
+  const ownerReadController = chatReadController;
+  let discoveryTimer = null, discoveryExpiry = null, discoveryStopped = null, discoveryNotice = null, readAbort = null;
+  const alive = () => host.isConnected && form.isConnected && chatReadController === ownerReadController && !ownerReadController?.signal.aborted;
+  const stopDiscovery = (cancelRead = false) => {
+    clearTimeout(discoveryTimer); clearTimeout(discoveryExpiry);
+    discoveryTimer = null; discoveryExpiry = null;
+    if (cancelRead) { readAbort?.abort(); readAbort = null; readInFlight = null; }
+  };
+  const dispose = () => { stopDiscovery(true); observer?.close(); observer = null; disposal.disconnect(); };
+  const disposal = new MutationObserver(() => { if (!alive()) dispose(); });
+  disposal.observe(document.body, { childList: true, subtree: true });
+  ownerReadController?.signal.addEventListener("abort", dispose, { once: true });
   const storageKey = () => "native-check:" + JSON.stringify([shell.shell_id, selection]);
   const save = () => { try { sessionStorage.setItem(storageKey(), JSON.stringify(intent)); } catch { /* Retain current intent. */ } };
   const paint = () => {
@@ -5093,44 +5107,102 @@ async function chatNativeNewForm(host, shell, config) {
     created.hidden = !intent?.create?.conversation_id;
     start.disabled = checking || creating || result?.admissible !== true || Boolean(intent?.create);
     const grades = result?.grades ? Object.entries(result.grades).map(([name, grade]) => `${name}: ${grade}`).join(" · ") : "";
-    status.textContent = intent?.create
+    status.textContent = discoveryNotice || (intent?.create
       ? (creating ? "Creating native chat…" : intent.create.state === "accepted" ? "Chat created. Open it or use shell history."
         : "Chat creation outcome unknown. Inspect shell history; this creation was not replayed.")
       : result
       ? `${result.state || "unknown"}${grades ? " · " + grades : ""}${result.diagnostics ? " · " + (Array.isArray(result.diagnostics) ? result.diagnostics.join("; ") : String(result.diagnostics)) : ""}`
-      : intent ? "Check recorded locally; read back its server outcome. No automatic retry." : "Check this requested route before starting. A candidate is not proof of availability.";
+      : intent ? "Check recorded locally; read back its server outcome. No automatic retry." : "Check this requested route before starting. A candidate is not proof of availability.");
   };
   const observeProbe = () => {
     observer?.close(); observer = null;
     const id = result?.probe?.conversation_id;
-    if (!id || !alive()) return;
-    observer = new EventSource(`/api/conversations/${encodeURIComponent(id)}/events?after=0`);
-    const changed = () => { if (alive()) refreshCheck(); else observer?.close(); };
+    if (!id || !alive() || result?.state === "complete") return;
+    stopDiscovery();
+    const captured = intent;
+    const currentObserver = observer = new EventSource(`/api/conversations/${encodeURIComponent(id)}/events?after=0`);
+    const changed = () => {
+      if (!alive() || intent !== captured || observer !== currentObserver) { currentObserver.close(); return; }
+      if (readInFlight) probeRefreshPending = true;
+      else refreshCheck();
+    };
     for (const event of [...CHAT_NATIVE_EVENTS, "conversation.closed"]) observer.addEventListener(event, changed);
     observer.onopen = changed;
-    observer.onerror = () => { status.textContent = "Probe connection interrupted. Refresh check or open its saved setup / Close."; };
-    chatReadController?.signal.addEventListener("abort", () => observer?.close(), { once: true });
+    observer.onerror = () => { if (alive() && intent === captured && observer === currentObserver) status.textContent = "Probe connection interrupted. Refresh check or open its saved setup / Close."; };
+    ownerReadController?.signal.addEventListener("abort", () => currentObserver.close(), { once: true });
   };
-  const accept = (value) => {
-    result = value;
-    if (value?.check_id) { intent.check_id = value.check_id; save(); }
+  const discoveryPending = () => alive() && intent && !intent.create && result
+    && ["accepted", "running"].includes(result.state) && !result.probe?.conversation_id;
+  const expireDiscovery = (captured) => {
+    if (intent !== captured || !alive()) return;
+    discoveryStopped = captured; stopDiscovery(true);
+    discoveryNotice = "Check discovery pending / inconclusive. Use Refresh check or Close; its native work remains supervised.";
     paint();
   };
-  const refreshCheck = () => {
-    if (!intent || readInFlight) return readInFlight;
+  const scheduleDiscovery = () => {
+    clearTimeout(discoveryTimer); discoveryTimer = null;
+    if (!discoveryPending() || discoveryStopped === intent) { stopDiscovery(); return; }
     const captured = intent;
+    if (!Number.isFinite(captured.discovery_expires_at)) {
+      captured.discovery_expires_at = Date.now() + CHAT_CHECK_DISCOVERY_MS; save();
+    }
+    const left = captured.discovery_expires_at - Date.now();
+    if (left <= 0) { expireDiscovery(captured); return; }
+    if (!discoveryExpiry) discoveryExpiry = setTimeout(() => expireDiscovery(captured), left);
+    if (readInFlight) return;
+    discoveryTimer = setTimeout(() => {
+      discoveryTimer = null;
+      if (intent !== captured || !discoveryPending() || discoveryStopped === captured) return;
+      if (Date.now() >= captured.discovery_expires_at) { expireDiscovery(captured); return; }
+      refreshCheck({ discovering: true });
+    }, Math.min(CHAT_CHECK_DISCOVERY_INTERVAL_MS, left));
+  };
+  const accept = (value) => {
+    if (!value || !intent || !["accepted", "running", "retained", "complete"].includes(value.state)
+        || typeof value.check_id !== "string" || !value.check_id
+        || intent.check_id && value.check_id !== intent.check_id
+        || !value.selection || ["harness", "model", "effort"].some((key) => value.selection[key] !== intent.selection[key])) {
+      if (result) result = { ...result, admissible: false, retry_allowed: false };
+      discoveryNotice = "CHECK_READBACK_INVALID: retain this check and use Refresh check; it was not replayed.";
+      discoveryStopped = intent; stopDiscovery(); paint(); return false;
+    }
+    if (result?.state === "complete" && value.state !== "complete") return false;
+    result = value; discoveryNotice = null;
+    intent.check_id = value.check_id; save();
+    if (!discoveryPending()) stopDiscovery();
+    if (value.state === "complete") { observer?.close(); observer = null; }
+    paint(); scheduleDiscovery(); return true;
+  };
+  const refreshCheck = ({ discovering = false } = {}) => {
+    if (!intent || readInFlight || !alive()) return readInFlight;
+    const captured = intent, request = new AbortController(); readAbort = request;
+    const cancel = () => request.abort();
+    ownerReadController?.signal.addEventListener("abort", cancel, { once: true });
     const path = captured.check_id ? `/conversations/native-checks/${encodeURIComponent(captured.check_id)}`
       : `/conversations/native-checks?request_key=${encodeURIComponent(captured.key)}`;
-    readInFlight = chatRead(path, chatReadController?.signal).then(async (value) => {
-      if (intent !== captured || !alive()) return;
+    const job = chatRead(path, request.signal).then(async (value) => {
+      if (intent !== captured || !alive() || request.signal.aborted) return;
+      if (discovering && Date.now() >= captured.discovery_expires_at) { expireDiscovery(captured); return; }
       const oldProbe = result?.probe?.conversation_id;
-      accept(value);
+      if (!accept(value)) return;
       if (value.probe?.conversation_id !== oldProbe) observeProbe();
       await reconcileCreate();
     }).catch((error) => {
-      if (intent === captured && alive()) status.textContent = `${error.code || "CHECK_UNKNOWN"}: ${error.message}. The check was not replayed.`;
-    }).finally(() => { readInFlight = null; });
-    return readInFlight;
+      if (intent !== captured || !alive() || request.signal.aborted) return;
+      discoveryStopped = captured; stopDiscovery();
+      if (result) result = { ...result, admissible: false, retry_allowed: false };
+      discoveryNotice = `${error.code || "CHECK_UNKNOWN"}: readback inconclusive. Use Refresh check; this check was not replayed.`;
+      paint();
+    }).finally(() => {
+      ownerReadController?.signal.removeEventListener("abort", cancel);
+      if (readInFlight === job) {
+        readInFlight = null; readAbort = null;
+        if (probeRefreshPending && alive() && intent === captured && observer && result?.state !== "complete") {
+          probeRefreshPending = false; queueMicrotask(() => { if (alive() && intent === captured && observer && result?.state !== "complete") refreshCheck(); });
+        } else { probeRefreshPending = false; scheduleDiscovery(); }
+      }
+    });
+    readInFlight = job; return job;
   };
   const reconcileCreate = async () => {
     const captured = intent, prior = captured?.create;
@@ -5157,6 +5229,7 @@ async function chatNativeNewForm(host, shell, config) {
     } catch { /* Retain ambiguous creation or cleanup; no mutation replay. */ }
   };
   choice.onchange = () => {
+    stopDiscovery(true); probeRefreshPending = false; discoveryStopped = null; discoveryNotice = null;
     observer?.close(); observer = null;
     const candidate = candidates[Number(choice.value)];
     selection = candidate && { harness: candidate.harness, model: candidate.model, effort: candidate.effort };
@@ -5173,13 +5246,14 @@ async function chatNativeNewForm(host, shell, config) {
   };
   check.onclick = async () => {
     if (check.disabled || !selection) return;
+    stopDiscovery(true); probeRefreshPending = false; discoveryStopped = null; discoveryNotice = null;
     observer?.close(); observer = null; result = null;
-    const captured = intent = { key: requestKey(), selection: { ...selection } };
+    const captured = intent = { key: requestKey(), selection: { ...selection }, discovery_expires_at: Date.now() + CHAT_CHECK_DISCOVERY_MS };
     save(); checking = true; choice.disabled = true; paint();
     try {
       const value = await chatApi("/conversations/native-checks", "POST", captured.selection, captured.key);
       if (!alive() || intent !== captured) return;
-      accept(value); observeProbe();
+      if (accept(value)) observeProbe();
     } catch (error) {
       if (alive() && intent === captured) status.textContent = `${error.code || "CHECK_UNKNOWN"}: ${error.message}. Use Refresh check; this check was not replayed.`;
     } finally {
@@ -5198,6 +5272,7 @@ async function chatNativeNewForm(host, shell, config) {
   created.onclick = () => { if (intent?.create?.conversation_id) location.hash = chatHash(shell.shortname, intent.create.conversation_id); };
   start.onclick = async () => {
     if (start.disabled || !selection) return;
+    stopDiscovery();
     start.disabled = true; choice.disabled = true; creating = true;
     intent.create = { key: requestKey(), body: { shell_id: shell.shell_id, ...selection,
       title: title.value.trim() || null, runtime_mode: "native_experiment" }, state: "pending" };

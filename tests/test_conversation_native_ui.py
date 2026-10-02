@@ -197,3 +197,16 @@ console.log(JSON.stringify(rows.map(row=>chatNativeWorkState({...row,data:{kind:
 """)
     assert result[0] == {'state':'inProgress','terminal':False,'partial':False}
     assert all(row == {'state':'inProgress','terminal':False,'partial':True} for row in result[1:])
+
+
+def test_fresh_chromium_same_intent_check_discovery():
+    if not shutil.which('node'):
+        pytest.skip('Node required')
+    installed=subprocess.run(['node','-e',"require(process.env.SC_PLAYWRIGHT_MODULE || 'playwright')"],capture_output=True,text=True,check=False)
+    if installed.returncode:
+        pytest.skip('Pinned Playwright required for named source seat')
+    result=subprocess.run(['node',str(ROOT/'tests/browser/native_check_discovery.cjs'),str(ROOT)],capture_output=True,text=True,timeout=60,env=os.environ.copy(),check=False)
+    assert result.returncode==0,result.stdout+result.stderr
+    receipt=json.loads(result.stdout.strip().splitlines()[-1])
+    assert receipt['native_processes']==0 and receipt['inference_turns']==0
+    assert receipt['cases']==['converge','immediate','error','expiry','selection','dispose','replacement','terminal_race']
