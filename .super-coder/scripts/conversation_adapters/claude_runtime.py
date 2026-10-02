@@ -81,6 +81,61 @@ HOOKS = (
 )
 
 
+MEMORY_SOURCE_BYTES = 512 * 1024 * 1024
+# A conservative consumed source shape, not a version/hash certificate. New
+# native implementations remain inconclusive until their disable path is read.
+_MEMORY_GATE = re.compile(
+    rb'function ([A-Za-z_$][\w$]*)\(\)\{(?:if\([^{};]{1,120}\)return"off";){0,4}'
+    rb'let ([A-Za-z_$][\w$]*)=process\.env\.CLAUDE_CODE_DISABLE_AUTO_MEMORY;'
+    rb'if\(([A-Za-z_$][\w$]*)\(\2\)\)return"off";'
+)
+_MEMORY_CALLER = re.compile(
+    rb'function [A-Za-z_$][\w$]*\(\)\{switch\(([A-Za-z_$][\w$]*)\(\)\)'
+    rb'\{case"off":return!1;'
+)
+_MEMORY_TRUE = re.compile(
+    rb'function ([A-Za-z_$][\w$]*)\(([A-Za-z_$][\w$]*)\)\{if\(!\2\)return!1;'
+    rb'if\(typeof \2==="boolean"\)return ?\2;let ([A-Za-z_$][\w$]*)=String\(\2\)'
+    rb'\.toLowerCase\(\)\.trim\(\);return\["1","true","yes","on"\]\.includes\(\3\)\}'
+)
+
+
+def _file_digest(path: Path) -> str:
+    with path.open("rb") as stream:
+        return hashlib.file_digest(stream, "sha256").hexdigest()
+
+
+def _memory_disable_source(path: Path, expected_sha256: str, *, deadline: float | None = None) -> str:
+    """Inspect the captured executable only; never consult native memory/state."""
+    gates, callers, truths = {}, {}, {}
+    digest, total, overlap = hashlib.sha256(), 0, b""
+    deadline = min(deadline if deadline is not None else float("inf"), time.monotonic() + 3)
+    with path.open("rb") as stream:
+        while chunk := stream.read(1024 * 1024):
+            total += len(chunk)
+            if time.monotonic() >= deadline:
+                raise RuntimeContractError("NATIVE_MEMORY_INCONCLUSIVE", "native disable source observation deadline expired")
+            if total > MEMORY_SOURCE_BYTES:
+                raise RuntimeContractError("NATIVE_MEMORY_INCONCLUSIVE", "native disable source exceeded observation bound")
+            digest.update(chunk)
+            data = overlap + chunk
+            for match in _MEMORY_GATE.finditer(data):
+                gates[(match[1], match[3])] = match[0]
+            for match in _MEMORY_CALLER.finditer(data):
+                callers[match[1]] = match[0]
+            for match in _MEMORY_TRUE.finditer(data):
+                truths[match[1]] = match[0]
+            if max(len(gates), len(callers), len(truths)) > 256:
+                raise RuntimeContractError("NATIVE_MEMORY_INCONCLUSIVE", "native disable source candidate bound exceeded")
+            overlap = data[-4096:]
+    if digest.hexdigest() != expected_sha256:
+        raise RuntimeContractError("EXECUTABLE_CHANGED", "captured executable changed during source observation")
+    for (gate, truth), snippet in gates.items():
+        if gate in callers and truth in truths:
+            return hashlib.sha256(snippet + b"\n" + callers[gate] + b"\n" + truths[truth]).hexdigest()
+    raise RuntimeContractError("NATIVE_MEMORY_INCONCLUSIVE", "captured native disable source is not recognized")
+
+
 def _parse_auth_status(raw: bytes, returncode: int) -> dict[str, str]:
     """Consume only native route enums; account identifiers never leave here."""
     try:
@@ -224,6 +279,9 @@ class ClaudeRuntimeDriver(RuntimeDriver):
         self._native_model: str | None = None
         self._native_effort: str | None = None
         self._route_inconclusive = False
+        self._memory_source_sha256 = ""
+        self._memory_policy: dict[str, Any] = {}
+        self._memory_inconclusive = False
         self._lost = False
         self._primary: str | None = None
         self._primary_state: Literal["idle", "active", "unknown"] = "unknown"
@@ -258,13 +316,13 @@ class ClaudeRuntimeDriver(RuntimeDriver):
 
     def _capabilities(self) -> dict[str, Grade]:
         evidence = self._context.capability_evidence if self._context else {}
-        return {name: "inconclusive" if self._policy_changed or self._route_inconclusive else evidence.get(name, "unverified") for name in (
+        return {name: "inconclusive" if self._policy_changed or self._route_inconclusive or self._memory_inconclusive else evidence.get(name, "unverified") for name in (
             "submission", "background_tasks", "stop_work", "stop_reply", "automation",
         )} | {"direct_task_control": "incompatible", "continuous_inventory": "incompatible"}
 
     def _allowed(self, capability: str) -> bool:
         context = self._context
-        return bool(context and not self._policy_changed and not self._route_inconclusive and (
+        return bool(context and not self._policy_changed and not self._route_inconclusive and not self._memory_inconclusive and (
             context.capability_evidence.get(capability) == "compatible"
             or capability in context.probe_capabilities
         ))
@@ -291,7 +349,7 @@ class ClaudeRuntimeDriver(RuntimeDriver):
             provenance="claude:validator", data={"reason": reason},
         ))
 
-    def _prepare(self, context: RuntimeContext) -> tuple[list[str], dict[str, str]]:
+    def _prepare(self, context: RuntimeContext, *, deadline: float | None = None) -> tuple[list[str], dict[str, str]]:
         if context.harness != "claude" or context.managed_mcp_args:
             raise RuntimeContractError("CONTEXT_INVALID", "Claude needs canonical MCP files")
         if context.driver_revision != REVISION:
@@ -313,6 +371,7 @@ class ClaudeRuntimeDriver(RuntimeDriver):
             executable_digest = hashlib.file_digest(executable, "sha256").hexdigest()
         if executable_digest != context.executable.sha256:
             raise RuntimeContractError("EXECUTABLE_CHANGED", "captured executable changed before launch")
+        self._memory_source_sha256 = _memory_disable_source(context.executable.path, context.executable.sha256, deadline=deadline)
         modes = {"unrestricted": ["--dangerously-skip-permissions"],
                  "bypassPermissions": ["--dangerously-skip-permissions"]}
         if context.permission_mode in {"default", "dontAsk", "acceptEdits", "plan", "auto"}:
@@ -406,7 +465,7 @@ class ClaudeRuntimeDriver(RuntimeDriver):
             root = str(uuid.uuid4())
             self._identity = RuntimeIdentity(root_id=root, session_id=root)
             try:
-                argv, env = self._prepare(context)
+                argv, env = self._prepare(context, deadline=deadline)
             except (OSError, RuntimeContractError) as exc:
                 self._route_inconclusive = True
                 return DriverStart("unavailable", self._identity, str(exc), self._capabilities())
@@ -435,7 +494,8 @@ class ClaudeRuntimeDriver(RuntimeDriver):
                 self._identity = RuntimeIdentity(root_id=root, session_id=root,
                     process=process_identity(self._process.pid),
                     protocol={"transport": "foreground-pty-channel", "revision": REVISION,
-                              "auth_observation": dict(self._native_auth)})
+                              "auth_observation": dict(self._native_auth),
+                              "configuration_sha256": self._configuration_sha256})
                 self._reader = threading.Thread(target=self._read_loop, name="claude-runtime-reader", daemon=True)
                 self._reader.start()
             except (OSError, RuntimeContractError) as exc:
@@ -677,6 +737,9 @@ class ClaudeRuntimeDriver(RuntimeDriver):
                 if peer != self._channel_peer:
                     raise RuntimeContractError("CHANNEL_INVALID", "unregistered channel peer")
                 if kind == "channel.pull":
+                    if self._readiness_queued and not self._ready and not self._memory_current():
+                        self._memory_failed()
+                        return {"notifications": []}
                     after = payload.get("after", 0)
                     if not isinstance(after, int) or isinstance(after, bool) or after < 0:
                         raise RuntimeContractError("CHANNEL_INVALID", "invalid notification cursor")
@@ -704,8 +767,72 @@ class ClaudeRuntimeDriver(RuntimeDriver):
                 return {"accepted": activity_id is not None}
             if kind != "hook" or not isinstance(payload.get("event"), Mapping):
                 raise RuntimeContractError("ASSET_INVALID", "unknown Claude asset operation")
+            if (payload["event"].get("hook_event_name") == "SessionStart" and self._identity and self._context
+                    and payload["event"].get("session_id") == self._identity.root_id
+                    and payload["event"].get("cwd") == str(self._context.worktree)):
+                self._observe_memory(payload.get("startup_observation"))
             self._hook(payload["event"])
             return {"accepted": True}
+
+    def _memory_current(self) -> bool:
+        context = self._context
+        try:
+            settings = context.state_root / "claude-runtime-settings.json" if context else None
+            if (settings is None or not settings.is_file() or settings.is_symlink()
+                    or settings.stat().st_size > 65536
+                    or json.loads(settings.read_bytes()).get("autoMemoryEnabled") is not False):
+                return False
+            return bool(context and self._memory_policy and not self._memory_inconclusive
+                and context.executable.path.is_file() and not context.executable.path.is_symlink()
+                and context.executable.path.stat().st_size <= MEMORY_SOURCE_BYTES
+                and _file_digest(context.executable.path) == context.executable.sha256
+                and self._configuration_digest(context) == self._configuration_sha256
+                and self._memory_policy["configuration_sha256"] == self._configuration_sha256
+                and self._memory_policy["hook_sha256"] == hashlib.sha256((ASSETS / "hook.py").read_bytes()).hexdigest())
+        except (OSError, KeyError, ValueError, AttributeError):
+            return False
+
+    def _observe_memory(self, value: Any) -> None:
+        # Ingress peer/session ownership is checked by the independent controller
+        # and _hook. This field comes from our hook wrapper, not native telemetry.
+        assert self._context and self._identity
+        if self._closing:
+            return
+        try:
+            hook_digest = hashlib.sha256((ASSETS / "hook.py").read_bytes()).hexdigest()
+        except OSError:
+            self._memory_failed()
+            return
+        if (not isinstance(value, Mapping)
+                or value.get("generation_id") != self._context.generation_id
+                or value.get("inherited_disable_flag") != "1"
+                or value.get("hook_sha256") != hook_digest
+                or not self._memory_source_sha256):
+            self._memory_failed()
+            return
+        self._memory_policy = {"evidence_level": "configuration_source_flag_inference",
+            "observation_origin": "claude:documented-settings+captured-executable+owned-SessionStart-hook",
+            "auto_memory_disabled": True, "effective_telemetry": False,
+            "generation_id": self._context.generation_id,
+            "executable_sha256": self._context.executable.sha256,
+            "configuration_sha256": self._configuration_sha256,
+            "hook_sha256": value["hook_sha256"], "source_condition_sha256": self._memory_source_sha256,
+            "inherited_disable_flag": "1", "auto_memory_enabled_setting": False}
+        if not self._memory_current():
+            self._memory_failed()
+            return
+        self._identity = replace(self._identity, protocol=dict(self._identity.protocol) | {"memory_policy": dict(self._memory_policy),
+            "configuration_sha256": self._configuration_sha256})
+
+    def _memory_failed(self) -> None:
+        self._memory_inconclusive = True
+        self._memory_policy = {}
+        if self._identity:
+            self._identity = replace(self._identity, protocol={k:v for k,v in self._identity.protocol.items() if k != "memory_policy"})
+        self._send_event(RuntimeEvent("capability.observed", reference=self._reference(),
+            provenance="claude:configuration-source-flag-inference", grade="inconclusive", partial=True,
+            data={"capability": "submission", "code": "NATIVE_MEMORY_INCONCLUSIVE"}))
+        self._condition.notify_all()
 
     def _maybe_ready(self) -> None:
         if (not self._closing and not self._lost and self._session_started and self._channel_peer
@@ -714,6 +841,9 @@ class ClaudeRuntimeDriver(RuntimeDriver):
             # A generation-specific processed native challenge establishes the
             # route after controlled consent. Cached grades/descriptors do not.
             assert self._context
+            if not self._memory_current():
+                self._memory_failed()
+                return
             self._queue(f'Respond with {self._readiness_nonce} as plain assistant text. '
                         'Do not call any tools, write files, schedule work, or do other work.', {
                 "generation_id": self._context.generation_id,
@@ -1077,7 +1207,7 @@ class ClaudeRuntimeDriver(RuntimeDriver):
         prompt_id = self._readiness_prompt
         activity = self._activities.get(prompt_id or "")
         if (activity and activity.terminal and not self._ready and not self._lost and not self._closing
-                and not self._policy_changed and not self._route_inconclusive
+                and not self._policy_changed and not self._route_inconclusive and not self._memory_inconclusive
                 and activity.terminal_status == "completed" and activity.readiness_reply
                 and activity.terminal_provenance == "claude:owned-transcript-turn_duration"):
             assert self._context and self._identity
@@ -1086,6 +1216,9 @@ class ClaudeRuntimeDriver(RuntimeDriver):
                 self._route_observation_inconclusive(mismatch=bool(
                     self._native_effort and self._native_effort != self._context.effort))
                 self._condition.notify_all()
+                return
+            if not self._memory_current():
+                self._memory_failed()
                 return
             route = {"account_type": self._native_auth["method"], "model": self._native_model,
                      "efforts": [self._native_effort], "auth": dict(self._native_auth),
@@ -1100,7 +1233,7 @@ class ClaudeRuntimeDriver(RuntimeDriver):
                       "observed_model_message_ids": len(activity.model_messages),
                       "observed_tool_calls": self._readiness_tool_count,
                       "tool_coverage": "configured-hooks; native coverage requires owner evidence",
-                      "native_route": route,
+                      "native_route": route, "memory_policy": dict(self._memory_policy),
                       "capabilities": self._capabilities()}))
         self._condition.notify_all()
 

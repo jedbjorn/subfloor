@@ -6,9 +6,11 @@ No raw hook record or transcript is persisted by this asset.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import sys
+from pathlib import Path
 from typing import Any
 
 from asset_client import MAX_FRAME_BYTES, call
@@ -34,7 +36,14 @@ def main() -> int:
                 "permissionDecision": "deny", "permissionDecisionReason":
                 "Experimental chat schedules require proven session-only support and explicit durable:false."}}))
             return 0
-        call({"kind": "hook", "event": event})
+        payload: dict[str, Any] = {"kind": "hook", "event": event}
+        if event.get("hook_event_name") == "SessionStart":
+            payload["startup_observation"] = {
+                "generation_id": os.environ.get("SC_F89_GENERATION_ID"),
+                "inherited_disable_flag": "1" if os.environ.get("CLAUDE_CODE_DISABLE_AUTO_MEMORY") == "1" else None,
+                "hook_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+            }
+        call(payload)
         return 0
     except (OSError, ValueError, TypeError, KeyError, TimeoutError):
         # Do not expose event/input/environment in native stderr. exit 2 is
