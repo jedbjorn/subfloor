@@ -40,6 +40,8 @@ class NativeFixture:
         self.on_submit = None
         self.closed = False
         self.fail_method = None
+        self.memory_config = {"memories": {"generate_memories": False, "use_memories": False},
+                              "features": {"memories": False}}
         self.account = {"type": "chatgpt", "email": "not-exported@example.invalid"}
         self.models = [{"id": "gpt-6.1-sol", "model": "gpt-6.1-sol",
                         "supportedReasoningEfforts": [{"reasoningEffort": "high"}]}]
@@ -70,6 +72,8 @@ class NativeFixture:
             return {"account": self.account}
         if method == "model/list":
             return {"data": self.models, "nextCursor": None}
+        if method == "config/read":
+            return {"config": self.memory_config}
         if method == "thread/start":
             return {"thread": {"id": "root", "sessionId": "different-metadata", "cwd": str(self.settings["cwd"])}}
         if method == "thread/memoryMode/set":
@@ -729,4 +733,30 @@ def test_selected_model_observation_follows_bounded_native_pagination(seat):
     result = driver.start(context, lambda _: None, deadline=deadline())
     assert result.state == "ready"
     assert [p["cursor"] for m, p in transport[0].calls if m == "model/list"] == [None, "second-page"]
+    driver.cleanup(deadline=deadline())
+
+
+def test_native_memory_policy_observed_before_readiness(seat):
+    driver, rpc, _, _ = seat
+    assert driver._identity.protocol["memory_policy"] == {
+        "generate_memories": False, "use_memories": False, "feature_enabled": False, "root_mode": "disabled"}
+    methods = [m for m, _ in rpc.calls]
+    assert methods.index("config/read") < methods.index("thread/start") < methods.index("thread/memoryMode/set")
+
+
+@pytest.mark.parametrize("config", [{}, {"memories": {}, "features": {"memories": False}},
+                                    {"memories": {"generate_memories": 0, "use_memories": False},
+                                     "features": {"memories": False}}])
+def test_unobserved_memory_policy_refuses_native_thread_before_inference(seat, config):
+    _, _, _, context = seat
+    transports = []
+    def factory(**kwargs):
+        rpc = NativeFixture(**kwargs)
+        rpc.memory_config = config
+        transports.append(rpc)
+        return rpc
+    driver = CodexRuntimeDriver(rpc_factory=factory)
+    result = driver.start(context, lambda _: None, deadline=deadline())
+    assert result.state == "unavailable" and result.capabilities["submission"] == "inconclusive"
+    assert not any(m == "thread/start" for m, _ in transports[0].calls)
     driver.cleanup(deadline=deadline())

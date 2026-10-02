@@ -391,6 +391,13 @@ class CodexRuntimeDriver(RuntimeDriver):
             native_route["efforts"] = sorted({item["reasoningEffort"] for item in supported})
             if context.effort and context.effort != "default" and context.effort not in native_route["efforts"]:
                 raise RuntimeContractError("NATIVE_ROUTE_UNAVAILABLE", "selected native effort was not advertised")
+            config = _object(_object(rpc.request("config/read", {
+                "cwd": str(context.worktree), "includeLayers": False}, deadline=deadline)).get("config"))
+            memories, features = config.get("memories"), config.get("features")
+            if (not isinstance(memories, dict) or not isinstance(features, dict)
+                    or memories.get("generate_memories") is not False
+                    or memories.get("use_memories") is not False or features.get("memories") is not False):
+                raise RuntimeContractError("NATIVE_MEMORY_UNVERIFIED", "required native no-memory flags unproved")
             started = _object(rpc.request("thread/start", {
                 "model": context.model, "modelProvider": "openai", "allowProviderModelFallback": False,
                 "cwd": str(context.worktree), "developerInstructions": context.boot_content,
@@ -411,6 +418,10 @@ class CodexRuntimeDriver(RuntimeDriver):
                 self._parents[root] = None
                 self._active[root] = None
             rpc.request("thread/memoryMode/set", {"threadId": root, "mode": "disabled"}, deadline=deadline)
+            with self._lock:
+                self._identity = replace(self._identity, protocol={**self._identity.protocol,
+                    "memory_policy": {"generate_memories": False, "use_memories": False,
+                                      "feature_enabled": False, "root_mode": "disabled"}})
             self._reconciler = threading.Thread(target=self._reconcile_loop,
                                                name="codex-runtime-reconcile", daemon=True)
             self._reconciler.start()
