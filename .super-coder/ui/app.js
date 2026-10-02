@@ -4841,6 +4841,18 @@ const CHAT_NATIVE_EVENTS = new Set([
   "control.acknowledged", "control.outcome", "capability.observed",
 ]);
 
+function chatNativeWorkState(row) {
+  const data = row.data || {};
+  const hasState = Object.prototype.hasOwnProperty.call(data, "state");
+  const value = hasState ? data.state : data.status;
+  const active = ["inProgress", "running", "active", "queued", "pending", "scheduled"];
+  const terminal = ["completed", "stopped", "failed", "deleted", "interrupted", "declined", "terminated", "cancelled", "canceled"];
+  const contradictory = hasState && Object.prototype.hasOwnProperty.call(data, "status") && data.status !== value;
+  const known = typeof value === "string" && [...active, ...terminal].includes(value) && !contradictory;
+  return { state: known ? value : "unknown", terminal: known && terminal.includes(value),
+    partial: row.partial === true || !known };
+}
+
 function chatNativeControlBody(conversation, action, target = {}) {
   const runtime = conversation.runtime;
   if (!runtime?.generation_id || !Number.isInteger(conversation.version)) return null;
@@ -4855,9 +4867,10 @@ function chatNativeControlBody(conversation, action, target = {}) {
     body.expected_activity_id = runtime.primary.activity_id;
   } else {
     const kind = target.data?.kind;
+    const workState = chatNativeWorkState(target);
     if (runtime.state !== "ready" || !target.work_key || target.partial !== false || target.freshness !== "current"
         || target.kind === "work.terminal"
-        || ["completed", "stopped", "failed", "deleted"].includes(target.data?.status)) return null;
+        || workState.partial || workState.terminal) return null;
     if (action === "stop_automation") {
       if (kind !== "automation" || runtime.capabilities?.automation !== "compatible") return null;
     } else if (action === "stop_work") {
@@ -5015,9 +5028,10 @@ function chatNativeRuntimePanel(host, conversation, { control, refresh, connecti
   if (!work.length) list.append(el("p", { className: "muted" }, "No work items recorded in this snapshot."));
   for (const row of work) {
     const kind = row.data?.kind || "unknown";
+    const workState = chatNativeWorkState(row);
     const item = el("div", { className: "chat-native-work-item" });
-    item.append(el("strong", {}, kind), el("span", {}, row.data?.status || row.kind || "unknown"),
-      el("span", {}, `${row.freshness || "unknown"}${row.partial ? " · partial" : ""} · ${chatNativeObservedTime(row.observed_at)}`));
+    item.append(el("strong", {}, kind), el("span", {}, workState.state),
+      el("span", {}, `${row.freshness || "unknown"}${workState.partial ? " · partial" : ""} · ${chatNativeObservedTime(row.observed_at)}`));
     const id = row.reference?.work_id || row.reference?.thread_id || row.reference?.native_process_id;
     if (id) item.append(el("code", {}, String(id)));
     if (row.provenance) item.append(el("small", {}, `Observed via ${row.provenance}`));
