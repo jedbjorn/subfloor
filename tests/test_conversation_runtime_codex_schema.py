@@ -219,3 +219,18 @@ def test_new_required_unused_input_variant_does_not_break_text_submission(record
         node['required'].append('new_required')
     edit(recorded[0], 'ClientRequest.json', mutate)
     assert set(observe(recorded).structural_grades.values()) == {'compatible'}
+
+
+def test_optional_unsupplied_text_elements_becoming_required_breaks_submission(recorded):
+    def mutate(d):
+        node = next(v for v in d['definitions']['UserInput']['oneOf']
+                    if 'text' in v['properties']['type']['enum'])
+        node['required'].append('text_elements')
+    edit(recorded[0], 'ClientRequest.json', mutate)
+    assert observe(recorded).structural_grades['submission'] == 'incompatible'
+
+
+def test_known_actually_supplied_turn_fields_becoming_required_are_supported(recorded):
+    edit(recorded[0], 'ClientRequest.json', lambda d:
+         params(d, 'turn/start')['required'].extend(['approvalPolicy', 'clientUserMessageId']))
+    assert observe(recorded).structural_grades['submission'] == 'compatible'
