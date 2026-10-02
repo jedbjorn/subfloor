@@ -18,11 +18,12 @@ from test_native_chat_ownership import database  # noqa: F401
 @pytest.fixture
 def fifo(request):
     path,con=request.getfixturevalue('database')
+    sender=getattr(request,'param','user')
     runtime={'generation_id':'g','state':'ready','capabilities':{'submission':'compatible'}}
     con.execute("UPDATE conversations SET runtime_mode='native_experiment',runtime_projection=?",(json.dumps(runtime),))
     mids=[]
     for ordinal in range(2):
-        mid=con.execute("INSERT INTO conversation_messages(conversation_id,sender_kind,sender_ref,message_kind,body,idempotency_key,request_hash) VALUES('cv','user','1','prompt',?,?,?)",('prompt'+str(ordinal),'key'+str(ordinal),'hash')).lastrowid
+        mid=con.execute("INSERT INTO conversation_messages(conversation_id,sender_kind,sender_ref,message_kind,body,idempotency_key,request_hash) VALUES('cv',?,?,'prompt',?,?,?)",(sender,'sprint-runtime' if sender=='engine' else '1','prompt'+str(ordinal),'key'+str(ordinal),'hash')).lastrowid
         con.execute("INSERT INTO conversation_outbox(conversation_id,message_id) VALUES('cv',?)",(mid,));mids.append(mid)
     con.commit()
     service=NativeChatsService(path,path.parent,None)
@@ -175,3 +176,42 @@ def test_itemless_claude_complete_chunks_use_engine_identity_and_cross_source_de
     assert not mirrored_output(con,'cv',rid,dataclasses.asdict(partial),'claude')
     unknown=dataclasses.replace(events[1],provenance='unknown:output')
     assert not mirrored_output(con,'cv',rid,dataclasses.asdict(unknown),'claude')
+
+
+@pytest.mark.parametrize('fifo,source',[('user','gui'),('engine','system'),('shell','system')],indirect=['fifo'])
+def test_actual_private_controller_accepts_fifo_source_and_retains_sender_purpose(fifo,tmp_path,source):
+    import os
+    import threading
+    import time
+
+    from conversation_runtime_contract import RuntimeIdentity
+    from conversation_runtime_controller import Controller, PrivateServer, start_ticks
+    from test_conversation_runtime_foundation import TestDriver, context
+    service,old_client,con,mids=fifo
+    root=tmp_path/'controller';root.mkdir(mode=0o700)
+    class Driver(TestDriver):
+        def submit(self,command,*,deadline):
+            self.command=command
+            return super().submit(command,deadline=deadline)
+    driver=Driver();controller=Controller('g',root,driver)
+    controller.context=context(root);controller.identity=RuntimeIdentity('root');controller.ready=True
+    controller.journal.lease(service.consumer,old_client.lease['fence'],old_client.lease['expires'])
+    server=PrivateServer(controller,root/'controller.sock')
+    worker=threading.Thread(target=server.serve);worker.start()
+    try:
+        until=time.monotonic()+2
+        while not server.endpoint.exists() and time.monotonic()<until:time.sleep(.005)
+        client=RuntimeClient(server.endpoint,'g',consumer=service.consumer,
+                             controller_pid=os.getpid(),controller_start_ticks=start_ticks(os.getpid()))
+        client.lease=old_client.lease
+        service.dispatch_queued('g','cv',client,1,1)
+        assert driver.writes==['gui-message:'+str(mids[0])]
+        assert driver.command.source==source
+        assert driver.command.message_id==str(mids[0])
+        assert con.execute('SELECT state FROM conversation_runtime_commands').fetchone()[0]=='written'
+        service.dispatch_queued('g','cv',client,1,1)
+        assert len(driver.writes)==1 # Written first intent fences later FIFO; no replay.
+    finally:
+        controller.shutdown.set();worker.join(timeout=3)
+        assert not worker.is_alive()
+        controller.journal.db.close()

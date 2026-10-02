@@ -238,7 +238,8 @@ class NativeChatsService:
                 con.execute("UPDATE conversation_messages SET state='queued' WHERE message_id=? AND state='accepted'",(message['message_id'],))
                 con.execute("UPDATE conversations SET state='queued' WHERE conversation_id=? AND state='idle'",(cid,))
             result=client.submit(self.store,owner,shell,command_id,text=message['body'],
-                                 message_id=str(message['message_id']),run_id=str(rid),source='user')
+                                 message_id=str(message['message_id']),run_id=str(rid),
+                                 source='gui' if message['sender_kind']=='user' else 'system')
             with db_driver.write_transaction(con,'native_chat.dispatch_receipt'):
                 # Close can cancel this outbox while native dispatch returns.
                 # Late receipts cannot restore a cancelled/dispatched slot.
