@@ -274,7 +274,7 @@ class CodexRuntimeDriver(RuntimeDriver):
         self._parents: dict[str, str | None] = {}
         self._active: dict[str, str | None] = {}
         self._activity_revision: dict[str, int] = {}
-        self._uncertain_activity: set[str] = set()
+        self._uncertain_activity: dict[str, set[str | None]] = {}
         self._turn_status: dict[tuple[str, str], str] = {}
         self._requests: dict[tuple[str, str], NativeSubmission] = {}
         self._pending_submission: NativeSubmission | None = None
@@ -403,7 +403,7 @@ class CodexRuntimeDriver(RuntimeDriver):
             with self._lock:
                 if (self._active.get(self._root) or self._root in self._uncertain_activity
                         or self._pending_submission is not None):
-                    return WriteReceipt("rejected", detail="native primary activity must be reconciled")
+                    return WriteReceipt("not_written", detail="native primary activity must be reconciled")
                 self._pending_submission = command
             assert self._context is not None
             params: dict[str, Any] = {"threadId": self._root,
@@ -493,10 +493,19 @@ class CodexRuntimeDriver(RuntimeDriver):
                 self._event("activity.processed", ref, provenance=provenance)
             elif method == "turn/completed" and turn and isinstance(nested, dict):
                 status = _string(nested.get("status")) or "unknown"
+                was_terminal = self._turn_status.get((thread, turn)) in TURN_TERMINALS
+                if was_terminal:
+                    return  # A read/event already proved this scoped terminal.
                 self._turn_status[(thread, turn)] = status
                 self._activity_revision[thread] = self._activity_revision.get(thread, 0) + 1
-                if status in TURN_TERMINALS and self._active.get(thread) == turn:
-                    self._active[thread] = None
+                if status in TURN_TERMINALS:
+                    if self._active.get(thread) == turn:
+                        self._active[thread] = None
+                    uncertain = self._uncertain_activity.get(thread)
+                    if uncertain is not None:
+                        uncertain.discard(turn)
+                        if not uncertain:
+                            self._uncertain_activity.pop(thread)
                 self._event("activity.terminal" if status in TURN_TERMINALS else "snapshot.observed", ref,
                             provenance=provenance, data={"status": status}, partial=status not in TURN_TERMINALS)
             elif method in {"item/agentMessage/delta", "item/commandExecution/outputDelta"}:
@@ -657,9 +666,13 @@ class CodexRuntimeDriver(RuntimeDriver):
                         uncertain = unknown_status or bool(unresolved_previous and turn_id != previous)
                         partial |= uncertain
                         if uncertain:
-                            self._uncertain_activity.add(thread)
+                            self._uncertain_activity[thread] = {
+                                _string(native_turn.get("id")) for native_turn in turns
+                                if native_turn.get("status") not in {*TURN_TERMINALS, "inProgress"}}
+                            if unresolved_previous and turn_id != previous:
+                                self._uncertain_activity[thread].add(previous)
                         else:
-                            self._uncertain_activity.discard(thread)
+                            self._uncertain_activity.pop(thread, None)
                         self._active[thread] = previous if unresolved_previous and not turn_id else turn_id
                         self._activity_revision[thread] = read_revision + 1
                         for native_turn in turns:
