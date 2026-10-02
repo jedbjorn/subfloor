@@ -168,6 +168,21 @@ def test_partial_startup_keyboard_write_is_unknown_and_never_replayed(startup_se
     assert writes == [b"y\r"] and not driver._ready
 
 
+def test_close_withdraws_setup_and_late_channel_cannot_start_readiness(startup_seat):
+    driver, context, events, setup = startup_seat
+    driver._context = replace(context, capability_evidence={"submission": "compatible"})
+    driver.cleanup(deadline=DEADLINE())
+    assert driver._startup_setup is None
+    assert driver.control(enable_command(setup), deadline=DEADLINE()).state == "rejected"
+    transcript = Path(context.env["HOME"]) / ".claude/projects/exact" / (driver._identity.root_id + ".jsonl")
+    driver.asset({"kind": "hook", "event": {"hook_event_name": "SessionStart",
+        "session_id": driver._identity.root_id, "cwd": str(context.worktree), "transcript_path": str(transcript)}},
+        peer=ProcessIdentity(999999999, 10), deadline=DEADLINE())
+    driver.asset({"kind": "channel.ready"}, peer=ProcessIdentity(999999999, 10), deadline=DEADLINE())
+    assert not driver._notifications and not driver._readiness_queued and not driver._ready
+    assert not [event for event in events if event.kind == "runtime.ready"]
+
+
 @pytest.mark.parametrize("replacement", ["Unknown warning", "Channels: server:other", "y. Other choice", "Enter y/n: n"])
 def test_unrecognized_startup_text_never_creates_eligible_setup(seat, replacement):
     driver, _, events = seat
