@@ -1,6 +1,7 @@
 """Native controller/driver contract identity and scoped-data boundaries."""
 from __future__ import annotations
 
+import dataclasses
 import sys
 from pathlib import Path
 
@@ -8,10 +9,13 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / '.super-coder/scripts'))
 from conversation_runtime_contract import (
+    DriverStart,
+    NativeControl,
     NativeReference,
     ProcessIdentity,
     RuntimeContractError,
     RuntimeEvent,
+    StartupConsent,
     WriteReceipt,
     payload_digest,
     public_payload,
@@ -60,3 +64,27 @@ def test_known_values_scrub_all_nested_strings_before_persistence():
 def test_redaction_cannot_silently_rewrite_native_identity_targets():
     with pytest.raises(RuntimeContractError,match='without rewriting'):
         public_payload({'root_id':'root-real-secret'},sensitive_values=('real-secret',))
+
+
+def test_startup_consent_is_a_typed_finite_choice_separate_from_ready_and_capabilities():
+    setup=StartupConsent('g','phase-epoch','a'*64,'driver-v1','b'*64,1)
+    start=DriverStart('needs_consent',setup=setup)
+    assert start.setup==setup and not start.capabilities
+    RuntimeEvent('runtime.setup',data=dataclasses.asdict(setup))
+    with pytest.raises(RuntimeContractError,match='needs_consent requires'):
+        DriverStart('needs_consent')
+    with pytest.raises(RuntimeContractError,match='needs_consent requires'):
+        DriverStart('ready',setup=setup)
+    with pytest.raises(RuntimeContractError,match='finite startup consent'):
+        dataclasses.replace(setup,phase='arbitrary_terminal_prompt')
+    with pytest.raises(RuntimeContractError,match='typed finite startup'):
+        RuntimeEvent('runtime.setup',data=dataclasses.asdict(setup)|{'arbitrary_input':'text'})
+
+
+def test_enable_local_channel_control_has_only_captured_phase_binding():
+    control=NativeControl('c',1,'a'*64,'enable_local_channel',options={'setup_id':'epoch','configuration_sha256':'b'*64})
+    assert control.target is None
+    with pytest.raises(RuntimeContractError,match='exact finite startup choice'):
+        dataclasses.replace(control,options=dict(control.options)|{'text':'arbitrary terminal input'})
+    with pytest.raises(RuntimeContractError,match='exact finite startup choice'):
+        dataclasses.replace(control,options={'setup_id':'epoch','configuration_sha256':'wrong'})
