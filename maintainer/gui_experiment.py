@@ -786,7 +786,7 @@ def bootstrap_repository(root: Path) -> str:
         ".sc-state/\n.sc-worktrees/\nruntime/\nsynthetic-upstream/\nhome/\nxdg-*/\n"
         "fixture_bootstrap.py\n.gui-experiment-owner.json\n*.log\n"
         ".super-coder/*.db*\n.super-coder/instance.json\n.super-coder/db_backups/\n"
-        ".super-coder/__pycache__/\n**/__pycache__/\n")
+        ".super-coder/__pycache__/\n**/__pycache__/\nnode_modules/\n")
     command(["git","-C",str(root),"init","-q","-b","main"])
     command(["git","-C",str(root),"add","sc",".super-coder",".gitignore"])
     command(["git","-C",str(root),"-c","user.name=GUI fixture","-c","user.email=fixture@example.invalid",

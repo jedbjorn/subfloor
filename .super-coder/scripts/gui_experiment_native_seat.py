@@ -12,8 +12,11 @@ import hashlib
 import importlib
 import json
 import os
+import shutil
+import signal
 import subprocess
 import sys
+import threading
 import time
 from collections.abc import Mapping
 from pathlib import Path
@@ -42,6 +45,8 @@ class NativeFixtureSeat:
         if set(native_bindings)-{'HOME','CODEX_HOME','CODEX','CLAUDE'}:
             raise RuntimeContractError('CONTEXT_INVALID','unknown native path binding')
         self.native_bindings=dict(native_bindings)
+        self.assets_lock=threading.Lock()
+        self.claude_assets_ready=False
         for value in self.native_bindings.values():
             if value and (not Path(value).is_absolute() or any(c in value for c in '\n\r\0')):
                 raise RuntimeContractError('CONTEXT_INVALID','absolute finite native paths required')
@@ -130,6 +135,92 @@ class NativeFixtureSeat:
             raise RuntimeContractError('WORKTREE_INVALID','canonical worktree has stale or aliased containment')
         return selected
 
+    def claude_startup_prerequisite(self,fingerprint: Fingerprint,deadline: float) -> dict:
+        """Configured prerequisites only; the driver observes its owned hook.
+
+        Source/configuration evidence is never an effective-memory observation
+        or capability grade. Actual SessionStart/config/hook checks remain in
+        the captured driver before its first readiness nonce and cached input.
+        """
+        self.supervisor.preparation_identity()
+        if (fingerprint.harness!='claude' or fingerprint.provider!='anthropic'
+                or not fingerprint.model or not fingerprint.effort or time.monotonic()>=deadline):
+            raise RuntimeContractError('CLAUDE_STARTUP_EVIDENCE_INCONCLUSIVE','captured configured Claude candidate unavailable')
+        if fingerprint!=self.candidate_fingerprint('claude',fingerprint.model,fingerprint.effort):
+            raise RuntimeContractError('CLAUDE_STARTUP_EVIDENCE_INCONCLUSIVE','captured configured Claude candidate changed')
+        if run.load_adapter('claude').get('launch_flags')!=['--dangerously-skip-permissions']:
+            raise RuntimeContractError('PERMISSION_INCONCLUSIVE','canonical Claude permission policy changed')
+        driver=importlib.import_module('conversation_adapters.claude_runtime')
+        source=driver._memory_disable_source(fingerprint.executable.path,fingerprint.executable.sha256,deadline=deadline)
+        self.prepare_claude_assets(deadline)
+        if time.monotonic()>=deadline or fingerprint!=self.candidate_fingerprint('claude',fingerprint.model,fingerprint.effort):
+            raise RuntimeContractError('CLAUDE_STARTUP_EVIDENCE_INCONCLUSIVE','captured implementation changed during prerequisites')
+        return {'state':'configured_pending_owned_hook','evidence_level':'configuration_source_flag_inference',
+                'effective_telemetry':False,'executable_sha256':fingerprint.executable.sha256,
+                'implementation_digest':fingerprint.implementation_digest,'source_condition_sha256':source,
+                'required_inherited_disable_flag':'1','required_auto_memory_enabled_setting':False}
+
+    def prepare_claude_assets(self,deadline: float) -> None:
+        """One fixed pinned dependency operation inside the marked API unit."""
+        if not self.assets_lock.acquire(timeout=max(0,min(30,deadline-time.monotonic()))):
+            raise RuntimeContractError('CHANNEL_UNAVAILABLE','pinned dependency preparation is busy')
+        try:
+            owner=self.supervisor.preparation_identity()
+            assets=self.root/'.super-coder/assets/runtime/claude'
+            if assets.is_symlink() or assets.resolve()!=assets or self.root.resolve() not in assets.resolve().parents:
+                raise RuntimeContractError('CHANNEL_UNAVAILABLE','copied channel assets escaped the fixture')
+            if any((assets/name).is_symlink() for name in ('package.json','package-lock.json')):
+                raise RuntimeContractError('CHANNEL_UNAVAILABLE','captured channel manifests are aliased')
+            package=json.loads((assets/'package.json').read_text())
+            lock=json.loads((assets/'package-lock.json').read_text())
+            if (package.get('dependencies')!={'@modelcontextprotocol/sdk':'1.31.0'}
+                    or lock.get('packages',{}).get('node_modules/@modelcontextprotocol/sdk',{}).get('version')!='1.31.0'):
+                raise RuntimeContractError('CHANNEL_UNAVAILABLE','captured pinned SDK composition changed')
+            node=shutil.which('node',path=os.defpath)
+            npm=shutil.which('npm',path=os.defpath)
+            home=self.root/'home'
+            if node is None or npm is None or home.is_symlink() or home.resolve()!=home:
+                raise RuntimeContractError('CHANNEL_UNAVAILABLE','fixed fixture Node/npm paths unavailable')
+            env={'HOME':str(home),'PATH':os.defpath,'npm_config_cache':str(home/'.npm-cache'),
+                 'npm_config_userconfig':str(home/'no-npm-user-config'),
+                 'npm_config_globalconfig':str(home/'no-npm-global-config')}
+            version=subprocess.run([node,'--version'],env=env,capture_output=True,text=True,check=False,
+                timeout=max(.001,min(3,deadline-time.monotonic())))
+            if version.returncode or len(version.stdout)>64 or int(version.stdout.strip().removeprefix('v').split('.')[0])<22:
+                raise RuntimeContractError('CHANNEL_UNAVAILABLE','pinned channel requires Node 22 or newer')
+            installed=assets/'node_modules/@modelcontextprotocol/sdk/package.json'
+            if any(path.is_symlink() for path in (installed,*installed.parents) if path!=assets and assets in path.parents):
+                raise RuntimeContractError('CHANNEL_UNAVAILABLE','copied dependencies are aliased')
+            if self.claude_assets_ready and installed.is_file() and not installed.is_symlink() and json.loads(installed.read_text()).get('version')=='1.31.0':
+                return
+            if (assets/'node_modules').is_symlink():
+                raise RuntimeContractError('CHANNEL_UNAVAILABLE','copied dependency root is aliased')
+            # No lifecycle scripts, host npm configuration, credential values,
+            # or global install. The child remains in this registered API unit.
+            before=hashlib.sha256((assets/'package-lock.json').read_bytes()).hexdigest()
+            if time.monotonic()>=deadline or self.supervisor.preparation_identity()!=owner:
+                raise RuntimeContractError('CHANNEL_UNAVAILABLE','owned dependency deadline/identity expired')
+            process=subprocess.Popen([npm,'ci','--omit=dev','--ignore-scripts','--no-audit','--no-fund'],cwd=assets,env=env,
+                stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,start_new_session=True)
+            try:
+                status=process.wait(timeout=max(.001,min(30,deadline-time.monotonic())))
+            finally:
+                if process.poll() is None:
+                    os.killpg(process.pid,signal.SIGTERM)
+                    try:process.wait(timeout=1)
+                    except subprocess.TimeoutExpired:
+                        os.killpg(process.pid,signal.SIGKILL);process.wait(timeout=1)
+            if (status or self.supervisor.preparation_identity()!=owner
+                    or hashlib.sha256((assets/'package-lock.json').read_bytes()).hexdigest()!=before
+                    or not installed.is_file() or installed.is_symlink()
+                    or json.loads(installed.read_text()).get('version')!='1.31.0'):
+                raise RuntimeContractError('CHANNEL_UNAVAILABLE','fixed pinned dependency preparation did not complete')
+            self.claude_assets_ready=True
+        except (OSError,ValueError,subprocess.TimeoutExpired) as exc:
+            raise RuntimeContractError('CHANNEL_UNAVAILABLE','bounded copied dependency prerequisite unavailable') from exc
+        finally:
+            self.assets_lock.release()
+
     def prepare(self,conversation_id: str,generation_id: str, *, probe_capabilities: tuple[str,...]=(),
                 checked_fingerprint: Fingerprint|None=None) -> tuple[RuntimeContext,Fingerprint,dict]:
         con=db_driver.connect(str(self.database))
@@ -171,6 +262,8 @@ class NativeFixtureSeat:
         observed=observer.observe()
         if observed.binding is None:
             raise RuntimeContractError('NATIVE_EXECUTABLE_INCONCLUSIVE','installed native identity observation is unavailable')
+        if harness=='claude':
+            self.claude_startup_prerequisite(self.candidate_fingerprint(harness,row['model'],row['effort']),time.monotonic()+30)
         if checked_fingerprint is not None:
             current_fingerprint=self.candidate_fingerprint(harness,row['model'],row['effort'])
             if (current_fingerprint!=checked_fingerprint or current_fingerprint.executable!=observed.binding

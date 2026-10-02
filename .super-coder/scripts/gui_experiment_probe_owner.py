@@ -26,7 +26,7 @@ from conversation_runtime_contract import (
     RuntimeIdentity,
     StartupConsent,
 )
-from conversation_runtime_controller import encoded, start_ticks
+from conversation_runtime_controller import encoded, observed_claude_memory, start_ticks
 from conversation_runtime_native_probes import OwnedProbe
 
 
@@ -70,15 +70,16 @@ class NativeProbeOwner:
                 self.allocating.discard(fingerprint.key)
 
     def _allocate(self,fingerprint: Fingerprint,capabilities: frozenset[str],deadline: float) -> OwnedProbe:
-        # Claude's readiness challenge itself performs inference. Pending
-        # workspace/no-memory authority is enforced before Driver.start, not
-        # by the factory's later post-ready observation check.
-        if fingerprint.harness=='claude':
-            raise RuntimeContractError('CLAUDE_STARTUP_EVIDENCE_INCONCLUSIVE','workspace and startup evidence prerequisites remain unresolved')
         allowed={'submission','stop_reply','stop_work','stop_work_terminal','stop_work_child'}
         if not capabilities<=allowed or time.monotonic()>=deadline:
             raise RuntimeContractError('PROBE_INVALID','finite supported native probe scope required')
         preparation_owner=self.seat.supervisor.preparation_identity()
+        prerequisite=None
+        if fingerprint.harness=='claude':
+            guard=getattr(self.seat,'claude_startup_prerequisite',None)
+            if guard is None:
+                raise RuntimeContractError('CLAUDE_STARTUP_EVIDENCE_INCONCLUSIVE','captured source/configured prerequisite unavailable')
+            prerequisite=guard(fingerprint,deadline)
         binding=self.candidate_binding(fingerprint)
         generation=uuid.uuid4().hex
         cid='cv_'+generation
@@ -97,6 +98,7 @@ class NativeProbeOwner:
                     projection={'role':'probe','generation_id':generation,'state':'preparing','capabilities':{},
                                 'setup':None,'partial':True,'freshness':'unknown','preparation_owner':preparation_owner,
                                 'check_deadline':time.time()+max(0,deadline-time.monotonic())}
+                    if prerequisite:projection['startup_prerequisite']=prerequisite
                     requests=con.execute("SELECT check_id,owner_user_id,selection_json FROM conversation_runtime_check_requests WHERE status IN ('accepted','running') AND json_extract(result_json,'$.fingerprint')=?",(fingerprint.key,)).fetchall()
                     if requests:
                         if (len(requests)!=1 or requests[0]['owner_user_id']!=1
@@ -116,7 +118,8 @@ class NativeProbeOwner:
                        check=True,capture_output=True,timeout=max(.001,min(15,deadline-time.monotonic())))
         granted=set(capabilities)|{'submission'}
         if 'stop_work' in capabilities:
-            granted.update({'stop_work_terminal','stop_work_child'})
+            granted.add('stop_work_terminal')
+            if fingerprint.harness=='codex':granted.add('stop_work_child')
         grants=tuple(sorted(granted))
         context,actual,native=self.seat.prepare(cid,generation,probe_capabilities=grants)
         with self.lock:
@@ -157,7 +160,7 @@ class NativeProbeOwner:
         return OwnedProbe(context,client,self.service.store,owner,shell_id,native['unit'],self.root,True,
             observe_marker=lambda marker,end:self.marker(shell_id,marker,end),
             process_identity=lambda pid:self.process(generation,pid),
-            on_identity=lambda identity:self.identity(cid,generation,identity),
+            on_identity=lambda identity:self.identity(cid,generation,identity,context=context),
             on_setup=lambda setup:self.setup(cid,generation,setup))
 
     def _update(self,cid: str,generation: str,**fields) -> None:
@@ -184,11 +187,17 @@ class NativeProbeOwner:
             raise RuntimeContractError('SETUP_INVALID','startup choice belongs to another probe')
         self._update(cid,generation,state='needs_consent' if setup else 'checking',setup=dataclasses.asdict(setup) if setup else None)
 
-    def identity(self,cid: str,generation: str,identity: RuntimeIdentity) -> None:
+    def identity(self,cid: str,generation: str,identity: RuntimeIdentity,*,context=None) -> None:
         # Native observations remain probe diagnostics, never cache admission.
         memory=identity.protocol.get('memory_policy') or {}
+        if context is not None and context.harness=='claude':
+            memory,matches=observed_claude_memory(memory,context,identity)
+            if not matches:
+                raise RuntimeContractError('NATIVE_MEMORY_INCONCLUSIVE','owned qualified Claude hook/config observation is unavailable')
+        else:
+            memory={key:memory[key] for key in ('generate_memories','use_memories','feature_enabled','root_mode') if key in memory}
         self._update(cid,generation,state='checking',root_id=identity.root_id,native_route=identity.protocol.get('native_route'),
-                     memory_policy={key:memory[key] for key in ('generate_memories','use_memories','feature_enabled','root_mode') if key in memory},
+                     memory_policy=memory,
                      ready_observation_at=time.time(),native_process={'pid':identity.process.pid,'start_ticks':identity.process.start_ticks} if identity.process else None,
                      setup=None)
 
