@@ -444,7 +444,7 @@ def test_withdrawn_startup_phase_blocks_choice_and_late_setup_cannot_regress_rea
 
 def test_async_readiness_retains_selected_observations_without_changing_native_identity(controller):
     owner,driver=controller
-    owner.context=dataclasses.replace(owner.context,harness='claude');driver.harness='claude'
+    owner.context=dataclasses.replace(owner.context,harness='claude',model='observed-model',effort='high');driver.harness='claude'
     owner.identity=RuntimeIdentity('root','native-session',protocol={'auth_observation':{'method':'claude.ai'}})
     owner.ready=False
     route={'account_type':'claude.ai','model':'observed-model','efforts':['high'],
@@ -465,7 +465,7 @@ def test_async_readiness_retains_selected_observations_without_changing_native_i
     assert not owner.ready and owner.identity.protocol['native_route']['model']=='observed-model'
 
 
-@pytest.mark.parametrize('change',[{'email':'private@example.invalid'},{'efforts':[]},{'auth':{'method':'claude.ai','provider':'firstParty','access_token':'private'}}])
+@pytest.mark.parametrize('change',[{'efforts':[]},{'auth':{'method':'claude.ai'}},{'model':'bad\nmodel'}])
 def test_readiness_rejects_unbounded_or_unsanitized_route_before_journal(controller,change):
     owner,_=controller
     before=owner.journal.get('sequence')
@@ -473,6 +473,31 @@ def test_readiness_rejects_unbounded_or_unsanitized_route_before_journal(control
         owner.emit(RuntimeEvent('runtime.ready',NativeReference('root',thread_id='root'),data={
             'native_route':{'account_type':'chatgpt','model':'observed','efforts':['high']}|change}))
     assert owner.journal.get('sequence')==before
+
+
+def test_added_native_observations_are_ignored_before_persistence(controller):
+    owner,_=controller
+    owner.context=dataclasses.replace(owner.context,model='selected',effort='high')
+    owner.ready=False
+    route={'account_type':'chatgpt','model':'selected','efforts':['high'],'future_observation':'private-unused',
+           'auth':{'method':'chatgpt','provider':'openai','future_field':'private-unused'}}
+    owner.emit(RuntimeEvent('runtime.ready',NativeReference('root',thread_id='root'),data={'native_route':route}))
+    assert owner.ready and not owner.lost
+    assert 'future_observation' not in owner.identity.protocol['native_route']
+    assert 'future_field' not in owner.identity.protocol['native_route']['auth']
+    assert 'private-unused' not in json.dumps(owner.journal.replay(0))
+
+
+@pytest.mark.parametrize('change,grade',[({'model':'other'},'unverified'),({'efforts':['low']},'unverified'),
+    ({'account_type':'claude.ai'},'unverified'),({},'incompatible'),({},'inconclusive')])
+def test_async_readiness_cannot_admit_mismatched_or_failed_native_observation(controller,change,grade):
+    owner,_=controller
+    owner.context=dataclasses.replace(owner.context,model='selected',effort='high')
+    owner.ready=False
+    route={'account_type':'chatgpt','model':'selected','efforts':['high']}|change
+    owner.emit(RuntimeEvent('runtime.ready',NativeReference('root',thread_id='root'),data={'native_route':route},grade=grade))
+    assert not owner.ready and not owner.lost and 'native_route' not in owner.identity.protocol
+    assert owner.handle(wire('close',command=control('close',1,action='close')))['outcome']=='complete'
 
 
 def test_startup_projection_binds_generation_binary_driver_and_preserves_close(tmp_path):
@@ -497,10 +522,14 @@ def test_startup_projection_binds_generation_binary_driver_and_preserves_close(t
     assert store.status('g',1,1)['state']=='setup_inconclusive'
     event(4,RuntimeEvent('runtime.setup',data=dataclasses.asdict(setup)))
     assert store.status('g',1,1)['state']=='needs_consent'
+    event(5,RuntimeEvent('runtime.ready',NativeReference('root'),grade='incompatible'))
+    assert store.status('g',1,1)['state']=='setup_inconclusive'
+    event(6,RuntimeEvent('runtime.ready',NativeReference('root'),partial=True))
+    assert store.status('g',1,1)['state']=='setup_inconclusive'
     store.state('g',1,1,'needs_consent')
     store.intent('g',1,1,lease,'close','close',{'action':'close'})
     store.state('g',1,1,'closing')
-    event(5,RuntimeEvent('runtime.ready',NativeReference('root')))
+    event(7,RuntimeEvent('runtime.ready',NativeReference('root')))
     assert store.status('g',1,1)['state']=='closing'
 
 
