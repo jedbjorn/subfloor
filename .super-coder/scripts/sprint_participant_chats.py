@@ -391,6 +391,7 @@ def create_shell_wake_conversation(
             raise SprintConversationError('native shell wake requires exact selection')
         if active_chat_registry.native_cleanup_pending(con,route.shell_id):
             raise WakeConversationBusy('native wake cleanup remains pending')
+        captured_service=sprint_native_wakes.owner(con)
         binding,digest=sprint_native_wakes.checked_shell_route(con,route.shell_id,route.harness,route.model,route.effort)
         if binding!=route.binding or digest!=route.binding_digest:
             raise SprintConversationError('native shell wake proof changed before creation')
@@ -401,6 +402,8 @@ def create_shell_wake_conversation(
                 or prior is None or (prior['conversation_id'],prior['owner_user_id'],prior['harness'],prior['model'],prior['effort'],prior['runtime_mode'])
                     !=(route.source_conversation_id,route.owner_user_id,route.harness,route.model,route.effort,route.runtime_mode)):
             raise SprintConversationError('native shell wake source selection or owner changed before creation')
+        if sprint_native_wakes.owner(con) is not captured_service:
+            raise SprintConversationError('native shell wake installed owner changed at creation edge')
 
     key = f"shell:{route.shell_id}:wake:{wake_id}"
     request = {
