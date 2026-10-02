@@ -127,3 +127,22 @@ def test_probe_role_refuses_ordinary_input_even_with_cached_submission(owner,mon
             {'Idempotency-Key':'attempted-probe-input'},{'text':'ordinary prompt'})
     assert error.value.code=='PROBE_INPUT_UNAVAILABLE'
     assert con.execute('SELECT COUNT(*) FROM conversation_messages').fetchone()[0]==0
+
+
+def test_real_checker_factory_entry_accepts_owned_common_fixture_boundary(owner,monkeypatch):
+    from conversation_runtime_checks import CompatibilityChecker
+    from conversation_runtime_contract import DriverStart, NativeCleanup
+    from conversation_runtime_native_probes import ControllerProbeDriver, NativeProbeFactory
+    value,fingerprint,_,_=owner
+    reached=[]
+    def unavailable(driver,context,emit,*,deadline):
+        reached.append(context.generation_id)
+        assert value.root.resolve() in context.worktree.resolve().parents
+        assert value.root.resolve() in context.state_root.resolve().parents
+        return DriverStart('unavailable',detail='test transport account absent')
+    monkeypatch.setattr(ControllerProbeDriver,'start',unavailable)
+    monkeypatch.setattr(ControllerProbeDriver,'cleanup',lambda *args,**kwargs:NativeCleanup('complete'))
+    result=CompatibilityChecker().request(fingerprint,observed_interface={},requirements={'submission':{}},
+        factory=NativeProbeFactory(value.allocate,value.cleanup),seconds=30).result(timeout=5)
+    assert len(reached)==1
+    assert all(d.code!='PROBE_OWNERSHIP_INVALID' for evidence in result.evidence.values() for d in evidence.diagnostics)

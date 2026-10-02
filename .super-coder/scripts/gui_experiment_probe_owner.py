@@ -133,7 +133,10 @@ class NativeProbeOwner:
                 con.close()
             self.seat.supervisor.launch(generation)
         client,owner,shell_id=self.service.attach(generation)
-        return OwnedProbe(context,client,self.service.store,owner,shell_id,native['unit'],context.state_root,True,
+        # Canonical worktree and private state are siblings beneath the marked
+        # synthetic fixture. The boundary is that verified shared seat root;
+        # per-probe shell/chat/generation/unit remain independently owned.
+        return OwnedProbe(context,client,self.service.store,owner,shell_id,native['unit'],self.root,True,
             observe_marker=lambda marker,end:self.marker(shell_id,marker,end),
             process_identity=lambda pid:self.process(generation,pid),
             on_identity=lambda identity:self.identity(cid,generation,identity),
