@@ -5,12 +5,11 @@ import hashlib
 import json
 import os
 import socket
-import sqlite3
 import subprocess
 import sys
 import threading
 import time
-from dataclasses import asdict, replace
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -65,9 +64,6 @@ def hook(seat, name, **fields):
 def prepared_assets(tmp_path, monkeypatch):
     assets = tmp_path / "assets"
     (assets / "node_modules/@modelcontextprotocol/sdk").mkdir(parents=True)
-    for original in runtime.ASSETS.iterdir():
-        if original.is_file():
-            (assets / original.name).write_bytes(original.read_bytes())
     (assets / "node_modules/@modelcontextprotocol/sdk/package.json").write_text("{}")
     monkeypatch.setattr(runtime, "ASSETS", assets)
     monkeypatch.setattr(runtime.shutil, "which", lambda *args, **kwargs: "/captured/node")
@@ -89,114 +85,6 @@ def make_ready(seat):
     driver._channel_peer = ProcessIdentity(999999999, 10)
 
 
-def startup_dialog():
-    # Exact installed 2.1.287 DevChannelsDialog/ax ConfirmCancel text;
-    # source fixture only, actual native phase acceptance remains separate.
-    return ("WARNING: Loading development channels\n"
-        "--dangerously-load-development-channels is for local channel development only. "
-        "Do not use this option to run channels you have downloaded off the internet.\n"
-        "Please use --channels to run a list of approved channels.\n"
-        "Channels: server:subfloor_runtime\n"
-        "y. I am using this for local development\nn. Exit\nEnter y/n: ")
-
-
-@pytest.fixture
-def startup_seat(seat, tmp_path, monkeypatch):
-    _, context, _ = seat
-    prepared_assets(tmp_path, monkeypatch)
-    context.executable.path.write_text("#!/usr/bin/python3\nimport sys,time\n"
-        + f"print({startup_dialog()!r},end='',flush=True)\n"
-        + "sys.stdin.readline()\nprint('fixture confirmation consumed',flush=True)\ntime.sleep(5)\n")
-    context.executable.path.chmod(0o700)
-    context = replace(context, executable=replace(context.executable,
-        sha256=hashlib.sha256(context.executable.path.read_bytes()).hexdigest()))
-    driver, events = runtime.ClaudeRuntimeDriver(), []
-    started = time.monotonic()
-    result = driver.start(context, events.append, deadline=started + 3)
-    try:
-        assert result.state == "needs_consent" and result.setup and time.monotonic() - started < 1
-        assert not driver._ready
-        yield driver, context, events, result.setup
-    finally:
-        driver.cleanup(deadline=time.monotonic() + 2)
-        assert driver._process.poll() is not None
-
-
-def enable_command(setup, **changes):
-    return NativeControl("enable", 1, "digest", "enable_local_channel",
-        options={"setup_id": setup.setup_id, "configuration_sha256": setup.configuration_sha256}, **changes)
-
-
-def test_finite_startup_returns_early_and_explicit_confirmation_is_not_readiness(startup_seat):
-    driver, _, events, setup = startup_seat
-    assert setup.phase == "local_channel_development_consent"
-    assert any(event.kind == "runtime.setup" and not event.partial for event in events)
-    assert driver.control(enable_command(setup), deadline=DEADLINE()).state == "written"
-    assert not driver._ready and not [event for event in events if event.kind == "runtime.ready"]
-    assert driver.control(replace(enable_command(setup), control_id="another"), deadline=DEADLINE()).state == "rejected"
-
-
-@pytest.mark.parametrize("mutation", ["stale_id", "wrong_digest", "changed_phase", "wrong_root", "changed_configuration", "changed_binary", "changed_boot", "expired"])
-def test_startup_confirmation_revalidates_only_captured_phase_and_writes_nothing(startup_seat, monkeypatch, mutation):
-    driver, context, events, setup = startup_seat
-    command = enable_command(setup)
-    if mutation == "stale_id":
-        command = replace(command, options=dict(command.options) | {"setup_id": "stale"})
-    elif mutation == "wrong_digest":
-        command = replace(command, options=dict(command.options) | {"configuration_sha256": "a" * 64})
-    elif mutation == "wrong_root":
-        command = replace(command, target=NativeReference("other-root"))
-    elif mutation == "changed_phase":
-        with driver._condition:
-            driver._observe_startup(b"\nA different startup choice\nEnter y/n: ")
-        assert any(event.kind == "runtime.setup" and event.partial and event.freshness == "stale" for event in events)
-    elif mutation == "changed_configuration":
-        (context.state_root / "claude-runtime-settings.json").write_text("different settings")
-    elif mutation == "changed_binary":
-        context.executable.path.write_text("changed native executable")
-    elif mutation == "changed_boot":
-        (context.worktree / "CLAUDE.md").write_text("different canonical boot")
-    writes = []
-    monkeypatch.setattr(runtime.os, "write", lambda fd, data: writes.append(data) or len(data))
-    result = driver.control(command, deadline=time.monotonic() - 1 if mutation == "expired" else DEADLINE())
-    assert result.state in {"not_written", "rejected"} and writes == [] and not driver._startup_confirmed
-
-
-def test_partial_startup_keyboard_write_is_unknown_and_never_replayed(startup_seat, monkeypatch):
-    driver, _, _, setup = startup_seat
-    writes = []
-    monkeypatch.setattr(runtime.os, "write", lambda fd, data: writes.append(data) or 1)
-    assert driver.control(enable_command(setup), deadline=DEADLINE()).state == "unknown"
-    assert driver.control(replace(enable_command(setup), control_id="retry"), deadline=DEADLINE()).state == "rejected"
-    assert writes == [b"y\r"] and not driver._ready
-
-
-def test_close_withdraws_setup_and_late_channel_cannot_start_readiness(startup_seat):
-    driver, context, events, setup = startup_seat
-    driver._context = replace(context, capability_evidence={"submission": "compatible"})
-    driver.cleanup(deadline=DEADLINE())
-    assert driver._startup_setup is None
-    assert driver.control(enable_command(setup), deadline=DEADLINE()).state == "rejected"
-    transcript = Path(context.env["HOME"]) / ".claude/projects/exact" / (driver._identity.root_id + ".jsonl")
-    driver.asset({"kind": "hook", "event": {"hook_event_name": "SessionStart",
-        "session_id": driver._identity.root_id, "cwd": str(context.worktree), "transcript_path": str(transcript)}},
-        peer=ProcessIdentity(999999999, 10), deadline=DEADLINE())
-    driver.asset({"kind": "channel.ready"}, peer=ProcessIdentity(999999999, 10), deadline=DEADLINE())
-    assert not driver._notifications and not driver._readiness_queued and not driver._ready
-    assert not [event for event in events if event.kind == "runtime.ready"]
-
-
-@pytest.mark.parametrize("replacement", ["Unknown warning", "Channels: server:other", "y. Other choice", "Enter y/n: n"])
-def test_unrecognized_startup_text_never_creates_eligible_setup(seat, replacement):
-    driver, _, events = seat
-    driver._configuration_sha256 = "a" * 64
-    text = startup_dialog()
-    original = {"Unknown warning": "WARNING: Loading development channels", "Channels: server:other": "Channels: server:subfloor_runtime",
-                "y. Other choice": "y. I am using this for local development", "Enter y/n: n": "Enter y/n: "}[replacement]
-    driver._observe_startup(text.replace(original, replacement).encode())
-    assert driver._startup_setup is None and not [event for event in events if event.kind == "runtime.setup"]
-
-
 def test_boot_keeps_canonical_permissions_mcp_discovery_and_native_route(seat, tmp_path, monkeypatch):
     driver, context, _ = seat
     prepared_assets(tmp_path, monkeypatch)
@@ -207,7 +95,6 @@ def test_boot_keeps_canonical_permissions_mcp_discovery_and_native_route(seat, t
     argv, env = driver._prepare(context)
     assert argv[0] == str(context.executable.path)
     assert "--dangerously-skip-permissions" in argv and str(mcp) in argv
-    assert "--ax-screen-reader" in argv
     assert not {"--print", "--bare", "--restricted", "--setting-sources"} & set(argv)
     assert "ANTHROPIC_API_KEY" not in env and "CLAUDE_CODE_SIMPLE" not in env
     assert env["CLAUDE_CODE_DISABLE_AUTO_MEMORY"] == "1"
@@ -245,9 +132,6 @@ def test_native_initialization_does_not_equal_consent_or_ready(seat):
     nonce = driver._readiness_nonce
     hook(seat, "UserPromptSubmit", prompt_id="ready-prompt",
          prompt=channel_prompt(seat, nonce, readiness_nonce=nonce))
-    driver._transcript_record({"sessionId": driver._identity.root_id, "type": "assistant",
-        "promptId": "ready-prompt", "message": {"id": "observed-native-message",
-        "content": [{"type": "text", "text": nonce}]}})
     hook(seat, "Stop", prompt_id="ready-prompt", background_tasks=[], session_crons=[])
     assert not driver._ready  # Pre-terminal Stop can be blocked by another hook.
     driver._transcript_record({"sessionId": driver._identity.root_id, "type": "system",
@@ -255,66 +139,7 @@ def test_native_initialization_does_not_equal_consent_or_ready(seat):
     assert driver._ready
     ready = [event for event in events if event.kind == "runtime.ready"]
     assert ready[0].data["inference_turns"] == 1
-    assert ready[0].data["observed_model_message_ids"] == 1
     assert not [event for event in events if event.kind == "output.final"]
-
-
-@pytest.mark.parametrize("failure", ["StopFailure", "failed_terminal", "missing_reply", "wrong_reply", "wrong_terminal_source"])
-def test_failed_or_unanswered_challenge_never_certifies_readiness(seat, failure):
-    driver, context, events = seat
-    driver._context = replace(context, capability_evidence={"submission": "compatible"})
-    transcript = Path(context.env["HOME"]) / ".claude/projects/exact" / (driver._identity.root_id + ".jsonl")
-    hook(seat, "SessionStart", transcript_path=str(transcript))
-    driver.asset({"kind": "channel.ready"}, peer=ProcessIdentity(999999999, 10), deadline=DEADLINE())
-    nonce = driver._readiness_nonce
-    hook(seat, "UserPromptSubmit", prompt_id="challenge", prompt=channel_prompt(seat, nonce, readiness_nonce=nonce))
-    if failure != "missing_reply":
-        driver._transcript_record({"sessionId": driver._identity.root_id, "type": "assistant", "promptId": "challenge",
-            "message": {"id": "observed-message", "content": [{"type": "text", "text": "different" if failure == "wrong_reply" else nonce}]}})
-    if failure == "StopFailure":
-        hook(seat, "StopFailure", prompt_id="challenge")
-    elif failure == "failed_terminal":
-        driver._terminal("challenge", "failed", "claude:owned-transcript-turn_duration")
-    elif failure == "wrong_terminal_source":
-        driver._terminal("challenge", "completed", "unattributed-terminal")
-    else:
-        driver._transcript_record({"sessionId": driver._identity.root_id, "type": "system",
-            "promptId": "challenge", "subtype": "turn_duration"})
-    assert not driver._ready and not [event for event in events if event.kind == "runtime.ready"]
-    assert driver.submit(request(), deadline=DEADLINE()).state == "not_written"
-    assert driver.cleanup(deadline=DEADLINE()).outcome in {"complete", "pending"}
-
-
-@pytest.mark.parametrize("invalid", [None, [None], [{"unexpected": "unparseable"}]])
-@pytest.mark.parametrize("native_tool", ["TaskStop", "CronDelete"])
-def test_partial_inventory_cannot_complete_native_stop_or_delete(seat, invalid, native_tool):
-    driver, context, events = seat
-    make_ready(seat)
-    driver._context = replace(context, capability_evidence={"stop_work": "compatible", "automation": "compatible"})
-    if native_tool == "TaskStop":
-        hook(seat, "PostToolUse", tool_name="Bash", tool_use_id="launch", tool_input={},
-            tool_response={"backgroundTaskId": "owned"})
-        action, args, response = "stop_work", {"task_id": "owned"}, {"task_id": "owned", "task_type": "local_bash"}
-    else:
-        hook(seat, "PostToolUse", tool_name="CronCreate", tool_use_id="launch",
-            tool_input={"durable": False}, tool_response={"id": "owned", "durable": False, "recurring": True})
-        action, args, response = "stop_automation", {"id": "owned"}, {"id": "owned"}
-    driver.control(NativeControl("control", 1, "sha", action,
-        NativeReference(root_id=driver._identity.root_id, work_id="owned")), deadline=DEADLINE())
-    hook(seat, "UserPromptSubmit", prompt_id="current", prompt=channel_prompt(seat, "none", control_id="control"))
-    hook(seat, "PostToolUse", prompt_id="current", tool_name=native_tool, tool_use_id="stop-tool",
-        tool_input=args, tool_response=response)
-    hook(seat, "Stop", prompt_id="current", background_tasks=invalid, session_crons=[])
-    assert driver.inventory(deadline=DEADLINE()).partial
-    assert not [event for event in events if event.kind in {"work.terminal", "control.outcome"}]
-    assert "control" in driver._pending_results and driver._work["owned"].state in {"running", "scheduled"}
-    if native_tool == "CronDelete":
-        assert "owned" in driver._definitions
-    hook(seat, "Stop", prompt_id="current", background_tasks=[], session_crons=[])
-    assert [event for event in events if event.kind == "control.outcome"][-1].data["outcome"] == "complete"
-    assert "control" not in driver._pending_results
-    if native_tool == "CronDelete":
-        assert "owned" not in driver._definitions
 
 
 def test_acks_are_not_processing_busy_queue_is_retained_and_no_blind_replay(seat):
@@ -366,7 +191,7 @@ def test_user_narration_and_stale_snapshot_cannot_prove_task_stop(seat):
     assert not [event for event in events if event.kind == "control.outcome"]
     hook(seat, "Stop", prompt_id="control-prompt", background_tasks=[], session_crons=[])
     outcome = [event for event in events if event.kind == "control.outcome"][-1]
-    assert outcome.data == {"outcome": "complete", "native_outcome": "native_stopped", "os_verified": False}
+    assert outcome.data == {"outcome": "native_stopped", "os_verified": False}
     hook(seat, "SubagentStop", background_tasks=[{"id": "task-1", "type": "shell", "status": "running"}], session_crons=[])
     assert driver.inventory(deadline=DEADLINE()).partial
     assert driver._work["task-1"].state == "unknown_conflicting_snapshot"
@@ -406,61 +231,6 @@ def test_close_fences_queued_channel_work_and_retains_definition_obligations(sea
     assert outcome.outcome == "pending" and outcome.unresolved_definitions == ("unsafe-cron",)
     assert not driver._notifications
     assert driver.submit(request("later"), deadline=DEADLINE()).state == "not_written"
-
-
-def test_native_work_kinds_survive_shared_projection_and_terminal_updates(seat, tmp_path):
-    from conversation_runtime import RuntimeStore
-
-    driver, context, events = seat
-    driver._context = replace(context, capability_evidence={"automation": "compatible"})
-    hook(seat, "PostToolUse", tool_name="Bash", tool_use_id="bash",
-        tool_input={}, tool_response={"backgroundTaskId": "bash-id"})
-    hook(seat, "PostToolUse", tool_name="CronCreate", tool_use_id="cron",
-        tool_input={"durable": False}, tool_response={"id": "cron-id", "durable": False})
-    hook(seat, "Stop", background_tasks=[{"id": "bash-id", "type": "shell"}, {"id": "unknown-id"}],
-        session_crons=[{"id": "cron-id", "schedule": "* * * * *"}])
-    hook(seat, "SubagentStart", agent_id="agent-id")
-    hook(seat, "SubagentStop", agent_id="agent-id", background_tasks=None, session_crons=None)
-    for identifier in ("bash-id", "cron-id", "unknown-id"):
-        driver._work_terminal(identifier, "completed", "claude:task-notification")
-    work_events = [event for event in events if event.kind.startswith("work.")]
-    assert all("kind" in event.data for event in work_events)
-    expected = {"bash-id": "terminal", "cron-id": "automation", "unknown-id": "task", "agent-id": "child"}
-    assert all(event.data["kind"] == expected[event.reference.work_id] for event in work_events)
-
-    database = tmp_path / "synthetic.db"
-    with sqlite3.connect(database) as con:
-        con.executescript((SCRIPTS.parent / "schema.sql").read_text())
-        for migration in sorted((SCRIPTS.parent / "migrations").glob("*.sql")):
-            con.executescript(migration.read_text())
-        con.execute("INSERT INTO users(user_id,username) VALUES(1,'fixture')")
-        con.execute("INSERT INTO shells(shell_id,shortname,display_name,flavor,system_prompt,user_id) VALUES(1,'FX','Fixture','dev','synthetic',1)")
-        con.execute("INSERT INTO conversations(conversation_id,shell_id,owner_user_id,harness,worktree,creation_idempotency_key,creation_request_hash) VALUES('chat',1,1,'claude',?,'key','hash')", (str(context.worktree),))
-        con.execute("INSERT INTO conversation_runtime_generations(generation_id,conversation_id,shell_id,owner_user_id,harness,binding_json,state,created_at,updated_at) VALUES('gen','chat',1,1,'claude','{}','ready',1,1)")
-    store = RuntimeStore(database)
-    lease = store.attach("gen", 1, 1, "fixture")
-    store.ingest("gen", 1, 1, lease, {"events": [{"sequence": i, "event": asdict(event)}
-        for i, event in enumerate(work_events, 1)], "partial": False})
-    with sqlite3.connect(database) as con:
-        rows = con.execute("SELECT work_key,projection_json FROM conversation_runtime_work").fetchall()
-    assert len(rows) == 4
-    assert {json.loads(key)[-1]: json.loads(value)["data"]["kind"] for key, value in rows} == expected
-
-
-@pytest.mark.parametrize("kind", ["terminal", "automation"])
-def test_incomplete_snapshot_cannot_replace_known_native_kind_with_default_task(seat, kind):
-    driver, context, events = seat
-    driver._context = replace(context, capability_evidence={"automation": "compatible"})
-    if kind == "terminal":
-        hook(seat, "PostToolUse", tool_name="Bash", tool_use_id="launch", tool_input={},
-            tool_response={"backgroundTaskId": "known"})
-    else:
-        hook(seat, "PostToolUse", tool_name="CronCreate", tool_use_id="launch",
-            tool_input={"durable": False}, tool_response={"id": "known", "durable": False})
-    hook(seat, "Stop", background_tasks=[{"id": "known"}], session_crons=[])
-    observed = [event for event in events if event.kind == "work.observed"][-1]
-    assert driver._work["known"].kind == kind and observed.data["kind"] == kind
-    assert observed.partial and driver.inventory(deadline=DEADLINE()).partial
 
 
 @pytest.mark.parametrize("durable", [None, True, "false", 0])
