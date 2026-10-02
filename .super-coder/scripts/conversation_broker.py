@@ -361,6 +361,7 @@ class BrokerStore:
                     " AND active.chat_id=c.conversation_id "
                     "JOIN conversation_messages m ON m.message_id=o.message_id "
                     "WHERE o.state='pending' AND c.state='queued' "
+                    "AND c.runtime_mode='ephemeral' "
                     "AND NOT EXISTS ("
                     " SELECT 1 FROM conversation_events closing "
                     " WHERE closing.conversation_id=c.conversation_id "

@@ -54,6 +54,7 @@ from compose import compose_boot  # noqa: E402
 
 sys.path.insert(0, str(ENGINE / "scripts"))
 import artifact_policy  # noqa: E402
+import active_chat_registry  # noqa: E402
 import callable_floor  # noqa: E402
 import conversation_boot  # noqa: E402
 import db_driver  # noqa: E402
@@ -1115,6 +1116,8 @@ def open_db():
 def browser_conversation_active(con, shell_id: int) -> bool:
     """Does an open browser chat own this shell's single session slot?"""
     try:
+        if active_chat_registry.native_cleanup_pending(con, shell_id) is not None:
+            return True
         row = con.execute(
             "SELECT COUNT(*) FROM conversations WHERE shell_id=? "
             "AND state!='closed'",
@@ -1139,7 +1142,16 @@ def browser_conversation_shell_ids(con) -> set[int]:
         rows = con.execute(
             "SELECT DISTINCT shell_id FROM conversations WHERE state!='closed'"
         ).fetchall()
-        return {int(row[0]) for row in rows}
+        retained = {int(row[0]) for row in rows}
+        try:
+            native_shells = con.execute('SELECT DISTINCT shell_id FROM conversation_runtime_generations').fetchall()
+        except db_driver.OperationalError as exc:
+            if 'no such table: conversation_runtime_generations' not in str(exc):
+                raise
+            native_shells = []
+        retained.update(int(row[0]) for row in native_shells
+                        if active_chat_registry.native_cleanup_pending(con, int(row[0])) is not None)
+        return retained
     except db_driver.OperationalError as exc:
         if "no such table: conversations" in str(exc):
             return set()

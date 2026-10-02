@@ -7,8 +7,11 @@ replacement chat.
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from pathlib import Path
+
+import db_driver
 
 
 class ActiveChatError(RuntimeError):
@@ -17,6 +20,42 @@ class ActiveChatError(RuntimeError):
 
 class ActiveChatBusy(ActiveChatError):
     """The active chat owns queued or running work and cannot rotate."""
+
+
+def native_cleanup_pending(con, shell_id: int) -> str | None:
+    """Retain native ownership even if the API/registry link is absent.
+
+    Only the captured owner can attest unit exit and native obligations. A
+    lost/closed projection or an idle foreground turn does not release it.
+    Older floors without the additive table retain their original behavior.
+    """
+    try:
+        rows = con.execute(
+            "SELECT generation_id,cleanup_json FROM conversation_runtime_generations "
+            "WHERE shell_id=?", (shell_id,),
+        ).fetchall()
+    except db_driver.OperationalError as exc:
+        if 'no such table: conversation_runtime_generations' in str(exc):
+            return None
+        raise
+    for row in rows:
+        try:
+            cleanup = json.loads(row['cleanup_json'])
+        except (ValueError, TypeError):
+            return str(row['generation_id'])
+        if (not isinstance(cleanup, dict)
+                or cleanup.get('unit_verified_exited') is not True
+                or cleanup.get('outcome') != 'complete'
+                or cleanup.get('unresolved_work')
+                or cleanup.get('unresolved_definitions')):
+            return str(row['generation_id'])
+    return None
+
+
+def require_native_cleanup(con, shell_id: int) -> None:
+    generation = native_cleanup_pending(con, shell_id)
+    if generation is not None:
+        raise ActiveChatBusy(f'native generation {generation} has pending cleanup; Close and verify its owned work first')
 
 
 @dataclass(frozen=True)
@@ -70,6 +109,7 @@ def has_live_process(active: ActiveChat) -> bool:
 
 def close_active(con, shell_id: int) -> ActiveChat | None:
     """Close and unlink one shell's active chat inside the caller's write."""
+    require_native_cleanup(con, shell_id)
     active = get(con, shell_id)
     if active is None:
         return None
@@ -105,6 +145,7 @@ def close_for_displacement(
     allow_live_process: bool,
 ) -> ActiveChat | None:
     """Cancel queued work, then close and unlink a displaced active chat."""
+    require_native_cleanup(con, shell_id)
     active = get(con, shell_id)
     if active is None:
         return None
