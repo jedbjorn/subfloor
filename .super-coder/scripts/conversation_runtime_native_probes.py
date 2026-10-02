@@ -51,6 +51,7 @@ from conversation_runtime_contract import (
     WriteReceipt,
     payload_digest,
 )
+from conversation_runtime_controller import observed_claude_memory
 
 
 @dataclass(frozen=True)
@@ -524,11 +525,15 @@ class _Scenarios:
         policy = root.protocol.get("memory_policy", {}) if root else {}
         if not isinstance(policy, dict):
             policy = {}
-        memory = (policy.get("generate_memories") is False and policy.get("use_memories") is False
-                  and policy.get("feature_enabled") is False and policy.get("root_mode") == "disabled"
-                  if self.driver.harness == "codex" else False)
-        # Claude has no observed public effective-memory field. Its evidence
-        # level remains unresolved; a made-up disabled flag cannot admit input.
+        if self.driver.harness == "codex":
+            memory = (policy.get("generate_memories") is False and policy.get("use_memories") is False
+                      and policy.get("feature_enabled") is False and policy.get("root_mode") == "disabled")
+        elif self.driver.harness == "claude":
+            # D413 accepts this explicitly labelled configuration/source/owned
+            # hook inference. It does not assert native effective telemetry.
+            _, memory = observed_claude_memory(policy, self.owned.context, root)
+        else:
+            memory = False
         route = root.protocol.get("native_route", {}) if root else {}
         route_observed = (isinstance(route, dict) and route.get("model") == self.owned.context.model
                           and route.get("account_type") == "chatgpt"
