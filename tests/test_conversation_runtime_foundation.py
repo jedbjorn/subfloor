@@ -500,6 +500,20 @@ def test_async_readiness_cannot_admit_mismatched_or_failed_native_observation(co
     assert owner.handle(wire('close',command=control('close',1,action='close')))['outcome']=='complete'
 
 
+@pytest.mark.parametrize('model,state',[('selected','ready'),('other','unknown')])
+def test_initial_driver_ready_observation_uses_same_selected_route_gate(controller,model,state):
+    owner,driver=controller
+    owner.context=None;owner.identity=None;owner.ready=False
+    driver.start=lambda context,emit,deadline: DriverStart('ready',RuntimeIdentity('root','session',protocol={
+        'native_route':{'account_type':'chatgpt','model':model,'efforts':['high'],'additional':'unused'}}))
+    prepared=json.loads(json.dumps(dataclasses.asdict(dataclasses.replace(context(owner.root),model='selected',effort='high')),default=str))
+    result=owner.handle(wire('open',context=prepared))
+    assert result['state']==state and owner.ready==(state=='ready')
+    assert owner.identity.root_id=='root' and owner.identity.session_id=='session'
+    assert 'additional' not in owner.identity.protocol['native_route']
+    assert owner.handle(wire('close',command=control('close',1,action='close')))['outcome']=='complete'
+
+
 def test_startup_projection_binds_generation_binary_driver_and_preserves_close(tmp_path):
     database=tmp_path/'fixture.sqlite';con=sqlite3.connect(database)
     con.executescript('CREATE TABLE users(user_id INTEGER PRIMARY KEY); CREATE TABLE shells(shell_id INTEGER PRIMARY KEY); CREATE TABLE conversations(conversation_id TEXT PRIMARY KEY,shell_id INTEGER,owner_user_id INTEGER,state TEXT,harness TEXT,provider TEXT,model TEXT,effort TEXT,worktree TEXT); INSERT INTO users VALUES(1); INSERT INTO shells VALUES(1); INSERT INTO conversations(conversation_id,shell_id,owner_user_id,state,harness) VALUES("cv",1,1,"idle","claude");')

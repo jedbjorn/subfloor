@@ -78,6 +78,11 @@ def observed_native_route(value: Any) -> dict:
     return value
 
 
+def selected_route_matches(route: dict,context: RuntimeContext) -> bool:
+    return (route['account_type']==('chatgpt' if context.harness=='codex' else 'claude.ai')
+            and route['model']==context.model and context.effort in route['efforts'])
+
+
 def private_directory(root: Path) -> None:
     info = root.lstat()
     if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.geteuid() or stat.S_IMODE(info.st_mode) != 0o700:
@@ -356,8 +361,7 @@ class Controller:
             if event.kind == 'runtime.ready' and 'native_route' in event.data:
                 route = observed_native_route(event.data['native_route'])
                 if self.context:
-                    route_matches=(route['account_type']==('chatgpt' if self.context.harness=='codex' else 'claude.ai')
-                                   and route['model']==self.context.model and self.context.effort in route['efforts'])
+                    route_matches=selected_route_matches(route,self.context)
                 # Unknown future observation fields are omitted before journal
                 # persistence; they cannot invalidate demonstrated required data.
                 event=dataclasses.replace(event,data={**event.data,'native_route':route})
@@ -438,6 +442,13 @@ class Controller:
                         raise RuntimeContractError('RUNTIME_CLOSING' if self.journal.get('close') else 'DEADLINE_EXPIRED','native startup was fenced before its edge')
                     return self.driver.start(context,self.emit,deadline=deadline)
                 started = self.call(start_edge,deadline=deadline)
+                if started.identity and 'native_route' in started.identity.protocol:
+                    route=observed_native_route(started.identity.protocol['native_route'])
+                    identity=dataclasses.replace(started.identity,protocol={**started.identity.protocol,'native_route':route})
+                    started=dataclasses.replace(started,identity=identity)
+                    if started.state=='ready' and not selected_route_matches(route,context):
+                        started=dataclasses.replace(started,state='unknown',detail='NATIVE_ROUTE_INCONCLUSIVE',
+                                                    capabilities={**started.capabilities,'submission':'inconclusive'})
                 self.identity = started.identity
                 self.ready = started.state == "ready" and self.identity is not None and not self.journal.get('close')
                 if started.setup is not None and not self.journal.get('close'):
