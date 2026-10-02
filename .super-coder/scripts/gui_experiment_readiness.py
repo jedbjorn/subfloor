@@ -20,6 +20,44 @@ from conversation_boot import BootDirective, content_digest
 _LOCK=threading.Lock()
 
 
+def prepared_plan(*, database: Path, root: Path, conversation_id: str,
+                  shell_id: int, harness: str) -> run.LaunchPlan:
+    """Retrieve an existing synthetic conversation's canonical resume plan.
+
+    Call inside a fixture-isolated process after selecting the copied engine
+    and synthetic DB. The returned env/boot remain private ephemeral launch
+    inputs; neither belongs in public evidence. This does not launch a driver
+    or grant native startup consent or capability evidence.
+    """
+    if (harness not in {'codex','claude'} or shell_id not in {1,2}
+            or not conversation_id.startswith('cv_fixture_')
+            or run.ENGINE.resolve()!=root.resolve()/'.super-coder'
+            or database.resolve()!=root.resolve()/'.super-coder/shell_db.db'
+            or Path(run.DB_PATH).resolve()!=database.resolve()):
+        raise ValueError('canonical launcher is outside the synthetic fixture')
+    con=db_driver.connect(str(database))
+    try:
+        row=con.execute('SELECT c.*,s.user_id AS shell_owner FROM conversations c JOIN shells s ON s.shell_id=c.shell_id WHERE c.conversation_id=?',
+                        (conversation_id,)).fetchone()
+    finally:
+        con.close()
+    if (row is None or row['shell_id']!=shell_id or row['owner_user_id']!=1
+            or row['shell_owner']!=1 or row['harness']!=harness or row['state']=='closed'
+            or row['provider']!=run.session_provider(harness,row['model'])):
+        raise ValueError('synthetic conversation route or ownership differs')
+    worktree=Path(row['worktree']).resolve()
+    if root.resolve() not in worktree.parents:
+        raise ValueError('synthetic conversation worktree escaped fixture')
+    plan=run.prepare_launch(shell_id=shell_id,harness=harness,model=row['model'],effort=row['effort'],
+                            headless_prompt='fixture readiness; never dispatch',conversation_owned=True,
+                            boot=BootDirective(conversation_id,'resume'))
+    if (plan.argv or Path(plan.cwd).resolve()!=worktree or plan.harness!=harness
+            or plan.model!=row['model'] or plan.effort!=row['effort']
+            or plan.env.get('SC_SHELL_ID')!=str(shell_id)):
+        raise ValueError('canonical preparation differs from synthetic binding')
+    return plan
+
+
 def prepare(*,database: Path,root: Path,fixture_id: str,harness: str,shell_id: int | None=None) -> dict:
     shell_id = shell_id if shell_id is not None else (1 if harness=='codex' else 2)
     if harness not in {'codex','claude'} or shell_id not in {1,2}:
@@ -46,9 +84,7 @@ def prepare(*,database: Path,root: Path,fixture_id: str,harness: str,shell_id: i
                                 headless_prompt='fixture readiness; never dispatch',conversation_owned=True,
                                 boot=BootDirective(cid,'start'))
         first_digest=content_digest(plan.boot_content)
-        resumed=run.prepare_launch(shell_id=shell_id,harness=harness,model=model,effort=effort,
-                                   headless_prompt='fixture readiness; never dispatch',conversation_owned=True,
-                                   boot=BootDirective(cid,'resume'))
+        resumed=prepared_plan(database=database,root=root,conversation_id=cid,shell_id=shell_id,harness=harness)
         if content_digest(resumed.boot_content)!=first_digest or plan.argv or resumed.argv:
             raise ValueError('conversation boot binding or native-owned preparation changed')
         if plan.env.get('SC_API_BASE')!=f'http://127.0.0.1:{run.ports_mod.resolve()["port"]}' or plan.env.get('SC_SHELL_ID')!=str(shell_id):

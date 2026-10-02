@@ -426,3 +426,25 @@ def test_native_root_count_bound_and_symlink_parent_refused(seat):
     (root/'runtime').symlink_to(seat,target_is_directory=True)
     with pytest.raises(fixture.FixtureError,match='parent is unsafe'):
         supervisor.register('1'*32,'claude')
+
+
+def test_native_cleanup_removes_only_retained_socket_after_unit_exit(seat,monkeypatch):
+    monkeypatch.setattr(fixture,'native_endpoint',lambda fid,gid:seat/'n.sock')
+    record,root,receipt=marked(seat)
+    record['runtime']='experimental'
+    fixture.write_json(root/fixture.MARKER,fixture.identity(record));fixture.save(record,receipt)
+    native=fixture.NativeSupervisor(receipt).register('e'*32,'codex')
+    endpoint=Path(native['endpoint'])
+    monkeypatch.setattr(fixture,'native_unit_state',lambda _:missing_state())
+    with socket.socket(socket.AF_UNIX) as sock:
+        sock.bind(str(endpoint));endpoint.chmod(0o600)
+        info=endpoint.lstat()
+        native.update(endpoint_device=info.st_dev,endpoint_inode=info.st_ino)
+        fixture.stop_native_unit(record,native)
+        assert not endpoint.exists() and native['os_cleanup']['complete']
+    sentinel=seat/'unrelated';sentinel.write_text('retain')
+    endpoint.symlink_to(sentinel)
+    with pytest.raises(fixture.FixtureError,match='socket identity changed'):
+        fixture.stop_native_unit(record,native)
+    assert endpoint.is_symlink() and sentinel.read_text()=='retain' and root.exists()
+    endpoint.unlink()

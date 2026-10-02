@@ -301,6 +301,13 @@ def stop_native_unit(record: dict, native: dict) -> None:
         pids = cgroup_pids(cgroup)
         live = native.get("main_pid", 0) > 0 and process_start_ticks(native["main_pid"]) == native.get("main_pid_start_ticks")
         if state.get("ActiveState") in {"inactive", "failed"} and state.get("MainPID", "0") == "0" and not pids and not live:
+            endpoint=Path(native['endpoint'])
+            if endpoint.exists() or endpoint.is_symlink():
+                info=endpoint.lstat()
+                if (not stat.S_ISSOCK(info.st_mode) or info.st_uid!=os.geteuid()
+                        or (info.st_dev,info.st_ino)!=(native.get('endpoint_device'),native.get('endpoint_inode'))):
+                    raise FixtureError("CLEANUP_UNVERIFIED", "native socket identity changed; retaining fixture state")
+                endpoint.unlink()
             native["os_cleanup"] = {"complete":True,"cgroup_empty":True,"recorded_process_exited":True}
             return
         if time.monotonic() >= deadline:
@@ -400,7 +407,12 @@ class NativeSupervisor:
                 pid = int(state.get("MainPID", "0"))
                 ticks = process_start_ticks(pid)
                 if state.get("ActiveState") == "active" and ticks is not None and Path(native["endpoint"]).is_socket():
+                    endpoint_info=Path(native['endpoint']).lstat()
+                    if (not stat.S_ISSOCK(endpoint_info.st_mode) or endpoint_info.st_uid!=os.geteuid()
+                            or stat.S_IMODE(endpoint_info.st_mode)!=0o600):
+                        raise FixtureError("OWNERSHIP_INVALID", "native socket ownership differs")
                     native.update(status="active",main_pid=pid,main_pid_start_ticks=ticks,control_group=state.get("ControlGroup",""))
+                    native.update(endpoint_device=endpoint_info.st_dev,endpoint_inode=endpoint_info.st_ino)
                     save(record,self.receipt)
                     return native
                 if state.get("ActiveState") in {"inactive","failed"}:
