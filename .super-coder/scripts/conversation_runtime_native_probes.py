@@ -459,9 +459,14 @@ class _Scenarios:
             "initial_root_terminal_current": False, "initial_child_ancestry_current": False,
             "initial_child_active_turn_present": False, "observed_child_terminal_current": False,
             "root_tagged_pid_candidates": 0, "root_owned_pid_matches": 0,
-            "child_tagged_pid_candidates": 0, "child_owned_pid_matches": 0}
+            "child_tagged_pid_candidates": 0, "child_owned_pid_matches": 0,
+            "sibling_tagged_pid_candidates": 0, "sibling_owned_pid_matches": 0}
+        for role in ("root", "sibling", "child"):
+            self.work_observation.update({role+"_rejected_pid_output_records": 0,
+                                          role+"_pid_observation": "unobserved"})
         self._root_label: str | None = None
         self._child_label: str | None = None
+        self._sibling_label: str | None = None
         with driver._lock:
             driver._scenario = self
 
@@ -600,14 +605,37 @@ class _Scenarios:
             raise RuntimeContractError("PROBE_INVENTORY_PARTIAL", "complete owned snapshot required")
         return result
 
-    def _pid(self, label: str) -> ProcessIdentity | None:
+    def _pid(self, label: str, target: NativeWork) -> ProcessIdentity | None:
+        key = "root" if label == self._root_label else "child" if label == self._child_label else "sibling" if label == self._sibling_label else None
+        if key:
+            with self.driver._lock:
+                self.work_observation.update({key+"_tagged_pid_candidates": 0, key+"_owned_pid_matches": 0,
+                    key+"_rejected_pid_output_records": 0, key+"_pid_observation": "missing_terminal_output"})
         outputs: dict[tuple[Any, ...], list[str]] = {}
         parts: dict[tuple[Any, ...], dict[int, tuple[str, bool]]] = {}
         ambiguous: set[tuple[Any, ...]] = set()
+        rejected = 0
+        root = self.driver.identity
+        if (not root or target.kind != "terminal" or target.freshness != "current"
+                or target.grade in {"incompatible", "inconclusive"}
+                or target.reference.root_id != root.root_id or not target.reference.thread_id
+                or not target.reference.activity_id or not target.reference.item_id
+                or target.state not in {"running", "inProgress"}):
+            return None
         for event in self._events():
             ref = event.reference
             value = event.data.get("text")
-            if ref and event.kind in {"output.delta", "output.final"} and isinstance(value, str):
+            if not (event.kind in {"output.delta", "output.final"} and isinstance(value, str)):
+                continue
+            scope = bool(ref and all(getattr(ref, key) == getattr(target.reference, key)
+                for key in ("root_id", "thread_id", "parent_thread_id", "activity_id", "item_id"))
+                and all(getattr(ref, key) in {None, getattr(target.reference, key)}
+                    for key in ("work_id", "native_process_id")))
+            if (not scope or event.data.get("kind") != "terminal" or event.partial
+                    or event.freshness != "current" or event.grade in {"inconclusive", "incompatible"}):
+                rejected += bool(re.search(re.escape(label)+r"=(\d+)\b", value))
+                continue
+            if ref:
                 digest, part = event.data.get("text_digest"), event.data.get("part")
                 output_key = (ref.thread_id, ref.activity_id, ref.item_id, event.kind,
                               digest if isinstance(digest, str) else None)
@@ -627,10 +655,12 @@ class _Scenarios:
             if (output_key not in ambiguous and last_parts == [len(rows)-1]
                     and sorted(rows) == list(range(len(rows)))):
                 outputs[output_key] = [rows[part][0] for part in sorted(rows)]
+        # The fixed command prints a complete newline-terminated PID line.
+        # An unfinished delta cannot qualify before later digits arrive.
         # Distinct full-text records/turns/items cannot append digits to PIDs;
         # contiguous complete-record chunks reassemble and replay parts dedup.
         text = "\n".join("".join(chunks) for chunks in outputs.values())
-        matches = list(dict.fromkeys(re.findall(re.escape(label)+r"=(\d+)\b", text)))[:128]
+        matches = list(dict.fromkeys(re.findall(re.escape(label)+r"=([1-9]\d*)\r?\n", text)))[:128]
         callback = self.owned.process_identity
         identities = []
         if callback is not None:
@@ -638,12 +668,47 @@ class _Scenarios:
                 identity = callback(int(match))
                 if identity is not None and identity.pid == int(match):
                     identities.append(identity)
-        key = "root" if label == self._root_label else "child" if label == self._child_label else None
+        key = "root" if label == self._root_label else "child" if label == self._child_label else "sibling" if label == self._sibling_label else None
         if key:
             with self.driver._lock:
-                self.work_observation[key+"_tagged_pid_candidates"] = min(len(matches), 2048)
-                self.work_observation[key+"_owned_pid_matches"] = min(len(identities), 2048)
-        return identities[0] if identities else None
+                self.work_observation[key+"_tagged_pid_candidates"] = min(len(matches), 128)
+                self.work_observation[key+"_owned_pid_matches"] = min(len(identities), 128)
+                self.work_observation[key+"_rejected_pid_output_records"] = min(rejected, 128)
+                self.work_observation[key+"_pid_observation"] = (
+                    "matched" if len(identities) == 1 else "ambiguous" if len(identities) > 1
+                    else "no_owned_match" if matches else "missing_terminal_output")
+        return identities[0] if len(identities) == 1 else None
+
+    def _terminal_pid(self, label: str, thread: str) -> tuple[NativeWork, ProcessIdentity] | None:
+        # A current complete inventory qualifies the exact output item. An
+        # assistant echo or a stale/missing terminal cannot establish OS scope.
+        found = []
+        key = "root" if label == self._root_label else "child" if label == self._child_label else "sibling" if label == self._sibling_label else None
+        totals = {"tagged_pid_candidates": 0, "owned_pid_matches": 0, "rejected_pid_output_records": 0}
+        for work in self._inventory().work:
+            if work.kind == "terminal" and work.freshness == "current" and work.reference.thread_id == thread:
+                identity = self._pid(label, work)
+                if key:
+                    with self.driver._lock:
+                        for suffix in totals:
+                            totals[suffix] += self.work_observation[key+"_"+suffix]
+                if identity is not None:
+                    found.append((work, identity))
+        if key:
+            with self.driver._lock:
+                self.work_observation.update({key+"_"+suffix: min(count, 128) for suffix, count in totals.items()})
+                self.work_observation[key+"_pid_observation"] = (
+                    "matched" if len(found) == 1 else "ambiguous" if len(found) > 1
+                    else "no_owned_match" if totals["tagged_pid_candidates"] else "missing_terminal_output")
+        return found[0] if len(found) == 1 else None
+
+    @staticmethod
+    def _terminal_present(snapshot: NativeSnapshot, target: NativeWork) -> bool:
+        return any(work.kind == "terminal" and work.freshness == "current"
+            and work.state in {"running", "inProgress"} and work.grade not in {"incompatible", "inconclusive"}
+            and all(getattr(work.reference, key) == getattr(target.reference, key)
+                for key in ("root_id", "thread_id", "parent_thread_id", "activity_id", "item_id", "work_id", "native_process_id")
+                if getattr(target.reference, key) is not None) for work in snapshot.work)
 
     def _alive(self, process: ProcessIdentity) -> bool:
         callback = self.owned.process_identity
@@ -687,20 +752,21 @@ class _Scenarios:
         work_enabled = CAP_STOP_WORK in self.caps and "stop_work_terminal" in grants
         background = work_enabled or CAP_STOP_REPLY in self.caps
         root_label, child_label = "F89_ROOT_"+self.nonce, "F89_CHILD_"+self.nonce
-        self._root_label, self._child_label = root_label, child_label
+        sibling_label = "F89_SIBLING_"+self.nonce
+        self._root_label, self._child_label, self._sibling_label = root_label, child_label, sibling_label
         root_command = f"python -u -c 'import os,time;print(\"{root_label}=\"+str(os.getpid()),flush=True);time.sleep(105)'"
+        sibling_command = f"python -u -c 'import os,time;print(\"{sibling_label}=\"+str(os.getpid()),flush=True);time.sleep(110)'"
         child_command = f"python -u -c 'import os,time;print(\"{child_label}=\"+str(os.getpid()),flush=True);time.sleep(110)'"
         prompt = ("Authorized finite synthetic compatibility probe. Obey the no-memory boot. Never inspect "
                   "credentials/environment or unrelated files. Call managed browser fixture_identity and "
                   f"fixture_state with marker {self.nonce}. Remember nonce {self.nonce}. ")
         if background:
             prompt += f"Start exactly one background terminal running {root_command}, yield 1000ms. "
+            prompt += f"Start one additional independent root sibling background terminal running {sibling_command}, yield 1000ms. "
         if child_enabled:
             prompt += (f"Spawn exactly one native child inheriting this model/effort. It starts exactly one "
                        f"background terminal running {child_command}, yield 1000ms, then waits only on that "
                        "same terminal and reports output. No additional resources or agents. Do not wait for child. ")
-        if background and not child_enabled:
-            prompt += f"Start one additional sibling background terminal running {child_command}, yield 1000ms. "
         prompt += "Immediately reply READY plus the nonce and any observed tagged process IDs. No other tools/resources."
         try:
             self._phase("first_processing")
@@ -729,23 +795,16 @@ class _Scenarios:
                     initial_child_ancestry_current=bool(child and child.freshness == "current"),
                     initial_child_active_turn_present=bool(child and child.reference.activity_id))
             self._phase("root_tagged_pid")
-            root_pid = self._wait(lambda: self._pid(root_label)) if background else None
+            root_pid = sibling_pid = None
+            sibling_work = None
+            if background:
+                root_work, root_pid = self._wait(lambda: self._terminal_pid(root_label, root.root_id))
+                self._phase("sibling_tagged_pid")
+                sibling_work, sibling_pid = self._wait(lambda: self._terminal_pid(sibling_label, root.root_id))
+                if sibling_work.reference == root_work.reference or sibling_pid == root_pid:
+                    raise RuntimeContractError("PROBE_SIBLING_UNPROVED", "distinct owned root sibling required")
             child_terminal = None
             child_pid = None
-            if child_enabled:
-                self._phase("child_ancestry")
-                if child is None or not child.reference.activity_id:
-                    raise RuntimeContractError("PROBE_CHILD_UNPROVED", "owned child ancestry/current turn required")
-                self._phase("child_terminal")
-                child_terminal = self._wait(lambda: next((w for w in self._inventory().work if w.kind == "terminal" and w.freshness == "current"
-                    and w.reference.thread_id == child.reference.thread_id), None))
-                with self.driver._lock:
-                    self.work_observation["observed_child_terminal_current"] = child_terminal.freshness == "current"
-                self._phase("child_tagged_pid")
-                child_pid = self._wait(lambda: self._pid(child_label))
-            elif background:
-                self._phase("child_tagged_pid")
-                child_pid = self._wait(lambda: self._pid(child_label))
             if CAP_STOP_REPLY in self.caps:
                 self.stage = CAP_STOP_REPLY
                 self._phase("stop_reply")
@@ -758,9 +817,10 @@ class _Scenarios:
                 self._wait(lambda: self._control_completed(reply_control, target))
                 self._wait(lambda: self._terminal(stopped))
                 after = self._inventory()
-                if (not self._retained_root(root, after) or not self._alive(root_pid) or not any(w.reference.native_process_id == root_work.reference.native_process_id
-                        and w.reference.thread_id == root.root_id for w in after.work)
-                        or child_pid is not None and not self._alive(child_pid)):
+                if (not self._retained_root(root, after) or not self._alive(root_pid)
+                        or not self._terminal_present(after, root_work)
+                        or sibling_pid is None or not self._alive(sibling_pid)
+                        or sibling_work is None or not self._terminal_present(after, sibling_work)):
                     raise RuntimeContractError("PROBE_BACKGROUND_ISOLATION_BROKEN", "root interruption changed background ownership")
                 self.coverage[CAP_STOP_REPLY].update({"expected_activity", "terminal", "background_isolation"})
             if work_enabled and root_work is not None and root_pid is not None:
@@ -771,8 +831,10 @@ class _Scenarios:
                 self._wait(lambda: not self._alive(root_pid))
                 self._wait(lambda: not any(w.kind == "terminal" and w.reference.thread_id == root.root_id
                     and w.reference.native_process_id == root_work.reference.native_process_id for w in self._inventory().work))
-                if (not self._retained_root(root, self._inventory())
-                        or child_pid is not None and not self._alive(child_pid)):
+                after = self._inventory()
+                if (not self._retained_root(root, after)
+                        or sibling_pid is None or not self._alive(sibling_pid)
+                        or sibling_work is None or not self._terminal_present(after, sibling_work)):
                     raise RuntimeContractError("PROBE_SIBLING_ISOLATION_BROKEN", "terminal stop changed root/sibling")
                 if self.driver.harness == "claude":
                     self._wait(lambda: any(e.kind == "control.acknowledged" and e.control_id == terminal_control
@@ -783,10 +845,23 @@ class _Scenarios:
                     self.coverage[CAP_STOP_WORK].update({"native_TaskStop", "matched_success", "later_complete_snapshot"})
                 self.coverage[CAP_STOP_WORK].update({"owned_work", "terminal_outcome", "sibling_isolation",
                     "target:terminal", "terminal_identity"})
-            if child_enabled and child is not None and child_terminal is not None and child_pid is not None:
+            if child_enabled:
+                self.stage = "stop_work_child"
+                self._phase("child_ancestry")
+                child = next((w for w in self._inventory().work if w.kind == "child" and w.freshness == "current"
+                    and w.reference.parent_thread_id == root.root_id), None)
+                if child is None or not child.reference.activity_id:
+                    raise RuntimeContractError("PROBE_CHILD_UNPROVED", "owned child ancestry/current turn required")
+                self._phase("child_tagged_pid")
+                child_terminal, child_pid = self._wait(lambda: self._terminal_pid(child_label, child.reference.thread_id or ""))
+                with self.driver._lock:
+                    self.work_observation["observed_child_terminal_current"] = True
                 self.stage = "stop_work_child"
                 self._phase("stop_child")
-                fresh = next(w for w in self._inventory().work if w.kind == "child" and w.reference.thread_id == child.reference.thread_id)
+                fresh = next(w for w in self._inventory().work if w.kind == "child" and w.freshness == "current"
+                    and w.reference.root_id == root.root_id and w.reference.parent_thread_id == root.root_id
+                    and w.reference.thread_id == child.reference.thread_id
+                    and w.reference.activity_id == child.reference.activity_id)
                 child_control = self._control("stop_work", fresh.reference, fresh.reference.activity_id)
                 self._wait(lambda: self._control_completed(child_control, fresh.reference))
                 self._wait(lambda: not self._alive(child_pid))
@@ -794,8 +869,10 @@ class _Scenarios:
                     and e.reference.thread_id == child.reference.thread_id and e.reference.activity_id == fresh.reference.activity_id for e in self._events()))
                 self._wait(lambda: not any(w.kind == "terminal" and w.reference.thread_id == child.reference.thread_id
                     and w.reference.native_process_id == child_terminal.reference.native_process_id for w in self._inventory().work))
-                if not self._retained_root(root, self._inventory()):
-                    raise RuntimeContractError("PROBE_SIBLING_ISOLATION_BROKEN", "child stop changed root process/thread")
+                after = self._inventory()
+                if (not self._retained_root(root, after) or sibling_pid is not None and not self._alive(sibling_pid)
+                        or sibling_work is not None and not self._terminal_present(after, sibling_work)):
+                    raise RuntimeContractError("PROBE_SIBLING_ISOLATION_BROKEN", "child stop changed root process/thread/sibling")
                 self.coverage[CAP_STOP_WORK].update({"owned_work", "terminal_outcome", "sibling_isolation", "target:child",
                     "child_ancestry", "child_expected_activity", "child_interrupt_terminal", "child_scoped_terminal_cleanup"})
         except (RuntimeError, OSError, ValueError, StopIteration) as exc:
