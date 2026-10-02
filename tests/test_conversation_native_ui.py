@@ -209,4 +209,4 @@ def test_fresh_chromium_same_intent_check_discovery():
     assert result.returncode==0,result.stdout+result.stderr
     receipt=json.loads(result.stdout.strip().splitlines()[-1])
     assert receipt['native_processes']==0 and receipt['inference_turns']==0
-    assert receipt['cases']==['converge','immediate','error','expiry','selection','dispose','replacement','terminal_race']
+    assert receipt['cases']==['converge','immediate','error','expiry','selection','dispose','replacement','terminal_race','future_restore','malformed_restore','past_restore','rollback','reopen']

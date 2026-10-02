@@ -5088,6 +5088,7 @@ async function chatNativeNewForm(host, shell, config) {
   let selection = null, intent = null, result = null, checking = false, creating = false, observer = null, readInFlight = null, probeRefreshPending = false;
   const ownerReadController = chatReadController;
   let discoveryTimer = null, discoveryExpiry = null, discoveryStopped = null, discoveryNotice = null, readAbort = null;
+  let discoveryDeadline = performance.now() + CHAT_CHECK_DISCOVERY_MS;
   const alive = () => host.isConnected && form.isConnected && chatReadController === ownerReadController && !ownerReadController?.signal.aborted;
   const stopDiscovery = (cancelRead = false) => {
     clearTimeout(discoveryTimer); clearTimeout(discoveryExpiry);
@@ -5143,17 +5144,22 @@ async function chatNativeNewForm(host, shell, config) {
     clearTimeout(discoveryTimer); discoveryTimer = null;
     if (!discoveryPending() || discoveryStopped === intent) { stopDiscovery(); return; }
     const captured = intent;
-    if (!Number.isFinite(captured.discovery_expires_at)) {
-      captured.discovery_expires_at = Date.now() + CHAT_CHECK_DISCOVERY_MS; save();
+    const mountedLeft = Math.max(0, discoveryDeadline - performance.now());
+    const wallLeft = Number.isFinite(captured.discovery_expires_at)
+      ? captured.discovery_expires_at - Date.now() : CHAT_CHECK_DISCOVERY_MS;
+    const left = Math.min(CHAT_CHECK_DISCOVERY_MS, mountedLeft, wallLeft);
+    // Persistence is only a shorter remaining limit. Clock rollback or a
+    // malformed/restored expiry cannot extend this mounted monotonic budget.
+    if (!Number.isFinite(captured.discovery_expires_at) || wallLeft > mountedLeft) {
+      captured.discovery_expires_at = Date.now() + left; save();
     }
-    const left = captured.discovery_expires_at - Date.now();
     if (left <= 0) { expireDiscovery(captured); return; }
     if (!discoveryExpiry) discoveryExpiry = setTimeout(() => expireDiscovery(captured), left);
     if (readInFlight) return;
     discoveryTimer = setTimeout(() => {
       discoveryTimer = null;
       if (intent !== captured || !discoveryPending() || discoveryStopped === captured) return;
-      if (Date.now() >= captured.discovery_expires_at) { expireDiscovery(captured); return; }
+      if ((performance.now() >= discoveryDeadline || Date.now() >= captured.discovery_expires_at)) { expireDiscovery(captured); return; }
       refreshCheck({ discovering: true });
     }, Math.min(CHAT_CHECK_DISCOVERY_INTERVAL_MS, left));
   };
@@ -5182,7 +5188,7 @@ async function chatNativeNewForm(host, shell, config) {
       : `/conversations/native-checks?request_key=${encodeURIComponent(captured.key)}`;
     const job = chatRead(path, request.signal).then(async (value) => {
       if (intent !== captured || !alive() || request.signal.aborted) return;
-      if (discovering && Date.now() >= captured.discovery_expires_at) { expireDiscovery(captured); return; }
+      if (discovering && (performance.now() >= discoveryDeadline || Date.now() >= captured.discovery_expires_at)) { expireDiscovery(captured); return; }
       const oldProbe = result?.probe?.conversation_id;
       if (!accept(value)) return;
       if (value.probe?.conversation_id !== oldProbe) observeProbe();
@@ -5229,7 +5235,8 @@ async function chatNativeNewForm(host, shell, config) {
     } catch { /* Retain ambiguous creation or cleanup; no mutation replay. */ }
   };
   choice.onchange = () => {
-    stopDiscovery(true); probeRefreshPending = false; discoveryStopped = null; discoveryNotice = null;
+    stopDiscovery(true); discoveryDeadline = performance.now() + CHAT_CHECK_DISCOVERY_MS;
+    probeRefreshPending = false; discoveryStopped = null; discoveryNotice = null;
     observer?.close(); observer = null;
     const candidate = candidates[Number(choice.value)];
     selection = candidate && { harness: candidate.harness, model: candidate.model, effort: candidate.effort };
@@ -5246,7 +5253,8 @@ async function chatNativeNewForm(host, shell, config) {
   };
   check.onclick = async () => {
     if (check.disabled || !selection) return;
-    stopDiscovery(true); probeRefreshPending = false; discoveryStopped = null; discoveryNotice = null;
+    stopDiscovery(true); discoveryDeadline = performance.now() + CHAT_CHECK_DISCOVERY_MS;
+    probeRefreshPending = false; discoveryStopped = null; discoveryNotice = null;
     observer?.close(); observer = null; result = null;
     const captured = intent = { key: requestKey(), selection: { ...selection }, discovery_expires_at: Date.now() + CHAT_CHECK_DISCOVERY_MS };
     save(); checking = true; choice.disabled = true; paint();
