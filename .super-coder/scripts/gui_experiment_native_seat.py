@@ -79,7 +79,7 @@ class NativeFixtureSeat:
         scripts=self.root/'.super-coder/scripts'
         paths=[scripts/name for name in ('conversation_runtime_contract.py','conversation_runtime_controller.py',
                'conversation_runtime.py','conversation_runtime_checks.py','gui_experiment_native_seat.py',
-               'gui_experiment_probe_owner.py','conversation_runtime_native_probes.py','conversation_native_chats.py',
+               'gui_experiment_probe_owner.py','gui_experiment_runtime.py','conversation_runtime_native_probes.py','conversation_native_chats.py',
                'gui_experiment_readiness.py','conversation_boot.py','run.py','route_transport.py',
                'execution_view.py','execution_view_exec.py')]
         paths.extend([scripts/'conversation_adapters'/f'{harness}_runtime.py',

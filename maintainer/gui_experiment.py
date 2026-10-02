@@ -890,6 +890,9 @@ def serve(root: Path, *, resume: bool=False) -> int:
     base_dispatch = server.dispatch_http
 
     def dispatch(method: str, path: str, headers_raw: str, body: bytes) -> tuple:
+        if path == '/api/experiment-native-check' and trusted['runtime']=='experimental':
+            import gui_experiment_runtime
+            return gui_experiment_runtime.handle_check(method,headers_raw,body)
         if path.startswith("/mcp/"):
             import gui_experiment_readiness
             return gui_experiment_readiness.mcp_response(method=method,path=path,body=body,
