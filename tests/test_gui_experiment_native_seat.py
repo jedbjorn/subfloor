@@ -28,9 +28,13 @@ def seat(tmp_path,monkeypatch):
     con.execute("INSERT INTO users(user_id,username) VALUES(1,'fixture')")
     con.execute("INSERT INTO shells(shell_id,shortname,display_name,flavor,system_prompt,user_id) VALUES(1,'FX','Fixture','dev','synthetic',1)")
     binding={'contract_version':2,'control_state':'controlled','harness':'codex','requested_model':'gpt-6.1-sol','provider_model':'gpt-6.1-sol','requested_effort':'high','effective_effort':'high','native_variant_id':None,'transport':'codex-reasoning-config','catalogue_generation':'a'*32,'evidence_digest':'b'*64,'selector_binding':{'experimental_native':True},'adapter_metadata':{}}
-    worktree=tmp_path/'worktree';worktree.mkdir()
+    worktree=tmp_path/'.sc-worktrees/fx';worktree.mkdir(parents=True)
     con.execute("INSERT INTO conversations(conversation_id,shell_id,owner_user_id,harness,provider,model,effort,worktree,creation_idempotency_key,creation_request_hash,runtime_mode,route_contract_version,route_binding) VALUES('cv',1,1,'codex','openai','gpt-6.1-sol','high',?,'key','hash','native_experiment',2,?)",(str(worktree),json.dumps(binding)));con.commit();con.close()
     shutil.copytree(ROOT/'.super-coder/scripts',engine/'scripts',ignore=shutil.ignore_patterns('__pycache__'))
+    (engine/'api').mkdir()
+    shutil.copyfile(ROOT/'.super-coder/api/route_bindings.py',engine/'api/route_bindings.py')
+    shutil.copytree(ROOT/'.super-coder/adapters/codex',engine/'adapters/codex')
+    shutil.copyfile(ROOT/'maintainer/gui_experiment.py',tmp_path/'fixture_bootstrap.py')
     binary=tmp_path/'native-binary';binary.write_bytes(b'executable fixture')
     monkeypatch.setattr(run,'ENGINE',engine);monkeypatch.setattr(run,'DB_PATH',str(database))
     events=[]
@@ -69,11 +73,12 @@ def test_fixed_context_registers_before_canonical_boot_and_never_unmasks_server_
     assert fingerprint.implementation_digest==value.implementation_digest('codex')
 
 
-def test_source_change_invalidates_fingerprint_without_dynamic_owner_ids(seat):
+@pytest.mark.parametrize('source',['conversation_adapters/codex_runtime.py','gui_experiment_readiness.py','conversation_boot.py','run.py'])
+def test_source_change_invalidates_fingerprint_without_dynamic_owner_ids(seat,source):
     value,_,_=seat
     initial=value.implementation_digest('codex')
     settings=value.settings_digest('codex')
-    path=value.root/'.super-coder/scripts/conversation_adapters/codex_runtime.py'
+    path=value.root/'.super-coder/scripts'/source
     path.write_text(path.read_text()+'\n# different source identity\n')
     assert value.implementation_digest('codex')!=initial
     assert value.settings_digest('codex')==settings
@@ -84,3 +89,19 @@ def test_changed_canonical_policy_stays_inconclusive_without_native_launch(seat,
     monkeypatch.setattr(run,'load_adapter',lambda harness:{'launch_flags':['--ask-for-approval','on-request']})
     with pytest.raises(RuntimeContractError) as raised:value.prepare('cv','generation')
     assert raised.value.code=='PERMISSION_INCONCLUSIVE'
+
+
+@pytest.mark.parametrize('alias',['leaf','parent'])
+def test_external_worktree_alias_is_rejected_before_registration_or_boot_writes(seat,tmp_path,alias):
+    value,events,_=seat
+    external=tmp_path.parent/(tmp_path.name+'-external');external.mkdir()
+    selected=value.root/'.sc-worktrees/fx'
+    if alias=='leaf':
+        selected.rmdir();selected.symlink_to(external,target_is_directory=True)
+    else:
+        selected.rmdir();selected.parent.rmdir();selected.parent.symlink_to(external,target_is_directory=True)
+        (external/'fx').mkdir()
+    with pytest.raises(RuntimeContractError) as raised:value.prepare('cv','generation')
+    assert raised.value.code=='WORKTREE_INVALID'
+    assert events==[]
+    assert list((external/'fx' if alias=='parent' else external).iterdir())==[]
