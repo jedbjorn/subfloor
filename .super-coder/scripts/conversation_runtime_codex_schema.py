@@ -34,10 +34,11 @@ REQUEST_FIELDS = {
     'model/list': {'cursor': 'string', 'limit': 'integer', 'includeHidden': 'boolean'},
     'config/read': {'cwd': 'string', 'includeLayers': 'boolean'},
     'thread/start': {'model': 'string', 'cwd': 'string', 'developerInstructions': 'string',
-                     'approvalPolicy': 'string', 'sandbox': 'string', 'config': 'object'},
+                     'approvalPolicy': 'string', 'sandbox': 'string', 'config': 'object',
+                     'modelProvider': 'string', 'allowProviderModelFallback': 'boolean'},
     'thread/memoryMode/set': {'threadId': 'string', 'mode': 'string'},
     'turn/start': {'threadId': 'string', 'input': 'array', 'input.*.@text.text': 'string',
-                   'input.*.@text.text_elements': 'array', 'model': 'string', 'effort': 'string'},
+                   'input.*.@text.text_elements': 'array', 'input.*.@text.type': 'string', 'model': 'string', 'effort': 'string'},
     'thread/read': {'threadId': 'string', 'includeTurns': 'boolean'},
     'thread/list': {'ancestorThreadId': 'string', 'sourceKinds': 'array', 'useStateDbOnly': 'boolean',
                     'limit': 'integer', 'cursor': 'string'},
@@ -122,7 +123,7 @@ def _options(node: Any, root: Mapping[str, Any], depth: int = 0) -> list[Mapping
     return [node]
 
 
-def _field(node: Any, path: str, root: Mapping[str, Any]) -> dict[str, Any]:
+def _nodes(node: Any, path: str, root: Mapping[str, Any]) -> list[Mapping[str, Any]]:
     nodes = _options(node, root)
     for part in path.split('.') if path else ():
         found = []
@@ -140,6 +141,11 @@ def _field(node: Any, path: str, root: Mapping[str, Any]) -> dict[str, Any]:
             if child is not None:
                 found.extend(_options(child, root))
         nodes = found
+    return nodes
+
+
+def _field(node: Any, path: str, root: Mapping[str, Any]) -> dict[str, Any]:
+    nodes = _nodes(node, path, root)
     types: set[str] = set()
     enums: set[str] = set()
     for item in nodes:
@@ -172,6 +178,27 @@ def _methods(document: Mapping[str, Any]) -> dict[str, Any]:
                 if isinstance(name, str) and name in REQUEST_FIELDS.keys() | EVENT_FIELDS.keys():
                     result[name] = properties.get('params', {})
     return result
+
+
+def _supplied_inputs(params: Any, method: str, root: Mapping[str, Any]) -> bool:
+    objects: dict[str, set[str]] = {'': set(PROVIDED_INPUTS[method])}
+    for path in REQUEST_FIELDS[method]:
+        parts = path.split('.')
+        for index, part in enumerate(parts):
+            if part == '*' or part.startswith('@'):
+                continue
+            prefix = '.'.join(parts[:index])
+            objects.setdefault(prefix, set()).add(part)
+    if method == 'thread/start':
+        objects['config'] = {'features.memories', 'memories.generate_memories', 'memories.use_memories'}
+    for path, provided in objects.items():
+        for item in _nodes(params, path, root):
+            names = item.get('required', [])
+            if not isinstance(names, list) or not all(isinstance(name, str) for name in names):
+                raise SchemaUnavailable('invalid native required fields')
+            if not set(names) <= provided:
+                return False
+    return True
 
 
 def _project_field(node: Any, path: str, root: Mapping[str, Any]) -> dict[str, Any]:
@@ -239,14 +266,12 @@ def project_codex_schema(directory: Path, executable: ExecutableBinding, *, effo
             if method not in request_methods:
                 continue
             params = request_methods[method]
-            required: set[str] = set()
-            for item in _options(params, requests):
-                names = item.get('required', [])
-                if not isinstance(names, list) or not all(isinstance(name, str) for name in names):
-                    raise SchemaUnavailable('invalid native required fields')
-                required.update(names)
-            observed['requests'][method] = {'fields': {path: _project_field(params, path, requests) for path in fields},
-                'required_inputs_satisfied': required <= PROVIDED_INPUTS[method]}
+            try:
+                supplied = _supplied_inputs(params, method, requests)
+                observed['requests'][method] = {'fields': {path: _project_field(params, path, requests) for path in fields},
+                    'required_inputs_satisfied': supplied}
+            except SchemaUnavailable:
+                observed['requests'][method] = {'unavailable': True}
         for method, name in RESPONSE_FILES.items():
             document = read(name)
             fields = RESULT_FIELDS[method] | (CHILD_FIELDS if method == 'thread/list' else {})
@@ -269,6 +294,8 @@ def project_codex_schema(directory: Path, executable: ExecutableBinding, *, effo
                         and 'enum' in observed.get('requests', {}).get('turn/start', {}).get('fields', {}).get('effort', {})):
                     requirement['requests']['turn/start']['fields']['effort']['enum'] = [effort]
             requirement['requests']['thread/memoryMode/set']['fields']['mode']['enum'] = ['disabled']
+            requirement['requests']['thread/start']['fields']['approvalPolicy']['enum'] = ['never']
+            requirement['requests']['thread/start']['fields']['sandbox']['enum'] = ['danger-full-access']
             if cap == 'stop_work':
                 requirement['events'].update({'item/commandExecution/outputDelta': _required(EVENT_FIELDS['item/commandExecution/outputDelta']),
                                                'item/completed': _required(TERMINAL_FIELDS)})
@@ -280,6 +307,8 @@ def project_codex_schema(directory: Path, executable: ExecutableBinding, *, effo
                                          'thread/read': _required({'thread.status.type': 'string', 'thread.canAcceptDirectInput': 'boolean'})},
                              'events': {'item/completed': _required(CHILD_ITEM_FIELDS)}}
         child_requirement['requests']['thread/memoryMode/set']['fields']['mode']['enum'] = ['disabled']
+        child_requirement['requests']['thread/start']['fields']['approvalPolicy']['enum'] = ['never']
+        child_requirement['requests']['thread/start']['fields']['sandbox']['enum'] = ['danger-full-access']
         child_requirement['results'].update({m: _required(RESULT_FIELDS[m]) for m in START_METHODS if m in RESULT_FIELDS})
         requirements['stop_work_child'] = child_requirement
         diagnostics = tuple(Diagnostic(cap, 'inconclusive' if _unavailable_consumed(observed, required) else 'incompatible',
