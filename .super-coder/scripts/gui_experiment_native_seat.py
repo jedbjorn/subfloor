@@ -145,6 +145,7 @@ class NativeFixtureSeat:
                                 (conversation_id,generation_id)).fetchone()
                 if (not probe_capabilities or 'submission' not in probe_capabilities
                         or json.loads(row['runtime_projection']).get('role')!='probe'
+                        or json.loads(row['runtime_projection']).get('generation_id')!=generation_id
                         or json.loads(row['runtime_projection']).get('state') in {'closing','closed','preparation_inconclusive'}
                         or job is None or job['status']!='preparing' or job['deadline']<=time.time()
                         or job['fingerprint_key']!=binding['evidence_digest']):

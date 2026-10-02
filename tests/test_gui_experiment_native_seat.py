@@ -103,12 +103,12 @@ def test_pending_route_cannot_prepare_an_ordinary_chat_or_unregistered_probe(sea
 
 
 @pytest.mark.parametrize('seat',['pending'],indirect=True)
-@pytest.mark.parametrize('wrong',['expired','foreign_generation','foreign_fingerprint','closing'])
+@pytest.mark.parametrize('wrong',['expired','foreign_generation','foreign_fingerprint','replaced_projection','closing'])
 def test_pending_candidate_job_must_match_unexpired_open_generation(seat,wrong):
     import time
     value,events,_=seat
     con=sqlite3.connect(value.database)
-    projection={'role':'probe','state':'closing' if wrong=='closing' else 'preparing','generation_id':'generation'}
+    projection={'role':'probe','state':'closing' if wrong=='closing' else 'preparing','generation_id':'replacement' if wrong=='replaced_projection' else 'generation'}
     con.execute('UPDATE conversations SET runtime_projection=?',(json.dumps(projection),))
     con.execute('INSERT INTO conversation_runtime_probe_jobs VALUES(?,?,?,\'preparing\',?,?)',
                 ('c'*64 if wrong=='foreign_fingerprint' else 'b'*64,'cv','other' if wrong=='foreign_generation' else 'generation',time.time()+(-1 if wrong=='expired' else 30),time.time()))

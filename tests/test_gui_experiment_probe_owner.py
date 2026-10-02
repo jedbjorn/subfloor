@@ -118,6 +118,55 @@ def test_close_during_canonical_prepare_fences_generation_and_launch(owner):
     assert con.execute('SELECT COUNT(*) FROM conversation_runtime_generations').fetchone()[0]==1 # unrelated retained g only
     probe=con.execute('SELECT runtime_projection FROM conversations WHERE conversation_id!=\'cv\'').fetchone()
     assert json.loads(probe[0])['state']=='closing'
+    assert value.cleanup(fingerprint,time.monotonic()+10).complete
+    assert con.execute('SELECT status FROM conversation_runtime_probe_jobs').fetchone()[0]=='complete'
+
+
+def test_git_failure_before_native_register_releases_job_with_never_launched_proof(owner,monkeypatch):
+    value,fingerprint,con,_=owner
+    def failed_git(*args,**kwargs): raise OSError('synthetic Git failure')
+    monkeypatch.setattr('gui_experiment_probe_owner.subprocess.run',failed_git)
+    with pytest.raises(OSError):value.allocate(fingerprint,frozenset({'submission'}),time.monotonic()+30)
+    assert value.cleanup(fingerprint,time.monotonic()+10).complete
+    assert con.execute('SELECT status FROM conversation_runtime_probe_jobs').fetchone()[0]=='complete'
+    assert con.execute("SELECT state FROM conversations WHERE conversation_id!='cv'").fetchone()[0]=='closed'
+
+
+def test_empty_finished_allocation_cleanup_allows_prerequisite_recovery(owner,monkeypatch):
+    value,fingerprint,_,events=owner
+    identity=value.seat.supervisor.preparation_identity
+    def missing(): raise RuntimeContractError('OWNERSHIP_INVALID','temporary fixture API not ready')
+    monkeypatch.setattr(value.seat.supervisor,'preparation_identity',missing)
+    with pytest.raises(RuntimeContractError):value.allocate(fingerprint,frozenset({'submission'}),time.monotonic()+30)
+    assert value.cleanup(fingerprint,time.monotonic()+10).complete
+    monkeypatch.setattr(value.seat.supervisor,'preparation_identity',identity)
+    probe=value.allocate(fingerprint,frozenset({'submission'}),time.monotonic()+30)
+    assert probe.registered and events==['git','prepare','launch']
+
+
+def test_empty_cleanup_cannot_release_inflight_allocation(owner,monkeypatch):
+    import threading
+    value,fingerprint,con,events=owner
+    entered,release=threading.Event(),threading.Event()
+    identity=value.seat.supervisor.preparation_identity
+    def blocked_identity():
+        entered.set();assert release.wait(3)
+        return identity()
+    monkeypatch.setattr(value.seat.supervisor,'preparation_identity',blocked_identity)
+    errors=[]
+    def allocate():
+        try:value.allocate(fingerprint,frozenset({'submission'}),time.monotonic()+30)
+        except RuntimeContractError as exc:errors.append(exc.code)
+    worker=threading.Thread(target=allocate);worker.start()
+    try:
+        assert entered.wait(2)
+        assert not value.cleanup(fingerprint,time.monotonic()+10).complete
+        release.set();worker.join(3)
+        assert errors==['PROBE_ALLOCATION_FENCED'] and not events
+        assert con.execute('SELECT COUNT(*) FROM conversation_runtime_probe_jobs').fetchone()[0]==0
+        assert value.cleanup(fingerprint,time.monotonic()+10).complete
+    finally:
+        release.set();worker.join(3)
 
 
 def test_probe_role_refuses_ordinary_input_even_with_cached_submission(owner,monkeypatch):

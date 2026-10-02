@@ -149,6 +149,8 @@ class NativeChatsService:
                     if cid in self.starting or len(self.starting)>=2:
                         continue
                     runtime=json.loads(chat['runtime_projection'])
+                    if runtime.get('role')=='probe':
+                        continue # The finite checker alone owns probe startup.
                     if runtime.get('state') in {'preparation_inconclusive','lost','closing'}:
                         if runtime.get('state')=='closing' and runtime.get('preparation_owner'):
                             self.recover_preparation(cid,runtime)
