@@ -333,9 +333,9 @@ class ClaudeRuntimeDriver(RuntimeDriver):
                     os.close(self._master)
                     self._master = None
                 return DriverStart("unavailable", self._identity, str(exc), self._capabilities())
-            while not self._ready and not self._lost and not self._startup_setup and time.monotonic() < deadline:
+            while not self._ready and not self._lost and not self._closing and not self._startup_setup and time.monotonic() < deadline:
                 self._condition.wait(min(0.1, max(0, deadline - time.monotonic())))
-            if self._startup_setup and not self._lost:
+            if self._startup_setup and not self._lost and not self._closing:
                 return DriverStart("needs_consent", self._identity,
                     "Explicit operator enablement of this captured local channel is required.",
                     self._capabilities(), setup=self._startup_setup)
@@ -597,7 +597,8 @@ class ClaudeRuntimeDriver(RuntimeDriver):
             return {"accepted": True}
 
     def _maybe_ready(self) -> None:
-        if self._session_started and self._channel_peer and not self._readiness_queued and self._allowed("submission"):
+        if (not self._closing and not self._lost and self._session_started and self._channel_peer
+                and not self._readiness_queued and self._allowed("submission")):
             # A generation-specific processed native challenge establishes the
             # route after controlled consent. Cached grades/descriptors do not.
             assert self._context
@@ -925,7 +926,7 @@ class ClaudeRuntimeDriver(RuntimeDriver):
         if not self._snapshot_partial and activity.automation_id and scheduled and scheduled.state == "absent_from_snapshot" and scheduled.durable is False and scheduled.data.get("recurring") is False:
             self._definitions.pop(activity.automation_id, None)
             self._work_terminal(activity.automation_id, "completed", "claude:oneshot-snapshot+native-terminal")
-        if (prompt_id == self._readiness_prompt and not self._ready and not self._lost and not self._policy_changed
+        if (prompt_id == self._readiness_prompt and not self._ready and not self._lost and not self._closing and not self._policy_changed
                 and status == "completed" and activity.readiness_reply
                 and provenance == "claude:owned-transcript-turn_duration"):
             self._ready = True
@@ -1006,6 +1007,8 @@ class ClaudeRuntimeDriver(RuntimeDriver):
     def cleanup(self, *, deadline: float) -> NativeCleanup:
         with self._condition:
             self._closing = True
+            self._withdraw_setup("Close fenced the previous finite startup choice")
+            self._condition.notify_all()
             # Pending and already-granted channel writes remain ambiguous; no
             # replay or processing success follows from cancellation on Close.
             self._notifications.clear()
