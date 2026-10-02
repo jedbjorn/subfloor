@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import dataclasses
+import json
 import sqlite3
 import sys
 import threading
@@ -495,3 +496,26 @@ def test_lost_generation_replacement_waits_for_os_and_definition_cleanup(tmp_pat
         store.reserve(replacement,{})
     store.state('g',1,1,'lost',{'outcome':'complete','unit_verified_exited':True})
     assert store.reserve(replacement,{})=='new'
+
+
+@pytest.mark.parametrize('boundary',['before_open','queued_native_edge'])
+def test_close_before_first_native_start_fences_open(controller,tmp_path,monkeypatch,boundary):
+    owner,driver=controller
+    owner.context=None;owner.identity=None;owner.ready=False
+    starts=[]
+    def start(context,emit,*,deadline):
+        starts.append(context.generation_id)
+        return DriverStart('ready',RuntimeIdentity('root'))
+    monkeypatch.setattr(driver,'start',start)
+    if boundary=='before_open':
+        assert owner.handle(wire('close',command=control('close',1,action='close')))['outcome']=='complete'
+    else:
+        def queued_edge(function,*,deadline,**fields):
+            owner.journal.reserve_command('close',1,'c'*64,'control',closing=True)
+            return function()
+        monkeypatch.setattr(owner,'call',queued_edge)
+    with pytest.raises(RuntimeContractError) as raised:
+        owner.handle(wire('open',context=json.loads(json.dumps(dataclasses.asdict(context(tmp_path)),default=str))))
+    assert raised.value.code=='RUNTIME_CLOSING'
+    assert starts==[] and owner.ready is False
+    assert owner.handle(wire('status'))['closing'] is True

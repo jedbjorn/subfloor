@@ -365,6 +365,8 @@ class Controller:
         if op == "open":
             with self.admission(self.dispatch_lock,deadline):
                 self.journal.check_lease(str(value.get("consumer","")),int(value.get("fence",0)))
+                if self.journal.get('close'):
+                    raise RuntimeContractError('RUNTIME_CLOSING','Close fences subsequent native startup')
                 if self.context is not None:
                     if payload_digest(value["context"]) != self.context_digest:
                         raise RuntimeContractError("GENERATION_CONFLICT", "prepared generation binding changed")
@@ -378,7 +380,12 @@ class Controller:
                 # this set or the full environment in the journal/receipt.
                 self.journal.secrets = tuple(v for k,v in context.env.items() if v and any(
                     s in k.upper() for s in ("TOKEN","SECRET","API_KEY","PASSWORD","CREDENTIAL","AUTHORIZATION")))
-                started = self.call(lambda:self.driver.start(context,self.emit,deadline=deadline),deadline=deadline)
+                def start_edge():
+                    self.journal.check_lease(str(value.get('consumer','')),int(value.get('fence',0)))
+                    if self.journal.get('close') or time.monotonic()>=deadline:
+                        raise RuntimeContractError('RUNTIME_CLOSING' if self.journal.get('close') else 'DEADLINE_EXPIRED','native startup was fenced before its edge')
+                    return self.driver.start(context,self.emit,deadline=deadline)
+                started = self.call(start_edge,deadline=deadline)
                 self.identity = started.identity
                 self.ready = started.state == "ready" and self.identity is not None and not self.journal.get('close')
                 if started.setup is not None and not self.journal.get('close'):
