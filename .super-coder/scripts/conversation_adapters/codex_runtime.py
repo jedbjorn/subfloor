@@ -274,8 +274,9 @@ class CodexRuntimeDriver(RuntimeDriver):
         self._parents: dict[str, str | None] = {}
         self._active: dict[str, str | None] = {}
         self._activity_revision: dict[str, int] = {}
+        self._uncertain_activity: set[str] = set()
         self._turn_status: dict[tuple[str, str], str] = {}
-        self._requests: dict[str, NativeSubmission] = {}
+        self._requests: dict[tuple[str, str], NativeSubmission] = {}
         self._pending_submission: NativeSubmission | None = None
         self._unbound: list[Mapping[str, Any]] = []
         self._foreign_pending: list[Mapping[str, Any]] = []
@@ -297,7 +298,7 @@ class CodexRuntimeDriver(RuntimeDriver):
     def _event(self, kind: str, reference: NativeReference | None = None, *,
                provenance: str, data: Mapping[str, Any] | None = None,
                control_id: str | None = None, partial: bool = False) -> None:
-        command = self._requests.get(reference.activity_id or "") if reference else None
+        command = self._requests.get((reference.thread_id or "", reference.activity_id or "")) if reference else None
         self._emit(RuntimeEvent(kind, reference=reference, request_id=command.request_id if command else None,
                                 control_id=control_id, source=command.source if command else "system",
                                 provenance=provenance, freshness="stale" if self._lost else "current",
@@ -329,6 +330,9 @@ class CodexRuntimeDriver(RuntimeDriver):
             return DriverStart("unavailable", detail="prepared provider has no demonstrated subscription route")
         if not context.model or not context.boot_content:
             return DriverStart("unavailable", detail="prepared native model and boot content are required")
+        if (context.driver_revision != self.revision
+                or hashlib.sha256(context.boot_content.encode()).hexdigest() != context.boot_digest):
+            return DriverStart("unavailable", detail="prepared driver/boot binding differs")
         try:
             executable = context.executable.path
             if (not executable.is_absolute() or executable.resolve() != executable
@@ -397,7 +401,8 @@ class CodexRuntimeDriver(RuntimeDriver):
             return WriteReceipt("not_written", detail="primary submission slot unavailable")
         try:
             with self._lock:
-                if self._active.get(self._root) or self._pending_submission is not None:
+                if (self._active.get(self._root) or self._root in self._uncertain_activity
+                        or self._pending_submission is not None):
                     return WriteReceipt("rejected", detail="native primary activity must be reconciled")
                 self._pending_submission = command
             assert self._context is not None
@@ -414,7 +419,7 @@ class CodexRuntimeDriver(RuntimeDriver):
                 if not turn_id:
                     raise RpcError("NATIVE_SHAPE_INVALID", "turn/start returned no turn identity")
                 with self._lock:
-                    self._requests[turn_id] = command
+                    self._requests[(self._root, turn_id)] = command
                     self._active[self._root] = turn_id
                     self._activity_revision[self._root] = self._activity_revision.get(self._root, 0) + 1
                     self._pending_submission = None
@@ -427,9 +432,9 @@ class CodexRuntimeDriver(RuntimeDriver):
                     for old in tuple(self._requests):
                         if len(self._requests) <= MAX_TRACKED:
                             break
-                        if self._turn_status.get((self._root, old)) in TURN_TERMINALS:
+                        if self._turn_status.get(old) in TURN_TERMINALS:
                             self._requests.pop(old)
-                            self._turn_status.pop((self._root, old), None)
+                            self._turn_status.pop(old, None)
                     # A response alone does not manufacture processing.
                 return WriteReceipt("written", True, turn_id)
             except (RuntimeContractError, OSError) as exc:
@@ -467,7 +472,7 @@ class CodexRuntimeDriver(RuntimeDriver):
             if method in {"turn/started", "turn/completed"} and (not turn or not isinstance(nested, dict)):
                 self._loss("required native turn identity missing")
                 return
-            if (thread == self._root and turn and turn not in self._requests
+            if (thread == self._root and turn and (thread, turn) not in self._requests
                     and self._pending_submission is not None and not unbound):
                 if len(self._unbound) >= MAX_PENDING_EVENTS:
                     self._loss("submission correlation buffer exceeded bound")
@@ -497,7 +502,10 @@ class CodexRuntimeDriver(RuntimeDriver):
             elif method in {"item/agentMessage/delta", "item/commandExecution/outputDelta"}:
                 text = params.get("delta")
                 if isinstance(text, str):
-                    self._output("output.delta", replace(ref, item_id=_string(params.get("itemId"))), text, provenance)
+                    item_id = _string(params.get("itemId"))
+                    bound_turn = _string(params.get("turnId"))
+                    self._output("output.delta", self._reference(thread, bound_turn, item=item_id), text, provenance,
+                                 partial=not bound_turn or not item_id)
             elif method in {"item/started", "item/completed"}:
                 self._item(thread, turn, params.get("item"), completed=method == "item/completed", provenance=provenance)
             elif "id" in raw:
@@ -505,9 +513,9 @@ class CodexRuntimeDriver(RuntimeDriver):
                             data={"capability": "native_request_response", "state": "unavailable",
                                   "native_request_id": raw["id"]}, partial=True)
 
-    def _output(self, kind: str, ref: NativeReference, text: str, provenance: str) -> None:
+    def _output(self, kind: str, ref: NativeReference, text: str, provenance: str, *, partial: bool = False) -> None:
         for offset in range(0, max(1, len(text)), 4096):
-            self._event(kind, ref, provenance=provenance,
+            self._event(kind, ref, provenance=provenance, partial=partial,
                         data={"text": text[offset:offset + 4096], "offset": offset,
                               "complete": offset + 4096 >= len(text)})
 
@@ -639,12 +647,30 @@ class CodexRuntimeDriver(RuntimeDriver):
                             or (turn_id and self._turn_status.get((thread, turn_id)) in TURN_TERMINALS)):
                         partial = True
                     else:
-                        self._active[thread] = turn_id
+                        previous = self._active.get(thread)
+                        by_id = {native_turn.get("id"): native_turn for native_turn in turns
+                                 if isinstance(native_turn.get("id"), str)}
+                        # A missing known active turn is not terminal proof.
+                        # Preserve occupancy and refuse another native write.
+                        unresolved_previous = bool(previous and by_id.get(previous, {}).get("status") not in TURN_TERMINALS
+                                                   and self._turn_status.get((thread, previous)) not in TURN_TERMINALS)
+                        uncertain = unknown_status or bool(unresolved_previous and turn_id != previous)
+                        partial |= uncertain
+                        if uncertain:
+                            self._uncertain_activity.add(thread)
+                        else:
+                            self._uncertain_activity.discard(thread)
+                        self._active[thread] = previous if unresolved_previous and not turn_id else turn_id
                         self._activity_revision[thread] = read_revision + 1
                         for native_turn in turns:
                             tid, status = _string(native_turn.get("id")), _string(native_turn.get("status"))
                             if tid and status in TURN_TERMINALS:
+                                prior_status = self._turn_status.get((thread, tid))
                                 self._turn_status[(thread, tid)] = status
+                                if prior_status not in TURN_TERMINALS and (
+                                        tid == previous or (thread, tid) in self._requests or prior_status == "inProgress"):
+                                    self._event("activity.terminal", self._reference(thread, tid),
+                                                provenance="codex:thread/read", data={"status": status})
                 if thread != self._root:
                     child_status = native.get("status")
                     status = _string(child_status.get("type")) if isinstance(child_status, dict) else None
@@ -707,7 +733,10 @@ class CodexRuntimeDriver(RuntimeDriver):
                 snapshot = self.inventory(deadline=deadline)
                 if snapshot.partial or snapshot.freshness != "current" or not any(
                     work.kind == "terminal" and work.reference.thread_id == thread
-                    and work.reference.native_process_id == target.native_process_id for work in snapshot.work):
+                    and work.reference.native_process_id == target.native_process_id
+                    and (target.item_id is None or target.item_id == work.reference.item_id)
+                    and (target.work_id is None or target.work_id == work.reference.work_id)
+                    for work in snapshot.work):
                     return WriteReceipt("rejected", detail="terminal target is stale or unproved")
                 result = _object(self._rpc.request("thread/backgroundTerminals/terminate", {
                     "threadId": thread, "processId": target.native_process_id}, deadline=deadline))

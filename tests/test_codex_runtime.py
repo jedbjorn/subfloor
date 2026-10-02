@@ -125,7 +125,7 @@ def seat(tmp_path):
     context = RuntimeContext(
         "generation", "conversation", 1, 1, "codex", tmp_path, tmp_path,
         ExecutableBinding(executable, hashlib.sha256(executable.read_bytes()).hexdigest(), "fixture"),
-        "f89-codex-app-server-v1", "boot-digest", "policy-digest", "unrestricted",
+        "f89-codex-app-server-v1", hashlib.sha256(b"Managed boot; no memory").hexdigest(), "policy-digest", "unrestricted",
         provider="openai", model="gpt-6.1-sol", effort="high", boot_content="Managed boot; no memory",
         env={"PATH": "/usr/bin", "SC_API_TOKEN": "synthetic-fixture-only", "OPENAI_API_KEY": "remove"},
         probe_capabilities=("submission", "stop_reply", "stop_work"),
@@ -166,7 +166,9 @@ def test_start_preserves_boot_route_effort_and_subscription_without_policy_fallb
 
 
 @pytest.mark.parametrize("change", [{"permission_mode": "interactive"}, {"provider": "paid-provider"},
-                                   {"boot_content": ""}, {"model": None}])
+                                   {"boot_content": ""}, {"model": None},
+                                   {"driver_revision": "different-driver"}, {"boot_digest": "stale-digest"},
+                                   {"boot_content": "different boot with stale digest"}])
 def test_unproved_policy_or_route_fails_before_native_launch(seat, change):
     _, _, _, context = seat
     launches = []
@@ -213,6 +215,50 @@ def test_acknowledgement_without_processing_event_does_not_manufacture_processed
     driver, _, events, _ = seat
     assert driver.submit(submission(), deadline=deadline()).acknowledged
     assert not any(event.kind == "activity.processed" for event in events)
+
+
+@pytest.mark.parametrize("readback", [[], [{"id": "turn-1", "status": "unknown-new-state"}]])
+def test_missing_or_unknown_acknowledged_turn_retains_occupancy_until_exact_terminal(seat, readback):
+    driver, rpc, events, _ = seat
+    turn = driver.submit(submission(), deadline=deadline()).native_activity_id
+    rpc.turns["root"] = readback
+    snapshot = driver.inventory(deadline=deadline())
+    assert snapshot.primary_state == "unknown" and snapshot.partial
+    assert snapshot.primary.activity_id == turn
+    assert driver.submit(submission("second"), deadline=deadline()).state == "rejected"
+    assert sum(method == "turn/start" for method, _ in rpc.calls) == 1
+    assert not any(event.kind == "activity.terminal" for event in events)
+    rpc.turns["root"] = [{"id": turn, "status": "completed"}]
+    assert driver.inventory(deadline=deadline()).primary_state == "idle"
+    terminal = next(event for event in events if event.kind == "activity.terminal")
+    assert terminal.request_id == "request" and terminal.reference.activity_id == turn
+    assert terminal.provenance == "codex:thread/read"
+    driver.inventory(deadline=deadline())
+    assert sum(event.kind == "activity.terminal" for event in events) == 1
+    assert driver.submit(submission("second"), deadline=deadline()).state == "written"
+
+
+def test_child_turn_alias_does_not_borrow_gui_request_or_source(seat):
+    driver, rpc, events, _ = seat
+    turn = driver.submit(submission(), deadline=deadline()).native_activity_id
+    rpc.child(turn=turn)
+    driver.inventory(deadline=deadline())
+    rpc.frame("item/completed", thread="child", turn=turn,
+              item={"type": "agentMessage", "id": "child-output", "text": "child output"})
+    assert events[-1].reference.thread_id == "child"
+    assert events[-1].request_id is None and events[-1].source == "system"
+
+
+@pytest.mark.parametrize("params", [{"delta": "unbound"}, {"turnId": "turn", "delta": "unbound"},
+                                   {"itemId": "item", "delta": "unbound"},
+                                   {"turnId": [], "itemId": "item", "delta": "unbound"}])
+def test_delta_missing_required_identity_is_partial_without_losing_reader(seat, params):
+    driver, rpc, events, _ = seat
+    rpc.frame("item/agentMessage/delta", **params)
+    assert events[-1].kind == "output.delta" and events[-1].partial
+    assert events[-1].request_id is None and not driver._lost
+    rpc.frame("item/completed", turn="owned-turn", item={"type": "agentMessage", "id": "final", "text": "intact"})
+    assert events[-1].kind == "output.final" and not events[-1].partial
 
 
 def test_late_start_cannot_reopen_terminal_primary_but_final_output_is_retained(seat):
@@ -374,6 +420,17 @@ def test_cleanup_fences_new_submissions_and_reports_native_separately_from_unit(
 def test_scheduling_remains_unavailable(seat):
     driver, _, _, _ = seat
     assert driver.control(control("stop_automation", NativeReference("root")), deadline=deadline()).state == "unsupported"
+
+
+@pytest.mark.parametrize("target_field", ["item_id", "work_id"])
+def test_terminal_explicit_identity_mismatch_cannot_stop_current_handle(seat, target_field):
+    driver, rpc, _, _ = seat
+    rpc.terminal("selected")
+    target = replace(NativeReference("root", "root", native_process_id="selected"),
+                     **{target_field: "earlier-different-item"})
+    assert driver.control(control("stop_work", target), deadline=deadline()).state == "rejected"
+    assert rpc.terminals["root"] and not any(method == "thread/backgroundTerminals/terminate"
+                                            for method, _ in rpc.calls)
 
 
 def test_stale_interrupt_unknown_does_not_retry_or_clean_background_work(seat):
