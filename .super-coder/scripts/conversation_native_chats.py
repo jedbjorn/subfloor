@@ -40,7 +40,7 @@ def project_event(con, cid: str, sequence: int, event: dict, *, primary: dict | 
     Autonomous and child activity remains independently visible. Terminal
     command truth is already reconciled by RuntimeStore before this callback.
     """
-    row = con.execute('SELECT runtime_mode,runtime_projection,state FROM conversations WHERE conversation_id=?',(cid,)).fetchone()
+    row = con.execute('SELECT runtime_mode,runtime_projection,state,owner_user_id,shell_id FROM conversations WHERE conversation_id=?',(cid,)).fetchone()
     if row is None or row['runtime_mode'] != 'native_experiment':
         raise RuntimeContractError('RUNTIME_NOT_OWNED','native projection requires opted-in chat')
     projection = json.loads(row['runtime_projection'])
@@ -48,7 +48,7 @@ def project_event(con, cid: str, sequence: int, event: dict, *, primary: dict | 
     if not generation:
         raise RuntimeContractError('GENERATION_INVALID','native projection has no captured generation')
     kind, ref = event['kind'], event.get('reference') or {}
-    current = con.execute('SELECT state,close_intent,harness FROM conversation_runtime_generations WHERE generation_id=? AND conversation_id=?',(generation,cid)).fetchone()
+    current = con.execute('SELECT state,close_intent,harness,cleanup_json FROM conversation_runtime_generations WHERE generation_id=? AND conversation_id=? AND owner_user_id=? AND shell_id=?',(generation,cid,row['owner_user_id'],row['shell_id'])).fetchone()
     if current is None:
         raise RuntimeContractError('GENERATION_INVALID','generation is outside chat projection')
     command = None
@@ -60,7 +60,12 @@ def project_event(con, cid: str, sequence: int, event: dict, *, primary: dict | 
     root_activity = bool(ref.get('root_id') and (ref.get('thread_id')==ref['root_id'] or current['harness']=='claude' and ref.get('thread_id') is None))
     projection.update(controller_sequence=sequence,observed_at=event['observed_at'],
                       freshness=event['freshness'],partial=bool(projection.get('partial') or event['partial']))
-    if current['close_intent']:
+    cleanup=json.loads(current['cleanup_json'])
+    closed=(current['state']=='closed' and cleanup.get('outcome')=='complete'
+            and cleanup.get('unit_verified_exited') is True and not cleanup.get('unresolved_work') and not cleanup.get('unresolved_definitions'))
+    if closed:
+        projection.update(state='closed',setup=None)
+    elif current['close_intent']:
         projection.update(state='closing',setup=None)
     elif kind == 'runtime.setup' and current['state'] not in {'ready','closed','lost'}:
         eligible = event['freshness']=='current' and not event['partial'] and event['grade']!='inconclusive'
@@ -83,7 +88,7 @@ def project_event(con, cid: str, sequence: int, event: dict, *, primary: dict | 
         projection['capability_observation'] = event['data']
     # Retained controller journal owns primary/terminal reconciliation, not
     # this individual event (which may be child, stale, late or replayed).
-    projection['primary'] = primary
+    projection['primary'] = None if closed else primary
     con.execute('UPDATE conversations SET runtime_projection=?,version=version+1 WHERE conversation_id=?',(json.dumps(projection),cid))
     envelope = {'generation_id':generation,'controller_sequence':sequence,**event}
     append_event(con,cid,kind,envelope,message_id=mid,run_id=rid)
