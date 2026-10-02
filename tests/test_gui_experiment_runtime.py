@@ -102,6 +102,34 @@ def test_explicit_close_uses_only_current_fixed_fingerprint_and_bounded_cleanup(
     assert finished.wait(1) and calls==[fp.key]
 
 
+def test_public_witness_counts_native_identity_without_output_or_private_receipt(operation):
+    value,fp,con,_=operation
+    value.fingerprint=fp
+    projection={'role':'probe','generation_id':'g','state':'closed','root_id':'root',
+                'native_route':{'account_type':'chatgpt','model':'gpt-6.1-sol','efforts':['high']},
+                'memory_policy':{'generate_memories':False,'use_memories':False,'feature_enabled':False,'root_mode':'disabled'},
+                'ready_observation_at':10,'native_process':{'pid':123,'start_ticks':456}}
+    con.execute('UPDATE conversations SET runtime_projection=? WHERE conversation_id=\'cv\'',(json.dumps(projection),))
+    con.execute("INSERT INTO conversation_runtime_probe_jobs VALUES(?,'cv','g','complete',100,1)",(fp.key,))
+    for sequence,thread,activity in [(1,'root','turn1'),(2,'root','turn1'),(3,'child','childturn')]:
+        con.execute('INSERT INTO conversation_runtime_events VALUES(?,?,?)',('g',sequence,json.dumps({
+            'kind':'activity.started','observed_at':20,'reference':{'root_id':'root','thread_id':thread,'activity_id':activity},
+            'data':{'private_output':'never-export-this'}})))
+    con.commit()
+    value.supervisor.inventory=lambda:[{'generation_id':'g','ownership_nonce':'never-export-this',
+        'os_cleanup':{'complete':True,'cgroup_empty':True,'recorded_process_exited':True}}]
+    report=value.status()
+    assert report['observations']['root_activities_observed']==1
+    assert report['observations']['child_activities_observed']==1
+    assert report['observations']['ready_observation_at']<report['observations']['first_activity_observed_at']
+    assert report['resources']['owned_capacity_released']
+    assert report['resources']['owned_unit_cleanup_verified']
+    assert report['resources']['private_journal_retained_until_fixture_stop']
+    assert 'never-export-this' not in json.dumps(report)
+    value.owner.allocating.add(fp.key)
+    assert not value.status()['resources']['owned_capacity_released']
+
+
 @pytest.mark.parametrize('method,headers,body,code',[
     ('POST','Host: 127.0.0.1\r\nOrigin: https://elsewhere.example\r\n',b'{}',403),
     ('POST','Host: elsewhere.example\r\n',b'{}',403),
