@@ -316,14 +316,14 @@ def test_unverified_cleanup_retains_capacity_until_independent_proof(context):
 def test_normal_observed_break_changes_only_captured_generation_fingerprint(context):
     checker=CompatibilityChecker();old=fingerprint(context);new=replace(old,implementation_digest='new-install-source')
     checker.cache.put(old,complete_evidence());checker.cache.put(new,complete_evidence())
-    checker.validate_runtime(old,RuntimeValidator('root'),RuntimeEvent('output.delta',NativeReference('root','root',activity_id='turn'),partial=True))
+    checker.validate_runtime(old,RuntimeValidator('root'),RuntimeEvent('output.delta',NativeReference('root','root',activity_id='turn'),partial=True,data={'text':'partial scoped output'}))
     assert checker.cache.get(old,CAP_SUBMISSION).grade=='inconclusive'
     assert checker.cache.get(new,CAP_SUBMISSION).grade=='compatible'
 
 
 def test_partial_normal_events_cannot_certify_behavior(context):
     factory=Factory(context)
-    factory.emit_extra=RuntimeEvent('output.delta',NativeReference('root','root',activity_id='turn'),partial=True)
+    factory.emit_extra=RuntimeEvent('output.delta',NativeReference('root','root',activity_id='turn'),partial=True,data={'text':'partial scoped output'})
     result=check(CompatibilityChecker(),context,factory).result(timeout=1)
     assert result.evidence[CAP_SUBMISSION].grade=='inconclusive'
 
@@ -391,3 +391,26 @@ def test_demonstrated_child_break_restricts_only_child_action(context):
     checker.validate_runtime(fp,RuntimeValidator('root'),event)
     assert checker.cache.admission(fp)['stop_work_child']=='incompatible'
     assert checker.cache.admission(fp)['stop_work_terminal']=='compatible'
+
+
+def test_same_installed_binding_recovery_is_published_after_unavailability(tmp_path):
+    target=tmp_path/'binary';target.write_bytes(b'unchanged executable')
+    installed=tmp_path/'native';installed.symlink_to(target)
+    observer=ExecutableObserver(installed,version_reader=lambda *_:'native-test')
+    captured=observer.observe().binding
+    installed.unlink()
+    assert observer.observe().changed
+    assert not observer.observe().changed
+    installed.symlink_to(target)
+    recovery=observer.observe()
+    assert recovery.changed and recovery.grade=='compatible' and recovery.binding==captured
+    assert not observer.observe().changed
+
+
+@pytest.mark.parametrize('data',[{}, {'text':42}, {'text':None}, {'text':False}])
+def test_consumed_output_requires_string_text_but_reader_validation_continues(data):
+    validator=RuntimeValidator('root')
+    diagnostics=validator.frame({'kind':'output.final','reference':{'root_id':'root','thread_id':'root','activity_id':'turn','item_id':'item'},'data':data})
+    assert {d.capability for d in diagnostics}=={CAP_SUBMISSION}
+    assert diagnostics[0].grade=='incompatible' and diagnostics[0].code=='OUTPUT_TEXT_INVALID'
+    assert not validator.frame({'kind':'output.final','reference':{'root_id':'root','thread_id':'root','activity_id':'turn','item_id':'next'},'data':{'text':'reader continues','extra':'harmless'}})
