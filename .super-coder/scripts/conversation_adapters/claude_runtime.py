@@ -297,7 +297,9 @@ class ClaudeRuntimeDriver(RuntimeDriver):
             argv += ["--model", context.model]
         if context.effort:
             argv += ["--effort", context.effort]
-        self._configuration_files = (settings, channel, *context.managed_mcp_files,
+        self._configuration_files = (context.worktree / "CLAUDE.md",
+            *((context.worktree / "AGENTS.md",) if (context.worktree / "AGENTS.md").is_file() else ()),
+            settings, channel, *context.managed_mcp_files,
             *(ASSETS / name for name in ("channel.mjs", "asset-client.mjs", "hook.py", "asset_client.py", "pty_exec.py", "package-lock.json")))
         self._configuration_sha256 = self._configuration_digest(context)
         # No --bare/--restricted/--safe-mode/--print or instruction-discovery suppression.
