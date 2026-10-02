@@ -17,4 +17,14 @@ CREATE TABLE IF NOT EXISTS conversation_runtime_http_requests (
  command_id TEXT NOT NULL,
  PRIMARY KEY(conversation_id,request_key)
 );
+-- Finite checks have separate synthetic chats/generations; no consent or
+-- controller context can transfer from a probe to its requested ordinary chat.
+CREATE TABLE IF NOT EXISTS conversation_runtime_probe_jobs (
+ fingerprint_key TEXT PRIMARY KEY,
+ conversation_id TEXT NOT NULL REFERENCES conversations(conversation_id),
+ generation_id TEXT NOT NULL UNIQUE,
+ status TEXT NOT NULL,
+ deadline REAL NOT NULL,
+ updated_at REAL NOT NULL
+);
 COMMIT;
