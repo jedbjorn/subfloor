@@ -78,8 +78,11 @@ class NativeFixtureSeat:
     def implementation_digest(self,harness: str) -> str:
         scripts=self.root/'.super-coder/scripts'
         paths=[scripts/name for name in ('conversation_runtime_contract.py','conversation_runtime_controller.py',
-               'conversation_runtime.py','conversation_runtime_checks.py','gui_experiment_native_seat.py')]
-        paths.append(scripts/'conversation_adapters'/f'{harness}_runtime.py')
+               'conversation_runtime.py','conversation_runtime_checks.py','gui_experiment_native_seat.py',
+               'gui_experiment_readiness.py','conversation_boot.py','run.py','route_transport.py')]
+        paths.extend([scripts/'conversation_adapters'/f'{harness}_runtime.py',
+                      self.root/'.super-coder/api/route_bindings.py',self.root/'fixture_bootstrap.py',
+                      self.root/'.super-coder/adapters'/harness/'adapter.json'])
         if harness=='claude':
             assets=self.root/'.super-coder/assets/runtime/claude'
             paths.extend(p for p in assets.iterdir() if p.is_file() and not p.is_symlink())
@@ -99,11 +102,25 @@ class NativeFixtureSeat:
     def prepare(self,conversation_id: str,generation_id: str, *, probe_capabilities: tuple[str,...]=()) -> tuple[RuntimeContext,Fingerprint,dict]:
         con=db_driver.connect(str(self.database))
         try:
-            row=con.execute('SELECT c.*,s.shortname,s.user_id AS shell_owner FROM conversations c JOIN shells s USING(shell_id) WHERE conversation_id=?',(conversation_id,)).fetchone()
+            row=con.execute('SELECT c.*,s.shortname,s.flavor,s.user_id AS shell_owner FROM conversations c JOIN shells s USING(shell_id) WHERE conversation_id=?',(conversation_id,)).fetchone()
             if (row is None or row['owner_user_id']!=1 or row['shell_owner']!=1
                     or row['state']=='closed' or row['runtime_mode']!='native_experiment'
                     or row['harness'] not in {'codex','claude'}):
                 raise RuntimeContractError('RUNTIME_NOT_OWNED','opted-in synthetic chat required')
+            expected=run.shell_work_dir(row['shortname'],row['flavor'],root=self.root).absolute()
+            selected=Path(row['worktree']).absolute()
+            if (selected!=expected or self.root.resolve() not in selected.resolve().parents
+                    or not selected.is_dir()):
+                raise RuntimeContractError('WORKTREE_INVALID','canonical selected worktree escaped the fixture')
+            # Check every component before the canonical start can repair Git
+            # links, emit boot/configuration, or mutate the session archive.
+            current=selected
+            while current!=self.root.absolute():
+                if current.is_symlink():
+                    raise RuntimeContractError('WORKTREE_INVALID','canonical worktree contains an aliased path')
+                current=current.parent
+            if selected.resolve()!=selected:
+                raise RuntimeContractError('WORKTREE_INVALID','canonical worktree has stale or aliased containment')
             binding=json.loads(row['route_binding'])
             route_bindings.validate_v2_binding(binding)
             digest=route_bindings.digest_json(binding)
@@ -131,8 +148,8 @@ class NativeFixtureSeat:
             raise RuntimeContractError('PREPARATION_INVALID','canonical native route preparation differs')
         adapter=run.load_adapter(harness)
         flags=adapter.get('launch_flags',[])
-        expected=['--sandbox','danger-full-access','--ask-for-approval','never'] if harness=='codex' else ['--dangerously-skip-permissions']
-        if flags!=expected:
+        expected_flags=['--sandbox','danger-full-access','--ask-for-approval','never'] if harness=='codex' else ['--dangerously-skip-permissions']
+        if flags!=expected_flags:
             raise RuntimeContractError('PERMISSION_INCONCLUSIVE','canonical prepared permission policy changed')
         mcp=run.managed_mcp_injection(adapter,row['shortname'])
         if not mcp or mcp['name']!='browser' or mcp['url']!=plan.env['SC_API_BASE']+'/mcp/'+row['shortname'].upper():
