@@ -366,3 +366,33 @@ def test_history_seat_never_launches_or_returns_replaced_preparation(seat,monkey
     if edge!='after_register':assert events==[]
     else:assert events==['register']
     assert seat.con.execute('SELECT COUNT(*) FROM conversation_runtime_generations').fetchone()[0]==1
+
+
+@pytest.mark.parametrize('stage',['observer','registered','prepared'])
+@pytest.mark.parametrize('change',['closing','shell_owner','generation','preparer','association'])
+def test_blocking_history_proof_cannot_authorize_later_preparation_side_effects(seat,monkeypatch,stage,change):
+    value,events=canonical_seat(seat,monkeypatch)
+    _,result=request();cid=result['conversation']['conversation_id'];generation=result['conversation']['runtime']['generation_id']
+    runtime=result['conversation']['runtime']|{'state':'preparing','preparation_owner':{'unit':'synthetic-api'},'preparation_cleanup':None}
+    seat.con.execute('UPDATE conversations SET runtime_projection=? WHERE conversation_id=?',(json.dumps(runtime),cid));seat.con.commit()
+    observed=[]
+    original=value.observers['codex'].observe
+    def observe():
+        observed.append(True)
+        return original()
+    value.observers['codex'].observe=observe
+    def proof(history):
+        armed=(bool(observed) if stage=='observer' else 'register' in events if stage=='registered' else 'canonical-start' in events)
+        if armed:
+            current=runtime|({'state':'closing'} if change=='closing' else {'generation_id':'replacement'} if change=='generation' else {'preparation_owner':{'unit':'replacement-api'}} if change=='preparer' else {})
+            seat.con.execute('UPDATE conversations SET runtime_projection=? WHERE conversation_id=?',(json.dumps(current),cid))
+            if change=='shell_owner':seat.con.execute('UPDATE shells SET user_id=2 WHERE shell_id=1')
+            if change=='association':seat.con.execute('DELETE FROM conversation_native_history WHERE conversation_id=?',(cid,))
+            seat.con.commit()
+        return seat.proof.copy()
+    seat.service.history_resolver=proof
+    with pytest.raises(RuntimeContractError):value.prepare(cid,generation,checked_fingerprint=seat.fp,history_proof=seat.proof)
+    assert events==([] if stage=='observer' else ['register'] if stage=='registered' else ['register','canonical-start'])
+    link=seat.con.execute('SELECT workspace_json FROM conversation_native_history WHERE conversation_id=?',(cid,)).fetchone()
+    assert link is None if change=='association' else link['workspace_json']=='{}'
+    assert seat.con.execute('SELECT COUNT(*) FROM conversation_runtime_generations').fetchone()[0]==1
