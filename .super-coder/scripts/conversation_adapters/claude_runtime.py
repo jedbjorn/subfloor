@@ -377,11 +377,11 @@ class ClaudeRuntimeDriver(RuntimeDriver):
         # No --bare/--restricted/--safe-mode/--print or instruction-discovery suppression.
         return context.execution_argv(argv), env
 
-    def _spawn_auth(self, *args: Any, **kwargs: Any) -> Any:
+    def _spawn_auth(self, deadline: float, *args: Any, **kwargs: Any) -> Any:
         # Only process creation is serialized with Close. Bounded observation
         # must release this condition so Close can fence and stop its own child.
         with self._condition:
-            if self._closing or self._auth_cancel.is_set():
+            if self._closing or self._auth_cancel.is_set() or time.monotonic() >= deadline:
                 raise RuntimeContractError("NATIVE_ACCOUNT_INCONCLUSIVE", "native account observation cancelled")
             self._auth_process = subprocess.Popen(*args, **kwargs)
             self._auth_identity = process_identity(self._auth_process.pid)
@@ -395,6 +395,8 @@ class ClaudeRuntimeDriver(RuntimeDriver):
             raise RuntimeContractError("EXECUTABLE_CHANGED", "captured executable changed before launch")
         if self._configuration_digest(context) != self._configuration_sha256:
             raise RuntimeContractError("BOOT_CHANGED", "captured native configuration changed before launch")
+        if time.monotonic() >= deadline:
+            raise RuntimeContractError("NATIVE_START_FENCED", "native launch deadline expired during validation")
 
     def start(self, context: RuntimeContext, emit: EventSink, *, deadline: float) -> DriverStart:
         with self._condition:
@@ -409,7 +411,8 @@ class ClaudeRuntimeDriver(RuntimeDriver):
                 self._route_inconclusive = True
                 return DriverStart("unavailable", self._identity, str(exc), self._capabilities())
         try:
-            auth = _auth_status(context, env, deadline, cancel=self._auth_cancel, spawn=self._spawn_auth)
+            auth = _auth_status(context, env, deadline, cancel=self._auth_cancel,
+                spawn=lambda *args, **kwargs: self._spawn_auth(deadline, *args, **kwargs))
         except (OSError, RuntimeContractError) as exc:
             with self._condition:
                 self._route_inconclusive = True
