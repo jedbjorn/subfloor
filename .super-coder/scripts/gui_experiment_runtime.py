@@ -253,27 +253,40 @@ class FixtureNativeCheck:
             threading.Thread(target=observe,name='fixture-native-schema',daemon=True).start()
             return self.status()
 
-    def begin(self, *, selection=None,on_candidate=None) -> dict:
+    def begin(self, *, selection=None,on_candidate=None,deadline=None,expected_fingerprint=None,validate_intent=None) -> dict:
         from conversation_native_checks import CODEX_SELECTION, configured_selection
         selection=configured_selection(CODEX_SELECTION if selection is None else selection)
         with self.lock:
             if self.stopped:
                 raise RuntimeContractError('FIXTURE_STOPPED','API consumer is stopping')
             if self.future is not None and not self.future.done():
+                if validate_intent is not None:
+                    raise RuntimeContractError('CHECK_BUSY','automatic intent cannot adopt another active operation')
                 if self.fingerprint and selection!={'harness':self.fingerprint.harness,'model':self.fingerprint.model,'effort':self.fingerprint.effort}:
                     raise RuntimeContractError('CHECK_BUSY','another selected native check is active')
                 return self.status()
             if self.schema_future is not None and not self.schema_future.done():
                 raise RuntimeContractError('CHECK_BUSY','native schema observation is active')
             self.retained_guard()
-            deadline=time.monotonic()+177
+            deadline=min(time.monotonic()+177,deadline) if deadline is not None else time.monotonic()+177
+            if time.monotonic()+20>=deadline:
+                raise RuntimeContractError('CHECK_DEADLINE','finite check has no cleanup reserve')
+            if validate_intent is not None:validate_intent()
             fp=self.seat.candidate_fingerprint(**selection)
+            if expected_fingerprint is not None and fp.key!=expected_fingerprint:
+                raise RuntimeContractError('CHECK_CANDIDATE_CHANGED','automatic captured candidate changed before checking')
+            loaded_guard=getattr(self.seat,'require_loaded_source',None)
+            if loaded_guard is not None:loaded_guard(fp)
+            capacity=getattr(self.seat,'probe_capacity',None)
+            if capacity is not None and capacity(fp.harness)<1:
+                raise RuntimeContractError('PROBE_CAPACITY_PENDING','retained roots leave no probe slot')
+            if validate_intent is not None:validate_intent()
             if (selection!={'harness':fp.harness,'model':fp.model,'effort':fp.effort}
                     or fp.provider!=('openai' if fp.harness=='codex' else 'anthropic')):
                 raise RuntimeContractError('CHECK_CANDIDATE_CHANGED','captured fingerprint does not match the selected native request')
             if fp.harness=='codex':
                 observation=self.native_schema(fp,deadline-20)
-                if observation.structural_grades['submission']!='compatible' or not observation.generation_completed:
+                if not observation.generation_completed:
                     raise RuntimeContractError('NATIVE_SCHEMA_INCONCLUSIVE','required native submission interface is unavailable')
                 shape=observation.observed_interface
                 requirements={cap:observation.requirements[cap] for cap in ('submission','stop_reply','stop_work')}
@@ -286,9 +299,15 @@ class FixtureNativeCheck:
             remaining=deadline-time.monotonic()
             if remaining<60:
                 raise RuntimeContractError('CHECK_DEADLINE','source preparation consumed the finite check budget')
+            if self.seat.candidate_fingerprint(**selection)!=fp:
+                raise RuntimeContractError('CHECK_CANDIDATE_CHANGED','captured candidate changed during source observation')
+            if validate_intent is not None:validate_intent()
             self.fingerprint,self.failure,self.persisted=fp,None,False
             if on_candidate is not None:
                 on_candidate(fp.key) # Commit HTTP binding before dispatch.
+            if validate_intent is not None:validate_intent()
+            remaining=deadline-time.monotonic()
+            if remaining<60:raise RuntimeContractError('CHECK_DEADLINE','finite dispatch has insufficient remaining budget')
             self.future=self.checker.request(fp,observed_interface=shape,requirements=requirements,
                                              factory=self.factory,seconds=min(177,remaining))
             self.future.add_done_callback(self.finished)

@@ -382,7 +382,7 @@ def test_claude_begin_uses_native_validators_not_codex_schema(operation,monkeypa
     assert result['harness']=='claude' and result['grades']=={} and not result['ordinary_chats_admitted']
     assert result['structural_observation']=='source-adapter-signatures-plus-native-runtime-validators'
     assert 'native_schema' not in result and 'schema' not in calls
-    assert selected==[CLAUDE_SELECTION,claude.key]
+    assert selected==[CLAUDE_SELECTION,CLAUDE_SELECTION,claude.key]
     assert requests[0][0]==claude and set(requests[0][1]['requirements'])=={'submission','stop_reply','stop_work'}
     assert value.begin(selection=CLAUDE_SELECTION)['state']=='running' and len(requests)==1
     with pytest.raises(RuntimeContractError) as exc:value.begin()

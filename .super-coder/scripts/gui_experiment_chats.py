@@ -25,6 +25,7 @@ class FixtureChats:
         self.operation,self.seat,self.service=operation,operation.seat,operation.service
         self.database=operation.database
         self.pending={}
+        self.last_scan=0.0
         self.lock=threading.Lock()
         self.stopped=threading.Event()
         self.wake=threading.Event()
@@ -33,6 +34,8 @@ class FixtureChats:
     def resolve_route(self,harness,model,effort):
         self.seat.ensure_codegen_clean()
         fp=self.seat.candidate_fingerprint(harness,model,effort)
+        guard=getattr(self.seat,'require_loaded_source',None)
+        if guard is not None:guard(fp)
         evidence=self.operation.cache.get(fp,'submission')
         if evidence is None or evidence.grade!='compatible' or self.operation.cache.admission(fp).get('submission')!='compatible':
             code='CAPABILITY_INCOMPATIBLE' if evidence and evidence.grade=='incompatible' else 'CAPABILITY_INCONCLUSIVE'
@@ -131,6 +134,59 @@ class FixtureChats:
             self.pending[harness]=observation
         self.wake.set()
 
+    def reconcile_automatic(self) -> None:
+        """Existing publication worker observes relevant content, not accounts."""
+        if conversation_native_chats._SERVICE is not self.service:return
+        from conversation_native_checks import configured_selection
+        con=db_driver.connect(str(self.database))
+        try:
+            selections=set()
+            for row in con.execute("SELECT c.harness,c.model,c.effort FROM conversations c JOIN shells s USING(shell_id) WHERE c.runtime_mode='native_experiment' AND c.owner_user_id=1 AND s.user_id=1 AND c.state!='closed'"):
+                selections.add((row['harness'],row['model'],row['effort']))
+            for row in con.execute('SELECT selection_json FROM conversation_runtime_check_requests WHERE owner_user_id=1'):
+                selection=json.loads(row[0]);selections.add((selection.get('harness'),selection.get('model'),selection.get('effort')))
+        finally:con.close()
+        for harness,model,effort in selections:
+            selection={'harness':harness,'model':model,'effort':effort}
+            try:
+                configured_selection(selection)
+                fp=self.seat.candidate_fingerprint(**selection)
+                grade='inconclusive'
+                try:
+                    self.resolve_route(harness,model,effort)
+                    grade='compatible'
+                except RuntimeContractError:
+                    self.operation.workflow.enqueue_automatic(selection,fp.key)
+                    evidence=self.operation.cache.get(fp,'submission')
+                    if evidence and evidence.grade=='incompatible':grade='incompatible'
+                ref=self.operation.workflow.automatic_reference(selection,fingerprint=fp.key)
+                self.publish_check_reference(selection,ref,fp,grade)
+            except RuntimeContractError as exc:
+                if exc.code=='NATIVE_EXECUTABLE_INCONCLUSIVE':self.operation.workflow.note_unavailable(harness)
+            except (OSError,ValueError):
+                continue # Source observation failure cannot prove a credential/setup availability transition.
+        self.operation.workflow.dispatch_automatic()
+
+    def publish_check_reference(self,selection: dict,ref: dict | None,fp,grade: str) -> None:
+        if conversation_native_chats._SERVICE is not self.service:return
+        if self.seat.candidate_fingerprint(**selection)!=fp:return
+        con=db_driver.connect(str(self.database));changed=[]
+        try:
+            with db_driver.write_transaction(con,'native_chat.automatic_check_ref'):
+                if conversation_native_chats._SERVICE is not self.service:return
+                rows=con.execute("SELECT c.conversation_id,c.runtime_projection FROM conversations c JOIN shells s USING(shell_id) WHERE c.runtime_mode='native_experiment' AND c.owner_user_id=1 AND s.user_id=1 AND c.state!='closed' AND c.harness=? AND c.model=? AND c.effort=?",(selection['harness'],selection['model'],selection['effort'])).fetchall()
+                for row in rows:
+                    runtime=json.loads(row['runtime_projection']);installed=runtime.get('latest_installed_identity') or {}
+                    if installed.get('check_ref')==ref and installed.get('fingerprint')==fp.key and installed.get('capability_grade')==grade:continue
+                    installed.update(check_ref=ref,fingerprint=fp.key,capability_grade=grade)
+                    runtime['latest_installed_identity']=installed
+                    con.execute('UPDATE conversations SET runtime_projection=?,version=version+1 WHERE conversation_id=?',(encoded(runtime),row['conversation_id']))
+                    conversation_native_chats.append_event(con,row['conversation_id'],'capability.observed',
+                        {'source':'system','scope':'latest_installation','check_ref':ref,'fingerprint':fp.key,'capability_grade':grade})
+                    changed.append(row['conversation_id'])
+        finally:con.close()
+        for cid in changed:conversation_events.notify(cid)
+
     def publish_changes(self):
         while not self.stopped.is_set():
             with self.lock:
@@ -146,7 +202,8 @@ class FixtureChats:
                         rows=con.execute("SELECT conversation_id,runtime_projection FROM conversations WHERE runtime_mode='native_experiment' AND owner_user_id=1 AND harness=? AND state!='closed'",(harness,)).fetchall()
                         for row in rows:
                             runtime=json.loads(row['runtime_projection'])
-                            runtime['latest_installed_identity']=installed
+                            prior=runtime.get('latest_installed_identity') or {}
+                            runtime['latest_installed_identity']={**installed,'check_ref':prior.get('check_ref')}
                             con.execute('UPDATE conversations SET runtime_projection=?,version=version+1 WHERE conversation_id=?',(encoded(runtime),row['conversation_id']))
                             conversation_native_chats.append_event(con,row['conversation_id'],'capability.observed',{'source':'system','scope':'latest_installation',**installed})
                 except Exception: # noqa: BLE001 - failed metadata publication never starts native work
@@ -156,6 +213,11 @@ class FixtureChats:
                     con.close()
                 for row in rows:
                     conversation_events.notify(row['conversation_id'])
+            if time.monotonic()-self.last_scan>=5:
+                self.last_scan=time.monotonic()
+                try:self.reconcile_automatic()
+                except Exception: # noqa: BLE001 - retained intent, no unknown native replay
+                    self.last_scan=time.monotonic()
             self.wake.clear()
             self.wake.wait(1)
 

@@ -90,11 +90,18 @@ class NativeFixtureSeat:
         for value in self.native_bindings.values():
             if value and (not Path(value).is_absolute() or any(c in value for c in '\n\r\0')):
                 raise RuntimeContractError('CONTEXT_INVALID','absolute finite native paths required')
+        self.source_lock=threading.RLock()
+        self.source_cache: dict[str,tuple[list[tuple],str]]={}
+        self.loaded_implementations: dict[str,str|None]={}
         self.observers={}
         for harness in ('codex','claude'):
             path=self.native_bindings.get(harness.upper())
             if path:
                 self.observers[harness]=ExecutableObserver(Path(path),version_reader=self._version)
+                # The copied source is immutable for this API lifetime. Disk
+                # edits are observed, but are not an in-process driver reload.
+                try:self.loaded_implementations[harness]=self.implementation_digest(harness)
+                except (OSError,RuntimeContractError):self.loaded_implementations[harness]=None
 
     def native_environment(self,harness: str) -> dict[str,str]:
         home=self.native_bindings.get('HOME')
@@ -120,7 +127,7 @@ class NativeFixtureSeat:
             raise RuntimeContractError('NATIVE_VERSION_INCONCLUSIVE','bounded native version observation unavailable')
         return result.stdout.splitlines()[0].strip()
 
-    def implementation_digest(self,harness: str) -> str:
+    def implementation_files(self,harness: str) -> list[Path]:
         scripts=self.root/'.super-coder/scripts'
         paths=[scripts/name for name in ('conversation_runtime_contract.py','conversation_runtime_controller.py',
                'conversation_runtime.py','conversation_runtime_checks.py','gui_experiment_native_seat.py',
@@ -135,12 +142,66 @@ class NativeFixtureSeat:
         if harness=='claude':
             assets=self.root/'.super-coder/assets/runtime/claude'
             paths.extend(p for p in assets.iterdir() if p.is_file() and not p.is_symlink())
-        content=[]
-        for path in sorted(paths):
-            if not path.is_file() or path.is_symlink():
-                raise RuntimeContractError('SOURCE_INVALID','captured implementation is unavailable')
-            content.append((str(path.relative_to(self.root)),hashlib.sha256(path.read_bytes()).hexdigest()))
-        return payload_digest({'source_files':content})
+        return sorted(paths)
+
+    def implementation_digest(self,harness: str) -> str:
+        with self.source_lock:
+            paths=self.implementation_files(harness)
+            metadata=[]
+            for path in paths:
+                if not path.is_file() or path.is_symlink():
+                    raise RuntimeContractError('SOURCE_INVALID','captured implementation is unavailable')
+                info=path.stat()
+                metadata.append((str(path),info.st_dev,info.st_ino,info.st_size,info.st_mtime_ns,info.st_ctime_ns))
+            cached=self.source_cache.get(harness)
+            if cached is not None and cached[0]==metadata:return cached[1]
+            content=[(str(path.relative_to(self.root)),hashlib.sha256(path.read_bytes()).hexdigest()) for path in paths]
+            if any((str(path),info.st_dev,info.st_ino,info.st_size,info.st_mtime_ns,info.st_ctime_ns)!=before
+                   for path,before in zip(paths,metadata,strict=True) for info in [path.stat()]):
+                raise RuntimeContractError('SOURCE_CHANGED','implementation changed during observation')
+            digest=payload_digest({'source_files':content})
+            self.source_cache[harness]=(metadata,digest)
+            return digest
+
+    def require_loaded_source(self,fingerprint: Fingerprint) -> None:
+        if (self.loaded_implementations.get(fingerprint.harness)!=fingerprint.implementation_digest
+                or self.implementation_digest(fingerprint.harness)!=fingerprint.implementation_digest):
+            raise RuntimeContractError('LOADED_SOURCE_CHANGED','observed content needs a new copied API source lifetime')
+
+    def probe_capacity(self,harness: str, *, exclude: str | None=None) -> int:
+        """Count retained roots and child reservations, never stop user work."""
+        con=db_driver.connect(str(self.database))
+        try:
+            return self._available_roots(con,harness,exclude=exclude)
+        except (ValueError,TypeError,AttributeError,KeyError) as exc:
+            raise RuntimeContractError('PROBE_CAPACITY_PENDING','retained root/child occupancy is inconclusive') from exc
+        finally:con.close()
+
+    def _available_roots(self,con,harness: str, *, exclude: str | None=None) -> int:
+        units={item['generation_id'] for item in self.supervisor.inventory()
+               if item.get('harness')==harness and item.get('os_cleanup',{}).get('complete') is not True
+               and item.get('generation_id')!=exclude}
+        children=set()
+        rows=con.execute("SELECT c.conversation_id,c.runtime_projection,g.generation_id,g.cleanup_json FROM conversations c LEFT JOIN conversation_runtime_generations g USING(conversation_id) WHERE c.runtime_mode='native_experiment' AND c.harness=?",(harness,)).fetchall()
+        for row in rows:
+            runtime=json.loads(row['runtime_projection'])
+            gid=row['generation_id'] or runtime.get('generation_id')
+            if not gid or gid==exclude:continue
+            cleanup=json.loads(row['cleanup_json']) if row['cleanup_json'] else runtime.get('preparation_cleanup',{})
+            clean=(cleanup.get('unit_verified_exited') is True and cleanup.get('outcome')=='complete'
+                   and (cleanup.get('native_outcome')=='complete' or cleanup.get('never_launched') is True)
+                   and cleanup.get('unresolved_work')==[] and cleanup.get('unresolved_definitions')==[])
+            if clean:continue
+            units.add(gid)
+            if runtime.get('probe_child_reserved') is True:children.add((gid,'reserved'))
+            for work in con.execute('SELECT projection_json FROM conversation_runtime_work WHERE generation_id=?',(gid,)):
+                event=json.loads(work[0]);ref=event.get('reference') or {};data=event.get('data') or {}
+                if data.get('kind')=='child':
+                    children.add((gid,ref.get('thread_id') or 'unknown'))
+        # A reserved child and its later actual observation are one slot.
+        child_count=sum(max(1,len({thread for generation,thread in children if generation==gid and thread!='reserved'}))
+                        for gid in {generation for generation,_ in children})
+        return max(0,2-len(units)-child_count)
 
     def settings_digest(self,harness: str) -> str:
         adapter=run.load_adapter(harness)
@@ -449,6 +510,37 @@ class NativeFixtureSeat:
         finally:
             con.close()
         # Durable fixture resources precede canonical archive/boot/DB mutations.
+        self.require_loaded_source(self.candidate_fingerprint(harness,row['model'],row['effort']))
+        # Serialize the resource grant with all canonical preparation entries.
+        # Reserve a possible child before register; other starts count it even
+        # before the native controller/store row exists.
+        capacity=db_driver.connect(str(self.database))
+        try:
+            with db_driver.write_transaction(capacity,'native_prepare.capacity'):
+                free=self._available_roots(capacity,harness,exclude=generation_id)
+                if free<1:
+                    raise RuntimeContractError('PROBE_CAPACITY_PENDING','retained roots leave no native allocation capacity')
+                final=capacity.execute('SELECT c.*,s.user_id AS shell_owner FROM conversations c JOIN shells s USING(shell_id) WHERE conversation_id=?',(conversation_id,)).fetchone()
+                projection=json.loads(final['runtime_projection']) if final else {}
+                if (final is None or final['owner_user_id']!=1 or final['shell_owner']!=1
+                        or final['state']=='closed' or final['runtime_mode']!='native_experiment'
+                        or projection.get('generation_id')!=generation_id or projection.get('state')!='preparing'
+                        or projection.get('role')!=json.loads(row['runtime_projection']).get('role')
+                        or projection.get('preparation_owner')!=json.loads(row['runtime_projection']).get('preparation_owner')
+                        or any(final[key]!=row[key] for key in ('shell_id','harness','provider','model','effort','worktree','route_binding'))):
+                    raise RuntimeContractError('RUNTIME_CLOSING','preparing ownership changed during capacity observation')
+                if probe_capabilities:
+                    if free<2:probe_capabilities=tuple(cap for cap in probe_capabilities if cap!='stop_work_child')
+                    current=capacity.execute('SELECT runtime_projection FROM conversations WHERE conversation_id=?',(conversation_id,)).fetchone()
+                    projection=json.loads(current[0]) if current else {}
+                    if projection.get('generation_id')!=generation_id or projection.get('state')!='preparing':
+                        raise RuntimeContractError('RUNTIME_CLOSING','allocation changed before capacity reservation')
+                    projection['probe_child_reserved']='stop_work_child' in probe_capabilities
+                    capacity.execute('UPDATE conversations SET runtime_projection=? WHERE conversation_id=?',
+                                     (json.dumps(projection),conversation_id))
+        finally:capacity.close()
+        # The preparing root and optional child are now durable reservations.
+        # Supervisor I/O stays outside the DB writer so Close can commit.
         native=self.supervisor.register(generation_id,harness)
         if history is not None:
             con=db_driver.connect(str(self.database))
@@ -456,6 +548,25 @@ class NativeFixtureSeat:
                 recheck_history(con)
             finally:
                 con.close()
+        # Resource registration and proof callbacks can block. Retained
+        # resource ownership does not authorize a now-closed boot mutation.
+        con=db_driver.connect(str(self.database))
+        try:
+            final=con.execute('SELECT c.*,s.user_id AS shell_owner,s.is_deleted AS shell_deleted FROM conversations c JOIN shells s USING(shell_id) WHERE conversation_id=?',(conversation_id,)).fetchone()
+            current=json.loads(final['runtime_projection']) if final else {}
+            if (final is None or final['owner_user_id']!=1 or final['shell_owner']!=1 or final['shell_deleted']
+                    or final['state']=='closed' or final['runtime_mode']!='native_experiment'
+                    or current.get('generation_id')!=generation_id or current.get('state')!='preparing'
+                    or current.get('role')!=json.loads(row['runtime_projection']).get('role')
+                    or current.get('preparation_owner')!=json.loads(row['runtime_projection']).get('preparation_owner')
+                    or any(final[key]!=row[key] for key in ('shell_id','harness','provider','model','effort','worktree','route_binding'))):
+                raise RuntimeContractError('RUNTIME_CLOSING','registered generation changed before canonical writes')
+            if binding['selector_binding'].get('proof_state')=='pending_finite_probe':
+                current_job=con.execute('SELECT status,deadline,fingerprint_key FROM conversation_runtime_probe_jobs WHERE conversation_id=? AND generation_id=?',(conversation_id,generation_id)).fetchone()
+                if (current.get('role')!='probe' or current_job is None or current_job['status']!='preparing'
+                        or current_job['deadline']<=time.time() or current_job['fingerprint_key']!=binding['evidence_digest']):
+                    raise RuntimeContractError('PROBE_ROUTE_ONLY','registered finite probe ownership changed before canonical writes')
+        finally:con.close()
         if initial:
             run.prepare_launch(shell_id=row['shell_id'],harness=harness,model=row['model'],effort=row['effort'],
                 headless_prompt='native owned preparation; never dispatch',conversation_owned=True,

@@ -42,6 +42,7 @@ def seat(tmp_path,monkeypatch,request):
     events=[]
     class Supervisor:
         def codegen_clean(self):return True
+        def inventory(self):return []
         def begin_codegen(self,*args,**kwargs):pass
         def finish_codegen(self,*args,**kwargs):return True
         def register(self,generation,harness):
