@@ -13,6 +13,7 @@ import socket
 import subprocess
 import sys
 import tarfile
+import uuid
 from pathlib import Path
 from unittest import mock
 
@@ -359,4 +360,5 @@ def test_missing_experimental_runtime_cleans_partial_preparation(seat, monkeypat
         fixture.start(repo, "HEAD", receipt, temp_parent=seat, runtime="experimental")
     record = fixture.read_json(receipt)
     assert record["error_code"] == "RUNTIME_UNAVAILABLE" and record["cleanup"]["complete"]
+    assert uuid.UUID(record["fixture_id"]).version == 4
     assert not Path(record["root"]).exists()
