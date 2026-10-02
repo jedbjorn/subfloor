@@ -602,13 +602,27 @@ class _Scenarios:
 
     def _pid(self, label: str) -> ProcessIdentity | None:
         outputs: dict[tuple[Any, ...], list[str]] = {}
+        parts: dict[tuple[Any, ...], dict[int, str]] = {}
+        ambiguous: set[tuple[Any, ...]] = set()
         for event in self._events():
             ref = event.reference
-            if ref and event.kind in {"output.delta", "output.final"} and isinstance(event.data.get("text"), str):
-                output_key = (ref.thread_id, ref.activity_id, ref.item_id, event.kind)
-                outputs.setdefault(output_key, []).append(event.data["text"])
-        # Separate attributable items/turns; nonce recall cannot append digits
-        # to a PID printed in an earlier terminal or assistant item.
+            value = event.data.get("text")
+            if ref and event.kind in {"output.delta", "output.final"} and isinstance(value, str):
+                digest, part = event.data.get("text_digest"), event.data.get("part")
+                output_key = (ref.thread_id, ref.activity_id, ref.item_id, event.kind,
+                              digest if isinstance(digest, str) else None)
+                if isinstance(digest, str) and type(part) is int and 0 <= part < 128:
+                    rows = parts.setdefault(output_key, {})
+                    if part in rows and rows[part] != value:
+                        ambiguous.add(output_key)
+                    rows[part] = value
+                else:
+                    outputs.setdefault(output_key, []).append(value)
+        for output_key, rows in parts.items():
+            if output_key not in ambiguous and sorted(rows) == list(range(len(rows))):
+                outputs[output_key] = [rows[part] for part in sorted(rows)]
+        # Distinct full-text records/turns/items cannot append digits to PIDs;
+        # contiguous complete-record chunks reassemble and replay parts dedup.
         text = "\n".join("".join(chunks) for chunks in outputs.values())
         matches = list(dict.fromkeys(re.findall(re.escape(label)+r"=(\d+)\b", text)))[:128]
         callback = self.owned.process_identity
