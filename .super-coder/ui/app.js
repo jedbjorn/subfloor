@@ -4927,7 +4927,7 @@ function chatNativeVisibleActivity(runtime) {
   return activity.filter(event => {
     const key = outputItem(event);
     return !["output.delta", "output.final"].includes(event.kind)
-      || (event.engine_mirrored !== true && (key === null || !mirrored.has(key)));
+      || (event.engine_mirrored !== true && (event.kind !== "output.delta" || key === null || !mirrored.has(key)));
   });
 }
 

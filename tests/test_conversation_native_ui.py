@@ -91,7 +91,8 @@ const runtime={generation_id:'gen',activity:[
  output(4,'root','terminal',{kind:'output.final',engine_mirrored:false}),
  output(5,'root','unknown-mirror',{engine_mirrored:'true'}),
  output(6,'root','setup',{source:'system'}),output(7,'root','old',{generation_id:'old'}),
- {generation_id:'gen',controller_sequence:8,kind:'activity.terminal',engine_mirrored:true}]};
+ {generation_id:'gen',controller_sequence:8,kind:'activity.terminal',engine_mirrored:true},
+ output(9,'root','assistant',{kind:'output.final',engine_mirrored:false,partial:true})]};
 console.log(JSON.stringify(chatNativeVisibleActivity(runtime).map(row=>row.controller_sequence)));
 ''')
-    assert result == [3, 4, 5, 6, 8]
+    assert result == [3, 4, 5, 6, 8, 9]
