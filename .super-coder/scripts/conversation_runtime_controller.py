@@ -42,6 +42,7 @@ from conversation_runtime_contract import (
     RuntimeEvent,
     RuntimeIdentity,
     StartupConsent,
+    WorkspaceIdentity,
     WriteReceipt,
     payload_digest,
     public_payload,
@@ -383,6 +384,14 @@ def runtime_context(value: dict) -> RuntimeContext:
             data['history']=NativeHistory(**(history | {'source_worktree':Path(history['source_worktree'])}))
         except (TypeError,ValueError) as exc:
             raise RuntimeContractError('HISTORY_INVALID','invalid predecessor selection') from exc
+    workspace=data.get('workspace')
+    if workspace is not None:
+        if not isinstance(workspace,dict) or set(workspace)!={'cwd','git_common_dir','branch','head'}:
+            raise RuntimeContractError('HISTORY_WORKSPACE_INVALID','exact canonical workspace observation required')
+        try:
+            data['workspace']=WorkspaceIdentity(**(workspace|{'cwd':Path(workspace['cwd']),'git_common_dir':Path(workspace['git_common_dir'])}))
+        except (TypeError,ValueError) as exc:
+            raise RuntimeContractError('HISTORY_WORKSPACE_INVALID','invalid canonical workspace observation') from exc
     return RuntimeContext(**data)
 
 
@@ -556,6 +565,8 @@ class Controller:
                     if self.journal.get('close') or time.monotonic()>=deadline:
                         raise RuntimeContractError('RUNTIME_CLOSING' if self.journal.get('close') else 'DEADLINE_EXPIRED','native startup was fenced before its edge')
                     if context.history is not None:
+                        if context.workspace is None:
+                            raise RuntimeContractError('HISTORY_WORKSPACE_INVALID','history resume requires a fresh canonical Git observation')
                         if (context.capability_evidence.get(CAP_HISTORY_RESUME)!='compatible'
                                 and CAP_HISTORY_RESUME not in context.probe_capabilities):
                             raise RuntimeContractError('NATIVE_HISTORY_UNAVAILABLE','matching history-specific behavior and cleanup coverage is required')

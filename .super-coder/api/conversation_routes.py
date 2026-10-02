@@ -38,6 +38,7 @@ import conversation_broker
 import conversation_events
 import conversation_git_targets
 import conversation_native_chats
+import conversation_native_history
 import db_driver
 import instance_state
 import model_catalog
@@ -74,6 +75,7 @@ _INTERRUPTIONS_PATH = re.compile(
     r"^/api/conversations/(cv_[0-9a-f]{32})/interruptions$"
 )
 _RUNTIME_CONTROLS_PATH = re.compile(r'^/api/conversations/(cv_[0-9a-f]{32})/runtime-controls$')
+_HISTORY_PATH = re.compile(r'^/api/conversations/(cv_[0-9a-f]{32})/history-resume$')
 _SENSITIVE_EVENT_KEYS = frozenset(
     (
         "api_key",
@@ -1710,6 +1712,107 @@ def _create_conversation(con, operator: dict, headers, body: dict):
     )
 
 
+def _history_service(service):
+    if (service is None or conversation_native_chats._SERVICE is not service
+            or service.stopped.is_set() or Path(service.database).resolve()!=Path(DB_PATH).resolve()):
+        raise ApiError(409,'NATIVE_HISTORY_UNAVAILABLE','the current owned experimental history service is unavailable')
+
+
+def _history_readback(con,operator,cid,key):
+    # The association is immutable. Reconciliation never opens native history
+    # or repeats today's preparation, even if installed evidence has changed.
+    row=con.execute('SELECT * FROM conversation_native_history WHERE owner_user_id=? AND request_key=?',
+                    (operator['user_id'],key)).fetchone()
+    if row is None or row['source_conversation_id']!=cid:
+        raise ApiError(404,'HISTORY_REQUEST_NOT_FOUND','owned continuation request was not found')
+    _require_conversation(con,cid,operator['user_id'])
+    destination=_require_conversation(con,row['conversation_id'],operator['user_id'])
+    runtime=json.loads(destination['runtime_projection'])
+    if (destination['shell_id']!=row['shell_id'] or destination['creation_idempotency_key']!=key
+            or destination['runtime_mode']!='native_experiment' or runtime.get('role')!='ordinary'
+            or runtime.get('generation_id')!=row['generation_id']
+            or runtime.get('history')!={'source_conversation_id':cid,'source_generation_id':row['source_generation_id']}):
+        raise ApiError(409,'HISTORY_NOT_OWNED','retained continuation identity conflicts')
+    return {'request_key':key,'source_conversation_id':cid,'conversation':_conversation_projection(destination,con=con)}
+
+
+def _resume_history(con,operator,cid,headers,body):
+    _only_fields(body,{'version','title'})
+    version=_integer(body.get('version'),'version')
+    title=_nonblank(body.get('title'),'title',maximum=200,optional=True)
+    key=_idempotency_key(headers)
+    request_hash=_request_hash({'source_conversation_id':cid,'version':version,'title':title})
+    prior=con.execute('SELECT * FROM conversation_native_history WHERE owner_user_id=? AND request_key=?',(operator['user_id'],key)).fetchone()
+    if prior is not None:
+        if prior['source_conversation_id']!=cid or prior['request_hash']!=request_hash:
+            raise ApiError(409,'HISTORY_IDEMPOTENCY_CONFLICT','continuation key belongs to a different request')
+        return _json(200,_history_readback(con,operator,cid,key))
+    if con.execute('SELECT 1 FROM conversations WHERE owner_user_id=? AND creation_idempotency_key=?',(operator['user_id'],key)).fetchone():
+        raise ApiError(409,'HISTORY_IDEMPOTENCY_CONFLICT','request key already belongs to another creation')
+    service=conversation_native_chats._SERVICE
+    _history_service(service)
+    try:
+        source,history,source_digest=conversation_native_history.source_history(con,cid,operator['user_id'])
+        if source['version']!=version:
+            raise ApiError(409,'CONVERSATION_VERSION_CONFLICT','predecessor changed before history selection')
+        conversation_native_history.require_slot(con,source['shell_id'])
+        proof=service.history_admission(history)
+        shell=con.execute('SELECT * FROM shells WHERE shell_id=?',(source['shell_id'],)).fetchone()
+        canonical=run_mod.shell_work_dir(shell['shortname'],shell['flavor']).resolve(strict=False)
+        if canonical!=history.source_worktree or (canonical.exists() and not canonical.is_dir()):
+            raise ApiError(409,'HISTORY_WORKSPACE_UNAVAILABLE','current canonical destination differs from owned predecessor workspace')
+        if _live_shell_session(shell) is not None:
+            raise ApiError(409,'WORKSPACE_BUSY','a live CLI session owns the canonical shell slot')
+        _history_service(service)
+        new_cid='cv_'+uuid.uuid4().hex
+        new_gid=uuid.uuid4().hex
+        runtime={'generation_id':new_gid,'state':'pending','role':'ordinary','capabilities':{},
+                 'history':{'source_conversation_id':cid,'source_generation_id':history.source_generation_id},
+                 'preparation_cleanup':{'unit_verified_exited':True,'never_launched':True},
+                 'setup':None,'partial':True,'freshness':'unknown'}
+        with db_driver.write_transaction(con,'native_history.create'):
+            # No Close/displacement is part of this operation. Revalidate all
+            # observations after callbacks and immediately before insertion.
+            prior=con.execute('SELECT * FROM conversation_native_history WHERE owner_user_id=? AND request_key=?',(operator['user_id'],key)).fetchone()
+            if prior is not None:
+                if prior['source_conversation_id']!=cid or prior['request_hash']!=request_hash:
+                    raise ApiError(409,'HISTORY_IDEMPOTENCY_CONFLICT','continuation key was concurrently reused')
+                return _json(200,_history_readback(con,operator,cid,key))
+            current,current_history,current_digest=conversation_native_history.source_history(con,cid,operator['user_id'])
+            if current_digest!=source_digest or current['version']!=version:
+                raise ApiError(409,'HISTORY_CHANGED','predecessor changed during admission')
+            if service.history_admission(current_history)!=proof:
+                raise ApiError(409,'HISTORY_CHANGED','current history proof changed during admission')
+            current_shell=con.execute('SELECT * FROM shells WHERE shell_id=?',(source['shell_id'],)).fetchone()
+            if (current_shell['user_id']!=operator['user_id'] or current_shell['is_deleted']
+                    or (current_shell['shortname'],current_shell['flavor'])!=(shell['shortname'],shell['flavor'])
+                    or run_mod.shell_work_dir(current_shell['shortname'],current_shell['flavor']).resolve(strict=False)!=canonical):
+                raise ApiError(409,'HISTORY_WORKSPACE_UNAVAILABLE','current canonical shell workspace changed')
+            if _live_shell_session(current_shell) is not None:
+                raise ApiError(409,'WORKSPACE_BUSY','a live CLI session owns the canonical shell slot')
+            conversation_native_history.require_slot(con,source['shell_id'])
+            final_source,_,final_digest=conversation_native_history.source_history(con,cid,operator['user_id'])
+            final_shell=con.execute('SELECT * FROM shells WHERE shell_id=?',(source['shell_id'],)).fetchone()
+            if (final_digest!=source_digest or final_source['version']!=version
+                    or final_shell['user_id']!=operator['user_id'] or final_shell['is_deleted']
+                    or (final_shell['shortname'],final_shell['flavor'])!=(shell['shortname'],shell['flavor'])):
+                raise ApiError(409,'HISTORY_CHANGED','predecessor or workspace owner changed at the mutation edge')
+            _history_service(service)
+            binding=proof['binding']
+            con.execute('INSERT INTO conversations(conversation_id,shell_id,owner_user_id,harness,provider,model,effort,route_contract_version,route_binding,worktree,title,creation_idempotency_key,creation_request_hash,runtime_mode,runtime_projection) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
+                (new_cid,source['shell_id'],operator['user_id'],history.harness,source['provider'],history.model,history.effort,
+                 binding['contract_version'],route_bindings.canonical_json(binding),str(canonical),title,key,request_hash,'native_experiment',json.dumps(runtime)))
+            con.execute('INSERT INTO conversation_native_history(conversation_id,generation_id,source_conversation_id,source_generation_id,owner_user_id,shell_id,request_key,request_hash,source_digest,fingerprint_key,proof_digest) VALUES(?,?,?,?,?,?,?,?,?,?,?)',
+                (new_cid,new_gid,cid,history.source_generation_id,operator['user_id'],source['shell_id'],key,request_hash,source_digest,proof['fingerprint'],conversation_native_history.payload_digest(proof)))
+            active_chat_registry.register(con,source['shell_id'],new_cid)
+            _append_event(con,new_cid,'conversation.created',{'shell_id':source['shell_id'],'history_source_conversation_id':cid,'history_source_generation_id':history.source_generation_id,'generation_id':new_gid})
+    except RuntimeContractError as exc:
+        raise ApiError(404 if exc.code=='HISTORY_NOT_FOUND' else 409,exc.code,str(exc)) from exc
+    conversation_events.notify(new_cid)
+    service.notify()
+    return _json(201,_history_readback(con,operator,cid,key),[('Location',f'/api/conversations/{new_cid}')])
+
+
 def _list_conversations(con, operator: dict, query):
     if "mode" in query:
         raise ApiError(422, "VALIDATION_ERROR", "unknown query field: mode")
@@ -3016,6 +3119,16 @@ def handle(method: str, path: str, headers_raw: str, raw_body: bytes) -> tuple:
                     (query.get("name") or [""])[0],
                 )
             body = _body(raw_body)
+            history_path=_HISTORY_PATH.fullmatch(parsed.path)
+            if history_path:
+                if method=='POST':
+                    return _resume_history(con,operator,history_path.group(1),headers,body)
+                if method=='GET':
+                    values=query.get('request_key')
+                    if set(query)!={'request_key'} or not values or len(values)!=1 or not 1<=len(values[0])<=255:
+                        raise ApiError(422,'HISTORY_REQUEST_INVALID','one exact continuation request key is required')
+                    return _json(200,_history_readback(con,operator,history_path.group(1),values[0]))
+                raise ApiError(405,'METHOD_NOT_ALLOWED','unsupported explicit history operation')
             if parsed.path in {'/api/conversations/native-config','/api/conversations/native-checks'} or parsed.path.startswith('/api/conversations/native-checks/'):
                 import gui_experiment_runtime
                 fixture=gui_experiment_runtime._FIXTURE

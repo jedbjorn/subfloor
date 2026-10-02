@@ -52,6 +52,9 @@ class RuntimeStore:
         con=db_driver.connect(self.database)
         try:
             con.execute("BEGIN IMMEDIATE")
+            if context.history is not None:
+                from conversation_native_history import validate_context
+                validate_context(con,context,binding)
             row=con.execute("SELECT shell_id,owner_user_id,state,harness,provider,model,effort,worktree FROM conversations WHERE conversation_id=?",(context.conversation_id,)).fetchone()
             if row is None or (row["shell_id"],row["owner_user_id"]) != (context.shell_id,context.owner_user_id) or row["state"]=="closed":
                 raise RuntimeContractError("RUNTIME_NOT_OWNED", "open conversation ownership required")
@@ -74,6 +77,9 @@ class RuntimeStore:
             if context.history is not None:
                 captured['context']['history']={**dataclasses.asdict(context.history),
                     'source_worktree':str(context.history.source_worktree)}
+            if context.workspace is not None:
+                captured['context']['workspace']={**dataclasses.asdict(context.workspace),
+                    'cwd':str(context.workspace.cwd),'git_common_dir':str(context.workspace.git_common_dir)}
             now=time.time()
             con.execute("INSERT INTO conversation_runtime_generations(generation_id,conversation_id,shell_id,owner_user_id,harness,binding_json,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)",(context.generation_id,context.conversation_id,context.shell_id,context.owner_user_id,context.harness,encoded(captured),now,now))
             con.commit()
@@ -299,6 +305,11 @@ class RuntimeClient:
             data["history"]["source_worktree"]=str(context.history.source_worktree)
         else:
             data.pop("history",None)
+        if context.workspace is not None:
+            data['workspace']['cwd']=str(context.workspace.cwd)
+            data['workspace']['git_common_dir']=str(context.workspace.git_common_dir)
+        else:
+            data.pop('workspace',None)
         return self.request("open",context=data,timeout=120)
 
     def submit(self,store: RuntimeStore,owner: int,shell: int,cid: str,**payload) -> dict:

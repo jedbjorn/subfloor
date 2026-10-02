@@ -29,6 +29,7 @@ from conversation_runtime_contract import (
     RuntimeEvent,
     RuntimeIdentity,
     StartupConsent,
+    WorkspaceIdentity,
     WriteReceipt,
     payload_digest,
 )
@@ -661,6 +662,7 @@ def test_close_before_first_native_start_fences_open(controller,tmp_path,monkeyp
 def history_context(root, *, grant=True):
     history=NativeHistory('old-cv','old-g','old-root','codex','selected-model','high',root,'d'*64,'e'*64,'f'*64)
     return dataclasses.replace(context(root),model='selected-model',effort='high',history=history,
+                               workspace=WorkspaceIdentity(root,root/'.git','current-owned-branch','a'*40),
                                capability_evidence={CAP_HISTORY_RESUME:'compatible'} if grant else {})
 
 
