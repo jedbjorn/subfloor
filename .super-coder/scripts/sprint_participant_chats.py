@@ -51,6 +51,10 @@ class PreparedShellWake:
     model: str | None
     effort: str | None
     worktree: str
+    runtime_mode: str = 'ephemeral'
+    binding: dict | None = None
+    binding_digest: str | None = None
+    source_conversation_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -212,8 +216,9 @@ def prepare_shell_wake_conversation(con, shell_id: int) -> PreparedShellWake:
         raise SprintConversationError("wake receiver shell has no browser owner")
 
     browser_harnesses = tuple(sorted(ADAPTER_TYPES))
+    runtime_column='runtime_mode' if any(row['name']=='runtime_mode' for row in con.execute('PRAGMA table_info(conversations)')) else "'ephemeral' AS runtime_mode"
     prior = con.execute(
-        "SELECT harness,model,effort FROM conversations WHERE shell_id=? "
+        f"SELECT conversation_id,owner_user_id,harness,model,effort,{runtime_column} FROM conversations WHERE shell_id=? "
         f"AND harness IN ({','.join('?' for _ in browser_harnesses)}) "
         "ORDER BY created_at DESC,conversation_id DESC LIMIT 1",
         (shell_id, *browser_harnesses),
@@ -236,6 +241,15 @@ def prepare_shell_wake_conversation(con, shell_id: int) -> PreparedShellWake:
         if prior is not None and prior["effort"] is not None
         else None
     )
+    if prior is not None and prior['runtime_mode']=='native_experiment':
+        import sprint_native_wakes
+        if prior['owner_user_id']!=shell['user_id'] or not selected_model or not selected_effort:
+            raise SprintConversationError('native wake has no captured exact route')
+        binding,digest=sprint_native_wakes.checked_shell_route(con,shell_id,harness,selected_model,selected_effort)
+        worktree=run_mod.shell_work_dir(shell['shortname'],shell['flavor'])
+        return PreparedShellWake(int(shell['shell_id']),int(shell['user_id']),str(shell['shortname']),
+                                 harness,run_mod.session_provider(harness,selected_model),selected_model,selected_effort,str(worktree.resolve(strict=False)),
+                                 'native_experiment',binding,digest,str(prior['conversation_id']))
     try:
         resolved = run_mod.resolve_headless_route(
             harness=harness,
@@ -371,6 +385,22 @@ def create_shell_wake_conversation(
         raise RuntimeError("wake conversation creation requires a transaction")
     if active_chat_registry.get(con, route.shell_id) is not None:
         raise WakeConversationBusy("another chat became active before wake creation")
+    if route.runtime_mode=='native_experiment':
+        import sprint_native_wakes
+        if not route.model or not route.effort:
+            raise SprintConversationError('native shell wake requires exact selection')
+        if active_chat_registry.native_cleanup_pending(con,route.shell_id):
+            raise WakeConversationBusy('native wake cleanup remains pending')
+        binding,digest=sprint_native_wakes.checked_shell_route(con,route.shell_id,route.harness,route.model,route.effort)
+        if binding!=route.binding or digest!=route.binding_digest:
+            raise SprintConversationError('native shell wake proof changed before creation')
+        shell=con.execute('SELECT user_id,shortname,flavor,is_deleted FROM shells WHERE shell_id=?',(route.shell_id,)).fetchone()
+        prior=con.execute('SELECT conversation_id,owner_user_id,harness,model,effort,runtime_mode FROM conversations WHERE shell_id=? ORDER BY created_at DESC,conversation_id DESC LIMIT 1',(route.shell_id,)).fetchone()
+        if (shell is None or shell['user_id']!=route.owner_user_id or shell['shortname']!=route.shortname or shell['is_deleted']
+                or str(run_mod.shell_work_dir(shell['shortname'],shell['flavor']).resolve())!=route.worktree
+                or prior is None or (prior['conversation_id'],prior['owner_user_id'],prior['harness'],prior['model'],prior['effort'],prior['runtime_mode'])
+                    !=(route.source_conversation_id,route.owner_user_id,route.harness,route.model,route.effort,route.runtime_mode)):
+            raise SprintConversationError('native shell wake source selection or owner changed before creation')
 
     key = f"shell:{route.shell_id}:wake:{wake_id}"
     request = {
@@ -382,6 +412,8 @@ def create_shell_wake_conversation(
         "wake_id": wake_id,
         "worktree": route.worktree,
     }
+    if route.runtime_mode=='native_experiment':
+        request.update(runtime_mode=route.runtime_mode,binding_digest=route.binding_digest)
     existing = con.execute(
         "SELECT conversation_id,shell_id,state,creation_request_hash "
         "FROM conversations WHERE owner_user_id=? "
@@ -401,11 +433,18 @@ def create_shell_wake_conversation(
         return conversation_id
 
     conversation_id = "cv_" + uuid.uuid4().hex
+    native_columns=native_marks=''
+    native_values: tuple[Any,...]=()
+    if route.runtime_mode=='native_experiment':
+        native_columns=',runtime_mode,route_contract_version,route_binding,runtime_projection'
+        native_marks=',?,?,?,?'
+        native_values=(route.runtime_mode,2,route_bindings.canonical_json(route.binding),
+                       _canonical_json({'role':'ordinary','state':'starting','source':'wake','wake_id':wake_id}))
     con.execute(
         "INSERT INTO conversations "
         "(conversation_id,shell_id,owner_user_id,harness,provider,model,effort,"
-        "worktree,title,creation_idempotency_key,creation_request_hash) "
-        "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+        "worktree,title,creation_idempotency_key,creation_request_hash"+native_columns+") "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?"+native_marks+")",
         (
             conversation_id,
             route.shell_id,
@@ -418,7 +457,7 @@ def create_shell_wake_conversation(
             f"Wake {wake_id} · {route.shortname}",
             key,
             request_hash,
-        ),
+        )+native_values,
     )
     _append_event(
         con,

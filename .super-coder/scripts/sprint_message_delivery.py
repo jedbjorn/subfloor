@@ -1053,6 +1053,17 @@ class SprintWakeDeliveryService:
         now_value = self.now()
         now = _stamp(now_value)
         expires = _stamp(now_value + timedelta(seconds=lease_seconds))
+        # Controller observations occur before the DB-only claim transaction;
+        # exact current owner/generation and queued intents are re-read inside.
+        import sprint_native_wakes
+        native_observations={}
+        for active_row in self.con.execute('SELECT shell_id,chat_id FROM active_shell_chats').fetchall():
+            chat=sprint_native_wakes.native_chat(self.con,active_row['chat_id'])
+            if chat is not None and not sprint_native_wakes.released(self.con,active_row['chat_id']) and self._receiver_has_force_new(active_row['shell_id']):
+                try:
+                    native_observations[active_row['chat_id']]=sprint_native_wakes.observe(self.con,active_row['chat_id'])
+                except (RuntimeError,OSError):
+                    native_observations[active_row['chat_id']]=None
         with db_driver.write_transaction(self.con, "sprint.wake.claim"):
             self.con.execute(
                 "UPDATE sprint_wake_outbox SET state='pending',available_at=?,"
@@ -1090,6 +1101,18 @@ class SprintWakeDeliveryService:
                 ):
                     row = candidate
                     break
+                if active is not None and sprint_native_wakes.native_chat(self.con,active.chat_id) is not None and not sprint_native_wakes.released(self.con,active.chat_id):
+                    observed=native_observations.get(active.chat_id)
+                    chat=sprint_native_wakes.native_chat(self.con,active.chat_id)
+                    if observed is None or not sprint_native_wakes.current_observation(self.con,observed[0],chat,observed[1]):
+                        self.con.execute('UPDATE sprint_wake_outbox SET quiet_since=NULL,native_quiet_signature=NULL WHERE wake_id=?',(candidate['wake_id'],))
+                        continue
+                    signature=sprint_native_wakes.signature(observed[1])
+                    if candidate['native_quiet_signature']!=signature:
+                        self.con.execute('UPDATE sprint_wake_outbox SET quiet_since=?,native_quiet_signature=? WHERE wake_id=?',(now,signature,candidate['wake_id']))
+                        if self.force_new_quiet_seconds>0:
+                            continue
+                        candidate=dict(candidate)|{'quiet_since':now,'native_quiet_signature':signature}
                 if active is not None and active_chat_registry.has_live_process(active):
                     self.con.execute(
                         "UPDATE sprint_wake_outbox SET quiet_since=NULL "
@@ -1256,6 +1279,32 @@ class SprintWakeDeliveryService:
             active, lease.wake_id
         ):
             return active.chat_id
+        import sprint_native_wakes
+        native_active=sprint_native_wakes.native_chat(self.con,active.chat_id) if active else None
+        if active is not None and native_active is not None and not sprint_native_wakes.released(self.con,active.chat_id):
+            wants_new=wants_force_new or 'new' in lease.declared_types
+            if not wants_new:
+                if json.loads(native_active['runtime_projection']).get('state') in {'closing','closed','lost'}:
+                    raise ForceNewDeferred('native runtime cleanup is pending')
+                return active.chat_id
+            try:
+                service,observation=sprint_native_wakes.observe(self.con,active.chat_id)
+                quiet=sprint_native_wakes.current_observation(self.con,service,native_active,observation)
+            except (RuntimeError,OSError):
+                quiet=False
+            if not quiet:
+                if not wants_force_new and json.loads(native_active['runtime_projection']).get('state')=='ready':
+                    return active.chat_id # New preserves the existing live-turn boundary.
+                raise ForceNewDeferred('native runtime is active, stale, or pending cleanup')
+            if wants_force_new:
+                current=self.con.execute('SELECT quiet_since,native_quiet_signature FROM sprint_wake_outbox WHERE wake_id=? AND state=\'delivering\' AND claim_owner=?',(lease.wake_id,lease.claim_owner)).fetchone()
+                if (current is None or current['quiet_since'] is None
+                        or current['native_quiet_signature']!=sprint_native_wakes.signature(observation)
+                        or (self.now()-_parse_stamp(current['quiet_since'])).total_seconds()<self.force_new_quiet_seconds):
+                    raise ForceNewDeferred('native force-new quiet observation changed')
+            sprint_native_wakes.request_rotation(self.con,active.chat_id,lease.wake_id,
+                                                 self.force_new_quiet_seconds if wants_force_new else 0)
+            raise ForceNewDeferred('native Close must verify complete cleanup before replacement')
         if active is not None and active_chat_registry.has_live_process(active):
             if wants_force_new:
                 raise ForceNewDeferred("a live chat appeared after force-new claim")
@@ -1302,7 +1351,7 @@ class SprintWakeDeliveryService:
                     closed = active_chat_registry.close_for_wake(
                         self.con,
                         lease.receiver_shell_id,
-                        expected_chat_id=(active.chat_id if wants_force_new else None),
+                        expected_chat_id=(active.chat_id if wants_force_new or native_active is not None else None),
                     )
                     if closed is not None:
                         closed_id = closed.chat_id

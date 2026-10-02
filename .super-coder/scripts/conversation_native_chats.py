@@ -520,7 +520,27 @@ class NativeChatsService:
             verdict = 'CAPABILITY_INCOMPATIBLE' if caps.get(capability)=='incompatible' else 'CAPABILITY_INCONCLUSIVE'
             raise RuntimeContractError(verdict,f'{capability} has no matching compatible native proof coverage')
 
-    def request_close(self,con,cid: str,owner: int,version: int) -> None:
+    def observe_wake(self, con, cid: str) -> dict:
+        """Fresh private observation; callers perform RPC outside write transactions."""
+        if con.in_transaction:
+            raise RuntimeError('wake observation cannot run inside a write transaction')
+        chat=con.execute('SELECT * FROM conversations WHERE conversation_id=?',(cid,)).fetchone()
+        if chat is None or chat['runtime_mode']!='native_experiment':
+            raise RuntimeContractError('RUNTIME_NOT_OWNED','wake requires an owned native chat')
+        runtime=json.loads(chat['runtime_projection'])
+        generation=runtime.get('generation_id')
+        if not generation or runtime.get('role')!='ordinary':
+            raise RuntimeContractError('WAKE_NOT_QUIET','native preparation/probe is not a quiet ordinary generation')
+        client,owner,shell=self.attach(generation)
+        if owner!=chat['owner_user_id'] or shell!=chat['shell_id']:
+            raise RuntimeContractError('RUNTIME_NOT_OWNED','wake controller differs from chat owner')
+        status=client.request('status',timeout=1)
+        return {'conversation_id':cid,'generation_id':generation,'owner_user_id':owner,'shell_id':shell,
+                'observed_at':time.time(),'consumer_fence':client.lease['fence'],
+                'status':status}
+
+    def request_close(self,con,cid: str,owner: int,version: int, *, wake_id: int | None = None,
+                      observation: dict | None = None, quiet_seconds: int = 0) -> None:
         """Persist the Close fence atomically with the operator/version check.
 
         The API returns the persisted chat immediately. Its independent
@@ -549,11 +569,33 @@ class NativeChatsService:
                 raise RuntimeContractError('GENERATION_INVALID','Close must match the retained chat generation')
             probe=projection.get('role')=='probe'
             control_id = 'probe-close' if probe else 'close:'+gid
-            existing = con.execute('SELECT 1 FROM conversation_runtime_commands WHERE generation_id=? AND command_id=?',(gid,control_id)).fetchone()
+            options={}
+            if wake_id is not None:
+                from sprint_native_wakes import current_observation
+                if (observation is None or not current_observation(con,self,chat,observation)
+                        or observation['generation_id']!=gid or generation['close_intent']):
+                    raise RuntimeContractError('WAKE_NOT_QUIET','wake ownership or quiet observation changed before Close')
+                quiet=observation['status']['quiet']
+                options={'wake_quiet_epoch':quiet['epoch'],'wake_quiet_seconds':quiet_seconds}
+                control_id=f'wake-close:{wake_id}:{gid}:{quiet["epoch"]}'
+                projection['wake_rotation']={'wake_id':wake_id,'epoch':quiet['epoch']}
+                projection['close_control_id']=control_id
+            else:
+                # An explicit operator Close supersedes a conditional wake
+                # attempt. Its unconditional fence may never be cleared by a
+                # delayed proved-no-write response from that older attempt.
+                projection.pop('wake_rotation',None)
+                projection.pop('close_control_id',None)
+            existing = con.execute('SELECT * FROM conversation_runtime_commands WHERE generation_id=? AND command_id=?',(gid,control_id)).fetchone()
+            if existing is not None and wake_id is not None:
+                previous=json.loads(existing['intent_json'])
+                if existing['state']!='not_written' or previous.get('options')!=options:
+                    raise RuntimeContractError('CLEANUP_PENDING','wake Close has a retained written or unknown intent')
+                con.execute("UPDATE conversation_runtime_commands SET state='accepted' WHERE generation_id=? AND command_id=?",(gid,control_id))
             if existing is None:
                 command = {'control_id':control_id,'request_sequence':generation['next_command_sequence'],'action':'close'}
                 if not probe:
-                    command.update(target=None,expected_activity_id=None,options={})
+                    command.update(target=None,expected_activity_id=None,options=options)
                 digest = payload_digest(command)
                 con.execute("INSERT INTO conversation_runtime_commands(generation_id,command_id,command_sequence,kind,payload_digest,intent_json) VALUES(?,?,?,'control',?,?)",(gid,control_id,command['request_sequence'],digest,encoded(command)))
                 con.execute("UPDATE conversation_runtime_generations SET next_command_sequence=next_command_sequence+1 WHERE generation_id=?",(gid,))
@@ -570,7 +612,7 @@ class NativeChatsService:
             runtime=json.loads(row[0]) if row else {}
             if runtime.get('generation_id')!=generation:
                 raise RuntimeContractError('GENERATION_INVALID','Close is outside the retained chat generation')
-            return 'probe-close' if runtime.get('role')=='probe' else 'close:'+generation
+            return runtime.get('close_control_id') or ('probe-close' if runtime.get('role')=='probe' else 'close:'+generation)
         finally:
             con.close()
 
@@ -602,8 +644,15 @@ class NativeChatsService:
         command = json.loads(row['intent_json'])|{'payload_digest':row['payload_digest']}
         try:
             native_cleanup = client.request('close',command=command,timeout=5)
-        except (OSError,RuntimeContractError):
+        except RuntimeContractError as exc:
+            native_cleanup = ({'state':'not_written','detail':exc.code} if exc.code in {'BACKPRESSURE','LEASE_FENCED','DEADLINE_EXPIRED'}
+                              else {'outcome':'inconclusive','delivery_unknown':True,'detail':'native cleanup deadline/transport inconclusive'})
+        except OSError:
             native_cleanup = {'outcome':'inconclusive','delivery_unknown':True,'detail':'native cleanup deadline/transport inconclusive'}
+        if native_cleanup.get('state')=='not_written' and command.get('options'):
+            self.store.receipt(generation,owner,shell,control_id,native_cleanup)
+            self.release_wake_close(generation,cid,owner,shell,control_id,client.lease['fence'])
+            return
         # Record ambiguity before any OS fallback. Never rerun an unknown
         # control under a fresh identity after API death or a lost reply.
         self.store.receipt(generation,owner,shell,control_id,{'state':'unknown' if native_cleanup.get('delivery_unknown') else 'written','native_cleanup':native_cleanup})
@@ -615,6 +664,30 @@ class NativeChatsService:
         if retained.get('state')=='terminal' and retained.get('outcome'):
             native_cleanup = retained
         self.finish_cleanup(generation,cid,owner,shell,native_cleanup)
+
+    def release_wake_close(self,generation: str,cid: str,owner: int,shell: int,control_id: str,fence: int) -> None:
+        retained=db_driver.connect(str(self.database))
+        try:
+            with db_driver.write_transaction(retained,'native_chat.wake_close_no_write'):
+                current=retained.execute('SELECT runtime_projection FROM conversations WHERE conversation_id=? AND owner_user_id=? AND shell_id=?',(cid,owner,shell)).fetchone()
+                runtime=json.loads(current[0]) if current else {}
+                owned=retained.execute('SELECT * FROM conversation_runtime_generations WHERE generation_id=? AND conversation_id=? AND owner_user_id=? AND shell_id=?',(generation,cid,owner,shell)).fetchone()
+                command=retained.execute('SELECT state,intent_json,receipt_json FROM conversation_runtime_commands WHERE generation_id=? AND command_id=?',(generation,control_id)).fetchone()
+                if (owned and command and command['state']=='not_written'
+                        and json.loads(command['intent_json']).get('options')
+                        and runtime.get('generation_id')==generation and runtime.get('close_control_id')==control_id
+                        and owned['consumer_fence']==fence and owned['consumer_id']==self.consumer
+                        and owned['consumer_expires']>time.time() and owned['state']=='closing'):
+                    state='ready' if json.loads(command['receipt_json']).get('runtime_ready') is True else 'lost'
+                    runtime.update(state=state)
+                    runtime.pop('close_control_id',None)
+                    runtime.pop('wake_rotation',None)
+                    retained.execute("UPDATE conversation_runtime_generations SET close_intent=0,state=? WHERE generation_id=?",(state,generation))
+                    retained.execute('UPDATE conversations SET runtime_projection=?,version=version+1 WHERE conversation_id=?',(encoded(runtime),cid))
+                    append_event(retained,cid,'control.acknowledged',{'generation_id':generation,'control_id':control_id,'state':'not_written','detail':'wake quiet condition changed'})
+        finally:
+            retained.close()
+        conversation_events.notify(cid)
 
     def recover_close(self,generation: str,cid: str,owner: int,shell: int) -> None:
         """Recovery never invents/replays native writes after ambiguous delivery.
@@ -675,7 +748,7 @@ class NativeChatsService:
                 con.execute('UPDATE conversation_runtime_generations SET state=?,cleanup_json=?,updated_at=? WHERE generation_id=?',('closed' if complete else 'lost',encoded(cleanup),time.time(),generation))
                 projection.update(state='closed' if complete else 'lost',cleanup=cleanup,setup=None,primary=None)
                 con.execute('UPDATE conversations SET runtime_projection=?,version=version+1 WHERE conversation_id=?',(encoded(projection),cid))
-                append_event(con,cid,'control.outcome',{'generation_id':generation,'control_id':'probe-close' if projection.get('role')=='probe' else 'close:'+generation,**cleanup})
+                append_event(con,cid,'control.outcome',{'generation_id':generation,'control_id':projection.get('close_control_id') or ('probe-close' if projection.get('role')=='probe' else 'close:'+generation),**cleanup})
                 if complete:
                     self._finish_chat(con,cid)
         finally:
@@ -743,7 +816,9 @@ class NativeChatsService:
                     generation_state = self.store.status(row['generation_id'],owner,shell)
                     if generation_state['close_intent']:
                         command_state = self.store.command_status(row['generation_id'],owner,shell,self.close_id(row['generation_id'],row['conversation_id']))['state']
-                        if command_state=='accepted':
+                        if command_state=='not_written':
+                            self.release_wake_close(row['generation_id'],row['conversation_id'],owner,shell,self.close_id(row['generation_id'],row['conversation_id']),client.lease['fence'])
+                        elif command_state=='accepted':
                             self.close_generation(row['generation_id'],row['conversation_id'],client,owner,shell)
                         else:
                             self.recover_close(row['generation_id'],row['conversation_id'],owner,shell)
