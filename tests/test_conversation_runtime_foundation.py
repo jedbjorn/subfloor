@@ -205,6 +205,11 @@ def test_private_socket_reconnect_same_controller_and_replay_once(controller,tmp
         assert len(replay['events'])==1
         replacement.request('ack',sequence=1)
         assert replacement.request('subscribe',after=1)['events']==[]
+        driver.block=True;driver.release.clear()
+        started=time.monotonic()
+        assert replacement.request('submit',command=command('bounded',2,text='hi'),timeout=.04)['state']=='unknown'
+        assert time.monotonic()-started<.2
+        driver.release.set()
     finally:
         owner.shutdown.set();thread.join(2)
 
@@ -293,6 +298,42 @@ def test_projection_preserves_scoped_opaque_handles_and_terminal_monotonicity(tm
     assert con.execute('SELECT COUNT(*) FROM conversation_runtime_work').fetchone()[0]==2
     assert con.execute('SELECT state FROM conversation_runtime_commands').fetchone()[0]=='terminal'
     con.close()
+    store.intent('g',1,1,lease,'stop','control',{'action':'stop_work'})
+    store.receipt('g',1,1,'stop',{'state':'written','acknowledged':True})
+    def outcome(n,value):
+        event=RuntimeEvent('control.outcome',control_id='stop',data={'outcome':value})
+        store.ingest('g',1,1,lease,{'events':[{'sequence':n,'event':dataclasses.asdict(event)}]})
+    outcome(5,'inconclusive')
+    assert store.command_status('g',1,1,'stop')['state']=='written'
+    outcome(6,'complete');outcome(7,'pending')
+    store.receipt('g',1,1,'stop',{'state':'written','acknowledged':True})
+    original=store.command_status('g',1,1,'stop')
+    assert original['state']=='terminal' and original['receipt']['outcome']=='complete'
+    client=RuntimeClient(tmp_path/'unused.sock','g',controller_pid=1,controller_start_ticks=1)
+    client.lease=lease
+    def compacted(*args,**kwargs):
+        raise RuntimeContractError('COMMAND_COMPACTED','resolved command below rejection boundary')
+    client.request=compacted
+    for _ in range(5):
+        result=client.control(store,1,1,'stop',action='stop_work')
+        assert result['state']=='terminal' and result['receipt']['outcome']=='complete' and result['compacted']
+    assert store.command_status('g',1,1,'stop')==original
+
+
+def test_expired_admission_never_reserves_or_writes_and_ingress_bounds_deadline(controller):
+    owner,driver=controller
+    owner.dispatch_lock.acquire()
+    try:
+        started=time.monotonic()
+        with pytest.raises(RuntimeContractError,match='waiting for dispatch admission'):
+            owner.handle(wire('submit',command=command('expired',1,text='hi'),timeout=.03))
+        assert time.monotonic()-started<.15
+    finally:
+        owner.dispatch_lock.release()
+    assert not driver.writes and owner.journal.db.execute('SELECT COUNT(*) FROM commands').fetchone()[0]==0
+    for bad in [0,-1,True,float('nan'),float('inf'),121,'1']:
+        with pytest.raises(RuntimeContractError,match='positive finite timeout'):
+            owner.handle(wire('status',timeout=bad))
 
 
 def test_late_start_or_processing_cannot_resurrect_terminal_root(controller):
