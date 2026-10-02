@@ -26,7 +26,12 @@ from conversation_runtime_contract import (
     RuntimeIdentity,
     StartupConsent,
 )
-from conversation_runtime_controller import encoded, observed_claude_memory, start_ticks
+from conversation_runtime_controller import (
+    encoded,
+    observed_claude_memory,
+    observed_native_route,
+    start_ticks,
+)
 from conversation_runtime_native_probes import OwnedProbe
 
 
@@ -196,7 +201,11 @@ class NativeProbeOwner:
                 raise RuntimeContractError('NATIVE_MEMORY_INCONCLUSIVE','owned qualified Claude hook/config observation is unavailable')
         else:
             memory={key:memory[key] for key in ('generate_memories','use_memories','feature_enabled','root_mode') if key in memory}
-        self._update(cid,generation,state='checking',root_id=identity.root_id,native_route=identity.protocol.get('native_route'),
+        route=observed_native_route(identity.protocol.get('native_route'))
+        if context is not None and (route['account_type']!=('claude.ai' if context.harness=='claude' else 'chatgpt')
+                or route['model']!=context.model or context.effort not in route['efforts']):
+            raise RuntimeContractError('NATIVE_ROUTE_INCONCLUSIVE','actual selected account/model/effective effort is unavailable')
+        self._update(cid,generation,state='checking',root_id=identity.root_id,native_route=route,
                      memory_policy=memory,
                      ready_observation_at=time.time(),native_process={'pid':identity.process.pid,'start_ticks':identity.process.start_ticks} if identity.process else None,
                      setup=None)

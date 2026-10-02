@@ -33,7 +33,7 @@ class FixtureChats:
         self.seat.ensure_codegen_clean()
         fp=self.seat.candidate_fingerprint(harness,model,effort)
         evidence=self.operation.cache.get(fp,'submission')
-        if evidence is None or evidence.grade!='compatible':
+        if evidence is None or evidence.grade!='compatible' or self.operation.cache.admission(fp).get('submission')!='compatible':
             code='CAPABILITY_INCOMPATIBLE' if evidence and evidence.grade=='incompatible' else 'CAPABILITY_INCONCLUSIVE'
             raise RuntimeContractError(code,'selected installed identity has no cleanup-bound submission coverage')
         con=db_driver.connect(str(self.database))

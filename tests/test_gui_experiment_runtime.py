@@ -41,8 +41,8 @@ def operation(request,monkeypatch):
             self.database,self.root=kwargs['database'],kwargs['root']
             calls.append('seat')
         def ensure_codegen_clean(self):pass
-        def candidate_fingerprint(self,*args):
-            assert args==('codex','gpt-6.1-sol','high')
+        def candidate_fingerprint(self,*args,**kwargs):
+            assert args==('codex','gpt-6.1-sol','high') if args else kwargs=={'harness':'codex','model':'gpt-6.1-sol','effort':'high'}
             calls.append('candidate');return fp
         def observe_native_schema(self,fingerprint,deadline):
             calls.append('schema')
@@ -207,7 +207,7 @@ def test_delayed_old_completion_merges_current_persisted_fingerprint_evidence(op
     try:
         assert entered.wait(1)
         newer=dataclasses.replace(fp,implementation_digest='e'*64)
-        value.seat.candidate_fingerprint=lambda *args:newer
+        value.seat.candidate_fingerprint=lambda *args,**kwargs:newer
         value.begin()
         item=CapabilityEvidence('submission','inconclusive')
         value.cache.put(newer,item)
@@ -361,3 +361,57 @@ def test_known_preallocation_schema_failure_is_retryable_without_fabricated_clea
     assert not value.schema_cleanup_pending
     monkeypatch.setattr(value.seat,'observe_native_schema',original)
     assert value.native_schema(fp,time.monotonic()+20).generation_completed
+
+
+def test_claude_begin_uses_native_validators_not_codex_schema(operation,monkeypatch):
+    import dataclasses
+
+    from conversation_native_checks import CLAUDE_SELECTION
+    from conversation_runtime_contract import RuntimeContractError
+    value,fp,_,calls=operation
+    claude=dataclasses.replace(fp,harness='claude',provider='anthropic',model=CLAUDE_SELECTION['model'])
+    selected=[]
+    def candidate(*args,**kwargs):
+        assert not args and kwargs==CLAUDE_SELECTION
+        selected.append(dict(kwargs));return claude
+    value.seat.candidate_fingerprint=candidate
+    monkeypatch.setattr(value,'native_schema',lambda *args:pytest.fail('Claude never consumes Codex generated schema'))
+    future=Future();requests=[]
+    value.checker.request=lambda observed,**kwargs:requests.append((observed,kwargs)) or future
+    result=value.begin(selection=CLAUDE_SELECTION,on_candidate=lambda key: selected.append(key))
+    assert result['harness']=='claude' and result['grades']=={} and not result['ordinary_chats_admitted']
+    assert result['structural_observation']=='source-adapter-signatures-plus-native-runtime-validators'
+    assert 'native_schema' not in result and 'schema' not in calls
+    assert selected==[CLAUDE_SELECTION,claude.key]
+    assert requests[0][0]==claude and set(requests[0][1]['requirements'])=={'submission','stop_reply','stop_work'}
+    assert value.begin(selection=CLAUDE_SELECTION)['state']=='running' and len(requests)==1
+    with pytest.raises(RuntimeContractError) as exc:value.begin()
+    assert exc.value.code=='CHECK_BUSY' and len(requests)==1
+    future.set_result(CheckResult(claude,{},CleanupProof(True,'complete')))
+    assert value.status()['grades']['submission']=='unverified'
+
+
+def test_unknown_codegen_cleanup_fences_claude_before_candidate(operation):
+    from conversation_native_checks import CLAUDE_SELECTION
+    from conversation_runtime_contract import RuntimeContractError
+    value,_,_,calls=operation
+    value.schema_cleanup_pending=True
+    before=list(calls)
+    with pytest.raises(RuntimeContractError) as exc:value.begin(selection=CLAUDE_SELECTION)
+    assert exc.value.code=='CLEANUP_PENDING' and calls==before
+
+
+@pytest.mark.parametrize('change',[{}, {'harness':'claude','provider':'openai','model':'claude-sonnet-5-5'},
+                                  {'harness':'claude','provider':'anthropic','model':'other'},
+                                  {'harness':'claude','provider':'anthropic','model':'claude-sonnet-5-5','effort':'low'}])
+def test_selected_claude_candidate_cannot_use_foreign_fingerprint(operation,monkeypatch,change):
+    import dataclasses
+
+    from conversation_native_checks import CLAUDE_SELECTION
+    from conversation_runtime_contract import RuntimeContractError
+    value,fp,_,_=operation
+    value.seat.candidate_fingerprint=lambda **_:dataclasses.replace(fp,**change)
+    monkeypatch.setattr(value,'native_schema',lambda *a:pytest.fail('no schema on selection mismatch'))
+    monkeypatch.setattr(value.checker,'request',lambda *a,**k:pytest.fail('no dispatch on selection mismatch'))
+    with pytest.raises(RuntimeContractError) as exc:value.begin(selection=CLAUDE_SELECTION)
+    assert exc.value.code=='CHECK_CANDIDATE_CHANGED' and value.future is None and value.fingerprint is None

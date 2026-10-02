@@ -122,7 +122,8 @@ def test_unresolved_startup_or_route_prerequisite_cannot_allocate_or_infer(owner
     assert not events and con.execute('SELECT COUNT(*) FROM conversation_runtime_probe_jobs').fetchone()[0]==0
 
 
-def test_claude_probe_captures_pending_prerequisite_then_qualified_owned_hook(owner):
+@pytest.mark.parametrize('gap',['none','account','model','effort','route','memory'])
+def test_claude_probe_captures_pending_prerequisite_then_qualified_owned_hook(owner,gap):
     value,fp,con,events=owner
     fp=dataclasses.replace(fp,harness='claude',provider='anthropic')
     prerequisite={'state':'configured_pending_owned_hook','evidence_level':'configuration_source_flag_inference',
@@ -143,9 +144,26 @@ def test_claude_probe_captures_pending_prerequisite_then_qualified_owned_hook(ow
             'executable_sha256':fp.executable.sha256,'configuration_sha256':'e'*64,'hook_sha256':'f'*64,
             'source_condition_sha256':'c'*64,'inherited_disable_flag':'1','auto_memory_enabled_setting':False}
     with pytest.raises(RuntimeContractError):probe.on_identity(RuntimeIdentity('root',protocol={'memory_policy':policy}))
-    probe.on_identity(RuntimeIdentity('root',protocol={'configuration_sha256':'e'*64,'memory_policy':policy}))
+    route={'account_type':'claude.ai','model':probe.context.model,'efforts':[probe.context.effort],
+           'catalogue_observed':False,'observation_origin':'claude:owned-hooks','unconsumed':'private',
+           'auth':{'method':'oauth','provider':'claude.ai','subscription_type':'pro','email':'private'}}
+    protocol={'configuration_sha256':'e'*64,'memory_policy':policy,'native_route':route}
+    if gap=='account':route['account_type']='api'
+    elif gap=='model':route['model']='fallback'
+    elif gap=='effort':route['efforts']=['low']
+    elif gap=='route':del protocol['native_route']
+    elif gap=='memory':protocol['configuration_sha256']='a'*64
+    if gap!='none':
+        with pytest.raises(RuntimeContractError):probe.on_identity(RuntimeIdentity('root',protocol=protocol))
+        runtime=json.loads(con.execute('SELECT runtime_projection FROM conversations WHERE conversation_id=?',(probe.context.conversation_id,)).fetchone()[0])
+        assert 'native_route' not in runtime and 'memory_policy' not in runtime
+        assert runtime['capabilities']=={} and events==['git','prepare','launch']
+        return
+    probe.on_identity(RuntimeIdentity('root',protocol=protocol))
     runtime=json.loads(con.execute('SELECT runtime_projection FROM conversations WHERE conversation_id=?',(probe.context.conversation_id,)).fetchone()[0])
     assert runtime['memory_policy']==policy and runtime['capabilities']=={}
+    assert 'unconsumed' not in runtime['native_route'] and 'email' not in runtime['native_route']['auth']
+    assert runtime['native_route']['catalogue_observed'] is False
     assert events==['git','prepare','launch']
 
 
