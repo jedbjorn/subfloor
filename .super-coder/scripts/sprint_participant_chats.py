@@ -24,6 +24,7 @@ from conversation_adapters import ADAPTER_TYPES
 ENGINE = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ENGINE / "api"))
 import route_bindings
+import sprint_native_selection
 
 _WAKE_ROLES = {
     "developer": ("Developer", "sprint_dev"),
@@ -70,6 +71,7 @@ class PreparedSprintWake:
     control_state: str | None
     binding_digest: str | None
     binding: dict | None
+    runtime_mode: str = "ephemeral"
 
 
 @dataclass(frozen=True)
@@ -83,6 +85,7 @@ class PreparedParticipantRoute:
     model: str
     effort: str | None
     worktree: str
+    runtime_mode: str = "ephemeral"
 
 
 def wake_prompt(sprint_id: int, role: str) -> str:
@@ -262,7 +265,14 @@ def _prepare_participant_route(
     harness: str,
     model: str | None,
     effort: str | None,
+    con=None,
 ) -> PreparedParticipantRoute:
+    if sprint_native_selection.mode(row) == "native_experiment":
+        binding, _ = sprint_native_selection.checked_binding(con, row["participant_id"], harness, model, effort)
+        worktree = run_mod.shell_work_dir(row["shortname"], row["flavor"])
+        return PreparedParticipantRoute(int(row["participant_id"]), int(row["shell_id"]),
+            str(row["role"]), str(row["shortname"]), harness, run_mod.session_provider(harness, model),
+            binding["requested_model"], binding["effective_effort"], str(worktree.resolve()), "native_experiment")
     adapter = _browser_adapter(harness)
     try:
         resolved = run_mod.resolve_headless_route(
@@ -300,7 +310,8 @@ def prepare_participant_route(
     """Resolve one proposed participant route without mutating its Sprint."""
     row = con.execute(
         "SELECT p.participant_id,p.shell_id,p.role,p.harness,p.model,p.effort,"
-        "sh.shortname,sh.flavor,fd.model AS flavor_model "
+        "sh.shortname,sh.flavor,fd.model AS flavor_model,"
+        + sprint_native_selection.mode_projection(con) + " "
         "FROM sprint_participants p "
         "JOIN shells sh ON sh.shell_id=p.shell_id "
         "LEFT JOIN flavor_defaults fd "
@@ -315,6 +326,7 @@ def prepare_participant_route(
         harness=harness,
         model=model,
         effort=effort,
+        con=con,
     )
 
 
@@ -325,7 +337,8 @@ def prepare_sprint_participant_routes(
     """Read and canonicalize one ordered snapshot of participant routes."""
     rows = con.execute(
         "SELECT p.participant_id,p.shell_id,p.role,p.harness,p.model,p.effort,"
-        "sh.shortname,sh.flavor,fd.model AS flavor_model "
+        "sh.shortname,sh.flavor,fd.model AS flavor_model,"
+        + sprint_native_selection.mode_projection(con) + " "
         "FROM sprint_participants p "
         "JOIN shells sh ON sh.shell_id=p.shell_id "
         "LEFT JOIN flavor_defaults fd "
@@ -341,6 +354,7 @@ def prepare_sprint_participant_routes(
             harness=str(row["harness"]),
             model=row["model"],
             effort=row["effort"],
+            con=con,
         )
         for row in rows
     )
@@ -457,7 +471,8 @@ def prepare_wake_conversation(
     )
     row = con.execute(
         "SELECT p.participant_id,p.sprint_id,p.shell_id,p.harness,p.model,p.effort,"
-        "s.conversation_generation,sh.shortname,sh.flavor,owner.user_id,"
+        "s.conversation_generation,s.lifecycle,sh.shortname,sh.flavor,owner.user_id,"
+        + sprint_native_selection.mode_projection(con) + ","
         "fd.model AS flavor_model," + binding_projection +
         "FROM sprint_participants p "
         "JOIN sprints s ON s.sprint_id=p.sprint_id "
@@ -482,6 +497,11 @@ def prepare_wake_conversation(
     route_revision = None
     binding_digest = None
     control_state = None
+    runtime_mode = sprint_native_selection.mode(row)
+    if runtime_mode == "native_experiment" and row["lifecycle"] != "armed":
+        raise SprintConversationError("native Sprint wake creation requires an armed Sprint")
+    if runtime_mode == "native_experiment" and row["active_route_binding_id"] is None:
+        raise SprintConversationError('native Sprint participant has no armed checked route binding')
     if row["active_route_binding_id"] is None:
         harness = str(row["harness"])
         adapter = _browser_adapter(harness)
@@ -539,7 +559,18 @@ def prepare_wake_conversation(
                 f"route:{route_revision}:wake:%",
             ),
         ).fetchone()
-        if prior_native_turn is None:
+        if runtime_mode == "native_experiment":
+            if (harness, model, effort) != (row['harness'], row['model'], row['effort']):
+                raise SprintConversationError('native participant intent differs from armed route')
+            try:
+                current_binding, current_digest = sprint_native_selection.checked_binding(
+                    con, participant_id, harness, model, effort,
+                )
+                if current_digest != binding_digest or current_binding != binding:
+                    raise ValueError('native Sprint proof differs from captured route binding')
+            except ValueError as exc:
+                raise SprintConversationError(str(exc)) from exc
+        elif prior_native_turn is None:
             try:
                 route_bindings.verify_stored_v2_before_first_turn(
                     con,
@@ -573,6 +604,7 @@ def prepare_wake_conversation(
         control_state=control_state,
         binding_digest=binding_digest,
         binding=binding,
+        runtime_mode=runtime_mode,
     )
 
 
@@ -587,6 +619,20 @@ def create_prepared_wake_conversation(
         raise RuntimeError("wake conversation creation requires a transaction")
     if active_chat_registry.get(con, route.shell_id) is not None:
         raise WakeConversationBusy("another chat became active before wake creation")
+
+    current = con.execute('SELECT ' + sprint_native_selection.mode_projection(con) +
+                          ' FROM sprint_participants p WHERE participant_id=? AND sprint_id=?',
+                          (route.participant_id, route.sprint_id)).fetchone()
+    if current is None or sprint_native_selection.mode(current) != route.runtime_mode:
+        raise SprintConversationError('Sprint runtime mode changed before creation')
+    if route.runtime_mode == "native_experiment":
+        # Revalidate the entire current owner/mode/route/proof snapshot at the
+        # mutation edge. A prepared route is not a launch authorization.
+        fresh = prepare_wake_conversation(con, sprint_id=route.sprint_id,
+                                          participant_id=route.participant_id)
+        if fresh != route:
+            raise SprintConversationError('native Sprint selection changed before creation')
+        active_chat_registry.require_native_cleanup(con, route.shell_id)
 
     key = (
         f"generation:{route.generation}:participant:{route.participant_id}:"
@@ -612,6 +658,8 @@ def create_prepared_wake_conversation(
                 "route_revision": route.route_revision,
             }
         )
+    if route.runtime_mode == "native_experiment":
+        request['runtime_mode'] = route.runtime_mode
     request_hash = _request_hash(request)
     existing = con.execute(
         "SELECT conversation_id,state,creation_request_hash FROM conversations "
@@ -684,6 +732,12 @@ def create_prepared_wake_conversation(
                 request_hash,
             ),
         )
+    if route.runtime_mode == "native_experiment":
+        projection = {'role': 'ordinary', 'state': 'starting',
+                      'source': 'sprint', 'sprint_id': route.sprint_id,
+                      'participant_id': route.participant_id, 'wake_id': wake_id}
+        con.execute('UPDATE conversations SET runtime_mode=?,runtime_projection=? WHERE conversation_id=?',
+                    (route.runtime_mode, _canonical_json(projection), conversation_id))
     _append_created_event(
         con,
         conversation_id=conversation_id,

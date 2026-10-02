@@ -72,7 +72,8 @@ class FixtureChats:
             raise RuntimeContractError('NATIVE_ROUTE_INCONCLUSIVE','native selected account/model/effort observation does not match')
         binding=NativeProbeOwner.candidate_binding(fp)
         binding['selector_binding'].update(proof_state='checked_native_selection',
-            model_observed=True,effort_observed=True,catalogue_observed=route.get('catalogue_observed',False))
+            model_observed=True,effort_observed=True,catalogue_observed=route.get('catalogue_observed',False),
+            native_fingerprint=fp.key,native_executable_version=fp.executable.version)
         binding['evidence_digest']=payload_digest({'fingerprint':fp.key,'selected_native_route':route,
             'submission_coverage':sorted(evidence.coverage),'observed_at':evidence.observed_at})
         route_bindings.validate_v2_binding(binding)

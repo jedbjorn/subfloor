@@ -3362,6 +3362,9 @@ class Handler(BaseHTTPRequestHandler):
                 raise sprint_domain.SprintPreflightError(
                     exc.message, code=exc.code, details=exc.details
                 ) from exc
+            runtime_mode = participant.get("runtime_mode", "ephemeral")
+            if not isinstance(runtime_mode, str) or runtime_mode not in {"ephemeral", "native_experiment"}:
+                raise ValueError("unsupported participant runtime_mode")
             model = participant.get("model")
             if model is not None and (
                 not isinstance(model, str) or not model or model != model.strip()
@@ -3375,7 +3378,10 @@ class Handler(BaseHTTPRequestHandler):
                     raise ValueError(
                         "participant effort must be non-empty when supplied"
                     )
-                effort = effort.strip().lower()
+                if runtime_mode == "native_experiment" and effort != effort.strip():
+                    raise ValueError("native participant effort must be an exact ID")
+                if runtime_mode == "ephemeral":
+                    effort = effort.strip().lower()
             if effort is not None and (model is None or harness == "vibe"):
                 raise sprint_domain.SprintPreflightError(
                     "Thinking control is unavailable for this route",
@@ -3386,6 +3392,10 @@ class Handler(BaseHTTPRequestHandler):
                         "requested_effort": effort,
                     },
                 )
+            if runtime_mode == "native_experiment" and (
+                harness not in {"codex", "claude"} or not model or not effort
+            ):
+                raise ValueError("native participants require exact model and effort")
             if participant_shell_id in seen_shells:
                 raise ValueError("participant shells must be unique")
             seen_shells.add(participant_shell_id)
@@ -3397,6 +3407,7 @@ class Handler(BaseHTTPRequestHandler):
                     "model": model,
                     "effort": effort,
                     "route": participant.get("route"),
+                    "runtime_mode": runtime_mode,
                 }
             )
         if not any(
@@ -3521,8 +3532,8 @@ class Handler(BaseHTTPRequestHandler):
             )
             con.executemany(
                 "INSERT INTO sprint_participants "
-                "(sprint_id,shell_id,role,harness,model,effort,route) "
-                "VALUES (?,?,?,?,?,?,?)",
+                "(sprint_id,shell_id,role,harness,model,effort,route,runtime_mode) "
+                "VALUES (?,?,?,?,?,?,?,?)",
                 (
                     (
                         sprint_id,
@@ -3532,6 +3543,7 @@ class Handler(BaseHTTPRequestHandler):
                         item["model"],
                         item["effort"],
                         item["route"],
+                        item["runtime_mode"],
                     )
                     for item in normalized
                 ),

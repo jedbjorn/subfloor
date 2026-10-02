@@ -15,6 +15,7 @@ from typing import Any
 
 import sprint_cleanup
 import sprint_health
+import sprint_native_selection
 import sprint_runtime
 
 LIFECYCLES = frozenset({"prepared", "armed", "paused", "completed", "aborted"})
@@ -819,12 +820,14 @@ class SprintBoardProjection:
                 "catalogue_generation": row["catalogue_generation"],
                 "harness_version": row["harness_version"],
                 "harness_support_state": row["harness_support_state"],
+                "runtime_mode": row["runtime_mode"],
                 "disposition": row["disposition"],
                 "current_conversation_id": row["current_conversation_id"],
             }
             for row in self.con.execute(
                 "SELECT p.participant_id,p.shell_id,sh.shortname,sh.display_name,"
                 "p.role,p.harness,p.model,p.effort,p.route,p.disposition,"
+                + sprint_native_selection.mode_projection(self.con) + ","
                 "p.active_route_binding_id,binding.control_state,"
                 "binding.effective_effort,binding.native_variant_id,"
                 "binding.route_revision,binding.binding_digest,"

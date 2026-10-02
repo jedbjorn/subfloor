@@ -27,6 +27,7 @@ ENGINE = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ENGINE / "api"))
 import model_catalog  # noqa: E402  (canonical local route evidence)
 import route_bindings  # noqa: E402  (versioned participant route contract)
+import sprint_native_selection
 
 SPRINT_TRANSITIONS = {
     "prepared": frozenset({"armed", "aborted"}),
@@ -206,6 +207,7 @@ class ParticipantBindingCandidate:
     harness_version: str | None
     harness_support_state: str | None
     evidence_observation: route_bindings.RouteEvidenceObservation | None = None
+    runtime_mode: str = "ephemeral"
 
 
 @dataclass(frozen=True)
@@ -299,6 +301,19 @@ def _participant_binding_candidate(
     evidence_observation = None
     source_fingerprint = None
     harness_support_state = None
+    if sprint_native_selection.mode(participant) == "native_experiment":
+        try:
+            binding, binding_digest = sprint_native_selection.checked_binding(
+                con, participant_id, harness, model, effort,
+            )
+        except ValueError as exc:
+            raise SprintPreflightError(str(exc)) from exc
+        return ParticipantBindingCandidate(
+            participant_id, binding, binding_digest, None, None, None,
+            binding["selector_binding"]["native_fingerprint"],
+            binding["selector_binding"]["native_executable_version"], "tested",
+            runtime_mode="native_experiment",
+        )
     if model is None or harness == "vibe":
         runtime_scope = model_catalog.harness_versions.runtime_scope()
         runtime_status = model_catalog.harness_runtime_status(harness)
@@ -908,6 +923,7 @@ class SprintLifecycleStore:
                 ) from exc
         for harness in dict.fromkeys(
             candidate.binding["harness"] for candidate in candidates
+            if candidate.runtime_mode == "ephemeral"
         ):
             self._probe_bound_harness(harness)
         return ArmBindingPreflight(
@@ -926,7 +942,7 @@ class SprintLifecycleStore:
     def _participant_intent_rows(self, sprint_id: int) -> list[sqlite3.Row]:
         return self.con.execute(
             "SELECT p.participant_id,p.shell_id,p.role,p.harness,p.model,p.effort,"
-            "p.route,sh.shortname FROM sprint_participants p "
+            "p.route,sh.shortname," + sprint_native_selection.mode_projection(self.con) + " FROM sprint_participants p "
             "JOIN shells sh ON sh.shell_id=p.shell_id WHERE p.sprint_id=? "
             "ORDER BY CASE p.role WHEN 'planner' THEN 0 "
             "WHEN 'developer' THEN 1 ELSE 2 END,p.participant_id",
@@ -948,6 +964,7 @@ class SprintLifecycleStore:
                 "model": participant["model"],
                 "effort": participant["effort"],
                 "route": participant["route"],
+                "runtime_mode": sprint_native_selection.mode(participant),
             }
             for participant in participants
         ]
@@ -959,6 +976,13 @@ class SprintLifecycleStore:
         candidates: Iterable[ParticipantBindingCandidate],
     ) -> None:
         for candidate in candidates:
+            if candidate.runtime_mode == "native_experiment":
+                binding, digest = sprint_native_selection.checked_binding(
+                    self.con, candidate.participant_id, candidate.binding['harness'],
+                    candidate.binding['requested_model'], candidate.binding['requested_effort'],
+                )
+                if digest != candidate.binding_digest or binding != candidate.binding:
+                    raise SprintInvariantError('native participant proof changed during preflight')
             expected = candidate.evidence_snapshot
             if expected is None:
                 continue
@@ -3331,7 +3355,7 @@ class SprintLifecycleStore:
             )
         selections = self.con.execute(
             "SELECT p.participant_id,p.role,p.harness,p.model,p.effort,p.route,"
-            "sh.shortname FROM sprint_participants p "
+            "sh.shortname," + sprint_native_selection.mode_projection(self.con) + " FROM sprint_participants p "
             "JOIN shells sh ON sh.shell_id=p.shell_id "
             "WHERE p.sprint_id=? ORDER BY "
             "CASE p.role WHEN 'planner' THEN 0 WHEN 'developer' THEN 1 ELSE 2 END,"
@@ -3807,6 +3831,7 @@ class SprintParticipantStore:
             "harness": harness,
             "model": model,
             "effort": effort,
+            "runtime_mode": sprint_native_selection.mode(participant),
         }
         try:
             candidate = _participant_binding_candidate(self.con, proposed)
@@ -3814,7 +3839,8 @@ class SprintParticipantStore:
             raise SprintPreflightError(
                 exc.message, code=exc.code, details=exc.details
             ) from exc
-        self._probe_bound_harness(candidate.binding["harness"])
+        if candidate.runtime_mode == "ephemeral":
+            self._probe_bound_harness(candidate.binding["harness"])
 
         before = self._projection(participant)
         after = {
@@ -3825,6 +3851,7 @@ class SprintParticipantStore:
                 if effort is not None else None
             ),
             "route": route if route is not None else participant["route"],
+            "runtime_mode": sprint_native_selection.mode(participant),
         }
         if before == after:
             active = self._active_binding(participant)
@@ -3872,6 +3899,12 @@ class SprintParticipantStore:
                 raise SprintInvariantError(
                     "participant route changed during preflight; retry reroute"
                 )
+            if candidate.runtime_mode == "native_experiment":
+                binding, digest = sprint_native_selection.checked_binding(
+                    self.con, candidate.participant_id, harness, model, effort,
+                )
+                if digest != candidate.binding_digest or binding != candidate.binding:
+                    raise SprintInvariantError('native participant proof changed during reroute')
             expectation_facts, closed_chat_id = self._require_idle_projection(
                 current, lifecycle, planner_shell_id=planner_shell_id
             )
@@ -4004,6 +4037,7 @@ class SprintParticipantStore:
             "SELECT participant.participant_id,participant.sprint_id,"
             "participant.shell_id,participant.role,participant.harness,"
             "participant.model,participant.effort,participant.route,"
+            + sprint_native_selection.mode_projection(self.con, "participant") + ","
             "participant.active_route_binding_id,binding.control_state,"
             "binding.route_revision,binding.binding_digest,binding.harness_version,"
             "binding.harness_support_state "
@@ -4322,6 +4356,7 @@ class SprintParticipantStore:
             "model": participant["model"],
             "effort": participant["effort"],
             "route": participant["route"],
+            "runtime_mode": sprint_native_selection.mode(participant),
         }
 
 
