@@ -4836,6 +4836,7 @@ const chatNativeRequests = new Map();
 const CHAT_NATIVE_EVENTS = new Set([
   "runtime.ready", "runtime.setup", "runtime.lost", "ownership.failed",
   "activity.started", "activity.processed", "activity.terminal",
+  "output.delta", "output.final",
   "work.observed", "work.terminal", "snapshot.observed",
   "control.acknowledged", "control.outcome", "capability.observed",
 ]);
@@ -4908,6 +4909,26 @@ function chatNativeObservedTime(value) {
   if (value == null) return "Timestamp unavailable";
   const date = new Date(typeof value === "number" ? value * 1000 : value);
   return Number.isNaN(date.getTime()) ? "Timestamp unavailable" : date.toLocaleString();
+}
+
+function chatNativeVisibleActivity(runtime) {
+  const activity = (Array.isArray(runtime.activity) ? runtime.activity : [])
+    .filter(event => event.generation_id === runtime.generation_id);
+  const outputItem = event => {
+    const ref = event.reference;
+    if (!["output.delta", "output.final"].includes(event.kind)
+        || typeof ref?.item_id !== "string" || !ref.item_id) return null;
+    return JSON.stringify([event.generation_id, ref.root_id, ref.thread_id, ref.item_id]);
+  };
+  // A later mirrored final also removes its earlier native streaming rows.
+  // Run attribution alone does not mean child or terminal output was mirrored.
+  const mirrored = new Set(activity.filter(event => event.engine_mirrored === true)
+    .map(outputItem).filter(key => key !== null));
+  return activity.filter(event => {
+    const key = outputItem(event);
+    return !["output.delta", "output.final"].includes(event.kind)
+      || (event.engine_mirrored !== true && (key === null || !mirrored.has(key)));
+  });
 }
 
 function chatNativeRuntimePanel(host, conversation, { control, refresh, connection = "connecting" }) {
@@ -4995,14 +5016,13 @@ function chatNativeRuntimePanel(host, conversation, { control, refresh, connecti
     list.append(item);
   }
   panel.append(list);
-  const activity = Array.isArray(runtime.activity) ? runtime.activity : [];
+  const activity = chatNativeVisibleActivity(runtime);
   const output = el("div", { className: "chat-native-activity", ariaLabel: "Native activity and output" });
   if (runtime.activity_partial) output.append(el("p", { className: "muted" }, "Native activity history is partial."));
   for (const event of activity) {
-    if (event.engine_run_id != null || event.generation_id !== runtime.generation_id) continue;
     const item = el("div", { className: "chat-native-activity-item" });
     item.dataset.activityKey = `${event.generation_id}:${event.controller_sequence}`;
-    item.append(el("small", {}, `${event.source === "system" ? "System / setup" : event.source === "automation" ? "Native automation" : event.source === "native_completion" ? "Native completion" : "Native activity"} · ${event.kind} · ${event.freshness || "unknown"}${event.partial ? " · partial" : ""} · ${chatNativeObservedTime(event.observed_at)}`));
+    item.append(el("small", {}, `${runtime.role === "probe" ? "Finite compatibility probe · " : ""}${event.source === "system" ? "System / setup" : event.source === "automation" ? "Native automation" : event.source === "native_completion" ? "Native completion" : "Native activity"} · ${event.kind} · ${event.freshness || "unknown"}${event.partial ? " · partial" : ""} · ${chatNativeObservedTime(event.observed_at)}`));
     if (typeof event.data?.text === "string") item.append(el("div", { className: "chat-native-output" }, event.data.text));
     else if (event.data?.status) item.append(el("span", {}, event.data.status));
     if (event.provenance) item.append(el("small", {}, `Observed via ${event.provenance}`));

@@ -78,3 +78,20 @@ def test_fresh_node_chromium_mocked_server_workflow():
     assert receipt["send_readback_no_replay"] and receipt["cleanup_bound_new_check"]
     assert receipt["separate_chat_consent"] and receipt["production_opt_in_hidden"]
     assert receipt["composer_reachable"]
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="Node required")
+def test_only_explicit_same_item_mirroring_removes_native_output():
+    result = run_js('''
+const output=(sequence,thread,item,extra={})=>({generation_id:'gen',controller_sequence:sequence,
+ kind:'output.delta',reference:{root_id:'root',thread_id:thread,item_id:item},engine_run_id:7,...extra});
+const runtime={generation_id:'gen',activity:[
+ output(1,'root','assistant'),output(2,'root','assistant',{kind:'output.final',engine_mirrored:true}),
+ output(3,'child','assistant',{kind:'output.final',engine_mirrored:false}),
+ output(4,'root','terminal',{kind:'output.final',engine_mirrored:false}),
+ output(5,'root','unknown-mirror',{engine_mirrored:'true'}),
+ output(6,'root','setup',{source:'system'}),output(7,'root','old',{generation_id:'old'}),
+ {generation_id:'gen',controller_sequence:8,kind:'activity.terminal',engine_mirrored:true}]};
+console.log(JSON.stringify(chatNativeVisibleActivity(runtime).map(row=>row.controller_sequence)));
+''')
+    assert result == [3, 4, 5, 6, 8]

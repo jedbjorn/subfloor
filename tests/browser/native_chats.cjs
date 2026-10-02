@@ -21,8 +21,10 @@ const cv = {conversation_id:cid,state:'idle',version:7,title:'Native UI source f
     activity:[{generation_id:'root-gen',controller_sequence:8,kind:'output.final',source:'native_completion',freshness:'current',partial:false,
       observed_at:1790935200,data:{text:'Autonomous native completion'}},
       {generation_id:'root-gen',controller_sequence:10,kind:'output.final',source:'system',freshness:'current',partial:false,data:{text:'Setup nonce belongs to system activity'}},
+      {generation_id:'root-gen',controller_sequence:12,engine_run_id:1,engine_mirrored:false,kind:'output.final',reference:{root_id:'root',thread_id:'child',item_id:'child-output'},data:{kind:'assistant',text:'Child output with engine run survives'}},
+      {generation_id:'root-gen',controller_sequence:13,engine_run_id:1,engine_mirrored:false,kind:'output.final',reference:{root_id:'root',thread_id:'root',item_id:'command-output'},data:{kind:'terminal',text:'Terminal output with engine run survives'}},
       {generation_id:'old-gen',controller_sequence:11,kind:'output.final',source:'native_completion',data:{text:'Foreign generation must not display'}},
-      {generation_id:'root-gen',controller_sequence:9,engine_run_id:1,kind:'output.final',data:{text:'Legacy duplicate must not display'}}]}};
+      {generation_id:'root-gen',controller_sequence:9,engine_run_id:1,engine_mirrored:true,kind:'output.final',reference:{root_id:'root',thread_id:'root',item_id:'mirrored'},data:{text:'Legacy duplicate must not display'}}]}};
 const probe = {...cv,conversation_id:probeId,runtime:{...cv.runtime,generation_id:'probe-gen',role:'probe',state:'needs_consent',primary:null,
   setup:{generation_id:'probe-gen',setup_id:'stored-setup',phase:'local_channel_development_consent'},work:[],activity:[]}};
 const check = {check_id:'nc_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',state:'needs_consent',admissible:false,grades:{submission:'inconclusive'},probe:{conversation_id:probeId,generation_id:'probe-gen'}};
@@ -98,6 +100,17 @@ const server = http.createServer((req,res) => {
     assert.match(await page.locator('.chat-native-panel').innerText(),/Autonomous native completion/);
     assert.doesNotMatch(await page.locator('.chat-native-panel').innerText(),/Legacy duplicate|Foreign generation/);
     assert.match(await page.locator('.chat-native-activity-item').filter({hasText:'Setup nonce'}).innerText(),/System \/ setup/);
+    assert.match(await page.locator('.chat-native-panel').innerText(),/Child output with engine run survives/);
+    assert.match(await page.locator('.chat-native-panel').innerText(),/Terminal output with engine run survives/);
+    cv.runtime.activity.push({generation_id:'root-gen',controller_sequence:14,engine_run_id:1,engine_mirrored:false,
+      kind:'output.delta',source:'gui',reference:{root_id:'root',thread_id:'root',item_id:'streamed'},data:{kind:'assistant',text:'Native streaming before final'}});
+    await page.evaluate(()=>window.emitNative('output.delta',{sequence:1,event_type:'output.delta',payload:{generation_id:'root-gen',controller_sequence:14}}));
+    await page.locator('.chat-native-output').filter({hasText:'Native streaming before final'}).waitFor();
+    cv.runtime.activity.push({generation_id:'root-gen',controller_sequence:15,engine_run_id:1,engine_mirrored:true,
+      kind:'output.final',source:'gui',reference:{root_id:'root',thread_id:'root',item_id:'streamed'},data:{kind:'assistant',text:'Final now mirrored to legacy'}});
+    await page.evaluate(()=>window.emitNative('output.final',{sequence:2,event_type:'output.final',payload:{generation_id:'root-gen',controller_sequence:15}}));
+    await page.waitForFunction(()=>!document.querySelector('.chat-native-panel').textContent.includes('Native streaming before final'));
+    assert.doesNotMatch(await page.locator('.chat-native-panel').innerText(),/Final now mirrored to legacy/);
     const bounds=await page.evaluate(()=>{const panel=document.querySelector('.chat-native-host'),composer=document.querySelector('.chat-composer');return {panel:panel.getBoundingClientRect().height,composer:composer.getBoundingClientRect().bottom,height:innerHeight};});
     assert.ok(bounds.panel<=321);assert.ok(bounds.composer<=bounds.height);
     await page.setViewportSize({width:390,height:780});
