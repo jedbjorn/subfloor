@@ -72,7 +72,7 @@ def test_additive_methods_fields_enums_and_annotations(recorded):
 @pytest.mark.parametrize('method,caps', [
     ('turn/start', {'submission'}),
     ('turn/interrupt', {'stop_reply', 'stop_work_child'}),
-    ('thread/backgroundTerminals/terminate', {'stop_work', 'stop_work_terminal'}),
+    ('thread/backgroundTerminals/terminate', {'stop_work', 'stop_work_terminal', 'stop_work_child'}),
 ])
 def test_required_method_removal_is_scoped(recorded, method, caps):
     edit(recorded[0], 'ClientRequest.json', lambda d: d.__setitem__('oneOf', [v for v in d['oneOf']
@@ -234,3 +234,53 @@ def test_known_actually_supplied_turn_fields_becoming_required_are_supported(rec
     edit(recorded[0], 'ClientRequest.json', lambda d:
          params(d, 'turn/start')['required'].extend(['approvalPolicy', 'clientUserMessageId']))
     assert observe(recorded).structural_grades['submission'] == 'compatible'
+
+
+@pytest.mark.parametrize('effort', [None, 'default', 'high'])
+def test_dynamic_effort_supply_matches_route(recorded, effort):
+    edit(recorded[0], 'ClientRequest.json', lambda d: params(d, 'turn/start')['required'].append('effort'))
+    assert observe(recorded, effort).structural_grades['submission'] == ('compatible' if effort == 'high' else 'incompatible')
+
+
+def test_actual_null_initial_cursor_requires_nullable_schema(recorded):
+    edit(recorded[0], 'ClientRequest.json', lambda d:
+         params(d, 'model/list')['properties'].update(cursor={'type': 'string'}))
+    assert set(observe(recorded).structural_grades.values()) == {'incompatible'}
+
+
+def test_declared_supply_matches_actual_driver_rpc_specimens(recorded):
+    from conversation_runtime_codex_schema import REQUEST_FIELDS
+    from conversation_runtime_contract import NativeReference
+    from test_codex_runtime import control, deadline, seat, submission
+    # Execute actual adapter methods with the owned fake RPC fixture only.
+    seat_generator = seat.__wrapped__(recorded[0].parent)
+    driver, rpc, _, context = next(seat_generator)
+    try:
+        reply = driver.submit(submission(), deadline=deadline())
+        driver.control(control('stop_reply', NativeReference('root', 'root', activity_id=reply.native_activity_id),
+                               reply.native_activity_id), deadline=deadline())
+        rpc.terminal(); driver.inventory(deadline=deadline())
+        work = next(w for w in driver.inventory(deadline=deadline()).work if w.kind == 'terminal')
+        driver.control(control('stop_work', work.reference), deadline=deadline())
+        driver.cleanup(deadline=deadline())
+        calls = {method: body for method, body in rpc.calls if method in REQUEST_FIELDS}
+        assert set(calls) == set(REQUEST_FIELDS)
+        for method, fields in REQUEST_FIELDS.items():
+            body = calls[method]
+            for path in fields:
+                value = body
+                for part in path.split('.'):
+                    if part == '*': value = value[0]
+                    elif part.startswith('@'): assert value['type'] == part[1:]
+                    else:
+                        assert part in value, (method, path)
+                        value = value[part]
+        assert calls['turn/start']['input'] == [{'type': 'text', 'text': 'finite user input'}]
+        assert calls['thread/start']['approvalPolicy'] == calls['turn/start']['approvalPolicy'] == 'never'
+        assert calls['thread/start']['sandbox'] == 'danger-full-access'
+        assert calls['thread/memoryMode/set']['mode'] == 'disabled'
+        assert calls['thread/start']['model'] == calls['turn/start']['model'] == context.model
+        assert calls['turn/start']['effort'] == context.effort
+    finally:
+        try: next(seat_generator)
+        except StopIteration: pass
