@@ -489,3 +489,38 @@ for line in sys.stdin:
     finally:
         assert rpc.close(deadline=deadline())
     assert rpc.process.poll() is not None
+
+
+def test_expired_write_deadline_proves_no_write_and_transport_remains_usable(tmp_path):
+    script = tmp_path / "finite_echo.py"
+    script.write_text("import json,sys\nfor line in sys.stdin:\n r=json.loads(line);print(json.dumps({'id':r['id'],'result':{}}),flush=True)\n")
+    losses = []
+    rpc = JsonlRpc(argv=[sys.executable, str(script)], cwd=tmp_path, env={"PATH": "/usr/bin"},
+                   on_message=lambda frame: None, on_loss=losses.append, before_write=lambda: None)
+    try:
+        with pytest.raises(RpcError) as error:
+            rpc.request("expired", {}, deadline=time.monotonic() - 1)
+        assert error.value.state == "not_written" and not losses
+        assert rpc.request("usable", {}, deadline=deadline()) == {}
+    finally:
+        assert rpc.close(deadline=deadline())
+
+
+def test_partial_pipe_write_loses_transport_and_cannot_append_second_rpc(tmp_path):
+    # An owned finite process deliberately does not read its stdin. The frame
+    # exceeds pipe capacity, so only its prefix can be written before deadline.
+    script = tmp_path / "finite_unread_pipe.py"
+    script.write_text("import time\ntime.sleep(2)\n")
+    losses = []
+    rpc = JsonlRpc(argv=[sys.executable, str(script)], cwd=tmp_path, env={"PATH": "/usr/bin"},
+                   on_message=lambda frame: None, on_loss=losses.append, before_write=lambda: None)
+    try:
+        with pytest.raises(RpcError) as partial:
+            rpc.request("partial", {"text": "x" * 200000}, deadline=time.monotonic() + .1)
+        assert partial.value.state == "unknown" and len(losses) == 1
+        with pytest.raises(RpcError) as later:
+            rpc.request("must-not-append", {}, deadline=deadline())
+        assert later.value.state == "not_written"
+    finally:
+        assert rpc.close(deadline=deadline())
+    assert rpc.process.poll() is not None
