@@ -21,7 +21,7 @@ CONTRACT_REVISION = "f89-native-runtime-v1"
 MAX_FRAME_BYTES = 256 * 1024
 MAX_EVENT_BYTES = 64 * 1024
 EVENT_KINDS = frozenset({
-    "runtime.ready", "runtime.lost", "ownership.failed",
+    "runtime.ready", "runtime.setup", "runtime.lost", "ownership.failed",
     "activity.started", "activity.processed", "activity.terminal",
     "output.delta", "output.final", "work.observed", "work.terminal",
     "snapshot.observed", "control.acknowledged", "control.outcome",
@@ -56,7 +56,8 @@ _SENSITIVE_KEYS = frozenset({
 _IDENTITY_KEYS = frozenset({"generation_id","conversation_id","root_id","thread_id",
                           "parent_thread_id","activity_id","native_activity_id","item_id",
                           "work_id","native_process_id","request_id","control_id",
-                          "boot_digest","policy_digest","payload_digest","sha256"})
+                          "boot_digest","policy_digest","payload_digest","sha256",
+                          "setup_id","configuration_sha256","executable_sha256"})
 
 
 class RuntimeContractError(RuntimeError):
@@ -200,11 +201,49 @@ class RuntimeIdentity:
 
 
 @dataclass(frozen=True)
+class StartupConsent:
+    """One captured Claude local-development choice, never a capability grade.
+
+    Driver revalidates this exact observed phase/configuration at its write
+    edge. setup_id identifies one finite phase epoch, not reusable permission.
+    Confirmation is not readiness; attributable successful processing/terminal
+    evidence must subsequently produce runtime.ready.
+    """
+    generation_id: str
+    setup_id: str
+    executable_sha256: str
+    driver_revision: str
+    configuration_sha256: str
+    observed_at: float
+    detail: str = ''
+    phase: Literal['local_channel_development_consent'] = 'local_channel_development_consent'
+    action: Literal['enable_local_channel'] = 'enable_local_channel'
+
+    def __post_init__(self) -> None:
+        if (self.phase!='local_channel_development_consent' or self.action!='enable_local_channel'
+                or any(not isinstance(v,str) or not 1<=len(v)<=255
+                       for v in (self.generation_id,self.setup_id,self.driver_revision))
+                or any(not isinstance(v,str) or len(v)!=64 or any(c not in '0123456789abcdef' for c in v)
+                       for v in (self.executable_sha256,self.configuration_sha256))
+                or isinstance(self.observed_at,bool) or not isinstance(self.observed_at,(int,float))
+                or not math.isfinite(self.observed_at) or self.observed_at<=0
+                or not isinstance(self.detail,str) or len(self.detail)>4096):
+            raise RuntimeContractError('SETUP_INVALID','captured finite startup consent descriptor required')
+
+
+@dataclass(frozen=True)
 class DriverStart:
-    state: Literal["ready", "unavailable", "unknown"]
+    state: Literal["ready", "unavailable", "unknown", "needs_consent"]
     identity: RuntimeIdentity | None = None
     detail: str = ""
     capabilities: Mapping[str, Grade] = field(default_factory=dict)
+    setup: StartupConsent | None = None
+
+    def __post_init__(self) -> None:
+        if (self.state not in {'ready','unavailable','unknown','needs_consent'}
+                or (self.state=='needs_consent')!=(self.setup is not None)
+                or (self.setup is not None and not isinstance(self.setup,StartupConsent))):
+            raise RuntimeContractError('SETUP_INVALID','needs_consent requires its captured startup descriptor')
 
 
 @dataclass(frozen=True)
@@ -225,11 +264,22 @@ class NativeControl:
     control_id: str
     request_sequence: int
     payload_digest: str
-    action: Literal["stop_reply", "stop_work", "stop_automation", "close"]
+    action: Literal["stop_reply", "stop_work", "stop_automation", "close", "enable_local_channel"]
     target: NativeReference | None = None
     expected_activity_id: str | None = None
     # No arbitrary child text/input. Driver-defined bounded fields only.
     options: Mapping[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if self.action=='enable_local_channel':
+            sid=self.options.get('setup_id')
+            digest=self.options.get('configuration_sha256')
+            if (set(self.options)!={'setup_id','configuration_sha256'}
+                    or not isinstance(sid,str) or not 1<=len(sid)<=255
+                    or not isinstance(digest,str) or len(digest)!=64
+                    or any(c not in '0123456789abcdef' for c in digest)
+                    or self.expected_activity_id is not None):
+                raise RuntimeContractError('SETUP_INVALID','only exact finite startup choice binding is allowed')
 
 
 @dataclass(frozen=True)
@@ -262,6 +312,11 @@ class RuntimeEvent:
     def __post_init__(self) -> None:
         if self.kind not in EVENT_KINDS:
             raise RuntimeContractError("EVENT_INVALID", "unknown driver event kind")
+        if self.kind=='runtime.setup':
+            try:
+                StartupConsent(**self.data)
+            except TypeError as exc:
+                raise RuntimeContractError('SETUP_INVALID','typed finite startup descriptor required') from exc
         if self.source not in {"gui","native_completion","automation","reconciliation","system"} or self.freshness not in {"current","last_observed","stale","unknown"} or self.grade not in {"compatible","incompatible","inconclusive","unverified"}:
             raise RuntimeContractError("EVENT_INVALID","invalid event source/freshness/grade")
         if not isinstance(self.observed_at,(int,float)) or not math.isfinite(self.observed_at):

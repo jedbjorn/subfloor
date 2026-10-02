@@ -179,6 +179,17 @@ class RuntimeStore:
                 event=public_payload(item["event"],sensitive_values=self.secrets)
                 normalized=RuntimeEvent(**(event|{"reference":reference(event.get("reference"))}))
                 event=dataclasses.asdict(normalized)
+                if event['kind']=='runtime.setup':
+                    captured=json.loads(row['binding_json'])['context']
+                    setup=event['data']
+                    if (row['harness']!='claude' or setup['generation_id']!=generation
+                            or setup['executable_sha256']!=captured['executable']['sha256']
+                            or setup['driver_revision']!=captured['driver_revision']):
+                        raise RuntimeContractError('SETUP_INVALID','startup event differs from captured Claude generation')
+                    phase='needs_consent' if event['freshness']=='current' and not event['partial'] and event['grade']!='inconclusive' else 'setup_inconclusive'
+                    con.execute("UPDATE conversation_runtime_generations SET state=? WHERE generation_id=? AND close_intent=0 AND state NOT IN ('closed','lost','ready')",(phase,generation))
+                elif event['kind']=='runtime.ready':
+                    con.execute("UPDATE conversation_runtime_generations SET state='ready' WHERE generation_id=? AND close_intent=0 AND state NOT IN ('closed','lost')",(generation,))
                 con.execute("INSERT INTO conversation_runtime_events VALUES(?,?,?)",(generation,sequence,encoded(event)))
                 ref=event.get("reference") or {}
                 if event["kind"].startswith("work."):
@@ -222,7 +233,7 @@ class RuntimeStore:
             con.close()
 
     def state(self,generation: str,owner: int,shell: int,state: str,cleanup: Mapping[str,Any] | None=None) -> None:
-        if state not in {"reserved","starting","ready","closing","closed","lost"}:
+        if state not in {"reserved","starting","needs_consent","setup_inconclusive","ready","closing","closed","lost"}:
             raise RuntimeContractError("STATE_INVALID", "unknown generation state")
         con=db_driver.connect(self.database)
         try:
