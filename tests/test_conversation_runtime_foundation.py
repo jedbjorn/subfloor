@@ -25,6 +25,7 @@ from conversation_runtime_contract import (
     RuntimeDriver,
     RuntimeEvent,
     RuntimeIdentity,
+    StartupConsent,
     WriteReceipt,
     payload_digest,
 )
@@ -334,6 +335,64 @@ def test_expired_admission_never_reserves_or_writes_and_ingress_bounds_deadline(
     for bad in [0,-1,True,float('nan'),float('inf'),121,'1']:
         with pytest.raises(RuntimeContractError,match='positive finite timeout'):
             owner.handle(wire('status',timeout=bad))
+
+
+def test_claude_setup_choice_is_pre_ready_captured_once_and_never_implies_readiness(controller):
+    owner,driver=controller
+    owner.context=dataclasses.replace(owner.context,harness='claude');driver.harness='claude'
+    setup=StartupConsent('g','epoch','a'*64,'test-only','b'*64,time.time())
+    owner.emit(RuntimeEvent('runtime.setup',data=dataclasses.asdict(setup)))
+    assert owner.status()['setup']['setup_id']=='epoch' and not owner.ready
+    assert owner.handle(wire('submit',command=command('queued',1,text='hi')))['state']=='not_written'
+    def choice(cid,n,**options):
+        return control(cid,n,action='enable_local_channel',options={'setup_id':'epoch','configuration_sha256':'b'*64}|options)
+    assert owner.handle(wire('control',command=choice('stale',2,setup_id='old')))['state']=='rejected'
+    current=choice('consent',3)
+    assert owner.handle(wire('control',command=current))['state']=='written'
+    assert not owner.ready and owner.status()['setup_confirmation']['control_id']=='consent'
+    assert owner.handle(wire('control',command=current))['duplicate']
+    assert owner.handle(wire('control',command=choice('duplicate-choice',4)))['state']=='rejected'
+    assert driver.controls==['consent'] and not driver.writes
+    owner.emit(RuntimeEvent('runtime.ready',NativeReference('root'),provenance='test successful readiness challenge'))
+    assert owner.ready and owner.status()['setup'] is None
+
+
+def test_setup_partial_choice_retains_fence_and_close_remains_available(controller):
+    owner,driver=controller
+    owner.context=dataclasses.replace(owner.context,harness='claude');driver.harness='claude'
+    owner.emit(RuntimeEvent('runtime.setup',data=dataclasses.asdict(StartupConsent('g','epoch','a'*64,'test-only','b'*64,time.time()))))
+    def partial(command,**kwargs):
+        driver.controls.append(command.control_id)
+        raise OSError('partial finite choice write')
+    driver.control=partial
+    action=control('consent',1,action='enable_local_channel',options={'setup_id':'epoch','configuration_sha256':'b'*64})
+    assert owner.handle(wire('control',command=action))['state']=='unknown'
+    assert owner.handle(wire('control',command=action))['duplicate'] and driver.controls==['consent']
+    assert owner.handle(wire('close',command=control('close',2,action='close')))['outcome']=='complete'
+    owner.emit(RuntimeEvent('runtime.ready',NativeReference('root')))
+    assert not owner.ready and owner.journal.get('close')
+
+
+def test_startup_projection_binds_generation_binary_driver_and_preserves_close(tmp_path):
+    database=tmp_path/'fixture.sqlite';con=sqlite3.connect(database)
+    con.executescript('CREATE TABLE users(user_id INTEGER PRIMARY KEY); CREATE TABLE shells(shell_id INTEGER PRIMARY KEY); CREATE TABLE conversations(conversation_id TEXT PRIMARY KEY,shell_id INTEGER,owner_user_id INTEGER,state TEXT,harness TEXT,provider TEXT,model TEXT,effort TEXT,worktree TEXT); INSERT INTO users VALUES(1); INSERT INTO shells VALUES(1); INSERT INTO conversations(conversation_id,shell_id,owner_user_id,state,harness) VALUES("cv",1,1,"idle","claude");')
+    con.executescript((SCRIPTS.parent/'migrations/0273_conversation_native_runtime.sql').read_text())
+    con.execute('UPDATE conversations SET worktree=?',(str(tmp_path),));con.commit();con.close()
+    store=RuntimeStore(database);store.reserve(dataclasses.replace(context(tmp_path),harness='claude'),{})
+    lease=store.attach('g',1,1,'api')
+    setup=StartupConsent('g','epoch','a'*64,'test-only','b'*64,time.time())
+    def event(sequence,value):
+        store.ingest('g',1,1,lease,{'events':[{'sequence':sequence,'event':dataclasses.asdict(value)}]})
+    for wrong in [dataclasses.replace(setup,generation_id='other'),dataclasses.replace(setup,executable_sha256='c'*64),dataclasses.replace(setup,driver_revision='other')]:
+        with pytest.raises(RuntimeContractError,match='differs from captured'):
+            event(1,RuntimeEvent('runtime.setup',data=dataclasses.asdict(wrong)))
+    assert store.status('g',1,1)['last_sequence']==0
+    event(1,RuntimeEvent('runtime.setup',data=dataclasses.asdict(setup)))
+    assert store.status('g',1,1)['state']=='needs_consent'
+    store.intent('g',1,1,lease,'close','close',{'action':'close'})
+    store.state('g',1,1,'closing')
+    event(2,RuntimeEvent('runtime.ready',NativeReference('root')))
+    assert store.status('g',1,1)['state']=='closing'
 
 
 def test_late_start_or_processing_cannot_resurrect_terminal_root(controller):

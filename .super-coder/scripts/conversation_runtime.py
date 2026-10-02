@@ -179,6 +179,16 @@ class RuntimeStore:
                 event=public_payload(item["event"],sensitive_values=self.secrets)
                 normalized=RuntimeEvent(**(event|{"reference":reference(event.get("reference"))}))
                 event=dataclasses.asdict(normalized)
+                if event['kind']=='runtime.setup':
+                    captured=json.loads(row['binding_json'])['context']
+                    setup=event['data']
+                    if (row['harness']!='claude' or setup['generation_id']!=generation
+                            or setup['executable_sha256']!=captured['executable']['sha256']
+                            or setup['driver_revision']!=captured['driver_revision']):
+                        raise RuntimeContractError('SETUP_INVALID','startup event differs from captured Claude generation')
+                    con.execute("UPDATE conversation_runtime_generations SET state='needs_consent' WHERE generation_id=? AND close_intent=0 AND state NOT IN ('closed','lost')",(generation,))
+                elif event['kind']=='runtime.ready':
+                    con.execute("UPDATE conversation_runtime_generations SET state='ready' WHERE generation_id=? AND close_intent=0 AND state NOT IN ('closed','lost')",(generation,))
                 con.execute("INSERT INTO conversation_runtime_events VALUES(?,?,?)",(generation,sequence,encoded(event)))
                 ref=event.get("reference") or {}
                 if event["kind"].startswith("work."):
