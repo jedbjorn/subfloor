@@ -102,6 +102,7 @@ class FixtureNativeCheck:
         self.cancelling=False
         from conversation_native_checks import NativeChecks
         self.workflow=NativeChecks(self)
+        self.chats: Any=None
 
     def consume_probe(self,cid: str,generation: str) -> bool:
         """The current factory retains its reader; restart only reconciles ownership."""
@@ -280,7 +281,10 @@ class FixtureNativeCheck:
         # Releasing an API consumer never signals captured native units.
         with self.lock:
             self.stopped=True
-        self.service.shutdown()
+        if self.chats is not None:
+            self.chats.close()
+        else:
+            self.service.shutdown()
 
 
 def handle_check(method: str,headers_raw: str,body: bytes) -> tuple:
@@ -321,6 +325,9 @@ def start_fixture(*,database: Path,root: Path,fixture_id: str,supervisor,native_
         raise ValueError('one fixture API owner required')
     _FIXTURE=FixtureNativeCheck(database=database,root=root,fixture_id=fixture_id,
                               supervisor=supervisor,native_bindings=native_bindings or {})
+    from gui_experiment_chats import FixtureChats
+    _FIXTURE.chats=FixtureChats(_FIXTURE)
+    _FIXTURE.chats.start()
     def shutdown():
         global _FIXTURE
         _FIXTURE.shutdown()
