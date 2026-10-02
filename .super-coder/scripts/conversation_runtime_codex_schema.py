@@ -38,7 +38,8 @@ REQUEST_FIELDS = {
                      'modelProvider': 'string', 'allowProviderModelFallback': 'boolean'},
     'thread/memoryMode/set': {'threadId': 'string', 'mode': 'string'},
     'turn/start': {'threadId': 'string', 'input': 'array', 'input.*.@text.text': 'string',
-                   'input.*.@text.text_elements': 'array', 'input.*.@text.type': 'string', 'model': 'string', 'effort': 'string'},
+                   'input.*.@text.type': 'string', 'model': 'string', 'effort': 'string',
+                   'approvalPolicy': 'string', 'clientUserMessageId': 'string'},
     'thread/read': {'threadId': 'string', 'includeTurns': 'boolean'},
     'thread/list': {'ancestorThreadId': 'string', 'sourceKinds': 'array', 'useStateDbOnly': 'boolean',
                     'limit': 'integer', 'cursor': 'string'},
@@ -293,6 +294,7 @@ def project_codex_schema(directory: Path, executable: ExecutableBinding, *, effo
                 if (effort not in {None, 'default'}
                         and 'enum' in observed.get('requests', {}).get('turn/start', {}).get('fields', {}).get('effort', {})):
                     requirement['requests']['turn/start']['fields']['effort']['enum'] = [effort]
+                requirement['requests']['turn/start']['fields']['approvalPolicy']['enum'] = ['never']
             requirement['requests']['thread/memoryMode/set']['fields']['mode']['enum'] = ['disabled']
             requirement['requests']['thread/start']['fields']['approvalPolicy']['enum'] = ['never']
             requirement['requests']['thread/start']['fields']['sandbox']['enum'] = ['danger-full-access']
