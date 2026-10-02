@@ -320,6 +320,69 @@ def test_fixed_auth_process_output_and_deadline_are_bounded_and_owned_child_is_r
     assert children[0].stdout.closed
 
 
+def test_close_cancels_pending_owned_auth_child_before_foreground_launch(seat, tmp_path, monkeypatch):
+    _, context, _ = seat
+    prepared_assets(tmp_path, monkeypatch)
+    context.executable.path.write_text("#!/usr/bin/python3\nimport time;time.sleep(5)\n")
+    context.executable.path.chmod(0o700)
+    context = replace(context, executable=replace(context.executable,
+        sha256=hashlib.sha256(context.executable.path.read_bytes()).hexdigest()))
+    children, launches, results = [], [], []
+    entered = threading.Event()
+    original = subprocess.Popen
+    def spawn(*args, **kwargs):
+        assert args[0] == [str(context.executable.path), "auth", "status", "--json"]
+        children.append(original(*args, **kwargs))
+        entered.set()
+        return children[-1]
+    monkeypatch.setattr(runtime.subprocess, "Popen", spawn)
+    driver = runtime.ClaudeRuntimeDriver(popen=lambda *args, **kwargs: launches.append(args))
+    start = threading.Thread(target=lambda: results.append(driver.start(context, lambda _: None,
+        deadline=time.monotonic()+2)))
+    start.start()
+    assert entered.wait(1)
+    begun = time.monotonic()
+    driver.cleanup(deadline=begun+1)
+    start.join(1)
+    assert not start.is_alive() and time.monotonic()-begun < 1
+    assert driver._closing and not launches and children[0].poll() is not None
+    assert children[0].stdout.closed and results[0].state == "unavailable"
+
+
+@pytest.mark.parametrize("changed", ["executable", "boot", "managed_mcp", "channel_asset"])
+def test_auth_observation_cannot_launch_changed_captured_binary_or_configuration(seat, tmp_path, monkeypatch, changed):
+    _, context, _ = seat
+    prepared_assets(tmp_path, monkeypatch)
+    mcp = tmp_path / "managed.json"
+    mcp.write_text('{"mcpServers":{}}')
+    context = replace(context, managed_mcp_files=(mcp,))
+    launches = []
+    driver = runtime.ClaudeRuntimeDriver(popen=lambda *args, **kwargs: launches.append(args))
+    def auth(ctx, env, deadline, **kwargs):
+        path = {"executable": context.executable.path, "boot": context.worktree / "CLAUDE.md",
+            "managed_mcp": mcp, "channel_asset": runtime.ASSETS / "channel.mjs"}[changed]
+        path.write_text("changed while account helper ran")
+        return {"method": "claude.ai", "provider": "firstParty"}
+    monkeypatch.setattr(runtime, "_auth_status", auth)
+    result = driver.start(context, lambda _: None, deadline=DEADLINE())
+    assert result.state == "unavailable" and not launches and driver._master is None
+    driver.cleanup(deadline=DEADLINE())
+
+
+def test_auth_completion_after_deadline_cannot_launch_foreground(seat, tmp_path, monkeypatch):
+    _, context, _ = seat
+    prepared_assets(tmp_path, monkeypatch)
+    launches = []
+    driver = runtime.ClaudeRuntimeDriver(popen=lambda *args, **kwargs: launches.append(args))
+    def auth(ctx, env, deadline, **kwargs):
+        time.sleep(.03)
+        return {"method": "claude.ai", "provider": "firstParty"}
+    monkeypatch.setattr(runtime, "_auth_status", auth)
+    result = driver.start(context, lambda _: None, deadline=time.monotonic()+.01)
+    assert result.state == "unavailable" and not launches
+    driver.cleanup(deadline=DEADLINE())
+
+
 @pytest.mark.parametrize("observed_model", [None, "another-model", "sonnet"])
 def test_missing_or_different_active_model_prevents_readiness_inference_and_alias_guessing(seat, observed_model):
     driver, context, events = seat

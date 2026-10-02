@@ -97,13 +97,14 @@ def _parse_auth_status(raw: bytes, returncode: int) -> dict[str, str]:
     return auth
 
 
-def _auth_status(context: RuntimeContext, env: Mapping[str, str], deadline: float) -> dict[str, str]:
+def _auth_status(context: RuntimeContext, env: Mapping[str, str], deadline: float, *,
+                 cancel: threading.Event | None = None, spawn: Callable[..., Any] | None = None) -> dict[str, str]:
     """Fixed zero-inference observation inside the already-owned native unit."""
     limit = min(deadline, time.monotonic() + 3)
-    if time.monotonic() >= limit:
+    if time.monotonic() >= limit or cancel is not None and cancel.is_set():
         raise RuntimeContractError("NATIVE_ACCOUNT_INCONCLUSIVE", "native account observation deadline expired")
     try:
-        process = subprocess.Popen(context.execution_argv([str(context.executable.path), "auth", "status", "--json"]),
+        process = (spawn or subprocess.Popen)(context.execution_argv([str(context.executable.path), "auth", "status", "--json"]),
             cwd=context.worktree, env=dict(env), stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
     except OSError as exc:
@@ -114,9 +115,13 @@ def _auth_status(context: RuntimeContext, env: Mapping[str, str], deadline: floa
         fd = process.stdout.fileno()
         os.set_blocking(fd, False)
         while True:
+            if cancel is not None and cancel.is_set():
+                raise RuntimeContractError("NATIVE_ACCOUNT_INCONCLUSIVE", "native account observation cancelled")
             remaining = limit - time.monotonic()
-            if remaining <= 0 or not select.select([fd], [], [], remaining)[0]:
+            if remaining <= 0:
                 raise RuntimeContractError("NATIVE_ACCOUNT_INCONCLUSIVE", "native account observation deadline expired")
+            if not select.select([fd], [], [], min(.05, remaining))[0]:
+                continue
             chunk = os.read(fd, min(4096, AUTH_STATUS_BYTES + 1 - len(data)))
             if not chunk:
                 break
@@ -205,6 +210,9 @@ class ClaudeRuntimeDriver(RuntimeDriver):
         self._reader: threading.Thread | None = None
         self._closed = threading.Event()
         self._closing = False
+        self._auth_cancel = threading.Event()
+        self._auth_process: Any = None
+        self._auth_identity: ProcessIdentity | None = None
         self._session_started = False
         self._channel_peer: ProcessIdentity | None = None
         self._ready = False
@@ -369,6 +377,25 @@ class ClaudeRuntimeDriver(RuntimeDriver):
         # No --bare/--restricted/--safe-mode/--print or instruction-discovery suppression.
         return context.execution_argv(argv), env
 
+    def _spawn_auth(self, *args: Any, **kwargs: Any) -> Any:
+        # Only process creation is serialized with Close. Bounded observation
+        # must release this condition so Close can fence and stop its own child.
+        with self._condition:
+            if self._closing or self._auth_cancel.is_set():
+                raise RuntimeContractError("NATIVE_ACCOUNT_INCONCLUSIVE", "native account observation cancelled")
+            self._auth_process = subprocess.Popen(*args, **kwargs)
+            self._auth_identity = process_identity(self._auth_process.pid)
+            return self._auth_process
+
+    def _validate_launch(self, context: RuntimeContext, deadline: float) -> None:
+        if self._closing or self._auth_cancel.is_set() or time.monotonic() >= deadline:
+            raise RuntimeContractError("NATIVE_START_FENCED", "native launch fenced by Close or deadline")
+        if (not context.executable.path.is_file() or context.executable.path.is_symlink()
+                or hashlib.sha256(context.executable.path.read_bytes()).hexdigest() != context.executable.sha256):
+            raise RuntimeContractError("EXECUTABLE_CHANGED", "captured executable changed before launch")
+        if self._configuration_digest(context) != self._configuration_sha256:
+            raise RuntimeContractError("BOOT_CHANGED", "captured native configuration changed before launch")
+
     def start(self, context: RuntimeContext, emit: EventSink, *, deadline: float) -> DriverStart:
         with self._condition:
             if self._context is not None or self._closing:
@@ -378,7 +405,19 @@ class ClaudeRuntimeDriver(RuntimeDriver):
             self._identity = RuntimeIdentity(root_id=root, session_id=root)
             try:
                 argv, env = self._prepare(context)
-                self._native_auth = _auth_status(context, env, deadline)
+            except (OSError, RuntimeContractError) as exc:
+                self._route_inconclusive = True
+                return DriverStart("unavailable", self._identity, str(exc), self._capabilities())
+        try:
+            auth = _auth_status(context, env, deadline, cancel=self._auth_cancel, spawn=self._spawn_auth)
+        except (OSError, RuntimeContractError) as exc:
+            with self._condition:
+                self._route_inconclusive = True
+                return DriverStart("unavailable", self._identity, str(exc), self._capabilities())
+        with self._condition:
+            try:
+                self._validate_launch(context, deadline)
+                self._native_auth = auth
                 master, slave = pty.openpty()
                 os.set_blocking(master, False)
                 self._master = master
@@ -1125,6 +1164,8 @@ class ClaudeRuntimeDriver(RuntimeDriver):
     def cleanup(self, *, deadline: float) -> NativeCleanup:
         with self._condition:
             self._closing = True
+            self._auth_cancel.set()
+            auth_process, auth_identity = self._auth_process, self._auth_identity
             self._withdraw_setup("Close fenced the previous finite startup choice")
             self._condition.notify_all()
             # Pending and already-granted channel writes remain ambiguous; no
@@ -1147,6 +1188,16 @@ class ClaudeRuntimeDriver(RuntimeDriver):
                     while any(identifier in self._definitions for identifier in deletable) and time.monotonic() < native_deadline and not self._lost:
                         self._condition.wait(min(0.1, native_deadline - time.monotonic()))
             channel_peer = self._channel_peer
+        if (auth_process is not None and auth_process.poll() is None
+                and auth_identity and process_identity(auth_identity.pid) == auth_identity):
+            try:
+                auth_process.terminate()
+                auth_process.wait(timeout=max(.01, min(.2, deadline - time.monotonic())))
+            except subprocess.TimeoutExpired:
+                auth_process.kill()
+                auth_process.wait(timeout=.2)
+            except ProcessLookupError:
+                pass
         # The peer came from verified private ingress (UID/cgroup + PID/start).
         # Fence the separate channel writer; never interpret native task IDs as
         # PIDs. A prior transport write can already have occurred and stays unknown.
