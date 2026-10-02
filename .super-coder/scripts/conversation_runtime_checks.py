@@ -654,8 +654,12 @@ class CompatibilityChecker:
                             for cap in remaining:
                                 item = evidence.get(cap)
                                 if item and item.grade == "compatible":
-                                    evidence[cap] = replace(item, coverage=item.coverage | {"owned_unit_cleanup"},
-                                                            provenance=(*item.provenance, "owner:unit_cleanup_verified"))
+                                    try:
+                                        evidence[cap] = replace(item, coverage=item.coverage | {"owned_unit_cleanup"},
+                                                                provenance=(*item.provenance, "owner:unit_cleanup_verified"))
+                                    except (ValueError,TypeError):
+                                        evidence[cap] = CapabilityEvidence(cap,"inconclusive",diagnostics=(
+                                            Diagnostic(cap,"inconclusive","CHECK_FINALIZATION_INCONCLUSIVE"),))
                         else:
                             with self._lock:
                                 self._retained[fingerprint.key] = fingerprint

@@ -298,11 +298,12 @@ def test_final_normalization_failure_still_resolves_with_cleanup(context):
         def reserve(self,*args,**kwargs):
             session=super().reserve(*args,**kwargs)
             # Adding the final cleanup provenance exceeds the bounded record.
-            return replace(session,exercise=lambda *_:{CAP_HISTORY_RESUME:evidence(fp,provenance=tuple(str(i) for i in range(64)))})
+            return replace(session,exercise=lambda *_:{CAP_HISTORY_RESUME:evidence(fp,provenance=tuple(str(i) for i in range(64))),CAP_SUBMISSION:complete_evidence()})
     checker=CompatibilityChecker()
-    result=checker.request(fp,observed_interface=INTERFACE,requirements={CAP_HISTORY_RESUME:REQUIREMENT},
+    result=checker.request(fp,observed_interface=INTERFACE,requirements={CAP_HISTORY_RESUME:REQUIREMENT,CAP_SUBMISSION:REQUIREMENT},
         factory=FullProvenanceFactory(context),seconds=.5).result(timeout=1)
     assert result.cleanup.complete
     assert result.evidence[CAP_HISTORY_RESUME].grade=='inconclusive'
     assert result.evidence[CAP_HISTORY_RESUME].diagnostics[0].code=='CHECK_FINALIZATION_INCONCLUSIVE'
+    assert result.evidence[CAP_SUBMISSION].grade=='compatible'
     assert fp.key not in checker._flights
