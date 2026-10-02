@@ -1,8 +1,8 @@
 """Explicit disposable experiment seam; production runtime startup is unchanged.
 
 Foundation alone starts no drivers/broker/reaper. The integration lane may bind
-its named experimental API clients here. Fixture shutdown always stops each
-registered owned native unit before its database/source root can be removed.
+its named experimental API clients here. API shutdown releases only clients;
+the fixture ledger owner stops all registered units before deleting any state.
 """
 from __future__ import annotations
 
@@ -13,7 +13,8 @@ def start_fixture(*,database: Path,root: Path,fixture_id: str,supervisor):
     if database.resolve()!=root/'.super-coder/shell_db.db' or not fixture_id:
         raise ValueError('synthetic fixture identity required')
     def shutdown():
-        for native in supervisor.inventory():
-            if not native.get('os_cleanup',{}).get('complete'):
-                supervisor.stop(native['generation_id'])
+        # A stopped/restarted API must not end an open chat's controller.
+        # The independent finite supervisor deadline and maintainer stop own
+        # OS cleanup; task870 binds API consumer release here.
+        return None
     return shutdown
