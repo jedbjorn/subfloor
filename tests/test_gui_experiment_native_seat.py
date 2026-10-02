@@ -133,7 +133,7 @@ def test_external_worktree_alias_is_rejected_before_registration_or_boot_writes(
     assert list((external/'fx' if alias=='parent' else external).iterdir())==[]
 
 
-@pytest.mark.parametrize('change',['closing','generation','owner','preparer'])
+@pytest.mark.parametrize('change',['closing','generation','owner','preparer','role'])
 def test_identity_observation_cannot_hide_changed_preparation_owner(seat,change):
     value,events,_=seat
     observe=value.observers['codex'].observe
@@ -142,6 +142,7 @@ def test_identity_observation_cannot_hide_changed_preparation_owner(seat,change)
         runtime={'role':'ordinary','generation_id':'replacement' if change=='generation' else 'generation',
                  'state':'closing' if change=='closing' else 'preparing'}
         if change=='preparer':runtime['preparation_owner']={'unit':'replacement'}
+        if change=='role':runtime['role']='probe'
         con.execute('UPDATE conversations SET runtime_projection=?',(json.dumps(runtime),))
         if change=='owner':con.execute('UPDATE shells SET user_id=NULL')
         con.commit();con.close()

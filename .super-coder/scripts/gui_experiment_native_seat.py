@@ -188,6 +188,7 @@ class NativeFixtureSeat:
             if (fresh is None or fresh['owner_user_id']!=1 or fresh['shell_owner']!=1
                     or fresh['state']=='closed' or fresh['runtime_mode']!='native_experiment'
                     or runtime.get('generation_id')!=generation_id or runtime.get('state')!='preparing'
+                    or runtime.get('role')!=json.loads(row['runtime_projection']).get('role')
                     or runtime.get('preparation_owner')!=json.loads(row['runtime_projection']).get('preparation_owner')
                     or any(fresh[key]!=row[key] for key in ('shell_id','harness','provider','model','effort','worktree','route_binding'))):
                 raise RuntimeContractError('RUNTIME_CLOSING','preparing generation was closed/replaced before canonical writes')
