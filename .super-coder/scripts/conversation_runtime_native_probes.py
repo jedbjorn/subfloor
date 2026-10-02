@@ -441,7 +441,9 @@ class NativeProbeFactory:
 
 class _Scenarios:
     def __init__(self, driver: ControllerProbeDriver, capabilities: frozenset[str], deadline: float):
-        self.driver, self.caps, self.deadline = driver, capabilities, deadline
+        self.driver, self.caps = driver, capabilities
+        # Return scoped measurements before the checker outer RPC deadline.
+        self.deadline = deadline-min(.25, max(0.0, deadline-time.monotonic())/10)
         self.owned = driver.owned
         self.nonce = uuid.uuid4().hex[:16]
         self.ordinal = 0
@@ -599,7 +601,15 @@ class _Scenarios:
         return result
 
     def _pid(self, label: str) -> ProcessIdentity | None:
-        text = "".join(str(e.data.get("text", "")) for e in self._events() if e.kind.startswith("output."))
+        outputs: dict[tuple[Any, ...], list[str]] = {}
+        for event in self._events():
+            ref = event.reference
+            if ref and event.kind in {"output.delta", "output.final"} and isinstance(event.data.get("text"), str):
+                output_key = (ref.thread_id, ref.activity_id, ref.item_id, event.kind)
+                outputs.setdefault(output_key, []).append(event.data["text"])
+        # Separate attributable items/turns; nonce recall cannot append digits
+        # to a PID printed in an earlier terminal or assistant item.
+        text = "\n".join("".join(chunks) for chunks in outputs.values())
         matches = list(dict.fromkeys(re.findall(re.escape(label)+r"=(\d+)\b", text)))[:128]
         callback = self.owned.process_identity
         identities = []
@@ -679,10 +689,21 @@ class _Scenarios:
             self._wait(lambda: self._successful_reply(first, first_receipt, "READY "+self.nonce))
             if not self.owned.observe_marker(self.nonce, self.deadline):
                 raise RuntimeContractError("PROBE_BOOT_FIXTURE_UNPROVED", "physical managed marker not observed")
+            self._phase("nonce_recall")
+            second, second_receipt = self._submit("Reply only with the remembered nonce from the previous message. No tools or resources.")
+            self._wait(lambda: self._successful_reply(second, second_receipt, self.nonce))
+            root_snapshot = self.driver.inventory(deadline=self.deadline)
+            if root_snapshot.freshness != "current" or not self._retained_root(root, root_snapshot):
+                raise RuntimeContractError("PROBE_ROOT_IDENTITY_UNPROVED", "same captured root/process required")
+            if CAP_SUBMISSION in self.coverage:
+                self.coverage[CAP_SUBMISSION].update({"repeated_input", "root_identity", "processing_terminal", "boot_fixture", "memory_disabled"})
+            # Work/PID observations qualify controls, independently of the
+            # already successful root messaging and captured root identity.
+            self.stage = CAP_STOP_REPLY if CAP_STOP_REPLY in self.caps else "stop_work_terminal"
             self._phase("initial_snapshot")
             initial = self._inventory()
-            root_work = next((w for w in initial.work if w.kind == "terminal" and w.reference.thread_id == root.root_id), None)
-            child = next((w for w in initial.work if w.kind == "child" and w.reference.parent_thread_id == root.root_id), None)
+            root_work = next((w for w in initial.work if w.kind == "terminal" and w.freshness == "current" and w.reference.thread_id == root.root_id), None)
+            child = next((w for w in initial.work if w.kind == "child" and w.freshness == "current" and w.reference.parent_thread_id == root.root_id), None)
             with self.driver._lock:
                 self.work_observation.update(initial_root_terminal_current=bool(root_work and root_work.freshness == "current"),
                     initial_child_ancestry_current=bool(child and child.freshness == "current"),
@@ -696,7 +717,7 @@ class _Scenarios:
                 if child is None or not child.reference.activity_id:
                     raise RuntimeContractError("PROBE_CHILD_UNPROVED", "owned child ancestry/current turn required")
                 self._phase("child_terminal")
-                child_terminal = self._wait(lambda: next((w for w in self._inventory().work if w.kind == "terminal"
+                child_terminal = self._wait(lambda: next((w for w in self._inventory().work if w.kind == "terminal" and w.freshness == "current"
                     and w.reference.thread_id == child.reference.thread_id), None))
                 with self.driver._lock:
                     self.work_observation["observed_child_terminal_current"] = child_terminal.freshness == "current"
@@ -705,13 +726,6 @@ class _Scenarios:
             elif background:
                 self._phase("child_tagged_pid")
                 child_pid = self._wait(lambda: self._pid(child_label))
-            self._phase("nonce_recall")
-            second, second_receipt = self._submit("Reply only with the remembered nonce from the previous message. No tools or resources.")
-            self._wait(lambda: self._successful_reply(second, second_receipt, self.nonce))
-            if not self._retained_root(root, self._inventory()):
-                raise RuntimeContractError("PROBE_ROOT_IDENTITY_UNPROVED", "same captured root/process required")
-            if CAP_SUBMISSION in self.coverage:
-                self.coverage[CAP_SUBMISSION].update({"repeated_input", "root_identity", "processing_terminal", "boot_fixture", "memory_disabled"})
             if CAP_STOP_REPLY in self.caps:
                 self.stage = CAP_STOP_REPLY
                 self._phase("stop_reply")

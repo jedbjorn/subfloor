@@ -14,7 +14,12 @@ from pathlib import Path
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / '.super-coder/scripts'))
-from conversation_runtime_checks import CleanupProof, EvidenceCache, Fingerprint
+from conversation_runtime_checks import (
+    CleanupProof,
+    CompatibilityChecker,
+    EvidenceCache,
+    Fingerprint,
+)
 from conversation_runtime_contract import (
     ExecutableBinding,
     NativeReference,
@@ -313,7 +318,7 @@ def test_inventory_witness_distinguishes_missing_tag_from_failed_owned_identity_
     fp=fingerprint(actual);session=factory.reserve(fp,frozenset({'submission','stop_work'}),deadline=time.monotonic()+3)
     session.driver.start(actual.context,lambda e:None,deadline=time.monotonic()+3)
     result=session.exercise(session.driver,time.monotonic()+1)
-    assert result['submission'].grade=='inconclusive'
+    assert result['submission'].grade=='compatible' and result['stop_work'].grade=='inconclusive'
     witness=factory.witness(fp)
     assert witness['waiting_stage']=='root_tagged_pid' and witness['first_successful_reply']
     assert witness['initial_snapshot_observed'] and witness['initial_snapshot_current']
@@ -336,7 +341,12 @@ def test_inventory_witness_preserves_partial_and_stale_snapshot_failure(owned,ch
     fp=fingerprint(owned);session=factory.reserve(fp,frozenset({'submission','stop_work'}),deadline=time.monotonic()+3)
     session.driver.start(owned.context,lambda e:None,deadline=time.monotonic()+3)
     result=session.exercise(session.driver,time.monotonic()+2)
-    assert result['submission'].grade=='inconclusive' and len([c for c in owned.client.calls if c[0]=='submit'])==1
+    assert result['submission'].grade==('compatible' if change.get('partial') else 'inconclusive')
+    assert len([c for c in owned.client.calls if c[0]=='submit'])==2
+    if not change.get('partial'):
+        assert factory.witness(fp)['waiting_stage']=='nonce_recall'
+        session.driver.cleanup(deadline=time.monotonic()+1)
+        return
     witness=factory.witness(fp)
     assert witness['waiting_stage']=='initial_snapshot' and witness['initial_snapshot_observed']
     assert witness['initial_snapshot_partial']==change.get('partial',False)
@@ -715,3 +725,39 @@ def test_current_snapshot_does_not_upgrade_work_witness_freshness(owned, freshne
         assert not witness['observed_child_terminal_current']
     finally:
         session.driver.cleanup(deadline=time.monotonic()+1)
+
+
+@pytest.mark.parametrize('gap', ['missing_pid_tag', 'unowned_pid', 'partial_work_snapshot'])
+@pytest.mark.parametrize('cleanup', ['complete', 'native_unknown', 'os_unknown'])
+def test_checker_submission_proof_survives_optional_target_gap_only_after_full_cleanup(owned, gap, cleanup):
+    event = owned.client.event
+    def output(kind, ref, request=None, **data):
+        if gap == 'missing_pid_tag' and isinstance(data.get('text'), str):
+            data['text'] = re.sub(r'F89_ROOT_[a-z0-9]+=200', 'untagged', data['text'])
+        return event(kind, ref, request, **data)
+    owned.client.event = output
+    original = owned.client.request
+    def request(op, **fields):
+        result = original(op, **fields)
+        if op == 'snapshot' and gap == 'partial_work_snapshot':
+            result['partial'] = True
+        if op == 'close' and cleanup == 'native_unknown':
+            result['outcome'] = 'inconclusive'
+        return result
+    owned.client.request = request
+    actual = replace(owned, process_identity=lambda pid:
+                     None if gap == 'unowned_pid' and pid == 200 else owned.client.pids.get(pid))
+    factory = NativeProbeFactory(lambda *args: actual, lambda *args:
+                                 CleanupProof(cleanup != 'os_unknown', 'complete'))
+    fp = fingerprint(actual)
+    checker = CompatibilityChecker()
+    result = checker.request(fp, observed_interface={'fixed': True},
+        requirements={'submission': {'fixed': True}, 'stop_work': {'fixed': True}},
+        factory=factory, seconds=2.4).result(timeout=4)
+    assert len([c for c in actual.client.calls if c[0] == 'submit']) == 2
+    assert not any(c[0] == 'control' for c in actual.client.calls)
+    assert result.evidence['submission'].grade == ('compatible' if cleanup == 'complete' else 'inconclusive')
+    assert result.evidence['stop_work'].grade == 'inconclusive'
+    assert ('owned_unit_cleanup' in result.evidence['submission'].coverage) == (cleanup == 'complete')
+    assert checker.cache.admission(fp)['submission'] == ('compatible' if cleanup == 'complete' else 'inconclusive')
+    assert not result.evidence['stop_work'].coverage
