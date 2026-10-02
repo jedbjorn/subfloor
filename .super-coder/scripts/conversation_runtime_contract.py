@@ -29,6 +29,14 @@ EVENT_KINDS = frozenset({
 # Only ephemeral output may be truncated; identity/intents/outcomes require
 # reserved journal capacity and must never become silent success.
 OUTPUT_KINDS = frozenset({"output.delta"})
+# Private socket wire: one UTF-8 JSON object + newline per connection, <=256KiB.
+# Request generation/contract/op; reply {ok:true,result:{...}} or
+# {ok:false,error:<stable code>,detail:<redacted detail>}. No auth env/token
+# in asset frames: owner-only endpoint + SO_PEERCRED/owned cgroup authorize.
+def asset_frame(generation: str, payload: Mapping[str, Any], *, timeout: float = 1) -> dict[str, Any]:
+    return {"generation":generation,"contract":CONTRACT_REVISION,"op":"asset",
+            "payload":dict(payload),"timeout":min(max(timeout,0.01),5)}
+
 Grade = Literal["compatible", "incompatible", "inconclusive", "unverified"]
 Freshness = Literal["current", "last_observed", "stale", "unknown"]
 ActivitySource = Literal["gui", "native_completion", "automation", "reconciliation", "system"]
