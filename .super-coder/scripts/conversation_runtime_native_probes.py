@@ -15,7 +15,7 @@ import uuid
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, cast
 
 from conversation_runtime import RuntimeClient, RuntimeStore
 from conversation_runtime_checks import (
@@ -131,6 +131,7 @@ class ControllerProbeDriver(RuntimeDriver):
         self._cleanup_lock = threading.Lock()
         self._native_cleanup: NativeCleanup | None = None
         self._first_native_cleanup: NativeCleanup | None = None
+        self._first_close_has_outcome = False
         self._scenario: _Scenarios | None = None
 
     def _capture_identity(self, value: Mapping[str, Any]) -> None:
@@ -330,11 +331,15 @@ class ControllerProbeDriver(RuntimeDriver):
                 if ref is None:
                     return NativeCleanup("inconclusive")
                 unresolved.append(ref)
-            native = NativeCleanup(result.get("outcome", "inconclusive"), tuple(unresolved),
+            outcome = result.get("outcome")
+            has_outcome = isinstance(outcome, str) and outcome in {"complete", "pending", "failed", "inconclusive"}
+            native_outcome = cast(Literal["complete", "pending", "failed", "inconclusive"], outcome) if has_outcome else "inconclusive"
+            native = NativeCleanup(native_outcome, tuple(unresolved),
                                    tuple(result.get("unresolved_definitions", ())))
             with self._lock:
                 if self._first_native_cleanup is None:
                     self._first_native_cleanup = native
+                    self._first_close_has_outcome = has_outcome
             if native.outcome == "complete" and not native.unresolved_work and not native.unresolved_definitions:
                 self._native_cleanup = native
             return native
@@ -417,8 +422,9 @@ class NativeProbeFactory:
             scenario, closing = driver._scenario, driver._closing
             cleanup = driver._first_native_cleanup
             retained = driver._native_cleanup is not None
+            observed = driver._first_close_has_outcome
         result: dict[str, Any] = scenario.witness() if scenario else {"waiting_stage": "startup"}
-        result.update(first_close_observed=cleanup is not None,
+        result.update(first_close_observed=observed,
             first_close_outcome=cleanup.outcome if cleanup and cleanup.outcome in {
                 "complete", "pending", "failed", "inconclusive"} else "inconclusive",
             first_close_unresolved_work=len(cleanup.unresolved_work) if cleanup else 0,
@@ -731,7 +737,8 @@ class _Scenarios:
             code = exc.code if isinstance(exc, RuntimeContractError) else "NATIVE_BEHAVIOR_UNPROVED"
             failure_grade: Grade = "incompatible" if code in {"PROBE_SIBLING_ISOLATION_BROKEN", "PROBE_BACKGROUND_ISOLATION_BROKEN"} else "inconclusive"
             self.failures.append(Diagnostic(self.stage, failure_grade, code))
-        self._phase("finished")
+        if not self.failures:
+            self._phase("finished")
         result = {}
         for cap in self.caps:
             diagnostics = tuple(d for d in (*self.driver.diagnostics, *self.failures) if d.capability in {cap, "stop_work_terminal", "stop_work_child"}
