@@ -64,6 +64,9 @@ def hook(seat, name, **fields):
 def prepared_assets(tmp_path, monkeypatch):
     assets = tmp_path / "assets"
     (assets / "node_modules/@modelcontextprotocol/sdk").mkdir(parents=True)
+    for original in runtime.ASSETS.iterdir():
+        if original.is_file():
+            (assets / original.name).write_bytes(original.read_bytes())
     (assets / "node_modules/@modelcontextprotocol/sdk/package.json").write_text("{}")
     monkeypatch.setattr(runtime, "ASSETS", assets)
     monkeypatch.setattr(runtime.shutil, "which", lambda *args, **kwargs: "/captured/node")
@@ -85,6 +88,97 @@ def make_ready(seat):
     driver._channel_peer = ProcessIdentity(999999999, 10)
 
 
+def startup_dialog():
+    # Exact installed 2.1.287 DevChannelsDialog/ax ConfirmCancel text;
+    # source fixture only, actual native phase acceptance remains separate.
+    return ("WARNING: Loading development channels\n"
+        "--dangerously-load-development-channels is for local channel development only. "
+        "Do not use this option to run channels you have downloaded off the internet.\n"
+        "Please use --channels to run a list of approved channels.\n"
+        "Channels: server:subfloor_runtime\n"
+        "y. I am using this for local development\nn. Exit\nEnter y/n: ")
+
+
+@pytest.fixture
+def startup_seat(seat, tmp_path, monkeypatch):
+    _, context, _ = seat
+    prepared_assets(tmp_path, monkeypatch)
+    context.executable.path.write_text("#!/usr/bin/python3\nimport sys,time\n"
+        + f"print({startup_dialog()!r},end='',flush=True)\n"
+        + "sys.stdin.readline()\nprint('fixture confirmation consumed',flush=True)\ntime.sleep(5)\n")
+    context.executable.path.chmod(0o700)
+    context = replace(context, executable=replace(context.executable,
+        sha256=hashlib.sha256(context.executable.path.read_bytes()).hexdigest()))
+    driver, events = runtime.ClaudeRuntimeDriver(), []
+    started = time.monotonic()
+    result = driver.start(context, events.append, deadline=started + 3)
+    try:
+        assert result.state == "needs_consent" and result.setup and time.monotonic() - started < 1
+        assert not driver._ready
+        yield driver, context, events, result.setup
+    finally:
+        driver.cleanup(deadline=time.monotonic() + 2)
+        assert driver._process.poll() is not None
+
+
+def enable_command(setup, **changes):
+    return NativeControl("enable", 1, "digest", "enable_local_channel",
+        options={"setup_id": setup.setup_id, "configuration_sha256": setup.configuration_sha256}, **changes)
+
+
+def test_finite_startup_returns_early_and_explicit_confirmation_is_not_readiness(startup_seat):
+    driver, _, events, setup = startup_seat
+    assert setup.phase == "local_channel_development_consent"
+    assert any(event.kind == "runtime.setup" and not event.partial for event in events)
+    assert driver.control(enable_command(setup), deadline=DEADLINE()).state == "written"
+    assert not driver._ready and not [event for event in events if event.kind == "runtime.ready"]
+    assert driver.control(replace(enable_command(setup), control_id="another"), deadline=DEADLINE()).state == "rejected"
+
+
+@pytest.mark.parametrize("mutation", ["stale_id", "wrong_digest", "changed_phase", "wrong_root", "changed_configuration", "changed_binary", "expired"])
+def test_startup_confirmation_revalidates_only_captured_phase_and_writes_nothing(startup_seat, monkeypatch, mutation):
+    driver, context, events, setup = startup_seat
+    command = enable_command(setup)
+    if mutation == "stale_id":
+        command = replace(command, options=dict(command.options) | {"setup_id": "stale"})
+    elif mutation == "wrong_digest":
+        command = replace(command, options=dict(command.options) | {"configuration_sha256": "a" * 64})
+    elif mutation == "wrong_root":
+        command = replace(command, target=NativeReference("other-root"))
+    elif mutation == "changed_phase":
+        with driver._condition:
+            driver._observe_startup(b"\nA different startup choice\nEnter y/n: ")
+        assert any(event.kind == "runtime.setup" and event.partial and event.freshness == "stale" for event in events)
+    elif mutation == "changed_configuration":
+        (context.state_root / "claude-runtime-settings.json").write_text("different settings")
+    elif mutation == "changed_binary":
+        context.executable.path.write_text("changed native executable")
+    writes = []
+    monkeypatch.setattr(runtime.os, "write", lambda fd, data: writes.append(data) or len(data))
+    result = driver.control(command, deadline=time.monotonic() - 1 if mutation == "expired" else DEADLINE())
+    assert result.state in {"not_written", "rejected"} and writes == [] and not driver._startup_confirmed
+
+
+def test_partial_startup_keyboard_write_is_unknown_and_never_replayed(startup_seat, monkeypatch):
+    driver, _, _, setup = startup_seat
+    writes = []
+    monkeypatch.setattr(runtime.os, "write", lambda fd, data: writes.append(data) or 1)
+    assert driver.control(enable_command(setup), deadline=DEADLINE()).state == "unknown"
+    assert driver.control(replace(enable_command(setup), control_id="retry"), deadline=DEADLINE()).state == "rejected"
+    assert writes == [b"y\r"] and not driver._ready
+
+
+@pytest.mark.parametrize("replacement", ["Unknown warning", "Channels: server:other", "y. Other choice", "Enter y/n: n"])
+def test_unrecognized_startup_text_never_creates_eligible_setup(seat, replacement):
+    driver, _, events = seat
+    driver._configuration_sha256 = "a" * 64
+    text = startup_dialog()
+    original = {"Unknown warning": "WARNING: Loading development channels", "Channels: server:other": "Channels: server:subfloor_runtime",
+                "y. Other choice": "y. I am using this for local development", "Enter y/n: n": "Enter y/n: "}[replacement]
+    driver._observe_startup(text.replace(original, replacement).encode())
+    assert driver._startup_setup is None and not [event for event in events if event.kind == "runtime.setup"]
+
+
 def test_boot_keeps_canonical_permissions_mcp_discovery_and_native_route(seat, tmp_path, monkeypatch):
     driver, context, _ = seat
     prepared_assets(tmp_path, monkeypatch)
@@ -95,6 +189,7 @@ def test_boot_keeps_canonical_permissions_mcp_discovery_and_native_route(seat, t
     argv, env = driver._prepare(context)
     assert argv[0] == str(context.executable.path)
     assert "--dangerously-skip-permissions" in argv and str(mcp) in argv
+    assert "--ax-screen-reader" in argv
     assert not {"--print", "--bare", "--restricted", "--setting-sources"} & set(argv)
     assert "ANTHROPIC_API_KEY" not in env and "CLAUDE_CODE_SIMPLE" not in env
     assert env["CLAUDE_CODE_DISABLE_AUTO_MEMORY"] == "1"

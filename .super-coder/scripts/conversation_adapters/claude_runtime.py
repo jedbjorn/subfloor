@@ -24,7 +24,7 @@ import time
 import uuid
 from collections import deque
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Literal
 
@@ -45,15 +45,29 @@ from conversation_runtime_contract import (
     RuntimeDriver,
     RuntimeEvent,
     RuntimeIdentity,
+    StartupConsent,
     WriteReceipt,
 )
 
 CHANNEL = "subfloor_runtime"
-REVISION = "f89-claude-foreground-v1"
+REVISION = "f89-claude-foreground-v2"
 ASSETS = Path(__file__).resolve().parents[2] / "assets/runtime/claude"
 MAX_RECORDS = 4096
 MAX_NOTIFICATIONS = 64
 TEXT_CHUNK = 4000
+STARTUP_BYTES = 8192
+STARTUP_TITLE = "WARNING: Loading development channels"
+# Installed 2.1.287 --ax-screen-reader ConfirmCancel emits this finite choice.
+# This recognizes one pre-ready dialog, not a terminal/screen model.
+STARTUP_CHOICE = re.compile(
+    r"WARNING: Loading development channels\s+"
+    r"--dangerously-load-development-channels is for local channel development only\. "
+    r"Do not use this option to run channels you have downloaded off the internet\.\s+"
+    r"Please use --channels to run a list of approved channels\.\s+"
+    rf"Channels:\s+server:{CHANNEL}\s+"
+    r"y\. I am using this for local development\s+n\. Exit\s+Enter y/n:\s*\Z"
+)
+STARTUP_ANSI = re.compile(rb"\x1b\[[0-9;?]*[mKGHJhl]")
 PROVIDER_OVERRIDES = (
     "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL",
     "CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX", "CLAUDE_CODE_USE_FOUNDRY",
@@ -164,6 +178,11 @@ class ClaudeRuntimeDriver(RuntimeDriver):
         self._policy_changed = False
         # Volatile diagnostic bytes only; never emitted or persisted as output.
         self._pty_tail: deque[bytes] = deque(maxlen=16)
+        self._startup_bytes = b""
+        self._startup_setup: StartupConsent | None = None
+        self._startup_confirmed = False
+        self._configuration_files: tuple[Path, ...] = ()
+        self._configuration_sha256 = ""
 
     def _capabilities(self) -> dict[str, Grade]:
         evidence = self._context.capability_evidence if self._context else {}
@@ -270,6 +289,7 @@ class ClaudeRuntimeDriver(RuntimeDriver):
                 raise RuntimeContractError("MCP_INVALID", "prepared managed MCP file missing")
         assert self._identity is not None
         argv = [str(context.executable.path), "--session-id", self._identity.root_id,
+                "--ax-screen-reader",
                 "--settings", str(settings), "--strict-mcp-config", "--mcp-config",
                 *map(str, context.managed_mcp_files), str(channel),
                 "--dangerously-load-development-channels", f"server:{CHANNEL}", *permissions]
@@ -277,6 +297,9 @@ class ClaudeRuntimeDriver(RuntimeDriver):
             argv += ["--model", context.model]
         if context.effort:
             argv += ["--effort", context.effort]
+        self._configuration_files = (settings, channel, *context.managed_mcp_files,
+            *(ASSETS / name for name in ("channel.mjs", "asset-client.mjs", "hook.py", "asset_client.py", "pty_exec.py", "package-lock.json")))
+        self._configuration_sha256 = self._configuration_digest(context)
         # No --bare/--restricted/--safe-mode/--print or instruction-discovery suppression.
         return context.execution_argv(argv), env
 
@@ -290,6 +313,7 @@ class ClaudeRuntimeDriver(RuntimeDriver):
             try:
                 argv, env = self._prepare(context)
                 master, slave = pty.openpty()
+                os.set_blocking(master, False)
                 self._master = master
                 try:
                     self._process = self._popen(
@@ -309,8 +333,12 @@ class ClaudeRuntimeDriver(RuntimeDriver):
                     os.close(self._master)
                     self._master = None
                 return DriverStart("unavailable", self._identity, str(exc), self._capabilities())
-            while not self._ready and not self._lost and time.monotonic() < deadline:
+            while not self._ready and not self._lost and not self._startup_setup and time.monotonic() < deadline:
                 self._condition.wait(min(0.1, max(0, deadline - time.monotonic())))
+            if self._startup_setup and not self._lost:
+                return DriverStart("needs_consent", self._identity,
+                    "Explicit operator enablement of this captured local channel is required.",
+                    self._capabilities(), setup=self._startup_setup)
             if not self._ready:
                 return DriverStart("unavailable", self._identity,
                     "controlled native channel/trust readiness not established; no dialog was auto-accepted",
@@ -324,12 +352,16 @@ class ClaudeRuntimeDriver(RuntimeDriver):
                 if master is None:
                     break
                 if select.select([master], [], [], 0.1)[0]:
-                    try:
-                        chunk = os.read(master, 8192)
-                    except OSError:
-                        chunk = b""
-                    if chunk:
-                        self._pty_tail.append(chunk)
+                    with self._condition:
+                        # Setup confirmation serializes with every consumed
+                        # startup byte, including bytes awaiting observation.
+                        try:
+                            chunk = os.read(master, 8192) if master == self._master else b""
+                        except OSError:
+                            chunk = b""
+                        if chunk:
+                            self._pty_tail.append(chunk)
+                            self._observe_startup(chunk)
                 self._drain_transcript()
                 if self._process.poll() is not None:
                     self._drain_transcript()
@@ -345,6 +377,81 @@ class ClaudeRuntimeDriver(RuntimeDriver):
                 self._lost = True
                 self._fail_observation("native reader unavailable")
                 self._condition.notify_all()
+
+    def _configuration_digest(self, context: RuntimeContext) -> str:
+        files = {str(path): hashlib.sha256(path.read_bytes()).hexdigest() for path in self._configuration_files}
+        binding = {"files": files, "driver_revision": REVISION, "boot_digest": context.boot_digest,
+                   "policy_digest": context.policy_digest, "model": context.model, "effort": context.effort,
+                   "permission_mode": context.permission_mode, "display": "--ax-screen-reader"}
+        return hashlib.sha256(json.dumps(binding, sort_keys=True).encode()).hexdigest()
+
+    def _observe_startup(self, chunk: bytes) -> None:
+        if self._startup_confirmed or self._ready or self._lost or self._closing or self._activities:
+            self._withdraw_setup("previous finite startup choice is no longer available")
+            return
+        self._startup_bytes = (self._startup_bytes + chunk)[-STARTUP_BYTES:]
+        plain = STARTUP_ANSI.sub(b"", self._startup_bytes).decode(errors="replace")
+        start = plain.rfind(STARTUP_TITLE)
+        if start < 0 or not STARTUP_CHOICE.fullmatch(plain[start:]):
+            self._withdraw_setup("previous startup choice changed or is no longer completely observed")
+            return
+        if self._startup_setup is None:
+            assert self._context
+            self._startup_setup = StartupConsent(self._context.generation_id, str(uuid.uuid4()),
+                self._context.executable.sha256, REVISION, self._configuration_sha256, time.time(),
+                "Documented local-development channel choice observed; confirmation does not establish readiness.")
+            self._send_event(RuntimeEvent("runtime.setup", provenance="claude:finite-ax-startup-choice",
+                data=asdict(self._startup_setup)))
+            self._condition.notify_all()
+
+    def _withdraw_setup(self, reason: str) -> None:
+        setup, self._startup_setup = self._startup_setup, None
+        if setup:
+            self._send_event(RuntimeEvent("runtime.setup", provenance="claude:finite-ax-startup-withdrawn",
+                freshness="stale", partial=True, grade="inconclusive", data=asdict(setup) | {"detail": reason}))
+
+    def _enable_local_channel(self, command: NativeControl, *, deadline: float) -> WriteReceipt:
+        with self._condition:
+            if self._closing or self._lost or self._ready or self._startup_confirmed or time.monotonic() >= deadline:
+                return WriteReceipt("rejected", detail="captured startup choice is no longer available")
+            setup = self._startup_setup
+            if not setup or command.options != {"setup_id": setup.setup_id,
+                    "configuration_sha256": setup.configuration_sha256}:
+                return WriteReceipt("rejected", detail="exact current startup setup binding required")
+            if command.target is not None and (not self._identity or command.target.root_id != self._identity.root_id):
+                return WriteReceipt("rejected", detail="startup target differs from captured native root")
+            if self._master is None or self._identity is None or self._identity.process is None or not self._context:
+                return WriteReceipt("not_written", detail="owned native startup descriptor unavailable")
+            try:
+                # Drain any already-readable change before confirming the finite
+                # choice. Bound this admission; never interpret general screens.
+                for _ in range(4):
+                    if not select.select([self._master], [], [], 0)[0]:
+                        break
+                    chunk = os.read(self._master, STARTUP_BYTES)
+                    if not chunk:
+                        return WriteReceipt("not_written", detail="native startup transport ended")
+                    self._observe_startup(chunk)
+                if (select.select([self._master], [], [], 0)[0] or self._startup_setup != setup
+                        or process_identity(self._identity.process.pid) != self._identity.process
+                        or self._configuration_digest(self._context) != setup.configuration_sha256
+                        or hashlib.sha256(self._context.executable.path.read_bytes()).hexdigest() != setup.executable_sha256
+                        or time.monotonic() >= deadline):
+                    self._withdraw_setup("startup phase or captured configuration changed before confirmation")
+                    return WriteReceipt("not_written", detail="startup phase or captured configuration changed")
+                # Fence BEFORE the keyboard edge. Partial/error is unknown and
+                # cannot be replayed or treated as consent/readiness.
+                self._startup_confirmed = True
+                self._startup_setup = None
+                written = os.write(self._master, b"y\r")
+            except OSError:
+                return WriteReceipt("unknown" if self._startup_confirmed else "not_written",
+                                    detail="startup confirmation transport unavailable")
+            if written != 2:
+                return WriteReceipt("unknown", detail="partial startup confirmation; never replay")
+            self._send_event(RuntimeEvent("control.acknowledged", control_id=command.control_id,
+                provenance="claude:finite-ax-startup-confirmation", data={"state": "written", "readiness": False}))
+            return WriteReceipt("written", detail="finite startup confirmation written; native readiness remains pending")
 
     def _queue(self, content: str, metadata: dict[str, str]) -> None:
         if len(self._notifications) >= MAX_NOTIFICATIONS:
@@ -393,6 +500,8 @@ class ClaudeRuntimeDriver(RuntimeDriver):
                 provenance="claude:owned-hooks-transcript")
 
     def control(self, command: NativeControl, *, deadline: float) -> WriteReceipt:
+        if command.action == "enable_local_channel":
+            return self._enable_local_channel(command, deadline=deadline)
         with self._condition:
             if time.monotonic() >= deadline or self._lost or (self._closing and command.action != "close"):
                 return WriteReceipt("not_written", detail="native control deadline/session unavailable")
@@ -816,7 +925,7 @@ class ClaudeRuntimeDriver(RuntimeDriver):
         if not self._snapshot_partial and activity.automation_id and scheduled and scheduled.state == "absent_from_snapshot" and scheduled.durable is False and scheduled.data.get("recurring") is False:
             self._definitions.pop(activity.automation_id, None)
             self._work_terminal(activity.automation_id, "completed", "claude:oneshot-snapshot+native-terminal")
-        if (prompt_id == self._readiness_prompt and not self._ready and not self._lost
+        if (prompt_id == self._readiness_prompt and not self._ready and not self._lost and not self._policy_changed
                 and status == "completed" and activity.readiness_reply
                 and provenance == "claude:owned-transcript-turn_duration"):
             self._ready = True
