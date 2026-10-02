@@ -181,7 +181,7 @@ def _methods(document: Mapping[str, Any]) -> dict[str, Any]:
     return result
 
 
-def _supplied_inputs(params: Any, method: str, root: Mapping[str, Any]) -> bool:
+def _supplied_inputs(params: Any, method: str, root: Mapping[str, Any], effort: str | None) -> bool:
     objects: dict[str, set[str]] = {'': set(PROVIDED_INPUTS[method])}
     for path in REQUEST_FIELDS[method]:
         parts = path.split('.')
@@ -190,6 +190,8 @@ def _supplied_inputs(params: Any, method: str, root: Mapping[str, Any]) -> bool:
                 continue
             prefix = '.'.join(parts[:index])
             objects.setdefault(prefix, set()).add(part)
+    if method == 'turn/start' and effort in {None, 'default'}:
+        objects[''].discard('effort')
     if method == 'thread/start':
         objects['config'] = {'features.memories', 'memories.generate_memories', 'memories.use_memories'}
     for path, provided in objects.items():
@@ -268,7 +270,7 @@ def project_codex_schema(directory: Path, executable: ExecutableBinding, *, effo
                 continue
             params = request_methods[method]
             try:
-                supplied = _supplied_inputs(params, method, requests)
+                supplied = _supplied_inputs(params, method, requests, effort)
                 observed['requests'][method] = {'fields': {path: _project_field(params, path, requests) for path in fields},
                     'required_inputs_satisfied': supplied}
             except SchemaUnavailable:
@@ -301,16 +303,25 @@ def project_codex_schema(directory: Path, executable: ExecutableBinding, *, effo
             if cap == 'stop_work':
                 requirement['events'].update({'item/commandExecution/outputDelta': _required(EVENT_FIELDS['item/commandExecution/outputDelta']),
                                                'item/completed': _required(TERMINAL_FIELDS)})
+            for method in methods:
+                if 'cursor' in REQUEST_FIELDS[method]:
+                    requirement['requests'][method]['fields']['cursor']['types'].append('null')
             requirements[cap] = requirement
         requirements['stop_work_terminal'] = requirements['stop_work']
         child_requirement = {'requests': {m: {'fields': _required(REQUEST_FIELDS[m]), 'required_inputs_satisfied': True}
-                                         for m in START_METHODS | {'thread/list', 'thread/read', 'turn/interrupt'}},
+                                         for m in METHODS_BY_CAP['stop_work'] | {'turn/interrupt'}},
                              'results': {'thread/list': _required(CHILD_FIELDS),
-                                         'thread/read': _required({'thread.status.type': 'string', 'thread.canAcceptDirectInput': 'boolean'})},
-                             'events': {'item/completed': _required(CHILD_ITEM_FIELDS)}}
+                                         'thread/read': _required(RESULT_FIELDS['thread/read'] | {'thread.status.type': 'string', 'thread.canAcceptDirectInput': 'boolean'}),
+                                         'thread/backgroundTerminals/list': _required(RESULT_FIELDS['thread/backgroundTerminals/list']),
+                                         'thread/backgroundTerminals/terminate': _required(RESULT_FIELDS['thread/backgroundTerminals/terminate'])},
+                             'events': {'item/completed': _required(CHILD_ITEM_FIELDS),
+                                        'turn/completed': _required(EVENT_FIELDS['turn/completed'])}}
         child_requirement['requests']['thread/memoryMode/set']['fields']['mode']['enum'] = ['disabled']
         child_requirement['requests']['thread/start']['fields']['approvalPolicy']['enum'] = ['never']
         child_requirement['requests']['thread/start']['fields']['sandbox']['enum'] = ['danger-full-access']
+        for method in child_requirement['requests']:
+            if 'cursor' in REQUEST_FIELDS[method]:
+                child_requirement['requests'][method]['fields']['cursor']['types'].append('null')
         child_requirement['results'].update({m: _required(RESULT_FIELDS[m]) for m in START_METHODS if m in RESULT_FIELDS})
         requirements['stop_work_child'] = child_requirement
         diagnostics = tuple(Diagnostic(cap, 'inconclusive' if _unavailable_consumed(observed, required) else 'incompatible',
