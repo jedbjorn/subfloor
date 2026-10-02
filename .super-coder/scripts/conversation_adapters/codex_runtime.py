@@ -743,6 +743,8 @@ class CodexRuntimeDriver(RuntimeDriver):
                     return WriteReceipt("rejected", detail="exact root activity required")
                 self._interrupt(thread, command.expected_activity_id, deadline=deadline)
             elif target.native_process_id:
+                if not self._allowed("stop_work_terminal"):
+                    return WriteReceipt("unsupported", detail="terminal-stop target coverage is not evidenced")
                 snapshot = self.inventory(deadline=deadline)
                 if snapshot.partial or snapshot.freshness != "current" or not any(
                     work.kind == "terminal" and work.reference.thread_id == thread
@@ -756,6 +758,8 @@ class CodexRuntimeDriver(RuntimeDriver):
                 if result.get("terminated") is not True:
                     return WriteReceipt("written", True, detail="native terminal termination not confirmed")
             elif thread != self._root and target.work_id == thread:
+                if not self._allowed("stop_work_child"):
+                    return WriteReceipt("unsupported", detail="child-stop target coverage is not evidenced")
                 snapshot = self.inventory(deadline=deadline)
                 if snapshot.partial or snapshot.freshness != "current":
                     return WriteReceipt("rejected", detail="child ancestry/inventory incomplete")

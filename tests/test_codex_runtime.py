@@ -128,7 +128,7 @@ def seat(tmp_path):
         "f89-codex-app-server-v1", hashlib.sha256(b"Managed boot; no memory").hexdigest(), "policy-digest", "unrestricted",
         provider="openai", model="gpt-6.1-sol", effort="high", boot_content="Managed boot; no memory",
         env={"PATH": "/usr/bin", "SC_API_TOKEN": "synthetic-fixture-only", "OPENAI_API_KEY": "remove"},
-        probe_capabilities=("submission", "stop_reply", "stop_work"),
+        probe_capabilities=("submission", "stop_reply", "stop_work", "stop_work_terminal", "stop_work_child"),
     )
     events, transports = [], []
 
@@ -603,3 +603,32 @@ def test_partial_pipe_write_loses_transport_and_cannot_append_second_rpc(tmp_pat
     finally:
         assert rpc.close(deadline=deadline())
     assert rpc.process.poll() is not None
+
+
+@pytest.mark.parametrize("proved_variant,target_kind", [("stop_work_terminal", "child"), ("stop_work_child", "terminal")])
+def test_target_stop_requires_compatible_matching_variant_without_native_write(seat, proved_variant, target_kind):
+    driver, rpc, _, context = seat
+    rpc.child()
+    rpc.terminal("owned-terminal")
+    driver.inventory(deadline=deadline())
+    driver._context = replace(context, probe_capabilities=(), capability_evidence={
+        "stop_work": "compatible", proved_variant: "compatible"})
+    target = (NativeReference("root", "child", "root", "child-turn", work_id="child")
+              if target_kind == "child" else NativeReference("root", "root", native_process_id="owned-terminal"))
+    before = len(rpc.calls)
+    receipt = driver.control(control("stop_work", target, "child-turn" if target_kind == "child" else None), deadline=deadline())
+    assert receipt.state == "unsupported" and len(rpc.calls) == before
+    assert rpc.terminals["root"] and rpc.turns["child"][0]["status"] == "inProgress"
+
+
+def test_finite_probe_grant_names_the_specific_stop_target(seat):
+    driver, rpc, _, context = seat
+    rpc.child()
+    rpc.terminal("owned-terminal")
+    driver.inventory(deadline=deadline())
+    driver._context = replace(context, probe_capabilities=("stop_work", "stop_work_terminal"))
+    target = NativeReference("root", "child", "root", "child-turn", work_id="child")
+    assert driver.control(control("stop_work", target, "child-turn"), deadline=deadline()).state == "unsupported"
+    receipt = driver.control(control("stop_work", NativeReference("root", "root", native_process_id="owned-terminal")), deadline=deadline())
+    assert receipt.state == "written" and not rpc.terminals["root"]
+    assert rpc.turns["child"][0]["status"] == "inProgress"
