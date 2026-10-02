@@ -444,7 +444,7 @@ def _conversation_row(con, conversation_id: str, owner_user_id: int):
         "SELECT c.conversation_id,c.shell_id,c.owner_user_id,c.harness,"
         "c.provider,c.model,c.effort,c.route_contract_version,c.route_binding,"
         "c.worktree,c.state,c.title,c.starred,c.runtime_mode,c.runtime_projection,"
-        "c.conversation_scope,c.created_at,"
+        "c.conversation_scope,c.created_at,c.creation_idempotency_key,"
         "c.last_activity_at,c.closed_at,c.version,c.harness_session_ref,"
         "s.display_name,s.shortname,"
         "CASE WHEN c.state!='closed' THEN ("
@@ -527,6 +527,7 @@ def _conversation_projection(row, *, con=None) -> dict:
         native_option_id = binding.get("native_option_id")
     return {
         "conversation_id": row["conversation_id"],
+        "request_key": row["creation_idempotency_key"],
         "shell": {
             "shell_id": int(row["shell_id"]),
             "display_name": row["display_name"],
@@ -1715,6 +1716,14 @@ def _list_conversations(con, operator: dict, query):
     limit = _limit(query, maximum=100)
     clauses = ["c.owner_user_id=?", f"c.harness IN ({_BROWSER_HARNESS_SQL})"]
     params: list = [operator["user_id"], *_BROWSER_HARNESSES]
+    request_key = None
+    if "request_key" in query:
+        keys = query["request_key"]
+        if len(keys) != 1 or not isinstance(keys[0], str) or not keys[0] or len(keys[0]) > 255:
+            raise ApiError(422, "VALIDATION_ERROR", "request_key must be one nonempty value of at most 255 characters")
+        request_key = keys[0]
+        clauses.append("c.creation_idempotency_key=?")
+        params.append(request_key)
     shell = query.get("shell_id", [None])[0]
     shell_id = None
     if shell not in (None, ""):
@@ -1747,6 +1756,7 @@ def _list_conversations(con, operator: dict, query):
         "starred": starred,
         "open": open_only,
         "state": state or None,
+        **({"request_key": request_key} if request_key is not None else {}),
     }
     cursor = query.get("cursor", [None])[0]
     if cursor:
@@ -1769,7 +1779,7 @@ def _list_conversations(con, operator: dict, query):
         "SELECT c.conversation_id,c.shell_id,c.owner_user_id,c.harness,"
         "c.provider,c.model,c.effort,c.route_contract_version,c.route_binding,"
         "c.state,c.title,c.starred,c.runtime_mode,c.runtime_projection,c.worktree,"
-        "c.conversation_scope,c.created_at,"
+        "c.conversation_scope,c.created_at,c.creation_idempotency_key,"
         "c.last_activity_at,c.closed_at,c.version,s.display_name,s.shortname,"
         "CASE WHEN c.state!='closed' THEN ("
         " SELECT requested.created_at FROM conversation_events requested "
