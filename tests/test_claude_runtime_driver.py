@@ -895,3 +895,34 @@ def test_setting_false_is_observed_not_assumed_from_written_configuration(seat):
         transcript_path=str(Path(context.env["HOME"])/".claude/projects/exact"/(driver._identity.root_id+".jsonl")))
     driver.asset({"kind":"channel.ready"},peer=ProcessIdentity(999999999,10),deadline=DEADLINE())
     assert not driver._readiness_queued and not driver._memory_policy
+
+
+@pytest.mark.parametrize("text", ["", "a" * 4097, "b" * 12001, "é" * 4097])
+def test_complete_bounded_reply_chunks_preserve_full_text_without_partial_uncertainty(seat, text):
+    driver, _, events = seat
+    driver._prompt("complete-reply", "ordinary input", "test:observed-prompt")
+    driver._output("complete-reply", text, "claude:owned-transcript-text", "native-item")
+    chunks = [event for event in events if event.kind == "output.final"]
+    assert len(chunks) == max(1, (len(text) + runtime.TEXT_CHUNK - 1) // runtime.TEXT_CHUNK)
+    assert "".join(event.data["text"] for event in chunks) == text
+    assert [event.data["part"] for event in chunks] == list(range(len(chunks)))
+    assert [event.data["last"] for event in chunks] == [False] * (len(chunks) - 1) + [True]
+    assert all(not event.partial and event.grade == "compatible" for event in chunks)
+    assert all(event.reference.item_id == "native-item" for event in chunks)
+    assert {event.data["text_digest"] for event in chunks} == {hashlib.sha256(text.encode()).hexdigest()}
+    driver._output("complete-reply", text, "claude:MessageDisplay", "native-item")
+    assert len([event for event in events if event.kind == "output.final"]) == len(chunks)
+
+
+def test_reply_chunk_fix_preserves_unknown_bounds_and_readiness_suppression(seat):
+    driver, _, events = seat
+    driver._output("unobserved-prompt", "unknown output", "claude:owned-transcript-text", "unknown-item")
+    driver._prompt("bounded-prompt", "ordinary input", "test:observed-prompt")
+    driver._output("bounded-prompt", "x" * (runtime.MAX_FRAME_BYTES + 1), "claude:owned-transcript-text", "too-large")
+    assert not any(event.kind == "output.final" for event in events)
+    assert driver._snapshot_partial
+    driver._readiness_prompt = "bounded-prompt"
+    driver._readiness_nonce = "finite-readiness-nonce"
+    driver._output("bounded-prompt", driver._readiness_nonce, "claude:owned-transcript-text", "readiness-item")
+    assert driver._activities["bounded-prompt"].readiness_reply
+    assert not any(event.kind == "output.final" for event in events)

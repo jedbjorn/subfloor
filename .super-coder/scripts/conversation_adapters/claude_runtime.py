@@ -997,7 +997,7 @@ class ClaudeRuntimeDriver(RuntimeDriver):
         for offset in range(0, max(1, len(text)), TEXT_CHUNK):
             self._send_event(RuntimeEvent("output.final", reference=self._reference(prompt_id, item=item),
                 request_id=activity.request_id, source=activity.source, provenance=provenance,
-                partial=len(text) > TEXT_CHUNK, grade="compatible",
+                grade="compatible",
                 data={"text": text[offset:offset + TEXT_CHUNK], "text_digest": digest,
                       "part": offset // TEXT_CHUNK, "last": offset + TEXT_CHUNK >= len(text)}))
 
