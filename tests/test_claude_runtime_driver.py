@@ -5,11 +5,12 @@ import hashlib
 import json
 import os
 import socket
+import sqlite3
 import subprocess
 import sys
 import threading
 import time
-from dataclasses import replace
+from dataclasses import asdict, replace
 from pathlib import Path
 
 import pytest
@@ -405,6 +406,61 @@ def test_close_fences_queued_channel_work_and_retains_definition_obligations(sea
     assert outcome.outcome == "pending" and outcome.unresolved_definitions == ("unsafe-cron",)
     assert not driver._notifications
     assert driver.submit(request("later"), deadline=DEADLINE()).state == "not_written"
+
+
+def test_native_work_kinds_survive_shared_projection_and_terminal_updates(seat, tmp_path):
+    from conversation_runtime import RuntimeStore
+
+    driver, context, events = seat
+    driver._context = replace(context, capability_evidence={"automation": "compatible"})
+    hook(seat, "PostToolUse", tool_name="Bash", tool_use_id="bash",
+        tool_input={}, tool_response={"backgroundTaskId": "bash-id"})
+    hook(seat, "PostToolUse", tool_name="CronCreate", tool_use_id="cron",
+        tool_input={"durable": False}, tool_response={"id": "cron-id", "durable": False})
+    hook(seat, "Stop", background_tasks=[{"id": "bash-id", "type": "shell"}, {"id": "unknown-id"}],
+        session_crons=[{"id": "cron-id", "schedule": "* * * * *"}])
+    hook(seat, "SubagentStart", agent_id="agent-id")
+    hook(seat, "SubagentStop", agent_id="agent-id", background_tasks=None, session_crons=None)
+    for identifier in ("bash-id", "cron-id", "unknown-id"):
+        driver._work_terminal(identifier, "completed", "claude:task-notification")
+    work_events = [event for event in events if event.kind.startswith("work.")]
+    assert all("kind" in event.data for event in work_events)
+    expected = {"bash-id": "terminal", "cron-id": "automation", "unknown-id": "task", "agent-id": "child"}
+    assert all(event.data["kind"] == expected[event.reference.work_id] for event in work_events)
+
+    database = tmp_path / "synthetic.db"
+    with sqlite3.connect(database) as con:
+        con.executescript((SCRIPTS.parent / "schema.sql").read_text())
+        for migration in sorted((SCRIPTS.parent / "migrations").glob("*.sql")):
+            con.executescript(migration.read_text())
+        con.execute("INSERT INTO users(user_id,username) VALUES(1,'fixture')")
+        con.execute("INSERT INTO shells(shell_id,shortname,display_name,flavor,system_prompt,user_id) VALUES(1,'FX','Fixture','dev','synthetic',1)")
+        con.execute("INSERT INTO conversations(conversation_id,shell_id,owner_user_id,harness,worktree,creation_idempotency_key,creation_request_hash) VALUES('chat',1,1,'claude',?,'key','hash')", (str(context.worktree),))
+        con.execute("INSERT INTO conversation_runtime_generations(generation_id,conversation_id,shell_id,owner_user_id,harness,binding_json,state,created_at,updated_at) VALUES('gen','chat',1,1,'claude','{}','ready',1,1)")
+    store = RuntimeStore(database)
+    lease = store.attach("gen", 1, 1, "fixture")
+    store.ingest("gen", 1, 1, lease, {"events": [{"sequence": i, "event": asdict(event)}
+        for i, event in enumerate(work_events, 1)], "partial": False})
+    with sqlite3.connect(database) as con:
+        rows = con.execute("SELECT work_key,projection_json FROM conversation_runtime_work").fetchall()
+    assert len(rows) == 4
+    assert {json.loads(key)[-1]: json.loads(value)["data"]["kind"] for key, value in rows} == expected
+
+
+@pytest.mark.parametrize("kind", ["terminal", "automation"])
+def test_incomplete_snapshot_cannot_replace_known_native_kind_with_default_task(seat, kind):
+    driver, context, events = seat
+    driver._context = replace(context, capability_evidence={"automation": "compatible"})
+    if kind == "terminal":
+        hook(seat, "PostToolUse", tool_name="Bash", tool_use_id="launch", tool_input={},
+            tool_response={"backgroundTaskId": "known"})
+    else:
+        hook(seat, "PostToolUse", tool_name="CronCreate", tool_use_id="launch",
+            tool_input={"durable": False}, tool_response={"id": "known", "durable": False})
+    hook(seat, "Stop", background_tasks=[{"id": "known"}], session_crons=[])
+    observed = [event for event in events if event.kind == "work.observed"][-1]
+    assert driver._work["known"].kind == kind and observed.data["kind"] == kind
+    assert observed.partial and driver.inventory(deadline=DEADLINE()).partial
 
 
 @pytest.mark.parametrize("durable", [None, True, "false", 0])
