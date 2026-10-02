@@ -95,6 +95,41 @@ def arm(f):
     return f.store.arm(f.sprint, 3)
 
 
+@pytest.mark.parametrize("replacement", ["removed", "foreign", "same_database"])
+def test_native_selection_refuses_replaced_service_at_final_observation(
+    selection, monkeypatch, replacement
+):
+    f = selection
+
+    def withdraw():
+        # The last transactional observation must still use the owner which
+        # issued the proof, even if all participant selection rows are stable.
+        if f.service.calls != 6:
+            return
+        new = (
+            None
+            if replacement == "removed"
+            else SimpleNamespace(
+                database=f.database
+                if replacement == "same_database"
+                else f.database.parent / "other.db"
+            )
+        )
+        monkeypatch.setattr(conversation_native_chats, "_SERVICE", new)
+
+    f.service.callback = withdraw
+    with pytest.raises((ValueError, sprint_domain.SprintPreflightError)):
+        arm(f)
+    assert f.con.execute("SELECT lifecycle FROM sprints").fetchone()[0] == "prepared"
+    assert (
+        f.con.execute(
+            "SELECT COUNT(*) FROM sprint_participant_route_bindings"
+        ).fetchone()[0]
+        == 0
+    )
+    assert f.con.execute("SELECT COUNT(*) FROM sprint_wake_outbox").fetchone()[0] == 0
+
+
 def test_native_arm_binding_creation_and_board_use_real_writer(selection):
     f = selection
     arm(f)

@@ -33,7 +33,9 @@ def mode_projection(con, alias: str = "p") -> str:
 def checked_binding(
     con, participant_id: int, harness: str, model: str | None, effort: str | None
 ) -> tuple[dict, str]:
-    from conversation_native_chats import _SERVICE
+    import conversation_native_chats
+
+    service = conversation_native_chats._SERVICE
 
     if harness not in {"codex", "claude"} or not model or not effort:
         raise ValueError(
@@ -68,15 +70,15 @@ def checked_binding(
         )
         or row["is_deleted"]
         or row["lifecycle"] in {"completed", "aborted"}
-        or _SERVICE is None
+        or service is None
         or not database
-        or Path(database).resolve() != Path(_SERVICE.database).resolve()
+        or Path(database).resolve() != Path(service.database).resolve()
     ):
         raise ValueError("native Sprint selection has no matching owned Chats service")
     from conversation_runtime_contract import RuntimeContractError
 
     try:
-        binding, digest = _SERVICE.resolve_route(harness, model, effort)
+        binding, digest = service.resolve_route(harness, model, effort)
     except RuntimeContractError as exc:
         raise ValueError(f"{exc.code}: {exc}") from exc
     route_bindings.validate_v2_binding(binding)
@@ -108,6 +110,11 @@ def checked_binding(
         "WHERE p.participant_id=?",
         (participant_id,),
     ).fetchone()
-    if current is None or tuple(current) != tuple(row):
+    if (
+        current is None
+        or tuple(current) != tuple(row)
+        or conversation_native_chats._SERVICE is not service
+        or Path(database).resolve() != Path(service.database).resolve()
+    ):
         raise ValueError("native Sprint owner or selection changed during observation")
     return binding, digest
