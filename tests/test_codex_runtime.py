@@ -632,3 +632,20 @@ def test_finite_probe_grant_names_the_specific_stop_target(seat):
     receipt = driver.control(control("stop_work", NativeReference("root", "root", native_process_id="owned-terminal")), deadline=deadline())
     assert receipt.state == "written" and not rpc.terminals["root"]
     assert rpc.turns["child"][0]["status"] == "inProgress"
+
+
+def test_managed_mcp_config_targets_app_server_subcommand_with_execution_view(seat):
+    _, _, _, context = seat
+    managed = ("-c", 'mcp_servers.browser.url="http://127.0.0.1:12345/mcp/fixture"')
+    transports = []
+    def factory(**kwargs):
+        rpc = NativeFixture(**kwargs)
+        transports.append(rpc)
+        return rpc
+    context = replace(context, managed_mcp_args=managed, execution_prefix=("prepared-execution-view", "--"))
+    driver = CodexRuntimeDriver(rpc_factory=factory)
+    assert driver.start(context, lambda _: None, deadline=deadline()).state == "ready"
+    argv = transports[0].settings["argv"]
+    assert argv[:3] == ["prepared-execution-view", "--", str(context.executable.path)]
+    assert argv[3:7] == ["app-server", "--stdio", *managed]
+    assert 'forced_login_method="chatgpt"' in argv and "--disable" in argv
