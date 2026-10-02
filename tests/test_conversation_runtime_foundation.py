@@ -15,10 +15,12 @@ SCRIPTS=Path(__file__).resolve().parents[1]/'.super-coder/scripts'
 sys.path.insert(0,str(SCRIPTS))
 from conversation_runtime import RuntimeClient, RuntimeStore
 from conversation_runtime_contract import (
+    CAP_HISTORY_RESUME,
     CONTRACT_REVISION,
     DriverStart,
     ExecutableBinding,
     NativeCleanup,
+    NativeHistory,
     NativeReference,
     NativeSnapshot,
     RuntimeContext,
@@ -653,3 +655,98 @@ def test_close_before_first_native_start_fences_open(controller,tmp_path,monkeyp
     assert raised.value.code=='RUNTIME_CLOSING'
     assert starts==[] and owner.ready is False
     assert owner.handle(wire('status'))['closing'] is True
+
+
+
+def history_context(root, *, grant=True):
+    history=NativeHistory('old-cv','old-g','old-root','codex','selected-model','high',root,'d'*64,'e'*64,'f'*64)
+    return dataclasses.replace(context(root),model='selected-model',effort='high',history=history,
+                               capability_evidence={CAP_HISTORY_RESUME:'compatible'} if grant else {})
+
+
+@pytest.mark.parametrize('fields', [
+    {'conversation_id':'old-cv'},{'generation_id':'old-g'},{'harness':'claude'},
+    {'model':'other-model'},{'effort':'low'},{'worktree':Path('/different/worktree')},
+])
+def test_history_context_requires_new_owned_identity_and_same_selected_route(tmp_path,fields):
+    with pytest.raises(RuntimeContractError,match='distinct conversation'):
+        dataclasses.replace(history_context(tmp_path),**fields)
+
+
+def test_old_driver_history_open_never_falls_back_to_fresh_start(tmp_path):
+    tmp_path.chmod(0o700)
+    driver=TestDriver()
+    calls=[]
+    driver.start=lambda *args,**kwargs: calls.append(True) or DriverStart('ready',RuntimeIdentity('fresh-root'))
+    owner=Controller('g',tmp_path,driver)
+    owner.handle(wire('attach',expires=time.time()+30))
+    prepared=json.loads(json.dumps(dataclasses.asdict(history_context(tmp_path)),default=str))
+    result=owner.handle(wire('open',context=prepared))
+    assert result['state']=='unavailable' and result['detail']=='NATIVE_HISTORY_UNAVAILABLE'
+    assert not calls and not owner.ready
+    assert owner.context.history.native_root_id=='old-root'
+    # Context is retained and Close remains available without creating a root.
+    result=owner.handle(wire('close',command=control('close',1,action='close')))
+    assert result['outcome']=='complete' and not calls
+
+
+def test_submission_grade_cannot_admit_unproven_history(tmp_path):
+    tmp_path.chmod(0o700)
+    driver=TestDriver()
+    calls=[]
+    driver.resume_history=lambda *args,**kwargs: calls.append(True) or DriverStart('ready',RuntimeIdentity('old-root'))
+    owner=Controller('g',tmp_path,driver)
+    owner.handle(wire('attach',expires=time.time()+30))
+    ctx=dataclasses.replace(history_context(tmp_path,grant=False),capability_evidence={'submission':'compatible'})
+    prepared=json.loads(json.dumps(dataclasses.asdict(ctx),default=str))
+    with pytest.raises(RuntimeContractError,match='history-specific'):
+        owner.handle(wire('open',context=prepared))
+    assert not calls and not owner.ready
+
+
+@pytest.mark.parametrize('change', [{'extra':'untrusted'},{'source_worktree':None},{'cleanup_digest':True}])
+def test_history_wire_parser_refuses_malformed_predecessor_before_native_edge(tmp_path,change):
+    from conversation_runtime_controller import runtime_context
+    prepared=json.loads(json.dumps(dataclasses.asdict(history_context(tmp_path)),default=str))
+    prepared['history'].update(change)
+    with pytest.raises(RuntimeContractError,match='history|predecessor'):
+        runtime_context(prepared)
+
+
+def test_wrong_resumed_root_is_retained_for_close_but_never_admitted(tmp_path):
+    tmp_path.chmod(0o700)
+    driver=TestDriver()
+    driver.resume_history=lambda *args,**kwargs: DriverStart('ready',RuntimeIdentity('fresh-root'))
+    owner=Controller('g',tmp_path,driver)
+    owner.handle(wire('attach',expires=time.time()+30))
+    prepared=json.loads(json.dumps(dataclasses.asdict(history_context(tmp_path)),default=str))
+    result=owner.handle(wire('open',context=prepared))
+    assert result['state']=='unknown' and owner.identity.root_id=='fresh-root' and not owner.ready
+    owner.emit(RuntimeEvent('runtime.ready',NativeReference('fresh-root',thread_id='fresh-root')))
+    assert not owner.ready and owner.journal.replay(0)['events'][-1]['event']['grade']=='inconclusive'
+
+
+def test_finite_history_probe_uses_only_explicit_resume_method(tmp_path):
+    tmp_path.chmod(0o700)
+    driver=TestDriver()
+    calls=[]
+    driver.resume_history=lambda *args,**kwargs: calls.append(True) or DriverStart('ready',RuntimeIdentity('old-root'))
+    owner=Controller('g',tmp_path,driver)
+    owner.handle(wire('attach',expires=time.time()+30))
+    ctx=dataclasses.replace(history_context(tmp_path,grant=False),probe_capabilities=(CAP_HISTORY_RESUME,'submission'))
+    owner.handle(wire('open',context=json.loads(json.dumps(dataclasses.asdict(ctx),default=str))))
+    assert calls==[True] and owner.identity.root_id=='old-root'
+    assert not driver.writes  # Test transport only; no historical prompt replay.
+
+
+
+def test_history_context_client_wire_roundtrip_and_ordinary_wire_remains_unchanged(tmp_path):
+    from conversation_runtime_controller import runtime_context
+    client=RuntimeClient(tmp_path/'unused.sock','g',controller_pid=1,controller_start_ticks=1)
+    frames=[]
+    client.request=lambda op,**fields: frames.append((op,fields)) or {}
+    selected=history_context(tmp_path)
+    client.open(selected)
+    assert runtime_context(frames[-1][1]['context'])==selected
+    client.open(context(tmp_path))
+    assert 'history' not in frames[-1][1]['context']

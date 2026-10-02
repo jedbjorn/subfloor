@@ -71,6 +71,9 @@ class RuntimeStore:
                 "permission_mode":context.permission_mode,"worktree":str(context.worktree),
                 "state_root":str(context.state_root),"controller_endpoint":str(context.controller_endpoint),
             },"supervision":public_payload(binding,sensitive_values=self.secrets)}
+            if context.history is not None:
+                captured['context']['history']={**dataclasses.asdict(context.history),
+                    'source_worktree':str(context.history.source_worktree)}
             now=time.time()
             con.execute("INSERT INTO conversation_runtime_generations(generation_id,conversation_id,shell_id,owner_user_id,harness,binding_json,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)",(context.generation_id,context.conversation_id,context.shell_id,context.owner_user_id,context.harness,encoded(captured),now,now))
             con.commit()
@@ -292,6 +295,10 @@ class RuntimeClient:
         data["controller_endpoint"]=str(context.controller_endpoint) if context.controller_endpoint else None
         data["executable"]["path"]=str(context.executable.path)
         data["managed_mcp_files"]=[str(p) for p in context.managed_mcp_files]
+        if context.history is not None:
+            data["history"]["source_worktree"]=str(context.history.source_worktree)
+        else:
+            data.pop("history",None)
         return self.request("open",context=data,timeout=120)
 
     def submit(self,store: RuntimeStore,owner: int,shell: int,cid: str,**payload) -> dict:
