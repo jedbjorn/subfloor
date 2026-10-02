@@ -50,6 +50,7 @@ SOURCE_FILES = (
     ".super-coder/api/server.py", ".super-coder/api/transport.py",
     ".super-coder/ui/index.html", ".super-coder/ui/app.js",
     ".super-coder/ui/style.css",
+    "sc",
 )
 IDENTITY_KEYS = (
     "fixture_id", "source_sha", "archive_sha256", "root", "root_device",
@@ -252,6 +253,152 @@ def process_start_ticks(pid: int) -> int | None:
         raise FixtureError("CLEANUP_UNVERIFIED", "recorded process identity cannot be inspected") from exc
 
 
+def native_description(record: dict, native: dict) -> str:
+    return description(record) + " native " + native["generation_id"]
+
+
+def verify_native(record: dict, native: dict) -> None:
+    gid = native.get("generation_id", "")
+    if (not ID_RE.fullmatch(gid) or native.get("harness") not in {"codex", "claude"}
+            or native.get("unit") != f"{PREFIX}{record['fixture_id']}-native-{gid}.service"
+            or native.get("root") != str(Path(record["root"]) / "runtime" / gid)):
+        raise FixtureError("OWNERSHIP_INVALID", "native resource identity is not fixture-derived")
+    root = Path(native["root"])
+    if root.exists() or root.is_symlink():
+        info = root.lstat()
+        if (not stat.S_ISDIR(info.st_mode) or info.st_uid != os.geteuid()
+                or stat.S_IMODE(info.st_mode) != 0o700
+                or (info.st_dev, info.st_ino) != (native["root_device"], native["root_inode"])):
+            raise FixtureError("OWNERSHIP_INVALID", "native state root was replaced")
+
+
+def native_unit_state(native: dict) -> dict[str, str]:
+    return unit_state({"unit":native["unit"]})
+
+
+def stop_native_unit(record: dict, native: dict) -> None:
+    verify_native(record, native)
+    state = native_unit_state(native)
+    if state["LoadState"] != "not-found":
+        if state.get("Description") != native_description(record, native):
+            raise FixtureError("OWNERSHIP_INVALID", "native unit description differs")
+        command(["systemctl", "--user", "stop", native["unit"]], timeout=15)
+    cgroup = state.get("ControlGroup", "") or native.get("control_group", "")
+    deadline = time.monotonic() + 10
+    while True:
+        state = native_unit_state(native)
+        if state["LoadState"] != "not-found" and state.get("Description") != native_description(record, native):
+            raise FixtureError("OWNERSHIP_INVALID", "native unit identity changed during cleanup")
+        pids = cgroup_pids(cgroup)
+        live = native.get("main_pid", 0) > 0 and process_start_ticks(native["main_pid"]) == native.get("main_pid_start_ticks")
+        if state.get("ActiveState") in {"inactive", "failed"} and state.get("MainPID", "0") == "0" and not pids and not live:
+            native["os_cleanup"] = {"complete":True,"cgroup_empty":True,"recorded_process_exited":True}
+            return
+        if time.monotonic() >= deadline:
+            native["os_cleanup"] = {"complete":False,"surviving_pids":pids}
+            raise FixtureError("CLEANUP_UNVERIFIED", "native unit survivors retain fixture state")
+        time.sleep(.1)
+
+
+class NativeSupervisor:
+    """Fixture-only fixed controller launch; independent retained ledger owner.
+
+    No arbitrary executable/unit/root operation. Native definition cleanup
+    remains in the controller/DB even when this OS cleanup succeeds.
+    """
+    def __init__(self, receipt: Path):
+        self.receipt = canonical_receipt(receipt)
+
+    def register(self, generation_id: str, harness: str) -> dict:
+        initial = read_json(self.receipt)
+        with ownership_lock(initial["fixture_id"]):
+            record = verify_receipt(self.receipt)
+            root = verify_root(record)
+            if record["runtime"] != "experimental" or record["status"] not in {"preparing", "serving"}:
+                raise FixtureError("RUNTIME_UNAVAILABLE", "native units require an active experimental fixture")
+            if not ID_RE.fullmatch(generation_id) or harness not in {"codex", "claude"}:
+                raise FixtureError("INPUT_INVALID", "native generation/harness invalid")
+            units = record.setdefault("native_units", [])
+            for native in units:
+                if native["generation_id"] == generation_id:
+                    verify_native(record, native)
+                    if native["harness"] != harness:
+                        raise FixtureError("OWNERSHIP_INVALID", "generation harness changed")
+                    return native
+            if sum(item["harness"] == harness and not item.get("os_cleanup", {}).get("complete") for item in units) >= 2:
+                raise FixtureError("RESOURCE_LIMIT", "two roots per harness already retained")
+            state_parent = root / "runtime"
+            state_parent.mkdir(mode=0o700, exist_ok=True)
+            parent_info = state_parent.lstat()
+            if not stat.S_ISDIR(parent_info.st_mode) or parent_info.st_uid != os.geteuid() or stat.S_IMODE(parent_info.st_mode) != 0o700:
+                raise FixtureError("OWNERSHIP_INVALID", "native state parent is unsafe")
+            state_root = state_parent / generation_id
+            state_root.mkdir(mode=0o700)
+            info = state_root.lstat()
+            native = {"generation_id":generation_id,"harness":harness,"root":str(state_root),
+                      "root_device":info.st_dev,"root_inode":info.st_ino,
+                      "unit":f"{PREFIX}{record['fixture_id']}-native-{generation_id}.service",
+                      "limits":{"memory_mib":2048,"tasks":128,"term_grace_seconds":5},
+                      "registered_at":time.time(),"status":"registered"}
+            units.append(native)
+            save(record,self.receipt)  # durable before systemd-run or native writes
+            return native
+
+    def launch(self, generation_id: str) -> dict:
+        initial = read_json(self.receipt)
+        with ownership_lock(initial["fixture_id"]):
+            record = verify_receipt(self.receipt)
+            root = verify_root(record)
+            native = next((n for n in record.get("native_units", []) if n["generation_id"] == generation_id), None)
+            if native is None:
+                raise FixtureError("OWNERSHIP_INVALID", "native unit was not registered before launch")
+            verify_native(record,native)
+            if native["status"] != "registered" or native_unit_state(native)["LoadState"] != "not-found":
+                raise FixtureError("GENERATION_TERMINAL", "native launch never restarts an existing generation")
+            script = root / ".super-coder/scripts/conversation_runtime_controller.py"
+            if not script.is_file() or script.is_symlink():
+                raise FixtureError("SOURCE_INVALID", "copied controller is unavailable")
+            native["status"] = "starting"
+            save(record,self.receipt)
+            command(["systemd-run","--user","--quiet","--collect","--unit",native["unit"],
+                     "--description",native_description(record,native),"-p","Type=exec",
+                     "-p","KillMode=control-group","-p","SendSIGKILL=yes","-p","TimeoutStopSec=5s",
+                     "-p",f"RuntimeMaxSec={record['limits']['lifetime_seconds']}s",
+                     "-p","MemoryMax=2048M","-p","TasksMax=128","-p",f"WorkingDirectory={root}",
+                     "-p",f"StandardOutput=append:{native['root']}/controller.log",
+                     "-p",f"StandardError=append:{native['root']}/controller.log",
+                     sys.executable,str(script),"--generation",generation_id,"--root",native["root"],
+                     "--harness",native["harness"]])
+            deadline = time.monotonic()+10
+            while time.monotonic()<deadline:
+                state = native_unit_state(native)
+                if state.get("Description") != native_description(record,native):
+                    raise FixtureError("OWNERSHIP_INVALID", "launched native unit identity differs")
+                pid = int(state.get("MainPID", "0"))
+                ticks = process_start_ticks(pid)
+                if state.get("ActiveState") == "active" and ticks is not None and (Path(native["root"])/"controller.sock").is_socket():
+                    native.update(status="active",main_pid=pid,main_pid_start_ticks=ticks,control_group=state.get("ControlGroup",""))
+                    save(record,self.receipt)
+                    return native
+                if state.get("ActiveState") in {"inactive","failed"}:
+                    break
+                time.sleep(.1)
+            raise FixtureError("STARTUP_FAILED", "native controller did not become ready; ledger retains cleanup")
+
+    def stop(self, generation_id: str) -> dict:
+        initial = read_json(self.receipt)
+        with ownership_lock(initial["fixture_id"]):
+            record = verify_receipt(self.receipt)
+            verify_root(record)
+            native = next((n for n in record.get("native_units",[]) if n["generation_id"] == generation_id),None)
+            if native is None:
+                raise FixtureError("OWNERSHIP_INVALID", "unknown fixture generation")
+            stop_native_unit(record,native)
+            native["status"] = "stopped"
+            save(record,self.receipt)
+            return native
+
+
 def stop(receipt: Path) -> dict[str, Any]:
     receipt = canonical_receipt(receipt)
     initial = read_json(receipt)
@@ -266,6 +413,12 @@ def stop_locked(receipt: Path) -> dict[str, Any]:
         verify_root(record)
     elif not record.get("cleanup", {}).get("root_removed"):
         raise FixtureError("OWNERSHIP_INVALID", "fixture root disappeared without a cleanup record")
+    # Native controllers are independently supervised. Stop and independently
+    # verify every pre-registered resource before removing API DB/source/state.
+    for native in record.get("native_units", []):
+        verify_native(record, native)
+        stop_native_unit(record, native)
+    save(record, receipt)
     before = unit_state(record)
     exists = owned_unit(record, before)
     cgroup = before.get("ControlGroup", "") or record.get("control_group", "")
@@ -331,7 +484,7 @@ def archive(source_repo: Path, ref: str) -> tuple[str, bytes]:
                    f"{ref}^{{commit}}"], check=False).stdout.strip()
     if not SHA_RE.fullmatch(sha):
         raise FixtureError("REF_INVALID", "requested ref does not resolve to a full commit")
-    result = subprocess.run(["git", "-C", str(source_repo), "archive", sha, ".super-coder"],
+    result = subprocess.run(["git", "-C", str(source_repo), "archive", sha, ".super-coder", "sc"],
                             capture_output=True, env=clean_environment(), timeout=20, check=False)
     if result.returncode:
         raise FixtureError("SOURCE_INVALID", "committed engine archive is unavailable")
@@ -498,6 +651,26 @@ def verified_bootstrap_root(root: Path, bootstrap: Path) -> tuple[Path, dict[str
     return caller_root, trusted
 
 
+def bootstrap_repository(root: Path) -> str:
+    """Fresh synthetic Git ancestry; never fetch/modify the source checkout."""
+    (root / ".gitignore").write_text(
+        ".sc-state/\n.sc-worktrees/\nruntime/\nsynthetic-upstream/\nhome/\nxdg-*/\n"
+        "fixture_bootstrap.py\n.gui-experiment-owner.json\n*.log\n"
+        ".super-coder/*.db*\n.super-coder/instance.json\n.super-coder/db_backups/\n"
+        ".super-coder/__pycache__/\n**/__pycache__/\n")
+    command(["git","-C",str(root),"init","-q","-b","main"])
+    command(["git","-C",str(root),"add","sc",".super-coder",".gitignore"])
+    command(["git","-C",str(root),"-c","user.name=GUI fixture","-c","user.email=fixture@example.invalid",
+             "-c","commit.gpgsign=false","commit","--no-verify","-qm","Synthetic exact-archive fixture"])
+    upstream = root / "synthetic-upstream/subfloor.git"
+    upstream.parent.mkdir(mode=0o700)
+    command(["git","clone","--bare","--quiet",str(root),str(upstream)])
+    command(["git","-C",str(root),"remote","add","origin",str(upstream)])
+    command(["git","-C",str(root),"fetch","--quiet","origin","main"])
+    command(["git","-C",str(root),"branch","--set-upstream-to=origin/main","main"])
+    return command(["git","-C",str(root),"rev-parse","HEAD"]).stdout.strip()
+
+
 def serve(root: Path) -> int:
     """Internal test-only bootstrap, executed from the marked archive."""
     root, trusted = verified_bootstrap_root(root, Path(__file__).absolute())
@@ -527,6 +700,7 @@ def serve(root: Path) -> int:
     import sqlite3
 
     import migrate
+    synthetic_git_sha = bootstrap_repository(root)
     db = engine / "shell_db.db"
     if db.exists():
         raise FixtureError("STATE_CONFLICT", "fixture database already exists")
@@ -543,9 +717,17 @@ def serve(root: Path) -> int:
         con.execute("INSERT INTO shells(shell_id,display_name,shortname,flavor,system_prompt,user_id,api_key) "
                     "VALUES(?,?,?,'dev','Isolated GUI fixture',?,?)",
                     (sid, short, short, owner, secrets.token_hex(32)))
-        (root / ".sc-worktrees" / short).mkdir(parents=True)
+        command(["git","-C",str(root),"worktree","add","--quiet","-b",f"shell/{short}",
+                 str(root / ".sc-worktrees" / short)])
     con.commit()
     con.close()
+    # Only this synthetic installation owns these ports/state. No installed
+    # profile, credentials, wrapper, or live instance is reconciled.
+    write_json(engine / "instance.json", {"repo":root.name,"port":trusted["port"],
+               "dev_port":trusted["port"]+1 if trusted["port"]<65535 else 65534,
+               "browser":{"proxy_port":trusted["port"],"fixture_test_transport":True}})
+    import instance_state
+    instance_state.resolve(instance_config=engine / "instance.json",create=True)
     import server
     import transport
     actual = Path(server.__file__).resolve()
@@ -562,13 +744,28 @@ def serve(root: Path) -> int:
             return
         gui_experiment_runtime = importlib.import_module("gui_experiment_runtime")
         runtime_stop = gui_experiment_runtime.start_fixture(
-            database=db, root=root, fixture_id=trusted["fixture_id"])
+            database=db, root=root, fixture_id=trusted["fixture_id"],
+            supervisor=NativeSupervisor(Path(trusted["receipt"])))
         if not callable(runtime_stop):
             raise FixtureError("RUNTIME_UNAVAILABLE", "experimental start_fixture must return a shutdown callable")
 
     base_dispatch = server.dispatch_http
 
     def dispatch(method: str, path: str, headers_raw: str, body: bytes) -> tuple:
+        if path.startswith("/mcp/"):
+            import gui_experiment_readiness
+            return gui_experiment_readiness.mcp_response(method=method,path=path,body=body,
+                       database=db,fixture_id=trusted["fixture_id"],dispatch=base_dispatch)
+        if path == "/api/experiment-readiness" and method == "POST":
+            import gui_experiment_readiness
+            args = json.loads(body)
+            try:
+                report = gui_experiment_readiness.prepare(database=db,root=root,
+                         fixture_id=trusted["fixture_id"],harness=args["harness"],
+                         shell_id=args.get("shell_id",1))
+                return 200, [("Content-Type","application/json")], json.dumps(report).encode()
+            except (ValueError,OSError,RuntimeError,SystemExit):
+                return 422, [("Content-Type","application/json")], b'{"error":"FIXTURE_READINESS_FAILED"}'
         if path == "/api/experiment-fixture" and method == "GET":
             services = {name: getattr(getattr(server, name), "_SERVICE", None) is not None
                         for name in ("conversation_broker", "conversation_reaper",
@@ -581,6 +778,8 @@ def serve(root: Path) -> int:
                 "production_services_started": any(services.values()),
                 "production_service_inventory": services,
                 "fixture_home": str(fixture_home),
+                "synthetic_git_sha":synthetic_git_sha,
+                "mcp_transport":"fixture-test-only",
                 "inherited_control_plane_environment": any(
                     name.startswith("SC_") and name != "SC_BIND" for name in os.environ),
             }).encode())
