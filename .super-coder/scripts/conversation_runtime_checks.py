@@ -20,14 +20,17 @@ from typing import Any, Protocol
 
 from conversation_runtime_contract import (
     CAP_AUTOMATION,
+    CAP_HISTORY_RESUME,
     CAP_STOP_REPLY,
     CAP_STOP_WORK,
     CAP_SUBMISSION,
     CONTRACT_REVISION,
     EVENT_KINDS,
     GUI_CAPABILITIES,
+    HISTORY_COVERAGE,
     ExecutableBinding,
     Grade,
+    HistorySourceIdentity,
     NativeReference,
     ProcessIdentity,
     RuntimeContext,
@@ -45,6 +48,7 @@ REQUIRED_COVERAGE = {
     CAP_STOP_REPLY: frozenset({"expected_activity", "terminal", "background_isolation"}),
     CAP_STOP_WORK: frozenset({"owned_work", "terminal_outcome", "sibling_isolation"}),
     CAP_AUTOMATION: frozenset({"creation_guard", "non_durable", "fire", "delete", "definitions_cleanup"}),
+    CAP_HISTORY_RESUME: HISTORY_COVERAGE,
 }
 
 
@@ -63,6 +67,8 @@ TARGET_COVERAGE = {
 
 def _covered(fingerprint: Fingerprint, evidence: CapabilityEvidence, *, cleanup: bool) -> bool:
     required = REQUIRED_COVERAGE[evidence.capability] | ({"owned_unit_cleanup"} if cleanup else set())
+    if evidence.capability == CAP_HISTORY_RESUME and not cleanup:
+        required = required - {"owned_unit_cleanup"}  # Added only after fresh owner cleanup.
     return (required <= evidence.coverage and bool(evidence.provenance)
             and (evidence.capability != CAP_STOP_WORK or any(
                 target <= evidence.coverage and not any(d.capability == variant and d.grade != "compatible" for d in evidence.diagnostics)
@@ -230,6 +236,36 @@ def required_subset(observed: Any, required: Any, *, path: str = "") -> str | No
 
 
 @dataclass(frozen=True)
+class HistoryEligibility:
+    """Measured eligibility for one exact source under a current fingerprint.
+
+    Creation records and actual native restoration-policy observations remain
+    distinct. Neither a source dataclass nor static interface signatures supply
+    either provenance. Only the owned behavioral checker may issue this record;
+    cache restore is the existing trusted owner persistence boundary.
+    """
+    fingerprint_key: str
+    source: HistorySourceIdentity
+    coverage: frozenset[str] = frozenset()
+    creation_provenance: tuple[str, ...] = ()
+    native_policy_provenance: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        if (not isinstance(self.source,HistorySourceIdentity) or not isinstance(self.fingerprint_key,str)
+                or len(self.fingerprint_key)!=64 or any(c not in '0123456789abcdef' for c in self.fingerprint_key)
+                or not isinstance(self.coverage,frozenset)
+                or not isinstance(self.creation_provenance,tuple) or not isinstance(self.native_policy_provenance,tuple)
+                or any(len(values)>64 or any(not isinstance(v,str) or not 1<=len(v)<=512 for v in values)
+                       for values in (self.coverage,self.creation_provenance,self.native_policy_provenance))):
+            raise ValueError('bounded exact-source history eligibility required')
+
+    @property
+    def qualified(self) -> bool:
+        return (HISTORY_COVERAGE <= self.coverage and bool(self.creation_provenance)
+                and bool(self.native_policy_provenance))
+
+
+@dataclass(frozen=True)
 class CapabilityEvidence:
     capability: str
     grade: Grade
@@ -237,6 +273,7 @@ class CapabilityEvidence:
     provenance: tuple[str, ...] = ()
     diagnostics: tuple[Diagnostic, ...] = ()
     observed_at: float = field(default_factory=time.time)
+    history_eligibility: tuple[HistoryEligibility, ...] = ()
 
     def __post_init__(self) -> None:
         if self.capability not in GUI_CAPABILITIES or self.grade not in {"compatible", "incompatible", "inconclusive", "unverified"}:
@@ -245,6 +282,10 @@ class CapabilityEvidence:
                 or any(not isinstance(value, str) or not 1 <= len(value) <= 512 for value in (*self.coverage, *self.provenance))
                 or not isinstance(self.observed_at, (int, float)) or not math.isfinite(self.observed_at)):
             raise ValueError("bounded public evidence required")
+        if (not isinstance(self.history_eligibility,tuple) or len(self.history_eligibility)>16
+                or any(not isinstance(value,HistoryEligibility) for value in self.history_eligibility)
+                or self.history_eligibility and self.capability != CAP_HISTORY_RESUME):
+            raise ValueError('history eligibility belongs only to bounded history evidence')
 
 
 class EvidenceCache:
@@ -257,6 +298,11 @@ class EvidenceCache:
     def put(self, fingerprint: Fingerprint, evidence: CapabilityEvidence) -> None:
         if evidence.capability not in GUI_CAPABILITIES or evidence.grade not in {"compatible", "incompatible", "inconclusive", "unverified"}:
             raise ValueError("supported capability evidence required")
+        if any(item.fingerprint_key != fingerprint.key
+               or (item.source.harness,item.source.provider,item.source.model,item.source.effort)
+               != (fingerprint.harness,fingerprint.provider,fingerprint.model,fingerprint.effort)
+               for item in evidence.history_eligibility):
+            raise ValueError('history eligibility fingerprint or selected route changed')
         with self._lock:
             self._items.setdefault(fingerprint.key, {})[evidence.capability] = evidence
             self._fingerprints[fingerprint.key] = fingerprint
@@ -265,12 +311,27 @@ class EvidenceCache:
                 self._items.pop(oldest)
                 self._fingerprints.pop(oldest)
 
-    def get(self, fingerprint: Fingerprint, capability: str) -> CapabilityEvidence | None:
+    def _reusable(self, fingerprint: Fingerprint, capability: str) -> CapabilityEvidence | None:
         with self._lock:
             evidence = self._items.get(fingerprint.key, {}).get(capability)
         if evidence is None or (evidence.grade == "compatible" and not _covered(fingerprint, evidence, cleanup=True)):
             return None
         if evidence.grade in {"unverified", "inconclusive"} and time.time()-evidence.observed_at > 60:
+            return None
+        return evidence
+
+    def get(self, fingerprint: Fingerprint, capability: str) -> CapabilityEvidence | None:
+        evidence = self._reusable(fingerprint,capability)
+        # Existing ordinary owners cannot consume a global pass as source
+        # authorization. Their explicit source wiring is a separate delivery.
+        return None if capability == CAP_HISTORY_RESUME and evidence and evidence.grade == 'compatible' else evidence
+
+    def history_evidence(self, fingerprint: Fingerprint, source: HistorySourceIdentity | None) -> CapabilityEvidence | None:
+        if not isinstance(source,HistorySourceIdentity):
+            return None
+        evidence = self._reusable(fingerprint,CAP_HISTORY_RESUME)
+        if (evidence is None or evidence.grade != 'compatible'
+                or not any(item.source == source and item.qualified for item in evidence.history_eligibility)):
             return None
         return evidence
 
@@ -300,6 +361,8 @@ class EvidenceCache:
                 for cap, item in evidence.items():
                     value = asdict(item)
                     value["coverage"] = sorted(item.coverage)
+                    value['history_eligibility'] = [asdict(qualifier) | {'coverage':sorted(qualifier.coverage)}
+                                                    for qualifier in item.history_eligibility]
                     items[cap] = value
                 records.append({"key": key, "fingerprint": fingerprint, "evidence": items})
         return public_payload({"revision": CONTRACT_REVISION, "records": records}, sensitive_values=sensitive_values)
@@ -325,6 +388,19 @@ class EvidenceCache:
                     item["coverage"] = frozenset(item["coverage"])
                     item["provenance"] = tuple(item["provenance"])
                     item["diagnostics"] = tuple(Diagnostic(**entry) for entry in item["diagnostics"])
+                    qualifiers = item.get('history_eligibility',[])
+                    if not isinstance(qualifiers,list) or len(qualifiers)>16:
+                        raise ValueError('bounded history eligibility cache required')
+                    for entry in qualifiers:
+                        if (not isinstance(entry,dict) or set(entry) != {'fingerprint_key','source','coverage','creation_provenance','native_policy_provenance'}
+                                or any(not isinstance(entry[key],list) or len(entry[key])>64
+                                       or any(not isinstance(value,str) or not 1<=len(value)<=512 for value in entry[key])
+                                       for key in ('coverage','creation_provenance','native_policy_provenance'))):
+                            raise ValueError('strict history eligibility cache shape required')
+                    item['history_eligibility'] = tuple(HistoryEligibility(
+                        fingerprint_key=entry['fingerprint_key'],source=HistorySourceIdentity(**entry['source']),
+                        coverage=frozenset(entry['coverage']),creation_provenance=tuple(entry['creation_provenance']),
+                        native_policy_provenance=tuple(entry['native_policy_provenance'])) for entry in qualifiers)
                     evidence = CapabilityEvidence(**item)
                     if cap != evidence.capability:
                         raise ValueError("cache capability changed")
@@ -489,7 +565,8 @@ class CompatibilityChecker:
                 if mismatch:
                     evidence[cap] = CapabilityEvidence(cap, "incompatible", diagnostics=(Diagnostic(cap, "incompatible", "REQUIRED_INTERFACE_CHANGED", mismatch),))
                 else:
-                    cached = self.cache.get(fingerprint, cap)
+                    # Global behavior reuse does not issue a predecessor operand.
+                    cached = self.cache._reusable(fingerprint, cap)
                     if cached:
                         evidence[cap] = cached
             remaining -= evidence.keys()

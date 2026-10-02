@@ -15,17 +15,12 @@ from typing import Any, NoReturn
 
 import active_chat_registry
 from conversation_runtime_contract import (
+    HISTORY_COVERAGE,
     NativeHistory,
     RuntimeContractError,
     WorkspaceIdentity,
     payload_digest,
 )
-
-HISTORY_COVERAGE = frozenset({
-    'consumed_history_interface', 'owned_history_baseline', 'native_history_identity',
-    'current_workspace', 'no_history_prompt_replay', 'no_restored_work_definitions',
-    'pre_resume_goal_tool_policy', 'repeated_input', 'native_cleanup', 'owned_unit_cleanup',
-})
 
 
 def _fail(code: str, detail: str) -> NoReturn:

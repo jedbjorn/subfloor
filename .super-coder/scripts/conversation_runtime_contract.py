@@ -35,11 +35,16 @@ CAP_STOP_REPLY = "stop_reply"
 CAP_STOP_WORK = "stop_work"
 CAP_AUTOMATION = "automation"
 # A separately checked operation, not a grant inherited from submission.
-# Checker/provider resume coverage is registered in its own delivery unit.
 CAP_HISTORY_RESUME = "history_resume"
 # Shared GUI/checker operation names; diagnostics may retain additional native
 # capability names, but repeated input must never be keyed as 'conversation'.
-GUI_CAPABILITIES = frozenset({CAP_SUBMISSION,CAP_STOP_REPLY,CAP_STOP_WORK,CAP_AUTOMATION})
+GUI_CAPABILITIES = frozenset({CAP_SUBMISSION,CAP_STOP_REPLY,CAP_STOP_WORK,CAP_AUTOMATION,CAP_HISTORY_RESUME})
+# A shared requirement, not evidence that any installed provider can resume.
+HISTORY_COVERAGE = frozenset({
+    'consumed_history_interface', 'owned_history_baseline', 'native_history_identity',
+    'current_workspace', 'no_history_prompt_replay', 'no_restored_work_definitions',
+    'pre_resume_goal_tool_policy', 'repeated_input', 'native_cleanup', 'owned_unit_cleanup',
+})
 # Private socket wire: one UTF-8 JSON object + newline per connection, <=256KiB.
 # Request generation/contract/op; reply {ok:true,result:{...}} or
 # {ok:false,error:<stable code>,detail:<redacted detail>}. No auth env/token
@@ -62,7 +67,9 @@ _IDENTITY_KEYS = frozenset({"generation_id","conversation_id","root_id","thread_
                           "boot_digest","policy_digest","payload_digest","sha256",
                           "setup_id","configuration_sha256","executable_sha256",
                           "source_conversation_id","source_generation_id","native_root_id",
-                          "source_boot_digest","source_policy_digest","cleanup_digest"})
+                          "source_boot_digest","source_policy_digest","cleanup_digest",
+                          "source_binding_digest","creation_provenance_digest","implementation_digest",
+                          "fingerprint_key"})
 
 
 class RuntimeContractError(RuntimeError):
@@ -117,6 +124,45 @@ class ExecutableBinding:
     path: Path
     sha256: str
     version: str
+
+
+@dataclass(frozen=True)
+class HistorySourceIdentity:
+    """Retained creation identity, independently qualified for native resume.
+
+    The owner hashes the exact predecessor CID/GID/native root, tenant/shell/
+    role, immutable boot/policy/creation provenance and all-generation cleanup
+    into source_binding_digest. Equal policy on another root is a different
+    subject. No raw subject IDs enter the reusable cache. This value records
+    creation provenance; it does not assert effective native policy, settled
+    definitions, source ownership or compatibility. Unknown retained fields
+    cannot be replaced by an installed fingerprint or desired configuration.
+    """
+    harness: str
+    executable_sha256: str
+    executable_version: str
+    driver_revision: str
+    implementation_digest: str
+    policy_digest: str
+    provider: str
+    model: str
+    effort: str
+    creation_provenance_digest: str
+    source_binding_digest: str
+    contract_revision: str = CONTRACT_REVISION
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.harness,str) or self.harness not in {'codex','claude'}:
+            raise ValueError('captured history provider required')
+        for key in ('executable_sha256','implementation_digest','policy_digest',
+                    'creation_provenance_digest','source_binding_digest'):
+            value=getattr(self,key)
+            if not isinstance(value,str) or len(value)!=64 or any(c not in '0123456789abcdef' for c in value):
+                raise ValueError('exact retained history identity digests required')
+        for key in ('executable_version','driver_revision','contract_revision','provider','model','effort'):
+            value=getattr(self,key)
+            if not isinstance(value,str) or not 1<=len(value)<=255 or any(c in value for c in '\x00\r\n'):
+                raise ValueError('bounded retained history selection required')
 
 
 @dataclass(frozen=True)
