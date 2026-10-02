@@ -267,6 +267,38 @@ def test_factory_witness_does_not_promote_partial_foreign_or_unknown_terminal_da
     assert 'private arbitrary native data' not in json.dumps(witness)
     driver.cleanup(deadline=time.monotonic()+1)
 
+
+def test_factory_witness_retains_the_predicate_that_timed_out(owned):
+    original=owned.client.event
+    def failed(kind,ref,request=None,**data):
+        if kind=='activity.terminal':data['status']='failed'
+        return original(kind,ref,request,**data)
+    owned.client.event=failed
+    factory=NativeProbeFactory(lambda *args:owned,lambda *args:CleanupProof(True,'complete'))
+    fp=fingerprint(owned);session=factory.reserve(fp,frozenset({'submission'}),deadline=time.monotonic()+2)
+    session.driver.start(owned.context,lambda e:None,deadline=time.monotonic()+2)
+    assert session.exercise(session.driver,time.monotonic()+1)['submission'].grade=='inconclusive'
+    witness=factory.witness(fp)
+    assert witness['waiting_stage']=='first_reply' and witness['first_root_processed']
+    assert witness['first_root_terminal_counts']['failed']==1 and not witness['first_successful_reply']
+    session.driver.cleanup(deadline=time.monotonic()+1)
+
+
+@pytest.mark.parametrize('outcome',[None,{'private':'arbitrary native data'}])
+def test_factory_witness_does_not_label_missing_native_close_outcome_observed(owned,outcome):
+    original=owned.client.request
+    def missing(op,**fields):
+        if op=='close':return {'outcome':outcome}
+        return original(op,**fields)
+    owned.client.request=missing
+    factory=NativeProbeFactory(lambda *args:owned,lambda *args:CleanupProof(True,'complete'))
+    fp=fingerprint(owned);session=factory.reserve(fp,frozenset({'submission'}),deadline=time.monotonic()+2)
+    session.driver.start(owned.context,lambda e:None,deadline=time.monotonic()+2)
+    assert not factory.cleanup(fp,deadline=time.monotonic()+1).complete
+    witness=factory.witness(fp)
+    assert not witness['first_close_observed'] and not witness['native_complete_retained']
+    assert witness['first_close_outcome']=='inconclusive' and 'arbitrary native data' not in json.dumps(witness)
+
 def test_finite_scenario_earns_observed_targets_without_early_os_cleanup_pass(owned):
     driver=start(owned);result=NativeProbeFactory._exercise(driver,frozenset({'submission','stop_reply','stop_work'}),time.monotonic()+3)
     assert all(item.grade=='compatible' for item in result.values())
