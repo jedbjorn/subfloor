@@ -139,6 +139,7 @@ class FixtureNativeCheck:
         self.schema_fingerprint: Fingerprint | None=None
         self.schema_observation=None
         self.schema_public: dict | None=None
+        self.schema_cleanup_pending=False
         from conversation_native_checks import NativeChecks
         self.workflow=NativeChecks(self)
         self.chats: Any=None
@@ -181,6 +182,9 @@ class FixtureNativeCheck:
         return False
 
     def retained_guard(self) -> None:
+        if self.schema_cleanup_pending:
+            raise RuntimeContractError('CLEANUP_PENDING','previous schema cleanup remains unresolved')
+        self.seat.ensure_codegen_clean()
         con=db_driver.connect(str(self.database))
         try:
             retained=con.execute("SELECT 1 FROM conversation_runtime_probe_jobs WHERE status!='complete' LIMIT 1").fetchone()
@@ -192,18 +196,27 @@ class FixtureNativeCheck:
     def native_schema(self,fp,deadline):
         # RAM reuse is exact captured identity + completed child cleanup only.
         # Re-capturing is required even when the previous operation succeeded.
+        if self.schema_cleanup_pending:
+            raise RuntimeContractError('CLEANUP_PENDING','previous schema cleanup remains unresolved')
+        self.seat.ensure_codegen_clean()
         if self.seat.candidate_fingerprint('codex','gpt-6.1-sol','high')!=fp or time.monotonic()>=deadline:
             raise RuntimeContractError('NATIVE_SCHEMA_INCONCLUSIVE','schema identity changed')
         if (self.schema_fingerprint==fp and self.schema_observation is not None
                 and self.schema_public is not None
                 and self.schema_public['owned_codegen'].get('cleanup_complete') is True):
             return self.schema_observation
-        observation,receipt=self.seat.observe_native_schema(fp,deadline)
+        try:
+            observation,receipt=self.seat.observe_native_schema(fp,deadline)
+        except Exception as exc:
+            if not isinstance(exc,RuntimeContractError) or exc.code!='NATIVE_SCHEMA_UNALLOCATED':
+                self.schema_cleanup_pending=True
+            raise
         self.schema_public=schema_summary(fp,observation,receipt)
         if not all(receipt.get(name) is True for name in ('cleanup_complete','child_registered',
                     'gate_released','child_reaped','process_group_exited','files_removed')):
             self.schema_observation=None
             self.schema_fingerprint=None
+            self.schema_cleanup_pending=True
             raise RuntimeContractError('NATIVE_SCHEMA_INCONCLUSIVE','schema child cleanup is not proved')
         self.schema_fingerprint=fp
         self.schema_observation=observation if receipt.get('cleanup_complete') is True and observation.generation_completed else None
@@ -339,6 +352,9 @@ class FixtureNativeCheck:
                     'cache_persisted':self.persisted,'close_pending':self.cancelling}
             if self.schema_public is not None:
                 result['native_schema']=self.schema_public
+            if self.schema_cleanup_pending:
+                result['native_schema']={'state':'cleanup_pending','behavior_admitted':False,
+                                         'observation':'installed-native-generated-schema'}
             if fp:
                 result['behavior_witness']=semantic_witness(self.factory.witness(fp))
             if job:

@@ -41,6 +41,9 @@ def seat(tmp_path,monkeypatch,request):
     monkeypatch.setattr(run,'ENGINE',engine);monkeypatch.setattr(run,'DB_PATH',str(database))
     events=[]
     class Supervisor:
+        def codegen_clean(self):return True
+        def begin_codegen(self,*args,**kwargs):pass
+        def finish_codegen(self,*args,**kwargs):return True
         def register(self,generation,harness):
             events.append('register')
             state=tmp_path/'runtime'/generation;state.mkdir(parents=True)
@@ -236,3 +239,13 @@ def test_actual_codegen_runner_content_participates_in_captured_fingerprint(seat
     path=value.root/'.super-coder/scripts/conversation_runtime_codex_codegen.py'
     path.write_text(path.read_text()+'\n# different consumed runner content\n')
     assert value.implementation_digest('codex')!=initial
+
+
+def test_pending_codegen_refuses_fresh_root_and_ordinary_prepare_before_mutation(seat,monkeypatch):
+    import time
+    value,events,_=seat
+    fingerprint=value.candidate_fingerprint('codex','gpt-6.1-sol','high')
+    monkeypatch.setattr(value.supervisor,'codegen_clean',lambda:False)
+    with pytest.raises(RuntimeContractError,match='previous codegen'):value.observe_native_schema(fingerprint,time.monotonic()+20)
+    with pytest.raises(RuntimeContractError,match='previous codegen'):value.prepare('cv','generation')
+    assert events==[] and not (value.root/'runtime').exists()

@@ -495,6 +495,7 @@ def test_codegen_child_receipt_is_durable_before_gate_and_requires_matching_api_
         return original(path,*args,**kwargs)
     monkeypatch.setattr(Path,'read_text',read)
     deadline=fixture.time.monotonic()+2
+    supervisor.begin_codegen('e'*32,deadline=deadline)
     assert not supervisor.record_codegen_child(SimpleNamespace(pid=123,start_ticks=788),'/owned-api',deadline=deadline)
     assert not supervisor.record_codegen_child(SimpleNamespace(pid=123,start_ticks=789),'/foreign',deadline=deadline)
     assert not fixture.read_json(receipt).get('codegen_children')
@@ -523,3 +524,43 @@ def test_preparation_identity_propagates_remaining_unit_budget_and_refuses_late_
     monkeypatch.setattr(fixture,'unit_state',state)
     with pytest.raises(fixture.FixtureError):supervisor.preparation_identity(deadline=11)
     assert seen==[1.0]
+
+
+def test_codegen_pending_survives_new_supervisor_and_only_fresh_bound_exit_clears(seat,monkeypatch):
+    record,root,receipt=marked(seat)
+    record.update(runtime='experimental',status='serving')
+    fixture.write_json(root/fixture.MARKER,fixture.identity(record));fixture.save(record,receipt)
+    owner={'pid':123,'start_ticks':456,'unit':record['unit'],'control_group':'/owned-api'}
+    supervisor=fixture.NativeSupervisor(receipt)
+    monkeypatch.setattr(supervisor,'preparation_identity',lambda **kwargs:owner)
+    deadline=fixture.time.monotonic()+2
+    supervisor.begin_codegen('e'*32,deadline=deadline)
+    assert not fixture.NativeSupervisor(receipt).codegen_clean()
+    saved=fixture.read_json(receipt)
+    saved['codegen_children']=[{'allocation_id':'e'*32,'api_owner':owner,'pid':789,'start_ticks':999,'control_group':'/owned-api'}]
+    fixture.save(saved,receipt)
+    proof={key:True for key in ('child_started','cleanup_complete','files_removed','child_reaped','process_group_exited','child_registered')}
+    monkeypatch.setattr(fixture,'process_start_ticks',lambda pid:999)
+    assert not supervisor.finish_codegen('e'*32,proof,deadline=deadline)
+    monkeypatch.setattr(fixture,'process_start_ticks',lambda pid:None)
+    monkeypatch.setattr(fixture,'cgroup_pids',lambda group:[])
+    assert not supervisor.finish_codegen('f'*32,proof,deadline=deadline)
+    assert not fixture.NativeSupervisor(receipt).codegen_clean()
+    assert supervisor.finish_codegen('e'*32,proof,deadline=deadline)
+    assert fixture.NativeSupervisor(receipt).codegen_clean()
+
+
+def test_codegen_never_forked_cleanup_requires_exact_pending_owner_and_no_child_record(seat,monkeypatch):
+    record,root,receipt=marked(seat)
+    record.update(runtime='experimental',status='serving')
+    fixture.write_json(root/fixture.MARKER,fixture.identity(record));fixture.save(record,receipt)
+    owner={'pid':123,'start_ticks':456,'unit':record['unit'],'control_group':'/owned-api'}
+    supervisor=fixture.NativeSupervisor(receipt)
+    monkeypatch.setattr(supervisor,'preparation_identity',lambda **kwargs:owner)
+    deadline=fixture.time.monotonic()+2
+    supervisor.begin_codegen('e'*32,deadline=deadline)
+    monkeypatch.setattr(supervisor,'preparation_identity',lambda **kwargs:{**owner,'start_ticks':457})
+    proof={'cleanup_complete':True,'files_removed':True,'child_started':False}
+    assert not supervisor.finish_codegen('e'*32,proof,deadline=deadline)
+    monkeypatch.setattr(supervisor,'preparation_identity',lambda **kwargs:owner)
+    assert supervisor.finish_codegen('e'*32,proof,deadline=deadline)
