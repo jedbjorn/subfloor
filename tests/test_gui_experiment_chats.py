@@ -47,6 +47,22 @@ def test_grade_alone_cannot_issue_normal_native_route(request):
     assert exc.value.code=='NATIVE_ROUTE_INCONCLUSIVE'
 
 
+@pytest.mark.parametrize('field,value',[
+    ('executable',{'path':'/bin/false','sha256':'f'*64,'version':'other'}),
+    ('driver_revision','other'),('contract_revision','other'),('policy_digest','other'),
+    ('permission_mode','interactive'),('model','other'),('effort','low'),
+    ('provider','other'),('harness','claude'),('conversation_id','other'),('shell_id',9)])
+def test_checked_context_cannot_disagree_with_proof_identity(request,field,value):
+    owner,fp,con,_=request.getfixturevalue('operation')
+    completed_probe(owner,fp,con)
+    owner.cache.put(fp,CapabilityEvidence('submission','compatible',REQUIRED_COVERAGE['submission']|{'owned_unit_cleanup'},('synthetic source fixture',)))
+    captured=json.loads(con.execute("SELECT binding_json FROM conversation_runtime_generations WHERE generation_id='proof-gen'").fetchone()[0])
+    captured['context'][field]=value
+    con.execute("UPDATE conversation_runtime_generations SET binding_json=? WHERE generation_id='proof-gen'",(json.dumps(captured),));con.commit()
+    with pytest.raises(RuntimeContractError) as exc:FixtureChats(owner).resolve_route('codex',fp.model,fp.effort)
+    assert exc.value.code=='NATIVE_ROUTE_INCONCLUSIVE'
+
+
 @pytest.mark.parametrize('gap',['none','coverage','cleanup','model','effort','account','source'])
 def test_route_requires_exact_selected_observation_coverage_and_cleanup(request,gap):
     value,fp,con,_=request.getfixturevalue('operation')

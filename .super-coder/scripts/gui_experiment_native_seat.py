@@ -116,7 +116,22 @@ class NativeFixtureSeat:
         return Fingerprint(harness,observed.binding,revision,policy,'openai' if harness=='codex' else 'anthropic',
                            model,effort,policy,self.implementation_digest(harness))
 
-    def prepare(self,conversation_id: str,generation_id: str, *, probe_capabilities: tuple[str,...]=()) -> tuple[RuntimeContext,Fingerprint,dict]:
+    def selected_worktree(self,row) -> Path:
+        expected=run.shell_work_dir(row['shortname'],row['flavor'],root=self.root).absolute()
+        selected=Path(row['worktree']).absolute()
+        if selected!=expected or self.root.resolve() not in selected.resolve().parents or not selected.is_dir():
+            raise RuntimeContractError('WORKTREE_INVALID','canonical selected worktree escaped the fixture')
+        current=selected
+        while current!=self.root.absolute():
+            if current.is_symlink():
+                raise RuntimeContractError('WORKTREE_INVALID','canonical worktree contains an aliased path')
+            current=current.parent
+        if selected.resolve()!=selected:
+            raise RuntimeContractError('WORKTREE_INVALID','canonical worktree has stale or aliased containment')
+        return selected
+
+    def prepare(self,conversation_id: str,generation_id: str, *, probe_capabilities: tuple[str,...]=(),
+                checked_fingerprint: Fingerprint|None=None) -> tuple[RuntimeContext,Fingerprint,dict]:
         con=db_driver.connect(str(self.database))
         try:
             row=con.execute('SELECT c.*,s.shortname,s.flavor,s.user_id AS shell_owner FROM conversations c JOIN shells s USING(shell_id) WHERE conversation_id=?',(conversation_id,)).fetchone()
@@ -124,20 +139,9 @@ class NativeFixtureSeat:
                     or row['state']=='closed' or row['runtime_mode']!='native_experiment'
                     or row['harness'] not in {'codex','claude'}):
                 raise RuntimeContractError('RUNTIME_NOT_OWNED','opted-in synthetic chat required')
-            expected=run.shell_work_dir(row['shortname'],row['flavor'],root=self.root).absolute()
-            selected=Path(row['worktree']).absolute()
-            if (selected!=expected or self.root.resolve() not in selected.resolve().parents
-                    or not selected.is_dir()):
-                raise RuntimeContractError('WORKTREE_INVALID','canonical selected worktree escaped the fixture')
             # Check every component before the canonical start can repair Git
             # links, emit boot/configuration, or mutate the session archive.
-            current=selected
-            while current!=self.root.absolute():
-                if current.is_symlink():
-                    raise RuntimeContractError('WORKTREE_INVALID','canonical worktree contains an aliased path')
-                current=current.parent
-            if selected.resolve()!=selected:
-                raise RuntimeContractError('WORKTREE_INVALID','canonical worktree has stale or aliased containment')
+            self.selected_worktree(row)
             binding=json.loads(row['route_binding'])
             route_bindings.validate_v2_binding(binding)
             if binding['selector_binding'].get('proof_state')=='pending_finite_probe':
@@ -150,6 +154,10 @@ class NativeFixtureSeat:
                         or job is None or job['status']!='preparing' or job['deadline']<=time.time()
                         or job['fingerprint_key']!=binding['evidence_digest']):
                     raise RuntimeContractError('PROBE_ROUTE_ONLY','pending native selection is exclusive to its registered finite probe')
+            else:
+                runtime=json.loads(row['runtime_projection'])
+                if runtime.get('role')=='probe' or runtime.get('generation_id')!=generation_id or runtime.get('state')!='preparing':
+                    raise RuntimeContractError('RUNTIME_CLOSING','ordinary preparation no longer owns this preparing generation')
             digest=route_bindings.digest_json(binding)
             if (binding['harness'],binding['requested_model'],binding['requested_effort'])!=(row['harness'],row['model'],row['effort']):
                 raise RuntimeContractError('ROUTE_INVALID','stored native route differs from captured chat')
@@ -163,6 +171,35 @@ class NativeFixtureSeat:
         observed=observer.observe()
         if observed.binding is None:
             raise RuntimeContractError('NATIVE_EXECUTABLE_INCONCLUSIVE','installed native identity observation is unavailable')
+        if checked_fingerprint is not None:
+            current_fingerprint=self.candidate_fingerprint(harness,row['model'],row['effort'])
+            if (current_fingerprint!=checked_fingerprint or current_fingerprint.executable!=observed.binding
+                    or binding['selector_binding'].get('proof_state')!='checked_native_selection'
+                    or binding['catalogue_generation']!=current_fingerprint.key[:32]
+                    or self.cache.admission(current_fingerprint).get('submission')!='compatible'):
+                raise RuntimeContractError('NATIVE_ROUTE_CHANGED','captured checked identity/coverage changed before preparation')
+        # Metadata/source observation can block. Recheck durable ownership at
+        # the mutation edge; a Close/replacement during that work must precede
+        # neither resource registration nor canonical start writes.
+        con=db_driver.connect(str(self.database))
+        try:
+            fresh=con.execute('SELECT c.*,s.shortname,s.flavor,s.user_id AS shell_owner FROM conversations c JOIN shells s USING(shell_id) WHERE conversation_id=?',(conversation_id,)).fetchone()
+            runtime=json.loads(fresh['runtime_projection']) if fresh else {}
+            if (fresh is None or fresh['owner_user_id']!=1 or fresh['shell_owner']!=1
+                    or fresh['state']=='closed' or fresh['runtime_mode']!='native_experiment'
+                    or runtime.get('generation_id')!=generation_id or runtime.get('state')!='preparing'
+                    or runtime.get('preparation_owner')!=json.loads(row['runtime_projection']).get('preparation_owner')
+                    or any(fresh[key]!=row[key] for key in ('shell_id','harness','provider','model','effort','worktree','route_binding'))):
+                raise RuntimeContractError('RUNTIME_CLOSING','preparing generation was closed/replaced before canonical writes')
+            self.selected_worktree(fresh)
+            if binding['selector_binding'].get('proof_state')=='pending_finite_probe':
+                job=con.execute('SELECT status,deadline,fingerprint_key FROM conversation_runtime_probe_jobs WHERE conversation_id=? AND generation_id=?',(conversation_id,generation_id)).fetchone()
+                if (runtime.get('role')!='probe' or not probe_capabilities or job is None
+                        or job['status']!='preparing' or job['deadline']<=time.time()
+                        or job['fingerprint_key']!=binding['evidence_digest']):
+                    raise RuntimeContractError('PROBE_ROUTE_ONLY','finite probe ownership expired before canonical writes')
+        finally:
+            con.close()
         # Durable fixture resources precede canonical archive/boot/DB mutations.
         native=self.supervisor.register(generation_id,harness)
         if initial:

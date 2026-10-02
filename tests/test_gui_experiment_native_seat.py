@@ -31,7 +31,7 @@ def seat(tmp_path,monkeypatch,request):
     if getattr(request,'param',None)=='pending':
         binding['selector_binding']['proof_state']='pending_finite_probe'
     worktree=tmp_path/'.sc-worktrees/fx';worktree.mkdir(parents=True)
-    con.execute("INSERT INTO conversations(conversation_id,shell_id,owner_user_id,harness,provider,model,effort,worktree,creation_idempotency_key,creation_request_hash,runtime_mode,route_contract_version,route_binding) VALUES('cv',1,1,'codex','openai','gpt-6.1-sol','high',?,'key','hash','native_experiment',2,?)",(str(worktree),json.dumps(binding)));con.commit();con.close()
+    con.execute("INSERT INTO conversations(conversation_id,shell_id,owner_user_id,harness,provider,model,effort,worktree,creation_idempotency_key,creation_request_hash,runtime_mode,route_contract_version,route_binding,runtime_projection) VALUES('cv',1,1,'codex','openai','gpt-6.1-sol','high',?,'key','hash','native_experiment',2,?,?)",(str(worktree),json.dumps(binding),json.dumps({'role':'ordinary','generation_id':'generation','state':'preparing'})));con.commit();con.close()
     shutil.copytree(ROOT/'.super-coder/scripts',engine/'scripts',ignore=shutil.ignore_patterns('__pycache__'))
     (engine/'api').mkdir()
     shutil.copyfile(ROOT/'.super-coder/api/route_bindings.py',engine/'api/route_bindings.py')
@@ -131,3 +131,34 @@ def test_external_worktree_alias_is_rejected_before_registration_or_boot_writes(
     assert raised.value.code=='WORKTREE_INVALID'
     assert events==[]
     assert list((external/'fx' if alias=='parent' else external).iterdir())==[]
+
+
+@pytest.mark.parametrize('change',['closing','generation','owner','preparer'])
+def test_identity_observation_cannot_hide_changed_preparation_owner(seat,change):
+    value,events,_=seat
+    observe=value.observers['codex'].observe
+    def interrupted_observe():
+        con=sqlite3.connect(value.database)
+        runtime={'role':'ordinary','generation_id':'replacement' if change=='generation' else 'generation',
+                 'state':'closing' if change=='closing' else 'preparing'}
+        if change=='preparer':runtime['preparation_owner']={'unit':'replacement'}
+        con.execute('UPDATE conversations SET runtime_projection=?',(json.dumps(runtime),))
+        if change=='owner':con.execute('UPDATE shells SET user_id=NULL')
+        con.commit();con.close()
+        return observe()
+    value.observers['codex'].observe=interrupted_observe
+    with pytest.raises(RuntimeContractError) as raised:value.prepare('cv','generation')
+    assert raised.value.code=='RUNTIME_CLOSING' and events==[]
+
+
+def test_worktree_alias_created_during_observation_has_no_canonical_writes(seat,tmp_path):
+    value,events,_=seat
+    observe=value.observers['codex'].observe
+    external=tmp_path/'foreign';external.mkdir()
+    def interrupted_observe():
+        worktree=value.root/'.sc-worktrees/fx'
+        worktree.rmdir();worktree.symlink_to(external,target_is_directory=True)
+        return observe()
+    value.observers['codex'].observe=interrupted_observe
+    with pytest.raises(RuntimeContractError) as raised:value.prepare('cv','generation')
+    assert raised.value.code=='WORKTREE_INVALID' and events==[] and not list(external.iterdir())
