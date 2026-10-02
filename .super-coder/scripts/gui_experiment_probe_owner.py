@@ -180,7 +180,11 @@ class NativeProbeOwner:
 
     def identity(self,cid: str,generation: str,identity: RuntimeIdentity) -> None:
         # Native observations remain probe diagnostics, never cache admission.
-        self._update(cid,generation,state='checking',root_id=identity.root_id,native_route=identity.protocol.get('native_route'),setup=None)
+        memory=identity.protocol.get('memory_policy') or {}
+        self._update(cid,generation,state='checking',root_id=identity.root_id,native_route=identity.protocol.get('native_route'),
+                     memory_policy={key:memory[key] for key in ('generate_memories','use_memories','feature_enabled','root_mode') if key in memory},
+                     ready_observation_at=time.time(),native_process={'pid':identity.process.pid,'start_ticks':identity.process.start_ticks} if identity.process else None,
+                     setup=None)
 
     def marker(self,shell: int,marker: str,deadline: float) -> bool:
         if time.monotonic()>=deadline:

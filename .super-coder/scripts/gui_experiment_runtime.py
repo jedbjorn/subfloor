@@ -136,6 +136,7 @@ class FixtureNativeCheck:
                     # allocation, inferred grades, or replay of a lost probe.
                     job=con.execute("SELECT * FROM conversation_runtime_probe_jobs WHERE status!='complete' ORDER BY updated_at DESC LIMIT 1").fetchone()
                 chat=con.execute('SELECT runtime_projection FROM conversations WHERE conversation_id=?',(job['conversation_id'],)).fetchone() if job else None
+                events=con.execute('SELECT event_json FROM conversation_runtime_events WHERE generation_id=? ORDER BY sequence',(job['generation_id'],)).fetchall() if job else []
             finally:
                 con.close()
             result: dict[str,Any]={'fixture_id':self.fixture_id,'operation':'finite-native-check','harness':'codex',
@@ -150,6 +151,30 @@ class FixtureNativeCheck:
                 result['probe']={'conversation_id':job['conversation_id'],'generation_id':job['generation_id'],
                                  'status':job['status'],'deadline':job['deadline'],'phase':projection.get('state'),
                                  'setup':projection.get('setup'),'cleanup':projection.get('cleanup') or projection.get('preparation_cleanup')}
+                root_activities: set[tuple[str | None,str | None,str]]=set()
+                child_activities: set[tuple[str | None,str | None,str]]=set()
+                first_activity=None
+                for raw in events:
+                    event=json.loads(raw[0]);ref=event.get('reference') or {}
+                    if event['kind'] in {'activity.started','activity.processed'} and ref.get('activity_id'):
+                        first_activity=event['observed_at'] if first_activity is None else min(first_activity,event['observed_at'])
+                        target=root_activities if ref.get('thread_id') in {None,ref.get('root_id')} else child_activities
+                        target.add((ref.get('root_id'),ref.get('thread_id'),ref['activity_id']))
+                native=next((item for item in self.supervisor.inventory() if item['generation_id']==job['generation_id']),None)
+                os_cleanup=native.get('os_cleanup',{}) if native else {}
+                with self.owner.lock:
+                    allocating=job['fingerprint_key'] in self.owner.allocating
+                    closing=job['fingerprint_key'] in self.owner.closing
+                result['observations']={'native_route':projection.get('native_route'),'memory_policy':projection.get('memory_policy'),
+                    'ready_observation_at':projection.get('ready_observation_at'),'native_process':projection.get('native_process'),
+                    'root_activities_observed':len(root_activities),'child_activities_observed':len(child_activities),
+                    'controller_events_retained':len(events),'first_activity_observed_at':first_activity}
+                result['resources']={'owner_allocating':allocating,'owner_closing':closing,
+                    'owned_capacity_released':job['status']=='complete' and not allocating and not closing,
+                    'owned_unit_cleanup_verified':os_cleanup.get('complete') is True,
+                    'owned_cgroup_empty':os_cleanup.get('cgroup_empty') is True,
+                    'owned_recorded_process_exited':os_cleanup.get('recorded_process_exited') is True,
+                    'private_journal_retained_until_fixture_stop':native is not None}
             if fp and self.future and self.future.done() and self.persisted and self.failure is None:
                 measured=self.future.result()
                 result.update(state='complete',grades=self.cache.admission(fp),
