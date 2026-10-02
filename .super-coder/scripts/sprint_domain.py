@@ -20,6 +20,7 @@ import conversation_broker
 import conversation_events
 import db_driver
 import sprint_cleanup
+import sprint_native_lifecycle
 import sprint_participant_chats
 from conversation_adapters import AdapterError, ProbeResult, adapter_for
 
@@ -1378,11 +1379,8 @@ class SprintLifecycleStore:
                             planner_participant_id=planner,
                         )
                     )
-                    reentered = (
-                        self._reenter_interrupted_participants_in_transaction(
-                            sprint_id
-                        )
-                    )
+                    reentered = tuple(sorted(set(self._reenter_interrupted_participants_in_transaction(sprint_id))
+                                             |set(sprint_native_lifecycle.reenter(self.con,sprint_id))))
                     self._event(
                         sprint_id,
                         "lifecycle.armed",
@@ -1574,7 +1572,7 @@ class SprintLifecycleStore:
                 return AbortReceipt(False, None, (), ())
             self._require_edge(current, "aborted")
             self._authorize(sprint, "aborted", actor)
-            run_ids, run_conversations = self._persist_interrupt_intents(sprint_id)
+            run_ids, run_conversations = self._persist_interrupt_intents(sprint_id,'aborted')
             self._update_lifecycle(
                 sprint_id,
                 current=current,
@@ -1922,10 +1920,13 @@ class SprintLifecycleStore:
         )
 
     def _persist_interrupt_intents(
-        self, sprint_id: int
+        self, sprint_id: int, lifecycle: str = 'paused'
     ) -> tuple[tuple[int, ...], tuple[str, ...]]:
         if not self.con.in_transaction:
             raise RuntimeError("interrupt persistence requires an active transaction")
+        native_conversations=sprint_native_lifecycle.persist_interrupts(self.con,sprint_id,lifecycle)
+        legacy_only=("AND NOT EXISTS(SELECT 1 FROM conversations c WHERE c.conversation_id=r.conversation_id AND c.runtime_mode='native_experiment') "
+                     if sprint_native_lifecycle.available(self.con) else '')
         rows = self.con.execute(
             "SELECT DISTINCT r.run_id FROM conversation_runs r "
             "JOIN sprint_participant_conversations pc "
@@ -1933,7 +1934,7 @@ class SprintLifecycleStore:
             "JOIN sprint_participants p "
             "ON p.participant_id=pc.sprint_participant_id "
             "WHERE p.sprint_id=? AND r.state IN ('leased','starting','running') "
-            "ORDER BY r.run_id",
+            + legacy_only + "ORDER BY r.run_id",
             (sprint_id,),
         ).fetchall()
         now = str(self.con.execute("SELECT datetime('now')").fetchone()[0])
@@ -1950,7 +1951,7 @@ class SprintLifecycleStore:
             )
             run_ids.append(run_id)
             conversations.append(conversation_id)
-        return tuple(run_ids), tuple(sorted(set(conversations)))
+        return tuple(run_ids), tuple(sorted(set(conversations)|set(native_conversations)))
 
     def _pause_report(
         self,
@@ -2013,6 +2014,7 @@ class SprintLifecycleStore:
             "detail": detail,
             "deterministic": {
                 "active_turns": active_turns,
+                "native_lifecycle_intents":sprint_native_lifecycle.projection(self.con,sprint_id),
                 "work_units": work_units,
                 "registered_prs": prs,
                 "recent_anomalies": anomalies,
@@ -3655,10 +3657,15 @@ class SprintLifecycleStore:
                 (sprint_id,),
             )
         )
+        sprint_native_lifecycle.persist_developer_close(self.con,sprint_id)
         closed_conversation_ids: list[str] = []
         for linked in self.linked_developer_chats_in_transaction(sprint_id):
             shell_id = int(linked["shell_id"])
             expected_chat_id = str(linked["chat_id"])
+            if sprint_native_lifecycle.available(self.con):
+                mode=self.con.execute('SELECT runtime_mode FROM conversations WHERE conversation_id=?',(expected_chat_id,)).fetchone()
+                if mode and mode['runtime_mode']=='native_experiment':
+                    continue # Close is retained; the existing consumer owns native cleanup.
             closed = active_chat_registry.close_for_displacement(
                 self.con,
                 shell_id,
