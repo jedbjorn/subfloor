@@ -494,16 +494,33 @@ def test_pagination_bound_is_partial_and_cannot_report_empty_idle_success(seat):
     assert sum(method == "thread/list" for method, _ in rpc.calls) == 8
 
 
-def test_additive_fields_and_large_final_output_preserve_owned_text(seat):
+@pytest.mark.parametrize('native_kind,output_kind',[('agentMessage','assistant'),('commandExecution','terminal')])
+def test_additive_fields_and_large_final_output_preserve_owned_text(seat,native_kind,output_kind):
     _, rpc, events, _ = seat
     text = "unicode λ " * 5000
     rpc.frame("item/completed", turn="prior-turn", extra="unused", item={
-        "type": "agentMessage", "id": "final", "text": text, "new_optional_field": {"ok": True}})
+        "type": native_kind, "id": "final", "text": text, "aggregatedOutput": text,
+        "status": "completed", "new_optional_field": {"ok": True}})
     assert "".join(event.data["text"] for event in events if event.kind == "output.final") == text
     assert events[-1].data["complete"] is True
+    assert all(e.data['kind']==output_kind for e in events if e.kind=='output.final')
     rpc.frame("item/completed", turn="prior-turn", item={"type": "newWorkType", "id": "new-work"})
     assert events[-1].kind == "work.observed" and events[-1].partial
     assert events[-1].data["state"] == "unknown"
+
+
+@pytest.mark.parametrize('method,output_kind',[
+    ('item/agentMessage/delta','assistant'),('item/commandExecution/outputDelta','terminal')])
+def test_delta_output_kind_preserves_exact_turn_item_text_and_offsets(seat,method,output_kind):
+    _,rpc,events,_=seat
+    text='visible λ '*1000
+    rpc.frame(method,turnId='prior-turn',itemId='owned-item',delta=text)
+    output=[e for e in events if e.kind=='output.delta']
+    assert ''.join(e.data['text'] for e in output)==text
+    assert [e.data['offset'] for e in output]==list(range(0,len(text),4096))
+    assert all(e.data['kind']==output_kind and e.reference.activity_id=='prior-turn'
+               and e.reference.item_id=='owned-item' and not e.partial for e in output)
+    assert output[-1].data['complete'] is True
 
 
 def test_close_does_not_wait_for_inflight_submission_rpc_acknowledgement(seat):

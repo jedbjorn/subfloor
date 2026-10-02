@@ -555,6 +555,7 @@ class CodexRuntimeDriver(RuntimeDriver):
                     item_id = _string(params.get("itemId"))
                     bound_turn = _string(params.get("turnId"))
                     self._output("output.delta", self._reference(thread, bound_turn, item=item_id), text, provenance,
+                                 output_kind="assistant" if method == "item/agentMessage/delta" else "terminal",
                                  partial=not bound_turn or not item_id)
             elif method in {"item/started", "item/completed"}:
                 self._item(thread, turn, params.get("item"), completed=method == "item/completed", provenance=provenance)
@@ -563,10 +564,11 @@ class CodexRuntimeDriver(RuntimeDriver):
                             data={"capability": "native_request_response", "state": "unavailable",
                                   "native_request_id": raw["id"]}, partial=True)
 
-    def _output(self, kind: str, ref: NativeReference, text: str, provenance: str, *, partial: bool = False) -> None:
+    def _output(self, kind: str, ref: NativeReference, text: str, provenance: str, *,
+                output_kind: Literal["assistant", "terminal"], partial: bool = False) -> None:
         for offset in range(0, max(1, len(text)), 4096):
             self._event(kind, ref, provenance=provenance, partial=partial,
-                        data={"text": text[offset:offset + 4096], "offset": offset,
+                        data={"kind": output_kind, "text": text[offset:offset + 4096], "offset": offset,
                               "complete": offset + 4096 >= len(text)})
 
     def _item(self, thread: str, turn: str | None, value: Any, *, completed: bool, provenance: str) -> None:
@@ -582,7 +584,7 @@ class CodexRuntimeDriver(RuntimeDriver):
             return
         if kind == "agentMessage":
             if completed and isinstance(value.get("text"), str):
-                self._output("output.final", ref, value["text"], provenance)
+                self._output("output.final", ref, value["text"], provenance, output_kind="assistant")
             return
         if kind == "subAgentActivity":
             child = _string(value.get("agentThreadId"))
@@ -610,7 +612,7 @@ class CodexRuntimeDriver(RuntimeDriver):
                     provenance=provenance, data={"kind": "terminal", "state": status, **work.data},
                     partial=status not in WORK_TERMINALS and status != "inProgress")
         if completed and isinstance(value.get("aggregatedOutput"), str):
-            self._output("output.final", ref, value["aggregatedOutput"], provenance)
+            self._output("output.final", ref, value["aggregatedOutput"], provenance, output_kind="terminal")
 
     def _reconcile_loop(self) -> None:
         while True:
