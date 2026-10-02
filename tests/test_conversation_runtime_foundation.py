@@ -215,6 +215,52 @@ def test_private_socket_reconnect_same_controller_and_replay_once(controller,tmp
         owner.shutdown.set();thread.join(2)
 
 
+def test_native_open_deadline_is_inconclusive_and_close_remains_available(controller,tmp_path):
+    import os
+    owner,driver=controller
+    owner.context=None
+    owner.identity=None
+    owner.ready=False
+    entered=threading.Event()
+    released=threading.Event()
+    def blocked_start(context,emit,*,deadline):
+        entered.set()
+        released.wait(2)
+        return DriverStart('ready',RuntimeIdentity('root'))
+    driver.start=blocked_start
+    server=PrivateServer(owner,tmp_path/'deadline.sock')
+    thread=threading.Thread(target=server.serve)
+    thread.start()
+    try:
+        for _ in range(100):
+            if server.endpoint.exists():break
+            time.sleep(.005)
+        client=RuntimeClient(server.endpoint,'g',controller_pid=os.getpid(),controller_start_ticks=start_ticks(os.getpid()))
+        client.lease={'consumer':'api','fence':1}
+        captured=dataclasses.asdict(context(tmp_path))
+        for key in ('state_root','worktree'):
+            captured[key]=str(captured[key])
+        captured['executable']['path']=str(captured['executable']['path'])
+        with pytest.raises(RuntimeContractError) as timed_out:
+            client.request('open',context=captured,timeout=.05)
+        assert entered.is_set()
+        assert timed_out.value.code=='NATIVE_DEADLINE_INCONCLUSIVE'
+        assert owner.context is not None and not owner.ready
+        # Captured ownership remains available for exact scoped cleanup.
+        assert client.request('status')['ready'] is False
+        closed=client.request('close',command=control('close',1,action='close'))
+        assert closed['outcome']=='complete'
+        assert owner.journal.get('close')
+        # Invalid shapes retain their distinct request classification.
+        with pytest.raises(RuntimeContractError) as invalid:
+            client.request('attach',expires='invalid-expiry')
+        assert invalid.value.code=='REQUEST_INVALID'
+    finally:
+        released.set()
+        owner.shutdown.set()
+        thread.join(2)
+
+
 def test_schema_reapplication_store_tenancy_fencing_and_replay_transaction(tmp_path):
     database=tmp_path/'fixture.sqlite'
     con=sqlite3.connect(database)
