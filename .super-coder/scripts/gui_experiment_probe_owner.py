@@ -248,8 +248,8 @@ class NativeProbeOwner:
             cleanup=projection.get('preparation_cleanup') or {}
             proof=CleanupProof(cleanup.get('unit_verified_exited') is True,
                 'complete' if cleanup.get('never_launched') is True else 'inconclusive')
-            if proof.complete:
-                self.completed(fingerprint)
+            if proof.complete and not self.completed(fingerprint,cid,generation):
+                return CleanupProof(False,'inconclusive')
             return proof
         try:
             receipt=self.service.store.command_status(generation,owner['owner_user_id'],owner['shell_id'],'probe-close')['receipt']
@@ -259,16 +259,22 @@ class NativeProbeOwner:
         cleanup=self.service.store.status(generation,owner['owner_user_id'],owner['shell_id'])['cleanup']
         proof=CleanupProof(cleanup.get('unit_verified_exited') is True,cleanup.get('native_outcome','inconclusive'),
                            tuple(cleanup.get('unresolved_work',())),tuple(cleanup.get('unresolved_definitions',())))
-        if proof.complete:
-            self.completed(fingerprint)
+        if proof.complete and not self.completed(fingerprint,cid,generation):
+            return CleanupProof(False,'inconclusive')
         return proof
 
-    def completed(self,fingerprint: Fingerprint) -> None:
-        con=db_driver.connect(str(self.database))
-        try:
-            with db_driver.write_transaction(con,'native_probe.completed'):
-                con.execute("UPDATE conversation_runtime_probe_jobs SET status='complete',updated_at=? WHERE fingerprint_key=?",(time.time(),fingerprint.key))
-        finally:
-            con.close()
+    def completed(self,fingerprint: Fingerprint,cid: str,generation: str) -> bool:
         with self.lock:
+            if fingerprint.key in self.allocating:
+                return False
+            con=db_driver.connect(str(self.database))
+            try:
+                with db_driver.write_transaction(con,'native_probe.completed'):
+                    updated=con.execute("UPDATE conversation_runtime_probe_jobs SET status='complete',updated_at=? WHERE fingerprint_key=? AND conversation_id=? AND generation_id=?",
+                                        (time.time(),fingerprint.key,cid,generation))
+                    if updated.rowcount!=1:
+                        return False
+            finally:
+                con.close()
             self.closing.discard(fingerprint.key)
+            return True
