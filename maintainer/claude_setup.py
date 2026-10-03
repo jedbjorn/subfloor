@@ -675,7 +675,7 @@ def record_setup_child(supervisor,generation: str,pid: int,ticks: int,group: str
         return True
 
 
-def setup_unit(receipt: Path,generation: str,executable: Path,sha256: str,deadline: float) -> dict[str,Any]:
+def setup_unit(receipt: Path,generation: str,executable: Path,sha256: str,deadline: float, *, pretrust: bool=False) -> dict[str,Any]:
     fixture=fixture_module()
     supervisor=fixture.NativeSupervisor(receipt)
     record=fixture.verify_receipt(receipt)
@@ -685,13 +685,39 @@ def setup_unit(receipt: Path,generation: str,executable: Path,sha256: str,deadli
         budget(deadline)
         time.sleep(.02)
     bus = service_bus()
+    override = None
+    if pretrust:
+        override = importlib.import_module('claude_trust').config_override(os.environ.get('CLAUDE_CONFIG_DIR'))
     os.environ.clear()
     os.environ.update(HOME=str(root/'home'),PATH=os.defpath,PYTHONUNBUFFERED='1',SC_USER='fixture-operator', **bus)
+    if override is not None:
+        os.environ['CLAUDE_CONFIG_DIR'] = str(override)
     phase = 'preparation'
     context = None
     try:
         setup_phase(supervisor, generation, phase, 'attempted', 'NONE')
         context=prepare_claude_setup_context(supervisor,generation,executable,sha256,deadline-2)
+        if pretrust:
+            from dataclasses import replace
+
+            claude_trust = importlib.import_module('claude_trust')
+            native=next(n for n in record['native_units'] if n['generation_id']==generation)
+            if not isinstance(claude_trust.__file__,str):
+                raise RuntimeContractError('TRUST_INCONCLUSIVE','captured trust source unavailable')
+            helper=Path(claude_trust.__file__).resolve()
+            if digest(helper)!=native.get('trust_helper_sha256'):
+                raise RuntimeContractError('TRUST_INCONCLUSIVE','captured trust source changed')
+            if override is not None:
+                context=replace(context,env={**context.env,'CLAUDE_CONFIG_DIR':str(override)})
+            def trust_owned() -> bool:
+                owned=setup_owned(supervisor,generation)
+                budget(deadline-2)
+                return owned and digest(helper)==native['trust_helper_sha256']
+            result=dict(claude_trust.prepared_trust(context,root,deadline=deadline-2,
+                verify_owned=trust_owned))
+            write_private(context.state_root/'claude-trust-result.json',
+                {**result,'generation':generation,'helper_sha256':digest(helper)})
+            return result
         phase = 'native_start'
         setup_phase(supervisor, generation, phase, 'attempted', 'NONE')
         result = run_setup(context,root,verify_owned=lambda:setup_owned(supervisor,generation),
@@ -725,6 +751,12 @@ def main() -> int:
     unit.add_argument('--executable', type=Path, required=True)
     unit.add_argument('--sha256', required=True)
     unit.add_argument('--deadline', type=float, required=True)
+    pretrust = sub.add_parser('_pretrust')
+    pretrust.add_argument('--receipt', type=Path, required=True)
+    pretrust.add_argument('--generation', required=True)
+    pretrust.add_argument('--executable', type=Path, required=True)
+    pretrust.add_argument('--sha256', required=True)
+    pretrust.add_argument('--deadline', type=float, required=True)
     args = parser.parse_args()
     try:
         if args.action == '_hook':
@@ -732,7 +764,7 @@ def main() -> int:
         elif args.action == '_child':
             gated_child(args.gate_fd)
         else:
-            setup_unit(args.receipt,args.generation,args.executable,args.sha256,args.deadline)
+            setup_unit(args.receipt,args.generation,args.executable,args.sha256,args.deadline,pretrust=args.action=='_pretrust')
         return 0
     except (OSError, ValueError, RuntimeError, KeyError, TypeError, sqlite3.Error):
         # Native command-hook errors can fail open. No turn is sent by setup;
