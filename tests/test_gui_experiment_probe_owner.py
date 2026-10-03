@@ -37,7 +37,7 @@ def owner(request,monkeypatch):
     class Supervisor:
         def __init__(self):self.units=[]
         def preparation_identity(self): return {'pid':123,'start_ticks':456,'unit':'fixed-api','control_group':'/fixed-api'}
-        def launch(self,generation):
+        def launch(self,generation,*,deadline):
             assert query('SELECT generation_id FROM conversation_runtime_generations WHERE generation_id=?',(generation,))
             events.append('launch')
         def inventory(self): return self.units
@@ -57,7 +57,7 @@ def owner(request,monkeypatch):
         return context,fingerprint,native
     seat=SimpleNamespace(database=path,root=path.parent,supervisor=supervisor,prepare=prepare)
     service=NativeChatsService(path,path.parent,supervisor)
-    service.attach=lambda gen:(SimpleNamespace(consumer='test'),1,
+    service.attach=lambda gen,**_kwargs:(SimpleNamespace(consumer='test'),1,
         query('SELECT shell_id FROM conversation_runtime_generations WHERE generation_id=?',(gen,))[0])
     value=NativeProbeOwner(seat,service)
     def git(argv,**kwargs):

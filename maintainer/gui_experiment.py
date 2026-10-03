@@ -293,8 +293,36 @@ def native_endpoint(fixture_id: str,generation_id: str) -> Path:
     return registry()/f"{key}.sock"
 
 
-def native_unit_state(native: dict) -> dict[str, str]:
-    return unit_state({"unit":native["unit"]})
+def native_unit_state(native: dict, *, timeout: float=20) -> dict[str, str]:
+    return unit_state({"unit":native["unit"]},timeout=timeout)
+
+
+def listener_remaining(deadline: float) -> float:
+    if isinstance(deadline,bool) or not isinstance(deadline,(int,float)) or not math.isfinite(deadline):
+        raise FixtureError('STARTUP_FAILED','finite controller listener budget required')
+    value=deadline-time.monotonic()
+    if value<=0:raise FixtureError('STARTUP_FAILED','controller listener budget expired; cleanup retained')
+    return value
+
+
+def native_listener_identity(record: dict,native: dict,deadline: float) -> dict:
+    """Observe the recorded controller only, without a lease or native action."""
+    remaining=listener_remaining(deadline)
+    verify_native(record,native)
+    state=native_unit_state(native,timeout=min(1,remaining))
+    pid=int(state.get('MainPID','0'));ticks=process_start_ticks(pid)
+    group=state.get('ControlGroup','')
+    if (time.monotonic()>=deadline or state.get('Description')!=native_description(record,native)
+            or state.get('ActiveState')!='active' or ticks is None or not group
+            or f'0::{group}' not in Path(f'/proc/{pid}/cgroup').read_text().splitlines()):
+        raise FixtureError('OWNERSHIP_INVALID','controller listener unit identity unavailable')
+    info=Path(native['endpoint']).lstat()
+    if (not stat.S_ISSOCK(info.st_mode) or info.st_uid!=os.geteuid() or stat.S_IMODE(info.st_mode)!=0o600):
+        raise FixtureError('OWNERSHIP_INVALID','controller listener socket differs')
+    listener_remaining(deadline)
+    return {'generation_id':native['generation_id'],'endpoint':native['endpoint'],'unit':native['unit'],
+            'main_pid':pid,'main_pid_start_ticks':ticks,'control_group':group,
+            'endpoint_device':info.st_dev,'endpoint_inode':info.st_ino}
 
 
 def stop_native_unit(record: dict, native: dict) -> None:
@@ -487,16 +515,30 @@ class NativeSupervisor:
             save(record,self.receipt)  # durable before systemd-run or native writes
             return native
 
-    def launch(self, generation_id: str) -> dict:
+    def listener_identity(self,generation_id: str, *, deadline: float) -> dict:
+        initial=read_json(self.receipt)
+        with ownership_lock(initial['fixture_id'],deadline=deadline):
+            record=verify_receipt(self.receipt);verify_root(record)
+            native=next((n for n in record.get('native_units',[]) if n['generation_id']==generation_id),None)
+            if native is None or native.get('status')!='active':
+                raise FixtureError('STARTUP_FAILED','captured listener unavailable; cleanup retained')
+            observed=native_listener_identity(record,native,deadline)
+            if any(native.get(k)!=observed[k] for k in observed):
+                raise FixtureError('OWNERSHIP_INVALID','recorded listener identity changed')
+            return observed
+
+    def launch(self, generation_id: str, *, deadline: float | None=None) -> dict:
+        deadline=min(deadline,time.monotonic()+10) if deadline is not None else time.monotonic()+10
+        listener_remaining(deadline)
         initial = read_json(self.receipt)
-        with ownership_lock(initial["fixture_id"]):
+        with ownership_lock(initial["fixture_id"],deadline=deadline):
             record = verify_receipt(self.receipt)
             root = verify_root(record)
             native = next((n for n in record.get("native_units", []) if n["generation_id"] == generation_id), None)
             if native is None:
                 raise FixtureError("OWNERSHIP_INVALID", "native unit was not registered before launch")
             verify_native(record,native)
-            if native["status"] != "registered" or native_unit_state(native)["LoadState"] != "not-found":
+            if native["status"] != "registered" or native_unit_state(native,timeout=listener_remaining(deadline))["LoadState"] != "not-found":
                 raise FixtureError("GENERATION_TERMINAL", "native launch never restarts an existing generation")
             script = root / ".super-coder/scripts/conversation_runtime_controller.py"
             if not script.is_file() or script.is_symlink():
@@ -518,26 +560,34 @@ class NativeSupervisor:
                      "--harness",native["harness"]]
             if native.get("test_transport"):
                 argv.append("--test-transport")
-            command(argv)
-            deadline = time.monotonic()+10
+            if time.monotonic()>=deadline:raise FixtureError("STARTUP_FAILED","native launch budget expired")
+            command(argv,timeout=listener_remaining(deadline))
             while time.monotonic()<deadline:
-                state = native_unit_state(native)
+                state = native_unit_state(native,timeout=min(1,listener_remaining(deadline)))
                 if state.get("Description") != native_description(record,native):
                     raise FixtureError("OWNERSHIP_INVALID", "launched native unit identity differs")
                 pid = int(state.get("MainPID", "0"))
                 ticks = process_start_ticks(pid)
                 if state.get("ActiveState") == "active" and ticks is not None and Path(native["endpoint"]).is_socket():
-                    endpoint_info=Path(native['endpoint']).lstat()
-                    if (not stat.S_ISSOCK(endpoint_info.st_mode) or endpoint_info.st_uid!=os.geteuid()
-                            or stat.S_IMODE(endpoint_info.st_mode)!=0o600):
-                        raise FixtureError("OWNERSHIP_INVALID", "native socket ownership differs")
-                    native.update(status="active",main_pid=pid,main_pid_start_ticks=ticks,control_group=state.get("ControlGroup",""))
-                    native.update(endpoint_device=endpoint_info.st_dev,endpoint_inode=endpoint_info.st_ino)
-                    save(record,self.receipt)
+                    observed=native_listener_identity(record,native,deadline)
+                    native.update({k:v for k,v in observed.items() if k not in {'generation_id','endpoint','unit'}})
+                    save(record,self.receipt)  # identity retained even when listening is inconclusive
+                    import conversation_runtime
+                    if Path(conversation_runtime.__file__).resolve()!=root/'.super-coder/scripts/conversation_runtime.py':
+                        raise FixtureError('SOURCE_INVALID','listener client is not the captured copied source')
+                    client=conversation_runtime.RuntimeClient(Path(native['endpoint']),generation_id,
+                        controller_pid=pid,controller_start_ticks=ticks)
+                    try:
+                        client.wait_listener(deadline=deadline,endpoint_device=observed['endpoint_device'],endpoint_inode=observed['endpoint_inode'])
+                    except (conversation_runtime.RuntimeContractError,OSError,ValueError) as exc:
+                        raise FixtureError('STARTUP_FAILED','controller listener inconclusive; ledger retains cleanup') from exc
+                    if native_listener_identity(record,native,deadline)!=observed:
+                        raise FixtureError('OWNERSHIP_INVALID','controller listener changed after status')
+                    native['status']='active';save(record,self.receipt)
                     return native
                 if state.get("ActiveState") in {"inactive","failed"}:
                     break
-                time.sleep(.1)
+                time.sleep(min(.1,max(0,deadline-time.monotonic())))
             raise FixtureError("STARTUP_FAILED", "native controller did not become ready; ledger retains cleanup")
 
     def stop(self, generation_id: str) -> dict:
