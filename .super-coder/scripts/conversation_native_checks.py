@@ -10,6 +10,7 @@ import json
 import threading
 import time
 import uuid
+from pathlib import Path
 
 import db_driver
 from conversation_runtime_contract import RuntimeContractError, payload_digest
@@ -44,15 +45,24 @@ class NativeChecks:
 
     def config(self) -> dict:
         import conversation_native_chats
-        return {'enabled':conversation_native_chats._SERVICE is self.operation.service,
+        preview=getattr(self.operation.seat,'behavioral_profile','full')=='submission-preview'
+        captured=getattr(self.operation.seat,'native_bindings',{})
+        path=captured.get('CODEX') if isinstance(captured,dict) else None
+        bound_codex=(type(path) is str and Path(path).is_absolute()
+                     and not any(char in path for char in '\n\r\0'))
+        candidates=[row for row in REQUESTED_CANDIDATES
+                    if not preview or row[0]=='codex' and bound_codex]
+        answer={'enabled':conversation_native_chats._SERVICE is self.operation.service,
                 'candidates':[{'harness':harness,'model':model,'effort':effort,'label':label,
                 'proof_state':'requested_candidate','grades':{},'diagnostics':[],
                 'automatic_check':self.automatic_reference({'harness':harness,'model':model,'effort':effort}),
                 **self.retained_references({'harness':harness,'model':model,'effort':effort})}
-                for harness,model,effort,label in REQUESTED_CANDIDATES],
+                for harness,model,effort,label in candidates],
                 'onboarding':{'canonical_main_root':str(self.operation.seat.root.resolve()),
                               'scope':'linked_worktrees','initial_setup':'native_tui',
                               'local_channel_setup':'scoped_gui_action'}}
+        if preview:answer['preview_profile']='submission-preview'
+        return answer
 
     def _current_owner(self) -> bool:
         import conversation_native_chats

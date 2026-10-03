@@ -210,3 +210,18 @@ def test_fresh_chromium_same_intent_check_discovery():
     receipt=json.loads(result.stdout.strip().splitlines()[-1])
     assert receipt['native_processes']==0 and receipt['inference_turns']==0
     assert receipt['cases']==['converge','immediate','error','expiry','selection','dispose','replacement','terminal_race','future_restore','malformed_restore','past_restore','rollback','reopen']
+
+
+def test_preview_native_entry_uses_actual_app_without_legacy_availability_grant():
+    if not shutil.which('node'):
+        pytest.skip('Node required')
+    check=subprocess.run(['node','-e',"require(process.env.SC_PLAYWRIGHT_MODULE || 'playwright')"],capture_output=True,text=True,check=False)
+    if check.returncode:
+        pytest.skip('Named Node Playwright seat required')
+    result=subprocess.run(['node',str(ROOT/'tests/browser/preview_native_entry.cjs'),str(ROOT)],
+                          capture_output=True,text=True,timeout=45,env=os.environ.copy(),check=False)
+    assert result.returncode==0,result.stdout+result.stderr
+    receipt=json.loads(result.stdout.strip().splitlines()[-1])
+    assert receipt['native_processes']==0 and receipt['preview_default_native']
+    assert receipt['generic_default_ephemeral'] and receipt['malformed_no_promotion']
+    assert receipt['start_inconclusive_disabled'] and receipt['posts']==1 and receipt['creates']==0

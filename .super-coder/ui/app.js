@@ -831,6 +831,13 @@ async function renderDefaultModels(root, s, catalogOverride = null) {
   if (catalogOverride) cat = catalogOverride;
   else try { cat = await loadModelCatalogue(); } catch { /* picker shows Harness default only */ }
 
+  try {
+    const config = await api("/conversations/native-config");
+    if (chatPreviewEntry(config)) root.append(el("div", { className: "vpanel" },
+      "Legacy launch settings are separate from this isolated native preview. Harness availability here does not report preview readiness. ",
+      el("a", { href: "#" + chatHash(s.shortname, CHAT_CONFIGURE_ROUTE) }, "Open native preview chat")));
+  } catch { /* no preview claim without its server profile */ }
+
   const head = el("div", { className: "viewer-head" }, microlabel("Default Models"));
   const refresh = el("button", { className: "act", type: "button", textContent: "↻ Refresh & verify" });
   refresh.onclick = async () => {
@@ -5181,6 +5188,10 @@ async function chatNativeOpenProbe(result, signal, current) {
   location.hash = chatHash(chat.shell.shortname, chat.conversation_id);
 }
 
+function chatPreviewEntry(config) {
+  return config?.enabled === true && config.preview_profile === "submission-preview";
+}
+
 async function chatNativeNewForm(host, shell, config) {
   const form = el("div", { className: "chat-native-check" });
   const choice = el("select", { ariaLabel: "Native route to check" });
@@ -5530,7 +5541,7 @@ async function chatNativeNewForm(host, shell, config) {
     } finally { choice.disabled = false; creating = false; }
   };
   const main = config.onboarding?.canonical_main_root;
-  form.append(el("h2", {}, "Keep a native runtime open"),
+  form.append(el("h2", {}, chatPreviewEntry(config) ? "Start a native preview chat" : "Keep a native runtime open"),
     el("p", { className: "muted" }, "Initial sign-in and workspace trust may require the native terminal. After setup, use the GUI for chats and background work."));
   if (main) form.append(el("p", {}, "Trust the validated canonical main repository. Its linked worktrees share workspace trust; each runtime requests local-channel consent separately."), el("code", {}, main));
   form.append(choice, status, check, readback, probe, created, title, start, refreshReferences, references);
@@ -5663,12 +5674,13 @@ async function chatRenderNew(host, shell, defaults, catalog) {
     const config = await chatRead("/conversations/native-config", chatReadController?.signal);
     if (!host.isConnected || config.enabled !== true) return;
     mode.disabled = false;
-    modeChoice.hidden = false;
+    modeChoice.hidden = chatPreviewEntry(config);
     mode.onchange = () => {
       form.hidden = mode.checked;
       native.hidden = !mode.checked;
       if (mode.checked && !native.childNodes.length) chatNativeNewForm(native, shell, config);
     };
+    if (chatPreviewEntry(config)) { mode.checked = true; mode.onchange(); }
   } catch { modeChoice.title = "Native experiment is not enabled or could not be checked on this server."; }
 }
 

@@ -252,3 +252,39 @@ def test_claude_start_rechecks_selected_fingerprint_and_resolver(workflow):
     assert selections and all(selection==checks.CLAUDE_SELECTION for selection in selections)
     operation.seat.candidate_fingerprint=lambda **_:SimpleNamespace(key='codex-or-replacement')
     assert not value.get(1,check_id=first['check_id'])['admissible']
+
+
+@pytest.mark.parametrize('captured',[True,False])
+def test_submission_preview_exposes_only_captured_codex_without_readiness_claim(workflow,monkeypatch,captured):
+    import conversation_native_chats
+    value,operation,_,calls,_=workflow
+    operation.seat.behavioral_profile='submission-preview'
+    operation.seat.native_bindings={'CODEX':'/inert/captured-codex'} if captured else {}
+    operation.service.stopped=threading.Event()
+    operation.service.database=operation.database
+    monkeypatch.setattr(conversation_native_chats,'_SERVICE',operation.service)
+    config=value.config()
+    assert config['enabled'] is True and config['preview_profile']=='submission-preview'
+    assert [row['harness'] for row in config['candidates']]==(['codex'] if captured else [])
+    assert all(row['model']=='gpt-6.1-sol' and row['effort']=='high'
+               and row['grades']=={} and row['proof_state']=='requested_candidate'
+               and row['automatic_check'] is None for row in config['candidates'])
+    assert calls==[]
+
+
+def test_full_fixture_keeps_existing_requested_candidates_and_default_profile(workflow):
+    value,operation,_,calls,_=workflow
+    operation.seat.behavioral_profile='full'
+    operation.seat.native_bindings={'CODEX':'/inert/captured-codex'}
+    config=value.config()
+    assert 'preview_profile' not in config
+    assert [row['harness'] for row in config['candidates']]==['codex','claude']
+    assert calls==[]
+
+
+@pytest.mark.parametrize('binding',[None,True,123,'','relative/path','/inert/path\n'])
+def test_preview_malformed_captured_binding_offers_no_route(workflow,binding):
+    value,operation,_,calls,_=workflow
+    operation.seat.behavioral_profile='submission-preview'
+    operation.seat.native_bindings={'CODEX':binding}
+    assert value.config()['candidates']==[] and calls==[]
