@@ -282,7 +282,13 @@ class NativeChecks:
                     if previous:
                         if previous['request_hash']!=request_hash:
                             raise RuntimeContractError('CHECK_IDEMPOTENCY_CONFLICT','check key was reused with different selection')
-                        return self._projection(previous)
+                        replay=self._projection(previous)
+                        if replay.get('behavior_witness') is not None:
+                            probe,binding=self._owned_probe(con,previous,json.loads(previous['result_json']))
+                            if probe is None or not binding:
+                                replay['behavior_witness']=None
+                                replay['behavior_witness_observation']='unavailable'
+                        return replay
                     if con.execute("SELECT 1 FROM conversation_runtime_check_requests WHERE status!='complete' LIMIT 1").fetchone():
                         raise RuntimeContractError('CLEANUP_PENDING','retained check must reconcile before another check')
                     if con.execute("SELECT 1 FROM conversation_runtime_probe_jobs WHERE status!='complete' LIMIT 1").fetchone():
@@ -442,12 +448,23 @@ class NativeChecks:
             finally:
                 con.close()
             if observed.get('probe') is not None and (probe is None or any(observed['probe'].get(key)!=probe[key] for key in ('conversation_id','generation_id'))):
-                result={name:None for name in ('probe','evidence','cleanup','observations','resources')}
+                result={name:None for name in ('probe','evidence','cleanup','observations','resources','behavior_witness')}
                 result.update(fingerprint=bound,grades={})
                 admissible=False
                 cleaned=False
             else:
                 result['probe']=probe
+            # Diagnostics belong to this exact captured check/probe. They
+            # cannot contribute to admission, grades or cleanup decisions.
+            observed_probe=observed.get('probe')
+            witness=observed.get('behavior_witness')
+            if (binding and probe and isinstance(observed_probe,dict)
+                    and all(observed_probe.get(key)==probe[key] for key in ('conversation_id','generation_id'))
+                    and isinstance(witness,dict)):
+                from gui_experiment_runtime import semantic_witness
+                result['behavior_witness']=semantic_witness(witness)
+            else:
+                result['behavior_witness']=None
             if binding:
                 result['probe_binding']=binding
             result.update(admissible=admissible,retry_allowed=bool(terminal and cleaned),
@@ -458,6 +475,13 @@ class NativeChecks:
     def _projection(row) -> dict:
         result=json.loads(row['result_json'])
         result.pop('probe_binding',None)
+        if isinstance(result.get('behavior_witness'),dict):
+            from gui_experiment_runtime import semantic_witness
+            result['behavior_witness']=semantic_witness(result['behavior_witness'])
+            result['behavior_witness_observation']='historical_check' if row['status']=='complete' else 'recorded_check'
+        else:
+            if 'behavior_witness' in result:result['behavior_witness']=None
+            result.pop('behavior_witness_observation',None)
         meta=result.pop('_automatic',None)
         if meta is not None:result['origin']='installed_change'
         return {'check_id':row['check_id'],'request_key':row['request_key'],'state':row['status'],
@@ -485,6 +509,11 @@ class NativeChecks:
             try:
                 row=con.execute('SELECT * FROM conversation_runtime_check_requests WHERE check_id=?',(target,)).fetchone()
                 result=self._projection(row)
+                if result.get('behavior_witness') is not None:
+                    observed_probe,binding=self._owned_probe(con,row,json.loads(row['result_json']))
+                    if observed_probe is None or not binding:
+                        result['behavior_witness']=None
+                        result['behavior_witness_observation']='unavailable'
                 if row['status']=='complete':
                     # A retained historical pass is not a claim about the
                     # latest installed source/binary or ordinary resolver.
