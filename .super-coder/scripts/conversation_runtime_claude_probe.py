@@ -121,6 +121,34 @@ class ClaudeScenarios(_Scenarios):
                     return True
         return False
 
+    def _sibling_reconciled(self, target: str, sibling: str, after: int) -> bool:
+        # Completion is attributed by the existing native task notification;
+        # absence or an OS exit alone never manufactures a terminal outcome.
+        root = self.driver.identity
+        if root is None:
+            return False
+        events = self._events()[after:]
+        for index, terminal in enumerate(events):
+            if not (terminal.kind == "work.terminal" and _qualified(terminal, root.root_id, work=sibling)
+                    and terminal.freshness == "current" and terminal.provenance == "claude:task-notification"
+                    and terminal.data.get("kind") == "terminal"
+                    and terminal.data.get("state") in {"completed", "failed", "stopped"}):
+                continue
+            isolated = any(e.reference and e.reference.activity_id
+                and complete_snapshot(e, root.root_id, e.reference.activity_id)
+                and e.observed_at <= terminal.observed_at
+                and target not in e.data["work_ids"] and sibling in e.data["work_ids"]
+                for e in events[:index])
+            if not isolated:
+                continue
+            for snapshot in events[index+1:]:
+                prompt = snapshot.reference.activity_id if snapshot.reference else None
+                if (prompt and complete_snapshot(snapshot, root.root_id, prompt)
+                        and snapshot.observed_at >= terminal.observed_at
+                        and not {target, sibling} & set(snapshot.data["work_ids"])):
+                    return True
+        return False
+
     def run(self) -> Mapping[str, CapabilityEvidence]:
         if not self.caps & {CAP_SUBMISSION, CAP_STOP_WORK}:
             return {cap: CapabilityEvidence(cap, "inconclusive", diagnostics=(
@@ -174,6 +202,9 @@ class ClaudeScenarios(_Scenarios):
                 self._wait(lambda: self._native_stopped(control, target, sibling, boundary))
                 if not self._retained(root, self.driver.inventory(deadline=self.deadline)):
                     raise RuntimeContractError("PROBE_SIBLING_ISOLATION_BROKEN", "native stop changed owned root")
+                self._wait(lambda: self._sibling_reconciled(target, sibling, boundary))
+                if not self._retained(root, self.driver.inventory(deadline=self.deadline)):
+                    raise RuntimeContractError("PROBE_SIBLING_ISOLATION_BROKEN", "reconciliation changed owned root")
                 self.coverage[CAP_STOP_WORK].update({"owned_work", "terminal_outcome", "sibling_isolation",
                     "target:terminal", "native_TaskStop", "matched_success", "later_complete_snapshot"})
         except (RuntimeError, OSError, ValueError) as exc:

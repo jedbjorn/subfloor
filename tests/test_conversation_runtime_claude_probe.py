@@ -39,7 +39,7 @@ from test_conversation_runtime_native_probes import (  # noqa: F401
 from test_native_check_workflow import database, workflow  # noqa: F401
 
 
-def claude_owned(owned, mutation='positive'):
+def claude_owned(owned, mutation='positive', reconciliation='complete'):
     context = replace(owned.context, harness='claude', provider='anthropic', model='claude-sonnet-5-5',
         probe_capabilities=('submission','stop_work','stop_work_terminal'))
     owned.client.context = context
@@ -65,11 +65,25 @@ def claude_owned(owned, mutation='positive'):
         text = '<channel '+ ' '.join(f'{k}="{v}"' for k,v in {'source':CHANNEL,
             'generation_id':context.generation_id,'conversation_id':context.conversation_id, **attrs}.items())+'></channel>'
         hook('UserPromptSubmit', prompt_id=turn, prompt=text)
+    snapshots = [0]
     def request(op, *, timeout, **fields):
+        if op == 'close':
+            return dataclasses.asdict(parser.cleanup(deadline=time.monotonic()+timeout))
         if op not in {'submit','control','snapshot'}: return original(op,timeout=timeout,**fields)
         owned.client.calls.append((op,fields,timeout))
         with owned.client.lock:
             if op=='snapshot':
+                snapshots[0] += 1
+                if (snapshots[0] == 2 and mutation == 'positive' and reconciliation != 'pending'):
+                    task = 'foreign' if reconciliation == 'foreign' else 'sibling'
+                    completion_turn = 'completion-turn'
+                    hook('UserPromptSubmit',prompt_id=completion_turn,prompt=
+                         '<task-notification><task-id>'+task+'</task-id><status>completed</status></task-notification>')
+                    rows = [] if reconciliation not in {'partial','unknown'} else [{'id':'bad','status':{}}]
+                    hook('SubagentStop' if reconciliation == 'nonstop' else 'Stop',
+                         prompt_id=completion_turn,background_tasks=rows,session_crons=[])
+                    with parser._condition:
+                        parser._terminal(completion_turn,'completed','claude:owned-transcript-turn_duration')
                 result=dataclasses.asdict(parser.inventory(deadline=time.monotonic()+timeout))
                 result['identity']=owned.client.identity()
                 return result
@@ -298,4 +312,56 @@ def test_unsupported_claude_probe_caps_do_not_issue_extra_native_turns(owned):
         measured=NativeProbeFactory._exercise(driver,frozenset({'stop_reply','automation','history_resume'}),time.monotonic()+1)
         assert all(value.grade=='inconclusive' and not value.coverage for value in measured.values())
         assert not [op for op,_,_ in actual.client.calls if op in {'submit','control'}]
+    finally:driver.cleanup(deadline=time.monotonic()+1)
+
+
+@pytest.mark.parametrize('reconciliation',['complete','pending','partial','foreign','nonstop'])
+def test_real_claude_cleanup_drives_checker_after_sibling_reconciliation(owned,reconciliation):
+    actual,parser=claude_owned(owned,reconciliation=reconciliation)
+    previous=actual.client.request
+    native=[]
+    def request(op,*,timeout,**fields):
+        result=previous(op,timeout=timeout,**fields)
+        if op=='close':native.append(result)
+        return result
+    actual.client.request=request
+    factory=NativeProbeFactory(lambda *args:actual,lambda *args:CleanupProof(True,'complete'))
+    checker=CompatibilityChecker();fp=fingerprint(actual)
+    checker.request(fp,observed_interface={'fixed':True},
+        requirements={cap:{'fixed':True} for cap in ('submission','stop_work')},
+        factory=factory,seconds=1).result(timeout=3)
+    grades=checker.cache.admission(fp)
+    assert native
+    if reconciliation=='complete':
+        assert native[0]['outcome']=='complete' and not native[0]['unresolved_work']
+        assert parser._work['target'].state=='stopped' and parser._work['sibling'].state=='completed'
+        assert grades['submission']=='compatible' and grades['stop_work_terminal']=='compatible'
+    elif reconciliation=='nonstop':
+        assert native[0]['outcome']=='complete'
+        assert grades['submission']=='compatible' and grades['stop_work_terminal']!='compatible'
+    else:
+        assert native[0]['outcome']=='pending' and native[0]['unresolved_work']
+        assert grades['submission']!='compatible' and grades['stop_work_terminal']!='compatible'
+    assert sum(op=='submit' for op,_,_ in actual.client.calls)==2
+    assert sum(op=='control' for op,_,_ in actual.client.calls)==1
+
+
+@pytest.mark.parametrize('edge',['before_boundary','partial','foreign','early_snapshot','wrong_kind','nonstop'])
+def test_sibling_reconciliation_requires_attributed_terminal_and_later_complete_stop(owned,edge):
+    actual,_=claude_owned(owned);driver=start(actual)
+    try:
+        scenario=ClaudeScenarios(driver,frozenset({'submission','stop_work'}),time.monotonic()+1)
+        assert scenario.run()['stop_work'].grade=='compatible'
+        events=list(driver.events)
+        terminal=next(e for e in events if e.kind=='work.terminal' and e.provenance=='claude:task-notification')
+        for index,event in enumerate(events):
+            if event is terminal:
+                if edge=='partial':events[index]=replace(event,partial=True)
+                if edge=='foreign':events[index]=replace(event,reference=replace(event.reference,root_id='other'))
+                if edge=='wrong_kind':events[index]=replace(event,data=dict(event.data,kind='task'))
+            if event.kind=='snapshot.observed' and event.reference.activity_id=='completion-turn':
+                if edge=='early_snapshot':events[index]=replace(event,observed_at=terminal.observed_at-1,data=dict(event.data,observed_at=terminal.observed_at-1))
+                if edge=='nonstop':events[index]=replace(event,provenance='claude:SubagentStop-snapshot')
+        with driver._lock:driver.events=events
+        assert not scenario._sibling_reconciled('target','sibling',len(events) if edge=='before_boundary' else 0)
     finally:driver.cleanup(deadline=time.monotonic()+1)
