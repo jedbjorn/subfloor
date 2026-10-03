@@ -11,6 +11,8 @@ import json
 import math
 import os
 import socket
+import sqlite3
+import stat
 import struct
 import time
 import uuid
@@ -30,6 +32,46 @@ from conversation_runtime_contract import (
     runtime_context_wire,
 )
 from conversation_runtime_controller import encoded, reference, start_ticks
+
+
+def remaining(deadline: float) -> float:
+    if isinstance(deadline,bool) or not isinstance(deadline,(int,float)) or not math.isfinite(deadline):
+        raise RuntimeContractError('DEADLINE_INVALID','absolute finite local deadline required')
+    value=deadline-time.monotonic()
+    if value<=0:raise RuntimeContractError('DEADLINE_EXPIRED','local operation budget expired')
+    return value
+
+
+def attach_connection(database: str | Path,deadline: float) -> sqlite3.Connection:
+    """Attach only to the serving engine's existing WAL DB within its budget.
+
+    Do not configure WAL through the generic connection's separate retry
+    window. Missing serving configuration is inconclusive, not a repair.
+    """
+    path=Path(database).absolute();remaining(deadline)
+    before=path.lstat()
+    if not stat.S_ISREG(before.st_mode) or before.st_uid!=os.geteuid():
+        raise RuntimeContractError('OWNERSHIP_INVALID','captured canonical database unavailable')
+    con=sqlite3.connect(path.as_uri()+'?mode=rw',uri=True,
+                       timeout=min(db_driver.DEFAULT_BUSY_TIMEOUT_MS/1000,remaining(deadline)))
+    try:
+        con.row_factory=sqlite3.Row
+        def bounded(sql: str):
+            wait_ms=int(remaining(deadline)*1000)
+            if wait_ms<1:raise RuntimeContractError('DEADLINE_EXPIRED','canonical attach budget expired')
+            con.execute(f'PRAGMA busy_timeout={min(db_driver.DEFAULT_BUSY_TIMEOUT_MS,wait_ms)}')
+            return con.execute(sql)
+        bounded('PRAGMA foreign_keys=ON')
+        if bounded('PRAGMA journal_mode').fetchone()[0]!='wal':
+            raise RuntimeContractError('CLEANUP_PENDING','canonical serving WAL unavailable; ownership retained')
+        bounded('PRAGMA synchronous=NORMAL');remaining(deadline)
+        after=path.lstat()
+        if (not stat.S_ISREG(after.st_mode) or after.st_uid!=os.geteuid()
+                or (after.st_dev,after.st_ino)!=(before.st_dev,before.st_ino)):
+            raise RuntimeContractError('OWNERSHIP_INVALID','captured canonical database changed')
+        return con
+    except BaseException:
+        con.close();raise
 
 
 class RuntimeStore:
@@ -95,18 +137,26 @@ class RuntimeStore:
         finally:
             con.close()
 
-    def attach(self, generation: str, owner: int, shell: int, consumer: str, *, lifetime: float=30) -> dict:
+    def attach(self, generation: str, owner: int, shell: int, consumer: str, *, lifetime: float=30, deadline: float | None=None) -> dict:
         if not 0<lifetime<=60 or not consumer:
             raise RuntimeContractError("LEASE_INVALID", "bounded named consumer required")
-        con=db_driver.connect(self.database)
+        if deadline is not None:remaining(deadline)
+        con=attach_connection(self.database,deadline) if deadline is not None else db_driver.connect(self.database)
         try:
+            if deadline is not None:
+                wait_ms=int(remaining(deadline)*1000)
+                if wait_ms<1:raise RuntimeContractError("DEADLINE_EXPIRED","attach budget expired")
+                current=int(con.execute("PRAGMA busy_timeout").fetchone()[0])
+                con.execute(f"PRAGMA busy_timeout={min(current,wait_ms)}")
             con.execute("BEGIN IMMEDIATE")
             row=self._owned(con,generation,owner,shell)
             if row["consumer_id"] not in {None,consumer} and row["consumer_expires"]>time.time():
                 raise RuntimeContractError("LEASE_BUSY", "another API consumer owns dispatch")
             fence=row["consumer_fence"]+(row["consumer_id"]!=consumer or row["consumer_expires"]<=time.time())
             expires=time.time()+lifetime
+            if deadline is not None:remaining(deadline)
             con.execute("UPDATE conversation_runtime_generations SET consumer_id=?,consumer_fence=?,consumer_expires=?,updated_at=? WHERE generation_id=?",(consumer,fence,expires,time.time(),generation))
+            if deadline is not None:remaining(deadline)
             con.commit()
             return {"consumer":consumer,"fence":fence,"expires":expires,"after":row["last_sequence"]}
         except Exception:
@@ -271,34 +321,69 @@ class RuntimeClient:
         self.consumer=consumer or uuid.uuid4().hex
         self.lease: dict[str,Any]={}
 
-    def request(self,op: str, *, timeout: float=10,**fields) -> dict:
-        if isinstance(timeout,bool) or not isinstance(timeout,(int,float)) or not math.isfinite(timeout) or not 0<timeout<=120:
-            raise RuntimeContractError('DEADLINE_INVALID','positive finite timeout at most 120 seconds required')
-        value={"op":op,"generation":self.generation,"contract":CONTRACT_REVISION,**self.lease,**fields,"timeout":timeout}
+    def _exchange(self,value: dict, *, timeout: float, deadline: float | None=None) -> dict:
         raw=(encoded(value)+"\n").encode()
         if len(raw)>MAX_FRAME_BYTES:
             raise RuntimeContractError("FRAME_TOO_LARGE", "private command exceeds frame bound")
         with socket.socket(socket.AF_UNIX,socket.SOCK_STREAM) as sock:
-            sock.settimeout(min(timeout,120)+2)
-            sock.connect(str(self.endpoint))
+            def bound():
+                sock.settimeout(min(timeout,remaining(deadline)) if deadline is not None else min(timeout,120)+2)
+            bound();sock.connect(str(self.endpoint))
             pid,uid,_=struct.unpack("3i",sock.getsockopt(socket.SOL_SOCKET,socket.SO_PEERCRED,12))
             if uid!=os.geteuid() or pid!=self.controller_pid or start_ticks(pid)!=self.controller_start_ticks:
                 raise RuntimeContractError("OWNERSHIP_INVALID", "private server process differs from captured controller")
-            sock.sendall(raw)
+            bound();sock.sendall(raw)
             response=bytearray()
             while b"\n" not in response:
-                chunk=sock.recv(min(65536,MAX_FRAME_BYTES+1-len(response)))
+                bound();chunk=sock.recv(min(65536,MAX_FRAME_BYTES+1-len(response)))
                 if not chunk or len(response)+len(chunk)>MAX_FRAME_BYTES:
                     raise RuntimeContractError("FRAME_INVALID", "private response missing or too large")
                 response.extend(chunk)
-            result=json.loads(bytes(response).split(b"\n",1)[0])
+            if deadline is not None:remaining(deadline)
+            try:result=json.loads(bytes(response).split(b"\n",1)[0])
+            except (ValueError,UnicodeError) as exc:
+                raise RuntimeContractError("FRAME_INVALID","private response is not valid JSON") from exc
+        if not isinstance(result,dict):raise RuntimeContractError('FRAME_INVALID','private response must be an object')
+        return result
+
+    def request(self,op: str, *, timeout: float=10,deadline: float | None=None,**fields) -> dict:
+        if isinstance(timeout,bool) or not isinstance(timeout,(int,float)) or not math.isfinite(timeout) or not 0<timeout<=120:
+            raise RuntimeContractError('DEADLINE_INVALID','positive finite timeout at most 120 seconds required')
+        if deadline is not None:timeout=min(timeout,remaining(deadline))
+        value={"op":op,"generation":self.generation,"contract":CONTRACT_REVISION,**self.lease,**fields,"timeout":timeout}
+        result=self._exchange(value,timeout=timeout,deadline=deadline)
         if result.get("ok") is not True:
             raise RuntimeContractError(result.get("error","CONTROLLER_FAILED"),result.get("detail","private controller failed"))
         return result["result"]
 
-    def attach(self,store: RuntimeStore,owner: int,shell: int) -> dict:
-        self.lease=store.attach(self.generation,owner,shell,self.consumer)
-        return self.request("attach",**self.lease)
+    def wait_listener(self, *, deadline: float, endpoint_device: int, endpoint_inode: int) -> None:
+        """Fixed lease-less status only; never attach/Open or a native action."""
+        if type(endpoint_device) is not int or endpoint_device<0 or type(endpoint_inode) is not int or endpoint_inode<=0:
+            raise RuntimeContractError('OWNERSHIP_INVALID','captured socket identity required')
+        def endpoint_current():
+            info=self.endpoint.lstat()
+            if (not stat.S_ISSOCK(info.st_mode) or info.st_uid!=os.geteuid() or stat.S_IMODE(info.st_mode)!=0o600
+                    or (info.st_dev,info.st_ino)!=(endpoint_device,endpoint_inode)
+                    or start_ticks(self.controller_pid)!=self.controller_start_ticks):
+                raise RuntimeContractError('OWNERSHIP_INVALID','captured listener identity changed')
+        while True:
+            timeout=min(.2,remaining(deadline))
+            try:
+                endpoint_current()
+                frame={'op':'status','generation':self.generation,'contract':CONTRACT_REVISION,'timeout':timeout}
+                result=self._exchange(frame,timeout=timeout,deadline=deadline)
+                endpoint_current();remaining(deadline)
+                if (set(result)!={'ok','error','detail'} or result['ok'] is not False
+                        or result['error']!='LEASE_FENCED' or not isinstance(result['detail'],str)
+                        or len(result['detail'])>2048):
+                    raise RuntimeContractError('LISTENER_INCONCLUSIVE','listener did not return the expected read-only fence')
+                return
+            except (FileNotFoundError,ConnectionRefusedError,TimeoutError):
+                time.sleep(min(.025,remaining(deadline)))
+
+    def attach(self,store: RuntimeStore,owner: int,shell: int, *, deadline: float | None=None) -> dict:
+        self.lease=store.attach(self.generation,owner,shell,self.consumer,deadline=deadline) if deadline is not None else store.attach(self.generation,owner,shell,self.consumer)
+        return self.request("attach",deadline=deadline,**self.lease)
 
     def open(self,context: RuntimeContext) -> dict:
         data=runtime_context_wire(context)
