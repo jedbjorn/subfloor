@@ -87,6 +87,27 @@ def semantic_witness(raw: dict) -> dict:
         name=role+'_pid_observation'
         if isinstance(raw.get(name),str) and raw[name] in {'unobserved','matched','ambiguous','no_owned_match','missing_terminal_output'}:
             result[name]=raw[name]
+        name=role+'_pid_qualification'
+        values=raw.get(name)
+        if isinstance(values,dict):
+            state=values.get('observation')
+            choices={
+                'native_target':{'qualified','missing_root_thread','association_unproved','not_current',
+                    'grade_unproved','missing_activity','missing_item','not_running','mixed'},
+                'native_handle':{'observed','unobserved','mixed'},
+                'terminal_record':{'unobserved','exact_current_record','conflicting','incomplete','no_matching_record','mixed'},
+                'tag_line':{'unobserved','observed','malformed','ambiguous','not_in_complete_record','mixed'},
+                'os_identity':{'unobserved','matched','ambiguous','unavailable','no_owned_match','mixed'}}
+            counts=('exact_output_records','complete_output_records')
+            if isinstance(state,str) and state in {'unobserved','overflow','unavailable'}:
+                result[name]={'observation':state}
+            elif state=='observed' and all(isinstance(values.get(key),str) and values[key] in options
+                    for key,options in choices.items()) and all(type(values[key]) is int and 0<=values[key]<=128
+                    for key in counts if key in values):
+                result[name]={'observation':'observed',**{key:values[key] for key in choices},
+                              **{key:values[key] for key in counts if key in values}}
+            else:
+                result[name]={'observation':'unavailable'}
     for name in ('first_root_terminal_counts','child_terminal_counts'):
         values=raw.get(name)
         if isinstance(values,dict):
