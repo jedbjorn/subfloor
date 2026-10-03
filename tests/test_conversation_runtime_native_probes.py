@@ -64,8 +64,8 @@ class Client:
         self.memory = True
         self.lost_submit = self.break_reply = self.break_child = False
         self.lock = threading.Lock()
-    def event(self, kind, ref, request=None, **data):
-        event = RuntimeEvent(kind,ref,request_id=request,data=data)
+    def event(self, event_kind, ref, request=None, **data):
+        event = RuntimeEvent(event_kind,ref,request_id=request,data=data)
         self.events.append({'sequence':len(self.events)+1,'event':dataclasses.asdict(event)})
     def identity(self):
         return {'root_id':'root','process':{'pid':77,'start_ticks':100},'protocol':{'native_route':{'account_type':'chatgpt','model':self.context.model,'efforts':['high']},'memory_policy':{'generate_memories':False,'use_memories':False,'feature_enabled':False,'root_mode':'disabled'} if self.memory else {}}}
@@ -85,16 +85,22 @@ class Client:
                 text=command['text'];marker=re.search(r'fixture_state with marker ([a-z0-9]+)',text)
                 if marker:
                     self.marker=marker[1];output='READY '+self.marker
-                    labels=re.findall(r'F89_(?:ROOT|CHILD)_[a-z0-9]+',text)
+                    labels=list(dict.fromkeys(re.findall(r'F89_(?:ROOT|SIBLING|CHILD)_[a-z0-9]+',text)))
                     if labels:
                         self.pids[200]=ProcessIdentity(200,2000);output+=' '+labels[0]+'=200'
                         root_terminal=NativeReference('root','root',activity_id=turn,item_id='root-item',work_id='root-item',native_process_id='opaque-root')
                         self.work.append({'reference':dataclasses.asdict(root_terminal),'kind':'terminal','state':'running','provenance':'fixture','observed_at':time.time(),'freshness':'current'})
+                        self.event('output.delta',root_terminal,request,kind='terminal',text=labels[0]+'=200\n',offset=0,complete=True)
                         self.pids[201]=ProcessIdentity(201,2001);output+=' '+labels[-1]+'=201'
                         child='Spawn exactly one native child' in text
                         sibling=NativeReference('root','child' if child else 'root','root' if child else None,'child-turn' if child else turn,'sibling-item','sibling-item','opaque-sibling')
                         self.work.append({'reference':dataclasses.asdict(sibling),'kind':'terminal','state':'running','provenance':'fixture','observed_at':time.time(),'freshness':'current'})
+                        self.event('output.delta',sibling,kind='terminal',text=labels[-1]+'=201\n',offset=0,complete=True)
                         if child:
+                            self.pids[203]=ProcessIdentity(203,2003)
+                            root_sibling=NativeReference('root','root',activity_id=turn,item_id='root-sibling',work_id='root-sibling',native_process_id='opaque-independent')
+                            self.work.append({'reference':dataclasses.asdict(root_sibling),'kind':'terminal','state':'running','provenance':'fixture','observed_at':time.time(),'freshness':'current'})
+                            self.event('output.delta',root_sibling,request,kind='terminal',text=labels[1]+'=203\n',offset=0,complete=True)
                             child_ref=NativeReference('root','child','root','child-turn',work_id='child')
                             self.work.append({'reference':dataclasses.asdict(child_ref),'kind':'child','state':'active','provenance':'fixture','observed_at':time.time(),'freshness':'current'})
                     self.event('output.final',replace(ref,item_id='reply'),request,text=output)
@@ -275,9 +281,9 @@ def test_factory_witness_does_not_promote_partial_foreign_or_unknown_terminal_da
 
 def test_factory_witness_retains_the_predicate_that_timed_out(owned):
     original=owned.client.event
-    def failed(kind,ref,request=None,**data):
-        if kind=='activity.terminal':data['status']='failed'
-        return original(kind,ref,request,**data)
+    def failed(event_kind,ref,request=None,**data):
+        if event_kind=='activity.terminal':data['status']='failed'
+        return original(event_kind,ref,request,**data)
     owned.client.event=failed
     factory=NativeProbeFactory(lambda *args:owned,lambda *args:CleanupProof(True,'complete'))
     fp=fingerprint(owned);session=factory.reserve(fp,frozenset({'submission'}),deadline=time.monotonic()+2)
@@ -308,10 +314,10 @@ def test_factory_witness_does_not_label_missing_native_close_outcome_observed(ow
 @pytest.mark.parametrize('case',['missing_tag','unowned_candidate'])
 def test_inventory_witness_distinguishes_missing_tag_from_failed_owned_identity_match(owned,case):
     original=owned.client.event
-    def output(kind,ref,request=None,**data):
+    def output(event_kind,ref,request=None,**data):
         if case=='missing_tag' and isinstance(data.get('text'),str):
             data['text']=re.sub(r'F89_ROOT_[a-z0-9]+=200','untagged root output',data['text'])
-        return original(kind,ref,request,**data)
+        return original(event_kind,ref,request,**data)
     owned.client.event=output
     actual=replace(owned,process_identity=lambda pid:None if pid==200 else owned.client.pids.get(pid))
     factory=NativeProbeFactory(lambda *args:actual,lambda *args:CleanupProof(True,'complete'))
@@ -731,10 +737,10 @@ def test_current_snapshot_does_not_upgrade_work_witness_freshness(owned, freshne
 @pytest.mark.parametrize('cleanup', ['complete', 'native_unknown', 'os_unknown'])
 def test_checker_submission_proof_survives_optional_target_gap_only_after_full_cleanup(owned, gap, cleanup):
     event = owned.client.event
-    def output(kind, ref, request=None, **data):
+    def output(event_kind, ref, request=None, **data):
         if gap == 'missing_pid_tag' and isinstance(data.get('text'), str):
             data['text'] = re.sub(r'F89_ROOT_[a-z0-9]+=200', 'untagged', data['text'])
-        return event(kind, ref, request, **data)
+        return event(event_kind, ref, request, **data)
     owned.client.event = output
     original = owned.client.request
     def request(op, **fields):
@@ -767,22 +773,23 @@ def test_checker_submission_proof_survives_optional_target_gap_only_after_full_c
 def test_pid_candidates_preserve_observed_text_record_and_part_boundaries(owned, boundary):
     from conversation_runtime_native_probes import _Scenarios
     driver = start(owned)
-    ref = NativeReference('root', 'root', activity_id='turn')
+    ref = NativeReference('root', 'root', activity_id='turn', item_id='terminal')
     owned.client.pids[200] = ProcessIdentity(200, 2000)
     other = replace(ref, activity_id='other') if boundary == 'activity' else replace(ref, item_id='other') if boundary == 'item' else ref
-    rows = [RuntimeEvent('output.final', ref, data={'text': 'TAG=200', 'text_digest': 'a'*64, 'part': 0, 'last': True}),
-            RuntimeEvent('output.final', other, data={'text': '123', 'text_digest': 'b'*64, 'part': 0, 'last': True})]
+    rows = [RuntimeEvent('output.final', ref, data={'kind':'terminal','text': 'TAG=200\n', 'text_digest': 'a'*64, 'part': 0, 'last': True}),
+            RuntimeEvent('output.final', other, data={'kind':'terminal','text': '123', 'text_digest': 'b'*64, 'part': 0, 'last': True})]
     if boundary in {'contiguous', 'replay', 'conflicting', 'missing_part'}:
-        rows = [RuntimeEvent('output.final', ref, data={'text': text, 'text_digest': 'a'*64, 'part': part, 'last': part == 1})
-                for part, text in enumerate(['TAG=2', '00'])]
+        rows = [RuntimeEvent('output.final', ref, data={'kind':'terminal','text': text, 'text_digest': 'a'*64, 'part': part, 'last': part == 1})
+                for part, text in enumerate(['TAG=2', '00\n'])]
         if boundary == 'replay': rows.insert(1, rows[0])
-        if boundary == 'conflicting': rows.append(replace(rows[0], data=rows[0].data | {'text': 'TAG=3'}))
-        if boundary == 'missing_part': rows = [replace(rows[1], data=rows[1].data | {'text': 'TAG=200'})]
+        if boundary == 'conflicting': rows.append(replace(rows[0], data=rows[0].data | {'text': 'TAG=3\n'}))
+        if boundary == 'missing_part': rows = [replace(rows[1], data=rows[1].data | {'text': 'TAG=200\n'})]
     if boundary == 'missing_tail': rows = [replace(rows[0], data=rows[0].data | {'last': False})]
     if boundary == 'conflicting_last': rows.append(replace(rows[0], data=rows[0].data | {'last': False}))
     with driver._lock: driver.events = rows
     scenario = _Scenarios(driver, frozenset({'submission'}), time.monotonic()+1)
     try:
-        assert scenario._pid('TAG') == (None if boundary in {'conflicting', 'missing_part', 'missing_tail', 'conflicting_last'} else ProcessIdentity(200, 2000))
+        target=__import__('conversation_runtime_contract').NativeWork(ref,'terminal','running','fixture',time.time(),freshness='current')
+        assert scenario._pid('TAG',target) == (None if boundary in {'conflicting', 'missing_part', 'missing_tail', 'conflicting_last'} else ProcessIdentity(200, 2000))
     finally:
         driver.cleanup(deadline=time.monotonic()+1)
