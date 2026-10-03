@@ -166,6 +166,17 @@ class NativeChecks:
                         raise RuntimeContractError('CHECK_CANDIDATE_CHANGED','automatic observation is no longer current')
                     if not self._current_owner():return None
                     rows=con.execute('SELECT * FROM conversation_runtime_check_requests WHERE owner_user_id=1 ORDER BY created_at DESC,check_id DESC').fetchall()
+                    # Source observation has not bound the manual candidate
+                    # yet. Defer, without claiming a fingerprint match: a
+                    # queued same-candidate row would later make owned probe
+                    # allocation ambiguous when the manual check binds.
+                    for row in rows:
+                        if (self.beginning and self.current==row['check_id'] and row['status']=='accepted'
+                                and json.loads(row['selection_json'])==selection
+                                and row['request_hash']==payload_digest(selection)):
+                            result=json.loads(row['result_json'])
+                            if '_automatic' not in result and result.get('fingerprint') is None:
+                                return None
                     attempt=0
                     # A later observation supersedes only positively queued
                     # work. Claimed/unknown ownership is retained for Close.
