@@ -466,7 +466,8 @@ class _Scenarios:
             "sibling_tagged_pid_candidates": 0, "sibling_owned_pid_matches": 0}
         for role in ("root", "sibling", "child"):
             self.work_observation.update({role+"_rejected_pid_output_records": 0,
-                                          role+"_pid_observation": "unobserved"})
+                                          role+"_pid_observation": "unobserved",
+                                          role+"_pid_qualification": {"observation": "unobserved"}})
         self._root_label: str | None = None
         self._child_label: str | None = None
         self._sibling_label: str | None = None
@@ -671,17 +672,32 @@ class _Scenarios:
 
     def _pid(self, label: str, target: NativeWork) -> ProcessIdentity | None:
         key = "root" if label == self._root_label else "child" if label == self._child_label else "sibling" if label == self._sibling_label else None
+        # Diagnostic decisions only. They never select a target or qualify a PID.
+        root = self.driver.identity
+        qualification = ("missing_root_thread" if not root or not target.reference.thread_id
+            else "association_unproved" if target.kind != "terminal" or target.reference.root_id != root.root_id
+            else "not_current" if target.freshness != "current"
+            else "grade_unproved" if target.grade in {"incompatible", "inconclusive"}
+            else "missing_activity" if not target.reference.activity_id
+            else "missing_item" if not target.reference.item_id
+            else "not_running" if target.state not in {"running", "inProgress"} else "qualified")
+        detail: dict[str, Any] = {"observation": "observed", "native_target": qualification,
+            "native_handle": "observed" if isinstance(target.reference.native_process_id, str)
+                and 0 < len(target.reference.native_process_id) <= 512 else "unobserved",
+            "terminal_record": "unobserved", "tag_line": "unobserved", "os_identity": "unobserved"}
         if key:
             with self.driver._lock:
                 self.work_observation.update({key+"_tagged_pid_candidates": 0, key+"_owned_pid_matches": 0,
-                    key+"_rejected_pid_output_records": 0, key+"_pid_observation": "missing_terminal_output"})
+                    key+"_rejected_pid_output_records": 0, key+"_pid_observation": "missing_terminal_output",
+                    key+"_pid_qualification": detail})
         outputs: list[str] = []
         offsets: dict[tuple[Any, ...], dict[int, tuple[str, bool]]] = {}
         invalid_offsets: set[tuple[Any, ...]] = set()
         parts: dict[tuple[Any, ...], dict[int, tuple[str, bool]]] = {}
         ambiguous: set[tuple[Any, ...]] = set()
         rejected = 0
-        root = self.driver.identity
+        exact_records = 0
+        conflicting_record = False
         if (not root or target.kind != "terminal" or target.freshness != "current"
                 or target.grade in {"incompatible", "inconclusive"}
                 or target.reference.root_id != root.root_id or not target.reference.thread_id
@@ -702,6 +718,7 @@ class _Scenarios:
                 rejected += bool(re.search(re.escape(label)+r"=(\d+)\b", value))
                 continue
             if ref:
+                exact_records += 1
                 digest, part = event.data.get("text_digest"), event.data.get("part")
                 output_key = (ref.thread_id, ref.activity_id, ref.item_id, event.kind,
                               digest if isinstance(digest, str) else None)
@@ -710,15 +727,18 @@ class _Scenarios:
                     if (not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest)
                             or type(part) is not int or not 0 <= part < 128 or type(last) is not bool):
                         ambiguous.add(output_key)
+                        conflicting_record = True
                         continue
                     rows = parts.setdefault(output_key, {})
                     if part in rows and rows[part] != (value, last):
                         ambiguous.add(output_key)
+                        conflicting_record = True
                     rows[part] = (value, last)
                 else:
                     offset, complete = event.data.get("offset"), event.data.get("complete")
                     if type(offset) is not int or not 0 <= offset < 512 * 1024 or type(complete) is not bool:
                         invalid_offsets.add(output_key)
+                        conflicting_record = True
                         continue
                     # Codex offsets are local to each normalized native output
                     # record, not a cumulative item stream. Every offset zero
@@ -730,10 +750,12 @@ class _Scenarios:
                     if offset in rows:
                         if rows[offset] != (value, complete):
                             invalid_offsets.add(output_key)
+                            conflicting_record = True
                         # Exact repeated chunks do not append another copy.
                         continue
                     if offset != sum(len(text) for text, _ in rows.values()):
                         invalid_offsets.add(output_key)
+                        conflicting_record = True
                     rows[offset] = (value, complete)
                     if complete:
                         if output_key not in invalid_offsets:
@@ -758,6 +780,18 @@ class _Scenarios:
                 identity = callback(int(match))
                 if identity is not None and identity.pid == int(match):
                     identities.append(identity)
+        # Count only the existing parser's records, not native task absence.
+        # Saturation makes this diagnostic unavailable; proof logic is unchanged.
+        overflow = exact_records > 128 or len(outputs) > 128 or rejected > 128 or len(matches) >= 128
+        detail = {"observation": "overflow"} if overflow else {
+            **detail, "exact_output_records": exact_records, "complete_output_records": len(outputs),
+            "terminal_record": "exact_current_record" if outputs else "conflicting" if conflicting_record
+                else "incomplete" if exact_records else "no_matching_record",
+            "tag_line": "ambiguous" if len(matches) > 1 else "observed" if matches
+                else "malformed" if outputs and any(label+"=" in value for value in outputs)
+                else "not_in_complete_record" if outputs else "unobserved",
+            "os_identity": "ambiguous" if len(identities) > 1 else "matched" if identities
+                else "unavailable" if matches and callback is None else "no_owned_match" if matches else "unobserved"}
         key = "root" if label == self._root_label else "child" if label == self._child_label else "sibling" if label == self._sibling_label else None
         if key:
             with self.driver._lock:
@@ -767,6 +801,7 @@ class _Scenarios:
                 self.work_observation[key+"_pid_observation"] = (
                     "matched" if len(identities) == 1 else "ambiguous" if len(identities) > 1
                     else "no_owned_match" if matches else "missing_terminal_output")
+                self.work_observation[key+"_pid_qualification"] = detail
         return identities[0] if len(identities) == 1 else None
 
     def _terminal_pid(self, label: str, thread: str) -> tuple[NativeWork, ProcessIdentity] | None:
@@ -775,6 +810,7 @@ class _Scenarios:
         found = []
         key = "root" if label == self._root_label else "child" if label == self._child_label else "sibling" if label == self._sibling_label else None
         totals = {"tagged_pid_candidates": 0, "owned_pid_matches": 0, "rejected_pid_output_records": 0}
+        details: list[dict[str, Any]] = []
         for work in self._inventory().work:
             if work.kind == "terminal" and work.freshness == "current" and work.reference.thread_id == thread:
                 identity = self._pid(label, work)
@@ -782,6 +818,8 @@ class _Scenarios:
                     with self.driver._lock:
                         for suffix in totals:
                             totals[suffix] += self.work_observation[key+"_"+suffix]
+                        if len(details) <= 128:
+                            details.append(self.work_observation[key+"_pid_qualification"])
                 if identity is not None:
                     found.append((work, identity))
         if key:
@@ -790,6 +828,19 @@ class _Scenarios:
                 self.work_observation[key+"_pid_observation"] = (
                     "matched" if len(found) == 1 else "ambiguous" if len(found) > 1
                     else "no_owned_match" if totals["tagged_pid_candidates"] else "missing_terminal_output")
+                # Multiple inventory rows must not inherit the last row's story.
+                diagnostic: dict[str, Any] = {"observation": "unobserved"}
+                if details and len(details) <= 128 and all(row.get("observation") == "observed" for row in details):
+                    counts = {name: sum(row[name] for row in details)
+                              for name in ("exact_output_records", "complete_output_records")
+                              if all(type(row.get(name)) is int for row in details)}
+                    diagnostic = {"observation": "overflow"} if any(n > 128 for n in counts.values()) else {
+                        "observation": "observed", **counts,
+                        **{name: details[0][name] if all(row[name] == details[0][name] for row in details) else "mixed"
+                           for name in ("native_target", "native_handle", "terminal_record", "tag_line", "os_identity")}}
+                elif details:
+                    diagnostic = {"observation": "overflow"}
+                self.work_observation[key+"_pid_qualification"] = diagnostic
         return found[0] if len(found) == 1 else None
 
     @staticmethod
