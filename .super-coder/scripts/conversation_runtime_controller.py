@@ -150,10 +150,18 @@ class Journal:
             self.db.execute("INSERT OR IGNORE INTO meta VALUES(?,?)", (key, encoded(value)))
 
     def get(self, key: str) -> Any:
-        return json.loads(self.db.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()[0])
+        # A shared connection still needs one owner around execute + cursor
+        # consumption. Status/Open race with the replay/ack reader otherwise.
+        with self.lock:
+            return json.loads(self.db.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()[0])
 
     def set(self, key: str, value: Any) -> None:
-        self.db.execute("UPDATE meta SET value=? WHERE key=?", (encoded(value), key))
+        with self.lock:
+            self.db.execute("UPDATE meta SET value=? WHERE key=?", (encoded(value), key))
+
+    def pending_submission_before(self, ordinal: int) -> bool:
+        with self.lock:
+            return self.db.execute("SELECT 1 FROM commands WHERE kind='submit' AND ordinal<? AND state NOT IN ('terminal','rejected','unsupported') LIMIT 1", (ordinal,)).fetchone() is not None
 
     def _compact(self) -> None:
         floor = self.get("floor")
@@ -710,7 +718,7 @@ class Controller:
             elif op == "submit":
                 if command.get("source","gui") not in {"gui","native_completion","automation","reconciliation","system"}:
                     raise RuntimeContractError("COMMAND_INVALID", "unknown activity source")
-                earlier=self.journal.db.execute("SELECT 1 FROM commands WHERE kind='submit' AND ordinal<? AND state NOT IN ('terminal','rejected','unsupported') LIMIT 1",(ordinal,)).fetchone()
+                earlier=self.journal.pending_submission_before(ordinal)
                 if self.journal.get("primary") is not None or earlier:
                     result = WriteReceipt("not_written",detail="primary slot occupied; retain API outbox order")
                 else:
@@ -800,10 +808,12 @@ class Controller:
                 self.journal.set('idle_since',None)
 
     def status(self) -> dict:
-        return {"generation":self.generation,"contract":CONTRACT_REVISION,"ready":self.ready,
-                "lost":self.lost,"identity":public_payload(dataclasses.asdict(self.identity),sensitive_values=self.journal.secrets) if self.identity else None,
-                "setup":self.journal.get('setup'),"setup_confirmation":self.journal.get('setup_confirmation'),
-                'quiet':self.journal.quiet(),**self.journal.replay(self.journal.get("sequence"))}
+        # One bounded local snapshot; this lock never covers a native RPC.
+        with self.journal.lock:
+            return {"generation":self.generation,"contract":CONTRACT_REVISION,"ready":self.ready,
+                    "lost":self.lost,"identity":public_payload(dataclasses.asdict(self.identity),sensitive_values=self.journal.secrets) if self.identity else None,
+                    "setup":self.journal.get('setup'),"setup_confirmation":self.journal.get('setup_confirmation'),
+                    'quiet':self.journal.quiet(),**self.journal.replay(self.journal.get("sequence"))}
 
 
 def owned_peer(peer: ProcessIdentity) -> bool:
@@ -837,6 +847,11 @@ class PrivateServer:
             result = {"ok":True,"result":self.controller.handle(value,peer=peer)}
         except RuntimeContractError as exc:
             result = {"ok":False,"error":exc.code,"detail":str(exc)}
+        except sqlite3.Error:
+            # A failed journal observation is not evidence of native delivery
+            # or cleanup. Keep ownership and let the caller reconcile/Close.
+            result = {"ok":False,"error":"JOURNAL_UNAVAILABLE",
+                      "detail":"owned journal observation unavailable; native outcome remains unproved"}
         except TimeoutError:
             # A native future may have crossed its write edge. This is not
             # the pre-dispatch DEADLINE_EXPIRED/no-write admission refusal.
