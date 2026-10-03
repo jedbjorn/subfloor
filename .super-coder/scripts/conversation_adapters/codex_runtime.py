@@ -897,6 +897,7 @@ class CodexRuntimeDriver(RuntimeDriver):
                 if snapshot.partial or snapshot.freshness != "current" or not any(
                     work.kind == "terminal" and work.reference.thread_id == thread
                     and work.reference.native_process_id == target.native_process_id
+                    and (target.activity_id is None or target.activity_id == work.reference.activity_id)
                     and (target.item_id is None or target.item_id == work.reference.item_id)
                     and (target.work_id is None or target.work_id == work.reference.work_id)
                     for work in snapshot.work):

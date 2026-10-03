@@ -280,6 +280,37 @@ def test_attributed_terminal_preserves_exact_expected_activity_fence(seat):
     assert driver.control(exact, deadline=deadline()).state == 'written'
 
 
+def test_current_inventory_withdrawal_refuses_old_attributed_control_without_native_write(seat):
+    from conversation_runtime_contract import NativeControl
+    driver, rpc, _, _ = seat
+    setup(rpc)
+    emit(rpc)
+    target = snapshot(driver)[1].reference
+    emit(rpc, turn='conflicting-turn')
+    assert snapshot(driver)[1].reference.activity_id is None
+    command = NativeControl('stale', 1, 'digest', 'stop_work', target, target.activity_id)
+    assert driver.control(command, deadline=deadline()).state == 'rejected'
+    assert not any(method == 'thread/backgroundTerminals/terminate' for method, _ in rpc.calls)
+
+
+def test_control_read_edge_completion_refuses_previously_attributed_target(seat):
+    from conversation_runtime_contract import NativeControl
+    driver, rpc, _, _ = seat
+    setup(rpc)
+    emit(rpc)
+    target = snapshot(driver)[1].reference
+    original = rpc.request
+    def race(method, params, *, deadline):
+        value = original(method, params, deadline=deadline)
+        if method == 'thread/backgroundTerminals/list':
+            rpc.frame('item/completed', turn='command-turn', item=command(status='completed')[1])
+        return value
+    rpc.request = race
+    intent = NativeControl('stale', 1, 'digest', 'stop_work', target, target.activity_id)
+    assert driver.control(intent, deadline=deadline()).state == 'rejected'
+    assert not any(method == 'thread/backgroundTerminals/terminate' for method, _ in rpc.calls)
+
+
 def test_real_factory_terminal_call_site_supplies_exact_observed_activity(tmp_path):
     from conversation_runtime_checks import CleanupProof, CompatibilityChecker
     from conversation_runtime_native_probes import NativeProbeFactory
@@ -305,3 +336,19 @@ def test_real_factory_terminal_call_site_supplies_exact_observed_activity(tmp_pa
     assert 'target:terminal' in result.evidence['stop_work'].coverage
     intents = [fields['command'] for op, fields, _ in actual.client.calls if op == 'control']
     assert len(intents) == 1 and intents[0]['expected_activity_id'] == intents[0]['target']['activity_id']
+
+
+def test_explicit_unobserved_activity_refuses_while_existing_none_legacy_boundary_remains(seat):
+    from conversation_runtime_contract import NativeControl
+    driver, rpc, _, _ = seat
+    setup(rpc)
+    target = snapshot(driver)[1].reference
+    assert target.activity_id is None
+    invented = replace(target, activity_id='not-observed')
+    assert driver.control(NativeControl('unproved', 1, 'digest', 'stop_work', invented, invented.activity_id),
+        deadline=deadline()).state == 'rejected'
+    assert not any(method == 'thread/backgroundTerminals/terminate' for method, _ in rpc.calls)
+    # Existing native handle-only control contract stays unchanged; this
+    # component action does not earn PID/OS/behavioral capability evidence.
+    assert driver.control(NativeControl('legacy', 2, 'digest', 'stop_work', target),
+        deadline=deadline()).state == 'written'
