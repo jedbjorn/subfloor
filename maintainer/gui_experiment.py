@@ -16,6 +16,7 @@ import argparse
 import contextlib
 import fcntl
 import hashlib
+import html
 import importlib
 import io
 import json
@@ -35,7 +36,7 @@ import time
 import urllib.error
 import urllib.request
 import uuid
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 from unittest import mock
 
@@ -61,6 +62,109 @@ IDENTITY_KEYS = (
 MAX_LIFETIME = 1800
 MAX_MEMORY_MIB = 512
 MAX_TASKS = 64
+MAX_PROJECT_BYTES = 32 * 1024 * 1024
+MAX_PROJECT_ENTRIES = 4096
+PROJECT_EXCLUDED = {'.git', '.super-coder', '.sc-state', '.sc-worktrees', '.subfloor',
+                    '.claude', '.codex', '.agents', '.opencode', '.ssh', '.npmrc', '.netrc', '.pypirc', 'node_modules',
+                    'home', 'xdg-state', 'xdg-config', 'xdg-data', 'runtime',
+                    'synthetic-upstream', 'AGENTS.md', 'CLAUDE.md', '.gitignore', 'sc',
+                    'fixture_bootstrap.py', 'maintainer', '.gui-experiment-owner.json'}
+
+
+def project_path(name: str) -> bool:
+    path = PurePosixPath(name)
+    if (not name or name != path.as_posix() or name == '.' or path.is_absolute() or '..' in path.parts or '\\' in name
+            or any(ord(ch) < 32 for ch in name) or len(name.encode()) > 1024):
+        raise FixtureError('PROJECT_INVALID', 'unsafe committed project path')
+    return not any(part in PROJECT_EXCLUDED or part.startswith('.env')
+                   or part.endswith(('.db', '.db-wal', '.db-shm', '.pem', '.key'))
+                   for part in path.parts)
+
+
+def validate_project(raw: bytes) -> list[tarfile.TarInfo]:
+    if not raw or len(raw) > MAX_PROJECT_BYTES:
+        raise FixtureError('PROJECT_INVALID', 'project archive exceeds the preview bound')
+    try:
+        with tarfile.open(fileobj=io.BytesIO(raw), mode='r:') as tar:
+            members = []
+            seen: set[str] = set()
+            size = 0
+            for member in tar:
+                name = member.name.rstrip('/')
+                if (not project_path(name) or name in seen or len(seen) >= MAX_PROJECT_ENTRIES
+                        or not (member.isfile() or member.isdir()) or member.mode & 0o7000):
+                    raise FixtureError('PROJECT_INVALID', 'project contains excluded or unsafe entries')
+                seen.add(name)
+                size += member.size
+                if size > MAX_PROJECT_BYTES:
+                    raise FixtureError('PROJECT_INVALID', 'project content exceeds the preview bound')
+                members.append(member)
+            return members
+    except tarfile.TarError:
+        raise FixtureError('PROJECT_INVALID', 'project archive is malformed') from None
+
+
+def committed_project(repo: Path, ref: str) -> tuple[dict, bytes]:
+    """Only tracked committed paths; no checkout, untracked file, or config copy."""
+    sha = command(['git', '-C', str(repo), 'rev-parse', '--verify', '--end-of-options',
+                   f'{ref}^{{commit}}']).stdout.strip()
+    if not SHA_RE.fullmatch(sha):
+        raise FixtureError('PROJECT_INVALID', 'project commit is unavailable')
+    tree = subprocess.run(['git', '-C', str(repo), 'ls-tree', '-r', '-l', '-z', sha],
+                          capture_output=True, timeout=20, env=clean_environment(), check=True)
+    if len(tree.stdout) > 512 * 1024:
+        raise FixtureError('PROJECT_INVALID', 'project tree exceeds the preview bound')
+    paths: list[str] = []
+    total = 0
+    for entry in tree.stdout.split(b'\0'):
+        if not entry:
+            continue
+        metadata, name = entry.split(b'\t', 1)
+        path = name.decode('utf-8', errors='strict')
+        if not project_path(path):
+            continue
+        if metadata.split()[0] not in {b'100644', b'100755'}:
+            raise FixtureError('PROJECT_INVALID', 'project links and special entries are refused')
+        total += int(metadata.split()[3])
+        if total > MAX_PROJECT_BYTES or len(paths) >= MAX_PROJECT_ENTRIES:
+            raise FixtureError('PROJECT_INVALID', 'project content exceeds the preview bound')
+        paths.append(path)
+    if not paths or len(paths) > MAX_PROJECT_ENTRIES:
+        raise FixtureError('PROJECT_INVALID', 'project has no bounded ordinary files')
+    with tempfile.TemporaryFile() as stream:
+        result = subprocess.run(['git', '-C', str(repo), 'archive', sha, '--', *paths],
+                                stdout=stream, stderr=subprocess.DEVNULL, timeout=20,
+                                env=clean_environment(), check=False)
+        if result.returncode or stream.tell() > MAX_PROJECT_BYTES:
+            raise FixtureError('PROJECT_INVALID', 'project archive is unavailable or oversized')
+        stream.seek(0)
+        raw = stream.read(MAX_PROJECT_BYTES + 1)
+    validate_project(raw)
+    return {'commit': sha, 'archive_sha256': hashlib.sha256(raw).hexdigest(),
+            'files': len(paths), 'policy': 'committed-project-only-v1'}, raw
+
+
+def extract_project(root: Path, raw: bytes) -> None:
+    members = validate_project(raw)
+    # All validation completes before any project mutation, in the new marked
+    # root, before Git/worktrees/API start. Never replace a captured engine file.
+    for member in members:
+        target = root / member.name
+        if target.exists() or target.is_symlink():
+            raise FixtureError('PROJECT_INVALID', 'project collides with captured fixture source')
+    with tarfile.open(fileobj=io.BytesIO(raw), mode='r:') as tar:
+        tar.extractall(root, members=members, filter='data')
+
+
+def validate_project_info(info: dict) -> None:
+    if (not isinstance(info, dict)
+            or set(info) != {'commit', 'archive_sha256', 'files', 'policy'}
+            or not isinstance(info['commit'], str) or not SHA_RE.fullmatch(info['commit'])
+            or not isinstance(info['archive_sha256'], str)
+            or not re.fullmatch(r'[0-9a-f]{64}', info['archive_sha256'])
+            or type(info['files']) is not int or not 1 <= info['files'] <= MAX_PROJECT_ENTRIES
+            or info['policy'] != 'committed-project-only-v1'):
+        raise FixtureError('PROJECT_INVALID', 'committed project metadata differs')
 
 
 class FixtureError(RuntimeError):
@@ -168,7 +272,11 @@ def ownership_lock(fixture_id: str, *, deadline: float | None = None):
 
 def identity(record: dict[str, Any]) -> dict[str, Any]:
     try:
-        return {key: record[key] for key in IDENTITY_KEYS}
+        result = {key: record[key] for key in IDENTITY_KEYS}
+        for optional in ('project', 'native_harnesses', 'preview'):
+            if optional in record:
+                result[optional] = record[optional]
+        return result
     except KeyError as exc:
         raise FixtureError("RECORD_INVALID", "incomplete fixture identity") from exc
 
@@ -851,7 +959,7 @@ def launch_api(record: dict,root: Path, *, resume: bool=False) -> None:
     if record['runtime']=='experimental':
         import pwd
         native_environment += ['--setenv=SC_FIXTURE_NATIVE_HOME='+pwd.getpwuid(os.geteuid()).pw_dir]
-        for harness in ('codex','claude'):
+        for harness in record.get('native_harnesses', ('codex','claude')):
             executable=shutil.which(harness)
             if executable:
                 native_environment += ['--setenv=SC_FIXTURE_NATIVE_'+harness.upper()+'='+str(Path(executable).absolute())]
@@ -919,7 +1027,10 @@ def restart_api(receipt: Path) -> dict:
 
 def start(source_repo: Path, ref: str, receipt: Path, *, temp_parent: Path | None = None,
           port: int | None = None, runtime: str = "none", lifetime: int = MAX_LIFETIME,
-          memory_mib: int = MAX_MEMORY_MIB, tasks: int = MAX_TASKS) -> dict[str, Any]:
+          memory_mib: int = MAX_MEMORY_MIB, tasks: int = MAX_TASKS,
+          project: tuple[dict, bytes] | None = None,
+          native_harnesses: tuple[str, ...] | None = None,
+          preview: bool = False) -> dict[str, Any]:
     # Serialize starts using the same exported receipt, even before a random
     # fixture ID exists. A second concurrent start then sees the first receipt.
     if runtime not in {"none", "experimental"}:
@@ -930,12 +1041,16 @@ def start(source_repo: Path, ref: str, receipt: Path, *, temp_parent: Path | Non
     with ownership_lock(receipt_key):
         return start_serialized(source_repo, ref, receipt, temp_parent=temp_parent,
                                 port=port, runtime=runtime, lifetime=lifetime,
-                                memory_mib=memory_mib, tasks=tasks)
+                                memory_mib=memory_mib, tasks=tasks, project=project,
+                                native_harnesses=native_harnesses, preview=preview)
 
 
 def start_serialized(source_repo: Path, ref: str, receipt: Path, *,
                      temp_parent: Path | None, port: int | None, runtime: str,
-                     lifetime: int, memory_mib: int, tasks: int) -> dict[str, Any]:
+                     lifetime: int, memory_mib: int, tasks: int,
+                     project: tuple[dict, bytes] | None = None,
+                     native_harnesses: tuple[str, ...] | None = None,
+                     preview: bool = False) -> dict[str, Any]:
     if runtime not in {"none", "experimental"}:
         raise FixtureError("RUNTIME_UNAVAILABLE", "unknown fixture runtime mode")
     limits = validate_limits(lifetime, memory_mib, tasks)
@@ -952,13 +1067,28 @@ def start_serialized(source_repo: Path, ref: str, receipt: Path, *,
     fid = uuid.uuid4().hex
     with ownership_lock(fid):
         return start_locked(source_repo, sha, raw, receipt, temp_parent=temp_parent,
-                            port=selected_port, runtime=runtime, limits=limits, fixture_id=fid)
+                            port=selected_port, runtime=runtime, limits=limits, fixture_id=fid,
+                            project=project, native_harnesses=native_harnesses, preview=preview)
 
 
 def start_locked(source_repo: Path, sha: str, raw: bytes, receipt: Path, *,
                  temp_parent: Path | None, port: int, runtime: str,
-                 limits: dict[str, int], fixture_id: str) -> dict[str, Any]:
+                 limits: dict[str, int], fixture_id: str,
+                 project: tuple[dict, bytes] | None = None,
+                 native_harnesses: tuple[str, ...] | None = None,
+                 preview: bool = False) -> dict[str, Any]:
     fid = fixture_id
+    if type(preview) is not bool or (preview and native_harnesses != ('codex',)):
+        raise FixtureError('RUNTIME_UNAVAILABLE', 'preview requires the captured Codex-only profile')
+    if native_harnesses is not None and native_harnesses not in {('codex',), ('claude',), ('codex', 'claude')}:
+        raise FixtureError('RUNTIME_UNAVAILABLE', 'invalid captured native harness set')
+    if project is not None:
+        project_info, project_bytes = project
+        validate_project_info(project_info)
+        validate_project(project_bytes)
+        if (not SHA_RE.fullmatch(str(project_info.get('commit', '')))
+                or project_info.get('archive_sha256') != hashlib.sha256(project_bytes).hexdigest()):
+            raise FixtureError('PROJECT_INVALID', 'committed project binding differs')
     parent = Path(temp_parent or tempfile.gettempdir()).resolve()
     root = parent / f"{PREFIX}{fid}"
     root.mkdir(mode=0o700)
@@ -973,6 +1103,12 @@ def start_locked(source_repo: Path, sha: str, raw: bytes, receipt: Path, *,
         "receipt": str(receipt), "status": "preparing", "cleanup": {"complete": False},
         "expires_at":time.time()+limits["lifetime_seconds"],
     }
+    if preview:
+        record['preview'] = True
+    if native_harnesses is not None:
+        record['native_harnesses'] = list(native_harnesses)
+    if project is not None:
+        record['project'] = project[0]
     try:
         write_json(root / MARKER, identity(record))
         save(record, receipt)
@@ -984,6 +1120,8 @@ def start_locked(source_repo: Path, sha: str, raw: bytes, receipt: Path, *,
     try:
         with tarfile.open(fileobj=io.BytesIO(raw)) as tar:
             tar.extractall(root, filter="data")
+        if project is not None:
+            extract_project(root, project[1])
         for name in SOURCE_FILES:
             if not (root / name).is_file() or (root / name).is_symlink():
                 raise FixtureError("SOURCE_INVALID", f"required source file is missing: {name}")
@@ -1070,6 +1208,23 @@ def verified_bootstrap_root(root: Path, bootstrap: Path) -> tuple[Path, dict[str
     return caller_root, trusted
 
 
+def preview_html(record: dict, response: tuple) -> tuple:
+    """Explicit fixture-only evaluation label; source UI bytes stay immutable."""
+    status, headers, body = response
+    if (record.get('preview') is not True or record.get('native_harnesses') != ['codex']
+            or status != 200 or not isinstance(body, bytes) or b'<body>' not in body):
+        return response
+    expiry = html.escape(time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime(record['expires_at'])))
+    banner = ('<aside role="note" style="padding:12px;background:#4c3509;color:#fff">'
+              'Isolated native Chat preview · expires ' + expiry +
+              ' · Stop/restart deletes chats and project edits. '
+              'Codex gpt-6.1-sol/high; Claude setup pending; Sprints unavailable. '
+              'Native controls depend on measured capability.</aside>')
+    decorated = body.replace(b'<body>', b'<body>' + banner.encode(), 1)
+    headers = [(key, value) for key, value in headers if key.lower() != 'content-length']
+    return status, headers, decorated
+
+
 def bootstrap_repository(root: Path) -> str:
     """Fresh synthetic Git ancestry; never fetch/modify the source checkout."""
     (root / ".gitignore").write_text(
@@ -1078,7 +1233,7 @@ def bootstrap_repository(root: Path) -> str:
         ".super-coder/*.db*\n.super-coder/instance.json\n.super-coder/db_backups/\n"
         ".super-coder/__pycache__/\n**/__pycache__/\nnode_modules/\n")
     command(["git","-C",str(root),"init","-q","-b","main"])
-    command(["git","-C",str(root),"add","sc",".super-coder",".gitignore"])
+    command(["git","-C",str(root),"add","--all"])
     command(["git","-C",str(root),"-c","user.name=GUI fixture","-c","user.email=fixture@example.invalid",
              "-c","commit.gpgsign=false","commit","--no-verify","-qm","Synthetic exact-archive fixture"])
     upstream = root / "synthetic-upstream/subfloor.git"
@@ -1214,7 +1369,10 @@ def serve(root: Path, *, resume: bool=False) -> int:
                 "inherited_control_plane_environment": any(
                     name.startswith("SC_") and name != "SC_BIND" for name in os.environ),
             }).encode())
-        return base_dispatch(method, path, headers_raw, body)
+        response = base_dispatch(method, path, headers_raw, body)
+        if method == 'GET' and path in {'/', '/index.html'}:
+            return preview_html(trusted, response)
+        return response
 
     server.start_runtime_services = start_selected
     server.dispatch_http = dispatch
