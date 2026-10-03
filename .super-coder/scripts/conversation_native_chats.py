@@ -7,6 +7,7 @@ scope is retained in every projected observation and control request.
 from __future__ import annotations
 
 import json
+import sqlite3
 import threading
 import time
 import uuid
@@ -16,7 +17,12 @@ from typing import Any
 
 import conversation_events
 import db_driver
-from conversation_runtime import RuntimeClient, RuntimeStore
+from conversation_runtime import (
+    RuntimeClient,
+    RuntimeStore,
+    attach_connection,
+    remaining,
+)
 from conversation_runtime_contract import (
     RuntimeContractError,
     payload_digest,
@@ -812,24 +818,43 @@ class NativeChatsService:
         self.starts.shutdown(wait=False,cancel_futures=True)
         # Native descriptors/controllers remain owned by their finite units.
 
-    def attach(self, generation: str) -> tuple[RuntimeClient,int,int]:
-        with self.lock:
-            if generation not in self.clients:
-                native = next((n for n in self.supervisor.inventory() if n['generation_id']==generation and n.get('status')=='active'),None)
-                if native is None:
-                    raise RuntimeContractError('CLEANUP_PENDING','captured controller is not available; ownership remains retained')
-                con = db_driver.connect(str(self.database))
-                try:
-                    row = con.execute('SELECT owner_user_id,shell_id FROM conversation_runtime_generations WHERE generation_id=?',(generation,)).fetchone()
-                finally:
-                    con.close()
-                if row is None:
-                    raise RuntimeContractError('RUNTIME_NOT_OWNED','controller has no canonical generation')
-                client = RuntimeClient(Path(native['endpoint']),generation,controller_pid=native['main_pid'],controller_start_ticks=native['main_pid_start_ticks'],consumer=self.consumer)
-                self.clients[generation] = client,int(row['owner_user_id']),int(row['shell_id'])
-            value = self.clients[generation]
-        value[0].attach(self.store,value[1],value[2])
-        return value
+    def attach(self, generation: str, *, deadline: float | None=None) -> tuple[RuntimeClient,int,int]:
+        end=min(deadline,time.monotonic()+10) if deadline is not None else time.monotonic()+10
+        if not self.lock.acquire(timeout=remaining(end)):
+            raise RuntimeContractError('DEADLINE_EXPIRED','controller attach lock budget expired')
+        try:
+            if self.supervisor is None:
+                raise RuntimeContractError("CLEANUP_PENDING","controller supervisor unavailable; ownership retained")
+            native=self.supervisor.listener_identity(generation,deadline=end)
+            con=attach_connection(self.database,end)
+            try:
+                row=con.execute('SELECT owner_user_id,shell_id FROM conversation_runtime_generations WHERE generation_id=?',(generation,)).fetchone()
+            finally:
+                con.close()
+            if row is None:
+                raise RuntimeContractError('RUNTIME_NOT_OWNED','controller has no canonical generation')
+            client=RuntimeClient(Path(native['endpoint']),generation,controller_pid=native['main_pid'],controller_start_ticks=native['main_pid_start_ticks'],consumer=self.consumer)
+            old=self.clients.get(generation)
+            if old is not None:
+                if (old[1:]!=(int(row['owner_user_id']),int(row['shell_id']))
+                        or old[0].endpoint!=client.endpoint or old[0].controller_pid!=client.controller_pid
+                        or old[0].controller_start_ticks!=client.controller_start_ticks):
+                    raise RuntimeContractError('OWNERSHIP_INVALID','captured API client identity changed')
+                client=old[0]
+            client.wait_listener(deadline=end,endpoint_device=native['endpoint_device'],endpoint_inode=native['endpoint_inode'])
+            if self.supervisor.listener_identity(generation,deadline=end)!=native:
+                raise RuntimeContractError('OWNERSHIP_INVALID','controller listener changed before attach')
+            remaining(end)
+            value=(client,int(row['owner_user_id']),int(row['shell_id']))
+            # Existing client serialization spans readiness and the single
+            # lease write. Concurrent first consumers cannot fence each other.
+            client.attach(self.store,value[1],value[2],deadline=end)
+            self.clients[generation]=value
+            return value
+        except sqlite3.Error as exc:
+            raise RuntimeContractError('CLEANUP_PENDING','canonical attach writer unavailable; ownership retained') from exc
+        finally:
+            self.lock.release()
 
     def run(self) -> None:
         while not self.stopped.is_set():

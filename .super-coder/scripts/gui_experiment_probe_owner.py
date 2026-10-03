@@ -157,8 +157,8 @@ class NativeProbeOwner:
                     raise RuntimeContractError('PROBE_ALLOCATION_FENCED','Close fenced probe before launch')
             finally:
                 con.close()
-            self.seat.supervisor.launch(generation)
-        client,owner,shell_id=self.service.attach(generation)
+            self.seat.supervisor.launch(generation,deadline=deadline)
+        client,owner,shell_id=self.service.attach(generation,deadline=deadline)
         # Canonical worktree and private state are siblings beneath the marked
         # synthetic fixture. The boundary is that verified shared seat root;
         # per-probe shell/chat/generation/unit remain independently owned.
