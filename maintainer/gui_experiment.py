@@ -616,6 +616,7 @@ class NativeSupervisor:
         setup=importlib.import_module("claude_setup")
         budget,digest=setup.budget,setup.digest
         budget(deadline)
+        bus=setup.service_bus()
         if not os.isatty(0) or not os.isatty(1):
             raise FixtureError("SETUP_INCONCLUSIVE","native operator terminal required")
         # Reusing a generation is forbidden even if its previous unit exited.
@@ -649,7 +650,9 @@ class NativeSupervisor:
                       '-p','Type=exec','-p','KillMode=control-group','-p','SendSIGKILL=yes',
                       '-p','TimeoutStopSec=1s','-p',f'RuntimeMaxSec={remaining}s',
                       '-p','MemoryMax=2048M','-p','TasksMax=128','-p',f'WorkingDirectory={root}',
-                      '/usr/bin/env','-i','PATH='+os.defpath,sys.executable,'-I',str(helper),'_setup','--receipt',str(self.receipt),
+                      '/usr/bin/env','-i','PATH='+os.defpath,
+                      'XDG_RUNTIME_DIR='+bus['XDG_RUNTIME_DIR'],'DBUS_SESSION_BUS_ADDRESS='+bus['DBUS_SESSION_BUS_ADDRESS'],
+                      sys.executable,'-I',str(helper),'_setup','--receipt',str(self.receipt),
                       '--generation',generation_id,'--executable',str(path),
                       '--sha256',native['setup_executable_sha256'],'--deadline',str(deadline-3)]
                 launcher=subprocess.Popen(argv,env=clean_environment())
@@ -686,6 +689,8 @@ class NativeSupervisor:
                         native['status']='stopped'
                         native['setup_transcript_evidence']=setup.transcript_turn_evidence(
                             Path(native['root']),deadline=deadline)
+                        native['setup_diagnostic']=setup.setup_diagnostic(
+                            Path(native['root']),generation_id,native['setup_helper_sha256'],deadline=deadline)
                         # The unit may have been killed during preparation.
                         # Finalize only its scoped synthetic setup row after
                         # whole-unit exit, retaining failures for review.

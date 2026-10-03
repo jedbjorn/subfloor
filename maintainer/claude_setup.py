@@ -16,6 +16,7 @@ import json
 import math
 import os
 import pty
+import re
 import secrets
 import selectors
 import shlex
@@ -39,6 +40,85 @@ from conversation_runtime_contract import RuntimeContext, RuntimeContractError
 
 MAX_FRAME = 256 * 1024
 MAX_TRANSCRIPT = 2 * 1024 * 1024
+SETUP_PHASES = ('ownership', 'preparation', 'native_start', 'observation')
+SETUP_DIAGNOSTIC_STATES = {'attempted', 'failed', 'returned'}
+SETUP_ERRORS = {'NONE', 'CONTRACT_REFUSED', 'DATABASE_UNAVAILABLE', 'IO_UNAVAILABLE',
+                'SHAPE_INVALID', 'OBSERVATION_UNAVAILABLE'}
+
+
+def service_bus() -> dict[str, str]:
+    """Existing current-user service transport only; never a fallback bus."""
+    runtime = os.environ.get('XDG_RUNTIME_DIR')
+    address = os.environ.get('DBUS_SESSION_BUS_ADDRESS')
+    expected = f'/run/user/{os.getuid()}'
+    if (runtime != expected or not isinstance(address, str) or len(address) > 256
+            or not re.fullmatch(re.escape('unix:path=' + expected + '/bus')
+                                + r'(?:,guid=[a-f0-9]{32})?', address)):
+        raise RuntimeContractError('SETUP_INCONCLUSIVE', 'current user service transport unavailable')
+    directory, socket = Path(expected).lstat(), (Path(expected) / 'bus').lstat()
+    if (not stat.S_ISDIR(directory.st_mode) or directory.st_uid != os.getuid()
+            or stat.S_IMODE(directory.st_mode) != 0o700
+            or not stat.S_ISSOCK(socket.st_mode) or socket.st_uid != os.getuid()):
+        raise RuntimeContractError('SETUP_INCONCLUSIVE', 'current user service transport ownership differs')
+    return {'XDG_RUNTIME_DIR': runtime, 'DBUS_SESSION_BUS_ADDRESS': address}
+
+
+def setup_phase(supervisor, generation: str, phase: str, state: str, code: str) -> None:
+    """Optional immutable private diagnostic; never blocks setup cleanup."""
+    try:
+        if phase not in SETUP_PHASES or state not in SETUP_DIAGNOSTIC_STATES or code not in SETUP_ERRORS:
+            return
+        if not setup_owned(supervisor, generation):
+            return
+        fixture = fixture_module()
+        record = fixture.verify_receipt(supervisor.receipt)
+        fixture.verify_root(record)
+        native = next(n for n in record['native_units'] if n['generation_id'] == generation)
+        fixture.verify_native(record, native)
+        budget(native['setup_deadline'])
+        write_private(Path(native['root']) / f'claude-setup-phase-{phase}-{state}.json',
+                      {'generation': generation, 'helper_sha256': digest(Path(__file__).resolve()),
+                       'phase': phase, 'state': state, 'code': code})
+    except (OSError, ValueError, RuntimeError, KeyError, TypeError, StopIteration):
+        pass
+
+
+def setup_diagnostic(state_root: Path, generation: str, helper_sha256: str, *, deadline: float) -> dict[str, str]:
+    """Bounded same-generation private records; output only fixed enums."""
+    result = {'phase': 'unavailable', 'state': 'unavailable', 'code': 'UNAVAILABLE'}
+    try:
+        budget(deadline)
+        root_info = state_root.lstat()
+        if not stat.S_ISDIR(root_info.st_mode) or root_info.st_uid != os.getuid() or stat.S_IMODE(root_info.st_mode) != 0o700:
+            return result
+        for phase in SETUP_PHASES:
+            for state in ('attempted', 'returned', 'failed'):
+                budget(deadline)
+                path = state_root / f'claude-setup-phase-{phase}-{state}.json'
+                if not path.exists() and not path.is_symlink():
+                    continue
+                with os.fdopen(os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK), 'rb') as stream:
+                    before = os.fstat(stream.fileno())
+                    if not stat.S_ISREG(before.st_mode) or before.st_uid != os.getuid() or stat.S_IMODE(before.st_mode) != 0o600 or before.st_size > 512:
+                        return {'phase': 'unavailable', 'state': 'unavailable', 'code': 'UNAVAILABLE'}
+                    raw = stream.read(513)
+                    after = os.fstat(stream.fileno())
+                current = path.lstat()
+                if len(raw) != before.st_size or len(raw) > 512 or (before.st_dev, before.st_ino, before.st_mtime_ns, before.st_size) != (after.st_dev, after.st_ino, after.st_mtime_ns, after.st_size) or (current.st_dev, current.st_ino) != (before.st_dev, before.st_ino):
+                    return {'phase': 'unavailable', 'state': 'unavailable', 'code': 'UNAVAILABLE'}
+                value = json.loads(raw)
+                if (not isinstance(value, dict) or set(value) != {'generation', 'helper_sha256', 'phase', 'state', 'code'}
+                        or value['generation'] != generation or value['helper_sha256'] != helper_sha256
+                        or value['phase'] != phase or value['state'] != state or value['code'] not in SETUP_ERRORS):
+                    return {'phase': 'unavailable', 'state': 'unavailable', 'code': 'UNAVAILABLE'}
+                result = {key: value[key] for key in ('phase', 'state', 'code')}
+        budget(deadline)
+        current_root = state_root.lstat()
+        if (root_info.st_dev, root_info.st_ino) != (current_root.st_dev, current_root.st_ino):
+            return {'phase': 'unavailable', 'state': 'unavailable', 'code': 'UNAVAILABLE'}
+        return result
+    except (OSError, ValueError, RuntimeError, TypeError, KeyError):
+        return {'phase': 'unavailable', 'state': 'unavailable', 'code': 'UNAVAILABLE'}
 
 def fixture_module():
     # A copied fixture has the hash-bound maintainer bootstrap, never a host
@@ -389,7 +469,7 @@ def run_setup(context: RuntimeContext, main_root: Path, *, verify_owned: Callabl
         budget(deadline)
         child = subprocess.Popen([sys.executable, '-I', str(Path(__file__).resolve()), '_child', '--gate-fd', str(read_fd)],
                                  stdin=slave, stdout=slave, stderr=slave, pass_fds=(read_fd,),
-                                 env={'PATH': os.defpath}, start_new_session=True)
+                                 env={'PATH': os.defpath, **service_bus()}, start_new_session=True)
         os.close(read_fd); read_fd = -1
         os.close(slave); slave = -1
         ticks, group = process(child.pid)
@@ -604,15 +684,32 @@ def setup_unit(receipt: Path,generation: str,executable: Path,sha256: str,deadli
     while not setup_owned(supervisor,generation):
         budget(deadline)
         time.sleep(.02)
+    bus = service_bus()
     os.environ.clear()
-    os.environ.update(HOME=str(root/'home'),PATH=os.defpath,PYTHONUNBUFFERED='1',SC_USER='fixture-operator')
-    context=prepare_claude_setup_context(supervisor,generation,executable,sha256,deadline-2)
+    os.environ.update(HOME=str(root/'home'),PATH=os.defpath,PYTHONUNBUFFERED='1',SC_USER='fixture-operator', **bus)
+    phase = 'preparation'
+    context = None
     try:
-        return run_setup(context,root,verify_owned=lambda:setup_owned(supervisor,generation),
+        setup_phase(supervisor, generation, phase, 'attempted', 'NONE')
+        context=prepare_claude_setup_context(supervisor,generation,executable,sha256,deadline-2)
+        phase = 'native_start'
+        setup_phase(supervisor, generation, phase, 'attempted', 'NONE')
+        result = run_setup(context,root,verify_owned=lambda:setup_owned(supervisor,generation),
                          record_child=lambda pid,ticks,group:record_setup_child(supervisor,generation,pid,ticks,group),
                          deadline=deadline-2)
+        setup_phase(supervisor, generation, 'observation', 'returned', 'NONE')
+        return result
+    except (OSError, ValueError, RuntimeError, KeyError, TypeError, sqlite3.Error) as error:
+        code = ('CONTRACT_REFUSED' if isinstance(error, RuntimeContractError)
+                else 'DATABASE_UNAVAILABLE' if isinstance(error, sqlite3.Error)
+                else 'IO_UNAVAILABLE' if isinstance(error, OSError)
+                else 'SHAPE_INVALID' if isinstance(error, (ValueError, KeyError, TypeError))
+                else 'OBSERVATION_UNAVAILABLE')
+        setup_phase(supervisor, generation, phase, 'failed', code)
+        raise
     finally:
-        close_setup_conversation(root/'.super-coder/shell_db.db',context.conversation_id,root,generation)
+        if context is not None:
+            close_setup_conversation(root/'.super-coder/shell_db.db',context.conversation_id,root,generation)
 
 
 def main() -> int:
@@ -637,7 +734,7 @@ def main() -> int:
         else:
             setup_unit(args.receipt,args.generation,args.executable,args.sha256,args.deadline)
         return 0
-    except (OSError, ValueError, RuntimeError, KeyError, TypeError):
+    except (OSError, ValueError, RuntimeError, KeyError, TypeError, sqlite3.Error):
         # Native command-hook errors can fail open. No turn is sent by setup;
         # later driver readiness separately requires its own actual owned hook.
         print('Experimental setup observation is inconclusive.', file=sys.stderr)

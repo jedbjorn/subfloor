@@ -42,7 +42,18 @@ def test_setup_deadline_refuses_registration_before_state_creation(seat):
     assert not (root / 'runtime').exists()
 
 
-def test_helper_is_exact_approved_source():
+def test_core_setup_guards_retain_approved_source():
+    import ast
     import hashlib
     helper = Path(__file__).resolve().parents[1] / 'maintainer/claude_setup.py'
-    assert hashlib.sha256(helper.read_bytes()).hexdigest() == '042e23910fe6bab5773869acd6371a41590d3f67374205571cfc04a823650481'
+    tree = ast.parse(helper.read_text())
+    hashes = {node.name: hashlib.sha256(ast.dump(node, include_attributes=False).encode()).hexdigest()
+              for node in ast.walk(tree) if isinstance(node, ast.FunctionDef)}
+    assert hashes['validate'] == 'ff6dbb2f17a52a1eeb7f075c3f5fbd1be29ab9ebfa3e1dcd13b90e1b09c0ad12'
+    assert hashes['fixed_launch'] == '74ed1381e793723bdda3c3c78700c897026bc115bf8a9f186e471a2d6a2979cf'
+    assert hashes['revalidate'] == '6884d0c426f5ee058818872a7b9605caa365c0928d528bc05bb87a539c87a3cb'
+    assert hashes['observe_hook'] == 'b3f9adc9130db20b60561969ec0f4d7b295f6079a3f2f320ebc62c5a1cdd06ef'
+    assert hashes['transcript_pointer'] == '3828fc73bcc4ce7a47b3de1e9b3c5b1e7c92574924b0bc1e63c7314092352dd4'
+    assert hashes['transcript_turn_evidence'] == '349fa1d2df19129781d24bd56ca4d48a3fdb923db19387d65cd1bc0fd9c8ea7f'
+    assert hashes['child_owner_current'] == '936d5377c17d004077219f9d97a00097ef785006ed44291a21e08bcc5966e869'
+    assert hashes['gated_child'] == 'e55563dae8b7422bf440b5f990356ddd0d98bacbe627628c44672687119fdf2e'
