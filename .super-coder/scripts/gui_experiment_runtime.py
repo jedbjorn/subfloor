@@ -63,7 +63,7 @@ def semantic_witness(raw: dict) -> dict:
     """Fixed diagnostic scalars only; never journal/native unknown fields."""
     stages={'allocation','startup','first_processing','first_reply','initial_work_inventory',
             'initial_snapshot','root_tagged_pid','child_ancestry','child_terminal','child_tagged_pid',
-            'nonce_recall','stop_reply','stop_terminal','stop_child','finished'}
+            'nonce_recall','stop_reply','stop_terminal','stop_child','sibling_tagged_pid','finished'}
     stage=raw.get('waiting_stage')
     result: dict[str,Any]={'waiting_stage':stage if isinstance(stage,str) and stage in stages else 'unknown'}
     for name in ('first_root_processed','first_final_nonce_matches','first_successful_reply',
@@ -79,9 +79,13 @@ def semantic_witness(raw: dict) -> dict:
     for name in ('first_close_unresolved_work','first_close_unresolved_definitions'):
         if type(raw.get(name)) is int and 0<=raw[name]<=4096:
             result[name]=raw[name]
-    for name in ('root_tagged_pid_candidates','child_tagged_pid_candidates',
-                 'root_owned_pid_matches','child_owned_pid_matches'):
-        if type(raw.get(name)) is int and 0<=raw[name]<=128:
+    for role in ('root','sibling','child'):
+        for suffix in ('tagged_pid_candidates','owned_pid_matches','rejected_pid_output_records'):
+            name=role+'_'+suffix
+            if type(raw.get(name)) is int and 0<=raw[name]<=128:
+                result[name]=raw[name]
+        name=role+'_pid_observation'
+        if isinstance(raw.get(name),str) and raw[name] in {'unobserved','matched','ambiguous','no_owned_match','missing_terminal_output'}:
             result[name]=raw[name]
     for name in ('first_root_terminal_counts','child_terminal_counts'):
         values=raw.get(name)
