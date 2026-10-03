@@ -418,7 +418,7 @@ class NativeFixtureSeat:
                     raise RuntimeContractError('HISTORY_UNAVAILABLE','current owned history preparation service is unavailable')
             elif history_proof is not None:
                 raise RuntimeContractError('HISTORY_NOT_OWNED','history proof has no canonical continuation association')
-            self.selected_worktree(row,allow_missing=history is not None)
+            captured_worktree=self.selected_worktree(row,allow_missing=history is not None)
             binding=json.loads(row['route_binding'])
             route_bindings.validate_v2_binding(binding)
             if binding['selector_binding'].get('proof_state')=='pending_finite_probe':
@@ -585,6 +585,11 @@ class NativeFixtureSeat:
                 if (current.get('role')!='probe' or current_job is None or current_job['status']!='preparing'
                         or current_job['deadline']<=time.time() or current_job['fingerprint_key']!=binding['evidence_digest']):
                     raise RuntimeContractError('PROBE_ROUTE_ONLY','registered finite probe ownership changed before canonical writes')
+            # Source/executable observations above may have changed the path
+            # after its first validation. The final lexical row alone cannot
+            # prove that the captured canonical checkout is still selected.
+            if self.selected_worktree(final,allow_missing=history is not None)!=captured_worktree:
+                raise RuntimeContractError('WORKTREE_INVALID','captured canonical worktree changed before canonical writes')
         finally:con.close()
         if initial:
             run.prepare_launch(shell_id=row['shell_id'],harness=harness,model=row['model'],effort=row['effort'],
@@ -592,7 +597,8 @@ class NativeFixtureSeat:
                 route_binding=binding,binding_digest=digest,boot=BootDirective(conversation_id,'start'))
         plan=prepared_plan(database=self.database,root=self.root,conversation_id=conversation_id,
                            shell_id=row['shell_id'],harness=harness)
-        if plan.argv or plan.model!=row['model'] or plan.effort!=row['effort']:
+        if (plan.argv or plan.model!=row['model'] or plan.effort!=row['effort']
+                or Path(plan.cwd).absolute()!=captured_worktree):
             raise RuntimeContractError('PREPARATION_INVALID','canonical native route preparation differs')
         adapter=run.load_adapter(harness)
         flags=adapter.get('launch_flags',[])

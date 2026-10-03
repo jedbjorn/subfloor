@@ -169,6 +169,24 @@ def test_worktree_alias_created_during_observation_has_no_canonical_writes(seat,
     assert raised.value.code=='WORKTREE_INVALID' and events==[] and not list(external.iterdir())
 
 
+@pytest.mark.parametrize('callback',['fingerprint','loaded_source'])
+def test_postregistration_observations_cannot_alias_the_captured_worktree(seat,tmp_path,callback):
+    value,events,_=seat
+    name='candidate_fingerprint' if callback=='fingerprint' else 'require_loaded_source'
+    original=getattr(value,name)
+    external=tmp_path/'outside-selection';external.mkdir()
+    def mutate(*args,**kwargs):
+        result=original(*args,**kwargs)
+        if events==['register']:
+            selected=value.root/'.sc-worktrees/fx'
+            selected.rmdir();selected.symlink_to(external,target_is_directory=True)
+        return result
+    setattr(value,name,mutate)
+    with pytest.raises(RuntimeContractError) as raised:value.prepare('cv','generation',probe_capabilities=('submission',))
+    assert raised.value.code=='WORKTREE_INVALID'
+    assert events==['register'] and not list(external.iterdir())
+
+
 def test_schema_generation_records_inert_child_before_use_and_reaps_before_return(seat,monkeypatch):
     import time
 
