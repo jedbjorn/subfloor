@@ -147,7 +147,11 @@ def committed_project(repo: Path, ref: str) -> tuple[dict, bytes]:
 def extract_project(root: Path, raw: bytes) -> None:
     members = validate_project(raw)
     # All validation completes before any project mutation, in the new marked
-    # root, before Git/worktrees/API start. Never replace a captured engine file.
+    # subdirectory, before Git/worktrees/API start. Never replace engine files.
+    root = root / 'preview-project'
+    if root.exists() or root.is_symlink():
+        raise FixtureError('PROJECT_INVALID', 'copied project directory already exists')
+    root.mkdir(mode=0o700)
     for member in members:
         target = root / member.name
         if target.exists() or target.is_symlink():
@@ -1228,7 +1232,7 @@ def preview_html(record: dict, response: tuple) -> tuple:
 def bootstrap_repository(root: Path) -> str:
     """Fresh synthetic Git ancestry; never fetch/modify the source checkout."""
     (root / ".gitignore").write_text(
-        ".sc-state/\n.sc-worktrees/\nruntime/\nsynthetic-upstream/\nhome/\nxdg-*/\n"
+        ".sc-state/\n.sc-worktrees/\n/runtime/\nsynthetic-upstream/\nhome/\nxdg-*/\n"
         "fixture_bootstrap.py\n.gui-experiment-owner.json\n*.log\n"
         ".super-coder/*.db*\n.super-coder/instance.json\n.super-coder/db_backups/\n"
         ".super-coder/__pycache__/\n**/__pycache__/\nnode_modules/\n")
@@ -1299,6 +1303,10 @@ def serve(root: Path, *, resume: bool=False) -> int:
             con.execute("INSERT INTO shells(shell_id,display_name,shortname,flavor,system_prompt,user_id,api_key) "
                         "VALUES(?,?,?,'dev','Isolated GUI fixture',?,?)",
                         (sid, short, short, owner, secrets.token_hex(32)))
+            if trusted.get('preview') is True and trusted.get('project') is not None:
+                con.execute('UPDATE shells SET system_prompt=? WHERE shell_id=?', (
+                    ('Isolated native Chat preview. The disposable copied project is in preview-project/ '
+                     'inside your worktree. Work there; leave the engine and control-plane files unchanged.'), sid))
             command(["git","-C",str(root),"worktree","add","--quiet","-b",f"shell/{short}",
                      str(root / ".sc-worktrees" / short)])
         con.commit()

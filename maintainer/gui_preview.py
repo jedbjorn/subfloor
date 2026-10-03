@@ -67,6 +67,40 @@ def private_dir(path: Path) -> None:
         raise PreviewError('preview requires an owner-only real directory')
 
 
+def remove_owned_directory(path: Path, expected: tuple[int, int] | list[int]) -> None:
+    """Delete only the original allocation, using its captured directory fd."""
+    private_dir(path)
+    parent_fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    root_fd = None
+    try:
+        current = os.stat(path.name, dir_fd=parent_fd, follow_symlinks=False)
+        if (current.st_dev, current.st_ino) != tuple(expected):
+            raise PreviewError('preview directory changed; replacement and ownership retained')
+        root_fd = os.open(path.name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent_fd)
+        opened = os.fstat(root_fd)
+        if (opened.st_dev, opened.st_ino) != tuple(expected):
+            raise PreviewError('preview directory changed; replacement and ownership retained')
+        # Traverse through the original fd. A renamed/replaced top-level path
+        # can never redirect recursive deletion into the replacement's files.
+        with os.scandir(root_fd) as entries:
+            for entry in entries:
+                current = os.stat(path.name, dir_fd=parent_fd, follow_symlinks=False)
+                if (current.st_dev, current.st_ino) != tuple(expected):
+                    raise PreviewError('preview directory changed; replacement and ownership retained')
+                if entry.is_dir(follow_symlinks=False):
+                    shutil.rmtree(entry.name, dir_fd=root_fd)
+                else:
+                    os.unlink(entry.name, dir_fd=root_fd)
+        current = os.stat(path.name, dir_fd=parent_fd, follow_symlinks=False)
+        if (current.st_dev, current.st_ino) != tuple(expected):
+            raise PreviewError('preview directory changed; replacement and ownership retained')
+        os.rmdir(path.name, dir_fd=parent_fd)
+    finally:
+        if root_fd is not None:
+            os.close(root_fd)
+        os.close(parent_fd)
+
+
 def fixture_module(base: Path):
     spec = importlib.util.spec_from_file_location('preview_fixture', base / 'gui_experiment.py')
     if spec is None or spec.loader is None:
@@ -98,6 +132,7 @@ def install(source_repo: Path, ref: str, destination: Path,
         raise PreviewError('exact committed source is required')
     # Build from the selected commit, not the launcher's mutable worktree.
     destination.mkdir(mode=0o700)
+    allocation = destination.stat()
     try:
         source = destination / 'source.git'
         source.mkdir(mode=0o700)
@@ -135,7 +170,7 @@ def install(source_repo: Path, ref: str, destination: Path,
                 'project': manifest['project'], 'native_started': False,
                 'command': f'{sys.executable} {helpers / "gui_preview.py"} status --package {destination}'}
     except Exception:
-        shutil.rmtree(destination)
+        remove_owned_directory(destination, (allocation.st_dev, allocation.st_ino))
         raise
 
 
@@ -246,6 +281,9 @@ def summary(package: Path, manifest: dict, fx) -> dict:
                       url=record.get('url'), dev_port=record['port'] + 1 if record['port'] < 65535 else 65534,
                       seconds_remaining=max(0, int(record['expires_at'] - time.time())),
                       workspace=record['root'], cleanup_complete=record.get('cleanup', {}).get('complete') is True)
+        if manifest['project'] is not None:
+            result['project_workspace'] = str(Path(record['root']) / 'preview-project')
+            result['chat_project_relative'] = 'preview-project/'
     return result
 
 
@@ -264,9 +302,10 @@ def operate(package: Path, action: str, port: int | None = None) -> dict:
                     raise PreviewError('cleanup remains unverified; installation retained')
             if action == 'remove':
                 result = {'removed': True, 'cleanup_complete': True, 'source_sha': manifest['source_sha']}
-                # Keep a public cleanup tombstone next to the removed package.
+                # Verify/delete the exact original package before claiming its
+                # removal. An owner replacement during stop remains untouched.
+                remove_owned_directory(package, manifest['directory_identity'])
                 fx.write_json(package.with_name(package.name + '-cleanup.json'), result)
-                shutil.rmtree(package)
                 return result
             if action == 'stop':
                 return summary(package, manifest, fx)

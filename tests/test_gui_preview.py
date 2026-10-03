@@ -2,6 +2,7 @@
 import importlib.util
 import io
 import json
+import os
 import shutil
 import socket
 import subprocess
@@ -119,10 +120,11 @@ def test_project_collision_and_committed_symlink_refused(installed, tmp_path):
         fx.committed_project(project, sha)
     root = tmp_path / 'root'
     root.mkdir()
-    (root / 'app.py').write_text('captured')
-    with pytest.raises(fx.FixtureError, match='collides'):
+    (root / 'preview-project').mkdir()
+    (root / 'preview-project/app.py').write_text('captured')
+    with pytest.raises(fx.FixtureError, match='already exists'):
         fx.extract_project(root, tar_bytes([('app.py', tarfile.REGTYPE, 0o644)]))
-    assert (root / 'app.py').read_text() == 'captured'
+    assert (root / 'preview-project/app.py').read_text() == 'captured'
 
 
 def test_project_size_and_entry_limits_are_preallocation(tmp_path, monkeypatch):
@@ -286,12 +288,12 @@ def test_disposable_project_enters_synthetic_git_and_worktrees_only(installed, t
     fx.bootstrap_repository(root)
     worktree = root / '.sc-worktrees/test'
     fx.command(['git', '-C', str(root), 'worktree', 'add', '--quiet', '-b', 'shell/test', str(worktree)])
-    assert (worktree / 'app.py').read_text() == (project / 'app.py').read_text()
-    (worktree / 'app.py').write_text('disposable edit')
+    assert (worktree / 'preview-project/app.py').read_text() == (project / 'app.py').read_text()
+    (worktree / 'preview-project/app.py').write_text('disposable edit')
     assert (project / 'app.py').read_text() == 'print("preview code")'
     assert git(project, 'rev-parse', 'HEAD') == before
-    assert not (worktree / '.env').exists()
-    assert not (worktree / 'untracked.txt').exists()
+    assert not (worktree / 'preview-project/.env').exists()
+    assert not (worktree / 'preview-project/untracked.txt').exists()
     assert not (root / 'maintainer/gui_preview.py').exists()
 
 
@@ -349,6 +351,69 @@ def test_committed_project_cannot_override_engine_or_managed_boot(installed, tmp
         path.write_text('captured engine identity')
     fx.extract_project(root, raw)
     assert all((root / name).read_text() == 'captured engine identity' for name in fx.SOURCE_FILES)
-    assert (root / 'app.py').read_text() == 'print("preview code")'
+    assert (root / 'preview-project/app.py').read_text() == 'print("preview code")'
     assert not (root / 'AGENTS.md').exists()
     assert not (root / 'opencode.json').exists()
+
+
+def assert_full_engine_project_preparation(tmp_path, project, project_sha):
+    """Actual full engine archive, project archive, Git and linked-worktree path."""
+    source_sha, engine = fx.archive(ROOT, 'HEAD')
+    project_before = git(project, 'rev-parse', 'HEAD')
+    info, raw = fx.committed_project(project, project_sha)
+    root = tmp_path / 'full-engine'
+    root.mkdir(mode=0o700)
+    with tarfile.open(fileobj=io.BytesIO(engine)) as archive:
+        archive.extractall(root, filter='data')
+    before = {str(path.relative_to(root)): preview.digest(path)
+              for path in root.rglob('*') if path.is_file()}
+    assert '.super-coder/ui/app.js' in before and 'sc' in before
+    fx.extract_project(root, raw)
+    assert all(preview.digest(root / name) == value for name, value in before.items())
+    # Keep the project's README byte-exact in its separate directory.
+    project_readme = subprocess.check_output(['git', '-C', str(project), 'show',
+                                             f'{project_sha}:README.md'])
+    assert (root / 'preview-project/README.md').read_bytes() == project_readme
+    assert len([member for member in fx.validate_project(raw) if member.isfile()]) == info['files']
+    fx.bootstrap_repository(root)
+    worktree = root / '.sc-worktrees/preview-test'
+    fx.command(['git', '-C', str(root), 'worktree', 'add', '--quiet', '-b',
+                'shell/preview-test', str(worktree)])
+    assert (worktree / 'preview-project/README.md').read_bytes() == project_readme
+    assert all(preview.digest(worktree / name) == value for name, value in before.items())
+    (worktree / 'preview-project/README.md').write_text('disposable edit')
+    assert subprocess.check_output(['git', '-C', str(project), 'show',
+                                    f'{project_sha}:README.md']) == project_readme
+    assert git(project, 'rev-parse', 'HEAD') == project_before
+    assert source_sha == git(ROOT, 'rev-parse', 'HEAD')
+    return info
+
+
+def test_full_engine_archive_project_readme_is_preserved(installed, tmp_path):
+    _, project, _, _ = installed
+    (project / 'untracked.txt').unlink()
+    (project / 'README.md').write_text('project README must survive')
+    project_sha = commit(project)
+    assert_full_engine_project_preparation(tmp_path, project, project_sha)
+
+
+def test_full_engine_archive_actual_committed_dos_app(tmp_path):
+    repo = os.environ.get('SC_PREVIEW_PROJECT_REPO')
+    if not repo:
+        pytest.skip('explicit committed project seat required')
+    info = assert_full_engine_project_preparation(
+        tmp_path, Path(repo), 'c4cf38ba68ccff9d1e23a1347d4e9e265ca1407e')
+    assert info['files'] == 193
+
+
+def test_owned_package_deletion_unlinks_symlink_without_touching_target(tmp_path):
+    package = tmp_path / 'owned-package'
+    package.mkdir(mode=0o700)
+    foreign = tmp_path / 'foreign'
+    foreign.mkdir()
+    (foreign / 'retained').write_text('unrelated')
+    (package / 'link').symlink_to(foreign, target_is_directory=True)
+    info = package.stat()
+    preview.remove_owned_directory(package, (info.st_dev, info.st_ino))
+    assert not package.exists()
+    assert (foreign / 'retained').read_text() == 'unrelated'
