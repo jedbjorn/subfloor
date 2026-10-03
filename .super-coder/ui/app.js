@@ -4835,6 +4835,9 @@ function chatReviewWorkspace(host, conversation) {
 const chatNativeRequests = new Map();
 // Observational GET coalescing only. These values never grant a native action.
 const chatNativeLatestReads = new Map();
+// Slots survive view/selection replacement until the bounded read settles.
+const chatNativeReferenceReads = new Map();
+const chatNativeReferenceListeners = new Set();
 const CHAT_NATIVE_EVENTS = new Set([
   "runtime.ready", "runtime.setup", "runtime.lost", "ownership.failed",
   "activity.started", "activity.processed", "activity.terminal",
@@ -4990,10 +4993,20 @@ function chatNativeRuntimePanel(host, conversation, { control, refresh, connecti
         read.disabled = true;
         try {
           let observed = chatNativeLatestReads.get(key);
-          if (force || !observed || observed.signal !== signal || observed.signal?.aborted) {
-            observed = { signal, promise: chatRead(`/conversations/native-checks/${encodeURIComponent(ref.check_id)}`, signal) };
-            chatNativeLatestReads.set(key, observed);
-            while (chatNativeLatestReads.size > 64) chatNativeLatestReads.delete(chatNativeLatestReads.keys().next().value);
+          // Refresh never bypasses the exact pending read, including one
+          // whose old view has aborted but whose promise has not settled yet.
+          if (observed?.pending && (observed.signal !== signal || observed.signal?.aborted)) throw new Error("CHECK_READBACK_PENDING");
+          if (!observed?.pending && (force || !observed || observed.signal !== signal || observed.signal?.aborted)) {
+            if (!observed && chatNativeLatestReads.size >= 64) {
+              const settled = [...chatNativeLatestReads].find(([, row]) => !row.pending);
+              if (!settled) throw new Error("CHECK_READBACK_CAPACITY");
+              chatNativeLatestReads.delete(settled[0]);
+            }
+            observed = { signal, pending: true, promise: null };
+            const captured = observed;
+            captured.promise = chatRead(`/conversations/native-checks/${encodeURIComponent(ref.check_id)}`, signal)
+              .finally(() => { captured.pending = false; });
+            chatNativeLatestReads.set(key, captured);
           }
           const value = await observed.promise;
           if (!latest.isConnected || signal?.aborted || chatReadController?.signal !== signal) return;
@@ -5180,7 +5193,9 @@ async function chatNativeNewForm(host, shell, config) {
     discoveryTimer = null; discoveryExpiry = null;
     if (cancelRead) { readAbort?.abort(); readAbort = null; readInFlight = null; }
   };
-  const dispose = () => { stopDiscovery(true); observer?.close(); observer = null; disposal.disconnect(); };
+  let repaintReferenceSlots = null;
+  const dispose = () => { stopDiscovery(true); observer?.close(); observer = null; disposal.disconnect();
+    chatNativeReferenceListeners.delete(repaintReferenceSlots); };
   const disposal = new MutationObserver(() => { if (!alive()) dispose(); });
   disposal.observe(document.body, { childList: true, subtree: true });
   ownerReadController?.signal.addEventListener("abort", dispose, { once: true });
@@ -5352,8 +5367,10 @@ async function chatNativeNewForm(host, shell, config) {
     result = null; save(); paint(); refreshCheck();
   };
   const readReference = (ref) => {
+    if (!alive()) return;
     if (referenceReads.has(ref.check_id)) return referenceReads.get(ref.check_id);
-    if (referenceReads.size >= 4) return;
+    if (chatNativeReferenceReads.has(ref.check_id)) return chatNativeReferenceReads.get(ref.check_id);
+    if (chatNativeReferenceReads.size >= 4) return;
     const capturedSelection = { ...selection }, epoch = referencesEpoch;
     const job = chatRead(`/conversations/native-checks/${encodeURIComponent(ref.check_id)}`, ownerReadController?.signal)
       .then((value) => {
@@ -5366,10 +5383,11 @@ async function chatNativeNewForm(host, shell, config) {
       }).finally(() => {
         if (referenceReads.get(ref.check_id) === job) {
           referenceReads.delete(ref.check_id);
-          if (alive() && epoch === referencesEpoch) paintReferences();
         }
+        if (chatNativeReferenceReads.get(ref.check_id) === job) chatNativeReferenceReads.delete(ref.check_id);
+        for (const repaint of chatNativeReferenceListeners) repaint();
       });
-    referenceReads.set(ref.check_id, job); paintReferences(); return job;
+    referenceReads.set(ref.check_id, job); chatNativeReferenceReads.set(ref.check_id, job); paintReferences(); return job;
   };
   const paintReferences = () => {
     references.replaceChildren(el("h3", {}, "Saved compatibility checks"));
@@ -5391,7 +5409,7 @@ async function chatNativeNewForm(host, shell, config) {
           ? `${observed.state} · ${Object.entries(observed.grades || {}).map(([k, v]) => `${k}: ${v}`).join(" · ")}`
           : `${ref.state} · read the owned result for setup, cleanup and admission.`));
       const read = el("button", { type: "button", className: "act", textContent: "Read saved check",
-        disabled: referenceReads.has(ref.check_id) || referenceReads.size >= 4 });
+        disabled: chatNativeReferenceReads.has(ref.check_id) || chatNativeReferenceReads.size >= 4 });
       read.onclick = () => readReference(ref); card.append(read);
       const use = el("button", { type: "button", className: "act", textContent: "Use saved check result",
         disabled: retainedCreate() || manualUnknown() });
@@ -5424,7 +5442,7 @@ async function chatNativeNewForm(host, shell, config) {
     observer?.close(); observer = null;
     const candidate = candidates[Number(choice.value)];
     selection = candidate && { harness: candidate.harness, model: candidate.model, effort: candidate.effort };
-    referencesEpoch++; referenceResults.clear(); referenceReads.clear();
+    referencesEpoch++; referenceResults.clear();
     result = null; intent = null; manualIntent = null; manualResult = null; adoptedIntent = null;
     try {
       const stored = JSON.parse(sessionStorage.getItem(storageKey()));
@@ -5500,6 +5518,8 @@ async function chatNativeNewForm(host, shell, config) {
   if (main) form.append(el("p", {}, "Trust the validated canonical main repository. Its linked worktrees share workspace trust; each runtime requests local-channel consent separately."), el("code", {}, main));
   form.append(choice, status, check, readback, probe, created, title, start, refreshReferences, references);
   host.replaceChildren(form);
+  repaintReferenceSlots = () => { if (alive()) paintReferences(); };
+  chatNativeReferenceListeners.add(repaintReferenceSlots);
   choice.onchange();
 }
 

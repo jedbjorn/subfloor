@@ -78,3 +78,19 @@ def test_actual_app_synthetic_browser_adopts_only_get_references():
     receipt = json.loads(result.stdout.strip().splitlines()[-1])
     assert len(receipt['cases']) == 16
     assert receipt['native_processes'] == receipt['inference_turns'] == 0
+
+
+def test_pending_saved_and_latest_reads_keep_their_actual_admission_bounds():
+    if not shutil.which('node'):
+        pytest.skip('Node required')
+    check = subprocess.run(['node','-e',"require(process.env.SC_PLAYWRIGHT_MODULE || 'playwright')"],
+        capture_output=True,text=True,check=False)
+    if check.returncode:
+        pytest.skip('Named Playwright module required')
+    result = subprocess.run(['node',str(ROOT/'tests/browser/native_check_pending.cjs'),str(ROOT)],
+        capture_output=True,text=True,check=False,timeout=30,env=os.environ.copy())
+    assert result.returncode == 0, result.stdout+result.stderr
+    receipt = json.loads(result.stdout.strip().splitlines()[-1])
+    assert len(receipt['cases']) == 2 and receipt['posts'] == receipt['native'] == 0
+    assert receipt['cases'][0]['maxActive'] <= 4
+    assert receipt['cases'][1]['maxActive'] <= 64
