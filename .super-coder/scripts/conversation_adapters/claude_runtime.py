@@ -53,6 +53,7 @@ CHANNEL = "subfloor_runtime"
 REVISION = "f89-claude-foreground-v3"
 ASSETS = Path(__file__).resolve().parents[2] / "assets/runtime/claude"
 MAX_RECORDS = 4096
+MAX_SNAPSHOT_ROWS = 64
 MAX_NOTIFICATIONS = 64
 TEXT_CHUNK = 4000
 STARTUP_BYTES = 8192
@@ -703,6 +704,8 @@ class ClaudeRuntimeDriver(RuntimeDriver):
             work_id = target.work_id
             if not work_id or work_id not in self._work:
                 return WriteReceipt("rejected", detail="target lacks observed owned work provenance")
+            if self._work[work_id].state in {"completed", "stopped", "failed", "deleted", "absent_from_snapshot"}:
+                return WriteReceipt("not_written", detail="observed work already terminal or absent; reconcile without replay")
             kind = self._work[work_id].kind
             if (command.action == "stop_work" and kind != "terminal") or (command.action == "stop_automation" and kind != "automation"):
                 return WriteReceipt("unsupported", detail="this native work type lacks proved individual control")
@@ -1026,59 +1029,67 @@ class ClaudeRuntimeDriver(RuntimeDriver):
 
     def _snapshot(self, event: Mapping[str, Any]) -> None:
         tasks, crons = event.get("background_tasks"), event.get("session_crons")
-        if not isinstance(tasks, list) or not isinstance(crons, list):
-            self._snapshot_partial = True
-            return
         observed = time.time()
+        prompt_id = _string(event.get("prompt_id"), 255)
+        is_stop = event.get("hook_event_name") == "Stop"
+        provenance = "claude:Stop-snapshot" if is_stop else "claude:SubagentStop-snapshot"
         seen: set[str] = set()
-        partial = False
-        for row in tasks + crons:
-            if not isinstance(row, Mapping) or not _string(row.get("id")):
+        partial = not isinstance(tasks, list) or not isinstance(crons, list)
+        prepared: list[NativeWork] = []
+        rows = tasks + crons if isinstance(tasks, list) and isinstance(crons, list) else []
+        if len(rows) > MAX_SNAPSHOT_ROWS:
+            partial = True
+        for row in rows[:MAX_SNAPSHOT_ROWS]:
+            if not isinstance(row, Mapping) or not _string(row.get("id"), 255):
                 partial = True
                 continue
             work_id = row["id"]
-            if work_id not in self._work and len(self._work) >= MAX_RECORDS:
+            if work_id in seen or work_id not in self._work and len(self._work) + len(prepared) >= MAX_RECORDS:
                 partial = True
                 continue
             seen.add(work_id)
             existing = self._work.get(work_id)
             kind: Any = "automation" if "schedule" in row else "terminal" if row.get("type") == "shell" else "task"
-            kind_partial = bool(kind == "task" and existing and existing.kind in {"terminal", "automation"})
-            if kind_partial and existing is not None:
-                # An incomplete/unsupported snapshot row cannot erase a kind
-                # established by an attributable native tool result.
-                kind = existing.kind
-                partial = True
+            if kind == "task" and existing and existing.kind in {"terminal", "automation"}:
+                kind, partial = existing.kind, True
             data = _metadata({k: row[k] for k in ("description", "command", "schedule", "prompt", "recurring") if k in row})
             partial = partial or data.get("metadata_truncated") is True
             if kind == "automation":
                 self._definitions.setdefault(work_id, None)
-            conflicting = bool(existing and existing.state in {"completed", "stopped", "failed", "deleted"})
-            state = "unknown_conflicting_snapshot" if conflicting else str(row.get("status", "scheduled" if kind == "automation" else "unknown"))
-            self._work[work_id] = NativeWork(self._reference(work=work_id), kind, state,
-                "claude:Stop-snapshot", observed, durable=self._definitions.get(work_id), data=data)
-            self._send_event(RuntimeEvent("work.observed", reference=self._reference(work=work_id),
-                provenance="claude:Stop-snapshot", freshness="last_observed", partial=kind_partial,
-                grade="compatible", data=data | {"kind": kind, "state": self._work[work_id].state}))
-            if conflicting:
-                partial = True  # Conflicting late snapshot never silently revives a terminal.
-        for work_id, work in list(self._work.items()):
-            if work.kind == "child":
-                continue  # Stop's arrays are not a complete native agent registry.
-            if not partial and work_id not in seen and work.state not in {"completed", "stopped", "failed", "deleted"}:
-                self._work[work_id] = NativeWork(work.reference, work.kind, "absent_from_snapshot",
-                    "claude:Stop-snapshot", observed, durable=work.durable, data=work.data)
+            state = _string(row.get("status"))
+            if state is None:
+                state, partial = "unknown", True
+            if existing and existing.state in {"completed", "stopped", "failed", "deleted"}:
+                state, partial = "unknown_conflicting_snapshot", True
+            prepared.append(NativeWork(self._reference(prompt_id, work=work_id), kind, state,
+                provenance, observed, freshness="last_observed", durable=self._definitions.get(work_id), data=data))
+        # Qualify the entire consumed array before publishing any eligible row.
+        # A later malformed sibling must also withdraw the earlier row's control.
+        for work in prepared:
+            work = replace(work, data=dict(work.data) | {"snapshot_complete": not partial})
+            assert work.reference.work_id
+            self._work[work.reference.work_id] = work
+            self._send_event(RuntimeEvent("work.observed", reference=work.reference,
+                provenance=provenance, observed_at=observed, freshness="last_observed", partial=partial,
+                grade="compatible", data=dict(work.data) | {"kind": work.kind, "state": work.state}))
+        if not partial:
+            for work_id, work in list(self._work.items()):
+                if work.kind != "child" and work_id not in seen and work.state not in {"completed", "stopped", "failed", "deleted"}:
+                    self._work[work_id] = replace(work, state="absent_from_snapshot", provenance=provenance,
+                        observed_at=observed, freshness="last_observed")
         self._snapshot_at, self._snapshot_partial = observed, partial
         for control_id, (work_id, success, result_prompt) in list(self._pending_results.items()):
-            if not partial and success and result_prompt and event.get("prompt_id") == result_prompt and work_id not in seen:
-                self._work_terminal(work_id, "stopped", "claude:native-result+later-snapshot")
+            result_work = self._work.get(work_id)
+            if (is_stop and not partial and success and result_prompt and prompt_id == result_prompt and work_id not in seen
+                    and result_work is not None and result_work.state not in {"completed", "failed", "stopped", "deleted"}):
                 is_automation = self._controls.get(control_id, (None, None))[0] == "CronDelete"
+                self._work_terminal(work_id, "deleted" if is_automation else "stopped", "claude:native-result+later-snapshot")
                 if is_automation:
                     self._definitions.pop(work_id, None)
-                    self._work_terminal(work_id, "deleted", "claude:CronDelete+later-snapshot")
-                self._send_event(RuntimeEvent("control.outcome", reference=self._reference(work=work_id),
+                self._send_event(RuntimeEvent("control.outcome", reference=self._reference(prompt_id, work=work_id),
                     control_id=control_id, provenance="claude:native-result+later-snapshot", grade="compatible",
-                    data={"outcome": "complete", "native_outcome": "native_deleted" if is_automation else "native_stopped", "os_verified": False}))
+                    data={"outcome": "complete", "native_outcome": "native_deleted" if is_automation else "native_stopped",
+                          "snapshot_observed_at": observed, "snapshot_complete": True, "os_verified": False}))
                 del self._pending_results[control_id]
         for activity in self._activities.values():
             work_id = activity.automation_id
@@ -1086,9 +1097,9 @@ class ClaudeRuntimeDriver(RuntimeDriver):
             if not partial and work_id and scheduled_work and activity.terminal and work_id not in seen and scheduled_work.durable is False and scheduled_work.data.get("recurring") is False:
                 self._definitions.pop(work_id, None)
                 self._work_terminal(work_id, "completed", "claude:oneshot-native-turn+later-snapshot")
-        self._send_event(RuntimeEvent("snapshot.observed", reference=self._reference(),
-            provenance="claude:Stop-snapshot", freshness="last_observed", partial=partial,
-            grade="compatible", data={"work_ids": sorted(seen), "observed_at": observed}))
+        self._send_event(RuntimeEvent("snapshot.observed", reference=self._reference(prompt_id),
+            provenance=provenance, observed_at=observed, freshness="last_observed", partial=partial,
+            grade="compatible", data={"work_ids": sorted(seen), "observed_at": observed, "snapshot_complete": not partial}))
 
     def _tool(self, event: Mapping[str, Any], prompt_id: str | None) -> None:
         tool, tool_id = _string(event.get("tool_name")), _string(event.get("tool_use_id"))
@@ -1117,7 +1128,7 @@ class ClaudeRuntimeDriver(RuntimeDriver):
                     control_id=control_id, provenance="claude:PostToolUseFailure", grade="inconclusive",
                     data={"outcome": "native_failed"}))
             return
-        if tool == "Bash" and _string(response.get("backgroundTaskId")):
+        if tool == "Bash" and name == "PostToolUse" and _string(response.get("backgroundTaskId")):
             work_id = response["backgroundTaskId"]
             self._work[work_id] = NativeWork(self._reference(prompt_id, work=work_id), "terminal", "running",
                 "claude:Bash-PostToolUse", time.time(), grade="compatible", data=_metadata({
@@ -1139,13 +1150,22 @@ class ClaudeRuntimeDriver(RuntimeDriver):
             control_id = self._control_tools.get(prompt_id or "")
             work_id = args.get("task_id")
             if control_id and self._controls.get(control_id) == ("TaskStop", work_id):
+                # Native PostToolUse is the tool-success hook. The installed
+                # TaskStop result has no status field; do not invent one or use
+                # narration as a success signal. Optional supplied status must
+                # be a bounded supported failure, never an arbitrary object.
+                status = response.get("status")
+                status_valid = "status" not in response or status in ("failed", "error")
+                work = self._work.get(str(work_id))
                 success = (name == "PostToolUse" and response.get("task_id") == work_id
-                    and response.get("task_type") == "local_bash" and not response.get("error")
-                    and response.get("status") not in {"failed", "error"})
+                    and response.get("task_type") == "local_bash" and "error" not in response
+                    and status_valid and "status" not in response and work is not None
+                    and work.state not in {"completed", "stopped", "failed", "deleted", "absent_from_snapshot"})
                 self._pending_results[control_id] = (str(work_id), success, prompt_id)
+                result = {"task_id": str(work_id), "task_type": "local_bash"} if success else {}
                 self._send_event(RuntimeEvent("control.acknowledged", reference=self._reference(prompt_id, work=str(work_id)),
-                    control_id=control_id, provenance="claude:TaskStop-PostToolUse", grade="compatible" if success else "inconclusive",
-                    data={"native_result": {k: response[k] for k in ("task_id", "task_type", "status") if k in response},
+                    control_id=control_id, provenance=f"claude:TaskStop-{name}", grade="compatible" if success else "inconclusive",
+                    data={"native_result": result, "tool_use_id": tool_id,
                           "outcome": "pending_snapshot" if success else "inconclusive"}))
         elif tool == "CronDelete":
             control_id = self._control_tools.get(prompt_id or "")

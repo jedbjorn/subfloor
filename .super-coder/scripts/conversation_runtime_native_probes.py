@@ -433,6 +433,9 @@ class NativeProbeFactory:
     def _exercise(native: RuntimeDriver, capabilities: frozenset[str], deadline: float) -> Mapping[str, CapabilityEvidence]:
         if not isinstance(native, ControllerProbeDriver):
             raise RuntimeContractError("PROBE_DRIVER_INVALID", "owned controller proxy required")
+        if native.harness == "claude":
+            from conversation_runtime_claude_probe import ClaudeScenarios
+            return ClaudeScenarios(native, capabilities, deadline).run()
         return _Scenarios(native, capabilities, deadline).run()
 
 

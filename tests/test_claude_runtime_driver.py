@@ -562,7 +562,8 @@ def test_user_narration_and_stale_snapshot_cannot_prove_task_stop(seat):
     assert not [event for event in events if event.kind == "control.outcome"]
     hook(seat, "Stop", prompt_id="control-prompt", background_tasks=[], session_crons=[])
     outcome = [event for event in events if event.kind == "control.outcome"][-1]
-    assert outcome.data == {"outcome": "complete", "native_outcome": "native_stopped", "os_verified": False}
+    assert {key: outcome.data[key] for key in ("outcome", "native_outcome", "os_verified")} == {"outcome": "complete", "native_outcome": "native_stopped", "os_verified": False}
+    assert outcome.reference.activity_id == "control-prompt" and outcome.data["snapshot_complete"] is True
     hook(seat, "SubagentStop", background_tasks=[{"id": "task-1", "type": "shell", "status": "running"}], session_crons=[])
     assert driver.inventory(deadline=DEADLINE()).partial
     assert driver._work["task-1"].state == "unknown_conflicting_snapshot"
@@ -926,3 +927,76 @@ def test_reply_chunk_fix_preserves_unknown_bounds_and_readiness_suppression(seat
     driver._output("bounded-prompt", driver._readiness_nonce, "claude:owned-transcript-text", "readiness-item")
     assert driver._activities["bounded-prompt"].readiness_reply
     assert not any(event.kind == "output.final" for event in events)
+
+
+@pytest.mark.parametrize("bad", [None, [None], [{"id": "sibling", "status": []}],
+    [{"id": "sibling", "type": "shell", "status": "running"}]*2])
+def test_whole_snapshot_qualifies_all_rows_before_publishing(seat, bad):
+    _driver, _, events = seat
+    tasks = [{"id": "target", "type": "shell", "status": "running"}]
+    tasks = tasks+bad if isinstance(bad, list) else bad
+    hook(seat, "Stop", prompt_id="snapshot-prompt", background_tasks=tasks, session_crons=[])
+    rows = [e for e in events if e.kind == "work.observed"]
+    assert all(e.partial and e.data["snapshot_complete"] is False for e in rows)
+    observed = [e for e in events if e.kind == "snapshot.observed"][-1]
+    assert observed.partial and observed.reference.activity_id == "snapshot-prompt"
+    assert observed.freshness == "last_observed"
+
+
+@pytest.mark.parametrize("response", [{"message": "stopped"}, {"task_id": "owned", "task_type": "local_bash", "error": "failure"},
+    {"task_id": "owned", "task_type": "local_bash", "status": {}},
+    {"task_id": "owned", "task_type": "local_bash", "status": "stopped"},
+    {"task_id": "other", "task_type": "local_bash"}])
+def test_unqualified_taskstop_result_never_exports_or_certifies_success(seat, response):
+    driver, context, events = seat
+    make_ready(seat)
+    driver._context = replace(context, capability_evidence={"stop_work": "compatible"})
+    hook(seat, "PostToolUse", tool_name="Bash", tool_use_id="launch", tool_input={},
+        tool_response={"backgroundTaskId": "owned"})
+    driver.control(NativeControl("stop", 1, "sha", "stop_work", NativeReference(driver._identity.root_id, work_id="owned")), deadline=DEADLINE())
+    hook(seat, "UserPromptSubmit", prompt_id="control", prompt=channel_prompt(seat, "none", control_id="stop"))
+    hook(seat, "PostToolUse", prompt_id="control", tool_name="TaskStop", tool_use_id="tool",
+        tool_input={"task_id": "owned"}, tool_response=response)
+    hook(seat, "Stop", prompt_id="control", background_tasks=[], session_crons=[])
+    ack = [e for e in events if e.kind == "control.acknowledged"][-1]
+    assert ack.grade == "inconclusive" and ack.data["native_result"] == {}
+    assert not any(e.kind == "control.outcome" and e.data.get("outcome") == "complete" for e in events)
+
+
+def test_subagent_snapshot_cannot_certify_root_taskstop_and_completed_race_stays_unproved(seat):
+    driver, context, events = seat
+    make_ready(seat)
+    driver._context = replace(context, capability_evidence={"stop_work": "compatible"})
+    hook(seat, "PostToolUse", tool_name="Bash", tool_use_id="launch", tool_input={},
+        tool_response={"backgroundTaskId": "owned"})
+    driver.control(NativeControl("stop", 1, "sha", "stop_work", NativeReference(driver._identity.root_id, work_id="owned")), deadline=DEADLINE())
+    hook(seat, "UserPromptSubmit", prompt_id="control", prompt=channel_prompt(seat, "none", control_id="stop"))
+    hook(seat, "PostToolUse", prompt_id="control", tool_name="TaskStop", tool_use_id="tool",
+        tool_input={"task_id": "owned"}, tool_response={"task_id": "owned", "task_type": "local_bash"})
+    hook(seat, "SubagentStop", prompt_id="control", background_tasks=[], session_crons=[])
+    assert not any(e.kind == "control.outcome" for e in events)
+    assert [e for e in events if e.kind == "snapshot.observed"][-1].provenance == "claude:SubagentStop-snapshot"
+    driver._work_terminal("owned", "completed", "native:known-completion")
+    hook(seat, "Stop", prompt_id="control", background_tasks=[], session_crons=[])
+    assert not any(e.kind == "control.outcome" for e in events)
+    driver._primary_state = "idle"
+    assert driver.control(NativeControl("again", 2, "sha", "stop_work", NativeReference(driver._identity.root_id, work_id="owned")), deadline=DEADLINE()).state == "not_written"
+
+
+def test_oversized_snapshot_is_bounded_partial_and_cannot_publish_eligible_prefix(seat):
+    driver, _, events = seat
+    rows=[{'id':str(n)+'x'*250,'type':'shell','status':'running'} for n in range(runtime.MAX_SNAPSHOT_ROWS+1)]
+    hook(seat,'Stop',prompt_id='owned',background_tasks=rows,session_crons=[])
+    work=[e for e in events if e.kind=='work.observed']
+    snapshot=[e for e in events if e.kind=='snapshot.observed'][-1]
+    assert len(work)==runtime.MAX_SNAPSHOT_ROWS and all(e.partial for e in work)
+    assert snapshot.partial and len(snapshot.data['work_ids'])==runtime.MAX_SNAPSHOT_ROWS
+    assert len(json.dumps(asdict(snapshot)).encode())<runtime.MAX_FRAME_BYTES//2
+    assert driver.inventory(deadline=DEADLINE()).partial
+
+
+def test_failed_bash_hook_cannot_invent_background_launch(seat):
+    _,_,events=seat
+    hook(seat,'PostToolUseFailure',prompt_id='owned',tool_name='Bash',tool_use_id='failed',
+        tool_input={'command':'finite'},tool_response={'backgroundTaskId':'not-launched'})
+    assert not [e for e in events if e.kind=='work.observed']
