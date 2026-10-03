@@ -637,7 +637,7 @@ def read_sprint_status(root: Path) -> dict:
         if set(result)-allowed or not isinstance(result.get('state'),str):
             raise FixtureError('CLEANUP_UNVERIFIED','private Sprint worker receipt is invalid')
         owner=result.get('owner')
-        if owner is not None and (not isinstance(owner,dict)
+        if 'owner' in result and (not isinstance(owner,dict)
                 or set(owner)!={'pid','start_ticks','unit','control_group'}
                 or any(type(owner.get(k)) is not int or owner[k]<=0 for k in ('pid','start_ticks'))
                 or any(not isinstance(owner.get(k),str) or not 0<len(owner[k])<=1024
@@ -698,14 +698,15 @@ def stop_locked(receipt: Path) -> dict[str, Any]:
                     or status.get('purpose') != SPRINT_PURPOSE or status.get('unit') != record['unit']
                     or status.get('state') not in {'not_started', 'stopped'}):
                 raise FixtureError('CLEANUP_UNVERIFIED', 'Sprint worker or Planner obligations remain retained')
-            if status['state']=='stopped':
+            if status['state']=='stopped' or 'owner' in status:
                 owner=status.get('owner',{})
                 if (owner.get('unit')!=record['unit'] or owner.get('pid')!=record.get('main_pid')
                         or owner.get('start_ticks')!=record.get('main_pid_start_ticks')
-                        or owner.get('control_group')!=record.get('control_group')
-                        or status.get('runtime_joined') is not True
-                        or status.get('cleanup_worker_joined') is not True):
+                        or owner.get('control_group')!=record.get('control_group')):
                     raise FixtureError('CLEANUP_UNVERIFIED','Sprint worker receipt has a stale owner')
+            if status['state']=='stopped' and (status.get('runtime_joined') is not True
+                    or status.get('cleanup_worker_joined') is not True):
+                raise FixtureError('CLEANUP_UNVERIFIED','Sprint worker joins remain unverified')
             # OS exit cannot erase unresolved durable native/artifact obligations.
             module=sprint_helper(root, record['sprint_helper_sha256'])
             if status['state']=='stopped':

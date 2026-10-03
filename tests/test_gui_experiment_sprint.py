@@ -430,7 +430,7 @@ def test_canonical_close_writer_wait_uses_original_absolute_deadline(database):
     finally:release.join(1);blocker.close()
 
 
-@pytest.mark.parametrize('obligation', ['native','artifact','clean'])
+@pytest.mark.parametrize('obligation', ['native','artifact','clean','clean_owned'])
 def test_not_started_retains_actual_durable_obligations_even_with_valid_helper(tmp_path,monkeypatch,database,obligation):
     import test_gui_experiment as original
     monkeypatch.setattr(fixture,'REGISTRY',tmp_path/'registry');monkeypatch.setattr(original.fixture,'REGISTRY',tmp_path/'registry')
@@ -448,12 +448,36 @@ def test_not_started_retains_actual_durable_obligations_even_with_valid_helper(t
     with sqlite3.connect(db) as copy:con.backup(copy)
     helper=root/fixture.SPRINT_HELPER;helper.parent.mkdir();helper.write_bytes((ROOT/fixture.SPRINT_HELPER).read_bytes())
     record.update(purpose='native-sprint',runtime='experimental',sprint_helper_sha256=hashlib.sha256(helper.read_bytes()).hexdigest())
+    if obligation=='clean_owned':record.update(main_pid=123,main_pid_start_ticks=456,control_group='/owned')
     fixture.write_json(root/fixture.MARKER,fixture.identity(record));fixture.save(record,receipt)
-    fixture.write_json(root/'sprint-status.json',{'fixture_id':record['fixture_id'],'source_sha':record['source_sha'],'purpose':'native-sprint','unit':record['unit'],'state':'not_started'})
+    status={'fixture_id':record['fixture_id'],'source_sha':record['source_sha'],'purpose':'native-sprint','unit':record['unit'],'state':'not_started'}
+    if obligation=='clean_owned':status['owner']={'pid':123,'start_ticks':456,'unit':record['unit'],'control_group':'/owned'}
+    fixture.write_json(root/'sprint-status.json',status)
     monkeypatch.setattr(fixture,'unit_state',lambda _:original.missing_state());monkeypatch.setattr(fixture,'cgroup_pids',lambda _:[])
     monkeypatch.setattr(fixture,'process_start_ticks',lambda _:None)
-    if obligation=='clean':
+    if obligation in {'clean','clean_owned'}:
         assert fixture.stop(receipt)['cleanup']['complete'] is True and not root.exists()
     else:
         with pytest.raises(fixture.FixtureError):fixture.stop(receipt)
         assert root.exists() and db.exists() and fixture.read_json(receipt)['cleanup']['complete'] is False
+
+
+@pytest.mark.parametrize('mutation', ['complete','native_missing','native_pending','native_inconclusive','work_missing','definitions_missing'])
+def test_native_and_composite_cleanup_are_independently_required(database,mutation):
+    import json
+    path,con=database;cid=planner_chat(con)
+    cleanup={'outcome':'complete','native_outcome':'complete','unit_verified_exited':True,'unresolved_work':[],'unresolved_definitions':[]}
+    if mutation=='native_missing':cleanup.pop('native_outcome')
+    elif mutation=='native_pending':cleanup['native_outcome']='pending'
+    elif mutation=='native_inconclusive':cleanup['native_outcome']='inconclusive'
+    elif mutation=='work_missing':cleanup.pop('unresolved_work')
+    elif mutation=='definitions_missing':cleanup.pop('unresolved_definitions')
+    con.execute("INSERT INTO conversation_runtime_generations(generation_id,conversation_id,shell_id,owner_user_id,harness,binding_json,state,cleanup_json,created_at,updated_at) VALUES('g',?,4,1,'codex','{}','closed',?,1,1)",(cid,json.dumps(cleanup)));con.commit()
+    if mutation=='complete':sprint.require_durable_cleanup(path,deadline=time.monotonic()+1)
+    else:
+        with pytest.raises(sprint.SprintFixtureError):sprint.require_durable_cleanup(path,deadline=time.monotonic()+1)
+
+
+def test_explicit_null_owner_is_not_initial_ownerless_provisional_receipt(tmp_path):
+    fixture.write_json(tmp_path/'sprint-status.json',{'state':'not_started','owner':None})
+    with pytest.raises(fixture.FixtureError):fixture.read_sprint_status(tmp_path)

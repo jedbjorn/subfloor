@@ -229,6 +229,7 @@ def require_durable_cleanup(database: Path, *, deadline: float) -> None:
         for state,raw in con.execute('SELECT state,cleanup_json FROM conversation_runtime_generations LIMIT 65'):
             cleanup=json.loads(raw)
             if (state!='closed' or cleanup.get('outcome')!='complete'
+                    or cleanup.get('native_outcome')!='complete'
                     or cleanup.get('unit_verified_exited') is not True
                     or cleanup.get('unresolved_work')!=[] or cleanup.get('unresolved_definitions')!=[]):
                 raise SprintFixtureError('SPRINT_DURABLE_CLEANUP_UNKNOWN')
