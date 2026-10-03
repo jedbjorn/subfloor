@@ -367,7 +367,11 @@ class LegacyUpdateCompatTest(unittest.TestCase):
             (state / "engine.ref.prev").write_text(old_ref + "\n")
             log = root / "compat.log"
             env = {**os.environ, "SC_COMPAT_TEST_LOG": str(log), "HOME": str(home)}
-            for key in ("CODEX_HOME", "CLAUDE_CONFIG_DIR", "OPENCODE_CONFIG_DIR", "XDG_CONFIG_HOME", "IS_SANDBOX", "SC_SANDBOX"):
+            for key in (
+                "CODEX_HOME", "CLAUDE_CONFIG_DIR", "OPENCODE_CONFIG_DIR",
+                "XDG_CONFIG_HOME", "IS_SANDBOX", "SC_SANDBOX", "SC_API_TOKEN",
+                "SC_ADMIN",
+            ):
                 env.pop(key, None)
 
             completed = subprocess.run(
