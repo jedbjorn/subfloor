@@ -50,6 +50,7 @@ from conversation_runtime_contract import (
     StartupConsent,
     WriteReceipt,
     payload_digest,
+    runtime_context_wire,
 )
 from conversation_runtime_controller import observed_claude_memory
 
@@ -173,11 +174,7 @@ class ControllerProbeDriver(RuntimeDriver):
             self._started = True
             self._emit, self._deadline = emit, deadline
         self._attach(deadline)
-        data = dataclasses.asdict(context)
-        for key in ("state_root", "worktree", "controller_endpoint"):
-            data[key] = str(data[key]) if data[key] is not None else None
-        data["executable"]["path"] = str(data["executable"]["path"])
-        data["managed_mcp_files"] = [str(path) for path in data["managed_mcp_files"]]
+        data = runtime_context_wire(context)
         with self._lock:
             if self._closing:
                 return DriverStart("unknown", detail="owned cleanup fenced Open")

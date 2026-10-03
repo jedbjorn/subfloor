@@ -133,7 +133,8 @@ class NativeFixtureSeat:
                'conversation_runtime.py','conversation_runtime_checks.py','gui_experiment_native_seat.py',
                'gui_experiment_probe_owner.py','gui_experiment_runtime.py','gui_experiment_chats.py','conversation_runtime_native_probes.py','conversation_native_chats.py','conversation_native_checks.py',
                'gui_experiment_readiness.py','conversation_boot.py','run.py','route_transport.py',
-               'execution_view.py','execution_view_exec.py','conversation_native_history.py')]
+               'execution_view.py','execution_view_exec.py','conversation_native_history.py',
+               'conversation_history_baseline.py')]
         if harness=='codex':paths.extend(scripts/name for name in (
             'conversation_runtime_codex_schema.py','conversation_runtime_codex_codegen.py'))
         paths.extend([scripts/'conversation_adapters'/f'{harness}_runtime.py',
