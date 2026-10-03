@@ -92,6 +92,33 @@ def semantic_witness(raw: dict) -> dict:
         if isinstance(values,dict):
             result[name]={key:values[key] for key in ('completed','failed','interrupted','other')
                           if type(values.get(key)) is int and 0<=values[key]<=4096}
+    for field in ('first_rpc_observation','first_output_observation'):
+        state=raw.get(field)
+        if isinstance(state,str) and state in {'observed','unobserved','unavailable','overflow'}:
+            result[field]=state
+    for field,keys in (
+        ('first_rpc_counts',('turn_started','turn_completed','item_started','item_completed',
+            'assistant_delta','terminal_delta','status_completed','status_failed','status_interrupted','status_unknown','normalization_refused')),
+        ('first_output_counts',('assistant_final','assistant_delta','terminal_final','terminal_delta','refused_output'))):
+        observation=field.replace('_counts','_observation')
+        values=raw.get(field)
+        if result.get(observation)=='observed':
+            if isinstance(values,dict) and any(key in values for key in keys) and all(type(values[key]) is int and 0<=values[key]<=128
+                                             for key in keys if key in values):
+                result[field]={key:values[key] for key in keys if key in values}
+            else:
+                result[observation]='unavailable'
+    phase=raw.get('first_native_lost_phase')
+    if isinstance(phase,str) and phase in {'unobserved','startup','acknowledgement','first_turn','post_first_turn'}:
+        result['first_native_lost_phase']=phase
+    receipt=raw.get('first_command_receipt')
+    if isinstance(receipt,str) and receipt in {'unobserved','written','unknown','rejected','unsupported','not_written'}:
+        result['first_command_receipt']=receipt
+    if type(raw.get('first_command_acknowledged')) is bool:
+        result['first_command_acknowledged']=raw['first_command_acknowledged']
+    loss=raw.get('first_reader_loss')
+    if isinstance(loss,str) and loss in {'unobserved','reader_unavailable','native_transport_lost'}:
+        result['first_reader_loss']=loss
     return result
 
 
