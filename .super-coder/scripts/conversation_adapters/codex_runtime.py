@@ -285,6 +285,12 @@ class CodexRuntimeDriver(RuntimeDriver):
         self._pending_submission: NativeSubmission | None = None
         self._unbound: list[Mapping[str, Any]] = []
         self._foreign_pending: list[Mapping[str, Any]] = []
+        # Scalar-only diagnostics for the first finite probe intent. No raw
+        # frame retention, extra emit, reader I/O, or synchronization surface.
+        self._probe_intent: tuple[str, int] | None = None
+        self._probe_turn: str | None = None
+        self._probe_counts: dict[str, int] = {}
+        self._probe_overflow = False
         self._partial = False
         self._lost = False
         self._closing = False
@@ -304,6 +310,13 @@ class CodexRuntimeDriver(RuntimeDriver):
                provenance: str, data: Mapping[str, Any] | None = None,
                control_id: str | None = None, partial: bool = False) -> None:
         command = self._requests.get((reference.thread_id or "", reference.activity_id or "")) if reference else None
+        if (command is not None and (command.request_id, command.request_sequence) == self._probe_intent and reference is not None
+                and reference.thread_id == self._root and reference.activity_id == self._probe_turn):
+            data = {**(data or {}), "first_rpc_observation": "overflow" if self._probe_overflow else "observed",
+                    "first_rpc_counts": {} if self._probe_overflow else dict(self._probe_counts),
+                    "first_rpc_binding_sha256": hashlib.sha256(json.dumps([
+                        self._context.generation_id if self._context else None, self._root,
+                        command.request_id, self._probe_turn]).encode()).hexdigest()}
         self._emit(RuntimeEvent(kind, reference=reference, request_id=command.request_id if command else None,
                                 control_id=control_id, source=command.source if command else "system",
                                 provenance=provenance, freshness="stale" if self._lost else "current",
@@ -313,7 +326,13 @@ class CodexRuntimeDriver(RuntimeDriver):
         with self._lock:
             self._lost = True
             self._partial = True
-            self._event("runtime.lost", provenance="codex:transport", data={"detail": reason}, partial=True)
+            data = {"detail": reason}
+            if self._context and self._context.probe_capabilities:
+                data["probe_lost_phase"] = ("startup" if self._probe_intent is None else
+                    "acknowledgement" if self._probe_turn is None else
+                    "post_first_turn" if self._turn_status.get((self._root, self._probe_turn)) in TURN_TERMINALS
+                    else "first_turn")
+            self._event("runtime.lost", provenance="codex:transport", data=data, partial=True)
 
     def _allowed(self, capability: str) -> bool:
         context = self._context
@@ -451,6 +470,8 @@ class CodexRuntimeDriver(RuntimeDriver):
                         or self._pending_submission is not None):
                     return WriteReceipt("not_written", detail="native primary activity must be reconciled")
                 self._pending_submission = command
+                if self._probe_intent is None and self._context and self._context.probe_capabilities:
+                    self._probe_intent = (command.request_id, command.request_sequence)
             assert self._context is not None
             params: dict[str, Any] = {"threadId": self._root,
                                      "input": [{"type": "text", "text": command.text}],
@@ -466,6 +487,8 @@ class CodexRuntimeDriver(RuntimeDriver):
                     raise RpcError("NATIVE_SHAPE_INVALID", "turn/start returned no turn identity")
                 with self._lock:
                     self._requests[(self._root, turn_id)] = command
+                    if self._probe_turn is None and (command.request_id, command.request_sequence) == self._probe_intent:
+                        self._probe_turn = turn_id
                     self._active[self._root] = turn_id
                     self._activity_revision[self._root] = self._activity_revision.get(self._root, 0) + 1
                     self._pending_submission = None
@@ -515,6 +538,33 @@ class CodexRuntimeDriver(RuntimeDriver):
                 return
             nested = params.get("turn")
             turn = _string(params.get("turnId")) or (_string(nested.get("id")) if isinstance(nested, dict) else None)
+            # Before acknowledgement no turn is bound; replay is counted once
+            # only after the response binds this exact owned first turn. A
+            # malformed field inside a bound frame still counts before refusal.
+            if (thread == self._root and turn is not None and turn == self._probe_turn and self._probe_intent is not None
+                    and (thread, turn) in self._requests
+                    and (self._requests[(thread, turn)].request_id, self._requests[(thread, turn)].request_sequence) == self._probe_intent):
+                names = {"turn/started": "turn_started", "turn/completed": "turn_completed",
+                         "item/started": "item_started", "item/completed": "item_completed",
+                         "item/agentMessage/delta": "assistant_delta",
+                         "item/commandExecution/outputDelta": "terminal_delta"}
+                name = names.get(method)
+                if name:
+                    self._probe_count(name)
+                    if method == "turn/completed":
+                        status = nested.get("status") if isinstance(nested, dict) else None
+                        self._probe_count("status_" + (status if isinstance(status, str)
+                            and status in TURN_TERMINALS else "unknown"))
+                    value = params.get("item")
+                    refused = ((method in {"item/agentMessage/delta", "item/commandExecution/outputDelta"}
+                        and (not isinstance(params.get("delta"), str) or not _string(params.get("itemId"))))
+                        or (method in {"turn/started", "turn/completed"} and not isinstance(nested, dict))
+                        or (method in {"item/started", "item/completed"} and
+                            (not isinstance(value, dict) or not _string(value.get("type")) or not _string(value.get("id"))
+                             or (method == "item/completed" and value.get("type") == "agentMessage"
+                                 and not isinstance(value.get("text"), str)))))
+                    if refused:
+                        self._probe_count("normalization_refused")
             if method in {"turn/started", "turn/completed"} and (not turn or not isinstance(nested, dict)):
                 self._loss("required native turn identity missing")
                 return
@@ -568,6 +618,15 @@ class CodexRuntimeDriver(RuntimeDriver):
                 self._event("capability.observed", ref, provenance=provenance,
                             data={"capability": "native_request_response", "state": "unavailable",
                                   "native_request_id": raw["id"]}, partial=True)
+
+    def _probe_count(self, name: str) -> None:
+        # Caller holds the existing native observation RLock. Overflow makes
+        # the snapshot unavailable, including otherwise valid smaller counts.
+        count = self._probe_counts.get(name, 0)
+        if count >= 128:
+            self._probe_overflow = True
+        else:
+            self._probe_counts[name] = count + 1
 
     def _output(self, kind: str, ref: NativeReference, text: str, provenance: str, *,
                 output_kind: Literal["assistant", "terminal"], partial: bool = False) -> None:

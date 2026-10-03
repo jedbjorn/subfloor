@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import copy
 import dataclasses
+import hashlib
+import json
 import re
 import threading
 import time
@@ -453,6 +455,7 @@ class _Scenarios:
         self.waiting_stage = "startup"
         self.first_request: str | None = None
         self.first_activity: str | None = None
+        self.first_receipt: WriteReceipt | None = None
         self.second_request: str | None = None
         self.work_observation: dict[str, Any] = {"initial_snapshot_observed": False,
             "initial_snapshot_current": False, "initial_snapshot_partial": False,
@@ -479,6 +482,8 @@ class _Scenarios:
             request, activity, second = self.first_request, self.first_activity, self.second_request
             stage, root, events = self.waiting_stage, self.driver.identity, tuple(self.driver.events)
             work = dict(self.work_observation)
+            receipt = self.first_receipt
+            reader_lost = any(d.code == "PROBE_READER_UNAVAILABLE" for d in getattr(self.driver, "diagnostics", ()))
         matched = [e for e in events if request and activity and self._root_event(e, request, activity)]
         statuses = ("completed", "failed", "interrupted", "other")
         root_terminals = dict.fromkeys(statuses, 0)
@@ -503,7 +508,53 @@ class _Scenarios:
         recalled = [e for e in events if second and e.reference and e.reference.activity_id
                     and self._root_event(e, second, e.reference.activity_id)]
         processed = any(e.kind == "activity.processed" for e in matched)
-        return {"waiting_stage": stage, "first_root_processed": processed,
+        # Correlation here is diagnostic only and cannot supply processing or
+        # terminal proof. The raw snapshot is tied to the captured generation
+        # as well as root/request/turn; no private identities escape the witness.
+        diagnostic_activity = activity or (receipt.native_activity_id if receipt else None)
+        observed = [e for e in events if request and diagnostic_activity and e.reference and root
+            and e.request_id == request and e.reference.root_id == root.root_id
+            and e.reference.thread_id == root.root_id and e.reference.activity_id == diagnostic_activity]
+        diagnostic: dict[str, Any] = {"first_rpc_observation": "unobserved",
+            "first_command_receipt": receipt.state if receipt else "unobserved",
+            "first_reader_loss": "reader_unavailable" if reader_lost else "unobserved"}
+        if receipt:
+            diagnostic["first_command_acknowledged"] = receipt.acknowledged
+        if root and request and diagnostic_activity:
+            binding = hashlib.sha256(json.dumps([self.owned.context.generation_id, root.root_id,
+                request, diagnostic_activity]).encode()).hexdigest()
+            binding_qualified = False
+            snapshots = [e for e in observed if "first_rpc_observation" in e.data]
+            if snapshots:
+                last = snapshots[-1]
+                if last.freshness == "current" and last.data.get("first_rpc_binding_sha256") == binding:
+                    binding_qualified = True
+                    diagnostic.update(first_rpc_observation=last.data.get("first_rpc_observation"),
+                                      first_rpc_counts=last.data.get("first_rpc_counts"))
+                else:
+                    diagnostic["first_rpc_observation"] = "unavailable"
+            counts = {"assistant_final": 0, "assistant_delta": 0, "terminal_final": 0,
+                      "terminal_delta": 0, "refused_output": 0}
+            overflow = False
+            for event in observed:
+                if event.kind not in {"output.final", "output.delta"}:
+                    continue
+                key = "refused_output"
+                if (event.freshness == "current" and not event.partial
+                        and event.grade not in {"incompatible", "inconclusive"}
+                        and isinstance(event.data.get("text"), str)
+                        and event.data.get("kind") in {"assistant", "terminal"}):
+                    key = event.data["kind"] + ("_final" if event.kind == "output.final" else "_delta")
+                counts[key] += 1
+                overflow = overflow or counts[key] > 128
+            diagnostic["first_output_observation"] = "unavailable" if snapshots and not binding_qualified else "unobserved" if not binding_qualified else "overflow" if overflow else "observed"
+            if binding_qualified and not overflow:
+                diagnostic["first_output_counts"] = counts
+        losses = [e for e in events if e.kind == "runtime.lost" and e.provenance == "codex:transport"]
+        if losses:
+            diagnostic["first_reader_loss"] = "native_transport_lost"
+            diagnostic["first_native_lost_phase"] = losses[-1].data.get("probe_lost_phase", "unobserved")
+        return {"waiting_stage": stage, "first_root_processed": processed, **diagnostic,
                 "first_root_terminal_counts": root_terminals, "child_terminal_counts": child_terminals,
                 "first_final_nonce_matches": reply, "first_successful_reply": bool(
                     processed and root_terminals["completed"] and reply),
@@ -566,6 +617,9 @@ class _Scenarios:
                 self.second_request = request
         receipt = self.driver.submit(NativeSubmission(request, self.ordinal,
             payload_digest({"text": text}), text), deadline=self.deadline)
+        if self.ordinal == 1:
+            with self.driver._lock:
+                self.first_receipt = receipt
         if receipt.state not in {"written", "unknown"}:
             raise RuntimeContractError("PROBE_SUBMISSION_UNPROVED", "no blind retry of native intent")
         # An ambiguous transport receipt may resolve through this exact intent's
