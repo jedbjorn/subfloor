@@ -326,3 +326,28 @@ def test_preview_port_default_ignores_host_dev_port_and_invalid_types(monkeypatc
     for invalid in (True, 0, 65536, '123'):
         with pytest.raises(preview.PreviewError):
             preview.preview_ports(invalid)
+
+
+def test_committed_project_cannot_override_engine_or_managed_boot(installed, tmp_path):
+    _, project, _, _ = installed
+    reserved = ['sc', 'AGENTS.md', 'CLAUDE.md', 'opencode.json',
+                '.super-coder/api/server.py', '.sc-state/engine.ref',
+                '.subfloor/dev-kit', '.claude/settings.json', '.codex/config.toml']
+    for name in reserved:
+        path = project / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text('project-owned replacement must not enter archive')
+    sha = commit(project)
+    _, raw = fx.committed_project(project, sha)
+    assert [entry.name for entry in fx.validate_project(raw)] == ['app.py']
+    root = tmp_path / 'engine-root'
+    root.mkdir()
+    for name in fx.SOURCE_FILES:
+        path = root / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text('captured engine identity')
+    fx.extract_project(root, raw)
+    assert all((root / name).read_text() == 'captured engine identity' for name in fx.SOURCE_FILES)
+    assert (root / 'app.py').read_text() == 'print("preview code")'
+    assert not (root / 'AGENTS.md').exists()
+    assert not (root / 'opencode.json').exists()

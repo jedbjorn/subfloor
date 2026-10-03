@@ -67,7 +67,7 @@ MAX_PROJECT_ENTRIES = 4096
 PROJECT_EXCLUDED = {'.git', '.super-coder', '.sc-state', '.sc-worktrees', '.subfloor',
                     '.claude', '.codex', '.agents', '.opencode', '.ssh', '.npmrc', '.netrc', '.pypirc', 'node_modules',
                     'home', 'xdg-state', 'xdg-config', 'xdg-data', 'runtime',
-                    'synthetic-upstream', 'AGENTS.md', 'CLAUDE.md', '.gitignore', 'sc',
+                    'synthetic-upstream', 'AGENTS.md', 'CLAUDE.md', 'opencode.json', '.gitignore', 'sc',
                     'fixture_bootstrap.py', 'maintainer', '.gui-experiment-owner.json'}
 
 
