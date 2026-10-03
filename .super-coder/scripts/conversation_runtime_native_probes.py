@@ -672,8 +672,16 @@ class _Scenarios:
 
     def _pid(self, label: str, target: NativeWork) -> ProcessIdentity | None:
         key = "root" if label == self._root_label else "child" if label == self._child_label else "sibling" if label == self._sibling_label else None
-        # Diagnostic decisions only. They never select a target or qualify a PID.
+        outputs: list[str] = []
+        offsets: dict[tuple[Any, ...], dict[int, tuple[str, bool]]] = {}
+        invalid_offsets: set[tuple[Any, ...]] = set()
+        parts: dict[tuple[Any, ...], dict[int, tuple[str, bool]]] = {}
+        ambiguous: set[tuple[Any, ...]] = set()
+        rejected = 0
+        exact_records = 0
+        conflicting_record = False
         root = self.driver.identity
+        # Diagnostic decisions only. They never select a target or qualify a PID.
         qualification = ("missing_root_thread" if not root or not target.reference.thread_id
             else "association_unproved" if target.kind != "terminal" or target.reference.root_id != root.root_id
             else "not_current" if target.freshness != "current"
@@ -690,14 +698,6 @@ class _Scenarios:
                 self.work_observation.update({key+"_tagged_pid_candidates": 0, key+"_owned_pid_matches": 0,
                     key+"_rejected_pid_output_records": 0, key+"_pid_observation": "missing_terminal_output",
                     key+"_pid_qualification": detail})
-        outputs: list[str] = []
-        offsets: dict[tuple[Any, ...], dict[int, tuple[str, bool]]] = {}
-        invalid_offsets: set[tuple[Any, ...]] = set()
-        parts: dict[tuple[Any, ...], dict[int, tuple[str, bool]]] = {}
-        ambiguous: set[tuple[Any, ...]] = set()
-        rejected = 0
-        exact_records = 0
-        conflicting_record = False
         if (not root or target.kind != "terminal" or target.freshness != "current"
                 or target.grade in {"incompatible", "inconclusive"}
                 or target.reference.root_id != root.root_id or not target.reference.thread_id
