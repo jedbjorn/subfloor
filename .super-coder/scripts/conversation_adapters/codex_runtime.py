@@ -276,6 +276,11 @@ class CodexRuntimeDriver(RuntimeDriver):
         self._activity_revision: dict[str, int] = {}
         self._uncertain_activity: dict[str, set[str | None]] = {}
         self._turn_status: dict[tuple[str, str], str] = {}
+        # Persist only qualified background identities/tombstones. Separately
+        # bounded pending frames disappear when an ordinary command finishes.
+        self._command_activity: dict[tuple[str, str], tuple[str, str, str] | None] = {}
+        self._command_pending: dict[tuple[str, str], tuple[str, str, str] | None] = {}
+        self._command_revision: dict[str, int] = {}
         self._requests: dict[tuple[str, str], NativeSubmission] = {}
         self._pending_submission: NativeSubmission | None = None
         self._unbound: list[Mapping[str, Any]] = []
@@ -571,6 +576,55 @@ class CodexRuntimeDriver(RuntimeDriver):
                         data={"kind": output_kind, "text": text[offset:offset + 4096], "offset": offset,
                               "complete": offset + 4096 >= len(text)})
 
+    def _observe_command(self, thread: str, turn: str | None, value: Mapping[str, Any]) -> None:
+        # Called under the native observation lock, never from assistant text
+        # or the currently active foreground slot. Missing attribution is not
+        # an inventory failure; it leaves the strict probe target unqualified.
+        item = value.get("id")
+        if (self._closing or thread not in self._parents or not isinstance(item, str)
+                or not item or len(item) > 255):
+            return
+        key = (thread, item)
+        self._command_revision[thread] = self._command_revision.get(thread, 0) + 1
+        cache = self._command_activity if key in self._command_activity else self._command_pending
+        if key not in cache and len(cache) >= MAX_TRACKED:
+            return
+        process, status = value.get("processId"), value.get("status")
+        if process is None and status == "inProgress" and key not in cache:
+            return  # Native startup may not have assigned a background handle yet.
+        if (not isinstance(turn, str) or not turn or len(turn) > 255
+                or not isinstance(process, str) or not process or len(process) > 255
+                or not isinstance(status, str) or status not in {*WORK_TERMINALS, "inProgress"}):
+            cache[key] = None
+            return
+        binding = (turn, process, status)
+        if key in cache:
+            previous = cache[key]
+            if (previous is None or previous[:2] != binding[:2]
+                    or (previous[2] in WORK_TERMINALS and status != previous[2])):
+                cache[key] = None
+                return
+        for candidates in (self._command_activity, self._command_pending):
+            for other, known in candidates.items():
+                if other != key and other[0] == thread and known is not None and known[1] == process:
+                    candidates[other] = None
+                    cache[key] = None
+                    return
+        cache[key] = binding
+
+    def _command_turn(self, reference: NativeReference) -> tuple[str | None, str]:
+        key = (reference.thread_id or "", reference.item_id or "")
+        binding = self._command_activity.get(key) if key in self._command_activity else self._command_pending.get(key)
+        if binding is None or binding[1] != reference.native_process_id or binding[2] != "inProgress":
+            reason = "pending_capacity" if key not in self._command_activity and len(self._command_pending) >= MAX_TRACKED else "unproved"
+            return None, reason
+        if key not in self._command_activity:
+            if len(self._command_activity) >= MAX_TRACKED:
+                return None, "background_capacity"
+            self._command_activity[key] = binding
+            self._command_pending.pop(key, None)
+        return binding[0], "observed"
+
     def _item(self, thread: str, turn: str | None, value: Any, *, completed: bool, provenance: str) -> None:
         if not isinstance(value, dict):
             self._partial = True
@@ -602,6 +656,7 @@ class CodexRuntimeDriver(RuntimeDriver):
             self._event("work.observed", replace(ref, work_id=item), provenance=provenance,
                         data={"kind": "task", "native_type": kind, "state": "unknown"}, partial=True)
             return
+        self._observe_command(thread, turn, value)
         process = _string(value.get("processId"))
         ref = replace(ref, work_id=process or item, native_process_id=process)
         status = _string(value.get("status")) or "unknown"
@@ -681,6 +736,7 @@ class CodexRuntimeDriver(RuntimeDriver):
             for thread in threads:
                 with self._lock:
                     read_revision = self._activity_revision.get(thread, 0)
+                    command_revision = self._command_revision.get(thread, 0)
                 result = _object(self._rpc.request("thread/read", {"threadId": thread, "includeTurns": True}, deadline=deadline))
                 native = _object(result.get("thread"))
                 if native.get("id") != thread:
@@ -731,8 +787,21 @@ class CodexRuntimeDriver(RuntimeDriver):
                         self._activity_revision[thread] = read_revision + 1
                         if thread == self._root:
                             root_read_revision = read_revision + 1
+                        command_read_current = self._command_revision.get(thread, 0) == command_revision
                         for native_turn in turns:
                             tid, status = _string(native_turn.get("id")), _string(native_turn.get("status"))
+                            items = native_turn.get("items")
+                            if "items" in native_turn and not command_read_current:
+                                partial = True  # Native command evidence changed during this read.
+                            elif "items" in native_turn:
+                                if (not tid or status not in {*TURN_TERMINALS, "inProgress"}
+                                        or not isinstance(items, list) or len(items) > MAX_TRACKED
+                                        or not all(isinstance(item, dict) for item in items)):
+                                    partial = True
+                                else:
+                                    for item in items:
+                                        if item.get("type") == "commandExecution":
+                                            self._observe_command(thread, tid, item)
                             if tid and status in TURN_TERMINALS:
                                 prior_status = self._turn_status.get((thread, tid))
                                 self._turn_status[(thread, tid)] = status
@@ -755,9 +824,26 @@ class CodexRuntimeDriver(RuntimeDriver):
                     observed.append(NativeWork(self._reference(thread, item=item, work=process, process=process),
                                                "terminal", "inProgress", "codex:thread/backgroundTerminals/list", time.time(),
                                                freshness="current", data={"command": terminal.get("command"), "cwd": terminal.get("cwd")}))
+                if not truncated:
+                    with self._lock:
+                        present = {(row.get("itemId"), row.get("processId")) for row in terminals}
+                        # Complete current absence reconciles finished pending
+                        # foreground commands; qualified background tombstones
+                        # stay retained to refuse later replay/reused handles.
+                        for key, binding in tuple(self._command_pending.items()):
+                            if (key[0] == thread and binding is not None and binding[2] in WORK_TERMINALS
+                                    and (key[1], binding[1]) not in present):
+                                self._command_pending.pop(key)
             with self._lock:
                 root_uncertain |= self._activity_revision.get(self._root) != root_read_revision
                 partial |= root_uncertain
+                # Recheck after all native reads: a late completion/conflict
+                # must not leave a previously observed running target bound.
+                for index, work in enumerate(observed):
+                    if work.kind == "terminal":
+                        activity, attribution = self._command_turn(work.reference)
+                        observed[index] = replace(work, reference=replace(work.reference, activity_id=activity),
+                            data={**work.data, "activity_attribution": attribution})
                 for work in observed:
                     self._event("work.observed", work.reference, provenance=work.provenance,
                                 data={"kind": work.kind, "state": work.state, **work.data}, partial=partial)
@@ -899,6 +985,11 @@ class CodexRuntimeDriver(RuntimeDriver):
             exited = False
         if self._reconciler is not None:
             self._reconciler.join(timeout=_remaining(deadline))
+        if exited:
+            with self._lock:
+                self._command_activity.clear()
+                self._command_pending.clear()
+                self._command_revision.clear()
         unresolved = [work.reference for work in snapshot.work
                       if work.kind == "terminal" or work.reference.activity_id or work.state == "unknown"]
         if snapshot.primary is not None:
