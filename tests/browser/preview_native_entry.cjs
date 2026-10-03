@@ -40,7 +40,8 @@ const server=http.createServer((req,res)=>{
    return fulfill(route,{});
   });
   const url='http://127.0.0.1:'+server.address().port;
-  await page.goto(url+'/#interface/ui/configure');
+  await page.goto(url+'/#interface/ui');
+  await page.getByRole('button',{name:'＋ Chat',exact:true}).click();
   await page.getByRole('heading',{name:'Start a native preview chat'}).waitFor();
   assert.equal(await page.getByLabel('Native route to check').locator('option').count(),1);
   assert.match(await page.getByLabel('Native route to check').textContent(),/gpt-6\.1-sol/);

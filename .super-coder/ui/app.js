@@ -7108,6 +7108,13 @@ async function renderInterface(root) {
     configure.disabled = true;
     newChat.textContent = "Starting…";
     try {
+      const config = await chatRead("/conversations/native-config", chatReadController?.signal);
+      if (generation !== chatRenderGeneration) return;
+      if (chatPreviewEntry(config)) {
+        if (chatRouteConversation === CHAT_CONFIGURE_ROUTE) renderInterface(root);
+        else location.hash = chatHash(shell.shortname, CHAT_CONFIGURE_ROUTE);
+        return;
+      }
       const conversation = await chatWithShellRelease(
         () => chatCreateConversation(shell));
       location.hash = chatHash(shell.shortname, conversation.conversation_id);
