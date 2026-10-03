@@ -129,12 +129,38 @@ class NativeFixtureSeat:
 
     def implementation_files(self,harness: str) -> list[Path]:
         scripts=self.root/'.super-coder/scripts'
+        # Only the fixed marked Sprint fixture consumes the additional helper.
+        # The marker is a private source/fixture binding, never a behavior grade.
+        sprint_purpose=False
+        marker=self.root/'.gui-experiment-owner.json'
+        if marker.exists() or marker.is_symlink():
+            fd=os.open(marker,os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK)
+            try:
+                before=os.fstat(fd)
+                if (not stat.S_ISREG(before.st_mode) or before.st_uid!=os.geteuid()
+                        or stat.S_IMODE(before.st_mode)&0o077 or before.st_size>65536):
+                    raise RuntimeContractError('SOURCE_INVALID','fixture purpose binding unavailable')
+                raw=os.read(fd,65537)
+                after=os.fstat(fd)
+                if len(raw)!=before.st_size or any(getattr(before,k)!=getattr(after,k)
+                        for k in ('st_dev','st_ino','st_size','st_mtime_ns','st_ctime_ns')):
+                    raise RuntimeContractError('SOURCE_INVALID','fixture purpose binding changed')
+                purpose=json.loads(raw)
+                sprint_purpose=purpose.get('purpose')=='native-sprint'
+                if sprint_purpose and (self.root.name!='subfloor-gui-experiment-'+str(purpose.get('fixture_id'))
+                                      or purpose.get('runtime')!='experimental'):
+                    raise RuntimeContractError('SOURCE_INVALID','fixture purpose belongs to another owner')
+            except (ValueError,TypeError,AttributeError):
+                raise RuntimeContractError('SOURCE_INVALID','fixture purpose binding invalid') from None
+            finally:
+                os.close(fd)
         paths=[scripts/name for name in ('conversation_runtime_contract.py','conversation_runtime_controller.py',
                'conversation_runtime.py','conversation_runtime_checks.py','gui_experiment_native_seat.py',
                'gui_experiment_probe_owner.py','gui_experiment_runtime.py','gui_experiment_chats.py','conversation_runtime_native_probes.py','conversation_native_chats.py','conversation_native_checks.py',
                'gui_experiment_readiness.py','conversation_boot.py','run.py','route_transport.py',
                'execution_view.py','execution_view_exec.py','conversation_native_history.py',
                'conversation_history_baseline.py')]
+        if sprint_purpose:paths.append(scripts/'gui_experiment_sprint.py')
         if harness=='codex':paths.extend(scripts/name for name in (
             'conversation_runtime_codex_schema.py','conversation_runtime_codex_codegen.py'))
         paths.extend([scripts/'conversation_adapters'/f'{harness}_runtime.py',

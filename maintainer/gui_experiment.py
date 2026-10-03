@@ -61,6 +61,8 @@ IDENTITY_KEYS = (
 MAX_LIFETIME = 1800
 MAX_MEMORY_MIB = 512
 MAX_TASKS = 64
+SPRINT_PURPOSE = "native-sprint"
+SPRINT_HELPER = ".super-coder/scripts/gui_experiment_sprint.py"
 
 
 class FixtureError(RuntimeError):
@@ -168,7 +170,9 @@ def ownership_lock(fixture_id: str, *, deadline: float | None = None):
 
 def identity(record: dict[str, Any]) -> dict[str, Any]:
     try:
-        return {key: record[key] for key in IDENTITY_KEYS}
+        return {key: record[key] for key in IDENTITY_KEYS} | {
+            key: record[key] for key in ("purpose", "sprint_helper_sha256", "sprint_executable_sha256")
+            if key in record}
     except KeyError as exc:
         raise FixtureError("RECORD_INVALID", "incomplete fixture identity") from exc
 
@@ -611,6 +615,41 @@ def stop(receipt: Path) -> dict[str, Any]:
         return stop_locked(receipt)
 
 
+def read_sprint_status(root: Path) -> dict:
+    """Bounded, no-follow read of the one fixed private worker receipt."""
+    fd = os.open(root / 'sprint-status.json', os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    try:
+        before = os.fstat(fd)
+        if (not stat.S_ISREG(before.st_mode) or before.st_uid != os.geteuid()
+                or stat.S_IMODE(before.st_mode) & 0o077 or before.st_size > 4096):
+            raise FixtureError('CLEANUP_UNVERIFIED', 'private Sprint worker receipt is invalid')
+        raw = os.read(fd, 4097)
+        after = os.fstat(fd)
+        if len(raw) != before.st_size or any(getattr(before, key) != getattr(after, key)
+                for key in ('st_dev', 'st_ino', 'st_size', 'st_mtime_ns', 'st_ctime_ns')):
+            raise FixtureError('CLEANUP_UNVERIFIED', 'private Sprint worker receipt changed')
+        result = json.loads(raw)
+        if not isinstance(result, dict):
+            raise FixtureError('CLEANUP_UNVERIFIED', 'private Sprint worker receipt is invalid')
+        allowed={'fixture_id','source_sha','purpose','unit','owner','state','code','planner_model',
+                 'planner_effort','planner_execution','model_pickup_proved','runtime_joined',
+                 'cleanup_worker_joined','planner_chats_closed','whole_unit_cleanup_verified'}
+        if set(result)-allowed or not isinstance(result.get('state'),str):
+            raise FixtureError('CLEANUP_UNVERIFIED','private Sprint worker receipt is invalid')
+        owner=result.get('owner')
+        if owner is not None and (not isinstance(owner,dict)
+                or set(owner)!={'pid','start_ticks','unit','control_group'}
+                or any(type(owner.get(k)) is not int or owner[k]<=0 for k in ('pid','start_ticks'))
+                or any(not isinstance(owner.get(k),str) or not 0<len(owner[k])<=1024
+                       or any(c in owner[k] for c in '\n\r\0') for k in ('unit','control_group'))):
+            raise FixtureError('CLEANUP_UNVERIFIED','private Sprint worker owner is invalid')
+        return result
+    except (ValueError, TypeError):
+        raise FixtureError('CLEANUP_UNVERIFIED', 'private Sprint worker receipt is invalid') from None
+    finally:
+        os.close(fd)
+
+
 def stop_locked(receipt: Path) -> dict[str, Any]:
     record = verify_receipt(receipt)
     root = Path(record["root"])
@@ -620,9 +659,10 @@ def stop_locked(receipt: Path) -> dict[str, Any]:
         raise FixtureError("OWNERSHIP_INVALID", "fixture root disappeared without a cleanup record")
     # Native controllers are independently supervised. Stop and independently
     # verify every pre-registered resource before removing API DB/source/state.
-    for native in record.get("native_units", []):
-        verify_native(record, native)
-        stop_native_unit(record, native)
+    if record.get('purpose') != SPRINT_PURPOSE:
+        for native in record.get("native_units", []):
+            verify_native(record, native)
+            stop_native_unit(record, native)
     save(record, receipt)
     before = unit_state(record)
     exists = owned_unit(record, before)
@@ -647,6 +687,37 @@ def stop_locked(receipt: Path) -> dict[str, Any]:
             save(record, receipt)
             raise FixtureError("CLEANUP_UNVERIFIED", "owned process/unit did not become inactive")
         time.sleep(.1)
+    if root.exists() and record.get('purpose') == SPRINT_PURPOSE:
+        for native in record.get('native_units', []):
+            verify_native(record, native)
+            stop_native_unit(record, native)
+        try:
+            status = read_sprint_status(root)
+            if (status.get('fixture_id') != record['fixture_id']
+                    or status.get('source_sha') != record['source_sha']
+                    or status.get('purpose') != SPRINT_PURPOSE or status.get('unit') != record['unit']
+                    or status.get('state') not in {'not_started', 'stopped'}):
+                raise FixtureError('CLEANUP_UNVERIFIED', 'Sprint worker or Planner obligations remain retained')
+            if status['state']=='stopped':
+                owner=status.get('owner',{})
+                if (owner.get('unit')!=record['unit'] or owner.get('pid')!=record.get('main_pid')
+                        or owner.get('start_ticks')!=record.get('main_pid_start_ticks')
+                        or owner.get('control_group')!=record.get('control_group')
+                        or status.get('runtime_joined') is not True
+                        or status.get('cleanup_worker_joined') is not True):
+                    raise FixtureError('CLEANUP_UNVERIFIED','Sprint worker receipt has a stale owner')
+            # OS exit cannot erase unresolved durable native/artifact obligations.
+            if status['state']=='stopped':
+                module=sprint_helper(root, record['sprint_helper_sha256'])
+                module.worker_status({key:value for key,value in status.items() if key not in {'fixture_id','source_sha','purpose','unit','owner'}})
+                module.require_durable_cleanup(root/'.super-coder/shell_db.db', deadline=time.monotonic()+1)
+            record['sprint_status'] = status
+        except (FixtureError, OSError, RuntimeError):
+            record['cleanup'] = {'complete': False, 'cgroup_empty': True,
+                                 'recorded_process_exited': True, 'root_removed': False,
+                                 'code': 'SPRINT_CLEANUP_UNKNOWN'}
+            save(record, receipt)
+            raise FixtureError('CLEANUP_UNVERIFIED', 'Sprint state retained after verified unit exit') from None
     if root.exists():
         verify_root(record)
         shutil.rmtree(root)
@@ -696,6 +767,34 @@ def archive(source_repo: Path, ref: str) -> tuple[str, bytes]:
     return sha, result.stdout
 
 
+def sprint_helper(root: Path, expected_sha256: str):
+    """Execute only bounded captured helper bytes whose archive hash matches."""
+    import types
+    path = root / SPRINT_HELPER
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    try:
+        before = os.fstat(fd)
+        if not stat.S_ISREG(before.st_mode) or before.st_size > 65536:
+            raise FixtureError('SOURCE_INVALID', 'fixed Sprint source is invalid')
+        raw = os.read(fd, 65537)
+        after = os.fstat(fd)
+        if (len(raw) != before.st_size or hashlib.sha256(raw).hexdigest() != expected_sha256
+                or any(getattr(before, key) != getattr(after, key)
+                       for key in ('st_dev','st_ino','st_size','st_mtime_ns','st_ctime_ns'))):
+            raise FixtureError('SOURCE_IDENTITY_INVALID', 'fixed Sprint source changed')
+    finally:
+        os.close(fd)
+    module = types.ModuleType('fixture_sprint')
+    module.__file__ = str(path)
+    exec(compile(raw, str(path), 'exec'), module.__dict__)  # noqa: S102 - fixed archive-hash-validated bytes, no caller program
+    return module
+
+
+def validate_purpose(purpose: str, runtime: str) -> None:
+    if purpose not in {"ordinary", SPRINT_PURPOSE} or (purpose == SPRINT_PURPOSE and runtime != "experimental"):
+        raise FixtureError("PURPOSE_INVALID", "Sprint purpose requires the explicit experimental runtime")
+
+
 def launch_api(record: dict,root: Path, *, resume: bool=False) -> None:
     remaining=math.ceil(record["expires_at"]-time.time())
     if remaining<=0:
@@ -713,6 +812,16 @@ def launch_api(record: dict,root: Path, *, resume: bool=False) -> None:
             executable=shutil.which(harness)
             if executable:
                 native_environment += ['--setenv=SC_FIXTURE_NATIVE_'+harness.upper()+'='+str(Path(executable).absolute())]
+                if harness == 'codex' and record.get('purpose') == SPRINT_PURPOSE:
+                    module = sprint_helper(root, record['sprint_helper_sha256'])
+                    captured = module.executable_identity(Path(executable).absolute(), deadline=time.monotonic()+min(8, remaining))
+                    if record.get('sprint_executable_sha256') not in {None, captured['sha256']}:
+                        raise FixtureError('SOURCE_IDENTITY_INVALID', 'captured Sprint metadata executable changed')
+                    record['sprint_executable_sha256'] = captured['sha256']
+                    write_json(root / MARKER, identity(record))
+                    save(record, Path(record['receipt']))
+        if record.get('purpose') == SPRINT_PURPOSE and 'sprint_executable_sha256' not in record:
+            raise FixtureError('SEAT_UNAVAILABLE', 'Sprint metadata executable is unavailable')
         if os.environ.get('CODEX_HOME'):
             native_environment += ['--setenv=SC_FIXTURE_NATIVE_CODEX_HOME='+str(Path(os.environ['CODEX_HOME']).resolve())]
     argv=["systemd-run", "--user", "--quiet", "--collect", *native_environment, "--unit", record["unit"],
@@ -777,25 +886,28 @@ def restart_api(receipt: Path) -> dict:
 
 def start(source_repo: Path, ref: str, receipt: Path, *, temp_parent: Path | None = None,
           port: int | None = None, runtime: str = "none", lifetime: int = MAX_LIFETIME,
-          memory_mib: int = MAX_MEMORY_MIB, tasks: int = MAX_TASKS) -> dict[str, Any]:
+          memory_mib: int = MAX_MEMORY_MIB, tasks: int = MAX_TASKS,
+          purpose: str = "ordinary") -> dict[str, Any]:
     # Serialize starts using the same exported receipt, even before a random
     # fixture ID exists. A second concurrent start then sees the first receipt.
     if runtime not in {"none", "experimental"}:
         raise FixtureError("RUNTIME_UNAVAILABLE", "unknown fixture runtime mode")
+    validate_purpose(purpose, runtime)
     validate_limits(lifetime, memory_mib, tasks)
     receipt = canonical_receipt(receipt)
     receipt_key = hashlib.sha256(str(receipt).encode()).hexdigest()[:32]
     with ownership_lock(receipt_key):
         return start_serialized(source_repo, ref, receipt, temp_parent=temp_parent,
                                 port=port, runtime=runtime, lifetime=lifetime,
-                                memory_mib=memory_mib, tasks=tasks)
+                                memory_mib=memory_mib, tasks=tasks, purpose=purpose)
 
 
 def start_serialized(source_repo: Path, ref: str, receipt: Path, *,
                      temp_parent: Path | None, port: int | None, runtime: str,
-                     lifetime: int, memory_mib: int, tasks: int) -> dict[str, Any]:
+                     lifetime: int, memory_mib: int, tasks: int, purpose: str = "ordinary") -> dict[str, Any]:
     if runtime not in {"none", "experimental"}:
         raise FixtureError("RUNTIME_UNAVAILABLE", "unknown fixture runtime mode")
+    validate_purpose(purpose, runtime)
     limits = validate_limits(lifetime, memory_mib, tasks)
     receipt = receipt.absolute()
     if receipt.exists() or receipt.is_symlink() or not receipt.parent.is_dir():
@@ -810,12 +922,13 @@ def start_serialized(source_repo: Path, ref: str, receipt: Path, *,
     fid = uuid.uuid4().hex
     with ownership_lock(fid):
         return start_locked(source_repo, sha, raw, receipt, temp_parent=temp_parent,
-                            port=selected_port, runtime=runtime, limits=limits, fixture_id=fid)
+                            port=selected_port, runtime=runtime, limits=limits, fixture_id=fid, purpose=purpose)
 
 
 def start_locked(source_repo: Path, sha: str, raw: bytes, receipt: Path, *,
                  temp_parent: Path | None, port: int, runtime: str,
-                 limits: dict[str, int], fixture_id: str) -> dict[str, Any]:
+                 limits: dict[str, int], fixture_id: str, purpose: str = "ordinary") -> dict[str, Any]:
+    validate_purpose(purpose, runtime)
     fid = fixture_id
     parent = Path(temp_parent or tempfile.gettempdir()).resolve()
     root = parent / f"{PREFIX}{fid}"
@@ -831,6 +944,8 @@ def start_locked(source_repo: Path, sha: str, raw: bytes, receipt: Path, *,
         "receipt": str(receipt), "status": "preparing", "cleanup": {"complete": False},
         "expires_at":time.time()+limits["lifetime_seconds"],
     }
+    if purpose == SPRINT_PURPOSE:
+        record["purpose"] = purpose
     try:
         write_json(root / MARKER, identity(record))
         save(record, receipt)
@@ -847,6 +962,13 @@ def start_locked(source_repo: Path, sha: str, raw: bytes, receipt: Path, *,
                 raise FixtureError("SOURCE_INVALID", f"required source file is missing: {name}")
         if runtime == "experimental" and not (root / ".super-coder/scripts/gui_experiment_runtime.py").is_file():
             raise FixtureError("RUNTIME_UNAVAILABLE", "copied source has no experimental fixture runtime")
+        if purpose == SPRINT_PURPOSE:
+            helper = root / SPRINT_HELPER
+            if not helper.is_file() or helper.is_symlink():
+                raise FixtureError('SOURCE_INVALID', 'fixed Sprint helper missing from source archive')
+            record['sprint_helper_sha256'] = hashlib.sha256(helper.read_bytes()).hexdigest()
+            write_json(root / 'sprint-status.json', {'fixture_id': fid, 'source_sha': sha, 'purpose': SPRINT_PURPOSE, 'unit': record['unit'], 'state': 'not_started'})
+            write_json(root / MARKER, identity(record))
         record["source_files"] = {name: hashlib.sha256((root / name).read_bytes()).hexdigest()
                                   for name in SOURCE_FILES}
         # Script is copied from this maintainer helper, never imported through
@@ -951,6 +1073,11 @@ def bootstrap_repository(root: Path) -> str:
 def serve(root: Path, *, resume: bool=False) -> int:
     """Internal test-only bootstrap, executed from the marked archive."""
     root, trusted = verified_bootstrap_root(root, Path(__file__).absolute())
+    purpose = trusted.get('purpose', 'ordinary')
+    validate_purpose(purpose, trusted['runtime'])
+    sprint_module = None
+    if purpose == SPRINT_PURPOSE:
+        sprint_module = sprint_helper(root, trusted['sprint_helper_sha256'])
     # Capture fixed owner-issued native path bindings before erasing inherited
     # locators and masking normal GUI inventory. These stay ephemeral/private.
     native_bindings={name:os.environ.get('SC_FIXTURE_NATIVE_'+name,'')
@@ -971,6 +1098,13 @@ def serve(root: Path, *, resume: bool=False) -> int:
     # CODEX_HOME, account files, or the production modules.
     fixture_home = root / "home"
     fixture_home.mkdir(exist_ok=resume)
+    metadata_alias = None
+    if sprint_module is not None:
+        os.environ['HOME'] = str(fixture_home)
+        if not native_bindings['CODEX'] or not trusted.get('sprint_executable_sha256'):
+            raise FixtureError('SEAT_UNAVAILABLE', 'captured Sprint metadata executable missing')
+        metadata_alias = sprint_module.MetadataAlias(root, Path(native_bindings['CODEX']), trusted['sprint_executable_sha256'])
+        os.environ['PATH'] = metadata_alias.prepare(deadline=time.monotonic()+8)
     mock.patch.object(Path, "home", return_value=fixture_home).start()
     original_expanduser = os.path.expanduser
     mock.patch.object(os.path, "expanduser", side_effect=lambda value: (
@@ -997,11 +1131,16 @@ def serve(root: Path, *, resume: bool=False) -> int:
         con = sqlite3.connect(db)
         con.execute("INSERT INTO users(user_id,username,is_active) VALUES(1,'fixture-operator',1),(2,'fixture-other',0)")
         shell_prefix = "fx" + trusted["fixture_id"][:10]
-        for sid, short, owner in ((1, shell_prefix + "a", 1), (2, shell_prefix + "b", 1),
-                                  (3, shell_prefix + "other", 2)):
-            con.execute("INSERT INTO shells(shell_id,display_name,shortname,flavor,system_prompt,user_id,api_key) "
-                        "VALUES(?,?,?,'dev','Isolated GUI fixture',?,?)",
-                        (sid, short, short, owner, secrets.token_hex(32)))
+        if sprint_module is None:
+            role_rows = ((1, shell_prefix + "a", 'dev', 1), (2, shell_prefix + "b", 'dev', 1),
+                         (3, shell_prefix + "other", 'dev', 2))
+            for sid, short, _flavor, owner in role_rows:
+                con.execute("INSERT INTO shells(shell_id,display_name,shortname,flavor,system_prompt,user_id,api_key) "
+                            "VALUES(?,?,?,'dev','Isolated GUI fixture',?,?)",
+                            (sid, short, short, owner, secrets.token_hex(32)))
+        else:
+            role_rows = sprint_module.seed_roles(con, trusted['fixture_id'])
+        for _sid, short, _flavor, _owner in role_rows:
             command(["git","-C",str(root),"worktree","add","--quiet","-b",f"shell/{short}",
                      str(root / ".sc-worktrees" / short)])
         con.commit()
@@ -1023,9 +1162,10 @@ def serve(root: Path, *, resume: bool=False) -> int:
     if hashes != trusted["source_files"]:
         raise FixtureError("SOURCE_IDENTITY_INVALID", "copied source differs from the retained archive")
     runtime_stop = None
+    sprint_seat = None
 
     def start_selected() -> None:
-        nonlocal runtime_stop
+        nonlocal runtime_stop, sprint_seat
         if trusted["runtime"] == "none":
             return
         gui_experiment_runtime = importlib.import_module("gui_experiment_runtime")
@@ -1034,10 +1174,31 @@ def serve(root: Path, *, resume: bool=False) -> int:
             supervisor=NativeSupervisor(Path(trusted["receipt"])),native_bindings=native_bindings)
         if not callable(runtime_stop):
             raise FixtureError("RUNTIME_UNAVAILABLE", "experimental start_fixture must return a shutdown callable")
+        if sprint_module is not None:
+            con = sqlite3.connect(db)
+            try:
+                sprint_module.validate_roles(con, trusted['fixture_id'])
+            finally:
+                con.close()
+            sprint_owner = NativeSupervisor(Path(trusted['receipt'])).preparation_identity(deadline=time.monotonic()+3)
+            def record_sprint(status):
+                # The parent holds its ledger startup lock until HTTP health.
+                # This fixed private resource receipt avoids a startup lock inversion.
+                write_json(root / 'sprint-status.json', {
+                    'fixture_id': trusted['fixture_id'], 'source_sha': trusted['source_sha'],
+                    'purpose': SPRINT_PURPOSE, 'unit': trusted['unit'], 'owner': sprint_owner,
+                    **sprint_module.worker_status(status)})
+            sprint_seat = sprint_module.SprintSeat(db, trusted['fixture_id'], record=record_sprint)
+            sprint_seat.start(deadline=time.monotonic()+5)
 
     base_dispatch = server.dispatch_http
 
     def dispatch(method: str, path: str, headers_raw: str, body: bytes) -> tuple:
+        if metadata_alias is not None and path.startswith('/_sc/sprint/'):
+            metadata_alias.verify(deadline=time.monotonic()+8)
+            result = base_dispatch(method, path, headers_raw, body)
+            metadata_alias.verify(deadline=time.monotonic()+8)
+            return result
         if path == '/api/experiment-native-check' and trusted['runtime']=='experimental':
             import gui_experiment_runtime
             return gui_experiment_runtime.handle_check(method,headers_raw,body)
@@ -1064,8 +1225,13 @@ def serve(root: Path, *, resume: bool=False) -> int:
                 "bootstrap_sha256": trusted["bootstrap_sha256"],
                 "server_file": str(actual), "transport_file": str(Path(transport.__file__).resolve()),
                 "database": str(db), "source_files": hashes, "runtime": trusted["runtime"],
-                "production_services_started": any(services.values()),
+                "production_services_started": any(value for name, value in services.items()
+                    if not (purpose == SPRINT_PURPOSE and name == 'sprint_runtime')),
                 "production_service_inventory": services,
+                **({'fixture_purpose': SPRINT_PURPOSE, 'fixture_sprint_runtime_started': services['sprint_runtime'],
+                    'operator_planner': {'shell_id': 4, 'model': None, 'effort': None,
+                                         'execution': 'operator_only', 'model_pickup_proved': False}}
+                   if purpose == SPRINT_PURPOSE else {}),
                 "fixture_home": str(fixture_home),
                 "synthetic_git_sha":synthetic_git_sha,
                 "mcp_transport":"fixture-test-only",
@@ -1084,6 +1250,9 @@ def serve(root: Path, *, resume: bool=False) -> int:
     try:
         return server.main(["--port", str(trusted["port"])])
     finally:
+        if sprint_seat is not None:
+            # Worker/queued Planner ownership must resolve before native chats.
+            sprint_seat.shutdown(deadline=time.monotonic()+min(20, max(0, trusted['expires_at']-time.time())))
         if runtime_stop is not None:
             runtime_stop()
 
@@ -1098,6 +1267,7 @@ def main(argv: list[str] | None = None) -> int:
     launch.add_argument("--temp-parent", type=Path)
     launch.add_argument("--port", type=int)
     launch.add_argument("--runtime", default="none")
+    launch.add_argument("--purpose", choices=("ordinary", SPRINT_PURPOSE), default="ordinary")
     launch.add_argument("--lifetime", type=int, default=MAX_LIFETIME)
     launch.add_argument("--memory-mib", type=int, default=MAX_MEMORY_MIB)
     launch.add_argument("--tasks", type=int, default=MAX_TASKS)
@@ -1119,7 +1289,7 @@ def main(argv: list[str] | None = None) -> int:
         else:
             record = start(args.source_repo.absolute(), args.ref, args.receipt,
                            temp_parent=args.temp_parent, port=args.port, runtime=args.runtime,
-                           lifetime=args.lifetime, memory_mib=args.memory_mib, tasks=args.tasks)
+                           lifetime=args.lifetime, memory_mib=args.memory_mib, tasks=args.tasks, purpose=args.purpose)
         print(json.dumps({key: record[key] for key in ("fixture_id", "source_sha", "status", "cleanup")}
                          | {"receipt": record["receipt"], "url": record.get("url")}))
         return 0
