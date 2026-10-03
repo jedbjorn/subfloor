@@ -1735,3 +1735,28 @@ textarea, input[type=text], select { transition: border-color .12s, outline-colo
   .scripts-layout { grid-template-columns: minmax(0, 1fr); }
   .services-panel { position: static; }
 }
+.chat-native-panel { padding: 12px 16px; border: 1px solid var(--line); border-radius: 8px; margin-bottom: 12px; font-size: 13px; }
+.chat-native-heading, .chat-native-states, .chat-native-primary, .chat-native-work-item { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+.chat-native-heading { justify-content: space-between; margin-bottom: 8px; }
+.chat-native-states { align-items: flex-start; gap: 8px 20px; }
+.chat-native-panel p { margin: 8px 0; }
+.chat-native-primary { margin: 10px 0; }
+.chat-native-work-item { padding: 10px 0; border-top: 1px solid var(--line); }
+.chat-native-work-item small { flex-basis: 100%; opacity: .8; }
+.chat-native-panel code { overflow-wrap: anywhere; }
+.chat-native-cleanup { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 12px; }
+.chat-native-partial, .chat-native-control-state { color: var(--dim); }
+.chat-native-receipt { margin: 6px 0; }
+.chat-runtime-choice, .chat-native-check { padding: 12px; border: 1px solid var(--line); border-radius: 8px; }
+.chat-runtime-choice label { display: flex; gap: 8px; align-items: center; }
+.chat-native-check { display: grid; gap: 10px; }
+
+/* Native evidence is bounded independently so the transcript and composer stay reachable. */
+.chat-pane:has(> .chat-native-host) { grid-template-rows: auto auto minmax(0, 1fr) auto; }
+.chat-native-host { min-height: 0; max-height: min(34vh, 320px); overflow: auto; }
+.chat-native-output { white-space: pre-wrap; overflow-wrap: anywhere; }
+.chat-native-activity-item { padding: 6px 0; border-top: 1px solid var(--line-soft); }
+.chat-native-check code { overflow-wrap: anywhere; }
+.chat-native-references { margin-top: 1rem; }
+.chat-native-reference, .chat-native-latest { padding: .75rem; margin: .5rem 0; border: 1px solid var(--line); border-radius: .4rem; }
+.chat-native-reference .act { margin-right: .5rem; }
