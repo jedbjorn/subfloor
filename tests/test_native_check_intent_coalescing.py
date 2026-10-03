@@ -93,3 +93,30 @@ def test_current_service_and_current_candidate_guards_still_refuse(pending_manua
         workflow.enqueue_automatic(checks.CODEX_SELECTION, 'f' * 64)
     assert failure.value.code == 'CHECK_CANDIDATE_CHANGED'
     assert con.execute('SELECT COUNT(*) FROM conversation_runtime_check_requests').fetchone()[0] == 1
+
+
+def test_automatic_first_manual_click_refuses_without_creating_second_intent(pending_manual):
+    workflow, _, _, fp, con, _, _ = pending_manual
+    con.execute('DELETE FROM conversation_runtime_check_requests'); con.commit()
+    workflow.current = None; workflow.beginning = False
+    automatic = workflow.enqueue_automatic(checks.CODEX_SELECTION, fp.key)
+    with pytest.raises(RuntimeContractError) as failure:
+        workflow.create(1, 'operator-after-auto', checks.CODEX_SELECTION)
+    assert failure.value.code == 'CLEANUP_PENDING'
+    assert workflow.current is None and not workflow.beginning
+    readback = workflow.get(1, check_id=automatic['check_id'])
+    assert readback['state'] == 'accepted' and not readback['admissible']
+    assert readback['origin'] == 'installed_change'
+    assert con.execute('SELECT COUNT(*) FROM conversation_runtime_check_requests').fetchone()[0] == 1
+
+
+def test_service_replacement_during_observation_does_not_defer_or_enqueue(pending_manual):
+    workflow, operation, _, fp, con, _, _ = pending_manual
+    current = [True]
+    workflow._current_owner = lambda: current[0]
+    def replacement(**_):
+        current[0] = False
+        return fp
+    operation.seat.candidate_fingerprint = replacement
+    assert workflow.enqueue_automatic(checks.CODEX_SELECTION, fp.key) is None
+    assert con.execute('SELECT COUNT(*) FROM conversation_runtime_check_requests').fetchone()[0] == 1
