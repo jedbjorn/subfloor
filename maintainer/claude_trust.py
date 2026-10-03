@@ -142,11 +142,14 @@ def merge_trust(config: Path, main: Path, *, deadline: float, verify_owned: Call
         remaining(deadline)
         # No retry/stale steal: even native's old lock remains an explicit
         # inconclusive prerequisite. mkdir is the actual native primitive.
+        until = min(deadline, time.monotonic() + LOCK_SECONDS)
         os.mkdir(lock, mode=0o700, dir_fd=parent)
-        lock_info = os.stat(lock, dir_fd=parent, follow_symlinks=False)
+        remaining(until)
+        captured_lock = os.stat(lock, dir_fd=parent, follow_symlinks=False)
+        remaining(until)
+        lock_info = captured_lock
         if not stat.S_ISDIR(lock_info.st_mode) or lock_info.st_uid != os.getuid() or stat.S_IMODE(lock_info.st_mode) != 0o700:
             refuse()
-        until = min(deadline, time.monotonic() + LOCK_SECONDS)
 
         def check() -> None:
             remaining(until)
@@ -238,12 +241,14 @@ def prepared_trust(context: RuntimeContext, main: Path, *, deadline: float,
     setup = importlib.import_module('claude_setup')
     digest, validate = setup.digest, setup.validate
 
+    executable_info = context.executable.path.lstat()
     validate(context, main, deadline)
     if context.executable.sha256 != NATIVE_SHA256 or digest(context.executable.path) != NATIVE_SHA256:
         refuse()
+    if identity(context.executable.path.lstat()) != identity(executable_info):
+        refuse()
     if context.env.get('CLAUDE_CODE_CUSTOM_OAUTH_URL'):
         refuse()
-    executable_info = context.executable.path.lstat()
     # Fresh fixed CLI processes, normal production config only. No cached
     # host-seeded global-file or OAuth deployment variant is guessed here.
     home = Path(context.env.get('HOME', ''))

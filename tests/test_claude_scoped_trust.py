@@ -156,6 +156,20 @@ def test_same_pending_lock_never_reclaimed_even_if_old(files):
     assert lock.stat().st_ino==before.st_ino
 
 
+def test_acquisition_consumes_same_two_second_budget_not_a_fresh_merge_window(files,monkeypatch):
+    _,main,config,_=files;start=time.monotonic();clock=[start]
+    monkeypatch.setattr(trust.time,'monotonic',lambda:clock[0])
+    original=trust.os.mkdir
+    def mkdir(*args,**kwargs):
+        original(*args,**kwargs);clock[0]=start+2.01
+    monkeypatch.setattr(trust.os,'mkdir',mkdir)
+    with pytest.raises(RuntimeError):merge(config,main,seconds=20)
+    assert json.loads(config.read_text())['projects'][str(main)]=={'other':7}
+    # Identity could not be captured inside budget; never remove an unbound
+    # lock. The operation remains inconclusive rather than pretending release.
+    assert Path(str(config)+'.lock').exists()
+
+
 def test_prepared_real_canonical_context_and_changed_required_source(context, files, monkeypatch):
     home,_,_,_=files
     context=dataclasses.replace(context,env={**context.env,'HOME':str(home)})
@@ -219,6 +233,24 @@ def test_new_content_at_final_commit_callback_is_preserved(files):
     with pytest.raises(RuntimeError):merge(config,main,verify)
     assert json.loads(config.read_text())=={'late':'must-preserve'}
     assert not any('.sc-trust-' in p.name for p in config.parent.iterdir())
+
+
+def test_native_content_changed_during_hash_never_becomes_pinned(context,files,monkeypatch):
+    home,_,config,_=files
+    context=dataclasses.replace(context,env={**context.env,'HOME':str(home)})
+    monkeypatch.setattr(trust,'NATIVE_SHA256',context.executable.sha256)
+    original=setup.digest;calls=0
+    def digest(path):
+        nonlocal calls
+        result=original(path)
+        if path==context.executable.path:
+            calls+=1
+            if calls==2:path.write_text('replacement after captured hash')
+        return result
+    monkeypatch.setattr(setup,'digest',digest)
+    with pytest.raises(RuntimeError):
+        trust.prepared_trust(context,context.worktree,deadline=time.monotonic()+3,verify_owned=lambda:True)
+    assert str(context.worktree) not in json.loads(config.read_text())['projects']
 
 
 def test_fixed_pretrust_launch_preserves_only_validated_captured_override(launch_seat,tmp_path,monkeypatch):
