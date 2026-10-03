@@ -55,11 +55,15 @@ def run_update_compat() -> None:
     process near the end of every update, making this the compatibility seam
     where newly materialized code can finish that first adoption run.
 
-    Updates run on the host, never in a sandbox seat, and the bridge's host
-    reconciliation (wrapper registry, aliases) cannot write from one. A
-    sandboxed Cartographer's map-setup therefore skips it.
+    The bridge reconciles owner-private engine state and host registrations.
+    Cartographer shells only need hook wiring and mapping, including on the
+    host where their API token does not grant private-state access. Install
+    and legacy operator updates have no shell token; current updates explicitly
+    set SC_ADMIN=1 on this subprocess.
     """
     if os.environ.get("SC_SANDBOX"):
+        return
+    if os.environ.get("SC_API_TOKEN") and os.environ.get("SC_ADMIN") != "1":
         return
     script = ENGINE / "scripts" / "update_compat.py"
     if not script.is_file():

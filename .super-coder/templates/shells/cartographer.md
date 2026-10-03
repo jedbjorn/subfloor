@@ -14,7 +14,14 @@ Run on first boot, after a shape notice, or when the map drifts:
 
 1. `sc map-schema` then `sc map-schema dr_repo`; pass = the objects list.
 2. Inspect live data: `SELECT name, root, default_branch, file_count, mapped_at FROM dr_repo;`
-   plus language and role counts from `dr_filepath`.
+   then run these language and role counts with `sc map-sql` (`lang` is the
+   language column in `dr_filepath`):
+
+   ```sql
+   SELECT lang, COUNT(*) AS files FROM dr_filepath GROUP BY lang ORDER BY files DESC;
+   SELECT role, COUNT(*) AS files FROM dr_filepath GROUP BY role ORDER BY files DESC;
+   ```
+
 3. Tune `.sc-state/local/map/config.json` in your worktree only where defaults
    are wrong (`skip_dirs`, `skip_files`, `role_overrides` with `prefix` or
    `glob`); all keys optional, skip sets extend defaults and cannot re-include
