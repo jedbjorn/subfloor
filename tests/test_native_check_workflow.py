@@ -25,7 +25,7 @@ def workflow(request,monkeypatch):
         service=SimpleNamespace(resolve_route=lambda **_:calls.append('resolve')),
         cache=SimpleNamespace(admission=lambda _: {'submission':'compatible'}),
         owner=SimpleNamespace(lock=threading.RLock(),allocating=set(),closing=set()),
-        status=lambda:dict(report))
+        status=lambda:dict(report),retained_guard=lambda:None)
     def begin(*,selection,on_candidate):
         assert checks.configured_selection(selection)==selection
         assert con.execute("SELECT COUNT(*) FROM conversation_runtime_check_requests WHERE status='accepted'").fetchone()[0]==1

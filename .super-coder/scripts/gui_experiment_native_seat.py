@@ -472,6 +472,14 @@ class NativeFixtureSeat:
         observed=observer.observe()
         if observed.binding is None:
             raise RuntimeContractError('NATIVE_EXECUTABLE_INCONCLUSIVE','installed native identity observation is unavailable')
+        def executable_metadata():
+            try:
+                info=observed.binding.path.stat()
+                return (str(observed.binding.path.resolve(strict=True)),info.st_dev,info.st_ino,
+                        info.st_size,info.st_mtime_ns,info.st_ctime_ns)
+            except OSError as exc:
+                raise RuntimeContractError('NATIVE_EXECUTABLE_INCONCLUSIVE','captured executable unavailable at preparation edge') from exc
+        captured_executable_metadata=executable_metadata()
         if harness=='claude':
             startup_deadline=time.monotonic()+30
             if binding['selector_binding'].get('proof_state')=='pending_finite_probe':
@@ -510,7 +518,8 @@ class NativeFixtureSeat:
         finally:
             con.close()
         # Durable fixture resources precede canonical archive/boot/DB mutations.
-        self.require_loaded_source(self.candidate_fingerprint(harness,row['model'],row['effort']))
+        preparation_fingerprint=self.candidate_fingerprint(harness,row['model'],row['effort'])
+        self.require_loaded_source(preparation_fingerprint)
         # Serialize the resource grant with all canonical preparation entries.
         # Reserve a possible child before register; other starts count it even
         # before the native controller/store row exists.
@@ -552,14 +561,24 @@ class NativeFixtureSeat:
         # resource ownership does not authorize a now-closed boot mutation.
         con=db_driver.connect(str(self.database))
         try:
-            final=con.execute('SELECT c.*,s.user_id AS shell_owner,s.is_deleted AS shell_deleted FROM conversations c JOIN shells s USING(shell_id) WHERE conversation_id=?',(conversation_id,)).fetchone()
+            first=con.execute('SELECT c.*,s.shortname,s.flavor,s.user_id AS shell_owner,s.is_deleted AS shell_deleted FROM conversations c JOIN shells s USING(shell_id) WHERE conversation_id=?',(conversation_id,)).fetchone()
+            if first is None:raise RuntimeContractError('RUNTIME_CLOSING','registered conversation is no longer owned')
+            self.selected_worktree(first,allow_missing=history is not None)
+            fresh_fingerprint=self.candidate_fingerprint(harness,row['model'],row['effort'])
+            self.require_loaded_source(fresh_fingerprint)
+            if (fresh_fingerprint!=preparation_fingerprint or fresh_fingerprint.executable!=observed.binding
+                    or executable_metadata()!=captured_executable_metadata):
+                raise RuntimeContractError('NATIVE_ROUTE_CHANGED','registered captured executable/source changed before canonical writes')
+            # Re-read after path/source observations; neither callback may
+            # authorize writes using the earlier shell or preparer snapshot.
+            final=con.execute('SELECT c.*,s.shortname,s.flavor,s.user_id AS shell_owner,s.is_deleted AS shell_deleted FROM conversations c JOIN shells s USING(shell_id) WHERE conversation_id=?',(conversation_id,)).fetchone()
             current=json.loads(final['runtime_projection']) if final else {}
             if (final is None or final['owner_user_id']!=1 or final['shell_owner']!=1 or final['shell_deleted']
                     or final['state']=='closed' or final['runtime_mode']!='native_experiment'
                     or current.get('generation_id')!=generation_id or current.get('state')!='preparing'
                     or current.get('role')!=json.loads(row['runtime_projection']).get('role')
                     or current.get('preparation_owner')!=json.loads(row['runtime_projection']).get('preparation_owner')
-                    or any(final[key]!=row[key] for key in ('shell_id','harness','provider','model','effort','worktree','route_binding'))):
+                    or any(final[key]!=row[key] for key in ('shell_id','harness','provider','model','effort','worktree','route_binding','shortname','flavor'))):
                 raise RuntimeContractError('RUNTIME_CLOSING','registered generation changed before canonical writes')
             if binding['selector_binding'].get('proof_state')=='pending_finite_probe':
                 current_job=con.execute('SELECT status,deadline,fingerprint_key FROM conversation_runtime_probe_jobs WHERE conversation_id=? AND generation_id=?',(conversation_id,generation_id)).fetchone()

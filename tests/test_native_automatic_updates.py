@@ -332,3 +332,43 @@ def test_running_probe_snapshot_setup_remains_exact_after_api_restart(automatic)
     assert result['probe']['generation_id']=='probe-g' and result['probe']['setup']=={'setup_id':'owned'}
     assert not result['admissible']
     assert restarted.retained_references(CODEX_SELECTION)['retained_checks'][0]['check_id']==first['check_id']
+
+
+def test_claimed_request_hash_change_at_marked_owner_edge_refuses_dispatch(automatic):
+    value,op,_,calls,con,_=automatic
+    first=value.enqueue_automatic(CODEX_SELECTION,FP)
+    def owner(**kw):
+        con.execute('UPDATE conversation_runtime_check_requests SET request_hash=? WHERE check_id=?',
+                    ('changed',first['check_id']));con.commit()
+        return {'pid':1,'start_ticks':2}
+    op.supervisor.preparation_identity=owner
+    value.dispatch_automatic()
+    assert calls==[] and not value.get(1,check_id=first['check_id'])['admissible']
+
+
+def test_schema_failure_retains_cleanup_diagnostic_and_no_retry_after_restart(automatic):
+    value,op,_,calls,_,_=automatic
+    first=value.enqueue_automatic(CODEX_SELECTION,FP)
+    def pending():raise RuntimeContractError('CLEANUP_PENDING','owned codegen exit unknown')
+    def begin(**kw):
+        op.retained_guard=pending;calls.append('attempt')
+        raise RuntimeContractError('NATIVE_SCHEMA_INCONCLUSIVE','fixed child unproved')
+    op.begin=begin
+    value.dispatch_automatic()
+    restart=NativeChecks(op)
+    result=restart.get(1,check_id=first['check_id'])
+    assert result['state']=='retained' and result['diagnostics'][0]['code']=='CLEANUP_PENDING'
+    assert not result['retry_allowed'] and not result['admissible']
+    restart.dispatch_automatic()
+    assert calls==['attempt']
+
+
+def test_completed_historical_check_cannot_advertise_retry_with_new_schema_ownership(automatic):
+    value,op,_,_,_,_=automatic
+    first=value.enqueue_automatic(CODEX_SELECTION,FP)
+    value._save(first['check_id'],'complete',{'admissible':False,'retry_allowed':True})
+    def pending():raise RuntimeContractError('CLEANUP_PENDING','retained schema group')
+    op.retained_guard=pending
+    result=value.get(1,check_id=first['check_id'])
+    assert result['state']=='complete' and not result['retry_allowed'] and not result['admissible']
+    assert result['diagnostics'][0]['code']=='CLEANUP_PENDING'
