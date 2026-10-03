@@ -557,6 +557,59 @@ def test_pointer_before_native_creates_file_still_needs_attributable_records(tra
     assert setup.transcript_turn_evidence(context.state_root,deadline=time.monotonic()+2)['zero_turn_records'] is True
 
 
+def test_qualified_never_created_transcript_is_named_not_zero(transcript):
+    context,binding,path,_row=transcript
+    pointer=context.state_root/'claude-setup-transcript.json'
+    pointer.unlink();path.unlink()
+    setup.write_private(pointer,setup.transcript_pointer(binding,path))
+    result=setup.transcript_turn_evidence(context.state_root,deadline=time.monotonic()+2)
+    assert result=={'state':'inconclusive','evidence':'exact_session_transcript_turn_records',
+                    'reason':'qualified_transcript_missing'}
+    assert not {'zero_turn_records','user_records','assistant_records','record_count',
+                'path','cwd','session_id','native_inference_verified'} & result.keys()
+
+
+@pytest.mark.parametrize('change',['removed','no_pointer','empty','malformed','foreign','parent_replaced',
+                                   'source_changed','settings_added','expired'])
+def test_unavailable_transcripts_never_become_qualified_missing(transcript,change):
+    context,binding,path,_row=transcript
+    pointer=context.state_root/'claude-setup-transcript.json'
+    deadline=time.monotonic()+2
+    if change=='removed':path.unlink()
+    elif change=='no_pointer':pointer.unlink()
+    elif change=='empty':path.write_text('')
+    elif change=='malformed':path.write_text('not-json\n')
+    else:
+        pointer.unlink();path.unlink()
+        setup.write_private(pointer,setup.transcript_pointer(binding,path))
+        if change=='foreign':
+            value=json.loads(pointer.read_text());value['path']=str(path.with_name('foreign.jsonl'))
+            pointer.write_text(json.dumps(value))
+        elif change=='parent_replaced':
+            path.parent.rename(path.parent.with_name('previous-parent'));path.parent.mkdir()
+        elif change=='source_changed':context.executable.path.write_text('changed source')
+        elif change=='settings_added':
+            settings=context.worktree/'.claude/settings.local.json';settings.parent.mkdir(exist_ok=True)
+            settings.write_text('{}')
+        elif change=='expired':deadline=time.monotonic()-1
+    result=setup.transcript_turn_evidence(context.state_root,deadline=deadline)
+    assert result=={'state':'inconclusive','evidence':'exact_session_transcript_turn_records'}
+
+
+def test_file_created_during_missing_source_revalidation_stays_unavailable(transcript,monkeypatch):
+    context,binding,path,row=transcript
+    pointer=context.state_root/'claude-setup-transcript.json'
+    pointer.unlink();path.unlink()
+    setup.write_private(pointer,setup.transcript_pointer(binding,path))
+    original=setup.revalidate
+    def changed(binding,deadline):
+        original(binding,deadline)
+        path.write_text(json.dumps(row|{'type':'user','message':{'content':'private'}})+'\n')
+    monkeypatch.setattr(setup,'revalidate',changed)
+    result=setup.transcript_turn_evidence(context.state_root,deadline=time.monotonic()+2)
+    assert result=={'state':'inconclusive','evidence':'exact_session_transcript_turn_records'}
+
+
 def test_owned_synthetic_hook_captures_pointer_privately_only(context,tmp_path,monkeypatch):
     # Actual pytest OS identity, synthetic hook fields; no native account/CLI.
     binary=Path(sys.executable).resolve();home=tmp_path/'native-home'
