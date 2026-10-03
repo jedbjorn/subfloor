@@ -18,7 +18,7 @@ agents durable identity, memory, specifications and handoffs, then runs them
 through your coding harness. Install it into an existing Git project and work
 with a standing team from the terminal or local browser UI.
 
-**[Quick start](docs/quick-start.md) · [User and operator guide](docs/README.md)**
+**[Website](https://subfloor.designs-os.com) · [Quick start](docs/quick-start.md) · [User and operator guide](docs/README.md) · [Promo film](https://www.youtube.com/watch?v=1mCHFYCI7LI)**
 
 ![Subfloor terminal demo: select a shell and harness, then enter its session](https://raw.githubusercontent.com/jedbjorn/subfloor/main/docs/demo.gif)
 
