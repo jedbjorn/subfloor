@@ -607,7 +607,15 @@ class NativeSupervisor:
                 time.sleep(min(.1,max(0,deadline-time.monotonic())))
             raise FixtureError("STARTUP_FAILED", "native controller did not become ready; ledger retains cleanup")
 
-    def launch_claude_setup(self, generation_id: str, *, deadline: float) -> dict:
+    def launch_claude_pretrust(self, generation_id: str, *, deadline: float) -> dict:
+        """Fixed trust-only canonical preparation; no native process or TUI."""
+        setup=importlib.import_module('claude_setup')
+        try:
+            return self.launch_claude_setup(generation_id, deadline=deadline, _pretrust=True)
+        except setup.RuntimeContractError:
+            raise FixtureError('TRUST_INCONCLUSIVE','scoped trust preparation unavailable') from None
+
+    def launch_claude_setup(self, generation_id: str, *, deadline: float, _pretrust: bool=False) -> dict:
         """Fixed local operator TUI; registered ownership before preparation.
 
         No arbitrary argv/environment/main-root input and no model prompt.
@@ -617,7 +625,9 @@ class NativeSupervisor:
         budget,digest=setup.budget,setup.digest
         budget(deadline)
         bus=setup.service_bus()
-        if not os.isatty(0) or not os.isatty(1):
+        trust=importlib.import_module('claude_trust') if _pretrust else None
+        override=trust.config_override(os.environ.get('CLAUDE_CONFIG_DIR')) if trust else None
+        if not _pretrust and (not os.isatty(0) or not os.isatty(1)):
             raise FixtureError("SETUP_INCONCLUSIVE","native operator terminal required")
         # Reusing a generation is forbidden even if its previous unit exited.
         initial=verify_receipt(self.receipt)
@@ -640,19 +650,23 @@ class NativeSupervisor:
                     raise FixtureError("SETUP_INCONCLUSIVE","validated canonical Git MAIN root required")
                 native.update(status='starting',setup_helper_sha256=digest(helper),
                               setup_executable_sha256=digest(path),setup_deadline=deadline)
+                if trust:
+                    trust_helper=root/'maintainer/claude_trust.py'
+                    native['trust_helper_sha256']=digest(trust_helper)
                 save(record,self.receipt)
                 budget(deadline)
                 remaining=min(27, math.floor(deadline-time.monotonic()-3))
                 if remaining<=0:
                     raise FixtureError("SETUP_INCONCLUSIVE","setup preparation budget expired")
-                argv=['systemd-run','--user','--quiet','--collect','--wait','--pty',
+                argv=['systemd-run','--user','--quiet','--collect','--wait','--pipe' if _pretrust else '--pty',
                       '--unit',native['unit'],'--description',native_description(record,native),
                       '-p','Type=exec','-p','KillMode=control-group','-p','SendSIGKILL=yes',
                       '-p','TimeoutStopSec=1s','-p',f'RuntimeMaxSec={remaining}s',
                       '-p','MemoryMax=2048M','-p','TasksMax=128','-p',f'WorkingDirectory={root}',
                       '/usr/bin/env','-i','PATH='+os.defpath,
                       'XDG_RUNTIME_DIR='+bus['XDG_RUNTIME_DIR'],'DBUS_SESSION_BUS_ADDRESS='+bus['DBUS_SESSION_BUS_ADDRESS'],
-                      sys.executable,'-I',str(helper),'_setup','--receipt',str(self.receipt),
+                      *(['CLAUDE_CONFIG_DIR='+str(override)] if override else []),
+                      sys.executable,'-I',str(helper),'_pretrust' if _pretrust else '_setup','--receipt',str(self.receipt),
                       '--generation',generation_id,'--executable',str(path),
                       '--sha256',native['setup_executable_sha256'],'--deadline',str(deadline-3)]
                 launcher=subprocess.Popen(argv,env=clean_environment())
@@ -691,6 +705,9 @@ class NativeSupervisor:
                             Path(native['root']),deadline=deadline)
                         native['setup_diagnostic']=setup.setup_diagnostic(
                             Path(native['root']),generation_id,native['setup_helper_sha256'],deadline=deadline)
+                        if trust:
+                            native['trust_result']=trust.read_result(Path(native['root']),generation_id,
+                                native['trust_helper_sha256'],deadline=deadline)
                         # The unit may have been killed during preparation.
                         # Finalize only its scoped synthetic setup row after
                         # whole-unit exit, retaining failures for review.
@@ -811,9 +828,9 @@ def archive(source_repo: Path, ref: str) -> tuple[str, bytes]:
     if not SHA_RE.fullmatch(sha):
         raise FixtureError("REF_INVALID", "requested ref does not resolve to a full commit")
     paths=[".super-coder", "sc"]
-    setup='maintainer/claude_setup.py'
-    present=command(["git","-C",str(source_repo),"cat-file","-e",f"{sha}:{setup}"],check=False)
-    if present.returncode==0:paths.append(setup)
+    for setup in ('maintainer/claude_setup.py','maintainer/claude_trust.py'):
+        present=command(["git","-C",str(source_repo),"cat-file","-e",f"{sha}:{setup}"],check=False)
+        if present.returncode==0:paths.append(setup)
     result = subprocess.run(["git", "-C", str(source_repo), "archive", sha, *paths],
                             capture_output=True, env=clean_environment(), timeout=20, check=False)
     if result.returncode:
@@ -1232,6 +1249,8 @@ def main(argv: list[str] | None = None) -> int:
     recovery.add_argument("--receipt",type=Path,required=True)
     setup = sub.add_parser("claude-setup", help="fixed 30-second MAIN-root native initial trust TUI")
     setup.add_argument("--receipt", type=Path, required=True)
+    pretrust = sub.add_parser('claude-pretrust', help='fixed registered MAIN trust-only operation; no native startup')
+    pretrust.add_argument('--receipt', type=Path, required=True)
     internal = sub.add_parser("_serve", help=argparse.SUPPRESS)
     internal.add_argument("--root", type=Path, required=True)
     internal.add_argument("--resume",action="store_true")
@@ -1242,6 +1261,14 @@ def main(argv: list[str] | None = None) -> int:
         if args.action == "claude-setup":
             native=NativeSupervisor(canonical_receipt(args.receipt)).launch_claude_setup(uuid.uuid4().hex,deadline=time.monotonic()+30)
             print(json.dumps({"state":"setup_inconclusive","cleanup_complete":native.get("os_cleanup",{}).get("complete") is True,"native_inference_verified":False}))
+            return 0
+        if args.action == 'claude-pretrust':
+            native=NativeSupervisor(canonical_receipt(args.receipt)).launch_claude_pretrust(uuid.uuid4().hex,deadline=time.monotonic()+30)
+            result=native.get('trust_result',{})
+            print(json.dumps({'state':result.get('state','trust_inconclusive'),
+                'exact_main_trusted':result.get('exact_main_trusted') is True,
+                'cleanup_complete':native.get('os_cleanup',{}).get('complete') is True,
+                'native_started':False,'behavior_verified':False}))
             return 0
         if args.action == "restart-api":
             record=restart_api(args.receipt.absolute())
