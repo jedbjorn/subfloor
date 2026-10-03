@@ -180,6 +180,23 @@ def test_blocking_owner_callback_cannot_return_qualified_after_budget(completed,
     assert not (completed.context.state_root/'claude-setup-confirmation.json').exists()
 
 
+@pytest.mark.parametrize('mutation', ['state', 'shell-owner'])
+def test_final_preparer_join_refreshed_after_transcript_observation(completed, monkeypatch, mutation):
+    import sqlite3
+
+    original = setup.transcript_turn_evidence
+    def changed(state, *, deadline):
+        evidence = original(state, deadline=deadline)
+        with sqlite3.connect(completed.context.worktree/'.super-coder/shell_db.db') as con:
+            if mutation == 'state':
+                con.execute("UPDATE conversations SET state='idle'")
+            else:
+                con.execute('UPDATE shells SET user_id=2')
+        return evidence
+    monkeypatch.setattr(setup, 'transcript_turn_evidence', changed)
+    assert qualify(completed)['state'] == 'inconclusive'
+
+
 def test_private_record_symlink_refused_without_public_payload(completed, tmp_path):
     path = completed.context.state_root/'claude-setup-observation.json'
     other = tmp_path/'private'; path.rename(other); path.symlink_to(other)

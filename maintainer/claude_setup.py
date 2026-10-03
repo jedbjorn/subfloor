@@ -552,18 +552,22 @@ def qualify_setup(supervisor, generation: str, confirmation: Mapping[str, Any], 
         if (settings.get('autoMemoryEnabled') is not False or settings.get('permissions', {}).get('deny') != ['CronCreate']
                 or 'SessionStart' not in settings.get('hooks', {})):
             return failure
-        database = root / '.super-coder/shell_db.db'
-        if database.resolve() != database or database.is_symlink():
-            return failure
-        with contextlib.closing(sqlite3.connect(database.as_uri() + '?mode=ro', uri=True,
-                                              timeout=min(.1, budget(deadline)))) as con:
-            con.set_progress_handler(lambda: int(time.monotonic() >= deadline), 100)
-            row = con.execute('SELECT c.owner_user_id,c.state,c.worktree,c.harness,c.provider,c.model,c.effort,'
-                'c.runtime_projection,s.user_id,s.flavor FROM conversations c JOIN shells s ON s.shell_id=c.shell_id '
-                'WHERE c.conversation_id=?', ('cv_fixture_setup_' + generation,)).fetchone()
-        budget(deadline)
-        if (not row or tuple(row[:7]) != (1, 'closed', str(root), 'claude', 'anthropic', 'claude-sonnet-5-5', 'high')
-                or json.loads(row[7]) != {'role': 'setup', 'generation_id': generation} or tuple(row[8:]) != (1, 'admin')):
+        def preparer_closed() -> bool:
+            database = root / '.super-coder/shell_db.db'
+            if database.resolve() != database or database.is_symlink():
+                return False
+            with contextlib.closing(sqlite3.connect(database.as_uri() + '?mode=ro', uri=True,
+                                                  timeout=min(.1, budget(deadline)))) as con:
+                con.set_progress_handler(lambda: int(time.monotonic() >= deadline), 100)
+                row = con.execute('SELECT c.owner_user_id,c.state,c.worktree,c.harness,c.provider,c.model,c.effort,'
+                    'c.runtime_projection,s.user_id,s.flavor FROM conversations c JOIN shells s ON s.shell_id=c.shell_id '
+                    'WHERE c.conversation_id=?', ('cv_fixture_setup_' + generation,)).fetchone()
+            budget(deadline)
+            return bool(row and tuple(row[:7]) == (1, 'closed', str(root), 'claude', 'anthropic', 'claude-sonnet-5-5', 'high')
+                        and json.loads(row[7]) == {'role': 'setup', 'generation_id': generation}
+                        and tuple(row[8:]) == (1, 'admin'))
+
+        if not preparer_closed():
             return failure
         _setup_record_scope(native.get('setup_transcript_evidence'))
         if current() != (record, root, native):
@@ -573,6 +577,10 @@ def qualify_setup(supervisor, generation: str, confirmation: Mapping[str, Any], 
         records = _setup_record_scope(transcript_turn_evidence(state_root, deadline=deadline))
         revalidate(binding, deadline)
         if current() != (record, root, native):
+            return failure
+        # Source/transcript/service observations can block. Re-read the joined
+        # preparer and tenancy after those callbacks, at the return boundary.
+        if not preparer_closed():
             return failure
         budget(deadline)
         return {'state': 'qualified', 'evidence_level': 'bounded_promptfree_setup_inference',
