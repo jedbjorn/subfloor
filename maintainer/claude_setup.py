@@ -413,6 +413,178 @@ def transcript_turn_evidence(state: Path, *, deadline: float) -> dict[str,Any]:
         return failure
 
 
+def _setup_private_json(path: Path, deadline: float) -> dict[str, Any]:
+    """Read a fixed existing setup record; never discover other native files."""
+    budget(deadline)
+    parent = path.parent.lstat()
+    if (path.resolve() != path or not stat.S_ISDIR(parent.st_mode)
+            or parent.st_uid != os.getuid() or stat.S_IMODE(parent.st_mode) != 0o700):
+        raise RuntimeContractError('SETUP_INCONCLUSIVE', 'setup record unavailable')
+    with os.fdopen(os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK), 'rb') as stream:
+        before = os.fstat(stream.fileno())
+        if (not stat.S_ISREG(before.st_mode) or before.st_uid != os.getuid()
+                or stat.S_IMODE(before.st_mode) != 0o600 or not 0 < before.st_size <= 65536):
+            raise RuntimeContractError('SETUP_INCONCLUSIVE', 'setup record unavailable')
+        raw = stream.read(65537)
+        after = os.fstat(stream.fileno())
+    current = path.lstat()
+    identity = lambda info: (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+    if (len(raw) != before.st_size or identity(before) != identity(after)
+            or identity(after) != identity(current)
+            or (path.parent.lstat().st_dev, path.parent.lstat().st_ino) != (parent.st_dev, parent.st_ino)):
+        raise RuntimeContractError('SETUP_INCONCLUSIVE', 'setup record changed')
+    budget(deadline)
+    value = json.loads(raw)
+    if not isinstance(value, dict):
+        raise RuntimeContractError('SETUP_INCONCLUSIVE', 'setup record shape unavailable')
+    return value
+
+
+def _setup_record_scope(evidence: Any) -> str:
+    """D420's two qualified evidence levels; neither admits ordinary work."""
+    if not isinstance(evidence, dict) or evidence.get('evidence') != 'exact_session_transcript_turn_records':
+        raise RuntimeContractError('SETUP_INCONCLUSIVE', 'setup turn observation unavailable')
+    if evidence == {'state': 'inconclusive', 'evidence': 'exact_session_transcript_turn_records',
+                    'reason': 'qualified_transcript_missing'}:
+        return 'unobserved'
+    if (evidence.get('state') != 'observed' or evidence.get('effective_telemetry') is not False
+            or any(type(evidence.get(key)) is not int or not 0 <= evidence[key] <= 128
+                   for key in ('user_records', 'assistant_records', 'record_count'))
+            or evidence['record_count'] < 1 or evidence['user_records'] != 0 or evidence['assistant_records'] != 0
+            or evidence.get('zero_turn_records') is not True
+            or not isinstance(evidence.get('transcript_sha256'), str)
+            or not re.fullmatch(r'[a-f0-9]{64}', evidence['transcript_sha256'])):
+        raise RuntimeContractError('SETUP_INCONCLUSIVE', 'setup turn observation unavailable')
+    return 'observed_zero_work_turn_records'
+
+
+def qualify_setup(supervisor, generation: str, confirmation: Mapping[str, Any], *, deadline: float) -> dict[str, Any]:
+    """Qualify one completed operator setup using existing private ownership.
+
+    The preview wrapper calls this after ``launch_claude_setup`` and asks the
+    human to confirm sign-in/trust/quit only. Confirmation is exactly
+    ``{source: receipt.source_sha, setup_gid: generation,
+    actions: 'sign_in_trust_quit_only', confirmed: True}``. It is captured once
+    in the existing private setup root. No native process is launched here.
+    Qualification is limited to five seconds of the caller's original deadline;
+    setup still has its separate thirty-second execution/cleanup budget.
+    This result never substitutes for per-generation channel consent, current
+    native compatibility, route/memory readiness or observed effective effort.
+    """
+    failure = {'state': 'inconclusive', 'code': 'SETUP_EVIDENCE_UNAVAILABLE',
+               'effective_telemetry': False, 'native_inference_verified': False}
+    try:
+        if type(deadline) not in (int, float) or not math.isfinite(deadline):
+            return failure
+        deadline = min(deadline, time.monotonic() + 5)
+        budget(deadline)
+        if any(key in os.environ for key in ('CLAUDE_CONFIG_DIR', 'CLAUDE_CODE_CUSTOM_OAUTH_URL')):
+            return failure
+        fixture = fixture_module()
+
+        def current():
+            budget(deadline)
+            record = fixture.verify_receipt(supervisor.receipt)
+            root = fixture.verify_root(record)
+            if record['status'] != 'serving':
+                raise RuntimeContractError('SETUP_INCONCLUSIVE', 'setup owner unavailable')
+            state = fixture.unit_state(record, timeout=min(1, budget(deadline)))
+            budget(deadline)
+            if (state.get('ActiveState') != 'active' or state.get('Description') != fixture.description(record)
+                    or int(state.get('MainPID', '0')) != record['main_pid']
+                    or fixture.process_start_ticks(record['main_pid']) != record['main_pid_start_ticks']
+                    or state.get('ControlGroup') != record['control_group']
+                    or record['main_pid'] not in fixture.cgroup_pids(record['control_group'])):
+                raise RuntimeContractError('SETUP_INCONCLUSIVE', 'setup owner changed')
+            entries = [n for n in record['native_units'] if n['generation_id'] == generation]
+            if len(entries) != 1:
+                raise RuntimeContractError('SETUP_INCONCLUSIVE', 'setup generation unavailable')
+            native = entries[0]
+            fixture.verify_native(record, native)
+            if native.get('purpose') != 'claude_setup' or native['harness'] != 'claude' or native['status'] != 'stopped':
+                raise RuntimeContractError('SETUP_INCONCLUSIVE', 'setup is not completed')
+            cleanup, child = native.get('os_cleanup', {}), native.get('setup_child', {})
+            if (not all(cleanup.get(key) is True for key in ('complete', 'cgroup_empty', 'recorded_process_exited'))
+                    or any(type(native.get(key)) is not int or native[key] <= 0 for key in ('main_pid', 'main_pid_start_ticks'))
+                    or any(type(child.get(key)) is not int or child[key] <= 0 for key in ('pid', 'start_ticks'))
+                    or not isinstance(native.get('control_group'), str) or not native['control_group'].startswith('/')
+                    or child.get('control_group') != native['control_group']
+                    or fixture.process_start_ticks(native['main_pid']) == native['main_pid_start_ticks']
+                    or fixture.process_start_ticks(child['pid']) == child['start_ticks']
+                    or fixture.cgroup_pids(native['control_group']) != []):
+                raise RuntimeContractError('SETUP_INCONCLUSIVE', 'setup exit unavailable')
+            budget(deadline)
+            return record, root, native
+
+        record, root, native = current()
+        expected = {'source': record['source_sha'], 'setup_gid': generation,
+                    'actions': 'sign_in_trust_quit_only', 'confirmed': True}
+        if not isinstance(confirmation, dict) or confirmation != expected or confirmation.get('confirmed') is not True:
+            return failure
+        helper_sha = digest(Path(__file__).resolve())
+        if (native.get('setup_helper_sha256') != helper_sha
+                or native.get('setup_diagnostic') != {'phase': 'observation', 'state': 'returned', 'code': 'NONE'}):
+            return failure
+        state_root = Path(native['root'])
+        binding = _setup_private_json(state_root / 'claude-setup-binding.json', deadline)
+        observation = _setup_private_json(state_root / 'claude-setup-observation.json', deadline)
+        import pwd
+        if (binding['generation_id'] != generation or binding['session_id'] != str(uuid.UUID(hex=generation))
+                or binding['worktree'] != str(root) or binding['native_home'] != pwd.getpwuid(os.getuid()).pw_dir
+                or binding['receipt'] != str(supervisor.receipt)
+                or binding['executable_sha256'] != native.get('setup_executable_sha256')
+                or not re.fullmatch(r'[a-f0-9]{64}', binding['configuration_sha256'])):
+            return failure
+        revalidate(binding, deadline)
+        if (observation.get('state') != 'owned_startup_observed' or observation.get('generation_id') != generation
+                or type(observation.get('observed_at')) not in (int, float) or not 0 < observation['observed_at'] < 1e20
+                or any(observation.get(key) != binding[key] for key in
+                       ('configuration_sha256', 'executable_sha256', 'source_condition_sha256'))
+                or observation.get('hook_sha256') != helper_sha
+                or observation.get('auto_memory_enabled_setting') is not False
+                or observation.get('effective_telemetry') is not False
+                or observation.get('evidence_level') != 'configuration_source_flag_inference'
+                or observation.get('inherited_disable_flag') != '1'
+                or _memory_disable_source(Path(binding['executable']), binding['executable_sha256'],
+                                          deadline=deadline) != binding['source_condition_sha256']):
+            return failure
+        settings = _setup_private_json(state_root / 'claude-setup-settings.json', deadline)
+        if (settings.get('autoMemoryEnabled') is not False or settings.get('permissions', {}).get('deny') != ['CronCreate']
+                or 'SessionStart' not in settings.get('hooks', {})):
+            return failure
+        database = root / '.super-coder/shell_db.db'
+        if database.resolve() != database or database.is_symlink():
+            return failure
+        with contextlib.closing(sqlite3.connect(database.as_uri() + '?mode=ro', uri=True,
+                                              timeout=min(.1, budget(deadline)))) as con:
+            con.set_progress_handler(lambda: int(time.monotonic() >= deadline), 100)
+            row = con.execute('SELECT c.owner_user_id,c.state,c.worktree,c.harness,c.provider,c.model,c.effort,'
+                'c.runtime_projection,s.user_id,s.flavor FROM conversations c JOIN shells s ON s.shell_id=c.shell_id '
+                'WHERE c.conversation_id=?', ('cv_fixture_setup_' + generation,)).fetchone()
+        budget(deadline)
+        if (not row or tuple(row[:7]) != (1, 'closed', str(root), 'claude', 'anthropic', 'claude-sonnet-5-5', 'high')
+                or json.loads(row[7]) != {'role': 'setup', 'generation_id': generation} or tuple(row[8:]) != (1, 'admin')):
+            return failure
+        _setup_record_scope(native.get('setup_transcript_evidence'))
+        if current() != (record, root, native):
+            return failure
+        # Capture the specific human act once; failure never prevents Close.
+        write_private(state_root / 'claude-setup-confirmation.json', expected)
+        records = _setup_record_scope(transcript_turn_evidence(state_root, deadline=deadline))
+        revalidate(binding, deadline)
+        if current() != (record, root, native):
+            return failure
+        budget(deadline)
+        return {'state': 'qualified', 'evidence_level': 'bounded_promptfree_setup_inference',
+                'operator_confirmation': True, 'turn_record_observation': records, 'effective_telemetry': False,
+                'native_inference_verified': False, 'owned_startup_observed': True,
+                'memory_evidence': 'configuration_source_flag_inference', 'whole_unit_exit_verified': True,
+                'preparer_closed': True, 'route_observation': 'requested_configuration_only',
+                'native_trust_acceptance': 'unproved'}
+    except (OSError, ValueError, RuntimeError, KeyError, TypeError, AttributeError, RecursionError, sqlite3.Error):
+        return failure
+
+
 
 def child_owner_current(binding: Mapping[str, Any], deadline: float) -> bool:
     """Recheck durable parent+child ownership at the actual native exec edge."""
