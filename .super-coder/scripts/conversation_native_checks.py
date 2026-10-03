@@ -193,7 +193,7 @@ class NativeChecks:
                     return {'check_id':cid,'state':'accepted'}
             finally:con.close()
 
-    def _automatic_edge(self,check_id: str,fp: str,deadline: float) -> None:
+    def _automatic_edge(self,check_id: str,fp: str,deadline: float,selection: dict) -> None:
         if time.monotonic()>=deadline or not self._current_owner():
             raise RuntimeContractError('CHECK_OWNER_CHANGED','automatic dispatch owner/deadline changed')
         self.operation.supervisor.preparation_identity(deadline=deadline)
@@ -205,6 +205,7 @@ class NativeChecks:
             meta=self._automatic(row) if row else None
             if (row is None or row['owner_user_id']!=1 or row['status'] not in {'accepted','running'}
                     or meta is None or meta['phase']!='claimed' or meta['consumer']!=self.consumer_token
+                    or json.loads(row['selection_json'])!=selection or row['request_hash']!=payload_digest(selection)
                     or meta['expected_fingerprint']!=fp or json.loads(row['result_json']).get('fingerprint')!=fp):
                 raise RuntimeContractError('CHECK_INTENT_INVALID','automatic dispatch no longer owns its captured intent')
         finally:con.close()
@@ -266,7 +267,7 @@ class NativeChecks:
                                 (json.dumps(result),time.time(),row['check_id']))
             finally:con.close()
             self.current,self.beginning,self.failed=row['check_id'],True,None
-            threading.Thread(target=self._begin,args=(row['check_id'],deadline),name='native-check-intent',daemon=True).start()
+            threading.Thread(target=self._begin,args=(row['check_id'],deadline,selection),name='native-check-intent',daemon=True).start()
 
     def create(self,owner: int,key: str,body: dict) -> dict:
         if owner!=1:
@@ -298,7 +299,7 @@ class NativeChecks:
             threading.Thread(target=self._begin,args=(check_id,),name='native-check-intent',daemon=True).start()
         return self.get(owner,check_id=check_id)
 
-    def _begin(self,check_id: str,deadline: float | None=None) -> None:
+    def _begin(self,check_id: str,deadline: float | None=None,claimed_selection: dict | None=None) -> None:
         try:
             con=db_driver.connect(str(self.database))
             try:
@@ -311,9 +312,10 @@ class NativeChecks:
             meta=self._automatic(row)
             options={}
             if meta is not None:
-                if deadline is None:raise RuntimeContractError('CHECK_INTENT_INVALID','claimed check has no current deadline')
+                if (deadline is None or claimed_selection!=selection or row['request_hash']!=payload_digest(selection)):
+                    raise RuntimeContractError('CHECK_INTENT_INVALID','claimed check has no current selected intent')
                 options={'deadline':deadline,'expected_fingerprint':meta['expected_fingerprint'],
-                         'validate_intent':lambda:self._automatic_edge(check_id,meta['expected_fingerprint'],deadline)}
+                         'validate_intent':lambda:self._automatic_edge(check_id,meta['expected_fingerprint'],deadline,selection)}
             self.operation.begin(selection=selection,on_candidate=lambda key:self._bind(check_id,key),**options)
             with self.lock:
                 self.beginning=False
@@ -330,10 +332,13 @@ class NativeChecks:
                     retained=con.execute("SELECT 1 FROM conversation_runtime_probe_jobs WHERE status!='complete' LIMIT 1").fetchone()
                 finally:
                     con.close()
+                retained_guard=False
+                try:self.operation.retained_guard()
+                except Exception:retained_guard=True # noqa: BLE001 - unknown codegen cleanup is not safe retry
                 with self.operation.owner.lock:
-                    empty=((self.operation.future is None or self.operation.future.done()) and not retained
+                    empty=((self.operation.future is None or self.operation.future.done()) and not retained and not retained_guard
                            and not self.operation.owner.allocating and not self.operation.owner.closing)
-                result: dict={'diagnostics':[{'code':'NATIVE_CHECK_INCONCLUSIVE','grade':'inconclusive'}],
+                result: dict={'diagnostics':[{'code':'CLEANUP_PENDING' if retained_guard else 'NATIVE_CHECK_INCONCLUSIVE','grade':'inconclusive'}],
                         'admissible':False,'retry_allowed':empty,'probe':None,'grades':{}}
                 self._save(check_id,'complete' if empty else 'retained',result)
 
@@ -473,6 +478,9 @@ class NativeChecks:
             finally:
                 con.close()
             self.refresh(target)
+            pending_cleanup=False
+            try:self.operation.retained_guard()
+            except Exception:pending_cleanup=True # noqa: BLE001 - recovery cannot assert unknown schema exit
             con=db_driver.connect(str(self.database))
             try:
                 row=con.execute('SELECT * FROM conversation_runtime_check_requests WHERE check_id=?',(target,)).fetchone()
@@ -481,6 +489,8 @@ class NativeChecks:
                     # A retained historical pass is not a claim about the
                     # latest installed source/binary or ordinary resolver.
                     result['admissible']=bool(result.get('admissible') and self._admissible(result,json.loads(row['selection_json'])))
+                    if pending_cleanup:result.update(admissible=False,retry_allowed=False,
+                        diagnostics=[{'code':'CLEANUP_PENDING','grade':'inconclusive'}])
                     if con.execute("SELECT 1 FROM conversation_runtime_check_requests WHERE check_id!=? AND status!='complete' LIMIT 1",(target,)).fetchone() or con.execute("SELECT 1 FROM conversation_runtime_probe_jobs WHERE status!='complete' LIMIT 1").fetchone():
                         result['retry_allowed']=False
                 meta=self._automatic(row)
@@ -494,7 +504,7 @@ class NativeChecks:
                     with self.operation.owner.lock:
                         released=(result.get('fingerprint') not in self.operation.owner.allocating
                                   and result.get('fingerprint') not in self.operation.owner.closing)
-                    if (probe and probe['status']=='complete' and probe['phase']=='closed' and released
+                    if (probe and probe['status']=='complete' and probe['phase']=='closed' and released and not pending_cleanup
                             and cleanup.get('unit_verified_exited') is True
                             and (cleanup.get('native_outcome')=='complete' or cleanup.get('never_launched') is True)
                             and not cleanup.get('unresolved_work') and not cleanup.get('unresolved_definitions')):
@@ -507,7 +517,7 @@ class NativeChecks:
                         self._save(target,'complete',persisted)
                         return result
                     result.update(state='retained',admissible=False,retry_allowed=False,
-                                  diagnostics=[{'code':'CHECK_CONSUMER_RESTARTED','grade':'inconclusive'}])
+                                  diagnostics=[{'code':'CLEANUP_PENDING' if pending_cleanup else 'CHECK_CONSUMER_RESTARTED','grade':'inconclusive'}])
                 return result
             finally:
                 con.close()

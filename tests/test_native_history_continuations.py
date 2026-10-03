@@ -41,7 +41,8 @@ def seat(tmp_path,monkeypatch):
     con.execute("INSERT INTO users(user_id,username) VALUES(1,'synthetic'),(2,'foreign')")
     con.execute("INSERT INTO shells(shell_id,shortname,display_name,flavor,system_prompt,user_id,api_key) VALUES(1,'FX','Synthetic','dev','synthetic',1,'synthetic-token')")
     worktree=tmp_path/'.sc-worktrees/fx';worktree.mkdir(parents=True)
-    fp=Fingerprint('codex',ExecutableBinding(Path('/synthetic/native'),'b'*64,'synthetic-version'),
+    native=tmp_path/'synthetic-native';native.write_bytes(b'non-executable synthetic transport fixture')
+    fp=Fingerprint('codex',ExecutableBinding(native,'b'*64,'synthetic-version'),
                    DRIVER_REVISION,'c'*64,'openai','selected-model','high','c'*64,'d'*64)
     binding=NativeProbeOwner.candidate_binding(fp)
     binding['selector_binding'].update(proof_state='checked_native_selection',native_fingerprint=fp.key)
