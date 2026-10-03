@@ -161,7 +161,11 @@ def adapter_interface(driver) -> tuple[dict,dict]:
 
 
 class FixtureNativeCheck:
-    def __init__(self, *, database: Path, root: Path, fixture_id: str, supervisor, native_bindings):
+    def __init__(self, *, database: Path, root: Path, fixture_id: str, supervisor, native_bindings,
+                 behavioral_profile: str = 'full'):
+        if type(behavioral_profile) is not str or behavioral_profile not in {'full','submission-preview'}:
+            raise ValueError('fixed fixture behavioral profile required')
+        self._behavioral_profile=behavioral_profile
         if database.resolve()!=root.resolve()/'.super-coder/shell_db.db' or not fixture_id:
             raise ValueError('synthetic fixture identity required')
         # Ownership is proved before even bounded native identity discovery.
@@ -174,7 +178,8 @@ class FixtureNativeCheck:
         finally:
             con.close()
         self.seat=NativeFixtureSeat(database=database,root=root,supervisor=supervisor,
-                                  native_bindings=native_bindings,cache=self.cache)
+                                  native_bindings=native_bindings,cache=self.cache,
+                                  behavioral_profile=behavioral_profile)
         self.service=conversation_native_chats.NativeChatsService(database,root,supervisor)
         self.owner=NativeProbeOwner(self.seat,self.service)
         self.factory=NativeProbeFactory(self.owner.allocate,self.owner.cleanup)
@@ -348,6 +353,8 @@ class FixtureNativeCheck:
                 # route and qualified memory observations are required by the
                 # owned driver/factory before useful inference and cache proof.
                 shape,requirements=adapter_interface(create_driver())
+            if self._behavioral_profile=='submission-preview':
+                requirements={'submission':requirements['submission']}
             remaining=deadline-time.monotonic()
             if remaining<60:
                 raise RuntimeContractError('CHECK_DEADLINE','source preparation consumed the finite check budget')
@@ -530,12 +537,14 @@ def handle_check(method: str,headers_raw: str,body: bytes) -> tuple:
         con.close()
 
 
-def start_fixture(*,database: Path,root: Path,fixture_id: str,supervisor,native_bindings=None):
+def start_fixture(*,database: Path,root: Path,fixture_id: str,supervisor,native_bindings=None,
+                  behavioral_profile: str = 'full'):
     global _FIXTURE
     if _FIXTURE is not None:
         raise ValueError('one fixture API owner required')
     _FIXTURE=FixtureNativeCheck(database=database,root=root,fixture_id=fixture_id,
-                              supervisor=supervisor,native_bindings=native_bindings or {})
+                              supervisor=supervisor,native_bindings=native_bindings or {},
+                              behavioral_profile=behavioral_profile)
     from gui_experiment_chats import FixtureChats
     _FIXTURE.chats=FixtureChats(_FIXTURE)
     _FIXTURE.chats.start()

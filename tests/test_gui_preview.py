@@ -303,6 +303,7 @@ def test_preview_banner_is_only_captured_profile_and_never_changes_source_html()
     assert fx.preview_html({'preview': True, 'native_harnesses': ['claude']}, original) is original
     decorated = fx.preview_html({'preview': True, 'native_harnesses': ['codex'], 'expires_at': 1}, original)
     assert b'Isolated native Chat preview' in decorated[2]
+    assert b'Foreground cancellation and targeted work controls are unverified.' in decorated[2]
     assert b'Stop/restart deletes chats and project edits' in decorated[2]
     assert b'Claude setup pending; Sprints unavailable' in decorated[2]
     assert b'real app' in decorated[2]

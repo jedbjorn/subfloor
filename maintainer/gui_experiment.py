@@ -1223,7 +1223,7 @@ def preview_html(record: dict, response: tuple) -> tuple:
               'Isolated native Chat preview · expires ' + expiry +
               ' · Stop/restart deletes chats and project edits. '
               'Codex gpt-6.1-sol/high; Claude setup pending; Sprints unavailable. '
-              'Native controls depend on measured capability.</aside>')
+              'Foreground cancellation and targeted work controls are unverified.</aside>')
     decorated = body.replace(b'<body>', b'<body>' + banner.encode(), 1)
     headers = [(key, value) for key, value in headers if key.lower() != 'content-length']
     return status, headers, decorated
@@ -1336,7 +1336,8 @@ def serve(root: Path, *, resume: bool=False) -> int:
         gui_experiment_runtime = importlib.import_module("gui_experiment_runtime")
         runtime_stop = gui_experiment_runtime.start_fixture(
             database=db, root=root, fixture_id=trusted["fixture_id"],
-            supervisor=NativeSupervisor(Path(trusted["receipt"])),native_bindings=native_bindings)
+            supervisor=NativeSupervisor(Path(trusted["receipt"])),native_bindings=native_bindings,
+            behavioral_profile='submission-preview' if trusted.get('preview') is True else 'full')
         if not callable(runtime_stop):
             raise FixtureError("RUNTIME_UNAVAILABLE", "experimental start_fixture must return a shutdown callable")
 

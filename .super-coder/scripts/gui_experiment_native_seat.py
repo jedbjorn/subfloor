@@ -75,7 +75,11 @@ def _reap_dependency_group(process,ticks: int,cgroup: str,deadline: float) -> No
 
 class NativeFixtureSeat:
     def __init__(self, *, database: Path, root: Path, supervisor,
-                 native_bindings: Mapping[str,str], cache: EvidenceCache):
+                 native_bindings: Mapping[str,str], cache: EvidenceCache,
+                 behavioral_profile: str = 'full'):
+        if type(behavioral_profile) is not str or behavioral_profile not in {'full','submission-preview'}:
+            raise RuntimeContractError('CONTEXT_INVALID','fixed fixture behavioral profile required')
+        self._behavioral_profile=behavioral_profile
         self.database,self.root,self.supervisor,self.cache=database,root,supervisor,cache
         if (database.resolve()!=root.resolve()/'.super-coder/shell_db.db'
                 or run.ENGINE.resolve()!=root.resolve()/'.super-coder'
@@ -205,11 +209,18 @@ class NativeFixtureSeat:
                         for gid in {generation for generation,_ in children})
         return max(0,2-len(units)-child_count)
 
+    @property
+    def behavioral_profile(self) -> str:
+        return self._behavioral_profile
+
     def settings_digest(self,harness: str) -> str:
         adapter=run.load_adapter(harness)
         # Dynamic owner/chat/boot/port values are intentionally absent. The
         # canonical policy and fixed fixture tool schema remain part of identity.
-        return payload_digest({'adapter':adapter,'fixture_mcp':{'revision':1,'tools':['fixture_identity','fixture_state']}})
+        settings: dict={'adapter':adapter,'fixture_mcp':{'revision':1,'tools':['fixture_identity','fixture_state']}}
+        if self.behavioral_profile=='submission-preview':
+            settings['behavioral_profile']='submission-preview'
+        return payload_digest(settings)
 
     def candidate_fingerprint(self,harness: str,model: str,effort: str) -> Fingerprint:
         """Capture requested transport identity, without claiming availability."""

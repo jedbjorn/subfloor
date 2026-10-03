@@ -51,7 +51,8 @@ def operation(request,monkeypatch):
                 key:True for key in ('cleanup_complete','child_registered','gate_released','child_reaped','process_group_exited','files_removed')}
     monkeypatch.setattr(runtime,'NativeFixtureSeat',Seat)
     value=runtime.FixtureNativeCheck(database=path,root=root,fixture_id='test',
-                                    supervisor=supervisor,native_bindings={})
+                                    supervisor=supervisor,native_bindings={},
+                                    behavioral_profile=getattr(request,'param','full'))
     yield value,fp,con,calls
     value.shutdown()
     con.close()
