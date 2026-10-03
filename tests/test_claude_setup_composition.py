@@ -54,6 +54,14 @@ def test_core_setup_guards_retain_approved_source():
     assert hashes['revalidate'] == '6884d0c426f5ee058818872a7b9605caa365c0928d528bc05bb87a539c87a3cb'
     assert hashes['observe_hook'] == 'b3f9adc9130db20b60561969ec0f4d7b295f6079a3f2f320ebc62c5a1cdd06ef'
     assert hashes['transcript_pointer'] == '3828fc73bcc4ce7a47b3de1e9b3c5b1e7c92574924b0bc1e63c7314092352dd4'
-    assert hashes['transcript_turn_evidence'] == '349fa1d2df19129781d24bd56ca4d48a3fdb923db19387d65cd1bc0fd9c8ea7f'
+    # D420's explicit missing-pointer distinction is the sole reader delta.
+    assert hashes['transcript_turn_evidence'] == '0473b33e093d32508386f5ab3b21dc63256ba3e20b95680ab5041ffc951df135'
+    reader = next(node for node in tree.body if isinstance(node, ast.FunctionDef)
+                  and node.name == 'transcript_turn_evidence')
+    missing = [node for node in ast.walk(reader) if isinstance(node, ast.If)
+               and ast.unparse(node.test) == "current['file_identity'] is None"]
+    assert len(missing) == 1
+    missing[0].body = [ast.Return(value=ast.Name(id='failure', ctx=ast.Load()))]
+    assert hashlib.sha256(ast.dump(reader, include_attributes=False).encode()).hexdigest() == '349fa1d2df19129781d24bd56ca4d48a3fdb923db19387d65cd1bc0fd9c8ea7f'
     assert hashes['child_owner_current'] == '936d5377c17d004077219f9d97a00097ef785006ed44291a21e08bcc5966e869'
     assert hashes['gated_child'] == 'e55563dae8b7422bf440b5f990356ddd0d98bacbe627628c44672687119fdf2e'
