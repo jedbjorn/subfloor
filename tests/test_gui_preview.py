@@ -3,6 +3,7 @@ import importlib.util
 import io
 import json
 import shutil
+import socket
 import subprocess
 import tarfile
 from pathlib import Path
@@ -305,3 +306,23 @@ def test_preview_banner_is_only_captured_profile_and_never_changes_source_html()
     assert b'real app' in decorated[2]
     assert not decorated[1]
     assert original[2] == b'<html><body>real app</body></html>'
+
+
+def test_adjacent_dev_port_conflict_refuses_before_session_reservation(lifecycle, monkeypatch):
+    package, _, calls, _ = lifecycle
+    with socket.socket() as dev:
+        dev.bind(('127.0.0.1', 0))
+        dev_port = dev.getsockname()[1]
+        with pytest.raises(preview.PreviewError, match='occupied'):
+            preview.operate(package, 'start', dev_port - 1)
+    assert calls == []
+    assert json.loads((package / 'install.json').read_text())['sessions'] == []
+
+
+def test_preview_port_default_ignores_host_dev_port_and_invalid_types(monkeypatch):
+    monkeypatch.setenv('SC_DEV_PORT', '1')
+    selected = preview.preview_ports(None)
+    assert selected > 1024
+    for invalid in (True, 0, 65536, '123'):
+        with pytest.raises(preview.PreviewError):
+            preview.preview_ports(invalid)

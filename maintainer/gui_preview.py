@@ -16,6 +16,7 @@ import importlib.util
 import json
 import os
 import shutil
+import socket
 import stat
 import subprocess
 import sys
@@ -35,6 +36,20 @@ def preflight() -> None:
     if (sys.version_info[:2] != (3, 14)
             or importlib.metadata.version('websockets') != '16.1.1'):
         raise PreviewError('use Python 3.14 with the source-pinned websockets 16.1.1 dependency')
+
+
+def preview_ports(requested: int | None) -> int:
+    """One bounded availability check, not a reservation or retrying manager."""
+    if requested is not None and (type(requested) is not int or not 1 <= requested <= 65535):
+        raise PreviewError('preview API port must be 1..65535')
+    try:
+        with socket.socket() as api, socket.socket() as dev:
+            api.bind(('127.0.0.1', requested or 0))
+            selected = int(api.getsockname()[1])
+            dev.bind(('127.0.0.1', selected + 1 if selected < 65535 else 65534))
+            return selected
+    except OSError:
+        raise PreviewError('preview API or adjacent dev port is occupied; choose another --port') from None
 
 
 def digest(path: Path) -> str:
@@ -228,7 +243,8 @@ def summary(package: Path, manifest: dict, fx) -> dict:
         if phase != 'stopped' and (expired or not alive):
             phase = 'expired-cleanup-required' if expired else 'inactive-cleanup-required'
         result.update(state=phase,
-                      url=record.get('url'), seconds_remaining=max(0, int(record['expires_at'] - time.time())),
+                      url=record.get('url'), dev_port=record['port'] + 1 if record['port'] < 65535 else 65534,
+                      seconds_remaining=max(0, int(record['expires_at'] - time.time())),
                       workspace=record['root'], cleanup_complete=record.get('cleanup', {}).get('complete') is True)
     return result
 
@@ -263,6 +279,7 @@ def operate(package: Path, action: str, port: int | None = None) -> dict:
                 raise PreviewError('existing session retained; use stop before a fresh start')
         if len(manifest['sessions']) >= MAX_SESSIONS:
             raise PreviewError('evaluation session bound reached; remove and reinstall after cleanup')
+        selected_port = preview_ports(port)
         session = str(len(manifest['sessions']) + 1)
         receipt = package / 'runs' / f'{session}.json'
         manifest['sessions'].append(session)
@@ -272,7 +289,7 @@ def operate(package: Path, action: str, port: int | None = None) -> dict:
         project = None if manifest['project'] is None else (manifest['project'], (package / 'project.tar').read_bytes())
         try:
             fx.start(package / 'source.git', manifest['source_sha'], receipt,
-                     temp_parent=package / 'runs', runtime='experimental', port=port,
+                     temp_parent=package / 'runs', runtime='experimental', port=selected_port,
                      lifetime=1800, project=project, native_harnesses=('codex',), preview=True)
         except Exception:
             # Preallocation failures are safe to roll back only when no receipt
