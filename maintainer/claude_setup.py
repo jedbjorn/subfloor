@@ -365,9 +365,11 @@ def transcript_turn_evidence(state: Path, *, deadline: float) -> dict[str,Any]:
             # Distinguish only a qualified pointer that never had a file.
             # This is not evidence of zero turns or successful setup. Unknown
             # pointers, removed files and all other read failures stay opaque.
+            if type(pointer['minimum_size']) is not int or pointer['minimum_size']!=0:return failure
             revalidate(binding, deadline)
             budget(deadline)
             if transcript_pointer(binding,path)!=current:return failure
+            budget(deadline)
             return failure | {'reason':'qualified_transcript_missing'}
         fd=os.open(path,os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK)
         with os.fdopen(fd,'rb') as stream:

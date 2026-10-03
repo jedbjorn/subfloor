@@ -610,6 +610,33 @@ def test_file_created_during_missing_source_revalidation_stays_unavailable(trans
     assert result=={'state':'inconclusive','evidence':'exact_session_transcript_turn_records'}
 
 
+@pytest.mark.parametrize('minimum_size',[1,-1,False,'0',None])
+def test_missing_transcript_requires_exact_never_present_size(transcript,minimum_size):
+    context,binding,path,_row=transcript
+    pointer=context.state_root/'claude-setup-transcript.json'
+    pointer.unlink();path.unlink()
+    value=setup.transcript_pointer(binding,path);value['minimum_size']=minimum_size
+    setup.write_private(pointer,value)
+    result=setup.transcript_turn_evidence(context.state_root,deadline=time.monotonic()+2)
+    assert result=={'state':'inconclusive','evidence':'exact_session_transcript_turn_records'}
+
+
+def test_missing_transcript_final_observation_deadline_fences_reason(transcript,monkeypatch):
+    context,binding,path,_row=transcript
+    pointer=context.state_root/'claude-setup-transcript.json'
+    pointer.unlink();path.unlink()
+    setup.write_private(pointer,setup.transcript_pointer(binding,path))
+    deadline=time.monotonic()+.03
+    original=setup.transcript_pointer;calls=[]
+    def late(*args):
+        value=original(*args);calls.append(True)
+        if len(calls)==2:time.sleep(max(0,deadline-time.monotonic())+.01)
+        return value
+    monkeypatch.setattr(setup,'transcript_pointer',late)
+    result=setup.transcript_turn_evidence(context.state_root,deadline=deadline)
+    assert result=={'state':'inconclusive','evidence':'exact_session_transcript_turn_records'}
+
+
 def test_owned_synthetic_hook_captures_pointer_privately_only(context,tmp_path,monkeypatch):
     # Actual pytest OS identity, synthetic hook fields; no native account/CLI.
     binary=Path(sys.executable).resolve();home=tmp_path/'native-home'

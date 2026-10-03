@@ -55,7 +55,7 @@ def test_core_setup_guards_retain_approved_source():
     assert hashes['observe_hook'] == 'b3f9adc9130db20b60561969ec0f4d7b295f6079a3f2f320ebc62c5a1cdd06ef'
     assert hashes['transcript_pointer'] == '3828fc73bcc4ce7a47b3de1e9b3c5b1e7c92574924b0bc1e63c7314092352dd4'
     # D420's explicit missing-pointer distinction is the sole reader delta.
-    assert hashes['transcript_turn_evidence'] == '0473b33e093d32508386f5ab3b21dc63256ba3e20b95680ab5041ffc951df135'
+    assert hashes['transcript_turn_evidence'] == '031040bc216c3c838eed20254d1400cbc90f6e488ac15c94b6d827223ec5be6a'
     reader = next(node for node in tree.body if isinstance(node, ast.FunctionDef)
                   and node.name == 'transcript_turn_evidence')
     missing = [node for node in ast.walk(reader) if isinstance(node, ast.If)
