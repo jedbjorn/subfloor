@@ -328,7 +328,7 @@ def test_native_control_stable_request_never_rewrites_ambiguous_or_written_deliv
 @pytest.mark.parametrize('variant,verdict', [('terminal','compatible'),('child','inconclusive')])
 def test_stop_work_admits_only_matching_direct_target_coverage(database,monkeypatch,variant,verdict):
     path,con=database
-    runtime={'generation_id':'g','state':'ready','capabilities':{'stop_work':'compatible','stop_work_terminal':'compatible','stop_work_child':'inconclusive'}}
+    runtime={'generation_id':'g','state':'ready','root_id':'root','capabilities':{'stop_work':'compatible','stop_work_terminal':'compatible','stop_work_child':'inconclusive'}}
     con.execute("UPDATE conversations SET runtime_mode='native_experiment',runtime_projection=?",(json.dumps(runtime),))
     work=dataclasses.asdict(RuntimeEvent('work.observed',NativeReference('root',thread_id='root' if variant=='terminal' else 'child',activity_id='child-turn',native_process_id='opaque-process' if variant=='terminal' else None),data={'kind':variant}))
     con.execute("INSERT INTO conversation_runtime_work(generation_id,work_key,projection_json,last_sequence) VALUES('g','stored-target',?,1)",(json.dumps(work),));con.commit()
@@ -407,12 +407,14 @@ def test_actual_claude_work_events_survive_store_and_admit_only_proved_scoped_te
     from conversation_adapters.claude_runtime import ClaudeRuntimeDriver
     from conversation_runtime_contract import RuntimeIdentity
     path,con=database
-    runtime={'generation_id':'g','state':'ready','capabilities':{'stop_work':'compatible','stop_work_terminal':'compatible','stop_work_child':'inconclusive'}}
+    runtime={'generation_id':'g','state':'ready','root_id':'root','capabilities':{'stop_work':'compatible','stop_work_terminal':'compatible','stop_work_child':'inconclusive'}}
     con.execute("UPDATE conversations SET runtime_mode='native_experiment',runtime_projection=?",(json.dumps(runtime),))
     con.commit()
     events=[];driver=ClaudeRuntimeDriver();driver._identity=RuntimeIdentity('root');driver._emit=events.append
     if observation!='unknown-task':
         driver._tool({'hook_event_name':'PostToolUse','tool_name':'Bash','tool_use_id':'tool','tool_input':{},'tool_response':{'backgroundTaskId':'native-bash-id'}},None)
+        if observation=='bash':
+            driver._snapshot({'hook_event_name':'Stop','prompt_id':'observed-turn','background_tasks':[{'id':'native-bash-id','type':'shell','status':'running'}],'session_crons':[]})
     if observation!='bash':
         driver._snapshot({'background_tasks':[{'id':'native-bash-id'}],'session_crons':[]})
     service=NativeChatsService(path,path.parent,None)
@@ -432,7 +434,7 @@ def test_actual_claude_work_events_survive_store_and_admit_only_proved_scoped_te
         assert writes[0]['command']['target']['work_id']=='native-bash-id'
     else:
         with pytest.raises(RuntimeContractError) as raised:service.control(con,'cv',1,'stop',body)
-        assert raised.value.code==('WORK_INCONCLUSIVE' if observation=='partial' else 'CAPABILITY_INCONCLUSIVE')
+        assert raised.value.code=='WORK_INCONCLUSIVE'
         assert writes==[]
 
 
