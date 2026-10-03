@@ -862,7 +862,7 @@ class _Scenarios:
             if work_enabled and root_work is not None and root_pid is not None:
                 self.stage = "stop_work_terminal"
                 self._phase("stop_terminal")
-                terminal_control = self._control("stop_work", root_work.reference)
+                terminal_control = self._control("stop_work", root_work.reference, root_work.reference.activity_id)
                 self._wait(lambda: self._control_completed(terminal_control, root_work.reference))
                 self._wait(lambda: not self._alive(root_pid))
                 self._wait(lambda: not any(w.kind == "terminal" and w.reference.thread_id == root.root_id
