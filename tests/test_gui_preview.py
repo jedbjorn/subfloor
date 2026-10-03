@@ -330,6 +330,7 @@ def test_preview_port_default_ignores_host_dev_port_and_invalid_types(monkeypatc
 
 def test_committed_project_cannot_override_engine_or_managed_boot(installed, tmp_path):
     _, project, _, _ = installed
+    (project / 'untracked.txt').unlink()  # This test commits new reserved paths only.
     reserved = ['sc', 'AGENTS.md', 'CLAUDE.md', 'opencode.json',
                 '.super-coder/api/server.py', '.sc-state/engine.ref',
                 '.subfloor/dev-kit', '.claude/settings.json', '.codex/config.toml']
