@@ -104,7 +104,18 @@ class MetadataAlias:
                 or not self.alias.is_symlink()
                 or os.readlink(self.alias) != str(self.executable)):
             raise SprintFixtureError('SPRINT_ALIAS_INVALID')
-        if executable_identity(self.executable, deadline=deadline)['sha256'] != self.expected_sha256:
+        alias_before = self.alias.lstat()
+        executable_before = self.executable.lstat()
+        captured = executable_identity(self.executable, deadline=deadline)
+        fields = ('st_dev', 'st_ino', 'st_size', 'st_mtime_ns', 'st_ctime_ns')
+        if (time.monotonic() >= deadline
+                or any(getattr(info,k) != getattr(self.directory.lstat(),k) for k in fields)
+                or any(getattr(alias_before,k) != getattr(self.alias.lstat(),k) for k in fields)
+                or os.readlink(self.alias) != str(self.executable)
+                or any(getattr(executable_before,k) != getattr(self.executable.lstat(),k) for k in fields)
+                or (captured['device'],captured['inode']) != (executable_before.st_dev,executable_before.st_ino)):
+            raise SprintFixtureError('SPRINT_ALIAS_INVALID')
+        if captured['sha256'] != self.expected_sha256:
             raise SprintFixtureError('SPRINT_EXECUTABLE_CHANGED')
 
 
@@ -134,13 +145,47 @@ def validate_roles(con, fixture_id: str) -> None:
             raise SprintFixtureError('SPRINT_ROLE_CONFLICT')
 
 
+class _ShutdownConnection(sqlite3.Connection):
+    """Only this fixed cleanup caller bounds canonical SQL at every edge."""
+    deadline: float
+
+    def remaining(self) -> float:
+        remaining = self.deadline - time.monotonic()
+        if remaining <= 0:
+            raise SprintFixtureError('SPRINT_SHUTDOWN_DEADLINE')
+        return remaining
+
+    def execute(self, sql, parameters=()):
+        milliseconds = max(0, min(50, int(self.remaining()*1000)))
+        super().execute('PRAGMA busy_timeout='+str(milliseconds))
+        if sql.strip().lower().startswith('pragma busy_timeout='):
+            sql = 'PRAGMA busy_timeout='+str(milliseconds)
+        result = super().execute(sql,parameters)
+        self.remaining()
+        return result
+
+    def commit(self):
+        self.remaining()
+        super().commit()
+        self.remaining()
+
+
 def close_operator_chats(database: Path, fixture_id: str, *, deadline: float) -> int:
     """Canonical Close of undispatched operator Planner wake chats, after join."""
     import conversation_routes
-    import db_driver
-    con = db_driver.connect(database)
+    if time.monotonic() >= deadline or database.is_symlink():
+        raise SprintFixtureError('SPRINT_SHUTDOWN_DEADLINE')
+    con = sqlite3.connect(str(database),timeout=max(0,min(.05,deadline-time.monotonic())),factory=_ShutdownConnection)
+    con.deadline = deadline
+    con.row_factory = sqlite3.Row
+    con.set_progress_handler(lambda: 1 if time.monotonic() >= deadline else 0,100)
     try:
-        con.execute('PRAGMA busy_timeout='+str(max(1, min(50, int((deadline-time.monotonic())*1000)))))
+        # Same engine PRAGMAs, without the default connection's fresh 5s WAL
+        # acquisition budget. Every later canonical transaction is fenced by
+        # this connection's original absolute deadline, including retries.
+        con.execute('PRAGMA foreign_keys=ON')
+        con.execute('PRAGMA journal_mode=WAL')
+        con.execute('PRAGMA synchronous=NORMAL')
         validate_roles(con, fixture_id)
         rows = con.execute('SELECT c.conversation_id,c.version,c.state,c.runtime_mode,c.owner_user_id,c.model,c.effort '
                            'FROM conversations c JOIN sprint_participant_conversations link USING(conversation_id) '
@@ -162,7 +207,10 @@ def close_operator_chats(database: Path, fixture_id: str, *, deadline: float) ->
                 conversation_routes._patch_conversation(con, {'user_id': 1}, cid,
                                                         {'version': row['version'], 'state': 'closed'})
                 closed += 1
+        con.remaining()
         return closed
+    except sqlite3.Error:
+        raise SprintFixtureError('SPRINT_PLANNER_CLOSE_PENDING') from None
     finally:
         con.close()
 
@@ -172,7 +220,10 @@ def require_durable_cleanup(database: Path, *, deadline: float) -> None:
     if time.monotonic()>=deadline or database.is_symlink():
         raise SprintFixtureError('SPRINT_DURABLE_CLEANUP_UNKNOWN')
     con=sqlite3.connect(database.as_uri()+'?mode=ro',uri=True,timeout=max(.001,min(.05,deadline-time.monotonic())))
+    con.set_progress_handler(lambda:1 if time.monotonic()>=deadline else 0,100)
     try:
+        if time.monotonic()>=deadline:
+            raise SprintFixtureError('SPRINT_DURABLE_CLEANUP_UNKNOWN')
         if con.execute("SELECT 1 FROM sprint_cleanup_targets WHERE target_kind='artifact_dir' AND state<>'succeeded' LIMIT 1").fetchone():
             raise SprintFixtureError('SPRINT_DURABLE_CLEANUP_UNKNOWN')
         for state,raw in con.execute('SELECT state,cleanup_json FROM conversation_runtime_generations LIMIT 65'):
@@ -224,7 +275,11 @@ class SprintSeat:
                 self.record({'state': 'cleanup_inconclusive', 'code': 'SPRINT_CLEANUP_JOIN_PENDING'})
                 raise SprintFixtureError('SPRINT_CLEANUP_JOIN_PENDING')
         try:
+            if time.monotonic() >= deadline:
+                raise SprintFixtureError('SPRINT_SHUTDOWN_DEADLINE')
             closed = close_operator_chats(self.database, self.fixture_id, deadline=deadline)
+            if time.monotonic() >= deadline:
+                raise SprintFixtureError('SPRINT_SHUTDOWN_DEADLINE')
         except Exception:  # noqa: BLE001 - static code retains all failed cleanup obligations
             self.record({'state': 'cleanup_inconclusive', 'code': 'SPRINT_PLANNER_CLOSE_PENDING'})
             raise SprintFixtureError('SPRINT_PLANNER_CLOSE_PENDING') from None

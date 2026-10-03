@@ -707,10 +707,10 @@ def stop_locked(receipt: Path) -> dict[str, Any]:
                         or status.get('cleanup_worker_joined') is not True):
                     raise FixtureError('CLEANUP_UNVERIFIED','Sprint worker receipt has a stale owner')
             # OS exit cannot erase unresolved durable native/artifact obligations.
+            module=sprint_helper(root, record['sprint_helper_sha256'])
             if status['state']=='stopped':
-                module=sprint_helper(root, record['sprint_helper_sha256'])
                 module.worker_status({key:value for key,value in status.items() if key not in {'fixture_id','source_sha','purpose','unit','owner'}})
-                module.require_durable_cleanup(root/'.super-coder/shell_db.db', deadline=time.monotonic()+1)
+            module.require_durable_cleanup(root/'.super-coder/shell_db.db', deadline=time.monotonic()+1)
             record['sprint_status'] = status
         except (FixtureError, OSError, RuntimeError):
             record['cleanup'] = {'complete': False, 'cgroup_empty': True,

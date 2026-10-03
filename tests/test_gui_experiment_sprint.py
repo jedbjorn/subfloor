@@ -388,3 +388,72 @@ def test_fixed_copied_helper_load_refuses_hash_symlink_and_missing(tmp_path):
     with pytest.raises(OSError):fixture.sprint_helper(tmp_path,sha)
     path.unlink()
     with pytest.raises(OSError):fixture.sprint_helper(tmp_path,sha)
+
+
+@pytest.mark.parametrize('change', ['alias','directory','binary'])
+def test_alias_rechecks_all_path_identities_after_bounded_hash(inert_alias,monkeypatch,tmp_path,change):
+    alias,executable=inert_alias;alias.prepare(deadline=time.monotonic()+1)
+    original=sprint.executable_identity
+    def change_after_hash(path,*,deadline):
+        result=original(path,deadline=deadline)
+        if change=='alias':alias.alias.unlink();alias.alias.symlink_to('/bin/false')
+        elif change=='directory':
+            alias.directory.rename(tmp_path/'old-directory');alias.directory.mkdir(mode=0o700)
+            alias.alias.symlink_to(executable)
+        else:executable.write_bytes(b'changed-after-hash')
+        return result
+    monkeypatch.setattr(sprint,'executable_identity',change_after_hash)
+    with pytest.raises(sprint.SprintFixtureError):alias.verify(deadline=time.monotonic()+1)
+
+
+def test_shutdown_expiry_after_close_refuses_final_stopped_receipt(tmp_path,monkeypatch):
+    records=[];seat=sprint.SprintSeat(tmp_path/'db',FID,record=records.append);seat.service=ThreadStub(False)
+    def exhausted(*args,**kw):time.sleep(.025);return 0
+    monkeypatch.setattr(sprint,'close_operator_chats',exhausted)
+    with pytest.raises(sprint.SprintFixtureError):seat.shutdown(deadline=time.monotonic()+.01)
+    assert records==[{'state':'cleanup_inconclusive','code':'SPRINT_PLANNER_CLOSE_PENDING'}]
+
+
+def test_expired_cleanup_never_opens_database(tmp_path,monkeypatch):
+    monkeypatch.setattr(sqlite3,'connect',lambda *args,**kw:pytest.fail('expired cleanup cannot open DB'))
+    with pytest.raises(sprint.SprintFixtureError):sprint.close_operator_chats(tmp_path/'db',FID,deadline=time.monotonic()-1)
+
+
+def test_canonical_close_writer_wait_uses_original_absolute_deadline(database):
+    path,con=database;cid=planner_chat(con)
+    blocker=sqlite3.connect(path,check_same_thread=False);blocker.execute('BEGIN IMMEDIATE')
+    release=threading.Timer(.25,blocker.rollback);release.start();before=time.monotonic()
+    try:
+        with pytest.raises(sprint.SprintFixtureError):sprint.close_operator_chats(path,FID,deadline=before+.025)
+        assert time.monotonic()-before<.10
+        assert con.execute('SELECT state FROM conversations WHERE conversation_id=?',(cid,)).fetchone()[0]!='closed'
+    finally:release.join(1);blocker.close()
+
+
+@pytest.mark.parametrize('obligation', ['native','artifact','clean'])
+def test_not_started_retains_actual_durable_obligations_even_with_valid_helper(tmp_path,monkeypatch,database,obligation):
+    import test_gui_experiment as original
+    monkeypatch.setattr(fixture,'REGISTRY',tmp_path/'registry');monkeypatch.setattr(original.fixture,'REGISTRY',tmp_path/'registry')
+    _path,con=database;cid=planner_chat(con)
+    if obligation=='native':
+        con.execute("INSERT INTO conversation_runtime_generations(generation_id,conversation_id,shell_id,owner_user_id,harness,binding_json,state,cleanup_json,created_at,updated_at) VALUES('g',?,4,1,'codex','{}','closing','{}',1,1)",(cid,))
+    elif obligation=='artifact':
+        con.execute("INSERT INTO sprint_participants(sprint_id,shell_id,role,harness) VALUES(1,2,'reviewer','codex')")
+        con.execute("UPDATE sprints SET conformance_reviewer_shell_id=2,conformance_owner_generation=1,merge_grant_enabled=1 WHERE sprint_id=1")
+        con.execute("UPDATE sprints SET lifecycle='armed' WHERE sprint_id=1")
+        con.execute("UPDATE sprints SET lifecycle='completed',terminal_outcome='accepted' WHERE sprint_id=1")
+        con.execute("INSERT INTO sprint_cleanup_targets(sprint_id,target_kind,canonical_path,repository_root,git_common_dir) VALUES(1,'artifact_dir','/synthetic/artifact','/synthetic','/synthetic/.git')")
+    con.commit();record,root,receipt=original.marked(tmp_path)
+    db=root/'.super-coder/shell_db.db';db.parent.mkdir()
+    with sqlite3.connect(db) as copy:con.backup(copy)
+    helper=root/fixture.SPRINT_HELPER;helper.parent.mkdir();helper.write_bytes((ROOT/fixture.SPRINT_HELPER).read_bytes())
+    record.update(purpose='native-sprint',runtime='experimental',sprint_helper_sha256=hashlib.sha256(helper.read_bytes()).hexdigest())
+    fixture.write_json(root/fixture.MARKER,fixture.identity(record));fixture.save(record,receipt)
+    fixture.write_json(root/'sprint-status.json',{'fixture_id':record['fixture_id'],'source_sha':record['source_sha'],'purpose':'native-sprint','unit':record['unit'],'state':'not_started'})
+    monkeypatch.setattr(fixture,'unit_state',lambda _:original.missing_state());monkeypatch.setattr(fixture,'cgroup_pids',lambda _:[])
+    monkeypatch.setattr(fixture,'process_start_ticks',lambda _:None)
+    if obligation=='clean':
+        assert fixture.stop(receipt)['cleanup']['complete'] is True and not root.exists()
+    else:
+        with pytest.raises(fixture.FixtureError):fixture.stop(receipt)
+        assert root.exists() and db.exists() and fixture.read_json(receipt)['cleanup']['complete'] is False
