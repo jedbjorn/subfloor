@@ -7,6 +7,7 @@ scope is retained in every projected observation and control request.
 from __future__ import annotations
 
 import json
+import math
 import sqlite3
 import threading
 import time
@@ -189,6 +190,33 @@ def project_event(con, cid: str, sequence: int, event: dict, *, primary: dict | 
     append_event(con,cid,kind,envelope,message_id=mid,run_id=rid)
 
 
+def claude_terminal_stop_record(runtime: dict, observed: dict) -> bool:
+    """A timestamped complete Stop record admits a request, never currentness.
+
+    Later inventory uncertainty remains visible. Only the native result and a
+    later matching complete snapshot can resolve this model-mediated request.
+    """
+    data, ref = observed.get('data'), observed.get('reference')
+    if not isinstance(data,dict) or not isinstance(ref,dict):
+        return False
+    root, stamp = runtime.get('root_id'), observed.get('observed_at')
+    try:
+        timestamp = isinstance(stamp,(int,float)) and not isinstance(stamp,bool) and math.isfinite(stamp) and stamp>0
+    except OverflowError:
+        timestamp = False
+    return bool(runtime.get('state')=='ready' and isinstance(root,str) and root
+        and observed.get('kind')=='work.observed' and observed.get('partial') is False
+        and observed.get('freshness')=='last_observed' and observed.get('grade')=='compatible'
+        and observed.get('provenance')=='claude:Stop-snapshot'
+        and timestamp
+        and data.get('kind')=='terminal' and data.get('state')=='running'
+        and ('status' not in data or data['status']=='running')
+        and data.get('snapshot_complete') is True and ref.get('root_id')==root
+        and all(isinstance(ref.get(name),str) and 0<len(ref[name])<=255 for name in ('activity_id','work_id'))
+        and ref.get('thread_id') in (None,root)
+        and all(ref.get(name) is None for name in ('parent_thread_id','os_process','native_process_id','item_id')))
+
+
 def persist_control_intent(con,cid: str,owner: int,body: dict,key: str):
     """One canonical command authority shared by GUI and Sprint lifecycle."""
     if not con.in_transaction:
@@ -240,9 +268,18 @@ def persist_control_intent(con,cid: str,owner: int,body: dict,key: str):
             if work is None:
                 raise RuntimeContractError('WORK_NOT_OWNED','work target is outside this generation')
             observed = json.loads(work['projection_json'])
+            if (not isinstance(observed,dict) or not isinstance(observed.get('reference'),dict)
+                    or not isinstance(observed.get('data'),dict)):
+                raise RuntimeContractError('WORK_INCONCLUSIVE','stored work record lacks typed native attribution')
             target = observed['reference']
             kind = observed['data'].get('kind') or ('terminal' if target.get('native_process_id') else 'task' if target.get('work_id') else 'child')
-            if observed['partial'] or observed['freshness'] in {'unknown','stale'}:
+            claude = chat['harness']=='claude'
+            if claude and (generation_row['harness']!='claude' or generation_row['shell_id']!=chat['shell_id']):
+                raise RuntimeContractError('WORK_NOT_OWNED','work target differs from captured Claude generation')
+            if claude and action=='stop_work':
+                if not claude_terminal_stop_record(runtime,observed):
+                    raise RuntimeContractError('WORK_INCONCLUSIVE','Claude Request stop requires a complete timestamped owned terminal Stop record')
+            elif observed.get('partial') is not False or observed.get('freshness')!='current':
                 raise RuntimeContractError('WORK_INCONCLUSIVE','target inventory requires current attributable reconciliation')
             if action=='stop_automation':
                 if kind!='automation':

@@ -4858,6 +4858,21 @@ function chatNativeWorkState(row) {
     partial: row.partial !== false || !known };
 }
 
+function chatNativeClaudeTerminalRecord(runtime, row) {
+  const data = row.data, ref = row.reference, root = runtime.root_id;
+  return Boolean(data && ref && runtime.state === "ready" && typeof root === "string" && root
+    && row.kind === "work.observed" && row.partial === false
+    && row.freshness === "last_observed" && row.grade === "compatible"
+    && row.provenance === "claude:Stop-snapshot"
+    && typeof row.observed_at === "number" && Number.isFinite(row.observed_at) && row.observed_at > 0
+    && data.kind === "terminal" && data.state === "running"
+    && (!Object.prototype.hasOwnProperty.call(data, "status") || data.status === "running")
+    && data.snapshot_complete === true && ref.root_id === root
+    && ["activity_id", "work_id"].every(name => typeof ref[name] === "string" && ref[name].length > 0 && ref[name].length <= 255)
+    && (ref.thread_id == null || ref.thread_id === root)
+    && ["parent_thread_id", "os_process", "native_process_id", "item_id"].every(name => ref[name] == null));
+}
+
 function chatNativeControlBody(conversation, action, target = {}) {
   const runtime = conversation.runtime;
   if (!runtime?.generation_id || !Number.isInteger(conversation.version)) return null;
@@ -4873,7 +4888,9 @@ function chatNativeControlBody(conversation, action, target = {}) {
   } else {
     const kind = target.data?.kind;
     const workState = chatNativeWorkState(target);
-    if (runtime.state !== "ready" || !target.work_key || target.partial !== false || target.freshness !== "current"
+    const claudeStop = action === "stop_work" && conversation.route?.harness === "claude";
+    const observed = claudeStop ? chatNativeClaudeTerminalRecord(runtime, target) : target.freshness === "current";
+    if (runtime.state !== "ready" || !target.work_key || target.partial !== false || !observed
         || target.kind === "work.terminal"
         || workState.partial || workState.terminal) return null;
     if (action === "stop_automation") {
@@ -5095,7 +5112,7 @@ function chatNativeRuntimePanel(host, conversation, { control, refresh, connecti
     if (row.provenance) item.append(el("small", {}, `Observed via ${row.provenance}`));
     const action = kind === "automation" ? "stop_automation" : "stop_work";
     addControl(item, action, claude ? "Request stop" : "Stop work", row);
-    if (claude) item.append(el("small", {}, "A model request; success requires an actual native result and fresh evidence."));
+    if (claude) item.append(el("small", {}, "Request based on this snapshot timestamp. Pending until an actual native result and later complete snapshot; task OS interruption is not verified."));
     list.append(item);
   }
   panel.append(list);

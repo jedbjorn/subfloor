@@ -141,6 +141,7 @@ class NativeFixtureSeat:
                       self.root/'.super-coder/api/route_bindings.py',self.root/'fixture_bootstrap.py',
                       self.root/'.super-coder/adapters'/harness/'adapter.json'])
         if harness=='claude':
+            paths.append(scripts/'conversation_runtime_claude_probe.py')
             assets=self.root/'.super-coder/assets/runtime/claude'
             paths.extend(p for p in assets.iterdir() if p.is_file() and not p.is_symlink())
         return sorted(paths)
