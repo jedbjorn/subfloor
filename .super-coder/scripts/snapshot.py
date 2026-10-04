@@ -166,6 +166,9 @@ PER_INSTANCE_TABLES = [
     # exact approvals, active routes, retries, reports, and history must all
     # survive update/rebuild together.
     *SPRINT_INSTANCE_TABLES,
+    "runs",
+    "engine_wake_receipts",
+    "engine_wake_failures",
     # NOTE: dr_section is authored navigation but lives in the MAP DB now
     # (.sc-state/map.db), not shell_db.db — it is serialized separately to
     # .sc-state/local/map/content.sql by snapshot_map() below, not here.

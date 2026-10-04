@@ -1786,6 +1786,8 @@ class ConversationBroker(threading.Thread):
             if not self._flush_all(active, pending):
                 return False
             if pending_terminal is not None:
+                from run_wakes import observe_codex_transcript
+                observe_codex_transcript(self.store, active.run, adapter, turn)
                 returncode = turn.metadata.get("returncode")
                 return self._finish_adapter_event(
                     active,

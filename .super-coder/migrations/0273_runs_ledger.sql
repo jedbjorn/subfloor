@@ -1,5 +1,114 @@
 -- 0273 — engine-owned runs and non-Sprint wake delivery receipts.
+-- migrate: foreign-keys-off
+-- Rebuild the wake kind constraint, retaining message ids, references and guards.
+PRAGMA foreign_keys=OFF;
+PRAGMA legacy_alter_table=ON;
 BEGIN;
+CREATE TABLE _run_wake_message (
+    message_id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    sprint_id               INTEGER REFERENCES sprints(sprint_id),
+    sender_shell_id         INTEGER REFERENCES shells(shell_id),
+    receiver_shell_id       INTEGER NOT NULL REFERENCES shells(shell_id),
+    from_participant_id     INTEGER REFERENCES sprint_participants(participant_id),
+    to_participant_id       INTEGER REFERENCES sprint_participants(participant_id),
+    work_unit_id            INTEGER REFERENCES sprint_work_units(work_unit_id),
+    message_kind            TEXT NOT NULL
+                            CHECK (message_kind IN
+                              ('work_assignment','review_request','notification',
+                               'nudge','escalation','system','result')),
+    body                    TEXT NOT NULL CHECK (length(body)>0),
+    declared_type           TEXT NOT NULL
+                            CHECK (declared_type IN
+                              ('force-new','new','re-enter')),
+    actionable              INTEGER NOT NULL DEFAULT 0
+                            CHECK (actionable IN (0,1)),
+    disposition             TEXT
+                            CHECK (disposition IN
+                              ('pending','accepted','declined')),
+    read_at                 TEXT,
+    delivered_at            TEXT,
+    decline_reason          TEXT,
+    idempotency_key         TEXT NOT NULL UNIQUE
+                            CHECK (length(idempotency_key) BETWEEN 1 AND 255),
+    created_at              TEXT NOT NULL DEFAULT (datetime('now')), intent TEXT NOT NULL DEFAULT 'information'
+  CHECK (intent IN ('information','handoff','question','blocker','decision')), requires_reply INTEGER NOT NULL DEFAULT 0
+  CHECK (
+    requires_reply IN (0,1)
+    AND (
+      requires_reply=0
+      OR intent IN ('question','blocker','decision')
+    )
+  ), reply_to_message_id INTEGER REFERENCES wake_message(message_id),
+    CHECK (
+      (actionable=1 AND disposition IS NOT NULL)
+      OR
+      (actionable=0 AND disposition IS NULL)
+    ),
+    CHECK (
+      disposition<>'declined' OR trim(COALESCE(decline_reason,''))<>''
+    ),
+    CHECK (
+      (sprint_id IS NULL AND from_participant_id IS NULL
+       AND to_participant_id IS NULL AND work_unit_id IS NULL)
+      OR
+      (sprint_id IS NOT NULL AND to_participant_id IS NOT NULL)
+    ),
+    UNIQUE (sprint_id, message_id),
+    FOREIGN KEY (sprint_id, from_participant_id)
+      REFERENCES sprint_participants(sprint_id, participant_id),
+    FOREIGN KEY (sprint_id, to_participant_id)
+      REFERENCES sprint_participants(sprint_id, participant_id),
+    FOREIGN KEY (sprint_id, work_unit_id)
+      REFERENCES sprint_work_units(sprint_id, work_unit_id)
+);
+INSERT INTO _run_wake_message ("message_id","sprint_id","sender_shell_id","receiver_shell_id","from_participant_id","to_participant_id","work_unit_id","message_kind","body","declared_type","actionable","disposition","read_at","delivered_at","decline_reason","idempotency_key","created_at","intent","requires_reply","reply_to_message_id") SELECT "message_id","sprint_id","sender_shell_id","receiver_shell_id","from_participant_id","to_participant_id","work_unit_id","message_kind","body","declared_type","actionable","disposition","read_at","delivered_at","decline_reason","idempotency_key","created_at","intent","requires_reply","reply_to_message_id" FROM wake_message;
+DROP TABLE wake_message;
+ALTER TABLE _run_wake_message RENAME TO wake_message;
+CREATE INDEX idx_wake_message_inbox
+    ON wake_message(receiver_shell_id, read_at, message_id);
+CREATE INDEX idx_wake_message_delivery
+    ON wake_message(receiver_shell_id, delivered_at, message_id);
+CREATE TRIGGER trg_wake_message_acceptance_insert
+BEFORE INSERT ON wake_message
+WHEN NOT (
+    (NEW.actionable=0 AND NEW.disposition IS NULL
+     AND NEW.decline_reason IS NULL)
+    OR
+    (NEW.actionable=1 AND NEW.disposition='pending'
+     AND NEW.read_at IS NULL AND NEW.decline_reason IS NULL)
+    OR
+    (NEW.actionable=1 AND NEW.disposition='accepted'
+     AND NEW.read_at IS NOT NULL AND NEW.decline_reason IS NULL)
+    OR
+    (NEW.actionable=1 AND NEW.disposition='declined'
+     AND NEW.read_at IS NOT NULL
+     AND trim(COALESCE(NEW.decline_reason,''))<>'')
+)
+BEGIN
+  SELECT RAISE(ABORT, 'invalid wake message acceptance state');
+END;
+CREATE TRIGGER trg_wake_message_acceptance_update
+BEFORE UPDATE OF actionable, disposition, read_at, decline_reason
+ON wake_message
+WHEN NOT (
+    (NEW.actionable=0 AND NEW.disposition IS NULL
+     AND NEW.decline_reason IS NULL)
+    OR
+    (NEW.actionable=1 AND NEW.disposition='pending'
+     AND NEW.read_at IS NULL AND NEW.decline_reason IS NULL)
+    OR
+    (NEW.actionable=1 AND NEW.disposition='accepted'
+     AND NEW.read_at IS NOT NULL AND NEW.decline_reason IS NULL)
+    OR
+    (NEW.actionable=1 AND NEW.disposition='declined'
+     AND NEW.read_at IS NOT NULL
+     AND trim(COALESCE(NEW.decline_reason,''))<>'')
+)
+BEGIN
+  SELECT RAISE(ABORT, 'invalid wake message acceptance state');
+END;
+CREATE INDEX idx_wake_message_replies
+  ON wake_message(sprint_id, reply_to_message_id, message_id);
 CREATE TABLE IF NOT EXISTS runs (
     run_id INTEGER PRIMARY KEY AUTOINCREMENT,
     owner_shell_id INTEGER NOT NULL REFERENCES shells(shell_id),
@@ -60,4 +169,7 @@ CREATE TABLE IF NOT EXISTS engine_wake_failures (
     last_attempt_at TEXT,
     last_error TEXT
 );
+UPDATE shells SET system_prompt=replace(system_prompt, 'Use the engine''s `./sc job` tools to watch checks that may outlive the current tool call or session. Do not set up independent watchers.', 'Use `./sc job start --label gate -- <command and args>` for checks that may outlive the current tool call or session. After confirmed registration/start, end the turn and continue on the owner wake; inspect `./sc job status <id>` and `./sc job tail <id>`. A lost outcome is unknown, never a pass. Do not set up independent watchers.') WHERE flavor='dev';
 COMMIT;
+PRAGMA legacy_alter_table=OFF;
+PRAGMA foreign_keys=ON;

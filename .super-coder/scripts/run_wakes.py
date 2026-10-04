@@ -1,7 +1,7 @@
 """Non-Sprint re-enter delivery receipts and bounded CLI contention recovery.
 
-The original conversation message/outbox is reused after proven pre-dispatch
-SHELL_BUSY; no new logical prompt or wake intent is minted. Native failures are
+A fresh, idempotent conversation attempt follows proven pre-dispatch
+SHELL_BUSY; the original failed attempt and completion wake intent are retained. Native failures are
 never automatically replayed. Transport retries retain the same wake key.
 """
 from __future__ import annotations
@@ -9,9 +9,9 @@ from __future__ import annotations
 import json
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from sprint_participant_chats import SprintConversationError
 
 import db_driver
+from sprint_participant_chats import SprintConversationError
 
 BACKOFF = (15, 60, 180, 300)
 
@@ -87,7 +87,8 @@ def _contains_prompt(path, offset, marker, body):
         return False
     for line in text.splitlines():
         try:
-            if contains(json.loads(line)):
+            record = json.loads(line)
+            if isinstance(record, dict) and record.get('type') == 'user' and contains(record.get('message')):
                 return True
         except ValueError:
             continue
@@ -103,7 +104,10 @@ def reconcile(con, *, now=None):
         'JOIN conversation_messages cm ON cm.message_id=e.conversation_message_id '
         'JOIN conversations c ON c.conversation_id=cm.conversation_id '
         'LEFT JOIN conversation_runs r ON r.run_id=(SELECT MAX(cr.run_id) FROM conversation_runs cr '
-        'WHERE cr.trigger_message_id=cm.message_id) WHERE e.blocked_reason IS NULL').fetchall()
+        'WHERE cr.trigger_message_id=cm.message_id) WHERE e.blocked_reason IS NULL '
+        'AND NOT EXISTS (SELECT 1 FROM runs done WHERE done.message_id=e.message_id '
+        "AND done.wake_state='consumed')").fetchall()
+    retries = []
     for row in rows:
         consumed = row['run_id'] is not None and _contains_prompt(
             row['transcript_path'], row['transcript_offset'],
@@ -132,14 +136,7 @@ def reconcile(con, *, now=None):
                     con.execute("UPDATE runs SET wake_state='blocked',last_error=? WHERE message_id=?",
                                 (reason, row['message_id']))
                     continue
-                con.execute("UPDATE conversation_messages SET state='queued',completed_at=NULL WHERE message_id=?",
-                            (row['conversation_message_id'],))
-                con.execute("UPDATE conversation_outbox SET state='pending',claim_owner=NULL,claimed_at=NULL,"
-                            'lease_expires_at=NULL,run_id=NULL,dispatched_at=NULL WHERE message_id=?',
-                            (row['conversation_message_id'],))
-                con.execute("UPDATE conversations SET state='queued',version=version+1 WHERE conversation_id=? "
-                            "AND state NOT IN ('running','closed')", (row['conversation_id'],))
-                con.execute('UPDATE engine_wake_receipts SET retry_at=NULL WHERE message_id=?', (row['message_id'],))
+                retries.append(dict(row))
                 continue
             if row['retry_at'] or busy:
                 continue
@@ -152,3 +149,59 @@ def reconcile(con, *, now=None):
             if terminal_failure:
                 con.execute('UPDATE engine_wake_receipts SET blocked_reason=? WHERE message_id=?',
                             (reason, row['message_id']))
+
+    # Enqueue can notify the broker; no external work inside a DB transaction.
+    from sprint_runtime import enqueue_conversation_turn
+    db_path = con.execute('PRAGMA database_list').fetchone()[2]
+    for row in retries:
+        original = con.execute('SELECT body,idempotency_key FROM conversation_messages WHERE message_id=?',
+                               (row['conversation_message_id'],)).fetchone()
+        native_ref = enqueue_conversation_turn(
+            db_path, row['conversation_id'], original['body'],
+            f"engine-wake:{row['message_id']}:busy:{row['busy_attempts']}")
+        with db_driver.write_transaction(con, 'wake.busy_retry'):
+            con.execute('UPDATE engine_wake_receipts SET conversation_message_id=?,retry_at=NULL '
+                        'WHERE message_id=?', (int(native_ref.split(':')[1]), row['message_id']))
+
+
+
+def observe_codex_transcript(store, run, adapter, turn):
+    """Codex has a server transcript, not a local transcript path on NativeTurn.
+
+    Inspect the exact native turn outside transactions. Only a userMessage
+    containing the full queued wake prompt proves consumption; turn/start or
+    assistant activity alone is insufficient.
+    """
+    if run.harness != 'codex' or '## wake_message #' not in run.body:
+        return
+    inspect = getattr(adapter, 'inspect', None)
+    if not callable(inspect):
+        return
+    from conversation_adapters.base import AdapterError
+    try:
+        inspection = inspect(turn.session_ref, run.context())
+    except AdapterError:
+        return  # no evidence; the ledger keeps enqueued/blocked visible
+    turns = inspection.metadata.get('turns', [])
+    matched = False
+    for native in turns:
+        if not isinstance(native, dict) or native.get('id') != turn.run_ref:
+            continue
+        for item in native.get('items', []):
+            if not isinstance(item, dict) or item.get('type') != 'userMessage':
+                continue
+            content = item.get('content', [])
+            if any(isinstance(part, dict) and part.get('text') == run.body for part in content):
+                matched = True
+    if not matched:
+        return
+    con = store.connect()
+    try:
+        with db_driver.write_transaction(con, 'runs.native_consumed'):
+            for row in con.execute('SELECT run_id,message_id FROM runs WHERE owner_shell_id=? '
+                                   'AND message_id IS NOT NULL', (run.shell_id,)).fetchall():
+                if f"## wake_message #{row['message_id']} " in run.body:
+                    con.execute("UPDATE runs SET wake_state='consumed',turn_run_id=?,last_error=NULL WHERE run_id=?",
+                                (run.run_id, row['run_id']))
+    finally:
+        con.close()

@@ -6,8 +6,6 @@ paths; an absent supervisor never supplies an inferred command exit code.
 from __future__ import annotations
 
 import json
-import os
-import signal
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
@@ -75,6 +73,16 @@ class RunStore:
         out['argv'] = json.loads(out['argv'])
         if out['receipt_json']:
             out['receipt_json'] = json.loads(out['receipt_json'])
+        if out['message_id'] is not None:
+            wake = self.con.execute(
+                'SELECT wm.wake_id,f.attempts,f.last_attempt_at,f.last_error '
+                'FROM sprint_wake_messages wm LEFT JOIN engine_wake_failures f USING(wake_id) '
+                'WHERE wm.message_id=?', (out['message_id'],)).fetchone()
+            if wake:
+                out['wake_id'] = wake['wake_id']
+                out['delivery_attempts'] = wake['attempts'] or 0
+                out['delivery_attempted_at'] = wake['last_attempt_at']
+                out['delivery_error'] = wake['last_error']
         return out
 
     def list(self, owner: int | None = None) -> list[dict]:
@@ -109,10 +117,12 @@ class RunStore:
                     raise ValueError('registration key reused with different input')
                 return self.get(existing['run_id'], owner)
             # Allocate the id transactionally; paths never contain caller labels.
-            rid = int(self.con.execute(
+            allocated = self.con.execute(
                 'INSERT INTO runs(owner_shell_id,registration_key,kind,label,argv,cwd,"commit",'
                 'evidence_path) VALUES(?,?,?,?,?,?,?,?)',
-                (owner, key, *identity, '')).lastrowid)
+                (owner, key, *identity, '')).lastrowid
+            assert allocated is not None
+            rid = int(allocated)
             self.con.execute('UPDATE runs SET evidence_path=? WHERE run_id=?',
                              (str(self.root / str(rid) / 'log'), rid))
         return self.get(rid, owner)
@@ -188,15 +198,18 @@ class RunStore:
             raise ValueError('process incarnation is gone, recycled or unverifiable')
         # Marker is independent of meta.json so cancellation never races a
         # supervisor write. External signaling is outside the DB transaction.
+        if process_alive(row['supervisor_pid'], row['supervisor_start_ticks'], row['boot_id']) is not True:
+            raise ValueError('supervisor incarnation is gone or unverifiable')
         Path(row['evidence_path']).with_name('kill_requested').touch()
-        os.killpg(row['pid'], signal.SIGTERM)
+        # The still-owning supervisor sends TERM/KILL to its child group.
+        # Signalling here could reap the leader before escalation is verified.
         return {'run_id': run_id, 'kill_requested': True}
 
     def reconcile(self) -> None:
         rows = self.con.execute("SELECT * FROM runs WHERE state IN ('registered','running')").fetchall()
         for raw in rows:
             row = dict(raw)
-            path = self.root / str(row['run_id']) / 'meta.json'
+            path = Path(row['evidence_path']).with_name('meta.json')
             try:
                 meta = json.loads(path.read_text())
             except (OSError, ValueError):

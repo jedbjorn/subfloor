@@ -15,9 +15,9 @@ import signal
 import subprocess
 import sys
 import time
-import uuid
 import urllib.error
 import urllib.request
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -37,7 +37,7 @@ KILL_GRACE = 10             # SIGTERM → SIGKILL grace (seconds)
 POLL = 2                    # supervisor/wait poll interval (seconds)
 
 
-def die(msg: str) -> "NoReturn":  # noqa: F821
+def die(msg: str) -> NoReturn:  # noqa: F821
     sys.exit(f"job: {msg}")
 
 
@@ -75,7 +75,10 @@ def read_meta(jobdir: Path) -> dict:
 
 def write_meta(jobdir: Path, meta: dict) -> None:
     tmp = _meta_path(jobdir).with_suffix(f".{os.getpid()}.tmp")
-    tmp.write_text(json.dumps(meta, indent=2) + "\n")
+    with tmp.open('w') as handle:
+        handle.write(json.dumps(meta, indent=2) + "\n")
+        handle.flush()
+        os.fsync(handle.fileno())
     os.replace(tmp, _meta_path(jobdir))
 
 
@@ -88,7 +91,7 @@ def job_dir(job_id: str) -> Path:
     return d
 
 
-def next_job_id(label: "str | None") -> str:
+def next_job_id(label: str | None) -> str:
     """Sequential id, readable: '7' or '7-pytest'. The number never repeats
     (max over existing dirs + 1), the label is display sugar."""
     JOBS.mkdir(parents=True, exist_ok=True)
@@ -101,7 +104,7 @@ def next_job_id(label: "str | None") -> str:
     return f"{n}-{label}" if label else str(n)
 
 
-def _start_ticks(pid: int) -> "int | None":
+def _start_ticks(pid: int) -> int | None:
     """Field 22 of /proc/<pid>/stat — the process's start time in clock ticks
     since boot. Together with the pid it names one process incarnation: a
     recycled pid carries a different value. None when the pid is gone or the
@@ -117,7 +120,7 @@ def _has_procfs() -> bool:
     return Path("/proc/self/stat").exists()
 
 
-def kill_refusal(meta: dict, pid: int) -> "str | None":
+def kill_refusal(meta: dict, pid: int) -> str | None:
     """Why `kill` must not signal `pid`, or None when it is still the job's own
     process. A recorded pid is only an identity while its incarnation matches;
     once the OS recycles it, killpg would hit a stranger's process group (#954
@@ -172,7 +175,7 @@ def state_of(meta: dict) -> str:
 
 # ── completion message (supervisor-side) ─────────────────────────────────────
 
-def _api(method: str, path: str, payload: "dict | None" = None) -> dict:
+def _api(method: str, path: str, payload: dict | None = None) -> dict:
     url = SC_API_BASE.rstrip("/") + path
     data = json.dumps(payload).encode() if payload is not None else None
     headers: dict = {"Authorization": f"Bearer {SC_API_TOKEN}"}
@@ -263,6 +266,13 @@ def supervise(jobdir: Path, notify=send_completion) -> int:
     meta["pid"] = child.pid
     meta["start_ticks"] = _start_ticks(child.pid)
     write_meta(jobdir, meta)
+    if meta.get('run_id'):
+        try:
+            _api('POST', f"/_sc/runs/{meta['run_id']}/running", {
+                k: meta.get(k) for k in ('pid', 'start_ticks', 'supervisor_pid',
+                                        'supervisor_start_ticks', 'boot_id', 'started_at')})
+        except (urllib.error.URLError, OSError):
+            pass  # local identity is durable; the runtime pulse recovers it
 
     timeout = meta.get("timeout")
     deadline = time.monotonic() + timeout if timeout else None
@@ -324,9 +334,11 @@ def cmd_start(args) -> int:
     cmd = args.cmd[1:] if args.cmd and args.cmd[0] == "--" else list(args.cmd)
     if not cmd:
         die("nothing to run after --")
+    if args.timeout is not None and args.timeout <= 0:
+        die('--timeout must be positive seconds')
     if not (SC_API_TOKEN and SC_API_BASE):
         die('authenticated shell API is required; no command launched')
-    commit = subprocess.run(['git', 'rev-parse', 'HEAD'], capture_output=True, text=True)
+    commit = subprocess.run(['git', 'rev-parse', 'HEAD'], capture_output=True, text=True, check=False)
     try:
         registered = _api('POST', '/_sc/runs', {
             'registration_key': uuid.uuid4().hex, 'kind': 'job', 'label': args.label,
@@ -353,15 +365,16 @@ def cmd_start(args) -> int:
     # pre-supervisor meta and mis-calls the job 'lost'.
     end = time.monotonic() + 5
     while time.monotonic() < end:
-        if read_meta(jobdir).get("supervisor_pid"):
+        started = read_meta(jobdir)
+        if started.get('pid') or started.get('finished_at'):
             break
         time.sleep(0.05)
     else:
-        print(f"job: WARNING — supervisor (pid {sup.pid}) has not checked in "
-              f"after 5s; `sc job status {job_id}` before trusting it")
+        die(f'supervisor startup unconfirmed; registered run {job_id} will reconcile; '
+            f'inspect `sc job status {job_id}` before starting dependent work')
     print(f"job: {job_id} started (supervisor pid {sup.pid}) — "
-          f"`sc job wait {job_id}` or end the turn; completion lands in "
-          f"a durable owner wake (TUI delivery waits for the CLI slot)")
+          f"end your turn; completion wakes you "
+          f"(TUI delivery waits for the CLI slot). `sc job status {job_id}`")
     return 0
 
 
@@ -505,7 +518,7 @@ def build_parser() -> argparse.ArgumentParser:
                "TUI wakes wait out the CLI lock. Legacy job status/logs remain readable.")
     sub = p.add_subparsers(dest="cmd_name", required=True)
 
-    sp = sub.add_parser("start", help="run a command detached; completion lands in your inbox")
+    sp = sub.add_parser("start", help="register and detach; completion durably wakes the owner")
     sp.add_argument("--label", help="display label (never used in a filesystem path)")
     sp.add_argument("--timeout", type=int,
                     help="kill the whole process group after N seconds")
@@ -542,7 +555,7 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
-def main(argv: "list[str]") -> int:
+def main(argv: list[str]) -> int:
     # Early-closed stdout is handled at the entrypoint (cli_entry.run_cli, #384).
     args = build_parser().parse_args(argv)
     return args.fn(args)
