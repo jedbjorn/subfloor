@@ -169,7 +169,11 @@
     ".super-coder/migrations/0270_snapshot_admin_guidance.sql",
     ".super-coder/migrations/0271_transcript_run_event_index.sql",
     ".super-coder/migrations/0272_conversation_hot_query_indexes.sql",
-    ".super-coder/migrations/0273_runs_ledger.sql"
+    ".super-coder/migrations/0273_runs_ledger.sql",
+    ".super-coder/docs/runs.md",
+    ".super-coder/scripts/run_wakes.py",
+    ".super-coder/scripts/runs.py",
+    "tests/test_runs.py"
   ],
   "baseline_migration_ledger": {
     "count": 142,
