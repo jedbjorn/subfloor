@@ -186,6 +186,10 @@ count=Path(os.environ["PROBE_COUNT"])
 count.write_text(str(int(count.read_text())+1) if count.exists() else "1")
 mode=os.environ["PROBE_MODE"]
 if mode == "hang": time.sleep(10)
+if mode == "flood":
+    sys.stdout.write("x" * 1048576); sys.stdout.flush()
+    sys.stderr.write("y" * 1048576); sys.stderr.flush()
+    time.sleep(10)
 settings=json.loads(Path(sys.argv[sys.argv.index("--settings")+1]).read_text())
 hook=settings["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
 for command in ("printf SC_PROBE_ORIGINAL","printf SC_PROBE_DENIED"):
@@ -197,9 +201,18 @@ for command in ("printf SC_PROBE_ORIGINAL","printf SC_PROBE_DENIED"):
     if response.get("permissionDecision") == "deny":
         output=response["permissionDecisionReason"]
     else:
-        effective=response.get("updatedInput",{}).get("command",command) if mode == "all" else command
+        effective=response.get("updatedInput",{}).get("command",command) if mode in ("all", "partial", "error", "linger") else command
         output=effective.removeprefix("printf ")
-    print(json.dumps({"type":"user","message":{"content":[{"type":"tool_result","content":output}]}}))
+    print(json.dumps({"type":"user","message":{"content":[{"type":"tool_result","content":output}]}}), flush=True)
+    if mode == "partial":
+        child=subprocess.Popen([sys.executable,"-c","import time; time.sleep(30)"])
+        print("partial probe stderr child="+str(child.pid), file=sys.stderr, flush=True)
+        time.sleep(10)
+    if mode == "error":
+        print("native error after first result", file=sys.stderr, flush=True)
+        sys.exit(3)
+if mode == "linger":
+    subprocess.Popen([sys.executable,"-c","import time; time.sleep(30)"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 '''
 
 
@@ -249,3 +262,87 @@ def test_timeout_is_durable_disarmed_and_visible_in_boot(installed, monkeypatch)
 def test_tool_result_parser_does_not_trust_assistant_claim():
     transcript = json.dumps({"type": "assistant", "message": {"content": [{"type": "text", "text": "SC_PROBE_REWRITTEN"}]}})
     assert seat_conversion._tool_results(transcript) == []
+
+
+def test_partial_timeout_retains_observations_and_kills_group(installed, monkeypatch):
+    _, count = installed
+    monkeypatch.setenv("PROBE_MODE", "partial")
+    monkeypatch.setattr(seat_conversion.harness_versions, "TIMEOUT", .5)
+    result = seat_conversion.ensure()
+    assert result["tier"] == "disarmed"
+    assert result["hook_fired"] is True
+    assert result["rewrite_honored"] is True
+    assert result["deny_honored"] is None
+    root = Path(result["artifact_directory"])
+    assert root.stat().st_mode & 0o077 == 0
+    assert "SC_PROBE_REWRITTEN" in (root / "stdout.jsonl").read_text()
+    assert "partial probe stderr" in (root / "stderr.log").read_text()
+    assert "SC_PROBE_ORIGINAL" in (root / "hook-calls.jsonl").read_text()
+    receipt = json.loads((root / "receipt.json").read_text())
+    assert receipt["capture"]["timed_out"] is True
+    assert receipt["process"]["start_ticks"] > 0
+    assert receipt["timings"]["hook_seconds"]
+    assert receipt["cleanup"]["signal"] == "SIGKILL"
+    assert len(receipt["cleanup"]["before"]["members"]) >= 2
+    for member in receipt["cleanup"]["before"]["members"]:
+        current = seat_conversion._process_identity(member["pid"])
+        assert current is None or current["start_ticks"] != member["start_ticks"] or current["state"] == "Z"
+    assert receipt["timings"]["total_seconds"] < 2
+    assert seat_conversion.ensure() == result
+    assert count.read_text() == "1"
+    assert seat_conversion.ensure(force=True)["artifact_directory"] != str(root)
+    assert count.read_text() == "2"
+    assert (root / "receipt.json").exists()
+
+
+def test_probe_error_retains_partial_facts(installed, monkeypatch):
+    monkeypatch.setenv("PROBE_MODE", "error")
+    result = seat_conversion.ensure()
+    assert result["tier"] == "disarmed"
+    assert result["error"] == "Probe exited 3"
+    assert result["rewrite_honored"] is True
+    assert result["deny_honored"] is None
+    root = Path(result["artifact_directory"])
+    assert "native error" in (root / "stderr.log").read_text()
+    assert json.loads((root / "receipt.json").read_text())["returncode"] == 3
+
+
+def test_probe_output_retention_is_bounded(installed, monkeypatch):
+    monkeypatch.setenv("PROBE_MODE", "flood")
+    monkeypatch.setattr(seat_conversion.harness_versions, "TIMEOUT", .5)
+    result = seat_conversion.ensure()
+    assert result["tier"] == "disarmed"
+    assert result["hook_fired"] is None
+    root = Path(result["artifact_directory"])
+    for name in ("stdout.jsonl", "stderr.log"):
+        assert (root / name).stat().st_size == seat_conversion.OUTPUT_LIMIT
+    receipt = json.loads((root / "receipt.json").read_text())
+    assert receipt["capture"]["bytes"] == {"stdout": 1048576, "stderr": 1048576}
+
+
+def test_unreadable_processes_are_not_reported_absent(installed, monkeypatch):
+    monkeypatch.setenv("PROBE_MODE", "all")
+    monkeypatch.setattr(seat_conversion, "_group_snapshot", lambda pgid: {"members": [], "unreadable_count": 1})
+    result = seat_conversion.ensure()
+    receipt = json.loads((Path(result["artifact_directory"]) / "receipt.json").read_text())
+    assert receipt["cleanup"]["status"] == "indeterminate"
+
+
+def test_spawn_failure_retains_receipt(tmp_path, monkeypatch):
+    monkeypatch.setattr(seat_conversion, "EVIDENCE_DIR", tmp_path)
+    result = seat_conversion.native_probe(str(tmp_path / "missing"), timeout=.5)
+    assert result["error"] == "Conversion probe failed: FileNotFoundError"
+    assert result["hook_fired"] is None
+    receipt = json.loads((Path(result["artifact_directory"]) / "receipt.json").read_text())
+    assert receipt["observations"] == result
+
+
+def test_completed_probe_cleans_remaining_group_member(installed, monkeypatch):
+    monkeypatch.setenv("PROBE_MODE", "linger")
+    result = seat_conversion.ensure()
+    assert result["tier"] == "rewrite"
+    receipt = json.loads((Path(result["artifact_directory"]) / "receipt.json").read_text())
+    assert receipt["returncode"] == 0
+    assert receipt["cleanup"]["signal"] == "SIGKILL"
+    assert receipt["cleanup"]["before"]["members"]
+    assert all(member["state"] == "Z" for member in receipt["cleanup"]["after"]["members"])
