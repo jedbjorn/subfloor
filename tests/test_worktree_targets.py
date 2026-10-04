@@ -286,6 +286,38 @@ class LinkedWorktreeRefusalTest(WorktreeFixture):
                 self.assertIn(f"cd {self.main} && ./sc {cmd}", done.stderr)
                 self.assertEqual(state_digest(self.main), before)
 
+    # G4 (spec #267, ledger C5): with the shell view retired this refusal is
+    # the single mechanism keeping every live-instance verb out of a worktree.
+    LIVE_INSTANCE_VERBS = ("update", "rollback", "rebuild", "migrate",
+                           "snapshot", "render", "remove")
+
+    def test_every_live_instance_verb_refuses_naming_the_shared_instance(self):
+        for cmd in self.LIVE_INSTANCE_VERBS:
+            with self.subTest(cmd=cmd):
+                self.setUp()
+                before = state_digest(self.main)
+                done = run_sc(self.wt, cmd)
+                self.assertEqual(done.returncode, 1, done.stdout + done.stderr)
+                self.assertEqual(done.stdout, "")
+                first = done.stderr.splitlines()[0]
+                self.assertIn(f"./sc {cmd} refused", first)
+                # The confusion comes first, naming the live instance path,
+                # before any remedy line.
+                self.assertIn("a linked worktree has no instance of its own", first)
+                self.assertIn(f"SHARED live instance at {self.main}", first)
+                self.assertIn(f"live instance   : {self.main}", done.stderr)
+                self.assertLess(done.stderr.index("silently maintain"),
+                                done.stderr.index("cd " + str(self.main)))
+                self.assertIn("Nothing was opened, written or deleted.", done.stderr)
+                self.assertEqual(state_digest(self.main), before)
+                self.assertFalse((self.wt / ".super-coder" / "shell_db.db").exists())
+
+    def test_update_help_still_answers_from_the_linked_worktree(self):
+        done = run_sc(self.wt, "update", "--help")
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertIn("usage: sc update", done.stdout)
+        self.assertNotIn("refused", done.stdout + done.stderr)
+
     def artifact_path(self, kind: str) -> str:
         """The live instance's own answer for an artifact path — asked the way
         the dispatcher asks it, so the assertion cannot encode one artifact

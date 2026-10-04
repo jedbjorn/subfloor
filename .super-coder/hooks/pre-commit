@@ -7,22 +7,27 @@
 # edit: refuses to commit while HEAD is a protected default branch.
 #
 # Reuses the one shared branch-decision script (exit 2 = block, stderr = reason);
-# any non-zero aborts the commit. A bare operator gets the deliberate
-# default-branch recovery hint. Launched shells retain branch-first guidance
-# without being taught a bypass recipe.
+# any non-zero aborts the commit. The refusal names the stale-root confusion
+# first, then the guard's branch-first guidance, then the --no-verify recovery
+# for a deliberate default-branch commit. The recovery is shown to every caller:
+# this hook is a reminder rail, not a gate (decision #428, ledger row A6).
 #
 # Resolve the guard from $SC_ENGINE_DIR when set, else relative to THIS hook's
 # own path (core.hooksPath points at <engine>/hooks, so ../scripts is the engine
 # install). show-toplevel was wrong in a fork worktree, where .super-coder/ is
 # gitignored and absent — the same trap the harness hooks fell into.
 guard="${SC_ENGINE_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")/.." && pwd)}/scripts/branch-guard.sh"
-bash "$guard"
+reason="$(bash "$guard" 2>&1 >/dev/null)"
 status=$?
 
-if [ "$status" -eq 2 ] \
-  && [ -z "${SC_SHELL_FLAVOR:-}" ] \
-  && [ -z "${SC_SHELL_WORKTREE:-}" ]; then
-  echo "Bare operator recovery for a deliberate default-branch commit: rerun the same git commit command with --no-verify." >&2
+if [ "$status" -eq 2 ]; then
+  {
+    echo "Commit refused: HEAD is on a protected default branch, which usually means this is the stale repo root rather than your own worktree."
+    [ -n "$reason" ] && printf '%s\n' "$reason"
+    echo "Deliberate default-branch commit (an operator install or engine pin, say)? Rerun the same git commit command with --no-verify."
+  } >&2
+elif [ -n "$reason" ]; then
+  printf '%s\n' "$reason" >&2
 fi
 
 exit "$status"

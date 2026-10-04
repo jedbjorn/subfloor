@@ -155,12 +155,11 @@ sc_help_form() {
 sc_refuse_linked() {
   [ "$LINKED" -eq 1 ] || return 0
   {
-    echo "✗ ./sc $1 refused: this is a linked worktree, not the live instance."
+    echo "✗ ./sc $1 refused: a linked worktree has no instance of its own, so this command would silently maintain the SHARED live instance at $LIVE_ROOT, which this worktree does not own."
     echo "    caller worktree : $CALLER_ROOT"
     echo "    live instance   : $LIVE_ROOT"
     echo "    declined target : $2"
-    echo "  ./sc $1 acts on the shared live instance above, which this worktree"
-    echo "  does not own. Nothing was opened, written or deleted."
+    echo "  Nothing was opened, written or deleted."
     echo "  For live maintenance, run it from the main checkout:"
     echo "      cd $LIVE_ROOT && ./sc $1"
   } >&2
@@ -1180,7 +1179,13 @@ case "$cmd" in
   harness-cleanup) exec "$PY" "$S/global_pointer.py" "$@" ;;
   ensure-harness)  exec "$PY" "$S/install.py" --ensure-harness ;;
   doctor)          exec "$PY" "$S/install.py" --check-docker ;;
-  update)            exec "$PY" "$S/update.py" "$@" ;;
+  # update/rollback replace the live engine floor and DB pair. Once the shell
+  # view was retired (decision #427) this refusal is also the effective role
+  # check for them: in a fork the main checkout is the Admin seat.
+  update)            if [ "$LINKED" -eq 1 ] && ! sc_help_form "$@"; then
+                       sc_refuse_linked update "$ENGINE + $(sc_engine_db)"
+                     fi
+                     exec "$PY" "$S/update.py" "$@" ;;
   # Refresh the harness CLIs the SHELLS run — which, on the docker path, means
   # the image and nothing else. Running the installers on the host here is what
   # this command used to do, and it reported success while changing nothing:
@@ -1204,7 +1209,10 @@ case "$cmd" in
     fi ;;
   harness-status)  sc_harness_status ;;
   docker-cache-gc) exec "$PY" "$S/docker_cache.py" "$@" ;;
-  rollback)     exec "$PY" "$S/rollback.py" "$@" ;;
+  rollback)     if [ "$LINKED" -eq 1 ]; then
+                  sc_refuse_linked rollback "$ENGINE + $(sc_engine_db)"
+                fi
+                exec "$PY" "$S/rollback.py" "$@" ;;
   feature)      exec "$PY" "$S/feature.py" "$@" ;;
   runtime)      exec "$PY" "$S/runtime.py" "$@" ;;
   artifact-mode) exec "$PY" "$S/artifact_policy.py" "$@" ;;

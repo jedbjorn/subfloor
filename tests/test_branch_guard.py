@@ -128,16 +128,23 @@ class BranchGuardTest(unittest.TestCase):
         self.assertIn("Create a feature branch first", result.stderr)
         self.assertIn("git commit command with --no-verify", result.stderr)
 
-    def test_launched_shell_markers_suppress_bypass_recipe(self):
+    def test_every_caller_sees_the_confusion_first_and_the_recovery(self):
+        # Ledger row A6: the rail is a reminder, not a gate, so launched
+        # shells see the same recovery as a bare operator.
         for markers in (
+            {},
             {"SC_SHELL_FLAVOR": "vibe"},
             {"SC_SHELL_WORKTREE": str(self.repo)},
         ):
             with self.subTest(markers=markers):
                 result = self.pre_commit(**markers)
                 self.assertEqual(result.returncode, 2)
+                lines = result.stderr.splitlines()
+                self.assertIn("stale repo root rather than your own worktree", lines[0])
                 self.assertIn("Create a feature branch first", result.stderr)
-                self.assertNotIn("no-verify", result.stderr)
+                self.assertIn("--no-verify", lines[-1])
+                self.assertLess(result.stderr.index("stale repo root"),
+                                result.stderr.index("--no-verify"))
 
     def test_explicit_admin_marker_allows_default_branch_commit(self):
         result = self.pre_commit(SC_SHELL_FLAVOR="admin")
