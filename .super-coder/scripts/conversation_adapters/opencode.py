@@ -58,6 +58,30 @@ _SERVER_ENDPOINT = SERVER_ENDPOINT
 _SERVER_PASSWORD: str | None = None
 _SERVER_LOG_HANDLE = None
 
+# One managed server serves every shell's conversations, so it must carry no
+# shell's identity or Admin-only engine paths: whoever started it (the API
+# process, an Admin CLI) would otherwise lend them to every tool call. Each
+# conversation's identity is restored per shell by the wrapper below.
+SERVER_SCRUBBED_ENV = ("SC_API_TOKEN", "SC_API_BASE", "SC_ENGINE_DIR", "SC_ROOT")
+# The identity and maintenance variables a shell wrapper unsets whenever its
+# own context does not set them, so the server's environment can never leak
+# Admin paths or another shell's identity into a tool call.
+WRAPPER_IDENTITY_ENV = (
+    "SC_API_TOKEN", "SC_API_BASE", "SC_ENGINE_DIR", "SC_ROOT",
+    "SC_SHELL_FLAVOR", "SC_SHELL_ID", "SC_SHELL_SHORTNAME", "SC_SHELL_NAME",
+    "SC_SHELL_WORKTREE",
+)
+
+
+def server_environment(source: Mapping[str, str] | None = None) -> dict[str, str]:
+    """The managed server's environment: the host's, minus any shell identity."""
+    return {
+        key: value
+        for key, value in (os.environ if source is None else source).items()
+        if key not in SERVER_SCRUBBED_ENV and not key.startswith("SC_SHELL_")
+    }
+
+
 MAX_CONNECTED_PROVIDERS = 256
 MAX_CONNECTED_MODELS = 2_000
 MAX_NATIVE_OPTIONS = 256
@@ -577,7 +601,7 @@ def ensure_server(*, timeout: float = 10.0) -> tuple[str, str | None]:
         password = configured_password or secrets.token_urlsafe(32)
         port = _available_loopback_port()
         endpoint = _server_endpoint(port)
-        env = dict(os.environ)
+        env = server_environment()
         env["OPENCODE_SERVER_PASSWORD"] = password
         env.setdefault("OPENCODE_SERVER_USERNAME", "opencode")
         env["OPENCODE_DISABLE_CLAUDE_CODE"] = "1"
@@ -943,6 +967,9 @@ class OpenCodeAdapter(ConversationAdapter):
             if key == "PATH" or key.startswith("SC_")
         }
         lines = ["#!/bin/sh"]
+        absent = [name for name in WRAPPER_IDENTITY_ENV if name not in exported]
+        if absent:
+            lines.append("unset " + " ".join(absent))
         lines.extend(
             f"export {key}={shlex.quote(value)}"
             for key, value in sorted(exported.items())

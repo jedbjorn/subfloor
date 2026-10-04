@@ -2513,6 +2513,38 @@ class ConversationAdapterTest(unittest.TestCase):
                 ensure_server.assert_called_once_with()
                 self.assertFalse(hasattr(opencode_adapter, "start_context_server"))
 
+    def test_opencode_shell_wrapper_unsets_what_its_shell_was_not_given(self) -> None:
+        """Review S1: the wrapper restores THIS shell's identity and drops the
+        engine paths and Admin flavor the shared server may carry."""
+        context = replace(self.context, env={
+            "PATH": "/usr/bin:/bin",
+            "SC_API_TOKEN": "dev-token",
+            "SC_API_BASE": "http://127.0.0.1:1",
+            "SC_SHELL_ID": "3",
+        })
+        adapter, _native = self.build("opencode")
+        adapter.start(context, "plain")
+        wrapper = next((self.root / "opencode-shells").glob("*.sh"))
+        body = wrapper.read_text()
+        unset = next(line for line in body.splitlines() if line.startswith("unset "))
+        for name in ("SC_ENGINE_DIR", "SC_ROOT", "SC_SHELL_FLAVOR"):
+            self.assertIn(name, unset.split())
+        self.assertNotIn("SC_API_TOKEN", unset.split())
+        server_env = {
+            "PATH": "/usr/bin:/bin",
+            "SC_ENGINE_DIR": "/main/.super-coder",
+            "SC_ROOT": "/main",
+            "SC_SHELL_FLAVOR": "admin",
+            "SC_API_TOKEN": "admin-token",
+        }
+        probe = subprocess.run(
+            ["/bin/sh", str(wrapper), "-c",
+             'echo "${SC_ENGINE_DIR-none}:${SC_ROOT-none}:'
+             '${SC_SHELL_FLAVOR-none}:$SC_API_TOKEN"'],
+            env=server_env, capture_output=True, text=True, check=True,
+        )
+        self.assertEqual(probe.stdout.strip(), "none:none:none:dev-token")
+
     def test_claude_resume_accepts_resolved_worktree_descendants(self) -> None:
         adapter, runner = self.build("claude")
         session_ref = "11111111-1111-4111-8111-111111111111"
