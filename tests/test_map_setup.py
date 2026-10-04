@@ -56,9 +56,12 @@ class ArgumentPreflightTest(unittest.TestCase):
 class UpdateBridgeSeatTest(unittest.TestCase):
     def test_sandbox_seat_skips_host_update_bridge(self):
         with mock.patch.dict(map_setup.os.environ, {"SC_SANDBOX": "1"}), \
-                mock.patch.object(map_setup.subprocess, "run") as run:
+                mock.patch.object(map_setup.subprocess, "run") as run, \
+                mock.patch("sys.stdout", new_callable=io.StringIO) as out:
             map_setup.run_update_compat()
         run.assert_not_called()
+        self.assertIn("skipped the owner update bridge", out.getvalue())
+        self.assertIn("sandbox does not hold", out.getvalue())
 
     def test_host_seat_runs_update_bridge(self):
         with mock.patch.dict(map_setup.os.environ, {}, clear=True), \

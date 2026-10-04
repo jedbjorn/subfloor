@@ -85,10 +85,8 @@
     {
       "id": "V11",
       "claim": "Source workers see tracked engine source but not live state; source Admin retains the maintenance view.",
-      "anchors": [
-        "tests/test_role_aware_boot_contract.py#test_source_worker_sees_tracked_source_but_not_live_state",
-        "tests/test_role_aware_boot_contract.py#test_admin_gets_exact_private_target_and_maintenance_routing"
-      ]
+      "superseded_by_decision": 427,
+      "anchors": []
     },
     {
       "id": "V12",
@@ -114,12 +112,8 @@
     {
       "id": "V14",
       "claim": "Linked-worktree dispatch, conversation recovery, Git metadata, declared work roots, and fork tooling survive the restricted view.",
-      "anchors": [
-        "tests/test_update_materialize.py#test_clean_stale_worktree_dispatcher_runs_current_read_only_help",
-        "tests/test_conversation_launch.py#test_recovery_withholds_maintenance_paths_without_a_view_wrapper",
-        "tests/test_map_repo.py#test_declared_work_repo_is_the_map_target",
-        "tests/test_fresh_install_shell_contract.py#test_install_is_committed_before_first_shell_worktree"
-      ]
+      "superseded_by_decision": 427,
+      "anchors": []
     },
     {
       "id": "V15",

@@ -63,6 +63,9 @@ def run_update_compat() -> None:
     bridge, as does Admin; any other launched shell skips it, and says so.
     """
     if os.environ.get("SC_SANDBOX"):
+        print("map-setup: skipped the owner update bridge — it reconciles "
+              "host-owned engine state, which the sandbox does not hold; "
+              "hook wiring and mapping continue.")
         return
     if os.environ.get("SC_API_TOKEN"):
         import engine_identity

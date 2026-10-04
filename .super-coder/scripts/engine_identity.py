@@ -4,8 +4,8 @@ Engine SQL (``engine_sql.py``), shared-instance serialization (``snapshot`` and
 ``render flat`` through ``_serialize_guard.py``) and map-setup's owner update
 bridge (``map_setup.py``) all ask the same question through ``resolve``.
 
-Identity derives from the launched shell's bearer token, never from a
-self-declared variable such as a flavor string or an "I am Admin" flag:
+Identity derives from the launched shell's bearer token, not from a
+self-declared flavor string or an "I am Admin" flag:
 
 1. ``SC_API_TOKEN`` with ``SC_API_BASE`` -> the API's ``/_sc/mem/whoami``
    names the flavor.
@@ -21,7 +21,15 @@ Rule 3 is deliberate (decision #428). These gates are confusion rails for
 capable collaborators, not containment: a launched shell always carries its
 token, so a shell only reaches rule 3 by stripping its own identity — the same
 class of deliberate step-around as ``git commit --no-verify``, which #428
-accepts for rails. Engine-internal callers that run on behalf of the engine
+accepts for rails.
+
+One self-declared input remains and is accepted on the same terms:
+``SC_API_BASE`` is caller-controlled, so a process that points it at a stub
+answering ``admin`` to ``/whoami`` passes the gate. That takes a deliberate
+act against one's own environment, the same step-around class as stripping
+the token; this module is a rail against confusion, not proof of identity.
+
+Engine-internal callers that run on behalf of the engine
 pass their children ``engine_internal_env`` so an operator's ambient token
 never decides whether the engine may maintain itself.
 """

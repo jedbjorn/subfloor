@@ -91,7 +91,7 @@ supported meaning and can misdescribe the seat.
 | `SC_DEVKIT_ROOT` · `SC_DEVKIT_SEAT` · `SC_DEVKIT_HOOK` | checkout · `host`/`docker` · hook name | Neutral context handed to every dev-kit hook child. |
 | `SC_DEVKIT_REPAIR` | `1` | Set for `./sc enter --devkit-repair`; the boot makes no readiness claim in that seat. |
 
-Evidence: `run.py:2073-2094,2665-2716`, `conversation_launch.py:94-111`,
+Evidence: `run.py:2073-2094,2665-2716`, `conversation_launch.py:113-131`,
 `execution_view.py:40-55`, `dispatch.sh:306-329,1507-1508,1574`,
 `devkit.py:816-823`, `branch-guard.sh:52,87`, `shell_liveness.py:56,270-277`.
 
