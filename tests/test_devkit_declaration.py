@@ -61,7 +61,9 @@ class DeclarationTest(unittest.TestCase):
         outside.write_text('{"version": 1}')
         (self.root / ".subfloor" / "dev-kit.json").symlink_to(outside)
         with self.assertRaisesRegex(
-            DevkitConfigError, r"\$: must stay inside the invoking checkout"
+            DevkitConfigError,
+            r"^\$: a declaration must run the tree it is declared in, not another "
+            r"checkout; must stay inside the invoking checkout$",
         ):
             load_declaration(self.root)
 
@@ -158,11 +160,18 @@ class DeclarationTest(unittest.TestCase):
         outside.mkdir()
         (outside / "tool").write_text("no")
         (self.root / "escape").symlink_to(outside, target_is_directory=True)
-        for executable in ("../outside/tool", "./escape/tool", "/bin/sh", "C:\\tool.exe"):
+        confusion = (r"\$\.hooks\.test\.argv\[0\]: a declaration must run the tree it "
+                     r"is declared in, not another checkout; ")
+        for executable, rule in (
+            ("../outside/tool", "must stay inside the invoking checkout"),
+            ("./escape/tool", "must stay inside the invoking checkout"),
+            ("/bin/sh", "absolute executable paths are forbidden"),
+            ("C:\\tool.exe", "absolute executable paths are forbidden"),
+        ):
             with self.subTest(executable=executable):
                 self.assert_invalid(
                     {"version": 1, "hooks": {"test": {"argv": [executable]}}},
-                    r"\$\.hooks\.test\.argv\[0\]",
+                    "^" + confusion + rule + "$",
                 )
 
     def test_provision_hook_must_reference_declared_hook(self):

@@ -268,6 +268,8 @@ class ApiMemTest(unittest.TestCase):
         with self.assertRaises(SystemExit) as caught:
             self.run_mem("delivery-audit")
         self.assertIn("planner_only_delivery_audit", str(caught.exception))
+        self.assertIn("flag_sweep's close and open rules are Planner-owned; "
+                      "delivery audit is available only to Planner", str(caught.exception))
 
     def test_write_lands_on_the_token_shell(self):
         self.run_mem("state", "hello state")

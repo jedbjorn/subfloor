@@ -195,7 +195,7 @@ def test_admin_interactive_preserves_explicit_controlled_model_in_native_argv() 
     )
     assert (ordinary_model, ordinary_route) == ("ordinary/default", None)
 
-    with pytest.raises(ValueError, match="must be a provider/model selector"):
+    with pytest.raises(ValueError, match=r"^requested route must be the observed route \(decision #310 canary posture\): controlled OpenCode route must be a provider/model selector"):
         run_mod.resolve_interactive_model(
             harness="opencode",
             flavor_model="ollama-cloud/glm-5.2",
@@ -234,6 +234,9 @@ def test_controlled_route_preflight_refuses_unavailable_selector() -> None:
             run=lambda *_args, **_kwargs: completed,
         )
 
+    assert str(refused.value).startswith(
+        "requested route must be the observed route (decision #310 canary posture): "
+    )
     assert f"requested={CONTROLLED}" in str(refused.value)
     assert f"selector={CONTROLLED_SELECTOR}" in str(refused.value)
 

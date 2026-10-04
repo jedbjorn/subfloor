@@ -86,6 +86,9 @@ sc_platform_unsupported() {
   exit 1
 }
 
+# The confusion the preflight prevents, named before any remedy (Feature #91 C2).
+SC_PYTHON_BASELINE="the engine's tracked baseline is Python 3.14 (decision #240); an older interpreter fails later with a worse message."
+
 sc_python_recovery() {
   echo '  recovery: install Python 3.14.x with sqlite3, then:' >&2
   echo '            export SC_PYTHON=/absolute/path/to/python3' >&2
@@ -96,9 +99,11 @@ sc_python_probe() {
   resolved="$(command -v "$requested" 2>/dev/null || true)"
   if [ -z "$resolved" ] || [ ! -x "$resolved" ]; then
     if [ -n "${SC_PYTHON:-}" ]; then
-      echo "✗ host Python preflight: SC_PYTHON '$SC_PYTHON' is not executable." >&2
+      echo "✗ host Python preflight: $SC_PYTHON_BASELINE" >&2
+      echo "  SC_PYTHON '$SC_PYTHON' is not executable." >&2
     else
-      echo "✗ host Python preflight: python3 is not executable on PATH." >&2
+      echo "✗ host Python preflight: $SC_PYTHON_BASELINE" >&2
+      echo "  python3 is not executable on PATH." >&2
     fi
     sc_python_recovery
     exit 1
@@ -120,7 +125,8 @@ except ImportError:
     raise SystemExit(3)
 print("{}|{}|{}".format(executable, version, sqlite3.sqlite_version))
 ' 2>&1)" || {
-    echo "✗ host Python preflight failed for '$requested' ($resolved):" >&2
+    echo "✗ host Python preflight: $SC_PYTHON_BASELINE" >&2
+    echo "  '$requested' ($resolved) failed the probe:" >&2
     printf '  %s\n' "$probe" >&2
     sc_python_recovery
     exit 1
@@ -381,7 +387,9 @@ sc_host_enter() {
     exit 2
   fi
   if ! sc_host_api_healthy; then
-    echo "✗ host review server is not answering on 127.0.0.1:$(port) — ./sc launch first" >&2
+    # Feature #91 C22: the confusion first, then the fact and the remedy.
+    echo "✗ sc enter: sc mem has no file fallback, so a shell booted now could not write memory." >&2
+    echo "  the host review server is not answering on 127.0.0.1:$(port) — ./sc launch first" >&2
     exit 1
   fi
   sc_urls || true
@@ -1493,10 +1501,7 @@ case "$cmd" in
       echo "Boot the sole active Admin directly on the host; no Docker or API is required."
       exit 0
     fi
-    if [ -n "${SC_SANDBOX:-}" ]; then
-      echo "sc admin: host Admin launch is unavailable inside the sandbox; run subfloor admin from a host terminal" >&2
-      exit 1
-    fi
+    # run.py owns the one Admin-in-sandbox refusal (Feature #91 C8).
     exec "$PY" "$S/run.py" --host-admin "$@" ;;
   boot)         exec "$PY" "$S/run.py" "$@" ;;
   boot-*)       exec "$PY" "$S/run.py" "${cmd#boot-}" "$@" ;;
@@ -1723,7 +1728,7 @@ case "$cmd" in
       exec docker exec -it -e SC_DEVKIT_REPAIR=1 ${SC_ENTER_LEASE:+-e SC_ENTER_LEASE} "$CNAME" ./sc boot "$@"
     fi
     sc_devkit_ready || {
-      echo "✗ dev-kit state: stale — normal entry blocked until fork provisioning is ready." >&2
+      echo "✗ dev-kit state: stale — the fork provisioning receipt is stale, so a shell entered now would run tools that do not match the fork's declaration; normal entry blocked until fork provisioning is ready." >&2
       echo "  retry:  ./sc launch --no-build" >&2
       echo "  repair: ./sc enter --devkit-repair" >&2
       exit 1
@@ -1739,7 +1744,7 @@ case "$cmd" in
       exit 2
     fi
     sc_devkit_ready || {
-      echo "✗ dev-kit state: stale — normal entry blocked until fork provisioning is ready." >&2
+      echo "✗ dev-kit state: stale — the fork provisioning receipt is stale, so a shell entered now would run tools that do not match the fork's declaration; normal entry blocked until fork provisioning is ready." >&2
       echo "  retry:  ./sc launch --no-build" >&2
       echo "  repair: ./sc enter --devkit-repair" >&2
       exit 1

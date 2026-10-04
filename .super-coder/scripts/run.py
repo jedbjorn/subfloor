@@ -349,6 +349,11 @@ CONTROLLED_OLLAMA_CLOUD_ROUTES = {
     # ollama-cloud provider exposes the same route without that transport tag.
     "deepseek-v4-flash:cloud": "ollama-cloud/deepseek-v4-flash",
 }
+# The confusion every controlled-route refusal prevents, named first (Feature
+# #91 C18): a launch whose served model differs from the one requested.
+CONTROLLED_ROUTE_CONFUSION = (
+    "requested route must be the observed route (decision #310 canary posture)"
+)
 
 
 def resolve_headless_route(
@@ -437,7 +442,8 @@ def resolve_interactive_model(
     )
     if selector is None:
         raise ValueError(
-            "controlled OpenCode route must be a provider/model selector or "
+            f"{CONTROLLED_ROUTE_CONFUSION}: controlled OpenCode route must be a "
+            "provider/model selector or "
             f"the supported Ollama Cloud route; requested={requested_model}"
         )
     return requested_model, ControlledOpenCodeRoute(requested_model, selector)
@@ -450,7 +456,8 @@ def controlled_opencode_model_args(
     flag = (adapter.get("headless") or {}).get("model_flag")
     if not flag:
         raise ValueError(
-            "controlled OpenCode route cannot be enforced: adapter has no "
+            f"{CONTROLLED_ROUTE_CONFUSION}: controlled OpenCode route cannot be "
+            "enforced: adapter has no "
             "native model flag"
         )
     return [flag, route.selector]
@@ -484,7 +491,8 @@ def preflight_controlled_opencode_route(
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
         raise ValueError(
-            "controlled OpenCode route unavailable before launch: "
+            f"{CONTROLLED_ROUTE_CONFUSION}: controlled OpenCode route "
+            "unavailable before launch: "
             f"requested={route.requested} selector={route.selector}: {exc}"
         ) from exc
     available = (
@@ -494,7 +502,8 @@ def preflight_controlled_opencode_route(
         detail = completed.stderr.strip()
         suffix = f": {detail}" if detail else ""
         raise ValueError(
-            "controlled OpenCode route unavailable before launch: "
+            f"{CONTROLLED_ROUTE_CONFUSION}: controlled OpenCode route "
+            "unavailable before launch: "
             f"requested={route.requested} selector={route.selector}{suffix}"
         )
 
@@ -2125,7 +2134,17 @@ def review_gui_panel(api_port: int, has_key: bool) -> str:
     ])
 
 
+ADMIN_IN_SANDBOX_REFUSAL = (
+    "sc admin: Admin maintains the host instance; the container has no host "
+    "state to maintain. Run `subfloor admin` from a host terminal."
+)
+
+
 def main() -> None:
+    # The one Admin-in-sandbox check (Feature #91 C8): before any floor or
+    # state read, so the refusal is the first and only thing a sandbox sees.
+    if "--host-admin" in sys.argv[1:] and os.environ.get("SC_SANDBOX"):
+        sys.exit(ADMIN_IN_SANDBOX_REFUSAL)
     source_repo = install.is_source_repo()
     tracked_engine = subprocess.run(
         [
@@ -2155,11 +2174,6 @@ def main() -> None:
     )
     raw_args = sys.argv[1:]
     host_admin = "--host-admin" in raw_args
-    if host_admin and os.environ.get("SC_SANDBOX"):
-        sys.exit(
-            "sc admin: host Admin launch is unavailable inside the sandbox; "
-            "run subfloor admin from a host terminal"
-        )
     if not os.environ.get("RENDER_ONLY") and not host_admin:
         global_pointer.reconcile()
     args = raw_args

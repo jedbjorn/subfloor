@@ -192,15 +192,30 @@ class AdminDispatcherTest(unittest.TestCase):
         self.assertIn("no Docker or API is required", completed.stdout)
         self.assertNotIn('["--host-admin"', completed.stdout)
 
-    def test_admin_refuses_inside_sandbox_before_running_launcher(self):
+    def test_admin_in_sandbox_reaches_the_one_launcher_check(self):
+        # Feature #91 C8: the dispatcher no longer duplicates the refusal;
+        # run.py owns the one check (RunAdminSandboxRefusalTest below).
         completed = self.invoke("admin", sandbox=True)
-        self.assertEqual(completed.returncode, 1)
-        self.assertEqual(completed.stdout, "")
-        self.assertRegex(
-            completed.stderr,
-            r"run `?subfloor admin`? from a host terminal",
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(
+            json.loads(completed.stdout),
+            {"argv": ["--host-admin"], "sandbox_present": True},
         )
-        self.assertNotIn('["--host-admin"]', completed.stdout)
+
+
+class RunAdminSandboxRefusalTest(unittest.TestCase):
+    def test_host_admin_inside_sandbox_refuses_before_any_floor_read(self):
+        with mock.patch.dict(os.environ, {"SC_SANDBOX": "1"}), \
+                mock.patch.object(sys, "argv", ["run.py", "--host-admin"]), \
+                mock.patch.object(run.install, "is_source_repo",
+                                  side_effect=AssertionError("read the floor")):
+            with self.assertRaises(SystemExit) as raised:
+                run.main()
+        self.assertEqual(
+            str(raised.exception.code),
+            "sc admin: Admin maintains the host instance; the container has no "
+            "host state to maintain. Run `subfloor admin` from a host terminal.",
+        )
 
 
 class AdminExecutionContextTest(unittest.TestCase):

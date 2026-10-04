@@ -178,14 +178,22 @@ def _is_absolute(value: str) -> bool:
     return Path(value).is_absolute() or PureWindowsPath(value).is_absolute()
 
 
+# The confusion every containment refusal prevents, named first (Feature #91
+# D12): a worktree's declaration silently running another checkout's tree.
+OTHER_CHECKOUT_CONFUSION = (
+    "a declaration must run the tree it is declared in, not another checkout"
+)
+OUTSIDE_CHECKOUT = f"{OTHER_CHECKOUT_CONFUSION}; must stay inside the invoking checkout"
+
+
 def _contained(checkout: Path, candidate: Path, field: str) -> Path:
     resolved = candidate.resolve(strict=False)
     try:
         common = Path(os.path.commonpath((str(checkout), str(resolved))))
     except ValueError as exc:
-        raise _error(field, "must stay inside the invoking checkout") from exc
+        raise _error(field, OUTSIDE_CHECKOUT) from exc
     if common != checkout:
-        raise _error(field, "must stay inside the invoking checkout")
+        raise _error(field, OUTSIDE_CHECKOUT)
     return resolved
 
 
@@ -199,7 +207,9 @@ def _repo_path(
 ) -> tuple[str, Path]:
     value = _string(declared, field)
     if _is_absolute(value):
-        raise _error(field, "must be relative to the invoking checkout")
+        raise _error(
+            field, f"{OTHER_CHECKOUT_CONFUSION}; must be relative to the invoking checkout"
+        )
     resolved = _contained(checkout, (base or checkout) / value, field)
     if kind == "directory" and not resolved.is_dir():
         raise _error(field, "must resolve to an existing directory")
@@ -232,10 +242,14 @@ def _hook(checkout: Path, name: str, value: Any) -> Hook:
     executable = _boot_field(argv[0], f"{field}.argv[0]")
     if "/" not in executable:
         if _is_absolute(executable):
-            raise _error(f"{field}.argv[0]", "absolute executable paths are forbidden")
+            raise _error(
+                f"{field}.argv[0]",
+                f"{OTHER_CHECKOUT_CONFUSION}; absolute executable paths are forbidden")
         return Hook(name, argv, cwd_declared, cwd, "path", executable, None)
     if _is_absolute(executable):
-        raise _error(f"{field}.argv[0]", "absolute executable paths are forbidden")
+        raise _error(
+                f"{field}.argv[0]",
+                f"{OTHER_CHECKOUT_CONFUSION}; absolute executable paths are forbidden")
     _, resolved = _repo_path(
         checkout, executable, f"{field}.argv[0]", base=cwd
     )

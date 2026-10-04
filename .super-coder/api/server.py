@@ -569,6 +569,14 @@ def get_cli_skills(con) -> dict:
 # local CLI has, so a launched Planner owns every `sc skill` verb.
 
 
+# The confusion every shell-facing browser refusal prevents, named first
+# (Feature #91 E5/E6).
+BROWSER_OWNERSHIP_CONFUSION = (
+    "the browser profile and its chats belong to the operator; a shell drives, "
+    "it does not own"
+)
+
+
 class SkillApiError(ValueError):
     """Client-visible skill mutation failure with a stable HTTP status."""
 
@@ -3041,8 +3049,12 @@ class Handler(BaseHTTPRequestHandler):
             return None
         return shell_id
 
-    def _require_browser_operator(self, con, what: str = "the Sprint board"):
-        """Accept the loopback browser operator and reject shell credentials."""
+    def _require_browser_operator(self, con, what: str = "the Sprint board",
+                                  confusion: str | None = None):
+        """Accept the loopback browser operator and reject shell credentials.
+
+        ``confusion`` names, ahead of the refusal, what a shell credential
+        here would get wrong (Feature #91 E6)."""
         token = self._bearer_token()
         if token:
             shell = con.execute(
@@ -3058,7 +3070,8 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 self._send(403, {"error": {
                     "code": "fnb_operator_required",
-                    "message": f"{what} is owned by the browser FnB operator",
+                    "message": (f"{confusion}: " if confusion else "")
+                    + f"{what} is owned by the browser FnB operator",
                     "details": {},
                 }})
             return False
@@ -4267,7 +4280,9 @@ class Handler(BaseHTTPRequestHandler):
         if sid is None:
             return
         if body.get('action') not in ('status', 'open'):
-            return self._send(403, {'error': 'Browser setup, lifecycle and arm are owned by the FnB; shells may use status and open.'})
+            return self._send(403, {'error': (
+                f'{BROWSER_OWNERSHIP_CONFUSION}. Browser setup, lifecycle and arm '
+                'are owned by the FnB; shells may use status and open.')})
         con = db()
         try:
             row = con.execute('SELECT shortname FROM shells WHERE shell_id=?', (sid,)).fetchone()
@@ -4378,7 +4393,9 @@ class Handler(BaseHTTPRequestHandler):
                 if actor is None or actor[0] != "planner":
                     return self._send(403, {"error": {
                         "code": "planner_only_delivery_audit",
-                        "message": "delivery audit is available only to Planner",
+                        "message": ("flag_sweep's close and open rules are "
+                                    "Planner-owned; delivery audit is available "
+                                    "only to Planner"),
                         "details": {},
                     }})
                 return self._send(200, get_delivery_audit(con))
@@ -5637,7 +5654,9 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/vm":
                 return self._send(200, {"vm": vm_mod.read()})
             if path == "/api/browser":
-                if not self._require_browser_operator(con, "browser configuration"):
+                if not self._require_browser_operator(
+                        con, "browser configuration",
+                        confusion=BROWSER_OWNERSHIP_CONFUSION):
                     return
                 return self._send(200, {**browser_mod.status(), "config": browser_mod.read(),
                     "defaults": browser_mod.defaults()})
@@ -5703,7 +5722,9 @@ class Handler(BaseHTTPRequestHandler):
         con = db()
         try:
             if path == "/api/browser":
-                if not self._require_browser_operator(con, "browser configuration"):
+                if not self._require_browser_operator(
+                        con, "browser configuration",
+                        confusion=BROWSER_OWNERSHIP_CONFUSION):
                     return
                 if not self._require_browser_mutation_origin("browser configuration changes"):
                     return

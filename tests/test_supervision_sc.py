@@ -631,6 +631,7 @@ class RestrictedLaunchTests(unittest.TestCase):
         self.assertEqual(normal.returncode, 1)
         self.assertIn("dev-kit state: stale", normal.stderr)
         self.assertIn("normal entry blocked", normal.stderr)
+        self.assertIn("the fork provisioning receipt is stale", normal.stderr)
         self.assertFalse(
             [line for line in self.fx.calls() if line.startswith("docker exec ")]
         )
