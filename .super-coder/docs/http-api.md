@@ -162,7 +162,7 @@ owning Planner may call `dispatch` or `monitor`.
 | `POST /_sc/pr/subscribe` | shell | `{repository, pr_number}` → `{subscription_id, created}`; `201` on create, `200` when already subscribed. `sc pr` |
 | `POST /_sc/skills/{put\|grant\|revoke\|rm\|retire\|unretire}` | Planner shell | fork-local skill catalogue mutations, enforced server-side against the same rules as the host CLI |
 | `PUT /_sc/skills/assign` | Planner shell | `{name, shell\|shells, granted}` — grant or revoke in one verb |
-| `PUT /_sc/skills/retire/…` | — | always `403`: retire/unretire write the tracked fork retire manifest on the host and stay Admin-only |
+| `PUT /_sc/skills/retire/{name}` | Planner shell | `{retired: bool}` (default `true`) — the same retire/unretire lane and Planner check as the `POST` routes |
 | `PUT /_sc/runtime-flags/{source}` | runtime token | system-managed non-blocking advisories; `401` when `X-SC-Runtime-Token` does not match |
 
 ## `/api` — the Review GUI

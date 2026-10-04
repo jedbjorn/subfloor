@@ -441,5 +441,82 @@ class SkillCliConnectionTest(unittest.TestCase):
                 self.assertEqual(api.call_args.args[1], route)
 
 
+class RetireRouteAuthorityTest(unittest.TestCase):
+    """Feature #91 E3 / acceptance G7: retire has one owner (the Planner), so
+    `PUT /_sc/skills/retire/{name}` and `POST /_sc/skills/{retire|unretire}`
+    authorize identically. Unknown names keep every call refusal-only: no
+    retire file is written and no projection runs."""
+
+    TOKENS = {"planner": "pln-retire-token", "dev": "dev-retire-token"}
+
+    @classmethod
+    def setUpClass(cls):
+        import threading
+        from http.server import ThreadingHTTPServer
+        engine = ROOT / ".super-coder"
+        cls.tmp = tempfile.TemporaryDirectory()
+        cls.db = Path(cls.tmp.name) / "shell_db.db"
+        with closing(sqlite3.connect(cls.db)) as con:
+            con.executescript((engine / "schema.sql").read_text())
+            for p in sorted((engine / "migrations").glob("*.sql")):
+                con.executescript(p.read_text())
+            con.execute("INSERT INTO users (user_id, username, is_active) "
+                        "VALUES (1, 'T', 1)")
+            for sid, (flavor, token) in enumerate(cls.TOKENS.items(), start=1):
+                con.execute(
+                    "INSERT INTO shells (shell_id, display_name, shortname, mandate, "
+                    "system_prompt, user_id, flavor, api_key) "
+                    "VALUES (?, ?, ?, 'm', 'sp', 1, ?, ?)",
+                    (sid, flavor, f"{flavor[:3].upper()}1", flavor, token))
+            con.commit()
+        cls._orig_db = server.DB_PATH
+        server.DB_PATH = cls.db
+        cls.httpd = ThreadingHTTPServer(("127.0.0.1", 0), server.Handler)
+        cls.thread = threading.Thread(target=cls.httpd.serve_forever, daemon=True)
+        cls.thread.start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.httpd.shutdown()
+        cls.httpd.server_close()
+        server.DB_PATH = cls._orig_db
+        cls.tmp.cleanup()
+
+    def call(self, method, path, body, token):
+        import urllib.error
+        import urllib.request
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{self.httpd.server_address[1]}{path}",
+            data=json.dumps(body).encode(), method=method,
+            headers={"Authorization": f"Bearer {token}",
+                     "Content-Type": "application/json"})
+        try:
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                return resp.status, json.loads(resp.read() or b"{}")
+        except urllib.error.HTTPError as exc:
+            return exc.code, json.loads(exc.read() or b"{}")
+
+    def test_put_and_post_retire_authorize_identically(self):
+        name = "no_such_engine_skill"
+        with mock.patch.object(skill_cli, "_write_retire_list",
+                               side_effect=AssertionError("wrote retire list")):
+            for flavor, token in self.TOKENS.items():
+                for action, put_body in (("retire", {}), ("retire", {"retired": True}),
+                                         ("unretire", {"retired": False})):
+                    with self.subTest(flavor=flavor, action=action, body=put_body):
+                        post = self.call("POST", f"/_sc/skills/{action}",
+                                         {"name": name}, token)
+                        put = self.call("PUT", f"/_sc/skills/retire/{name}",
+                                        put_body, token)
+                        self.assertEqual(post, put)
+                        if flavor == "planner":
+                            self.assertEqual(post[0], 409)   # past auth, unknown name
+                        else:
+                            self.assertEqual(post[0], 403)
+                            self.assertTrue(post[1]["error"].startswith(
+                                "the skill catalogue is DB-canonical and "
+                                "Planner-curated (fork_skill_design)"), post[1])
+
+
 if __name__ == "__main__":
     unittest.main()

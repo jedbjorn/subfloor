@@ -595,8 +595,9 @@ def _resolve_planner_shell(con, shell_id: int) -> dict:
         label = row["shortname"] or row["display_name"] or row["shell_id"]
         raise SkillApiError(
             403,
-            f"skill mutations are Planner-owned; shell {label} has "
-            f"flavor {row['flavor'] or 'bespoke'}",
+            f"{skill_mod.PLANNER_CURATION_CONFUSION}; skill mutations are "
+            f"Planner-owned, and shell {label} has flavor "
+            f"{row['flavor'] or 'bespoke'}",
         )
     return dict(row)
 
@@ -5683,8 +5684,8 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         path = urlparse(self.path).path
         if path.startswith("/_sc/skills/"):
-            # Planner-owned fork-local skill catalogue. Retire/unretire remain
-            # Admin-only (fork-tracked retire manifest on the host).
+            # Planner-owned fork-local skill catalogue, retire/unretire included
+            # (PUT /_sc/skills/retire/{name} routes to the same Planner check).
             try:
                 return self._skills_mutation_post(path, self._body())
             except Exception as exc:  # noqa: BLE001 — _fail handles reporting
@@ -6047,9 +6048,16 @@ class Handler(BaseHTTPRequestHandler):
         path = urlparse(self.path).path
         parts = path.strip("/").split("/")
         if len(parts) == 4 and parts[:3] == ["_sc", "skills", "retire"]:
-            return self._send(403, {"error":
-                "skill retire/unretire are Admin-only: they write the tracked "
-                "fork retire manifest on the host"})
+            # PUT /_sc/skills/retire/{name} {retired: bool=true} — the same
+            # Planner-owned lane as POST /_sc/skills/{retire|unretire}; one
+            # owner, so both routes authorize identically (Feature #91 E3).
+            try:
+                body = self._body()
+                action = "retire" if body.get("retired", True) else "unretire"
+                return self._skills_mutation_post(
+                    f"/_sc/skills/{action}", {"name": unquote(parts[3])})
+            except Exception as exc:  # noqa: BLE001
+                return self._fail(exc)
         if len(parts) == 4 and parts[:3] == ["_sc", "skills", "assign"]:
             try:
                 return self._skills_mutation_assign(self._body())

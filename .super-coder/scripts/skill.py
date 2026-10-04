@@ -82,6 +82,12 @@ API_DOWN_CONFUSION = (
     "behind the API every other shell reads (a write believed delivered that "
     "the control plane never saw)."
 )
+# The confusion a non-Planner skill mutation would cause, named first in every
+# Planner refusal (Feature #91 D7/E2); server._resolve_planner_shell says the same.
+PLANNER_CURATION_CONFUSION = (
+    "the skill catalogue is DB-canonical and Planner-curated "
+    "(fork_skill_design)"
+)
 
 
 def _shell_api_enabled() -> bool:
@@ -125,8 +131,8 @@ def require_planner(con) -> int:
     """Resolve the launched shell token locally and require Planner flavor."""
     if not mem.SC_API_TOKEN:
         sys.exit(
-            "sc skill: `put` requires a launched Planner shell; no shell token "
-            "is present"
+            f"sc skill: {PLANNER_CURATION_CONFUSION}, so `put` requires a "
+            "launched Planner shell; no shell token is present"
         )
     row = con.execute(
         "SELECT shell_id, shortname, flavor FROM shells WHERE api_key=? "
@@ -134,12 +140,13 @@ def require_planner(con) -> int:
         (mem.SC_API_TOKEN,),
     ).fetchone()
     if row is None:
-        sys.exit("sc skill: `put` shell token does not resolve to an active shell")
+        sys.exit(f"sc skill: {PLANNER_CURATION_CONFUSION}; `put` shell token "
+                 "does not resolve to an active shell")
     if row[2] != "planner":
         label = row[1] or row[0]
         sys.exit(
-            f"sc skill: `put` is Planner-owned; shell {label} has flavor "
-            f"{row[2] or 'bespoke'}"
+            f"sc skill: {PLANNER_CURATION_CONFUSION}; `put` is Planner-owned, "
+            f"and shell {label} has flavor {row[2] or 'bespoke'}"
         )
     return int(row[0])
 
