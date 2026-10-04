@@ -8,5 +8,6 @@
 [ "$3" = "1" ] || exit 0
 root="$(git rev-parse --show-toplevel 2>/dev/null)" || exit 0
 [ -x "$root/sc" ] || exit 0
-( cd "$root" && ./sc map >/dev/null 2>&1 ) || true
+# --auto: refresh only the tree the catalogue already maps (see `./sc map -h`).
+( cd "$root" && ./sc map --auto >/dev/null 2>&1 ) || true
 exit 0

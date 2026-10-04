@@ -821,7 +821,7 @@ class ModeTest(unittest.TestCase):
         )
         dispatcher = (ROOT / ".super-coder" / "scripts" / "dispatch.sh").read_text()
         self.assertIn(
-            'visual-qa)         exec "$PY" "$S/visual_qa.py" "$@" ;;', dispatcher
+            'visual-qa)         sc_project_env; exec "$PY" "$S/visual_qa.py" "$@" ;;', dispatcher
         )
         self.assertIn("./sc visual-qa <mode>", dispatcher)
 

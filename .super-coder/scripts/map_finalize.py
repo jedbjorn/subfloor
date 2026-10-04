@@ -333,7 +333,7 @@ def _read_receipt(path: Path) -> dict[str, object] | None:
 
 
 def check_extractor_install() -> tuple[CheckRow, dict[str, ExtractorRecord], set[str]]:
-    target_dir = map_repo.MAP_ROOT / ".sc-state" / "map_extractors"
+    target_dir = map_repo.EXTRACTOR_ROOT / ".sc-state" / "map_extractors"
     receipt_dir = artifact_policy.map_extractor_receipts_dir()
     unsafe_roots: list[str] = []
     if target_dir.is_symlink():

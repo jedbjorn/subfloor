@@ -959,7 +959,7 @@ def cmd_doc(args) -> int:
         if args.title is not None:
             payload["title"] = args.title
         if args.body_file is not None:
-            payload["body"] = Path(args.body_file).read_text()
+            payload["body"] = _operator_file(args.body_file).read_text()
         if args.render_path is not None:
             payload["render_path"] = args.render_path
         if not payload:
@@ -968,7 +968,8 @@ def cmd_doc(args) -> int:
                  timeout=_DOC_WRITE_TIMEOUT)
         rc = _finish_api(f"mem: document #{args.document_id} edited")
         return _note_serialize(r) or rc
-    body_text = Path(args.body_file).read_text()
+    # A relative --body-file names a path from the operator's cwd (U3).
+    body_text = _operator_file(args.body_file).read_text()
     r = _api("POST", "/_sc/mem/docs",
              {"feature_id": args.feature,
               "kind": args.kind,
@@ -980,6 +981,12 @@ def cmd_doc(args) -> int:
     rc = _finish_api(f"mem: {args.kind} document #{r.get('document_id', '')} added"
                      f" ('{args.title}', {len(body_text)} chars)")
     return _note_serialize(r) or rc
+
+
+def _operator_file(raw: str) -> Path:
+    """An operator-named file, relative to where `sc` was typed (spec #267 U3)."""
+    import project_root
+    return project_root.invocation_path(raw)
 
 
 def _note_serialize(r: dict) -> int:

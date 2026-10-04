@@ -19,7 +19,16 @@ fi
 # SC_CALLER_ROOT is a one-hop bootstrap projection and is not part of nested
 # command execution.
 unset SC_CALLER_ROOT
+# Likewise the project identity below is set per command by sc_project_env; an
+# inherited copy from an outer command never speaks for this one.
+unset SC_PROJECT_ROOT SC_INVOCATION_CWD SC_PROJECT_ENGINE
+# The operator's own directory, captured before the cd below: a relative FILE
+# argument (`--body-file notes/x.md` typed in a worktree subdirectory) names a
+# path from here, not from the checkout root. Project-subject verbs receive it
+# through sc_project_env; a deleted cwd degrades to the caller root.
+sc_invocation_cwd="$(pwd -P 2>/dev/null || true)"
 cd "$here"
+[ -n "$sc_invocation_cwd" ] && [ -d "$sc_invocation_cwd" ] || sc_invocation_cwd="$(pwd -P)"
 
 # FOUR identities, never one ROOT (spec #68). The CALLER is the checkout holding
 # the `sc` that was invoked; the LIVE instance is the MAIN worktree root, which
@@ -121,6 +130,23 @@ print("{}|{}|{}".format(executable, version, sqlite3.sqlite_version))
   PY="$resolved"
   SC_PYTHON="$resolved"
   export PY SC_PYTHON SC_PYTHON_EXECUTABLE SC_PYTHON_RUNTIME
+}
+
+# --- caller-root resolution for project-subject verbs (spec #267 U3) ----------
+# A command whose subject is the shell's PROJECT (dev-kit hooks, visual QA, the
+# tree the map scans, task context's declared hooks, operator-named body files)
+# resolves from the CALLER checkout; one whose subject is the LIVE instance
+# resolves from LIVE_ROOT and refuses from a linked worktree (sc_refuse_linked).
+# No command mixes the two. The live engine's scripts would otherwise compute
+# their project as ENGINE.parent — the main checkout — from every worktree.
+# This exports the caller identity for the ONE command a project arm runs;
+# scripts/project_root.py honors it only inside the engine named here, and the
+# scripts that spawn fork code strip it from that code's environment.
+sc_project_env() {  # $1 = the engine directory whose scripts the arm executes
+  SC_PROJECT_ROOT="$CALLER_ROOT"
+  SC_INVOCATION_CWD="$sc_invocation_cwd"
+  SC_PROJECT_ENGINE="${1:-$ENGINE}"
+  export SC_PROJECT_ROOT SC_INVOCATION_CWD SC_PROJECT_ENGINE
 }
 
 sc_mapdb() {
@@ -581,6 +607,7 @@ sc_devkit_hook() {  # $1 = hook name; remaining args append to declared argv
     return 0
   fi
   if [ "${1:-}" = "--" ]; then shift; fi
+  sc_project_env
   "$PY" "$S/devkit.py" run "$CALLER_ROOT" "$hook" "$@"
 }
 
@@ -1232,7 +1259,7 @@ case "$cmd" in
                 exec "$PY" "$S/eject.py" "$@" ;;
   alias)        exec "$PY" "$S/shell_alias.py" "$@" ;;
   make-cleanup) exec "$PY" "$S/make_cleanup.py" "$@" ;;
-  actions-artifacts) exec "$PY" "$S/actions_artifacts.py" "$@" ;;
+  actions-artifacts) sc_project_env; exec "$PY" "$S/actions_artifacts.py" "$@" ;;
   remove)       if sc_help_form "$@"; then
                   exec "$PY" "$CALLER_ENGINE/scripts/remove.py" "$@"
                 fi
@@ -1258,9 +1285,12 @@ case "$cmd" in
                     "$(sc_engine_db) -> $("$PY" "$S/artifact_policy.py" path content)"
                 fi
                 exec "$PY" "$S/snapshot.py" ;;
-  mem)          exec "$PY" "$S/mem.py" "$@" ;;
+  # mem/sprint/skill/job/vm/remote read operator-named files (--body-file,
+  # --readiness-file, --file, --command-file) from the invocation cwd and are
+  # otherwise API clients of the live instance.
+  mem)          sc_project_env; exec "$PY" "$S/mem.py" "$@" ;;
   pr)           exec "$PY" "$S/pr_cli.py" "$@" ;;
-  sprint)       sc_python_probe; exec "$PY" "$S/sprint_cli.py" "$@" ;;
+  sprint)       sc_python_probe; sc_project_env; exec "$PY" "$S/sprint_cli.py" "$@" ;;
   token)        exec "$PY" "$S/operator_token.py" "$@" ;;
   engine-ref)   sc_engine_ref_path="$LIVE_ROOT/.sc-state/engine.ref"
                 if [ ! -r "$sc_engine_ref_path" ]; then
@@ -1292,9 +1322,10 @@ case "$cmd" in
                      sc_persist ;;
   # ── session-surviving local jobs: detached supervised one-shots whose
   # completion posts a result row to the starting shell's inbox ──
-  job)               exec "$PY" "$S/job.py" "$@" ;;
+  job)               sc_project_env; exec "$PY" "$S/job.py" "$@" ;;
   # Advisory viewport screenshots for fork apps (CI + local capture + init).
-  visual-qa)         exec "$PY" "$S/visual_qa.py" "$@" ;;
+  # It captures the CALLER checkout's app and writes that checkout's gallery.
+  visual-qa)         sc_project_env; exec "$PY" "$S/visual_qa.py" "$@" ;;
   # General engine SQL is an Admin maintenance capability. The helper resolves
   # the bearer token through the API, with a canonical-DB fallback solely for
   # API-down host Admin diagnosis; caller-set flavor/path strings never grant it.
@@ -1304,7 +1335,7 @@ case "$cmd" in
   sql-rw)       exec "$PY" "$S/engine_sql.py" read-write "$@" ;;
   map-sql-rw)   exec sqlite3 "$(sc_mapdb)" "$@" ;;
   map-schema)   exec "$PY" "$S/map_schema_cli.py" "$@" ;;
-  map-extractor) exec "$PY" "$S/map_extractor_install.py" "$@" ;;
+  map-extractor) sc_project_env; exec "$PY" "$S/map_extractor_install.py" "$@" ;;
   render)       if [ "$LINKED" -eq 1 ]; then
                   sc_refuse_linked render \
                     "$(sc_engine_db) -> $("$PY" "$S/artifact_policy.py" path renders)"
@@ -1323,16 +1354,28 @@ case "$cmd" in
                   exit 1
                 fi
                 exec "$PY" "$CALLER_ENGINE/scripts/render_check.py" ;;
+  # map/map-setup SCAN the caller checkout (the Cartographer's worktree) into
+  # the live catalogue; the catalogue, its config and installed extractors stay
+  # with the live instance. `--auto` is the remap hooks' form: it refreshes only
+  # when the caller is the tree the catalogue already maps, so a branch switch
+  # in some other worktree never re-points the shared catalogue.
   map)          case "${1:-}" in
-                  -h|--help) echo "usage: ./sc map [finalize [--json]] — refresh the dr_* catalogue or report Cartographer completion"
+                  -h|--help) echo "usage: ./sc map [--auto | finalize [--json]] — refresh the dr_* catalogue from this checkout, or report Cartographer completion"
+                             echo "  --auto  refresh only when this checkout is the tree the catalogue maps (the auto-remap hooks' form)"
                              exit 0 ;;
                   finalize)  shift
+                             sc_project_env
                              exec "$PY" "$S/map_finalize.py" "$@" ;;
+                  --auto)    if [ $# -ne 1 ]; then
+                               echo "sc map: unknown argument '$2' (-h for usage)" >&2
+                               exit 2
+                             fi ;;
                   ?*)        echo "sc map: unknown argument '$1' (-h for usage)" >&2
                              exit 2 ;;
                 esac
-                exec "$PY" "$S/map_repo.py" ;;
-  map-setup)    exec "$PY" "$S/map_setup.py" "$@" ;;
+                sc_project_env
+                exec "$PY" "$S/map_repo.py" "$@" ;;
+  map-setup)    sc_project_env; exec "$PY" "$S/map_setup.py" "$@" ;;
   # Token & session analytics — sweep each harness's on-disk usage data for
   # THIS repo into session_token_usage (incremental, idempotent; doc #11).
   analytics)    exec "$PY" "$S/analytics.py" "$@" ;;
@@ -1349,7 +1392,7 @@ case "$cmd" in
                 exec "$PY" "$CALLER_ENGINE/scripts/seed_skills.py" ;;
   # Skill catalogue write surface — grants/retirement by name, loud on a miss
   # (the raw-SQL grant's silent no-op class). Snapshot is still the persist step.
-  skill)        exec "$PY" "$S/skill.py" "$@" ;;
+  skill)        sc_project_env; exec "$PY" "$S/skill.py" "$@" ;;
   # Web search through the engine API (doc #215): the Tavily key stays on
   # the host; the shell only carries its own bearer token.
   browser)      exec "$PY" "$S/browser.py" "$@" ;;
@@ -1357,7 +1400,7 @@ case "$cmd" in
   # Task context projection (doc #187): one read-only view of a task or
   # work unit — Assignment, Goal, Authority, Blockers, Boundaries,
   # Resources — through the same API lane as `sc mem`.
-  context)      exec "$PY" "$S/task_context.py" "$@" ;;
+  context)      sc_project_env; exec "$PY" "$S/task_context.py" "$@" ;;
   ports)        exec "$PY" "$S/ports.py" show ;;
   url)          sc_urls ;;
   preview)      exec "$PY" "$S/preview.py" "$@" ;;
@@ -1366,8 +1409,8 @@ case "$cmd" in
   # ── VM and remotes broker (HOST-side primitive — runs where virsh + the key live) ──
   # Subcommands (adopt/init/status/start/stop/restart/snapshot/bake/reset/push/
   # pull/exec/capture/mcp) are parsed by vm.py's client parser.
-  vm)                exec "$PY" "$S/vm.py" client "$@" ;;
-  remote)            exec "$PY" "$S/remote.py" "$@" ;;
+  vm)                sc_project_env; exec "$PY" "$S/vm.py" client "$@" ;;
+  remote)            sc_project_env; exec "$PY" "$S/remote.py" "$@" ;;
   vm-broker)         exec "$PY" "$ENGINE/api/vm_broker.py" "$@" ;;
   # The HOST-DIRECT bake (spec #232): it runs vm.py in this process against
   # libvirt, with no broker in the path. `./sc vm bake` is the shell-legal

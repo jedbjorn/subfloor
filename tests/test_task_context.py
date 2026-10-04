@@ -867,7 +867,7 @@ class CliTest(unittest.TestCase):
 
     def test_dispatcher_registers_the_verb(self):
         text = (ENGINE / "scripts" / "dispatch.sh").read_text()
-        self.assertIn('context)      exec "$PY" "$S/task_context.py" "$@" ;;', text)
+        self.assertIn('context)      sc_project_env; exec "$PY" "$S/task_context.py" "$@" ;;', text)
         gate = next(line for line in text.splitlines()
                     if line.strip().startswith("install|ensure-harness|doctor|"))
         self.assertIn("|context|", gate)

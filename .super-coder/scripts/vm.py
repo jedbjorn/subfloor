@@ -44,6 +44,7 @@ from contextlib import contextmanager
 from pathlib import Path
 
 import ports
+import project_root
 import winbox
 
 CHECKS = ("domain", "ssh", "snapshot", "toolchain")
@@ -3344,7 +3345,8 @@ def client_main(argv: list[str]) -> int:
             )
         elif args.command_file:
             try:
-                command_text = Path(args.command_file).read_text(encoding="utf-8")
+                command_text = project_root.invocation_path(
+                    args.command_file).read_text(encoding="utf-8")
             except (OSError, UnicodeError):
                 value = operation_error(
                     "exec",

@@ -56,6 +56,7 @@ import artifact_policy
 import db_driver
 import instance_state
 import mem
+import project_root
 import render as render_mod
 import seed_skills
 import skill_projection
@@ -810,7 +811,7 @@ def main(argv: list[str]) -> int:
     if cmd == "list" and not args:
         return _route(cmd_list, cmd_list_api)
     if cmd == "put" and len(args) == 2 and args[0] == "--file":
-        path = Path(args[1])
+        path = project_root.invocation_path(args[1])
         return _route(
             lambda con: cmd_put(con, path), lambda: cmd_put_api(path))
     if cmd == "grant" and len(args) >= 2:

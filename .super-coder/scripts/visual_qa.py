@@ -32,10 +32,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, TextIO
 
+import project_root
 import visual_qa_evidence as evidence
 
 ENGINE = Path(__file__).resolve().parents[1]
-REPO_ROOT = ENGINE.parent
+# The fork app under capture is the checkout that invoked `sc` (a shell's
+# worktree), not the main checkout holding the live engine (spec #267 U3).
+REPO_ROOT = project_root.project_root()
 CONFIG_RELATIVE = Path(".sc-state/visual-qa.json")
 DEFAULT_GALLERY = Path("gallery")
 PLAYWRIGHT_VERSION = "1.54.0"
@@ -461,7 +464,7 @@ def wait_until_ready(
 def ci_app(
     config: dict[str, Any], repo: Path, log: TextIO
 ) -> Iterator[tuple[str, dict[str, str]]]:
-    env = dict(os.environ)
+    env = project_root.scrubbed()
     services: list[ServiceHandle] = []
     server: subprocess.Popen[str] | None = None
     try:
@@ -1218,7 +1221,7 @@ def cmd_run(
         raise VisualQaError(
             f"visual QA is not configured; run `./sc visual-qa init` to create {CONFIG_RELATIVE}"
         )
-    env = dict(os.environ) if environ is None else environ
+    env = project_root.scrubbed() if environ is None else environ
     base_url = args.url or _default_local_url(env)
     output = Path(args.output)
     if output.is_absolute() or ".." in output.parts or output in (Path("."), Path("")):
@@ -1254,7 +1257,7 @@ def cmd_ci(
     app_context: Callable[..., AbstractContextManager] = ci_app,
     capture_factory: Callable[[], object] = PlaywrightCapture,
 ) -> int:
-    env = dict(os.environ) if environ is None else environ
+    env = project_root.scrubbed() if environ is None else environ
     gallery = repo / DEFAULT_GALLERY
     try:
         config = load_config(repo)

@@ -1099,6 +1099,7 @@ class DispatcherHelpTest(unittest.TestCase):
         shutil.copy2(RUNNER.with_name("cli_entry.py"), scripts / "cli_entry.py")
         shutil.copy2(RUNNER.with_name("artifact_policy.py"), scripts / "artifact_policy.py")
         shutil.copy2(RUNNER.with_name("instance_state.py"), scripts / "instance_state.py")
+        shutil.copy2(RUNNER.with_name("project_root.py"), scripts / "project_root.py")
         (self.root / ".subfloor").mkdir()
         capture = self.root / ".subfloor" / "capture"
         capture.write_text("#!/bin/sh\nprintf '<%s>\\n' \"$@\"\n")

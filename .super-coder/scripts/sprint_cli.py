@@ -9,6 +9,7 @@ import sys
 from pathlib import Path
 
 import mem
+import project_root
 
 PAYLOAD_FILE_HELP = "text file; hard maximum 8,000 characters"
 FINDINGS_FILE_HELP = (
@@ -21,7 +22,8 @@ def _text(path: str, name: str) -> str:
         value = sys.stdin.read()
     else:
         try:
-            value = Path(path).read_text()
+            # Relative to the operator's cwd, never the live checkout (U3).
+            value = project_root.invocation_path(path).read_text()
         except OSError as exc:
             raise SystemExit(f"sprint: cannot read {name} file {path}: {exc}") from exc
     value = value.strip()

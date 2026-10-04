@@ -37,22 +37,44 @@ from pathlib import Path, PurePosixPath
 import artifact_policy  # noqa: E402
 from engine_paths import is_generated_install_path  # noqa: E402
 import map_db  # noqa: E402 — sibling module in scripts/ (on sys.path for script + importers)
+import project_root  # noqa: E402
 import toml_compat  # noqa: E402
 
 ENGINE = Path(__file__).resolve().parents[1]
 REPO_ROOT = ENGINE.parent
 
 
-def _resolve_map_root() -> Path:
-    """Return the project tree to scan, never the home-state location."""
+def _declared_work_repo() -> Path | None:
     import install
 
     work_repo = install.work_repo()
     candidate = Path(work_repo) if work_repo else None
-    return candidate if candidate and candidate.is_dir() else REPO_ROOT
+    return candidate if candidate and candidate.is_dir() else None
+
+
+def _resolve_map_root() -> Path:
+    """Return the project tree to scan, never the home-state location.
+
+    An external-work install declares its project, so that is the subject.
+    Otherwise the subject is the checkout that invoked ``sc`` — the
+    Cartographer's worktree — not the main checkout that holds the live engine
+    (spec #267 U3); a direct run falls back to this engine's checkout.
+    """
+    return _declared_work_repo() or project_root.project_root()
+
+
+def _resolve_extractor_root() -> Path:
+    """Where installed extractors live: with the live install, never a worktree.
+
+    ``sc map-extractor install`` copies a Cartographer-authored candidate from
+    its worktree into this root; resolving it from the caller would make the
+    authored source and the installed copy one file.
+    """
+    return _declared_work_repo() or REPO_ROOT
 
 
 MAP_ROOT = _resolve_map_root()
+EXTRACTOR_ROOT = _resolve_extractor_root()
 # Per-fork map tuning, authored by the cartographer (see the `cartographer`
 # skill). Tracked fork-owned state, kept OUTSIDE the gitignored engine dir (B7)
 # so a wholesale engine refresh never touches it. Absent → built-in defaults
@@ -323,7 +345,8 @@ def seed_sections(con: sqlite3.Connection) -> None:
             "VALUES (?, ?, NULL, ?)", (d, d + "/", i))
 
 
-def run_extractors(con: sqlite3.Connection, repo_root: Path, cfg: dict) -> list[str]:
+def run_extractors(con: sqlite3.Connection, repo_root: Path, cfg: dict,
+                   extractor_root: Path | None = None) -> list[str]:
     """Run fork-owned extractor plug-ins after the core map pass.
 
     The engine maps the generic 80% (files/deps/env). The semantic, per-repo
@@ -340,8 +363,11 @@ def run_extractors(con: sqlite3.Connection, repo_root: Path, cfg: dict) -> list[
     reads it to find its inputs); it DELETEs + repopulates its own dr_* table(s),
     like the core does for derived tables. The returned string is a short summary
     for the map log. Each call is guarded — a broken extractor is logged and
-    skipped, never failing the map (the auto-remap hook must stay robust)."""
-    ext_dir = repo_root / ".sc-state" / "map_extractors"
+    skipped, never failing the map (the auto-remap hook must stay robust).
+    `extractor_root` names the installed-extractor home when it differs from the
+    scanned `repo_root` (a Cartographer worktree scan runs the live install's
+    extractors)."""
+    ext_dir = (extractor_root or repo_root) / ".sc-state" / "map_extractors"
     if not ext_dir.is_dir():
         return []
     summaries: list[str] = []
@@ -464,7 +490,7 @@ def refresh() -> MapRefreshResult:
              mapped_at))
         con.commit()
         # Fork-owned semantic extractors (endpoints / db schema / routes), if any.
-        ext_summaries = run_extractors(con, MAP_ROOT, cfg)
+        ext_summaries = run_extractors(con, MAP_ROOT, cfg, EXTRACTOR_ROOT)
         status = {
             "mapped_at": mapped_at,
             "outcomes": [
@@ -496,7 +522,51 @@ def refresh() -> MapRefreshResult:
         con.close()
 
 
-def main() -> int:
+def mapped_root() -> str | None:
+    """The tree the catalogue currently maps (dr_repo.root), if any."""
+    con = map_db.open_ro()
+    if con is None:
+        return None
+    try:
+        row = con.execute("SELECT root FROM dr_repo WHERE repo_id=1").fetchone()
+    except sqlite3.Error:
+        return None
+    finally:
+        con.close()
+    return row[0] if row and row[0] else None
+
+
+def auto_refresh_declined() -> str | None:
+    """Why the remap hooks' `--auto` refresh must not re-point the catalogue.
+
+    One catalogue describes one tree. A hook fires in whichever checkout saw a
+    branch switch, pull or rebase — including a Developer worktree on a feature
+    branch, whose scan would prune every authored description for paths that
+    branch lacks. So a hook keeps the mapped tree fresh and never chooses a new
+    one; an explicit `sc map` does that. An unmapped catalogue, or one whose
+    recorded tree no longer exists, accepts the refresh.
+    """
+    recorded = mapped_root()
+    if not recorded:
+        return None
+    recorded_path = Path(recorded)
+    if not recorded_path.is_dir():
+        return None
+    if recorded_path.resolve() == MAP_ROOT.resolve():
+        return None
+    return (f"map_repo: --auto skipped — the catalogue maps {recorded}, not "
+            f"{MAP_ROOT}; run `sc map` there (or here, to re-point it)")
+
+
+def main(argv: list[str] | tuple[str, ...] = ()) -> int:
+    if list(argv) == ["--auto"]:
+        declined = auto_refresh_declined()
+        if declined:
+            print(declined)
+            return 0
+    elif argv:
+        print(f"map_repo: unknown argument '{argv[0]}'", file=sys.stderr)
+        return 2
     try:
         result = refresh()
     except MapRootEmptyError as exc:
@@ -517,4 +587,4 @@ def main() -> int:
 if __name__ == "__main__":
     from cli_entry import run_cli
 
-    raise SystemExit(run_cli(main))
+    raise SystemExit(run_cli(main, sys.argv[1:]))

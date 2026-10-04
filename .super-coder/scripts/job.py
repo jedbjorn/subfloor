@@ -43,6 +43,8 @@ import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 
+import project_root
+
 ENGINE = Path(__file__).resolve().parents[1]
 JOBS = ENGINE / "run" / "jobs"
 
@@ -243,6 +245,7 @@ def supervise(jobdir: Path, notify=send_completion) -> int:
     try:
         child = subprocess.Popen(
             meta["cmd"], cwd=meta.get("cwd") or None,
+            env=project_root.scrubbed(),
             stdout=log, stderr=subprocess.STDOUT,
             stdin=subprocess.DEVNULL, start_new_session=True)
     except OSError as e:
@@ -317,7 +320,9 @@ def cmd_start(args) -> int:
         "job_id": job_id,
         "label": args.label,
         "cmd": cmd,
-        "cwd": os.getcwd(),
+        # Where the operator typed `sc job start`, not the checkout root the
+        # dispatcher runs from: `-- ./tool` names a path from there (U3).
+        "cwd": str(project_root.invocation_cwd()),
         "timeout": args.timeout,
         "started_at": _now(),
         "log": str(jobdir / "log"),
