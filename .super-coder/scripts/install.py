@@ -1159,17 +1159,19 @@ def main(argv: list[str]) -> int:
     # map-setup points core.hooksPath at the tracked hooks so the dr_* catalogue
     # stays fresh on every pull/checkout/rebase, then runs the initial map. The
     # Cartographer shell (seeded above) tunes map.config.json + heals later.
-    run_critical_phase(
-        "Wiring map automation + mapping the repo (dr_* catalogue)",
-        [PY, str(ENGINE / "scripts/map_setup.py")],
-    )
-
-    # 8. Persist: snapshot + render ------------------------------------------
-    # install maintains the instance itself: serialize as the engine, not as a
-    # launched shell whose token the installing terminal may carry.
+    # install maintains the instance itself: its children run as the engine,
+    # not as a launched shell whose token the installing terminal may carry
+    # (the same child environment update gives map-setup).
     import engine_identity  # lazy: install.py is also copied standalone
 
     admin_env = engine_identity.engine_internal_env()
+    run_critical_phase(
+        "Wiring map automation + mapping the repo (dr_* catalogue)",
+        [PY, str(ENGINE / "scripts/map_setup.py")],
+        env=admin_env,
+    )
+
+    # 8. Persist: snapshot + render ------------------------------------------
     run_critical_phase(
         "Serializing the installed state",
         [PY, str(ENGINE / "scripts/snapshot.py")],
