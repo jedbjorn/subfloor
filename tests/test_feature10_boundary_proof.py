@@ -47,6 +47,13 @@ def test_every_spec_acceptance_item_has_live_test_anchors() -> None:
     parsed: dict[Path, set[str]] = {}
     for item in verification:
         assert item["claim"].strip()
+        if "superseded_by_decision" in item:
+            # A claim retired by a later FnB decision keeps its id for
+            # traceability; it has nothing left to prove.
+            decision = item["superseded_by_decision"]
+            assert isinstance(decision, int) and decision > 0, item["id"]
+            assert item["anchors"] == [], item["id"]
+            continue
         assert item["anchors"]
         for anchor in item["anchors"]:
             relative, separator, test_name = anchor.partition("#")

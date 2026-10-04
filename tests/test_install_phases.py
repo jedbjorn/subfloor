@@ -39,5 +39,34 @@ class CriticalPhaseRunnerTest(unittest.TestCase):
         self.assertIn("retry: ./sc install", completed.stderr)
 
 
+class EngineInternalChildrenTest(unittest.TestCase):
+    def test_every_instance_maintaining_phase_runs_as_the_engine(self) -> None:
+        """map-setup, snapshot and render run with the shell token dropped,
+        exactly as update runs map-setup (review S2)."""
+        import ast
+
+        tree = ast.parse((SCRIPTS / "install.py").read_text())
+        internal = {
+            target.id
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Assign)
+            and isinstance(node.value, ast.Call)
+            and getattr(node.value.func, "attr", "") == "engine_internal_env"
+            for target in node.targets if isinstance(target, ast.Name)
+        }
+        self.assertTrue(internal)
+        phases = {}
+        for node in ast.walk(tree):
+            if (isinstance(node, ast.Call)
+                    and getattr(node.func, "id", "") == "run_critical_phase"):
+                script = ast.unparse(node.args[1])
+                env = next((kw.value for kw in node.keywords if kw.arg == "env"), None)
+                phases[script] = env.id if isinstance(env, ast.Name) else None
+        for script in ("map_setup.py", "snapshot.py", "render.py"):
+            matches = [env for argv, env in phases.items() if script in argv]
+            self.assertEqual(len(matches), 1, script)
+            self.assertIn(matches[0], internal, script)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -121,6 +121,38 @@ class OpenCodeServerTest(unittest.TestCase):
         self.assertTrue(process.terminated)
         self.assertFalse(process.killed)
 
+    def test_managed_server_carries_no_shell_identity_or_engine_paths(self):
+        """Review S1: the shared server must not lend its starter's Admin
+        paths or identity to every shell's tool calls."""
+        starter = {
+            "PATH": "/usr/bin", "HOME": "/home/operator",
+            "SC_API_TOKEN": "admin-token", "SC_API_BASE": "http://127.0.0.1:1",
+            "SC_ENGINE_DIR": "/main/.super-coder", "SC_ROOT": "/main",
+            "SC_SHELL_FLAVOR": "admin", "SC_SHELL_ID": "15",
+            "SC_SHELL_WORKTREE": "/main", "SC_DEV_PORT": "8801",
+        }
+        process = FakeProcess()
+        checks = iter([False, True])
+        with mock.patch.dict(os.environ, starter, clear=True), \
+                mock.patch.object(
+                    opencode, "_server_healthy",
+                    side_effect=lambda _endpoint, _password: next(checks),
+                ), mock.patch.object(
+                    opencode.shutil, "which", return_value="/bin/opencode"
+                ), mock.patch.object(
+                    opencode, "_available_loopback_port", return_value=43211
+                ), mock.patch.object(
+                    opencode.subprocess, "Popen", return_value=process
+                ) as spawn:
+            opencode.ensure_server(timeout=1)
+        env = spawn.call_args.kwargs["env"]
+        for name in ("SC_API_TOKEN", "SC_API_BASE", "SC_ENGINE_DIR", "SC_ROOT",
+                     "SC_SHELL_FLAVOR", "SC_SHELL_ID", "SC_SHELL_WORKTREE"):
+            self.assertNotIn(name, env)
+        self.assertEqual(env["PATH"], "/usr/bin")
+        self.assertEqual(env["SC_DEV_PORT"], "8801")
+        opencode.stop_server()
+
     def test_orphaned_managed_server_is_readopted_via_recorded_password(self):
         self.state_path.write_text(
             json.dumps({"pid": os.getpid(), "password": "orphan-secret"})

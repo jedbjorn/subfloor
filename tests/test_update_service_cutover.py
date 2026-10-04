@@ -16,6 +16,7 @@ ENGINE = Path(__file__).resolve().parents[1] / ".super-coder"
 sys.path.insert(0, str(ENGINE / "scripts"))
 import update  # noqa: E402
 import snapshot as snapshot_mod  # noqa: E402
+import engine_identity  # noqa: E402
 
 
 class Stop(Exception):
@@ -33,29 +34,36 @@ class UpdateServiceCutoverTest(unittest.TestCase):
         patcher.start()
         self.addCleanup(patcher.stop)
 
-    def test_in_process_snapshot_uses_scoped_update_admin_authority(self):
-        observed_admin = []
-
-        def snapshot(*, lease_held):
-            snapshot_mod.require_admin("snapshot")
-            observed_admin.append((lease_held, os.environ.get("SC_ADMIN")))
-
-        with mock.patch.dict(os.environ, {}, clear=False), mock.patch.object(
-            snapshot_mod, "main", side_effect=snapshot
-        ):
-            os.environ.pop("SC_ADMIN", None)
+    def test_in_process_snapshot_runs_as_the_lease_holder(self):
+        with mock.patch.object(snapshot_mod, "main", return_value=0) as main:
             update.snapshot_under_cutover()
-            self.assertNotIn("SC_ADMIN", os.environ)
+        main.assert_called_once_with(lease_held=True)
 
-        self.assertEqual(observed_admin, [(True, "1")])
+    def test_lease_holder_snapshot_does_not_consult_caller_identity(self):
+        # The cutover holds the exclusive maintenance lease; a non-Admin
+        # token in the operator's environment must not abort it mid-cutover.
+        with mock.patch.dict(os.environ, {"SC_API_TOKEN": "dev-token"}), \
+             mock.patch.object(snapshot_mod.instance_state, "active_database_path"), \
+             mock.patch.object(snapshot_mod.instance_state, "maintenance_state"), \
+             mock.patch.object(
+                 engine_identity,
+                 "resolve",
+                 side_effect=AssertionError("identity consulted under the lease"),
+             ), mock.patch.object(
+                 snapshot_mod.state_relocation, "refuse_live_database_owners"
+             ), mock.patch.object(snapshot_mod, "_main_under_lease", return_value=0):
+            self.assertEqual(snapshot_mod.main(lease_held=True), 0)
 
-    def test_in_process_snapshot_restores_admin_environment_after_failure(self):
-        with mock.patch.dict(os.environ, {"SC_ADMIN": "caller"}), mock.patch.object(
-            snapshot_mod, "main", side_effect=SystemExit("snapshot failed")
-        ):
-            with self.assertRaisesRegex(SystemExit, "snapshot failed"):
-                update.snapshot_under_cutover()
-            self.assertEqual(os.environ.get("SC_ADMIN"), "caller")
+    def test_update_children_run_as_the_engine_not_the_callers_shell(self):
+        with mock.patch.dict(os.environ, {
+            "SC_API_TOKEN": "dev-token", "SC_API_BASE": "http://127.0.0.1:1",
+        }), mock.patch.object(update.subprocess, "run") as run:
+            run.return_value.returncode = 0
+            update.run_script("map_setup.py", update_target_ref="abc")
+        env = run.call_args.kwargs["env"]
+        self.assertNotIn("SC_API_TOKEN", env)
+        self.assertNotIn("SC_API_BASE", env)
+        self.assertEqual(env["SC_UPDATE_TARGET_REF"], "abc")
 
     def assert_restart_failure_stops_all(
         self,
@@ -301,7 +309,6 @@ class UpdateServiceCutoverTest(unittest.TestCase):
                 migration_targets.append(update.DB_PATH)
 
             def snapshot_body():
-                self.assertEqual(os.environ.get("SC_ADMIN"), "1")
                 snapshot_targets.append(
                     (snapshot_mod.DB_PATH, snapshot_mod.OUT_PATH)
                 )

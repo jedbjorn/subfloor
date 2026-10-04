@@ -209,7 +209,7 @@ def main() -> int:
                 + "".join(f"    {p}\n" for p in drifted)
                 + (f"\n{diagnostics}\n" if diagnostics else "")
                 + "\n  fix (Admin, from the main checkout):\n"
-                + "    SC_ADMIN=1 ./sc snapshot && SC_ADMIN=1 ./sc render flat\n"
+                + "    ./sc snapshot && ./sc render flat   # Admin, from the main checkout\n"
                 + "  then rerun ./sc render-check.\n"
             )
             return 1

@@ -66,6 +66,7 @@ import conversation_launch  # noqa: E402  (canonical shell launch preparation)
 import conversation_reaper  # noqa: E402  (Feature #31 orphan process ladder)
 import db_driver  # noqa: E402
 import document_retirement  # noqa: E402  (shared retirement projection + chain rule, doc #251)
+import engine_identity  # noqa: E402  (caller identity for engine-internal children)
 import git_hygiene  # noqa: E402  (live repo dirty/stale/clean snapshot)
 import harness_surfaces  # noqa: E402  (authoritative per-harness surfaces)
 import instance_state  # noqa: E402
@@ -557,11 +558,10 @@ def get_cli_skills(con) -> dict:
 # Authenticated Planner-owned fork-local skill mutations (`sc skill` API lane)
 # ===========================================================================
 #
-# Launched shells (Planner included) run under the restricted execution view
-# (spec execution_view), which masks the engine private-state root, the legacy
-# engine DB, and the snapshot/render files. `sc skill put|grant|revoke|rm`
-# therefore cannot open the DB from the shell seat; only the API (running
-# unrestrained on the host) can. These routes mirror the local CLI mutations:
+# Every launched shell reaches `sc skill put|grant|revoke|rm` through these
+# routes: the API is the single writer the control plane advertises, and a
+# tokened shell never writes the engine DB directly. They mirror the local CLI
+# mutations:
 # they reuse skill.py's validation + persistence ladder and are planner-only —
 # the same check the CLI enforces via ``require_planner`` for local writes.
 # Retire/unretire ride the same lane: the retire list is instance-local
@@ -2496,11 +2496,12 @@ def run_script(key: str) -> dict | None:
         return None
     argv = spec[2]
     try:
-        # The API is the admin/GUI surface — snapshot/render here are sanctioned,
-        # so pass SC_ADMIN to clear the serialize guard (see _serialize_guard.py).
+        # The API is the engine's own GUI surface: its children run as the
+        # engine (no shell token), whoever started the server, so the
+        # serialization gate admits Save locally (see _serialize_guard.py).
         p = subprocess.run(argv, capture_output=True, text=True,
                            cwd=str(REPO_ROOT), timeout=180,
-                           env={**os.environ, "SC_ADMIN": "1"})
+                           env=engine_identity.engine_internal_env())
         return {"ok": p.returncode == 0, "code": p.returncode,
                 "output": (p.stdout + p.stderr).strip() or "(no output)"}
     except subprocess.TimeoutExpired:
@@ -2530,7 +2531,7 @@ _CONTENT_WRITE_LOCK = threading.Lock()
 def serialize_doc_write() -> dict:
     """Re-snapshot + re-render after a mem doc write, so `sc mem doc add/edit/
     freeze` lands in the gitignored local artifact cache headlessly.
-    The API is the admin surface (run_script sets SC_ADMIN), and a doc write
+    The API is the engine's own surface (run_script drops shell identity), and a doc write
     is rare enough that the synchronous pair costs nothing that matters.
     Never raises: the DB write is already committed, so a serialize failure
     comes back as {"ok": False, ...} for the caller to surface instead."""
@@ -4662,8 +4663,8 @@ class Handler(BaseHTTPRequestHandler):
         """Route POST /_sc/skills/<action> for a launched Planner shell.
 
         Planner-only; every local CLI rule is enforced server-side via the
-        shared skill module so the restricted shell seat reaches the same
-        catalogue state that a host Admin sees.
+        shared skill module so a launched shell reaches the same catalogue
+        state that a host Admin sees.
         """
         sid = self._require_shell_auth()
         if sid is None:

@@ -81,7 +81,7 @@ def latest_backup(
     """Find the newest matching backup across every configured candidate.
 
     The writable destination may change between update and rollback (for
-    example, a restricted seat adds ``SC_DB_BACKUP_DIR`` later, or home becomes
+    example, a later seat adds ``SC_DB_BACKUP_DIR``, or home becomes
     read-only). Discovery therefore reads all candidate directories instead of
     hiding an existing restore point behind the currently selected writer.
     """

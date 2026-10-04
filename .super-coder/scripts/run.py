@@ -58,7 +58,7 @@ import callable_floor  # noqa: E402
 import conversation_boot  # noqa: E402
 import db_driver  # noqa: E402
 import devkit  # noqa: E402
-import execution_view  # noqa: E402  — role/repo-mode harness containment
+import execution_view  # noqa: E402  — which seats receive engine maintenance paths
 import git_freshness  # noqa: E402
 import git_prune  # noqa: E402  — boot-time prune of provably-merged local branches
 import global_pointer  # noqa: E402
@@ -1846,20 +1846,10 @@ def prepare_launch(*, shell_id: int, harness: "str | None" = None,
             "(unknown, deleted, or neither owned nor shared)")
     chosen = dict(row)
 
-    if os.environ.get("RENDER_ONLY"):
-        shell_view = execution_view.ExecutionView(mode="render-only")
-    else:
-        try:
-            shell_view = execution_view.build(
-                engine=ENGINE,
-                repo_root=REPO_ROOT,
-                flavor=chosen["flavor"],
-                source_mode=install.is_source_repo(),
-            )
-            shell_view.preflight()
-        except execution_view.ExecutionViewError as exc:
-            con.close()
-            raise LaunchError(str(exc)) from exc
+    shell_view = execution_view.build(
+        flavor=chosen["flavor"],
+        render_only=bool(os.environ.get("RENDER_ONLY")),
+    )
 
     # Harness route, picker-free: the reservation's harness wins; else this
     # flavor's default harness; else instance.json / 'claude' — the same
@@ -2098,7 +2088,7 @@ def prepare_launch(*, shell_id: int, harness: "str | None" = None,
     env.update(shell_git_ident_env(full))
     env["SC_HARNESS"] = harness
     env["SC_SHELL_WORKTREE"] = str(work_dir)
-    if not shell_view.restricted:
+    if shell_view.maintenance_environment:
         env["SC_ENGINE_DIR"] = str(ENGINE)
         env["SC_ROOT"] = str(REPO_ROOT)
     env["PATH"] = _shell_path(work_dir, env.get("PATH", ""))
@@ -2286,23 +2276,10 @@ def main() -> None:
     else:
         launchable = list_shells(con, user["user_id"])
         chosen = pick_shell(launchable, requested, first, fdefaults, snap)
-    if os.environ.get("RENDER_ONLY"):
-        shell_view = execution_view.ExecutionView(mode="render-only")
-    else:
-        try:
-            shell_view = execution_view.build(
-                engine=ENGINE,
-                repo_root=REPO_ROOT,
-                flavor=chosen["flavor"],
-                source_mode=source_repo,
-            )
-            shell_view.preflight()
-        except execution_view.ExecutionViewError as exc:
-            con.close()
-            prefix = "sc admin" if host_admin else (
-                "sc run" if headless else "session launch"
-            )
-            sys.exit(f"{prefix}: {exc}")
+    shell_view = execution_view.build(
+        flavor=chosen["flavor"],
+        render_only=bool(os.environ.get("RENDER_ONLY")),
+    )
     if browser_conversation_active(con, chosen["shell_id"]):
         con.close()
         sys.exit(
@@ -2706,8 +2683,8 @@ def main() -> None:
     env.update(shell_git_ident_env(full))
     env["SC_API_TOKEN"] = full["api_key"] or ""
     env["SC_API_BASE"] = f"http://127.0.0.1:{api_port}" if api_port else ""
-    # Admin keeps the engine-path fast path for maintenance hooks. Restricted
-    # shells use the env-independent git-common-dir resolution instead.
+    # Admin keeps the engine-path fast path for maintenance hooks. Every other
+    # seat uses the env-independent git-common-dir resolution instead.
     env["SC_HARNESS"] = harness
     env.pop("SC_OPENCODE_ENFORCED_MODEL", None)
     if controlled_opencode_route:
@@ -2731,8 +2708,9 @@ def main() -> None:
     # LATER bare git/grep then silently targeted the main tree (a different branch),
     # so the shell's own worktree edits looked gone. Kill the trigger structurally:
     # prepend the worktree to PATH so `sc …` resolves bare from any cwd. Admin
-    # additionally receives the maintenance root; restricted shells do not.
-    if not shell_view.restricted:
+    # additionally receives the maintenance root; every other seat does not, so
+    # it is never handed the main checkout's paths to cd into (decision #427).
+    if shell_view.maintenance_environment:
         env["SC_ENGINE_DIR"] = str(ENGINE)
         env["SC_ROOT"] = str(REPO_ROOT)
     env["PATH"] = _shell_path(work_dir, env.get("PATH", ""))

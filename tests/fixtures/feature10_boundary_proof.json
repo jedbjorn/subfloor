@@ -38,19 +38,14 @@
     {
       "id": "V05",
       "claim": "Downstream non-Admin direct, process-root, child-process, schema, migration, backup, and state paths are masked.",
-      "anchors": [
-        "tests/test_execution_view.py#test_downstream_view_masks_state_schema_and_process_root_alias",
-        "tests/test_execution_view.py#test_sandbox_landlock_view_masks_direct_and_process_root_aliases",
-        "tests/test_execution_view.py#test_detached_descendant_survives_wrapper_and_keeps_restriction",
-        "tests/test_execution_view.py#test_relative_backup_override_is_masked_across_harness_cwd"
-      ]
+      "superseded_by_decision": 427,
+      "anchors": []
     },
     {
       "id": "V06",
       "claim": "Caller-controlled flavor and path environment values cannot widen command or filesystem authority.",
       "anchors": [
-        "tests/test_engine_sql.py#test_non_admin_refuses_before_query_even_when_flavor_is_spoofed",
-        "tests/test_execution_view.py#test_relative_backup_override_is_masked_across_harness_cwd"
+        "tests/test_engine_sql.py#test_non_admin_refuses_before_query_even_when_flavor_is_spoofed"
       ]
     },
     {
@@ -60,7 +55,6 @@
         "tests/test_engine_sql.py#test_api_down_local_non_admin_is_still_refused",
         "tests/test_mem.py#test_write_lands_on_the_token_shell",
         "tests/test_map_repo.py#test_declared_work_repo_is_the_map_target",
-        "tests/test_conversation_broker.py#test_sprint_opencode_recovery_keeps_restricted_server_argv",
         "tests/test_sprint_work_dispatch.py#test_armed_pulse_enqueues_every_parallel_ready_lane"
       ]
     },
@@ -83,7 +77,7 @@
       "id": "V10",
       "claim": "Host/container Admin keeps read-only diagnosis while mutation remains maintenance-gated.",
       "anchors": [
-        "tests/test_execution_view.py#test_admin_is_unwrapped_and_keeps_maintenance_environment",
+        "tests/test_execution_view.py#test_only_admin_receives_the_maintenance_paths",
         "tests/test_engine_sql.py#test_api_down_admin_keeps_read_only_diagnosis",
         "tests/test_engine_sql.py#test_api_up_admin_write_fails_closed_before_sqlite"
       ]
@@ -91,11 +85,8 @@
     {
       "id": "V11",
       "claim": "Source workers see tracked engine source but not live state; source Admin retains the maintenance view.",
-      "anchors": [
-        "tests/test_execution_view.py#test_source_view_keeps_tracked_engine_source_but_masks_live_state",
-        "tests/test_role_aware_boot_contract.py#test_source_worker_sees_tracked_source_but_not_live_state",
-        "tests/test_role_aware_boot_contract.py#test_admin_gets_exact_private_target_and_maintenance_routing"
-      ]
+      "superseded_by_decision": 427,
+      "anchors": []
     },
     {
       "id": "V12",
@@ -121,12 +112,8 @@
     {
       "id": "V14",
       "claim": "Linked-worktree dispatch, conversation recovery, Git metadata, declared work roots, and fork tooling survive the restricted view.",
-      "anchors": [
-        "tests/test_update_materialize.py#test_clean_stale_worktree_dispatcher_runs_current_read_only_help",
-        "tests/test_conversation_launch.py#test_recovery_view_masks_private_state_and_parent_root_alias",
-        "tests/test_map_repo.py#test_declared_work_repo_is_the_map_target",
-        "tests/test_fresh_install_shell_contract.py#test_install_is_committed_before_first_shell_worktree"
-      ]
+      "superseded_by_decision": 427,
+      "anchors": []
     },
     {
       "id": "V15",

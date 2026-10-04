@@ -10,16 +10,17 @@ and every supported mutation persists the local snapshot and projections.
 Naming a standard shell targets its shared flavor pack; naming a Bespoke shell
 targets only that shell.
 
-Launched shells reach this module through two lanes. A local Admin seat opens
-the DB directly and enforces `require_planner` before `put`. A launched shell
-(including the Planner, whose restricted execution view masks the private
-engine-state root) is detected by a failed direct-DB open and rerouted
-through authenticated `/_sc/skills/*` routes on the review API, which runs
-the same validation and persistence ladder server-side. Both lanes share
+The lane is chosen by identity, not by whether the DB happens to open. A
+launched shell (it carries SC_API_TOKEN) always goes through the authenticated
+`/_sc/skills/*` routes on the review API, which run the same validation and
+persistence ladder server-side; the API is the single writer the control plane
+advertises, so a shell never writes the DB behind it. A caller without a token
+(the host operator, Admin maintenance, install) opens the DB directly and
+enforces `require_planner` before `put`. Both lanes share
 `cmd_*_api` and the `_*_spec` helpers, and every verb rides the fallback —
 including retire/unretire, whose retire list is instance-local state the API
 host writes exactly as the local CLI would. Nothing here resolves the private
-DB path at import time: that resolution is what fails on a restricted seat,
+DB path at import time: that resolution fails on a container seat,
 so it happens inside `connect()` where the fallback can catch it (#1493).
 
 Engine catalogue rows are authored as assets + `./sc seed-skills`. Fork-local
@@ -67,19 +68,26 @@ LOCAL_FRONTMATTER_FIELDS = {"name", "description", "category", "command", "commo
 
 
 def connect():
-    """Open the live DB; raises InstanceStateError/OSError on a restricted seat."""
+    """Open the live DB; raises InstanceStateError/OSError where it is unreachable."""
     db_path = DB_PATH if DB_PATH is not None else instance_state.active_database_path(ENGINE)
     if not db_path.exists() or not db_path.stat().st_size:
         sys.exit("sc skill: no live DB — run `./sc rebuild` (or `./sc launch`) first.")
     return db_driver.connect(db_path)
 
 
+API_DOWN_CONFUSION = (
+    "sc skill: refused — a launched shell writes skills only through the "
+    "engine API, which is unreachable, and a direct DB write would land "
+    "behind the API every other shell reads (a write believed delivered that "
+    "the control plane never saw)."
+)
+
+
 def _shell_api_enabled() -> bool:
     """True when the caller is a launched shell and must go through the API.
 
-    `sc skill list` already used this lane for reads. It's keyed off the API
-    token alone — a host Admin running `sc` in the repo root has no token, so
-    it always takes the direct-DB path.
+    Keyed off the API token alone: a host operator or Admin maintenance seat
+    running `sc` with no token takes the direct-DB path.
     """
     if not mem.SC_API_TOKEN:
         return False
@@ -88,26 +96,24 @@ def _shell_api_enabled() -> bool:
     return True
 
 
-def _with_api_fallback(local, remote):
-    """Run a verb on the local DB; reroute to the API lane when the seat cannot open it.
+def _route(local, remote):
+    """Run a verb through the API for a launched shell, locally otherwise.
 
-    The restricted execution view (launched non-Admin shells) masks the
-    private engine-state root, so `connect()` raises an InstanceStateError or a
-    filesystem permission error before any verb runs. With a shell token
-    present, retry through the engine API, which runs unrestricted and reuses
-    the same validation + persistence ladder. A missing/empty DB on a host
-    seat ("no live DB") and any failure without a token surface unchanged.
+    A shell token means the API lane, with no direct-DB fallback: the API is
+    the single writer, and a local write from a shell is the split-brain the
+    lane exists to prevent. If the API is down the verb is refused with that
+    confusion named, the same posture as `sc mem`. Without a token the caller
+    is the host operator or engine maintenance and uses the local DB.
     """
-    try:
-        con = connect()
-    except SystemExit as exc:
-        if not mem.SC_API_TOKEN or "no live DB" in str(exc):
+    if _shell_api_enabled():
+        try:
+            return remote()
+        except SystemExit as exc:
+            if "API unreachable" in str(exc):
+                sys.exit(f"{API_DOWN_CONFUSION}\n  {exc}\n"
+                         "  Retry once the engine API is back (`sc health`).")
             raise
-        return remote()
-    except (OSError, instance_state.InstanceStateError):
-        if not mem.SC_API_TOKEN:
-            raise
-        return remote()
+    con = connect()
     try:
         return local(con)
     finally:
@@ -802,29 +808,27 @@ def main(argv: list[str]) -> int:
         return 0
     cmd, args = argv[0], argv[1:]
     if cmd == "list" and not args:
-        if _shell_api_enabled():
-            return cmd_list_api()
-        return _with_api_fallback(cmd_list, cmd_list_api)
+        return _route(cmd_list, cmd_list_api)
     if cmd == "put" and len(args) == 2 and args[0] == "--file":
         path = Path(args[1])
-        return _with_api_fallback(
+        return _route(
             lambda con: cmd_put(con, path), lambda: cmd_put_api(path))
     if cmd == "grant" and len(args) >= 2:
-        return _with_api_fallback(
+        return _route(
             lambda con: cmd_grant(con, args[0], args[1:]),
             lambda: cmd_grant_api(args[0], args[1:]))
     if cmd == "revoke" and len(args) >= 2:
-        return _with_api_fallback(
+        return _route(
             lambda con: cmd_revoke(con, args[0], args[1:]),
             lambda: cmd_revoke_api(args[0], args[1:]))
     if cmd == "rm" and len(args) == 1:
-        return _with_api_fallback(
+        return _route(
             lambda con: cmd_rm(con, args[0]), lambda: cmd_rm_api(args[0]))
     if cmd == "retire" and len(args) == 1:
-        return _with_api_fallback(
+        return _route(
             lambda con: cmd_retire(con, args[0]), lambda: cmd_retire_api(args[0]))
     if cmd == "unretire" and len(args) == 1:
-        return _with_api_fallback(
+        return _route(
             lambda con: cmd_unretire(con, args[0]),
             lambda: cmd_unretire_api(args[0]))
     sys.exit(usage)

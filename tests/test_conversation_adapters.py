@@ -2472,63 +2472,78 @@ class ConversationAdapterTest(unittest.TestCase):
         self.assertTrue(adapter.interrupt(resumed).acknowledged)
         self.assertEqual(runner.processes[-1].signals, [signal.SIGINT])
 
-    def test_native_processes_receive_parent_owned_execution_prefix(self) -> None:
-        context = replace(
-            self.context,
-            execution_prefix=("view-helper", "--"),
-        )
+    def test_native_processes_launch_the_harness_argv_unwrapped(self) -> None:
+        """Decision #427: no execution-view helper precedes any harness argv."""
+        self.assertFalse(hasattr(self.context, "execution_prefix"))
+        self.assertFalse(hasattr(self.context, "execution_argv"))
 
         claude, claude_runner = self.build("claude")
-        claude.start(context, "contained")
-        self.assertEqual(claude_runner.calls[-1][0][:2], ["view-helper", "--"])
+        claude.start(self.context, "plain")
+        self.assertEqual(claude_runner.calls[-1][0][0], "claude")
 
         kimi, kimi_runner = self.build("kimi")
-        kimi.start(context, "contained")
-        self.assertEqual(kimi_runner.calls[-1][0][:2], ["view-helper", "--"])
+        kimi.start(self.context, "plain")
+        self.assertEqual(kimi_runner.calls[-1][0][0], "kimi")
 
         with mock.patch.object(codex_adapter, "JsonLineRpcProcess") as rpc_process:
             codex = CodexAdapter()
-            codex._transport(context)
-        self.assertEqual(
-            rpc_process.call_args.kwargs["argv"][:2],
-            ["view-helper", "--"],
-        )
+            codex._transport(self.context)
+        self.assertEqual(rpc_process.call_args.kwargs["argv"][0], "codex")
 
         for surface in ("browser", "sprint"):
             with self.subTest(surface=surface):
-                restricted = replace(
-                    context,
-                    env={**context.env, "SC_CONVERSATION_SURFACE": surface},
+                context = replace(
+                    self.context,
+                    env={**self.context.env, "SC_CONVERSATION_SURFACE": surface},
                 )
-                restricted_server = mock.Mock()
-                restricted_server.poll.return_value = None
-                restricted_log = mock.Mock()
                 native = FakeOpenCode()
                 with mock.patch.object(
                     opencode_adapter,
                     "ensure_server",
+                    return_value=("http://127.0.0.1:12345", "password"),
                 ) as ensure_server, mock.patch.object(
-                    opencode_adapter,
-                    "start_context_server",
-                    return_value=(
-                        restricted_server,
-                        restricted_log,
-                        "http://127.0.0.1:12345",
-                        "password",
-                    ),
-                ) as start_context_server, mock.patch.object(
                     opencode_adapter,
                     "UrlHttpTransport",
                     return_value=native,
                 ):
                     opencode = OpenCodeAdapter()
                     ensure_server.assert_not_called()
-                    opencode.start(restricted, "contained")
-                    ensure_server.assert_not_called()
-                    opencode.close()
-                start_context_server.assert_called_once_with(restricted)
-                restricted_server.terminate.assert_called_once_with()
-                restricted_log.close.assert_called_once_with()
+                    opencode.start(context, "plain")
+                    opencode.start(context, "again")
+                ensure_server.assert_called_once_with()
+                self.assertFalse(hasattr(opencode_adapter, "start_context_server"))
+
+    def test_opencode_shell_wrapper_unsets_what_its_shell_was_not_given(self) -> None:
+        """Review S1: the wrapper restores THIS shell's identity and drops the
+        engine paths and Admin flavor the shared server may carry."""
+        context = replace(self.context, env={
+            "PATH": "/usr/bin:/bin",
+            "SC_API_TOKEN": "dev-token",
+            "SC_API_BASE": "http://127.0.0.1:1",
+            "SC_SHELL_ID": "3",
+        })
+        adapter, _native = self.build("opencode")
+        adapter.start(context, "plain")
+        wrapper = next((self.root / "opencode-shells").glob("*.sh"))
+        body = wrapper.read_text()
+        unset = next(line for line in body.splitlines() if line.startswith("unset "))
+        for name in ("SC_ENGINE_DIR", "SC_ROOT", "SC_SHELL_FLAVOR"):
+            self.assertIn(name, unset.split())
+        self.assertNotIn("SC_API_TOKEN", unset.split())
+        server_env = {
+            "PATH": "/usr/bin:/bin",
+            "SC_ENGINE_DIR": "/main/.super-coder",
+            "SC_ROOT": "/main",
+            "SC_SHELL_FLAVOR": "admin",
+            "SC_API_TOKEN": "admin-token",
+        }
+        probe = subprocess.run(
+            ["/bin/sh", str(wrapper), "-c",
+             'echo "${SC_ENGINE_DIR-none}:${SC_ROOT-none}:'
+             '${SC_SHELL_FLAVOR-none}:$SC_API_TOKEN"'],
+            env=server_env, capture_output=True, text=True, check=True,
+        )
+        self.assertEqual(probe.stdout.strip(), "none:none:none:dev-token")
 
     def test_claude_resume_accepts_resolved_worktree_descendants(self) -> None:
         adapter, runner = self.build("claude")

@@ -155,12 +155,11 @@ sc_help_form() {
 sc_refuse_linked() {
   [ "$LINKED" -eq 1 ] || return 0
   {
-    echo "✗ ./sc $1 refused: this is a linked worktree, not the live instance."
+    echo "✗ ./sc $1 refused: a linked worktree has no instance of its own, so this command would silently maintain the SHARED live instance at $LIVE_ROOT, which this worktree does not own."
     echo "    caller worktree : $CALLER_ROOT"
     echo "    live instance   : $LIVE_ROOT"
     echo "    declined target : $2"
-    echo "  ./sc $1 acts on the shared live instance above, which this worktree"
-    echo "  does not own. Nothing was opened, written or deleted."
+    echo "  Nothing was opened, written or deleted."
     echo "  For live maintenance, run it from the main checkout:"
     echo "      cd $LIVE_ROOT && ./sc $1"
   } >&2
@@ -226,7 +225,12 @@ sc_host_server_up() {
   systemctl --user stop "$HOST_SERVER_UNIT" >/dev/null 2>&1 || true
   : > "$HOST_SERVER_LOG"
   # systemd consumes one dollar-escape layer; the shell must receive $$.
-  if ! systemd-run --user --quiet --collect --unit "$HOST_SERVER_UNIT" -- \
+  # The transient unit starts from the user manager's environment, not this
+  # one. A non-default XDG_STATE_HOME selects where this install's private
+  # engine state lives, so carry it across or the server resolves a different
+  # (or missing) instance than the launcher that started it.
+  if ! systemd-run --user --quiet --collect --unit "$HOST_SERVER_UNIT" \
+      ${XDG_STATE_HOME:+"--setenv=XDG_STATE_HOME=$XDG_STATE_HOME"} -- \
       /bin/sh -c 'printf "%s\n" "$$$$" > "$1"; exec env SC_BIND=127.0.0.1 PYTHONUNBUFFERED=1 "$2" "$3" --port "$4" >> "$5" 2>&1' \
       sc-host-server "$HOST_SERVER_PID" "$PY" "$ENGINE/api/server.py" "$host_port" "$HOST_SERVER_LOG"; then
     echo "✗ host-runtime: systemd could not start $HOST_SERVER_UNIT" >&2
@@ -1175,7 +1179,13 @@ case "$cmd" in
   harness-cleanup) exec "$PY" "$S/global_pointer.py" "$@" ;;
   ensure-harness)  exec "$PY" "$S/install.py" --ensure-harness ;;
   doctor)          exec "$PY" "$S/install.py" --check-docker ;;
-  update)            exec "$PY" "$S/update.py" "$@" ;;
+  # update/rollback replace the live engine floor and DB pair. Once the shell
+  # view was retired (decision #427) this refusal is also the effective role
+  # check for them: in a fork the main checkout is the Admin seat.
+  update)            if [ "$LINKED" -eq 1 ] && ! sc_help_form "$@"; then
+                       sc_refuse_linked update "$ENGINE + $(sc_engine_db)"
+                     fi
+                     exec "$PY" "$S/update.py" "$@" ;;
   # Refresh the harness CLIs the SHELLS run — which, on the docker path, means
   # the image and nothing else. Running the installers on the host here is what
   # this command used to do, and it reported success while changing nothing:
@@ -1199,11 +1209,27 @@ case "$cmd" in
     fi ;;
   harness-status)  sc_harness_status ;;
   docker-cache-gc) exec "$PY" "$S/docker_cache.py" "$@" ;;
-  rollback)     exec "$PY" "$S/rollback.py" "$@" ;;
+  rollback)     if sc_help_form "$@"; then
+                  echo "usage: ./sc rollback [--engine-only]"
+                  echo "  restore the (DB + engine) pair from the newest pre-update restore point; --engine-only restores just the engine half"
+                  exit 0
+                fi
+                if [ "$LINKED" -eq 1 ]; then
+                  sc_refuse_linked rollback "$ENGINE + $(sc_engine_db)"
+                fi
+                exec "$PY" "$S/rollback.py" "$@" ;;
   feature)      exec "$PY" "$S/feature.py" "$@" ;;
   runtime)      exec "$PY" "$S/runtime.py" "$@" ;;
   artifact-mode) exec "$PY" "$S/artifact_policy.py" "$@" ;;
-  eject)        exec "$PY" "$S/eject.py" "$@" ;;
+  # eject rewrites the live root's .gitignore and .sc-state; init seeds the
+  # live DB. Neither has anything of its own to act on in a worktree.
+  eject)        if sc_help_form "$@"; then
+                  echo "usage: ./sc eject [--yes] [--keep-remote]"
+                  echo "  one-way: stop tracking upstream and own the engine as fork source"
+                  exit 0
+                fi
+                sc_refuse_linked eject "$LIVE_ROOT/.gitignore + $LIVE_ROOT/.sc-state"
+                exec "$PY" "$S/eject.py" "$@" ;;
   alias)        exec "$PY" "$S/shell_alias.py" "$@" ;;
   make-cleanup) exec "$PY" "$S/make_cleanup.py" "$@" ;;
   actions-artifacts) exec "$PY" "$S/actions_artifacts.py" "$@" ;;
@@ -1212,7 +1238,10 @@ case "$cmd" in
                 fi
                 sc_refuse_linked remove "$ROOT"
                 exec "$PY" "$S/remove.py" "$@" ;;
-  init)         exec "$PY" "$S/init_fork.py" "$@" ;;
+  init)         if [ "$LINKED" -eq 1 ] && ! sc_help_form "$@"; then
+                  sc_refuse_linked init "$(sc_engine_db)"
+                fi
+                exec "$PY" "$S/init_fork.py" "$@" ;;
   # rebuild/migrate: the script owns the whole argument contract (help, unknown
   # tokens), so the dispatcher forwards VERBATIM and only inserts the refusal —
   # after the help question, before the action.
@@ -1403,7 +1432,12 @@ case "$cmd" in
   typecheck)    sc_devkit_hook typecheck "$@" ;;
   sandbox-memory) exec "$PY" "$S/sandbox_resources.py" "$@" ;;
   # ── docker sandbox (host-side; the default way to run) ──
+  # launch/down/restart operate the shared live runtime (review server,
+  # sandbox, brokers) of the live root; a worktree has no runtime of its own.
   launch)
+    if [ "$LINKED" -eq 1 ] && ! sc_help_form "$@"; then
+      sc_refuse_linked launch "the runtime of $LIVE_ROOT (review server, sandbox, brokers)"
+    fi
     no_build=""
     while [ $# -gt 0 ]; do
       case "$1" in
@@ -1636,7 +1670,13 @@ case "$cmd" in
     sc_urls || true
     sc_enter_lease
     exec docker exec -it ${SC_ENTER_LEASE:+-e SC_ENTER_LEASE} "$CNAME" ./sc boot "${cmd#enter-}" "$@" ;;
-  down)         if sc_host_runtime; then
+  down)         if sc_help_form "$@"; then
+                  echo "usage: ./sc down"
+                  echo "  stop this fork's review server or sandbox and the brokers it started"
+                  exit 0
+                fi
+                sc_refuse_linked down "the runtime of $LIVE_ROOT (review server, sandbox, brokers)"
+                if sc_host_runtime; then
                   down_rc=0
                   sc_host_server_down || down_rc=1
                   sc_vm_broker_down
@@ -1663,6 +1703,9 @@ case "$cmd" in
   # that build before down, so a network/install failure cannot strand a
   # healthy fork offline.
   restart)
+    if [ "$LINKED" -eq 1 ] && ! sc_help_form "$@"; then
+      sc_refuse_linked restart "the runtime of $LIVE_ROOT (review server, sandbox, brokers)"
+    fi
     assume_yes=""
     no_build=""
     while [ $# -gt 0 ]; do

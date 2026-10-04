@@ -63,7 +63,6 @@ the next launch and need no restart of anything else.
 | `SC_NO_COLOR` | unset | Any value disables ANSI styling, exactly like `NO_COLOR`. | `style.py:5,24` |
 | `SC_DEVKIT_OUTPUT` | `compact` | `full` restores unbounded hook output instead of the bounded envelope. For `test`/`lint`/`typecheck` any other value exits `64`. | `devkit.py:37,824-831` |
 | `SC_USER` | unset | Operator username used when a boot or `./sc verify` has no TTY to prompt on. Without it a headless boot aborts. | `run.py:1155-1169` |
-| `SC_ADMIN` | unset | `1` clears the serialize guard so `snapshot` and `render` may run. The engine sets it for its own admin subprocesses; an operator uses it for a host-side `SC_ADMIN=1 ./sc snapshot`. | `_serialize_guard.py:10-32` · `init_fork.py:14,181` |
 | `SC_MEM_AS` | unset | On a host Admin seat, picks one runtime memory credential by shortname when several exist. Ambiguity otherwise refuses. | `mem.py:25-31,210-229` |
 | `SC_MEM_CREDENTIAL_FILE` | unset | Owner-only credential artifact `sc mem` validates and reads instead of an injected token. | `mem.py:21-23,240-243` |
 | `SC_GH_TOKEN` | unset | GitHub token candidate for push and PR creation. `GH_TOKEN` is accepted as an equivalent; a host `gh` login is the usual path. | `github_auth.py:37,542` · `server.py:2287,2494` |
@@ -87,14 +86,13 @@ supported meaning and can misdescribe the seat.
 | `SC_HARNESS` | `claude` · `codex` · `opencode` · `vibe` · `kimi` | The harness this session runs. |
 | `SC_CONVERSATION_SURFACE` | the browser conversation surface | Set only for browser-owned conversations. |
 | `SC_API_BASE` · `SC_API_TOKEN` | `http://127.0.0.1:<api port>` and the shell's API key | How `sc mem`, `sc job` and the telemetry hook reach the engine. Identity **is** the token; no command takes a `--shell`. |
-| `SC_ENGINE_DIR` · `SC_ROOT` | engine and repo-root paths | Present only for an unrestricted (Admin) view; a restricted shell has both removed. |
-| `SC_EXECUTION_VIEW` | `restricted-source` or `restricted-downstream` | Present only in a restricted view, naming which mask set applies. |
+| `SC_ENGINE_DIR` · `SC_ROOT` | engine and repo-root paths | Present only for an Admin seat; every other seat has both removed so it is never handed the main checkout to `cd` into. |
 | `SC_ENTER_LEASE` | a lease file path | Held open by `./sc enter` so a departed client reads as client-gone rather than busy forever. |
 | `SC_DEVKIT_ROOT` · `SC_DEVKIT_SEAT` · `SC_DEVKIT_HOOK` | checkout · `host`/`docker` · hook name | Neutral context handed to every dev-kit hook child. |
 | `SC_DEVKIT_REPAIR` | `1` | Set for `./sc enter --devkit-repair`; the boot makes no readiness claim in that seat. |
 
-Evidence: `run.py:2088-2104,2696-2738`, `conversation_launch.py:137-149`,
-`execution_view.py:48-54,175`, `dispatch.sh:306-329,1507-1508,1574`,
+Evidence: `run.py:2073-2094,2665-2716`, `conversation_launch.py:113-131`,
+`execution_view.py:40-55`, `dispatch.sh:306-329,1507-1508,1574`,
 `devkit.py:816-823`, `branch-guard.sh:52,87`, `shell_liveness.py:56,270-277`.
 
 ## Build contracts

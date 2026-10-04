@@ -11,7 +11,7 @@ singleton `cartographer` — a ten-shell roster out of the box. One planner is
 your primary by default.
 
 Run ONCE, right after `./sc rebuild`, on a fresh fork. Refuses if a shell already
-exists. After it runs: `SC_ADMIN=1 ./sc snapshot`, then `./sc launch`. More shells (or
+exists. After it runs: `./sc snapshot`, then `./sc launch`. More shells (or
 fewer) are managed later via the GUI (also through the factory).
 
 Shells ship pre-named out of the box, so install asks for your username and
@@ -178,7 +178,7 @@ def main(argv: list[str]) -> int:
                   "— owns the repo map.")
         total = 1 + len(team) + (1 if cart_id else 0)
         print(f"init_fork: seeded a {total}-shell team. "
-              "next -> `SC_ADMIN=1 ./sc snapshot` (serialize), then `./sc launch`.")
+              "next -> `./sc snapshot` (serialize), then `./sc launch`.")
     finally:
         con.close()
     return 0

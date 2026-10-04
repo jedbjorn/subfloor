@@ -1,361 +1,87 @@
-"""Restricted role/repository-mode harness execution view."""
+"""Launch policy after decision #427 retired the Landlock execution view.
+
+Every flavor launches its harness argv unchanged, in source and downstream
+repositories alike. The one surviving environment guard withholds the main
+checkout's engine and root paths (``SC_ENGINE_DIR``/``SC_ROOT``) from every
+seat except Admin, so an ordinary shell is never handed a path to ``cd`` into
+the stale default-branch tree.
+"""
 from __future__ import annotations
 
-import os
-import subprocess
+import inspect
 import sys
-import time
 from pathlib import Path
 
 import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
-SCRIPTS = ROOT / ".super-coder" / "scripts"
-sys.path.insert(0, str(SCRIPTS))
+ENGINE = ROOT / ".super-coder"
+sys.path.insert(0, str(ENGINE / "scripts"))
 
-import execution_view
-import instance_state
+import execution_view  # noqa: E402
+
+FLAVORS = ("admin", "planner", "dev", "reviewer", "devops", "cartographer", None)
+ARGV = ["claude", "--model", "opus", "--resume", "session id with spaces"]
+SOURCE = {
+    "PATH": "/usr/bin",
+    "SC_ENGINE_DIR": "/main/.super-coder",
+    "SC_ROOT": "/main",
+    "SC_API_TOKEN": "token",
+}
 
 
-def installation(tmp_path: Path) -> tuple[Path, Path, dict[str, str], Path]:
-    repo = tmp_path / "fork"
-    engine = repo / ".super-coder"
-    engine.mkdir(parents=True)
-    (engine / "schema.sql").write_text("engine schema secret\n")
-    (engine / "migrations").mkdir()
-    (engine / "migrations" / "0001.sql").write_text("migration secret\n")
-    (engine / "shell_db.db").write_text("legacy db secret\n")
-    config = engine / "instance.json"
-    env = {
-        "HOME": str(tmp_path / "home"),
-        "XDG_STATE_HOME": str(tmp_path / "state"),
-        "PATH": os.environ.get("PATH", ""),
-        "SC_ROOT": "/spoofed/root",
-        "SC_ENGINE_DIR": "/spoofed/engine",
-        "SC_SHELL_FLAVOR": "admin",
+@pytest.mark.parametrize("flavor", FLAVORS)
+def test_every_flavor_launches_the_harness_argv_unchanged(flavor):
+    view = execution_view.build(flavor=flavor)
+    assert view.command(ARGV) == ARGV
+    assert view.command([]) == []
+
+
+@pytest.mark.parametrize("flavor", FLAVORS)
+def test_only_admin_receives_the_maintenance_paths(flavor):
+    env = execution_view.build(flavor=flavor).environment(SOURCE)
+    assert "SC_EXECUTION_VIEW" not in env
+    if flavor == "admin":
+        assert env == SOURCE
+    else:
+        assert "SC_ENGINE_DIR" not in env
+        assert "SC_ROOT" not in env
+        assert env == {"PATH": "/usr/bin", "SC_API_TOKEN": "token"}
+
+
+def test_labels_are_admin_shell_and_render_only():
+    assert execution_view.build(flavor="admin").mode == "admin"
+    assert execution_view.build(flavor="dev").mode == "shell"
+    assert execution_view.build(flavor=None).mode == "shell"
+    render = execution_view.build(flavor="admin", render_only=True)
+    assert render.mode == "render-only"
+    assert render.command(ARGV) == ARGV
+    assert not render.maintenance_environment
+    assert execution_view.build(flavor="admin").maintenance_environment
+    assert not execution_view.build(flavor="planner").maintenance_environment
+
+
+def test_repository_mode_is_not_an_input_to_the_launch_policy():
+    # Source and downstream repositories launch every flavor identically:
+    # the builder cannot see the repository mode at all.
+    assert set(inspect.signature(execution_view.build).parameters) == {
+        "flavor", "render_only",
     }
-    Path(env["HOME"]).mkdir(mode=0o700)
-    private = instance_state.resolve(
-        instance_config=config,
-        environ=env,
-        id_factory=lambda: "0123456789abcdef0123456789abcdef",
+
+
+def test_the_kernel_view_and_its_refusal_surface_are_gone():
+    assert not (ENGINE / "scripts" / "execution_view_exec.py").exists()
+    for name in ("ExecutionViewError", "RESTRICTED_VIEW_ERROR", "build_masks"):
+        assert not hasattr(execution_view, name)
+    view = execution_view.build(flavor="dev")
+    for name in ("preflight", "prefix", "masked_paths", "restricted"):
+        assert not hasattr(view, name)
+    retired = (
+        "ExecutionViewError", "execution_view_exec", "SC_EXECUTION_VIEW",
+        "execution_prefix", "execution_argv", "RESTRICTED_SHELL_VIEW_MISMATCH",
     )
-    private.database.write_text("private db secret\n")
-    return repo, engine, env, private.root
-
-
-def run_in(
-    view: execution_view.ExecutionView,
-    script: str,
-    *,
-    cwd: Path | None = None,
-) -> subprocess.CompletedProcess:
-    return subprocess.run(
-        view.command(["/bin/sh", "-c", script]),
-        text=True,
-        capture_output=True,
-        check=False,
-        cwd=cwd,
-        timeout=10,
-    )
-
-
-def test_downstream_view_masks_state_schema_and_process_root_alias(tmp_path: Path) -> None:
-    repo, engine, env, private_root = installation(tmp_path)
-    view = execution_view.build(
-        engine=engine,
-        repo_root=repo,
-        flavor="developer",
-        source_mode=False,
-        environ=env,
-    )
-    view.preflight()
-    probe = run_in(
-        view,
-        " && ".join(
-            (
-                f"! cat {engine / 'shell_db.db'} >/dev/null 2>&1",
-                f"! cat {private_root / 'shell_db.db'} >/dev/null 2>&1",
-                (
-                    f"! /bin/sh -c 'echo mutate >> \"$1\"' child "
-                    f"{private_root / 'shell_db.db'}"
-                ),
-                f"! rm {private_root / 'shell_db.db'} >/dev/null 2>&1",
-                f"! cat {engine / 'schema.sql'} >/dev/null 2>&1",
-                f"! cat {engine / 'migrations' / '0001.sql'} >/dev/null 2>&1",
-                (
-                    f"! cat /proc/{os.getpid()}/root"
-                    f"{private_root / 'shell_db.db'} >/dev/null 2>&1"
-                ),
-                (
-                    f"/bin/sh -c '! cat \"$1\" >/dev/null 2>&1' child "
-                    f"{private_root / 'shell_db.db'}"
-                ),
-            )
-        ),
-    )
-    assert probe.returncode == 0, probe.stderr
-
-    restricted_env = view.environment(env)
-    assert restricted_env["SC_EXECUTION_VIEW"] == "restricted-downstream"
-    assert "SC_ROOT" not in restricted_env
-    assert "SC_ENGINE_DIR" not in restricted_env
-    assert restricted_env["SC_SHELL_FLAVOR"] == "admin"  # diagnostic only
-
-
-def test_source_view_keeps_tracked_engine_source_but_masks_live_state(
-    tmp_path: Path,
-) -> None:
-    repo, engine, env, private_root = installation(tmp_path)
-    view = execution_view.build(
-        engine=engine,
-        repo_root=repo,
-        flavor="dev",
-        source_mode=True,
-        environ=env,
-    )
-    probe = run_in(
-        view,
-        f"grep -q secret {engine / 'schema.sql'} && "
-        f"grep -q secret {engine / 'migrations' / '0001.sql'} && "
-        f"! cat {private_root / 'shell_db.db'} >/dev/null 2>&1",
-    )
-    assert probe.returncode == 0, probe.stderr
-
-
-def test_relative_backup_override_is_masked_across_harness_cwd(
-    tmp_path: Path,
-) -> None:
-    repo, engine, env, _private_root = installation(tmp_path)
-    env["SC_DB_BACKUP_DIR"] = "backups"
-    backup = repo / "backups" / "shell_db.preboundary.db"
-    backup.parent.mkdir()
-    backup.write_text("backup secret\n")
-    worktree = repo / ".sc-worktrees" / "dev"
-    worktree.mkdir(parents=True)
-    (worktree / "backups").symlink_to(backup.parent, target_is_directory=True)
-    view = execution_view.build(
-        engine=engine,
-        repo_root=repo,
-        flavor="dev",
-        source_mode=False,
-        environ=env,
-    )
-
-    assert backup.parent.resolve() in view.masked_paths
-    probe = run_in(
-        view,
-        f"! cat {backup} >/dev/null 2>&1 && "
-        "! cat backups/shell_db.preboundary.db >/dev/null 2>&1 && "
-        "! /bin/sh -c 'cat backups/shell_db.preboundary.db' "
-        ">/dev/null 2>&1 && "
-        f"! cat /proc/{os.getpid()}/root{backup} >/dev/null 2>&1",
-        cwd=worktree,
-    )
-    assert probe.returncode == 0, probe.stderr
-
-
-def test_sandbox_landlock_view_masks_direct_and_process_root_aliases(
-    tmp_path: Path,
-) -> None:
-    repo, engine, env, private_root = installation(tmp_path)
-    env["SC_SANDBOX"] = "1"
-    view = execution_view.build(
-        engine=engine,
-        repo_root=repo,
-        flavor="reviewer",
-        source_mode=False,
-        environ=env,
-    )
-    view.preflight()
-    secret = private_root / "shell_db.db"
-    probe = run_in(
-        view,
-        f"! cat {secret} >/dev/null 2>&1 && "
-        f"! cat /proc/{os.getpid()}/root{secret} >/dev/null 2>&1 && "
-        f"! cat {engine / 'schema.sql'} >/dev/null 2>&1",
-    )
-    assert probe.returncode == 0, probe.stderr
-
-
-def test_detached_descendant_survives_wrapper_and_keeps_restriction(
-    tmp_path: Path,
-) -> None:
-    repo, engine, env, private_root = installation(tmp_path)
-    product = repo / "product"
-    product.mkdir()
-    result = product / "job-result"
-    view = execution_view.build(
-        engine=engine,
-        repo_root=repo,
-        flavor="dev",
-        source_mode=False,
-        environ=env,
-    )
-    secret = private_root / "shell_db.db"
-    launched = run_in(
-        view,
-        f"setsid /bin/sh -c 'sleep 0.05; "
-        f"if cat {secret} >/dev/null 2>&1; then echo exposed; "
-        f"else echo restricted; fi > {result}' >/dev/null 2>&1 &",
-    )
-    assert launched.returncode == 0, launched.stderr
-    deadline = time.monotonic() + 2
-    while not result.exists() and time.monotonic() < deadline:
-        time.sleep(0.01)
-    assert result.read_text().strip() == "restricted"
-
-
-def test_admin_is_unwrapped_and_keeps_maintenance_environment(tmp_path: Path) -> None:
-    view = execution_view.build(
-        engine=tmp_path / "missing-engine",
-        repo_root=tmp_path / "repo",
-        flavor="admin",
-        source_mode=False,
-        environ={},
-    )
-    assert view.command(["tool", "arg"]) == ["tool", "arg"]
-    assert view.environment({"SC_ROOT": "/repo"})["SC_ROOT"] == "/repo"
-
-
-def test_missing_private_identity_fails_closed_without_path_disclosure(
-    tmp_path: Path,
-) -> None:
-    engine = tmp_path / "repo" / ".super-coder"
-    engine.mkdir(parents=True)
-    with pytest.raises(execution_view.ExecutionViewError) as caught:
-        execution_view.build(
-            engine=engine,
-            repo_root=engine.parent,
-            flavor="dev",
-            source_mode=False,
-            environ={"HOME": str(tmp_path)},
-        )
-    assert str(caught.value) == execution_view.RESTRICTED_VIEW_ERROR
-    assert str(tmp_path) not in str(caught.value)
-
-
-def test_masked_file_alias_fails_closed(tmp_path: Path) -> None:
-    repo, engine, env, private_root = installation(tmp_path)
-    alias = repo / "product-db-alias"
-    os.link(private_root / "shell_db.db", alias)
-    with pytest.raises(execution_view.ExecutionViewError) as caught:
-        execution_view.build(
-            engine=engine,
-            repo_root=repo,
-            flavor="dev",
-            source_mode=False,
-            environ=env,
-        )
-    assert str(caught.value) == execution_view.RESTRICTED_VIEW_ERROR
-    assert str(private_root) not in str(caught.value)
-
-
-@pytest.mark.parametrize("source_mode", [False, True])
-@pytest.mark.parametrize("flavor", ["planner", "developer", "reviewer"])
-def test_private_npm_links_allow_launch_without_exposing_state(
-    tmp_path: Path, source_mode: bool, flavor: str,
-) -> None:
-    repo, engine, env, private_root = installation(tmp_path)
-    modules = private_root / "browser/package/node_modules"
-    bins = modules / ".bin"
-    bins.mkdir(parents=True)
-    for name, package in (
-        ("playwright", "playwright"),
-        ("playwright-core", "playwright-core"),
-        ("playwright-mcp", "@playwright/mcp"),
-    ):
-        cli = modules / package / "cli.js"
-        cli.parent.mkdir(parents=True)
-        cli.write_text("private package content")
-        (bins / name).symlink_to(f"../{package}/cli.js")
-    # A product-side alias cannot bypass the private directory mask either.
-    alias = repo / "package-alias"
-    alias.symlink_to(modules, target_is_directory=True)
-    # Mask ancestors cannot grant recursive creation rights; product trees
-    # receive their own rule, as in the detached-descendant fixture above.
-    product = repo / "product"
-    product.mkdir()
-    view = execution_view.build(
-        engine=engine, repo_root=repo, flavor=flavor,
-        source_mode=source_mode, environ=env,
-    )
-    view.preflight()
-    probe = run_in(
-        view,
-        f"! cat {bins / 'playwright'} >/dev/null 2>&1 && "
-        f"! cat {alias / '.bin/playwright'} >/dev/null 2>&1 && "
-        f"! cat {private_root / 'shell_db.db'} >/dev/null 2>&1 && "
-        f"! cat /proc/{os.getpid()}/root{bins / 'playwright'} >/dev/null 2>&1 && "
-        f"echo usable > {product / 'output'}",
-    )
-    assert probe.returncode == 0, probe.stderr
-    assert (product / "output").read_text() == "usable\n"
-
-
-def test_internal_directory_and_chained_backup_links(tmp_path: Path) -> None:
-    repo, engine, env, _private_root = installation(tmp_path)
-    backups = repo / "backups"
-    backups.mkdir()
-    env["SC_DB_BACKUP_DIR"] = str(backups)
-    generation = backups / "generation"
-    generation.mkdir()
-    (generation / "snapshot.db").write_text("secret")
-    (backups / "latest").symlink_to("generation", target_is_directory=True)
-    (backups / "current").symlink_to("latest", target_is_directory=True)
-    view = execution_view.build(
-        engine=engine, repo_root=repo, flavor="planner",
-        source_mode=False, environ=env,
-    )
-    view.preflight()
-    assert run_in(
-        view, f"! cat {backups / 'current/snapshot.db'} >/dev/null 2>&1",
-    ).returncode == 0
-
-
-@pytest.mark.parametrize("kind", ["escape", "directory-escape", "dangling", "cycle", "root", "hardlink"])
-def test_unsafe_aliases_still_fail_closed(tmp_path: Path, kind: str) -> None:
-    repo, engine, env, private_root = installation(tmp_path)
-    link = private_root / "alias"
-    if kind == "escape":
-        target = repo / "exposed-secret"
-        target.write_text("secret")
-        link.symlink_to(target)
-    elif kind == "directory-escape":
-        link.symlink_to(repo, target_is_directory=True)
-    elif kind == "dangling":
-        link.symlink_to("missing")
-    elif kind == "cycle":
-        link.symlink_to("alias")
-    elif kind == "root":
-        (engine / "schema.sql").unlink()
-        (engine / "schema.sql").symlink_to(private_root / "shell_db.db")
-    else:
-        link.symlink_to("shell_db.db")
-        os.link(private_root / "shell_db.db", repo / "exposed-secret")
-    with pytest.raises(execution_view.ExecutionViewError) as caught:
-        execution_view.build(
-            engine=engine, repo_root=repo, flavor="planner",
-            source_mode=False, environ=env,
-        )
-    assert str(caught.value) == execution_view.RESTRICTED_VIEW_ERROR
-
-
-@pytest.mark.parametrize("directory", [False, True])
-def test_internal_mask_links_validate_without_following_aliases(
-    tmp_path: Path, directory: bool,
-) -> None:
-    masked = tmp_path / "masked"
-    masked.mkdir()
-    target = masked / "target"
-    if directory:
-        target.mkdir()
-        (target / "secret").write_text("secret")
-        # This resolves to an actual directory, not a cyclic symlink chain.
-        (target / "parent").symlink_to(masked, target_is_directory=True)
-    else:
-        target.write_text("secret")
-    (masked / "relative").symlink_to("target", target_is_directory=directory)
-    (masked / "absolute").symlink_to(target, target_is_directory=directory)
-    (masked / "chain").symlink_to("relative", target_is_directory=directory)
-    execution_view._validate_masks([masked])
+    for tree in (ENGINE / "scripts", ENGINE / "api", ENGINE / "render"):
+        for source in tree.rglob("*.py"):
+            text = source.read_text()
+            for symbol in retired:
+                assert symbol not in text, f"{symbol} in {source}"

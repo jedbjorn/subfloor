@@ -51,7 +51,7 @@ class EngineSqlTest(unittest.TestCase):
             "SC_ENGINE_DIR": "/attacker/engine",
         }
         with mock.patch.dict(os.environ, env, clear=True), self._path(), \
-             mock.patch.object(engine_sql, "_api_flavor", return_value=None), \
+             mock.patch.object(engine_sql.engine_identity, "api_flavor", return_value=None), \
              mock.patch.object(engine_sql.shutil, "which", return_value="/bin/sqlite3"), \
              mock.patch.object(engine_sql.subprocess, "run", return_value=completed) as run:
             self.assertEqual(engine_sql.main(["read-only", "SELECT 1;"]), 0)
@@ -96,7 +96,7 @@ class EngineSqlTest(unittest.TestCase):
         engine_sql.mem._DISCOVERED_FROM = None
 
         with mock.patch.dict(os.environ, {}, clear=True), self._path(), \
-             mock.patch.object(engine_sql, "_api_flavor", return_value=None), \
+             mock.patch.object(engine_sql.engine_identity, "api_flavor", return_value=None), \
              mock.patch.object(engine_sql.shutil, "which", return_value="/bin/sqlite3"), \
              mock.patch.object(engine_sql.subprocess, "run", return_value=completed) as run:
             self.assertEqual(engine_sql.main(["read-only", "SELECT 1;"]), 0)
@@ -113,7 +113,7 @@ class EngineSqlTest(unittest.TestCase):
             "SC_SHELL_FLAVOR": "admin",
         }
         with mock.patch.dict(os.environ, env, clear=True), \
-             mock.patch.object(engine_sql, "_api_flavor", return_value="dev"), \
+             mock.patch.object(engine_sql.engine_identity, "api_flavor", return_value="dev"), \
              mock.patch.object(
                  engine_sql.instance_state,
                  "active_database_path",
@@ -129,7 +129,7 @@ class EngineSqlTest(unittest.TestCase):
             "SC_API_BASE": "http://127.0.0.1:8837",
         }
         with mock.patch.dict(os.environ, env, clear=True), self._path(), \
-             mock.patch.object(engine_sql, "_api_flavor", return_value="admin"), \
+             mock.patch.object(engine_sql.engine_identity, "api_flavor", return_value="admin"), \
              mock.patch.object(
                  engine_sql.shutil,
                  "which",
@@ -151,7 +151,7 @@ class EngineSqlTest(unittest.TestCase):
             "SC_API_BASE": "http://127.0.0.1:1",
         }
         with mock.patch.dict(os.environ, env, clear=True), self._path(), \
-             mock.patch.object(engine_sql, "_api_flavor", return_value=None), \
+             mock.patch.object(engine_sql.engine_identity, "api_flavor", return_value=None), \
              mock.patch.object(
                  engine_sql.shutil,
                  "which",
@@ -173,7 +173,7 @@ class EngineSqlTest(unittest.TestCase):
             {"SC_API_TOKEN": "dev-token", "SC_SHELL_FLAVOR": "admin"},
             clear=True,
         ), self._path(), \
-             mock.patch.object(engine_sql, "_api_flavor", return_value=None), \
+             mock.patch.object(engine_sql.engine_identity, "api_flavor", return_value=None), \
              mock.patch.object(
                  engine_sql.subprocess,
                  "run",
@@ -185,8 +185,19 @@ class EngineSqlTest(unittest.TestCase):
         self.assertNotIn(str(self.db), str(caught.exception))
 
     def test_missing_identity_does_not_adopt_an_admin_credential(self):
-        with mock.patch.dict(os.environ, {}, clear=True), \
-             self.assertRaises(SystemExit) as caught:
+        # Hermetic: discovery looks only at an empty credential directory, so
+        # a run from a checkout whose run/mem holds a live Admin credential
+        # can never adopt it (or reach the live API and DB through it).
+        empty = Path(self.tmp.name) / "no-credentials"
+        empty.mkdir()
+        with mock.patch.object(engine_sql.mem, "_CRED_DIR", empty), \
+             mock.patch.object(engine_sql.mem, "SC_API_TOKEN", ""), \
+             mock.patch.object(engine_sql.mem, "SC_API_BASE", ""), \
+             mock.patch.dict(os.environ, {}, clear=True), \
+             mock.patch.object(
+                 engine_sql.engine_identity, "api_flavor",
+                 side_effect=AssertionError("an identity was resolved"),
+             ), self.assertRaises(SystemExit) as caught:
             engine_sql.main(["read-only", "SELECT 1;"])
         self.assertIn(engine_sql.ERROR_CODE, str(caught.exception))
 

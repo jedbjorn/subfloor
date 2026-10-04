@@ -129,7 +129,8 @@ class RelocatedSnapshotReportTest(unittest.TestCase):
         self.assertIn(str(relocated), report)
         self.assertIn("roadmap_sc.md", report)
         self.assertIn("Admin, from the main checkout", report)
-        self.assertIn("SC_ADMIN=1 ./sc snapshot && SC_ADMIN=1 ./sc render flat", report)
+        self.assertIn("./sc snapshot && ./sc render flat", report)
+        self.assertNotIn("SC_ADMIN", report)
         self.assertNotIn("./sc rebuild &&", report)
 
 

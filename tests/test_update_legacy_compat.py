@@ -370,7 +370,6 @@ class LegacyUpdateCompatTest(unittest.TestCase):
             for key in (
                 "CODEX_HOME", "CLAUDE_CONFIG_DIR", "OPENCODE_CONFIG_DIR",
                 "XDG_CONFIG_HOME", "IS_SANDBOX", "SC_SANDBOX", "SC_API_TOKEN",
-                "SC_ADMIN",
             ):
                 env.pop(key, None)
 

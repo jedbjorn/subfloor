@@ -168,7 +168,6 @@ PRODUCTION_CONSUMERS = (
         "shell_entry_and_liveness",
         (
             ".super-coder/scripts/dispatch.sh",
-            ".super-coder/scripts/execution_view.py",
             ".super-coder/scripts/run.py",
             ".super-coder/scripts/shell_liveness.py",
         ),
