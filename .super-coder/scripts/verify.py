@@ -132,9 +132,9 @@ def main(argv: list[str]) -> int:
                     ).fetchone()[0]
                 if populated:
                     continue
+            # env carries no SC_* identity, so the candidate's render step runs
+            # as the engine against its own disposable instance.
             step_env = dict(env)
-            if index == 2:
-                step_env["SC_ADMIN"] = "1"
             if index == 3:
                 step_env["RENDER_ONLY"] = "1"
                 import sqlite3

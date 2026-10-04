@@ -88,17 +88,18 @@ def main(argv: list[str]) -> int:
     if not argv:
         sys.exit(__doc__)
     mode = argv[0]
+    if mode in ("flat", "all"):
+        # Refuse before opening the shared DB, not after.
+        require_admin("render flat")
     con = _open()
     try:
         if mode == "flat":
-            require_admin("render flat")
             _heal_fresh(con)
             _report("flat", persist_visibility(con))
         elif mode in ("skills", "all"):
             if len(argv) < 2:
                 sys.exit(f"render: `{mode}` needs a shell shortname")
             if mode == "all":
-                require_admin("render flat")
                 _heal_fresh(con)
                 _report("flat", persist_visibility(con))
             shell = _resolve_shell(con, argv[1])

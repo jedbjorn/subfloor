@@ -21,7 +21,7 @@ import server  # noqa: E402
 
 class SnapshotLiveRuntimeTest(unittest.TestCase):
     def test_healthy_runtime_routes_before_requesting_maintenance(self) -> None:
-        with mock.patch.dict(os.environ, {"SC_ADMIN": "1"}, clear=False), \
+        with mock.patch.object(snapshot, "require_admin"), \
              mock.patch.object(snapshot.instance_state, "active_database_path"), \
              mock.patch.object(
                  snapshot, "_snapshot_via_runtime_api", return_value="snapshot: wrote live"
@@ -36,7 +36,7 @@ class SnapshotLiveRuntimeTest(unittest.TestCase):
 
     def test_api_absence_retains_offline_exclusive_maintenance(self) -> None:
         state = mock.Mock()
-        with mock.patch.dict(os.environ, {"SC_ADMIN": "1"}, clear=False), \
+        with mock.patch.object(snapshot, "require_admin"), \
              mock.patch.object(snapshot.instance_state, "active_database_path"), \
              mock.patch.object(snapshot, "_snapshot_via_runtime_api", return_value=None), \
              mock.patch.object(
@@ -57,7 +57,7 @@ class SnapshotLiveRuntimeTest(unittest.TestCase):
             database = Path(raw) / "engine.db"
             database.touch()
             connection = mock.Mock()
-            with mock.patch.dict(os.environ, {"SC_ADMIN": "1"}, clear=False), \
+            with mock.patch.object(snapshot, "require_admin"), \
                  mock.patch.object(snapshot, "DB_PATH", database), \
                  mock.patch.object(snapshot.instance_state, "active_database_path"), \
                  mock.patch.object(snapshot.artifact_policy, "prepare_local_state", return_value=[]), \

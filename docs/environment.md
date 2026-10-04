@@ -63,7 +63,6 @@ the next launch and need no restart of anything else.
 | `SC_NO_COLOR` | unset | Any value disables ANSI styling, exactly like `NO_COLOR`. | `style.py:5,24` |
 | `SC_DEVKIT_OUTPUT` | `compact` | `full` restores unbounded hook output instead of the bounded envelope. For `test`/`lint`/`typecheck` any other value exits `64`. | `devkit.py:37,824-831` |
 | `SC_USER` | unset | Operator username used when a boot or `./sc verify` has no TTY to prompt on. Without it a headless boot aborts. | `run.py:1155-1169` |
-| `SC_ADMIN` | unset | `1` clears the serialize guard so `snapshot` and `render` may run. The engine sets it for its own admin subprocesses; an operator uses it for a host-side `SC_ADMIN=1 ./sc snapshot`. | `_serialize_guard.py:10-32` · `init_fork.py:14,181` |
 | `SC_MEM_AS` | unset | On a host Admin seat, picks one runtime memory credential by shortname when several exist. Ambiguity otherwise refuses. | `mem.py:25-31,210-229` |
 | `SC_MEM_CREDENTIAL_FILE` | unset | Owner-only credential artifact `sc mem` validates and reads instead of an injected token. | `mem.py:21-23,240-243` |
 | `SC_GH_TOKEN` | unset | GitHub token candidate for push and PR creation. `GH_TOKEN` is accepted as an equivalent; a host `gh` login is the usual path. | `github_auth.py:37,542` · `server.py:2287,2494` |

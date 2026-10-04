@@ -1,24 +1,25 @@
 #!/usr/bin/env python3
 """Admin-only engine SQL passthrough.
 
-Authorization comes from the launched shell bearer token. The API is the
-preferred authority; when it is unavailable, the host Admin recovery seat may
-resolve the same token against the canonical active database. Caller-supplied
-flavor and path environment variables are deliberately ignored.
+Authorization comes from the launched shell bearer token, resolved by
+``engine_identity`` (the one identity check shared with the serialization
+gate). The API is the preferred authority; when it is unavailable, the host
+Admin recovery seat may resolve the same token against the canonical active
+database. Unlike serialization, engine SQL requires a positive Admin identity:
+a caller without a token must adopt the host Admin runtime credential.
+Caller-supplied flavor and path environment variables are deliberately
+ignored.
 """
 from __future__ import annotations
 
-import json
 import os
 import shutil
-import sqlite3
 import subprocess
 import sys
-import urllib.error
-import urllib.request
 from pathlib import Path
 from typing import NoReturn
 
+import engine_identity
 import instance_state
 import mem
 
@@ -28,7 +29,11 @@ MAINTENANCE_ERROR_CODE = "maintenance_cutover_required"
 
 
 def refuse() -> NoReturn:
-    sys.exit(f"{ERROR_CODE}: general engine SQL is available only to Admin")
+    sys.exit(
+        f"{ERROR_CODE}: general engine SQL is available only to Admin — an "
+        "ordinary shell reads and writes engine state through `sc mem`, so "
+        "raw SQL would bypass the API that keeps the shared instance coherent."
+    )
 
 
 def refuse_write() -> NoReturn:
@@ -38,53 +43,42 @@ def refuse_write() -> NoReturn:
     )
 
 
-def _api_flavor(token: str, base: str) -> str | None:
-    if not token or not base:
-        return None
-    request = urllib.request.Request(
-        base.rstrip("/") + "/_sc/mem/whoami",
-        headers={"Authorization": f"Bearer {token}"},
-    )
-    try:
-        with urllib.request.urlopen(request, timeout=2) as response:
-            return json.loads(response.read()).get("flavor")
-    except (OSError, ValueError, urllib.error.URLError):
-        return None
+def _discovered_admin_credential() -> tuple[str, str]:
+    """Adopt the host Admin's runtime credential, or refuse.
+
+    A host Admin seat booted outside run.py carries no token; the supervised
+    API provisions an owner-only credential it may adopt (mem.py). Only a
+    login seat may do so: an environment with no HOME (``env -i``, a test
+    harness that clears the environment) names no seat, and adopting the
+    credential that happens to sit on disk would hand it the owner's Admin
+    identity and the live database.
+    """
+    if not os.environ.get("HOME"):
+        refuse()
+    mem._PROG = "sc sql"
+    if not mem._discover_runtime_credential():
+        refuse()
+    return mem.SC_API_TOKEN, mem.SC_API_BASE
 
 
 def _admin_token() -> str:
     token = os.environ.get("SC_API_TOKEN", "")
     base = os.environ.get("SC_API_BASE", "")
-    flavor = _api_flavor(token, base)
-    if flavor is not None:
-        if flavor != "admin":
-            refuse()
-        return token
-
     if not token:
-        mem._PROG = "sc sql"
-        if not mem._discover_runtime_credential():
-            refuse()
-        token = mem.SC_API_TOKEN
+        token, base = _discovered_admin_credential()
+    # The same identity resolution the serialization gate uses. The canonical
+    # DB is consulted below in main(), after the API has had its say, so a
+    # refused non-Admin never resolves (or learns) the database path.
+    caller = engine_identity.resolve(token=token, base=base, db_path=lambda: None)
+    if caller.flavor is not None and not caller.admin:
+        refuse()
     return token
 
 
 def _require_local_admin(token: str, db_path: Path) -> None:
-    try:
-        con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
-        try:
-            row = con.execute(
-                "SELECT flavor FROM shells WHERE api_key=? "
-                "AND COALESCE(is_deleted,0)=0",
-                (token,),
-            ).fetchone()
-        finally:
-            con.close()
-    except (OSError, sqlite3.Error):
-        # An unavailable database is not a reason to disclose its path or
-        # fall back to caller-controlled identity hints.
-        refuse()
-    if row is None or row[0] != "admin":
+    # An unavailable database is not a reason to disclose its path or fall
+    # back to caller-controlled identity hints: local_flavor answers None.
+    if engine_identity.local_flavor(token, db_path) != engine_identity.ADMIN:
         refuse()
 
 

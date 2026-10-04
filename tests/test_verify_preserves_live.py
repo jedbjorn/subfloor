@@ -25,7 +25,7 @@ class VerifyPreservesLiveTest(unittest.TestCase):
             env = {k: v for k, v in os.environ.items() if not k.startswith("SC_")}
             env.update({"HOME": str(base / "home"),
                         "XDG_STATE_HOME": str(base / "state"),
-                        "TMPDIR": str(base / "tmp"), "SC_ADMIN": "1"})
+                        "TMPDIR": str(base / "tmp")})
             (base / "tmp").mkdir()
             subprocess.run(["git", "init", "-q", str(checkout)], check=True)
             subprocess.run(["git", "-C", str(checkout), "remote", "add", "origin",

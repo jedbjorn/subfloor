@@ -109,7 +109,7 @@ class QuotaSnapshotExclusionTest(unittest.TestCase):
             snapshot_map=lambda: None,   # else it serializes the REPO's map db
         ), mock.patch.object(
             snapshot.artifact_policy, "prepare_local_state", lambda: []
-        ), mock.patch.dict(os.environ, {"SC_ADMIN": "1"}):
+        ), mock.patch.object(snapshot, "require_admin"):
             self.assertEqual(snapshot.main(), 0)
         return self.out.read_text()
 

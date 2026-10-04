@@ -30,7 +30,7 @@ Match the left column -> file.
 
 | You hit | Real case |
 |---|---|
-| A `sc` command fails out of the box | `sc verify` always aborted — its own render step needed `SC_ADMIN` it never set (#227) |
+| A `sc` command fails out of the box | `sc verify` always aborted — its own render step failed the Admin serialization gate it never satisfied (#227) |
 | A command exits green without doing the work | `sc test` silently fell back to unittest when pytest was missing — green-washed suites (#219) |
 | The documented remedy is a closed loop | `sc lint` said "run `sc deps` first," but deps skips pip in the sandbox — tool unobtainable from inside the box (#246) |
 | A skill instructs tools/paths your seat doesn't have | a sandbox skill drove raw host-only `ssh`/`virsh` paths (#248) |

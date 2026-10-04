@@ -51,7 +51,7 @@ class EngineSqlTest(unittest.TestCase):
             "SC_ENGINE_DIR": "/attacker/engine",
         }
         with mock.patch.dict(os.environ, env, clear=True), self._path(), \
-             mock.patch.object(engine_sql, "_api_flavor", return_value=None), \
+             mock.patch.object(engine_sql.engine_identity, "api_flavor", return_value=None), \
              mock.patch.object(engine_sql.shutil, "which", return_value="/bin/sqlite3"), \
              mock.patch.object(engine_sql.subprocess, "run", return_value=completed) as run:
             self.assertEqual(engine_sql.main(["read-only", "SELECT 1;"]), 0)
@@ -59,6 +59,48 @@ class EngineSqlTest(unittest.TestCase):
             run.call_args.args[0],
             ["/bin/sqlite3", "-readonly", str(self.db), "SELECT 1;"],
         )
+
+    def _credential_dir(self) -> Path:
+        credential_dir = Path(self.tmp.name) / "credentials"
+        credential_dir.mkdir()
+        artifact = credential_dir / "admin.json"
+        artifact.write_text(json.dumps({
+            "shell_id": 1,
+            "shortname": "admin",
+            "api_base": "http://127.0.0.1:1",
+            "token": "admin-token",
+        }))
+        artifact.chmod(0o600)
+        saved = (
+            engine_sql.mem._CRED_DIR,
+            engine_sql.mem.SC_API_TOKEN,
+            engine_sql.mem.SC_API_BASE,
+            engine_sql.mem._DISCOVERED_FROM,
+        )
+
+        def restore():
+            (engine_sql.mem._CRED_DIR, engine_sql.mem.SC_API_TOKEN,
+             engine_sql.mem.SC_API_BASE, engine_sql.mem._DISCOVERED_FROM) = saved
+
+        self.addCleanup(restore)
+        engine_sql.mem._CRED_DIR = credential_dir
+        engine_sql.mem.SC_API_TOKEN = ""
+        engine_sql.mem.SC_API_BASE = ""
+        engine_sql.mem._DISCOVERED_FROM = None
+        return credential_dir
+
+    def test_cleared_environment_never_adopts_an_admin_credential_on_disk(self):
+        self._credential_dir()
+        with mock.patch.dict(os.environ, {}, clear=True), self._path(), \
+             mock.patch.object(engine_sql.engine_identity, "api_flavor", return_value=None), \
+             mock.patch.object(
+                 engine_sql.subprocess,
+                 "run",
+                 side_effect=AssertionError("query must not be executed"),
+             ), self.assertRaises(SystemExit) as caught:
+            engine_sql.main(["read-only", "SELECT 1;"])
+        self.assertIn(engine_sql.ERROR_CODE, str(caught.exception))
+        self.assertEqual(engine_sql.mem.SC_API_TOKEN, "")
 
     def test_api_down_host_admin_discovers_owner_only_runtime_credential(self):
         credential_dir = Path(self.tmp.name) / "credentials"
@@ -95,8 +137,9 @@ class EngineSqlTest(unittest.TestCase):
         engine_sql.mem.SC_API_BASE = ""
         engine_sql.mem._DISCOVERED_FROM = None
 
-        with mock.patch.dict(os.environ, {}, clear=True), self._path(), \
-             mock.patch.object(engine_sql, "_api_flavor", return_value=None), \
+        login_seat = {"HOME": self.tmp.name}
+        with mock.patch.dict(os.environ, login_seat, clear=True), self._path(), \
+             mock.patch.object(engine_sql.engine_identity, "api_flavor", return_value=None), \
              mock.patch.object(engine_sql.shutil, "which", return_value="/bin/sqlite3"), \
              mock.patch.object(engine_sql.subprocess, "run", return_value=completed) as run:
             self.assertEqual(engine_sql.main(["read-only", "SELECT 1;"]), 0)
@@ -113,7 +156,7 @@ class EngineSqlTest(unittest.TestCase):
             "SC_SHELL_FLAVOR": "admin",
         }
         with mock.patch.dict(os.environ, env, clear=True), \
-             mock.patch.object(engine_sql, "_api_flavor", return_value="dev"), \
+             mock.patch.object(engine_sql.engine_identity, "api_flavor", return_value="dev"), \
              mock.patch.object(
                  engine_sql.instance_state,
                  "active_database_path",
@@ -129,7 +172,7 @@ class EngineSqlTest(unittest.TestCase):
             "SC_API_BASE": "http://127.0.0.1:8837",
         }
         with mock.patch.dict(os.environ, env, clear=True), self._path(), \
-             mock.patch.object(engine_sql, "_api_flavor", return_value="admin"), \
+             mock.patch.object(engine_sql.engine_identity, "api_flavor", return_value="admin"), \
              mock.patch.object(
                  engine_sql.shutil,
                  "which",
@@ -151,7 +194,7 @@ class EngineSqlTest(unittest.TestCase):
             "SC_API_BASE": "http://127.0.0.1:1",
         }
         with mock.patch.dict(os.environ, env, clear=True), self._path(), \
-             mock.patch.object(engine_sql, "_api_flavor", return_value=None), \
+             mock.patch.object(engine_sql.engine_identity, "api_flavor", return_value=None), \
              mock.patch.object(
                  engine_sql.shutil,
                  "which",
@@ -173,7 +216,7 @@ class EngineSqlTest(unittest.TestCase):
             {"SC_API_TOKEN": "dev-token", "SC_SHELL_FLAVOR": "admin"},
             clear=True,
         ), self._path(), \
-             mock.patch.object(engine_sql, "_api_flavor", return_value=None), \
+             mock.patch.object(engine_sql.engine_identity, "api_flavor", return_value=None), \
              mock.patch.object(
                  engine_sql.subprocess,
                  "run",

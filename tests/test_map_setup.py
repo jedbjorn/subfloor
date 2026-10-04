@@ -2,6 +2,7 @@
 """Regression coverage for home-owned map hook wiring."""
 from __future__ import annotations
 
+import io
 import os
 import shutil
 import subprocess
@@ -66,19 +67,41 @@ class UpdateBridgeSeatTest(unittest.TestCase):
             map_setup.run_update_compat()
         run.assert_called_once()
 
-    def test_host_shell_skips_owner_bridge(self):
-        with mock.patch.dict(os.environ, {"SC_API_TOKEN": "shell-token"}, clear=True), \
-                mock.patch.object(map_setup.subprocess, "run") as run:
-            map_setup.run_update_compat()
-        run.assert_not_called()
+    def _flavor(self, flavor):
+        import engine_identity
 
-    def test_operator_update_preserves_bridge_with_inherited_shell_token(self):
-        with mock.patch.dict(os.environ, {
-            "SC_API_TOKEN": "shell-token", "SC_ADMIN": "1",
-        }, clear=True), mock.patch.object(map_setup.subprocess, "run") as run:
+        return mock.patch.object(
+            engine_identity, "resolve",
+            return_value=engine_identity.Caller(token="shell-token", flavor=flavor),
+        )
+
+    def test_host_shell_skips_owner_bridge_and_says_why(self):
+        for flavor in ("cartographer", "dev", None):
+            with self.subTest(flavor=flavor), \
+                    mock.patch.dict(os.environ, {"SC_API_TOKEN": "shell-token"}, clear=True), \
+                    self._flavor(flavor), \
+                    mock.patch.object(map_setup.subprocess, "run") as run, \
+                    mock.patch("sys.stdout", new_callable=io.StringIO) as out:
+                map_setup.run_update_compat()
+            run.assert_not_called()
+            self.assertIn("skipped the owner update bridge", out.getvalue())
+            self.assertIn("this launched shell is neither", out.getvalue())
+
+    def test_admin_shell_runs_the_bridge(self):
+        with mock.patch.dict(os.environ, {"SC_API_TOKEN": "shell-token"}, clear=True), \
+                self._flavor("admin"), \
+                mock.patch.object(map_setup.subprocess, "run") as run:
             run.return_value.returncode = 0
             map_setup.run_update_compat()
         run.assert_called_once()
+
+    def test_self_declared_admin_flag_does_not_run_the_bridge(self):
+        with mock.patch.dict(os.environ, {
+            "SC_API_TOKEN": "shell-token", "SC_ADMIN": "1",
+        }, clear=True), self._flavor("cartographer"), \
+                mock.patch.object(map_setup.subprocess, "run") as run:
+            map_setup.run_update_compat()
+        run.assert_not_called()
 
     def test_operator_bridge_failure_still_aborts(self):
         with mock.patch.dict(os.environ, {}, clear=True), \
@@ -92,7 +115,8 @@ class UpdateBridgeSeatTest(unittest.TestCase):
             root = Path(td)
             scripts = root / ".super-coder/scripts"
             scripts.mkdir(parents=True)
-            shutil.copy2(ENGINE / "scripts/map_setup.py", scripts / "map_setup.py")
+            for name in ("map_setup.py", "engine_identity.py", "instance_state.py"):
+                shutil.copy2(ENGINE / "scripts" / name, scripts / name)
             (scripts / "update_compat.py").write_text(
                 "raise PermissionError('cannot read private state owner metadata')\n"
             )
@@ -112,8 +136,9 @@ class UpdateBridgeSeatTest(unittest.TestCase):
             hook.chmod(0o644)
             subprocess.run(["git", "init", "-q", str(root)], check=True)
             env = {**os.environ, "SC_API_TOKEN": "shell-token"}
-            for key in ("SC_SANDBOX", "SC_ADMIN"):
+            for key in ("SC_SANDBOX", "SC_API_BASE"):
                 env.pop(key, None)
+            env["XDG_STATE_HOME"] = str(root / "state")
             result = subprocess.run(
                 [sys.executable, str(scripts / "map_setup.py")],
                 env=env, capture_output=True, text=True, check=False,
@@ -121,6 +146,7 @@ class UpdateBridgeSeatTest(unittest.TestCase):
 
             self.assertEqual(0, result.returncode, result.stderr)
             self.assertTrue((root / "mapped").exists())
+            self.assertIn("skipped the owner update bridge", result.stdout)
             self.assertTrue(hook.stat().st_mode & 0o111)
             configured = subprocess.run(
                 ["git", "-C", str(root), "config", "--get", "core.hooksPath"],

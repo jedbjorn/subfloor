@@ -1,33 +1,28 @@
-"""Guard: serializing shared instance state is an admin/GUI operation.
+"""Guard: serializing the shared instance is an Admin step.
 
-`snapshot.py` and `render.py flat` write ignored local artifacts for the shared
-instance. A shell's `./sc mem` write
-is already live and visible to all shells through the shared engine DB, so
-per-write serialization is never needed from a shell and can collide with
-another serialization.
+`snapshot.py` and `render.py flat` rewrite the shared instance's ignored local
+snapshot and renders. A shell's `sc mem` write is already live in the shared
+engine DB and visible to every shell, so re-serializing from a shell is never
+needed; it only dirties the shared tree and can collide with another
+serialization in flight.
 
-Serialization is therefore gated to admin surfaces — the GUI/API, install, update,
-and render-check — which set `SC_ADMIN=1` on the subprocess. A shell running
-`./sc snapshot` / `./sc render flat` directly gets one clear refusal instead of
-silently dirtying the shared tree.
+The caller is resolved from its bearer token by `engine_identity` — the same
+check engine SQL uses — never from a self-declared variable. Admin, the host
+operator's seat and engine-internal callers (the API's Save locally, install,
+update, verify) pass; any other launched shell gets one refusal naming that
+confusion.
 """
 from __future__ import annotations
 
-import os
-import sys
+import engine_identity
 
-
-def is_admin() -> bool:
-    return os.environ.get("SC_ADMIN") == "1"
+CONFUSION = (
+    "shared instance serialization is an Admin step: your `sc mem` write is "
+    "already live in the engine DB, and re-serializing from a shell dirties "
+    "the shared tree and can collide with another serialization."
+)
 
 
 def require_admin(op: str) -> None:
-    """Exit with a clear message unless SC_ADMIN=1 is set."""
-    if is_admin():
-        return
-    sys.exit(
-        f"{op}: refused — serializing shared instance state is an admin/GUI step.\n"
-        "  Your write is already live in the engine DB and shared with every shell.\n"
-        "  To refresh the ignored local snapshot, use Save locally, or as admin:\n"
-        "    SC_ADMIN=1 ./sc snapshot && SC_ADMIN=1 ./sc render flat"
-    )
+    """Exit with the confusion-first refusal unless the caller may serialize."""
+    engine_identity.require_maintainer(op, CONFUSION)

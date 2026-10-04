@@ -567,7 +567,6 @@ def persist_instance(con) -> Path:
 
 
 def _main_under_lease() -> int:
-    require_admin("snapshot")
     copied = artifact_policy.prepare_local_state()
     if copied:
         print(f"snapshot: localized {len(copied)} existing artifact(s)")
@@ -716,7 +715,11 @@ def _snapshot_via_runtime_api() -> str | None:
 
 def main(*, lease_held: bool = False, runtime_owned: bool = False) -> int:
     instance_state.active_database_path(ENGINE)
-    require_admin("snapshot")
+    if not lease_held:
+        # An in-process caller already holding the exclusive maintenance lease
+        # (update's cutover) passed the maintenance gate to acquire it; its
+        # ambient shell identity must not decide a mid-cutover serialization.
+        require_admin("snapshot")
     if runtime_owned:
         return _main_runtime_owned()
     if not lease_held:

@@ -56,15 +56,23 @@ def run_update_compat() -> None:
     where newly materialized code can finish that first adoption run.
 
     The bridge reconciles owner-private engine state and host registrations.
-    Cartographer shells only need hook wiring and mapping, including on the
-    host where their API token does not grant private-state access. Install
-    and legacy operator updates have no shell token; current updates explicitly
-    set SC_ADMIN=1 on this subprocess.
+    Cartographer shells only need hook wiring and mapping. Whether the caller
+    maintains the instance is resolved from its bearer token by
+    ``engine_identity`` (the check engine SQL and serialization share):
+    install, update and the host operator carry no shell token and run the
+    bridge, as does Admin; any other launched shell skips it, and says so.
     """
     if os.environ.get("SC_SANDBOX"):
         return
-    if os.environ.get("SC_API_TOKEN") and os.environ.get("SC_ADMIN") != "1":
-        return
+    if os.environ.get("SC_API_TOKEN"):
+        import engine_identity
+
+        if not engine_identity.resolve().maintains_instance:
+            print("map-setup: skipped the owner update bridge — it reconciles "
+                  "owner-private engine state that only Admin or the host "
+                  "operator maintains, and this launched shell is neither; "
+                  "hook wiring and mapping continue.")
+            return
     script = ENGINE / "scripts" / "update_compat.py"
     if not script.is_file():
         return
