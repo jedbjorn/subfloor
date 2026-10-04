@@ -59,6 +59,7 @@ import conversation_boot  # noqa: E402
 import db_driver  # noqa: E402
 import devkit  # noqa: E402
 import execution_view  # noqa: E402  — which seats receive engine maintenance paths
+import run_seat
 import git_freshness  # noqa: E402
 import git_prune  # noqa: E402  — boot-time prune of provably-merged local branches
 import global_pointer  # noqa: E402
@@ -1961,6 +1962,8 @@ def prepare_launch(*, shell_id: int, harness: "str | None" = None,
     work_repo_note = declared_work_repo_note(REPO_ROOT)
 
     launch_mode = execution_mode()
+    seat = run_seat.select(chosen["flavor"], headless=headless)
+    conversion = run_seat.conversion_status(harness, seat, render_only=bool(os.environ.get("RENDER_ONLY")))
     repair_mode = bool(os.environ.get("SC_DEVKIT_REPAIR"))
     content = conversation_boot.resolve_boot(
         con,
@@ -1979,7 +1982,8 @@ def prepare_launch(*, shell_id: int, harness: "str | None" = None,
             ),
             api_key=full["api_key"],
             api_port=api_port,
-            launch_mode=launch_mode),
+            launch_mode=launch_mode,
+            seat=seat, conversion=conversion),
     )
     render_harness_skills(
         con, full["shell_id"], work_dir, adapter
@@ -2096,6 +2100,8 @@ def prepare_launch(*, shell_id: int, harness: "str | None" = None,
     # name + shortname — a refusal beats a misattributed or failed commit.
     env.update(shell_git_ident_env(full))
     env["SC_HARNESS"] = harness
+    run_seat.inject(env, seat)
+    run_seat.inject_conversion(env, conversion)
     env["SC_SHELL_WORKTREE"] = str(work_dir)
     if shell_view.maintenance_environment:
         env["SC_ENGINE_DIR"] = str(ENGINE)
@@ -2500,6 +2506,8 @@ def main() -> None:
 
         spinner.label = "rendering boot doc + skills"
         launch_mode = execution_mode()
+        seat = run_seat.select(chosen["flavor"], headless=headless)
+        conversion = run_seat.conversion_status(harness, seat, render_only=bool(os.environ.get("RENDER_ONLY")))
         repair_mode = bool(os.environ.get("SC_DEVKIT_REPAIR"))
         content = compose_boot(con, full, user, session_id, archive_id,
                                work_dir=work_dir if work_dir != REPO_ROOT else None,
@@ -2514,7 +2522,8 @@ def main() -> None:
                                ),
                                api_key=full["api_key"],
                                api_port=api_port,
-                               launch_mode=launch_mode)
+                               launch_mode=launch_mode,
+                               seat=seat, conversion=conversion)
 
         # Render this shell's granted skills to every directory declared by the
         # selected harness — gitignored and rebuilt per boot.
@@ -2702,6 +2711,8 @@ def main() -> None:
     # Admin keeps the engine-path fast path for maintenance hooks. Every other
     # seat uses the env-independent git-common-dir resolution instead.
     env["SC_HARNESS"] = harness
+    run_seat.inject(env, seat)
+    run_seat.inject_conversion(env, conversion)
     env.pop("SC_OPENCODE_ENFORCED_MODEL", None)
     if controlled_opencode_route:
         # This narrows one Admin turn; it is not an authorization signal.

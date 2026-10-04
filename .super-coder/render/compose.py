@@ -19,6 +19,7 @@ ENGINE = Path(__file__).resolve().parents[1]
 TEMPLATE_PATH = ENGINE / "templates" / "boot.md"
 sys.path.insert(0, str(ENGINE / "scripts"))
 import artifact_policy  # noqa: E402
+import run_seat  # noqa: E402
 
 # Rendered into ORIENTATION for every shell EXCEPT the cartographer (who owns the
 # map and heals discrepancies directly — telling it to report them to itself is
@@ -592,7 +593,9 @@ def compose_boot(con: sqlite3.Connection, shell, user, session_id: str,
                  devkit_declared: bool = False,
                  devkit_repair: bool = False,
                  dev_tools: "dict | None" = None,
-                 launch_mode: str = "container") -> str:
+                 launch_mode: str = "container",
+                 seat: str | None = None,
+                 conversion: dict | None = None) -> str:
     """Assemble the full boot markdown for `shell`, driven by `user`.
 
     work_dir, when set, is the shell's effective working directory (dev-shell
@@ -627,6 +630,7 @@ def compose_boot(con: sqlite3.Connection, shell, user, session_id: str,
     )
     template = template.replace(
         "{{execution_context}}", render_execution_context(flavor, launch_mode)
+        + run_seat.boot_block(flavor, seat, conversion)
     )
     dev_tools_block = render_dev_tools(flavor, dev_tools)
     if dev_tools_block:

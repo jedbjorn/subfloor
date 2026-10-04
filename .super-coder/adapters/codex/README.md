@@ -178,3 +178,18 @@ bwrap-backed policy that cannot start on this host (see Permission stance).
 refused alongside `--ask-for-approval`, verbatim on 0.155.1. `codex sandbox --
 pwd` still fails with `bwrap: Failed to make / slave: Operation not permitted`
 on this host, so `danger-full-access` remains the only runnable policy here.
+
+## Runs inventory (0.160.0)
+
+The Runs lane inspected installed `codex exec` help, config/features and native
+scratch transcripts on 2026-10-04. Unified execution exposes `exec_command`
+and `write_stdin`; a command can yield a session handle while the model
+continues. The exposed tool inventory also includes timer and multi-agent
+operations. Availability alone establishes no lifetime guarantee.
+
+A measured native exec probe started `sleep 120`, yielded handle `57449`, and
+finished the CLI after 11.08 seconds. Its observed child process incarnation
+was gone at CLI exit. This proves no durable detachment for that native exec
+session. Multi-agent lifetime and explicit OS detachment were not asserted.
+GUI long work therefore continues through `sc job`; no Codex conversion hook
+is introduced by this lane.
