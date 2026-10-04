@@ -77,11 +77,9 @@ toplevel_of() { git -C "$1" rev-parse --show-toplevel 2>/dev/null || echo ""; }
 
 # The shell's HOME worktree — the tree it is MEANT to edit in. run.py exports
 # SC_SHELL_WORKTREE (the dir it exec's the harness from) for every non-admin
-# shell. "Outside your worktree" is judged against THIS, not the live cwd: a
-# planner/dev/reviewer whose cwd has drifted to the repo root (to run a
-# root-level command) is still working correctly when it edits into its own
-# worktree, so it must not be warned. Falls back to the cwd for callers run.py
-# didn't launch — the git pre-commit backstop, which has no SC_SHELL_WORKTREE.
+# shell. A protected-branch refusal names it as the place to edit instead.
+# Falls back to the cwd for callers run.py didn't launch — the git pre-commit
+# backstop, which has no SC_SHELL_WORKTREE.
 home_toplevel() {
   if [ -n "${SC_SHELL_WORKTREE:-}" ] && [ -d "${SC_SHELL_WORKTREE}" ]; then
     toplevel_of "$SC_SHELL_WORKTREE"

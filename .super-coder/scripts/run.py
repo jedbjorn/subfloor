@@ -2695,11 +2695,9 @@ def main() -> None:
             "selector": controlled_opencode_route.selector,
         }, separators=(",", ":"))
     # The shell's HOME worktree — the dir we exec the harness from (below). The
-    # branch-guard reads it to judge "outside your worktree" against the assigned
-    # tree, not the live cwd: a shell whose cwd has drifted to the repo root (to
-    # run a root-level command) is still working correctly when it edits into its
-    # own worktree, and must not be warned. For admin this is REPO_ROOT, but admin
-    # exits the guard earlier via SC_SHELL_FLAVOR, so it never reads this.
+    # branch-guard names it as the place to edit when it refuses a protected
+    # branch. For admin this is REPO_ROOT, but admin exits the guard earlier via
+    # SC_SHELL_FLAVOR, so it never reads this.
     env["SC_SHELL_WORKTREE"] = str(work_dir)
     # cwd-proofing (the recurring "my edits vanished" trap). The engine + its live
     # DBs sit at the MAIN worktree root, but the harness is exec'd from the shell's

@@ -122,6 +122,12 @@ class BranchGuardTest(unittest.TestCase):
             subprocess.run(["git", "checkout", "-q", "main"],
                            cwd=self.repo, check=True, capture_output=True)
 
+    @unittest.skipIf(
+        any(str(Path.home().resolve()).startswith(root) for root in
+            ("/tmp/", "/var/tmp/", "/dev/shm/",
+             *([os.environ["TMPDIR"].rstrip("/") + "/"] if os.environ.get("TMPDIR") else []))),
+        "HOME is under a scratch root the guard allows outright; the case would be vacuous",
+    )
     def test_cross_tree_feature_branch_edit_is_allowed_silently(self):
         """Ledger A2 retired (spec #267 U3): an edit outside SC_SHELL_WORKTREE on
         a feature branch is allowed with no warning, because engine commands now
