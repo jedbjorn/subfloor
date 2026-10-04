@@ -132,6 +132,7 @@
     "tests/sprint_route_binding_support.py",
     "tests/test_activity_monitor.py",
     "tests/test_callable_floor.py",
+    "tests/test_caller_root_resolution.py",
     "tests/test_dos_app_sprint_canary.py",
     "tests/test_focused_dev_verification.py",
     "tests/test_harness_surfaces.py",
@@ -875,7 +876,7 @@
       ],
       ".super-coder/scripts/dispatch.sh": [
         "./sc sprint <cmd>        authenticated Sprints v2 actions (run without a command for the full verb list)",
-        "sprint)       sc_python_probe; exec \"$PY\" \"$S/sprint_cli.py\" \"$@\" ;;",
+        "sprint)       sc_python_probe; sc_project_env; exec \"$PY\" \"$S/sprint_cli.py\" \"$@\" ;;",
         "Memory & catalogue    mem · context · skill · search · models · job · pr · sprint · token · analytics"
       ],
       "docs/README.md": [

@@ -1285,9 +1285,9 @@ case "$cmd" in
                     "$(sc_engine_db) -> $("$PY" "$S/artifact_policy.py" path content)"
                 fi
                 exec "$PY" "$S/snapshot.py" ;;
-  # mem/sprint/skill/job/vm/remote read operator-named files (--body-file,
-  # --readiness-file, --file, --command-file) from the invocation cwd and are
-  # otherwise API clients of the live instance.
+  # Verbs below that take operator-named files (--body-file, --result-file,
+  # --file, --command-file) read them from the invocation cwd; they are
+  # otherwise clients of the live instance.
   mem)          sc_project_env; exec "$PY" "$S/mem.py" "$@" ;;
   pr)           exec "$PY" "$S/pr_cli.py" "$@" ;;
   sprint)       sc_python_probe; sc_project_env; exec "$PY" "$S/sprint_cli.py" "$@" ;;
