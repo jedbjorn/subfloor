@@ -38,11 +38,6 @@ class ExtractorInstallTest(unittest.TestCase):
         self.source_dir.mkdir(parents=True)
         self.local = self.root / "engine-state" / ".sc-state" / "local"
         self.map_root_patch = mock.patch.object(map_repo, "MAP_ROOT", self.live)
-        # Installed extractors live with the live install, apart from the scan.
-        self.extractor_root_patch = mock.patch.object(
-            map_repo, "EXTRACTOR_ROOT", self.live)
-        self.extractor_root_patch.start()
-        self.addCleanup(self.extractor_root_patch.stop)
         self.local_patch = mock.patch.object(artifact_policy, "LOCAL_DIR", self.local)
         self.map_root_patch.start()
         self.local_patch.start()

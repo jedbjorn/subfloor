@@ -61,11 +61,6 @@ class MapFinalizeTest(unittest.TestCase):
             "COMMIT;\n"
         )
         self.map_root_patch = mock.patch.object(map_repo, "MAP_ROOT", self.live)
-        # Installed extractors live with the live install, apart from the scan.
-        self.extractor_root_patch = mock.patch.object(
-            map_repo, "EXTRACTOR_ROOT", self.live)
-        self.extractor_root_patch.start()
-        self.addCleanup(self.extractor_root_patch.stop)
         self.local_patch = mock.patch.object(artifact_policy, "LOCAL_DIR", self.local)
         self.map_root_patch.start()
         self.local_patch.start()
@@ -313,7 +308,7 @@ class MapFinalizeTest(unittest.TestCase):
         dispatch = (ENGINE / "scripts" / "dispatch.sh").read_text()
         self.assertIn('finalize)  shift', dispatch)
         self.assertIn('exec "$PY" "$S/map_finalize.py" "$@"', dispatch)
-        self.assertIn('exec "$PY" "$S/map_repo.py" "$@" ;;', dispatch)
+        self.assertIn('exec "$PY" "$S/map_repo.py" ;;', dispatch)
 
 
 if __name__ == "__main__":

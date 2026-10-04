@@ -133,20 +133,49 @@ print("{}|{}|{}".format(executable, version, sqlite3.sqlite_version))
 }
 
 # --- caller-root resolution for project-subject verbs (spec #267 U3) ----------
-# A command whose subject is the shell's PROJECT (dev-kit hooks, visual QA, the
-# tree the map scans, task context's declared hooks, operator-named body files)
-# resolves from the CALLER checkout; one whose subject is the LIVE instance
-# resolves from LIVE_ROOT and refuses from a linked worktree (sc_refuse_linked).
-# No command mixes the two. The live engine's scripts would otherwise compute
-# their project as ENGINE.parent — the main checkout — from every worktree.
-# This exports the caller identity for the ONE command a project arm runs;
-# scripts/project_root.py honors it only inside the engine named here, and the
+# A command whose subject is the shell's PROJECT (dev-kit hooks, visual QA,
+# task context's declared hooks, operator-named body files) resolves from the
+# CALLER checkout; one whose subject is the LIVE instance resolves from
+# LIVE_ROOT. No command mixes the two. The live engine's scripts would otherwise
+# compute their project as ENGINE.parent — the main checkout — from every
+# worktree. This exports the caller identity for the ONE command a project arm
+# runs; scripts/project_root.py honors it only inside this engine, and the
 # scripts that spawn fork code strip it from that code's environment.
-sc_project_env() {  # $1 = the engine directory whose scripts the arm executes
+sc_project_env() {
   SC_PROJECT_ROOT="$CALLER_ROOT"
   SC_INVOCATION_CWD="$sc_invocation_cwd"
-  SC_PROJECT_ENGINE="${1:-$ENGINE}"
+  SC_PROJECT_ENGINE="$ENGINE"
   export SC_PROJECT_ROOT SC_INVOCATION_CWD SC_PROJECT_ENGINE
+}
+
+# The dr_* catalogue is live-instance state whose subject is the install's
+# main line (decision #429): the declared work repo, else the live root — never
+# the caller. Run from a linked worktree, map/map-setup/map finalize still map
+# that subject; this names the confusion first and the target's staleness from
+# its existing refs (no fetch), so the shared index is never re-pointed at a
+# feature branch and its authored descriptions are never pruned by one.
+sc_map_notice() {  # $1 = the command as typed
+  [ "$LINKED" -eq 1 ] || return 0
+  _target="$LIVE_ROOT"
+  _what="the main checkout"
+  _work="$("$PY" -c 'import json, sys
+try:
+    print((json.load(open(sys.argv[1])).get("work_repo") or "").strip())
+except (OSError, ValueError, AttributeError):
+    print("")' "$ENGINE/instance.json" 2>/dev/null || true)"
+  if [ -n "$_work" ] && [ -d "$_work" ]; then
+    _target="$_work"
+    _what="this install's declared work repo"
+  fi
+  _branch="$(git -C "$_target" rev-parse --abbrev-ref HEAD 2>/dev/null || echo '?')"
+  _sha="$(git -C "$_target" rev-parse --short HEAD 2>/dev/null || echo '?')"
+  _behind=""
+  _up="$(git -C "$_target" rev-parse --abbrev-ref --symbolic-full-name '@{u}' 2>/dev/null || true)"
+  if [ -n "$_up" ]; then
+    _n="$(git -C "$_target" rev-list --count 'HEAD..@{u}' 2>/dev/null || echo 0)"
+    [ "${_n:-0}" -gt 0 ] 2>/dev/null && _behind=", behind $_up by $_n"
+  fi
+  echo "sc $1: the catalogue is one shared index of $_what, not of this worktree; mapping $_target ($_branch@$_sha$_behind) instead of $CALLER_ROOT." >&2
 }
 
 sc_mapdb() {
@@ -1354,28 +1383,30 @@ case "$cmd" in
                   exit 1
                 fi
                 exec "$PY" "$CALLER_ENGINE/scripts/render_check.py" ;;
-  # map/map-setup SCAN the caller checkout (the Cartographer's worktree) into
-  # the live catalogue; the catalogue, its config and installed extractors stay
-  # with the live instance. `--auto` is the remap hooks' form: it refreshes only
-  # when the caller is the tree the catalogue already maps, so a branch switch
-  # in some other worktree never re-points the shared catalogue.
+  # map/map-setup/map finalize act on the live catalogue's subject, never the
+  # caller (decision #429; sc_map_notice). `--auto` is the remap hooks' form:
+  # it refreshes only when the hook fires in the live root, and is a silent
+  # no-op in a linked worktree, whose branch switches are not the index's.
   map)          case "${1:-}" in
-                  -h|--help) echo "usage: ./sc map [--auto | finalize [--json]] — refresh the dr_* catalogue from this checkout, or report Cartographer completion"
-                             echo "  --auto  refresh only when this checkout is the tree the catalogue maps (the auto-remap hooks' form)"
+                  -h|--help) echo "usage: ./sc map [--auto | finalize [--json]] — refresh the dr_* catalogue of the main checkout (or declared work repo), or report Cartographer completion"
+                             echo "  --auto  the auto-remap hooks' form: refresh from the main checkout; a silent no-op in a linked worktree"
                              exit 0 ;;
                   finalize)  shift
-                             sc_project_env
+                             sc_map_notice "map finalize"
                              exec "$PY" "$S/map_finalize.py" "$@" ;;
                   --auto)    if [ $# -ne 1 ]; then
                                echo "sc map: unknown argument '$2' (-h for usage)" >&2
                                exit 2
-                             fi ;;
+                             fi
+                             [ "$LINKED" -eq 0 ] || exit 0
+                             exec "$PY" "$S/map_repo.py" ;;
                   ?*)        echo "sc map: unknown argument '$1' (-h for usage)" >&2
                              exit 2 ;;
                 esac
-                sc_project_env
-                exec "$PY" "$S/map_repo.py" "$@" ;;
-  map-setup)    sc_project_env; exec "$PY" "$S/map_setup.py" "$@" ;;
+                sc_map_notice map
+                exec "$PY" "$S/map_repo.py" ;;
+  map-setup)    sc_help_form "$@" || sc_map_notice map-setup
+                exec "$PY" "$S/map_setup.py" "$@" ;;
   # Token & session analytics — sweep each harness's on-disk usage data for
   # THIS repo into session_token_usage (incremental, idempotent; doc #11).
   analytics)    exec "$PY" "$S/analytics.py" "$@" ;;
@@ -1964,7 +1995,7 @@ Subfloor — forkable shell substrate — full command reference (./sc help for 
   ./sc analytics sweep     parse each harness's on-disk token usage for this repo into session_token_usage
                              (incremental + idempotent; --harness <name> · --quiet · --full re-parses everything).
                              Also runs at boot and behind the GUI Analytics tab
-  ./sc map                 scan the host repo into the dr_* catalogue (re-runnable)
+  ./sc map [--auto]        scan the main checkout (or declared work repo) into the dr_* catalogue (re-runnable); --auto = hooks form, no-op in a worktree
   ./sc map finalize [--json]
                            refresh + report live/snapshot/install/source/Admin/notice/flag evidence; never owns those actions
   ./sc map-extractor install <worktree-file>

@@ -285,7 +285,7 @@ def _same_receipt(existing: bytes | None, desired: dict[str, object]) -> bool:
 def install_extractor(candidate: Candidate) -> InstallResult:
     with _install_lock():
         target_dir = _prepare_directory_beneath(
-            map_repo.EXTRACTOR_ROOT,
+            map_repo.MAP_ROOT,
             Path(".sc-state") / "map_extractors",
         )
         receipt_dir = _prepare_directory_beneath(

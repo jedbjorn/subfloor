@@ -6,8 +6,7 @@ The repo map (dr_* catalogue) is kept fresh by tracked git hooks that re-run
 `.super-coder/hooks/` and fire via `core.hooksPath` — a *per-clone* git setting,
 so a fresh clone needs this run once to point git at them. In an external-work
 install, the hooks always remain on this HOME clone; only the map scan moves to
-the declared project. Without one, the scan is the checkout that invoked `sc`
-(the Cartographer's worktree), while the hooks stay wired to this clone. This:
+the declared project. This:
 
     1. completes any one-time legacy update bridge materialized by an older
        updater process

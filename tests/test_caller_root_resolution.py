@@ -14,6 +14,11 @@ one acted on and the main-checkout marker never is.
 One test per verb, named after it, so an issue can cite
 ``tests/test_caller_root_resolution.py::<Class>::test_<verb>``.
 
+The dr_* catalogue is the deliberate exception (decision #429): it is
+live-instance state whose subject is the install's main line, so ``map``,
+``map-setup`` and ``map finalize`` from a worktree map the LIVE root and say so
+(``CatalogueSubjectTest``); only an extractor candidate path is caller-resolved.
+
 The engine under test is copied from this checkout; the fixture never reads a
 live ``instance.json`` and runs with the ambient engine environment scrubbed
 and a private XDG state home.
@@ -54,8 +59,11 @@ SCRUB = (
     "SC_CALLER_ROOT", "SC_DISPATCH", "SC_SANDBOX", "SC_ADMIN", "SC_MEM_CREDENTIAL_FILE",
     "SC_DEVKIT_OUTPUT", *project_root.VARIABLES,
 )
+# A global core.hooksPath (or any global/system git config) must never fire
+# inside the fixture's git operations.
 GIT_ENV = {"GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
-           "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"}
+           "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t",
+           "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1"}
 
 
 def git(cwd: Path, *args: str) -> str:
@@ -277,70 +285,6 @@ class ProjectVerbTest(CallerRootFixture):
         self.assertTrue((self.wt / workflows).is_file())
         self.assertFalse((self.main / workflows).exists())
 
-    def test_map(self):
-        done = self.sc(self.wt, "map", cwd=self.wt / "sub")
-        self.assert_ok(done)
-        root, paths = self.map_repo_row()
-        self.assertEqual(root, str(self.wt))
-        self.assertIn("wt_only.txt", paths)
-        self.assertNotIn("main_only.txt", paths)
-
-    def test_map_auto(self):
-        """The remap hooks' form keeps the mapped tree fresh and never lets a
-        branch switch in another worktree re-point the shared catalogue."""
-        self.assert_ok(self.sc(self.wt, "map"))
-        skipped = self.sc(self.dev, "map", "--auto")
-        self.assert_ok(skipped)
-        self.assertIn("--auto skipped", skipped.stdout)
-        self.assertEqual(self.map_repo_row()[0], str(self.wt))
-        refreshed = self.sc(self.wt, "map", "--auto")
-        self.assert_ok(refreshed)
-        self.assertIn("map_repo:", refreshed.stdout)
-        self.assertNotIn("skipped", refreshed.stdout)
-        self.assertEqual(self.map_repo_row()[0], str(self.wt))
-
-    def test_map_setup(self):
-        # A shell token marks a launched seat: the owner-only update bridge is
-        # skipped, exactly as for a Cartographer shell.
-        done = self.sc(self.wt, "map-setup", SC_API_TOKEN="fixture-shell-token")
-        self.assert_ok(done)
-        root, paths = self.map_repo_row()
-        self.assertEqual(root, str(self.wt))
-        self.assertNotIn("main_only.txt", paths)
-        # The hooks stay wired to the live engine: one clone, one hook set.
-        self.assertEqual(git(self.wt, "config", "--get", "core.hooksPath"),
-                         str(self.main / ".super-coder" / "hooks"))
-
-    def test_map_extractor(self):
-        """A candidate named relative to the operator's cwd installs into the
-        live install; the next map runs it against the caller's tree."""
-        source_dir = self.wt / ".sc-state" / "map_extractors"
-        write(source_dir / "rootprobe.py",
-              "def extract(con, repo_root, cfg):\n"
-              "    return 'scanned ' + str(repo_root)\n")
-        self.addCleanup(shutil.rmtree, source_dir, ignore_errors=True)
-        installed = self.main / ".sc-state" / "map_extractors" / "rootprobe.py"
-        self.addCleanup(installed.unlink, missing_ok=True)
-        done = self.sc(self.wt, "map-extractor", "install", "rootprobe.py",
-                       cwd=source_dir, SC_SHELL_FLAVOR="cartographer",
-                       SC_SHELL_WORKTREE=str(self.wt))
-        self.assert_ok(done)
-        self.assertTrue(installed.is_file())
-        mapped = self.sc(self.wt, "map")
-        self.assert_ok(mapped)
-        self.assertIn(f"rootprobe: scanned {self.wt}", mapped.stdout)
-
-    def test_map_finalize(self):
-        self.assert_ok(self.sc(self.wt, "map"))
-        done = self.sc(self.wt, "map", "finalize", "--json")
-        rows = {row["key"]: row for row in json.loads(done.stdout)["rows"]}
-        live_map = rows["live_map"]
-        self.assertFalse(
-            [e for e in live_map["evidence"] if "repo identity mismatch" in e], live_map)
-        # The installed-extractor check reads the live install, not the worktree.
-        self.assertNotIn(str(self.wt / ".sc-state" / "map_extractors"),
-                         json.dumps(rows))
-
     def test_context(self):
         base = self.start_api({"resources": {"dev_hooks": {"state": "absent", "hooks": []}}})
         done = self.sc(self.wt, "context", "--task", "5", "--json", cwd=self.wt / "sub",
@@ -374,6 +318,8 @@ class ProjectVerbTest(CallerRootFixture):
     def test_sprint_request_review_readiness_file(self):
         posted = self.sprint_body("request-review", "--sprint", "1", "--registered-pr", "3",
                                   "--readiness-file", "../note.md", "--key", "k2")
+        # `../note.md` typed in wt/sub names the worktree root's file.
+        self.assertEqual(posted["readiness"], "WT-ROOT-BODY")
         self.assertNotIn("MAIN", json.dumps(posted))
 
     def test_mem_doc_body_file(self):
@@ -396,6 +342,216 @@ class ProjectVerbTest(CallerRootFixture):
         while time.monotonic() < deadline and "project_env=" not in log.read_text():
             time.sleep(0.1)
         self.assertEqual(log.read_text().split(), [str(self.wt / "sub"), "project_env=unset"])
+
+    def test_skill_put_file(self):
+        """A relative draft path is read from the subdirectory it was typed in."""
+        db = self.main / ".super-coder" / "shell_db.db"
+        con = sqlite3.connect(db)
+        con.executescript((self.main / ".super-coder" / "schema.sql").read_text())
+        if "api_key" not in {row[1] for row in con.execute("PRAGMA table_info(shells)")}:
+            con.execute("ALTER TABLE shells ADD COLUMN api_key TEXT")
+        con.execute("INSERT INTO shells (display_name, shortname, flavor, system_prompt, api_key) "
+                    "VALUES ('Planner', 'PLN1', 'planner', '', 'fixture-planner-token')")
+        con.commit()
+        con.close()
+        self.addCleanup(db.unlink, missing_ok=True)
+        write(self.wt / "sub" / "draft.md", "WT draft without frontmatter\n")
+        self.addCleanup((self.wt / "sub" / "draft.md").unlink, missing_ok=True)
+        done = self.sc(self.wt, "skill", "put", "--file", "draft.md", cwd=self.wt / "sub",
+                       SC_API_TOKEN="fixture-planner-token")
+        self.assertNotEqual(done.returncode, 0)
+        self.assertIn(f"sc skill: draft {self.wt / 'sub' / 'draft.md'}:", done.stderr)
+        self.assertNotIn("cannot read draft", done.stderr)
+
+    def command_file_case(self, *verb: str) -> None:
+        write(self.wt / "sub" / "cmd.sh", "echo WT\n")
+        self.addCleanup((self.wt / "sub" / "cmd.sh").unlink, missing_ok=True)
+        found = self.sc(self.wt, *verb, "--command-file", "cmd.sh", "--json",
+                        cwd=self.wt / "sub")
+        missing = self.sc(self.wt, *verb, "--command-file", "absent.sh", "--json",
+                          cwd=self.wt / "sub")
+        unreadable = "the command file could not be read as UTF-8"
+        self.assertIn(unreadable, missing.stdout + missing.stderr)
+        self.assertNotIn(unreadable, found.stdout + found.stderr)
+
+    def test_vm_command_file(self):
+        self.command_file_case("vm", "exec")
+
+    def test_remote_command_file(self):
+        self.command_file_case("remote", "exec", "fixture-box")
+
+    def test_actions_artifacts(self):
+        done = self.sc(self.wt, "actions-artifacts", "setup-ci", cwd=self.wt / "sub")
+        self.assert_ok(done)
+        workflow = ".github/workflows/subfloor-artifact-cleanup.yml"
+        self.assertTrue((self.wt / workflow).is_file())
+        self.assertFalse((self.main / workflow).exists())
+
+    def test_forged_identity_is_ignored(self):
+        """An inherited project identity naming main never redirects a worktree
+        command: the dispatcher clears it and re-derives the caller."""
+        done = self.sc(self.wt, "sprint", "send", "--sprint", "1", "--to", "PLN1",
+                       "--body-file", "note.md", "--key", "forged",
+                       cwd=self.wt / "sub", SC_API_BASE=self.start_api(),
+                       SC_API_TOKEN="fixture-shell-token",
+                       SC_PROJECT_ROOT=str(self.main),
+                       SC_INVOCATION_CWD=str(self.main / "sub"),
+                       SC_PROJECT_ENGINE=str(self.main / ".super-coder"))
+        self.assert_ok(done)
+        posts = [p for method, _path, p in _RecordingApi.requests if method == "POST"]
+        self.assertEqual(posts[-1]["body"], "WT-SUBDIR-BODY")
+        hooks = self.sc(self.wt, "deps", cwd=self.wt / "sub", SC_DEVKIT_OUTPUT="full",
+                        SC_PROJECT_ROOT=str(self.main),
+                        SC_PROJECT_ENGINE=str(self.main / ".super-coder"))
+        self.assert_ok(hooks)
+        self.assertIn("side=WT", hooks.stdout)
+        self.assertIn("project_env=unset", hooks.stdout)
+
+    def test_admin_seat_unchanged(self):
+        """From the main checkout, project verbs act on the main checkout, and a
+        relative file still resolves from the subdirectory typed in."""
+        deps = self.sc(self.main, "deps", cwd=self.main / "sub", SC_DEVKIT_OUTPUT="full")
+        self.assert_ok(deps)
+        self.assertIn(f"hook=deps side=MAIN devkit_root={self.main}", deps.stdout)
+        posted = None
+        done = self.sc(self.main, "sprint", "send", "--sprint", "1", "--to", "PLN1",
+                       "--body-file", "note.md", "--key", "admin", cwd=self.main / "sub",
+                       SC_API_BASE=self.start_api(), SC_API_TOKEN="fixture-shell-token")
+        self.assert_ok(done)
+        posted = [p for method, _path, p in _RecordingApi.requests if method == "POST"][-1]
+        self.assertEqual(posted["body"], "MAIN-SUBDIR-BODY")
+
+
+class CatalogueSubjectTest(CallerRootFixture):
+    """The dr_* catalogue maps the install's main line, never the caller
+    (decision #429): a worktree run maps the live root and names that first."""
+
+    def notice(self, verb: str) -> str:
+        return (f"sc {verb}: the catalogue is one shared index of the main checkout, "
+                f"not of this worktree; mapping {self.main} (main@")
+
+    def mapped(self) -> tuple[str, set[str], str]:
+        db = self.main / ".sc-state" / "local" / "map" / "map.db"
+        con = sqlite3.connect(db)
+        try:
+            root, at = con.execute(
+                "SELECT root, mapped_at FROM dr_repo WHERE repo_id=1").fetchone()
+            paths = {row[0] for row in con.execute("SELECT path FROM dr_filepath")}
+        finally:
+            con.close()
+        return root, paths, at
+
+    def describe(self, path: str, desc: str) -> None:
+        con = sqlite3.connect(self.main / ".sc-state" / "local" / "map" / "map.db")
+        try:
+            con.execute("UPDATE dr_filepath SET desc=? WHERE path=?", (desc, path))
+            con.commit()
+        finally:
+            con.close()
+
+    def desc_of(self, path: str) -> str | None:
+        con = sqlite3.connect(self.main / ".sc-state" / "local" / "map" / "map.db")
+        try:
+            row = con.execute("SELECT desc FROM dr_filepath WHERE path=?", (path,)).fetchone()
+        finally:
+            con.close()
+        return row[0] if row else None
+
+    def setUp(self):
+        self.assert_ok(self.sc(self.main, "map"))
+
+    def test_map(self):
+        """#1354: from a worktree the live root is mapped and the confusion named."""
+        done = self.sc(self.wt, "map", cwd=self.wt / "sub")
+        self.assert_ok(done)
+        first = done.stderr.splitlines()[0]
+        self.assertTrue(first.startswith(self.notice("map")), done.stderr)
+        self.assertTrue(first.endswith(f") instead of {self.wt}."), first)
+        self.assertNotIn("behind", first)
+        root, paths, _ = self.mapped()
+        self.assertEqual(root, str(self.main))
+        self.assertIn("main_only.txt", paths)
+        self.assertNotIn("wt_only.txt", paths)
+
+    def test_map_notice_names_staleness(self):
+        """The live root's staleness comes from its existing refs (no fetch)."""
+        tree = git(self.main, "rev-parse", "HEAD^{tree}")
+        ahead = git(self.main, "commit-tree", tree, "-p", "HEAD", "-m", "upstream")
+        git(self.main, "branch", "fixture-upstream", ahead)
+        git(self.main, "branch", "--set-upstream-to=fixture-upstream", "main")
+        self.addCleanup(git, self.main, "branch", "-D", "fixture-upstream")
+        self.addCleanup(git, self.main, "branch", "--unset-upstream", "main")
+        done = self.sc(self.wt, "map")
+        self.assert_ok(done)
+        self.assertIn(", behind fixture-upstream by 1) instead of", done.stderr)
+
+    def test_map_auto(self):
+        _, _, before = self.mapped()
+        silent = self.sc(self.wt, "map", "--auto")
+        self.assert_ok(silent)
+        self.assertEqual((silent.stdout, silent.stderr), ("", ""))
+        self.assertEqual(self.mapped()[2], before)
+        time.sleep(1.1)  # mapped_at has one-second resolution
+        refreshed = self.sc(self.main, "map", "--auto")
+        self.assert_ok(refreshed)
+        self.assertIn("map_repo:", refreshed.stdout)
+        self.assertEqual(refreshed.stderr, "")
+        self.assertNotEqual(self.mapped()[2], before)
+
+    def test_map_authored_descriptions_survive_worktree_map(self):
+        self.describe("main_only.txt", "Cartographer-authored description")
+        self.assert_ok(self.sc(self.wt, "map"))
+        self.assertEqual(self.desc_of("main_only.txt"), "Cartographer-authored description")
+
+    def test_map_finalize(self):
+        self.describe("main_only.txt", "Cartographer-authored description")
+        done = self.sc(self.wt, "map", "finalize", "--json")
+        self.assertTrue(done.stderr.startswith(self.notice("map finalize")), done.stderr)
+        rows = {row["key"]: row for row in json.loads(done.stdout)["rows"]}
+        self.assertFalse([e for e in rows["live_map"]["evidence"]
+                          if "repo identity mismatch" in e], rows["live_map"])
+        root, paths, _ = self.mapped()
+        self.assertEqual(root, str(self.main))
+        self.assertNotIn("wt_only.txt", paths)
+        self.assertEqual(self.desc_of("main_only.txt"), "Cartographer-authored description")
+
+    def test_map_setup(self):
+        done = self.sc(self.wt, "map-setup", SC_API_TOKEN="fixture-shell-token")
+        self.addCleanup(git, self.main, "config", "--unset", "core.hooksPath")
+        self.assert_ok(done)
+        self.assertTrue(done.stderr.startswith(self.notice("map-setup")), done.stderr)
+        root, paths, _ = self.mapped()
+        self.assertEqual(root, str(self.main))
+        self.assertNotIn("wt_only.txt", paths)
+        self.assertEqual(git(self.wt, "config", "--get", "core.hooksPath"),
+                         str(self.main / ".super-coder" / "hooks"))
+        helped = self.sc(self.wt, "map-setup", "--help")
+        self.assert_ok(helped)
+        self.assertEqual(helped.stderr, "")
+
+    def test_map_admin_seat(self):
+        done = self.sc(self.main, "map")
+        self.assert_ok(done)
+        self.assertEqual(done.stderr, "")
+        self.assertEqual(self.mapped()[0], str(self.main))
+
+    def test_map_extractor(self):
+        """The candidate path is caller-resolved; the install is the live one."""
+        source_dir = self.wt / ".sc-state" / "map_extractors"
+        write(source_dir / "rootprobe.py",
+              "def extract(con, repo_root, cfg):\n"
+              "    return 'scanned ' + str(repo_root)\n")
+        self.addCleanup(shutil.rmtree, source_dir, ignore_errors=True)
+        installed = self.main / ".sc-state" / "map_extractors" / "rootprobe.py"
+        self.addCleanup(installed.unlink, missing_ok=True)
+        done = self.sc(self.wt, "map-extractor", "install", "rootprobe.py",
+                       cwd=source_dir, SC_SHELL_FLAVOR="cartographer",
+                       SC_SHELL_WORKTREE=str(self.wt))
+        self.assert_ok(done)
+        self.assertTrue(installed.is_file())
+        mapped = self.sc(self.main, "map")
+        self.assert_ok(mapped)
+        self.assertIn(f"rootprobe: scanned {self.main}", mapped.stdout)
 
 
 class SourceCallerEngineTest(unittest.TestCase):
@@ -421,7 +577,8 @@ class SourceCallerEngineTest(unittest.TestCase):
 
     def sc(self, *args: str) -> subprocess.CompletedProcess:
         env = {k: v for k, v in os.environ.items() if k not in SCRUB}
-        env.update(XDG_STATE_HOME=str(self.state), SC_PYTHON=sys.executable)
+        env.update(XDG_STATE_HOME=str(self.state), HOME=str(self.state),
+                   SC_PYTHON=sys.executable, **GIT_ENV)
         return subprocess.run([str(self.wt / "sc"), *args], cwd=str(self.wt), env=env,
                               capture_output=True, text=True, timeout=600, check=False)
 
@@ -450,10 +607,11 @@ class DispatcherClassificationTest(unittest.TestCase):
     """The dispatcher exports the caller identity to project verbs only."""
 
     DISPATCH = (ENGINE / "scripts" / "dispatch.sh").read_text()
-    PROJECT = ("visual-qa", "map-setup", "map-extractor", "context", "sprint", "mem",
+    PROJECT = ("visual-qa", "map-extractor", "context", "sprint", "mem",
                "skill", "job", "actions-artifacts", "vm", "remote")
     LIVE = ("install", "update", "rollback", "rebuild", "migrate", "snapshot", "render",
-            "remove", "eject", "sql", "map-sql", "models", "analytics", "boot", "run")
+            "remove", "eject", "sql", "map-sql", "map-setup", "models", "analytics",
+            "boot", "run")
 
     def arm(self, verb: str) -> str:
         match = re.search(rf"(?m)^  {re.escape(verb)}\)\s+(.*)$", self.DISPATCH)
@@ -471,6 +629,10 @@ class DispatcherClassificationTest(unittest.TestCase):
         for verb in self.LIVE:
             with self.subTest(verb=verb):
                 self.assertNotIn("sc_project_env", self.arm(verb))
+
+    def test_catalogue_arms_never_export(self):
+        block = self.DISPATCH.split("\n  map)", 1)[1].split("\n  map-setup)", 1)[0]
+        self.assertNotIn("sc_project_env", block)
 
     def test_inherited_identity_is_cleared_before_dispatch(self):
         head = self.DISPATCH.split("sc_invocation_cwd=", 1)[0]
