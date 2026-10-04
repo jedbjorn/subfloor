@@ -57,7 +57,6 @@ _SERVER_PROCESS: subprocess.Popen | None = None
 _SERVER_ENDPOINT = SERVER_ENDPOINT
 _SERVER_PASSWORD: str | None = None
 _SERVER_LOG_HANDLE = None
-_CONTEXT_SERVERS: list[tuple[subprocess.Popen, Any]] = []
 
 MAX_CONNECTED_PROVIDERS = 256
 MAX_CONNECTED_MODELS = 2_000
@@ -636,87 +635,6 @@ def ensure_server(*, timeout: float = 10.0) -> tuple[str, str | None]:
         )
 
 
-def start_context_server(
-    context: ConversationContext,
-    *,
-    timeout: float = 10.0,
-) -> tuple[subprocess.Popen, Any, str, str]:
-    """Start one conversation server inside its canonical execution view."""
-    binary = shutil.which("opencode")
-    if not binary:
-        raise AdapterError(
-            "HARNESS_UNAVAILABLE",
-            "opencode executable is not installed",
-            retryable=True,
-        )
-    password = secrets.token_urlsafe(32)
-    port = _available_loopback_port()
-    endpoint = _server_endpoint(port)
-    env = dict(context.env)
-    env["OPENCODE_SERVER_PASSWORD"] = password
-    env.setdefault("OPENCODE_SERVER_USERNAME", "opencode")
-    env["OPENCODE_DISABLE_CLAUDE_CODE"] = "1"
-    SERVER_LOG.parent.mkdir(parents=True, exist_ok=True)
-    log_handle = SERVER_LOG.open("a")
-    command = context.execution_argv(
-        [
-            binary,
-            "serve",
-            "--hostname",
-            "127.0.0.1",
-            "--port",
-            str(port),
-            "--log-level",
-            "WARN",
-        ]
-    )
-    try:
-        process = subprocess.Popen(
-            command,
-            cwd=context.checked_worktree(),
-            stdin=subprocess.DEVNULL,
-            stdout=log_handle,
-            stderr=subprocess.STDOUT,
-            env=env,
-            start_new_session=True,
-        )
-    except OSError as exc:
-        log_handle.close()
-        raise AdapterError(
-            "HARNESS_UNAVAILABLE",
-            f"could not start restricted opencode serve: {exc}",
-            retryable=True,
-        ) from exc
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        if process.poll() is not None:
-            break
-        if _server_healthy(endpoint, password):
-            with _SERVER_LOCK:
-                _CONTEXT_SERVERS.append((process, log_handle))
-            return process, log_handle, endpoint, password
-        time.sleep(0.05)
-    exit_code = process.poll()
-    if exit_code is None:
-        process.terminate()
-        try:
-            process.wait(timeout=3)
-        except subprocess.TimeoutExpired:
-            process.kill()
-            process.wait(timeout=3)
-    log_handle.close()
-    detail = (
-        f"exited with code {exit_code}"
-        if exit_code is not None
-        else f"did not become healthy within {timeout:g}s"
-    )
-    raise AdapterError(
-        "HARNESS_UNAVAILABLE",
-        f"restricted opencode serve {detail}",
-        retryable=True,
-    )
-
-
 def stop_server() -> None:
     """Stop only the OpenCode server process this module started."""
     global _SERVER_PROCESS, _SERVER_ENDPOINT, _SERVER_PASSWORD
@@ -740,26 +658,6 @@ def stop_server() -> None:
         if _SERVER_LOG_HANDLE is not None:
             _SERVER_LOG_HANDLE.close()
             _SERVER_LOG_HANDLE = None
-
-
-def stop_context_servers() -> None:
-    """Stop restricted servers owned by this broker process."""
-    with _SERVER_LOCK:
-        servers = list(_CONTEXT_SERVERS)
-        _CONTEXT_SERVERS.clear()
-    for process, log_handle in servers:
-        _stop_context_server(process, log_handle)
-
-
-def _stop_context_server(process: subprocess.Popen, log_handle: Any) -> None:
-    if process.poll() is None:
-        process.terminate()
-        try:
-            process.wait(timeout=3)
-        except subprocess.TimeoutExpired:
-            process.kill()
-            process.wait(timeout=3)
-    log_handle.close()
 
 
 def provider_state() -> dict[str, Any]:
@@ -907,7 +805,6 @@ def connected_models(state: Mapping[str, Any] | None = None) -> list[dict[str, A
 
 
 atexit.register(stop_server)
-atexit.register(stop_context_servers)
 
 
 class OpenCodeAdapter(ConversationAdapter):
@@ -933,15 +830,11 @@ class OpenCodeAdapter(ConversationAdapter):
                 timeout=TURN_TIMEOUT_SECONDS,
             )
         else:
-            # A conversation's canonical context decides whether server launch
-            # is restricted.  Starting the global server here would happen
-            # before that policy exists and create an unwrapped side channel.
+            # The managed server starts on first use, not at construction:
+            # building an adapter (probe, catalogue) must not spawn a process.
             self.transport = None
-        self._context_server: subprocess.Popen | None = None
-        self._context_log = None
-        self._context_prefix: tuple[str, ...] = ()
 
-    def _ensure_global_transport(self) -> None:
+    def _ensure_transport(self) -> None:
         if self.transport is not None:
             return
         endpoint, password = ensure_server()
@@ -951,53 +844,9 @@ class OpenCodeAdapter(ConversationAdapter):
             timeout=TURN_TIMEOUT_SECONDS,
         )
 
-    def _ensure_context_transport(self, context: ConversationContext) -> None:
-        prefix = tuple(context.execution_prefix)
-        if self._context_server is not None:
-            if prefix != self._context_prefix:
-                raise AdapterError(
-                    "RESTRICTED_SHELL_VIEW_MISMATCH",
-                    "OpenCode adapter cannot reuse a different shell execution view",
-                )
-            if self._context_server.poll() is None:
-                return
-            raise AdapterError(
-                "HARNESS_UNAVAILABLE",
-                "restricted OpenCode server exited",
-                retryable=True,
-            )
-        if not prefix:
-            self._ensure_global_transport()
-            return
-        process, log_handle, endpoint, password = start_context_server(context)
-        self._context_server = process
-        self._context_log = log_handle
-        self._context_prefix = prefix
-        self.transport = UrlHttpTransport(
-            endpoint,
-            password=password,
-            timeout=TURN_TIMEOUT_SECONDS,
-        )
-
     def probe(self) -> ProbeResult:
         launch = self.manifest["launch"][0]
         return self._probe_result(command_version([launch, "--version"]))
-
-    def close(self) -> None:
-        process = self._context_server
-        log_handle = self._context_log
-        self._context_server = None
-        self._context_log = None
-        self._context_prefix = ()
-        if process is None or log_handle is None:
-            return
-        with _SERVER_LOCK:
-            _CONTEXT_SERVERS[:] = [
-                owned
-                for owned in _CONTEXT_SERVERS
-                if owned[0] is not process
-            ]
-        _stop_context_server(process, log_handle)
 
     @staticmethod
     def _bound_model(context: ConversationContext) -> str | None:
@@ -1253,7 +1102,7 @@ class OpenCodeAdapter(ConversationAdapter):
         return lock
 
     def start(self, context: ConversationContext, message: str) -> NativeTurn:
-        self._ensure_context_transport(context)
+        self._ensure_transport()
         worktree = context.checked_worktree()
         message = ensure_nonempty_message(message)
         self._prepare_shell_environment(context)
@@ -1290,7 +1139,7 @@ class OpenCodeAdapter(ConversationAdapter):
         context: ConversationContext,
         message: str,
     ) -> NativeTurn:
-        self._ensure_context_transport(context)
+        self._ensure_transport()
         message = ensure_nonempty_message(message)
         self._prepare_shell_environment(context)
         if (
@@ -1677,7 +1526,7 @@ class OpenCodeAdapter(ConversationAdapter):
         session_ref: str,
         context: ConversationContext,
     ) -> SessionInspection:
-        self._ensure_context_transport(context)
+        self._ensure_transport()
         worktree = context.checked_worktree()
         try:
             session = self.transport.request(

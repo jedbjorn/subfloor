@@ -144,7 +144,7 @@ class ClaudeAdapter(ConversationAdapter):
             transcript.stat().st_size if transcript.is_file() else 0
         )
         process = self.runner.spawn(
-            context.execution_argv(command),
+            command,
             cwd=worktree,
             env=merged_env(self.manifest, context),
         )

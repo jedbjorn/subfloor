@@ -226,7 +226,12 @@ sc_host_server_up() {
   systemctl --user stop "$HOST_SERVER_UNIT" >/dev/null 2>&1 || true
   : > "$HOST_SERVER_LOG"
   # systemd consumes one dollar-escape layer; the shell must receive $$.
-  if ! systemd-run --user --quiet --collect --unit "$HOST_SERVER_UNIT" -- \
+  # The transient unit starts from the user manager's environment, not this
+  # one. A non-default XDG_STATE_HOME selects where this install's private
+  # engine state lives, so carry it across or the server resolves a different
+  # (or missing) instance than the launcher that started it.
+  if ! systemd-run --user --quiet --collect --unit "$HOST_SERVER_UNIT" \
+      ${XDG_STATE_HOME:+"--setenv=XDG_STATE_HOME=$XDG_STATE_HOME"} -- \
       /bin/sh -c 'printf "%s\n" "$$$$" > "$1"; exec env SC_BIND=127.0.0.1 PYTHONUNBUFFERED=1 "$2" "$3" --port "$4" >> "$5" 2>&1' \
       sc-host-server "$HOST_SERVER_PID" "$PY" "$ENGINE/api/server.py" "$host_port" "$HOST_SERVER_LOG"; then
     echo "✗ host-runtime: systemd could not start $HOST_SERVER_UNIT" >&2

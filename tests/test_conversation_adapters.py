@@ -2472,63 +2472,46 @@ class ConversationAdapterTest(unittest.TestCase):
         self.assertTrue(adapter.interrupt(resumed).acknowledged)
         self.assertEqual(runner.processes[-1].signals, [signal.SIGINT])
 
-    def test_native_processes_receive_parent_owned_execution_prefix(self) -> None:
-        context = replace(
-            self.context,
-            execution_prefix=("view-helper", "--"),
-        )
+    def test_native_processes_launch_the_harness_argv_unwrapped(self) -> None:
+        """Decision #427: no execution-view helper precedes any harness argv."""
+        self.assertFalse(hasattr(self.context, "execution_prefix"))
+        self.assertFalse(hasattr(self.context, "execution_argv"))
 
         claude, claude_runner = self.build("claude")
-        claude.start(context, "contained")
-        self.assertEqual(claude_runner.calls[-1][0][:2], ["view-helper", "--"])
+        claude.start(self.context, "plain")
+        self.assertEqual(claude_runner.calls[-1][0][0], "claude")
 
         kimi, kimi_runner = self.build("kimi")
-        kimi.start(context, "contained")
-        self.assertEqual(kimi_runner.calls[-1][0][:2], ["view-helper", "--"])
+        kimi.start(self.context, "plain")
+        self.assertEqual(kimi_runner.calls[-1][0][0], "kimi")
 
         with mock.patch.object(codex_adapter, "JsonLineRpcProcess") as rpc_process:
             codex = CodexAdapter()
-            codex._transport(context)
-        self.assertEqual(
-            rpc_process.call_args.kwargs["argv"][:2],
-            ["view-helper", "--"],
-        )
+            codex._transport(self.context)
+        self.assertEqual(rpc_process.call_args.kwargs["argv"][0], "codex")
 
         for surface in ("browser", "sprint"):
             with self.subTest(surface=surface):
-                restricted = replace(
-                    context,
-                    env={**context.env, "SC_CONVERSATION_SURFACE": surface},
+                context = replace(
+                    self.context,
+                    env={**self.context.env, "SC_CONVERSATION_SURFACE": surface},
                 )
-                restricted_server = mock.Mock()
-                restricted_server.poll.return_value = None
-                restricted_log = mock.Mock()
                 native = FakeOpenCode()
                 with mock.patch.object(
                     opencode_adapter,
                     "ensure_server",
+                    return_value=("http://127.0.0.1:12345", "password"),
                 ) as ensure_server, mock.patch.object(
-                    opencode_adapter,
-                    "start_context_server",
-                    return_value=(
-                        restricted_server,
-                        restricted_log,
-                        "http://127.0.0.1:12345",
-                        "password",
-                    ),
-                ) as start_context_server, mock.patch.object(
                     opencode_adapter,
                     "UrlHttpTransport",
                     return_value=native,
                 ):
                     opencode = OpenCodeAdapter()
                     ensure_server.assert_not_called()
-                    opencode.start(restricted, "contained")
-                    ensure_server.assert_not_called()
-                    opencode.close()
-                start_context_server.assert_called_once_with(restricted)
-                restricted_server.terminate.assert_called_once_with()
-                restricted_log.close.assert_called_once_with()
+                    opencode.start(context, "plain")
+                    opencode.start(context, "again")
+                ensure_server.assert_called_once_with()
+                self.assertFalse(hasattr(opencode_adapter, "start_context_server"))
 
     def test_claude_resume_accepts_resolved_worktree_descendants(self) -> None:
         adapter, runner = self.build("claude")

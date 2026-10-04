@@ -311,6 +311,33 @@ class HostRuntimeLifecycleTest(unittest.TestCase):
         self.assertFalse(self.fx.health())
         self.assert_no_docker()
 
+    def _systemd_run_line(self) -> str:
+        lines = [line for line in self.fx.calls() if line.startswith("systemd-run ")]
+        self.assertEqual(len(lines), 1, self.fx.calls())
+        return lines[0]
+
+    def test_launch_carries_a_custom_state_home_into_the_server_unit(self):
+        state_home = str(self.fx.home / "custom state")
+        self.fx.env["XDG_STATE_HOME"] = state_home
+        result = self.fx.run("launch")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        line = self._systemd_run_line()
+        options = line.split(" -- ", 1)[0]
+        self.assertIn(f"--setenv=XDG_STATE_HOME={state_home}", options)
+
+    def test_launch_sets_no_state_home_when_the_launcher_has_none(self):
+        for value in (None, ""):
+            with self.subTest(value=value):
+                if value is None:
+                    self.fx.env.pop("XDG_STATE_HOME", None)
+                else:
+                    self.fx.env["XDG_STATE_HOME"] = value
+                self.fx.log.unlink(missing_ok=True)
+                result = self.fx.run("launch")
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertNotIn("--setenv", self._systemd_run_line())
+                self.assertEqual(self.fx.run("down").returncode, 0)
+
     def test_down_without_a_server_is_a_calm_no_op(self):
         result = self.fx.run("down")
         self.assertEqual(result.returncode, 0, result.stderr)

@@ -156,11 +156,11 @@ class FakeAdapter:
 
 
 class RecoveryExecutionAdapter(FakeAdapter):
-    """Capture the server argv that recovery hands to an adapter."""
+    """Capture the recovered context that recovery hands to an adapter."""
 
     def __init__(self, harness: str) -> None:
         super().__init__(harness=harness)
-        self.execution_argvs: list[list[str]] = []
+        self.contexts: list[ConversationContext] = []
         self.surfaces: list[str | None] = []
 
     def reconcile(
@@ -168,9 +168,7 @@ class RecoveryExecutionAdapter(FakeAdapter):
         turn: NativeTurn,
         context: ConversationContext,
     ) -> ReconcileResult:
-        self.execution_argvs.append(
-            context.execution_argv([self.harness, "inspection-server"])
-        )
+        self.contexts.append(context)
         self.surfaces.append(context.env.get("SC_CONVERSATION_SURFACE"))
         return super().reconcile(turn, context)
 
@@ -190,7 +188,6 @@ class RecoveryExecutionPreparer:
             effort=run.effort,
             env={"SC_CONVERSATION_SURFACE": self.surface},
             conversation_id=run.conversation_id,
-            execution_prefix=("landlock-view", "--"),
         )
 
 
@@ -198,7 +195,7 @@ class RefusingRecoveryPreparer:
     def recovery(self, _run: BrokerRun) -> ConversationContext:
         raise AdapterError(
             "CONVERSATION_LAUNCH_REFUSED",
-            "restricted execution view preflight failed",
+            "shell_id 1 is not launchable by 'operator'",
         )
 
 
@@ -1734,15 +1731,17 @@ class StoreContractTest(ConversationBrokerCase):
 
 
 class ServiceContractTest(ConversationBrokerCase):
-    def _assert_recovery_execution_view(self, harness: str, surface: str) -> None:
+    def test_browser_codex_recovery_reconciles_with_the_recovered_context(
+        self,
+    ) -> None:
         _conversation_id, _message_id, run_id = self.add_live_run(
             state="running",
-            session_after=f"{harness}-session",
-            runner_ref=f"{harness}-run",
-            harness=harness,
+            session_after="codex-session",
+            runner_ref="codex-run",
+            harness="codex",
         )
-        adapter = RecoveryExecutionAdapter(harness)
-        preparer = RecoveryExecutionPreparer(self.worktree, surface)
+        adapter = RecoveryExecutionAdapter("codex")
+        preparer = RecoveryExecutionPreparer(self.worktree, "browser")
 
         broker = self.start_broker(
             lambda _harness: adapter,
@@ -1752,18 +1751,14 @@ class ServiceContractTest(ConversationBrokerCase):
         self.wait_run_state(run_id, "succeeded")
         self.assertTrue(broker.wait_idle())
         self.assertEqual(preparer.recovered, [run_id])
-        self.assertEqual(
-            adapter.execution_argvs,
-            [["landlock-view", "--", harness, "inspection-server"]],
-        )
-        self.assertEqual(adapter.surfaces, [surface])
+        self.assertEqual(len(adapter.contexts), 1)
+        self.assertFalse(hasattr(adapter.contexts[0], "execution_prefix"))
+        self.assertEqual(adapter.surfaces, ["browser"])
         self.assertEqual(adapter.started, 0)
         self.assertEqual(adapter.resumed, 0)
 
-    def test_browser_codex_recovery_keeps_restricted_server_argv(self) -> None:
-        self._assert_recovery_execution_view("codex", "browser")
-
-    def test_sprint_opencode_recovery_keeps_restricted_server_argv(self) -> None:
+    def test_sprint_opencode_recovery_uses_the_managed_server(self) -> None:
+        """Decision #427: no per-view OpenCode server exists for recovery."""
         _conversation_id, _message_id, run_id = self.add_live_run(
             state="running",
             session_after="opencode-session",
@@ -1771,9 +1766,6 @@ class ServiceContractTest(ConversationBrokerCase):
             harness="opencode",
         )
         preparer = RecoveryExecutionPreparer(self.worktree, "sprint")
-        restricted_server = mock.Mock()
-        restricted_server.poll.return_value = None
-        restricted_log = mock.Mock()
         transport = mock.Mock()
         transport.request.side_effect = (
             {"id": "opencode-session"},
@@ -1783,16 +1775,8 @@ class ServiceContractTest(ConversationBrokerCase):
         with mock.patch.object(
             opencode_adapter,
             "ensure_server",
+            return_value=("http://127.0.0.1:12345", "password"),
         ) as ensure_server, mock.patch.object(
-            opencode_adapter,
-            "start_context_server",
-            return_value=(
-                restricted_server,
-                restricted_log,
-                "http://127.0.0.1:12345",
-                "password",
-            ),
-        ) as start_context_server, mock.patch.object(
             opencode_adapter,
             "UrlHttpTransport",
             return_value=transport,
@@ -1804,18 +1788,8 @@ class ServiceContractTest(ConversationBrokerCase):
             self.wait_run_state(run_id, "unknown")
             self.assertTrue(broker.wait_idle())
 
-        ensure_server.assert_not_called()
-        recovered_context = start_context_server.call_args.args[0]
-        self.assertEqual(
-            recovered_context.execution_prefix,
-            ("landlock-view", "--"),
-        )
-        self.assertEqual(
-            recovered_context.env["SC_CONVERSATION_SURFACE"],
-            "sprint",
-        )
-        restricted_server.terminate.assert_called_once_with()
-        restricted_log.close.assert_called_once_with()
+        ensure_server.assert_called_once_with()
+        self.assertEqual(preparer.recovered, [run_id])
 
     def test_recovery_preflight_refusal_prevents_adapter_dispatch(self) -> None:
         _conversation_id, _message_id, run_id = self.add_live_run(
@@ -1844,7 +1818,7 @@ class ServiceContractTest(ConversationBrokerCase):
         self.assertEqual(row["error_code"], "CONVERSATION_LAUNCH_REFUSED")
         self.assertEqual(
             row["error_detail"],
-            "restricted execution view preflight failed",
+            "shell_id 1 is not launchable by 'operator'",
         )
 
     def test_routine_dispatch_requires_post_commit_notification(self) -> None:
