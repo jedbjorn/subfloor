@@ -252,6 +252,42 @@ class RunLedgerTest(ApiFixture, unittest.TestCase):
         self.assertEqual(self.cli("kill", str(row["run_id"])).returncode, 0)
         self.assertEqual(self.finished(row)["state"], "killed")
 
+    def test_job_client_and_supervisor_do_not_resolve_private_database(self):
+        guard = self.root / "restricted-client"
+        guard.mkdir()
+        activations = guard / "active-pids"
+        denied = guard / "denied"
+        # Enforce the managed Developer boundary in each fresh interpreter,
+        # including the detached supervisor. The API server keeps its own
+        # database authority in this test process.
+        (guard / "sitecustomize.py").write_text(
+            "import os\nfrom pathlib import Path\nimport instance_state\n"
+            f"with open({str(activations)!r}, 'a') as f: f.write(str(os.getpid()) + '\\n')\n"
+            "def deny_private_resolution(*args, **kwargs):\n"
+            f"    Path({str(denied)!r}).touch()\n"
+            "    raise PermissionError(13, 'private owner metadata denied')\n"
+            "instance_state.active_database_path = deny_private_resolution\n"
+        )
+        env = {
+            **self.env,
+            "PYTHONPATH": os.pathsep.join((str(guard), str(ENGINE / "scripts"))),
+        }
+        result = self.cli(
+            "start", "--label", "restricted-client", "--",
+            "sh", "-c", "echo restricted-job-completed; exit 17", env=env,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        row = self.finished(job._api("GET", "/_sc/runs")["runs"][0])
+        self.assertEqual((row["state"], row["exit_code"]), ("failed", 17))
+        self.assertIsNotNone(row["message_id"])
+        self.assertIsNotNone(row["wake_id"])
+        for action in ("status", "tail"):
+            result = self.cli(action, str(row["run_id"]), env=env)
+            self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("restricted-job-completed", result.stdout)
+        self.assertGreaterEqual(len(set(activations.read_text().splitlines())), 4)
+        self.assertFalse(denied.exists())
+
     def test_killed_launcher_does_not_kill_supervisor(self):
         launcher = subprocess.Popen(
             [

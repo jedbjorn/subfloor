@@ -12,7 +12,6 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import db_driver
-from sprint_message_delivery import SprintMessageStore
 
 TERMINAL = frozenset({"done", "failed", "timeout", "killed", "lost"})
 ENGINE = Path(__file__).resolve().parents[1]
@@ -213,6 +212,10 @@ class RunStore:
         return self.get(run_id, owner)
 
     def terminal(self, run_id: int, owner: int, payload: dict) -> dict:
+        # The job client imports pure helpers from this module. Wake delivery
+        # loads host-private launch state, so import it only on the API side.
+        from sprint_message_delivery import SprintMessageStore
+
         allowed = {"state", "exit_code", "finished_at", "spawn_error"}
         if set(payload) - allowed or payload.get("state") not in TERMINAL:
             raise ValueError("invalid terminal payload")
