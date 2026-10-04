@@ -21,9 +21,8 @@
 #      the repo that OWNS that file and block if it is protected. This catches the
 #      foot-gun a cwd-only check misses: a worktree shell editing files in the
 #      stale main checkout (a DIFFERENT repo dir on `main`) — the cwd is a clean
-#      feature branch, so the old cwd check waved it through. If the target is
-#      outside the shell's own worktree but NOT on a protected branch, we ALLOW
-#      but emit a loud warning (claude additionalContext + stderr).
+#      feature branch, so the old cwd check waved it through. A target on a
+#      non-protected branch is allowed wherever it lives.
 #   2. CWD (all consumers, and the fallback when there is no target) — the
 #      original behavior: block if HEAD of the cwd's repo is a protected branch.
 #
@@ -202,18 +201,9 @@ if [ -n "$target" ]; then
       feature_branch_hint
       exit 2
     fi
-    # In a repo, on a feature branch, but OUTSIDE the shell's own worktree →
-    # allow with a loud warning (the chosen "block protected + warn out-of-tree"
-    # policy). additionalContext puts the warning in claude's context; stderr
-    # shows it to the human. Other harnesses never reach here (no stdin target).
-    home_top="$(home_toplevel)"
-    if [ -n "$home_top" ] && [ "$tgt_top" != "$home_top" ]; then
-      warn="⚠ branch-guard: editing '$target' OUTSIDE your worktree. That file is in '$tgt_top' (on '$tgt_branch'); your worktree is '$home_top'. Allowed because it is not a protected branch — but cross-tree edits are how stale-tree/wrong-tree mistakes happen. Confirm this path is intentional."
-      printf '%s\n' "$warn" >&2
-      python3 -c 'import json,sys; print(json.dumps({"hookSpecificOutput":{"hookEventName":"PreToolUse","additionalContext":sys.argv[1]}}))' "$warn" 2>/dev/null || true
-      exit 0
-    fi
-    # Target is inside the shell's own worktree on a feature branch → fine.
+    # Any feature-branch target is allowed, inside the shell's worktree or not:
+    # engine commands resolve project paths from the invoking checkout (spec
+    # #267 U3), so a cross-tree edit no longer has a tree confusion to warn about.
     exit 0
   fi
   # Target not in any git repo (e.g. /tmp scratch) → fall through to cwd check.
