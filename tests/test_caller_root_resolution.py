@@ -421,6 +421,26 @@ class ProjectVerbTest(CallerRootFixture):
         posted = [p for method, _path, p in _RecordingApi.requests if method == "POST"][-1]
         self.assertEqual(posted["body"], "MAIN-SUBDIR-BODY")
 
+    def test_make_cleanup_refuses_from_worktree(self):
+        makefile = self.main / "Makefile"
+        write(makefile, "include .super-coder/aliases.mk\n")
+        aliases = self.main / ".super-coder" / "aliases.mk"
+        write(aliases, "dos-e:\n\t@true\n")
+        self.addCleanup(makefile.unlink, missing_ok=True)
+        self.addCleanup(aliases.unlink, missing_ok=True)
+        for args in (("make-cleanup",), ("make-cleanup", "--dry-run")):
+            with self.subTest(args=args):
+                done = self.sc(self.wt, *args)
+                self.assertEqual(done.returncode, 1, done.stdout + done.stderr)
+                self.assertIn("refused", done.stderr)
+                self.assertIn(str(makefile), done.stderr)
+                self.assertEqual(done.stdout, "")
+        self.assertEqual(makefile.read_text(), "include .super-coder/aliases.mk\n")
+        self.assertTrue(aliases.is_file())
+        helped = self.sc(self.wt, "make-cleanup", "--help")
+        self.assert_ok(helped)
+        self.assertIn("usage: sc make-cleanup", helped.stdout)
+
 
 class CatalogueSubjectTest(CallerRootFixture):
     """The dr_* catalogue maps the install's main line, never the caller
@@ -611,7 +631,7 @@ class DispatcherClassificationTest(unittest.TestCase):
                "skill", "job", "actions-artifacts", "vm", "remote")
     LIVE = ("install", "update", "rollback", "rebuild", "migrate", "snapshot", "render",
             "remove", "eject", "sql", "map-sql", "map-setup", "models", "analytics",
-            "boot", "run")
+            "boot", "run", "make-cleanup")
 
     def arm(self, verb: str) -> str:
         match = re.search(rf"(?m)^  {re.escape(verb)}\)\s+(.*)$", self.DISPATCH)

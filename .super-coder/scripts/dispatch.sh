@@ -1287,7 +1287,10 @@ case "$cmd" in
                 sc_refuse_linked eject "$LIVE_ROOT/.gitignore + $LIVE_ROOT/.sc-state"
                 exec "$PY" "$S/eject.py" "$@" ;;
   alias)        exec "$PY" "$S/shell_alias.py" "$@" ;;
-  make-cleanup) exec "$PY" "$S/make_cleanup.py" "$@" ;;
+  # make-cleanup edits the main checkout's Makefile and deletes its
+  # .super-coder/aliases.mk: live-install wiring a worktree does not own.
+  make-cleanup) sc_help_form "$@" || sc_refuse_linked make-cleanup "$ROOT/Makefile"
+                exec "$PY" "$S/make_cleanup.py" "$@" ;;
   actions-artifacts) sc_project_env; exec "$PY" "$S/actions_artifacts.py" "$@" ;;
   remove)       if sc_help_form "$@"; then
                   exec "$PY" "$CALLER_ENGINE/scripts/remove.py" "$@"
