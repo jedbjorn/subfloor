@@ -662,8 +662,8 @@ def _source_projection(con, conversation_id: str, owner_user_id: int, query) -> 
 
 
 def _chat_uploads_root() -> Path:
-    # <repo_root>/shared is the engine's gitignored scratch/handoff dir, and no
-    # execution view masks it, so every harness can read an upload by path.
+    # <repo_root>/shared is the engine's ignored scratch/handoff dir that
+    # every seat can reach, so every harness can read an upload by path.
     return run_mod.REPO_ROOT / "shared" / "chat-uploads"
 
 

@@ -49,7 +49,7 @@ import update as update_mod  # noqa: E402  (materialize_engine, super_coder_remo
 DB_PATH = instance_state.active_database_path(ENGINE)
 
 # Compatibility alias for callers that inspect the preferred location. Runtime
-# reads/writes use rebuild_mod.backup_dir() so restricted seats share the same
+# reads/writes use rebuild_mod.backup_dir() so every seat shares the same
 # fallback selection as rebuild and restart.
 BACKUP_DIR = rebuild_mod.BACKUP_DIR
 

@@ -87,14 +87,13 @@ supported meaning and can misdescribe the seat.
 | `SC_HARNESS` | `claude` · `codex` · `opencode` · `vibe` · `kimi` | The harness this session runs. |
 | `SC_CONVERSATION_SURFACE` | the browser conversation surface | Set only for browser-owned conversations. |
 | `SC_API_BASE` · `SC_API_TOKEN` | `http://127.0.0.1:<api port>` and the shell's API key | How `sc mem`, `sc job` and the telemetry hook reach the engine. Identity **is** the token; no command takes a `--shell`. |
-| `SC_ENGINE_DIR` · `SC_ROOT` | engine and repo-root paths | Present only for an unrestricted (Admin) view; a restricted shell has both removed. |
-| `SC_EXECUTION_VIEW` | `restricted-source` or `restricted-downstream` | Present only in a restricted view, naming which mask set applies. |
+| `SC_ENGINE_DIR` · `SC_ROOT` | engine and repo-root paths | Present only for an Admin seat; every other seat has both removed so it is never handed the main checkout to `cd` into. |
 | `SC_ENTER_LEASE` | a lease file path | Held open by `./sc enter` so a departed client reads as client-gone rather than busy forever. |
 | `SC_DEVKIT_ROOT` · `SC_DEVKIT_SEAT` · `SC_DEVKIT_HOOK` | checkout · `host`/`docker` · hook name | Neutral context handed to every dev-kit hook child. |
 | `SC_DEVKIT_REPAIR` | `1` | Set for `./sc enter --devkit-repair`; the boot makes no readiness claim in that seat. |
 
-Evidence: `run.py:2088-2104,2696-2738`, `conversation_launch.py:137-149`,
-`execution_view.py:48-54,175`, `dispatch.sh:306-329,1507-1508,1574`,
+Evidence: `run.py:2073-2094,2665-2716`, `conversation_launch.py:94-111`,
+`execution_view.py:40-55`, `dispatch.sh:306-329,1507-1508,1574`,
 `devkit.py:816-823`, `branch-guard.sh:52,87`, `shell_liveness.py:56,270-277`.
 
 ## Build contracts

@@ -1,11 +1,9 @@
----
-name: fork_skill_design
-description: Design and maintain DB-canonical fork-local skills that describe the fork's real systems, tools, testing seats, and core processes. Planner-only; use when a capability needs durable shell guidance without becoming global doctrine.
-category: substrate
-common: false
----
+-- 0273 — fork_skill_design API-lane wording after decision #427.
+-- Reseed engine skill bodies edited after 0001 was applied.
 
-# fork_skill_design — describe fork capabilities
+BEGIN;
+
+UPDATE skills SET content = '# fork_skill_design — describe fork capabilities
 
 Use a fork-local skill when shells need durable knowledge specific to this
 repository, stack, host, VM, deployment surface, database, or core fork
@@ -53,7 +51,7 @@ Describe locations, commands, states, boundaries, and receipts. A testing-seat
 skill identifies the runner, fixtures, reach, readiness, and evidence; it does
 not choose assertions. A VM or host skill identifies the supplied control
 surface and reset boundary; it does not invent a lifecycle. A deployment or
-database skill records the fork's tracked procedure and authority; it does not
+database skill records the fork''s tracked procedure and authority; it does not
 teach generic deployment or SQL technique.
 
 Persist and grant through the supported DB-canonical surface:
@@ -71,7 +69,7 @@ naming a Bespoke shell changes only that shell. Creation grants nothing.
 A seat that cannot open the engine DB directly (a container seat) runs the
 same `sc skill` verbs through the engine API with identical validation and
 persistence. `sc skill list` shows each
-row's category so a redraft can carry the existing metadata forward.
+row''s category so a redraft can carry the existing metadata forward.
 
 ## Update, retire, and recover
 
@@ -92,4 +90,6 @@ state and rides `sc update`; it is never committed.
 
 Keep fork-local skill bodies on the supported `sc skill` surface; do not place
 them under engine assets, regenerate the engine seed for them, or set them
-common.
+common.' WHERE name = 'fork_skill_design';
+
+COMMIT;

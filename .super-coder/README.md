@@ -33,12 +33,16 @@ private state before building the first DB. Legacy copies and incomplete
 relocation require the named Admin recovery procedure; do not infer the active
 DB from whichever file happens to exist.
 
-Ordinary downstream shells receive API-backed control-plane commands and a
-restricted execution view. General engine SQL and direct private-state
-inspection are Admin-only. Source maintainers can read tracked engine code,
-schema and migrations because those are the project; that does not grant a
-Dev shell direct live-state maintenance authority. See
-[`scripts/execution_view.py`](scripts/execution_view.py).
+Ordinary shells run as plain same-user processes (decision #427). Engine
+state is unadvertised rather than masked: their control plane is the API, the
+launcher withholds the engine and repository-root paths (`SC_ENGINE_DIR`,
+`SC_ROOT`) from every seat except Admin, general engine SQL and shared-instance
+serialization are Admin-only on the caller's API identity, and live-instance
+maintenance verbs refuse from a linked worktree. Source maintainers can read
+tracked engine code, schema and migrations because those are the project; that
+does not grant a Dev shell direct live-state maintenance authority. See
+[`scripts/execution_view.py`](scripts/execution_view.py) and
+[`scripts/engine_identity.py`](scripts/engine_identity.py).
 
 The fork application's own data remains distinct from engine memory. The
 `dr_*` repository catalogue describes project files; it is neither engine

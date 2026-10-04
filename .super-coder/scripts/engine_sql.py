@@ -81,7 +81,7 @@ def _require_local_admin(token: str, db_path: Path) -> None:
         finally:
             con.close()
     except (OSError, sqlite3.Error):
-        # A masked/unavailable database is not a reason to disclose its path or
+        # An unavailable database is not a reason to disclose its path or
         # fall back to caller-controlled identity hints.
         refuse()
     if row is None or row[0] != "admin":

@@ -1,6 +1,6 @@
 """One launch policy per seat: which engine paths a harness environment carries.
 
-Decision #427 retired the Landlock execution view. Every shell runs as a plain
+Decision #427 retired the kernel-enforced shell view. Every shell runs as a plain
 same-user process; nothing wraps the harness argv and no launch is refused on
 view grounds. What survives is one environment guard, kept by FnB decision:
 non-Admin seats do not receive ``SC_ENGINE_DIR`` or ``SC_ROOT``. It prevents a

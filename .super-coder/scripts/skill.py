@@ -10,16 +10,16 @@ and every supported mutation persists the local snapshot and projections.
 Naming a standard shell targets its shared flavor pack; naming a Bespoke shell
 targets only that shell.
 
-Launched shells reach this module through two lanes. A local Admin seat opens
-the DB directly and enforces `require_planner` before `put`. A launched shell
-(including the Planner, whose restricted execution view masks the private
-engine-state root) is detected by a failed direct-DB open and rerouted
-through authenticated `/_sc/skills/*` routes on the review API, which runs
-the same validation and persistence ladder server-side. Both lanes share
+Launched shells reach this module through two lanes. A seat that can open the
+DB uses it directly and enforces `require_planner` before `put`. A seat that
+cannot (a container seat, whose private engine state lives on the host) is
+detected by a failed direct-DB open and rerouted through authenticated
+`/_sc/skills/*` routes on the review API, which runs the same validation and
+persistence ladder server-side. Both lanes share
 `cmd_*_api` and the `_*_spec` helpers, and every verb rides the fallback —
 including retire/unretire, whose retire list is instance-local state the API
 host writes exactly as the local CLI would. Nothing here resolves the private
-DB path at import time: that resolution is what fails on a restricted seat,
+DB path at import time: that resolution is what fails on such a seat,
 so it happens inside `connect()` where the fallback can catch it (#1493).
 
 Engine catalogue rows are authored as assets + `./sc seed-skills`. Fork-local
@@ -67,7 +67,7 @@ LOCAL_FRONTMATTER_FIELDS = {"name", "description", "category", "command", "commo
 
 
 def connect():
-    """Open the live DB; raises InstanceStateError/OSError on a restricted seat."""
+    """Open the live DB; raises InstanceStateError/OSError where it is unreachable."""
     db_path = DB_PATH if DB_PATH is not None else instance_state.active_database_path(ENGINE)
     if not db_path.exists() or not db_path.stat().st_size:
         sys.exit("sc skill: no live DB — run `./sc rebuild` (or `./sc launch`) first.")
@@ -91,11 +91,11 @@ def _shell_api_enabled() -> bool:
 def _with_api_fallback(local, remote):
     """Run a verb on the local DB; reroute to the API lane when the seat cannot open it.
 
-    The restricted execution view (launched non-Admin shells) masks the
-    private engine-state root, so `connect()` raises an InstanceStateError or a
-    filesystem permission error before any verb runs. With a shell token
-    present, retry through the engine API, which runs unrestricted and reuses
-    the same validation + persistence ladder. A missing/empty DB on a host
+    A seat that cannot reach the private engine state (a container seat)
+    gets an InstanceStateError or a filesystem error from `connect()` before
+    any verb runs. With a shell token present, retry through the engine API,
+    which runs on the host beside the DB and reuses the same validation +
+    persistence ladder. A missing/empty DB on a host
     seat ("no live DB") and any failure without a token surface unchanged.
     """
     try:

@@ -134,26 +134,32 @@ harness configuration, start a substitute server, or arm the feature yourself.
 The returned `proxy_url` is yours and the tab group is
 `Playwright · Subfloor <SHORTNAME>`.
 
-The FnB opens the dedicated Subfloor profile and approves each new shell
-connection in the Playwright Extension. Ask the FnB if either step is missing;
-never open the profile or click its approval control yourself. Work only in
-your tab group, without moving or touching other groups'' tabs.
+Run `sc browser open --json` to launch the linked, existing Subfloor profile.
+No live window is required. The FnB still approves each new shell connection
+in the Playwright Extension; never click that approval control yourself. Work
+only in your tab group, without moving or touching other groups'' tabs.
 
 Snapshot before acting, preferring accessibility snapshots over screenshots.
 Save screenshots/downloads only in the returned output directory. Close the
 tabs you opened unless directed to leave them. Report the result, tab group,
 the session path returned by Playwright, and anything left open.
 
-`extension not connected` means the profile is closed, mismatched, or the
-connection is unapproved. Report and stop; never retry in a loop. A timed-out
-action has an unknown outcome: inspect only after a new directive to resume,
-rather than replaying a mutation. `disarmed` requires the FnB to arm it.
+`extension not connected` means the extension is unavailable or the connection
+is unapproved; it does not prove the profile window is closed. Report and stop;
+never retry in a loop. The proxy sets no action deadline — it waits for
+Playwright''s own action or navigation result and keeps the approved session
+alive, so a slow action is still running: wait for its result rather than
+replaying it. Actions are never retried, and overlapping requests on one
+session refuse rather than queue. Confirmed transport loss ends the connection
+and is reported as such. `disarmed` requires the FnB to arm it.
 
 Admin diagnosis/repair stays under the operator''s named assignment. The FnB''s
-host terminal can run `sc browser doctor --json`, `up`, `down`, `arm`, or
-`disarm`; launched shell credentials only permit `status`. Doctor verifies the
-exact MCP/Playwright/core versions and installs an absent package tree; drift
-requires operator repair. Creating profiles, installing the extension, logins,
+host terminal can run `sc browser setup --json` to detect and link the existing
+profile, or `doctor`, `up`, `down`, `arm`, and `disarm`. Launched shell credentials
+permit `status` and (with this grant) `open`; they cannot set paths or arm. Doctor
+checks actual package capabilities and repairs missing or incompatible private
+packages without version pins. It reports `setup_ready` separately from
+`connection_ready`; `ok` requires both and running, armed services. Creating profiles, installing the extension, logins,
 and approval clicks remain human steps. See the engine''s
 `.super-coder/docs/browser-driving.md` for the setup and live acceptance record.',
   0
@@ -541,8 +547,9 @@ sc skill list
 projections reconcile. Naming a standard shell changes its shared flavor pack;
 naming a Bespoke shell changes only that shell. Creation grants nothing.
 
-On a launched Planner seat the same `sc skill` verbs run through the engine
-API with identical validation and persistence. `sc skill list` shows each
+A seat that cannot open the engine DB directly (a container seat) runs the
+same `sc skill` verbs through the engine API with identical validation and
+persistence. `sc skill list` shows each
 row''s category so a redraft can carry the existing metadata forward.
 
 ## Update, retire, and recover
@@ -555,7 +562,7 @@ sc skill rm <skill_name>
 
 Retry the exact command after fixing a reported snapshot, render, or projection
 path. Pass = the full persistence receipt returns and the projected body
-matches `sc skill list` plus the intended grant. On a launched seat the same
+matches `sc skill list` plus the intended grant. On an API-routed seat the same
 receipt names which of the four layers (DB, snapshot, flat render,
 projection) is still outstanding. `rm` is only for
 fork-local names; retire an upstream skill with `sc skill retire <name>` and
@@ -636,7 +643,7 @@ NEVER delete a branch carrying unmerged, un-PR''d work — no PR = lost work.
 ## Never commit the engine or derived files
 
 - In a fork `/.super-coder/` is gitignored — never force-add anything under it.
-- Gitignored + regenerated, never commit: `CLAUDE.md`, `AGENTS.md`, `opencode.json`, `.claude/skills/`, `.sc-state/engine.ref.prev` (ephemeral rollback pointer).
+- Gitignored + regenerated, never commit: `CLAUDE.md`, `AGENTS.md`, `opencode.json`, the per-harness skill renders (`.claude/skills/`, `.agents/skills/`, `.opencode/skills/`), the engine-managed harness config (`.claude/settings.local.json`, `.codex/hooks.json`), and `.sc-state/engine.ref.prev` (ephemeral rollback pointer).
 - From a worktree, commit only your project''s authored files. Generated
   snapshots and `_sc` renders live under ignored `.sc-state/local/` and never
   enter Git. `.sc-state/engine.ref` is the deliberate tracked exception: it is
@@ -721,7 +728,7 @@ NEVER auto-delete: a `merged: null` branch, an `is_base` branch (`main` or any `
 Any other shell''s worktree: `is_main: false` + `dirty > 0`.
 
 1. **Liveness gate.** Committing files is non-destructive, but re-branching a worktree under a mid-session shell stomps that live session. Read the `shell_liveness` verdict:
-   - `safe_to_clean_all: true` -> every worktree dormant -> act on all.
+   - `safe_to_clean_all: true` -> admin presence confirmed, every other worktree dormant, nothing indeterminate -> act on all.
    - shortname in `active_other_shells` -> that shell is LIVE -> surface only, do NOT touch its tree. The others remain safe.
    - `indeterminate > 0` -> a harness process whose cwd was unreadable (another OS user, say) -> do NOT assume all-clear -> surface.
 2. **Attribution.** The commit carries THAT shell''s trailer, never the admin''s. Read the display name for `shell/<shortname>` from `sc mem get shells`, then export the identity on the commit so the tracked `prepare-commit-msg` hook writes the trailer for you:
@@ -1132,9 +1139,12 @@ in any state — a running domain gets a live snapshot, and a hypervisor that
 refuses one answers `snapshot_live_unsupported`), `snapshot delete <name>` (the
 configured baseline is refused; redefine it with `bake` instead), `bake [<name>]`
 (graceful shutdown, then a replace-not-stack offline snapshot that becomes the
-baseline; `./sc vm-bake` is an alias), and `reset [<name>] --off|--running` for a
-named snapshot. Exactly one of `--off` and `--running` is required on every
-reset. `push` sources and `pull` destinations must sit inside the repo or
+baseline; `./sc vm-bake` is the host-direct escape hatch that runs the same
+operation against libvirt in-process with no broker in the path — host-only,
+never in the sandbox, and only when the broker is down; `vm bake` is the
+normal route), and `reset [<name>] --off|--running` for a named snapshot.
+Exactly one of `--off` and `--running` is required on every reset.
+`push` sources and `pull` destinations must sit inside the repo or
 `.sc-state/local/`, and never inside `.sc-state/local/vm/` (the host''s key and
 host-key pin live there); a pull destination inside `.super-coder/` or `.git/`
 is refused too. Add `--json` to any verb for one result object.
@@ -1266,11 +1276,19 @@ you.
 exists because new code expects the new schema — restoring only the DB strands
 new code on the old schema, so rollback restores both:
 
-1. backs up the current (post-bad-update) DB first — rollback is itself
-   reversible;
-2. restores the DB from the most recent pre-update backup in
+1. backs up the current (post-bad-update) DB first, under its own
+   `prerollback` prefix so it is never mistaken for a pre-update restore point
+   — rollback is itself reversible. Where that copy is *written* is an ordered,
+   fail-closed choice: `$SC_DB_BACKUP_DIR` when set and writable, else
    `~/db_backups/<repo-name>/` (keyed by this fork''s repo dir name — distinct
-   from any `db_backups/` dir the fork''s app keeps at its repo root);
+   from any `db_backups/` dir the fork''s app keeps at its repo root), else the
+   gitignored repo-local `.sc-state/db_backups/`. Pruning keeps the five newest
+   backups per lifecycle prefix per directory, so classes never evict each
+   other;
+2. restores the DB from the newest pre-update backup found across *every*
+   candidate directory, not just the currently writable one — the writable
+   destination can change between update and rollback, and discovery must not
+   hide a restore point behind it;
 3. re-materializes the engine at `.sc-state/engine.ref.prev` + restores
    `engine.ref`.
 
@@ -2409,8 +2427,9 @@ device-side enforcement is deferred, not a gap you are free to use.
 
 The broker accepts a command on a `readonly_hosts` entry only when its first
 tokens match this table, the string contains none of `; & | > < $ \` ( )` or a
-newline, and `sudo` appears nowhere. The table lives as data in `ts.py`
-(`READONLY_COMMANDS`); trailing operands select a unit, container, or file.
+newline or carriage return, and `sudo` appears nowhere. The table lives as data
+in `ts.py` (`READONLY_COMMANDS`); trailing operands select a unit, container,
+or file.
 
 | Verb | Permitted forms |
 |---|---|

@@ -69,8 +69,9 @@ than creating another native session.
 ## Private engine state
 
 The live DB, snapshot and backups use the private XDG instance namespace.
-Ordinary downstream shells operate through API-backed surfaces and a restricted
-execution view. Admin owns direct maintenance and recovery. See the
+Ordinary shells operate through API-backed surfaces; engine paths are not
+advertised to them and engine SQL is Admin-only (decision #427). Admin owns
+direct maintenance and recovery. See the
 [engine state reference](../README.md#source-dependency-and-private-state).
 
 The host service runs as the installing user. Rootless Docker maps container

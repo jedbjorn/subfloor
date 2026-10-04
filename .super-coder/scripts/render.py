@@ -27,7 +27,7 @@ from _serialize_guard import require_admin
 from seed_skills import sync_engine_skills
 
 # Resolved when a render opens the DB, never at import: `sc skill` imports
-# this module from launched seats that cannot read the private state root
+# this module from seats that cannot read the private state root
 # (#1493). Tests may pin it.
 DB_PATH: Path | None = None
 

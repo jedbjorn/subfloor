@@ -51,8 +51,8 @@ ENGINE = Path(__file__).resolve().parents[1]
 SKILLS_DIR = ENGINE / "assets" / "skills"
 SHELL_TEMPLATES = ENGINE / "templates" / "shells"
 OUT = ENGINE / "migrations" / "0001_seed_skills.sql"
-# Resolved on first use, never at import: a launched non-Admin seat cannot
-# read the private state root, and every `sc skill` verb imports this module
+# Resolved on first use, never at import: a container seat cannot read the
+# private state root, and every `sc skill` verb imports this module
 # before its API fallback can run (#1493). Tests and relocation code pin it.
 # Update imports the seed helpers while recovering relocation publication.
 # The standalone command validates active_database_path in ``main``.
