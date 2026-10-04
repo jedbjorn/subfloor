@@ -186,5 +186,12 @@ def ensure(*, force: bool = False) -> dict:
         return {"tier": "disarmed", "error": f"Conversion verification unavailable: {type(exc).__name__}"}
 
 
+def main(argv: list[str]) -> int:
+    print(json.dumps(ensure(force="--force" in argv), indent=2))
+    return 0
+
+
 if __name__ == "__main__":
-    print(json.dumps(ensure(force="--force" in sys.argv), indent=2))
+    from cli_entry import run_cli
+
+    raise SystemExit(run_cli(main, sys.argv[1:]))

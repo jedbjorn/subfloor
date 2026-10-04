@@ -78,6 +78,7 @@ def test_real_wrapper_executes_original_once_after_argv_dispatch(gui, tmp_path, 
     scripts.mkdir(parents=True)
     bridge = scripts / "seat_convert.py"
     bridge.write_text((SCRIPTS / "seat_convert.py").read_text())
+    (scripts / "cli_entry.py").write_text((SCRIPTS / "cli_entry.py").read_text())
     launcher = root / "sc"
     launcher.write_text('''#!/usr/bin/env python3
 import json,os,subprocess,sys
