@@ -71,6 +71,89 @@ def test_absent_timeout_is_omitted_and_start_failure_not_announced(gui, tmp_path
     assert "completion wakes" not in capsys.readouterr().out
 
 
+def test_real_wrapper_executes_original_once_after_argv_dispatch(gui, tmp_path, monkeypatch):
+    """Instrument the sc boundary; this is transport proof, not native A6."""
+    root = tmp_path / "engine with ' quotes λ"
+    scripts = root / ".super-coder" / "scripts"
+    scripts.mkdir(parents=True)
+    bridge = scripts / "seat_convert.py"
+    bridge.write_text((SCRIPTS / "seat_convert.py").read_text())
+    launcher = root / "sc"
+    launcher.write_text('''#!/usr/bin/env python3
+import json,os,subprocess,sys
+from pathlib import Path
+args=sys.argv[1:]
+Path("dispatch.json").write_text(json.dumps({"argv":args,"cwd":os.getcwd(),
+    "premature":any(Path(p).exists() for p in ("once","dollar","backtick","result"))}))
+raise SystemExit(subprocess.run(args[args.index("--")+1:],shell=False,check=False).returncode)
+''')
+    launcher.chmod(0o755)
+    cwd = root / "cwd ' \" $(touch WRONG) `touch ALSO_WRONG`\nUnicode λ"
+    cwd.mkdir()
+    original = '''printf x >> once
+printf '%s\\n' "double quote: $SEAT_TEST_VALUE" 'single quote: λ' \\
+  "$(printf x >> dollar; printf substitution)" "`printf x >> backtick; printf tick`" \\
+  | tr a-z A-Z > result
+'''
+    monkeypatch.setattr(seat_convert, "__file__", str(bridge))
+    event = {"tool_name": "Bash", "cwd": str(cwd), "tool_input": {
+        "command": original, "run_in_background": True, "timeout": 1001}}
+    updated = seat_convert.convert(event, "rewrite")["hookSpecificOutput"]["updatedInput"]
+    assert list(cwd.iterdir()) == []
+    parsed = subprocess.run(["bash", "-n", "-c", updated["command"]], cwd=tmp_path,
+                            capture_output=True, text=True, check=False)
+    assert parsed.returncode == 0
+    assert list(cwd.iterdir()) == []
+    executed = subprocess.run(["bash", "-c", updated["command"]], cwd=tmp_path,
+                              env={**os.environ, "SEAT_TEST_VALUE": "expanded λ"},
+                              capture_output=True, text=True, check=False, timeout=10)
+    assert executed.returncode == 0, executed.stderr
+    dispatch = json.loads((cwd / "dispatch.json").read_text())
+    assert dispatch["premature"] is False
+    assert dispatch["cwd"] == str(cwd)
+    assert dispatch["argv"][-2:] == ["-c", original]
+    assert dispatch["argv"][dispatch["argv"].index("--timeout") + 1] == "2"
+    for marker in ("once", "dollar", "backtick"):
+        assert (cwd / marker).read_text() == "x"
+    assert (cwd / "result").read_text() == "DOUBLE QUOTE: EXPANDED λ\nSINGLE QUOTE: λ\nSUBSTITUTION\nTICK\n"
+    assert not (tmp_path / "WRONG").exists()
+    assert not (tmp_path / "ALSO_WRONG").exists()
+    assert "End your turn; the completion wakes you." in executed.stdout
+
+
+@pytest.mark.parametrize("payload", [None, [], {"v": True}, {"v": 0},
+    {"v": 1, "command": "true", "cwd": ".", "bash": "/bin/bash"},
+    {"v": 1, "command": "true\0bad", "cwd": "/", "bash": "/bin/bash"},
+])
+def test_malformed_payload_never_invokes_job(payload):
+    encoded = base64.urlsafe_b64encode(json.dumps(payload).encode()).decode()
+    with mock.patch.object(seat_convert.subprocess, "run") as launch:
+        assert seat_convert.bridge(encoded) == 2
+    launch.assert_not_called()
+
+
+@pytest.mark.parametrize("value", [0, -1, None, True, False, "1000", 1.5])
+def test_bridge_revalidates_timeout_before_job(tmp_path, value):
+    payload = {"v": 1, "command": "true", "cwd": str(tmp_path), "bash": "/bin/bash", "timeout": value}
+    encoded = base64.urlsafe_b64encode(json.dumps(payload).encode()).decode()
+    with mock.patch.object(seat_convert.subprocess, "run") as launch:
+        assert seat_convert.bridge(encoded) == 2
+    launch.assert_not_called()
+
+
+def test_bad_encoding_and_non_directory_cwd_refuse_before_job(tmp_path):
+    file = tmp_path / "file"
+    file.touch()
+    payload = {"v": 1, "command": "true", "cwd": str(file), "bash": "/bin/bash"}
+    encoded = base64.urlsafe_b64encode(json.dumps(payload).encode()).decode()
+    with mock.patch.object(seat_convert.subprocess, "run") as launch:
+        assert seat_convert.bridge("not!base64") == 2
+        assert seat_convert.bridge(encoded) == 2
+        payload["cwd"] = str(tmp_path / "absent")
+        assert seat_convert.bridge(base64.urlsafe_b64encode(json.dumps(payload).encode()).decode()) == 2
+    launch.assert_not_called()
+
+
 @pytest.mark.parametrize("name", ["Monitor", "CronCreate", "ScheduleWakeup"])
 def test_schedulers_have_engine_equivalent(gui, name):
     assert "sc job start --until" in seat_convert.convert({"tool_name": name}, "rewrite")["hookSpecificOutput"]["permissionDecisionReason"]

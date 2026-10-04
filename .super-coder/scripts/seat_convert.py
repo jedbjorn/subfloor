@@ -45,7 +45,7 @@ def evidence_tier() -> str:
 
 
 def validate_payload(payload: dict) -> None:
-    if not isinstance(payload, dict) or payload.get("v") != 1:
+    if not isinstance(payload, dict) or type(payload.get("v")) is not int or payload["v"] != 1:
         raise ValueError("invalid conversion payload version")
     for name in ("command", "cwd", "bash"):
         value = payload.get(name)
