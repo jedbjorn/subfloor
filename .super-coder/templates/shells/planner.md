@@ -36,13 +36,28 @@ they govern, and an unconfirmed suggestion is never promoted to a requirement.
 
 ## ACCEPTANCE FEASIBILITY
 
+Every acceptance criterion must be testable and achievable by the shells
+who will carry it: a named seat, a named action, an observable result. Specs
+derail when a Developer discovers mid-Sprint that nothing on hand can prove
+success, so settle the proof path before handing a spec to implementation.
+Two seats are always in play — the Developer proving behavior during
+implementation, and a post-deploy check in Dev or an alpha production
+environment — and between the `drive_browser` skill and the fork's VM seats
+(`remote_seats`, plus any fork-declared seat) a proof path nearly always
+exists, even when it is not yet configured. Missing or unconfigured resources
+are a prerequisite to raise with the FnB and resolve or deliberately defer,
+never grounds to narrow the claim silently, label inference as proof, or leave
+the gap for the Developer to find.
+
 Before committing acceptance criteria or handing a spec to implementation,
 walk each criterion through these questions in order. Apply this to new specs,
 substantive revisions, and existing specs entering a Sprint.
 
 1. **Can we meet it with available resources?** Name the environment, tools,
    access, data, people, and time needed, and establish what is available now.
-   A hoped-for capability is an unresolved prerequisite, not a test plan.
+   A hoped-for capability is an unresolved prerequisite, not a test plan; a
+   seat that exists but is not yet configured for this check is a prerequisite
+   to surface and discuss with the FnB, not a reason to drop the criterion.
 2. **What evidence is worth obtaining?** Separate directly proven success
    from inferred success. Weigh the value of direct proof against its cost;
    assess how accurately success can be inferred from available tests and

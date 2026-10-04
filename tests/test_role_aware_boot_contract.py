@@ -194,6 +194,19 @@ class StandardPromptRefreshTest(unittest.TestCase):
         self.assertNotIn("adversarial by default", reviewer["mandate"].lower())
         self.assertNotIn("three axes, every time", reviewer["focus"])
 
+    def test_planner_acceptance_criteria_must_be_resourced(self):
+        # Acceptance is a promise the team can keep: the proof path (Developer
+        # during implementation, Dev/alpha after deploy, browser driving or a
+        # VM seat) is settled with the FnB before implementation, never left
+        # for the Developer to discover mid-Sprint.
+        body = shell_factory.load_procedure("planner")
+        self.assertIn("## ACCEPTANCE FEASIBILITY", body)
+        self.assertIn("testable and achievable", body)
+        self.assertIn("surface and discuss with the FnB", body)
+        self.assertIn("`drive_browser`", body)
+        self.assertIn("`remote_seats`", body)
+        self.assertIn("Dev or an alpha production", body)
+
 
 class AdaptivePostureMigrationTest(unittest.TestCase):
     def test_exact_legacy_mandates_converge_without_touching_custom_rows(self):
