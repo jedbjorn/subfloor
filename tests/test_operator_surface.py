@@ -39,27 +39,76 @@ UNCHARTED_BY_DESIGN = {
 }
 
 
+# A standalone copy of the checkout under test. `./sc` run from a linked
+# worktree resolves the LIVE instance at the main checkout (git common dir),
+# so driving the worktree's own `./sc` executed the live floor's run.py and
+# read its instance.json. A copy that is its own root, with no instance
+# identity of its own, can only ever reach itself.
+FIXTURE: Path | None = None
+# A pin no real checkout carries: `./sc engine-ref` answering it proves the
+# dispatcher resolved the fixture as the live root.
+FIXTURE_PIN = "0123456789abcdef0123456789abcdef01234567"
+_FIXTURE_TMP: tempfile.TemporaryDirectory | None = None
+
+
+def setUpModule() -> None:
+    global FIXTURE, _FIXTURE_TMP
+    _FIXTURE_TMP = tempfile.TemporaryDirectory(prefix="sc-opsurface-")
+    FIXTURE = Path(_FIXTURE_TMP.name) / "fork"
+    FIXTURE.mkdir()
+    shutil.copytree(
+        ROOT / ".super-coder", FIXTURE / ".super-coder",
+        ignore=shutil.ignore_patterns(
+            "__pycache__", "*.pyc", "node_modules", "run", "logs", "backups",
+            "instance.json", "shell_db.db*", "*.sock",
+        ),
+    )
+    shutil.copy2(ROOT / "sc", FIXTURE / "sc")
+    (FIXTURE / ".sc-state").mkdir()
+    (FIXTURE / ".sc-state" / "engine.ref").write_text(FIXTURE_PIN + "\n")
+    # Its own repository (never a linked worktree), so engine provenance
+    # resolves inside the fixture.
+    ident = {**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
+             "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"}
+    for argv in (["init", "-q", "-b", "main"], ["add", "-A"],
+                 ["-c", "core.hooksPath=/dev/null", "commit", "-q",
+                  "--no-verify", "-m", "fixture"]):
+        subprocess.run(["git", "-C", str(FIXTURE), *argv], check=True,
+                       env=ident, capture_output=True)
+
+
+def tearDownModule() -> None:
+    if _FIXTURE_TMP is not None:
+        _FIXTURE_TMP.cleanup()
+
+
 def sc(*args: str, env: dict | None = None) -> subprocess.CompletedProcess[str]:
+    assert FIXTURE is not None, "setUpModule did not build the fixture"
+    base = {
+        key: value for key, value in os.environ.items()
+        if key not in ("SC_API_TOKEN", "SC_API_BASE", "SC_ROOT",
+                       "SC_ENGINE_DIR", "SC_CALLER_ROOT", "SC_DISPATCH",
+                       "SC_SANDBOX", "SC_DEV_PORT")
+    }
     return subprocess.run(
         ["./sc", *args],
-        cwd=ROOT,
+        cwd=FIXTURE,
         text=True,
         capture_output=True,
         check=False,
         env={
-            **os.environ,
+            **base,
             "NO_COLOR": "1",
-            "SC_DISPATCH": str(ROOT / ".super-coder" / "scripts" / "dispatch.sh"),
+            "SC_DISPATCH": str(FIXTURE / ".super-coder" / "scripts" / "dispatch.sh"),
             **(env or {}),
         },
     )
 
 
 def fork_ports() -> dict:
-    """This fork's ports as the DISPATCHER resolves them. Not re-derived
-    here: `./sc` resolves the engine at the MAIN worktree root, so importing
-    ports.py out of a linked worktree's own copy answers about a different
-    instance.json than the operator's commands use."""
+    """The fixture's ports as the DISPATCHER resolves them. Not re-derived
+    here: ports.py owns the derivation, and the operator's commands are the
+    only authority on which instance.json they read."""
     out = sc("ports")
     assert out.returncode == 0, out.stderr
     return json.loads(out.stdout)
@@ -78,6 +127,14 @@ def dispatch_verbs() -> list[str]:
             labels.extend(m.group(1).split("|"))
     # `boot-*` / `enter-*` are shortname globs charted under their base verb.
     return sorted({v for v in labels if "*" not in v})
+
+
+class FixtureIsolationTest(unittest.TestCase):
+    def test_the_dispatcher_resolves_the_fixture_never_a_live_checkout(self):
+        self.assertTrue((FIXTURE / ".git").is_dir(), "fixture must be its own root")
+        out = sc("engine-ref")
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertEqual(out.stdout.strip(), FIXTURE_PIN)
 
 
 class ScUrlTest(unittest.TestCase):
@@ -112,9 +169,7 @@ class EnterPreAttachPrintTest(unittest.TestCase):
         self.bin = Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, self.bin)
         # These tests exercise URL ordering and attach dispatch, not the
-        # provisioning contract.  The launcher resolves helpers from the live
-        # main checkout even when SC_DISPATCH points at this worktree, so keep
-        # readiness at its already-satisfied seam here.
+        # provisioning contract, so keep readiness at its satisfied seam.
         self._stub(
             "python3",
             "#!/bin/sh\n"
