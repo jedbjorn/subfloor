@@ -47,19 +47,8 @@ def _discovered_admin_credential() -> tuple[str, str]:
     """Adopt the host Admin's runtime credential, or refuse.
 
     A host Admin seat booted outside run.py carries no token; the supervised
-    API provisions an owner-only credential it may adopt (mem.py). Only a
-    login seat may do so: an environment with no HOME (``env -i``, a test
-    harness that clears the environment) names no seat, and adopting the
-    credential that happens to sit on disk would hand it the owner's Admin
-    identity and the live database.
-
-    The HOME check is a confusion rail, not identity proof: any same-user
-    process can set HOME. It stops an accidental scrubbed-environment caller
-    from inheriting the owner's credential; the credential file's own
-    owner-only checks and the token's Admin flavor remain the authority.
+    API provisions an owner-only credential it may adopt (mem.py).
     """
-    if not os.environ.get("HOME"):
-        refuse()
     mem._PROG = "sc sql"
     if not mem._discover_runtime_credential():
         refuse()

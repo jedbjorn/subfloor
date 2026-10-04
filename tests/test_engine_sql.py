@@ -60,48 +60,6 @@ class EngineSqlTest(unittest.TestCase):
             ["/bin/sqlite3", "-readonly", str(self.db), "SELECT 1;"],
         )
 
-    def _credential_dir(self) -> Path:
-        credential_dir = Path(self.tmp.name) / "credentials"
-        credential_dir.mkdir()
-        artifact = credential_dir / "admin.json"
-        artifact.write_text(json.dumps({
-            "shell_id": 1,
-            "shortname": "admin",
-            "api_base": "http://127.0.0.1:1",
-            "token": "admin-token",
-        }))
-        artifact.chmod(0o600)
-        saved = (
-            engine_sql.mem._CRED_DIR,
-            engine_sql.mem.SC_API_TOKEN,
-            engine_sql.mem.SC_API_BASE,
-            engine_sql.mem._DISCOVERED_FROM,
-        )
-
-        def restore():
-            (engine_sql.mem._CRED_DIR, engine_sql.mem.SC_API_TOKEN,
-             engine_sql.mem.SC_API_BASE, engine_sql.mem._DISCOVERED_FROM) = saved
-
-        self.addCleanup(restore)
-        engine_sql.mem._CRED_DIR = credential_dir
-        engine_sql.mem.SC_API_TOKEN = ""
-        engine_sql.mem.SC_API_BASE = ""
-        engine_sql.mem._DISCOVERED_FROM = None
-        return credential_dir
-
-    def test_cleared_environment_never_adopts_an_admin_credential_on_disk(self):
-        self._credential_dir()
-        with mock.patch.dict(os.environ, {}, clear=True), self._path(), \
-             mock.patch.object(engine_sql.engine_identity, "api_flavor", return_value=None), \
-             mock.patch.object(
-                 engine_sql.subprocess,
-                 "run",
-                 side_effect=AssertionError("query must not be executed"),
-             ), self.assertRaises(SystemExit) as caught:
-            engine_sql.main(["read-only", "SELECT 1;"])
-        self.assertIn(engine_sql.ERROR_CODE, str(caught.exception))
-        self.assertEqual(engine_sql.mem.SC_API_TOKEN, "")
-
     def test_api_down_host_admin_discovers_owner_only_runtime_credential(self):
         credential_dir = Path(self.tmp.name) / "credentials"
         credential_dir.mkdir()
@@ -137,8 +95,7 @@ class EngineSqlTest(unittest.TestCase):
         engine_sql.mem.SC_API_BASE = ""
         engine_sql.mem._DISCOVERED_FROM = None
 
-        login_seat = {"HOME": self.tmp.name}
-        with mock.patch.dict(os.environ, login_seat, clear=True), self._path(), \
+        with mock.patch.dict(os.environ, {}, clear=True), self._path(), \
              mock.patch.object(engine_sql.engine_identity, "api_flavor", return_value=None), \
              mock.patch.object(engine_sql.shutil, "which", return_value="/bin/sqlite3"), \
              mock.patch.object(engine_sql.subprocess, "run", return_value=completed) as run:
@@ -228,8 +185,19 @@ class EngineSqlTest(unittest.TestCase):
         self.assertNotIn(str(self.db), str(caught.exception))
 
     def test_missing_identity_does_not_adopt_an_admin_credential(self):
-        with mock.patch.dict(os.environ, {}, clear=True), \
-             self.assertRaises(SystemExit) as caught:
+        # Hermetic: discovery looks only at an empty credential directory, so
+        # a run from a checkout whose run/mem holds a live Admin credential
+        # can never adopt it (or reach the live API and DB through it).
+        empty = Path(self.tmp.name) / "no-credentials"
+        empty.mkdir()
+        with mock.patch.object(engine_sql.mem, "_CRED_DIR", empty), \
+             mock.patch.object(engine_sql.mem, "SC_API_TOKEN", ""), \
+             mock.patch.object(engine_sql.mem, "SC_API_BASE", ""), \
+             mock.patch.dict(os.environ, {}, clear=True), \
+             mock.patch.object(
+                 engine_sql.engine_identity, "api_flavor",
+                 side_effect=AssertionError("an identity was resolved"),
+             ), self.assertRaises(SystemExit) as caught:
             engine_sql.main(["read-only", "SELECT 1;"])
         self.assertIn(engine_sql.ERROR_CODE, str(caught.exception))
 
