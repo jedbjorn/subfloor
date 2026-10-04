@@ -52,6 +52,11 @@ def _discovered_admin_credential() -> tuple[str, str]:
     harness that clears the environment) names no seat, and adopting the
     credential that happens to sit on disk would hand it the owner's Admin
     identity and the live database.
+
+    The HOME check is a confusion rail, not identity proof: any same-user
+    process can set HOME. It stops an accidental scrubbed-environment caller
+    from inheriting the owner's credential; the credential file's own
+    owner-only checks and the token's Admin flavor remain the authority.
     """
     if not os.environ.get("HOME"):
         refuse()
