@@ -287,9 +287,10 @@ class LinkedWorktreeRefusalTest(WorktreeFixture):
                 self.assertEqual(state_digest(self.main), before)
 
     # G4 (spec #267, ledger C5): with the shell view retired this refusal is
-    # the single mechanism keeping every live-instance verb out of a worktree.
+    # what keeps these live-instance and live-runtime verbs out of a worktree.
     LIVE_INSTANCE_VERBS = ("update", "rollback", "rebuild", "migrate",
-                           "snapshot", "render", "remove")
+                           "snapshot", "render", "remove", "eject", "init",
+                           "launch", "down", "restart")
 
     def test_every_live_instance_verb_refuses_naming_the_shared_instance(self):
         for cmd in self.LIVE_INSTANCE_VERBS:
@@ -312,11 +313,24 @@ class LinkedWorktreeRefusalTest(WorktreeFixture):
                 self.assertEqual(state_digest(self.main), before)
                 self.assertFalse((self.wt / ".super-coder" / "shell_db.db").exists())
 
-    def test_update_help_still_answers_from_the_linked_worktree(self):
-        done = run_sc(self.wt, "update", "--help")
-        self.assertEqual(done.returncode, 0, done.stderr)
-        self.assertIn("usage: sc update", done.stdout)
-        self.assertNotIn("refused", done.stdout + done.stderr)
+    def test_help_forms_of_refused_verbs_still_answer_from_the_worktree(self):
+        for argv, needle in (
+            (("update", "--help"), "usage: sc update"),
+            (("rollback", "--help"), "usage: ./sc rollback"),
+            (("rollback", "-h"), "usage: ./sc rollback"),
+            (("eject", "--help"), "usage: ./sc eject"),
+            (("init", "--help"), "usage:"),
+            (("launch", "--help"), "usage: ./sc launch"),
+            (("down", "--help"), "usage: ./sc down"),
+            (("restart", "--help"), "usage: ./sc restart"),
+        ):
+            with self.subTest(argv=argv):
+                before = state_digest(self.main)
+                done = run_sc(self.wt, *argv)
+                self.assertEqual(done.returncode, 0, done.stderr)
+                self.assertIn(needle, done.stdout)
+                self.assertNotIn("refused", done.stdout + done.stderr)
+                self.assertEqual(state_digest(self.main), before)
 
     def artifact_path(self, kind: str) -> str:
         """The live instance's own answer for an artifact path — asked the way
