@@ -60,8 +60,8 @@ _LOG_LOCK = threading.Lock()
 
 sys.path.insert(0, str(ENGINE / "scripts"))
 import artifact_policy  # noqa: E402
-import run_seat  # noqa: E402
-import seat_conversion  # noqa: E402
+import run_seat
+import seat_conversion
 import backfill_shell_api_keys  # noqa: E402  (startup key provisioning)
 import conversation_broker  # noqa: E402  (Feature #24 durable turn service)
 import conversation_launch  # noqa: E402  (canonical shell launch preparation)

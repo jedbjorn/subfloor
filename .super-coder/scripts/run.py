@@ -59,7 +59,6 @@ import conversation_boot  # noqa: E402
 import db_driver  # noqa: E402
 import devkit  # noqa: E402
 import execution_view  # noqa: E402  — which seats receive engine maintenance paths
-import run_seat
 import git_freshness  # noqa: E402
 import git_prune  # noqa: E402  — boot-time prune of provably-merged local branches
 import global_pointer  # noqa: E402
@@ -67,6 +66,7 @@ import install  # noqa: E402  — reuse its canonical HARNESS_BIN (one source of
 import instance_state  # noqa: E402
 import opencode_config  # noqa: E402  — one locked owner for opencode.json
 import ports as ports_mod  # noqa: E402  — derive the per-fork API base URL
+import run_seat
 import sandbox_devkit  # noqa: E402  — readiness receipt identity contract
 import sc_wrapper  # noqa: E402  — verified host command wrapper
 import seed_skills  # noqa: E402  — boot-time self-heal of stale engine skills

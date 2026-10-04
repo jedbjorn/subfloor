@@ -1467,6 +1467,7 @@ class UpdateRefPublicationTest(unittest.TestCase):
             self.assertEqual(
                 scripts,
                 [
+                    ("seat_conversion.py", {}),
                     ("map_setup.py", {"update_target_ref": self.NEW}),
                     ("snapshot.py", {}),
                 ],
@@ -1476,6 +1477,7 @@ class UpdateRefPublicationTest(unittest.TestCase):
                 [
                     "materialize",
                     "reload-seed",
+                    "seat_conversion.py",
                     "migration",
                     "sync-skills",
                     "map_setup.py",

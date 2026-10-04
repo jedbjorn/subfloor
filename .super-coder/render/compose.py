@@ -19,7 +19,7 @@ ENGINE = Path(__file__).resolve().parents[1]
 TEMPLATE_PATH = ENGINE / "templates" / "boot.md"
 sys.path.insert(0, str(ENGINE / "scripts"))
 import artifact_policy  # noqa: E402
-import run_seat  # noqa: E402
+import run_seat
 
 # Rendered into ORIENTATION for every shell EXCEPT the cartographer (who owns the
 # map and heals discrepancies directly — telling it to report them to itself is
