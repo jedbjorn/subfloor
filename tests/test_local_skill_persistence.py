@@ -193,6 +193,11 @@ class SkillCommandTest(unittest.TestCase):
         seed_skills.seeded_skill_names = lambda: ["eng_a"]
         self._saved_token = skill_mod.mem.SC_API_TOKEN
         skill_mod.mem.SC_API_TOKEN = "planner-token"
+        # These tests exercise the local lane's validation and persistence
+        # ladder (the code the API lane runs server-side). A tokened CLI caller
+        # is routed to the API, so pin the lane selector to local here;
+        # require_planner still resolves the planner token above.
+        mock.patch.object(skill_mod, "_shell_api_enabled", return_value=False).start()
         self.persist_snapshot = mock.patch.object(
             skill_mod, "_persist_snapshot"
         ).start()
@@ -522,6 +527,8 @@ class LocalSkillPersistenceIntegrationTest(unittest.TestCase):
         self.patches = [
             mock.patch.object(skill_mod, "DB_PATH", self.db),
             mock.patch.object(skill_mod.mem, "SC_API_TOKEN", "planner-token"),
+            # Local-lane ladder under test; see SkillCommandTest.setUp.
+            mock.patch.object(skill_mod, "_shell_api_enabled", return_value=False),
             mock.patch.object(snapshot_mod, "OUT_PATH", self.snapshot),
             mock.patch.object(
                 skill_mod.artifact_policy, "prepare_local_state", return_value=[]
@@ -650,8 +657,12 @@ class ManifestScopeTest(unittest.TestCase):
 
 
 class SkillApiLaneTest(unittest.TestCase):
-    """`sc skill put` falls back to the engine API when the restricted view
-    masks the engine DB (a launched Planner's seat)."""
+    """A launched shell's `sc skill` verbs go through the engine API only.
+
+    The API is the single writer the control plane advertises; a tokened shell
+    never opens the engine DB directly, even when it could, and an API outage
+    refuses instead of writing behind it. Without a token (host operator,
+    maintenance) the local DB lane stays."""
 
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp())
@@ -674,8 +685,7 @@ class SkillApiLaneTest(unittest.TestCase):
         seed_skills.seeded_skill_names = lambda: ["eng_a"]
         self._saved_token = skill_mod.mem.SC_API_TOKEN
         self._saved_base = skill_mod.mem.SC_API_BASE
-        # The API-lane fallback fires only when the token is present; simulate
-        # the launched shell exactly.
+        # The API lane is chosen by the token; simulate the launched shell.
         skill_mod.mem.SC_API_TOKEN = "planner-token"
         skill_mod.mem.SC_API_BASE = "http://127.0.0.1:9"  # unreachable by design
 
@@ -699,26 +709,41 @@ class SkillApiLaneTest(unittest.TestCase):
         )
         return path
 
-    def test_local_put_works_when_db_is_reachable(self):
-        """A planner token + reachable DB keeps the canonical local put lane."""
-        with mock.patch.object(skill_mod, "_persist_snapshot"), \
-             mock.patch.object(skill_mod, "_persist_render"), \
-             mock.patch.object(
-                 skill_mod.skill_projection, "reconcile_existing_checkouts"):
-            skill_mod.main(["put", "--file", str(self.write_draft("loc_local"))])
+    def test_tokened_shell_never_opens_the_db_even_when_reachable(self):
+        """The DB is right there and readable; the shell still uses the API."""
+        draft = self.write_draft("loc_local")
+        with mock.patch.object(
+            skill_mod, "connect",
+            side_effect=AssertionError("a launched shell opened the engine DB"),
+        ), mock.patch.object(
+            skill_mod.mem, "_api",
+            return_value={"name": "loc_local", "verb": "created"},
+        ) as api:
+            self.assertEqual(skill_mod.main(["put", "--file", str(draft)]), 0)
+        self.assertEqual(api.call_args.args[1], "/_sc/skills/put")
         con = sqlite3.connect(self.db)
         try:
-            self.assertEqual(
-                con.execute(
-                    "SELECT content, is_deleted FROM skills WHERE name='loc_local'"
-                ).fetchone(),
-                ("procedure", 0),
-            )
+            self.assertIsNone(con.execute(
+                "SELECT 1 FROM skills WHERE name='loc_local'").fetchone())
         finally:
             con.close()
 
-    def test_api_fallback_fires_on_permission_error(self):
-        """A masked DB path raises OSError/PermissionError — the call reroutes."""
+    def test_api_outage_refuses_with_the_confusion_instead_of_writing_locally(self):
+        draft = self.write_draft("loc_down")
+        with mock.patch.object(
+            skill_mod, "connect",
+            side_effect=AssertionError("fell back to a direct DB write"),
+        ), self.assertRaises(SystemExit) as caught:
+            skill_mod.main(["put", "--file", str(draft)])
+        message = str(caught.exception)
+        first = message.splitlines()[0]
+        self.assertIn("writes skills only through the engine API", first)
+        self.assertIn("behind the API every other shell reads", first)
+        self.assertIn("API unreachable", message)
+        self.assertLess(message.index("behind the API"), message.index("Retry"))
+
+    def test_tokened_put_uses_the_api_lane_with_the_write_budget(self):
+        """A tokened put reaches the API route; the DB is never tried."""
         draft = self.write_draft("loc_api")
         api_calls: list[tuple[str, str, dict]] = []
         api_kwargs: list[dict] = []
@@ -736,7 +761,7 @@ class SkillApiLaneTest(unittest.TestCase):
             raise AssertionError(f"unexpected API call {path}")
 
         with mock.patch.object(
-            skill_mod, "connect", side_effect=PermissionError("masked root")
+            skill_mod, "connect", side_effect=AssertionError("DB opened")
         ), mock.patch.object(skill_mod.mem, "_api", side_effect=fake_api):
             skill_mod.main(["put", "--file", str(draft)])
 
@@ -753,8 +778,9 @@ class SkillApiLaneTest(unittest.TestCase):
         )
         self.assertGreater(skill_mod.mem._SKILL_WRITE_TIMEOUT, skill_mod.mem._TIMEOUT)
 
-    def test_api_fallback_does_not_swallow_no_db(self):
+    def test_host_seat_without_token_reports_no_db(self):
         """`no live DB` (a missing/empty engine DB on a host seat) still dies."""
+        skill_mod.mem.SC_API_TOKEN = ""
         draft = self.write_draft("loc_nodb")
         with mock.patch.object(
             skill_mod, "connect",
@@ -764,7 +790,7 @@ class SkillApiLaneTest(unittest.TestCase):
         self.assertIn("no live DB", str(cm.exception))
 
     def test_no_token_does_not_fall_back(self):
-        """A restricted-view failure WITHOUT a token cannot reach the API and
+        """A local DB failure WITHOUT a token cannot reach the API and
         surfaces the underlying filesystem error unchanged."""
         skill_mod.mem.SC_API_TOKEN = ""
         draft = self.write_draft("loc_noretry")
@@ -831,8 +857,8 @@ class SkillApiLaneTest(unittest.TestCase):
                 fresh.connect()
 
     def test_every_verb_reroutes_when_private_state_is_unreadable(self):
-        """With a token, every `sc skill` verb reaches its API route when the
-        seat cannot even resolve the DB path — retire/unretire included."""
+        """With a token, every `sc skill` verb reaches its API route — even on
+        a seat that cannot resolve the DB path — retire/unretire included."""
         draft = self.write_draft("loc_all")
         calls: list[tuple[str, dict]] = []
 

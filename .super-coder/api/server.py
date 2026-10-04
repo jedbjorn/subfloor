@@ -558,10 +558,10 @@ def get_cli_skills(con) -> dict:
 # Authenticated Planner-owned fork-local skill mutations (`sc skill` API lane)
 # ===========================================================================
 #
-# A seat that cannot open the engine DB directly (a container seat, whose
-# private engine state lives on the host) reaches `sc skill put|grant|revoke|rm`
-# through these routes; the API runs on the host beside the DB. They mirror the
-# local CLI mutations:
+# Every launched shell reaches `sc skill put|grant|revoke|rm` through these
+# routes: the API is the single writer the control plane advertises, and a
+# tokened shell never writes the engine DB directly. They mirror the local CLI
+# mutations:
 # they reuse skill.py's validation + persistence ladder and are planner-only —
 # the same check the CLI enforces via ``require_planner`` for local writes.
 # Retire/unretire ride the same lane: the retire list is instance-local
@@ -4663,8 +4663,8 @@ class Handler(BaseHTTPRequestHandler):
         """Route POST /_sc/skills/<action> for a launched Planner shell.
 
         Planner-only; every local CLI rule is enforced server-side via the
-        shared skill module so a seat without direct DB access reaches the
-        same catalogue state that a host Admin sees.
+        shared skill module so a launched shell reaches the same catalogue
+        state that a host Admin sees.
         """
         sid = self._require_shell_auth()
         if sid is None:
