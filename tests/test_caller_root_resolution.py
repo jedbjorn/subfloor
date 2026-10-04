@@ -344,24 +344,19 @@ class ProjectVerbTest(CallerRootFixture):
         self.assertEqual(log.read_text().split(), [str(self.wt / "sub"), "project_env=unset"])
 
     def test_skill_put_file(self):
-        """A relative draft path is read from the subdirectory it was typed in."""
-        db = self.main / ".super-coder" / "shell_db.db"
-        con = sqlite3.connect(db)
-        con.executescript((self.main / ".super-coder" / "schema.sql").read_text())
-        if "api_key" not in {row[1] for row in con.execute("PRAGMA table_info(shells)")}:
-            con.execute("ALTER TABLE shells ADD COLUMN api_key TEXT")
-        con.execute("INSERT INTO shells (display_name, shortname, flavor, system_prompt, api_key) "
-                    "VALUES ('Planner', 'PLN1', 'planner', '', 'fixture-planner-token')")
-        con.commit()
-        con.close()
-        self.addCleanup(db.unlink, missing_ok=True)
+        """A relative draft path is read from the subdirectory it was typed in.
+
+        `sc skill put` routes through the API lane by token and validates the
+        draft locally first, so a malformed worktree draft fails naming the
+        resolved path before anything is posted."""
         write(self.wt / "sub" / "draft.md", "WT draft without frontmatter\n")
         self.addCleanup((self.wt / "sub" / "draft.md").unlink, missing_ok=True)
         done = self.sc(self.wt, "skill", "put", "--file", "draft.md", cwd=self.wt / "sub",
-                       SC_API_TOKEN="fixture-planner-token")
+                       SC_API_BASE=self.start_api(), SC_API_TOKEN="fixture-planner-token")
         self.assertNotEqual(done.returncode, 0)
         self.assertIn(f"sc skill: draft {self.wt / 'sub' / 'draft.md'}:", done.stderr)
         self.assertNotIn("cannot read draft", done.stderr)
+        self.assertFalse([r for r in _RecordingApi.requests if r[0] == "POST"])
 
     def command_file_case(self, *verb: str) -> None:
         write(self.wt / "sub" / "cmd.sh", "echo WT\n")
