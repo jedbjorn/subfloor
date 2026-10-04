@@ -316,7 +316,8 @@ def _table_columns(con, table: str) -> list[str]:
 
 def _insert_line(table: str, cols: list[str], row) -> str:
     vals = ", ".join(quote(v) for v in row)
-    return f"INSERT INTO {table} ({', '.join(cols)}) VALUES ({vals});"
+    columns = ", ".join('"' + name.replace('"', '""') + '"' for name in cols)
+    return f"INSERT INTO {table} ({columns}) VALUES ({vals});"
 
 
 def _dependency_ordered_rows(
@@ -465,7 +466,7 @@ def dump_plain_table(con, table: str) -> list[str]:
     cols = [c for c in cols if c not in SENSITIVE_COLUMNS.get(table, ())]
     if not cols:
         return []
-    collist = ", ".join(cols)
+    collist = ", ".join('"' + name.replace('"', '""') + '"' for name in cols)
     where = SNAPSHOT_ROW_FILTERS.get(table, "")
     rows = con.execute(
         f"SELECT {collist} FROM {table} {where} ORDER BY rowid"

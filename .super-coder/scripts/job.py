@@ -379,12 +379,15 @@ def cmd_start(args) -> int:
 
 
 def cmd_list(args) -> int:
+    emitted = False
     if SC_API_TOKEN and SC_API_BASE:
         for row in _api('GET', '/_sc/runs')['runs']:
             if args.all or row['state'] in {'registered', 'running'} or row['wake_state'] == 'blocked':
+                emitted = True
                 print(f"  {row['run_id']:<20} {row['state']:<10} wake={row['wake_state']} {row['label']}")
     if not JOBS.is_dir():
-        print("job: none")
+        if not emitted:
+            print("job: none")
         return 0
     rows = []
     for d in sorted(JOBS.iterdir(), key=lambda p: p.name):
@@ -396,7 +399,8 @@ def cmd_list(args) -> int:
             continue
         rows.append((d.name, st, meta))
     if not rows:
-        print("job: none live" + ("" if args.all else " (--all includes finished)"))
+        if not emitted:
+            print("job: none live" + ("" if args.all else " (--all includes finished)"))
         return 0
     for name, st, meta in rows:
         dur = (_dur(meta.get("started_at", ""), meta.get("finished_at") or _now()))

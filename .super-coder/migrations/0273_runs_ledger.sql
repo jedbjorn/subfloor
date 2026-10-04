@@ -149,7 +149,7 @@ CREATE TRIGGER IF NOT EXISTS runs_identity_immutable
 BEFORE UPDATE OF owner_shell_id,registration_key,kind,argv,cwd ON runs
 BEGIN SELECT RAISE(ABORT,'run identity is immutable'); END;
 CREATE TRIGGER IF NOT EXISTS runs_path_immutable
-BEFORE UPDATE OF evidence_path ON runs WHEN OLD.evidence_path <> ''
+BEFORE UPDATE OF evidence_path ON runs
 BEGIN SELECT RAISE(ABORT,'run evidence path is immutable'); END;
 CREATE TRIGGER IF NOT EXISTS runs_terminal_immutable
 BEFORE UPDATE OF state,exit_code,finished_at,terminal_json ON runs
