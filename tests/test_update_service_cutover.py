@@ -93,6 +93,11 @@ class UpdateServiceCutoverTest(unittest.TestCase):
         ), mock.patch.object(
             update, "stop_docker_review_server", return_value=docker_service
         ), mock.patch.object(
+            # The live module's host-runtime probe reads this checkout's real
+            # instance.json and pidfile; unmocked, this test stopped the real
+            # review server (2026-10-05). The host lane is not under test here.
+            update, "stop_host_review_server", return_value=None
+        ), mock.patch.object(
             update.instance_state, "resolve", return_value=mock.Mock()
         ), mock.patch.object(
             update.instance_state,
