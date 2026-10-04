@@ -4368,6 +4368,62 @@ class Handler(BaseHTTPRequestHandler):
                 map_con.close()
         return self._send(200, out)
 
+    def _runs_request(self, path: str, *, post: bool = False):
+        from runs import RunStore
+
+        operator = path.startswith('/api/')
+        con = db()
+        try:
+            if operator:
+                if not self._require_browser_operator(con, "runs"):
+                    return
+                if post and not self._require_browser_mutation_origin("run controls"):
+                    return
+                sid = None
+            else:
+                sid = self._require_shell_auth()
+                if sid is None:
+                    return
+            store = RunStore(con, ENGINE)
+            parts = path.strip('/').split('/')
+            if len(parts) == 2:
+                if not post:
+                    return self._send(200, {'runs': store.list(sid)})
+                if operator:
+                    raise PermissionError('registration requires shell authentication')
+                return self._send(201, store.register(sid, self._body()))
+            rid = int(parts[2])
+            row = store.get(rid, sid)
+            if len(parts) == 3 and not post:
+                return self._send(200, row)
+            action = parts[3] if len(parts) == 4 else ''
+            if action == 'tail' and not post:
+                # Only the registered engine path is read, never caller input.
+                log = Path(row['evidence_path'])
+                if not log.is_file():
+                    return self._send(200, {'text': '', 'evidence_pruned': True})
+                with log.open('rb') as handle:
+                    handle.seek(max(0, log.stat().st_size - 65536))
+                    text = handle.read(65536).decode(errors='replace')
+                return self._send(200, {'text': text, 'evidence_pruned': False})
+            if action == 'kill' and post:
+                return self._send(200, store.kill(rid, sid))
+            if operator:
+                raise PermissionError('run execution writes require owner authentication')
+            if post and action == 'running':
+                return self._send(200, store.running(rid, sid, self._body()))
+            if post and action == 'terminal':
+                return self._send(200, store.terminal(rid, sid, self._body()))
+            return self._send(404, {'error': 'unknown run action'})
+        except PermissionError as exc:
+            return self._send(403, {'error': str(exc)})
+        except KeyError as exc:
+            return self._send(404, {'error': str(exc)})
+        except (ValueError, TypeError) as exc:
+            return self._send(409 if 'conflict' in str(exc) else 400, {'error': str(exc)})
+        finally:
+            con.close()
+
     # -- /mem/* token-scoped shell memory endpoints --
 
     def _mem_get(self, path: str):
@@ -5437,6 +5493,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._shell_catalog_get(path)
         if path == "/_sc/context":
             return self._context_get()
+        if path in ('/_sc/runs', '/api/runs') or path.startswith(('/_sc/runs/', '/api/runs/')):
+            return self._runs_request(path)
         if path.startswith("/_sc/mem/"):
             return self._mem_get(path)
         if path.startswith("/_sc/sprint/"):
@@ -5711,6 +5769,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._skills_mutation_post(path, self._body())
             except Exception as exc:  # noqa: BLE001 — _fail handles reporting
                 return self._fail(exc)
+        if path in ('/_sc/runs', '/api/runs') or path.startswith(('/_sc/runs/', '/api/runs/')):
+            return self._runs_request(path, post=True)
         if path.startswith("/_sc/mem/"):
             return self._mem_post(path, self._body())
         if path.startswith("/_sc/pr/"):

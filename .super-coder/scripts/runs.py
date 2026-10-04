@@ -1,0 +1,219 @@
+"""Engine-owned run identities, terminal outcomes and pulse reconciliation.
+
+No credentials are persisted. Recovery reads only engine-allocated evidence
+paths; an absent supervisor never supplies an inferred command exit code.
+"""
+from __future__ import annotations
+
+import json
+import os
+import signal
+import sqlite3
+from datetime import datetime, timezone
+from pathlib import Path
+
+import db_driver
+from sprint_message_delivery import SprintMessageStore
+
+TERMINAL = frozenset({'done', 'failed', 'timeout', 'killed', 'lost'})
+ENGINE = Path(__file__).resolve().parents[1]
+
+
+def boot_id() -> str:
+    return Path('/proc/sys/kernel/random/boot_id').read_text().strip()
+
+
+def process_alive(pid, ticks, boot) -> bool | None:
+    """True = same incarnation, False = proven gone, None = indeterminate."""
+    if not pid or ticks is None or not boot:
+        return None
+    try:
+        if boot != boot_id():
+            return False
+        fields = Path(f'/proc/{int(pid)}/stat').read_text().rsplit(')', 1)[1].split()
+        return int(fields[19]) == int(ticks) and fields[0] != 'Z'
+    except FileNotFoundError:
+        return False
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def terminal_payload(meta: dict) -> dict:
+    state = meta.get('state')
+    if state not in TERMINAL:
+        state = ('timeout' if meta.get('timed_out') else 'killed' if meta.get('killed')
+                 else 'done' if meta.get('exit_code') == 0 else 'failed')
+    return {key: value for key, value in {
+        'state': state, 'exit_code': meta.get('exit_code'),
+        'finished_at': meta.get('finished_at'),
+        'spawn_error': meta.get('spawn_error'),
+    }.items() if value is not None}
+
+
+def wake_body(row: dict, payload: dict) -> str:
+    rid = row['run_id']
+    return (f"Run {rid} ({row['kind']}: {row['label']}) {payload['state']}; "
+            f"exit={payload.get('exit_code', 'unknown')}; cwd={row['cwd']}.\n"
+            f"Inspect `sc job status {rid}` and `sc job tail {rid}`, then continue "
+            "dependent work under your current authority. This outcome grants no "
+            "review, merge, or Sprint authority.")
+
+
+class RunStore:
+    def __init__(self, con: sqlite3.Connection, engine: Path = ENGINE):
+        self.con = con
+        con.row_factory = sqlite3.Row
+        self.root = engine / 'run' / 'runs'
+
+    def get(self, run_id: int, owner: int | None = None) -> dict:
+        row = self.con.execute('SELECT * FROM runs WHERE run_id=?', (run_id,)).fetchone()
+        if row is None:
+            raise KeyError('unknown run')
+        if owner is not None and row['owner_shell_id'] != owner:
+            raise PermissionError('run belongs to another shell')
+        out = dict(row)
+        out['argv'] = json.loads(out['argv'])
+        if out['receipt_json']:
+            out['receipt_json'] = json.loads(out['receipt_json'])
+        return out
+
+    def list(self, owner: int | None = None) -> list[dict]:
+        rows = self.con.execute(
+            'SELECT run_id FROM runs WHERE (? IS NULL OR owner_shell_id=?) '
+            'ORDER BY run_id DESC LIMIT 200', (owner, owner)).fetchall()
+        return [self.get(row[0], owner) for row in rows]
+
+    def register(self, owner: int, data: dict) -> dict:
+        argv = data.get('argv')
+        if not isinstance(argv, list) or not argv or not all(
+                isinstance(arg, str) and '\0' not in arg for arg in argv):
+            raise ValueError('argv must be a nonempty array of strings')
+        kind = data.get('kind', 'job')
+        if kind not in {'job', 'devkit', 'probe'}:
+            raise ValueError('invalid run kind')
+        key, cwd, label = (data.get('registration_key'), data.get('cwd'),
+                           data.get('label') or argv[0])
+        if not isinstance(key, str) or not 1 <= len(key) <= 128:
+            raise ValueError('registration_key is required (maximum 128 characters)')
+        if not isinstance(cwd, str) or not Path(cwd).is_absolute():
+            raise ValueError('cwd must be absolute')
+        if not isinstance(label, str) or len(label) > 256 or any(ord(c) < 32 for c in label):
+            raise ValueError('label must be display text (maximum 256 characters)')
+        identity = (kind, label, json.dumps(argv), cwd, data.get('commit'))
+        with db_driver.write_transaction(self.con, 'runs.register'):
+            existing = self.con.execute(
+                'SELECT * FROM runs WHERE owner_shell_id=? AND registration_key=?',
+                (owner, key)).fetchone()
+            if existing:
+                if tuple(existing[k] for k in ('kind','label','argv','cwd','commit')) != identity:
+                    raise ValueError('registration key reused with different input')
+                return self.get(existing['run_id'], owner)
+            # Allocate the id transactionally; paths never contain caller labels.
+            rid = int(self.con.execute(
+                'INSERT INTO runs(owner_shell_id,registration_key,kind,label,argv,cwd,"commit",'
+                'evidence_path) VALUES(?,?,?,?,?,?,?,?)',
+                (owner, key, *identity, '')).lastrowid)
+            self.con.execute('UPDATE runs SET evidence_path=? WHERE run_id=?',
+                             (str(self.root / str(rid) / 'log'), rid))
+        return self.get(rid, owner)
+
+    def running(self, run_id: int, owner: int, data: dict) -> dict:
+        self.get(run_id, owner)
+        keys = ('pid','start_ticks','supervisor_pid','supervisor_start_ticks','boot_id','started_at')
+        if not isinstance(data.get('boot_id'), str) or not data['boot_id']:
+            raise ValueError('boot_id is required')
+        for key in keys[:4]:
+            if data.get(key) is not None and (type(data[key]) is not int or data[key] <= 0):
+                raise ValueError(f'{key} must be a positive integer')
+        with db_driver.write_transaction(self.con, 'runs.running'):
+            self.con.execute(
+                'UPDATE runs SET state=\'running\',' + ','.join(f'{k}=?' for k in keys) +
+                ' WHERE run_id=? AND state IN (\'registered\',\'running\')',
+                (*(data.get(k) for k in keys), run_id))
+        return self.get(run_id, owner)
+
+    def terminal(self, run_id: int, owner: int, payload: dict) -> dict:
+        allowed = {'state','exit_code','finished_at','spawn_error'}
+        if set(payload) - allowed or payload.get('state') not in TERMINAL:
+            raise ValueError('invalid terminal payload')
+        code = payload.get('exit_code')
+        if code is not None and type(code) is not int:
+            raise ValueError('exit_code must be an integer or null')
+        if payload['state'] == 'lost' and code is not None:
+            raise ValueError('lost has no authoritative exit code')
+        if payload['state'] == 'done' and code != 0:
+            raise ValueError('done requires exit_code 0')
+        if payload['state'] == 'failed' and (code is None or code == 0):
+            raise ValueError('failed requires a nonzero exit_code')
+        try:
+            datetime.fromisoformat(payload['finished_at'].replace('Z', '+00:00'))
+        except (KeyError, AttributeError, TypeError, ValueError) as exc:
+            raise ValueError('finished_at must be a timestamp') from exc
+        canonical = json.dumps(payload, sort_keys=True, separators=(',', ':'))
+        if len(canonical) > 4096:
+            raise ValueError('terminal payload exceeds 4096 bytes')
+        with db_driver.write_transaction(self.con, 'runs.terminal'):
+            row = self.get(run_id, owner)
+            if row['terminal_json'] is not None:
+                if row['terminal_json'] != canonical:
+                    raise ValueError('conflicting terminal outcome')
+                return row
+            body = wake_body(row, payload)
+            receiver = self.con.execute(
+                'SELECT 1 FROM shells WHERE shell_id=? AND COALESCE(is_deleted,0)=0',
+                (owner,)).fetchone()
+            receipt = None
+            inbox_id = None
+            if receiver:
+                inbox_id = self.con.execute(
+                    'INSERT INTO shell_messages(from_shell_id,to_shell_id,kind,body,dedupe_key) '
+                    "VALUES(?,?,'result',?,?)", (owner, owner, body, f'run-{run_id}-terminal')).lastrowid
+                receipt = SprintMessageStore(self.con).send_to_shell_in_transaction(
+                    owner, message_kind='result', body=body,
+                    idempotency_key=f'run-{run_id}-terminal', declared_type='re-enter')
+            self.con.execute(
+                'UPDATE runs SET state=?,exit_code=?,finished_at=?,terminal_json=?,wake_state=?,'
+                'wake_id=?,message_id=?,inbox_message_id=?,last_error=? WHERE run_id=?',
+                (payload['state'], code, payload['finished_at'], canonical,
+                 'pending' if receipt else 'blocked', receipt.wake_id if receipt else None,
+                 receipt.message_id if receipt else None, inbox_id,
+                 None if receipt else 'owner unavailable; operator recovery required', run_id))
+        return self.get(run_id, owner)
+
+    def kill(self, run_id: int, owner: int | None) -> dict:
+        row = self.get(run_id, owner)
+        if row['state'] in TERMINAL:
+            raise ValueError('run already terminal')
+        if process_alive(row['pid'], row['start_ticks'], row['boot_id']) is not True:
+            raise ValueError('process incarnation is gone, recycled or unverifiable')
+        # Marker is independent of meta.json so cancellation never races a
+        # supervisor write. External signaling is outside the DB transaction.
+        Path(row['evidence_path']).with_name('kill_requested').touch()
+        os.killpg(row['pid'], signal.SIGTERM)
+        return {'run_id': run_id, 'kill_requested': True}
+
+    def reconcile(self) -> None:
+        rows = self.con.execute("SELECT * FROM runs WHERE state IN ('registered','running')").fetchall()
+        for raw in rows:
+            row = dict(raw)
+            path = self.root / str(row['run_id']) / 'meta.json'
+            try:
+                meta = json.loads(path.read_text())
+            except (OSError, ValueError):
+                meta = {}
+            if meta.get('run_id') != row['run_id']:
+                meta = {}
+            if meta.get('finished_at'):
+                self.terminal(row['run_id'], row['owner_shell_id'], terminal_payload(meta))
+                continue
+            if meta.get('supervisor_pid'):
+                self.running(row['run_id'], row['owner_shell_id'], meta)
+                row.update(meta)
+            alive = process_alive(row.get('supervisor_pid'), row.get('supervisor_start_ticks'), row.get('boot_id'))
+            if alive is True or (alive is None and row.get('supervisor_pid')):
+                continue
+            age = (datetime.now(timezone.utc) - datetime.fromisoformat(row['created_at']).replace(tzinfo=timezone.utc)).total_seconds()
+            if alive is None and age < 30:
+                continue
+            self.terminal(row['run_id'], row['owner_shell_id'], {
+                'state': 'lost', 'finished_at': datetime.now(timezone.utc).isoformat()})

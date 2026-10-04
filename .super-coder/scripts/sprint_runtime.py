@@ -247,6 +247,11 @@ class SprintRuntimeService(threading.Thread):
         startup: bool,
         run_cleanup: bool = True,
     ) -> bool:
+        from runs import RunStore
+        import run_wakes
+
+        RunStore(con).reconcile()
+        run_wakes.reconcile(con)
         monitored = activity_monitor.ActivityMonitor(
             con, config=self.activity_config
         ).tick()

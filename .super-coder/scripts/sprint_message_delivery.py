@@ -1419,6 +1419,8 @@ class SprintWakeDeliveryService:
                     if index == last
                     else f"{lease.idempotency_key}:message:{message_id}",
                 )
+                import run_wakes
+                run_wakes.record_enqueue(self.con, message_id, native_run_ref)
         except ForceNewDeferred:
             self._defer_force_new(lease)
             return DeliveryOutcome(
@@ -1427,6 +1429,13 @@ class SprintWakeDeliveryService:
                 lease.attempt_number - 1,
             )
         except Exception as exc:  # external delivery faults become durable evidence
+            if lease.sprint_id is None and self.con.execute(
+                'SELECT 1 FROM runs r JOIN sprint_wake_messages wm USING(message_id) '
+                'WHERE wm.wake_id=? LIMIT 1', (lease.wake_id,)
+            ).fetchone():
+                import run_wakes
+                attempt, state = run_wakes.record_transport_failure(self.con, lease, exc, self.now())
+                return DeliveryOutcome(lease.wake_id, state, attempt)
             attempt = self.lifecycle.record_wake_failure(
                 lease.wake_id,
                 str(exc) or exc.__class__.__name__,

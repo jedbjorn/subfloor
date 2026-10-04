@@ -300,20 +300,25 @@ class CompletionRowTest(unittest.TestCase):
             con.close()
 
     def test_completion_row_lands_and_dedupes(self):
-        meta = {"job_id": "9-suite", "label": "suite", "cmd": ["pytest"],
-                "started_at": "2026-07-14T10:00:00Z",
-                "finished_at": "2026-07-14T10:05:00Z",
-                "exit_code": 0, "log": "/tmp/x/log"}
+        row = job._api('POST', '/_sc/runs', {
+            'registration_key': 'completion-test', 'argv': ['pytest'], 'cwd': self.tmpdir,
+            'label': 'suite'})
+        jobdir = Path(self.tmpdir) / 'completion'
+        jobdir.mkdir(exist_ok=True)
+        meta = {"run_id": row['run_id'], "job_id": str(row['run_id']), "label": "suite",
+                "cmd": ["pytest"], "started_at": "2026-07-14T10:00:00Z",
+                "finished_at": "2026-07-14T10:05:00Z", "exit_code": 0,
+                "log": str(jobdir / 'log')}
         self.assertTrue(job.send_completion(meta, retries=1, delay=0))
-        self.assertTrue(job.send_completion(meta, retries=1, delay=0))  # retry
-        rows = self.q(
-            "SELECT from_shell_id, to_shell_id, kind, body FROM shell_messages "
-            "WHERE dedupe_key='job-9-suite-completion'")
-        self.assertEqual(1, len(rows))          # deduped, not twinned
+        self.assertTrue(job.send_completion(meta, retries=1, delay=0))
+        rows = self.q("SELECT from_shell_id,to_shell_id,kind,body FROM shell_messages "
+                      "WHERE dedupe_key=?", f"run-{row['run_id']}-terminal")
+        self.assertEqual(1, len(rows))
         frm, to, kind, body = rows[0]
-        self.assertEqual((1, 1, "result"), (frm, to, kind))  # own inbox
-        self.assertIn("9-suite", body)
-        self.assertIn("done", body)
+        self.assertEqual((1, 1, 'result'), (frm, to, kind))
+        self.assertIn('done', body)
+        self.assertEqual(1, len(self.q('SELECT * FROM wake_message WHERE message_id=?',
+                                      job.ledger_run(str(row['run_id']))['message_id'])))
 
     def test_no_api_env_gives_up_quietly(self):
         old_base, old_tok = job.SC_API_BASE, job.SC_API_TOKEN

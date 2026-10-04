@@ -149,6 +149,8 @@ class ActivityMonitor:
             "FROM sprint_wake_outbox w "
             "WHERE w.sprint_id IS NULL AND w.state='failed' "
             "AND w.idempotency_key NOT LIKE 'engine-recovery:%' "
+            "AND NOT EXISTS (SELECT 1 FROM runs r JOIN sprint_wake_messages wm "
+            "ON wm.message_id=r.message_id WHERE wm.wake_id=w.wake_id) "
             "AND w.created_at>=datetime('now', ?) "
             "AND EXISTS (SELECT 1 FROM sprint_wake_messages joined "
             "JOIN wake_message message USING (message_id) "
