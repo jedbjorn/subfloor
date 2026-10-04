@@ -403,13 +403,42 @@ class SkillCliConnectionTest(unittest.TestCase):
         opened.assert_called_once_with()
 
     def test_mutation_keeps_the_wal_enabled_write_connection(self):
+        # The host operator's lane: no shell token.
         con = mock.Mock()
         with (
+            mock.patch.object(skill_cli.mem, "SC_API_TOKEN", ""),
             mock.patch.object(skill_cli, "connect", return_value=con) as opened,
             mock.patch.object(skill_cli, "cmd_grant", return_value=0),
         ):
             self.assertEqual(skill_cli.main(["grant", "onboard", "DEV1"]), 0)
         opened.assert_called_once_with()
+
+    def test_a_tokened_shell_with_a_readable_db_never_mutates_locally(self):
+        """B1: a Dev token on the host must reach the Planner-checked API
+        lane for every mutation, never cmd_* against the live DB."""
+        verbs = {
+            "grant": (["grant", "onboard", "DEV1"], "cmd_grant", "/_sc/skills/grant"),
+            "revoke": (["revoke", "onboard", "DEV1"], "cmd_revoke", "/_sc/skills/revoke"),
+            "rm": (["rm", "onboard"], "cmd_rm", "/_sc/skills/rm"),
+            "retire": (["retire", "onboard"], "cmd_retire", "/_sc/skills/retire"),
+            "unretire": (["unretire", "onboard"], "cmd_unretire", "/_sc/skills/unretire"),
+        }
+        for name, (argv, local, route) in verbs.items():
+            with self.subTest(verb=name), (
+                mock.patch.object(skill_cli.mem, "SC_API_TOKEN", "dev-token")
+            ), mock.patch.object(skill_cli.mem, "SC_API_BASE", "http://engine"), \
+                    mock.patch.object(skill_cli, "connect",
+                                      side_effect=AssertionError("opened DB")), \
+                    mock.patch.object(skill_cli, local,
+                                      side_effect=AssertionError("local mutation")), \
+                    mock.patch.object(
+                        skill_cli.mem, "_api",
+                        side_effect=SystemExit("skill: API POST " + route
+                                               + " → HTTP 403: Planner-owned"),
+                    ) as api:
+                with self.assertRaisesRegex(SystemExit, "Planner-owned"):
+                    skill_cli.main(argv)
+                self.assertEqual(api.call_args.args[1], route)
 
 
 if __name__ == "__main__":

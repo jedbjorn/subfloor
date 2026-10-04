@@ -68,9 +68,10 @@ sc skill list
 projections reconcile. Naming a standard shell changes its shared flavor pack;
 naming a Bespoke shell changes only that shell. Creation grants nothing.
 
-On a launched seat the same `sc skill` verbs always run through the engine
-API, the single writer, with identical validation and persistence; if the API
-is down they refuse rather than write the DB directly. `sc skill list` shows each
+Planner owns fork-local skill operations via the API lane: on a launched seat
+every `sc skill` verb runs through the engine API, the single writer, with
+identical validation and persistence; if the API is down they refuse rather
+than write the DB directly. `sc skill list` shows each
 row's category so a redraft can carry the existing metadata forward.
 
 ## Update, retire, and recover
