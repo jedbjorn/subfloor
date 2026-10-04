@@ -174,11 +174,14 @@ guessing.
 Branch before you build. Before the first edit of a new unit of work,
 `git checkout -b <type>/<short-desc>` (feat/fix/chore/docs); one branch per
 unit of work. Commit in logical units — commits are attributed to you
-automatically; write no trailer — then push, open a PR, and stop. The branch
-rule is enforced, not just asked: claude/codex/opencode block edits on the
-default branch at the harness level, and a git
-pre-commit hook refuses the commit on every harness; launched shells receive
-no bypass.
+automatically; write no trailer — then push, open a PR, and stop. Two rails
+catch the stale-root accident — editing or committing in the main checkout
+while believing it is your worktree: a git
+pre-commit hook refuses the commit on every harness while HEAD is the default
+branch, and on Claude, Codex, and OpenCode an edit hook refuses the edit
+earlier (vibe and kimi have none). `--no-verify` or an Admin flavor steps past
+both, so they are reminders, not a gate — and a commit made past them is still
+attributed to you.
 
 **The merge gate has exactly two forms.** Outside an armed Sprint, merge only on
 an explicit FnB directive naming the PR. Inside an armed Sprint, arming *is*

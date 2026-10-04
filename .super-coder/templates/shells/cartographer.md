@@ -8,6 +8,13 @@ data with `sc map-sql "…"`, write only the authored rows named below with
 with `sc map finalize` (exit 0 = every required row PASS or N/A; 2 = pending
 owner actions; 1 = a failed check).
 
+The catalogue's subject is the install's main line, never your worktree:
+`sc map`, `sc map-setup`, and `sc map finalize` run from your worktree scan and
+check the live root (or the declared work repo) and print one line naming its
+branch, sha, and whether it is behind upstream. Behind -> ask Admin to
+fast-forward main, then remap; never point the map at your worktree to get
+newer files.
+
 ## FIRST BOOT AND HEAL
 
 Run on first boot, after a shape notice, or when the map drifts:
@@ -22,13 +29,16 @@ Run on first boot, after a shape notice, or when the map drifts:
    SELECT role, COUNT(*) AS files FROM dr_filepath GROUP BY role ORDER BY files DESC;
    ```
 
-3. Tune `.sc-state/local/map/config.json` in your worktree only where defaults
-   are wrong (`skip_dirs`, `skip_files`, `role_overrides` with `prefix` or
-   `glob`); all keys optional, skip sets extend defaults and cannot re-include
-   engine-owned paths. Config is per-clone runtime state, never a commit.
-4. `sc map-setup`; pass = `git config --get core.hooksPath` prints
-   `.super-coder/hooks`, the hooks are executable, and `dr_repo` carries a
-   current `mapped_at` and correct file count.
+3. Tune the map config only where defaults are wrong (`skip_dirs`,
+   `skip_files`, `role_overrides` with `prefix` or `glob`); all keys optional,
+   skip sets extend defaults and cannot re-include engine-owned paths. `sc map`
+   reads it from the live install's `.sc-state/local/map/config.json` — a copy in
+   your worktree is never read. Config is per-clone runtime state,
+   never a commit.
+4. `sc map-setup`; pass = `git config --get core.hooksPath` prints the live
+   install's absolute `<live root>/.super-coder/hooks` (never a path inside
+   your worktree), the hooks are executable, and `dr_repo` carries a current
+   `mapped_at` and correct file count for the live root.
 5. Curate sections, descriptions, and semantic rows with the worklists below.
 6. Resolve every notice-linked flag, then mark the notice read last.
 7. `sc map finalize`; complete your rows, hand Admin-owned snapshot and review
@@ -92,7 +102,9 @@ product DB -> N/A.
 An extractor implements `extract(con, repo_root, cfg) -> str`, owns only its
 semantic `dr_*` rows, deletes and repopulates them, guards unparseable files,
 and reports best-effort omissions. Adopt one: inspect the stack with
-`sc map-sql`; author `.sc-state/map_extractors/<name>.py` in your worktree;
+`sc map-sql`; read the closest reference from the live install's
+`<live root>/.super-coder/templates/map_extractors/` (a fork worktree has no
+`.super-coder/`); author `.sc-state/map_extractors/<name>.py` in your worktree;
 install it only with `sc map-extractor install ".sc-state/map_extractors/<name>.py"`
 (pass = it prints the canonical path and a SHA-256 matching your bytes); never
 `cp`, `mv`, redirect, or edit into another checkout's `.sc-state/map_extractors/`;
@@ -126,6 +138,9 @@ verified map result, otherwise
 
 Map config, live descriptions, derived rows, install receipts, and generated
 status are local-only. Sections persist only through the GUI Snapshot action
-or Admin's `sc snapshot`; never run `sc snapshot` yourself — it is refused.
+or Admin's `sc snapshot`. Serializing the shared instance is an Admin step
+gated on token identity: a Cartographer's `sc snapshot` is refused with that
+message (and from a worktree the dispatcher refuses it first), so hand the
+step to Admin.
 Pass = `sc map finalize` reports Authored sections PASS after Admin acts,
 without you mutating snapshot, Git, message, or flag state on their behalf.
