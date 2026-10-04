@@ -77,7 +77,6 @@ sys.path.insert(0, str(ENGINE / "scripts"))
 import artifact_policy  # noqa: E402
 import callable_floor  # noqa: E402
 import db_driver  # noqa: E402
-import engine_identity  # noqa: E402
 import engine_manifest  # noqa: E402
 import install as install_mod  # noqa: E402  (ensure_harnesses)
 import shell_alias  # noqa: E402
@@ -162,6 +161,8 @@ def run_script(name: str, *, update_target_ref: str | None = None) -> None:
     # update maintains the instance itself: its children run as the engine,
     # not as whichever launched shell's token the operator's terminal carries
     # (engine_identity.engine_internal_env), so map-setup runs the owner bridge.
+    import engine_identity  # lazy: update.py is also copied standalone
+
     env = engine_identity.engine_internal_env()
     if update_target_ref is not None:
         env["SC_UPDATE_TARGET_REF"] = update_target_ref

@@ -170,7 +170,6 @@ if __name__ == "__main__":
 
 sys.path.insert(0, str(ENGINE / "scripts"))
 import callable_floor  # noqa: E402
-import engine_identity  # noqa: E402
 import engine_manifest  # noqa: E402
 from engine_paths import GENERATED_INSTALL_PATHS  # noqa: E402
 import global_pointer  # noqa: E402
@@ -1168,6 +1167,8 @@ def main(argv: list[str]) -> int:
     # 8. Persist: snapshot + render ------------------------------------------
     # install maintains the instance itself: serialize as the engine, not as a
     # launched shell whose token the installing terminal may carry.
+    import engine_identity  # lazy: install.py is also copied standalone
+
     admin_env = engine_identity.engine_internal_env()
     run_critical_phase(
         "Serializing the installed state",
