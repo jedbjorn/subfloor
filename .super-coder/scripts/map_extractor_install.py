@@ -20,6 +20,7 @@ from typing import Iterator, Mapping
 
 import artifact_policy
 import map_repo
+import project_root
 
 
 SAFE_NAME = re.compile(r"[A-Za-z][A-Za-z0-9_]*\.py\Z")
@@ -129,9 +130,9 @@ def validate_candidate(
     except OSError as exc:
         raise ExtractorInstallError(f"shell worktree is unavailable: {raw_worktree}") from exc
     expected_dir = worktree / ".sc-state" / "map_extractors"
-    source = Path(raw_source).expanduser()
-    if not source.is_absolute():
-        source = Path.cwd() / source
+    # Relative to where the operator typed it, not the checkout root the
+    # dispatcher runs from (spec #267 U3).
+    source = project_root.invocation_path(raw_source, env)
     try:
         source_stat = source.lstat()
     except OSError as exc:

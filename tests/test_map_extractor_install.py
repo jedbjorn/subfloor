@@ -229,7 +229,7 @@ class ExtractorInstallTest(unittest.TestCase):
     def test_dispatcher_exposes_only_the_dedicated_install_module(self):
         dispatch = (ENGINE / "scripts" / "dispatch.sh").read_text()
         self.assertIn(
-            'map-extractor) exec "$PY" "$S/map_extractor_install.py" "$@" ;;',
+            'map-extractor) sc_project_env; exec "$PY" "$S/map_extractor_install.py" "$@" ;;',
             dispatch,
         )
 

@@ -122,6 +122,38 @@ class BranchGuardTest(unittest.TestCase):
             subprocess.run(["git", "checkout", "-q", "main"],
                            cwd=self.repo, check=True, capture_output=True)
 
+    @unittest.skipIf(
+        any(str(Path.home().resolve()).startswith(root) for root in
+            ("/tmp/", "/var/tmp/", "/dev/shm/",
+             *([os.environ["TMPDIR"].rstrip("/") + "/"] if os.environ.get("TMPDIR") else []))),
+        "HOME is under a scratch root the guard allows outright; the case would be vacuous",
+    )
+    def test_cross_tree_feature_branch_edit_is_allowed_silently(self):
+        """Ledger A2 retired (spec #267 U3): an edit outside SC_SHELL_WORKTREE on
+        a feature branch is allowed with no warning, because engine commands now
+        resolve project paths from the invoking checkout."""
+        home = Path(tempfile.mkdtemp(prefix="sc-bg-home-", dir=Path.home()))
+        self.addCleanup(shutil.rmtree, home, ignore_errors=True)
+        subprocess.run(["git", "init", "-q", "-b", "feat/home"], cwd=home,
+                       check=True, capture_output=True)
+        subprocess.run(["git", "checkout", "-q", "-B", "feat/cross-tree"],
+                       cwd=self.repo, check=True, capture_output=True)
+        try:
+            env = {k: v for k, v in os.environ.items()
+                   if k not in ("SC_SHELL_FLAVOR", "SC_SHARED_DIRS", "TMPDIR",
+                                "SC_PROTECTED_BRANCHES")}
+            env["SC_SHELL_WORKTREE"] = str(home)
+            payload = json.dumps(
+                {"tool_input": {"file_path": str(self.repo / "src" / "other.py")}})
+            r = subprocess.run(["bash", str(GUARD)], input=payload, text=True,
+                               cwd=home, env=env, capture_output=True, check=False)
+        finally:
+            subprocess.run(["git", "checkout", "-q", "main"],
+                           cwd=self.repo, check=True, capture_output=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(r.stderr, "")
+        self.assertEqual(r.stdout, "")
+
     def test_bare_operator_gets_deliberate_recovery(self):
         result = self.pre_commit()
         self.assertEqual(result.returncode, 2)

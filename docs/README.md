@@ -278,7 +278,7 @@ repo config, so it applies to the main checkout and every shell worktree alike.
 | `pre-commit` | the branch-guard backstop — refuses a commit on a protected default branch |
 | `prepare-commit-msg` | appends one `Co-Authored-By: <shell> <shortname@subfloor.local>` trailer when a shell is booted |
 | `post-commit` | prints the shell's `./sc preview` URL after a commit inside a worktree |
-| `post-checkout` · `post-merge` · `post-rewrite` | best-effort `./sc map` refresh of the `dr_*` catalogue |
+| `post-checkout` · `post-merge` · `post-rewrite` | best-effort `./sc map --auto` refresh of the `dr_*` catalogue: when the event happens in the main checkout it re-scans that checkout (or the declared work repo); in a shell worktree it does nothing |
 
 Only `pre-commit` can block; the rest never fail a git operation.
 

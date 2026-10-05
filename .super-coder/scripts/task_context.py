@@ -757,12 +757,13 @@ def render(p: dict) -> str:
         out.append("  repo map: not mapped yet (the cartographer maps it)")
     out.append("  " + " · ".join(r["map_commands"]) + f" — {r['map_note']}")
     hooks = r["dev_hooks"]
+    where = f" [declared in {hooks['checkout']}]" if hooks.get("checkout") else ""
     if hooks["hooks"]:
         out.append("  dev hooks: " + ", ".join(f"sc {h}" for h in hooks["hooks"])
-                   + f" — {r['dev_hooks_note']}")
+                   + f" — {r['dev_hooks_note']}{where}")
     else:
         out.append(f"  dev hooks: {hooks['state']}"
-                   + (f" ({hooks['detail']})" if hooks.get("detail") else ""))
+                   + (f" ({hooks['detail']})" if hooks.get("detail") else "") + where)
     return "\n".join(out)
 
 
@@ -781,6 +782,24 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
+def _declare_caller_hooks(payload: dict) -> None:
+    """Report the dev hooks of the checkout that invoked `sc`.
+
+    The API server can only read its own (live) checkout, so from a shell's
+    worktree it reported that checkout's declaration — "absent" while the
+    worktree declared hooks (issue #1616). `sc <hook>` runs the CALLER's
+    declaration, so the projection names that one (spec #267 U3).
+    """
+    resources = payload.get("resources")
+    if not isinstance(resources, dict):
+        return
+    import project_root
+    root = project_root.project_root()
+    hooks = _declared_hooks(root)
+    hooks["checkout"] = str(root)
+    resources["dev_hooks"] = hooks
+
+
 def main(argv: list[str]) -> int:
     import urllib.parse
 
@@ -791,6 +810,7 @@ def main(argv: list[str]) -> int:
     query = {"task": args.task} if args.task is not None else {"work_unit": args.work_unit}
     query.update(runtime_from_environment())
     payload = mem._api("GET", "/_sc/context?" + urllib.parse.urlencode(query))
+    _declare_caller_hooks(payload)
     print(json.dumps(payload, indent=2, default=str) if args.json else render(payload))
     return 0
 

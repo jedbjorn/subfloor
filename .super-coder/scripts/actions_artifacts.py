@@ -7,6 +7,7 @@ import sys
 from pathlib import Path
 
 import actions_artifact_gc as gc
+import project_root
 
 WORKFLOW = Path(".github/workflows/subfloor-artifact-cleanup.yml")
 
@@ -83,7 +84,8 @@ def main(argv: list[str] | None = None) -> int:
     setup = argparse.ArgumentParser(prog="sc actions-artifacts setup-ci")
     setup.add_argument("--older-than-days", type=gc.positive_days, default=7)
     options = setup.parse_args(remainder)
-    target = setup_ci(Path.cwd(), options.older_than_days)
+    # The workflow belongs to the checkout that invoked `sc` (U3).
+    target = setup_ci(project_root.project_root(), options.older_than_days)
     print(f"Created {target}. Review, commit and merge to enable daily cleanup.")
     print("Manual dispatch defaults to dry run. Set upload-artifact retention-days to match.")
     return 0

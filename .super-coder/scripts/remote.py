@@ -12,6 +12,7 @@ import sys
 from pathlib import Path
 
 import ports
+import project_root
 import vm
 
 RESOURCE_NAME = re.compile(r"[a-z0-9][a-z0-9-]{0,31}\Z")
@@ -522,7 +523,8 @@ def client_main(argv: list[str]) -> int:
             )
         elif args.command_file:
             try:
-                command = Path(args.command_file).read_text(encoding="utf-8")
+                command = project_root.invocation_path(
+                    args.command_file).read_text(encoding="utf-8")
             except (OSError, UnicodeError):
                 value = vm.operation_error(
                     "exec", "remote_exec_invalid",

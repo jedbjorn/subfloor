@@ -797,7 +797,12 @@ def run_hook(
         )
         return 78
 
-    child_environment = dict(environment if environment is not None else os.environ)
+    # The hook is fork code, not this command: it never inherits the
+    # dispatcher's one-command project identity (scripts/project_root.py).
+    # Imported here so declaration-only consumers (sandbox_devkit) need no more.
+    import project_root
+
+    child_environment = project_root.scrubbed(environment)
     seat = "docker" if child_environment.get("SC_SANDBOX") else "host"
     child_environment.update(
         {

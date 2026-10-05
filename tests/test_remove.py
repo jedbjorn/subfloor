@@ -500,7 +500,8 @@ class WiringTest(unittest.TestCase):
         self.assertIn('remove)       if sc_help_form "$@"; then', dispatcher)
         self.assertIn('exec "$PY" "$S/remove.py" "$@"', dispatcher)
         self.assertIn('alias)        exec "$PY" "$S/shell_alias.py" "$@" ;;', dispatcher)
-        self.assertIn('make-cleanup) exec "$PY" "$S/make_cleanup.py" "$@" ;;', dispatcher)
+        self.assertIn('make-cleanup) sc_help_form "$@" || sc_refuse_linked make-cleanup "$ROOT/Makefile"', dispatcher)
+        self.assertIn('exec "$PY" "$S/make_cleanup.py" "$@" ;;', dispatcher)
         self.assertFalse((ROOT / ".super-coder/aliases.mk").exists())
 
 

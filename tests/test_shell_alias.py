@@ -215,7 +215,8 @@ class OperatorSurfaceTest(unittest.TestCase):
     def test_dispatcher_exposes_alias_and_make_cleanup(self) -> None:
         dispatcher = (SCRIPTS / "dispatch.sh").read_text()
         self.assertIn('alias)        exec "$PY" "$S/shell_alias.py" "$@" ;;', dispatcher)
-        self.assertIn('make-cleanup) exec "$PY" "$S/make_cleanup.py" "$@" ;;', dispatcher)
+        self.assertIn('make-cleanup) sc_help_form "$@" || sc_refuse_linked make-cleanup "$ROOT/Makefile"', dispatcher)
+        self.assertIn('exec "$PY" "$S/make_cleanup.py" "$@" ;;', dispatcher)
 
     def test_make_surface_is_gone_from_the_engine(self) -> None:
         self.assertFalse((ROOT / "Makefile").exists())
