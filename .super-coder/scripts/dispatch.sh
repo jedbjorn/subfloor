@@ -164,9 +164,12 @@ sc_map_notice() {  # $1 = the command as typed
   [ "$LINKED" -eq 1 ] || return 0
   _target="$LIVE_ROOT"
   _what="the main checkout"
-  _work="$("$PY" -c 'import json, sys
+  # Same resolution as install.work_repo(): stripped, then `~` expanded, so the
+  # notice names the tree map_repo.py actually scans.
+  _work="$("$PY" -c 'import json, os, sys
 try:
-    print((json.load(open(sys.argv[1])).get("work_repo") or "").strip())
+    raw = (json.load(open(sys.argv[1])).get("work_repo") or "").strip()
+    print(os.path.expanduser(raw) if raw else "")
 except (OSError, ValueError, AttributeError):
     print("")' "$ENGINE/instance.json" 2>/dev/null || true)"
   if [ -n "$_work" ] && [ -d "$_work" ]; then
