@@ -178,10 +178,11 @@ automatically; write no trailer — then push, open a PR, and stop. Two rails
 catch the stale-root accident — editing or committing in the main checkout
 while believing it is your worktree: a git
 pre-commit hook refuses the commit on every harness while HEAD is the default
-branch, and on Claude, Codex, and OpenCode an edit hook refuses the edit
-earlier (vibe and kimi have none). `--no-verify` or an Admin flavor steps past
-both, so they are reminders, not a gate — and a commit made past them is still
-attributed to you.
+branch, and on Claude, Codex, and OpenCode an edit hook refuses a file-tool
+edit earlier (shell writes are not seen; vibe and kimi have no edit hook).
+`--no-verify` skips the commit hook; `SC_SHELL_FLAVOR=admin`, an environment
+flag anyone can set, skips both. They are reminders, not a gate — and a commit
+made past them is still attributed to you.
 
 **The merge gate has exactly two forms.** Outside an armed Sprint, merge only on
 an explicit FnB directive naming the PR. Inside an armed Sprint, arming *is*

@@ -11,9 +11,11 @@ owner actions; 1 = a failed check).
 The catalogue's subject is the install's main line, never your worktree:
 `sc map`, `sc map-setup`, and `sc map finalize` run from your worktree scan and
 check the live root (or the declared work repo) and print one line naming its
-branch, sha, and whether it is behind upstream. Behind -> ask Admin to
-fast-forward main, then remap; never point the map at your worktree to get
-newer files.
+branch, sha, and how far it is behind upstream. That count comes from the
+refs already fetched (no fetch runs), so a line without "behind" does not prove
+the tree is current. Behind -> ask Admin to fast-forward main (or, when a work
+repo is declared, whoever owns that checkout per your boot's work-repo line),
+then remap; never point the map at your worktree to get newer files.
 
 ## FIRST BOOT AND HEAL
 

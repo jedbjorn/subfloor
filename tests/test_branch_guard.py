@@ -270,6 +270,20 @@ class OperatorDocumentationTest(unittest.TestCase):
         self.assertIn("pre-commit hook refuses the commit on every harness", body)
         self.assertNotIn("git commit --no-verify", body)
 
+    def test_guide_describes_the_rails_as_landed(self):
+        # Decision #428 and U2/U3: no gate claim, no cross-tree warning, and
+        # the --no-verify recovery is shown to every caller.
+        flat = " ".join((ROOT / "docs" / "README.md").read_text().split())
+        for retired in ("bypass recipe", "blocks work on `main` in every harness",
+                        "feature branch warns"):
+            self.assertNotIn(retired, flat)
+        self.assertIn("a git pre-commit hook refuses a commit on `main` in every "
+                      "harness", flat)
+        self.assertIn("on Claude Code, Codex and OpenCode a file-tool edit hook "
+                      "refuses earlier", flat)
+        self.assertIn("allowed without a warning", flat)
+        self.assertIn("shows every caller the same `--no-verify` recovery", flat)
+
 
 if __name__ == "__main__":
     unittest.main()

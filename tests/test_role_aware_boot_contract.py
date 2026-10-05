@@ -74,7 +74,8 @@ class EnforcementTruthTest(unittest.TestCase):
                       "token identity", flat)
         # decision #429: the catalogue's subject is the live root, not the worktree
         self.assertIn("scan and check the live root", flat)
-        self.assertIn("whether it is behind upstream", flat)
+        self.assertIn("how far it is behind upstream", flat)
+        self.assertIn("no fetch runs", flat)
         self.assertIn("ask Admin to fast-forward main", flat)
         self.assertIn("absolute `<live root>/.super-coder/hooks`", flat)
         self.assertIn("`<live root>/.super-coder/templates/map_extractors/`", flat)
@@ -84,10 +85,17 @@ class EnforcementTruthTest(unittest.TestCase):
         section = body.split("## VERSION CONTROL", 1)[1].split("\n---", 1)[0]
         flat = " ".join(section.split())
         self.assertIn("pre-commit hook refuses the commit on every harness", flat)
-        self.assertIn("on Claude, Codex, and OpenCode an edit hook refuses the edit "
-                      "earlier (vibe and kimi have none)", flat)
-        self.assertIn("`--no-verify` or an Admin flavor steps past both, so they are "
-                      "reminders, not a gate", flat)
+        self.assertIn("on Claude, Codex, and OpenCode an edit hook refuses a file-tool "
+                      "edit earlier (shell writes are not seen; vibe and kimi have no "
+                      "edit hook)", flat)
+        self.assertIn("`--no-verify` skips the commit hook; `SC_SHELL_FLAVOR=admin`, an "
+                      "environment flag anyone can set, skips both. They are reminders, "
+                      "not a gate", flat)
+        # the matchers the sentence summarizes
+        claude = (ENGINE / "adapters" / "claude" / "adapter.json").read_text()
+        self.assertIn('"matcher": "Edit|Write|NotebookEdit|MultiEdit"', claude)
+        opencode = (ENGINE / "adapters" / "opencode" / "protect-default-branch.js").read_text()
+        self.assertIn('new Set(["write", "edit", "patch"])', opencode)
         self.assertIn("stale-root accident", flat)
 
 
@@ -114,7 +122,10 @@ class BoundaryRenderingTest(unittest.TestCase):
         self.assertIn("`sc map-sql`", boundary)
         self.assertIn("app code, migrations", boundary)
         self.assertIn("app database connection", boundary)
-        self.assertIn("Engine paths are not advertised to this shell; use `sc mem`.", boundary)
+        self.assertIn("Engine maintenance variables are not given to this shell; the "
+                      "`floor:` line names the main checkout only so you can check its "
+                      "freshness.", boundary)
+        self.assertNotIn("not advertised", boundary)
         self.assertNotIn("view", boundary)
         for text in WORKER_FORBIDDEN:
             self.assertNotIn(text, rendered)
@@ -126,7 +137,8 @@ class BoundaryRenderingTest(unittest.TestCase):
         boundary = compose.render_data_boundaries("dev", True, "container")
 
         self.assertIn("Tracked engine schema and migrations are project source", boundary)
-        self.assertIn("Live engine paths are not advertised to this shell", boundary)
+        self.assertIn("Engine maintenance variables are not given to this shell", boundary)
+        self.assertNotIn("not advertised", boundary)
         self.assertIn("API failure does not grant a file fallback", boundary)
         self.assertIn("live instance state remains Admin-maintained", boundary)
         self.assertNotIn("shell_db.db", boundary)
