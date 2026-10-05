@@ -235,7 +235,8 @@ class FocusedDeveloperVerificationMigrationTest(unittest.TestCase):
     @staticmethod
     def _testing_posture(text: str) -> str:
         policy = text.split(POLICY_HEADING, 1)[1].lstrip("\n")
-        return policy.split("\n\n## CODE CRAFT", 1)[0].rstrip()
+        # Compare this section only; neighboring Developer sections can grow.
+        return policy.split("\n\n## ", 1)[0].rstrip()
 
 
 if __name__ == "__main__":
