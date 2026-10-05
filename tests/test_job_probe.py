@@ -99,6 +99,7 @@ class ProbeTest(ApiFixture, unittest.TestCase):
 
     def test_invalid_options_never_register_or_launch(self):
         for options in (['--until', 'touch bad', '--every', '4'],
+                        ['--kind', 'devkit', '--until', 'touch bad'],
                         ['--until', 'touch bad', '--every', '0'],
                         ['--until', 'touch bad', '--every', '-5'],
                         ['--until', 'touch bad', '--timeout', '0'],
