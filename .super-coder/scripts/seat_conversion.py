@@ -133,6 +133,39 @@ def _group_snapshot(pgid: int) -> dict:
     return {"members": members, "unreadable_count": unreadable}
 
 
+def _probe_observations(root: Path) -> tuple[dict, list[dict]]:
+    calls = []
+    audit = root / "hook-calls.jsonl"
+    if audit.exists():
+        for line in audit.read_text().splitlines():
+            try:
+                event = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(event, dict):
+                calls.append(event)
+    transcript = root / "stdout.jsonl"
+    results = _tool_results(transcript.read_text(errors="replace")) if transcript.exists() else []
+    background = any(call.get("tool_input", {}).get("run_in_background") is True
+                     and call.get("tool_input", {}).get("command") == "printf SC_PROBE_ORIGINAL"
+                     for call in calls)
+    denied_call = any(call.get("tool_input", {}).get("command") == "printf SC_PROBE_DENIED" for call in calls)
+    result: dict = {"hook_fired": None, "rewrite_honored": None, "deny_honored": None}
+    if calls:
+        result["hook_fired"] = True
+    if background:
+        if any("SC_PROBE_ORIGINAL" == value.strip() for value in results):
+            result["rewrite_honored"] = False
+        elif any("SC_PROBE_REWRITTEN" == value.strip() for value in results):
+            result["rewrite_honored"] = True
+    if denied_call:
+        if any("SC_PROBE_DENIED" == value.strip() for value in results):
+            result["deny_honored"] = False
+        elif any("SC_PROBE_DENY_HONORED" in value for value in results):
+            result["deny_honored"] = True
+    return result, calls
+
+
 def _capture(process: subprocess.Popen, root: Path, deadline: float, started: float) -> dict:
     """Drain both pipes until EOF/deadline; retain at most OUTPUT_LIMIT each."""
     observed: dict = {"bytes": {}, "first_output_seconds": {}}
@@ -159,6 +192,11 @@ def _capture(process: subprocess.Popen, root: Path, deadline: float, started: fl
                     retained = observed["bytes"][name]
                     outputs[name].write(chunk[:max(0, OUTPUT_LIMIT - retained)])
                     observed["bytes"][name] += len(chunk)
+                    outputs[name].flush()
+                    facts, _ = _probe_observations(root)
+                    if facts["hook_fired"] and all(facts[key] is not None for key in ("rewrite_honored", "deny_honored")):
+                        observed.update(timed_out=False, completed_evidence=True)
+                        return observed
     observed["timed_out"] = False
     return observed
 
@@ -237,7 +275,7 @@ def native_probe(executable: str, *, timeout: float) -> dict:
         record["timings"]["capture_seconds"] = time.monotonic() - started
         if record["capture"]["timed_out"]:
             result["error"] = f"Conversion probe exceeded {timeout:g}s"
-        else:
+        elif not record["capture"].get("completed_evidence"):
             owned_members = _group_snapshot(process.pid)["members"]
             process.wait(timeout=max(.001, started + timeout - time.monotonic()))
             if process.returncode:
@@ -255,34 +293,8 @@ def native_probe(executable: str, *, timeout: float) -> dict:
                 result["error"] = result["error"] or "Probe cleanup incomplete; inspect retained receipt"
             record["returncode"] = process.returncode
         record["timings"]["total_seconds"] = time.monotonic() - started
-    calls = []
-    audit = root / "hook-calls.jsonl"
-    if audit.exists():
-        for line in audit.read_text().splitlines():
-            try:
-                event = json.loads(line)
-            except ValueError:
-                continue
-            if isinstance(event, dict):
-                calls.append(event)
-    transcript = root / "stdout.jsonl"
-    results = _tool_results(transcript.read_text(errors="replace")) if transcript.exists() else []
-    background = any(call.get("tool_input", {}).get("run_in_background") is True
-                     and call.get("tool_input", {}).get("command") == "printf SC_PROBE_ORIGINAL"
-                     for call in calls)
-    denied_call = any(call.get("tool_input", {}).get("command") == "printf SC_PROBE_DENIED" for call in calls)
-    if calls:
-        result["hook_fired"] = True
-    if background:
-        if any("SC_PROBE_ORIGINAL" == value.strip() for value in results):
-            result["rewrite_honored"] = False
-        elif any("SC_PROBE_REWRITTEN" == value.strip() for value in results):
-            result["rewrite_honored"] = True
-    if denied_call:
-        if any("SC_PROBE_DENIED" == value.strip() for value in results):
-            result["deny_honored"] = False
-        elif any("SC_PROBE_DENY_HONORED" in value for value in results):
-            result["deny_honored"] = True
+    observations, calls = _probe_observations(root)
+    result.update(observations)
     record["timings"]["hook_seconds"] = [call["observed_monotonic"] - started
         for call in calls if isinstance(call.get("observed_monotonic"), (int, float))]
     record["observations"] = result.copy()

@@ -192,6 +192,8 @@ if mode == "flood":
     time.sleep(10)
 settings=json.loads(Path(sys.argv[sys.argv.index("--settings")+1]).read_text())
 hook=settings["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
+if mode == "linger":
+    subprocess.Popen([sys.executable,"-c","import time; time.sleep(30)"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 for command in ("printf SC_PROBE_ORIGINAL","printf SC_PROBE_DENIED"):
     event={"tool_name":"Bash","tool_input":{"command":command,"run_in_background":command.endswith("ORIGINAL")}}
     response={}
@@ -201,7 +203,7 @@ for command in ("printf SC_PROBE_ORIGINAL","printf SC_PROBE_DENIED"):
     if response.get("permissionDecision") == "deny":
         output=response["permissionDecisionReason"]
     else:
-        effective=response.get("updatedInput",{}).get("command",command) if mode in ("all", "partial", "error", "linger") else command
+        effective=response.get("updatedInput",{}).get("command",command) if mode in ("all", "partial", "error", "linger", "narration") else command
         output=effective.removeprefix("printf ")
     print(json.dumps({"type":"user","message":{"content":[{"type":"tool_result","content":output}]}}), flush=True)
     if mode == "partial":
@@ -211,8 +213,7 @@ for command in ("printf SC_PROBE_ORIGINAL","printf SC_PROBE_DENIED"):
     if mode == "error":
         print("native error after first result", file=sys.stderr, flush=True)
         sys.exit(3)
-if mode == "linger":
-    subprocess.Popen([sys.executable,"-c","import time; time.sleep(30)"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+if mode == "narration": time.sleep(10)
 '''
 
 
@@ -342,7 +343,23 @@ def test_completed_probe_cleans_remaining_group_member(installed, monkeypatch):
     result = seat_conversion.ensure()
     assert result["tier"] == "rewrite"
     receipt = json.loads((Path(result["artifact_directory"]) / "receipt.json").read_text())
-    assert receipt["returncode"] == 0
+    assert receipt["capture"]["completed_evidence"] is True
     assert receipt["cleanup"]["signal"] == "SIGKILL"
     assert receipt["cleanup"]["before"]["members"]
     assert all(member["state"] == "Z" for member in receipt["cleanup"]["after"]["members"])
+
+
+def test_complete_tool_evidence_does_not_wait_for_narration(installed, monkeypatch):
+    _, count = installed
+    monkeypatch.setenv("PROBE_MODE", "narration")
+    monkeypatch.setattr(seat_conversion.harness_versions, "TIMEOUT", 2)
+    result = seat_conversion.ensure()
+    assert result["tier"] == "rewrite"
+    assert result["error"] is None
+    receipt = json.loads((Path(result["artifact_directory"]) / "receipt.json").read_text())
+    assert receipt["capture"]["completed_evidence"] is True
+    assert receipt["capture"]["timed_out"] is False
+    assert receipt["timings"]["total_seconds"] < 2
+    assert receipt["cleanup"]["signal"] == "SIGKILL"
+    assert seat_conversion.ensure() == result
+    assert count.read_text() == "1"
