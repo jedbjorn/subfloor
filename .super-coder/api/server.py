@@ -569,6 +569,11 @@ def get_cli_skills(con) -> dict:
 # local CLI has, so a launched Planner owns every `sc skill` verb.
 
 
+# The confusion every shell-facing browser refusal prevents, named first
+# (Feature #91 E5/E6); one sentence shared with the conversation routes.
+BROWSER_OWNERSHIP_CONFUSION = conversation_routes.BROWSER_OWNERSHIP_CONFUSION
+
+
 class SkillApiError(ValueError):
     """Client-visible skill mutation failure with a stable HTTP status."""
 
@@ -595,8 +600,9 @@ def _resolve_planner_shell(con, shell_id: int) -> dict:
         label = row["shortname"] or row["display_name"] or row["shell_id"]
         raise SkillApiError(
             403,
-            f"skill mutations are Planner-owned; shell {label} has "
-            f"flavor {row['flavor'] or 'bespoke'}",
+            f"{skill_mod.PLANNER_CURATION_CONFUSION}; skill mutations are "
+            f"Planner-owned, and shell {label} has flavor "
+            f"{row['flavor'] or 'bespoke'}",
         )
     return dict(row)
 
@@ -3040,8 +3046,12 @@ class Handler(BaseHTTPRequestHandler):
             return None
         return shell_id
 
-    def _require_browser_operator(self, con, what: str = "the Sprint board"):
-        """Accept the loopback browser operator and reject shell credentials."""
+    def _require_browser_operator(self, con, what: str = "the Sprint board",
+                                  confusion: str | None = None):
+        """Accept the loopback browser operator and reject shell credentials.
+
+        ``confusion`` names, ahead of the refusal, what a shell credential
+        here would get wrong (Feature #91 E6)."""
         token = self._bearer_token()
         if token:
             shell = con.execute(
@@ -3057,7 +3067,8 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 self._send(403, {"error": {
                     "code": "fnb_operator_required",
-                    "message": f"{what} is owned by the browser FnB operator",
+                    "message": (f"{confusion}: " if confusion else "")
+                    + f"{what} is owned by the browser FnB operator",
                     "details": {},
                 }})
             return False
@@ -4266,7 +4277,9 @@ class Handler(BaseHTTPRequestHandler):
         if sid is None:
             return
         if body.get('action') not in ('status', 'open'):
-            return self._send(403, {'error': 'Browser setup, lifecycle and arm are owned by the FnB; shells may use status and open.'})
+            return self._send(403, {'error': (
+                f'{BROWSER_OWNERSHIP_CONFUSION}. Browser setup, lifecycle and arm '
+                'are owned by the FnB; shells may use status and open.')})
         con = db()
         try:
             row = con.execute('SELECT shortname FROM shells WHERE shell_id=?', (sid,)).fetchone()
@@ -4377,7 +4390,9 @@ class Handler(BaseHTTPRequestHandler):
                 if actor is None or actor[0] != "planner":
                     return self._send(403, {"error": {
                         "code": "planner_only_delivery_audit",
-                        "message": "delivery audit is available only to Planner",
+                        "message": ("flag_sweep's close and open rules are "
+                                    "Planner-owned; delivery audit is available "
+                                    "only to Planner"),
                         "details": {},
                     }})
                 return self._send(200, get_delivery_audit(con))
@@ -5636,7 +5651,9 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/vm":
                 return self._send(200, {"vm": vm_mod.read()})
             if path == "/api/browser":
-                if not self._require_browser_operator(con, "browser configuration"):
+                if not self._require_browser_operator(
+                        con, "browser configuration",
+                        confusion=BROWSER_OWNERSHIP_CONFUSION):
                     return
                 return self._send(200, {**browser_mod.status(), "config": browser_mod.read(),
                     "defaults": browser_mod.defaults()})
@@ -5683,8 +5700,8 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         path = urlparse(self.path).path
         if path.startswith("/_sc/skills/"):
-            # Planner-owned fork-local skill catalogue. Retire/unretire remain
-            # Admin-only (fork-tracked retire manifest on the host).
+            # Planner-owned fork-local skill catalogue, retire/unretire included
+            # (PUT /_sc/skills/retire/{name} routes to the same Planner check).
             try:
                 return self._skills_mutation_post(path, self._body())
             except Exception as exc:  # noqa: BLE001 — _fail handles reporting
@@ -5702,7 +5719,9 @@ class Handler(BaseHTTPRequestHandler):
         con = db()
         try:
             if path == "/api/browser":
-                if not self._require_browser_operator(con, "browser configuration"):
+                if not self._require_browser_operator(
+                        con, "browser configuration",
+                        confusion=BROWSER_OWNERSHIP_CONFUSION):
                     return
                 if not self._require_browser_mutation_origin("browser configuration changes"):
                     return
@@ -6047,9 +6066,19 @@ class Handler(BaseHTTPRequestHandler):
         path = urlparse(self.path).path
         parts = path.strip("/").split("/")
         if len(parts) == 4 and parts[:3] == ["_sc", "skills", "retire"]:
-            return self._send(403, {"error":
-                "skill retire/unretire are Admin-only: they write the tracked "
-                "fork retire manifest on the host"})
+            # PUT /_sc/skills/retire/{name} {retired: bool=true} — the same
+            # Planner-owned lane as POST /_sc/skills/{retire|unretire}; one
+            # owner, so both routes authorize identically (Feature #91 E3).
+            try:
+                retired = self._body().get("retired", True)
+                if not isinstance(retired, bool):
+                    # "false" is truthy; a string must not silently retire.
+                    return self._send(400, {"error": "retired must be a JSON boolean"})
+                action = "retire" if retired else "unretire"
+                return self._skills_mutation_post(
+                    f"/_sc/skills/{action}", {"name": unquote(parts[3])})
+            except Exception as exc:  # noqa: BLE001
+                return self._fail(exc)
         if len(parts) == 4 and parts[:3] == ["_sc", "skills", "assign"]:
             try:
                 return self._skills_mutation_assign(self._body())

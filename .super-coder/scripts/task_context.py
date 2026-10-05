@@ -86,6 +86,9 @@ LANE_ACTIONS = {
     "blocked": (
         "sc sprint send --sprint {sprint} --to <planner> --body-file <path> --intent blocker --requires-reply --work-unit {unit} --key <stable-key>",
     ),
+    "merge_ready": (
+        "sc sprint authorize-merge --sprint {sprint} --registered-pr <id>",
+    ),
 }
 SPRINT_WALLS = {
     "prepared": "Sprint not armed — nothing is dispatched",
@@ -95,10 +98,33 @@ SPRINT_WALLS = {
     "aborted": "Sprint aborted — lanes are closed",
 }
 RESERVED_TO_OTHERS = (
-    "merge authorization: Planner/FnB (`sc sprint authorize-merge`)",
     "review verdicts: Reviewer (`sc sprint record-review`)",
     "dispatch, replan, recall, pause/resume: Planner/FnB",
 )
+
+
+def merge_gate(*, sprint_id: int | None, lifecycle: str | None,
+               developer: str | None, caller_is_developer: bool) -> str:
+    """The one merge-gate statement (boot VERSION CONTROL; Feature #91 E11/F3).
+
+    Inside an armed Sprint (the schema refuses arming without the merge
+    grant), the owning Developer authorizes its own registered PR through
+    `sc sprint authorize-merge` — `sprint_review_loop.authorize_merge` refuses
+    every other caller. Everywhere else the gate is an explicit FnB directive
+    naming the PR.
+    """
+    if sprint_id is not None and lifecycle == "armed":
+        who = f"the owning Developer {developer}" + (" (you)" if caller_is_developer else "")
+        return (f"merge gate: inside armed Sprint {sprint_id}, {who} merges its own "
+                f"registered PR once `sc sprint authorize-merge --sprint {sprint_id} "
+                "--registered-pr <id>` returns it live green + approved; arming was "
+                "the FnB's grant")
+    if lifecycle == "paused" and sprint_id is not None:
+        return (f"merge gate: Sprint {sprint_id} is paused — wait for resume, or an "
+                "explicit FnB directive naming the PR")
+    where = ("no armed Sprint covers this work" if sprint_id is None
+             else f"Sprint {sprint_id} is {lifecycle or 'unknown'}, not armed")
+    return f"merge gate: an explicit FnB directive naming the PR ({where})"
 TASK_WALLS = {
     "pending": "not started — `sc mem task start {task}` before building it",
     "in_progress": "in progress — `sc mem task done {task}` when verified",
@@ -268,9 +294,17 @@ def _select_task(con, task_id: int) -> dict:
         "description": t["description"] or "", "status": t["status"],
         "document_id": t["document_id"],
     }
+    lane = None
     if link is not None:
         task["sprint_work_unit_id"] = int(link["work_unit_id"])
         task["sprint_id"] = int(link["sprint_id"])
+        lane = con.execute(
+            "SELECT sp.lifecycle, u.assigned_shell_id, "
+            "a.shortname AS assigned_shortname FROM sprint_work_units u "
+            "JOIN sprints sp ON sp.sprint_id=u.sprint_id "
+            "LEFT JOIN shells a ON a.shell_id=u.assigned_shell_id "
+            "WHERE u.sprint_id=? AND u.work_unit_id=?",
+            (link["sprint_id"], link["work_unit_id"])).fetchone()
     document = _document(con, t["document_id"])
     return {
         "selector": "task",
@@ -282,6 +316,12 @@ def _select_task(con, task_id: int) -> dict:
         "documents": [document] if document else [],
         "sprint": None,
         "unit": None,
+        "lane": None if lane is None else {
+            "sprint_id": int(link["sprint_id"]),
+            "lifecycle": lane["lifecycle"],
+            "assigned": lane["assigned_shortname"],
+            "assigned_shell_id": lane["assigned_shell_id"],
+        },
     }
 
 
@@ -561,6 +601,7 @@ def project(con, *, task_id: int | None = None, work_unit_id: int | None = None,
         "walls": [],
         "actions": [],
         "reserved": [],
+        "merge": None,
         "qualifications": ["feature-level", "direct dependency", "current decision",
                            "immutable Sprint revision"],
         "note": "omission is not a grant; every command is guidance — the action "
@@ -589,7 +630,13 @@ def project(con, *, task_id: int | None = None, work_unit_id: int | None = None,
                 f"task is linked to Sprint {t['sprint_id']} work unit #{t['sprint_work_unit_id']} — "
                 f"the bound revision and lane walls come from "
                 f"`sc context --work-unit {t['sprint_work_unit_id']}`")
-        boundaries["reserved"].append("merging a PR: the FnB's gate")
+        lane = sel.get("lane")
+        boundaries["merge"] = merge_gate(
+            sprint_id=lane["sprint_id"] if lane else None,
+            lifecycle=lane["lifecycle"] if lane else None,
+            developer=lane["assigned"] if lane else None,
+            caller_is_developer=bool(
+                lane and lane["assigned_shell_id"] == caller["shell_id"]))
     else:
         sid, uid = sprint["sprint_id"], unit["work_unit_id"]
         if sprint["caller_role"]:
@@ -629,6 +676,9 @@ def project(con, *, task_id: int | None = None, work_unit_id: int | None = None,
         boundaries["reserved"].extend(
             item for item in RESERVED_TO_OTHERS
             if not is_reviewer or not item.startswith("review verdicts:"))
+        boundaries["merge"] = merge_gate(
+            sprint_id=sid, lifecycle=sprint["lifecycle"],
+            developer=unit["assigned"], caller_is_developer=is_developer)
 
     # Resources — the catalogue as abbreviated documentation, never a mandate.
     resources = {
@@ -740,6 +790,7 @@ def render(p: dict) -> str:
         out.append(f"  wall: {w}")
     for act in bo["actions"]:
         out.append(f"  action: {act}")
+    out.append(f"  {bo['merge']}")
     for res in bo["reserved"]:
         out.append(f"  reserved: {res}")
     out.append(f"  ({bo['note']})")

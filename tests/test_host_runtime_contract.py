@@ -440,6 +440,10 @@ class DispatcherRuntimeProbeTest(unittest.TestCase):
         selected = str(self.root / "missing-python")
         completed = self.invoke(selected)
         self.assertEqual(completed.returncode, 1)
+        self.assertTrue(completed.stderr.startswith(
+            "✗ host Python preflight: the engine's tracked baseline is Python 3.14 "
+            "(decision #240); any other interpreter fails later with a worse message.\n"),
+            completed.stderr)
         self.assertIn(f"SC_PYTHON '{selected}' is not executable", completed.stderr)
         self.assertIn("export SC_PYTHON=", completed.stderr)
         self.assertFalse((self.root / ".super-coder/scripts/install-ran").exists())
@@ -452,6 +456,9 @@ class DispatcherRuntimeProbeTest(unittest.TestCase):
                 )
                 completed = self.invoke(str(selected))
                 self.assertEqual(completed.returncode, 1)
+                self.assertTrue(completed.stderr.startswith(
+                    "✗ host Python preflight: the engine's tracked baseline is "
+                    "Python 3.14 (decision #240)"), completed.stderr)
                 self.assertIn("Python 3.14.x required", completed.stderr)
                 self.assertIn(
                     "reports " + ".".join(map(str, version)), completed.stderr

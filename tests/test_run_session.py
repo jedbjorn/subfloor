@@ -693,7 +693,10 @@ class HeadlessSessionFailureTest(unittest.TestCase):
                 self.assertRaises(SystemExit) as raised:
             run.main()
 
-        self.assertIn("run subfloor admin from a host terminal", str(raised.exception))
+        self.assertTrue(str(raised.exception).startswith(
+            "sc admin: Admin maintains the host instance; the container has no host "
+            "state to maintain."), str(raised.exception))
+        self.assertIn("Run `subfloor admin` from a host terminal", str(raised.exception))
         pointers.assert_not_called()
         open_db.assert_not_called()
 

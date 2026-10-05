@@ -553,15 +553,21 @@ needed. They all work the same repo without clobbering each other:
   (on the base branch, clean tree, no local-only commits). Anything local
   blocks the sync and is surfaced in the boot doc instead, so the shell asks
   you before any work is touched.
-- **A branch-guard blocks work on `main`** in every harness — pre-tool hooks
-  (Claude Code, Codex), an OpenCode plugin, and a git pre-commit backstop, all
-  one shared script. Under Claude Code it also inspects the **edit's target
-  path**, so a shell editing the stale repo-root checkout from inside its
-  worktree is blocked (and an out-of-worktree edit to a feature branch warns).
+- **A branch-guard catches the stale-root accident** — editing or committing
+  in the main checkout while believing it is a worktree. It is one shared
+  script with two rails: a git pre-commit hook refuses a commit on `main` in
+  every harness, and on Claude Code, Codex and OpenCode a file-tool edit hook
+  refuses earlier, judging the **edit's target path**, so a file-tool edit to
+  the stale repo-root checkout from inside a worktree is refused. Shell writes
+  are not seen, vibe and kimi have no edit hook, and an edit to a feature
+  branch outside the shell's worktree is allowed without a warning. The rails
+  are reminders, not a gate: every refused commit shows the `--no-verify`
+  recovery, which skips the commit hook.
 - **The admin shell is the one exception.** It boots in the **repo root** on
   `main` and maintains it directly — engine updates, rollbacks, migrations,
-  applying approved maintenance. Planner owns fork-local skills. The branch-guard exempts it
-  (and only it). Working shells consume the substrate; admin owns the floor.
+  applying approved maintenance. Planner owns fork-local skills. The branch-guard exempts
+  `SC_SHELL_FLAVOR=admin`, an environment flag the Admin launch sets (and any
+  caller could). Working shells consume the substrate; admin owns the floor.
 - **Reviewing a shell's UI work:** worktree edits never show on your main dev
   server. `./sc preview` serves every dev shell's worktree UI live (HMR) on the
   fork's dev port, routed by subdomain — `http://<shortname>.localhost:<port>/`
@@ -852,8 +858,9 @@ git add .sc-state/engine.ref sc && git commit --no-verify -m "chore: update subf
 ```
 
 The update commit is another deliberate operator-owned commit on the protected
-default branch. Launched shells still create a feature branch first and are not
-given a bypass recipe.
+default branch. Launched shells still create a feature branch first; the
+pre-commit refusal shows every caller the same `--no-verify` recovery, so the
+branch rule is a reminder rail, not a gate.
 
 `./sc update` first runs a `git pull --ff-only` for the tracked checkout itself
 — advisory, never blocking: an unsafe or offline pull warns and the engine

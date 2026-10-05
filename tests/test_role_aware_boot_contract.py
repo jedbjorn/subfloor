@@ -31,6 +31,74 @@ WORKER_FORBIDDEN = (
 )
 
 
+class EnforcementTruthTest(unittest.TestCase):
+    """Decision #428 / Feature #91 G6: boot rules describe only what is
+    enforced. The branch rails are bypassable reminders, the Landlock view is
+    retired, and SC_ADMIN no longer exists."""
+
+    RETIRED_CLAIMS = (
+        "enforced, not just asked",
+        "no bypass",
+        "engine-state view",
+        "execution view",
+        "landlock",
+        "sc_admin",
+        "masked",
+        "restricted view",
+    )
+
+    def test_boot_template_and_rendered_slots_claim_no_retired_enforcement(self):
+        texts = {"boot.md": compose.TEMPLATE_PATH.read_text()}
+        texts["fork"] = compose.PROJECT_VS_ENGINE_FORK
+        texts["source"] = compose.PROJECT_VS_ENGINE_SOURCE
+        for flavor in ("dev", "planner", "reviewer", "cartographer", "admin"):
+            for source in (False, True):
+                texts[f"{flavor}/{source}"] = compose.render_data_boundaries(
+                    flavor, source, "host", database_path="/x/shell_db.db")
+        for name, text in texts.items():
+            for claim in self.RETIRED_CLAIMS:
+                with self.subTest(surface=name, claim=claim):
+                    self.assertNotIn(claim, text.lower())
+
+    def test_role_procedures_claim_no_retired_enforcement(self):
+        for flavor in ("dev", "planner", "reviewer", "cartographer", "admin", "devops"):
+            body = shell_factory.load_procedure(flavor).lower()
+            for claim in self.RETIRED_CLAIMS:
+                with self.subTest(flavor=flavor, claim=claim):
+                    self.assertNotIn(claim, body)
+
+    def test_cartographer_names_the_real_snapshot_gate_and_map_subject(self):
+        flat = " ".join(shell_factory.load_procedure("cartographer").split())
+        self.assertNotIn("it is refused.", flat)
+        self.assertIn("Serializing the shared instance is an Admin step gated on "
+                      "token identity", flat)
+        # decision #429: the catalogue's subject is the live root, not the worktree
+        self.assertIn("scan and check the live root", flat)
+        self.assertIn("how far it is behind upstream", flat)
+        self.assertIn("no fetch runs", flat)
+        self.assertIn("ask Admin to fast-forward main", flat)
+        self.assertIn("absolute `<live root>/.super-coder/hooks`", flat)
+        self.assertIn("`<live root>/.super-coder/templates/map_extractors/`", flat)
+
+    def test_version_control_names_the_rails_and_their_bypass(self):
+        body = compose.TEMPLATE_PATH.read_text()
+        section = body.split("## VERSION CONTROL", 1)[1].split("\n---", 1)[0]
+        flat = " ".join(section.split())
+        self.assertIn("pre-commit hook refuses the commit on every harness", flat)
+        self.assertIn("on Claude, Codex, and OpenCode an edit hook refuses a file-tool "
+                      "edit earlier (shell writes are not seen; vibe and kimi have no "
+                      "edit hook)", flat)
+        self.assertIn("`--no-verify` skips the commit hook; `SC_SHELL_FLAVOR=admin`, an "
+                      "environment flag anyone can set, skips both. They are reminders, "
+                      "not a gate", flat)
+        # the matchers the sentence summarizes
+        claude = (ENGINE / "adapters" / "claude" / "adapter.json").read_text()
+        self.assertIn('"matcher": "Edit|Write|NotebookEdit|MultiEdit"', claude)
+        opencode = (ENGINE / "adapters" / "opencode" / "protect-default-branch.js").read_text()
+        self.assertIn('new Set(["write", "edit", "patch"])', opencode)
+        self.assertIn("stale-root accident", flat)
+
+
 class BoundaryRenderingTest(unittest.TestCase):
     def test_universal_boot_calibrates_work_to_fnb_and_project(self):
         rendered = compose.TEMPLATE_PATH.read_text()
@@ -54,7 +122,11 @@ class BoundaryRenderingTest(unittest.TestCase):
         self.assertIn("`sc map-sql`", boundary)
         self.assertIn("app code, migrations", boundary)
         self.assertIn("app database connection", boundary)
-        self.assertIn("absent from this shell's engine-state view", boundary)
+        self.assertIn("Engine maintenance variables are not given to this shell; the "
+                      "`floor:` line names the main checkout only so you can check its "
+                      "freshness.", boundary)
+        self.assertNotIn("not advertised", boundary)
+        self.assertNotIn("view", boundary)
         for text in WORKER_FORBIDDEN:
             self.assertNotIn(text, rendered)
 
@@ -65,6 +137,9 @@ class BoundaryRenderingTest(unittest.TestCase):
         boundary = compose.render_data_boundaries("dev", True, "container")
 
         self.assertIn("Tracked engine schema and migrations are project source", boundary)
+        self.assertIn("Engine maintenance variables are not given to this shell", boundary)
+        self.assertNotIn("not advertised", boundary)
+        self.assertIn("API failure does not grant a file fallback", boundary)
         self.assertIn("live instance state remains Admin-maintained", boundary)
         self.assertNotIn("shell_db.db", boundary)
         self.assertNotIn("sc sql", boundary)

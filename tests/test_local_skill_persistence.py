@@ -366,7 +366,10 @@ class SkillCommandTest(unittest.TestCase):
     def test_put_requires_the_launched_planner_identity(self):
         draft = self.write_draft("loc_auth", "procedure")
         skill_mod.mem.SC_API_TOKEN = "dev-token"
-        with self.assertRaisesRegex(SystemExit, "`put` is Planner-owned"):
+        with self.assertRaisesRegex(
+                SystemExit,
+                r"^sc skill: the skill catalogue is DB-canonical and Planner-curated "
+                r"\(fork_skill_design\); `put` is Planner-owned"):
             skill_mod.main(["put", "--file", str(draft)])
         skill_mod.mem.SC_API_TOKEN = "missing-token"
         with self.assertRaisesRegex(SystemExit, "does not resolve"):

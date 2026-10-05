@@ -2404,6 +2404,12 @@ class ConversationResourceTest(ConversationApiCase):
         )
         self.assertEqual(status, 403)
         self.assertEqual(obj["error"]["code"], "OPERATOR_REQUIRED")
+        # Feature #91 E6: the confusion first, then the ownership fact.
+        self.assertEqual(
+            obj["error"]["message"],
+            "the browser profile and its chats belong to the operator; a shell "
+            "drives, it does not own: conversations are owned by the browser operator",
+        )
 
         status, _, obj = self.request(
             "GET",

@@ -54,10 +54,16 @@ def test_shell_cannot_mutate_browser(api, action):
         mock.patch.object(browser, "operate") as operation,
         mock.patch.object(browser, "link") as link,
     ):
-        status, _ = api(action, token="shell-token")
+        confusion = ("the browser profile and its chats belong to the operator; "
+                     "a shell drives, it does not own")
+        status, body = api(action, token="shell-token")
         assert status == 403
-        status, _ = api(action, token="shell-token", route="/_sc/browser")
+        assert body["error"]["message"] == (
+            f"{confusion}: browser configuration is owned by the browser FnB operator")
+        status, body = api(action, token="shell-token", route="/_sc/browser")
         assert status == 403
+        if action not in ("status", "open"):
+            assert body["error"].startswith(f"{confusion}. Browser setup, lifecycle")
         operation.assert_not_called()
         link.assert_not_called()
 

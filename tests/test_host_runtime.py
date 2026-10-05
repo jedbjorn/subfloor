@@ -347,7 +347,11 @@ class HostRuntimeLifecycleTest(unittest.TestCase):
     def test_enter_requires_the_host_server_then_boots_through_run_py(self):
         blocked = self.fx.run("enter-cc")
         self.assertEqual(blocked.returncode, 1)
-        self.assertIn("./sc launch first", blocked.stderr)
+        # The refusal's first line names the confusion; the remedy follows.
+        self.assertIn(
+            "✗ sc enter: sc mem has no file fallback, so a shell booted now "
+            "could not write memory.\n  the host review server is not answering "
+            f"on 127.0.0.1:{self.fx.port} — ./sc launch first", blocked.stderr)
         self.assertFalse(self.fx.run_argv.exists())
 
         self.assertEqual(self.fx.run("launch").returncode, 0)
@@ -362,6 +366,22 @@ class HostRuntimeLifecycleTest(unittest.TestCase):
 
         picker = self.fx.run("enter")
         self.assertEqual(picker.returncode, 0, picker.stderr)
+        self.assertEqual(json.loads(self.fx.run_argv.read_text())["argv"], [])
+        self.assert_no_docker()
+
+    def test_host_entry_never_blocks_on_a_sandbox_provisioning_receipt(self):
+        # Feature #91 C21 (decisions #120, #199): the provisioning receipt is a
+        # sandbox-image fact. A host entry proceeds even when the sandbox
+        # readiness probe would call it stale.
+        (self.fx.root / ".subfloor").mkdir()
+        (self.fx.root / ".subfloor" / "dev-kit.json").write_text(
+            json.dumps({"provision": {"run": ["true"]}}))
+        (self.fx.scripts / "sandbox_devkit.py").write_text(
+            "import sys\nsys.exit(1)  # every readiness question answers stale\n")
+        self.assertEqual(self.fx.run("launch").returncode, 0)
+        entered = self.fx.run("enter")
+        self.assertEqual(entered.returncode, 0, entered.stderr)
+        self.assertNotIn("stale", entered.stderr)
         self.assertEqual(json.loads(self.fx.run_argv.read_text())["argv"], [])
         self.assert_no_docker()
 

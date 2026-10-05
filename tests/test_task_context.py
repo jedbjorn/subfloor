@@ -299,7 +299,9 @@ class ProjectorTest(unittest.TestCase):
         self.assertEqual(bo["git"]["branch"], "feat/projection")
         self.assertEqual(bo["git"]["base"], "origin/main")
         self.assertIn(f"sc mem task start {ids['tasks'][1]}", " ".join(bo["walls"]))
-        self.assertIn("merging a PR: the FnB's gate", bo["reserved"])
+        self.assertEqual(bo["merge"], "merge gate: an explicit FnB directive naming the PR "
+                                       "(no armed Sprint covers this work)")
+        self.assertEqual(bo["reserved"], [])
         self.assertEqual(bo["actions"], [])
 
         done = self.project(task_id=ids["tasks"][0])["boundaries"]
@@ -445,6 +447,45 @@ class ProjectorTest(unittest.TestCase):
         self.assertFalse(any("sc sprint accept" in action for action in boundaries["actions"]))
         self.assertFalse(any("register-pr" in action for action in boundaries["actions"]))
         self.assertNotIn("review verdicts: Reviewer", boundaries["reserved"])
+
+    # ── one merge-gate statement (Feature #91 E11/F3, acceptance G7) ─────
+    def test_armed_sprint_merge_gate_names_the_owning_developer(self):
+        ids = seed_feature(self.con)
+        sp = seed_sprint(self.con, ids, disposition="merge_ready")
+        gate = (f"merge gate: inside armed Sprint {sp['sprint']}, the owning Developer "
+                f"DEV1{{you}} merges its own registered PR once `sc sprint authorize-merge "
+                f"--sprint {sp['sprint']} --registered-pr <id>` returns it live green + "
+                "approved; arming was the FnB's grant")
+        # `sc context --task` from the developer, the reviewer and the planner
+        for caller, you in ((1, " (you)"), (2, ""), (3, "")):
+            p = self.project(task_id=ids["tasks"][1], caller_shell_id=caller)
+            self.assertEqual(p["boundaries"]["merge"], gate.format(you=you))
+            self.assertIn("  " + gate.format(you=you) + "\n", tc.render(p))
+        dev = self.project(work_unit_id=sp["unit"])["boundaries"]
+        self.assertEqual(dev["merge"], gate.format(you=" (you)"))
+        self.assertIn(f"sc sprint authorize-merge --sprint {sp['sprint']} --registered-pr <id>",
+                      dev["actions"])
+        reviewer = self.project(work_unit_id=sp["unit"], caller_shell_id=2)["boundaries"]
+        self.assertEqual(reviewer["merge"], gate.format(you=""))
+        self.assertFalse(any("authorize-merge" in a for a in reviewer["actions"]))
+        for bo in (dev, reviewer):
+            self.assertFalse(any("merge" in r for r in bo["reserved"]), bo["reserved"])
+            self.assertNotIn("Planner/FnB (`sc sprint authorize-merge`)", json.dumps(bo))
+
+    def test_unarmed_sprint_merge_gate_is_the_fnb_directive(self):
+        ids = seed_feature(self.con)
+        sp = seed_sprint(self.con, ids, lifecycle="paused")
+        paused = (f"merge gate: Sprint {sp['sprint']} is paused — wait for resume, "
+                  "or an explicit FnB directive naming the PR")
+        self.assertEqual(
+            self.project(task_id=ids["tasks"][1])["boundaries"]["merge"], paused)
+        self.assertEqual(
+            self.project(work_unit_id=sp["unit"])["boundaries"]["merge"], paused)
+        self.assertEqual(
+            tc.merge_gate(sprint_id=7, lifecycle="completed", developer="DEV1",
+                          caller_is_developer=True),
+            "merge gate: an explicit FnB directive naming the PR "
+            "(Sprint 7 is completed, not armed)")
 
     def test_task_linked_to_a_unit_points_at_the_work_unit_selector(self):
         ids = seed_feature(self.con)

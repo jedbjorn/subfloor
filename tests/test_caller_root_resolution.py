@@ -500,6 +500,27 @@ class CatalogueSubjectTest(CallerRootFixture):
         self.assert_ok(done)
         self.assertIn(", behind fixture-upstream by 1) instead of", done.stderr)
 
+    def test_map_notice_expands_a_home_relative_work_repo(self):
+        """The notice resolves `~/…` like install.work_repo(), so it names the
+        tree map_repo.py scans rather than falling back to the main checkout."""
+        work = self.home / "workrepo"
+        write(work / "work_only.txt", "work\n")
+        git(work, "init", "-q", "-b", "trunk")
+        git(work, "add", "-A")
+        git(work, "commit", "-qm", "work repo")
+        self.addCleanup(shutil.rmtree, work, ignore_errors=True)
+        config = self.main / ".super-coder" / "instance.json"
+        self.assertFalse(config.exists())
+        config.write_text(json.dumps({"work_repo": " ~/workrepo "}))
+        self.addCleanup(config.unlink, missing_ok=True)
+        done = self.sc(self.wt, "map")
+        self.assert_ok(done)
+        first = done.stderr.splitlines()[0]
+        self.assertTrue(first.startswith(
+            "sc map: the catalogue is one shared index of this install's declared "
+            f"work repo, not of this worktree; mapping {work} (trunk@"), first)
+        self.assertEqual(self.mapped()[0], str(work))
+
     def test_map_auto(self):
         _, _, before = self.mapped()
         silent = self.sc(self.wt, "map", "--auto")
