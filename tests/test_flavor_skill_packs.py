@@ -335,13 +335,27 @@ class HardCutoverMigrationTest(unittest.TestCase):
             ("local", "fork", "local bytes"),
         )
 
-    def test_0241_migrates_only_the_untouched_legacy_dev_kit_starter(self) -> None:
+    def test_legacy_dev_kit_starter_replays_and_upgrades_through_later_reseeds(self) -> None:
         migration = "0241_global_skill_simplification.sql"
         con = build_db(before=migration)
         sql = (MIGRATIONS / migration).read_text()
 
         con.executescript(sql)
+        first = tuple(con.execute(
+            "SELECT description,category,command,common,content,is_deleted "
+            "FROM skills WHERE name='dev_kit'"
+        ).fetchone())
         con.executescript(sql)
+        self.assertEqual(first, tuple(con.execute(
+            "SELECT description,category,command,common,content,is_deleted "
+            "FROM skills WHERE name='dev_kit'"
+        ).fetchone()))
+
+        # Historical migrations are immutable. The current starter asset may
+        # advance through later reseeds (0276 adds the Runs receipt contract).
+        for later in sorted(MIGRATIONS.glob("*.sql")):
+            if later.name > migration:
+                con.executescript(later.read_text())
 
         expected = seed_skills.parse_skill(
             ENGINE / "assets" / "seed" / "skills" / "dev_kit" / "SKILL.md"
