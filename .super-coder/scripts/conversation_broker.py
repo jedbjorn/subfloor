@@ -33,6 +33,7 @@ import conversation_events
 import conversation_git_targets
 import db_driver
 import route_transport
+import run_processes
 from conversation_adapters import (
     AdapterError,
     ConversationAdapter,
@@ -803,6 +804,10 @@ class BrokerStore:
         now, _ = self._times()
         notify_ids: set[str] = set()
         try:
+            evidence = (
+                run_processes.termination_evidence(run_processes.last_snapshot(con, run_id))
+                if process_exited else None
+            )
             with db_driver.write_transaction(
                 con,
                 "conversation.broker.finish_run",
@@ -828,6 +833,7 @@ class BrokerStore:
                     raise BrokerError("CONVERSATION_RUN_NOT_FOUND", str(run_id))
                 if row["state"] in TERMINAL_RUN_STATES:
                     return False
+                run_processes.append_termination(con, run_id, evidence)
                 require_transition("run", row["state"], outcome)
                 message_state = {
                     "succeeded": "completed",
@@ -1081,7 +1087,9 @@ class BrokerStore:
         and every continuation of its trigger message — stops naming it.
         """
         con = self.connect()
+        conversation_id = None
         try:
+            evidence = run_processes.termination_evidence(run_processes.last_snapshot(con, run_id))
             with db_driver.write_transaction(
                 con,
                 "conversation.broker.release_process_link",
@@ -1093,6 +1101,8 @@ class BrokerStore:
                 ).fetchone()
                 if row is None:
                     raise BrokerError("CONVERSATION_RUN_NOT_FOUND", str(run_id))
+                conversation_id = row["conversation_id"]
+                run_processes.append_termination(con, run_id, evidence)
                 con.execute(
                     "UPDATE conversation_runs SET process_pid=NULL,"
                     "process_start_ticks=NULL,process_group_id=NULL "
@@ -1106,6 +1116,8 @@ class BrokerStore:
                 )
         finally:
             con.close()
+            if conversation_id is not None:
+                conversation_events.notify(conversation_id)
 
     def defer_run(
         self,
@@ -1778,6 +1790,12 @@ class ConversationBroker(threading.Thread):
                 else:
                     retry_after = now + self.recovery_seconds
 
+            # The subprocess runner already owns group cleanup. Wait for its
+            # bounded ladder before describing descendants as terminated; do
+            # not add a second signaling path or wait on a live harness.
+            cleanup_done = getattr(turn.opaque, "_sc_conversation_cleanup_done", None)
+            if isinstance(cleanup_done, threading.Event) and turn.opaque.poll() is not None:
+                cleanup_done.wait(timeout=2.0)
             if lingering:
                 # Verified exit with no continuation: only quiet events can
                 # still be buffered, and the process no longer needs naming.

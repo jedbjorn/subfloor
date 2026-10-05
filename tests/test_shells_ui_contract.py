@@ -498,6 +498,7 @@ function renderHarness() { rendered.push("harness"); }
 function renderSkillViewer() { rendered.push("skills"); }
 function renderSkillAssignments() { rendered.push("assignments"); }
 function renderDefaultModels() { rendered.push("models"); }
+function renderRunsFleet() { rendered.push("runs"); }
 """ + SHELL_RENDER + r"""
 function all(root, predicate, found = []) {
   if (predicate(root)) found.push(root);
@@ -508,7 +509,7 @@ function all(root, predicate, found = []) {
 
 (async () => {
   const views = [];
-  for (const key of ["harness", "skills", "assignments", "models"]) {
+  for (const key of ["harness", "skills", "assignments", "models", "runs"]) {
     shellTab = key;
     const root = new FakeElement("div");
     await renderShells(root);
@@ -537,12 +538,13 @@ function all(root, predicate, found = []) {
 });
 """
     result = run_js(script)
-    labels = ["Harness", "Skills", "Skill Assignments", "Default Models"]
+    labels = ["Harness", "Skills", "Skill Assignments", "Default Models", "Runs"]
     hashes = [
         "shells",
         "shells-skills",
         "shells-skill-assignments",
         "shells-default-models",
+        "shells-runs",
     ]
     for view, label in zip(result["views"], labels, strict=True):
         assert view["labels"] == labels

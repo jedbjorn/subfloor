@@ -29,6 +29,8 @@ CONVERSATION_EVENT_TYPES = NORMALIZED_EVENTS | frozenset(
         "run.unknown",
         "run.deferred",
         "run.reaped",
+        "run.process.snapshot",
+        "run.process.ended",
     }
 )
 
