@@ -235,6 +235,10 @@ def compatibility_status(
 def main(argv: list[str]) -> int:
     provenance = runtime_scope()["runtime"]
     found = compatibility_status()
+    if "claude" in found:
+        import seat_conversion
+        conversion = seat_conversion.ensure(force="--reverify" in argv)
+        found["claude"]["conversion"] = conversion
     if "--json" in argv:
         print(json.dumps({"runtime": provenance, "harnesses": found}, indent=2))
         return 0
@@ -260,6 +264,10 @@ def main(argv: list[str]) -> int:
         else:
             detail = "— not installed"
         print(f"  {name:9} {detail}")
+        if name == "claude":
+            print(f"    GUI conversion: {conversion['tier']} · "
+                  f"{conversion.get('verified_at') or 'unverified'}"
+                  + (f" · {conversion['error']}" if conversion.get("error") else ""))
     return 0
 
 

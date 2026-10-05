@@ -568,7 +568,7 @@ sc_harness_status() {
   # In-container, host runtime, or no docker at all: this process IS the runtime.
   if [ -n "${SC_SANDBOX:-}" ] || sc_host_runtime || ! command -v docker >/dev/null 2>&1 || ! docker info >/dev/null 2>&1; then
     echo "harness CLIs (this runtime):"
-    "$PY" "$S/harness_versions.py" || true
+    "$PY" "$S/harness_versions.py" "$@" || true
     return 0
   fi
   stored="$(harness_epoch)"
@@ -579,7 +579,7 @@ sc_harness_status() {
     # a host SC_PYTHON pointing at a host venv would not exist in there. $S is a
     # host absolute path that resolves identically inside — launch bind-mounts
     # the repo at its own path, which is what makes this exec work at all.
-    docker exec "$CNAME" python3 "$S/harness_versions.py" 2>/dev/null \
+    docker exec "$CNAME" python3 "$S/harness_versions.py" "$@" 2>/dev/null \
       || echo "  (could not probe $CNAME)"
   else
     echo "harness CLIs (runtime and compatibility):"
@@ -1274,7 +1274,7 @@ case "$cmd" in
       sc_harness_status || true
       echo "  running sandboxes keep the OLD image until they restart: ./sc restart --no-build"
     fi ;;
-  harness-status)  sc_harness_status ;;
+  harness-status)  sc_harness_status "$@" ;;
   docker-cache-gc) exec "$PY" "$S/docker_cache.py" "$@" ;;
   rollback)     if sc_help_form "$@"; then
                   echo "usage: ./sc rollback [--engine-only]"

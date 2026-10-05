@@ -1927,6 +1927,8 @@ def main(argv: list[str]) -> int:
     # Auth/login stays manual; this only ensures the CLI binary is present.
     print("→ ensure harnesses installed (claude + opencode + codex + vibe + kimi)")
     install_mod.ensure_harnesses()
+    # Each runtime owns its evidence; sandbox first launch verifies its binary.
+    run_script("seat_conversion.py")
 
     # …and that covers the HOST only — see expire_sandbox_harnesses() for the
     # half of the fleet ensure_harnesses() cannot reach.

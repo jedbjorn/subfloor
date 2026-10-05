@@ -240,7 +240,7 @@ class BootPhaseLabelTest(unittest.TestCase):
 
         # SC_RAW_BOOT: these unit tests drive the raw
         # boot pipeline itself, so they hold the tooling escape hatch.
-        env = {"SC_RAW_BOOT": "1"}
+        env = {"SC_RAW_BOOT": "1", "SC_SEAT": "gui"}
         if no_prune:
             env["SC_NO_AUTOPRUNE"] = "1"
         if sandbox:
@@ -308,10 +308,14 @@ class BootPhaseLabelTest(unittest.TestCase):
             stack.enter_context(mock.patch.object(run, "apply_sandbox", return_value=[]))
             stack.enter_context(mock.patch.object(run, "set_terminal_tab_title"))
             stack.enter_context(mock.patch.object(run.os, "chdir"))
-            stack.enter_context(mock.patch.object(
+            execute = stack.enter_context(mock.patch.object(
                 run.os, "execvpe", side_effect=_ExecReached))
             with self.assertRaises(_ExecReached):
                 run.main()
+
+        expected_seat = None if admin else "tui"
+        self.assertEqual(expected_seat, compose_boot.call_args.kwargs["seat"])
+        self.assertEqual(expected_seat, execute.call_args.args[2].get("SC_SEAT"))
 
         return (
             labels,

@@ -8,6 +8,7 @@ from collections.abc import Callable, Mapping
 from pathlib import Path
 
 import harness_versions
+import seat_conversion
 from conversation_adapters import ADAPTER_TYPES, AdapterError
 from conversation_adapters.base import ADAPTERS, load_manifest
 
@@ -221,5 +222,6 @@ def project(
             "compatibility": compatibility,
             "surfaces": surfaces,
             "unavailable_reason": reason,
+            "conversion": seat_conversion.current() if harness == "claude" else None,
         }
     return projected

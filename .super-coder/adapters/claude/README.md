@@ -87,3 +87,28 @@ interruption record; a fresh process resumed that UUID and retained the
 interrupted prompt. Browser-mediated permission responses remain unproven, so
 the manifest advertises that capability as false until the adapter has a typed
 permission bridge.
+
+## GUI background conversion
+
+Non-Admin launches carry `SC_SEAT=gui|tui`. Only the GUI seat uses
+`seat-convert-hook.sh`: verified background Bash calls become foreground
+job-start bridges, background Agent calls become foreground, and native
+scheduling tools are refused with the engine equivalent. TUI and Admin return
+before reading hook input or evidence.
+
+The bridge transports the original Bash program and cwd as encoded data,
+then starts `sc job` through argv with `shell=False`. The original program is
+one unchanged argument to Bash `-c`. Positive native millisecond timeouts round
+up to seconds; invalid explicit timeouts refuse before starting a job. An
+omitted timeout keeps the job default. The foreground bridge has its own
+startup timeout and does not wait for the child job.
+
+Conversion verification is keyed by observed version, binary identity and
+runtime, beside the model evidence in `logs/seat_conversion`. A new install
+gets one bounded native probe; repeated GUI launches read its result. Update,
+harness update and `sc harness-status` also observe new identities.
+`sc harness-status --reverify` explicitly retries. The tiers are `rewrite`,
+`deny-only`, and `disarmed`; disarmed launches state the manual `sc job` rule.
+The GUI status projection exposes the tier, version, timestamp and reason;
+its operator-only reverify endpoint is
+`POST /api/harnesses/claude/conversion/verify`.

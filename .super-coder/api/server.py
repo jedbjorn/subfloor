@@ -60,6 +60,8 @@ _LOG_LOCK = threading.Lock()
 
 sys.path.insert(0, str(ENGINE / "scripts"))
 import artifact_policy  # noqa: E402
+import run_seat
+import seat_conversion
 import backfill_shell_api_keys  # noqa: E402  (startup key provisioning)
 import conversation_broker  # noqa: E402  (Feature #24 durable turn service)
 import conversation_launch  # noqa: E402  (canonical shell launch preparation)
@@ -415,6 +417,7 @@ def get_shell(con, sid: int) -> dict | None:
     if r is None:
         return None
     shell = dict(r)
+    shell["seat"] = run_seat.live_seat(shell["shortname"], shell["flavor"])
     shell["seed"] = rows(con.execute(
         "SELECT entry_id, entry_date, body FROM shell_identity_entries "
         "WHERE shell_id=? AND kind='seed' AND is_deleted=0 AND retired_at IS NULL "
@@ -4379,7 +4382,9 @@ class Handler(BaseHTTPRequestHandler):
                     "SELECT shell_id, shortname, display_name, flavor "
                     "FROM shells WHERE shell_id=?",
                     (sid,)).fetchone()
-                return self._send(200, dict(r) if r else {"shell_id": sid})
+                identity = dict(r) if r else {"shell_id": sid}
+                identity["seat"] = run_seat.live_seat(identity.get("shortname", ""), identity.get("flavor"))
+                return self._send(200, identity)
 
             if path == "/_sc/mem/delivery-audit":
                 actor = con.execute(
@@ -5718,6 +5723,12 @@ class Handler(BaseHTTPRequestHandler):
             return self._search_post(self._body())
         con = db()
         try:
+            if path == "/api/harnesses/claude/conversion/verify":
+                if not self._require_browser_operator(con, "harness conversion verification"):
+                    return
+                if not self._require_browser_mutation_origin("harness conversion verification"):
+                    return
+                return self._send(200, seat_conversion.ensure(force=True))
             if path == "/api/browser":
                 if not self._require_browser_operator(
                         con, "browser configuration",

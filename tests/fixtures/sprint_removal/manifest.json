@@ -107,6 +107,7 @@
     ".super-coder/scripts/harness_surfaces.py",
     ".super-coder/scripts/instance_state.py",
     ".super-coder/scripts/migration.py",
+    ".super-coder/scripts/seat_convert.py",
     ".super-coder/scripts/shell_alias.py",
     ".super-coder/scripts/sprint.py",
     ".super-coder/scripts/sprint_board.py",

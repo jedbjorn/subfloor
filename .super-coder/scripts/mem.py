@@ -349,6 +349,10 @@ def cmd_which(args) -> int:
     me = _api("GET", "/_sc/mem/whoami")
     print(f"engine API : {SC_API_BASE}")
     print(f"shell      : {me.get('display_name')} ({me.get('shortname')}) #{me.get('shell_id')}")
+    if me.get("flavor") != "admin":
+        seat = os.environ.get("SC_SEAT")
+        if seat in {"gui", "tui"}:
+            print(f"seat       : {seat}")
     if _DISCOVERED_FROM is not None:
         print(f"credential : discovered from runtime artifact {_DISCOVERED_FROM}")
     else:

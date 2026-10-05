@@ -968,6 +968,9 @@ def main(argv: list[str]) -> int:
     if "--update-harnesses" in argv:
         step("Updating managed harness CLIs")
         status = update_harnesses()
+        import seat_conversion
+        conversion = seat_conversion.ensure()
+        print(f"  Claude GUI conversion: {conversion['tier']}")
         if any(result not in ("updated", "installed") for result in status.values()):
             print("install: one or more harness updates failed; see results above", file=sys.stderr)
             return 1
