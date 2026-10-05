@@ -159,7 +159,7 @@ class FocusedDeveloperVerificationMigrationTest(unittest.TestCase):
         # This fixture contains only guidance tables. The Runs integration
         # suite applies the complete ledger migration; include its prompt
         # statement here to prove convergence with the current template.
-        runs_migration = (ENGINE / "migrations" / "0273_runs_ledger.sql").read_text()
+        runs_migration = (ENGINE / "migrations" / "0275_runs_ledger.sql").read_text()
         guidance = [
             line for line in runs_migration.splitlines()
             if line.startswith("UPDATE shells SET system_prompt=")

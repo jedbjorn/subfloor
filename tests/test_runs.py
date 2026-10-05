@@ -406,7 +406,7 @@ class RunLedgerTest(ApiFixture, unittest.TestCase):
 
     def test_migration_repeat_preserves_terminal_wake_and_references(self):
         row = self.terminal(self.register())
-        migration = (ENGINE / "migrations/0273_runs_ledger.sql").read_text()
+        migration = (ENGINE / "migrations/0275_runs_ledger.sql").read_text()
         self.con.executescript(migration)
         self.con.executescript(migration)
         self.assertEqual(self.store.get(row["run_id"]), row)

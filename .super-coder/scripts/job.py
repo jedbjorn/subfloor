@@ -338,11 +338,13 @@ def cmd_start(args) -> int:
         die('--timeout must be positive seconds')
     if not (SC_API_TOKEN and SC_API_BASE):
         die('authenticated shell API is required; no command launched')
-    commit = subprocess.run(['git', 'rev-parse', 'HEAD'], capture_output=True, text=True, check=False)
+    cwd = str(project_root.invocation_cwd())
+    commit = subprocess.run(['git', 'rev-parse', 'HEAD'], cwd=cwd,
+                            capture_output=True, text=True, check=False)
     try:
         registered = _api('POST', '/_sc/runs', {
             'registration_key': uuid.uuid4().hex, 'kind': 'job', 'label': args.label,
-            'argv': cmd, 'cwd': os.getcwd(), 'commit': commit.stdout.strip() or None})
+            'argv': cmd, 'cwd': cwd, 'commit': commit.stdout.strip() or None})
     except (urllib.error.URLError, OSError, ValueError) as exc:
         die(f'registration failed ({type(exc).__name__}); no command launched')
     job_id = str(registered['run_id'])
@@ -351,7 +353,7 @@ def cmd_start(args) -> int:
     (jobdir / 'log').touch()
     write_meta(jobdir, {
         'run_id': registered['run_id'], 'job_id': job_id,
-        'label': args.label, 'cmd': cmd, 'cwd': str(project_root.invocation_cwd()),
+        'label': args.label, 'cmd': cmd, 'cwd': cwd,
         'timeout': args.timeout, 'started_at': _now(), 'log': str(jobdir / 'log'),
     })
     # Detach: the supervisor gets its own session so it survives this process,
