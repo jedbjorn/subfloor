@@ -160,7 +160,7 @@ class ProbeGuidanceTest(unittest.TestCase):
         guidance = template.split('## BOUNDED PROBES\n', 1)[1].split('## CODE CRAFT', 1)[0]
         block = '## BOUNDED PROBES\n' + guidance
         old = 'Custom focus\n' + template.replace(block, '')
-        migration = (ENGINE / 'migrations/0276_developer_bounded_probes.sql').read_text()
+        migration = (ENGINE / 'migrations/0278_developer_bounded_probes.sql').read_text()
         with tempfile.TemporaryDirectory() as tmp:
             db = Path(tmp) / 'test.db'
             build_db(str(db))
