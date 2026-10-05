@@ -648,6 +648,13 @@ sc_devkit_hook() {  # $1 = hook name; remaining args append to declared argv
   fi
   if [ "${1:-}" = "--" ]; then shift; fi
   sc_project_env
+  case "$hook:${SC_SEAT:-}:${SC_SHELL_FLAVOR:-}:${SC_DEVKIT_RUN_ID:-}" in
+    test:gui:admin:*|lint:gui:admin:*|typecheck:gui:admin:*) ;;
+    test:gui:*:|lint:gui:*:|typecheck:gui:*:)
+      "$PY" "$S/job.py" start --kind devkit --label "devkit-$hook" -- \
+        "$CALLER_ROOT/sc" "$hook" -- "$@"
+      return $? ;;
+  esac
   "$PY" "$S/devkit.py" run "$CALLER_ROOT" "$hook" "$@"
 }
 

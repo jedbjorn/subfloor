@@ -263,10 +263,14 @@ def supervise(jobdir: Path, notify=send_completion) -> int:
         return supervise_probe(jobdir, meta, notify)
 
     log = open(jobdir / "log", "ab", buffering=0)
+    child_environment = project_root.scrubbed()
+    child_environment.pop('SC_DEVKIT_RUN_ID', None)
+    if meta.get('kind') == 'devkit':
+        child_environment['SC_DEVKIT_RUN_ID'] = str(meta['run_id'])
     try:
         child = subprocess.Popen(
             meta["cmd"], cwd=meta.get("cwd") or None,
-            env=project_root.scrubbed(),
+            env=child_environment,
             stdout=log, stderr=subprocess.STDOUT,
             stdin=subprocess.DEVNULL, start_new_session=True)
     except OSError as e:
@@ -426,6 +430,8 @@ def cmd_start(args) -> int:
     until = getattr(args, 'until', None)
     every = getattr(args, 'every', None)
     if until is not None:
+        if getattr(args, 'kind', 'job') == 'devkit':
+            die('--kind devkit cannot be combined with --until')
         if not until.strip() or '\0' in until or cmd:
             die('--until requires one nonempty quoted shell command and no positional command')
         cmd = ['/bin/sh', '-c', until]
@@ -447,7 +453,7 @@ def cmd_start(args) -> int:
                             capture_output=True, text=True, check=False)
     try:
         registered = _api('POST', '/_sc/runs', {
-            'registration_key': uuid.uuid4().hex, 'kind': 'probe' if until is not None else 'job', 'label': args.label,
+            'registration_key': uuid.uuid4().hex, 'kind': 'probe' if until is not None else getattr(args, 'kind', 'job'), 'label': args.label,
             'argv': cmd, 'cwd': cwd, 'commit': commit.stdout.strip() or None})
     except (urllib.error.URLError, OSError, ValueError) as exc:
         die(f'registration failed ({type(exc).__name__}); no command launched')
@@ -457,8 +463,9 @@ def cmd_start(args) -> int:
     (jobdir / 'log').touch()
     write_meta(jobdir, {
         'run_id': registered['run_id'], 'job_id': job_id,
+        'kind': registered['kind'],
         'label': args.label, 'cmd': cmd, 'cwd': cwd,
-        'kind': 'probe' if until is not None else 'job', 'every': every,
+        'every': every,
         'timeout': args.timeout, 'started_at': _now(), 'log': str(jobdir / 'log'),
     })
     # Detach: the supervisor gets its own session so it survives this process,
@@ -657,6 +664,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     sp = sub.add_parser("start", help="register and detach; completion durably wakes the owner")
     sp.add_argument("--label", help="display label (never used in a filesystem path)")
+    sp.add_argument("--kind", choices=('job', 'devkit'), default='job', help=argparse.SUPPRESS)
     sp.add_argument("--timeout", type=int,
                     help="positive overall seconds; probes default to 3600, ordinary jobs have no default")
     sp.add_argument("--until", metavar="COMMAND",

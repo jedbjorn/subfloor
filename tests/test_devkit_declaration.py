@@ -19,7 +19,6 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / ".super-coder" / "scripts"))
 
 import devkit
-import seed_skills
 from devkit import DevkitConfigError, load_declaration
 
 RUNNER = ROOT / ".super-coder" / "scripts" / "devkit.py"
@@ -655,7 +654,7 @@ class RunnerTest(unittest.TestCase):
         self.assertIn(r"raw\rreturn\bbackspace\x00nulred", displayed)
         self.assertEqual(self.compact_log(done).read_bytes(), raw)
 
-    def test_full_mode_inherits_streams_and_status_without_creating_a_log(self):
+    def test_full_mode_preserves_streams_and_status_with_receipt(self):
         child = self.root / "full-failure"
         child.write_text(
             "#!/bin/sh\nprintf 'full-out\\n'\nprintf 'full-err\\n' >&2\nexit 17\n"
@@ -668,8 +667,10 @@ class RunnerTest(unittest.TestCase):
         self.assertEqual(done.returncode, 17)
         self.assertEqual(done.stdout, "full-out\n")
         self.assertIn("full-err\n", done.stderr)
-        self.assertNotIn("dev-kit log:", done.stderr)
-        self.assertFalse((self.root / ".sc-state").exists())
+        log = self.compact_log(done)
+        self.assertIn("full-out", log.read_text())
+        self.assertIn("full-err", log.read_text())
+        self.assertEqual(json.loads(log.with_suffix(".receipt.json").read_text())["exit_status"], 17)
 
     def test_compact_log_merges_stdout_and_stderr_without_losing_bytes(self):
         child = self.root / "merged"
@@ -717,7 +718,7 @@ class RunnerTest(unittest.TestCase):
         self.assertEqual(deps.returncode, 0, deps.stdout + deps.stderr)
         self.assertEqual(deps.stdout, "direct-output\n")
         self.assertTrue(marker.exists())
-        self.assertNotIn("dev-kit log:", deps.stderr)
+        self.assertTrue(self.compact_log(deps).with_suffix(".receipt.json").exists())
 
     def test_compact_retention_keeps_newest_twenty_and_never_running_files(self):
         child = self.root / "success"
@@ -817,7 +818,7 @@ class RunnerTest(unittest.TestCase):
             devkit.subprocess, "Popen", side_effect=InterruptedProcess
         ), mock.patch.object(
             devkit, "invoking_checkout", return_value=self.root.resolve()
-        ), self.assertRaises(KeyboardInterrupt):
+        ), mock.patch("devkit_receipts.provenance", return_value={"commit": None, "branch": None}), self.assertRaises(KeyboardInterrupt):
             devkit.run_hook(self.root, "test", ())
 
         running = list(
@@ -1109,6 +1110,7 @@ class DispatcherHelpTest(unittest.TestCase):
         shutil.copy2(RUNNER.with_name("artifact_policy.py"), scripts / "artifact_policy.py")
         shutil.copy2(RUNNER.with_name("instance_state.py"), scripts / "instance_state.py")
         shutil.copy2(RUNNER.with_name("project_root.py"), scripts / "project_root.py")
+        shutil.copy2(RUNNER.with_name("devkit_receipts.py"), scripts / "devkit_receipts.py")
         (self.root / ".subfloor").mkdir()
         capture = self.root / ".subfloor" / "capture"
         capture.write_text("#!/bin/sh\nprintf '<%s>\\n' \"$@\"\n")

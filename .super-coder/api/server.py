@@ -4414,6 +4414,10 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, store.running(rid, sid, self._body()))
             if post and action == 'terminal':
                 return self._send(200, store.terminal(rid, sid, self._body()))
+            if post and action == 'receipt':
+                return self._send(200, store.receipt(rid, sid, self._body()))
+            if post and action == 'prune-evidence':
+                return self._send(200, store.prune_evidence(rid, sid))
             return self._send(404, {'error': 'unknown run action'})
         except PermissionError as exc:
             return self._send(403, {'error': str(exc)})

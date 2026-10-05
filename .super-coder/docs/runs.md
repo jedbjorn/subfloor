@@ -67,11 +67,36 @@ submit execution outcomes. Cancellation verifies boot id, pid and start ticks.
 | `POST /_sc/runs/<id>/running` | Supervisor/child pid, start ticks, boot id, started timestamp |
 | `POST /_sc/runs/<id>/terminal` | `{state,exit_code,finished_at,spawn_error?}`; one immutable terminal payload |
 | `GET /_sc/runs/<id>/tail` | Bounded log text; absent evidence is identified |
+| `POST /_sc/runs/<id>/receipt` | Owner-only immutable dev-kit receipt; duplicate identical submissions are idempotent |
+| `POST /_sc/runs/<id>/prune-evidence` | Record pruned completed receipt evidence; preserve the row and parsed receipt |
 | `POST /_sc/runs/<id>/kill` | Owner cancellation request; supervisor retains authoritative exit |
 | `GET /api/runs[/<id>[/tail]]` | Operator projection |
 | `POST /api/runs/<id>/kill` | Operator cancellation, guarded browser origin |
 
 `kind` registration accepts `job`, `devkit`, and `probe`. Native process
-observations are reserved for the process-tree lane. Receipt and attachment
-columns are reserved for their downstream lanes. The snapshot includes runs
+observations are reserved for the process-tree lane. Attachment columns remain reserved for their downstream lane. The snapshot includes runs
 and delivery evidence after their message/conversation parents.
+
+## Dev-kit receipts
+
+GUI-seat shell `sc test`, `sc lint` and `sc typecheck` calls return a registered
+`devkit` job id. The hook reuses that run, attaches its receipt before terminal
+completion and produces one owner wake. TUI, Admin and `deps` calls stay
+foreground. A nested hook consumes no outer marker and receives its own run.
+
+Logs and adjacent `.receipt.json` files live in the invoking checkout's
+`.sc-state/local/devkit-logs/<hook>/`. Receipts record the declared hook argv,
+appended arguments, checkout, host/container seat, starting Git commit and
+branch, status, duration and log. Pytest summaries include counts and failing
+node ids; missing terminal summaries remain null. Full-output mode also retains
+the streams and receipt. A standalone CI/operator invocation without shell API
+credentials produces local evidence without promising a ledger row or wake.
+
+Authenticated hooks register before execution; refusal launches no command.
+Receipts persist beside the engine-allocated run evidence before completion,
+so reconciliation can recover them after an API outage. Owner-only receipt
+submission is idempotent and refuses conflicting data. The newest twenty
+log/receipt pairs per hook are retained; pruning records `evidence_pruned` on
+the ledger first. If the ledger cannot acknowledge pruning, both files remain.
+The row and structured receipt outlive the files. These receipts describe local
+execution; GitHub checks remain the merge-gate evidence.
