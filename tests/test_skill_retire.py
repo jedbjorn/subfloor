@@ -517,6 +517,26 @@ class RetireRouteAuthorityTest(unittest.TestCase):
                                 "the skill catalogue is DB-canonical and "
                                 "Planner-curated (fork_skill_design)"), post[1])
 
+    def test_planner_put_retires_and_unretires_an_engine_skill(self):
+        name = sorted(seed_skills.seeded_skill_names())[0]
+        planner = self.TOKENS["planner"]
+        with tempfile.TemporaryDirectory() as tmp, \
+                mock.patch.object(seed_skills, "RETIRED_FILE",
+                                  Path(tmp) / "skills_retired.json"), \
+                mock.patch.object(skill_cli.skill_projection,
+                                  "reconcile_existing_checkouts", return_value={}):
+            status, body = self.call("PUT", f"/_sc/skills/retire/{name}", {}, planner)
+            self.assertEqual((status, body["action"], body["name"]),
+                             (200, "retire", name), body)
+            self.assertEqual(json.loads(seed_skills.RETIRED_FILE.read_text()), [name])
+            # a string is not a boolean: "false" must not silently retire
+            self.assertEqual(self.call("PUT", f"/_sc/skills/retire/{name}",
+                                       {"retired": "false"}, planner)[0], 400)
+            status, body = self.call("PUT", f"/_sc/skills/retire/{name}",
+                                     {"retired": False}, planner)
+            self.assertEqual((status, body["action"]), (200, "unretire"), body)
+            self.assertEqual(json.loads(seed_skills.RETIRED_FILE.read_text()), [])
+
 
 if __name__ == "__main__":
     unittest.main()

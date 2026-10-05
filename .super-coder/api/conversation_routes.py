@@ -52,6 +52,12 @@ DB_PATH = instance_state.maintenance_database_path(ENGINE)
 _SIGNAL_GROUP = os.killpg
 
 _ALLOWED_HOST_SET = frozenset(("127.0.0.1", "localhost", "::1"))
+# The confusion every shell-facing browser refusal prevents, named first
+# (Feature #91 E5/E6); server.py reuses it for the browser profile routes.
+BROWSER_OWNERSHIP_CONFUSION = (
+    "the browser profile and its chats belong to the operator; a shell drives, "
+    "it does not own"
+)
 _BROWSER_HARNESSES = tuple(sorted(ADAPTER_TYPES))
 _BROWSER_HARNESS_SQL = ",".join("?" for _ in _BROWSER_HARNESSES)
 _CONVERSATION_STATES = frozenset(
@@ -223,7 +229,8 @@ def _operator(con, headers) -> dict:
         raise ApiError(
             403,
             "OPERATOR_REQUIRED",
-            "conversations are owned by the browser operator",
+            f"{BROWSER_OWNERSHIP_CONFUSION}: conversations are owned by the "
+            "browser operator",
         )
     row = con.execute(
         "SELECT user_id,username FROM users WHERE is_active=1 ORDER BY user_id LIMIT 1"

@@ -442,7 +442,7 @@ class DispatcherRuntimeProbeTest(unittest.TestCase):
         self.assertEqual(completed.returncode, 1)
         self.assertTrue(completed.stderr.startswith(
             "✗ host Python preflight: the engine's tracked baseline is Python 3.14 "
-            "(decision #240); an older interpreter fails later with a worse message.\n"),
+            "(decision #240); any other interpreter fails later with a worse message.\n"),
             completed.stderr)
         self.assertIn(f"SC_PYTHON '{selected}' is not executable", completed.stderr)
         self.assertIn("export SC_PYTHON=", completed.stderr)

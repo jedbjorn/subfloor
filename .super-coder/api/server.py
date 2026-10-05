@@ -570,11 +570,8 @@ def get_cli_skills(con) -> dict:
 
 
 # The confusion every shell-facing browser refusal prevents, named first
-# (Feature #91 E5/E6).
-BROWSER_OWNERSHIP_CONFUSION = (
-    "the browser profile and its chats belong to the operator; a shell drives, "
-    "it does not own"
-)
+# (Feature #91 E5/E6); one sentence shared with the conversation routes.
+BROWSER_OWNERSHIP_CONFUSION = conversation_routes.BROWSER_OWNERSHIP_CONFUSION
 
 
 class SkillApiError(ValueError):
@@ -6073,8 +6070,11 @@ class Handler(BaseHTTPRequestHandler):
             # Planner-owned lane as POST /_sc/skills/{retire|unretire}; one
             # owner, so both routes authorize identically (Feature #91 E3).
             try:
-                body = self._body()
-                action = "retire" if body.get("retired", True) else "unretire"
+                retired = self._body().get("retired", True)
+                if not isinstance(retired, bool):
+                    # "false" is truthy; a string must not silently retire.
+                    return self._send(400, {"error": "retired must be a JSON boolean"})
+                action = "retire" if retired else "unretire"
                 return self._skills_mutation_post(
                     f"/_sc/skills/{action}", {"name": unquote(parts[3])})
             except Exception as exc:  # noqa: BLE001

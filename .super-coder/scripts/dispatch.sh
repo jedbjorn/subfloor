@@ -87,7 +87,7 @@ sc_platform_unsupported() {
 }
 
 # The confusion the preflight prevents, named before any remedy (Feature #91 C2).
-SC_PYTHON_BASELINE="the engine's tracked baseline is Python 3.14 (decision #240); an older interpreter fails later with a worse message."
+SC_PYTHON_BASELINE="the engine's tracked baseline is Python 3.14 (decision #240); any other interpreter fails later with a worse message."
 
 sc_python_recovery() {
   echo '  recovery: install Python 3.14.x with sqlite3, then:' >&2

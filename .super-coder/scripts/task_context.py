@@ -119,6 +119,9 @@ def merge_gate(*, sprint_id: int | None, lifecycle: str | None,
                 f"registered PR once `sc sprint authorize-merge --sprint {sprint_id} "
                 "--registered-pr <id>` returns it live green + approved; arming was "
                 "the FnB's grant")
+    if lifecycle == "paused" and sprint_id is not None:
+        return (f"merge gate: Sprint {sprint_id} is paused — wait for resume, or an "
+                "explicit FnB directive naming the PR")
     where = ("no armed Sprint covers this work" if sprint_id is None
              else f"Sprint {sprint_id} is {lifecycle or 'unknown'}, not armed")
     return f"merge gate: an explicit FnB directive naming the PR ({where})"

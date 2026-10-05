@@ -2141,8 +2141,10 @@ ADMIN_IN_SANDBOX_REFUSAL = (
 
 
 def main() -> None:
-    # The one Admin-in-sandbox check (Feature #91 C8): before any floor or
-    # state read, so the refusal is the first and only thing a sandbox sees.
+    # The one Admin-in-sandbox check (Feature #91 C8), first in main(): no
+    # floor or launch state is read before it. Module import can still fail
+    # earlier (instance_state may raise MaintenanceCutoverRequired), so this is
+    # the first refusal main() gives, not the only possible output.
     if "--host-admin" in sys.argv[1:] and os.environ.get("SC_SANDBOX"):
         sys.exit(ADMIN_IN_SANDBOX_REFUSAL)
     source_repo = install.is_source_repo()

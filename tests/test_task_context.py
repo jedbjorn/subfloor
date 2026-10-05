@@ -475,14 +475,17 @@ class ProjectorTest(unittest.TestCase):
     def test_unarmed_sprint_merge_gate_is_the_fnb_directive(self):
         ids = seed_feature(self.con)
         sp = seed_sprint(self.con, ids, lifecycle="paused")
+        paused = (f"merge gate: Sprint {sp['sprint']} is paused — wait for resume, "
+                  "or an explicit FnB directive naming the PR")
         self.assertEqual(
-            self.project(task_id=ids["tasks"][1])["boundaries"]["merge"],
-            "merge gate: an explicit FnB directive naming the PR "
-            f"(Sprint {sp['sprint']} is paused, not armed)")
+            self.project(task_id=ids["tasks"][1])["boundaries"]["merge"], paused)
         self.assertEqual(
-            self.project(work_unit_id=sp["unit"])["boundaries"]["merge"],
+            self.project(work_unit_id=sp["unit"])["boundaries"]["merge"], paused)
+        self.assertEqual(
+            tc.merge_gate(sprint_id=7, lifecycle="completed", developer="DEV1",
+                          caller_is_developer=True),
             "merge gate: an explicit FnB directive naming the PR "
-            f"(Sprint {sp['sprint']} is paused, not armed)")
+            "(Sprint 7 is completed, not armed)")
 
     def test_task_linked_to_a_unit_points_at_the_work_unit_selector(self):
         ids = seed_feature(self.con)
