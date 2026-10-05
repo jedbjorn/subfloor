@@ -1,6 +1,7 @@
 """Runs UI process evidence: real children, incarnation boundaries and replay."""
 from __future__ import annotations
 
+import copy
 import json
 import os
 import signal
@@ -104,6 +105,65 @@ def test_lingering_release_records_loss_once(broker_case, native_process):
     store.release_process_link(rid)
     with case.connect() as con:
         assert con.execute("SELECT count(*) FROM conversation_events WHERE event_type='run.process.ended'").fetchone()[0] == 1
+
+
+@pytest.mark.parametrize('change', ['child_exited', 'pid_reused', 'indeterminate', 'omitted'])
+def test_snapshot_persists_only_process_identity_or_count_changes(broker_case, native_process, change):
+    process, child_pid = native_process
+    cid, _, rid, ticks = bind_process(broker_case, process)
+    live = run_processes.snapshot(process.pid, ticks, process.pid)
+    with broker_case.connect() as con, \
+            mock.patch.object(run_processes, 'snapshot', return_value=live), \
+            mock.patch.object(run_processes.conversation_events, 'notify') as notify:
+        first = copy.deepcopy(run_processes.observe(con, cid))
+        with mock.patch.object(run_processes.db_driver, 'write_transaction') as write:
+            for i in range(30):
+                live['observed_at'] = f'poll-{i}'
+                live['processes'].reverse()
+                for child in live['processes']:
+                    child['age_s'] += 2
+                    child['cmdline'] = f'updated argv {i}'
+                assert run_processes.observe(con, cid) == live
+            write.assert_not_called()
+        assert run_processes.last_snapshot(con, rid) == first
+        assert con.execute("SELECT count(*) FROM conversation_events WHERE event_type='run.process.snapshot'").fetchone()[0] == 1
+        notify.assert_called_once_with(cid)
+
+        if change == 'child_exited':
+            live['processes'] = [p for p in live['processes'] if p['pid'] != child_pid]
+        elif change == 'pid_reused':
+            next(p for p in live['processes'] if p['pid'] == child_pid)['start_ticks'] += 1
+        else:
+            live[change] += 1
+        assert run_processes.observe(con, cid) == live
+        assert run_processes.last_snapshot(con, rid) == live
+        assert con.execute("SELECT count(*) FROM conversation_events WHERE event_type='run.process.snapshot'").fetchone()[0] == 2
+        assert notify.call_count == 2
+
+
+def test_concurrent_observer_does_not_duplicate_snapshot(broker_case, native_process):
+    process, _ = native_process
+    cid, mid, rid, ticks = bind_process(broker_case, process)
+    live = run_processes.snapshot(process.pid, ticks, process.pid)
+    live['run_id'] = rid
+    write_transaction = run_processes.db_driver.write_transaction
+
+    def competing_write(con, operation):
+        # A second tab commits after the first tab's read but before its lock.
+        with broker_case.connect() as other, write_transaction(other, operation):
+            BrokerStore._append_event(other, conversation_id=cid,
+                                      event_type='run.process.snapshot', payload=live,
+                                      message_id=mid, run_id=rid)
+        return write_transaction(con, operation)
+
+    with broker_case.connect() as con, \
+            mock.patch.object(run_processes, 'snapshot', return_value=live), \
+            mock.patch.object(run_processes.db_driver, 'write_transaction', side_effect=competing_write), \
+            mock.patch.object(run_processes.conversation_events, 'notify') as notify:
+        assert run_processes.observe(con, cid) == live
+        assert con.execute("SELECT count(*) FROM conversation_events WHERE event_type='run.process.snapshot'").fetchone()[0] == 1
+        assert run_processes.last_snapshot(con, rid) == live
+        notify.assert_not_called()
 
 
 def test_live_child_is_never_reported_terminated(broker_case, native_process):

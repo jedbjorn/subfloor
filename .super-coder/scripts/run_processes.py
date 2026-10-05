@@ -108,13 +108,16 @@ def observe(con, conversation_id: str) -> dict:
         return {'processes': [], 'indeterminate': 1, 'omitted': 0}
     observed = snapshot(row['process_pid'], row['process_start_ticks'], row['process_group_id'])
     observed['run_id'] = row['run_id']
-    if not observed['root_alive']:
+    if not observed['root_alive'] or _snapshot_unchanged(con, observed):
         return observed
     with db_driver.write_transaction(con, 'conversation.process_snapshot'):
         current = con.execute('SELECT process_pid,process_start_ticks FROM conversation_runs WHERE run_id=?',
                               (row['run_id'],)).fetchone()
         if tuple(current) != (row['process_pid'], row['process_start_ticks']):
             return {'processes': [], 'indeterminate': 0, 'omitted': 0}
+        # Another observer may have persisted this tree since our read above.
+        if _snapshot_unchanged(con, observed):
+            return observed
         BrokerStore._append_event(con, conversation_id=conversation_id,
                                   event_type='run.process.snapshot', payload=observed,
                                   message_id=row['trigger_message_id'], run_id=row['run_id'])
@@ -130,6 +133,18 @@ def last_snapshot(con, run_id: int) -> dict | None:
         "AND e.event_type='run.process.snapshot' ORDER BY e.sequence DESC LIMIT 1", (run_id,),
     ).fetchone()
     return json.loads(row[0]) if row else None
+
+
+def _snapshot_unchanged(con, observed: dict) -> bool:
+    previous = last_snapshot(con, observed['run_id'])
+    if previous is None or previous['run_id'] != observed['run_id']:
+        return False
+    return (
+        {(p['pid'], p['start_ticks']) for p in previous['processes']}
+        == {(p['pid'], p['start_ticks']) for p in observed['processes']}
+        and previous['indeterminate'] == observed['indeterminate']
+        and previous['omitted'] == observed['omitted']
+    )
 
 
 def termination_evidence(observed: dict | None) -> dict | None:
