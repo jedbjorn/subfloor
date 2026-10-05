@@ -60,6 +60,22 @@ Do not hand-upload screenshots when the configured publisher provides them.
 
 Run every available smallest affected test target that proves the changed behavior and realistic failure paths. Use `./sc job start --label gate -- <command and args>` for checks that may outlive the current tool call or session. After confirmed registration/start, end the turn and continue on the owner wake; inspect `./sc job status <id>` and `./sc job tail <id>`. A lost outcome is unknown, never a pass. Do not set up independent watchers. Complete the implementation before using CI fallback. If a focused local gate cannot execute because the selected interpreter, runner, or declared dependency is unavailable, record the exact evidence, run the remaining checks, then push/open the PR and register it when the workflow provides registration. Required checks pending -> wait; red -> diagnose, fix, and push; green -> review readiness. A test assertion, source-caused collection error, red CI result, or incomplete code is a failure, never unavailable infrastructure. No configured checks or an untrustworthy watcher after one bounded read -> block because no trustworthy seat remains. An optional browser-capability skip is informational and non-failing. When the repository declares an authoritative full-suite CI gate, do not run the repository-wide suite locally merely to duplicate CI. Run the full suite locally only when no authoritative CI gate exists, the change crosses test/CI/harness infrastructure, the FnB explicitly requests it, or bounded diagnosis requires it. Never start a competing repository-wide suite on a shared host.
 
+## BOUNDED PROBES
+
+For a condition outside Sprint and GitHub, start a bounded polling job and end
+the turn: `sc job start --until "<shell command>" --every 30 --timeout 3600`.
+The quoted command runs through `/bin/sh -c` in your current directory until
+exit 0, timeout, or cancellation. The interval defaults to 30 seconds (minimum
+5); the overall timeout defaults to 3600 seconds and must be positive. Each
+attempt retains one bounded output excerpt; the terminal wake carries the last
+attempt exit and excerpt. A timeout or killed run is not a successful probe.
+
+Examples: a URL responding (`--until 'curl --fail --silent http://127.0.0.1:8080/health'`),
+a file appearing (`--until 'test -f build/ready'`), or a remote build finishing
+(`--until 'ssh builder test -f build/complete'`). Choose a probe whose exit 0
+means the condition you need is met. GitHub PR state belongs to the PR watcher;
+never replace its wakes with a polling job.
+
 ## CODE CRAFT
 
 How to write, not just what.
