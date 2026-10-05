@@ -8,6 +8,7 @@ never automatically replayed. Transport retries retain the same wake key.
 from __future__ import annotations
 
 import json
+import re
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -134,113 +135,175 @@ def reconcile(con, *, now=None):
     now = now or datetime.now(timezone.utc)
     rows = con.execute(
         "SELECT e.*,m.body,c.conversation_id,c.state AS chat_state,r.run_id,r.state AS run_state,"
-        "r.error_code,r.error_detail,r.transcript_path,r.transcript_offset "
+        "r.error_code,r.error_detail,r.transcript_path,r.transcript_offset,cm.state AS message_state "
         "FROM engine_wake_receipts e JOIN wake_message m USING(message_id) "
         "JOIN conversation_messages cm ON cm.message_id=e.conversation_message_id "
         "JOIN conversations c ON c.conversation_id=cm.conversation_id "
         "LEFT JOIN conversation_runs r ON r.run_id=(SELECT MAX(cr.run_id) FROM conversation_runs cr "
-        "WHERE cr.trigger_message_id=cm.message_id) WHERE e.blocked_reason IS NULL "
-        "AND NOT EXISTS (SELECT 1 FROM runs done WHERE done.message_id=e.message_id "
-        "AND done.wake_state='consumed')"
+        "WHERE cr.trigger_message_id=cm.message_id) WHERE e.settled_at IS NULL"
     ).fetchall()
     retries = []
     for row in rows:
-        consumed = row["run_id"] is not None and _contains_prompt(
-            row["transcript_path"],
-            row["transcript_offset"],
-            f"wake_message #{row['message_id']} ",
-            row["body"],
-        )
-        with db_driver.write_transaction(con, "wake.engine_reconcile"):
-            if consumed:
+        try:
+            if _reconcile_receipt(con, row, now):
+                retries.append(row)
+        except Exception as exc:  # noqa: BLE001 - isolate untrusted per-turn evidence
+            with db_driver.write_transaction(con, "wake.receipt_blocked"):
+                _block_receipt(con, row, _reconcile_error(exc), now)
+
+    # Enqueue can notify the broker; no external work inside a DB transaction.
+    db_path = con.execute("PRAGMA database_list").fetchone()[2]
+    for row in retries:
+        try:
+            _retry_receipt(con, db_path, row)
+        except OSError as exc:
+            # Retain the idempotent attempt after a temporary enqueue outage.
+            with db_driver.write_transaction(con, "wake.receipt_retry"):
                 con.execute(
-                    "UPDATE runs SET wake_state='consumed',turn_run_id=?,last_error=NULL "
-                    "WHERE message_id=?",
-                    (row["run_id"], row["message_id"]),
-                )
-                continue
-            busy = row["run_state"] == "failed" and row["error_code"] == "SHELL_BUSY"
-            if busy and row["last_run_id"] != row["run_id"]:
-                attempt = row["busy_attempts"] + 1
-                blocked = (
-                    "SHELL_BUSY retry ladder exhausted; release CLI slot and recover via operator"
-                    if attempt > len(BACKOFF)
-                    else None
-                )
-                retry = (
-                    None
-                    if blocked
-                    else _stamp(now + timedelta(seconds=BACKOFF[attempt - 1]))
-                )
-                con.execute(
-                    "UPDATE engine_wake_receipts SET busy_attempts=?,last_run_id=?,retry_at=?,"
-                    "blocked_reason=? WHERE message_id=?",
-                    (attempt, row["run_id"], retry, blocked, row["message_id"]),
-                )
-                con.execute(
-                    "UPDATE runs SET wake_state=?,last_error=?,turn_run_id=NULL WHERE message_id=?",
+                    "UPDATE engine_wake_receipts SET last_error=?,retry_at=? WHERE message_id=?",
                     (
-                        "blocked" if blocked else "pending",
-                        blocked or "SHELL_BUSY; queued for retry",
+                        f"{type(exc).__name__}: retry enqueue unavailable",
+                        _stamp(now + timedelta(seconds=BACKOFF[-1])),
                         row["message_id"],
                     ),
                 )
-                continue
-            if row["retry_at"] and row["retry_at"] <= _stamp(now):
-                if row["chat_state"] == "closed":
-                    reason = "wake chat closed during CLI contention; operator recovery required"
-                    con.execute(
-                        "UPDATE engine_wake_receipts SET blocked_reason=? WHERE message_id=?",
-                        (reason, row["message_id"]),
-                    )
-                    con.execute(
-                        "UPDATE runs SET wake_state='blocked',last_error=? WHERE message_id=?",
-                        (reason, row["message_id"]),
-                    )
-                    continue
-                retries.append(dict(row))
-                continue
-            if row["retry_at"] or busy:
-                continue
-            terminal_failure = row["run_state"] in {"failed", "cancelled", "unknown"}
-            state = "blocked" if terminal_failure else "enqueued"
-            reason = (
-                "wake turn ended without transcript consumption evidence; operator recovery required"
-                if terminal_failure
+        except Exception as exc:  # noqa: BLE001 - one failed enqueue must not halt the pulse
+            with db_driver.write_transaction(con, "wake.receipt_blocked"):
+                _block_receipt(con, row, _reconcile_error(exc), now)
+
+
+def _reconcile_error(exc):
+    return (
+        "reconciliation blocked; operator recovery required: "
+        + (f"{type(exc).__name__}: {exc}"[:512])
+    )
+
+
+def _block_receipt(con, row, reason, now):
+    con.execute(
+        "UPDATE engine_wake_receipts SET blocked_reason=?,last_error=?,"
+        "settled_at=?,retry_at=NULL WHERE message_id=?",
+        (reason, reason, _stamp(now), row["message_id"]),
+    )
+    con.execute(
+        "UPDATE runs SET wake_state='blocked',last_error=? "
+        "WHERE message_id=? AND wake_state<>'consumed'",
+        (reason, row["message_id"]),
+    )
+
+
+def _reconcile_receipt(con, row, now):
+    consumed = row["run_id"] is not None and _contains_prompt(
+        row["transcript_path"],
+        row["transcript_offset"],
+        f"wake_message #{row['message_id']} ",
+        row["body"],
+    )
+    with db_driver.write_transaction(con, "wake.engine_reconcile"):
+        if consumed:
+            con.execute(
+                "UPDATE engine_wake_receipts SET settled_at=?,retry_at=NULL,last_error=NULL "
+                "WHERE message_id=?",
+                (_stamp(now), row["message_id"]),
+            )
+            con.execute(
+                "UPDATE runs SET wake_state='consumed',turn_run_id=?,last_error=NULL "
+                "WHERE message_id=?",
+                (row["run_id"], row["message_id"]),
+            )
+            return False
+        busy = row["run_state"] == "failed" and row["error_code"] == "SHELL_BUSY"
+        if busy and row["last_run_id"] != row["run_id"]:
+            attempt = row["busy_attempts"] + 1
+            blocked = (
+                "SHELL_BUSY retry ladder exhausted; release CLI slot and recover via operator"
+                if attempt > len(BACKOFF)
                 else None
             )
-            con.execute(
-                "UPDATE runs SET wake_state=?,turn_run_id=?,last_error=? "
-                "WHERE message_id=? AND wake_state<>'consumed'",
-                (state, row["run_id"], reason, row["message_id"]),
+            retry = (
+                None
+                if blocked
+                else _stamp(now + timedelta(seconds=BACKOFF[attempt - 1]))
             )
-            if terminal_failure:
-                con.execute(
-                    "UPDATE engine_wake_receipts SET blocked_reason=? WHERE message_id=?",
-                    (reason, row["message_id"]),
+            con.execute(
+                "UPDATE engine_wake_receipts SET busy_attempts=?,last_run_id=?,retry_at=?,"
+                "blocked_reason=?,last_error=?,settled_at=? WHERE message_id=?",
+                (
+                    attempt,
+                    row["run_id"],
+                    retry,
+                    blocked,
+                    blocked,
+                    _stamp(now) if blocked else None,
+                    row["message_id"],
+                ),
+            )
+            con.execute(
+                "UPDATE runs SET wake_state=?,last_error=?,turn_run_id=NULL WHERE message_id=?",
+                (
+                    "blocked" if blocked else "pending",
+                    blocked or "SHELL_BUSY; queued for retry",
+                    row["message_id"],
+                ),
+            )
+            return False
+        if row["retry_at"] and row["retry_at"] <= _stamp(now):
+            if row["chat_state"] == "closed":
+                reason = (
+                    "wake chat closed during CLI contention; operator recovery required"
                 )
+                _block_receipt(con, row, reason, now)
+                return False
+            return True
+        if row["retry_at"] or busy:
+            return False
+        terminal_failure = row["run_state"] in {
+            "succeeded",
+            "failed",
+            "cancelled",
+            "unknown",
+        }
+        terminal_failure = terminal_failure or row["chat_state"] == "closed"
+        terminal_failure = terminal_failure or row["message_state"] in {
+            "failed",
+            "cancelled",
+            "completed",
+        }
+        state = "blocked" if terminal_failure else "enqueued"
+        reason = (
+            "wake turn ended without transcript consumption evidence; operator recovery required"
+            if terminal_failure
+            else None
+        )
+        con.execute(
+            "UPDATE runs SET wake_state=?,turn_run_id=?,last_error=? "
+            "WHERE message_id=? AND wake_state<>'consumed'",
+            (state, row["run_id"], reason, row["message_id"]),
+        )
+        if terminal_failure:
+            _block_receipt(con, row, reason, now)
+    return False
 
-    # Enqueue can notify the broker; no external work inside a DB transaction.
+
+def _retry_receipt(con, db_path, row):
     from sprint_runtime import enqueue_conversation_turn
 
-    db_path = con.execute("PRAGMA database_list").fetchone()[2]
-    for row in retries:
-        original = con.execute(
-            "SELECT body,idempotency_key FROM conversation_messages WHERE message_id=?",
-            (row["conversation_message_id"],),
-        ).fetchone()
-        native_ref = enqueue_conversation_turn(
-            db_path,
-            row["conversation_id"],
-            original["body"],
-            f"engine-wake:{row['message_id']}:busy:{row['busy_attempts']}",
+    original = con.execute(
+        "SELECT body,idempotency_key FROM conversation_messages WHERE message_id=?",
+        (row["conversation_message_id"],),
+    ).fetchone()
+    native_ref = enqueue_conversation_turn(
+        db_path,
+        row["conversation_id"],
+        original["body"],
+        f"engine-wake:{row['message_id']}:busy:{row['busy_attempts']}",
+    )
+    with db_driver.write_transaction(con, "wake.busy_retry"):
+        con.execute(
+            "UPDATE engine_wake_receipts SET conversation_message_id=?,retry_at=NULL,last_error=NULL "
+            "WHERE message_id=?",
+            (int(native_ref.split(":")[1]), row["message_id"]),
         )
-        with db_driver.write_transaction(con, "wake.busy_retry"):
-            con.execute(
-                "UPDATE engine_wake_receipts SET conversation_message_id=?,retry_at=NULL "
-                "WHERE message_id=?",
-                (int(native_ref.split(":")[1]), row["message_id"]),
-            )
 
 
 def observe_codex_transcript(store, run, adapter, turn):
@@ -280,15 +343,26 @@ def observe_codex_transcript(store, run, adapter, turn):
     con = store.connect()
     try:
         with db_driver.write_transaction(con, "runs.native_consumed"):
-            for row in con.execute(
-                "SELECT run_id,message_id FROM runs WHERE owner_shell_id=? "
-                "AND message_id IS NOT NULL",
-                (run.shell_id,),
-            ).fetchall():
-                if f"## wake_message #{row['message_id']} " in run.body:
-                    con.execute(
-                        "UPDATE runs SET wake_state='consumed',turn_run_id=?,last_error=NULL WHERE run_id=?",
-                        (run.run_id, row["run_id"]),
-                    )
+            for message_id in re.findall(r"## wake_message #(\d+) ", run.body):
+                row = con.execute(
+                    "SELECT message_id,body FROM wake_message "
+                    "WHERE receiver_shell_id=? AND message_id=? AND sprint_id IS NULL "
+                    "AND declared_type='re-enter'",
+                    (run.shell_id, int(message_id)),
+                ).fetchone()
+                if row is None or row["body"] not in run.body:
+                    continue
+                # The broker may finish before record_enqueue commits its
+                # receipt. Upsert here so that race cannot lose consumption.
+                con.execute(
+                    "INSERT INTO engine_wake_receipts(message_id,conversation_message_id,settled_at) "
+                    "VALUES(?,?,datetime('now')) ON CONFLICT(message_id) DO UPDATE SET "
+                    "settled_at=excluded.settled_at,retry_at=NULL,last_error=NULL,blocked_reason=NULL",
+                    (row["message_id"], run.message_id),
+                )
+                con.execute(
+                    "UPDATE runs SET wake_state='consumed',turn_run_id=?,last_error=NULL WHERE message_id=?",
+                    (run.run_id, row["message_id"]),
+                )
     finally:
         con.close()

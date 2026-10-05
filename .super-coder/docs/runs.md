@@ -29,7 +29,12 @@ intent commit atomically. The wake names the outcome and status/tail commands;
 it conveys no review, merge or Sprint authority. Each run has its own message;
 transport may coalesce wakes. Status distinguishes `pending`, `enqueued`,
 `consumed` (the exact wake appears in the native transcript), and `blocked`.
-A broker run id alone is not consumption evidence.
+A broker run id alone is not consumption evidence. Settled receipts leave the
+active reconciliation set, including non-job engine wakes. A completed turn
+without consumption evidence is blocked for operator recovery. Invalid run or
+receipt evidence blocks only that row with a bounded reason; other delivery
+and runtime heartbeats continue. The supervisor bounds spawn-error text in its
+terminal submission while retaining full local evidence.
 
 A non-Sprint re-enter wake refused before dispatch with `SHELL_BUSY` retries
 at 15, 60, 180 and 300 seconds. It retains the failed conversation attempts and
@@ -42,7 +47,10 @@ readable at the next boot. The engine never injects into the CLI session.
 `run/jobs/<legacy-id>/meta.json` and logs remain readable by the legacy status
 and tail commands. New job evidence lives in engine-allocated
 `run/runs/<run-id>/`. An upgrade does not invent legacy ownership or issue old
-completion wakes.
+completion wakes. During an API outage, status, tail, wait and list read local
+ledger or legacy evidence and label it unauthoritative. Status and list expose
+submission errors and attempt timestamps; a local terminal result does not
+prove wake delivery. Ledger cancellation requires the authenticated API.
 
 ## API and integration boundary
 

@@ -26,6 +26,7 @@ from runs import boot_id, terminal_payload
 
 ENGINE = Path(__file__).resolve().parents[1]
 JOBS = ENGINE / "run" / "jobs"
+RUNS = ENGINE / "run" / "runs"
 
 # API proxy — run.py injects these at boot; the supervisor inherits them.
 SC_API_TOKEN = os.environ.get("SC_API_TOKEN", "")
@@ -85,7 +86,7 @@ def write_meta(jobdir: Path, meta: dict) -> None:
 def job_dir(job_id: str) -> Path:
     if Path(job_id).name != job_id or job_id in {".", ".."}:
         die("invalid job id")
-    d = JOBS / job_id
+    d = RUNS / job_id if job_id.isdecimal() and (RUNS / job_id).is_dir() else JOBS / job_id
     if not d.is_dir():
         die(f"no such job '{job_id}' (see `sc job list --all`)")
     return d
@@ -380,45 +381,58 @@ def cmd_start(args) -> int:
     return 0
 
 
-def cmd_list(args) -> int:
-    emitted = False
-    if SC_API_TOKEN and SC_API_BASE:
-        for row in _api('GET', '/_sc/runs')['runs']:
-            if args.all or row['state'] in {'registered', 'running'} or row['wake_state'] == 'blocked':
-                emitted = True
-                print(f"  {row['run_id']:<20} {row['state']:<10} wake={row['wake_state']} {row['label']}")
-    if not JOBS.is_dir():
-        if not emitted:
-            print("job: none")
-        return 0
-    rows = []
-    for d in sorted(JOBS.iterdir(), key=lambda p: p.name):
-        meta = read_meta(d)
-        if not meta:
-            continue
-        st = state_of(meta)
-        if not args.all and st not in ("running", "lost"):
-            continue
-        rows.append((d.name, st, meta))
-    if not rows:
-        if not emitted:
-            print("job: none live" + ("" if args.all else " (--all includes finished)"))
-        return 0
-    for name, st, meta in rows:
-        dur = (_dur(meta.get("started_at", ""), meta.get("finished_at") or _now()))
-        print(f"  {name:<20} {st:<8} {dur:>8}  {' '.join(meta.get('cmd', []))[:60]}")
-    return 0
-
-
-def ledger_run(job_id: str) -> dict | None:
-    if not job_id.isdecimal() or not (SC_API_TOKEN and SC_API_BASE):
+def read_api(path: str) -> dict | None:
+    """Read remotely when reachable; authorization failures never fall back."""
+    if not (SC_API_TOKEN and SC_API_BASE):
         return None
     try:
-        return _api('GET', f'/_sc/runs/{job_id}')
+        return _api('GET', path)
     except urllib.error.HTTPError as exc:
         if exc.code == 404:
             return None
         die(f'run access refused (HTTP {exc.code})')
+    except (urllib.error.URLError, OSError):
+        print('job: API unreachable; using local evidence (unauthoritative)', file=sys.stderr)
+        return None
+
+
+def local_notice():
+    print('job: local evidence (unauthoritative; wake delivery unconfirmed)', file=sys.stderr)
+
+
+def cmd_list(args) -> int:
+    emitted = False
+    result = read_api('/_sc/runs')
+    if result is not None:
+        for row in result['runs']:
+            if args.all or row['state'] in {'registered', 'running'} or row['wake_state'] == 'blocked':
+                emitted = True
+                print(f"  {row['run_id']:<20} {row['state']:<10} wake={row['wake_state']} {row['label']}")
+    roots = [JOBS] if result is not None else [RUNS, JOBS]
+    for root in roots:
+        if not root.is_dir():
+            continue
+        for directory in sorted(root.iterdir(), key=lambda p: p.name):
+            meta = read_meta(directory)
+            if not meta:
+                continue
+            st = state_of(meta)
+            if not args.all and st not in ('running', 'lost') and not meta.get('submission_error'):
+                continue
+            emitted = True
+            dur = _dur(meta.get('started_at', ''), meta.get('finished_at') or _now())
+            print(f"  {directory.name:<20} {st:<8} {dur:>8}  local evidence (unauthoritative) "
+                  f"{' '.join(meta.get('cmd', []))[:60]}")
+            for key in ('submission_error', 'submission_attempted_at', 'submission_attempt'):
+                if meta.get(key) is not None:
+                    print(f"    {key}: {meta[key]}")
+    if not emitted:
+        print('job: none live' + ('' if args.all else ' (--all includes finished)'))
+    return 0
+
+
+def ledger_run(job_id: str) -> dict | None:
+    return read_api(f'/_sc/runs/{job_id}') if job_id.isdecimal() else None
 
 
 def cmd_status(args) -> int:
@@ -427,11 +441,13 @@ def cmd_status(args) -> int:
         print(json.dumps(row, indent=2))
         return 1 if row['state'] == 'lost' else 0
     meta = read_meta(job_dir(args.id))
+    local_notice()
     st = state_of(meta)
     print(f"job {meta.get('job_id')}: {st}")
     for k in ("label", "cmd", "cwd", "pid", "supervisor_pid", "started_at",
               "finished_at", "exit_code", "timed_out", "killed", "timeout",
-              "spawn_error", "log"):
+              "spawn_error", "log", "submission_error", "submission_attempted_at",
+              "submission_attempt"):
         v = meta.get(k)
         if v is not None and v is not False:   # `v not in (None, False)` hides exit_code=0
             print(f"  {k}: {v if not isinstance(v, list) else ' '.join(v)}")
@@ -442,13 +458,14 @@ def cmd_status(args) -> int:
 
 
 def cmd_tail(args) -> int:
-    if ledger_run(args.id) is not None:
-        result = _api('GET', f'/_sc/runs/{args.id}/tail')
+    result = read_api(f'/_sc/runs/{args.id}/tail') if args.id.isdecimal() else None
+    if result is not None:
         print('\n'.join(result['text'].splitlines()[-args.n:]))
         return 0
     log = job_dir(args.id) / "log"
     if not log.exists():
         die(f"no log for job '{args.id}'")
+    local_notice()
     lines = log.read_bytes().decode(errors="replace").splitlines()
     for line in lines[-args.n:]:
         print(line)
@@ -459,11 +476,14 @@ def cmd_wait(args) -> int:
     """Bounded foreground wait — THE wait-slice primitive. Exit 0 = finished
     (status line printed) · 2 = still running after the slice (drain your
     inbox, then slice again) · 1 = no such job / lost."""
+    slice_s = min(args.for_seconds or WAIT_DEFAULT, WAIT_CAP)
+    deadline = time.monotonic() + slice_s
     row = ledger_run(args.id)
     if row is not None:
-        deadline = time.monotonic() + min(args.for_seconds or WAIT_DEFAULT, WAIT_CAP)
         while True:
             row = ledger_run(args.id)
+            if row is None:
+                break  # API went away while waiting; inspect persisted evidence.
             if row['state'] not in {'registered', 'running'}:
                 print(json.dumps(row, indent=2))
                 return 1 if row['state'] == 'lost' else 0
@@ -472,8 +492,7 @@ def cmd_wait(args) -> int:
                 return 2
             time.sleep(POLL)
     jobdir = job_dir(args.id)
-    slice_s = min(args.for_seconds or WAIT_DEFAULT, WAIT_CAP)
-    deadline = time.monotonic() + slice_s
+    local_notice()
     while True:
         meta = read_meta(jobdir)
         if is_finished(meta):
@@ -493,9 +512,16 @@ def cmd_wait(args) -> int:
 
 def cmd_kill(args) -> int:
     if ledger_run(args.id) is not None:
-        print(json.dumps(_api('POST', f'/_sc/runs/{args.id}/kill', {})))
+        try:
+            print(json.dumps(_api('POST', f'/_sc/runs/{args.id}/kill', {})))
+        except urllib.error.HTTPError as exc:
+            die(f'kill refused (HTTP {exc.code})')
+        except (urllib.error.URLError, OSError):
+            die('API unreachable; cancellation unconfirmed; inspect status before retrying')
         return 0
     jobdir = job_dir(args.id)
+    if jobdir.parent == RUNS:
+        die('ledger cancellation requires the API; inspect local status until it recovers')
     meta = read_meta(jobdir)
     if is_finished(meta):
         die(f"job '{args.id}' already finished ({state_of(meta)})")
@@ -536,7 +562,7 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--all", action="store_true")
     sp.set_defaults(fn=cmd_list)
 
-    sp = sub.add_parser("status", help="one job's state, exit, paths")
+    sp = sub.add_parser("status", help="state, exit, paths; local evidence when API unreachable")
     sp.add_argument("id")
     sp.set_defaults(fn=cmd_status)
 

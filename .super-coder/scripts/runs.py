@@ -54,7 +54,11 @@ def terminal_payload(meta: dict) -> dict:
             "state": state,
             "exit_code": meta.get("exit_code"),
             "finished_at": meta.get("finished_at"),
-            "spawn_error": meta.get("spawn_error"),
+            # JSON escapes a non-BMP character as twelve ASCII bytes. Leave
+            # room for the supervisor's fixed state/code/timestamp fields.
+            "spawn_error": str(meta["spawn_error"])[:256]
+            if meta.get("spawn_error") is not None
+            else None,
         }.items()
         if value is not None
     }
@@ -303,56 +307,68 @@ class RunStore:
 
     def reconcile(self) -> None:
         rows = self.con.execute(
-            "SELECT * FROM runs WHERE state IN ('registered','running')"
+            "SELECT * FROM runs WHERE state IN ('registered','running') "
+            "AND wake_state<>'blocked'"
         ).fetchall()
         for raw in rows:
-            row = dict(raw)
-            path = Path(row["evidence_path"]).with_name("meta.json")
             try:
-                meta = json.loads(path.read_text())
-            except (OSError, ValueError):
-                meta = {}
-            if meta.get("run_id") != row["run_id"]:
-                meta = {}
-            if meta.get("finished_at"):
-                self.terminal(
-                    row["run_id"], row["owner_shell_id"], terminal_payload(meta)
-                )
-                continue
-            if meta.get("supervisor_pid"):
-                self.running(row["run_id"], row["owner_shell_id"], meta)
-                row.update(meta)
-            alive = process_alive(
-                row.get("supervisor_pid"),
-                row.get("supervisor_start_ticks"),
-                row.get("boot_id"),
-            )
-            if alive is True or (alive is None and row.get("supervisor_pid")):
-                continue
-            age = (
-                datetime.now(timezone.utc)
-                - datetime.fromisoformat(row["created_at"]).replace(tzinfo=timezone.utc)
-            ).total_seconds()
-            if alive is None and age < 30:
-                continue
-            # Re-read after proving the supervisor gone: it may have persisted
-            # its terminal result between our first read and the liveness check.
-            try:
-                final = json.loads(path.read_text())
-            except (OSError, ValueError):
-                final = {}
-            if self.get(row["run_id"])["state"] in TERMINAL:
-                continue
-            if final.get("run_id") == row["run_id"] and final.get("finished_at"):
-                self.terminal(
-                    row["run_id"], row["owner_shell_id"], terminal_payload(final)
-                )
-                continue
-            self.terminal(
-                row["run_id"],
-                row["owner_shell_id"],
-                {
-                    "state": "lost",
-                    "finished_at": datetime.now(timezone.utc).isoformat(),
-                },
-            )
+                self._reconcile_row(dict(raw))
+            except Exception as exc:  # noqa: BLE001 - row evidence must not halt engine wake delivery
+                reason = f"{type(exc).__name__}: {exc}"[:512]
+                with db_driver.write_transaction(self.con, "runs.reconcile_blocked"):
+                    self.con.execute(
+                        "UPDATE runs SET wake_state='blocked',last_error=? "
+                        "WHERE run_id=? AND state IN ('registered','running')",
+                        (
+                            "reconciliation blocked; operator recovery required: "
+                            + reason,
+                            raw["run_id"],
+                        ),
+                    )
+
+    def _reconcile_row(self, row: dict) -> None:
+        path = Path(row["evidence_path"]).with_name("meta.json")
+        try:
+            meta = json.loads(path.read_text())
+        except (OSError, ValueError):
+            meta = {}
+        if meta.get("run_id") != row["run_id"]:
+            meta = {}
+        if meta.get("finished_at"):
+            self.terminal(row["run_id"], row["owner_shell_id"], terminal_payload(meta))
+            return
+        if meta.get("supervisor_pid"):
+            self.running(row["run_id"], row["owner_shell_id"], meta)
+            row.update(meta)
+        alive = process_alive(
+            row.get("supervisor_pid"),
+            row.get("supervisor_start_ticks"),
+            row.get("boot_id"),
+        )
+        if alive is True or (alive is None and row.get("supervisor_pid")):
+            return
+        age = (
+            datetime.now(timezone.utc)
+            - datetime.fromisoformat(row["created_at"]).replace(tzinfo=timezone.utc)
+        ).total_seconds()
+        if alive is None and age < 30:
+            return
+        # Re-read after proving the supervisor gone: it may have persisted
+        # its terminal result between our first read and the liveness check.
+        try:
+            final = json.loads(path.read_text())
+        except (OSError, ValueError):
+            final = {}
+        if self.get(row["run_id"])["state"] in TERMINAL:
+            return
+        if final.get("run_id") == row["run_id"] and final.get("finished_at"):
+            self.terminal(row["run_id"], row["owner_shell_id"], terminal_payload(final))
+            return
+        self.terminal(
+            row["run_id"],
+            row["owner_shell_id"],
+            {
+                "state": "lost",
+                "finished_at": datetime.now(timezone.utc).isoformat(),
+            },
+        )

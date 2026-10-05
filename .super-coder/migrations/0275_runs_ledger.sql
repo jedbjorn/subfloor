@@ -1,4 +1,4 @@
--- 0273 — engine-owned runs and non-Sprint wake delivery receipts.
+-- 0275 — engine-owned runs and non-Sprint wake delivery receipts.
 -- migrate: foreign-keys-off
 -- Rebuild the wake kind constraint, retaining message ids, references and guards.
 PRAGMA foreign_keys=OFF;
@@ -145,6 +145,7 @@ CREATE TABLE IF NOT EXISTS runs (
 );
 CREATE INDEX IF NOT EXISTS idx_runs_owner ON runs(owner_shell_id,run_id);
 CREATE INDEX IF NOT EXISTS idx_runs_pending ON runs(state,wake_state);
+CREATE INDEX IF NOT EXISTS idx_runs_message ON runs(message_id) WHERE message_id IS NOT NULL;
 CREATE TRIGGER IF NOT EXISTS runs_identity_immutable
 BEFORE UPDATE OF owner_shell_id,registration_key,kind,argv,cwd ON runs
 BEGIN SELECT RAISE(ABORT,'run identity is immutable'); END;
@@ -161,8 +162,14 @@ CREATE TABLE IF NOT EXISTS engine_wake_receipts (
     busy_attempts INTEGER NOT NULL DEFAULT 0,
     last_run_id INTEGER REFERENCES conversation_runs(run_id),
     retry_at TEXT,
-    blocked_reason TEXT
+    blocked_reason TEXT,
+    last_error TEXT,
+    settled_at TEXT
 );
+CREATE INDEX IF NOT EXISTS idx_engine_wake_receipts_active
+    ON engine_wake_receipts(message_id) WHERE settled_at IS NULL;
+CREATE INDEX IF NOT EXISTS idx_conversation_runs_trigger
+    ON conversation_runs(trigger_message_id,run_id);
 CREATE TABLE IF NOT EXISTS engine_wake_failures (
     wake_id INTEGER PRIMARY KEY REFERENCES sprint_wake_outbox(wake_id),
     attempts INTEGER NOT NULL DEFAULT 0,

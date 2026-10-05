@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import dataclasses
+import io
 import json
 import os
 import signal
@@ -15,9 +16,11 @@ import time
 import unittest
 import urllib.error
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import redirect_stderr, redirect_stdout
 from datetime import datetime, timedelta, timezone
 from http.server import ThreadingHTTPServer
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 ENGINE = Path(__file__).resolve().parents[1] / ".super-coder"
@@ -29,6 +32,7 @@ import run_wakes
 import runs
 import server
 import sprint_runtime
+import test_sprint_work_dispatch as sprint_fixture
 from conversation_launch import ConversationLaunchPreparer
 from sprint_message_delivery import SprintMessageStore
 from test_conversation_broker import ConversationBrokerCase, FakeAdapter
@@ -156,6 +160,80 @@ class RunLedgerTest(ApiFixture, unittest.TestCase):
             self.con.execute("SELECT count(*) FROM wake_message").fetchone()[0], 0
         )
 
+    def test_oversized_spawn_error_submits_bounded_terminal_payload(self):
+        result = self.cli("start", "--label", "long-argv", "--", "x" * 5000)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        row = self.finished(job._api("GET", "/_sc/runs")["runs"][0])
+        self.assertEqual(row["state"], "failed")
+        self.assertEqual(row["exit_code"], 127)
+        self.assertLess(len(row["terminal_json"].encode()), 4096)
+        self.assertIsNotNone(row["message_id"])
+        meta = job.read_meta(Path(row["evidence_path"]).parent)
+        self.assertGreater(len(meta["spawn_error"]), 4096)
+        meta["spawn_error"] = "😀" * 5000
+        self.assertLess(len(json.dumps(runs.terminal_payload(meta)).encode()), 4096)
+
+    def test_local_reads_during_api_outage_for_ledger_and_decimal_legacy(self):
+        row = self.register()
+        directory = Path(row["evidence_path"]).parent
+        legacy = self.engine / "run" / "jobs" / "42"
+        for path in (directory, legacy):
+            path.mkdir(parents=True)
+            (path / "log").write_text("persisted command output\n")
+            job.write_meta(
+                path,
+                {
+                    "job_id": path.name,
+                    "run_id": row["run_id"] if path == directory else None,
+                    "cmd": ["echo", "proof"],
+                    "exit_code": 19,
+                    "finished_at": job._now(),
+                    "log": str(path / "log"),
+                    "submission_error": "URLError: submission unavailable",
+                    "submission_attempted_at": "2026-10-05T10:00:00Z",
+                    "submission_attempt": 2,
+                },
+            )
+        self.stop_api()  # exercise the actual refused connection, not a mock
+        with (
+            mock.patch.object(job, "RUNS", directory.parent),
+            mock.patch.object(job, "JOBS", legacy.parent),
+        ):
+            for path in (directory, legacy):
+                args = SimpleNamespace(id=path.name, n=10, for_seconds=1)
+                for command in (job.cmd_status, job.cmd_tail, job.cmd_wait):
+                    with self.subTest(path=path.name, command=command.__name__):
+                        out, err = io.StringIO(), io.StringIO()
+                        with redirect_stdout(out), redirect_stderr(err):
+                            self.assertEqual(command(args), 0)
+                        self.assertIn("API unreachable", err.getvalue())
+                        self.assertIn("unauthoritative", err.getvalue())
+                        if command == job.cmd_status:
+                            self.assertIn("exit_code: 19", out.getvalue())
+                            self.assertIn("submission_error: URLError", out.getvalue())
+                            self.assertIn("2026-10-05T10:00:00Z", out.getvalue())
+                        if command == job.cmd_tail:
+                            self.assertIn("persisted command output", out.getvalue())
+            out = io.StringIO()
+            with redirect_stdout(out), redirect_stderr(io.StringIO()):
+                self.assertEqual(job.cmd_list(SimpleNamespace(all=True)), 0)
+            self.assertEqual(
+                out.getvalue().count("local evidence (unauthoritative)"), 2
+            )
+            self.assertIn("submission_attempted_at", out.getvalue())
+            with self.assertRaisesRegex(SystemExit, "cancellation requires the API"):
+                job.cmd_kill(SimpleNamespace(id=directory.name))
+
+    def test_forbidden_api_read_never_falls_back_to_local_evidence(self):
+        row = self.register()
+        with (
+            mock.patch.object(job, "SC_API_TOKEN", "other-token"),
+            mock.patch.object(job, "job_dir") as local,
+        ):
+            with self.assertRaisesRegex(SystemExit, "HTTP 403"):
+                job.cmd_status(SimpleNamespace(id=str(row["run_id"])))
+            local.assert_not_called()
+
     def test_registration_concurrent_retry_and_label_never_path(self):
         with ThreadPoolExecutor(max_workers=8) as pool:
             rows = list(
@@ -273,8 +351,14 @@ class RunLedgerTest(ApiFixture, unittest.TestCase):
             "PYTHONPATH": os.pathsep.join((str(guard), str(ENGINE / "scripts"))),
         }
         result = self.cli(
-            "start", "--label", "restricted-client", "--",
-            "sh", "-c", "echo restricted-job-completed; exit 17", env=env,
+            "start",
+            "--label",
+            "restricted-client",
+            "--",
+            "sh",
+            "-c",
+            "echo restricted-job-completed; exit 17",
+            env=env,
         )
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         row = self.finished(job._api("GET", "/_sc/runs")["runs"][0])
@@ -391,16 +475,17 @@ class RunLedgerTest(ApiFixture, unittest.TestCase):
 
     def test_populated_run_and_wake_survive_snapshot_rebuild(self):
         import snapshot
+
         row = self.terminal(self.register())
         content = snapshot.serialize_instance(self.con)
-        rebuilt = self.root / 'rebuilt.db'
+        rebuilt = self.root / "rebuilt.db"
         build_db(str(rebuilt))
         con = sqlite3.connect(rebuilt)
         try:
             con.executescript(content)
-            restored = runs.RunStore(con, self.engine).get(row['run_id'])
+            restored = runs.RunStore(con, self.engine).get(row["run_id"])
             self.assertEqual(restored, row)
-            self.assertEqual(con.execute('PRAGMA foreign_key_check').fetchall(), [])
+            self.assertEqual(con.execute("PRAGMA foreign_key_check").fetchall(), [])
         finally:
             con.close()
 
@@ -454,9 +539,27 @@ class RunContinuationTest(ApiFixture, ConversationBrokerCase):
         return TranscriptAdapter()
 
     def test_codex_server_transcript_proves_consumption_without_a_local_path(self):
+        self._codex_consumption(non_run=False)
+
+    def test_codex_non_run_receipt_settles_without_a_local_transcript(self):
+        self._codex_consumption(non_run=True)
+
+    def _codex_consumption(self, *, non_run):
         self.add_conversation(state="idle")
-        row = self.terminal(self.register())
-        case = self
+        con = self.connect()
+        self.addCleanup(con.close)
+        if non_run:
+            receipt = SprintMessageStore(con).send_to_shell(
+                1,
+                message_kind="notification",
+                body="PR checks passed",
+                idempotency_key="non-run-codex",
+                declared_type="re-enter",
+            )
+            mid = receipt.message_id
+        else:
+            row = self.terminal(self.register())
+            mid = row["message_id"]
         from conversation_adapters.base import SessionInspection
 
         class ServerTranscript(FakeAdapter):
@@ -496,13 +599,154 @@ class RunContinuationTest(ApiFixture, ConversationBrokerCase):
         broker.notify()
         wait_for(
             lambda: (
-                case.cli("status", str(row["run_id"])).stdout.find(
-                    '"wake_state": "consumed"'
+                (
+                    receipt := con.execute(
+                        "SELECT settled_at FROM engine_wake_receipts WHERE message_id=?",
+                        (mid,),
+                    ).fetchone()
                 )
-                >= 0
+                and receipt[0]
             )
         )
+        if not non_run:
+            self.assertEqual(
+                job.ledger_run(str(row["run_id"]))["wake_state"], "consumed"
+            )
         self.assertTrue(broker.wait_idle(3))
+        with mock.patch.object(run_wakes, "_contains_prompt") as read:
+            run_wakes.reconcile(con)
+            read.assert_not_called()
+
+    def test_non_run_receipt_settles_and_is_never_read_again(self):
+        self.add_conversation(state="idle")
+        con = self.connect()
+        self.addCleanup(con.close)
+        receipt = SprintMessageStore(con).send_to_shell(
+            1,
+            message_kind="notification",
+            body="PR checks passed",
+            idempotency_key="non-run-pr-wake",
+            declared_type="re-enter",
+        )
+        broker = self.start_broker(lambda _: self._adapter())
+        runtime = sprint_runtime.SprintRuntimeService(self.db_path)
+        runtime.pulse_once()
+        mid = con.execute(
+            "SELECT conversation_message_id FROM engine_wake_receipts WHERE message_id=?",
+            (receipt.message_id,),
+        ).fetchone()[0]
+        broker.notify()
+        wait_for(lambda: self._message_state(mid) == "completed")
+        run_wakes.reconcile(con)
+        self.assertIsNotNone(
+            con.execute(
+                "SELECT settled_at FROM engine_wake_receipts WHERE message_id=?",
+                (receipt.message_id,),
+            ).fetchone()[0]
+        )
+        with mock.patch.object(run_wakes, "_contains_prompt") as read:
+            for _ in range(5):
+                run_wakes.reconcile(con)
+            read.assert_not_called()
+        self.assertEqual(con.execute("SELECT count(*) FROM runs").fetchone()[0], 0)
+
+    def test_cancelled_before_dispatch_receipt_settles_without_a_run(self):
+        self.add_conversation(state="idle")
+        con = self.connect()
+        self.addCleanup(con.close)
+        SprintMessageStore(con).send_to_shell(
+            1,
+            message_kind="notification",
+            body="cancelled wake",
+            idempotency_key="cancelled-before-dispatch",
+            declared_type="re-enter",
+        )
+        sprint_runtime.SprintRuntimeService(self.db_path).pulse_once()
+        mid = con.execute(
+            "SELECT conversation_message_id FROM engine_wake_receipts"
+        ).fetchone()[0]
+        con.execute(
+            "UPDATE conversation_messages SET state='cancelled',completed_at=datetime('now') WHERE message_id=?",
+            (mid,),
+        )
+        con.commit()
+        run_wakes.reconcile(con)
+        receipt = con.execute(
+            "SELECT settled_at,blocked_reason FROM engine_wake_receipts"
+        ).fetchone()
+        self.assertIsNotNone(receipt["settled_at"])
+        self.assertIn("without transcript", receipt["blocked_reason"])
+        self.assertEqual(
+            con.execute("SELECT count(*) FROM conversation_runs").fetchone()[0], 0
+        )
+        with mock.patch.object(run_wakes, "_contains_prompt") as read:
+            run_wakes.reconcile(con)
+            read.assert_not_called()
+
+    def test_completed_turn_without_evidence_settles_as_blocked(self):
+        self.add_conversation(state="idle")
+        row = self.terminal(self.register())
+        broker = self.start_broker(lambda _: FakeAdapter())
+        runtime = sprint_runtime.SprintRuntimeService(self.db_path)
+        runtime.pulse_once()
+        con = self.connect()
+        self.addCleanup(con.close)
+        mid = con.execute(
+            "SELECT conversation_message_id FROM engine_wake_receipts"
+        ).fetchone()[0]
+        broker.notify()
+        wait_for(lambda: self._message_state(mid) == "completed")
+        run_wakes.reconcile(con)
+        self.assertEqual(job.ledger_run(str(row["run_id"]))["wake_state"], "blocked")
+        receipt = con.execute("SELECT * FROM engine_wake_receipts").fetchone()
+        self.assertIsNotNone(receipt["settled_at"])
+        self.assertIn("without transcript", receipt["last_error"])
+        with mock.patch.object(run_wakes, "_contains_prompt") as read:
+            runtime.pulse_once(startup=True)
+            read.assert_not_called()
+
+    def test_bad_receipt_is_isolated_from_healthy_receipt_and_heartbeat(self):
+        self.add_conversation(state="idle")
+        bad = self.terminal(self.register(registration_key="bad"))
+        good = self.terminal(self.register(registration_key="good"))
+        broker = self.start_broker(lambda _: self._adapter())
+        runtime = sprint_runtime.SprintRuntimeService(self.db_path)
+        runtime.pulse_once()
+        con = self.connect()
+        self.addCleanup(con.close)
+        mids = con.execute(
+            "SELECT conversation_message_id FROM engine_wake_receipts"
+        ).fetchall()
+        broker.notify()
+        wait_for(
+            lambda: all(self._message_state(mid[0]) == "completed" for mid in mids)
+        )
+        contains = run_wakes._contains_prompt
+
+        def invalid_one(path, offset, marker, body):
+            if marker == f"wake_message #{bad['message_id']} ":
+                raise ValueError("bad transcript evidence " + "x" * 5000)
+            return contains(path, offset, marker, body)
+
+        with mock.patch.object(run_wakes, "_contains_prompt", side_effect=invalid_one):
+            runtime.pulse_once(startup=True)
+        bad_receipt = con.execute(
+            "SELECT * FROM engine_wake_receipts WHERE message_id=?",
+            (bad["message_id"],),
+        ).fetchone()
+        self.assertIsNotNone(bad_receipt["settled_at"])
+        self.assertLess(len(bad_receipt["last_error"]), 600)
+        self.assertEqual(job.ledger_run(str(bad["run_id"]))["wake_state"], "blocked")
+        self.assertEqual(job.ledger_run(str(good["run_id"]))["wake_state"], "consumed")
+        self.assertEqual(
+            con.execute(
+                "SELECT count(*) FROM daemon_heartbeats WHERE name='sprint-runtime'"
+            ).fetchone()[0],
+            1,
+        )
+        with mock.patch.object(run_wakes, "_contains_prompt") as read:
+            runtime.pulse_once()
+            read.assert_not_called()
 
     def test_job_from_turn_one_resumes_same_chat_with_exact_outcome(self):
         chat = self.add_conversation()
@@ -618,6 +862,28 @@ class RunContinuationTest(ApiFixture, ConversationBrokerCase):
         ).fetchall()
         self.assertEqual([r[0] for r in attempts], ["SHELL_BUSY", None])
 
+    def test_busy_retry_enqueue_outage_retains_retry_and_does_not_halt_pulse(self):
+        row, held, _adapter, broker, runtime, con, _mid = self._busy_setup()
+        now = datetime.now(timezone.utc)
+        run_wakes.reconcile(con, now=now)
+        held["busy"] = False
+        with mock.patch.object(
+            sprint_runtime, "enqueue_conversation_turn", side_effect=OSError("offline")
+        ):
+            run_wakes.reconcile(con, now=now + timedelta(seconds=16))
+        receipt = con.execute("SELECT * FROM engine_wake_receipts").fetchone()
+        self.assertIsNone(receipt["settled_at"])
+        self.assertIn("enqueue unavailable", receipt["last_error"])
+        runtime.pulse_once(startup=True)
+        run_wakes.reconcile(con, now=now + timedelta(seconds=317))
+        mid = con.execute(
+            "SELECT conversation_message_id FROM engine_wake_receipts"
+        ).fetchone()[0]
+        broker.notify()
+        wait_for(lambda: self._message_state(mid) == "completed")
+        run_wakes.reconcile(con)
+        self.assertEqual(job.ledger_run(str(row["run_id"]))["wake_state"], "consumed")
+
     def test_busy_ladder_exhaustion_is_visible_and_does_not_reboot(self):
         row, _held, adapter, broker, runtime, con, mid = self._busy_setup()
         now = datetime.now(timezone.utc)
@@ -669,3 +935,57 @@ class RunContinuationTest(ApiFixture, ConversationBrokerCase):
         self.assertEqual(
             con.execute("SELECT attempts FROM engine_wake_failures").fetchone()[0], 7
         )
+
+
+class RunPulseIsolationTest(sprint_fixture.SprintWorkDispatchCase):
+    def test_invalid_run_does_not_stop_healthy_run_sprint_wake_or_heartbeat(self):
+        self.create_unit(developer=1)
+        self.lifecycle.arm(self.sprint_id, 3, conformance_reviewer_shell_id=2)
+        store = runs.RunStore(self.con, self.db_path.parent / "engine")
+        bad_rows = []
+        for key, evidence in (
+            ("bad-terminal", {"finished_at": "invalid", "exit_code": 0}),
+            ("bad-incarnation", {"supervisor_pid": -1, "boot_id": "fixture"}),
+            ("bad-json-shape", []),
+            ("healthy", {"finished_at": job._now(), "exit_code": 0}),
+        ):
+            row = store.register(
+                4,
+                {
+                    "registration_key": key,
+                    "label": key,
+                    "argv": ["true"],
+                    "cwd": str(self.db_path.parent),
+                },
+            )
+            path = Path(row["evidence_path"]).with_name("meta.json")
+            path.parent.mkdir(parents=True)
+            if isinstance(evidence, dict):
+                evidence["run_id"] = row["run_id"]
+            path.write_text(json.dumps(evidence))
+            if key != "healthy":
+                bad_rows.append(row)
+            else:
+                good = row
+        runtime = sprint_runtime.SprintRuntimeService(self.db_path)
+        runtime.pulse_once(startup=True)
+        for row in bad_rows:
+            result = store.get(row["run_id"])
+            self.assertEqual(result["wake_state"], "blocked")
+            self.assertIn("reconciliation blocked", result["last_error"])
+        self.assertEqual(store.get(good["run_id"])["state"], "done")
+        self.assertGreater(
+            self.con.execute(
+                "SELECT count(*) FROM wake_message WHERE sprint_id=? AND delivered_at IS NOT NULL",
+                (self.sprint_id,),
+            ).fetchone()[0],
+            0,
+        )
+        first = self.con.execute(
+            "SELECT beat_at FROM daemon_heartbeats WHERE name='sprint-runtime'"
+        ).fetchone()[0]
+        runtime.pulse_once()
+        second = self.con.execute(
+            "SELECT beat_at FROM daemon_heartbeats WHERE name='sprint-runtime'"
+        ).fetchone()[0]
+        self.assertGreater(second, first)
