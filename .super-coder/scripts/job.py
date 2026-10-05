@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import selectors
 import signal
 import subprocess
 import sys
@@ -20,9 +21,10 @@ import urllib.request
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import NoReturn
 
 import project_root
-from runs import boot_id, terminal_payload
+from runs import PROBE_EXCERPT, boot_id, terminal_payload
 
 ENGINE = Path(__file__).resolve().parents[1]
 JOBS = ENGINE / "run" / "jobs"
@@ -36,9 +38,10 @@ WAIT_DEFAULT = 300          # `job wait` default slice (seconds)
 WAIT_CAP = 550              # hard cap — under harness foreground-timeout limits
 KILL_GRACE = 10             # SIGTERM → SIGKILL grace (seconds)
 POLL = 2                    # supervisor/wait poll interval (seconds)
+PROBE_TIMEOUT = 3600        # probes always have a finite overall deadline
 
 
-def die(msg: str) -> NoReturn:  # noqa: F821
+def die(msg: str) -> NoReturn:
     sys.exit(f"job: {msg}")
 
 
@@ -237,11 +240,15 @@ def supervise(jobdir: Path, notify=send_completion) -> int:
     meta["supervisor_pid"] = os.getpid()
     meta["supervisor_start_ticks"] = _start_ticks(os.getpid())
     meta["boot_id"] = boot_id()
+    if meta.get('kind') == 'probe':
+        # A probe has many short-lived children. Its stable, cancellable
+        # incarnation is the supervisor, including between attempts.
+        meta.update(pid=os.getpid(), start_ticks=meta['supervisor_start_ticks'])
     write_meta(jobdir, meta)
     if meta.get('run_id'):
         try:
             _api('POST', f"/_sc/runs/{meta['run_id']}/running", {
-                k: meta.get(k) for k in ('supervisor_pid', 'supervisor_start_ticks',
+                k: meta.get(k) for k in ('pid', 'start_ticks', 'supervisor_pid', 'supervisor_start_ticks',
                                         'boot_id', 'started_at')})
         except (urllib.error.URLError, OSError):
             meta.update(finished_at=_now(), exit_code=127,
@@ -249,6 +256,11 @@ def supervise(jobdir: Path, notify=send_completion) -> int:
             write_meta(jobdir, meta)
             notify(meta)
             return 127
+
+    if meta.get('kind') == 'probe':
+        meta['probe_ready'] = True
+        write_meta(jobdir, meta)
+        return supervise_probe(jobdir, meta, notify)
 
     log = open(jobdir / "log", "ab", buffering=0)
     try:
@@ -305,7 +317,85 @@ def supervise(jobdir: Path, notify=send_completion) -> int:
     return rc
 
 
-def _kill_group(pid: int) -> None:
+def probe_stop(jobdir: Path, deadline: float) -> str | None:
+    if (jobdir / 'kill_requested').exists():
+        return 'killed'
+    return 'timeout' if time.monotonic() >= deadline else None
+
+
+def probe_attempt(jobdir: Path, meta: dict, deadline: float) -> tuple[int, str, str | None]:
+    """Drain output without accumulating it; check cancellation even on floods.
+
+    The pipe is nonblocking so a silent probe or a descendant retaining stdout
+    cannot hold the supervisor beyond its deadline.
+    """
+    try:
+        child = subprocess.Popen(
+            meta['cmd'], cwd=meta['cwd'], env=project_root.scrubbed(),
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            stdin=subprocess.DEVNULL, start_new_session=True)
+    except OSError as exc:
+        return 127, str(exc)[:PROBE_EXCERPT], 'failed'
+    output = bytearray()
+    stop = None
+    assert child.stdout is not None  # PIPE above always supplies it
+    with child.stdout, selectors.DefaultSelector() as selector:
+        os.set_blocking(child.stdout.fileno(), False)
+        selector.register(child.stdout, selectors.EVENT_READ)
+        while True:
+            stop = probe_stop(jobdir, deadline)
+            if stop:
+                _kill_group(child.pid, child)
+                break
+            for key, _ in selector.select(timeout=min(0.1, max(0, deadline - time.monotonic()))):
+                chunk = os.read(key.fd, 65536)
+                output.extend(chunk[:max(0, PROBE_EXCERPT * 4 - len(output))])
+                if not chunk:
+                    selector.unregister(key.fileobj)
+            if child.poll() is not None:
+                # Capture the final buffered prefix, without waiting for EOF
+                # from descendants or growing memory with the output volume.
+                chunk = child.stdout.read(PROBE_EXCERPT * 4) or b''
+                output.extend(chunk[:max(0, PROBE_EXCERPT * 4 - len(output))])
+                break
+        # Reap the leader before group cleanup, avoiding zombie grace waits.
+        rc = child.wait()
+        if not stop:
+            _kill_group(child.pid)
+    return rc, output.decode(errors='replace')[:PROBE_EXCERPT], stop
+
+
+def supervise_probe(jobdir: Path, meta: dict, notify) -> int:
+    deadline = time.monotonic() + meta['timeout']
+    attempt = 0
+    rc = None
+    stop = probe_stop(jobdir, deadline)
+    with (jobdir / 'log').open('a', buffering=1) as log:
+        while not stop:
+            attempt += 1
+            rc, excerpt, stop = probe_attempt(jobdir, meta, deadline)
+            stop = stop or probe_stop(jobdir, deadline)
+            meta['probe_attempt'] = {'number': attempt, 'exit_code': rc, 'excerpt': excerpt}
+            # JSON escaping guarantees one physical line, even for binary or
+            # multiline output. Raw probe output is never retained elsewhere.
+            log.write(json.dumps(meta['probe_attempt']) + '\n')
+            log.flush()
+            os.fsync(log.fileno())
+            write_meta(jobdir, meta)
+            if stop or rc == 0:
+                break
+            next_attempt = time.monotonic() + meta['every']
+            while not stop and time.monotonic() < next_attempt:
+                time.sleep(min(0.1, max(0, min(next_attempt, deadline) - time.monotonic())))
+                stop = probe_stop(jobdir, deadline)
+    meta.update(finished_at=_now(), exit_code=rc,
+                timed_out=stop == 'timeout', killed=stop == 'killed')
+    write_meta(jobdir, meta)
+    notify(meta)
+    return rc if rc is not None else 1
+
+
+def _kill_group(pid: int, child: subprocess.Popen | None = None) -> None:
     """SIGTERM the job's process group; SIGKILL what remains after the grace
     period. The group is the child's own session (start_new_session at spawn),
     so a suite's worker processes die with it — no half-dead pytest trees."""
@@ -316,6 +406,8 @@ def _kill_group(pid: int) -> None:
             return
         end = time.monotonic() + wait_s
         while time.monotonic() < end:
+            if child is not None:
+                child.poll()  # reap our leader so a zombie cannot consume the grace
             try:
                 os.killpg(pid, 0)
             except ProcessLookupError:
@@ -330,13 +422,24 @@ def cmd_supervise(args) -> int:
 # ── verbs ─────────────────────────────────────────────────────────────────────
 
 def cmd_start(args) -> int:
-    if not args.cmd:
-        die("nothing to run — usage: sc job start [--label x] [--timeout N] -- <cmd ...>")
     cmd = args.cmd[1:] if args.cmd and args.cmd[0] == "--" else list(args.cmd)
+    until = getattr(args, 'until', None)
+    every = getattr(args, 'every', None)
+    if until is not None:
+        if not until.strip() or '\0' in until or cmd:
+            die('--until requires one nonempty quoted shell command and no positional command')
+        cmd = ['/bin/sh', '-c', until]
+        if every is not None and not 5 <= every <= sys.maxsize:
+            die(f'--every must be between 5 and {sys.maxsize} seconds')
+        every = every if every is not None else 30
+        if args.timeout is None:
+            args.timeout = PROBE_TIMEOUT
+    elif every is not None:
+        die('--every requires --until')
     if not cmd:
-        die("nothing to run after --")
-    if args.timeout is not None and args.timeout <= 0:
-        die('--timeout must be positive seconds')
+        die('nothing to run — use -- <command and args> or --until "<probe command>"')
+    if args.timeout is not None and not 0 < args.timeout <= sys.maxsize:
+        die(f'--timeout must be positive seconds (maximum {sys.maxsize})')
     if not (SC_API_TOKEN and SC_API_BASE):
         die('authenticated shell API is required; no command launched')
     cwd = str(project_root.invocation_cwd())
@@ -344,7 +447,7 @@ def cmd_start(args) -> int:
                             capture_output=True, text=True, check=False)
     try:
         registered = _api('POST', '/_sc/runs', {
-            'registration_key': uuid.uuid4().hex, 'kind': 'job', 'label': args.label,
+            'registration_key': uuid.uuid4().hex, 'kind': 'probe' if until is not None else 'job', 'label': args.label,
             'argv': cmd, 'cwd': cwd, 'commit': commit.stdout.strip() or None})
     except (urllib.error.URLError, OSError, ValueError) as exc:
         die(f'registration failed ({type(exc).__name__}); no command launched')
@@ -355,6 +458,7 @@ def cmd_start(args) -> int:
     write_meta(jobdir, {
         'run_id': registered['run_id'], 'job_id': job_id,
         'label': args.label, 'cmd': cmd, 'cwd': cwd,
+        'kind': 'probe' if until is not None else 'job', 'every': every,
         'timeout': args.timeout, 'started_at': _now(), 'log': str(jobdir / 'log'),
     })
     # Detach: the supervisor gets its own session so it survives this process,
@@ -369,7 +473,8 @@ def cmd_start(args) -> int:
     end = time.monotonic() + 5
     while time.monotonic() < end:
         started = read_meta(jobdir)
-        if started.get('pid') or started.get('finished_at'):
+        ready = started.get('probe_ready') if until is not None else started.get('pid')
+        if ready or started.get('finished_at'):
             break
         time.sleep(0.05)
     else:
@@ -546,14 +651,18 @@ def build_parser() -> argparse.ArgumentParser:
         prog="sc job",
         description="Registered jobs survive harness exit and durably wake their owner.",
         epilog="Service teardown/reboot may interrupt computation; recovery records lost "
-               "when no exit evidence survives. Commands are never automatically rerun. "
+               "when no exit evidence survives. Interrupted runs are never automatically restarted. "
                "TUI wakes wait out the CLI lock. Legacy job status/logs remain readable.")
     sub = p.add_subparsers(dest="cmd_name", required=True)
 
     sp = sub.add_parser("start", help="register and detach; completion durably wakes the owner")
     sp.add_argument("--label", help="display label (never used in a filesystem path)")
     sp.add_argument("--timeout", type=int,
-                    help="kill the whole process group after N seconds")
+                    help="positive overall seconds; probes default to 3600, ordinary jobs have no default")
+    sp.add_argument("--until", metavar="COMMAND",
+                    help="repeat a quoted /bin/sh command until exit 0; bounded attempt excerpts and owner wake")
+    sp.add_argument("--every", type=int, metavar="SECONDS",
+                    help="delay between probe attempts (default 30, minimum 5); requires --until")
     sp.add_argument("cmd", nargs=argparse.REMAINDER,
                     help="-- <command and args>")
     sp.set_defaults(fn=cmd_start)

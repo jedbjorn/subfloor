@@ -417,7 +417,9 @@
     ".super-coder/docs/conversation-runtime.md",
     ".super-coder/docs/http-api.md",
     ".super-coder/docs/sprint-pr-watcher.md",
-    "docs/environment.md"
+    "docs/environment.md",
+    ".super-coder/migrations/0278_developer_bounded_probes.sql",
+    "tests/test_job_probe.py"
   ],
   "decision": 33,
   "generation_markers": {

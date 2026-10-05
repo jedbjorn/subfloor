@@ -15,6 +15,19 @@ import db_driver
 
 TERMINAL = frozenset({"done", "failed", "timeout", "killed", "lost"})
 ENGINE = Path(__file__).resolve().parents[1]
+PROBE_EXCERPT = 160
+
+
+def validate_probe_attempt(attempt: object) -> dict:
+    if not isinstance(attempt, dict) or set(attempt) != {'number', 'exit_code', 'excerpt'}:
+        raise ValueError('invalid probe attempt')
+    if type(attempt['number']) is not int or attempt['number'] < 1:
+        raise ValueError('probe attempt number must be positive')
+    if type(attempt['exit_code']) is not int:
+        raise ValueError('probe exit_code must be an integer')
+    if not isinstance(attempt['excerpt'], str) or len(attempt['excerpt']) > PROBE_EXCERPT:
+        raise ValueError('probe excerpt exceeds bound')
+    return attempt
 
 
 def boot_id() -> str:
@@ -56,9 +69,10 @@ def terminal_payload(meta: dict) -> dict:
             "finished_at": meta.get("finished_at"),
             # JSON escapes a non-BMP character as twelve ASCII bytes. Leave
             # room for the supervisor's fixed state/code/timestamp fields.
-            "spawn_error": str(meta["spawn_error"])[:256]
+            "spawn_error": str(meta["spawn_error"])[:128 if meta.get('probe_attempt') else 256]
             if meta.get("spawn_error") is not None
             else None,
+            "probe_attempt": meta.get("probe_attempt"),
         }.items()
         if value is not None
     }
@@ -66,9 +80,16 @@ def terminal_payload(meta: dict) -> dict:
 
 def wake_body(row: dict, payload: dict) -> str:
     rid = row["run_id"]
+    attempt = payload.get('probe_attempt')
+    probe = (
+        f"Final probe attempt {attempt['number']}: exit={attempt['exit_code']}; "
+        f"excerpt={json.dumps(attempt['excerpt'])}.\n"
+        if attempt else ''
+    )
     return (
         f"Run {rid} ({row['kind']}: {row['label']}) {payload['state']}; "
         f"exit={payload.get('exit_code', 'unknown')}; cwd={row['cwd']}.\n"
+        f"{probe}"
         f"Inspect `sc job status {rid}` and `sc job tail {rid}`, then continue "
         "dependent work under your current authority. This outcome grants no "
         "review, merge, or Sprint authority."
@@ -220,7 +241,7 @@ class RunStore:
         # loads host-private launch state, so import it only on the API side.
         from sprint_message_delivery import SprintMessageStore
 
-        allowed = {"state", "exit_code", "finished_at", "spawn_error"}
+        allowed = {"state", "exit_code", "finished_at", "spawn_error", "probe_attempt"}
         if set(payload) - allowed or payload.get("state") not in TERMINAL:
             raise ValueError("invalid terminal payload")
         code = payload.get("exit_code")
@@ -232,6 +253,11 @@ class RunStore:
             raise ValueError("done requires exit_code 0")
         if payload["state"] == "failed" and (code is None or code == 0):
             raise ValueError("failed requires a nonzero exit_code")
+        attempt = payload.get('probe_attempt')
+        if 'probe_attempt' in payload:
+            attempt = validate_probe_attempt(attempt)
+            if code != attempt['exit_code']:
+                raise ValueError('probe attempt exit must match terminal exit_code')
         try:
             datetime.fromisoformat(payload["finished_at"].replace("Z", "+00:00"))
         except (KeyError, AttributeError, TypeError, ValueError) as exc:
@@ -241,6 +267,8 @@ class RunStore:
             raise ValueError("terminal payload exceeds 4096 bytes")
         with db_driver.write_transaction(self.con, "runs.terminal"):
             row = self.get(run_id, owner)
+            if attempt is not None and row['kind'] != 'probe':
+                raise ValueError('probe attempt requires a probe run')
             if row["terminal_json"] is not None:
                 if row["terminal_json"] != canonical:
                     raise ValueError("conflicting terminal outcome")
