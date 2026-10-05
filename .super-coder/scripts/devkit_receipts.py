@@ -107,7 +107,7 @@ class RunReceipt:
                 raise ValueError('checkout changed since job registration; no hook launched')
             return
         self.row = api(environment, 'POST', '/_sc/runs', {
-            'registration_key': uuid.uuid4().hex, 'kind': 'devkit',
+            'registration_key': uuid.uuid4().hex, 'kind': 'devkit', 'foreground': True,
             'label': f'devkit-{hook.name}', 'argv': list(argv),
             'cwd': str(hook.cwd), 'commit': source['commit']})
         import job

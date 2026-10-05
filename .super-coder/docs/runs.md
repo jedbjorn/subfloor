@@ -61,7 +61,7 @@ submit execution outcomes. Cancellation verifies boot id, pid and start ticks.
 
 | Route | Contract |
 | --- | --- |
-| `POST /_sc/runs` | `{registration_key,kind,label,argv,cwd,commit}`; returns registered run with engine-allocated evidence path; retries require identical input |
+| `POST /_sc/runs` | `{registration_key,kind,label,argv,cwd,commit,foreground?}`; returns registered run with engine-allocated evidence path; retries require identical input |
 | `GET /_sc/runs` | Owner's runs, newest first |
 | `GET /_sc/runs/<id>` | Owner's authoritative state and wake receipt |
 | `POST /_sc/runs/<id>/running` | Supervisor/child pid, start ticks, boot id, started timestamp |
@@ -82,7 +82,12 @@ and delivery evidence after their message/conversation parents.
 GUI-seat shell `sc test`, `sc lint` and `sc typecheck` calls return a registered
 `devkit` job id. The hook reuses that run, attaches its receipt before terminal
 completion and produces one owner wake. TUI, Admin and `deps` calls stay
-foreground. A nested hook consumes no outer marker and receives its own run.
+foreground without a completion wake. A nested hook consumes no outer run
+marker and receives its own foreground run; a separate nesting marker prevents
+GUI wrapping and preserves the nested exit status. Foreground registration sets
+`foreground: true` (devkit only). This immutable registration attribute makes
+terminal submission and reconciliation retain `wake_state=none`; terminal
+callers cannot suppress a wrapped job wake.
 
 Logs and adjacent `.receipt.json` files live in the invoking checkout's
 `.sc-state/local/devkit-logs/<hook>/`. Receipts record the declared hook argv,

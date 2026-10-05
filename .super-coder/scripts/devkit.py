@@ -890,6 +890,7 @@ def run_hook(
         # The wrapper marker is one invocation only. A hook invoking another
         # hook must get a fresh run, rather than overwrite this one's receipt.
         child_environment.pop("SC_DEVKIT_RUN_ID", None)
+        child_environment["SC_DEVKIT_NESTED"] = "1"
         if not compact:
             print(f"dev-kit executable: {executable}", file=sys.stderr)
         status = _run_compact(

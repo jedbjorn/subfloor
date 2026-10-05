@@ -34,6 +34,13 @@ DEVKIT_RESEED = (
 )
 
 
+def isolated_environment() -> dict[str, str]:
+    """Fixture hooks must never inherit a launched shell's API or routing."""
+    excluded = {"SC_API_TOKEN", "SC_API_BASE", "SC_SEAT", "SC_DEVKIT_RUN_ID",
+                "SC_DEVKIT_NESTED", "SC_DEVKIT_OUTPUT"}
+    return {key: value for key, value in os.environ.items() if key not in excluded}
+
+
 class DeclarationTest(unittest.TestCase):
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory()
@@ -407,14 +414,14 @@ class RunnerTest(unittest.TestCase):
         return subprocess.run(
             (sys.executable, str(RUNNER), "run", str(self.root), hook, *arguments),
             cwd=self.root,
-            env=env,
+            env=isolated_environment() if env is None else env,
             text=True,
             capture_output=True,
             check=False,
         )
 
     def full_environment(self, **updates: str) -> dict[str, str]:
-        environment = dict(os.environ)
+        environment = isolated_environment()
         environment["SC_DEVKIT_OUTPUT"] = "full"
         environment.update(updates)
         return environment
@@ -500,7 +507,7 @@ class RunnerTest(unittest.TestCase):
         fallback.write_text(f"#!/bin/sh\ntouch '{fallback_marker}'\n")
         fallback.chmod(0o755)
         self.write({"version": 1, "hooks": {"test": {"argv": ["fork-tool"]}}})
-        environment = dict(os.environ)
+        environment = isolated_environment()
         environment["PATH"] = f"{first_bin}:{fallback_bin}:{environment['PATH']}"
         original_resolver = devkit._resolve_executable
 
@@ -706,7 +713,7 @@ class RunnerTest(unittest.TestCase):
                 },
             }
         )
-        environment = dict(os.environ)
+        environment = isolated_environment()
         environment["SC_DEVKIT_OUTPUT"] = "verbose"
 
         invalid = self.run_hook("test", env=environment)
@@ -755,6 +762,7 @@ class RunnerTest(unittest.TestCase):
             subprocess.Popen(
                 command,
                 cwd=self.root,
+                env=isolated_environment(),
                 text=True,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
@@ -819,7 +827,7 @@ class RunnerTest(unittest.TestCase):
         ), mock.patch.object(
             devkit, "invoking_checkout", return_value=self.root.resolve()
         ), mock.patch("devkit_receipts.provenance", return_value={"commit": None, "branch": None}), self.assertRaises(KeyboardInterrupt):
-            devkit.run_hook(self.root, "test", ())
+            devkit.run_hook(self.root, "test", (), environment=isolated_environment())
 
         running = list(
             (self.root / ".sc-state" / "local" / "devkit-logs" / "test").glob(
@@ -883,7 +891,7 @@ class RunnerTest(unittest.TestCase):
         (linked / ".subfloor" / "dev-kit.json").write_text(
             json.dumps({"version": 1, "hooks": {"test": {"argv": ["./.subfloor/root"]}}})
         )
-        environment = dict(os.environ)
+        environment = isolated_environment()
         environment["SC_DEVKIT_OUTPUT"] = "full"
         done = subprocess.run(
             (sys.executable, str(RUNNER), "run", str(linked), "test"),
@@ -897,7 +905,7 @@ class RunnerTest(unittest.TestCase):
         self.assertEqual(done.stdout, f"{linked.resolve()}\n")
         self.assertIn(f"dev-kit checkout: {linked.resolve()}", done.stderr)
 
-        compact_environment = dict(os.environ)
+        compact_environment = isolated_environment()
         compact_environment.pop("SC_DEVKIT_OUTPUT", None)
         main_local = main / ".sc-state" / "local"
         main_local.mkdir(parents=True)
@@ -967,7 +975,7 @@ class SourcePolicyTest(unittest.TestCase):
             )
             outside_python.chmod(0o755)
             (root / ".venv" / "bin" / "python").symlink_to(outside_python)
-            environment = dict(os.environ)
+            environment = isolated_environment()
             environment.update(
                 {"SC_DEVKIT_ROOT": str(root), "SC_DEVKIT_SEAT": "docker"}
             )
@@ -1001,7 +1009,7 @@ class SourcePolicyTest(unittest.TestCase):
                 f"#!/bin/sh\ntouch {shlex.quote(str(fallback_marker))}\n"
             )
             fallback.chmod(0o755)
-            environment = dict(os.environ)
+            environment = isolated_environment()
             environment.update(
                 {
                     "SC_DEVKIT_ROOT": str(root),
@@ -1124,7 +1132,7 @@ class DispatcherHelpTest(unittest.TestCase):
         self.dispatch = ROOT / ".super-coder" / "scripts" / "dispatch.sh"
 
     def run_dispatch(self, *arguments: str, python: str = sys.executable):
-        environment = dict(os.environ)
+        environment = isolated_environment()
         environment.update(
             {
                 "SC_CALLER_ROOT": str(self.root),

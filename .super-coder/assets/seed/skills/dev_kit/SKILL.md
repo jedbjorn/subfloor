@@ -54,10 +54,11 @@ the fork application sidecar; it never points at the engine memory DB.
 `SC_SEAT=gui` wraps shell `test`, `lint`, and `typecheck` invocations in one
 registered job. After the job id is confirmed, end the turn; its completion
 wake tells you to inspect `sc job status <id>` and `sc job tail <id>` before
-continuing. TUI and Admin hooks remain foreground and return the child status;
-`deps` remains foreground in every seat. The wrapper marker is consumed by the
+continuing. TUI and Admin hooks remain foreground without a completion wake
+and return the child status; `deps` remains foreground in every seat. The wrapper marker is consumed by the
 runner and removed from the hook's environment, so nested hooks get their own
-run and cannot overwrite an outer receipt.
+foreground run and return their real status without a completion wake. A
+separate nesting marker prevents GUI wrapping inside a hook.
 
 Every executed hook retains a log and adjacent `.receipt.json` under
 `.sc-state/local/devkit-logs/<hook>/`. The receipt records declared argv with

@@ -8,8 +8,10 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 import urllib.error
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from unittest import mock
 
@@ -54,7 +56,7 @@ class DevkitRunsTest(ApiFixture, unittest.TestCase):
         for args in (('init', '-q'), ('add', '.'), ('-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.com', '-c', 'core.hooksPath=/dev/null', 'commit', '-qm', 'fixture')):
             subprocess.run(['git', '-C', str(self.checkout), *args], check=True, capture_output=True)
         self.env.update(SC_PYTHON=sys.executable, SC_SHELL_FLAVOR='dev', PATH=str(Path(sys.executable).parent) + os.pathsep + os.environ['PATH'])
-        for key in ('SC_DEVKIT_RUN_ID', 'SC_DISPATCH', 'SC_CALLER_ROOT', 'SC_DEVKIT_OUTPUT'):
+        for key in ('SC_DEVKIT_RUN_ID', 'SC_DEVKIT_NESTED', 'SC_DISPATCH', 'SC_CALLER_ROOT', 'SC_DEVKIT_OUTPUT'):
             self.env.pop(key, None)
 
     def hook(self, selection, seat='tui', **extra):
@@ -92,7 +94,8 @@ class DevkitRunsTest(ApiFixture, unittest.TestCase):
                     self.assertIn('failed' if code else 'passed', log.read_text())
                     self.assertEqual(json.loads(log.with_suffix('.receipt.json').read_text()), receipt)
                     self.assertEqual(self.con.execute('SELECT count(*) FROM runs').fetchone()[0], before + 1)
-                    self.assertEqual(self.con.execute('SELECT count(*) FROM wake_message WHERE message_id=?', (row['message_id'],)).fetchone()[0], 1)
+                    self.assertEqual(row['wake_state'], 'pending' if seat == 'gui' else 'none')
+                    self.assertEqual(self.con.execute('SELECT count(*) FROM wake_message WHERE message_id=?', (row['message_id'],)).fetchone()[0], int(seat == 'gui'))
 
     def test_full_output_and_admin_foreground(self):
         full = self.hook('test_fail.py', SC_DEVKIT_OUTPUT='full')
@@ -104,6 +107,65 @@ class DevkitRunsTest(ApiFixture, unittest.TestCase):
         self.assertEqual(admin.returncode, 0, admin.stderr)
         self.assertNotIn('job:', admin.stdout)
         self.assertEqual(len(job._api('GET', '/_sc/runs')['runs']), count)
+
+    def test_deps_is_foreground_without_wakes_in_both_seats(self):
+        for seat in ('tui', 'gui'):
+            with self.subTest(seat=seat):
+                done = subprocess.run(['./sc', 'deps', 'test_pass.py', '-q'], cwd=self.checkout,
+                                      env={**self.env, 'SC_SEAT': seat}, capture_output=True,
+                                      text=True, timeout=20, check=False)
+                self.assertEqual(done.returncode, 0, done.stderr)
+                self.assertNotIn('job:', done.stdout)
+                row = self.finished(self.latest())
+                self.assertEqual(row['receipt_json']['hook'], 'deps')
+                self.assertEqual(row['wake_state'], 'none')
+                self.assertIsNone(row['last_error'])
+        for table in ('wake_message', 'shell_messages'):
+            self.assertEqual(self.con.execute(f'SELECT count(*) FROM {table}').fetchone()[0], 0)
+
+    def test_foreground_policy_is_fixed_at_registration(self):
+        row = self.register(kind='devkit', foreground=True)
+        self.assertEqual(self.register(kind='devkit', foreground=True)['run_id'], row['run_id'])
+        with self.assertRaises(urllib.error.HTTPError) as caught:
+            self.register(kind='devkit', foreground=False)
+        self.assertEqual(caught.exception.code, 400)
+        for kind, foreground in (('job', True), ('probe', True), ('devkit', 'false')):
+            with self.subTest(kind=kind, foreground=foreground), self.assertRaises(urllib.error.HTTPError):
+                self.register(registration_key='invalid', kind=kind, foreground=foreground)
+        done = self.terminal(row)
+        self.assertEqual(done['wake_state'], 'none')
+        self.assertEqual(self.terminal(row), done)
+        wrapped = self.register(registration_key='wrapped', kind='devkit')
+        with self.assertRaises(urllib.error.HTTPError):
+            job._api('POST', f"/_sc/runs/{wrapped['run_id']}/terminal", {
+                'state': 'done', 'exit_code': 0, 'finished_at': job._now(), 'foreground': True})
+        self.assertEqual(self.terminal(wrapped)['wake_state'], 'pending')
+        self.assertEqual(self.con.execute('SELECT count(*) FROM wake_message').fetchone()[0], 1)
+
+    def test_nested_gui_hook_returns_failure_without_detaching_or_extra_wake(self):
+        for name, body in (('outer', './sc lint\n'), ('inner', 'exit 23\n')):
+            script = self.checkout / name
+            script.write_text('#!/bin/sh\n' + body)
+            script.chmod(0o755)
+        (self.checkout / '.subfloor/dev-kit.json').write_text(json.dumps({
+            'version': 1, 'hooks': {'test': {'argv': ['./outer']}, 'lint': {'argv': ['./inner']}}}))
+        done = self.hook('unused', 'gui')
+        self.assertEqual(done.returncode, 0, done.stderr)
+        # Registration is synchronous; the outer is the first run even if the
+        # nested hook has already registered by the time start returns.
+        rows = job._api('GET', '/_sc/runs')['runs']
+        outer = self.finished(min(rows, key=lambda row: row['run_id']))
+        rows = job._api('GET', '/_sc/runs')['runs']
+        self.assertEqual(len(rows), 2)
+        inner = next(row for row in rows if row['run_id'] != outer['run_id'])
+        for row, hook, wake in ((outer, 'test', 'pending'), (inner, 'lint', 'none')):
+            self.assertEqual(row['state'], 'failed')
+            self.assertEqual(row['exit_code'], 23)
+            self.assertEqual(row['receipt_json']['exit_status'], 23)
+            self.assertEqual(row['receipt_json']['hook'], hook)
+            self.assertEqual(row['wake_state'], wake)
+        self.assertNotIn('job:', (self.checkout / outer['receipt_json']['log']).read_text())
+        self.assertEqual(self.con.execute('SELECT count(*) FROM wake_message').fetchone()[0], 1)
 
     def test_registration_refusal_launches_nothing(self):
         marker = self.checkout / 'executed'
@@ -138,20 +200,23 @@ class DevkitRunsTest(ApiFixture, unittest.TestCase):
         self.assertEqual(retained['evidence_pruned'], 1)
 
     def test_reconciler_recovers_receipt_before_terminal_wake(self):
-        row = self.register(kind='devkit')
-        directory = Path(row['evidence_path']).parent
-        directory.mkdir(parents=True)
-        receipt = {'hook': 'test', 'argv': ['pytest'], 'checkout': str(self.checkout),
-                   'commit': None, 'branch': None, 'seat': 'host', 'exit_status': 0,
-                   'duration_s': 1, 'summary': None, 'log': '.sc-state/local/selection.log',
-                   'run_id': row['run_id']}
-        devkit_receipts.atomic_json(directory / 'receipt.json', receipt)
-        job.write_meta(directory, {'run_id': row['run_id'], 'finished_at': job._now(), 'exit_code': 0})
-        runs.RunStore(self.con, self.engine).reconcile()
-        recovered = self.latest()
-        self.assertEqual(recovered['state'], 'done')
-        self.assertEqual(recovered['receipt_json'], receipt)
-        self.assertIsNotNone(recovered['message_id'])
+        for foreground in (False, True):
+            with self.subTest(foreground=foreground):
+                row = self.register(kind='devkit', foreground=foreground, registration_key=str(foreground))
+                directory = Path(row['evidence_path']).parent
+                directory.mkdir(parents=True)
+                receipt = {'hook': 'test', 'argv': ['pytest'], 'checkout': str(self.checkout),
+                           'commit': None, 'branch': None, 'seat': 'host', 'exit_status': 0,
+                           'duration_s': 1, 'summary': None, 'log': '.sc-state/local/selection.log',
+                           'run_id': row['run_id']}
+                devkit_receipts.atomic_json(directory / 'receipt.json', receipt)
+                job.write_meta(directory, {'run_id': row['run_id'], 'finished_at': job._now(), 'exit_code': 0})
+                runs.RunStore(self.con, self.engine).reconcile()
+                recovered = self.latest()
+                self.assertEqual(recovered['state'], 'done')
+                self.assertEqual(recovered['receipt_json'], receipt)
+                self.assertEqual(recovered['wake_state'], 'none' if foreground else 'pending')
+                self.assertEqual(recovered['message_id'] is None, foreground)
 
     def test_no_summary_and_wrapper_marker_is_scrubbed(self):
         script = self.checkout / 'plain.py'
@@ -166,6 +231,40 @@ class DevkitRunsTest(ApiFixture, unittest.TestCase):
         self.assertIsNone(row['receipt_json']['summary'])
         self.assertEqual(row['receipt_json']['argv'][-2:], ['literal; $(touch never)', '-q'])
         self.assertFalse((self.checkout / 'never').exists())
+
+
+class AmbientEnvironmentTest(unittest.TestCase):
+    def test_declaration_suite_ignores_ambient_shell_api_and_routing(self):
+        requests = []
+
+        class Sink(BaseHTTPRequestHandler):
+            def do_POST(self):
+                requests.append(self.path)
+                self.send_error(500, 'test contacted ambient API')
+
+            do_GET = do_POST
+
+            def log_message(self, *_args):
+                pass
+
+        server = ThreadingHTTPServer(('127.0.0.1', 0), Sink)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            for seat in ('tui', 'gui'):
+                with self.subTest(seat=seat):
+                    env = {**os.environ, 'SC_API_TOKEN': 'ambient-test-token',
+                           'SC_API_BASE': f'http://127.0.0.1:{server.server_port}',
+                           'SC_SEAT': seat, 'SC_DEVKIT_RUN_ID': '987', 'SC_DEVKIT_NESTED': '1'}
+                    done = subprocess.run([sys.executable, '-m', 'unittest', 'test_devkit_declaration'],
+                                          cwd=ENGINE.parent / 'tests', env=env,
+                                          capture_output=True, text=True, timeout=90, check=False)
+                    self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+                    self.assertEqual(requests, [])
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(2)
 
 
 class PytestSummaryTest(unittest.TestCase):

@@ -147,6 +147,9 @@ class RunStore:
         kind = data.get("kind", "job")
         if kind not in {"job", "devkit", "probe"}:
             raise ValueError("invalid run kind")
+        foreground = data.get("foreground", False)
+        if type(foreground) is not bool or (foreground and kind != "devkit"):
+            raise ValueError("foreground must be a boolean and requires a devkit run")
         key, cwd, label = (
             data.get("registration_key"),
             data.get("cwd"),
@@ -162,7 +165,7 @@ class RunStore:
             or any(ord(c) < 32 for c in label)
         ):
             raise ValueError("label must be display text (maximum 256 characters)")
-        identity = (kind, label, json.dumps(argv), cwd, data.get("commit"))
+        identity = (kind, label, json.dumps(argv), cwd, data.get("commit"), int(foreground))
         legacy = self.root.parent / "jobs"
         legacy_floor = (
             max(
@@ -184,7 +187,7 @@ class RunStore:
             if existing:
                 if (
                     tuple(
-                        existing[k] for k in ("kind", "label", "argv", "cwd", "commit")
+                        existing[k] for k in ("kind", "label", "argv", "cwd", "commit", "foreground")
                     )
                     != identity
                 ):
@@ -198,7 +201,7 @@ class RunStore:
             rid = max(int(sequence[0]) if sequence else 0, legacy_floor) + 1
             self.con.execute(
                 'INSERT INTO runs(run_id,owner_shell_id,registration_key,kind,label,argv,cwd,"commit",'
-                "evidence_path) VALUES(?,?,?,?,?,?,?,?,?)",
+                "foreground,evidence_path) VALUES(?,?,?,?,?,?,?,?,?,?)",
                 (rid, owner, key, *identity, str(self.root / str(rid) / "log")),
             )
         return self.get(rid, owner)
@@ -292,7 +295,7 @@ class RunStore:
             ).fetchone()
             receipt = None
             inbox_id = None
-            if receiver:
+            if receiver and not row["foreground"]:
                 inbox_id = self.con.execute(
                     "INSERT INTO shell_messages(from_shell_id,to_shell_id,kind,body,dedupe_key) "
                     "VALUES(?,?,'result',?,?)",
@@ -313,12 +316,12 @@ class RunStore:
                     code,
                     payload["finished_at"],
                     canonical,
-                    "pending" if receipt else "blocked",
+                    "none" if row["foreground"] else "pending" if receipt else "blocked",
                     receipt.wake_id if receipt else None,
                     receipt.message_id if receipt else None,
                     inbox_id,
                     None
-                    if receipt
+                    if receipt or row["foreground"]
                     else "owner unavailable; operator recovery required",
                     run_id,
                 ),
