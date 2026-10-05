@@ -51,8 +51,32 @@ current provisioning receipt. `$SC_DEV_PORT` is loopback-bound on the host and
 published from `0.0.0.0` in the container. A configured `$DATABASE_URL` reaches
 the fork application sidecar; it never points at the engine memory DB.
 
-Full hook output is available with `SC_DEVKIT_OUTPUT=full`; retained
-provisioning/readiness evidence lives under `.sc-state/local/dev-kit/`. Planner
+`SC_SEAT=gui` wraps shell `test`, `lint`, and `typecheck` invocations in one
+registered job. After the job id is confirmed, end the turn; its completion
+wake tells you to inspect `sc job status <id>` and `sc job tail <id>` before
+continuing. TUI and Admin hooks remain foreground without a completion wake
+and return the child status; `deps` remains foreground in every seat. The wrapper marker is consumed by the
+runner and removed from the hook's environment, so nested hooks get their own
+foreground run and return their real status without a completion wake. A
+separate nesting marker prevents GUI wrapping inside a hook.
+
+Every executed hook retains a log and adjacent `.receipt.json` under
+`.sc-state/local/devkit-logs/<hook>/`. The receipt records declared argv with
+appended arguments, checkout, host/container seat, starting commit and branch,
+exit status, duration and log path. Test receipts parse pytest's terminal
+summary and failing ids; an absent summary is `null`, never zero failures.
+Authenticated shell runs register before execution; wrapped hooks attach to
+the existing run. Standalone CI and Admin retain local receipts without
+claiming a shell run or completion wake. Receipts are local test evidence;
+GitHub checks still own the merge gate.
+
+Pruning retains the newest twenty completed log/receipt pairs per hook and
+keeps ledger receipts with `evidence_pruned` set. If that acknowledgment is
+unavailable, the files remain for a later pruning attempt. Submission outages
+retain the run's receipt and outcome for reconciliation, without rerunning the
+hook. `SC_DEVKIT_OUTPUT=full` streams stdout and stderr while retaining the same
+log and receipt. Provisioning/readiness evidence lives under
+`.sc-state/local/dev-kit/`. Planner
 uses this skill for pinch-hit development and capability design. It describes
 the available surface and boundaries, not the fork's test assertions,
 deployment ritual, database technique, or VM lifecycle.

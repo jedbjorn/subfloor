@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import selectors
 import shlex
 import shutil
 import subprocess
@@ -368,7 +369,7 @@ def _sandbox(checkout: Path, value: Any) -> Sandbox:
     mounts_value = item.get("mounts", [])
     if type(mounts_value) is not list:
         raise _error(f"{field}.mounts", "must be an array")
-    mounts = []
+    mounts: list[SandboxMount] = []
     names = set()
     for index, mount_value in enumerate(mounts_value):
         mount_field = f"{field}.mounts[{index}]"
@@ -682,7 +683,8 @@ def _bounded_envelope(
     return result
 
 
-def _prune_logs(directory: Path) -> None:
+def _prune_logs(directory: Path, environment: Mapping[str, str]) -> None:
+    from devkit_receipts import prune_pair
     dated = []
     for path in directory.glob("*.log"):
         try:
@@ -691,17 +693,7 @@ def _prune_logs(directory: Path) -> None:
             continue
     finalized = [item[2] for item in sorted(dated, reverse=True)]
     for old in finalized[LOG_RETENTION:]:
-        old.unlink(missing_ok=True)
-
-
-def _run_full(command: Sequence[str], hook: Hook, child_environment: Mapping[str, str]) -> int:
-    completed = subprocess.run(
-        command,
-        cwd=hook.cwd,
-        env=child_environment,
-        check=False,
-    )
-    return _shell_status(completed.returncode)
+        prune_pair(old, environment)
 
 
 def _terminate_and_reap(process: subprocess.Popen[bytes]) -> None:
@@ -722,7 +714,12 @@ def _run_compact(
     arguments: Sequence[str],
     child_environment: Mapping[str, str],
     seat: str,
+    *,
+    full: bool = False,
+    run=None,
+    source=None,
 ) -> int:
+    from devkit_receipts import atomic_json, pytest_summary
     # A linked worktree can run its hook without access to the main checkout's state.
     directory = devkit_log_root(checkout) / hook.name
     directory.mkdir(parents=True, exist_ok=True)
@@ -736,13 +733,33 @@ def _run_compact(
                 command,
                 cwd=hook.cwd,
                 env=child_environment,
-                stdout=log,
-                stderr=subprocess.STDOUT,
+                stdout=subprocess.PIPE if full else log,
+                stderr=subprocess.PIPE if full else subprocess.STDOUT,
+                start_new_session=bool(run and run.meta),
             )
         except OSError:
             running.unlink(missing_ok=True)
             raise
         try:
+            if run:
+                run.started(process, running)
+            if full:
+                # Preserve stdout/stderr routing while retaining a complete log.
+                assert process.stdout is not None and process.stderr is not None
+                with selectors.DefaultSelector() as selector:
+                    selector.register(process.stdout, selectors.EVENT_READ, (process.stdout, sys.stdout))
+                    selector.register(process.stderr, selectors.EVENT_READ, (process.stderr, sys.stderr))
+                    while selector.get_map():
+                        for key, _ in selector.select():
+                            pipe, target = key.data
+                            chunk = os.read(key.fd, 65536)
+                            if not chunk:
+                                selector.unregister(key.fileobj)
+                                pipe.close()
+                                continue
+                            log.write(chunk)
+                            target.buffer.write(chunk)
+                            target.buffer.flush()
             returncode = process.wait()
         except BaseException:
             _terminate_and_reap(process)
@@ -761,6 +778,16 @@ def _run_compact(
     failed = status != 0
     scan = _scan_log(finalized, failed=failed)
     relative = finalized.relative_to(checkout)
+    receipt = {
+        "hook": hook.name, "argv": [*hook.argv, *arguments],
+        "checkout": str(checkout), "seat": seat, **(source or {}),
+        "exit_status": status, "duration_s": round(duration, 3),
+        "summary": pytest_summary(finalized) if hook.name == "test" else None,
+        "log": str(relative), "run_id": run.row["run_id"] if run and run.row else None,
+    }
+    atomic_json(finalized.with_suffix(".receipt.json"), receipt)
+    if run:
+        run.finish(receipt, finalized)
     recovery_args = shlex.join(("./sc", hook.name, *arguments))
     prefix = [
         f"dev-kit checkout: {checkout}",
@@ -779,10 +806,13 @@ def _run_compact(
         ),
     ]
     recovery = f"dev-kit full output: SC_DEVKIT_OUTPUT=full {recovery_args}"
-    sys.stderr.write(
-        _bounded_envelope(prefix, _excerpt_lines(scan, failed=failed), recovery, failed=failed)
-    )
-    _prune_logs(directory)
+    if full:
+        print(f"dev-kit log: {relative}", file=sys.stderr)
+    else:
+        sys.stderr.write(
+            _bounded_envelope(prefix, _excerpt_lines(scan, failed=failed), recovery, failed=failed)
+        )
+    _prune_logs(directory, run.environment if run else child_environment)
     return status
 
 
@@ -853,14 +883,21 @@ def run_hook(
     command = (str(executable), *hook.argv[1:], *arguments)
     compact = hook_name in COMPACT_HOOKS and output_mode == "compact"
     try:
-        if compact:
-            status = _run_compact(
-                checkout, hook, command, arguments, child_environment, seat
-            )
-        else:
+        from devkit_receipts import RunReceipt, provenance
+
+        source = provenance(checkout)
+        run = RunReceipt(checkout, hook, requested, child_environment.copy(), source)
+        # The wrapper marker is one invocation only. A hook invoking another
+        # hook must get a fresh run, rather than overwrite this one's receipt.
+        child_environment.pop("SC_DEVKIT_RUN_ID", None)
+        child_environment["SC_DEVKIT_NESTED"] = "1"
+        if not compact:
             print(f"dev-kit executable: {executable}", file=sys.stderr)
-            status = _run_full(command, hook, child_environment)
-    except OSError as exc:
+        status = _run_compact(
+            checkout, hook, command, arguments, child_environment, seat,
+            full=not compact, run=run, source=source,
+        )
+    except (OSError, ValueError) as exc:
         print(
             f"dev-kit hook state: failed — start failed for {executable}: {exc}",
             file=sys.stderr,

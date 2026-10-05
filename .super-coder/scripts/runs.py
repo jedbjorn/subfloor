@@ -147,6 +147,9 @@ class RunStore:
         kind = data.get("kind", "job")
         if kind not in {"job", "devkit", "probe"}:
             raise ValueError("invalid run kind")
+        foreground = data.get("foreground", False)
+        if type(foreground) is not bool or (foreground and kind != "devkit"):
+            raise ValueError("foreground must be a boolean and requires a devkit run")
         key, cwd, label = (
             data.get("registration_key"),
             data.get("cwd"),
@@ -162,7 +165,7 @@ class RunStore:
             or any(ord(c) < 32 for c in label)
         ):
             raise ValueError("label must be display text (maximum 256 characters)")
-        identity = (kind, label, json.dumps(argv), cwd, data.get("commit"))
+        identity = (kind, label, json.dumps(argv), cwd, data.get("commit"), int(foreground))
         legacy = self.root.parent / "jobs"
         legacy_floor = (
             max(
@@ -184,7 +187,7 @@ class RunStore:
             if existing:
                 if (
                     tuple(
-                        existing[k] for k in ("kind", "label", "argv", "cwd", "commit")
+                        existing[k] for k in ("kind", "label", "argv", "cwd", "commit", "foreground")
                     )
                     != identity
                 ):
@@ -198,7 +201,7 @@ class RunStore:
             rid = max(int(sequence[0]) if sequence else 0, legacy_floor) + 1
             self.con.execute(
                 'INSERT INTO runs(run_id,owner_shell_id,registration_key,kind,label,argv,cwd,"commit",'
-                "evidence_path) VALUES(?,?,?,?,?,?,?,?,?)",
+                "foreground,evidence_path) VALUES(?,?,?,?,?,?,?,?,?,?)",
                 (rid, owner, key, *identity, str(self.root / str(rid) / "log")),
             )
         return self.get(rid, owner)
@@ -265,10 +268,22 @@ class RunStore:
         canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
         if len(canonical) > 4096:
             raise ValueError("terminal payload exceeds 4096 bytes")
+        # A dev-kit runner persists the receipt before its command returns.
+        # Recover it before publishing completion, including API-outage recovery.
+        row = self.get(run_id, owner)
+        receipt_path = Path(row["evidence_path"]).with_name("receipt.json")
+        if row["kind"] == "devkit" and not row["receipt_json"] and receipt_path.is_file():
+            if receipt_path.stat().st_size > 262144:
+                raise ValueError("receipt exceeds 256 KiB")
+            self.receipt(run_id, owner, json.loads(receipt_path.read_text()))
         with db_driver.write_transaction(self.con, "runs.terminal"):
             row = self.get(run_id, owner)
             if attempt is not None and row['kind'] != 'probe':
                 raise ValueError('probe attempt requires a probe run')
+            if row["receipt_json"] and payload["state"] in {"done", "failed"} and (
+                row["receipt_json"]["exit_status"] != code
+            ):
+                raise ValueError("terminal outcome conflicts with receipt exit status")
             if row["terminal_json"] is not None:
                 if row["terminal_json"] != canonical:
                     raise ValueError("conflicting terminal outcome")
@@ -280,7 +295,7 @@ class RunStore:
             ).fetchone()
             receipt = None
             inbox_id = None
-            if receiver:
+            if receiver and not row["foreground"]:
                 inbox_id = self.con.execute(
                     "INSERT INTO shell_messages(from_shell_id,to_shell_id,kind,body,dedupe_key) "
                     "VALUES(?,?,'result',?,?)",
@@ -301,16 +316,68 @@ class RunStore:
                     code,
                     payload["finished_at"],
                     canonical,
-                    "pending" if receipt else "blocked",
+                    "none" if row["foreground"] else "pending" if receipt else "blocked",
                     receipt.wake_id if receipt else None,
                     receipt.message_id if receipt else None,
                     inbox_id,
                     None
-                    if receipt
+                    if receipt or row["foreground"]
                     else "owner unavailable; operator recovery required",
                     run_id,
                 ),
             )
+        return self.get(run_id, owner)
+
+    def receipt(self, run_id: int, owner: int, data: dict) -> dict:
+        row = self.get(run_id, owner)
+        if row["kind"] != "devkit":
+            raise ValueError("receipts require a devkit run")
+        if not isinstance(data, dict) or len(json.dumps(data).encode()) > 262144:
+            raise ValueError("receipt must be an object of at most 256 KiB")
+        if data.get("hook") not in {"test", "lint", "typecheck", "deps"}:
+            raise ValueError("invalid receipt hook")
+        if type(data.get("run_id")) is not int or data["run_id"] != run_id or data.get("commit") != row["commit"]:
+            raise ValueError("receipt run/commit conflict")
+        if type(data.get("exit_status")) is not int:
+            raise ValueError("receipt requires an exit_status")
+        if type(data.get("duration_s")) not in (int, float) or not 0 <= data["duration_s"] < 1e12:
+            raise ValueError("invalid receipt duration")
+        argv = data.get("argv")
+        if not isinstance(argv, list) or not argv or not all(isinstance(v, str) for v in argv):
+            raise ValueError("invalid receipt argv")
+        checkout, log = data.get("checkout"), data.get("log")
+        if not isinstance(checkout, str) or not Path(checkout).is_absolute():
+            raise ValueError("receipt checkout must be absolute")
+        if not isinstance(log, str) or Path(log).is_absolute() or ".." in Path(log).parts:
+            raise ValueError("receipt log must be checkout-relative")
+        summary = data.get("summary")
+        if summary is not None:
+            if not isinstance(summary, dict) or summary.get("framework") != "pytest":
+                raise ValueError("invalid receipt summary")
+            if any(type(summary.get(k)) is not int or summary[k] < 0
+                   for k in ("passed", "failed", "errors", "skipped")):
+                raise ValueError("invalid pytest counts")
+            if not isinstance(summary.get("failing"), list) or not all(
+                isinstance(v, str) for v in summary["failing"]
+            ):
+                raise ValueError("invalid pytest failing ids")
+        canonical = json.dumps(data, sort_keys=True, separators=(",", ":"))
+        with db_driver.write_transaction(self.con, "runs.receipt"):
+            row = self.get(run_id, owner)
+            if row["state"] in {"done", "failed"} and row["exit_code"] != data["exit_status"]:
+                raise ValueError("receipt exit status conflicts with terminal outcome")
+            existing = row["receipt_json"]
+            if existing is not None and existing != data:
+                raise ValueError("conflicting receipt")
+            self.con.execute("UPDATE runs SET receipt_json=? WHERE run_id=?", (canonical, run_id))
+        return self.get(run_id, owner)
+
+    def prune_evidence(self, run_id: int, owner: int) -> dict:
+        row = self.get(run_id, owner)
+        if row["state"] not in TERMINAL or row["receipt_json"] is None:
+            raise ValueError("only completed receipt evidence may be pruned")
+        with db_driver.write_transaction(self.con, "runs.prune_evidence"):
+            self.con.execute("UPDATE runs SET evidence_pruned=1 WHERE run_id=?", (run_id,))
         return self.get(run_id, owner)
 
     def kill(self, run_id: int, owner: int | None) -> dict:

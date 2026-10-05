@@ -686,7 +686,7 @@ class DispatcherClassificationTest(unittest.TestCase):
         for verb in self.PROJECT:
             with self.subTest(verb=verb):
                 self.assertIn("sc_project_env", self.arm(verb))
-        self.assertIn('  sc_project_env\n  "$PY" "$S/devkit.py" run "$CALLER_ROOT"',
+        self.assertIn('  "$PY" "$S/devkit.py" run "$CALLER_ROOT"',
                       self.DISPATCH)
 
     def test_live_arms_never_do(self):

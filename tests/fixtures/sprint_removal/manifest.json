@@ -173,7 +173,8 @@
     ".super-coder/scripts/run_wakes.py",
     ".super-coder/scripts/runs.py",
     "tests/test_runs.py",
-    ".super-coder/migrations/0275_runs_ledger.sql"
+    ".super-coder/migrations/0275_runs_ledger.sql",
+    ".super-coder/migrations/0276_devkit_run_receipts.sql"
   ],
   "baseline_migration_ledger": {
     "count": 142,
