@@ -1,33 +1,10 @@
 #!/usr/bin/env python3
-"""sc job — session-surviving local job runner (specs_sc/job-runner.md).
+"""Durable local commands: register first, detach, retain outcome and owner wake.
 
-A harness background task is session-scoped: in a headless (-p) boot it dies
-with the session, silently. `sc job` runs a long local command — a suite, a
-bench, a build — as a detached, supervised process that survives the session
-that started it, and posts ONE completion message (`result` row) to the
-starting shell's own inbox, so the existing eventing loop (inbox watcher,
-headless boots on message rows) covers local long jobs the way it already
-covers PR transitions.
-
-    ./sc job start [--label <slug>] [--timeout <sec>] -- <cmd ...>
-    ./sc job list [--all]
-    ./sc job status <id>
-    ./sc job tail <id> [-n N]
-    ./sc job wait <id> [--for <sec>]     bounded foreground wait (wait-slice)
-    ./sc job kill <id>
-
-State: <engine>/run/jobs/<id>/ — meta.json + log. No DB surface except the
-completion message, sent through the API with the token the environment
-carried at `start` (the `sc mem` doctrine: shell-side writes go through the
-API, stamped with a dedupe_key so a retry never double-sends). If the API is
-unreachable at completion the supervisor retries briefly and gives up —
-meta.json still holds the result; the row is the fast path, never the only
-path.
-
-The supervisor (`job.py _supervise <dir>`, spawned with start_new_session)
-is the job's parent: it survives the harness session, streams the child's
-output to the log, enforces --timeout on the whole process group, records
-the exit, and sends the wake-up.
+Computation survives harness exit. Service teardown, reboot or container loss
+may interrupt it: the ledger and local evidence recover a truthful terminal or
+lost result, never rerun the command. No general shell token is written to disk.
+Legacy run/jobs status and logs remain readable without retrospective wakes.
 """
 from __future__ import annotations
 
@@ -40,13 +17,16 @@ import sys
 import time
 import urllib.error
 import urllib.request
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
 import project_root
+from runs import boot_id, terminal_payload
 
 ENGINE = Path(__file__).resolve().parents[1]
 JOBS = ENGINE / "run" / "jobs"
+RUNS = ENGINE / "run" / "runs"
 
 # API proxy — run.py injects these at boot; the supervisor inherits them.
 SC_API_TOKEN = os.environ.get("SC_API_TOKEN", "")
@@ -58,7 +38,7 @@ KILL_GRACE = 10             # SIGTERM → SIGKILL grace (seconds)
 POLL = 2                    # supervisor/wait poll interval (seconds)
 
 
-def die(msg: str) -> "NoReturn":  # noqa: F821
+def die(msg: str) -> NoReturn:  # noqa: F821
     sys.exit(f"job: {msg}")
 
 
@@ -95,19 +75,24 @@ def read_meta(jobdir: Path) -> dict:
 
 
 def write_meta(jobdir: Path, meta: dict) -> None:
-    tmp = _meta_path(jobdir).with_suffix(".tmp")
-    tmp.write_text(json.dumps(meta, indent=2) + "\n")
+    tmp = _meta_path(jobdir).with_suffix(f".{os.getpid()}.tmp")
+    with tmp.open('w') as handle:
+        handle.write(json.dumps(meta, indent=2) + "\n")
+        handle.flush()
+        os.fsync(handle.fileno())
     os.replace(tmp, _meta_path(jobdir))
 
 
 def job_dir(job_id: str) -> Path:
-    d = JOBS / job_id
+    if Path(job_id).name != job_id or job_id in {".", ".."}:
+        die("invalid job id")
+    d = RUNS / job_id if job_id.isdecimal() and (RUNS / job_id).is_dir() else JOBS / job_id
     if not d.is_dir():
         die(f"no such job '{job_id}' (see `sc job list --all`)")
     return d
 
 
-def next_job_id(label: "str | None") -> str:
+def next_job_id(label: str | None) -> str:
     """Sequential id, readable: '7' or '7-pytest'. The number never repeats
     (max over existing dirs + 1), the label is display sugar."""
     JOBS.mkdir(parents=True, exist_ok=True)
@@ -120,7 +105,7 @@ def next_job_id(label: "str | None") -> str:
     return f"{n}-{label}" if label else str(n)
 
 
-def _start_ticks(pid: int) -> "int | None":
+def _start_ticks(pid: int) -> int | None:
     """Field 22 of /proc/<pid>/stat — the process's start time in clock ticks
     since boot. Together with the pid it names one process incarnation: a
     recycled pid carries a different value. None when the pid is gone or the
@@ -136,12 +121,14 @@ def _has_procfs() -> bool:
     return Path("/proc/self/stat").exists()
 
 
-def kill_refusal(meta: dict, pid: int) -> "str | None":
+def kill_refusal(meta: dict, pid: int) -> str | None:
     """Why `kill` must not signal `pid`, or None when it is still the job's own
     process. A recorded pid is only an identity while its incarnation matches;
     once the OS recycles it, killpg would hit a stranger's process group (#954
     — a foreign install's watchers died this way). Mismatch, gone, or
     unverifiable all count as 'not ours to kill'."""
+    if meta.get("boot_id") and meta["boot_id"] != boot_id():
+        return "host boot identity changed; refusing to signal"
     recorded = meta.get("start_ticks")
     live = _start_ticks(pid)
     if live is None:
@@ -189,7 +176,7 @@ def state_of(meta: dict) -> str:
 
 # ── completion message (supervisor-side) ─────────────────────────────────────
 
-def _api(method: str, path: str, payload: "dict | None" = None) -> dict:
+def _api(method: str, path: str, payload: dict | None = None) -> dict:
     url = SC_API_BASE.rstrip("/") + path
     data = json.dumps(payload).encode() if payload is not None else None
     headers: dict = {"Authorization": f"Bearer {SC_API_TOKEN}"}
@@ -210,24 +197,33 @@ def completion_body(meta: dict) -> str:
             f" {meta.get('job_id')}` · log: {meta.get('log')}")
 
 
-def send_completion(meta: dict, retries: int = 5, delay: float = 3.0) -> bool:
-    """One result row to the starting shell's OWN inbox — the wake-up. The
-    dedupe_key makes retries safe (#333 doctrine); API down after `retries`
-    attempts → give up quietly (meta.json still has the result)."""
-    if not (SC_API_TOKEN and SC_API_BASE):
+def send_completion(meta: dict, retries: int | None = None, delay: float = 3.0) -> bool:
+    """Submit persisted evidence; retry transport outages at a five-minute cap.
+
+    A stopped supervisor needs no token recovery: the runtime reconciler reads
+    the registered evidence path and commits the same terminal payload.
+    """
+    if not (SC_API_TOKEN and SC_API_BASE and meta.get('run_id')):
         return False
-    for attempt in range(retries):
+    attempt = 0
+    jobdir = Path(meta['log']).parent
+    while retries is None or attempt < retries:
+        attempt += 1
+        meta.update(submission_attempt=attempt, submission_attempted_at=_now())
         try:
-            me = _api("GET", "/_sc/mem/whoami")
-            _api("POST", "/_sc/mem/messages", {
-                "to_shell_id": me["shell_id"],
-                "body": completion_body(meta),
-                "kind": "result",
-                "dedupe_key": f"job-{meta.get('job_id')}-completion",
-            })
+            receipt = _api('POST', f"/_sc/runs/{meta['run_id']}/terminal", terminal_payload(meta))
+            meta.update(wake_id=receipt['wake_id'], message_id=receipt['message_id'],
+                        wake_state=receipt['wake_state'], submission_error=None)
+            write_meta(jobdir, meta)
             return True
-        except (urllib.error.URLError, OSError, KeyError, json.JSONDecodeError):
-            time.sleep(delay * (attempt + 1))
+        except (urllib.error.URLError, OSError, KeyError, json.JSONDecodeError) as exc:
+            # Do not persist response bodies, headers or credentials.
+            meta['submission_error'] = f'{type(exc).__name__}: submission unavailable'
+            write_meta(jobdir, meta)
+            if isinstance(exc, urllib.error.HTTPError) and 400 <= exc.code < 500:
+                return False  # reconciler owns recovery after token expiry/conflict
+            if retries is None or attempt < retries:
+                time.sleep(min(300, delay * 2 ** min(attempt - 1, 10)))
     return False
 
 
@@ -239,7 +235,20 @@ def supervise(jobdir: Path, notify=send_completion) -> int:
     wake-up. `notify` is injectable for tests."""
     meta = read_meta(jobdir)
     meta["supervisor_pid"] = os.getpid()
+    meta["supervisor_start_ticks"] = _start_ticks(os.getpid())
+    meta["boot_id"] = boot_id()
     write_meta(jobdir, meta)
+    if meta.get('run_id'):
+        try:
+            _api('POST', f"/_sc/runs/{meta['run_id']}/running", {
+                k: meta.get(k) for k in ('supervisor_pid', 'supervisor_start_ticks',
+                                        'boot_id', 'started_at')})
+        except (urllib.error.URLError, OSError):
+            meta.update(finished_at=_now(), exit_code=127,
+                        spawn_error='registration check-in unavailable; command not launched')
+            write_meta(jobdir, meta)
+            notify(meta)
+            return 127
 
     log = open(jobdir / "log", "ab", buffering=0)
     try:
@@ -251,12 +260,20 @@ def supervise(jobdir: Path, notify=send_completion) -> int:
     except OSError as e:
         meta.update(finished_at=_now(), exit_code=127, spawn_error=str(e))
         write_meta(jobdir, meta)
+        log.close()
         notify(meta)
         return 127
 
     meta["pid"] = child.pid
     meta["start_ticks"] = _start_ticks(child.pid)
     write_meta(jobdir, meta)
+    if meta.get('run_id'):
+        try:
+            _api('POST', f"/_sc/runs/{meta['run_id']}/running", {
+                k: meta.get(k) for k in ('pid', 'start_ticks', 'supervisor_pid',
+                                        'supervisor_start_ticks', 'boot_id', 'started_at')})
+        except (urllib.error.URLError, OSError):
+            pass  # local identity is durable; the runtime pulse recovers it
 
     timeout = meta.get("timeout")
     deadline = time.monotonic() + timeout if timeout else None
@@ -266,6 +283,10 @@ def supervise(jobdir: Path, notify=send_completion) -> int:
             rc = child.wait(timeout=POLL)
             break
         except subprocess.TimeoutExpired:
+            if (jobdir / 'kill_requested').exists():
+                _kill_group(child.pid)
+                rc = child.wait()
+                break
             if deadline and time.monotonic() >= deadline:
                 timed_out = True
                 _kill_group(child.pid)
@@ -276,6 +297,8 @@ def supervise(jobdir: Path, notify=send_completion) -> int:
     # disk while we held a stale copy — never clobber it.
     meta = read_meta(jobdir) or meta
     meta.update(finished_at=_now(), exit_code=rc, timed_out=timed_out)
+    if (jobdir / 'kill_requested').exists():
+        meta['killed'] = True
     write_meta(jobdir, meta)
     log.close()
     notify(meta)
@@ -312,20 +335,27 @@ def cmd_start(args) -> int:
     cmd = args.cmd[1:] if args.cmd and args.cmd[0] == "--" else list(args.cmd)
     if not cmd:
         die("nothing to run after --")
-    job_id = next_job_id(args.label)
-    jobdir = JOBS / job_id
-    jobdir.mkdir(parents=True)
-    (jobdir / "log").touch()
+    if args.timeout is not None and args.timeout <= 0:
+        die('--timeout must be positive seconds')
+    if not (SC_API_TOKEN and SC_API_BASE):
+        die('authenticated shell API is required; no command launched')
+    cwd = str(project_root.invocation_cwd())
+    commit = subprocess.run(['git', 'rev-parse', 'HEAD'], cwd=cwd,
+                            capture_output=True, text=True, check=False)
+    try:
+        registered = _api('POST', '/_sc/runs', {
+            'registration_key': uuid.uuid4().hex, 'kind': 'job', 'label': args.label,
+            'argv': cmd, 'cwd': cwd, 'commit': commit.stdout.strip() or None})
+    except (urllib.error.URLError, OSError, ValueError) as exc:
+        die(f'registration failed ({type(exc).__name__}); no command launched')
+    job_id = str(registered['run_id'])
+    jobdir = Path(registered['evidence_path']).parent
+    jobdir.mkdir(parents=True, exist_ok=False)
+    (jobdir / 'log').touch()
     write_meta(jobdir, {
-        "job_id": job_id,
-        "label": args.label,
-        "cmd": cmd,
-        # Where the operator typed `sc job start`, not the checkout root the
-        # dispatcher runs from: `-- ./tool` names a path from there (U3).
-        "cwd": str(project_root.invocation_cwd()),
-        "timeout": args.timeout,
-        "started_at": _now(),
-        "log": str(jobdir / "log"),
+        'run_id': registered['run_id'], 'job_id': job_id,
+        'label': args.label, 'cmd': cmd, 'cwd': cwd,
+        'timeout': args.timeout, 'started_at': _now(), 'log': str(jobdir / 'log'),
     })
     # Detach: the supervisor gets its own session so it survives this process,
     # the harness turn, and the harness session itself.
@@ -338,47 +368,86 @@ def cmd_start(args) -> int:
     # pre-supervisor meta and mis-calls the job 'lost'.
     end = time.monotonic() + 5
     while time.monotonic() < end:
-        if read_meta(jobdir).get("supervisor_pid"):
+        started = read_meta(jobdir)
+        if started.get('pid') or started.get('finished_at'):
             break
         time.sleep(0.05)
     else:
-        print(f"job: WARNING — supervisor (pid {sup.pid}) has not checked in "
-              f"after 5s; `sc job status {job_id}` before trusting it")
+        die(f'supervisor startup unconfirmed; registered run {job_id} will reconcile; '
+            f'inspect `sc job status {job_id}` before starting dependent work')
     print(f"job: {job_id} started (supervisor pid {sup.pid}) — "
-          f"`sc job wait {job_id}` or end the turn; completion lands in "
-          f"your inbox as a result row")
+          f"end your turn; completion wakes you "
+          f"(TUI delivery waits for the CLI slot). `sc job status {job_id}`")
     return 0
+
+
+def read_api(path: str) -> dict | None:
+    """Read remotely when reachable; authorization failures never fall back."""
+    if not (SC_API_TOKEN and SC_API_BASE):
+        return None
+    try:
+        return _api('GET', path)
+    except urllib.error.HTTPError as exc:
+        if exc.code == 404:
+            return None
+        die(f'run access refused (HTTP {exc.code})')
+    except (urllib.error.URLError, OSError):
+        print('job: API unreachable; using local evidence (unauthoritative)', file=sys.stderr)
+        return None
+
+
+def local_notice():
+    print('job: local evidence (unauthoritative; wake delivery unconfirmed)', file=sys.stderr)
 
 
 def cmd_list(args) -> int:
-    if not JOBS.is_dir():
-        print("job: none")
-        return 0
-    rows = []
-    for d in sorted(JOBS.iterdir(), key=lambda p: p.name):
-        meta = read_meta(d)
-        if not meta:
+    emitted = False
+    result = read_api('/_sc/runs')
+    if result is not None:
+        for row in result['runs']:
+            if args.all or row['state'] in {'registered', 'running'} or row['wake_state'] == 'blocked':
+                emitted = True
+                print(f"  {row['run_id']:<20} {row['state']:<10} wake={row['wake_state']} {row['label']}")
+    roots = [JOBS] if result is not None else [RUNS, JOBS]
+    for root in roots:
+        if not root.is_dir():
             continue
-        st = state_of(meta)
-        if not args.all and st not in ("running", "lost"):
-            continue
-        rows.append((d.name, st, meta))
-    if not rows:
-        print("job: none live" + ("" if args.all else " (--all includes finished)"))
-        return 0
-    for name, st, meta in rows:
-        dur = (_dur(meta.get("started_at", ""), meta.get("finished_at") or _now()))
-        print(f"  {name:<20} {st:<8} {dur:>8}  {' '.join(meta.get('cmd', []))[:60]}")
+        for directory in sorted(root.iterdir(), key=lambda p: p.name):
+            meta = read_meta(directory)
+            if not meta:
+                continue
+            st = state_of(meta)
+            if not args.all and st not in ('running', 'lost') and not meta.get('submission_error'):
+                continue
+            emitted = True
+            dur = _dur(meta.get('started_at', ''), meta.get('finished_at') or _now())
+            print(f"  {directory.name:<20} {st:<8} {dur:>8}  local evidence (unauthoritative) "
+                  f"{' '.join(meta.get('cmd', []))[:60]}")
+            for key in ('submission_error', 'submission_attempted_at', 'submission_attempt'):
+                if meta.get(key) is not None:
+                    print(f"    {key}: {meta[key]}")
+    if not emitted:
+        print('job: none live' + ('' if args.all else ' (--all includes finished)'))
     return 0
 
 
+def ledger_run(job_id: str) -> dict | None:
+    return read_api(f'/_sc/runs/{job_id}') if job_id.isdecimal() else None
+
+
 def cmd_status(args) -> int:
+    row = ledger_run(args.id)
+    if row is not None:
+        print(json.dumps(row, indent=2))
+        return 1 if row['state'] == 'lost' else 0
     meta = read_meta(job_dir(args.id))
+    local_notice()
     st = state_of(meta)
     print(f"job {meta.get('job_id')}: {st}")
     for k in ("label", "cmd", "cwd", "pid", "supervisor_pid", "started_at",
               "finished_at", "exit_code", "timed_out", "killed", "timeout",
-              "spawn_error", "log"):
+              "spawn_error", "log", "submission_error", "submission_attempted_at",
+              "submission_attempt"):
         v = meta.get(k)
         if v is not None and v is not False:   # `v not in (None, False)` hides exit_code=0
             print(f"  {k}: {v if not isinstance(v, list) else ' '.join(v)}")
@@ -389,9 +458,14 @@ def cmd_status(args) -> int:
 
 
 def cmd_tail(args) -> int:
+    result = read_api(f'/_sc/runs/{args.id}/tail') if args.id.isdecimal() else None
+    if result is not None:
+        print('\n'.join(result['text'].splitlines()[-args.n:]))
+        return 0
     log = job_dir(args.id) / "log"
     if not log.exists():
         die(f"no log for job '{args.id}'")
+    local_notice()
     lines = log.read_bytes().decode(errors="replace").splitlines()
     for line in lines[-args.n:]:
         print(line)
@@ -402,9 +476,23 @@ def cmd_wait(args) -> int:
     """Bounded foreground wait — THE wait-slice primitive. Exit 0 = finished
     (status line printed) · 2 = still running after the slice (drain your
     inbox, then slice again) · 1 = no such job / lost."""
-    jobdir = job_dir(args.id)
     slice_s = min(args.for_seconds or WAIT_DEFAULT, WAIT_CAP)
     deadline = time.monotonic() + slice_s
+    row = ledger_run(args.id)
+    if row is not None:
+        while True:
+            row = ledger_run(args.id)
+            if row is None:
+                break  # API went away while waiting; inspect persisted evidence.
+            if row['state'] not in {'registered', 'running'}:
+                print(json.dumps(row, indent=2))
+                return 1 if row['state'] == 'lost' else 0
+            if time.monotonic() >= deadline:
+                print(f"job {args.id}: still running; end the turn and await its owner wake")
+                return 2
+            time.sleep(POLL)
+    jobdir = job_dir(args.id)
+    local_notice()
     while True:
         meta = read_meta(jobdir)
         if is_finished(meta):
@@ -423,7 +511,17 @@ def cmd_wait(args) -> int:
 
 
 def cmd_kill(args) -> int:
+    if ledger_run(args.id) is not None:
+        try:
+            print(json.dumps(_api('POST', f'/_sc/runs/{args.id}/kill', {})))
+        except urllib.error.HTTPError as exc:
+            die(f'kill refused (HTTP {exc.code})')
+        except (urllib.error.URLError, OSError):
+            die('API unreachable; cancellation unconfirmed; inspect status before retrying')
+        return 0
     jobdir = job_dir(args.id)
+    if jobdir.parent == RUNS:
+        die('ledger cancellation requires the API; inspect local status until it recovers')
     meta = read_meta(jobdir)
     if is_finished(meta):
         die(f"job '{args.id}' already finished ({state_of(meta)})")
@@ -446,11 +544,14 @@ def cmd_kill(args) -> int:
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="sc job",
-        description="session-surviving local job runner (specs_sc/job-runner.md)")
+        description="Registered jobs survive harness exit and durably wake their owner.",
+        epilog="Service teardown/reboot may interrupt computation; recovery records lost "
+               "when no exit evidence survives. Commands are never automatically rerun. "
+               "TUI wakes wait out the CLI lock. Legacy job status/logs remain readable.")
     sub = p.add_subparsers(dest="cmd_name", required=True)
 
-    sp = sub.add_parser("start", help="run a command detached; completion lands in your inbox")
-    sp.add_argument("--label", help="short slug for the id + the completion row")
+    sp = sub.add_parser("start", help="register and detach; completion durably wakes the owner")
+    sp.add_argument("--label", help="display label (never used in a filesystem path)")
     sp.add_argument("--timeout", type=int,
                     help="kill the whole process group after N seconds")
     sp.add_argument("cmd", nargs=argparse.REMAINDER,
@@ -461,7 +562,7 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--all", action="store_true")
     sp.set_defaults(fn=cmd_list)
 
-    sp = sub.add_parser("status", help="one job's state, exit, paths")
+    sp = sub.add_parser("status", help="state, exit, paths; local evidence when API unreachable")
     sp.add_argument("id")
     sp.set_defaults(fn=cmd_status)
 
@@ -486,7 +587,7 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
-def main(argv: "list[str]") -> int:
+def main(argv: list[str]) -> int:
     # Early-closed stdout is handled at the entrypoint (cli_entry.run_cli, #384).
     args = build_parser().parse_args(argv)
     return args.fn(args)

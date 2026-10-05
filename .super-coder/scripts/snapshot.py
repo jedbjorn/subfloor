@@ -166,6 +166,9 @@ PER_INSTANCE_TABLES = [
     # exact approvals, active routes, retries, reports, and history must all
     # survive update/rebuild together.
     *SPRINT_INSTANCE_TABLES,
+    "runs",
+    "engine_wake_receipts",
+    "engine_wake_failures",
     # NOTE: dr_section is authored navigation but lives in the MAP DB now
     # (.sc-state/map.db), not shell_db.db — it is serialized separately to
     # .sc-state/local/map/content.sql by snapshot_map() below, not here.
@@ -313,7 +316,8 @@ def _table_columns(con, table: str) -> list[str]:
 
 def _insert_line(table: str, cols: list[str], row) -> str:
     vals = ", ".join(quote(v) for v in row)
-    return f"INSERT INTO {table} ({', '.join(cols)}) VALUES ({vals});"
+    columns = ", ".join('"' + name.replace('"', '""') + '"' for name in cols)
+    return f"INSERT INTO {table} ({columns}) VALUES ({vals});"
 
 
 def _dependency_ordered_rows(
@@ -462,7 +466,7 @@ def dump_plain_table(con, table: str) -> list[str]:
     cols = [c for c in cols if c not in SENSITIVE_COLUMNS.get(table, ())]
     if not cols:
         return []
-    collist = ", ".join(cols)
+    collist = ", ".join('"' + name.replace('"', '""') + '"' for name in cols)
     where = SNAPSHOT_ROW_FILTERS.get(table, "")
     rows = con.execute(
         f"SELECT {collist} FROM {table} {where} ORDER BY rowid"

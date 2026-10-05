@@ -41,6 +41,7 @@ import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse
+from unittest import mock
 
 REPO = Path(__file__).resolve().parents[1]
 ENGINE = REPO / ".super-coder"
@@ -332,16 +333,43 @@ class ProjectVerbTest(CallerRootFixture):
         self.assertEqual(posts[-1]["body"], "WT-SUBDIR-BODY\n")
 
     def test_job(self):
-        start = self.sc(self.wt, "job", "start", "--label", "cwdprobe", "--",
-                        "sh", "-c", "pwd -P; echo project_env=${SC_PROJECT_ROOT:-unset}",
-                        cwd=self.wt / "sub")
-        self.assert_ok(start)
-        job_id = re.search(r"job: (\S+) started", start.stdout).group(1)
-        log = self.main / ".super-coder" / "run" / "jobs" / job_id / "log"
-        deadline = time.monotonic() + 30
-        while time.monotonic() < deadline and "project_env=" not in log.read_text():
-            time.sleep(0.1)
-        self.assertEqual(log.read_text().split(), [str(self.wt / "sub"), "project_env=unset"])
+        from test_job import TOKEN, build_db, server as api_server
+
+        database = self.state / "job-api.db"
+        build_db(str(database))
+        with (
+            mock.patch.object(api_server, "DB_PATH", str(database)),
+            mock.patch.object(api_server, "ENGINE", self.main / ".super-coder"),
+        ):
+            api = ThreadingHTTPServer(("127.0.0.1", 0), api_server.Handler)
+            thread = threading.Thread(target=api.serve_forever, daemon=True)
+            thread.start()
+            try:
+                start = self.sc(
+                    self.wt, "job", "start", "--label", "cwdprobe", "--",
+                    "sh", "-c", "pwd -P; echo project_env=${SC_PROJECT_ROOT:-unset}",
+                    cwd=self.wt / "sub", SC_API_TOKEN=TOKEN,
+                    SC_API_BASE=f"http://127.0.0.1:{api.server_port}",
+                )
+                self.assert_ok(start)
+                job_id = re.search(r"job: (\d+) started", start.stdout).group(1)
+                deadline = time.monotonic() + 30
+                with sqlite3.connect(database) as con:
+                    while time.monotonic() < deadline:
+                        row = con.execute(
+                            'SELECT state,cwd,"commit",evidence_path FROM runs WHERE run_id=?',
+                            (job_id,),
+                        ).fetchone()
+                        if row and row[0] == "done":
+                            break
+                        time.sleep(0.1)
+                self.assertEqual(row[:3], ("done", str(self.wt / "sub"), git(self.wt, "rev-parse", "HEAD")))
+                self.assertEqual(Path(row[3]).read_text().split(),
+                                 [str(self.wt / "sub"), "project_env=unset"])
+            finally:
+                api.shutdown()
+                api.server_close()
+                thread.join(2)
 
     def test_skill_put_file(self):
         """A relative draft path is read from the subdirectory it was typed in.

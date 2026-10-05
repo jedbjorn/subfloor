@@ -34,7 +34,7 @@ import seed_skills
 POLICY_HEADING = "## TESTING POSTURE"
 FULL_SUITE_BOUNDARY = "do not run the repository-wide suite locally merely to duplicate"
 SHARED_HOST_BOUNDARY = "Never start a competing repository-wide suite on a shared host."
-LONG_JOB_BOUNDARY = "Use the engine's `./sc job` tools to watch checks"
+LONG_JOB_BOUNDARY = "Use `./sc job start --label gate -- <command and args>`"
 
 
 class FocusedDeveloperVerificationSourceTest(unittest.TestCase):
@@ -55,6 +55,8 @@ class FocusedDeveloperVerificationSourceTest(unittest.TestCase):
         self.assertIn("no trustworthy seat remains", focus)
         self.assertIn("browser-capability skip is informational and non-failing", focus)
         self.assertIn(LONG_JOB_BOUNDARY, focus)
+        self.assertIn("end the turn and continue on the owner wake", focus)
+        self.assertIn("A lost outcome is unknown, never a pass.", focus)
         self.assertIn("Do not set up independent watchers.", focus)
         self.assertIn(FULL_SUITE_BOUNDARY, focus)
         self.assertIn(SHARED_HOST_BOUNDARY, focus)
@@ -154,6 +156,16 @@ class FocusedDeveloperVerificationMigrationTest(unittest.TestCase):
             "SELECT system_prompt FROM shells WHERE shell_id=3"
         ).fetchone()[0]
         migration = "\n".join(path.read_text() for path in MIGRATIONS)
+        # This fixture contains only guidance tables. The Runs integration
+        # suite applies the complete ledger migration; include its prompt
+        # statement here to prove convergence with the current template.
+        runs_migration = (ENGINE / "migrations" / "0275_runs_ledger.sql").read_text()
+        guidance = [
+            line for line in runs_migration.splitlines()
+            if line.startswith("UPDATE shells SET system_prompt=")
+        ]
+        self.assertEqual(len(guidance), 1)
+        migration += "\n" + guidance[0]
 
         self.con.executescript(migration)
         first_prompts = dict(
