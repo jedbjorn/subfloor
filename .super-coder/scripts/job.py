@@ -651,6 +651,18 @@ def cmd_kill(args) -> int:
     return 0
 
 
+def cmd_attach(args) -> int:
+    payload = {'pr': args.pr} if args.pr is not None else {'work_unit': args.work_unit}
+    if args.repository is not None:
+        payload['repository'] = args.repository
+    try:
+        row = _api('POST', f'/_sc/runs/{args.id}/attach', payload)
+    except (urllib.error.URLError, OSError, ValueError) as exc:
+        die(f'attach failed: {exc}')
+    print(json.dumps(row))
+    return 0
+
+
 # ── arg parsing ───────────────────────────────────────────────────────────────
 
 def build_parser() -> argparse.ArgumentParser:
@@ -697,6 +709,14 @@ def build_parser() -> argparse.ArgumentParser:
     sp = sub.add_parser("kill", help="SIGTERM→SIGKILL the job's process group")
     sp.add_argument("id")
     sp.set_defaults(fn=cmd_kill)
+
+    sp = sub.add_parser("attach", help="link a terminal run by id; receipts supplement, never replace CI")
+    sp.add_argument("id", type=int)
+    target = sp.add_mutually_exclusive_group(required=True)
+    target.add_argument("--pr", type=int)
+    target.add_argument("--work-unit", type=int)
+    sp.add_argument("--repository", help="owner/name when a PR number is ambiguous")
+    sp.set_defaults(fn=cmd_attach)
 
     sp = sub.add_parser("_supervise", help=argparse.SUPPRESS)
     sp.add_argument("jobdir")

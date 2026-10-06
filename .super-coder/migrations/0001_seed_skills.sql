@@ -641,6 +641,17 @@ Only after the PR is merged:
 
 NEVER delete a branch carrying unmerged, un-PR''d work — no PR = lost work.
 
+## RUN RECEIPTS
+
+Attach completed local evidence by run id with `sc job attach <id> --pr <number>`
+or `sc job attach <id> --work-unit <id>`. The run and target must share an owner;
+a PR must already be registered. Use `--repository owner/name` if its number is
+ambiguous. The Runs drawer and fleet offer the same attachment action.
+Receipts show beside the observed GitHub check in Chats and the Sprint board.
+A commit outside the PR head''s ancestry is stale; unavailable ancestry stays
+unknown. Pruned logs retain their receipt. Receipts supplement CI evidence;
+only GitHub checks and the existing merge grant authorize a merge.
+
 ## Never commit the engine or derived files
 
 - In a fork `/.super-coder/` is gitignored — never force-add anything under it.

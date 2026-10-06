@@ -4385,7 +4385,12 @@ class Handler(BaseHTTPRequestHandler):
                 if sid is None:
                     return
             store = RunStore(con, ENGINE)
+            from run_attachments import RunAttachments
+            attachments = RunAttachments(con)
             parts = path.strip('/').split('/')
+            if operator and not post and parts[2:] == ['prs']:
+                query = parse_qs(urlparse(self.path).query)
+                return self._send(200, {'prs': attachments.prs(int(query.get('shell_id', ['0'])[0]))})
             if operator and not post and parts[2:] == ['processes']:
                 from run_processes import observe
                 query = parse_qs(urlparse(self.path).query)
@@ -4406,7 +4411,11 @@ class Handler(BaseHTTPRequestHandler):
                     raise PermissionError('registration requires shell authentication')
                 return self._send(201, store.register(sid, self._body()))
             rid = int(parts[2])
+            if post and parts[3:] == ['attach']:
+                return self._send(200, attachments.attach(rid, sid, self._body()))
             row = store.get(rid, sid)
+            if not post and parts[3:] == ['attachment-targets']:
+                return self._send(200, {'targets': attachments.targets(row['owner_shell_id'])})
             if len(parts) == 3 and not post:
                 return self._send(200, row)
             action = parts[3] if len(parts) == 4 else ''

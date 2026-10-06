@@ -615,10 +615,17 @@ class SprintBoardProjection:
         if owns_transaction:
             self.con.execute("BEGIN")
         try:
-            return self._board_in_snapshot(sprint_id)
+            result = self._board_in_snapshot(sprint_id)
         finally:
             if owns_transaction:
                 self.con.rollback()
+        from run_attachments import RunAttachments
+        attachments = RunAttachments(self.con)
+        for unit in result['work_units']:
+            unit['receipts'] = attachments.receipts(work_unit=unit['work_unit_id'])
+            for pr in unit['pull_requests']:
+                pr['receipts'] = attachments.pr_receipts(pr['repository'], pr['pr_number'], pr['observed_head_sha'])
+        return result
 
     def _health_messages(
         self,
